@@ -14,6 +14,9 @@ pub mod decode;
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
 pub mod dff;
+/// Dither TPDF — UNE implémentation, partagée par tous les étages qui
+/// repassent du flottant à l'entier (#4075, #4076).
+pub mod dither;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
 #[cfg(test)]

@@ -14,7 +14,7 @@ affirme le comportement attendu, à dé-ignorer par le correctif.
 |---|---|---|
 | 1 | le gain logiciel peut-il porter un échantillon au-delà de 0 dBFS ? | **oui** — ReplayGain sans pic tagué : +6 dB sur un sinus à −0,1 dBFS, **66,2 % des échantillons écrêtés dur**, excès max 31 866 LSB, sans compteur ; égaliseur passe-bas Q = 4 : **83,7 % d'overs**, comptés (`eq_overs`), écrêtés dur, jamais journalisés |
 | 2 | ReplayGain + égaliseur produisent-ils des inter-échantillons > 0 dBFS ? | **oui quand le pic tagué est un pic d'échantillon** : carré à −0,05 dBFS posé au rail par `prevent_clipping`, crête vraie **+2,10 dBTP** ; avec le pic VRAI tagué : **−0,000 dBTP** (le mécanisme est juste, c'est le tag qui manque) |
-| 3 | flottant → entier : dither, troncature ou arrondi ? | **quatre réponses différentes selon l'étage** : égaliseur = TPDF ±1 LSB + arrondi (16/24/32 bits) ; ReplayGain et mixeur = **troncature vers zéro** sans dither ; convolveur = arrondi sans dither (IR unité ≠ identité, −0,00027 dB) ; réduction 24→16 bits = **décalage** (troncature vers −∞) sans dither |
+| 3 | flottant → entier : dither, troncature ou arrondi ? | **corrigé le 13/09 par #4075 + #4076** — une seule réponse, une seule implémentation (`audio::dither`) : TPDF ±1 LSB puis arrondi pour l'égaliseur, ReplayGain, le mixeur et la réduction de profondeur ; convolveur = arrondi sans dither, et son IR unité est redevenue l'identité (asymétrie 2^(n−1)−1 supprimée). Mesures d'origine conservées ci-dessous |
 | 4 | PURE / désarmé : identité octet pour octet ? | **oui pour chaque étage désarmé** atteignable par une porte publique, à 16/24/32 bits ; la garde PURE de la sortie locale est privée (prouvée par T8, pas ici) |
 
 ## Protocole
@@ -74,10 +74,10 @@ affirme le comportement attendu, à dé-ignorer par le correctif.
 | étage | 16 bits | 24 bits | 32 bits | détail |
 |---|---|---|---|---|
 | `EqProcessor::process_pcm` | dither | dither | dither (silence ressort à ±1 LSB) | TPDF ±1 LSB puis arrondi ; erreur moyenne +0,001 / +0,004 LSB, max 1,47 / 1,46 LSB — référence : les mêmes mots élargis à 32 bits par la même cascade |
-| `replaygain::apply_gain_pcm` (−1 dB) | troncature vers zéro | troncature vers zéro | troncature vers zéro | `clamp` puis `as i16` / `as i32` ; **un facteur de 1 − 10⁻⁷ (−0,000001 dB) déplace 44 098 / 44 098 échantillons non nuls d'1 LSB vers zéro** |
-| `PcmMixer::apply_gain` (−1 dB) | troncature vers zéro | troncature vers zéro | troncature vers zéro | `SampleFormat::write`, même écriture |
-| `Convolver::process_pcm`, IR unité | arrondi | — | — | décode ÷32 768, encode ×32 767 : **29 214 / 44 100 échantillons (66 %) perdent 1 LSB** — une IR unité n'est pas l'identité (−0,00027 dB) |
-| `decode::convert_pcm_bytes` 24 → 16 | décalage (troncature vers −∞) | — | — | 385 → 1 (un arrondi donnerait 2), −1 → −1, 255 → 0 ; chemin du transcodage 16 bits (DLNA/WAV) d'une source 24 bits et de la mémoire de préchargement |
+| `replaygain::apply_gain_pcm` (−1 dB) | ~~troncature vers zéro~~ **dither** | ~~troncature~~ **dither** | ~~troncature~~ **dither** | était : `clamp` puis `as i16` / `as i32`, et **un facteur de 1 − 10⁻⁷ (−0,000001 dB) déplaçait 44 098 / 44 098 échantillons non nuls d'1 LSB vers zéro**. Depuis #4076 : TPDF puis arrondi ; l'erreur n'est plus corrélée au signe du signal (mesuré ≤ 0,003 LSB) |
+| `PcmMixer::apply_gain` (−1 dB) | ~~troncature~~ **dither** | ~~troncature~~ **dither** | ~~troncature~~ **dither** | `SampleFormat::write_quantifie`, même correctif (#4076) |
+| `Convolver::process_pcm`, IR unité | arrondi, **identité exacte** | arrondi | arrondi | était : décode ÷32 768, encode ×32 767, donc **29 214 / 44 100 échantillons (66 %) perdaient 1 LSB**. Depuis #4076 les deux sens partagent l'échelle 2^(n−1) : identité octet pour octet à 16 bits. Au-dessus, le tampon `f32` du convolveur devient le plancher (écart max 4 LSB à 24 bits, 1 035 à 32) |
+| `decode::convert_pcm_bytes` 24 → 16 | ~~décalage~~ **dither** | — | — | était : 385 → 1 (un arrondi donnerait 2), 255 → 0. Depuis #4075 : TPDF puis arrondi, biais mesuré +0,002 LSB ; un continu à 255/256 LSB ne disparaît plus (moyenne 0,994). Le dither est dans `convert_pcm_bytes` SEUL, jamais dans `convert_pcm_bit_depth` (que l'analyse emprunte) |
 | `outputs::local::f32_to_native_i32` | *non témoignable* | | | privé (`local.rs`), lu : `.round().clamp()`, sans dither |
 | `decode::StreamingPcmByteAdapter::resample` | *non témoignable* | | | `pub(crate)`, lu : `clamp` puis `as i32` — troncature vers zéro après le SRC |
 
@@ -90,10 +90,25 @@ immédiat), `EqProcessor` désactivé, `EqProcessor` armé à bandes neutres
 
 ## Ce qui est prouvé, ce qui ne l'est pas
 
-**Prouvé** (14 témoins verts, sur toute PR Rust) : les comportements du
-tableau ci-dessus, tels qu'ils sont. Les 5 témoins `#[ignore]` sont
-**rouges** quand on les lance (`cargo test … -- --ignored`) : ce sont des
-défauts, pas des intentions.
+**Prouvé** (19 témoins verts depuis #4072, #4075/#4076, sur toute PR Rust) :
+les comportements du tableau ci-dessus, tels qu'ils sont. Il reste **3**
+témoins `#[ignore]`, **rouges** quand on les lance
+(`cargo test … -- --ignored`) : ce sont les défauts B et C, pas des
+intentions. Des deux autres, `q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`
+a été **dé-ignoré par #4075** (c'est aujourd'hui
+`q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither`), et celui du
+défaut A par #4072 — voir juste en dessous.
+
+🟢 **Le défaut A est CORRIGÉ (#4072).** Son témoin
+`q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague`
+a été réveillé et renommé
+`q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague` : il est vert
+sur toute PR. `gain_factor` refuse le gain positif quand aucun pic n'est
+tagué et que `prevent_clipping` est armé — le facteur ne dépasse plus
+l'unité, pas un octet ne bouge. Le témoin voisin qui mesurait 66,2 %
+d'écrêtés avec le garde-fou ARMÉ les mesure désormais avec le garde-fou
+DÉSARMÉ (`q1_replaygain_sans_garde_fou_…`, mêmes chiffres, même stimulus) :
+ce que l'auditeur obtient quand il décoche la case. Voir §A ci-dessous.
 
 **Non prouvé ici** :
 
@@ -119,7 +134,7 @@ défauts, pas des intentions.
 
 ## Issues à ouvrir (à la main de Bertrand)
 
-### A — ReplayGain : sans pic tagué, `prevent_clipping` n'empêche rien et `apply_gain_pcm` écrête dur sans compter
+### A — ✅ CORRIGÉ (#4072) — ReplayGain : sans pic tagué, `prevent_clipping` n'empêchait rien et `apply_gain_pcm` écrêtait dur sans compter
 
 Mesuré : +6 dB sur un sinus à −0,1 dBFS, 66,2 % d'échantillons écrêtés,
 excès 31 866 LSB, aucun compteur, aucun journal. Attendu : `prevent_clipping`
@@ -127,6 +142,47 @@ armé ⇒ aucun échantillon au-delà du rail, pic tagué ou non (refuser le gai
 positif sans pic, ou l'analyser) ; et `apply_gain_pcm` compte ses écrêtés
 comme `EqProcessStats.overs`, exposés dans `signal-path`. Témoin :
 `q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague`.
+
+**Livré (#4072, issue #4072).** Ce qui a changé, exactement :
+
+* `gain_factor` délègue à `gain_factor_detail`, qui dit AUSSI ce que
+  l'anti-écrêtage a retenu (`RetenueAntiEcretage` : `Aucune` /
+  `ParLePicTague` / `GainPositifRefuseSansPic`). Sans pic exploitable — absent,
+  nul, négatif, ou écarté par `PEAK_MAX_PLAUSIBLE` — et avec
+  `prevent_clipping` armé, **le facteur ne dépasse plus l'unité**. Le témoin
+  `#[ignore]` est réveillé, renommé
+  `q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague`, et garde
+  trois choses : zéro écrêté contre l'idéal, aucun échantillon au rail, et
+  l'identité **octet pour octet** du PCM (un facteur simplement raboté à 0,99
+  passerait la première, pas la troisième).
+* **Refus, pas déclenchement de l'analyse.** `gain_factor` est pure et
+  synchrone, appelée au démarrage d'une piste et à chaque construction du
+  chemin du signal ; mesurer un pic exige de décoder le fichier entier
+  (`measure_loudness_and_peak`, borné à 180 s). Le déclenchement existe déjà,
+  au bon endroit : la passe de fond de `replaygain.rs` remplit `rg_track_peak`,
+  et la piste retrouve son gain positif dès qu'elle est mesurée. Refuser en
+  attendant coûte un gain non appliqué ; le contraire coûtait 66 %
+  d'échantillons mutilés.
+* **Le plafond dBTP n'entre PAS dans cette borne.** Sans pic, la borne sûre est
+  l'unité : le signal source tient déjà sous le rail. Descendre à `ceiling`
+  (−0,5 / −1 dBTP) atténuerait silencieusement toute piste non taguée, gain
+  demandé nul compris. La marge inter-échantillons reste la question C.
+* **L'atténuation n'est jamais touchée**, et le garde-fou DÉSARMÉ rend
+  exactement le comportement d'avant : le témoin voisin le mesure toujours
+  (66,2 %, excès 31 866 LSB, saturation dure, signe conservé), et les quinze
+  empreintes FNV-1a de `ecretage_compte_2218.rs` sont inchangées — le chemin
+  désarmé de `gain_factor` n'a pas bougé d'un bit.
+* **Exposition dans `signal-path`** : l'étape ReplayGain porte
+  `clipping_guard` (`none` / `tagged_peak` / `refused_no_peak`) et `metrics`,
+  le relevé de `audio::ecretage::REGISTRE.replaygain` (#4020) avec son
+  `portee: "processus"` dit dans l'objet — l'étage reçoit un `f64` nu, il ne
+  connaît ni piste ni zone. Un refus **affiche une étape** au lieu de
+  disparaître (facteur 1,0 : l'ancien seuil `|f − 1| ≤ 1e-6` la masquait) et
+  reste `bit_perfect: true`, verdict compris — il n'a touché aucun
+  échantillon.
+
+Ce que #4072 ne traite pas : B et C, dont les témoins `#[ignore]` restent
+rouges. D et E ont été corrigés depuis, par #4075/#4076.
 
 ### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux
 
@@ -147,23 +203,51 @@ dire dans `signal-path` et appliquer une marge par défaut, ou déclencher
 l'analyse qui écrit le pic vrai. Témoin :
 `q2_defaut_connu_prevent_clipping_devrait_tenir_la_crete_vraie_sous_0_dbtp_avec_un_pic_d_echantillon`.
 
-### D — Réduction 24 → 16 bits par décalage, sans dither
+### D — Réduction 24 → 16 bits par décalage, sans dither — ✅ CORRIGÉ (#4075)
 
-Mesuré : `convert_pcm_bytes` tronque vers −∞ (385 → 1). Chemins : transcodage
-16 bits (DLNA / WAV) d'une source 24 bits, mémoire de préchargement servie à
-une sortie moins profonde. Attendu : TPDF avant arrondi, comme
-`EqProcessor::write_sample_f64` le fait déjà. Témoin :
-`q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`.
+Mesuré : `convert_pcm_bytes` tronquait vers −∞ (385 → 1). Chemins :
+transcodage 16 bits (DLNA / WAV) d'une source 24 bits, mémoire de
+préchargement servie à une sortie moins profonde.
 
-### E — `apply_gain_pcm` et `PcmMixer::apply_gain` tronquent vers zéro sans dither
+**Corrigé le 13/09** : TPDF avant arrondi, par le module partagé
+`audio::dither`. Le dither est posé dans le corps de `convert_pcm_bytes`
+**seul** — surtout pas dans `convert_pcm_bit_depth` ni `requantize`, que
+`audio::analyzer` emprunte pour ReplayGain, le BPM, la forme d'onde et les
+empreintes : les y mettre rendrait l'analyse non reproductible. Il est
+déterministe (graine dérivée du contenu du bloc), sans quoi le cache de
+transcodage et la reprise par `Range` d'OAAT se casseraient.
 
-Mesuré : un gain de −0,000001 dB déplace tout le signal d'1 LSB vers zéro ; à
-−1 dB, erreur corrélée au signe du signal (distorsion de troncature, pas de
-bruit). Attendu : arrondi au plus proche au minimum, TPDF de préférence — le
-dither de l'égaliseur est déjà là, à partager. Constat voisin, sans témoin
-ignoré : une IR unité du convolveur perd 1 LSB sur 66 % des échantillons
-(×32 767 / 32 768). Pas de témoin `#[ignore]` : l'attendu est un choix de
-conception (arrondi ou dither) à trancher dans l'issue.
+### E — `apply_gain_pcm` et `PcmMixer::apply_gain` tronquent vers zéro — ✅ CORRIGÉ (#4076)
+
+Mesuré : un gain de −0,000001 dB déplaçait tout le signal d'1 LSB vers zéro ;
+à −1 dB, erreur corrélée au signe du signal (distorsion de troncature, pas de
+bruit).
+
+**Tranché le 13/09 : TPDF, pas simple arrondi.** L'arrondi enlève le biais
+mais laisse l'erreur *corrélée au signal* — une distorsion harmonique, la plus
+audible là où le signal n'occupe plus que quelques LSB (fins de notes, queues
+de réverbération, fondus). Le TPDF décorrèle l'erreur ET rend sa puissance
+indépendante du signal, ce qu'un RPDF ne fait pas ; il coûte +4,77 dB de
+plancher, soit ≈ −93 dBFS à 16 bits. C'est déjà ce que faisait l'égaliseur : le
+retenir aligne les quatre étages au lieu d'en laisser deux à part.
+
+Une seule implémentation, `audio::dither`, appelée par les trois étages —
+l'égaliseur y a versé la sienne, à l'octet près (ses empreintes `B_EQ_*` de
+`ecretage_compte_2218.rs` sont inchangées, c'est la preuve).
+
+**Règle associée** : pas de requantification, pas de dither. Un facteur
+entier (1, 2, 0) envoie un entier sur un entier ; un élargissement de
+profondeur est un décalage exact. Ni l'un ni l'autre ne dithère, et les
+témoins `q4_*` d'identité tiennent.
+
+**Constat voisin, corrigé aussi** : l'IR unité du convolveur perdait 1 LSB sur
+66 % des échantillons (÷32 768 puis ×32 767). Les deux sens partagent
+désormais l'échelle 2^(n−1) : à 16 bits l'identité est exacte. Le décodage 24
+bits portait un second défaut trouvé en tenant cette identité — il convertissait
+l'échantillon **décalé de 8 rangs** en `f32`, dont la mantisse de 24 bits en
+jetait sept **avant** la convolution. Le convolveur ne dithère pas, et c'est
+délibéré : il arrondit déjà au plus proche, et du bruit détruirait l'identité
+qu'on vient de lui rendre.
 
 ## Contre-épreuves
 
@@ -178,8 +262,8 @@ par `cp` + `touch`, verts — sorties collées dans la PR :
 ## Reproduction locale
 
 ```sh
-cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 14 verts, 5 ignorés
-cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 5 rouges : les défauts A–D
+cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 19 verts, 3 ignorés
+cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 3 rouges : les défauts B et C
 ```
 
 ## Comptage livré le 12/09 (agent F, `tune-core/tests/ecretage_compte_2218.rs`)
@@ -191,7 +275,8 @@ Q = 4 entier et flottant, plateau grave sur carré, chaîne ReplayGain puis
 égaliseur, mixeur −1 dB et ×2 : 15 empreintes) ont été relevées sur
 `batch/bugs-12` à 49ecf1fe **avant** le comptage par un témoin temporaire non
 publié, collées dans `ecretage_compte_2218.rs`, et sont **inchangées après**.
-Les 14 témoins verts et les 5 ignorés de ce banc n'ont pas été touchés.
+Les 14 témoins verts et les 5 ignorés de ce banc n'ont pas été touchés
+(#4072 en a depuis réveillé un : 15 verts, 4 ignorés).
 Le clamp de chaque étage est resté où il est, dans l'ordre où il est (clamp
 PUIS dither pour l'égaliseur), avec ses seuils.
 
@@ -251,17 +336,25 @@ section `dsp_ecretage` — par étage, `echantillons_vus`, `echantillons_ecretes
 (`audio::ecretage::REGISTRE`, `AtomicU64`). Pas par zone : `OutputDspMetrics`
 est construit par littéral dans `outputs/local.rs`, hors périmètre.
 
-### Les cinq défauts, toujours à trancher par Bertrand
+### Les cinq défauts : A, D et E corrigés, B et C toujours à trancher
 
-Rien de ce qui suit n'a été corrigé ; c'est maintenant compté et dit.
-
-* **A** — `prevent_clipping` sans pic tagué n'empêche rien (66 % écrêtés) ;
+* **A** — ✅ **corrigé par #4072** : `prevent_clipping` armé sans pic tagué
+  refuse le gain positif (facteur borné à l'unité), le chemin du signal nomme
+  le refus (`clipping_guard`) et porte le compteur d'écrêtage de l'étage ;
 * **B** — la réserve automatique ignore la résonance des passe-bas/haut et la
-  réponse en temps des plateaux (83,7 % / 40,4 % d'overs) ;
-* **C** — avec un pic d'échantillon tagué, la crête vraie passe à +2,10 dBTP ;
-* **D** — réduction 24 → 16 bits par décalage, sans dither ;
-* **E** — `apply_gain_pcm` et `PcmMixer::apply_gain` tronquent vers zéro sans
-  dither (le comptage garde le même `clamp` puis le même `as`).
+  réponse en temps des plateaux (83,7 % / 40,4 % d'overs) — 🔴 ouvert ;
+* **C** — avec un pic d'échantillon tagué, la crête vraie passe à +2,10 dBTP —
+  🔴 ouvert ;
+* **D** — réduction 24 → 16 bits par décalage — ✅ **corrigé, #4075** ;
+* **E** — `apply_gain_pcm` et `PcmMixer::apply_gain` tronquaient vers zéro —
+  ✅ **corrigé, #4076**.
+
+⚠️ Les empreintes `A_*`, `E_*` et `Q2_*` de `ecretage_compte_2218.rs` ont
+changé avec #4076 : c'est l'objet du correctif, pas un effet de bord. Tous les
+**compteurs** d'écrêtage (29 174 écrêtés, 31 866 LSB, 36 896 overs) sont
+inchangés — ils comparent la valeur idéale au rail, en amont du bruit et de
+l'arrondi. Les empreintes `B_EQ_*` sont inchangées elles aussi : la
+mutualisation du dither de l'égaliseur est neutre à l'octet.
 
 ```sh
 cargo test -p tune-core --test ecretage_compte_2218 -- --nocapture   # 8 verts

@@ -431,8 +431,11 @@ pub struct EqProcessor {
     /// Automatic pre-gain per channel, applied before the cascade.
     preamp_gains: Vec<f64>,
     preamp_db: Vec<f64>,
-    /// Independent deterministic PRNG state per channel for TPDF dithering.
-    dither_states: Vec<u64>,
+    /// Une suite de dither TPDF **indépendante par canal**, déterministe.
+    /// L'implémentation vient de [`crate::audio::dither`] — partagée avec
+    /// ReplayGain, le mélangeur et la réduction de profondeur (#4075, #4076) ;
+    /// l'égaliseur n'en garde plus de copie, seulement son état par canal.
+    dither_states: Vec<crate::audio::dither::Dither>,
     /// Cumulative runtime diagnostics since this processor was built for the
     /// current stream. Read by the output telemetry path (#2212).
     process_stats: EqProcessStats,
@@ -520,7 +523,11 @@ impl EqProcessor {
             preamp_gains,
             preamp_db,
             dither_states: (0..channels.max(1))
-                .map(|channel| 0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1))
+                .map(|channel| {
+                    crate::audio::dither::Dither::depuis_graine(
+                        0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1),
+                    )
+                })
                 .collect(),
             process_stats: EqProcessStats::default(),
             ecretage: crate::audio::ecretage::CompteurDEcretage::default(),
@@ -597,7 +604,7 @@ impl EqProcessor {
                     );
                 }
 
-                let dither = tpdf_dither(&mut self.dither_states[ch]);
+                let dither = self.dither_states[ch].tirer();
                 write_sample_f64(&mut frame[offset..], s, bytes_per_sample, bit_depth, dither);
             }
         }
@@ -813,9 +820,17 @@ fn read_sample_f64(buf: &[u8], bytes: usize, bit_depth: u16) -> f64 {
 
 fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16, dither_lsb: f64) {
     let max_val = (1i64 << (bit_depth - 1)) as f64;
+    // La saturation à 1,0 − 1 LSB AVANT le dither est propre à l'égaliseur :
+    // c'est son écrêtage, compté séparément (`stats.overs`). Le dither,
+    // l'arrondi et la saturation finale viennent du module partagé — même
+    // arithmétique qu'avant, à l'octet près.
     let clamped = sample.clamp(-1.0, 1.0 - 1.0 / max_val);
-    let raw = (clamped * max_val + dither_lsb).round();
-    let raw = raw.clamp(-max_val, max_val - 1.0) as i64;
+    let raw = crate::audio::dither::quantifier_avec(
+        clamped * max_val,
+        dither_lsb,
+        -max_val,
+        max_val - 1.0,
+    );
     match bytes {
         2 => {
             let b = (raw as i16).to_le_bytes();
@@ -836,20 +851,6 @@ fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16, d
         }
         _ => {}
     }
-}
-
-/// Triangular PDF noise in [-1, 1] LSB, obtained by subtracting two uniform
-/// variates. Xorshift64* keeps this lock-free in the audio path.
-fn tpdf_dither(state: &mut u64) -> f64 {
-    fn uniform(state: &mut u64) -> f64 {
-        *state ^= *state >> 12;
-        *state ^= *state << 25;
-        *state ^= *state >> 27;
-        let value = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        (value >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
-    }
-
-    uniform(state) - uniform(state)
 }
 
 #[cfg(test)]

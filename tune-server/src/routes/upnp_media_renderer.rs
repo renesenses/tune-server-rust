@@ -244,10 +244,11 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
         .flatten()
         .map(|z| z.muted)
         .unwrap_or(false);
-    let volume = if tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id)
-        && tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id)
-    {
-        100
+    let volume = if volume_verrouille(
+        tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id),
+        tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id),
+    ) {
+        PLEINE_ECHELLE
     } else {
         (ps.volume.clamp(0.0, 1.0) * 100.0).round() as u8
     };
@@ -452,9 +453,10 @@ async fn renderingcontrol_control(
             upnp_renderer::volume_response(&snapshot(&state, zone_id).await)
         }
         RendererCommand::SetVolume(v) => {
-            let volume_locked =
-                tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id)
-                    && tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id);
+            let volume_locked = volume_verrouille(
+                tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id),
+                tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id),
+            );
             if volume_locked {
                 info!(
                     zone_id,
@@ -491,6 +493,26 @@ async fn renderingcontrol_control(
         _ => tune_core::upnp_server::soap_fault(401, "Invalid Action"),
     };
     xml_response(xml)
+}
+
+/// Le volume publié par un renderer verrouillé : la pleine échelle.
+pub(crate) const PLEINE_ECHELLE: u8 = 100;
+
+/// Le Mode PURE verrouille-t-il le volume de cette zone ? (#3972, garde #4098)
+///
+/// Décision unique des DEUX sites de la route `RenderingControl` : `snapshot`,
+/// qui publie le volume, et `SetVolume`, qui acquitte sans toucher au gain.
+/// Les deux doivent répondre pareil, sinon un contrôleur lit 100 et croit
+/// pouvoir descendre, ou l'inverse.
+///
+/// Le verrouillage exige les DEUX conditions. Le réglage `audiophile_lock_volume`
+/// seul ne suffit pas : hors Mode PURE, il n'y a pas de promesse de bit-perfect
+/// à protéger, et confisquer le volume d'une zone ordinaire serait un défaut.
+///
+/// Extrait de la route pour être gardé : voir
+/// `le_verrou_de_volume_exige_les_deux_conditions`.
+fn volume_verrouille(verrou_actif: bool, mode_pure_actif: bool) -> bool {
+    verrou_actif && mode_pure_actif
 }
 
 /// Un `Play` sur une session en pause doit REPRENDRE, jamais relancer (#3969).
@@ -770,6 +792,75 @@ mod tests {
             production.contains(".resume(zone_id, device_id.as_deref())"),
             "la branche de reprise doit appeler `orchestrator.resume` : \
              relancer un PlayRequest remettrait la piste à 0 (#3969)."
+        );
+    }
+
+    /// 🔴 #4098 — le verrou de volume du Mode PURE n'avait aucune garde.
+    ///
+    /// La promesse : en Mode PURE avec verrou, la sortie reste à pleine échelle,
+    /// sans atténuation numérique, donc sans troncature de bits. Un contrôleur
+    /// UPnP qui pousse un volume ne doit pas pouvoir la casser.
+    ///
+    /// Ce que ce témoin garde : la décision elle-même, et surtout qu'elle exige
+    /// les DEUX conditions. Un défaut où le verrou seul suffirait confisquerait
+    /// le volume de toutes les zones ordinaires ; un défaut où le Mode PURE seul
+    /// suffirait le confisquerait sans que l'utilisateur ait demandé le verrou.
+    #[test]
+    fn le_verrou_de_volume_exige_les_deux_conditions() {
+        assert!(
+            volume_verrouille(true, true),
+            "verrou + Mode PURE : le volume DOIT être verrouillé, c'est la \
+             promesse de bit-perfect du Mode PURE (#3972)."
+        );
+
+        // Contre-épreuve 1 — le verrou seul, sans Mode PURE : rien à protéger.
+        assert!(
+            !volume_verrouille(true, false),
+            "hors Mode PURE, il n'y a aucune promesse de bit-perfect à \
+             protéger : confisquer le volume d'une zone ordinaire serait un \
+             défaut, pas une garantie."
+        );
+
+        // Contre-épreuve 2 — le Mode PURE seul, sans verrou demandé.
+        assert!(
+            !volume_verrouille(false, true),
+            "le Mode PURE sans `audiophile_lock_volume` laisse le volume \
+             réglable : le verrou est un choix de l'utilisateur."
+        );
+
+        // Contre-épreuve 3 — ni l'un ni l'autre.
+        assert!(
+            !volume_verrouille(false, false),
+            "sans verrou ni Mode PURE, le volume est celui de la zone."
+        );
+    }
+
+    /// Les DEUX sites de la route passent-ils encore par la décision ?
+    ///
+    /// `snapshot` publie le volume et `SetVolume` l'acquitte. Si l'un des deux
+    /// cesse d'appeler `volume_verrouille`, ils peuvent diverger : le contrôleur
+    /// lirait 100 tout en pouvant réellement atténuer, ou l'inverse. Le témoin
+    /// ci-dessus resterait vert — il ne teste que la décision.
+    #[test]
+    fn les_deux_sites_du_verrou_passent_par_la_decision() {
+        let source = include_str!("upnp_media_renderer.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]")
+            .expect("le module de tests doit exister")];
+
+        // On cherche les APPELS, pas le nom : `fn volume_verrouille(` contient
+        // la sous-chaîne et suffirait à satisfaire un `contains` naïf — le faux
+        // vert mesuré le 13/09 sur le témoin de #3969.
+        let appels = production
+            .lines()
+            .filter(|l| l.contains("volume_verrouille(") && !l.trim_start().starts_with("fn "))
+            .count();
+        assert_eq!(
+            appels, 2,
+            "les DEUX sites — `snapshot` et `SetVolume` — doivent appeler \
+             `volume_verrouille` : s'ils divergent, le volume publié ne \
+             correspond plus au volume réellement appliqué (#4098).\nappels \
+             trouvés hors définition : {appels}"
         );
     }
 }
