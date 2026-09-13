@@ -13,8 +13,36 @@ pub const HQPLAYER_V6_PORT: u16 = 8019;
 /// Ports to try when auto-detecting HQPlayer.
 pub const HQPLAYER_PROBE_PORTS: &[u16] = &[4321, 8019];
 
-/// XML declaration prepended to every command sent to HQPlayer.
+/// XML declaration that heads the command stream of a control connection.
+///
+/// It is written **once per connection**, before the first command — never
+/// again (see [`frame_message`] and #4023).
 const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+
+/// A live control connection, and whether its XML declaration is already out.
+///
+/// HQPlayer parses everything a client writes on one control socket as a
+/// *single* XML stream: the declaration belongs at its head, and a second
+/// declaration in the middle is a fatal parse error for a streaming reader.
+/// The flag is per-connection on purpose — a reconnect starts a brand new
+/// stream, which needs the declaration again.
+struct Control {
+    stream: TcpStream,
+    header_sent: bool,
+}
+
+/// Frame one command for the wire.
+///
+/// The XML declaration goes out only when the connection has not seen it yet.
+/// Every command is newline-terminated so two consecutive commands stay
+/// visibly separate in the stream.
+fn frame_message(xml_body: &str, header_sent: bool) -> String {
+    if header_sent {
+        format!("{xml_body}\n")
+    } else {
+        format!("{XML_HEADER}\n{xml_body}\n")
+    }
+}
 
 /// HQPlayer uses a custom TCP protocol with XML messages.
 /// Commands are sent as XML fragments; responses are XML documents.
@@ -24,7 +52,7 @@ pub struct HqplayerOutput {
     host: String,
     port: u16,
     /// Persistent TCP connection to HQPlayer (reconnects on failure).
-    connection: Arc<Mutex<Option<TcpStream>>>,
+    connection: Arc<Mutex<Option<Control>>>,
 }
 
 impl HqplayerOutput {
@@ -70,7 +98,11 @@ impl HqplayerOutput {
                 .await
                 .map_err(|_| format!("hqplayer connect timeout: {addr}"))?
                 .map_err(|e| format!("hqplayer connect failed {addr}: {e}"))?;
-        *conn = Some(stream);
+        // Brand new stream: its XML declaration has not been written yet.
+        *conn = Some(Control {
+            stream,
+            header_sent: false,
+        });
         Ok(())
     }
 
@@ -81,8 +113,23 @@ impl HqplayerOutput {
     /// both the blocking QUERY path (`send_command`) and the fire-and-forget ACTION
     /// path (`send_action`) share it — they differ only in `PostWrite`.
     async fn send_inner(&self, xml_body: &str, mode: PostWrite) -> Result<String, String> {
-        // Build full XML message
-        let message = format!("{}\n{}", XML_HEADER, xml_body);
+        let mut conn = self.connection.lock().await;
+
+        // Try to use existing connection, reconnect if needed
+        let control = match conn.as_mut() {
+            Some(c) => c,
+            None => {
+                drop(conn);
+                self.get_connection().await?;
+                conn = self.connection.lock().await;
+                conn.as_mut()
+                    .ok_or_else(|| "hqplayer: no connection after reconnect".to_string())?
+            }
+        };
+
+        // Framing depends on the connection we actually got: the declaration
+        // heads a fresh stream and is never repeated on an established one.
+        let message = frame_message(xml_body, control.header_sent);
 
         // Raw protocol logging: exact bytes we put on the wire. Cheap, debug-level.
         // Lets us learn v6 behavior from the field (v6 stays silent on actions).
@@ -93,38 +140,36 @@ impl HqplayerOutput {
             "hqplayer_send"
         );
 
-        let mut conn = self.connection.lock().await;
-
-        // Try to use existing connection, reconnect if needed
-        let stream = match conn.as_mut() {
-            Some(s) => s,
-            None => {
-                drop(conn);
-                self.get_connection().await?;
-                conn = self.connection.lock().await;
-                conn.as_mut()
-                    .ok_or_else(|| "hqplayer: no connection after reconnect".to_string())?
-            }
-        };
-
         // Send the command
-        if let Err(e) = stream.write_all(message.as_bytes()).await {
+        if let Err(e) = control.stream.write_all(message.as_bytes()).await {
             // Connection broken, drop it and retry once
             *conn = None;
             drop(conn);
             self.get_connection().await?;
             let mut conn2 = self.connection.lock().await;
-            let stream2 = conn2
+            let control2 = conn2
                 .as_mut()
                 .ok_or_else(|| "hqplayer: no connection after retry".to_string())?;
-            stream2
-                .write_all(message.as_bytes())
+            // Fresh stream after the reconnect: it needs the declaration again,
+            // so re-frame instead of replaying the bytes built for the old one.
+            let retry = frame_message(xml_body, control2.header_sent);
+            debug!(
+                device = %self.name,
+                bytes = retry.len(),
+                raw = %retry.replace('\n', "\\n"),
+                "hqplayer_send_retry"
+            );
+            control2
+                .stream
+                .write_all(retry.as_bytes())
                 .await
                 .map_err(|e2| format!("hqplayer write retry failed: {e}, then {e2}"))?;
-            return post_write(stream2, mode).await;
+            control2.header_sent = true;
+            return post_write(&mut control2.stream, mode).await;
         }
 
-        post_write(stream, mode).await
+        control.header_sent = true;
+        post_write(&mut control.stream, mode).await
     }
 
     /// Send an XML QUERY command and receive the (complete-XML) response.
@@ -347,7 +392,8 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
             .map_err(|_| format!("probe timeout: {addr}"))?
             .map_err(|e| format!("probe connect: {addr}: {e}"))?;
 
-    let cmd = format!("{}\n<GetInfo />", XML_HEADER);
+    // Throw-away connection, one command: it heads its own XML stream.
+    let cmd = frame_message("<GetInfo />", false);
     stream
         .write_all(cmd.as_bytes())
         .await
@@ -448,6 +494,11 @@ impl OutputTarget for HqplayerOutput {
         // transport commands but sends NO reply, so blocking on a response would
         // hit the 5s read timeout and fail the play. `action` writes and only
         // briefly drains any v4/v5 ack. See `send_action` for the full rationale.
+        //
+        // This is the only place that puts TWO commands on one control
+        // connection, which is why #4023 showed up here and nowhere else: the
+        // second one must NOT be preceded by another XML declaration, or
+        // HQPlayer's stream parser dies on it and `Play` is never executed.
 
         // Add URI to playlist (clear existing, start playing)
         let xml = format!(
