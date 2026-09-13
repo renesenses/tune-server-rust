@@ -2155,6 +2155,31 @@ impl SharedDeviceResolution {
     }
 }
 
+/// Rendre une période MUETTE sans tirer de l'anneau — et le dire à l'horloge
+/// du pilote (#3814).
+///
+/// Les deux sorties anticipées du rappel cpal partagé (sourdine établie,
+/// pré-remplissage pas atteint) faisaient `fill(zero); return;`. Le pilote
+/// avait pourtant bien consommé cette période : c'est
+/// `RingStarvation::record`, appelé depuis `RingBuf::pop_mapped`, qui la
+/// comptait — et `pop_mapped` n'était pas appelé. `served_samples` restait
+/// donc figé pendant toute une sourdine, et `stream_ms` avec lui.
+///
+/// Le sondeur (`poller::decisions::rappel_en_retard`) lit précisément cet
+/// écart pour trancher entre « le pilote ne réclame plus rien » et « tout va
+/// bien ». Une sourdine de deux secondes lui rendait `duree_ms ≈ 0` sur
+/// `ecoule_ms ≈ 2000` — la signature exacte d'un rappel mort — et il écrivait
+/// `rappel_pilote_arrete` sur une sortie intacte.
+///
+/// C'est le SEUL chemin de sortie qui pouvait produire ce faux rouge : les
+/// trois bras exclusifs (CoreAudio, WASAPI, ASIO) tirent de l'anneau à chaque
+/// période, sourdine comprise, et leur horloge de pilote n'a jamais menti.
+#[inline]
+fn periode_muette<T: Copy>(ring: &RingBuf, output: &mut [T], zero: T) {
+    output.fill(zero);
+    ring.starvation().record_silent_period(output.len());
+}
+
 /// Une période du rappel `f32` local **partagé** (cpal shared), hors de la
 /// fermeture pour être mesurable.
 ///
@@ -2183,7 +2208,7 @@ fn render_local_shared_f32_callback(
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        output.fill(0.0);
+        periode_muette(ring, output, 0.0);
         return 0;
     }
     // Wait for a minimum amount of data before starting to read from the ring
@@ -2191,7 +2216,7 @@ fn render_local_shared_f32_callback(
     // samples during track transitions.
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            output.fill(0.0);
+            periode_muette(ring, output, 0.0);
             return 0;
         }
         data_started.store(true, Ordering::Release);
@@ -2243,12 +2268,12 @@ where
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        output.fill(zero);
+        periode_muette(ring, output, zero);
         return 0;
     }
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            output.fill(zero);
+            periode_muette(ring, output, zero);
             return 0;
         }
         data_started.store(true, Ordering::Release);
