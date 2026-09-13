@@ -1338,6 +1338,9 @@ mod wav_override_tests;
 
 #[cfg(test)]
 mod plafond_16_bits_tests;
+/// #4016 — le plafond de 4 GiB de l en-tete RIFF, mesure puis route.
+#[cfg(test)]
+mod plafond_riff_4016_tests;
 #[cfg(test)]
 mod transcodage_de_sortie_tests;
 
