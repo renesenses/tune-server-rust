@@ -196,6 +196,31 @@ impl SampleFormat {
             Self::I32 => out[..4].copy_from_slice(&(clamped as i32).to_le_bytes()),
         }
     }
+
+    /// Écrit un échantillon **dithéré puis arrondi**, saturé (#4076).
+    ///
+    /// [`Self::write`] fait `clamp` puis `as` : une troncature vers zéro, dont
+    /// l'erreur porte le signe du signal — une distorsion, pas un bruit. Ici
+    /// le bruit TPDF s'ajoute AVANT l'arrondi, par
+    /// [`crate::audio::dither::quantifier_avec`], l'implémentation partagée.
+    ///
+    /// Un `bruit_lsb` nul rend un arrondi au plus proche pur : c'est ce qui
+    /// garde un gain unitaire exact à l'octet, puisque `valeur` est alors un
+    /// entier.
+    fn write_quantifie(self, value: f64, bruit_lsb: f64, out: &mut [u8]) {
+        let (lo, hi) = self.range();
+        let v = crate::audio::dither::quantifier_avec(value, bruit_lsb, lo, hi);
+        match self {
+            Self::I16 => out[..2].copy_from_slice(&(v as i16).to_le_bytes()),
+            Self::I24 => {
+                let v = v as i32;
+                out[0] = (v & 0xFF) as u8;
+                out[1] = ((v >> 8) & 0xFF) as u8;
+                out[2] = ((v >> 16) & 0xFF) as u8;
+            }
+            Self::I32 => out[..4].copy_from_slice(&(v as i32).to_le_bytes()),
+        }
+    }
 }
 
 pub struct PcmMixer {
@@ -284,17 +309,42 @@ impl PcmMixer {
     /// laissait le tampon INCHANGÉ, ce qui se lit à l'oreille comme un gain
     /// ignoré et à la lecture du code comme un succès.
     ///
-    /// #2218 (T9) — compte ce que `SampleFormat::write` ramène au rail dans
-    /// le registre du processus (`dsp_ecretage.mixeur`), sans changer un
-    /// échantillon : même produit, même `clamp`, même `as` (troncature vers
-    /// zéro, défaut E, inchangé). Pas de ligne de journal : le mixeur n'a pas
-    /// de piste. `mix_into`, appelable depuis un rappel temps réel, n'est
-    /// pas touché.
+    /// #2218 (T9) — compte ce que l'écriture ramène au rail dans le registre
+    /// du processus (`dsp_ecretage.mixeur`). Pas de ligne de journal : le
+    /// mixeur n'a pas de piste.
+    ///
+    /// #4076 — l'écriture ne tronque plus vers zéro. Elle passe par
+    /// [`SampleFormat::write_quantifie`] : dither TPDF ±1 LSB, puis arrondi au
+    /// plus proche, puis saturation. Deux points tiennent ce changement :
+    ///
+    /// * **Gain ENTIER ⇒ aucun dither** (`Dither::pour_facteur`). Le produit
+    ///   est alors un entier, l'arrondi est exact, et les octets sortent tels
+    ///   quels : le témoin `q4_les_etages_desarmes_sont_l_identite_octet_pour_octet`
+    ///   passe `1.0` ici et attend le tampon inchangé, et `A_MIXEUR_X2_16B`
+    ///   (`ecretage_compte_2218.rs`) tient l'octet à `2.0`.
+    /// * **Le comptage d'écrêtage ne bouge pas d'un poil.** Il compte la
+    ///   valeur IDÉALE (produit avant saturation) contre le rail, donc ni le
+    ///   bruit ni l'arrondi n'entrent dans sa condition. Un échantillon
+    ///   écrêté par le gain reste compté ; un échantillon que seul le bruit
+    ///   pousserait au rail n'est pas compté comme écrêté — il ne l'est pas
+    ///   par le gain.
+    ///
+    /// `mix_into`, appelable depuis un rappel temps réel, n'est **pas** touché :
+    /// l'issue nomme `apply_gain`, et dériver une graine du contenu demande une
+    /// passe sur le tampon qui n'a rien à faire dans un rappel audio.
     pub fn apply_gain(data: &mut [u8], gain: f32, bit_depth: u16) -> Result<(), MixError> {
         let format = SampleFormat::from_bit_depth(bit_depth)?;
         let width = format.bytes();
         let (lo, hi) = format.range();
         let pleine_echelle = -lo;
+        // Pas de requantification, pas de dither : `pour_facteur` rend `None`
+        // pour tout gain ENTIER — 1 (étage désarmé), 2, 0 — parce qu'un tel
+        // gain envoie un entier sur un entier, sans rien perdre.
+        let mut dither = crate::audio::dither::Dither::pour_facteur(
+            crate::audio::dither::Etage::Melangeur,
+            data,
+            f64::from(gain),
+        );
         let mut compteur = crate::audio::ecretage::CompteurDEcretage::default();
         for (i, chunk) in data.chunks_exact_mut(width).enumerate() {
             let value = format.read(chunk) as f64 * gain as f64;
@@ -303,7 +353,8 @@ impl PcmMixer {
             } else if value < lo {
                 compteur.noter_ecrete(i as u64, lo - value, -value / pleine_echelle);
             }
-            format.write(value, chunk);
+            let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+            format.write_quantifie(value, bruit, chunk);
         }
         compteur.noter_vus((data.len() / width) as u64);
         crate::audio::ecretage::REGISTRE.mixeur.absorber(
