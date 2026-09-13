@@ -55,6 +55,16 @@ const LOCAL_RS: &str = include_str!("../../tune-core/src/outputs/local.rs");
 // la fermeture `refuser_le_porteur_dop` et l'étage restent dans `local.rs`.
 // La garde lit les deux fichiers concaténés, jamais l'un à la place de l'autre.
 const BACKEND_RS: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
+// REF-8 (#2219) : la SECONDE route « décision DoP », celle des bras Windows
+// exclusifs sur anneau entier (`local/etage_natif.rs`). Elle ne refuse pas le
+// porteur : elle le porte. Voir `la_route_native_porte_le_porteur_dop_et_le_dit`.
+const ETAGE_NATIF_RS: &str = include_str!("../../tune-core/src/outputs/local/etage_natif.rs");
+
+// REF-8 (#2219) : le bras ASIO monte l'étage de R1 sur sa route traitée avec
+// une fermeture qui refuse TOUT porteur DoP — la seconde route « refuser puis
+// convertir », que cette garde doit nommer, et dont elle prouve l'ABSENCE sur
+// la route native (le DoP y est porté, jamais refusé).
+const BRAS_ASIO_RS: &str = include_str!("../../tune-core/src/outputs/local/bras_asio.rs");
 
 /// La production seule : `local.rs` se termine par `#[cfg(test)] mod tests`,
 /// dont le texte citerait nos propres motifs et rendrait la garde complaisante.
@@ -289,6 +299,91 @@ fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
     );
 }
 
+/// REF-8 (#2219) — la route TRAITÉE d'ASIO passe par la route unique de R1
+/// avec une fermeture qui refuse tout porteur (`|dop, _, _| dop`), et le
+/// refus est rapporté sous le motif d'avant (`DopUnsupported`, `"ASIO"`).
+/// La route NATIVE, elle, ne refuse rien : un `PorteurDopRefuse` n'y existe
+/// pas, le porteur traverse intact.
+#[test]
+fn la_route_traitee_d_asio_refuse_tout_porteur_et_la_native_n_en_refuse_aucun() {
+    // Les virgules finales que `rustfmt` pose ou retire selon la longueur
+    // d'une ligne ne disent rien de la route : elles sont effacées.
+    let source = sans_commentaires_ni_blancs(BRAS_ASIO_RS)
+        .replace(",}", "}")
+        .replace(",)", ")");
+    assert!(
+        source.contains("letmutrefuser_tout_porteur=|dop:bool,_:u32,_:u16|dop;")
+            && source.contains("letmutne_rien_refuser=|_:bool,_:u32,_:u16|false;"),
+        "#3233/REF-8 — les deux fermetures du bras ASIO ont changé : `refuser_tout_porteur` \
+         (route traitée) doit refuser dès que `dop` est vrai, `ne_rien_refuser` (route native) \
+         ne jamais refuser"
+    );
+    // L'amorce : la route traitée reçoit la fermeture qui refuse, la native
+    // celle qui ne refuse rien.
+    let amorce = source
+        .split("letamorce_poussee=match&mutroute{")
+        .nth(1)
+        .and_then(|s| s.split("};matchamorce_poussee{").next())
+        .expect("l'amorce du bras ASIO doit rester identifiable");
+    assert!(
+        amorce.contains(
+            "Route::Native{etage,puits}=>{etage.recevoir(amorce);etage.pousser(&mut**puits,&mutne_rien_refuser,"
+        ) && amorce.contains(
+            "Route::Flottante{etage,puits,contrat}=>{etage.recevoir(amorce);letpoussee=etage.pousser(&mut**puits,&mutrefuser_tout_porteur,"
+        ),
+        "#3233/REF-8 — à l'amorce, la route traitée d'ASIO ne passe plus par `pousser` avec la \
+         fermeture qui refuse TOUT porteur DoP (ou la native refuse) : un DoP traverserait la \
+         conversion flottante et sortirait en bruit blanc"
+    );
+    // La boucle commune : mêmes fermetures, mêmes routes.
+    let boucle = source
+        .split("letfin=match&mutroute{")
+        .nth(1)
+        .and_then(|s| {
+            s.split("};total_frames_fed=compteurs.total_frames_fed;")
+                .next()
+        })
+        .expect("l'appel de la boucle commune par le bras ASIO doit rester identifiable");
+    assert!(
+        boucle.contains(
+            "Route::Native{etage,puits}=>producteur.tourner(&mutsource,&muttampon_de_lecture,etage,&mut**puits,&mutne_rien_refuser,"
+        ) && boucle.contains(
+            "Route::Flottante{etage,puits,contrat}=>producteur.tourner(&mutsource,&muttampon_de_lecture,etage,&mut**puits,&mutrefuser_tout_porteur,"
+        ),
+        "#3233/REF-8 — dans la boucle commune, la route traitée d'ASIO ne reçoit plus la \
+         fermeture qui refuse TOUT porteur DoP (ou la native en reçoit une qui refuse)"
+    );
+    // Le refus est rapporté sous le motif d'avant, aux deux sorties.
+    assert!(
+        source.contains(
+            "PousseeVersLePuits::PorteurDopRefuse=>{pcm_refusal=Some(WindowsExclusivePcmError::DopUnsupported);}"
+        ) && source.contains(
+            "FinDeBoucle::PorteurDopRefuse=>{pcm_refusal=Some(WindowsExclusivePcmError::DopUnsupported);}"
+        ),
+        "#3233/REF-8 — le refus DoP de la route traitée n'est plus rapporté sous \
+         `DopUnsupported` (amorce ou boucle) : l'écran perd sa cause"
+    );
+    assert!(
+        source.contains("record_windows_exclusive_pcm_refusal(error,\"ASIO\","),
+        "#3233/REF-8 — le refus n'est plus rapporté par `record_windows_exclusive_pcm_refusal` \
+         avec \"ASIO\""
+    );
+    // La route native, vue par le trait : elle décode et pousse, ne consulte
+    // jamais la fermeture, et ne rend jamais `PorteurDopRefuse`.
+    let native = source
+        .split("implEtageforEtageNatifAsio<'_>{")
+        .nth(1)
+        .and_then(|s| s.split("enumRoute<'a>{").next())
+        .expect("l'étage natif d'ASIO (`impl Etage for EtageNatifAsio`) doit rester identifiable");
+    assert!(
+        native.contains("self.etage.decoder_et_pousser(")
+            && !native.contains("PorteurDopRefuse")
+            && !native.contains("refuser_le_porteur_dop("),
+        "#3233/REF-8 — la route native d'ASIO refuse un porteur DoP : elle doit le PORTER \
+         (mots entiers, marqueurs intacts), le refus n'appartient qu'à la route flottante"
+    );
+}
+
 /// REF-7 (#2219) — l'étage flottant n'a qu'UN site d'écriture au puits.
 ///
 /// La garde de positions ci-dessus enferme l'ordre refus < conversion <
@@ -397,4 +492,78 @@ fn la_decision_de_cadence_reste_branchee_et_le_filtre_tautologique_n_est_pas_rev
         "#3233 — une décision qui change ce qui part au DAC doit atteindre le \
          client : sans `note_rate_decision`, il ne reste que le journal"
     );
+}
+
+/// REF-8 (#2219) — la SECONDE route « décision DoP », nommée.
+///
+/// La route cpal partagée REFUSE le porteur DoP avant toute conversion : le
+/// sinc le détruirait. La route native des bras Windows exclusifs (WASAPI,
+/// ASIO natif) n'a ni sinc ni adaptation de canaux : le mot part entier,
+/// aligné à gauche, jusqu'au DAC. Elle ne refuse donc PAS le porteur — elle
+/// le **détecte** (`is_dop_pcm` sur la première fenêtre 24 bits, verrouillé
+/// par `dop_latched`), le **porte** tel quel (branche brute de
+/// `prepare_windows_native_pcm` : ni volume, ni DSP) et le **dit** (`dop`
+/// dans `EcritureNative::Poussee`). Ce test verrouille ces trois gestes, pour
+/// qu'une « unification » des deux routes ne fasse pas refuser à WASAPI un
+/// DoP qu'il joue aujourd'hui — ni ne fasse taire la décision.
+///
+/// La preuve d'exécution vit sur Shrek : `empreinte_wasapi_f70496` joue la
+/// fixture DoP versionnée à travers l'étage, le puits, l'anneau et
+/// `pop_pcm_bytes`, octet pour octet.
+#[test]
+fn la_route_native_porte_le_porteur_dop_et_le_dit() {
+    let etage = sans_commentaires_ni_blancs(
+        ETAGE_NATIF_RS
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("etage_natif.rs garde son `mod tests` en fin de fichier"),
+    );
+    let corps = etage
+        .split("fndecoder_et_pousser(")
+        .nth(1)
+        .and_then(|s| s.split("fnrendre_la_queue(").next())
+        .expect("REF-8 — `EtageNatif::decoder_et_pousser` doit rester identifiable");
+    assert!(
+        corps.contains("prepare_windows_native_pcm(")
+            && corps.contains("self.must_classify_24_bit,")
+            && corps.contains("self.dop_latched,"),
+        "REF-8 — la route native ne décide plus le DoP par `prepare_windows_native_pcm` \
+         (sonde 24 bits + verrou) : un porteur DoP serait traité comme du PCM, volume et DSP \
+         compris, et le DAC quitterait le mode DSD"
+    );
+    assert!(
+        corps.contains("self.dop_latched=prepared.dop;"),
+        "REF-8 — la décision DoP n'est plus verrouillée : un flux mal formé pourrait \
+         basculer à une frontière de bloc"
+    );
+    assert!(
+        !corps.contains("refuser_le_porteur_dop") && !corps.contains("PorteurDopRefuse"),
+        "REF-8 — la route native REFUSE le porteur DoP : elle le portait tel quel, et c'est \
+         ce que les testeurs WASAPI écoutent (Pierre M, fil 1043)"
+    );
+    assert!(
+        corps.contains("dop:prepared.dop,"),
+        "REF-8 — la route native ne dit plus si elle porte du DoP : la zone ne peut plus \
+         afficher le mode DSD ni caler le volume dessus"
+    );
+
+    // La branche brute de la préparation : DoP ⇒ `bit_perfect`, donc aucune
+    // arithmétique — c'est `local.rs` qui la tient, et elle doit y rester.
+    let preparation = sans_commentaires_ni_blancs(&production());
+    let corps = preparation
+        .split("fnprepare_windows_native_pcm(")
+        .nth(1)
+        .and_then(|s| s.split("Some(PreparedNativePcm{").next())
+        .expect("#3233 — `prepare_windows_native_pcm` doit rester identifiable");
+    assert!(
+        corps
+            .contains("letdop=dop_latched||(bit_depth==24&&is_dop_pcm(bytes,bit_depth,channels));")
+            && la_branche_brute_protege_le_dop(corps),
+        "REF-8 — la branche brute de `prepare_windows_native_pcm` ne protège plus le DoP du \
+         volume et du DSP"
+    );
+}
+
+fn la_branche_brute_protege_le_dop(corps: &str) -> bool {
+    corps.contains("letbit_perfect=dop||(volume_units==1000&&local_dsp_is_identity(")
 }

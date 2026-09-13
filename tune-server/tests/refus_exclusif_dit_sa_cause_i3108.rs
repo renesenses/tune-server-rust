@@ -52,6 +52,9 @@ const BRAS_WASAPI: &str = include_str!("../../tune-core/src/outputs/local/bras_w
 // REF-8 (#2219) : le backend CPAL partagé (trait `BackendLocal`, anneau, cascade
 // d'ouverture, vidage) — lu EN PLUS de `local.rs`, jamais à sa place.
 const BACKEND: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
+// REF-8 (#2219) : l'étage natif des bras Windows (`local/etage_natif.rs`) —
+// la préparation, la queue du DSP et le puits d'anneau de WASAPI y vivent.
+const ETAGE_NATIF: &str = include_str!("../../tune-core/src/outputs/local/etage_natif.rs");
 // REF-8 (#2219) : la sortie CoreAudio exclusive possède son anneau (D2) — sa
 // contenance vit là, et la garde qui la tenait la suit, sans cesser de lire
 // le bras.
@@ -66,6 +69,7 @@ fn toute_la_sortie_locale() -> String {
     [
         LOCAL,
         BACKEND,
+        ETAGE_NATIF,
         BRAS_COREAUDIO,
         BRAS_ASIO,
         BRAS_WASAPI,
@@ -154,12 +158,29 @@ fn appelle_avec(texte: &str, nom: &str, argument: &str) -> bool {
 #[test]
 fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
     let sortie_locale = toute_la_sortie_locale();
-    for transport in ["ASIO", "WASAPI"] {
+    // REF-8 (#2219) : un bras qui implémente `BackendLocal` ne rapporte plus
+    // en ligne — il rend `RefusDOuverture::OuvertureExclusiveRefusee { backend:
+    // "<transport>", … }` et `play_url` appelle `rapporter`, qui passe par
+    // `record_exclusive_open_failure(backend, …)`. Les deux formes valent, à
+    // condition que la seconde soit réellement branchée : le bras du
+    // `match` de `rapporter` doit appeler le rapporteur.
+    let rapporter_branche = {
+        let sans_blancs: String = BACKEND.chars().filter(|c| !c.is_whitespace()).collect();
+        sans_blancs.contains(
+            "RefusDOuverture::OuvertureExclusiveRefusee{backend,erreur}=>{\
+             record_exclusive_open_failure(backend,device_name,erreur,open_failure);",
+        )
+    };
+    for transport in ["CoreAudio", "ASIO", "WASAPI"] {
+        let en_ligne = appelle_avec(&sortie_locale, "record_exclusive_open_failure(", transport);
+        let type_ = rapporter_branche
+            && appelle_avec(&sortie_locale, "OuvertureExclusiveRefusee {", transport);
         assert!(
-            appelle_avec(&sortie_locale, "record_exclusive_open_failure(", transport),
-            "aucun site n'appelle `record_exclusive_open_failure` pour {transport} : un refus \
-             d'ouverture exclusive sur ce transport redevient muet, la zone reste figée sans \
-             message (#3108)"
+            en_ligne || type_,
+            "aucun site n'appelle `record_exclusive_open_failure` pour {transport}, ni en \
+             ligne ni par `RefusDOuverture::OuvertureExclusiveRefusee` + `rapporter` : un \
+             refus d'ouverture exclusive sur ce transport redevient muet, la zone reste \
+             figée sans message (#3108)"
         );
     }
 
@@ -213,6 +234,73 @@ fn les_trois_transports_exclusifs_arment_le_canal_sur_un_refus_d_ouverture() {
              lecture » sur un périphérique jamais ouvert (#3108)"
         );
     }
+    // WASAPI a DEUX sites de refus, `new` et `start` (carte §1.2, l. 5473 et
+    // 5777 sur `210e2a81`) : les deux doivent rendre le refus typé.
+    assert_eq!(
+        BRAS_WASAPI.matches("backend: \"WASAPI\",").count(),
+        2,
+        "le bras WASAPI doit rendre `OuvertureExclusiveRefusee {{ backend: \"WASAPI\", … }}` \
+         sur ses DEUX sites de refus, `ouvrir` (`new`) et `demarrer` (`start`) — l'un des \
+         deux est redevenu muet (#3108, REF-8)"
+    );
+}
+
+/// REF-8 (#2219) — le bras ASIO, passé au trait, garde les maillons 2 et 3 :
+/// le verdict de blocage du puits (rappel mort, anneau jamais drainé) est
+/// relu et rapporté avec la position figée — il était JETÉ avant REF-8, seul
+/// chemin de lecture à l'ignorer avec WASAPI —, et le vidage reste
+/// doublement borné (`asio_drain_timeout`, dans `drainer`).
+#[test]
+fn le_bras_asio_rapporte_son_blocage_et_borne_son_vidage() {
+    // REF-7 (#2219) : la famine est rapportée UNE fois, par la boucle commune,
+    // avec le nom que `BackendLocal::nom` rend. Le bras ASIO doit donc
+    // (1) rendre "ASIO", (2) passer par la boucle commune sur ses DEUX routes
+    // avec ce nom — sinon le rapport dit « CPAL » ou ne part pas.
+    assert!(
+        BRAS_ASIO.contains("fn nom(&self) -> &'static str {\n        \"ASIO\"\n    }"),
+        "le backend ASIO ne dit plus son nom : le rapport de famine de la boucle commune le \
+         nommerait autrement, ou pas du tout (#3108, REF-8)"
+    );
+    assert!(
+        BRAS_ASIO.contains("backend: backend.nom(),")
+            && BRAS_ASIO.matches(".tourner(").count() >= 2,
+        "le bras ASIO ne passe plus par `BoucleProducteur::tourner` avec `backend.nom()` sur ses \
+         deux routes : un `PuitsMort` dont le verdict retombe dans le vide rend la zone muette \
+         et figée sur la position atteinte (#3108, REF-8)"
+    );
+    let boucle = LOCAL
+        .split("    fn tourner<E: Etage>(")
+        .nth(1)
+        .and_then(|s| s.split("\n#[async_trait::async_trait]").next())
+        .expect("la boucle producteur commune doit rester identifiable (#3108)");
+    assert!(
+        boucle.contains("record_feed_stall_failure(") && boucle.contains("self.backend,"),
+        "la boucle commune ne rapporte plus la famine avec le nom du backend : ASIO redevient \
+         muet (#3108, REF-7)"
+    );
+    assert!(
+        BRAS_ASIO.matches("\"asio_drain_timeout\"").count() >= 2,
+        "le vidage ASIO n'a plus ses deux bornes (échéance ET détecteur de blocage) : face à \
+         un pilote figé il ne se vide jamais et le verrou ASIO reste pris (#789, bug-22)"
+    );
+}
+
+/// La « figée à 2 s » vaut aussi pour ASIO : ses deux anneaux, désormais créés
+/// par `AsioExclusiveOutput::new` (REF-8, D2), tiennent deux secondes à la
+/// cadence de la source. Même garde que pour CoreAudio et CPAL.
+#[test]
+fn l_anneau_asio_exclusif_tient_les_deux_secondes_du_constat() {
+    const ASIO: &str = include_str!("../../tune-core/src/outputs/asio_exclusive.rs");
+    assert!(
+        ASIO.contains("let ring_cap = (sample_rate as usize) * (channels as usize) * 2;"),
+        "la contenance des anneaux ASIO exclusifs a changé : c'est elle qui produit le \
+         « figée à 2 s » du constat de #3108 — mettre à jour le message et cette garde ensemble"
+    );
+    assert!(
+        !BRAS_ASIO.contains("let ring_cap ="),
+        "le bras ASIO recalcule une contenance d'anneau : le backend possède ses anneaux (D2), \
+         `play_url` et ses bras n'en créent plus (REF-8, #2219)"
+    );
 }
 
 /// Maillon 2 — la branche « figée à 2 s » du constat.

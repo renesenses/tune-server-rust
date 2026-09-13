@@ -310,6 +310,12 @@ mod bras_coreaudio;
 #[cfg(target_os = "windows")]
 mod bras_wasapi;
 
+// REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
+// → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
+// `NativePcmRing`. Même `cfg` que les aides qu'il appelle : jugé sur Shrek.
+#[cfg(any(target_os = "windows", test))]
+mod etage_natif;
+
 // REF-8 (#2219) : le trait backend minimal et son premier implémenteur, CPAL
 // partagé. Le bras CPAL de `play_url` l'appelle : ouvrir, puits, démarrer,
 // observer, drainer.
@@ -4853,6 +4859,7 @@ impl OutputTarget for LocalOutput {
                     sample_rate,
                     bit_depth,
                     channels,
+                    spec,
                     data_offset,
                     header_buf,
                     reader,
@@ -4893,13 +4900,12 @@ impl OutputTarget for LocalOutput {
                 bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
                     device_name,
                     endpoint_id,
-                    sample_rate,
-                    bit_depth,
-                    channels,
+                    audio_backend,
+                    spec,
+                    soft_mute,
                     data_offset,
                     header_buf,
                     reader,
-                    frame_bytes,
                     seek_offset,
                     my_generation,
                     starvation,
@@ -6501,6 +6507,17 @@ mod empreinte_coreaudio_f70496;
 /// décodeur de référence. Voir son en-tête pour ce qu'il ne couvre pas.
 #[cfg(test)]
 mod capture_bout_en_bout_2218;
+
+/// REF-8 (#2219) — les empreintes du bras WASAPI, relevées AVANT son passage
+/// au puits natif (`49ecf1fe`) : 16 bits identité, 24 bits identité, DoP.
+#[cfg(test)]
+mod empreinte_wasapi_f70496;
+
+/// REF-8 (#2219) — les empreintes des deux routes du bras ASIO, relevées AVANT
+/// son passage au trait (`49ecf1fe`) : route native 16 et 24 bits identité,
+/// DoP, volume ; route flottante 16 bits par l'étage de R1, refus DoP.
+#[cfg(test)]
+mod empreinte_asio_f70496;
 
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]
