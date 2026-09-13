@@ -244,12 +244,19 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
         .flatten()
         .map(|z| z.muted)
         .unwrap_or(false);
+    let volume = if tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id)
+        && tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id)
+    {
+        100
+    } else {
+        (ps.volume.clamp(0.0, 1.0) * 100.0).round() as u8
+    };
     RendererSnapshot {
         transport_state,
         position_ms: ps.position_ms,
         duration_ms,
         uri: session.uri,
-        volume: (ps.volume.clamp(0.0, 1.0) * 100.0).round() as u8,
+        volume,
         muted,
     }
 }
@@ -445,13 +452,25 @@ async fn renderingcontrol_control(
             upnp_renderer::volume_response(&snapshot(&state, zone_id).await)
         }
         RendererCommand::SetVolume(v) => {
-            match state
-                .orchestrator
-                .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
-                .await
-            {
-                Ok(()) => upnp_renderer::empty_response("SetVolume"),
-                Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+            let volume_locked =
+                tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id)
+                    && tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id);
+            if volume_locked {
+                info!(
+                    zone_id,
+                    requested_v = v,
+                    "upnp_renderer_set_volume_locked_bitperfect_preserved"
+                );
+                upnp_renderer::empty_response("SetVolume")
+            } else {
+                match state
+                    .orchestrator
+                    .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
+                    .await
+                {
+                    Ok(()) => upnp_renderer::empty_response("SetVolume"),
+                    Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+                }
             }
         }
         RendererCommand::GetMute => upnp_renderer::mute_response(&snapshot(&state, zone_id).await),
