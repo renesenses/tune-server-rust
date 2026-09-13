@@ -124,11 +124,12 @@ async fn le_play_suit_le_playlistadd_sans_seconde_declaration_xml() {
     );
 
     // 2. Le `Play` est bien là, et il suit le `PlaylistAdd`.
+    //    (chercher `<Play />` et non `<Play` : `<PlaylistAdd` commence pareil.)
     let pos_add = sur_le_fil
         .find("<PlaylistAdd")
         .unwrap_or_else(|| panic!("pas de PlaylistAdd sur le fil :\n{sur_le_fil}"));
     let pos_play = sur_le_fil
-        .find("<Play")
+        .find("<Play />")
         .unwrap_or_else(|| panic!("pas de Play sur le fil :\n{sur_le_fil}"));
     assert!(
         pos_add < pos_play,
@@ -142,7 +143,7 @@ async fn le_play_suit_le_playlistadd_sans_seconde_declaration_xml() {
         "l'URL du flux doit partir intacte :\n{sur_le_fil}"
     );
     assert!(
-        sur_le_fil.contains("</PlaylistAdd>\n<Play"),
+        sur_le_fil.contains("</PlaylistAdd>\n<Play />"),
         "chaque commande est terminée par un saut de ligne, pour que deux \
          commandes consécutives restent distinctes dans le flux :\n{sur_le_fil}"
     );
