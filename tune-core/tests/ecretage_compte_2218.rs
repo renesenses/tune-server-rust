@@ -11,12 +11,15 @@
 //! comptage, par un témoin temporaire non publié. Les 14 témoins de T9 et ses
 //! 5 ignorés restent inchangés à côté.
 //!
-//! Le journal est capturé par un abonné `tracing_subscriber::fmt` sur le fil
-//! du test (`with_default`) : deux lignes `dsp_ecretage` par piste et par
-//! étage, jamais une par bloc.
+//! Le journal est capturé par un abonné `tracing_subscriber::fmt` GLOBAL,
+//! posé une fois pour le processus, qui écrit dans un tampon PROPRE AU FIL :
+//! deux lignes `dsp_ecretage` par piste et par étage, jamais une par bloc.
+//! Voir [`capturer`] pour la raison — un abonné de fil (`with_default`) ne
+//! capte rien ici.
 
+use std::cell::RefCell;
 use std::f64::consts::PI;
-use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 use tune_core::audio::ecretage::{CompteurDEcretage, releve};
 use tune_core::audio::eq::{EqBandSpec, EqProcessor, EqProfile};
@@ -197,18 +200,21 @@ fn passe_bas_q4() -> EqProcessor {
 
 // ───────────── capture du journal ─────────────
 
-#[derive(Clone, Default)]
-struct JournalCapture(Arc<Mutex<Vec<u8>>>);
-
-impl JournalCapture {
-    fn texte(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
-    }
+thread_local! {
+    /// Le journal du fil courant. Un tampon PAR FIL, donc par essai : libtest
+    /// donne un fil à chacun, et deux essais qui écrêtent en même temps ne se
+    /// mélangent pas.
+    static TAMPON: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-impl std::io::Write for JournalCapture {
+/// L'écrivain de l'abonné global : il range chaque ligne dans le tampon du fil
+/// qui l'a émise.
+#[derive(Clone, Copy, Default)]
+struct VersLeFil;
+
+impl std::io::Write for VersLeFil {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        TAMPON.with(|t| t.borrow_mut().extend_from_slice(buf));
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -216,23 +222,44 @@ impl std::io::Write for JournalCapture {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
-    type Writer = JournalCapture;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for VersLeFil {
+    type Writer = VersLeFil;
     fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        VersLeFil
     }
+}
+
+/// Pose l'abonné GLOBAL, une fois pour le processus.
+///
+/// Il DOIT être global, et non posé sur le fil de l'essai le temps d'un
+/// `with_default` : `tracing` met en cache POUR TOUT LE PROCESSUS la décision
+/// « ce point d'appel intéresse-t-il quelqu'un ? » et le niveau maximal utile.
+/// Avec un abonné de fil, les sept voisins de ce binaire — qui écrêtent eux
+/// aussi, sans abonné — figent le point d'appel `dsp_ecretage` à « personne »,
+/// et le témoin du journal relevait alors ZÉRO ligne quel que soit le
+/// comportement du code (mesuré : vert seul, rouge 20 fois sur 20 à
+/// `--test-threads=4`, journal entièrement vide). Un abonné global est
+/// enregistré avant le premier écrêtage et ne meurt jamais : le point d'appel
+/// reste intéressant pour la durée du processus.
+fn abonne_global() {
+    static POSE: OnceLock<()> = OnceLock::new();
+    POSE.get_or_init(|| {
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(VersLeFil)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(abonne)
+            .expect("aucun autre abonné global dans ce binaire");
+    });
 }
 
 /// Tout ce que `f` émet au niveau WARN et au-dessus, sur ce fil.
 fn capturer(f: impl FnOnce()) -> String {
-    let journal = JournalCapture::default();
-    let abonne = tracing_subscriber::fmt()
-        .with_writer(journal.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    tracing::subscriber::with_default(abonne, f);
-    journal.texte()
+    abonne_global();
+    TAMPON.with(|t| t.borrow_mut().clear());
+    f();
+    TAMPON.with(|t| String::from_utf8_lossy(&t.borrow()).into_owned())
 }
 
 fn lignes_ecretage(journal: &str) -> Vec<&str> {
