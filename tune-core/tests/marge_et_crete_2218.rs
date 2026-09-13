@@ -306,11 +306,19 @@ fn profil(bands: Vec<EqBandSpec>) -> EqProfile {
 // ═════════════════════════ Q1 — gain, écrêtage, nommage ═════════════════════════
 
 /// Sinus 997 Hz à −0,1 dBFS, 16 bits ; ReplayGain +6 dB SANS pic tagué,
-/// `prevent_clipping` armé. Mesuré : le facteur reste ×1,995 (+6 dB), 66 % des
-/// échantillons sont écrêtés DUR (saturation, pas d'enroulement), et
-/// `apply_gain_pcm` ne rend rien : ni compteur, ni journal.
+/// `prevent_clipping` **désarmé**. Mesuré : le facteur reste ×1,995 (+6 dB),
+/// 66 % des échantillons sont écrêtés DUR (saturation, pas d'enroulement).
+///
+/// 🔴 **#4072 a changé l'armement, pas la saturation.** Ce témoin mesurait le
+/// même stimulus avec `prevent_clipping` ARMÉ, et c'était le défaut A de T9 :
+/// le garde-fou ne retenait rien sans pic tagué. Depuis le correctif, armé, le
+/// facteur ne dépasse plus l'unité — c'est le jumeau ci-dessous qui le tient.
+/// Ce que ce témoin garde toujours, désarmé, c'est le comportement de
+/// `apply_gain_pcm` lui-même : saturation dure au rail, signe conservé, aucun
+/// enroulement. L'auditeur qui décoche la case obtient exactement cela, et les
+/// chiffres de T9 restent mesurés, à l'échantillon près.
 #[test]
-fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur_sans_le_dire() {
+fn q1_replaygain_sans_garde_fou_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur() {
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 16);
     let entree = depuis_pcm(&pcm, 16);
@@ -320,11 +328,11 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
             gain_db: 6.0,
             peak: None,
         },
-        reglages(true, 0.0),
+        reglages(false, 0.0),
     );
     assert!(
         (facteur - 1.9953).abs() < 1e-3,
-        "sans pic tagué, prevent_clipping ne retient rien : facteur ×{facteur:.4} (+6 dB)"
+        "garde-fou désarmé : rien ne retient le facteur ×{facteur:.4} (+6 dB)"
     );
     assert_eq!(
         gain_factor(
@@ -332,10 +340,10 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
                 gain_db: 30.0,
                 peak: None
             },
-            reglages(true, 0.0)
+            reglages(false, 0.0)
         ),
         4.0,
-        "le seul plafond du facteur est le clamp ×4 (+12 dB) de gain_factor"
+        "désarmé, le seul plafond du facteur est le clamp ×4 (+12 dB) de gain_factor"
     );
 
     let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * facteur).collect();
@@ -381,13 +389,22 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
     );
 }
 
-/// Le comportement ATTENDU : `prevent_clipping` armé ⇒ aucun échantillon
-/// écrêté, pic tagué ou non.
+/// Le comportement ATTENDU, **tenu depuis #4072** : `prevent_clipping` armé ⇒
+/// aucun échantillon écrêté, pic tagué ou non.
+///
+/// Le témoin était `#[ignore]` — c'était le défaut A de T9. Il est réveillé
+/// par le correctif : sans pic tagué, `gain_factor` refuse le gain positif en
+/// entier (l'unité, pas le plafond dBTP), et les octets sortent intacts.
+///
+/// Ce qu'il garde, et qui rougirait si le refus disparaissait : le nombre
+/// d'écrêtés contre l'IDÉAL (0), le compteur du registre (0), et l'identité
+/// octet pour octet du PCM — un facteur simplement raboté à 0,99 passerait le
+/// premier et pas le troisième.
 #[test]
-#[ignore = "défaut connu : sans pic tagué, prevent_clipping n'empêche rien et apply_gain_pcm écrête dur sans compter (docs/mesures/2218-marge-ecretage-crete-vraie.md, issue A)"]
-fn q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague() {
+fn q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague() {
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 16);
+    let original = pcm.clone();
     let entree = depuis_pcm(&pcm, 16);
     let facteur = gain_factor(
         TrackGain {
@@ -396,12 +413,27 @@ fn q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic
         },
         reglages(true, 0.0),
     );
+    eprintln!("q1 prevent_clipping armé, +6 dB sans pic : facteur ×{facteur:.6}");
+    assert!(
+        facteur <= 1.0,
+        "sans pic tagué, le facteur ne doit jamais amplifier : ×{facteur:.6}"
+    );
     let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * facteur).collect();
     apply_gain_pcm(&mut pcm, 16, facteur);
-    let (n_ecretes, _) = ecretes(&ideal, 16);
+    let (n_ecretes, exces_lsb) = ecretes(&ideal, 16);
     assert_eq!(
         n_ecretes, 0,
-        "prevent_clipping est armé : aucun échantillon ne devrait dépasser le rail"
+        "prevent_clipping est armé : aucun échantillon ne devrait dépasser le rail (excès max {exces_lsb:.0} LSB)"
+    );
+    assert_eq!(
+        pcm, original,
+        "un gain refusé est l'identité : pas un octet ne bouge"
+    );
+    let sortie = depuis_pcm(&pcm, 16);
+    assert_eq!(
+        au_rail(&sortie, 16),
+        0,
+        "aucun échantillon posé sur le rail"
     );
 }
 

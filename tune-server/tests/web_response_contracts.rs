@@ -942,3 +942,86 @@ async fn la_carte_web_ne_cite_que_des_routes_encore_servies() {
         fantomes.join("\n    ")
     );
 }
+
+/// 🔴 #2218 — la plage dynamique n'était comptée NULLE PART.
+///
+/// Le DR s'affiche par piste et par album, se filtre à la recherche (`dr=14`),
+/// mais aucune route ne disait combien de pistes en avaient un, ni d'où il
+/// venait. La vue Processing ne pouvait donc pas en parler, alors qu'elle a
+/// une carte pour chacune des cinq autres passes de fond.
+///
+/// Ce témoin joue la ROUTE réelle — `GET /library/stats/completeness` sur une
+/// app montée avec sa base — et non le SQL en vase clos : c'est la route que
+/// le client appelle, c'est elle qui doit répondre.
+///
+/// La distinction `tag` / `analysis` est le cœur du témoin. Un DR lu dans les
+/// tags du fichier vaut ce que vaut le tagueur qui l'a écrit ; un DR
+/// `analysis` a été mesuré par Tune. Les additionner sans les distinguer
+/// laisserait croire à une bibliothèque homogène qui ne l'est pas.
+#[tokio::test]
+async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
+    let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
+        .expect("etat serveur isole");
+    let pistes = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let meta =
+        tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
+
+    let mut poser = |nom: &str| -> i64 {
+        let mut t = tune_core::db::models::Track::new(nom.into());
+        t.file_path = Some(format!("/music/{nom}.flac"));
+        pistes.create(&t).expect("piste temoin")
+    };
+
+    // Une piste dont le DR a été MESURÉ par la passe.
+    let mesuree = poser("dr-mesuree");
+    meta.set(mesuree, "dr_track", "12").expect("dr mesure");
+    meta.set(mesuree, "dr_source", "analysis").expect("source");
+
+    // Une piste dont le DR vient des TAGS du fichier.
+    let taguee = poser("dr-taguee");
+    meta.set(taguee, "dr_track", "8").expect("dr tague");
+    meta.set(taguee, "dr_source", "tag").expect("source");
+
+    // Une piste que la passe a essayée et écartée pour de bon : elle ne doit
+    // pas gonfler « ce qui reste à faire ».
+    let ecartee = poser("dr-indisponible");
+    meta.set(ecartee, "dr_indisponible", "1").expect("ecartee");
+
+    // Et une piste vierge, pour que le total ne soit pas égal au compte.
+    let _vierge = poser("dr-absent");
+
+    let app = tune_server::routes::router(etat);
+    let p = get_json(&app, "/api/v1/library/stats/completeness")
+        .await
+        .unwrap_or_else(|erreur| panic!("{erreur}"));
+
+    assert_eq!(
+        p["with_dynamic_range"], 2,
+        "deux pistes portent un DR — la mesurée et la taguée. payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_from_analysis"], 1,
+        "une seule a été MESURÉE par Tune : mélanger les deux sources \
+         laisserait croire à une bibliothèque homogène. payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_from_tag"], 1,
+        "une seule vient des tags du fichier. payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_unavailable"], 1,
+        "la piste écartée pour de bon doit être comptée à part : elle ne \
+         reviendra jamais et fausse « ce qui reste ». payload={p}"
+    );
+
+    // Contre-épreuve — le pourcentage porte sur le TOTAL des pistes, pas sur
+    // celles qui ont un DR : 2 sur 4 vierges comprises.
+    assert_eq!(
+        p["dynamic_range_pct"], 50.0,
+        "2 pistes avec DR sur 4 au total. payload={p}"
+    );
+    assert_eq!(
+        p["total_tracks"], 4,
+        "le dénominateur est bien le total. payload={p}"
+    );
+}
