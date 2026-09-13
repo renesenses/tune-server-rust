@@ -645,6 +645,88 @@ fn piste_finie_sans_la_moindre_observation(state: &ZoneState, marge: std::time::
     ouverture.elapsed() >= std::time::Duration::from_millis(reste_ms) + marge
 }
 
+/// Depuis combien de temps la position OBSERVÉE d'une zone doit-elle être
+/// immobile avant qu'on cesse de la croire ?
+///
+/// **Une seule valeur pour les deux usages de [`zone_figee`]**, et c'est
+/// délibéré : le garde-fou de mise à jour (`routes/system/update.rs`) et le
+/// détecteur de fond ([`PlaybackManager::arreter_les_zones_figees`]) doivent
+/// dire la même chose de « figée ». Deux copies auraient divergé, et une zone
+/// aurait pu être ignorée par l'un sans être rattrapée par l'autre.
+///
+/// **Justification de la constante.** Elle doit être plus grande que le plus
+/// long silence LÉGITIME d'une lecture réelle :
+/// - la position observée est réécrite toutes les **1 s**
+///   (`POLL_INTERVAL_MS = 1000`, `crate::poller`) ;
+/// - la plus longue tolérance que le sondeur s'accorde AVANT de déclarer une
+///   zone en panne est `TRACK_LOAD_GRACE_SECS = 45` puis
+///   `STOPPED_FAILURE_THRESHOLD = 30` ticks, soit **75 s** ;
+/// - le plus long gel d'appareil mesuré sur ce dépôt est le réveil d'un ampli
+///   DLNA sorti de veille réseau, `BUDGET_REVEIL_STANDBY` ≈ **32 s**
+///   (`outputs/dlna.rs`).
+///
+/// **600 s = 8 × le verdict de panne du sondeur et ≈ 19 × le plus long gel
+/// mesuré.** Aucune lecture que le reste du serveur considère encore vivante
+/// ne peut franchir ce seuil.
+pub const SILENCE_AVANT_ZONE_FIGEE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Cadence du détecteur de zones figées.
+///
+/// Un tour est un verrou et un parcours de `HashMap` : le coût est nul devant
+/// la minute qui le sépare du suivant. Le retard maximal ajouté au seuil est
+/// donc d'une minute sur dix — la précision n'a aucune importance ici, seule
+/// la garantie que ça finit par arriver en a.
+pub const CADENCE_DETECTEUR_ZONES_FIGEES: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Le détecteur de zones figées : une passe de fond qui contredit, toutes les
+/// [`CADENCE_DETECTEUR_ZONES_FIGEES`], toute zone que [`zone_figee`] désigne.
+///
+/// **C'est le « aucun détecteur » de #3581**, écrit noir sur blanc dans le
+/// commentaire de `RESTART_DEFERRAL_MAX` : « une zone peut rester `Playing` en
+/// mémoire indéfiniment sans qu'un seul échantillon sorte ». Le chemin de mise
+/// à jour avait appris à ne plus la croire (#3723, #3882) ; rien ne la
+/// remettait à l'arrêt. Tades voyait donc une Serenade « en train de jouer »
+/// qui ne jouait pas, sans savoir que `POST /zones/{id}/stop` l'aurait
+/// débloqué.
+///
+/// Les deux écritures vont ensemble et dans cet ordre : la MÉMOIRE d'abord —
+/// c'est elle que l'écran lit (`routes/zones/lecture.rs`, `routes/ws.rs`) et
+/// qu'interroge le garde-fou de mise à jour — puis la COLONNE
+/// `zones.last_play_state`, que `audio::replaygain::playing_zone_name` relit à
+/// chaque lot pour céder le pas à la lecture : laissée à `"playing"`, elle
+/// suspend les passes ReplayGain et empreintes aussi longtemps que dure le
+/// mensonge.
+///
+/// Un échec d'écriture en base ne fait pas tomber la passe : la mémoire est
+/// déjà corrigée, c'est-à-dire l'essentiel, et le tour suivant réessaiera si la
+/// zone est de nouveau désignée.
+pub fn spawn_detecteur_de_zones_figees(
+    playback: Arc<PlaybackManager>,
+    backend: Arc<dyn crate::db::backend::DbBackend>,
+    cadence: std::time::Duration,
+    silence_max: std::time::Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(cadence).await;
+            let rattrapees = playback.arreter_les_zones_figees(silence_max).await;
+            if rattrapees.is_empty() {
+                continue;
+            }
+            let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+            for zone_id in rattrapees {
+                if let Err(e) = repo.save_play_state(zone_id, "stopped") {
+                    tracing::warn!(
+                        zone_id,
+                        erreur = %e,
+                        "zone_figee_rattrapee_non_persistee"
+                    );
+                }
+            }
+        }
+    });
+}
+
 /// Build a materialised shuffle order: a Fisher-Yates permutation of
 /// `[0, length)` with `current` moved to index 0, so the first advance goes to
 /// a different track than the one playing. Seeded from the wall clock via a
@@ -1085,6 +1167,79 @@ impl PlaybackManager {
             zone_id,
             data,
         });
+    }
+
+    /// Remet à l'arrêt toute zone que [`zone_figee`] désigne, et rend leurs
+    /// identifiants.
+    ///
+    /// **C'est le détecteur qui manquait à #3581.** Le commentaire de
+    /// `RESTART_DEFERRAL_MAX` le disait mot pour mot : « aucun détecteur ne
+    /// rattrape une zone locale figée : une zone peut rester `Playing` en
+    /// mémoire indéfiniment sans qu'un seul échantillon sorte ». #3723 et
+    /// #3882 ont appris au chemin de mise à jour à ne PLUS CROIRE une telle
+    /// zone ; personne n'était encore chargé de la CONTREDIRE. Elle restait
+    /// donc `Playing` pour toujours, et avec elle :
+    /// - l'écran, qui annonçait à Tades une Serenade en train de jouer alors
+    ///   qu'elle était à l'arrêt — le symptôme même du fil 1700 ;
+    /// - `POST /zones/{id}/stop`, seul recours possible, qu'il fallait deviner ;
+    /// - la colonne `zones.last_play_state`, que l'appelant remet à
+    ///   `"stopped"` avec les identifiants rendus ici : tant qu'elle vaut
+    ///   `"playing"`, `audio::replaygain::playing_zone_name` fait céder le pas
+    ///   aux passes ReplayGain et empreintes à CHAQUE lot, indéfiniment.
+    ///
+    /// L'arrêt n'est pas plus brutal que ce que le chemin de mise à jour
+    /// s'autorise déjà sur le même prédicat : là-bas, une zone figée ne retient
+    /// plus l'échange d'image, qui coupe le son sans préavis. Ici, on remet à
+    /// `Stopped` un état qui, par construction, ne décrit plus aucun son.
+    ///
+    /// `now_playing` et `position_ms` sont CONSERVÉS, comme dans [`Self::stop`] :
+    /// l'écran garde de quoi proposer une reprise là où la lecture s'est
+    /// éteinte.
+    ///
+    /// Le verrou est pris une seule fois pour le verdict et la mutation — une
+    /// zone ne peut pas repartir entre les deux — et les événements ne sont
+    /// émis qu'après l'avoir rendu.
+    pub async fn arreter_les_zones_figees(&self, silence_max: std::time::Duration) -> Vec<i64> {
+        let mut zones = self.zones.lock().await;
+        let mut rattrapees: Vec<i64> = Vec::new();
+        let mut evenements: Vec<PlaybackEvent> = Vec::new();
+        for (zone_id, state) in zones.iter_mut() {
+            if !zone_figee(state, silence_max) {
+                continue;
+            }
+            tracing::warn!(
+                zone_id = *zone_id,
+                immobile_secs = state
+                    .derniere_avance_de_position
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or_default(),
+                seuil_secs = silence_max.as_secs(),
+                "zone_figee_rattrapee"
+            );
+            state.resolving = false;
+            state.state = PlayState::Stopped;
+            state.output_signal_path = None;
+            state.transformations_reelles = None;
+            state.paused_at = None;
+            state.last_seek_at = None;
+            state.derniere_avance_de_position = None;
+            state.observation_rouverte_a = None;
+            evenements.push(PlaybackEvent {
+                event: "stopped".into(),
+                zone_id: *zone_id,
+                data: now_playing_event_data(state),
+            });
+            rattrapees.push(*zone_id);
+        }
+        if rattrapees.is_empty() {
+            return rattrapees;
+        }
+        self.sync_sleep_inhibition(&zones);
+        drop(zones);
+        for evenement in evenements {
+            self.emit(evenement);
+        }
+        rattrapees
     }
 
     /// Stop playback and clear the now_playing metadata entirely.
@@ -2293,11 +2448,10 @@ mod zone_figee_tests {
     use super::{NowPlaying, PlayState, ZoneState, zone_figee};
     use std::time::{Duration, Instant};
 
-    /// La valeur de production de `SILENCE_DE_POSITION_AVANT_ZONE_FIGEE`
-    /// (`tune-server/src/routes/system/update.rs`). Recopiée ici parce que
-    /// `tune-core` ne dépend pas de `tune-server` ; c'est la borne du serveur
-    /// qui fait foi, ce test tient le PRÉDICAT à cette échelle-là.
-    const DIX_MINUTES: Duration = Duration::from_secs(600);
+    /// La valeur de production, celle-là même que le garde-fou de mise à jour
+    /// et le détecteur de fond emploient. Elle n'est plus recopiée : depuis
+    /// #3581 elle vit ici, dans `tune-core`, avec le prédicat.
+    const DIX_MINUTES: Duration = super::SILENCE_AVANT_ZONE_FIGEE;
 
     fn zone(state: PlayState, source: &str, avance_il_y_a: Option<Duration>) -> ZoneState {
         ZoneState {
@@ -2551,5 +2705,242 @@ mod zone_figee_tests {
                 "après « {geste} », la mesure d'avance d'avant ne décrit plus rien"
             );
         }
+    }
+}
+
+/// #3581 — le DÉTECTEUR, par sa porte de production.
+///
+/// Les épreuves de [`zone_figee_tests`] tiennent le PRÉDICAT. Celles-ci
+/// tiennent le BRANCHEMENT : elles n'appellent jamais
+/// [`PlaybackManager::arreter_les_zones_figees`] elles-mêmes — elles lancent
+/// [`spawn_detecteur_de_zones_figees`], exactement ce que `background.rs`
+/// lance, et regardent la zone changer d'état toute seule. Une garde qui
+/// construirait elle-même son objet ne prouverait pas que la passe tourne.
+///
+/// Le seuil est passé à zéro parce qu'on ne peut pas remonter le temps à
+/// travers `PlaybackManager` ; l'échelle réelle de dix minutes est mesurée par
+/// [`zone_figee_tests`], sur un état antidaté.
+#[cfg(test)]
+mod detecteur_de_zones_figees_tests {
+    use super::{NowPlaying, PlayState, PlaybackManager, spawn_detecteur_de_zones_figees};
+    use crate::db::backend::DbBackend;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const CADENCE_COURTE: Duration = Duration::from_millis(10);
+    /// Un tour du détecteur suffit à trancher ; on lui en laisse largement de
+    /// quoi en faire plusieurs avant de conclure à l'échec.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    fn base_avec_zone() -> Arc<dyn DbBackend> {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().expect("base mémoire");
+        db.init_schema().expect("schéma");
+        crate::db::migrations::run_migrations(&db).expect("migrations");
+        db.execute("INSERT INTO zones (id, name) VALUES (12, 'Serenade')", &[])
+            .expect("zone de test");
+        Arc::new(db)
+    }
+
+    fn etat_persiste(backend: &Arc<dyn DbBackend>) -> Option<String> {
+        backend
+            .query_one("SELECT last_play_state FROM zones WHERE id = 12", &[])
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+    }
+
+    /// Amène la zone 12 dans l'état exact du fantôme : `Playing` en mémoire,
+    /// une avance OBSERVÉE (donc `derniere_avance_de_position` renseignée),
+    /// puis plus rien — le sondeur a lâché la zone.
+    async fn zone_qui_pretend_jouer(pm: &PlaybackManager) {
+        pm.play(
+            12,
+            NowPlaying {
+                source: "local".into(),
+                duration_ms: 240_000,
+                ..Default::default()
+            },
+        )
+        .await;
+        pm.update_position(12, 1_000).await;
+    }
+
+    /// Attend que `condition` soit vraie, ou rend `false` au bout de
+    /// [`PATIENCE`]. Une boucle bornée, pas un `sleep` fixe : le test ne dort
+    /// pas plus que nécessaire et ne devient pas instable sous charge.
+    async fn attendre<F, Fut>(mut condition: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let debut = tokio::time::Instant::now();
+        while debut.elapsed() < PATIENCE {
+            if condition().await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    /// 🔴 LE témoin de #3581 : une zone figée revient à l'arrêt sans que
+    /// personne ne la touche. Avant ce correctif elle restait `Playing` pour
+    /// toujours — l'écran de Tades annonçait une Serenade en lecture, le
+    /// garde-fou de mise à jour refusait, et il n'existait aucun recours.
+    #[tokio::test]
+    async fn le_detecteur_remet_a_l_arret_une_zone_figee() {
+        let pm = Arc::new(PlaybackManager::new());
+        zone_qui_pretend_jouer(&pm).await;
+        assert_eq!(
+            pm.get_state(12).await.state,
+            PlayState::Playing,
+            "témoin : la zone doit d'abord prétendre jouer"
+        );
+
+        spawn_detecteur_de_zones_figees(
+            pm.clone(),
+            base_avec_zone(),
+            CADENCE_COURTE,
+            Duration::ZERO,
+        );
+
+        let pm_lu = pm.clone();
+        assert!(
+            attendre(move || {
+                let pm = pm_lu.clone();
+                async move { pm.get_state(12).await.state == PlayState::Stopped }
+            })
+            .await,
+            "aucun détecteur n'a rattrapé la zone figée : c'est le défaut même \
+             de #3581, une zone peut rester `Playing` en mémoire indéfiniment"
+        );
+    }
+
+    /// L'écran doit l'APPRENDRE. Une correction muette en mémoire laisserait
+    /// l'interface sur sa dernière vérité connue jusqu'au prochain
+    /// rafraîchissement — `routes/ws.rs` vit de ce flux d'événements.
+    #[tokio::test]
+    async fn l_ecran_est_prevenu_que_la_zone_s_est_arretee() {
+        let pm = Arc::new(PlaybackManager::new());
+        zone_qui_pretend_jouer(&pm).await;
+        let mut rx = pm.subscribe();
+
+        spawn_detecteur_de_zones_figees(
+            pm.clone(),
+            base_avec_zone(),
+            CADENCE_COURTE,
+            Duration::ZERO,
+        );
+
+        let attendu = tokio::time::timeout(PATIENCE, async {
+            loop {
+                match rx.recv().await {
+                    Ok(e) if e.event == "stopped" && e.zone_id == 12 => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(attendu, Ok(true)),
+            "le détecteur doit émettre l'arrêt : sans événement, l'écran \
+             continue d'annoncer une lecture qui n'existe pas (#3581)"
+        );
+    }
+
+    /// La COLONNE cesse de mentir elle aussi. Tant que
+    /// `zones.last_play_state` vaut `'playing'`,
+    /// `audio::replaygain::playing_zone_name` fait céder le pas aux passes
+    /// ReplayGain et empreintes à chaque lot : une zone figée les suspendait
+    /// pour toujours.
+    #[tokio::test]
+    async fn la_colonne_de_la_zone_cesse_d_annoncer_une_lecture() {
+        let pm = Arc::new(PlaybackManager::new());
+        zone_qui_pretend_jouer(&pm).await;
+        let backend = base_avec_zone();
+        crate::db::zone_repo::ZoneRepo::with_backend(backend.clone())
+            .save_play_state(12, "playing")
+            .expect("état initial");
+        assert_eq!(
+            etat_persiste(&backend).as_deref(),
+            Some("playing"),
+            "témoin : la colonne doit d'abord annoncer une lecture"
+        );
+
+        spawn_detecteur_de_zones_figees(
+            pm.clone(),
+            backend.clone(),
+            CADENCE_COURTE,
+            Duration::ZERO,
+        );
+
+        let lu = backend.clone();
+        assert!(
+            attendre(move || {
+                let lu = lu.clone();
+                async move { etat_persiste(&lu).as_deref() == Some("stopped") }
+            })
+            .await,
+            "la colonne doit suivre la mémoire, sans quoi les passes de fond \
+             restent suspendues par une lecture qui n'existe pas (#3581)"
+        );
+    }
+
+    /// 🔴 La contre-épreuve du détecteur : une zone qu'on VIENT de voir
+    /// avancer ne doit rien subir. Au seuil de production, un détecteur qui
+    /// couperait celle-là couperait de la vraie musique.
+    #[tokio::test]
+    async fn une_zone_vivante_n_est_pas_arretee_au_seuil_de_production() {
+        let pm = Arc::new(PlaybackManager::new());
+        zone_qui_pretend_jouer(&pm).await;
+
+        spawn_detecteur_de_zones_figees(
+            pm.clone(),
+            base_avec_zone(),
+            CADENCE_COURTE,
+            super::SILENCE_AVANT_ZONE_FIGEE,
+        );
+
+        // Plusieurs dizaines de tours du détecteur.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            pm.get_state(12).await.state,
+            PlayState::Playing,
+            "une zone observée il y a une fraction de seconde joue : \
+             l'arrêter couperait une écoute réelle"
+        );
+    }
+
+    /// Une RADIO ne s'arrête jamais toute seule : elle n'a pas de durée, et
+    /// plusieurs renderers n'en annoncent la position que par à-coups. Le
+    /// prédicat l'exclut ; ce test tient l'exclusion à travers la passe.
+    #[tokio::test]
+    async fn une_radio_n_est_jamais_rattrapee() {
+        let pm = Arc::new(PlaybackManager::new());
+        pm.play(
+            12,
+            NowPlaying {
+                source: "radio".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        pm.update_position(12, 1_000).await;
+
+        spawn_detecteur_de_zones_figees(
+            pm.clone(),
+            base_avec_zone(),
+            CADENCE_COURTE,
+            Duration::ZERO,
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            pm.get_state(12).await.state,
+            PlayState::Playing,
+            "un flux live dure des heures sans changer de piste : le détecteur \
+             ne doit jamais le couper"
+        );
     }
 }
