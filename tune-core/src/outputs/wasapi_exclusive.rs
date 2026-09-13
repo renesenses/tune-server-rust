@@ -881,6 +881,17 @@ impl WasapiExclusiveOutput {
         &self.device_id
     }
 
+    /// REF-8 (#2219) — le format que `Initialize(EXCLUSIVE)` a accepté : la
+    /// cadence et les canaux demandés, vérifiés par `IsFormatSupported` en
+    /// mode exclusif. C'est le `FormatOuvert` que le backend publie.
+    pub fn opened_sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn opened_channels(&self) -> u32 {
+        self.channels
+    }
+
     pub fn underrun_count(&self) -> u64 {
         self.underruns.load(Ordering::Relaxed)
     }

@@ -39,12 +39,36 @@ fn bras(nom: &str) -> String {
     })
 }
 
+/// L'étage natif des bras Windows (REF-8, #2219) : `local/etage_natif.rs`,
+/// coupé à son `mod tests`. C'est lui qui prépare (`prepare_windows_native_pcm`)
+/// et qui draine (`flush_local_dsp`) pour WASAPI ; le bras ne fait plus que
+/// l'appeler. Un appel par fichier, chemin en clair, comme `bras`.
+fn etage_natif() -> String {
+    let lu = std::fs::read_to_string(Path::new("src/outputs/local/etage_natif.rs"))
+        .expect("src/outputs/local/etage_natif.rs doit être lisible depuis la racine du crate");
+    lu.split("#[cfg(test)]\nmod tests")
+        .next()
+        .unwrap_or(&lu)
+        .to_string()
+}
+
 /// La production seule : `mod tests` contient les mêmes appels et rendrait
 /// toute assertion de comptage triviale. Ma première version de
 /// `la_boucle_gapless_applique_le_dsp` allait jusqu'à la fin du fichier et
 /// restait verte en débranchant un site.
 fn production(src: &str) -> &str {
     src.split("mod tests").next().unwrap_or(src)
+}
+
+/// Le corps d'une méthode de l'étage flottant (`impl Etage for
+/// EtageDeConversion`), du premier `    fn <nom>(` du fichier à sa fermeture
+/// `\n    }`. REF-7 (#2219) déclare le trait `Etage` APRÈS son implémenteur
+/// précisément pour que ce premier `fn` soit un corps et non une signature.
+fn methode_de_l_etage<'a>(prod: &'a str, nom: &str) -> &'a str {
+    prod.split(&format!("    fn {nom}("))
+        .nth(1)
+        .and_then(|s| s.split("\n    }").next())
+        .unwrap_or_else(|| panic!("EtageDeConversion::{nom} doit rester identifiable"))
 }
 
 #[test]
@@ -88,15 +112,23 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let bras_coreaudio = bras("coreaudio");
     let bras_asio = bras("asio");
     let bras_wasapi = bras("wasapi");
+    let etage_natif = etage_natif();
 
     // R6 bis (#2219) : la définition et les deux drainages du chemin cpal
     // partagé (transition gapless, fin de chaîne) restent dans `local.rs` ;
     // chaque bras exclusif porte le sien dans son module. Le plancher ne
     // bouge pas : cinq chemins, cinq drainages, quel que soit le fichier.
+    // REF-8 : le drainage de WASAPI vit dans l'étage natif (`rendre_la_queue`),
+    // que le bras appelle ; il compte pour lui.
+    // REF-8 (#2219) : le bras CoreAudio draine par le geste de l'étage,
+    // `etage.rendre_la_queue_du_dsp(` — qui tire la queue par `flush_local_dsp`
+    // (vérifié plus bas sur le corps du geste). C'est cet appel qui compte
+    // pour lui.
     let drainages = prod.matches("flush_local_dsp(").count() - 1 // moins la définition
-        + bras_coreaudio.matches("flush_local_dsp(").count()
+        + bras_coreaudio.matches("etage.rendre_la_queue_du_dsp(").count()
         + bras_asio.matches("flush_local_dsp(").count()
-        + bras_wasapi.matches("flush_local_dsp(").count();
+        + bras_wasapi.matches("flush_local_dsp(").count()
+        + etage_natif.matches("flush_local_dsp(").count();
     assert!(
         drainages >= 5,
         "les cinq chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
@@ -125,10 +157,19 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "play_url n'appelle plus le bras CoreAudio exclusif : un module écrit mais pas \
          branché ne draine rien (R6 bis, #2219)"
     );
+    // REF-8 (#2219) : le bras CoreAudio n'appelle plus `process_pcm_chunk` en
+    // ligne — comme le chemin partagé depuis R1, il MONTE la frontière PCM
+    // commune dans son étage de conversion, amorce par `etage.pousser`, puis
+    // passe par la boucle producteur commune (`.tourner(`), et drainer sa fin
+    // de piste. L'exigence est la même, et plus forte : une seule route.
     assert!(
-        bras_coreaudio.contains("pcm_processor.process_pcm_chunk(")
-            && bras_coreaudio.contains("flush_local_dsp("),
-        "CoreAudio exclusif doit traverser la frontière PCM commune puis drainer sa fin de piste"
+        bras_coreaudio.contains("pcm: LocalPcmProcessor {")
+            && bras_coreaudio.contains("etage.pousser(")
+            && bras_coreaudio.contains(".tourner(")
+            && bras_coreaudio.contains("&mut etage,")
+            && bras_coreaudio.contains("etage.rendre_la_queue_du_dsp("),
+        "CoreAudio exclusif doit traverser la frontière PCM commune (étage + boucle commune) \
+         puis drainer sa fin de piste"
     );
 
     let preparation_windows = prod
@@ -163,10 +204,26 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "play_url n'appelle plus le bras ASIO exclusif : un module écrit mais pas branché \
          ne draine rien (R6 bis, #2219)"
     );
+    // REF-8 (#2219) : ASIO a deux routes, et chacune draine. Route native :
+    // l'étage natif (`EtageNatif`, `local/etage_natif.rs`, qui appelle
+    // `prepare_windows_native_pcm` puis `flush_local_dsp` dans
+    // `rendre_la_queue`) ; route traitée : l'étage de R1 (`EtageDeConversion`)
+    // avec `flush_local_dsp` appelé dans le bras. Les deux doivent être
+    // montées ET drainées : perdre l'une des deux, c'est perdre la fin de
+    // piste sur la moitié des pilotes.
+    // REF-7 (#2219) : les deux routes passent par la boucle commune
+    // (`tourner`) et drainent par le geste de l'étage
+    // (`rendre_la_queue_du_dsp`) — pour la route native, l'enveloppe
+    // `EtageNatifAsio` le délègue à `EtageNatif::rendre_la_queue`, qui tire
+    // la queue par `flush_local_dsp` (vérifié ci-dessus sur `etage_natif`).
     assert!(
-        bras_asio.contains("feed_selected_windows_exclusive_leftover(")
-            && bras_asio.contains("flush_local_dsp("),
-        "ASIO doit sélectionner la préparation conforme au pilote puis drainer sa fin de piste"
+        bras_asio.contains("EtageNatif::monter(")
+            && bras_asio.contains("EtageDeConversion {")
+            && bras_asio.matches(".tourner(").count() >= 2
+            && bras_asio.matches("etage.rendre_la_queue_du_dsp(").count() >= 2
+            && bras_asio.contains("self.etage.rendre_la_queue(puits)"),
+        "ASIO doit monter l'étage conforme au pilote (natif ou R1) puis drainer sa fin de \
+         piste sur les DEUX routes (REF-8, #2219)"
     );
 
     let wasapi = prod
@@ -182,10 +239,36 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         "play_url n'appelle plus le bras WASAPI exclusif : un module écrit mais pas \
          branché ne draine rien (R6 bis, #2219)"
     );
+    // REF-8 (#2219) : le bras WASAPI ne prépare ni ne draine en ligne — il
+    // monte l'étage natif, lui fait décoder et pousser chaque lecture, puis
+    // lui fait rendre la queue du DSP. La préparation entière et le drainage
+    // vivent dans l'étage ; un bras qui n'appellerait plus l'un des deux, ou
+    // un étage qui ne les contiendrait plus, rougit nommément.
     assert!(
-        bras_wasapi.contains("feed_windows_native_exclusive_leftover(")
-            && bras_wasapi.contains("flush_local_dsp("),
-        "WASAPI doit passer par la préparation entière puis drainer sa fin de piste"
+        bras_wasapi.contains("etage.decoder_et_pousser(")
+            && bras_wasapi.contains("etage.rendre_la_queue("),
+        "WASAPI doit faire décoder et pousser par l'étage natif, puis lui faire rendre la \
+         queue du DSP en fin de piste (REF-8, #2219)"
+    );
+    let decoder = etage_natif
+        .split("fn decoder_et_pousser(")
+        .nth(1)
+        .and_then(|s| s.split("fn rendre_la_queue(").next())
+        .expect("l'étage natif doit garder `decoder_et_pousser` avant `rendre_la_queue`");
+    assert!(
+        decoder.contains("prepare_windows_native_pcm("),
+        "l'étage natif ne passe plus par la préparation entière : DoP, volume et DSP ne \
+         sont plus résolus avant l'anneau (REF-8, #2219)"
+    );
+    let queue = etage_natif
+        .split("fn rendre_la_queue(")
+        .nth(1)
+        .and_then(|s| s.split("fn vider(").next())
+        .expect("l'étage natif doit garder `rendre_la_queue` avant `vider`");
+    assert!(
+        queue.contains("flush_local_dsp(") && queue.contains("f32_to_native_i32("),
+        "l'étage natif ne draine plus le convolveur vers l'anneau entier en fin de piste \
+         (#2209) : la queue de la convolution ne part jamais au DAC"
     );
 
     let partage = prod
@@ -196,11 +279,23 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     // ligne — il MONTE la frontière PCM commune dans son étage de conversion,
     // et tout ce qui part au DAC traverse `etage.pousser`. L'exigence est la
     // même, et elle est même plus forte : il n'existe plus qu'UNE route.
+    //
+    // REF-7 (#2219) : le drainage de fin de chaîne n'est plus une ligne de
+    // `play_url` mais un geste de l'étage, `rendre_la_queue_du_dsp`, qui tire
+    // lui-même la queue par `flush_local_dsp`. La garde suit la route un cran
+    // plus loin : le chemin partagé appelle le geste, ET le geste draine.
+    // Chercher `flush_local_dsp(` dans `play_url` seul serait vert contre rien
+    // — le chemin compressé d'un seul tenant l'appelle encore en ligne.
     assert!(
         partage.contains("pcm: LocalPcmProcessor {")
             && partage.contains("etage.pousser(")
-            && partage.contains("flush_local_dsp("),
+            && partage.contains("etage.rendre_la_queue_du_dsp("),
         "cpal partagé doit traverser la frontière PCM commune puis drainer la fin de chaîne"
+    );
+    assert!(
+        methode_de_l_etage(prod, "rendre_la_queue_du_dsp").contains("flush_local_dsp("),
+        "le geste `rendre_la_queue_du_dsp` de l'étage ne tire plus la queue du DSP : \
+         `play_url` l'appelle et rien n'est drainé (REF-7, #2219)"
     );
 }
 
@@ -248,10 +343,16 @@ fn la_boucle_gapless_applique_le_dsp() {
         .nth(1)
         .and_then(|s| s.split("\n    }").next())
         .expect("EtageDeConversion::pousser doit rester identifiable");
+    // REF-7 (#2219) : la route n'écrit plus elle-même, elle LIVRE par l'unique
+    // site d'écriture de l'étage, `livrer` — qui, lui, écrit au puits.
     assert!(
-        pousser.contains("self.decoder()") && pousser.contains("puits.ecrire("),
+        pousser.contains("self.decoder()") && pousser.contains("Self::livrer(puits,"),
         "la seule route vers le puits doit décoder par la frontière PCM \
          commune AVANT d'écrire (#2296/#2232)"
+    );
+    assert!(
+        methode_de_l_etage(prod, "livrer").contains("puits.ecrire("),
+        "`livrer` n'écrit plus au puits : la route livre dans le vide (REF-7, #2219)"
     );
     let decoder = prod
         .split("    fn decoder(")
@@ -289,8 +390,13 @@ fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
         .find("End of gapless continuation")
         .map(|i| debut + i)
         .expect("la fin de la boucle gapless doit être identifiable");
+    // REF-7 (#2219) : les deux drainages du chemin partagé sont le MÊME geste
+    // de l'étage, `etage.rendre_la_queue_du_dsp(`, qui tire la queue par
+    // `flush_local_dsp` (vérifié dans `les_chemins_de_fin_de_piste_drainent_le_convolveur`).
+    // C'est cet appel que la garde situe désormais, aux mêmes places.
+    const DRAINAGE: &str = "etage.rendre_la_queue_du_dsp(";
     let draine = prod[fin_chaine..]
-        .find("flush_local_dsp(")
+        .find(DRAINAGE)
         .map(|i| fin_chaine + i)
         .expect("la fin effective de chaîne doit drainer le DSP (#2295/#2296)");
     let vide_resampler = prod[draine..]
@@ -304,16 +410,16 @@ fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
         .find("if convolver_format_changed {")
         .expect("un changement de format gapless doit être traité explicitement (#2210)");
     let draine_transition = milieu[garde_format..]
-        .find("flush_local_dsp(")
+        .find(DRAINAGE)
         .map(|i| garde_format + i)
         .expect("l'ancien moteur doit rendre sa queue avant d'être remplacé");
     assert_eq!(
-        milieu.matches("flush_local_dsp(").count(),
+        milieu.matches(DRAINAGE).count() + milieu.matches("flush_local_dsp(").count(),
         1,
         "un seul drainage est permis dans la boucle : celui du changement de format"
     );
     assert!(
-        !milieu[..garde_format].contains("flush_local_dsp(")
+        !milieu[..garde_format].contains(DRAINAGE)
             && garde_format < draine_transition
             && milieu[draine_transition..].contains("rebuild_local_convolver("),
         "le drainage intermédiaire doit rester sous la garde de changement de format \
@@ -434,10 +540,37 @@ fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
     // ne peut pas devenir un vert contre rien : l'assertion suivante exige que
     // l'unique appel non-vidage soit bien celui de l'étage, c'est-à-dire que
     // la baisse vienne de la centralisation et non d'une branche perdue.
+    //
+    // REF-7 (#2219) : les deux vidages `flush = true` de `play_url` — frontière
+    // gapless qui change de cadence, fin de chaîne — étaient eux aussi la MÊME
+    // ligne recopiée. Ils n'en font plus qu'un, `EtageDeConversion::vider`, et
+    // le plancher descend de 3 à 2. Même clause de non-complaisance : l'unique
+    // vidage doit être celui de l'étage, et les DEUX sites de `play_url`
+    // doivent l'appeler — sinon la baisse viendrait d'un vidage perdu.
     assert!(
-        sites >= 3,
+        sites >= 2,
         "seulement {sites} appel(s) au resampler trouvé(s) : le test ne couvre \
          plus la chaîne locale"
+    );
+    assert_eq!(
+        vidages, 1,
+        "il doit exister exactement UN vidage du resampler dans la production, \
+         celui de l'étage (REF-7, #2219) ; {vidages} trouvé(s)"
+    );
+    assert!(
+        methode_de_l_etage(prod, "vider").contains("rubato_resample_chunk("),
+        "le geste `vider` de l'étage ne vide plus le resampler (REF-7, #2219)"
+    );
+    let partage = prod
+        .split("// ------- Open cpal device (shared mode) -------")
+        .nth(1)
+        .expect("le chemin cpal partagé doit rester identifiable");
+    assert_eq!(
+        partage.matches("etage.vider(").count(),
+        2,
+        "le chemin partagé doit vider le resampler à DEUX endroits — la frontière \
+         gapless qui change de cadence et la fin de chaîne — par le geste de \
+         l'étage (REF-7, #2219)"
     );
     let convertir = prod
         .split("    fn convertir(")
@@ -449,10 +582,22 @@ fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
         "l'unique conversion source → sortie doit adapter les canaux PUIS \
          rééchantillonner : c'est la ligne que les quatre sites recopiaient"
     );
+    // REF-7 (#2219) : « les fins de piste et de chaîne doivent vider le
+    // resampler » se lit désormais sur les APPELANTS du geste unique, pas sur
+    // des copies du vidage : un `etage.vider(` AVANT la fin de la boucle
+    // gapless (la transition qui change de cadence), un APRÈS le commentaire
+    // du vidage final. Une transition gapless à cadence identique ne doit
+    // précisément PAS le vider — c'est `le_gapless_preserve_le_resampler_si_la_cadence_ne_change_pas`.
+    let fin_de_boucle = partage
+        .find("// End of gapless continuation")
+        .expect("la fin de la boucle gapless doit être identifiable");
+    let vidage_final = partage
+        .find("// Flush the resampler")
+        .expect("le vidage final du resampler doit rester commenté à sa place");
     assert!(
-        vidages >= 2,
-        "seulement {vidages} vidage(s) trouvé(s) — les fins de piste et de \
-         chaîne doivent vider le resampler ; une transition gapless à cadence \
-         identique ne doit précisément PAS le vider"
+        partage[..fin_de_boucle].contains("etage.vider(")
+            && partage[vidage_final..].contains("etage.vider("),
+        "les deux appelants du vidage ne sont plus à leur place : l'un doit vivre \
+         dans la transition gapless, l'autre après la fin de chaîne (REF-7, #2219)"
     );
 }

@@ -268,6 +268,13 @@ pub(super) trait BackendLocal<'a>: Sized {
     /// Vidage de fin de piste, borné par `borne`. Fait reculer la position
     /// publiée vers ce qui est réellement joué et rend où il s'est arrêté.
     fn drainer(&mut self, borne: std::time::Duration) -> Vidage;
+
+    /// Le nom du backend tel que les journaux et les messages à l'écran le
+    /// disent — `"CPAL"`, `"CoreAudio"`, `"WASAPI"`, `"ASIO"`. REF-7 (#2219) :
+    /// c'est la boucle producteur commune qui rapporte la famine
+    /// (`record_feed_stall_failure`), une fois, et elle ne sait pas sur quel
+    /// backend elle tourne ; ce nom est ce qu'elle met dans le rapport.
+    fn nom(&self) -> &'static str;
 }
 
 /// Le puits du chemin CPAL partagé : l'anneau flottant que draine le rappel.
@@ -800,6 +807,10 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             starvation,
             position_ms: demande.position_ms,
         })
+    }
+
+    fn nom(&self) -> &'static str {
+        "CPAL"
     }
 
     fn format_ouvert(&self) -> FormatOuvert {
