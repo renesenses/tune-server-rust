@@ -596,3 +596,13 @@ path = "tests/borne_smart_collections_2732.rs"
 [[test]]
 name = "journal_sondage_hqplayer_sans_bruit_4025"
 path = "tests/journal_sondage_hqplayer_sans_bruit_4025.rs"
+
+# 🔴 Ce banc n'avait JAMAIS eu de cible : `autotests = false` en tête de ce
+# manifeste le laissait hors compilation depuis sa création. 1 027 lignes,
+# 13 essais, zéro exécution — les contrats de 30 routes entre le serveur et le
+# client web n'étaient gardés par rien. Découvert le 13/09/2026 en ajoutant le
+# comptage de la plage dynamique (#2218) : `cargo test` a répondu « no test
+# target named `web_response_contracts` ».
+[[test]]
+name = "web_response_contracts"
+path = "tests/web_response_contracts.rs"
