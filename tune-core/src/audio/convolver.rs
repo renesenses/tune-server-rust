@@ -588,7 +588,7 @@ impl Convolver {
     /// plus proche — son erreur ne dépasse pas un demi-LSB et ne porte pas le
     /// signe du signal, contrairement aux troncatures de #4075 et #4076. Lui
     /// ajouter du bruit détruirait précisément l'identité qu'on vient de lui
-    /// rendre. Voir la note de fin de module de [`crate::audio::dither`].
+    /// rendre. Voir « Où ce dither ne doit PAS aller » dans [`crate::audio::dither`].
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
         let ch = self.channels;
         if ch == 0 || pcm.is_empty() {
