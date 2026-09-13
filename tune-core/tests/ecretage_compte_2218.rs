@@ -17,15 +17,20 @@
 //! arrondi. Les octets devaient donc bouger — c'est l'objet du correctif, pas
 //! un effet de bord. Ce qui n'a PAS bougé, et que ce fichier continue de
 //! tenir ligne à ligne : tous les compteurs d'écrêtage (29 174 écrêtés,
-//! 31 866 LSB d'excès, 36 896 overs), parce qu'ils comparent la valeur
-//! **idéale** au rail, en amont du bruit et de l'arrondi.
+//! 31 866 LSB d'excès), parce qu'ils comparent la valeur **idéale** au rail,
+//! en amont du bruit et de l'arrondi.
 //!
-//! Les empreintes de l'**égaliseur** (`B_EQ_*`) sont, elles, inchangées : son
-//! dither était déjà là, et #4075/#4076 n'ont fait que le déplacer dans
-//! `audio::dither` sans toucher un seul nombre. C'est la meilleure preuve que
-//! la mutualisation est neutre.
+//! # 🔴 Les empreintes de l'ÉGALISEUR ont CHANGÉ le 13/09 (#4073)
 //!
-//! Les 18 témoins de T9 et ses 4 ignorés restent à côté.
+//! Pour la même raison, et tout aussi volontairement : #4073 corrige la
+//! réserve automatique, donc le pré-gain, donc chaque échantillon. Le
+//! passe-bas Q = 4 (36 896 overs) et le plateau grave +6 dB (17 825) n'écrêtent
+//! plus DU TOUT, et c'est un passe-haut de Butterworth sur un carré — dont la
+//! norme L1 n'est volontairement pas réservée — qui fait désormais vivre le
+//! compteur et le journal. Le dither de l'égaliseur, lui, n'a pas bougé d'un
+//! nombre : #4075/#4076 l'ont seulement déplacé dans `audio::dither`.
+//!
+//! Les 21 témoins de T9 et ses 2 ignorés restent à côté.
 //!
 //! Le journal est capturé par un abonné `tracing_subscriber::fmt` GLOBAL,
 //! posé une fois pour le processus, qui écrit dans un tampon PROPRE AU FIL :
@@ -49,9 +54,16 @@ const FS: u32 = 44_100;
 const N: usize = 44_100;
 
 // ───────── empreintes FNV-1a ─────────
-// `A_*`, `E_*`, `Q2_*` (ReplayGain, mélangeur, chaîne) : relevées le 13/09
+// `A_*`, `E_*`, `Q2_RG_PIC_16B` (ReplayGain, mélangeur) : relevées le 13/09
 // APRÈS #4075/#4076, sur `batch/bugs-13` — le dither a remplacé la troncature.
-// `B_EQ_*` : relevées à 49ecf1fe, AVANT le comptage, et INCHANGÉES depuis.
+// `B_EQ_*` et `Q2_CHAINE_RG_EQ_16B` : relevées le 13/09 APRÈS #4073, qui change
+// la réserve automatique de l'égaliseur donc son pré-gain. Les anciennes
+// valeurs de l'égaliseur (0xc2f3_7c72_784a_7078 pour le passe-bas,
+// 0x285b_3693_c85d_4121 pour le plateau, 0xa879_54df_086e_8265 pour le
+// flottant) allaient avec des réserves trop courtes et 36 896 / 17 825
+// échantillons écrêtés dur. Ce qui n'a PAS bougé, et que ce fichier continue de
+// prouver : l'endroit du clamp, son ordre (clamp PUIS dither) et ses seuils —
+// le compteur d'écrêtage reste exactement le compteur d'overs.
 
 const A_RG_PLUS6_16B: u64 = 0x70ed_00f1_327a_171f;
 const A_RG_PLUS6_24B: u64 = 0x28b2_9fa3_c47f_2f8e;
@@ -59,16 +71,22 @@ const A_RG_PLUS6_32B: u64 = 0x45d6_6c51_9c9b_bfdd;
 const E_RG_MOINS1_16B: u64 = 0x7ccf_e03f_36b3_4143;
 const E_RG_MOINS1_24B: u64 = 0x1412_74cb_e444_e276;
 const E_RG_MOINS1_32B: u64 = 0x4ae4_154e_e968_b69f;
-const B_EQ_LOWPASS_Q4_24B: u64 = 0xc2f3_7c72_784a_7078;
-const B_EQ_LOWPASS_Q4_OVERS: u64 = 36_896;
-const B_EQ_LOWSHELF_CARRE_24B: u64 = 0x285b_3693_c85d_4121;
-const B_EQ_LOWSHELF_CARRE_OVERS: u64 = 17_825;
-const B_EQ_FLOTTANT_Q4: u64 = 0xa879_54df_086e_8265;
 const Q2_RG_PIC_16B: u64 = 0xfae0_2d13_6dbf_0670;
-const Q2_CHAINE_RG_EQ_16B: u64 = 0x25db_2059_e212_ef86;
 const E_MIXEUR_MOINS1_16B: u64 = 0x4c00_4b27_9e0f_b429;
 const E_MIXEUR_MOINS1_24B: u64 = 0x53bc_d36e_bb4c_14c0;
 const E_MIXEUR_MOINS1_32B: u64 = 0x204e_851d_0428_4df5;
+const B_EQ_LOWPASS_Q4_24B: u64 = 0x9116_d8c0_b1ce_21f7;
+const B_EQ_LOWPASS_Q4_OVERS: u64 = 0;
+const B_EQ_LOWSHELF_CARRE_24B: u64 = 0x0646_ad5a_8ffa_ac80;
+const B_EQ_LOWSHELF_CARRE_OVERS: u64 = 0;
+const B_EQ_FLOTTANT_Q4: u64 = 0xe7ef_1090_2da3_b1da;
+const Q2_CHAINE_RG_EQ_16B: u64 = 0x1c77_57f5_32af_6cdc;
+/// Le passe-haut de Butterworth sur un carré 50 Hz : ce que l'égaliseur écrête
+/// ENCORE après #4073, par un choix assumé (la norme L1 d'un filtre `pass` de
+/// +7,02 dB n'est pas réservée, sans quoi tout coupe-bas coûterait 7 dB). C'est
+/// ce cas-là qui fait vivre le compteur et le journal dans ce fichier.
+const B_EQ_PASSE_HAUT_CARRE_24B: u64 = 0xc334_6da2_84ba_6a0a;
+const B_EQ_PASSE_HAUT_CARRE_OVERS: u64 = 297;
 const A_MIXEUR_X2_16B: u64 = 0x64a4_cd35_d280_d173;
 /// Le même signal, le même facteur, mais découpé en 100 blocs de 441 trames.
 ///
@@ -226,6 +244,23 @@ fn profil(bands: Vec<EqBandSpec>) -> EqProfile {
 
 fn passe_bas_q4() -> EqProcessor {
     EqProcessor::new(&profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]), FS, 1)
+}
+
+/// L'égaliseur qui écrête ENCORE après #4073 : un passe-haut de Butterworth,
+/// dont la norme L1 (+7,02 dB) n'est volontairement pas réservée. Sur un carré
+/// 50 Hz à −0,05 dBFS il dépasse 297 fois, réparties sur 99 blocs de 441
+/// échantillons — de quoi faire vivre le compteur et le journal.
+fn passe_haut_butterworth() -> EqProcessor {
+    EqProcessor::new(
+        &profil(vec![bande(
+            "high_pass",
+            997.0,
+            0.0,
+            std::f64::consts::FRAC_1_SQRT_2,
+        )]),
+        FS,
+        1,
+    )
 }
 
 // ───────────── capture du journal ─────────────
@@ -414,18 +449,23 @@ fn a_gain_replay_bloc_par_bloc_produit_les_memes_octets_et_cumule() {
 
 // ═════════════════════════ B — égaliseur ═════════════════════════
 
-/// Le cas B de T9 rejoué : passe-bas 997 Hz Q = 4 sur un sinus à −0,1 dBFS,
-/// 24 bits. Le compteur d'écrêtage vaut EXACTEMENT `overs` (36 896, 83,7 %),
-/// avec l'excès (résonance +12 dB : crête ≈ +11,9 dBFS) ; les octets — clamp
-/// PUIS dither — sont ceux d'avant.
+/// Le cas B de T9 rejoué APRÈS #4073 : le compteur d'écrêtage vaut toujours
+/// EXACTEMENT `overs`, incrémenté au même endroit, avec l'excès — mais la
+/// réserve automatique a changé, et avec elle les octets.
+///
+/// Ce qui écrête encore : un passe-haut de Butterworth sur un carré 50 Hz,
+/// 297 fois (0,67 %), parce que la norme L1 d'un filtre `pass` n'est
+/// volontairement pas réservée. Ce qui n'écrête plus : le passe-bas Q = 4
+/// (36 896 overs avant, **zéro** après), le plateau grave +6 dB sur un carré
+/// (17 825 avant, **zéro** après), et leurs deux chemins entier et flottant.
 #[test]
-fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_octets() {
-    let mut eq = passe_bas_q4();
-    let mut pcm = vers_pcm(&sinus(997.0, -0.1, N, 0.0), 24);
+fn b_l_egaliseur_compte_ce_qu_il_ecrete_et_n_ecrete_plus_ce_que_4073_reserve() {
+    let mut eq = passe_haut_butterworth();
+    let mut pcm = vers_pcm(&carre(50.0, -0.05, N), 24);
     let stats = eq.process_pcm(&mut pcm, 24);
     let c = eq.ecretage();
     eprintln!(
-        "B : overs {} / compteur {} ({:.1} %), excès max {} LSB, crête {:+.2} dBFS, premier à {:?}",
+        "B : overs {} / compteur {} ({:.2} %), excès max {} LSB, crête {:+.2} dBFS, premier à {:?}",
         stats.overs,
         c.echantillons_ecretes,
         c.pourcentage(),
@@ -435,10 +475,10 @@ fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_oct
     );
     assert_eq!(
         fnv1a(&pcm),
-        B_EQ_LOWPASS_Q4_24B,
-        "empreinte des octets de l'égaliseur (clamp puis dither) inchangée"
+        B_EQ_PASSE_HAUT_CARRE_24B,
+        "empreinte des octets de l'égaliseur (clamp puis dither)"
     );
-    assert_eq!(stats.overs, B_EQ_LOWPASS_Q4_OVERS, "les overs de T9");
+    assert_eq!(stats.overs, B_EQ_PASSE_HAUT_CARRE_OVERS);
     assert_eq!(
         c.echantillons_ecretes, stats.overs,
         "le compteur d'écrêtage EST le compteur d'overs, incrémenté au même endroit"
@@ -446,35 +486,43 @@ fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_oct
     assert_eq!(c.echantillons_ecretes, eq.process_stats().overs);
     assert_eq!(c.echantillons_vus, N as u64);
     assert!(
-        (83.5..=83.9).contains(&c.pourcentage()),
-        "83,7 % : {:.1}",
+        (0.6..=0.75).contains(&c.pourcentage()),
+        "0,67 % : {:.2}",
         c.pourcentage()
     );
     let crete = c.crete_max_dbfs().expect("crête connue");
     assert!(
-        (crete - 11.94).abs() < 0.1,
-        "résonance +12 dB : crête idéale ≈ +11,94 dBFS (T9), mesurée {crete:+.2}"
+        (crete - 5.10).abs() < 0.1,
+        "le front du carré passe à +5,10 dBFS (norme L1 non réservée), mesuré {crete:+.2}"
     );
     assert!(
-        c.exces_max_lsb > 20_000_000,
-        "≈ (3,95 − 1) × 2^23 LSB d'excès : {}",
+        c.exces_max_lsb > 6_000_000,
+        "≈ (1,80 − 1) × 2^23 LSB d'excès : {}",
         c.exces_max_lsb
     );
     assert!(matches!(c.premier_ecretage_a, Some(p) if p < N as u64 / 10));
 
-    // Plateau grave +6 dB sur un carré 50 Hz (T9 : 40,4 % d'overs).
+    // Passe-bas Q = 4 sur un sinus : la résonance est réservée, plus rien ne
+    // dépasse, et le compteur reste vierge.
+    let mut eqlp = passe_bas_q4();
+    let mut plp = vers_pcm(&sinus(997.0, -0.1, N, 0.0), 24);
+    let stlp = eqlp.process_pcm(&mut plp, 24);
+    assert_eq!(fnv1a(&plp), B_EQ_LOWPASS_Q4_24B, "empreinte du passe-bas");
+    assert_eq!(stlp.overs, B_EQ_LOWPASS_Q4_OVERS);
+    assert_eq!(eqlp.ecretage().echantillons_ecretes, 0);
+    assert_eq!(eqlp.ecretage().premier_ecretage_a, None);
+    assert_eq!(eqlp.ecretage().echantillons_vus, N as u64);
+
+    // Plateau grave +6 dB sur un carré 50 Hz : la norme L1 est réservée.
     let mut eq2 = EqProcessor::new(&profil(vec![bande("low_shelf", 80.0, 6.0, 0.707)]), FS, 1);
     let mut p2 = vers_pcm(&carre(50.0, -0.05, N), 24);
     let st2 = eq2.process_pcm(&mut p2, 24);
-    assert_eq!(
-        fnv1a(&p2),
-        B_EQ_LOWSHELF_CARRE_24B,
-        "empreinte plateau inchangée"
-    );
+    assert_eq!(fnv1a(&p2), B_EQ_LOWSHELF_CARRE_24B, "empreinte plateau");
     assert_eq!(st2.overs, B_EQ_LOWSHELF_CARRE_OVERS);
     assert_eq!(eq2.ecretage().echantillons_ecretes, st2.overs);
 
-    // Chemin flottant, même passe-bas : compté, jamais saturé (T9).
+    // Chemin flottant, même passe-bas : ne sature toujours rien, et n'a plus
+    // rien à laisser passer.
     let mut eq3 = passe_bas_q4();
     let mut fl: Vec<f32> = sinus(997.0, -0.1, N, 0.0)
         .iter()
@@ -482,11 +530,7 @@ fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_oct
         .collect();
     let st3 = eq3.process_interleaved(&mut fl);
     let fl_bytes: Vec<u8> = fl.iter().flat_map(|v| v.to_le_bytes()).collect();
-    assert_eq!(
-        fnv1a(&fl_bytes),
-        B_EQ_FLOTTANT_Q4,
-        "empreinte flottante inchangée"
-    );
+    assert_eq!(fnv1a(&fl_bytes), B_EQ_FLOTTANT_Q4, "empreinte flottante");
     assert_eq!(st3.overs, B_EQ_LOWPASS_Q4_OVERS);
     assert_eq!(eq3.ecretage().echantillons_ecretes, st3.overs);
     assert_eq!(eq3.ecretage().echantillons_vus, N as u64);
@@ -605,17 +649,20 @@ fn le_journal_dit_deux_lignes_par_piste_jamais_une_par_bloc() {
     let facteur = facteur_plus_6_sans_pic();
 
     let journal = capturer(|| {
-        let mut eq = passe_bas_q4();
-        let mut p = vers_pcm(&x, 24);
+        let mut eq = passe_haut_butterworth();
+        let mut p = vers_pcm(&carre(50.0, -0.05, N), 24);
         for bloc in p.chunks_mut(441 * 3) {
             eq.process_pcm(bloc, 24);
         }
         assert_eq!(
             fnv1a(&p),
-            B_EQ_LOWPASS_Q4_24B,
+            B_EQ_PASSE_HAUT_CARRE_24B,
             "100 blocs = un seul tenant, à l'octet (l'état des biquads est continu)"
         );
-        assert_eq!(eq.ecretage().echantillons_ecretes, B_EQ_LOWPASS_Q4_OVERS);
+        assert_eq!(
+            eq.ecretage().echantillons_ecretes,
+            B_EQ_PASSE_HAUT_CARRE_OVERS
+        );
         drop(eq);
 
         let mut g = GainReplay::new(facteur);
@@ -661,7 +708,7 @@ fn le_journal_dit_deux_lignes_par_piste_jamais_une_par_bloc() {
         );
     }
     assert!(
-        porte(eq[1], "echantillons_ecretes", "36896") && porte(eq[1], "echantillons_vus", "44100"),
+        porte(eq[1], "echantillons_ecretes", "297") && porte(eq[1], "echantillons_vus", "44100"),
         "égaliseur, fin : le total de la piste : {}",
         eq[1]
     );
@@ -682,22 +729,24 @@ fn le_journal_dit_deux_lignes_par_piste_jamais_une_par_bloc() {
 /// relais dit UNE fin, avec le total des deux.
 #[test]
 fn un_processeur_relaye_a_chaud_ne_clot_pas_la_piste() {
-    let x = sinus(997.0, -0.1, N, 0.0);
     let journal = capturer(|| {
-        let mut p = vers_pcm(&x, 24);
+        let mut p = vers_pcm(&carre(50.0, -0.05, N), 24);
         let (avant, apres) = p.split_at_mut(N / 2 * 3);
-        let mut eq1 = passe_bas_q4();
+        let mut eq1 = passe_haut_butterworth();
         eq1.process_pcm(avant, 24);
-        let mut eq2 = passe_bas_q4();
+        let mut eq2 = passe_haut_butterworth();
         eq2.inherit_state_from(&eq1);
         drop(eq1);
         eq2.process_pcm(apres, 24);
         assert_eq!(
             fnv1a(&p),
-            B_EQ_LOWPASS_Q4_24B,
+            B_EQ_PASSE_HAUT_CARRE_24B,
             "l'historique relayé rend les mêmes octets qu'un seul processeur"
         );
-        assert_eq!(eq2.ecretage().echantillons_ecretes, B_EQ_LOWPASS_Q4_OVERS);
+        assert_eq!(
+            eq2.ecretage().echantillons_ecretes,
+            B_EQ_PASSE_HAUT_CARRE_OVERS
+        );
         drop(eq2);
     });
     let lignes = lignes_ecretage(&journal);
@@ -708,7 +757,7 @@ fn un_processeur_relaye_a_chaud_ne_clot_pas_la_piste() {
     );
     assert!(porte(lignes[0], "moment", "premier"));
     assert!(
-        porte(lignes[1], "moment", "fin") && porte(lignes[1], "echantillons_ecretes", "36896"),
+        porte(lignes[1], "moment", "fin") && porte(lignes[1], "echantillons_ecretes", "297"),
         "la fin porte le total des deux moitiés : {}",
         lignes[1]
     );

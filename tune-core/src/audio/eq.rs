@@ -94,7 +94,43 @@ impl EqBandSpec {
             Some(c) => c == ch,
         }
     }
+
+    /// Ce que cette bande demande de réserver pour sa RÉSONANCE, en dB (≥ 0).
+    ///
+    /// Un `low_pass` / `high_pass` RBJ vaut |H(fc)| = Q : au-dessus de
+    /// Q = 1/√2 il POUSSE, sans qu'aucun champ `gain` ne le dise. La réserve
+    /// est `20·log10(Q/0,707)` — zéro à Butterworth et au-dessous, 15,05 dB à
+    /// Q = 4. Les autres types rendent zéro : leur boost, quand il existe, est
+    /// dans leur gain.
+    fn reserve_de_resonance_db(&self) -> f64 {
+        if !matches!(self.band_type.as_str(), "low_pass" | "high_pass") || !self.q.is_finite() {
+            return 0.0;
+        }
+        // Même bornage que `coeffs` : la réserve parle du filtre RÉELLEMENT
+        // construit, pas de la valeur brute du profil.
+        let q = self.q.clamp(0.1, 30.0);
+        if q <= Q_SANS_RESONANCE {
+            return 0.0;
+        }
+        20.0 * (q / Q_SANS_RESONANCE).log10()
+    }
 }
+
+/// Le débit auquel répond [`EqProfile::automatic_headroom_db`] quand
+/// l'appelant n'en a pas.
+///
+/// 44 100 Hz est déjà la sonde du panneau signal-path
+/// (`zone_eq_step_description`) et de l'import AutoEq : la valeur affichée et
+/// la valeur appliquée parlent donc du même filtre sur toute source CD.
+pub const DEBIT_DE_REFERENCE_HZ: f64 = 44_100.0;
+
+/// Le Q d'un `pass` de Butterworth : au-dessous, la réponse ne dépasse jamais
+/// l'unité et rien n'est à réserver.
+const Q_SANS_RESONANCE: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// Bornes de la réponse impulsionnelle sommée par [`norme_l1`].
+const LONGUEUR_L1_MIN: usize = 4_096;
+const LONGUEUR_L1_MAX: usize = 1 << 19;
 
 fn default_band_q() -> f64 {
     1.0
@@ -176,32 +212,132 @@ impl EqProfile {
         )
     }
 
-    /// Conservative automatic headroom for one channel.
+    /// Réserve automatique d'un canal, au débit de référence.
     ///
-    /// Biquads are cascaded, so their gains multiply in the linear domain and
-    /// add in dB. Reserving the sum of every positive peak/shelf gain prevents
-    /// an EQ boost from depending on a limiter or saturator. Pass, notch and
-    /// cut-only filters need no positive-gain allowance.
+    /// Le débit entre dans le calcul (voir [`Self::automatic_headroom_db_at`]) :
+    /// cette porte-ci répond pour [`DEBIT_DE_REFERENCE_HZ`], qui est déjà la
+    /// sonde du panneau signal-path et de l'import AutoEq. Le chemin audio,
+    /// lui, réserve au débit RÉEL de la zone.
     pub fn automatic_headroom_db(&self, channel: u16) -> f64 {
-        let positive_db: f64 = if self.bands.is_empty() {
+        self.automatic_headroom_db_at(channel, DEBIT_DE_REFERENCE_HZ)
+    }
+
+    /// Réserve automatique d'un canal, en dB (négative ou nulle), au débit donné.
+    ///
+    /// Trois termes, et seulement trois — chacun répond à un défaut mesuré
+    /// (#4073, `docs/mesures/2218-marge-ecretage-crete-vraie.md`) :
+    ///
+    /// 1. **La somme des gains positifs** des bandes `peak` / `low_shelf` /
+    ///    `high_shelf`, telle qu'elle est depuis d423c16b. Les biquads se
+    ///    cascadent : leurs gains se multiplient en linéaire, s'additionnent en
+    ///    dB, et cette somme majore toujours le maximum de la réponse en
+    ///    FRÉQUENCE. Elle est conservée telle quelle, parce que sur un profil à
+    ///    plusieurs bandes elle majore aussi — largement — le terme suivant.
+    /// 2. **La norme L1 de la cascade à gain**, en dB. `max|y| ≤ ‖h‖₁·max|x|`
+    ///    est la seule borne VRAIE pour une entrée bornée quelconque, et c'est
+    ///    une réponse en TEMPS, pas en fréquence. Un plateau grave de +6 dB a
+    ///    un maximum fréquentiel de 6,000 dB et une norme L1 de 6,505 dB : sur
+    ///    un carré, la somme des gains est courte de 0,50 dB et 40 % des
+    ///    échantillons sortaient du rail. On retient le PLUS GRAND des deux
+    ///    termes : jamais moins que l'historique, jamais moins que la borne.
+    /// 3. **La résonance des `low_pass` / `high_pass`**, `20·log10(Q/0,707)`
+    ///    pour Q > 0,707, zéro sinon. Un passe-bas RBJ vaut |H(fc)| = Q :
+    ///    à Q = 4 il pousse de 12,04 dB et la réserve valait… 0 dB, pour 83,7 %
+    ///    d'overs écrêtés dur. La formule rend 15,05 dB, soit le maximum
+    ///    fréquentiel EXACT (Q/√(1−1/4Q²) = 12,11 dB) plus une marge qui couvre
+    ///    aussi la norme L1 du même filtre (14,19 dB).
+    ///
+    /// **Ce qui n'est volontairement PAS réservé** : la norme L1 des filtres
+    /// `pass` et `notch` eux-mêmes. Un passe-haut de Butterworth (Q = 0,707,
+    /// le filtre anti-rumble ordinaire) a un maximum fréquentiel de 0 dB et une
+    /// norme L1 de **7,02 dB** : la couvrir coûterait 7 dB de niveau à tout
+    /// utilisateur d'un coupe-bas, pour un dépassement qui ne se produit que
+    /// sur un signal adverse. Une réserve trop large abîme le son autant
+    /// qu'une réserve trop courte ; cette ligne-là est tracée ici, et elle est
+    /// témoignée (`marge_et_crete_2218.rs`).
+    ///
+    /// Même raison pour la **cascade qui ne pousse nulle part** : une bande qui
+    /// ne fait que creuser sonne elle aussi, sa norme L1 dépasse l'unité, et
+    /// réserver là-dessus atténuerait un profil purement soustractif — ce que
+    /// personne ne demande et que `un_profil_uniquement_attenuateur_ne_reserve_aucune_marge`
+    /// interdit. Le terme L1 ne s'applique donc que lorsqu'au moins une bande
+    /// pousse.
+    pub fn automatic_headroom_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
+        let (somme_positive_db, cascade) = self.cascade_a_gain(channel, sample_rate);
+        let l1_db = if somme_positive_db > 0.0 {
+            let l1 = norme_l1(&cascade);
+            if l1 > 1.0 { 20.0 * l1.log10() } else { 0.0 }
+        } else {
+            0.0
+        };
+        let resonance_db: f64 = if self.bands.is_empty() {
+            0.0
+        } else {
+            self.bands
+                .iter()
+                .filter(|band| band.vise_le_canal(channel))
+                .map(EqBandSpec::reserve_de_resonance_db)
+                .sum()
+        };
+        -(somme_positive_db.max(l1_db) + resonance_db)
+    }
+
+    /// La somme des gains positifs et la cascade des bandes à GAIN
+    /// (`peak` / `low_shelf` / `high_shelf`, et tout type inconnu — que
+    /// [`EqBandSpec::coeffs`] traite en `peaking_eq`), exactement celle que
+    /// construit [`EqProcessor::new`] pour ce canal, amputée des `pass` et des
+    /// `notch` dont la norme L1 n'est pas réservée (voir
+    /// [`Self::automatic_headroom_db_at`]).
+    fn cascade_a_gain(&self, channel: u16, sample_rate: f64) -> (f64, Vec<BiquadCoeffs>) {
+        if self.bands.is_empty() {
             let (bass, mid, treble) = self.effective_gains();
-            [bass, mid, treble]
+            let somme: f64 = [bass, mid, treble]
                 .into_iter()
                 .filter(|gain| gain.is_finite() && *gain > 0.0)
-                .sum()
-        } else {
+                .sum();
+            let utilisable = [bass, mid, treble].iter().all(|g| g.is_finite());
+            let actif = bass.abs() > 0.01 || mid.abs() > 0.01 || treble.abs() > 0.01;
+            let cascade = if utilisable && actif && sample_rate.is_finite() && sample_rate > 0.0 {
+                vec![
+                    low_shelf(80.0, bass, sample_rate),
+                    peaking_eq(2000.0, mid, 1.0, sample_rate),
+                    high_shelf(10000.0, treble, sample_rate),
+                ]
+            } else {
+                Vec::new()
+            };
+            return (somme, cascade);
+        }
+
+        let somme: f64 = self
+            .bands
+            .iter()
+            .filter(|band| {
+                band.vise_le_canal(channel)
+                    && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
+                    && band.gain.is_finite()
+                    && band.gain > 0.0
+            })
+            .map(|band| band.gain.clamp(0.0, 24.0))
+            .sum();
+
+        let cascade = if sample_rate.is_finite() && sample_rate > 0.0 {
             self.bands
                 .iter()
                 .filter(|band| {
                     band.vise_le_canal(channel)
-                        && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
+                        && !band.is_neutral()
+                        && !matches!(band.band_type.as_str(), "low_pass" | "high_pass" | "notch")
+                        && band.freq.is_finite()
                         && band.gain.is_finite()
-                        && band.gain > 0.0
+                        && band.q.is_finite()
                 })
-                .map(|band| band.gain.clamp(0.0, 24.0))
-                .sum()
+                .map(|band| band.coeffs(sample_rate))
+                .collect()
+        } else {
+            Vec::new()
         };
-        -positive_db
+        (somme, cascade)
     }
 
     /// Tone preset for the DECLARED listening environment.
@@ -276,6 +412,56 @@ impl BiquadState {
         self.y1 = y;
         y
     }
+}
+
+/// Norme L1 de la réponse impulsionnelle d'une cascade de biquads.
+///
+/// `Σ|h[n]|` : le gain le plus grand que cette cascade puisse donner à une
+/// entrée bornée, `max|y| ≤ ‖h‖₁·max|x|`, atteint par `x[n] = signe(h[−n])`.
+/// C'est une réponse en TEMPS : elle voit ce que le maximum de la réponse en
+/// fréquence ne voit pas — la sonnerie d'un plateau sur un front, qui est
+/// exactement le défaut de #4073.
+///
+/// La somme est tronquée, jamais infinie : la longueur vient du pôle le plus
+/// lent de la cascade (|p|² = a₂ pour une paire conjuguée), assez loin pour
+/// que l'enveloppe soit tombée à 10⁻⁹, bornée à [`LONGUEUR_L1_MIN`] …
+/// [`LONGUEUR_L1_MAX`]. Une troncature ne peut que SOUS-estimer, et
+/// [`EqProfile::automatic_headroom_db_at`] prend le maximum avec la somme
+/// historique des gains : la garantie d'avant ne peut pas être perdue par
+/// cette borne-ci. Rendue en linéaire ; une cascade vide vaut 1,0 (0 dB).
+fn norme_l1(cascade: &[BiquadCoeffs]) -> f64 {
+    if cascade.is_empty() {
+        return 1.0;
+    }
+    let rayon = cascade
+        .iter()
+        .map(|c| c.a2.abs().sqrt())
+        .fold(0.0_f64, f64::max);
+    if !rayon.is_finite() {
+        return 1.0;
+    }
+    let rayon = rayon.min(0.999_999);
+    let longueur = if rayon <= f64::EPSILON {
+        LONGUEUR_L1_MIN
+    } else {
+        let brut = 1e-9_f64.ln() / rayon.ln();
+        if brut.is_finite() && brut >= 0.0 {
+            (brut.ceil() as usize).clamp(LONGUEUR_L1_MIN, LONGUEUR_L1_MAX)
+        } else {
+            LONGUEUR_L1_MAX
+        }
+    };
+
+    let mut etats = vec![BiquadState::default(); cascade.len()];
+    let mut somme = 0.0_f64;
+    for n in 0..longueur {
+        let mut v = if n == 0 { 1.0 } else { 0.0 };
+        for (coeffs, etat) in cascade.iter().zip(etats.iter_mut()) {
+            v = etat.process(coeffs, v);
+        }
+        somme += v.abs();
+    }
+    if somme.is_finite() { somme } else { 1.0 }
 }
 
 /// Design a low-shelf biquad filter.
@@ -470,8 +656,10 @@ impl EqProcessor {
             .iter()
             .map(|f| vec![BiquadState::default(); f.len()])
             .collect();
+        // Au débit RÉEL : la norme L1 d'un plateau et la place d'un aigu sous
+        // Nyquist ne sont pas les mêmes à 44,1 et à 192 kHz.
         let preamp_db: Vec<f64> = (0..channels.max(1))
-            .map(|ch| profile.automatic_headroom_db(ch))
+            .map(|ch| profile.automatic_headroom_db_at(ch, sr))
             .collect();
         let preamp_gains = preamp_db
             .iter()

@@ -8,6 +8,13 @@ Aucun fichier de production n'a été modifié dans cette tranche : là où un
 témoin révèle un défaut, il est nommé ici et dans un témoin `#[ignore]` qui
 affirme le comportement attendu, à dé-ignorer par le correctif.
 
+> **Mise à jour du 13/09/2026 — #4073.** Le défaut **B** (réserve automatique
+> de l'égaliseur) est **réglé** : ses deux témoins `#[ignore]` sont dé-ignorés
+> et verts. Les lignes du tableau Q1 qui le décrivent restent telles qu'elles
+> ont été mesurées le 12/09 — c'est un relevé, pas un état courant — et portent
+> chacune le chiffre d'après. Voir la section « B » plus bas pour la formule
+> retenue et ce qu'elle coûte. A, C et D restent ouverts.
+
 ## Les quatre questions, et la réponse en une ligne
 
 | # | question | réponse mesurée |
@@ -54,9 +61,9 @@ affirme le comportement attendu, à dé-ignorer par le correctif.
 | étage | stimulus | mesure | où ça sature | nommé ? |
 |---|---|---|---|---|
 | `gain_factor` + `apply_gain_pcm`, +6 dB, **pic non tagué**, `prevent_clipping` armé | sinus 997 Hz −0,1 dBFS, 16 bits | facteur ×1,9953 (rien ne le retient : seul le clamp ×4 de `gain_factor` borne) ; idéal +5,90 dBFS ; **29 174 / 44 100 écrêtés (66,2 %)**, excès max 31 866 LSB, 29 174 au rail ; signe conservé (saturation, pas d'enroulement) | `apply_gain_pcm`, clamp puis `as i16` | **non** : la fonction rend `()`, ni compteur ni journal |
-| `EqProcessor::process_pcm`, bande `low_pass` 997 Hz Q = 4 | sinus 997 Hz −0,1 dBFS, 24 bits | `automatic_headroom_db` = **0 dB** (rien pour un filtre « pass ») ; résonance |H(fc)| = Q = +12,04 dB ; **36 896 / 44 100 overs (83,7 %)** ; au rail 32 412, au rail à 1 LSB près 36 896 | `write_sample_f64` : clamp à 1,0 − 1 LSB, **puis** dither ±1 LSB, puis arrondi — le plateau écrêté sort au rail ou 1 LSB dessous | compté (`EqProcessStats.overs`, exposé `eq_overs` dans `dsp_metrics` / signal-path), **jamais journalisé** |
-| `EqProcessor::process_interleaved` (chemin flottant de la sortie locale), même profil | idem, f32 | 36 896 overs, crête **×3,954 (+11,94 dBFS)**, aucune saturation | plus loin : `f32_to_native_i32` (privé, WASAPI : arrondi + clamp) ou **personne** sur le chemin cpal flottant (macOS/Linux) | compté, pas journalisé |
-| `EqProcessor::process_pcm`, `low_shelf` 80 Hz +6 dB (réserve −6 dB) | carré 50 Hz −0,05 dBFS, 24 bits | **17 825 overs (40,4 %)** ; crête flottante +0,45 dBFS : la réserve, somme des gains en dB (maximum **fréquentiel**), est courte de **0,50 dB** face à la réponse en **temps** d'un plateau d'ordre 2 | idem | idem |
+| `EqProcessor::process_pcm`, bande `low_pass` 997 Hz Q = 4 | sinus 997 Hz −0,1 dBFS, 24 bits | `automatic_headroom_db` = **0 dB** (rien pour un filtre « pass ») ; résonance |H(fc)| = Q = +12,04 dB ; **36 896 / 44 100 overs (83,7 %)** ; au rail 32 412, au rail à 1 LSB près 36 896 | `write_sample_f64` : clamp à 1,0 − 1 LSB, **puis** dither ±1 LSB, puis arrondi — le plateau écrêté sort au rail ou 1 LSB dessous | compté (`EqProcessStats.overs`, exposé `eq_overs` dans `dsp_metrics` / signal-path), **jamais journalisé** — ⚠️ **corrigé par #4073** : réserve 20·log10(Q/0,707) = −15,05 dB, 0 over |
+| `EqProcessor::process_interleaved` (chemin flottant de la sortie locale), même profil | idem, f32 | 36 896 overs, crête **×3,954 (+11,94 dBFS)**, aucune saturation | plus loin : `f32_to_native_i32` (privé, WASAPI : arrondi + clamp) ou **personne** sur le chemin cpal flottant (macOS/Linux) | compté, pas journalisé — ⚠️ **corrigé par #4073** : crête ×0,699, 0 over |
+| `EqProcessor::process_pcm`, `low_shelf` 80 Hz +6 dB (réserve −6 dB) | carré 50 Hz −0,05 dBFS, 24 bits | **17 825 overs (40,4 %)** ; crête flottante +0,45 dBFS : la réserve, somme des gains en dB (maximum **fréquentiel**), est courte de **0,50 dB** face à la réponse en **temps** d'un plateau d'ordre 2 | idem | idem — ⚠️ **corrigé par #4073** : réserve = norme L1 = −6,505 dB, 0 over |
 | volume utilisateur | — | pas de témoin ici : `volume_scale` plafonne à l'unité (`le_plafond_est_l_unite`, `un_db_positif_est_refuse_pas_rabote`) | — | — |
 
 ### Q2 — crête vraie
@@ -67,7 +74,7 @@ affirme le comportement attendu, à dé-ignorer par le correctif.
 | même carré, ReplayGain +6 dB, **pic d'échantillon** tagué (0,9943), `prevent_clipping`, plafond 0 dBTP | facteur ramené à ×1,00577 = 1/pic ; le plateau positif est posé **1 LSB au-delà du rail** (22 050 échantillons, excès 0,99 LSB — le plafond 0 dB vise 1,0 = 2^23, non représentable) | **+2,10 dBTP** |
 | idem, plafond −1 dBTP (#1694) | ×0,89640 | **+1,10 dBTP** — le plafond retire 1 dB, il ne mesure rien |
 | idem, **pic VRAI** tagué (1,2658, ce que `rg_track_true_peak` contient quand l'analyse a tourné) | ×0,79004 (−2,05 dBFS) | **−0,000 dBTP** |
-| chaîne complète du bras progressif : ReplayGain +6 dB (pic d'échantillon) **puis** égaliseur `peak` 3 kHz +6 dB Q 1 (réserve −6 dB), sinus 997 Hz −0,1 dBFS, 16 bits | après RG : 32 767 / −32 768 (au rail), après EQ : −4,72 dBFS, 0 over | après RG : **+0,000 dBTP** ; après EQ : −4,72 dBTP |
+| chaîne complète du bras progressif : ReplayGain +6 dB (pic d'échantillon) **puis** égaliseur `peak` 3 kHz +6 dB Q 1 (réserve −6 dB), sinus 997 Hz −0,1 dBFS, 16 bits | après RG : 32 767 / −32 768 (au rail), après EQ : −4,72 dBFS, 0 over | après RG : **+0,000 dBTP** ; après EQ : −4,72 dBTP — ⚠️ **#4073** porte la réserve à −7,13 dB (norme L1 de la cloche) : après EQ −5,85 dBFS / −5,85 dBTP, toujours 0 over |
 
 ### Q3 — flottant → entier, étage par étage
 
@@ -90,13 +97,15 @@ immédiat), `EqProcessor` désactivé, `EqProcessor` armé à bandes neutres
 
 ## Ce qui est prouvé, ce qui ne l'est pas
 
-**Prouvé** (18 témoins verts depuis #4075/#4076, sur toute PR Rust) : les
-comportements du tableau ci-dessus, tels qu'ils sont. Il reste **4** témoins
-`#[ignore]`, **rouges** quand on les lance (`cargo test … -- --ignored`) : ce
-sont les défauts A, B et C, pas des intentions. Le cinquième,
+**Prouvé** (21 témoins verts depuis #4073, 18 depuis #4075/#4076, 14 à la
+livraison de T9, sur toute PR Rust) : les comportements du tableau ci-dessus,
+tels qu'ils sont. Il reste **2** témoins `#[ignore]`, **rouges** quand on les
+lance (`cargo test … -- --ignored`) : ce sont les défauts A et C, pas des
+intentions. Le témoin du défaut D,
 `q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`, a été
 **dé-ignoré par #4075** — c'est aujourd'hui
-`q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither`.
+`q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither`. Les **deux**
+témoins du défaut B ont été **dé-ignorés par #4073** et sont verts.
 
 **Non prouvé ici** :
 
@@ -131,7 +140,7 @@ positif sans pic, ou l'analyser) ; et `apply_gain_pcm` compte ses écrêtés
 comme `EqProcessStats.overs`, exposés dans `signal-path`. Témoin :
 `q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague`.
 
-### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux
+### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux — ✅ **RÉGLÉ (#4073, 13/09/2026)**
 
 Mesuré : `low_pass` Q = 4 ⇒ réserve 0 dB, résonance +12,04 dB, 83,7 % d'overs
 écrêtés dur ; `low_shelf` +6 dB sur un carré ⇒ 40,4 % d'overs, réserve courte
@@ -140,6 +149,47 @@ de 0,50 dB. Attendu : réserver 20·log10(Q/0,707) pour un `low_pass` /
 fixe documentée) pour les plateaux. Témoins :
 `q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_passe_bas`,
 `q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_reponse_en_temps_d_un_plateau`.
+
+**Ce qui a été fait.** `EqProfile::automatic_headroom_db` réserve désormais
+trois termes, et seulement trois (`tune-core/src/audio/eq.rs`) :
+
+1. la **somme des gains positifs** des bandes `peak` / `low_shelf` /
+   `high_shelf`, inchangée depuis d423c16b ;
+2. la **norme L1 de la cascade à gain**, `Σ|h[n]|`, en dB — la seule borne
+   vraie de la réponse en TEMPS (`max|y| ≤ ‖h‖₁·max|x|`). C'est le PLUS GRAND
+   des deux termes qui est retenu : jamais moins que l'historique, jamais moins
+   que la borne ;
+3. la **résonance** `20·log10(Q/0,707)` de chaque `low_pass` / `high_pass` à
+   Q > 0,707, nulle en dessous.
+
+Chiffres mesurés sur Shrek (44,1 kHz) :
+
+| profil | avant | après | ce que ça couvre |
+|---|---|---|---|
+| `low_pass` 997 Hz Q = 4 | 0 dB, 36 896 overs | **−15,0515 dB**, 0 over, rien au rail, crête −3,11 dBFS | max fréquentiel exact Q/√(1−1/4Q²) = +12,11 dB, et la norme L1 du filtre, +14,19 dB |
+| `low_shelf` 80 Hz +6 dB | −6 dB, 17 825 overs | **−6,5049 dB**, 0 over | ‖h‖₁ = 6,505 dB ; crête flottante ×0,9942, borne serrée |
+| `peak` 3 kHz +6 dB Q 1 | −6 dB | **−7,1308 dB** | ‖h‖₁ = 7,131 dB |
+| `high_shelf`, `high_pass` Q ≤ 0,707, `notch` | 0 dB | **0 dB**, inchangé | — |
+| AutoEq HD 650 (10 bandes) | −13,8 dB | **−13,8 dB**, inchangé | la somme des gains (13,8) majore la norme L1 du même profil (10,3) |
+| tilt du profileur +12/+12/+12 | −36 dB | **−36 dB**, inchangé | idem |
+
+**Ce que ça coûte en niveau.** Sur un profil ORDINAIRE — plusieurs bandes
+étalées, c'est-à-dire tout profil AutoEq et tout profil du profileur à trois
+pentes — **zéro dB** : la somme des gains positifs majore déjà la norme L1 dès
+que les bandes ne se superposent pas, et c'est elle qui reste retenue. Les
+trois profils AutoEq réels du banc (`autoeq_profils_reels.rs` : −13,8, −16,7,
+−22,2 dB) sont inchangés au bit près. Seul un profil à une ou deux bandes qui
+poussent paie, et seulement ce qu'il faut : 0,50 dB pour un plateau grave
+de +6 dB, 1,13 dB pour une cloche de +6 dB.
+
+**Ce qui n'est volontairement PAS réservé.** La norme L1 des filtres `pass` et
+`notch` eux-mêmes. Un passe-haut de Butterworth — le coupe-bas ordinaire, Q =
+0,707 — a un maximum fréquentiel de 0 dB et une **norme L1 de +7,02 dB** : sur
+un carré à 50 Hz il dépasse (297 / 44 100 échantillons, 0,7 %, mesuré). La
+couvrir coûterait 7 dB de niveau à tout utilisateur d'un coupe-bas pour un
+dépassement que seul un signal adverse atteint. Une réserve trop large abîme le
+son autant qu'une réserve trop courte : la ligne est tracée là, et elle est
+témoignée par `q1_un_passe_haut_de_butterworth_ne_reserve_rien_et_c_est_assume`.
 
 ### C — ReplayGain : avec un pic d'échantillon tagué, `prevent_clipping` laisse passer les inter-échantillons
 
@@ -209,8 +259,8 @@ par `cp` + `touch`, verts — sorties collées dans la PR :
 ## Reproduction locale
 
 ```sh
-cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 18 verts, 4 ignorés
-cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 4 rouges : les défauts A–C
+cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 21 verts, 2 ignorés
+cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 2 rouges : les défauts A et C
 ```
 
 ## Comptage livré le 12/09 (agent F, `tune-core/tests/ecretage_compte_2218.rs`)
