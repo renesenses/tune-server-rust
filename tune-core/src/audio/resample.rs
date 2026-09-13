@@ -124,6 +124,111 @@ pub fn parametres_sinc(from_sr: u32, to_sr: u32) -> SincInterpolationParameters 
     }
 }
 
+// ──────────────── l'alignement d'une piste entière (D2, #4078) ────────────────
+//
+// Le délai VRAI de rubato, démontré plutôt que relevé
+// ----------------------------------------------------
+// `Async::output_delay()` rend `⌊sinc_len/2 · ratio⌋`. Ce n'est pas le délai du
+// filtre : c'est une approximation entière d'une valeur qui ne l'est pas. Le
+// délai vrai se lit dans le code de rubato 3.0.0 :
+//
+// * `InnerSinc::init_last_index()` = `−(N − 1)` (`asynchro_sinc.rs`), et
+//   `process` avance `idx` de `1/ratio` AVANT de produire chaque trame : la
+//   trame de sortie `n` est donc prise à `idx_n = −(N−1) + (n+1)/ratio` ;
+// * `make_sincs` (`sinc.rs`) range la phase `s` de sorte que son lobe central
+//   tombe sur la position `N/2 − 1 + (s+1)/F` de la fenêtre, alors que
+//   `get_nearest_times_2` (`interpolation.rs`) rend `s = ⌊frac(idx)·F⌋` : la
+//   table couvre donc `(0, 1]` là où l'index couvre `[0, 1)`, et la position
+//   réellement évaluée vaut `idx + N/2 − 1 + 1/F`.
+//
+// En remettant les deux bouts, la trame de sortie `n` échantillonne l'entrée à
+// l'instant `(n+1)/ratio − N/2 + 1/F`. Le délai vaut donc
+// `N/2 − 1/F − 1/ratio` trames d'ENTRÉE, soit
+// **`(N/2 − 1/F)·ratio − 1` trames de sortie** — la formule que le banc T10
+// avait relevée sur les sept rapports, ici démontrée.
+//
+// Pourquoi la fraction ne peut pas être annulée
+// ----------------------------------------------
+// Rien, depuis l'extérieur de rubato, ne déplace la grille de sortie : ses
+// instants sont `m/ratio + r` avec `r` constant. On ne dispose que de deux
+// leviers ENTIERS — un pré-roll de `p` trames d'entrée (qui décale de `p`
+// trames d'entrée) et le retrait de `k` trames de sortie (qui décale de
+// `k/ratio` trames d'entrée). L'écart restant vaut
+//
+//     avance(p, k) = (k+1)/ratio − (N/2 − 1/F) − p   trames d'entrée
+//
+// et `ratio = L/M` réduit : `(k+1)/ratio` ne prend que des multiples de `1/L`.
+// Le terme `1/F = 1/256` n'est un multiple de `1/L` que si `256 | L` — jamais
+// pour les cadences du produit. **Le résidu est donc irréductible**, borné par
+// `min(1/F, 1/(2L))` trames d'entrée. C'est un arrondi ASSUMÉ, et il est
+// chiffré : voir `alignement_de_piste` et le témoin
+// `alignement_residu_borne_sur_toutes_les_cadences`.
+//
+// Ce que le pré-roll apporte : sans lui, l'arrondi seul laisse jusqu'à une
+// demi-trame (mesuré : −0,40 à +0,32 trame sur les sept rapports du banc).
+// Avec lui, le résidu tombe sous 1/256 de trame d'entrée sur tous les rapports
+// mesurés. Il coûte `p < M` trames de zéros en tête — au pire 3,3 ms à
+// 44,1 kHz, jetées avec le délai.
+
+/// Le décalage de phase de la table de rubato, en trames d'entrée : sa table
+/// couvre `(0, 1]` quand son index couvre `[0, 1)`. C'est le seul terme du
+/// délai qu'aucun levier entier ne peut annuler.
+const PHASE_TABLE_ENTREE: f64 = 1.0 / SUR_ECHANTILLONNAGE as f64;
+
+/// Pré-roll maximal exploré, en trames d'entrée. La période de
+/// `p·ratio mod 1` vaut `M = from/pgcd(from, to)` ; elle est de 147 ou 640 pour
+/// toutes les cadences du produit. La borne n'existe que pour qu'une cadence
+/// exotique (`44 101 Hz`) ne fasse pas boucler 44 101 fois.
+const PRE_ROLL_MAX: usize = 1_024;
+
+fn pgcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { pgcd(b, a % b) }
+}
+
+/// Le délai vrai du filtre, en trames de sortie, pour un pré-roll de `p`
+/// trames d'entrée. Voir la note ci-dessus pour la dérivation.
+fn delai_vrai_trames_sortie(sinc_len: usize, ratio: f64, pre_roll: usize) -> f64 {
+    (sinc_len as f64 / 2.0 - PHASE_TABLE_ENTREE + pre_roll as f64) * ratio - 1.0
+}
+
+/// Ce qu'il faut faire pour qu'une piste rééchantillonnée porte l'instant zéro
+/// de sa source : `(pré-roll d'entrée, trames de sortie à retirer)`.
+///
+/// Publique parce que le banc T10 (`reechantillonnage_reference_2218.rs`) doit
+/// affirmer le résidu de la production, pas celui d'une copie du calcul.
+///
+/// Le troisième membre du triplet est le résidu prévu, en trames de sortie
+/// (positif = la piste reste en retard, négatif = en avance). Il est
+/// irréductible : voir la note ci-dessus.
+pub fn alignement_de_piste(from_sr: u32, to_sr: u32) -> (usize, usize, f64) {
+    if from_sr == 0 || to_sr == 0 || from_sr == to_sr {
+        return (0, 0, 0.0);
+    }
+    let ratio = to_sr as f64 / from_sr as f64;
+    let sinc_len = parametres_sinc(from_sr, to_sr).sinc_len;
+    let periode = (from_sr / pgcd(from_sr, to_sr)) as usize;
+    let mut meilleur = (0usize, 0usize, f64::INFINITY);
+    for p in 0..periode.min(PRE_ROLL_MAX) {
+        let d = delai_vrai_trames_sortie(sinc_len, ratio, p);
+        if d < 0.0 {
+            continue;
+        }
+        let k = d.round();
+        let residu = d - k;
+        if residu.abs() < meilleur.2.abs() {
+            meilleur = (p, k as usize, residu);
+        }
+        if residu == 0.0 {
+            break;
+        }
+    }
+    if meilleur.2.is_infinite() {
+        // Aucun pré-roll ne rend un délai positif : rien à retirer.
+        return (0, 0, 0.0);
+    }
+    meilleur
+}
+
 /// Build the stateful sinc resampler used by progressive PCM pipelines.
 ///
 /// Callers that promise an exact output rate must propagate this error: using
@@ -195,10 +300,16 @@ pub fn rubato_resample_batch_exact(
 /// Ce que compense le retrait du delai de groupe
 /// --------------------------------------------
 /// Le delai de groupe n'est pas un alignement voulu entre deux signaux : c'est
-/// la latence propre du filtre sinc. Les `output_delay()` premieres trames de
-/// sortie sont la montee en regime du FIR, pas de la matiere musicale, et le
-/// drainage de fin ajoute une queue de rembourrage symetrique. Les garder
-/// decale l'instant zero de la piste et allonge sa duree de ~2×delay trames.
+/// la latence propre du filtre sinc. Les premieres trames de sortie sont la
+/// montee en regime du FIR, pas de la matiere musicale, et le drainage de fin
+/// ajoute une queue de rembourrage symetrique. Les garder decale l'instant
+/// zero de la piste et allonge sa duree de ~2×delai trames.
+///
+/// ⚠️ Ce qui est retire n'est PAS `output_delay()` : cette valeur est
+/// `⌊sinc_len/2 · ratio⌋`, un arrondi par DEFAUT d'un delai qui vaut en
+/// realite `(sinc_len/2 − 1/256)·ratio − 1`. La retrancher enlevait jusqu'a
+/// une trame de musique en tete (#4078). C'est `alignement_de_piste` qui
+/// decide, pre-roll compris.
 ///
 /// Pourquoi ici, et surtout POURQUOI PAS sur le chemin en flux
 /// -----------------------------------------------------------
@@ -245,16 +356,30 @@ fn rubato_batch_inner(
             return simple_resample(samples, from_sr, to_sr, channels);
         }
     };
-    let delay_frames = resampler
-        .as_ref()
-        .map(|r| r.output_delay())
-        .unwrap_or_default();
+    // Le délai vrai n'est pas `output_delay()` : c'est
+    // `(sinc_len/2 − 1/256)·ratio − 1`, et il n'est pas entier. Le pré-roll
+    // rattrape ce que l'arrondi laisserait (#4078, D2 du banc T10).
+    let (pre_roll, a_retirer, _residu) = if exact {
+        alignement_de_piste(from_sr, to_sr)
+    } else {
+        (0, 0, 0.0)
+    };
+
+    let avec_pre_roll: Vec<f32>;
+    let a_traiter: &[f32] = if pre_roll > 0 {
+        let mut v = vec![0.0f32; pre_roll * ch];
+        v.extend_from_slice(samples);
+        avec_pre_roll = v;
+        &avec_pre_roll
+    } else {
+        samples
+    };
 
     // Resample using the chunk helper, then flush
     let mut batch_leftover: Vec<f32> = Vec::new();
     let mut out = rubato_resample_chunk(
         &mut resampler,
-        samples,
+        a_traiter,
         channels,
         false,
         &mut batch_leftover,
@@ -265,7 +390,7 @@ fn rubato_batch_inner(
     if exact {
         // Drop the group delay at the head, keep exactly the expected frames.
         let expected = ((samples.len() / ch) as f64 * ratio).round() as usize;
-        let skip = delay_frames.min(out.len() / ch) * ch;
+        let skip = a_retirer.min(out.len() / ch) * ch;
         out.drain(..skip);
         out.truncate(expected * ch);
     }
@@ -553,6 +678,62 @@ mod tests {
              est le couple le plus dur du jeu : 512 coefficients n'y rendent que \
              19 698 Hz. Aucun des sept rapports du banc T10 ne le mesure — \
              c'est cette boucle qui l'a trouvé"
+        );
+    }
+
+    /// D2 de T10 (#4078) : ce que l'alignement d'une piste laisse, et ce qu'il
+    /// ne peut PAS laisser.
+    ///
+    /// Le résidu est irréductible — la table de phases de rubato couvre
+    /// `(0, 1]` quand son index couvre `[0, 1)`, d'où un `1/256` de trame
+    /// d'ENTRÉE qu'aucun levier entier n'annule. Ce témoin verrouille la
+    /// borne sur les 8 × 7 couples du produit, et il verrouille surtout le
+    /// fait que l'arrondi SEUL ne suffit pas : sans pré-roll, 44,1 → 48 laisse
+    /// 0,32 trame.
+    #[test]
+    fn alignement_residu_borne_sur_toutes_les_cadences() {
+        let borne_entree = 1.0 / SUR_ECHANTILLONNAGE as f64;
+        let mut pire: f64 = 0.0;
+        for de in PRODUCT_PCM_SAMPLE_RATES {
+            for vers in PRODUCT_PCM_SAMPLE_RATES {
+                if de == vers {
+                    continue;
+                }
+                let ratio = vers as f64 / de as f64;
+                let (p, k, residu) = alignement_de_piste(de, vers);
+                let residu_entree = residu / ratio;
+                pire = pire.max(residu_entree.abs());
+                assert!(
+                    residu_entree.abs() <= borne_entree + 1e-12,
+                    "{de} → {vers} : résidu {residu_entree:.6} trame d'entrée \
+                     (pré-roll {p}, retrait {k}) — la borne démontrée est \
+                     1/{SUR_ECHANTILLONNAGE}"
+                );
+                // Ce qui est retiré reste le délai, pas de la musique.
+                let sans_pre_roll =
+                    delai_vrai_trames_sortie(parametres_sinc(de, vers).sinc_len, ratio, 0);
+                assert!(
+                    (k as f64) >= sans_pre_roll - 1.0,
+                    "{de} → {vers} : on retire {k} trames pour un délai de \
+                     {sans_pre_roll:.3} — la tête de piste serait tronquée"
+                );
+            }
+        }
+        eprintln!("[D2] pire résidu sur les 8 × 7 couples : {pire:.6} trame d'entrée");
+
+        // L'arrondi seul ne suffit pas : c'est ce que le pré-roll achète.
+        let (p, _, residu) = alignement_de_piste(44_100, 48_000);
+        let nu = delai_vrai_trames_sortie(
+            parametres_sinc(44_100, 48_000).sinc_len,
+            48_000.0 / 44_100.0,
+            0,
+        );
+        assert!(p > 0, "44,1 → 48 kHz : le pré-roll doit être exercé");
+        assert!(
+            (nu - nu.round()).abs() > 0.3 && residu.abs() < 0.01,
+            "44,1 → 48 kHz : sans pré-roll l'arrondi laisse {:.3} trame, avec \
+             pré-roll {residu:.4}",
+            nu - nu.round()
         );
     }
 
