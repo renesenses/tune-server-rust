@@ -1856,8 +1856,13 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
 /// dit qu'UNE ligne `dsp_ecretage`, au premier bloc du processus qui écrête :
 /// une ligne par bloc noierait le journal. Les lignes par piste (premier
 /// écrêtage, fin) sont portées par [`GainReplay`], qui sait où une piste
-/// commence et finit. Les échantillons produits sont ceux d'avant, à l'octet
-/// (empreintes dans `tune-core/tests/ecretage_compte_2218.rs`).
+/// commence et finit.
+///
+/// #4076 : les échantillons produits ne sont PLUS ceux d'avant — le dither a
+/// remplacé la troncature vers zéro, c'est tout l'objet du correctif. Les
+/// empreintes de `tune-core/tests/ecretage_compte_2218.rs` ont été relevées à
+/// neuf ; les COMPTEURS d'écrêtage, eux, sont inchangés (ils comparent la
+/// valeur idéale au rail, en amont du bruit et de l'arrondi).
 pub fn apply_gain_pcm(pcm: &mut [u8], bit_depth: u16, factor: f64) {
     let mut compteur = CompteurDEcretage::default();
     apply_gain_pcm_compte(pcm, bit_depth, factor, &mut compteur);
