@@ -1059,8 +1059,7 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
 /// dès sa première seconde, sans que rien ne l'ait empêchée — la zone
 /// « Volumio » de JeromeQ (fil 1750).
 ///
-/// `create_zone` la consulte désormais **à la naissance** : la route refuse ce
-/// que la lecture refusera de toute façon.
+/// [`sortie_annoncee_sans_appareil`] la consulte désormais **à la naissance**.
 ///
 /// L'exemption navigateur n'est pas un cas particulier de plus : une zone
 /// `browser` n'a **jamais** d'`output_device_id`, la sortie étant l'onglet
@@ -1071,6 +1070,35 @@ pub(crate) fn zone_sans_appareil(
     output_device_id: Option<&str>,
 ) -> bool {
     output_device_id.is_none() && output_type != Some("browser")
+}
+
+/// Le corps de `POST /zones` **annonce** une sortie qu'il ne nomme pas —
+/// le seul cas que la création refuse (#3835 / #3838).
+///
+/// `output_type: "local"` veut dire « cette zone joue sur une carte son » ;
+/// sans `output_device_id`, le serveur ne peut pas savoir laquelle. La route
+/// PORTE DÉJÀ cette vérification — `create_zone_local_device_not_found`, 404 —
+/// mais sous un `if let Some(device_id)` : le champ absent la saute. Idem pour
+/// `dlna` / `openhome`, dont l'enregistrement de sortie est sous le même `if`.
+/// Ce garde ne pose donc pas de politique neuve : il rend inconditionnel un
+/// contrôle qui existait, et refuse d'écrire une ligne que
+/// [`zone_sans_appareil`] condamne au badge rouge et au 409
+/// `zone_no_output_device` dès sa première seconde.
+///
+/// ⚠️ **Ce qui reste délibérément hors du garde** : un corps SANS
+/// `output_type` du tout (`{"name":"Salon"}`). Il n'annonce aucune sortie, et
+/// c'est le contrat historique de la « zone à remplir plus tard » — sur lequel
+/// s'appuient une trentaine de contrats de `tests/server_contracts.rs`, dont
+/// les trois `orphan_zone_*` qui gardent précisément le traitement d'une zone
+/// orpheline. Le fermer change ce contrat client : c'est l'arbitrage de
+/// Bertrand, pas celui de ce correctif. Aucun client connu n'emprunte ce
+/// chemin — `tune-web-client` pose `output_type = 'local'` par défaut
+/// (`api.ts`, `createZone`).
+pub(crate) fn sortie_annoncee_sans_appareil(
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> bool {
+    output_type.is_some() && zone_sans_appareil(output_type, output_device_id)
 }
 
 /// La décision seule, sans I/O — c'est elle que les tests couvrent.

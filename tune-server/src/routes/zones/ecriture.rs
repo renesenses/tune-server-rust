@@ -893,7 +893,12 @@ pub(super) async fn create_zone(
     // (`output_reach_of`) appliquent déjà. Elle est simplement consultée à la
     // NAISSANCE — refuser ce que la lecture refusera de toute façon —, et son
     // exemption navigateur est la même, écrite au même endroit.
-    if zone_sans_appareil(output_type, output_device_id) {
+    //
+    // Le garde ne mord que sur un corps qui ANNONCE un type de sortie : un
+    // `{"name":"Salon"}` nu reste accepté, contrat historique de la « zone à
+    // remplir plus tard ». Voir `sortie_annoncee_sans_appareil` — ce qu'il
+    // couvre, et ce qu'il laisse sciemment ouvert.
+    if sortie_annoncee_sans_appareil(output_type, output_device_id) {
         warn!(
             name = %body.name,
             output_type = ?output_type,

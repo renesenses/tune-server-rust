@@ -36,6 +36,19 @@
 //! naissance** : `POST /zones` refuse ce que `POST /zones/{id}/play` refusera
 //! de toute façon. La zone navigateur garde son exemption, écrite au même
 //! endroit que les deux autres — [`zone_sans_appareil`].
+//!
+//! ## Ce que le garde ne couvre PAS, et pourquoi c'est dit ici
+//!
+//! Il ne mord que sur un corps qui **annonce** un `output_type`
+//! ([`sortie_annoncee_sans_appareil`]). Un `{"name":"Salon"}` nu crée toujours
+//! une zone sans sortie : c'est le contrat historique de la « zone à remplir
+//! plus tard », sur lequel s'appuie une trentaine de contrats de
+//! `tests/server_contracts.rs` — dont les trois `orphan_zone_*`, écrits exprès
+//! pour garder le traitement d'une zone orpheline. Le fermer est un changement
+//! de contrat client, donc l'arbitrage de Bertrand. Aucun client connu ne passe
+//! par là : `tune-web-client` pose `output_type = 'local'` par défaut. Le
+//! témoin `sans_type_annonce_la_zone_nait_encore` le mesure au lieu de le
+//! laisser en note.
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -44,7 +57,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use tune_core::db::zone_repo::ZoneRepo;
 
-use super::zone_sans_appareil;
+use super::{sortie_annoncee_sans_appareil, zone_sans_appareil};
 
 fn serveur() -> (axum::Router, crate::state::AppState) {
     let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -108,6 +121,35 @@ fn la_regle_exempte_le_navigateur_et_personne_d_autre() {
     );
 }
 
+/// Le garde de CRÉATION est plus étroit que la règle d'état, et l'écart est
+/// volontaire : c'est tout ce qui sépare « refuser d'écrire » de « constater ».
+#[test]
+fn le_garde_de_creation_ne_mord_que_sur_un_type_annonce() {
+    assert!(
+        sortie_annoncee_sans_appareil(Some("local"), None),
+        "le corps du formulaire web : il ANNONCE une carte son et n'en nomme \
+         aucune — c'est le cas de JeromeQ, et le seul que la route refuse"
+    );
+    assert!(
+        sortie_annoncee_sans_appareil(Some("openhome"), None),
+        "annoncer un renderer réseau sans le nommer n'est pas mieux"
+    );
+    assert!(
+        !sortie_annoncee_sans_appareil(None, None),
+        "un corps SANS output_type n'annonce aucune sortie : contrat \
+         historique de la « zone à remplir plus tard », laissé ouvert \
+         sciemment (trente contrats de server_contracts s'y appuient)"
+    );
+    assert!(
+        !sortie_annoncee_sans_appareil(Some("browser"), None),
+        "même exemption que la règle d'état : l'onglet EST la sortie"
+    );
+    assert!(
+        !sortie_annoncee_sans_appareil(Some("dlna"), Some("uuid:x")),
+        "une sortie annoncée ET nommée passe"
+    );
+}
+
 /// Le ticket, mot pour mot : le corps que `Sidebar.svelte` envoie quand on
 /// tape « Volumio » et qu'on valide sans toucher au sélecteur de type.
 #[tokio::test]
@@ -132,26 +174,35 @@ async fn la_route_refuse_la_zone_du_ticket() {
     );
 }
 
-/// Le même défaut sans `output_type` du tout — la colonne reste NULL, la carte
-/// affiche « SORTIE LOCALE » par le `?? 'local'` du client. Rien ne doit
-/// dépendre de la présence du champ.
+/// **LA LIMITE DU CORRECTIF, mesurée.** Un corps sans `output_type` crée
+/// toujours une zone sans sortie. Ce n'est pas un oubli : c'est le contrat
+/// historique dont vit `tests/server_contracts.rs`, `orphan_zone_*` compris.
+///
+/// Si ce témoin rougit un jour, c'est que le contrat a été fermé — et alors
+/// c'est ici qu'il faut dire qui l'a tranché, pas ailleurs.
 #[tokio::test]
-async fn la_route_refuse_aussi_quand_le_type_est_absent() {
+async fn sans_type_annonce_la_zone_nait_encore() {
     let (app, state) = serveur();
 
-    let (statut, corps) = poster_une_zone(&app, json!({"name": "Volumio"})).await;
+    let (statut, corps) = poster_une_zone(&app, json!({"name": "Salon"})).await;
 
     assert_eq!(
         statut,
-        StatusCode::BAD_REQUEST,
-        "un corps sans output_type saute toutes les vérifications d'appareil. \
-         Corps rendu : {corps}"
+        StatusCode::CREATED,
+        "le contrat « zone à remplir plus tard » n'est PAS fermé par ce \
+         correctif. Corps rendu : {corps}"
     );
+    let zones = ZoneRepo::with_backend(state.backend.clone())
+        .list()
+        .unwrap();
+    assert_eq!(zones.len(), 1);
     assert!(
-        ZoneRepo::with_backend(state.backend.clone())
-            .list()
-            .unwrap()
-            .is_empty()
+        zone_sans_appareil(
+            zones[0].output_type.as_deref(),
+            zones[0].output_device_id.as_deref()
+        ),
+        "et elle reste une zone SANS sortie : badge rouge et 409 à la lecture — \
+         le trou qui subsiste, nommé plutôt que tu"
     );
 }
 
@@ -291,6 +342,7 @@ async fn une_zone_orpheline_deja_en_base_reste_signalee_et_refusee() {
 #[test]
 fn les_trois_consommateurs_passent_par_la_meme_regle() {
     let regle = format!("{}(", "zone_sans_appareil");
+    let garde = format!("{}(", "sortie_annoncee_sans_appareil");
 
     let ecriture = std::fs::read_to_string("src/routes/zones/ecriture.rs")
         .expect("zones/ecriture.rs doit être lisible depuis la racine du crate");
@@ -303,17 +355,22 @@ fn les_trois_consommateurs_passent_par_la_meme_regle() {
     );
     let corps = &corps[..fin];
     assert!(
-        corps.contains(&regle),
-        "create_zone ne consulte plus la règle : une zone sans appareil peut \
-         de nouveau naître, ou le refus a été réécrit en clair et divergera \
-         (#3835 / #3838)"
+        corps.contains(&garde),
+        "create_zone ne consulte plus le garde : une zone qui annonce une \
+         sortie sans la nommer peut de nouveau naître, ou le refus a été \
+         réécrit en clair et divergera (#3835 / #3838)"
     );
 
     let zones = std::fs::read_to_string("src/routes/zones.rs").expect("zones.rs doit être lisible");
     assert!(
-        zones.matches(&regle).count() >= 2,
-        "output_reach_of n'appelle plus la règle : le badge rouge et le refus \
-         de création peuvent diverger"
+        zones.matches(&regle).count() >= 3,
+        "la règle d'état n'est plus partagée : `output_reach_of` ou le garde \
+         de création l'a réécrite, et le badge rouge, le 409 et le refus \
+         peuvent diverger"
+    );
+    assert!(
+        zones.contains(&garde),
+        "le garde de création ne vit plus à côté de la règle qu'il restreint"
     );
 
     let lecture =
