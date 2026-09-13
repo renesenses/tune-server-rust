@@ -1098,7 +1098,44 @@ impl PositionPoller {
                 }
             }
 
-            if !in_seek_grace {
+            // ── Un échantillon PÉRIMÉ ne se publie pas non plus ──
+            //
+            // renesenses/tune-web-client#954, fil forum 1764.
+            //
+            // Quatre-vingts lignes plus bas, `stale_start_position` écarte les
+            // échantillons « provably-stale » — « BEFORE they poison anything »,
+            // dit son commentaire — et saute le reste du tour. Mais la position
+            // est publiée ICI, en amont : la valeur écartée avait déjà atteint
+            // l'état servi par `GET /zones` et l'évènement `position`.
+            //
+            // Le cas nommé par ce ticket est le changement de piste. Entre le
+            // basculement de `now_playing` par `PlaybackManager::play` et le
+            // démarrage réel du flux sur la sortie il s'écoule du temps — deux
+            // secondes mesurées sur le .18 le 12/09/2026 (`playback_timing …
+            // output_ms=2002`). Pendant cette fenêtre la sortie rend encore la
+            // position de la piste PRÉCÉDENTE, et le sondeur la recopiait sur la
+            // piste neuve : l'écran gardait le curseur là où il était.
+            //
+            // La garde de monotonie aggravait la chose au lieu de l'arrêter : la
+            // valeur périmée, plus grande que le plancher que `play` venait de
+            // remettre à zéro, passait pour une AVANCE et devenait le nouveau
+            // plancher. Les échantillons honnêtes du nouveau morceau étaient
+            // alors des reculs, et il en fallait cinq — cinq secondes — pour que
+            // le plancher cède.
+            //
+            // Aucune décision nouvelle : on se contente d'appeler le même
+            // prédicat au même tour, mais AVANT de publier. `ps.track_started_at`
+            // est lu ici et non plus bas parce que le repli de seek qui précède
+            // vient peut-être de le réécrire.
+            let echantillon_perime = status.realtime
+                && decisions::stale_start_position(
+                    ps.track_started_at
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0),
+                    status.position_ms,
+                );
+
+            if !in_seek_grace && !echantillon_perime {
                 // Clamp the reported position to the track duration so the UI
                 // progress bar doesn't briefly overshoot past the end. The
                 // output can report a position a few seconds past the duration
