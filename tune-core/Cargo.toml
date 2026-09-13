@@ -408,3 +408,17 @@ path = "tests/journal_latence_demarrage_local_i3568.rs"
 [[test]]
 name = "melangeur_multi_producteurs_r3"
 path = "tests/melangeur_multi_producteurs_r3.rs"
+
+# #2218 — le chemin de LECTURE journalise la perte d'un bloc FLAC. La tranche
+# T4 n'avait branché le contrôle de longueur du conteneur que sur
+# `decode_to_pcm` (l'analyse) ; `decode_to_pcm_streaming_inner` — celui qui
+# joue la musique — a sa propre boucle symphonia et ne lisait pas
+# `track.num_frames`. Binaire à lui seul : le témoin pose un abonné `tracing`
+# GLOBAL (le décodage tourne sur un fil dédié, un abonné local au fil ne
+# capterait rien et le témoin serait vert à vide), et un abonné global est
+# unique par PROCESSUS — il ne peut pas cohabiter avec les autres cibles.
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier ne
+# serait JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "journal_perte_flac_2218"
+path = "tests/journal_perte_flac_2218.rs"
