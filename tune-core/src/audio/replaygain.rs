@@ -1856,8 +1856,13 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
 /// dit qu'UNE ligne `dsp_ecretage`, au premier bloc du processus qui écrête :
 /// une ligne par bloc noierait le journal. Les lignes par piste (premier
 /// écrêtage, fin) sont portées par [`GainReplay`], qui sait où une piste
-/// commence et finit. Les échantillons produits sont ceux d'avant, à l'octet
-/// (empreintes dans `tune-core/tests/ecretage_compte_2218.rs`).
+/// commence et finit.
+///
+/// #4076 : les échantillons produits ne sont PLUS ceux d'avant — le dither a
+/// remplacé la troncature vers zéro, c'est tout l'objet du correctif. Les
+/// empreintes de `tune-core/tests/ecretage_compte_2218.rs` ont été relevées à
+/// neuf ; les COMPTEURS d'écrêtage, eux, sont inchangés (ils comparent la
+/// valeur idéale au rail, en amont du bruit et de l'arrondi).
 pub fn apply_gain_pcm(pcm: &mut [u8], bit_depth: u16, factor: f64) {
     let mut compteur = CompteurDEcretage::default();
     apply_gain_pcm_compte(pcm, bit_depth, factor, &mut compteur);
@@ -1874,11 +1879,29 @@ pub fn apply_gain_pcm(pcm: &mut [u8], bit_depth: u16, factor: f64) {
 }
 
 /// [`apply_gain_pcm`] qui COMPTE dans `compteur` chaque échantillon que le
-/// clamp ramène au rail — la condition du clamp, ni plus ni moins — sans
-/// changer un échantillon : même produit, même `clamp`, même `as i16` /
-/// `as i32` (troncature vers zéro, défaut E de T9, inchangé). Zéro
-/// allocation : un compteur à champs simples, deux comparaisons par
-/// échantillon, une addition par bloc.
+/// clamp ramène au rail — la condition du clamp, ni plus ni moins.
+///
+/// #4076 — l'écriture ne tronque plus vers zéro. Le produit passe par
+/// [`crate::audio::dither::Dither::quantifier`] : bruit TPDF ±1 LSB, puis
+/// arrondi au plus proche, puis saturation. Ce qui était mesuré et qui
+/// disparaît : un facteur de 1 − 10⁻⁷ (−0,000001 dB, inaudible **en tant que
+/// gain**) déplaçait 44 098 échantillons non nuls sur 44 098 d'un LSB **vers
+/// zéro**, et à −1 dB l'erreur portait le signe du signal — une distorsion,
+/// pas un bruit.
+///
+/// Deux invariants tiennent ce changement :
+///
+/// * **Facteur ENTIER ⇒ aucun dither** (`Dither::pour_facteur`) : 1, 2, 0
+///   envoient un entier sur un entier, sans rien perdre. Le retour immédiat
+///   sur facteur unitaire ci-dessous reste, et le couvre d'avance.
+/// * **Le comptage d'écrêtage ne change pas** : il compare la valeur IDÉALE
+///   (produit avant saturation) au rail, donc ni le bruit ni l'arrondi
+///   n'entrent dans sa condition.
+///
+/// Zéro allocation : le générateur est un `u64` sur la pile, et sa graine
+/// vient du contenu du bloc — même bloc, même facteur, **même bruit**, ce qui
+/// garde le cache de transcodage et la reprise par `Range` exacts à l'octet
+/// (voir la note « le dither est DÉTERMINISTE » de [`crate::audio::dither`]).
 pub fn apply_gain_pcm_compte(
     pcm: &mut [u8],
     bit_depth: u16,
@@ -1888,6 +1911,13 @@ pub fn apply_gain_pcm_compte(
     if pcm.is_empty() || (factor - 1.0).abs() < 1e-9 {
         return;
     }
+    // Pas de requantification, pas de dither : `pour_facteur` rend `None` pour
+    // tout facteur ENTIER, qui envoie un entier sur un entier sans rien perdre.
+    let mut dither = crate::audio::dither::Dither::pour_facteur(
+        crate::audio::dither::Etage::ReplayGain,
+        pcm,
+        factor,
+    );
     let base = compteur.echantillons_vus;
     match bit_depth {
         16 => {
@@ -1901,8 +1931,9 @@ pub fn apply_gain_pcm_compte(
                 } else if v < MIN {
                     compteur.noter_ecrete(base + i as u64, MIN - v, -v / PLEINE_ECHELLE);
                 }
-                let clamped = v.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                s.copy_from_slice(&clamped.to_le_bytes());
+                let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+                let sortie = crate::audio::dither::quantifier_avec(v, bruit, MIN, MAX) as i16;
+                s.copy_from_slice(&sortie.to_le_bytes());
             }
             compteur.noter_vus((pcm.len() / 2) as u64);
         }
@@ -1919,7 +1950,8 @@ pub fn apply_gain_pcm_compte(
                 } else if ideal < MIN {
                     compteur.noter_ecrete(base + i as u64, MIN - ideal, -ideal / PLEINE_ECHELLE);
                 }
-                let v = ideal.clamp(MIN, MAX) as i32;
+                let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+                let v = crate::audio::dither::quantifier_avec(ideal, bruit, MIN, MAX) as i32;
                 s[0] = (v & 0xFF) as u8;
                 s[1] = ((v >> 8) & 0xFF) as u8;
                 s[2] = ((v >> 16) & 0xFF) as u8;
@@ -1938,7 +1970,8 @@ pub fn apply_gain_pcm_compte(
                 } else if ideal < MIN {
                     compteur.noter_ecrete(base + i as u64, MIN - ideal, -ideal / PLEINE_ECHELLE);
                 }
-                let v = ideal.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+                let v = crate::audio::dither::quantifier_avec(ideal, bruit, MIN, MAX) as i32;
                 s.copy_from_slice(&v.to_le_bytes());
             }
             compteur.noter_vus((pcm.len() / 4) as u64);

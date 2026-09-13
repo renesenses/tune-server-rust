@@ -5,11 +5,27 @@
 //! a mesuré : (A) `apply_gain_pcm` à +6 dB sans pic tagué écrête dur 66 % d'un
 //! sinus à −0,1 dBFS, excès 31 866 LSB, sans compteur ni journal ; (B)
 //! l'égaliseur compte 83,7 % d'overs sur un passe-bas Q = 4 et ne les dit
-//! jamais. Ce fichier prouve que c'est maintenant compté et dit, et que les
-//! octets de sortie sont EXACTEMENT ceux d'avant : les empreintes FNV-1a
-//! ci-dessous ont été relevées sur `batch/bugs-12` à 49ecf1fe, AVANT le
-//! comptage, par un témoin temporaire non publié. Les 14 témoins de T9 et ses
-//! 5 ignorés restent inchangés à côté.
+//! jamais. Ce fichier prouve que c'est compté et dit, et fige les octets de
+//! sortie par des empreintes FNV-1a.
+//!
+//! # 🔴 Les empreintes ReplayGain et mélangeur ont CHANGÉ le 13/09 (#4076)
+//!
+//! Elles avaient été relevées sur `batch/bugs-12` à 49ecf1fe pour prouver que
+//! le COMPTAGE ne déplaçait pas un échantillon. Il ne l'a jamais fait, et ce
+//! n'est pas lui qui les change : #4076 remplace la **troncature vers zéro**
+//! de `apply_gain_pcm` et `PcmMixer::apply_gain` par un dither TPDF suivi d'un
+//! arrondi. Les octets devaient donc bouger — c'est l'objet du correctif, pas
+//! un effet de bord. Ce qui n'a PAS bougé, et que ce fichier continue de
+//! tenir ligne à ligne : tous les compteurs d'écrêtage (29 174 écrêtés,
+//! 31 866 LSB d'excès, 36 896 overs), parce qu'ils comparent la valeur
+//! **idéale** au rail, en amont du bruit et de l'arrondi.
+//!
+//! Les empreintes de l'**égaliseur** (`B_EQ_*`) sont, elles, inchangées : son
+//! dither était déjà là, et #4075/#4076 n'ont fait que le déplacer dans
+//! `audio::dither` sans toucher un seul nombre. C'est la meilleure preuve que
+//! la mutualisation est neutre.
+//!
+//! Les 18 témoins de T9 et ses 4 ignorés restent à côté.
 //!
 //! Le journal est capturé par un abonné `tracing_subscriber::fmt` GLOBAL,
 //! posé une fois pour le processus, qui écrit dans un tampon PROPRE AU FIL :
@@ -32,25 +48,39 @@ use tune_core::audio::replaygain::{
 const FS: u32 = 44_100;
 const N: usize = 44_100;
 
-// ───────────── empreintes FNV-1a relevées AVANT le comptage (49ecf1fe) ─────────────
+// ───────── empreintes FNV-1a ─────────
+// `A_*`, `E_*`, `Q2_*` (ReplayGain, mélangeur, chaîne) : relevées le 13/09
+// APRÈS #4075/#4076, sur `batch/bugs-13` — le dither a remplacé la troncature.
+// `B_EQ_*` : relevées à 49ecf1fe, AVANT le comptage, et INCHANGÉES depuis.
 
-const A_RG_PLUS6_16B: u64 = 0xa7a4_86c4_3cd6_d9ab;
-const A_RG_PLUS6_24B: u64 = 0xf186_0607_5951_65fe;
-const A_RG_PLUS6_32B: u64 = 0x60a9_dcb0_0373_3225;
-const E_RG_MOINS1_16B: u64 = 0x7fc6_df74_7028_6260;
-const E_RG_MOINS1_24B: u64 = 0x3d80_523f_6cc4_ccbd;
-const E_RG_MOINS1_32B: u64 = 0xaa3a_0186_8033_57e7;
+const A_RG_PLUS6_16B: u64 = 0x70ed_00f1_327a_171f;
+const A_RG_PLUS6_24B: u64 = 0x28b2_9fa3_c47f_2f8e;
+const A_RG_PLUS6_32B: u64 = 0x45d6_6c51_9c9b_bfdd;
+const E_RG_MOINS1_16B: u64 = 0x7ccf_e03f_36b3_4143;
+const E_RG_MOINS1_24B: u64 = 0x1412_74cb_e444_e276;
+const E_RG_MOINS1_32B: u64 = 0x4ae4_154e_e968_b69f;
 const B_EQ_LOWPASS_Q4_24B: u64 = 0xc2f3_7c72_784a_7078;
 const B_EQ_LOWPASS_Q4_OVERS: u64 = 36_896;
 const B_EQ_LOWSHELF_CARRE_24B: u64 = 0x285b_3693_c85d_4121;
 const B_EQ_LOWSHELF_CARRE_OVERS: u64 = 17_825;
 const B_EQ_FLOTTANT_Q4: u64 = 0xa879_54df_086e_8265;
-const Q2_RG_PIC_16B: u64 = 0x94e2_4a9d_871c_6a68;
-const Q2_CHAINE_RG_EQ_16B: u64 = 0x1e6e_dd8c_21b6_36ea;
-const E_MIXEUR_MOINS1_16B: u64 = 0x54b6_1054_e7fb_17c0;
-const E_MIXEUR_MOINS1_24B: u64 = 0x5074_ba6c_5f9d_9be9;
-const E_MIXEUR_MOINS1_32B: u64 = 0x59a8_5e56_0750_8f1e;
+const Q2_RG_PIC_16B: u64 = 0xfae0_2d13_6dbf_0670;
+const Q2_CHAINE_RG_EQ_16B: u64 = 0x25db_2059_e212_ef86;
+const E_MIXEUR_MOINS1_16B: u64 = 0x4c00_4b27_9e0f_b429;
+const E_MIXEUR_MOINS1_24B: u64 = 0x53bc_d36e_bb4c_14c0;
+const E_MIXEUR_MOINS1_32B: u64 = 0x204e_851d_0428_4df5;
 const A_MIXEUR_X2_16B: u64 = 0x64a4_cd35_d280_d173;
+/// Le même signal, le même facteur, mais découpé en 100 blocs de 441 trames.
+///
+/// Ce n'est PLUS la même empreinte que `A_RG_PLUS6_16B` (un seul tenant), et
+/// c'est une conséquence assumée de #4076 : un dither tire sa graine du
+/// CONTENU du bloc qu'on lui donne, donc découper le flux autrement donne un
+/// autre bruit. Un dither sans mémoire ni position ne peut pas faire
+/// autrement — et la propriété dont la production a besoin n'est pas
+/// « 100 blocs = un seul tenant » mais « le même découpage rend toujours les
+/// mêmes octets », que ce témoin tient aussi, puisque cette constante est
+/// stable d'une exécution à l'autre.
+const A_RG_PLUS6_16B_EN_100_BLOCS: u64 = 0x95b2_a010_14b8_3ba3;
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -311,7 +341,7 @@ fn a_replaygain_plus_6_db_sans_pic_compte_66_pour_cent_et_31_866_lsb_sans_bouger
     assert_eq!(
         fnv1a(&pcm),
         A_RG_PLUS6_16B,
-        "empreinte des octets de sortie relevée avant le comptage : 0x{A_RG_PLUS6_16B:016x}, obtenue 0x{:016x}",
+        "empreinte des octets de sortie (dither #4076) : 0x{A_RG_PLUS6_16B:016x} attendue, 0x{:016x} obtenue",
         fnv1a(&pcm)
     );
     assert_eq!(c.echantillons_vus, N as u64, "chaque échantillon est vu");
@@ -345,7 +375,7 @@ fn a_replaygain_plus_6_db_sans_pic_compte_66_pour_cent_et_31_866_lsb_sans_bouger
         let mut p = vers_pcm(&x, bits);
         let mut c = CompteurDEcretage::default();
         apply_gain_pcm_compte(&mut p, bits, facteur, &mut c);
-        assert_eq!(fnv1a(&p), empreinte, "empreinte {bits} bits inchangée");
+        assert_eq!(fnv1a(&p), empreinte, "empreinte {bits} bits, dither #4076");
         assert!(
             (65.2..=67.2).contains(&c.pourcentage()),
             "{bits} bits : {:.1} %",
@@ -369,8 +399,13 @@ fn a_gain_replay_bloc_par_bloc_produit_les_memes_octets_et_cumule() {
     let c = g.ecretage();
     assert_eq!(
         fnv1a(&pcm),
+        A_RG_PLUS6_16B_EN_100_BLOCS,
+        "le même découpage doit rendre les mêmes octets à chaque exécution"
+    );
+    assert_ne!(
+        fnv1a(&pcm),
         A_RG_PLUS6_16B,
-        "100 blocs = un seul tenant, à l'octet"
+        "#4076 : un dither dépend du découpage — si les deux empreintes          coïncident, c'est que le dither a disparu"
     );
     assert_eq!(c.echantillons_vus, N as u64);
     assert_eq!(c.exces_max_lsb, 31_866);
@@ -470,14 +505,14 @@ fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_oct
     assert_eq!(
         fnv1a(&ch),
         Q2_RG_PIC_16B,
-        "empreinte ReplayGain avec pic inchangée"
+        "empreinte ReplayGain avec pic, dither #4076"
     );
     let mut eq4 = EqProcessor::new(&profil(vec![bande("peak", 3000.0, 6.0, 1.0)]), FS, 1);
     let st4 = eq4.process_pcm(&mut ch, 16);
     assert_eq!(
         fnv1a(&ch),
         Q2_CHAINE_RG_EQ_16B,
-        "empreinte de la chaîne inchangée"
+        "empreinte de la chaîne, dither #4076"
     );
     assert_eq!(st4.overs, 0);
     assert_eq!(
@@ -510,7 +545,7 @@ fn un_signal_sous_0_dbfs_compte_zero_et_le_journal_reste_vide() {
         assert_eq!(
             fnv1a(&p),
             empreinte,
-            "ReplayGain −1 dB, {bits} bits : octets inchangés"
+            "ReplayGain −1 dB, {bits} bits : octets dithérés reproductibles"
         );
         assert_eq!(
             c.echantillons_ecretes, 0,
@@ -531,7 +566,7 @@ fn un_signal_sous_0_dbfs_compte_zero_et_le_journal_reste_vide() {
         assert_eq!(
             fnv1a(&p),
             empreinte,
-            "mixeur −1 dB, {bits} bits : octets inchangés"
+            "mixeur −1 dB, {bits} bits : octets dithérés reproductibles"
         );
     }
 
