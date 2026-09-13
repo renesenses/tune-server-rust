@@ -613,33 +613,21 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        // Rampe anti-« ploc » (#1590) — voir le callback du
-                        // chemin compressé pour le détail. `arm(0)` rétablit la
-                        // coupure franche sur DoP, PURE et sortie exclusive.
-                        ramp_cb.arm(soft_mute_cb.armed_ms());
-                        let silence =
-                            paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
-                        if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-                            data.fill(0.0);
-                            return;
-                        }
-                        // Wait for a minimum amount of data before starting
-                        // to read from the ring buffer. This prevents the
-                        // audio device from playing stale/garbage samples
-                        // during track transitions.
-                        if !ds_cb.load(Ordering::Acquire) {
-                            if ring_cb.available() < min_buf {
-                                data.fill(0.0);
-                                return;
-                            }
-                            ds_cb.store(true, Ordering::Release);
-                        }
-                        let read = ring_cb.pop(data);
-                        let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-                        ramp_cb.apply(&mut data[..read], v);
-                        if read < data.len() {
-                            data[read..].fill(0.0);
-                        }
+                        // Le corps est partagé avec le chemin compressé
+                        // (`render_local_shared_f32_callback`) : c'était deux
+                        // copies identiques, et le faux rouge de #3814 vivait
+                        // dans les deux.
+                        render_local_shared_f32_callback(
+                            &ring_cb,
+                            &vol_cb,
+                            &paused_cb,
+                            &silent_cb,
+                            &ds_cb,
+                            &mut ramp_cb,
+                            soft_mute_cb.armed_ms(),
+                            min_buf,
+                            data,
+                        );
                     },
                     make_stream_error_cb(device_gone.clone(), famine_cb),
                     None,
