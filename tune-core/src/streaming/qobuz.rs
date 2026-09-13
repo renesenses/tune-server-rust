@@ -2162,7 +2162,9 @@ impl StreamingService for QobuzService {
     /// name-matched local artist ») est gardée par `if let Ok(…)` — elle n'a
     /// donc JAMAIS tourné.
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
-        let data = self.api_get("/artist/get", &[("artist_id", artist_id)]).await?;
+        let data = self
+            .api_get("/artist/get", &[("artist_id", artist_id)])
+            .await?;
         Ok(Self::map_artist(&data))
     }
 
