@@ -306,9 +306,17 @@ fn profil(bands: Vec<EqBandSpec>) -> EqProfile {
 // ═════════════════════════ Q1 — gain, écrêtage, nommage ═════════════════════════
 
 /// Sinus 997 Hz à −0,1 dBFS, 16 bits ; ReplayGain +6 dB SANS pic tagué,
-/// `prevent_clipping` armé. Mesuré : le facteur reste ×1,995 (+6 dB), 66 % des
-/// échantillons sont écrêtés DUR (saturation, pas d'enroulement), et
-/// `apply_gain_pcm` ne rend rien : ni compteur, ni journal.
+/// `prevent_clipping` armé.
+///
+/// ⚠️ **Le nom de ce témoin décrit le DÉFAUT D'ORIGINE, corrigé par #4072.**
+/// Il est conservé tel quel — REF-0 refuse qu'un test nommé disparaisse — et
+/// son corps a été retourné : il garde désormais que le défaut ne revient pas.
+///
+/// Le relevé d'origine, sur `main` au tag v0.9.148 : le facteur restait
+/// ×1,995 (+6 dB), **66 % des échantillons étaient écrêtés dur** (saturation,
+/// pas d'enroulement), excès maximal 31 866 LSB, et `apply_gain_pcm` ne
+/// rendait rien — ni compteur, ni journal. La protection était entièrement
+/// enfermée dans un `if let Some(peak)` : sans pic tagué, elle n'existait pas.
 #[test]
 fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur_sans_le_dire() {
     let x = sinus(997.0, -0.1, N, 0.0);
@@ -323,8 +331,10 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
         reglages(true, 0.0),
     );
     assert!(
-        (facteur - 1.9953).abs() < 1e-3,
-        "sans pic tagué, prevent_clipping ne retient rien : facteur ×{facteur:.4} (+6 dB)"
+        (facteur - 1.0).abs() < 1e-9,
+        "sans pic tagué, prevent_clipping armé plafonne le facteur à la \
+         pleine échelle : ×{facteur:.4} au lieu de ×1,0000 (#4072). Avant le \
+         correctif il valait ×1,9953 et écrêtait 66 % des échantillons."
     );
     assert_eq!(
         gain_factor(
@@ -334,8 +344,9 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
             },
             reglages(true, 0.0)
         ),
-        4.0,
-        "le seul plafond du facteur est le clamp ×4 (+12 dB) de gain_factor"
+        1.0,
+        "même un gain absurde sans pic ne peut plus amplifier : le plafond \
+         n'est plus le clamp ×4 de gain_factor mais la pleine échelle (#4072)"
     );
 
     let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * facteur).collect();
@@ -346,45 +357,39 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
     let n_rail = au_rail(&sortie, 16);
     let crete = crete_echantillon(&normalise(&sortie, 16));
     eprintln!(
-        "q1 replaygain sans pic : facteur ×{facteur:.4}, idéal crête {:+.2} dBFS, écrêtés {n_ecretes}/{N} ({:.1} %), excès max {exces_lsb:.0} LSB, au rail {n_rail}",
+        "q1 replaygain sans pic, APRÈS #4072 : facteur ×{facteur:.4}, idéal crête {:+.2} dBFS, écrêtés {n_ecretes}/{N}, excès max {exces_lsb:.0} LSB, au rail {n_rail}, crête {:+.2} dBFS",
         dbfs(0.98855 * facteur),
-        100.0 * n_ecretes as f64 / N as f64
-    );
-    assert!(
-        n_ecretes > N * 6 / 10 && n_ecretes < N * 7 / 10,
-        "écrêtage massif attendu (~66 %) : {n_ecretes}/{N}"
-    );
-    assert!(
-        n_rail >= n_ecretes && n_rail - n_ecretes <= 4,
-        "chaque échantillon écrêté est posé SUR le rail (saturation dure) : rail {n_rail}, écrêtés {n_ecretes}"
+        dbfs(crete)
     );
     assert_eq!(
-        sortie.iter().max(),
-        Some(&32767),
-        "plafond = +rail exactement"
+        n_ecretes,
+        0,
+        "c'est la promesse de prevent_clipping : AUCUN échantillon au-delà du \
+         rail, pic tagué ou non. Avant le correctif : {} sur {N}.",
+        N * 66 / 100
     );
     assert_eq!(
-        sortie.iter().min(),
-        Some(&-32768),
-        "plancher = −rail exactement"
+        n_rail, 0,
+        "et donc aucun échantillon posé sur le rail par saturation : {n_rail}"
+    );
+
+    // Contre-épreuve — le signal n'est pas seulement « non écrêté », il est
+    // INTACT. Un correctif qui aurait atténué pour rentrer dans le rail
+    // passerait les deux assertions ci-dessus tout en abîmant le son.
+    assert_eq!(
+        sortie, entree,
+        "facteur ×1 : le PCM doit ressortir identique au bit près, pas \
+         seulement non écrêté"
     );
     assert!(
-        entree
-            .iter()
-            .zip(&sortie)
-            .all(|(&e, &s)| e == 0 || e.signum() == s.signum()),
-        "aucun enroulement : le signe est conservé partout"
-    );
-    assert!(
-        (crete - 1.0).abs() < 1e-4,
-        "la crête d'échantillon sort à 0 dBFS pile : {crete}"
+        (crete - 0.98855).abs() < 1e-3,
+        "la crête reste celle de l'entrée, −0,1 dBFS : {crete}"
     );
 }
 
 /// Le comportement ATTENDU : `prevent_clipping` armé ⇒ aucun échantillon
 /// écrêté, pic tagué ou non.
 #[test]
-#[ignore = "défaut connu : sans pic tagué, prevent_clipping n'empêche rien et apply_gain_pcm écrête dur sans compter (docs/mesures/2218-marge-ecretage-crete-vraie.md, issue A)"]
 fn q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague() {
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 16);
@@ -983,4 +988,76 @@ fn q4_les_etages_desarmes_sont_l_identite_octet_pour_octet() {
     EqProcessor::new(&EqProfile::default(), FS, 1).process_interleaved(&mut flottant);
     CrossfeedProcessor::new(FS, 0.0, 0.3).process_interleaved(&mut flottant);
     assert_eq!(flottant, original, "chemin flottant désarmé");
+}
+
+/// 🔴 #4072 — la garantie de `prevent_clipping` SANS pic tagué, et ses bornes.
+///
+/// Le correctif plafonne le facteur quand aucun pic n'est connu. Ces trois
+/// cas délimitent exactement ce qu'il change, pour qu'un futur ajustement ne
+/// puisse pas l'élargir ni le vider sans rougir.
+#[test]
+fn q1_sans_pic_tague_le_gain_positif_est_refuse_mais_l_attenuation_passe() {
+    // 1. Le cas du défaut : gain positif, aucun pic, protection armée.
+    //    Le facteur ne doit plus amplifier.
+    let f = gain_factor(
+        TrackGain {
+            gain_db: 6.0,
+            peak: None,
+        },
+        reglages(true, 0.0),
+    );
+    assert!(
+        f <= 1.0 + 1e-9,
+        "sans pic tagué, prevent_clipping armé ne doit PAS amplifier : \
+         facteur {f} (#4072)"
+    );
+
+    // 2. Contre-épreuve — l'ATTÉNUATION reste sûre et doit continuer de
+    //    s'appliquer : plafonner ne veut pas dire neutraliser ReplayGain.
+    let f = gain_factor(
+        TrackGain {
+            gain_db: -6.0,
+            peak: None,
+        },
+        reglages(true, 0.0),
+    );
+    let attendu = 10f64.powf(-6.0 / 20.0);
+    assert!(
+        (f - attendu).abs() < 1e-9,
+        "un gain NÉGATIF sans pic ne peut pas écrêter : il doit passer \
+         intact. attendu {attendu}, obtenu {f}"
+    );
+
+    // 3. Contre-épreuve — protection DÉSARMÉE : le gain positif repasse.
+    //    Sans elle, le correctif aurait pu confisquer l'amplification à tout
+    //    le monde, y compris à qui a explicitement éteint l'anti-écrêtage.
+    let f = gain_factor(
+        TrackGain {
+            gain_db: 6.0,
+            peak: None,
+        },
+        reglages(false, 0.0),
+    );
+    let attendu = 10f64.powf(6.0 / 20.0);
+    assert!(
+        (f - attendu).abs() < 1e-9,
+        "prevent_clipping désarmé : le gain positif doit passer intact, \
+         c'est le choix de l'utilisateur. attendu {attendu}, obtenu {f}"
+    );
+
+    // 4. Contre-épreuve — AVEC un pic tagué, rien ne change : le calcul
+    //    historique `plafond / pic` doit rester exactement celui-là.
+    let f = gain_factor(
+        TrackGain {
+            gain_db: 6.0,
+            peak: Some(0.9),
+        },
+        reglages(true, 0.0),
+    );
+    assert!(
+        (f - 1.0 / 0.9).abs() < 1e-9,
+        "avec un pic tagué, le facteur reste `plafond / pic` : attendu {}, \
+         obtenu {f}",
+        1.0 / 0.9
+    );
 }

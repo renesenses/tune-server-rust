@@ -1831,9 +1831,33 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
         // inter-échantillons. Le peak stocké est le true peak quand
         // l'analyse l'a mesuré (`stored_gain_detail` le préfère).
         let ceiling = 10f64.powf(settings.true_peak_ceiling_db.min(0.0) / 20.0);
-        if let Some(peak) = gain.peak {
-            if peak > 0.0 && factor * peak > ceiling {
-                factor = ceiling / peak;
+        match gain.peak {
+            Some(peak) if peak > 0.0 => {
+                if factor * peak > ceiling {
+                    factor = ceiling / peak;
+                }
+            }
+            // Aucun pic tagué (#4072). La protection était ENTIÈREMENT
+            // conditionnée à ce `Some` : un gain positif passait intact et
+            // `apply_gain_pcm` saturait en silence. Mesuré par le banc T9 sur
+            // un sinus à −0,1 dBFS avec +6 dB : 66,2 % des échantillons
+            // écrêtés, excès maximal 31 866 LSB, aucun compteur, aucun
+            // journal.
+            //
+            // Sans pic, on ne SAIT pas de combien le signal peut monter :
+            // aucune atténuation calculée ne peut garantir le rail. La seule
+            // garantie disponible est de ne pas amplifier — l'atténuation,
+            // elle, reste sûre et continue de s'appliquer. C'est ce que
+            // `prevent_clipping` promet à l'utilisateur qui l'arme : aucun
+            // échantillon au-delà du rail, pic tagué ou non.
+            //
+            // Une piste analysée par Tune porte toujours son pic ; ce cas ne
+            // touche donc que les tags importés incomplets et les gains de
+            // préampli seuls.
+            _ => {
+                if factor > ceiling {
+                    factor = ceiling;
+                }
             }
         }
     }
