@@ -515,15 +515,11 @@ jobs:
         if: "!matrix.cross && runner.os == 'Linux'"
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,dj,karaoke,bandcamp,concerts,plugins-wasm,audio-embedding
 
-      - name: Build (native, Windows)
-        if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
-
-      # The `asio` feature (Windows-only, cfg(all(windows, feature="asio"))) is
-      # NOT covered by the build above, so ASIO code compiled only at release
-      # time — a compile error there (e.g. #803 ASIO stall guardrails) slipped
-      # past PR CI and would only surface in the release build. Compile-check it
-      # here with the ASIO SDK so the asio path is gated on every PR.
+      # Le SDK ASIO est telecharge AVANT la construction : l'artefact Windows
+      # doit porter `local-audio` et `asio`, sinon il est incapable de toute
+      # sortie audio locale. Mesure du 13/09/2026 sur le banc Windows .42 :
+      # l'artefact d'alors rendait `audio_backend: none` et dix zones sans
+      # moteur, alors que le binaire de release y tournait en WASAPI.
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
         shell: pwsh
@@ -533,9 +529,15 @@ jobs:
           $sdkDir = Get-ChildItem -Path asiosdk -Directory | Select-Object -First 1
           echo "CPAL_ASIO_DIR=$($sdkDir.FullName)" >> $env:GITHUB_ENV
 
-      - name: ASIO feature compile-check (Windows)
+      # Cette construction couvre desormais le chemin `asio`
+      # (cfg(all(windows, feature="asio"))), qui n'etait auparavant que
+      # verifie par un `cargo check` place APRES elle : une erreur de
+      # compilation ASIO (par exemple #803) ne sortait qu'au moment de la
+      # release. Elle est maintenant gardee par la construction elle-meme,
+      # et l'artefact produit est utilisable pour ecouter.
+      - name: Build (native, Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo check --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm
 
       - name: Build (native, macOS with local-audio)
         if: "!matrix.cross && runner.os == 'macOS'"
