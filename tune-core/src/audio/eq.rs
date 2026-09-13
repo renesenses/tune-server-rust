@@ -94,7 +94,43 @@ impl EqBandSpec {
             Some(c) => c == ch,
         }
     }
+
+    /// Ce que cette bande demande de réserver pour sa RÉSONANCE, en dB (≥ 0).
+    ///
+    /// Un `low_pass` / `high_pass` RBJ vaut |H(fc)| = Q : au-dessus de
+    /// Q = 1/√2 il POUSSE, sans qu'aucun champ `gain` ne le dise. La réserve
+    /// est `20·log10(Q/0,707)` — zéro à Butterworth et au-dessous, 15,05 dB à
+    /// Q = 4. Les autres types rendent zéro : leur boost, quand il existe, est
+    /// dans leur gain.
+    fn reserve_de_resonance_db(&self) -> f64 {
+        if !matches!(self.band_type.as_str(), "low_pass" | "high_pass") || !self.q.is_finite() {
+            return 0.0;
+        }
+        // Même bornage que `coeffs` : la réserve parle du filtre RÉELLEMENT
+        // construit, pas de la valeur brute du profil.
+        let q = self.q.clamp(0.1, 30.0);
+        if q <= Q_SANS_RESONANCE {
+            return 0.0;
+        }
+        20.0 * (q / Q_SANS_RESONANCE).log10()
+    }
 }
+
+/// Le débit auquel répond [`EqProfile::automatic_headroom_db`] quand
+/// l'appelant n'en a pas.
+///
+/// 44 100 Hz est déjà la sonde du panneau signal-path
+/// (`zone_eq_step_description`) et de l'import AutoEq : la valeur affichée et
+/// la valeur appliquée parlent donc du même filtre sur toute source CD.
+pub const DEBIT_DE_REFERENCE_HZ: f64 = 44_100.0;
+
+/// Le Q d'un `pass` de Butterworth : au-dessous, la réponse ne dépasse jamais
+/// l'unité et rien n'est à réserver.
+const Q_SANS_RESONANCE: f64 = std::f64::consts::FRAC_1_SQRT_2;
+
+/// Bornes de la réponse impulsionnelle sommée par [`norme_l1`].
+const LONGUEUR_L1_MIN: usize = 4_096;
+const LONGUEUR_L1_MAX: usize = 1 << 19;
 
 fn default_band_q() -> f64 {
     1.0
@@ -176,32 +212,132 @@ impl EqProfile {
         )
     }
 
-    /// Conservative automatic headroom for one channel.
+    /// Réserve automatique d'un canal, au débit de référence.
     ///
-    /// Biquads are cascaded, so their gains multiply in the linear domain and
-    /// add in dB. Reserving the sum of every positive peak/shelf gain prevents
-    /// an EQ boost from depending on a limiter or saturator. Pass, notch and
-    /// cut-only filters need no positive-gain allowance.
+    /// Le débit entre dans le calcul (voir [`Self::automatic_headroom_db_at`]) :
+    /// cette porte-ci répond pour [`DEBIT_DE_REFERENCE_HZ`], qui est déjà la
+    /// sonde du panneau signal-path et de l'import AutoEq. Le chemin audio,
+    /// lui, réserve au débit RÉEL de la zone.
     pub fn automatic_headroom_db(&self, channel: u16) -> f64 {
-        let positive_db: f64 = if self.bands.is_empty() {
+        self.automatic_headroom_db_at(channel, DEBIT_DE_REFERENCE_HZ)
+    }
+
+    /// Réserve automatique d'un canal, en dB (négative ou nulle), au débit donné.
+    ///
+    /// Trois termes, et seulement trois — chacun répond à un défaut mesuré
+    /// (#4073, `docs/mesures/2218-marge-ecretage-crete-vraie.md`) :
+    ///
+    /// 1. **La somme des gains positifs** des bandes `peak` / `low_shelf` /
+    ///    `high_shelf`, telle qu'elle est depuis d423c16b. Les biquads se
+    ///    cascadent : leurs gains se multiplient en linéaire, s'additionnent en
+    ///    dB, et cette somme majore toujours le maximum de la réponse en
+    ///    FRÉQUENCE. Elle est conservée telle quelle, parce que sur un profil à
+    ///    plusieurs bandes elle majore aussi — largement — le terme suivant.
+    /// 2. **La norme L1 de la cascade à gain**, en dB. `max|y| ≤ ‖h‖₁·max|x|`
+    ///    est la seule borne VRAIE pour une entrée bornée quelconque, et c'est
+    ///    une réponse en TEMPS, pas en fréquence. Un plateau grave de +6 dB a
+    ///    un maximum fréquentiel de 6,000 dB et une norme L1 de 6,505 dB : sur
+    ///    un carré, la somme des gains est courte de 0,50 dB et 40 % des
+    ///    échantillons sortaient du rail. On retient le PLUS GRAND des deux
+    ///    termes : jamais moins que l'historique, jamais moins que la borne.
+    /// 3. **La résonance des `low_pass` / `high_pass`**, `20·log10(Q/0,707)`
+    ///    pour Q > 0,707, zéro sinon. Un passe-bas RBJ vaut |H(fc)| = Q :
+    ///    à Q = 4 il pousse de 12,04 dB et la réserve valait… 0 dB, pour 83,7 %
+    ///    d'overs écrêtés dur. La formule rend 15,05 dB, soit le maximum
+    ///    fréquentiel EXACT (Q/√(1−1/4Q²) = 12,11 dB) plus une marge qui couvre
+    ///    aussi la norme L1 du même filtre (14,19 dB).
+    ///
+    /// **Ce qui n'est volontairement PAS réservé** : la norme L1 des filtres
+    /// `pass` et `notch` eux-mêmes. Un passe-haut de Butterworth (Q = 0,707,
+    /// le filtre anti-rumble ordinaire) a un maximum fréquentiel de 0 dB et une
+    /// norme L1 de **7,02 dB** : la couvrir coûterait 7 dB de niveau à tout
+    /// utilisateur d'un coupe-bas, pour un dépassement qui ne se produit que
+    /// sur un signal adverse. Une réserve trop large abîme le son autant
+    /// qu'une réserve trop courte ; cette ligne-là est tracée ici, et elle est
+    /// témoignée (`marge_et_crete_2218.rs`).
+    ///
+    /// Même raison pour la **cascade qui ne pousse nulle part** : une bande qui
+    /// ne fait que creuser sonne elle aussi, sa norme L1 dépasse l'unité, et
+    /// réserver là-dessus atténuerait un profil purement soustractif — ce que
+    /// personne ne demande et que `un_profil_uniquement_attenuateur_ne_reserve_aucune_marge`
+    /// interdit. Le terme L1 ne s'applique donc que lorsqu'au moins une bande
+    /// pousse.
+    pub fn automatic_headroom_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
+        let (somme_positive_db, cascade) = self.cascade_a_gain(channel, sample_rate);
+        let l1_db = if somme_positive_db > 0.0 {
+            let l1 = norme_l1(&cascade);
+            if l1 > 1.0 { 20.0 * l1.log10() } else { 0.0 }
+        } else {
+            0.0
+        };
+        let resonance_db: f64 = if self.bands.is_empty() {
+            0.0
+        } else {
+            self.bands
+                .iter()
+                .filter(|band| band.vise_le_canal(channel))
+                .map(EqBandSpec::reserve_de_resonance_db)
+                .sum()
+        };
+        -(somme_positive_db.max(l1_db) + resonance_db)
+    }
+
+    /// La somme des gains positifs et la cascade des bandes à GAIN
+    /// (`peak` / `low_shelf` / `high_shelf`, et tout type inconnu — que
+    /// [`EqBandSpec::coeffs`] traite en `peaking_eq`), exactement celle que
+    /// construit [`EqProcessor::new`] pour ce canal, amputée des `pass` et des
+    /// `notch` dont la norme L1 n'est pas réservée (voir
+    /// [`Self::automatic_headroom_db_at`]).
+    fn cascade_a_gain(&self, channel: u16, sample_rate: f64) -> (f64, Vec<BiquadCoeffs>) {
+        if self.bands.is_empty() {
             let (bass, mid, treble) = self.effective_gains();
-            [bass, mid, treble]
+            let somme: f64 = [bass, mid, treble]
                 .into_iter()
                 .filter(|gain| gain.is_finite() && *gain > 0.0)
-                .sum()
-        } else {
+                .sum();
+            let utilisable = [bass, mid, treble].iter().all(|g| g.is_finite());
+            let actif = bass.abs() > 0.01 || mid.abs() > 0.01 || treble.abs() > 0.01;
+            let cascade = if utilisable && actif && sample_rate.is_finite() && sample_rate > 0.0 {
+                vec![
+                    low_shelf(80.0, bass, sample_rate),
+                    peaking_eq(2000.0, mid, 1.0, sample_rate),
+                    high_shelf(10000.0, treble, sample_rate),
+                ]
+            } else {
+                Vec::new()
+            };
+            return (somme, cascade);
+        }
+
+        let somme: f64 = self
+            .bands
+            .iter()
+            .filter(|band| {
+                band.vise_le_canal(channel)
+                    && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
+                    && band.gain.is_finite()
+                    && band.gain > 0.0
+            })
+            .map(|band| band.gain.clamp(0.0, 24.0))
+            .sum();
+
+        let cascade = if sample_rate.is_finite() && sample_rate > 0.0 {
             self.bands
                 .iter()
                 .filter(|band| {
                     band.vise_le_canal(channel)
-                        && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
+                        && !band.is_neutral()
+                        && !matches!(band.band_type.as_str(), "low_pass" | "high_pass" | "notch")
+                        && band.freq.is_finite()
                         && band.gain.is_finite()
-                        && band.gain > 0.0
+                        && band.q.is_finite()
                 })
-                .map(|band| band.gain.clamp(0.0, 24.0))
-                .sum()
+                .map(|band| band.coeffs(sample_rate))
+                .collect()
+        } else {
+            Vec::new()
         };
-        -positive_db
+        (somme, cascade)
     }
 
     /// Tone preset for the DECLARED listening environment.
@@ -276,6 +412,56 @@ impl BiquadState {
         self.y1 = y;
         y
     }
+}
+
+/// Norme L1 de la réponse impulsionnelle d'une cascade de biquads.
+///
+/// `Σ|h[n]|` : le gain le plus grand que cette cascade puisse donner à une
+/// entrée bornée, `max|y| ≤ ‖h‖₁·max|x|`, atteint par `x[n] = signe(h[−n])`.
+/// C'est une réponse en TEMPS : elle voit ce que le maximum de la réponse en
+/// fréquence ne voit pas — la sonnerie d'un plateau sur un front, qui est
+/// exactement le défaut de #4073.
+///
+/// La somme est tronquée, jamais infinie : la longueur vient du pôle le plus
+/// lent de la cascade (|p|² = a₂ pour une paire conjuguée), assez loin pour
+/// que l'enveloppe soit tombée à 10⁻⁹, bornée à [`LONGUEUR_L1_MIN`] …
+/// [`LONGUEUR_L1_MAX`]. Une troncature ne peut que SOUS-estimer, et
+/// [`EqProfile::automatic_headroom_db_at`] prend le maximum avec la somme
+/// historique des gains : la garantie d'avant ne peut pas être perdue par
+/// cette borne-ci. Rendue en linéaire ; une cascade vide vaut 1,0 (0 dB).
+fn norme_l1(cascade: &[BiquadCoeffs]) -> f64 {
+    if cascade.is_empty() {
+        return 1.0;
+    }
+    let rayon = cascade
+        .iter()
+        .map(|c| c.a2.abs().sqrt())
+        .fold(0.0_f64, f64::max);
+    if !rayon.is_finite() {
+        return 1.0;
+    }
+    let rayon = rayon.min(0.999_999);
+    let longueur = if rayon <= f64::EPSILON {
+        LONGUEUR_L1_MIN
+    } else {
+        let brut = 1e-9_f64.ln() / rayon.ln();
+        if brut.is_finite() && brut >= 0.0 {
+            (brut.ceil() as usize).clamp(LONGUEUR_L1_MIN, LONGUEUR_L1_MAX)
+        } else {
+            LONGUEUR_L1_MAX
+        }
+    };
+
+    let mut etats = vec![BiquadState::default(); cascade.len()];
+    let mut somme = 0.0_f64;
+    for n in 0..longueur {
+        let mut v = if n == 0 { 1.0 } else { 0.0 };
+        for (coeffs, etat) in cascade.iter().zip(etats.iter_mut()) {
+            v = etat.process(coeffs, v);
+        }
+        somme += v.abs();
+    }
+    if somme.is_finite() { somme } else { 1.0 }
 }
 
 /// Design a low-shelf biquad filter.
@@ -395,11 +581,24 @@ pub struct EqProcessor {
     /// Automatic pre-gain per channel, applied before the cascade.
     preamp_gains: Vec<f64>,
     preamp_db: Vec<f64>,
-    /// Independent deterministic PRNG state per channel for TPDF dithering.
-    dither_states: Vec<u64>,
+    /// Une suite de dither TPDF **indépendante par canal**, déterministe.
+    /// L'implémentation vient de [`crate::audio::dither`] — partagée avec
+    /// ReplayGain, le mélangeur et la réduction de profondeur (#4075, #4076) ;
+    /// l'égaliseur n'en garde plus de copie, seulement son état par canal.
+    dither_states: Vec<crate::audio::dither::Dither>,
     /// Cumulative runtime diagnostics since this processor was built for the
     /// current stream. Read by the output telemetry path (#2212).
     process_stats: EqProcessStats,
+    /// #2218 (T9, défaut B) — les `overs` étaient comptés, jamais dits. Ce
+    /// compteur suit `process_stats.overs` là où il est incrémenté, avec
+    /// l'excès et l'index du premier, et porte les DEUX lignes `dsp_ecretage`
+    /// de la piste : `ecretage_premier_dit` après le premier bloc qui écrête,
+    /// la fin dans `Drop`. `ecretage_fin_dite` est atomique parce que
+    /// `inherit_state_from` doit faire taire un processeur qu'elle ne tient
+    /// que par `&` : relayé, il ne clôt pas une piste qui continue.
+    ecretage: crate::audio::ecretage::CompteurDEcretage,
+    ecretage_premier_dit: bool,
+    ecretage_fin_dite: std::sync::atomic::AtomicBool,
     channels: u16,
     enabled: bool,
 }
@@ -457,8 +656,10 @@ impl EqProcessor {
             .iter()
             .map(|f| vec![BiquadState::default(); f.len()])
             .collect();
+        // Au débit RÉEL : la norme L1 d'un plateau et la place d'un aigu sous
+        // Nyquist ne sont pas les mêmes à 44,1 et à 192 kHz.
         let preamp_db: Vec<f64> = (0..channels.max(1))
-            .map(|ch| profile.automatic_headroom_db(ch))
+            .map(|ch| profile.automatic_headroom_db_at(ch, sr))
             .collect();
         let preamp_gains = preamp_db
             .iter()
@@ -474,11 +675,42 @@ impl EqProcessor {
             preamp_gains,
             preamp_db,
             dither_states: (0..channels.max(1))
-                .map(|channel| 0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1))
+                .map(|channel| {
+                    crate::audio::dither::Dither::depuis_graine(
+                        0x9e37_79b9_7f4a_7c15_u64 ^ (u64::from(channel) + 1),
+                    )
+                })
                 .collect(),
             process_stats: EqProcessStats::default(),
+            ecretage: crate::audio::ecretage::CompteurDEcretage::default(),
+            ecretage_premier_dit: false,
+            ecretage_fin_dite: std::sync::atomic::AtomicBool::new(false),
             channels,
             enabled,
+        }
+    }
+
+    /// #2218 — le compteur d'écrêtage de la piste : `echantillons_ecretes`
+    /// vaut exactement `process_stats().overs`, avec en plus l'excès maximal,
+    /// la crête et l'index du premier.
+    pub fn ecretage(&self) -> crate::audio::ecretage::CompteurDEcretage {
+        self.ecretage
+    }
+
+    /// Après un bloc : cumule le delta dans le registre du processus et dit
+    /// le premier écrêtage de la piste UNE fois. Jamais dans la boucle
+    /// d'échantillons.
+    fn apres_le_bloc(&mut self, avant: &crate::audio::ecretage::CompteurDEcretage) {
+        crate::audio::ecretage::REGISTRE
+            .egaliseur
+            .absorber(avant, &self.ecretage);
+        if !self.ecretage_premier_dit && self.ecretage.echantillons_ecretes > 0 {
+            self.ecretage_premier_dit = true;
+            crate::audio::ecretage::dire_premier(
+                crate::audio::ecretage::EtageEcretant::Egaliseur,
+                crate::audio::ecretage::Portee::Piste,
+                &self.ecretage,
+            );
         }
     }
 
@@ -492,8 +724,14 @@ impl EqProcessor {
 
         let bytes_per_sample = (bit_depth / 8) as usize;
         let frame_size = bytes_per_sample * self.channels as usize;
+        // #2218 — l'excès en LSB de la profondeur traitée ; `base` place le
+        // premier écrêtage dans la piste, pas dans le bloc.
+        let max_val = (1i64 << (bit_depth - 1)) as f64;
+        let avant = self.ecretage;
+        let base = avant.echantillons_vus;
+        let canaux = self.channels as u64;
 
-        for frame in pcm.chunks_exact_mut(frame_size) {
+        for (fi, frame) in pcm.chunks_exact_mut(frame_size).enumerate() {
             for ch in 0..self.channels as usize {
                 let offset = ch * bytes_per_sample;
                 let sample = read_sample_f64(&frame[offset..], bytes_per_sample, bit_depth)
@@ -511,18 +749,26 @@ impl EqProcessor {
                     s = 0.0;
                 } else if !(-1.0..1.0).contains(&s) {
                     stats.overs += 1;
+                    self.ecretage.noter_ecrete(
+                        base + fi as u64 * canaux + ch as u64,
+                        (s.abs() - 1.0) * max_val,
+                        s.abs(),
+                    );
                 }
 
-                let dither = tpdf_dither(&mut self.dither_states[ch]);
+                let dither = self.dither_states[ch].tirer();
                 write_sample_f64(&mut frame[offset..], s, bytes_per_sample, bit_depth, dither);
             }
         }
+        self.ecretage
+            .noter_vus((pcm.len() / frame_size) as u64 * canaux);
 
         self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
         self.process_stats.non_finite_samples = self
             .process_stats
             .non_finite_samples
             .saturating_add(stats.non_finite_samples);
+        self.apres_le_bloc(&avant);
         stats
     }
 
@@ -550,7 +796,14 @@ impl EqProcessor {
             return stats;
         }
 
-        for frame in samples.chunks_exact_mut(ch_count) {
+        // #2218 — ce chemin ne sature PAS (T9 : crête ×3,95 laissée passer) ;
+        // il compte les overs comme `process_pcm`, avec un LSB de référence à
+        // 24 bits faute de profondeur.
+        const LSB_REFERENCE: f64 = 8_388_608.0;
+        let avant = self.ecretage;
+        let base = avant.echantillons_vus;
+
+        for (fi, frame) in samples.chunks_exact_mut(ch_count).enumerate() {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let state = &mut self.states[ch];
                 let cascade = &self.filters[ch];
@@ -567,16 +820,23 @@ impl EqProcessor {
                     s = 0.0;
                 } else if !(-1.0..1.0).contains(&s) {
                     stats.overs += 1;
+                    self.ecretage.noter_ecrete(
+                        base + (fi * ch_count + ch) as u64,
+                        (s.abs() - 1.0) * LSB_REFERENCE,
+                        s.abs(),
+                    );
                 }
                 *sample = s as f32;
             }
         }
+        self.ecretage.noter_vus(samples.len() as u64);
 
         self.process_stats.overs = self.process_stats.overs.saturating_add(stats.overs);
         self.process_stats.non_finite_samples = self
             .process_stats
             .non_finite_samples
             .saturating_add(stats.non_finite_samples);
+        self.apres_le_bloc(&avant);
         stats
     }
 
@@ -659,6 +919,40 @@ impl EqProcessor {
         // Aucun échantillon n'est touché : `process_stats` ne sort que par
         // `dsp_metrics()`, vers `/zones/{id}/signal-path` et le rapport.
         self.process_stats = previous.process_stats;
+        // #2218 — et le compteur d'écrêtage, avec ses deux « déjà dit » : le
+        // relayé ne clôt pas la piste (elle continue dans `self`), et `self`
+        // ne redit pas un premier écrêtage déjà dit.
+        self.ecretage = previous.ecretage;
+        self.ecretage_premier_dit = previous.ecretage_premier_dit;
+        previous
+            .ecretage_fin_dite
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// #2218 — la fin de la piste : UNE ligne `dsp_ecretage` avec le total, si
+/// quelque chose a été écrêté, et rien sinon. Un processeur relayé par
+/// `inherit_state_from` se tait : sa piste continue ailleurs.
+///
+/// Le processeur est détruit côté producteur (`set_eq` / `replace_eq_live`
+/// de la sortie locale, fin du relais du bras progressif), jamais dans le
+/// rappel cpal, qui ne fait que vider l'anneau.
+impl Drop for EqProcessor {
+    fn drop(&mut self) {
+        if self
+            .ecretage_fin_dite
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        if self.ecretage.echantillons_ecretes > 0 {
+            crate::audio::ecretage::REGISTRE.egaliseur.piste_close();
+        }
+        crate::audio::ecretage::dire_fin(
+            crate::audio::ecretage::EtageEcretant::Egaliseur,
+            crate::audio::ecretage::Portee::Piste,
+            &self.ecretage,
+        );
     }
 }
 
@@ -678,9 +972,17 @@ fn read_sample_f64(buf: &[u8], bytes: usize, bit_depth: u16) -> f64 {
 
 fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16, dither_lsb: f64) {
     let max_val = (1i64 << (bit_depth - 1)) as f64;
+    // La saturation à 1,0 − 1 LSB AVANT le dither est propre à l'égaliseur :
+    // c'est son écrêtage, compté séparément (`stats.overs`). Le dither,
+    // l'arrondi et la saturation finale viennent du module partagé — même
+    // arithmétique qu'avant, à l'octet près.
     let clamped = sample.clamp(-1.0, 1.0 - 1.0 / max_val);
-    let raw = (clamped * max_val + dither_lsb).round();
-    let raw = raw.clamp(-max_val, max_val - 1.0) as i64;
+    let raw = crate::audio::dither::quantifier_avec(
+        clamped * max_val,
+        dither_lsb,
+        -max_val,
+        max_val - 1.0,
+    );
     match bytes {
         2 => {
             let b = (raw as i16).to_le_bytes();
@@ -701,20 +1003,6 @@ fn write_sample_f64(buf: &mut [u8], sample: f64, bytes: usize, bit_depth: u16, d
         }
         _ => {}
     }
-}
-
-/// Triangular PDF noise in [-1, 1] LSB, obtained by subtracting two uniform
-/// variates. Xorshift64* keeps this lock-free in the audio path.
-fn tpdf_dither(state: &mut u64) -> f64 {
-    fn uniform(state: &mut u64) -> f64 {
-        *state ^= *state >> 12;
-        *state ^= *state << 25;
-        *state ^= *state >> 27;
-        let value = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
-        (value >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64))
-    }
-
-    uniform(state) - uniform(state)
 }
 
 #[cfg(test)]

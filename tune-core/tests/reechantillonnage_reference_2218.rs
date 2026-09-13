@@ -44,9 +44,13 @@
 //! audiophile doit rendre (bande 20 kHz à −0,1 dB, réjection > 100 dB, erreur
 //! RMS < −100 dB — le plancher d'un mot de 24 bits est −144 dBFS).
 //!
-//! Portes PUBLIQUES : `audio::resample::{new_streaming_resampler,
-//! rubato_resample_chunk, rubato_resample_track}` et `rubato::Resampler` pour
-//! `output_delay()`. `tune-core` porte `autotests = false` : ce fichier est
+//! Portes PUBLIQUES : `audio::resample::{alignement_de_piste,
+//! new_streaming_resampler, parametres_sinc, rubato_resample_chunk,
+//! rubato_resample_track}` et `rubato::Resampler` pour `output_delay()`.
+//! `alignement_de_piste` et `parametres_sinc` sont publiques pour la même
+//! raison : ce banc doit affirmer ce que la PRODUCTION décide, pas une copie
+//! du calcul qui pourrait diverger en silence.
+//! `tune-core` porte `autotests = false` : ce fichier est
 //! une cible `[[test]]` du manifeste, sinon il ne serait jamais compilé.
 
 use std::f64::consts::PI;
@@ -54,7 +58,8 @@ use std::sync::OnceLock;
 
 use rubato::Resampler;
 use tune_core::audio::resample::{
-    new_streaming_resampler, parametres_sinc, rubato_resample_chunk, rubato_resample_track,
+    alignement_de_piste, new_streaming_resampler, parametres_sinc, rubato_resample_chunk,
+    rubato_resample_track,
 };
 
 // ───────────────────────────── la référence ─────────────────────────────
@@ -359,18 +364,43 @@ const RAPPORTS: [Rapport; 7] = [
 ];
 
 /// Ce que chaque rapport rend AUJOURD'HUI (relevé sur Shrek, 13/09/2026,
-/// APRÈS le correctif D1 : fenêtre Blackman², noyau choisi sur la cadence la
-/// plus basse). Les témoins affirment ces chiffres ; les tolérances sont
+/// APRÈS le correctif D1 — fenêtre Blackman², noyau choisi sur la cadence la
+/// plus basse — ET le correctif D2, #4078 : la piste retire son délai VRAI,
+/// pré-roll compris). Les témoins affirment ces chiffres ; les tolérances sont
 /// justifiées dans chaque message d'assertion.
 ///
 /// La valeur d'avant est rappelée en commentaire sur chaque entrée : ces
 /// relevés-ci ne sont pas des seuils qu'on desserre, ce sont les mesures d'un
 /// filtre qui a délibérément changé.
+///
+/// D2 (#4078) ne touche ni le filtre ni la longueur : `err_sinus_db`,
+/// `err_balayage_db`, `gain_20k_db`, `bande_hz`, `thd_n_db`,
+/// `delai_annonce`, `vidage_trames` et `marge_queue` sont **inchangés**. Ce
+/// qui bouge est le CADRAGE : `delai` (−0,17…−1,00 → ±0,0034 trame),
+/// `err_sinus_brute_db` (−17,7…−38,2 → −68,4…−79,3 dB) et les deux bords.
+///
+/// ⚠️ `rejection_db` bouge sur les TROIS montées depuis 44,1 kHz, et c'est un
+/// effet de MESURE, pas de filtre. Elle s'y mesure sur une impulsion, et son
+/// plancher est l'interpolation linéaire de rubato entre phases — une erreur
+/// qui n'est pas à bande limitée, donc qui dépend de l'endroit où l'impulsion
+/// tombe par rapport à la grille de sortie. Aligner la piste l'y ramène. Le
+/// balayage l'a mesuré sur 44,1 → 48 : résidu −0,0043 → −107,4 dB ; +0,0026
+/// (retenu) → −109,9 dB ; +0,0094 → −116,6 dB. Choisir ce dernier flatterait
+/// le chiffre au prix d'un décalage 3,7 fois plus grand : refusé. La réjection
+/// reste au-delà de 107 dB partout, et les mesures sur SIGNAL (erreur RMS,
+/// THD+N, bande, balayage) ne bougent pas d'un dixième de dB.
 struct Attendu {
     /// Délai résiduel de la piste (trames de sortie, négatif = Tune en avance).
     delai: f64,
+    /// Ce que `alignement_de_piste` decide (#4078) : pre-roll d'entree et
+    /// trames de sortie retirees.
+    pre_roll: usize,
+    a_retirer: usize,
     /// Erreur RMS contre la référence alignée, sinus 1 kHz (dB).
     err_sinus_db: f64,
+    /// Erreur RMS contre la référence à délai NUL, sinus 1 kHz (dB) : ce que
+    /// verrait un banc d'identité sample-exact, sans recalage (#4078).
+    err_sinus_brute_db: f64,
     /// THD+N de Tune à 1 kHz (dB).
     thd_n_db: f64,
     /// Erreur RMS contre la référence alignée, balayage (dB, 2 → 18 kHz).
@@ -395,15 +425,18 @@ const ATTENDU: [Attendu; 7] = [
     // 44,1 → 48 kHz — AVANT le correctif D1 : −10,31 dB à 20 kHz, bande
     // 18 550 Hz, erreur RMS −108,4 dB, délai annoncé 69 (noyau 128).
     Attendu {
-        delai: -0.685,
+        delai: 0.0026,
+        pre_roll: 53,
+        a_retirer: 196,
         err_sinus_db: -121.4,
+        err_sinus_brute_db: -69.5,
         thd_n_db: -136.8,
         err_balayage_db: -108.4,
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
-        rejection_db: -116.4,
-        bord_debut_db: -64.0,
-        bord_fin_db: -63.4,
+        rejection_db: -109.9,
+        bord_debut_db: -63.5,
+        bord_fin_db: -63.9,
         delai_annonce: 139,
         vidage_trames: 2_229,
         marge_queue: 2_013,
@@ -411,15 +444,18 @@ const ATTENDU: [Attendu; 7] = [
     // 48 → 44,1 kHz — AVANT : −9,90 dB à 20 kHz, bande 18 450 Hz, erreur RMS
     // −105,0 dB, délai annoncé 58 (noyau 128).
     Attendu {
-        delai: -0.404,
+        delai: 0.0027,
+        pre_roll: 155,
+        a_retirer: 259,
         err_sinus_db: -118.1,
+        err_sinus_brute_db: -68.4,
         thd_n_db: -138.2,
         err_balayage_db: -110.8,
         gain_20k_db: 0.0,
         bande_hz: 20_700.0,
         rejection_db: -122.6,
-        bord_debut_db: -64.9,
-        bord_fin_db: -66.2,
+        bord_debut_db: -65.3,
+        bord_fin_db: -65.6,
         delai_annonce: 117,
         vidage_trames: 1_882,
         marge_queue: 939,
@@ -427,14 +463,17 @@ const ATTENDU: [Attendu; 7] = [
     // 44,1 → 96 kHz — AVANT : −10,31 dB à 20 kHz, bande 18 550 Hz, délai
     // annoncé 139 (noyau 128).
     Attendu {
-        delai: -0.369,
+        delai: -0.0017,
+        pre_roll: 36,
+        a_retirer: 356,
         err_sinus_db: -121.4,
+        err_sinus_brute_db: -79.1,
         thd_n_db: -136.1,
         err_balayage_db: -108.4,
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
-        rejection_db: -111.1,
-        bord_debut_db: -60.7,
+        rejection_db: -107.4,
+        bord_debut_db: -60.6,
         bord_fin_db: -60.8,
         delai_annonce: 278,
         vidage_trames: 4_458,
@@ -445,15 +484,18 @@ const ATTENDU: [Attendu; 7] = [
     // `audiophile_erreur_1k_96_vers_48`, c'est un écart de GAIN en bande
     // (+0,00033 dB), pas de la distorsion — le THD+N reste à −146,3 dB.
     Attendu {
-        delai: -1.002,
+        delai: -0.002,
+        pre_roll: 0,
+        a_retirer: 63,
         err_sinus_db: -88.4,
+        err_sinus_brute_db: -71.7,
         thd_n_db: -146.3,
         err_balayage_db: -88.4,
         gain_20k_db: 0.0,
         bande_hz: 22_050.0,
         rejection_db: -134.1,
-        bord_debut_db: -74.0,
-        bord_fin_db: -73.5,
+        bord_debut_db: -73.5,
+        bord_fin_db: -74.0,
         delai_annonce: 64,
         vidage_trames: 1_024,
         marge_queue: 575,
@@ -461,15 +503,18 @@ const ATTENDU: [Attendu; 7] = [
     // 44,1 → 192 kHz — AVANT : −10,31 dB à 20 kHz, bande 18 550 Hz, délai
     // annoncé 278 (noyau 128).
     Attendu {
-        delai: -0.738,
+        delai: -0.0034,
+        pre_roll: 36,
+        a_retirer: 713,
         err_sinus_db: -121.4,
+        err_sinus_brute_db: -79.1,
         thd_n_db: -135.9,
         err_balayage_db: -108.4,
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
-        rejection_db: -111.1,
-        bord_debut_db: -61.1,
-        bord_fin_db: -61.0,
+        rejection_db: -107.5,
+        bord_debut_db: -60.9,
+        bord_fin_db: -61.1,
         delai_annonce: 557,
         vidage_trames: 8_916,
         marge_queue: 8_054,
@@ -479,14 +524,17 @@ const ATTENDU: [Attendu; 7] = [
     // fenêtre passe de Blackman-Harris² à Blackman², d'où 750 Hz de bande en
     // plus et une erreur RMS qui passe enfin sous les −100 dB.
     Attendu {
-        delai: -0.171,
+        delai: -0.0011,
+        pre_roll: 19,
+        a_retirer: 39,
         err_sinus_db: -102.0,
+        err_sinus_brute_db: -77.1,
         thd_n_db: -144.5,
         err_balayage_db: -102.3,
         gain_20k_db: 0.0,
         bande_hz: 21_150.0,
         rejection_db: -144.3,
-        bord_debut_db: -77.5,
+        bord_debut_db: -76.9,
         bord_fin_db: -77.1,
         delai_annonce: 34,
         vidage_trames: 557,
@@ -495,15 +543,18 @@ const ATTENDU: [Attendu; 7] = [
     // 192 → 44,1 kHz — AVANT : −0,04 dB à 20 kHz, bande 20 200 Hz. Noyau 512
     // avant comme après ; seule la fenêtre change.
     Attendu {
-        delai: -0.201,
+        delai: 0.0007,
+        pre_roll: 27,
+        a_retirer: 64,
         err_sinus_db: -85.4,
+        err_sinus_brute_db: -79.3,
         thd_n_db: -144.6,
         err_balayage_db: -85.4,
         gain_20k_db: 0.0,
         bande_hz: 20_600.0,
         rejection_db: -145.8,
-        bord_debut_db: -73.6,
-        bord_fin_db: -77.4,
+        bord_debut_db: -74.4,
+        bord_fin_db: -74.7,
         delai_annonce: 58,
         vidage_trames: 471,
         marge_queue: 294,
@@ -517,6 +568,11 @@ struct Mesures {
     delai_1k: f64,
     /// Idem à 10 kHz : égal au précédent si la phase est linéaire.
     delai_10k: f64,
+    /// Ce que la PRODUCTION a décidé pour aligner la piste (#4078) : pré-roll
+    /// d'entrée, trames de sortie retirées, résidu prévu (trames de sortie).
+    pre_roll: usize,
+    a_retirer: usize,
+    residu_prevu: f64,
     /// Erreur RMS (dB) sinus 1 kHz, référence à délai nul (ce que voit le gapless).
     err_sinus_brute_db: f64,
     /// Erreur RMS (dB) sinus 1 kHz, référence décalée du délai résiduel mesuré.
@@ -671,12 +727,25 @@ fn mesurer(r: Rapport) -> Mesures {
     };
 
     // ── flux par blocs : vidage et identité avec la piste ──
+    //
+    // La piste ne se compare plus au flux « moins `output_delay()` » : depuis
+    // #4078 elle porte un pré-roll de `pre_roll` trames d'entrée et retire
+    // `a_retirer` trames de sortie. Ce que ces témoins doivent prouver est
+    // inchangé — la piste n'est QUE le flux, recadré — mais il faut recadrer
+    // pareil pour le voir.
+    let (pre_roll, a_retirer, residu_prevu) = alignement_de_piste(de, vers);
+    let pre_rouler = |v: &[f32], canaux: usize| -> Vec<f32> {
+        let mut w = vec![0.0f32; pre_roll * canaux];
+        w.extend_from_slice(v);
+        w
+    };
+
     let (flux, vidage_trames, delai_annonce) = tune_flux(&x, de, vers, 1, 1_024);
     let flux_marge_queue = flux.len() as i64 - (delai_annonce + attendu) as i64;
-    let flux64 = en_f64(&flux);
-    let utile: Vec<f64> = flux64
+    let (flux_cadre, _, _) = tune_flux(&pre_rouler(&x, 1), de, vers, 1, 1_024);
+    let utile: Vec<f64> = en_f64(&flux_cadre)
         .iter()
-        .skip(delai_annonce)
+        .skip(a_retirer)
         .take(attendu)
         .copied()
         .collect();
@@ -686,8 +755,10 @@ fn mesurer(r: Rapport) -> Mesures {
     // stéréo, comme le producteur : blocs de 1 024 puis 4 096 contre la piste
     let xs: Vec<f32> = x.iter().flat_map(|&s| [s, -s * 0.5]).collect();
     let piste_s = rubato_resample_track(&xs, de, vers, 2);
-    let (f1, _, d1) = tune_flux(&xs, de, vers, 2, 1_024);
-    let (f4, _, d4) = tune_flux(&xs, de, vers, 2, 4_096);
+    let xs_cadre = pre_rouler(&xs, 2);
+    let (f1, _, _) = tune_flux(&xs_cadre, de, vers, 2, 1_024);
+    let (f4, _, _) = tune_flux(&xs_cadre, de, vers, 2, 4_096);
+    let (d1, d4) = (a_retirer, a_retirer);
     let u1 = &f1[d1 * 2..(d1 * 2 + piste_s.len()).min(f1.len())];
     let u4 = &f4[d4 * 2..(d4 * 2 + piste_s.len()).min(f4.len())];
     let ecart_max = |a: &[f32], b: &[f32]| {
@@ -702,6 +773,9 @@ fn mesurer(r: Rapport) -> Mesures {
     Mesures {
         delai_1k,
         delai_10k,
+        pre_roll,
+        a_retirer,
+        residu_prevu,
         err_sinus_brute_db,
         err_sinus_db,
         err_balayage_db,
@@ -828,19 +902,34 @@ macro_rules! temoins_du_rapport {
                     "{} : délai {:.4} à 1 kHz mais {:.4} à 10 kHz : la phase n'est pas linéaire",
                     r.nom, m.delai_1k, m.delai_10k
                 );
-                // Le délai vrai du sinc de rubato vaut (sinc_len/2 − 1/256)·ratio − 1
+                // Le délai vrai du sinc de rubato vaut (sinc_len/2 + pré-roll − 1/256)·ratio − 1
                 // trame de sortie — le 1/256 est le pas de la table suréchantillonnée
-                // (`oversampling_factor = 256`, interpolation linéaire) ; `output_delay()`
-                // rend ⌊sinc_len/2 · ratio⌋ ; la piste retire ce dernier : reste
-                // (fraction − 1) ∈ (−1, 0], jamais nul.
+                // (`oversampling_factor = 256`, interpolation linéaire). C'est
+                // `alignement_de_piste` qui choisit le pré-roll et le retrait ; on
+                // affirme ici que la MESURE rend bien ce que la production a prévu,
+                // et non une copie du calcul.
                 let ratio = r.vers as f64 / r.de as f64;
-                let explique = ((r.sinc_len() as f64 / 2.0 - 1.0 / 256.0) * ratio - 1.0)
-                    - m.delai_annonce as f64;
+                let explique = ((r.sinc_len() as f64 / 2.0 - 1.0 / 256.0 + m.pre_roll as f64)
+                    * ratio
+                    - 1.0)
+                    - m.a_retirer as f64;
                 assert!(
                     (m.delai_1k - explique).abs() < 0.005,
-                    "{} : délai résiduel {:.4} ≠ ((sinc_len/2 − 1/256)·ratio − 1) − output_delay() = {:.4} \
+                    "{} : délai résiduel {:.4} ≠ ((sinc_len/2 + pré-roll − 1/256)·ratio − 1) − retrait = {:.4} \
                      (± 0,005 : les sept rapports s'y tiennent à 0,001 près)",
                     r.nom, m.delai_1k, explique
+                );
+                assert!(
+                    (m.delai_1k - m.residu_prevu).abs() < 0.005,
+                    "{} : la production annonce un résidu de {:.4} trame (pré-roll {}, \
+                     retrait {}), la phase en mesure {:.4}",
+                    r.nom, m.residu_prevu, m.pre_roll, m.a_retirer, m.delai_1k
+                );
+                assert_eq!(
+                    (m.pre_roll, m.a_retirer), (a.pre_roll, a.a_retirer),
+                    "{} : `alignement_de_piste` rend (pré-roll {}, retrait {}), attendu ({}, {}) \
+                     — un changement de noyau déplace les deux",
+                    r.nom, m.pre_roll, m.a_retirer, a.pre_roll, a.a_retirer
                 );
             }
 
@@ -859,11 +948,14 @@ macro_rules! temoins_du_rapport {
                     "{} : THD+N de Tune à 1 kHz = {:.1} dB, attendu ≤ {:.1} + 3 (plancher f32 ≈ −140 dB)",
                     r.nom, m.thd_n_1k_db, a.thd_n_db
                 );
+                // Ce que le correctif D2 achète, vu par un banc d'identité : la
+                // référence à délai NUL, sans recalage. Elle valait −17,7 à
+                // −38,2 dB tant que la piste retirait `output_delay()`.
                 assert!(
-                    m.err_sinus_brute_db > -50.0,
-                    "{} : l'erreur SANS alignement vaut {:.1} dB : le délai résiduel a disparu, \
-                     le témoin de délai doit être relu",
-                    r.nom, m.err_sinus_brute_db
+                    (m.err_sinus_brute_db - a.err_sinus_brute_db).abs() < 1.0,
+                    "{} : erreur RMS à 1 kHz contre la référence NON recalée = {:.1} dB, \
+                     attendu {:.1} ± 1 (c'est le résidu de délai, irréductible : {:.4} trame)",
+                    r.nom, m.err_sinus_brute_db, a.err_sinus_brute_db, m.delai_1k
                 );
             }
 
@@ -991,8 +1083,10 @@ macro_rules! temoins_du_rapport {
                 );
             }
 
+            // D2 est CORRIGÉ (#4078) : ce témoin était `#[ignore]`, il est
+            // désormais exécuté. Il ne demande rien de nouveau — c'est le
+            // contrat « exact » que la fonction annonce depuis #1525.
             #[test]
-            #[ignore = "défaut connu : la piste retire ⌊sinc_len/2·ratio⌋ trames alors que le délai vrai vaut (sinc_len/2 − 1/256)·ratio − 1 ; reste −0,17 à −1,00 trame (96 → 48 : une trame entière perdue en tête)"]
             fn audiophile_delai_residuel_nul() {
                 let (m, r) = (mesures(I), RAPPORTS[I]);
                 assert!(

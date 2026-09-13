@@ -507,8 +507,9 @@ struct ImportAutoEqBody {
 ///
 /// AutoEq préfixe ses profils d'un `Preamp` négatif pour que ses gains positifs
 /// n'écrêtent pas. Tune réserve déjà cette marge, et davantage : le pré-gain
-/// automatique de l'égaliseur vaut la somme de tous les gains positifs de la
-/// cascade (`EqProfile::automatic_headroom_db`, d423c16b). Appliquer en plus le
+/// automatique de l'égaliseur vaut le plus grand de la somme de tous les gains
+/// positifs de la cascade et de sa norme L1
+/// (`EqProfile::automatic_headroom_db`, d423c16b puis #4073). Appliquer en plus le
 /// `Preamp` du fichier atténuerait deux fois.
 ///
 /// La conséquence s'entend et doit être affichée : sur l'Etymotic ER4SR, le

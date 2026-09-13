@@ -126,6 +126,47 @@ pub fn radio_logo_url(base_url: &str, logo: &str) -> String {
     artwork_url(base_url, logo)
 }
 
+/// Vrai si `path` est le chemin d'une ressource que le serveur média publie
+/// lui-même dans sa DIDL — c'est-à-dire l'image de [`track_audio_url`],
+/// [`radio_audio_url`], [`artwork_url`] ou [`radio_logo_url`].
+///
+/// #3933 : les quatre constructeurs ci-dessus émettent sous [`API_PATH`], et
+/// `/api/v1` est justement la seule surface qu'`auth_middleware` protège
+/// (`tune-server/src/routes/mod.rs`, `app.nest("/api/v1", api)`). Le reste du
+/// serveur média — `/upnp/description.xml`, le `control` ContentDirectory, le
+/// `/stream/…` du chemin PUSH — est monté à la RACINE, hors de cette couche.
+/// Résultat mesuré avec `auth_enabled = true` : un renderer découvre le
+/// serveur, le parcourt, et se fait refuser en 401 **chaque** ressource qu'il
+/// y trouve, l'audio comme la pochette. Il n'a aucun moyen de s'authentifier :
+/// il n'y a pas d'écran de connexion dans un Marantz.
+///
+/// Cette fonction vit à côté des constructeurs, et pas dans le middleware, pour
+/// une seule raison : une liste de chemins écrite ailleurs dérive. Le témoin
+/// `serveur_media_didl_hors_auth_3933` la vérifie en fabriquant ses URL avec
+/// les constructeurs eux-mêmes, jamais en réécrivant les chemins à la main.
+///
+/// Reconnaît les deux orthographes, avec et sans le préfixe [`API_PATH`] :
+/// `auth_middleware` couche le routeur `api` AVANT qu'il ne soit imbriqué, et
+/// axum retire le préfixe pour le service imbriqué — laquelle des deux arrive
+/// ici dépend de détails internes d'axum, que ce contrat ne suit pas.
+pub fn est_ressource_didl(path: &str) -> bool {
+    let path = path.strip_prefix(API_PATH).unwrap_or(path);
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match segments.as_slice() {
+        // `track_audio_url`
+        ["library", "tracks", id, "audio"] => id.parse::<i64>().is_ok(),
+        // `radio_audio_url`
+        ["radios", id, "audio.wav"] => id.parse::<i64>().is_ok(),
+        // `radio_logo_url`, forme « relais d'une adresse distante ». Doit
+        // passer AVANT le condensat : `proxy` n'est pas un hexadécimal, et
+        // l'arme du condensat capturerait le motif sans rendre la main.
+        ["library", "artwork", "proxy"] => true,
+        // `artwork_url`, et `radio_logo_url` quand le logo est un condensat nu
+        ["library", "artwork", hash] => is_hex_hash(hash),
+        _ => false,
+    }
+}
+
 #[derive(Clone)]
 pub struct UpnpState {
     pub backend: Arc<dyn DbBackend>,

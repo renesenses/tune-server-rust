@@ -115,7 +115,8 @@ fn le_hd_650_est_traduit_ligne_a_ligne() {
 /// LE point de vigilance : un profil AutoEq pousse, et sans marge il ecrete.
 ///
 /// Tune reserve la somme des gains positifs
-/// (`EqProfile::automatic_headroom_db`, d423c16b). Cette somme majore toujours
+/// (`EqProfile::automatic_headroom_db`, d423c16b ; depuis #4073, le plus grand
+/// de cette somme et de la norme L1 de la cascade). Cette somme majore toujours
 /// le maximum de la reponse combinee, que le `Preamp` d'AutoEq vient
 /// compenser : la marge reservee est donc au moins aussi protectrice que celle
 /// que le fichier demande. Ce test le VERIFIE sur les trois profils plutot que

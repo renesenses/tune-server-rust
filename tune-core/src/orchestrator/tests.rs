@@ -852,17 +852,27 @@ fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
     // ONLY with the toggle on. Everything else keeps its prior behaviour.
 
     // DSD → WAV, renderer needs LPCM, toggle ON → stream (the fix).
-    assert!(!use_file_transcode_for(true, true, true, true, false));
+    assert!(!use_file_transcode_for(
+        true, true, true, true, false, false
+    ));
     // Same, toggle OFF → temp file (rollback, unchanged).
-    assert!(use_file_transcode_for(true, true, true, false, false));
+    assert!(use_file_transcode_for(
+        true, true, true, false, false, false
+    ));
     // FLAC target (non-WAV) always temp-files for Content-Length — the
     // dsd flag can't apply (dsd_lpcm_streams stays false for non-DSD/WAV).
-    assert!(use_file_transcode_for(true, false, false, false, false));
+    assert!(use_file_transcode_for(
+        true, false, false, false, false, false
+    ));
     // WAV target a renderer is fine to stream (dlna_needs_wav false):
     // streams regardless of the flag (local/OAAT/Linn path, unchanged).
-    assert!(!use_file_transcode_for(true, true, false, false, false));
+    assert!(!use_file_transcode_for(
+        true, true, false, false, false, false
+    ));
     // Local/OAAT (not network): never file-transcodes.
-    assert!(!use_file_transcode_for(false, true, true, false, false));
+    assert!(!use_file_transcode_for(
+        false, true, true, false, false, false
+    ));
 }
 
 /// Un traitement actif RAMÈNE au fichier temporaire, quel que soit le reste.
@@ -876,22 +886,38 @@ fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
 #[test]
 fn un_traitement_actif_ne_ramene_plus_au_fichier_quand_la_cible_est_wav() {
     // Renderer FLAC-capable, DSD → WAV progressif : streame sans DSP…
-    assert!(!use_file_transcode_for(true, true, false, false, false));
+    assert!(!use_file_transcode_for(
+        true, true, false, false, false, false
+    ));
     // …et STREAME AUSSI avec un traitement actif : le relais l'applique.
-    assert!(!use_file_transcode_for(true, true, false, false, true));
+    assert!(!use_file_transcode_for(
+        true, true, false, false, false, true
+    ));
     // Renderer LPCM, bascule « Streaming continu » armée : même règle.
-    assert!(!use_file_transcode_for(true, true, true, true, false));
-    assert!(!use_file_transcode_for(true, true, true, true, true));
+    assert!(!use_file_transcode_for(
+        true, true, true, true, false, false
+    ));
+    assert!(!use_file_transcode_for(true, true, true, true, false, true));
     // Zone navigateur avec EQ (#1168) : progressive avec son traitement.
-    assert!(!use_file_transcode_for(false, true, false, false, true));
+    assert!(!use_file_transcode_for(
+        false, true, false, false, false, true
+    ));
     // Sans traitement, une sortie non réseau ne file-transcode toujours pas.
-    assert!(!use_file_transcode_for(false, true, false, false, false));
+    assert!(!use_file_transcode_for(
+        false, true, false, false, false, false
+    ));
     // Cible NON WAV (FLAC ré-encodé pour un renderer qui le lit) : le fichier,
     // avec ou sans traitement — l'encodeur FLAC n'est branché que là.
-    assert!(use_file_transcode_for(true, false, false, false, false));
-    assert!(use_file_transcode_for(true, false, false, false, true));
+    assert!(use_file_transcode_for(
+        true, false, false, false, false, false
+    ));
+    assert!(use_file_transcode_for(
+        true, false, false, false, false, true
+    ));
     // Renderer LPCM sans bascule streaming : le fichier WAV, comme avant.
-    assert!(use_file_transcode_for(true, true, true, false, false));
+    assert!(use_file_transcode_for(
+        true, true, true, false, false, false
+    ));
 }
 
 /// LAT-F1 (phase 1) — la cible WAV « pour traitement » exige les CINQ
@@ -4241,6 +4267,203 @@ async fn une_zone_locale_hors_ligne_mais_dont_la_sortie_est_enregistree_passe_to
     );
 }
 
+/// Une zone locale hors ligne, et une VRAIE piste : de quoi faire passer la
+/// route de lecture entière, pas seulement son garde.
+///
+/// Le fichier est une copie du FLAC du dépôt — la résolution lit sa taille sur
+/// le disque, un chemin fantôme échouerait en `file_not_found` et le témoin
+/// mesurerait ce refus-là au lieu du bon.
+async fn zone_locale_hors_ligne_avec_une_piste(
+    dev: &str,
+) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
+    let orch = test_orchestrator();
+    let dir = tempfile::tempdir().unwrap();
+    let chemin = dir.path().join("piste-3737.flac");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        &chemin,
+    )
+    .unwrap();
+    orch.db
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    let fichier = chemin.to_string_lossy().into_owned();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (1, 'Piste', 1, 1, ?, 'flac', 300000, 44100, 16, 2)",
+            &[&fichier as &dyn crate::db::backend::ToSqlValue],
+        )
+        .unwrap();
+    let zone_id = zone_locale_hors_ligne(&orch, "audio-gd USB audio", dev);
+    (orch, zone_id, dir)
+}
+
+/// Le refus tel que la ROUTE le rend : `play()` sans `output_device_id`, comme
+/// le client web l'appelle.
+///
+/// `gate_or_rebind_offline_zone` n'est atteint QUE par cette branche
+/// (`resoudre_la_sortie_de_la_zone` ne consulte la zone que lorsque la demande
+/// ne porte pas d'appareil). Un témoin qui appellerait le garde lui-même ne
+/// prouverait donc pas que le branchement réel est gardé.
+async fn refus_de_la_route(orch: &PlaybackOrchestrator, zone_id: i64) -> Option<String> {
+    match orch
+        .play(PlayRequest {
+            zone_id,
+            track_id: Some(1),
+            source: Some("local".into()),
+            ..Default::default()
+        })
+        .await
+    {
+        Err(e) => Some(e),
+        Ok(r) => r.error,
+    }
+}
+
+/// 🔴 #3737 — un parc local VIDE n'est pas une preuve d'absence.
+///
+/// #3738 a retiré l'exemption « une zone `local:` est toujours disponible » et
+/// l'a remplacée par « l'appareil est-il dans le registre vivant ». L'issue
+/// posait la garde qui va avec, dans la phrase suivante : « un parc vide
+/// (démarrage, énumération en cours) ferait refuser TOUTES les zones locales.
+/// Le test doit exiger un parc non vide avant de conclure à l'absence. Sans
+/// cette garde, le correctif est pire que le défaut. » Elle n'avait pas été
+/// posée.
+///
+/// Le parc local est vide sans qu'aucun appareil n'ait disparu dès que
+/// l'énumération de démarrage échoue, expire ou panique :
+/// `startup.rs::register_local_outputs` garde tout son bloc d'enregistrement
+/// par `if !devices.is_empty()`, et son propre commentaire annonce « starting
+/// the server WITHOUT local zones this boot » quand un pilote ASIO tenu par
+/// une autre application ne répond pas dans les 8 s.
+///
+/// Le registre porte ici une sortie RÉSEAU : le registre n'est pas vide, seul
+/// le parc LOCAL l'est. C'est la situation exacte d'un serveur dont le SSDP a
+/// répondu et dont l'énumération audio n'a pas répondu.
+#[tokio::test]
+async fn la_route_ne_refuse_pas_une_zone_locale_quand_le_parc_local_est_vide() {
+    let (orch, zone_id, _dir) =
+        zone_locale_hors_ligne_avec_une_piste("local:audio-gd USB audio").await;
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("dlna-salon", "Salon").with_type("dlna"),
+    ));
+
+    let erreur = refus_de_la_route(&orch, zone_id).await;
+    assert!(
+        !erreur
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("zone_output_unavailable:"),
+        "aucune énumération locale n'a eu lieu : conclure à l'absence du DAC refuse \
+         la lecture à chaque clic pour TOUT le démarrage, alors que l'appareil est \
+         branché et que `recreate_local_and_play` sait l'ouvrir sans passer par le \
+         registre — erreur rendue : {erreur:?}"
+    );
+
+    // Et rien n'a été réécrit en base au passage : la zone garde son appareil.
+    let apres = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        apres.output_device_id.as_deref(),
+        Some("local:audio-gd USB audio")
+    );
+}
+
+/// L'AUTRE moitié, sur la même route : dès qu'UN appareil local répond,
+/// l'énumération a bien eu lieu, et l'absence du DAC est mesurée.
+///
+/// C'est le cas de Jean-Luc Cassé — WASAPI n'énumère plus que « Haut-parleurs »
+/// —, et c'est ce que #3738 a corrigé. Sans ce témoin, élargir la garde
+/// ci-dessus à tout parc rouvrirait #3738 : la lecture repartirait pour mourir
+/// 600 ms plus tard, sans refus au journal.
+#[tokio::test]
+async fn la_route_refuse_toujours_une_zone_locale_quand_le_parc_local_repond() {
+    let (orch, zone_id, _dir) =
+        zone_locale_hors_ligne_avec_une_piste("local:audio-gd USB audio").await;
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:haut-parleurs", "Haut-parleurs").with_type("local"),
+    ));
+
+    let erreur = refus_de_la_route(&orch, zone_id)
+        .await
+        .expect("la route doit refuser, pas laisser partir une lecture qui ne peut pas aboutir");
+    assert!(
+        erreur.starts_with("zone_output_unavailable:"),
+        "le refus doit porter la sentinelle que la couche HTTP mappe sur un 409 : {erreur}"
+    );
+    assert!(
+        erreur.contains("audio-gd USB audio"),
+        "et NOMMER l'appareil manquant (#3737) : {erreur}"
+    );
+}
+
+/// Le même verdict, lu sur le garde lui-même : un parc local vide rend
+/// `Ok(None)` — pas de rebond au hasard, pas d'écriture en base.
+///
+/// Le témoin de route ci-dessus ne peut pas distinguer « le garde a laissé
+/// passer » de « le garde a rebondi » : les deux évitent la sentinelle. Ici on
+/// lit le verdict.
+#[tokio::test]
+async fn un_parc_local_vide_laisse_passer_sans_rebondir_ni_ecrire() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_hors_ligne(&orch, "Bureau", "local:bureau");
+    // Un homonyme RÉSEAU : le rebond de #1287 le prendrait s'il était atteint,
+    // et enverrait le son d'un DAC sur un renderer du salon.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("dlna-bureau", "Bureau").with_type("dlna"),
+    ));
+
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        orch.gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .unwrap(),
+        None,
+        "parc local vide : l'absence n'est pas mesurée, on laisse passer"
+    );
+    let apres = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        apres.output_device_id.as_deref(),
+        Some("local:bureau"),
+        "aucun rebond ne doit avoir eu lieu"
+    );
+    assert!(!apres.online, "et aucune écriture d'état non plus");
+}
+
+/// Contre-épreuve de la PORTÉE : une zone RÉSEAU dont le registre est vide
+/// reste refusée.
+///
+/// La garde de ce ticket est délibérément limitée aux sorties `local:`, parce
+/// que « le parc » n'y est une énumération de périphériques qu'à cet
+/// endroit-là. L'étendre à toutes les familles ferait taire le refus de #1287
+/// sur tout serveur dont la découverte réseau démarre.
+#[tokio::test]
+async fn une_zone_reseau_reste_refusee_meme_avec_un_registre_vide() {
+    let orch = test_orchestrator();
+    let zone_id = stale_network_zone(&orch, "Salon");
+
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_id, &zone)
+        .await
+        .expect_err("la garde du parc vide ne doit pas déborder sur les zones réseau");
+    assert!(err.starts_with("zone_output_unavailable:"), "err = {err}");
+}
+
 #[test]
 fn timeout_means_the_command_may_have_landed() {
     let err = format!(
@@ -6882,7 +7105,10 @@ async fn un_changement_d_eq_nomme_son_premier_echec() {
 ///
 /// Le format est identique avant et après : un égaliseur ne touche ni la
 /// cadence ni le nombre de canaux. Ce qu'il touche est le NIVEAU, et le
-/// pré-gain automatique le dit : ici −8,0 dB pour un unique low-shelf à +8 dB.
+/// pré-gain automatique le dit : ici −8,58 dB pour un unique low-shelf à +8 dB
+/// — la norme L1 du plateau, que #4073 réserve à la place de son seul gain
+/// crête (8,00 dB), parce qu'un plateau dépasse son maximum fréquentiel sur un
+/// front.
 /// C'est ce chiffre-là, absent de tout journal jusqu'à #3479, qui distingue
 /// « l'égaliseur a coupé le son » de « l'égaliseur a beaucoup baissé le son ».
 #[cfg(feature = "local-audio")]
@@ -6901,8 +7127,10 @@ async fn le_rapport_a_chaud_chiffre_le_format_et_le_pregain() {
     assert_eq!(r.format, Some((44_100, 2)));
     assert_eq!(r.format_ecrit(), "44100 Hz / 2 canaux / f32");
     assert!(r.eq_actif, "le profil de la zone est audible");
-    assert_eq!(r.preamp_db, Some(-8.0));
-    assert_eq!(r.preamp_db_droite, Some(-8.0));
+    let g = r.preamp_db.expect("le pré-gain gauche est chiffré");
+    let d = r.preamp_db_droite.expect("le pré-gain droit est chiffré");
+    assert!((g + 8.581_233).abs() < 1e-5, "pré-gain gauche : {g}");
+    assert!((d + 8.581_233).abs() < 1e-5, "pré-gain droit : {d}");
 }
 
 /// La famille de sortie est un MOT, pas une déduction refaite après coup.

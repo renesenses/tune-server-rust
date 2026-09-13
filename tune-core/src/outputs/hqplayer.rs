@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -13,8 +14,36 @@ pub const HQPLAYER_V6_PORT: u16 = 8019;
 /// Ports to try when auto-detecting HQPlayer.
 pub const HQPLAYER_PROBE_PORTS: &[u16] = &[4321, 8019];
 
-/// XML declaration prepended to every command sent to HQPlayer.
+/// XML declaration that heads the command stream of a control connection.
+///
+/// It is written **once per connection**, before the first command — never
+/// again (see [`frame_message`] and #4023).
 const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
+
+/// A live control connection, and whether its XML declaration is already out.
+///
+/// HQPlayer parses everything a client writes on one control socket as a
+/// *single* XML stream: the declaration belongs at its head, and a second
+/// declaration in the middle is a fatal parse error for a streaming reader.
+/// The flag is per-connection on purpose — a reconnect starts a brand new
+/// stream, which needs the declaration again.
+struct Control {
+    stream: TcpStream,
+    header_sent: bool,
+}
+
+/// Frame one command for the wire.
+///
+/// The XML declaration goes out only when the connection has not seen it yet.
+/// Every command is newline-terminated so two consecutive commands stay
+/// visibly separate in the stream.
+fn frame_message(xml_body: &str, header_sent: bool) -> String {
+    if header_sent {
+        format!("{xml_body}\n")
+    } else {
+        format!("{XML_HEADER}\n{xml_body}\n")
+    }
+}
 
 /// HQPlayer uses a custom TCP protocol with XML messages.
 /// Commands are sent as XML fragments; responses are XML documents.
@@ -24,7 +53,12 @@ pub struct HqplayerOutput {
     host: String,
     port: u16,
     /// Persistent TCP connection to HQPlayer (reconnects on failure).
-    connection: Arc<Mutex<Option<TcpStream>>>,
+    connection: Arc<Mutex<Option<Control>>>,
+    /// « J'ai déjà dit que je ne comprenais pas la réponse `Status`. »
+    ///
+    /// Le sondage tourne en boucle : sans ce garde, une réponse d'une forme
+    /// inattendue écrirait une ligne toutes les secondes.
+    etat_inconnu_dit: Arc<AtomicBool>,
 }
 
 impl HqplayerOutput {
@@ -35,16 +69,33 @@ impl HqplayerOutput {
             host,
             port,
             connection: Arc::new(Mutex::new(None)),
+            etat_inconnu_dit: Arc::new(AtomicBool::new(false)),
         }
     }
 
     /// Probe a host to find which port HQPlayer is listening on.
     /// Tries each port with a TCP connect + GetInfo handshake.
     pub async fn probe_port(host: &str) -> Option<u16> {
-        for &port in HQPLAYER_PROBE_PORTS {
+        Self::probe_port_parmi(host, HQPLAYER_PROBE_PORTS).await
+    }
+
+    /// Comme [`probe_port`](Self::probe_port), mais sur la liste de ports
+    /// donnée, dans l'ordre donné.
+    ///
+    /// Le sondeur s'en sert pour essayer le port **configuré** avant les deux
+    /// ports standards : le panneau Services laisse saisir un port, et
+    /// `probe_port` ne regardait que 4321 puis 8019 — un HQPlayer sur un
+    /// autre port n'était jamais détecté, réglage renseigné.
+    ///
+    /// `hqplayer_port_detected` est en `debug!` et non en `info!` : ce sondage
+    /// tourne toutes les 60 s et la ligne sortait à chaque tour pour dire que
+    /// rien n'avait changé (#4025). Le port découvert est journalisé au
+    /// niveau utile par l'appelant, quand il CHANGE quelque chose.
+    pub async fn probe_port_parmi(host: &str, ports: &[u16]) -> Option<u16> {
+        for &port in ports {
             match probe_hqplayer(host, port).await {
                 Ok(true) => {
-                    info!(host, port, "hqplayer_port_detected");
+                    debug!(host, port, "hqplayer_port_detected");
                     return Some(port);
                 }
                 Ok(false) => {
@@ -56,6 +107,19 @@ impl HqplayerOutput {
             }
         }
         None
+    }
+
+    /// Les ports à essayer quand `configure` est le port enregistré dans les
+    /// réglages : le sien d'abord, puis les standards qu'il ne double pas.
+    pub fn ports_a_sonder(configure: u16) -> Vec<u16> {
+        let mut ports = vec![configure];
+        ports.extend(
+            HQPLAYER_PROBE_PORTS
+                .iter()
+                .copied()
+                .filter(|p| *p != configure),
+        );
+        ports
     }
 
     /// Get or establish a TCP connection to HQPlayer.
@@ -70,7 +134,11 @@ impl HqplayerOutput {
                 .await
                 .map_err(|_| format!("hqplayer connect timeout: {addr}"))?
                 .map_err(|e| format!("hqplayer connect failed {addr}: {e}"))?;
-        *conn = Some(stream);
+        // Brand new stream: its XML declaration has not been written yet.
+        *conn = Some(Control {
+            stream,
+            header_sent: false,
+        });
         Ok(())
     }
 
@@ -81,8 +149,23 @@ impl HqplayerOutput {
     /// both the blocking QUERY path (`send_command`) and the fire-and-forget ACTION
     /// path (`send_action`) share it — they differ only in `PostWrite`.
     async fn send_inner(&self, xml_body: &str, mode: PostWrite) -> Result<String, String> {
-        // Build full XML message
-        let message = format!("{}\n{}", XML_HEADER, xml_body);
+        let mut conn = self.connection.lock().await;
+
+        // Try to use existing connection, reconnect if needed
+        let control = match conn.as_mut() {
+            Some(c) => c,
+            None => {
+                drop(conn);
+                self.get_connection().await?;
+                conn = self.connection.lock().await;
+                conn.as_mut()
+                    .ok_or_else(|| "hqplayer: no connection after reconnect".to_string())?
+            }
+        };
+
+        // Framing depends on the connection we actually got: the declaration
+        // heads a fresh stream and is never repeated on an established one.
+        let message = frame_message(xml_body, control.header_sent);
 
         // Raw protocol logging: exact bytes we put on the wire. Cheap, debug-level.
         // Lets us learn v6 behavior from the field (v6 stays silent on actions).
@@ -93,38 +176,36 @@ impl HqplayerOutput {
             "hqplayer_send"
         );
 
-        let mut conn = self.connection.lock().await;
-
-        // Try to use existing connection, reconnect if needed
-        let stream = match conn.as_mut() {
-            Some(s) => s,
-            None => {
-                drop(conn);
-                self.get_connection().await?;
-                conn = self.connection.lock().await;
-                conn.as_mut()
-                    .ok_or_else(|| "hqplayer: no connection after reconnect".to_string())?
-            }
-        };
-
         // Send the command
-        if let Err(e) = stream.write_all(message.as_bytes()).await {
+        if let Err(e) = control.stream.write_all(message.as_bytes()).await {
             // Connection broken, drop it and retry once
             *conn = None;
             drop(conn);
             self.get_connection().await?;
             let mut conn2 = self.connection.lock().await;
-            let stream2 = conn2
+            let control2 = conn2
                 .as_mut()
                 .ok_or_else(|| "hqplayer: no connection after retry".to_string())?;
-            stream2
-                .write_all(message.as_bytes())
+            // Fresh stream after the reconnect: it needs the declaration again,
+            // so re-frame instead of replaying the bytes built for the old one.
+            let retry = frame_message(xml_body, control2.header_sent);
+            debug!(
+                device = %self.name,
+                bytes = retry.len(),
+                raw = %retry.replace('\n', "\\n"),
+                "hqplayer_send_retry"
+            );
+            control2
+                .stream
+                .write_all(retry.as_bytes())
                 .await
                 .map_err(|e2| format!("hqplayer write retry failed: {e}, then {e2}"))?;
-            return post_write(stream2, mode).await;
+            control2.header_sent = true;
+            return post_write(&mut control2.stream, mode).await;
         }
 
-        post_write(stream, mode).await
+        control.header_sent = true;
+        post_write(&mut control.stream, mode).await
     }
 
     /// Send an XML QUERY command and receive the (complete-XML) response.
@@ -347,7 +428,8 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
             .map_err(|_| format!("probe timeout: {addr}"))?
             .map_err(|e| format!("probe connect: {addr}: {e}"))?;
 
-    let cmd = format!("{}\n<GetInfo />", XML_HEADER);
+    // Throw-away connection, one command: it heads its own XML stream.
+    let cmd = frame_message("<GetInfo />", false);
     stream
         .write_all(cmd.as_bytes())
         .await
@@ -362,21 +444,38 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
     )
 }
 
-/// Parse transport state from HQPlayer XML status response.
-fn parse_state_from_xml(xml: &str) -> TransportState {
-    // HQPlayer status response contains state attribute or element
+/// L'état de transport **reconnu** dans une réponse `<Status>` de HQPlayer,
+/// ou `None` quand aucun des mots attendus n'y figure.
+///
+/// Séparé de [`parse_state_from_xml`] pour une raison précise : la valeur de
+/// repli est `Stopped`, et `Stopped` n'est pas un état neutre pour le
+/// sondeur. C'est **lui** qui déclenche l'avance de file après cinq sondes
+/// (`STOPPED_TICKS_THRESHOLD`) et l'arrêt de zone après trente
+/// (`STOPPED_FAILURE_THRESHOLD`). « Je n'ai pas compris la réponse » et « le
+/// lecteur est à l'arrêt » ne peuvent donc pas rendre la même chose sans que
+/// personne ne le sache : le repli reste, mais il est désormais **dit**.
+fn etat_reconnu(xml: &str) -> Option<TransportState> {
     let lower = xml.to_lowercase();
     if lower.contains("\"playing\"") || lower.contains(">playing<") {
-        TransportState::Playing
+        Some(TransportState::Playing)
     } else if lower.contains("\"paused\"") || lower.contains(">paused<") {
-        TransportState::Paused
+        Some(TransportState::Paused)
     } else if lower.contains("\"stopped\"") || lower.contains(">stopped<") {
-        TransportState::Stopped
+        Some(TransportState::Stopped)
     } else if lower.contains("\"transitioning\"") || lower.contains("\"buffering\"") {
-        TransportState::Transitioning
+        Some(TransportState::Transitioning)
     } else {
-        TransportState::Stopped
+        None
     }
+}
+
+/// Parse transport state from HQPlayer XML status response.
+///
+/// Le comportement ne change pas : une réponse non reconnue vaut `Stopped`.
+/// Voir [`etat_reconnu`] pour ce que cela coûte, et `get_status` pour la
+/// ligne qui le signale.
+fn parse_state_from_xml(xml: &str) -> TransportState {
+    etat_reconnu(xml).unwrap_or(TransportState::Stopped)
 }
 
 /// Extract an attribute value from XML by attribute name.
@@ -448,6 +547,11 @@ impl OutputTarget for HqplayerOutput {
         // transport commands but sends NO reply, so blocking on a response would
         // hit the 5s read timeout and fail the play. `action` writes and only
         // briefly drains any v4/v5 ack. See `send_action` for the full rationale.
+        //
+        // This is the only place that puts TWO commands on one control
+        // connection, which is why #4023 showed up here and nowhere else: the
+        // second one must NOT be preceded by another XML declaration, or
+        // HQPlayer's stream parser dies on it and `Play` is never executed.
 
         // Add URI to playlist (clear existing, start playing)
         let xml = format!(
@@ -508,6 +612,23 @@ impl OutputTarget for HqplayerOutput {
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
         let response = self.command(r#"<Status subscribe="0" />"#).await?;
+
+        // #4023 — une réponse dont l'état n'est pas reconnu retombe sur
+        // `Stopped`, et `Stopped` est ce qui fait avancer la file au bout de
+        // cinq sondes puis arrêter la zone au bout de trente. Si un jour un
+        // HQPlayer répond dans une forme que ces mots ne couvrent pas, le
+        // symptôme est « l'album s'arrête après une piste » et RIEN dans le
+        // journal ne le dit. Une ligne, UNE seule par sortie : ce sondage
+        // tourne en boucle et #4025 vient justement de le faire taire.
+        if etat_reconnu(&response).is_none() && !self.etat_inconnu_dit.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                device = %self.name,
+                reponse = %response.trim().chars().take(400).collect::<String>(),
+                "hqplayer_status_etat_inconnu — aucun etat reconnu dans la reponse Status ; \
+                 lue comme `stopped`, ce qui fait avancer la file puis arreter la zone"
+            );
+        }
 
         let state = parse_state_from_xml(&response);
         let position = extract_xml_attr(&response, "position")

@@ -99,14 +99,18 @@ async fn lyrics_by_meta(
         .filter(|s| !s.is_empty());
     let duration = params.duration.filter(|d| *d > 0);
 
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let lrclib_enabled = settings
-        .get("lyrics_lrclib_enabled")
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
-    if !lrclib_enabled {
+    // #4051 — le MÊME lecteur que la route par id et que la passe de fond.
+    // Voir `routes/library/tracks.rs` : la règle vivait en trois copies, dont
+    // deux écrites au littéral.
+    if !tune_core::library::lyrics_pass::lrclib_consent_given(&state.backend) {
+        // Muette elle aussi, et pour rien : c'est la route des radios et des
+        // pistes streaming, celle qui sort à 100 % sur le réseau. Un
+        // exploitant doit pouvoir lire dans son journal que son serveur s'est
+        // abstenu parce que le réglage est éteint.
+        tracing::info!(
+            reglage = tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+            "paroles_recherche_en_ligne_desactivee"
+        );
         return no_lyrics_response();
     }
 

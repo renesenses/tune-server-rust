@@ -11,11 +11,13 @@ qui affirme le comportement attendu, à dé-ignorer par le correctif.
 
 Relevé du 12/09/2026 sur `origin/batch/bugs-12` à `49ecf1fe`, rubato 3.0.0.
 
-> **Mise à jour du 13/09/2026 — D1 est corrigé.** Tout ce qui suit jusqu'à
-> « Contre-épreuves » décrit l'état du 12/09, c'est-à-dire **avant** le
-> correctif ; il est conservé tel quel parce que c'est la mesure qui a motivé
-> le changement. Les chiffres d'aujourd'hui, le coût CPU, la latence et ce qui
-> reste ouvert sont dans « [Correctif du 13/09](#correctif-du-1309--d1-est-corrigé) ».
+> **Mise à jour du 13/09/2026 — D1 et D2 sont corrigés.** Tout ce qui suit
+> jusqu'à « Correctif du 13/09 — D1 » décrit l'état du 12/09, c'est-à-dire
+> **avant** les correctifs ; il est conservé tel quel parce que c'est la mesure
+> qui a motivé les changements. Les chiffres d'aujourd'hui, le coût CPU, la
+> latence et ce qui reste ouvert sont dans
+> « [Correctif du 13/09 — D1](#correctif-du-1309--d1-est-corrigé) » puis
+> « [Correctif du 13/09 — D2](#correctif-du-1309--d2-est-corrigé) ».
 
 ## Pourquoi une référence
 
@@ -370,12 +372,167 @@ avec leurs motifs remis à jour).
   que le délai vrai vaut `(sinc_len/2 − 1/256)·ratio − 1` : il reste −0,17 à
   −1,00 trame de décalage, une trame entière perdue en tête en 96 → 48.
   Inchangé par ce correctif (le délai résiduel bouge avec le noyau, le défaut
-  non).
+  non) — **et vérifié tel quel après lui** : voir
+  « [Correctif du 13/09 — D2](#correctif-du-1309--d2-est-corrigé) », #4078.
 * **D3** — l'erreur en bande reste au-dessus de −100 dB sur 96 → 48
   (−88,4 dB) et 192 → 44,1 (−85,4 dB), et ce correctif l'a **aggravée** sur ces
   deux-là. C'est un gain scalaire, pas de la distorsion. Piste inchangée :
   `oversampling_factor`, ou une normalisation explicite du gain continu du
   noyau.
+
+
+## Correctif du 13/09 — D2 est corrigé
+
+Mesuré sur Shrek, `fix/4078-delai-residuel-src-b209` sur `origin/batch/bugs-13`
+(`baa7f19d`), rubato 3.0.0 — donc **sur le noyau d'après D1** (Blackman²,
+barème 256/512/1024).
+
+Première question, posée avant d'écrire une ligne : **D2 survit-il au correctif
+de D1 ?** Oui, à l'identique. Les sept témoins `audiophile_delai_residuel_nul`
+relevés sur `batch/bugs-13` **avant toute retouche** rendent −0,404 / −0,685 /
+−0,369 / −1,002 / −0,738 / −0,171 / −0,201 trame : les chiffres du relevé du
+12/09 sont inchangés par D1, et « une trame entière perdue en 96 → 48 kHz »
+tient toujours.
+
+### Le délai vrai, démontré au lieu d'être relevé
+
+La formule `(sinc_len/2 − 1/256)·ratio − 1` était une constatation du banc.
+Elle se lit maintenant dans le code de rubato 3.0.0 — et c'est cette lecture
+qui dit ce qui est réductible et ce qui ne l'est pas :
+
+* `InnerSinc::init_last_index()` (`asynchro_sinc.rs`) vaut `−(N − 1)`, et
+  `process` (`asynchro.rs`) avance `idx` de `1/ratio` **avant** chaque trame :
+  la trame de sortie `n` est prise à `idx_n = −(N−1) + (n+1)/ratio` ;
+* `make_sincs` (`sinc.rs`) range la phase `s` de sorte que son lobe central
+  tombe en `N/2 − 1 + (s+1)/F` de la fenêtre (`F = oversampling_factor = 256`),
+  alors que `get_nearest_times_2` (`interpolation.rs`) rend
+  `s = ⌊frac(idx)·F⌋` : **la table couvre `(0, 1]` là où l'index couvre
+  `[0, 1)`**. La position réellement évaluée vaut donc `idx + N/2 − 1 + 1/F`.
+
+En recollant les deux bouts : la trame de sortie `n` échantillonne l'entrée à
+l'instant `(n+1)/ratio − N/2 + 1/F`. Le délai vaut donc `N/2 − 1/F − 1/ratio`
+trames d'ENTRÉE, soit **`(N/2 − 1/F)·ratio − 1` trames de sortie**.
+`output_delay()`, lui, rend `⌊N/2 · ratio⌋` : un arrondi **par défaut** d'une
+valeur voisine, jamais la valeur.
+
+### La fraction : ce qu'on peut en faire, et ce qu'on ne peut pas
+
+Depuis l'extérieur de rubato, la grille de sortie ne bouge pas : ses instants
+sont `m/ratio + r`, `r` constant. Il n'existe que deux leviers, tous deux
+**entiers** — un pré-roll de `p` trames d'entrée, et le retrait de `k` trames
+de sortie. L'écart restant vaut
+
+```
+avance(p, k) = (k+1)/ratio − (N/2 − 1/F) − p      trames d'entrée
+```
+
+et avec `ratio = L/M` réduit, `(k+1)/ratio` ne prend que des multiples de
+`1/L`. Le terme `1/F = 1/256` n'est un multiple de `1/L` que si `256 | L` —
+**jamais pour les cadences du produit**. Le résidu est donc *irréductible*,
+borné par `min(1/F, 1/(2L))` trame d'entrée.
+
+**Le choix : arrondi assumé, résidu chiffré.** `alignement_de_piste` balaie `p`
+sur une période (`M = de/pgcd(de, vers)`), prend `k = round(délai vrai)` et
+garde le couple qui minimise `|résidu|`. Sans pré-roll, l'arrondi seul
+laisserait **−0,40 à +0,32 trame** sur les sept rapports — le contrat
+« exact » ne tiendrait pas. Avec, il reste au pire **1/256 de trame
+d'ENTRÉE**, et le témoin `alignement_residu_borne_sur_toutes_les_cadences`
+le verrouille sur les **8 × 7 couples** que le produit annonce : pire relevé
+**0,003906 trame d'entrée**, soit exactement `1/256`. À 44,1 kHz : **89 ns**.
+
+Le pré-roll coûte `p < M` trames de zéros en tête — au pire 155 trames, 3,5 ms
+à 44,1 kHz — jetées avec le délai.
+
+### Les sept rapports
+
+| rapport | résidu av. → ap. | pré-roll | retrait (`output_delay()` d'avant) | identité SANS recalage av. → ap. |
+|---|---|---|---|---|
+| 44,1 → 48 | **−0,685 → +0,00255** | 53 | 196 (139) | −21,0 → **−69,5 dB** |
+| 48 → 44,1 | **−0,404 → +0,00266** | 155 | 259 (117) | −24,8 → **−68,4 dB** |
+| 44,1 → 96 | **−0,369 → −0,00170** | 36 | 356 (278) | −32,3 → **−79,1 dB** |
+| 96 → 48 | **−1,002 → −0,00195** | 0 | 63 (64) | −17,7 → **−71,7 dB** |
+| 44,1 → 192 | **−0,738 → −0,00340** | 36 | 713 (557) | −32,3 → **−79,1 dB** |
+| 176,4 → 48 | **−0,171 → −0,00106** | 19 | 39 (34) | −33,0 → **−77,1 dB** |
+| 192 → 44,1 | **−0,201 → +0,00067** | 27 | 64 (58) | −30,9 → **−79,3 dB** |
+
+La dernière colonne est ce que voit un banc d'identité sample-exact : la
+référence à délai NUL, sans recalage. Le plancher qui reste — −68 à −79 dB —
+est le résidu de délai lui-même et rien d'autre ; la mesure RECALÉE, elle, ne
+bouge pas (−121,4 / −118,2 / −121,3 / −88,4 / −121,4 / −102,1 / −85,4 dB).
+
+Le délai mesuré par la phase à 1 kHz colle à ce que la production annonce
+(`alignement_de_piste`) à **1e−8 près**, et le délai à 10 kHz au délai à 1 kHz
+à 1e−6 près : la phase reste linéaire.
+
+### Ce que le correctif change dans le rendu, et ce qu'il ne change pas
+
+**Il change le son, et c'est le but.** En 96 → 48 kHz, une trame entière de
+musique cessait d'exister en tête de chaque piste convertie (#1525) ou décodée
+en bloc (#2246), remplacée par une trame de queue filtrée : elle revient. Sur
+les six autres rapports, c'est une fraction de trame de décalage qui disparaît.
+La v0.9.148 venait de changer le rendu du rééchantillonneur (D1) ; **celui-ci
+est le second changement délibéré, et il doit être écouté avant publication.**
+
+Ce qui ne bouge pas, vérifié plutôt qu'affirmé : `err_sinus_db`,
+`err_balayage_db`, `gain_20k_db`, `bande_hz`, `thd_n_db`, `delai_annonce`,
+`vidage_trames`, `marge_queue` — identiques à 0,1 dB / 0 trame près sur les
+sept rapports. Les empreintes de R1 (`empreinte_du_puits_r1.rs`) ne bougent
+**pas d'un bit** : elles passent par `new_streaming_resampler` et
+`rubato_resample_chunk`, pas par la piste. L'identité blocs de 1 024 / 4 096 /
+piste reste **exacte à 0** — recadrée du même pré-roll, la piste n'est toujours
+QUE le flux.
+
+**Une valeur bouge, et c'est un effet de MESURE** : la réjection des images des
+trois montées depuis 44,1 kHz, la seule qui se mesure sur une IMPULSION. Son
+plancher est l'interpolation linéaire de rubato entre phases — une erreur qui
+n'est pas à bande limitée, donc qui dépend de l'endroit où l'impulsion tombe
+par rapport à la grille de sortie. Aligner la piste l'y ramène. Balayé sur
+44,1 → 48 en faisant varier le pré-roll :
+
+| pré-roll | résidu | réjection |
+|---|---|---|
+| 19 | −0,00425 | −107,4 dB |
+| **53 (retenu)** | **+0,00255** | **−109,9 dB** |
+| 87 | +0,00935 | −116,6 dB |
+
+Le troisième garde le chiffre d'avant et passerait le seuil de 0,01 trame : il
+est **refusé**, ce serait choisir un décalage 3,7 fois plus grand pour flatter
+une mesure. Après correctif : −109,9 dB (44,1 → 48), −107,4 (44,1 → 96),
+−107,5 (44,1 → 192). Les quatre autres rapports mesurent leur réjection sur un
+TON et ne bougent pas (−122,6 / −134,1 / −144,0 / −145,5 dB). Partout au-delà
+de **107 dB**, soit 7 dB de marge sur le seuil audiophile de 100 dB.
+
+### Témoins dé-ignorés
+
+Les 7 témoins `r*::audiophile_delai_residuel_nul` passent au vert et sont
+exécutés. Il reste **2 ignorés**, tous D3 :
+`audiophile_erreur_1k_{96_vers_48, 192_vers_44_1}`.
+
+Deux témoins gagnent en plus une affirmation :
+`delai_residuel_affirme_la_mesure` affirme désormais le couple
+`(pré-roll, retrait)` que la PRODUCTION décide — et non une copie du calcul,
+qui pourrait diverger en silence comme le barème des noyaux l'avait fait avant
+D1 ; `erreur_rms_sinus_1k_affirme_la_mesure` affirme l'identité SANS recalage,
+là où il vérifiait auparavant qu'elle était mauvaise.
+
+### Ce qui reste, et n'est pas traité ici
+
+* **`StreamingPcmAdapter` (`audio/decode.rs`) porte le MÊME défaut**, et il
+  n'est pas corrigé ici. Il retire lui aussi `output_delay()`
+  (`resampler_delay_remaining`), pour les décodages progressifs servis en
+  HTTP ; il crée son rééchantillonneur par piste, donc `alignement_de_piste`
+  s'y appliquerait tel quel. Aucun témoin ne le mesure aujourd'hui : le
+  corriger sans banc serait un changement de rendu non prouvé sur le chemin
+  servi aux testeurs. À ouvrir séparément, avec son banc.
+* **D3** — inchangé : l'erreur en bande reste au-dessus de −100 dB sur
+  96 → 48 (−88,4 dB) et 192 → 44,1 (−85,4 dB). C'est un gain scalaire, pas de
+  la distorsion.
+* **Le résidu de 1/256 de trame d'entrée** est irréductible sans toucher à
+  rubato. Le supprimer demanderait soit un filtre de retard fractionnaire de
+  plus dans la chaîne — un second FIR, pour 89 ns — soit un correctif chez
+  rubato sur l'indexation `(0, 1]` / `[0, 1)` de sa table. Ni l'un ni l'autre
+  ne se justifie à cette échelle.
+
 
 ## Contre-épreuves
 
@@ -430,20 +587,23 @@ branche `de/vers ≤ 2`, pas seulement la source 44,1 kHz.
 
 ## Témoins
 
-82 dans la cible : **67 passés, 15 ignorés** (D1 : 5, D2 : 7, D3 : 3), 0
-rouge. Par rapport : `delai_residuel`, `erreur_rms_sinus_1k`,
+82 dans la cible. Au 12/09 : **67 passés, 15 ignorés** (D1 : 5, D2 : 7,
+D3 : 3). Après les correctifs D1 et D2 du 13/09 : **80 passés, 2 ignorés**
+(D3 seulement), 0 rouge. Par rapport : `delai_residuel`, `erreur_rms_sinus_1k`,
 `erreur_rms_balayage`, `bande_passante`, `rejection`, `bords`,
 `longueur_et_vidage`, `blocs_de_1024_et_4096_rendent_la_piste_a_l_identique`
 (×7), les seuils audiophiles `audiophile_bande_20k_*` (7, 5 ignorés),
-`audiophile_erreur_1k_*` (7, 3 ignorés), `audiophile_delai_residuel_nul`
-(×7, tous ignorés), les 4 preuves de la référence, et le relevé
+`audiophile_erreur_1k_*` (7, 3 ignorés au 12/09, 2 aujourd'hui),
+`audiophile_delai_residuel_nul` (×7, tous ignorés au 12/09, tous exécutés
+aujourd'hui), les 4 preuves de la référence, et le relevé
 (`releve_de_tous_les_rapports`, imprime tout avec `--nocapture`).
 
 ## Cases de #2218 (« SRC, remix et DSP »)
 
 * « Nombre exact de frames pour chaque ratio et flush » — déjà cochée ;
   confirmée ici contre une référence (longueur exacte, vidage déterministe),
-  **avec une réserve** : exact en nombre, pas en position (D2).
+  **et la réserve de position est levée** depuis #4078 : exact en nombre ET
+  en position, à 1/256 de trame d'entrée près.
 * « Impulsion, sweep, bande passante, réjection d'alias, bruit et THD+N » —
   déjà cochée ; **ne devrait pas l'être** telle quelle : la bande passante
   n'avait jamais été mesurée à 20 kHz. Ce document la rend cochable **pour les
@@ -469,6 +629,8 @@ rouge. Par rapport : `delai_residuel`, `erreur_rms_sinus_1k`,
    (#2246) sont touchés, pas le flux. Piste : retirer `output_delay() − 1`
    trames, ou compenser la fraction par un rééchantillonnage à phase
    ajustée. Dé-ignorer `r*::audiophile_delai_residuel_nul`.
+   → ouverte en **#4078**, **corrigée le 13/09** : le délai vrai est retiré,
+   pré-roll d'entrée compris ; résidu ≤ 1/256 de trame d'entrée.
 3. **« SRC 192 → 44,1 : erreur en bande −87,8 dB (gain +0,00036 dB), sous le
    seuil de 24 bits »** — noyau 512, ondulation de bande passante ; 96 → 48
    et 176,4 → 48 à −99 dB. Pas de distorsion (THD+N < −143 dB). Piste :
@@ -478,6 +640,6 @@ rouge. Par rapport : `delai_residuel`, `erreur_rms_sinus_1k`,
 
 ```sh
 cargo test -p tune-core --test reechantillonnage_reference_2218
-cargo test -p tune-core --test reechantillonnage_reference_2218 -- --ignored   # les 15 défauts
+cargo test -p tune-core --test reechantillonnage_reference_2218 -- --ignored   # les défauts restants (D3)
 cargo test -p tune-core --test reechantillonnage_reference_2218 releve -- --nocapture
 ```

@@ -3,6 +3,9 @@ pub mod mac;
 pub mod mdns;
 pub mod minimal_dmr;
 mod oui_audio;
+/// Fraîcheur du registre des serveurs multimédia (#2219, phase 1) — le verdict
+/// PUR « présent / absent », sans horloge ni réseau.
+pub mod presence_serveur;
 pub mod redecouverte;
 pub mod renderer_identity;
 pub mod sendspin;

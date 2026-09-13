@@ -62,11 +62,15 @@
 //! Tune la traite déjà, et plus sévèrement. Depuis d423c16b,
 //! [`crate::audio::eq::EqProfile::automatic_headroom_db`] réserve la **somme de tous les gains
 //! positifs** de la cascade, appliquée en pré-gain par canal avant les
-//! biquads. Or la somme des gains positifs majore toujours le maximum de la
+//! biquads ; depuis #4073 elle réserve le **plus grand** de cette somme et de
+//! la **norme L1** de la cascade, qui est la seule borne vraie de sa réponse
+//! en temps. Or la somme des gains positifs majore toujours le maximum de la
 //! réponse combinée, que le `Preamp` d'AutoEq vient précisément compenser :
 //! la marge que Tune réserve est donc toujours au moins aussi grande que celle
 //! qu'AutoEq demande. Sur le HD 650 d'oratory1990, AutoEq demande −6,1 dB et
-//! Tune en réserve −13,8.
+//! Tune en réserve −13,8 — inchangé par #4073, la somme des gains (13,8 dB)
+//! majorant largement la norme L1 du même profil (10,3 dB) dès que les bandes
+//! sont nombreuses et étalées.
 //!
 //! Ajouter le `Preamp` par-dessus atténuerait donc **deux fois**. Ce module se
 //! contente de le lire et de le rendre dans [`ProfilAutoEq::preamp_db`], pour
@@ -619,9 +623,17 @@ mod tests {
         .expect("des types que le DSP construit déjà");
         let types: Vec<&str> = profil.bandes.iter().map(|b| b.band_type.as_str()).collect();
         assert_eq!(types, ["high_pass", "low_pass", "notch", "peak"]);
-        // Sans `Gain`, un passe reste à zéro — et ne réserve donc aucune marge.
+        // Sans `Gain`, un passe reste à zéro — et à Q ≤ 0,707 il ne réserve
+        // aucune marge (#4073 : la réserve d'un passe est sa RÉSONANCE,
+        // 20·log10(Q/0,707), nulle ici comme pour le `LPQ` à Q 0,5). Le rejet
+        // non plus. Seule la cloche de +3 dB réserve, à hauteur de sa norme
+        // L1 (3,717 dB) plutôt que de son seul gain crête.
         assert_eq!(profil.bandes[0].gain, 0.0);
-        assert_eq!(profil.marge_reservee_db(), -3.0);
+        assert!(
+            (profil.marge_reservee_db() + 3.717_159).abs() < 1e-5,
+            "marge réservée : {}",
+            profil.marge_reservee_db()
+        );
     }
 
     /// Contre-épreuve : un `PK` sans `Gain` reste REFUSÉ. La tolérance porte

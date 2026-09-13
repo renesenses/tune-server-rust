@@ -362,3 +362,213 @@ async fn premium_ne_voit_aucun_plafond() {
         "Premium doit etre annonce illimite : {conf}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 5. « La mesure qui tranche » du ticket, jouée contre le routeur monté
+// ---------------------------------------------------------------------------
+
+/// Une application Free avec l'adresse du pair simulée : `POST /zones` extrait
+/// un `ConnectInfo` (il suffixe le nom des zones « browser » de l'IP du
+/// client) et ne se laisse pas appeler sans lui.
+fn app_gratuite_avec_pair() -> (tune_server::state::AppState, axum::Router) {
+    let state = etat_gratuit();
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
+    (state, app)
+}
+
+/// Le geste « j'ajoute l'enceinte que le réseau vient de m'annoncer », par la
+/// route que tape réellement le client.
+async fn creer_zone(app: &axum::Router, n: usize) -> (StatusCode, Value) {
+    reponse(
+        app,
+        Request::post("/api/v1/zones")
+            .header("Content-Type", "application/json")
+            .header("Accept-Language", "fr")
+            .body(Body::from(
+                json!({
+                    "name": format!("Enceinte reseau {n}"),
+                    "output_type": "dlna",
+                    "output_device_id": format!("uuid:decouverte-{n}"),
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+/// **La mesure qui tranche**, telle que le ticket #3673 la formule :
+///
+/// > découvrir 5 appareils réseau sans jouer, puis lancer une lecture sur
+/// > chacun à tour de rôle. Attendu si la doctrine Rust est partout : les 3
+/// > premières lectures passent, la 4ᵉ est refusée, et **aucune création** de
+/// > zone n'est jamais refusée.
+///
+/// Elle n'existait nulle part : `cinq_zones_dormantes_ne_consomment_rien` ne
+/// joue qu'**une** fois, et rien ne mesurait le versant « création ». C'est
+/// pourtant la moitié qui départage la doctrine Rust de celle de Swift et de
+/// Dart, qui refusent tous deux à la CRÉATION et sur *toutes* les zones
+/// (`ZoneManager.swift:167` `zones.count >= freeMaxZones`,
+/// `zone_manager.dart:106-110`). Tant que ce contrat n'est pas épinglé ici, le
+/// serveur peut dériver vers leur règle sans qu'aucun témoin ne bouge.
+///
+/// Le verdict à chaque pas est celui de la ROUTE. Entre deux pas, la zone
+/// acceptée est marquée jouée par `activer()` — l'écriture exacte
+/// (`save_playback_position`) qu'une lecture réussie effectue ; le témoin ne
+/// peut pas la laisser faire à une lecture réelle, faute de piste jouable dans
+/// une base en mémoire.
+#[tokio::test]
+async fn la_mesure_qui_tranche_cinq_decouvertes_puis_une_lecture_sur_chacune() {
+    let (state, app) = app_gratuite_avec_pair();
+
+    // 1. Cinq appareils découverts, aucun joué. AUCUNE création n'est refusée,
+    //    pas même la 4ᵉ ni la 5ᵉ : c'est là que Swift et Dart s'arrêtent.
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        let (status, corps) = creer_zone(&app, n).await;
+        assert_ne!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "la creation de la zone {} a ete refusee — le garde est reparti \
+             a la creation, comme Swift et Dart : {corps}",
+            n + 1
+        );
+        assert!(
+            status.is_success(),
+            "la creation de la zone {} a echoue ({status}) : {corps}",
+            n + 1
+        );
+        ids.push(
+            corps["id"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("pas d'id dans la reponse de creation : {corps}")),
+        );
+    }
+
+    // 2. Les cinq sont en ligne mais dormantes : le quota est intact.
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    for id in &ids {
+        repo.update_online(*id, true).unwrap();
+    }
+    let (_, conf) = lire(&app, "/api/v1/system/config").await;
+    assert_eq!(conf["zone_limit"], 3, "/system/config : {conf}");
+
+    // 3. Une lecture sur chacune, à tour de rôle.
+    let mut verdicts = Vec::new();
+    for id in &ids {
+        let (status, corps) = jouer(&app, *id, Some("fr")).await;
+        let refuse = status == StatusCode::PAYMENT_REQUIRED;
+        if refuse {
+            assert_eq!(
+                corps["code"], "free_zone_cap_reached",
+                "refus sans le code stable : {corps}"
+            );
+            assert_eq!(corps["zone_limit"], 3, "refus : {corps}");
+            assert_eq!(corps["zones_actives"], 3, "refus : {corps}");
+        } else {
+            // Lecture acceptée ⇒ la zone a joué, donc elle consomme.
+            activer(&state, *id);
+        }
+        verdicts.push(refuse);
+    }
+
+    assert_eq!(
+        verdicts,
+        vec![false, false, false, true, true],
+        "attendu : 3 lectures acceptees puis 2 refusees. Obtenu : {verdicts:?}"
+    );
+}
+
+/// Le versant Premium de la même mesure : cinq découvertes, cinq lectures,
+/// aucun refus — et **aucun** des chemins d'affichage n'annonce de nombre.
+///
+/// `premium_ne_voit_aucun_plafond` ne regardait que `/system/config`. Un
+/// lecteur aveugle au palier — feu `LicenseManager::free_zone_limit()`, qui
+/// rendait le chiffre du gratuit quel que soit le palier — pouvait être
+/// rebranché sur `/cloud/license/status` sans qu'aucun témoin ne rougisse.
+/// C'est le motif nommé par le ticket : un second lecteur du chiffre, écrit
+/// mais pas branché, n'attend qu'un appelant.
+#[tokio::test]
+async fn en_premium_aucun_chemin_n_annonce_de_nombre() {
+    let (state, app) = app_gratuite_avec_pair();
+    state.license.set_account_premium(true, None).await;
+
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        let (status, corps) = creer_zone(&app, n).await;
+        assert!(status.is_success(), "creation {n} : {corps}");
+        ids.push(corps["id"].as_i64().unwrap());
+    }
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    for id in &ids {
+        repo.update_online(*id, true).unwrap();
+        activer(&state, *id);
+    }
+
+    let (status, corps) = jouer(&app, ids[4], Some("fr")).await;
+    assert_ne!(
+        status,
+        StatusCode::PAYMENT_REQUIRED,
+        "Premium a rencontre un plafond : {corps}"
+    );
+
+    let (_, conf) = lire(&app, "/api/v1/system/config").await;
+    assert!(
+        conf["zone_limit"].is_null(),
+        "/system/config annonce un nombre a un abonne Premium : {conf}"
+    );
+    let (_, licence) = lire(&app, "/api/v1/cloud/license/status").await;
+    assert!(
+        licence["zone_limit"].is_null(),
+        "/cloud/license/status annonce un nombre a un abonne Premium : {licence}"
+    );
+}
+
+/// Le plafond configuré traverse **les trois** chemins, pas deux.
+/// `le_plafond_suit_la_configuration_partout` vérifiait le refus et
+/// `/system/config` ; `/cloud/license/status` pouvait garder son propre
+/// chiffre en dur sans que rien ne bouge, puisque l'autre témoin qui le
+/// regarde (`les_trois_chemins_annoncent_le_meme_plafond`) tourne sur un
+/// serveur dont le plafond vaut justement 3.
+#[tokio::test]
+async fn un_plafond_non_standard_traverse_aussi_le_statut_de_licence() {
+    let config = tune_server::config::TuneConfig {
+        free_max_zones: 2,
+        ..Default::default()
+    };
+    let state = tune_server::state::AppState::new(":memory:", 0, config).unwrap();
+    let ids = zones_dormantes(&state, 3);
+    for id in &ids[..2] {
+        activer(&state, *id);
+    }
+    let app = tune_server::routes::router(state);
+
+    let (status, refus) = jouer(&app, ids[2], Some("fr")).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "refus : {refus}");
+    assert_eq!(refus["zone_limit"], 2, "refus : {refus}");
+
+    let (_, conf) = lire(&app, "/api/v1/system/config").await;
+    assert_eq!(
+        conf["zone_limit"], 2,
+        "/system/config a garde son propre chiffre : {conf}"
+    );
+    let (_, licence) = lire(&app, "/api/v1/cloud/license/status").await;
+    assert_eq!(
+        licence["zone_limit"], 2,
+        "/cloud/license/status a garde son propre chiffre : {licence}"
+    );
+    let message = refus["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains('2') && !message.contains('3'),
+        "la phrase doit dire le plafond REEL (2), pas 3 : {refus}"
+    );
+    assert!(
+        !message.contains(PHRASE_EN_DUR),
+        "la phrase anglaise en dur est revenue : {refus}"
+    );
+}

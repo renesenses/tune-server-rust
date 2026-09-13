@@ -324,8 +324,14 @@ async fn le_mode_pure_annonce_quil_desarme_la_sortie_mono() {
 /// trois sites interrogent — passerait au vert ici en mentant.
 #[tokio::test]
 async fn une_zone_locale_orpheline_nannonce_pas_un_repli_quelle_na_pas() {
-    let (app, _state) = app();
-    let id = creer_zone(&app, "Orpheline", "local", None).await;
+    let (app, state) = app();
+    // #3835 / #3838 — la ligne est posée en BASE, pas par la route : depuis ce
+    // correctif, `POST /zones` refuse un corps qui annonce `output_type:
+    // "local"` sans nommer d'appareil. Ce que ce témoin garde n'a pas changé —
+    // le traitement d'une zone orpheline DÉJÀ là, comme celle de JeromeQ.
+    let id = ZoneRepo::with_backend(state.backend.clone())
+        .create("Orpheline", Some("local"), None)
+        .expect("la ligne orpheline doit pouvoir être posée en base");
     patch(
         &app,
         &format!("/api/v1/zones/{id}"),
