@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -53,6 +54,11 @@ pub struct HqplayerOutput {
     port: u16,
     /// Persistent TCP connection to HQPlayer (reconnects on failure).
     connection: Arc<Mutex<Option<Control>>>,
+    /// « J'ai déjà dit que je ne comprenais pas la réponse `Status`. »
+    ///
+    /// Le sondage tourne en boucle : sans ce garde, une réponse d'une forme
+    /// inattendue écrirait une ligne toutes les secondes.
+    etat_inconnu_dit: Arc<AtomicBool>,
 }
 
 impl HqplayerOutput {
@@ -63,6 +69,7 @@ impl HqplayerOutput {
             host,
             port,
             connection: Arc::new(Mutex::new(None)),
+            etat_inconnu_dit: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -408,21 +415,38 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
     )
 }
 
-/// Parse transport state from HQPlayer XML status response.
-fn parse_state_from_xml(xml: &str) -> TransportState {
-    // HQPlayer status response contains state attribute or element
+/// L'état de transport **reconnu** dans une réponse `<Status>` de HQPlayer,
+/// ou `None` quand aucun des mots attendus n'y figure.
+///
+/// Séparé de [`parse_state_from_xml`] pour une raison précise : la valeur de
+/// repli est `Stopped`, et `Stopped` n'est pas un état neutre pour le
+/// sondeur. C'est **lui** qui déclenche l'avance de file après cinq sondes
+/// (`STOPPED_TICKS_THRESHOLD`) et l'arrêt de zone après trente
+/// (`STOPPED_FAILURE_THRESHOLD`). « Je n'ai pas compris la réponse » et « le
+/// lecteur est à l'arrêt » ne peuvent donc pas rendre la même chose sans que
+/// personne ne le sache : le repli reste, mais il est désormais **dit**.
+fn etat_reconnu(xml: &str) -> Option<TransportState> {
     let lower = xml.to_lowercase();
     if lower.contains("\"playing\"") || lower.contains(">playing<") {
-        TransportState::Playing
+        Some(TransportState::Playing)
     } else if lower.contains("\"paused\"") || lower.contains(">paused<") {
-        TransportState::Paused
+        Some(TransportState::Paused)
     } else if lower.contains("\"stopped\"") || lower.contains(">stopped<") {
-        TransportState::Stopped
+        Some(TransportState::Stopped)
     } else if lower.contains("\"transitioning\"") || lower.contains("\"buffering\"") {
-        TransportState::Transitioning
+        Some(TransportState::Transitioning)
     } else {
-        TransportState::Stopped
+        None
     }
+}
+
+/// Parse transport state from HQPlayer XML status response.
+///
+/// Le comportement ne change pas : une réponse non reconnue vaut `Stopped`.
+/// Voir [`etat_reconnu`] pour ce que cela coûte, et `get_status` pour la
+/// ligne qui le signale.
+fn parse_state_from_xml(xml: &str) -> TransportState {
+    etat_reconnu(xml).unwrap_or(TransportState::Stopped)
 }
 
 /// Extract an attribute value from XML by attribute name.
@@ -559,6 +583,23 @@ impl OutputTarget for HqplayerOutput {
 
     async fn get_status(&self) -> Result<OutputStatus, String> {
         let response = self.command(r#"<Status subscribe="0" />"#).await?;
+
+        // #4023 — une réponse dont l'état n'est pas reconnu retombe sur
+        // `Stopped`, et `Stopped` est ce qui fait avancer la file au bout de
+        // cinq sondes puis arrêter la zone au bout de trente. Si un jour un
+        // HQPlayer répond dans une forme que ces mots ne couvrent pas, le
+        // symptôme est « l'album s'arrête après une piste » et RIEN dans le
+        // journal ne le dit. Une ligne, UNE seule par sortie : ce sondage
+        // tourne en boucle et #4025 vient justement de le faire taire.
+        if etat_reconnu(&response).is_none() && !self.etat_inconnu_dit.swap(true, Ordering::Relaxed)
+        {
+            warn!(
+                device = %self.name,
+                reponse = %response.trim().chars().take(400).collect::<String>(),
+                "hqplayer_status_etat_inconnu — aucun etat reconnu dans la reponse Status ; \
+                 lue comme `stopped`, ce qui fait avancer la file puis arreter la zone"
+            );
+        }
 
         let state = parse_state_from_xml(&response);
         let position = extract_xml_attr(&response, "position")
