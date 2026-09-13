@@ -576,3 +576,15 @@ path = "tests/serveur_media_didl_hors_auth_3933.rs"
 [[test]]
 name = "borne_smart_collections_2732"
 path = "tests/borne_smart_collections_2732.rs"
+
+# #4025 — même raison que `journal_sondage_hqplayer` ci-dessus, mot pour mot :
+# abonné `tracing` GLOBAL, donc un binaire à lui seul et UN SEUL essai dedans.
+# Celui-ci compte les lignes INFO que trois tours de `discover_and_register`
+# coûtent au journal (trois par minute chez le testeur du fil 1773), et vérifie
+# que la sortie n'est plus ré-enregistrée — donc que sa connexion TCP de
+# contrôle survit au sondage. `autotests = false` en tête de ce manifeste :
+# sans cette cible, le fichier ne serait JAMAIS compilé et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "journal_sondage_hqplayer_sans_bruit_4025"
+path = "tests/journal_sondage_hqplayer_sans_bruit_4025.rs"
