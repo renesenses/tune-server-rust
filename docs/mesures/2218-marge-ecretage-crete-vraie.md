@@ -151,9 +151,6 @@ positif sans pic, ou l'analyser) ; et `apply_gain_pcm` compte ses écrêtés
 comme `EqProcessStats.overs`, exposés dans `signal-path`. Témoin :
 `q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague`.
 
-<<<<<<< HEAD
-### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux — ✅ **RÉGLÉ (#4073, 13/09/2026)**
-=======
 **Livré (#4072, issue #4072).** Ce qui a changé, exactement :
 
 * `gain_factor` délègue à `gain_factor_detail`, qui dit AUSSI ce que
@@ -195,8 +192,7 @@ comme `EqProcessStats.overs`, exposés dans `signal-path`. Témoin :
 Ce que #4072 ne traite pas : B et C, dont les témoins `#[ignore]` restent
 rouges. D et E ont été corrigés depuis, par #4075/#4076.
 
-### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux
->>>>>>> origin/batch/bugs-13
+### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux — ✅ **RÉGLÉ (#4073, 13/09/2026)**
 
 Mesuré : `low_pass` Q = 4 ⇒ réserve 0 dB, résonance +12,04 dB, 83,7 % d'overs
 écrêtés dur ; `low_shelf` +6 dB sur un carré ⇒ 40,4 % d'overs, réserve courte
@@ -315,13 +311,8 @@ par `cp` + `touch`, verts — sorties collées dans la PR :
 ## Reproduction locale
 
 ```sh
-<<<<<<< HEAD
-cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 21 verts, 2 ignorés
-cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 2 rouges : les défauts A et C
-=======
-cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 19 verts, 3 ignorés
-cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 3 rouges : les défauts B et C
->>>>>>> origin/batch/bugs-13
+cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 22 verts, 1 ignoré
+cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 1 rouge : le défaut C
 ```
 
 ## Comptage livré le 12/09 (agent F, `tune-core/tests/ecretage_compte_2218.rs`)
