@@ -1462,6 +1462,12 @@ impl RingBuf {
 #[cfg(test)]
 mod ringbuf_tests;
 
+// #3814 — le rappel cpal partagé rend-il son dû à l'horloge du pilote quand
+// il se tait ? Le banc appelle le rappel réel, période par période, et fait
+// juger le résultat par le `SuiviFamine` du sondeur.
+#[cfg(test)]
+mod horloge_du_pilote_muet_3814;
+
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
 /// `decode_compressed_stream` rendait `None` pour QUATRE causes distinctes, et
@@ -2149,6 +2155,56 @@ impl SharedDeviceResolution {
     }
 }
 
+/// Une période du rappel `f32` local **partagé** (cpal shared), hors de la
+/// fermeture pour être mesurable.
+///
+/// Ce corps existait en DEUX copies identiques au commentaire près — celle du
+/// chemin compressé (`build_compressed_f32_stream`) et celle du chemin
+/// PCM/WAV (`local/backend.rs`) — et aucune des deux n'était atteignable par
+/// un test : toutes deux vivaient dans une fermeture passée à
+/// `cpal::Device::build_output_stream`. Les réunir ici est ce qui rend le
+/// témoin de #3814 possible, et évite qu'un correctif ne soit posé que dans
+/// une des deux.
+fn render_local_shared_f32_callback(
+    ring: &RingBuf,
+    volume: &AtomicU32,
+    paused: &AtomicBool,
+    silent: &AtomicBool,
+    data_started: &AtomicBool,
+    ramp: &mut crate::audio::soft_mute::SoftMuteRamp,
+    armed_ms: u32,
+    min_buffer_samples: usize,
+    output: &mut [f32],
+) -> usize {
+    // Rampe anti-« ploc » (#1590) : au lieu de sauter de l'amplitude courante
+    // à zéro, le gain glisse sur quelques dizaines de millisecondes. `arm(0)`
+    // — DoP, PURE, sortie exclusive — rend exactement la coupure franche
+    // d'avant.
+    ramp.arm(armed_ms);
+    let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
+        output.fill(0.0);
+        return 0;
+    }
+    // Wait for a minimum amount of data before starting to read from the ring
+    // buffer. This prevents the audio device from playing stale/garbage
+    // samples during track transitions.
+    if !data_started.load(Ordering::Acquire) {
+        if ring.available() < min_buffer_samples {
+            output.fill(0.0);
+            return 0;
+        }
+        data_started.store(true, Ordering::Release);
+    }
+    let read = ring.pop(output);
+    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    ramp.apply(&mut output[..read], v);
+    if read < output.len() {
+        output[read..].fill(0.0);
+    }
+    read
+}
+
 /// Une période du rappel entier local **partagé** (cpal shared), hors de la
 /// fermeture pour être mesurable.
 ///
@@ -2289,32 +2345,17 @@ fn build_compressed_f32_stream(
     device.build_output_stream(
         cfg,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Rampe anti-« ploc » (#1590) : au lieu de sauter de l'amplitude
-            // courante à zéro, le gain glisse sur quelques dizaines de
-            // millisecondes. `arm(0)` — DoP, PURE, sortie exclusive — rend
-            // exactement la coupure franche d'avant.
-            ramp_cb.arm(soft_mute_cb.armed_ms());
-            let silence = paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
-            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-                data.fill(0.0);
-                return;
-            }
-            // Wait for a minimum amount of data before starting to read from
-            // the ring buffer. This prevents the audio device from playing
-            // stale/garbage samples during track transitions.
-            if !ds_cb.load(Ordering::Acquire) {
-                if ring_cb.available() < min_buf {
-                    data.fill(0.0);
-                    return;
-                }
-                ds_cb.store(true, Ordering::Release);
-            }
-            let read = ring_cb.pop(data);
-            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-            ramp_cb.apply(&mut data[..read], v);
-            if read < data.len() {
-                data[read..].fill(0.0);
-            }
+            render_local_shared_f32_callback(
+                &ring_cb,
+                &vol_cb,
+                &paused_cb,
+                &silent_cb,
+                &ds_cb,
+                &mut ramp_cb,
+                soft_mute_cb.armed_ms(),
+                min_buf,
+                data,
+            );
         },
         make_stream_error_cb(device_gone, famine_cb),
         None,
