@@ -199,6 +199,8 @@ mod support_journaux_joints;
 mod support_relais_diagnostic_sortant;
 #[path = "support_relais_marquer_lu.rs"]
 mod support_relais_marquer_lu;
+#[path = "support_relais_reponse_suivante.rs"]
+mod support_relais_reponse_suivante;
 #[path = "teneur_du_pcm_branche_3575.rs"]
 mod teneur_du_pcm_branche_3575;
 #[path = "tests_orphelins.rs"]
