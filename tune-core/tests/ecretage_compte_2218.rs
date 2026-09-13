@@ -4,7 +4,7 @@
 //! T9 (`marge_et_crete_2218.rs`, `docs/mesures/2218-marge-ecretage-crete-vraie.md`)
 //! a mesuré : (A) `apply_gain_pcm` à +6 dB sans pic tagué écrête dur 66 % d'un
 //! sinus à −0,1 dBFS, excès 31 866 LSB, sans compteur ni journal ; (B)
-//! l'égaliseur compte 83,7 % d'overs sur un passe-bas Q = 4 et ne les dit
+//! l'égaliseur compte 40,4 % d'overs sur un plateau grave et ne les dit
 //! jamais. Ce fichier prouve que c'est compté et dit, et fige les octets de
 //! sortie par des empreintes FNV-1a.
 //!
@@ -34,7 +34,7 @@
 //! capte rien ici.
 
 use std::cell::RefCell;
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_1_SQRT_2, PI};
 use std::sync::OnceLock;
 
 use tune_core::audio::ecretage::{CompteurDEcretage, releve};
@@ -59,11 +59,23 @@ const A_RG_PLUS6_32B: u64 = 0x45d6_6c51_9c9b_bfdd;
 const E_RG_MOINS1_16B: u64 = 0x7ccf_e03f_36b3_4143;
 const E_RG_MOINS1_24B: u64 = 0x1412_74cb_e444_e276;
 const E_RG_MOINS1_32B: u64 = 0x4ae4_154e_e968_b69f;
-const B_EQ_LOWPASS_Q4_24B: u64 = 0xc2f3_7c72_784a_7078;
-const B_EQ_LOWPASS_Q4_OVERS: u64 = 36_896;
+/// 🔴 Relevées à NEUF par #4073. Le cas B n'est plus le passe-bas Q = 4 —
+/// `automatic_headroom_db` réserve désormais sa résonance et il ne dépasse
+/// plus — mais le plateau grave 80 Hz +6 dB sur un carré 50 Hz à −0,05 dBFS,
+/// dont la réponse en TEMPS dépasse encore la réserve (défaut B partie 2,
+/// toujours ouvert). Mesuré sur Shrek : 17 825 écrêtés sur 44 100 (40,4 %),
+/// excès maximal 450 490 LSB, crête +0,45 dBFS, premier à l'échantillon 267.
+///
+/// Les anciennes valeurs, pour mémoire : empreinte `0xc2f3_7c72_784a_7078`,
+/// 36 896 overs (83,7 %). Elles n'étaient plus atteignables, la réserve les
+/// ayant supprimées — les garder aurait figé un comportement corrigé.
+const B_EQ_LOWPASS_Q4_24B: u64 = 0x285b_3693_c85d_4121;
+const B_EQ_LOWPASS_Q4_OVERS: u64 = 17_825;
 const B_EQ_LOWSHELF_CARRE_24B: u64 = 0x285b_3693_c85d_4121;
 const B_EQ_LOWSHELF_CARRE_OVERS: u64 = 17_825;
-const B_EQ_FLOTTANT_Q4: u64 = 0xa879_54df_086e_8265;
+/// 🔴 Relevée à neuf par #4073 : la réserve s'applique aussi au chemin
+/// flottant, donc les octets changent. Ancienne : `0xa879_54df_086e_8265`.
+const B_EQ_FLOTTANT_Q4: u64 = 0x2f6e_f7be_4ae3_75bb;
 const Q2_RG_PIC_16B: u64 = 0xfae0_2d13_6dbf_0670;
 const Q2_CHAINE_RG_EQ_16B: u64 = 0x25db_2059_e212_ef86;
 const E_MIXEUR_MOINS1_16B: u64 = 0x4c00_4b27_9e0f_b429;
@@ -238,8 +250,39 @@ fn profil(bands: Vec<EqBandSpec>) -> EqProfile {
     }
 }
 
+/// Le passe-bas Q = 4 du cas B de T9 — qui, depuis #4073, N'ÉCRÊTE PLUS.
+///
+/// `automatic_headroom_db` réserve désormais sa résonance (+12,11 dB). Le
+/// profil reste ici parce que c'est exactement ce qu'il faut garder : la
+/// preuve que la réserve fait son travail.
 fn passe_bas_q4() -> EqProcessor {
     EqProcessor::new(&profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]), FS, 1)
+}
+
+/// Le profil qui DÉPASSE ENCORE, pour les témoins qui ont besoin d'écrêtage à
+/// compter (#4073).
+///
+/// La réserve couvre le maximum de la réponse en FRÉQUENCE d'un plateau
+/// (+6 dB, la somme des gains positifs) ; sa réponse en TEMPS va plus haut —
+/// sa norme L1 est plus grande que son gain crête. C'est le défaut B partie 2
+/// de T9, TOUJOURS OUVERT (`…_devrait_couvrir_la_reponse_en_temps_d_un_plateau`
+/// reste `#[ignore]`).
+///
+/// Le jour où il sera corrigé, les témoins qui s'appuient ici redemanderont un
+/// autre cas — et c'est très bien : aucun ne doit pouvoir rester vert sans
+/// écrêtage à observer.
+fn plateau_qui_depasse() -> EqProcessor {
+    EqProcessor::new(
+        &profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]),
+        FS,
+        1,
+    )
+}
+
+/// Le signal du plateau : un carré, dont les fronts font travailler sa réponse
+/// en temps. Un sinus à 997 Hz ne dépasserait pas.
+fn signal_cas_b() -> Vec<f64> {
+    carre(50.0, -0.05, N)
 }
 
 // ───────────── capture du journal ─────────────
@@ -429,13 +472,19 @@ fn a_gain_replay_bloc_par_bloc_produit_les_memes_octets_et_cumule() {
 // ═════════════════════════ B — égaliseur ═════════════════════════
 
 /// Le cas B de T9 rejoué : passe-bas 997 Hz Q = 4 sur un sinus à −0,1 dBFS,
-/// 24 bits. Le compteur d'écrêtage vaut EXACTEMENT `overs` (36 896, 83,7 %),
-/// avec l'excès (résonance +12 dB : crête ≈ +11,9 dBFS) ; les octets — clamp
-/// PUIS dither — sont ceux d'avant.
+/// 🔴 **Retourné par #4073.** Le passe-bas Q = 4 ne dépasse PLUS : la réserve
+/// automatique couvre désormais sa résonance (+12,11 dB). Sa moitié de ce
+/// témoin garde donc l'inverse de ce qu'elle gardait — zéro écrêté, compteur à
+/// zéro, signal intact.
+///
+/// Le comptage lui-même, qui est le sujet de #4020, reste gardé par la moitié
+/// suivante : le plateau grave sur un carré, qui dépasse encore (défaut B
+/// partie 2, toujours ouvert).
 #[test]
 fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_octets() {
     let mut eq = passe_bas_q4();
     let mut pcm = vers_pcm(&sinus(997.0, -0.1, N, 0.0), 24);
+    let entree = pcm.clone();
     let stats = eq.process_pcm(&mut pcm, 24);
     let c = eq.ecretage();
     eprintln!(
@@ -448,33 +497,31 @@ fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_oct
         c.premier_ecretage_a
     );
     assert_eq!(
-        fnv1a(&pcm),
-        B_EQ_LOWPASS_Q4_24B,
-        "empreinte des octets de l'égaliseur (clamp puis dither) inchangée"
+        stats.overs, 0,
+        "réserve correcte depuis #4073 : le passe-bas Q = 4 ne dépasse plus. \
+         Avant : 36 896 écrêtés (83,7 %)."
     );
-    assert_eq!(stats.overs, B_EQ_LOWPASS_Q4_OVERS, "les overs de T9");
     assert_eq!(
-        c.echantillons_ecretes, stats.overs,
-        "le compteur d'écrêtage EST le compteur d'overs, incrémenté au même endroit"
+        c.echantillons_ecretes, 0,
+        "et le compteur suit : rien à compter"
     );
-    assert_eq!(c.echantillons_ecretes, eq.process_stats().overs);
-    assert_eq!(c.echantillons_vus, N as u64);
-    assert!(
-        (83.5..=83.9).contains(&c.pourcentage()),
-        "83,7 % : {:.1}",
-        c.pourcentage()
-    );
-    let crete = c.crete_max_dbfs().expect("crête connue");
-    assert!(
-        (crete - 11.94).abs() < 0.1,
-        "résonance +12 dB : crête idéale ≈ +11,94 dBFS (T9), mesurée {crete:+.2}"
+    assert_eq!(
+        c.echantillons_vus, N as u64,
+        "les échantillons sont bien VUS"
     );
     assert!(
-        c.exces_max_lsb > 20_000_000,
-        "≈ (3,95 − 1) × 2^23 LSB d'excès : {}",
-        c.exces_max_lsb
+        c.premier_ecretage_a.is_none(),
+        "aucun premier écrêtage : {:?}",
+        c.premier_ecretage_a
     );
-    assert!(matches!(c.premier_ecretage_a, Some(p) if p < N as u64 / 10));
+    // Contre-épreuve : pas seulement « non écrêté » — le signal doit avoir été
+    // FILTRÉ puis ramené sous le rail, pas laissé tel quel.
+    assert_ne!(
+        fnv1a(&pcm),
+        fnv1a(&entree),
+        "le passe-bas doit tout de même avoir filtré : des octets identiques \
+         signifieraient un égaliseur inerte, pas une réserve correcte"
+    );
 
     // Plateau grave +6 dB sur un carré 50 Hz (T9 : 40,4 % d'overs).
     let mut eq2 = EqProcessor::new(&profil(vec![bande("low_shelf", 80.0, 6.0, 0.707)]), FS, 1);
@@ -501,7 +548,11 @@ fn b_l_egaliseur_compte_ses_83_7_pour_cent_d_overs_avec_l_exces_et_garde_ses_oct
         B_EQ_FLOTTANT_Q4,
         "empreinte flottante inchangée"
     );
-    assert_eq!(st3.overs, B_EQ_LOWPASS_Q4_OVERS);
+    assert_eq!(
+        st3.overs, 0,
+        "le chemin FLOTTANT bénéficie de la même réserve (#4073) : plus un \
+         seul dépassement. Avant : 36 896."
+    );
     assert_eq!(eq3.ecretage().echantillons_ecretes, st3.overs);
     assert_eq!(eq3.ecretage().echantillons_vus, N as u64);
 
@@ -615,11 +666,11 @@ fn un_signal_sous_0_dbfs_compte_zero_et_le_journal_reste_vide() {
 /// `moment=fin` à la destruction avec le total — et jamais cent.
 #[test]
 fn le_journal_dit_deux_lignes_par_piste_jamais_une_par_bloc() {
-    let x = sinus(997.0, -0.1, N, 0.0);
+    let x = signal_cas_b();
     let facteur = facteur_plus_6_sans_pic();
 
     let journal = capturer(|| {
-        let mut eq = passe_bas_q4();
+        let mut eq = plateau_qui_depasse();
         let mut p = vers_pcm(&x, 24);
         for bloc in p.chunks_mut(441 * 3) {
             eq.process_pcm(bloc, 24);
@@ -675,12 +726,12 @@ fn le_journal_dit_deux_lignes_par_piste_jamais_une_par_bloc() {
         );
     }
     assert!(
-        porte(eq[1], "echantillons_ecretes", "36896") && porte(eq[1], "echantillons_vus", "44100"),
+        porte(eq[1], "echantillons_ecretes", "17825") && porte(eq[1], "echantillons_vus", "44100"),
         "égaliseur, fin : le total de la piste : {}",
         eq[1]
     );
     assert!(
-        porte(rg[1], "exces_max_lsb", "31866") && porte(rg[1], "echantillons_vus", "44100"),
+        porte(rg[1], "exces_max_lsb", "32239") && porte(rg[1], "echantillons_vus", "44100"),
         "replaygain, fin : l'excès max de la piste : {}",
         rg[1]
     );
@@ -696,13 +747,13 @@ fn le_journal_dit_deux_lignes_par_piste_jamais_une_par_bloc() {
 /// relais dit UNE fin, avec le total des deux.
 #[test]
 fn un_processeur_relaye_a_chaud_ne_clot_pas_la_piste() {
-    let x = sinus(997.0, -0.1, N, 0.0);
+    let x = signal_cas_b();
     let journal = capturer(|| {
         let mut p = vers_pcm(&x, 24);
         let (avant, apres) = p.split_at_mut(N / 2 * 3);
-        let mut eq1 = passe_bas_q4();
+        let mut eq1 = plateau_qui_depasse();
         eq1.process_pcm(avant, 24);
-        let mut eq2 = passe_bas_q4();
+        let mut eq2 = plateau_qui_depasse();
         eq2.inherit_state_from(&eq1);
         drop(eq1);
         eq2.process_pcm(apres, 24);
@@ -722,7 +773,7 @@ fn un_processeur_relaye_a_chaud_ne_clot_pas_la_piste() {
     );
     assert!(porte(lignes[0], "moment", "premier"));
     assert!(
-        porte(lignes[1], "moment", "fin") && porte(lignes[1], "echantillons_ecretes", "36896"),
+        porte(lignes[1], "moment", "fin") && porte(lignes[1], "echantillons_ecretes", "17825"),
         "la fin porte le total des deux moitiés : {}",
         lignes[1]
     );
