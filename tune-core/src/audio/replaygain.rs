@@ -1811,6 +1811,37 @@ fn gain_source_from_meta(
     Some(GainSource::FileTags)
 }
 
+/// Ce que l'anti-écrêtage a retenu sur le facteur demandé, et POURQUOI
+/// (#4072).
+///
+/// Un simple `f64` ne permettait pas au chemin du signal de distinguer « le
+/// gain demandé s'applique » de « le gain demandé a été refusé » : dans les
+/// deux cas le facteur peut valoir 1,0, et l'étape disparaissait alors du
+/// panneau. L'auditeur voyait ReplayGain armé, ses tags lus, et rien ne
+/// bougeait — sans un mot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetenueAntiEcretage {
+    /// Rien retenu : le facteur demandé multiplie les échantillons tel quel.
+    Aucune,
+    /// Le pic TAGUÉ a borné le facteur à `plafond / pic` — le cas nominal,
+    /// inchangé depuis toujours.
+    ParLePicTague,
+    /// Aucun pic tagué (ni `rg_*_true_peak`, ni `rg_*_peak` plausible) et un
+    /// gain POSITIF demandé : il est refusé en entier. Voir [`gain_factor`].
+    GainPositifRefuseSansPic,
+}
+
+impl RetenueAntiEcretage {
+    /// Clé stable pour le JSON du chemin du signal — jamais du français.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aucune => "none",
+            Self::ParLePicTague => "tagged_peak",
+            Self::GainPositifRefuseSansPic => "refused_no_peak",
+        }
+    }
+}
+
 /// The linear factor to multiply samples by: `1.0` means "leave the audio
 /// alone".
 ///
@@ -1819,27 +1850,82 @@ fn gain_source_from_meta(
 /// crunch on every peak — the listener would blame Tune, rightly. When the
 /// tagged peak says the result would exceed full scale, the factor is pulled
 /// back to exactly what fits.
+///
+/// 🔴 **#4072 — sans pic tagué, le facteur ne dépasse JAMAIS l'unité.** Le
+/// garde-fou ci-dessus ne s'armait que si `gain.peak` existait ; sans pic il
+/// ne retenait RIEN, et `prevent_clipping` — armé par défaut — ne prévenait
+/// rien du tout. Mesuré par le banc T9 (#2218,
+/// `docs/mesures/2218-marge-ecretage-crete-vraie.md`, Q1) : +6 dB sur un sinus
+/// à −0,1 dBFS, pic non tagué, garde-fou armé ⇒ **29 174 / 44 100 échantillons
+/// écrêtés dur (66,2 %)**, excès maximal 31 866 LSB.
+///
+/// Le choix est le **refus**, pas le déclenchement de l'analyse : cette
+/// fonction est pure et synchrone, appelée au démarrage d'une piste et à
+/// chaque construction du chemin du signal, tandis que mesurer un pic exige de
+/// décoder le fichier entier (`measure_loudness_and_peak`, des secondes à des
+/// minutes, borné à `PER_TRACK_ANALYSIS_TIMEOUT_SECS` = 180 s). Le déclenchement
+/// existe déjà, ailleurs et au bon endroit : la passe de fond de ce module
+/// remplit `rg_track_peak`, et la piste retrouve son gain positif dès qu'elle
+/// est mesurée. Refuser en attendant ne coûte qu'un gain non appliqué ; le
+/// contraire coûte 66 % d'échantillons mutilés.
+///
+/// **Le plafond dBTP n'entre PAS dans cette borne.** Sans pic, la borne sûre
+/// est l'unité — le signal source tient déjà sous le rail, le laisser tel quel
+/// ne peut rien faire déborder. Descendre à `ceiling` (−0,5 / −1 dBTP)
+/// atténuerait silencieusement toute piste non taguée, y compris celles dont
+/// le gain demandé est nul ; la marge inter-échantillons est une autre
+/// question, tenue par le pic vrai (issue C de T9).
+///
+/// L'atténuation n'est jamais touchée : un gain négatif ne peut pas écrêter,
+/// et c'est la grande majorité des valeurs ReplayGain réelles.
 pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
+    gain_factor_detail(gain, settings).0
+}
+
+/// [`gain_factor`], qui dit AUSSI ce que l'anti-écrêtage a retenu.
+///
+/// Même calcul, même résultat au bit près : `gain_factor` délègue ici. Le
+/// second membre sert au chemin du signal, qui doit nommer un gain refusé
+/// plutôt que de faire disparaître l'étape.
+pub fn gain_factor_detail(
+    gain: TrackGain,
+    settings: ReplayGainSettings,
+) -> (f64, RetenueAntiEcretage) {
     if settings.mode == ReplayGainMode::Off {
-        return 1.0;
+        return (1.0, RetenueAntiEcretage::Aucune);
     }
     let total_db = (gain.gain_db + settings.preamp_db).clamp(-30.0, 30.0);
     let mut factor = 10f64.powf(total_db / 20.0);
+    let mut retenue = RetenueAntiEcretage::Aucune;
     if settings.prevent_clipping {
         // Plafond dBTP (#1694) : 0 dB = pleine échelle (comportement
         // historique, à l'identique) ; −0.5 / −1 laissent une marge
         // inter-échantillons. Le peak stocké est le true peak quand
         // l'analyse l'a mesuré (`stored_gain_detail` le préfère).
         let ceiling = 10f64.powf(settings.true_peak_ceiling_db.min(0.0) / 20.0);
-        if let Some(peak) = gain.peak {
-            if peak > 0.0 && factor * peak > ceiling {
-                factor = ceiling / peak;
+        match gain.peak {
+            // Un pic tagué : la borne exacte, celle d'avant.
+            Some(peak) if peak > 0.0 => {
+                if factor * peak > ceiling {
+                    factor = ceiling / peak;
+                    retenue = RetenueAntiEcretage::ParLePicTague;
+                }
+            }
+            // Aucun pic exploitable — absent, nul, négatif, ou hors échelle
+            // écarté par `stored_gain_detail` (`PEAK_MAX_PLAUSIBLE`). Le pic
+            // réel peut valoir 1,0 : tout facteur au-dessus de l'unité porte
+            // alors des échantillons au-delà du rail.
+            _ => {
+                if factor > 1.0 {
+                    factor = 1.0;
+                    retenue = RetenueAntiEcretage::GainPositifRefuseSansPic;
+                }
             }
         }
     }
     // A factor below this is inaudible attenuation of a signal to nothing; a
     // factor above is a bug, not a preference.
-    factor.clamp(0.001, 4.0)
+    (factor.clamp(0.001, 4.0), retenue)
 }
 
 /// Scale interleaved PCM in place by a linear factor.
@@ -2916,6 +3002,155 @@ mod tests {
                 loose
             ) > 1.9
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #4072 — sans pic tagué, `prevent_clipping` refuse le gain positif.
+    // ------------------------------------------------------------------
+
+    /// Le défaut mesuré par T9 : +6 dB, aucun pic tagué, garde-fou ARMÉ.
+    /// Avant, le facteur sortait à ×1,9953 et 66,2 % des échantillons d'un
+    /// sinus à −0,1 dBFS étaient écrêtés dur. Il ne dépasse plus l'unité.
+    #[test]
+    fn sans_pic_tague_le_gain_positif_est_refuse_pas_rabote_sur_le_plafond() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let g = TrackGain {
+            gain_db: 6.0,
+            peak: None,
+        };
+        let (f, retenue) = gain_factor_detail(g, s);
+        assert_eq!(
+            f, 1.0,
+            "aucun pic tagué ⇒ le facteur ne dépasse pas l'unité"
+        );
+        assert_eq!(retenue, RetenueAntiEcretage::GainPositifRefuseSansPic);
+        assert_eq!(retenue.as_str(), "refused_no_peak");
+        // Le clamp ×4 n'est plus la seule borne : même +30 dB reste à l'unité.
+        assert_eq!(
+            gain_factor(
+                TrackGain {
+                    gain_db: 30.0,
+                    peak: None
+                },
+                s
+            ),
+            1.0
+        );
+    }
+
+    /// Un plafond dBTP n'entre PAS dans la borne « sans pic » : il
+    /// atténuerait toute piste non taguée, gain nul compris. La borne est
+    /// l'unité, et rien d'autre.
+    #[test]
+    fn sans_pic_tague_le_plafond_dbtp_n_attenue_pas_le_signal() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: -1.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: 0.0,
+                peak: None,
+            },
+            s,
+        );
+        assert_eq!(f, 1.0, "un gain nul sans pic reste l'identité");
+        assert_eq!(retenue, RetenueAntiEcretage::Aucune);
+    }
+
+    /// L'ATTÉNUATION traverse le garde-fou sans être touchée : un gain
+    /// négatif ne peut pas écrêter, et c'est la majorité des tags réels.
+    #[test]
+    fn sans_pic_tague_l_attenuation_passe_intacte() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: -6.0206,
+                peak: None,
+            },
+            s,
+        );
+        assert!((f - 0.5).abs() < 1e-4, "{f}");
+        assert_eq!(retenue, RetenueAntiEcretage::Aucune);
+    }
+
+    /// Un pic ABSURDE (nul ou négatif) ne doit pas rouvrir la porte : il n'est
+    /// pas un pic, il retombe donc sur le refus, pas sur une division.
+    #[test]
+    fn un_pic_nul_ou_negatif_retombe_sur_le_refus_pas_sur_une_division() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        for pic in [0.0, -0.5] {
+            let (f, retenue) = gain_factor_detail(
+                TrackGain {
+                    gain_db: 6.0,
+                    peak: Some(pic),
+                },
+                s,
+            );
+            assert_eq!(f, 1.0, "pic {pic}");
+            assert_eq!(retenue, RetenueAntiEcretage::GainPositifRefuseSansPic);
+        }
+    }
+
+    /// Garde-fou DÉSARMÉ : le refus disparaît avec lui. L'auditeur qui a
+    /// décoché la case garde exactement le comportement d'avant, écrêtage
+    /// compris — c'est ce qu'il a demandé.
+    #[test]
+    fn garde_fou_desarme_le_gain_positif_sans_pic_passe_comme_avant() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: false,
+            true_peak_ceiling_db: 0.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: 6.0,
+                peak: None,
+            },
+            s,
+        );
+        assert!((f - 1.9953).abs() < 1e-3, "{f}");
+        assert_eq!(retenue, RetenueAntiEcretage::Aucune);
+    }
+
+    /// Un pic tagué garde sa retenue nommée — le cas nominal n'a pas bougé.
+    #[test]
+    fn un_pic_tague_nomme_sa_retenue() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: 6.0,
+                peak: Some(0.95),
+            },
+            s,
+        );
+        assert!((f - 1.0 / 0.95).abs() < 1e-9, "{f}");
+        assert_eq!(retenue, RetenueAntiEcretage::ParLePicTague);
+        assert_eq!(retenue.as_str(), "tagged_peak");
+        assert_eq!(RetenueAntiEcretage::Aucune.as_str(), "none");
     }
 
     // ------------------------------------------------------------------
