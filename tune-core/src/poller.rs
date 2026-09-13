@@ -27,7 +27,7 @@ use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
     OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransportState,
+    TransformationsReelles, TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
@@ -71,6 +71,7 @@ async fn get_status_with_signal_path_bounded(
         Option<OutputSignalPathStatus>,
         Option<OutputDspMetrics>,
         Option<OutputRingStarvation>,
+        Option<TransformationsReelles>,
     ),
     String,
 > {
@@ -82,6 +83,9 @@ async fn get_status_with_signal_path_bounded(
             output.signal_path_status(),
             output.dsp_metrics(),
             output.ring_starvation(),
+            // Même verrou, même tick (REF-6b, #2219) : ce que la sortie a
+            // réellement fait au flux se relève à côté de sa sonde.
+            output.transformations_reelles(),
         ))
     };
     match timeout {
@@ -1051,3 +1055,22 @@ mod position_publiee_guard;
 /// avance n'est, elle, ni abandonnée ni refusée.
 #[cfg(test)]
 mod relance_radio_bornee_3756;
+
+/// REF-9 préparatoire (#2219) — témoins des transitions de `ZonePollState`.
+///
+/// Un témoin par transition nommée dans `docs/refonte/ref9-etats-du-sondeur.md` :
+/// l'état de sondage avant, la décision de `fsm` / `decisions`, l'état après.
+/// Aucune ligne de production : ce module ne vit que sous `cfg(test)`.
+#[cfg(test)]
+mod temoins_de_transitions_ref9;
+
+/// La position publiée ne porte jamais la piste PRÉCÉDENTE
+/// (renesenses/tune-web-client#954).
+///
+/// Le sondeur publie l'échantillon de la sortie AVANT de décider s'il est
+/// recevable : entre le basculement de `now_playing` et le démarrage réel du
+/// nouveau flux, la sortie rend encore la position de la piste d'avant, et
+/// cette valeur périmée devient l'état servi par `GET /zones`. Les témoins
+/// montent le vrai `tick` et rejouent la séquence.
+#[cfg(test)]
+mod position_de_la_piste_precedente_954;

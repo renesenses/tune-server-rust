@@ -170,6 +170,13 @@ pub(super) struct ZonePollState {
     /// relévé n'a été pris, ou après une remise à zéro (pause, arrêt, sortie
     /// sans anneau).
     pub(super) famine_releve_at: Option<Instant>,
+    /// REF-9 (#2219) — l'état de lecture, en OMBRE, à côté des 39 champs.
+    ///
+    /// Écrit par les 22 transitions nommées de [`super::fsm::Transition`]
+    /// que `tick` appelle juste après ses écritures de drapeaux ; vérifié
+    /// contre les drapeaux par [`ZonePollState::coherent`] en fin de tour.
+    /// AUCUNE décision de `tick` ne le lit.
+    pub(super) etat: EtatDeLecture,
 }
 
 impl ZonePollState {
@@ -220,6 +227,7 @@ impl ZonePollState {
             gapless_armed: None,
             famine: decisions::SuiviFamine::default(),
             famine_releve_at: None,
+            etat: EtatDeLecture::Neuve,
         }
     }
 }
@@ -246,4 +254,346 @@ pub(super) struct ArmedNext {
     /// La position occupee AU MOMENT de l'armement. Journalisee seule : elle
     /// dit de combien la file a glisse sous l'armement.
     pub(super) position: i64,
+}
+
+// ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────
+//
+// Huit variantes, une par ligne de la proposition de
+// `docs/refonte/ref9-etats-du-sondeur.md`. Décisions du 12/09 (par défaut,
+// arbitrage de Bertrand attendu) : « Arrêtée » est un état ; le second sens
+// de `gapless_sent` sur sortie exclusive est une variante distincte
+// (`Armement::Renonce`) ; le retrait depuis la branche d'erreur de sonde passe
+// par une transition nommée (`FinParHorlogeMurale` → `Terminee`).
+//
+// Une variante ne porte que ce qui la DISTINGUE : la ligne armée, l'état
+// d'avant l'arrêt, l'état d'avant la panne de sonde, le motif terminal. Les
+// compteurs et les horloges que la proposition lui attribue restent dans les
+// champs de `ZonePollState` tant que l'ombre ne pilote rien : les recopier
+// ferait deux écrivains pour un même fait, et c'est précisément ce que
+// l'invariant doit rendre impossible.
+
+/// L'état de lecture d'une zone, tel que la machine à états le dira.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum EtatDeLecture {
+    /// Piste chargée, aucun échantillon honnête encore (grâce de
+    /// chargement, `stale_start_position`). Aussi l'état d'une zone sans
+    /// périphérique, que rien ne fait avancer.
+    Neuve,
+    /// Le renderer joue, rien n'est armé.
+    Lecture,
+    /// `SetNext` accepté — ou renoncé sur sortie exclusive.
+    Armee { armement: Armement },
+    /// Le renderer dit `Stopped` alors que Tune joue ; on compte
+    /// (`stopped_ticks`). Porte l'état d'où l'on vient, car l'armement
+    /// survit à l'arrêt (armé, garde expirée, `Stopped` × 5 → attente
+    /// d'enchaînement).
+    Arretee { depuis: Depuis },
+    /// Les métadonnées sont prêtes à avancer ; on attend que le renderer
+    /// rejoue pour confirmer l'enchaînement.
+    AvancePendante,
+    /// Flux sans fin : ni pic, ni fin, ni gapless.
+    Radio,
+    /// La sonde ne répond pas ; recul exponentiel. Porte l'état d'avant,
+    /// que le prochain succès de sonde restitue.
+    SondageEnEchec { precedent: Box<EtatDeLecture> },
+    /// Terminal : l'orchestrateur agit et l'état est retiré — sauf sur la
+    /// branche d'erreur de sonde, où l'emprunt l'interdit et où l'état
+    /// survit avec le verrou `wall_clock_end_fired`.
+    Terminee(Issue),
+}
+
+/// Ce que « armé » veut dire — les deux sens du drapeau `gapless_sent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Armement {
+    /// `SetNextAVTransportURI` accepté (`tick.rs`, `GaplessPrep::Armed`).
+    /// `ligne` : ce que le renderer a accepté, `None` si la file n'a pas su
+    /// la rendre — la même valeur que `gapless_armed`.
+    Accepte { ligne: Option<ArmedNext> },
+    /// Sortie exclusive (ASIO / WASAPI exclusif) : on a renoncé à armer,
+    /// rien n'est parti ; `gapless_sent` n'est levé que pour cesser de
+    /// re-tenter (`gapless_skipped_exclusive_output`).
+    Renonce,
+}
+
+/// D'où vient un arrêt compté.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Depuis {
+    Lecture,
+    Armee(Armement),
+}
+
+/// L'issue d'un état terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Issue {
+    /// La piste est finie : `handle_track_end` enchaîne.
+    Finie(MotifFin),
+    /// La zone est coupée : `orchestrator.stop` (ou relance « démarrage
+    /// mort »).
+    Coupee(CauseDeCoupure),
+}
+
+/// Les cinq motifs de `decisions::motif_fin`, plus la fin prononcée sur
+/// sonde en échec, qui n'a pas de motif aujourd'hui (aucun `track_end_gap`
+/// n'est journalisé sur cette branche).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MotifFin {
+    FinNaturelleApresArret,
+    AvanceGaplessBloquee,
+    PositionAuDelaDeLaFin,
+    FinNaturelleLocale,
+    DsdDlnaPicAtteint,
+    HorlogeMuraleSurSondeEnEchec,
+}
+
+#[cfg(test)]
+impl MotifFin {
+    /// L'étiquette que `track_end_gap` journalise pour ce motif — ce que les
+    /// témoins confrontent au `motif_fin_de_piste` que `tick` écrit.
+    pub(super) fn etiquette(self) -> &'static str {
+        match self {
+            MotifFin::FinNaturelleApresArret => decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED,
+            MotifFin::AvanceGaplessBloquee => decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE,
+            MotifFin::PositionAuDelaDeLaFin => decisions::motif_fin::POSITION_AU_DELA_DE_LA_FIN,
+            MotifFin::FinNaturelleLocale => decisions::motif_fin::FIN_NATURELLE_LOCALE,
+            MotifFin::DsdDlnaPicAtteint => decisions::motif_fin::DSD_DLNA_PIC_ATTEINT,
+            MotifFin::HorlogeMuraleSurSondeEnEchec => "dlna_poll_failed_wall_clock",
+        }
+    }
+}
+
+/// Les quatre causes d'arrêt de zone que `tick` prononce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CauseDeCoupure {
+    /// `renderer_stalled_not_advancing_stopping_zone` : fin naturelle
+    /// refusée dix fois sur un flux incomplet.
+    RendererCale,
+    /// `playback_failure_stopping_zone` : `Stopped` × 30 et compteur
+    /// d'octets MESURÉ à sec.
+    FluxASec,
+    /// `dlna_playing_without_progress_stopping_zone` : `Playing` × 30 sans
+    /// progrès ni octets.
+    LectureSansProgres,
+    /// `radio_renderer_stopped_giving_up` : six ticks `Stopped` sans
+    /// position, ou station déjà refusée.
+    RadioAbandonnee,
+}
+
+/// Ce que l'invariant a trouvé en désaccord.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Incoherence {
+    /// `coherent()` : l'état et un drapeau ne disent pas la même chose.
+    Drapeau {
+        etat: &'static str,
+        drapeau: &'static str,
+        attendu: String,
+        lu: String,
+    },
+    /// `transition()` : cette transition n'est pas prévue depuis cet état.
+    TransitionInattendue { etat: String, transition: String },
+}
+
+impl std::fmt::Display for Incoherence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Incoherence::Drapeau {
+                etat,
+                drapeau,
+                attendu,
+                lu,
+            } => write!(f, "etat={etat} drapeau={drapeau} attendu={attendu} lu={lu}"),
+            Incoherence::TransitionInattendue { etat, transition } => {
+                write!(
+                    f,
+                    "transition_inattendue etat={etat} transition={transition}"
+                )
+            }
+        }
+    }
+}
+
+impl EtatDeLecture {
+    /// Le nom de la variante, pour les rapports.
+    pub(super) fn nom(&self) -> &'static str {
+        match self {
+            EtatDeLecture::Neuve => "Neuve",
+            EtatDeLecture::Lecture => "Lecture",
+            EtatDeLecture::Armee { .. } => "Armee",
+            EtatDeLecture::Arretee { .. } => "Arretee",
+            EtatDeLecture::AvancePendante => "AvancePendante",
+            EtatDeLecture::Radio => "Radio",
+            EtatDeLecture::SondageEnEchec { .. } => "SondageEnEchec",
+            EtatDeLecture::Terminee(_) => "Terminee",
+        }
+    }
+}
+
+/// Les drapeaux que l'invariant confronte à l'état. Un relevé, pas l'état :
+/// c'est ce qui permet de vérifier l'état d'AVANT une panne de sonde avec
+/// les mêmes champs.
+struct Drapeaux {
+    gapless_sent: bool,
+    gapless_advance_pending: bool,
+    wall_clock_end_fired: bool,
+    stopped_ticks: u8,
+    gapless_armed: Option<ArmedNext>,
+    gapless_sent_at_pose: bool,
+    consecutive_errors: u8,
+}
+
+impl Drapeaux {
+    fn attendre<T: PartialEq + std::fmt::Debug>(
+        etat: &'static str,
+        drapeau: &'static str,
+        attendu: T,
+        lu: T,
+    ) -> Result<(), Incoherence> {
+        if attendu == lu {
+            Ok(())
+        } else {
+            Err(Incoherence::Drapeau {
+                etat,
+                drapeau,
+                attendu: format!("{attendu:?}"),
+                lu: format!("{lu:?}"),
+            })
+        }
+    }
+
+    /// Ce qu'un armement impose : `gapless_sent` levé, `gapless_armed`
+    /// égal à la ligne acceptée (ou vide si l'on a renoncé).
+    fn armement(&self, etat: &'static str, armement: Armement) -> Result<(), Incoherence> {
+        Self::attendre(etat, "gapless_sent", true, self.gapless_sent)?;
+        match armement {
+            Armement::Accepte { ligne } => {
+                Self::attendre(etat, "gapless_armed", ligne, self.gapless_armed)
+            }
+            Armement::Renonce => {
+                Self::attendre(etat, "gapless_armed", None, self.gapless_armed)?;
+                Self::attendre(etat, "gapless_sent_at", false, self.gapless_sent_at_pose)
+            }
+        }
+    }
+
+    /// Rien d'armé, rien de pendant : `Neuve`, `Lecture`, `Radio` et
+    /// l'origine `Depuis::Lecture` d'un arrêt.
+    fn desarme(&self, etat: &'static str) -> Result<(), Incoherence> {
+        Self::attendre(etat, "gapless_sent", false, self.gapless_sent)?;
+        Self::attendre(etat, "gapless_armed", None, self.gapless_armed)?;
+        Self::attendre(etat, "gapless_sent_at", false, self.gapless_sent_at_pose)
+    }
+
+    /// La table de cohérence, état par état — sans bras `_`.
+    fn disent(&self, etat: &EtatDeLecture) -> Result<(), Incoherence> {
+        let nom = etat.nom();
+        match etat {
+            EtatDeLecture::Terminee(Issue::Finie(MotifFin::HorlogeMuraleSurSondeEnEchec)) => {
+                // Le seul état terminal qui survive au tour : le verrou par
+                // piste est levé, et il le reste jusqu'au changement de
+                // génération.
+                return Self::attendre(
+                    nom,
+                    "wall_clock_end_fired",
+                    true,
+                    self.wall_clock_end_fired,
+                );
+            }
+            EtatDeLecture::Terminee(Issue::Finie(_))
+            | EtatDeLecture::Terminee(Issue::Coupee(_)) => {
+                // Retiré de `poll_states` dans le même tour : rien à confronter.
+                return Ok(());
+            }
+            EtatDeLecture::Neuve
+            | EtatDeLecture::Lecture
+            | EtatDeLecture::Armee { .. }
+            | EtatDeLecture::Arretee { .. }
+            | EtatDeLecture::AvancePendante
+            | EtatDeLecture::Radio
+            | EtatDeLecture::SondageEnEchec { .. } => {}
+        }
+        // Hors état terminal, la fin par horloge murale n'a pas été prononcée.
+        Self::attendre(
+            nom,
+            "wall_clock_end_fired",
+            false,
+            self.wall_clock_end_fired,
+        )?;
+        match etat {
+            EtatDeLecture::Neuve | EtatDeLecture::Lecture | EtatDeLecture::Radio => {
+                self.desarme(nom)?;
+                Self::attendre(
+                    nom,
+                    "gapless_advance_pending",
+                    false,
+                    self.gapless_advance_pending,
+                )?;
+                Self::attendre(nom, "stopped_ticks", 0, self.stopped_ticks)
+            }
+            EtatDeLecture::Armee { armement } => {
+                self.armement(nom, *armement)?;
+                Self::attendre(
+                    nom,
+                    "gapless_advance_pending",
+                    false,
+                    self.gapless_advance_pending,
+                )?;
+                Self::attendre(nom, "stopped_ticks", 0, self.stopped_ticks)
+            }
+            EtatDeLecture::Arretee { depuis } => {
+                match depuis {
+                    Depuis::Lecture => self.desarme(nom)?,
+                    Depuis::Armee(armement) => self.armement(nom, *armement)?,
+                }
+                Self::attendre(
+                    nom,
+                    "gapless_advance_pending",
+                    false,
+                    self.gapless_advance_pending,
+                )?;
+                Self::attendre(nom, "stopped_ticks > 0", true, self.stopped_ticks > 0)
+            }
+            EtatDeLecture::AvancePendante => {
+                self.desarme(nom)?;
+                Self::attendre(
+                    nom,
+                    "gapless_advance_pending",
+                    true,
+                    self.gapless_advance_pending,
+                )?;
+                Self::attendre(nom, "stopped_ticks", 0, self.stopped_ticks)
+            }
+            EtatDeLecture::SondageEnEchec { precedent } => {
+                Self::attendre(
+                    nom,
+                    "consecutive_errors > 0",
+                    true,
+                    self.consecutive_errors > 0,
+                )?;
+                // Les drapeaux de lecture n'ont pas bougé pendant la panne :
+                // l'état d'avant doit encore les décrire.
+                self.disent(precedent)
+            }
+            EtatDeLecture::Terminee(_) => Ok(()),
+        }
+    }
+}
+
+impl ZonePollState {
+    /// L'invariant REF-9 : `etat` et la combinaison de drapeaux disent la
+    /// même chose. `Err` nomme l'état et le drapeau en désaccord.
+    ///
+    /// Vérifié sous `debug_assertions` à la fin de chaque tour de `tick`,
+    /// et par chaque témoin de `temoins_de_transitions_ref9` après la
+    /// transition qu'il rejoue. N'entre dans aucune décision.
+    pub(super) fn coherent(&self) -> Result<(), Incoherence> {
+        Drapeaux {
+            gapless_sent: self.gapless_sent,
+            gapless_advance_pending: self.gapless_advance_pending,
+            wall_clock_end_fired: self.wall_clock_end_fired,
+            stopped_ticks: self.stopped_ticks,
+            gapless_armed: self.gapless_armed,
+            gapless_sent_at_pose: self.gapless_sent_at.is_some(),
+            consecutive_errors: self.consecutive_errors,
+        }
+        .disent(&self.etat)
+    }
 }

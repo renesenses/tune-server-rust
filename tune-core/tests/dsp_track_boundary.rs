@@ -9,12 +9,34 @@
 //! `play_url` est async et pilote un périphérique : il ne se teste pas en
 //! unitaire. On verrouille donc le point d'appel dans la source, comme le fait
 //! déjà `no_blind_ffmpeg.rs` pour une autre invariante de ce dépôt.
+//!
+//! R6 bis (#2219) : les trois bras exclusifs de `play_url` vivent chacun dans
+//! leur module (`local/bras_coreaudio.rs`, `local/bras_asio.rs`,
+//! `local/bras_wasapi.rs`). Chaque bras est donc lu DEUX fois : son module,
+//! pour ce qu'il fait ; et sa fenêtre dans `play_url`, entre les bannières,
+//! pour prouver qu'il est APPELÉ — un module écrit mais pas branché serait
+//! exactement le défaut que ce fichier existe pour attraper.
 
 use std::path::Path;
 
 fn source() -> String {
     std::fs::read_to_string(Path::new("src/outputs/local.rs"))
         .expect("src/outputs/local.rs doit être lisible depuis la racine du crate")
+}
+
+/// Le module d'un bras exclusif, entier : il n'a pas de `mod tests`. Un appel
+/// par fichier, chemin en clair : `scripts/refonte/gardes.sh` inventorie les
+/// lecteurs par ce littéral, un chemin composé lui échapperait.
+fn bras(nom: &str) -> String {
+    let lu = match nom {
+        "coreaudio" => std::fs::read_to_string(Path::new("src/outputs/local/bras_coreaudio.rs")),
+        "asio" => std::fs::read_to_string(Path::new("src/outputs/local/bras_asio.rs")),
+        "wasapi" => std::fs::read_to_string(Path::new("src/outputs/local/bras_wasapi.rs")),
+        autre => panic!("bras exclusif inconnu : {autre}"),
+    };
+    lu.unwrap_or_else(|e| {
+        panic!("src/outputs/local/bras_{nom}.rs doit être lisible depuis la racine du crate : {e}")
+    })
 }
 
 /// La production seule : `mod tests` contient les mêmes appels et rendrait
@@ -63,8 +85,18 @@ fn play_url_remet_le_convolveur_a_zero() {
 fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
     let src = source();
     let prod = production(&src);
+    let bras_coreaudio = bras("coreaudio");
+    let bras_asio = bras("asio");
+    let bras_wasapi = bras("wasapi");
 
-    let drainages = prod.matches("flush_local_dsp(").count() - 1; // moins la définition
+    // R6 bis (#2219) : la définition et les deux drainages du chemin cpal
+    // partagé (transition gapless, fin de chaîne) restent dans `local.rs` ;
+    // chaque bras exclusif porte le sien dans son module. Le plancher ne
+    // bouge pas : cinq chemins, cinq drainages, quel que soit le fichier.
+    let drainages = prod.matches("flush_local_dsp(").count() - 1 // moins la définition
+        + bras_coreaudio.matches("flush_local_dsp(").count()
+        + bras_asio.matches("flush_local_dsp(").count()
+        + bras_wasapi.matches("flush_local_dsp(").count();
     assert!(
         drainages >= 5,
         "les cinq chemins de lecture locale doivent drainer, {drainages} trouvé(s)"
@@ -89,8 +121,13 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         })
         .expect("le chemin CoreAudio exclusif doit rester identifiable");
     assert!(
-        coreaudio.contains("pcm_processor.process_pcm_chunk(")
-            && coreaudio.contains("flush_local_dsp("),
+        coreaudio.contains("bras_coreaudio::jouer_via_coreaudio("),
+        "play_url n'appelle plus le bras CoreAudio exclusif : un module écrit mais pas \
+         branché ne draine rien (R6 bis, #2219)"
+    );
+    assert!(
+        bras_coreaudio.contains("pcm_processor.process_pcm_chunk(")
+            && bras_coreaudio.contains("flush_local_dsp("),
         "CoreAudio exclusif doit traverser la frontière PCM commune puis drainer sa fin de piste"
     );
 
@@ -122,8 +159,13 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         })
         .expect("le chemin ASIO doit rester identifiable");
     assert!(
-        asio.contains("feed_selected_windows_exclusive_leftover(")
-            && asio.contains("flush_local_dsp("),
+        asio.contains("bras_asio::jouer_via_asio("),
+        "play_url n'appelle plus le bras ASIO exclusif : un module écrit mais pas branché \
+         ne draine rien (R6 bis, #2219)"
+    );
+    assert!(
+        bras_asio.contains("feed_selected_windows_exclusive_leftover(")
+            && bras_asio.contains("flush_local_dsp("),
         "ASIO doit sélectionner la préparation conforme au pilote puis drainer sa fin de piste"
     );
 
@@ -136,8 +178,13 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
         })
         .expect("le chemin WASAPI doit rester identifiable");
     assert!(
-        wasapi.contains("feed_windows_native_exclusive_leftover(")
-            && wasapi.contains("flush_local_dsp("),
+        wasapi.contains("bras_wasapi::jouer_via_wasapi("),
+        "play_url n'appelle plus le bras WASAPI exclusif : un module écrit mais pas \
+         branché ne draine rien (R6 bis, #2219)"
+    );
+    assert!(
+        bras_wasapi.contains("feed_windows_native_exclusive_leftover(")
+            && bras_wasapi.contains("flush_local_dsp("),
         "WASAPI doit passer par la préparation entière puis drainer sa fin de piste"
     );
 

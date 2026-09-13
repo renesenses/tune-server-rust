@@ -395,6 +395,7 @@ fn gapless_cooldown_suppresses_stopped() {
         gapless_armed: None,
         famine: Default::default(),
         famine_releve_at: None,
+        etat: EtatDeLecture::Neuve,
     };
 
     // While cooldown > 0, stopped_ticks must not accumulate
@@ -458,6 +459,7 @@ fn playing_state_resets_cooldown() {
         gapless_armed: None,
         famine: Default::default(),
         famine_releve_at: None,
+        etat: EtatDeLecture::Neuve,
     };
 
     // Simulates entering Playing state
@@ -766,6 +768,7 @@ fn backoff_exponential() {
         gapless_armed: None,
         famine: Default::default(),
         famine_releve_at: None,
+        etat: EtatDeLecture::Neuve,
     };
 
     // Simulate consecutive errors with exponential backoff
@@ -1612,6 +1615,7 @@ fn gapless_stuck_forces_track_end() {
         gapless_armed: None,
         famine: Default::default(),
         famine_releve_at: None,
+        etat: EtatDeLecture::Neuve,
     };
 
     // Simulate renderer staying Stopped after cooldown expired.
@@ -1942,6 +1946,7 @@ fn gapless_stuck_cleared_on_playing() {
         gapless_armed: None,
         famine: Default::default(),
         famine_releve_at: None,
+        etat: EtatDeLecture::Neuve,
     };
 
     // Simulate entering Playing state (renderer auto-transitioned)

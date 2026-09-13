@@ -211,6 +211,95 @@ pub(super) fn apply_radio_eq(
     }
 }
 
+// Radio streams from Radio France (FIP, etc.) periodically drop the upstream
+// HTTP body (`request or response body error`) — Xavier's ~1h30 cutoffs.
+// The old code ended the decode on such an error, tearing down the WAV
+// session and relying on the poller auto-retry (~1min40 of silence). Instead
+// we reconnect the upstream in place and keep feeding the SAME session, so
+// the renderer never stops (a sub-second gap at worst). We give up only after
+// MAX_RECONNECTS so a permanently-dead station still falls back to the poller.
+const MAX_RECONNECTS: u32 = 30;
+
+/// L'état porté d'une connexion à la suivante par la boucle `'reconnect` de
+/// [`decode_radio_stream_to_pcm`] : les `let mut` d'avant la boucle, ni plus
+/// ni moins. Chaque temps le reçoit par `&mut` et n'écrit que ce que le texte
+/// d'origine écrivait au même endroit.
+struct EtatRadio {
+    first_chunk_sent: bool,
+    pcm_buf: Vec<u8>,
+    chunk_size: usize,
+    reconnects: u32,
+    // When the upstream last dropped, so we can measure how long the renderer
+    // was starved during a reconnect (diagnostics: FIP silent-after-reconnect).
+    dropped_at: Option<std::time::Instant>,
+    // Format of the first successful connection. A reconnect that returns a
+    // different rate/channel layout would feed PCM that doesn't match the WAV
+    // header already sent to the renderer, so we bail to a fresh session instead.
+    expected_format: Option<(u16, u32)>,
+    // Construit une seule fois au format réellement détecté, puis conservé à
+    // travers les reconnexions compatibles : réinitialiser les biquads à chaque
+    // coupure amont créerait un transitoire audible (#2063).
+    radio_eq: Option<crate::audio::eq::EqProcessor>,
+}
+
+/// Les canaux et le contexte du décodeur, relevés une fois par
+/// [`decode_radio_stream_to_pcm`] et lus par chaque temps.
+struct CanauxRadio<'a> {
+    tx: &'a tokio::sync::mpsc::Sender<Vec<u8>>,
+    data_ready: &'a std::sync::Arc<tokio::sync::Notify>,
+    session: &'a std::sync::Arc<crate::http::streamer::StreamSession>,
+    eq_profile: &'a Option<crate::audio::eq::EqProfile>,
+    levels_tx: &'a Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
+    rt: &'a tokio::runtime::Handle,
+}
+
+/// Ce que rend une connexion sondée : le lecteur de conteneur, le décodeur
+/// et la piste audio retenue.
+struct Sonde {
+    format: Box<dyn symphonia::core::formats::FormatReader>,
+    decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
+    track_id: u32,
+    source_channels: u16,
+    source_sample_rate: u32,
+}
+
+/// Le format de sortie décidé pour une connexion (voir `renderer_safe_wav_rate`).
+struct SortieRadio {
+    output_sample_rate: u32,
+    needs_resample: bool,
+}
+
+/// La suite que décide UNE connexion de la boucle `'reconnect`.
+enum SuiteRadio {
+    /// `continue 'reconnect` : la connexion a échoué ou l'amont a coupé, on
+    /// retente sur la MÊME session.
+    Reconnecter,
+    /// Chacun des `return` du texte d'origine, avec sa valeur : `Err` quand
+    /// la première connexion échoue ou que la station est une page web ou un
+    /// manifeste HLS ; `Ok(())` quand le consommateur est parti, que le
+    /// format a changé ou que `MAX_RECONNECTS` est dépassé.
+    Rendre(Result<(), String>),
+}
+
+/// La suite que décide UN paquet de la boucle de décodage.
+enum SuitePaquet {
+    /// Fin naturelle de l'itération : le paquet est décodé et servi.
+    PaquetServi,
+    /// `continue` : le paquet appartient à une autre piste.
+    AutrePiste,
+    /// `continue` : trame indécodable, sautée.
+    TrameSautee,
+    /// `break` : l'amont a terminé son flux (`Ok(None)`) — on se reconnecte.
+    AmontTermine,
+    /// `break` : l'amont a coupé (fin de fichier inattendue) — on se reconnecte.
+    AmontCoupe,
+    /// `break` : erreur de lecture d'un paquet (corps FIP) — on se reconnecte.
+    ErreurDePaquet,
+    /// `return Ok(())` : le canal est fermé ou l'envoi refusé, le
+    /// consommateur est parti.
+    ConsommateurParti,
+}
+
 pub(super) fn decode_radio_stream_to_pcm(
     url: String,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -225,15 +314,6 @@ pub(super) fn decode_radio_stream_to_pcm(
     // pas — on tappe ici le PCM déjà décodé. `None` = pas de bus (tests).
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
 ) -> Result<(), String> {
-    use symphonia::core::audio::conv::IntoSample;
-    use symphonia::core::codecs::CodecParameters;
-    use symphonia::core::codecs::audio::AudioDecoderOptions;
-    use symphonia::core::formats::probe::Hint;
-    use symphonia::core::formats::{FormatOptions, TrackType};
-    use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
-    use symphonia::core::meta::MetadataOptions;
-    use tracing::{debug, info, warn};
-
     // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
     // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
     // rafraîchissement de playlist, rien de ce qu'un direct HLS exige. Sans
@@ -250,349 +330,432 @@ pub(super) fn decode_radio_stream_to_pcm(
     let rt =
         tokio::runtime::Handle::try_current().map_err(|_| "no tokio runtime for radio decode")?;
 
-    let mut first_chunk_sent = false;
-    let mut pcm_buf: Vec<u8> = Vec::with_capacity(65536);
-    let chunk_size: usize = 32768;
-
-    // Radio streams from Radio France (FIP, etc.) periodically drop the upstream
-    // HTTP body (`request or response body error`) — Xavier's ~1h30 cutoffs.
-    // The old code ended the decode on such an error, tearing down the WAV
-    // session and relying on the poller auto-retry (~1min40 of silence). Instead
-    // we reconnect the upstream in place and keep feeding the SAME session, so
-    // the renderer never stops (a sub-second gap at worst). We give up only after
-    // MAX_RECONNECTS so a permanently-dead station still falls back to the poller.
-    const MAX_RECONNECTS: u32 = 30;
-    let mut reconnects: u32 = 0;
-    // When the upstream last dropped, so we can measure how long the renderer
-    // was starved during a reconnect (diagnostics: FIP silent-after-reconnect).
-    let mut dropped_at: Option<std::time::Instant> = None;
-    // Format of the first successful connection. A reconnect that returns a
-    // different rate/channel layout would feed PCM that doesn't match the WAV
-    // header already sent to the renderer, so we bail to a fresh session instead.
-    let mut expected_format: Option<(u16, u32)> = None;
-    // Construit une seule fois au format réellement détecté, puis conservé à
-    // travers les reconnexions compatibles : réinitialiser les biquads à chaque
-    // coupure amont créerait un transitoire audible (#2063).
-    let mut radio_eq: Option<crate::audio::eq::EqProcessor> = None;
+    let mut etat = EtatRadio {
+        first_chunk_sent: false,
+        pcm_buf: Vec::with_capacity(65536),
+        chunk_size: 32768,
+        reconnects: 0,
+        dropped_at: None,
+        expected_format: None,
+        radio_eq: None,
+    };
+    let canaux = CanauxRadio {
+        tx: &tx,
+        data_ready: &data_ready,
+        session: &session,
+        eq_profile: &eq_profile,
+        levels_tx: &levels_tx,
+        rt: &rt,
+    };
 
     'reconnect: loop {
-        // ---- Connect + probe + build decoder ----
-        let setup = (|| -> Result<
-            (
-                Box<dyn symphonia::core::formats::FormatReader>,
-                Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
-                u32,
-                u16,
-                u32,
-            ),
-            String,
-        > {
-            // No total timeout for infinite radio streams
-            let response = crate::http::client::blocking_builder()
-                .timeout(None)
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .and_then(|c| c.get(&url).send())
-                .map_err(|e| format!("radio HTTP fetch failed: {e}"))?;
-            if !response.status().is_success() {
-                return Err(format!("radio HTTP error: {}", response.status()));
-            }
-            // Le type réellement reçu, tracé à CHAQUE connexion : c'est la
-            // seule façon de savoir, la prochaine fois qu'une station meurt,
-            // ce que son serveur a répondu (issue #1960).
-            let content_type = response
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            // Une station peut disparaître en répondant 200 : la BBC redirige
-            // son ancien flux vers sa page d'accueil. Sans ce contrôle, le
-            // décodeur avale du HTML, échoue plus loin sur un message obscur
-            // (« no audio track found ») et l'auditeur n'a que du silence.
-            if let Some(bad) = non_audio_content_type(&content_type) {
-                return Err(format!(
-                    "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
-                ));
-            }
-            // Un manifeste HLS servi depuis une URL sans extension : seul le
-            // type MIME le dénonce. Même refus nommé que la porte d'entrée.
-            if is_hls_manifest(&url, &content_type) {
-                return Err(format!(
-                    "{RADIO_HLS_UNSUPPORTED}: le serveur a répondu « {content_type} », un manifeste HLS et non un flux audio"
-                ));
-            }
-            info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
-
-            let source = ReadOnlySource::new(response);
-            let mss = MediaSourceStream::new(Box::new(source), Default::default());
-
-            let mut hint = Hint::new();
-            let lower = url.to_lowercase();
-            let path_part = lower.split('?').next().unwrap_or(&lower);
-            if path_part.ends_with(".mp3") {
-                hint.with_extension("mp3");
-            } else if path_part.ends_with(".aac") || path_part.ends_with(".m4a") {
-                hint.with_extension("aac");
-            } else if path_part.ends_with(".ogg") {
-                hint.with_extension("ogg");
-            } else if path_part.ends_with(".flac") {
-                hint.with_extension("flac");
-            } else {
-                hint.with_extension("mp3");
-            }
-
-            let format: Box<dyn symphonia::core::formats::FormatReader> =
-                symphonia::default::get_probe()
-                    .probe(
-                        &hint,
-                        mss,
-                        FormatOptions::default(),
-                        MetadataOptions::default(),
-                    )
-                    .map_err(|e| format!("radio probe failed: {e}"))?;
-
-            // Extract track metadata in a scope so the borrow of `format` ends
-            // before we move it into the return tuple.
-            let (track_id, audio_params) = {
-                let track = format
-                    .default_track(TrackType::Audio)
-                    .ok_or("radio stream: no audio track found")?;
-                let params = match &track.codec_params {
-                    Some(CodecParameters::Audio(params)) => params.clone(),
-                    _ => return Err("radio stream: no audio codec parameters".into()),
-                };
-                (track.id, params)
-            };
-            let source_channels = audio_params
-                .channels
-                .as_ref()
-                .map(|c| c.count() as u16)
-                .unwrap_or(2);
-            let source_sample_rate = audio_params.sample_rate.unwrap_or(44100);
-
-            let decoder = symphonia::default::get_codecs()
-                .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
-                .map_err(|e| format!("radio decoder init failed: {e}"))?;
-
-            Ok((
-                format,
-                decoder,
-                track_id,
-                source_channels,
-                source_sample_rate,
-            ))
-        })();
-
-        let (mut format, mut decoder, track_id, source_channels, source_sample_rate) = match setup {
-            Ok(v) => v,
-            Err(e) => {
-                if reconnects == 0 {
-                    // Initial connection failed — fail fast (bad URL, etc.)
-                    return Err(e);
-                }
-                // Une station remplacée par une page web ne redeviendra pas un
-                // flux audio en réessayant trente fois : on remonte l'erreur
-                // tout de suite pour qu'elle soit DITE, au lieu de quinze
-                // secondes de silence suivies d'un abandon muet.
-                // Ni un manifeste HLS, que trente reconnexions ne
-                // transformeront pas davantage en flux Icecast (#2307).
-                if e.starts_with(RADIO_NOT_AUDIO) || e.starts_with(RADIO_HLS_UNSUPPORTED) {
-                    return Err(e);
-                }
-                reconnects += 1;
-                if reconnects > MAX_RECONNECTS {
-                    warn!(url = %url, error = %e, "radio_reconnect_giving_up");
-                    return Ok(());
-                }
-                warn!(url = %url, error = %e, attempt = reconnects, "radio_reconnect_setup_failed_retrying");
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                continue 'reconnect;
-            }
-        };
-
-        // Guard against a reconnect changing the audio format underneath the
-        // WAV header already advertised to the renderer.
-        match expected_format {
-            None => expected_format = Some((source_channels, source_sample_rate)),
-            Some((ch, sr)) if (ch, sr) != (source_channels, source_sample_rate) => {
-                warn!(
-                    url = %url,
-                    expected_ch = ch, expected_sr = sr,
-                    got_ch = source_channels, got_sr = source_sample_rate,
-                    "radio_reconnect_format_changed_bailing"
-                );
-                return Ok(());
-            }
-            _ => {}
+        match une_connexion(&mut etat, &url, &canaux) {
+            SuiteRadio::Reconnecter => continue 'reconnect,
+            SuiteRadio::Rendre(resultat) => return resultat,
         }
+    }
+}
 
-        // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
-        // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
-        // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
-        let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
-        let needs_resample = output_sample_rate != source_sample_rate;
-        if radio_eq.is_none() {
-            radio_eq = eq_profile.as_ref().and_then(|profile| {
-                let eq = crate::audio::eq::EqProcessor::new(
-                    profile,
-                    output_sample_rate,
-                    source_channels,
-                );
-                if eq.is_enabled() { Some(eq) } else { None }
-            });
-        }
+/// Le corps d'UNE itération de `'reconnect` : connexion et sonde, format de
+/// sortie, boucle de décodage, reprise après coupure. Chaque sortie de
+/// boucle du texte d'origine est une variante de [`SuiteRadio`] ou de
+/// [`SuitePaquet`] ; aucune condition n'a changé.
+fn une_connexion(etat: &mut EtatRadio, url: &str, canaux: &CanauxRadio<'_>) -> SuiteRadio {
+    // ---- Connect + probe + build decoder ----
+    let mut sonde = match se_connecter_et_sonder(etat, url) {
+        Ok(sonde) => sonde,
+        Err(suite) => return suite,
+    };
 
-        // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
-        // that matches the PCM we actually feed (FIP is 48000 → advertised as
-        // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
-        // BEFORE first_chunk so the header, emitted after data_ready, is right.
-        session.publish_detected_output_format(output_sample_rate, source_channels);
+    let sortie = match preparer_la_sortie(etat, url, canaux, &sonde) {
+        Ok(sortie) => sortie,
+        Err(suite) => return suite,
+    };
 
-        // Measure the reconnect gap: how long the session went without fresh
-        // PCM. A long gap can starve the renderer's HTTP read.
-        let gap_ms = dropped_at.take().map(|t| t.elapsed().as_millis());
-        info!(
-            channels = source_channels,
-            sample_rate = source_sample_rate,
-            output_sample_rate = output_sample_rate,
-            resampled = needs_resample,
-            reconnect = reconnects,
-            gap_ms = ?gap_ms,
-            "radio_local_decode_started"
-        );
-        if let Some(g) = gap_ms {
-            if g > 2000 {
-                warn!(
-                    gap_ms = g,
-                    reconnect = reconnects,
-                    "radio_reconnect_gap_long — renderer may have been starved"
-                );
-            }
-        }
+    // When this connection started streaming. A healthy station streams for
+    // minutes between periodic upstream drops; only a permanently-dead
+    // station fails in rapid succession. Used below to reset the reconnect
+    // counter after a good stretch (see the drop handler).
+    let connected_at = std::time::Instant::now();
 
-        // When this connection started streaming. A healthy station streams for
-        // minutes between periodic upstream drops; only a permanently-dead
-        // station fails in rapid succession. Used below to reset the reconnect
-        // counter after a good stretch (see the drop handler).
-        let connected_at = std::time::Instant::now();
-
-        // ---- Decode loop ----
-        loop {
-            if tx.is_closed() {
-                debug!("radio_local_decode_channel_closed_before_packet");
-                return Ok(());
-            }
-            let packet = match format.next_packet() {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    debug!("radio_local_decode_stream_ended_upstream");
-                    break; // upstream ended — reconnect
-                }
-                Err(symphonia::core::errors::Error::IoError(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    debug!("radio_local_decode_eof");
-                    break; // upstream dropped — reconnect
-                }
-                Err(e) => {
-                    // FIP-style upstream body error — reconnect in place.
-                    warn!(error = %e, "radio_local_decode_packet_error");
-                    break;
-                }
-            };
-
-            if packet.track_id != track_id {
+    // ---- Decode loop ----
+    loop {
+        match decoder_un_paquet(etat, canaux, &mut sonde, &sortie) {
+            SuitePaquet::PaquetServi | SuitePaquet::AutrePiste | SuitePaquet::TrameSautee => {
                 continue;
             }
-
-            let decoded = match decoder.decode(&packet) {
-                Ok(d) => d,
-                Err(e) => {
-                    debug!(error = %e, "radio_local_decode_frame_skip");
-                    continue;
-                }
-            };
-
-            // Convert decoded audio buffer to interleaved 16-bit PCM bytes
-            let channels = decoded.spec().channels().count();
-            let frames = decoded.frames();
-
-            let mut interleaved: Vec<f32> = Vec::with_capacity(frames * channels);
-            decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
-
-            // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
-            // before packing to i16, so the bytes match the advertised WAV
-            // header. No-op (single move) when the stream is already 44.1/48.
-            if needs_resample {
-                interleaved = crate::audio::simple_resample(
-                    &interleaved,
-                    source_sample_rate,
-                    output_sample_rate,
-                    channels as u16,
-                );
+            SuitePaquet::AmontTermine | SuitePaquet::AmontCoupe | SuitePaquet::ErreurDePaquet => {
+                break;
             }
-
-            // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
-            // le profil de zone. Le traitement se fait en f32 avant i16, comme
-            // les autres chemins DSP, et les VU observent ainsi le signal final.
-            apply_radio_eq(&mut radio_eq, &mut interleaved);
-
-            let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
-            for sample in &interleaved {
-                let s16: i16 = (*sample).into_sample();
-                packet_buf.extend_from_slice(&s16.to_le_bytes());
-            }
-
-            pcm_buf.extend_from_slice(&packet_buf);
-
-            while pcm_buf.len() >= chunk_size {
-                let chunk: Vec<u8> = pcm_buf.drain(..chunk_size).collect();
-                // VU-mètres : tappe le PCM 16-bit avant de le servir (canal
-                // séparé, non bloquant — n'affecte pas le flux du renderer).
-                if let Some(ref ltx) = levels_tx {
-                    crate::audio::tap::send_windowed_pcm(
-                        ltx,
-                        &chunk,
-                        16,
-                        channels as u16,
-                        output_sample_rate,
-                    );
-                }
-                if rt.block_on(tx.send(chunk)).is_err() {
-                    debug!("radio_local_decode_consumer_dropped");
-                    return Ok(());
-                }
-                if !first_chunk_sent {
-                    first_chunk_sent = true;
-                    data_ready.notify_one();
-                }
-            }
+            SuitePaquet::ConsommateurParti => return SuiteRadio::Rendre(Ok(())),
         }
-
-        // Inner loop broke because the upstream stream dropped (not tx closed).
-        // Reconnect and keep feeding the SAME session (pcm_buf carries over).
-        if tx.is_closed() {
-            return Ok(());
-        }
-        // MAX_RECONNECTS guards against a *permanently dead* station (rapid
-        // back-to-back failures) — not against a healthy station's periodic
-        // upstream drops. FIP-style streams drop the body roughly every ~6 min,
-        // so a cumulative counter hit 30 at ~3h and cut a good listen (Xavier
-        // #1212, a regression of #382). Reset the counter after any sustained
-        // good stretch so a normal long listen is never capped, while a dead
-        // station (each connection dies in <60s) still burns through
-        // MAX_RECONNECTS in seconds and correctly falls back to the poller.
-        if connected_at.elapsed() >= std::time::Duration::from_secs(60) {
-            reconnects = 0;
-        }
-        reconnects += 1;
-        if reconnects > MAX_RECONNECTS {
-            warn!(url = %url, reconnects, "radio_reconnect_giving_up");
-            return Ok(());
-        }
-        dropped_at = Some(std::time::Instant::now());
-        info!(url = %url, attempt = reconnects, "radio_upstream_dropped_reconnecting");
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
+
+    reprendre_apres_coupure(etat, url, canaux, connected_at)
+}
+
+/// Premier temps : la station est sondée ; sur échec, la décision de
+/// réessayer ou de rendre est celle du texte d'origine (échec initial,
+/// page web ou HLS, plafond de reconnexions).
+fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, SuiteRadio> {
+    use tracing::warn;
+
+    let setup = sonder_la_station(url);
+
+    match setup {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if etat.reconnects == 0 {
+                // Initial connection failed — fail fast (bad URL, etc.)
+                return Err(SuiteRadio::Rendre(Err(e)));
+            }
+            // Une station remplacée par une page web ne redeviendra pas un
+            // flux audio en réessayant trente fois : on remonte l'erreur
+            // tout de suite pour qu'elle soit DITE, au lieu de quinze
+            // secondes de silence suivies d'un abandon muet.
+            // Ni un manifeste HLS, que trente reconnexions ne
+            // transformeront pas davantage en flux Icecast (#2307).
+            if e.starts_with(RADIO_NOT_AUDIO) || e.starts_with(RADIO_HLS_UNSUPPORTED) {
+                return Err(SuiteRadio::Rendre(Err(e)));
+            }
+            etat.reconnects += 1;
+            if etat.reconnects > MAX_RECONNECTS {
+                warn!(url = %url, error = %e, "radio_reconnect_giving_up");
+                return Err(SuiteRadio::Rendre(Ok(())));
+            }
+            warn!(url = %url, error = %e, attempt = etat.reconnects, "radio_reconnect_setup_failed_retrying");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            Err(SuiteRadio::Reconnecter)
+        }
+    }
+}
+
+/// Le GET, les contrôles de type, la sonde Symphonia et le décodeur : le
+/// texte de la fermeture `setup` d'origine, tel quel.
+fn sonder_la_station(url: &str) -> Result<Sonde, String> {
+    use symphonia::core::codecs::CodecParameters;
+    use symphonia::core::codecs::audio::AudioDecoderOptions;
+    use symphonia::core::formats::probe::Hint;
+    use symphonia::core::formats::{FormatOptions, TrackType};
+    use symphonia::core::io::{MediaSourceStream, ReadOnlySource};
+    use symphonia::core::meta::MetadataOptions;
+    use tracing::info;
+
+    // No total timeout for infinite radio streams
+    let response = crate::http::client::blocking_builder()
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .and_then(|c| c.get(url).send())
+        .map_err(|e| format!("radio HTTP fetch failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("radio HTTP error: {}", response.status()));
+    }
+    // Le type réellement reçu, tracé à CHAQUE connexion : c'est la
+    // seule façon de savoir, la prochaine fois qu'une station meurt,
+    // ce que son serveur a répondu (issue #1960).
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    // Une station peut disparaître en répondant 200 : la BBC redirige
+    // son ancien flux vers sa page d'accueil. Sans ce contrôle, le
+    // décodeur avale du HTML, échoue plus loin sur un message obscur
+    // (« no audio track found ») et l'auditeur n'a que du silence.
+    if let Some(bad) = non_audio_content_type(&content_type) {
+        return Err(format!(
+            "{RADIO_NOT_AUDIO}: le serveur a répondu « {bad} » au lieu d'un flux audio"
+        ));
+    }
+    // Un manifeste HLS servi depuis une URL sans extension : seul le
+    // type MIME le dénonce. Même refus nommé que la porte d'entrée.
+    if is_hls_manifest(url, &content_type) {
+        return Err(format!(
+            "{RADIO_HLS_UNSUPPORTED}: le serveur a répondu « {content_type} », un manifeste HLS et non un flux audio"
+        ));
+    }
+    info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
+
+    let source = ReadOnlySource::new(response);
+    let mss = MediaSourceStream::new(Box::new(source), Default::default());
+
+    let mut hint = Hint::new();
+    let lower = url.to_lowercase();
+    let path_part = lower.split('?').next().unwrap_or(&lower);
+    if path_part.ends_with(".mp3") {
+        hint.with_extension("mp3");
+    } else if path_part.ends_with(".aac") || path_part.ends_with(".m4a") {
+        hint.with_extension("aac");
+    } else if path_part.ends_with(".ogg") {
+        hint.with_extension("ogg");
+    } else if path_part.ends_with(".flac") {
+        hint.with_extension("flac");
+    } else {
+        hint.with_extension("mp3");
+    }
+
+    let format: Box<dyn symphonia::core::formats::FormatReader> = symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| format!("radio probe failed: {e}"))?;
+
+    // Extract track metadata in a scope so the borrow of `format` ends
+    // before we move it into the return tuple.
+    let (track_id, audio_params) = {
+        let track = format
+            .default_track(TrackType::Audio)
+            .ok_or("radio stream: no audio track found")?;
+        let params = match &track.codec_params {
+            Some(CodecParameters::Audio(params)) => params.clone(),
+            _ => return Err("radio stream: no audio codec parameters".into()),
+        };
+        (track.id, params)
+    };
+    let source_channels = audio_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+    let source_sample_rate = audio_params.sample_rate.unwrap_or(44100);
+
+    let decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
+        .map_err(|e| format!("radio decoder init failed: {e}"))?;
+
+    Ok(Sonde {
+        format,
+        decoder,
+        track_id,
+        source_channels,
+        source_sample_rate,
+    })
+}
+
+/// Deuxième temps : le format attendu est vérifié, le taux de sortie
+/// décidé, l'EQ construit une seule fois, le format publié à la session, et
+/// la coupure mesurée.
+fn preparer_la_sortie(
+    etat: &mut EtatRadio,
+    url: &str,
+    canaux: &CanauxRadio<'_>,
+    sonde: &Sonde,
+) -> Result<SortieRadio, SuiteRadio> {
+    use tracing::{info, warn};
+
+    let source_channels = sonde.source_channels;
+    let source_sample_rate = sonde.source_sample_rate;
+
+    // Guard against a reconnect changing the audio format underneath the
+    // WAV header already advertised to the renderer.
+    match etat.expected_format {
+        None => etat.expected_format = Some((source_channels, source_sample_rate)),
+        Some((ch, sr)) if (ch, sr) != (source_channels, source_sample_rate) => {
+            warn!(
+                url = %url,
+                expected_ch = ch, expected_sr = sr,
+                got_ch = source_channels, got_sr = source_sample_rate,
+                "radio_reconnect_format_changed_bailing"
+            );
+            return Err(SuiteRadio::Rendre(Ok(())));
+        }
+        _ => {}
+    }
+
+    // Renderer-safe output rate: HE-AAC/aacPlus decodes at its AAC-LC core
+    // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
+    // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
+    let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
+    let needs_resample = output_sample_rate != source_sample_rate;
+    if etat.radio_eq.is_none() {
+        etat.radio_eq = canaux.eq_profile.as_ref().and_then(|profile| {
+            let eq =
+                crate::audio::eq::EqProcessor::new(profile, output_sample_rate, source_channels);
+            if eq.is_enabled() { Some(eq) } else { None }
+        });
+    }
+
+    // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
+    // that matches the PCM we actually feed (FIP is 48000 → advertised as
+    // is; Morow HE-AAC is 22050 → advertised as the resampled 44100). Set
+    // BEFORE first_chunk so the header, emitted after data_ready, is right.
+    canaux
+        .session
+        .publish_detected_output_format(output_sample_rate, source_channels);
+
+    // Measure the reconnect gap: how long the session went without fresh
+    // PCM. A long gap can starve the renderer's HTTP read.
+    let gap_ms = etat.dropped_at.take().map(|t| t.elapsed().as_millis());
+    info!(
+        channels = source_channels,
+        sample_rate = source_sample_rate,
+        output_sample_rate = output_sample_rate,
+        resampled = needs_resample,
+        reconnect = etat.reconnects,
+        gap_ms = ?gap_ms,
+        "radio_local_decode_started"
+    );
+    if let Some(g) = gap_ms {
+        if g > 2000 {
+            warn!(
+                gap_ms = g,
+                reconnect = etat.reconnects,
+                "radio_reconnect_gap_long — renderer may have been starved"
+            );
+        }
+    }
+
+    Ok(SortieRadio {
+        output_sample_rate,
+        needs_resample,
+    })
+}
+
+/// Troisième temps, le corps d'UNE itération de la boucle de décodage : un
+/// paquet lu, décodé, rééchantillonné, égalisé, quantifié en i16, puis servi
+/// par morceaux de `chunk_size` octets. `pcm_buf` traverse les itérations et
+/// les reconnexions.
+fn decoder_un_paquet(
+    etat: &mut EtatRadio,
+    canaux: &CanauxRadio<'_>,
+    sonde: &mut Sonde,
+    sortie: &SortieRadio,
+) -> SuitePaquet {
+    use symphonia::core::audio::conv::IntoSample;
+    use tracing::{debug, warn};
+
+    if canaux.tx.is_closed() {
+        debug!("radio_local_decode_channel_closed_before_packet");
+        return SuitePaquet::ConsommateurParti;
+    }
+    let packet = match sonde.format.next_packet() {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            debug!("radio_local_decode_stream_ended_upstream");
+            return SuitePaquet::AmontTermine; // upstream ended — reconnect
+        }
+        Err(symphonia::core::errors::Error::IoError(ref e))
+            if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            debug!("radio_local_decode_eof");
+            return SuitePaquet::AmontCoupe; // upstream dropped — reconnect
+        }
+        Err(e) => {
+            // FIP-style upstream body error — reconnect in place.
+            warn!(error = %e, "radio_local_decode_packet_error");
+            return SuitePaquet::ErreurDePaquet;
+        }
+    };
+
+    if packet.track_id != sonde.track_id {
+        return SuitePaquet::AutrePiste;
+    }
+
+    let decoded = match sonde.decoder.decode(&packet) {
+        Ok(d) => d,
+        Err(e) => {
+            debug!(error = %e, "radio_local_decode_frame_skip");
+            return SuitePaquet::TrameSautee;
+        }
+    };
+
+    // Convert decoded audio buffer to interleaved 16-bit PCM bytes
+    let channels = decoded.spec().channels().count();
+    let frames = decoded.frames();
+
+    let mut interleaved: Vec<f32> = Vec::with_capacity(frames * channels);
+    decoded.copy_to_vec_interleaved::<f32>(&mut interleaved);
+
+    // Upsample low-rate (HE-AAC 22050) PCM to the renderer-safe rate
+    // before packing to i16, so the bytes match the advertised WAV
+    // header. No-op (single move) when the stream is already 44.1/48.
+    if sortie.needs_resample {
+        interleaved = crate::audio::simple_resample(
+            &interleaved,
+            sonde.source_sample_rate,
+            sortie.output_sample_rate,
+            channels as u16,
+        );
+    }
+
+    // Le WAV servi à OAAT/DLNA/navigateur doit porter le son promis par
+    // le profil de zone. Le traitement se fait en f32 avant i16, comme
+    // les autres chemins DSP, et les VU observent ainsi le signal final.
+    apply_radio_eq(&mut etat.radio_eq, &mut interleaved);
+
+    let mut packet_buf: Vec<u8> = Vec::with_capacity(interleaved.len() * 2);
+    for sample in &interleaved {
+        let s16: i16 = (*sample).into_sample();
+        packet_buf.extend_from_slice(&s16.to_le_bytes());
+    }
+
+    etat.pcm_buf.extend_from_slice(&packet_buf);
+
+    while etat.pcm_buf.len() >= etat.chunk_size {
+        let chunk: Vec<u8> = etat.pcm_buf.drain(..etat.chunk_size).collect();
+        // VU-mètres : tappe le PCM 16-bit avant de le servir (canal
+        // séparé, non bloquant — n'affecte pas le flux du renderer).
+        if let Some(ltx) = canaux.levels_tx {
+            crate::audio::tap::send_windowed_pcm(
+                ltx,
+                &chunk,
+                16,
+                channels as u16,
+                sortie.output_sample_rate,
+            );
+        }
+        if canaux.rt.block_on(canaux.tx.send(chunk)).is_err() {
+            debug!("radio_local_decode_consumer_dropped");
+            return SuitePaquet::ConsommateurParti;
+        }
+        if !etat.first_chunk_sent {
+            etat.first_chunk_sent = true;
+            canaux.data_ready.notify_one();
+        }
+    }
+
+    SuitePaquet::PaquetServi
+}
+
+/// Quatrième temps, après que la boucle de décodage a cassé : le
+/// consommateur est-il encore là, le compteur de reconnexions est-il à
+/// remettre à zéro, le plafond est-il atteint ; sinon, on se reconnecte.
+fn reprendre_apres_coupure(
+    etat: &mut EtatRadio,
+    url: &str,
+    canaux: &CanauxRadio<'_>,
+    connected_at: std::time::Instant,
+) -> SuiteRadio {
+    use tracing::{info, warn};
+
+    // Inner loop broke because the upstream stream dropped (not tx closed).
+    // Reconnect and keep feeding the SAME session (pcm_buf carries over).
+    if canaux.tx.is_closed() {
+        return SuiteRadio::Rendre(Ok(()));
+    }
+    // MAX_RECONNECTS guards against a *permanently dead* station (rapid
+    // back-to-back failures) — not against a healthy station's periodic
+    // upstream drops. FIP-style streams drop the body roughly every ~6 min,
+    // so a cumulative counter hit 30 at ~3h and cut a good listen (Xavier
+    // #1212, a regression of #382). Reset the counter after any sustained
+    // good stretch so a normal long listen is never capped, while a dead
+    // station (each connection dies in <60s) still burns through
+    // MAX_RECONNECTS in seconds and correctly falls back to the poller.
+    if connected_at.elapsed() >= std::time::Duration::from_secs(60) {
+        etat.reconnects = 0;
+    }
+    etat.reconnects += 1;
+    if etat.reconnects > MAX_RECONNECTS {
+        warn!(url = %url, reconnects = etat.reconnects, "radio_reconnect_giving_up");
+        return SuiteRadio::Rendre(Ok(()));
+    }
+    etat.dropped_at = Some(std::time::Instant::now());
+    info!(url = %url, attempt = etat.reconnects, "radio_upstream_dropped_reconnecting");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    SuiteRadio::Reconnecter
 }

@@ -47,6 +47,25 @@ enum DashOuFini<'a> {
     Fini(ResolvedStream),
 }
 
+/// Ce que la tâche détachée de `resoudre_flux_local_ou_oaat` emporte : tout
+/// est possédé ou cloné AVANT le `tokio::spawn`, rien n'emprunte
+/// l'orchestrateur (REF-2 phase 2, #2219).
+struct TranscodageEnTache {
+    upstream_url: String,
+    codec: String,
+    sr: u32,
+    bd: u16,
+    ev_bus: Option<Arc<EventBus>>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    streamer_for_eof: Arc<AudioStreamer>,
+    session_id_for_eof: String,
+    attach_levels: bool,
+    seek_s: f64,
+    is_dash_local: bool,
+    use_http_range: bool,
+}
+
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
     /// radios du MediaServer.
@@ -410,365 +429,464 @@ impl PlaybackOrchestrator {
         let flux = {
             let upstream_url = stream_data.url.clone();
             let codec = stream_data.quality.codec.to_lowercase();
-            // Cap the WAV rate to the zone's max_sample_rate (e.g. an OAAT
-            // endpoint whose DAC tops out at 96k). resolve_local_track applies
-            // this cap for local files; the streaming path historically did NOT,
-            // so a 192k Qobuz/Tidal track was transcoded to a 192k WAV and handed
-            // to a 96k OAAT endpoint → the DAC rejected the rate → silence with no
-            // server-side error (radio at 44.1/48k on the same zone played fine).
-            // decode_to_pcm_streaming_with_levels resamples to `sr`, so capping
-            // here downsamples the PCM, not just the WAV header.
-            let zone_max_sample_rate = ZoneRepo::with_backend(self.db.clone())
-                .get(req.zone_id)
-                .ok()
-                .flatten()
-                .and_then(|z| z.max_sample_rate);
-            let mut sr = stream_data.quality.sample_rate;
-            if let Some(max_sr) = zone_max_sample_rate {
-                if sr > max_sr {
-                    info!(
-                        zone_id = req.zone_id,
-                        source_rate = sr,
-                        max_rate = max_sr,
-                        "streaming_zone_max_sample_rate_cap_applied"
-                    );
-                    sr = max_sr;
-                }
-            }
-            // Local output: 32-bit to avoid 24-bit byte misalignment noise
-            // (see local_needs_wav comment in resolve_local_track).
-            // OAAT: cap at 24-bit (endpoints may not support 32-bit WAV).
-            let bd = if is_local_stream {
-                32
-            } else {
-                cap_output_bit_depth(stream_data.quality.bit_depth)
-            };
+            let (sr, bd, wav_info) =
+                self.decider_le_wav_de_sortie(req, stream_data, is_local_stream);
 
-            let wav_info = StreamInfo {
-                format: "wav".into(),
-                mime_type: "audio/wav".into(),
-                sample_rate: sr,
-                bit_depth: bd,
-                channels: 2,
-                file_size: None,
-                duration_ms: None,
-                ..Default::default()
-            };
+            Self::verifier_le_fichier_dash(&upstream_url)?;
 
-            // Guard against a stale/cleaned-up DASH temp file (mirrors the
-            // `is_dash_file` DLNA path below). The local transcode runs
-            // fire-and-forget in a spawned task, so a missing file would decode
-            // to nothing while play() still reports output_sent=true. Fail early
-            // so the caller sees the real failure instead of silent no-playback.
-            // (Reported on ASIO with 24/192 Tidal DASH after the temp file is gone.)
-            if upstream_url.starts_with("file://") {
-                let fp = upstream_url
-                    .strip_prefix("file://")
-                    .unwrap_or(&upstream_url);
-                let size = std::fs::metadata(fp).map(|m| m.len()).unwrap_or(0);
-                if size == 0 {
-                    warn!(path = %fp, "streaming_dash_file_missing_or_empty");
-                    return Err(format!(
-                        "DASH temp file missing or empty (needs re-download): {fp}"
-                    ));
-                }
-            }
+            let (session_id, tx, data_ready) = self
+                .ouvrir_la_session_wav(wav_info, service_name, &codec, sr, bd)
+                .await;
 
-            let (session_id, tx, data_ready) =
-                self.streamer.create_session(wav_info, false, 256).await;
-
-            {
-                let sessions = self.streamer.sessions_state();
-                let sessions = sessions.lock().await;
-                if let Some(session) = sessions.get(&session_id) {
-                    session
-                        .wav_header_included
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-
-            info!(
-                service = service_name,
-                codec = %codec,
-                sample_rate = sr,
-                bit_depth = bd,
-                "streaming_transcode_to_wav_for_local_output"
+            let tache = self.capturer_pour_le_transcodage(
+                req,
+                service_name,
+                upstream_url,
+                codec,
+                sr,
+                bd,
+                &session_id,
             );
 
-            let ev_bus = self.event_bus.clone();
-            let playback = self.playback.clone();
-            let zone_id = req.zone_id;
-            let streamer_for_eof = self.streamer.clone();
-            let session_id_for_eof = session_id.clone();
-            // Pré-chargement gapless : pas de forwarder (voir `levels_prewarm`).
-            let attach_levels = self.levels_attach_allowed(zone_id);
-            // Seek d'une piste streaming (Qobuz/Tidal) sur sortie locale/OAAT :
-            // le chemin local passait déjà l'offset au décodeur, celui-ci
-            // repartait TOUJOURS de zéro — l'audio recommençait au début alors
-            // que l'UI affichait la position demandée (repros Hard To Say
-            // Goodbye 405s et Bina 1015s, .18, 28/07).
-            let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
-
-            // Detect file:// URLs from DASH multi-segment downloads — the fMP4
-            // is already on disk, skip the HTTP download step.
-            let is_dash_local = upstream_url.starts_with("file://");
-            // Le CDN YouTube accepte les requetes Range. Un M4A peut garder son
-            // atome `moov` a la fin : une source HTTP seekable permet a
-            // Symphonia de lire cet index puis de revenir aux premiers paquets,
-            // sans attendre le telechargement complet (#1885). Les autres
-            // services gardent leur chemin eprouve dans cette premiere vague.
-            let use_http_range = service_name.eq_ignore_ascii_case("youtube")
-                && matches!(codec.as_str(), "m4a" | "mp4" | "aac");
-
             // Background task: download upstream → temp file → decode → WAV → session
-            tokio::spawn(async move {
-                // Audio-levels channel so the web client VU-meter works for
-                // streaming-service content played through local/OAAT outputs.
-                // Paced to the playback clock by the forwarder; without a bus,
-                // the receiver is dropped and the decoder's sends are no-ops.
-                let levels_tx = match ev_bus.filter(|_| attach_levels) {
-                    Some(bus) => {
-                        let play_seq = playback.current_play_seq(zone_id).await;
-                        spawn_paced_levels_forwarder(
-                            bus,
-                            playback,
-                            zone_id,
-                            play_seq,
-                            (seek_s * 1000.0) as i64,
-                        )
-                    }
-                    None => {
-                        tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0
-                    }
-                };
-
-                // Sonde Range AVANT d'envoyer un en-tete WAV. Si le CDN le
-                // refuse, aucun octet n'a encore rejoint la session et le repli
-                // historique par fichier temporaire reste parfaitement propre.
-                let ranged_source = if use_http_range {
-                    let upstream = upstream_url.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        crate::audio::http_range::HttpRangeSource::open(&upstream)
-                    })
-                    .await
-                    {
-                        Ok(Ok(source)) => {
-                            info!("streaming_http_range_decode_selected");
-                            Some(source)
-                        }
-                        Ok(Err(e)) => {
-                            info!(error = %e, "streaming_http_range_unavailable_falling_back");
-                            None
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "streaming_http_range_probe_task_failed");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // Sans source Range, conserver strictement le chemin existant :
-                // fichier DASH deja local ou telechargement complet vers un temp.
-                let tmp_file = if ranged_source.is_some() {
-                    None
-                } else if is_dash_local {
-                    let file_path = upstream_url
-                        .strip_prefix("file://")
-                        .unwrap_or(&upstream_url)
-                        .to_string();
-                    let file_size = std::fs::metadata(&file_path)
-                        .ok()
-                        .map(|m| m.len())
-                        .unwrap_or(0);
-                    info!(
-                        path = %file_path,
-                        file_size,
-                        "streaming_dash_file_already_on_disk"
-                    );
-                    Some((file_path, false))
-                } else {
-                    let tmp_path = std::env::temp_dir()
-                        .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
-                        .to_string_lossy()
-                        .to_string();
-                    let tmp_path_clone = tmp_path.clone();
-                    let upstream = upstream_url.clone();
-                    // Deuxieme etape chronometree (#3568) : le telechargement
-                    // COMPLET du flux compresse vers un fichier temporaire.
-                    // `LocalOutput` ne decode pas de flux compresse, donc rien
-                    // ne part vers la carte son avant que cette boucle soit
-                    // finie. C'est la moitie de l'attente qu'Audirvana ne paie
-                    // pas : lui lit l'adresse Tidal en progressif.
-                    let debut_telechargement = std::time::Instant::now();
-                    let download_result = tokio::task::spawn_blocking(move || {
-                        let resp = crate::http::client::blocking_builder()
-                            .timeout(std::time::Duration::from_secs(120))
-                            .build()
-                            .and_then(|c| c.get(&upstream).send());
-                        match resp {
-                            Ok(mut r) if r.status().is_success() => {
-                                let mut file = match std::fs::File::create(&tmp_path_clone) {
-                                    Ok(f) => f,
-                                    Err(e) => return Err(format!("tmp create: {e}")),
-                                };
-                                match std::io::copy(&mut r, &mut file) {
-                                    Ok(bytes) => {
-                                        debug!(path = %tmp_path_clone, "streaming_download_target");
-                                        Ok((tmp_path_clone, bytes))
-                                    }
-                                    Err(e) => Err(format!("download copy: {e}")),
-                                }
-                            }
-                            Ok(r) => Err(format!("upstream HTTP {}", r.status())),
-                            Err(e) => Err(format!("upstream fetch: {e}")),
-                        }
-                    })
-                    .await;
-
-                    match download_result {
-                        Ok(Ok((path, octets))) => {
-                            // `info!`, et non plus `debug!` : au niveau livre,
-                            // le journal de FranckLeRouge ne portait AUCUNE
-                            // ligne entre l'ordre de lecture et la fin du
-                            // transcodage. Impossible d'attribuer l'attente
-                            // (#3568). Une ligne par piste, avec de quoi
-                            // separer « le reseau est lent » de « le fichier
-                            // est gros ».
-                            let ms = debut_telechargement.elapsed().as_millis() as u64;
-                            info!(
-                                octets,
-                                elapsed_ms = ms,
-                                debit_kio_s = if ms > 0 { octets * 1000 / 1024 / ms } else { 0 },
-                                "streaming_download_complete"
-                            );
-                            Some((path, true))
-                        }
-                        Ok(Err(e)) => {
-                            warn!(error = %e, "streaming_transcode_download_failed");
-                            // #3287 : ces deux sorties quittaient la tache
-                            // AVANT le `end_session_input` du bas, en se
-                            // contentant d'effacer le fichier temporaire. La
-                            // session restait donc inscrite, sans producteur,
-                            // canal ouvert — et le gapless s'y enchainait.
-                            abandonner_la_session_de_transcodage(
-                                &streamer_for_eof,
-                                &session_id_for_eof,
-                                &tmp_path,
-                            )
-                            .await;
-                            return;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "streaming_transcode_task_join_failed");
-                            abandonner_la_session_de_transcodage(
-                                &streamer_for_eof,
-                                &session_id_for_eof,
-                                &tmp_path,
-                            )
-                            .await;
-                            return;
-                        }
-                    }
-                };
-
-                // Troisieme etape chronometree (#3568) : le decodage vers du
-                // PCM en WAV. Il est progressif — la session recoit ses
-                // premiers octets bien avant la fin — mais rien ne disait
-                // jusqu'ici combien il coute ni ou il commence.
-                let debut_transcodage = std::time::Instant::now();
-                let tx_for_decode = tx.clone();
-                // Drop the original sender so the channel closes when decode finishes.
-                drop(tx);
-                let decode_result = if let Some(source) = ranged_source {
-                    tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
-                            source,
-                            &codec,
-                            Some(sr),
-                            Some(2),
-                            Some(bd),
-                            tx_for_decode,
-                            32768,
-                            data_ready,
-                            levels_tx,
-                            seek_s,
-                        )
-                    })
-                    .await
-                } else {
-                    let tmp_file_clone = tmp_file.as_ref().unwrap().0.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::audio::decode::decode_to_pcm_streaming_seeked(
-                            &tmp_file_clone,
-                            Some(sr),
-                            Some(2),
-                            Some(bd),
-                            tx_for_decode,
-                            32768,
-                            data_ready,
-                            levels_tx,
-                            seek_s,
-                        )
-                    })
-                    .await
-                };
-
-                // Clean up the temp file — but ONLY if WE downloaded it. For a
-                // file:// DASH source, tmp_file IS the Tidal-cache-owned
-                // tune-dash-*.mp4 that is still referenced by the cached stream
-                // URL. Deleting it here made every subsequent re-resolution
-                // (repeat=one, or a seek that recreates the local stream) see the
-                // file gone, mark the cache stale, and re-download the whole
-                // ~54MB DASH — while concurrent transcodes raced on the emptied
-                // file (file_size=0 → decode failed). That was the ASIO "repeat"
-                // runaway (also on Qobuz). Leave cache-owned files alone.
-                if let Some((tmp_file, owned)) = tmp_file
-                    && owned
-                {
-                    let _ = std::fs::remove_file(&tmp_file);
-                }
-
-                match decode_result {
-                    Ok(Ok((_bit_depth, actual_rate))) => {
-                        if actual_rate != sr {
-                            tracing::info!(
-                                api_rate = sr,
-                                actual_rate,
-                                "streaming_sample_rate_mismatch_wav_header_has_correct_rate"
-                            );
-                        }
-                        info!(
-                            elapsed_ms = debut_transcodage.elapsed().as_millis() as u64,
-                            sample_rate = actual_rate,
-                            bit_depth = bd,
-                            "streaming_transcode_complete_progressive"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "streaming_transcode_decode_failed");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "streaming_transcode_decode_task_panic");
-                    }
-                }
-
-                // Fin d'entrée : sans ça, le keep-alive de la session garde le
-                // canal ouvert après la fin du décodage, le corps HTTP ne se
-                // termine jamais, et l'OAAT (gapless interne basé sur l'EOF)
-                // reste muet en fin de piste puis se fait relancer par le
-                // superviseur — silence + « le dernier morceau est rejoué ».
-                streamer_for_eof
-                    .end_session_input(&session_id_for_eof)
-                    .await;
-            });
+            tokio::spawn(Self::transcoder_le_flux_en_wav(tache, tx, data_ready));
 
             let server_ip = self.server_ip();
             let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
             (url, Some(session_id), "audio/wav".to_string(), None)
         };
         Ok(flux)
+    }
+
+    /// Premier temps : le WAV que la sortie recevra — cadence plafonnée au
+    /// `max_sample_rate` de la zone, profondeur 32 bits en local ou plafonnée
+    /// en OAAT — et la description de session qui en découle.
+    fn decider_le_wav_de_sortie(
+        &self,
+        req: &PlayRequest,
+        stream_data: &crate::streaming::StreamUrl,
+        is_local_stream: bool,
+    ) -> (u32, u16, StreamInfo) {
+        // Cap the WAV rate to the zone's max_sample_rate (e.g. an OAAT
+        // endpoint whose DAC tops out at 96k). resolve_local_track applies
+        // this cap for local files; the streaming path historically did NOT,
+        // so a 192k Qobuz/Tidal track was transcoded to a 192k WAV and handed
+        // to a 96k OAAT endpoint → the DAC rejected the rate → silence with no
+        // server-side error (radio at 44.1/48k on the same zone played fine).
+        // decode_to_pcm_streaming_with_levels resamples to `sr`, so capping
+        // here downsamples the PCM, not just the WAV header.
+        let zone_max_sample_rate = ZoneRepo::with_backend(self.db.clone())
+            .get(req.zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.max_sample_rate);
+        let mut sr = stream_data.quality.sample_rate;
+        if let Some(max_sr) = zone_max_sample_rate {
+            if sr > max_sr {
+                info!(
+                    zone_id = req.zone_id,
+                    source_rate = sr,
+                    max_rate = max_sr,
+                    "streaming_zone_max_sample_rate_cap_applied"
+                );
+                sr = max_sr;
+            }
+        }
+        // Local output: 32-bit to avoid 24-bit byte misalignment noise
+        // (see local_needs_wav comment in resolve_local_track).
+        // OAAT: cap at 24-bit (endpoints may not support 32-bit WAV).
+        let bd = if is_local_stream {
+            32
+        } else {
+            cap_output_bit_depth(stream_data.quality.bit_depth)
+        };
+
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: sr,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        (sr, bd, wav_info)
+    }
+
+    /// Deuxième temps : un fMP4 DASH déjà sur disque doit encore y être ;
+    /// sinon la résolution échoue ici, avant toute session.
+    fn verifier_le_fichier_dash(upstream_url: &str) -> Result<(), String> {
+        // Guard against a stale/cleaned-up DASH temp file (mirrors the
+        // `is_dash_file` DLNA path below). The local transcode runs
+        // fire-and-forget in a spawned task, so a missing file would decode
+        // to nothing while play() still reports output_sent=true. Fail early
+        // so the caller sees the real failure instead of silent no-playback.
+        // (Reported on ASIO with 24/192 Tidal DASH after the temp file is gone.)
+        if upstream_url.starts_with("file://") {
+            let fp = upstream_url.strip_prefix("file://").unwrap_or(upstream_url);
+            let size = std::fs::metadata(fp).map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                warn!(path = %fp, "streaming_dash_file_missing_or_empty");
+                return Err(format!(
+                    "DASH temp file missing or empty (needs re-download): {fp}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Troisième temps : la session WAV que la sortie lira, en-tête compris.
+    async fn ouvrir_la_session_wav(
+        &self,
+        wav_info: StreamInfo,
+        service_name: &str,
+        codec: &str,
+        sr: u32,
+        bd: u16,
+    ) -> (
+        String,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (session_id, tx, data_ready) = self.streamer.create_session(wav_info, false, 256).await;
+
+        {
+            let sessions = self.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .wav_header_included
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        info!(
+            service = service_name,
+            codec = %codec,
+            sample_rate = sr,
+            bit_depth = bd,
+            "streaming_transcode_to_wav_for_local_output"
+        );
+        (session_id, tx, data_ready)
+    }
+
+    /// Quatrième temps : tout ce que la tâche détachée emporte, relevé et
+    /// cloné avant le `spawn` (bus, lecture, streamer, session, seek, choix
+    /// du chemin Range ou fichier).
+    #[allow(clippy::too_many_arguments)] // les valeurs des trois premiers temps, plus la session
+    fn capturer_pour_le_transcodage(
+        &self,
+        req: &PlayRequest,
+        service_name: &str,
+        upstream_url: String,
+        codec: String,
+        sr: u32,
+        bd: u16,
+        session_id: &str,
+    ) -> TranscodageEnTache {
+        let ev_bus = self.event_bus.clone();
+        let playback = self.playback.clone();
+        let zone_id = req.zone_id;
+        let streamer_for_eof = self.streamer.clone();
+        let session_id_for_eof = session_id.to_string();
+        // Pré-chargement gapless : pas de forwarder (voir `levels_prewarm`).
+        let attach_levels = self.levels_attach_allowed(zone_id);
+        // Seek d'une piste streaming (Qobuz/Tidal) sur sortie locale/OAAT :
+        // le chemin local passait déjà l'offset au décodeur, celui-ci
+        // repartait TOUJOURS de zéro — l'audio recommençait au début alors
+        // que l'UI affichait la position demandée (repros Hard To Say
+        // Goodbye 405s et Bina 1015s, .18, 28/07).
+        let seek_s = req.seek_ms.map(|ms| ms as f64 / 1000.0).unwrap_or(0.0);
+
+        // Detect file:// URLs from DASH multi-segment downloads — the fMP4
+        // is already on disk, skip the HTTP download step.
+        let is_dash_local = upstream_url.starts_with("file://");
+        // Le CDN YouTube accepte les requetes Range. Un M4A peut garder son
+        // atome `moov` a la fin : une source HTTP seekable permet a
+        // Symphonia de lire cet index puis de revenir aux premiers paquets,
+        // sans attendre le telechargement complet (#1885). Les autres
+        // services gardent leur chemin eprouve dans cette premiere vague.
+        let use_http_range = service_name.eq_ignore_ascii_case("youtube")
+            && matches!(codec.as_str(), "m4a" | "mp4" | "aac");
+        TranscodageEnTache {
+            upstream_url,
+            codec,
+            sr,
+            bd,
+            ev_bus,
+            playback,
+            zone_id,
+            streamer_for_eof,
+            session_id_for_eof,
+            attach_levels,
+            seek_s,
+            is_dash_local,
+            use_http_range,
+        }
+    }
+
+    /// Cinquième temps, la tâche détachée : téléchargement (ou source Range,
+    /// ou fichier DASH déjà local), décodage progressif en WAV vers la
+    /// session, puis fin d'entrée. Rend la future que l'hôte `spawn`e.
+    async fn transcoder_le_flux_en_wav(
+        tache: TranscodageEnTache,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        data_ready: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let TranscodageEnTache {
+            upstream_url,
+            codec,
+            sr,
+            bd,
+            ev_bus,
+            playback,
+            zone_id,
+            streamer_for_eof,
+            session_id_for_eof,
+            attach_levels,
+            seek_s,
+            is_dash_local,
+            use_http_range,
+        } = tache;
+        // Audio-levels channel so the web client VU-meter works for
+        // streaming-service content played through local/OAAT outputs.
+        // Paced to the playback clock by the forwarder; without a bus,
+        // the receiver is dropped and the decoder's sends are no-ops.
+        let levels_tx = match ev_bus.filter(|_| attach_levels) {
+            Some(bus) => {
+                let play_seq = playback.current_play_seq(zone_id).await;
+                spawn_paced_levels_forwarder(
+                    bus,
+                    playback,
+                    zone_id,
+                    play_seq,
+                    (seek_s * 1000.0) as i64,
+                )
+            }
+            None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
+        };
+
+        // Sonde Range AVANT d'envoyer un en-tete WAV. Si le CDN le
+        // refuse, aucun octet n'a encore rejoint la session et le repli
+        // historique par fichier temporaire reste parfaitement propre.
+        let ranged_source = if use_http_range {
+            let upstream = upstream_url.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::audio::http_range::HttpRangeSource::open(&upstream)
+            })
+            .await
+            {
+                Ok(Ok(source)) => {
+                    info!("streaming_http_range_decode_selected");
+                    Some(source)
+                }
+                Ok(Err(e)) => {
+                    info!(error = %e, "streaming_http_range_unavailable_falling_back");
+                    None
+                }
+                Err(e) => {
+                    warn!(error = %e, "streaming_http_range_probe_task_failed");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Sans source Range, conserver strictement le chemin existant :
+        // fichier DASH deja local ou telechargement complet vers un temp.
+        let tmp_file = if ranged_source.is_some() {
+            None
+        } else if is_dash_local {
+            let file_path = upstream_url
+                .strip_prefix("file://")
+                .unwrap_or(&upstream_url)
+                .to_string();
+            let file_size = std::fs::metadata(&file_path)
+                .ok()
+                .map(|m| m.len())
+                .unwrap_or(0);
+            info!(
+                path = %file_path,
+                file_size,
+                "streaming_dash_file_already_on_disk"
+            );
+            Some((file_path, false))
+        } else {
+            let tmp_path = std::env::temp_dir()
+                .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+                .to_string_lossy()
+                .to_string();
+            let tmp_path_clone = tmp_path.clone();
+            let upstream = upstream_url.clone();
+            // Deuxieme etape chronometree (#3568) : le telechargement
+            // COMPLET du flux compresse vers un fichier temporaire.
+            // `LocalOutput` ne decode pas de flux compresse, donc rien
+            // ne part vers la carte son avant que cette boucle soit
+            // finie. C'est la moitie de l'attente qu'Audirvana ne paie
+            // pas : lui lit l'adresse Tidal en progressif.
+            let debut_telechargement = std::time::Instant::now();
+            let download_result = tokio::task::spawn_blocking(move || {
+                let resp = crate::http::client::blocking_builder()
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build()
+                    .and_then(|c| c.get(&upstream).send());
+                match resp {
+                    Ok(mut r) if r.status().is_success() => {
+                        let mut file = match std::fs::File::create(&tmp_path_clone) {
+                            Ok(f) => f,
+                            Err(e) => return Err(format!("tmp create: {e}")),
+                        };
+                        match std::io::copy(&mut r, &mut file) {
+                            Ok(bytes) => {
+                                debug!(path = %tmp_path_clone, "streaming_download_target");
+                                Ok((tmp_path_clone, bytes))
+                            }
+                            Err(e) => Err(format!("download copy: {e}")),
+                        }
+                    }
+                    Ok(r) => Err(format!("upstream HTTP {}", r.status())),
+                    Err(e) => Err(format!("upstream fetch: {e}")),
+                }
+            })
+            .await;
+
+            match download_result {
+                Ok(Ok((path, octets))) => {
+                    // `info!`, et non plus `debug!` : au niveau livre,
+                    // le journal de FranckLeRouge ne portait AUCUNE
+                    // ligne entre l'ordre de lecture et la fin du
+                    // transcodage. Impossible d'attribuer l'attente
+                    // (#3568). Une ligne par piste, avec de quoi
+                    // separer « le reseau est lent » de « le fichier
+                    // est gros ».
+                    let ms = debut_telechargement.elapsed().as_millis() as u64;
+                    info!(
+                        octets,
+                        elapsed_ms = ms,
+                        debit_kio_s = if ms > 0 { octets * 1000 / 1024 / ms } else { 0 },
+                        "streaming_download_complete"
+                    );
+                    Some((path, true))
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "streaming_transcode_download_failed");
+                    // #3287 : ces deux sorties quittaient la tache
+                    // AVANT le `end_session_input` du bas, en se
+                    // contentant d'effacer le fichier temporaire. La
+                    // session restait donc inscrite, sans producteur,
+                    // canal ouvert — et le gapless s'y enchainait.
+                    abandonner_la_session_de_transcodage(
+                        &streamer_for_eof,
+                        &session_id_for_eof,
+                        &tmp_path,
+                    )
+                    .await;
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "streaming_transcode_task_join_failed");
+                    abandonner_la_session_de_transcodage(
+                        &streamer_for_eof,
+                        &session_id_for_eof,
+                        &tmp_path,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        };
+
+        // Troisieme etape chronometree (#3568) : le decodage vers du
+        // PCM en WAV. Il est progressif — la session recoit ses
+        // premiers octets bien avant la fin — mais rien ne disait
+        // jusqu'ici combien il coute ni ou il commence.
+        let debut_transcodage = std::time::Instant::now();
+        let tx_for_decode = tx.clone();
+        // Drop the original sender so the channel closes when decode finishes.
+        drop(tx);
+        let decode_result = if let Some(source) = ranged_source {
+            tokio::task::spawn_blocking(move || {
+                crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                    source,
+                    &codec,
+                    Some(sr),
+                    Some(2),
+                    Some(bd),
+                    tx_for_decode,
+                    32768,
+                    data_ready,
+                    levels_tx,
+                    seek_s,
+                )
+            })
+            .await
+        } else {
+            let tmp_file_clone = tmp_file.as_ref().unwrap().0.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::audio::decode::decode_to_pcm_streaming_seeked(
+                    &tmp_file_clone,
+                    Some(sr),
+                    Some(2),
+                    Some(bd),
+                    tx_for_decode,
+                    32768,
+                    data_ready,
+                    levels_tx,
+                    seek_s,
+                )
+            })
+            .await
+        };
+
+        // Clean up the temp file — but ONLY if WE downloaded it. For a
+        // file:// DASH source, tmp_file IS the Tidal-cache-owned
+        // tune-dash-*.mp4 that is still referenced by the cached stream
+        // URL. Deleting it here made every subsequent re-resolution
+        // (repeat=one, or a seek that recreates the local stream) see the
+        // file gone, mark the cache stale, and re-download the whole
+        // ~54MB DASH — while concurrent transcodes raced on the emptied
+        // file (file_size=0 → decode failed). That was the ASIO "repeat"
+        // runaway (also on Qobuz). Leave cache-owned files alone.
+        if let Some((tmp_file, owned)) = tmp_file
+            && owned
+        {
+            let _ = std::fs::remove_file(&tmp_file);
+        }
+
+        match decode_result {
+            Ok(Ok((_bit_depth, actual_rate))) => {
+                if actual_rate != sr {
+                    tracing::info!(
+                        api_rate = sr,
+                        actual_rate,
+                        "streaming_sample_rate_mismatch_wav_header_has_correct_rate"
+                    );
+                }
+                info!(
+                    elapsed_ms = debut_transcodage.elapsed().as_millis() as u64,
+                    sample_rate = actual_rate,
+                    bit_depth = bd,
+                    "streaming_transcode_complete_progressive"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "streaming_transcode_decode_failed");
+            }
+            Err(e) => {
+                warn!(error = %e, "streaming_transcode_decode_task_panic");
+            }
+        }
+
+        // Fin d'entrée : sans ça, le keep-alive de la session garde le
+        // canal ouvert après la fin du décodage, le corps HTTP ne se
+        // termine jamais, et l'OAAT (gapless interne basé sur l'EOF)
+        // reste muet en fin de piste puis se fait relancer par le
+        // superviseur — silence + « le dernier morceau est rejoué ».
+        streamer_for_eof
+            .end_session_input(&session_id_for_eof)
+            .await;
     }
 
     /// Branche DASH de `resolve_streaming_url`, sortie telle quelle (REF-2

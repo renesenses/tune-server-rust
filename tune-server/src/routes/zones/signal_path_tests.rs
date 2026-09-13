@@ -1918,3 +1918,152 @@ async fn le_meme_aiff_sur_une_zone_dlna_reste_un_passthrough() {
         "aucun transcodage : l'AIFF part tel quel"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// REF-6b (#2219) — le chemin du signal préfère ce que la sortie a RÉELLEMENT
+// fait à ce que les réglages prédisent.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Une sortie qui a mesuré : FLAC 96 kHz stéréo entré, périphérique ouvert à
+/// 48 kHz — ou ailleurs, selon le témoin.
+fn transformations_mesurees(
+    cadence_ouverte: u32,
+    canaux_ouverts: u16,
+    dsp_actif: bool,
+) -> TransformationsReelles {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let entree = AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier24, 2).unwrap();
+    TransformationsReelles::nouvelles(
+        entree,
+        FormatOuvert::new(cadence_ouverte, canaux_ouverts),
+        dsp_actif,
+    )
+}
+
+/// (a) Les réglages prédisent « bit-perfect » — aucun plafond, aucun DSP,
+/// aucun mono, FLAC servi tel quel — mais la sortie déclare avoir ouvert le
+/// périphérique à 48 kHz. Le verdict tombe et l'étape est nommée MESURÉE,
+/// depuis les cadences réelles, pas depuis un plafond qui n'existe pas.
+#[test]
+fn un_reechantillonnage_mesure_fait_tomber_le_verdict_bit_perfect_predit() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(48_000, 2, false));
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        sp.get("bit_perfect").and_then(|b| b.as_bool()),
+        Some(false),
+        "la sortie a rééchantillonné : le verdict prédit ne tient plus"
+    );
+    assert_eq!(
+        step_desc(&sp, "Resampler").as_deref(),
+        Some("96kHz \u{2192} 48kHz (mesuré)"),
+        "l'étape nomme la cadence réellement ouverte, et dit qu'elle est mesurée"
+    );
+    // Le badge qualité reste vert : la SOURCE n'a pas perdu son caractère
+    // sans perte, seule la promesse bit-perfect est retirée.
+    assert_eq!(sp.get("lossless").and_then(|b| b.as_bool()), Some(true));
+}
+
+/// (b) La même zone, sans transformations déclarées, rend EXACTEMENT le
+/// résultat d'avant : le JSON du témoin `sortie_mono_desarmee_ninvente_aucune_etape`,
+/// verdict bit-perfect compris. `None` ne change rien — c'est ce qui garde
+/// les 63 témoins précédents verts sans y toucher.
+#[test]
+fn sans_transformations_declarees_le_chemin_est_strictement_celui_d_avant() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = None;
+
+    let attendu = build_signal_path(
+        &flac_playing(),
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp, attendu, "None doit être strictement neutre");
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    assert_eq!(step_desc(&sp, "Resampler"), None);
+    assert_eq!(step_desc(&sp, "Canaux"), None);
+    assert_eq!(step_desc(&sp, "DSP"), None);
+}
+
+/// Une sortie qui a mesuré « rien » — même cadence, mêmes canaux, pas de
+/// DSP — laisse le verdict prédit intact : déclarer, ce n'est pas dégrader.
+#[test]
+fn des_transformations_mesurees_nulles_ne_font_pas_tomber_le_verdict() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(96_000, 2, false));
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+    assert_eq!(step_desc(&sp, "Resampler"), None);
+    assert_eq!(step_desc(&sp, "Canaux"), None);
+}
+
+/// DSP et adaptation de canaux déclarés : chacun porte son étape « (mesuré) »
+/// et le verdict tombe, alors qu'aucun réglage de zone ne les prédit.
+#[test]
+fn un_dsp_et_une_adaptation_de_canaux_mesures_portent_chacun_leur_etape() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(96_000, 8, true));
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+    assert_eq!(
+        step_desc(&sp, "Resampler"),
+        None,
+        "même cadence : pas de rééchantillonnage"
+    );
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("DSP appliqué (mesuré)")
+    );
+    assert_eq!(
+        step_desc(&sp, "Canaux").as_deref(),
+        Some("2 \u{2192} 8 canaux (mesuré)")
+    );
+}

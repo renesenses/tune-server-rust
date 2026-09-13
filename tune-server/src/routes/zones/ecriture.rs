@@ -287,18 +287,49 @@ async fn commander_la_sortie(
         ));
     }
 
-    /// Écrit un champ, ou s'arrête en journalisant la cause.
-    ///
-    /// Une macro et non une closure : chaque échec doit **sortir** du handler,
-    /// et une closure ne peut pas rendre la main à sa place. C'est aussi ce qui
-    /// garantit qu'aucun des trente blocs ne puisse redevenir muet — il n'y a
-    /// plus qu'un seul endroit où le `return` est écrit.
     Ok(())
+}
+
+/// Écrit un champ, ou s'arrête en journalisant la cause.
+///
+/// Une macro et non une closure : chaque échec doit **sortir** du handler,
+/// et une closure ne peut pas rendre la main à sa place. C'est aussi ce qui
+/// garantit qu'aucun des trente blocs ne puisse redevenir muet — il n'y a
+/// plus qu'un seul endroit où le `return` est écrit.
+///
+/// REF-4 phase 2 (#2219) : les blocs vivent dans sept familles, une fonction
+/// chacune. Une macro déclarée au module ne voit pas les locaux de la fonction
+/// qui l'invoque (hygiène de `macro_rules!`) : `lier_ecrire_a!(state, id, $)`
+/// déclare donc `ecrire!` DANS chaque famille, liée à SES `state` et `id`. Le
+/// `$d:tt` reçoit le signe `$` lui-même — la seule façon stable d'écrire les
+/// paramètres d'une macro depuis une macro. La règle d'`ecrire!`, elle, est
+/// celle du bloc plat, inchangée.
+macro_rules! lier_ecrire_a {
+    ($state:ident, $id:ident, $d:tt) => {
+        macro_rules! ecrire {
+                    ($d champ:literal, $d valeur:expr, $d ecriture:expr) => {
+                        if let Err(e) = $d ecriture {
+                            return Err(echec_ecriture($id, $d champ, &$d valeur.to_string(), e));
+                        }
+                        // #3589 — la MARQUE d'auteur. Ce `PATCH` est la seule porte par
+                        // laquelle un humain règle une zone : ce qui passe ici est, par
+                        // définition, posé à la main. La marque survit au retour au
+                        // défaut — c'est précisément ce que la convention « clé supprimée
+                        // à la désactivation » ne sait pas dire, et sans quoi la
+                        // préconfiguration écraserait la case que l'utilisateur DÉCOCHE.
+                        super::preconfiguration::marquer_pose(&$state.backend, $id, $d champ);
+                    };
+                }
+    };
 }
 
 /// Troisième temps : chaque préférence persistée par la macro `ecrire!`, qui
 /// journalise l'échec, et les rafraîchissements de la sortie vivante qui
-/// l'accompagnent. Bloc sorti tel quel, ses `return` enrobés d'`Err`.
+/// l'accompagnent. Sept familles de clés (REF-4 phase 2, #2219), appelées
+/// DANS L'ORDRE des écritures du bloc plat d'origine — cet ordre est un
+/// comportement : la sortie mono relit la zone APRÈS le changement de sortie,
+/// le trim de gain repousse le volume APRÈS `fixed_volume`. Chaque famille
+/// rend la main au premier échec, comme le bloc plat le faisait.
 async fn persister_le_patch(
     state: &AppState,
     repo: &ZoneRepo,
@@ -307,27 +338,31 @@ async fn persister_le_patch(
     command_device_id: Option<&str>,
     body: &PatchZone,
 ) -> Result<(), axum::response::Response> {
-    /// Écrit un champ, ou s'arrête en journalisant la cause.
-    ///
-    /// Une macro et non une closure : chaque échec doit **sortir** du handler,
-    /// et une closure ne peut pas rendre la main à sa place. C'est aussi ce qui
-    /// garantit qu'aucun des trente blocs ne puisse redevenir muet — il n'y a
-    /// plus qu'un seul endroit où le `return` est écrit.
-    macro_rules! ecrire {
-        ($champ:literal, $valeur:expr, $ecriture:expr) => {
-            if let Err(e) = $ecriture {
-                return Err(echec_ecriture(id, $champ, &$valeur.to_string(), e));
-            }
-            // #3589 — la MARQUE d'auteur. Ce `PATCH` est la seule porte par
-            // laquelle un humain règle une zone : ce qui passe ici est, par
-            // définition, posé à la main. La marque survit au retour au
-            // défaut — c'est précisément ce que la convention « clé supprimée
-            // à la désactivation » ne sait pas dire, et sans quoi la
-            // préconfiguration écraserait la case que l'utilisateur DÉCOCHE.
-            super::preconfiguration::marquer_pose(&state.backend, id, $champ);
-        };
-    }
+    persister_la_zone_et_sa_sortie(state, repo, id, body)?;
+    persister_le_volume_fixe(state, repo, id, zone_before, command_device_id, body).await?;
+    persister_la_lecture(state, repo, id, body)?;
+    persister_le_reseau(state, repo, id, body).await?;
+    persister_la_marque_et_le_modele(state, id, body)?;
+    persister_l_upnp(state, repo, id, body).await?;
+    persister_le_son(state, repo, id, body).await?;
+    // Correction de marque/modele : la remonter a mozaiklabs.fr.
+    //
+    // Le catalogue d'appareils est fige dans le binaire ; ces corrections sont
+    // la seule matiere qui permette de le faire evoluer a partir du parc reel.
+    // Envoi anonyme et sans attente : la reponse HTTP a l'utilisateur ne doit
+    // dependre en rien de la disponibilite du site.
+    Ok(())
+}
 
+/// Famille 1 — la zone et sa sortie : `name`, `output_device_id`,
+/// `output_type`, `gapless_enabled`, `sync_delay_ms`, `max_sample_rate`.
+fn persister_la_zone_et_sa_sortie(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     if let Some(ref name) = body.name {
         ecrire!("name", name, repo.update_name(id, name));
     }
@@ -359,6 +394,20 @@ async fn persister_le_patch(
             repo.update_max_sample_rate(id, rate)
         );
     }
+    Ok(())
+}
+
+/// Famille 2 — le volume fixe (#2395) : `fixed_volume`, et les deux commandes
+/// à l'appareil qui n'agissent que sur une TRANSITION.
+async fn persister_le_volume_fixe(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    zone_before: &Zone,
+    command_device_id: Option<&str>,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     if let Some(fixed) = body.fixed_volume {
         // #2395 — le mode bit-perfect fait UN saut, annoncé et réversible.
         //
@@ -417,6 +466,18 @@ async fn persister_le_patch(
             }
         }
     }
+    Ok(())
+}
+
+/// Famille 3 — la lecture : `autoplay_mode` / `autoplay_enabled` (#2271),
+/// `dsd_mode`, `lyrics_offset_ms`.
+fn persister_la_lecture(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     // #2271 — les deux champs visent la MEME colonne. `autoplay_mode` est le
     // plus precis, il gagne ; `autoplay_enabled` n'est applique que seul, pour
     // que les clients qui ne connaissent que lui continuent de fonctionner.
@@ -448,6 +509,20 @@ async fn persister_le_patch(
             repo.update_lyrics_offset_ms(id, clamped)
         );
     }
+    Ok(())
+}
+
+/// Famille 4 — le réseau : `dlna_native_flac`, `alac_passthrough`,
+/// `aac_passthrough`, `dlna_lpcm`, `dlna_cap_16bit`, `dlna_wav24`,
+/// `dlna_play_delay_ms` — ce dernier appliqué en direct à la sortie DLNA
+/// déjà enregistrée.
+async fn persister_le_reseau(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     if let Some(native_flac) = body.dlna_native_flac {
         ecrire!(
             "dlna_native_flac",
@@ -505,6 +580,17 @@ async fn persister_le_patch(
             }
         }
     }
+    Ok(())
+}
+
+/// Famille 5 — la marque et le modèle : `brand`, `model` (chaîne vide =
+/// retour à la détection UPnP), `identite_appareil_effacee` (#3660).
+fn persister_la_marque_et_le_modele(
+    state: &AppState,
+    id: i64,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     // Marque / modèle choisis par l'utilisateur → settings zone_{id}_brand/model.
     // Chaîne vide = suppression de l'override (retour à la détection UPnP).
     if let Some(ref brand) = body.brand {
@@ -541,6 +627,19 @@ async fn persister_le_patch(
         };
         ecrire!("identite_appareil_effacee", efface, r);
     }
+    Ok(())
+}
+
+/// Famille 6 — UPnP : `upnp_renderer` (#1750), `upnp_silence` (#2263) — clé
+/// supprimée à la désactivation, et le second appliqué en direct à la sortie
+/// DLNA déjà enregistrée.
+async fn persister_l_upnp(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     // Opt-in MediaRenderer UPnP (#1750) → setting zone_{id}_upnp_renderer.
     if let Some(enabled) = body.upnp_renderer {
         let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -587,6 +686,19 @@ async fn persister_le_patch(
             }
         }
     }
+    Ok(())
+}
+
+/// Famille 7 — le son : `mono_downmix` (#2362, avec le rafraîchisseur de la
+/// sortie vivante qu'exige `eq_refresh_guard`) et `gain_trim_db`, qui
+/// repousse le volume courant à l'appareil.
+async fn persister_le_son(
+    state: &AppState,
+    repo: &ZoneRepo,
+    id: i64,
+    body: &PatchZone,
+) -> Result<(), axum::response::Response> {
+    lier_ecrire_a!(state, id, $);
     // Sortie mono (#2362) → setting zone_{id}_mono_downmix. Même forme que
     // `upnp_renderer` juste au-dessus : la clé est supprimée à la désactivation
     // plutôt qu'écrite à « false », pour que l'absence de clé et le défaut
@@ -665,12 +777,6 @@ async fn persister_le_patch(
             }
         }
     }
-    // Correction de marque/modele : la remonter a mozaiklabs.fr.
-    //
-    // Le catalogue d'appareils est fige dans le binaire ; ces corrections sont
-    // la seule matiere qui permette de le faire evoluer a partir du parc reel.
-    // Envoi anonyme et sans attente : la reponse HTTP a l'utilisateur ne doit
-    // dependre en rien de la disponibilite du site.
     Ok(())
 }
 

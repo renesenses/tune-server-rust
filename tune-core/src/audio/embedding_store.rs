@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use crate::db::backend::{DbBackend, ToSqlValue};
+use crate::db::track_repo::sql::chemin_ouvrable;
 
 /// Dimensionality of the CLAP audio embedding.
 pub const EMBED_DIM: usize = 512;
@@ -158,6 +159,124 @@ pub fn failed_count(backend: &Arc<dyn DbBackend>) -> i64 {
     (processed_count(backend) - analysed_count(backend)).max(0)
 }
 
+/// Fenêtre que le modèle CLAP regarde, en secondes.
+pub const FENETRE_SECONDES: f64 = 10.0;
+
+/// Le prédicat d'éligibilité de la passe acoustique.
+///
+/// **Un seul texte**, partagé par la requête de candidats
+/// ([`candidats_acoustiques`]) et par le dénominateur ([`eligible_count`]) :
+/// deux copies finiraient par diverger, et la jauge n'annoncerait plus la
+/// population que la passe traite.
+///
+/// 🔴 Le chemin passe par [`sql::A_UN_FICHIER`] et non par `t.file_path` :
+/// une piste de feuille CUE porte `file_path = NULL` par construction. Avant
+/// ce geste, aucune piste CUE n'a jamais reçu d'empreinte acoustique — donc
+/// aucune n'est jamais remontée dans une ambiance ni dans une recherche par
+/// similarité.
+pub const ELIGIBLE_WHERE: &str = concat!(
+    chemin_ouvrable!(),
+    " IS NOT NULL \
+     AND (t.format IS NULL OR lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff'))"
+);
+
+/// Une ligne rendue par la requête de candidats de la passe acoustique.
+///
+/// La requête garantit normalement un identifiant et un chemin non vide. On
+/// garde néanmoins la distinction : avec un identifiant, une ligne
+/// inexploitable peut être marquée comme traitée ; sans identifiant, aucune
+/// sentinelle ne peut être écrite et l'invariant de base doit être signalé.
+/// Sans ces deux cas, une ligne illisible ressortirait à CHAQUE lot et la
+/// passe piétinerait sur place.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CandidatAcoustique {
+    Pret {
+        track_id: i64,
+        /// Le fichier à OUVRIR : `file_path`, ou le support CUE à défaut.
+        chemin: String,
+        /// Début du SEGMENT dans ce fichier, en secondes. `0.0` pour une piste
+        /// ordinaire ; `cue_start_ms / 1000` pour une tranche de feuille CUE.
+        ///
+        /// 🔴 C'est la moitié qui compte. Sélectionner la piste CUE sans
+        /// déplacer le décodage donnerait aux quinze pistes d'une même image
+        /// l'empreinte des DIX PREMIÈRES SECONDES DE L'IMAGE — quinze vecteurs
+        /// identiques, et une ambiance qui enchaîne quinze fois le même disque.
+        debut_s: f64,
+        /// Durée à décoder : la fenêtre CLAP, rognée quand la tranche est plus
+        /// courte qu'elle, pour ne pas déborder sur la piste suivante.
+        duree_s: f64,
+    },
+    SansChemin {
+        track_id: i64,
+    },
+    SansIdentifiant,
+}
+
+/// Les pistes que la passe acoustique doit encore traiter.
+///
+/// Vit ici, et pas dans `audio::embedding`, pour deux raisons : le module
+/// d'écriture est derrière `#[cfg(feature = "audio-embedding")]` — donc jamais
+/// compilé par la porte `Test` de la CI — et le dénominateur
+/// [`eligible_count`] doit partager le MÊME prédicat.
+///
+/// `seuil_report` : l'estampille en deçà de laquelle un report de chemin
+/// (#1865) est périmé.
+pub fn candidats_acoustiques(
+    backend: &Arc<dyn DbBackend>,
+    seuil_report: &str,
+    limite: i64,
+) -> Result<Vec<CandidatAcoustique>, String> {
+    let chemin = crate::db::track_repo::sql::CHEMIN_OUVRABLE;
+    let sql = format!(
+        "SELECT t.id, {chemin}, COALESCE(t.cue_start_ms, 0), t.cue_end_ms FROM tracks t \
+         WHERE {ELIGIBLE_WHERE} \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' \
+                   AND m.value = ?) \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' \
+                   AND m.value > ?) \
+         LIMIT ?"
+    );
+    let rows = backend.query_many(
+        &sql,
+        &[
+            &MODEL_ID as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
+            &limite as &dyn ToSqlValue,
+        ],
+    )?;
+    Ok(rows.iter().map(|r| ligne_candidate(r)).collect())
+}
+
+/// Lecture d'UNE ligne de [`candidats_acoustiques`].
+fn ligne_candidate(row: &[crate::db::backend::SqlValue]) -> CandidatAcoustique {
+    use crate::db::backend::SqlValue;
+    let Some(track_id) = row.first().and_then(SqlValue::as_i64) else {
+        return CandidatAcoustique::SansIdentifiant;
+    };
+    let chemin = match row.get(1).and_then(SqlValue::as_string) {
+        Some(p) if !p.is_empty() => p,
+        _ => return CandidatAcoustique::SansChemin { track_id },
+    };
+    let debut_ms = row.get(2).and_then(SqlValue::as_i64).unwrap_or(0).max(0);
+    let debut_s = debut_ms as f64 / 1000.0;
+    // `cue_end_ms` est NULL quand la tranche court jusqu'au bout de l'image —
+    // et sur toute piste ordinaire. Dans les deux cas : la fenêtre entière.
+    let duree_s = match row.get(3).and_then(SqlValue::as_i64) {
+        Some(fin_ms) if fin_ms > debut_ms => {
+            (((fin_ms - debut_ms) as f64) / 1000.0).min(FENETRE_SECONDES)
+        }
+        _ => FENETRE_SECONDES,
+    };
+    CandidatAcoustique::Pret {
+        track_id,
+        chemin,
+        debut_s,
+        duree_s,
+    }
+}
+
 /// Combien de pistes la passe acoustique peut-elle analyser en tout — le
 /// dénominateur honnête d'une barre de progression.
 ///
@@ -167,15 +286,13 @@ pub fn failed_count(backend: &Arc<dyn DbBackend>) -> i64 {
 /// donnerait une jauge qui n'atteint jamais 100 % sur une discothèque qui
 /// contient du DSD, et personne ne saurait pourquoi.
 ///
-/// Les conditions ci-dessous doivent rester le miroir exact de la requête de
-/// candidats de `analyze_embedding_batch`, moins le `NOT EXISTS`.
+/// Le prédicat est [`ELIGIBLE_WHERE`], celui-là même que la requête de
+/// candidats emploie, moins ses `NOT EXISTS` : le miroir ne peut plus se
+/// fêler.
 pub fn eligible_count(backend: &Arc<dyn DbBackend>) -> i64 {
     backend
         .query_one(
-            "SELECT COUNT(*) FROM tracks t \
-             WHERE t.file_path IS NOT NULL AND t.file_path != '' \
-               AND (t.format IS NULL OR \
-                    lower(t.format) NOT IN ('dsd', 'dsf', 'dff', 'dsdiff'))",
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {ELIGIBLE_WHERE}"),
             &[],
         )
         .ok()
@@ -601,5 +718,209 @@ mod progress_counter_tests {
         let charges = fetch_all(&backend, 100);
         assert_eq!(charges.len(), 1, "un seul espace vectoriel à la fois");
         assert_eq!(charges[0].0, courant, "celui du modèle courant");
+    }
+}
+
+#[cfg(test)]
+mod pistes_cue_tests {
+    use super::*;
+    use crate::db::models::Track;
+    use crate::db::sqlite::SqliteDb;
+    use crate::db::track_repo::TrackRepo;
+
+    fn setup() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    /// Une piste de feuille CUE **telle qu'elle est en production** :
+    /// `file_path = NULL`, le support dans `cue_media_path`, la tranche dans
+    /// `cue_start_ms`/`cue_end_ms`.
+    ///
+    /// 🔴 Le `file_path = None` EST le témoin. Une fixture qui renseignerait
+    /// `file_path` décrirait le cas qui marchait déjà et resterait verte
+    /// contre n'importe quel code.
+    fn piste_cue(
+        backend: &Arc<dyn DbBackend>,
+        titre: &str,
+        image: &str,
+        debut_ms: i64,
+        fin_ms: Option<i64>,
+    ) -> i64 {
+        let repo = TrackRepo::with_backend(backend.clone());
+        let mut t = Track::new(titre.to_string());
+        t.format = Some("flac".into());
+        t.file_path = None;
+        t.cue_media_path = Some(image.to_string());
+        t.cue_start_ms = Some(debut_ms);
+        t.cue_end_ms = fin_ms;
+        repo.create(&t).unwrap()
+    }
+
+    fn piste_ordinaire(backend: &Arc<dyn DbBackend>, chemin: &str) -> i64 {
+        let repo = TrackRepo::with_backend(backend.clone());
+        let mut t = Track::new("piste ordinaire".into());
+        t.format = Some("flac".into());
+        t.file_path = Some(chemin.to_string());
+        repo.create(&t).unwrap()
+    }
+
+    /// 🔴 LES PISTES CUE ENTRENT DANS LA PASSE ACOUSTIQUE.
+    ///
+    /// Une piste découpée par une feuille CUE porte `file_path = NULL` par
+    /// construction. La requête de candidats filtrait sur
+    /// `t.file_path IS NOT NULL` : aucune piste CUE n'a JAMAIS reçu
+    /// d'empreinte, donc aucune n'est jamais remontée dans une ambiance ni
+    /// dans une recherche par similarité, et rien ne le disait.
+    #[test]
+    fn une_piste_cue_sans_file_path_est_candidate_a_l_empreinte() {
+        let backend = setup();
+        let aria = piste_cue(&backend, "Aria", "/m/gould/image.flac", 0, Some(180_000));
+
+        let candidats = candidats_acoustiques(&backend, "00000000000", 25).unwrap();
+        assert_eq!(
+            candidats.len(),
+            1,
+            "la piste CUE doit être candidate : elle a un titre et un audio, \
+             seul son fichier est partagé — candidats rendus : {candidats:?}"
+        );
+        match &candidats[0] {
+            CandidatAcoustique::Pret {
+                track_id, chemin, ..
+            } => {
+                assert_eq!(*track_id, aria);
+                assert_eq!(
+                    chemin, "/m/gould/image.flac",
+                    "le fichier à ouvrir est le support CUE"
+                );
+            }
+            autre => panic!("la piste CUE devait être prête, rendu : {autre:?}"),
+        }
+        assert_eq!(
+            eligible_count(&backend),
+            1,
+            "le dénominateur de la jauge doit compter la piste CUE, sinon la \
+             jauge dépasse 100 % dès que la passe la traite"
+        );
+    }
+
+    /// 🔴 LE SEGMENT, PAS LE FICHIER.
+    ///
+    /// Sélectionner la piste ne suffit pas : le fichier ouvert est l'IMAGE
+    /// ENTIÈRE. Décoder depuis son début donnerait aux quinze pistes du disque
+    /// le même vecteur — quinze pistes acoustiquement identiques, et une
+    /// ambiance qui rejoue le même disque en boucle. Chaque candidate doit
+    /// porter le début de SA tranche.
+    #[test]
+    fn deux_pistes_de_la_meme_image_sont_decodees_a_des_endroits_differents() {
+        let backend = setup();
+        let image = "/m/gould/image.flac";
+        piste_cue(&backend, "Aria", image, 0, Some(180_000));
+        piste_cue(&backend, "Variatio 1", image, 180_000, Some(300_000));
+        piste_cue(&backend, "Variatio 2", image, 300_000, None);
+
+        let candidats = candidats_acoustiques(&backend, "00000000000", 25).unwrap();
+        assert_eq!(candidats.len(), 3, "les trois tranches sont candidates");
+
+        let debuts: Vec<f64> = candidats
+            .iter()
+            .map(|c| match c {
+                CandidatAcoustique::Pret { debut_s, .. } => *debut_s,
+                autre => panic!("candidate non prête : {autre:?}"),
+            })
+            .collect();
+        assert_eq!(
+            debuts,
+            vec![0.0, 180.0, 300.0],
+            "chaque tranche doit être décodée à SON début ; des débuts tous \
+             égaux donneraient trois vecteurs identiques"
+        );
+
+        let durees: Vec<f64> = candidats
+            .iter()
+            .map(|c| match c {
+                CandidatAcoustique::Pret { duree_s, .. } => *duree_s,
+                autre => panic!("candidate non prête : {autre:?}"),
+            })
+            .collect();
+        assert_eq!(
+            durees,
+            vec![FENETRE_SECONDES; 3],
+            "trois tranches plus longues que la fenêtre : la fenêtre entière"
+        );
+    }
+
+    /// Une tranche plus courte que la fenêtre CLAP ne doit pas déborder sur la
+    /// piste suivante — une transition d'album de 4 s reste 4 s.
+    #[test]
+    fn une_tranche_plus_courte_que_la_fenetre_est_rognee() {
+        let backend = setup();
+        piste_cue(
+            &backend,
+            "Transition",
+            "/m/live/image.flac",
+            60_000,
+            Some(64_000),
+        );
+        let candidats = candidats_acoustiques(&backend, "00000000000", 25).unwrap();
+        match &candidats[0] {
+            CandidatAcoustique::Pret {
+                debut_s, duree_s, ..
+            } => {
+                assert_eq!(*debut_s, 60.0);
+                assert_eq!(*duree_s, 4.0, "4 s de tranche, 4 s décodées");
+            }
+            autre => panic!("candidate non prête : {autre:?}"),
+        }
+    }
+
+    /// La piste ordinaire, elle, n'a pas bougé : chemin propre, décodage depuis
+    /// le début, fenêtre entière. Contre-poids du témoin précédent.
+    #[test]
+    fn une_piste_ordinaire_garde_son_chemin_et_part_de_zero() {
+        let backend = setup();
+        let id = piste_ordinaire(&backend, "/m/a.flac");
+        let candidats = candidats_acoustiques(&backend, "00000000000", 25).unwrap();
+        assert_eq!(
+            candidats,
+            vec![CandidatAcoustique::Pret {
+                track_id: id,
+                chemin: "/m/a.flac".into(),
+                debut_s: 0.0,
+                duree_s: FENETRE_SECONDES,
+            }]
+        );
+    }
+
+    /// Déménagé depuis `audio::embedding`, qui est derrière
+    /// `#[cfg(feature = "audio-embedding")]` : la porte `Test` de la CI ne
+    /// compile pas cette fonctionnalité, donc ce témoin n'y tournait pas.
+    #[test]
+    fn une_ligne_candidate_garde_l_identifiant_quand_seul_le_chemin_est_invalide() {
+        use crate::db::backend::SqlValue;
+        assert_eq!(
+            ligne_candidate(&[
+                SqlValue::Int(42),
+                SqlValue::Text("/music/a.flac".into()),
+                SqlValue::Int(0),
+                SqlValue::Null,
+            ]),
+            CandidatAcoustique::Pret {
+                track_id: 42,
+                chemin: "/music/a.flac".into(),
+                debut_s: 0.0,
+                duree_s: FENETRE_SECONDES,
+            }
+        );
+        assert_eq!(
+            ligne_candidate(&[SqlValue::Int(42), SqlValue::Text(String::new())]),
+            CandidatAcoustique::SansChemin { track_id: 42 }
+        );
+        assert_eq!(
+            ligne_candidate(&[SqlValue::Text("not-an-id".into()), SqlValue::Null]),
+            CandidatAcoustique::SansIdentifiant
+        );
     }
 }

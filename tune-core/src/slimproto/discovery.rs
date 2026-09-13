@@ -24,8 +24,9 @@
 //! La décision de réponse est une fonction pure ([`repondre`]) : tout le
 //! protocole se teste sans réseau. La boucle réseau ne fait que transporter.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 /// Le nom historique tient sur 17 octets, ni plus ni moins.
@@ -122,9 +123,75 @@ async fn adresse_face_a(correspondant: std::net::SocketAddr) -> Option<String> {
     Some(sonde.local_addr().ok()?.ip().to_string())
 }
 
-/// Arme le répondeur de découverte. Tourne pour toujours.
+/// Le répondeur en cours, s'il tourne.
+///
+/// # #3809 — pourquoi une poignée de tâche, et pas un simple booléen
+///
+/// Le réglage `slimproto_discovery_enabled` n'était lu qu'au DÉMARRAGE. Une
+/// fois l'annonce armée, plus rien ne pouvait la faire taire sans redémarrer
+/// le serveur : un interrupteur à l'écran aurait écrit sa valeur en base et
+/// n'aurait rien changé sur le réseau. C'est le symptôme du testeur — *« ça ne
+/// change rien »* — déplacé d'un cran, pas corrigé.
+///
+/// Garder la poignée permet les deux sens à chaud, et surtout de **rendre le
+/// port** : abandonner la tâche relâche la prise UDP 3483, qu'un LMS installé
+/// sur la même machine peut alors reprendre. Un booléen consulté dans la
+/// boucle aurait laissé Tune tenir le port en silence — éteindre l'annonce
+/// sans libérer le port n'aurait résolu que la moitié de la gêne.
+static REPONDEUR: StdMutex<Option<JoinHandle<()>>> = StdMutex::new(None);
+
+/// Le verrou du répondeur, empoisonnement compris.
+///
+/// Un `unwrap()` ici ferait échouer l'extinction de l'annonce parce qu'une
+/// AUTRE tâche a paniqué ailleurs. Ce que le verrou protège est une poignée de
+/// tâche : la reprendre après une panique est sans danger.
+fn verrou() -> std::sync::MutexGuard<'static, Option<JoinHandle<()>>> {
+    REPONDEUR.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// L'annonce est-elle armée en ce moment ?
+///
+/// `is_finished` compte : la tâche se termine d'elle-même quand le bind UDP
+/// échoue — un LMS tient déjà le port (#2938). Sans ce test, une première
+/// tentative ratée passerait pour un répondeur en place et interdirait toute
+/// reprise, alors que c'est précisément le cas où il faut pouvoir réessayer.
+pub fn est_armee() -> bool {
+    verrou().as_ref().is_some_and(|h| !h.is_finished())
+}
+
+/// Fait taire l'annonce et rend le port. Vrai si quelque chose tournait.
+///
+/// Ne touche PAS l'écoute TCP du même port : #2938 et #2349 ont coûté cinq
+/// testeurs sur ce point exact, et la doctrine de #3809 est que le réglage ne
+/// gouverne que l'annonce.
+pub fn eteindre() -> bool {
+    let Some(tache) = verrou().take() else {
+        return false;
+    };
+    let tournait = !tache.is_finished();
+    tache.abort();
+    if tournait {
+        info!(
+            "slimproto_discovery_stopped — l'annonce se tait et le port UDP est rendu ; \
+             l'écoute TCP 3483 reste armée (#3809)"
+        );
+    }
+    tournait
+}
+
+/// Arme le répondeur de découverte.
+///
+/// La tâche tourne jusqu'à [`eteindre`] — depuis #3809, l'annonce se coupe sans
+/// redémarrage. Un second appel alors qu'elle tourne déjà ne fait RIEN : deux
+/// répondeurs sur le même port, c'est le second qui échoue au bind et un
+/// journal qui accuse à tort un LMS voisin.
 pub fn spawn(identite: IdentiteServeur) {
-    tokio::spawn(async move {
+    let mut place = verrou();
+    if place.as_ref().is_some_and(|h| !h.is_finished()) {
+        debug!("slimproto_discovery_deja_armee — second armement ignoré (#3809)");
+        return;
+    }
+    let tache = tokio::spawn(async move {
         // La MEME resolution que le serveur TCP (`SlimProtoServer::resolve_port`).
         // Une seconde lecture de la variable, ecrite a la main ici, laisserait le
         // repondeur UDP et le serveur TCP diverger a la premiere retouche : la
@@ -175,6 +242,7 @@ pub fn spawn(identite: IdentiteServeur) {
             }
         }
     });
+    *place = Some(tache);
 }
 
 #[cfg(test)]
@@ -280,6 +348,32 @@ mod tests {
         assert!(
             !r.windows(4).any(|w| w == b"IPAD"),
             "l'étiquette tronquée n'est pas servie"
+        );
+    }
+
+    /// #3809 — le registre du répondeur, mesuré sans prendre le port.
+    ///
+    /// Ce témoin ne peut pas armer l'annonce : `spawn` réclame un ordonnanceur
+    /// tokio et surtout le port UDP 3483, que la suite de tests n'a aucune
+    /// raison de réquisitionner — deux binaires de test en parallèle se le
+    /// disputeraient. Il vérifie donc le seul état établissable sans réseau,
+    /// et c'est déjà celui qui compte : au repos, le registre ne PRÉTEND pas
+    /// qu'un répondeur tourne.
+    ///
+    /// ⚠️ Ce module partage un `static` avec tout le binaire de test. Si un
+    /// témoin arme un jour le répondeur pour de vrai, il devra l'éteindre en
+    /// partant — sinon celui-ci rougira selon l'ordre d'exécution.
+    #[test]
+    fn au_repos_le_registre_n_annonce_aucun_repondeur() {
+        assert!(
+            !est_armee(),
+            "aucun répondeur n'a été armé : le registre ne doit pas en annoncer un"
+        );
+        assert!(
+            !eteindre(),
+            "éteindre ce qui ne tourne pas doit rendre `false`, jamais prétendre \
+             avoir coupé quelque chose — un `true` complaisant ferait dire à la \
+             route qu'elle a appliqué un changement qui n'a pas eu lieu"
         );
     }
 }

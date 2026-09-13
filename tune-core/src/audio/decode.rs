@@ -2200,6 +2200,27 @@ fn decode_to_pcm_streaming_inner(
         Some(CodecParameters::Audio(params)) => params.clone(),
         _ => return Err("track has no audio codec parameters".into()),
     };
+    // Ce que le CONTENEUR annonce comme longueur (#2218).
+    //
+    // La tranche T4 avait posé cette comparaison sur `decode_to_pcm` — le
+    // chemin d'ANALYSE. Celui-ci est le chemin de LECTURE : il a sa propre
+    // boucle symphonia, et il ne lisait pas `track.num_frames`. Une piste
+    // pouvait donc perdre un bloc entier en cours de route sans qu'une seule
+    // ligne le dise. Mesuré le 12/09/2026 sur
+    // `tests/fixtures/flac/ref_16_44100_stereo.flac`, un octet inversé au
+    // milieu des trames : 13 544 trames servies sur 17 640, `Ok(_)` en
+    // retour, journal vide.
+    //
+    // `None` dès qu'un départ décalé est demandé : comparer une fenêtre à la
+    // longueur totale de la piste ne voudrait rien dire. Le cadre borné des
+    // feuilles CUE n'a pas besoin d'exclusion — `borner_la_fin` ferme le
+    // canal, l'envoi suivant échoue, et la fonction sort par un `return`
+    // anticipé bien avant le point de contrôle.
+    let trames_annoncees = if seek_s <= 0.0 {
+        track.num_frames
+    } else {
+        None
+    };
     let mut track_id = track.id;
     let source_channels = audio_params
         .channels
@@ -2317,6 +2338,13 @@ fn decode_to_pcm_streaming_inner(
     let mut source_samples_seen: usize = 0;
     let mut decode_errors: usize = 0;
 
+    // Le MÊME relevé que `decode_symphonia`, pour que les deux chemins se
+    // lisent d'une seule façon dans le journal (#2218).
+    let mut integrite = IntegriteFlux {
+        trames_annoncees,
+        ..Default::default()
+    };
+
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
@@ -2345,6 +2373,8 @@ fn decode_to_pcm_streaming_inner(
                 }
             }
             Err(e) => {
+                integrite.paquets_refuses = integrite.paquets_refuses.saturating_add(1);
+                integrite.premier_refus.get_or_insert_with(|| e.to_string());
                 tracing::warn!(file = file_path, error = %e, total_samples, source_bd, "streaming_decode_packet_error");
                 break;
             }
@@ -2358,6 +2388,8 @@ fn decode_to_pcm_streaming_inner(
             Ok(d) => d,
             Err(e) => {
                 decode_errors += 1;
+                integrite.trames_refusees = integrite.trames_refusees.saturating_add(1);
+                integrite.premier_refus.get_or_insert_with(|| e.to_string());
                 if decode_errors <= 3 {
                     tracing::warn!(file = file_path, error = %e, total_samples, source_bd, "streaming_decode_frame_error");
                 }
@@ -2492,6 +2524,39 @@ fn decode_to_pcm_streaming_inner(
         duration_s,
         "decoded_symphonia_streaming"
     );
+
+    // Le CONSOMMATEUR du relevé, sur le chemin de LECTURE (#2218).
+    //
+    // On compare en trames SOURCE : `total_samples` est déjà passé par le
+    // rééchantillonneur et le mélangeur de canaux, il ne se compare à rien de
+    // ce que le conteneur annonce. `source_samples_seen` compte les
+    // échantillons entrelacés tels que le décodeur les a rendus.
+    //
+    // Ce point n'est atteint QUE si la boucle est allée à son terme : un
+    // consommateur qui décroche (arrêt, piste suivante, borne de fin d'une
+    // feuille CUE) sort par un `return Ok(..)` plus haut, et n'est donc jamais
+    // compté comme une perte.
+    //
+    // ⛔ Aucun refus, et aucune coupure : un fichier légèrement abîmé qui
+    // s'écoutait hier s'écoute encore, jusqu'au bout. Il laisse désormais une
+    // trace. À `warn` et non à `debug` parce que le journal exporté par
+    // « Diagnostics » est filtré à `info` (même raison qu'`ape_ouvert`, #3311).
+    integrite.trames_rendues = (source_samples_seen / source_channels.max(1) as usize) as u64;
+    if integrite.perte_detectee() {
+        tracing::warn!(
+            file = file_path,
+            trames_annoncees = integrite.trames_annoncees,
+            trames_rendues = integrite.trames_rendues,
+            perte_pour_cent = integrite.perte_pour_cent(),
+            paquets_refuses = integrite.paquets_refuses,
+            trames_refusees = integrite.trames_refusees,
+            controle = integrite
+                .premier_refus
+                .as_deref()
+                .unwrap_or("le conteneur annonce plus de trames que le décodeur n'en a rendues"),
+            "decodage_incomplet_le_conteneur_annoncait_plus"
+        );
+    }
 
     Ok((output_bd, output_rate))
 }

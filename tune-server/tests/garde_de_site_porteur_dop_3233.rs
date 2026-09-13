@@ -50,14 +50,19 @@
 //! parce qu'il est déclaré dans l'agrégateur `server_contracts.rs`.
 
 const LOCAL_RS: &str = include_str!("../../tune-core/src/outputs/local.rs");
+// REF-8 (#2219) : la décision de cadence (`decide_local_rate_opening`,
+// `note_rate_decision`) vit dans `BackendCpal::ouvrir` (`local/backend.rs`) ;
+// la fermeture `refuser_le_porteur_dop` et l'étage restent dans `local.rs`.
+// La garde lit les deux fichiers concaténés, jamais l'un à la place de l'autre.
+const BACKEND_RS: &str = include_str!("../../tune-core/src/outputs/local/backend.rs");
 
 /// La production seule : `local.rs` se termine par `#[cfg(test)] mod tests`,
 /// dont le texte citerait nos propres motifs et rendrait la garde complaisante.
-fn production() -> &'static str {
+fn production() -> String {
     let fin = LOCAL_RS
         .find("#[cfg(test)]\nmod tests")
         .expect("local.rs doit garder son `#[cfg(test)] mod tests` en fin de fichier");
-    &LOCAL_RS[..fin]
+    [&LOCAL_RS[..fin], BACKEND_RS].concat()
 }
 
 /// Le texte sans commentaires ni blancs.
@@ -97,7 +102,7 @@ fn sans_commentaires_ni_blancs(source: &str) -> String {
 /// `open_failure` vivent à plusieurs autres endroits de `local.rs`. Une
 /// fermeture vidée resterait alors verte — c'est exactement ce qu'a montré la
 /// contre-épreuve de ce fichier.
-fn corps_de_la_fermeture() -> &'static str {
+fn corps_de_la_fermeture() -> String {
     let production = production();
     // R1 (#2219) : la fermeture est passée à un puits par `&mut dyn FnMut`,
     // ce qui impose de la DÉCLARER `mut`. L'aiguille est donc l'affectation
@@ -111,7 +116,7 @@ fn corps_de_la_fermeture() -> &'static str {
     let fin = corps
         .find("\n            };")
         .expect("la fermeture doit se refermer à son indentation de déclaration");
-    &corps[..fin]
+    corps[..fin].to_string()
 }
 
 /// LA route, écrite comme un seul motif — et assemblée à l'exécution.
@@ -157,7 +162,7 @@ fn motif_de_la_route() -> String {
 /// protégerait plus rien. Le motif enferme donc l'ordre.
 #[test]
 fn la_route_unique_refuse_le_porteur_dop_avant_toute_conversion() {
-    let source = sans_commentaires_ni_blancs(production());
+    let source = sans_commentaires_ni_blancs(&production());
     let routes = source.matches(&motif_de_la_route()).count();
     assert_eq!(
         routes, 1,
@@ -213,7 +218,7 @@ fn la_route_unique_refuse_le_porteur_dop_avant_toute_conversion() {
 /// qu'à lui.
 #[test]
 fn la_fermeture_refusante_journalise_force_le_silence_et_retombe_le_dop() {
-    let source = sans_commentaires_ni_blancs(corps_de_la_fermeture());
+    let source = sans_commentaires_ni_blancs(&corps_de_la_fermeture());
     for (fragment, pourquoi) in [
         (
             "rupture.journaliser(&device_name);",
@@ -253,7 +258,7 @@ fn la_fermeture_refusante_journalise_force_le_silence_et_retombe_le_dop() {
 /// devenir vide.
 #[test]
 fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
-    let source = sans_commentaires_ni_blancs(production());
+    let source = sans_commentaires_ni_blancs(&production());
     let corps = source
         .split("fnpousser(")
         .nth(1)
@@ -311,7 +316,7 @@ fn la_route_ne_refuse_pas_le_porteur_dop_apres_la_conversion() {
 /// `tune-server/tests`, qui tourne, lui, dans le job `Test`.
 #[test]
 fn la_decision_de_cadence_reste_branchee_et_le_filtre_tautologique_n_est_pas_revenu() {
-    let source = sans_commentaires_ni_blancs(production());
+    let source = sans_commentaires_ni_blancs(&production());
 
     let appel_reel = [
         "decide_local_rate_opening(sample_rate,default_sr,",

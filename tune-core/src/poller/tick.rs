@@ -58,7 +58,7 @@ impl PositionPoller {
                     // Chemin « zone au repos » : rien ne joue, donc rien ne
                     // peut manquer à l'anneau. Le relevé de famine n'a de sens
                     // que sur le chemin de lecture, plus bas.
-                    Ok((s, signal_path, dsp_metrics, _famine)) => {
+                    Ok((s, signal_path, dsp_metrics, _famine, transformations)) => {
                         let b = idle_backoff.entry(zone_id).or_default();
                         b.record_success(s.state);
                         // Clôture de panne (#2566) : muette si le sondage
@@ -72,6 +72,9 @@ impl PositionPoller {
                             .await;
                         self.playback
                             .set_output_dsp_metrics(zone_id, dsp_metrics)
+                            .await;
+                        self.playback
+                            .set_transformations_reelles(zone_id, transformations)
                             .await;
                         s
                     }
@@ -460,6 +463,7 @@ impl PositionPoller {
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
                 ps.gapless_armed = None;
+                ps.transition(fsm::Transition::NouvellePiste);
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -625,8 +629,9 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path, dsp_metrics, famine)) => {
+                    Ok((s, signal_path, dsp_metrics, famine, transformations)) => {
                         ps.consecutive_errors = 0;
+                        ps.transition(fsm::Transition::SondeRetablie);
                         // Clôture de panne (#2566) : muette si le sondage
                         // n'avait jamais cessé de répondre.
                         ps.journal.succes_lecture(zone_id, &device_id);
@@ -645,12 +650,16 @@ impl PositionPoller {
                         self.playback
                             .set_output_dsp_metrics(zone_id, dsp_metrics)
                             .await;
+                        self.playback
+                            .set_transformations_reelles(zone_id, transformations)
+                            .await;
                         (s, famine)
                     }
                     Err(e) => {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
                         ps.total_errors += 1;
                         ps.backoff_remaining = 1u8 << ps.consecutive_errors.min(4);
+                        ps.transition(fsm::Transition::SondeEnEchec);
                         // Les trois compteurs ci-dessus sont tenus AVANT, et le
                         // journal n'en touche aucun : une panne qui cesse
                         // d'être dite continue d'être comptée, donc le repli de
@@ -710,6 +719,7 @@ impl PositionPoller {
                                 "dlna_poll_failed_wall_clock_advancing"
                             );
                             ps.wall_clock_end_fired = true;
+                            ps.transition(fsm::Transition::FinParHorlogeMurale);
                             self.handle_track_end(zone_id, zone_state).await;
                         }
                         continue;
@@ -819,6 +829,7 @@ impl PositionPoller {
             // Update last_radio_poll so the throttle gate works on next tick.
             if is_radio {
                 ps.last_radio_poll = Instant::now();
+                ps.transition(fsm::Transition::SourceRadio);
             }
 
             // Radio zones: after the throttled poll, only check transport
@@ -1017,6 +1028,7 @@ impl PositionPoller {
                             ticks = ps.radio_stopped_ticks,
                             "radio_renderer_stopped_giving_up"
                         );
+                        ps.transition(fsm::Transition::RadioAbandonnee);
                         poll_states.remove(&zone_id);
                         let device_id_ref = self.get_zone_device_id(zone_id);
                         self.orchestrator
@@ -1086,7 +1098,44 @@ impl PositionPoller {
                 }
             }
 
-            if !in_seek_grace {
+            // ── Un échantillon PÉRIMÉ ne se publie pas non plus ──
+            //
+            // renesenses/tune-web-client#954, fil forum 1764.
+            //
+            // Quatre-vingts lignes plus bas, `stale_start_position` écarte les
+            // échantillons « provably-stale » — « BEFORE they poison anything »,
+            // dit son commentaire — et saute le reste du tour. Mais la position
+            // est publiée ICI, en amont : la valeur écartée avait déjà atteint
+            // l'état servi par `GET /zones` et l'évènement `position`.
+            //
+            // Le cas nommé par ce ticket est le changement de piste. Entre le
+            // basculement de `now_playing` par `PlaybackManager::play` et le
+            // démarrage réel du flux sur la sortie il s'écoule du temps — deux
+            // secondes mesurées sur le .18 le 12/09/2026 (`playback_timing …
+            // output_ms=2002`). Pendant cette fenêtre la sortie rend encore la
+            // position de la piste PRÉCÉDENTE, et le sondeur la recopiait sur la
+            // piste neuve : l'écran gardait le curseur là où il était.
+            //
+            // La garde de monotonie aggravait la chose au lieu de l'arrêter : la
+            // valeur périmée, plus grande que le plancher que `play` venait de
+            // remettre à zéro, passait pour une AVANCE et devenait le nouveau
+            // plancher. Les échantillons honnêtes du nouveau morceau étaient
+            // alors des reculs, et il en fallait cinq — cinq secondes — pour que
+            // le plancher cède.
+            //
+            // Aucune décision nouvelle : on se contente d'appeler le même
+            // prédicat au même tour, mais AVANT de publier. `ps.track_started_at`
+            // est lu ici et non plus bas parce que le repli de seek qui précède
+            // vient peut-être de le réécrire.
+            let echantillon_perime = status.realtime
+                && decisions::stale_start_position(
+                    ps.track_started_at
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0),
+                    status.position_ms,
+                );
+
+            if !in_seek_grace && !echantillon_perime {
                 // Clamp the reported position to the track duration so the UI
                 // progress bar doesn't briefly overshoot past the end. The
                 // output can report a position a few seconds past the duration
@@ -1197,6 +1246,7 @@ impl PositionPoller {
                 );
                 continue;
             }
+            ps.transition(fsm::Transition::PremierEchantillonPlausible);
 
             // enough of the track was actually played before accepting a
             // gapless transition.  We update this BEFORE checking for resets
@@ -1320,6 +1370,7 @@ impl PositionPoller {
                     ps.track_started_at = Some(Instant::now());
                     ps.gapless_advance_pending = false;
                     ps.gapless_stuck_ticks = 0;
+                    ps.transition(fsm::Transition::TransitionDetectee);
                     // A stall-recovery restart (OAAT stall supervisor) replays
                     // the CURRENT track from 0. That from-zero position drop
                     // trips `position_reset` exactly like a real gapless
@@ -1394,6 +1445,7 @@ impl PositionPoller {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
                     // Tune is not playing on this zone — ignore device Stopped.
                     ps.stopped_ticks = 0;
+                    ps.transition(fsm::Transition::ArretEfface);
                     ps.playing_stall_ticks = 0;
                 }
                 TransportState::Stopped => {
@@ -1473,6 +1525,7 @@ impl PositionPoller {
                     if in_seek_grace {
                         fsm_actual = Some(fsm::StoppedOutcome::SuppressSeekGrace);
                         ps.stopped_ticks = 0;
+                        ps.transition(fsm::Transition::ArretEfface);
                         debug!(
                             zone_id,
                             seek_grace_secs = seek_grace_secs,
@@ -1481,6 +1534,7 @@ impl PositionPoller {
                     } else if in_track_load_grace {
                         fsm_actual = Some(fsm::StoppedOutcome::SuppressLoadGrace);
                         ps.stopped_ticks = 0;
+                        ps.transition(fsm::Transition::ArretEfface);
                         debug!(
                             zone_id,
                             elapsed = ps.track_loaded_at.elapsed().as_secs(),
@@ -1491,6 +1545,7 @@ impl PositionPoller {
                         fsm_actual = Some(fsm::StoppedOutcome::SuppressCooldown);
                         ps.gapless_cooldown -= 1;
                         ps.stopped_ticks = 0;
+                        ps.transition(fsm::Transition::ArretEfface);
                     } else if in_gapless_guard {
                         if !played_enough {
                             fsm_actual = Some(fsm::StoppedOutcome::GuardStoppedIgnored);
@@ -1522,6 +1577,7 @@ impl PositionPoller {
                             ps.gapless_advance_pending = true;
                             ps.gapless_stuck_ticks = 0;
                             ps.gapless_cooldown = 4;
+                            ps.transition(fsm::Transition::ArretDansLaGarde);
                         }
                     } else if ps.gapless_advance_pending {
                         // The poller advanced metadata expecting the renderer
@@ -1542,6 +1598,7 @@ impl PositionPoller {
                             ps.stopped_ticks = 0;
                             track_ended = true;
                             motif_fin_de_piste = decisions::motif_fin::AVANCE_GAPLESS_BLOQUEE;
+                            ps.transition(fsm::Transition::EnchainementBloque);
                         } else {
                             fsm_actual = Some(fsm::StoppedOutcome::StuckWaiting);
                             debug!(
@@ -1570,6 +1627,9 @@ impl PositionPoller {
                         );
                         track_ended = true;
                         motif_fin_de_piste = decisions::motif_fin::FIN_NATURELLE_LOCALE;
+                        ps.transition(fsm::Transition::FinConstateeAvantLeSeuil {
+                            motif: MotifFin::FinNaturelleLocale,
+                        });
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
@@ -1588,11 +1648,15 @@ impl PositionPoller {
                         ps.stopped_ticks = 0;
                         track_ended = true;
                         motif_fin_de_piste = decisions::motif_fin::DSD_DLNA_PIC_ATTEINT;
+                        ps.transition(fsm::Transition::FinConstateeAvantLeSeuil {
+                            motif: MotifFin::DsdDlnaPicAtteint,
+                        });
                     } else {
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
                         fsm_actual = Some(fsm::StoppedOutcome::Waiting);
                         ps.stopped_ticks += 1;
+                        ps.transition(fsm::Transition::RendererArrete);
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
                             // When repeat mode is active (One or All) on DLNA,
                             // be more lenient about accepting track-end: if the
@@ -1670,6 +1734,9 @@ impl PositionPoller {
                                     ps.gapless_advance_pending = true;
                                     ps.gapless_stuck_ticks = 0;
                                     ps.gapless_cooldown = 4;
+                                    ps.transition(
+                                        fsm::Transition::FinNaturelleEnAttenteDEnchainement,
+                                    );
                                 } else {
                                     // Avant d'accepter cette fin : le renderer
                                     // a-t-il vraiment reçu le morceau ? Sur un
@@ -1699,6 +1766,7 @@ impl PositionPoller {
                                         track_ended = true;
                                         motif_fin_de_piste =
                                             decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
+                                        ps.transition(fsm::Transition::FinNaturelleApresArret);
                                     } else if ps.stall_declines < STALL_DECLINE_MAX_TICKS {
                                         // On laisse au renderer le temps de
                                         // reprendre : s'il repart, il repassera
@@ -1728,6 +1796,9 @@ impl PositionPoller {
                                         );
                                         track_ended = false;
                                         force_stop = true;
+                                        ps.transition(fsm::Transition::PanneDeLecture {
+                                            cause: CauseDeCoupure::RendererCale,
+                                        });
                                     }
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
@@ -1762,6 +1833,7 @@ impl PositionPoller {
 
                                 if consommation == fsm::ConsommationFlux::Consomme {
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
+                                    ps.transition(fsm::Transition::AttenteProlongee);
                                     if ps.stopped_ticks % 30 == 0 {
                                         debug!(
                                             zone_id,
@@ -1780,6 +1852,7 @@ impl PositionPoller {
                                     // et on le DIT : un état invisible se
                                     // reconfondrait avec zéro.
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingUnknown);
+                                    ps.transition(fsm::Transition::AttenteProlongee);
                                     if ps.stopped_ticks % 30 == 0 {
                                         warn!(
                                             zone_id,
@@ -1805,6 +1878,9 @@ impl PositionPoller {
                                     );
                                     track_ended = false;
                                     force_stop = true;
+                                    ps.transition(fsm::Transition::PanneDeLecture {
+                                        cause: CauseDeCoupure::FluxASec,
+                                    });
                                     // « Démarrage mort » (#2394) : la piste n'a
                                     // JAMAIS été tirée (0 octet servi) sur un
                                     // renderer DLNA — le profil du pipeline
@@ -1858,6 +1934,7 @@ impl PositionPoller {
                 }
                 TransportState::Playing | TransportState::Transitioning => {
                     ps.stopped_ticks = 0;
+                    ps.transition(fsm::Transition::ArretEfface);
                     ps.gapless_cooldown = 0;
                     // v0.9 rc.2 FSM shadow: snapshot the Playing-arm inputs
                     // (pre-mutation). gapless_enabled is filled in the arm branch
@@ -1899,6 +1976,7 @@ impl PositionPoller {
                     if ps.gapless_advance_pending {
                         ps.gapless_advance_pending = false;
                         ps.gapless_stuck_ticks = 0;
+                        ps.transition(fsm::Transition::EnchainementConfirme);
                         if let Some(next_pos) = Self::next_position(zone_state) {
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
                             if let Err(e) = self
@@ -2017,6 +2095,7 @@ impl PositionPoller {
                         // re-arm the once-per-track gapless_arm_trace line.
                         ps.gapless_arm_logged = None;
                         ps.gapless_dsd_skip_pos = None;
+                        ps.transition(fsm::Transition::TransitionDetectee);
                         if let Some(next_pos) = self
                             .position_a_avancer(zone_id, zone_state, arme_avant)
                             .await
@@ -2057,6 +2136,7 @@ impl PositionPoller {
                             ps.gapless_sent = false;
                             ps.gapless_sent_at = None;
                             ps.gapless_armed = None;
+                            ps.transition(fsm::Transition::Desarmement);
                         }
                         // « Lire ensuite » PENDANT la fenetre d'armement : la
                         // piste que le renderer a acceptee n'est plus celle que
@@ -2105,6 +2185,7 @@ impl PositionPoller {
                                 // « already_armed » et ne dirait pas ce qui
                                 // vient d'etre renvoye.
                                 ps.gapless_arm_logged = None;
+                                ps.transition(fsm::Transition::Desarmement);
                             }
                         }
                         decisions::should_arm_gapless(
@@ -2149,6 +2230,9 @@ impl PositionPoller {
                                 // pas parce qu'une piste est partie : ne rien
                                 // laisser croire le contraire (#3026).
                                 ps.gapless_armed = None;
+                                ps.transition(fsm::Transition::Armement {
+                                    armement: Armement::Renonce,
+                                });
                             } else if decisions::dsd_skip_latched(
                                 ps.gapless_dsd_skip_pos,
                                 Self::next_position(zone_state),
@@ -2167,6 +2251,7 @@ impl PositionPoller {
                                         // apres `set_next_media` seulement :
                                         // un envoi refuse n'arme rien (#3026).
                                         ps.gapless_armed = arme;
+                                        ps.transition(fsm::armement_accepte(arme));
                                     }
                                     GaplessPrep::DsdNextSkipped => {
                                         ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
@@ -2302,6 +2387,7 @@ impl PositionPoller {
                             track_ended = true;
                             fsm_pact.past_end_track_ended = true;
                             motif_fin_de_piste = decisions::motif_fin::POSITION_AU_DELA_DE_LA_FIN;
+                            ps.transition(fsm::Transition::PositionAuDelaDeLaFin);
                         }
                     } else {
                         ps.past_end_ticks = 0;
@@ -2416,6 +2502,7 @@ impl PositionPoller {
                                     "dlna_playing_without_progress_stopping_zone"
                                 );
                                 force_stop = true;
+                                ps.transition(fsm::Transition::LectureSansProgres);
                             }
                         } else {
                             // No byte evidence means no conviction: a transient
@@ -2440,6 +2527,7 @@ impl PositionPoller {
                 }
                 TransportState::Paused => {
                     ps.stopped_ticks = 0;
+                    ps.transition(fsm::Transition::ArretEfface);
                     ps.playing_stall_ticks = 0;
                 }
             }
@@ -2540,6 +2628,18 @@ impl PositionPoller {
                 poll_states.remove(&zone_id);
                 self.handle_track_end(zone_id, zone_state).await;
             }
+        }
+        // REF-9 (#2219) — l'invariant, en fin de tour et sous debug seulement :
+        // l'état en ombre et les drapeaux disent la même chose pour chaque zone
+        // encore sondée. Un seul site, à la fin ; aucune décision n'en dépend.
+        #[cfg(debug_assertions)]
+        for (zone_id, ps) in poll_states.iter() {
+            let verdict = ps.coherent();
+            debug_assert!(
+                verdict.is_ok(),
+                "poller_etat_incoherent zone_id={zone_id} : {}",
+                verdict.as_ref().unwrap_err()
+            );
         }
     }
 }
