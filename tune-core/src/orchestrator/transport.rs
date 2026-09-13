@@ -181,8 +181,62 @@ impl PlaybackOrchestrator {
         // refusé. Seule une zone à la fois HORS LIGNE et ABSENTE du registre
         // atteint désormais le rebond puis le refus nommé — comme toutes les
         // autres familles de sorties depuis #1287.
-        if dev_id.is_empty() || self.outputs.lock().await.contains(dev_id) {
-            return Ok(None);
+        {
+            let registre = self.outputs.lock().await;
+            if dev_id.is_empty() || registre.contains(dev_id) {
+                return Ok(None);
+            }
+            // 🔴 #3737 — un parc VIDE n'est pas une preuve d'absence.
+            //
+            // #3738 a remplacé l'exemption `local:` par le seul critère qui
+            // vaille : « l'appareil est-il dans le registre vivant ». Ce
+            // critère lit une ÉNUMÉRATION, et l'issue posait la garde qui va
+            // avec dans la phrase suivante : « un parc vide (démarrage,
+            // énumération en cours) ferait refuser TOUTES les zones locales.
+            // Le test doit exiger un parc non vide avant de conclure à
+            // l'absence. Sans cette garde, le correctif est pire que le
+            // défaut. » Elle n'a pas été posée.
+            //
+            // Le parc local peut être vide sans qu'aucun appareil n'ait
+            // disparu, et `startup.rs::register_local_outputs` le dit
+            // lui-même : l'énumération tourne sous un délai de garde de 8 s
+            // parce qu'un pilote ASIO déjà ouvert par une autre application
+            // (JRiver, foobar2000) BLOQUE à l'ouverture — « starting the
+            // server WITHOUT local zones this boot ». Son bloc
+            // d'enregistrement est gardé par `if !devices.is_empty()` : quand
+            // l'énumération échoue, expire ou panique, AUCUNE sortie locale
+            // n'est enregistrée de tout le démarrage.
+            //
+            // Une zone locale que la base croit hors ligne était alors
+            // refusée à chaque clic, pour tout le démarrage, alors que son DAC
+            // est branché : `recreate_local_and_play` sait ouvrir un
+            // périphérique qui n'est PAS au registre — ce chemin existe
+            // précisément pour ça — et la lecture aboutissait avant #3738.
+            //
+            // La même leçon est déjà écrite dans `background.rs`, sur le
+            // rescan qui RETIRE les sorties disparues : « If the scan returned
+            // nothing, skip all removals — an empty result means the backend
+            // couldn't enumerate (e.g. WASAPI held exclusively by
+            // foobar2000), not that everything disappeared. » Le retrait
+            // exigeait un parc non vide ; le refus, non.
+            //
+            // Portée strictement limitée aux sorties `local:` : c'est là que
+            // « le parc » est une énumération de périphériques qui peut
+            // échouer en bloc. Une zone réseau dont le registre SSDP est vide
+            // reste refusée comme avant, et une zone locale l'est toujours dès
+            // qu'un seul autre appareil local répond : le parc n'est pas vide,
+            // l'énumération a donc bien eu lieu, et l'absence est mesurée.
+            if dev_id.starts_with("local:")
+                && !registre.list().iter().any(|id| id.starts_with("local:"))
+            {
+                warn!(
+                    zone_id,
+                    zone_name = %zone.name,
+                    device = dev_id,
+                    "play_allowed_local_parc_empty_absence_unproven"
+                );
+                return Ok(None);
+            }
         }
 
         // The stored device really is gone. Before rejecting, look for a live
