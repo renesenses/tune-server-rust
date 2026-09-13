@@ -193,6 +193,14 @@ path = "tests/cles_developpeur_hors_journal.rs"
 [[test]]
 name = "journal_sondage_hqplayer"
 path = "tests/journal_sondage_hqplayer.rs"
+
+# #4051 — troisième de la même famille : abonné `tracing` GLOBAL, donc un
+# binaire à lui seul et UN essai dedans. Il garde le réglage LRCLIB publié par
+# `GET /system/config`, l'aller-retour du PATCH, et les deux lignes de journal
+# sans lesquelles ce ticket n'a pas pu être diagnostiqué.
+[[test]]
+name = "paroles_reglage_lrclib_4051"
+path = "tests/paroles_reglage_lrclib_4051.rs"
 # Les requêtes SQL de `tune-server` sur une VRAIE base PostgreSQL (#3123).
 # Cible à elle seule, derrière `required-features`, pour deux raisons : elle
 # monte un `AppState` sur le moteur PostgreSQL (impossible sans la feature), et
