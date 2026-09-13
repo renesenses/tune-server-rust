@@ -593,6 +593,31 @@ pub(super) fn publier_le_parc(parc: &[AudioDevice]) {
     *DERNIER_PARC.lock().unwrap_or_else(|e| e.into_inner()) = parc.to_vec();
 }
 
+/// Poser un parc CONNU, comme si l'énumération venait de le rendre (#3322).
+///
+/// La raison d'être de cette porte est une contrainte de témoin, pas un
+/// besoin de production : les routes qui publient les dispositions de canaux
+/// — `GET /devices/audio`, `GET /zones`, `GET /zones/{id}` — lisent le parc
+/// par [`list_audio_devices_with_backend`] et [`cached_audio_devices`], donc
+/// par les deux dépôts ci-dessus. Sans cette porte, un témoin ne peut les
+/// éprouver QUE sur le matériel de la machine de compilation : vert sur un
+/// Mac qui a une carte son, vide et donc vert CONTRE RIEN sur Shrek. C'est
+/// exactement le faux vert que #3322 dénonce — un champ publié que personne
+/// ne remplit, et une garde qui ne s'en aperçoit pas.
+///
+/// Elle pose les DEUX dépôts, parce que les deux chemins de lecture existent :
+/// [`SCAN_GUARD`] avec un horodatage neuf (le cooldown de
+/// [`SCAN_COOLDOWN_SECS`] fait alors servir ce parc sans toucher au matériel)
+/// et [`DERNIER_PARC`] (lu par [`cached_audio_devices`]).
+///
+/// Aucun appelant de production. Rien n'y appelle en dehors des témoins, et
+/// rien ne doit : la production n'a qu'un producteur d'inventaire, l'énumérateur.
+#[doc(hidden)]
+pub fn amorcer_le_parc_connu(parc: Vec<AudioDevice>) {
+    publier_le_parc(&parc);
+    *SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), parc));
+}
+
 /// List audio devices using the default host.
 pub fn list_audio_devices() -> Vec<AudioDevice> {
     list_audio_devices_with_backend("auto")

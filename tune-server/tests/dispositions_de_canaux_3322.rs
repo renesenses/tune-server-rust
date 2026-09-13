@@ -356,15 +356,15 @@ async fn la_grille_des_appareils_publie_aussi_les_dispositions_locales() {
 /// Ce qu'il prouve : le champ voyage jusqu'au client par la route réelle, et
 /// la règle « inconnu ⇒ `[]`, jamais une valeur inventée » y tient aussi.
 ///
-/// Ce qu'il NE prouve PAS, et il faut le dire : l'ENRICHISSEMENT ne peut pas
-/// être observé depuis une route montée dans un test. Le parc vient de
+/// Ce qu'il ne prouvait PAS, et que
+/// [`la_route_montee_zones_enrichit_une_sortie_locale`] prouve désormais :
+/// l'ENRICHISSEMENT observé depuis une route montée. Le parc vient de
 /// `tune_core::outputs::local::cached_audio_devices()`, qui rend le CACHE de
 /// la dernière énumération et non une énumération fraîche ; dans un processus
-/// de test rien ne l'a jamais peuplé, il est donc vide sur toute machine —
-/// mesuré `[]` sur Shrek. Le témoin de l'enrichissement est celui d'au-dessus,
-/// sur l'assemblage de production `liste_des_appareils`, que le handler
-/// `list_devices` se contente d'appeler avec le parc réel : il n'y a rien
-/// entre les deux où une divergence pourrait se loger.
+/// de test rien ne l'avait jamais peuplé, il était donc vide sur toute machine
+/// — mesuré `[]` sur Shrek. C'est ce trou que
+/// `tune_core::outputs::local::amorcer_le_parc_connu` referme : le témoin pose
+/// un parc CONNU, et les routes le servent.
 #[tokio::test]
 async fn la_route_montee_devices_publie_le_contrat_de_capacites() {
     let banc = Banc::neuf();
@@ -402,4 +402,160 @@ fn dispositions_de(entrees: &[Value], device_id: &str) -> Vec<String> {
         .find(|e| e["id"].as_str() == Some(device_id))
         .unwrap_or_else(|| panic!("l'entrée {device_id} doit être listée par GET /devices"));
     dispositions(entree)
+}
+
+// ---------------------------------------------------------------------------
+// #3322 — le parc local, et la quatrième surface
+// ---------------------------------------------------------------------------
+
+/// Le parc que TOUS les témoins de ce fichier posent.
+///
+/// Un seul et même contenu, parce que le parc est un dépôt de processus et que
+/// les témoins d'un même binaire tournent en parallèle : deux amorçages
+/// concurrents doivent poser la même chose, sans quoi l'un déferait l'autre.
+///
+/// Les deux entrées couvrent les deux moitiés de la règle : un appareil dont
+/// on connaît la capacité, et un appareil dont on ne la connaît pas
+/// (`max_channels == 0`), qui doit publier `[]` et jamais « mono ».
+fn amorcer_le_parc_temoin() {
+    let appareil = |nom: &str, max_channels: u16| tune_core::outputs::local::AudioDevice {
+        name: nom.to_string(),
+        endpoint_id: String::new(),
+        is_default: false,
+        max_channels,
+        sample_rates: vec![44_100, 48_000],
+        sample_rates_measured: true,
+        backend: "auto".to_string(),
+        hardware_detail: None,
+    };
+    tune_core::outputs::local::amorcer_le_parc_connu(vec![
+        appareil("Convertisseur 8 voies", 8),
+        appareil("Capacite inconnue", 0),
+    ]);
+}
+
+/// Les quatre dispositions d'un appareil 8 canaux, dans le vocabulaire du
+/// serveur — et rien d'autre : « 7 canaux » n'existe pas.
+fn huit_voies() -> Vec<String> {
+    vec![
+        "mono".to_string(),
+        "stereo".to_string(),
+        "surround51".to_string(),
+        "surround71".to_string(),
+    ]
+}
+
+/// La QUATRIÈME surface : `GET /devices/audio`, le parc audio local.
+///
+/// Les trois autres routes ne parlent que d'un appareil DÉJÀ enregistré comme
+/// sortie. La grille « Appareils » propose aussi les périphériques locaux que
+/// rien n'utilise encore, et elle les tient d'ici. Cette route portait
+/// `max_channels` — l'ENTRÉE du moteur multicanal — et pas sa sortie : le
+/// client aurait dû refabriquer les neuf noms lui-même à partir d'un entier,
+/// c'est-à-dire précisément la « plage libre 0–32 » que l'issue interdit.
+///
+/// Témoin sur la route MONTÉE, avec un parc connu.
+#[tokio::test]
+async fn le_parc_local_publie_ses_dispositions_sur_devices_audio() {
+    let banc = Banc::neuf();
+    amorcer_le_parc_temoin();
+
+    let (status, charge) = banc.lire("/api/v1/devices/audio").await;
+    assert_eq!(status, StatusCode::OK);
+    let appareils = charge["devices"]
+        .as_array()
+        .expect("GET /devices/audio rend un tableau d'appareils")
+        .clone();
+
+    let lire = |nom: &str| -> Vec<String> {
+        let entree = appareils
+            .iter()
+            .find(|d| d["name"].as_str() == Some(nom))
+            .unwrap_or_else(|| panic!("l'appareil {nom} doit être publié par GET /devices/audio"));
+        entree["channel_layouts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("channel_layouts manque sur {nom}"))
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    };
+
+    assert_eq!(
+        lire("Convertisseur 8 voies"),
+        huit_voies(),
+        "un appareil 8 canaux publie les quatre dispositions qui y tiennent"
+    );
+    assert!(
+        lire("Capacite inconnue").is_empty(),
+        "max_channels == 0 publie [] : « on ne sait pas » ne s'arrondit pas à mono"
+    );
+}
+
+/// L'enrichissement d'une sortie LOCALE, vu depuis la ROUTE.
+///
+/// C'est le témoin qui manquait. Les trois autres passent par
+/// `output_capabilities_avec` ou `liste_des_appareils` avec un parc donné en
+/// paramètre : ils prouvent la RÈGLE, pas le BRANCHEMENT. Une règle juste que
+/// la route n'appelle plus resterait verte — c'est exactement l'état que
+/// #3322 décrit, un moteur correct que personne n'appelle.
+///
+/// Ici la sortie ne déclare RIEN : tout ce que le client reçoit vient du parc,
+/// par le chemin de production `output_capabilities` →
+/// `canaux_des_peripheriques_locaux` → `cached_audio_devices`.
+#[tokio::test]
+async fn la_route_montee_zones_enrichit_une_sortie_locale() {
+    let banc = Banc::neuf();
+    amorcer_le_parc_temoin();
+    let zone_id = banc
+        .zone_liee(SortieDEssai::neuve(
+            "local:Convertisseur 8 voies",
+            OutputCapabilities::v1(true, true, true, true, true, false),
+        ))
+        .await;
+    let zone_muette = banc
+        .zone_liee(SortieDEssai::neuve(
+            "local:Capacite inconnue",
+            OutputCapabilities::v1(true, true, true, true, true, false),
+        ))
+        .await;
+
+    let (status, liste) = banc.lire("/api/v1/zones").await;
+    assert_eq!(status, StatusCode::OK);
+    let zones = liste.as_array().expect("un tableau de zones");
+    let par_id = |id: i64| {
+        zones
+            .iter()
+            .find(|z| z["id"].as_i64() == Some(id))
+            .unwrap_or_else(|| panic!("la zone {id}"))
+    };
+    assert_eq!(
+        dispositions(par_id(zone_id)),
+        huit_voies(),
+        "GET /zones doit enrichir une sortie locale depuis le parc énuméré"
+    );
+    assert!(
+        dispositions(par_id(zone_muette)).is_empty(),
+        "un appareil dont la capacité est inconnue publie [] sur GET /zones"
+    );
+
+    let (status, detail) = banc.lire(&format!("/api/v1/zones/{zone_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        dispositions(&detail),
+        huit_voies(),
+        "GET /zones/{{id}} doit publier exactement la même chose que GET /zones"
+    );
+
+    // Et la grille « Appareils », par sa route montée : le même appareil, la
+    // même réponse. C'est le critère « la même chose partout ».
+    let (status, appareils) = banc.lire("/api/v1/devices").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        dispositions_de(
+            appareils.as_array().expect("un tableau d'appareils"),
+            "local:Convertisseur 8 voies"
+        ),
+        huit_voies(),
+        "GET /devices doit publier les mêmes dispositions que GET /zones"
+    );
 }
