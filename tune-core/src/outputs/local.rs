@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rubato::{
-    Async, FixedAsync, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-    calculate_cutoff,
-};
+// Les paramètres du noyau sinc ne sont plus décidés ici : `audio::resample`
+// est le seul à les connaître (#2218, D1).
+use rubato::Async;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -310,6 +309,12 @@ mod bras_asio;
 mod bras_coreaudio;
 #[cfg(target_os = "windows")]
 mod bras_wasapi;
+
+// REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
+// → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
+// `NativePcmRing`. Même `cfg` que les aides qu'il appelle : jugé sur Shrek.
+#[cfg(any(target_os = "windows", test))]
+mod etage_natif;
 
 // REF-8 (#2219) : le trait backend minimal et son premier implémenteur, CPAL
 // partagé. Le bras CPAL de `play_url` l'appelle : ouvrir, puits, démarrer,
@@ -1457,6 +1462,12 @@ impl RingBuf {
 #[cfg(test)]
 mod ringbuf_tests;
 
+// #3814 — le rappel cpal partagé rend-il son dû à l'horloge du pilote quand
+// il se tait ? Le banc appelle le rappel réel, période par période, et fait
+// juger le résultat par le `SuiviFamine` du sondeur.
+#[cfg(test)]
+mod horloge_du_pilote_muet_3814;
+
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
 /// `decode_compressed_stream` rendait `None` pour QUATRE causes distinctes, et
@@ -2144,6 +2155,81 @@ impl SharedDeviceResolution {
     }
 }
 
+/// Rendre une période MUETTE sans tirer de l'anneau — et le dire à l'horloge
+/// du pilote (#3814).
+///
+/// Les deux sorties anticipées du rappel cpal partagé (sourdine établie,
+/// pré-remplissage pas atteint) faisaient `fill(zero); return;`. Le pilote
+/// avait pourtant bien consommé cette période : c'est
+/// `RingStarvation::record`, appelé depuis `RingBuf::pop_mapped`, qui la
+/// comptait — et `pop_mapped` n'était pas appelé. `served_samples` restait
+/// donc figé pendant toute une sourdine, et `stream_ms` avec lui.
+///
+/// Le sondeur (`poller::decisions::rappel_en_retard`) lit précisément cet
+/// écart pour trancher entre « le pilote ne réclame plus rien » et « tout va
+/// bien ». Une sourdine de deux secondes lui rendait `duree_ms ≈ 0` sur
+/// `ecoule_ms ≈ 2000` — la signature exacte d'un rappel mort — et il écrivait
+/// `rappel_pilote_arrete` sur une sortie intacte.
+///
+/// C'est le SEUL chemin de sortie qui pouvait produire ce faux rouge : les
+/// trois bras exclusifs (CoreAudio, WASAPI, ASIO) tirent de l'anneau à chaque
+/// période, sourdine comprise, et leur horloge de pilote n'a jamais menti.
+#[inline]
+fn periode_muette<T: Copy>(ring: &RingBuf, output: &mut [T], zero: T) {
+    output.fill(zero);
+    ring.starvation().record_silent_period(output.len());
+}
+
+/// Une période du rappel `f32` local **partagé** (cpal shared), hors de la
+/// fermeture pour être mesurable.
+///
+/// Ce corps existait en DEUX copies identiques au commentaire près — celle du
+/// chemin compressé (`build_compressed_f32_stream`) et celle du chemin
+/// PCM/WAV (`local/backend.rs`) — et aucune des deux n'était atteignable par
+/// un test : toutes deux vivaient dans une fermeture passée à
+/// `cpal::Device::build_output_stream`. Les réunir ici est ce qui rend le
+/// témoin de #3814 possible, et évite qu'un correctif ne soit posé que dans
+/// une des deux.
+fn render_local_shared_f32_callback(
+    ring: &RingBuf,
+    volume: &AtomicU32,
+    paused: &AtomicBool,
+    silent: &AtomicBool,
+    data_started: &AtomicBool,
+    ramp: &mut crate::audio::soft_mute::SoftMuteRamp,
+    armed_ms: u32,
+    min_buffer_samples: usize,
+    output: &mut [f32],
+) -> usize {
+    // Rampe anti-« ploc » (#1590) : au lieu de sauter de l'amplitude courante
+    // à zéro, le gain glisse sur quelques dizaines de millisecondes. `arm(0)`
+    // — DoP, PURE, sortie exclusive — rend exactement la coupure franche
+    // d'avant.
+    ramp.arm(armed_ms);
+    let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
+    if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
+        periode_muette(ring, output, 0.0);
+        return 0;
+    }
+    // Wait for a minimum amount of data before starting to read from the ring
+    // buffer. This prevents the audio device from playing stale/garbage
+    // samples during track transitions.
+    if !data_started.load(Ordering::Acquire) {
+        if ring.available() < min_buffer_samples {
+            periode_muette(ring, output, 0.0);
+            return 0;
+        }
+        data_started.store(true, Ordering::Release);
+    }
+    let read = ring.pop(output);
+    let v = volume.load(Ordering::Relaxed) as f32 / 1000.0;
+    ramp.apply(&mut output[..read], v);
+    if read < output.len() {
+        output[read..].fill(0.0);
+    }
+    read
+}
+
 /// Une période du rappel entier local **partagé** (cpal shared), hors de la
 /// fermeture pour être mesurable.
 ///
@@ -2182,12 +2268,12 @@ where
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        output.fill(zero);
+        periode_muette(ring, output, zero);
         return 0;
     }
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            output.fill(zero);
+            periode_muette(ring, output, zero);
             return 0;
         }
         data_started.store(true, Ordering::Release);
@@ -2284,32 +2370,17 @@ fn build_compressed_f32_stream(
     device.build_output_stream(
         cfg,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Rampe anti-« ploc » (#1590) : au lieu de sauter de l'amplitude
-            // courante à zéro, le gain glisse sur quelques dizaines de
-            // millisecondes. `arm(0)` — DoP, PURE, sortie exclusive — rend
-            // exactement la coupure franche d'avant.
-            ramp_cb.arm(soft_mute_cb.armed_ms());
-            let silence = paused_cb.load(Ordering::Relaxed) || silent_cb.load(Ordering::Relaxed);
-            if ramp_cb.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-                data.fill(0.0);
-                return;
-            }
-            // Wait for a minimum amount of data before starting to read from
-            // the ring buffer. This prevents the audio device from playing
-            // stale/garbage samples during track transitions.
-            if !ds_cb.load(Ordering::Acquire) {
-                if ring_cb.available() < min_buf {
-                    data.fill(0.0);
-                    return;
-                }
-                ds_cb.store(true, Ordering::Release);
-            }
-            let read = ring_cb.pop(data);
-            let v = vol_cb.load(Ordering::Relaxed) as f32 / 1000.0;
-            ramp_cb.apply(&mut data[..read], v);
-            if read < data.len() {
-                data[read..].fill(0.0);
-            }
+            render_local_shared_f32_callback(
+                &ring_cb,
+                &vol_cb,
+                &paused_cb,
+                &silent_cb,
+                &ds_cb,
+                &mut ramp_cb,
+                soft_mute_cb.armed_ms(),
+                min_buf,
+                data,
+            );
         },
         make_stream_error_cb(device_gone, famine_cb),
         None,
@@ -4854,6 +4925,7 @@ impl OutputTarget for LocalOutput {
                     sample_rate,
                     bit_depth,
                     channels,
+                    spec,
                     data_offset,
                     header_buf,
                     reader,
@@ -4894,13 +4966,12 @@ impl OutputTarget for LocalOutput {
                 bras_wasapi::jouer_via_wasapi(bras_wasapi::EntreesWasapi {
                     device_name,
                     endpoint_id,
-                    sample_rate,
-                    bit_depth,
-                    channels,
+                    audio_backend,
+                    spec,
+                    soft_mute,
                     data_offset,
                     header_buf,
                     reader,
-                    frame_bytes,
                     seek_offset,
                     my_generation,
                     starvation,
@@ -5028,42 +5099,18 @@ impl OutputTarget for LocalOutput {
             };
 
             // Create rubato sinc resampler once for the entire track.
-            // Using FixedAsync::Input so we feed fixed-size input chunks.
+            //
+            // #2218 (D1) : ce site tenait sa PROPRE table de paramètres,
+            // restée aux 32/64 coefficients d'avant #2711 — le correctif de
+            // l'époque n'avait touché que `audio/resample.rs`, si bien que la
+            // sortie locale, c'est-à-dire le chemin du DAC, rééchantillonnait
+            // deux fois plus court que le convertisseur de fichiers. Un seul
+            // constructeur désormais : `new_streaming_resampler`.
             let resampler: Option<Async<f32>> = if needs_resample {
-                let ratio = output_sr as f64 / sample_rate as f64;
-                // Adaptive resampler params based on conversion ratio:
-                //   ratio ≤ 2.0 (e.g. 96kHz→48kHz): quality params, plenty of CPU budget
-                //   ratio > 2.0 (e.g. 176.4kHz→48kHz, 192kHz→48kHz): lighter params
-                //     to avoid real-time stuttering on Windows (still ~90dB SNR)
-                let inv_ratio = 1.0 / ratio; // > 1.0 when downsampling
-                let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
-                    (32_usize, 64_usize) // lighter: 176.4/192kHz → 48kHz
-                } else {
-                    (64_usize, 128_usize) // standard: 96kHz → 48kHz
-                };
-                let window = WindowFunction::BlackmanHarris2;
-                let f_cutoff = calculate_cutoff(sinc_len, window);
-                let params = SincInterpolationParameters {
-                    sinc_len,
-                    f_cutoff,
-                    interpolation: SincInterpolationType::Linear,
-                    oversampling_factor,
-                    window,
-                };
-                info!(
-                    from_sr = sample_rate,
-                    to_sr = output_sr,
-                    sinc_len,
-                    oversampling_factor,
-                    "rubato_resampler_adaptive_params"
-                );
-                match Async::<f32>::new_sinc(
-                    ratio,
-                    1.1,
-                    &params,
-                    1024,
-                    output_ch as usize,
-                    FixedAsync::Input,
+                match crate::audio::resample::new_streaming_resampler(
+                    sample_rate,
+                    output_sr,
+                    output_ch,
                 ) {
                     Ok(r) => {
                         info!(
@@ -5534,29 +5581,11 @@ impl OutputTarget for LocalOutput {
                 if etage.needs_resample && new_sr != prev_sr {
                     // Sample rate changed — flush old resampler residuals
                     etage.resample_leftover.clear();
-                    let ratio = output_sr as f64 / new_sr as f64;
-                    let inv_ratio = 1.0 / ratio;
-                    let (sinc_len, oversampling_factor) = if inv_ratio > 2.0 {
-                        (32_usize, 64_usize)
-                    } else {
-                        (64_usize, 128_usize)
-                    };
-                    let window = WindowFunction::BlackmanHarris2;
-                    let f_cutoff = calculate_cutoff(sinc_len, window);
-                    let params = SincInterpolationParameters {
-                        sinc_len,
-                        f_cutoff,
-                        interpolation: SincInterpolationType::Linear,
-                        oversampling_factor,
-                        window,
-                    };
-                    etage.resampler = match Async::<f32>::new_sinc(
-                        ratio,
-                        1.1,
-                        &params,
-                        1024,
-                        output_ch as usize,
-                        FixedAsync::Input,
+                    // Même constructeur que l'amorçage de piste : la cadence
+                    // qui change en cours de chaîne ne doit pas changer le
+                    // filtre (#2218, D1).
+                    etage.resampler = match crate::audio::resample::new_streaming_resampler(
+                        new_sr, output_sr, output_ch,
                     ) {
                         Ok(r) => {
                             info!(
@@ -6531,6 +6560,11 @@ mod pcm_materiel_a_la_resolution_i1655;
 #[cfg(test)]
 mod empreinte_du_puits_r1;
 
+/// REF-8 (#2219) — l'empreinte du bras CoreAudio sur le chemin décoder →
+/// étage → boucle commune → puits, relevée sur la route directe d'avant.
+#[cfg(test)]
+mod empreinte_coreaudio_f70496;
+
 /// T8 de #2218 — le puits de capture branché sur une VRAIE piste.
 ///
 /// R1 garde la conversion contre des relevés pris sur la version d'avant ; T1
@@ -6539,6 +6573,17 @@ mod empreinte_du_puits_r1;
 /// décodeur de référence. Voir son en-tête pour ce qu'il ne couvre pas.
 #[cfg(test)]
 mod capture_bout_en_bout_2218;
+
+/// REF-8 (#2219) — les empreintes du bras WASAPI, relevées AVANT son passage
+/// au puits natif (`49ecf1fe`) : 16 bits identité, 24 bits identité, DoP.
+#[cfg(test)]
+mod empreinte_wasapi_f70496;
+
+/// REF-8 (#2219) — les empreintes des deux routes du bras ASIO, relevées AVANT
+/// son passage au trait (`49ecf1fe`) : route native 16 et 24 bits identité,
+/// DoP, volume ; route flottante 16 bits par l'étage de R1, refus DoP.
+#[cfg(test)]
+mod empreinte_asio_f70496;
 
 /// REF-6b (#2219) — l'étage dit ce qu'il fait, et `LocalOutput` le publie.
 #[cfg(test)]

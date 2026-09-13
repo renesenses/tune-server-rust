@@ -279,6 +279,20 @@ impl AutoFixEngine {
     }
 }
 
+/// ⚠️ Le `t.file_path IS NOT NULL` de cette requête n'est PAS un filtre global.
+///
+/// C'est la garde d'UN disjoint sur six — celui qui repère une piste dont le
+/// chemin ne descend pas du dossier de son album. Les pistes de feuille CUE
+/// (`file_path = NULL`) entrent déjà par les cinq autres : titre vide,
+/// « Unknown Artist », numéro de disque absent, numéro de piste manquant ou en
+/// double, dossier d'album ambigu. Cette passe n'est donc **pas** aveugle aux
+/// pistes CUE, contrairement aux sélections que #3998 a corrigées.
+///
+/// Et l'élargir n'apporterait rien : le sujet du disjoint — un fichier rangé
+/// hors du dossier de son album — n'existe pas pour une tranche. L'album CUE
+/// est créé PAR le dossier de son image (`scanner::cue_bibliotheque`) : les
+/// deux coïncident par construction, le test serait toujours faux. Les quinze
+/// tranches basculeraient d'ailleurs ensemble, n'ajoutant aucune information.
 fn find_defective_tracks(repo: &TrackRepo) -> Vec<i64> {
     let db = repo.backend();
     db.query_many(

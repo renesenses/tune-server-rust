@@ -42,7 +42,12 @@ pub fn router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(MAX_TOTAL_BYTES)),
         )
         .route("/tickets/{id}", get(detail))
-        .route("/tickets/{id}/reply", post(reply))
+        .route(
+            "/tickets/{id}/reply",
+            // Même plafond qu'à l'ouverture : une réponse peut porter les mêmes
+            // pièces jointes que le premier message (#3871).
+            post(reply).layer(DefaultBodyLimit::max(MAX_TOTAL_BYTES)),
+        )
         // Dernier appel du support que le client web adressait encore en direct
         // à mozaiklabs.fr, clé de licence dans le corps (#2559).
         .route("/tickets/{id}/read", post(mark_read))
@@ -95,12 +100,7 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
         Err(resp) => return resp,
     };
 
-    let is_multipart = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.starts_with("multipart/form-data"))
-        .unwrap_or(false);
+    let is_multipart = est_multipart(&req);
 
     // Les en-têtes sont copiés AVANT l'extraction du corps, qui consomme la
     // requête : sans eux, `Accept-Language` serait perdu et un 429 repartirait
@@ -112,6 +112,15 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     } else {
         create_json(state, auth, req, headers).await
     }
+}
+
+/// Le corps entrant est-il un `multipart/form-data` ?
+fn est_multipart(req: &Request) -> bool {
+    req.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.starts_with("multipart/form-data"))
+        .unwrap_or(false)
 }
 
 /// Chemin JSON historique — ticket sans pièce jointe.
@@ -154,21 +163,84 @@ async fn create_multipart(
     req: Request,
     headers: HeaderMap,
 ) -> Response {
-    let mut multipart = match req.extract::<Multipart, _>().await {
+    let multipart = match req.extract::<Multipart, _>().await {
         Ok(m) => m,
         Err(rej) => return rej.into_response(),
     };
 
-    let mut fields: Vec<(String, String)> = Vec::new();
-    let mut files: Vec<support::AttachmentUpload> = Vec::new();
-    let mut has_subject = false;
-    let mut has_body = false;
+    let relais = match lire_multipart(multipart, CHAMPS_CREATION).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    if !relais.porte("subject") || !relais.porte("body") {
+        return client_error(
+            "missing_fields",
+            "Le sujet et la description sont obligatoires.",
+        );
+    }
+
+    let base = base_url(&state);
+    finish(
+        support::create_ticket_multipart(
+            &state.http_client,
+            &auth,
+            relais.fields,
+            relais.files,
+            base.as_deref(),
+        )
+        .await,
+        &headers,
+    )
+}
+
+/// Champs texte relayés à l'OUVERTURE d'un ticket, liste blanche de
+/// `StoreSupportTicketRequest`.
+const CHAMPS_CREATION: &[&str] = &["subject", "body", "category", "zone", "system", "logs"];
+
+/// Champs texte relayés sur une RÉPONSE. `ReplySupportTicketRequest` n'en
+/// valide qu'un — le corps ; tout le reste serait ignoré côté mozaiklabs, on
+/// ne l'émet donc pas.
+const CHAMPS_REPONSE: &[&str] = &["body"];
+
+/// Ce qu'un `multipart/form-data` entrant a livré, une fois validé.
+struct RelaisMultipart {
+    /// Champs texte de la liste blanche, dans l'ordre reçu.
+    fields: Vec<(String, String)>,
+    /// Pièces jointes, nombre / taille / type déjà vérifiés.
+    files: Vec<support::AttachmentUpload>,
+    /// Noms des champs de la liste blanche reçus NON VIDES.
+    renseignes: Vec<String>,
+}
+
+impl RelaisMultipart {
+    fn porte(&self, nom: &str) -> bool {
+        self.renseignes.iter().any(|n| n == nom)
+    }
+}
+
+/// Lit un `multipart/form-data` entrant, commun à l'ouverture d'un ticket et à
+/// la réponse à un ticket.
+///
+/// Valide nombre, taille et type des fichiers **avant** de relayer, pour rendre
+/// un message clair plutôt qu'un 422 amont. Ne retient des champs texte que
+/// ceux d'`autorises` : `tune_version` et `platform` fournis par un client sont
+/// ignorés — ils sont injectés côté serveur, jamais dictés par la page.
+async fn lire_multipart(
+    mut multipart: Multipart,
+    autorises: &[&str],
+) -> Result<RelaisMultipart, Response> {
+    let mut out = RelaisMultipart {
+        fields: Vec::new(),
+        files: Vec::new(),
+        renseignes: Vec::new(),
+    };
 
     loop {
         let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return client_error("invalid_multipart", &e.to_string()),
+            Err(e) => return Err(client_error("invalid_multipart", &e.to_string())),
         };
 
         let name = field.name().unwrap_or("").to_string();
@@ -179,69 +251,49 @@ async fn create_multipart(
             Some(fname) if !fname.is_empty() => {
                 // Rejets AVANT de bufferiser le contenu : trop de fichiers, ou
                 // extension non autorisée.
-                if files.len() >= MAX_FILES {
-                    return client_error(
+                if out.files.len() >= MAX_FILES {
+                    return Err(client_error(
                         "too_many_attachments",
                         "Trop de pièces jointes : 5 fichiers au maximum.",
-                    );
+                    ));
                 }
                 let ext = ext_of(&fname);
                 if !ext_allowed(&ext) {
-                    return client_error(
+                    return Err(client_error(
                         "attachment_type",
                         &format!("Type de fichier non autorisé : « {fname} »."),
-                    );
+                    ));
                 }
                 let bytes = match field.bytes().await {
                     Ok(b) => b,
-                    Err(e) => return client_error("attachment_read", &e.to_string()),
+                    Err(e) => return Err(client_error("attachment_read", &e.to_string())),
                 };
                 if bytes.len() > MAX_FILE_BYTES {
-                    return payload_too_large(&fname);
+                    return Err(payload_too_large(&fname));
                 }
                 let content_type = declared_ct.unwrap_or_else(|| mime_for(&ext).to_string());
-                files.push(support::AttachmentUpload {
+                out.files.push(support::AttachmentUpload {
                     file_name: fname,
                     content_type,
                     bytes: bytes.to_vec(),
                 });
             }
             _ => {
-                // Champ texte : liste blanche relayée telle quelle. On ignore
-                // tune_version/platform d'un client (injectés côté serveur).
                 let value = match field.text().await {
                     Ok(v) => v,
-                    Err(e) => return client_error("invalid_field", &e.to_string()),
+                    Err(e) => return Err(client_error("invalid_field", &e.to_string())),
                 };
-                match name.as_str() {
-                    "subject" => {
-                        has_subject = !value.trim().is_empty();
-                        fields.push((name, value));
+                if autorises.contains(&name.as_str()) {
+                    if !value.trim().is_empty() {
+                        out.renseignes.push(name.clone());
                     }
-                    "body" => {
-                        has_body = !value.trim().is_empty();
-                        fields.push((name, value));
-                    }
-                    "category" | "zone" | "system" | "logs" => fields.push((name, value)),
-                    _ => {}
+                    out.fields.push((name, value));
                 }
             }
         }
     }
 
-    if !has_subject || !has_body {
-        return client_error(
-            "missing_fields",
-            "Le sujet et la description sont obligatoires.",
-        );
-    }
-
-    let base = base_url(&state);
-    finish(
-        support::create_ticket_multipart(&state.http_client, &auth, fields, files, base.as_deref())
-            .await,
-        &headers,
-    )
+    Ok(out)
 }
 
 /// 400 Bad Request avec un code machine + un message FR lisible par l'UI.
@@ -544,15 +596,48 @@ async fn detail(
     )
 }
 
-async fn reply(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(payload): Json<ReplyBody>,
-) -> Response {
+/// Répond à un ticket. Deux formats, comme à l'ouverture : `application/json`
+/// (chemin historique, corps seul) ou `multipart/form-data` (avec
+/// `attachments[]`).
+///
+/// Le multipart manquait. mozaiklabs accepte pourtant les pièces jointes sur ce
+/// chemin depuis toujours (`ReplySupportTicketRequest`, `AddSupportMessage`) :
+/// c'est ici que la chaîne s'arrêtait, et c'est pourquoi le PREMIER message
+/// d'un testeur pouvait porter son journal quand le DEUXIÈME ne pouvait rien
+/// porter — pas même jusqu'au ticket que le SAV lit (#3871).
+///
+/// ⚠️ Ce qui reste hors de ce dépôt : que ce deuxième message apparaisse sur le
+/// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
+/// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
+async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request) -> Response {
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
+    };
+
+    let is_multipart = est_multipart(&req);
+    // Copiés avant l'extraction du corps, qui consomme la requête (#2178).
+    let headers = req.headers().clone();
+
+    if is_multipart {
+        reply_multipart(state, auth, id, req, headers).await
+    } else {
+        reply_json(state, auth, id, req, headers).await
+    }
+}
+
+/// Chemin JSON historique — réponse sans pièce jointe. C'est le seul que les
+/// clients déployés connaissent : il ne bouge pas.
+async fn reply_json(
+    state: AppState,
+    auth: support::SupportAuth,
+    id: i64,
+    req: Request,
+    headers: HeaderMap,
+) -> Response {
+    let payload = match req.extract::<Json<ReplyBody>, _>().await {
+        Ok(Json(p)) => p,
+        Err(rej) => return rej.into_response(),
     };
     let base = base_url(&state);
     finish(
@@ -561,6 +646,47 @@ async fn reply(
             &auth,
             id,
             &payload.body,
+            base.as_deref(),
+        )
+        .await,
+        &headers,
+    )
+}
+
+/// Chemin multipart — réponse AVEC pièces jointes. Mêmes bornes qu'à
+/// l'ouverture (5 fichiers, 50 Mo, même liste blanche d'extensions), parce que
+/// c'est la même règle Laravel de l'autre côté.
+async fn reply_multipart(
+    state: AppState,
+    auth: support::SupportAuth,
+    id: i64,
+    req: Request,
+    headers: HeaderMap,
+) -> Response {
+    let multipart = match req.extract::<Multipart, _>().await {
+        Ok(m) => m,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let relais = match lire_multipart(multipart, CHAMPS_REPONSE).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // Refusé ici plutôt qu'en 422 amont : la règle est connue, et un
+    // aller-retour réseau pour l'apprendre ne sert personne.
+    if !relais.porte("body") {
+        return client_error("missing_fields", "La réponse ne peut pas être vide.");
+    }
+
+    let base = base_url(&state);
+    finish(
+        support::reply_multipart(
+            &state.http_client,
+            &auth,
+            id,
+            relais.fields,
+            relais.files,
             base.as_deref(),
         )
         .await,

@@ -11,6 +11,12 @@ qui affirme le comportement attendu, à dé-ignorer par le correctif.
 
 Relevé du 12/09/2026 sur `origin/batch/bugs-12` à `49ecf1fe`, rubato 3.0.0.
 
+> **Mise à jour du 13/09/2026 — D1 est corrigé.** Tout ce qui suit jusqu'à
+> « Contre-épreuves » décrit l'état du 12/09, c'est-à-dire **avant** le
+> correctif ; il est conservé tel quel parce que c'est la mesure qui a motivé
+> le changement. Les chiffres d'aujourd'hui, le coût CPU, la latence et ce qui
+> reste ouvert sont dans « [Correctif du 13/09](#correctif-du-1309--d1-est-corrigé) ».
+
 ## Pourquoi une référence
 
 Le bilan du 12/09 : « le rééchantillonnage n'a aucune référence externe ; il
@@ -168,6 +174,208 @@ LSB d'un mot de 14,6 bits. Témoins :
   seulement la cadence PCM qu'il produit.
 * Le chemin en flux avec changement de cadence en cours de route
   (`set_resample_ratio`) : non exercé.
+
+## Correctif du 13/09 — D1 est corrigé
+
+Mesuré sur Shrek, `fix/src-bande-20khz-f70496` sur
+`origin/batch/refonte-coeur-2` (`e818f2f7`), rubato 3.0.0.
+
+### Ce qui était faux, et de quelle grandeur
+
+Deux décisions se trompaient d'unité dans `new_streaming_resampler` :
+
+1. **Le noyau était choisi sur le RAPPORT des cadences.** La largeur de
+   transition d'un noyau sinc est fixée par sa **durée**, `sinc_len / from_sr`,
+   donc elle vaut `K · from_sr / sinc_len` hertz — le rapport n'y entre pas. Et
+   la bande utile disponible est bornée par la **plus basse** des deux cadences.
+   Or 44,1 kHz est le cas le plus dur de tout l'audio : 20 kHz y occupent 90,7 %
+   de Nyquist, il ne reste que 2 050 Hz pour toute la transition. Un rapport
+   proche de 1 — 44,1 → 48 — tombait donc dans la branche « 128 », la plus
+   courte, exactement là où il fallait la plus longue.
+2. **La sortie locale ne suivait pas.** `outputs/local.rs` tenait **deux
+   copies** de la table de paramètres, restées aux **32/64 coefficients**
+   d'avant #2711 : le correctif de l'époque n'avait touché que
+   `audio/resample.rs`. Le chemin du DAC rééchantillonnait donc deux fois plus
+   court que le convertisseur de fichiers. Les deux copies sont supprimées ;
+   `new_streaming_resampler` est le seul constructeur du dépôt.
+
+### Le choix, et pourquoi
+
+`FENETRE = Blackman2`, et la longueur retenue est **la première du barème
+{128, 256, 512, 1024} dont la bande à −0,1 dB atteint 20 500 Hz** (20 kHz
+promis + 500 Hz de marge), calculée par
+
+```
+bande(N) = calculate_cutoff(N, Blackman²) · min(from, to)/2  −  2,82 · from / N
+```
+
+Le premier terme est relatif à la cadence la plus **basse** (rubato met sa
+coupure à l'échelle du rapport en descente) ; le second à la cadence
+d'**entrée**, parce que la transition est fixée par la durée du noyau. La
+constante 2,82 est relevée sur ce banc : elle prédit les sept rapports mesurés
+**à moins de 40 Hz près**.
+
+Sur les sept rapports du banc, le barème donne 256 partout sauf 192 → 44,1
+(512). Le témoin `le_choix_du_noyau_suit_la_cadence_la_plus_basse` l'exerce sur
+les **8 × 7 couples** de cadences que le produit annonce, et c'est lui qui a
+trouvé un trou qu'aucun des sept rapports ne mesure : **352,8 et 384 → 44,1
+kHz** — le PCM de DSD256 servi à une zone à la cadence du CD — ne rendent que
+19 698 et 19 526 Hz même à 512 coefficients. Ce sont les couples les plus durs
+du jeu : Nyquist bas à 22,05 kHz (2 050 Hz pour toute la transition) **et** un
+noyau qui, à 352,8 kHz d'entrée, ne dure que 1,45 ms à 512 coefficients. D'où
+le quatrième barreau, **1 024**, qui les porte à 20 873 et 20 786 Hz. Il ne
+sert qu'à eux ; 128 ne suffit, lui, à **aucun** couple du produit.
+
+### Les combinaisons essayées
+
+Mesurées sur 44,1 → 48 (le couple contraignant), même instrumentation :
+
+| configuration | gain 20 kHz | bande −0,1 dB | réjection |
+|---|---|---|---|
+| BH² N=128 (**avant**) | −10,31 dB | 18 550 Hz | −109,8 dB |
+| BH² N=256 | −0,00 dB | 20 300 Hz | −115,8 dB |
+| BH² N=384 | −0,00 dB | 20 900 Hz | −116,9 dB |
+| BH² N=512 | −0,00 dB | 21 200 Hz | −109,6 dB |
+| BH² N=256, `f_cutoff` = 0,970 | −0,00 dB | 20 800 Hz | −116,2 dB |
+| BH N=128 | −0,31 dB | 19 850 Hz | −106,2 dB |
+| BH N=256 | −0,00 dB | 20 950 Hz | −108,8 dB |
+| Blackman² N=128 | −1,66 dB | 19 450 Hz | −108,5 dB |
+| Blackman² N=192 | −0,00 dB | 20 350 Hz | −111,9 dB |
+| **Blackman² N=256 (retenu)** | **−0,00 dB** | **20 750 Hz** | **−116,4 dB** |
+| Blackman² N=384 | −0,00 dB | 21 200 Hz | −115,8 dB |
+| Blackman² N=512 | 0,00 dB | 21 400 Hz | −109,5 dB |
+| Blackman² N=256, `f_cutoff` = 0,975 | −0,00 dB | 21 050 Hz | −113,8 dB |
+| Blackman² N=256, `oversampling` = 512 | 0,00 dB | 20 750 Hz | **−126,2 dB** |
+
+Lecture : à longueur égale, **Blackman² bat Blackman-Harris² de 450 Hz de
+bande utile pour la même réjection** (sa constante de coupure vaut 9,51 contre
+13,75, pour un plancher de lobes qui reste sous −110 dB). Relever `f_cutoff`
+à la main gagne encore 300 Hz mais rogne la réserve de bande d'arrêt sans
+qu'aucun rapport n'en ait besoin : écarté. `oversampling_factor = 512` gagne
+7 à 10 dB de réjection en montée pour **zéro** opération de plus — mais double
+la table (512 Kio balayés à chaque échantillon), et Tune tourne aussi sur
+Raspberry Pi ; la réjection est déjà au-delà des 100 dB visés, donc écarté
+aussi. Il reste disponible si un besoin apparaît.
+
+### Avant / après, les sept rapports
+
+| rapport | noyau av. → ap. | gain 20 kHz av. → ap. | bande −0,1 dB av. → ap. | réjection av. → ap. |
+|---|---|---|---|---|
+| 44,1 → 48 | 128 → 256 | **−10,31 → −0,00 dB** | **18 550 → 20 750 Hz** | −109,8 → −116,4 dB |
+| 48 → 44,1 | 128 → 256 | **−9,90 → −0,00 dB** | **18 450 → 20 700 Hz** | −139,9 → −122,6 dB |
+| 44,1 → 96 | 128 → 256 | **−10,31 → −0,00 dB** | **18 550 → 20 750 Hz** | −110,5 → −111,1 dB |
+| 96 → 48 | 128 → 256 | **−0,92 → +0,00 dB** | **18 950 → 22 050 Hz** | −157,1 → −134,1 dB |
+| 44,1 → 192 | 128 → 256 | **−10,31 → −0,00 dB** | **18 550 → 20 750 Hz** | −110,5 → −111,1 dB |
+| 176,4 → 48 (DSD64) | 256 → 256 | −0,03 → −0,00 dB | 20 400 → 21 150 Hz | −144,9 → −144,3 dB |
+| 192 → 44,1 | 512 → 512 | −0,04 → −0,00 dB | 20 200 → 20 600 Hz | −145,1 → −145,8 dB |
+
+Les deux derniers rapports gardent leur noyau : **seule la fenêtre change**, et
+elle leur rend tout de même 750 et 400 Hz de bande.
+
+La réjection baisse là où elle était très large (96 → 48 : −157 → −134 dB ;
+48 → 44,1 : −140 → −123 dB) parce qu'une transition plus raide rapproche la
+bande d'arrêt. Elle reste partout **au-delà de 111 dB**, soit 11 dB de marge
+sur le seuil audiophile de 100 dB, et sous le plancher d'un mot de 24 bits
+(−144 dBFS) sur les quatre rapports en descente.
+
+### Erreur RMS et THD+N
+
+| rapport | erreur RMS 1 kHz av. → ap. | THD+N av. → ap. |
+|---|---|---|
+| 44,1 → 48 | −108,4 → **−121,4 dB** | −140,2 → −136,8 dB |
+| 48 → 44,1 | −105,0 → **−118,1 dB** | −140,1 → −138,2 dB |
+| 44,1 → 96 | −108,4 → **−121,4 dB** | −139,8 → −136,1 dB |
+| 96 → 48 | −99,1 → **−88,4 dB** | −146,8 → −146,3 dB |
+| 44,1 → 192 | −108,4 → **−121,4 dB** | −139,6 → −135,9 dB |
+| 176,4 → 48 | −99,4 → **−102,0 dB** | −143,1 → −144,5 dB |
+| 192 → 44,1 | −87,8 → **−85,4 dB** | −144,1 → −144,6 dB |
+
+Cinq rapports sur sept gagnent 13 dB. **Deux régressent** : 96 → 48 de 10,7 dB
+et 192 → 44,1 de 2,4 dB. Il faut le dire précisément : dans les deux cas
+l'écart est **entièrement un gain scalaire en bande** — +0,00033 dB (0,0038 %)
+en 96 → 48, −0,00047 dB en 192 → 44,1 — et non de la distorsion : le THD+N est
+inchangé, à −146,3 et −144,6 dB. C'est exactement le défaut **D3**, la
+normalisation de gain de la fenêtre, qui n'est pas traité ici.
+
+### Coût CPU et latence
+
+5 minutes de stéréo, blocs de 1 024 trames, `--release` sur Shrek :
+
+| chemin | avant | après | rapport | débit après |
+|---|---|---|---|---|
+| partagé, 44,1 → 48 (N=128 → 256) | 1,422 s | 2,150 s | **×1,51** | 140 × temps réel |
+| sortie locale, 44,1 → 48 (N=64 → 256) | 1,030 s | 2,150 s | **×2,09** | 140 × temps réel |
+| partagé, 96 → 48 (N=128 → 256) | 1,193 s | 1,768 s | **×1,48** | 170 × temps réel |
+| sortie locale, 96 → 48 (N=64 → 256) | 0,904 s | 1,768 s | **×1,96** | 170 × temps réel |
+
+Le chemin partagé reste **sous 2 ×**, la cible annoncée. La sortie locale paie
+2,09 × parce qu'elle partait de 64 coefficients — un noyau qui ne tenait aucune
+des promesses du produit. Dans l'absolu on reste à **140 × le temps réel** pour
+un cœur : le rééchantillonnage occupe 0,7 % d'un cœur par zone.
+
+Latence (délai de groupe, `output_delay()`) :
+
+| chemin | avant | après |
+|---|---|---|
+| partagé, 44,1 → 48 | 69 trames · 1,44 ms | 139 trames · 2,90 ms |
+| sortie locale, 44,1 → 48 | 34 trames · 0,71 ms | 139 trames · 2,90 ms |
+| partagé, 96 → 48 | 32 trames · 0,67 ms | 64 trames · 1,33 ms |
+| sortie locale, 96 → 48 | 16 trames · 0,33 ms | 64 trames · 1,33 ms |
+
+Au pire **+2,2 ms**, une fois pour toute la chaîne sur le chemin en flux (le
+rééchantillonneur y survit d'une piste à l'autre).
+
+### Ce que le correctif change dans le rendu, et ce qu'il ne change pas
+
+**Il change le son, volontairement.** Deux empreintes de R1
+(`empreinte_du_puits_r1.rs`) sont remesurées :
+`EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000` (`0x4491…a9ee` →
+`0x7d6d…4f8d`) et `EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE`
+(`0x8c1c…9aaa` → `0x6cc3…25ed`). C'est le **filtre**, pas l'ordre des étages :
+le compte de mots de la chaîne complète est inchangé (8 914), et il serait le
+premier à sauter si l'ordre avait bougé. Ces deux témoins injectaient jusqu'ici
+leur propre noyau de 64 coefficients, une valeur qui n'existait plus en
+production — ils imageaient un filtre imaginaire ; ils prennent désormais
+`new_streaming_resampler`.
+
+**Il ne touche à rien d'autre**, et c'est vérifié plutôt qu'affirmé :
+
+* `EMPREINTE_IDENTITE_16_BITS_STEREO` et
+  `EMPREINTE_ADAPTATION_STEREO_VERS_MONO` **n'ont pas bougé d'un bit** : ni le
+  chemin identité — celui de l'immense majorité des lectures — ni l'adaptation
+  de canaux ne traversent le rééchantillonneur.
+* Les trois empreintes de T8 (`capture_bout_en_bout_2218.rs`) sont
+  **inchangées et n'ont pas été touchées** : ce banc monte sa chaîne en
+  44,1 kHz vers une sortie 44,1 kHz, il ne rééchantillonne jamais.
+* **Le bit-perfect et le DoP ne passent pas par le rééchantillonneur** :
+  `versioned_dop_fixture_*`, `native_windows_ring_*` et
+  `un_porteur_dop_refuse_n_ecrit_rien_dans_le_puits` passent sans retouche. Le
+  porteur DoP est même refusé *avant* l'écriture (#3233) — il ne survivrait ni
+  au sinc ni à l'adaptation de canaux.
+
+**Ce correctif doit être écouté avant publication** (Mac et .42) : c'est le
+premier changement de rendu délibéré du chemin de lecture.
+
+### Témoins dé-ignorés
+
+Les 5 témoins D1 passent au vert et sont exécutés :
+`audiophile_bande_20k_{44_1_vers_48, 48_vers_44_1, 44_1_vers_96, 96_vers_48,
+44_1_vers_192}`. `audiophile_erreur_1k_176_4_vers_48` passe aussi
+(−99,4 → −102,0 dB) : 6 en tout. Il reste **9 ignorés** : D2 (7) et D3 (2,
+avec leurs motifs remis à jour).
+
+### Ce qui reste, et n'est pas traité ici
+
+* **D2** — `rubato_resample_track` retire `⌊sinc_len/2·ratio⌋` trames alors
+  que le délai vrai vaut `(sinc_len/2 − 1/256)·ratio − 1` : il reste −0,17 à
+  −1,00 trame de décalage, une trame entière perdue en tête en 96 → 48.
+  Inchangé par ce correctif (le délai résiduel bouge avec le noyau, le défaut
+  non).
+* **D3** — l'erreur en bande reste au-dessus de −100 dB sur 96 → 48
+  (−88,4 dB) et 192 → 44,1 (−85,4 dB), et ce correctif l'a **aggravée** sur ces
+  deux-là. C'est un gain scalaire, pas de la distorsion. Piste inchangée :
+  `oversampling_factor`, ou une normalisation explicite du gain continu du
+  noyau.
 
 ## Contre-épreuves
 

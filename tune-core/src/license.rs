@@ -740,10 +740,19 @@ impl LicenseManager {
         GRACE_PERIOD_DAYS
     }
 
-    /// Zone limit for the free tier (exposed for UI display).
-    pub fn free_zone_limit(&self) -> i64 {
-        self.free_max_zones
-    }
+    // Ce qui se trouvait ici s'appelait `free_zone_limit()` et rendait
+    // `self.free_max_zones` **sans regarder le palier** (#3673). Il n'avait
+    // plus aucun appelant de production — exactement l'état de feu
+    // `check_zone_limit`, et le même danger : la première interface qui s'en
+    // serait servie aurait affiché « 3 zones » à un abonné Premium, pendant
+    // que `/system/config` et `/cloud/license/status` lui annonçaient
+    // « illimité ». Un second lecteur du chiffre, écrit mais pas branché,
+    // n'attend qu'un appelant pour redevenir une seconde règle.
+    //
+    // La question « quel plafond s'applique ici ? » se pose désormais à
+    // [`LicenseManager::limite_zones`], qui connaît le palier et rend `None`
+    // pour Premium ; « où en est-on de ce plafond ? » à
+    // [`LicenseManager::plafond_zones`], qui connaît en plus l'assiette.
 }
 
 // ---------------------------------------------------------------------------
@@ -1594,7 +1603,6 @@ mod tests {
         assert!(!mgr.is_premium().await);
         assert!(!mgr.check_feature(Feature::DspEq).await);
         // Free tier is capped at the configured limit (3 here).
-        assert_eq!(mgr.free_zone_limit(), 3);
         assert_eq!(mgr.limite_zones().await, Some(3));
         // Le plafond mesure lui-même son assiette (#3673) : ce n'est plus
         // l'appelant qui annonce un nombre, c'est la base qui le dit.
@@ -1633,14 +1641,28 @@ mod tests {
         assert!(p.atteint(), "3 zones jouees sur un plafond de 3 = atteint");
     }
 
+    /// Le plafond par défaut est 3 — le chiffre que la page tarifaire annonce
+    /// — et il est rendu par la SEULE lecture qui connaisse le palier.
+    /// S'appelait `free_zone_limit_defaults_to_three` et interrogeait
+    /// `free_zone_limit()`, un lecteur aveugle au palier (#3673).
     #[tokio::test]
-    async fn free_zone_limit_defaults_to_three() {
+    async fn le_plafond_par_defaut_est_trois_et_disparait_en_premium() {
         let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let mgr = LicenseManager::new(backend);
-        assert_eq!(mgr.free_zone_limit(), 3);
+        assert_eq!(mgr.limite_zones().await, Some(3));
+
+        // La même question posée à un serveur Premium ne rend PAS un nombre.
+        // C'est ce que `free_zone_limit()` était incapable de dire : il aurait
+        // répondu « 3 » ici aussi.
+        mgr.update_from_server(Tier::Premium, None).await;
+        assert_eq!(
+            mgr.limite_zones().await,
+            None,
+            "Premium doit etre illimite, pas plafonne au chiffre du gratuit"
+        );
     }
 
     #[tokio::test]

@@ -353,3 +353,208 @@ fn un_producteur_un_consommateur_ne_perdent_ni_ne_reordonnent_rien() {
         assert_eq!(*v, i as f32, "echantillon {i} perdu, duplique ou reordonne");
     }
 }
+
+// ---------------------------------------------------------------------------
+// REF-8 (#2219) — la chaîne de PRODUCTION du puits natif, de bout en bout.
+//
+// Les empreintes de `empreinte_wasapi_f70496.rs` et `empreinte_asio_f70496.rs`
+// s'arrêtent à `CaptureOutputNatif` : un puits de TEST. Les témoins
+// `native_windows_ring_*` de `tests.rs` partent, eux, de mots `i32` écrits à
+// la main. Entre les deux il restait un trou, et c'est le trou par lequel le
+// son passe réellement sous Windows :
+//
+//     EtageNatif → PuitsAnneauNatif → NativePcmRing → pop_pcm_bytes
+//
+// C'est-à-dire le puits que `BackendWasapi::puits` et `BackendAsio::puits`
+// rendent VRAIMENT (`Puits::Natif(PuitsAnneauNatif::sur(…))`), posé sur
+// l'anneau que le fil de rendu draine. Personne ne le montait dans un test.
+// Ces gardes le montent, et vérifient que les octets source ressortent à
+// l'identique de l'autre côté de l'anneau.
+// ---------------------------------------------------------------------------
+
+use super::etage_natif::{EtageNatif, PuitsAnneauNatif, spec_du_puits_natif};
+use crate::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm, PuitsNatif};
+
+/// Le DSP au repos : ni EQ, ni convolveur, ni crossfeed, volume à l'unité.
+/// L'étage doit alors conserver les octets source bit à bit.
+struct DspAuReposNatif {
+    eq: std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: AtomicBool,
+    mono_downmix: AtomicBool,
+    volume: AtomicU32,
+}
+
+impl DspAuReposNatif {
+    fn neuf() -> Self {
+        Self {
+            eq: std::sync::Mutex::new(None),
+            convolver: std::sync::Mutex::new(None),
+            crossfeed: std::sync::Mutex::new(None),
+            pure_bypass: AtomicBool::new(false),
+            mono_downmix: AtomicBool::new(false),
+            volume: AtomicU32::new(1000),
+        }
+    }
+
+    fn etage(&self, spec: AudioSpec) -> EtageNatif<'_> {
+        EtageNatif::monter(
+            spec,
+            FormatOuvert::new(spec.cadence(), spec.canaux()),
+            &self.volume,
+            &self.eq,
+            &self.convolver,
+            &self.crossfeed,
+            &self.pure_bypass,
+            &self.mono_downmix,
+        )
+    }
+}
+
+fn spec_stereo(profondeur: ProfondeurPcm) -> AudioSpec {
+    AudioSpec::nouvelle(44_100, profondeur, 2).expect("stéréo 44,1 kHz")
+}
+
+/// Monte la chaîne de production réelle et rend ce que le fil de rendu
+/// lirait : `octets` traversent l'étage, le puits d'anneau, l'anneau, puis
+/// `pop_pcm_bytes(bit_depth)` — la resérialisation par les octets HAUTS.
+fn a_travers_l_anneau(octets: &[u8], profondeur: ProfondeurPcm) -> Vec<u8> {
+    let spec = spec_stereo(profondeur);
+    let dsp = DspAuReposNatif::neuf();
+    let mut etage = dsp.etage(spec);
+
+    // L'anneau et le puits que les deux bras Windows montent réellement.
+    let anneau = Arc::new(NativePcmRing::new(octets.len() * 4));
+    let (_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let paused = AtomicBool::new(false);
+    let force_silent = AtomicBool::new(false);
+    let mut puits = PuitsAnneauNatif::sur(
+        anneau.clone(),
+        spec_du_puits_natif(spec),
+        &stop_rx,
+        &paused,
+        &force_silent,
+    );
+
+    let ecriture = etage.decoder_et_pousser(octets, &mut puits);
+    assert!(
+        !matches!(
+            ecriture,
+            super::etage_natif::EcritureNative::PuitsMort { .. }
+        ),
+        "le puits d'anneau natif est mort pendant la poussée : l'anneau n'a pas \
+         accepté les mots de l'étage (REF-8, #2219)"
+    );
+    // La quarantaine 24 bits garde ses 32 premières trames tant que la sonde
+    // DoP n'a pas conclu ; le reliquat part brut, comme en production.
+    etage.vider(&mut puits);
+
+    let mut sortie = vec![0u8; octets.len()];
+    let ecrits = anneau.pop_pcm_bytes(&mut sortie, profondeur.bits_declares());
+    sortie.truncate(ecrits);
+    sortie
+}
+
+/// 16 bits identité : l'anneau rend les octets source, mot pour mot.
+#[test]
+fn la_chaine_de_production_natif_rend_le_16_bits_a_l_identique() {
+    let source: Vec<u8> = (0..256u32)
+        .flat_map(|i| ((i * 257) as u16).to_le_bytes())
+        .collect();
+    assert_eq!(
+        a_travers_l_anneau(&source, ProfondeurPcm::Entier16),
+        source,
+        "EtageNatif → PuitsAnneauNatif → NativePcmRing → pop_pcm_bytes a changé un octet \
+         en 16 bits : le rendu WASAPI/ASIO natif n'est plus bit-perfect (REF-8, #2219)"
+    );
+}
+
+/// 24 bits identité : trois octets par mot, alignés à gauche dans l'anneau,
+/// resérialisés par les octets HAUTS.
+#[test]
+fn la_chaine_de_production_natif_rend_le_24_bits_a_l_identique() {
+    let source: Vec<u8> = (0..256u32)
+        .flat_map(|i| {
+            let mot = i * 65_793;
+            [mot as u8, (mot >> 8) as u8, (mot >> 16) as u8]
+        })
+        .collect();
+    assert_eq!(
+        a_travers_l_anneau(&source, ProfondeurPcm::Entier24),
+        source,
+        "EtageNatif → PuitsAnneauNatif → NativePcmRing → pop_pcm_bytes a changé un octet \
+         en 24 bits : le rendu WASAPI/ASIO natif n'est plus bit-perfect (REF-8, #2219)"
+    );
+}
+
+/// Le porteur DoP versionné traverse la chaîne de production SANS qu'un
+/// marqueur bouge. C'est la fixture réelle de l'encodeur
+/// (`versioned_dop_fixture_is_the_real_encoder_output_byte_for_byte`), pas un
+/// signal fabriqué ici.
+#[test]
+fn la_chaine_de_production_natif_porte_le_dop_intact() {
+    let source: Vec<u8> = include_str!("../../../tests/fixtures/dop_stereo_24le_64frames.hex")
+        .split_ascii_whitespace()
+        .map(|octet| u8::from_str_radix(octet, 16).expect("fixture DoP hexadécimale valide"))
+        .collect();
+    assert_eq!(
+        a_travers_l_anneau(&source, ProfondeurPcm::Entier24),
+        source,
+        "un marqueur DoP a bougé entre l'étage natif et `pop_pcm_bytes` : la route native \
+         DÉTRUIT le porteur au lieu de le porter (REF-8, #2219)"
+    );
+}
+
+/// CONTRE-ÉPREUVE du contrat de puits : un bloc dont le format contredit
+/// celui de l'ouverture doit TUER le puits (`ecrire` rend `false`), et non
+/// être poussé en silence dans l'anneau. Sans cette garde, un étage qui
+/// livrerait des mots 16 bits à un puits ouvert en `Entier32` remplirait
+/// l'anneau de bruit sans un mot dans le journal.
+#[test]
+fn le_puits_d_anneau_natif_refuse_un_bloc_qui_contredit_le_format_ouvert() {
+    let spec = spec_stereo(ProfondeurPcm::Entier24);
+    let anneau = Arc::new(NativePcmRing::new(1024));
+    let (_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    let paused = AtomicBool::new(false);
+    let force_silent = AtomicBool::new(false);
+    let mut puits = PuitsAnneauNatif::sur(
+        anneau.clone(),
+        spec_du_puits_natif(spec),
+        &stop_rx,
+        &paused,
+        &force_silent,
+    );
+
+    // Le bon format passe.
+    let mots = [0x1234_5600u32 as i32, -0x1234_5600i32];
+    let octets: Vec<u8> = mots.iter().flat_map(|m| m.to_le_bytes()).collect();
+    let bon = spec_du_puits_natif(spec);
+    assert!(
+        puits.ecrire(bon.bloc(&octets)),
+        "le puits doit accepter un bloc au format qu'il a ouvert"
+    );
+    assert_eq!(
+        anneau.available(),
+        2,
+        "les deux mots doivent être dans l'anneau"
+    );
+
+    // Le mauvais format tue le puits, et n'ajoute RIEN.
+    let mauvais = spec_stereo(ProfondeurPcm::Entier16);
+    assert!(
+        !puits.ecrire(mauvais.bloc(&octets)),
+        "un bloc qui contredit le format ouvert doit TUER le puits natif, pas être poussé \
+         en silence (REF-8, #2219)"
+    );
+    assert_eq!(
+        anneau.available(),
+        2,
+        "le bloc refusé ne doit pas avoir été poussé dans l'anneau"
+    );
+    // Le puits reste mort : il ne se rouvre pas au bloc suivant, même correct.
+    assert!(
+        !puits.ecrire(bon.bloc(&octets)),
+        "un puits tué par une rupture de contrat doit le RESTER"
+    );
+}

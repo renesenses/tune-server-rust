@@ -31,8 +31,8 @@
 //!
 //! 44,1 → 48, 48 → 44,1, 44,1 → 96, 96 → 48, 44,1 → 192, 176,4 → 48 (la
 //! sortie PCM de DSD64, `dsd_to_pcm::choose_output_rate`, vers une zone à
-//! 48 kHz) et 192 → 44,1 (seule branche `inv_ratio > 4` de
-//! `new_streaming_resampler`, 512 coefficients). Sur chacun : erreur RMS
+//! 48 kHz) et 192 → 44,1 (le seul rapport qui demande 512 coefficients à
+//! `parametres_sinc`). Sur chacun : erreur RMS
 //! contre la référence (sinus 1 kHz, balayage 20 Hz → 20 kHz), réponse en
 //! fréquence par impulsion (bande à −0,1 dB, réjection des images), réjection
 //! des repliements par un ton au-dessus de Nyquist de sortie, délai résiduel
@@ -54,7 +54,7 @@ use std::sync::OnceLock;
 
 use rubato::Resampler;
 use tune_core::audio::resample::{
-    new_streaming_resampler, rubato_resample_chunk, rubato_resample_track,
+    new_streaming_resampler, parametres_sinc, rubato_resample_chunk, rubato_resample_track,
 };
 
 // ───────────────────────────── la référence ─────────────────────────────
@@ -305,10 +305,19 @@ struct Rapport {
     de: u32,
     vers: u32,
     nom: &'static str,
-    /// `sinc_len` que `new_streaming_resampler` choisit pour ce rapport
-    /// (128 si `de/vers` ≤ 2, 256 si ≤ 4, 512 au-delà) — lu dans
-    /// `resample.rs`, sert à expliquer le délai résiduel mesuré.
-    sinc_len: usize,
+}
+
+impl Rapport {
+    /// Le noyau que la production choisit RÉELLEMENT pour ce rapport.
+    ///
+    /// C'était une constante recopiée ici, avec le barème de `resample.rs` en
+    /// commentaire. Le correctif D1 a changé ce barème — et la copie, elle,
+    /// n'aurait pas bougé : les témoins de délai auraient continué d'affirmer
+    /// un noyau qui n'existait plus, en vert. `parametres_sinc` est publique
+    /// pour cette raison.
+    fn sinc_len(self) -> usize {
+        parametres_sinc(self.de, self.vers).sinc_len
+    }
 }
 
 const RAPPORTS: [Rapport; 7] = [
@@ -316,49 +325,47 @@ const RAPPORTS: [Rapport; 7] = [
         de: 44_100,
         vers: 48_000,
         nom: "44,1 → 48 kHz",
-        sinc_len: 128,
     },
     Rapport {
         de: 48_000,
         vers: 44_100,
         nom: "48 → 44,1 kHz",
-        sinc_len: 128,
     },
     Rapport {
         de: 44_100,
         vers: 96_000,
         nom: "44,1 → 96 kHz",
-        sinc_len: 128,
     },
     Rapport {
         de: 96_000,
         vers: 48_000,
         nom: "96 → 48 kHz",
-        sinc_len: 128,
     },
     Rapport {
         de: 44_100,
         vers: 192_000,
         nom: "44,1 → 192 kHz",
-        sinc_len: 128,
     },
     Rapport {
         de: 176_400,
         vers: 48_000,
         nom: "176,4 → 48 kHz (PCM de DSD64)",
-        sinc_len: 256,
     },
     Rapport {
         de: 192_000,
         vers: 44_100,
         nom: "192 → 44,1 kHz",
-        sinc_len: 512,
     },
 ];
 
-/// Ce que chaque rapport rend AUJOURD'HUI (relevé sur Shrek, 12/09/2026,
-/// `49ecf1fe`). Les témoins affirment ces chiffres ; les tolérances sont
+/// Ce que chaque rapport rend AUJOURD'HUI (relevé sur Shrek, 13/09/2026,
+/// APRÈS le correctif D1 : fenêtre Blackman², noyau choisi sur la cadence la
+/// plus basse). Les témoins affirment ces chiffres ; les tolérances sont
 /// justifiées dans chaque message d'assertion.
+///
+/// La valeur d'avant est rappelée en commentaire sur chaque entrée : ces
+/// relevés-ci ne sont pas des seuils qu'on desserre, ce sont les mesures d'un
+/// filtre qui a délibérément changé.
 struct Attendu {
     /// Délai résiduel de la piste (trames de sortie, négatif = Tune en avance).
     delai: f64,
@@ -385,100 +392,118 @@ struct Attendu {
 }
 
 const ATTENDU: [Attendu; 7] = [
+    // 44,1 → 48 kHz — AVANT le correctif D1 : −10,31 dB à 20 kHz, bande
+    // 18 550 Hz, erreur RMS −108,4 dB, délai annoncé 69 (noyau 128).
     Attendu {
-        delai: -0.344,
-        err_sinus_db: -108.4,
-        thd_n_db: -140.2,
-        err_balayage_db: -94.6,
-        gain_20k_db: -10.31,
-        bande_hz: 18_550.0,
-        rejection_db: -109.8,
-        bord_debut_db: -57.2,
-        bord_fin_db: -58.2,
-        delai_annonce: 69,
-        vidage_trames: 2_229,
-        marge_queue: 2_083,
-    },
-    Attendu {
-        delai: -0.204,
-        err_sinus_db: -105.0,
-        thd_n_db: -140.1,
-        err_balayage_db: -85.2,
-        gain_20k_db: -9.90,
-        bande_hz: 18_450.0,
-        rejection_db: -139.9,
-        bord_debut_db: -57.8,
-        bord_fin_db: -61.4,
-        delai_annonce: 58,
-        vidage_trames: 1_882,
-        marge_queue: 998,
-    },
-    Attendu {
-        delai: -0.689,
-        err_sinus_db: -108.4,
-        thd_n_db: -139.8,
-        err_balayage_db: -94.6,
-        gain_20k_db: -10.31,
-        bande_hz: 18_550.0,
-        rejection_db: -110.5,
-        bord_debut_db: -54.2,
-        bord_fin_db: -54.0,
+        delai: -0.685,
+        err_sinus_db: -121.4,
+        thd_n_db: -136.8,
+        err_balayage_db: -108.4,
+        gain_20k_db: 0.0,
+        bande_hz: 20_750.0,
+        rejection_db: -116.4,
+        bord_debut_db: -64.0,
+        bord_fin_db: -63.4,
         delai_annonce: 139,
-        vidage_trames: 4_458,
-        marge_queue: 4_166,
+        vidage_trames: 2_229,
+        marge_queue: 2_013,
     },
+    // 48 → 44,1 kHz — AVANT : −9,90 dB à 20 kHz, bande 18 450 Hz, erreur RMS
+    // −105,0 dB, délai annoncé 58 (noyau 128).
+    Attendu {
+        delai: -0.404,
+        err_sinus_db: -118.1,
+        thd_n_db: -138.2,
+        err_balayage_db: -110.8,
+        gain_20k_db: 0.0,
+        bande_hz: 20_700.0,
+        rejection_db: -122.6,
+        bord_debut_db: -64.9,
+        bord_fin_db: -66.2,
+        delai_annonce: 117,
+        vidage_trames: 1_882,
+        marge_queue: 939,
+    },
+    // 44,1 → 96 kHz — AVANT : −10,31 dB à 20 kHz, bande 18 550 Hz, délai
+    // annoncé 139 (noyau 128).
+    Attendu {
+        delai: -0.369,
+        err_sinus_db: -121.4,
+        thd_n_db: -136.1,
+        err_balayage_db: -108.4,
+        gain_20k_db: 0.0,
+        bande_hz: 20_750.0,
+        rejection_db: -111.1,
+        bord_debut_db: -60.7,
+        bord_fin_db: -60.8,
+        delai_annonce: 278,
+        vidage_trames: 4_458,
+        marge_queue: 4_027,
+    },
+    // 96 → 48 kHz — AVANT : −0,92 dB à 20 kHz, bande 18 950 Hz, délai annoncé
+    // 32 (noyau 128). L'erreur RMS PASSE de −99,1 à −88,4 dB : voir le témoin
+    // `audiophile_erreur_1k_96_vers_48`, c'est un écart de GAIN en bande
+    // (+0,00033 dB), pas de la distorsion — le THD+N reste à −146,3 dB.
     Attendu {
         delai: -1.002,
-        err_sinus_db: -99.1,
-        thd_n_db: -146.8,
-        err_balayage_db: -83.0,
-        gain_20k_db: -0.92,
-        bande_hz: 18_950.0,
-        rejection_db: -157.1,
-        bord_debut_db: -66.0,
-        bord_fin_db: -64.8,
-        delai_annonce: 32,
+        err_sinus_db: -88.4,
+        thd_n_db: -146.3,
+        err_balayage_db: -88.4,
+        gain_20k_db: 0.0,
+        bande_hz: 22_050.0,
+        rejection_db: -134.1,
+        bord_debut_db: -74.0,
+        bord_fin_db: -73.5,
+        delai_annonce: 64,
         vidage_trames: 1_024,
-        marge_queue: 607,
+        marge_queue: 575,
     },
+    // 44,1 → 192 kHz — AVANT : −10,31 dB à 20 kHz, bande 18 550 Hz, délai
+    // annoncé 278 (noyau 128).
     Attendu {
-        delai: -0.378,
-        err_sinus_db: -108.4,
-        thd_n_db: -139.6,
-        err_balayage_db: -94.6,
-        gain_20k_db: -10.31,
-        bande_hz: 18_550.0,
-        rejection_db: -110.5,
-        bord_debut_db: -52.5,
-        bord_fin_db: -52.6,
-        delai_annonce: 278,
+        delai: -0.738,
+        err_sinus_db: -121.4,
+        thd_n_db: -135.9,
+        err_balayage_db: -108.4,
+        gain_20k_db: 0.0,
+        bande_hz: 20_750.0,
+        rejection_db: -111.1,
+        bord_debut_db: -61.1,
+        bord_fin_db: -61.0,
+        delai_annonce: 557,
         vidage_trames: 8_916,
-        marge_queue: 8_333,
+        marge_queue: 8_054,
     },
+    // 176,4 → 48 kHz — AVANT : −0,03 dB à 20 kHz, bande 20 400 Hz, erreur RMS
+    // −99,4 dB. Le noyau ne change PAS (256 avant comme après) : seule la
+    // fenêtre passe de Blackman-Harris² à Blackman², d'où 750 Hz de bande en
+    // plus et une erreur RMS qui passe enfin sous les −100 dB.
     Attendu {
         delai: -0.171,
-        err_sinus_db: -99.4,
-        thd_n_db: -143.1,
-        err_balayage_db: -99.2,
-        gain_20k_db: -0.03,
-        bande_hz: 20_400.0,
-        rejection_db: -144.9,
-        bord_debut_db: -74.0,
-        bord_fin_db: -74.5,
+        err_sinus_db: -102.0,
+        thd_n_db: -144.5,
+        err_balayage_db: -102.3,
+        gain_20k_db: 0.0,
+        bande_hz: 21_150.0,
+        rejection_db: -144.3,
+        bord_debut_db: -77.5,
+        bord_fin_db: -77.1,
         delai_annonce: 34,
         vidage_trames: 557,
         marge_queue: 448,
     },
+    // 192 → 44,1 kHz — AVANT : −0,04 dB à 20 kHz, bande 20 200 Hz. Noyau 512
+    // avant comme après ; seule la fenêtre change.
     Attendu {
         delai: -0.201,
-        err_sinus_db: -87.8,
-        thd_n_db: -144.1,
-        err_balayage_db: -87.8,
-        gain_20k_db: -0.04,
-        bande_hz: 20_200.0,
-        rejection_db: -145.1,
-        bord_debut_db: -76.6,
-        bord_fin_db: -79.5,
+        err_sinus_db: -85.4,
+        thd_n_db: -144.6,
+        err_balayage_db: -85.4,
+        gain_20k_db: 0.0,
+        bande_hz: 20_600.0,
+        rejection_db: -145.8,
+        bord_debut_db: -73.6,
+        bord_fin_db: -77.4,
         delai_annonce: 58,
         vidage_trames: 471,
         marge_queue: 294,
@@ -809,7 +834,7 @@ macro_rules! temoins_du_rapport {
                 // rend ⌊sinc_len/2 · ratio⌋ ; la piste retire ce dernier : reste
                 // (fraction − 1) ∈ (−1, 0], jamais nul.
                 let ratio = r.vers as f64 / r.de as f64;
-                let explique = ((r.sinc_len as f64 / 2.0 - 1.0 / 256.0) * ratio - 1.0)
+                let explique = ((r.sinc_len() as f64 / 2.0 - 1.0 / 256.0) * ratio - 1.0)
                     - m.delai_annonce as f64;
                 assert!(
                     (m.delai_1k - explique).abs() < 0.005,
@@ -903,7 +928,7 @@ macro_rules! temoins_du_rapport {
                     "{} : erreur RMS des 64 premières trames = {:.1} dB, attendu {:.1} ± 3 (la \
                      référence sonne 512 trames avant un départ dur, Tune {} : l'écart est \
                      attendu, sa VALEUR est surveillée)",
-                    r.nom, m.bord_debut_db, a.bord_debut_db, r.sinc_len / 2
+                    r.nom, m.bord_debut_db, a.bord_debut_db, r.sinc_len() / 2
                 );
                 assert!(
                     (m.bord_fin_db - a.bord_fin_db).abs() < 3.0,
@@ -1016,28 +1041,26 @@ fn affirme_erreur(i: usize) {
     );
 }
 
+// D1 est CORRIGÉ (13/09) : les cinq témoins ci-dessous étaient `#[ignore]`,
+// ils sont désormais exécutés. Ils ne demandent rien de nouveau — c'est le
+// même `affirme_bande` qu'avant, avec le même seuil de 20 kHz à −0,1 dB.
 #[test]
-#[ignore = "défaut connu : −10,3 dB à 20 kHz pour toute source 44,1 kHz (noyau 128, bande −0,1 dB = 18 550 Hz)"]
 fn audiophile_bande_20k_44_1_vers_48() {
     affirme_bande(0);
 }
 #[test]
-#[ignore = "défaut connu : −9,9 dB à 20 kHz en 48 → 44,1 kHz (bande −0,1 dB = 18 450 Hz)"]
 fn audiophile_bande_20k_48_vers_44_1() {
     affirme_bande(1);
 }
 #[test]
-#[ignore = "défaut connu : −10,3 dB à 20 kHz pour toute source 44,1 kHz (noyau 128, bande −0,1 dB = 18 550 Hz)"]
 fn audiophile_bande_20k_44_1_vers_96() {
     affirme_bande(2);
 }
 #[test]
-#[ignore = "défaut connu : −0,92 dB à 20 kHz en 96 → 48 kHz (bande −0,1 dB = 18 950 Hz)"]
 fn audiophile_bande_20k_96_vers_48() {
     affirme_bande(3);
 }
 #[test]
-#[ignore = "défaut connu : −10,3 dB à 20 kHz pour toute source 44,1 kHz (noyau 128, bande −0,1 dB = 18 550 Hz)"]
 fn audiophile_bande_20k_44_1_vers_192() {
     affirme_bande(4);
 }
@@ -1063,7 +1086,7 @@ fn audiophile_erreur_1k_44_1_vers_96() {
     affirme_erreur(2);
 }
 #[test]
-#[ignore = "défaut connu : −99,1 dB en 96 → 48 kHz, à 0,9 dB du seuil (gain en bande +0,0001 dB)"]
+#[ignore = "défaut connu, AGGRAVÉ par le correctif D1 : −88,4 dB en 96 → 48 kHz (était −99,1). L'écart est entièrement un gain en bande de +0,00033 dB (0,0038 %) — le THD+N reste à −146,3 dB, donc aucune distorsion ajoutée. C'est la normalisation de gain de la fenêtre, le même défaut que 192 → 44,1 ; il se traite à part"]
 fn audiophile_erreur_1k_96_vers_48() {
     affirme_erreur(3);
 }
@@ -1071,13 +1094,14 @@ fn audiophile_erreur_1k_96_vers_48() {
 fn audiophile_erreur_1k_44_1_vers_192() {
     affirme_erreur(4);
 }
+// Était `#[ignore]` à −99,4 dB, 0,6 dB sous le seuil. La fenêtre Blackman²
+// l'amène à −102,0 dB : le témoin s'exécute.
 #[test]
-#[ignore = "défaut connu : −99,4 dB en 176,4 → 48 kHz, à 0,6 dB du seuil (gain en bande −0,0001 dB)"]
 fn audiophile_erreur_1k_176_4_vers_48() {
     affirme_erreur(5);
 }
 #[test]
-#[ignore = "défaut connu : −87,8 dB en 192 → 44,1 kHz (gain en bande +0,00036 dB, noyau 512)"]
+#[ignore = "défaut connu : −85,4 dB en 192 → 44,1 kHz (était −87,8 ; gain en bande −0,00047 dB, noyau 512). Comme en 96 → 48, l'écart est un GAIN, pas une distorsion : THD+N à −144,6 dB"]
 fn audiophile_erreur_1k_192_vers_44_1() {
     affirme_erreur(6);
 }
