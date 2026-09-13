@@ -1906,11 +1906,45 @@ impl PlaybackOrchestrator {
         // le WAV que `dlna_needs_wav` impose déjà à un renderer sans
         // `audio/flac`, que ce prédicat renvoyait au fichier.
         let wav_diffusable = dsd_lpcm_streams || (ape_flux_wav && target_fmt == AudioFormat::Wav);
+        // #4016 — le plafond de 4 GiB de l'en-tête RIFF, VU AVANT de décoder.
+        //
+        // Les quatre grandeurs qui le décident sont toutes connues ici : durée
+        // de la piste, cadence de sortie, canaux, profondeur de sortie. Les
+        // lire maintenant coûte une multiplication ; les ignorer coûtait le
+        // décodage complet du morceau, puis un échec dur à l'écriture de
+        // l'en-tête (Cyrille, 24/384 de 46 min, deux essais à 64 s et 174 s).
+        let target_is_wav = target_format_str == "wav";
+        let wav_hors_plafond_riff = target_is_wav
+            && crate::audio::wav::pcm_depasse_le_plafond_riff(
+                track_duration_ms.max(0) as u64,
+                out_sr,
+                channels,
+                out_bd,
+            );
+        if wav_hors_plafond_riff {
+            warn!(
+                zone_id = req.zone_id,
+                file = %file_path,
+                duree_ms = track_duration_ms,
+                sample_rate = out_sr,
+                bit_depth = out_bd,
+                canaux = channels,
+                octets_pcm = crate::audio::wav::octets_pcm_attendus(
+                    track_duration_ms.max(0) as u64,
+                    out_sr,
+                    channels,
+                    out_bd,
+                ),
+                plafond = crate::audio::wav::PLAFOND_DATA_RIFF,
+                "wav_hors_plafond_riff_session_progressive"
+            );
+        }
         let use_file_transcode = use_file_transcode_for(
             is_network_output,
-            target_format_str == "wav",
+            target_is_wav,
             dlna_needs_wav,
             wav_diffusable,
+            wav_hors_plafond_riff,
             // Une zone dont un TRAITEMENT est actif doit l'entendre. Depuis
             // LAT-F1 (phase 0), le bras progressif applique lui-même
             // égaliseur, convolveur et ReplayGain au fil de l'eau (relais

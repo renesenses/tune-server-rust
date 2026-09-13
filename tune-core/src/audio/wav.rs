@@ -22,6 +22,55 @@ pub const LIVE_BOUNDED_TOTAL_LEN: u64 = i32::MAX as u64;
 /// `data` chunk size matching [`LIVE_BOUNDED_TOTAL_LEN`], header deducted.
 pub const LIVE_BOUNDED_DATA_SIZE: u32 = (LIVE_BOUNDED_TOTAL_LEN - 44) as u32;
 
+/// Le plafond du champ `data_size` d'un en-tête RIFF.
+///
+/// Ce champ est un `u32` **par construction du format WAV** : ce n'est pas un
+/// réglage, et rien ne l'élargit. Au-delà, [`crate::audio::encoder`] ne peut
+/// qu'échouer — « wav: pcm exceeds 4 GiB » — et il échouait APRÈS avoir décodé
+/// la piste entière, une à trois minutes perdues pour rien (#4016, Cyrille,
+/// fil 1772).
+pub const PLAFOND_DATA_RIFF: u64 = u32::MAX as u64;
+
+/// Le volume de PCM entrelacé qu'une piste produira, en octets — la SEULE
+/// grandeur que le plafond RIFF regarde, et elle se calcule **avant** de
+/// décoder quoi que ce soit.
+///
+/// La cadence n'y entre que par son PRODUIT avec la durée. En 24 bits stéréo à
+/// 384 kHz, une seconde pèse 2 304 000 octets : le plafond tombe à 1 864 s,
+/// soit 31 min 04 s. Mais 16 bits stéréo à 44,1 kHz — la cadence la plus
+/// ordinaire qui soit — l'atteint aussi, à 6 h 45. Ce n'est donc pas « le
+/// 384 kHz » : c'est le volume.
+///
+/// Arithmétique en `u64` de bout en bout, et saturante : le produit qui déborde
+/// est justement celui qu'on cherche à mesurer. Le résultat est arrondi vers le
+/// bas sur une TRAME entière, parce que le `data` chunk ne décrit que des
+/// trames complètes.
+pub fn octets_pcm_attendus(duree_ms: u64, sample_rate: u32, channels: u16, bit_depth: u16) -> u64 {
+    let octets_par_trame = channels as u64 * (bit_depth as u64 / 8);
+    if octets_par_trame == 0 || sample_rate == 0 {
+        return 0;
+    }
+    let octets = duree_ms
+        .saturating_mul(sample_rate as u64)
+        .saturating_mul(octets_par_trame)
+        / 1000;
+    octets - octets % octets_par_trame
+}
+
+/// `true` quand le PCM de cette piste ne PEUT PAS être décrit par un en-tête
+/// RIFF, donc qu'un fichier WAV complet est hors de portée quoi qu'on fasse.
+///
+/// Les quatre grandeurs sont connues dès la décision de format : la question se
+/// répond avant le décodage, pas après.
+pub fn pcm_depasse_le_plafond_riff(
+    duree_ms: u64,
+    sample_rate: u32,
+    channels: u16,
+    bit_depth: u16,
+) -> bool {
+    octets_pcm_attendus(duree_ms, sample_rate, channels, bit_depth) > PLAFOND_DATA_RIFF
+}
+
 /// Build the 44-byte WAV header for a live stream served as a bounded file.
 /// Sizes are finite and positive as `i32`, so a renderer that parses the header
 /// to plan a ranged fetch can do so (see [`LIVE_BOUNDED_TOTAL_LEN`]).

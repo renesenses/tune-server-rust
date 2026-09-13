@@ -852,17 +852,27 @@ fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
     // ONLY with the toggle on. Everything else keeps its prior behaviour.
 
     // DSD → WAV, renderer needs LPCM, toggle ON → stream (the fix).
-    assert!(!use_file_transcode_for(true, true, true, true, false));
+    assert!(!use_file_transcode_for(
+        true, true, true, true, false, false
+    ));
     // Same, toggle OFF → temp file (rollback, unchanged).
-    assert!(use_file_transcode_for(true, true, true, false, false));
+    assert!(use_file_transcode_for(
+        true, true, true, false, false, false
+    ));
     // FLAC target (non-WAV) always temp-files for Content-Length — the
     // dsd flag can't apply (dsd_lpcm_streams stays false for non-DSD/WAV).
-    assert!(use_file_transcode_for(true, false, false, false, false));
+    assert!(use_file_transcode_for(
+        true, false, false, false, false, false
+    ));
     // WAV target a renderer is fine to stream (dlna_needs_wav false):
     // streams regardless of the flag (local/OAAT/Linn path, unchanged).
-    assert!(!use_file_transcode_for(true, true, false, false, false));
+    assert!(!use_file_transcode_for(
+        true, true, false, false, false, false
+    ));
     // Local/OAAT (not network): never file-transcodes.
-    assert!(!use_file_transcode_for(false, true, true, false, false));
+    assert!(!use_file_transcode_for(
+        false, true, true, false, false, false
+    ));
 }
 
 /// Un traitement actif RAMÈNE au fichier temporaire, quel que soit le reste.
@@ -876,22 +886,38 @@ fn dsd_lpcm_streams_only_when_toggled_and_dsd_wav() {
 #[test]
 fn un_traitement_actif_ne_ramene_plus_au_fichier_quand_la_cible_est_wav() {
     // Renderer FLAC-capable, DSD → WAV progressif : streame sans DSP…
-    assert!(!use_file_transcode_for(true, true, false, false, false));
+    assert!(!use_file_transcode_for(
+        true, true, false, false, false, false
+    ));
     // …et STREAME AUSSI avec un traitement actif : le relais l'applique.
-    assert!(!use_file_transcode_for(true, true, false, false, true));
+    assert!(!use_file_transcode_for(
+        true, true, false, false, false, true
+    ));
     // Renderer LPCM, bascule « Streaming continu » armée : même règle.
-    assert!(!use_file_transcode_for(true, true, true, true, false));
-    assert!(!use_file_transcode_for(true, true, true, true, true));
+    assert!(!use_file_transcode_for(
+        true, true, true, true, false, false
+    ));
+    assert!(!use_file_transcode_for(true, true, true, true, false, true));
     // Zone navigateur avec EQ (#1168) : progressive avec son traitement.
-    assert!(!use_file_transcode_for(false, true, false, false, true));
+    assert!(!use_file_transcode_for(
+        false, true, false, false, false, true
+    ));
     // Sans traitement, une sortie non réseau ne file-transcode toujours pas.
-    assert!(!use_file_transcode_for(false, true, false, false, false));
+    assert!(!use_file_transcode_for(
+        false, true, false, false, false, false
+    ));
     // Cible NON WAV (FLAC ré-encodé pour un renderer qui le lit) : le fichier,
     // avec ou sans traitement — l'encodeur FLAC n'est branché que là.
-    assert!(use_file_transcode_for(true, false, false, false, false));
-    assert!(use_file_transcode_for(true, false, false, false, true));
+    assert!(use_file_transcode_for(
+        true, false, false, false, false, false
+    ));
+    assert!(use_file_transcode_for(
+        true, false, false, false, false, true
+    ));
     // Renderer LPCM sans bascule streaming : le fichier WAV, comme avant.
-    assert!(use_file_transcode_for(true, true, true, false, false));
+    assert!(use_file_transcode_for(
+        true, true, true, false, false, false
+    ));
 }
 
 /// LAT-F1 (phase 1) — la cible WAV « pour traitement » exige les CINQ

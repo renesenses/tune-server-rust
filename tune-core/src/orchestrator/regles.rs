@@ -250,9 +250,23 @@ pub(super) fn use_file_transcode_for(
     target_is_wav: bool,
     dlna_needs_wav: bool,
     wav_diffusable: bool,
+    // #4016 — le PCM de cette piste ne tient PAS dans un en-tête RIFF.
+    //
+    // Le bras fichier écrit un WAV COMPLET ; son champ `data_size` est un `u32`
+    // par construction du format, et au-delà de 4 GiB il n'y a pas de fichier
+    // WAV à écrire — quelle que soit la machine, quel que soit le budget. Le
+    // bras fichier n'est donc pas « lent » ici : il est IMPOSSIBLE, et il le
+    // découvrait après avoir décodé la piste entière (« wav: pcm exceeds
+    // 4 GiB », une à trois minutes plus tard, chez Cyrille, fil 1772).
+    //
+    // La sortie de secours est la même que pour un `.ape` ou un DSD→LPCM :
+    // la session progressive, qui ne matérialise jamais le morceau entier. Elle
+    // est déjà servie à des renderers réseau par `wav_diffusable`, à côté.
+    wav_hors_plafond_riff: bool,
     dsp_active: bool,
 ) -> bool {
-    is_network && (!target_is_wav || (dlna_needs_wav && !wav_diffusable))
+    let wav_par_le_fichier = !wav_diffusable && !wav_hors_plafond_riff;
+    is_network && (!target_is_wav || (dlna_needs_wav && wav_par_le_fichier))
         || (dsp_active && !target_is_wav)
 }
 

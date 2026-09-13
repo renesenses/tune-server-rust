@@ -7,6 +7,15 @@ use tracing::{debug, warn};
 /// The FLAC encoder works in streaming mode: PCM data is encoded incrementally
 /// as it arrives via `write()`, keeping memory usage bounded regardless of
 /// track length. Only one block's worth of samples (~4096) is buffered at a time.
+///
+/// ⚠️ **Cette borne ne vaut QUE pour le FLAC.** Le bras WAV accumule au
+/// contraire TOUT le PCM dans `pcm_buffer` — le rédacteur du WAV a besoin de la
+/// longueur avant d'écrire son en-tête — puis en produit une seconde copie
+/// complète dans `finish`. Placée sur la structure entière, la phrase
+/// ci-dessus se lisait comme une propriété générale et elle est fausse pour le
+/// chemin WAV : c'est celui qui a mis un Mac mini à genoux sur un 24/384 de
+/// 46 min avant d'échouer sur le plafond RIFF (#4016). Qui doit servir un tel
+/// volume ne passe pas par ici : il passe par la session progressive.
 pub struct AudioEncoder {
     format: String,
     sample_rate: u32,
