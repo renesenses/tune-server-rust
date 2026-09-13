@@ -365,6 +365,14 @@ path = "tests/temoin_resolution_streaming.rs"
 name = "temoin_resolution_locale"
 path = "tests/temoin_resolution_locale.rs"
 
+# REF-2 phase 2 (#2219) — les blocs de `decider_la_lecture_locale` que les six
+# témoins ci-dessus ne traversent pas : DoP anticipé, passthrough DSD, zone
+# navigateur, WAV 24 bits, passthrough ALAC, bras Chromecast, plafond de
+# fréquence, flux `.ape`. Même montage, mêmes fixtures de la caisse.
+[[test]]
+name = "temoin_decision_locale"
+path = "tests/temoin_decision_locale.rs"
+
 # #2218 T9 — marge, écrêtage, crête vraie et dither, par les portes PUBLIQUES
 # de `audio::{replaygain, eq, mixer, convolver, crossfeed, decode}`. Aucune
 # caractéristique requise : tourne sur toute PR Rust. `autotests = false` plus

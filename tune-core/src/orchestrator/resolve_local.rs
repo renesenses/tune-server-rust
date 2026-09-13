@@ -116,6 +116,226 @@ pub(super) struct FormatDeSortie {
     pub(super) info: StreamInfo,
 }
 
+/// Ce que le premier temps de `decider_la_lecture_locale` relève de la ligne
+/// `tracks` et de la zone, lu par tous les temps suivants (REF-2 phase 2,
+/// #2219). Les champs portent les noms des `let` d'origine.
+struct SourceEtZone {
+    sample_rate: u32,
+    bit_depth: u16,
+    channels: u16,
+    zone: Option<crate::db::zone_repo::Zone>,
+    zone_output_type: Option<String>,
+    device_quirks: crate::device_catalog::DeviceQuirks,
+    zone_max_sample_rate: Option<u32>,
+}
+
+/// Deuxième temps : les familles de sortie que la demande et la zone
+/// désignent, et les deux forçages WAV qui en découlent directement.
+#[derive(Clone, Copy)]
+struct Sorties {
+    is_oaat_output: bool,
+    oaat_needs_wav: bool,
+    is_local_output: bool,
+    local_needs_wav: bool,
+    is_network_output: bool,
+}
+
+/// Quatrième temps : les forçages de la zone réseau — navigateur, passthrough
+/// DSD voulu, profondeur sur le fil, WAV 24 bits, forçage WAV, plafond 16 bits.
+#[derive(Clone, Copy)]
+struct ForcagesReseau {
+    is_browser_output: bool,
+    browser_needs_wav: bool,
+    dsd_passthrough: bool,
+    bit_depth_wire: u16,
+    dlna_wav24: bool,
+    dlna_force_wav: bool,
+    dlna_cap_16bit: bool,
+}
+
+/// Cinquième temps : le transcodage que la SORTIE exige — passthrough ALAC
+/// voulu, bras Chromecast, négociation DLNA du FLAC.
+#[derive(Clone, Copy)]
+struct TranscodagePourLaSortie {
+    alac_passthrough: bool,
+    is_chromecast: bool,
+    needs_transcode_for_output: bool,
+    will_be_flac: bool,
+    dlna_needs_wav: bool,
+}
+
+/// Sixième temps : le traitement et ses cibles — rééchantillonnage, égaliseur,
+/// WAV progressif de LAT-F1, flux `.ape`.
+#[derive(Clone, Copy)]
+struct Traitement {
+    needs_downsample: bool,
+    sortie_tire_le_flux: bool,
+    eq_forces_transcode: bool,
+    browser_needs_wav: bool,
+    dsp_progressif_wav: bool,
+    ape_flux_wav: bool,
+}
+
+/// Deuxième temps de `decider_la_lecture_locale` : les familles de sortie.
+/// Pas d'`&self`, pas d'E/S — tout se lit dans la demande et le type de la
+/// zone.
+fn reconnaitre_les_sorties(
+    req: &PlayRequest,
+    source_format: Option<AudioFormat>,
+    zone_output_type: Option<&str>,
+) -> Sorties {
+    let is_oaat_output = est_sortie_oaat(req.output_device_id.as_deref());
+    // OAAT endpoints: transcode to WAV for reliable bit-perfect playback.
+    // Always transcode, even WAV sources, to normalise EXTENSIBLE/FLOAT
+    // variants into simple PCM that the endpoint can reliably parse.
+    let oaat_needs_wav = is_oaat_output && source_format.is_some();
+
+    // Local output (cpal) has a simple WAV parser that only understands
+    // standard PCM (format tag 1).  Real-world WAV files can use
+    // WAVE_FORMAT_EXTENSIBLE (0xFFFE), IEEE_FLOAT (3), or have extra
+    // metadata chunks that shift the data offset beyond the parser's
+    // 4096-byte header buffer.  Feeding such files as passthrough causes
+    // white noise because the byte layout doesn't match what the parser
+    // expects (wrong bit depth, wrong data offset, or float-as-integer).
+    //
+    // Fix: ALWAYS transcode through symphonia for local output, even when
+    // the source is already WAV.  Symphonia handles all WAV variants and
+    // produces normalised integer PCM.  The HTTP stream handler then
+    // prepends a simple 44-byte PCM header that the local parser handles
+    // correctly.  The overhead is negligible (memcpy, no re-encoding).
+    let is_local_output = est_sortie_locale(req.output_device_id.as_deref());
+    let local_needs_wav = is_local_output && source_format.is_some();
+
+    // Calculé ici, et non plus après la branche DoP : celle-ci en a besoin
+    // pour servir du DoP à un renderer réseau (#1772). Ne dépend que de
+    // `zone_output_type`, connu bien plus haut.
+    let is_network_output = is_network_output_type(zone_output_type);
+    Sorties {
+        is_oaat_output,
+        oaat_needs_wav,
+        is_local_output,
+        local_needs_wav,
+        is_network_output,
+    }
+}
+
+/// Septième temps de `decider_la_lecture_locale` : le transcodage requis, son
+/// journal, et la `DecisionLocale` remplie champ par champ comme avant.
+#[allow(clippy::too_many_arguments)]
+fn assembler_la_decision(
+    req: &PlayRequest,
+    track: &crate::db::models::Track,
+    file_path: String,
+    fmt: String,
+    source_format: Option<AudioFormat>,
+    tranche_cue: Option<TrancheCue>,
+    source: SourceEtZone,
+    sorties: Sorties,
+    forcages: ForcagesReseau,
+    transcodage: TranscodagePourLaSortie,
+    traitement: Traitement,
+) -> DecisionLocale {
+    let SourceEtZone {
+        sample_rate,
+        bit_depth,
+        channels,
+        zone,
+        zone_max_sample_rate,
+        ..
+    } = source;
+    let Sorties {
+        oaat_needs_wav,
+        is_local_output,
+        local_needs_wav,
+        is_network_output,
+        ..
+    } = sorties;
+    let ForcagesReseau {
+        is_browser_output,
+        bit_depth_wire,
+        dlna_wav24,
+        dlna_cap_16bit,
+        ..
+    } = forcages;
+    let TranscodagePourLaSortie {
+        is_chromecast,
+        needs_transcode_for_output,
+        will_be_flac,
+        dlna_needs_wav,
+        ..
+    } = transcodage;
+    let Traitement {
+        needs_downsample,
+        sortie_tire_le_flux,
+        eq_forces_transcode,
+        browser_needs_wav,
+        dsp_progressif_wav,
+        ape_flux_wav,
+    } = traitement;
+
+    let needs_transcode = transcodage_requis(&MotifsDeTranscodage {
+        needs_transcode_for_output,
+        oaat_needs_wav,
+        local_needs_wav,
+        browser_needs_wav,
+        needs_downsample,
+        dlna_needs_wav,
+        eq_forces_transcode,
+        // Une zone qui n'a QUE du crossfeed n'allume pas
+        // `eq_forces_transcode` (voir plus haut) : sans cette ligne, sa
+        // cible progressive serait décidée puis jamais empruntée, et le
+        // crossfeed resterait muet malgré l'opt-in.
+        dsp_progressif_wav,
+        // 16-bit cap on a FLAC-direct renderer: force a transcode so the
+        // hi-res FLAC is re-encoded at 16-bit instead of served direct
+        // (silent on the Ruark R3, #1137). ALAC already transcodes because
+        // the cap disables alac_passthrough above.
+        dlna_cap_16bit,
+        will_be_flac,
+        // #3631 — une TRANCHE ne se sert jamais telle quelle. Le
+        // passthrough enverrait le fichier image ENTIER : l'album complet
+        // sous le nom d'une de ses pistes. Seul le décodage sait couper.
+        est_une_tranche_cue: tranche_cue.is_some(),
+    });
+    if eq_forces_transcode && !needs_transcode_for_output && !dlna_needs_wav {
+        info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
+    }
+
+    let track_duration_ms = track.duration_ms;
+    let track_file_size = track.file_size;
+    DecisionLocale {
+        bit_depth,
+        bit_depth_wire,
+        browser_needs_wav,
+        channels,
+        dlna_cap_16bit,
+        dlna_needs_wav,
+        dlna_wav24,
+        eq_forces_transcode,
+        is_browser_output,
+        is_chromecast,
+        is_local_output,
+        dsp_progressif_wav,
+        ape_flux_wav,
+        is_network_output,
+        sortie_tire_le_flux,
+        local_needs_wav,
+        needs_downsample,
+        needs_transcode_for_output,
+        oaat_needs_wav,
+        sample_rate,
+        source_format,
+        zone_max_sample_rate,
+        track_duration_ms,
+        track_file_size,
+        file_path,
+        fmt,
+        zone,
+        needs_transcode,
+        tranche_cue,
+    }
+}
+
 impl PlaybackOrchestrator {
     /// Faut-il envoyer le DSD tel quel au renderer ?
     ///
@@ -488,6 +708,13 @@ impl PlaybackOrchestrator {
     /// plafonds, égaliseur, transcodage requis), sorties telles quelles (REF-2
     /// phase 2, #2219). Le DoP servi directement rend une résolution complète
     /// sans passer par les armes : c'est le retour anticipé d'origine.
+    ///
+    /// Sept temps nommés, dans l'ordre du texte d'origine : la relève de la
+    /// source et de la zone, les familles de sortie, le DoP anticipé (seul
+    /// retour anticipé), les forçages de la zone réseau, le transcodage que
+    /// la sortie exige, le traitement et ses cibles, puis l'assemblage de la
+    /// décision. Chaque temps lit ce que les précédents ont relevé et rend ce
+    /// qu'il décide ; les conditions pures vivent dans `regles.rs`.
     #[allow(clippy::too_many_arguments)]
     async fn decider_la_lecture_locale(
         &self,
@@ -499,6 +726,55 @@ impl PlaybackOrchestrator {
         is_dsd_source: bool,
         tranche_cue: Option<TrancheCue>,
     ) -> Result<DecisionOuResolu, String> {
+        let source = self.relever_la_source_et_la_zone(req, track, is_dsd_source);
+        let sorties =
+            reconnaitre_les_sorties(req, source_format, source.zone_output_type.as_deref());
+        if let Some(resolu) = self
+            .decider_le_dop(req, track, &file_path, source_format, &source, &sorties)
+            .await?
+        {
+            return Ok(DecisionOuResolu::Resolu(resolu));
+        }
+        let forcages = self
+            .decider_les_forcages_reseau(req, &file_path, source_format, &source, &sorties)
+            .await;
+        let transcodage = self
+            .decider_le_transcodage_pour_la_sortie(req, source_format, &source, &sorties, &forcages)
+            .await;
+        let traitement = self
+            .decider_le_traitement(
+                req,
+                source_format,
+                &source,
+                &sorties,
+                &forcages,
+                &transcodage,
+            )
+            .await;
+        Ok(DecisionOuResolu::Decision(assembler_la_decision(
+            req,
+            track,
+            file_path,
+            fmt,
+            source_format,
+            tranche_cue,
+            source,
+            sorties,
+            forcages,
+            transcodage,
+            traitement,
+        )))
+    }
+
+    /// Premier temps : ce que la ligne `tracks` et la zone disent de la source
+    /// — cadence, profondeur, canaux, type de sortie, quirks du catalogue et
+    /// plafond de fréquence combiné.
+    fn relever_la_source_et_la_zone(
+        &self,
+        req: &PlayRequest,
+        track: &crate::db::models::Track,
+        is_dsd_source: bool,
+    ) -> SourceEtZone {
         let sample_rate = track
             .sample_rate
             .unwrap_or(if is_dsd_source { 2_822_400 } else { 44100 })
@@ -524,40 +800,35 @@ impl PlaybackOrchestrator {
             zone.as_ref().and_then(|z| z.max_sample_rate),
             device_quirks.max_sample_rate,
         );
+        SourceEtZone {
+            sample_rate,
+            bit_depth,
+            channels,
+            zone,
+            zone_output_type,
+            device_quirks,
+            zone_max_sample_rate,
+        }
+    }
 
-        let is_oaat_output = req
-            .output_device_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
-        // OAAT endpoints: transcode to WAV for reliable bit-perfect playback.
-        // Always transcode, even WAV sources, to normalise EXTENSIBLE/FLOAT
-        // variants into simple PCM that the endpoint can reliably parse.
-        let oaat_needs_wav = is_oaat_output && source_format.is_some();
-
-        // Local output (cpal) has a simple WAV parser that only understands
-        // standard PCM (format tag 1).  Real-world WAV files can use
-        // WAVE_FORMAT_EXTENSIBLE (0xFFFE), IEEE_FLOAT (3), or have extra
-        // metadata chunks that shift the data offset beyond the parser's
-        // 4096-byte header buffer.  Feeding such files as passthrough causes
-        // white noise because the byte layout doesn't match what the parser
-        // expects (wrong bit depth, wrong data offset, or float-as-integer).
-        //
-        // Fix: ALWAYS transcode through symphonia for local output, even when
-        // the source is already WAV.  Symphonia handles all WAV variants and
-        // produces normalised integer PCM.  The HTTP stream handler then
-        // prepends a simple 44-byte PCM header that the local parser handles
-        // correctly.  The overhead is negligible (memcpy, no re-encoding).
-        let is_local_output = req
-            .output_device_id
-            .as_deref()
-            .is_some_and(|id| id.starts_with("local:"));
-        let local_needs_wav = is_local_output && source_format.is_some();
-
-        // Calculé ici, et non plus après la branche DoP : celle-ci en a besoin
-        // pour servir du DoP à un renderer réseau (#1772). Ne dépend que de
-        // `zone_output_type`, connu bien plus haut.
-        let is_network_output = is_network_output_type(zone_output_type.as_deref());
-
+    /// Troisième temps : le DoP anticipé. Une source DSD que la sortie prend
+    /// en DoP est résolue ici même et court-circuite tout le reste ; les deux
+    /// journaux qui expliquent un DSD parti en PCM vivent au même endroit,
+    /// seul à connaître à la fois le format, la sortie et le mode réglé.
+    async fn decider_le_dop(
+        &self,
+        req: &PlayRequest,
+        track: &crate::db::models::Track,
+        file_path: &str,
+        source_format: Option<AudioFormat>,
+        source: &SourceEtZone,
+        sorties: &Sorties,
+    ) -> Result<Option<ResolvedStream>, String> {
+        let Sorties {
+            is_local_output,
+            is_network_output,
+            ..
+        } = *sorties;
         // DSD en DoP (DSD over PCM), c'est-à-dire du DSD transporté dans des
         // trames PCM 24 bits au seizième du débit.
         //
@@ -642,19 +913,38 @@ impl PlaybackOrchestrator {
         }
 
         if source_format == Some(AudioFormat::Dsd) && dop_requested {
-            if let Some(resolu) = self
+            return self
                 .anticiper_le_dop(
                     track,
-                    file_path.clone(),
-                    zone_max_sample_rate,
+                    file_path.to_string(),
+                    source.zone_max_sample_rate,
                     is_local_output,
                 )
-                .await?
-            {
-                return Ok(DecisionOuResolu::Resolu(resolu));
-            }
+                .await;
         }
+        Ok(None)
+    }
 
+    /// Quatrième temps : les forçages de la zone réseau — le navigateur qui ne
+    /// décode pas l'exotique, le passthrough DSD voulu, la profondeur lue sur
+    /// le fil, l'opt-in WAV 24 bits, le forçage WAV et le plafond 16 bits.
+    async fn decider_les_forcages_reseau(
+        &self,
+        req: &PlayRequest,
+        file_path: &str,
+        source_format: Option<AudioFormat>,
+        source: &SourceEtZone,
+        sorties: &Sorties,
+    ) -> ForcagesReseau {
+        let SourceEtZone {
+            bit_depth,
+            zone,
+            zone_output_type,
+            device_quirks,
+            ..
+        } = source;
+        let bit_depth = *bit_depth;
+        let is_network_output = sorties.is_network_output;
         // Transcode exotic formats (AIFF, DSD, WavPack, APE, ALAC, WMA) for network outputs
         // that receive a URL and play it directly. FLAC, WAV, MP3, AAC pass through as-is.
         // (`is_network_output` est calculé plus haut, la branche DoP en a besoin.)
@@ -668,24 +958,14 @@ impl PlaybackOrchestrator {
         // here, mirroring the streaming arm which already serves WAV to browser
         // zones. Codecs a browser plays natively stay direct (no regression).
         let is_browser_output = zone_output_type.as_deref() == Some("browser");
-        let browser_needs_wav = is_browser_output
-            && matches!(
-                source_format,
-                Some(AudioFormat::Dsd)
-                    | Some(AudioFormat::WavPack)
-                    | Some(AudioFormat::Ape)
-                    | Some(AudioFormat::Wma)
-                    | Some(AudioFormat::Aiff)
-                    | Some(AudioFormat::Alac)
-            );
+        let browser_needs_wav = navigateur_exige_le_wav(is_browser_output, source_format);
 
         // DSD native passthrough: skip transcode when the renderer supports DSD natively.
         let dsd_passthrough = if source_format == Some(AudioFormat::Dsd) && is_network_output {
-            let did = req
-                .output_device_id
-                .as_deref()
-                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-                .unwrap_or("");
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+            );
             self.should_dsd_passthrough(req.zone_id, did).await
         } else {
             false
@@ -723,7 +1003,7 @@ impl PlaybackOrchestrator {
         let wav24_opt_in = is_network_output
             && ZoneRepo::with_backend(self.db.clone()).get_dlna_wav24(req.zone_id);
         let bit_depth_wire = if wav24_opt_in && bit_depth <= 16 {
-            profondeur_sondee_si_la_base_ignore(&file_path, source_format).unwrap_or(bit_depth)
+            profondeur_sondee_si_la_base_ignore(file_path, source_format).unwrap_or(bit_depth)
         } else {
             bit_depth
         };
@@ -767,6 +1047,39 @@ impl PlaybackOrchestrator {
             ZoneRepo::with_backend(self.db.clone()).get_dlna_cap_16bit(req.zone_id),
             device_quirks.force_16bit,
         );
+        ForcagesReseau {
+            is_browser_output,
+            browser_needs_wav,
+            dsd_passthrough,
+            bit_depth_wire,
+            dlna_wav24,
+            dlna_force_wav,
+            dlna_cap_16bit,
+        }
+    }
+
+    /// Cinquième temps : le transcodage que la SORTIE exige — passthroughs
+    /// ALAC et AAC voulus, bras Chromecast, négociation DLNA du FLAC.
+    async fn decider_le_transcodage_pour_la_sortie(
+        &self,
+        req: &PlayRequest,
+        source_format: Option<AudioFormat>,
+        source: &SourceEtZone,
+        sorties: &Sorties,
+        forcages: &ForcagesReseau,
+    ) -> TranscodagePourLaSortie {
+        let SourceEtZone {
+            zone,
+            zone_output_type,
+            ..
+        } = source;
+        let is_network_output = sorties.is_network_output;
+        let ForcagesReseau {
+            dsd_passthrough,
+            dlna_force_wav,
+            dlna_cap_16bit,
+            ..
+        } = *forcages;
         let alac_passthrough = source_format == Some(AudioFormat::Alac)
             && is_network_output
             && !dlna_force_wav
@@ -808,17 +1121,12 @@ impl PlaybackOrchestrator {
         // is FLAC, or source needs transcode and target is FLAC), check that
         // the renderer supports audio/flac. Otherwise force WAV (LPCM).
         let is_dlna = zone_output_type.as_deref() == Some("dlna");
-        let will_be_flac = source_format == Some(AudioFormat::Flac)
-            || (needs_transcode_for_output
-                && source_format
-                    .map(|f| f.dlna_transcode_target() == AudioFormat::Flac)
-                    .unwrap_or(false));
+        let will_be_flac = sera_du_flac(source_format, needs_transcode_for_output);
         let dlna_needs_wav = if is_dlna && will_be_flac {
-            let did = req
-                .output_device_id
-                .as_deref()
-                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-                .unwrap_or("");
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+            );
             if dlna_force_wav {
                 // User forces WAV for this zone (16-bit LPCM via `dlna_lpcm`, or
                 // genuine 24-bit via `dlna_wav24`): skips the slow native FLAC
@@ -840,7 +1148,50 @@ impl PlaybackOrchestrator {
         } else {
             false
         };
+        TranscodagePourLaSortie {
+            alac_passthrough,
+            is_chromecast,
+            needs_transcode_for_output,
+            will_be_flac,
+            dlna_needs_wav,
+        }
+    }
 
+    /// Sixième temps : le traitement et ses cibles — le plafond de fréquence,
+    /// l'égaliseur qui force le transcodage (réseau, navigateur, sortie qui
+    /// tire le flux), le WAV progressif de LAT-F1 et le flux `.ape`.
+    async fn decider_le_traitement(
+        &self,
+        req: &PlayRequest,
+        source_format: Option<AudioFormat>,
+        source: &SourceEtZone,
+        sorties: &Sorties,
+        forcages: &ForcagesReseau,
+        transcodage: &TranscodagePourLaSortie,
+    ) -> Traitement {
+        let SourceEtZone {
+            sample_rate,
+            bit_depth,
+            zone,
+            zone_output_type,
+            zone_max_sample_rate,
+            ..
+        } = source;
+        let (sample_rate, bit_depth, zone_max_sample_rate) =
+            (*sample_rate, *bit_depth, *zone_max_sample_rate);
+        let Sorties {
+            is_oaat_output,
+            is_local_output,
+            is_network_output,
+            ..
+        } = *sorties;
+        let ForcagesReseau {
+            is_browser_output,
+            browser_needs_wav,
+            dsd_passthrough,
+            ..
+        } = *forcages;
+        let alac_passthrough = transcodage.alac_passthrough;
         // Downsample if the zone has a max_sample_rate cap and the source
         // exceeds it. For DSD, `sample_rate` is the raw DSD bit rate (MHz), so
         // this uses the PCM *output* rate for the comparison and never
@@ -882,19 +1233,21 @@ impl PlaybackOrchestrator {
         // plus le DSD et le format inconnu — deux exclusions qui ont leur sens
         // pour le DSP et aucun ici, où le DSD est déjà écarté par
         // `skip_passthrough_levels`.
-        let sortie_tire_le_flux = is_pull_dsp_output_type(zone_output_type.as_deref())
-            && !is_local_output
-            && !is_oaat_output;
-        let eq_forces_transcode = (is_network_output || is_browser_output || is_pull_dsp_output)
-            && !dsd_passthrough
-            && !alac_passthrough
-            && (self.zone_has_active_eq(req.zone_id)
-                || self.zone_has_active_ir(req.zone_id)
-                // ReplayGain scales the samples, so it lives in the same place
-                // as the EQ — and would be discarded in the same way on a
-                // passthrough. Enabling it is an explicit choice of processing;
-                // PURE zones are excluded upstream.
-                || self.zone_replaygain_changes_audio(req.zone_id, req.track_id));
+        let sortie_tire_le_flux =
+            la_sortie_tire_le_flux(zone_output_type.as_deref(), is_local_output, is_oaat_output);
+        let eq_forces_transcode = sortie_sujette_au_traitement(
+            is_network_output,
+            is_browser_output,
+            is_pull_dsp_output,
+            dsd_passthrough,
+            alac_passthrough,
+        ) && (self.zone_has_active_eq(req.zone_id)
+            || self.zone_has_active_ir(req.zone_id)
+            // ReplayGain scales the samples, so it lives in the same place
+            // as the EQ — and would be discarded in the same way on a
+            // passthrough. Enabling it is an explicit choice of processing;
+            // PURE zones are excluded upstream.
+            || self.zone_replaygain_changes_audio(req.zone_id, req.track_id));
         // En navigateur, la sortie transcodée doit être du WAV : un FLAC
         // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
         // Range (#1168) — même règle que le bras streaming.
@@ -933,11 +1286,10 @@ impl PlaybackOrchestrator {
                 cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
 
             let renderer_accepte_lpcm = if candidat {
-                let did = req
-                    .output_device_id
-                    .as_deref()
-                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-                    .unwrap_or("");
+                let did = identifiant_du_renderer(
+                    req.output_device_id.as_deref(),
+                    zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+                );
                 !did.is_empty() && self.dlna_accepte_lpcm(did, bit_depth > 16).await
             } else {
                 false
@@ -965,77 +1317,24 @@ impl PlaybackOrchestrator {
             let src_est_ape = source_format == Some(AudioFormat::Ape);
             let candidat = cible_wav_pour_ape_reseau(src_est_ape, is_network_output, true);
             let renderer_accepte_lpcm = if candidat {
-                let did = req
-                    .output_device_id
-                    .as_deref()
-                    .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-                    .unwrap_or("");
+                let did = identifiant_du_renderer(
+                    req.output_device_id.as_deref(),
+                    zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+                );
                 !did.is_empty() && self.dlna_accepte_lpcm(did, bit_depth > 16).await
             } else {
                 false
             };
             cible_wav_pour_ape_reseau(src_est_ape, is_network_output, renderer_accepte_lpcm)
         };
-
-        let needs_transcode = needs_transcode_for_output
-            || oaat_needs_wav
-            || local_needs_wav
-            || browser_needs_wav
-            || needs_downsample
-            || dlna_needs_wav
-            || eq_forces_transcode
-            // Une zone qui n'a QUE du crossfeed n'allume pas
-            // `eq_forces_transcode` (voir plus haut) : sans cette ligne, sa
-            // cible progressive serait décidée puis jamais empruntée, et le
-            // crossfeed resterait muet malgré l'opt-in.
-            || dsp_progressif_wav
-            // 16-bit cap on a FLAC-direct renderer: force a transcode so the
-            // hi-res FLAC is re-encoded at 16-bit instead of served direct
-            // (silent on the Ruark R3, #1137). ALAC already transcodes because
-            // the cap disables alac_passthrough above.
-            || (dlna_cap_16bit && will_be_flac)
-            // #3631 — une TRANCHE ne se sert jamais telle quelle. Le
-            // passthrough enverrait le fichier image ENTIER : l'album complet
-            // sous le nom d'une de ses pistes. Seul le décodage sait couper.
-            || tranche_cue.is_some();
-        if eq_forces_transcode && !needs_transcode_for_output && !dlna_needs_wav {
-            info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
-        }
-
-        let track_duration_ms = track.duration_ms;
-        let track_file_size = track.file_size;
-        let decision = DecisionLocale {
-            bit_depth,
-            bit_depth_wire,
-            browser_needs_wav,
-            channels,
-            dlna_cap_16bit,
-            dlna_needs_wav,
-            dlna_wav24,
+        Traitement {
+            needs_downsample,
+            sortie_tire_le_flux,
             eq_forces_transcode,
-            is_browser_output,
-            is_chromecast,
-            is_local_output,
+            browser_needs_wav,
             dsp_progressif_wav,
             ape_flux_wav,
-            is_network_output,
-            sortie_tire_le_flux,
-            local_needs_wav,
-            needs_downsample,
-            needs_transcode_for_output,
-            oaat_needs_wav,
-            sample_rate,
-            source_format,
-            zone_max_sample_rate,
-            track_duration_ms,
-            track_file_size,
-            file_path,
-            fmt,
-            zone,
-            needs_transcode,
-            tranche_cue,
-        };
-        Ok(DecisionOuResolu::Decision(decision))
+        }
     }
 
     /// DoP anticipé : une source DSD que la sortie prend en DoP est résolue
