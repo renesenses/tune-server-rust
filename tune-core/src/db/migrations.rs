@@ -1816,6 +1816,67 @@ CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(i
         name: "favoris_ordre_manuel",
         up: "",
     },
+    // #2219, phase 1 — le registre des serveurs multimedia devient DURABLE.
+    //
+    // Il vivait entierement dans `Arc<Mutex<HashMap<String, MediaServerInfo>>>`
+    // (`tune-server/src/state.rs:86`), et sa date de derniere observation etait
+    // un `Instant` `#[serde(skip)]` (`ssdp.rs:146`) : rien ne survivait a un
+    // redemarrage, et rien n'etait meme representable en absolu. La liste
+    // repartait donc VIDE a chaque demarrage, puis se remplissait au gre des
+    // annonces — c'est-a-dire au hasard.
+    //
+    // Le modele est `network_mounts` (migration 178-197 de ce meme fichier),
+    // et on en reprend la separation qui a rendu #1916 visible :
+    //   - `active` dit l'INTENTION (« ce serveur doit etre propose ») ;
+    //   - `last_state` / `absence_reason` disent le CONSTAT (ce qui s'est
+    //     reellement passe a la derniere observation).
+    // Sans cette separation, un serveur eteint et un serveur qu'on a choisi
+    // d'ecarter se ressemblent, et la route ne peut nommer ni l'un ni l'autre.
+    //
+    // `udn` EST la clef primaire, pas une colonne `id` : l'UDN est l'identite
+    // stable d'un appareil UPnP — le port change, lui non
+    // (`discovery/redecouverte.rs:1-45`). Une colonne `id` imposerait en prime
+    // la divergence AUTOINCREMENT / BIGSERIAL que la bascule SQLite ->
+    // PostgreSQL a deja payee cher (#1706) — meme choix que
+    // `streaming_item_tags` (97), `favorite_facets` (PG 038) et `task_runs`
+    // (87).
+    //
+    // `first_seen_at` n'est JAMAIS reecrit. C'est ce qui fait qu'un serveur qui
+    // revient ne perd pas son histoire, et c'est la lecon exacte de
+    // `zones.last_seen_at` (voir le commentaire de la migration 95,
+    // `migrations.rs:1659-1673`) : « poser la date de la mise a jour sur une
+    // zone morte depuis trois semaines la ferait passer pour recente ».
+    //
+    // Dates en TEXT ISO-8601 UTC des deux cotes, comme `zones.last_seen_at`
+    // (95 / PG 050) : rien a rattraper dans la parite de types.
+    //
+    // Rien n'est INDEXE par cette migration : elle ne porte que la liste des
+    // serveurs. L'indexation de leur contenu est la phase 2 du chantier.
+    Migration {
+        version: 101,
+        name: "media_servers_durables",
+        up: "
+CREATE TABLE IF NOT EXISTS media_servers (
+    udn TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    manufacturer TEXT,
+    model TEXT,
+    device_type TEXT NOT NULL DEFAULT 'upnp_media_server',
+    location TEXT NOT NULL DEFAULT '',
+    content_directory_url TEXT,
+    host TEXT,
+    port INTEGER,
+    max_age_secs INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    last_state TEXT,
+    absence_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -3057,6 +3118,33 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // table vient seulement d'etre garantie. PG : migration 057.
     add_column_if_missing(db, "streaming_favorites", "position", "INTEGER");
 
+    // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
+    // re-creee inconditionnellement pour la meme raison que les tables
+    // ci-dessus : une base venue de n'importe quelle version anterieure doit
+    // l'avoir, quel que soit le chemin de migration qu'elle a emprunte.
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS media_servers (\
+            udn TEXT PRIMARY KEY,\
+            name TEXT NOT NULL DEFAULT '',\
+            manufacturer TEXT,\
+            model TEXT,\
+            device_type TEXT NOT NULL DEFAULT 'upnp_media_server',\
+            location TEXT NOT NULL DEFAULT '',\
+            content_directory_url TEXT,\
+            host TEXT,\
+            port INTEGER,\
+            max_age_secs INTEGER,\
+            first_seen_at TEXT NOT NULL,\
+            last_seen_at TEXT NOT NULL,\
+            active INTEGER NOT NULL DEFAULT 1,\
+            last_state TEXT,\
+            absence_reason TEXT,\
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);",
+    )
+    .ok();
+
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -3554,6 +3642,16 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         57,
         "favoris_ordre_manuel",
         include_str!("../../migrations/postgres/057_favoris_ordre_manuel.sql"),
+    ),
+    // Jumelle de la migration SQLite 101 (#2219, phase 1) : le registre des
+    // serveurs multimedia. Sans elle, tout le parc PostgreSQL — .15, .18,
+    // Docker — n'aurait pas la table, et la route `GET /media-servers`, qui la
+    // LIT des cette version, y rendrait une erreur SQL : une liste vide sur les
+    // machines memes ou le defaut a ete mesure.
+    (
+        58,
+        "media_servers_durables",
+        include_str!("../../migrations/postgres/058_media_servers_durables.sql"),
     ),
 ];
 
@@ -5503,7 +5601,16 @@ mod tests {
         // le numero libre a ete remesure DANS LE CODE, entree par entree de
         // PG_MIGRATIONS, et non par un `ls migrations/postgres` que la 54 —
         // une entree `concat!` sans fichier — rendrait faux.
-        assert_eq!(pg_latest_version(), 57, "latest PG migration must be 57");
+        // 58 : `media_servers_durables` (#2219, phase 1). Jumelle SQLite : la
+        // 101. Le registre des serveurs multimedia vivait ENTIEREMENT en
+        // memoire (`Arc<Mutex<HashMap<String, MediaServerInfo>>>`,
+        // `tune-server/src/state.rs:86`), et sa date de derniere observation
+        // etait un `Instant` `#[serde(skip)]` — donc ni durable, ni meme
+        // representable en absolu. Table neuve, clef primaire naturelle
+        // (`udn`), dates en TEXT des deux cotes comme `zones.last_seen_at`
+        // (95 / PG 050). Le numero libre a ete remesure DANS LE CODE, entree
+        // par entree, comme la 56 et la 57 l'imposent.
+        assert_eq!(pg_latest_version(), 58, "latest PG migration must be 58");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
@@ -6129,6 +6236,84 @@ mod tests {
             "`streaming_item_tags` manque a ENSURE_TABLES : les bases \
              PostgreSQL deja converties (schema_version 99) resteraient sans \
              la table pour toujours"
+        );
+    }
+
+    /// `media_servers` (#2219, phase 1) doit exister sur les QUATRE chemins,
+    /// exactement comme `task_runs` et `streaming_item_tags`.
+    ///
+    /// L'enjeu est le meme, et il est concret : la route `GET /media-servers`
+    /// LIT cette table des cette version. Une base PostgreSQL creee par la
+    /// bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne
+    /// rejoue JAMAIS les scripts numerotes — sur ces bases-la, la migration
+    /// 058 ne s'appliquera ni maintenant ni jamais, et la liste des serveurs
+    /// multimedia rendrait une erreur SQL. Le `.15` et le `.18` sont
+    /// PRECISEMENT dans ce cas, et ce sont les machines ou le defaut a ete
+    /// mesure.
+    ///
+    /// Ce test lit les SOURCES : il vaut quel que soit le jeu de features
+    /// compile, `PG_MIGRATIONS` vivant derriere `#[cfg(feature = "postgres")]`.
+    #[test]
+    fn le_registre_des_serveurs_multimedia_existe_sur_les_quatre_chemins() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        // 1. Migration SQLite.
+        assert!(
+            MIGRATIONS
+                .iter()
+                .any(|m| m.name == "media_servers_durables"),
+            "la migration SQLite `media_servers_durables` a disparu"
+        );
+        // 1 bis. Le rattrapage inconditionnel de `run_migrations`, pour une
+        //        base SQLite venue de n'importe quelle version anterieure.
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains("CREATE TABLE IF NOT EXISTS media_servers (\\"),
+            "le rattrapage SQLite inconditionnel de `media_servers` a disparu \
+             de `run_migrations`"
+        );
+        // 2. Migration PG numerotee — .15, .18, Docker sur la piste numerotee.
+        assert!(
+            ce_fichier.contains("058_media_servers_durables.sql"),
+            "`media_servers` existe cote SQLite mais n'est pas enregistree \
+             dans PG_MIGRATIONS : tout le parc PostgreSQL resterait sans la \
+             table, et `GET /media-servers` y rendrait une erreur SQL"
+        );
+        assert!(
+            racine
+                .join("migrations/postgres/058_media_servers_durables.sql")
+                .exists(),
+            "l'entree PG_MIGRATIONS pointe sur un fichier absent"
+        );
+        // 3. `PG_FULL_SCHEMA` — une base montee d'un bloc par la bascule.
+        let pg_neuf = fs::read_to_string(racine.join("src/db/pg_migrate.rs")).unwrap();
+        assert!(
+            pg_neuf.contains("CREATE TABLE IF NOT EXISTS media_servers"),
+            "`media_servers` manque a PG_FULL_SCHEMA : une base creee par la \
+             bascule porte schema_version 99 et ne recevrait JAMAIS la \
+             migration 058"
+        );
+        // 3 bis. La table doit etre COPIEE a la bascule : sinon le registre
+        //        qu'on vient de rendre durable repartirait de zero ce jour-la,
+        //        c'est-a-dire le defaut exact qu'on corrige.
+        assert!(
+            pg_neuf.contains("\"media_servers\","),
+            "`media_servers` n'est pas dans MIGRATION_TABLES : le registre \
+             serait perdu a la bascule SQLite -> PostgreSQL"
+        );
+        // 3 ter. Pas de colonne `id` — la clef est l'UDN. La clause par
+        //        defaut `ON CONFLICT (id)` de la copie echouerait.
+        assert!(
+            pg_neuf.contains("ON CONFLICT (udn) DO NOTHING"),
+            "la copie SQLite -> PG n'a pas de clause ON CONFLICT propre a \
+             `media_servers`, qui n'a PAS de colonne `id`"
+        );
+        // 4. `ENSURE_TABLES` — le rattrapage rejoue a CHAQUE demarrage.
+        let ensure = fs::read_to_string(racine.join("src/db/postgres.rs")).unwrap();
+        assert!(
+            ensure.contains("CREATE TABLE IF NOT EXISTS media_servers"),
+            "`media_servers` manque a ENSURE_TABLES : les bases PostgreSQL \
+             deja converties (schema_version 99) resteraient sans la table \
+             pour toujours — le .15 et le .18 en font partie"
         );
     }
 }

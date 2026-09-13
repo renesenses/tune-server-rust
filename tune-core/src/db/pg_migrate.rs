@@ -177,6 +177,11 @@ const MIGRATION_TABLES: &[&str] = &[
     "bookmarks",
     "alarms",
     "network_mounts",
+    // Registre des serveurs multimedia (#2219, phase 1). Juste apres
+    // `network_mounts`, dont il reprend la forme — et pour la meme raison :
+    // sans cette ligne, la bascule SQLite -> PostgreSQL rendrait au registre
+    // le defaut qu'on vient de lui retirer, une liste qui repart de zero.
+    "media_servers",
     "podcast_subscriptions",
     "offline_cache",
     "sync_links",
@@ -638,6 +643,33 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
     PRIMARY KEY (tag_id, item_type, source, source_id)
 );
 
+-- Registre DURABLE des serveurs multimedia (#2219, phase 1). Une base creee
+-- par la bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne
+-- rejoue JAMAIS les scripts numerotes : sans cette declaration ici, la
+-- migration 058 ne l'atteindrait pas — ni maintenant, ni jamais.
+--
+-- Meme forme que `network_mounts` : `active` dit l'INTENTION, `last_state` et
+-- `absence_reason` disent le CONSTAT. `udn` est la clef primaire — l'identite
+-- stable d'un appareil UPnP, que le changement de port ne touche pas.
+CREATE TABLE IF NOT EXISTS media_servers (
+    udn TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    manufacturer TEXT,
+    model TEXT,
+    device_type TEXT NOT NULL DEFAULT 'upnp_media_server',
+    location TEXT NOT NULL DEFAULT '',
+    content_directory_url TEXT,
+    host TEXT,
+    port INTEGER,
+    max_age_secs INTEGER,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    last_state TEXT,
+    absence_reason TEXT,
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+
 CREATE TABLE IF NOT EXISTS album_ratings (
     id TEXT PRIMARY KEY,
     album_id TEXT NOT NULL,
@@ -845,6 +877,7 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
+CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
 CREATE INDEX IF NOT EXISTS idx_album_metadata_key ON album_metadata(key);
@@ -1167,6 +1200,10 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         // Cette table n'a PAS de colonne `id` : la clause par defaut
         // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
         "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
+        // Meme cas : pas de colonne `id`, la clef primaire est l'UDN — la
+        // seule identite d'un appareil UPnP qui survive a un changement de
+        // port (#2219, phase 1).
+        "media_servers" => "ON CONFLICT (udn) DO NOTHING",
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",
         "track_source_links" => "ON CONFLICT (track_id, service) DO NOTHING",

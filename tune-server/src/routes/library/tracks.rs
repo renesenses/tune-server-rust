@@ -761,14 +761,24 @@ pub(super) async fn track_lyrics(
     }
 
     // 3. LRCLIB — opt-in via the generic settings key `lyrics_lrclib_enabled`.
-    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let lrclib_enabled = settings
-        .get("lyrics_lrclib_enabled")
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("true");
-    if !lrclib_enabled {
+    //
+    // #4051 — UN seul lecteur du consentement, celui de `tune-core`. La règle
+    // était recopiée ici, dans `routes/lyrics.rs` et dans la passe de fond ;
+    // seule la troisième passait par la constante. Chercher le littéral dans
+    // le code trouvait donc deux sites sur trois, et rien n'empêchait les
+    // copies de diverger sur l'interprétation d'une clé absente.
+    if !tune_core::library::lyrics_pass::lrclib_consent_given(&state.backend) {
+        // Cette branche était MUETTE. `journalctl -u tune.service | grep -i lrc`
+        // restait vide qu'elle soit prise ou non — c'est l'argument dont
+        // Belkadi Yacine a conclu que le serveur n'essayait pas, et il ne
+        // départageait rien. Elle rend le MÊME 404 `no_lyrics` qu'un titre
+        // réellement sans paroles : sans cette ligne, rien au monde ne
+        // distingue les deux depuis le serveur.
+        tracing::info!(
+            track_id = id,
+            reglage = tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+            "paroles_recherche_en_ligne_desactivee"
+        );
         return no_lyrics();
     }
 

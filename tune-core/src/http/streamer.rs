@@ -97,13 +97,22 @@ impl StreamInfo {
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
         }
-        let bytes_per_sample = self.bit_depth as u64 / 8;
-        let frame_bytes = self.channels as u64 * bytes_per_sample;
+        let frame_bytes = self.channels as u64 * (self.bit_depth as u64 / 8);
         if frame_bytes == 0 {
             return None;
         }
-        let data_bytes = dur * self.sample_rate as u64 * frame_bytes / 1000;
-        Some(44 + data_bytes - data_bytes % frame_bytes)
+        // Une seule copie de la formule dans le dépôt : c'est la même que celle
+        // qui décide, AVANT décodage, si le PCM tiendra dans un en-tête RIFF
+        // (#4016). Deux copies auraient divergé le jour où l'une des deux
+        // s'arrondit autrement.
+        Some(
+            44 + crate::audio::wav::octets_pcm_attendus(
+                dur,
+                self.sample_rate,
+                self.channels,
+                self.bit_depth,
+            ),
+        )
     }
 }
 

@@ -18,6 +18,10 @@ use super::local::{
     NativePcmRing, WasapiEndpoint, WasapiInitDecision, select_wasapi_endpoint,
     wasapi_aligned_duration_100ns, wasapi_init_decision,
 };
+#[cfg(target_os = "windows")]
+use super::negociation_format_exclusif_3837::{
+    CandidatFormat, ResultatSonde, negocier_format_exclusif,
+};
 
 #[cfg(target_os = "windows")]
 fn resolve_wasapi_endpoint(requested: &str) -> Result<WasapiEndpoint, String> {
@@ -307,6 +311,108 @@ unsafe fn audio_client_buffer_size(audio_client: *mut std::ffi::c_void) -> Resul
     Ok(frames)
 }
 
+/// #3837 — le `WAVEFORMATEXTENSIBLE` d'un candidat, à cadence et canaux
+/// **inchangés**. Le seul point du code où `wBitsPerSample` et
+/// `wValidBitsPerSample` peuvent différer : un conteneur 32 bits portant
+/// 24 bits valides est ce que la plupart des interfaces d'enregistrement
+/// exposent en exclusif, et c'est bit à bit ce que Symphonia produit déjà.
+#[cfg(target_os = "windows")]
+fn format_wave_du_candidat(
+    candidat: CandidatFormat,
+    channels: u32,
+    sample_rate: u32,
+) -> ffi::WAVEFORMATEXTENSIBLE {
+    let block_align = (channels as u16) * candidat.octets_par_echantillon();
+    ffi::WAVEFORMATEXTENSIBLE {
+        Format: ffi::WAVEFORMATEX {
+            wFormatTag: ffi::WAVE_FORMAT_EXTENSIBLE,
+            nChannels: channels as u16,
+            nSamplesPerSec: sample_rate,
+            nAvgBytesPerSec: sample_rate * block_align as u32,
+            nBlockAlign: block_align,
+            wBitsPerSample: candidat.bits_conteneur,
+            cbSize: 22,
+        },
+        Samples: candidat.bits_valides,
+        dwChannelMask: if channels == 2 {
+            0x3
+        } else {
+            (1u32 << channels) - 1
+        },
+        SubFormat: ffi::KSDATAFORMAT_SUBTYPE_PCM,
+    }
+}
+
+/// #3837 — **une** sonde `IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, …)`.
+///
+/// Le quatrième argument n'est plus `null` : le pilote peut y déposer un
+/// format proche. Windows documente `*ppClosestMatch = NULL` en exclusif, mais
+/// les pilotes qui répondent quand même nous épargnent la liste de replis. Le
+/// bloc rendu par COM est libéré ici, dans tous les cas, et n'est retenu que
+/// s'il garde **la cadence et les canaux demandés** — on ne rééchantillonne ni
+/// ne remixe sur ce chemin.
+///
+/// # Safety
+/// `audio_client` doit être un `IAudioClient` valide et non encore initialisé.
+#[cfg(target_os = "windows")]
+unsafe fn sonder_format_exclusif(
+    audio_client: *mut std::ffi::c_void,
+    candidat: CandidatFormat,
+    channels: u32,
+    sample_rate: u32,
+) -> ResultatSonde {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    let wfx = format_wave_du_candidat(candidat, channels, sample_rate);
+    type IsFormatFn = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const ffi::WAVEFORMATEX,
+        *mut *mut ffi::WAVEFORMATEX,
+    ) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const c_void) };
+    let is_format: IsFormatFn = unsafe { std::mem::transmute(*vtable.add(7)) };
+    let mut plus_proche: *mut ffi::WAVEFORMATEX = ptr::null_mut();
+    let hr = unsafe {
+        is_format(
+            audio_client,
+            ffi::AUDCLNT_SHAREMODE_EXCLUSIVE,
+            &wfx.Format as *const ffi::WAVEFORMATEX,
+            &mut plus_proche,
+        )
+    };
+
+    let propose = if plus_proche.is_null() {
+        None
+    } else {
+        // `WAVEFORMATEX` est `repr(C, packed)` : on copie le bloc avant de
+        // lire ses champs, jamais de référence sur un champ désaligné.
+        let entete: ffi::WAVEFORMATEX = unsafe { ptr::read_unaligned(plus_proche) };
+        let conteneur = entete.wBitsPerSample;
+        let valides = if entete.cbSize >= 22 {
+            let etendu: ffi::WAVEFORMATEXTENSIBLE =
+                unsafe { ptr::read_unaligned(plus_proche as *const ffi::WAVEFORMATEXTENSIBLE) };
+            etendu.Samples
+        } else {
+            conteneur
+        };
+        let meme_flux = entete.nSamplesPerSec == sample_rate && entete.nChannels as u32 == channels;
+        unsafe { ffi::CoTaskMemFree(plus_proche as *mut c_void) };
+        if meme_flux {
+            Some(CandidatFormat::nouveau(conteneur, valides))
+        } else {
+            None
+        }
+    };
+
+    if hr == ffi::S_OK || hr == ffi::S_FALSE {
+        ResultatSonde::Accepte
+    } else {
+        ResultatSonde::Refuse { hr, propose }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -412,59 +518,54 @@ impl WasapiExclusiveOutput {
             };
             release(enumerator);
 
-            // 4. Build WAVEFORMATEXTENSIBLE for our desired format
-            let block_align = (channels as u16) * (bit_depth as u16 / 8);
-            let avg_bytes = sample_rate * block_align as u32;
-            let wfx = WAVEFORMATEXTENSIBLE {
-                Format: WAVEFORMATEX {
-                    wFormatTag: WAVE_FORMAT_EXTENSIBLE,
-                    nChannels: channels as u16,
-                    nSamplesPerSec: sample_rate,
-                    nAvgBytesPerSec: avg_bytes,
-                    nBlockAlign: block_align,
-                    wBitsPerSample: bit_depth as u16,
-                    cbSize: 22,
-                },
-                Samples: bit_depth as u16,
-                dwChannelMask: if channels == 2 {
-                    0x3
-                } else {
-                    (1u32 << channels) - 1
-                },
-                SubFormat: KSDATAFORMAT_SUBTYPE_PCM,
-            };
-
-            // 5. Check if format is supported in exclusive mode
-            {
-                type IsFormatFn = unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    *const WAVEFORMATEX,
-                    *mut *mut WAVEFORMATEX,
-                ) -> HRESULT;
-                let vtable = *(audio_client as *const *const *const c_void);
-                let is_format: IsFormatFn = std::mem::transmute(*vtable.add(7));
-                let hr = is_format(
-                    audio_client,
-                    AUDCLNT_SHAREMODE_EXCLUSIVE,
-                    &wfx.Format as *const WAVEFORMATEX,
-                    ptr::null_mut(),
+            // 4-5. Négocier le format en exclusif (#3837).
+            //
+            // La sortie locale arrive TOUJOURS en WAV 32 bits
+            // (`resolve_local.rs`), et c'est ce format qui était présenté tel
+            // quel au pilote — une seule fois, sans repli. Les interfaces
+            // d'enregistrement (TASCAM US-366, Focusrite, RME…) n'exposent en
+            // exclusif que 24 bits valides : pour elles, l'exclusif était
+            // impossible par construction, quelle que soit la source.
+            //
+            // On déroule maintenant `32/32` → `32/24` → `24/24` → `16/16`, à
+            // cadence et canaux INCHANGÉS, chaque essai n'étant qu'un
+            // `IsFormatSupported`. Aucun repli vers le mode partagé, aucun
+            // changement d'endpoint : la doctrine de #2233/#2125 tient.
+            let bit_depth_demande = bit_depth;
+            let negocie =
+                match negocier_format_exclusif(bit_depth, channels, sample_rate, |candidat| {
+                    sonder_format_exclusif(audio_client, candidat, channels, sample_rate)
+                }) {
+                    Ok(negocie) => negocie,
+                    Err(erreur) => {
+                        info!(
+                            sample_rate,
+                            bit_depth,
+                            channels,
+                            detail = %erreur,
+                            "wasapi_exclusive_format_not_supported"
+                        );
+                        release(audio_client);
+                        release(device);
+                        return Err(erreur);
+                    }
+                };
+            // Le conteneur retenu commande `pop_pcm_bytes` : c'est LUI, pas la
+            // profondeur demandée, que le fil de rendu doit sérialiser.
+            let bit_depth = u32::from(negocie.format.bits_conteneur);
+            if negocie.est_un_repli() {
+                warn!(
+                    device = %resolved.name,
+                    sample_rate,
+                    channels,
+                    profondeur_demandee = bit_depth_demande,
+                    conteneur_retenu = negocie.format.bits_conteneur,
+                    bits_valides = negocie.format.bits_valides,
+                    refus_avant = negocie.refus_avant,
+                    "wasapi_exclusive_format_replie"
                 );
-                if hr != S_OK && hr != S_FALSE {
-                    info!(
-                        sample_rate,
-                        bit_depth,
-                        channels,
-                        hr = format!("0x{hr:08X}"),
-                        "wasapi_exclusive_format_not_supported"
-                    );
-                    release(audio_client);
-                    release(device);
-                    return Err(format!(
-                        "WASAPI Exclusive: format {channels}ch {bit_depth}bit {sample_rate}Hz not supported (0x{hr:08X})"
-                    ));
-                }
             }
+            let wfx = format_wave_du_candidat(negocie.format, channels, sample_rate);
 
             // 6. Get device period for exclusive mode
             let mut default_period: REFERENCE_TIME = 0;
@@ -615,6 +716,10 @@ impl WasapiExclusiveOutput {
                 endpoint_id = %resolved.id,
                 sample_rate,
                 bit_depth,
+                // #3837 : le conteneur retenu peut différer de la profondeur
+                // demandée, et porter moins de bits valides que lui.
+                bit_depth_demande,
+                bits_valides = negocie.format.bits_valides,
                 channels,
                 buffer_frames = buffer_frame_count,
                 period_100ns = selected_period,

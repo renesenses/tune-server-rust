@@ -229,7 +229,10 @@ fn tune_os_recoit_version_sha_source_et_checksums_immuables() {
         "os_sha",
         "os_tag",
         "release OS deja publique",
-        "wait_workflow build-iso.yml",
+        // `build-iso.yml` n'est PLUS attendu : l'ISO x86_64 est abandonnee
+        // (#2151), l'image raw.xz fait le meme travail. Le train ne doit plus
+        // patienter 350 min pour elle. Ce qui reste garde est qu'il attend
+        // bien les deux images qui, elles, sont livrees.
         "wait_workflow build-rpi-image.yml",
         "wait_workflow build-x86-image.yml",
     ] {
@@ -238,6 +241,16 @@ fn tune_os_recoit_version_sha_source_et_checksums_immuables() {
             "preuve OS absente du workflow: {preuve}"
         );
     }
+
+    // #2151 — l'ISO x86_64 est abandonnee. Le train ne doit plus l'ATTENDRE :
+    // sans cette garde, retirer l'exigence ci-dessus laisserait le temoin
+    // muet sur le sujet, et l'attente de 350 min pourrait revenir sans qu'on
+    // le voie. Elle reste TOLEREE dans la release (`build-iso.yml` tourne
+    // encore dans tune-os) : c'est l'attente qui est interdite, pas le fichier.
+    assert!(
+        !os.contains("wait_workflow build-iso.yml"),
+        "le train attend a nouveau `build-iso.yml` : l'ISO x86_64 est abandonnee (#2151)"
+    );
 }
 
 #[test]

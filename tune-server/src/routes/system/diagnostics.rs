@@ -171,6 +171,26 @@ const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 /// `try_lock` et non `lock` : un diagnostic ne doit jamais attendre derrière
 /// une sortie en train de jouer — même choix que la section OAAT du rapport de
 /// bogue.
+///
+/// 🔴 #3801 — et c'est là que le relevé se retournait contre lui-même. Le
+/// `?` de `try_lock().ok()?` faisait DISPARAÎTRE la sortie de la liste. Or une
+/// sortie n'est verrouillée que parce que quelqu'un la tient : le sondeur, qui
+/// la prend à chaque tick pour lire son statut, ou l'orchestrateur. C'est-à-dire
+/// pendant qu'elle JOUE — le seul moment où le chiffre veut dire quelque chose.
+///
+/// Le dossier #3801 (Didier, décrochages FLAC 16/44 en sortie locale WASAPI)
+/// tient tout entier sur une mesure : `ring_starvation` pour sa zone, pendant
+/// un morceau qui décroche. Un `events` non nul place la panne en AMONT de la
+/// sortie, un zéro la place en AVAL. Une LIGNE ABSENTE, elle, ne se distingue
+/// pas d'un zéro : le JSON ne porte plus rien pour cette sortie, et la section
+/// du rapport de bogue disparaît entièrement (`if !ring_starvation.is_empty()`).
+/// Le testeur envoie un rapport muet, le triage lit « pas de famine », et la
+/// moitié du problème qu'une seule mesure devait éliminer est éliminée à tort.
+///
+/// Depuis #3801, une sortie verrouillée laisse une ligne qui DIT qu'elle n'a pas
+/// pu être mesurée. Une sortie sans anneau — tout renderer réseau — reste hors
+/// du relevé : elle n'a rien à mesurer, et c'est une propriété permanente de la
+/// sortie, pas l'accident d'un instant.
 async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
     let outputs = state.outputs.lock().await;
     outputs
@@ -178,19 +198,274 @@ async fn releve_famine_anneau(state: &AppState) -> Vec<Value> {
         .iter()
         .filter_map(|id| {
             let output = outputs.get(id)?;
-            let output = output.try_lock().ok()?;
-            let famine = output.ring_starvation()?;
-            Some(json!({
-                "output_id": id,
-                "output_name": output.name(),
-                "ring_starvation_events": famine.events,
-                "ring_starvation_missing_samples": famine.missing_samples,
-                "driver_underruns": famine.driver_underruns,
-                "served_samples": famine.served_samples,
-                "stream_ms": famine.stream_ms,
-            }))
+            match output.try_lock() {
+                Err(_) => ligne_famine(id, EtatDuReleve::Occupee),
+                Ok(sortie) => {
+                    let etat = match sortie.ring_starvation() {
+                        Some(famine) => EtatDuReleve::Mesure {
+                            nom: sortie.name(),
+                            famine,
+                        },
+                        None => EtatDuReleve::SansAnneau,
+                    };
+                    ligne_famine(id, etat)
+                }
+            }
         })
         .collect()
+}
+
+/// Ce qu'un relevé a pu établir pour UNE sortie (#3801).
+///
+/// Les trois cas sont disjoints et le troisième n'est PAS le deuxième : une
+/// sortie sans anneau n'a rien à mesurer, une sortie occupée a quelque chose à
+/// mesurer et on n'a pas pu le lire.
+enum EtatDuReleve<'a> {
+    /// Verrou pris, la sortie tient un anneau : voici son compteur.
+    Mesure {
+        nom: &'a str,
+        famine: tune_core::outputs::traits::OutputRingStarvation,
+    },
+    /// Verrou pris, aucun anneau : tout renderer réseau. Propriété permanente
+    /// de la sortie, elle reste hors du relevé.
+    SansAnneau,
+    /// Verrou refusé : la sortie était occupée à l'instant du relevé.
+    Occupee,
+}
+
+/// La ligne de relevé d'une sortie, ou `None` si elle n'a rien à y faire.
+///
+/// **Pourquoi une ligne pour une sortie occupée** : voir le bloc #3801 sur
+/// [`releve_famine_anneau`]. Elle ne porte AUCUNE des clés chiffrées, et c'est
+/// délibéré — tous les lecteurs de ce tableau font `as_u64().unwrap_or(0)`, et
+/// une clé à zéro serait exactement le mensonge que cette ligne existe pour
+/// empêcher. Une clé absente n'est pas un zéro : elle force le lecteur à
+/// traiter le cas.
+///
+/// `output_name` manque aussi, pour la raison qui a produit la ligne : le nom
+/// se lit à travers le verrou, celui-là même qui n'a pas pu être pris.
+fn ligne_famine(output_id: &str, etat: EtatDuReleve<'_>) -> Option<Value> {
+    match etat {
+        EtatDuReleve::SansAnneau => None,
+        EtatDuReleve::Occupee => Some(json!({
+            "output_id": output_id,
+            "mesure": "indisponible",
+            "raison": "sortie verrouillée au moment du relevé (elle jouait, ou le sondeur la lisait)",
+        })),
+        EtatDuReleve::Mesure { nom, famine } => Some(json!({
+            "output_id": output_id,
+            "output_name": nom,
+            "mesure": "lue",
+            "ring_starvation_events": famine.events,
+            "ring_starvation_missing_samples": famine.missing_samples,
+            "driver_underruns": famine.driver_underruns,
+            "served_samples": famine.served_samples,
+            "stream_ms": famine.stream_ms,
+        })),
+    }
+}
+
+/// La section « famine de l'anneau » du rapport de bogue, à partir du relevé.
+///
+/// Extraite du corps de `bug_report_markdown` par #3801 pour qu'un témoin
+/// puisse la lire : c'est ce texte-là que le testeur colle sur le forum, et
+/// c'est donc lui, et pas le JSON, qui doit rendre impossible de confondre
+/// « mesuré à zéro » et « pas mesuré ».
+fn section_famine_anneau(releve: &[Value]) -> String {
+    if releve.is_empty() {
+        return String::new();
+    }
+    let mut md = String::from("## Ring starvation (famine de l'anneau audio)\n");
+    for s in releve {
+        if s["mesure"] == "indisponible" {
+            md.push_str(&format!(
+                "- {} : ⚠ MESURE INDISPONIBLE — {}. Ce n'est PAS un compteur à zéro : \
+                 l'anneau de cette sortie n'a pas pu être lu.\n",
+                s["output_id"].as_str().unwrap_or("?"),
+                s["raison"].as_str().unwrap_or("sortie verrouillée"),
+            ));
+            continue;
+        }
+        md.push_str(&format!(
+            "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux) ; {} sous-alimentation(s) du pilote\n",
+            s["output_name"].as_str().unwrap_or("?"),
+            s["ring_starvation_events"].as_u64().unwrap_or(0),
+            s["ring_starvation_missing_samples"].as_u64().unwrap_or(0),
+            s["served_samples"].as_u64().unwrap_or(0),
+            s["stream_ms"].as_u64().unwrap_or(0),
+            s["driver_underruns"].as_u64().unwrap_or(0),
+        ));
+    }
+    md.push_str(
+        "  (un événement = un rappel audio comblé par des zéros, donc un \
+         PRODUCTEUR en retard ; la sous-alimentation du pilote est l'autre \
+         panne — le processus pas ordonnancé à temps — et c'est elle qui \
+         décide du noyau RT de Tune OS)\n\n",
+    );
+    md
+}
+
+/// #3801 — Didier, décrochages FLAC 16/44 en sortie locale WASAPI (fil 1741).
+///
+/// Le dossier tient sur UNE mesure, et elle est déjà livrée chez lui :
+/// `ring_starvation` pour sa zone, pendant un morceau qui décroche. Non nul, la
+/// panne est en amont de la sortie ; nul, elle est en aval. Une seule lecture
+/// élimine la moitié du problème.
+///
+/// Ces témoins gardent la seule chose qui pouvait rendre cette mesure
+/// trompeuse : qu'elle soit ABSENTE et se lise comme un zéro.
+///
+/// **Ce qu'ils couvrent** : la construction du relevé et le texte que le
+/// testeur colle sur le forum. Tout est indépendant de la plate-forme — pas un
+/// `cfg(windows)`, pas la feature `local-audio` — et tourne dans la cible `lib`
+/// de `tune-server`, donc à chaque `cargo test --workspace`.
+///
+/// **Ce qu'ils NE couvrent PAS** : le décrochage lui-même. Rien ici ne joue de
+/// son, n'ouvre WASAPI, ni ne prouve où la panne de Didier se trouve. Le fil
+/// de rendu WASAPI (`outputs/wasapi_exclusive.rs`) et le bras
+/// `outputs/local/bras_wasapi.rs` sont `cfg(target_os = "windows")` : ni Shrek
+/// ni le Mac ne les compilent, et aucun job ne les EXÉCUTE.
+#[cfg(test)]
+mod releve_famine_visible_3801 {
+    use super::*;
+    use tune_core::outputs::traits::OutputRingStarvation;
+
+    fn compteur_a_zero() -> OutputRingStarvation {
+        OutputRingStarvation::default()
+    }
+
+    /// LE témoin du dossier. Une sortie dont le verrou n'a pas pu être pris —
+    /// c'est-à-dire une sortie qui JOUE, la seule qui vaille d'être mesurée —
+    /// doit laisser une ligne. Avant #3801, le `?` de `try_lock().ok()?` la
+    /// faisait purement disparaître du tableau.
+    #[test]
+    fn une_sortie_occupee_laisse_une_ligne_au_lieu_de_disparaitre() {
+        let ligne = ligne_famine("local:SMSL SU-8", EtatDuReleve::Occupee).expect(
+            "une sortie occupée doit laisser une ligne : son ABSENCE se lit comme un \
+             compteur à zéro, et c'est la lecture qui a fermé #3801 à tort",
+        );
+        assert_eq!(ligne["output_id"], "local:SMSL SU-8");
+        assert_eq!(ligne["mesure"], "indisponible");
+        assert!(
+            ligne["raison"].as_str().is_some_and(|r| !r.is_empty()),
+            "la ligne doit dire POURQUOI la mesure manque"
+        );
+    }
+
+    /// Et elle ne doit porter aucun chiffre : tous les lecteurs du tableau font
+    /// `as_u64().unwrap_or(0)`, donc une clé posée à zéro serait le mensonge
+    /// même que la ligne existe pour empêcher.
+    #[test]
+    fn la_ligne_indisponible_ne_porte_aucun_compteur() {
+        let ligne = ligne_famine("local:SMSL SU-8", EtatDuReleve::Occupee).unwrap();
+        for cle in [
+            "ring_starvation_events",
+            "ring_starvation_missing_samples",
+            "driver_underruns",
+            "served_samples",
+            "stream_ms",
+        ] {
+            assert!(
+                ligne.get(cle).is_none(),
+                "la ligne d'une mesure indisponible ne doit porter aucun compteur, \
+                 or elle porte « {cle} » : un lecteur en `unwrap_or(0)` y lirait un zéro \
+                 fabriqué"
+            );
+        }
+    }
+
+    /// La contre-épreuve de la contre-épreuve : une sortie SANS anneau — tout
+    /// renderer réseau — reste hors du relevé. Elle n'a rien à mesurer, et
+    /// c'est une propriété permanente, pas l'accident d'un instant. Sans cette
+    /// garde, le correctif noierait le relevé sous une ligne par renderer.
+    #[test]
+    fn une_sortie_sans_anneau_reste_hors_du_releve() {
+        assert!(
+            ligne_famine("dlna:Cabasse", EtatDuReleve::SansAnneau).is_none(),
+            "un renderer réseau n'a pas d'anneau : il n'a rien à faire dans le relevé"
+        );
+    }
+
+    /// Une mesure réellement lue garde EXACTEMENT ses clés d'avant #3801 : le
+    /// correctif ne doit rien changer à ce que lisent les rapports déjà
+    /// déposés.
+    #[test]
+    fn une_mesure_lue_garde_ses_cles() {
+        let famine = OutputRingStarvation {
+            events: 41,
+            missing_samples: 17_640,
+            served_samples: 3_528_000,
+            driver_underruns: 0,
+            stream_ms: 40_000,
+        };
+        let ligne = ligne_famine(
+            "local:SMSL SU-8",
+            EtatDuReleve::Mesure {
+                nom: "Sortie SMSL SU-8",
+                famine,
+            },
+        )
+        .unwrap();
+        assert_eq!(ligne["output_name"], "Sortie SMSL SU-8");
+        assert_eq!(ligne["ring_starvation_events"], 41);
+        assert_eq!(ligne["ring_starvation_missing_samples"], 17_640);
+        assert_eq!(ligne["served_samples"], 3_528_000);
+        assert_eq!(ligne["stream_ms"], 40_000);
+        assert_eq!(ligne["driver_underruns"], 0);
+    }
+
+    /// Le texte que le testeur colle sur le forum. Une mesure indisponible ne
+    /// doit PAS s'y écrire comme la phrase d'un compteur à zéro — c'est la
+    /// forme sous laquelle la confusion arrive jusqu'au triage.
+    #[test]
+    fn le_rapport_ne_lit_pas_une_mesure_absente_comme_un_zero() {
+        let indisponible = ligne_famine("local:SMSL SU-8", EtatDuReleve::Occupee).unwrap();
+        let section = section_famine_anneau(std::slice::from_ref(&indisponible));
+
+        assert!(
+            section.contains("local:SMSL SU-8"),
+            "la sortie doit être NOMMÉE dans le rapport, sans quoi le testeur envoie un \
+             rapport muet : {section}"
+        );
+        assert!(
+            section.contains("MESURE INDISPONIBLE"),
+            "le rapport doit dire que la mesure manque : {section}"
+        );
+        assert!(
+            !section.contains("0 événement(s)"),
+            "le rapport écrit « 0 événement(s) » pour une mesure qui n'a jamais été \
+             prise : c'est le zéro fabriqué de #3801, et il envoie chercher la panne en \
+             aval de l'anneau : {section}"
+        );
+    }
+
+    /// Et un zéro RÉEL, lui, doit continuer de se lire comme un zéro : c'est
+    /// une mesure, et elle vaut autant que l'autre moitié du diagnostic.
+    #[test]
+    fn un_zero_reellement_mesure_reste_un_zero_dans_le_rapport() {
+        let mesuree = ligne_famine(
+            "local:SMSL SU-8",
+            EtatDuReleve::Mesure {
+                nom: "Sortie SMSL SU-8",
+                famine: compteur_a_zero(),
+            },
+        )
+        .unwrap();
+        let section = section_famine_anneau(std::slice::from_ref(&mesuree));
+        assert!(section.contains("Sortie SMSL SU-8"));
+        assert!(
+            section.contains("0 événement(s)"),
+            "un zéro mesuré doit rester lisible comme tel : {section}"
+        );
+        assert!(!section.contains("MESURE INDISPONIBLE"));
+    }
+
+    /// Un relevé vide n'écrit toujours aucune section : le comportement
+    /// d'avant l'extraction de `section_famine_anneau`.
+    #[test]
+    fn un_releve_vide_n_ecrit_aucune_section() {
+        assert_eq!(section_famine_anneau(&[]), "");
+    }
 }
 
 /// #3479 — ce que l'étage d'égalisation PRODUIT, et pas seulement ce qu'il
@@ -639,6 +914,12 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // lui-même, sur un anneau qui n'a pas eu faim. `eq_overs` dit
         // l'inverse, la saturation. Les deux étaient mesurés et invisibles.
         "dsp_egaliseur": dsp_egaliseur,
+        // #2218 (T9 suite) — ce que chaque étage a ÉCRÊTÉ depuis le démarrage,
+        // compté là où le clamp a lieu (ReplayGain, égaliseur, mixeur), sans
+        // le changer. Par processus, pas par zone : ces étages ne connaissent
+        // pas leur zone. Le journal porte `dsp_ecretage` au premier écrêtage
+        // d'une piste et à sa fin.
+        "dsp_ecretage": tune_core::audio::ecretage::releve(),
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -1853,26 +2134,7 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // #3205 : sans cette section, une famine ne laissait AUCUNE trace dans ce
     // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
     // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
-    if !ring_starvation.is_empty() {
-        md.push_str("## Ring starvation (famine de l'anneau audio)\n");
-        for s in &ring_starvation {
-            md.push_str(&format!(
-                "- {} : {} événement(s), {} échantillon(s) manquant(s) sur {} servis ({} ms de flux) ; {} sous-alimentation(s) du pilote\n",
-                s["output_name"].as_str().unwrap_or("?"),
-                s["ring_starvation_events"].as_u64().unwrap_or(0),
-                s["ring_starvation_missing_samples"].as_u64().unwrap_or(0),
-                s["served_samples"].as_u64().unwrap_or(0),
-                s["stream_ms"].as_u64().unwrap_or(0),
-                s["driver_underruns"].as_u64().unwrap_or(0),
-            ));
-        }
-        md.push_str(
-            "  (un événement = un rappel audio comblé par des zéros, donc un \
-             PRODUCTEUR en retard ; la sous-alimentation du pilote est l'autre \
-             panne — le processus pas ordonnancé à temps — et c'est elle qui \
-             décide du noyau RT de Tune OS)\n\n",
-        );
-    }
+    md.push_str(&section_famine_anneau(&ring_starvation));
     // #3479 : sans cette section, un etage d'egalisation qui rend du SILENCE
     // ne laissait aucune trace dans ce que le testeur depose — ni ici, ni dans
     // le journal. Reivax66 a fourni 25 lignes `eq_change_journal` toutes
@@ -1894,6 +2156,29 @@ instable ; l'anneau reste alimente et le DAC recoit du silence. A ne pas \
 confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
         );
     }
+    // #2218 (T9 suite) : ReplayGain sans pic tague ecretait 66 % d'un sinus a
+    // −0,1 dBFS sans compteur ni journal ; l'egaliseur comptait ses overs sans
+    // les dire. Chaque etage compte desormais la ou son clamp a lieu, sans le
+    // changer. Par processus depuis le demarrage, pas par zone.
+    let dsp_ecretage = tune_core::audio::ecretage::releve();
+    md.push_str("## DSP — ecretage (compte la ou le clamp a lieu, #2218)\n");
+    for (nom, e) in dsp_ecretage.etages() {
+        md.push_str(&format!(
+            "- {nom} : {} echantillon(s) ecrete(s) sur {} ({} %), exces max {} LSB, {} bloc(s) ecretant(s), {} piste(s) close(s) avec ecretage, {} ligne(s) dsp_ecretage\n",
+            e.echantillons_ecretes,
+            e.echantillons_vus,
+            e.pourcentage,
+            e.exces_max_lsb,
+            e.appels_ecretants,
+            e.pistes_ecretees,
+            e.lignes_journal,
+        ));
+    }
+    md.push_str(
+        "  (compte depuis le demarrage du processus, tous flux confondus ; le \
+journal porte `dsp_ecretage` au premier ecretage d'une piste et a sa fin, \
+jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
+    );
     md.push_str("## Database\n");
     // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
     // argument, donc une chaîne littérale, et toute installation PostgreSQL
@@ -2000,6 +2285,8 @@ confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
         "ring_starvation": ring_starvation,
         // Le pendant JSON de la section markdown ci-dessus (#3479).
         "dsp_egaliseur": dsp_egaliseur,
+        // Le pendant JSON de la section « DSP — ecretage » (#2218).
+        "dsp_ecretage": dsp_ecretage,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.

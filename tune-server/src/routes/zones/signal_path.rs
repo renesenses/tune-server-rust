@@ -142,13 +142,23 @@ pub(super) fn zone_eq_step_description(
 /// La PROVENANCE est le reste de #1627 : le panneau disait ce qui s'applique et
 /// de combien, jamais d'où ça vient. « Tune utilise-t-il mes tags rsgain ? »
 /// (#1382) se répondait alors partout sauf à l'endroit où la question se pose.
+///
+/// 🔴 **#4072 — un gain REFUSÉ est une étape, pas un silence.** Depuis le
+/// correctif, `prevent_clipping` armé refuse le gain positif d'une piste sans
+/// pic tagué : le facteur retombe à 1,0 exactement, et le seuil ci-dessous
+/// faisait alors DISPARAÎTRE l'étape. L'auditeur voyait ReplayGain armé, ses
+/// tags lus, la piste inchangée, et pas un mot pour l'expliquer — le même
+/// défaut de panneau muet que #1548/#1627. La retenue est donc nommée
+/// (`clipping_guard`), et l'étape existe même à facteur unité quand c'est un
+/// refus.
 pub(super) fn zone_replaygain_step(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
     track_id: Option<i64>,
 ) -> Option<ReplayGainStep> {
     use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, gain_factor, stored_gain_detail, stored_gain_source,
+        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_detail,
+        stored_gain_detail, stored_gain_source,
     };
     // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
     if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
@@ -157,9 +167,12 @@ pub(super) fn zone_replaygain_step(
     let tid = track_id?;
     let settings = ReplayGainSettings::load(backend);
     let (gain, source) = stored_gain_detail(backend, tid, settings.mode)?;
-    let factor = gain_factor(gain, settings);
-    // Même seuil que l'orchestrateur (`zone_replaygain_changes_audio`).
-    if (factor - 1.0).abs() <= 1e-6 {
+    let (factor, retenue) = gain_factor_detail(gain, settings);
+    let refus = retenue == RetenueAntiEcretage::GainPositifRefuseSansPic;
+    // Même seuil que l'orchestrateur (`zone_replaygain_changes_audio`). Un
+    // REFUS échappe au seuil : son facteur vaut justement 1,0, et c'est
+    // précisément ce qu'il faut dire.
+    if !refus && (factor - 1.0).abs() <= 1e-6 {
         return None;
     }
     // Le dB affiché est celui qui multiplie réellement les échantillons
@@ -173,23 +186,37 @@ pub(super) fn zone_replaygain_step(
     // le mode demandé. Une base illisible ne doit rien inventer : on retombe
     // sur la description d'avant, sans mention d'origine.
     let origin = stored_gain_source(backend, tid, source);
-    let description = match origin {
-        Some(src) => format!(
-            "ReplayGain ({label}, {applied_db:+.1} dB, {})",
-            src.label_fr()
-        ),
-        None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
+    let description = if refus {
+        // Dire les DEUX choses : ce que les tags demandaient, et pourquoi ça
+        // ne s'applique pas. Le gain demandé est celui du tag plus le
+        // pré-ampli — ce que l'auditeur a réglé, pas ce que le garde-fou en a
+        // fait.
+        let demande_db = gain.gain_db + settings.preamp_db;
+        format!(
+            "ReplayGain ({label}, {demande_db:+.1} dB refusés : aucun pic tagué, anti-écrêtage armé)"
+        )
+    } else {
+        match origin {
+            Some(src) => format!(
+                "ReplayGain ({label}, {applied_db:+.1} dB, {})",
+                src.label_fr()
+            ),
+            None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
+        }
     };
     Some(ReplayGainStep {
         description,
         granularity: label,
         source: origin.map(GainSource::as_str),
+        clipping_guard: retenue.as_str(),
+        // Un refus ne touche pas un échantillon : le fil reste intact.
+        alters_audio: !refus,
     })
 }
 
 /// L'étape ReplayGain du chemin du signal, description ET faits bruts.
 ///
-/// Les deux champs structurés sont ADDITIFS : le client qui ne lit que
+/// Les champs structurés sont ADDITIFS : le client qui ne lit que
 /// `description` continue de fonctionner à l'identique.
 pub(super) struct ReplayGainStep {
     description: String,
@@ -197,6 +224,42 @@ pub(super) struct ReplayGainStep {
     granularity: &'static str,
     /// `"file_tags"` ou `"analysis"`, absent si la base n'a pas répondu.
     source: Option<&'static str>,
+    /// `"none"` / `"tagged_peak"` / `"refused_no_peak"` (#4072) : ce que
+    /// l'anti-écrêtage a retenu sur le facteur demandé.
+    clipping_guard: &'static str,
+    /// Cette étape multiplie-t-elle réellement les échantillons ? Faux pour un
+    /// refus, qui laisse le fil intact.
+    alters_audio: bool,
+}
+
+/// Ce que l'étage ReplayGain a écrêté depuis le DÉMARRAGE DU PROCESSUS
+/// (#2218 T9 A, #4072).
+///
+/// ⚠️ **Portée `processus`, pas zone, et c'est dit dans la charge utile.**
+/// `apply_gain_pcm` reçoit un `f64` nu du bras progressif
+/// (`StreamingDsp.replaygain: Option<f64>`) : elle ne connaît ni la piste ni
+/// la zone, et son compteur ne peut donc pas être ventilé. Le champ `portee`
+/// interdit de lire ces chiffres comme ceux de la zone affichée — c'est la
+/// même limite que la section `dsp_ecretage` du rapport de diagnostic, qui lit
+/// le même registre.
+///
+/// Pourquoi l'exposer ici quand même : `eq_overs` est exposé juste en dessous
+/// depuis longtemps et c'est ce qui a permis de nommer le défaut B de T9. Le
+/// ReplayGain n'avait RIEN — la mutilation de 66 % des échantillons mesurée
+/// par le banc T9 était invisible de partout. Depuis #4072 le garde-fou armé
+/// tient ce compteur à zéro : un chiffre non nul ici veut dire garde-fou
+/// désarmé, et l'auditeur peut le relier à son réglage.
+fn replaygain_ecretage_metrics() -> serde_json::Value {
+    let releve = tune_core::audio::ecretage::REGISTRE.replaygain.releve();
+    json!({
+        "portee": "processus",
+        "echantillons_vus": releve.echantillons_vus,
+        "echantillons_ecretes": releve.echantillons_ecretes,
+        "pourcentage": releve.pourcentage,
+        "exces_max_lsb": releve.exces_max_lsb,
+        "appels_ecretants": releve.appels_ecretants,
+        "pistes_ecretees": releve.pistes_ecretees,
+    })
 }
 
 /// La zone replie-t-elle sa sortie LOCALE en mono — et si oui, que dire ?
@@ -666,12 +729,19 @@ fn assembler_les_etapes(
         steps.push(json!({
             "name": "ReplayGain",
             "description": rg.description,
-            "bit_perfect": false,
+            // #4072 : un gain REFUSÉ ne touche pas un échantillon — le dire
+            // « non bit-perfect » peindrait en rouge une étape qui n'a rien
+            // dégradé, exactement l'erreur de couleur de #2053.
+            "bit_perfect": !rg.alters_audio,
             // Additifs (#1627) : la description reste le libellé prêt à
-            // afficher, ces deux champs permettent au client de composer le
-            // sien (icône, traduction) sans analyser une chaîne française.
+            // afficher, ces champs permettent au client de composer le sien
+            // (icône, traduction) sans analyser une chaîne française.
             "granularity": rg.granularity,
             "gain_source": rg.source,
+            // #4072 : ce que l'anti-écrêtage a retenu, et ce que l'étage a
+            // écrêté depuis le démarrage (portée processus, dite dans l'objet).
+            "clipping_guard": rg.clipping_guard,
+            "metrics": replaygain_ecretage_metrics(),
         }));
     }
 
@@ -905,12 +975,19 @@ fn rendre_les_verdicts(
     // `dsp_applique`, et non `dsp_enabled` : un EQ armé qu'un flux DSD brut
     // met hors de portée ne touche AUCUN échantillon. Le faire tomber le
     // verdict serait mentir dans l'autre sens (#1393).
+    //
+    // #4072 : `alters_audio`, et non la simple PRÉSENCE de l'étape. Une étape
+    // ReplayGain existe maintenant aussi pour un gain REFUSÉ (anti-écrêtage
+    // armé, aucun pic tagué) — facteur 1,0, pas un échantillon touché. La
+    // faire tomber le verdict serait le même mensonge inverse que #1393 : le
+    // fil est intact, l'étape ne fait que l'expliquer.
+    let replaygain_altere = replaygain_step.is_some_and(|rg| rg.alters_audio);
     let bit_perfect = is_lossless
         && transport_bit_perfect
         && !dsp_applique
         && !resampling_active
         && !transformation_reelle_declaree
-        && replaygain_step.is_none()
+        && !replaygain_altere
         && mono_downmix_step.is_none();
 
     // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.

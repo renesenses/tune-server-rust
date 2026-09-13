@@ -191,7 +191,11 @@ pub(super) async fn completeness_stats(
           WHERE al.artist_id IS NULL OR ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist'), \
          (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
          (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) \
-          AND (image_path IS NULL OR image_path = ''))";
+          AND (image_path IS NULL OR image_path = '')), \
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_track' AND value != ''), \
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'analysis'), \
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'tag'), \
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_indisponible')";
     let row = b
         .query_one(sql, &[])
         .map_err(AppError::internal)?
@@ -219,6 +223,22 @@ pub(super) async fn completeness_stats(
     let albums_without_artist = get(10);
     let total_artists = get(11);
     let artists_without_image = get(12);
+    // Plage dynamique (#2218). Ces quatre compteurs n'existaient nulle part :
+    // le DR s'affichait par piste et par album, se filtrait à la recherche,
+    // mais RIEN ne disait combien de pistes en avaient un, ni d'où il venait.
+    //
+    // La distinction `tag` / `analysis` n'est pas cosmétique : un DR lu dans
+    // les tags du fichier vaut ce que vaut le tagueur qui l'a écrit, un DR
+    // `analysis` a été mesuré ici. Les mélanger sans le dire laisse croire à
+    // une bibliothèque homogène qui ne l'est pas.
+    //
+    // `dr_indisponible` marque les pistes que la passe a essayées et écartées
+    // pour de bon : elles ne reviendront jamais, et il faut les retirer du
+    // dénominateur mental « ce qui reste à faire ».
+    let with_dr = get(13);
+    let dr_from_analysis = get(14);
+    let dr_from_tag = get(15);
+    let dr_unavailable = get(16);
     // Le client affiche ce nombre dans la pastille « Métadonnées douteuses ».
     // Réutiliser le compteur de la route `/metadata/doubtful` garantit que la
     // pastille et la liste comptent exactement la même population (#1897).
@@ -293,6 +313,15 @@ pub(super) async fn completeness_stats(
         "mbid_pct": mbid_pct.round(),
         "health_score": health_score,
         "health_grade": grade,
+        "with_dynamic_range": with_dr,
+        "dynamic_range_from_analysis": dr_from_analysis,
+        "dynamic_range_from_tag": dr_from_tag,
+        "dynamic_range_unavailable": dr_unavailable,
+        "dynamic_range_pct": if total_tracks > 0 {
+            (with_dr as f64 / total_tracks as f64 * 100.0).round()
+        } else {
+            0.0
+        },
     })))
 }
 

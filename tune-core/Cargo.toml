@@ -381,6 +381,13 @@ path = "tests/temoin_decision_locale.rs"
 name = "marge_et_crete_2218"
 path = "tests/marge_et_crete_2218.rs"
 
+# #2218 (suite de T9) — l'écrêtage est COMPTÉ et DIT, sans changer un
+# échantillon : compteurs, lignes `dsp_ecretage`, empreintes FNV des octets de
+# sortie relevées AVANT le comptage. Aucune caractéristique requise.
+[[test]]
+name = "ecretage_compte_2218"
+path = "tests/ecretage_compte_2218.rs"
+
 # #2218 T10 — le rééchantillonneur (`audio::resample`) mesuré contre une
 # référence sinc indépendante écrite dans le test (Kaiser β = 14, 1025
 # coefficients, f64, polyphase exacte), par rapport de cadence. Aucune
@@ -439,3 +446,34 @@ path = "tests/melangeur_multi_producteurs_r3.rs"
 [[test]]
 name = "journal_perte_flac_2218"
 path = "tests/journal_perte_flac_2218.rs"
+
+# #2211 — le fondu enchaîné qui superpose vraiment deux pistes. Le témoin
+# mesure le PCM LIVRÉ (Goertzel sur trois fenêtres, comparaison mot à mot d'un
+# recouvrement issu de deux décodages réels menés dans deux fils simultanés) et
+# porte sa propre contre-épreuve : le flux séquentiel de #2211, reconstitué,
+# doit faire échouer la même mesure. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et la porte
+# rendrait un vert contre rien.
+[[test]]
+name = "fondu_enchaine_superpose_deux_pistes_2211"
+path = "tests/fondu_enchaine_superpose_deux_pistes_2211.rs"
+# #4023 — HQPlayer natif : le `Play` qui suivait le `PlaylistAdd` n'arrivait
+# jamais. Le témoin monte un faux HQPlayer sur une socket locale et lit les
+# octets réellement écrits par un `play_media` : une SEULE déclaration XML par
+# connexion de contrôle, et le `Play` après le `PlaylistAdd`. `autotests =
+# false` en tête de ce manifeste : sans cette cible, le fichier ne serait
+# JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "hqplayer_declaration_xml_unique_4023"
+path = "tests/hqplayer_declaration_xml_unique_4023.rs"
+
+# #4023, second temps — l'album qui n'avançait pas. Le témoin mesure l'AVANCE
+# de file au niveau du protocole (deux `play_media` d'affilée sur une seule
+# sortie, soit quatre commandes sur une connexion) et garde la ligne qui dit
+# qu'une réponse `Status` n'a pas été comprise. Binaire à lui seul : il pose un
+# abonné `tracing` GLOBAL, donc un seul essai dedans. `autotests = false` en
+# tête de ce manifeste : sans cette cible, le fichier ne serait JAMAIS compilé
+# et la porte rendrait un vert contre rien.
+[[test]]
+name = "hqplayer_avance_album_4023"
+path = "tests/hqplayer_avance_album_4023.rs"

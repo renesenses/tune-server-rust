@@ -336,6 +336,30 @@ pub(super) async fn get_config(
         // from the one above, and default ON since it always behaved that way.
         // The web toggle writes "false" to opt out (JP Borderies).
         ("scan_import_playlists", json!(true)),
+        // #4051 — le consentement LRCLIB, publié comme ses deux voisins de la
+        // MÊME section « Bibliothèque » (`metadata_readonly`, `enrich_on_scan`).
+        //
+        // Il n'y figurait pas : sur une base qui n'a jamais reçu le réglage, la
+        // clé était simplement ABSENTE de la réponse. Le client web ne pouvait
+        // donc pas distinguer « éteint » de « je n'ai pas lu la config » — la
+        // distinction que `lyricsOnline.ts` tient pourtant à trois états
+        // (`true`/`false`/`null`), et dont le troisième existe pour ne pas
+        // accuser un réglage qu'on n'a pas mesuré. C'est la règle que ce
+        // fichier applique déjà partout ailleurs (`local_exclusive_mode_supported`,
+        // `replaygain_analysis_enabled`) : **une clé absente se lit « je ne sais
+        // pas », pas « non »**.
+        //
+        // `GET /system/profile` (la fiche support) la publie, elle, depuis
+        // #3577, avec le même défaut `false`. Deux surfaces du même serveur ne
+        // répondaient pas la même chose sur le même réglage : celle que le
+        // support lit le nommait, celle que l'interface lit l'omettait.
+        //
+        // La clé vient de la CONSTANTE, pas d'un littéral recopié : c'est la
+        // même que celle que lisent les deux routes paroles et la passe de fond.
+        (
+            tune_core::library::lyrics_pass::SETTING_LRCLIB_ENABLED,
+            json!(false),
+        ),
         // Le mode PURE impose-t-il le volume à 100 % ? Inactif par défaut :
         // cocher « Audiophile » ne doit pas changer le niveau sans prévenir.
         ("audiophile_lock_volume", json!(false)),
@@ -943,6 +967,23 @@ pub(super) async fn update_config(
         write_profile_pref(&settings, profile.id(), UI_PREFERENCES, &str_val);
     }
 
+    // #4051 — ce que cette route a réellement POSÉ, et sous quels noms.
+    //
+    // La porte d'écriture de tous les réglages était entièrement MUETTE. Un
+    // testeur qui bascule un interrupteur et ne voit rien changer n'avait, côté
+    // serveur, aucun moyen de savoir si sa demande était arrivée : le journal
+    // ne portait pas une ligne, ni au succès ni au refus. Belkadi Yacine y a
+    // passé trois heures et a conclu — de bonne foi, et à tort d'après le code
+    // — que l'interface n'appelait pas l'API. Personne ne pouvait le
+    // départager sans lui demander d'ouvrir la console de son navigateur.
+    //
+    // On journalise les NOMS, jamais les valeurs : la table `settings` porte
+    // des secrets (`jwt_secret`, `auth_tokens_*`, clés développeur), et le
+    // journal n'en est pas le dépositaire — c'est la règle que garde déjà
+    // `tests/cles_developpeur_hors_journal.rs`. Un nom suffit pour trancher
+    // « la requête est arrivée » de « la requête n'est jamais partie », qui
+    // est la seule question que ce ticket n'a pas su résoudre.
+    let mut cles_posees: Vec<String> = Vec::with_capacity(values.len());
     for (key, value) in values {
         let str_val = if value.is_string() {
             value
@@ -953,8 +994,17 @@ pub(super) async fn update_config(
             value.to_string()
         };
         if let Err(e) = settings.set(&key, &str_val) {
+            tracing::error!(reglage = %key, erreur = %e, "reglage_non_ecrit");
             return Ok((StatusCode::INTERNAL_SERVER_ERROR, e).into_response());
         }
+        cles_posees.push(key);
+    }
+    if !cles_posees.is_empty() {
+        tracing::info!(
+            reglages = %cles_posees.join(","),
+            nombre = cles_posees.len(),
+            "reglages_ecrits"
+        );
     }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));

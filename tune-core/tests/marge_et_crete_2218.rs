@@ -306,11 +306,19 @@ fn profil(bands: Vec<EqBandSpec>) -> EqProfile {
 // ═════════════════════════ Q1 — gain, écrêtage, nommage ═════════════════════════
 
 /// Sinus 997 Hz à −0,1 dBFS, 16 bits ; ReplayGain +6 dB SANS pic tagué,
-/// `prevent_clipping` armé. Mesuré : le facteur reste ×1,995 (+6 dB), 66 % des
-/// échantillons sont écrêtés DUR (saturation, pas d'enroulement), et
-/// `apply_gain_pcm` ne rend rien : ni compteur, ni journal.
+/// `prevent_clipping` **désarmé**. Mesuré : le facteur reste ×1,995 (+6 dB),
+/// 66 % des échantillons sont écrêtés DUR (saturation, pas d'enroulement).
+///
+/// 🔴 **#4072 a changé l'armement, pas la saturation.** Ce témoin mesurait le
+/// même stimulus avec `prevent_clipping` ARMÉ, et c'était le défaut A de T9 :
+/// le garde-fou ne retenait rien sans pic tagué. Depuis le correctif, armé, le
+/// facteur ne dépasse plus l'unité — c'est le jumeau ci-dessous qui le tient.
+/// Ce que ce témoin garde toujours, désarmé, c'est le comportement de
+/// `apply_gain_pcm` lui-même : saturation dure au rail, signe conservé, aucun
+/// enroulement. L'auditeur qui décoche la case obtient exactement cela, et les
+/// chiffres de T9 restent mesurés, à l'échantillon près.
 #[test]
-fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur_sans_le_dire() {
+fn q1_replaygain_sans_garde_fou_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur() {
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 16);
     let entree = depuis_pcm(&pcm, 16);
@@ -320,11 +328,11 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
             gain_db: 6.0,
             peak: None,
         },
-        reglages(true, 0.0),
+        reglages(false, 0.0),
     );
     assert!(
         (facteur - 1.9953).abs() < 1e-3,
-        "sans pic tagué, prevent_clipping ne retient rien : facteur ×{facteur:.4} (+6 dB)"
+        "garde-fou désarmé : rien ne retient le facteur ×{facteur:.4} (+6 dB)"
     );
     assert_eq!(
         gain_factor(
@@ -332,10 +340,10 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
                 gain_db: 30.0,
                 peak: None
             },
-            reglages(true, 0.0)
+            reglages(false, 0.0)
         ),
         4.0,
-        "le seul plafond du facteur est le clamp ×4 (+12 dB) de gain_factor"
+        "désarmé, le seul plafond du facteur est le clamp ×4 (+12 dB) de gain_factor"
     );
 
     let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * facteur).collect();
@@ -381,13 +389,22 @@ fn q1_replaygain_sans_pic_tague_porte_le_sinus_au_dela_de_0_dbfs_et_l_ecrete_dur
     );
 }
 
-/// Le comportement ATTENDU : `prevent_clipping` armé ⇒ aucun échantillon
-/// écrêté, pic tagué ou non.
+/// Le comportement ATTENDU, **tenu depuis #4072** : `prevent_clipping` armé ⇒
+/// aucun échantillon écrêté, pic tagué ou non.
+///
+/// Le témoin était `#[ignore]` — c'était le défaut A de T9. Il est réveillé
+/// par le correctif : sans pic tagué, `gain_factor` refuse le gain positif en
+/// entier (l'unité, pas le plafond dBTP), et les octets sortent intacts.
+///
+/// Ce qu'il garde, et qui rougirait si le refus disparaissait : le nombre
+/// d'écrêtés contre l'IDÉAL (0), le compteur du registre (0), et l'identité
+/// octet pour octet du PCM — un facteur simplement raboté à 0,99 passerait le
+/// premier et pas le troisième.
 #[test]
-#[ignore = "défaut connu : sans pic tagué, prevent_clipping n'empêche rien et apply_gain_pcm écrête dur sans compter (docs/mesures/2218-marge-ecretage-crete-vraie.md, issue A)"]
-fn q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague() {
+fn q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague() {
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 16);
+    let original = pcm.clone();
     let entree = depuis_pcm(&pcm, 16);
     let facteur = gain_factor(
         TrackGain {
@@ -396,31 +413,50 @@ fn q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic
         },
         reglages(true, 0.0),
     );
+    eprintln!("q1 prevent_clipping armé, +6 dB sans pic : facteur ×{facteur:.6}");
+    assert!(
+        facteur <= 1.0,
+        "sans pic tagué, le facteur ne doit jamais amplifier : ×{facteur:.6}"
+    );
     let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * facteur).collect();
     apply_gain_pcm(&mut pcm, 16, facteur);
-    let (n_ecretes, _) = ecretes(&ideal, 16);
+    let (n_ecretes, exces_lsb) = ecretes(&ideal, 16);
     assert_eq!(
         n_ecretes, 0,
-        "prevent_clipping est armé : aucun échantillon ne devrait dépasser le rail"
+        "prevent_clipping est armé : aucun échantillon ne devrait dépasser le rail (excès max {exces_lsb:.0} LSB)"
+    );
+    assert_eq!(
+        pcm, original,
+        "un gain refusé est l'identité : pas un octet ne bouge"
+    );
+    let sortie = depuis_pcm(&pcm, 16);
+    assert_eq!(
+        au_rail(&sortie, 16),
+        0,
+        "aucun échantillon posé sur le rail"
     );
 }
 
 /// Sinus 997 Hz à −0,1 dBFS, 24 bits ; une bande passe-bas à 997 Hz, Q = 4.
-/// Un passe-bas RBJ vaut |H(fc)| = Q, soit +12 dB à la résonance — et
-/// `automatic_headroom_db` ne réserve RIEN pour un filtre « pass ». Mesuré :
-/// préampli 0 dB, ~84 % d'overs comptés dans `EqProcessStats` (exposés par
-/// `eq_overs`), écrêtés DUR par `write_sample_f64` à 1,0 − 1 LSB PUIS dithérés
-/// (ils sortent au rail ou 1 LSB en dessous), sans journal.
+/// Un passe-bas RBJ vaut |H(fc)| = Q, soit +12,04 dB à la résonance — et
+/// jusqu'à #4073 `automatic_headroom_db` ne réservait RIEN pour un filtre
+/// « pass » : 0 dB de préampli, **36 896 / 44 100 overs (83,7 %)** écrêtés DUR
+/// par `write_sample_f64`, comptés mais jamais journalisés.
+///
+/// Depuis #4073 la réserve regarde le Q : `20·log10(Q/0,707)` = **−15,05 dB**,
+/// ce qui couvre le maximum fréquentiel exact (Q/√(1−1/4Q²) = +12,11 dB) ET la
+/// norme L1 du même filtre (+14,19 dB, mesurée). Résultat : zéro over, rien au
+/// rail, et la crête retombe à −3,11 dBFS.
 #[test]
-fn q1_l_egaliseur_entier_ne_reserve_rien_pour_un_passe_bas_resonnant_et_ecrete_dur_en_comptant() {
+fn q1_l_egaliseur_entier_reserve_la_resonance_d_un_passe_bas_et_n_ecrete_plus() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
-    assert_eq!(
-        p.automatic_headroom_db(0),
-        0.0,
-        "réserve automatique : rien pour un passe-bas, quelle que soit sa résonance"
+    let reserve = p.automatic_headroom_db(0);
+    assert!(
+        (reserve + 15.0515).abs() < 1e-3,
+        "réserve = 20·log10(Q/0,707) pour Q = 4, soit −15,0515 dB : {reserve}"
     );
     let mut eq = EqProcessor::new(&p, FS, 1);
-    assert_eq!(eq.preamp_db(0), Some(0.0));
+    assert_eq!(eq.preamp_db(0), Some(reserve));
 
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 24);
@@ -428,40 +464,33 @@ fn q1_l_egaliseur_entier_ne_reserve_rien_pour_un_passe_bas_resonnant_et_ecrete_d
     let sortie = depuis_pcm(&pcm, 24);
     let n_rail = au_rail(&sortie, 24);
     let n_rail_1 = au_rail_a_1_lsb_pres(&sortie, 24);
+    let crete = crete_echantillon(&normalise(&sortie, 24));
     eprintln!(
-        "q1 égaliseur passe-bas Q=4 : préampli {:?} dB, overs {}/{N} ({:.1} %), au rail {n_rail}, au rail à 1 LSB près {n_rail_1}, non finis {}",
+        "q1 égaliseur passe-bas Q=4 : préampli {:?} dB, overs {}/{N}, au rail {n_rail}, au rail à 1 LSB près {n_rail_1}, crête {:+.2} dBFS, non finis {}",
         eq.preamp_db(0),
         stats.overs,
-        100.0 * stats.overs as f64 / N as f64,
+        dbfs(crete),
         stats.non_finite_samples
     );
-    assert!(
-        stats.overs > N as u64 * 3 / 4 && stats.overs < N as u64 * 9 / 10,
-        "résonance +12 dB sur un signal à −0,1 dBFS : la majorité des échantillons dépasse (~84 %) : {}",
-        stats.overs
+    assert_eq!(
+        stats.overs, 0,
+        "la résonance est réservée : plus un seul échantillon ne dépasse"
     );
-    assert!(
-        n_rail_1 >= stats.overs.saturating_sub(4) as usize,
-        "chaque over est écrêté DUR (rail ou rail − 1 LSB, le dither venant APRÈS la saturation) : {n_rail_1}, overs {}",
-        stats.overs
-    );
-    assert!(
-        n_rail < n_rail_1 && n_rail > n_rail_1 / 2,
-        "le dither ±1 LSB répartit le plateau écrêté entre le rail et 1 LSB en dessous : {n_rail} / {n_rail_1}"
-    );
-    assert_eq!(sortie.iter().max(), Some(&8_388_607));
-    assert_eq!(sortie.iter().min(), Some(&-8_388_608));
+    assert_eq!(n_rail, 0, "plus rien au rail");
+    assert_eq!(n_rail_1, 0, "ni à 1 LSB du rail");
+    assert_eq!(stats.non_finite_samples, 0);
     assert_eq!(
         eq.process_stats().overs,
-        stats.overs,
-        "compté, cumulé — mais jamais journalisé"
+        0,
+        "le compteur cumulé de la piste reste à zéro"
     );
 }
 
-/// Le comportement ATTENDU : la réserve automatique couvre la résonance
-/// (+20·log10(Q) dB) des passe-bas / passe-haut, et rien ne dépasse.
+/// Le comportement ATTENDU par #4073 — et désormais OBTENU. Le nom est
+/// conservé tel quel : c'est celui que citent l'issue et
+/// `docs/mesures/2218-marge-ecretage-crete-vraie.md`, et c'est ce témoin-là
+/// qui devait passer de `#[ignore]` à vert.
 #[test]
-#[ignore = "défaut connu : automatic_headroom_db ignore la résonance +20·log10(Q) dB des filtres low_pass/high_pass (issue B)"]
 fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_passe_bas() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
     assert!(
@@ -475,12 +504,45 @@ fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_pass
     assert_eq!(stats.overs, 0, "aucun over avec une réserve correcte");
 }
 
-/// Même profil, chemin FLOTTANT (sortie locale) : les overs sont comptés et
-/// laissés tels quels, jusqu'à ×3,95. C'est documenté comme voulu (le
-/// saturateur est plus loin — `f32_to_native_i32`, privé, ou personne sur le
-/// chemin cpal flottant).
+/// Le prix de la réserve, et la ligne qu'elle ne franchit PAS.
+///
+/// Un passe-haut de Butterworth (Q = 0,707) — le coupe-bas ordinaire — a un
+/// maximum fréquentiel de 0 dB et une norme L1 de **+7,02 dB** : sur un carré
+/// à 50 Hz il dépasse le rail. #4073 ne le réserve pas, et c'est un CHOIX :
+/// couvrir cette norme-là coûterait 7 dB de niveau à tout utilisateur d'un
+/// coupe-bas, pour un dépassement que seul un signal adverse atteint. Une
+/// réserve trop large abîme le son autant qu'une réserve trop courte ; ce
+/// témoin fige la ligne, chiffrée, pour que personne ne la déplace sans le
+/// dire.
 #[test]
-fn q1_l_egaliseur_flottant_laisse_passer_les_overs_sans_les_ecreter() {
+fn q1_un_passe_haut_de_butterworth_ne_reserve_rien_et_c_est_assume() {
+    let p = profil(vec![bande("high_pass", 997.0, 0.0, FRAC_1_SQRT_2)]);
+    assert_eq!(
+        p.automatic_headroom_db(0),
+        0.0,
+        "Q ≤ 0,707 : aucune résonance, aucune réserve"
+    );
+    let mut eq = EqProcessor::new(&p, FS, 1);
+    let mut pcm = vers_pcm(&carre(50.0, -0.05, N), 24);
+    let stats = eq.process_pcm(&mut pcm, 24);
+    eprintln!(
+        "q1 passe-haut Butterworth sur un carré 50 Hz : réserve 0 dB, overs {} / {N} ({:.1} %) — norme L1 du filtre +7,02 dB, non réservée",
+        stats.overs,
+        100.0 * stats.overs as f64 / N as f64
+    );
+    assert!(
+        stats.overs > 0,
+        "la norme L1 d'un passe-haut n'est pas réservée : le carré dépasse"
+    );
+}
+
+/// Même profil, chemin FLOTTANT (sortie locale). Le chemin flottant ne sature
+/// TOUJOURS rien — le saturateur est plus loin (`f32_to_native_i32`, privé, ou
+/// personne sur le chemin cpal) — mais il n'a plus rien à laisser passer :
+/// la réserve de #4073 ramène la crête de ×3,95 (+11,94 dBFS, mesuré avant) à
+/// moins de l'unité, et le compteur d'overs tombe à zéro.
+#[test]
+fn q1_l_egaliseur_flottant_ne_deborde_plus_grace_a_la_reserve() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
     let mut s: Vec<f32> = sinus(997.0, -0.1, N, 0.0)
@@ -490,30 +552,40 @@ fn q1_l_egaliseur_flottant_laisse_passer_les_overs_sans_les_ecreter() {
     let stats = eq.process_interleaved(&mut s);
     let crete = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     eprintln!(
-        "q1 égaliseur flottant : overs {}, crête {crete:.3} ({:+.2} dBFS)",
+        "q1 égaliseur flottant : préampli {:?} dB, overs {}, crête {crete:.3} ({:+.2} dBFS)",
+        eq.preamp_db(0),
         stats.overs,
         dbfs(f64::from(crete))
     );
-    assert!(stats.overs > N as u64 * 3 / 4);
+    assert_eq!(
+        stats.overs, 0,
+        "plus un over sur le chemin flottant non plus"
+    );
     assert!(
-        crete > 3.5 && crete < 4.2,
-        "aucune saturation sur le chemin flottant : crête ×{crete:.3} (Q = 4 ⇒ ×4 attendu)"
+        crete < 1.0,
+        "la crête reste sous l'unité : ×{crete:.3} — rien à saturer, donc rien à confier au pilote"
     );
 }
 
 /// Carré 50 Hz à −0,05 dBFS, 24 bits, plateau grave 80 Hz +6 dB. La réserve
-/// automatique retire 6 dB — la somme des gains positifs, c'est-à-dire le
+/// automatique retirait 6 dB — la somme des gains positifs, c'est-à-dire le
 /// maximum de la réponse en FRÉQUENCE. Mesuré : la réponse en TEMPS d'un
-/// plateau d'ordre 2 dépasse ce maximum (sa norme L1 est plus grande que son
-/// gain crête), et ~40 % des échantillons sortent du rail, écrêtés dur.
+/// plateau d'ordre 2 dépasse ce maximum (sa **norme L1 vaut 6,505 dB**, contre
+/// 6,000 dB de gain crête), et 17 825 / 44 100 échantillons (40,4 %) sortaient
+/// du rail, écrêtés dur.
+///
+/// Depuis #4073 la réserve prend le PLUS GRAND de la somme des gains et de la
+/// norme L1 de la cascade : −6,505 dB, soit 0,50 dB de plus. Rien ne dépasse,
+/// et la crête flottante s'arrête à ×0,9942 — la borne `max|y| ≤ ‖h‖₁·max|x|`
+/// est serrée, ce n'est pas une marge de confort.
 #[test]
-fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_reserve_depasse_quand_meme() {
+fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_tient_grace_a_la_norme_l1() {
     let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
-    assert_eq!(
-        eq.preamp_db(0),
-        Some(-6.0),
-        "réserve = somme des gains positifs"
+    let reserve = eq.preamp_db(0).expect("un canal");
+    assert!(
+        (reserve + 6.5049).abs() < 1e-3,
+        "réserve = norme L1 du plateau, plus grande que la somme des gains (−6,0) : {reserve}"
     );
     let x = carre(50.0, -0.05, N);
     let mut pcm = vers_pcm(&x, 24);
@@ -521,34 +593,31 @@ fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_reserve_depasse_quand_mem
     let sortie = normalise(&depuis_pcm(&pcm, 24), 24);
 
     // Le même signal sur le chemin flottant, non saturé : de combien la
-    // réserve est-elle courte ?
+    // réserve est-elle LARGE, maintenant ?
     let mut flottant: Vec<f32> = x.iter().map(|&v| v as f32).collect();
     EqProcessor::new(&p, FS, 1).process_interleaved(&mut flottant);
     let crete_flottante = flottant.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     eprintln!(
-        "q1 carré 50 Hz −0,05 dBFS + plateau grave 80 Hz +6 dB : overs {} ({:.1} %), crête entière {:+.2} dBFS, crête flottante {:+.2} dBFS (réserve courte de {:.2} dB)",
+        "q1 carré 50 Hz −0,05 dBFS + plateau grave 80 Hz +6 dB : réserve {reserve:.4} dB, overs {} ({:.1} %), crête entière {:+.3} dBFS, crête flottante ×{crete_flottante:.4} ({:+.3} dBFS)",
         stats.overs,
         100.0 * stats.overs as f64 / N as f64,
         dbfs(crete_echantillon(&sortie)),
-        dbfs(f64::from(crete_flottante)),
-        dbfs(f64::from(crete_flottante)) + 0.05
+        dbfs(f64::from(crete_flottante))
+    );
+    assert_eq!(
+        stats.overs, 0,
+        "la norme L1 couvre la réponse en temps : plus aucun over"
     );
     assert!(
-        stats.overs > N as u64 * 35 / 100 && stats.overs < N as u64 * 45 / 100,
-        "un plateau réservé en fréquence dépasse en temps : {} overs (~40 % attendus)",
-        stats.overs
+        crete_flottante < 1.0 && crete_flottante > 0.99,
+        "borne serrée, pas une marge de confort : crête flottante ×{crete_flottante:.4}"
     );
-    assert!(
-        crete_flottante > 1.03 && crete_flottante < 1.15,
-        "la réserve est courte d'environ 0,5 dB : crête flottante ×{crete_flottante:.3}"
-    );
-    assert!(dbfs(crete_echantillon(&sortie)) > -0.001, "écrêté au rail");
+    assert_eq!(au_rail(&depuis_pcm(&pcm, 24), 24), 0, "plus rien au rail");
 }
 
-/// Le comportement ATTENDU : la réserve couvre aussi la réponse en TEMPS
-/// (norme L1) d'un plateau, et aucun échantillon ne dépasse.
+/// Le comportement ATTENDU par #4073 — et désormais OBTENU. Nom conservé :
+/// c'est le témoin que l'issue cite et qui devait passer de `#[ignore]` à vert.
 #[test]
-#[ignore = "défaut connu : la réserve automatique est un maximum FRÉQUENTIEL ; un carré sous un plateau +6 dB dépasse de ~0,5 dB en temps (issue B)"]
 fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_reponse_en_temps_d_un_plateau() {
     let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
@@ -700,9 +769,10 @@ fn q2_defaut_connu_prevent_clipping_devrait_tenir_la_crete_vraie_sous_0_dbtp_ave
 
 /// La chaîne du bras progressif, dans son ordre : ReplayGain (+6 dB, pic
 /// d'échantillon tagué) PUIS égaliseur (+6 dB de crête à 3 kHz, réserve
-/// −6 dB), sur un sinus 997 Hz à −0,1 dBFS, 16 bits. Mesuré : le ReplayGain
-/// pose le sinus au rail (0 dBFS, ≈ 0 dBTP), l'égaliseur le redescend
-/// (~−4,5 dBFS) sans over.
+/// −7,13 dB depuis #4073 : la norme L1 d'une cloche de +6 dB vaut 7,13 dB,
+/// plus que la somme des gains), sur un sinus 997 Hz à −0,1 dBFS, 16 bits.
+/// Mesuré : le ReplayGain pose le sinus au rail (0 dBFS, ≈ 0 dBTP),
+/// l'égaliseur le redescend (~−5,9 dBFS) sans over.
 #[test]
 fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
     let x = sinus(997.0, -0.1, N, 0.0);
@@ -721,7 +791,11 @@ fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
     let tp_rg = dbtp(&apres_rg);
 
     let mut eq = EqProcessor::new(&profil(vec![bande("peak", 3000.0, 6.0, 1.0)]), FS, 1);
-    assert_eq!(eq.preamp_db(0), Some(-6.0));
+    let reserve = eq.preamp_db(0).expect("un canal");
+    assert!(
+        (reserve + 7.1308).abs() < 1e-3,
+        "réserve = norme L1 de la cloche (7,13 dB), pas sa somme de gains (6,0) : {reserve}"
+    );
     let stats = eq.process_pcm(&mut pcm, 16);
     let apres_eq = normalise(&depuis_pcm(&pcm, 16), 16);
     let tp_eq = dbtp(&apres_eq);
@@ -743,16 +817,42 @@ fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
         "au rail, crête vraie ≈ 0 dBTP : {tp_rg:+.3}"
     );
     assert_eq!(stats.overs, 0);
-    assert!(tp_eq < -3.0 && tp_eq > -6.0, "{tp_eq:+.2} dBTP");
+    assert!(tp_eq < -3.0 && tp_eq > -8.0, "{tp_eq:+.2} dBTP");
 }
 
 // ═════════════════════════ Q3 — flottant → entier ═════════════════════════
 
-/// `apply_gain_pcm` : `as i16` / `as i32` après saturation = troncature VERS
-/// ZÉRO, sans dither. Conséquence mesurable : un facteur de 1 − 1e-7 (−0,000001 dB,
-/// inaudible) abaisse CHAQUE échantillon non nul d'exactement 1 LSB.
+/// Corrélation de l'erreur avec le SIGNE du signal, en LSB.
+///
+/// C'est la mesure qui sépare une distorsion d'un bruit. Une troncature vers
+/// zéro donne −1 quand elle déplace chaque échantillon d'un LSB vers zéro, et
+/// ≈ −0,5 sur une erreur uniforme ; un dither centré donne ≈ 0. Une moyenne
+/// signée nue ne verrait rien : sur un sinus symétrique, les erreurs des
+/// alternances positive et négative s'annulent exactement.
+fn correlation_au_signe(ideal_raw: &[f64], sortie: &[i64]) -> f64 {
+    let mut somme = 0.0;
+    let mut vus = 0usize;
+    for (&i, &s) in ideal_raw.iter().zip(sortie) {
+        if i == 0.0 {
+            continue;
+        }
+        somme += (s as f64 - i) * i.signum();
+        vus += 1;
+    }
+    if vus == 0 { 0.0 } else { somme / vus as f64 }
+}
+
+/// `apply_gain_pcm` : dither TPDF ±1 LSB puis arrondi au plus proche (#4076).
+///
+/// Ce qui était mesuré et qui n'est plus : `clamp` puis `as i16` / `as i32`,
+/// donc une troncature VERS ZÉRO, dont l'erreur porte le signe du signal —
+/// une distorsion, pas un bruit. Deux conséquences tenues ici :
+///
+/// * l'erreur n'est plus corrélée au signe du signal ;
+/// * un facteur de 1 − 1e-7 (−0,000001 dB, inaudible EN TANT QUE GAIN) ne
+///   déplace plus 44 098 échantillons non nuls sur 44 098 d'un LSB vers zéro.
 #[test]
-fn q3_apply_gain_pcm_tronque_vers_zero_sans_dither() {
+fn q3_apply_gain_pcm_dithere_au_lieu_de_tronquer_vers_zero() {
     let x = sinus(997.0, -20.0, N, 0.0);
     for bits in [16u16, 24, 32] {
         let mut pcm = vers_pcm(&x, bits);
@@ -762,8 +862,15 @@ fn q3_apply_gain_pcm_tronque_vers_zero_sans_dither() {
         apply_gain_pcm(&mut pcm, bits, facteur);
         let sortie = depuis_pcm(&pcm, bits);
         let classe = classer_quantification(&ideal, &sortie);
-        eprintln!("q3 apply_gain_pcm {bits} bits, −1 dB : {classe}");
-        assert_eq!(classe, "troncature vers zéro", "{bits} bits");
+        let correlation = correlation_au_signe(&ideal, &sortie);
+        eprintln!(
+            "q3 apply_gain_pcm {bits} bits, −1 dB : {classe}, erreur·signe(signal) = {correlation:+.4} LSB"
+        );
+        assert_eq!(classe, "bruit ajouté avant arrondi (dither)", "{bits} bits");
+        assert!(
+            correlation.abs() < 0.05,
+            "{bits} bits : l'erreur reste corrélée au signe du signal ({correlation:+.4} LSB) — c'est une distorsion, pas un bruit"
+        );
     }
 
     let mut pcm = vers_pcm(&sinus(997.0, -0.1, N, 0.0), 16);
@@ -776,19 +883,49 @@ fn q3_apply_gain_pcm_tronque_vers_zero_sans_dither() {
         .zip(&sortie)
         .filter(|&(&e, &s)| e != 0 && (s - e) == -e.signum())
         .count();
+    let intacts = entree
+        .iter()
+        .zip(&sortie)
+        .filter(|&(&e, &s)| e != 0 && s == e)
+        .count();
     eprintln!(
-        "q3 apply_gain_pcm ×(1 − 1e-7) : {decales}/{non_nuls} échantillons non nuls décalés d'1 LSB vers zéro"
+        "q3 apply_gain_pcm ×(1 − 1e-7) : {decales}/{non_nuls} déplacés d'1 LSB vers zéro, {intacts}/{non_nuls} intacts"
     );
-    assert_eq!(
-        decales, non_nuls,
-        "un gain de −0,000001 dB déplace TOUT le signal d'1 LSB vers zéro"
+    assert!(
+        decales < non_nuls,
+        "−0,000001 dB déplace ENCORE tout le signal d'1 LSB vers zéro : {decales}/{non_nuls}"
+    );
+    assert!(
+        intacts > non_nuls / 4,
+        "un gain inaudible devrait laisser une bonne part du signal intacte : {intacts}/{non_nuls}"
     );
 }
 
-/// `PcmMixer::apply_gain` : même écriture (`SampleFormat::write`), même
-/// troncature vers zéro, sans dither.
+/// Un facteur ENTIER ne requantifie rien : il ne dithère donc pas. ×2 sur des
+/// entiers est exact, et `apply_gain_pcm` doit le rendre exact — la règle
+/// « pas de requantification, pas de dither » de `audio::dither`.
 #[test]
-fn q3_pcm_mixer_apply_gain_tronque_vers_zero_lui_aussi() {
+fn q3_un_facteur_entier_ne_dithere_pas() {
+    let x = sinus(997.0, -20.0, N, 0.0);
+    for bits in [16u16, 24, 32] {
+        let mut pcm = vers_pcm(&x, bits);
+        let entree = depuis_pcm(&pcm, bits);
+        apply_gain_pcm(&mut pcm, bits, 2.0);
+        let sortie = depuis_pcm(&pcm, bits);
+        let rail = (1i64 << (bits - 1)) - 1;
+        for (&e, &s) in entree.iter().zip(&sortie) {
+            assert_eq!(
+                s,
+                (e * 2).clamp(-(rail + 1), rail),
+                "{bits} bits : ×2 devrait être exact, sans un LSB de bruit"
+            );
+        }
+    }
+}
+
+/// `PcmMixer::apply_gain` : même correctif, même implémentation de dither.
+#[test]
+fn q3_pcm_mixer_apply_gain_dithere_lui_aussi() {
     let x = sinus(997.0, -20.0, N, 0.0);
     for bits in [16u16, 24, 32] {
         let mut pcm = vers_pcm(&x, bits);
@@ -799,10 +936,58 @@ fn q3_pcm_mixer_apply_gain_tronque_vers_zero_lui_aussi() {
             .map(|&v| v as f64 * f64::from(facteur as f32))
             .collect();
         PcmMixer::apply_gain(&mut pcm, facteur as f32, bits).expect("profondeur mélangeable");
-        let classe = classer_quantification(&ideal, &depuis_pcm(&pcm, bits));
-        eprintln!("q3 PcmMixer::apply_gain {bits} bits, −1 dB : {classe}");
-        assert_eq!(classe, "troncature vers zéro", "{bits} bits");
+        let sortie = depuis_pcm(&pcm, bits);
+        let classe = classer_quantification(&ideal, &sortie);
+        let correlation = correlation_au_signe(&ideal, &sortie);
+        eprintln!(
+            "q3 PcmMixer::apply_gain {bits} bits, −1 dB : {classe}, erreur·signe(signal) = {correlation:+.4} LSB"
+        );
+        assert_eq!(classe, "bruit ajouté avant arrondi (dither)", "{bits} bits");
+        assert!(
+            correlation.abs() < 0.05,
+            "{bits} bits : erreur corrélée au signe du signal ({correlation:+.4} LSB)"
+        );
     }
+}
+
+/// 🔴 Le dither est DÉTERMINISTE : même entrée, même sortie, octet pour octet.
+///
+/// Le cache de transcodage nomme ses renditions d'après tout ce qui change les
+/// octets encodés, pour qu'une requête identique retrouve le fichier fini ; et
+/// la sortie OAAT reprend un flux interrompu par `Range`, donc un deuxième
+/// passage doit continuer le premier à l'octet. Un bruit tiré au hasard
+/// casserait les deux.
+#[test]
+fn q3_le_dither_est_deterministe_pour_une_meme_entree() {
+    let x = sinus(997.0, -20.0, N, 0.0);
+    let facteur = amplitude(-1.0);
+    for bits in [16u16, 24, 32] {
+        let passe = |quoi: &dyn Fn(&mut Vec<u8>)| {
+            let mut pcm = vers_pcm(&x, bits);
+            quoi(&mut pcm);
+            pcm
+        };
+        let rg = |p: &mut Vec<u8>| apply_gain_pcm(p, bits, facteur);
+        assert_eq!(
+            passe(&rg),
+            passe(&rg),
+            "{bits} bits : ReplayGain non reproductible"
+        );
+        let mx = |p: &mut Vec<u8>| {
+            PcmMixer::apply_gain(p, facteur as f32, bits).expect("profondeur mélangeable");
+        };
+        assert_eq!(
+            passe(&mx),
+            passe(&mx),
+            "{bits} bits : mélangeur non reproductible"
+        );
+    }
+    let pcm24 = vers_pcm(&x, 24);
+    assert_eq!(
+        convert_pcm_bytes(&pcm24, 24, 16),
+        convert_pcm_bytes(&pcm24, 24, 16),
+        "réduction 24→16 non reproductible : cache de transcodage cassé"
+    );
 }
 
 /// `EqProcessor::process_pcm` : requantification avec dither TPDF ±1 LSB puis
@@ -859,74 +1044,170 @@ fn q3_l_egaliseur_entier_requantifie_avec_un_dither_tpdf_a_toute_profondeur() {
 
 /// `decode::convert_pcm_bytes` (24 → 16 bits, chemin du transcodage DLNA/WAV
 /// 16 bits depuis une source 24 bits, et de la mémoire de préchargement) :
-/// décalage arithmétique = troncature vers −∞, sans dither.
+/// dither TPDF puis arrondi, là où c'était un décalage arithmétique — donc une
+/// troncature vers −∞ (#4075).
+///
+/// 🔖 **C'est le témoin pré-écrit de T9**, `q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`,
+/// dont #4075 lève le `#[ignore = "défaut connu …"]`. Son assertion d'origine
+/// — `classer_quantification(...) == "bruit ajouté avant arrondi (dither)"` —
+/// est reprise mot pour mot ci-dessous ; seul le biais moyen a été ajouté,
+/// parce qu'un dither doit être CENTRÉ, là où le décalage biaisait d'un
+/// demi-LSB vers −∞. Le témoin qui affirmait le défaut,
+/// `q3_convert_pcm_bytes_reduit_24_vers_16_bits_par_decalage_sans_dither`, est
+/// remplacé par celui-ci : il affirmait un comportement qui n'existe plus.
 #[test]
-fn q3_convert_pcm_bytes_reduit_24_vers_16_bits_par_decalage_sans_dither() {
-    let mut cas = Vec::new();
-    for raw in [384i64, 385, 383, -384, -385, -1, 1, 255] {
-        ecrire(&mut cas, raw, 24);
-    }
-    let sortie = depuis_pcm(&convert_pcm_bytes(&cas, 24, 16), 16);
-    assert_eq!(
-        sortie,
-        vec![1, 1, 1, -2, -2, -1, 0, 0],
-        "385/256 = 1,504 → 1 (arrondi donnerait 2) ; −1/256 → −1 (vers −∞) ; 255/256 → 0"
-    );
-
+fn q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither() {
     let x = sinus(997.0, -20.0, N, 0.0);
     let pcm24 = vers_pcm(&x, 24);
     let ideal: Vec<f64> = depuis_pcm(&pcm24, 24)
         .iter()
         .map(|&v| v as f64 / 256.0)
         .collect();
-    let classe =
-        classer_quantification(&ideal, &depuis_pcm(&convert_pcm_bytes(&pcm24, 24, 16), 16));
-    eprintln!("q3 convert_pcm_bytes 24→16 : {classe}");
-    assert_eq!(classe, "troncature vers −∞ (décalage)");
-}
-
-/// Le comportement ATTENDU d'une réduction de profondeur audiophile : un
-/// dither (TPDF) avant l'arrondi, pas un décalage.
-#[test]
-#[ignore = "défaut connu : convert_pcm_bytes réduit 24→16 bits par décalage, sans dither ni arrondi (issue D)"]
-fn q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither() {
-    let x = sinus(997.0, -20.0, N, 0.0);
-    let pcm24 = vers_pcm(&x, 24);
-    let ideal: Vec<f64> = depuis_pcm(&pcm24, 24)
+    let sortie = depuis_pcm(&convert_pcm_bytes(&pcm24, 24, 16), 16);
+    let classe = classer_quantification(&ideal, &sortie);
+    let biais = ideal
         .iter()
-        .map(|&v| v as f64 / 256.0)
-        .collect();
-    let classe =
-        classer_quantification(&ideal, &depuis_pcm(&convert_pcm_bytes(&pcm24, 24, 16), 16));
+        .zip(&sortie)
+        .map(|(i, &s)| s as f64 - i)
+        .sum::<f64>()
+        / ideal.len() as f64;
+    eprintln!("q3 convert_pcm_bytes 24→16 : {classe}, biais moyen {biais:+.4} LSB");
     assert_eq!(classe, "bruit ajouté avant arrondi (dither)");
+    assert!(
+        biais.abs() < 0.05,
+        "le décalage biaisait vers −∞ d'un demi-LSB ; le dither doit être centré : {biais:+.4} LSB"
+    );
 }
 
-/// `Convolver::process_pcm` : arrondi au plus proche, saturé à ±1,0, sans
-/// dither — et une réponse impulsionnelle UNITÉ n'est pas l'identité : le
-/// décodage divise par 32768 et l'encodage multiplie par 32767 (−0,00027 dB),
-/// donc tout échantillon |x| ≥ 16384 (~66 % d'un sinus à −0,1 dBFS) perd 1 LSB.
+/// La conséquence audible du décalage : un signal continu SOUS le LSB de la
+/// cible disparaissait entièrement. 255/256 de LSB tronquait à 0 — silence.
+/// Dithéré, il survit : sa moyenne vaut ce qu'elle doit valoir.
 #[test]
-fn q3_le_convolveur_entier_arrondit_sans_dither_et_une_ir_unite_perd_1_lsb() {
+fn q3_un_signal_sous_le_lsb_ne_disparait_plus_a_la_reduction() {
+    let mut entree = Vec::new();
+    for _ in 0..N {
+        ecrire(&mut entree, 255, 24);
+    }
+    let sortie = depuis_pcm(&convert_pcm_bytes(&entree, 24, 16), 16);
+    let moyenne = sortie.iter().map(|&v| v as f64).sum::<f64>() / sortie.len() as f64;
+    eprintln!("q3 réduction 24→16 d'un continu à 255/256 LSB : moyenne {moyenne:.4} LSB");
+    assert!(
+        (moyenne - 255.0 / 256.0).abs() < 0.05,
+        "un continu à 255/256 LSB doit ressortir à {:.4} LSB en moyenne, pas {moyenne:.4}",
+        255.0 / 256.0
+    );
+    assert!(
+        sortie.iter().any(|&v| v != 0),
+        "le signal a disparu : c'est le défaut #4075, pas son correctif"
+    );
+}
+
+/// Élargir une profondeur ne dithère PAS : c'est un décalage exact, sans
+/// perte. La règle « pas de requantification, pas de dither ».
+#[test]
+fn q3_elargir_une_profondeur_reste_exact_sans_dither() {
+    let x = sinus(997.0, -20.0, N, 0.0);
+    let pcm16 = vers_pcm(&x, 16);
+    for cible in [24u16, 32] {
+        let sortie = depuis_pcm(&convert_pcm_bytes(&pcm16, 16, cible), cible);
+        let attendu: Vec<i64> = depuis_pcm(&pcm16, 16)
+            .iter()
+            .map(|&v| v << (cible - 16))
+            .collect();
+        assert_eq!(sortie, attendu, "16 → {cible} bits doit rester exact");
+    }
+}
+
+/// `Convolver::process_pcm` : arrondi au plus proche, sans dither — et le
+/// **gain parasite** d'une réponse impulsionnelle unité a disparu (#4076,
+/// constat voisin).
+///
+/// Ce qui était mesuré : le décodage divisait par 2^(n−1) et le réencodage
+/// multipliait par 2^(n−1) **− 1**. Cette asymétrie est un gain de
+/// −0,00027 dB appliqué à chaque passage — 1 LSB perdu par **29 214
+/// échantillons sur 44 100 (66 %)** à 16 bits. Un convolveur chargé d'une
+/// impulsion unité, donc censé ne rien faire, abîmait le signal.
+///
+/// Le témoin sépare les deux choses qu'il ne faut pas confondre :
+///
+/// * **à 16 bits, l'identité est exacte** — c'est la garde forte du
+///   correctif : un seul échantillon décalé la fait rougir ;
+/// * **au-dessus, l'identité est hors de portée**, et c'est mesuré, pas
+///   supposé : le convolveur tient son tampon en `f32`, dont la mantisse de
+///   24 bits ne peut pas porter un entier de 24 bits déjà convolué, encore
+///   moins de 32. À 24 bits, ce qui est tenu est l'**absence de gain
+///   parasite** — l'asymétrie donnait −0,637 LSB sur ce sinus, le plancher du
+///   f32 en donne −0,11. À **32 bits, cette garde est impossible** : le
+///   plancher du f32 y vaut −62,9 LSB, cent fois ce qu'on chercherait. Le
+///   témoin le dit au lieu de faire semblant.
+#[test]
+fn q3_le_convolveur_arrondit_sans_dither_et_une_ir_unite_ne_perd_plus_de_gain() {
     let x = sinus(997.0, -0.1, N, 0.0);
+
+    // 16 bits : identité EXACTE, octet pour octet.
     let mut pcm = vers_pcm(&x, 16);
     let entree = depuis_pcm(&pcm, 16);
-    let mut conv = Convolver::new(&[vec![1.0f32]], 256);
-    conv.process_pcm(&mut pcm, 16);
+    Convolver::new(&[vec![1.0f32]], 256).process_pcm(&mut pcm, 16);
     let sortie = depuis_pcm(&pcm, 16);
-    let ideal: Vec<f64> = entree
-        .iter()
-        .map(|&v| v as f64 * 32767.0 / 32768.0)
-        .collect();
-    let classe = classer_quantification(&ideal, &sortie);
     let perdus = entree.iter().zip(&sortie).filter(|(e, s)| e != s).count();
-    eprintln!(
-        "q3 Convolver::process_pcm IR unité 16 bits : {classe}, {perdus}/{N} échantillons ≠ entrée"
+    eprintln!("q3 Convolver IR unité 16 bits : {perdus}/{N} échantillons ≠ entrée");
+    assert_eq!(
+        perdus, 0,
+        "une IR unité doit être l'identité à 16 bits : {perdus} échantillons décalés (gain parasite 32767/32768 ?)"
     );
+
+    // 24 bits : l'identité n'est plus atteignable (le f32 du convolveur s'y
+    // épuise), mais le GAIN PARASITE doit avoir disparu. L'asymétrie donnait
+    // −0,637 LSB sur ce sinus ; le plancher numérique du f32, lui, est à
+    // −0,11 LSB. Le seuil sépare les deux avec de la marge.
+    //
+    // 🔍 À **32 bits**, cette garde est IMPOSSIBLE et il vaut mieux l'écrire
+    // que la simuler : le plancher du f32 y vaut −62,9 LSB, cent fois
+    // l'asymétrie (−0,637 LSB) qu'on voudrait détecter. Aucun seuil ne peut
+    // les distinguer. C'est le témoin 16 bits — identité EXACTE — qui garde
+    // le correctif ; 32 bits n'y mesure que le plafond du tampon f32.
+    for (bits, garde_le_gain, plafond) in [(24u16, true, 64i64), (32u16, false, 4096i64)] {
+        let mut pcm = vers_pcm(&x, bits);
+        let entree = depuis_pcm(&pcm, bits);
+        Convolver::new(&[vec![1.0f32]], 256).process_pcm(&mut pcm, bits);
+        let sortie = depuis_pcm(&pcm, bits);
+        let ideal: Vec<f64> = entree.iter().map(|&v| v as f64).collect();
+        let correlation = correlation_au_signe(&ideal, &sortie);
+        let ecart = entree
+            .iter()
+            .zip(&sortie)
+            .map(|(&e, &s)| (s - e).abs())
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "q3 Convolver IR unité {bits} bits : erreur·signe(signal) = {correlation:+.4} LSB, écart max {ecart} LSB (plancher du tampon f32){}",
+            if garde_le_gain {
+                ""
+            } else {
+                " — gain non témoignable à cette profondeur"
+            }
+        );
+        if garde_le_gain {
+            assert!(
+                correlation.abs() < 0.15,
+                "{bits} bits : gain parasite de retour, erreur·signe(signal) = {correlation:+.4} LSB (l'asymétrie 2^(n−1)−1 en donnait −0,637)"
+            );
+        }
+        assert!(
+            ecart <= plafond,
+            "{bits} bits : écart max {ecart} LSB au-delà du plancher numérique du f32 ({plafond})"
+        );
+    }
+
+    // L'arrondi, lui, reste : pas de dither dans le convolveur.
+    let x = sinus(997.0, -20.0, N, 0.0);
+    let mut pcm = vers_pcm(&x, 16);
+    let entree = depuis_pcm(&pcm, 16);
+    Convolver::new(&[vec![0.5f32]], 256).process_pcm(&mut pcm, 16);
+    let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * 0.5).collect();
+    let classe = classer_quantification(&ideal, &depuis_pcm(&pcm, 16));
+    eprintln!("q3 Convolver IR 0,5 16 bits : {classe}");
     assert_eq!(classe, "arrondi au plus proche");
-    assert!(
-        perdus > N * 60 / 100 && perdus < N * 72 / 100,
-        "IR unité ≠ identité : {perdus} échantillons (|x| ≥ 16384, ~66 %) décalés d'1 LSB (gain 32767/32768)"
-    );
 }
 
 // ═════════════════════════ Q4 — identité des étages désarmés ═════════════════════════
