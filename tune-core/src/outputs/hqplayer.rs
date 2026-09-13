@@ -69,10 +69,26 @@ impl HqplayerOutput {
     /// Probe a host to find which port HQPlayer is listening on.
     /// Tries each port with a TCP connect + GetInfo handshake.
     pub async fn probe_port(host: &str) -> Option<u16> {
-        for &port in HQPLAYER_PROBE_PORTS {
+        Self::probe_port_parmi(host, HQPLAYER_PROBE_PORTS).await
+    }
+
+    /// Comme [`probe_port`](Self::probe_port), mais sur la liste de ports
+    /// donnée, dans l'ordre donné.
+    ///
+    /// Le sondeur s'en sert pour essayer le port **configuré** avant les deux
+    /// ports standards : le panneau Services laisse saisir un port, et
+    /// `probe_port` ne regardait que 4321 puis 8019 — un HQPlayer sur un
+    /// autre port n'était jamais détecté, réglage renseigné.
+    ///
+    /// `hqplayer_port_detected` est en `debug!` et non en `info!` : ce sondage
+    /// tourne toutes les 60 s et la ligne sortait à chaque tour pour dire que
+    /// rien n'avait changé (#4025). Le port découvert est journalisé au
+    /// niveau utile par l'appelant, quand il CHANGE quelque chose.
+    pub async fn probe_port_parmi(host: &str, ports: &[u16]) -> Option<u16> {
+        for &port in ports {
             match probe_hqplayer(host, port).await {
                 Ok(true) => {
-                    info!(host, port, "hqplayer_port_detected");
+                    debug!(host, port, "hqplayer_port_detected");
                     return Some(port);
                 }
                 Ok(false) => {
@@ -84,6 +100,19 @@ impl HqplayerOutput {
             }
         }
         None
+    }
+
+    /// Les ports à essayer quand `configure` est le port enregistré dans les
+    /// réglages : le sien d'abord, puis les standards qu'il ne double pas.
+    pub fn ports_a_sonder(configure: u16) -> Vec<u16> {
+        let mut ports = vec![configure];
+        ports.extend(
+            HQPLAYER_PROBE_PORTS
+                .iter()
+                .copied()
+                .filter(|p| *p != configure),
+        );
+        ports
     }
 
     /// Get or establish a TCP connection to HQPlayer.

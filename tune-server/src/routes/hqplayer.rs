@@ -145,8 +145,11 @@ async fn discover_and_register_inner(
     host: &str,
     port: u16,
 ) -> Result<Value, String> {
-    // Auto-detect which port HQPlayer is on (tries 4321 then 8019)
-    let detected_port = HqplayerOutput::probe_port(host).await;
+    // Auto-detect which port HQPlayer is on: the CONFIGURED one first, then
+    // the two standard ones (4321 v4/v5, 8019 v6). Le panneau Services laisse
+    // saisir un port et cette sonde ne regardait que les deux standards.
+    let detected_port =
+        HqplayerOutput::probe_port_parmi(host, &HqplayerOutput::ports_a_sonder(port)).await;
 
     let actual_port = match detected_port {
         Some(p) => {
@@ -173,18 +176,37 @@ async fn discover_and_register_inner(
     let device_id = format!("hqplayer-{host}");
     let output_name = "HQPlayer".to_string();
 
-    // Register output with the detected port
-    let output = HqplayerOutput::new(
-        output_name.clone(),
-        device_id.clone(),
-        host.to_string(),
-        actual_port,
-    );
-    {
-        let mut reg = state.outputs.lock().await;
-        reg.register(Box::new(output));
+    // #4025 — ce sondage tourne toutes les 60 s et ré-enregistrait la sortie
+    // à chaque tour. Deux dégâts, pas un :
+    //
+    // 1. une ligne INFO par minute (1 440/jour) pour dire que rien n'a
+    //    changé, qui évince les lignes utiles d'un export plafonné ;
+    // 2. `OutputRegistry::register` ÉCRASE l'entrée existante, donc l'objet
+    //    `HqplayerOutput` précédent était détruit toutes les 60 s **avec sa
+    //    connexion TCP de contrôle persistante**.
+    //
+    // On ne (ré-)enregistre donc que lorsqu'il y a quelque chose à changer :
+    // entrée absente du registre, ou port qui a bougé.
+    let deja_enregistree = {
+        let reg = state.outputs.lock().await;
+        reg.contains(&device_id)
+    };
+    let port_a_change = actual_port != port;
+    if !deja_enregistree || port_a_change {
+        let output = HqplayerOutput::new(
+            output_name.clone(),
+            device_id.clone(),
+            host.to_string(),
+            actual_port,
+        );
+        {
+            let mut reg = state.outputs.lock().await;
+            reg.register(Box::new(output));
+        }
+        tracing::info!(name = %output_name, id = %device_id, host = %host, port = actual_port, "hqplayer_output_registered");
+    } else {
+        tracing::debug!(name = %output_name, id = %device_id, port = actual_port, "hqplayer_output_deja_enregistree");
     }
-    tracing::info!(name = %output_name, id = %device_id, host = %host, port = actual_port, "hqplayer_output_registered");
 
     // Auto-create zone if not already present
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -212,8 +234,20 @@ async fn discover_and_register_inner(
             tracing::info!(name = %zone_name, id = %device_id, "hqplayer_zone_auto_create_disabled_skipping");
         }
         Ok(CreationDeZone::Existante(_)) => {
+            // L'écriture reste inconditionnelle : `set_online_by_device` date
+            // aussi la dernière réponse (DUP-1). Seule la LIGNE devient
+            // conditionnelle — « reconnected » n'a de sens que si la zone
+            // était hors ligne. Sinon elle sortait à chaque tour, c'est-à-dire
+            // toujours après la première fois (#4025).
+            let etait_hors_ligne = existing
+                .iter()
+                .any(|z| z.output_device_id.as_deref() == Some(device_id.as_str()) && !z.online);
             let _ = zone_repo.set_online_by_device(&device_id, true);
-            tracing::info!(name = %output_name, id = %device_id, "hqplayer_zone_reconnected");
+            if etait_hors_ligne {
+                tracing::info!(name = %output_name, id = %device_id, "hqplayer_zone_reconnected");
+            } else {
+                tracing::debug!(name = %output_name, id = %device_id, "hqplayer_zone_toujours_en_ligne");
+            }
         }
         Err(e) => {
             tracing::warn!(name = %zone_name, id = %device_id, error = %e, "hqplayer_zone_create_failed");
