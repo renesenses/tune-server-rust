@@ -90,13 +90,25 @@ immédiat), `EqProcessor` désactivé, `EqProcessor` armé à bandes neutres
 
 ## Ce qui est prouvé, ce qui ne l'est pas
 
-**Prouvé** (18 témoins verts depuis #4075/#4076, sur toute PR Rust) : les
-comportements du tableau ci-dessus, tels qu'ils sont. Il reste **4** témoins
-`#[ignore]`, **rouges** quand on les lance (`cargo test … -- --ignored`) : ce
-sont les défauts A, B et C, pas des intentions. Le cinquième,
-`q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`, a été
-**dé-ignoré par #4075** — c'est aujourd'hui
-`q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither`.
+**Prouvé** (19 témoins verts depuis #4072, #4075/#4076, sur toute PR Rust) :
+les comportements du tableau ci-dessus, tels qu'ils sont. Il reste **3**
+témoins `#[ignore]`, **rouges** quand on les lance
+(`cargo test … -- --ignored`) : ce sont les défauts B et C, pas des
+intentions. Des deux autres, `q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`
+a été **dé-ignoré par #4075** (c'est aujourd'hui
+`q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither`), et celui du
+défaut A par #4072 — voir juste en dessous.
+
+🟢 **Le défaut A est CORRIGÉ (#4072).** Son témoin
+`q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague`
+a été réveillé et renommé
+`q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague` : il est vert
+sur toute PR. `gain_factor` refuse le gain positif quand aucun pic n'est
+tagué et que `prevent_clipping` est armé — le facteur ne dépasse plus
+l'unité, pas un octet ne bouge. Le témoin voisin qui mesurait 66,2 %
+d'écrêtés avec le garde-fou ARMÉ les mesure désormais avec le garde-fou
+DÉSARMÉ (`q1_replaygain_sans_garde_fou_…`, mêmes chiffres, même stimulus) :
+ce que l'auditeur obtient quand il décoche la case. Voir §A ci-dessous.
 
 **Non prouvé ici** :
 
@@ -122,7 +134,7 @@ sont les défauts A, B et C, pas des intentions. Le cinquième,
 
 ## Issues à ouvrir (à la main de Bertrand)
 
-### A — ReplayGain : sans pic tagué, `prevent_clipping` n'empêche rien et `apply_gain_pcm` écrête dur sans compter
+### A — ✅ CORRIGÉ (#4072) — ReplayGain : sans pic tagué, `prevent_clipping` n'empêchait rien et `apply_gain_pcm` écrêtait dur sans compter
 
 Mesuré : +6 dB sur un sinus à −0,1 dBFS, 66,2 % d'échantillons écrêtés,
 excès 31 866 LSB, aucun compteur, aucun journal. Attendu : `prevent_clipping`
@@ -130,6 +142,47 @@ armé ⇒ aucun échantillon au-delà du rail, pic tagué ou non (refuser le gai
 positif sans pic, ou l'analyser) ; et `apply_gain_pcm` compte ses écrêtés
 comme `EqProcessStats.overs`, exposés dans `signal-path`. Témoin :
 `q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic_tague`.
+
+**Livré (#4072, issue #4072).** Ce qui a changé, exactement :
+
+* `gain_factor` délègue à `gain_factor_detail`, qui dit AUSSI ce que
+  l'anti-écrêtage a retenu (`RetenueAntiEcretage` : `Aucune` /
+  `ParLePicTague` / `GainPositifRefuseSansPic`). Sans pic exploitable — absent,
+  nul, négatif, ou écarté par `PEAK_MAX_PLAUSIBLE` — et avec
+  `prevent_clipping` armé, **le facteur ne dépasse plus l'unité**. Le témoin
+  `#[ignore]` est réveillé, renommé
+  `q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague`, et garde
+  trois choses : zéro écrêté contre l'idéal, aucun échantillon au rail, et
+  l'identité **octet pour octet** du PCM (un facteur simplement raboté à 0,99
+  passerait la première, pas la troisième).
+* **Refus, pas déclenchement de l'analyse.** `gain_factor` est pure et
+  synchrone, appelée au démarrage d'une piste et à chaque construction du
+  chemin du signal ; mesurer un pic exige de décoder le fichier entier
+  (`measure_loudness_and_peak`, borné à 180 s). Le déclenchement existe déjà,
+  au bon endroit : la passe de fond de `replaygain.rs` remplit `rg_track_peak`,
+  et la piste retrouve son gain positif dès qu'elle est mesurée. Refuser en
+  attendant coûte un gain non appliqué ; le contraire coûtait 66 %
+  d'échantillons mutilés.
+* **Le plafond dBTP n'entre PAS dans cette borne.** Sans pic, la borne sûre est
+  l'unité : le signal source tient déjà sous le rail. Descendre à `ceiling`
+  (−0,5 / −1 dBTP) atténuerait silencieusement toute piste non taguée, gain
+  demandé nul compris. La marge inter-échantillons reste la question C.
+* **L'atténuation n'est jamais touchée**, et le garde-fou DÉSARMÉ rend
+  exactement le comportement d'avant : le témoin voisin le mesure toujours
+  (66,2 %, excès 31 866 LSB, saturation dure, signe conservé), et les quinze
+  empreintes FNV-1a de `ecretage_compte_2218.rs` sont inchangées — le chemin
+  désarmé de `gain_factor` n'a pas bougé d'un bit.
+* **Exposition dans `signal-path`** : l'étape ReplayGain porte
+  `clipping_guard` (`none` / `tagged_peak` / `refused_no_peak`) et `metrics`,
+  le relevé de `audio::ecretage::REGISTRE.replaygain` (#4020) avec son
+  `portee: "processus"` dit dans l'objet — l'étage reçoit un `f64` nu, il ne
+  connaît ni piste ni zone. Un refus **affiche une étape** au lieu de
+  disparaître (facteur 1,0 : l'ancien seuil `|f − 1| ≤ 1e-6` la masquait) et
+  reste `bit_perfect: true`, verdict compris — il n'a touché aucun
+  échantillon.
+
+Ce que #4072 ne traite pas : B et C, dont les témoins `#[ignore]` restent
+rouges. D et E ont été corrigés depuis, par #4075/#4076.
 
 ### B — Égaliseur : la réserve automatique ignore la résonance des passe-bas/haut et la réponse en temps des plateaux
 
@@ -209,8 +262,8 @@ par `cp` + `touch`, verts — sorties collées dans la PR :
 ## Reproduction locale
 
 ```sh
-cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 18 verts, 4 ignorés
-cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 4 rouges : les défauts A–C
+cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 19 verts, 3 ignorés
+cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 3 rouges : les défauts B et C
 ```
 
 ## Comptage livré le 12/09 (agent F, `tune-core/tests/ecretage_compte_2218.rs`)
@@ -222,7 +275,8 @@ Q = 4 entier et flottant, plateau grave sur carré, chaîne ReplayGain puis
 égaliseur, mixeur −1 dB et ×2 : 15 empreintes) ont été relevées sur
 `batch/bugs-12` à 49ecf1fe **avant** le comptage par un témoin temporaire non
 publié, collées dans `ecretage_compte_2218.rs`, et sont **inchangées après**.
-Les 14 témoins verts et les 5 ignorés de ce banc n'ont pas été touchés.
+Les 14 témoins verts et les 5 ignorés de ce banc n'ont pas été touchés
+(#4072 en a depuis réveillé un : 15 verts, 4 ignorés).
 Le clamp de chaque étage est resté où il est, dans l'ordre où il est (clamp
 PUIS dither pour l'égaliseur), avec ses seuils.
 
@@ -282,10 +336,11 @@ section `dsp_ecretage` — par étage, `echantillons_vus`, `echantillons_ecretes
 (`audio::ecretage::REGISTRE`, `AtomicU64`). Pas par zone : `OutputDspMetrics`
 est construit par littéral dans `outputs/local.rs`, hors périmètre.
 
-### Les cinq défauts : D et E corrigés, A, B, C toujours à trancher
+### Les cinq défauts : A, D et E corrigés, B et C toujours à trancher
 
-* **A** — `prevent_clipping` sans pic tagué n'empêche rien (66 % écrêtés) —
-  🔴 ouvert, compté et dit ;
+* **A** — ✅ **corrigé par #4072** : `prevent_clipping` armé sans pic tagué
+  refuse le gain positif (facteur borné à l'unité), le chemin du signal nomme
+  le refus (`clipping_guard`) et porte le compteur d'écrêtage de l'étage ;
 * **B** — la réserve automatique ignore la résonance des passe-bas/haut et la
   réponse en temps des plateaux (83,7 % / 40,4 % d'overs) — 🔴 ouvert ;
 * **C** — avec un pic d'échantillon tagué, la crête vraie passe à +2,10 dBTP —

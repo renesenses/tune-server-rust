@@ -186,13 +186,27 @@ fn reglages(prevent_clipping: bool, plafond_dbtp: f64) -> ReplayGainSettings {
     }
 }
 
+/// Le facteur du cas A de T9, ×1,9953 : +6 dB, aucun pic tagué.
+///
+/// 🔴 **Garde-fou DÉSARMÉ depuis #4072.** Ce banc mesure ce que compte
+/// `apply_gain_pcm` quand elle écrête ; il lui faut donc un facteur qui
+/// écrête. Avec `prevent_clipping` armé, `gain_factor` refuse désormais le
+/// gain positif sans pic (le défaut A est corrigé) et rendrait 1,0 : plus un
+/// seul écrêté à compter, et les quinze empreintes FNV-1a de ce fichier —
+/// relevées pour prouver qu'aucun échantillon n'avait bougé — deviendraient
+/// celles du signal d'entrée.
+///
+/// Le facteur rendu ici est **exactement** celui d'avant, au bit près : le
+/// chemin désarmé de `gain_factor` n'a pas été touché par #4072. Les
+/// empreintes restent donc valides et continuent de garder ce qu'elles
+/// gardaient.
 fn facteur_plus_6_sans_pic() -> f64 {
     gain_factor(
         TrackGain {
             gain_db: 6.0,
             peak: None,
         },
-        reglages(true, 0.0),
+        reglages(false, 0.0),
     )
 }
 
