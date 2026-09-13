@@ -228,6 +228,43 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
+    // #3933 — les ressources que le serveur média publie dans sa DIDL.
+    //
+    // Un renderer DLNA n'a AUCUN moyen de s'authentifier : il n'y a ni écran
+    // de connexion ni en-tête `Authorization` dans un Marantz. Or les quatre
+    // URL que le serveur média lui donne (audio de piste, flux radio,
+    // pochette, relais de logo) vivent toutes sous `/api/v1`, la seule surface
+    // que cette couche protège. Avec `auth_enabled = true`, le renderer voyait
+    // le serveur, le parcourait — et se faisait refuser en 401 tout ce qu'il y
+    // trouvait. Le chemin PUSH marchait (`/stream/…` est monté à la racine),
+    // le chemin PULL non : c'est l'asymétrie que les testeurs rapportaient.
+    //
+    // L'arbitrage retenu, et ses bornes :
+    //
+    // * la liste des chemins n'est PAS écrite ici — elle est rendue par
+    //   `est_ressource_didl`, qui vit à côté des constructeurs d'URL. Deux
+    //   listes séparées, c'est la dérive garantie le jour où une cinquième
+    //   ressource entre dans la DIDL ;
+    // * GET et HEAD seulement. Un renderer sonde en HEAD avant de lire — la
+    //   route radio a d'ailleurs son propre gestionnaire `.head(…)`. Tout le
+    //   reste retombe sur le contrôle de jeton ;
+    // * appelant sur le réseau local uniquement. Un serveur publié sur
+    //   Internet ne s'ouvre pas : la DIDL n'est de toute façon atteignable
+    //   qu'en SSDP, donc depuis le LAN.
+    //
+    // Ce qui a été ÉCARTÉ : « n'exempter que ceux qui ont parcouru la DIDL ».
+    // En DLNA le point de contrôle qui parcourt (le téléphone) et le renderer
+    // qui va chercher les octets (l'ampli) sont deux machines différentes, avec
+    // deux adresses différentes. Une exemption gagnée en parcourant n'aurait
+    // jamais profité à celui qui en a besoin.
+    if !is_extension_route
+        && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+        && tune_core::upnp_server::est_ressource_didl(path)
+        && appelant_sur_le_reseau_local(&request)
+    {
+        return next.run(request).await;
+    }
+
     // Extract token from Authorization header or tune_session cookie
     let token = extract_token_from_request(&request);
 
@@ -260,6 +297,45 @@ pub async fn auth_middleware(
             }
         }
         None => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+    }
+}
+
+/// L'appelant est-il sur le réseau local (ou la machine elle-même) ?
+///
+/// L'adresse vient de `ConnectInfo`, posé par
+/// `into_make_service_with_connect_info` (`bootstrap.rs`) et par
+/// `MockConnectInfo` sous test. **Absente, la réponse est NON** : une couche
+/// qui oublierait de le poser doit fermer l'exemption, pas l'ouvrir.
+fn appelant_sur_le_reseau_local(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(peer)| adresse_locale(peer.ip()))
+        .unwrap_or(false)
+}
+
+/// Loopback, plages privées RFC 1918, lien local — et leurs équivalents IPv6.
+///
+/// Écrit à la main plutôt qu'avec `Ipv6Addr::is_unique_local` /
+/// `is_unicast_link_local`, qui sont encore instables : les deux masques
+/// ci-dessous sont ceux de la RFC (fc00::/7 et fe80::/10).
+fn adresse_locale(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    fn v4_local(v4: &std::net::Ipv4Addr) -> bool {
+        v4.is_loopback() || v4.is_private() || v4.is_link_local()
+    }
+    match ip {
+        IpAddr::V4(v4) => v4_local(&v4),
+        IpAddr::V6(v6) => {
+            // Une socket à double pile rend l'appelant IPv4 sous la forme
+            // ::ffff:192.168.1.42 — sans ce déballage, tout le LAN IPv4 d'un
+            // serveur en écoute IPv6 serait vu comme distant.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4_local(&v4);
+            }
+            let s = v6.segments();
+            v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 
