@@ -449,3 +449,14 @@ path = "tests/journal_perte_flac_2218.rs"
 [[test]]
 name = "hqplayer_declaration_xml_unique_4023"
 path = "tests/hqplayer_declaration_xml_unique_4023.rs"
+
+# #4023, second temps — l'album qui n'avançait pas. Le témoin mesure l'AVANCE
+# de file au niveau du protocole (deux `play_media` d'affilée sur une seule
+# sortie, soit quatre commandes sur une connexion) et garde la ligne qui dit
+# qu'une réponse `Status` n'a pas été comprise. Binaire à lui seul : il pose un
+# abonné `tracing` GLOBAL, donc un seul essai dedans. `autotests = false` en
+# tête de ce manifeste : sans cette cible, le fichier ne serait JAMAIS compilé
+# et la porte rendrait un vert contre rien.
+[[test]]
+name = "hqplayer_avance_album_4023"
+path = "tests/hqplayer_avance_album_4023.rs"
