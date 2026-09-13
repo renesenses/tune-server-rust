@@ -4267,6 +4267,203 @@ async fn une_zone_locale_hors_ligne_mais_dont_la_sortie_est_enregistree_passe_to
     );
 }
 
+/// Une zone locale hors ligne, et une VRAIE piste : de quoi faire passer la
+/// route de lecture entière, pas seulement son garde.
+///
+/// Le fichier est une copie du FLAC du dépôt — la résolution lit sa taille sur
+/// le disque, un chemin fantôme échouerait en `file_not_found` et le témoin
+/// mesurerait ce refus-là au lieu du bon.
+async fn zone_locale_hors_ligne_avec_une_piste(
+    dev: &str,
+) -> (PlaybackOrchestrator, i64, tempfile::TempDir) {
+    let orch = test_orchestrator();
+    let dir = tempfile::tempdir().unwrap();
+    let chemin = dir.path().join("piste-3737.flac");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        &chemin,
+    )
+    .unwrap();
+    orch.db
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    let fichier = chemin.to_string_lossy().into_owned();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (1, 'Piste', 1, 1, ?, 'flac', 300000, 44100, 16, 2)",
+            &[&fichier as &dyn crate::db::backend::ToSqlValue],
+        )
+        .unwrap();
+    let zone_id = zone_locale_hors_ligne(&orch, "audio-gd USB audio", dev);
+    (orch, zone_id, dir)
+}
+
+/// Le refus tel que la ROUTE le rend : `play()` sans `output_device_id`, comme
+/// le client web l'appelle.
+///
+/// `gate_or_rebind_offline_zone` n'est atteint QUE par cette branche
+/// (`resoudre_la_sortie_de_la_zone` ne consulte la zone que lorsque la demande
+/// ne porte pas d'appareil). Un témoin qui appellerait le garde lui-même ne
+/// prouverait donc pas que le branchement réel est gardé.
+async fn refus_de_la_route(orch: &PlaybackOrchestrator, zone_id: i64) -> Option<String> {
+    match orch
+        .play(PlayRequest {
+            zone_id,
+            track_id: Some(1),
+            source: Some("local".into()),
+            ..Default::default()
+        })
+        .await
+    {
+        Err(e) => Some(e),
+        Ok(r) => r.error,
+    }
+}
+
+/// 🔴 #3737 — un parc local VIDE n'est pas une preuve d'absence.
+///
+/// #3738 a retiré l'exemption « une zone `local:` est toujours disponible » et
+/// l'a remplacée par « l'appareil est-il dans le registre vivant ». L'issue
+/// posait la garde qui va avec, dans la phrase suivante : « un parc vide
+/// (démarrage, énumération en cours) ferait refuser TOUTES les zones locales.
+/// Le test doit exiger un parc non vide avant de conclure à l'absence. Sans
+/// cette garde, le correctif est pire que le défaut. » Elle n'avait pas été
+/// posée.
+///
+/// Le parc local est vide sans qu'aucun appareil n'ait disparu dès que
+/// l'énumération de démarrage échoue, expire ou panique :
+/// `startup.rs::register_local_outputs` garde tout son bloc d'enregistrement
+/// par `if !devices.is_empty()`, et son propre commentaire annonce « starting
+/// the server WITHOUT local zones this boot » quand un pilote ASIO tenu par
+/// une autre application ne répond pas dans les 8 s.
+///
+/// Le registre porte ici une sortie RÉSEAU : le registre n'est pas vide, seul
+/// le parc LOCAL l'est. C'est la situation exacte d'un serveur dont le SSDP a
+/// répondu et dont l'énumération audio n'a pas répondu.
+#[tokio::test]
+async fn la_route_ne_refuse_pas_une_zone_locale_quand_le_parc_local_est_vide() {
+    let (orch, zone_id, _dir) =
+        zone_locale_hors_ligne_avec_une_piste("local:audio-gd USB audio").await;
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("dlna-salon", "Salon").with_type("dlna"),
+    ));
+
+    let erreur = refus_de_la_route(&orch, zone_id).await;
+    assert!(
+        !erreur
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("zone_output_unavailable:"),
+        "aucune énumération locale n'a eu lieu : conclure à l'absence du DAC refuse \
+         la lecture à chaque clic pour TOUT le démarrage, alors que l'appareil est \
+         branché et que `recreate_local_and_play` sait l'ouvrir sans passer par le \
+         registre — erreur rendue : {erreur:?}"
+    );
+
+    // Et rien n'a été réécrit en base au passage : la zone garde son appareil.
+    let apres = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        apres.output_device_id.as_deref(),
+        Some("local:audio-gd USB audio")
+    );
+}
+
+/// L'AUTRE moitié, sur la même route : dès qu'UN appareil local répond,
+/// l'énumération a bien eu lieu, et l'absence du DAC est mesurée.
+///
+/// C'est le cas de Jean-Luc Cassé — WASAPI n'énumère plus que « Haut-parleurs »
+/// —, et c'est ce que #3738 a corrigé. Sans ce témoin, élargir la garde
+/// ci-dessus à tout parc rouvrirait #3738 : la lecture repartirait pour mourir
+/// 600 ms plus tard, sans refus au journal.
+#[tokio::test]
+async fn la_route_refuse_toujours_une_zone_locale_quand_le_parc_local_repond() {
+    let (orch, zone_id, _dir) =
+        zone_locale_hors_ligne_avec_une_piste("local:audio-gd USB audio").await;
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:haut-parleurs", "Haut-parleurs").with_type("local"),
+    ));
+
+    let erreur = refus_de_la_route(&orch, zone_id)
+        .await
+        .expect("la route doit refuser, pas laisser partir une lecture qui ne peut pas aboutir");
+    assert!(
+        erreur.starts_with("zone_output_unavailable:"),
+        "le refus doit porter la sentinelle que la couche HTTP mappe sur un 409 : {erreur}"
+    );
+    assert!(
+        erreur.contains("audio-gd USB audio"),
+        "et NOMMER l'appareil manquant (#3737) : {erreur}"
+    );
+}
+
+/// Le même verdict, lu sur le garde lui-même : un parc local vide rend
+/// `Ok(None)` — pas de rebond au hasard, pas d'écriture en base.
+///
+/// Le témoin de route ci-dessus ne peut pas distinguer « le garde a laissé
+/// passer » de « le garde a rebondi » : les deux évitent la sentinelle. Ici on
+/// lit le verdict.
+#[tokio::test]
+async fn un_parc_local_vide_laisse_passer_sans_rebondir_ni_ecrire() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_hors_ligne(&orch, "Bureau", "local:bureau");
+    // Un homonyme RÉSEAU : le rebond de #1287 le prendrait s'il était atteint,
+    // et enverrait le son d'un DAC sur un renderer du salon.
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("dlna-bureau", "Bureau").with_type("dlna"),
+    ));
+
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        orch.gate_or_rebind_offline_zone(zone_id, &zone)
+            .await
+            .unwrap(),
+        None,
+        "parc local vide : l'absence n'est pas mesurée, on laisse passer"
+    );
+    let apres = repo.get(zone_id).unwrap().unwrap();
+    assert_eq!(
+        apres.output_device_id.as_deref(),
+        Some("local:bureau"),
+        "aucun rebond ne doit avoir eu lieu"
+    );
+    assert!(!apres.online, "et aucune écriture d'état non plus");
+}
+
+/// Contre-épreuve de la PORTÉE : une zone RÉSEAU dont le registre est vide
+/// reste refusée.
+///
+/// La garde de ce ticket est délibérément limitée aux sorties `local:`, parce
+/// que « le parc » n'y est une énumération de périphériques qu'à cet
+/// endroit-là. L'étendre à toutes les familles ferait taire le refus de #1287
+/// sur tout serveur dont la découverte réseau démarre.
+#[tokio::test]
+async fn une_zone_reseau_reste_refusee_meme_avec_un_registre_vide() {
+    let orch = test_orchestrator();
+    let zone_id = stale_network_zone(&orch, "Salon");
+
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_id, &zone)
+        .await
+        .expect_err("la garde du parc vide ne doit pas déborder sur les zones réseau");
+    assert!(err.starts_with("zone_output_unavailable:"), "err = {err}");
+}
+
 #[test]
 fn timeout_means_the_command_may_have_landed() {
     let err = format!(
