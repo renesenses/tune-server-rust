@@ -406,62 +406,60 @@ fn q1_defaut_connu_prevent_clipping_arme_ne_devrait_jamais_ecreter_meme_sans_pic
 }
 
 /// Sinus 997 Hz à −0,1 dBFS, 24 bits ; une bande passe-bas à 997 Hz, Q = 4.
-/// Un passe-bas RBJ vaut |H(fc)| = Q, soit +12 dB à la résonance — et
-/// `automatic_headroom_db` ne réserve RIEN pour un filtre « pass ». Mesuré :
-/// préampli 0 dB, ~84 % d'overs comptés dans `EqProcessStats` (exposés par
-/// `eq_overs`), écrêtés DUR par `write_sample_f64` à 1,0 − 1 LSB PUIS dithérés
-/// (ils sortent au rail ou 1 LSB en dessous), sans journal.
+///
+/// ⚠️ **Le nom de ce témoin décrit le DÉFAUT D'ORIGINE, corrigé par #4073.**
+/// Il est conservé tel quel — REF-0 refuse qu'un test nommé disparaisse — et
+/// son corps a été retourné : il garde désormais que le défaut ne revient pas.
+///
+/// Le relevé d'origine : `automatic_headroom_db` ne réservait RIEN pour un
+/// filtre « pass », préampli 0 dB, ~84 % d'overs comptés dans `EqProcessStats`,
+/// écrêtés dur par `write_sample_f64` PUIS dithérés, sans journal.
 #[test]
 fn q1_l_egaliseur_entier_ne_reserve_rien_pour_un_passe_bas_resonnant_et_ecrete_dur_en_comptant() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
-    assert_eq!(
-        p.automatic_headroom_db(0),
-        0.0,
-        "réserve automatique : rien pour un passe-bas, quelle que soit sa résonance"
+
+    // Q = 4 : le maximum de |H| vaut Q/√(1−1/(4Q²)) = ×4,0316, soit +12,11 dB.
+    let reserve = p.automatic_headroom_db(0);
+    assert!(
+        (reserve + 12.11).abs() < 0.02,
+        "la réserve doit couvrir la résonance du passe-bas : attendu ≈ −12,11 dB, \
+         obtenu {reserve} (#4073). Avant le correctif elle valait 0,0."
     );
+
     let mut eq = EqProcessor::new(&p, FS, 1);
-    assert_eq!(eq.preamp_db(0), Some(0.0));
+    assert!(
+        eq.preamp_db(0).is_some_and(|d| (d - reserve).abs() < 1e-9),
+        "le préampli appliqué est la réserve : {:?}",
+        eq.preamp_db(0)
+    );
 
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 24);
     let stats = eq.process_pcm(&mut pcm, 24);
     let sortie = depuis_pcm(&pcm, 24);
     let n_rail = au_rail(&sortie, 24);
-    let n_rail_1 = au_rail_a_1_lsb_pres(&sortie, 24);
     eprintln!(
-        "q1 égaliseur passe-bas Q=4 : préampli {:?} dB, overs {}/{N} ({:.1} %), au rail {n_rail}, au rail à 1 LSB près {n_rail_1}, non finis {}",
-        eq.preamp_db(0),
-        stats.overs,
-        100.0 * stats.overs as f64 / N as f64,
-        stats.non_finite_samples
-    );
-    assert!(
-        stats.overs > N as u64 * 3 / 4 && stats.overs < N as u64 * 9 / 10,
-        "résonance +12 dB sur un signal à −0,1 dBFS : la majorité des échantillons dépasse (~84 %) : {}",
+        "q1 égaliseur passe-bas Q=4, APRÈS #4073 : réserve {reserve:.2} dB, overs {}/{N}, au rail {n_rail}",
         stats.overs
     );
-    assert!(
-        n_rail_1 >= stats.overs.saturating_sub(4) as usize,
-        "chaque over est écrêté DUR (rail ou rail − 1 LSB, le dither venant APRÈS la saturation) : {n_rail_1}, overs {}",
-        stats.overs
-    );
-    assert!(
-        n_rail < n_rail_1 && n_rail > n_rail_1 / 2,
-        "le dither ±1 LSB répartit le plateau écrêté entre le rail et 1 LSB en dessous : {n_rail} / {n_rail_1}"
-    );
-    assert_eq!(sortie.iter().max(), Some(&8_388_607));
-    assert_eq!(sortie.iter().min(), Some(&-8_388_608));
     assert_eq!(
-        eq.process_stats().overs,
-        stats.overs,
-        "compté, cumulé — mais jamais journalisé"
+        stats.overs, 0,
+        "réserve correcte ⇒ aucun over : {} sur {N}. Avant le correctif : ~84 %.",
+        stats.overs
+    );
+    assert_eq!(
+        n_rail, 0,
+        "et aucun échantillon posé sur le rail : {n_rail}"
+    );
+    assert_eq!(
+        stats.non_finite_samples, 0,
+        "aucun échantillon non fini ne doit apparaître"
     );
 }
 
 /// Le comportement ATTENDU : la réserve automatique couvre la résonance
 /// (+20·log10(Q) dB) des passe-bas / passe-haut, et rien ne dépasse.
 #[test]
-#[ignore = "défaut connu : automatic_headroom_db ignore la résonance +20·log10(Q) dB des filtres low_pass/high_pass (issue B)"]
 fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_passe_bas() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
     assert!(
@@ -475,29 +473,47 @@ fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_pass
     assert_eq!(stats.overs, 0, "aucun over avec une réserve correcte");
 }
 
-/// Même profil, chemin FLOTTANT (sortie locale) : les overs sont comptés et
-/// laissés tels quels, jusqu'à ×3,95. C'est documenté comme voulu (le
-/// saturateur est plus loin — `f32_to_native_i32`, privé, ou personne sur le
-/// chemin cpal flottant).
+/// Chemin FLOTTANT (sortie locale) : les overs sont comptés et laissés tels
+/// quels, jamais saturés. C'est documenté comme voulu — le saturateur est plus
+/// loin (`f32_to_native_i32`, privé), ou personne sur le chemin cpal flottant.
+///
+/// ⚠️ **Le profil de ce témoin a changé avec #4073.** Il utilisait un passe-bas
+/// Q = 4, dont la résonance n'était alors pas réservée : le signal ressortait
+/// à ×4 sans écrêtage, ce qui prouvait la propriété. Depuis #4073 la réserve
+/// couvre cette résonance et il n'y a plus d'over à observer avec ce profil —
+/// le témoin ne gardait plus rien.
+///
+/// Il passe donc au plateau grave, dont la réponse en TEMPS dépasse encore la
+/// réserve (défaut B, partie 2, toujours ouvert : voir le témoin `#[ignore]`
+/// `…_devrait_couvrir_la_reponse_en_temps_d_un_plateau`). Le jour où ce
+/// défaut-là sera corrigé, ce témoin redemandera un autre cas — et c'est très
+/// bien : il ne doit jamais pouvoir rester vert sans overs à observer.
 #[test]
 fn q1_l_egaliseur_flottant_laisse_passer_les_overs_sans_les_ecreter() {
-    let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
+    let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
-    let mut s: Vec<f32> = sinus(997.0, -0.1, N, 0.0)
-        .iter()
-        .map(|&v| v as f32)
-        .collect();
+    let mut s: Vec<f32> = carre(50.0, -0.05, N).iter().map(|&v| v as f32).collect();
     let stats = eq.process_interleaved(&mut s);
     let crete = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     eprintln!(
-        "q1 égaliseur flottant : overs {}, crête {crete:.3} ({:+.2} dBFS)",
+        "q1 égaliseur flottant (plateau grave) : overs {}, crête {crete:.3} ({:+.2} dBFS)",
         stats.overs,
         dbfs(f64::from(crete))
     );
-    assert!(stats.overs > N as u64 * 3 / 4);
+
+    // Sans overs à observer, ce témoin ne garde rien : on l'exige d'abord.
     assert!(
-        crete > 3.5 && crete < 4.2,
-        "aucune saturation sur le chemin flottant : crête ×{crete:.3} (Q = 4 ⇒ ×4 attendu)"
+        stats.overs > 0,
+        "ce témoin exige un cas qui dépasse ENCORE le rail, sinon il est vide"
+    );
+    assert!(
+        crete > 1.0,
+        "le chemin flottant ne sature pas : la crête doit dépasser la pleine \
+         échelle, elle vaut ×{crete:.3}"
+    );
+    assert_eq!(
+        stats.non_finite_samples, 0,
+        "laisser passer n'est pas laisser diverger"
     );
 }
 
@@ -983,4 +999,74 @@ fn q4_les_etages_desarmes_sont_l_identite_octet_pour_octet() {
     EqProcessor::new(&EqProfile::default(), FS, 1).process_interleaved(&mut flottant);
     CrossfeedProcessor::new(FS, 0.0, 0.3).process_interleaved(&mut flottant);
     assert_eq!(flottant, original, "chemin flottant désarmé");
+}
+
+/// 🔴 #4073 — la BORNE de la réserve de résonance : en deçà de `Q = 1/√2`,
+/// il ne doit y en avoir aucune.
+///
+/// Un passe-bas Butterworth (`Q = 0,707`) a une réponse monotone décroissante :
+/// il ne dépasse jamais 0 dB. Lui rendre une réserve atténuerait la musique
+/// pour rien, sur le réglage le plus courant qui soit.
+///
+/// Ce témoin existe parce que la contre-épreuve l'a exigé : en supprimant le
+/// seuil `q <= Q_SANS_SURTENSION`, les quinze autres témoins restaient VERTS.
+/// Rien ne gardait ce côté-là du correctif.
+#[test]
+fn q1_un_passe_bas_sans_surtension_ne_recoit_aucune_reserve() {
+    // Butterworth — la borne exacte.
+    let p = profil(vec![bande("low_pass", 997.0, 0.0, FRAC_1_SQRT_2)]);
+    assert_eq!(
+        p.automatic_headroom_db(0),
+        0.0,
+        "Q = 1/√2 : réponse monotone, aucune surtension, donc aucune réserve. \
+         Obtenu {}",
+        p.automatic_headroom_db(0)
+    );
+
+    // 🔴 LE cas qui compte : entre 0,5 et 1/√2, SEUL le seuil protège.
+    //
+    // La formule `Q/√(1−1/(4Q²))` n'est le maximum de |H| qu'au-dessus de
+    // 1/√2 ; en dessous il n'y a pas de maximum interne et la réponse plafonne
+    // à 1,0. À Q = 0,6 la formule rend pourtant ×1,085 — elle réserverait
+    // −0,71 dB pour une surtension qui n'existe pas.
+    //
+    // Les deux bornes ci-dessus (0,707 et 0,5) sont rattrapées PAR ACCIDENT
+    // par les garde-fous `pic <= 1.0` et `!pic.is_finite()`, même sans le
+    // seuil : mesuré, en le supprimant elles restaient vertes. Sans ce cas-ci,
+    // le témoin ne gardait pas ce qu'il prétendait garder.
+    let p = profil(vec![bande("low_pass", 997.0, 0.0, 0.6)]);
+    assert_eq!(
+        p.automatic_headroom_db(0),
+        0.0,
+        "Q = 0,6 < 1/√2 : la réponse plafonne à 1,0, aucune réserve n'est due. \
+         Obtenu {} — la formule du maximum, appliquée hors de son domaine, \
+         rendrait −0,71 dB",
+        p.automatic_headroom_db(0)
+    );
+
+    // Franchement amorti — encore moins de raison de réserver.
+    let p = profil(vec![bande("high_pass", 40.0, 0.0, 0.5)]);
+    assert_eq!(
+        p.automatic_headroom_db(0),
+        0.0,
+        "Q = 0,5 : aucune réserve. Obtenu {}",
+        p.automatic_headroom_db(0)
+    );
+
+    // Et juste AU-DESSUS de la borne, la réserve doit repartir : sans cette
+    // moitié-ci, un correctif qui ne réserverait plus jamais rien passerait.
+    let p = profil(vec![bande("low_pass", 997.0, 0.0, 1.0)]);
+    let r = p.automatic_headroom_db(0);
+    assert!(
+        r < -1.0 && r > -2.0,
+        "Q = 1 : |H|max = 1/√(3/4) = ×1,155, soit −1,25 dB de réserve. Obtenu {r}"
+    );
+
+    // Le `notch` reste hors compte, quelle que soit sa résonance.
+    let p = profil(vec![bande("notch", 997.0, 0.0, 8.0)]);
+    assert_eq!(
+        p.automatic_headroom_db(0),
+        0.0,
+        "un notch ne dépasse jamais 0 dB : aucune réserve, même à Q = 8"
+    );
 }

@@ -176,12 +176,39 @@ impl EqProfile {
         )
     }
 
+    /// La surtension d'un passe-bas ou passe-haut résonnant, en dB (#4073).
+    ///
+    /// Un biquad RBJ du second ordre ne se contente pas de couper : au-delà de
+    /// `Q = 1/√2` il BOSSE autour de sa fréquence de coupure. Le maximum de
+    /// `|H|` vaut alors `Q / √(1 − 1/(4Q²))` — soit **+12,11 dB pour Q = 4**,
+    /// que rien ne réservait.
+    ///
+    /// En deçà de `1/√2` (Butterworth), la réponse est monotone décroissante :
+    /// aucune réserve n'est due, et en rendre une atténuerait pour rien.
+    fn surtension_pass_db(q: f64) -> f64 {
+        const Q_SANS_SURTENSION: f64 = std::f64::consts::FRAC_1_SQRT_2;
+        if !q.is_finite() || q <= Q_SANS_SURTENSION {
+            return 0.0;
+        }
+        let pic = q / (1.0 - 1.0 / (4.0 * q * q)).sqrt();
+        if !pic.is_finite() || pic <= 1.0 {
+            return 0.0;
+        }
+        20.0 * pic.log10()
+    }
+
     /// Conservative automatic headroom for one channel.
     ///
     /// Biquads are cascaded, so their gains multiply in the linear domain and
     /// add in dB. Reserving the sum of every positive peak/shelf gain prevents
-    /// an EQ boost from depending on a limiter or saturator. Pass, notch and
-    /// cut-only filters need no positive-gain allowance.
+    /// an EQ boost from depending on a limiter or saturator.
+    ///
+    /// 🔴 #4073 — la phrase qui tenait ici, « Pass, notch and cut-only filters
+    /// need no positive-gain allowance », était FAUSSE pour les filtres pass.
+    /// Un passe-bas à Q = 4 bosse de +12 dB à sa coupure, et la réserve rendait
+    /// 0,0 : sur un signal à −0,1 dBFS, 83,7 % des échantillons dépassaient le
+    /// rail, écrêtés dur par `write_sample_f64` puis dithérés. Mesuré par le
+    /// banc T9. Le `notch`, lui, ne dépasse jamais 0 dB : il reste hors compte.
     pub fn automatic_headroom_db(&self, channel: u16) -> f64 {
         let positive_db: f64 = if self.bands.is_empty() {
             let (bass, mid, treble) = self.effective_gains();
@@ -192,13 +219,22 @@ impl EqProfile {
         } else {
             self.bands
                 .iter()
-                .filter(|band| {
-                    band.vise_le_canal(channel)
-                        && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
-                        && band.gain.is_finite()
-                        && band.gain > 0.0
+                .filter(|band| band.vise_le_canal(channel))
+                .map(|band| match band.band_type.as_str() {
+                    // Gain explicite : c'est l'utilisateur qui le demande.
+                    "peak" | "low_shelf" | "high_shelf" => {
+                        if band.gain.is_finite() && band.gain > 0.0 {
+                            band.gain.clamp(0.0, 24.0)
+                        } else {
+                            0.0
+                        }
+                    }
+                    // Gain IMPLICITE : la résonance du filtre, que personne
+                    // n'a saisie et que rien ne réservait (#4073).
+                    "low_pass" | "high_pass" => Self::surtension_pass_db(band.q).clamp(0.0, 24.0),
+                    // `notch` ne dépasse jamais 0 dB.
+                    _ => 0.0,
                 })
-                .map(|band| band.gain.clamp(0.0, 24.0))
                 .sum()
         };
         -positive_db
