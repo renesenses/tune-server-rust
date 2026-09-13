@@ -139,6 +139,31 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (tag_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id)",
+    // Registre DURABLE des serveurs multimedia (#2219, phase 1). Quatrieme
+    // chemin, meme raison : une base PostgreSQL convertie AVANT cette version
+    // porte `schema_version = 99` et ne recevra jamais la migration 058. Or la
+    // route `GET /media-servers` LIT cette table des cette version : sans ce
+    // rattrapage, elle rendrait une erreur SQL sur tout le parc migre — .15 et
+    // .18 compris, c'est-a-dire les machines memes ou le defaut a ete mesure.
+    "CREATE TABLE IF NOT EXISTS media_servers (\
+            udn TEXT PRIMARY KEY,\
+            name TEXT NOT NULL DEFAULT '',\
+            manufacturer TEXT,\
+            model TEXT,\
+            device_type TEXT NOT NULL DEFAULT 'upnp_media_server',\
+            location TEXT NOT NULL DEFAULT '',\
+            content_directory_url TEXT,\
+            host TEXT,\
+            port INTEGER,\
+            max_age_secs INTEGER,\
+            first_seen_at TEXT NOT NULL,\
+            last_seen_at TEXT NOT NULL,\
+            active INTEGER NOT NULL DEFAULT 1,\
+            last_state TEXT,\
+            absence_reason TEXT,\
+            created_at TEXT\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the

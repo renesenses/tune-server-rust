@@ -162,33 +162,183 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
     StatusCode::NO_CONTENT
 }
 
+/// Verser dans le registre DURABLE ce que la découverte tient en mémoire.
+///
+/// Le registre en mémoire (`state.media_servers`) est la vue de la couche
+/// SSDP ; la table `media_servers` est la vue qui SURVIT. Les tenir d'accord
+/// ici, plutôt que dans `discovery_setup`, a une raison mesurée : la couche
+/// SSDP n'émet un évènement qu'à la PREMIÈRE découverte
+/// (`SsdpEvent::MediaServerDiscovered`) — un serveur déjà connu qui se
+/// réannonce voit sa fraîcheur remise à zéro EN PLACE
+/// (`discovery/ssdp.rs:1367-1371`) sans que rien ne soit publié. Un branchement
+/// sur le seul évènement daterait donc chaque serveur de sa première apparition
+/// et jamais de la dernière — c'est-à-dire exactement le défaut qu'on corrige.
+///
+/// L'observation est datée `maintenant - âge` : on écrit ce que la découverte
+/// SAIT, jamais « vu à l'instant ». C'est la contre-épreuve de la phase 1 —
+/// un serveur éteint ne doit pas ressusciter parce qu'on a relu la liste.
+///
+/// Idempotent, quelques lignes au plus, et sans effet de bord visible : une
+/// observation ne réécrit ni `first_seen_at`, ni `active`.
+async fn synchroniser_le_registre(state: &AppState) {
+    use tune_core::db::media_server_repo::{
+        MediaServerRepo, ObservationServeurRecue, horodatage_il_y_a,
+    };
+
+    // Le verrou est relâché AVANT d'écrire en base : une écriture SQLite sous
+    // le mutex du registre ferait attendre la découverte SSDP, qui le prend à
+    // chaque annonce reçue.
+    let observations: Vec<(ObservationServeurRecue, String)> = {
+        let servers = state.media_servers.lock().await;
+        servers
+            .values()
+            .map(|ms| {
+                let vu_le = horodatage_il_y_a(ms.age().as_secs() as i64);
+                (
+                    ObservationServeurRecue {
+                        udn: ms.id.clone(),
+                        name: ms.name.clone(),
+                        manufacturer: Some(ms.manufacturer.clone()).filter(|s| !s.is_empty()),
+                        model: Some(ms.model.clone()).filter(|s| !s.is_empty()),
+                        device_type: "upnp_media_server".into(),
+                        location: ms.location.clone(),
+                        content_directory_url: Some(ms.content_directory_url.clone())
+                            .filter(|s| !s.is_empty()),
+                        host: Some(ms.host.clone()).filter(|s| !s.is_empty()),
+                        port: Some(i64::from(ms.port)),
+                        max_age_secs: None,
+                    },
+                    vu_le,
+                )
+            })
+            .collect()
+    };
+
+    let repo = MediaServerRepo::with_backend(state.backend.clone());
+    for (obs, vu_le) in &observations {
+        if let Err(e) = repo.enregistrer_observation_a(obs, vu_le) {
+            warn!(udn = %obs.udn, error = %e, "media_server_registre_ecriture_echouee");
+        }
+    }
+}
+
 async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
-    let servers = state.media_servers.lock().await;
-    let items: Vec<Value> = servers
-        .values()
-        .map(|ms| {
+    use tune_core::discovery::presence_serveur::{
+        ObservationServeur, PART_MAX_ABSENCE_SIMULTANEE, PLANCHER_PLAFOND_ABSENCE,
+        SERVEUR_ABSENT_APRES, qualifier_le_registre,
+    };
+
+    synchroniser_le_registre(&state).await;
+
+    let repo =
+        tune_core::db::media_server_repo::MediaServerRepo::with_backend(state.backend.clone());
+    let enregistres = match repo.lister() {
+        Ok(v) => v,
+        Err(e) => {
+            // On ne rend PAS une liste vide sur une erreur de base : une liste
+            // vide se lit « aucun serveur », et c'est un mensonge de plus. Le
+            // registre en mémoire prend le relais, dégradé mais honnête.
+            warn!(error = %e, "media_server_registre_lecture_echouee");
+            Vec::new()
+        }
+    };
+
+    // Le calcul de fraîcheur porte sur la LISTE, jamais sur la ligne : le
+    // plafond de bascule en masse ne peut se juger que sur l'ensemble — même
+    // raison que `verdict_purge` (`routes/system/scan.rs:454-481`).
+    let ages: Vec<Option<i64>> = enregistres.iter().map(|s| s.age_secs()).collect();
+    let observations: Vec<ObservationServeur<'_>> = enregistres
+        .iter()
+        .zip(&ages)
+        .map(|(s, age)| ObservationServeur {
+            udn: &s.udn,
+            age_secs: *age,
+            disparition_confirmee: s.absence_reason.as_deref() == Some("disparition_confirmee"),
+        })
+        .collect();
+    let verdict = qualifier_le_registre(&observations);
+
+    // Le constat écrit suit le calcul : la table doit pouvoir se relire seule,
+    // sans rejouer la qualification (c'est `network_mounts.mount_state`).
+    for (udn, presence) in &verdict.presences {
+        let ecriture = match presence.raison() {
+            Some(raison) => repo.marquer_absent(udn, raison.code()),
+            None => Ok(()),
+        };
+        if let Err(e) = ecriture {
+            warn!(udn = %udn, error = %e, "media_server_constat_ecriture_echouee");
+        }
+    }
+
+    let en_memoire = state.media_servers.lock().await;
+    let items: Vec<Value> = enregistres
+        .iter()
+        .zip(&ages)
+        .map(|(s, age)| {
+            let presence = verdict
+                .pour(&s.udn)
+                .unwrap_or(tune_core::discovery::presence_serveur::PresenceServeur::Present);
             json!({
-                "id": ms.id,
-                "name": ms.name,
-                "manufacturer": ms.manufacturer,
-                "model": ms.model,
-                "host": ms.host,
-                "port": ms.port,
-                "location": ms.location,
+                "id": s.udn,
+                "name": s.name,
+                "manufacturer": s.manufacturer.clone().unwrap_or_default(),
+                "model": s.model.clone().unwrap_or_default(),
+                "host": s.host.clone().unwrap_or_default(),
+                "port": s.port.unwrap_or(0),
+                "location": s.location,
                 // Le marquage demandé par Bertrand dans le fil forum 1425 :
                 // l'interface grise un serveur qui ne répond plus au lieu de
                 // le faire clignoter en le retirant puis le remettant. Champs
                 // AJOUTÉS — aucun client existant ne casse (#2139).
-                "reachable": ms.is_reachable(),
-                "last_seen_secs": ms.age().as_secs(),
+                "reachable": en_memoire.get(&s.udn).is_some_and(|ms| ms.is_reachable()),
+                "last_seen_secs": age.unwrap_or(0),
+                // #2219 phase 1 — ce que la liste ne savait pas dire.
+                //
+                // `last_seen_at` est la réparation la plus concrète : la date
+                // était un `Instant` `#[serde(skip)]` (`ssdp.rs:146`), donc
+                // rien d'absolu n'était exposable, et le client ne pouvait que
+                // relire un âge relatif à un instant qu'il ignorait.
+                "presence": presence.code(),
+                "proposable": presence.proposable(),
+                "absence_reason": presence.raison().map(|r| r.code()),
+                "first_seen_at": s.first_seen_at,
+                "last_seen_at": s.last_seen_at,
+                // L'INTENTION, distincte du constat (`network_mounts`, #1916).
+                "active": s.active,
             })
         })
         .collect();
+    drop(en_memoire);
+
     let total = items.len();
-    Json(json!({
+    let proposables = items
+        .iter()
+        .filter(|i| i.get("proposable").and_then(Value::as_bool) == Some(true))
+        .count();
+    let mut sortie = json!({
         "items": items,
         "total": total,
-    }))
+        // Combien sont réellement utilisables. `total` seul laissait croire
+        // que trois serveurs vus il y a 23 h étaient trois serveurs.
+        "proposables": proposables,
+        "absent_apres_secs": SERVEUR_ABSENT_APRES.as_secs(),
+    });
+    // Le refus du plafond est PUBLIÉ, avec ses nombres — comme le refus de
+    // purge de `scan.rs:531-536`. Un refus muet serait indébogable.
+    if let Some(refus) = verdict.bascule_refusee {
+        sortie["bascule_en_masse_refusee"] = json!({
+            "candidats": refus.candidats,
+            "total": refus.total,
+            "plafond": refus.plafond,
+            "part_max": PART_MAX_ABSENCE_SIMULTANEE,
+            "plancher": PLANCHER_PLAFOND_ABSENCE,
+            "confirmation_apres_secs": refus.confirmation_apres_secs,
+            "motif": "une bascule de cette ampleur est bien plus souvent notre propre lien réseau \
+                      qui tombe qu'une extinction simultanée. Les serveurs restent proposés ; \
+                      si le silence dure une seconde fenêtre, l'absence sera actée.",
+        });
+    }
+    Json(sortie)
 }
 
 // ---------------------------------------------------------------------------
