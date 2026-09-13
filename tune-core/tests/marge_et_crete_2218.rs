@@ -780,11 +780,37 @@ fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
 
 // ═════════════════════════ Q3 — flottant → entier ═════════════════════════
 
-/// `apply_gain_pcm` : `as i16` / `as i32` après saturation = troncature VERS
-/// ZÉRO, sans dither. Conséquence mesurable : un facteur de 1 − 1e-7 (−0,000001 dB,
-/// inaudible) abaisse CHAQUE échantillon non nul d'exactement 1 LSB.
+/// Corrélation de l'erreur avec le SIGNE du signal, en LSB.
+///
+/// C'est la mesure qui sépare une distorsion d'un bruit. Une troncature vers
+/// zéro donne −1 quand elle déplace chaque échantillon d'un LSB vers zéro, et
+/// ≈ −0,5 sur une erreur uniforme ; un dither centré donne ≈ 0. Une moyenne
+/// signée nue ne verrait rien : sur un sinus symétrique, les erreurs des
+/// alternances positive et négative s'annulent exactement.
+fn correlation_au_signe(ideal_raw: &[f64], sortie: &[i64]) -> f64 {
+    let mut somme = 0.0;
+    let mut vus = 0usize;
+    for (&i, &s) in ideal_raw.iter().zip(sortie) {
+        if i == 0.0 {
+            continue;
+        }
+        somme += (s as f64 - i) * i.signum();
+        vus += 1;
+    }
+    if vus == 0 { 0.0 } else { somme / vus as f64 }
+}
+
+/// `apply_gain_pcm` : dither TPDF ±1 LSB puis arrondi au plus proche (#4076).
+///
+/// Ce qui était mesuré et qui n'est plus : `clamp` puis `as i16` / `as i32`,
+/// donc une troncature VERS ZÉRO, dont l'erreur porte le signe du signal —
+/// une distorsion, pas un bruit. Deux conséquences tenues ici :
+///
+/// * l'erreur n'est plus corrélée au signe du signal ;
+/// * un facteur de 1 − 1e-7 (−0,000001 dB, inaudible EN TANT QUE GAIN) ne
+///   déplace plus 44 098 échantillons non nuls sur 44 098 d'un LSB vers zéro.
 #[test]
-fn q3_apply_gain_pcm_tronque_vers_zero_sans_dither() {
+fn q3_apply_gain_pcm_dithere_au_lieu_de_tronquer_vers_zero() {
     let x = sinus(997.0, -20.0, N, 0.0);
     for bits in [16u16, 24, 32] {
         let mut pcm = vers_pcm(&x, bits);
@@ -794,8 +820,15 @@ fn q3_apply_gain_pcm_tronque_vers_zero_sans_dither() {
         apply_gain_pcm(&mut pcm, bits, facteur);
         let sortie = depuis_pcm(&pcm, bits);
         let classe = classer_quantification(&ideal, &sortie);
-        eprintln!("q3 apply_gain_pcm {bits} bits, −1 dB : {classe}");
-        assert_eq!(classe, "troncature vers zéro", "{bits} bits");
+        let correlation = correlation_au_signe(&ideal, &sortie);
+        eprintln!(
+            "q3 apply_gain_pcm {bits} bits, −1 dB : {classe}, erreur·signe(signal) = {correlation:+.4} LSB"
+        );
+        assert_eq!(classe, "bruit ajouté avant arrondi (dither)", "{bits} bits");
+        assert!(
+            correlation.abs() < 0.05,
+            "{bits} bits : l'erreur reste corrélée au signe du signal ({correlation:+.4} LSB) — c'est une distorsion, pas un bruit"
+        );
     }
 
     let mut pcm = vers_pcm(&sinus(997.0, -0.1, N, 0.0), 16);
@@ -808,19 +841,49 @@ fn q3_apply_gain_pcm_tronque_vers_zero_sans_dither() {
         .zip(&sortie)
         .filter(|&(&e, &s)| e != 0 && (s - e) == -e.signum())
         .count();
+    let intacts = entree
+        .iter()
+        .zip(&sortie)
+        .filter(|&(&e, &s)| e != 0 && s == e)
+        .count();
     eprintln!(
-        "q3 apply_gain_pcm ×(1 − 1e-7) : {decales}/{non_nuls} échantillons non nuls décalés d'1 LSB vers zéro"
+        "q3 apply_gain_pcm ×(1 − 1e-7) : {decales}/{non_nuls} déplacés d'1 LSB vers zéro, {intacts}/{non_nuls} intacts"
     );
-    assert_eq!(
-        decales, non_nuls,
-        "un gain de −0,000001 dB déplace TOUT le signal d'1 LSB vers zéro"
+    assert!(
+        decales < non_nuls,
+        "−0,000001 dB déplace ENCORE tout le signal d'1 LSB vers zéro : {decales}/{non_nuls}"
+    );
+    assert!(
+        intacts > non_nuls / 4,
+        "un gain inaudible devrait laisser une bonne part du signal intacte : {intacts}/{non_nuls}"
     );
 }
 
-/// `PcmMixer::apply_gain` : même écriture (`SampleFormat::write`), même
-/// troncature vers zéro, sans dither.
+/// Un facteur ENTIER ne requantifie rien : il ne dithère donc pas. ×2 sur des
+/// entiers est exact, et `apply_gain_pcm` doit le rendre exact — la règle
+/// « pas de requantification, pas de dither » de `audio::dither`.
 #[test]
-fn q3_pcm_mixer_apply_gain_tronque_vers_zero_lui_aussi() {
+fn q3_un_facteur_entier_ne_dithere_pas() {
+    let x = sinus(997.0, -20.0, N, 0.0);
+    for bits in [16u16, 24, 32] {
+        let mut pcm = vers_pcm(&x, bits);
+        let entree = depuis_pcm(&pcm, bits);
+        apply_gain_pcm(&mut pcm, bits, 2.0);
+        let sortie = depuis_pcm(&pcm, bits);
+        let rail = (1i64 << (bits - 1)) - 1;
+        for (&e, &s) in entree.iter().zip(&sortie) {
+            assert_eq!(
+                s,
+                (e * 2).clamp(-(rail + 1), rail),
+                "{bits} bits : ×2 devrait être exact, sans un LSB de bruit"
+            );
+        }
+    }
+}
+
+/// `PcmMixer::apply_gain` : même correctif, même implémentation de dither.
+#[test]
+fn q3_pcm_mixer_apply_gain_dithere_lui_aussi() {
     let x = sinus(997.0, -20.0, N, 0.0);
     for bits in [16u16, 24, 32] {
         let mut pcm = vers_pcm(&x, bits);
@@ -831,10 +894,58 @@ fn q3_pcm_mixer_apply_gain_tronque_vers_zero_lui_aussi() {
             .map(|&v| v as f64 * f64::from(facteur as f32))
             .collect();
         PcmMixer::apply_gain(&mut pcm, facteur as f32, bits).expect("profondeur mélangeable");
-        let classe = classer_quantification(&ideal, &depuis_pcm(&pcm, bits));
-        eprintln!("q3 PcmMixer::apply_gain {bits} bits, −1 dB : {classe}");
-        assert_eq!(classe, "troncature vers zéro", "{bits} bits");
+        let sortie = depuis_pcm(&pcm, bits);
+        let classe = classer_quantification(&ideal, &sortie);
+        let correlation = correlation_au_signe(&ideal, &sortie);
+        eprintln!(
+            "q3 PcmMixer::apply_gain {bits} bits, −1 dB : {classe}, erreur·signe(signal) = {correlation:+.4} LSB"
+        );
+        assert_eq!(classe, "bruit ajouté avant arrondi (dither)", "{bits} bits");
+        assert!(
+            correlation.abs() < 0.05,
+            "{bits} bits : erreur corrélée au signe du signal ({correlation:+.4} LSB)"
+        );
     }
+}
+
+/// 🔴 Le dither est DÉTERMINISTE : même entrée, même sortie, octet pour octet.
+///
+/// Le cache de transcodage nomme ses renditions d'après tout ce qui change les
+/// octets encodés, pour qu'une requête identique retrouve le fichier fini ; et
+/// la sortie OAAT reprend un flux interrompu par `Range`, donc un deuxième
+/// passage doit continuer le premier à l'octet. Un bruit tiré au hasard
+/// casserait les deux.
+#[test]
+fn q3_le_dither_est_deterministe_pour_une_meme_entree() {
+    let x = sinus(997.0, -20.0, N, 0.0);
+    let facteur = amplitude(-1.0);
+    for bits in [16u16, 24, 32] {
+        let passe = |quoi: &dyn Fn(&mut Vec<u8>)| {
+            let mut pcm = vers_pcm(&x, bits);
+            quoi(&mut pcm);
+            pcm
+        };
+        let rg = |p: &mut Vec<u8>| apply_gain_pcm(p, bits, facteur);
+        assert_eq!(
+            passe(&rg),
+            passe(&rg),
+            "{bits} bits : ReplayGain non reproductible"
+        );
+        let mx = |p: &mut Vec<u8>| {
+            PcmMixer::apply_gain(p, facteur as f32, bits).expect("profondeur mélangeable");
+        };
+        assert_eq!(
+            passe(&mx),
+            passe(&mx),
+            "{bits} bits : mélangeur non reproductible"
+        );
+    }
+    let pcm24 = vers_pcm(&x, 24);
+    assert_eq!(
+        convert_pcm_bytes(&pcm24, 24, 16),
+        convert_pcm_bytes(&pcm24, 24, 16),
+        "réduction 24→16 non reproductible : cache de transcodage cassé"
+    );
 }
 
 /// `EqProcessor::process_pcm` : requantification avec dither TPDF ±1 LSB puis
@@ -891,74 +1002,170 @@ fn q3_l_egaliseur_entier_requantifie_avec_un_dither_tpdf_a_toute_profondeur() {
 
 /// `decode::convert_pcm_bytes` (24 → 16 bits, chemin du transcodage DLNA/WAV
 /// 16 bits depuis une source 24 bits, et de la mémoire de préchargement) :
-/// décalage arithmétique = troncature vers −∞, sans dither.
+/// dither TPDF puis arrondi, là où c'était un décalage arithmétique — donc une
+/// troncature vers −∞ (#4075).
+///
+/// 🔖 **C'est le témoin pré-écrit de T9**, `q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither`,
+/// dont #4075 lève le `#[ignore = "défaut connu …"]`. Son assertion d'origine
+/// — `classer_quantification(...) == "bruit ajouté avant arrondi (dither)"` —
+/// est reprise mot pour mot ci-dessous ; seul le biais moyen a été ajouté,
+/// parce qu'un dither doit être CENTRÉ, là où le décalage biaisait d'un
+/// demi-LSB vers −∞. Le témoin qui affirmait le défaut,
+/// `q3_convert_pcm_bytes_reduit_24_vers_16_bits_par_decalage_sans_dither`, est
+/// remplacé par celui-ci : il affirmait un comportement qui n'existe plus.
 #[test]
-fn q3_convert_pcm_bytes_reduit_24_vers_16_bits_par_decalage_sans_dither() {
-    let mut cas = Vec::new();
-    for raw in [384i64, 385, 383, -384, -385, -1, 1, 255] {
-        ecrire(&mut cas, raw, 24);
-    }
-    let sortie = depuis_pcm(&convert_pcm_bytes(&cas, 24, 16), 16);
-    assert_eq!(
-        sortie,
-        vec![1, 1, 1, -2, -2, -1, 0, 0],
-        "385/256 = 1,504 → 1 (arrondi donnerait 2) ; −1/256 → −1 (vers −∞) ; 255/256 → 0"
-    );
-
+fn q3_convert_pcm_bytes_reduit_24_vers_16_bits_avec_un_dither() {
     let x = sinus(997.0, -20.0, N, 0.0);
     let pcm24 = vers_pcm(&x, 24);
     let ideal: Vec<f64> = depuis_pcm(&pcm24, 24)
         .iter()
         .map(|&v| v as f64 / 256.0)
         .collect();
-    let classe =
-        classer_quantification(&ideal, &depuis_pcm(&convert_pcm_bytes(&pcm24, 24, 16), 16));
-    eprintln!("q3 convert_pcm_bytes 24→16 : {classe}");
-    assert_eq!(classe, "troncature vers −∞ (décalage)");
-}
-
-/// Le comportement ATTENDU d'une réduction de profondeur audiophile : un
-/// dither (TPDF) avant l'arrondi, pas un décalage.
-#[test]
-#[ignore = "défaut connu : convert_pcm_bytes réduit 24→16 bits par décalage, sans dither ni arrondi (issue D)"]
-fn q3_defaut_connu_la_reduction_24_vers_16_bits_devrait_dither() {
-    let x = sinus(997.0, -20.0, N, 0.0);
-    let pcm24 = vers_pcm(&x, 24);
-    let ideal: Vec<f64> = depuis_pcm(&pcm24, 24)
+    let sortie = depuis_pcm(&convert_pcm_bytes(&pcm24, 24, 16), 16);
+    let classe = classer_quantification(&ideal, &sortie);
+    let biais = ideal
         .iter()
-        .map(|&v| v as f64 / 256.0)
-        .collect();
-    let classe =
-        classer_quantification(&ideal, &depuis_pcm(&convert_pcm_bytes(&pcm24, 24, 16), 16));
+        .zip(&sortie)
+        .map(|(i, &s)| s as f64 - i)
+        .sum::<f64>()
+        / ideal.len() as f64;
+    eprintln!("q3 convert_pcm_bytes 24→16 : {classe}, biais moyen {biais:+.4} LSB");
     assert_eq!(classe, "bruit ajouté avant arrondi (dither)");
+    assert!(
+        biais.abs() < 0.05,
+        "le décalage biaisait vers −∞ d'un demi-LSB ; le dither doit être centré : {biais:+.4} LSB"
+    );
 }
 
-/// `Convolver::process_pcm` : arrondi au plus proche, saturé à ±1,0, sans
-/// dither — et une réponse impulsionnelle UNITÉ n'est pas l'identité : le
-/// décodage divise par 32768 et l'encodage multiplie par 32767 (−0,00027 dB),
-/// donc tout échantillon |x| ≥ 16384 (~66 % d'un sinus à −0,1 dBFS) perd 1 LSB.
+/// La conséquence audible du décalage : un signal continu SOUS le LSB de la
+/// cible disparaissait entièrement. 255/256 de LSB tronquait à 0 — silence.
+/// Dithéré, il survit : sa moyenne vaut ce qu'elle doit valoir.
 #[test]
-fn q3_le_convolveur_entier_arrondit_sans_dither_et_une_ir_unite_perd_1_lsb() {
+fn q3_un_signal_sous_le_lsb_ne_disparait_plus_a_la_reduction() {
+    let mut entree = Vec::new();
+    for _ in 0..N {
+        ecrire(&mut entree, 255, 24);
+    }
+    let sortie = depuis_pcm(&convert_pcm_bytes(&entree, 24, 16), 16);
+    let moyenne = sortie.iter().map(|&v| v as f64).sum::<f64>() / sortie.len() as f64;
+    eprintln!("q3 réduction 24→16 d'un continu à 255/256 LSB : moyenne {moyenne:.4} LSB");
+    assert!(
+        (moyenne - 255.0 / 256.0).abs() < 0.05,
+        "un continu à 255/256 LSB doit ressortir à {:.4} LSB en moyenne, pas {moyenne:.4}",
+        255.0 / 256.0
+    );
+    assert!(
+        sortie.iter().any(|&v| v != 0),
+        "le signal a disparu : c'est le défaut #4075, pas son correctif"
+    );
+}
+
+/// Élargir une profondeur ne dithère PAS : c'est un décalage exact, sans
+/// perte. La règle « pas de requantification, pas de dither ».
+#[test]
+fn q3_elargir_une_profondeur_reste_exact_sans_dither() {
+    let x = sinus(997.0, -20.0, N, 0.0);
+    let pcm16 = vers_pcm(&x, 16);
+    for cible in [24u16, 32] {
+        let sortie = depuis_pcm(&convert_pcm_bytes(&pcm16, 16, cible), cible);
+        let attendu: Vec<i64> = depuis_pcm(&pcm16, 16)
+            .iter()
+            .map(|&v| v << (cible - 16))
+            .collect();
+        assert_eq!(sortie, attendu, "16 → {cible} bits doit rester exact");
+    }
+}
+
+/// `Convolver::process_pcm` : arrondi au plus proche, sans dither — et le
+/// **gain parasite** d'une réponse impulsionnelle unité a disparu (#4076,
+/// constat voisin).
+///
+/// Ce qui était mesuré : le décodage divisait par 2^(n−1) et le réencodage
+/// multipliait par 2^(n−1) **− 1**. Cette asymétrie est un gain de
+/// −0,00027 dB appliqué à chaque passage — 1 LSB perdu par **29 214
+/// échantillons sur 44 100 (66 %)** à 16 bits. Un convolveur chargé d'une
+/// impulsion unité, donc censé ne rien faire, abîmait le signal.
+///
+/// Le témoin sépare les deux choses qu'il ne faut pas confondre :
+///
+/// * **à 16 bits, l'identité est exacte** — c'est la garde forte du
+///   correctif : un seul échantillon décalé la fait rougir ;
+/// * **au-dessus, l'identité est hors de portée**, et c'est mesuré, pas
+///   supposé : le convolveur tient son tampon en `f32`, dont la mantisse de
+///   24 bits ne peut pas porter un entier de 24 bits déjà convolué, encore
+///   moins de 32. À 24 bits, ce qui est tenu est l'**absence de gain
+///   parasite** — l'asymétrie donnait −0,637 LSB sur ce sinus, le plancher du
+///   f32 en donne −0,11. À **32 bits, cette garde est impossible** : le
+///   plancher du f32 y vaut −62,9 LSB, cent fois ce qu'on chercherait. Le
+///   témoin le dit au lieu de faire semblant.
+#[test]
+fn q3_le_convolveur_arrondit_sans_dither_et_une_ir_unite_ne_perd_plus_de_gain() {
     let x = sinus(997.0, -0.1, N, 0.0);
+
+    // 16 bits : identité EXACTE, octet pour octet.
     let mut pcm = vers_pcm(&x, 16);
     let entree = depuis_pcm(&pcm, 16);
-    let mut conv = Convolver::new(&[vec![1.0f32]], 256);
-    conv.process_pcm(&mut pcm, 16);
+    Convolver::new(&[vec![1.0f32]], 256).process_pcm(&mut pcm, 16);
     let sortie = depuis_pcm(&pcm, 16);
-    let ideal: Vec<f64> = entree
-        .iter()
-        .map(|&v| v as f64 * 32767.0 / 32768.0)
-        .collect();
-    let classe = classer_quantification(&ideal, &sortie);
     let perdus = entree.iter().zip(&sortie).filter(|(e, s)| e != s).count();
-    eprintln!(
-        "q3 Convolver::process_pcm IR unité 16 bits : {classe}, {perdus}/{N} échantillons ≠ entrée"
+    eprintln!("q3 Convolver IR unité 16 bits : {perdus}/{N} échantillons ≠ entrée");
+    assert_eq!(
+        perdus, 0,
+        "une IR unité doit être l'identité à 16 bits : {perdus} échantillons décalés (gain parasite 32767/32768 ?)"
     );
+
+    // 24 bits : l'identité n'est plus atteignable (le f32 du convolveur s'y
+    // épuise), mais le GAIN PARASITE doit avoir disparu. L'asymétrie donnait
+    // −0,637 LSB sur ce sinus ; le plancher numérique du f32, lui, est à
+    // −0,11 LSB. Le seuil sépare les deux avec de la marge.
+    //
+    // 🔍 À **32 bits**, cette garde est IMPOSSIBLE et il vaut mieux l'écrire
+    // que la simuler : le plancher du f32 y vaut −62,9 LSB, cent fois
+    // l'asymétrie (−0,637 LSB) qu'on voudrait détecter. Aucun seuil ne peut
+    // les distinguer. C'est le témoin 16 bits — identité EXACTE — qui garde
+    // le correctif ; 32 bits n'y mesure que le plafond du tampon f32.
+    for (bits, garde_le_gain, plafond) in [(24u16, true, 64i64), (32u16, false, 4096i64)] {
+        let mut pcm = vers_pcm(&x, bits);
+        let entree = depuis_pcm(&pcm, bits);
+        Convolver::new(&[vec![1.0f32]], 256).process_pcm(&mut pcm, bits);
+        let sortie = depuis_pcm(&pcm, bits);
+        let ideal: Vec<f64> = entree.iter().map(|&v| v as f64).collect();
+        let correlation = correlation_au_signe(&ideal, &sortie);
+        let ecart = entree
+            .iter()
+            .zip(&sortie)
+            .map(|(&e, &s)| (s - e).abs())
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "q3 Convolver IR unité {bits} bits : erreur·signe(signal) = {correlation:+.4} LSB, écart max {ecart} LSB (plancher du tampon f32){}",
+            if garde_le_gain {
+                ""
+            } else {
+                " — gain non témoignable à cette profondeur"
+            }
+        );
+        if garde_le_gain {
+            assert!(
+                correlation.abs() < 0.15,
+                "{bits} bits : gain parasite de retour, erreur·signe(signal) = {correlation:+.4} LSB (l'asymétrie 2^(n−1)−1 en donnait −0,637)"
+            );
+        }
+        assert!(
+            ecart <= plafond,
+            "{bits} bits : écart max {ecart} LSB au-delà du plancher numérique du f32 ({plafond})"
+        );
+    }
+
+    // L'arrondi, lui, reste : pas de dither dans le convolveur.
+    let x = sinus(997.0, -20.0, N, 0.0);
+    let mut pcm = vers_pcm(&x, 16);
+    let entree = depuis_pcm(&pcm, 16);
+    Convolver::new(&[vec![0.5f32]], 256).process_pcm(&mut pcm, 16);
+    let ideal: Vec<f64> = entree.iter().map(|&v| v as f64 * 0.5).collect();
+    let classe = classer_quantification(&ideal, &depuis_pcm(&pcm, 16));
+    eprintln!("q3 Convolver IR 0,5 16 bits : {classe}");
     assert_eq!(classe, "arrondi au plus proche");
-    assert!(
-        perdus > N * 60 / 100 && perdus < N * 72 / 100,
-        "IR unité ≠ identité : {perdus} échantillons (|x| ≥ 16384, ~66 %) décalés d'1 LSB (gain 32767/32768)"
-    );
 }
 
 // ═════════════════════════ Q4 — identité des étages désarmés ═════════════════════════

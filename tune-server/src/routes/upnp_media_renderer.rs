@@ -244,12 +244,19 @@ async fn snapshot(state: &AppState, zone_id: i64) -> RendererSnapshot {
         .flatten()
         .map(|z| z.muted)
         .unwrap_or(false);
+    let volume = if tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id)
+        && tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id)
+    {
+        100
+    } else {
+        (ps.volume.clamp(0.0, 1.0) * 100.0).round() as u8
+    };
     RendererSnapshot {
         transport_state,
         position_ms: ps.position_ms,
         duration_ms,
         uri: session.uri,
-        volume: (ps.volume.clamp(0.0, 1.0) * 100.0).round() as u8,
+        volume,
         muted,
     }
 }
@@ -321,27 +328,53 @@ async fn avtransport_control(
             if session.uri.is_empty() {
                 tune_core::upnp_server::soap_fault(701, "No URI set")
             } else {
-                // Même chemin que la lecture d'un media server externe : le
-                // flux traverse toute la chaîne Tune (EQ, convolveur, trim).
-                let req = tune_core::orchestrator::PlayRequest {
-                    zone_id,
-                    output_device_id: device_id.clone(),
-                    track_id: None,
-                    source: Some("upnp".into()),
-                    source_id: Some(session.uri.clone()),
-                    title: session.title.clone(),
-                    artist_name: session.artist.clone(),
-                    duration_ms: session.duration_ms,
-                    ..Default::default()
-                };
-                match state.orchestrator.play(req).await {
-                    Ok(_) => {
-                        info!(zone_id, uri = %session.uri, "upnp_renderer_play");
-                        upnp_renderer::empty_response("Play")
+                let ps = state.playback.get_state(zone_id).await;
+                let is_paused_same_uri = doit_reprendre(
+                    ps.state,
+                    ps.now_playing
+                        .as_ref()
+                        .and_then(|np| np.source_id.as_deref()),
+                    &session.uri,
+                );
+
+                if is_paused_same_uri {
+                    match state
+                        .orchestrator
+                        .resume(zone_id, device_id.as_deref())
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(zone_id, uri = %session.uri, "upnp_renderer_play_resumed");
+                            upnp_renderer::empty_response("Play")
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "upnp_renderer_resume_failed");
+                            tune_core::upnp_server::soap_fault(701, &e.to_string())
+                        }
                     }
-                    Err(e) => {
-                        warn!(zone_id, error = %e, "upnp_renderer_play_failed");
-                        tune_core::upnp_server::soap_fault(701, &e)
+                } else {
+                    // Même chemin que la lecture d'un media server externe : le
+                    // flux traverse toute la chaîne Tune (EQ, convolveur, trim).
+                    let req = tune_core::orchestrator::PlayRequest {
+                        zone_id,
+                        output_device_id: device_id.clone(),
+                        track_id: None,
+                        source: Some("upnp".into()),
+                        source_id: Some(session.uri.clone()),
+                        title: session.title.clone(),
+                        artist_name: session.artist.clone(),
+                        duration_ms: session.duration_ms,
+                        ..Default::default()
+                    };
+                    match state.orchestrator.play(req).await {
+                        Ok(_) => {
+                            info!(zone_id, uri = %session.uri, "upnp_renderer_play");
+                            upnp_renderer::empty_response("Play")
+                        }
+                        Err(e) => {
+                            warn!(zone_id, error = %e, "upnp_renderer_play_failed");
+                            tune_core::upnp_server::soap_fault(701, &e)
+                        }
                     }
                 }
             }
@@ -419,13 +452,25 @@ async fn renderingcontrol_control(
             upnp_renderer::volume_response(&snapshot(&state, zone_id).await)
         }
         RendererCommand::SetVolume(v) => {
-            match state
-                .orchestrator
-                .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
-                .await
-            {
-                Ok(()) => upnp_renderer::empty_response("SetVolume"),
-                Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+            let volume_locked =
+                tune_core::audio::audiophile::volume_lock_enabled(&state.backend, zone_id)
+                    && tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id);
+            if volume_locked {
+                info!(
+                    zone_id,
+                    requested_v = v,
+                    "upnp_renderer_set_volume_locked_bitperfect_preserved"
+                );
+                upnp_renderer::empty_response("SetVolume")
+            } else {
+                match state
+                    .orchestrator
+                    .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
+                    .await
+                {
+                    Ok(()) => upnp_renderer::empty_response("SetVolume"),
+                    Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
+                }
             }
         }
         RendererCommand::GetMute => upnp_renderer::mute_response(&snapshot(&state, zone_id).await),
@@ -446,6 +491,25 @@ async fn renderingcontrol_control(
         _ => tune_core::upnp_server::soap_fault(401, "Invalid Action"),
     };
     xml_response(xml)
+}
+
+/// Un `Play` sur une session en pause doit REPRENDRE, jamais relancer (#3969).
+///
+/// Le point de décision de la route `AVTransport` : le contrôleur distant
+/// n'a qu'une commande `Play` pour « démarrer » et pour « reprendre », c'est
+/// donc au renderer de distinguer les deux. Reprendre ne vaut que si la zone
+/// est en pause ET que ce qui est en pause est bien l'URI de la session — un
+/// contrôleur qui pousse une NOUVELLE URI puis `Play` attend une relecture,
+/// pas la reprise du morceau précédent.
+///
+/// Extrait de la route pour être gardé : voir
+/// `un_play_en_pause_sur_la_meme_uri_reprend`.
+fn doit_reprendre(
+    etat: tune_core::playback::PlayState,
+    uri_en_cours: Option<&str>,
+    uri_de_session: &str,
+) -> bool {
+    etat == tune_core::playback::PlayState::Paused && uri_en_cours == Some(uri_de_session)
 }
 
 /// Enchaîne la piste posée par SetNextAVTransportURI quand la courante se
@@ -628,6 +692,84 @@ mod tests {
             xml.matches("(Tune)").count(),
             1,
             "et une seule fois.\nXML servi :\n{xml}"
+        );
+    }
+
+    /// 🔴 #3969 — un `Play` reçu sur une session en pause reprenait la lecture
+    /// à zéro au lieu de la reprendre.
+    ///
+    /// Point de décision gardé : `doit_reprendre`, que la route
+    /// `avtransport_control` appelle sur la commande `Play` avant de choisir
+    /// entre `orchestrator.resume` et un `PlayRequest` neuf. La garde de texte
+    /// plus bas vérifie que la route l'appelle bien — sans elle, ce témoin
+    /// pourrait rester vert sur une route qui a cessé de s'en servir.
+    #[test]
+    fn un_play_en_pause_sur_la_meme_uri_reprend() {
+        use tune_core::playback::PlayState;
+        const URI: &str = "http://192.168.0.39:8888/stream/17.flac";
+
+        // Le cas du défaut : en pause sur cette URI, `Play` doit reprendre.
+        assert!(
+            doit_reprendre(PlayState::Paused, Some(URI), URI),
+            "en pause sur la même URI, Play doit REPRENDRE : c'est #3969, la \
+             piste repartait de 0 et le flux était re-résolu."
+        );
+
+        // Contre-épreuve 1 — une AUTRE URI en pause : le contrôleur a poussé
+        // un nouveau morceau, il attend une relecture, pas la reprise.
+        assert!(
+            !doit_reprendre(PlayState::Paused, Some("http://ailleurs/2.flac"), URI),
+            "une autre URI en pause doit relancer, pas reprendre : sinon un \
+             changement de piste rejouerait la précédente."
+        );
+
+        // Contre-épreuve 2 — déjà en lecture : rien à reprendre.
+        assert!(
+            !doit_reprendre(PlayState::Playing, Some(URI), URI),
+            "déjà en lecture, il n'y a rien à reprendre."
+        );
+
+        // Contre-épreuve 3 — arrêté : la session est morte, il faut relancer.
+        assert!(
+            !doit_reprendre(PlayState::Stopped, Some(URI), URI),
+            "à l'arrêt, Play doit relancer."
+        );
+
+        // Contre-épreuve 4 — rien en cours : pas d'URI à comparer.
+        assert!(
+            !doit_reprendre(PlayState::Paused, None, URI),
+            "sans rien en cours, il n'y a pas de reprise possible."
+        );
+    }
+
+    /// La route appelle-t-elle encore le point de décision ?
+    ///
+    /// Sans cette garde, `un_play_en_pause_sur_la_meme_uri_reprend` testerait
+    /// une fonction que plus personne n'appelle — un vert qui ne garde rien.
+    #[test]
+    fn la_route_play_passe_bien_par_doit_reprendre() {
+        let source = include_str!("upnp_media_renderer.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]")
+            .expect("le module de tests doit exister")];
+        // On cherche l'APPEL, pas le nom : `fn doit_reprendre(` contient la
+        // sous-chaîne et suffirait à satisfaire un `contains` naïf — la garde
+        // resterait verte sur une route réécrite en ligne, avec la fonction
+        // laissée orpheline. Mesuré : ce faux vert existait bel et bien.
+        let appels = production
+            .lines()
+            .filter(|l| l.contains("doit_reprendre(") && !l.trim_start().starts_with("fn "))
+            .count();
+        assert!(
+            appels >= 1,
+            "la route AVTransport doit APPELER `doit_reprendre` : si le \
+             branchement a été réécrit en ligne, le témoin de #3969 ne garde \
+             plus rien.\nappels trouvés hors définition : {appels}"
+        );
+        assert!(
+            production.contains(".resume(zone_id, device_id.as_deref())"),
+            "la branche de reprise doit appeler `orchestrator.resume` : \
+             relancer un PlayRequest remettrait la piste à 0 (#3969)."
         );
     }
 }

@@ -637,7 +637,9 @@ async fn admin_zones_returns_created_zones() {
     post_json(
         &app,
         "/api/v1/zones",
-        json!({"name": "Salon", "output_type": "dlna"}),
+        // #3835 / #3838 — une zone qui ANNONCE `dlna` doit nommer son
+        // appareil : `POST /zones` refuse désormais l'annonce sans le nom.
+        json!({"name": "Salon", "output_type": "dlna", "output_device_id": "uuid:salon-dlna"}),
     )
     .await;
     post_json(&app, "/api/v1/zones", json!({"name": "Bureau"})).await;

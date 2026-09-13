@@ -694,6 +694,35 @@ fn append_pcm_samples(output: &mut Vec<u8>, samples: &[i32], from_bd: u16, to_bd
 /// which expects 32-bit — the bytes must be widened, otherwise the device reads
 /// 32-bit frames out of 16-bit data and plays white noise (Bilou: "bruit blanc"
 /// on next-track for a Qobuz album on Windows local output).
+///
+/// # Élargir : exact. Réduire : dithéré (#4075)
+///
+/// **Élargir** une profondeur (16 → 24, 16 → 32, 24 → 32) est un décalage
+/// exact : rien n'est perdu, donc rien n'est dithéré, et les témoins `q4_*`
+/// tiennent l'identité.
+///
+/// **Réduire** (24 → 16 pour le transcodage DLNA/WAV d'une source 24 bits,
+/// 32 → 16, 32 → 24, et la mémoire de préchargement servie à une sortie moins
+/// profonde) se faisait par le même décalage arithmétique — donc une
+/// troncature vers −∞, sans arrondi ni dither : 385 devenait 1 là où un
+/// arrondi donne 2, et 255 devenait 0. C'est désormais un dither TPDF ±1 LSB
+/// puis un arrondi au plus proche, par l'implémentation partagée
+/// [`crate::audio::dither`].
+///
+/// # ⛔ Pourquoi ICI, et pas dans `convert_pcm_bit_depth`
+///
+/// [`convert_pcm_bit_depth`] et [`requantize`] sont les helpers du
+/// **décodage** : `audio::analyzer` les emprunte pour l'analyse ReplayGain, le
+/// BPM, la forme d'onde et les empreintes. Un dither posé là rendrait toute
+/// l'analyse non reproductible. Le dither de la réduction vit donc dans le
+/// corps de cette fonction — la porte du **transcodage** — et nulle part
+/// ailleurs.
+///
+/// Le bruit est déterministe, dérivé du contenu du bloc : même entrée, même
+/// sortie, octet pour octet. Le cache de transcodage
+/// (`transcode_cache.rs`) en dépend — son nom est dérivé de tout ce qui change
+/// les octets encodés, pour qu'une requête identique retrouve le fichier fini
+/// — et la reprise par `Range` de la sortie OAAT aussi.
 pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
     if from_bd == to_bd {
         return data.to_vec();
@@ -717,7 +746,44 @@ pub fn convert_pcm_bytes(data: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
             .collect(),
         _ => return data.to_vec(),
     };
+    if to_bd < from_bd && matches!(to_bd, 16 | 24) {
+        return reduire_avec_dither(&samples, data, from_bd, to_bd);
+    }
     convert_pcm_bit_depth(&samples, from_bd, to_bd)
+}
+
+/// Réduire une profondeur avec dither TPDF puis arrondi au plus proche (#4075).
+///
+/// `samples` sont **droitisés** à `from_bd` bits, comme partout dans ce
+/// module ; `bloc` est le tampon d'entrée, dont la graine du dither est
+/// dérivée (déterminisme : voir [`convert_pcm_bytes`]).
+///
+/// La valeur idéale à la profondeur cible est `echantillon / 2^(from − to)`.
+/// L'ancien code prenait sa partie entière par décalage arithmétique — une
+/// troncature vers −∞. Ici : + bruit TPDF, arrondi, puis saturation au rail de
+/// la cible, dans cet ordre.
+fn reduire_avec_dither(samples: &[i32], bloc: &[u8], from_bd: u16, to_bd: u16) -> Vec<u8> {
+    let diviseur = f64::from(1u32 << (from_bd - to_bd));
+    let max = ((1i64 << (to_bd - 1)) - 1) as f64;
+    let min = -((1i64 << (to_bd - 1)) as f64);
+    let mut dither = crate::audio::dither::Dither::depuis_contenu(
+        crate::audio::dither::Etage::ReductionDeProfondeur,
+        bloc,
+        (u64::from(from_bd) << 16) | u64::from(to_bd),
+    );
+    let octets = (to_bd / 8) as usize;
+    let mut sortie = Vec::with_capacity(samples.len() * octets);
+    for &echantillon in samples {
+        let ideal = f64::from(echantillon) / diviseur;
+        let v = dither.quantifier(ideal, min, max);
+        if to_bd == 24 {
+            let b = (v as i32).to_le_bytes();
+            sortie.extend_from_slice(&b[..3]);
+        } else {
+            sortie.extend_from_slice(&(v as i16).to_le_bytes());
+        }
+    }
+    sortie
 }
 
 pub fn can_decode_native(file_path: &str) -> bool {
@@ -4932,13 +4998,32 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     fn convert_pcm_bytes_24_to_16_for_dlna_lpcm() {
         // #1137: a 24-bit source served to a DLNA renderer over the LPCM
         // fallback must be reduced to genuine 16-bit PCM, not relabelled.
-        // 24-bit LE sample 0x123456 -> keep the top 16 bits -> 0x1234 (LE 34 12).
-        // A negative sample 0x800000 (-8388608) -> 0x8000 (i16::MIN, LE 00 80).
+        //
+        // #4075 : la réduction dithère puis arrondit, au lieu de décaler. On
+        // n'attend donc plus un vecteur d'octets EXACT — ce serait figer un
+        // tirage de bruit et le prendre pour la spécification. Ce qui est
+        // tenu, et qui est le vrai contrat : chaque échantillon tombe à 1 LSB
+        // près de sa valeur idéale, et la sortie fait bien 2 octets par
+        // échantillon.
+        //
+        // 0x123456 = 1 193 046 ⇒ idéal 1 193 046 / 256 = 4660,3 (0x1234).
+        // 0x800000 = −8 388 608 ⇒ idéal −32 768 exactement, le rail bas d'un
+        // i16 : la saturation doit le tenir, le bruit ne doit pas le faire
+        // déborder.
         let src = [0x56, 0x34, 0x12, /* next */ 0x00, 0x00, 0x80];
         let out = convert_pcm_bytes(&src, 24, 16);
-        assert_eq!(out, vec![0x34, 0x12, 0x00, 0x80]);
         // Output is exactly 2 bytes per sample (16-bit).
         assert_eq!(out.len(), 4);
+        let sortie = [
+            i16::from_le_bytes([out[0], out[1]]),
+            i16::from_le_bytes([out[2], out[3]]),
+        ];
+        for (obtenu, ideal) in sortie.iter().zip([1_193_046.0 / 256.0, -32_768.0]) {
+            assert!(
+                (f64::from(*obtenu) - ideal).abs() <= 1.0,
+                "réduction 24 → 16 : {obtenu} s'écarte de plus d'1 LSB de {ideal}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------

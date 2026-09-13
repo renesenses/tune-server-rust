@@ -19,6 +19,11 @@ pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
 pub mod local;
 pub mod mock;
+/// #3837 — la négociation de format de la sortie WASAPI exclusive. Sans FFI
+/// ni `cfg` de plateforme dans son corps : aucun job de CI n'exécute WASAPI,
+/// cette logique-ci est donc jugée par `cargo test` sur Linux.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod negociation_format_exclusif_3837;
 #[cfg(feature = "oaat")]
 pub mod oaat;
 pub mod oh_events;

@@ -2221,7 +2221,10 @@ fn reject_if_zone_has_no_output_device(
         .get(zone_id)
         .ok()
         .flatten()?;
-    if zone.output_device_id.is_none() && zone.output_type.as_deref() != Some("browser") {
+    if crate::routes::zones::zone_sans_appareil(
+        zone.output_type.as_deref(),
+        zone.output_device_id.as_deref(),
+    ) {
         warn!(zone_id, zone_name = %zone.name, "play_rejected_zone_without_output_device");
         // Cette branche-ci ne consulte pas la langue (son message nomme la
         // zone, il n'est pas traduit) : la valeur passee est le defaut de
