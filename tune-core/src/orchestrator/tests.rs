@@ -7105,7 +7105,10 @@ async fn un_changement_d_eq_nomme_son_premier_echec() {
 ///
 /// Le format est identique avant et après : un égaliseur ne touche ni la
 /// cadence ni le nombre de canaux. Ce qu'il touche est le NIVEAU, et le
-/// pré-gain automatique le dit : ici −8,0 dB pour un unique low-shelf à +8 dB.
+/// pré-gain automatique le dit : ici −8,58 dB pour un unique low-shelf à +8 dB
+/// — la norme L1 du plateau, que #4073 réserve à la place de son seul gain
+/// crête (8,00 dB), parce qu'un plateau dépasse son maximum fréquentiel sur un
+/// front.
 /// C'est ce chiffre-là, absent de tout journal jusqu'à #3479, qui distingue
 /// « l'égaliseur a coupé le son » de « l'égaliseur a beaucoup baissé le son ».
 #[cfg(feature = "local-audio")]
@@ -7124,8 +7127,10 @@ async fn le_rapport_a_chaud_chiffre_le_format_et_le_pregain() {
     assert_eq!(r.format, Some((44_100, 2)));
     assert_eq!(r.format_ecrit(), "44100 Hz / 2 canaux / f32");
     assert!(r.eq_actif, "le profil de la zone est audible");
-    assert_eq!(r.preamp_db, Some(-8.0));
-    assert_eq!(r.preamp_db_droite, Some(-8.0));
+    let g = r.preamp_db.expect("le pré-gain gauche est chiffré");
+    let d = r.preamp_db_droite.expect("le pré-gain droit est chiffré");
+    assert!((g + 8.581_233).abs() < 1e-5, "pré-gain gauche : {g}");
+    assert!((d + 8.581_233).abs() < 1e-5, "pré-gain droit : {d}");
 }
 
 /// La famille de sortie est un MOT, pas une déduction refaite après coup.

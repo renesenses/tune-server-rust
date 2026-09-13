@@ -438,21 +438,25 @@ fn q1_prevent_clipping_arme_n_ecrete_jamais_meme_sans_pic_tague() {
 }
 
 /// Sinus 997 Hz à −0,1 dBFS, 24 bits ; une bande passe-bas à 997 Hz, Q = 4.
-/// Un passe-bas RBJ vaut |H(fc)| = Q, soit +12 dB à la résonance — et
-/// `automatic_headroom_db` ne réserve RIEN pour un filtre « pass ». Mesuré :
-/// préampli 0 dB, ~84 % d'overs comptés dans `EqProcessStats` (exposés par
-/// `eq_overs`), écrêtés DUR par `write_sample_f64` à 1,0 − 1 LSB PUIS dithérés
-/// (ils sortent au rail ou 1 LSB en dessous), sans journal.
+/// Un passe-bas RBJ vaut |H(fc)| = Q, soit +12,04 dB à la résonance — et
+/// jusqu'à #4073 `automatic_headroom_db` ne réservait RIEN pour un filtre
+/// « pass » : 0 dB de préampli, **36 896 / 44 100 overs (83,7 %)** écrêtés DUR
+/// par `write_sample_f64`, comptés mais jamais journalisés.
+///
+/// Depuis #4073 la réserve regarde le Q : `20·log10(Q/0,707)` = **−15,05 dB**,
+/// ce qui couvre le maximum fréquentiel exact (Q/√(1−1/4Q²) = +12,11 dB) ET la
+/// norme L1 du même filtre (+14,19 dB, mesurée). Résultat : zéro over, rien au
+/// rail, et la crête retombe à −3,11 dBFS.
 #[test]
-fn q1_l_egaliseur_entier_ne_reserve_rien_pour_un_passe_bas_resonnant_et_ecrete_dur_en_comptant() {
+fn q1_l_egaliseur_entier_reserve_la_resonance_d_un_passe_bas_et_n_ecrete_plus() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
-    assert_eq!(
-        p.automatic_headroom_db(0),
-        0.0,
-        "réserve automatique : rien pour un passe-bas, quelle que soit sa résonance"
+    let reserve = p.automatic_headroom_db(0);
+    assert!(
+        (reserve + 15.0515).abs() < 1e-3,
+        "réserve = 20·log10(Q/0,707) pour Q = 4, soit −15,0515 dB : {reserve}"
     );
     let mut eq = EqProcessor::new(&p, FS, 1);
-    assert_eq!(eq.preamp_db(0), Some(0.0));
+    assert_eq!(eq.preamp_db(0), Some(reserve));
 
     let x = sinus(997.0, -0.1, N, 0.0);
     let mut pcm = vers_pcm(&x, 24);
@@ -460,40 +464,33 @@ fn q1_l_egaliseur_entier_ne_reserve_rien_pour_un_passe_bas_resonnant_et_ecrete_d
     let sortie = depuis_pcm(&pcm, 24);
     let n_rail = au_rail(&sortie, 24);
     let n_rail_1 = au_rail_a_1_lsb_pres(&sortie, 24);
+    let crete = crete_echantillon(&normalise(&sortie, 24));
     eprintln!(
-        "q1 égaliseur passe-bas Q=4 : préampli {:?} dB, overs {}/{N} ({:.1} %), au rail {n_rail}, au rail à 1 LSB près {n_rail_1}, non finis {}",
+        "q1 égaliseur passe-bas Q=4 : préampli {:?} dB, overs {}/{N}, au rail {n_rail}, au rail à 1 LSB près {n_rail_1}, crête {:+.2} dBFS, non finis {}",
         eq.preamp_db(0),
         stats.overs,
-        100.0 * stats.overs as f64 / N as f64,
+        dbfs(crete),
         stats.non_finite_samples
     );
-    assert!(
-        stats.overs > N as u64 * 3 / 4 && stats.overs < N as u64 * 9 / 10,
-        "résonance +12 dB sur un signal à −0,1 dBFS : la majorité des échantillons dépasse (~84 %) : {}",
-        stats.overs
+    assert_eq!(
+        stats.overs, 0,
+        "la résonance est réservée : plus un seul échantillon ne dépasse"
     );
-    assert!(
-        n_rail_1 >= stats.overs.saturating_sub(4) as usize,
-        "chaque over est écrêté DUR (rail ou rail − 1 LSB, le dither venant APRÈS la saturation) : {n_rail_1}, overs {}",
-        stats.overs
-    );
-    assert!(
-        n_rail < n_rail_1 && n_rail > n_rail_1 / 2,
-        "le dither ±1 LSB répartit le plateau écrêté entre le rail et 1 LSB en dessous : {n_rail} / {n_rail_1}"
-    );
-    assert_eq!(sortie.iter().max(), Some(&8_388_607));
-    assert_eq!(sortie.iter().min(), Some(&-8_388_608));
+    assert_eq!(n_rail, 0, "plus rien au rail");
+    assert_eq!(n_rail_1, 0, "ni à 1 LSB du rail");
+    assert_eq!(stats.non_finite_samples, 0);
     assert_eq!(
         eq.process_stats().overs,
-        stats.overs,
-        "compté, cumulé — mais jamais journalisé"
+        0,
+        "le compteur cumulé de la piste reste à zéro"
     );
 }
 
-/// Le comportement ATTENDU : la réserve automatique couvre la résonance
-/// (+20·log10(Q) dB) des passe-bas / passe-haut, et rien ne dépasse.
+/// Le comportement ATTENDU par #4073 — et désormais OBTENU. Le nom est
+/// conservé tel quel : c'est celui que citent l'issue et
+/// `docs/mesures/2218-marge-ecretage-crete-vraie.md`, et c'est ce témoin-là
+/// qui devait passer de `#[ignore]` à vert.
 #[test]
-#[ignore = "défaut connu : automatic_headroom_db ignore la résonance +20·log10(Q) dB des filtres low_pass/high_pass (issue B)"]
 fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_passe_bas() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
     assert!(
@@ -507,12 +504,45 @@ fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_resonance_d_un_pass
     assert_eq!(stats.overs, 0, "aucun over avec une réserve correcte");
 }
 
-/// Même profil, chemin FLOTTANT (sortie locale) : les overs sont comptés et
-/// laissés tels quels, jusqu'à ×3,95. C'est documenté comme voulu (le
-/// saturateur est plus loin — `f32_to_native_i32`, privé, ou personne sur le
-/// chemin cpal flottant).
+/// Le prix de la réserve, et la ligne qu'elle ne franchit PAS.
+///
+/// Un passe-haut de Butterworth (Q = 0,707) — le coupe-bas ordinaire — a un
+/// maximum fréquentiel de 0 dB et une norme L1 de **+7,02 dB** : sur un carré
+/// à 50 Hz il dépasse le rail. #4073 ne le réserve pas, et c'est un CHOIX :
+/// couvrir cette norme-là coûterait 7 dB de niveau à tout utilisateur d'un
+/// coupe-bas, pour un dépassement que seul un signal adverse atteint. Une
+/// réserve trop large abîme le son autant qu'une réserve trop courte ; ce
+/// témoin fige la ligne, chiffrée, pour que personne ne la déplace sans le
+/// dire.
 #[test]
-fn q1_l_egaliseur_flottant_laisse_passer_les_overs_sans_les_ecreter() {
+fn q1_un_passe_haut_de_butterworth_ne_reserve_rien_et_c_est_assume() {
+    let p = profil(vec![bande("high_pass", 997.0, 0.0, FRAC_1_SQRT_2)]);
+    assert_eq!(
+        p.automatic_headroom_db(0),
+        0.0,
+        "Q ≤ 0,707 : aucune résonance, aucune réserve"
+    );
+    let mut eq = EqProcessor::new(&p, FS, 1);
+    let mut pcm = vers_pcm(&carre(50.0, -0.05, N), 24);
+    let stats = eq.process_pcm(&mut pcm, 24);
+    eprintln!(
+        "q1 passe-haut Butterworth sur un carré 50 Hz : réserve 0 dB, overs {} / {N} ({:.1} %) — norme L1 du filtre +7,02 dB, non réservée",
+        stats.overs,
+        100.0 * stats.overs as f64 / N as f64
+    );
+    assert!(
+        stats.overs > 0,
+        "la norme L1 d'un passe-haut n'est pas réservée : le carré dépasse"
+    );
+}
+
+/// Même profil, chemin FLOTTANT (sortie locale). Le chemin flottant ne sature
+/// TOUJOURS rien — le saturateur est plus loin (`f32_to_native_i32`, privé, ou
+/// personne sur le chemin cpal) — mais il n'a plus rien à laisser passer :
+/// la réserve de #4073 ramène la crête de ×3,95 (+11,94 dBFS, mesuré avant) à
+/// moins de l'unité, et le compteur d'overs tombe à zéro.
+#[test]
+fn q1_l_egaliseur_flottant_ne_deborde_plus_grace_a_la_reserve() {
     let p = profil(vec![bande("low_pass", 997.0, 0.0, 4.0)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
     let mut s: Vec<f32> = sinus(997.0, -0.1, N, 0.0)
@@ -522,30 +552,40 @@ fn q1_l_egaliseur_flottant_laisse_passer_les_overs_sans_les_ecreter() {
     let stats = eq.process_interleaved(&mut s);
     let crete = s.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     eprintln!(
-        "q1 égaliseur flottant : overs {}, crête {crete:.3} ({:+.2} dBFS)",
+        "q1 égaliseur flottant : préampli {:?} dB, overs {}, crête {crete:.3} ({:+.2} dBFS)",
+        eq.preamp_db(0),
         stats.overs,
         dbfs(f64::from(crete))
     );
-    assert!(stats.overs > N as u64 * 3 / 4);
+    assert_eq!(
+        stats.overs, 0,
+        "plus un over sur le chemin flottant non plus"
+    );
     assert!(
-        crete > 3.5 && crete < 4.2,
-        "aucune saturation sur le chemin flottant : crête ×{crete:.3} (Q = 4 ⇒ ×4 attendu)"
+        crete < 1.0,
+        "la crête reste sous l'unité : ×{crete:.3} — rien à saturer, donc rien à confier au pilote"
     );
 }
 
 /// Carré 50 Hz à −0,05 dBFS, 24 bits, plateau grave 80 Hz +6 dB. La réserve
-/// automatique retire 6 dB — la somme des gains positifs, c'est-à-dire le
+/// automatique retirait 6 dB — la somme des gains positifs, c'est-à-dire le
 /// maximum de la réponse en FRÉQUENCE. Mesuré : la réponse en TEMPS d'un
-/// plateau d'ordre 2 dépasse ce maximum (sa norme L1 est plus grande que son
-/// gain crête), et ~40 % des échantillons sortent du rail, écrêtés dur.
+/// plateau d'ordre 2 dépasse ce maximum (sa **norme L1 vaut 6,505 dB**, contre
+/// 6,000 dB de gain crête), et 17 825 / 44 100 échantillons (40,4 %) sortaient
+/// du rail, écrêtés dur.
+///
+/// Depuis #4073 la réserve prend le PLUS GRAND de la somme des gains et de la
+/// norme L1 de la cascade : −6,505 dB, soit 0,50 dB de plus. Rien ne dépasse,
+/// et la crête flottante s'arrête à ×0,9942 — la borne `max|y| ≤ ‖h‖₁·max|x|`
+/// est serrée, ce n'est pas une marge de confort.
 #[test]
-fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_reserve_depasse_quand_meme() {
+fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_tient_grace_a_la_norme_l1() {
     let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
-    assert_eq!(
-        eq.preamp_db(0),
-        Some(-6.0),
-        "réserve = somme des gains positifs"
+    let reserve = eq.preamp_db(0).expect("un canal");
+    assert!(
+        (reserve + 6.5049).abs() < 1e-3,
+        "réserve = norme L1 du plateau, plus grande que la somme des gains (−6,0) : {reserve}"
     );
     let x = carre(50.0, -0.05, N);
     let mut pcm = vers_pcm(&x, 24);
@@ -553,34 +593,31 @@ fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_reserve_depasse_quand_mem
     let sortie = normalise(&depuis_pcm(&pcm, 24), 24);
 
     // Le même signal sur le chemin flottant, non saturé : de combien la
-    // réserve est-elle courte ?
+    // réserve est-elle LARGE, maintenant ?
     let mut flottant: Vec<f32> = x.iter().map(|&v| v as f32).collect();
     EqProcessor::new(&p, FS, 1).process_interleaved(&mut flottant);
     let crete_flottante = flottant.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     eprintln!(
-        "q1 carré 50 Hz −0,05 dBFS + plateau grave 80 Hz +6 dB : overs {} ({:.1} %), crête entière {:+.2} dBFS, crête flottante {:+.2} dBFS (réserve courte de {:.2} dB)",
+        "q1 carré 50 Hz −0,05 dBFS + plateau grave 80 Hz +6 dB : réserve {reserve:.4} dB, overs {} ({:.1} %), crête entière {:+.3} dBFS, crête flottante ×{crete_flottante:.4} ({:+.3} dBFS)",
         stats.overs,
         100.0 * stats.overs as f64 / N as f64,
         dbfs(crete_echantillon(&sortie)),
-        dbfs(f64::from(crete_flottante)),
-        dbfs(f64::from(crete_flottante)) + 0.05
+        dbfs(f64::from(crete_flottante))
+    );
+    assert_eq!(
+        stats.overs, 0,
+        "la norme L1 couvre la réponse en temps : plus aucun over"
     );
     assert!(
-        stats.overs > N as u64 * 35 / 100 && stats.overs < N as u64 * 45 / 100,
-        "un plateau réservé en fréquence dépasse en temps : {} overs (~40 % attendus)",
-        stats.overs
+        crete_flottante < 1.0 && crete_flottante > 0.99,
+        "borne serrée, pas une marge de confort : crête flottante ×{crete_flottante:.4}"
     );
-    assert!(
-        crete_flottante > 1.03 && crete_flottante < 1.15,
-        "la réserve est courte d'environ 0,5 dB : crête flottante ×{crete_flottante:.3}"
-    );
-    assert!(dbfs(crete_echantillon(&sortie)) > -0.001, "écrêté au rail");
+    assert_eq!(au_rail(&depuis_pcm(&pcm, 24), 24), 0, "plus rien au rail");
 }
 
-/// Le comportement ATTENDU : la réserve couvre aussi la réponse en TEMPS
-/// (norme L1) d'un plateau, et aucun échantillon ne dépasse.
+/// Le comportement ATTENDU par #4073 — et désormais OBTENU. Nom conservé :
+/// c'est le témoin que l'issue cite et qui devait passer de `#[ignore]` à vert.
 #[test]
-#[ignore = "défaut connu : la réserve automatique est un maximum FRÉQUENTIEL ; un carré sous un plateau +6 dB dépasse de ~0,5 dB en temps (issue B)"]
 fn q1_defaut_connu_la_reserve_automatique_devrait_couvrir_la_reponse_en_temps_d_un_plateau() {
     let p = profil(vec![bande("low_shelf", 80.0, 6.0, FRAC_1_SQRT_2)]);
     let mut eq = EqProcessor::new(&p, FS, 1);
@@ -732,9 +769,10 @@ fn q2_defaut_connu_prevent_clipping_devrait_tenir_la_crete_vraie_sous_0_dbtp_ave
 
 /// La chaîne du bras progressif, dans son ordre : ReplayGain (+6 dB, pic
 /// d'échantillon tagué) PUIS égaliseur (+6 dB de crête à 3 kHz, réserve
-/// −6 dB), sur un sinus 997 Hz à −0,1 dBFS, 16 bits. Mesuré : le ReplayGain
-/// pose le sinus au rail (0 dBFS, ≈ 0 dBTP), l'égaliseur le redescend
-/// (~−4,5 dBFS) sans over.
+/// −7,13 dB depuis #4073 : la norme L1 d'une cloche de +6 dB vaut 7,13 dB,
+/// plus que la somme des gains), sur un sinus 997 Hz à −0,1 dBFS, 16 bits.
+/// Mesuré : le ReplayGain pose le sinus au rail (0 dBFS, ≈ 0 dBTP),
+/// l'égaliseur le redescend (~−5,9 dBFS) sans over.
 #[test]
 fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
     let x = sinus(997.0, -0.1, N, 0.0);
@@ -753,7 +791,11 @@ fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
     let tp_rg = dbtp(&apres_rg);
 
     let mut eq = EqProcessor::new(&profil(vec![bande("peak", 3000.0, 6.0, 1.0)]), FS, 1);
-    assert_eq!(eq.preamp_db(0), Some(-6.0));
+    let reserve = eq.preamp_db(0).expect("un canal");
+    assert!(
+        (reserve + 7.1308).abs() < 1e-3,
+        "réserve = norme L1 de la cloche (7,13 dB), pas sa somme de gains (6,0) : {reserve}"
+    );
     let stats = eq.process_pcm(&mut pcm, 16);
     let apres_eq = normalise(&depuis_pcm(&pcm, 16), 16);
     let tp_eq = dbtp(&apres_eq);
@@ -775,7 +817,7 @@ fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
         "au rail, crête vraie ≈ 0 dBTP : {tp_rg:+.3}"
     );
     assert_eq!(stats.overs, 0);
-    assert!(tp_eq < -3.0 && tp_eq > -6.0, "{tp_eq:+.2} dBTP");
+    assert!(tp_eq < -3.0 && tp_eq > -8.0, "{tp_eq:+.2} dBTP");
 }
 
 // ═════════════════════════ Q3 — flottant → entier ═════════════════════════

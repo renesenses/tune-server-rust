@@ -321,9 +321,13 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
     )
     .unwrap();
 
+    // #4073 : la réserve est le PLUS GRAND de la somme des gains positifs
+    // (9,0 / 6,0 dB) et de la norme L1 de la cascade — ici 10,476 / 7,165 dB,
+    // parce que deux cloches empilées à 1 kHz sonnent au-delà de leur gain
+    // crête. Le panneau annonce ce qui est RÉELLEMENT retiré au signal.
     assert_eq!(
         step_desc(&sp, "DSP").as_deref(),
-        Some("EQ actif (pré-gain auto G -9.0 dB / D -6.0 dB, sans limiteur)")
+        Some("EQ actif (pré-gain auto G -10.5 dB / D -7.2 dB, sans limiteur)")
     );
     assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
 }
