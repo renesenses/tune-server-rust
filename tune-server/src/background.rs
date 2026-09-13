@@ -61,6 +61,18 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
         state.clone(),
         config.auto_update,
     );
+    // Détecteur de zones figées (#3581). Sans lui, une zone restée `Playing`
+    // en mémoire n'est contredite par PERSONNE : l'écran annonce une lecture
+    // qui n'existe pas, le garde-fou de mise à jour refuse tour après tour, et
+    // `zones.last_play_state = 'playing'` suspend les passes de fond. Le
+    // commentaire de `RESTART_DEFERRAL_MAX` nommait ce trou depuis #3155. Un
+    // test de câblage garde la ligne.
+    tune_core::playback::spawn_detecteur_de_zones_figees(
+        state.playback.clone(),
+        state.backend.clone(),
+        tune_core::playback::CADENCE_DETECTEUR_ZONES_FIGEES,
+        tune_core::playback::SILENCE_AVANT_ZONE_FIGEE,
+    );
     spawn_mp3_duration_repair(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);

@@ -531,6 +531,45 @@ impl RingStarvation {
         }
     }
 
+    /// Comptabiliser UNE période que le rappel a rendue **muette sans tirer de
+    /// l'anneau** (#3814).
+    ///
+    /// Le rappel cpal partagé a deux sorties anticipées — la rampe de sourdine
+    /// établie (pause, silence forcé) et la garde de pré-remplissage — qui
+    /// remplissent le tampon de zéros et rendent la main AVANT `pop`. Or c'est
+    /// `pop` qui appelle [`record`](Self::record) : sur ces périodes-là,
+    /// `served_samples` ne bougeait pas. L'horloge du pilote se figeait donc
+    /// alors que le rappel tournait parfaitement.
+    ///
+    /// La conséquence n'est pas cosmétique : le sondeur lit `stream_ms` pour
+    /// décider si le pilote « a cessé de réclamer son dû ». Une sourdine de
+    /// deux secondes lui donnait exactement la signature d'un rappel mort —
+    /// `duree_ms ≈ 0` sur `ecoule_ms ≈ 2000` — et il écrivait
+    /// `rappel_pilote_arrete`, « la panne est en aval de l'anneau », sur une
+    /// sortie en parfait état. C'est le faux rouge que #3814 pose comme sa
+    /// preuve centrale.
+    ///
+    /// Ce que ce compteur-ci ajoute, et **uniquement** cela : le pilote a bien
+    /// consommé cette période, elle appartient à son horloge. Ni `events` ni
+    /// `missing_samples` ne bougent — une sourdine délibérée n'est pas une
+    /// famine d'anneau, et les confondre reviendrait à remplacer un faux
+    /// rouge par un autre.
+    ///
+    /// Garde `armed` conservée, et pour la même raison que dans `record` : au
+    /// démarrage le rappel rend du silence parce que l'anneau n'a pas encore
+    /// ses 200 ms, et compter ce silence-là ferait démarrer l'horloge du
+    /// pilote avant la première note.
+    ///
+    /// Même contrat temps réel que `record` : un seul atomique `Relaxed`.
+    #[inline]
+    pub fn record_silent_period(&self, demande: usize) {
+        if !self.armed.load(Ordering::Relaxed) {
+            return;
+        }
+        self.served_samples
+            .fetch_add(demande as u64, Ordering::Relaxed);
+    }
+
     /// Comptabiliser UNE sous-alimentation du pilote, telle que le backend la
     /// remonte dans son rappel d'ERREUR (#3205).
     ///
@@ -631,6 +670,58 @@ mod famine_pilote_3205 {
         assert_eq!(
             releve.driver_underruns, 0,
             "une famine de l'ANNEAU a été comptée comme une sous-alimentation du              PILOTE : le chiffre qui décide du noyau RT se met à monter quand              c'est le réseau ou le décodage qui est en retard"
+        );
+    }
+
+    /// #3814 — une période rendue MUETTE appartient quand même à l'horloge du
+    /// pilote, et à elle seule.
+    ///
+    /// Le contrat tient en trois lignes, et chacune est un piège évité :
+    /// `served_samples` avance (sans quoi le sondeur lit un rappel mort),
+    /// `events` ne bouge pas (une sourdine délibérée n'est pas une famine), et
+    /// `missing_samples` non plus (ces zéros-là ne manquent à personne).
+    #[test]
+    fn une_periode_muette_avance_l_horloge_sans_inventer_de_famine() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.record(1_024, 1_024);
+        let avant = compteur.snapshot();
+
+        compteur.record_silent_period(1_024);
+        compteur.record_silent_period(1_024);
+
+        let apres = compteur.snapshot();
+        assert_eq!(
+            apres.served_samples,
+            avant.served_samples + 2_048,
+            "le pilote a consommé ces deux périodes : son horloge doit les porter"
+        );
+        assert_eq!(
+            apres.events, avant.events,
+            "une sourdine délibérée comptée comme un rappel servi à court"
+        );
+        assert_eq!(
+            apres.missing_samples, avant.missing_samples,
+            "une sourdine délibérée comptée en échantillons manquants"
+        );
+    }
+
+    /// La garde `armed`, pour la même raison que dans `record` : au démarrage
+    /// le rappel rend du silence parce que l'anneau n'a pas encore ses 200 ms.
+    /// Le compter ferait partir l'horloge du pilote avant la première note, et
+    /// chaque début de piste paraîtrait avoir déjà joué.
+    #[test]
+    fn une_periode_muette_avant_le_premier_rappel_servi_ne_compte_pas() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+
+        compteur.record_silent_period(1_024);
+        compteur.record_silent_period(1_024);
+
+        assert_eq!(
+            compteur.snapshot().served_samples,
+            0,
+            "le silence de pré-remplissage a armé l'horloge du pilote"
         );
     }
 
