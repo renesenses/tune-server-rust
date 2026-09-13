@@ -550,6 +550,19 @@ path = "tests/derive_des_garde_fous_2816.rs"
 name = "zones_auto_create_recension"
 path = "tests/zones_auto_create_recension.rs"
 
+# #3933 : tout ce que le serveur media publie dans sa DIDL vit sous `/api/v1`,
+# la seule surface qu'`auth_middleware` protege — un renderer DLNA se faisait
+# refuser en 401 chaque ressource qu'il y trouvait, sans aucun moyen de
+# s'authentifier. Le temoin passe par le ROUTEUR MONTE (`routes::router`), pas
+# par la fonction de decision, et fabrique ses chemins avec les constructeurs
+# d'URL de la DIDL pour qu'une cinquieme ressource ajoutee plus tard le fasse
+# rougir. Cible propre plutot qu'un `mod` dans `server_contracts` : ce banc-la
+# est deja le plus lourd de la caisse. `autotests = false` plus haut : sans
+# cette entree, le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "serveur_media_didl_hors_auth_3933"
+path = "tests/serveur_media_didl_hors_auth_3933.rs"
+
 # #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
 # rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
 # jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
