@@ -181,3 +181,88 @@ par `cp` + `touch`, verts — sorties collées dans la PR :
 cargo test -p tune-core --test marge_et_crete_2218 -- --nocapture   # 14 verts, 5 ignorés
 cargo test -p tune-core --test marge_et_crete_2218 -- --ignored      # 5 rouges : les défauts A–D
 ```
+
+## Comptage livré le 12/09 (agent F, `tune-core/tests/ecretage_compte_2218.rs`)
+
+**Aucun échantillon n'a bougé.** Les empreintes FNV-1a des octets de sortie
+des étages sur les signaux de ce banc (ReplayGain +6 dB sans pic à 16/24/32
+bits, −1 dB à 16/24/32 bits, ReplayGain avec pic tagué, égaliseur passe-bas
+Q = 4 entier et flottant, plateau grave sur carré, chaîne ReplayGain puis
+égaliseur, mixeur −1 dB et ×2 : 15 empreintes) ont été relevées sur
+`batch/bugs-12` à 49ecf1fe **avant** le comptage par un témoin temporaire non
+publié, collées dans `ecretage_compte_2218.rs`, et sont **inchangées après**.
+Les 14 témoins verts et les 5 ignorés de ce banc n'ont pas été touchés.
+Le clamp de chaque étage est resté où il est, dans l'ordre où il est (clamp
+PUIS dither pour l'égaliseur), avec ses seuils.
+
+### Ce qui est compté, et où
+
+`tune-core/src/audio/ecretage.rs` : `CompteurDEcretage { echantillons_vus,
+echantillons_ecretes, exces_max_lsb, crete_max, premier_ecretage_a }` — des
+champs simples, zéro allocation, deux comparaisons par échantillon, une
+addition par bloc. « Écrêté » = la condition du clamp de l'étage, ni plus ni
+moins ; l'excès en LSB de la profondeur traitée (24 bits de référence pour le
+chemin flottant de l'égaliseur, qui n'a pas de profondeur).
+
+| étage | compteur | où il est incrémenté | par |
+|---|---|---|---|
+| ReplayGain | `apply_gain_pcm_compte(pcm, bits, facteur, &mut CompteurDEcretage)` ; `apply_gain_pcm` (signature inchangée) délègue et cumule dans le registre | `replaygain.rs`, juste avant le `clamp`, sur la valeur idéale | appel (bloc) ; **piste** avec `GainReplay` |
+| égaliseur | `EqProcessor::ecretage()` — `echantillons_ecretes` vaut exactement `process_stats().overs` | `eq.rs`, la branche `stats.overs += 1` de `process_pcm` et `process_interleaved` | **piste** (le processeur est bâti par piste ; `inherit_state_from` relaie le compteur et ses « déjà dit ») |
+| mixeur | registre seulement | `mixer.rs`, `PcmMixer::apply_gain`, avant `SampleFormat::write` ; `mix_into` (appelable d'un rappel temps réel) n'est pas touché | appel |
+
+Cas A rejoué : 29 174 / 44 100 écrêtés (66,2 %, à 8 près de l'arrondi de ce
+banc : le compteur suit la condition du clamp, `> 32 767` ou `< −32 768`),
+excès max **31 866 LSB**, crête idéale +5,90 dBFS, premier écrêtage au 4ᵉ
+échantillon. Cas B rejoué : 36 896 overs (83,7 %), crête +11,94 dBFS.
+
+**Fil d'exécution, vérifié** : ces étages tournent côté producteur — relais
+du bras progressif (`spawn_streaming_dsp_relay`, tâche tokio), transcodage
+complet (`orchestrator/transcodage.rs`), et pour la sortie locale
+`apply_local_dsp`, appelé par `process_pcm_chunk` / `prepare_windows_*_pcm` /
+`play_url`, jamais par les rappels cpal (`build_output_stream`, qui ne font
+que vider l'anneau). Le `warn!` est émis après un bloc, jamais dans la boucle.
+
+### Ce qui est dit : deux lignes `dsp_ecretage` par piste
+
+Niveau WARN, champs `etage` (`replaygain` / `egaliseur`), `moment`
+(`premier` / `fin`), `portee` (`piste` / `processus`), `echantillons_vus`,
+`echantillons_ecretes`, `pourcentage`, `exces_max_lsb`, `crete_max_dbfs`,
+`premier_ecretage_a`. La première après le PREMIER bloc qui écrête, la seconde
+à la destruction du porteur avec le total ; rien pour une piste propre ; jamais
+une ligne par bloc (témoin : 100 blocs écrêtants ⇒ 4 lignes pour deux étages,
+pas 200). La **zone** n'est pas connue de ces étages (un facteur, un profil) :
+elle vient du `Span` de l'appelant quand il en tient un.
+
+Limite, dite : sur le bras progressif, `StreamingDsp.replaygain` est un
+`Option<f64>` nu (`orchestrator.rs`) — `apply_gain_pcm` ne connaît pas la
+piste. Il compte dans le registre à chaque bloc et ne dit qu'UNE ligne
+`portee=processus`, au premier bloc du processus qui écrête. Les deux lignes
+par piste du ReplayGain sont portées par `GainReplay` (`process` + `Drop`),
+témoigné ici, que l'orchestrateur ne porte pas encore (hors périmètre de la
+nuit : `orchestrator/` a d'autres écrivains). Pour l'égaliseur, les deux lignes
+par piste sont livrées sur tous les chemins, sans branchement à faire.
+
+### Où c'est lu
+
+Rapport de diagnostic (`routes/system/diagnostics.rs`), JSON et Markdown :
+section `dsp_ecretage` — par étage, `echantillons_vus`, `echantillons_ecretes`,
+`pourcentage`, `exces_max_lsb`, `appels_ecretants`, `pistes_ecretees`,
+`lignes_journal`, depuis le démarrage du processus, tous flux confondus
+(`audio::ecretage::REGISTRE`, `AtomicU64`). Pas par zone : `OutputDspMetrics`
+est construit par littéral dans `outputs/local.rs`, hors périmètre.
+
+### Les cinq défauts, toujours à trancher par Bertrand
+
+Rien de ce qui suit n'a été corrigé ; c'est maintenant compté et dit.
+
+* **A** — `prevent_clipping` sans pic tagué n'empêche rien (66 % écrêtés) ;
+* **B** — la réserve automatique ignore la résonance des passe-bas/haut et la
+  réponse en temps des plateaux (83,7 % / 40,4 % d'overs) ;
+* **C** — avec un pic d'échantillon tagué, la crête vraie passe à +2,10 dBTP ;
+* **D** — réduction 24 → 16 bits par décalage, sans dither ;
+* **E** — `apply_gain_pcm` et `PcmMixer::apply_gain` tronquent vers zéro sans
+  dither (le comptage garde le même `clamp` puis le même `as`).
+
+```sh
+cargo test -p tune-core --test ecretage_compte_2218 -- --nocapture   # 8 verts
+```

@@ -283,13 +283,33 @@ impl PcmMixer {
     /// Rend une erreur nommée plutôt que de ne rien faire : un `_ => {}` ici
     /// laissait le tampon INCHANGÉ, ce qui se lit à l'oreille comme un gain
     /// ignoré et à la lecture du code comme un succès.
+    ///
+    /// #2218 (T9) — compte ce que `SampleFormat::write` ramène au rail dans
+    /// le registre du processus (`dsp_ecretage.mixeur`), sans changer un
+    /// échantillon : même produit, même `clamp`, même `as` (troncature vers
+    /// zéro, défaut E, inchangé). Pas de ligne de journal : le mixeur n'a pas
+    /// de piste. `mix_into`, appelable depuis un rappel temps réel, n'est
+    /// pas touché.
     pub fn apply_gain(data: &mut [u8], gain: f32, bit_depth: u16) -> Result<(), MixError> {
         let format = SampleFormat::from_bit_depth(bit_depth)?;
         let width = format.bytes();
-        for chunk in data.chunks_exact_mut(width) {
+        let (lo, hi) = format.range();
+        let pleine_echelle = -lo;
+        let mut compteur = crate::audio::ecretage::CompteurDEcretage::default();
+        for (i, chunk) in data.chunks_exact_mut(width).enumerate() {
             let value = format.read(chunk) as f64 * gain as f64;
+            if value > hi {
+                compteur.noter_ecrete(i as u64, value - hi, value / pleine_echelle);
+            } else if value < lo {
+                compteur.noter_ecrete(i as u64, lo - value, -value / pleine_echelle);
+            }
             format.write(value, chunk);
         }
+        compteur.noter_vus((data.len() / width) as u64);
+        crate::audio::ecretage::REGISTRE.mixeur.absorber(
+            &crate::audio::ecretage::CompteurDEcretage::default(),
+            &compteur,
+        );
         Ok(())
     }
 
