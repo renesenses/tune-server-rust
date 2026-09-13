@@ -443,6 +443,8 @@ mod fusion_tests;
 mod identite_appareil_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
+#[cfg(test)]
+mod zone_sans_appareil_guard;
 
 pub async fn create_zone_handler(
     state: State<AppState>,
@@ -1048,14 +1050,39 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
     reach
 }
 
+/// « Cette zone n'a **rien** à appeler » — la règle, UNE fois (#3835 / #3838).
+///
+/// Elle était écrite deux fois, aux deux endroits qui la CONSTATENT trop tard :
+/// `output_reach_of` (le badge rouge « Aucune sortie ») et
+/// `routes/playback.rs::reject_if_zone_has_no_output_device` (le 409
+/// `zone_no_output_device`). Une zone née sans appareil portait donc les deux
+/// dès sa première seconde, sans que rien ne l'ait empêchée — la zone
+/// « Volumio » de JeromeQ (fil 1750).
+///
+/// `create_zone` la consulte désormais **à la naissance** : la route refuse ce
+/// que la lecture refusera de toute façon.
+///
+/// L'exemption navigateur n'est pas un cas particulier de plus : une zone
+/// `browser` n'a **jamais** d'`output_device_id`, la sortie étant l'onglet
+/// (`orchestrator/transport.rs`). Elle est écrite ici, une fois, pour les trois
+/// appelants.
+pub(crate) fn zone_sans_appareil(
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> bool {
+    output_device_id.is_none() && output_type != Some("browser")
+}
+
 /// La décision seule, sans I/O — c'est elle que les tests couvrent.
 fn output_reach_of(zone: &Zone, ps: &ZoneState, browser_stream_pulled: bool) -> &'static str {
+    if zone_sans_appareil(
+        zone.output_type.as_deref(),
+        zone.output_device_id.as_deref(),
+    ) {
+        return "no_output";
+    }
     if zone.output_type.as_deref() != Some("browser") {
-        return if zone.output_device_id.is_none() {
-            "no_output"
-        } else {
-            "ok"
-        };
+        return "ok";
     }
 
     // Zone navigateur : la sortie, c'est l'onglet. On ne peut pas la

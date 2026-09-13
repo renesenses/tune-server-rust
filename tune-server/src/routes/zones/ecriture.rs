@@ -873,6 +873,44 @@ pub(super) async fn create_zone(
     });
     let output_device_id = device_id_normalise.as_deref();
 
+    // #3835 / #3838 — une zone sans appareil naissait, et ne jouait JAMAIS.
+    //
+    // Toutes les vérifications d'appareil de cette fonction sont sous
+    // `if let Some(device_id) = output_device_id` : un corps sans
+    // `output_device_id` les saute TOUTES et atteint l'`INSERT`. Le formulaire
+    // « créer une zone » du client web le produit sans le vouloir — il n'exige
+    // que le nom, laisse `output_type` sur son défaut `local` et n'affiche un
+    // sélecteur d'appareil que pour `dlna | airplay | snapcast | sonos`
+    // (`Sidebar.svelte`, `ZoneManagerView.svelte`). Taper « Volumio » et
+    // valider suffisait donc à créer une ligne morte : la carte affichait
+    // « SORTIE LOCALE », « Aucune sortie — la lecture sera refusée » et
+    // « Jamais vue depuis la mise à jour » dès la première seconde, et la
+    // lecture répondait 409 `zone_no_output_device`. C'est la zone « Volumio »
+    // de JeromeQ (fil 1750), pendant que son boîtier était découvert deux fois.
+    //
+    // Rien de neuf n'est décidé ici : `zone_sans_appareil` est la règle que la
+    // lecture (`reject_if_zone_has_no_output_device`) et le badge
+    // (`output_reach_of`) appliquent déjà. Elle est simplement consultée à la
+    // NAISSANCE — refuser ce que la lecture refusera de toute façon —, et son
+    // exemption navigateur est la même, écrite au même endroit.
+    if zone_sans_appareil(output_type, output_device_id) {
+        warn!(
+            name = %body.name,
+            output_type = ?output_type,
+            "create_zone_sans_appareil_refuse"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "detail": format!(
+                    "zone_sans_appareil:La zone « {} » n'aurait aucune sortie : choisissez un appareil découvert avant de la créer.",
+                    body.name
+                )
+            })),
+        )
+            .into_response();
+    }
+
     // If device already has a zone (visible OR hidden), return it (no premium check needed).
     // A previously soft-deleted zone (is_hidden=1) is resurrected so the user's
     // prior settings (volume, DSP, gapless, etc.) are preserved.
