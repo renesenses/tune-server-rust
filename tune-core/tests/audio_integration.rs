@@ -625,8 +625,8 @@ fn decode_nonexistent_ape() {
 #[test]
 fn can_decode_all_native_formats() {
     for ext in &[
-        "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "oga", "opus", "aiff", "aif", "dsf",
-        "dff", "wv", "ape",
+        "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "oga", "opus", "aiff", "aif", "aifc",
+        "dsf", "dff", "wv", "ape",
     ] {
         assert!(
             tune_core::audio::decode::can_decode_native(&format!("test.{ext}")),
@@ -652,6 +652,7 @@ fn can_decode_case_insensitive() {
     assert!(tune_core::audio::decode::can_decode_native("test.FLAC"));
     assert!(tune_core::audio::decode::can_decode_native("test.Wav"));
     assert!(tune_core::audio::decode::can_decode_native("test.AIFF"));
+    assert!(tune_core::audio::decode::can_decode_native("test.AIFC"));
     assert!(tune_core::audio::decode::can_decode_native("test.DSF"));
 }
 
