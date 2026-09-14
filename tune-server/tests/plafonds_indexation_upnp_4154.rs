@@ -425,6 +425,19 @@ async fn i4154_sans_limite_fait_l_aller_retour_et_ne_tronque_pas() {
         Value::Null,
         "…et aucun plafond ne doit mordre — {corps}"
     );
+    // 🔴 Sans cette ligne, l'épreuve serait VERTE pour la mauvaise raison.
+    //
+    // La contre-épreuve l'a montré : correctif retiré — donc réglages ignorés
+    // et défaut en dur appliqué —, un banc de six pistes ne heurte pas
+    // davantage un plafond de 50 000. « Rien n'a été tronqué » ne distingue
+    // donc PAS « sans limite appliqué » de « réglage jamais lu ». La borne
+    // EFFECTIVE que la passe annonce, elle, les sépare.
+    assert_eq!(
+        corps["parcours"]["plafonds"]["max_pistes"],
+        Value::Null,
+        "la passe doit annoncer qu'elle a tourné SANS LIMITE, pas sous un \
+         défaut qu'on ne lui a pas demandé — {corps}"
+    );
 }
 
 /// **6. « Sans limite » sur la PROFONDEUR n'existe pas.**
