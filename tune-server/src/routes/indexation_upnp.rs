@@ -111,6 +111,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::models::{Album, Track};
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::orchestrator::verdict_upnp::SortieD4;
@@ -137,14 +138,140 @@ pub const CLE_POCHETTE: &str = "upnp_cover_url";
 /// Profondeur de descente par défaut. Asset range ses pistes sous
 /// `Album > [All Albums] > <album>` : trois niveaux depuis la racine. Six
 /// laisse de la marge sans autoriser une descente sans fin.
-const PROFONDEUR_DEFAUT: u32 = 6;
+pub const PROFONDEUR_DEFAUT: u32 = 6;
 /// Plafond de conteneurs visités. Un serveur qui publie douze axes de
 /// navigation en démultiplie le nombre ; sans borne, indexer la racine d'un
 /// gros catalogue ne se termine pas dans un temps utile.
-const CONTENEURS_DEFAUT: usize = 1_000;
-/// Plafond de pistes retenues. 22 331 pistes se parcourent en 11,6 s (mesure du
-/// 13/09) ; 50 000 est large et reste un refus CHIFFRÉ plutôt qu'un blocage.
-const PISTES_DEFAUT: usize = 50_000;
+pub const CONTENEURS_DEFAUT: usize = 1_000;
+/// Plafond de pistes retenues (#4154).
+///
+/// 🔴 **50 000 était mal calé, et c'est mesuré.** Le chiffre avait été posé en
+/// phase 2 sur les 22 331 pistes d'Asset. La bibliothèque locale de Bertrand en
+/// compte **47 056** (relevé sur le `.18` le 14/09/2026) : la marge réelle
+/// était de **6 %**, et un Tune qui en indexerait un autre aurait été tronqué
+/// presque aussitôt — en silence.
+///
+/// 100 000 est le DOUBLE de cette bibliothèque. Ce n'est pas une limite
+/// technique : 22 331 pistes se parcourent en 11,6 s (mesure du 13/09), le coût
+/// est linéaire, et le réglage se relève jusqu'à « sans limite ».
+pub const PISTES_DEFAUT: usize = 100_000;
+
+/// **Le plafond DUR de profondeur, celui que « sans limite » ne lève pas.**
+///
+/// Le parcours retient les conteneurs déjà vus (`vus`), ce qui ferme le cas du
+/// cycle ordinaire. Mais l'en-tête de ce module le documente : chez Asset,
+/// l'`ObjectID` d'une piste **change d'un axe de navigation à l'autre**. Un
+/// serveur qui frappe un identifiant neuf à chaque visite — c'est-à-dire le
+/// même travers, poussé aux conteneurs — donnerait à `vus` une clé différente
+/// chaque fois, et la descente ne s'arrêterait JAMAIS.
+///
+/// 64 est hors d'atteinte d'une hiérarchie réelle (Asset en demande trois). Il
+/// ne borne donc aucun catalogue légitime : il borne une boucle.
+pub const PROFONDEUR_PLAFOND_DUR: u32 = 64;
+
+/// Les trois réglages persistés, dans `settings` (#4154).
+///
+/// Même mécanique que tous les réglages du serveur : `GET /system/config` les
+/// publie, `PATCH /system/config` les écrit. Ce qui se lit se réécrit.
+pub mod reglages {
+    /// Plafond de pistes. `0` = sans limite.
+    pub const MAX_PISTES: &str = "upnp_index_max_pistes";
+    /// Plafond de conteneurs visités. `0` = sans limite.
+    pub const MAX_CONTENEURS: &str = "upnp_index_max_conteneurs";
+    /// Profondeur de descente. `0` = sans limite — bornée malgré tout par
+    /// [`super::PROFONDEUR_PLAFOND_DUR`].
+    pub const PROFONDEUR_MAX: &str = "upnp_index_profondeur_max";
+}
+
+/// Lit un plafond persisté, `0` valant « sans limite ».
+///
+/// Vocabulaire FERMÉ, comme partout ailleurs dans ce dépôt : une valeur
+/// illisible — texte, nombre négatif, ligne héritée d'une autre version —
+/// **retombe sur le défaut** plutôt que d'être réinterprétée. Un plafond deviné
+/// tronquerait une bibliothèque sans que personne ne l'ait demandé, et c'est
+/// exactement le défaut que ce lot referme.
+///
+/// `0` est la seule valeur spéciale, et elle est explicite : elle rend
+/// `usize::MAX`, c'est-à-dire un parcours que seuls les deux autres plafonds
+/// bornent encore.
+pub fn plafond_persiste(brut: Option<&str>, defaut: usize) -> usize {
+    match brut.map(str::trim) {
+        None | Some("") => defaut,
+        Some("0") => usize::MAX,
+        Some(texte) => match texte.parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                tracing::warn!(valeur = %texte, defaut, "plafond_indexation_illisible_defaut_retenu");
+                defaut
+            }
+        },
+    }
+}
+
+/// Idem pour la profondeur, qui compte en `u32` — et que « sans limite »
+/// ramène au plafond DUR, jamais à l'infini. Voir
+/// [`PROFONDEUR_PLAFOND_DUR`].
+pub fn profondeur_persistee(brut: Option<&str>) -> u32 {
+    match brut.map(str::trim) {
+        None | Some("") => PROFONDEUR_DEFAUT,
+        Some("0") => PROFONDEUR_PLAFOND_DUR,
+        Some(texte) => match texte.parse::<u32>() {
+            Ok(n) if n > 0 => n.min(PROFONDEUR_PLAFOND_DUR),
+            _ => {
+                tracing::warn!(
+                    valeur = %texte,
+                    defaut = PROFONDEUR_DEFAUT,
+                    "profondeur_indexation_illisible_defaut_retenu"
+                );
+                PROFONDEUR_DEFAUT
+            }
+        },
+    }
+}
+
+/// Le réglage à relever quand un plafond a mordu, et de combien il était.
+///
+/// 🔴 C'est le cœur de #4154 : « plafond « pistes » atteint » ne disait pas
+/// QUOI faire. Une annonce de troncature qui ne nomme pas le réglage à changer
+/// ne sert à rien — l'utilisateur cherche un album jamais indexé et croit à un
+/// bug de recherche.
+pub fn reglage_du_plafond(nature: &str) -> Option<&'static str> {
+    match nature {
+        "pistes" => Some(reglages::MAX_PISTES),
+        "conteneurs" => Some(reglages::MAX_CONTENEURS),
+        "profondeur" => Some(reglages::PROFONDEUR_MAX),
+        _ => None,
+    }
+}
+
+/// La phrase que la réponse HTTP porte quand un plafond a mordu.
+///
+/// Elle nomme les trois choses dont l'utilisateur a besoin : **ce qui** a
+/// coupé, **à combien**, et **quel réglage relever**. `valeur` est la borne
+/// EFFECTIVE de la passe, pas le défaut — sinon le message parlerait d'un
+/// réglage que l'utilisateur a déjà changé.
+pub fn message_de_plafond(nature: &str, valeur: u64) -> String {
+    let combien = if valeur == u64::MAX {
+        "sans limite".to_string()
+    } else {
+        valeur.to_string()
+    };
+    match nature {
+        "pistes" => format!(
+            "plafond de PISTES atteint ({combien}) : le catalogue est plus grand que              la borne, et les pistes au-delà n'ont PAS été indexées — relever le              réglage « {} », ou indexer un conteneur plus précis",
+            reglages::MAX_PISTES
+        ),
+        "conteneurs" => format!(
+            "plafond de CONTENEURS atteint ({combien}) : le parcours a visité autant              de dossiers qu'il s'y autorise et s'est arrêté là — un serveur qui publie              beaucoup d'axes de navigation (Album, Artiste, Genre…) en démultiplie le              nombre. Relever le réglage « {} », ou partir d'un conteneur plus précis              plutôt que de la racine",
+            reglages::MAX_CONTENEURS
+        ),
+        "profondeur" => format!(
+            "profondeur maximale atteinte ({combien}) : des sous-dossiers n'ont pas été              ouverts, et les pistes qu'ils contiennent ne sont PAS indexées — relever              le réglage « {} »",
+            reglages::PROFONDEUR_MAX
+        ),
+        autre => format!("plafond « {autre} » atteint ({combien})"),
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
 pub struct DemandeIndexation {
@@ -311,6 +438,10 @@ struct Bilan {
     sans_taille: usize,
     albums_ajoutes: usize,
     plafond_atteint: Option<&'static str>,
+    /// La valeur du plafond qui a mordu (#4154) — `u64::MAX` pour « sans
+    /// limite ». Rangée ici parce que `reserves()` ne reçoit que le bilan, et
+    /// qu'un message de troncature sans son chiffre ne dit pas quoi relever.
+    plafond_valeur: u64,
     erreurs: Vec<String>,
 }
 
@@ -337,9 +468,25 @@ pub async fn indexer_une_source(
     drop(serveurs);
 
     let conteneur = demande.conteneur.clone().unwrap_or_else(|| "0".into());
-    let profondeur_max = demande.profondeur_max.unwrap_or(PROFONDEUR_DEFAUT);
-    let max_conteneurs = demande.max_conteneurs.unwrap_or(CONTENEURS_DEFAUT);
-    let max_pistes = demande.max_pistes.unwrap_or(PISTES_DEFAUT);
+    // #4154 — l'ordre de priorité, et il n'y en a qu'un : ce que la REQUÊTE
+    // demande, sinon ce que l'utilisateur a RÉGLÉ, sinon le défaut mesuré. Le
+    // paramètre de requête reste pour les essais ponctuels et pour les clients
+    // qui le posaient déjà ; il ne persiste rien.
+    // Nommé `persistes` et non `reglages` : `reglages` est le module des clés,
+    // juste au-dessus, et deux choses du même nom dans la même fonction se
+    // relisent mal même quand le compilateur s'y retrouve.
+    let persistes = SettingsRepo::with_backend(state.backend.clone());
+    let lu = |cle: &str| persistes.get(cle).ok().flatten();
+    let profondeur_max = demande
+        .profondeur_max
+        .map(|n| n.min(PROFONDEUR_PLAFOND_DUR))
+        .unwrap_or_else(|| profondeur_persistee(lu(reglages::PROFONDEUR_MAX).as_deref()));
+    let max_conteneurs = demande.max_conteneurs.unwrap_or_else(|| {
+        plafond_persiste(lu(reglages::MAX_CONTENEURS).as_deref(), CONTENEURS_DEFAUT)
+    });
+    let max_pistes = demande
+        .max_pistes
+        .unwrap_or_else(|| plafond_persiste(lu(reglages::MAX_PISTES).as_deref(), PISTES_DEFAUT));
 
     let debut = std::time::Instant::now();
     let (pistes, mut bilan) = recolter(
@@ -365,7 +512,30 @@ pub async fn indexer_une_source(
             "conteneurs_visites": bilan.conteneurs_visites,
             "items_vus": bilan.items_vus,
             "duree_ms": parcours_ms,
+            // Conservé tel quel : les clients livrés le lisent.
             "plafond_atteint": bilan.plafond_atteint,
+            // #4154 — les bornes EFFECTIVES de cette passe, pour que l'écran
+            // puisse dire « 100 000 » sans les redeviner. `null` = sans limite.
+            "plafonds": {
+                "max_pistes": borne_json(max_pistes as u64),
+                "max_conteneurs": borne_json(max_conteneurs as u64),
+                "profondeur_max": borne_json(profondeur_max as u64),
+            },
+            // …et, quand un plafond a mordu, de quoi AGIR : ce qui a coupé, à
+            // combien, et le réglage à relever.
+            "plafond": bilan.plafond_atteint.map(|nature| {
+                let valeur = match nature {
+                    "pistes" => max_pistes as u64,
+                    "conteneurs" => max_conteneurs as u64,
+                    _ => profondeur_max as u64,
+                };
+                json!({
+                    "nature": nature,
+                    "valeur": borne_json(valeur),
+                    "reglage": reglage_du_plafond(nature),
+                    "message": message_de_plafond(nature, valeur),
+                })
+            }),
         },
         "pistes": {
             "distinctes": bilan.pistes_distinctes,
@@ -425,13 +595,26 @@ fn reserves(bilan: &Bilan) -> Vec<String> {
             bilan.sans_taille
         ));
     }
-    if let Some(plafond) = bilan.plafond_atteint {
-        dites.push(format!(
-            "plafond « {plafond} » atteint : le parcours s'est arrêté avant la \
-             fin du catalogue — relancer sur un conteneur plus précis"
-        ));
+    if let Some(nature) = bilan.plafond_atteint {
+        // #4154 — la phrase vient du MÊME endroit que celle du champ
+        // `parcours.plafond`. Deux textes écrits à la main auraient divergé, et
+        // c'est celui qui nomme le réglage qui aurait pris du retard.
+        dites.push(message_de_plafond(nature, bilan.plafond_valeur));
     }
     dites
+}
+
+/// Une borne, telle que le JSON la porte : `null` pour « sans limite ».
+///
+/// `usize::MAX` sérialisé tel quel donnerait 18 446 744 073 709 551 615 dans la
+/// réponse — un nombre que le client afficherait, et qui n'est pas ce que
+/// l'utilisateur a choisi. Il a choisi « sans limite ».
+fn borne_json(valeur: u64) -> Value {
+    if valeur == u64::MAX || valeur == usize::MAX as u64 {
+        Value::Null
+    } else {
+        json!(valeur)
+    }
 }
 
 /// Descente en largeur depuis le conteneur choisi, bornée de trois façons.
@@ -454,6 +637,7 @@ async fn recolter(
     while let Some((conteneur, profondeur)) = file.pop() {
         if bilan.conteneurs_visites >= max_conteneurs {
             bilan.plafond_atteint = Some("conteneurs");
+            bilan.plafond_valeur = max_conteneurs as u64;
             break;
         }
         bilan.conteneurs_visites += 1;
@@ -489,6 +673,7 @@ async fn recolter(
             retenues.entry(cle).or_insert(piste);
             if retenues.len() >= max_pistes {
                 bilan.plafond_atteint = Some("pistes");
+                bilan.plafond_valeur = max_pistes as u64;
                 break;
             }
         }
@@ -499,6 +684,7 @@ async fn recolter(
         if profondeur >= profondeur_max {
             if !sous_conteneurs.is_empty() {
                 bilan.plafond_atteint.get_or_insert("profondeur");
+                bilan.plafond_valeur = profondeur_max as u64;
             }
             continue;
         }

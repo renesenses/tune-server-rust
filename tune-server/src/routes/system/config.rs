@@ -722,6 +722,23 @@ pub(super) async fn get_config(
     );
     config.insert("zone_limit".to_string(), zone_limit);
     config.insert("license_key_masked".to_string(), json!(license_key_masked));
+    // #4154 — les trois plafonds de l'indexation UPnP, sous leur valeur
+    // EFFECTIVE.
+    //
+    // La boucle du dessus ne publie que les lignes qui EXISTENT dans
+    // `settings` : un réglage jamais posé n'apparaîtrait pas, et l'écran
+    // n'aurait rien à afficher tant que l'utilisateur n'y aurait pas touché —
+    // c'est-à-dire précisément au moment où il a besoin de savoir sur quoi il
+    // est. Les valeurs sont donc réinjectées ici, défauts compris, et elles
+    // ÉCRASENT la version brute : ce qui est publié est ce que la prochaine
+    // indexation appliquera.
+    //
+    // `null` = « sans limite ». C'est la valeur que le client repasse en
+    // `PATCH`, et `update_config` la retraduit en `0` — voir
+    // `normaliser_plafonds_indexation`.
+    for (cle, valeur) in plafonds_indexation_publies(&settings) {
+        config.insert(cle.to_string(), valeur);
+    }
     // Caviardage des secrets, EN DERNIER — après `discogs_token_set` et
     // `license_key_masked`, qui se calculent sur les valeurs en clair.
     //
@@ -735,6 +752,47 @@ pub(super) async fn get_config(
     // donc aussi le réglage ajouté demain.
     tune_core::secrets::caviarder_carte(&mut config);
     Json(Value::Object(config))
+}
+
+/// Les trois plafonds de l'indexation UPnP tels que la PROCHAINE passe les
+/// appliquera (#4154) — défauts compris, `null` pour « sans limite ».
+///
+/// Elle lit par les MÊMES fonctions que la route d'indexation
+/// (`plafond_persiste`, `profondeur_persistee`). Recopier ici la logique de
+/// repli ferait afficher un chiffre que l'indexation ne suivrait pas, ce qui
+/// est pire que de ne rien afficher.
+fn plafonds_indexation_publies(settings: &SettingsRepo) -> Vec<(&'static str, Value)> {
+    use crate::routes::indexation_upnp as idx;
+    let lu = |cle: &str| settings.get(cle).ok().flatten();
+    let borne = |v: usize| {
+        if v == usize::MAX {
+            Value::Null
+        } else {
+            json!(v)
+        }
+    };
+    vec![
+        (
+            idx::reglages::MAX_PISTES,
+            borne(idx::plafond_persiste(
+                lu(idx::reglages::MAX_PISTES).as_deref(),
+                idx::PISTES_DEFAUT,
+            )),
+        ),
+        (
+            idx::reglages::MAX_CONTENEURS,
+            borne(idx::plafond_persiste(
+                lu(idx::reglages::MAX_CONTENEURS).as_deref(),
+                idx::CONTENEURS_DEFAUT,
+            )),
+        ),
+        (
+            idx::reglages::PROFONDEUR_MAX,
+            json!(idx::profondeur_persistee(
+                lu(idx::reglages::PROFONDEUR_MAX).as_deref()
+            )),
+        ),
+    ]
 }
 
 pub(super) async fn get_settings(
@@ -857,6 +915,66 @@ fn expand_replaygain_source(
     Ok(Some(mode))
 }
 
+/// Normalise les trois plafonds d'indexation d'un `PATCH /config` (#4154).
+///
+/// Ce que le client envoie, et ce qui est écrit :
+///
+/// | reçu | écrit | sens |
+/// |---|---|---|
+/// | `null` | `"0"` | sans limite — la valeur que `GET /config` publie |
+/// | `100000` ou `"100000"` | `"100000"` | un plafond |
+/// | `0` | `"0"` | sans limite, écrit directement |
+/// | autre chose | **400** | refusé, jamais deviné |
+///
+/// 🔴 Le refus n'est pas de la rigidité. Sans lui, `{"upnp_index_max_pistes":
+/// "beaucoup"}` tomberait dans la boucle d'écriture générique, installerait une
+/// ligne illisible, répondrait `{"ok": true}` — et l'indexation retomberait
+/// silencieusement sur le défaut. L'utilisateur croirait avoir levé un plafond
+/// qui n'a pas bougé : exactement le défaut muet que #4154 referme, déplacé
+/// d'un cran.
+///
+/// La profondeur est bornée à l'écriture par le plafond DUR : « sans limite »
+/// sur la descente n'existe pas, et il vaut mieux que le réglage persisté dise
+/// la vérité plutôt que de laisser l'écran afficher une valeur que la route
+/// ramènerait ensuite en silence.
+fn normaliser_plafonds_indexation(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    use crate::routes::indexation_upnp as idx;
+    for cle in [
+        idx::reglages::MAX_PISTES,
+        idx::reglages::MAX_CONTENEURS,
+        idx::reglages::PROFONDEUR_MAX,
+    ] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let nombre: Option<u64> = match brut {
+            Value::Null => Some(0),
+            Value::Number(n) => n.as_u64(),
+            Value::String(t) if t.trim().is_empty() => Some(0),
+            Value::String(t) => t.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        let Some(mut nombre) = nombre else {
+            return Err(AppError::bad_request(format!(
+                "{cle} : un entier positif, 0 ou null pour « sans limite » — reçu {brut}"
+            )));
+        };
+        if cle == idx::reglages::PROFONDEUR_MAX {
+            let dur = u64::from(idx::PROFONDEUR_PLAFOND_DUR);
+            if nombre == 0 || nombre > dur {
+                // Écrit borné plutôt que refusé : l'intention « le plus
+                // profond possible » est légitime, seule sa valeur infinie ne
+                // l'est pas.
+                nombre = dur;
+            }
+        }
+        values.insert(cle.to_string(), Value::String(nombre.to_string()));
+    }
+    Ok(())
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     profile: ActiveProfile,
@@ -895,6 +1013,10 @@ pub(super) async fn update_config(
             demande.trim(),
         )));
     }
+    // #4154 — les trois plafonds de l'indexation UPnP. `null` (« sans limite »)
+    // devient `0`, la valeur que la route d'indexation lit ; une valeur
+    // illisible est REFUSÉE, jamais réinterprétée.
+    normaliser_plafonds_indexation(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
