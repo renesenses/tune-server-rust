@@ -171,6 +171,15 @@ path = "tests/albums_upnp_visibles_4146.rs"
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
 
+# #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
+# qui DISENT quand ils mordent. Mesuré sur les routes montées.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "plafonds_indexation_upnp_4154"
+path = "tests/plafonds_indexation_upnp_4154.rs"
+
 [[test]]
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
