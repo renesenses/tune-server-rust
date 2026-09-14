@@ -107,3 +107,21 @@ trois répondent HTTP 200 sur leur `description.xml` depuis le Mac, à l'instant
 Soit `reachable` mesure autre chose que la joignabilité HTTP — un parcours `Browse` réussi,
 par exemple —, soit il n'est jamais remis à `true`. **Non tranché ici** : cela demande de lire
 le calcul de ce champ, ce qui sort du périmètre de cette mesure.
+
+## 6. ⛔ Les Sonos ne serviront PAS de serveur tiers de référence
+
+**Arbitrage de Bertrand, 14/09/2026 : « ne prends pas les Sonos, ils sont vides. »**
+
+Un Sonos Play:1 expose bien un `ContentDirectory`, mais ce n'est pas une bibliothèque : il y
+publie sa file de lecture, ses favoris et ses services, pas un catalogue de fichiers. Le
+parcourir ne renseignerait ni sur la forme des `ObjectID` d'un vrai serveur, ni sur
+`res@size`, ni sur le temps de parcours d'un catalogue réel.
+
+**Conséquence pour la phase 0** : les trois serveurs tiers à mesurer restent à trouver
+ailleurs — MinimServer, Asset ou Twonky, Synology DS Audio, LMS. Les Sonos sont hors liste, et
+ce paragraphe existe pour qu'on ne les y remette pas.
+
+**Conséquence pour ce qui précède : aucune.** Le défaut de classification décrit plus haut
+reste entier et vaut d'être corrigé — il ne concerne pas que Sonos. Tout appareil composite à
+racine non standard est rangé comme renderer et ne peut jamais être serveur, y compris ceux
+qui, eux, portent une vraie bibliothèque.
