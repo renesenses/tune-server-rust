@@ -572,6 +572,15 @@ impl PlaybackOrchestrator {
         let advance_track_id = np.track_id;
         let advance_source = np.source.clone();
         let advance_source_id = np.source_id.clone();
+        let ecoute = (advance_source != "radio").then(|| {
+            (
+                np.title.clone(),
+                np.artist_name.clone(),
+                np.album_title.clone(),
+                np.cover_path.clone(),
+                np.duration_ms,
+            )
+        });
         self.playback.update_now_playing(zone_id, np).await;
         // `reset_position` et non `update_position` : ce chemin est le SEUL
         // changement de piste qui n'emprunte pas `play()` — c'est tout l'objet
@@ -582,6 +591,40 @@ impl PlaybackOrchestrator {
         // la fin de la piste précédente pendant tout un album enchaîné (#3229).
         self.playback.reset_position(zone_id, 0).await;
         self.playback.emit_position(zone_id, 0);
+
+        // Une avance gapless est une nouvelle écoute confirmée par le sondeur
+        // (position remise à zéro, durée changée ou transition Playing après
+        // SetNext). Elle contourne `play_inner`, donc son unique écriture dans
+        // `listen_history` doit vivre ici, l'entonnoir commun aux trois preuves.
+        // Le profil et le contexte restent ceux de la session ; le rang, lui,
+        // est celui que la file vient réellement d'atteindre.
+        if let Some((title, artist, album, cover, duration_ms)) = ecoute {
+            let etat = self.playback.get_state(zone_id).await;
+            let album_id = advance_track_id.and_then(|track_id| {
+                TrackRepo::with_backend(self.db.clone())
+                    .get(track_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|track| track.album_id)
+            });
+            self.record_listen(
+                &title,
+                artist.as_deref(),
+                album.as_deref(),
+                &advance_source,
+                advance_source_id.as_deref(),
+                album_id,
+                duration_ms,
+                zone_id,
+                cover.as_deref(),
+                etat.session_profile_id,
+                ContexteEcoute {
+                    nature: etat.session_context_type.as_deref(),
+                    id: etat.session_context_id.as_deref(),
+                    rang: rang_a_retenir(etat.shuffle, etat.queue_position),
+                },
+            );
+        }
 
         // Niveaux de la piste devenue courante. Le pré-chargement gapless
         // n'attache pas de forwarder (ses fenêtres seraient datées de
