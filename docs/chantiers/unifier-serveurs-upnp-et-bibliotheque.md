@@ -629,6 +629,32 @@ Trois postures possibles :
 
 Recommandation : **(b)**, en phase 3, et (c) jamais automatiquement.
 
+**D1bis — Le badge d'une piste distante dit « UPNP ». ✅ TRANCHÉ**
+
+**Arbitrage de Bertrand, 14/09/2026** : une piste venue d'un serveur UPnP porte le badge
+**`UPNP`**, comme `QOBUZ` ou `BANDCAMP` portent le leur. Pas « local », et pas un badge
+par serveur.
+
+C'est une entrée de plus dans la table de `ServiceBadge.svelte`, rien d'autre :
+
+```ts
+upnp: { name: 'UPNP', bg: '…', color: '#ffffff' },
+```
+
+État mesuré du code au moment de la décision (v0.9.149) :
+
+* `ServiceBadge.svelte` est une table fixe de huit entrées. Une source absente de la table
+  rend `null`, donc **aucun badge** — une piste `source = 'upnp'` n'afficherait rien
+  aujourd'hui, ce qui est un défaut discret ;
+* le « LOCAL » visible vient des appelants qui forcent le défaut :
+  `source={(t as any).source ?? 'local'}` dans `FavoritesView.svelte:886` et `:930`.
+  **Ces replis doivent cesser** — sinon une piste distante réapparaîtra en « LOCAL »,
+  c'est-à-dire en mensonge.
+
+Le **nom du serveur d'origine** reste utile pour distinguer deux pistes identiques venues de
+deux machines, mais il n'a pas sa place dans le badge : il ira dans l'infobulle ou dans le
+détail de la piste, à trancher au moment de l'écran.
+
 **D2 — Que faire quand un serveur disparaît ?**
 Le dépôt a déjà tranché quatre fois dans le même sens (marquer, jamais
 retirer ; ne pas croire un byebye ; ne supprimer qu'après une observation
