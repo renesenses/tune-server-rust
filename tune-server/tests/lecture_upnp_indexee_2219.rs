@@ -298,6 +298,19 @@ async fn une_piste_indexee_se_joue_et_oaat_refuse_toujours() {
          le domaine, puis reçoit le repli SPA) — lu : {flux}"
     );
 
+    // La réponse DIT la dégradation de cette sortie (D4, reste).
+    let avertissements = zone["avertissements"]
+        .as_array()
+        .unwrap_or_else(|| panic!("la zone navigateur doit porter ses avertissements — {corps}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        avertissements.contains("Le DSP de la zone"),
+        "la zone navigateur joue sans DSP : il faut le DIRE — lu : {avertissements}"
+    );
+
     // --- 2. LOCALE et 3. RÉSEAU : la résolution trouve l'adresse distante ---
     let (_statut, corps_local) = jouer(&app, 2, track_id).await;
     let (_statut, corps_reseau) = jouer(&app, 3, track_id).await;
@@ -306,7 +319,41 @@ async fn une_piste_indexee_se_joue_et_oaat_refuse_toujours() {
             !corps.contains("no tracks to play"),
             "sortie {ou} : la demande ne doit plus mourir avant la résolution — {corps}"
         );
+        assert!(
+            !corps.contains("track has no file_path"),
+            "sortie {ou} : la demande ne doit plus chercher un FICHIER — c'est \
+             le défaut exact que la phase 3 ferme : {corps}"
+        );
     }
+
+    // …et chacune dit SA dégradation, pas celle de la voisine.
+    let local: Value = serde_json::from_str(&corps_local).expect("JSON");
+    let dits_local = local["avertissements"].to_string();
+    assert!(
+        dits_local.contains("ReplayGain"),
+        "la sortie locale joue sans ReplayGain : il faut le dire — {dits_local}"
+    );
+    assert!(
+        dits_local.contains("saut dans la piste"),
+        "la sortie locale relance la piste au début sur un saut : il faut le \
+         dire — {dits_local}"
+    );
+    assert!(
+        !dits_local.contains("Le DSP de la zone"),
+        "la sortie locale applique BIEN le DSP : lui prêter le défaut du \
+         réseau serait un mensonge de plus, dans l'autre sens — {dits_local}"
+    );
+
+    let reseau: Value = serde_json::from_str(&corps_reseau).expect("JSON");
+    let dits_reseau = reseau["avertissements"].to_string();
+    assert!(
+        dits_reseau.contains("Le DSP de la zone"),
+        "la sortie réseau joue sans DSP : il faut le dire — {dits_reseau}"
+    );
+    assert!(
+        !dits_reseau.contains("ReplayGain"),
+        "le manque de ReplayGain est un défaut de la sortie LOCALE — {dits_reseau}"
+    );
 
     // --- 4. OAAT : le refus MORD TOUJOURS ---
     //
@@ -324,6 +371,22 @@ async fn une_piste_indexee_se_joue_et_oaat_refuse_toujours() {
             "le motif du refus OAAT doit toujours dire « {attendu} » — corps {corps}"
         );
     }
+
+    // --- 5. CONTRE-ÉPREUVE : une piste LOCALE n'hérite d'aucun avertissement ---
+    //
+    // Sans elle, un champ `avertissements` posé sans condition passerait tous
+    // les contrôles ci-dessus en salissant chaque lecture du produit. Les
+    // dégradations de D4 sont celles d'une piste DISTANTE, et d'elle seule.
+    let locale = tune_core::db::track_repo::TrackRepo::with_backend(etat.backend.clone());
+    let mut piste_locale = tune_core::db::models::Track::new("Une piste à moi".into());
+    piste_locale.file_path = Some("/musique/a-moi.flac".into());
+    let id_local = locale.create(&piste_locale).expect("piste locale");
+    let (_statut, corps_local_pur) = jouer(&app, 2, id_local).await;
+    assert!(
+        !corps_local_pur.contains("avertissements"),
+        "une piste locale ne doit porter AUCUN avertissement de D4 : sinon le \
+         champ ne dit plus rien de particulier — {corps_local_pur}"
+    );
 
     // --- Le journal : l'URL vient bien de l'INSTANTANÉ, pour les quatre zones ---
     let journal = capture.texte();

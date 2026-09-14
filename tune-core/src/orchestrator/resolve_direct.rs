@@ -448,10 +448,28 @@ impl PlaybackOrchestrator {
         // amont n'est PAS déjà du WAV — un serveur qui publie du
         // `audio/wav` (Asset le propose en `.forced.wav`) reste jouable et
         // continue de passer.
-        if source == "upnp" && is_oaat_output && !est_du_wav(mime_type) {
+        //
+        // Le motif n'est plus rédigé ici. Il vient de `verdict_upnp`, la table
+        // unique de D4, que `routes/playback.rs` lit AUSSI pour annoncer les
+        // dégradations des trois sorties jouantes : deux textes écrits
+        // séparément auraient divergé au premier correctif.
+        //
+        // 🔴 Ce motif était écrit à la main, et il était ABÎMÉ : les
+        // continuations de chaîne avaient été perdues à l'écriture, si bien que
+        // le message livré portait des suites de dix-huit espaces en plein
+        // milieu de ses phrases. Personne ne l'a vu — les témoins cherchaient
+        // « OAAT », « WAV », « silence », des mots isolés qu'un texte crevé
+        // contient tout aussi bien. Le témoin exige désormais une PHRASE
+        // entière (`temoins_du_refus_oaat`, et le banc de route), ce qui est le
+        // seul contrôle qui aurait rougi.
+        if source == "upnp"
+            && !crate::orchestrator::verdict_upnp::SortieD4::Oaat.joue_un_flux_compresse()
+            && is_oaat_output
+            && !est_du_wav(mime_type)
+        {
             let titre = req.title.as_deref().unwrap_or("cette piste");
-            return Err(format!(
-                "Lecture refusée : « {titre} » vient d'un serveur multimédia UPnP                  et n'est publiée qu'en {mime_type}, alors qu'un point de sortie                  OAAT ne lit que du PCM en conteneur WAV. Tune ne sait pas encore                  convertir ce flux au fil de l'eau pour OAAT — la piste n'a pas été                  lancée, elle n'aurait produit qu'un silence. Elle joue en revanche                  sur une zone réseau, navigateur ou locale."
+            return Err(crate::orchestrator::verdict_upnp::motif_du_refus_oaat(
+                titre, mime_type,
             ));
         }
         // ------------------------------------------------------------------

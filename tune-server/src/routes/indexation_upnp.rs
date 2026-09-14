@@ -113,6 +113,7 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::models::{Album, Track};
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::orchestrator::verdict_upnp::SortieD4;
 
 use crate::state::AppState;
 
@@ -390,23 +391,27 @@ fn reserves(bilan: &Bilan) -> Vec<String> {
         "aucun rapprochement avec la bibliothèque locale : un album présent \
          des deux côtés apparaît deux fois (D1, marquage en phase 5)"
             .to_string(),
-        // D4, tranchée par Bertrand le 14/09 : jouable partout, défauts
-        // assumés et DITS. Depuis la phase 3, une ligne indexée SE JOUE — la
-        // lecture retrouve son URL dans l'instantané, pas dans `source_id`.
-        // Ce qui reste à dire, ce sont les dégradations par sortie.
-        "sortie réseau (DLNA / OpenHome) : la piste joue, mais le DSP de la \
-         zone ne s'y applique pas — pas un octet ne traverse Tune"
-            .to_string(),
-        "sortie navigateur : la piste joue, sans DSP non plus (relais octet \
-         pour octet)"
-            .to_string(),
-        "sortie locale : la piste joue AVEC le DSP, mais sans ReplayGain, et \
-         un saut dans la piste la relance à 0:00"
-            .to_string(),
-        "sortie OAAT : refusée explicitement, avec son motif — un point de \
-         sortie OAAT ne lit que du PCM en conteneur WAV"
-            .to_string(),
     ];
+    // D4, tranchée par Bertrand le 14/09 : jouable partout, défauts assumés et
+    // DITS. Depuis la phase 3, une ligne indexée SE JOUE — la lecture retrouve
+    // son URL dans l'instantané, pas dans `source_id`. Ce qui reste à dire,
+    // ce sont les dégradations, sortie par sortie.
+    //
+    // Elles ne sont pas recopiées ici : c'est la MÊME table que celle où
+    // l'orchestrateur puise son refus OAAT, et que les routes de lecture
+    // rendent dans leur champ `avertissements`. Trois listes écrites à la main
+    // auraient divergé — ici, corriger une dégradation la fait disparaître des
+    // trois endroits d'un coup.
+    for sortie in [
+        SortieD4::Reseau,
+        SortieD4::Navigateur,
+        SortieD4::Locale,
+        SortieD4::Oaat,
+    ] {
+        for degradation in sortie.degradations() {
+            dites.push(format!("sortie {} — {degradation}", sortie.nom()));
+        }
+    }
     if bilan.sans_taille > 0 {
         dites.push(format!(
             "{} piste(s) sans `res@size` : leur clé d'identité repose sur les \

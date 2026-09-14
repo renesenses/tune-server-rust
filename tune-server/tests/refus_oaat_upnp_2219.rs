@@ -117,25 +117,35 @@ async fn une_piste_upnp_refuse_la_sortie_oaat_en_disant_pourquoi() {
          {statut}, corps {corps})"
     );
 
-    // --- 2. Le motif dit les trois choses qui comptent ---
+    // --- 2. Le motif dit les quatre choses qui comptent ---
+    //
+    // 🔴 Ces contrôles cherchaient des MOTS ISOLÉS — « OAAT », « WAV »,
+    // « silence ». Le motif livré était crevé : les continuations de chaîne
+    // avaient été perdues à l'écriture, et le message portait des suites de
+    // dix-huit espaces au milieu de ses phrases. Il contenait bien les trois
+    // mots, et les trois contrôles passaient. Un texte destiné à être LU se
+    // vérifie par des phrases entières, sinon on ne garde qu'un sac de mots.
+    for phrase in [
+        "un point de sortie OAAT ne lit que du PCM en conteneur WAV",
+        "la piste n'a pas été lancée, elle n'aurait produit qu'un silence",
+        "Elle joue en revanche sur une zone réseau, navigateur ou locale",
+    ] {
+        assert!(
+            corps.contains(phrase),
+            "le motif doit contenir la phrase « {phrase} », mot pour mot et \
+             espace pour espace — corps {corps}"
+        );
+    }
+    // Et le titre de la piste, qui est ce que l'auditeur reconnaît.
     assert!(
-        corps.contains("OAAT"),
-        "le motif doit NOMMER la sortie en cause — corps {corps}"
+        corps.contains("Wonderwall"),
+        "le motif doit nommer la piste refusée — corps {corps}"
     );
+    // Aucune suite d'espaces : un message à trous a déjà été livré une fois.
     assert!(
-        corps.contains("WAV"),
-        "le motif doit dire CE QU'OAAT sait lire, sinon l'auditeur ne peut rien \
-         en faire — corps {corps}"
-    );
-    assert!(
-        corps.contains("silence"),
-        "le motif doit dire ce qui SERAIT arrivé : c'est ce qui distingue un \
-         refus d'une panne — corps {corps}"
-    );
-    assert!(
-        corps.contains("réseau") || corps.contains("navigateur"),
-        "le motif doit dire OÙ la piste joue : un refus sans issue est une \
-         impasse — corps {corps}"
+        !corps.contains("  "),
+        "le motif porte une suite d'espaces — une chaîne dont les \
+         continuations ont été perdues : {corps}"
     );
 }
 
@@ -154,8 +164,13 @@ async fn un_res_deja_en_wav_ne_porte_pas_le_refus_oaat() {
 
     let (_statut, corps) = jouer_une_piste_upnp(&app, URL_WAV).await;
 
+    // La phrase cherchée ici est EXACTEMENT celle que le premier témoin exige
+    // de trouver. Les deux contrôles se tiennent : si le motif changeait de
+    // mots, le premier rougirait, et ce second-ci ne pourrait pas devenir
+    // vacuux sans que l'autre ne le dise. C'est ce qui manquait quand ce test
+    // cherchait une phrase que le motif abîmé ne contenait plus.
     assert!(
-        !corps.contains("ne lit que du PCM en conteneur WAV"),
+        !corps.contains("un point de sortie OAAT ne lit que du PCM en conteneur WAV"),
         "un flux DÉJÀ en WAV ne doit pas tomber sous le refus : le refus \
          garderait alors plus que le défaut qu'il vise — corps {corps}"
     );
