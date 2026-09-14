@@ -1783,8 +1783,10 @@ fn dsf_dff_fallback_complete(
             .cloned()
             .or_else(|| raw_genres.first().map(|s| s.to_string()));
 
-        let compilation_str = tags.get("TCMP").unwrap_or("");
-        let compilation = matches!(compilation_str, "1" | "true" | "True");
+        // Même décodeur que le chemin lofty : voir `lire_drapeau_compilation`.
+        let drapeau_compilation = lire_drapeau_compilation(tags.get("TCMP"));
+        drapeau_compilation.journaliser(path);
+        let compilation = drapeau_compilation.actif();
 
         let mut credits = Vec::new();
         if let Some(composer) = tags.composer() {
@@ -2791,6 +2793,114 @@ pub fn probe_duration_ms(path: &Path) -> Option<u64> {
     (ms > 0).then_some(ms)
 }
 
+/// État du drapeau « compilation » tel que le FICHIER le porte.
+///
+/// [`TrackMetadata::compilation`] est un `bool` et le reste : ce lot **lit**,
+/// il ne change rien en aval — ni `mark_compilation()`, ni le choix de
+/// l'artiste d'un album, ni le regroupement des dossiers. Mais « pas de tag »
+/// et « tag à zéro » ne sont pas la même chose, et le `bool` les confond. La
+/// phase 0 de `docs/chantiers/gestion-du-tag-compilation.md` veut précisément
+/// compter les fichiers concernés : cet état les sépare, le journal les dit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DrapeauCompilation {
+    /// Aucun champ « compilation » dans le fichier — le cas massif.
+    Absent,
+    /// Champ présent, explicitement faux (`0`, `false`, `no`).
+    Faux,
+    /// Champ présent, explicitement vrai (`1`, `true`, `yes`).
+    Vrai,
+    /// Champ présent dans une graphie qu'on ne sait pas lire. Compté comme
+    /// faux — mais dit à voix haute, pour qu'une graphie inconnue se voie au
+    /// lieu de disparaître en silence.
+    Illisible(String),
+}
+
+impl DrapeauCompilation {
+    /// Ce que [`TrackMetadata::compilation`] retient : un `bool`, comme avant.
+    ///
+    /// `Illisible` vaut `false` : une graphie qu'on ne sait pas lire n'est pas
+    /// une affirmation.
+    pub(crate) fn actif(&self) -> bool {
+        matches!(self, DrapeauCompilation::Vrai)
+    }
+
+    /// Écrit dans le journal ce que le `bool` perd.
+    ///
+    /// Les noms d'évènement sont STABLES : la phase 0 du chantier compte
+    /// dessus (`compilation_tag_absent` / `_faux` / `_vrai` / `_illisible`).
+    pub(crate) fn journaliser(&self, path: &Path) {
+        match self {
+            // 23 677 FLAC sur 24 937 n'ont pas le champ (mesure du 14/09/2026,
+            // voir la note de [`lire_drapeau_compilation`]). En `trace!` et pas
+            // en `debug!` : sinon un scan complet écrit une ligne par fichier
+            // de la bibliothèque pour ne rien dire.
+            DrapeauCompilation::Absent => {
+                tracing::trace!(path = %path.display(), "compilation_tag_absent");
+            }
+            DrapeauCompilation::Faux => {
+                tracing::debug!(path = %path.display(), "compilation_tag_faux");
+            }
+            DrapeauCompilation::Vrai => {
+                tracing::debug!(path = %path.display(), "compilation_tag_vrai");
+            }
+            DrapeauCompilation::Illisible(valeur) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    valeur = %valeur,
+                    "compilation_tag_illisible"
+                );
+            }
+        }
+    }
+}
+
+/// Décode la valeur brute du champ « compilation », quel que soit le format.
+///
+/// **Un seul décodeur pour les trois conteneurs.** Le champ était déjà lu
+/// partout avant ce lot — `TCMP` en ID3, `COMPILATION` en VorbisComment,
+/// `cpil` en MP4 — mais par DEUX listes de valeurs recopiées l'une de
+/// l'autre, l'une dans le chemin lofty, l'autre dans le repli DSF/DFF qui
+/// analyse l'ID3 à la main. Elles ne pouvaient que diverger ; il n'y en a
+/// plus qu'une.
+///
+/// Les graphies retenues, **mesurées** le 14/09/2026 sur les deux
+/// bibliothèques de Bertrand (24 937 FLAC, 82 M4A, 140 MP3, 735 DSF) :
+///
+/// - `1` / `0` — les SEULES valeurs réellement rencontrées : les 1 260 FLAC
+///   tagués portent tous `1`, les 10 M4A tagués portent tous `cpil=0`. C'est
+///   aussi la forme sous laquelle lofty rend le booléen BINAIRE de MP4 : il
+///   normalise l'atome `cpil` en texte `"1"` / `"0"` avant qu'on le voie.
+/// - `true` / `false` — `"true"` et `"True"` étaient déjà acceptés avant ce
+///   lot. La comparaison devient insensible à la casse, donc `TRUE` ne tombe
+///   plus en silence par la seule faute d'une majuscule.
+/// - `yes` / `no` — graphie documentée de VorbisComment. **Aucun fichier
+///   mesuré n'en porte** : acceptée par précaution, pas sur une mesure.
+///
+/// Tout le reste vaut `false`, comme avant, mais en `Illisible` : le journal
+/// le dit au lieu de l'avaler.
+///
+/// L'ensemble des valeurs rendues VRAIES est un sur-ensemble strict de
+/// l'ancien `"1" | "true" | "True"` : aucun fichier ne peut basculer de vrai
+/// à faux. Sur les bibliothèques mesurées, le résultat est identique au
+/// précédent pour les 25 000 fichiers.
+pub(crate) fn lire_drapeau_compilation(brut: Option<&str>) -> DrapeauCompilation {
+    let Some(brut) = brut else {
+        return DrapeauCompilation::Absent;
+    };
+    let valeur = brut.trim();
+    // Un champ présent mais vide n'affirme rien de plus qu'un champ absent —
+    // et l'ancien code le voyait déjà ainsi, `unwrap_or("")` confondant les
+    // deux. On ne le compte donc pas comme un « tag à zéro ».
+    if valeur.is_empty() {
+        return DrapeauCompilation::Absent;
+    }
+    match valeur.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "y" => DrapeauCompilation::Vrai,
+        "0" | "false" | "no" | "n" => DrapeauCompilation::Faux,
+        _ => DrapeauCompilation::Illisible(valeur.to_string()),
+    }
+}
+
 pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     let mut metadata = try_read_metadata_unsanitized(path)?;
     let corrections = metadata.sanitize_text_fields();
@@ -2904,8 +3014,14 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
 
     let get = |key: ItemKey| tag.get_string(key).map(|s| s.to_string());
 
-    let compilation_str = get(ItemKey::FlagCompilation).unwrap_or_default();
-    let compilation = matches!(compilation_str.as_str(), "1" | "true" | "True");
+    // `ItemKey::FlagCompilation` couvre DEJA les trois conteneurs : lofty le
+    // fait correspondre a `TCMP` en ID3, `COMPILATION` en VorbisComment
+    // (recherche insensible a la casse, donc `Compilation` aussi) et a
+    // l'atome binaire `cpil` en MP4, qu'il rend en texte `"1"` / `"0"`.
+    let brut_compilation = get(ItemKey::FlagCompilation);
+    let drapeau_compilation = lire_drapeau_compilation(brut_compilation.as_deref());
+    drapeau_compilation.journaliser(path);
+    let compilation = drapeau_compilation.actif();
 
     let bpm = get(ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
 
@@ -5803,6 +5919,187 @@ mod genres_multivalues_i1821 {
                 "Fusion".to_string(),
                 "Latin Jazz".to_string()
             ]
+        );
+    }
+}
+
+/// Lecture du drapeau « compilation » dans les trois conteneurs (#4145).
+///
+/// Ces épreuves VERROUILLENT un comportement qui marchait déjà : le champ
+/// était lu dans les trois formats avant ce lot, et rien ne le testait. Un
+/// saut de version de lofty, ou un remaniement du chemin de lecture, pouvait
+/// l'éteindre sans qu'une seule épreuve rougisse.
+#[cfg(test)]
+mod tests_drapeau_compilation {
+    use super::*;
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem};
+
+    fn fixture(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(rel)
+    }
+
+    /// Recopie une fixture RÉELLE et y grave le champ « compilation » avec un
+    /// vrai graveur de balises. Le fichier reste un conteneur authentique :
+    /// on ne fabrique pas une chaîne d'octets à la main.
+    fn graver(fixture_rel: &str, dest: &Path, valeur: &str) {
+        std::fs::copy(fixture(fixture_rel), dest).unwrap();
+        let mut tagged = lofty::read_from_path(dest).unwrap();
+        if tagged.primary_tag_mut().is_none() {
+            let type_de_balise = tagged.primary_tag_type();
+            tagged.insert_tag(Tag::new(type_de_balise));
+        }
+        let tag = tagged.primary_tag_mut().unwrap();
+        tag.insert(TagItem::new(
+            ItemKey::FlagCompilation,
+            ItemValue::Text(valeur.to_string()),
+        ));
+        tag.save_to_path(dest, WriteOptions::default()).unwrap();
+    }
+
+    /// Le décodeur, valeur par valeur.
+    ///
+    /// C'est ici que vivent les graphies : `1`/`0` (les seules MESURÉES sur
+    /// les 25 000 fichiers de Bertrand), `true`/`false` (déjà acceptées
+    /// avant, désormais insensibles à la casse) et `yes`/`no` (documentées,
+    /// jamais rencontrées, acceptées par précaution).
+    #[test]
+    fn decodeur_graphies() {
+        use DrapeauCompilation::*;
+        // Vrai — dont `TRUE`, que l'ancienne liste `"1" | "true" | "True"`
+        // laissait tomber pour une simple majuscule.
+        for v in ["1", "true", "True", "TRUE", "yes", "Yes", "YES", "y", "Y"] {
+            assert_eq!(lire_drapeau_compilation(Some(v)), Vrai, "valeur {v:?}");
+            assert!(lire_drapeau_compilation(Some(v)).actif(), "valeur {v:?}");
+        }
+        // Faux EXPLICITE — un champ présent qui dit non.
+        for v in ["0", "false", "False", "FALSE", "no", "No", "n", "N"] {
+            assert_eq!(lire_drapeau_compilation(Some(v)), Faux, "valeur {v:?}");
+            assert!(!lire_drapeau_compilation(Some(v)).actif(), "valeur {v:?}");
+        }
+        // Les espaces autour ne changent rien.
+        assert_eq!(lire_drapeau_compilation(Some("  1  ")), Vrai);
+        // Absent, et champ présent mais vide : rien d'affirmé ni dans un sens
+        // ni dans l'autre.
+        assert_eq!(lire_drapeau_compilation(None), Absent);
+        assert_eq!(lire_drapeau_compilation(Some("")), Absent);
+        assert_eq!(lire_drapeau_compilation(Some("   ")), Absent);
+        // Graphie inconnue : comptée comme fausse, mais SIGNALÉE.
+        assert_eq!(
+            lire_drapeau_compilation(Some("peut-être")),
+            Illisible("peut-être".to_string())
+        );
+        assert!(!lire_drapeau_compilation(Some("peut-être")).actif());
+    }
+
+    /// « Tag absent » et « tag à zéro » ne sont pas la même chose.
+    ///
+    /// Les deux rendent `compilation == false` — c'est voulu, ce lot ne change
+    /// rien en aval. Mais la phase 0 du chantier doit pouvoir les COMPTER
+    /// séparément, et le `bool` seul ne le permet pas.
+    #[test]
+    fn absent_et_zero_ne_se_confondent_pas() {
+        let absent = lire_drapeau_compilation(None);
+        let zero = lire_drapeau_compilation(Some("0"));
+        assert!(!absent.actif());
+        assert!(!zero.actif());
+        assert_ne!(absent, zero, "le journal doit pouvoir les séparer");
+    }
+
+    /// Un FLAC RÉEL sans le champ ne devient pas une compilation.
+    #[test]
+    fn flac_reel_sans_champ_rend_faux() {
+        let md = try_read_metadata(&fixture("test.flac")).unwrap();
+        assert!(!md.compilation);
+    }
+
+    /// **La contre-épreuve.** Un FLAC réel portant `COMPILATION=1` rend
+    /// `true` ; le MÊME fichier sans le champ rend `false`.
+    #[test]
+    fn flac_reel_avec_compilation_1_rend_vrai() {
+        let base = tempfile::TempDir::new().unwrap();
+        let p = base.path().join("avec.flac");
+
+        // Témoin négatif : la fixture nue, avant toute gravure.
+        std::fs::copy(fixture("test.flac"), &p).unwrap();
+        assert!(
+            !try_read_metadata(&p).unwrap().compilation,
+            "témoin : sans le champ, ce doit être faux"
+        );
+
+        graver("test.flac", &p, "1");
+        assert!(
+            try_read_metadata(&p).unwrap().compilation,
+            "COMPILATION=1 dans un FLAC doit rendre vrai"
+        );
+    }
+
+    /// Un FLAC réel portant `COMPILATION=0` rend `false` — et le champ est
+    /// bien LU, pas simplement absent.
+    #[test]
+    fn flac_reel_avec_compilation_0_rend_faux_mais_present() {
+        let base = tempfile::TempDir::new().unwrap();
+        let p = base.path().join("zero.flac");
+        graver("test.flac", &p, "0");
+        assert!(!try_read_metadata(&p).unwrap().compilation);
+        assert_eq!(
+            lire_drapeau_compilation(raw_vorbis_comment(&p, "COMPILATION").as_deref()),
+            DrapeauCompilation::Faux,
+            "le champ doit être lu comme un faux EXPLICITE, pas comme un absent"
+        );
+    }
+
+    /// La clé VorbisComment est insensible à la casse — et il FAUT qu'elle le
+    /// soit : sur les 1 260 FLAC tagués de Bertrand, 304 écrivent
+    /// `Compilation` et non `COMPILATION`. Une lecture sensible à la casse en
+    /// perdrait un sur quatre.
+    ///
+    /// La clé est réécrite octet pour octet, à longueur IDENTIQUE, dans un
+    /// fichier gravé par un vrai graveur : le bloc VorbisComment reste valide.
+    #[test]
+    fn flac_reel_cle_en_casse_mixte_rend_vrai() {
+        let base = tempfile::TempDir::new().unwrap();
+        let p = base.path().join("casse.flac");
+        graver("test.flac", &p, "1");
+
+        let mut octets = std::fs::read(&p).unwrap();
+        let avant = b"COMPILATION=";
+        let apres = b"Compilation=";
+        let pos = octets
+            .windows(avant.len())
+            .position(|f| f == avant)
+            .expect("la clé gravée doit être présente");
+        octets[pos..pos + apres.len()].copy_from_slice(apres);
+        std::fs::write(&p, &octets).unwrap();
+
+        assert!(
+            try_read_metadata(&p).unwrap().compilation,
+            "`Compilation=1` doit se lire comme `COMPILATION=1`"
+        );
+    }
+
+    /// MP4/ALAC : l'atome `cpil` est un booléen BINAIRE, pas une chaîne.
+    /// lofty le rend en texte `"1"` / `"0"` — ce test verrouille ce passage,
+    /// qui est le seul endroit où un booléen devient lisible par le décodeur.
+    #[test]
+    fn m4a_reel_cpil_rend_vrai_ou_faux() {
+        let base = tempfile::TempDir::new().unwrap();
+
+        let vrai = base.path().join("vrai.m4a");
+        graver("alac/ref_16_44100_stereo.m4a", &vrai, "1");
+        assert!(
+            try_read_metadata(&vrai).unwrap().compilation,
+            "cpil=1 doit rendre vrai"
+        );
+
+        let faux = base.path().join("faux.m4a");
+        graver("alac/ref_16_44100_stereo.m4a", &faux, "0");
+        assert!(
+            !try_read_metadata(&faux).unwrap().compilation,
+            "cpil=0 doit rendre faux"
         );
     }
 }
