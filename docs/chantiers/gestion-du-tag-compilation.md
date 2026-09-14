@@ -67,14 +67,29 @@ pour mot. À prouver, pas à supposer : `git grep` ne fait pas autorité sur l'a
 
 ## 4. Ce qui revient à Bertrand
 
-**C1 — Qui gagne, du tag ou de la forme des dossiers ?**
+**C1 — Qui gagne, du tag ou de la forme des dossiers ? ✅ TRANCHÉ**
+
+**Bertrand, 14/09/2026 : le tag fait foi, la forme sert de repli.** Le tag est une intention
+explicite de celui qui a étiqueté ; la forme des dossiers n'est qu'une déduction. Quand les
+deux se contredisent, **le tag l'emporte**, et la forme n'intervient que si aucun tag n'existe.
+
+*Question d'origine, pour mémoire :*
 Un fichier peut porter `TCMP=1` dans un rangement classique, et un coffret peut n'avoir aucun
 tag. Trois postures : le tag fait foi et la forme ne sert que de repli ; la forme fait foi ;
 ou l'un **confirme** l'autre et un désaccord se journalise sans trancher.
 *Recommandation : le tag fait foi, la forme en repli — le tag est une intention explicite de
 celui qui a étiqueté, la forme est une déduction.*
 
-**C2 — Que devient l'artiste d'un album de compilation ?**
+**C2 — Que devient l'artiste d'un album de compilation ? ✅ TRANCHÉ**
+
+**Bertrand, 14/09/2026 : l'artiste d'album tagué s'il existe, sinon « Various Artists ».**
+On respecte ce que le fichier déclare dans `ALBUMARTIST`, et on ne retombe sur la convention
+que lorsqu'il est absent.
+
+C'est le choix qui sert le coffret RCA Reiner de #3855 : 63 CD d'un seul chef d'orchestre, où
+« Various Artists » serait une régression par rapport à l'étiquette du fichier.
+
+*Question d'origine, pour mémoire :*
 `Various Artists` en dur, l'artiste d'album tagué s'il existe, ou un champ nul que l'écran
 interprète ? Cela décide de ce que voit l'utilisateur dans la liste des artistes — et de si
 une compilation y crée une entrée parasite.
