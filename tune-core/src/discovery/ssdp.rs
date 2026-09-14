@@ -355,6 +355,24 @@ impl SsdpScanner {
         let state = self.state.lock().await;
         state.devices.len()
     }
+
+    /// La vue FRAÎCHE des serveurs multimédia, telle que le balayage la tient.
+    ///
+    /// `devices()` ne rend que les renderers : les serveurs multimédia vivent
+    /// dans `media_servers`, délibérément hors de `devices` (voir le champ), et
+    /// n'avaient jusqu'ici AUCUN accesseur. Le seul moyen de les lire hors du
+    /// scanner était l'évènement `MediaServerDiscovered` — qui n'est émis qu'à
+    /// la PREMIÈRE découverte (`enregistrer_l_appareil`). Une réannonce
+    /// rafraîchit `last_seen` ici même (`classer_la_reponse`) et ne publie
+    /// rien : quiconque ne s'abonnait qu'à l'évènement détenait un instantané
+    /// gelé à la première découverte, dont l'`Instant` ne bougeait plus jamais.
+    ///
+    /// C'est le défaut mesuré sur le `.18` le 14/09/2026 : quatre serveurs, et
+    /// `first_seen_at == last_seen_at` à la seconde près sur les quatre.
+    pub async fn media_servers(&self) -> Vec<MediaServerInfo> {
+        let state = self.state.lock().await;
+        state.media_servers.values().cloned().collect()
+    }
 }
 
 /// Le recensement periodique du balayage — extrait pour etre mesurable, et

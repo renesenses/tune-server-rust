@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 use crate::smb;
@@ -169,10 +169,23 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
 /// ici, plutôt que dans `discovery_setup`, a une raison mesurée : la couche
 /// SSDP n'émet un évènement qu'à la PREMIÈRE découverte
 /// (`SsdpEvent::MediaServerDiscovered`) — un serveur déjà connu qui se
-/// réannonce voit sa fraîcheur remise à zéro EN PLACE
-/// (`discovery/ssdp.rs:1367-1371`) sans que rien ne soit publié. Un branchement
-/// sur le seul évènement daterait donc chaque serveur de sa première apparition
-/// et jamais de la dernière — c'est-à-dire exactement le défaut qu'on corrige.
+/// réannonce voit sa fraîcheur remise à zéro EN PLACE, dans la carte du
+/// SCANNER, sans que rien ne soit publié. Un branchement sur le seul évènement
+/// daterait donc chaque serveur de sa première apparition et jamais de la
+/// dernière — c'est-à-dire exactement le défaut qu'on corrige.
+///
+/// ⚠️ Ce raisonnement portait juste sur la couche SSDP et lisait la MAUVAISE
+/// carte. `state.media_servers` n'EST PAS la carte du scanner : c'en est une
+/// copie, dont le seul écrivain est ce même évènement
+/// (`discovery_setup.rs`, `media_servers.lock().await.insert(...)`). Elle était
+/// donc gelée à la première découverte, son `Instant` figé pour toujours, et
+/// `horodatage_il_y_a(ms.age())` y rendait `maintenant - (maintenant - t0)`,
+/// soit `t0`, constant. Mesure du 14/09/2026 sur le `.18` : quatre serveurs,
+/// et `first_seen_at == last_seen_at` à la seconde près sur les quatre, à
+/// 56 s d'intervalle entre deux relevés (#4125).
+///
+/// On reprend donc d'abord la fraîcheur de la carte du scanner — celle qui,
+/// elle, est tenue à jour — avant de verser quoi que ce soit en base.
 ///
 /// L'observation est datée `maintenant - âge` : on écrit ce que la découverte
 /// SAIT, jamais « vu à l'instant ». C'est la contre-épreuve de la phase 1 —
@@ -184,6 +197,18 @@ async fn synchroniser_le_registre(state: &AppState) {
     use tune_core::db::media_server_repo::{
         MediaServerRepo, ObservationServeurRecue, horodatage_il_y_a,
     };
+
+    // La carte du scanner est la seule tenue à jour. La reprise n'insère ni ne
+    // retire rien : voir `reprendre_la_fraicheur`, et le rideau de #3688.
+    {
+        let vue_du_balayage = state.scanner.media_servers().await;
+        let mut registre = state.media_servers.lock().await;
+        let reprises = tune_core::discovery::presence_serveur::reprendre_la_fraicheur(
+            &mut registre,
+            vue_du_balayage,
+        );
+        debug!(reprises, "media_server_fraicheur_reprise_du_balayage");
+    }
 
     // Le verrou est relâché AVANT d'écrire en base : une écriture SQLite sous
     // le mutex du registre ferait attendre la découverte SSDP, qui le prend à
@@ -270,7 +295,6 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
-    let en_memoire = state.media_servers.lock().await;
     let items: Vec<Value> = enregistres
         .iter()
         .zip(&ages)
@@ -290,7 +314,32 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 // l'interface grise un serveur qui ne répond plus au lieu de
                 // le faire clignoter en le retirant puis le remettant. Champs
                 // AJOUTÉS — aucun client existant ne casse (#2139).
-                "reachable": en_memoire.get(&s.udn).is_some_and(|ms| ms.is_reachable()),
+                //
+                // Ce que `reachable` MESURE, puisque son nom laissait le doute
+                // (#4125) : « le balayage SSDP l'a revu il y a moins de
+                // `MEDIA_SERVER_STALE_AFTER` (900 s) ». Ce n'est PAS une sonde
+                // HTTP, ce n'est PAS un `Browse` réussi — le registre ne sonde
+                // personne au moment de rendre la liste, et il ne doit pas :
+                // la route serait alors aussi lente que le plus lent des
+                // serveurs du réseau.
+                //
+                // Il se calcule désormais sur le MÊME âge que `presence`, celui
+                // du registre durable. Il lisait jusqu'ici un second `Instant`,
+                // celui de la copie en mémoire : deux horloges pour une seule
+                // question, et l'une d'elles était gelée. Trois serveurs vivants
+                // et qui se réannonçaient correctement portaient `reachable:
+                // false` sur le `.18` le 14/09/2026, quinze minutes après leur
+                // découverte et pour toujours.
+                //
+                // Les deux seuils restent distincts et cette hiérarchie est
+                // voulue : 900 s marque « plus revu depuis un moment » sans
+                // aucune conséquence, 5 400 s (`SERVEUR_ABSENT_APRES`) retire
+                // des propositions. Un serveur peut donc être `reachable:
+                // false` et `proposable: true` — c'est la zone grise, et c'est
+                // exactement ce que le fil 1425 demandait de montrer.
+                "reachable": age.is_some_and(|a| tune_core::discovery::ssdp::media_server_reachable(
+                    Duration::from_secs(a.max(0) as u64)
+                )),
                 "last_seen_secs": age.unwrap_or(0),
                 // #2219 phase 1 — ce que la liste ne savait pas dire.
                 //
@@ -308,7 +357,6 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
-    drop(en_memoire);
 
     let total = items.len();
     let proposables = items
