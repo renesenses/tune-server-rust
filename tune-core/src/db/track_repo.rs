@@ -740,11 +740,13 @@ pub mod sql {
     }
 
     /// Compteur de la VUE pistes : exclut les pistes d'albums masqués, comme
-    /// la liste qu'il pagine (#1391). `count()` reste le compte COMPLET.
+    /// la liste qu'il pagine (#1391), et celles d'un album distant doublé par
+    /// un local (#4146). `count()` reste le compte COMPLET.
     pub fn count_visible() -> String {
         format!(
-            "SELECT COUNT(*) FROM tracks t WHERE {}",
-            crate::db::facet_filter::hidden_tracks_excluded()
+            "SELECT COUNT(*) FROM tracks t WHERE {} AND {}",
+            crate::db::facet_filter::hidden_tracks_excluded(),
+            crate::db::facet_filter::pistes_album_distant_double_exclu()
         )
     }
 
@@ -1582,9 +1584,10 @@ impl TrackRepo {
     /// ENTIER pour la maintenance (export, résolutions internes).
     pub fn list_visible(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
-            "{} WHERE {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
+            "{} WHERE {} AND {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
             sql::select_track(),
             hidden_tracks_excluded(),
+            crate::db::facet_filter::pistes_album_distant_double_exclu(),
             match self.db.engine() {
                 Engine::Sqlite => SqliteDialect.placeholder(1),
                 Engine::Postgres => PostgresDialect.placeholder(1),
@@ -1894,6 +1897,10 @@ impl TrackRepo {
         // dessous partage `where_clause`, donc liste et total ne peuvent pas
         // diverger.
         conditions.push(hidden_tracks_excluded().to_string());
+        // Doublon distant (#4146) : les pistes d'un album `upnp` dont
+        // l'équivalent LOCAL existe sortent de la vue, comme leur album sort
+        // de la grille. Même statut que ci-dessus — socle, pas facette.
+        conditions.push(crate::db::facet_filter::pistes_album_distant_double_exclu());
 
         let where_clause = if conditions.is_empty() {
             String::new()

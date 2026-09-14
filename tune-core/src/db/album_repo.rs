@@ -355,19 +355,22 @@ pub mod sql {
 
     /// Compteur de la GRILLE : même exclusion des albums masqués que
     /// `list_filtered`, sinon le `total` de la pagination ment et la grille
-    /// saute ou duplique des pages (#1391).
+    /// saute ou duplique des pages (#1391). Même exclusion, aussi, des albums
+    /// distants doublés par un local (#4146) — et pour la même raison.
     pub fn count_visible() -> String {
         format!(
-            "SELECT COUNT(*) FROM albums a WHERE {}",
-            crate::db::facet_filter::hidden_albums_excluded()
+            "SELECT COUNT(*) FROM albums a WHERE {} AND {}",
+            crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu("a")
         )
     }
 
     pub fn list_recent<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} ORDER BY a.id DESC LIMIT {}",
+            "{} WHERE {} AND {} ORDER BY a.id DESC LIMIT {}",
             select_album(),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu("a"),
             d.placeholder(1)
         )
     }
@@ -2014,6 +2017,10 @@ impl AlbumRepo {
         if !include_hidden {
             wheres.push(crate::db::facet_filter::hidden_albums_excluded().to_string());
         }
+        // #4146 : le doublon distant sort de la tranche comme il sort de la
+        // grille. `include_hidden` ne le rouvre PAS — c'est le drapeau des
+        // albums masqués à la main (#1391), pas celui des doublons.
+        wheres.push(crate::db::facet_filter::album_distant_double_exclu("a"));
         let sql = format!(
             "SELECT COUNT(*) FROM albums a {} WHERE {}",
             Self::dr_album_join(engine),
@@ -2293,6 +2300,12 @@ impl AlbumRepo {
         if !include_hidden {
             wheres.push(crate::db::facet_filter::hidden_albums_excluded().to_string());
         }
+        // Doublon distant (#4146) : un album `upnp` dont l'équivalent LOCAL
+        // existe sort de la grille — seul le local est rendu. Il reste en
+        // base, et y revient dès que le local disparaît. Le prédicat passe par
+        // `wheres`, comme celui des masqués, et le compteur `count_visible`
+        // porte le MÊME, sinon la pagination ment.
+        wheres.push(crate::db::facet_filter::album_distant_double_exclu("a"));
         // Tranche de DR (#2144) : les marqueurs se prennent ICI, avant ceux de
         // LIMIT/OFFSET, sinon PostgreSQL décale toutes les valeurs liées (le
         // `?` de SQLite, lui, ignore l'indice et masquerait le défaut — piège
