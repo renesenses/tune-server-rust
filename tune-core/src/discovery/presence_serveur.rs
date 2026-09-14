@@ -100,6 +100,52 @@ pub const PLANCHER_PLAFOND_ABSENCE: usize = 3;
 /// laisse donc courir une seconde fenêtre complète avant d'acter.
 pub const FACTEUR_CONFIRMATION_MASSE: u32 = 2;
 
+/// Reprendre, dans le registre partagé, la fraîcheur et l'identité que le
+/// balayage tient à jour.
+///
+/// # Pourquoi ce geste existe
+///
+/// Il y a DEUX cartes de serveurs multimédia. `ScannerState.media_servers`
+/// (`ssdp.rs`) est tenue à jour : une réannonce y remet `last_seen` à zéro EN
+/// PLACE. `AppState.media_servers` (`tune-server/src/state.rs`) en est une
+/// COPIE, et elle n'a qu'un seul écrivain — l'évènement
+/// `SsdpEvent::MediaServerDiscovered`, émis à la seule PREMIÈRE découverte. La
+/// copie était donc un instantané gelé : son `Instant` ne bougeait plus jamais,
+/// et tout ce qui en dérivait mentait d'un temps qui grandissait tout seul.
+///
+/// # Ce que la fonction NE fait pas, et pourquoi
+///
+/// **Elle n'insère jamais.** `get_mut` est le geste, et il est délibéré : le
+/// rideau de #3688 écarte NOTRE PROPRE serveur multimédia du registre partagé
+/// (`discovery_setup.rs`, `est_notre_propre_serveur_multimedia`) alors que le
+/// balayage, lui, le voit et le garde dans sa carte. Une insertion aveugle
+/// ferait donc revenir Tune dans sa propre liste de serveurs du réseau —
+/// exactement ce que #3688 a retiré.
+///
+/// **Elle ne retire jamais.** L'oubli est un acte à part, il a son évènement
+/// (`MediaServerLost`) et son unique chemin (`retirer_serveur_multimedia`).
+/// Un serveur absent d'un cycle de balayage n'est pas un serveur disparu — la
+/// doctrine de `ssdp.rs` est de MARQUER, pas de retirer.
+///
+/// Rend le nombre d'entrées reprises.
+pub fn reprendre_la_fraicheur(
+    registre: &mut std::collections::HashMap<String, crate::discovery::ssdp::MediaServerInfo>,
+    vue_du_balayage: Vec<crate::discovery::ssdp::MediaServerInfo>,
+) -> usize {
+    let mut reprises = 0usize;
+    for frais in vue_du_balayage {
+        if let Some(place) = registre.get_mut(&frais.id) {
+            // L'identité entière, pas seulement la date : une `LOCATION` qui
+            // change réécrit l'hôte, le port et l'URL de contrôle
+            // (`ssdp.rs`, « ssdp_location_changee_appareil_reenregistre »), et
+            // la copie gardait l'ancienne à vie.
+            *place = frais;
+            reprises += 1;
+        }
+    }
+    reprises
+}
+
 /// Ce que le registre sait d'un serveur, au moment de le qualifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationServeur<'a> {
@@ -498,5 +544,137 @@ mod tests {
         let v = qualifier_le_registre(&[]);
         assert!(v.presences.is_empty());
         assert_eq!(v.bascule_refusee, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // La reprise de fraîcheur — le défaut mesuré sur le `.18` le 14/09/2026.
+    // -----------------------------------------------------------------------
+
+    fn info(
+        udn: &str,
+        nom: &str,
+        host: &str,
+        port: u16,
+    ) -> crate::discovery::ssdp::MediaServerInfo {
+        crate::discovery::ssdp::MediaServerInfo {
+            id: udn.into(),
+            name: nom.into(),
+            manufacturer: "MozAIk Labs".into(),
+            model: "Tune".into(),
+            location: format!("http://{host}:{port}/upnp/description.xml"),
+            content_directory_url: format!("http://{host}:{port}/upnp/cd/control"),
+            host: host.into(),
+            port,
+            last_seen: std::time::Instant::now(),
+            max_age: Duration::from_secs(1800),
+        }
+    }
+
+    /// Le témoin de l'anomalie : la copie partagée reprend la DATE que le
+    /// balayage tient, au lieu de rester gelée à la première découverte.
+    ///
+    /// La preuve ne se joue pas sur un `Instant` reculé — `Instant::checked_sub`
+    /// rend `None` sur une machine fraîchement démarrée, piège documenté plus
+    /// haut. Elle se joue sur l'IDENTITÉ de l'`Instant` : après reprise, la
+    /// date du registre est CELLE du balayage, et non plus celle qu'il avait.
+    #[test]
+    fn la_copie_partagee_reprend_la_date_du_balayage() {
+        let mut registre = std::collections::HashMap::new();
+        let ancienne = info("uuid:2c35bec3", "Tune Server", "192.168.1.42", 8888);
+        let date_gelee = ancienne.last_seen;
+        registre.insert("uuid:2c35bec3".to_string(), ancienne);
+
+        // Le balayage a revu le serveur depuis.
+        std::thread::sleep(Duration::from_millis(20));
+        let frais = info("uuid:2c35bec3", "Tune Server", "192.168.1.42", 8888);
+        let date_fraiche = frais.last_seen;
+        assert!(date_fraiche > date_gelee, "le témoin doit bien avancer");
+
+        assert_eq!(reprendre_la_fraicheur(&mut registre, vec![frais]), 1);
+        assert_eq!(
+            registre["uuid:2c35bec3"].last_seen, date_fraiche,
+            "la copie doit porter la date du balayage, pas la sienne"
+        );
+    }
+
+    /// Le rideau de #3688 : la reprise n'INSÈRE jamais. Notre propre serveur
+    /// multimédia est dans la carte du balayage et volontairement absent du
+    /// registre partagé ; une insertion aveugle le ferait revenir dans la liste
+    /// « Serveurs multimédia » que le testeur voit.
+    #[test]
+    fn la_reprise_n_insere_jamais_et_le_rideau_3688_tient() {
+        let mut registre = std::collections::HashMap::new();
+        registre.insert(
+            "uuid:connu".to_string(),
+            info("uuid:connu", "Tune Server", "192.168.1.42", 8888),
+        );
+
+        let reprises = reprendre_la_fraicheur(
+            &mut registre,
+            vec![
+                info("uuid:connu", "Tune Server", "192.168.1.42", 8888),
+                // Nous-mêmes, que le rideau a écartés du registre partagé.
+                info("uuid:nous-memes", "Tune Server", "192.168.1.18", 8888),
+            ],
+        );
+
+        assert_eq!(reprises, 1, "une seule entrée était connue");
+        assert_eq!(registre.len(), 1, "rien n'a été inséré");
+        assert!(
+            !registre.contains_key("uuid:nous-memes"),
+            "notre propre serveur ne doit pas revenir dans sa propre liste (#3688)"
+        );
+    }
+
+    /// L'identité ENTIÈRE est reprise, pas seulement la date : une `LOCATION`
+    /// qui change réécrit l'hôte, le port et l'URL de contrôle. La copie gelée
+    /// gardait l'ancienne adresse à vie.
+    #[test]
+    fn la_reprise_reecrit_l_identite_entiere_pas_seulement_la_date() {
+        let mut registre = std::collections::HashMap::new();
+        registre.insert(
+            "uuid:asset".to_string(),
+            info(
+                "uuid:asset",
+                "Asset UPnP: ancien-nom",
+                "192.168.1.41",
+                26125,
+            ),
+        );
+
+        reprendre_la_fraicheur(
+            &mut registre,
+            vec![info(
+                "uuid:asset",
+                "Asset UPnP: Mac-Studio-6",
+                "192.168.1.41",
+                26126,
+            )],
+        );
+
+        let repris = &registre["uuid:asset"];
+        assert_eq!(repris.name, "Asset UPnP: Mac-Studio-6");
+        assert_eq!(repris.port, 26126);
+        assert_eq!(
+            repris.location, "http://192.168.1.41:26126/upnp/description.xml",
+            "l'adresse de description suit le déménagement"
+        );
+    }
+
+    /// La reprise ne RETIRE jamais : l'oubli a son évènement
+    /// (`MediaServerLost`) et son unique chemin. Un serveur absent d'un cycle
+    /// de balayage n'est pas un serveur disparu.
+    #[test]
+    fn la_reprise_ne_retire_jamais_ce_que_le_balayage_n_a_pas_vu() {
+        let mut registre = std::collections::HashMap::new();
+        registre.insert(
+            "uuid:silencieux".to_string(),
+            info("uuid:silencieux", "NAS", "192.168.1.50", 8200),
+        );
+        assert_eq!(reprendre_la_fraicheur(&mut registre, Vec::new()), 0);
+        assert!(
+            registre.contains_key("uuid:silencieux"),
+            "marquer, pas retirer — la doctrine de ssdp.rs"
+        );
     }
 }

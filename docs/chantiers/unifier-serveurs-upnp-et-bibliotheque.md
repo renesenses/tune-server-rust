@@ -672,6 +672,28 @@ Trois plafonds à fixer :
 - **en profondeur** : les pistes seules, ou aussi les playlists, radios et
   genres du serveur distant. Le `.42` expose 51 radios et 21 playlists.
 
+**D4 — Une piste distante est-elle jouable, et par quelles sorties ? ✅ TRANCHÉ**
+
+**Arbitrage de Bertrand, 14/09/2026 : jouable PARTOUT, défauts assumés et DITS.**
+
+Chaque zone joue ce qu'elle peut. Là où c'est dégradé, **l'écran le dit** au lieu de faire
+semblant. Là où c'est impossible, la lecture **refuse avec un motif** au lieu de rendre du
+silence.
+
+Ce que cela impose, sortie par sortie, à partir de l'état mesuré :
+
+| sortie | état | ce que la décision exige |
+|---|---|---|
+| réseau | joue, **sans DSP** | dire que le DSP ne s'applique pas |
+| navigateur | joue, **sans DSP** | idem |
+| locale | joue, **avec DSP**, sans ReplayGain, **seek cassé** | dire les deux manques ; ne pas prétendre que le seek marche |
+| OAAT | **silence** | **refuser explicitement**, avec un motif — un silence sans message est le pire des deux |
+
+Le principe qui tranche les cas non listés : **ne jamais faire semblant**. Une piste qui ne
+peut pas jouer sur une zone doit le dire avant d'être lancée, pas après.
+
+L'ancien état, pour mémoire :
+
 **D4 — Une piste distante est-elle jouable, et par quelles sorties ?**
 Aujourd'hui : sortie réseau oui (sans DSP), navigateur oui (sans DSP), locale
 oui (avec DSP, sans ReplayGain, seek cassé), OAAT non (silence). Livrer

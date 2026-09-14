@@ -617,3 +617,9 @@ path = "tests/indexation_upnp_2219.rs"
 [[test]]
 name = "refus_oaat_upnp_2219"
 path = "tests/refus_oaat_upnp_2219.rs"
+# #4125 — la fraîcheur du registre des serveurs multimédia, mesurée sur la
+# ROUTE montée. `autotests = false` en tête de ce manifeste : sans cette cible,
+# le fichier ne serait JAMAIS compilé et la garde serait verte contre rien.
+[[test]]
+name = "registre_serveurs_fraicheur_4125"
+path = "tests/registre_serveurs_fraicheur_4125.rs"
