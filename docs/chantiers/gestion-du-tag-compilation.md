@@ -153,27 +153,62 @@ Selon **C3**, et seulement si C3 dit oui.
 - **Il ne sait pas si le défaut est encore présent.** Les trois signalements portent sur les
   versions 0.9.71, 0.9.130 et 0.9.147. La phase 0 commence par les rejouer sur la version
   courante — deux d'entre eux pourraient déjà être clos.
-## 7. 🔴 Le fait le plus grave, vérifié — le tag n'est lu QU'EN ID3
+## 7. ✅ Phase 0 faite — la section précédente était FAUSSE
 
-`TCMP` est la forme **ID3**, celle des MP3. Les deux autres n'existent nulle part dans le
-code :
+> Cette section affirmait, tableau à l'appui, que le tag n'était lu qu'en ID3 et que « sur une
+> bibliothèque FLAC le tag compilation est ignoré à 100 % ». **C'est faux.** La réserve qui
+> terminait la section — *« l'absence dans `metadata/mod.rs` ne prouve pas l'absence
+> partout »* — était la bonne piste : la lecture vit ailleurs. Mesuré le 14/09/2026, #4145.
 
-| format | champ attendu | trouvé dans `metadata/mod.rs` |
+Le chemin principal est `mod.rs:2907`, qui demande `ItemKey::FlagCompilation` à lofty. Lofty
+fait correspondre cette clé unique aux trois formes du tag :
+
+| format | champ | lu ? |
 |---|---|---|
-| MP3 / ID3 | `TCMP` (alias `TCP`) | **oui**, l. 860 et 1786 |
-| **FLAC, OGG** (VorbisComment) | `COMPILATION` | **NON** |
-| **M4A, ALAC** (MP4) | `cpil` | **NON** |
+| MP3 / ID3 | `TCMP` (alias `TCP`) | **oui** |
+| FLAC, OGG (VorbisComment) | `COMPILATION`, casse indifférente | **oui** |
+| M4A, ALAC (MP4) | atome binaire `cpil` | **oui**, normalisé en `"1"` / `"0"` |
 
-La machinerie Vorbis est pourtant là — `raw_vorbis_comment()` et `read_vorbis_header()`
-(l. 2620-2631) savent lire un champ arbitraire. **Personne ne leur demande `COMPILATION`.**
+La ligne `tags.get("TCMP")` (l. 1786) qui avait servi de base au constat n'est pas ce
+chemin-là : c'est le **repli DSF/DFF**, qui analyse l'ID3 à la main faute de support lofty.
 
-👉 **Conséquence : sur une bibliothèque FLAC — le cas de la plupart des testeurs
-audiophiles — le tag compilation est ignoré à 100 %, quelle que soit la suite du chantier.**
+Sondé sur des fichiers réels du `.18`, branche **non modifiée** :
 
-C'est probablement le **premier** correctif à écrire, et il est court : demander le champ aux
-deux autres formats, comme on le fait déjà pour ID3. Sans lui, les phases 1 à 4 ne
-serviraient que les MP3.
+```
+real_upper.flac (COMPILATION=1) -> compilation=true   lofty_brut=Some("1")
+real_mixed.flac (Compilation=1) -> compilation=true   lofty_brut=Some("1")
+real_cpil0.m4a  (cpil=0)        -> compilation=false  lofty_brut=Some("0")
+real_cpil1.m4a  (cpil=1)        -> compilation=true   lofty_brut=Some("1")
+```
 
-⚠️ À confirmer tout de même en phase 0 : l'absence dans `metadata/mod.rs` ne prouve pas
-l'absence **partout**. Chercher `COMPILATION` et `cpil` dans tout `tune-core/src` avant de
-conclure — une lecture peut vivre dans le décodeur plutôt que dans l'extracteur d'étiquettes.
+Le `Some("0")` est la preuve que l'atome MP4 est **lu**, et non simplement absent.
+
+### Ce que porte réellement la bibliothèque
+
+| format | fichiers | tagués | valeurs rencontrées |
+|---|---:|---:|---|
+| FLAC | 24 937 | **1 260** (5,1 %) | `1`, et rien d'autre |
+| M4A / ALAC | 82 | 10 | `cpil=0` — **aucun** `1` |
+| MP3 | 140 | **0** | — |
+| DSF | 735 | **0** | — |
+| OGG / Opus | 0 | — | — |
+
+Deux enseignements : **aucun encodeur n'écrit `yes` ni `true`** — la liste de valeurs n'avait
+jamais rien raté — et **304 des 1 260 FLAC écrivent `Compilation`** et non `COMPILATION`, un
+sur quatre, qui fonctionnait sans qu'aucune épreuve ne le couvre.
+
+### Ce que #4148 a livré, du coup
+
+Pas une correction de comportement : **il n'y avait pas de défaut à cet endroit**. Ce qui est
+livré est un seul décodeur `lire_drapeau_compilation()` là où deux sites recopiaient la même
+liste, la casse devenue indifférente (`TRUE` ne tombe plus), un journal qui **sépare absent de
+faux** (`compilation_tag_absent` / `_faux` / `_vrai` / `_illisible`), et sept épreuves sur de
+vrais conteneurs — il n'y en avait aucune. L'ensemble des valeurs rendues vraies est un
+sur-ensemble strict de l'ancien : sur les 25 894 fichiers mesurés, pas un ne bascule.
+
+👉 **Le défaut des trois signalements est donc en AVAL de la lecture**, pas dedans : le tag
+arrive jusqu'à `metadata.compilation` et personne ne s'en sert. C'est la phase 1 — brancher
+`mark_compilation()` — qui reste le premier correctif à écrire, et la question ouverte du § 3
+(`mark_compilation()` a-t-il un appelant de production ?) devient la seule qui compte.
+
+⚠️ Non mesurés : WAV et AIFF, 12 fichiers.
