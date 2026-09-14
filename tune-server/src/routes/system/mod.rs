@@ -29,6 +29,8 @@ mod playlist_hub;
 mod plugins;
 mod profile;
 mod remote;
+/// #4144 — l'avancement de la passe ReplayGain, que rien n'exposait.
+mod replaygain;
 // `pub` et non `pub(crate)` : la décision « insertion ou mise à jour »
 // (`verdict_ecriture`) doit être atteignable depuis un test d'intégration, qui
 // est une caisse EXTERNE. Sans cette couture, le garde de #2939 aurait dû
@@ -87,6 +89,10 @@ pub fn router() -> Router<AppState> {
         .route("/scan/status", get(scan::scan_status))
         .route("/scan/cancel", post(scan::scan_cancel))
         .route("/scan/report", get(scan::scan_report))
+        // #4144 — le pendant de `/scan/status` pour la passe ReplayGain.
+        // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
+        // de cette route.
+        .route("/replaygain/progress", get(replaygain::replaygain_progress))
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
         // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit

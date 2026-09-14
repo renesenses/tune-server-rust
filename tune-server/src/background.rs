@@ -2218,6 +2218,11 @@ fn spawn_community_sync(state: &AppState) {
 /// loudness. Throttled and fully separate from the scan (which stays tag-only) so
 /// it never slows indexing. Gated by the `replaygain_analysis_enabled` setting.
 fn spawn_replaygain_analysis(state: &AppState) {
+    // #4144 — branche le bus AVANT de lancer la boucle, sinon les premiers
+    // évènements d'avancement partiraient dans le vide. La passe vit dans
+    // `tune-core` et ne connaît pas l'API : c'est le démarrage du serveur qui
+    // lui dépose le bus, comme il le fait pour l'orchestrateur.
+    tune_core::audio::replaygain::progression::brancher_le_bus(state.event_bus.clone());
     tune_core::audio::replaygain::spawn(state.backend.clone());
 }
 

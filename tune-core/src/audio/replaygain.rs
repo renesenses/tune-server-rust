@@ -14,6 +14,12 @@
 //! ReplayGain tags always win: a track that already has `rg_track_gain` is never
 //! recomputed.
 
+/// Ce que la passe dit d'elle-même pendant qu'elle travaille (#4144).
+///
+/// Déclaré ici plutôt que dans `audio/mod.rs` : l'avancement n'a de sens que
+/// pour cette passe-ci, et rien d'autre ne doit l'écrire.
+pub mod progression;
+
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
@@ -526,6 +532,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 // Passe désactivée en cours de route : la campagne ouverte est
                 // terminée, pas suspendue. La laisser ouverte la ferait
                 // apparaître « en cours » jusqu'au prochain redémarrage.
+                //
+                // #4144 — même raisonnement pour l'écran : `analyze_track_batch`
+                // n'est plus appelé du tout dans cette branche, personne ne
+                // viendrait donc fermer l'avancement, et la carte afficherait
+                // « en cours » sur une passe qu'on vient d'éteindre.
+                progression::au_repos();
                 clore_campagne(
                     &registre,
                     &mut campagne,
@@ -575,6 +587,51 @@ fn clore_campagne(
     }
 }
 
+/// Le prédicat des pistes À ANALYSER, partagé entre le balayage et son compteur
+/// (#4144).
+///
+/// Il était écrit en toutes lettres dans [`analyze_track_batch`], et il y était
+/// seul. Le sortir n'est pas de la cosmétique : la jauge de l'écran Santé a
+/// besoin du DÉNOMINATEUR, et un second texte recopié à la main finirait par
+/// diverger de la sélection — la carte annoncerait alors une progression vers
+/// un total que la passe ne vise pas. Même montage que
+/// [`CANDIDATS_EMPREINTE_WHERE`] et [`CANDIDATS_DR_WHERE`], pour la même
+/// raison.
+///
+/// Un seul paramètre : le seuil de report (#1865).
+///
+/// 🔴 `t.file_path IS NOT NULL` écarte les pistes CUE, À DESSEIN. Voir le
+/// commentaire de [`analyze_track_batch`] : `mesurer_intensite_et_plage` mesure
+/// le fichier ENTIER, et les quinze pistes d'une image recevraient le gain du
+/// disque complet.
+const CANDIDATS_RG_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_track_gain') \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
+                   AND m.value > ?)";
+
+/// Combien de pistes le balayage ReplayGain a encore devant lui (#4144).
+///
+/// Le dénominateur de la jauge, et rien d'autre : la MÊME sélection que
+/// [`analyze_track_batch`], sans `LIMIT`. `0` sur erreur de requête — une base
+/// qui ne répond pas ne doit pas faire tomber la passe, et une jauge sur zéro
+/// se rend comme « total inconnu » plutôt que comme une fausse certitude.
+pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    backend
+        .query_one(
+            &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_RG_WHERE}"),
+            &[&seuil_report as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 /// Analyse up to `TRACK_BATCH` local tracks that have no ReplayGain yet. Returns
 /// how many were processed (0 ⇒ nothing left, caller idles).
 pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
@@ -614,16 +671,10 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // sélectionnerait rien.
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let rows = match backend.query_many(
-        "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
-         WHERE t.file_path IS NOT NULL AND t.file_path != '' \
-           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'rg_analyzed') \
-           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'rg_track_gain') \
-           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
-                 WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
-                   AND m.value > ?) \
-         LIMIT ?",
+        &format!(
+            "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels FROM tracks t \
+             WHERE {CANDIDATS_RG_WHERE} LIMIT ?"
+        ),
         &[
             &seuil_report as &dyn ToSqlValue,
             &(TRACK_BATCH as i64) as &dyn ToSqlValue,
@@ -637,8 +688,14 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     };
     if rows.is_empty() {
         debug!("replaygain_no_pending_tracks");
+        // #4144 — le bord « fini ». Sans lui, la carte resterait sur le dernier
+        // couple annoncé et l'écran dirait « en cours » pour toujours.
+        progression::au_repos();
         return 0;
     }
+    // #4144 — l'ouverture de la campagne, et avec elle le DÉNOMINATEUR. Compté
+    // une seule fois : voir `progression::ouvrir_si_besoin`.
+    progression::ouvrir_si_besoin(|| compter_les_candidats_replaygain(backend));
 
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
@@ -698,6 +755,9 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                 // un lot entièrement introuvable rendrait 0 et endormirait la
                 // passe 15 minutes à chaque paquet de 25 lignes.
                 done += 1;
+                // #4144 — comptée comme traitée pour la MÊME raison : la ligne
+                // ne ressortira pas de la prochaine requête de candidats.
+                progression::avancer();
                 continue;
             }
         };
@@ -719,6 +779,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
             );
             let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
             let _ = repo.set(track_id, "rg_skipped_oversized", "1");
+            // #4144 — le témoin `rg_analyzed` vient d'être posé : la piste sort
+            // des candidats, la jauge doit donc avancer. Ce chemin n'incrémente
+            // volontairement pas `done` (c'est le contrat de la boucle, on n'y
+            // touche pas) ; le compteur d'écran, lui, compte des PISTES sorties
+            // du balayage, pas des mesures réussies.
+            progression::avancer();
             continue;
         }
 
@@ -820,6 +886,7 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
                     &deferral_stamp(now_epoch_secs() as i64),
                 );
                 done += 1;
+                progression::avancer(); // #4144
                 continue;
             }
             Ok(None) => {
@@ -849,6 +916,12 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // handled even when it produced no gain.
         let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
         done += 1;
+        // #4144 — LE point d'avancement nominal. Il est ici, par piste, et non
+        // au retour du lot : un lot de 25 fichiers peut tenir plus d'une heure
+        // (jusqu'à `PER_TRACK_ANALYSIS_TIMEOUT_SECS` chacun), et un compteur
+        // qui ne bougerait qu'entre deux lots serait figé tout ce temps —
+        // c'est-à-dire indiscernable du `IDLE` qu'on corrige.
+        progression::avancer();
 
         tokio::time::sleep(std::time::Duration::from_millis(PER_FILE_PAUSE_MS)).await;
     }

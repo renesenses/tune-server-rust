@@ -22,6 +22,14 @@ const PING_INTERVAL: Duration = Duration::from_secs(15);
 /// `device.updated` en fait partie depuis #2870 : le mDNS re-resout un appareil
 /// a chaque rafraichissement de bail, et parfois a chaque changement d'etat de
 /// l'enceinte. Le client ne fait qu'y recharger sa liste d'appareils.
+///
+/// 🔴 `library.replaygain.progress` n'y est PAS, et ce n'est pas un oubli
+/// (#4144). Son emetteur applique deja la cadence a la source
+/// (`audio::replaygain::progression`), mais il fait passer sous le MEME nom les
+/// deux BORDS — ouverture de campagne et retour au repos — qui, eux, ne sont
+/// pas idempotents : perdre le bord « idle » laisse la carte de l'ecran Sante
+/// sur « en cours » jusqu'au prochain sondage. Un second filet ici ne
+/// retiendrait donc rien d'utile et pourrait manger le seul message qui compte.
 const EVENEMENTS_CADENCES: &[&str] = &[
     "library.scan.progress",
     "library.enrich.progress",
