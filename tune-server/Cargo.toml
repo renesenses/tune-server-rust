@@ -607,6 +607,16 @@ path = "tests/journal_sondage_hqplayer_sans_bruit_4025.rs"
 name = "web_response_contracts"
 path = "tests/web_response_contracts.rs"
 
+# #2219 / chantier `unifier-serveurs-upnp-et-bibliotheque`, phase 2.
+# `autotests = false` en tête de ce manifeste : sans ces deux cibles, les
+# témoins de l'indexation et du refus OAAT ne seraient JAMAIS compilés.
+[[test]]
+name = "indexation_upnp_2219"
+path = "tests/indexation_upnp_2219.rs"
+
+[[test]]
+name = "refus_oaat_upnp_2219"
+path = "tests/refus_oaat_upnp_2219.rs"
 # #4125 — la fraîcheur du registre des serveurs multimédia, mesurée sur la
 # ROUTE montée. `autotests = false` en tête de ce manifeste : sans cette cible,
 # le fichier ne serait JAMAIS compilé et la garde serait verte contre rien.

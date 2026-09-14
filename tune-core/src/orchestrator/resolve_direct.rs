@@ -327,6 +327,36 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("oaat:") || id.starts_with("oaat-group:"));
+        // ------------------------------------------------------------------
+        // D4 — « jouable partout, défauts assumés et DITS » (Bertrand, 14/09).
+        //
+        // OAAT est la SEULE sortie qui ne peut pas jouer une piste de serveur
+        // UPnP, et elle ne peut pas le dire par elle-même : un point de sortie
+        // OAAT « ne consomme que du PCM en conteneur WAV » (voir
+        // `decoder_bandcamp_en_wav`, plus bas). Lui pousser le FLAC ou le MP3
+        // d'un serveur média tel quel produit un SILENCE — pas une erreur, pas
+        // un voyant rouge : une zone qui dit « en lecture » et ne joue rien.
+        //
+        // Les deux autres sources qui passent par ici ont chacune leur bras de
+        // décodage vers OAAT (`is_radio`, `is_bandcamp`) ; ce chemin-ci n'en a
+        // jamais eu. Plutôt que de faire semblant, on refuse AVANT de lancer
+        // quoi que ce soit : `resoudre_la_demande` abaisse le drapeau
+        // « recherche en cours » et remonte ce motif sans qu'un seul octet ne
+        // parte vers le point de sortie.
+        //
+        // Le refus est fermé sur trois conditions, pour ne rien casser de ce
+        // qui marche : la source EST `upnp`, la sortie EST OAAT, et le flux
+        // amont n'est PAS déjà du WAV — un serveur qui publie du
+        // `audio/wav` (Asset le propose en `.forced.wav`) reste jouable et
+        // continue de passer.
+        if source == "upnp" && is_oaat_output && !est_du_wav(mime_type) {
+            let titre = req.title.as_deref().unwrap_or("cette piste");
+            return Err(format!(
+                "Lecture refusée : « {titre} » vient d'un serveur multimédia UPnP                  et n'est publiée qu'en {mime_type}, alors qu'un point de sortie                  OAAT ne lit que du PCM en conteneur WAV. Tune ne sait pas encore                  convertir ce flux au fil de l'eau pour OAAT — la piste n'a pas été                  lancée, elle n'aurait produit qu'un silence. Elle joue en revanche                  sur une zone réseau, navigateur ou locale."
+            ));
+        }
+        // ------------------------------------------------------------------
+
         // Une zone navigateur n'a volontairement aucun `output_device_id` :
         // l'onglet est la sortie et tire lui-même `stream_url`. On doit donc
         // lire son type en base plutôt que déduire « aucune sortie » de
@@ -996,5 +1026,74 @@ fn conteneur_depuis_url(url: &str, mime: &str) -> &'static str {
         "audio/ogg" | "application/ogg" => "ogg",
         "audio/opus" => "opus",
         _ => "mp3",
+    }
+}
+
+/// Ce flux est-il déjà du PCM en conteneur WAV ?
+///
+/// Le seul contenu qu'un point de sortie OAAT sait ouvrir. La liste est celle
+/// des types que le dépôt écrit ou reconnaît déjà pour du WAV
+/// (`conteneur_depuis_url` ci-dessus, `decoder_bandcamp_en_wav`), plus
+/// `audio/vnd.wave`, la forme enregistrée à l'IANA que certains serveurs
+/// publient. La comparaison ignore la casse et les paramètres qui suivent le
+/// point-virgule (`audio/wav; charset=…`), parce qu'un `protocolInfo` DLNA en
+/// porte.
+pub(crate) fn est_du_wav(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave"
+    )
+}
+
+#[cfg(test)]
+mod temoins_du_refus_oaat {
+    use super::est_du_wav;
+
+    /// Ce que le refus laisse passer — sans cette liste, un serveur qui publie
+    /// du WAV (Asset le fait, en `.forced.wav`) serait refusé pour rien.
+    #[test]
+    fn le_wav_reste_jouable_sur_oaat() {
+        for mime in [
+            "audio/wav",
+            "audio/x-wav",
+            "audio/wave",
+            "audio/vnd.wave",
+            "AUDIO/WAV",
+            "audio/wav; charset=binary",
+        ] {
+            assert!(est_du_wav(mime), "{mime} devrait être reconnu comme du WAV");
+        }
+    }
+
+    /// **La contre-épreuve du refus** : ce sont EXACTEMENT ces types que les
+    /// serveurs médias publient en premier `res`, et ceux qu'OAAT ne sait pas
+    /// ouvrir. Si `est_du_wav` devenait laxiste, le silence reviendrait sans
+    /// qu'un seul test ne rougisse ailleurs.
+    #[test]
+    fn tout_le_reste_ne_l_est_pas() {
+        for mime in [
+            "audio/x-flac",
+            "audio/flac",
+            "audio/mpeg",
+            "audio/mp4",
+            "audio/aac",
+            "application/x-dsd",
+            // `audio/L16` est du PCM, mais SANS conteneur : c'est justement le
+            // flux « headerless » sur lequel les renderers s'étranglent
+            // (`res_format_rank`, routes/network.rs). Il ne passe pas.
+            "audio/L16",
+            "",
+        ] {
+            assert!(
+                !est_du_wav(mime),
+                "{mime} ne doit PAS être pris pour du WAV : OAAT n'en tirerait qu'un silence"
+            );
+        }
     }
 }
