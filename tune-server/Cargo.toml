@@ -155,6 +155,18 @@ path = "tests/server_contracts.rs"
 name = "album_lecture_en_double"
 path = "tests/album_lecture_en_double.rs"
 
+# #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
+# local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
+# manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
+# propriétés seraient gardées par rien.
+#
+# Rangée ICI, au MILIEU du manifeste, et non en queue : deux lots qui ajoutent
+# chacun leur cible à la fin du même fichier se conflictent à tous les coups —
+# c'est ce qui est arrivé entre cette cible et celle de #4147.
+[[test]]
+name = "albums_upnp_visibles_4146"
+path = "tests/albums_upnp_visibles_4146.rs"
+
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
@@ -624,10 +636,9 @@ path = "tests/refus_oaat_upnp_2219.rs"
 name = "registre_serveurs_fraicheur_4125"
 path = "tests/registre_serveurs_fraicheur_4125.rs"
 
-# #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
-# local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
-# manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
-# propriétés seraient gardées par rien.
+# #2219 phase 3 — la lecture d'une ligne indexee. Binaire a lui seul : il pose
+# un abonne `tracing` GLOBAL, qui ne capterait rien s'il partageait un binaire
+# avec des tests paralleles.
 [[test]]
-name = "albums_upnp_visibles_4146"
-path = "tests/albums_upnp_visibles_4146.rs"
+name = "lecture_upnp_indexee_2219"
+path = "tests/lecture_upnp_indexee_2219.rs"

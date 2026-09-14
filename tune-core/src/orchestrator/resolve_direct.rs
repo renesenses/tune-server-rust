@@ -272,14 +272,113 @@ impl PlaybackOrchestrator {
         })
     }
 
+    /// L'URL de lecture rangée par l'indexation dans l'instantané de la piste.
+    ///
+    /// Une seule clé, une seule ligne : `track_metadata(track_id, key)` est la
+    /// clé primaire de la table, donc un seul saut d'index. Rend `None` si la
+    /// piste n'a pas été indexée, si l'instantané est incomplet, ou si la base
+    /// est illisible — trois cas que l'appelant traite de la même façon : il le
+    /// DIT plutôt que de lancer quelque chose au hasard.
+    pub(super) fn url_de_lecture_indexee(&self, track_id: i64) -> Option<String> {
+        use crate::db::backend::ToSqlValue;
+        self.db
+            .query_one(
+                "SELECT value FROM track_metadata WHERE track_id = ? AND key = ?",
+                &[
+                    &track_id as &dyn ToSqlValue,
+                    &CLE_URL_DE_LECTURE_UPNP as &dyn ToSqlValue,
+                ],
+            )
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))
+            .filter(|u| est_une_url_http(u))
+    }
+
     pub(super) async fn resolve_direct_url(
         &self,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
-        let raw_url = req
+        self.resolve_direct_url_de_source(req, None).await
+    }
+
+    /// Comme [`Self::resolve_direct_url`], mais la source peut être IMPOSÉE par
+    /// l'appelant.
+    ///
+    /// `PlayRequest.source` vient du corps de la demande, et le bouton Lecture
+    /// n'en envoie pas : une piste indexée depuis un serveur UPnP arrive avec
+    /// `source = None`. `resolve_stream` lit alors la source sur la LIGNE et la
+    /// passe ici, faute de quoi le repli `"podcast"` ci-dessous s'appliquerait
+    /// et aucune des branches `upnp` — ni le refus OAAT — ne verrait le jour.
+    pub(super) async fn resolve_direct_url_de_source(
+        &self,
+        req: &PlayRequest,
+        source_de_la_ligne: Option<&str>,
+    ) -> Result<ResolvedStream, String> {
+        // **Où la lecture trouve l'URL d'une piste indexée.**
+        //
+        // `tracks.source_id` porte l'IDENTITÉ d'une piste distante depuis la
+        // phase 2 — un condensat `<udn>|<hex>` —, parce que ni l'`ObjectID` ni
+        // l'URL de `res` ne sont stables (les deux portent l'identifiant du
+        // conteneur parent ; mesuré sur Asset le 14/09). L'URL de lecture vit
+        // donc dans l'instantané d'affichage, `track_metadata.upnp_res_url`,
+        // exactement comme `streaming_item_tags` range ce qu'il faut pour
+        // afficher sans interroger le service.
+        //
+        // L'ordre ci-dessous n'est pas indifférent :
+        //
+        // 1. une URL http(s) NOMMÉE dans la demande gagne toujours. C'est le
+        //    chemin du renderer (`upnp_media_renderer.rs`), qui reçoit un
+        //    `SetAVTransportURI` et n'a pas de ligne en base : le contredire
+        //    casserait un chemin éprouvé ;
+        // 2. sinon, l'instantané de la ligne ;
+        // 3. sinon, `source_id` tel quel — le contrat inchangé de `radio`,
+        //    `podcast` et `bandcamp`, dont le `source_id` EST l'URL.
+        let source_apparente = source_de_la_ligne
+            .map(str::to_string)
+            .or_else(|| req.source.clone())
+            .unwrap_or_else(|| "podcast".into());
+        let url_nommee = req
             .source_id
             .as_deref()
+            .filter(|u| est_une_url_http(u))
+            .map(str::to_string);
+        let url_indexee = if url_nommee.is_none() && source_apparente == "upnp" {
+            req.track_id.and_then(|id| self.url_de_lecture_indexee(id))
+        } else {
+            None
+        };
+        let depuis_l_instantane = url_indexee.is_some();
+        let url_retenue = url_nommee.or(url_indexee);
+        let raw_url = url_retenue
+            .as_deref()
+            .or(req.source_id.as_deref())
             .ok_or("source_id (audio URL) required for podcast/radio playback")?;
+        // Une piste indexée dont l'instantané ne porte aucune URL jouable ne
+        // doit pas partir « au cas où » : `source_id` est alors le condensat
+        // d'identité, et le pousser à une sortie produirait une erreur de
+        // décodage illisible, ou pire, un silence. On le dit.
+        if source_apparente == "upnp" && !est_une_url_http(raw_url) {
+            return Err(format!(
+                "Lecture impossible : « {} » est indexée depuis un serveur \
+                 multimédia, mais aucune URL de lecture n'est enregistrée pour \
+                 elle. Relancer l'indexation de ce serveur \
+                 (POST /network/media-servers/<id>/indexer) la rétablira.",
+                req.title.as_deref().unwrap_or("cette piste")
+            ));
+        }
+        // Au niveau INFO, donc visible avec le `log_level` ordinaire : c'est la
+        // ligne qui dit, pour une piste indexée, D'OÙ vient l'adresse jouée.
+        // Posée en `debug!` elle n'aurait fait que changer de silence, et le
+        // témoin de la phase 3 n'aurait rien à lire.
+        if depuis_l_instantane {
+            info!(
+                track_id = ?req.track_id,
+                zone_id = req.zone_id,
+                url = %raw_url,
+                "upnp_url_de_lecture_lue_dans_l_instantane"
+            );
+        }
         // A station is often published as an .m3u/.pls PLAYLIST file rather than a
         // direct stream. Dereference it to the real stream first, otherwise the
         // decoder is fed the playlist text and no sound plays (Pascal). Cheap for
@@ -292,7 +391,7 @@ impl PlaybackOrchestrator {
         let album = req.album_title.clone();
         let cover_url = req.cover_url.clone();
         let duration_ms = req.duration_ms;
-        let source = req.source.clone().unwrap_or_else(|| "podcast".into());
+        let source = source_apparente;
         // La qualité Bandcamp est LUE DANS L'URL, jamais déduite du nom du
         // service. L'écoute libre est du `mp3-128` ; un fichier ACHETÉ entre
         // par la même porte en `flac`, `alac` ou `mp3-320`, et l'étiqueter
@@ -349,10 +448,28 @@ impl PlaybackOrchestrator {
         // amont n'est PAS déjà du WAV — un serveur qui publie du
         // `audio/wav` (Asset le propose en `.forced.wav`) reste jouable et
         // continue de passer.
-        if source == "upnp" && is_oaat_output && !est_du_wav(mime_type) {
+        //
+        // Le motif n'est plus rédigé ici. Il vient de `verdict_upnp`, la table
+        // unique de D4, que `routes/playback.rs` lit AUSSI pour annoncer les
+        // dégradations des trois sorties jouantes : deux textes écrits
+        // séparément auraient divergé au premier correctif.
+        //
+        // 🔴 Ce motif était écrit à la main, et il était ABÎMÉ : les
+        // continuations de chaîne avaient été perdues à l'écriture, si bien que
+        // le message livré portait des suites de dix-huit espaces en plein
+        // milieu de ses phrases. Personne ne l'a vu — les témoins cherchaient
+        // « OAAT », « WAV », « silence », des mots isolés qu'un texte crevé
+        // contient tout aussi bien. Le témoin exige désormais une PHRASE
+        // entière (`temoins_du_refus_oaat`, et le banc de route), ce qui est le
+        // seul contrôle qui aurait rougi.
+        if source == "upnp"
+            && !crate::orchestrator::verdict_upnp::SortieD4::Oaat.joue_un_flux_compresse()
+            && is_oaat_output
+            && !est_du_wav(mime_type)
+        {
             let titre = req.title.as_deref().unwrap_or("cette piste");
-            return Err(format!(
-                "Lecture refusée : « {titre} » vient d'un serveur multimédia UPnP                  et n'est publiée qu'en {mime_type}, alors qu'un point de sortie                  OAAT ne lit que du PCM en conteneur WAV. Tune ne sait pas encore                  convertir ce flux au fil de l'eau pour OAAT — la piste n'a pas été                  lancée, elle n'aurait produit qu'un silence. Elle joue en revanche                  sur une zone réseau, navigateur ou locale."
+            return Err(crate::orchestrator::verdict_upnp::motif_du_refus_oaat(
+                titre, mime_type,
             ));
         }
         // ------------------------------------------------------------------
@@ -1095,5 +1212,73 @@ mod temoins_du_refus_oaat {
                 "{mime} ne doit PAS être pris pour du WAV : OAAT n'en tirerait qu'un silence"
             );
         }
+    }
+}
+
+/// La clé sous laquelle l'indexation range l'URL de lecture d'une piste
+/// distante (`routes/indexation_upnp.rs`, phase 2).
+///
+/// Elle est répétée ici et pas importée : `tune-core` ne dépend pas de
+/// `tune-server`, et c'est dans ce sens que va la dépendance. Le témoin
+/// `la_lecture_et_l_indexation_parlent_de_la_meme_cle` exige que les deux
+/// littéraux restent égaux — une divergence rendrait toute piste indexée
+/// injouable, en silence.
+pub(crate) const CLE_URL_DE_LECTURE_UPNP: &str = "upnp_res_url";
+
+/// Cette chaîne est-elle une URL qu'on peut aller chercher en HTTP ?
+///
+/// Le seul test qui sépare une URL de lecture du CONDENSAT D'IDENTITÉ que
+/// `tracks.source_id` porte depuis la phase 2 (`uuid:…|9f3c…`). Sans lui, le
+/// condensat partirait à la sortie comme s'il était une adresse.
+pub(crate) fn est_une_url_http(valeur: &str) -> bool {
+    let v = valeur.trim();
+    (v.starts_with("http://") || v.starts_with("https://")) && v.len() > "https://".len()
+}
+
+#[cfg(test)]
+mod temoins_de_l_url_indexee {
+    use super::{CLE_URL_DE_LECTURE_UPNP, est_une_url_http};
+
+    /// Le condensat d'identité ne doit JAMAIS être pris pour une adresse.
+    #[test]
+    fn un_condensat_d_identite_n_est_pas_une_url() {
+        for valeur in [
+            "uuid:258FC2D5-E2C3-B734-0-123456789abc|85944171f73967e8",
+            "track/21825",
+            "",
+            "   ",
+            "https://",
+            "d6120941636376083059-co4E8D6A18CD1AC698",
+        ] {
+            assert!(
+                !est_une_url_http(valeur),
+                "« {valeur} » ne doit pas passer pour une URL de lecture"
+            );
+        }
+    }
+
+    /// …et une vraie URL de `res` doit passer, http comme https.
+    #[test]
+    fn une_url_de_res_passe() {
+        for valeur in [
+            "http://192.168.1.41:26125/content/c2/b16/f44100/d61-coX.flac",
+            "https://192.168.1.42:8888/api/v1/library/tracks/21825/audio",
+            "  http://192.168.1.18:8888/x.wav  ",
+        ] {
+            assert!(est_une_url_http(valeur), "« {valeur} » devrait passer");
+        }
+    }
+
+    /// La clé de l'instantané est un contrat entre DEUX caisses : l'indexation
+    /// l'écrit dans `tune-server`, la lecture la relit dans `tune-core`. Si
+    /// l'une des deux change de nom, plus aucune piste indexée ne joue — et
+    /// rien d'autre ne rougirait.
+    #[test]
+    fn la_lecture_et_l_indexation_parlent_de_la_meme_cle() {
+        assert_eq!(
+            CLE_URL_DE_LECTURE_UPNP, "upnp_res_url",
+            "la clé lue par la lecture a changé : verifier \
+             `routes/indexation_upnp.rs::CLE_URL_DE_LECTURE`"
+        );
     }
 }

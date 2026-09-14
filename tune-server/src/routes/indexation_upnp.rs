@@ -93,10 +93,12 @@
 //!
 //! L'URL de lecture n'est pas dans `source_id` **parce que `source_id` porte
 //! l'identité**. C'est un écart assumé avec le chemin `radio`/`podcast`, où
-//! l'orchestrateur lit l'URL directement dans `source_id`
-//! (`orchestrator/resolve_direct.rs`) — et c'est pourquoi la lecture d'une
-//! ligne indexée reste la **phase 3**. Ce lot ne prétend pas le contraire : il
-//! le DIT, dans la réponse de la route.
+//! `source_id` EST l'URL. Depuis la **phase 3**, l'orchestrateur le sait :
+//! `resolve_direct_url_de_source` (`orchestrator/resolve_direct.rs`) lit
+//! [`CLE_URL_DE_LECTURE`] dans l'instantané quand la demande ne nomme aucune
+//! URL. Les deux littéraux — celui écrit ici, celui relu là-bas — sont chacun
+//! gardés par un témoin : s'ils divergeaient, plus aucune piste indexée ne
+//! jouerait, et rien d'autre ne rougirait.
 
 use std::collections::{HashMap, HashSet};
 
@@ -111,6 +113,7 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::models::{Album, Track};
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::orchestrator::verdict_upnp::SortieD4;
 
 use crate::state::AppState;
 
@@ -388,10 +391,33 @@ fn reserves(bilan: &Bilan) -> Vec<String> {
         "aucun rapprochement avec la bibliothèque locale : un album présent \
          des deux côtés apparaît deux fois (D1, marquage en phase 5)"
             .to_string(),
-        "la LECTURE d'une piste indexée est la phase 3 : l'orchestrateur lit \
-         encore l'URL dans `source_id`, où vit désormais l'identité"
-            .to_string(),
     ];
+    // D4, tranchée par Bertrand le 14/09 : jouable partout, défauts assumés et
+    // DITS. Depuis la phase 3, une ligne indexée SE JOUE — la lecture retrouve
+    // son URL dans l'instantané, pas dans `source_id`. Ce qui reste à dire,
+    // ce sont les dégradations, sortie par sortie.
+    //
+    // Elles ne sont pas recopiées ici : c'est la MÊME table que celle où
+    // l'orchestrateur puise son refus OAAT, et que les routes de lecture
+    // rendent dans leur champ `avertissements`. Trois listes écrites à la main
+    // auraient divergé — ici, corriger une dégradation la fait disparaître des
+    // trois endroits d'un coup.
+    for sortie in [
+        SortieD4::Reseau,
+        SortieD4::Navigateur,
+        SortieD4::Locale,
+        SortieD4::Oaat,
+    ] {
+        for degradation in sortie.degradations() {
+            dites.push(format!("sortie {} — {degradation}", sortie.nom()));
+        }
+        // Le refus n'est pas une dégradation de la lecture : c'est son absence.
+        // Il porte sa condition — un flux déjà en WAV passe —, sans quoi la
+        // réserve dirait « refusée » d'une sortie qui joue parfois.
+        if let Some(condition) = sortie.refus_sauf_wav() {
+            dites.push(format!("sortie {} — {condition}", sortie.nom()));
+        }
+    }
     if bilan.sans_taille > 0 {
         dites.push(format!(
             "{} piste(s) sans `res@size` : leur clé d'identité repose sur les \
