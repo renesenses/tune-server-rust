@@ -629,37 +629,31 @@ Trois postures possibles :
 
 Recommandation : **(b)**, en phase 3, et (c) jamais automatiquement.
 
-**D1bis — Le badge d'une piste distante porte le SERVEUR, pas « local ». ✅ TRANCHÉ**
+**D1bis — Le badge d'une piste distante dit « UPNP ». ✅ TRANCHÉ**
 
-**Arbitrage de Bertrand, 14/09/2026** : pour une source UPnP, le badge ne doit pas dire
-« local » mais **le nom du serveur UPnP, ou son adresse IP à défaut**.
+**Arbitrage de Bertrand, 14/09/2026** : une piste venue d'un serveur UPnP porte le badge
+**`UPNP`**, comme `QOBUZ` ou `BANDCAMP` portent le leur. Pas « local », et pas un badge
+par serveur.
+
+C'est une entrée de plus dans la table de `ServiceBadge.svelte`, rien d'autre :
+
+```ts
+upnp: { name: 'UPNP', bg: '…', color: '#ffffff' },
+```
 
 État mesuré du code au moment de la décision (v0.9.149) :
 
-* `tune-web-client/src/components/ServiceBadge.svelte` est une **table fixe** de huit entrées
-  (`tidal`, `qobuz`, `deezer`, `spotify`, `youtube`, `amazon`, `bandcamp`, `local`). Une
-  source absente de la table rend **`null`**, donc **aucun badge** — pas un badge erroné ;
-* le « LOCAL » visible aujourd'hui vient des appelants qui forcent le défaut, par exemple
-  `source={(t as any).source ?? 'local'}` dans `FavoritesView.svelte:886` et `:930` ;
-* une piste `source = 'upnp'` n'afficherait donc **rien**, ce qui est un défaut distinct et
-  plus discret que celui qu'on corrige.
+* `ServiceBadge.svelte` est une table fixe de huit entrées. Une source absente de la table
+  rend `null`, donc **aucun badge** — une piste `source = 'upnp'` n'afficherait rien
+  aujourd'hui, ce qui est un défaut discret ;
+* le « LOCAL » visible vient des appelants qui forcent le défaut :
+  `source={(t as any).source ?? 'local'}` dans `FavoritesView.svelte:886` et `:930`.
+  **Ces replis doivent cesser** — sinon une piste distante réapparaîtra en « LOCAL »,
+  c'est-à-dire en mensonge.
 
-Ce que la décision implique, et qui n'est pas qu'un changement de client :
-
-1. **le serveur doit publier le nom du serveur d'origine** avec la piste. Le plan range
-   `source_id = '<udn>|<objectid>'` : l'UDN est un identifiant opaque, illisible pour un
-   humain. Il faut donc joindre le **nom convivial** (`friendlyName` du descripteur UPnP),
-   et le tenir à jour dans le registre `media_servers` de la phase 1 ;
-2. **le badge devient dynamique** : une table fixe de huit services ne peut pas porter un
-   nombre inconnu de serveurs. `ServiceBadge` doit accepter un libellé et une couleur
-   calculés, pas seulement une clé ;
-3. **le repli sur l'IP doit être explicite.** Un serveur qui n'annonce pas de `friendlyName`,
-   ou qu'on n'a jamais interrogé, doit montrer son adresse plutôt que « inconnu » — c'est
-   l'information qui permet à l'utilisateur de reconnaître sa propre machine ;
-4. **les appelants qui forcent `?? 'local'` doivent cesser.** Sinon une piste distante dont
-   le serveur est momentanément inconnu réapparaîtra en « LOCAL », c'est-à-dire en mensonge.
-
-Cette décision précède la phase 2 : elle dit ce que l'indexation doit rendre disponible.
+Le **nom du serveur d'origine** reste utile pour distinguer deux pistes identiques venues de
+deux machines, mais il n'a pas sa place dans le badge : il ira dans l'infobulle ou dans le
+détail de la piste, à trancher au moment de l'écran.
 
 **D2 — Que faire quand un serveur disparaît ?**
 Le dépôt a déjà tranché quatre fois dans le même sens (marquer, jamais
