@@ -53,6 +53,14 @@ pub fn router() -> Router<AppState> {
         .route("/smb/mounts", get(list_smb_mounts))
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
+        // Phase 2 du chantier `unifier-serveurs-upnp-et-bibliotheque` :
+        // indexer UNE source, choisie à la main. Voir
+        // `routes/indexation_upnp.rs` pour la clé d'identité retenue et la
+        // mesure qui a écarté l'`ObjectID`.
+        .route(
+            "/media-servers/{id}/indexer",
+            post(crate::routes::indexation_upnp::indexer_une_source),
+        )
         .route("/media-servers/{id}/search", get(search_media_server))
         .route(
             "/media-servers/{id}/item/{item_id}/stream-url",
@@ -1089,13 +1097,42 @@ async fn browse_media_server(
     };
     drop(servers);
 
-    // UPnP Browse returns results in PAGES. The old code issued a single
-    // Browse with RequestedCount=200 and returned only that page, so a server
-    // with thousands of albums showed just its first page (~100 on MinimServer /
-    // Twonky / Asset, which cap a single response) — "le résumé est juste mais la
-    // liste est très incomplète (~100 sur x xxx)" (Pierre M). Loop over
-    // StartingIndex, accumulating children until NumberReturned==0 or
-    // StartingIndex>=TotalMatches, with a safety bound.
+    let (containers, items, total_matches) =
+        parcourir_les_enfants(&ms.content_directory_url, &ms.name, object_id).await;
+
+    let fetched = containers.len() + items.len();
+    let total = (total_matches as usize).max(fetched);
+
+    Json(json!({
+        "object_id": object_id,
+        "containers": containers,
+        "items": items,
+        "total_matches": total,
+        "number_returned": fetched,
+    }))
+}
+
+/// Parcourt TOUTES les pages d'un conteneur d'un serveur ContentDirectory.
+///
+/// Extrait tel quel du corps de [`browse_media_server`], qui l'appelle
+/// toujours — l'indexation de la phase 2 du chantier
+/// `unifier-serveurs-upnp-et-bibliotheque` a besoin du MEME parcours, page par
+/// page, et le recopier aurait fait diverger deux lecteurs du même protocole.
+///
+/// Rend `(conteneurs, items, total_matches)`. Un `total_matches` de 0 avec des
+/// items rendus signifie seulement que le serveur ne l'annonce pas.
+// UPnP Browse returns results in PAGES. The old code issued a single
+// Browse with RequestedCount=200 and returned only that page, so a server
+// with thousands of albums showed just its first page (~100 on MinimServer /
+// Twonky / Asset, which cap a single response) — "le résumé est juste mais la
+// liste est très incomplète (~100 sur x xxx)" (Pierre M). Loop over
+// StartingIndex, accumulating children until NumberReturned==0 or
+// StartingIndex>=TotalMatches, with a safety bound.
+pub(crate) async fn parcourir_les_enfants(
+    content_directory_url: &str,
+    nom_du_serveur: &str,
+    object_id: &str,
+) -> (Vec<Value>, Vec<Value>, u32) {
     const PAGE_SIZE: u32 = 200;
     const MAX_PAGES: u32 = 500; // up to 100k children
     // Client partagé (voir `tune_core::http::client`). Le délai d'attente de
@@ -1126,7 +1163,7 @@ async fn browse_media_server(
         );
 
         let resp = match client
-            .post(&ms.content_directory_url)
+            .post(content_directory_url)
             .header("Content-Type", "text/xml; charset=utf-8")
             .header(
                 "SOAPAction",
@@ -1140,8 +1177,8 @@ async fn browse_media_server(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
-                    "browse_media_server soap_error server={} start={starting_index} err={e}",
-                    ms.name
+                    "browse_media_server soap_error server={nom_du_serveur} \
+                     start={starting_index} err={e}"
                 );
                 break;
             }
@@ -1175,16 +1212,7 @@ async fn browse_media_server(
         }
     }
 
-    let fetched = containers.len() + items.len();
-    let total = (total_matches as usize).max(fetched);
-
-    Json(json!({
-        "object_id": object_id,
-        "containers": containers,
-        "items": items,
-        "total_matches": total,
-        "number_returned": fetched,
-    }))
+    (containers, items, total_matches)
 }
 
 #[derive(serde::Deserialize)]
@@ -1514,6 +1542,9 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     let bit_depth = best.and_then(|r| r.bit_depth);
                     let channels = best.and_then(|r| r.channels);
                     let protocol_info = best.and_then(|r| r.protocol_info.clone());
+                    // `res@size` : jamais rendu jusqu'ici. L'indexation de la
+                    // phase 2 en fait une composante de la clé d'identité.
+                    let size = best.and_then(|r| r.size);
                     items.push(json!({
                         "id": id,
                         "title": title,
@@ -1526,6 +1557,7 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "bit_depth": bit_depth,
                         "channels": channels,
                         "protocol_info": protocol_info,
+                        "size": size,
                     }));
                 }
 
@@ -1547,6 +1579,14 @@ struct DidlRes {
     sample_rate: Option<u32>,
     bit_depth: Option<u16>,
     channels: Option<u16>,
+    /// `res@size` — la taille du fichier amont, en octets.
+    ///
+    /// Le DIDL la publie depuis toujours (mesuré le 14/09 sur Asset UPnP comme
+    /// sur un Tune : `size="31911291"`), et le parseur la jetait. Elle entre
+    /// ici parce qu'elle est le seul discriminant **stable** qui reste quand
+    /// l'`ObjectID` ne l'est pas — voir `cle_d_identite` dans
+    /// `routes/indexation_upnp.rs`.
+    size: Option<u64>,
 }
 
 /// Parse every `<res …>url</res>` of a DIDL item, in document order.
@@ -1582,6 +1622,7 @@ fn parse_res_elements(element: &str) -> Vec<DidlRes> {
                     .and_then(|s| s.parse::<u16>().ok()),
                 channels: extract_attr(res_tag, "nrAudioChannels")
                     .and_then(|s| s.parse::<u16>().ok()),
+                size: extract_attr(res_tag, "size").and_then(|s| s.parse::<u64>().ok()),
             });
         }
         pos = tag_end + close_rel + "</res>".len();
