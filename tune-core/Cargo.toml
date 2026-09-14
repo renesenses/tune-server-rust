@@ -188,6 +188,19 @@ path = "tests/journal_insertion_par_lot.rs"
 name = "niveaux_sortie_pull_3807"
 path = "tests/niveaux_sortie_pull_3807.rs"
 
+# #4144 — l'ecran Sante affichait `IDLE` pendant des heures de ReplayGain parce
+# que la passe ne publiait aucun compteur. Le temoin tient les deux bords : le
+# compteur avance, et l'annonce reste a cadence espacee. Binaire A LUI SEUL :
+# l'avancement est un etat de PROCESSUS (comme le compteur d'ecretage), un
+# voisin qui ferait tourner la passe dans le meme binaire le rendrait
+# intermittent. `autotests = false` en tete de ce manifeste : sans cette cible,
+# le fichier ne serait JAMAIS compile et la porte rendrait un vert contre rien.
+# Declaree ici, au MILIEU du manifeste, et non en queue ou tous les lots
+# ajoutent la leur.
+[[test]]
+name = "replaygain_progression_4144"
+path = "tests/replaygain_progression_4144.rs"
+
 # #2373 T2 — la reconciliation du catalogue en ligne, exercee A BLANC, n'ecrit
 # rien. `autotests = false` en tete de ce manifeste : sans cette cible, le
 # fichier ne serait JAMAIS compile et la porte rendrait un vert contre rien.

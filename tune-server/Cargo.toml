@@ -155,9 +155,30 @@ path = "tests/server_contracts.rs"
 name = "album_lecture_en_double"
 path = "tests/album_lecture_en_double.rs"
 
+# #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
+# local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
+# manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
+# propriétés seraient gardées par rien.
+#
+# Rangée ICI, au MILIEU du manifeste, et non en queue : deux lots qui ajoutent
+# chacun leur cible à la fin du même fichier se conflictent à tous les coups —
+# c'est ce qui est arrivé entre cette cible et celle de #4147.
+[[test]]
+name = "albums_upnp_visibles_4146"
+path = "tests/albums_upnp_visibles_4146.rs"
+
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
+
+# #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
+# qui DISENT quand ils mordent. Mesuré sur les routes montées.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "plafonds_indexation_upnp_4154"
+path = "tests/plafonds_indexation_upnp_4154.rs"
 
 [[test]]
 name = "plugin_contracts"
@@ -606,3 +627,27 @@ path = "tests/journal_sondage_hqplayer_sans_bruit_4025.rs"
 [[test]]
 name = "web_response_contracts"
 path = "tests/web_response_contracts.rs"
+
+# #2219 / chantier `unifier-serveurs-upnp-et-bibliotheque`, phase 2.
+# `autotests = false` en tête de ce manifeste : sans ces deux cibles, les
+# témoins de l'indexation et du refus OAAT ne seraient JAMAIS compilés.
+[[test]]
+name = "indexation_upnp_2219"
+path = "tests/indexation_upnp_2219.rs"
+
+[[test]]
+name = "refus_oaat_upnp_2219"
+path = "tests/refus_oaat_upnp_2219.rs"
+# #4125 — la fraîcheur du registre des serveurs multimédia, mesurée sur la
+# ROUTE montée. `autotests = false` en tête de ce manifeste : sans cette cible,
+# le fichier ne serait JAMAIS compilé et la garde serait verte contre rien.
+[[test]]
+name = "registre_serveurs_fraicheur_4125"
+path = "tests/registre_serveurs_fraicheur_4125.rs"
+
+# #2219 phase 3 — la lecture d'une ligne indexee. Binaire a lui seul : il pose
+# un abonne `tracing` GLOBAL, qui ne capterait rien s'il partageait un binaire
+# avec des tests paralleles.
+[[test]]
+name = "lecture_upnp_indexee_2219"
+path = "tests/lecture_upnp_indexee_2219.rs"

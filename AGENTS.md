@@ -38,3 +38,36 @@ Règles non négociables :
 
 La PR indique l'issue, la RC, l'identité de l'agent, les preuves exécutées et
 ce qui n'est pas traité.
+
+## Ce qu'est une preuve
+
+« N tests réussis » mesure un **périmètre**, pas une propriété. Un vert ne
+prouve rien tant qu'on n'a pas montré que le témoin sait rougir.
+
+Avant d'annoncer qu'un correctif est couvert : retirer le **correctif** — pas
+le test — et relancer. Le test doit rougir, et son message doit nommer le
+défaut. Restaurer ensuite par copie (`cp` d'une sauvegarde prise avant), jamais
+par `git checkout --` qui emporte aussi le reste du travail, puis relancer une
+dernière fois pour revenir au vert.
+
+Trois rouges ne valent pas contre-épreuve :
+
+- un rouge de **compilation** : le sabotage a cassé le code, pas la propriété.
+  Refaire le sabotage de sorte que tout compile encore ;
+- un rouge d'un **autre** test que celui présenté comme témoin ;
+- un rouge obtenu en modifiant le test plutôt que le code gardé.
+
+Si le rouge ne vient pas, c'est le témoin qui est en défaut, pas le correctif
+qui est prouvé. Deux causes fréquentes, toutes deux constatées ici :
+
+- une garde de texte satisfaite par sa propre cible : `contains("fn ma_fn(")`
+  est vrai grâce à la ligne de **définition**. Compter les occurrences hors
+  définition ;
+- un fichier de `tests/` sans entrée `[[test]]` dans le `Cargo.toml` :
+  `autotests = false` fait qu'il n'est **jamais compilé**. Un banc de
+  1 027 lignes gardant 30 routes est resté ainsi treize essais durant, tous
+  annoncés verts parce qu'aucun n'existait.
+
+La PR écrit le résultat de la contre-épreuve : la commande passée, le test qui
+a rougi, la ligne de son message. Une PR qui ne le dit pas déclare, par
+omission, que la contre-épreuve n'a pas été faite.

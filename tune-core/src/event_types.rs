@@ -110,6 +110,13 @@ declarer_evenements! {
     /// produite cote serveur : l'ecran restait fige jusqu'au rechargement de la
     /// page (#2259, fil forum 788).
     EnrichComplete => "library.enrich.completed", Emis;
+    /// Avancement de la passe ReplayGain : `processed` / `total`, plus
+    /// `active` (#4144). L'ecran Sante affichait `IDLE` pendant des heures de
+    /// balayage parce que la passe ne publiait RIEN — ni compteur, ni
+    /// evenement. Emis a cadence espacee (2 s, celle du scan) depuis
+    /// `audio::replaygain::progression`, jamais par piste : 50 000 titres
+    /// feraient 50 000 messages sur un bus de 256 entrees.
+    ReplayGainProgress => "library.replaygain.progress", Emis;
     /// Avancement de la reprise des pochettes (`POST /library/artwork/rescan`).
     /// `SettingsView.svelte` en lit `current`, `total` et `found` — les trois
     /// champs de `settings.coversProgress` (#2870).
@@ -355,7 +362,7 @@ mod tests {
     fn toutes_couvre_l_enumeration_entiere() {
         assert_eq!(
             EventType::TOUTES.len(),
-            37,
+            38,
             "une variante a ete ajoutee ou retiree : mettre ce compte a jour APRES \
              avoir verifie son statut d'emission"
         );
@@ -391,6 +398,19 @@ mod tests {
             EventType::ScanComplete.as_str()
         );
         assert_eq!(EventType::ScanProgress.as_str(), "library.scan.progress");
+        // Contrat ENTRE DEUX DEPOTS (#4144) : `TuneHealthV2.svelte` ecoute
+        // cette chaine exacte pour sa carte ReplayGain. La renommer ici sans
+        // toucher au client remettrait la carte sur `IDLE`, en silence.
+        assert_eq!(
+            EventType::ReplayGainProgress.as_str(),
+            "library.replaygain.progress"
+        );
+        // Et ce n'est PAS le scan : les deux passes tournent en meme temps et
+        // l'ecran les affiche l'une sous l'autre.
+        assert_ne!(
+            EventType::ReplayGainProgress.as_str(),
+            EventType::ScanProgress.as_str()
+        );
         assert_eq!(EventType::DeviceLost.as_str(), "device.lost");
         assert_eq!(EventType::VolumeChanged.as_str(), "playback.volume");
 
