@@ -100,11 +100,24 @@ impl SortieD4 {
         !matches!(self, Self::Oaat)
     }
 
-    /// Ce que l'auditeur doit savoir **avant** d'entendre le résultat.
+    /// Ce que l'auditeur doit savoir **quand la lecture a bien lieu**.
     ///
-    /// Vide n'est pas une option pour les trois sorties jouantes : chacune a au
-    /// moins un défaut, et le taire serait le contraire de ce que D4 demande.
-    /// C'est ce que garde [`tests::aucune_sortie_jouante_ne_se_tait`].
+    /// Vide n'est pas une option pour les trois sorties qui jouent un flux
+    /// compressé : chacune a au moins un défaut, et le taire serait le
+    /// contraire de ce que D4 demande
+    /// ([`tests::aucune_sortie_jouante_ne_se_tait`]).
+    ///
+    /// **OAAT ne dit rien ici, et c'est voulu.** Son refus n'est pas une
+    /// dégradation de la lecture : c'est l'absence de lecture. Une piste qui
+    /// arrive quand même jusqu'à un point OAAT est, par construction, déjà en
+    /// WAV — Asset en publie un à côté de son FLAC — et elle joue alors telle
+    /// quelle. Lui accrocher « lecture refusée » serait mentir dans l'autre
+    /// sens, sur une piste qui sort vraiment du haut-parleur. Le refus vit dans
+    /// [`Self::refus_sauf_wav`] et dans [`motif_du_refus_oaat`].
+    ///
+    /// 🔴 Cette distinction manquait : la table rendait le texte du refus comme
+    /// s'il était une dégradation, et le banc de route l'a attrapée en rougissant
+    /// sur le seul cas qui la révèle — un `res` WAV joué sur une zone OAAT.
     pub fn degradations(self) -> &'static [&'static str] {
         match self {
             Self::Reseau => &["Le DSP de la zone (égaliseur, convolveur, crossfeed) ne \
@@ -119,11 +132,27 @@ impl SortieD4 {
                 "Un saut dans la piste la relance au début : la position n'est \
                  pas encore propagée sur ce chemin.",
             ],
-            Self::Oaat => &[
-                "Lecture refusée : un point de sortie OAAT ne lit que du PCM en \
-                 conteneur WAV, et Tune ne sait pas encore convertir ce flux au \
-                 fil de l'eau.",
-            ],
+            // Voir la note du doc-commentaire : une piste qui joue sur OAAT est
+            // déjà en WAV, et rien n'a été mesuré à lui reprocher.
+            Self::Oaat => &[],
+        }
+    }
+
+    /// Ce que cette sortie **refuse**, et à quelle condition — indépendamment
+    /// de la piste.
+    ///
+    /// `Some` pour OAAT seulement, et la phrase porte la condition : le refus
+    /// n'est pas inconditionnel, un flux déjà en WAV passe. C'est ce que la
+    /// route d'indexation annonce dans ses réserves, et c'est le même fait que
+    /// [`motif_du_refus_oaat`] rédige pour une piste précise.
+    pub fn refus_sauf_wav(self) -> Option<&'static str> {
+        match self {
+            Self::Oaat => Some(
+                "un point de sortie OAAT ne lit que du PCM en conteneur WAV : \
+                 une piste publiée dans un autre format est refusée avant \
+                 d'être lancée, avec son motif, plutôt que jouée en silence.",
+            ),
+            _ => None,
         }
     }
 }
@@ -220,36 +249,77 @@ mod tests {
         );
     }
 
+    /// **OAAT ne dit rien quand elle joue.**
+    ///
+    /// Une piste qui atteint un point OAAT est déjà en WAV : elle sort du
+    /// haut-parleur. Lui accrocher « lecture refusée » serait un mensonge
+    /// symétrique de celui qu'on ferme — et c'est exactement ce que la table
+    /// faisait avant que le banc de route ne rougisse dessus.
+    #[test]
+    fn oaat_ne_dit_rien_quand_elle_joue() {
+        assert!(
+            SortieD4::Oaat.degradations().is_empty(),
+            "un flux WAV joué sur OAAT ne doit porter AUCUN avertissement : \
+             il joue vraiment"
+        );
+        assert!(
+            SortieD4::Oaat.refus_sauf_wav().is_some(),
+            "le refus doit vivre quelque part — simplement pas parmi les \
+             dégradations d'une lecture qui a lieu"
+        );
+        for sortie in [SortieD4::Reseau, SortieD4::Navigateur, SortieD4::Locale] {
+            assert!(
+                sortie.refus_sauf_wav().is_none(),
+                "la sortie {} ne refuse rien : OAAT est la seule",
+                sortie.nom()
+            );
+        }
+    }
+
     /// **Le verrou entre les deux lecteurs de la table.** Le refus opposé par
-    /// l'orchestrateur et l'avertissement rendu par les routes de lecture
+    /// l'orchestrateur et la condition annoncée par la route d'indexation
     /// doivent dire la même chose ; s'ils se séparaient, le produit refuserait
     /// pour une raison et en annoncerait une autre.
     #[test]
-    fn le_refus_et_l_avertissement_disent_la_meme_chose() {
+    fn le_refus_et_sa_condition_disent_la_meme_chose() {
         assert!(
             !SortieD4::Oaat.joue_un_flux_compresse(),
             "OAAT doit rester la seule sortie qui refuse"
         );
-        let avertissement = SortieD4::Oaat.degradations()[0];
+        let condition = SortieD4::Oaat
+            .refus_sauf_wav()
+            .expect("OAAT annonce sa condition");
         let motif = motif_du_refus_oaat("Wonderwall", "audio/x-flac");
-        for mot in ["OAAT", "WAV"] {
+        // La phrase cardinale, mot pour mot des deux côtés : c'est elle que le
+        // banc de route cherche, et c'est la seule façon d'attraper un texte
+        // dont les continuations de chaîne auraient été perdues.
+        let cardinale = "un point de sortie OAAT ne lit que du PCM en conteneur WAV";
+        assert!(
+            condition.contains(cardinale),
+            "la condition a changé de mots : {condition}"
+        );
+        assert!(
+            motif.contains(cardinale),
+            "le motif a changé de mots : {motif}"
+        );
+        assert!(
+            motif.contains("elle n'aurait produit qu'un silence"),
+            "le motif doit dire ce qui serait arrivé : c'est ce qui distingue \
+             un refus d'une panne — {motif}"
+        );
+        assert!(
+            motif.contains("Elle joue en revanche sur une zone réseau, navigateur ou locale"),
+            "le motif doit dire où la piste joue : un refus sans issue est une \
+             impasse — {motif}"
+        );
+        // Aucune suite d'espaces : un motif à trous a déjà été livré une fois,
+        // et trois contrôles de MOTS isolés l'avaient laissé passer.
+        for (quoi, texte) in [("le motif", motif.as_str()), ("la condition", condition)] {
             assert!(
-                avertissement.contains(mot) && motif.contains(mot),
-                "« {mot} » doit figurer des DEUX côtés : \
-                 avertissement = {avertissement} / motif = {motif}"
+                !texte.contains("  "),
+                "{quoi} porte une suite d'espaces — continuations de chaîne \
+                 perdues : {texte}"
             );
         }
-        assert!(
-            avertissement.contains("refusée") && motif.contains("refusée"),
-            "les deux doivent dire que c'est un REFUS, pas une panne"
-        );
-        assert!(
-            motif.contains("silence"),
-            "le motif doit dire ce qui serait arrivé"
-        );
-        assert!(
-            motif.contains("réseau") && motif.contains("navigateur"),
-            "le motif doit dire où la piste joue"
-        );
     }
 }

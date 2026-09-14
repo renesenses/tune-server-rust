@@ -174,4 +174,16 @@ async fn un_res_deja_en_wav_ne_porte_pas_le_refus_oaat() {
         "un flux DÉJÀ en WAV ne doit pas tomber sous le refus : le refus \
          garderait alors plus que le défaut qu'il vise — corps {corps}"
     );
+    // …et il ne doit pas non plus se voir accrocher un avertissement de D4.
+    //
+    // 🔴 C'est ici que la table s'est fait prendre : elle rangeait le texte du
+    // refus parmi les DÉGRADATIONS de la sortie OAAT, si bien qu'une piste qui
+    // jouait vraiment se voyait annoncer « lecture refusée ». Un mensonge
+    // symétrique de celui qu'on ferme, et le seul cas qui le révèle est
+    // celui-ci.
+    assert!(
+        !corps.contains("avertissements"),
+        "une piste qui JOUE sur OAAT ne doit porter aucun avertissement : \
+         son refus n'a pas eu lieu — corps {corps}"
+    );
 }

@@ -411,6 +411,12 @@ fn reserves(bilan: &Bilan) -> Vec<String> {
         for degradation in sortie.degradations() {
             dites.push(format!("sortie {} — {degradation}", sortie.nom()));
         }
+        // Le refus n'est pas une dégradation de la lecture : c'est son absence.
+        // Il porte sa condition — un flux déjà en WAV passe —, sans quoi la
+        // réserve dirait « refusée » d'une sortie qui joue parfois.
+        if let Some(condition) = sortie.refus_sauf_wav() {
+            dites.push(format!("sortie {} — {condition}", sortie.nom()));
+        }
     }
     if bilan.sans_taille > 0 {
         dites.push(format!(
