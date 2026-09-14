@@ -551,11 +551,17 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
     // rendait l'adresse aux vingt routes de lecture qui passent par ici
     // (`play`, `next`, `previous`, `resume`, `queue/jump`, `pins/{i}/invoke`…)
     // — c'est-à-dire au chemin le plus fréquenté du client web.
-    let output_type = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+    // Une seule lecture de la zone pour les deux décisions qui suivent :
+    // l'adresse du flux, et les dégradations à annoncer.
+    let sortie_de_la_zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
         .flatten()
-        .and_then(|z| z.output_type);
+        .map(|z| (z.output_type, z.output_device_id));
+    let (output_type, output_device_id) = match sortie_de_la_zone {
+        Some((t, d)) => (t, d),
+        None => (None, None),
+    };
     if crate::routes::zones::zone_recoit_l_adresse_du_flux(output_type.as_deref())
         && let Some(ref url) = result.stream_url
     {
@@ -563,7 +569,57 @@ async fn build_zone_json_with_result(state: &AppState, zone_id: i64, result: &Pl
             .unwrap()
             .insert("stream_url".into(), json!(url));
     }
+    // D4 — « jouable partout, défauts assumés et DITS » (Bertrand, 14/09).
+    //
+    // Une piste de serveur multimédia joue sur trois des quatre familles de
+    // sortie, mais AUCUNE des trois ne la joue entièrement : deux perdent le
+    // DSP, la troisième perd le ReplayGain et le saut dans la piste. Le
+    // produit le savait et ne le disait pas.
+    //
+    // Ici, et pas dans chacune des routes : `build_zone_json_with_result` est
+    // le goulot par lequel passent les vingt routes de lecture (`play`, `next`,
+    // `previous`, `resume`, `queue/jump`, `pins/{i}/invoke`…). Une annonce
+    // posée dans `play` seule aurait été vraie au premier titre et muette à
+    // l'avancement de file.
+    //
+    // Le champ est ADDITIF : un client déjà livré l'ignore (`fetchJSON` fait un
+    // `as T` nu). Il n'apparaît que quand il y a quelque chose à dire — un
+    // tableau vide serait du bruit sur toutes les autres lectures.
+    let degradations = avertissements_de_lecture(
+        &result.source,
+        output_type.as_deref(),
+        output_device_id.as_deref(),
+    );
+    if !degradations.is_empty() {
+        zone.as_object_mut()
+            .unwrap()
+            .insert("avertissements".into(), json!(degradations));
+    }
     zone
+}
+
+/// Ce qu'il faut DIRE d'une lecture, d'après la source jouée et la sortie.
+///
+/// Rend la liste vide pour tout ce qui n'est pas une piste de serveur
+/// multimédia : le reste du produit n'a pas été audité, et annoncer des
+/// dégradations qu'on n'a pas mesurées serait le symétrique du défaut qu'on
+/// ferme.
+///
+/// Le texte n'est pas écrit ici : il vient de
+/// [`tune_core::orchestrator::verdict_upnp::SortieD4::degradations`], la MÊME
+/// table que celle où l'orchestrateur puise son refus OAAT.
+fn avertissements_de_lecture(
+    source: &str,
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> Vec<&'static str> {
+    use tune_core::orchestrator::verdict_upnp::SortieD4;
+    if source != "upnp" {
+        return Vec::new();
+    }
+    SortieD4::depuis(output_type, output_device_id)
+        .degradations()
+        .to_vec()
 }
 
 #[derive(Deserialize, Default)]

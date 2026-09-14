@@ -189,7 +189,47 @@ impl PlaybackOrchestrator {
             return self.resolve_streaming_url(source, req).await;
         }
 
+        // Phase 3 du chantier `unifier-serveurs-upnp-et-bibliotheque` : une
+        // ligne INDEXÉE depuis un serveur UPnP se joue comme n'importe quelle
+        // piste de la bibliothèque — par son `track_id`, et rien d'autre.
+        //
+        // Le bouton Lecture, l'avancement de file et la reprise envoient tous
+        // `{ track_id }` sans `source` : `PlayRequest.source` vient du CORPS de
+        // la demande (`routes/playback.rs`), pas de la ligne. Une piste posée
+        // par l'indexation tombait donc ici, dans `resolve_local_track`, qui
+        // cherche un `file_path` qu'elle n'a pas — la piste apparaissait dans
+        // la bibliothèque et ne jouait pas.
+        //
+        // La source EST une propriété de la ligne : on la lit là où elle vit.
+        // La requête reste prioritaire — un appelant qui NOMME sa source
+        // (renderer, greffon, file de streaming) n'est pas contredit ; on ne
+        // comble qu'un silence.
+        if let Some(track_id) = req.track_id
+            && self.source_de_la_ligne(track_id).as_deref() == Some("upnp")
+        {
+            return self.resolve_direct_url_de_source(req, Some("upnp")).await;
+        }
+
         self.resolve_local_track(req).await
+    }
+
+    /// La `source` que porte la LIGNE de bibliothèque, quand la demande n'en
+    /// nomme aucune.
+    ///
+    /// Lecture étroite et sans effet : une seule colonne, une seule ligne. Une
+    /// base illisible rend `None`, ce qui remet la demande sur le chemin local
+    /// d'avant — un défaut de base ne doit pas changer l'aiguillage.
+    pub(super) fn source_de_la_ligne(&self, track_id: i64) -> Option<String> {
+        use crate::db::backend::ToSqlValue;
+        self.db
+            .query_one(
+                "SELECT source FROM tracks WHERE id = ?",
+                &[&track_id as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))
+            .filter(|s| !s.is_empty())
     }
 
     /// Dereference an M3U/PLS *playlist* URL to its first real http(s) stream.

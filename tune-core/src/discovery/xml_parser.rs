@@ -50,6 +50,22 @@ impl DeviceDescription {
             .any(|s| s.service_type.contains("AVTransport"))
     }
 
+    /// Vrai si le descriptif porte un `ContentDirectory`, **d'où qu'il vienne
+    /// dans l'arbre** — racine ou appareil imbriqué rattaché ci-dessous par
+    /// [`parse_device_description`].
+    ///
+    /// C'est ce service, et lui seul, qui rend un serveur média parcourable :
+    /// `ssdp.rs` n'inscrit rien au registre sans son `controlURL`.
+    /// [`Self::is_media_server`], lui, ne lit que le `deviceType` de la
+    /// **racine**, et rate donc tout composite — un Sonos Play:1 annonce
+    /// `ZonePlayer:1` en racine et cache son `MediaServer:1` un cran plus bas
+    /// (#4124).
+    pub fn has_content_directory(&self) -> bool {
+        self.services
+            .iter()
+            .any(|s| s.service_type.contains("ContentDirectory"))
+    }
+
     pub fn service_urls(&self) -> HashMap<String, String> {
         let mut map = HashMap::new();
         for svc in &self.services {
@@ -426,6 +442,59 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
             // in service_urls/event_sub_urls, while retaining root-only vendor
             // services used by some OpenHome-compatible devices.
             desc.services.extend(renderer.services);
+        }
+    }
+
+    // ── La moitié SERVEUR du même composite (#4124) ─────────────────────────
+    //
+    // Le bloc ci-dessus n'a jamais rattaché que le renderer : il a été écrit
+    // pour faire marcher les composites **en tant que renderers**. Un Sonos
+    // Play:1 annonce pourtant `ZonePlayer:1` en racine avec, un cran plus bas,
+    // un `MediaServer:1` qui porte le SEUL `ContentDirectory` du document. Sans
+    // ce service, `ssdp.rs` n'a rien à inscrire dans `media_servers` : les deux
+    // Sonos du réseau répondaient au M-SEARCH, leur descripteur rendait 200, et
+    // le registre restait à trois entrées, toutes des Tune.
+    //
+    // ⚠️ La fusion est NOMMÉE, jamais aveugle. `service_urls()` et
+    // `event_sub_urls()` sont des `HashMap` par nom de service : le dernier
+    // arrivé gagne. Un `extend` laisserait donc le `ConnectionManager` du
+    // serveur écraser celui du renderer, dont le `Sink` redeviendrait
+    // légitimement vide — c'est mot pour mot le défaut de #2072, et il tenait
+    // un Marantz ND8006 hors de portée de la sonde de capacités.
+    //
+    // On ne reprend du serveur que les services dont AUCUN appareil déjà
+    // rattaché ne fournit l'équivalent. En pratique, sur un composite :
+    // `ContentDirectory` entre, `ConnectionManager` reste celui du renderer.
+    if let Some(server) = embedded_devices
+        .iter()
+        .find(|device| device.is_media_server())
+    {
+        let mut deja_servis: std::collections::HashSet<String> = desc
+            .services
+            .iter()
+            .map(|service| service_key(&service.service_type))
+            .collect();
+
+        for service in &server.services {
+            if deja_servis.insert(service_key(&service.service_type)) {
+                desc.services.push(service.clone());
+            }
+        }
+
+        // Repli d'identité, seulement sur ce qui est encore vide : une racine
+        // sans `friendlyName` inscrirait sinon un serveur sans nom au registre.
+        // La racine et le renderer restent prioritaires, dans cet ordre.
+        if desc.friendly_name.is_empty() {
+            desc.friendly_name = server.friendly_name.clone();
+        }
+        if desc.manufacturer.is_empty() {
+            desc.manufacturer = server.manufacturer.clone();
+        }
+        if desc.model_name.is_empty() {
+            desc.model_name = server.model_name.clone();
+        }
+        if desc.model_description.is_empty() {
+            desc.model_description = server.model_description.clone();
         }
     }
 
@@ -821,13 +890,180 @@ mod tests {
             control_urls.get("avtransport").map(String::as_str),
             Some("/upnp/control/renderer_dvc/AVTransport")
         );
-        assert!(!control_urls.contains_key("contentdirectory"));
 
         let event_urls = desc.event_sub_urls();
         assert_eq!(
             event_urls.get("connectionmanager").map(String::as_str),
             Some("/upnp/event/renderer_dvc/ConnectionManager")
         );
+    }
+
+    // ── #4124 : un composite est serveur ET renderer ────────────────────────
+    //
+    // Ce module vérifie les DEUX sens sur le même descripteur. Le sens gagné
+    // (`ContentDirectory` rattaché) ne vaut que si le sens conservé
+    // (`ConnectionManager` du renderer) tient dans la même assertion : c'est
+    // exactement ce qu'un `extend` aveugle casserait, et c'était le défaut de
+    // #2072.
+
+    /// Le descripteur d'un Sonos Play:1, réduit à sa forme mesurée le
+    /// 14/09/2026 sur `http://192.168.1.19:1400/xml/device_description.xml` :
+    /// racine `ZonePlayer:1` — ni renderer, ni porteuse d'AVTransport — et
+    /// **deux** appareils imbriqués, le serveur AVANT le renderer dans l'ordre
+    /// du document. Cet ordre compte : c'est lui qui, sous un `extend`, ferait
+    /// gagner le mauvais `ConnectionManager`.
+    const SONOS_ZONEPLAYER_XML: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:ZonePlayer:1</deviceType>
+    <friendlyName>192.168.1.19 - Sonos Play:1</friendlyName>
+    <manufacturer>Sonos, Inc.</manufacturer>
+    <modelName>Sonos Play:1</modelName>
+    <UDN>uuid:RINCON_000E58F1D2E401400</UDN>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+        <friendlyName>192.168.1.19 - Sonos Play:1 Media Server</friendlyName>
+        <UDN>uuid:RINCON_000E58F1D2E401400_MS</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+            <controlURL>/MediaServer/ContentDirectory/Control</controlURL>
+            <eventSubURL>/MediaServer/ContentDirectory/Event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <controlURL>/MediaServer/ConnectionManager/Control</controlURL>
+            <eventSubURL>/MediaServer/ConnectionManager/Event</eventSubURL>
+          </service>
+        </serviceList>
+      </device>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+        <friendlyName>192.168.1.19 - Sonos Play:1 Media Renderer</friendlyName>
+        <UDN>uuid:RINCON_000E58F1D2E401400_MR</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <controlURL>/MediaRenderer/AVTransport/Control</controlURL>
+            <eventSubURL>/MediaRenderer/AVTransport/Event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+            <controlURL>/MediaRenderer/RenderingControl/Control</controlURL>
+            <eventSubURL>/MediaRenderer/RenderingControl/Event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <controlURL>/MediaRenderer/ConnectionManager/Control</controlURL>
+            <eventSubURL>/MediaRenderer/ConnectionManager/Event</eventSubURL>
+          </service>
+        </serviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>"#;
+
+    /// **Sens gagné** : le `ContentDirectory` du `MediaServer` imbriqué est
+    /// rattaché, donc `ssdp.rs` a de quoi inscrire le Sonos au registre. Avant
+    /// #4124 la carte n'avait aucune clé `contentdirectory` et le registre
+    /// restait à trois entrées pour cinq serveurs sur le réseau.
+    #[test]
+    fn sonos_le_serveur_imbrique_est_rattache() {
+        let desc = parse_device_description(SONOS_ZONEPLAYER_XML).unwrap();
+
+        // La racine, à elle seule, ne dit rien : c'est tout le problème.
+        assert!(!desc.is_media_server(), "la RACINE est un ZonePlayer");
+        assert!(!desc.is_media_renderer());
+
+        assert!(
+            desc.has_content_directory(),
+            "le ContentDirectory du serveur imbriqué doit être visible dans l'arbre"
+        );
+        assert_eq!(
+            desc.service_urls()
+                .get("contentdirectory")
+                .map(String::as_str),
+            Some("/MediaServer/ContentDirectory/Control")
+        );
+        assert_eq!(
+            desc.event_sub_urls()
+                .get("contentdirectory")
+                .map(String::as_str),
+            Some("/MediaServer/ContentDirectory/Event")
+        );
+    }
+
+    /// **Sens conservé** : le même descripteur reste un renderer complet, et le
+    /// `ConnectionManager` retenu est celui du RENDERER, pas celui du serveur.
+    ///
+    /// C'est l'assertion qui garde #2072. Le fixture place délibérément le
+    /// serveur en premier dans le document : un `desc.services.extend(server)`
+    /// posé après le renderer ferait passer cette URL à
+    /// `/MediaServer/ConnectionManager/Control`, `GetProtocolInfo`
+    /// interrogerait le serveur, et son `Sink` — un serveur a un `Source` —
+    /// reviendrait vide.
+    #[test]
+    fn sonos_reste_un_renderer_et_garde_son_connection_manager() {
+        let desc = parse_device_description(SONOS_ZONEPLAYER_XML).unwrap();
+
+        assert!(desc.has_av_transport(), "le renderer imbriqué est rattaché");
+
+        let control_urls = desc.service_urls();
+        assert_eq!(
+            control_urls.get("avtransport").map(String::as_str),
+            Some("/MediaRenderer/AVTransport/Control")
+        );
+        assert_eq!(
+            control_urls.get("renderingcontrol").map(String::as_str),
+            Some("/MediaRenderer/RenderingControl/Control")
+        );
+        assert_eq!(
+            control_urls.get("connectionmanager").map(String::as_str),
+            Some("/MediaRenderer/ConnectionManager/Control"),
+            "le ConnectionManager du SERVEUR ne doit jamais écraser celui du renderer (#2072)"
+        );
+        assert_eq!(
+            desc.event_sub_urls()
+                .get("connectionmanager")
+                .map(String::as_str),
+            Some("/MediaRenderer/ConnectionManager/Event")
+        );
+
+        // L'identité SSDP reste celle de la racine : c'est l'UDN que le
+        // M-SEARCH annonce, et celui sous lequel la zone est déjà enregistrée.
+        assert_eq!(desc.udn, "uuid:RINCON_000E58F1D2E401400");
+        assert_eq!(desc.friendly_name, "192.168.1.19 - Sonos Play:1");
+    }
+
+    /// Le composite HEOS de #2072 gagne lui aussi sa moitié serveur, sans rien
+    /// céder de sa moitié renderer. Même contrat, autre ordre de document — ici
+    /// le renderer vient en premier.
+    #[test]
+    fn composite_heos_gagne_le_content_directory_sans_perdre_le_renderer() {
+        let desc = parse_device_description(COMPOSITE_RENDERER_AND_SERVER_XML).unwrap();
+        let control_urls = desc.service_urls();
+
+        assert_eq!(
+            control_urls.get("contentdirectory").map(String::as_str),
+            Some("/upnp/control/ams_dvc/ContentDirectory"),
+            "sens gagné"
+        );
+        assert_eq!(
+            control_urls.get("connectionmanager").map(String::as_str),
+            Some("/upnp/control/renderer_dvc/ConnectionManager"),
+            "sens conservé (#2072)"
+        );
+    }
+
+    /// Un pur renderer ne gagne rien et ne perd rien : il n'a pas de serveur
+    /// imbriqué, donc aucune fusion n'a lieu. Le témoin qui dit que le
+    /// correctif ne déborde pas.
+    #[test]
+    fn un_pur_renderer_ne_gagne_pas_de_content_directory() {
+        let desc = parse_device_description(FOOBAR_XML).unwrap();
+        assert!(!desc.has_content_directory());
+        assert!(desc.has_av_transport());
     }
 }
 

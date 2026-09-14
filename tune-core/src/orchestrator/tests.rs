@@ -2300,6 +2300,74 @@ async fn avance_gapless_remet_la_position_a_zero() {
     );
 }
 
+/// #4068 — la piste atteinte sans repasser par `play()` est une écoute à part
+/// entière. Le témoin garde aussi l'attribution héritée de la session : profil,
+/// contexte et rang de file.
+#[tokio::test]
+async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 4068", Some("local"), None)
+        .unwrap();
+
+    let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let mut ids = Vec::new();
+    for n in 1..=2 {
+        let mut piste = crate::db::models::Track::new(format!("Historique {n}"));
+        piste.file_path = Some(format!("/aucun/chemin/4068/piste{n}.flac"));
+        piste.track_number = n;
+        piste.duration_ms = 180_000;
+        ids.push(pistes.create(&piste).unwrap());
+    }
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &ids)
+        .unwrap();
+
+    orch.playback.set_session_profile(zone_id, Some(17)).await;
+    orch.playback
+        .set_session_context(
+            zone_id,
+            Some("playlist".into()),
+            Some("42".into()),
+            Some("local".into()),
+        )
+        .await;
+    orch.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                track_id: Some(ids[0]),
+                title: "Historique 1".into(),
+                duration_ms: 180_000,
+                source: "local".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    orch.playback.update_queue_info(zone_id, 0, 2).await;
+
+    assert_eq!(lignes_historique(&orch), 0);
+    orch.advance_queue_metadata(zone_id, 1)
+        .await
+        .expect("l'avance gapless doit aboutir");
+
+    let history = crate::db::history_repo::HistoryRepo::with_backend(orch.db.clone())
+        .recent(10)
+        .unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].title, "Historique 2");
+    assert_eq!(history[0].source, "local");
+    let stored_profile = orch
+        .db
+        .query_one("SELECT profile_id FROM listen_history LIMIT 1", &[])
+        .unwrap()
+        .and_then(|cols| cols.first().and_then(|value| value.as_i64()));
+    assert_eq!(stored_profile, Some(17));
+    assert_eq!(history[0].context_type.as_deref(), Some("playlist"));
+    assert_eq!(history[0].context_id.as_deref(), Some("42"));
+    assert_eq!(history[0].context_position, Some(1));
+}
+
 // ------------------------------------------------------------------
 // #1541 — VU-mètres après une avance gapless, DSD local compris.
 // ------------------------------------------------------------------

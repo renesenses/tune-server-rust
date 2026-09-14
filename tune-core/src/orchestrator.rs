@@ -1194,6 +1194,10 @@ mod resolve_local;
 mod dsp;
 
 mod resolve_direct;
+/// D4 — ce que vaut la lecture d'une piste de serveur UPnP, sortie par sortie.
+/// Publique : `routes/playback.rs` lit la MÊME table que le refus de
+/// `resolve_direct`, pour que les deux ne puissent pas diverger.
+pub mod verdict_upnp;
 
 mod queue;
 

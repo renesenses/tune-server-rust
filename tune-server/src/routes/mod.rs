@@ -30,6 +30,7 @@ pub mod homeassistant;
 pub mod hqplayer;
 pub mod hue;
 pub mod i18n;
+pub mod indexation_upnp;
 pub mod kiosk;
 pub mod lastfm_social;
 pub mod library;

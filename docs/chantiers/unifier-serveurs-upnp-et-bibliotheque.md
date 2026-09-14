@@ -629,6 +629,32 @@ Trois postures possibles :
 
 Recommandation : **(b)**, en phase 3, et (c) jamais automatiquement.
 
+**D1bis — Le badge d'une piste distante dit « UPNP ». ✅ TRANCHÉ**
+
+**Arbitrage de Bertrand, 14/09/2026** : une piste venue d'un serveur UPnP porte le badge
+**`UPNP`**, comme `QOBUZ` ou `BANDCAMP` portent le leur. Pas « local », et pas un badge
+par serveur.
+
+C'est une entrée de plus dans la table de `ServiceBadge.svelte`, rien d'autre :
+
+```ts
+upnp: { name: 'UPNP', bg: '…', color: '#ffffff' },
+```
+
+État mesuré du code au moment de la décision (v0.9.149) :
+
+* `ServiceBadge.svelte` est une table fixe de huit entrées. Une source absente de la table
+  rend `null`, donc **aucun badge** — une piste `source = 'upnp'` n'afficherait rien
+  aujourd'hui, ce qui est un défaut discret ;
+* le « LOCAL » visible vient des appelants qui forcent le défaut :
+  `source={(t as any).source ?? 'local'}` dans `FavoritesView.svelte:886` et `:930`.
+  **Ces replis doivent cesser** — sinon une piste distante réapparaîtra en « LOCAL »,
+  c'est-à-dire en mensonge.
+
+Le **nom du serveur d'origine** reste utile pour distinguer deux pistes identiques venues de
+deux machines, mais il n'a pas sa place dans le badge : il ira dans l'infobulle ou dans le
+détail de la piste, à trancher au moment de l'écran.
+
 **D2 — Que faire quand un serveur disparaît ?**
 Le dépôt a déjà tranché quatre fois dans le même sens (marquer, jamais
 retirer ; ne pas croire un byebye ; ne supprimer qu'après une observation
@@ -645,6 +671,28 @@ Trois plafonds à fixer :
   pistes passent en 11,6 s ; 500 000 non ;
 - **en profondeur** : les pistes seules, ou aussi les playlists, radios et
   genres du serveur distant. Le `.42` expose 51 radios et 21 playlists.
+
+**D4 — Une piste distante est-elle jouable, et par quelles sorties ? ✅ TRANCHÉ**
+
+**Arbitrage de Bertrand, 14/09/2026 : jouable PARTOUT, défauts assumés et DITS.**
+
+Chaque zone joue ce qu'elle peut. Là où c'est dégradé, **l'écran le dit** au lieu de faire
+semblant. Là où c'est impossible, la lecture **refuse avec un motif** au lieu de rendre du
+silence.
+
+Ce que cela impose, sortie par sortie, à partir de l'état mesuré :
+
+| sortie | état | ce que la décision exige |
+|---|---|---|
+| réseau | joue, **sans DSP** | dire que le DSP ne s'applique pas |
+| navigateur | joue, **sans DSP** | idem |
+| locale | joue, **avec DSP**, sans ReplayGain, **seek cassé** | dire les deux manques ; ne pas prétendre que le seek marche |
+| OAAT | **silence** | **refuser explicitement**, avec un motif — un silence sans message est le pire des deux |
+
+Le principe qui tranche les cas non listés : **ne jamais faire semblant**. Une piste qui ne
+peut pas jouer sur une zone doit le dire avant d'être lancée, pas après.
+
+L'ancien état, pour mémoire :
 
 **D4 — Une piste distante est-elle jouable, et par quelles sorties ?**
 Aujourd'hui : sortie réseau oui (sans DSP), navigateur oui (sans DSP), locale

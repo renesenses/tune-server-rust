@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::AppError;
 use crate::smb;
@@ -53,6 +53,14 @@ pub fn router() -> Router<AppState> {
         .route("/smb/mounts", get(list_smb_mounts))
         .route("/smb/mount", post(mount_smb_share))
         .route("/media-servers/{id}/browse", get(browse_media_server))
+        // Phase 2 du chantier `unifier-serveurs-upnp-et-bibliotheque` :
+        // indexer UNE source, choisie à la main. Voir
+        // `routes/indexation_upnp.rs` pour la clé d'identité retenue et la
+        // mesure qui a écarté l'`ObjectID`.
+        .route(
+            "/media-servers/{id}/indexer",
+            post(crate::routes::indexation_upnp::indexer_une_source),
+        )
         .route("/media-servers/{id}/search", get(search_media_server))
         .route(
             "/media-servers/{id}/item/{item_id}/stream-url",
@@ -169,10 +177,23 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
 /// ici, plutôt que dans `discovery_setup`, a une raison mesurée : la couche
 /// SSDP n'émet un évènement qu'à la PREMIÈRE découverte
 /// (`SsdpEvent::MediaServerDiscovered`) — un serveur déjà connu qui se
-/// réannonce voit sa fraîcheur remise à zéro EN PLACE
-/// (`discovery/ssdp.rs:1367-1371`) sans que rien ne soit publié. Un branchement
-/// sur le seul évènement daterait donc chaque serveur de sa première apparition
-/// et jamais de la dernière — c'est-à-dire exactement le défaut qu'on corrige.
+/// réannonce voit sa fraîcheur remise à zéro EN PLACE, dans la carte du
+/// SCANNER, sans que rien ne soit publié. Un branchement sur le seul évènement
+/// daterait donc chaque serveur de sa première apparition et jamais de la
+/// dernière — c'est-à-dire exactement le défaut qu'on corrige.
+///
+/// ⚠️ Ce raisonnement portait juste sur la couche SSDP et lisait la MAUVAISE
+/// carte. `state.media_servers` n'EST PAS la carte du scanner : c'en est une
+/// copie, dont le seul écrivain est ce même évènement
+/// (`discovery_setup.rs`, `media_servers.lock().await.insert(...)`). Elle était
+/// donc gelée à la première découverte, son `Instant` figé pour toujours, et
+/// `horodatage_il_y_a(ms.age())` y rendait `maintenant - (maintenant - t0)`,
+/// soit `t0`, constant. Mesure du 14/09/2026 sur le `.18` : quatre serveurs,
+/// et `first_seen_at == last_seen_at` à la seconde près sur les quatre, à
+/// 56 s d'intervalle entre deux relevés (#4125).
+///
+/// On reprend donc d'abord la fraîcheur de la carte du scanner — celle qui,
+/// elle, est tenue à jour — avant de verser quoi que ce soit en base.
 ///
 /// L'observation est datée `maintenant - âge` : on écrit ce que la découverte
 /// SAIT, jamais « vu à l'instant ». C'est la contre-épreuve de la phase 1 —
@@ -184,6 +205,18 @@ async fn synchroniser_le_registre(state: &AppState) {
     use tune_core::db::media_server_repo::{
         MediaServerRepo, ObservationServeurRecue, horodatage_il_y_a,
     };
+
+    // La carte du scanner est la seule tenue à jour. La reprise n'insère ni ne
+    // retire rien : voir `reprendre_la_fraicheur`, et le rideau de #3688.
+    {
+        let vue_du_balayage = state.scanner.media_servers().await;
+        let mut registre = state.media_servers.lock().await;
+        let reprises = tune_core::discovery::presence_serveur::reprendre_la_fraicheur(
+            &mut registre,
+            vue_du_balayage,
+        );
+        debug!(reprises, "media_server_fraicheur_reprise_du_balayage");
+    }
 
     // Le verrou est relâché AVANT d'écrire en base : une écriture SQLite sous
     // le mutex du registre ferait attendre la découverte SSDP, qui le prend à
@@ -270,7 +303,6 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
-    let en_memoire = state.media_servers.lock().await;
     let items: Vec<Value> = enregistres
         .iter()
         .zip(&ages)
@@ -290,7 +322,32 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 // l'interface grise un serveur qui ne répond plus au lieu de
                 // le faire clignoter en le retirant puis le remettant. Champs
                 // AJOUTÉS — aucun client existant ne casse (#2139).
-                "reachable": en_memoire.get(&s.udn).is_some_and(|ms| ms.is_reachable()),
+                //
+                // Ce que `reachable` MESURE, puisque son nom laissait le doute
+                // (#4125) : « le balayage SSDP l'a revu il y a moins de
+                // `MEDIA_SERVER_STALE_AFTER` (900 s) ». Ce n'est PAS une sonde
+                // HTTP, ce n'est PAS un `Browse` réussi — le registre ne sonde
+                // personne au moment de rendre la liste, et il ne doit pas :
+                // la route serait alors aussi lente que le plus lent des
+                // serveurs du réseau.
+                //
+                // Il se calcule désormais sur le MÊME âge que `presence`, celui
+                // du registre durable. Il lisait jusqu'ici un second `Instant`,
+                // celui de la copie en mémoire : deux horloges pour une seule
+                // question, et l'une d'elles était gelée. Trois serveurs vivants
+                // et qui se réannonçaient correctement portaient `reachable:
+                // false` sur le `.18` le 14/09/2026, quinze minutes après leur
+                // découverte et pour toujours.
+                //
+                // Les deux seuils restent distincts et cette hiérarchie est
+                // voulue : 900 s marque « plus revu depuis un moment » sans
+                // aucune conséquence, 5 400 s (`SERVEUR_ABSENT_APRES`) retire
+                // des propositions. Un serveur peut donc être `reachable:
+                // false` et `proposable: true` — c'est la zone grise, et c'est
+                // exactement ce que le fil 1425 demandait de montrer.
+                "reachable": age.is_some_and(|a| tune_core::discovery::ssdp::media_server_reachable(
+                    Duration::from_secs(a.max(0) as u64)
+                )),
                 "last_seen_secs": age.unwrap_or(0),
                 // #2219 phase 1 — ce que la liste ne savait pas dire.
                 //
@@ -308,7 +365,6 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
             })
         })
         .collect();
-    drop(en_memoire);
 
     let total = items.len();
     let proposables = items
@@ -1089,13 +1145,42 @@ async fn browse_media_server(
     };
     drop(servers);
 
-    // UPnP Browse returns results in PAGES. The old code issued a single
-    // Browse with RequestedCount=200 and returned only that page, so a server
-    // with thousands of albums showed just its first page (~100 on MinimServer /
-    // Twonky / Asset, which cap a single response) — "le résumé est juste mais la
-    // liste est très incomplète (~100 sur x xxx)" (Pierre M). Loop over
-    // StartingIndex, accumulating children until NumberReturned==0 or
-    // StartingIndex>=TotalMatches, with a safety bound.
+    let (containers, items, total_matches) =
+        parcourir_les_enfants(&ms.content_directory_url, &ms.name, object_id).await;
+
+    let fetched = containers.len() + items.len();
+    let total = (total_matches as usize).max(fetched);
+
+    Json(json!({
+        "object_id": object_id,
+        "containers": containers,
+        "items": items,
+        "total_matches": total,
+        "number_returned": fetched,
+    }))
+}
+
+/// Parcourt TOUTES les pages d'un conteneur d'un serveur ContentDirectory.
+///
+/// Extrait tel quel du corps de [`browse_media_server`], qui l'appelle
+/// toujours — l'indexation de la phase 2 du chantier
+/// `unifier-serveurs-upnp-et-bibliotheque` a besoin du MEME parcours, page par
+/// page, et le recopier aurait fait diverger deux lecteurs du même protocole.
+///
+/// Rend `(conteneurs, items, total_matches)`. Un `total_matches` de 0 avec des
+/// items rendus signifie seulement que le serveur ne l'annonce pas.
+// UPnP Browse returns results in PAGES. The old code issued a single
+// Browse with RequestedCount=200 and returned only that page, so a server
+// with thousands of albums showed just its first page (~100 on MinimServer /
+// Twonky / Asset, which cap a single response) — "le résumé est juste mais la
+// liste est très incomplète (~100 sur x xxx)" (Pierre M). Loop over
+// StartingIndex, accumulating children until NumberReturned==0 or
+// StartingIndex>=TotalMatches, with a safety bound.
+pub(crate) async fn parcourir_les_enfants(
+    content_directory_url: &str,
+    nom_du_serveur: &str,
+    object_id: &str,
+) -> (Vec<Value>, Vec<Value>, u32) {
     const PAGE_SIZE: u32 = 200;
     const MAX_PAGES: u32 = 500; // up to 100k children
     // Client partagé (voir `tune_core::http::client`). Le délai d'attente de
@@ -1126,7 +1211,7 @@ async fn browse_media_server(
         );
 
         let resp = match client
-            .post(&ms.content_directory_url)
+            .post(content_directory_url)
             .header("Content-Type", "text/xml; charset=utf-8")
             .header(
                 "SOAPAction",
@@ -1140,8 +1225,8 @@ async fn browse_media_server(
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
-                    "browse_media_server soap_error server={} start={starting_index} err={e}",
-                    ms.name
+                    "browse_media_server soap_error server={nom_du_serveur} \
+                     start={starting_index} err={e}"
                 );
                 break;
             }
@@ -1175,16 +1260,7 @@ async fn browse_media_server(
         }
     }
 
-    let fetched = containers.len() + items.len();
-    let total = (total_matches as usize).max(fetched);
-
-    Json(json!({
-        "object_id": object_id,
-        "containers": containers,
-        "items": items,
-        "total_matches": total,
-        "number_returned": fetched,
-    }))
+    (containers, items, total_matches)
 }
 
 #[derive(serde::Deserialize)]
@@ -1514,6 +1590,9 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                     let bit_depth = best.and_then(|r| r.bit_depth);
                     let channels = best.and_then(|r| r.channels);
                     let protocol_info = best.and_then(|r| r.protocol_info.clone());
+                    // `res@size` : jamais rendu jusqu'ici. L'indexation de la
+                    // phase 2 en fait une composante de la clé d'identité.
+                    let size = best.and_then(|r| r.size);
                     items.push(json!({
                         "id": id,
                         "title": title,
@@ -1526,6 +1605,7 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
                         "bit_depth": bit_depth,
                         "channels": channels,
                         "protocol_info": protocol_info,
+                        "size": size,
                     }));
                 }
 
@@ -1547,6 +1627,14 @@ struct DidlRes {
     sample_rate: Option<u32>,
     bit_depth: Option<u16>,
     channels: Option<u16>,
+    /// `res@size` — la taille du fichier amont, en octets.
+    ///
+    /// Le DIDL la publie depuis toujours (mesuré le 14/09 sur Asset UPnP comme
+    /// sur un Tune : `size="31911291"`), et le parseur la jetait. Elle entre
+    /// ici parce qu'elle est le seul discriminant **stable** qui reste quand
+    /// l'`ObjectID` ne l'est pas — voir `cle_d_identite` dans
+    /// `routes/indexation_upnp.rs`.
+    size: Option<u64>,
 }
 
 /// Parse every `<res …>url</res>` of a DIDL item, in document order.
@@ -1582,6 +1670,7 @@ fn parse_res_elements(element: &str) -> Vec<DidlRes> {
                     .and_then(|s| s.parse::<u16>().ok()),
                 channels: extract_attr(res_tag, "nrAudioChannels")
                     .and_then(|s| s.parse::<u16>().ok()),
+                size: extract_attr(res_tag, "size").and_then(|s| s.parse::<u64>().ok()),
             });
         }
         pos = tag_end + close_rel + "</res>".len();

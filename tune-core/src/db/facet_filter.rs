@@ -387,6 +387,91 @@ pub fn hidden_tracks_excluded() -> &'static str {
      WHERE h.item_type = 'album' AND h.item_id = t.album_id)"
 }
 
+/// Le nom de l'artiste d'un album, en sous-requête corrélée.
+///
+/// Volontairement PAS une jointure : le prédicat de doublon ci-dessous doit
+/// tenir dans un `WHERE` seul, et il est employé aussi bien par la liste
+/// (`... FROM albums a LEFT JOIN artists ar ...`) que par son compteur
+/// (`SELECT COUNT(*) FROM albums a WHERE ...`), qui n'a AUCUNE jointure. Un
+/// prédicat qui supposerait l'alias `ar` marcherait dans la liste et
+/// exploserait dans le compteur — donc la pagination mentirait sur PostgreSQL
+/// comme sur SQLite.
+fn nom_d_artiste(alias_album: &str, alias_artiste: &str) -> String {
+    format!(
+        "COALESCE((SELECT {alias_artiste}.name FROM artists {alias_artiste} \
+         WHERE {alias_artiste}.id = {alias_album}.artist_id), '')"
+    )
+}
+
+/// « Cette source n'est pas le disque local. » `source` vaut `'local'` par
+/// défaut mais une base migrée porte des NULL et des chaînes vides — le même
+/// `COALESCE(NULLIF(...), 'local')` que `AlbumRepo::sql::count_by_source`.
+fn source_est(alias: &str, operateur: &str) -> String {
+    format!("COALESCE(NULLIF({alias}.source, ''), 'local') {operateur} 'local'")
+}
+
+/// « Cet album DISTANT a une contrepartie LOCALE. » Cœur du masquage #4146.
+///
+/// Les règles de rapprochement sont celles de
+/// [`super::favorites_reconcile::find_album_by_identity`], et pour la même
+/// raison qu'ailleurs : un album distant et son équivalent local n'ont AUCUN
+/// identifiant commun — ni `source_id`, ni MBID garanti —, seule l'identité
+/// (titre, artiste) les rapproche. Transposées en SQL ensembliste, car un
+/// appel par ligne sur 4 255 albums ferait 4 255 requêtes :
+///
+/// * artiste connu : titre + artiste, en `LOWER` des deux côtés ;
+/// * artiste inconnu : titre seul, **uniquement si non ambigu** — un seul
+///   album local porte ce titre. Sans cette garde, un « Live » distant sans
+///   artiste serait masqué par le « Live » de n'importe qui.
+///
+/// Un album LOCAL n'est jamais masqué : le premier terme le sort d'emblée.
+fn double_par_un_local(alias: &str) -> String {
+    let nom_distant = nom_d_artiste(alias, "ar_dist");
+    let nom_local = nom_d_artiste("loc", "ar_loc");
+    let distant = source_est(alias, "<>");
+    let local = source_est("loc", "=");
+    let ambigu = source_est("amb", "=");
+    format!(
+        "EXISTS (SELECT 1 FROM albums loc \
+         WHERE {distant} AND {local} \
+           AND LOWER(loc.title) = LOWER({alias}.title) \
+           AND (LOWER({nom_local}) = LOWER({nom_distant}) \
+                OR ({nom_distant} = '' \
+                    AND (SELECT COUNT(*) FROM albums amb \
+                         WHERE LOWER(amb.title) = LOWER({alias}.title) AND {ambigu}) = 1)))"
+    )
+}
+
+/// Prédicat « cet album distant n'est PAS doublé par un local » (#4146), pour
+/// les requêtes d'ALBUMS — alias `a`, celui de `AlbumRepo::sql::select_album()`.
+///
+/// Arbitrage de Bertrand du 14/09/2026 : quand un album existe des deux côtés,
+/// **seul le local est rendu**. Le distant reste en base, indexé, jouable par
+/// `GET /library/albums/{id}` — il n'est qu'absent des LISTES, et il y revient
+/// dès que sa contrepartie locale disparaît. **Masquer n'est pas effacer.**
+///
+/// Vit ici pour la même raison que [`hidden_albums_excluded`] : la liste, son
+/// compteur de pagination et le compteur de tranche DR doivent exclure
+/// EXACTEMENT le même ensemble, sinon la grille saute des pages.
+pub fn album_distant_double_exclu(alias: &str) -> String {
+    format!("NOT {}", double_par_un_local(alias))
+}
+
+/// Prédicat jumeau pour les requêtes de PISTES (#4146) — alias `t`, celui de
+/// `TrackRepo::sql::select_track()`.
+///
+/// La piste suit son album : si l'album distant est masqué par un local, ses
+/// pistes le sont aussi. Une piste SANS album reste visible — le `NOT EXISTS`
+/// est vrai quand la sous-requête ne trouve rien, NULL compris, exactement
+/// comme [`hidden_tracks_excluded`].
+pub fn pistes_album_distant_double_exclu() -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM albums dist \
+         WHERE dist.id = t.album_id AND {})",
+        double_par_un_local("dist")
+    )
+}
+
 /// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
 /// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
 ///
