@@ -14,6 +14,9 @@ pub mod decode;
 /// sur le décodage en cours, sans le coûter.
 pub mod decode_progress;
 pub mod dff;
+/// Dither TPDF — UNE implémentation, partagée par tous les étages qui
+/// repassent du flottant à l'entier (#4075, #4076).
+pub mod dither;
 #[cfg(test)]
 mod dop_porteur_bout_en_bout;
 #[cfg(test)]
@@ -21,6 +24,7 @@ mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+pub mod ecretage;
 #[cfg(feature = "audio-embedding")]
 pub mod embedding;
 /// READ side of audio embeddings (storage + cosine) — always compiled, no ort.
@@ -32,6 +36,10 @@ pub mod eq_presets;
 pub mod faststart;
 /// Mémoire du volume d'avant l'armement du mode bit-perfect (#2395).
 pub mod fixed_volume;
+/// Le fondu enchaîné qui superpose vraiment deux pistes (#2211) — deux flux
+/// `f32` décodés, une enveloppe par échantillon, un seul puits. Aucun volume
+/// de sortie n'est touché : c'est tout le sujet du ticket.
+pub mod fondu_enchaine;
 pub mod formats;
 pub mod http_range;
 pub mod iso_sacd;

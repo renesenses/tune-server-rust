@@ -1402,12 +1402,37 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         //
         // La clé est celle que posent les quatre points d'enregistrement
         // (`local.rs`, `background.rs`, `startup.rs`) : `local:{name}`.
+        // #3322 — et les dispositions de canaux à côté du nombre de canaux.
+        //
+        // C'est la QUATRIÈME surface, et la dernière qui manquait. Les trois
+        // autres — `GET /zones`, `GET /zones/{id}`
+        // (`zones::output_capabilities_avec`) et `GET /devices`
+        // (`enrichir_les_dispositions_de_canaux`) — ne peuvent parler que d'un
+        // appareil DÉJÀ enregistré comme sortie. La grille « Appareils » du
+        // client, elle, propose les périphériques locaux que rien n'utilise
+        // encore, et elle les tient d'ICI.
+        //
+        // Cette route portait déjà `max_channels`, l'entrée du moteur, et pas
+        // sa sortie. Un client qui voudrait offrir un choix devrait donc
+        // refabriquer le vocabulaire lui-même à partir d'un entier — et c'est
+        // précisément le piège que l'issue interdit : « ne pas offrir une plage
+        // libre 0–32 », le serveur ne sait nommer que neuf dispositions.
+        //
+        // `noms_jusqu_a` rend `[]` quand `max_channels` vaut 0 : une capacité
+        // inconnue publie une liste vide, jamais une valeur inventée. Le champ
+        // est ADDITIF — un client qui l'ignore continue de l'ignorer.
         let devices: Vec<Value> = devices
             .into_iter()
             .map(|d| {
                 let mut v = serde_json::to_value(&d).unwrap_or_else(|_| json!({}));
                 if let Some(o) = v.as_object_mut() {
                     o.insert("id".into(), json!(format!("local:{}", d.name)));
+                    o.insert(
+                        "channel_layouts".into(),
+                        json!(tune_core::audio::channels::ChannelLayout::noms_jusqu_a(
+                            d.max_channels
+                        )),
+                    );
                 }
                 v
             })

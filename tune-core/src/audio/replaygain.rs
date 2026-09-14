@@ -14,6 +14,7 @@
 //! ReplayGain tags always win: a track that already has `rg_track_gain` is never
 //! recomputed.
 
+use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
@@ -1810,6 +1811,37 @@ fn gain_source_from_meta(
     Some(GainSource::FileTags)
 }
 
+/// Ce que l'anti-écrêtage a retenu sur le facteur demandé, et POURQUOI
+/// (#4072).
+///
+/// Un simple `f64` ne permettait pas au chemin du signal de distinguer « le
+/// gain demandé s'applique » de « le gain demandé a été refusé » : dans les
+/// deux cas le facteur peut valoir 1,0, et l'étape disparaissait alors du
+/// panneau. L'auditeur voyait ReplayGain armé, ses tags lus, et rien ne
+/// bougeait — sans un mot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetenueAntiEcretage {
+    /// Rien retenu : le facteur demandé multiplie les échantillons tel quel.
+    Aucune,
+    /// Le pic TAGUÉ a borné le facteur à `plafond / pic` — le cas nominal,
+    /// inchangé depuis toujours.
+    ParLePicTague,
+    /// Aucun pic tagué (ni `rg_*_true_peak`, ni `rg_*_peak` plausible) et un
+    /// gain POSITIF demandé : il est refusé en entier. Voir [`gain_factor`].
+    GainPositifRefuseSansPic,
+}
+
+impl RetenueAntiEcretage {
+    /// Clé stable pour le JSON du chemin du signal — jamais du français.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aucune => "none",
+            Self::ParLePicTague => "tagged_peak",
+            Self::GainPositifRefuseSansPic => "refused_no_peak",
+        }
+    }
+}
+
 /// The linear factor to multiply samples by: `1.0` means "leave the audio
 /// alone".
 ///
@@ -1818,27 +1850,82 @@ fn gain_source_from_meta(
 /// crunch on every peak — the listener would blame Tune, rightly. When the
 /// tagged peak says the result would exceed full scale, the factor is pulled
 /// back to exactly what fits.
+///
+/// 🔴 **#4072 — sans pic tagué, le facteur ne dépasse JAMAIS l'unité.** Le
+/// garde-fou ci-dessus ne s'armait que si `gain.peak` existait ; sans pic il
+/// ne retenait RIEN, et `prevent_clipping` — armé par défaut — ne prévenait
+/// rien du tout. Mesuré par le banc T9 (#2218,
+/// `docs/mesures/2218-marge-ecretage-crete-vraie.md`, Q1) : +6 dB sur un sinus
+/// à −0,1 dBFS, pic non tagué, garde-fou armé ⇒ **29 174 / 44 100 échantillons
+/// écrêtés dur (66,2 %)**, excès maximal 31 866 LSB.
+///
+/// Le choix est le **refus**, pas le déclenchement de l'analyse : cette
+/// fonction est pure et synchrone, appelée au démarrage d'une piste et à
+/// chaque construction du chemin du signal, tandis que mesurer un pic exige de
+/// décoder le fichier entier (`measure_loudness_and_peak`, des secondes à des
+/// minutes, borné à `PER_TRACK_ANALYSIS_TIMEOUT_SECS` = 180 s). Le déclenchement
+/// existe déjà, ailleurs et au bon endroit : la passe de fond de ce module
+/// remplit `rg_track_peak`, et la piste retrouve son gain positif dès qu'elle
+/// est mesurée. Refuser en attendant ne coûte qu'un gain non appliqué ; le
+/// contraire coûte 66 % d'échantillons mutilés.
+///
+/// **Le plafond dBTP n'entre PAS dans cette borne.** Sans pic, la borne sûre
+/// est l'unité — le signal source tient déjà sous le rail, le laisser tel quel
+/// ne peut rien faire déborder. Descendre à `ceiling` (−0,5 / −1 dBTP)
+/// atténuerait silencieusement toute piste non taguée, y compris celles dont
+/// le gain demandé est nul ; la marge inter-échantillons est une autre
+/// question, tenue par le pic vrai (issue C de T9).
+///
+/// L'atténuation n'est jamais touchée : un gain négatif ne peut pas écrêter,
+/// et c'est la grande majorité des valeurs ReplayGain réelles.
 pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
+    gain_factor_detail(gain, settings).0
+}
+
+/// [`gain_factor`], qui dit AUSSI ce que l'anti-écrêtage a retenu.
+///
+/// Même calcul, même résultat au bit près : `gain_factor` délègue ici. Le
+/// second membre sert au chemin du signal, qui doit nommer un gain refusé
+/// plutôt que de faire disparaître l'étape.
+pub fn gain_factor_detail(
+    gain: TrackGain,
+    settings: ReplayGainSettings,
+) -> (f64, RetenueAntiEcretage) {
     if settings.mode == ReplayGainMode::Off {
-        return 1.0;
+        return (1.0, RetenueAntiEcretage::Aucune);
     }
     let total_db = (gain.gain_db + settings.preamp_db).clamp(-30.0, 30.0);
     let mut factor = 10f64.powf(total_db / 20.0);
+    let mut retenue = RetenueAntiEcretage::Aucune;
     if settings.prevent_clipping {
         // Plafond dBTP (#1694) : 0 dB = pleine échelle (comportement
         // historique, à l'identique) ; −0.5 / −1 laissent une marge
         // inter-échantillons. Le peak stocké est le true peak quand
         // l'analyse l'a mesuré (`stored_gain_detail` le préfère).
         let ceiling = 10f64.powf(settings.true_peak_ceiling_db.min(0.0) / 20.0);
-        if let Some(peak) = gain.peak {
-            if peak > 0.0 && factor * peak > ceiling {
-                factor = ceiling / peak;
+        match gain.peak {
+            // Un pic tagué : la borne exacte, celle d'avant.
+            Some(peak) if peak > 0.0 => {
+                if factor * peak > ceiling {
+                    factor = ceiling / peak;
+                    retenue = RetenueAntiEcretage::ParLePicTague;
+                }
+            }
+            // Aucun pic exploitable — absent, nul, négatif, ou hors échelle
+            // écarté par `stored_gain_detail` (`PEAK_MAX_PLAUSIBLE`). Le pic
+            // réel peut valoir 1,0 : tout facteur au-dessus de l'unité porte
+            // alors des échantillons au-delà du rail.
+            _ => {
+                if factor > 1.0 {
+                    factor = 1.0;
+                    retenue = RetenueAntiEcretage::GainPositifRefuseSansPic;
+                }
             }
         }
     }
     // A factor below this is inaudible attenuation of a signal to nothing; a
     // factor above is a bug, not a preference.
-    factor.clamp(0.001, 4.0)
+    (factor.clamp(0.001, 4.0), retenue)
 }
 
 /// Scale interleaved PCM in place by a linear factor.
@@ -1847,40 +1934,210 @@ pub fn gain_factor(gain: TrackGain, settings: ReplayGainSettings) -> f64 {
 /// themselves: the gain has to be baked in here or it never happens.
 /// Saturating on the way out — a sample pushed past full scale wraps around
 /// into a loud click if it is simply truncated.
+///
+/// #2218 (T9, défaut A) : cette porte ne connaît ni la piste ni la zone — le
+/// bras progressif lui passe un `f64` nu, bloc par bloc. Elle COMPTE donc ses
+/// écrêtés par appel dans le registre du processus
+/// (`audio::ecretage::REGISTRE`, section `dsp_ecretage` du rapport) et ne
+/// dit qu'UNE ligne `dsp_ecretage`, au premier bloc du processus qui écrête :
+/// une ligne par bloc noierait le journal. Les lignes par piste (premier
+/// écrêtage, fin) sont portées par [`GainReplay`], qui sait où une piste
+/// commence et finit.
+///
+/// #4076 : les échantillons produits ne sont PLUS ceux d'avant — le dither a
+/// remplacé la troncature vers zéro, c'est tout l'objet du correctif. Les
+/// empreintes de `tune-core/tests/ecretage_compte_2218.rs` ont été relevées à
+/// neuf ; les COMPTEURS d'écrêtage, eux, sont inchangés (ils comparent la
+/// valeur idéale au rail, en amont du bruit et de l'arrondi).
 pub fn apply_gain_pcm(pcm: &mut [u8], bit_depth: u16, factor: f64) {
+    let mut compteur = CompteurDEcretage::default();
+    apply_gain_pcm_compte(pcm, bit_depth, factor, &mut compteur);
+    let premier_du_processus = crate::audio::ecretage::REGISTRE
+        .replaygain
+        .absorber(&CompteurDEcretage::default(), &compteur);
+    if premier_du_processus {
+        crate::audio::ecretage::dire_premier(
+            crate::audio::ecretage::EtageEcretant::ReplayGain,
+            crate::audio::ecretage::Portee::Processus,
+            &compteur,
+        );
+    }
+}
+
+/// [`apply_gain_pcm`] qui COMPTE dans `compteur` chaque échantillon que le
+/// clamp ramène au rail — la condition du clamp, ni plus ni moins.
+///
+/// #4076 — l'écriture ne tronque plus vers zéro. Le produit passe par
+/// [`crate::audio::dither::Dither::quantifier`] : bruit TPDF ±1 LSB, puis
+/// arrondi au plus proche, puis saturation. Ce qui était mesuré et qui
+/// disparaît : un facteur de 1 − 10⁻⁷ (−0,000001 dB, inaudible **en tant que
+/// gain**) déplaçait 44 098 échantillons non nuls sur 44 098 d'un LSB **vers
+/// zéro**, et à −1 dB l'erreur portait le signe du signal — une distorsion,
+/// pas un bruit.
+///
+/// Deux invariants tiennent ce changement :
+///
+/// * **Facteur ENTIER ⇒ aucun dither** (`Dither::pour_facteur`) : 1, 2, 0
+///   envoient un entier sur un entier, sans rien perdre. Le retour immédiat
+///   sur facteur unitaire ci-dessous reste, et le couvre d'avance.
+/// * **Le comptage d'écrêtage ne change pas** : il compare la valeur IDÉALE
+///   (produit avant saturation) au rail, donc ni le bruit ni l'arrondi
+///   n'entrent dans sa condition.
+///
+/// Zéro allocation : le générateur est un `u64` sur la pile, et sa graine
+/// vient du contenu du bloc — même bloc, même facteur, **même bruit**, ce qui
+/// garde le cache de transcodage et la reprise par `Range` exacts à l'octet
+/// (voir la note « le dither est DÉTERMINISTE » de [`crate::audio::dither`]).
+pub fn apply_gain_pcm_compte(
+    pcm: &mut [u8],
+    bit_depth: u16,
+    factor: f64,
+    compteur: &mut CompteurDEcretage,
+) {
     if pcm.is_empty() || (factor - 1.0).abs() < 1e-9 {
         return;
     }
+    // Pas de requantification, pas de dither : `pour_facteur` rend `None` pour
+    // tout facteur ENTIER, qui envoie un entier sur un entier sans rien perdre.
+    let mut dither = crate::audio::dither::Dither::pour_facteur(
+        crate::audio::dither::Etage::ReplayGain,
+        pcm,
+        factor,
+    );
+    let base = compteur.echantillons_vus;
     match bit_depth {
         16 => {
-            for s in pcm.chunks_exact_mut(2) {
+            const MAX: f64 = i16::MAX as f64;
+            const MIN: f64 = i16::MIN as f64;
+            const PLEINE_ECHELLE: f64 = 32_768.0;
+            for (i, s) in pcm.chunks_exact_mut(2).enumerate() {
                 let v = i16::from_le_bytes([s[0], s[1]]) as f64 * factor;
-                let clamped = v.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
-                s.copy_from_slice(&clamped.to_le_bytes());
+                if v > MAX {
+                    compteur.noter_ecrete(base + i as u64, v - MAX, v / PLEINE_ECHELLE);
+                } else if v < MIN {
+                    compteur.noter_ecrete(base + i as u64, MIN - v, -v / PLEINE_ECHELLE);
+                }
+                let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+                let sortie = crate::audio::dither::quantifier_avec(v, bruit, MIN, MAX) as i16;
+                s.copy_from_slice(&sortie.to_le_bytes());
             }
+            compteur.noter_vus((pcm.len() / 2) as u64);
         }
         24 => {
             const MAX: f64 = 8_388_607.0;
             const MIN: f64 = -8_388_608.0;
-            for s in pcm.chunks_exact_mut(3) {
+            const PLEINE_ECHELLE: f64 = 8_388_608.0;
+            for (i, s) in pcm.chunks_exact_mut(3).enumerate() {
                 // Sign-extend the 24-bit little-endian sample into an i32.
                 let raw = ((s[2] as i32) << 24 | (s[1] as i32) << 16 | (s[0] as i32) << 8) >> 8;
-                let v = (raw as f64 * factor).clamp(MIN, MAX) as i32;
+                let ideal = raw as f64 * factor;
+                if ideal > MAX {
+                    compteur.noter_ecrete(base + i as u64, ideal - MAX, ideal / PLEINE_ECHELLE);
+                } else if ideal < MIN {
+                    compteur.noter_ecrete(base + i as u64, MIN - ideal, -ideal / PLEINE_ECHELLE);
+                }
+                let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+                let v = crate::audio::dither::quantifier_avec(ideal, bruit, MIN, MAX) as i32;
                 s[0] = (v & 0xFF) as u8;
                 s[1] = ((v >> 8) & 0xFF) as u8;
                 s[2] = ((v >> 16) & 0xFF) as u8;
             }
+            compteur.noter_vus((pcm.len() / 3) as u64);
         }
         32 => {
-            for s in pcm.chunks_exact_mut(4) {
+            const MAX: f64 = i32::MAX as f64;
+            const MIN: f64 = i32::MIN as f64;
+            const PLEINE_ECHELLE: f64 = 2_147_483_648.0;
+            for (i, s) in pcm.chunks_exact_mut(4).enumerate() {
                 let raw = i32::from_le_bytes([s[0], s[1], s[2], s[3]]);
-                let v = (raw as f64 * factor).clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+                let ideal = raw as f64 * factor;
+                if ideal > MAX {
+                    compteur.noter_ecrete(base + i as u64, ideal - MAX, ideal / PLEINE_ECHELLE);
+                } else if ideal < MIN {
+                    compteur.noter_ecrete(base + i as u64, MIN - ideal, -ideal / PLEINE_ECHELLE);
+                }
+                let bruit = dither.as_mut().map_or(0.0, |d| d.tirer());
+                let v = crate::audio::dither::quantifier_avec(ideal, bruit, MIN, MAX) as i32;
                 s.copy_from_slice(&v.to_le_bytes());
             }
+            compteur.noter_vus((pcm.len() / 4) as u64);
         }
         // 8-bit and anything exotic: leave the audio strictly alone rather
         // than guess at its encoding.
         _ => {}
+    }
+}
+
+/// Le ReplayGain d'UNE piste, avec son compteur d'écrêtage (#2218, T9 A).
+///
+/// C'est ce qu'un porteur DSP devrait tenir à la place d'un `f64` nu : il
+/// sait où la piste commence (sa construction) et où elle finit (sa
+/// destruction), donc il peut dire `dsp_ecretage` UNE fois au premier
+/// écrêtage et UNE fois à la fin avec le total — jamais par bloc. Les
+/// échantillons sortent de [`apply_gain_pcm_compte`], à l'octet près ceux de
+/// [`apply_gain_pcm`]. Le bras progressif (`StreamingDsp.replaygain:
+/// Option<f64>`, `orchestrator.rs`) ne le porte pas encore : c'est l'écrivain
+/// de l'orchestrateur qui branche.
+pub struct GainReplay {
+    facteur: f64,
+    ecretage: CompteurDEcretage,
+    premier_dit: bool,
+    fin_dite: bool,
+}
+
+impl GainReplay {
+    /// Un facteur linéaire, tel que [`gain_factor`] le rend.
+    pub fn new(facteur: f64) -> Self {
+        Self {
+            facteur,
+            ecretage: CompteurDEcretage::default(),
+            premier_dit: false,
+            fin_dite: false,
+        }
+    }
+
+    pub fn facteur(&self) -> f64 {
+        self.facteur
+    }
+
+    /// Le compteur de la piste, tel qu'il est.
+    pub fn ecretage(&self) -> CompteurDEcretage {
+        self.ecretage
+    }
+
+    /// Un bloc de la piste, en place. Compte, et dit le premier écrêtage
+    /// UNE fois — après le bloc, jamais dans la boucle d'échantillons.
+    pub fn process(&mut self, pcm: &mut [u8], bit_depth: u16) {
+        let avant = self.ecretage;
+        apply_gain_pcm_compte(pcm, bit_depth, self.facteur, &mut self.ecretage);
+        crate::audio::ecretage::REGISTRE
+            .replaygain
+            .absorber(&avant, &self.ecretage);
+        if !self.premier_dit && self.ecretage.echantillons_ecretes > 0 {
+            self.premier_dit = true;
+            crate::audio::ecretage::dire_premier(
+                crate::audio::ecretage::EtageEcretant::ReplayGain,
+                crate::audio::ecretage::Portee::Piste,
+                &self.ecretage,
+            );
+        }
+    }
+}
+
+impl Drop for GainReplay {
+    fn drop(&mut self) {
+        if self.fin_dite {
+            return;
+        }
+        self.fin_dite = true;
+        if self.ecretage.echantillons_ecretes > 0 {
+            crate::audio::ecretage::REGISTRE.replaygain.piste_close();
+        }
+        crate::audio::ecretage::dire_fin(
+            crate::audio::ecretage::EtageEcretant::ReplayGain,
+            crate::audio::ecretage::Portee::Piste,
+            &self.ecretage,
+        );
     }
 }
 
@@ -2778,6 +3035,155 @@ mod tests {
                 loose
             ) > 1.9
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #4072 — sans pic tagué, `prevent_clipping` refuse le gain positif.
+    // ------------------------------------------------------------------
+
+    /// Le défaut mesuré par T9 : +6 dB, aucun pic tagué, garde-fou ARMÉ.
+    /// Avant, le facteur sortait à ×1,9953 et 66,2 % des échantillons d'un
+    /// sinus à −0,1 dBFS étaient écrêtés dur. Il ne dépasse plus l'unité.
+    #[test]
+    fn sans_pic_tague_le_gain_positif_est_refuse_pas_rabote_sur_le_plafond() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let g = TrackGain {
+            gain_db: 6.0,
+            peak: None,
+        };
+        let (f, retenue) = gain_factor_detail(g, s);
+        assert_eq!(
+            f, 1.0,
+            "aucun pic tagué ⇒ le facteur ne dépasse pas l'unité"
+        );
+        assert_eq!(retenue, RetenueAntiEcretage::GainPositifRefuseSansPic);
+        assert_eq!(retenue.as_str(), "refused_no_peak");
+        // Le clamp ×4 n'est plus la seule borne : même +30 dB reste à l'unité.
+        assert_eq!(
+            gain_factor(
+                TrackGain {
+                    gain_db: 30.0,
+                    peak: None
+                },
+                s
+            ),
+            1.0
+        );
+    }
+
+    /// Un plafond dBTP n'entre PAS dans la borne « sans pic » : il
+    /// atténuerait toute piste non taguée, gain nul compris. La borne est
+    /// l'unité, et rien d'autre.
+    #[test]
+    fn sans_pic_tague_le_plafond_dbtp_n_attenue_pas_le_signal() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: -1.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: 0.0,
+                peak: None,
+            },
+            s,
+        );
+        assert_eq!(f, 1.0, "un gain nul sans pic reste l'identité");
+        assert_eq!(retenue, RetenueAntiEcretage::Aucune);
+    }
+
+    /// L'ATTÉNUATION traverse le garde-fou sans être touchée : un gain
+    /// négatif ne peut pas écrêter, et c'est la majorité des tags réels.
+    #[test]
+    fn sans_pic_tague_l_attenuation_passe_intacte() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: -6.0206,
+                peak: None,
+            },
+            s,
+        );
+        assert!((f - 0.5).abs() < 1e-4, "{f}");
+        assert_eq!(retenue, RetenueAntiEcretage::Aucune);
+    }
+
+    /// Un pic ABSURDE (nul ou négatif) ne doit pas rouvrir la porte : il n'est
+    /// pas un pic, il retombe donc sur le refus, pas sur une division.
+    #[test]
+    fn un_pic_nul_ou_negatif_retombe_sur_le_refus_pas_sur_une_division() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        for pic in [0.0, -0.5] {
+            let (f, retenue) = gain_factor_detail(
+                TrackGain {
+                    gain_db: 6.0,
+                    peak: Some(pic),
+                },
+                s,
+            );
+            assert_eq!(f, 1.0, "pic {pic}");
+            assert_eq!(retenue, RetenueAntiEcretage::GainPositifRefuseSansPic);
+        }
+    }
+
+    /// Garde-fou DÉSARMÉ : le refus disparaît avec lui. L'auditeur qui a
+    /// décoché la case garde exactement le comportement d'avant, écrêtage
+    /// compris — c'est ce qu'il a demandé.
+    #[test]
+    fn garde_fou_desarme_le_gain_positif_sans_pic_passe_comme_avant() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: false,
+            true_peak_ceiling_db: 0.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: 6.0,
+                peak: None,
+            },
+            s,
+        );
+        assert!((f - 1.9953).abs() < 1e-3, "{f}");
+        assert_eq!(retenue, RetenueAntiEcretage::Aucune);
+    }
+
+    /// Un pic tagué garde sa retenue nommée — le cas nominal n'a pas bougé.
+    #[test]
+    fn un_pic_tague_nomme_sa_retenue() {
+        let s = ReplayGainSettings {
+            mode: ReplayGainMode::Track,
+            preamp_db: 0.0,
+            prevent_clipping: true,
+            true_peak_ceiling_db: 0.0,
+        };
+        let (f, retenue) = gain_factor_detail(
+            TrackGain {
+                gain_db: 6.0,
+                peak: Some(0.95),
+            },
+            s,
+        );
+        assert!((f - 1.0 / 0.95).abs() < 1e-9, "{f}");
+        assert_eq!(retenue, RetenueAntiEcretage::ParLePicTague);
+        assert_eq!(retenue.as_str(), "tagged_peak");
+        assert_eq!(RetenueAntiEcretage::Aucune.as_str(), "none");
     }
 
     // ------------------------------------------------------------------

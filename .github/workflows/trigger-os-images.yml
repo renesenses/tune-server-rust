@@ -199,10 +199,14 @@ jobs:
             return 1
           }
 
-          wait_workflow build-iso.yml & P1=$!
+          # L'ISO x86_64 est abandonnee (13/09/2026) : l'image raw.xz x86_64
+          # fait le meme travail, pese 656 Mio au lieu de 1 201, et amorce la
+          # ou l'ISO echouait (#2151, confirme par deux testeurs). On cesse de
+          # l'attendre : la construire prenait du temps de train pour un
+          # artefact que plus personne ne doit telecharger.
           wait_workflow build-rpi-image.yml & P2=$!
           wait_workflow build-x86-image.yml & P3=$!
-          wait "$P1"; wait "$P2"; wait "$P3"
+          wait "$P2"; wait "$P3"
 
       - name: Verifier la matrice OS staged
         env:
@@ -217,7 +221,18 @@ jobs:
             --jq "[.[] | select(.tag_name == \"$OS_TAG\")] | .[0].id // empty" | head -1)"
           [ -n "$REL_ID" ] || { echo "::error::aucune release ne porte le tag $OS_TAG"; exit 1; }
           ASSETS="$(GH_TOKEN="$TOKEN" gh api "repos/renesenses/tune-os/releases/$REL_ID" --jq '.assets[].name')"
-          grep -Eq 'x86_64.*\.iso$' <<<"$ASSETS" || { echo "::error::ISO x86_64 absente"; exit 1; }
+          # L'ISO x86_64 n'est plus exigee : abandonnee le 13/09/2026 (#2151),
+          # l'image raw.xz fait le meme travail pour 656 Mio au lieu de 1 201.
+          # Elle est TOLEREE tant que `build-iso.yml` tourne encore dans
+          # renesenses/tune-os : une garde qui la refuserait ferait echouer le
+          # train a chaque release. Le jour ou ce build sera desactive, la
+          # ligne ci-dessous pourra devenir une garde inverse.
+          # `|| true` indispensable : sous `set -e`, un grep qui ne trouve RIEN
+          # rend 1 et tuerait l'etape — c'est-a-dire le jour meme ou l'ISO
+          # cessera d'etre construite, le resultat qu'on attend.
+          if grep -Eq 'x86_64.*\.iso$' <<<"$ASSETS"; then
+            echo "::notice::une ISO x86_64 est encore construite — build-iso.yml tourne toujours dans tune-os (#2151)"
+          fi
           grep -Eq 'x86_64-image.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image x86_64 absente"; exit 1; }
           grep -Eq 'aarch64.*\.raw\.xz$' <<<"$ASSETS" || { echo "::error::image aarch64 absente"; exit 1; }
-          [ "$(grep -Ec '\.sha256$' <<<"$ASSETS")" -ge 3 ] || { echo "::error::checksums OS incomplets"; exit 1; }
+          [ "$(grep -Ec '\.sha256$' <<<"$ASSETS")" -ge 2 ] || { echo "::error::checksums OS incomplets"; exit 1; }

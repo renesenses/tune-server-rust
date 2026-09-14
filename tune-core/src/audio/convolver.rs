@@ -1,3 +1,4 @@
+use crate::audio::dither::quantifier_avec;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::collections::VecDeque;
@@ -555,6 +556,39 @@ impl Convolver {
     /// the layout the transcode pipeline hands to `EqProcessor::process_pcm`
     /// (little-endian, `bit_depth` of 16/24/32). Decodes to f32, convolves
     /// offline, and writes the samples back with soft clamping.
+    ///
+    /// # #4076 (constat voisin) — une réponse impulsionnelle UNITÉ est
+    /// maintenant l'identité
+    ///
+    /// Le décodage divisait par 2^(n−1) — 32 768 à 16 bits — et le réencodage
+    /// multipliait par 2^(n−1) **− 1** — 32 767. Cette asymétrie est un gain de
+    /// −0,00027 dB appliqué à chaque passage : mesuré par T9, elle faisait
+    /// perdre 1 LSB à **29 214 échantillons sur 44 100 (66 %)** d'un sinus à
+    /// −0,1 dBFS, si bien qu'un convolveur chargé d'une impulsion unité — donc
+    /// censé ne rien faire — abîmait le signal.
+    ///
+    /// Les deux sens utilisent désormais la **même** échelle, 2^(n−1), et la
+    /// saturation au rail (`2^(n−1) − 1` en haut) vient après l'arrondi. Une IR
+    /// unité rend donc exactement ses octets d'entrée, à 16 et 24 bits.
+    ///
+    /// Le décodage 24 bits portait un second défaut, trouvé en tenant cette
+    /// identité : il lisait l'échantillon **décalé de 8 rangs** (`<< 8`, donc
+    /// jusqu'à 2^31) avant de le convertir en `f32`. Or un `f32` n'a que 24
+    /// bits de mantisse : sept bits partaient à la poubelle AVANT la
+    /// convolution. L'échantillon est maintenant ramené à sa plage naturelle
+    /// ±2^23, exacte en `f32`.
+    ///
+    /// À **32 bits**, l'identité est hors de portée et ce n'est pas un
+    /// oubli : le convolveur travaille en `f32`, dont la mantisse de 24 bits
+    /// ne peut pas porter un entier de 32. Le témoin y mesure une erreur
+    /// BORNÉE, pas une identité ; la lever demanderait un tampon `f64`, ce qui
+    /// n'est pas le sujet de #4076.
+    ///
+    /// Pas de dither ici, et c'est délibéré : le convolveur arrondit déjà au
+    /// plus proche — son erreur ne dépasse pas un demi-LSB et ne porte pas le
+    /// signe du signal, contrairement aux troncatures de #4075 et #4076. Lui
+    /// ajouter du bruit détruirait précisément l'identité qu'on vient de lui
+    /// rendre. Voir « Où ce dither ne doit PAS aller » dans [`crate::audio::dither`].
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16) {
         let ch = self.channels;
         if ch == 0 || pcm.is_empty() {
@@ -571,8 +605,15 @@ impl Convolver {
             let s = match bit_depth {
                 16 => i16::from_le_bytes([pcm[o], pcm[o + 1]]) as f32 / 32768.0,
                 24 => {
-                    let v = i32::from_le_bytes([0, pcm[o], pcm[o + 1], pcm[o + 2]]);
-                    v as f32 / 2147483648.0
+                    // Le décalage arithmétique redonne l'échantillon 24 bits
+                    // SIGNÉ, dans sa plage naturelle. Sans lui, la valeur
+                    // valait `echantillon << 8` — jusqu'à 2^31, qu'un f32 ne
+                    // sait pas porter : sa mantisse de 24 bits en jetait
+                    // sept, avant même la convolution. Ramené à ±2^23,
+                    // l'échantillon est exact en f32, et 2^23 est une
+                    // puissance de deux, donc la division l'est aussi.
+                    let v = i32::from_le_bytes([0, pcm[o], pcm[o + 1], pcm[o + 2]]) >> 8;
+                    v as f32 / 8_388_608.0
                 }
                 32 => {
                     let v = i32::from_le_bytes([pcm[o], pcm[o + 1], pcm[o + 2], pcm[o + 3]]);
@@ -587,20 +628,29 @@ impl Convolver {
             let o = i * bps;
             let s = buf.get(i).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
             match bit_depth {
+                // Même échelle qu'au décodage (2^(n−1)), arrondi au plus
+                // proche, saturation au rail EN DERNIER — par la porte
+                // partagée, avec un bruit nul : le convolveur ne dithère pas.
                 16 => {
-                    let v = (s * 32767.0).round() as i16;
-                    pcm[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                    let v = quantifier_avec(f64::from(s) * 32_768.0, 0.0, -32_768.0, 32_767.0);
+                    pcm[o..o + 2].copy_from_slice(&(v as i16).to_le_bytes());
                 }
                 24 => {
-                    let v = (s * 8_388_607.0).round() as i32;
-                    let b = v.to_le_bytes();
+                    let v =
+                        quantifier_avec(f64::from(s) * 8_388_608.0, 0.0, -8_388_608.0, 8_388_607.0);
+                    let b = (v as i32).to_le_bytes();
                     pcm[o] = b[0];
                     pcm[o + 1] = b[1];
                     pcm[o + 2] = b[2];
                 }
                 32 => {
-                    let v = (s * 2_147_483_647.0).round() as i32;
-                    pcm[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                    let v = quantifier_avec(
+                        f64::from(s) * 2_147_483_648.0,
+                        0.0,
+                        f64::from(i32::MIN),
+                        f64::from(i32::MAX),
+                    );
+                    pcm[o..o + 4].copy_from_slice(&(v as i32).to_le_bytes());
                 }
                 _ => {}
             }

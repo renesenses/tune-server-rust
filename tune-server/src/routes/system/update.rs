@@ -133,7 +133,12 @@ async fn playback_in_progress(playback: &tune_core::playback::PlaybackManager) -
 /// Le pire cas d'un faux positif reste borné : la relance coupe un son qui,
 /// par construction, n'avance plus depuis dix minutes. Le pire cas d'un faux
 /// négatif était de deux heures d'attente muette. L'asymétrie tranche.
-const SILENCE_DE_POSITION_AVANT_ZONE_FIGEE: Duration = Duration::from_secs(600);
+/// **La valeur vit désormais dans `tune-core`**, avec le prédicat, parce que le
+/// détecteur de fond ([`tune_core::playback::PlaybackManager::arreter_les_zones_figees`])
+/// doit dire exactement la même chose de « figée » que ce garde-fou-ci. Deux
+/// copies auraient divergé.
+const SILENCE_DE_POSITION_AVANT_ZONE_FIGEE: Duration =
+    tune_core::playback::SILENCE_AVANT_ZONE_FIGEE;
 
 /// Les zones qui jouent, par identifiant. Sert uniquement à nommer dans le
 /// journal ce qui retient la relance : le 30 août, `update_restarting` est
@@ -1798,6 +1803,56 @@ mod verificateur_periodique_cablage {
         let auto = annonce_de_release("0.9.140-rc2", &release, UpdateChannel::Auto);
         assert_eq!(auto["channel"], "auto");
         assert_eq!(auto["effective_channel"], "beta");
+    }
+}
+
+/// Câblage du détecteur de zones figées (#3581).
+///
+/// Le comportement du détecteur est tenu dans `tune-core`
+/// (`playback::detecteur_de_zones_figees_tests`, par sa porte de lancement).
+/// Ce qui se joue ICI est l'autre moitié, et c'est la moitié qui a manqué à
+/// `spawn_periodic` pendant des mois : l'APPEL. Un détecteur écrit et jamais
+/// lancé laisserait le fantôme de #3581 exactement où il est — une zone
+/// `Playing` que personne ne contredit.
+#[cfg(test)]
+mod detecteur_zones_figees_cablage {
+    /// Le seul endroit qui lance les passes de fond doit porter l'appel, et lui
+    /// passer la cadence et le seuil de production.
+    #[test]
+    fn le_detecteur_de_zones_figees_est_lance_au_demarrage() {
+        let background = include_str!("../../background.rs");
+        // Témoin : si `include_str!` pointait sur un fichier vide ou faux,
+        // l'assertion suivante échouerait pour la mauvaise raison.
+        assert!(
+            background.contains("pub async fn spawn_background_tasks"),
+            "témoin : le fichier lu doit être celui qui câble les passes de fond"
+        );
+        // Espaces normalisés : `rustfmt` replie l'appel sur plusieurs lignes.
+        let serre: String = background.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            serre.contains(
+                "tune_core::playback::spawn_detecteur_de_zones_figees( \
+                 state.playback.clone(), state.backend.clone(), \
+                 tune_core::playback::CADENCE_DETECTEUR_ZONES_FIGEES, \
+                 tune_core::playback::SILENCE_AVANT_ZONE_FIGEE, );"
+            ),
+            "spawn_detecteur_de_zones_figees doit être appelé depuis \
+             background.rs, avec la cadence et le seuil de production — sans \
+             cet appel, une zone restée `Playing` en mémoire n'est contredite \
+             par personne et #3581 est intact"
+        );
+    }
+
+    /// 🔴 Le garde-fou de mise à jour et le détecteur doivent parler du MÊME
+    /// seuil. Deux copies auraient divergé, et une zone aurait pu être ignorée
+    /// par l'un sans jamais être rattrapée par l'autre.
+    #[test]
+    fn le_garde_fou_et_le_detecteur_partagent_le_seuil() {
+        assert_eq!(
+            super::SILENCE_DE_POSITION_AVANT_ZONE_FIGEE,
+            tune_core::playback::SILENCE_AVANT_ZONE_FIGEE,
+            "le seuil du garde-fou de mise à jour doit être celui du détecteur"
+        );
     }
 }
 

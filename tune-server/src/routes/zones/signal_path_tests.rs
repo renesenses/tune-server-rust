@@ -321,9 +321,13 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
     )
     .unwrap();
 
+    // #4073 : la réserve est le PLUS GRAND de la somme des gains positifs
+    // (9,0 / 6,0 dB) et de la norme L1 de la cascade — ici 10,476 / 7,165 dB,
+    // parce que deux cloches empilées à 1 kHz sonnent au-delà de leur gain
+    // crête. Le panneau annonce ce qui est RÉELLEMENT retiré au signal.
     assert_eq!(
         step_desc(&sp, "DSP").as_deref(),
-        Some("EQ actif (pré-gain auto G -9.0 dB / D -6.0 dB, sans limiteur)")
+        Some("EQ actif (pré-gain auto G -10.5 dB / D -7.2 dB, sans limiteur)")
     );
     assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
 }
@@ -1224,6 +1228,186 @@ fn replaygain_off_shows_nothing_and_stays_bit_perfect() {
 
     assert_eq!(step_desc(&sp, "ReplayGain"), None);
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+}
+
+// ---- #4072 : un gain positif REFUSÉ faute de pic tagué -------------------
+
+/// Un champ quelconque de l'étape nommée.
+fn step_field<'a>(v: &'a Value, name: &str, field: &str) -> Option<&'a Value> {
+    v.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some(name))?
+        .get(field)
+}
+
+/// #4072 — le cœur du panneau muet.
+///
+/// `flac_track_with_rg_tag` tague `rg_track_gain` et RIEN d'autre : aucun pic,
+/// exactement le cas mesuré par le banc T9 (+6 dB sur un signal proche du
+/// rail ⇒ 66,2 % d'échantillons écrêtés avant le correctif). Avec
+/// l'anti-écrêtage armé, le gain est maintenant refusé — facteur 1,0 — et
+/// l'ancien seuil `(factor - 1.0).abs() <= 1e-6` faisait alors DISPARAÎTRE
+/// l'étape : ReplayGain armé, tags lus, rien qui bouge, rien qui l'explique.
+///
+/// Ce que ce témoin garde : l'étape existe, elle dit le gain DEMANDÉ et le
+/// motif du refus, et `clipping_guard` porte le motif en clé stable.
+#[test]
+fn un_gain_positif_sans_pic_tague_est_refuse_et_le_panneau_le_dit() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        step_desc(&sp, "ReplayGain").as_deref(),
+        Some("ReplayGain (track, +6.0 dB refusés : aucun pic tagué, anti-écrêtage armé)")
+    );
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "clipping_guard").and_then(|v| v.as_str()),
+        Some("refused_no_peak")
+    );
+    // Un refus ne touche pas un échantillon : le fil reste intact, l'étape
+    // n'est pas peinte en rouge, et le VERDICT ne tombe pas. La faire tomber
+    // serait le mensonge inverse de #1393 — punir une zone pour un traitement
+    // qui n'a précisément pas eu lieu.
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "bit_perfect").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(true));
+}
+
+/// Le même tag +6 dB, anti-écrêtage DÉSARMÉ : le gain s'applique comme avant,
+/// l'étape le dit, et le verdict tombe. Sans ce témoin, une garde qui
+/// refuserait TOUT gain positif passerait le témoin précédent.
+#[test]
+fn le_meme_gain_positif_passe_quand_l_anti_ecretage_est_desarme() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
+    let settings = SettingsRepo::with_backend(backend.clone());
+    settings
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+    settings
+        .set(tune_core::audio::replaygain::PREVENT_CLIPPING_KEY, "false")
+        .unwrap();
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        step_desc(&sp, "ReplayGain").as_deref(),
+        Some("ReplayGain (track, +6.0 dB, tags du fichier)")
+    );
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "clipping_guard").and_then(|v| v.as_str()),
+        Some("none")
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+}
+
+/// Avec un pic TAGUÉ, le gain positif retrouve exactement sa retenue d'avant :
+/// borné à `1 / pic`, nommé `tagged_peak`, et le verdict tombe. Le correctif
+/// n'a touché que la branche « aucun pic ».
+#[test]
+fn un_gain_positif_avec_pic_tague_garde_sa_retenue_d_avant() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (tid, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
+    tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+        .set(tid, "rg_track_peak", "0.95")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    // 1 / 0,95 = ×1,0526 ⇒ +0,4 dB.
+    assert_eq!(
+        step_desc(&sp, "ReplayGain").as_deref(),
+        Some("ReplayGain (track, +0.4 dB, tags du fichier)")
+    );
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "clipping_guard").and_then(|v| v.as_str()),
+        Some("tagged_peak")
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+}
+
+/// #2218 T9 A — l'écrêtage de l'étage ReplayGain, compté par #4020, est
+/// désormais LU dans le chemin du signal comme `eq_overs` l'est pour
+/// l'égaliseur. Sa portée est celle du processus (l'étage reçoit un `f64` nu,
+/// sans piste ni zone) et l'objet le DIT, pour qu'on ne le lise jamais comme
+/// le compte de la zone affichée.
+#[test]
+fn l_etape_replaygain_porte_le_compteur_d_ecretage_et_dit_sa_portee() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    let metrics = step_field(&sp, "ReplayGain", "metrics").expect("métriques d'écrêtage");
+    assert_eq!(
+        metrics.get("portee").and_then(|v| v.as_str()),
+        Some("processus"),
+        "la portée doit être dite, jamais devinée : {metrics}"
+    );
+    for champ in [
+        "echantillons_vus",
+        "echantillons_ecretes",
+        "exces_max_lsb",
+        "appels_ecretants",
+        "pistes_ecretees",
+    ] {
+        assert!(
+            metrics.get(champ).and_then(|v| v.as_u64()).is_some(),
+            "champ {champ} absent : {metrics}"
+        );
+    }
+    assert!(
+        metrics
+            .get("pourcentage")
+            .and_then(|v| v.as_f64())
+            .is_some()
+    );
 }
 
 // ---- #2362 : sortie mono ------------------------------------------------

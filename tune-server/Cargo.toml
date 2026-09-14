@@ -193,6 +193,14 @@ path = "tests/cles_developpeur_hors_journal.rs"
 [[test]]
 name = "journal_sondage_hqplayer"
 path = "tests/journal_sondage_hqplayer.rs"
+
+# #4051 — troisième de la même famille : abonné `tracing` GLOBAL, donc un
+# binaire à lui seul et UN essai dedans. Il garde le réglage LRCLIB publié par
+# `GET /system/config`, l'aller-retour du PATCH, et les deux lignes de journal
+# sans lesquelles ce ticket n'a pas pu être diagnostiqué.
+[[test]]
+name = "paroles_reglage_lrclib_4051"
+path = "tests/paroles_reglage_lrclib_4051.rs"
 # Les requêtes SQL de `tune-server` sur une VRAIE base PostgreSQL (#3123).
 # Cible à elle seule, derrière `required-features`, pour deux raisons : elle
 # monte un `AppState` sur le moteur PostgreSQL (impossible sans la feature), et
@@ -550,6 +558,19 @@ path = "tests/derive_des_garde_fous_2816.rs"
 name = "zones_auto_create_recension"
 path = "tests/zones_auto_create_recension.rs"
 
+# #3933 : tout ce que le serveur media publie dans sa DIDL vit sous `/api/v1`,
+# la seule surface qu'`auth_middleware` protege — un renderer DLNA se faisait
+# refuser en 401 chaque ressource qu'il y trouvait, sans aucun moyen de
+# s'authentifier. Le temoin passe par le ROUTEUR MONTE (`routes::router`), pas
+# par la fonction de decision, et fabrique ses chemins avec les constructeurs
+# d'URL de la DIDL pour qu'une cinquieme ressource ajoutee plus tard le fasse
+# rougir. Cible propre plutot qu'un `mod` dans `server_contracts` : ce banc-la
+# est deja le plus lourd de la caisse. `autotests = false` plus haut : sans
+# cette entree, le fichier ne serait JAMAIS compile, donc vert contre rien.
+[[test]]
+name = "serveur_media_didl_hors_auth_3933"
+path = "tests/serveur_media_didl_hors_auth_3933.rs"
+
 # #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
 # rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
 # jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
@@ -563,3 +584,25 @@ path = "tests/zones_auto_create_recension.rs"
 [[test]]
 name = "borne_smart_collections_2732"
 path = "tests/borne_smart_collections_2732.rs"
+
+# #4025 — même raison que `journal_sondage_hqplayer` ci-dessus, mot pour mot :
+# abonné `tracing` GLOBAL, donc un binaire à lui seul et UN SEUL essai dedans.
+# Celui-ci compte les lignes INFO que trois tours de `discover_and_register`
+# coûtent au journal (trois par minute chez le testeur du fil 1773), et vérifie
+# que la sortie n'est plus ré-enregistrée — donc que sa connexion TCP de
+# contrôle survit au sondage. `autotests = false` en tête de ce manifeste :
+# sans cette cible, le fichier ne serait JAMAIS compilé et la porte rendrait un
+# vert contre rien.
+[[test]]
+name = "journal_sondage_hqplayer_sans_bruit_4025"
+path = "tests/journal_sondage_hqplayer_sans_bruit_4025.rs"
+
+# 🔴 Ce banc n'avait JAMAIS eu de cible : `autotests = false` en tête de ce
+# manifeste le laissait hors compilation depuis sa création. 1 027 lignes,
+# 13 essais, zéro exécution — les contrats de 30 routes entre le serveur et le
+# client web n'étaient gardés par rien. Découvert le 13/09/2026 en ajoutant le
+# comptage de la plage dynamique (#2218) : `cargo test` a répondu « no test
+# target named `web_response_contracts` ».
+[[test]]
+name = "web_response_contracts"
+path = "tests/web_response_contracts.rs"
