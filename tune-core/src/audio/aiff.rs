@@ -182,6 +182,16 @@ pub fn decode_aiff_to_pcm(
 
     let is_little_endian = matches!(info.compression.as_deref(), Some("sowt"));
     let is_float = matches!(info.compression.as_deref(), Some("fl32") | Some("fl64"));
+    // `DecodedAudio` porte du PCM entier. Les sources 8 bits sont déjà
+    // élargies en mots de 16 bits ci-dessous ; les AIFC flottants sont
+    // convertis à la pleine échelle du conteneur entier maximal.
+    let output_bit_depth = if is_float {
+        32
+    } else if info.bits_per_sample == 8 {
+        16
+    } else {
+        info.bits_per_sample
+    };
 
     // Validate compression — we only handle uncompressed and common AIFC types
     if let Some(ref comp) = info.compression {
@@ -217,7 +227,7 @@ pub fn decode_aiff_to_pcm(
     if max_frames == 0 {
         return Ok(DecodedAudio {
             samples_i32: Vec::new(),
-            bit_depth: info.bits_per_sample,
+            bit_depth: output_bit_depth,
             sample_rate: info.sample_rate.round() as u32,
             channels: info.channels as u32,
             duration_s: 0.0,
@@ -242,7 +252,7 @@ pub fn decode_aiff_to_pcm(
     let mut samples: Vec<i32> = Vec::with_capacity(total_samples);
 
     if is_float {
-        // Float formats — scale to 16-bit range as i32
+        // Float formats — convert to full-scale signed 32-bit PCM.
         match info.bits_per_sample {
             32 => {
                 for chunk in raw.chunks_exact(4) {
@@ -251,8 +261,7 @@ pub fn decode_aiff_to_pcm(
                     } else {
                         f32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                     };
-                    let clamped = f_val.max(-1.0).min(1.0);
-                    samples.push((clamped * i16::MAX as f32) as i32);
+                    samples.push(float_to_i32(f_val as f64));
                 }
             }
             64 => {
@@ -268,8 +277,7 @@ pub fn decode_aiff_to_pcm(
                             chunk[7],
                         ])
                     };
-                    let clamped = f_val.max(-1.0).min(1.0);
-                    samples.push((clamped * i16::MAX as f64) as i32);
+                    samples.push(float_to_i32(f_val));
                 }
             }
             _ => {
@@ -284,9 +292,9 @@ pub fn decode_aiff_to_pcm(
         match info.bits_per_sample {
             8 => {
                 for &b in &raw {
-                    // 8-bit AIFF is unsigned
-                    let signed = b as i16 - 128;
-                    samples.push((signed << 8) as i32);
+                    // `sowt` ne change que l'ordre des octets. À 8 bits il
+                    // reste donc, comme AIFF, du PCM signé.
+                    samples.push(((b as i8 as i16) << 8) as i32);
                 }
             }
             16 => {
@@ -391,12 +399,19 @@ pub fn decode_aiff_to_pcm(
 
     Ok(DecodedAudio {
         samples_i32: samples,
-        bit_depth: info.bits_per_sample,
+        bit_depth: output_bit_depth,
         sample_rate: info.sample_rate.round() as u32,
         channels: info.channels as u32,
         duration_s,
         integrite,
     })
+}
+
+fn float_to_i32(sample: f64) -> i32 {
+    let clamped = sample.clamp(-1.0, 1.0);
+    (clamped * 2_147_483_648.0)
+        .round()
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32
 }
 
 #[cfg(test)]
@@ -409,6 +424,40 @@ mod tests {
         p.push("tests/fixtures");
         p.push(name);
         p.to_string_lossy().to_string()
+    }
+
+    fn synthetic_aifc(compression: &[u8; 4], bits_per_sample: u16, pcm: &[u8]) -> Vec<u8> {
+        let channels = 1u16;
+        let bytes_per_sample = u32::from(bits_per_sample).div_ceil(8);
+        let num_frames = (pcm.len() as u32) / bytes_per_sample;
+
+        let mut comm = Vec::new();
+        comm.extend_from_slice(b"COMM");
+        comm.extend_from_slice(&24u32.to_be_bytes());
+        comm.extend_from_slice(&(channels as i16).to_be_bytes());
+        comm.extend_from_slice(&num_frames.to_be_bytes());
+        comm.extend_from_slice(&(bits_per_sample as i16).to_be_bytes());
+        comm.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+        comm.extend_from_slice(compression);
+        comm.extend_from_slice(&[1, b'x']);
+
+        let mut ssnd = Vec::new();
+        ssnd.extend_from_slice(b"SSND");
+        ssnd.extend_from_slice(&(8u32 + pcm.len() as u32).to_be_bytes());
+        ssnd.extend_from_slice(&0u32.to_be_bytes());
+        ssnd.extend_from_slice(&0u32.to_be_bytes());
+        ssnd.extend_from_slice(pcm);
+        if pcm.len() % 2 != 0 {
+            ssnd.push(0);
+        }
+
+        let mut form = Vec::new();
+        form.extend_from_slice(b"FORM");
+        form.extend_from_slice(&(4u32 + comm.len() as u32 + ssnd.len() as u32).to_be_bytes());
+        form.extend_from_slice(b"AIFC");
+        form.extend_from_slice(&comm);
+        form.extend_from_slice(&ssnd);
+        form
     }
 
     // --- IEEE 754 extended precision tests ---
@@ -680,5 +729,52 @@ mod tests {
         assert_eq!(decoded.samples_i32.len(), 2);
         assert_eq!(decoded.samples_i32[0], 500);
         assert_eq!(decoded.samples_i32[1], -500);
+    }
+
+    #[test]
+    fn aifc_sowt_8_bits_reste_signe_et_sort_en_pcm_16_bits() {
+        let tmp = tempfile::Builder::new().suffix(".aifc").tempfile().unwrap();
+        std::fs::write(tmp.path(), synthetic_aifc(b"sowt", 8, &[0x00, 0x7f, 0x80])).unwrap();
+
+        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
+        assert_eq!(decoded.samples_i32, [0, 32_512, -32_768]);
+        assert_eq!(decoded.bit_depth, 16);
+        assert_eq!(decoded.pcm_bytes(), [0x00, 0x00, 0x00, 0x7f, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn aifc_fl32_sort_a_pleine_echelle_en_pcm_32_bits() {
+        let mut pcm = Vec::new();
+        for sample in [0.0f32, 0.5, -0.5, 1.0, -1.0] {
+            pcm.extend_from_slice(&sample.to_be_bytes());
+        }
+        let tmp = tempfile::Builder::new().suffix(".aifc").tempfile().unwrap();
+        std::fs::write(tmp.path(), synthetic_aifc(b"fl32", 32, &pcm)).unwrap();
+
+        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
+        assert_eq!(
+            decoded.samples_i32,
+            [0, 1_073_741_824, -1_073_741_824, i32::MAX, i32::MIN]
+        );
+        assert_eq!(decoded.bit_depth, 32);
+        assert_eq!(decoded.pcm_bytes().len(), decoded.samples_i32.len() * 4);
+    }
+
+    #[test]
+    fn aifc_fl64_sort_a_pleine_echelle_en_pcm_32_bits() {
+        let mut pcm = Vec::new();
+        for sample in [0.0f64, 0.5, -0.5, 1.0, -1.0] {
+            pcm.extend_from_slice(&sample.to_be_bytes());
+        }
+        let tmp = tempfile::Builder::new().suffix(".aifc").tempfile().unwrap();
+        std::fs::write(tmp.path(), synthetic_aifc(b"fl64", 64, &pcm)).unwrap();
+
+        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
+        assert_eq!(
+            decoded.samples_i32,
+            [0, 1_073_741_824, -1_073_741_824, i32::MAX, i32::MIN]
+        );
+        assert_eq!(decoded.bit_depth, 32);
+        assert_eq!(decoded.pcm_bytes().len(), decoded.samples_i32.len() * 4);
     }
 }
