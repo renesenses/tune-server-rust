@@ -25,7 +25,7 @@ pub async fn run_worker_if_requested() {
     std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 
-fn initialize_tls() {
+pub(super) fn initialize_tls() {
     // The child bypasses the server bootstrap, including its TLS setup.
     // tune-core directly enables rustls's default aws-lc provider; with ring
     // also present transitively, rustls cannot choose one automatically.
@@ -36,7 +36,7 @@ fn encode<T: Serialize>(result: Result<T, TuneError>) -> Result<Value, TuneError
     serde_json::to_value(result?).map_err(|_| "Spotify worker serialization failed".into())
 }
 
-async fn execute(engine: &mut Engine, operation: Operation) -> Result<Value, TuneError> {
+pub(super) async fn execute(engine: &mut Engine, operation: Operation) -> Result<Value, TuneError> {
     match operation {
         Operation::Init { tokens } => {
             if engine.restore_tokens(&tokens) {
@@ -44,7 +44,7 @@ async fn execute(engine: &mut Engine, operation: Operation) -> Result<Value, Tun
             }
             Ok(Value::Null)
         }
-        Operation::Status => encode(Ok(engine.auth_status().await)),
+        Operation::Status => encode(Ok(engine.poll_status().await)),
         Operation::Pair => encode(engine.authenticate(&json!({})).await),
         Operation::Search { query, limit } => encode(engine.search(&query, limit).await),
         Operation::Track { id } => encode(engine.get_track(&id).await),
@@ -54,6 +54,7 @@ async fn execute(engine: &mut Engine, operation: Operation) -> Result<Value, Tun
         Operation::ArtistAlbums { id } => encode(engine.get_artist_albums(&id).await),
         Operation::Playlist { id } => encode(engine.get_playlist(&id).await),
         Operation::PlaylistTracks { id } => encode(engine.get_playlist_tracks(&id).await),
+        Operation::UserPlaylists => encode(engine.get_user_playlists().await),
         Operation::Play { .. } => Err("Audio operations require an audio worker".into()),
     }
 }

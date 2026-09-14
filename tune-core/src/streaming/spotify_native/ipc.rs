@@ -47,6 +47,7 @@ pub(super) enum Operation {
     PlaylistTracks {
         id: String,
     },
+    UserPlaylists,
     Play {
         tokens: Value,
         id: String,

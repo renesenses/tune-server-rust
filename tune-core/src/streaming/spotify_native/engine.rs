@@ -18,6 +18,22 @@ use crate::streaming::traits::*;
 
 pub const PAIRING_SECONDS: u64 = 180;
 const TOKEN_KIND: &str = "librespot-pairing-v1";
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// The network boundary is replaceable in tests; status and worker dispatch
+/// still exercise the real session lifecycle, including invalidation/backoff.
+#[async_trait::async_trait]
+trait SessionConnector: Send + Sync {
+    async fn connect(&self, session: &Session, credentials: Credentials) -> Result<(), TuneError>;
+}
+
+struct NetworkConnector;
+#[async_trait::async_trait]
+impl SessionConnector for NetworkConnector {
+    async fn connect(&self, session: &Session, credentials: Credentials) -> Result<(), TuneError> {
+        bounded(session.connect(credentials, false)).await
+    }
+}
 
 /// Shuts down the AP connection even if login is cancelled or times out.
 struct Connected(Session);
@@ -35,6 +51,7 @@ struct Account {
     error: Option<String>,
     dirty: bool,
     generation: u64,
+    retry_after: Option<tokio::time::Instant>,
 }
 
 pub struct SpotifyNativeService {
@@ -43,6 +60,7 @@ pub struct SpotifyNativeService {
     account: Arc<Mutex<Account>>,
     pairing_cancel: Option<oneshot::Sender<()>>,
     reconnect: tokio::sync::Mutex<()>,
+    connector: Arc<dyn SessionConnector>,
 }
 
 impl Default for SpotifyNativeService {
@@ -59,6 +77,7 @@ impl SpotifyNativeService {
             account: Arc::new(Mutex::new(Account::default())),
             pairing_cancel: None,
             reconnect: tokio::sync::Mutex::new(()),
+            connector: Arc::new(NetworkConnector),
         }
     }
 
@@ -103,10 +122,37 @@ impl SpotifyNativeService {
             })?
         };
         let session = Connected(Session::new(self.config(), None));
-        bounded(session.0.connect(credentials, false)).await?;
+        if let Err(error) = self.connector.connect(&session.0, credentials).await {
+            let mut account = self.account.lock().unwrap();
+            account.retry_after = Some(tokio::time::Instant::now() + RECONNECT_BACKOFF);
+            account.error = Some("Spotify reconnect failed; retrying with saved pairing".into());
+            return Err(error);
+        }
         let result = session.0.clone();
-        self.account.lock().unwrap().session = Some(session);
+        let mut account = self.account.lock().unwrap();
+        account.session = Some(session);
+        account.retry_after = None;
+        account.error = None;
         Ok(result)
+    }
+
+    /// A status request may renew an existing pairing, but must never create
+    /// one. Snapshot reads remain free of I/O (including the worker's reply).
+    pub(super) async fn poll_status(&self) -> AuthStatus {
+        let reconnect = {
+            let account = self.account.lock().unwrap();
+            self.enabled
+                && account.credentials.is_some()
+                && account.pairing_until.is_none()
+                && account.session.as_ref().is_none_or(|s| s.0.is_invalid())
+                && account
+                    .retry_after
+                    .is_none_or(|at| tokio::time::Instant::now() >= at)
+        };
+        if reconnect {
+            let _ = self.session().await;
+        }
+        self.auth_status().await
     }
 
     /// Safe diagnostic payload: never returns credentials or access tokens.
@@ -170,7 +216,7 @@ impl StreamingService for SpotifyNativeService {
         }
         // Status polling must NEVER reopen discovery or extend its deadline.
         if input == &serde_json::json!({"poll": true}) {
-            return Ok(self.auth_status().await);
+            return Ok(self.poll_status().await);
         }
         // Never turn this route into a password/token importer. Re-pairing an
         // account requires logout first, so a stray LAN client cannot replace it.
@@ -330,7 +376,10 @@ impl StreamingService for SpotifyNativeService {
         catalog::playlist_tracks(&self.session().await?, id).await
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        Err(unsupported("personal playlists"))
+        super::library::user_playlists(&self.session().await?).await
+    }
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+        Err(unsupported("liked tracks"))
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Err(unsupported("saved albums"))
@@ -368,10 +417,7 @@ impl StreamingService for SpotifyNativeService {
         true
     }
     async fn post_restore(&mut self) {
-        if self.enabled && self.session().await.is_err() {
-            self.account.lock().unwrap().error =
-                Some("Spotify reconnect failed; retry or pair again".into());
-        }
+        self.poll_status().await;
     }
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         let mut state = self.account.lock().unwrap();
@@ -382,6 +428,109 @@ impl StreamingService for SpotifyNativeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FixtureConnector {
+        attempts: AtomicUsize,
+        fail: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl SessionConnector for FixtureConnector {
+        async fn connect(&self, _: &Session, _: Credentials) -> Result<(), TuneError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err("fixture: network unavailable; private diagnostic".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn paired_fixture() -> (SpotifyNativeService, Arc<FixtureConnector>) {
+        super::super::worker::initialize_tls();
+        let mut service = SpotifyNativeService::new();
+        let connector = Arc::new(FixtureConnector::default());
+        service.connector = connector.clone();
+        service.account.lock().unwrap().credentials =
+            Some(Credentials::with_access_token("fixture-only"));
+        (service, connector)
+    }
+
+    async fn worker_status(service: &mut SpotifyNativeService) -> AuthStatus {
+        serde_json::from_value(
+            super::super::worker::execute(service, super::super::ipc::Operation::Status)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_worker_status_reconnects_invalid_session_without_pairing() {
+        let (mut service, connector) = paired_fixture();
+        service.session().await.unwrap().shutdown();
+        assert!(!service.auth_status().await.authenticated);
+        let credentials = service.save_tokens().unwrap();
+        assert!(
+            worker_status(&mut service).await.authenticated,
+            "Spotify status must reconnect an invalid saved session without a search"
+        );
+        assert_eq!(connector.attempts.load(Ordering::SeqCst), 2);
+        assert!(worker_status(&mut service).await.authenticated);
+        assert_eq!(connector.attempts.load(Ordering::SeqCst), 2);
+        assert!(!service.pairing_status()["pairing"].as_bool().unwrap());
+        assert_eq!(service.save_tokens().unwrap(), credentials);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_status_reconnect_failure_keeps_pairing_and_backs_off() {
+        let (mut service, connector) = paired_fixture();
+        connector.fail.store(true, Ordering::SeqCst);
+        let credentials = service.save_tokens().unwrap();
+        assert!(!worker_status(&mut service).await.authenticated);
+        for _ in 0..3 {
+            assert!(!worker_status(&mut service).await.authenticated);
+        }
+        assert_eq!(
+            connector.attempts.load(Ordering::SeqCst),
+            1,
+            "Spotify status must back off after a failed reconnect"
+        );
+        assert_eq!(service.save_tokens().unwrap(), credentials);
+        assert!(
+            !service
+                .pairing_status()
+                .to_string()
+                .contains("private diagnostic")
+        );
+        assert!(!service.pairing_status()["pairing"].as_bool().unwrap());
+        tokio::time::advance(RECONNECT_BACKOFF).await;
+        connector.fail.store(false, Ordering::SeqCst);
+        assert!(worker_status(&mut service).await.authenticated);
+        assert_eq!(connector.attempts.load(Ordering::SeqCst), 2);
+        assert!(service.pairing_status()["error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn native_status_cannot_reconnect_disabled_logged_out_or_pairing_accounts() {
+        let (mut service, connector) = paired_fixture();
+        service.set_enabled(false);
+        assert!(!worker_status(&mut service).await.authenticated);
+        service.set_enabled(true);
+        service.account.lock().unwrap().pairing_until =
+            Some(std::time::Instant::now() + Duration::from_secs(60));
+        assert!(!worker_status(&mut service).await.authenticated);
+        service.logout().await.unwrap();
+        assert!(!worker_status(&mut service).await.authenticated);
+        assert_eq!(
+            connector.attempts.load(Ordering::SeqCst),
+            0,
+            "A status read must not reconnect after logout/disable or interfere with pairing"
+        );
+        assert!(!service.pairing_status()["pairing"].as_bool().unwrap());
+    }
+
     #[tokio::test]
     async fn native_starts_disconnected_and_refuses_password_input() {
         let mut service = SpotifyNativeService::new();

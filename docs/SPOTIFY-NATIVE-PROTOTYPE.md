@@ -47,14 +47,23 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   Coller une URI ou un lien `https://open.spotify.com/…` ouvre aussi l'entité
   correspondante (piste, album, artiste ou playlist).
 - Collections limitées à 300 objets. Une playlist partielle est refusée,
-  pas présentée comme complète. Favoris personnels, écriture et synchronisation
-  de playlists non implémentés et signalés comme tels.
+  pas présentée comme complète. Les playlists personnelles sont lues via la
+  rootlist de la session, par pages de 100 entrées, avec un plafond de 300
+  entrées (marqueurs de dossiers inclus). Tune en présente une liste plate,
+  dédoublonnée dans l'ordre Spotify. Une révision qui change entre les pages,
+  une page incohérente ou des métadonnées introuvables font échouer la lecture ;
+  aucun résultat partiel n'est mis en cache comme une liste complète.
+  Les décorations facultatives de la rootlist peuvent manquer : les fiches
+  des seules playlists concernées sont alors lues, avec quatre requêtes au
+  maximum en parallèle et conservation de l'ordre.
+  Titres aimés, albums enregistrés, artistes suivis, écriture et synchronisation
+  de playlists restent non implémentés. Les titres aimés rendent désormais un
+  refus explicite, au lieu de la liste vide héritée du trait.
 - Lecture par le Player Rust, PCM WAV 44,1 kHz / 16 bits stéréo vers une session
   Tune. La file et les commandes de sortie restent celles de Tune. Le seek
-  des sorties gérées par le serveur recrée le décodeur à l'offset demandé.
-  Le navigateur suit un autre chemin : son client déplace `audio.currentTime`
-  seulement si la durée du média est connue. Ce chemin doit être validé
-  séparément, notamment avant la fin du téléchargement.
+  des sorties gérées par le serveur et du navigateur recrée le décodeur à
+  l'offset demandé. Le navigateur suit `origine du flux + audio.currentTime`
+  et conserve la pause. Voir les preuves du raccord navigateur ci-dessous.
 - Sortie PCM bornée (64 blocs de 4096 octets), annulation même sous
   contre-pression, timeout de démarrage, EOF fini. Une seule zone productrice
   Spotify à la fois. Pas de préchargement gapless dans ce premier périmètre.
@@ -237,6 +246,87 @@ Le binaire de cet essai a pour SHA-256
 Le son avait été confirmé par l'utilisateur sur le premier prototype ; cette
 unité apporte des observations Chrome et serveur, pas une nouvelle attestation
 d'écoute humaine. Les deux pistes d'essai restent dans la file du Mac, arrêtée.
+
+### Reconnexion et bibliothèque personnelle — 14 septembre 2026
+
+Le statut demandé au worker appelle maintenant `poll_status` : une session
+invalide est reconnectée avec l'appairage conservé, sans recherche préalable
+et sans ouvrir la découverte. Après un échec, les consultations du statut
+attendent au moins 30 secondes avant une autre tentative. Une recherche
+explicite peut toujours réessayer immédiatement. Une session valide ne se
+reconnecte pas inutilement ; logout, désactivation et appairage en cours
+interdisent cette reconnexion. Un succès efface le diagnostic précédent.
+Les lectures de snapshot restent sans I/O, notamment lors de la construction
+des réponses du worker. Le rafraîchissement périodique existant du serveur
+(toutes les cinq minutes) emprunte lui aussi ce chemin.
+
+La rootlist personnelle passe par `get_rootlist` de librespot 0.8.0 puis le
+message protobuf `SelectedListContent`. Les routes Tune existantes
+`/streaming/spotify/playlists` et `/streaming/spotify/favorites/playlists`
+utilisent le même résultat. Ni favoris ajoutés, ni playlist créée/modifiée,
+ni permissions supplémentaires demandées.
+
+Preuves automatisées : 25 tests natifs et 29 tests HTTP réussis sur Shrek.
+Les nouveaux tests appellent le vrai dispatch `Operation::Status` et
+invalident une vraie `Session` ; seule la frontière réseau est remplacée par
+un connecteur de test. L'horloge Tokio est avancée sans attente réelle pour
+la temporisation. Le parseur de bibliothèque reçoit aussi une trame protobuf
+encodée puis décodée, avec deux pages et des marqueurs de dossiers.
+
+Contre-épreuves compilables, tests inchangés, puis restauration par copie et
+retour au vert :
+
+- `Status` renvoyant seulement le snapshot :
+  `native_worker_status_reconnects_invalid_session_without_pairing` échoue avec
+  `Spotify status must reconnect an invalid saved session without a search` ;
+- contrôle du délai retiré :
+  `native_status_reconnect_failure_keeps_pairing_and_backs_off` échoue avec
+  `Spotify status must back off after a failed reconnect`, 4 tentatives au
+  lieu de 1 ;
+- contrôle de révision retiré :
+  `native_library_refuses_changed_or_partial_pages` échoue avec
+  `Spotify personal library must refuse revision, not return a partial collection`.
+- refus réintroduit sur les décorations absentes :
+  `native_library_resolves_optional_decorations_without_inventing_metadata`
+  échoue avec `Spotify rootlist decorations are optional, not a missing playlist`.
+  Le code est restauré par copie, puis les 25 tests natifs et 29 tests HTTP
+  sont relancés et réussissent.
+
+L'essai réel de la bibliothèque n'est **pas validé** pour ce compte. Le premier
+binaire échoue sur une décoration sans nom ; celles-ci sont désormais
+complétées par lecture de leur fiche (test additionnel :
+`native_library_resolves_optional_decorations_without_inventing_metadata`).
+La rootlist du compte contient aussi une entrée marquée 403, sans indicateur
+de suppression. Une contre-vérification par lecture ordinaire de la fiche,
+avec la même session authentifiée, reçoit également un 403. Ce refus n'est
+pas contourné et l'entrée n'est pas supprimée du compte ni omise silencieusement.
+Le code final refuse donc rapidement la liste complète sur ce statut, au
+lieu de recommencer la lecture de cette fiche à chaque ouverture de l'écran.
+
+La reconnexion du statut est traitée ; l'affichage d'une bibliothèque avec
+des entrées indisponibles reste une étape distincte. Un résultat partiel devra
+porter un avertissement et ne pas emprunter le contrat actuel « liste complète ».
+Les tests à réseau simulé ne prouvent pas une longue veille réseau réelle.
+
+Essai du binaire final sur le Mac, SHA-256
+`62aa1c184cd97721e091ebfc964eba82ae232d60d832de606c291d61100f37df` :
+
+- redémarrage de la seule instance de test, santé `ok`, compte authentifié
+  sans appairage et recherche réelle de trois pistes réussie ;
+- fiche de la playlist publique `37i9dQZF1DXcBWIGoYBM5M` : HTTP 200 ;
+  ses 50 pistes sont reçues, avec identifiants et durées ;
+- Chrome : lien Spotify collé dans la recherche, carte « Today’s Top Hits »,
+  ouverture par le titre, puis tableau de 50 titres (2 h 43 min). Aucun
+  favori ajouté, aucune playlist modifiée, aucun démarrage audio depuis cette
+  fiche. Elle est laissée ouverte pour l'essai utilisateur ;
+- worker audio réel, sans conserver ni faire entendre le PCM : offsets
+  330 s et 335 s, respectivement 7,558 s et 2,541 s reçues, EOF et sortie 0 ;
+- liste personnelle : refus explicite de la rootlist portant le statut 403,
+  relayé en HTTP 502. Ce résultat ne vaut ni une liste vide ni une collection
+  complète validée. Les deux pistes de la zone de test restent arrêtées.
+
+Le client web n'a pas été modifié dans cette unité. Goinfre et l'instance de production restent
+inchangés ; aucune PR, release ou publication n'est effectuée.
 
 ## Essai utilisateur requis
 

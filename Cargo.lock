@@ -6191,6 +6191,7 @@ dependencies = [
  "objc2-core-audio-types",
  "opus",
  "ort",
+ "protobuf",
  "quick-xml 0.41.0",
  "rand_core 0.6.4",
  "rayon",

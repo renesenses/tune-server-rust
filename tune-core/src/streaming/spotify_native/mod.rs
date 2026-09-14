@@ -4,6 +4,7 @@ mod audio;
 mod catalog;
 mod engine;
 mod ipc;
+mod library;
 mod worker;
 
 use crate::TuneError;
@@ -272,7 +273,10 @@ impl StreamingService for SpotifyNativeService {
         self.call(Operation::PlaylistTracks { id: id.into() }).await
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
-        Err(unsupported("personal playlists"))
+        self.call(Operation::UserPlaylists).await
+    }
+    async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+        Err(unsupported("liked tracks"))
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Err(unsupported("saved albums"))
