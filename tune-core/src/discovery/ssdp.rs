@@ -258,8 +258,19 @@ impl ScannerState {
     /// serveur multimédia connu (cas courant : un `byebye` de renderer).
     fn oublier_serveur_multimedia(&mut self, id: &str) -> Option<MediaServerInfo> {
         let ms = self.media_servers.remove(id)?;
-        self.known_locations.remove(id);
-        self.miss_count.remove(id);
+        // ⚠️ Sauf si le MÊME identifiant est aussi un lecteur (#4124).
+        //
+        // Depuis la classification multiple, un composite — Sonos, HEOS — tient
+        // une entrée dans `devices` ET une dans `media_servers`, sous le même
+        // UDN. Retirer sa `LOCATION` en oubliant la moitié serveur priverait la
+        // moitié renderer de la seule adresse que `unicast_probe` et
+        // `known_id_for_location` savent interroger : le lecteur serait déclaré
+        // perdu sans qu'aucune sonde n'ait pu le défendre. C'est le renderer,
+        // qui répond à chaque M-SEARCH, qui garde alors la clé.
+        if !self.devices.contains_key(id) {
+            self.known_locations.remove(id);
+            self.miss_count.remove(id);
+        }
         Some(ms)
     }
 
@@ -1404,11 +1415,31 @@ async fn enregistrer_l_appareil(
             let host = host_from_location(&resp.location).unwrap_or_default();
             let port = port_from_location(&resp.location);
 
-            let device_type = if desc.is_openhome() {
-                OutputType::Openhome
-            } else if desc.is_media_renderer() {
-                OutputType::Dlna
-            } else if desc.has_av_transport() {
+            // ── Classification MULTIPLE, et non plus une chaîne de `else if`
+            //    (#4124) ───────────────────────────────────────────────────
+            //
+            // L'ancienne chaîne posait « renderer OU serveur » comme un choix
+            // exclusif. Un appareil composite est légitimement les DEUX, et la
+            // chaîne choisissait toujours renderer, parce que la branche
+            // `has_av_transport()` — vraie dès que `xml_parser` a rattaché les
+            // services du renderer imbriqué — précède `is_media_server()`.
+            //
+            // Sur un Sonos Play:1 :
+            //   is_openhome()       → non  (racine = ZonePlayer)
+            //   is_media_renderer() → non  (le type de la RACINE ne dit rien)
+            //   has_av_transport()  → OUI  ← et tout s'arrêtait là
+            //   is_media_server()   → JAMAIS ÉVALUÉ
+            //
+            // Les deux questions sont désormais posées SÉPARÉMENT, et les deux
+            // inscriptions se suivent. Rien ne change pour un appareil qui
+            // n'est que l'un des deux : l'ordre des trois tests de renderer est
+            // conservé tel quel, et un pur serveur n'a pas d'AVTransport.
+            let classement = classer_le_descripteur(&desc);
+
+            if classement.sortie == Some(OutputType::Dlna)
+                && !desc.is_media_renderer()
+                && !desc.is_openhome()
+            {
                 // Non-standard deviceType but supports AVTransport (WiiM, foobar2000 foo_upnp, etc.)
                 debug!(
                     id = %dev_id,
@@ -1416,67 +1447,23 @@ async fn enregistrer_l_appareil(
                     device_type = %desc.device_type,
                     "ssdp_non_standard_renderer_accepted"
                 );
-                OutputType::Dlna
-            } else if desc.is_media_server() {
-                let cd_url = desc
-                    .services
-                    .iter()
-                    .find(|s| s.service_type.contains("ContentDirectory"))
-                    .map(|s| s.control_url.clone())
-                    .unwrap_or_default();
-                if !cd_url.is_empty() {
-                    let host = host_from_location(&resp.location).unwrap_or_default();
-                    let base = base_url_from_location(&resp.location);
-                    let full_cd_url = if cd_url.starts_with("http") {
-                        cd_url
-                    } else {
-                        format!("{base}{cd_url}")
-                    };
-                    let ms = MediaServerInfo {
-                        id: dev_id.clone(),
-                        name: desc.friendly_name.clone(),
-                        manufacturer: desc.manufacturer.clone(),
-                        model: desc.model_name.clone(),
-                        location: resp.location.clone(),
-                        content_directory_url: full_cd_url,
-                        host,
-                        port,
-                        last_seen: Instant::now(),
-                        max_age: max_age_from_response(&resp),
-                    };
-                    // Record the media server as known so later SSDP cycles
-                    // skip it (see the `!known` gate above). Renderers are
-                    // recorded the same way further down; media servers were
-                    // omitted, so every ~2 min cycle re-fetched their
-                    // description and re-logged this INFO line — dozens of
-                    // duplicate `ssdp_media_server_discovered` entries that
-                    // drowned the playback traces in tester logs and made
-                    // DLNA issues undiagnosable (#954).
-                    {
-                        let mut st = state.lock().await;
-                        st.known_locations
-                            .insert(dev_id.clone(), resp.location.clone());
-                        // Le registre de fraîcheur, sans lequel rien
-                        // n'expire (#2139).
-                        st.media_servers.insert(dev_id.clone(), ms.clone());
-                    }
-                    info!(
-                        id = %dev_id,
-                        name = %ms.name,
-                        location = %ms.location,
-                        cd_url = %ms.content_directory_url,
-                        "ssdp_media_server_discovered"
-                    );
-                    let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
-                }
-                return;
+            }
+
+            let serveur_inscrit = if classement.serveur_multimedia {
+                inscrire_le_serveur_multimedia(state, event_tx, &dev_id, &resp, &desc, port).await
             } else {
-                debug!(
-                    id = %dev_id,
-                    name = %desc.friendly_name,
-                    device_type = %desc.device_type,
-                    "ssdp_device_skipped"
-                );
+                false
+            };
+
+            let Some(device_type) = classement.sortie else {
+                if !serveur_inscrit {
+                    debug!(
+                        id = %dev_id,
+                        name = %desc.friendly_name,
+                        device_type = %desc.device_type,
+                        "ssdp_device_skipped"
+                    );
+                }
                 return;
             };
 
@@ -1585,6 +1572,131 @@ async fn enregistrer_l_appareil(
             }
         }
     }
+}
+
+/// Ce qu'un descripteur autorise : une sortie audio (renderer) **et/ou** une
+/// inscription au registre des serveurs multimédia.
+///
+/// Les deux réponses sont INDÉPENDANTES, et c'est tout le correctif de #4124.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClassementDuDescripteur {
+    /// Le type de sortie à créer, ou `None` si ce n'est pas un lecteur.
+    pub sortie: Option<OutputType>,
+    /// Faut-il tenter une inscription au registre `media_servers` ?
+    pub serveur_multimedia: bool,
+}
+
+/// Classer un descripteur — sans réseau, sans état, sans effet de bord.
+///
+/// ⚠️ Ceci remplace une **chaîne de `else if`** qui posait « renderer OU
+/// serveur » comme un choix exclusif. Un appareil composite est légitimement
+/// les DEUX, et la chaîne choisissait toujours renderer, parce que la branche
+/// `has_av_transport()` — vraie dès que `xml_parser` a rattaché les services du
+/// renderer imbriqué — précédait `is_media_server()`.
+///
+/// Sur un Sonos Play:1, mesuré le 14/09/2026 :
+///
+/// ```text
+/// is_openhome()       → non   (racine = ZonePlayer)
+/// is_media_renderer() → non   (le type de la RACINE ne dit rien)
+/// has_av_transport()  → OUI   ← et tout s'arrêtait là
+/// is_media_server()   → JAMAIS ÉVALUÉ
+/// ```
+///
+/// Les deux questions sont désormais posées séparément. L'ordre des trois
+/// tests de renderer est conservé tel quel — rien ne change pour un appareil
+/// qui n'est que l'un des deux, et un pur serveur n'a pas d'AVTransport.
+///
+/// Le serveur, lui, est cherché dans l'ARBRE ENTIER : `is_media_server()` ne
+/// lit que le `deviceType` de la racine, `has_content_directory()` voit aussi
+/// le `MediaServer` imbriqué.
+pub(crate) fn classer_le_descripteur(desc: &DeviceDescription) -> ClassementDuDescripteur {
+    let sortie = if desc.is_openhome() {
+        Some(OutputType::Openhome)
+    } else if desc.is_media_renderer() || desc.has_av_transport() {
+        Some(OutputType::Dlna)
+    } else {
+        None
+    };
+
+    ClassementDuDescripteur {
+        sortie,
+        serveur_multimedia: desc.is_media_server() || desc.has_content_directory(),
+    }
+}
+
+/// Inscrit l'appareil au registre `media_servers`, s'il porte bien un
+/// `ContentDirectory` exploitable. Rend `true` si une entrée a été créée.
+///
+/// Extrait de [`enregistrer_l_appareil`] pour que la classification puisse être
+/// MULTIPLE (#4124) : un composite est serveur *et* renderer, et les deux
+/// inscriptions doivent pouvoir se suivre. Tant que ce corps vivait dans une
+/// branche `else if`, il était structurellement hors d'atteinte d'un appareil
+/// qui avait déjà satisfait une branche précédente.
+///
+/// Le corps lui-même est inchangé : mêmes champs, même trace, même évènement.
+async fn inscrire_le_serveur_multimedia(
+    state: &Arc<Mutex<ScannerState>>,
+    event_tx: &mpsc::Sender<SsdpEvent>,
+    dev_id: &str,
+    resp: &SsdpResponse,
+    desc: &DeviceDescription,
+    port: u16,
+) -> bool {
+    let cd_url = desc
+        .services
+        .iter()
+        .find(|s| s.service_type.contains("ContentDirectory"))
+        .map(|s| s.control_url.clone())
+        .unwrap_or_default();
+    if cd_url.is_empty() {
+        return false;
+    }
+
+    let host = host_from_location(&resp.location).unwrap_or_default();
+    let base = base_url_from_location(&resp.location);
+    let full_cd_url = if cd_url.starts_with("http") {
+        cd_url
+    } else {
+        format!("{base}{cd_url}")
+    };
+    let ms = MediaServerInfo {
+        id: dev_id.to_string(),
+        name: desc.friendly_name.clone(),
+        manufacturer: desc.manufacturer.clone(),
+        model: desc.model_name.clone(),
+        location: resp.location.clone(),
+        content_directory_url: full_cd_url,
+        host,
+        port,
+        last_seen: Instant::now(),
+        max_age: max_age_from_response(resp),
+    };
+
+    // Record the media server as known so later SSDP cycles
+    // skip it (see the `!known` gate above). Renderers are
+    // recorded the same way further down; media servers were
+    // omitted, so every ~2 min cycle re-fetched their
+    // description and re-logged this INFO line — dozens of
+    // duplicate `ssdp_media_server_discovered` entries that
+    // drowned the playback traces in tester logs and made
+    // DLNA issues undiagnosable (#954).
+    {
+        let mut st = state.lock().await;
+        st.known_locations
+            .insert(dev_id.to_string(), resp.location.clone());
+        // Le registre de fraîcheur, sans lequel rien n'expire (#2139).
+        st.media_servers.insert(dev_id.to_string(), ms.clone());
+    }
+    info!(
+        id = %dev_id,
+        name = %ms.name,
+        location = %ms.location,
+        cd_url = %ms.content_directory_url,
+        "ssdp_media_server_discovered"
+    );
+    let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
+    true
 }
 
 /// Troisième passe, sur le lot entier : les appareils qui n'ont pas répondu
@@ -3542,6 +3654,217 @@ mod porte_de_sortie_serveurs_multimedia {
         assert!(
             st.media_servers.contains_key("uuid:minim-1"),
             "le serveur voisin ne doit pas être emporté"
+        );
+    }
+}
+
+// ── #4124 : un appareil composite est serveur ET renderer ───────────────────
+//
+// Ce que la mesure du 14/09/2026 donnait : cinq serveurs répondent au M-SEARCH
+// `MediaServer:1`, dont les deux Sonos Play:1 de Bertrand, descripteurs
+// joignables en 200 — et le registre du `.18` n'en portait que trois, tous des
+// Tune. La cause n'était pas le réseau : c'était une chaîne de `else if` où la
+// branche serveur vivait en aval de la branche renderer.
+//
+// Les témoins ci-dessous prouvent les DEUX sens sur le même descripteur. Le
+// sens gagné ne vaut rien si le sens conservé lâche : c'est #2072 qui est en
+// jeu de l'autre côté.
+#[cfg(test)]
+mod classement_des_composites {
+    use super::*;
+    use crate::discovery::xml_parser::parse_device_description;
+
+    /// Le Sonos Play:1 tel qu'il se décrit : racine `ZonePlayer:1`, ni
+    /// renderer ni porteuse d'AVTransport, avec serveur et renderer imbriqués.
+    const SONOS: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:ZonePlayer:1</deviceType>
+    <friendlyName>192.168.1.19 - Sonos Play:1</friendlyName>
+    <UDN>uuid:RINCON_000E58F1D2E401400</UDN>
+    <deviceList>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+        <UDN>uuid:RINCON_000E58F1D2E401400_MS</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+            <controlURL>/MediaServer/ContentDirectory/Control</controlURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <controlURL>/MediaServer/ConnectionManager/Control</controlURL>
+          </service>
+        </serviceList>
+      </device>
+      <device>
+        <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+        <UDN>uuid:RINCON_000E58F1D2E401400_MR</UDN>
+        <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <controlURL>/MediaRenderer/AVTransport/Control</controlURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <controlURL>/MediaRenderer/ConnectionManager/Control</controlURL>
+          </service>
+        </serviceList>
+      </device>
+    </deviceList>
+  </device>
+</root>"#;
+
+    /// Un pur serveur — MinimServer, Asset UPnP : pas d'AVTransport, donc
+    /// aucune sortie. Le témoin qui dit que la classification multiple ne
+    /// fabrique pas de faux lecteurs.
+    const PUR_SERVEUR: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>
+    <friendlyName>Asset UPnP</friendlyName>
+    <UDN>uuid:asset-1</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+        <controlURL>/ContentDirectory/control</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    /// Un pur renderer, type standard, sans la moindre bibliothèque.
+    const PUR_RENDERER: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+    <friendlyName>WiiM Pro</friendlyName>
+    <UDN>uuid:wiim-1</UDN>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+        <controlURL>/AVTransport/control</controlURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+        <controlURL>/ConnectionManager/control</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+    /// **Les deux sens à la fois.** C'est l'assertion du ticket : le Sonos est
+    /// désormais serveur *et* renderer. Avant #4124, `serveur_multimedia` était
+    /// faux — non parce que le descripteur ne portait rien, mais parce que la
+    /// question n'était jamais posée.
+    #[test]
+    fn un_sonos_est_serveur_et_renderer() {
+        let desc = parse_device_description(SONOS).unwrap();
+        let classement = classer_le_descripteur(&desc);
+
+        assert_eq!(
+            classement.sortie,
+            Some(OutputType::Dlna),
+            "sens conservé : le Sonos reste un lecteur DLNA"
+        );
+        assert!(
+            classement.serveur_multimedia,
+            "sens gagné : le Sonos entre enfin au registre des serveurs"
+        );
+    }
+
+    /// La contre-épreuve du témoin précédent : la RACINE, à elle seule, ne
+    /// permet de répondre à aucune des deux questions. Sans cette assertion,
+    /// « le Sonos est serveur » pourrait être vrai pour une raison sans rapport
+    /// avec l'arbre imbriqué.
+    #[test]
+    fn la_racine_du_sonos_ne_dit_ni_serveur_ni_renderer() {
+        let desc = parse_device_description(SONOS).unwrap();
+
+        assert!(
+            !desc.is_media_server(),
+            "le deviceType de la racine est ZonePlayer:1"
+        );
+        assert!(!desc.is_media_renderer());
+        assert!(
+            desc.has_content_directory(),
+            "c'est l'ARBRE, pas la racine, qui porte le ContentDirectory"
+        );
+    }
+
+    /// Un pur serveur ne devient pas un lecteur. La classification multiple
+    /// ajoute une réponse, elle n'en relâche aucune.
+    #[test]
+    fn un_pur_serveur_ne_devient_pas_un_lecteur() {
+        let desc = parse_device_description(PUR_SERVEUR).unwrap();
+        let classement = classer_le_descripteur(&desc);
+
+        assert_eq!(classement.sortie, None, "aucun AVTransport, aucune sortie");
+        assert!(classement.serveur_multimedia);
+    }
+
+    /// Un pur renderer n'entre pas au registre des serveurs.
+    #[test]
+    fn un_pur_renderer_nentre_pas_au_registre_des_serveurs() {
+        let desc = parse_device_description(PUR_RENDERER).unwrap();
+        let classement = classer_le_descripteur(&desc);
+
+        assert_eq!(classement.sortie, Some(OutputType::Dlna));
+        assert!(
+            !classement.serveur_multimedia,
+            "pas de ContentDirectory, pas d'entrée au registre"
+        );
+    }
+
+    /// Un composite tient DEUX entrées sous le même UDN — une dans `devices`,
+    /// une dans `media_servers`. Oublier sa moitié serveur ne doit pas lui
+    /// retirer la `LOCATION` dont sa moitié lecteur a besoin pour se défendre :
+    /// `unicast_probe` ne sait interroger que celle-là.
+    #[test]
+    fn oublier_le_serveur_dun_composite_laisse_la_location_au_lecteur() {
+        let mut st = ScannerState::new();
+        let id = "uuid:RINCON_000E58F1D2E401400";
+        let location = "http://192.168.1.19:1400/xml/device_description.xml";
+
+        st.devices.insert(
+            id.to_string(),
+            DiscoveredDevice::new(
+                id.to_string(),
+                "Sonos Play:1".into(),
+                OutputType::Dlna,
+                "192.168.1.19".into(),
+                1400,
+            ),
+        );
+        st.media_servers.insert(
+            id.to_string(),
+            MediaServerInfo {
+                id: id.to_string(),
+                name: "Sonos Play:1".into(),
+                manufacturer: "Sonos, Inc.".into(),
+                model: "Sonos Play:1".into(),
+                location: location.to_string(),
+                content_directory_url:
+                    "http://192.168.1.19:1400/MediaServer/ContentDirectory/Control".into(),
+                host: "192.168.1.19".into(),
+                port: 1400,
+                last_seen: Instant::now(),
+                max_age: MEDIA_SERVER_MIN_MAX_AGE,
+            },
+        );
+        st.known_locations
+            .insert(id.to_string(), location.to_string());
+
+        assert!(st.oublier_serveur_multimedia(id).is_some());
+
+        assert!(
+            !st.media_servers.contains_key(id),
+            "la moitié serveur est bien oubliée"
+        );
+        assert_eq!(
+            st.known_locations.get(id).map(String::as_str),
+            Some(location),
+            "la LOCATION reste au lecteur, qui est toujours là"
         );
     }
 }
