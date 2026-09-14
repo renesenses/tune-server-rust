@@ -461,17 +461,30 @@ async fn une_source_upnp_s_indexe_sans_doublon_et_sans_rien_supprimer() {
         "le nombre total de pistes ne bouge pas d'une passe à l'autre"
     );
 
-    // --- 8. La réponse DIT ce qu'elle ne fait pas ---
+    // --- 8. La réponse DIT ses dégradations, sortie par sortie (D4) ---
+    //
+    // Depuis la phase 3, une ligne indexée SE JOUE : la réserve « la lecture
+    // est la phase 3 » serait devenue un mensonge dans l'autre sens. Ce que la
+    // route doit dire maintenant, ce sont les quatre comportements de D4.
     let reserves = deuxieme["reserves"]
         .as_array()
         .unwrap_or_else(|| panic!("reserves doit être une liste — {deuxieme}"));
+    let dites: Vec<&str> = reserves.iter().filter_map(Value::as_str).collect();
     assert!(
-        reserves
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|r| r.contains("phase 3")),
-        "la réponse doit dire que la LECTURE d'une ligne indexée n'est pas \
-         livrée par ce lot — ne jamais faire semblant : {deuxieme}"
+        !dites.iter().any(|r| r.contains("phase 3")),
+        "la réserve « la lecture est la phase 3 » doit avoir DISPARU : elle \
+         est fausse depuis que la lecture est branchée — {deuxieme}"
+    );
+    for attendu in ["réseau", "navigateur", "locale", "OAAT"] {
+        assert!(
+            dites.iter().any(|r| r.contains(attendu)),
+            "la réponse doit dire ce que vaut la lecture sur la sortie \
+             « {attendu} » — ne jamais faire semblant : {deuxieme}"
+        );
+    }
+    assert!(
+        dites.iter().any(|r| r.contains("ReplayGain")),
+        "la sortie locale joue sans ReplayGain : il faut le dire — {deuxieme}"
     );
 }
 

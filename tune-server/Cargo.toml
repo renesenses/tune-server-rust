@@ -623,3 +623,10 @@ path = "tests/refus_oaat_upnp_2219.rs"
 [[test]]
 name = "registre_serveurs_fraicheur_4125"
 path = "tests/registre_serveurs_fraicheur_4125.rs"
+
+# #2219 phase 3 — la lecture d'une ligne indexee. Binaire a lui seul : il pose
+# un abonne `tracing` GLOBAL, qui ne capterait rien s'il partageait un binaire
+# avec des tests paralleles.
+[[test]]
+name = "lecture_upnp_indexee_2219"
+path = "tests/lecture_upnp_indexee_2219.rs"

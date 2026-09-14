@@ -93,10 +93,12 @@
 //!
 //! L'URL de lecture n'est pas dans `source_id` **parce que `source_id` porte
 //! l'identité**. C'est un écart assumé avec le chemin `radio`/`podcast`, où
-//! l'orchestrateur lit l'URL directement dans `source_id`
-//! (`orchestrator/resolve_direct.rs`) — et c'est pourquoi la lecture d'une
-//! ligne indexée reste la **phase 3**. Ce lot ne prétend pas le contraire : il
-//! le DIT, dans la réponse de la route.
+//! `source_id` EST l'URL. Depuis la **phase 3**, l'orchestrateur le sait :
+//! `resolve_direct_url_de_source` (`orchestrator/resolve_direct.rs`) lit
+//! [`CLE_URL_DE_LECTURE`] dans l'instantané quand la demande ne nomme aucune
+//! URL. Les deux littéraux — celui écrit ici, celui relu là-bas — sont chacun
+//! gardés par un témoin : s'ils divergeaient, plus aucune piste indexée ne
+//! jouerait, et rien d'autre ne rougirait.
 
 use std::collections::{HashMap, HashSet};
 
@@ -388,8 +390,21 @@ fn reserves(bilan: &Bilan) -> Vec<String> {
         "aucun rapprochement avec la bibliothèque locale : un album présent \
          des deux côtés apparaît deux fois (D1, marquage en phase 5)"
             .to_string(),
-        "la LECTURE d'une piste indexée est la phase 3 : l'orchestrateur lit \
-         encore l'URL dans `source_id`, où vit désormais l'identité"
+        // D4, tranchée par Bertrand le 14/09 : jouable partout, défauts
+        // assumés et DITS. Depuis la phase 3, une ligne indexée SE JOUE — la
+        // lecture retrouve son URL dans l'instantané, pas dans `source_id`.
+        // Ce qui reste à dire, ce sont les dégradations par sortie.
+        "sortie réseau (DLNA / OpenHome) : la piste joue, mais le DSP de la \
+         zone ne s'y applique pas — pas un octet ne traverse Tune"
+            .to_string(),
+        "sortie navigateur : la piste joue, sans DSP non plus (relais octet \
+         pour octet)"
+            .to_string(),
+        "sortie locale : la piste joue AVEC le DSP, mais sans ReplayGain, et \
+         un saut dans la piste la relance à 0:00"
+            .to_string(),
+        "sortie OAAT : refusée explicitement, avec son motif — un point de \
+         sortie OAAT ne lit que du PCM en conteneur WAV"
             .to_string(),
     ];
     if bilan.sans_taille > 0 {
