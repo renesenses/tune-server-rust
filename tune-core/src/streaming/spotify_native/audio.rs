@@ -213,6 +213,9 @@ impl SpotifyNativeService {
         .map_err(|_| "Spotify audio worker startup timed out")??;
         let track = header.map_err(|e| e.into_tune().to_string())?;
         let (stream_id, tx, ready) = streamer.create_session(pcm_stream_info(), false, 64).await;
+        if let Some(session) = streamer.sessions_state().lock().await.get(&stream_id) {
+            let _ = session.restart_position_ms.set(u64::from(seek_ms));
+        }
         let (started, mut startup) = oneshot::channel::<Result<(), String>>();
         let stream_task = streamer.clone();
         let task_id = stream_id.clone();

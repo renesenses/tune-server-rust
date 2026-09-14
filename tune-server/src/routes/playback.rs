@@ -478,7 +478,8 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
                 .now_playing
                 .as_ref()
                 .and_then(|np| np.stream_id.as_deref()),
-        );
+        )
+        .await;
     }
     // Include signal_path (the bit-perfect indicator) so the play / next /
     // previous / resume responses carry it, matching GET /zones/{id}. Without
@@ -961,7 +962,8 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
                 .now_playing
                 .as_ref()
                 .and_then(|np| np.stream_id.as_deref()),
-        );
+        )
+        .await;
     }
     // #1274 — cette charge utile est la sérialisation brute de
     // `PlaybackState`, qui ne porte que le volume linéaire ; le dB s'ajoute
@@ -2501,13 +2503,23 @@ async fn seek(
     Path(zone_id): Path<i64>,
     Json(body): Json<SeekRequest>,
 ) -> impl IntoResponse {
+    if body.position_ms < 0 {
+        return (StatusCode::BAD_REQUEST, "position_ms must be non-negative").into_response();
+    }
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
         .seek(zone_id, body.position_ms as u64, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(json!({ "position_ms": body.position_ms })).into_response(),
+        Ok(()) => {
+            let zone = build_zone_json(&state, zone_id).await;
+            let mut reply = json!({ "position_ms": zone["position_ms"] });
+            if zone.get("browser_stream").is_some() {
+                reply["zone"] = zone;
+            }
+            Json(reply).into_response()
+        }
         Err(error) => output_command_error_response(error),
     }
 }

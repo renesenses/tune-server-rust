@@ -2234,6 +2234,42 @@ fn test_orchestrator() -> PlaybackOrchestrator {
 
 #[cfg(feature = "spotify-native")]
 #[tokio::test]
+async fn spotify_native_browser_seek_requires_decoder_confirmation() {
+    let orch = test_orchestrator();
+    orch.services.lock().await.register(Box::new(
+        crate::streaming::spotify_native::SpotifyNativeService::new(),
+    ));
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Native browser", Some("browser"), None)
+        .unwrap();
+    orch.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                source: "spotify".into(),
+                source_id: Some("4uLU6hMCjMI75M1A2tKUQC".into()),
+                title: "Test".into(),
+                duration_ms: 300_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    orch.playback.seek(zone_id, 5000).await;
+    let result = orch.seek(zone_id, 219_000, None).await;
+    assert!(
+        result.is_err(),
+        "browser native seek must restart a decoder, not falsely acknowledge a state-only seek"
+    );
+    assert_eq!(
+        orch.playback.get_state(zone_id).await.position_ms,
+        5000,
+        "a refused decoder seek must not commit the requested position"
+    );
+    assert!(orch.streamer.sessions_state().lock().await.is_empty());
+}
+
+#[cfg(feature = "spotify-native")]
+#[tokio::test]
 async fn spotify_native_resolves_through_session_not_public_audio_url() {
     let orch = test_orchestrator();
     orch.services.lock().await.register(Box::new(

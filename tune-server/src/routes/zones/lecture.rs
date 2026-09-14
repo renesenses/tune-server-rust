@@ -407,7 +407,8 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 ps.now_playing
                     .as_ref()
                     .and_then(|np| np.stream_id.as_deref()),
-            );
+            )
+            .await;
         }
         result.push(v);
     }
@@ -566,7 +567,8 @@ pub(super) async fn get_zone(
                     ps.now_playing
                         .as_ref()
                         .and_then(|np| np.stream_id.as_deref()),
-                );
+                )
+                .await;
             }
             Json(v).into_response()
         }

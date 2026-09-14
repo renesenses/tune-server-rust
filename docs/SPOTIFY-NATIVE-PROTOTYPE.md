@@ -137,7 +137,7 @@ Ces validations ciblées ne remplacent pas la CI multiplateforme.
   pause, puis reprise au passage conservé après une attente. Pas de nouvelle
   confirmation d'écoute humaine sur ce binaire, contrairement au premier.
 
-### Restes côté client web — non validés pour production
+### Défauts observés avant le raccord du client web
 
 Le seek Chrome a été reproduit en échec : demande à 219 514 ms, état serveur
 mis à cette valeur, mais `audio.currentTime` continue autour de 43 secondes.
@@ -151,7 +151,92 @@ alors que la reprise audio conserve son passage. Le badge « CD » est encore
 une déduction de la résolution PCM par le client, pas une preuve de qualité
 lossless Spotify. Le verdict global du chemin du signal est désormais faux
 pour `lossless` et `bit_perfect`, sans inventer une seconde conversion WAV.
-Le client web n'a pas été modifié dans cette unité.
+Le client web n'avait pas été modifié dans l'unité d'isolation.
+
+### Raccord navigateur — 14 septembre 2026
+
+Le flux natif porte maintenant une origine temporelle immuable, attachée à
+son identifiant de session : `restart_position_ms`. Les réponses de zone
+navigateur publient le contrat additif suivant :
+
+```json
+{
+  "stream_url": "http://serveur:18888/stream/identifiant-unique.wav",
+  "browser_stream": { "seek_mode": "restart", "start_position_ms": 219000 }
+}
+```
+
+La liste des zones, la fiche, le statut et les réponses de lecture utilisent
+la même URL WAV. Les autres sources gardent leur contrat ; les sorties
+matérielles ne reçoivent ni URL consommable par le navigateur ni ce marqueur.
+
+Le seek natif recrée le décodeur même sans `output_device_id`. Sa réponse
+conserve `position_ms` et ajoute `zone` avec le nouveau flux. Un échec du
+décodeur est un refus, pas un déplacement confirmé. La pause est conservée
+si le déplacement a été demandé pendant la pause. Une position négative
+est refusée ; l'extrémité est bornée avant la fin de la piste.
+
+Le client expérimental `feat/spotify-native-browser` suit l'horloge média,
+avec `position = origine du flux + audio.currentTime`. Il ne la remplace plus
+par le zéro obsolète du serveur pendant la pause. Les déplacements sont
+sérialisés, les gestes intermédiaires dépassés sont abandonnés, et une
+notification REST puis WebSocket du même flux ne le consomme pas deux fois.
+Les contrôles de seek passent par un chemin commun. La fin de file n'essaie
+plus de relire le dernier flux arrêté.
+
+Preuves automatisées :
+
+- Shrek, `tune-core`, `--no-default-features --features oaat,spotify-native` :
+  18 tests `spotify_native`, puis 30 tests `seek` réussis.
+- `tune-server --lib` : 2 tests du contrat navigateur, dont les vraies routes
+  GET liste/fiche/statut et le constructeur des réponses de lecture.
+- Client web, Node 22.23.2 (majeure de la CI) : `npm test`, 409 fichiers et
+  4 570 tests réussis ; build Vite réussi. Node 26.5.0 produisait des échecs
+  `localStorage` dans le banc DOM ; aucune configuration CI n'a été modifiée.
+- Contre-épreuves, tests inchangés et code compilable : sans routage vers le
+  décodeur, `spotify_native_browser_seek_requires_decoder_confirmation` échoue
+  avec `browser native seek must restart a decoder`; sans contrat de flux,
+  `native_browser_stream_contract_is_consistent_on_every_zone_surface` échoue
+  avec `PCM byte zero needs its track offset`.
+- Côté web, retirer l'offset donne `2250` au lieu de `221250`; retirer la
+  priorité de l'horloge audio donne `0` au lieu de `27500` pendant la pause.
+  Un témoin supplémentaire exécute la vraie boucle WebSocket `v2Live` : sans
+  son raccord, la pause rend `60000` au lieu de `99000`, exactement le défaut
+  observé dans la nouvelle interface (qui ne monte pas `App.svelte`). Le
+  chargement d'un onglet respecte aussi le volume enregistré : retirer ce
+  correctif donne `1` au lieu de `0.15` dans le témoin.
+  Les correctifs ont été restaurés par copie, puis les suites sont
+  revenues au vert. Les fichiers Rust restaurés ont été retouchés sur Shrek
+  pour ne pas réutiliser un témoin saboté à cause d'un mtime plus ancien.
+
+Limite supplémentaire constatée pendant cette unité : après environ trente
+minutes d'inactivité, le statut de la session catalogue peut devenir faux.
+Une recherche réelle reconnecte la session avec l'appairage conservé et le
+statut redevient vrai. L'affichage/reconnexion sur simple consultation du
+statut reste à traiter séparément.
+
+Essai réel Mac ARM64, serveur sur `18888`, appairage conservé, nouveau client
+chargé explicitement (le premier onglet conservait encore l'ancienne app) :
+
+- clic au milieu de la barre : nouveau flux à `168780` ms, Chrome avance
+  ensuite à `178801` ms ;
+- pause à `188493` ms (3:08), compteur inchangé après attente, alors que le
+  serveur reste à `168780` ms : la priorité de l'horloge média est observée ;
+- flèche gauche pendant la pause : nouveau flux à `178493` ms, zone toujours
+  en pause et compteur immobile à 2:58 ;
+- reprise : même identifiant de flux, compteur observé à `190352` ms ;
+- seek à `330000` ms sur Instant Crush (durée `337560`) : Chrome à 5:34,
+  puis un seul appel suivant automatique 7,4 s après la prise du flux ;
+  la deuxième piste démarre à zéro et Chrome affiche 0:13 sur celle-ci ;
+- deuxième piste, seek à `272000` ms pour une durée de `276560` : fin
+  naturelle 4,5 s après la prise du flux, un seul suivant, zone arrêtée en fin
+  de file. Aucun worker audio restant, santé serveur `ok`, même PID parent.
+
+Le binaire de cet essai a pour SHA-256
+`2006b1bab363e3060cff949dfe5251499452d2cf91669ecf31872ae8c35d73bb`.
+Le son avait été confirmé par l'utilisateur sur le premier prototype ; cette
+unité apporte des observations Chrome et serveur, pas une nouvelle attestation
+d'écoute humaine. Les deux pistes d'essai restent dans la file du Mac, arrêtée.
 
 ## Essai utilisateur requis
 

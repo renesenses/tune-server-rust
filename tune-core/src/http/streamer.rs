@@ -119,6 +119,10 @@ impl StreamInfo {
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
+    /// A one-shot decoder stream whose byte zero starts here in the track.
+    /// Seek must restart the producer, never use HTTP Range. Unset for normal
+    /// file/proxy/radio sessions; immutable for the lifetime of this stream ID.
+    pub restart_position_ms: std::sync::OnceLock<u64>,
     pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// Keeps the channel open until the session is removed, even after the
     /// decoder drops its tx. Without this, the HTTP stream ends as soon as
@@ -347,6 +351,7 @@ impl StreamSession {
         Self {
             id,
             info,
+            restart_position_ms: std::sync::OnceLock::new(),
             tx: Mutex::new(Some(tx)),
             _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),

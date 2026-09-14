@@ -23,6 +23,9 @@ use tune_core::playback::{PlayState, ZoneState};
 use crate::error::AppError;
 use crate::state::AppState;
 
+#[cfg(test)]
+mod browser_stream_tests;
+
 #[derive(Deserialize)]
 pub struct CreateZone {
     name: String,
@@ -777,7 +780,7 @@ pub fn zone_recoit_l_adresse_du_flux(output_type: Option<&str>) -> bool {
 ///
 /// Rend `true` quand l'adresse a été publiée, pour que l'appelant puisse le
 /// dire sans relire la charge utile.
-pub(crate) fn inject_stream_url(
+pub(crate) async fn inject_stream_url(
     obj: &mut serde_json::Map<String, Value>,
     state: &AppState,
     output_type: Option<&str>,
@@ -794,17 +797,34 @@ pub(crate) fn inject_stream_url(
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| "127.0.0.1".into())
     });
-    const EXT: &str = "flac";
+    let restart_position = state
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(stream_id)
+        .and_then(|session| session.restart_position_ms.get().copied());
+    let ext = if let Some(position) = restart_position {
+        obj.insert(
+            "browser_stream".into(),
+            json!({
+                "seek_mode": "restart", "start_position_ms": position
+            }),
+        );
+        "wav"
+    } else {
+        "flac"
+    };
     obj.insert(
         "stream_url".into(),
         json!(format!(
             "http://{}:{}/stream/{}.{}",
-            server_ip, state.port, stream_id, EXT
+            server_ip, state.port, stream_id, ext
         )),
     );
     // Adresse joignable de l'exterieur, quand le pont est actif.
     if let Some(distant) =
-        crate::routes::stream_handler::stream_url_distant(state.backend.clone(), stream_id, EXT)
+        crate::routes::stream_handler::stream_url_distant(state.backend.clone(), stream_id, ext)
     {
         obj.insert("stream_url_remote".into(), json!(distant));
     }
