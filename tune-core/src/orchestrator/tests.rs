@@ -2232,6 +2232,34 @@ fn test_orchestrator() -> PlaybackOrchestrator {
     )
 }
 
+#[cfg(feature = "spotify-native")]
+#[tokio::test]
+async fn spotify_native_resolves_through_session_not_public_audio_url() {
+    let orch = test_orchestrator();
+    orch.services.lock().await.register(Box::new(
+        crate::streaming::spotify_native::SpotifyNativeService::new(),
+    ));
+    let request = PlayRequest {
+        zone_id: 1,
+        source: Some("spotify".into()),
+        source_id: Some("4uLU6hMCjMI75M1A2tKUQC".into()),
+        ..Default::default()
+    };
+    let error = orch
+        .resolve_streaming_url("spotify", &request)
+        .await
+        .err()
+        .expect("unpaired Spotify must refuse playback");
+    assert!(
+        error.contains("pair Tune"),
+        "native Spotify must reach the session path, not get_track_url: {error}"
+    );
+    assert!(
+        orch.streamer.sessions_state().lock().await.is_empty(),
+        "an unpaired play must not leak an HTTP audio session"
+    );
+}
+
 /// #3229 — l'avance gapless remet le curseur à 0:00 pour de VRAI.
 ///
 /// La position publiée ne recule plus dans une piste : `update_position`

@@ -340,6 +340,15 @@ pub trait StreamingService: Send + Sync {
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError>;
     async fn auth_status(&self) -> AuthStatus;
+    /// Optional, non-secret instructions for an authentication flow without a
+    /// browser URL (e.g. LAN pairing). Never include credentials in this value.
+    fn auth_details(&self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Separate credential namespaces for opt-in implementations of one source.
+    fn credential_key(&self) -> String {
+        format!("auth_tokens_{}", self.name())
+    }
     async fn logout(&mut self) -> Result<(), TuneError>;
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError>;

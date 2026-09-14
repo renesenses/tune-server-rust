@@ -7,6 +7,7 @@ autotests = false
 
 [features]
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp"]
+spotify-native = ["tune-core/spotify-native"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]

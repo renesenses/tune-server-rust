@@ -941,7 +941,7 @@ fn spawn_token_refresher(state: &AppState) {
                             let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(
                                 db.clone(),
                             );
-                            let key = format!("auth_tokens_{name}");
+                            let key = svc.credential_key();
                             if svc.session_expired() {
                                 // The token was rejected and could not be
                                 // renewed. Delete the row instead of leaving a

@@ -2383,6 +2383,31 @@ impl PlaybackOrchestrator {
         seek_start: std::time::Instant,
     ) -> OutputCommandResult<()> {
         let original_position_ms = state.position_ms;
+        #[cfg(feature = "spotify-native")]
+        if state
+            .now_playing
+            .as_ref()
+            .is_some_and(|np| np.source == "spotify")
+        {
+            let service = { self.services.lock().await.get("spotify") };
+            let native = if let Some(service) = service {
+                service
+                    .read()
+                    .await
+                    .as_any()
+                    .is::<crate::streaming::spotify_native::SpotifyNativeService>()
+            } else {
+                false
+            };
+            if native {
+                // A Spotify PCM pipe cannot seek by HTTP Range or SOAP. Decode
+                // a new stream at the requested offset; no second renderer seek.
+                return self
+                    .replay_zone_at_position(zone_id, position_ms, "spotify_native_seek")
+                    .await
+                    .map_err(|error| OutputCommandError::failed(OutputCommand::Seek, error));
+            }
+        }
         // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
         // the seek strategy depends on whether the stream session supports
         // HTTP Range-based seeking:

@@ -72,7 +72,7 @@ impl ServiceRegistry {
         for (name, svc) in &self.services {
             let svc = svc.read().await;
             if let Some(tokens) = svc.save_tokens() {
-                let key = format!("auth_tokens_{name}");
+                let key = svc.credential_key();
                 settings.set(&key, &tokens.to_string()).ok();
                 info!(service = %name, "tokens_saved");
             }
@@ -158,7 +158,7 @@ impl ServiceRegistry {
             }
 
             // Restore auth tokens
-            let key = format!("auth_tokens_{name}");
+            let key = svc.read().await.credential_key();
             if let Some(json_str) = settings.get(&key).ok().flatten()
                 && let Ok(tokens) = serde_json::from_str(&json_str)
             {

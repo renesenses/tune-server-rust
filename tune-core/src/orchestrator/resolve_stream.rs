@@ -148,6 +148,28 @@ impl PlaybackOrchestrator {
             .as_deref()
             .ok_or("source_id required for streaming")?;
 
+        #[cfg(feature = "spotify-native")]
+        if service_name == "spotify" {
+            let service = { self.services.lock().await.get(service_name) };
+            if let Some(service) = service {
+                let service = service.read().await;
+                if let Some(native) = service
+                    .as_any()
+                    .downcast_ref::<crate::streaming::spotify_native::SpotifyNativeService>(
+                ) {
+                    if self
+                        .load_streaming_dsp(req.zone_id, req.track_id, 44100, 2)
+                        .is_active()
+                    {
+                        return Err("Spotify native prototype does not apply zone DSP; use a zone without active DSP".into());
+                    }
+                    return native
+                        .resolve_audio(self.streamer.clone(), &self.server_ip(), req)
+                        .await;
+                }
+            }
+        }
+
         // Check for prefetched PCM data before downloading.
         // If the prefetch engine has already decoded this track, serve
         // the PCM directly via a streaming session — zero download delay.

@@ -42,6 +42,12 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
 
+# Experimental native Spotify source (#4166), never linked by default.
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-discovery = { version = "=0.8.0", default-features = false, features = ["with-libmdns", "rustls-tls-webpki-roots"], optional = true }
+
 # --- Sendspin (#3326) : cryptographie et encodage, sur TOUTES les plateformes.
 #
 # Ces quatre caisses ne doivent PAS retourner sous
@@ -269,6 +275,7 @@ harness = false
 
 [features]
 default = ["local-audio"]
+spotify-native = ["dep:librespot-core", "dep:librespot-metadata", "dep:librespot-playback", "dep:librespot-discovery", "dep:vergen"]
 local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
@@ -355,6 +362,10 @@ path = "tests/reactivite_egaliseur_i3479.rs"
 
 [build-dependencies]
 cc = "1"
+# librespot 0.8.0 / vergen-gitcl 1.0.8 cannot build with vergen 9.1.0
+# (upstream #1681). Match librespot's release lockfile, including when Tune
+# is consumed as a path dependency and this workspace lockfile is ignored.
+vergen = { version = "=9.0.6", default-features = false, optional = true }
 
 # AAC natif Windows (#1527) : Media Foundation via le crate `windows` —
 # même version 0.62 que celle que cpal tire déjà, donc aucune compilation

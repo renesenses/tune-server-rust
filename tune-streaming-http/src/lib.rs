@@ -18,6 +18,7 @@ use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
 pub mod deezer_proxy_handler;
+mod spotify_pairing;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -438,6 +439,8 @@ where
         .route("/youtube/moods", get(youtube_moods))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        .route("/spotify/native-pairing", get(spotify_pairing::page))
+        .route("/spotify/native-pairing.js", get(spotify_pairing::script))
         .route("/tidal/callback", get(tidal_callback))
 }
 
@@ -870,6 +873,13 @@ async fn list_services(State(state): State<StreamingHttpState>) -> Json<Value> {
     }
 }
 
+fn with_auth_details(mut response: Value, details: Option<Value>) -> Value {
+    if let Some(details) = details {
+        response["auth_details"] = details;
+    }
+    response
+}
+
 async fn service_status(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
@@ -881,22 +891,31 @@ async fn service_status(
 
     let mut svc = svc.write().await;
     let mut status = svc.auth_status().await;
+    let mut save = false;
     if !status.authenticated
         && let Ok(poll_status) = svc.authenticate(&json!({"poll": true})).await
         && poll_status.authenticated
     {
         status = poll_status;
-        drop(svc);
+        save = true;
+    }
+    let details = svc.auth_details();
+    let enabled = svc.enabled();
+    drop(svc);
+    if save {
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
     }
-    Json(json!({
-        "service": service,
-        "enabled": true,
-        "authenticated": status.authenticated,
-        "username": status.username,
-        "subscription": status.subscription,
-    }))
+    Json(with_auth_details(
+        json!({
+            "service": service,
+            "enabled": enabled,
+            "authenticated": status.authenticated,
+            "username": status.username,
+            "subscription": status.subscription,
+        }),
+        details,
+    ))
     .into_response()
 }
 
@@ -908,7 +927,12 @@ async fn service_auth(
     let body: Option<Value> = if raw_body.is_empty() {
         None
     } else {
-        serde_json::from_slice(&raw_body).ok()
+        match serde_json::from_slice(&raw_body) {
+            Ok(value) => Some(value),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "invalid authentication JSON").into_response();
+            }
+        }
     };
 
     let svc = match get_svc(&state, &service).await {
@@ -921,6 +945,7 @@ async fn service_auth(
 
     match svc.authenticate(&credentials).await {
         Ok(status) => {
+            let details = svc.auth_details();
             drop(svc);
             state.save_tokens().await;
             // Nouveau compte possible : les listes de l'ancien ne valent plus.
@@ -934,15 +959,18 @@ async fn service_auth(
                     }),
                 );
             }
-            Json(json!({
-                "service": service,
-                "authenticated": status.authenticated,
-                "username": status.username,
-                "verification_url": status.verification_url,
-                "user_code": status.user_code,
-                "device_code": status.device_code,
-                "expires_in": status.expires_in,
-            }))
+            Json(with_auth_details(
+                json!({
+                    "service": service,
+                    "authenticated": status.authenticated,
+                    "username": status.username,
+                    "verification_url": status.verification_url,
+                    "user_code": status.user_code,
+                    "device_code": status.device_code,
+                    "expires_in": status.expires_in,
+                }),
+                details,
+            ))
             .into_response()
         }
         Err(e) => {
@@ -977,6 +1005,7 @@ async fn auth_poll_status(
     let poll_creds = json!({"poll": true});
     match svc.authenticate(&poll_creds).await {
         Ok(status) => {
+            let details = svc.auth_details();
             let authenticated = status.authenticated;
             let username = status.username.clone();
             if authenticated {
@@ -984,15 +1013,18 @@ async fn auth_poll_status(
                 state.save_tokens().await;
                 purge_contenu_utilisateur(&service);
             }
-            Json(json!({
-                "service": service,
-                "authenticated": authenticated,
-                "username": username,
-                // The YouTube client names this account identifier `email`.
-                // Keep the generic `username` field and expose the explicit
-                // alias so the route fulfils both contracts (#1897).
-                "email": status.username,
-            }))
+            Json(with_auth_details(
+                json!({
+                    "service": service,
+                    "authenticated": authenticated,
+                    "username": username,
+                    // The YouTube client names this account identifier `email`.
+                    // Keep the generic `username` field and expose the explicit
+                    // alias so the route fulfils both contracts (#1897).
+                    "email": status.username,
+                }),
+                details,
+            ))
             .into_response()
         }
         Err(e) => Json(json!({
