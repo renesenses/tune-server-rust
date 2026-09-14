@@ -114,13 +114,19 @@ fn exige_un_banc_des_deux_natures() {
     );
 }
 
+/// Le fichier d'un album LOCAL du banc — celui qu'un scan retrouve sur le
+/// disque, et dont la disparition lève le masque (propriété 3).
+fn fichier_local(titre: &str) -> String {
+    format!("/musique/{titre}.flac")
+}
+
 /// Pose le banc et rend `(id du distant doublé, id du local qui le masque)`.
 fn poser_le_banc(etat: &AppState) -> (i64, i64) {
     let artistes = ArtistRepo::with_backend(etat.backend.clone());
     let albums = AlbumRepo::with_backend(etat.backend.clone());
     let pistes = TrackRepo::with_backend(etat.backend.clone());
 
-    let mut creer = |titre: &str, artiste: &str, source: &str| -> i64 {
+    let creer = |titre: &str, artiste: &str, source: &str| -> i64 {
         let artiste_id = artistes
             .get_or_create(artiste, None, None)
             .unwrap_or_else(|e| panic!("artiste {artiste} : {e}"))
@@ -144,7 +150,7 @@ fn poser_le_banc(etat: &AppState) -> (i64, i64) {
         piste.artist_id = artiste_id;
         piste.source = source.to_string();
         if source == "local" {
-            piste.file_path = Some(format!("/musique/{titre}.flac"));
+            piste.file_path = Some(fichier_local(titre));
         } else {
             piste.source_id = Some(format!("upnp:{titre}:1"));
         }
@@ -333,6 +339,17 @@ async fn i4146_le_masque_n_efface_rien_et_se_leve() {
         "aucune piste n'a été effacée — {stats}"
     );
 
+    // Le masque est bien POSÉ avant qu'on le lève : sans cette lecture, la
+    // levée ne prouverait rien — un serveur qui ne masque jamais rendrait le
+    // distant avant comme après, et la fin de cette épreuve passerait au vert
+    // sans qu'aucun masquage n'existe.
+    let avant = grille(&corps_de(&app, "/api/v1/library/albums?limit=100").await);
+    assert!(
+        !avant.iter().any(|(t, s)| t == DOUBLE_TITRE && s == "upnp"),
+        "point de départ : « {DOUBLE_TITRE} » (upnp) doit être MASQUÉ tant que le \
+         local existe — rendus : {avant:?}"
+    );
+
     // La fiche de l'album masqué répond toujours : il est consultable et
     // jouable, il n'est qu'absent des LISTES.
     let fiche = corps_de(&app, &format!("/api/v1/library/albums/{distant_double}")).await;
@@ -342,10 +359,29 @@ async fn i4146_le_masque_n_efface_rien_et_se_leve() {
         "l'album masqué doit rester consultable par son identifiant — {fiche}"
     );
 
-    // 2. Le local disparaît (fichier retiré, racine démontée, purge de scan).
-    AlbumRepo::with_backend(etat.backend.clone())
-        .delete(local_doublon)
-        .expect("suppression de la contrepartie locale");
+    // 2. Le local disparaît — par le CHEMIN DE PRODUCTION, pas par un
+    //    `DELETE` de complaisance : un scan qui ne retrouve plus le fichier
+    //    purge la piste (`delete_by_path`), puis l'album devenu vide
+    //    (`delete_orphans`). Supprimer l'album directement échouerait d'ailleurs
+    //    sur la clé étrangère des pistes — la base ne le permet pas.
+    TrackRepo::with_backend(etat.backend.clone())
+        .delete_by_path(&fichier_local(DOUBLE_TITRE))
+        .expect("purge de la piste locale, fichier disparu");
+    let orphelins = AlbumRepo::with_backend(etat.backend.clone())
+        .delete_orphans()
+        .expect("purge des albums devenus vides");
+    assert_eq!(
+        orphelins, 1,
+        "seul l'album LOCAL devenu vide doit être purgé — l'album distant garde \
+         sa piste et reste en base"
+    );
+    assert!(
+        AlbumRepo::with_backend(etat.backend.clone())
+            .get(local_doublon)
+            .expect("lecture de l'album local purgé")
+            .is_none(),
+        "la contrepartie locale doit avoir disparu de la base"
+    );
 
     let apres = corps_de(&app, "/api/v1/library/albums?limit=100").await;
     let rendus = grille(&apres);
