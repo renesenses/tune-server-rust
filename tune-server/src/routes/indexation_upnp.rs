@@ -674,7 +674,7 @@ mod tests {
     fn le_condensat_est_fige() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a64(b"foobar"), 0x8556_8907_7dc4_4413);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     /// **La mesure du 14/09, rejouée.** Deux `ObjectID` différents, la même
