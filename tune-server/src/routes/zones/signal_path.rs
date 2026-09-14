@@ -1598,6 +1598,12 @@ fn decrire_la_source<'w>(
         .as_ref()
         .map(|f| f.is_lossless())
         .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
+    // The native prototype requests librespot's compressed 320 profile. WAV
+    // is its DECODED transport, not evidence of a lossless Spotify source.
+    // Do not generalize to future Spotify transports or change other sources.
+    #[cfg(feature = "spotify-native")]
+    let is_lossless =
+        is_lossless && !(np.source == "spotify" && source_format == Some(AudioFormat::Wav));
     Source {
         output_container,
         wire_sample_rate,

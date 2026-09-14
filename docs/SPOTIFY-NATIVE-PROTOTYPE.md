@@ -4,14 +4,27 @@ Arbitrage JP : essayer sans application développeur ni Client ID à saisir.
 Base : `main` 24123a4e (v0.9.150). Aucun changement de version, aucun déploiement
 automatique. Le service existant reste celui des compilations ordinaires.
 
-## Limite de sécurité avant toute utilisation
+## Isolation et limites de sécurité
 
 **Instance de test séparée, base séparée, compte Premium uniquement.**
 `librespot-core` 0.8.0 appelle `process::exit(1)` quand le compte n'est pas
 Premium ; `librespot-playback` le fait aussi sur certains états internes
-invalides. `catch_unwind` ne peut pas intercepter ces sorties. Le prototype
-ne doit donc pas être activé dans une instance Tune en production. Une
-isolation en sous-processus avec supervision est requise avant intégration.
+invalides. `catch_unwind` ne peut pas intercepter ces sorties. Le catalogue
+et l'authentification tournent donc dans un sous-processus persistant, et
+chaque lecture dans un sous-processus jetable. Le bootstrap les distingue
+avant d'ouvrir configuration, base, plugins ou journaux du serveur.
+
+Les messages passent par des tuyaux anonymes, avec des trames JSON limitées
+à 8 Mio ; les identifiants ne passent ni dans les arguments ni dans des
+fichiers de transfert. La sortie d'erreur du worker est désactivée. Le flux
+audio enchaîne une réponse encadrée puis du PCM brut. Le parent supervise,
+arrête et récolte les enfants, même bloqués sur un tuyau plein. Une requête
+interrompue détruit son worker pour ne pas réutiliser une réponse orpheline.
+Une requête suivante peut reconnecter le catalogue avec les identifiants
+conservés ; aucune réouverture automatique de l'appairage.
+
+Cette isolation de panne n'est **pas** une sandbox de sécurité ni une
+validation de production. L'instance de test reste séparée de Goinfre/l'instance de production.
 
 Sources examinées : [session.rs](https://github.com/librespot-org/librespot/blob/v0.8.0/core/src/session.rs),
 [player.rs](https://github.com/librespot-org/librespot/blob/v0.8.0/playback/src/player.rs).
@@ -38,13 +51,20 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   de playlists non implémentés et signalés comme tels.
 - Lecture par le Player Rust, PCM WAV 44,1 kHz / 16 bits stéréo vers une session
   Tune. La file et les commandes de sortie restent celles de Tune. Le seek
-  recrée le décodeur à l'offset demandé, sans tenter un Range dans un tuyau PCM.
+  des sorties gérées par le serveur recrée le décodeur à l'offset demandé.
+  Le navigateur suit un autre chemin : son client déplace `audio.currentTime`
+  seulement si la durée du média est connue. Ce chemin doit être validé
+  séparément, notamment avant la fin du téléchargement.
 - Sortie PCM bornée (64 blocs de 4096 octets), annulation même sous
   contre-pression, timeout de démarrage, EOF fini. Une seule zone productrice
   Spotify à la fois. Pas de préchargement gapless dans ce premier périmètre.
 - Les zones avec DSP actif sont refusées : il ne faut pas ignorer un réglage
   silencieusement. Pas de normalisation supplémentaire, pas de VU-mètres
   Spotify ajoutés. 320 kbit/s est demandé, mais pas annoncé comme débit mesuré.
+- La durée du catalogue ne sert pas à inventer un `Content-Length` PCM :
+  le HTTP est de longueur inconnue et se termine sur le véritable EOF du
+  worker. Le chemin du signal ne qualifie pas ce décodage de lossless ou
+  bit-perfect. L'étiquette WAV 44,1/16 décrit le transport, pas la source.
 
 ## Compilation / validation
 
@@ -80,10 +100,58 @@ Le verrou provient de la release amont, pas d'une modification du cache Cargo.
   JSON mal formé à l'authentification : HTTP 400, toujours aucun appairage.
 - Recherche sans compte : refus explicite demandant l'appairage, aucun résultat
   inventé. Formatage Rust, `git diff --check` et `node --check` réussis.
-- Aucun navigateur connecté à l'outil : rendu visuel et interactions JavaScript
-  non vérifiés dans un navigateur. Les contrôles HTTP ne les remplacent pas.
+- Essai utilisateur effectué ensuite sur le Mac : appairage depuis Spotify,
+  recherche, navigation d'album et lecture dans une zone navigateur dédiée.
+  L'utilisateur a confirmé entendre le son. L'interface a été pilotée et
+  inspectée dans Chrome. Ces résultats portent sur le premier binaire ; la
+  version isolée fait l'objet d'une validation complémentaire ci-dessous.
 
 Ces validations ciblées ne remplacent pas la CI multiplateforme.
+
+### Validation complémentaire de l'isolation, le même jour
+
+- 17 tests natifs sur Shrek, un test serveur du chemin du signal et 29 tests
+  HTTP réussis. Les contre-épreuves ci-dessous ont rougi, puis les correctifs
+  restaurés sont revenus au vert. Cross-build macOS ARM réussi.
+- Le premier démarrage réel a révélé l'initialisation TLS manquante dans le
+  worker : rustls voyait deux providers et paniquait. Tune restait disponible.
+  Le worker installe maintenant explicitement son provider avant toute session.
+  Le témoin runtime `verify-worker-tls.py`, avec des identifiants factices,
+  échoue sur le binaire sans correctif avec
+  `Spotify worker needs its own TLS provider before creating a session`, puis
+  réussit inchangé avec le correctif. Aucun secret réel utilisé par ce témoin.
+- Redémarrage Mac : appairage conservé, statut authentifié, recherche réelle
+  de trois pistes réussie. Le parent et le worker de catalogue sont bien deux
+  processus distincts. Après `SIGKILL` du worker, le PID du serveur ne change
+  pas, sa santé reste `ok` et le statut suivant reconnecte un nouveau worker.
+- Après `SIGKILL` d'un worker audio exactement identifié comme enfant de
+  cette instance, il disparaît et Tune reste disponible avec le même PID.
+  Une lecture suivante dans Chrome démarre un nouveau worker et avance.
+- Worker audio réel, sans sauvegarder le PCM : les offsets 330 000 et
+  335 000 ms d'une piste de 337 560 ms produisent respectivement 7,558 et
+  2,541 secondes PCM, puis EOF et sortie 0.
+- HTTP, navigateur écarté du flux pour éviter deux consommateurs concurrents :
+  59 545 628 octets reçus, HTTP 200 `audio/wav`, chunked, fermeture normale.
+  Cela valide la fin HTTP, pas encore l'enchaînement naturel dans Chrome.
+- Chrome : lecture observée (`Lecture audio`, progression du compteur),
+  pause, puis reprise au passage conservé après une attente. Pas de nouvelle
+  confirmation d'écoute humaine sur ce binaire, contrairement au premier.
+
+### Restes côté client web — non validés pour production
+
+Le seek Chrome a été reproduit en échec : demande à 219 514 ms, état serveur
+mis à cette valeur, mais `audio.currentTime` continue autour de 43 secondes.
+Le client ignore le seek d'un média dont `audio.duration` n'est pas finie ;
+le serveur ne recrée pas le flux d'une zone navigateur sans périphérique.
+Il faut un contrat explicite de rechargement du flux et d'offset côté client,
+pas simplement annoncer le seek réussi après la mise à jour de l'état.
+
+Pendant la pause, le compteur visuel retombe à zéro (position serveur obsolète)
+alors que la reprise audio conserve son passage. Le badge « CD » est encore
+une déduction de la résolution PCM par le client, pas une preuve de qualité
+lossless Spotify. Le verdict global du chemin du signal est désormais faux
+pour `lossless` et `bit_perfect`, sans inventer une seconde conversion WAV.
+Le client web n'a pas été modifié dans cette unité.
 
 ## Essai utilisateur requis
 
@@ -107,21 +175,43 @@ Les tests hors connexion ne prouvent **ni** l'acceptation de l'appairage par
 Spotify **ni** la recherche réelle **ni** l'écoute sur un renderer. Aucun de
 ces trois résultats ne doit être annoncé sans essai avec le compte utilisateur.
 
-## Contre-épreuve exécutée
+## Contre-épreuves exécutées
 
 Le 2026-09-14, le témoin
-`streaming::spotify_native::tests::native_registry_save_and_logout_preserve_existing_web_credentials`
+`streaming::spotify_native::engine::tests::native_registry_save_and_logout_preserve_existing_web_credentials`
 est vert avec la clé séparée. Remplacer **uniquement le code** de
 `SpotifyNativeService::credential_key` par la clé historique
 `auth_tokens_spotify` le fait rougir après compilation réussie :
 `native pairing must not overwrite Web API credentials`. Le test est inchangé.
-La clé séparée est ensuite restaurée avant la validation finale.
+Le témoin utilise désormais le proxy public enregistré par Tune. La clé
+séparée est ensuite restaurée avant la validation finale.
 
 Commande de contre-épreuve :
 
 ```sh
 cargo test -p tune-core --locked --lib --no-default-features \
   --features oaat,spotify-native \
-  streaming::spotify_native::tests::native_registry_save_and_logout_preserve_existing_web_credentials \
+  streaming::spotify_native::engine::tests::native_registry_save_and_logout_preserve_existing_web_credentials \
   -- --exact
 ```
+
+La suite `spotify_native` a aussi été exécutée avec les seuls correctifs
+suivants retirés, sans modifier les tests. Chaque compilation a réussi avant
+les échecs attendus :
+
+- Retrait de `child.kill().await` :
+  `native_worker_drop_kills_and_reaps_a_child_ignoring_stdin` échoue avec
+  `Spotify worker survived cancellation; the server must kill and reap it`.
+- Remplacement de la durée PCM inconnue par celle du catalogue :
+  `native_pcm_never_invents_content_length_from_catalogue_duration` échoue avec
+  `Spotify metadata duration is not an exact PCM length; Chrome must receive real EOF`.
+- Retrait de l'exception Spotify dans le chemin du signal :
+  `spotify_native_decoded_wav_is_not_claimed_lossless_or_bit_perfect` échoue avec
+  `Spotify decoded PCM is not a lossless source`.
+
+Commandes : le filtre `spotify_native` sur `tune-core --lib` et sur
+`tune-server --lib`, tous deux avec `--locked --no-default-features --features
+oaat,spotify-native`. Les sources corrigées sont recopiées depuis le worktree
+local. Après une copie conservant les dates anciennes, Cargo peut réutiliser
+le binaire saboté : comparer les SHA-256 puis actualiser les dates des quatre
+fichiers restaurés avant la relance, sans modifier leur contenu.

@@ -1,12 +1,14 @@
-//! Finite, bounded PCM producer. Tune owns the queue and the HTTP session.
-//! The sink is cancelled on stop/replacement/logout, including while backpressured.
-
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+//! Disposable decoder process -> bounded PCM -> Tune HTTP session.
+use super::{
+    SpotifyNativeService,
+    engine::SpotifyNativeService as Engine,
+    ipc::{self, ChildProcess, Failure, Operation},
 };
-use std::time::Duration;
-
+use crate::{
+    http::streamer::{AudioStreamer, StreamInfo},
+    orchestrator::{PlayRequest, ResolvedStream},
+    streaming::traits::*,
+};
 use librespot_playback::{
     NUM_CHANNELS, SAMPLE_RATE,
     audio_backend::{Sink, SinkError, SinkResult},
@@ -16,11 +18,13 @@ use librespot_playback::{
     mixer::NoOpVolume,
     player::{Player, PlayerEvent},
 };
-use tokio::sync::{Notify, mpsc, oneshot};
-
-use super::{SpotifyNativeService, catalog};
-use crate::http::streamer::{AudioStreamer, StreamInfo};
-use crate::orchestrator::{PlayRequest, ResolvedStream};
+use std::io::Write;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+use tokio::{io::AsyncReadExt, sync::oneshot};
 
 pub(super) struct Lease {
     zone: i64,
@@ -31,71 +35,6 @@ impl Drop for Lease {
         self.cancelled.store(true, Ordering::Release);
     }
 }
-
-struct PcmSink {
-    tx: mpsc::Sender<Vec<u8>>,
-    cancelled: Arc<AtomicBool>,
-    ready: Arc<Notify>,
-    started: Option<oneshot::Sender<Result<(), String>>>,
-}
-
-fn pcm_s16le(samples: &[f64]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(samples.len() * 2);
-    for sample in samples {
-        // NaN is silence; Rust's saturating float cast prevents full-scale wrap.
-        let sample = if sample.is_finite() { *sample } else { 0.0 };
-        bytes.extend_from_slice(&((sample * 32768.0).round() as i16).to_le_bytes());
-    }
-    bytes
-}
-
-impl PcmSink {
-    fn send(&self, mut bytes: Vec<u8>) -> SinkResult<()> {
-        loop {
-            if self.cancelled.load(Ordering::Acquire) {
-                return Err(SinkError::NotConnected("Tune stream cancelled".into()));
-            }
-            match self.tx.try_send(bytes) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(SinkError::NotConnected("Tune stream closed".into()));
-                }
-                Err(mpsc::error::TrySendError::Full(value)) => {
-                    bytes = value;
-                    // This is librespot's dedicated audio thread, not Tokio.
-                    // Never block in blocking_send: cancellation must wake a full sink.
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-            }
-        }
-    }
-}
-
-impl Sink for PcmSink {
-    fn write(&mut self, packet: AudioPacket, _: &mut Converter) -> SinkResult<()> {
-        let AudioPacket::Samples(samples) = packet else {
-            return Err(SinkError::InvalidParams(
-                "Spotify raw packets are not PCM".into(),
-            ));
-        };
-        if samples.len() % NUM_CHANNELS as usize != 0 {
-            return Err(SinkError::InvalidParams(
-                "Spotify PCM is not frame-aligned".into(),
-            ));
-        }
-        // 4096-byte chunks, 64 slots: less than 1.5 seconds of stereo PCM.
-        for chunk in samples.chunks(2048) {
-            self.send(pcm_s16le(chunk))?;
-            if let Some(started) = self.started.take() {
-                self.ready.notify_one();
-                let _ = started.send(Ok(()));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Cancels a producer if resolving play is itself dropped (e.g. superseded).
 struct Pending {
     cancelled: Arc<AtomicBool>,
     armed: bool,
@@ -108,6 +47,116 @@ impl Drop for Pending {
     }
 }
 
+fn pcm_s16le(samples: &[f64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let sample = if sample.is_finite() { *sample } else { 0.0 };
+        bytes.extend_from_slice(&((sample * 32768.0).round() as i16).to_le_bytes());
+    }
+    bytes
+}
+
+// Constructed exclusively by run_audio_worker, never by the server.
+struct PipeSink;
+impl Sink for PipeSink {
+    fn write(&mut self, packet: AudioPacket, _: &mut Converter) -> SinkResult<()> {
+        let AudioPacket::Samples(samples) = packet else {
+            return Err(SinkError::InvalidParams(
+                "Spotify packets are not PCM".into(),
+            ));
+        };
+        if samples.len() % NUM_CHANNELS as usize != 0 {
+            return Err(SinkError::InvalidParams(
+                "Spotify PCM is not frame aligned".into(),
+            ));
+        }
+        let mut stdout = std::io::stdout();
+        for chunk in samples.chunks(2048) {
+            // Blocking is intentional on librespot's dedicated audio thread.
+            // The parent kills/reaps this CHILD on stop, even if the pipe is full.
+            stdout
+                .write_all(&pcm_s16le(chunk))
+                .map_err(|_| SinkError::NotConnected("Tune PCM pipe closed".into()))?;
+        }
+        stdout
+            .flush()
+            .map_err(|_| SinkError::NotConnected("Tune PCM pipe closed".into()))
+    }
+}
+
+pub(super) async fn run_audio_worker() -> Result<(), String> {
+    let Operation::Play {
+        tokens,
+        id,
+        seek_ms,
+    } = ipc::read_frame(&mut tokio::io::stdin()).await?
+    else {
+        return Err("Audio worker expected Play".into());
+    };
+    let mut engine = Engine::new();
+    if !engine.restore_tokens(&tokens) {
+        return Err("Spotify credentials are missing".into());
+    }
+    let session = engine.session().await.map_err(|e| e.to_string())?;
+    let track = super::catalog::track(&session, &id)
+        .await
+        .map_err(|e| e.to_string())?;
+    if track.duration_ms == 0 || seek_ms as u64 >= track.duration_ms {
+        return Err("Spotify seek is out of range".into());
+    }
+    let uri = super::catalog::uri(&id, "track").map_err(|e| e.to_string())?;
+    let header: Result<StreamTrack, Failure> = Ok(track);
+    ipc::write_frame(&mut tokio::io::stdout(), &header).await?;
+    let player = Player::new(
+        PlayerConfig {
+            bitrate: Bitrate::Bitrate320,
+            normalisation: false,
+            gapless: false,
+            ..Default::default()
+        },
+        session,
+        Box::new(NoOpVolume),
+        || Box::new(PipeSink),
+    );
+    let mut events = player.get_player_event_channel();
+    player.load(uri, true, seek_ms);
+    let result = loop {
+        match events.recv().await {
+            Some(PlayerEvent::EndOfTrack { .. }) => break Ok(()),
+            Some(PlayerEvent::Unavailable { .. }) => break Err("Spotify track unavailable".into()),
+            None => break Err("Spotify decoder stopped unexpectedly".into()),
+            _ => {}
+        }
+    };
+    player.stop();
+    drop(player);
+    result
+}
+
+fn pcm_stream_info() -> StreamInfo {
+    StreamInfo {
+        format: "wav".into(),
+        mime_type: "audio/wav".into(),
+        sample_rate: SAMPLE_RATE,
+        bit_depth: 16,
+        channels: NUM_CHANNELS as u16,
+        // Spotify metadata milliseconds are NOT an exact decoded frame count.
+        // An invented Content-Length can leave a renderer waiting after EOF.
+        // HTTP is chunked; the child pipe's EOF terminates this finite stream.
+        duration_ms: None,
+        ..Default::default()
+    }
+}
+
+async fn cancelled(cancel: &AtomicBool, streamer: &AudioStreamer, id: &str) {
+    loop {
+        if cancel.load(Ordering::Acquire) || !streamer.session_alive(id).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 impl SpotifyNativeService {
     pub async fn resolve_audio(
         &self,
@@ -115,96 +164,96 @@ impl SpotifyNativeService {
         server_ip: &str,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
-        let source_id = req
+        if !self.enabled {
+            return Err("Spotify native is disabled".into());
+        }
+        let id = req
             .source_id
             .as_deref()
             .ok_or("Spotify track id is required")?;
-        let uri = catalog::uri(source_id, "track").map_err(|e| e.to_string())?;
-        let session = self.session().await.map_err(|e| e.to_string())?;
-        let track = catalog::track(&session, source_id)
-            .await
-            .map_err(|e| e.to_string())?;
+        super::catalog::uri(id, "track").map_err(|e| e.to_string())?;
+        if !self.has_credentials() {
+            return Err("Spotify: pair Tune from the Spotify app first".into());
+        }
         let seek_ms = u32::try_from(req.seek_ms.unwrap_or(0))
             .map_err(|_| "Spotify seek exceeds supported range")?;
-        if track.duration_ms == 0 || seek_ms as u64 >= track.duration_ms {
-            return Err("Spotify track duration or seek position is invalid".into());
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut active = self.audio.lock().unwrap();
             if active.as_ref().is_some_and(|lease| {
                 lease.zone != req.zone_id && !lease.cancelled.load(Ordering::Acquire)
             }) {
                 return Err(
-                    "Spotify native prototype permits one active zone; stop the other zone first"
-                        .into(),
+                    "Spotify native permits one active zone; stop the other zone first".into(),
                 );
             }
             *active = Some(Lease {
                 zone: req.zone_id,
-                cancelled: cancelled.clone(),
+                cancelled: cancel.clone(),
             });
         }
         let mut pending = Pending {
-            cancelled: cancelled.clone(),
+            cancelled: cancel.clone(),
             armed: true,
         };
-        let info = StreamInfo {
-            format: "wav".into(),
-            mime_type: "audio/wav".into(),
-            sample_rate: SAMPLE_RATE,
-            bit_depth: 16,
-            channels: NUM_CHANNELS as u16,
-            duration_ms: Some(track.duration_ms - seek_ms as u64),
-            ..Default::default()
-        };
-        let (stream_id, tx, ready) = streamer.create_session(info, false, 64).await;
-        let (started, mut startup) = oneshot::channel();
-        let sink = PcmSink {
-            tx,
-            cancelled: cancelled.clone(),
-            ready,
-            started: Some(started),
-        };
-        let player = Player::new(
-            PlayerConfig {
-                bitrate: Bitrate::Bitrate320,
-                normalisation: false,
-                gapless: false,
-                ..Default::default()
-            },
-            session.clone(),
-            Box::new(NoOpVolume),
-            move || Box::new(sink),
-        );
-        let mut events = player.get_player_event_channel();
-        player.load(uri, true, seek_ms);
+        let mut child = ChildProcess::spawn("audio").map_err(|e| e.to_string())?;
+        let header: Result<StreamTrack, Failure> = tokio::time::timeout(ipc::DEADLINE, async {
+            ipc::write_frame(
+                &mut child.input,
+                &Operation::Play {
+                    tokens: self.client.tokens(),
+                    id: id.into(),
+                    seek_ms,
+                },
+            )
+            .await?;
+            ipc::read_frame(&mut child.output).await
+        })
+        .await
+        .map_err(|_| "Spotify audio worker startup timed out")??;
+        let track = header.map_err(|e| e.into_tune().to_string())?;
+        let (stream_id, tx, ready) = streamer.create_session(pcm_stream_info(), false, 64).await;
+        let (started, mut startup) = oneshot::channel::<Result<(), String>>();
         let stream_task = streamer.clone();
         let task_id = stream_id.clone();
-        let cancel_task = cancelled.clone();
+        let cancel_task = cancel.clone();
         let active = self.audio.clone();
-        let (failed, mut failure) = oneshot::channel::<String>();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(100));
-            let error = loop {
-                tokio::select! {
-                    _ = tick.tick() => {
-                        if cancel_task.load(Ordering::Acquire) || session.is_invalid() || !stream_task.session_alive(&task_id).await {
-                            break Some("Spotify playback session ended or was cancelled".to_owned());
-                        }
+            let mut started = Some(started);
+            let mut buffer = [0u8; 4096];
+            let mut carry = Vec::with_capacity(4100);
+            let result: Result<(), String> = async {
+                loop {
+                    let size = tokio::select! {
+                        _ = cancelled(&cancel_task, &stream_task, &task_id) => return Err("Spotify playback cancelled".into()),
+                        result = child.output.read(&mut buffer) => result.map_err(|_| "Spotify PCM pipe failed")?,
+                    };
+                    if size == 0 {
+                        if !carry.is_empty() { return Err("Spotify PCM ended inside a stereo frame".into()); }
+                        return child.successful_exit().await;
                     }
-                    event = events.recv() => match event {
-                        Some(PlayerEvent::EndOfTrack { .. }) => break None,
-                        Some(PlayerEvent::Unavailable { .. }) => break Some("Spotify track is unavailable for this account".to_owned()),
-                        None => break Some("Spotify player stopped unexpectedly".to_owned()),
-                        _ => {}
+                    carry.extend_from_slice(&buffer[..size]);
+                    let length = carry.len() / 4 * 4;
+                    if length == 0 { continue; }
+                    let tail = carry.split_off(length);
+                    let chunk = std::mem::replace(&mut carry, tail);
+                    tokio::select! {
+                        _ = cancelled(&cancel_task, &stream_task, &task_id) => return Err("Spotify playback cancelled".into()),
+                        result = tx.send(chunk) => result.map_err(|_| "Tune PCM consumer closed")?,
                     }
+                    if let Some(started) = started.take() { ready.notify_one(); let _ = started.send(Ok(())); }
                 }
-            };
-            cancel_task.store(true, Ordering::Release);
-            player.stop();
-            drop(player);
+            }.await;
+            if let Some(started) = started {
+                let _ = started.send(Err(result
+                    .clone()
+                    .err()
+                    .unwrap_or_else(|| "Spotify decoder produced no PCM".into())));
+            }
+            drop(child); // signal, kill if still alive, and reap in the supervisor
+            drop(tx);
             stream_task.end_session_input(&task_id).await;
+            cancel_task.store(true, Ordering::Release);
             {
                 let mut current = active.lock().unwrap();
                 if current
@@ -214,17 +263,16 @@ impl SpotifyNativeService {
                     current.take();
                 }
             }
-            if let Some(error) = error {
+            if result.is_err() {
                 tracing::warn!(stream_id = %task_id, "spotify_native_producer_ended_early");
-                let _ = failed.send(error);
                 stream_task.remove_session(&task_id).await;
             }
         });
-        let result = tokio::select! {
-            result = &mut startup => result.unwrap_or_else(|_| Err("Spotify decoder produced no PCM".into())),
-            result = &mut failure => Err(result.unwrap_or_else(|_| "Spotify track ended before playback began".into())),
-            _ = tokio::time::sleep(Duration::from_secs(30)) => Err("Spotify decoder startup timed out".into()),
-        };
+        let result = tokio::time::timeout(Duration::from_secs(30), &mut startup)
+            .await
+            .map_err(|_| "Spotify decoder startup timed out".to_owned())
+            .and_then(|r| r.map_err(|_| "Spotify decoder stopped before producing PCM".to_owned()))
+            .and_then(|r| r);
         if let Err(error) = result {
             streamer.remove_session(&stream_id).await;
             return Err(error);
@@ -245,7 +293,6 @@ impl SpotifyNativeService {
             bit_depth: Some(16),
             channels: Some(NUM_CHANNELS as u32),
             origin_url: None,
-            // 320 is requested, not measured. Do not claim negotiated bitrate.
             bitrate_kbps: None,
         })
     }
@@ -256,36 +303,17 @@ mod tests {
     use super::*;
     #[test]
     fn native_pcm_is_little_endian_saturating_and_nan_safe() {
-        let bytes = pcm_s16le(&[-1.0, 0.5, 1.0, -2.0, f64::NAN]);
         assert_eq!(
-            bytes,
-            [0, 128, 0, 64, 255, 127, 0, 128, 0, 0],
-            "PCM must not wrap full scale or swap byte order"
+            pcm_s16le(&[-1.0, 0.5, 1.0, -2.0, f64::NAN]),
+            [0, 128, 0, 64, 255, 127, 0, 128, 0, 0]
         );
     }
-    #[tokio::test]
-    async fn native_cancel_unblocks_full_sink() {
-        let (tx, _rx) = mpsc::channel(1);
-        tx.send(vec![0; 4]).await.unwrap();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let signal = cancelled.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            PcmSink {
-                tx,
-                cancelled,
-                ready: Arc::new(Notify::new()),
-                started: None,
-            }
-            .send(vec![0; 4])
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        signal.store(true, Ordering::Release);
-        assert!(
-            tokio::time::timeout(Duration::from_secs(1), task)
-                .await
-                .expect("cancellation must unblock a full Spotify sink")
-                .unwrap()
-                .is_err()
+    #[test]
+    fn native_pcm_never_invents_content_length_from_catalogue_duration() {
+        assert_eq!(
+            pcm_stream_info().wav_content_length(),
+            None,
+            "Spotify metadata duration is not an exact PCM length; Chrome must receive real EOF"
         );
     }
     #[test]

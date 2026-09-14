@@ -18,6 +18,52 @@ fn dlna_zone() -> (Arc<dyn DbBackend>, Zone) {
     (backend, zone)
 }
 
+#[cfg(feature = "spotify-native")]
+#[test]
+fn spotify_native_decoded_wav_is_not_claimed_lossless_or_bit_perfect() {
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("browser".into());
+    zone.output_device_id = None;
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "spotify".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            ..Default::default()
+        }),
+        volume: 0.15,
+        ..Default::default()
+    };
+    let path = build_signal_path_pub(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        "none",
+        Some(&wire("wav", 44100, 16)),
+    )
+    .unwrap();
+    assert_eq!(
+        path["lossless"], false,
+        "Spotify decoded PCM is not a lossless source"
+    );
+    assert_eq!(
+        path["bit_perfect"], false,
+        "Spotify decoded PCM must not claim bit-perfect"
+    );
+    assert!(!path["summary"].as_str().unwrap().contains("bit-perfect"));
+    assert!(
+        path["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != "Transcoder"),
+        "Decoded Spotify WAV must not invent a second WAV-to-WAV transcode"
+    );
+}
+
 // Hi-res ALAC source, currently playing, with a live stream session.
 fn alac_hires_playing() -> ZoneState {
     let np = NowPlaying {
