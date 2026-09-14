@@ -623,3 +623,11 @@ path = "tests/refus_oaat_upnp_2219.rs"
 [[test]]
 name = "registre_serveurs_fraicheur_4125"
 path = "tests/registre_serveurs_fraicheur_4125.rs"
+
+# #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
+# local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
+# manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
+# propriétés seraient gardées par rien.
+[[test]]
+name = "albums_upnp_visibles_4146"
+path = "tests/albums_upnp_visibles_4146.rs"
