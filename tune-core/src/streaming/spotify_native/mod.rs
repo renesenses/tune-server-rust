@@ -275,6 +275,9 @@ impl StreamingService for SpotifyNativeService {
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         self.call(Operation::UserPlaylists).await
     }
+    async fn get_playlist_library(&self) -> Result<PlaylistLibrary, TuneError> {
+        self.call(Operation::PlaylistLibrary).await
+    }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
         Err(unsupported("liked tracks"))
     }

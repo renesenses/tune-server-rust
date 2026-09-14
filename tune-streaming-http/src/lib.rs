@@ -439,6 +439,7 @@ where
         .route("/youtube/moods", get(youtube_moods))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        .route("/{service}/playlist-library", get(service_playlist_library))
         .route("/spotify/native-pairing", get(spotify_pairing::page))
         .route("/spotify/native-pairing.js", get(spotify_pairing::script))
         .route("/tidal/callback", get(tidal_callback))
@@ -591,6 +592,19 @@ async fn service_playlists(
             "playlists",
             json!(p)
         )))
+}
+
+/// Additive opt-in contract: warnings travel with the data, never through
+/// the old complete-array cache. Re-read on retry; no private library cache.
+async fn service_playlist_library(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    let mut response = with_svc!(&state, &service, |svc| svc.get_playlist_library().await);
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
 }
 
 async fn service_playlist(
@@ -1755,6 +1769,29 @@ mod tests_cache_utilisateur {
             tokio::time::sleep(self.delai).await;
             Ok(vec![])
         }
+        async fn get_playlist_library(
+            &self,
+        ) -> Result<tune_core::streaming::traits::PlaylistLibrary, TuneError> {
+            use tune_core::streaming::traits::{PlaylistLibrary, UnavailablePlaylist};
+            self.lit();
+            if self.nom == "library-network-failure" {
+                return Err("fixture network failure".into());
+            }
+            Ok(PlaylistLibrary {
+                playlists: vec![StreamPlaylist {
+                    id: "accessible".into(),
+                    name: "Accessible fixture".into(),
+                    description: None,
+                    cover_path: None,
+                    track_count: 12,
+                    owner: None,
+                }],
+                unavailable: vec![UnavailablePlaylist {
+                    source_id: "denied".into(),
+                    status: 403,
+                }],
+            })
+        }
         async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
             self.lit();
             tokio::time::sleep(self.delai).await;
@@ -1808,6 +1845,52 @@ mod tests_cache_utilisateur {
 
     fn etat_essai(nom: &str, lectures: Arc<AtomicUsize>, delai: Duration) -> StreamingHttpState {
         etat_essai_complet(nom, lectures, delai, RecherchesVues::default())
+    }
+
+    #[tokio::test]
+    async fn playlist_library_keeps_warnings_with_data_and_never_uses_the_complete_cache() {
+        let name = "partial-library-fixture";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = etat_essai(name, calls.clone(), Duration::ZERO);
+        memoriser_contenu_utilisateur(name, "playlists", json!([]));
+        for _ in 0..2 {
+            let response = service_playlist_library(State(state.clone()), Path(name.into())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()["cache-control"],
+                "no-store",
+                "Private partial library must not be browser-cached"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap();
+            let report: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                report["playlists"][0]["source_id"], "accessible",
+                "Available playlist disappeared from HTTP report"
+            );
+            assert_eq!(
+                report["unavailable"][0]["status"], 403,
+                "HTTP dropped the partial-library warning"
+            );
+            assert_eq!(report["unavailable"][0]["source_id"], "denied");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "Retry must re-read the library, not a stale complete-array cache"
+        );
+        purge_contenu_utilisateur(name);
+        let failure = service_playlist_library(
+            State(etat_essai("library-network-failure", calls, Duration::ZERO)),
+            Path("library-network-failure".into()),
+        )
+        .await;
+        assert_eq!(
+            failure.status(),
+            StatusCode::BAD_GATEWAY,
+            "Network failures must not masquerade as empty/partial success"
+        );
     }
 
     /// Un état dont le connecteur date — ou non — ses favoris d'album (#3489).

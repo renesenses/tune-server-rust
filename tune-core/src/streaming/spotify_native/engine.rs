@@ -376,6 +376,9 @@ impl StreamingService for SpotifyNativeService {
         catalog::playlist_tracks(&self.session().await?, id).await
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        self.get_playlist_library().await?.into_complete()
+    }
+    async fn get_playlist_library(&self) -> Result<PlaylistLibrary, TuneError> {
         super::library::user_playlists(&self.session().await?).await
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {

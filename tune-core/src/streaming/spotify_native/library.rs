@@ -8,7 +8,10 @@ use librespot_metadata::{Metadata, Playlist};
 use protobuf::Message;
 
 use super::{bounded, catalog, unsupported};
-use crate::{TuneError, streaming::traits::StreamPlaylist};
+use crate::{
+    TuneError,
+    streaming::traits::{PlaylistLibrary, StreamPlaylist, UnavailablePlaylist},
+};
 
 type Rootlist = <Playlist as Metadata>::Message;
 const PAGE_SIZE: usize = 100;
@@ -26,6 +29,7 @@ struct LibraryPages {
     revision: Option<Vec<u8>>,
     seen: HashSet<String>,
     playlists: Vec<PlaylistEntry>,
+    unavailable: Vec<UnavailablePlaylist>,
 }
 
 impl LibraryPages {
@@ -80,14 +84,29 @@ impl LibraryPages {
                 .to_id()
                 .map_err(|_| TuneError::from("Invalid Spotify playlist identifier"))?;
             let meta = contents.meta_items.get(index);
-            // A denied decoration was also denied by an ordinary metadata
-            // lookup on the real account. Do not repeatedly retry that denial
-            // or silently omit the entry from the supposedly complete list.
+            // Only explicit per-entry access/not-found refusals may be partial.
+            // Auth, throttling and server failures still fail the whole read.
             if meta.is_some_and(|meta| !matches!(meta.status_code(), 0 | 200)) {
+                let status = meta.unwrap().status_code();
+                if matches!(status, 403 | 404 | 410) {
+                    // A duplicated entry can disagree with earlier decoration.
+                    // The explicit refusal wins; never show it in both lists.
+                    self.seen.insert(id.clone());
+                    self.playlists.retain(|entry| entry.id != id);
+                    if !self.unavailable.iter().any(|entry| entry.source_id == id) {
+                        self.unavailable.push(UnavailablePlaylist {
+                            source_id: id,
+                            status,
+                        });
+                    }
+                    continue;
+                }
                 return Err(format!(
-                    "Spotify rootlist contains an unavailable playlist (status {}, entry {}); no partial list returned",
-                    meta.unwrap().status_code(), self.next + index
-                ).into());
+                    "Spotify rootlist failed (status {}, entry {}); no partial list returned",
+                    status,
+                    self.next + index
+                )
+                .into());
             }
             // Decorations are optional in the protocol and genuinely absent
             // for some entries on the paired account. Resolve those through
@@ -142,7 +161,7 @@ where
     .await
 }
 
-pub(super) async fn user_playlists(session: &Session) -> Result<Vec<StreamPlaylist>, TuneError> {
+pub(super) async fn user_playlists(session: &Session) -> Result<PlaylistLibrary, TuneError> {
     let mut pages = LibraryPages::default();
     loop {
         let bytes = bounded(session.spclient().get_rootlist(pages.next, Some(PAGE_SIZE))).await?;
@@ -152,10 +171,14 @@ pub(super) async fn user_playlists(session: &Session) -> Result<Vec<StreamPlayli
         let page = Rootlist::parse_from_bytes(&bytes)
             .map_err(|_| TuneError::from("Spotify rootlist response is invalid"))?;
         if pages.append(page)? {
-            return resolve_entries(pages.playlists, |id| async move {
+            let playlists = resolve_entries(pages.playlists, |id| async move {
                 catalog::playlist(session, &id).await
             })
-            .await;
+            .await?;
+            return Ok(PlaylistLibrary {
+                playlists,
+                unavailable: pages.unavailable,
+            });
         }
     }
 }
@@ -235,12 +258,7 @@ mod tests {
     #[test]
     fn native_library_refuses_changed_or_partial_pages() {
         for defect in [
-            "revision",
-            "length",
-            "offset",
-            "empty",
-            "metadata",
-            "forbidden",
+            "revision", "length", "offset", "empty", "metadata", "server",
         ] {
             let mut pages = LibraryPages::default();
             pages
@@ -258,9 +276,7 @@ mod tests {
                     .unwrap()
                     .meta_items
                     .push(Default::default()),
-                "forbidden" => {
-                    second.contents.as_mut().unwrap().meta_items[0].status_code = Some(403)
-                }
+                "server" => second.contents.as_mut().unwrap().meta_items[0].status_code = Some(503),
                 _ => unreachable!(),
             }
             assert!(
@@ -268,6 +284,92 @@ mod tests {
                 "Spotify personal library must refuse {defect}, not return a partial collection"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_library_reports_denied_entries_without_hiding_accessible_playlists() {
+        for status in [403, 404, 410] {
+            let mut pages = LibraryPages::default();
+            let mut first = page(3, 0, &[format!("spotify:playlist:{FIRST}")]);
+            first.contents.as_mut().unwrap().meta_items[0].status_code = Some(status);
+            assert!(
+                !pages
+                    .append(first)
+                    .expect("A denied entry must not block accessible playlists")
+            );
+            assert!(
+                pages
+                    .append(page(
+                        3,
+                        1,
+                        &[
+                            format!("spotify:playlist:{SECOND}"),
+                            format!("spotify:playlist:{FIRST}")
+                        ]
+                    ))
+                    .unwrap()
+            );
+            let playlists = resolve_entries(pages.playlists, |_| async {
+                panic!("A denied entry must not be retried via metadata lookup")
+            })
+            .await
+            .unwrap();
+            let report = PlaylistLibrary {
+                playlists,
+                unavailable: pages.unavailable,
+            };
+            assert_eq!(
+                report.playlists.len(),
+                1,
+                "Accessible playlists must survive a neighbouring refusal"
+            );
+            assert_eq!(report.playlists[0].id, SECOND);
+            assert_eq!(
+                report.unavailable.len(),
+                1,
+                "Every omitted playlist needs an explicit availability warning, without duplicates"
+            );
+            assert_eq!(report.unavailable[0].source_id, FIRST);
+            assert_eq!(report.unavailable[0].status, status);
+            assert!(
+                report.into_complete().is_err(),
+                "Legacy readers must never receive a partial list as complete"
+            );
+        }
+        for status in [401, 429, 500, 503] {
+            let mut failed = page(1, 0, &[format!("spotify:playlist:{FIRST}")]);
+            failed.contents.as_mut().unwrap().meta_items[0].status_code = Some(status);
+            assert!(
+                LibraryPages::default().append(failed).is_err(),
+                "Global failure {status} must not be hidden as item unavailability"
+            );
+        }
+        assert!(
+            PlaylistLibrary::default()
+                .into_complete()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_library_duplicate_refusal_wins_over_previous_accessible_decoration() {
+        let mut pages = LibraryPages::default();
+        pages
+            .append(page(2, 0, &[format!("spotify:playlist:{FIRST}")]))
+            .unwrap();
+        let mut denied = page(2, 1, &[format!("spotify:playlist:{FIRST}")]);
+        denied.contents.as_mut().unwrap().meta_items[0].status_code = Some(403);
+        assert!(pages.append(denied).unwrap());
+        assert!(
+            pages.playlists.is_empty(),
+            "A denied duplicate must not remain falsely accessible"
+        );
+        assert_eq!(
+            pages.unavailable.len(),
+            1,
+            "A denied duplicate must still be reported exactly once"
+        );
     }
 
     #[test]

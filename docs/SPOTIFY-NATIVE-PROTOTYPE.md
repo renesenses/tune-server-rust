@@ -56,6 +56,13 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   Les décorations facultatives de la rootlist peuvent manquer : les fiches
   des seules playlists concernées sont alors lues, avec quatre requêtes au
   maximum en parallèle et conservation de l'ordre.
+  Le rapport additif `GET /streaming/spotify/playlist-library` accepte les
+  refus explicites par entrée (403, 404, 410) : `playlists` contient les fiches
+  accessibles et `unavailable` les identifiants/codes refusés, sans nom ni
+  nombre de titres inventés. L'onglet Playlists et le widget Mes playlists V2
+  affichent ensemble les cartes et l'avertissement traduit. Le contrat ancien
+  `/playlists` reste strict ; les autres écrans non migrés n'acceptent pas les
+  listes partielles. Les erreurs 401/429/5xx et de pagination restent fatales.
   Titres aimés, albums enregistrés, artistes suivis, écriture et synchronisation
   de playlists restent non implémentés. Les titres aimés rendent désormais un
   refus explicite, au lieu de la liste vide héritée du trait.
@@ -327,6 +334,65 @@ Essai du binaire final sur le Mac, SHA-256
 
 Le client web n'a pas été modifié dans cette unité. Goinfre et l'instance de production restent
 inchangés ; aucune PR, release ou publication n'est effectuée.
+
+## Bibliothèque explicitement partielle — continuation du 14 septembre 2026
+
+L'utilisateur autorise désormais l'affichage des playlists accessibles avec
+avertissement pour les autres. Cette étape remplace le refus intégral de
+l'essai précédent uniquement pour les lecteurs qui optent pour le rapport.
+
+- Trait additif `get_playlist_library`, valeur `{playlists, unavailable}`,
+  opération IPC `PlaylistLibrary` ; aucun changement du tableau JSON historique.
+- Les refus 403/404/410 de la rootlist sont comptés et dédoublonnés. Aucun
+  nouvel essai de fiche pour contourner un refus. Si deux occurrences se
+  contredisent, le refus gagne : jamais de carte accessible et refusée à la fois.
+- Révisions, pagination, limites, champs obligatoires et erreurs réseau restent
+  contrôlés. Un problème global ne devient ni bibliothèque vide ni succès partiel.
+- Route `/{service}/playlist-library` sans cache de contenu utilisateur et avec
+  `Cache-Control: no-store` ; les avertissements restent attachés aux données.
+- Le widget et l'onglet Playlists V2 affichent le nombre accessible, le nombre
+  indisponible et les codes Spotify. Cas entièrement indisponible distingué du
+  compte vide ; échec réseau visible ; une réponse tardive de l'onglet Playlists
+  ne remplace pas les données du service suivant. Message traduit en 11 langues.
+- L'ancienne interface et le hub transversal Playlists conservent pour l'instant
+  le contrat complet. Les favoris et l'écriture ne sont pas ajoutés.
+
+Preuves de cette unité : 27 tests natifs, 30 HTTP ; client web 410 fichiers /
+4 575 tests et build de production. Contre-épreuves compilables, tests
+inchangés, restauration par copie puis suites vertes :
+
+- retrait de l'enregistrement des refus dans `LibraryPages::append` :
+  `native_library_reports_denied_entries_without_hiding_accessible_playlists`
+  échoue, `Every omitted playlist needs an explicit availability warning,
+  without duplicates` (0 au lieu de 1) ;
+- effacement de `unavailable` par la route :
+  `playlist_library_keeps_warnings_with_data_and_never_uses_the_complete_cache`
+  échoue, `HTTP dropped the partial-library warning` (null au lieu de 403) ;
+- bloc d'avertissement masqué dans le vrai widget monté : deux tests échouent,
+  dont `Une bibliothèque partielle doit annoncer les playlists indisponibles`.
+
+Commandes Rust : `cargo test -p tune-core --locked --lib --no-default-features
+--features oaat,spotify-native spotify_native` et `cargo test -p
+tune-streaming-http --locked --features tune-core/spotify-native,tune-core/oaat`.
+Pour les contre-épreuves, le filtre est remplacé par le nom du témoin ci-dessus.
+
+Essai réel du binaire Mac arm64 (SHA-256
+`0ccb303326c3993a0bff5fcf3f10ef80726c2f9acbb62c9497e5f551ef3a687f`) :
+rapport HTTP 200 avec 30 playlists accessibles et une entrée indisponible
+403. L'ancien `/playlists` refuse toujours explicitement le résultat incomplet.
+Une fiche personnelle et ses 15 titres sont lus ; l'authentification reste
+valide et les zones restent arrêtées. Le worker audio conserve les deux seeks
+de fin de piste (7,558 s / 2,541 s PCM, EOF et sortie 0, ni fichier audio ni
+son émis).
+
+Deux playlists accessibles ont un nom vide dans les métadonnées Spotify ;
+leurs 16 et 27 titres ont été réellement lus. Le serveur conserve le nom vide
+et les identifiants/comptages du service. Le client affiche le libellé traduit
+« Playlist sans nom », explicitement une absence de nom, au lieu de supprimer
+leurs cartes faute de titre et de pochette. Ce cas a son témoin DOM et sa
+contre-épreuve : retour au marqueur `—` supprimant la carte, échec nommé
+`Une playlist sans nom mais accessible ne doit pas disparaître`, puis
+restauration par copie. Ce n'est pas un refus d'accès ajouté artificiellement.
 
 ## Essai utilisateur requis
 

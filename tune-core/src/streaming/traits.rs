@@ -89,6 +89,29 @@ pub struct StreamPlaylist {
     pub owner: Option<String>,
 }
 
+/// An explicitly partial personal library. Pagination failures remain errors;
+/// unavailable entries carry no invented title or track count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlaylistLibrary {
+    pub playlists: Vec<StreamPlaylist>,
+    pub unavailable: Vec<UnavailablePlaylist>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnavailablePlaylist {
+    pub source_id: String,
+    pub status: i32,
+}
+
+impl PlaylistLibrary {
+    pub fn into_complete(self) -> Result<Vec<StreamPlaylist>, TuneError> {
+        if !self.unavailable.is_empty() {
+            return Err("Personal playlist library is incomplete; use playlist-library for the explicit availability report".into());
+        }
+        Ok(self.playlists)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamQuality {
     pub codec: String,
@@ -445,6 +468,13 @@ pub trait StreamingService: Send + Sync {
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
 
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError>;
+
+    async fn get_playlist_library(&self) -> Result<PlaylistLibrary, TuneError> {
+        Ok(PlaylistLibrary {
+            playlists: self.get_user_playlists().await?,
+            unavailable: Vec::new(),
+        })
+    }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError>;
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError>;
 
