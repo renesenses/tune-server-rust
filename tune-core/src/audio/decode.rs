@@ -1685,8 +1685,8 @@ fn decode_opus_to_pcm(
 ///
 /// Returns the emitted bit depth and sample rate on success. Requested rate and
 /// channel count are guarantees on every emitted chunk.
-/// For non-symphonia formats (AIFF, DSD, WavPack, APE), falls back to full
-/// decode + chunked send (still benefits from the early session creation).
+/// AIFF still falls back to full decode followed by chunked sends.
+/// DSD, WavPack and APE have native incremental paths.
 pub fn decode_to_pcm_streaming(
     file_path: &str,
     target_sample_rate: Option<u32>,
@@ -2151,17 +2151,32 @@ fn decode_to_pcm_streaming_inner(
             Err(_) => Err("ape: decoder panicked (corrupt file?)".into()),
         };
     }
+    // #4120: WavPack emits CRC-verified blocks without decoding the whole file.
+    if ext == "wv" {
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| "no tokio runtime for streaming decode")?;
+        return catch_unwind(AssertUnwindSafe(|| {
+            decode_wavpack_streaming(
+                file_path,
+                target_sample_rate,
+                target_channels,
+                target_bit_depth,
+                tx,
+                chunk_size,
+                &data_ready,
+                &levels_tx,
+                &rt,
+                seek_s,
+            )
+        }))
+        .unwrap_or_else(|_| Err("wavpack: decoder panicked (corrupt file?)".into()));
+    }
     // Non-symphonia formats: fall back to full decode then stream chunks.
     // This still benefits from the session being created early.
     //
-    // `.ape` en est SORTI (#2505) : il a désormais son propre chemin
-    // incrémental juste au-dessus. `aiff`/`aif`/`wv` restent ici parce que
-    // leurs décodeurs (`audio::aiff::decode_aiff_to_pcm`,
-    // `audio::wavpack::decode_wavpack_to_pcm`) n'exposent QUE le décodage
-    // intégral : leur donner le même traitement demande de les réécrire en
-    // décodeurs par blocs, ce qui est un autre chantier que #2505. Ils
-    // souffrent du même défaut et il est nommé ici plutôt que tu.
-    if matches!(ext.as_str(), "aiff" | "aif" | "wv") {
+    // APE (#2505) and WavPack (#4120) have their own incremental paths above.
+    // AIFF still uses the full-file decoder.
+    if matches!(ext.as_str(), "aiff" | "aif") {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
@@ -3175,6 +3190,118 @@ fn decode_ape_streaming(
     );
     Ok((output_bd, output_rate))
 }
+/// #4120: native WavPack blocks use the same channel/rate adapter as APE.
+/// No NAS staging: copying the complete source would delay the first PCM.
+#[allow(clippy::too_many_arguments)]
+fn decode_wavpack_streaming(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
+    rt: &tokio::runtime::Handle,
+    seek_s: f64,
+) -> Result<(u16, u32), String> {
+    let mut decoder = super::wavpack::WavPackDecoder::open(file_path, seek_s)?;
+    let source_bd = decoder.info.bits_per_sample as u16;
+    // The PCM/WAV writer supports signed 16/24/32-bit output. Promote
+    // native 8-bit samples losslessly instead of labelling 16-bit bytes as 8.
+    let output_bd = target_bit_depth.unwrap_or(source_bd.max(16));
+    let output_rate = target_sample_rate.unwrap_or(decoder.info.sample_rate);
+    let output_channels = target_channels.unwrap_or(decoder.info.channels);
+    let output_ch = checked_channels(output_channels, "wavpack stream target")?;
+    let mut adapter = StreamingPcmAdapter::new(
+        source_bd,
+        decoder.info.channels,
+        output_channels,
+        decoder.info.sample_rate,
+        output_rate,
+    )?;
+    let flush_len = frame_aligned_chunk_len(chunk_size, output_bd, output_ch);
+    let chrono = std::time::Instant::now();
+    let mut first_pcm = true;
+    let mut output_samples = 0usize;
+    let mut blocks = 0usize;
+    let send = |chunk: Vec<u8>| -> bool {
+        match rt.block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+            tx.send(chunk),
+        )) {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) => false,
+            Err(_) => {
+                tracing::warn!(file = file_path, "wavpack_streaming_send_timeout");
+                false
+            }
+        }
+    };
+    if target_bit_depth.is_some() {
+        if !send(super::wav::build_wav_header(output_ch, output_rate, output_bd).to_vec()) {
+            return Ok((output_bd, output_rate));
+        }
+        if let Some(n) = data_ready {
+            n.notify_one();
+        }
+    }
+    loop {
+        if tx.is_closed() {
+            return Ok((output_bd, output_rate));
+        }
+        let source = decoder.next_pcm().map_err(|e| {
+            tracing::warn!(file = file_path, blocks, error = %e, "wavpack_streaming_block_refused");
+            e
+        })?;
+        let finished = source.is_none();
+        let adapted = match source {
+            Some(samples) => {
+                blocks += 1;
+                adapter.push(&samples)?
+            }
+            None if blocks > 0 => adapter.finish()?,
+            None => Vec::new(),
+        };
+        output_samples += adapted.len();
+        let mut pcm = Vec::new();
+        append_pcm_samples(&mut pcm, &adapted, source_bd, output_bd);
+        // Flush even a short first block: the block is already frame-aligned.
+        for chunk in pcm.chunks(flush_len) {
+            if !send(chunk.to_vec()) {
+                return Ok((output_bd, output_rate));
+            }
+            if first_pcm {
+                first_pcm = false;
+                tracing::info!(
+                    file = file_path,
+                    delai_ms = chrono.elapsed().as_millis() as u64,
+                    octets = chunk.len(),
+                    "wavpack_streaming_first_pcm"
+                );
+                if let Some(n) = data_ready {
+                    n.notify_one();
+                }
+            }
+            if let Some(ltx) = levels_tx {
+                super::tap::send_windowed_pcm(ltx, chunk, output_bd, output_ch, output_rate);
+            }
+        }
+        if finished {
+            break;
+        }
+    }
+    tracing::info!(
+        file = file_path,
+        blocks,
+        output_samples,
+        output_rate,
+        elapsed_s = chrono.elapsed().as_secs_f64(),
+        "wavpack_streaming_finished"
+    );
+    Ok((output_bd, output_rate))
+}
+
 /// Remux a Tidal HI-RES DASH FLAC-in-fMP4 file into a native `.flac` file
 /// WITHOUT decoding or re-encoding (#1146). The source is already FLAC (Tidal
 /// delivers FLAC frames inside a fragmented MP4), so the old path — decode to
