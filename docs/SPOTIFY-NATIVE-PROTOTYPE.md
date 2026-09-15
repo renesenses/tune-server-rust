@@ -84,6 +84,107 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   worker. Le chemin du signal ne qualifie pas ce décodage de lossless ou
   bit-perfect. L'étiquette WAV 44,1/16 décrit le transport, pas la source.
 
+## Reprises bornées des métadonnées — 15 septembre 2026
+
+Les refus par fiche étaient ramenés à un message sans code numérique. Le code
+du refus ponctuel observé dans l'unité précédente ne peut donc pas être
+reconstitué ; la réussite d'une relance manuelle ne prouve pas qu'il s'agissait
+d'un 503. Le parseur conserve désormais le code et le niveau (`provider` ou
+`entry`) sans URI, nom, identifiant de compte ou jeton dans le diagnostic.
+
+Les schémas épinglés exposent ces deux codes sous forme d'entiers, sans champ
+Retry-After : [entity_extension_data.proto](https://github.com/librespot-org/librespot/blob/v0.8.0/protocol/proto/entity_extension_data.proto),
+[extended_metadata.proto](https://github.com/librespot-org/librespot/blob/v0.8.0/protocol/proto/extended_metadata.proto).
+La politique locale choisit une liste limitée : 408, 500, 502, 503, 504.
+401/403, contenu absent 404/410, 429, 501 et codes inconnus ne déclenchent
+aucune relance de métadonnées. Les erreurs de transport gardent la politique
+existante de [SpClient](https://github.com/librespot-org/librespot/blob/v0.8.0/core/src/spclient.rs),
+sans ajouter de relance fondée sur leur texte.
+
+Chaque groupe en échec peut faire trois tentatives au total, après 250 puis
+500 ms d'attente. Les groupes déjà réussis ne sont pas relus. Un budget partagé
+limite toute la collection à quatre appels supplémentaires de cette couche,
+hors éventuelles relances de transport internes à librespot, toujours dans
+les quatre emplacements simultanés et par groupes de 50 identifiants. Une
+limite de 30 s couvre la résolution entière, toutes tentatives comprises,
+et annule les futures réseau restantes. La limite IPC de 45 s de l'opération
+reste distincte et inchangée ; une préparation longue peut donc réduire le
+temps disponible. Pas de boucle sans limite ou de relance de la bibliothèque
+entière. Les 2 000 positions, leur ordre et leurs doublons restent préservés.
+
+Le parseur examine tout le groupe avant de décider d'une reprise : un refus
+permanent prime sur un transitoire, indépendamment de l'ordre. Type d'extension
+inattendu, identifiant étranger/répété, contenu invalide et réponse tronquée
+restent des erreurs, même si une autre fiche porte un 503. Un refus global du
+fournisseur peut légitimement ne porter aucune fiche ; il n'est jamais traité
+comme une collection vide. Aucun résultat partiel n'est servi ou mis en cache.
+
+Le trait expose aussi `auth_retry_on_content_error`, vrai par défaut. Le proxy
+natif le désactive : les 401/403 de contenu ne doivent pas provoquer une autre
+lecture via l'heuristique HTTP de renouvellement de jeton. Le chemin Favoris
+respecte cette politique, sans changer celle des autres connecteurs. Le moteur
+natif et le rafraîchisseur périodique continuent de gérer leurs sessions.
+
+Les témoins couvrent les trois types de métadonnées, le groupe seul à relire,
+1 512 positions dont un doublon, les refus mixtes/permanents, les plafonds
+par groupe et partagés, la limite globale et l'annulation des quatre requêtes.
+Le témoin HTTP contraste le mode auto-géré natif avec la reprise OAuth
+historique et vérifie qu'un refus ne devient pas un résultat vide en cache.
+
+Contre-épreuves compilées, tests inchangés, sept rouges attendus. Commande
+native : `cargo test --locked -p tune-core --lib --no-default-features
+--features oaat,spotify-native <témoin>`. Commande HTTP :
+`cargo test --locked -p tune-streaming-http --features
+tune-core/spotify-native,tune-core/oaat <témoin>`.
+
+- Une seule tentative :
+  `native_metadata_retries_only_the_failed_batch_and_preserves_all_positions`
+  → `A transient metadata refusal must retry its batch instead of rejecting
+  the whole collection`.
+- Réautoriser le proxy natif à renouveler via HTTP :
+  `native_proxy_poll_and_logout_do_not_spawn_a_worker`
+  → `Native Spotify owns recovery; HTTP must not replay a metadata access refusal`.
+- Ignorer l'option du connecteur dans le gestionnaire Favoris :
+  `native_metadata_refusals_do_not_trigger_http_auth_replay_or_empty_cache`
+  → `Native metadata refusals must not trigger HTTP auth replay or become
+  a cached empty collection` (200 au lieu de 400).
+- Budget partagé relevé à 99 :
+  `native_metadata_retries_have_per_batch_and_whole_collection_limits`
+  → `A collection-wide failure must stop when its shared retry budget is exhausted`.
+- Limite globale relevée à 60 s :
+  `native_metadata_deadline_covers_all_attempts_and_cancels_pending_fetches`
+  → `The collection deadline must not restart for each retry`.
+- Code effacé du diagnostic :
+  `native_metadata_permanent_refusals_keep_their_code_without_retrying`
+  → `Metadata errors must preserve the numeric status and scope without entity identifiers`.
+- 403 classé comme transitoire :
+  `native_metadata_mixed_refusals_and_invalid_responses_never_trigger_retry`
+  → `A transient status must not hide denied_first or trigger retries of an
+  invalid batch` (trois appels au lieu d'un).
+
+Chaque correctif est restauré par copie après sa contre-épreuve ; les dates
+des sources distantes sont actualisées avant recompilation. Les journaux
+restent avec l'instance privée du Mac. Cette unité n'ajoute ni écriture Spotify,
+ni nouvelle lecture audio, ni reprise de l'interface historique.
+
+Validation après restauration : 55 tests natifs et 33 tests HTTP réussis,
+puis cross-build macOS ARM. Le client web est inchangé (`b0a143df`), sa batterie
+n'est pas relancée dans cette unité. Une future PR d'intégration devra demander
+`ci:full` puisque le trait commun et son gestionnaire HTTP sont concernés ;
+Shrek et le prototype Mac ne remplacent pas cette batterie multiplateforme.
+
+Binaire installé sur le prototype Mac, SHA-256
+`98aa1391586b1f4eae803f744d09b9fefa7526e113f76434306d5ddbdb22de87`.
+Sonde worker et HTTP réels : 160 albums, 14 artistes avec portraits, 1 512
+titres aimés, 18 pistes de l'album contrôlé et 520 de la grande playlist.
+Chrome confirme les trois catégories et la réception/affichage des pistes
+de la fiche album, zéro erreur JS. Trois arrêts du seul worker catalogue
+restent récupérables à l'ouverture de Streaming en 2,7–2,8 s, sans POST
+d'appairage, parent inchangé. Quatre zones arrêtées et files inchangées.
+Ces lectures réelles ne constituent pas une injection de 503 dans Spotify :
+la politique de reprise et ses refus sont prouvés sur les réponses contrôlées
+des tests ci-dessus. Le code du refus initial reste inconnu.
+
 ## Reprise après arrêt du worker — 15 septembre 2026
 
 Reproduction sur l'instance Mac isolée : arrêter uniquement son enfant

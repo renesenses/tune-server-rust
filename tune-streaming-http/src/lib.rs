@@ -1206,9 +1206,12 @@ async fn service_favorites(
     // gestionnaire prenait les sérialisait — temps total = somme des trois,
     // pas le max (#1621). Le dispatch n'appelle que des méthodes `&self` ;
     // seul le rafraîchissement de jeton, plus bas, exige l'écriture.
-    let result = {
+    let (result, auth_retry) = {
         let svc = arc.read().await;
-        lire_favoris(&**svc, &fav_type).await
+        (
+            lire_favoris(&**svc, &fav_type).await,
+            svc.auth_retry_on_content_error(),
+        )
     };
     match result {
         Ok(data) => {
@@ -1223,7 +1226,7 @@ async fn service_favorites(
         Err(ref e)
             if {
                 let msg = e.to_string();
-                msg.contains("401") || msg.contains("403")
+                auth_retry && (msg.contains("401") || msg.contains("403"))
             } =>
         {
             // Token expired — attempt refresh and retry
@@ -2409,6 +2412,7 @@ mod tests_favoris_dates {
 #[cfg(test)]
 mod temoin_statut_du_refus_i859 {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tune_core::TuneError;
     use tune_core::db::sqlite::SqliteDb;
     use tune_core::streaming::traits::{
@@ -2432,6 +2436,23 @@ mod temoin_statut_du_refus_i859 {
     struct ServiceDHumeur {
         nom: String,
         humeur: Humeur,
+        auth_retry: bool,
+        metadata_refusal: Option<i32>,
+        reads: Arc<AtomicUsize>,
+        refreshes: Arc<AtomicUsize>,
+    }
+
+    impl ServiceDHumeur {
+        fn new(nom: &str, humeur: Humeur) -> Self {
+            Self {
+                nom: nom.into(),
+                humeur,
+                auth_retry: true,
+                metadata_refusal: None,
+                reads: Arc::new(AtomicUsize::new(0)),
+                refreshes: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2495,6 +2516,26 @@ mod temoin_statut_du_refus_i859 {
         async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
             Err(TuneError::Streaming(PANNE.into()))
         }
+        async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if let Some(code) = self.metadata_refusal {
+                if self.refreshes.load(Ordering::SeqCst) > 0 {
+                    return Ok(vec![]);
+                }
+                return Err(format!(
+                    "Spotify metadata entry failed (status {code}); no partial collection returned"
+                )
+                .into());
+            }
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        fn auth_retry_on_content_error(&self) -> bool {
+            self.auth_retry
+        }
+        async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
         // `get_album_label` n'est PAS surchargé : c'est le défaut du trait —
         // le vrai producteur de refus — que l'essai du label interroge.
     }
@@ -2505,10 +2546,7 @@ mod temoin_statut_du_refus_i859 {
         let backend: Arc<dyn DbBackend> =
             Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
         let mut registre = ServiceRegistry::new();
-        registre.register(Box::new(ServiceDHumeur {
-            nom: nom.to_string(),
-            humeur,
-        }));
+        registre.register(Box::new(ServiceDHumeur::new(nom, humeur)));
         let etat = StreamingHttpState::new(
             backend,
             Arc::new(Mutex::new(registre)),
@@ -2522,6 +2560,67 @@ mod temoin_statut_du_refus_i859 {
             .await
             .expect("corps lisible");
         String::from_utf8_lossy(&octets).into_owned()
+    }
+
+    #[tokio::test]
+    async fn native_metadata_refusals_do_not_trigger_http_auth_replay_or_empty_cache() {
+        for (nom, code, auth_retry) in [
+            ("native-metadata-401-4166", 401, false),
+            ("native-metadata-403-4166", 403, false),
+            ("oauth-metadata-401-4166", 401, true),
+            ("oauth-metadata-403-4166", 403, true),
+        ] {
+            let (state, name) = etat(nom, Humeur::PasserelleEnPanne);
+            let arc = state.services.lock().await.get(nom).unwrap();
+            let (reads, refreshes) = {
+                let mut service = arc.write().await;
+                let service = service
+                    .as_any_mut()
+                    .downcast_mut::<ServiceDHumeur>()
+                    .unwrap();
+                service.auth_retry = auth_retry;
+                service.metadata_refusal = Some(code);
+                (service.reads.clone(), service.refreshes.clone())
+            };
+            for _ in 0..2 {
+                let response = service_favorites(
+                    State(state.clone()),
+                    Path((name.clone(), "tracks".into())),
+                    Query(TriQuery {
+                        sort: None,
+                        order: None,
+                    }),
+                )
+                .await;
+                if auth_retry {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "Existing OAuth refresh-and-retry must remain supported"
+                    );
+                } else {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST,
+                        "Native metadata refusals must not trigger HTTP auth replay or become a cached empty collection"
+                    );
+                    assert!(
+                        texte(response).await.contains(&format!("status {code}")),
+                        "HTTP must preserve the numeric metadata refusal without converting it to an empty collection"
+                    );
+                }
+            }
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                2,
+                "Refusals must not enter the favorites cache; successful OAuth replay still may"
+            );
+            assert_eq!(
+                refreshes.load(Ordering::SeqCst),
+                usize::from(auth_retry),
+                "Only connectors opting into the HTTP auth policy may refresh on content refusals"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2637,10 +2736,7 @@ mod temoin_statut_du_refus_i859 {
     /// défaut de `tune-core` qui répond.
     #[tokio::test]
     async fn les_huit_refus_par_defaut_du_trait_sont_types() {
-        let mut svc = ServiceDHumeur {
-            nom: "essai-defauts".into(),
-            humeur: Humeur::PasserelleEnPanne,
-        };
+        let mut svc = ServiceDHumeur::new("essai-defauts", Humeur::PasserelleEnPanne);
         let refus: Vec<(&str, TuneError)> = vec![
             (
                 "create_playlist",

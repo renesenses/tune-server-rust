@@ -326,6 +326,9 @@ impl StreamingService for SpotifyNativeService {
             let _ = self.call::<AuthStatus>(Operation::Status).await;
         }
     }
+    fn auth_retry_on_content_error(&self) -> bool {
+        false
+    }
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         // A cancelled catalogue request deliberately kills its child. Saved
         // pairing must still be refreshed when that child no longer exists.
@@ -438,6 +441,10 @@ mod tests {
     #[tokio::test]
     async fn native_proxy_poll_and_logout_do_not_spawn_a_worker() {
         let mut service = SpotifyNativeService::new();
+        assert!(
+            !service.auth_retry_on_content_error(),
+            "Native Spotify owns recovery; HTTP must not replay a metadata access refusal"
+        );
         assert!(
             !service
                 .authenticate(&json!({"poll": true}))

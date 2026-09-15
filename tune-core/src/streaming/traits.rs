@@ -663,6 +663,13 @@ pub trait StreamingService: Send + Sync {
 
     async fn post_restore(&mut self) {}
 
+    /// May a generic HTTP adapter refresh credentials and replay content on a
+    /// 401/403? Session-based connectors that own their recovery policy opt out:
+    /// an individual metadata refusal must not bypass their request budgets.
+    fn auth_retry_on_content_error(&self) -> bool {
+        true
+    }
+
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
         Ok(false)
     }
