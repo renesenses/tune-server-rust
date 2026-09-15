@@ -290,16 +290,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     // au-delà de `GET /auth/me` : `POST /auth/login` lit `is_admin` par
     // `as_bool().unwrap_or(false)`, qui rend `None` sur un `SqlValue::Text` —
     // un administrateur se connectait donc avec le rôle `user`, en silence.
-    (
-        "migree",
-        "radio_stations",
-        "is_favorite",
-        "TEXT vs INTEGER — aucun degat MESURE : #3181 a reecrit toutes les \
-         comparaisons en litteral texte (`= '1'`, `= '0'`), qui valent des deux \
-         cotes, la lecture passe par `as_i64()`, et `ORDER BY is_favorite DESC` \
-         donne le meme ordre sur '0'/'1' que sur 0/1. Convertible sans urgence \
-         mesuree, apres verification de chaque redacteur (#3715)",
-    ),
     // `zones.dsp_enabled` était ici, avec pour motif « réparer `update_dsp`
     // d'abord ». C'est fait dans le même commit : `update_dsp` lie désormais
     // `Option<i64>` et `i64` — il était mort sur TOUT PostgreSQL, natif compris,
@@ -731,8 +721,9 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        19,
-        // #3715 retire aussi streaming_favorites.id natif : 2 natifs, 17 migrés.
+        18,
+        // #3715 retire radio_stations.is_favorite migré : 2 natifs, 16 migrés.
+        // La passe précédente avait retiré streaming_favorites.id (20 -> 19).
         // La passe précédente avait retiré profile_id natif (21 -> 20).
         // #3716 avait retiré queue_items.is_current côté migré (22 -> 21).
         // Le 31/08/2026 il valait 16 ; #3715 en a
