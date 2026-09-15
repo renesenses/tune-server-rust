@@ -1,5 +1,40 @@
 use super::*;
 
+// Le coupe-circuit du démarrage vaut aussi pour les listes à la demande
+// (#4168). Il reste fermé jusqu'au prochain processus : réarmer le fichier
+// témoin ne doit pas rouvrir un pilote pendant une session de lecture.
+#[derive(Default)]
+struct AsioScanGate {
+    blocked: std::sync::atomic::AtomicBool,
+}
+
+impl AsioScanGate {
+    fn block(&self) {
+        self.blocked
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn run<T>(&self, backend: &str, cached: impl FnOnce() -> T, probe: impl FnOnce() -> T) -> T {
+        if backend.eq_ignore_ascii_case("asio")
+            && self.blocked.load(std::sync::atomic::Ordering::Acquire)
+        {
+            debug!("asio_device_enumeration_blocked_after_boot_decision");
+            return cached();
+        }
+        probe()
+    }
+}
+
+static ASIO_SCAN_GATE: AsioScanGate = AsioScanGate {
+    blocked: std::sync::atomic::AtomicBool::new(false),
+};
+
+/// Interdit l'énumération ASIO jusqu'au prochain démarrage, y compris depuis
+/// les réglages et les diagnostics. Les autres backends restent disponibles.
+pub fn block_asio_device_enumeration() {
+    ASIO_SCAN_GATE.block();
+}
+
 // ---------------------------------------------------------------------------
 // Device enumeration
 // ---------------------------------------------------------------------------
@@ -106,6 +141,7 @@ pub fn backend_value_is_supported(value: &str) -> bool {
 /// Each returned `AsioDeviceInfo` includes the driver name, supported sample
 /// rates, max channels, and whether it's the default ASIO device.
 pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
+    ASIO_SCAN_GATE.run("asio", Vec::new, || {
     #[cfg(all(target_os = "windows", feature = "asio"))]
     {
         use std::sync::Mutex as StdMutex;
@@ -224,6 +260,7 @@ pub fn list_asio_devices() -> Vec<AsioDeviceInfo> {
     {
         Vec::new()
     }
+    })
 }
 
 /// Information about an ASIO audio device.
@@ -677,30 +714,32 @@ pub(super) fn asio_device_busy() -> bool {
 /// Protected by a global Mutex + 5s cache to prevent concurrent ASIO
 /// driver enumeration which crashes on Windows (non-reentrant COM STA).
 pub fn list_audio_devices_with_backend(backend: &str) -> Vec<AudioDevice> {
-    // Avant tout : ne pas rouvrir un pilote ASIO qu'une lecture exclusive est
-    // en train de verrouiller (#1267). Le cooldown de 5 s ci-dessous ne suffit
-    // pas — passé ce délai il relance un balayage complet en pleine session.
-    if plan_audio_enumeration(backend, asio_device_busy()) == AsioEnumerationPlan::ServeCache {
-        debug!(
-            backend = %backend,
-            "local_audio_enumeration_skipped_asio_device_busy"
-        );
-        return cached_audio_devices();
-    }
-    let mut guard = SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((last_scan, ref cached)) = *guard {
-        if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
-            debug!("local_audio_scan_cached");
-            return cached.clone();
+    ASIO_SCAN_GATE.run(backend, cached_audio_devices, || {
+        // Avant tout : ne pas rouvrir un pilote ASIO qu'une lecture exclusive est
+        // en train de verrouiller (#1267). Le cooldown de 5 s ci-dessous ne suffit
+        // pas — passé ce délai il relance un balayage complet en pleine session.
+        if plan_audio_enumeration(backend, asio_device_busy()) == AsioEnumerationPlan::ServeCache {
+            debug!(
+                backend = %backend,
+                "local_audio_enumeration_skipped_asio_device_busy"
+            );
+            return cached_audio_devices();
         }
-    }
-    let result = list_audio_devices_uncached(backend);
-    // Publier AVANT de relâcher `SCAN_GUARD` : le parc devient lisible sans
-    // attendre, et les lecteurs n'ont jamais à prendre le verrou d'énumération
-    // (#3730).
-    publier_le_parc(&result);
-    *guard = Some((std::time::Instant::now(), result.clone()));
-    result
+        let mut guard = SCAN_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((last_scan, ref cached)) = *guard {
+            if last_scan.elapsed().as_secs() < SCAN_COOLDOWN_SECS {
+                debug!("local_audio_scan_cached");
+                return cached.clone();
+            }
+        }
+        let result = list_audio_devices_uncached(backend);
+        // Publier AVANT de relâcher `SCAN_GUARD` : le parc devient lisible sans
+        // attendre, et les lecteurs n'ont jamais à prendre le verrou d'énumération
+        // (#3730).
+        publier_le_parc(&result);
+        *guard = Some((std::time::Instant::now(), result.clone()));
+        result
+    })
 }
 
 /// Return the last cached device list WITHOUT triggering a fresh enumeration.
@@ -1019,5 +1058,72 @@ pub(super) fn log_no_devices_diagnostics(host_name: &str) {
             host = %host_name,
             "local_audio_no_output_devices_found"
         );
+    }
+}
+
+#[cfg(test)]
+mod asio_scan_gate_4168_tests {
+    use super::AsioScanGate;
+    use std::cell::Cell;
+
+    #[test]
+    fn un_crash_interdit_toutes_les_sondes_asio_suivantes() {
+        let gate = AsioScanGate::default();
+        let probes = Cell::new(0);
+        let probe = || {
+            probes.set(probes.get() + 1);
+            vec!["pilote"]
+        };
+        assert_eq!(gate.run("asio", Vec::new, probe), vec!["pilote"]);
+        gate.block();
+        for backend in ["asio", "ASIO", "Asio"] {
+            assert_eq!(
+                gate.run(backend, || vec!["cache"], probe),
+                vec!["cache"],
+                "une liste rouvre le pilote ASIO malgré le blocage de démarrage (#4168)"
+            );
+        }
+        assert_eq!(
+            probes.get(),
+            1,
+            "le pilote ASIO a été rouvert après le blocage de démarrage (#4168)"
+        );
+        assert_eq!(gate.run("wasapi", Vec::new, probe), vec!["pilote"]);
+        assert_eq!(gate.run("auto", Vec::new, probe), vec!["pilote"]);
+        assert_eq!(
+            probes.get(),
+            3,
+            "le blocage ASIO ne doit pas interdire WASAPI"
+        );
+    }
+
+    #[test]
+    fn les_deux_listes_passent_par_le_coupe_circuit() {
+        let source = include_str!("parc.rs");
+        for (signature, call, hardware) in [
+            (
+                "pub fn list_asio_devices()",
+                "ASIO_SCAN_GATE.run(\"asio\"",
+                "cpal::host_from_id(",
+            ),
+            (
+                "pub fn list_audio_devices_with_backend(",
+                "ASIO_SCAN_GATE.run(backend",
+                "list_audio_devices_uncached(",
+            ),
+        ] {
+            let body = source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n}\n")
+                .unwrap()
+                .0;
+            assert!(
+                body.find(call)
+                    .expect("une liste contourne le coupe-circuit ASIO (#4168)")
+                    < body.find(hardware).expect("sonde matérielle introuvable")
+            );
+        }
     }
 }
