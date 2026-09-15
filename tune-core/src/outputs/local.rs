@@ -1,3 +1,6 @@
+mod lecture_http;
+use lecture_http::LecteurHttpAnnulable;
+
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -3831,6 +3834,9 @@ impl BoucleProducteur<'_> {
                     // Délai de lecture : reboucler pour revoir les témoins.
                     continue;
                 }
+                Err(_) if self.force_silent.load(Ordering::Relaxed) => {
+                    return FinDeBoucle::Interrompue;
+                }
                 Err(e) => {
                     if initiale {
                         journaliser_erreur_de_lecture(
@@ -4261,19 +4267,20 @@ impl OutputTarget for LocalOutput {
             // dire après la fermeture effective du PCM (#3575).
             let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_vivante);
             // ------- HTTP fetch the audio stream -------
-            // No total timeout — long tracks can stream for 30+ minutes.
-            // The force_silent flag is checked at every loop iteration and
-            // in feed_ring to abort promptly on stop().
-            let response = match crate::http::client::blocking_builder()
-                .timeout(None)
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .and_then(|client| client.get(&url).send())
-            {
+            // Pas de delai total pour les longues pistes, mais Stop doit
+            // interrompre aussi une attente HTTP, pas seulement l'alimentation
+            // de l'anneau entre deux Read (#4220).
+            let response = match LecteurHttpAnnulable::ouvrir(&url, force_silent.clone()) {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(error = %e, url = %url, "local_audio_http_fetch_failed");
-                    playing.store(false, Ordering::SeqCst);
+                    if force_silent.load(Ordering::SeqCst) {
+                        debug!("local_audio_http_fetch_cancelled");
+                    } else {
+                        warn!(error = %e, url = %url, "local_audio_http_fetch_failed");
+                    }
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
                     return;
                 }
             };
@@ -4302,8 +4309,14 @@ impl OutputTarget for LocalOutput {
                         continue;
                     }
                     Err(e) => {
-                        warn!(error = %e, "local_audio_header_read_failed");
-                        playing.store(false, Ordering::SeqCst);
+                        if force_silent.load(Ordering::SeqCst) {
+                            debug!("local_audio_header_read_aborted");
+                        } else {
+                            warn!(error = %e, "local_audio_header_read_failed");
+                        }
+                        if play_generation.load(Ordering::SeqCst) == my_generation {
+                            playing.store(false, Ordering::SeqCst);
+                        }
                         return;
                     }
                 }
@@ -5337,7 +5350,19 @@ impl OutputTarget for LocalOutput {
             total_frames_fed = compteurs.total_frames_fed;
             match fin {
                 FinDeBoucle::FinDeFlux => http_eof = true,
-                FinDeBoucle::Interrompue => {}
+                FinDeBoucle::Interrompue => {
+                    // Un Stop / puits mort n'est pas une piste courte a
+                    // demarrer une derniere fois, ni un flux vide (#4220).
+                    drop(backend);
+                    info!(device = %device_name, total_bytes_read,
+                        frames = total_frames_fed,
+                        elapsed_ms = stream_start.elapsed().as_millis() as u64,
+                        "local_audio_stopped");
+                    if play_generation.load(Ordering::SeqCst) == my_generation {
+                        playing.store(false, Ordering::SeqCst);
+                    }
+                    return;
+                }
                 FinDeBoucle::PorteurDopRefuse => {
                     if play_generation.load(Ordering::SeqCst) == my_generation {
                         playing.store(false, Ordering::SeqCst);
@@ -5417,30 +5442,30 @@ impl OutputTarget for LocalOutput {
                 // rapportait donc 0 au lieu de la fin du morceau.
 
                 // Fetch the next track's HTTP stream
-                let next_response = match crate::http::client::blocking_builder()
-                    .timeout(None)
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .and_then(|client| client.get(&next.url).send())
-                {
-                    Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
-                    Ok(r) => {
-                        warn!(
-                            status = %r.status(),
-                            url = %next.url,
-                            "local_audio_gapless_http_error"
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            url = %next.url,
-                            "local_audio_gapless_http_fetch_failed"
-                        );
-                        break;
-                    }
-                };
+                let next_response =
+                    match LecteurHttpAnnulable::ouvrir(&next.url, force_silent.clone()) {
+                        Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
+                        Ok(r) => {
+                            warn!(
+                                status = %r.status(),
+                                url = %next.url,
+                                "local_audio_gapless_http_error"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            if force_silent.load(Ordering::SeqCst) {
+                                debug!("local_audio_gapless_http_fetch_cancelled");
+                            } else {
+                                warn!(
+                                    error = %e,
+                                    url = %next.url,
+                                    "local_audio_gapless_http_fetch_failed"
+                                );
+                            }
+                            break;
+                        }
+                    };
 
                 // Read header bytes from the next track.
                 // The next track's transcode session may have only just
@@ -5464,13 +5489,17 @@ impl OutputTarget for LocalOutput {
                             continue;
                         }
                         Err(e) => {
-                            warn!(error = %e, "local_audio_gapless_header_read_failed");
+                            if !force_silent.load(Ordering::SeqCst) {
+                                warn!(error = %e, "local_audio_gapless_header_read_failed");
+                            }
                             break 0;
                         }
                     }
                 };
                 if nh_read == 0 {
-                    warn!("local_audio_gapless_header_read_empty");
+                    if !force_silent.load(Ordering::SeqCst) {
+                        warn!("local_audio_gapless_header_read_empty");
+                    }
                     break;
                 }
                 next_header.truncate(nh_read);
