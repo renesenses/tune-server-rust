@@ -5,6 +5,10 @@ pub struct ZonePollerMetrics {
     pub total_polls: u64,
     pub total_errors: u64,
     pub consecutive_errors: u8,
+    /// Dernière série d’échecs des sondages au repos (#2566), distincte
+    /// des échecs en lecture. Remise à zéro au prochain sondage au repos
+    /// réussi ; les tours sautés ne l’incrémentent pas.
+    pub echecs_sondage_repos: u32,
     pub last_latency_ms: u32,
     pub max_latency_ms: u32,
     /// L'appareil annonce toujours jouer alors que la position est arrivee a la
