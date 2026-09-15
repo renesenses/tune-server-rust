@@ -152,6 +152,12 @@ fn statut_porte_par_l_erreur(e: &tune_core::TuneError) -> Option<StatusCode> {
     }
 }
 
+#[derive(Clone)]
+struct StreamingFailure {
+    kind: &'static str,
+    message: String,
+}
+
 /// Convert a service method result into a JSON response (OK -> 200, Err ->
 /// 502, sauf refus délibéré -> 501 ; voir [`statut_porte_par_l_erreur`]).
 ///
@@ -161,11 +167,28 @@ fn statut_porte_par_l_erreur(e: &tune_core::TuneError) -> Option<StatusCode> {
 fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) -> Response {
     match result {
         Ok(data) => Json(json!(data)).into_response(),
-        Err(e) => (
-            statut_porte_par_l_erreur(&e).unwrap_or(StatusCode::BAD_GATEWAY),
-            e.to_string(),
-        )
-            .into_response(),
+        Err(e) => {
+            let status = statut_porte_par_l_erreur(&e).unwrap_or(StatusCode::BAD_GATEWAY);
+            let error_kind = match &e {
+                tune_core::TuneError::Io(_) => "io",
+                tune_core::TuneError::Db(_) => "db",
+                tune_core::TuneError::Streaming(_) => "streaming",
+                tune_core::TuneError::Audio(_) => "audio",
+                tune_core::TuneError::Network(_) => "network",
+                tune_core::TuneError::Json(_) => "json",
+                tune_core::TuneError::NotFound(_) => "not_found",
+                tune_core::TuneError::Config(_) => "config",
+                tune_core::TuneError::Unsupported(_) => "unsupported",
+                tune_core::TuneError::Other(_) => "other",
+            };
+            let message = e.to_string();
+            let mut response = (status, message.clone()).into_response();
+            response.extensions_mut().insert(StreamingFailure {
+                kind: error_kind,
+                message,
+            });
+            response
+        }
     }
 }
 
@@ -342,6 +365,36 @@ struct SearchQuery {
     offset: Option<usize>,
 }
 
+/// Journalise la cause attachée par le convertisseur commun à la réponse.
+/// Les champs restent présents même si le filtre de logs n'accepte que WARN ;
+/// le contexte ne dépend pas de l'activation d'un span INFO (#4039).
+async fn contexte_diagnostic_streaming(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    // Router::nest peut retirer les préfixes de l'URI interne : aligner les
+    // segments depuis la fin conserve le bon service sans lire la query.
+    let service = route
+        .rsplit('/')
+        .zip(request.uri().path().rsplit('/'))
+        .find_map(|(pattern, value)| (pattern == "{service}").then_some(value))
+        .unwrap_or("unknown")
+        .to_owned();
+    let method = request.method().clone();
+    let response = next.run(request).await;
+    if let Some(failure) = response.extensions().get::<StreamingFailure>() {
+        tracing::warn!(service, route, %method, status = response.status().as_u16(),
+            error_kind = failure.kind, error = %failure.message, "streaming_service_error");
+    }
+    response
+}
+
 pub fn router<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -439,6 +492,7 @@ where
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
         .route("/tidal/callback", get(tidal_callback))
+        .route_layer(axum::middleware::from_fn(contexte_diagnostic_streaming))
 }
 
 // ---------------------------------------------------------------------------
@@ -2404,6 +2458,92 @@ mod temoin_statut_du_refus_i859 {
             .await
             .expect("corps lisible");
         String::from_utf8_lossy(&octets).into_owned()
+    }
+
+    #[derive(Clone, Default)]
+    struct Journal4039(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal4039 {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_4039_nomme_la_route_le_service_et_le_defaut() {
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+        for (suffix, kind, status) in [
+            ("artists/42", "streaming", StatusCode::BAD_GATEWAY),
+            (
+                "albums/42/label",
+                "unsupported",
+                StatusCode::NOT_IMPLEMENTED,
+            ),
+        ] {
+            let journal = Journal4039::default();
+            let writer = journal.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::WARN)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let (state, name) = etat("diagnostic-4039", Humeur::PasserelleEnPanne);
+            let app = Router::new().nest("/api/v1/streaming", router().with_state(state));
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!(
+                            "/api/v1/streaming/{name}/{suffix}?token=secret-4039"
+                        ))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(axum::http::header::CACHE_CONTROL)
+            );
+            let text = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+            let events: Vec<Value> = text
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let event = events
+                .iter()
+                .find(|v| v["fields"]["message"] == "streaming_service_error")
+                .expect("le 5xx streaming ne laisse aucune cause dans le journal (#4039)");
+            assert_eq!(event["fields"]["status"], status.as_u16());
+            assert_eq!(event["fields"]["error_kind"], kind);
+            assert!(
+                event["fields"]["error"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            );
+            assert_eq!(event["fields"]["service"], name);
+            assert_eq!(event["fields"]["method"], "GET");
+            assert_eq!(
+                event["fields"]["route"],
+                if kind == "streaming" {
+                    "/api/v1/streaming/{service}/artists/{artist_id}"
+                } else {
+                    "/api/v1/streaming/{service}/albums/{album_id}/label"
+                }
+            );
+            assert!(
+                !text.contains("secret-4039"),
+                "le contexte ne doit pas journaliser les paramètres privés"
+            );
+        }
     }
 
     /// Le défaut mesuré : `GET /streaming/{service}/playlists` sur un
