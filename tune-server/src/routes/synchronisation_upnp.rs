@@ -1,0 +1,355 @@
+//! Durable subscriptions to chosen UPnP containers. Only a complete Browse
+//! authorizes reconciliation; overlapping subscriptions retain their tracks.
+use super::indexation_upnp::{DemandeIndexation, indexer};
+use crate::state::AppState;
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use tune_core::db::backend::{DbBackend, DbTxHandle};
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
+fn error(e: impl ToString) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": e.to_string()})),
+    )
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Source {
+    key: String,
+    udn: String,
+    container: String,
+    name: String,
+    enabled: bool,
+    status: String,
+    last_attempt: i64,
+    last_success: Option<i64>,
+    report: Value,
+    generation: String,
+    pending: Vec<i64>,
+}
+
+fn sources(db: &dyn DbBackend) -> Result<Vec<Source>, String> {
+    db.query_many_strong(
+        "SELECT state_json FROM upnp_library_sources ORDER BY source_key",
+        &[],
+    )?
+    .iter()
+    .map(|r| {
+        serde_json::from_str(r[0].as_str().ok_or("source invalide")?).map_err(|e| e.to_string())
+    })
+    .collect()
+}
+fn save(db: &dyn DbBackend, s: &Source) -> Result<(), String> {
+    let body = serde_json::to_string(s).map_err(|e| e.to_string())?;
+    db.execute("INSERT INTO upnp_library_sources (source_key, udn, container, state_json) VALUES (?, ?, ?, ?) ON CONFLICT(source_key) DO UPDATE SET state_json = excluded.state_json",
+        &[&s.key, &s.udn, &s.container, &body])?;
+    Ok(())
+}
+fn public(s: &Source) -> Value {
+    json!({"key": s.key, "udn": s.udn, "container": s.container, "name": s.name,
+        "enabled": s.enabled, "status": s.status, "last_attempt": s.last_attempt,
+        "last_success": s.last_success, "report": s.report, "generation": s.generation,
+        "pending_count": s.pending.len()})
+}
+pub async fn list(State(state): State<AppState>) -> ApiResult {
+    Ok(Json(
+        json!({"items": sources(state.backend.as_ref()).map_err(error)?.iter().map(public).collect::<Vec<_>>()}),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct Subscribe {
+    container: String,
+    name: Option<String>,
+}
+/// Registration returns immediately. The job and its report survive navigation.
+pub async fn subscribe(
+    State(state): State<AppState>,
+    Path(udn): Path<String>,
+    Json(request): Json<Subscribe>,
+) -> ApiResult {
+    if request.container.is_empty() || request.container.len() > 4096 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "conteneur invalide"})),
+        ));
+    }
+    let _guard = state.upnp_index_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "Une indexation est en cours. Réessayez après sa fin."})),
+        )
+    })?;
+    let server = state
+        .media_servers
+        .lock()
+        .await
+        .get(&udn)
+        .cloned()
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "serveur inconnu"})),
+            )
+        })?;
+    let key = serde_json::to_string(&(&udn, &request.container)).map_err(error)?;
+    let mut source = sources(state.backend.as_ref())
+        .map_err(error)?
+        .into_iter()
+        .find(|s| s.key == key)
+        .unwrap_or(Source {
+            key,
+            udn,
+            container: request.container,
+            name: request
+                .name
+                .filter(|n| !n.trim().is_empty())
+                .map(|n| format!("{} · {}", server.name, n))
+                .unwrap_or(server.name),
+            enabled: true,
+            status: "pending".into(),
+            last_attempt: 0,
+            last_success: None,
+            report: json!({}),
+            generation: String::new(),
+            pending: vec![],
+        });
+    source.enabled = true;
+    source.status = "pending".into();
+    source.pending.clear();
+    save(state.backend.as_ref(), &source).map_err(error)?;
+    let result = public(&source);
+    let next = state.clone();
+    tokio::spawn(async move {
+        run_one(next, source.key).await;
+    });
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct Action {
+    key: String,
+    action: String,
+    generation: Option<String>,
+    count: Option<usize>,
+}
+pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> ApiResult {
+    let _guard = state.upnp_index_lock.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "Une indexation est en cours. Réessayez après sa fin."})),
+        )
+    })?;
+    let mut source = sources(state.backend.as_ref())
+        .map_err(error)?
+        .into_iter()
+        .find(|s| s.key == request.key)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "source inconnue"})),
+            )
+        })?;
+    match request.action.as_str() {
+        "pause" => {
+            source.enabled = false;
+        }
+        "sync" => {
+            source.enabled = true;
+            source.status = "pending".into();
+            source.pending.clear();
+        }
+        "confirm" => {
+            if source.status != "confirmation"
+                || request.generation.as_deref() != Some(source.generation.as_str())
+                || request.count != Some(source.pending.len())
+                || source.pending.is_empty()
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(
+                        json!({"error": "Le bilan a changé. Relisez le nombre de suppressions avant de confirmer."}),
+                    ),
+                ));
+            }
+            // Confirmation is bound to this exact complete snapshot, and expires
+            // after an hour: a stale browser cannot purge a later catalogue.
+            if now_seconds() - source.last_attempt > 3600 {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({"error": "Bilan expiré : relancez la synchronisation."})),
+                ));
+            }
+            let removed = remove_missing(&state, &source).map_err(error)?;
+            source.report["supprimees"] = json!(removed);
+            source.pending.clear();
+            source.status = "ready".into();
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "action inconnue"})),
+            ));
+        }
+    }
+    save(state.backend.as_ref(), &source).map_err(error)?;
+    let result = public(&source);
+    if request.action == "sync" {
+        let next = state.clone();
+        tokio::spawn(async move {
+            run_one(next, source.key).await;
+        });
+    }
+    Ok(Json(result))
+}
+
+fn member_ids(tx: &dyn DbTxHandle, key: &str) -> Result<Vec<i64>, String> {
+    Ok(tx
+        .query_many(
+            "SELECT track_id FROM upnp_library_members WHERE source_key = ?",
+            &[&key],
+        )?
+        .iter()
+        .filter_map(|r| r[0].as_i64())
+        .collect())
+}
+
+/// Every candidate is scoped by both membership and the track's source/UDN.
+/// A second subscription still owning the track prevents its deletion.
+fn remove_missing(state: &AppState, source: &Source) -> Result<usize, String> {
+    let mut removed = 0;
+    state.backend.write_tx(&mut |tx| {
+        let owned: std::collections::HashSet<i64> = member_ids(tx, &source.key)?.into_iter().collect();
+        for id in &source.pending {
+            if !owned.contains(id) { continue; }
+            tx.execute("DELETE FROM upnp_library_members WHERE source_key = ? AND track_id = ? AND generation <> ?",
+                &[&source.key, id, &source.generation])?;
+            // A refreshed member must not be removed by an earlier proposal.
+            if tx.query_one("SELECT track_id FROM upnp_library_members WHERE track_id = ?", &[id])?.is_some() { continue; }
+            let row = tx.query_one("SELECT source, source_id FROM tracks WHERE id = ?", &[id])?;
+            let ours = row.is_some_and(|r| r[0].as_str() == Some("upnp") && r[1].as_str().is_some_and(|s| s.starts_with(&format!("{}|", source.udn))));
+            if ours { removed += tx.execute("DELETE FROM tracks WHERE id = ? AND source = 'upnp'", &[id])?; }
+        }
+        // Only empty remote albums of THIS server. Local albums are untouched.
+        let albums = tx.query_many("SELECT id, source_id FROM albums WHERE source = 'upnp' AND NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id)", &[])?;
+        for row in albums {
+            if row[1].as_str().is_some_and(|s| s.starts_with(&format!("{}|", source.udn))) {
+                let id = row[0].as_i64().ok_or("album sans identifiant")?;
+                tx.execute("DELETE FROM albums WHERE id = ? AND source = 'upnp'", &[&id])?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
+async fn run_one(state: AppState, key: String) {
+    let _guard = state.upnp_index_lock.lock().await;
+    let result = async {
+        let Some(mut source) = sources(state.backend.as_ref())?.into_iter().find(|s| s.key == key) else { return Ok::<(), String>(()); };
+        if !source.enabled || source.status == "confirmation" { return Ok(()); }
+        // A queued duplicate does not run again after the first has finished.
+        let now = now_seconds();
+        if source.status != "pending" && now - source.last_attempt < 3600 { return Ok(()); }
+        source.status = "running".into();
+        source.last_attempt = now;
+        source.generation = uuid::Uuid::new_v4().to_string();
+        source.pending.clear();
+        save(state.backend.as_ref(), &source)?;
+        super::network::synchroniser_le_registre(&state).await;
+        let Json(mut report) = tokio::time::timeout(std::time::Duration::from_secs(1800), indexer(&state, &source.udn, DemandeIndexation {
+            conteneur: Some(source.container.clone()), profondeur_max: None, max_conteneurs: None, max_pistes: None,
+        })).await.map_err(|_| "Synchronisation interrompue après 30 minutes ; aucun retrait autorisé")?;
+        let identities = report.as_object_mut().and_then(|r| r.remove("identites")).unwrap_or(json!([]));
+        let complete = report["complet"] == true;
+        let mut prior_count = 0;
+        state.backend.write_tx(&mut |tx| {
+            // The conversion schema temporarily uses TEXT track IDs, so the
+            // membership table cannot declare that FK at creation time.
+            // Clean up removed tracks explicitly before computing percentages.
+            tx.execute("DELETE FROM upnp_library_members WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.id = upnp_library_members.track_id)", &[])?;
+            prior_count = member_ids(tx, &source.key)?.len();
+            for identity in identities.as_array().ok_or("identités invalides")? {
+                let identity = identity.as_str().ok_or("identité invalide")?;
+                let row = tx.query_one("SELECT id FROM tracks WHERE source = 'upnp' AND source_id = ?", &[&identity])?
+                    .ok_or("piste indexée introuvable")?;
+                let id = row[0].as_i64().ok_or("identifiant de piste invalide")?;
+                tx.execute("INSERT INTO upnp_library_members (source_key, track_id, generation) VALUES (?, ?, ?) ON CONFLICT(source_key, track_id) DO UPDATE SET generation = excluded.generation",
+                    &[&source.key, &id, &source.generation])?;
+            }
+            if complete {
+                source.pending = tx.query_many("SELECT track_id FROM upnp_library_members WHERE source_key = ? AND generation <> ?", &[&source.key, &source.generation])?
+                    .iter().filter_map(|r| r[0].as_i64()).collect();
+            }
+            Ok(())
+        })?;
+        source.report = report;
+        if complete {
+            source.last_success = Some(now);
+            if !source.pending.is_empty() && source.pending.len().saturating_mul(100) > prior_count.saturating_mul(20) {
+                source.status = "confirmation".into();
+            } else {
+                source.report["supprimees"] = json!(remove_missing(&state, &source)?);
+                source.pending.clear();
+                source.status = "ready".into();
+            }
+        } else {
+            source.status = if source.report["indexe"] == true { "partial" } else { "unavailable" }.into();
+        }
+        save(state.backend.as_ref(), &source)?;
+        Ok(())
+    }.await;
+    if let Err(e) = result {
+        tracing::error!(source = %key, error = %e, "upnp_sync_failed");
+        if let Ok(all) = sources(state.backend.as_ref()) {
+            if let Some(mut s) = all.into_iter().find(|s| s.key == key) {
+                s.status = "error".into();
+                s.report = json!({"error": e});
+                s.pending.clear();
+                if let Err(e) = save(state.backend.as_ref(), &s) {
+                    tracing::error!("upnp_sync_state_failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+pub fn start(state: AppState) {
+    tokio::spawn(async move {
+        // Persisted running states belonged to the previous process. Retry
+        // without treating the interrupted snapshot as deletion evidence.
+        if let Ok(all) = sources(state.backend.as_ref()) {
+            for mut s in all {
+                if s.status == "running" {
+                    s.status = "pending".into();
+                    s.pending.clear();
+                    let _ = save(state.backend.as_ref(), &s);
+                }
+            }
+        }
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            match sources(state.backend.as_ref()) {
+                Ok(all) => {
+                    for s in all {
+                        run_one(state.clone(), s.key).await;
+                    }
+                }
+                Err(e) => tracing::error!("upnp_sync_sources_failed: {e}"),
+            }
+        }
+    });
+}

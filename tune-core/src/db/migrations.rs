@@ -1877,6 +1877,9 @@ CREATE TABLE IF NOT EXISTS media_servers (
 CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);
 ",
     },
+    Migration { version: 102, name: "upnp_library_sync",
+        up: include_str!("../../migrations/upnp_library_sync.sql"),
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -3145,6 +3148,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
+    db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
+
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -3652,6 +3657,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         58,
         "media_servers_durables",
         include_str!("../../migrations/postgres/058_media_servers_durables.sql"),
+    ),
+    (
+        59,
+        "upnp_library_sync",
+        include_str!("../../migrations/postgres/059_upnp_library_sync.sql"),
     ),
 ];
 
@@ -5610,7 +5620,7 @@ mod tests {
         // (`udn`), dates en TEXT des deux cotes comme `zones.last_seen_at`
         // (95 / PG 050). Le numero libre a ete remesure DANS LE CODE, entree
         // par entree, comme la 56 et la 57 l'imposent.
-        assert_eq!(pg_latest_version(), 58, "latest PG migration must be 58");
+        assert_eq!(pg_latest_version(), 59, "latest PG migration must be 59");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

@@ -454,8 +454,20 @@ pub async fn indexer_une_source(
     Path(id): Path<String>,
     Query(demande): Query<DemandeIndexation>,
 ) -> Json<Value> {
+    let _guard = state.upnp_index_lock.lock().await;
+    let Json(mut report) = indexer(&state, &id, demande).await;
+    if let Some(object) = report.as_object_mut() {
+        object.remove("identites");
+    }
+    if let Some(reserves) = report["reserves"].as_array_mut() {
+        reserves.push(json!("Indexation ponctuelle : aucune piste supprimée. Ajoutez une source à la bibliothèque pour la synchroniser automatiquement."));
+    }
+    Json(report)
+}
+
+pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexation) -> Json<Value> {
     let serveurs = state.media_servers.lock().await;
-    let Some(ms) = serveurs.get(&id).cloned() else {
+    let Some(ms) = serveurs.get(id).cloned() else {
         return Json(json!({
             "indexe": false,
             "raison": "serveur inconnu",
@@ -501,10 +513,25 @@ pub async fn indexer_une_source(
     .await;
 
     let parcours_ms = debut.elapsed().as_millis() as u64;
-    ecrire(&state, &ms.id, &ms.name, &pistes, &mut bilan);
+    ecrire(state, &ms.id, &ms.name, &pistes, &mut bilan);
 
+    let identities: Vec<String> = pistes
+        .iter()
+        .map(|p| {
+            cle_d_identite(
+                &ms.id,
+                &p.titre,
+                p.artiste.as_deref(),
+                p.album.as_deref(),
+                p.duree_ms,
+                p.taille,
+            )
+        })
+        .collect();
     Json(json!({
+        "identites": identities,
         "indexe": true,
+        "complet": bilan.erreurs.is_empty() && bilan.plafond_atteint.is_none() && bilan.sans_url == 0,
         "serveur": { "id": ms.id, "nom": ms.name, "adresse": format!("{}:{}", ms.host, ms.port) },
         "conteneur": conteneur,
         "cle_d_identite": "condensat de (titre, artiste, album, durée à la seconde, res@size)",
@@ -555,11 +582,7 @@ pub async fn indexer_une_source(
 /// Ce que la passe ne fait pas, dit dans sa propre réponse.
 fn reserves(bilan: &Bilan) -> Vec<String> {
     let mut dites = vec![
-        "passe purement additive : aucune ligne n'est supprimée, \
-         la réconciliation est la phase 4"
-            .to_string(),
-        "aucun rapprochement avec la bibliothèque locale : un album présent \
-         des deux côtés apparaît deux fois (D1, marquage en phase 5)"
+        "les albums distants correspondant à un album local sont masqués dans la bibliothèque"
             .to_string(),
     ];
     // D4, tranchée par Bertrand le 14/09 : jouable partout, défauts assumés et
@@ -642,12 +665,18 @@ async fn recolter(
         }
         bilan.conteneurs_visites += 1;
 
-        let (sous_conteneurs, items, _total) =
-            super::network::parcourir_les_enfants(cd_url, nom, &conteneur).await;
+        let page = super::network::parcourir_les_enfants_verifie(cd_url, nom, &conteneur).await;
+        let (sous_conteneurs, items) = (page.conteneurs, page.items);
+        if let Some(erreur) = page.erreur {
+            bilan.erreurs.push(erreur);
+        }
         bilan.items_vus += items.len();
 
         for item in &items {
             let Some(piste) = PisteDistante::depuis_item(item) else {
+                bilan.erreurs.push(format!(
+                    "{nom} : une piste sans titre ne peut pas être identifiée"
+                ));
                 continue;
             };
             if piste.url_de_lecture.is_none() {
@@ -690,6 +719,9 @@ async fn recolter(
         }
         for sous in &sous_conteneurs {
             let Some(sous_id) = texte(sous, "id") else {
+                bilan.erreurs.push(format!(
+                    "{nom} : un dossier sans identifiant ne peut pas être parcouru"
+                ));
                 continue;
             };
             if vus.insert(sous_id.clone()) {

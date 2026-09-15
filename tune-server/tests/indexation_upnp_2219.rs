@@ -499,3 +499,266 @@ async fn un_serveur_inconnu_se_refuse_en_le_disant() {
     assert_eq!(corps["indexe"], json!(false), "corps : {corps}");
     assert_eq!(corps["raison"], json!("serveur inconnu"), "corps : {corps}");
 }
+
+/// A complete catalogue, a partial HTTP failure, and guarded removal through
+/// the public subscription API. The same real SOAP endpoint changes over time.
+#[tokio::test]
+async fn synchronisation_durable_refuse_les_pannes_et_confirme_les_retraits_massifs() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let stage = Arc::new(AtomicUsize::new(6));
+    let value = stage.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = Router::new().route("/control", post(move || {
+        let count = value.load(Ordering::SeqCst);
+        async move {
+            if count == 99 { return (StatusCode::BAD_GATEWAY, "upstream unavailable".to_string()); }
+            let content: String = (0..count).map(|i| format!(
+                "<item id=\"p{i}\"><dc:title>Piste {i}</dc:title><upnp:artist>Artiste</upnp:artist><upnp:album>Album</upnp:album><res duration=\"0:01:00\" size=\"100\" protocolInfo=\"http-get:*:audio/flac:*\">http://example.invalid/{i}.flac</res></item>"
+            )).collect();
+            (StatusCode::OK, enveloppe_soap(&content, count))
+        }
+    }));
+    let remote = tokio::spawn(async move {
+        axum::serve(listener, endpoint).await.unwrap();
+    });
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    inscrire_le_serveur(&state, &format!("http://{address}/control")).await;
+    let local_id = TrackRepo::with_backend(state.backend.clone())
+        .create(&Track::new("Local protégé".into()))
+        .unwrap();
+    let app = tune_server::routes::network::router().with_state(state.clone());
+
+    async fn call(app: &Router, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(if body.is_some() { "POST" } else { "GET" })
+            .uri(path)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    async fn settled(app: &Router) -> Value {
+        for _ in 0..200 {
+            let (status, body) = call(app, "/library-sources", None).await;
+            assert_eq!(status, StatusCode::OK);
+            let s = &body["items"][0];
+            if !matches!(s["status"].as_str(), Some("pending" | "running")) {
+                return s.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("la synchronisation ne rend pas son bilan");
+    }
+    let (status, _) = call(
+        &app,
+        &format!("/media-servers/{UDN}/library-source"),
+        Some(json!({"container":"0"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut source = settled(&app).await;
+    assert_eq!(source["status"], "ready", "première indexation complète");
+    assert_eq!(source["report"]["pistes"]["distinctes"], 6);
+    let key = source["key"].clone();
+    let count = || {
+        state
+            .backend
+            .query_one_strong("SELECT COUNT(*) FROM tracks WHERE source = 'upnp'", &[])
+            .unwrap()
+            .unwrap()[0]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(count(), 6);
+
+    stage.store(99, Ordering::SeqCst);
+    call(
+        &app,
+        "/library-sources",
+        Some(json!({"key":key,"action":"sync"})),
+    )
+    .await;
+    source = settled(&app).await;
+    assert_eq!(source["status"], "partial");
+    assert_eq!(
+        source["report"]["complet"], false,
+        "un HTTP 502 n’est pas un catalogue vide complet"
+    );
+    assert_eq!(count(), 6, "une panne ne supprime aucune piste");
+
+    stage.store(5, Ordering::SeqCst);
+    call(
+        &app,
+        "/library-sources",
+        Some(json!({"key":key,"action":"sync"})),
+    )
+    .await;
+    source = settled(&app).await;
+    assert_eq!(source["status"], "ready");
+    assert_eq!(
+        source["report"]["supprimees"], 1,
+        "un retrait inférieur à 20 % est réconcilié"
+    );
+    assert_eq!(count(), 5);
+
+    stage.store(3, Ordering::SeqCst);
+    call(
+        &app,
+        "/library-sources",
+        Some(json!({"key":key,"action":"sync"})),
+    )
+    .await;
+    source = settled(&app).await;
+    assert_eq!(
+        source["status"], "confirmation",
+        "40 % exige une confirmation"
+    );
+    assert_eq!(source["pending_count"], 2);
+    assert_eq!(count(), 5, "aucun retrait massif avant confirmation");
+    let (status, _) = call(
+        &app,
+        "/library-sources",
+        Some(json!({"key":key,"action":"confirm","count":2,"generation":"stale"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "un ancien bilan ne confirme pas le nouveau"
+    );
+    assert_eq!(count(), 5);
+    let (status, _) = call(
+        &app,
+        "/library-sources",
+        Some(json!({"key":key,"action":"confirm","count":2,"generation":source["generation"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(count(), 3);
+    assert!(
+        state
+            .backend
+            .query_one_strong("SELECT id FROM tracks WHERE id = ?", &[&local_id])
+            .unwrap()
+            .is_some(),
+        "le local reste intact"
+    );
+    assert!(
+        state
+            .backend
+            .query_one_strong(
+                "SELECT state_json FROM upnp_library_sources WHERE source_key = ?",
+                &[&key.as_str().unwrap()]
+            )
+            .unwrap()
+            .is_some(),
+        "le bilan est persistant"
+    );
+    remote.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn une_deuxieme_page_manquante_ne_devient_pas_un_catalogue_complet() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = Router::new().route(
+        "/control",
+        post(|body: String| async move {
+            if body.contains("<StartingIndex>0</StartingIndex>") {
+                let didl: String = AXE_ALBUM
+                    .iter()
+                    .map(|i| didl_item(i, "http://example.invalid"))
+                    .collect();
+                enveloppe_soap(&didl, 2).replace(
+                    "<TotalMatches>2</TotalMatches>",
+                    "<TotalMatches>3</TotalMatches>",
+                )
+            } else {
+                enveloppe_soap("", 0).replace(
+                    "<TotalMatches>0</TotalMatches>",
+                    "<TotalMatches>3</TotalMatches>",
+                )
+            }
+        }),
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, endpoint).await.unwrap();
+    });
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    inscrire_le_serveur(&state, &format!("http://{address}/control")).await;
+    let app = tune_server::routes::network::router().with_state(state);
+    let (_, report) = poster(&app, &format!("/media-servers/{UDN}/indexer")).await;
+    assert_eq!(
+        report["pistes"]["distinctes"], 2,
+        "les pages déjà reçues restent utilisables"
+    );
+    assert_eq!(
+        report["complet"], false,
+        "une page manquante interdit la réconciliation"
+    );
+    assert!(
+        report["erreurs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("pagination interrompue"))
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn un_retrait_ne_supprime_ni_une_autre_source_ni_une_piste_locale() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let repo = TrackRepo::with_backend(state.backend.clone());
+    let mut remote = Track::new("Partagée".into());
+    remote.source = "upnp".into();
+    remote.source_id = Some(format!("{UDN}|shared"));
+    let remote_id = repo.create(&remote).unwrap();
+    let local_id = repo.create(&Track::new("Locale".into())).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for key in ["a", "b"] {
+        let source = json!({"key":key,"udn":UDN,"container":key,"name":key,"enabled":true,
+            "status":"confirmation","last_attempt":now,"last_success":now,"report":{},
+            "generation":"new","pending":[remote_id,local_id]});
+        state.backend.execute("INSERT INTO upnp_library_sources (source_key,udn,container,state_json) VALUES (?,?,?,?)", &[&key,&UDN,&key,&source.to_string()]).unwrap();
+        for id in [remote_id, local_id] {
+            state.backend.execute("INSERT INTO upnp_library_members (source_key,track_id,generation) VALUES (?,?,?)", &[&key,&id,&"old"]).unwrap();
+        }
+    }
+    let app = tune_server::routes::network::router().with_state(state.clone());
+    for (key, expected_remote) in [("a", true), ("b", false)] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/library-sources")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                json!({"key":key,"action":"confirm","generation":"new","count":2}).to_string(),
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            repo.get(remote_id).unwrap().is_some(),
+            expected_remote,
+            "la piste distante reste tant qu’une autre source la possède"
+        );
+        assert!(
+            repo.get(local_id).unwrap().is_some(),
+            "une piste locale ne peut jamais être supprimée par la réconciliation UPnP"
+        );
+    }
+}
