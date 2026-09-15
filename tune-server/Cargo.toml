@@ -651,3 +651,7 @@ path = "tests/registre_serveurs_fraicheur_4125.rs"
 [[test]]
 name = "lecture_upnp_indexee_2219"
 path = "tests/lecture_upnp_indexee_2219.rs"
+
+[[test]]
+name = "history_context_4036"
+path = "tests/history_context_4036.rs"
