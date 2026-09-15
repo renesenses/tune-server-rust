@@ -3659,6 +3659,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "queue_items_types",
         include_str!("../../migrations/postgres/059_queue_items_types.sql"),
     ),
+    // #3715: streaming profile bindings and schema agree on i64.
+    (
+        60,
+        "streaming_profile_id",
+        include_str!("../../migrations/postgres/060_streaming_profile_id.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5616,7 +5622,9 @@ mod tests {
         // (`udn`), dates en TEXT des deux cotes comme `zones.last_seen_at`
         // (95 / PG 050). Le numero libre a ete remesure DANS LE CODE, entree
         // par entree, comme la 56 et la 57 l'imposent.
-        assert_eq!(pg_latest_version(), 59, "latest PG migration must be 59");
+        // 59 aligns queue types (#3716); 60 aligns streaming profile IDs
+        // with the repository's integer bindings (#3715).
+        assert_eq!(pg_latest_version(), 60, "latest PG migration must be 60");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
