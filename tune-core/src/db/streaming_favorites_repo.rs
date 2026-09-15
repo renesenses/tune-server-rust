@@ -173,10 +173,8 @@ impl StreamingFavoritesRepo {
         cover_url: Option<&str>,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::add, sql::add);
-        // profile_id is bound as TEXT: PG's column is TEXT (so `= $1` with a
-        // bigint fails "operator does not exist: text = bigint"), and SQLite's
-        // INTEGER affinity coerces the string back. Mirrors ProfileRepo.
-        let pid = profile_id.to_string();
+        // Native and migrated PostgreSQL profiles are BIGINT after migration 060.
+        let pid = profile_id;
         let params: [&dyn ToSqlValue; 8] = [
             &pid,
             &item_type,
@@ -199,7 +197,7 @@ impl StreamingFavoritesRepo {
         service_id: &str,
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::remove, sql::remove);
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
         self.db.execute(&sql, &params)?;
         Ok(())
@@ -213,7 +211,7 @@ impl StreamingFavoritesRepo {
         service_id: &str,
     ) -> Result<bool, String> {
         let sql = self.dialect_sql(sql::count_one, sql::count_one);
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
         let n = self
             .db
@@ -228,7 +226,7 @@ impl StreamingFavoritesRepo {
         profile_id: i64,
         item_type: Option<&str>,
     ) -> Result<Vec<StreamingFavorite>, String> {
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let rows = if let Some(t) = item_type {
             let sql = self.dialect_sql(sql::list_by_type, sql::list_by_type);
             let params: [&dyn ToSqlValue; 2] = [&pid, &t];
@@ -257,7 +255,7 @@ impl StreamingFavoritesRepo {
         // client) : il faut donc relire les lignes avec leur colonne 10 et
         // ranger AVANT de construire les structures.
         if tri.cle == CleDeTri::Manuel {
-            let pid = profile_id.to_string();
+            let pid = profile_id;
             let mut rows = if let Some(t) = item_type {
                 let sql =
                     self.dialect_sql(sql::list_by_type_pour_rang, sql::list_by_type_pour_rang);
@@ -313,7 +311,7 @@ impl StreamingFavoritesRepo {
             .filter(|cle| vus.insert((*cle).clone()))
             .collect();
 
-        let pid = profile_id.to_string();
+        let pid = profile_id;
         let raz = self.dialect_sql(sql::raz_ordre_manuel, sql::raz_ordre_manuel);
         let pose = self.dialect_sql(sql::poser_rang_manuel, sql::poser_rang_manuel);
 
@@ -323,8 +321,8 @@ impl StreamingFavoritesRepo {
             let params: [&dyn ToSqlValue; 2] = [&pid, &item_type];
             tx.execute(&raz, &params)?;
             for (rang, (service, service_id)) in uniques.iter().enumerate() {
-                // Rang lié en TEXTE : la colonne est TEXT sur le miroir
-                // PostgreSQL, comme `profile_id` juste à côté.
+                // Rang lié en TEXTE : position reste TEXT sur PostgreSQL
+                // (migration 057), indépendamment du profil entier.
                 let rang = (rang as i64 + 1).to_string();
                 let params: [&dyn ToSqlValue; 5] = [&rang, &pid, &item_type, service, service_id];
                 ranges += tx.execute(&pose, &params)?;

@@ -1712,3 +1712,210 @@ async fn pg_3039_fenetre_et_decompte_des_ajouts_recents() {
     );
     let _ = db.execute(&format!("DELETE FROM artists WHERE id = {artiste}"), &[]);
 }
+
+// #3715: exercise repository bindings on both historical PostgreSQL shapes.
+async fn pg_3715_pool(case: &str) -> Option<sqlx::PgPool> {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("SAUT : TUNE_TEST_PG_URL non posée — favoris PostgreSQL #3715");
+        return None;
+    };
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let name = format!("tune_streaming_profile_{case}");
+    assert!(
+        name.chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+    );
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {name}"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let (base, query) = url.split_once('?').unwrap_or((&url, ""));
+    let root = base.rsplit_once('/').unwrap().0;
+    let pool = sqlx::PgPool::connect(&format!("{root}/{name}?{query}"))
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    admin.close().await;
+    Some(pool)
+}
+
+async fn pg_3715_ensure_favorites(pool: &sqlx::PgPool) {
+    for stmt in crate::db::postgres::ENSURE_TABLES
+        .iter()
+        .filter(|s| s.contains("streaming_favorites"))
+    {
+        sqlx::raw_sql(*stmt).execute(pool).await.unwrap();
+    }
+}
+
+const PG_3715_MIGRATION: &str =
+    include_str!("../../migrations/postgres/060_streaming_profile_id.sql");
+
+async fn pg_3715_roundtrip(case: &str) {
+    use crate::db::streaming_favorites_repo::StreamingFavoritesRepo;
+    use crate::favorites_sort::TriFavoris;
+    let Some(pool) = pg_3715_pool(case).await else {
+        return;
+    };
+    pg_3715_ensure_favorites(&pool).await;
+    if case == "native" {
+        let typ: String = sqlx::query_scalar("SELECT data_type FROM information_schema.columns WHERE table_schema='public' AND table_name='streaming_favorites' AND column_name='profile_id'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            typ, "bigint",
+            "new native table must use the repository's i64 profile type"
+        );
+    } else if case == "legacy" {
+        sqlx::raw_sql("ALTER TABLE streaming_favorites ALTER COLUMN profile_id DROP DEFAULT; ALTER TABLE streaming_favorites ALTER COLUMN profile_id TYPE TEXT USING profile_id::text; ALTER TABLE streaming_favorites ALTER COLUMN profile_id SET DEFAULT '1'")
+            .execute(&pool).await.unwrap();
+    } else {
+        // The SQLite -> PG path already repaired both IDs via migration 012.
+        sqlx::raw_sql("ALTER TABLE streaming_favorites ALTER COLUMN id DROP DEFAULT; ALTER TABLE streaming_favorites ALTER COLUMN id TYPE BIGINT USING id::bigint; ALTER TABLE streaming_favorites ALTER COLUMN id SET DEFAULT nextval('streaming_favorites_id_seq')")
+            .execute(&pool).await.unwrap();
+    }
+    sqlx::raw_sql("INSERT INTO streaming_favorites (id, profile_id, item_type, service, service_id, title, position) VALUES ('500', '9000000001', 'track', 'qobuz', 'kept', 'Existing favorite', '7')")
+        .execute(&pool).await.unwrap();
+    for _ in 0..2 {
+        sqlx::raw_sql(PG_3715_MIGRATION)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pg_3715_ensure_favorites(&pool).await;
+    }
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    let repo = StreamingFavoritesRepo::with_backend(db);
+    let pid = 9_000_000_001_i64;
+    let kept = repo
+        .list(pid, None)
+        .expect("existing favorites must remain readable");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].id, 500);
+    assert_eq!(kept[0].profile_id, pid);
+    assert_eq!(kept[0].title.as_deref(), Some("Existing favorite"));
+    for (profile, kind, id) in [
+        (pid, "track", "a"),
+        (pid, "track", "b"),
+        (pid, "album", "album"),
+        (pid + 1, "track", "a"),
+    ] {
+        repo.add(profile, kind, "qobuz", id, Some(id), None, None, None)
+            .expect("add binds an integer profile");
+    }
+    repo.add(
+        pid,
+        "track",
+        "qobuz",
+        "a",
+        Some("duplicate"),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(repo.list(pid, Some("track")).unwrap().len(), 3);
+    assert_eq!(repo.list(pid, None).unwrap().len(), 4);
+    assert!(repo.is_favorite(pid, "track", "qobuz", "a").unwrap());
+    assert!(!repo.is_favorite(pid, "track", "qobuz", "absent").unwrap());
+    assert_eq!(
+        repo.reorder(
+            pid,
+            "track",
+            &[
+                ("qobuz".into(), "b".into()),
+                ("qobuz".into(), "a".into()),
+                ("qobuz".into(), "b".into()),
+                ("qobuz".into(), "absent".into())
+            ]
+        )
+        .unwrap(),
+        2
+    );
+    let manual = TriFavoris::depuis(Some("manual"), None).unwrap();
+    let sorted = repo.list_sorted(pid, Some("track"), manual).unwrap();
+    assert_eq!(
+        sorted
+            .iter()
+            .map(|f| f.service_id.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a", "kept"]
+    );
+    assert_eq!(repo.list_sorted(pid, None, manual).unwrap().len(), 4);
+    repo.remove(pid, "track", "qobuz", "a").unwrap();
+    assert!(!repo.is_favorite(pid, "track", "qobuz", "a").unwrap());
+    assert!(repo.is_favorite(pid + 1, "track", "qobuz", "a").unwrap());
+    assert_eq!(repo.list(pid, Some("album")).unwrap().len(), 1);
+    sqlx::raw_sql("INSERT INTO streaming_favorites (item_type, service, service_id) VALUES ('track','tidal','default-profile')")
+        .execute(&pool).await.unwrap();
+    assert!(
+        repo.is_favorite(1, "track", "tidal", "default-profile")
+            .unwrap()
+    );
+    drop(repo);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_native_favorites() {
+    pg_3715_roundtrip("native").await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_legacy_favorites() {
+    pg_3715_roundtrip("legacy").await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_migrated_favorites() {
+    pg_3715_roundtrip("migrated").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_invalid_profiles_preserve_data_and_version() {
+    let Some(pool) = pg_3715_pool("invalid").await else {
+        return;
+    };
+    let mut c = pool.acquire().await.unwrap();
+    for value in ["not-an-id", "9223372036854775808"] {
+        sqlx::raw_sql("DROP TABLE IF EXISTS streaming_favorites; CREATE TABLE streaming_favorites (profile_id TEXT NOT NULL DEFAULT '1', title TEXT)")
+            .execute(&mut *c).await.unwrap();
+        sqlx::query("INSERT INTO streaming_favorites VALUES ($1, 'keep me')")
+            .bind(value)
+            .execute(&mut *c)
+            .await
+            .unwrap();
+        let error = sqlx::raw_sql(PG_3715_MIGRATION)
+            .execute(&mut *c)
+            .await
+            .expect_err("invalid profile must refuse the migration");
+        assert!(
+            matches!(
+                error.as_database_error().and_then(|e| e.code()).as_deref(),
+                Some("22P02" | "22003")
+            ),
+            "{error}"
+        );
+        sqlx::raw_sql("ROLLBACK").execute(&mut *c).await.unwrap();
+        let row: (String, String) =
+            sqlx::query_as("SELECT profile_id, title FROM streaming_favorites")
+                .fetch_one(&mut *c)
+                .await
+                .unwrap();
+        assert_eq!(row, (value.into(), "keep me".into()));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_version WHERE version=60")
+            .fetch_one(&mut *c)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let default: String = sqlx::query_scalar("SELECT column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='streaming_favorites' AND column_name='profile_id'").fetch_one(&mut *c).await.unwrap();
+        assert_eq!(default, "'1'::text");
+    }
+    drop(c);
+    pool.close().await;
+}
