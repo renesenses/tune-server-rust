@@ -15,7 +15,7 @@ members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tu
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast"]
+exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast", "vendor/ape-decoder"]
 resolver = "2"
 
 [workspace.package]
