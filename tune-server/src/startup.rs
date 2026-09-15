@@ -272,6 +272,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     resolve_ytdlp(state).await;
     restore_convolvers(state).await;
     warm_sqlite_cache(state);
+    crate::routes::synchronisation_upnp::start(state.clone());
 
     // Re-register manually-added devices (BluOS, legacy DLNA renderers that
     // don't answer SSDP M-SEARCH). Done off the startup path so an offline

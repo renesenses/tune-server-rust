@@ -1,5 +1,57 @@
 # Unifier les serveurs multimédia UPnP et la bibliothèque
 
+## Suite du 15 septembre 2026 — #4201 (code en préparation, non livré)
+
+La 0.9.150 contient le registre, l’indexation additive, la lecture des pistes
+indexées, les plafonds et le filtre Source. Les phases ci-dessous décrivent
+le plan initial ; leurs détails ne sont pas tous encore à réaliser. En
+particulier, l’identité retenue est UDN + condensat des métadonnées, et les
+albums distants correspondant à un album local sont masqués.
+
+Le lot #4201 ajoute des abonnements explicites à des conteneurs UPnP :
+
+- `POST /network/media-servers/{id}/library-source` mémorise `{container, name?}`
+  et démarre une passe en arrière-plan ; `GET /network/library-sources` rend
+  les états et bilans persistants ;
+- `POST /network/library-sources` accepte `{key, action}` (`sync`, `pause`),
+  et `confirm` exige en plus la génération du bilan et son nombre exact ;
+- les abonnements sont revisités chaque heure, en série ; le travail réseau
+  est borné à 30 minutes par passe et les mutations concurrentes sont refusées ;
+- HTTP en échec, XML incomplet, compteurs incohérents, pagination interrompue,
+  catalogue changeant entre pages, limite atteinte ou item non identifiable
+  interdisent toute suppression ; les entrées déjà récoltées restent additives ;
+- les appartenances sont mémorisées par conteneur. Une piste appartenant encore
+  à un autre abonnement est conservée. Le local n’est jamais une cible ;
+- au-delà de 20 % des appartenances précédentes manquantes, un bilan chiffré
+  attend confirmation. Celle-ci expire au bout d’une heure et ne vaut que
+  pour la génération affichée. Aucune suppression de fichier distant ;
+- le client permet l’ajout depuis un serveur Tune comme depuis un serveur tiers,
+  expose les bilans et affiche les avertissements audio reçus ; Source reste
+  accessible, avec les provenances à zéro sous les autres filtres.
+
+### Limites explicites de ce lot
+
+Les indexations manuelles antérieures ne deviennent pas automatiquement des
+abonnements : l’utilisateur choisit le périmètre à suivre. La réconciliation
+ne supprime que les pistes dont ce périmètre a effectivement pris possession.
+Les restrictions des sorties audio restent celles de `verdict_upnp.rs`.
+
+À terminer avant de déclarer le chantier complet : disponibilité sur chaque
+album/piste et pochettes hors connexion ; filtres Source dans Artistes et
+Pistes ; continuité des favoris/playlists lors d’un changement des métadonnées
+servant de clé (un changement d’URL seul garde l’identité) ; compteur UPnP
+`SystemUpdateID` ; qualification multiservers, gros volumes et redémarrages
+réels. La parité DSP/seek/ReplayGain/OAAT constitue le lot audio suivant.
+
+Les migrations couvrent SQLite, PostgreSQL, le schéma de conversion et les
+rattrapages de démarrage. La table d’appartenance ne déclare pas de FK vers
+`tracks.id` : le schéma intermédiaire de conversion porte cet ID en TEXT.
+Les appartenances orphelines sont nettoyées dans la transaction de réconciliation ;
+la vérification de source précède toute suppression de piste.
+
+---
+
+
 **Reconnaissance en lecture seule.** Relevé sur `origin/batch/refonte-coeur-2`
 (`33af7382`), 13 septembre 2026. Aucun fichier de production n'est modifié par
 ce document.
