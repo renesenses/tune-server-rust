@@ -32,6 +32,7 @@ struct Snapshot {
 }
 
 struct WorkerClient {
+    spawn: fn() -> Result<ChildProcess, TuneError>,
     process: tokio::sync::Mutex<Option<ChildProcess>>,
     life: Mutex<Option<(Arc<AtomicBool>, tokio::sync::watch::Sender<bool>)>>,
     snapshot: Mutex<Snapshot>,
@@ -40,6 +41,7 @@ struct WorkerClient {
 impl WorkerClient {
     fn new() -> Self {
         Self {
+            spawn: || ChildProcess::spawn("control"),
             process: tokio::sync::Mutex::new(None),
             life: Mutex::new(None),
             snapshot: Mutex::new(Snapshot {
@@ -82,7 +84,7 @@ impl WorkerClient {
         let mut process = match slot.take().filter(|process| process.alive()) {
             Some(process) => process,
             None => {
-                let mut process = ChildProcess::spawn("control")?;
+                let mut process = (self.spawn)()?;
                 *self.life.lock().unwrap() = Some((process.life.clone(), process.kill.clone()));
                 let reply = process
                     .rpc(&Operation::Init {
@@ -139,9 +141,11 @@ impl SpotifyNativeService {
     }
     pub fn pairing_status(&self) -> Value {
         let alive = self.client.alive();
+        let paired = self.has_credentials();
         let snapshot = self.client.snapshot.lock().unwrap();
         json!({
             "mode": "unofficial-native", "process_isolated": true,
+            "paired": paired,
             "device_name": "Tune — Spotify pairing",
             "instructions": "On the same local network, open Spotify and select Tune — Spotify pairing in Available devices. Then return to Tune.",
             "pairing": self.enabled && alive && snapshot.details["pairing"] == true,
@@ -323,7 +327,11 @@ impl StreamingService for SpotifyNativeService {
         }
     }
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
-        if self.enabled && self.client.alive() {
+        // A cancelled catalogue request deliberately kills its child. Saved
+        // pairing must still be refreshed when that child no longer exists.
+        // The normal server refresher runs every five minutes; Status keeps
+        // the engine's reconnect backoff and never starts discovery.
+        if self.enabled && (self.client.alive() || self.has_credentials()) {
             let _: AuthStatus = self.call(Operation::Status).await?;
         }
         Ok(std::mem::take(
@@ -335,6 +343,98 @@ impl StreamingService for SpotifyNativeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn authenticated_worker_fixture() -> Result<ChildProcess, TuneError> {
+        let reply = Reply {
+            result: Ok(json!({"authenticated": true})),
+            status: AuthStatus {
+                authenticated: true,
+                ..Default::default()
+            },
+            details: json!({"pairing": false, "error": null}),
+            tokens: json!({"credentials": {"fixture": true}}),
+        };
+        let payload = serde_json::to_vec(&reply).unwrap();
+        let frame: Vec<_> = (payload.len() as u32)
+            .to_be_bytes()
+            .into_iter()
+            .chain(payload)
+            .collect();
+        let escaped = frame
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect::<String>();
+        // Two complete replies (Init and Status), then stay alive. This is
+        // real framed IPC with a supervised child, not a mocked status getter.
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%b%b' \"$1\" \"$1\"; exec sleep 30",
+            "fixture",
+            &escaped,
+        ]);
+        ChildProcess::from_command(command).map_err(TuneError::from)
+    }
+
+    #[cfg(unix)]
+    fn saved_pairing_fixture() -> SpotifyNativeService {
+        let mut service = SpotifyNativeService::new();
+        Arc::get_mut(&mut service.client).unwrap().spawn = authenticated_worker_fixture;
+        service.client.snapshot.lock().unwrap().tokens = json!({"credentials": {"fixture": true}});
+        service
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_refresh_recovers_a_dead_worker_using_saved_pairing() {
+        let mut service = saved_pairing_fixture();
+        let tokens = service.save_tokens().unwrap();
+        assert!(!service.auth_status().await.authenticated);
+        service.refresh_if_needed().await.unwrap();
+        assert!(
+            service.auth_status().await.authenticated,
+            "The periodic refresh must reconnect a stopped Spotify worker with saved pairing"
+        );
+        service.client.stop();
+        assert!(!service.auth_status().await.authenticated);
+        service.refresh_if_needed().await.unwrap();
+        assert!(
+            service.auth_status().await.authenticated,
+            "A later worker loss must remain recoverable without a new pairing"
+        );
+        assert_eq!(service.save_tokens().unwrap(), tokens);
+        assert_eq!(service.pairing_status()["pairing"], false);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_refresh_never_reconnects_disabled_logged_out_or_unpaired_services() {
+        let mut service = saved_pairing_fixture();
+        service.set_enabled(false);
+        service.refresh_if_needed().await.unwrap();
+        assert!(
+            !service.client.alive(),
+            "Disabled Spotify must not reconnect"
+        );
+        service.set_enabled(true);
+        service.refresh_if_needed().await.unwrap();
+        assert!(service.client.alive());
+        service.logout().await.unwrap();
+        service.refresh_if_needed().await.unwrap();
+        assert!(
+            !service.client.alive(),
+            "Logged-out Spotify must not reconnect or pair"
+        );
+        let mut fresh = SpotifyNativeService::new();
+        Arc::get_mut(&mut fresh.client).unwrap().spawn = authenticated_worker_fixture;
+        fresh.refresh_if_needed().await.unwrap();
+        assert!(
+            !fresh.client.alive(),
+            "Unpaired Spotify must not spawn a worker on refresh"
+        );
+    }
+
     #[tokio::test]
     async fn native_proxy_poll_and_logout_do_not_spawn_a_worker() {
         let mut service = SpotifyNativeService::new();

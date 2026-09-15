@@ -84,6 +84,78 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   worker. Le chemin du signal ne qualifie pas ce décodage de lossless ou
   bit-perfect. L'étiquette WAV 44,1/16 décrit le transport, pas la source.
 
+## Reprise après arrêt du worker — 15 septembre 2026
+
+Reproduction sur l'instance Mac isolée : arrêter uniquement son enfant
+`--spotify-native-worker control` fait passer `/streaming/services` de
+`authenticated=true` à `false`, parent Tune inchangé. L'ancien écran V2 reste
+sans onglet Spotify et n'appelle pas le statut individuel. Cette reproduction
+établit le chemin défaillant ; elle ne prouve pas la cause exacte de la perte
+de session observée à la fin de l'unité albums/artistes.
+
+Deux raccords complémentaires, sans modifier le contrat de la liste globale :
+
+- `refresh_if_needed` accepte aussi un worker absent si l'appairage est
+  conservé. Le rafraîchisseur existant du serveur l'appelle toutes les cinq
+  minutes. Son `Status` conserve le délai de reprise du moteur ; une absence
+  d'appairage, un logout ou une désactivation n'ouvre aucune connexion.
+- À l'ouverture de Streaming V2, Spotify activé mais non authentifié déclenche
+  un unique `GET /streaming/spotify/status`. La reprise n'est pas incluse dans
+  le GET global des services et n'en rallonge donc pas le chemin de lecture.
+  Les autres onglets restent affichés, la reprise ne vole pas leur sélection.
+  L'onglet Spotify n'apparaît qu'après une réponse activée ET authentifiée.
+  Échec réseau ou appairage conservé mais refusé : message visible et bouton
+  Réessayer, sans boucle automatique ni requête d'appairage. Une réponse
+  reçue après fermeture de la vue est ignorée. La requête a une limite client
+  de 95 s couvrant les deux RPC bornés Init/Status, pas une attente infinie.
+
+Le statut individuel ajoute seulement le booléen sûr `auth_details.paired`,
+pour distinguer une reprise échouée d'un compte jamais appairé. Aucun
+identifiant, jeton, mot de passe ou contenu de bibliothèque n'y est ajouté.
+Le simple snapshot `auth_status()` reste sans réseau et ne prétend pas qu'un
+worker arrêté est authentifié. L'interface historique ne reçoit pas ce
+raccord d'ouverture V2 dans cette unité.
+
+Tests : deux témoins Rust du proxy utilisent de vrais enfants supervisés
+et des trames Init/Status factices, sans Spotify ni secrets. Ils couvrent
+deux pertes successives, conservation de l'appairage, absence d'appairage,
+logout et désactivation. Neuf nouveaux tests montent le vrai composant V2 :
+réapparition, sélection Qobuz préservée, compte non appairé, services absents /
+désactivés / connectés, refus réessayables et réponse tardive après démontage.
+
+Contre-épreuves, tests inchangés :
+
+- Remettre la seule garde `self.client.alive()` dans `refresh_if_needed`, puis
+  `cargo test --locked -p tune-core --lib --no-default-features --features
+  oaat,spotify-native native_refresh_recovers_a_dead_worker_using_saved_pairing`
+  compile et échoue : `The periodic refresh must reconnect a stopped Spotify
+  worker with saved pairing` (un rouge attendu).
+- Retirer seulement l'appel de reprise à l'ouverture V2, puis
+  `npx vitest run src/lib/__tests__/spotifyRecovery.test.ts -t 'fait réapparaître'`
+  échoue : `La consultation Streaming doit reconnecter le worker arrêté et
+  rendre son onglet` (un rouge attendu, huit tests non sélectionnés).
+
+Sources restaurées par copie après chaque contre-épreuve. Le relevé final
+d'exécution est conservé avec l'instance privée sur le Mac ; aucune écriture
+Spotify, aucune publication ou modification Goinfre/l'instance de production dans cette unité.
+
+Validation du candidat installé : 48 tests natifs, 32 tests HTTP, puis
+cross-build macOS ARM. Client `b0a143dfc5f3d3111569cbbd52cbc32f0949a55f` :
+413 fichiers / 4 599 tests et build verts. Binaire SHA-256
+`696a2f795250c354d064b4c3c4bc88bc9bfa02d571903d4b6e8bd7a6c742a128`.
+Trois arrêts contrôlés du worker suivis d'une ouverture Chrome : onglet
+revenu en 2,6–2,8 s, un seul GET de reprise par essai, zéro POST d'appairage,
+parent inchangé, zéro erreur JS. Les quatre zones et leurs files sont
+inchangées. Ces durées ponctuelles ne garantissent pas une latence réseau.
+
+La première sonde directe du candidat a reçu un refus sur une fiche de
+métadonnées des titres aimés : aucun résultat partiel servi. Une relance
+complète a réussi sans modification du binaire (160 albums / 14 artistes avec
+portraits / 1 512 titres). Les HTTP du serveur installé confirment ces nombres,
+18 pistes sur l'album contrôlé et 520 sur la grande playlist. Le refus initial
+est conservé dans les preuves ; cette unité n'ajoute pas de reprise automatique
+des lectures de collections échouées et ne détermine pas sa cause amont.
+
 ## Albums enregistrés et artistes suivis — 15 septembre 2026
 
 Les opérations privées `UserAlbums` et `UserArtists` relient maintenant le
@@ -195,9 +267,9 @@ Limite de reconnexion observée lors d'une réouverture Chrome :
 ce qui masque son onglet. Le `GET /streaming/spotify/auth/status` suivant a
 rétabli l'état authentifié, sans appairage ; la liste des services était alors
 de nouveau correcte. L'origine de cette perte transitoire n'est pas déterminée
-dans cette unité. La réapparition autonome de l'onglet après perte de session
-reste donc à fiabiliser : le succès des lectures de collections ne clôt pas
-ce sujet.
+dans cette unité. Ce constat a motivé l'unité de reprise du worker décrite
+plus haut ; le succès des lectures de collections, à lui seul, ne clôturait
+pas ce sujet.
 
 ## Compilation / validation
 

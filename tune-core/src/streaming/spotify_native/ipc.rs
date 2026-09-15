@@ -144,7 +144,7 @@ impl ChildProcess {
         command.arg("--spotify-native-worker").arg(mode);
         Self::from_command(command).map_err(TuneError::from)
     }
-    fn from_command(mut command: Command) -> Result<Self, String> {
+    pub(super) fn from_command(mut command: Command) -> Result<Self, String> {
         // No credentials in argv, environment, filesystem or child stderr.
         command
             .stdin(std::process::Stdio::piped())
