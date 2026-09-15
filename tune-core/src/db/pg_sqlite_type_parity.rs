@@ -230,12 +230,7 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
         "lyrics_offset_ms",
         "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
     ),
-    (
-        "migree",
-        "queue_items",
-        "is_current",
-        "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
-    ),
+    // queue_items.is_current: converted by migration 059 (#3716).
     // ── #3715 — les NEUF qui restent, mesurees le 09/09/2026 ──────────────
     //
     // Quatre des treize lignes de #3715 ont ete CONVERTIES par la migration 053
@@ -757,8 +752,9 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        22,
-        // 4 côté natif, 18 côté migré. Le 31/08/2026 il valait 16 ; #3715 en a
+        21,
+        // #3716 retire queue_items.is_current côté migré : 4 natifs, 17 migrés.
+        // Le 31/08/2026 il valait 16 ; #3715 en a
         // retiré 2 (tolérances périmées, `zones.dlna_wav24` et
         // `zones.dlna_play_delay_ms`, réparées depuis) et inscrit les 9
         // divergences que la migration 053 ne convertit pas, d'où 23 ; #3726 en
