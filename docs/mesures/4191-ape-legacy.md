@@ -86,3 +86,43 @@ de la PR WavPack #4207. Il rejoint le lot audio JP
 manifestes Cargo : l'intégration doit conserver les deux chemins vendored
 indépendants, Rubato (#4229) et ape-decoder. L'audit de sécurité de la base
 reste suivi par #4200. Pas de migration ni bump de version.
+
+## Garde d'inventaire du workspace — suite CI du 16/09
+
+La CI du premier HEAD `363708f6` a révélé un faux membre dans
+`workflows_bornes::membres_du_workspace`. Le lecteur suivait toutes les
+dépendances `path` sans tenir compte de `workspace.exclude`. Il inventait
+donc un seizième membre, `ape-decoder`, alors que
+`cargo metadata --no-deps --offline --format-version 1` rend bien **15 membres**
+et exclut cette dépendance.
+
+Les deux gardes de couverture (`cargo test` et Clippy) utilisaient ce lecteur.
+Ce sont les seuls tests rouges des trois suites CI concernées : standard,
+fonctionnalités livrées et PostgreSQL. Les gardes n'ont pas été désactivées,
+et aucune liste blanche n'a été ajoutée.
+
+Le lecteur utilise maintenant `workspace_members` de Cargo. La commande
+fonctionne hors ligne, sans construire les dépendances. Un échec de Cargo
+ou une réponse invalide fait échouer la garde.
+
+Un workspace temporaire réel exerce simultanément dix membres déclarés,
+un membre implicite atteint par `path` et une dépendance `path` exclue.
+La garde doit rendre exactement les onze membres effectifs. Avec l'ancien
+lecteur, elle rend douze paquets et échoue :
+`an excluded path dependency is not a Cargo workspace member`.
+
+Validation Shrek :
+
+```sh
+cargo test -p tune-server --test server_contracts --no-default-features   --features oaat workflows_bornes::
+```
+
+**32/32 verts**. Retrait du nouveau lecteur, tests inchangés : témoin compilé,
+**1 rouge** sur le paquet exclu. Restauration par `cp` du fichier corrigé :
+**32/32 verts**, formatage vert. Journaux :
+`/tmp/jp-4191-workspace-counterproof-final.log` et
+`/tmp/jp-4191-workspace-final.log`.
+
+Clippy correctness du harnais serveur réussit également :
+`cargo clippy -p tune-server --test server_contracts --no-default-features --features oaat -- -D clippy::correctness`.
+Journal : `/tmp/jp-4191-workspace-clippy.log` ; avertissements préexistants conservés.
