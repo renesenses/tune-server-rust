@@ -5490,7 +5490,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
+ "tracing-subscriber",
  "tune-core",
 ]
 
