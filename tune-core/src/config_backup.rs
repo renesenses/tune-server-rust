@@ -1484,7 +1484,21 @@ mod tests {
             eprintln!("SAUT : TUNE_TEST_PG_URL non posee — PostgreSQL non exerce");
             return;
         };
-        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        // The other pg_config_backup test resets public.zones in parallel.
+        // Keep the real migrated column types/defaults, but give this roundtrip
+        // a connection-local table and sequence that its reset cannot erase.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        for statement in [
+            "CREATE TEMP TABLE zones (LIKE public.zones INCLUDING ALL)",
+            "CREATE TEMP SEQUENCE autoplay_backup_zone_id",
+            "ALTER TABLE pg_temp.zones ALTER COLUMN id SET DEFAULT nextval('pg_temp.autoplay_backup_zone_id')",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
         autoplay_backup_roundtrip(Arc::new(crate::db::backend::PostgresBackend::new(pool)));
     }
 
