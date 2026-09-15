@@ -15,7 +15,7 @@ members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tu
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast"]
+exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast", "vendor/rubato"]
 resolver = "2"
 
 [workspace.package]
@@ -90,7 +90,8 @@ cbc = "0.1"
 regex = "1"
 csv = "1"
 symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg", "mkv"] }
-rubato = "3"
+# Rubato 3.0.0, normalisation compensee du sinc (#4079). Voir vendor/rubato/TUNE-PATCH.md.
+rubato = { path = "vendor/rubato" }
 # libopus — liaison sûre `opus` (SpaceManiac/opus-rs) au-dessus d'`opusic-sys`
 # (DoumanAsh), qui embarque libopus 1.6.1 et la construit en statique.
 #
