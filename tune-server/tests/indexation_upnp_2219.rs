@@ -762,3 +762,182 @@ async fn un_retrait_ne_supprime_ni_une_autre_source_ni_une_piste_locale() {
         );
     }
 }
+
+#[tokio::test]
+async fn identites_upnp_la_synchronisation_conserve_liens_et_appartenances_apres_correction() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    async fn appel(app: &Router, body: Option<Value>) -> Value {
+        let request = Request::builder()
+            .method(if body.is_some() { "POST" } else { "GET" })
+            .uri("/library-sources")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    async fn bilan(app: &Router) -> Value {
+        for _ in 0..300 {
+            let body = appel(app, None).await;
+            let s = &body["items"][0];
+            if !matches!(s["status"].as_str(), Some("pending" | "running")) {
+                return s.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("la synchronisation doit finir");
+    }
+    let stage = Arc::new(AtomicUsize::new(0));
+    let value = stage.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = Router::new().route("/control", post(move || {
+        let stage = value.load(Ordering::SeqCst);
+        async move {
+            let didl: String = (0..6).map(|i| {
+                let suffixe = if stage == 0 { "" } else { " corrigé" };
+                let taille = if stage == 0 { 1000 } else { 1100 };
+                let objet = if stage == 4 && i == 0 { "sans-aucun-indice".into() } else if stage < 2 { format!("p{i}") } else { format!("rescan-{i}") };
+                let duree = if stage == 3 && i == 0 { "0:02:00" } else { "0:01:00" };
+                let titre = if stage >= 3 && i == 0 { "Fichier étranger".into() } else { format!("Piste {i}{suffixe}") };
+                format!("<item id=\"{objet}\"><dc:title>{titre}</dc:title><upnp:artist>Artiste{suffixe}</upnp:artist><upnp:album>Album{suffixe}</upnp:album><res duration=\"{duree}\" size=\"{taille}\" protocolInfo=\"http-get:*:audio/flac:*\">http://example.invalid/{objet}.flac</res></item>")
+            }).collect();
+            enveloppe_soap(&didl, 6)
+        }
+    }));
+    let remote = tokio::spawn(async move {
+        axum::serve(listener, endpoint).await.unwrap();
+    });
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    inscrire_le_serveur(&state, &format!("http://{address}/control")).await;
+    let app = tune_server::routes::network::router().with_state(state.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/media-servers/{UDN}/library-source"))
+        .header("Content-Type", "application/json")
+        .body(Body::from("{\"container\":\"0\"}"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let premier = bilan(&app).await;
+    assert_eq!(premier["status"], "ready");
+    let key = premier["key"].clone();
+    let membres = || {
+        state
+            .backend
+            .query_many(
+                "SELECT track_id FROM upnp_library_members ORDER BY track_id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    let avant = membres();
+    assert_eq!(avant.len(), 6);
+    let favori = state
+        .backend
+        .query_one("SELECT id FROM tracks WHERE title = 'Piste 0'", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_i64()
+        .unwrap();
+    state
+        .backend
+        .execute(
+            "INSERT INTO favorites (profile_id,item_type,item_id) VALUES (1,'track',?)",
+            &[&favori.to_string()],
+        )
+        .unwrap();
+    let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
+    let playlist = repo.create("Conserver", None, 1).unwrap();
+    repo.add_tracks(playlist, &[favori, avant[1], favori], None)
+        .unwrap();
+    for etape in 1..=2 {
+        stage.store(etape, Ordering::SeqCst);
+        appel(&app, Some(json!({"key":key,"action":"sync"}))).await;
+        let resultat = bilan(&app).await;
+        assert_eq!(
+            resultat["status"], "ready",
+            "un changement de tags/adresse n'est pas un retrait : {resultat}"
+        );
+        assert_eq!(
+            resultat["report"]["pistes"]["mises_a_jour"], 6,
+            "réutiliser les lignes, pas les recréer"
+        );
+        assert_eq!(resultat["report"]["pistes"]["ajoutees"], 0);
+        assert_eq!(resultat["report"]["supprimees"], 0);
+        assert_eq!(
+            membres(),
+            avant,
+            "les appartenances suivent les identifiants durables"
+        );
+    }
+    stage.store(3, Ordering::SeqCst);
+    appel(&app, Some(json!({"key":key,"action":"sync"}))).await;
+    let ambigu = bilan(&app).await;
+    assert_eq!(
+        ambigu["status"], "partial",
+        "un indice réutilisé interdit même un retrait de 1/6 : {ambigu}"
+    );
+    assert_eq!(membres(), avant);
+    assert_eq!(
+        TrackRepo::with_backend(state.backend.clone())
+            .get(favori)
+            .unwrap()
+            .unwrap()
+            .title,
+        "Piste 0 corrigé"
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM favorites f JOIN tracks t ON CAST(f.item_id AS INTEGER) = t.id WHERE f.item_type = 'track'"
+        ),
+        1
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM playlist_tracks pt JOIN tracks t ON pt.track_id = t.id"
+        ),
+        3
+    );
+    // Plus aucun indice pour l'ancienne piste favorite : une nouvelle piste
+    // peut entrer, mais le retrait de l'ancienne exige un examen même à 1/6.
+    stage.store(4, Ordering::SeqCst);
+    appel(&app, Some(json!({"key":key,"action":"sync"}))).await;
+    let disparu = bilan(&app).await;
+    assert_eq!(
+        disparu["status"], "confirmation",
+        "les liens utilisateur protègent aussi un retrait inférieur à 20 % : {disparu}"
+    );
+    assert_eq!(disparu["pending_count"], 1);
+    assert_eq!(disparu["report"]["retrait_avec_liens_utilisateur"], true);
+    assert!(
+        TrackRepo::with_backend(state.backend.clone())
+            .get(favori)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM playlist_tracks pt JOIN tracks t ON pt.track_id = t.id"
+        ),
+        3
+    );
+    remote.abort();
+}

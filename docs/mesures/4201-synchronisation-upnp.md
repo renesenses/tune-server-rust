@@ -74,7 +74,12 @@ attendue jamais émise. Restaurations par copies, puis 93 tests verts.
 Node 26 avait fait échouer des tests existants liés à son `localStorage`
 global ; la batterie complète a été reprise avec Node 22.
 
-## Périmètre restant
+## Périmètre restant au terme du premier lot
+
+Ce relevé décrit le premier lot. Les PR ont depuis été complétées par les
+filtres des trois onglets, la disponibilité et les pochettes locales, puis
+les identités durables. Voir `4201-pochettes-hors-connexion.md` et
+`4201-identites-durables.md` pour les preuves et limites des ajouts serveur.
 
 Les PR sont à relire et leur CI complète doit passer. Ce lot ne prétend pas
 clore la qualification matérielle, la conservation des pochettes hors connexion,

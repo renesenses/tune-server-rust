@@ -193,7 +193,7 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
                     Json(json!({"error": "Bilan expiré : relancez la synchronisation."})),
                 ));
             }
-            let removed = remove_missing(&state, &source).map_err(error)?;
+            let removed = remove_missing(&state, &source, true).map_err(error)?;
             source.report["supprimees"] = json!(removed);
             source.pending.clear();
             source.status = "ready".into();
@@ -229,7 +229,32 @@ fn member_ids(tx: &dyn DbTxHandle, key: &str) -> Result<Vec<i64>, String> {
 
 /// Every candidate is scoped by both membership and the track's source/UDN.
 /// A second subscription still owning the track prevents its deletion.
-fn remove_missing(state: &AppState, source: &Source) -> Result<usize, String> {
+fn liens_utilisateur_sql(ids: &str) -> String {
+    // ids est construit exclusivement depuis des i64, jamais depuis une requête.
+    format!(
+        "SELECT t.id FROM tracks t WHERE t.id IN ({ids}) AND (
+        EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id)
+        OR EXISTS (SELECT 1 FROM favorites f WHERE
+            (f.item_type = 'track' AND f.item_id = CAST(t.id AS TEXT))
+            OR (f.item_type = 'album' AND f.item_id = CAST(t.album_id AS TEXT)))) LIMIT 1"
+    )
+}
+
+fn retrait_avec_liens(state: &AppState, source: &Source) -> Result<bool, String> {
+    for ids in source.pending.chunks(500) {
+        let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        if state
+            .backend
+            .query_one(&liens_utilisateur_sql(&ids), &[])?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn remove_missing(state: &AppState, source: &Source, confirme: bool) -> Result<usize, String> {
     let mut removed = 0;
     state.backend.write_tx(&mut |tx| {
         let owned: std::collections::HashSet<i64> = member_ids(tx, &source.key)?.into_iter().collect();
@@ -241,14 +266,22 @@ fn remove_missing(state: &AppState, source: &Source) -> Result<usize, String> {
             if tx.query_one("SELECT track_id FROM upnp_library_members WHERE track_id = ?", &[id])?.is_some() { continue; }
             let row = tx.query_one("SELECT source, source_id FROM tracks WHERE id = ?", &[id])?;
             let ours = row.is_some_and(|r| r[0].as_str() == Some("upnp") && r[1].as_str().is_some_and(|s| s.starts_with(&format!("{}|", source.udn))));
-            if ours { removed += tx.execute("DELETE FROM tracks WHERE id = ? AND source = 'upnp'", &[id])?; }
+            if ours {
+                // Revalider dans la transaction : un favori/une playlist a pu
+                // être ajouté depuis le bilan. Une erreur annule aussi le
+                // retrait des appartenances effectué plus haut.
+                if !confirme && tx.query_one(&liens_utilisateur_sql(&id.to_string()), &[])?.is_some() {
+                    return Err("Une piste à retirer possède des favoris ou des liens de playlist ; relancez la synchronisation pour examiner le retrait".into());
+                }
+                removed += tx.execute("DELETE FROM tracks WHERE id = ? AND source = 'upnp'", &[id])?;
+            }
         }
         // Only empty remote albums of THIS server. Local albums are untouched.
         let albums = tx.query_many("SELECT id, source_id FROM albums WHERE source = 'upnp' AND NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id)", &[])?;
         for row in albums {
             if row[1].as_str().is_some_and(|s| s.starts_with(&format!("{}|", source.udn))) {
                 let id = row[0].as_i64().ok_or("album sans identifiant")?;
-                tx.execute("DELETE FROM albums WHERE id = ? AND source = 'upnp'", &[&id])?;
+                tx.execute("DELETE FROM albums WHERE id = ? AND source = 'upnp' AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.item_type = 'album' AND f.item_id = CAST(albums.id AS TEXT))", &[&id])?;
             }
         }
         Ok(())
@@ -299,10 +332,12 @@ async fn run_one(state: AppState, key: String) {
         source.report = report;
         if complete {
             source.last_success = Some(now);
-            if !source.pending.is_empty() && source.pending.len().saturating_mul(100) > prior_count.saturating_mul(20) {
+            let liens = retrait_avec_liens(&state, &source)?;
+            source.report["retrait_avec_liens_utilisateur"] = json!(liens);
+            if !source.pending.is_empty() && (liens || source.pending.len().saturating_mul(100) > prior_count.saturating_mul(20)) {
                 source.status = "confirmation".into();
             } else {
-                source.report["supprimees"] = json!(remove_missing(&state, &source)?);
+                source.report["supprimees"] = json!(remove_missing(&state, &source, false)?);
                 source.pending.clear();
                 source.status = "ready".into();
             }
@@ -352,4 +387,94 @@ pub fn start(state: AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod identites_upnp_tests {
+    use super::*;
+    use tune_core::db::{
+        album_repo::AlbumRepo,
+        models::{Album, Track},
+        playlist_repo::PlaylistRepo,
+        track_repo::TrackRepo,
+    };
+
+    #[test]
+    fn identites_upnp_les_liens_interdisent_le_retrait_automatique_et_la_transaction_restitue_les_membres()
+     {
+        for nature in ["track", "album", "playlist"] {
+            let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+            let albums = AlbumRepo::with_backend(state.backend.clone());
+            let mut album = Album::new("Album protégé".into());
+            album.source = "upnp".into();
+            album.source_id = Some("u|album".into());
+            let aid = albums.create(&album).unwrap();
+            let tracks = TrackRepo::with_backend(state.backend.clone());
+            let mut track = Track::new("Piste protégée".into());
+            track.source = "upnp".into();
+            track.source_id = Some("u|piste".into());
+            track.album_id = Some(aid);
+            let id = tracks.create(&track).unwrap();
+            let source = Source {
+                key: "s".into(),
+                udn: "u".into(),
+                container: "0".into(),
+                name: "NAS".into(),
+                enabled: true,
+                status: "ready".into(),
+                last_attempt: now_seconds(),
+                last_success: None,
+                report: json!({}),
+                generation: "new".into(),
+                pending: vec![id],
+            };
+            save(state.backend.as_ref(), &source).unwrap();
+            state.backend.execute("INSERT INTO upnp_library_members (source_key,track_id,generation) VALUES ('s',?,'old')", &[&id]).unwrap();
+            assert!(!retrait_avec_liens(&state, &source).unwrap());
+            if nature == "playlist" {
+                let playlists = PlaylistRepo::with_backend(state.backend.clone());
+                let pid = playlists.create("Garder", None, 1).unwrap();
+                playlists.add_tracks(pid, &[id], None).unwrap();
+            } else {
+                let item = if nature == "album" { aid } else { id };
+                state
+                    .backend
+                    .execute(
+                        "INSERT INTO favorites (profile_id,item_type,item_id) VALUES (1,?,?)",
+                        &[&nature, &item.to_string()],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                retrait_avec_liens(&state, &source).unwrap(),
+                "un lien {nature} impose une confirmation"
+            );
+            assert!(
+                remove_missing(&state, &source, false).is_err(),
+                "le retrait automatique doit refuser le lien {nature}"
+            );
+            assert!(tracks.get(id).unwrap().is_some());
+            assert_eq!(
+                state
+                    .backend
+                    .query_one("SELECT COUNT(*) FROM upnp_library_members", &[])
+                    .unwrap()
+                    .unwrap()[0]
+                    .as_i64(),
+                Some(1),
+                "la transaction restitue l'appartenance"
+            );
+            assert_eq!(
+                remove_missing(&state, &source, true).unwrap(),
+                1,
+                "la confirmation explicite reste possible"
+            );
+            if nature == "album" {
+                assert!(
+                    albums.get(aid).unwrap().is_some(),
+                    "le nettoyage ne supprime pas un album favori vide"
+                );
+            }
+        }
+    }
 }

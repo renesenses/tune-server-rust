@@ -30,7 +30,19 @@
 //! `tracks.id` « in walk order » (`db/sqlite.rs`). L'URL de `res` porte le même
 //! `id`, donc le même défaut. Ni l'un ni l'autre n'est une identité.
 //!
-//! ## Ce qui est retenu : un CONDENSAT DU CONTENU ANNONCÉ
+//! ## Clé durable et empreinte de recherche (#4201)
+//!
+//! La clé initiale ci-dessous reste conservée sur la ligne. Après correction
+//! des tags, le rapprochement utilise les métadonnées COURANTES en base,
+//! puis les ObjectID/URL corroborés par durée, format et taille (ou les deux
+//! indices concordants). Une ambiguïté rend la passe partielle, sans retrait.
+//! L'ID numérique, la clé source et les liens utilisateur restent inchangés.
+//! Un renommage d'album complet conserve également son ID.
+//!
+//! Si tous les indices changent simultanément, le DIDL ne permet pas de
+//! prouver la continuité : aucun rapprochement approximatif n'est inventé.
+//!
+//! ## Empreinte initiale : un CONDENSAT DU CONTENU ANNONCÉ
 //!
 //! `source_id = '<udn>|<condensat>'`, le condensat étant calculé sur le
 //! quintuplet que le DIDL publie déjà, **sans une seconde requête** :
@@ -100,6 +112,9 @@
 //! gardés par un témoin : s'ils divergeaient, plus aucune piste indexée ne
 //! jouerait, et rien d'autre ne rougirait.
 
+#[path = "identites_upnp.rs"]
+mod identites;
+
 use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Path, State};
@@ -126,7 +141,7 @@ pub const SOURCE_UPNP: &str = "upnp";
 /// L'URL de lecture annoncée par `res`, rangée dans `track_metadata`.
 pub const CLE_URL_DE_LECTURE: &str = "upnp_res_url";
 /// L'`ObjectID` sous lequel la piste a été VUE. Contextuel — conservé pour le
-/// diagnostic, jamais pour l'identité.
+/// diagnostic et rapprochement corroboré, jamais comme clé primaire.
 pub const CLE_OBJECT_ID: &str = "upnp_object_id";
 /// L'UDN du serveur d'origine — ce que D1bis veut afficher en infobulle.
 pub const CLE_SERVEUR: &str = "upnp_serveur";
@@ -443,6 +458,7 @@ struct Bilan {
     /// qu'un message de troncature sans son chiffre ne dit pas quoi relever.
     plafond_valeur: u64,
     erreurs: Vec<String>,
+    identites: Vec<String>,
 }
 
 /// `POST /api/v1/network/media-servers/{id}/indexer`
@@ -523,26 +539,13 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
     )
     .await;
 
-    let identities: Vec<String> = pistes
-        .iter()
-        .map(|p| {
-            cle_d_identite(
-                &ms.id,
-                &p.titre,
-                p.artiste.as_deref(),
-                p.album.as_deref(),
-                p.duree_ms,
-                p.taille,
-            )
-        })
-        .collect();
     Json(json!({
-        "identites": identities,
+        "identites": bilan.identites,
         "indexe": true,
         "complet": bilan.erreurs.is_empty() && bilan.plafond_atteint.is_none() && bilan.sans_url == 0,
         "serveur": { "id": ms.id, "nom": ms.name, "adresse": format!("{}:{}", ms.host, ms.port) },
         "conteneur": conteneur,
-        "cle_d_identite": "condensat de (titre, artiste, album, durée à la seconde, res@size)",
+        "cle_d_identite": "clé persistante ; rapprochement par métadonnées courantes puis indices contextuels corroborés",
         "parcours": {
             "conteneurs_visites": bilan.conteneurs_visites,
             "items_vus": bilan.items_vus,
@@ -775,6 +778,16 @@ fn ecrire(
     let artistes_repo = ArtistRepo::with_backend(state.backend.clone());
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
 
+    let mut plan = match identites::preparer(state, udn, pistes) {
+        Ok(plan) => plan,
+        Err(e) => {
+            bilan
+                .erreurs
+                .push(format!("lecture des identités UPnP : {e}"));
+            return;
+        }
+    };
+
     // Mémoire d'une seule passe : un album distant n'est résolu qu'une fois,
     // quel que soit le nombre de ses pistes.
     let mut albums_vus: HashMap<String, i64> = HashMap::new();
@@ -790,7 +803,19 @@ fn ecrire(
         })
         .collect();
 
-    for piste in pistes {
+    for (position, piste) in pistes.iter().enumerate() {
+        let ancienne = match plan.pistes[position].clone() {
+            Ok(a) => a,
+            Err(e) => {
+                bilan.erreurs.push(e);
+                continue;
+            }
+        };
+        let empreinte = identites::empreinte(udn, piste);
+        let cle = ancienne
+            .as_ref()
+            .map(|a| a.cle.clone())
+            .unwrap_or_else(|| plan.nouvelle_cle(udn, &empreinte));
         let pochette = piste
             .pochette
             .as_ref()
@@ -811,14 +836,20 @@ fn ecrire(
                 match albums_vus.get(&cle_album) {
                     Some(id) => Some(*id),
                     None => {
-                        let trouve = album_existant(state, &cle_album);
+                        let trouve = plan.albums.get(&cle_album).copied();
                         let id = match trouve {
                             Some(id) => Some(id),
                             None => {
                                 let mut album = Album::new(titre_album.to_string());
                                 album.artist_id = artiste_id;
                                 album.source = SOURCE_UPNP.to_string();
-                                album.source_id = Some(cle_album.clone());
+                                // L'ancien nom peut être une clé durable encore utilisée.
+                                album.source_id =
+                                    Some(if album_existant(state, &cle_album).is_some() {
+                                        format!("{udn}|{}", uuid::Uuid::new_v4())
+                                    } else {
+                                        cle_album.clone()
+                                    });
                                 // Adresse locale du contenu : aucune requête
                                 // vers le serveur UPnP pendant l'affichage.
                                 album.cover_path = pochette_album.clone();
@@ -841,8 +872,13 @@ fn ecrire(
                                 let conservee =
                                     album.cover_path.clone().filter(|p| !p.starts_with("http"));
                                 let suivante = pochette_album.clone().or(conservee);
-                                if album.cover_path != suivante {
+                                if album.cover_path != suivante
+                                    || album.title != titre_album
+                                    || album.artist_id != artiste_id
+                                {
                                     album.cover_path = suivante;
+                                    album.title = titre_album.to_string();
+                                    album.artist_id = artiste_id;
                                     if let Err(e) = albums_repo.update(&album) {
                                         bilan
                                             .erreurs
@@ -858,16 +894,20 @@ fn ecrire(
             }
         };
 
-        let cle = cle_d_identite(
-            udn,
-            &piste.titre,
-            piste.artiste.as_deref(),
-            piste.album.as_deref(),
-            piste.duree_ms,
-            piste.taille,
-        );
-
-        let mut ligne = Track::new(piste.titre.clone());
+        let mut ligne = if let Some(a) = &ancienne {
+            match pistes_repo.get(a.id) {
+                Ok(Some(t)) => t,
+                autre => {
+                    bilan
+                        .erreurs
+                        .push(format!("piste UPnP {} non relue : {autre:?}", a.id));
+                    continue;
+                }
+            }
+        } else {
+            Track::new(piste.titre.clone())
+        };
+        ligne.title = piste.titre.clone();
         ligne.album_id = album_id;
         ligne.artist_id = artiste_id;
         ligne.artist_name = piste.artiste.clone();
@@ -891,7 +931,7 @@ fn ecrire(
         ligne.source_id = Some(cle.clone());
         ligne.cover_path = pochette;
 
-        let existante = piste_existante(state, &cle);
+        let existante = ancienne.as_ref().map(|a| a.id);
         let id = match existante {
             Some(id) => {
                 ligne.id = Some(id);
@@ -931,6 +971,7 @@ fn ecrire(
         };
 
         let Some(id) = id else { continue };
+        bilan.identites.push(cle);
         // L'édition générale de piste ne touche pas cover_path. La mise à jour
         // de l'instantané UPnP doit donc publier explicitement sa nouvelle image.
         if ligne.id.is_some() {
@@ -967,18 +1008,6 @@ fn ecrire(
                 .push(format!("instantané de « {} » : {e}", piste.titre));
         }
     }
-}
-
-fn piste_existante(state: &AppState, cle: &str) -> Option<i64> {
-    state
-        .backend
-        .query_one(
-            "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
-            &[&SOURCE_UPNP as &dyn ToSqlValue, &cle as &dyn ToSqlValue],
-        )
-        .ok()
-        .flatten()
-        .and_then(|r| r.first().and_then(|v| v.as_i64()))
 }
 
 fn album_existant(state: &AppState, cle: &str) -> Option<i64> {
