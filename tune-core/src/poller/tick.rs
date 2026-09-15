@@ -64,6 +64,12 @@ impl PositionPoller {
                         // Clôture de panne (#2566) : muette si le sondage
                         // n'avait jamais échoué.
                         b.journal.succes(zone_id, &device_id);
+                        self.shared_metrics
+                            .lock()
+                            .await
+                            .entry(zone_id)
+                            .or_default()
+                            .echecs_sondage_repos = 0;
                         // Le curseur de volume est inerte tant que dure le DoP :
                         // l'état de zone doit le dire au client (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
@@ -87,6 +93,12 @@ impl PositionPoller {
                         // lui-même, lui, ne change pas d'un tick.
                         let skip_ticks = b.remaining;
                         b.journal.echec(zone_id, &device_id, &e, skip_ticks);
+                        self.shared_metrics
+                            .lock()
+                            .await
+                            .entry(zone_id)
+                            .or_default()
+                            .echecs_sondage_repos = b.journal.echecs();
                         continue;
                     }
                 }
@@ -909,6 +921,10 @@ impl PositionPoller {
                         total_polls: ps.total_polls,
                         total_errors: ps.total_errors,
                         consecutive_errors: ps.consecutive_errors,
+                        echecs_sondage_repos: idle_backoff
+                            .get(&zone_id)
+                            .map(|b| b.journal.echecs())
+                            .unwrap_or(0),
                         last_latency_ms: ps.last_latency_ms,
                         max_latency_ms: ps.max_latency_ms,
                         // Chemin RADIO : un flux sans fin ne depasse aucune
@@ -2539,6 +2555,10 @@ impl PositionPoller {
                     total_polls: ps.total_polls,
                     total_errors: ps.total_errors,
                     consecutive_errors: ps.consecutive_errors,
+                    echecs_sondage_repos: idle_backoff
+                        .get(&zone_id)
+                        .map(|b| b.journal.echecs())
+                        .unwrap_or(0),
                     last_latency_ms: ps.last_latency_ms,
                     max_latency_ms: ps.max_latency_ms,
                     lecture_au_dela_de_la_duree: ps.depassement_duree_signale,
