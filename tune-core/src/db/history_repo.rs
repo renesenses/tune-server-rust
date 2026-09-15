@@ -337,6 +337,45 @@ impl HistoryRepo {
         Ok((rows.iter().map(row_to_listen).collect(), total))
     }
 
+    /// Current names of unambiguous local playlist contexts (#4036).
+    ///
+    /// Resolve the requested history IDs in one query, without changing the
+    /// history pagination. A streaming track's source does not identify the
+    /// playlist's source: numeric service IDs can collide with local IDs.
+    /// Until that provenance is stored, leave those contexts unresolved.
+    /// Names are read from the current playlist, not historical snapshots.
+    pub fn playlist_context_names(
+        &self,
+        history_ids: &[i64],
+    ) -> Result<HashMap<i64, String>, String> {
+        if history_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        // Only typed IDs obtained from history rows enter this SQL fragment.
+        let ids = history_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT h.id, p.name FROM listen_history h \
+             JOIN playlists p ON h.context_id = CAST(p.id AS TEXT) \
+             WHERE h.id IN ({ids}) AND h.context_type = 'playlist' \
+             AND h.source = 'local' \
+             AND (h.profile_id IS NULL OR h.profile_id = p.profile_id)"
+        );
+        Ok(self
+            .db
+            .query_many(&sql, &[])?
+            .into_iter()
+            .filter_map(|cols| {
+                let id = cols.first()?.as_i64()?;
+                let name = cols.get(1)?.as_string()?;
+                (!name.trim().is_empty()).then_some((id, name))
+            })
+            .collect())
+    }
+
     pub fn top_tracks(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
         let sql = self.dialect_sql(sql::top_tracks, sql::top_tracks);
         let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -2093,5 +2132,90 @@ mod tests {
         pose_un_album(&repo);
         assert!(repo.plays_for_tracks(&[]).expect("lecture").is_empty());
         assert!(repo.plays_for_tracks(&[9999]).expect("lecture").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod context_names_4036 {
+    use super::*;
+
+    fn verify(db: Arc<dyn DbBackend>) {
+        db.execute("CREATE TEMP TABLE listen_history (id BIGINT PRIMARY KEY, context_type TEXT, context_id TEXT, source TEXT, profile_id BIGINT)", &[]).unwrap();
+        db.execute(
+            "CREATE TEMP TABLE playlists (id BIGINT PRIMARY KEY, name TEXT, profile_id BIGINT)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO playlists VALUES (42,'Soirée',1),(43,'   ',1)",
+            &[],
+        )
+        .unwrap();
+        let cases = [
+            (1_i64, "playlist", "42", "local", Some(1_i64)),
+            (2, "playlist", "42", "qobuz", Some(1)),
+            (3, "album", "42", "local", Some(1)),
+            (4, "playlist", "0042", "local", Some(1)),
+            (5, "playlist", "42 OR 1=1", "local", Some(1)),
+            (6, "playlist", "99", "local", Some(1)),
+            (7, "playlist", "42", "local", Some(2)),
+            (8, "playlist", "42", "local", None),
+            (9, "playlist", "43", "local", Some(1)),
+            (10, "playlist", "42", "spotify", Some(1)),
+        ];
+        for (id, kind, context, source, profile) in cases {
+            db.execute(
+                "INSERT INTO listen_history VALUES (?,?,?,?,?)",
+                &[&id, &kind, &context, &source, &profile],
+            )
+            .unwrap();
+        }
+        let repo = HistoryRepo::with_backend(db.clone());
+        assert!(repo.playlist_context_names(&[]).unwrap().is_empty());
+        let all = repo
+            .playlist_context_names(&(1..=10).collect::<Vec<i64>>())
+            .unwrap();
+        assert_eq!(
+            all,
+            HashMap::from([(1, "Soirée".into()), (8, "Soirée".into())])
+        );
+        assert_eq!(repo.playlist_context_names(&[1, 1]).unwrap().len(), 1);
+        assert!(
+            repo.playlist_context_names(&[2, 3, 4, 5, 6, 7, 9, 10])
+                .unwrap()
+                .is_empty()
+        );
+        db.execute("UPDATE playlists SET name='Renommée' WHERE id=42", &[])
+            .unwrap();
+        assert_eq!(
+            repo.playlist_context_names(&[1]).unwrap().get(&1).unwrap(),
+            "Renommée"
+        );
+        db.execute("DELETE FROM playlists WHERE id=42", &[])
+            .unwrap();
+        assert!(repo.playlist_context_names(&[1, 8]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn i4036_context_names_sqlite() {
+        verify(Arc::new(SqliteDb::open_in_memory().unwrap()));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn i4036_context_names_postgres() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        verify(Arc::new(super::super::backend::PostgresBackend::new(
+            pool.clone(),
+        )));
+        pool.close().await;
     }
 }
