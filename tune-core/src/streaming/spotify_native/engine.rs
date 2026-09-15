@@ -382,7 +382,9 @@ impl StreamingService for SpotifyNativeService {
         super::library::user_playlists(&self.session().await?).await
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
-        Err(unsupported("liked tracks"))
+        let session = self.session().await?;
+        let uris = super::liked::uris(&session).await?;
+        super::metadata::tracks(&session, uris).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Err(unsupported("saved albums"))

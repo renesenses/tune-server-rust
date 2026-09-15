@@ -394,6 +394,84 @@ contre-épreuve : retour au marqueur `—` supprimant la carte, échec nommé
 `Une playlist sans nom mais accessible ne doit pas disparaître`, puis
 restauration par copie. Ce n'est pas un refus d'accès ajouté artificiellement.
 
+## Titres aimés et grandes playlists (2026-09-15)
+
+La lecture `get_user_tracks` traverse maintenant le proxy, l'opération privée
+`UserTracks` et le moteur natif. Elle résout le contexte de collection du compte
+appairé, sans Web API, cookie de navigateur ni nouvel appairage. Les pages en
+chargement, continuations inconnues, boucles, doublons et erreurs restent des
+échecs explicites. Seul le résolveur de collection Spotify est accepté pour les
+continuations. L'absence de pages n'est pas assimilée à une collection vide.
+
+Les pistes de playlists sont lues par pages de 100. Longueur, position et
+révision sont vérifiées à chaque page ; une modification concurrente impose une
+relance. L'ordre et les doublons intentionnels sont conservés. Fichiers locaux
+et podcasts restent refusés par cette source musicale.
+
+Les métadonnées des pistes (albums, playlists, recherche et titres aimés) sont
+demandées par groupes de 50, au plus quatre groupes simultanés. La réponse est
+réordonnée selon les identifiants demandés, sans perdre les doublons de file.
+Une piste absente/refusée, une identité contradictoire, un doublon de réponse ou
+un échec du fournisseur fait échouer la collection, sans raccourcissement caché.
+Les corps protobuf sont bornés à 8 Mio ; la limite IPC de 8 Mio et son délai de
+45 secondes restent inchangés.
+
+Limite actuelle : **2 000 pistes par collection**, au-delà refus explicite.
+Ce n'est pas une bibliothèque illimitée. Les discographies restent limitées à
+300 albums et la rootlist à 300 entrées, dossiers compris. Le contexte des
+titres aimés n'expose pas de révision de snapshot comparable à celle des
+playlists : la cohérence transactionnelle d'une collection modifiée pendant
+sa lecture n'est pas garantie. Albums enregistrés, artistes suivis et écritures
+Spotify restent non implémentés.
+
+Le client web V2 conserve les titres lisibles quand une autre catégorie de
+favoris échoue ; chaque refus reste visible avec une relance. Les réponses
+périmées après changement de service sont ignorées. Le cœur Tune conserve son
+sens existant : il ne devient pas une écriture de favori sur Spotify.
+
+Contre-épreuve du lot, tests inchangés, compilation réussie : arrêt après la
+première page et retrait de la garde de révision, troncature des titres aimés et
+des métadonnées à 300, puis retrait du refus de métadonnées par piste. La suite
+`cargo test --locked -p tune-core --lib --no-default-features --features
+oaat,spotify-native spotify_native` donne cinq échecs attendus (31 autres verts) :
+
+- `native_playlist_reads_every_page_above_300_and_preserves_duplicates` :
+  `Every Spotify page must be requested at its exact track offset` ;
+- `native_playlist_refuses_changed_incomplete_or_unsupported_pages` :
+  `Spotify playlist must reject revision, not return a truncated or mixed queue` ;
+- `native_liked_tracks_reads_the_complete_context_beyond_300` :
+  `Liked tracks must not be silently truncated` (300 au lieu de 1 512) ;
+- `native_metadata_batches_large_collections_without_reordering_or_dropping_duplicates` :
+  `Batched metadata must return every collection position` ;
+- `native_metadata_refuses_missing_denied_duplicate_or_mismatched_tracks` :
+  `Spotify metadata must refuse denied, never serve a shortened or incorrect collection`.
+
+Les fichiers sont restaurés par copie, jamais par retrait des tests. La sonde
+macOS de lecture seule a obtenu 1 512 titres aimés et 520 pistes de playlist,
+avec toutes leurs métadonnées. Les 30 playlists accessibles et l'entrée refusée
+restent distinctes. Aucun son ni écriture Spotify pendant ces vérifications.
+
+La validation HTTP réelle a aussi révélé un écart préexistant : la route
+Favoris ne passait pas par le mapping des refus typés et rendait 400 pour les
+albums/artistes non implémentés. Elle conserve maintenant le verdict 501 de
+`TuneError::Unsupported`, sans modifier le 400 d'un type de favori invalide.
+Retirer ce seul branchement fait rougir, après compilation réussie,
+`les_favoris_non_implementes_sortent_en_501_sans_devenir_un_compte_vide` :
+`Les favoris non implementes doivent sortir en 501, pas en 400 ou en collection vide`.
+Le correctif a ensuite été restauré par copie.
+
+Validation finale du 2026-09-15 : 36 tests natifs, 32 tests HTTP et build macOS
+ARM verts. Sur le dernier binaire réellement installé, les routes HTTP rendent
+1 512 titres aimés (1,69 s) et les 520 pistes de la grande playlist (0,75 s),
+avec leurs métadonnées ; albums/artistes non implémentés rendent bien 501.
+Ces durées sont un essai ponctuel, pas un benchmark à froid. Le contrat ancien
+de liste complète refuse toujours la rootlist partielle, tandis que le rapport
+conserve 30 playlists accessibles et une indisponible 403.
+
+Chrome headless dans un profil de test isolé affiche 1 512 cartes et les deux
+catégories non implémentées, sans erreur JavaScript. Capture inspectée ; aucun
+clic de lecture. L'appairage reste valide et les quatre zones sont arrêtées.
+
 ## Essai utilisateur requis
 
 1. Démarrer le binaire dans une instance de test avec un nouveau `TUNE_DB_PATH`,

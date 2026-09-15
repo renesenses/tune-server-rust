@@ -2,9 +2,12 @@
 //! The server owns credentials, the queue and bounded PCM HTTP sessions.
 mod audio;
 mod catalog;
+mod collections;
 mod engine;
 mod ipc;
 mod library;
+mod liked;
+mod metadata;
 mod worker;
 
 use crate::TuneError;
@@ -279,7 +282,7 @@ impl StreamingService for SpotifyNativeService {
         self.call(Operation::PlaylistLibrary).await
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
-        Err(unsupported("liked tracks"))
+        self.call(Operation::UserTracks).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Err(unsupported("saved albums"))

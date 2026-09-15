@@ -1217,6 +1217,9 @@ async fn service_favorites(
             memoriser_contenu_utilisateur(&service, &ressource, data.clone());
             Json(poser_le_tri(data, &tri)).into_response()
         }
+        Err(e) if matches!(e, tune_core::TuneError::Unsupported(_)) => {
+            svc_response::<Value>(Err(e))
+        }
         Err(ref e)
             if {
                 let msg = e.to_string();
@@ -2519,6 +2522,45 @@ mod temoin_statut_du_refus_i859 {
             .await
             .expect("corps lisible");
         String::from_utf8_lossy(&octets).into_owned()
+    }
+
+    #[tokio::test]
+    async fn les_favoris_non_implementes_sortent_en_501_sans_devenir_un_compte_vide() {
+        let (etat, nom) = etat("refus-favoris-4166", Humeur::Refuse);
+        let response = service_favorites(
+            State(etat),
+            Path((nom, "playlists".into())),
+            Query(TriQuery {
+                sort: None,
+                order: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "Les favoris non implementes doivent sortir en 501, pas en 400 ou en collection vide"
+        );
+        assert_eq!(texte(response).await, REFUS);
+    }
+
+    #[tokio::test]
+    async fn un_type_de_favori_invalide_ne_devient_pas_un_refus_501() {
+        let (etat, nom) = etat("type-favori-invalide-4166", Humeur::Refuse);
+        let response = service_favorites(
+            State(etat),
+            Path((nom, "invalid".into())),
+            Query(TriQuery {
+                sort: None,
+                order: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "Une requete de favoris mal formee reste un 400, pas un refus du connecteur"
+        );
     }
 
     /// Le défaut mesuré : `GET /streaming/{service}/playlists` sur un

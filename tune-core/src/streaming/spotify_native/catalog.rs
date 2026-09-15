@@ -43,7 +43,7 @@ fn cover(images: &Images) -> Option<String> {
         .map(|i| format!("https://i.scdn.co/image/{}", i.id))
 }
 
-fn map_track(t: Track) -> StreamTrack {
+pub(super) fn map_track(t: Track) -> StreamTrack {
     let artist = t.artists.first();
     StreamTrack {
         id: id(&t.id),
@@ -94,18 +94,7 @@ pub(super) async fn album(session: &Session, album_id: &str) -> Result<StreamAlb
 }
 
 async fn tracks(session: &Session, uris: Vec<SpotifyUri>) -> Result<Vec<StreamTrack>, TuneError> {
-    if uris.len() > MAX_COLLECTION {
-        return Err(unsupported("collections above 300 tracks"));
-    }
-    // Four concurrent metadata requests, preserving order. One unavailable item
-    // is an explicit error, never a silently shortened album/queue.
-    stream::iter(
-        uris.into_iter()
-            .map(|uri| async move { Ok(map_track(bounded(Track::get(session, &uri)).await?)) }),
-    )
-    .buffered(4)
-    .try_collect()
-    .await
+    super::metadata::tracks(session, uris).await
 }
 
 pub(super) async fn album_tracks(
@@ -167,11 +156,7 @@ pub(super) async fn playlist_tracks(
     session: &Session,
     playlist_id: &str,
 ) -> Result<Vec<StreamTrack>, TuneError> {
-    let p = bounded(Playlist::get(session, &uri(playlist_id, "playlist")?)).await?;
-    let uris: Vec<_> = p.tracks().cloned().collect();
-    if uris.len() != p.length.max(0) as usize {
-        return Err(unsupported("partial playlists; pagination required"));
-    }
+    let uris = super::collections::playlist_uris(session, playlist_id).await?;
     tracks(session, uris).await
 }
 

@@ -47,7 +47,9 @@ librespot-core = { version = "=0.8.0", default-features = false, features = ["ru
 librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 librespot-playback = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 librespot-discovery = { version = "=0.8.0", default-features = false, features = ["with-libmdns", "rustls-tls-webpki-roots"], optional = true }
+librespot-protocol = { version = "=0.8.0", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
+protobuf-json-mapping = { version = "=3.7.2", optional = true }
 
 # --- Sendspin (#3326) : cryptographie et encodage, sur TOUTES les plateformes.
 #
@@ -276,7 +278,7 @@ harness = false
 
 [features]
 default = ["local-audio"]
-spotify-native = ["dep:librespot-core", "dep:librespot-metadata", "dep:librespot-playback", "dep:librespot-discovery", "dep:protobuf", "dep:vergen"]
+spotify-native = ["dep:librespot-core", "dep:librespot-metadata", "dep:librespot-playback", "dep:librespot-discovery", "dep:librespot-protocol", "dep:protobuf", "dep:protobuf-json-mapping", "dep:vergen"]
 local-audio = ["cpal", "coreaudio-rs", "objc2-core-audio", "objc2-core-audio-types"]
 # Lets plugins mount HTTP routes through `PluginContext::register_router`.
 # Gated so tune-cli — which links tune-core but serves no HTTP — does not
