@@ -1863,10 +1863,9 @@ impl ZoneRepo {
 
     /// Ecrit le mode de continuation d'une zone (#2271).
     ///
-    /// **Aucune migration n'est consommee** : la valeur va dans la colonne
-    /// `zones.autoplay_enabled` qui existe deja. Voir
-    /// [`AutoplayMode::as_stocke`] pour l'encodage, choisi pour rester
-    /// relisible par une version anterieure de Tune.
+    /// La colonne existante accepte les noms en SQLite ; PostgreSQL 064
+    /// convertit sa declaration native INTEGER en TEXT. Voir
+    /// [`AutoplayMode::as_stocke`] pour l'encodage historique 0/1 et les noms.
     pub fn update_autoplay_mode(&self, id: i64, mode: AutoplayMode) -> Result<(), String> {
         let sql = self.update_field_sql("autoplay_enabled");
         let val = mode.as_stocke().to_string();
@@ -3874,13 +3873,11 @@ mod fusion_doublons_tests {
     }
 }
 
-/// #2271 — le mode de continuation remplace le booleen, SANS migration.
+/// #2271 — le mode de continuation remplace le booleen.
 ///
-/// La colonne `zones.autoplay_enabled` existe deja : `INTEGER DEFAULT 0` en
-/// SQLite, `TEXT DEFAULT '0'` en PostgreSQL. L'affinite SQLite range une
-/// chaine non numerique telle quelle (`typeof('similar') = 'text'`) tout en
-/// convertissant `'1'`/`'0'` en entiers — la meme colonne porte donc l'ancien
-/// booleen ET le nouveau mode. Aucun numero de migration n'est consomme.
+/// L'affinite INTEGER de SQLite preserve les noms non numeriques et range
+/// encore '0'/'1' en entiers. PostgreSQL 064 convertit la colonne native
+/// INTEGER en TEXT et conserve les valeurs du chemin importe deja TEXT.
 #[cfg(test)]
 mod autoplay_mode_tests {
     use super::*;

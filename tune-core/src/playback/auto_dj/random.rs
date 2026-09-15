@@ -205,42 +205,69 @@ mod tests {
             eprintln!("SAUT : TUNE_TEST_PG_URL non posee — PostgreSQL non exerce");
             return;
         };
-        // Tables TEMP sur une connexion unique : aucun schema ni donnees des
-        // autres tests ne sont touches, meme avec une URL de CI partagee.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await
-            .unwrap();
-        let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool));
-        db.execute_batch("CREATE TEMP TABLE zones (id BIGINT PRIMARY KEY, autoplay_enabled TEXT DEFAULT '0');
+        for initial_type in ["INTEGER", "TEXT"] {
+            // Tables TEMP sur une connexion unique : aucun schema ni donnees des
+            // autres tests ne sont touches, meme avec une URL de CI partagee.
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .unwrap();
+            let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool));
+            db.execute_batch(&format!("CREATE TEMP TABLE zones (id BIGINT PRIMARY KEY, autoplay_enabled {initial_type} DEFAULT '0');
+            CREATE TEMP TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT);
             CREATE TEMP TABLE artists (id BIGINT PRIMARY KEY, name TEXT);
             CREATE TEMP TABLE albums (id BIGINT PRIMARY KEY, title TEXT, artist_id BIGINT, year INTEGER);
             CREATE TEMP TABLE tracks (id BIGINT PRIMARY KEY, title TEXT, album_id BIGINT, artist_id BIGINT,
                 file_path TEXT, cue_media_path TEXT, disc_number INTEGER, track_number INTEGER,
                 duration_ms BIGINT DEFAULT 0, genre TEXT, year INTEGER, bpm DOUBLE PRECISION, source TEXT DEFAULT 'local');
-            INSERT INTO zones (id) VALUES (1);").unwrap();
-        let repo = crate::db::zone_repo::ZoneRepo::with_backend(db.clone());
-        for name in AutoplayMode::NOMS {
-            let mode = AutoplayMode::from_str_stocke(name).unwrap();
-            repo.update_autoplay_mode(1, mode).unwrap();
-            assert_eq!(repo.get_autoplay_mode(1), mode);
-            assert_eq!(repo.get_autoplay_enabled(1), mode != AutoplayMode::Off);
-        }
-        for (enabled, mode) in [(true, AutoplayMode::Similar), (false, AutoplayMode::Off)] {
-            repo.update_autoplay_enabled(1, enabled).unwrap();
-            assert_eq!(repo.get_autoplay_mode(1), mode);
-        }
-        db.execute(
-            "UPDATE zones SET autoplay_enabled = ? WHERE id = 1",
-            &[&"future_mode"],
-        )
-        .unwrap();
-        assert_eq!(repo.get_autoplay_mode(1), AutoplayMode::Similar);
-        db.execute("UPDATE zones SET autoplay_enabled = NULL WHERE id = 1", &[])
+            INSERT INTO zones (id, autoplay_enabled) VALUES (1, 0), (2, 1), (3, NULL);")).unwrap();
+            if initial_type == "TEXT" {
+                db.execute_batch(
+                    "INSERT INTO zones VALUES (4, 'random_artist'), (5, 'future_mode');",
+                )
+                .unwrap();
+            }
+            let migration =
+                include_str!("../../../migrations/postgres/064_zone_autoplay_mode_text.sql");
+            for _ in 0..2 {
+                db.execute_batch(migration).unwrap();
+                let rows = db
+                    .query_many("SELECT id, autoplay_enabled FROM zones ORDER BY id", &[])
+                    .unwrap();
+                assert_eq!(rows[0][1].as_str(), Some("0"));
+                assert_eq!(rows[1][1].as_str(), Some("1"));
+                assert!(rows[2][1].is_null());
+                if initial_type == "TEXT" {
+                    assert_eq!(rows[3][1].as_str(), Some("random_artist"));
+                    assert_eq!(rows[4][1].as_str(), Some("future_mode"));
+                }
+            }
+            db.execute_batch("INSERT INTO zones (id) VALUES (6);")
+                .unwrap();
+            let repo = crate::db::zone_repo::ZoneRepo::with_backend(db.clone());
+            for name in AutoplayMode::NOMS {
+                let mode = AutoplayMode::from_str_stocke(name).unwrap();
+                repo.update_autoplay_mode(1, mode).unwrap();
+                assert_eq!(repo.get_autoplay_mode(1), mode);
+                assert_eq!(repo.get_autoplay_enabled(1), mode != AutoplayMode::Off);
+            }
+            for (enabled, mode) in [(true, AutoplayMode::Similar), (false, AutoplayMode::Off)] {
+                repo.update_autoplay_enabled(1, enabled).unwrap();
+                assert_eq!(repo.get_autoplay_mode(1), mode);
+            }
+            db.execute(
+                "UPDATE zones SET autoplay_enabled = ? WHERE id = 1",
+                &[&"future_mode"],
+            )
             .unwrap();
-        assert_eq!(repo.get_autoplay_mode(1), AutoplayMode::Off);
-        library(&db);
-        check_groups(&db);
+            assert_eq!(repo.get_autoplay_mode(1), AutoplayMode::Similar);
+            db.execute("UPDATE zones SET autoplay_enabled = NULL WHERE id = 1", &[])
+                .unwrap();
+            assert_eq!(repo.get_autoplay_mode(1), AutoplayMode::Off);
+            assert_eq!(repo.get_autoplay_mode(6), AutoplayMode::Off);
+            library(&db);
+            check_groups(&db);
+        }
     }
 }

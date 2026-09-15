@@ -701,7 +701,12 @@ fn import_zones(
         // backup that predates the autoplay field must NOT silently
         // re-enable endless auto-DJ, which appends random tracks
         // when a launched playlist ends (#1132).
-        let autoplay_enabled = z["autoplay_enabled"].as_i64().unwrap_or(0);
+        // #2271: preserve named modes and legacy 0/1 on both databases.
+        // PostgreSQL 064 makes the column TEXT, so bind text here too.
+        let autoplay_enabled = z["autoplay_enabled"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| z["autoplay_enabled"].as_i64().unwrap_or(0).to_string());
 
         // Le `volume` d'une sauvegarde prise zone ARMEE est l'artefact de
         // l'armement, pas une preference : le contrat « volume fixe » impose
@@ -1411,6 +1416,76 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         Arc::new(db)
+    }
+
+    fn autoplay_backup_roundtrip(backend: Arc<dyn DbBackend>) {
+        use crate::db::zone_repo::{AutoplayMode, ZoneRepo};
+        let repo = ZoneRepo::with_backend(backend.clone());
+        let name = "I2271 backup roundtrip";
+        backend
+            .execute("DELETE FROM zones WHERE name = ?", &[&name])
+            .unwrap();
+        for mode in AutoplayMode::NOMS {
+            let mode = AutoplayMode::from_str_stocke(mode).unwrap();
+            let id = repo.create(name, Some("dlna"), None).unwrap();
+            repo.update_autoplay_mode(id, mode).unwrap();
+            let saved = export_zones(&backend)
+                .unwrap()
+                .into_iter()
+                .find(|z| z["name"] == name)
+                .unwrap();
+            // UPDATE an existing zone after changing its mode.
+            repo.update_autoplay_mode(id, AutoplayMode::Off).unwrap();
+            import_zones(&backend, std::slice::from_ref(&saved), &mut Vec::new()).unwrap();
+            assert_eq!(repo.get_autoplay_mode(id), mode, "backup UPDATE {mode:?}");
+            // INSERT the exported zone into a database without it.
+            backend
+                .execute("DELETE FROM zones WHERE id = ?", &[&id])
+                .unwrap();
+            import_zones(&backend, std::slice::from_ref(&saved), &mut Vec::new()).unwrap();
+            let id = backend
+                .query_one("SELECT id FROM zones WHERE name = ?", &[&name])
+                .unwrap()
+                .unwrap()[0]
+                .as_i64()
+                .unwrap();
+            assert_eq!(repo.get_autoplay_mode(id), mode, "backup INSERT {mode:?}");
+            // Legacy numeric backups, then a backup with the field absent.
+            for (value, expected) in [
+                (serde_json::json!(1), AutoplayMode::Similar),
+                (serde_json::json!(0), AutoplayMode::Off),
+                (Value::Null, AutoplayMode::Off),
+            ] {
+                let mut legacy = saved.clone();
+                if value.is_null() {
+                    legacy.as_object_mut().unwrap().remove("autoplay_enabled");
+                } else {
+                    legacy["autoplay_enabled"] = value;
+                }
+                import_zones(&backend, &[legacy], &mut Vec::new()).unwrap();
+                assert_eq!(repo.get_autoplay_mode(id), expected);
+            }
+            backend
+                .execute("DELETE FROM zones WHERE id = ?", &[&id])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn autoplay_2271_backup_roundtrip_sqlite() {
+        autoplay_backup_roundtrip(backend_sqlite());
+    }
+
+    // Executed by the existing pg_config_backup CI step, after real migrations.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_config_backup_autoplay_2271_roundtrip() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT : TUNE_TEST_PG_URL non posee — PostgreSQL non exerce");
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        autoplay_backup_roundtrip(Arc::new(crate::db::backend::PostgresBackend::new(pool)));
     }
 
     #[test]
