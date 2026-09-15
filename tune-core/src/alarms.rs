@@ -427,7 +427,7 @@ impl AlarmScheduler {
     fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let rows = self.db.query_many(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE enabled = '1'",
+            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE enabled = '1'",
             &[],
         )?;
         Ok(rows
@@ -459,7 +459,7 @@ impl AlarmScheduler {
     pub fn get_alarm(&self, id: i64) -> Result<Option<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let row = self.db.query_one(
-            "SELECT id, name, time, days, zone_id, source_type, source_id, volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE id = ?",
+            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id FROM alarms WHERE id = ?",
             &[&id as &dyn ToSqlValue],
         )?;
         Ok(row.map(|r| {
