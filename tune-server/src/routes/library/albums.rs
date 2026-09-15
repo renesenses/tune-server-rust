@@ -346,20 +346,17 @@ pub(super) async fn get_album(
             // `track_average` quand Tune l'a déduite de la moyenne arrondie des
             // `dr_track` des pistes.
             //
-            // ⚠️ `track_average` ne dit RIEN de la provenance de ces pistes :
-            // depuis la v0.9.145 un `dr_track` peut venir du tag du fichier ou
-            // du calcul de la passe d'analyse. Cette seconde question se lit
-            // piste par piste, sur les listes de pistes, sous la clé de même
-            // nom `dynamic_range_source` (#3924). Les deux clés apparaissent et
-            // disparaissent ENSEMBLE : un client qui ne connaît que la première
-            // ne voit aucun changement, celui qui lit la seconde peut annoncer
-            // une mesure ou une déduction plutôt que de les confondre.
+            // `dynamic_range_provenance` détaille l'origine des valeurs
+            // retenues (#3924), dans la même requête que leur agrégat : tags,
+            // analyse, mélange des deux, ou origine inconnue. Les anciennes
+            // clés gardent leur sens ; les trois sont absentes sans DR valide.
             if let (Some(obj), Ok(Some(dr))) = (j.as_object_mut(), repo.dynamic_range_detail(id)) {
                 obj.insert("dynamic_range".into(), Value::String(dr.valeur.to_string()));
                 obj.insert(
                     "dynamic_range_source".into(),
                     Value::String(dr.source().into()),
                 );
+                obj.insert("dynamic_range_provenance".into(), json!(dr.provenance));
             }
             Json(j).into_response()
         }
