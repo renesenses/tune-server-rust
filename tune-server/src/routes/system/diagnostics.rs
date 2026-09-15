@@ -1065,6 +1065,8 @@ pub(super) async fn diagnostics_network(State(state): State<AppState>) -> Json<V
         // Squeezebox ne pourraient jamais se connecter (#2938). `null` tant
         // qu'aucune tentative d'ecoute n'a eu lieu.
         "slimproto": tune_core::slimproto::etat_ecoute(),
+        "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),
+        "slimproto_udp": tune_core::slimproto::discovery::etat_ecoute(),
         // L'etat de l'ecouteur SSDP (port 1900) et le nombre de reponses
         // M-SEARCH emises. Sans ce champ, « Tune repond-il aux M-SEARCH ? » ne
         // se mesurait qu'au tcpdump, chez le testeur — c'est exactement ce
@@ -2073,6 +2075,30 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         }
     }
 
+    for (nom, etat) in [
+        (
+            "Pont CLI LMS",
+            tune_core::slimproto::cli_server::etat_ecoute(),
+        ),
+        (
+            "Découverte SlimProto UDP",
+            tune_core::slimproto::discovery::etat_ecoute(),
+        ),
+    ] {
+        match etat {
+            Some(etat) if etat.ecoute => md.push_str(&format!(
+                "- {nom} : en écoute sur {} {}\n",
+                etat.protocole, etat.port
+            )),
+            Some(etat) => md.push_str(&format!(
+                "- **⚠ {nom} HORS SERVICE** : {}\n  - erreur système : {}\n",
+                etat.message.as_deref().unwrap_or("cause inconnue"),
+                etat.erreur_systeme.as_deref().unwrap_or("inconnue"),
+            )),
+            None => md.push_str(&format!("- {nom} : aucune écoute active ni échec retenu\n")),
+        }
+    }
+
     // #3687 : un testeur a passe une soiree au tcpdump et au M-SEARCH Python
     // pour savoir si Tune repond aux recherches SSDP. La reponse tient en une
     // ligne, et elle est desormais ici — avec, en cas de panne, la cause.
@@ -2278,6 +2304,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
             "discovered_devices": devices.len(),
             "registered_outputs": output_count,
             "slimproto": tune_core::slimproto::etat_ecoute(),
+            "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),
+            "slimproto_udp": tune_core::slimproto::discovery::etat_ecoute(),
             // Le pendant de la ligne markdown ci-dessus (#3687).
             "ssdp": tune_core::discovery::ssdp::etat_ecoute_ssdp(),
         },
