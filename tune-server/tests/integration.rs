@@ -3073,3 +3073,60 @@ async fn album_tracks_ignore_un_grouping_vide() {
         items[0]
     );
 }
+
+#[tokio::test]
+async fn autoplay_2271_modes_roundtrip_through_patch_detail_and_list() {
+    let app = make_app();
+    let zid = make_zone(&app, "Autoplay modes").await;
+    let path = format!("/api/v1/zones/{zid}");
+    for mode in [
+        "random_album",
+        "random_artist",
+        "random_year",
+        "random_tracks",
+        "similar",
+        "off",
+    ] {
+        let (status, body) = patch_json(
+            &app,
+            &path,
+            json!({"autoplay_mode": mode, "autoplay_enabled": mode == "off"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, zone) = get(&app, &path).await;
+        assert_eq!(zone["autoplay_mode"], mode);
+        assert_eq!(
+            zone["autoplay_enabled"],
+            mode != "off",
+            "mode explicite prioritaire"
+        );
+        let (_, zones) = get(&app, "/api/v1/zones").await;
+        let zone = zones
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["id"] == zid)
+            .unwrap();
+        assert_eq!(zone["autoplay_mode"], mode);
+        assert_eq!(zone["autoplay_enabled"], mode != "off");
+    }
+    let (status, _) = patch_json(
+        &app,
+        &path,
+        json!({"autoplay_mode":"future_mode", "autoplay_enabled":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, zone) = get(&app, &path).await;
+    assert_eq!(
+        zone["autoplay_mode"], "off",
+        "requete invalide sans ecriture partielle"
+    );
+    for (enabled, mode) in [(true, "similar"), (false, "off")] {
+        let (status, _) = patch_json(&app, &path, json!({"autoplay_enabled":enabled})).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, zone) = get(&app, &path).await;
+        assert_eq!(zone["autoplay_mode"], mode);
+    }
+}
