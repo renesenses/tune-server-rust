@@ -864,3 +864,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod temps_upnp_3971_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn un_seek_invalide_ne_modifie_pas_la_position() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zone_id = ZoneRepo::with_backend(state.backend.clone())
+            .create("UPnP temps", None, None)
+            .unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(&format!("zone_{zone_id}_upnp_renderer"), "true")
+            .unwrap();
+        state.playback.set_resolving(zone_id, false).await;
+        state.playback.seek(zone_id, 42_000).await;
+        assert_eq!(state.playback.get_state(zone_id).await.position_ms, 42_000);
+        for target in [
+            "18446744073709551615:00:00",
+            "0:00:01.",
+            "0:00:01.x",
+            "2562047788015:12:55.808",
+        ] {
+            let body = format!(
+                r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Seek xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{target}</Target></u:Seek></s:Body></s:Envelope>"#
+            );
+            let response = avtransport_control(State(state.clone()), Path(zone_id), body).await;
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("<errorCode>401</errorCode>"),
+                "un temps UPnP invalide doit rendre un défaut SOAP (#3971)"
+            );
+            assert_eq!(
+                state.playback.get_state(zone_id).await.position_ms,
+                42_000,
+                "un Seek UPnP refusé a modifié la position (#3971)"
+            );
+        }
+    }
+}
