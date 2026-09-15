@@ -108,11 +108,8 @@ struct PatchZone {
     /// `autoplay_mode: "similar"`, `false` vaut `"off"`. Si les deux champs
     /// arrivent ensemble, `autoplay_mode` l'emporte : il est le plus precis.
     autoplay_enabled: Option<bool>,
-    /// Ce qui s'enchaine quand la file se vide : `"off"` ou `"similar"` (#2271).
-    ///
-    /// Remplace `autoplay_enabled`, qui ne pouvait pas porter un choix de
-    /// source. Le catalogue est volontairement limite aux deux comportements
-    /// qui existent reellement aujourd'hui — voir `AutoplayMode`.
+    /// Continuation : off, similar, random_album, random_artist, random_year
+    /// ou random_tracks (#2271). Voir `AutoplayMode` pour le comportement.
     autoplay_mode: Option<String>,
     /// DSD output mode: "auto" (probe renderer), "native" (always passthrough), "pcm" (always transcode).
     dsd_mode: Option<String>,

@@ -517,16 +517,9 @@ pub struct Zone {
 /// « non » alors que la demande d'origine portait sur le CHOIX de la source de
 /// continuation.
 ///
-/// **Deux valeurs seulement, et c'est volontaire.** Le socle pose le
-/// mecanisme ; il n'invente aucun mode. Les sources evoquees dans l'issue
-/// (album aleatoire, artiste aleatoire, annee aleatoire, morceaux aleatoires,
-/// radio, favoris, playlist) n'ont a ce jour **aucun comportement attendu
-/// defini** — ni combien de titres, ni dans quel perimetre, ni s'il faut
-/// reapprovisionner quand la file se revide. Les ajouter ici reviendrait a
-/// trancher un arbitrage produit a la place de qui de droit. Chaque mode
-/// nouveau se resume desormais a : definir son comportement, ajouter une
-/// variante, ajouter un bras de `match` dans le bloc « queue ended » du
-/// poller.
+/// Les quatre modes aleatoires locaux sont sans graine (#2271, arbitrage
+/// du 01/09/2026). Le choix est renouvele chaque fois que la file se termine.
+/// Radio, favoris et playlist avec cible restent reserves a une evolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AutoplayMode {
     /// La lecture s'arrete en fin de file. Defaut historique et actuel.
@@ -538,6 +531,14 @@ pub enum AutoplayMode {
     /// de streaming si l'ecoute en cours en vient, generateur genre/BPM
     /// local, puis repli streaming).
     Similar,
+    /// Un album local complet, dans l'ordre des disques et des pistes.
+    RandomAlbum,
+    /// Dix pistes au plus d'un artiste local tire au sort.
+    RandomArtist,
+    /// Dix pistes au plus d'une annee de la bibliotheque tiree au sort.
+    RandomYear,
+    /// Dix pistes locales au plus, sans graine ni doublon dans le tirage.
+    RandomTracks,
 }
 
 impl AutoplayMode {
@@ -546,23 +547,24 @@ impl AutoplayMode {
         match self {
             AutoplayMode::Off => "off",
             AutoplayMode::Similar => "similar",
+            AutoplayMode::RandomAlbum => "random_album",
+            AutoplayMode::RandomArtist => "random_artist",
+            AutoplayMode::RandomYear => "random_year",
+            AutoplayMode::RandomTracks => "random_tracks",
         }
     }
 
     /// L'encodage RANGE EN BASE, qui n'est pas le nom d'API.
     ///
-    /// Les deux modes d'aujourd'hui recouvrent exactement l'ancien booleen :
-    /// on les ecrit donc `"0"` et `"1"`, tels quels. Une version anterieure de
-    /// Tune, qui lit la colonne avec `as_i64()`, continue de comprendre le
-    /// reglage — une bascule vers `similar` puis un retour a une version plus
-    /// ancienne ne perd pas l'autoplay. Un mode reellement nouveau s'ecrira
-    /// sous son nom, et sera alors vu comme « eteint » par les versions qui ne
-    /// le connaissent pas : inevitable, mais reserve aux modes qui n'existent
-    /// pas encore.
+    /// Off et Similar conservent l'ancien booleen `"0"` / `"1"`. Les nouveaux
+    /// modes portent leur nom, dans la meme colonne (TEXT en PostgreSQL,
+    /// affinite INTEGER en SQLite). Les tres anciennes versions qui lisent
+    /// uniquement un entier verront ces nouveaux modes comme desactives.
     pub fn as_stocke(&self) -> &'static str {
         match self {
             AutoplayMode::Off => "0",
             AutoplayMode::Similar => "1",
+            mode => mode.as_str(),
         }
     }
 
@@ -575,12 +577,23 @@ impl AutoplayMode {
         match s.trim() {
             "off" | "0" => Some(AutoplayMode::Off),
             "similar" | "1" => Some(AutoplayMode::Similar),
+            "random_album" => Some(AutoplayMode::RandomAlbum),
+            "random_artist" => Some(AutoplayMode::RandomArtist),
+            "random_year" => Some(AutoplayMode::RandomYear),
+            "random_tracks" => Some(AutoplayMode::RandomTracks),
             _ => None,
         }
     }
 
     /// Les noms acceptes par `PATCH /zones/{id}`, pour le message de refus.
-    pub const NOMS: [&'static str; 2] = ["off", "similar"];
+    pub const NOMS: [&'static str; 6] = [
+        "off",
+        "similar",
+        "random_album",
+        "random_artist",
+        "random_year",
+        "random_tracks",
+    ];
 }
 
 /// La charge utile `zone` d'une zone qui vient de naitre, dans le contrat que
@@ -1741,7 +1754,9 @@ impl ZoneRepo {
     }
 
     pub fn update_autoplay_enabled(&self, id: i64, enabled: bool) -> Result<(), String> {
-        let val: i64 = i64::from(enabled);
+        // PostgreSQL stocke ce reglage en TEXT : un parametre binaire i64
+        // n'est pas un texte UTF-8. SQLite conserve ses entiers par affinite.
+        let val = if enabled { "1" } else { "0" };
         let sql = self.update_field_sql("autoplay_enabled");
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         visible_setting_write(id, "autoplay_enabled", self.db.execute(&sql, &params))
@@ -1804,6 +1819,7 @@ impl ZoneRepo {
     /// - colonne absente (base pre-v36) ou NULL → `Off`, l'ancien defaut ;
     /// - entier `0`, ou texte `"0"` / `"off"` → `Off` ;
     /// - entier non nul, ou texte `"1"` / `"similar"` → `Similar` ;
+    /// - les quatre noms aleatoires → leur mode ;
     /// - **tout autre texte → `Similar`**, jamais `Off`.
     ///
     /// Ce dernier point est deliberé. Un serveur plus recent peut avoir ecrit
@@ -1817,7 +1833,7 @@ impl ZoneRepo {
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
         let sql =
-            format!("SELECT COALESCE(autoplay_enabled, 0) FROM zones WHERE id = {placeholder}");
+            format!("SELECT COALESCE(autoplay_enabled, '0') FROM zones WHERE id = {placeholder}");
         let params: [&dyn ToSqlValue; 1] = [&id];
         let Some(val) = self
             .db
@@ -1837,10 +1853,7 @@ impl ZoneRepo {
         // passent donc par ici avec des variantes differentes pour la MEME
         // valeur logique.
         if let Some(s) = val.as_str() {
-            return match s.trim() {
-                "0" | "off" => AutoplayMode::Off,
-                _ => AutoplayMode::Similar,
-            };
+            return AutoplayMode::from_str_stocke(s).unwrap_or(AutoplayMode::Similar);
         }
         match val.as_i64() {
             Some(0) | None => AutoplayMode::Off,
@@ -1864,11 +1877,7 @@ impl ZoneRepo {
     /// Safely read autoplay_enabled for a zone.  Returns false (the default)
     /// if the column doesn't exist (pre-v36 database).
     ///
-    /// #2271 — POINT DE COMPATIBILITE. Le poller interroge toujours ce
-    /// booleen dans son bloc « queue ended » (`poller.rs`) ; il n'a pas a
-    /// connaitre les modes tant qu'il n'en existe qu'un seul de reellement
-    /// enchainable. « L'autoplay est actif » se lit desormais « le mode n'est
-    /// pas `off` », ce qui reste vrai quel que soit le mode ajoute plus tard.
+    /// Compatibilite des anciens clients : tous les modes sauf Off sont actifs.
     pub fn get_autoplay_enabled(&self, id: i64) -> bool {
         self.get_autoplay_mode(id) != AutoplayMode::Off
     }
@@ -3887,6 +3896,32 @@ mod autoplay_mode_tests {
             .unwrap()
     }
 
+    #[test]
+    fn autoplay_2271_random_modes_survive_reopening_sqlite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("autoplay.sqlite");
+        let db = SqliteDb::open(path.to_str().unwrap()).unwrap();
+        db.init_schema().unwrap();
+        let repo = ZoneRepo::new(db);
+        let id = zone(&repo);
+        for name in [
+            "random_album",
+            "random_artist",
+            "random_year",
+            "random_tracks",
+        ] {
+            let mode = AutoplayMode::from_str_stocke(name).expect("API mode accepte");
+            repo.update_autoplay_mode(id, mode).unwrap();
+            let reopened = ZoneRepo::new(SqliteDb::open(path.to_str().unwrap()).unwrap());
+            assert_eq!(reopened.get_autoplay_mode(id).as_str(), name);
+            assert!(reopened.get_autoplay_enabled(id));
+        }
+        repo.update_autoplay_enabled(id, true).unwrap();
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Similar);
+        repo.update_autoplay_enabled(id, false).unwrap();
+        assert_eq!(repo.get_autoplay_mode(id), AutoplayMode::Off);
+    }
+
     fn valeur_texte(repo: &ZoneRepo, sql: &str) -> Option<String> {
         repo.db
             .query_many_strong(sql, &[])
@@ -4236,7 +4271,7 @@ mod autoplay_mode_tests {
         );
         assert_eq!(AutoplayMode::Off.as_str(), "off");
         assert_eq!(AutoplayMode::Similar.as_str(), "similar");
-        assert_eq!(AutoplayMode::from_str_stocke("random_album"), None);
+        assert_eq!(AutoplayMode::from_str_stocke("future_mode"), None);
     }
 
     /// Une valeur inconnue en base — un serveur plus recent a ecrit un mode
@@ -4248,7 +4283,7 @@ mod autoplay_mode_tests {
         let repo = repo();
         let id = zone(&repo);
         let sql = repo.update_field_sql("autoplay_enabled");
-        let val = "random_album".to_string();
+        let val = "future_mode".to_string();
         let params: [&dyn ToSqlValue; 2] = [&val, &id];
         repo.db.execute(&sql, &params).unwrap();
 
