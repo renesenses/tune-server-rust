@@ -187,6 +187,11 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
 
+      - name: Provenance du DR album sur PostgreSQL (#3924)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i3924_album_provenance_postgres -- --nocapture
+
       # #2441 — le CONTEXTE de lecture, sur une vraie base. Meme angle mort que
       # ci-dessus, une release plus tard : les deux requetes qui portent
       # « Continuer l'ecoute » depuis listen_history (la derniere ecoute de
