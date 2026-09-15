@@ -2103,3 +2103,201 @@ async fn pg_3715_id_invalid_or_colliding_values_preserve_rows_and_sequence() {
     drop(c);
     pool.close().await;
 }
+
+const PG_3715_RADIO_MIGRATION: &str =
+    include_str!("../../migrations/postgres/062_radio_favorite_integer.sql");
+
+async fn pg_3715_radio_pool(case: &str, typ: &str) -> Option<sqlx::PgPool> {
+    let pool = pg_3715_pool(case).await?;
+    assert!(matches!(typ, "SMALLINT" | "TEXT"));
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE radio_stations (
+        id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL,
+        homepage TEXT, logo_url TEXT, country TEXT, language TEXT, genre TEXT,
+        codec TEXT, bitrate INTEGER, is_favorite {typ} DEFAULT '0',
+        last_played TEXT, play_count INTEGER DEFAULT 0)"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    Some(pool)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_radio_create_list_toggle_on_native_and_migrated_schemas() {
+    use crate::db::radio_repo::{RadioRepo, RadioStation};
+    for (case, typ) in [("radio_native", "SMALLINT"), ("radio_migrated", "TEXT")] {
+        let Some(pool) = pg_3715_radio_pool(case, typ).await else {
+            return;
+        };
+        for _ in 0..2 {
+            sqlx::raw_sql(PG_3715_RADIO_MIGRATION)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let repo = RadioRepo::with_backend(Arc::new(PostgresBackend::new(pool.clone())));
+        let mut ids = Vec::new();
+        for favorite in [true, false] {
+            let station = RadioStation {
+                id: None,
+                name: format!("Station {favorite}"),
+                url: format!("http://example.invalid/{favorite}"),
+                homepage: None,
+                logo_url: None,
+                country: Some("FR".into()),
+                language: None,
+                genre: None,
+                codec: Some("flac".into()),
+                bitrate: Some(900),
+                is_favorite: favorite,
+                last_played: None,
+                play_count: 0,
+            };
+            let id = repo
+                .create(&station)
+                .expect("integer favorite flags must be accepted by PostgreSQL");
+            assert!(id > 0);
+            ids.push(id);
+        }
+        let all = repo.list().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .find(|r| r.id == Some(ids[0]))
+                .unwrap()
+                .is_favorite
+        );
+        assert!(
+            !all.iter()
+                .find(|r| r.id == Some(ids[1]))
+                .unwrap()
+                .is_favorite
+        );
+        assert_eq!(
+            repo.favorites()
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            [Some(ids[0])]
+        );
+        repo.set_favorite(ids[0], false).unwrap();
+        repo.set_favorite(ids[1], true).unwrap();
+        assert_eq!(
+            repo.favorites()
+                .unwrap()
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            [Some(ids[1])]
+        );
+        assert_eq!(repo.favorites().unwrap()[0].codec.as_deref(), Some("flac"));
+        drop(repo);
+        pool.close().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_radio_migration_recovers_boolean_text_and_preserves_numeric_values() {
+    use crate::db::radio_repo::RadioRepo;
+    let Some(pool) = pg_3715_radio_pool("radio_legacy", "TEXT").await else {
+        return;
+    };
+    for (i, flag) in [
+        Some("true"),
+        Some("false"),
+        Some("1"),
+        Some("0"),
+        None,
+        Some("2"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        sqlx::query("INSERT INTO radio_stations (name,url,is_favorite) VALUES ($1,$2,$3)")
+            .bind(format!("Saved {i}"))
+            .bind(format!("http://example.invalid/{i}"))
+            .bind(flag)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    for _ in 0..2 {
+        sqlx::raw_sql(PG_3715_RADIO_MIGRATION)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let flags: Vec<Option<i64>> =
+        sqlx::query_scalar("SELECT is_favorite FROM radio_stations ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(flags, [Some(1), Some(0), Some(1), Some(0), None, Some(2)]);
+    let repo = RadioRepo::with_backend(Arc::new(PostgresBackend::new(pool.clone())));
+    let mut names: Vec<_> = repo
+        .favorites()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["Saved 0", "Saved 2"],
+        "the former true text must become visible as a favorite"
+    );
+    assert_eq!(repo.list().unwrap().len(), 6);
+    let flag: i64 = sqlx::query_scalar("INSERT INTO radio_stations (name,url) VALUES ('Default','http://example.invalid/default') RETURNING is_favorite").fetch_one(&pool).await.unwrap();
+    assert_eq!(flag, 0);
+    drop(repo);
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_radio_invalid_flags_preserve_data_and_version() {
+    let Some(pool) = pg_3715_radio_pool("radio_invalid", "TEXT").await else {
+        return;
+    };
+    let mut c = pool.acquire().await.unwrap();
+    for value in ["unknown", "9223372036854775808"] {
+        sqlx::raw_sql("DELETE FROM radio_stations")
+            .execute(&mut *c)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO radio_stations (name,url,is_favorite) VALUES ('Keep','http://example.invalid/keep',$1)").bind(value).execute(&mut *c).await.unwrap();
+        let err = sqlx::raw_sql(PG_3715_RADIO_MIGRATION)
+            .execute(&mut *c)
+            .await
+            .expect_err("invalid flag must refuse migration");
+        assert!(
+            matches!(
+                err.as_database_error().and_then(|e| e.code()).as_deref(),
+                Some("22P02" | "22003")
+            ),
+            "{err}"
+        );
+        sqlx::raw_sql("ROLLBACK").execute(&mut *c).await.unwrap();
+        let row: (String, String, String) =
+            sqlx::query_as("SELECT name,url,is_favorite FROM radio_stations")
+                .fetch_one(&mut *c)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            (
+                "Keep".into(),
+                "http://example.invalid/keep".into(),
+                value.into()
+            )
+        );
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM schema_version WHERE version=62")
+            .fetch_one(&mut *c)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    drop(c);
+    pool.close().await;
+}
