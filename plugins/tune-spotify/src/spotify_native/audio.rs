@@ -1,4 +1,4 @@
-//! Disposable decoder process -> bounded PCM -> Tune HTTP session.
+//! Disposable decoder process -> standard bounded PCM source.
 use super::{
     SpotifyNativeService,
     engine::SpotifyNativeService as Engine,
@@ -19,11 +19,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::{io::AsyncReadExt, sync::oneshot};
-use tune_core::{
-    http::streamer::{AudioStreamer, StreamInfo},
-    orchestrator::{PlayRequest, ResolvedStream},
-    streaming::traits::*,
+use tokio::io::AsyncReadExt;
+use tune_core::streaming::{
+    audio_source::{DecodedPcmSource, PcmFormat as SourcePcmFormat, PcmRequest, PcmSender},
+    traits::*,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -216,50 +215,55 @@ async fn run_audio_worker_inner(published: Arc<AtomicBool>) -> Result<(), String
     result
 }
 
-fn pcm_stream_info(pcm: PcmFormat) -> StreamInfo {
-    StreamInfo {
-        format: "wav".into(),
-        mime_type: "audio/wav".into(),
-        sample_rate: pcm.sample_rate,
-        bit_depth: pcm.bit_depth,
-        channels: pcm.channels,
-        // Spotify metadata milliseconds are NOT an exact decoded frame count.
-        // An invented Content-Length can leave a renderer waiting after EOF.
-        // HTTP is chunked; the child pipe's EOF terminates this finite stream.
-        duration_ms: None,
-        ..Default::default()
-    }
-}
-
-async fn cancelled(cancel: &AtomicBool, streamer: &AudioStreamer, id: &str) {
+async fn cancelled(cancel: &AtomicBool) {
     loop {
-        if cancel.load(Ordering::Acquire) || !streamer.session_alive(id).await {
+        if cancel.load(Ordering::Acquire) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
+async fn forward_pcm(
+    mut child: ChildProcess,
+    tx: &PcmSender,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let mut buffer = [0u8; 4096];
+    let produce = async {
+        loop {
+            let size = child
+                .output
+                .read(&mut buffer)
+                .await
+                .map_err(|_| "Spotify PCM pipe failed")?;
+            if size == 0 {
+                return child.successful_exit().await;
+            }
+            tx.send(buffer[..size].to_vec()).await?;
+        }
+    };
+    // Covers both a child blocked writing to a full pipe and a child stuck
+    // reading upstream. Dropping ChildProcess signals kill + supervisor reap.
+    tokio::select! {
+        result = produce => result,
+        _ = cancelled(cancel) => Err("Spotify playback cancelled".into()),
+        _ = tx.closed() => Ok(()),
+    }
+}
+
 impl SpotifyNativeService {
-    pub async fn resolve_audio(
-        &self,
-        streamer: Arc<AudioStreamer>,
-        server_ip: &str,
-        req: &PlayRequest,
-    ) -> Result<ResolvedStream, String> {
+    pub async fn open_audio(&self, req: &PcmRequest<'_>) -> Result<DecodedPcmSource, String> {
         if !self.enabled {
             return Err("Spotify native is disabled".into());
         }
-        let id = req
-            .source_id
-            .as_deref()
-            .ok_or("Spotify track id is required")?;
+        let id = req.source_id;
         super::catalog::uri(id, "track").map_err(|e| e.to_string())?;
         if !self.has_credentials() {
             return Err("Spotify: pair Tune from the Spotify app first".into());
         }
-        let seek_ms = u32::try_from(req.seek_ms.unwrap_or(0))
-            .map_err(|_| "Spotify seek exceeds supported range")?;
+        let seek_ms =
+            u32::try_from(req.seek_ms).map_err(|_| "Spotify seek exceeds supported range")?;
         let lossless_format = super::lossless::requested_format()?;
         let cancel = Arc::new(AtomicBool::new(false));
         {
@@ -299,55 +303,19 @@ impl SpotifyNativeService {
         let header = header.map_err(|e| e.into_tune().to_string())?;
         let pcm = header.pcm;
         let source_format = header.confirmed_source_format(lossless_format)?;
-        let track = header.track;
-        let frame_bytes = pcm.frame_bytes();
-        let (stream_id, tx, ready) = streamer
-            .create_session(pcm_stream_info(pcm), false, 64)
-            .await;
-        if let Some(session) = streamer.sessions_state().lock().await.get(&stream_id) {
-            let _ = session.restart_position_ms.set(u64::from(seek_ms));
-            let _ = session.decoded_source_format.set(source_format);
-        }
-        let (started, mut startup) = oneshot::channel::<Result<(), String>>();
-        let stream_task = streamer.clone();
-        let task_id = stream_id.clone();
+        let (tx, source) = DecodedPcmSource::channel(
+            SourcePcmFormat {
+                sample_rate: pcm.sample_rate,
+                bit_depth: pcm.bit_depth,
+                channels: pcm.channels,
+            },
+            source_format,
+            header.track,
+        )?;
         let cancel_task = cancel.clone();
         let active = self.audio.clone();
         tokio::spawn(async move {
-            let mut started = Some(started);
-            let mut buffer = [0u8; 4096];
-            let mut carry = Vec::with_capacity(4100);
-            let result: Result<(), String> = async {
-                loop {
-                    let size = tokio::select! {
-                        _ = cancelled(&cancel_task, &stream_task, &task_id) => return Err("Spotify playback cancelled".into()),
-                        result = child.output.read(&mut buffer) => result.map_err(|_| "Spotify PCM pipe failed")?,
-                    };
-                    if size == 0 {
-                        if !carry.is_empty() { return Err("Spotify PCM ended inside an audio frame".into()); }
-                        return child.successful_exit().await;
-                    }
-                    carry.extend_from_slice(&buffer[..size]);
-                    let length = carry.len() / frame_bytes * frame_bytes;
-                    if length == 0 { continue; }
-                    let tail = carry.split_off(length);
-                    let chunk = std::mem::replace(&mut carry, tail);
-                    tokio::select! {
-                        _ = cancelled(&cancel_task, &stream_task, &task_id) => return Err("Spotify playback cancelled".into()),
-                        result = tx.send(chunk) => result.map_err(|_| "Tune PCM consumer closed")?,
-                    }
-                    if let Some(started) = started.take() { ready.notify_one(); let _ = started.send(Ok(())); }
-                }
-            }.await;
-            if let Some(started) = started {
-                let _ = started.send(Err(result
-                    .clone()
-                    .err()
-                    .unwrap_or_else(|| "Spotify decoder produced no PCM".into())));
-            }
-            drop(child); // signal, kill if still alive, and reap in the supervisor
-            drop(tx);
-            stream_task.end_session_input(&task_id).await;
+            let result = forward_pcm(child, &tx, &cancel_task).await;
             cancel_task.store(true, Ordering::Release);
             {
                 let mut current = active.lock().unwrap();
@@ -358,44 +326,78 @@ impl SpotifyNativeService {
                     current.take();
                 }
             }
-            if result.is_err() {
-                tracing::warn!(stream_id = %task_id, "spotify_native_producer_ended_early");
-                stream_task.remove_session(&task_id).await;
+            if let Err(error) = result {
+                // Core owns readiness, HTTP lifetime and error teardown.
+                tx.fail(error).await;
             }
         });
-        let result = tokio::time::timeout(Duration::from_secs(30), &mut startup)
-            .await
-            .map_err(|_| "Spotify decoder startup timed out".to_owned())
-            .and_then(|r| r.map_err(|_| "Spotify decoder stopped before producing PCM".to_owned()))
-            .and_then(|r| r);
-        if let Err(error) = result {
-            streamer.remove_session(&stream_id).await;
-            return Err(error);
-        }
         pending.armed = false;
-        Ok(ResolvedStream {
-            url: streamer.get_stream_url(&stream_id, server_ip, "wav"),
-            mime_type: "audio/wav".into(),
-            title: track.title,
-            artist: Some(track.artist),
-            album: track.album,
-            duration_ms: Some(track.duration_ms as i64),
-            source: "spotify".into(),
-            cover_url: track.cover_path,
-            stream_id: Some(stream_id),
-            file_size: None,
-            sample_rate: Some(pcm.sample_rate),
-            bit_depth: Some(u32::from(pcm.bit_depth)),
-            channels: Some(u32::from(pcm.channels)),
-            origin_url: None,
-            bitrate_kbps: None,
-        })
+        Ok(source)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_core_pcm_drop_stops_worker_even_with_blocked_pipe() {
+        use tokio::io::AsyncBufReadExt;
+        for script in ["sleep 30", "exec yes pcm"] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", &format!("printf '%s\\n' \"$$\"; {script}")]);
+            let mut child = ChildProcess::from_command(command).unwrap();
+            let mut pid = String::new();
+            tokio::time::timeout(Duration::from_secs(2), child.output.read_line(&mut pid))
+                .await
+                .unwrap()
+                .unwrap();
+            let pid: i32 = pid.trim().parse().unwrap();
+            let life = child.life.clone();
+            let (tx, source) = DecodedPcmSource::channel(
+                SourcePcmFormat {
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    channels: 2,
+                },
+                tune_core::audio::formats::AudioFormat::Ogg,
+                serde_json::from_value(serde_json::json!({
+                    "id": "fixture", "title": "Fixture", "artist": "Fixture",
+                    "duration_ms": 1000, "explicit": false
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let task =
+                tokio::spawn(async move { forward_pcm(child, &tx, &AtomicBool::new(false)).await });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(life.load(Ordering::Acquire));
+            drop(source);
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("core dropping PCM must stop a provider blocked on IO or backpressure")
+                .unwrap();
+            // send() and closed() can both become ready on the same drop.
+            if let Err(error) = result {
+                assert_eq!(error, "PCM consumer closed");
+            }
+            assert!(!life.load(Ordering::Acquire));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    // Includes zombies: kill(0) only fails with ESRCH once the
+                    // exact child is gone, not just when Drop sets life=false.
+                    if unsafe { libc::kill(pid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("provider process must actually exit and be reaped");
+        }
+    }
     #[test]
     fn native_confirmed_source_comes_from_decoder_not_quality_preference() {
         use tune_core::audio::formats::AudioFormat;
@@ -436,14 +438,6 @@ mod tests {
         assert_eq!(
             pcm_s16le(&[-1.0, 0.5, 1.0, -2.0, f64::NAN]),
             [0, 128, 0, 64, 255, 127, 0, 128, 0, 0]
-        );
-    }
-    #[test]
-    fn native_pcm_never_invents_content_length_from_catalogue_duration() {
-        assert_eq!(
-            pcm_stream_info(PcmFormat::ogg()).wav_content_length(),
-            None,
-            "Spotify metadata duration is not an exact PCM length; Chrome must receive real EOF"
         );
     }
     #[test]

@@ -147,20 +147,31 @@ impl PlaybackOrchestrator {
             .source_id
             .as_deref()
             .ok_or("source_id required for streaming")?;
+        let source_play_seq = self.playback.current_play_seq(req.zone_id).await;
 
         {
             let service = { self.services.lock().await.get(service_name) };
             if let Some(service) = service {
                 let service = service.read().await;
-                if service.private_audio() {
+                if service.audio_delivery()
+                    == crate::streaming::audio_source::AudioDelivery::DecodedPcm
+                {
                     if self
                         .load_streaming_dsp(req.zone_id, req.track_id, 44100, 2)
                         .is_active()
                     {
-                        return Err("Private audio service does not apply zone DSP; use a zone without active DSP".into());
+                        return Err("Decoded PCM delivery does not yet apply zone DSP; use a zone without active DSP".into());
                     }
-                    return service
-                        .resolve_private_audio(self.streamer.clone(), &self.server_ip(), req)
+                    let source = service
+                        .open_pcm_audio(&crate::streaming::audio_source::PcmRequest {
+                            source_id,
+                            zone_id: req.zone_id,
+                            seek_ms: req.seek_ms.unwrap_or(0),
+                        })
+                        .await?;
+                    drop(service);
+                    return self
+                        .serve_decoded_pcm(service_name, source, source_play_seq, req)
                         .await;
                 }
             }

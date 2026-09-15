@@ -358,19 +358,16 @@ pub trait StreamingService: Send + Sync {
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);
 
-    /// Private decoded transport: no public CDN URL, replay to seek, no host DSP.
-    /// The default keeps existing URL-based services unchanged.
-    fn private_audio(&self) -> bool {
-        false
+    /// Audio delivery capability, independent of the provider's identity.
+    fn audio_delivery(&self) -> super::audio_source::AudioDelivery {
+        super::audio_source::AudioDelivery::Url
     }
 
-    async fn resolve_private_audio(
+    async fn open_pcm_audio(
         &self,
-        _streamer: std::sync::Arc<crate::http::streamer::AudioStreamer>,
-        _server_ip: &str,
-        _request: &crate::orchestrator::PlayRequest,
-    ) -> Result<crate::orchestrator::ResolvedStream, String> {
-        Err("Service does not provide private audio".into())
+        _request: &super::audio_source::PcmRequest<'_>,
+    ) -> Result<super::audio_source::DecodedPcmSource, String> {
+        Err("Service does not provide decoded PCM".into())
     }
 
     /// Stop owned workers without deleting the user's saved pairing.

@@ -19,15 +19,32 @@ impl StreamingService for TestService {
         true
     }
     fn set_enabled(&mut self, _: bool) {}
-    fn private_audio(&self) -> bool {
-        true
+    fn audio_delivery(&self) -> audio_source::AudioDelivery {
+        audio_source::AudioDelivery::DecodedPcm
     }
-    async fn resolve_private_audio(
+    async fn open_pcm_audio(
         &self,
-        _: std::sync::Arc<crate::http::streamer::AudioStreamer>,
-        _: &str,
-        _: &crate::orchestrator::PlayRequest,
-    ) -> Result<crate::orchestrator::ResolvedStream, String> {
+        _: &audio_source::PcmRequest<'_>,
+    ) -> Result<audio_source::DecodedPcmSource, String> {
+        if self.0 == "fixture-decoded" {
+            let (tx, source) = audio_source::DecodedPcmSource::channel(
+                audio_source::PcmFormat {
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    channels: 2,
+                },
+                crate::audio::formats::AudioFormat::Flac,
+                serde_json::from_value(serde_json::json!({
+                    "id": "pcm", "title": "Generic provider", "artist": "Fixture",
+                    "duration_ms": 120, "explicit": false
+                }))
+                .unwrap(),
+            )?;
+            tokio::spawn(async move {
+                let _ = tx.send(vec![1; 44100 * 4 * 120 / 1000]).await;
+            });
+            return Ok(source);
+        }
         Err("private decoder refused".into())
     }
     async fn authenticate(&mut self, _: &serde_json::Value) -> Result<AuthStatus, TuneError> {

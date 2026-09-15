@@ -18,18 +18,13 @@
 //!   (`receiver_count() == 0`), so behaviour is identical to today when no plugin
 //!   wants PCM.
 //!
-//! # Wiring (follow-up, kept out of this scaffold)
-//! - `Playback` holds one [`ZoneTap`] per active zone (same place as
-//!   `current_play_seq(zone_id)`), and hands a [`PcmPublisher`] to the decoder.
-//! - `decode_to_pcm_streaming_inner` publishes at the **four** sites where
-//!   #1105 calls `levels::send_windowed_levels(...)` — same `pcm: &[u8]` +
-//!   `bit_depth`/`channels`/`sample_rate` already in hand.
-//! - The `playback.audio_levels` forwarder (#1105) becomes a **consumer** of the
-//!   tap: it `subscribe()`s, runs `compute_levels` off the decode hot path, and
-//!   keeps its existing pacing / play_seq supersession logic.
-//! - The plugin SDK exposes the tap to opted-in plugins via a host callback
-//!   `on_pcm(zone_id, ptr, len, format, position_ms, play_seq)`.
-#![allow(dead_code)] // scaffold: consumed once wired into decode.rs + Playback
+//! # Current wiring
+//! `PlaybackManager::zone_tap` owns each zone's tap. Decoders and standard PCM
+//! providers feed raw windows to the orchestrator's common paced forwarder.
+//! It publishes PCM here and computes `playback.audio_levels` from the SAME
+//! window, after pause/position/play-generation checks. Native subscribers
+//! receive timed frames; there is no implemented WASM `on_pcm` import yet.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::Duration;

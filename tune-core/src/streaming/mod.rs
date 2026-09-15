@@ -1,4 +1,5 @@
 pub mod amazon;
+pub mod audio_source;
 pub mod deezer;
 pub mod deezer_decrypt;
 pub mod favorites_date;

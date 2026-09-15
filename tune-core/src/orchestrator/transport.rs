@@ -2351,9 +2351,7 @@ impl PlaybackOrchestrator {
                 position_ms = (np.duration_ms as u64).saturating_sub(1000);
             }
         }
-        let restarted = self
-            .seek_private_audio(zone_id, position_ms, &state)
-            .await?;
+        let restarted = self.seek_decoded_pcm(zone_id, position_ms, &state).await?;
         if !restarted && let Some(did) = device_id {
             self.deplacer_la_sortie(zone_id, did, position_ms, &state, seek_start)
                 .await?;
@@ -2380,7 +2378,7 @@ impl PlaybackOrchestrator {
 
     /// Browser zones have no output device. They need the same new decoder as
     /// device outputs: a state-only seek falsely acknowledged a silent no-op.
-    async fn seek_private_audio(
+    async fn seek_decoded_pcm(
         &self,
         zone_id: i64,
         position_ms: u64,
@@ -2388,16 +2386,17 @@ impl PlaybackOrchestrator {
     ) -> OutputCommandResult<bool> {
         if let Some(np) = state.now_playing.as_ref() {
             let service = { self.services.lock().await.get(&np.source) };
-            let native = if let Some(service) = service {
-                service.read().await.private_audio()
+            let decoded_pcm = if let Some(service) = service {
+                service.read().await.audio_delivery()
+                    == crate::streaming::audio_source::AudioDelivery::DecodedPcm
             } else {
                 false
             };
-            if native {
-                // A private PCM pipe cannot seek by HTTP Range or SOAP. Decode
+            if decoded_pcm {
+                // A PCM producer cannot seek by HTTP Range or SOAP. Decode
                 // a new stream at the requested offset; no second renderer seek.
                 if let Err(error) = self
-                    .replay_zone_at_position(zone_id, position_ms, "private_audio_seek")
+                    .replay_zone_at_position(zone_id, position_ms, "decoded_pcm_seek")
                     .await
                 {
                     self.playback.seek(zone_id, state.position_ms).await;

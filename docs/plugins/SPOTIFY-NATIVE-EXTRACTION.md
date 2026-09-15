@@ -76,10 +76,17 @@ l'implémentation dans `tune-core`.
 2. **Restauration ciblée.** L'hôte restaure uniquement les nouveaux services
    avant de démarrer les événements et d'accepter des requêtes ; il ne relance
    pas la restauration des services déjà présents.
-3. **Audio privé.** `StreamingService::private_audio` /
-   `resolve_private_audio` remplacent les downcasts Spotify. Le contrat impose
-   un nouveau décodage pour chercher une position, la confirmation avant
-   publication, le maintien de la pause et le refus de DSP non appliqué.
+3. **Source audio.** `StreamingService::audio_delivery` déclare `Url` (défaut,
+   contrat `get_track_url` existant) ou `DecodedPcm`. Pour ce dernier,
+   `open_pcm_audio(PcmRequest)` fournit un `DecodedPcmSource` : format entier
+   signé little-endian 16/24 bits, codec observé, métadonnées et canal borné.
+   Le plugin ne reçoit plus `AudioStreamer`, `PlayRequest` ou `ResolvedStream`.
+   Le cœur crée la session WAV, confirme le premier PCM, conserve l'origine
+   FLAC/OGG et le décalage du seek, ferme le flux HTTP à EOF et annule la
+   source lors d'un arrêt/remplacement. Le plugin supervise et récolte son
+   worker quand le consommateur disparaît, même avec une pipe bloquée.
+   Le seek rouvre la source et conserve une pause ; le DSP non appliqué est
+   toujours refusé explicitement, pas annoncé comme fonctionnel.
 4. **Workers avant bootstrap.** `PluginWorker` et `RunOptions::workers`
    permettent aux plugins compilés ou composés hors arbre d'apporter leurs
    entrées privées. Un flag inconnu ou possédé deux fois refuse le démarrage.
@@ -92,10 +99,17 @@ l'implémentation dans `tune-core`.
 Le fournisseur PlayPlay privé reste externe ; ni APK ni clé ni table dans le
 plugin distribué. Sélecteur de qualité, extension UI dédiée et chargement à
 chaud ne sont pas ajoutés. La provenance FLAC a été raccordée ensuite : le
-plugin publie le codec confirmé sur sa session, le cœur le porte dans
+plugin fournit le codec confirmé dans sa source PCM, le cœur le porte dans
 `NowPlaying.format`, et le chemin du signal distingue source FLAC/OGG et
 transport WAV sans promettre un navigateur bit-perfect.
-Bandcamp n'est pas migré vers le nouveau hook. La CI multiplateforme reste
+Qobuz/Bandcamp gardent le contrat URL par défaut, sans changement de leur
+qualité, refresh ou proxy. Le chemin PCM branche désormais les mêmes tap,
+FFT et événements `playback.audio_levels`, avec la même horloge de zone et
+les mêmes gardes de génération. Les lectures arbitraires du fournisseur sont
+réassemblées en fenêtres de 40 ms ; la voie d'analyse est bornée à 750
+fenêtres (30 s) et exerce une contre-pression, sans modifier les échantillons.
+Ni passthrough FLAC Spotify, ni DSP PCM, ni contrat de flux encodé privé ne
+sont ajoutés par ce raccordement. La CI multiplateforme reste
 nécessaire avant intégration ; une compilation Shrek n'est pas une release.
 
 Commandes ciblées :
@@ -104,6 +118,7 @@ Commandes ciblées :
 cargo test -p tune-spotify --features native --lib --locked
 cargo test -p tune-core --lib --no-default-features --features oaat,plugin-http plugin_ --locked
 cargo test -p tune-core --lib --no-default-features --features oaat,plugin-http private_audio --locked
+cargo test -p tune-core --lib --no-default-features --features oaat decoded_pcm --locked
 cargo test -p tune-server --no-default-features --features oaat,spotify-native --test spotify_plugin --locked
 ```
 

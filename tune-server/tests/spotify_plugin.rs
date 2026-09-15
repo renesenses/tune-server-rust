@@ -222,7 +222,10 @@ async fn oauth_callback_retains_its_legacy_contract_without_authenticating_on_ge
 async fn native_worker_and_audio_capability_are_contributed_by_the_plugin() {
     use tune_core::streaming::StreamingService;
     let mut service = tune_spotify::spotify_native::SpotifyNativeService::new();
-    assert!(service.private_audio());
+    assert_eq!(
+        service.audio_delivery(),
+        tune_core::streaming::audio_source::AudioDelivery::DecodedPcm
+    );
     assert_eq!(service.credential_key(), "auth_tokens_spotify_native");
     service.shutdown().await;
     assert!(!service.enabled());

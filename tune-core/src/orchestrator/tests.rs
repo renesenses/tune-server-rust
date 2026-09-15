@@ -2217,7 +2217,7 @@ fn les_reglages_de_sortie_locale_viennent_de_la_base() {
     );
 }
 
-fn test_orchestrator() -> PlaybackOrchestrator {
+pub(super) fn test_orchestrator() -> PlaybackOrchestrator {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     run_migrations(&db).unwrap();

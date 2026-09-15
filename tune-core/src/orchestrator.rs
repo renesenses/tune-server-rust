@@ -161,7 +161,51 @@ fn spawn_paced_levels_forwarder(
     play_seq: u64,
     start_position_ms: i64,
 ) -> tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
+    spawn_levels_receiver(
+        bus,
+        playback,
+        zone_id,
+        play_seq,
+        start_position_ms,
+        LevelsReceiver::Unbounded(rx),
+    );
+    tx
+}
+
+/// Existing decoders brake their unbounded lane upstream. PCM providers use
+/// the bounded lane: at most 30 seconds of 40 ms windows, even while paused
+/// or when a browser downloads much faster than it plays. Both lanes have the
+/// SAME clock, generation, tap and FFT implementation below.
+enum LevelsReceiver {
+    Unbounded(tokio::sync::mpsc::UnboundedReceiver<crate::audio::tap::RawWindow>),
+    Bounded {
+        rx: tokio::sync::mpsc::Receiver<crate::audio::tap::RawWindow>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    },
+}
+
+impl LevelsReceiver {
+    async fn recv(&mut self) -> Option<crate::audio::tap::RawWindow> {
+        match self {
+            Self::Unbounded(rx) => rx.recv().await,
+            Self::Bounded { rx, .. } => rx.recv().await,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        matches!(self, Self::Bounded { cancelled, .. } if cancelled.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+fn spawn_levels_receiver(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    start_position_ms: i64,
+    mut rx: LevelsReceiver,
+) {
     tokio::spawn(async move {
         // Le forwarder est le métronome du signal : il reçoit les fenêtres
         // brutes à la vitesse du décodage, les recadence sur l'horloge de
@@ -202,7 +246,8 @@ fn spawn_paced_levels_forwarder(
             // (toute sortie de boucle passe par une affectation), et le déclarer
             // laissait croire à un repli qui n'existe pas.
             let reported_position_ms: i64 = loop {
-                if playback.current_play_seq(zone_id).await != play_seq
+                if rx.cancelled()
+                    || playback.current_play_seq(zone_id).await != play_seq
                     || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
                 {
                     return;
@@ -357,7 +402,6 @@ fn spawn_paced_levels_forwarder(
             position += window;
         }
     });
-    tx
 }
 
 /// Le FREIN du décodage-pour-niveaux, isolé de ce QU'ON décode.
@@ -1187,6 +1231,7 @@ mod transport;
 #[cfg(feature = "local-audio")]
 mod repli_de_peripherique;
 
+mod decoded_pcm;
 mod resolve_stream;
 
 mod resolve_local;

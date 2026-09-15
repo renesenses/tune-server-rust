@@ -178,17 +178,15 @@ fn unsupported(operation: &str) -> TuneError {
 
 #[async_trait::async_trait]
 impl StreamingService for SpotifyNativeService {
-    fn private_audio(&self) -> bool {
-        true
+    fn audio_delivery(&self) -> tune_core::streaming::audio_source::AudioDelivery {
+        tune_core::streaming::audio_source::AudioDelivery::DecodedPcm
     }
 
-    async fn resolve_private_audio(
+    async fn open_pcm_audio(
         &self,
-        streamer: std::sync::Arc<tune_core::http::streamer::AudioStreamer>,
-        server_ip: &str,
-        request: &tune_core::orchestrator::PlayRequest,
-    ) -> Result<tune_core::orchestrator::ResolvedStream, String> {
-        self.resolve_audio(streamer, server_ip, request).await
+        request: &tune_core::streaming::audio_source::PcmRequest<'_>,
+    ) -> Result<tune_core::streaming::audio_source::DecodedPcmSource, String> {
+        self.open_audio(request).await
     }
 
     async fn shutdown(&mut self) {
