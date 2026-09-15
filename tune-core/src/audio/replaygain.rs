@@ -1787,49 +1787,96 @@ pub fn stored_gain_detail(
     track_id: i64,
     mode: ReplayGainMode,
 ) -> Option<(TrackGain, ReplayGainMode)> {
+    stored_gain_with_peak(backend, track_id, mode).map(|(gain, mode, _)| (gain, mode))
+}
+
+/// Nature du pic utilisé, indépendante de la provenance du gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeakKind {
+    None,
+    SamplePeak,
+    TruePeak,
+}
+
+impl PeakKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SamplePeak => "sample_peak",
+            Self::TruePeak => "true_peak",
+        }
+    }
+
+    /// Réserve de repli, pas une mesure ni une garantie universelle de crête vraie.
+    pub fn headroom_db(self, settings: ReplayGainSettings) -> f64 {
+        if self == Self::SamplePeak
+            && settings.prevent_clipping
+            && settings.mode != ReplayGainMode::Off
+        {
+            3.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Gain brut, granularité effective et nature du pic (#4074).
+/// Un pic d'échantillon ne devient jamais une crête vraie par changement de nom.
+pub fn stored_gain_with_peak(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    mode: ReplayGainMode,
+) -> Option<(TrackGain, ReplayGainMode, PeakKind)> {
     if mode == ReplayGainMode::Off {
         return None;
     }
     let meta = TrackMetadataRepo::with_backend(backend.clone())
         .get_all(track_id)
         .ok()?;
-    let pick = |gain_key: &str, peak_key: &str, true_peak_key: &str| -> Option<TrackGain> {
-        let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
-        // Un pic ReplayGain est une AMPLITUDE NORMALISÉE, pas une valeur
-        // d'échantillon. Le tag est importé VERBATIM du fichier
-        // (`metadata/mod.rs`, `ItemKey::ReplayGainTrackPeak` → `rg_track_peak`)
-        // et certains vieux tagueurs y écrivent l'échelle de l'échantillon :
-        // `32768` en 16 bits, `8388607` en 24 bits. `gain_factor` calcule alors
-        // `plafond / pic`, tombe sur le plancher `0.001` de son `clamp` final,
-        // et la piste sort 60 dB trop bas — inaudible, sans qu'aucun message ne
-        // le dise.
-        //
-        // Le plafond est `PEAK_MAX_PLAUSIBLE` = 4 (+12 dBFS) et non 1 : un
-        // master écrêté dépasse légitimement la pleine échelle (1,02 ; 1,1) et
-        // son pic doit continuer de protéger. Au-delà, la valeur n'est plus un
-        // pic normalisé mais une autre échelle ; l'IGNORER fait retomber
-        // `prevent_clipping` sur le cas « aucun pic tagué », ce qui vaut mieux
-        // que d'éteindre le son.
-        let read_peak = |key: &str| {
-            meta.get(key)
-                .and_then(|p| p.trim().parse::<f64>().ok())
-                .filter(|p| *p > 0.0 && *p <= PEAK_MAX_PLAUSIBLE)
+    let pick =
+        |gain_key: &str, peak_key: &str, true_peak_key: &str| -> Option<(TrackGain, PeakKind)> {
+            let gain_db = meta.get(gain_key).cloned().and_then(parse_gain_db)?;
+            // Un pic ReplayGain est une AMPLITUDE NORMALISÉE, pas une valeur
+            // d'échantillon. Le tag est importé VERBATIM du fichier
+            // (`metadata/mod.rs`, `ItemKey::ReplayGainTrackPeak` → `rg_track_peak`)
+            // et certains vieux tagueurs y écrivent l'échelle de l'échantillon :
+            // `32768` en 16 bits, `8388607` en 24 bits. `gain_factor` calcule alors
+            // `plafond / pic`, tombe sur le plancher `0.001` de son `clamp` final,
+            // et la piste sort 60 dB trop bas — inaudible, sans qu'aucun message ne
+            // le dise.
+            //
+            // Le plafond est `PEAK_MAX_PLAUSIBLE` = 4 (+12 dBFS) et non 1 : un
+            // master écrêté dépasse légitimement la pleine échelle (1,02 ; 1,1) et
+            // son pic doit continuer de protéger. Au-delà, la valeur n'est plus un
+            // pic normalisé mais une autre échelle ; l'IGNORER fait retomber
+            // `prevent_clipping` sur le cas « aucun pic tagué », ce qui vaut mieux
+            // que d'éteindre le son.
+            let read_peak = |key: &str| {
+                meta.get(key)
+                    .and_then(|p| p.trim().parse::<f64>().ok())
+                    .filter(|p| *p > 0.0 && *p <= PEAK_MAX_PLAUSIBLE)
+            };
+            // Le true peak (inter-échantillons, #1694) PRIME quand il existe :
+            // c'est lui qui voit les overs que le sample peak rate, et c'est
+            // contre lui que `prevent_clipping` et le plafond dBTP doivent tirer.
+            let (peak, kind) = if let Some(peak) = read_peak(true_peak_key) {
+                (Some(peak), PeakKind::TruePeak)
+            } else if let Some(peak) = read_peak(peak_key) {
+                (Some(peak), PeakKind::SamplePeak)
+            } else {
+                (None, PeakKind::None)
+            };
+            Some((TrackGain { gain_db, peak }, kind))
         };
-        // Le true peak (inter-échantillons, #1694) PRIME quand il existe :
-        // c'est lui qui voit les overs que le sample peak rate, et c'est
-        // contre lui que `prevent_clipping` et le plafond dBTP doivent tirer.
-        let peak = read_peak(true_peak_key).or_else(|| read_peak(peak_key));
-        Some(TrackGain { gain_db, peak })
-    };
     match mode {
         ReplayGainMode::Album => pick("rg_album_gain", "rg_album_peak", "rg_album_true_peak")
-            .map(|g| (g, ReplayGainMode::Album))
+            .map(|(g, kind)| (g, ReplayGainMode::Album, kind))
             .or_else(|| {
                 pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
-                    .map(|g| (g, ReplayGainMode::Track))
+                    .map(|(g, kind)| (g, ReplayGainMode::Track, kind))
             }),
         _ => pick("rg_track_gain", "rg_track_peak", "rg_track_true_peak")
-            .map(|g| (g, ReplayGainMode::Track)),
+            .map(|(g, kind)| (g, ReplayGainMode::Track, kind)),
     }
 }
 
@@ -1915,8 +1962,9 @@ impl RetenueAntiEcretage {
     }
 }
 
-/// The linear factor to multiply samples by: `1.0` means "leave the audio
-/// alone".
+/// The scalar linear factor: `1.0` means "leave the audio alone".
+/// This low-level API cannot infer peak provenance. For stored metadata use
+/// [`playback_factor`] or [`gain_factor_with_peak`] so sample peaks get headroom.
 ///
 /// Clipping prevention is not cosmetic. A loudness-war master tagged at
 /// `peak = 1.0` with a positive gain would be pushed past full scale and
@@ -1999,6 +2047,23 @@ pub fn gain_factor_detail(
     // A factor below this is inaudible attenuation of a signal to nothing; a
     // factor above is a bug, not a preference.
     (factor.clamp(0.001, 4.0), retenue)
+}
+
+/// Facteur de lecture tenant compte de la nature du pic.
+/// La réserve de 3 dB borne le gain quand seul un sample peak est disponible.
+/// Elle ne s'ajoute pas à une atténuation déjà suffisante et ne modifie pas
+/// les tags. Une crête vraie exploitable remplace cette estimation.
+/// Les helpers historiques sans nature de pic restent des calculs scalaires ;
+/// les consommateurs de métadonnées doivent utiliser cette porte.
+pub fn gain_factor_with_peak(
+    mut gain: TrackGain,
+    settings: ReplayGainSettings,
+    kind: PeakKind,
+) -> (f64, RetenueAntiEcretage) {
+    if let Some(peak) = gain.peak {
+        gain.peak = Some(peak * 10f64.powf(kind.headroom_db(settings) / 20.0));
+    }
+    gain_factor_detail(gain, settings)
 }
 
 /// Scale interleaved PCM in place by a linear factor.
@@ -2218,8 +2283,8 @@ impl Drop for GainReplay {
 /// off, unmeasured, or unreadable.
 pub fn playback_factor(backend: &Arc<dyn DbBackend>, track_id: i64) -> f64 {
     let settings = ReplayGainSettings::load(backend);
-    match stored_gain_for(backend, track_id, settings.mode) {
-        Some(gain) => gain_factor(gain, settings),
+    match stored_gain_with_peak(backend, track_id, settings.mode) {
+        Some((gain, _, kind)) => gain_factor_with_peak(gain, settings, kind).0,
         None => 1.0,
     }
 }
@@ -4511,6 +4576,52 @@ mod garde_pic_hors_echelle {
         backend
     }
 
+    #[test]
+    fn sample_peak_headroom_tracks_metadata_and_playback() {
+        let backend = base_replaygain("+6", Some("0.95"));
+        let meta = TrackMetadataRepo::with_backend(backend.clone());
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let expected = 10f64.powf(-3.0 / 20.0) / 0.95;
+        let (raw, mode, kind) = stored_gain_with_peak(&backend, 42, ReplayGainMode::Album).unwrap();
+        assert_eq!(raw.peak, Some(0.95));
+        assert_eq!(mode, ReplayGainMode::Track);
+        assert_eq!(kind, PeakKind::SamplePeak);
+        assert!((playback_factor(&backend, 42) - expected).abs() < 1e-12);
+        meta.set(42, "rg_track_true_peak", "1.2").unwrap();
+        assert_eq!(
+            stored_gain_with_peak(&backend, 42, ReplayGainMode::Track)
+                .unwrap()
+                .2,
+            PeakKind::TruePeak
+        );
+        assert!((playback_factor(&backend, 42) - 1.0 / 1.2).abs() < 1e-12);
+        // Invalid true peak falls back to the sample peak, retaining its reserve.
+        meta.set(42, "rg_track_true_peak", "NaN").unwrap();
+        assert!((playback_factor(&backend, 42) - expected).abs() < 1e-12);
+        meta.set(42, "rg_album_gain", "+6").unwrap();
+        meta.set(42, "rg_album_peak", "0.8").unwrap();
+        settings.set(MODE_KEY, "album").unwrap();
+        assert_eq!(
+            stored_gain_with_peak(&backend, 42, ReplayGainMode::Album)
+                .unwrap()
+                .1,
+            ReplayGainMode::Album
+        );
+        assert!((playback_factor(&backend, 42) - 10f64.powf(-3.0 / 20.0) / 0.8).abs() < 1e-12);
+        meta.set(42, "rg_album_true_peak", "1.1").unwrap();
+        assert!((playback_factor(&backend, 42) - 1.0 / 1.1).abs() < 1e-12);
+        settings.set(PREVENT_CLIPPING_KEY, "false").unwrap();
+        assert!((playback_factor(&backend, 42) - 10f64.powf(6.0 / 20.0)).abs() < 1e-12);
+        settings.set(MODE_KEY, "off").unwrap();
+        assert_eq!(playback_factor(&backend, 42), 1.0);
+    }
+
+    #[test]
+    fn sample_peak_headroom_does_not_stack_on_sufficient_attenuation() {
+        let backend = base_replaygain("-6", Some("1.0"));
+        assert!((playback_factor(&backend, 42) - 10f64.powf(-6.0 / 20.0)).abs() < 1e-12);
+    }
+
     /// LE défaut : `32768` (16 bits) et `8388607` (24 bits) sont des échelles
     /// d'échantillon, pas des amplitudes. `gain_factor` en tirait
     /// `plafond / pic`, tombait sur le plancher `0.001` du `clamp` final, et la
@@ -4535,12 +4646,12 @@ mod garde_pic_hors_echelle {
 
     /// Contre-épreuve, l'autre moitié : un pic PLAUSIBLE doit continuer de
     /// protéger. Un master écrêté à `1.1` avec un gain de +6 dB dépasserait la
-    /// pleine échelle ; `prevent_clipping` doit tirer le facteur à `1/1.1`.
+    /// pleine échelle ; le pic d'échantillon garde désormais 3 dB de réserve.
     #[test]
     fn un_pic_plausible_protege_toujours_de_l_ecretage() {
         let backend = base_replaygain("+6.0 dB", Some("1.1"));
         let f = playback_factor(&backend, 42);
-        let attendu = 1.0 / 1.1;
+        let attendu = 10f64.powf(-3.0 / 20.0) / 1.1;
         assert!(
             (f - attendu).abs() < 1e-9,
             "facteur {f}, attendu {attendu} : l'anti-écrêtage ne tire plus"
@@ -4554,8 +4665,8 @@ mod garde_pic_hors_echelle {
         let backend = base_replaygain("+12.0 dB", Some("4.0"));
         let f = playback_factor(&backend, 42);
         assert!(
-            (f - 0.25).abs() < 1e-9,
-            "facteur {f}, attendu 0.25 : le pic 4.0 doit encore protéger"
+            (f - 0.25 * 10f64.powf(-3.0 / 20.0)).abs() < 1e-9,
+            "facteur {f} : le pic 4.0 doit encore protéger avec sa réserve"
         );
     }
 
