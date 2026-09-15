@@ -5,7 +5,7 @@ use librespot_core::{Session, SpotifyUri};
 use librespot_metadata::{Album, Artist, Metadata, Playlist, Track, image::Images};
 
 use super::{bounded, unsupported};
-use crate::{TuneError, streaming::traits::*};
+use tune_core::{TuneError, streaming::traits::*};
 
 const MAX_COLLECTION: usize = 300;
 

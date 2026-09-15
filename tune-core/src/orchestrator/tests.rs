@@ -2232,13 +2232,15 @@ fn test_orchestrator() -> PlaybackOrchestrator {
     )
 }
 
-#[cfg(feature = "spotify-native")]
 #[tokio::test]
-async fn spotify_native_browser_seek_requires_decoder_confirmation() {
+async fn private_audio_browser_seek_requires_decoder_confirmation() {
     let orch = test_orchestrator();
-    orch.services.lock().await.register(Box::new(
-        crate::streaming::spotify_native::SpotifyNativeService::new(),
-    ));
+    orch.services
+        .lock()
+        .await
+        .register(Box::new(crate::streaming::test_service::TestService(
+            "fixture-private",
+        )));
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("Native browser", Some("browser"), None)
         .unwrap();
@@ -2246,7 +2248,7 @@ async fn spotify_native_browser_seek_requires_decoder_confirmation() {
         .play(
             zone_id,
             NowPlaying {
-                source: "spotify".into(),
+                source: "fixture-private".into(),
                 source_id: Some("4uLU6hMCjMI75M1A2tKUQC".into()),
                 title: "Test".into(),
                 duration_ms: 300_000,
@@ -2268,26 +2270,28 @@ async fn spotify_native_browser_seek_requires_decoder_confirmation() {
     assert!(orch.streamer.sessions_state().lock().await.is_empty());
 }
 
-#[cfg(feature = "spotify-native")]
 #[tokio::test]
-async fn spotify_native_resolves_through_session_not_public_audio_url() {
+async fn private_audio_resolves_through_session_not_public_audio_url() {
     let orch = test_orchestrator();
-    orch.services.lock().await.register(Box::new(
-        crate::streaming::spotify_native::SpotifyNativeService::new(),
-    ));
+    orch.services
+        .lock()
+        .await
+        .register(Box::new(crate::streaming::test_service::TestService(
+            "fixture-private",
+        )));
     let request = PlayRequest {
         zone_id: 1,
-        source: Some("spotify".into()),
+        source: Some("fixture-private".into()),
         source_id: Some("4uLU6hMCjMI75M1A2tKUQC".into()),
         ..Default::default()
     };
     let error = orch
-        .resolve_streaming_url("spotify", &request)
+        .resolve_streaming_url("fixture-private", &request)
         .await
         .err()
         .expect("unpaired Spotify must refuse playback");
     assert!(
-        error.contains("pair Tune"),
+        error.contains("private decoder refused"),
         "native Spotify must reach the session path, not get_track_url: {error}"
     );
     assert!(

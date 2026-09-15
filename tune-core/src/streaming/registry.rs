@@ -8,6 +8,13 @@ use super::traits::StreamingService;
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
+pub type ServiceHandle = Arc<RwLock<Box<dyn StreamingService>>>;
+
+pub struct ServiceRegistration {
+    pub name: String,
+    pub service: ServiceHandle,
+}
+
 /// `RwLock` et non `Mutex` : les lectures peuvent se faire en parallele.
 ///
 /// Le `Mutex` donnait une exclusivite que les lectures ne peuvent PAS utiliser
@@ -41,6 +48,24 @@ impl ServiceRegistry {
     pub fn register(&mut self, service: Box<dyn StreamingService>) {
         let name = service.name().to_string();
         self.services.insert(name, Arc::new(RwLock::new(service)));
+    }
+
+    /// Refuse the whole batch before mutating the registry on any collision.
+    pub fn register_plugins(&mut self, services: Vec<ServiceRegistration>) -> Result<(), String> {
+        let mut names: std::collections::HashSet<_> = self.services.keys().cloned().collect();
+        for registration in &services {
+            if !names.insert(registration.name.clone()) {
+                return Err(format!(
+                    "streaming service already registered: {}",
+                    registration.name
+                ));
+            }
+        }
+        for registration in services {
+            self.services
+                .insert(registration.name, registration.service);
+        }
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<RwLock<Box<dyn StreamingService>>>> {
@@ -143,8 +168,15 @@ impl ServiceRegistry {
     }
 
     pub async fn restore_all_tokens(&self, db: &Arc<dyn DbBackend>) {
+        self.restore_tokens_for(&self.list(), db).await;
+    }
+
+    pub async fn restore_tokens_for(&self, names: &[String], db: &Arc<dyn DbBackend>) {
         let settings = SettingsRepo::with_backend(db.clone());
         for (name, svc) in &self.services {
+            if !names.contains(name) {
+                continue;
+            }
             // Restore enabled/disabled state
             let enabled_key = format!("streaming_{name}_enabled");
             if let Some(val) = settings.get(&enabled_key).ok().flatten() {

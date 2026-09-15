@@ -1506,10 +1506,13 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
     // Rien nulle part ne la lui disait : ni les docs, ni une locale du client.
     // Elle est publiee ici, resolue par la MEME fonction que celle qui
     // construit le service, pour qu'on ne puisse pas en afficher une autre.
-    let spotify_redirect_uri = tune_core::streaming::spotify::effective_redirect_uri(
+    #[cfg(feature = "spotify")]
+    let spotify_redirect_uri = tune_spotify::spotify::effective_redirect_uri(
         state.config.spotify_redirect_uri.as_deref(),
         state.port,
     );
+    #[cfg(not(feature = "spotify"))]
+    let spotify_redirect_uri: Option<String> = None;
     Json(json!({
         "TUNE_PORT": state.port.to_string(),
         "TUNE_DB_PATH": state.db.as_ref().map(|_| state.config.db_path.clone()),

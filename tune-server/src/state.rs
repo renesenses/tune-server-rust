@@ -17,7 +17,6 @@ use tune_core::orchestrator::PlaybackOrchestrator;
 use tune_core::outputs::OutputRegistry;
 use tune_core::playback::PlaybackManager;
 use tune_core::streaming::ServiceRegistry;
-use tune_core::streaming::spotify_connect::SpotifyConnectManager;
 use tune_core::upnp_server::UpnpState;
 
 use crate::config::TuneConfig;
@@ -78,7 +77,6 @@ pub struct AppState {
         Arc<Mutex<HashMap<String, oneshot::Sender<tune_core::outputs::bridge::BridgeResponse>>>>,
     pub health_monitor: Arc<AdvancedHealthMonitor>,
     pub suggestion_store: Arc<SuggestionStore>,
-    pub spotify_connect: Arc<SpotifyConnectManager>,
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
@@ -347,14 +345,6 @@ impl AppState {
         );
         qobuz.set_proxy_first(qobuz_proxy_first);
         services.register(Box::new(qobuz));
-        services.register(tune_core::streaming::configured_spotify(
-            tune_config.spotify_client_id.as_deref(),
-            tune_config.spotify_redirect_uri.as_deref(),
-            // Le port REELLEMENT ecoute (`bootstrap.rs` lie `config.port`),
-            // pas le defaut de la caisse : l'URI de redirection envoyee a
-            // Spotify doit nommer un port ou Tune repond (#2680).
-            port,
-        ));
         services.register(Box::new(tune_core::streaming::deezer::DeezerService::new()));
         services.register(Box::new(
             tune_core::streaming::youtube::YouTubeService::new(),
@@ -410,8 +400,6 @@ impl AppState {
         let suggestion_store = Arc::new(SuggestionStore::with_backend(backend.clone()));
         suggestion_store.setup_table().ok();
 
-        let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
-
         let http_client = tune_core::http::client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
@@ -451,7 +439,6 @@ impl AppState {
             bridge_responses: Arc::new(Mutex::new(HashMap::new())),
             health_monitor,
             suggestion_store,
-            spotify_connect,
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_phase: Arc::new(std::sync::Mutex::new(None)),

@@ -4,11 +4,6 @@ use super::{
     engine::SpotifyNativeService as Engine,
     ipc::{self, ChildProcess, Failure, Operation},
 };
-use crate::{
-    http::streamer::{AudioStreamer, StreamInfo},
-    orchestrator::{PlayRequest, ResolvedStream},
-    streaming::traits::*,
-};
 use librespot_playback::{
     NUM_CHANNELS, SAMPLE_RATE,
     audio_backend::{Sink, SinkError, SinkResult},
@@ -25,6 +20,11 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::{io::AsyncReadExt, sync::oneshot};
+use tune_core::{
+    http::streamer::{AudioStreamer, StreamInfo},
+    orchestrator::{PlayRequest, ResolvedStream},
+    streaming::traits::*,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PcmFormat {

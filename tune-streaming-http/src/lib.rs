@@ -17,8 +17,9 @@ use tune_core::favorites_sort::TriFavoris;
 use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
+#[cfg(test)]
+mod auth_contract_tests;
 pub mod deezer_proxy_handler;
-mod spotify_pairing;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -289,6 +290,11 @@ fn purge_contenu_utilisateur(service: &str) {
     cache.retain(|(svc, _), _| svc != service);
 }
 
+/// Called after a provider-owned authentication callback succeeds.
+pub fn invalidate_user_content(service: &str) {
+    purge_contenu_utilisateur(service);
+}
+
 /// Reduce boilerplate for read-only handlers: get_svc + lock + call + respond.
 macro_rules! with_svc {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
@@ -438,10 +444,7 @@ where
         .route("/youtube/charts", get(youtube_charts))
         .route("/youtube/moods", get(youtube_moods))
         .route("/youtube/library", get(youtube_library))
-        .route("/spotify/callback", get(spotify_callback))
         .route("/{service}/playlist-library", get(service_playlist_library))
-        .route("/spotify/native-pairing", get(spotify_pairing::page))
-        .route("/spotify/native-pairing.js", get(spotify_pairing::script))
         .route("/tidal/callback", get(tidal_callback))
 }
 
@@ -1325,46 +1328,6 @@ async fn youtube_moods() -> Json<Value> {
 
 async fn youtube_library() -> Json<Value> {
     Json(json!({"playlists": [], "albums": [], "artists": []}))
-}
-
-#[derive(Deserialize)]
-struct SpotifyCallbackQuery {
-    code: Option<String>,
-    state: Option<String>,
-    error: Option<String>,
-}
-
-async fn spotify_callback(
-    State(state): State<StreamingHttpState>,
-    Query(q): Query<SpotifyCallbackQuery>,
-) -> Response {
-    if let Some(ref error) = q.error {
-        return Json(json!({"error": error})).into_response();
-    }
-    let Some(code) = q.code else {
-        return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
-    };
-    let svc = match get_svc(&state, "spotify").await {
-        Ok(s) => s,
-        Err(e) => return e.into_response(),
-    };
-    let mut svc = svc.write().await;
-    match svc
-        .authenticate(&json!({"code": code, "state": q.state}))
-        .await
-    {
-        Ok(status) => {
-            drop(svc);
-            state.save_tokens().await;
-            purge_contenu_utilisateur("spotify");
-            Json(json!({
-                "authenticated": status.authenticated,
-                "username": status.username,
-            }))
-            .into_response()
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
-    }
 }
 
 #[derive(Deserialize)]

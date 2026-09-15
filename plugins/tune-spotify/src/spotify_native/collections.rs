@@ -4,7 +4,7 @@ use librespot_metadata::{Metadata, Playlist};
 use protobuf::Message;
 
 use super::{bounded, catalog, unsupported};
-use crate::TuneError;
+use tune_core::TuneError;
 
 type PlaylistPage = <Playlist as Metadata>::Message;
 const PAGE_SIZE: usize = 100;

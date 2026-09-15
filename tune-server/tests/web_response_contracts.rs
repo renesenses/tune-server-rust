@@ -228,6 +228,7 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
     // n'existe plus. Le comportement de #2119 (distinguer « aucune station de
     // ce nom » d'une panne) reste gardé par `tests/radios_recherche_distinction.rs`,
     // qui joue la route sans passer par la carte — aucune couverture perdue.
+    #[cfg(feature = "spotify")]
     ("/spotify-connect/status", "/api/v1/spotify-connect/status"),
     (
         "/streaming/youtube/auth/status",
@@ -267,7 +268,11 @@ async fn trente_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
     zones
         .create("Zone du contrat", Some("browser"), Some("browser-contract"))
         .expect("zone temoin pour prouver le contrat de liste");
-    let app = tune_server::routes::router(etat);
+    let dir = tempfile::tempdir().unwrap();
+    *etat.plugins.lock().await =
+        tune_core::plugin_sdk::PluginLoader::new(dir.path().into()).with_db(etat.backend.clone());
+    let routers = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
+    let app = tune_server::routes::router_with_plugins(etat, routers);
 
     for (route_contrat, chemin_reel) in VAGUE_INITIALE {
         let payload = get_json(&app, chemin_reel)
@@ -285,11 +290,16 @@ async fn trente_reponses_reelles_respectent_les_champs_exiges_par_le_web() {
 }
 
 #[tokio::test]
+#[cfg(feature = "spotify")]
 async fn desactiver_spotify_connect_rend_le_statut_complet_annonce_au_web() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
-    let app = tune_server::routes::router(etat);
+    let dir = tempfile::tempdir().unwrap();
+    *etat.plugins.lock().await =
+        tune_core::plugin_sdk::PluginLoader::new(dir.path().into()).with_db(etat.backend.clone());
+    let routers = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
+    let app = tune_server::routes::router_with_plugins(etat, routers);
     let payload = post_json(&app, "/api/v1/spotify-connect/disable")
         .await
         .expect("reponse disable Spotify Connect");
@@ -862,7 +872,11 @@ async fn la_carte_web_ne_cite_que_des_routes_encore_servies() {
     let carte: CarteContrats = serde_json::from_str(CARTE_WEB).expect("carte contrat web");
     let etat = tune_server::state::AppState::new(":memory:", 0, Default::default())
         .expect("etat serveur isole");
-    let app = tune_server::routes::router(etat);
+    let dir = tempfile::tempdir().unwrap();
+    *etat.plugins.lock().await =
+        tune_core::plugin_sdk::PluginLoader::new(dir.path().into()).with_db(etat.backend.clone());
+    let routers = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
+    let app = tune_server::routes::router_with_plugins(etat, routers);
 
     // ── D'abord éprouver la SONDE, sinon la garde ne prouve rien ──
     //
@@ -900,6 +914,14 @@ async fn la_carte_web_ne_cite_que_des_routes_encore_servies() {
         let Some(chemin) = chemin_de_sonde(&contrat.route) else {
             continue;
         };
+        if contrat.route.starts_with("/spotify-connect/") && !cfg!(feature = "spotify") {
+            assert_eq!(
+                statut_de_sonde(&app, &chemin).await,
+                StatusCode::NOT_FOUND,
+                "a build without Spotify must not retain its compatibility routes"
+            );
+            continue;
+        }
         if !deja_sondes.insert(chemin.clone()) {
             continue;
         }

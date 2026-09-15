@@ -75,7 +75,6 @@ pub mod snapcast;
 pub mod social;
 pub mod sonos;
 pub mod soundcloud;
-pub mod spotify_connect;
 pub mod squeezebox;
 // Le transport HTTP des flux ne depend d'aucun etat propre au serveur. Il vit
 // dans une branche soeur du graphe de compilation, tout en gardant le chemin
@@ -350,7 +349,6 @@ pub fn router_with_plugins(
         .nest("/snapcast", snapcast::router())
         .nest("/sonos", sonos::router())
         .nest("/squeezebox", squeezebox::router())
-        .nest("/spotify-connect", spotify_connect::router())
         .nest("/listenbrainz", listenbrainz::router())
         .nest("/scrobbler", scrobbler::router())
         .nest("/soundcloud", soundcloud::router())
@@ -443,6 +441,16 @@ pub fn router_with_plugins(
     let api = plugin_routers
         .into_iter()
         .fold(api, |api, (plugin_name, plugin_router)| {
+            // Host-owned compatibility alias; no provider implementation here.
+            // Disabled/absent plugin means neither route namespace is mounted.
+            let api = if plugin_name == "spotify" {
+                api.nest_service("/spotify-connect", plugin_router.clone())
+                    .route_service("/streaming/spotify/callback", plugin_router.clone())
+                    .route_service("/streaming/spotify/native-pairing", plugin_router.clone())
+                    .route_service("/streaming/spotify/native-pairing.js", plugin_router.clone())
+            } else {
+                api
+            };
             let mount = format!("/ext/{plugin_name}");
             tracing::info!(plugin = %plugin_name, mount = %format!("/api/v1{mount}"), "plugin_routes_mounted");
             api.nest_service(&mount, plugin_router)

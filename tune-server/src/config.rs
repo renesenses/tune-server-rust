@@ -973,10 +973,11 @@ mod port_documente_guard {
     /// Le defaut Spotify DERIVE de ce meme port : les deux ne peuvent plus
     /// diverger en silence.
     #[test]
+    #[cfg(feature = "spotify")]
     fn l_uri_spotify_par_defaut_nomme_ce_port() {
         let port = TuneConfig::default().port;
         assert_eq!(
-            tune_core::streaming::spotify::default_redirect_uri(port),
+            tune_spotify::spotify::default_redirect_uri(port),
             format!("http://127.0.0.1:{port}/api/v1/streaming/spotify/callback")
         );
     }

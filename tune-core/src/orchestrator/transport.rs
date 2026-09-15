@@ -2345,12 +2345,9 @@ impl PlaybackOrchestrator {
                 position_ms = (np.duration_ms as u64).saturating_sub(1000);
             }
         }
-        #[cfg(feature = "spotify-native")]
         let restarted = self
-            .seek_spotify_native(zone_id, position_ms, &state)
+            .seek_private_audio(zone_id, position_ms, &state)
             .await?;
-        #[cfg(not(feature = "spotify-native"))]
-        let restarted = false;
         if !restarted && let Some(did) = device_id {
             self.deplacer_la_sortie(zone_id, did, position_ms, &state, seek_start)
                 .await?;
@@ -2377,33 +2374,24 @@ impl PlaybackOrchestrator {
 
     /// Browser zones have no output device. They need the same new decoder as
     /// device outputs: a state-only seek falsely acknowledged a silent no-op.
-    #[cfg(feature = "spotify-native")]
-    async fn seek_spotify_native(
+    async fn seek_private_audio(
         &self,
         zone_id: i64,
         position_ms: u64,
         state: &crate::playback::ZoneState,
     ) -> OutputCommandResult<bool> {
-        if state
-            .now_playing
-            .as_ref()
-            .is_some_and(|np| np.source == "spotify")
-        {
-            let service = { self.services.lock().await.get("spotify") };
+        if let Some(np) = state.now_playing.as_ref() {
+            let service = { self.services.lock().await.get(&np.source) };
             let native = if let Some(service) = service {
-                service
-                    .read()
-                    .await
-                    .as_any()
-                    .is::<crate::streaming::spotify_native::SpotifyNativeService>()
+                service.read().await.private_audio()
             } else {
                 false
             };
             if native {
-                // A Spotify PCM pipe cannot seek by HTTP Range or SOAP. Decode
+                // A private PCM pipe cannot seek by HTTP Range or SOAP. Decode
                 // a new stream at the requested offset; no second renderer seek.
                 if let Err(error) = self
-                    .replay_zone_at_position(zone_id, position_ms, "spotify_native_seek")
+                    .replay_zone_at_position(zone_id, position_ms, "private_audio_seek")
                     .await
                 {
                     self.playback.seek(zone_id, state.position_ms).await;

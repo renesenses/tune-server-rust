@@ -13,8 +13,8 @@ use librespot_core::{Session, authentication::Credentials, config::SessionConfig
 use librespot_discovery::Discovery;
 use tokio::sync::oneshot;
 
-use crate::TuneError;
-use crate::streaming::traits::*;
+use tune_core::TuneError;
+use tune_core::streaming::traits::*;
 
 pub const PAIRING_SECONDS: u64 = 180;
 const TOKEN_KIND: &str = "librespot-pairing-v1";
@@ -587,16 +587,16 @@ mod tests {
         assert_eq!(service.credential_key(), "auth_tokens_spotify_native");
         assert_ne!(
             service.credential_key(),
-            crate::streaming::spotify::SpotifyService::new().credential_key()
+            crate::spotify::SpotifyService::new().credential_key()
         );
     }
 
     #[tokio::test]
     async fn native_registry_save_and_logout_preserve_existing_web_credentials() {
-        use crate::db::{backend::DbBackend, settings_repo::SettingsRepo, sqlite::SqliteDb};
+        use tune_core::db::{backend::DbBackend, settings_repo::SettingsRepo, sqlite::SqliteDb};
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
-        crate::db::migrations::run_migrations(&db).unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
         let db: Arc<dyn DbBackend> = Arc::new(db);
         let settings = SettingsRepo::with_backend(db.clone());
         settings
@@ -610,7 +610,7 @@ mod tests {
             "device_id": uuid::Uuid::new_v4().to_string(),
             "credentials": Credentials::with_access_token("native-fixture"),
         })));
-        let mut registry = crate::streaming::ServiceRegistry::new();
+        let mut registry = tune_core::streaming::ServiceRegistry::new();
         registry.register(Box::new(service));
         registry.save_all_tokens(&db).await;
         assert_eq!(

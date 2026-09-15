@@ -15,7 +15,7 @@ use librespot_protocol::{
 use protobuf::{EnumOrUnknown, Message};
 
 use super::{bounded, catalog, collections::MAX_TRACKS, unsupported};
-use crate::{
+use tune_core::{
     TuneError,
     streaming::{StreamAlbum, StreamArtist, StreamTrack},
 };

@@ -3,8 +3,8 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 
-use super::traits::*;
-use crate::TuneError;
+use tune_core::TuneError;
+use tune_core::streaming::traits::*;
 
 const AUTH_URL: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_URL: &str = "https://accounts.spotify.com/api/token";
@@ -116,7 +116,7 @@ impl SpotifyService {
             });
         let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
         Self {
-            client: crate::http::client::builder()
+            client: tune_core::http::client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),

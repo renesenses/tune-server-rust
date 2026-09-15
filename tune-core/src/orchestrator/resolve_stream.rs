@@ -148,23 +148,19 @@ impl PlaybackOrchestrator {
             .as_deref()
             .ok_or("source_id required for streaming")?;
 
-        #[cfg(feature = "spotify-native")]
-        if service_name == "spotify" {
+        {
             let service = { self.services.lock().await.get(service_name) };
             if let Some(service) = service {
                 let service = service.read().await;
-                if let Some(native) = service
-                    .as_any()
-                    .downcast_ref::<crate::streaming::spotify_native::SpotifyNativeService>(
-                ) {
+                if service.private_audio() {
                     if self
                         .load_streaming_dsp(req.zone_id, req.track_id, 44100, 2)
                         .is_active()
                     {
-                        return Err("Spotify native prototype does not apply zone DSP; use a zone without active DSP".into());
+                        return Err("Private audio service does not apply zone DSP; use a zone without active DSP".into());
                     }
-                    return native
-                        .resolve_audio(self.streamer.clone(), &self.server_ip(), req)
+                    return service
+                        .resolve_private_audio(self.streamer.clone(), &self.server_ip(), req)
                         .await;
                 }
             }

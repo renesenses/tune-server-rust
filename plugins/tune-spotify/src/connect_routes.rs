@@ -9,18 +9,45 @@ use tracing::info;
 
 use tune_core::db::settings_repo::SettingsRepo;
 
-use crate::state::AppState;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-pub fn router() -> Router<AppState> {
+#[derive(Clone)]
+pub(crate) struct SpotifyHttpState {
+    pub backend: Arc<dyn tune_core::db::backend::DbBackend>,
+    pub services: Arc<Mutex<tune_core::streaming::ServiceRegistry>>,
+    pub http_client: reqwest::Client,
+    pub spotify_connect: Arc<crate::spotify_connect::SpotifyConnectManager>,
+    pub invalidate_content: fn(&str),
+}
+
+pub fn router() -> Router<SpotifyHttpState> {
     Router::new()
         .route("/status", get(connect_status))
         .route("/enable", post(enable_connect))
         .route("/disable", post(disable_connect))
         .route("/devices", get(list_connect_devices))
         .route("/transfer", post(transfer_playback))
+        .route("/native-pairing", get(crate::spotify_pairing::page))
+        .route("/native-pairing.js", get(crate::spotify_pairing::script))
+        .route("/callback", get(crate::spotify_pairing::callback))
+        // Exact legacy aliases forwarded by the host without shadowing its
+        // generic /streaming/{service}/status or /auth routes.
+        .route(
+            "/streaming/spotify/native-pairing",
+            get(crate::spotify_pairing::page),
+        )
+        .route(
+            "/streaming/spotify/native-pairing.js",
+            get(crate::spotify_pairing::script),
+        )
+        .route(
+            "/streaming/spotify/callback",
+            get(crate::spotify_pairing::callback),
+        )
 }
 
-async fn spotify_token(state: &AppState) -> Option<String> {
+async fn spotify_token(state: &SpotifyHttpState) -> Option<String> {
     let registry = state.services.lock().await;
     let svc = registry.get("spotify")?;
     drop(registry);
@@ -29,7 +56,7 @@ async fn spotify_token(state: &AppState) -> Option<String> {
     tokens.get("access_token")?.as_str().map(Into::into)
 }
 
-async fn connect_status(State(state): State<AppState>) -> Json<Value> {
+async fn connect_status(State(state): State<SpotifyHttpState>) -> Json<Value> {
     Json(state.spotify_connect.status().await)
 }
 
@@ -40,7 +67,7 @@ struct EnableBody {
 }
 
 async fn enable_connect(
-    State(state): State<AppState>,
+    State(state): State<SpotifyHttpState>,
     Json(body): Json<EnableBody>,
 ) -> Json<Value> {
     let zone_id = body.zone_id.unwrap_or(1);
@@ -66,7 +93,7 @@ async fn enable_connect(
     Json(state.spotify_connect.status().await)
 }
 
-async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
+async fn disable_connect(State(state): State<SpotifyHttpState>) -> Json<Value> {
     state.spotify_connect.disable().await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -75,7 +102,7 @@ async fn disable_connect(State(state): State<AppState>) -> Json<Value> {
     Json(state.spotify_connect.status().await)
 }
 
-async fn list_connect_devices(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_connect_devices(State(state): State<SpotifyHttpState>) -> impl IntoResponse {
     let Some(token) = spotify_token(&state).await else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -109,7 +136,7 @@ struct TransferBody {
 }
 
 async fn transfer_playback(
-    State(state): State<AppState>,
+    State(state): State<SpotifyHttpState>,
     Json(body): Json<TransferBody>,
 ) -> impl IntoResponse {
     let Some(token) = spotify_token(&state).await else {
@@ -148,7 +175,7 @@ async fn transfer_playback(
     }
 }
 
-pub async fn auto_start(state: &AppState) {
+pub async fn auto_start(state: &SpotifyHttpState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("spotify_connect_enabled")
@@ -166,7 +193,7 @@ pub async fn auto_start(state: &AppState) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
 
-    if !tune_core::streaming::spotify_connect::binary_available() {
+    if !crate::spotify_connect::binary_available() {
         info!("spotify_connect_auto_start_skipped: librespot not found");
         return;
     }

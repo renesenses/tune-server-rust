@@ -5,7 +5,7 @@ use librespot_core::{Session, SpotifyUri};
 use serde::{Deserialize, Serialize};
 
 use super::{bounded, catalog, unsupported};
-use crate::TuneError;
+use tune_core::TuneError;
 
 const PAGE_SIZE: usize = 100;
 const MAX_PAGES: usize = 100;

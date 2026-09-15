@@ -5,9 +5,15 @@ edition.workspace = true
 license.workspace = true
 autotests = false
 
+[[test]]
+name = "spotify_plugin"
+path = "tests/spotify_plugin.rs"
+required-features = ["spotify"]
+
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp"]
-spotify-native = ["tune-core/spotify-native"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "spotify"]
+spotify = ["dep:tune-spotify"]
+spotify-native = ["spotify", "tune-spotify/native"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]
@@ -52,6 +58,7 @@ bandcamp = ["dep:tune-bandcamp"]
 concerts = ["dep:tune-concerts"]
 
 [dependencies]
+tune-spotify = { path = "../plugins/tune-spotify", optional = true }
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-http-types = { path = "../tune-http-types" }

@@ -33,7 +33,7 @@ impl RangeSource {
     }
 
     fn open_checked_url(url: reqwest::Url) -> Result<Self, String> {
-        let client = crate::http::client::blocking_builder()
+        let client = tune_core::http::client::blocking_builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(20))

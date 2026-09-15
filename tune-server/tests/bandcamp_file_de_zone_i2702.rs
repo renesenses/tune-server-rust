@@ -130,17 +130,22 @@ async fn bandcamp_est_inscrit_au_registre_des_services() {
 #[tokio::test]
 async fn les_services_deja_inscrits_ne_changent_pas() {
     let etat = etat();
+    let dir = tempfile::tempdir().unwrap();
+    *etat.plugins.lock().await =
+        tune_core::plugin_sdk::PluginLoader::new(dir.path().into()).with_db(etat.backend.clone());
+    tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
     let registre = etat.services.lock().await;
-    for nom in ["tidal", "qobuz", "spotify", "deezer", "youtube"] {
+    for nom in ["tidal", "qobuz", "deezer", "youtube"] {
         assert!(
             registre.get(nom).is_some(),
             "{nom} doit rester inscrit — inscrits : {:?}",
             registre.list()
         );
     }
+    assert_eq!(registre.get("spotify").is_some(), cfg!(feature = "spotify"));
     assert_eq!(
         registre.list().len(),
-        6,
+        5 + usize::from(cfg!(feature = "spotify")),
         "cinq services d'origine plus Bandcamp, et rien d'autre : {:?}",
         registre.list()
     );

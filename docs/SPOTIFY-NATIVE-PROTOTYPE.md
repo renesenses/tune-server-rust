@@ -4,6 +4,11 @@ Arbitrage JP : essayer sans application développeur ni Client ID à saisir.
 Base : `main` 24123a4e (v0.9.150). Aucun changement de version, aucun déploiement
 automatique. Le service existant reste celui des compilations ordinaires.
 
+Depuis l'extraction du 2026-09-15, l'implémentation et ses tests vivent dans
+`plugins/tune-spotify` ([frontière du plugin](plugins/SPOTIFY-NATIVE-EXTRACTION.md)).
+Les comptes rendus datés ci-dessous conservent le nom de leur crate historique ;
+les commandes réexécutables emploient maintenant `tune-spotify/native`.
+
 ## Isolation et limites de sécurité
 
 **Instance de test séparée, base séparée, compte Premium uniquement.**
@@ -131,11 +136,10 @@ par groupe et partagés, la limite globale et l'annulation des quatre requêtes.
 Le témoin HTTP contraste le mode auto-géré natif avec la reprise OAuth
 historique et vérifie qu'un refus ne devient pas un résultat vide en cache.
 
-Contre-épreuves compilées, tests inchangés, sept rouges attendus. Commande
-native : `cargo test --locked -p tune-core --lib --no-default-features
---features oaat,spotify-native <témoin>`. Commande HTTP :
-`cargo test --locked -p tune-streaming-http --features
-tune-core/spotify-native,tune-core/oaat <témoin>`.
+Contre-épreuves compilées, tests inchangés, sept rouges attendus. Depuis
+l'extraction en plugin, commande native : `cargo test --locked -p tune-spotify
+--lib --features native <témoin>`. Commande HTTP :
+`cargo test --locked -p tune-streaming-http --features tune-core/oaat <témoin>`.
 
 - Une seule tentative :
   `native_metadata_retries_only_the_failed_batch_and_preserves_all_positions`
@@ -378,10 +382,9 @@ Utiliser Shrek selon `AGENTS.md` avec une clé propre à l'unité, préflight
 charge/espace/AOSP, puis purge. Ne pas compiler en parallèle sur la même clé.
 
 ```sh
-cargo test -p tune-core --locked --lib --no-default-features \
-  --features oaat,spotify-native spotify_native
+cargo test -p tune-spotify --locked --lib --features native spotify_native
 cargo test -p tune-streaming-http --locked \
-  --features tune-core/spotify-native,tune-core/oaat
+  --features tune-core/oaat
 cargo build -p tune-server --locked --no-default-features \
   --features oaat,spotify-native
 ```
@@ -661,9 +664,9 @@ inchangés, restauration par copie puis suites vertes :
 - bloc d'avertissement masqué dans le vrai widget monté : deux tests échouent,
   dont `Une bibliothèque partielle doit annoncer les playlists indisponibles`.
 
-Commandes Rust : `cargo test -p tune-core --locked --lib --no-default-features
---features oaat,spotify-native spotify_native` et `cargo test -p
-tune-streaming-http --locked --features tune-core/spotify-native,tune-core/oaat`.
+Commandes Rust actuelles : `cargo test -p tune-spotify --locked --lib
+--features native spotify_native` et `cargo test -p
+tune-streaming-http --locked --features tune-core/oaat`.
 Pour les contre-épreuves, le filtre est remplacé par le nom du témoin ci-dessus.
 
 Essai réel du binaire Mac arm64 (SHA-256
@@ -796,12 +799,11 @@ est vert avec la clé séparée. Remplacer **uniquement le code** de
 Le témoin utilise désormais le proxy public enregistré par Tune. La clé
 séparée est ensuite restaurée avant la validation finale.
 
-Commande de contre-épreuve :
+Commande de contre-épreuve actuelle, après extraction :
 
 ```sh
-cargo test -p tune-core --locked --lib --no-default-features \
-  --features oaat,spotify-native \
-  streaming::spotify_native::engine::tests::native_registry_save_and_logout_preserve_existing_web_credentials \
+cargo test -p tune-spotify --locked --lib --features native \
+  spotify_native::engine::tests::native_registry_save_and_logout_preserve_existing_web_credentials \
   -- --exact
 ```
 

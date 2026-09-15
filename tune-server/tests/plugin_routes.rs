@@ -21,7 +21,13 @@ use tune_server::state::AppState;
 const SECRET: &str = "test-jwt-secret";
 
 fn new_state() -> AppState {
-    AppState::new(":memory:", 0, Default::default()).unwrap()
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // These witnesses isolate synthetic plugins; Spotify has its own real
+    // lifecycle/route tests in spotify_plugin.rs.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_spotify_enabled", "false")
+        .unwrap();
+    state
 }
 
 /// A plugin router with a plain route and one whose path deliberately collides

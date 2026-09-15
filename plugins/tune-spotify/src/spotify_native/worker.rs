@@ -3,17 +3,13 @@ use super::{
     engine::SpotifyNativeService as Engine,
     ipc::{self, Failure, Operation, Reply},
 };
-use crate::{TuneError, streaming::traits::*};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tune_core::{TuneError, streaming::traits::*};
 
 /// Called by every server/composer bootstrap. Never starts the Tune service in
 /// a worker; all secrets are read from inherited anonymous pipes, not argv.
-pub async fn run_worker_if_requested() {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("--spotify-native-worker") {
-        return;
-    }
+pub async fn worker_main(args: Vec<String>) -> i32 {
     initialize_tls();
     let result = match args.as_slice() {
         [_, mode] if mode == "control" => control().await,
@@ -22,7 +18,7 @@ pub async fn run_worker_if_requested() {
     };
     // Only the child reaches this branch. In particular, librespot exit(1)
     // and a broken PCM pipe have no path to the parent's process::exit.
-    std::process::exit(if result.is_ok() { 0 } else { 1 });
+    if result.is_ok() { 0 } else { 1 }
 }
 
 pub(super) fn initialize_tls() {

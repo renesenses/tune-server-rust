@@ -1,9 +1,9 @@
 //! Read the paired account's liked-tracks context, without Web API credentials.
 use super::{bounded, catalog, collections::MAX_TRACKS, unsupported};
-use crate::TuneError;
 use librespot_core::{Session, SpotifyUri};
 use librespot_protocol::{context::Context, context_page::ContextPage};
 use std::collections::{HashSet, VecDeque};
+use tune_core::TuneError;
 
 fn page_url(url: &str) -> Result<&str, TuneError> {
     // A continuation is not permission to fetch an arbitrary URL with tokens.

@@ -460,14 +460,19 @@ async fn playlist_crud() {
 
 #[tokio::test]
 async fn streaming_services_list() {
-    let app = make_app();
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    *state.plugins.lock().await =
+        tune_core::plugin_sdk::PluginLoader::new(dir.path().into()).with_db(state.backend.clone());
+    let routers = tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+    let app = tune_server::routes::router_with_plugins(state, routers);
     let (status, body) = get(&app, "/api/v1/streaming/services").await;
     assert_eq!(status, StatusCode::OK);
     let services = body.as_object().unwrap();
-    assert!(services.len() >= 5);
+    assert!(services.len() >= 4);
     assert!(services.contains_key("tidal"));
     assert!(services.contains_key("qobuz"));
-    assert!(services.contains_key("spotify"));
+    assert_eq!(services.contains_key("spotify"), cfg!(feature = "spotify"));
 }
 
 #[tokio::test]

@@ -10,6 +10,8 @@ use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 use crate::event_bus::{EventBus, TuneEvent};
 use crate::outputs::traits::{OutputProvider, OutputTarget};
+use crate::streaming::StreamingService;
+use crate::streaming::registry::{ServiceHandle, ServiceRegistration};
 
 /// The plugin ABI generation. A plugin declares the version it was built
 /// against via [`TunePlugin::protocol_version`]; [`PluginLoader::setup_all`]
@@ -20,7 +22,10 @@ use crate::outputs::traits::{OutputProvider, OutputTarget};
 /// The Python host had the same constant (`PROTOCOL_VERSION`) but only
 /// *warned* on mismatch — here it is enforced, because a Rust plugin that
 /// disagrees about the trait layout is a crash, not a degraded feature.
-pub const PLUGIN_PROTOCOL_VERSION: (u32, u32) = (1, 0);
+pub const PLUGIN_PROTOCOL_VERSION: (u32, u32) = (1, 1);
+
+#[cfg(test)]
+mod streaming_tests;
 
 /// A zone a plugin wants the host to create on its behalf.
 ///
@@ -44,6 +49,7 @@ pub struct ZoneRequest {
 /// once, at a point where it knows the registry and router are free.
 #[derive(Default)]
 pub struct PluginRegistrations {
+    pub streaming_services: Vec<ServiceRegistration>,
     pub outputs: Vec<Box<dyn OutputTarget>>,
     /// Providers that DISCOVER outputs, as opposed to `outputs`, which are
     /// fixed instances known at `setup` time. The host hands these to
@@ -60,6 +66,9 @@ pub struct PluginRegistrations {
 
 impl PluginRegistrations {
     pub fn is_empty(&self) -> bool {
+        if !self.streaming_services.is_empty() {
+            return false;
+        }
         #[cfg(feature = "plugin-http")]
         if !self.routers.is_empty() {
             return false;
@@ -68,6 +77,7 @@ impl PluginRegistrations {
     }
 
     fn absorb(&mut self, other: PluginRegistrations) {
+        self.streaming_services.extend(other.streaming_services);
         self.outputs.extend(other.outputs);
         self.output_providers.extend(other.output_providers);
         #[cfg(feature = "plugin-http")]
@@ -201,6 +211,28 @@ impl PluginContext {
             Ok(mut reg) => reg.outputs.push(output),
             Err(_) => self.warn_registration_lost("output"),
         }
+    }
+
+    /// Deferred until successful setup. The handle lets teardown stop workers
+    /// without logging out or erasing credentials.
+    pub fn register_streaming_service(
+        &self,
+        service: Box<dyn StreamingService>,
+    ) -> Result<ServiceHandle, String> {
+        let name = service.name().to_owned();
+        if name.is_empty() {
+            return Err("streaming service name is empty".into());
+        }
+        let handle = Arc::new(tokio::sync::RwLock::new(service));
+        self.registrations
+            .lock()
+            .map_err(|_| "streaming registrations poisoned")?
+            .streaming_services
+            .push(ServiceRegistration {
+                name,
+                service: handle.clone(),
+            });
+        Ok(handle)
     }
 
     /// Expose a provider that DISCOVERS outputs, instead of a fixed instance.
@@ -375,6 +407,7 @@ pub trait TunePlugin: Send + Sync {
 }
 
 pub struct PluginLoader {
+    reserved_streaming_services: Vec<String>,
     plugins: Arc<tokio::sync::Mutex<Vec<Box<dyn TunePlugin>>>>,
     data_root: PathBuf,
     event_bus: Option<EventBus>,
@@ -391,6 +424,7 @@ pub struct PluginLoader {
 impl PluginLoader {
     pub fn new(data_root: PathBuf) -> Self {
         Self {
+            reserved_streaming_services: Vec::new(),
             plugins: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             data_root,
             event_bus: None,
@@ -415,14 +449,27 @@ impl PluginLoader {
         self.plugins.lock().await.push(plugin);
     }
 
+    /// Existing host services cannot be shadowed by a plugin.
+    pub fn reserve_streaming_services(&mut self, names: Vec<String>) {
+        self.reserved_streaming_services = names;
+    }
+
     pub async fn setup_all(&self, api_base_url: &str) -> Vec<String> {
         let mut loaded = Vec::new();
+        let mut loaded_indices = std::collections::HashSet::new();
+        let mut plugin_names = std::collections::HashSet::new();
+        let mut claimed: std::collections::HashSet<String> =
+            self.reserved_streaming_services.iter().cloned().collect();
         let mut unloaded: Vec<AvailablePluginInfo> = Vec::new();
         std::fs::create_dir_all(&self.data_root).ok();
 
         let mut plugins = self.plugins.lock().await;
-        for plugin in plugins.iter_mut() {
+        for (index, plugin) in plugins.iter_mut().enumerate() {
             let name = plugin.name().to_string();
+            if !plugin_names.insert(name.clone()) {
+                warn!(plugin_name = %name, "plugin_name_collision");
+                continue;
+            }
 
             // Enable / install gate. A compiled-in plugin can be turned off
             // without recompiling (`plugin_{name}_enabled=false`, review #907).
@@ -504,6 +551,17 @@ impl PluginLoader {
             match plugin.setup(&ctx).await {
                 Ok(()) => {
                     let reg = ctx.take_registrations();
+                    let mut candidate = claimed.clone();
+                    if let Some(conflict) = reg
+                        .streaming_services
+                        .iter()
+                        .find(|s| !candidate.insert(s.name.clone()))
+                    {
+                        warn!(plugin_name = %name, service = %conflict.name, "plugin_streaming_service_collision");
+                        let _ = plugin.teardown().await;
+                        continue;
+                    }
+                    claimed = candidate;
                     #[cfg(feature = "plugin-http")]
                     let router_count = reg.routers.len();
                     #[cfg(not(feature = "plugin-http"))]
@@ -520,12 +578,14 @@ impl PluginLoader {
                         acc.absorb(reg);
                     }
                     loaded.push(name);
+                    loaded_indices.insert(index);
                 }
                 Err(e) => {
                     // Deliberately not draining ctx here: a plugin that failed
                     // halfway may have registered an output backed by
                     // half-initialised state. Dropping it is the safe move.
                     warn!(plugin_name = %name, error = %e, "plugin_setup_failed");
+                    let _ = plugin.teardown().await;
                 }
             }
         }
@@ -534,7 +594,14 @@ impl PluginLoader {
         // would otherwise show up as loaded in /api/v1/plugins and keep
         // receiving every event via on_event on half-built state — the very
         // hazard setup registrations are dropped for (review #907).
-        plugins.retain(|p| loaded.iter().any(|n| n == p.name()));
+        // Identity, not the name: a refused duplicate must not survive merely
+        // because another instance with that name loaded successfully.
+        let mut index = 0;
+        plugins.retain(|_| {
+            let keep = loaded_indices.contains(&index);
+            index += 1;
+            keep
+        });
 
         if let Ok(mut slot) = self.unloaded.lock() {
             *slot = unloaded;

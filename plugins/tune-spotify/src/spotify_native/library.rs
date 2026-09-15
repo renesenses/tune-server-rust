@@ -8,7 +8,7 @@ use librespot_metadata::{Metadata, Playlist};
 use protobuf::Message;
 
 use super::{bounded, catalog, unsupported};
-use crate::{
+use tune_core::{
     TuneError,
     streaming::traits::{PlaylistLibrary, StreamPlaylist, UnavailablePlaylist},
 };

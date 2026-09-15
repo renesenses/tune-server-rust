@@ -5,7 +5,7 @@ use librespot_core::{Session, SpotifyUri};
 use serde::Deserialize;
 
 use super::{bounded, catalog, unsupported};
-use crate::TuneError;
+use tune_core::TuneError;
 
 const MAX_FOLLOWING: usize = 1000;
 

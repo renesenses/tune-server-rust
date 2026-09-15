@@ -1,6 +1,5 @@
 //! Integer FLAC -> PCM, preserving the decoded source precision. No audio device.
 use super::super::audio::{AudioHeader, PcmFormat};
-use crate::streaming::StreamTrack;
 use std::io::{Read, SeekFrom, Write};
 use symphonia::core::{
     codecs::{
@@ -12,6 +11,7 @@ use symphonia::core::{
     meta::MetadataOptions,
     units::Time,
 };
+use tune_core::streaming::StreamTrack;
 
 fn streaminfo(bytes: &[u8; 42], expected_bits: u16) -> Result<(PcmFormat, u64), String> {
     if &bytes[..4] != b"fLaC" || bytes[4] & 127 != 0 || bytes[5..8] != [0, 0, 34] {
@@ -206,7 +206,7 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::encoder::AudioEncoder;
+    use tune_core::audio::encoder::AudioEncoder;
     fn fixture(bits: u16, rate: u32) -> (Vec<u8>, Vec<u8>) {
         let mut pcm = Vec::new();
         for n in 0..24002i32 {

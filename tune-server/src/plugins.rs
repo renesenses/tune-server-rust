@@ -7,7 +7,8 @@
 //! ## Loading model
 //!
 //! Plugins are compiled in, behind cargo features — there is no `libloading`
-//! and no wasm runtime. `docs/ARCHITECTURE-CIBLE-v0.9.md` is explicit that
+//! for native plugins. WASM has a separate restricted runtime.
+//! `docs/ARCHITECTURE-CIBLE-v0.9.md` is explicit that
 //! dynamic loading is a target, not the current state; adding it here would
 //! mean pinning an ABI across rustc releases, which the roadmap defers.
 //!
@@ -91,6 +92,20 @@ fn plugins_data_root() -> std::path::PathBuf {
 /// the wiring site.
 #[allow(unused_variables)]
 async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
+    #[cfg(feature = "spotify")]
+    loader
+        .register(Box::new(tune_spotify::SpotifyPlugin::new(
+            tune_spotify::HostServices {
+                backend: state.backend.clone(),
+                services: state.services.clone(),
+                http_client: state.http_client.clone(),
+                port: state.port,
+                client_id: state.config.spotify_client_id.clone(),
+                redirect_uri: state.config.spotify_redirect_uri.clone(),
+                invalidate_content: tune_streaming_http::invalidate_user_content,
+            },
+        )))
+        .await;
     // P5 (#917): DJ mode, extracted from the always-on core into a native
     // in-tree plugin. Host services are passed explicitly at construction so
     // DJ's real dependency (the DB backend) is visible here at the wiring site.
@@ -156,6 +171,18 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
 /// [`crate::bootstrap::run`].
 pub type PluginBuilder = Box<dyn FnOnce(&AppState) -> Vec<Box<dyn TunePlugin>> + Send>;
 
+/// Wiring only: implementation and flag ownership live in the plugin crate.
+pub fn builtin_workers() -> Vec<tune_core::plugin_worker::PluginWorker> {
+    #[cfg(feature = "spotify-native")]
+    {
+        vec![tune_spotify::worker_entry()]
+    }
+    #[cfg(not(feature = "spotify-native"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Set every plugin up, install what they registered, and start event
 /// dispatch. Returns the routers for [`crate::routes::router`] to mount.
 ///
@@ -168,6 +195,7 @@ pub async fn init(
     extra: Vec<Box<dyn TunePlugin>>,
 ) -> PluginRouters {
     let mut loader = state.plugins.lock().await;
+    loader.reserve_streaming_services(state.services.lock().await.list());
 
     register_builtin_plugins(&loader, state).await;
     for plugin in extra {
@@ -205,10 +233,17 @@ pub async fn init(
     // hang for as long as the slowest plugin — while holding `state.plugins`,
     // which delays shutdown too. Nothing registers after init, so one snapshot
     // serves every request with no lock at all.
-    let _ = state.plugin_info.set(loader.loaded_plugins().await);
-
     let registrations = loader.take_registrations();
-    let routers = install(state, registrations).await;
+    let routers = match install(state, registrations).await {
+        Ok(routers) => routers,
+        Err(error) => {
+            warn!(%error, "plugin_install_failed");
+            loader.teardown_all().await;
+            let _ = state.plugin_info.set(Vec::new());
+            return Vec::new();
+        }
+    };
+    let _ = state.plugin_info.set(loader.loaded_plugins().await);
 
     loader.start_event_dispatch();
     info!(plugins = ?loaded, "plugins_ready");
@@ -218,15 +253,30 @@ pub async fn init(
 
 /// Apply a drained [`PluginRegistrations`]: outputs into the registry, zones
 /// into the DB, routers handed back to the caller.
-async fn install(state: &AppState, registrations: PluginRegistrations) -> PluginRouters {
+async fn install(
+    state: &AppState,
+    registrations: PluginRegistrations,
+) -> Result<PluginRouters, String> {
     // `routers` exists unconditionally here: tune-server always enables
     // tune-core's `plugin-http` feature (see its Cargo.toml).
     let PluginRegistrations {
+        streaming_services,
         outputs,
         output_providers,
         routers,
         zones,
     } = registrations;
+
+    if !streaming_services.is_empty() {
+        let names: Vec<_> = streaming_services.iter().map(|s| s.name.clone()).collect();
+        let mut registry = state.services.lock().await;
+        if let Err(error) = registry.register_plugins(streaming_services) {
+            // Loader prevalidates ownership. Refuse a competing startup writer.
+            warn!(%error, "plugin_streaming_install_refused");
+            return Err(error);
+        }
+        registry.restore_tokens_for(&names, &state.backend).await;
+    }
 
     // Providers DISCOVER their devices, so they cannot go into the registry
     // here: there is nothing to register yet. They are handed to the same
@@ -313,7 +363,7 @@ async fn install(state: &AppState, registrations: PluginRegistrations) -> Plugin
         }
     }
 
-    routers
+    Ok(routers)
 }
 
 /// Tear every plugin down. Called on graceful shutdown, before the process

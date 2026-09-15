@@ -1,6 +1,5 @@
 //! Private anonymous pipes, bounded frames, and a reaping child supervisor.
 //! Never derive Debug for payloads: Init/Play/Reply contain credentials.
-use crate::{TuneError, streaming::AuthStatus};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::sync::{
@@ -11,6 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::watch;
+use tune_core::{TuneError, streaming::AuthStatus};
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub(super) const DEADLINE: Duration = Duration::from_secs(45);

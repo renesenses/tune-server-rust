@@ -45,6 +45,7 @@ pub mod playlist_manager;
 pub mod playlist_sync;
 pub mod playlist_transfer;
 pub mod plugin_sdk;
+pub mod plugin_worker;
 pub mod plugins;
 pub mod poller;
 pub mod prefetch;

@@ -13,17 +13,17 @@ mod metadata;
 mod saved;
 mod worker;
 
-use crate::TuneError;
-use crate::streaming::traits::*;
 use ipc::{ChildProcess, Operation, Reply};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tune_core::TuneError;
+use tune_core::streaming::traits::*;
 
 pub const PAIRING_SECONDS: u64 = 180;
 const TOKEN_KIND: &str = "librespot-pairing-v1";
-pub use worker::run_worker_if_requested;
+pub use worker::worker_main;
 
 struct Snapshot {
     status: AuthStatus,
@@ -178,6 +178,22 @@ fn unsupported(operation: &str) -> TuneError {
 
 #[async_trait::async_trait]
 impl StreamingService for SpotifyNativeService {
+    fn private_audio(&self) -> bool {
+        true
+    }
+
+    async fn resolve_private_audio(
+        &self,
+        streamer: std::sync::Arc<tune_core::http::streamer::AudioStreamer>,
+        server_ip: &str,
+        request: &tune_core::orchestrator::PlayRequest,
+    ) -> Result<tune_core::orchestrator::ResolvedStream, String> {
+        self.resolve_audio(streamer, server_ip, request).await
+    }
+
+    async fn shutdown(&mut self) {
+        self.set_enabled(false);
+    }
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

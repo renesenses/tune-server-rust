@@ -34,7 +34,7 @@ impl Prepared {
     pub(super) fn decode(
         self,
         seek_ms: u32,
-        track: crate::streaming::StreamTrack,
+        track: tune_core::streaming::StreamTrack,
         published: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), String> {
         // Only a server-listed alternative for a missing/removed CDN object.
@@ -117,7 +117,7 @@ pub(super) async fn prepare(session: &Session, id: &str, format: i32) -> Result<
         .map_err(|_| "Spotify license clock is invalid")?
         .as_secs();
     let body = protocol::license_request(&provider.token, now);
-    let client = crate::http::client::builder()
+    let client = tune_core::http::client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(15))
         .build()

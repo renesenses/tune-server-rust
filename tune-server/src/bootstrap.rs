@@ -45,6 +45,8 @@ use crate::state::AppState;
 /// d'appel qu'utilisent les binaires composeurs.
 #[derive(Default)]
 pub struct RunOptions {
+    /// Private subprocess entries supplied by out-of-tree native plugins.
+    pub workers: Vec<tune_core::plugin_worker::PluginWorker>,
     /// Appele une fois, apres construction de [`AppState`] et enregistrement
     /// des sorties locales, pour produire des greffons a enregistrer aux cotes
     /// de ceux compiles dans le binaire.
@@ -74,8 +76,16 @@ pub async fn run(build_plugins: Option<PluginBuilder>) {
 /// Comme [`run`], mais pour un binaire composeur qui apporte ses propres
 /// fournisseurs de sorties.
 pub async fn run_with(opts: RunOptions) {
-    #[cfg(feature = "spotify-native")]
-    tune_core::streaming::spotify_native::run_worker_if_requested().await;
+    let mut workers = crate::plugins::builtin_workers();
+    workers.extend(opts.workers);
+    match tune_core::plugin_worker::dispatch(&workers, std::env::args().skip(1).collect()).await {
+        Ok(Some(code)) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        Ok(None) => {}
+    }
     let build_plugins = opts.build_plugins;
     // Probe-child dispatch FIRST: when spawned as a wasm-load probe, do the
     // one dangerous thing and exit before any server state exists (#1249).
@@ -493,8 +503,6 @@ pub async fn run_with(opts: RunOptions) {
         web = %crate::config::resolve_web_dir().display(),
         "tune_server_starting"
     );
-
-    routes::spotify_connect::auto_start(&state).await;
 
     // Clone before `state` is moved into the router — used to auto-resume local
     // zones once the listener is bound (see below).

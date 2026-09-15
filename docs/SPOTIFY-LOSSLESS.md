@@ -86,15 +86,15 @@ du code natif du fournisseur.
   jusqu'à ce calcul avant de lever ce garde-fou ; ne pas déduire le codec de
   la préférence demandée. Aucune promesse de bit-perfect jusqu'au DAC/browser.
 - Pas de sélecteur de qualité dans l'interface ni d'installation automatique
-  du fournisseur. Aucune migration globale vers un plugin dans cette unité.
+  du fournisseur. L'implémentation serveur a depuis été extraite dans
+  `plugins/tune-spotify` ; voir la note d'extraction.
 
 ## Validation
 
 Suite ciblée :
 
 ```sh
-cargo test -p tune-core --lib --locked --no-default-features \
-  --features oaat,spotify-native spotify_native
+cargo test -p tune-spotify --lib --locked --features native spotify_native
 ```
 
 Les tests synthétiques couvrent protobuf malformé, qualité stricte, IPC,

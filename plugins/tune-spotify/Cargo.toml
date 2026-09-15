@@ -1,0 +1,51 @@
+[package]
+name = "tune-spotify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+native = ["dep:librespot-core", "dep:librespot-metadata", "dep:librespot-playback", "dep:librespot-discovery", "dep:librespot-protocol", "dep:protobuf", "dep:protobuf-json-mapping", "dep:aes", "dep:ctr", "dep:hex", "dep:vergen"]
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+urlencoding.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+symphonia.workspace = true
+base64 = "0.22"
+rustls = "0.23"
+libc = "0.2"
+# Experimental native Spotify source (#4166), never linked by default.
+librespot-core = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-metadata = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-playback = { version = "=0.8.0", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+librespot-discovery = { version = "=0.8.0", default-features = false, features = ["with-libmdns", "rustls-tls-webpki-roots"], optional = true }
+librespot-protocol = { version = "=0.8.0", optional = true }
+protobuf = { version = "=3.7.2", optional = true }
+protobuf-json-mapping = { version = "=3.7.2", optional = true }
+aes = { version = "0.8", optional = true }
+ctr = { version = "0.9", optional = true }
+hex = { version = "0.4", optional = true }
+
+[build-dependencies]
+# librespot 0.8.0 / vergen-gitcl 1.0.8 cannot build with vergen 9.1.0
+# (upstream #1681). Match librespot's release lockfile, including when Tune
+# is consumed as a path dependency and this workspace lockfile is ignored.
+vergen = { version = "=9.0.6", default-features = false, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
