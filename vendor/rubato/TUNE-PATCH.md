@@ -6,7 +6,10 @@ Source : https://crates.io/api/v1/crates/rubato/3.0.0/download
 SHA-256 : d4be9c88e3d722d3d36939e41941f6b6f52810c1235bf19998a7d4535b402892
 
 Copie de la version publiée, sans changement d'API ni de version. Les fichiers
-d'origine et la licence MIT sont conservés ; .cargo-ok et .github sont exclus.
+d'origine et la licence MIT sont conservés ; .cargo-ok, .github et le
+Cargo.lock de développement de la bibliothèque sont exclus. Les espaces
+finaux présents dans les fichiers amont sont conservés pour garder leur
+comparaison exacte ; les contrôles de formatage de Tune excluent ce vendor.
 
 Seul correctif source : src/sinc.rs accumule la somme de normalisation par
 sommation compensée de Kahan. La table et le traitement en flux restent f32 ;
