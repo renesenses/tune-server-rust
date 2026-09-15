@@ -46,3 +46,6 @@ mod poller_bascule;
 // — sans quoi le prochain harnais posé ici serait vert sans jamais tourner.
 #[path = "tests_orphelins.rs"]
 mod tests_orphelins;
+
+#[path = "ape_legacy_4191.rs"]
+mod ape_legacy_4191;
