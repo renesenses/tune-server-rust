@@ -3653,6 +3653,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "media_servers_durables",
         include_str!("../../migrations/postgres/058_media_servers_durables.sql"),
     ),
+    // #3716: reconcile startup and numbered migrations without narrowing data.
+    (
+        59,
+        "queue_items_types",
+        include_str!("../../migrations/postgres/059_queue_items_types.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5610,7 +5616,7 @@ mod tests {
         // (`udn`), dates en TEXT des deux cotes comme `zones.last_seen_at`
         // (95 / PG 050). Le numero libre a ete remesure DANS LE CODE, entree
         // par entree, comme la 56 et la 57 l'imposent.
-        assert_eq!(pg_latest_version(), 58, "latest PG migration must be 58");
+        assert_eq!(pg_latest_version(), 59, "latest PG migration must be 59");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
