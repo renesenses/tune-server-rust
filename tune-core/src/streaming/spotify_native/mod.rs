@@ -4,10 +4,12 @@ mod audio;
 mod catalog;
 mod collections;
 mod engine;
+mod following;
 mod ipc;
 mod library;
 mod liked;
 mod metadata;
+mod saved;
 mod worker;
 
 use crate::TuneError;
@@ -285,10 +287,10 @@ impl StreamingService for SpotifyNativeService {
         self.call(Operation::UserTracks).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        Err(unsupported("saved albums"))
+        self.call(Operation::UserAlbums).await
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
-        Err(unsupported("followed artists"))
+        self.call(Operation::UserArtists).await
     }
     fn save_tokens(&self) -> Option<Value> {
         Some(self.client.tokens())

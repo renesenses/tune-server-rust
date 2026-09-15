@@ -387,10 +387,14 @@ impl StreamingService for SpotifyNativeService {
         super::metadata::tracks(&session, uris).await
     }
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
-        Err(unsupported("saved albums"))
+        let session = self.session().await?;
+        let uris = super::saved::album_uris(&session).await?;
+        super::metadata::albums(&session, uris).await
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
-        Err(unsupported("followed artists"))
+        let session = self.session().await?;
+        let uris = super::following::artist_uris(&session).await?;
+        super::metadata::artists(&session, uris).await
     }
 
     fn save_tokens(&self) -> Option<serde_json::Value> {

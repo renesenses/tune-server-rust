@@ -64,7 +64,7 @@ pub(super) fn map_track(t: Track) -> StreamTrack {
     }
 }
 
-fn map_album(a: Album) -> StreamAlbum {
+pub(super) fn map_album(a: Album) -> StreamAlbum {
     StreamAlbum {
         id: id(&a.id),
         title: a.name.clone(),
@@ -107,12 +107,16 @@ pub(super) async fn album_tracks(
 
 pub(super) async fn artist(session: &Session, artist_id: &str) -> Result<StreamArtist, TuneError> {
     let a = bounded(Artist::get(session, &uri(artist_id, "artist")?)).await?;
-    Ok(StreamArtist {
+    Ok(map_artist(a))
+}
+
+pub(super) fn map_artist(a: Artist) -> StreamArtist {
+    StreamArtist {
         id: id(&a.id),
         name: a.name,
-        image_path: cover(&a.portraits),
+        image_path: cover(&a.portrait_group).or_else(|| cover(&a.portraits)),
         bio: None,
-    })
+    }
 }
 
 pub(super) async fn artist_albums(
@@ -238,6 +242,46 @@ pub(super) async fn search(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_artist_portraits_use_modern_group_with_legacy_fallback() {
+        use super::*;
+        use librespot_protocol::metadata::{Artist as ArtistMessage, Image, ImageGroup};
+        let picture = |n| Image {
+            file_id: Some(vec![n; 20]),
+            width: Some(640),
+            height: Some(640),
+            ..Default::default()
+        };
+        for (group, legacy, expected) in [
+            (true, true, Some(1)),
+            (false, true, Some(2)),
+            (false, false, None),
+        ] {
+            let message = ArtistMessage {
+                gid: Some(vec![0; 16]),
+                name: Some("Fixture artist".into()),
+                portrait_group: if group {
+                    Some(ImageGroup {
+                        image: vec![picture(1)],
+                        ..Default::default()
+                    })
+                    .into()
+                } else {
+                    Default::default()
+                },
+                portrait: if legacy { vec![picture(2)] } else { vec![] },
+                ..Default::default()
+            };
+            let id = uri("0000000000000000000000", "artist").unwrap();
+            let artist = map_artist(Artist::parse(&message, &id).unwrap());
+            assert_eq!(
+                artist.image_path,
+                expected
+                    .map(|n| format!("https://i.scdn.co/image/{}", format!("{n:02x}").repeat(20))),
+                "Artist portraits must prefer portrait_group, keep the legacy fallback, and never invent an image"
+            );
+        }
+    }
     use super::*;
     #[test]
     fn native_identifiers_reject_wrong_kind_and_external_hosts() {

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use futures_util::{StreamExt, TryStreamExt, stream};
 use librespot_core::{Session, SpotifyUri};
-use librespot_metadata::{Metadata, Track};
+use librespot_metadata::{Album, Artist, Metadata, Track};
 use librespot_protocol::{
     extended_metadata::{
         BatchedEntityRequest, BatchedExtensionResponse, EntityRequest, ExtensionQuery,
@@ -13,11 +13,21 @@ use librespot_protocol::{
 use protobuf::{EnumOrUnknown, Message};
 
 use super::{bounded, catalog, collections::MAX_TRACKS, unsupported};
-use crate::{TuneError, streaming::StreamTrack};
+use crate::{
+    TuneError,
+    streaming::{StreamAlbum, StreamArtist, StreamTrack},
+};
 
 const BATCH_SIZE: usize = 50;
 
 fn request(uris: &[SpotifyUri]) -> Result<BatchedEntityRequest, TuneError> {
+    entity_request(uris, ExtensionKind::TRACK_V4)
+}
+
+fn entity_request(
+    uris: &[SpotifyUri],
+    kind: ExtensionKind,
+) -> Result<BatchedEntityRequest, TuneError> {
     let mut seen = HashSet::new();
     let mut entity_request = Vec::new();
     for uri in uris {
@@ -25,9 +35,9 @@ fn request(uris: &[SpotifyUri]) -> Result<BatchedEntityRequest, TuneError> {
             entity_request.push(EntityRequest {
                 entity_uri: uri
                     .to_uri()
-                    .map_err(|_| TuneError::from("Invalid Spotify track identifier"))?,
+                    .map_err(|_| TuneError::from("Invalid Spotify metadata identifier"))?,
                 query: vec![ExtensionQuery {
-                    extension_kind: EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                    extension_kind: EnumOrUnknown::new(kind),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -41,6 +51,31 @@ fn request(uris: &[SpotifyUri]) -> Result<BatchedEntityRequest, TuneError> {
 }
 
 fn decode(uris: &[SpotifyUri], bytes: &[u8]) -> Result<Vec<StreamTrack>, TuneError> {
+    decode_entities(
+        uris,
+        bytes,
+        ExtensionKind::TRACK_V4,
+        "track",
+        |data, uri| {
+            let message = <Track as Metadata>::Message::parse_from_bytes(data)
+                .map_err(|_| TuneError::from("Spotify track metadata is invalid"))?;
+            let track = Track::parse(&message, uri)
+                .map_err(|_| TuneError::from("Spotify track metadata cannot be decoded"))?;
+            if track.id != *uri {
+                return Err("Spotify track metadata identity mismatch".into());
+            }
+            Ok(catalog::map_track(track))
+        },
+    )
+}
+
+fn decode_entities<T: Clone>(
+    uris: &[SpotifyUri],
+    bytes: &[u8],
+    kind: ExtensionKind,
+    name: &str,
+    parse: impl Fn(&[u8], &SpotifyUri) -> Result<T, TuneError>,
+) -> Result<Vec<T>, TuneError> {
     if bytes.len() > 8 * 1024 * 1024 {
         return Err("Spotify metadata response exceeds limit".into());
     }
@@ -49,33 +84,25 @@ fn decode(uris: &[SpotifyUri], bytes: &[u8]) -> Result<Vec<StreamTrack>, TuneErr
     let expected: HashSet<_> = uris.iter().cloned().collect();
     let mut tracks = HashMap::new();
     for group in reply.extended_metadata {
-        if group.extension_kind.enum_value_or_default() != ExtensionKind::TRACK_V4
+        if group.extension_kind.enum_value().ok() != Some(kind)
             || !matches!(group.header.get_or_default().provider_error_status, 0 | 200)
         {
-            return Err("Spotify track metadata provider failed".into());
+            return Err("Spotify metadata provider failed".into());
         }
         for entry in group.extension_data {
             if !matches!(entry.header.get_or_default().status_code, 0 | 200) {
-                return Err(
-                    "Spotify track metadata unavailable; no partial collection returned".into(),
-                );
+                return Err("Spotify metadata unavailable; no partial collection returned".into());
             }
-            let uri = catalog::uri(&entry.entity_uri, "track")?;
+            let uri = catalog::uri(&entry.entity_uri, name)?;
             if !expected.contains(&uri) || tracks.contains_key(&uri) {
-                return Err("Spotify metadata contains an unexpected or duplicate track".into());
+                return Err("Spotify metadata contains an unexpected or duplicate entity".into());
             }
             let data = entry
                 .extension_data
                 .as_ref()
-                .ok_or("Spotify track metadata is missing")?;
-            let message = <Track as Metadata>::Message::parse_from_bytes(&data.value)
-                .map_err(|_| TuneError::from("Spotify track metadata is invalid"))?;
-            let track = Track::parse(&message, &uri)
-                .map_err(|_| TuneError::from("Spotify track metadata cannot be decoded"))?;
-            if track.id != uri {
-                return Err("Spotify track metadata identity mismatch".into());
-            }
-            tracks.insert(uri, catalog::map_track(track));
+                .ok_or("Spotify metadata is missing")?;
+            let entity = parse(&data.value, &uri)?;
+            tracks.insert(uri, entity);
         }
     }
     uris.iter()
@@ -92,8 +119,22 @@ where
     F: Fn(BatchedEntityRequest) -> Fut + Sync,
     Fut: std::future::Future<Output = Result<bytes::Bytes, TuneError>> + Send,
 {
+    resolve_entities(uris, request, decode, fetch).await
+}
+
+async fn resolve_entities<T, F, Fut>(
+    uris: Vec<SpotifyUri>,
+    request: fn(&[SpotifyUri]) -> Result<BatchedEntityRequest, TuneError>,
+    decode: fn(&[SpotifyUri], &[u8]) -> Result<Vec<T>, TuneError>,
+    fetch: F,
+) -> Result<Vec<T>, TuneError>
+where
+    T: Send,
+    F: Fn(BatchedEntityRequest) -> Fut + Sync,
+    Fut: std::future::Future<Output = Result<bytes::Bytes, TuneError>> + Send,
+{
     if uris.len() > MAX_TRACKS {
-        return Err(unsupported("collections above 2000 tracks"));
+        return Err(unsupported("collections above 2000 items"));
     }
     let chunks: Vec<_> = uris
         .chunks(BATCH_SIZE)
@@ -125,12 +166,245 @@ pub(super) async fn tracks(
     .await
 }
 
+fn decode_albums(uris: &[SpotifyUri], bytes: &[u8]) -> Result<Vec<StreamAlbum>, TuneError> {
+    decode_entities(
+        uris,
+        bytes,
+        ExtensionKind::ALBUM_V4,
+        "album",
+        |data, uri| {
+            let message = <Album as Metadata>::Message::parse_from_bytes(data)
+                .map_err(|_| TuneError::from("Spotify album metadata is invalid"))?;
+            let album = Album::parse(&message, uri)
+                .map_err(|_| TuneError::from("Spotify album metadata cannot be decoded"))?;
+            if album.id != *uri {
+                return Err("Spotify album metadata identity mismatch".into());
+            }
+            Ok(catalog::map_album(album))
+        },
+    )
+}
+
+fn decode_artists(uris: &[SpotifyUri], bytes: &[u8]) -> Result<Vec<StreamArtist>, TuneError> {
+    decode_entities(
+        uris,
+        bytes,
+        ExtensionKind::ARTIST_V4,
+        "artist",
+        |data, uri| {
+            let message = <Artist as Metadata>::Message::parse_from_bytes(data)
+                .map_err(|_| TuneError::from("Spotify artist metadata is invalid"))?;
+            let artist = Artist::parse(&message, uri)
+                .map_err(|_| TuneError::from("Spotify artist metadata cannot be decoded"))?;
+            if artist.id != *uri {
+                return Err("Spotify artist metadata identity mismatch".into());
+            }
+            Ok(catalog::map_artist(artist))
+        },
+    )
+}
+
+pub(super) async fn albums(
+    session: &Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<StreamAlbum>, TuneError> {
+    resolve_entities(
+        uris,
+        |uris| entity_request(uris, ExtensionKind::ALBUM_V4),
+        decode_albums,
+        |request| async move {
+            bounded(session.spclient().request_with_protobuf(
+                &reqwest::Method::POST,
+                "/extended-metadata/v0/extended-metadata",
+                None,
+                &request,
+            ))
+            .await
+        },
+    )
+    .await
+}
+
+pub(super) async fn artists(
+    session: &Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<StreamArtist>, TuneError> {
+    resolve_entities(
+        uris,
+        |uris| entity_request(uris, ExtensionKind::ARTIST_V4),
+        decode_artists,
+        |request| async move {
+            bounded(session.spclient().request_with_protobuf(
+                &reqwest::Method::POST,
+                "/extended-metadata/v0/extended-metadata",
+                None,
+                &request,
+            ))
+            .await
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use librespot_protocol::{
         entity_extension_data::EntityExtensionData, extended_metadata::EntityExtensionDataArray,
     };
+
+    fn entity_reply(request: BatchedEntityRequest) -> BatchedExtensionResponse {
+        let mut reply = BatchedExtensionResponse::new();
+        let mut group = EntityExtensionDataArray::new();
+        for entry in request.entity_request.into_iter().rev() {
+            group.extension_kind = entry.query[0].extension_kind;
+            let name = if group.extension_kind.enum_value().unwrap() == ExtensionKind::ALBUM_V4 {
+                "album"
+            } else {
+                "artist"
+            };
+            let uri = catalog::uri(&entry.entity_uri, name).unwrap();
+            let id = match uri {
+                SpotifyUri::Album { id } | SpotifyUri::Artist { id } => id,
+                _ => unreachable!(),
+            };
+            let value = if name == "album" {
+                librespot_protocol::metadata::Album {
+                    gid: Some(id.to_raw().to_vec()),
+                    name: Some("Saved fixture album".into()),
+                    date: Some(librespot_protocol::metadata::Date {
+                        year: Some(2020),
+                        month: Some(1),
+                        day: Some(1),
+                        ..Default::default()
+                    })
+                    .into(),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .unwrap()
+            } else {
+                librespot_protocol::metadata::Artist {
+                    gid: Some(id.to_raw().to_vec()),
+                    name: Some("Followed fixture artist".into()),
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .unwrap()
+            };
+            group.extension_data.push(EntityExtensionData {
+                entity_uri: entry.entity_uri,
+                extension_data: Some(protobuf::well_known_types::any::Any {
+                    value,
+                    ..Default::default()
+                })
+                .into(),
+                ..Default::default()
+            });
+        }
+        reply.extended_metadata.push(group);
+        reply
+    }
+
+    #[tokio::test]
+    async fn native_saved_metadata_batches_albums_and_artists_with_their_real_entity_kind() {
+        let albums: Vec<_> = (1u128..124)
+            .map(|n| SpotifyUri::Album {
+                id: librespot_core::SpotifyId::from_raw(&n.to_be_bytes()).unwrap(),
+            })
+            .collect();
+        let artists: Vec<_> = (1u128..124)
+            .map(|n| SpotifyUri::Artist {
+                id: librespot_core::SpotifyId::from_raw(&n.to_be_bytes()).unwrap(),
+            })
+            .collect();
+        let calls = std::sync::Mutex::new(Vec::new());
+        let fetch = |r: BatchedEntityRequest| {
+            calls.lock().unwrap().push(r.entity_request.len());
+            async move { Ok(entity_reply(r).write_to_bytes().unwrap().into()) }
+        };
+        let a = resolve_entities(
+            albums.clone(),
+            |u| entity_request(u, ExtensionKind::ALBUM_V4),
+            decode_albums,
+            &fetch,
+        )
+        .await
+        .expect("Saved albums require album metadata, not track metadata");
+        let b = resolve_entities(
+            artists.clone(),
+            |u| entity_request(u, ExtensionKind::ARTIST_V4),
+            decode_artists,
+            &fetch,
+        )
+        .await
+        .expect("Followed artists require artist metadata, not track metadata");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![50, 50, 23, 50, 50, 23],
+            "Albums and artists must retain bounded metadata batches"
+        );
+        assert_eq!(
+            a.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            albums
+                .iter()
+                .map(|u| u.to_id().unwrap())
+                .collect::<Vec<_>>(),
+            "Saved albums must retain every requested identity in order"
+        );
+        assert_eq!(
+            b.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            artists
+                .iter()
+                .map(|u| u.to_id().unwrap())
+                .collect::<Vec<_>>(),
+            "Followed artists must retain every requested identity in order"
+        );
+        assert!(
+            a.iter()
+                .all(|e| e.title == "Saved fixture album" && e.year == Some(2020))
+        );
+        assert!(b.iter().all(|e| e.name == "Followed fixture artist"));
+    }
+
+    #[test]
+    fn native_saved_metadata_refuses_missing_foreign_and_denied_entities() {
+        for (name, kind) in [
+            ("album", ExtensionKind::ALBUM_V4),
+            ("artist", ExtensionKind::ARTIST_V4),
+        ] {
+            let uris = [catalog::uri("0000000000000000000001", name).unwrap()];
+            for defect in ["missing", "identity", "denied", "kind"] {
+                let mut reply = entity_reply(entity_request(&uris, kind).unwrap());
+                let group = &mut reply.extended_metadata[0];
+                match defect {
+                    "missing" => group.extension_data.clear(),
+                    "identity" => {
+                        group.extension_data[0].entity_uri =
+                            format!("spotify:{name}:0000000000000000000002")
+                    }
+                    "denied" => {
+                        group.extension_data[0]
+                            .header
+                            .mut_or_insert_default()
+                            .status_code = 403
+                    }
+                    "kind" => group.extension_kind = EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                    _ => unreachable!(),
+                }
+                let bytes = reply.write_to_bytes().unwrap();
+                let rejected = if name == "album" {
+                    decode_albums(&uris, &bytes).is_err()
+                } else {
+                    decode_artists(&uris, &bytes).is_err()
+                };
+                assert!(
+                    rejected,
+                    "Saved {name} metadata must reject {defect}, never return a shortened collection"
+                );
+            }
+        }
+    }
 
     fn uri(n: u128) -> SpotifyUri {
         SpotifyUri::Track {

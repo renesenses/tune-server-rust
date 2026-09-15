@@ -46,7 +46,8 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   limitée à 30 pistes. Ce n'est pas la recherche multi-catégorie du Web Player.
   Coller une URI ou un lien `https://open.spotify.com/…` ouvre aussi l'entité
   correspondante (piste, album, artiste ou playlist).
-- Collections limitées à 300 objets. Une playlist partielle est refusée,
+- Pistes de collections et albums enregistrés : plafond de 2 000 par résultat ;
+  discographies : 300 albums. Une playlist partielle est refusée,
   pas présentée comme complète. Les playlists personnelles sont lues via la
   rootlist de la session, par pages de 100 entrées, avec un plafond de 300
   entrées (marqueurs de dossiers inclus). Tune en présente une liste plate,
@@ -63,9 +64,10 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   affichent ensemble les cartes et l'avertissement traduit. Le contrat ancien
   `/playlists` reste strict ; les autres écrans non migrés n'acceptent pas les
   listes partielles. Les erreurs 401/429/5xx et de pagination restent fatales.
-  Titres aimés, albums enregistrés, artistes suivis, écriture et synchronisation
-  de playlists restent non implémentés. Les titres aimés rendent désormais un
-  refus explicite, au lieu de la liste vide héritée du trait.
+  Titres aimés, albums enregistrés et artistes suivis sont lus nativement
+  (limites détaillées ci-dessous). Écriture Spotify et synchronisation de
+  playlists restent non implémentées. Les cœurs du client sont les favoris
+  propres à Tune, pas une mutation de la bibliothèque Spotify.
 - Lecture par le Player Rust, PCM WAV 44,1 kHz / 16 bits stéréo vers une session
   Tune. La file et les commandes de sortie restent celles de Tune. Le seek
   des sorties gérées par le serveur et du navigateur recrée le décodeur à
@@ -81,6 +83,121 @@ Cette voie n'est ni une API partenaire Spotify ni une promesse de stabilité.
   le HTTP est de longueur inconnue et se termine sur le véritable EOF du
   worker. Le chemin du signal ne qualifie pas ce décodage de lossless ou
   bit-perfect. L'étiquette WAV 44,1/16 décrit le transport, pas la source.
+
+## Albums enregistrés et artistes suivis — 15 septembre 2026
+
+Les opérations privées `UserAlbums` et `UserArtists` relient maintenant le
+proxy public au moteur isolé. Les routes favoris existantes ne changent pas.
+
+- Albums : requête de lecture `POST /collection/v2/paging`, représentation
+  JSON du schéma [collection2v2.proto](https://github.com/librespot-org/librespot/blob/v0.8.0/protocol/proto/collection2v2.proto),
+  ensemble `collection` du compte appairé. Parcours de toutes les pages de
+  100 éléments, puis sélection des URI albums explicitement enregistrées et
+  non supprimées. Aucun album n'est déduit d'un titre aimé. Tri décroissant
+  par date d'ajout. Les dates entières sont acceptées comme nombres ou chaînes
+  décimales ([ProtoJSON](https://protobuf.dev/programming-guides/json/)) ;
+  une date absente est classée après les dates connues. La dernière page doit
+  porter son jeton de fin de synchro.
+  Plafonds : 100 pages / 10 000 entrées parcourues, 2 000 albums retournés.
+- Artistes : méthodes natives `get_user_profile` et `get_user_following` de
+  [spclient.rs](https://github.com/librespot-org/librespot/blob/v0.8.0/core/src/spclient.rs).
+  Le total `following_count` doit correspondre à toutes les fiches reçues,
+  utilisateurs compris, puis rester identique après lecture. Les utilisateurs
+  ne deviennent pas des artistes ; une fiche non suivie ou répétée est refusée.
+  Plafond : 1 000 profils suivis (artistes et utilisateurs cumulés). Pas de
+  pagination des profils au-delà ; résultat tronqué ou compte supérieur à
+  cette limite = erreur explicite, jamais une collection complète inventée.
+- Fiches : groupes de 50 et quatre requêtes simultanées, avec les extensions
+  natives `ALBUM_V4` / `ARTIST_V4`. Les contrôles de complétude, refus, type
+  et identité sont partagés avec les métadonnées des pistes. Chaque type
+  conserve son parseur et sa représentation Tune.
+- Une erreur de page, de schéma, de réseau ou une modification détectée ne
+  produit pas de résultat partiel silencieux. Les jetons/compteurs ne prouvent
+  pas un instantané transactionnel face à toute modification simultanée
+  (notamment un remplacement d'artiste conservant le même total).
+
+Le test de protocole en lecture seule sur le Mac appairé a reçu 160 albums
+et 1 512 titres sur 17 pages, puis 14 artistes pour un total de profil de 14.
+Ce relevé précède les validations du binaire final ; il ne prouve pas à lui
+seul le raccord HTTP ou l'interface. Aucun appel d'écriture Spotify ni audio.
+
+Le premier candidat a refusé la collection réelle : les 1 672 dates étaient
+toutes des chaînes numériques, contrairement aux fixtures initiales. Il n'a
+pas remplacé l'instance installée. Le parseur et une fixture dédiée couvrent
+désormais cette forme, les valeurs absentes et les dates numériques ; booléens,
+fractions, valeurs négatives ou hors plage restent refusés. Le candidat
+intermédiaire ne constitue donc pas une validation runtime réussie.
+
+Contre-épreuves, tests inchangés et compilations réussies avant les rouges :
+
+- Arrêt après la première page et retrait du jeton de fin : le témoin
+  `native_saved_albums_read_all_pages_without_inventing_albums_from_tracks`
+  échoue avec `Saved albums must read the continuation page` (1 contre 2).
+  Les témoins de complétude et de plafond échouent également.
+- Retrait du contrôle du total des profils :
+  `native_following_rejects_truncation_mutation_duplicates_and_false_follows`
+  échoue avec `Following must reject truncated`.
+- Omission silencieuse de métadonnées absentes : les témoins des albums
+  et des pistes échouent, dont `Saved album metadata must reject missing`.
+  Bilan de cette contre-épreuve groupée : 38 verts, 6 rouges attendus.
+- Retrait du parseur des dates entre guillemets :
+  `native_saved_albums_accept_real_quoted_timestamps_without_relaxing_validation`
+  échoue avec `Real Spotify timestamps are quoted integers; they must not
+  make saved albums unreadable` ; un rouge attendu, aucun autre test exécuté.
+
+Chaque correctif a été restauré par copie de sa sauvegarde, puis les dates
+des fichiers distants actualisées pour éviter de réutiliser un binaire saboté.
+
+Validation avant le raccord des portraits : 45 tests `spotify_native` et 32 tests HTTP réussis,
+puis cross-build macOS ARM. Le worker exécuté sur le Mac reçoit réellement
+160 albums, 14 artistes et 1 512 titres, avec l'appairage conservé et sans
+audio. Le binaire corrigé a pour SHA-256
+`064fed2ba7d867090524207266097d0b95e0893b8e3bbd3a82a6c77aea49596b`.
+
+Le client utilise aussi l'identifiant natif `id` pour la clé des artistes
+favoris, comme pour ceux de la recherche. Deux artistes homonymes restent
+deux fiches : retirer ce raccord provoque un test DOM rouge, quatre verts,
+et l'erreur Svelte `each_key_duplicate` sur la fixture `Artiste homonyme`.
+Le témoin vérifie simultanément albums, artistes et titres sans avertissement
+de catégorie indisponible. Le raccord a été restauré par copie.
+
+Le contrôle visuel a ensuite relevé zéro portrait dans les 14 fiches artistes.
+Le mapping lit désormais `portrait_group` (champ moderne), avec repli sur
+`portrait` (ancien champ). Le témoin
+`native_artist_portraits_use_modern_group_with_legacy_fallback` couvre les
+deux champs et leur absence. Retirer le raccord provoque un rouge compilé,
+`Artist portraits must prefer portrait_group, keep the legacy fallback, and
+never invent an image`, puis le code est restauré par copie.
+
+État final installé sur le Mac :
+
+- 46 tests natifs, 32 tests HTTP ; client web 412 fichiers / 4 590 tests,
+  build de production réussi. Aucun changement de version ou de CI.
+- Binaire macOS ARM SHA-256
+  `6865c28ae0cb34771de545f9d38823bec30d68979dd8c29a4746ba15e3467412`.
+  Client web `9c057b9515d83c5c221ca2eaf87e816288965abb`.
+- HTTP réel : 160 albums, 14 artistes avec 14 URL de portraits et 1 512
+  titres aimés. Le premier album ouvre ses 18 pistes ; la playlist de 520
+  titres reste complète. Le rapport personnel conserve 30 playlists
+  accessibles / une refusée 403 et l'ancien contrat complet reste en refus.
+- Chrome indépendant du profil utilisateur : 160 cartes albums, 14 artistes,
+  1 512 titres, aucun avertissement de catégorie non implémentée, fiche album
+  ouverte et zéro erreur JavaScript. Captures inspectées et gardées privées.
+- Appairage conservé, aucune écriture Spotify ni lecture audio ; quatre zones
+  arrêtées. Les cœurs restent les favoris Tune. Goinfre et l'instance de production inchangés.
+
+Les timings des lectures locales sont des observations ponctuelles, pas des
+benchmarks à froid. Ces validations ciblées ne remplacent pas la CI
+multiplateforme ni une nouvelle écoute humaine.
+
+Limite de reconnexion observée lors d'une réouverture Chrome :
+`/streaming/services` a momentanément rendu Spotify activé mais non authentifié,
+ce qui masque son onglet. Le `GET /streaming/spotify/auth/status` suivant a
+rétabli l'état authentifié, sans appairage ; la liste des services était alors
+de nouveau correcte. L'origine de cette perte transitoire n'est pas déterminée
+dans cette unité. La réapparition autonome de l'onglet après perte de session
+reste donc à fiabiliser : le succès des lectures de collections ne clôt pas
+ce sujet.
 
 ## Compilation / validation
 
@@ -421,8 +538,9 @@ Ce n'est pas une bibliothèque illimitée. Les discographies restent limitées �
 300 albums et la rootlist à 300 entrées, dossiers compris. Le contexte des
 titres aimés n'expose pas de révision de snapshot comparable à celle des
 playlists : la cohérence transactionnelle d'une collection modifiée pendant
-sa lecture n'est pas garantie. Albums enregistrés, artistes suivis et écritures
-Spotify restent non implémentés.
+sa lecture n'est pas garantie. À la fin de cette unité, albums enregistrés et
+artistes suivis restaient non implémentés ; l'étape correspondante est décrite
+plus haut. Les écritures Spotify restent non implémentées.
 
 Le client web V2 conserve les titres lisibles quand une autre catégorie de
 favoris échoue ; chaque refus reste visible avec une relance. Les réponses

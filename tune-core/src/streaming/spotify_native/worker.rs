@@ -56,6 +56,8 @@ pub(super) async fn execute(engine: &mut Engine, operation: Operation) -> Result
         Operation::PlaylistTracks { id } => encode(engine.get_playlist_tracks(&id).await),
         Operation::UserPlaylists => encode(engine.get_user_playlists().await),
         Operation::UserTracks => encode(engine.get_user_tracks().await),
+        Operation::UserAlbums => encode(engine.get_user_albums().await),
+        Operation::UserArtists => encode(engine.get_user_artists().await),
         Operation::PlaylistLibrary => encode(engine.get_playlist_library().await),
         Operation::Play { .. } => Err("Audio operations require an audio worker".into()),
     }
