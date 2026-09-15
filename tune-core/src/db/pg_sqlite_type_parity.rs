@@ -146,6 +146,15 @@ fn famille_pg(t: &str) -> Famille {
 ///
 /// Le classement par danger est dans #2995.
 const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
+    // #2271 (2026-09-15): intentional TEXT for six named modes. SQLite's
+    // historical INTEGER affinity already preserves nonnumeric strings;
+    // PostgreSQL needs 064 to store the same values on both creation paths.
+    (
+        "native",
+        "zones",
+        "autoplay_enabled",
+        "named modes: PG TEXT, SQLite dynamic INTEGER affinity (#2271)",
+    ),
     // ── Base NATIVE ────────────────────────────────────────────────────────
     // `listen_history.profile_id` et `playlists.profile_id` étaient ici : elles
     // sont CONVERTIES par cette PR (migration 049 + `ENSURE_COLUMNS` en
@@ -181,7 +190,7 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
         "migree",
         "zones",
         "autoplay_enabled",
-        "TEXT vs INTEGER — 032 ajoute au lieu de convertir (#2995)",
+        "named modes: PG TEXT, SQLite dynamic INTEGER affinity (#2271)",
     ),
     (
         "migree",
@@ -725,7 +734,10 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        19,
+        20,
+        // #2271: AutoPlay named modes require TEXT on native PG too (19 -> 20).
+        // Four native, sixteen imported differences; the legacy SQLite
+        // INTEGER affinity preserves these names without a table rewrite.
         // #3715 source_id natif devient TEXT : 3 natifs, 16 migrés.
         // La declaration SQLite historique INTEGER reste a migrer.
         // La passe précédente avait retiré streaming_favorites.id (20 -> 19).

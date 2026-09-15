@@ -3680,6 +3680,12 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "alarm_source_text",
         include_str!("../../migrations/postgres/063_alarm_source_text.sql"),
     ),
+    // #2271: named AutoPlay modes require TEXT on native and imported databases.
+    (
+        64,
+        "zone_autoplay_mode_text",
+        include_str!("../../migrations/postgres/064_zone_autoplay_mode_text.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5641,7 +5647,8 @@ mod tests {
         // with the repository's integer bindings (#3715).
         // 61 repairs native streaming favorite IDs without rewinding the sequence.
         // 62 repairs radio favorite flags and their former boolean writer.
-        assert_eq!(pg_latest_version(), 63, "latest PG migration must be 63");
+        // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
+        assert_eq!(pg_latest_version(), 64, "latest PG migration must be 64");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
