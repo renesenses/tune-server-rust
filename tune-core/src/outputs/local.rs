@@ -2486,10 +2486,9 @@ fn record_shared_device_not_found(
 /// et où la lecture s'est arrêtée.
 ///
 /// Distinct de [`record_exclusive_open_failure`] parce que la cause l'est :
-/// là-bas rien n'a jamais été envoyé, ici le rappel de rendu a accepté
-/// l'ouverture puis s'est tu. Vu de l'utilisateur les deux se ressemblent —
-/// « ça ne joue pas » — mais le geste diffère (rebrancher/rallumer contre
-/// choisir une autre sortie), et c'est ce que dit le message.
+/// là-bas l'ouverture a échoué, ici l'anneau ne se vide plus après une
+/// ouverture réussie. Cela ne prouve ni une disparition du périphérique ni
+/// la cause du blocage. Le premier geste est de relancer la lecture.
 ///
 /// `frozen_position_ms` n'est pas décoratif : c'est la position à laquelle
 /// l'écran est resté figé, donc le seul chiffre qui relie ce que le testeur
@@ -2514,8 +2513,7 @@ fn record_feed_stall_failure(
     );
     if let Ok(mut slot) = failure_slot.lock() {
         *slot = Some(format!(
-            "Sortie « {device} » : le périphérique a accepté l'ouverture {backend} puis a cessé de recevoir l'audio ; la lecture est restée figée à {frozen_position_ms} ms. {}",
-            OpenFailure::DeviceGone.user_message()
+            "Sortie « {device} » ({backend}) : l'envoi de l'audio est bloqué ; la lecture a été arrêtée à {frozen_position_ms} ms. Relancez la lecture. Si le blocage se reproduit, essayez une autre sortie."
         ));
     }
 }
@@ -6274,7 +6272,7 @@ fn feed_ring_abortable_with_stall_timeout(
             if last_progress_at.elapsed() >= stall_timeout {
                 warn!(
                     remaining_samples = samples.len() - offset,
-                    "asio_feed_ring_stall_timeout"
+                    "local_audio_feed_ring_stall_timeout"
                 );
                 return false;
             }
