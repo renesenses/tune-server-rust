@@ -246,16 +246,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     // redacteur lie du texte echangerait une lecture fausse contre une ecriture
     // refusee.
     (
-        "native",
-        "streaming_favorites",
-        "id",
-        "TEXT vs INTEGER — la table n'est montee QUE par `ENSURE_TABLES`, en TEXT \
-         avec `nextval(...)::text`. MESURE 09/09/2026 : native=text, migree=bigint \
-         (la 012 convertit apres la copie). Convertir le natif exige de changer \
-         AUSSI la liaison du depot — c'est la table exacte de #1706, elle demande \
-         sa propre passe (#3715)",
-    ),
-    (
         "migree",
         "alarms",
         "enabled",
@@ -741,8 +731,9 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        20,
-        // #3715 retire streaming_favorites.profile_id natif : 3 natifs, 17 migrés.
+        19,
+        // #3715 retire aussi streaming_favorites.id natif : 2 natifs, 17 migrés.
+        // La passe précédente avait retiré profile_id natif (21 -> 20).
         // #3716 avait retiré queue_items.is_current côté migré (22 -> 21).
         // Le 31/08/2026 il valait 16 ; #3715 en a
         // retiré 2 (tolérances périmées, `zones.dlna_wav24` et
