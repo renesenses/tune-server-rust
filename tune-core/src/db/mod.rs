@@ -52,3 +52,5 @@ pub mod track_metadata_repo;
 pub mod track_repo;
 pub mod tx_holder;
 pub mod zone_repo;
+
+pub mod upnp_revision;

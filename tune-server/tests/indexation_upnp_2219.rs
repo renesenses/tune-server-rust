@@ -444,7 +444,19 @@ async fn une_source_upnp_s_indexe_sans_doublon_et_sans_rien_supprimer() {
     );
 
     // --- 7. Rejouer l'indexation n'ajoute rien, ne supprime rien ---
+    let revision_avant = compte(
+        &etat,
+        "SELECT value FROM upnp_catalog_revision WHERE id = 1",
+    );
     let (_, deuxieme) = poster(&app, &chemin).await;
+    assert_eq!(
+        compte(
+            &etat,
+            "SELECT value FROM upnp_catalog_revision WHERE id = 1"
+        ),
+        revision_avant,
+        "réindexation UPnP identique : le SystemUpdateID doit rester stable"
+    );
     assert_eq!(
         deuxieme["pistes"]["ajoutees"],
         json!(0),
