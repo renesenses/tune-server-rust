@@ -513,7 +513,15 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
     .await;
 
     let parcours_ms = debut.elapsed().as_millis() as u64;
-    ecrire(state, &ms.id, &ms.name, &pistes, &mut bilan);
+    let nb_pochettes = ecrire_avec_pochettes(
+        state,
+        &ms.id,
+        &ms.name,
+        &pistes,
+        &mut bilan,
+        &super::library::artwork_cache_dir(),
+    )
+    .await;
 
     let identities: Vec<String> = pistes
         .iter()
@@ -572,6 +580,7 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
             "sans_res_size": bilan.sans_taille,
         },
         "albums_ajoutes": bilan.albums_ajoutes,
+        "pochettes_en_cache": nb_pochettes,
         "supprimees": 0,
         "erreurs": bilan.erreurs,
         // Ne jamais faire semblant : ce que cette passe NE fait pas.
@@ -734,6 +743,24 @@ async fn recolter(
     (retenues.into_values().collect(), bilan)
 }
 
+async fn ecrire_avec_pochettes(
+    state: &AppState,
+    udn: &str,
+    nom: &str,
+    pistes: &[PisteDistante],
+    bilan: &mut Bilan,
+    cache: &std::path::Path,
+) -> usize {
+    let pochettes = super::pochettes_upnp::preparer(
+        &state.http_client,
+        cache,
+        pistes.iter().filter_map(|p| p.pochette.clone()),
+    )
+    .await;
+    ecrire(state, udn, nom, pistes, bilan, &pochettes);
+    pochettes.len()
+}
+
 /// Écrit l'instantané. **Aucun `DELETE`.**
 fn ecrire(
     state: &AppState,
@@ -741,6 +768,7 @@ fn ecrire(
     nom_du_serveur: &str,
     pistes: &[PisteDistante],
     bilan: &mut Bilan,
+    pochettes: &HashMap<String, String>,
 ) {
     let pistes_repo = TrackRepo::with_backend(state.backend.clone());
     let albums_repo = AlbumRepo::with_backend(state.backend.clone());
@@ -750,8 +778,24 @@ fn ecrire(
     // Mémoire d'une seule passe : un album distant n'est résolu qu'une fois,
     // quel que soit le nombre de ses pistes.
     let mut albums_vus: HashMap<String, i64> = HashMap::new();
+    let pochettes_albums: HashMap<String, String> = pistes
+        .iter()
+        .filter_map(|p| {
+            let titre = p.album.as_deref()?;
+            let hash = pochettes.get(p.pochette.as_ref()?)?;
+            Some((
+                cle_d_identite_album(udn, titre, p.artiste.as_deref()),
+                hash.clone(),
+            ))
+        })
+        .collect();
 
     for piste in pistes {
+        let pochette = piste
+            .pochette
+            .as_ref()
+            .and_then(|url| pochettes.get(url))
+            .cloned();
         let artiste_id = piste.artiste.as_deref().and_then(|nom| {
             artistes_repo
                 .get_or_create(nom, None, None)
@@ -763,6 +807,7 @@ fn ecrire(
             None => None,
             Some(titre_album) => {
                 let cle_album = cle_d_identite_album(udn, titre_album, piste.artiste.as_deref());
+                let pochette_album = pochettes_albums.get(&cle_album).cloned();
                 match albums_vus.get(&cle_album) {
                     Some(id) => Some(*id),
                     None => {
@@ -774,10 +819,9 @@ fn ecrire(
                                 album.artist_id = artiste_id;
                                 album.source = SOURCE_UPNP.to_string();
                                 album.source_id = Some(cle_album.clone());
-                                // `cover_path` porte ici une URL, comme pour
-                                // toute source distante : l'instantané doit
-                                // pouvoir s'afficher serveur éteint.
-                                album.cover_path = piste.pochette.clone();
+                                // Adresse locale du contenu : aucune requête
+                                // vers le serveur UPnP pendant l'affichage.
+                                album.cover_path = pochette_album.clone();
                                 match albums_repo.create(&album) {
                                     Ok(id) => {
                                         bilan.albums_ajoutes += 1;
@@ -793,6 +837,19 @@ fn ecrire(
                             }
                         };
                         if let Some(id) = id {
+                            if let Ok(Some(mut album)) = albums_repo.get(id) {
+                                let conservee =
+                                    album.cover_path.clone().filter(|p| !p.starts_with("http"));
+                                let suivante = pochette_album.clone().or(conservee);
+                                if album.cover_path != suivante {
+                                    album.cover_path = suivante;
+                                    if let Err(e) = albums_repo.update(&album) {
+                                        bilan
+                                            .erreurs
+                                            .push(format!("pochette de « {titre_album} » : {e}"));
+                                    }
+                                }
+                            }
                             albums_vus.insert(cle_album, id);
                         }
                         id
@@ -832,11 +889,20 @@ fn ecrire(
         ligne.file_size = piste.taille.map(|t| t as i64);
         ligne.source = SOURCE_UPNP.to_string();
         ligne.source_id = Some(cle.clone());
+        ligne.cover_path = pochette;
 
         let existante = piste_existante(state, &cle);
         let id = match existante {
             Some(id) => {
                 ligne.id = Some(id);
+                if ligne.cover_path.is_none() && (piste.pochette.is_some() || album_id.is_none()) {
+                    ligne.cover_path = pistes_repo
+                        .get(id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.cover_path)
+                        .filter(|p| !p.starts_with("http"));
+                }
                 match pistes_repo.update(&ligne) {
                     Ok(()) => {
                         bilan.mises_a_jour += 1;
@@ -865,6 +931,26 @@ fn ecrire(
         };
 
         let Some(id) = id else { continue };
+        // L'édition générale de piste ne touche pas cover_path. La mise à jour
+        // de l'instantané UPnP doit donc publier explicitement sa nouvelle image.
+        if ligne.id.is_some() {
+            let sql = match state.backend.engine() {
+                tune_core::db::engine::Engine::Sqlite => {
+                    "UPDATE tracks SET cover_path = ? WHERE id = ? AND source = 'upnp'"
+                }
+                tune_core::db::engine::Engine::Postgres => {
+                    "UPDATE tracks SET cover_path = $1 WHERE id = $2 AND source = 'upnp'"
+                }
+            };
+            if let Err(e) = state.backend.execute(
+                sql,
+                &[&ligne.cover_path as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            ) {
+                bilan
+                    .erreurs
+                    .push(format!("pochette de « {} » : {e}", piste.titre));
+            }
+        }
         let mut instantane: HashMap<String, String> = HashMap::new();
         if let Some(url) = &piste.url_de_lecture {
             instantane.insert(CLE_URL_DE_LECTURE.to_string(), url.clone());
@@ -1029,5 +1115,139 @@ mod tests {
         assert_eq!(p.format().as_deref(), Some("flac"));
         p.protocol_info = None;
         assert_eq!(p.format(), None, "rien n'est inventé quand rien n'est dit");
+    }
+
+    #[tokio::test]
+    async fn pochettes_upnp_restent_lisibles_apres_extinction_et_reindexation() {
+        use axum::{Router, routing::get};
+        use base64::Engine;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let image = base64::engine::general_purpose::STANDARD.decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="
+        ).unwrap();
+        let attendue = image.clone();
+        let appels = Arc::new(AtomicUsize::new(0));
+        let compteur = appels.clone();
+        let serveur = Router::new().route(
+            "/cover.png",
+            get(move || {
+                let image = image.clone();
+                let compteur = compteur.clone();
+                async move {
+                    compteur.fetch_add(1, Ordering::SeqCst);
+                    image
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/cover.png", listener.local_addr().unwrap());
+        let tache = tokio::spawn(async move {
+            axum::serve(listener, serveur).await.unwrap();
+        });
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let p = |titre: &str, pochette| PisteDistante {
+            object_id: titre.into(),
+            titre: titre.into(),
+            artiste: Some("Artiste".into()),
+            album: Some("Album".into()),
+            url_de_lecture: Some("http://exemple/piste.flac".into()),
+            pochette,
+            duree_ms: Some(1000),
+            taille: None,
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            protocol_info: None,
+        };
+        // La première piste n'annonce pas d'image, la suivante oui.
+        let pistes = vec![p("A", None), p("B", Some(url.clone())), p("C", Some(url))];
+        let mut bilan = Bilan::default();
+        assert_eq!(
+            ecrire_avec_pochettes(
+                &state,
+                "uuid:test",
+                "NAS",
+                &pistes,
+                &mut bilan,
+                cache.path()
+            )
+            .await,
+            1
+        );
+        let albums = AlbumRepo::with_backend(state.backend.clone());
+        let aid = album_existant(
+            &state,
+            &cle_d_identite_album("uuid:test", "Album", Some("Artiste")),
+        )
+        .unwrap();
+        let hash = albums
+            .get(aid)
+            .unwrap()
+            .unwrap()
+            .cover_path
+            .expect("pochette locale de l'album");
+        assert_eq!(hash, tune_core::library::artwork::content_hash(&attendue));
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            1,
+            "une requête par URL, pas par piste"
+        );
+        tache.abort();
+        let _ = tache.await;
+        let mut suite = Bilan::default();
+        ecrire_avec_pochettes(
+            &state,
+            "uuid:test",
+            "NAS",
+            &pistes,
+            &mut suite,
+            cache.path(),
+        )
+        .await;
+        assert_eq!(suite.mises_a_jour, 3);
+        assert!(suite.erreurs.is_empty());
+        assert_eq!(
+            albums.get(aid).unwrap().unwrap().cover_path.as_deref(),
+            Some(hash.as_str())
+        );
+        for piste in TrackRepo::with_backend(state.backend.clone())
+            .list_by_album(aid)
+            .unwrap()
+        {
+            assert_eq!(
+                piste.cover_path.as_deref(),
+                Some(hash.as_str()),
+                "pochette disponible aussi sur les pistes"
+            );
+        }
+        let (chemin, _) = tune_core::library::artwork::find_cached(cache.path(), &hash).unwrap();
+        assert_eq!(tokio::fs::read(chemin).await.unwrap(), attendue);
+        assert_eq!(appels.load(Ordering::SeqCst), 1);
+
+        // Une piste sans image propre continue de suivre celle de l'album.
+        let mut nouvelle_image = attendue.clone();
+        nouvelle_image.push(0);
+        let nouvelle =
+            tune_core::library::artwork::cache_fetched_image(&nouvelle_image, cache.path(), "png")
+                .unwrap();
+        let images = HashMap::from([(pistes[1].pochette.clone().unwrap(), nouvelle.clone())]);
+        ecrire(
+            &state,
+            "uuid:test",
+            "NAS",
+            &pistes,
+            &mut Bilan::default(),
+            &images,
+        );
+        for piste in TrackRepo::with_backend(state.backend.clone())
+            .list_by_album(aid)
+            .unwrap()
+        {
+            assert_eq!(piste.cover_path.as_deref(), Some(nouvelle.as_str()));
+        }
     }
 }
