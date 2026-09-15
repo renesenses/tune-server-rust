@@ -479,8 +479,31 @@ pub fn pistes_album_distant_double_exclu() -> String {
 /// laisse souvent une chaîne vide, et l'utilisateur qui range sa bibliothèque
 /// ne fait pas la différence entre les deux.
 pub fn untagged_condition(field: &str) -> Option<&'static str> {
+    untagged_condition_for_engine(field, Engine::Sqlite)
+}
+
+/// Le rail et la liste partagent la même définition des genres absents (#3979).
+/// Un tableau vide, malformé ou qui ne contient pas exclusivement des chaînes
+/// ne fournit aucun genre, comme le décodage Vec<String> de la facette.
+pub fn untagged_condition_for_engine(field: &str, engine: Engine) -> Option<&'static str> {
     match field {
-        "genre" => Some("(t.genre IS NULL OR t.genre = '')"),
+        "genre" => Some(match engine {
+            Engine::Sqlite => {
+                "((t.genre IS NULL OR TRIM(t.genre) = '') AND NOT EXISTS (\
+                 SELECT COUNT(*) FROM json_each(CASE WHEN json_valid(t.genres) THEN \
+                 CASE WHEN json_type(t.genres) = 'array' THEN t.genres ELSE '[]' END \
+                 ELSE '[]' END) g HAVING COUNT(*) > 0 \
+                 AND SUM(CASE WHEN g.type <> 'text' THEN 1 ELSE 0 END) = 0 \
+                 AND SUM(CASE WHEN TRIM(CAST(g.value AS TEXT)) <> '' THEN 1 ELSE 0 END) > 0))"
+            }
+            Engine::Postgres => {
+                "((t.genre IS NULL OR TRIM(t.genre) = '') AND NOT EXISTS (\
+                 SELECT COUNT(*) FROM json_array_elements((CASE WHEN t.genres IS JSON ARRAY \
+                 THEN t.genres ELSE '[]' END)::json) g(value) HAVING COUNT(*) > 0 \
+                 AND SUM(CASE WHEN json_typeof(g.value) <> 'string' THEN 1 ELSE 0 END) = 0 \
+                 AND SUM(CASE WHEN TRIM(g.value #>> '{}') <> '' THEN 1 ELSE 0 END) > 0))"
+            }
+        }),
         "year" => Some("(t.year IS NULL OR t.year = 0)"),
         "artist" => Some("t.artist_id IS NULL"),
         "album" => Some("t.album_id IS NULL"),
