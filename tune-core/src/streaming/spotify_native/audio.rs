@@ -26,6 +26,43 @@ use std::sync::{
 use std::time::Duration;
 use tokio::{io::AsyncReadExt, sync::oneshot};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct PcmFormat {
+    pub sample_rate: u32,
+    pub bit_depth: u16,
+    pub channels: u16,
+}
+impl PcmFormat {
+    pub fn validate(self) -> Result<(), String> {
+        if !(8000..=192000).contains(&self.sample_rate)
+            || ![16, 24].contains(&self.bit_depth)
+            || ![1, 2].contains(&self.channels)
+        {
+            return Err("Spotify worker returned unsupported PCM parameters".into());
+        }
+        Ok(())
+    }
+    pub fn frame_bytes(self) -> usize {
+        usize::from(self.channels) * usize::from(self.bit_depth / 8)
+    }
+    fn ogg() -> Self {
+        Self {
+            sample_rate: SAMPLE_RATE,
+            bit_depth: 16,
+            channels: NUM_CHANNELS as u16,
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct AudioHeader {
+    // Preserve existing diagnostic readers of the private track header.
+    #[serde(flatten)]
+    pub track: StreamTrack,
+    pub pcm: PcmFormat,
+    pub source_codec: String,
+}
+
 pub(super) struct Lease {
     zone: i64,
     cancelled: Arc<AtomicBool>,
@@ -85,10 +122,24 @@ impl Sink for PipeSink {
 }
 
 pub(super) async fn run_audio_worker() -> Result<(), String> {
+    let published = Arc::new(AtomicBool::new(false));
+    let result = run_audio_worker_inner(published.clone()).await;
+    if let Err(error) = &result {
+        if !published.load(Ordering::Acquire) {
+            // Refusals before PCM are meaningful startup replies, not opaque EOF.
+            let reply: Result<AudioHeader, Failure> = Err(Failure::from_tune(error.clone().into()));
+            let _ = ipc::write_frame(&mut tokio::io::stdout(), &reply).await;
+        }
+    }
+    result
+}
+
+async fn run_audio_worker_inner(published: Arc<AtomicBool>) -> Result<(), String> {
     let Operation::Play {
         tokens,
         id,
         seek_ms,
+        lossless_format,
     } = ipc::read_frame(&mut tokio::io::stdin()).await?
     else {
         return Err("Audio worker expected Play".into());
@@ -98,15 +149,29 @@ pub(super) async fn run_audio_worker() -> Result<(), String> {
         return Err("Spotify credentials are missing".into());
     }
     let session = engine.session().await.map_err(|e| e.to_string())?;
+    session
+        .spclient()
+        .set_strategy(librespot_core::spclient::RequestStrategy::TryTimes(1));
     let track = super::catalog::track(&session, &id)
         .await
         .map_err(|e| e.to_string())?;
     if track.duration_ms == 0 || seek_ms as u64 >= track.duration_ms {
         return Err("Spotify seek is out of range".into());
     }
+    if let Some(format) = lossless_format {
+        let prepared = super::lossless::prepare(&session, &id, format).await?;
+        return tokio::task::spawn_blocking(move || prepared.decode(seek_ms, track, published))
+            .await
+            .map_err(|_| "Spotify FLAC decoder task failed")?;
+    }
     let uri = super::catalog::uri(&id, "track").map_err(|e| e.to_string())?;
-    let header: Result<StreamTrack, Failure> = Ok(track);
+    let header: Result<AudioHeader, Failure> = Ok(AudioHeader {
+        track,
+        pcm: PcmFormat::ogg(),
+        source_codec: "vorbis".into(),
+    });
     ipc::write_frame(&mut tokio::io::stdout(), &header).await?;
+    published.store(true, Ordering::Release);
     let player = Player::new(
         PlayerConfig {
             bitrate: Bitrate::Bitrate320,
@@ -133,13 +198,13 @@ pub(super) async fn run_audio_worker() -> Result<(), String> {
     result
 }
 
-fn pcm_stream_info() -> StreamInfo {
+fn pcm_stream_info(pcm: PcmFormat) -> StreamInfo {
     StreamInfo {
         format: "wav".into(),
         mime_type: "audio/wav".into(),
-        sample_rate: SAMPLE_RATE,
-        bit_depth: 16,
-        channels: NUM_CHANNELS as u16,
+        sample_rate: pcm.sample_rate,
+        bit_depth: pcm.bit_depth,
+        channels: pcm.channels,
         // Spotify metadata milliseconds are NOT an exact decoded frame count.
         // An invented Content-Length can leave a renderer waiting after EOF.
         // HTTP is chunked; the child pipe's EOF terminates this finite stream.
@@ -177,6 +242,7 @@ impl SpotifyNativeService {
         }
         let seek_ms = u32::try_from(req.seek_ms.unwrap_or(0))
             .map_err(|_| "Spotify seek exceeds supported range")?;
+        let lossless_format = super::lossless::requested_format()?;
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut active = self.audio.lock().unwrap();
@@ -197,13 +263,14 @@ impl SpotifyNativeService {
             armed: true,
         };
         let mut child = ChildProcess::spawn("audio").map_err(|e| e.to_string())?;
-        let header: Result<StreamTrack, Failure> = tokio::time::timeout(ipc::DEADLINE, async {
+        let header: Result<AudioHeader, Failure> = tokio::time::timeout(ipc::DEADLINE, async {
             ipc::write_frame(
                 &mut child.input,
                 &Operation::Play {
                     tokens: self.client.tokens(),
                     id: id.into(),
                     seek_ms,
+                    lossless_format,
                 },
             )
             .await?;
@@ -211,8 +278,20 @@ impl SpotifyNativeService {
         })
         .await
         .map_err(|_| "Spotify audio worker startup timed out")??;
-        let track = header.map_err(|e| e.into_tune().to_string())?;
-        let (stream_id, tx, ready) = streamer.create_session(pcm_stream_info(), false, 64).await;
+        let header = header.map_err(|e| e.into_tune().to_string())?;
+        let pcm = header.pcm;
+        pcm.validate()?;
+        match (lossless_format, header.source_codec.as_str()) {
+            (None, "vorbis") if pcm == PcmFormat::ogg() => {}
+            (Some(16), "flac") if pcm.bit_depth == 16 => {}
+            (Some(22), "flac") if pcm.bit_depth == 24 => {}
+            _ => return Err("Spotify worker did not decode the requested quality".into()),
+        }
+        let track = header.track;
+        let frame_bytes = pcm.frame_bytes();
+        let (stream_id, tx, ready) = streamer
+            .create_session(pcm_stream_info(pcm), false, 64)
+            .await;
         if let Some(session) = streamer.sessions_state().lock().await.get(&stream_id) {
             let _ = session.restart_position_ms.set(u64::from(seek_ms));
         }
@@ -232,11 +311,11 @@ impl SpotifyNativeService {
                         result = child.output.read(&mut buffer) => result.map_err(|_| "Spotify PCM pipe failed")?,
                     };
                     if size == 0 {
-                        if !carry.is_empty() { return Err("Spotify PCM ended inside a stereo frame".into()); }
+                        if !carry.is_empty() { return Err("Spotify PCM ended inside an audio frame".into()); }
                         return child.successful_exit().await;
                     }
                     carry.extend_from_slice(&buffer[..size]);
-                    let length = carry.len() / 4 * 4;
+                    let length = carry.len() / frame_bytes * frame_bytes;
                     if length == 0 { continue; }
                     let tail = carry.split_off(length);
                     let chunk = std::mem::replace(&mut carry, tail);
@@ -292,9 +371,9 @@ impl SpotifyNativeService {
             cover_url: track.cover_path,
             stream_id: Some(stream_id),
             file_size: None,
-            sample_rate: Some(SAMPLE_RATE),
-            bit_depth: Some(16),
-            channels: Some(NUM_CHANNELS as u32),
+            sample_rate: Some(pcm.sample_rate),
+            bit_depth: Some(u32::from(pcm.bit_depth)),
+            channels: Some(u32::from(pcm.channels)),
             origin_url: None,
             bitrate_kbps: None,
         })
@@ -314,7 +393,7 @@ mod tests {
     #[test]
     fn native_pcm_never_invents_content_length_from_catalogue_duration() {
         assert_eq!(
-            pcm_stream_info().wav_content_length(),
+            pcm_stream_info(PcmFormat::ogg()).wav_content_length(),
             None,
             "Spotify metadata duration is not an exact PCM length; Chrome must receive real EOF"
         );

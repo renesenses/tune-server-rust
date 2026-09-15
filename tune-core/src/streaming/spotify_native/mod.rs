@@ -8,6 +8,7 @@ mod following;
 mod ipc;
 mod library;
 mod liked;
+mod lossless;
 mod metadata;
 mod saved;
 mod worker;

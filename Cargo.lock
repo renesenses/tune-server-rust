@@ -6154,6 +6154,7 @@ dependencies = [
 name = "tune-core"
 version = "0.9.150"
 dependencies = [
+ "aes",
  "ape-decoder",
  "argon2",
  "async-stream",
@@ -6170,9 +6171,11 @@ dependencies = [
  "cpal",
  "criterion",
  "csv",
+ "ctr",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
+ "hex",
  "hostname",
  "if-addrs 0.13.4",
  "image",

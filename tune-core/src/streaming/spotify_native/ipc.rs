@@ -56,6 +56,8 @@ pub(super) enum Operation {
         tokens: Value,
         id: String,
         seek_ms: u32,
+        #[serde(default)]
+        lossless_format: Option<i32>,
     },
 }
 
@@ -113,11 +115,18 @@ pub(super) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
 pub(super) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<T, String> {
+    read_frame_limited(reader, MAX_FRAME).await
+}
+
+pub(super) async fn read_frame_limited<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<T, String> {
     let length = reader
         .read_u32()
         .await
         .map_err(|_| "Spotify worker stopped or closed its pipe")? as usize;
-    if length == 0 || length > MAX_FRAME {
+    if length == 0 || length > limit {
         return Err("Spotify IPC frame exceeds limit".into());
     }
     let mut bytes = vec![0; length];
@@ -145,6 +154,10 @@ impl ChildProcess {
         Self::from_command(command).map_err(TuneError::from)
     }
     pub(super) fn from_command(mut command: Command) -> Result<Self, String> {
+        // A disposable worker owns its descendants too (e.g. a local key
+        // provider). Killing only the decoder PID can orphan its helper.
+        #[cfg(unix)]
+        command.process_group(0);
         // No credentials in argv, environment, filesystem or child stderr.
         command
             .stdin(std::process::Stdio::piped())
@@ -173,10 +186,23 @@ impl ChildProcess {
                 _ = stop.changed() => {
                     // Mandatory even when stdout is backpressured or the child
                     // ignores EOF. Always reap it; no orphan decoder or zombie.
+                    #[cfg(unix)]
+                    if let Some(pid) = pid {
+                        // pid came from our newly spawned process-group leader.
+                        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+                    }
                     let _ = child.kill().await;
                     child.wait().await
                 }
             };
+            // Also cover a fatal exit inside the worker (e.g. librespot),
+            // where its destructors never get to stop an external provider.
+            #[cfg(unix)]
+            if let Some(pid) = pid {
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
             let code = result.ok().and_then(|status| status.code()).unwrap_or(-1);
             alive.store(false, Ordering::Release);
             let _ = finished.send(Some(code));
@@ -242,6 +268,74 @@ mod tests {
                 .unwrap_err()
                 .contains("exceeds limit")
         );
+    }
+    #[tokio::test]
+    async fn native_lossless_provider_ipc_has_a_smaller_independent_limit() {
+        let mut input = std::io::Cursor::new(4097u32.to_be_bytes());
+        assert!(
+            read_frame_limited::<_, Value>(&mut input, 4096)
+                .await
+                .unwrap_err()
+                .contains("exceeds limit")
+        );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_worker_drop_also_kills_its_key_provider_descendant() {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & printf '%s\\n' \"$!\"; wait"]);
+        let mut child = ChildProcess::from_command(command).unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), child.output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        let mut exit = child.exit.clone();
+        drop(child);
+        tokio::time::timeout(Duration::from_secs(2), exit.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_descendant_stopped(descendant).await;
+    }
+    #[cfg(unix)]
+    async fn assert_descendant_stopped(descendant: u32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = Command::new("ps")
+                .args(["-o", "stat=", "-p", &descendant.to_string()])
+                .output()
+                .await
+                .unwrap();
+            let status = String::from_utf8_lossy(&status.stdout);
+            // An orphan already killed can briefly await init's reap as Z.
+            if status.trim().is_empty() || status.trim().starts_with('Z') {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Terminating audio must kill the key-provider descendant too"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_worker_fatal_exit_also_kills_its_key_provider_descendant() {
+        use tokio::io::AsyncBufReadExt;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 & printf '%s\\n' \"$!\"; exit 17"]);
+        let mut child = ChildProcess::from_command(command).unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), child.output.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let descendant: u32 = line.trim().parse().unwrap();
+        assert!(child.successful_exit().await.unwrap_err().contains("17"));
+        assert_descendant_stopped(descendant).await;
     }
     #[tokio::test]
     async fn native_ipc_roundtrip_preserves_payload_without_log_text() {
