@@ -137,6 +137,29 @@ fn une_cadence_nulle_ne_divise_pas_par_zero() {
 /// Le nom du diagnostic ne doit pas attribuer le chemin f32 generique a ASIO.
 #[test]
 fn i4046_la_trace_de_blocage_du_chemin_generique_ne_dit_pas_asio() {
+    // Other tests hit this same tracing callsite without a subscriber.
+    // Isolate its first registration and interest cache in a child test process,
+    // rather than relying on the scheduling of the surrounding parallel suite.
+    const CHILD: &str = "TUNE_I4046_TRACE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD, "1")
+            .args([
+                "--exact",
+                "outputs::local::feed_stall_tests::i4046_la_trace_de_blocage_du_chemin_generique_ne_dit_pas_asio",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "trace child failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+        );
+        return;
+    }
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     #[derive(Clone)]
