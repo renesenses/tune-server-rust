@@ -90,8 +90,11 @@ l'implémentation dans `tune-core`.
 ## Reste hors de cette extraction
 
 Le fournisseur PlayPlay privé reste externe ; ni APK ni clé ni table dans le
-plugin distribué. Sélecteur de qualité, provenance FLAC dans le chemin du
-signal, extension UI dédiée et chargement à chaud ne sont pas ajoutés.
+plugin distribué. Sélecteur de qualité, extension UI dédiée et chargement à
+chaud ne sont pas ajoutés. La provenance FLAC a été raccordée ensuite : le
+plugin publie le codec confirmé sur sa session, le cœur le porte dans
+`NowPlaying.format`, et le chemin du signal distingue source FLAC/OGG et
+transport WAV sans promettre un navigateur bit-perfect.
 Bandcamp n'est pas migré vers le nouveau hook. La CI multiplateforme reste
 nécessaire avant intégration ; une compilation Shrek n'est pas une release.
 

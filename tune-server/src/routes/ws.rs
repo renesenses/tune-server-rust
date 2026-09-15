@@ -386,6 +386,77 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
 }
 
 #[cfg(test)]
+mod decoded_source_tests {
+    use super::*;
+    #[tokio::test]
+    async fn decoded_source_websocket_snapshot_keeps_flac_source_and_wav_transport() {
+        use tune_core::{
+            db::zone_repo::ZoneRepo, http::streamer::StreamInfo, playback::NowPlaying,
+        };
+        let state = AppState::new(":memory:", 18888, Default::default()).unwrap();
+        let id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Fixture", Some("browser"), None)
+            .unwrap();
+        let (sid, _tx, _) = state
+            .streamer
+            .create_session(
+                StreamInfo {
+                    format: "wav".into(),
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    ..Default::default()
+                },
+                false,
+                1,
+            )
+            .await;
+        state.streamer.sessions_state().lock().await[&sid]
+            .restart_position_ms
+            .set(0)
+            .unwrap();
+        state
+            .playback
+            .play(
+                id,
+                NowPlaying {
+                    source: "spotify".into(),
+                    format: Some("flac".into()),
+                    stream_id: Some(sid.clone()),
+                    sample_rate: Some(44100),
+                    bit_depth: Some(16),
+                    ..Default::default()
+                },
+            )
+            .await;
+        let snapshot = build_snapshot(&state).await;
+        let zone = snapshot["data"]["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["zone_id"] == id)
+            .unwrap();
+        assert_eq!(
+            zone["now_playing"]["format"], "flac",
+            "WebSocket must not replace source format with the transport container"
+        );
+        assert_eq!(zone["signal_path"]["source_format"], "FLAC");
+        assert_eq!(zone["signal_path"]["transport_format"], "WAV");
+        assert_eq!(zone["signal_path"]["lossless"], true);
+        assert_eq!(zone["signal_path"]["bit_perfect"], false);
+        assert_eq!(zone["now_playing"]["stream_id"], sid);
+        assert_eq!(
+            state
+                .streamer
+                .stream_output_wire(&sid)
+                .await
+                .unwrap()
+                .format,
+            "wav"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_cadence {
     use super::*;
 

@@ -371,7 +371,9 @@ impl PlaybackOrchestrator {
             cover_path: req.cover_url.clone().or(resolved.cover_url.clone()),
             album: req.album_title.clone().or(resolved.album.clone()),
         };
-        let np = self.composer_le_now_playing(&req, &resolved, &habillage);
+        let np = self
+            .composer_le_now_playing(&req, &resolved, &habillage)
+            .await;
 
         self.playback.play(req.zone_id, np).await;
 
@@ -732,15 +734,19 @@ impl PlaybackOrchestrator {
         })
     }
 
-    /// Troisième temps : le `NowPlaying` annoncé aux clients, la ligne de
-    /// bibliothèque prenant le pas sur le flux pour le format et la
-    /// résolution (`resolution_annoncee`).
-    pub(super) fn composer_le_now_playing(
+    /// Troisième temps : le `NowPlaying` annoncé aux clients. Le codec source
+    /// observé par le décodeur prime sur le catalogue et le conteneur du flux ;
+    /// la résolution conserve ses règles de priorité (`resolution_annoncee`).
+    pub(super) async fn composer_le_now_playing(
         &self,
         req: &PlayRequest,
         resolved: &ResolvedStream,
         habillage: &Habillage,
     ) -> NowPlaying {
+        let decoded_source = match resolved.stream_id.as_deref() {
+            Some(id) => self.streamer.stream_decoded_source_format(id).await,
+            None => None,
+        };
         let track_meta = req.track_id.and_then(|tid| {
             crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
                 .get(tid)
@@ -757,9 +763,9 @@ impl PlaybackOrchestrator {
             source: resolved.source.clone(),
             source_id: req.source_id.clone(),
             stream_id: resolved.stream_id.clone(),
-            format: track_meta
-                .as_ref()
-                .and_then(|t| t.format.clone())
+            format: decoded_source
+                .map(|format| format.container_format().to_owned())
+                .or_else(|| track_meta.as_ref().and_then(|t| t.format.clone()))
                 // Qobuz only ever streams FLAC; surface the source format even
                 // when the stream is transcoded to WAV for a local output, so
                 // the format chip shows FLAC and not the output container

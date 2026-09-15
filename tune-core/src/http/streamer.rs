@@ -123,6 +123,10 @@ pub struct StreamSession {
     /// Seek must restart the producer, never use HTTP Range. Unset for normal
     /// file/proxy/radio sessions; immutable for the lifetime of this stream ID.
     pub restart_position_ms: std::sync::OnceLock<u64>,
+    /// Source codec observed by the decoder for this exact stream, BEFORE
+    /// conversion to `info.format` on the wire. Never a quality preference or
+    /// a catalogue guess. Immutable, absent on older/unobserved sessions.
+    pub decoded_source_format: std::sync::OnceLock<crate::audio::formats::AudioFormat>,
     pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// Keeps the channel open until the session is removed, even after the
     /// decoder drops its tx. Without this, the HTTP stream ends as soon as
@@ -352,6 +356,7 @@ impl StreamSession {
             id,
             info,
             restart_position_ms: std::sync::OnceLock::new(),
+            decoded_source_format: std::sync::OnceLock::new(),
             tx: Mutex::new(Some(tx)),
             _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),
@@ -1241,6 +1246,17 @@ impl AudioStreamer {
             .await
             .get(stream_id)
             .map(|s| s.effective_output_info())
+    }
+
+    pub async fn stream_decoded_source_format(
+        &self,
+        stream_id: &str,
+    ) -> Option<crate::audio::formats::AudioFormat> {
+        self.sessions
+            .lock()
+            .await
+            .get(stream_id)
+            .and_then(|s| s.decoded_source_format.get().copied())
     }
 
     pub fn sessions_state(&self) -> Arc<Mutex<HashMap<String, Arc<StreamSession>>>> {

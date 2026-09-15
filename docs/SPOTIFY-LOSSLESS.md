@@ -81,10 +81,14 @@ du code natif du fournisseur.
   disponibilité réelle chez Spotify reste à vérifier sur un titre proposé.
 - Une seule zone active, pas de DSP de zone, comme le prototype précédent.
 - Fréquences acceptées : 8–192 kHz ; mono/stéréo ; PCM 16/24 bits.
-- L'affichage du chemin du signal reste conservateur : un WAV Spotify n'est
-  pas encore marqué lossless. La provenance FLAC du worker doit être transportée
-  jusqu'à ce calcul avant de lever ce garde-fou ; ne pas déduire le codec de
-  la préférence demandée. Aucune promesse de bit-perfect jusqu'au DAC/browser.
+- Le codec confirmé par le décodeur est conservé par session et transmis au
+  `current_track.format` : FLAC ou OGG, indépendamment du WAV servi au navigateur.
+  Le chemin du signal distingue `source_format` et `transport_format` ; le
+  verdict lossless suit la source observée, jamais la préférence demandée.
+  Une ancienne session Spotify connue seulement comme WAV reste conservatrice.
+  Le transport navigateur PCM ne promet pas de bit-perfect jusqu'au DAC : sa
+  sortie finale n'est pas mesurée. Les échantillons FLAC 16/24 bits peuvent être
+  conservés dans le WAV sans que cela prouve la chaîne navigateur/système.
 - Pas de sélecteur de qualité dans l'interface ni d'installation automatique
   du fournisseur. L'implémentation serveur a depuis été extraite dans
   `plugins/tune-spotify` ; voir la note d'extraction.

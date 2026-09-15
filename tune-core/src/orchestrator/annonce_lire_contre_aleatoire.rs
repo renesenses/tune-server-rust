@@ -119,6 +119,71 @@ fn demande_lecture_aleatoire(track_id: i64) -> PlayRequest {
     }
 }
 
+#[tokio::test]
+async fn decoded_source_format_survives_wav_transport_and_never_leaks_between_sessions() {
+    use crate::audio::formats::AudioFormat;
+    use crate::http::streamer::StreamInfo;
+    let orch = orchestrateur_de_test();
+    let mut req = demande_lire(0);
+    req.track_id = None;
+    req.source = Some("fixture-private".into());
+    let mut resolved = flux_local_resolu(Some(44100), Some(16));
+    resolved.source = "fixture-private".into();
+    let habillage = Habillage {
+        album: None,
+        cover_path: None,
+    };
+    for (observed, expected) in [
+        (Some(AudioFormat::Flac), "flac"),
+        (Some(AudioFormat::Ogg), "ogg"),
+        (None, "wav"),
+    ] {
+        let (id, _tx, _) = orch
+            .streamer
+            .create_session(
+                StreamInfo {
+                    format: "wav".into(),
+                    sample_rate: 44100,
+                    bit_depth: 16,
+                    ..Default::default()
+                },
+                false,
+                1,
+            )
+            .await;
+        if let Some(format) = observed {
+            orch.streamer.sessions_state().lock().await[&id]
+                .decoded_source_format
+                .set(format)
+                .unwrap();
+        }
+        resolved.stream_id = Some(id.clone());
+        let np = orch
+            .composer_le_now_playing(&req, &resolved, &habillage)
+            .await;
+        assert_eq!(
+            np.format.as_deref(),
+            Some(expected),
+            "NowPlaying must report the observed source, not the WAV transport or a previous track"
+        );
+        assert_eq!(serde_json::to_value(&np).unwrap()["format"], expected);
+        assert_eq!(
+            orch.streamer.stream_output_wire(&id).await.unwrap().format,
+            "wav",
+            "source metadata must not alter the HTTP container"
+        );
+        orch.streamer.remove_session(&id).await;
+        let unobserved = orch
+            .composer_le_now_playing(&req, &resolved, &habillage)
+            .await;
+        assert_eq!(
+            unobserved.format.as_deref(),
+            Some("wav"),
+            "a removed session cannot lend its old source codec to a new resolution"
+        );
+    }
+}
+
 fn ligne_16_bits(
     orch: &PlaybackOrchestrator,
     sample_rate: Option<i32>,
@@ -145,9 +210,12 @@ async fn lire_et_lecture_aleatoire_annoncent_la_meme_profondeur() {
         cover_path: None,
     };
 
-    let par_lire = orch.composer_le_now_playing(&demande_lire(id), &resolu, &habillage);
-    let par_aleatoire =
-        orch.composer_le_now_playing(&demande_lecture_aleatoire(id), &resolu, &habillage);
+    let par_lire = orch
+        .composer_le_now_playing(&demande_lire(id), &resolu, &habillage)
+        .await;
+    let par_aleatoire = orch
+        .composer_le_now_playing(&demande_lecture_aleatoire(id), &resolu, &habillage)
+        .await;
 
     assert_eq!(
         par_lire.bit_depth,
@@ -184,9 +252,12 @@ async fn une_ligne_muette_se_tait_par_les_deux_chemins() {
         cover_path: None,
     };
 
-    let par_lire = orch.composer_le_now_playing(&demande_lire(id), &resolu, &habillage);
-    let par_aleatoire =
-        orch.composer_le_now_playing(&demande_lecture_aleatoire(id), &resolu, &habillage);
+    let par_lire = orch
+        .composer_le_now_playing(&demande_lire(id), &resolu, &habillage)
+        .await;
+    let par_aleatoire = orch
+        .composer_le_now_playing(&demande_lecture_aleatoire(id), &resolu, &habillage)
+        .await;
 
     assert_eq!(
         par_lire.bit_depth, None,
@@ -216,9 +287,12 @@ async fn track_id_est_le_seul_champ_qui_porte_l_annonce() {
     let mut sans_ligne = demande_lecture_aleatoire(id);
     sans_ligne.track_id = None;
 
-    let avec_ligne =
-        orch.composer_le_now_playing(&demande_lecture_aleatoire(id), &resolu, &habillage);
-    let sans = orch.composer_le_now_playing(&sans_ligne, &resolu, &habillage);
+    let avec_ligne = orch
+        .composer_le_now_playing(&demande_lecture_aleatoire(id), &resolu, &habillage)
+        .await;
+    let sans = orch
+        .composer_le_now_playing(&sans_ligne, &resolu, &habillage)
+        .await;
     assert_eq!(
         avec_ligne.bit_depth,
         Some(16),

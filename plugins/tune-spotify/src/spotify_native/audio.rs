@@ -63,6 +63,24 @@ pub(super) struct AudioHeader {
     pub source_codec: String,
 }
 
+impl AudioHeader {
+    /// Trust only the decoder's confirmed codec/PCM pair, not the requested
+    /// quality. The returned source format must survive the WAV transport.
+    fn confirmed_source_format(
+        &self,
+        requested: Option<i32>,
+    ) -> Result<tune_core::audio::formats::AudioFormat, String> {
+        use tune_core::audio::formats::AudioFormat;
+        self.pcm.validate()?;
+        match (requested, self.source_codec.as_str()) {
+            (None, "vorbis") if self.pcm == PcmFormat::ogg() => Ok(AudioFormat::Ogg),
+            (Some(16), "flac") if self.pcm.bit_depth == 16 => Ok(AudioFormat::Flac),
+            (Some(22), "flac") if self.pcm.bit_depth == 24 => Ok(AudioFormat::Flac),
+            _ => Err("Spotify worker did not decode the requested quality".into()),
+        }
+    }
+}
+
 pub(super) struct Lease {
     zone: i64,
     cancelled: Arc<AtomicBool>,
@@ -280,13 +298,7 @@ impl SpotifyNativeService {
         .map_err(|_| "Spotify audio worker startup timed out")??;
         let header = header.map_err(|e| e.into_tune().to_string())?;
         let pcm = header.pcm;
-        pcm.validate()?;
-        match (lossless_format, header.source_codec.as_str()) {
-            (None, "vorbis") if pcm == PcmFormat::ogg() => {}
-            (Some(16), "flac") if pcm.bit_depth == 16 => {}
-            (Some(22), "flac") if pcm.bit_depth == 24 => {}
-            _ => return Err("Spotify worker did not decode the requested quality".into()),
-        }
+        let source_format = header.confirmed_source_format(lossless_format)?;
         let track = header.track;
         let frame_bytes = pcm.frame_bytes();
         let (stream_id, tx, ready) = streamer
@@ -294,6 +306,7 @@ impl SpotifyNativeService {
             .await;
         if let Some(session) = streamer.sessions_state().lock().await.get(&stream_id) {
             let _ = session.restart_position_ms.set(u64::from(seek_ms));
+            let _ = session.decoded_source_format.set(source_format);
         }
         let (started, mut startup) = oneshot::channel::<Result<(), String>>();
         let stream_task = streamer.clone();
@@ -383,6 +396,41 @@ impl SpotifyNativeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_confirmed_source_comes_from_decoder_not_quality_preference() {
+        use tune_core::audio::formats::AudioFormat;
+        let mut header = AudioHeader {
+            track: serde_json::from_value(serde_json::json!({
+                "id": "fixture", "title": "Fixture", "artist": "Fixture",
+                "duration_ms": 1000, "explicit": false
+            }))
+            .unwrap(),
+            pcm: PcmFormat::ogg(),
+            source_codec: "vorbis".into(),
+        };
+        assert_eq!(
+            header.confirmed_source_format(None).unwrap(),
+            AudioFormat::Ogg
+        );
+        assert!(
+            header.confirmed_source_format(Some(16)).is_err(),
+            "requesting FLAC must not relabel a Vorbis decoder"
+        );
+        header.source_codec = "flac".into();
+        assert_eq!(
+            header.confirmed_source_format(Some(16)).unwrap(),
+            AudioFormat::Flac
+        );
+        assert!(header.confirmed_source_format(None).is_err());
+        assert!(header.confirmed_source_format(Some(22)).is_err());
+        header.pcm.bit_depth = 24;
+        assert_eq!(
+            header.confirmed_source_format(Some(22)).unwrap(),
+            AudioFormat::Flac
+        );
+        header.source_codec = "unknown".into();
+        assert!(header.confirmed_source_format(Some(22)).is_err());
+    }
     #[test]
     fn native_pcm_is_little_endian_saturating_and_nan_safe() {
         assert_eq!(

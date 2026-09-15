@@ -12,7 +12,16 @@ async fn native_browser_stream_contract_is_consistent_on_every_zone_surface() {
         .unwrap();
     let (stream_id, _tx, _) = state
         .streamer
-        .create_session(StreamInfo::default(), false, 1)
+        .create_session(
+            StreamInfo {
+                format: "wav".into(),
+                sample_rate: 44100,
+                bit_depth: 16,
+                ..Default::default()
+            },
+            false,
+            1,
+        )
         .await;
     state.streamer.sessions_state().lock().await[&stream_id]
         .restart_position_ms
@@ -25,6 +34,9 @@ async fn native_browser_stream_contract_is_consistent_on_every_zone_surface() {
             NowPlaying {
                 source: "spotify".into(),
                 stream_id: Some(stream_id.clone()),
+                format: Some("flac".into()),
+                sample_rate: Some(44100),
+                bit_depth: Some(16),
                 ..Default::default()
             },
         )
@@ -58,6 +70,20 @@ async fn native_browser_stream_contract_is_consistent_on_every_zone_surface() {
             "PCM byte zero needs its track offset on {path}"
         );
         assert_eq!(body["browser_stream"]["seek_mode"], "restart");
+        // /status serializes ZoneState (now_playing), whereas the list and
+        // detail expose current_track plus the enriched signal path.
+        if path.ends_with("/status") {
+            assert_eq!(body["now_playing"]["format"], "flac");
+        } else {
+            assert_eq!(
+                body["current_track"]["format"], "flac",
+                "source codec must survive every HTTP surface: {path}"
+            );
+            assert_eq!(body["signal_path"]["source_format"], "FLAC");
+            assert_eq!(body["signal_path"]["transport_format"], "WAV");
+            assert_eq!(body["signal_path"]["lossless"], true);
+            assert_eq!(body["signal_path"]["bit_perfect"], false);
+        }
         assert!(
             body["stream_url"]
                 .as_str()
@@ -68,6 +94,9 @@ async fn native_browser_stream_contract_is_consistent_on_every_zone_surface() {
     }
     let play_body = crate::routes::playback::build_zone_json(&state, zone_id).await;
     assert_eq!(play_body["browser_stream"]["start_position_ms"], 219000);
+    assert_eq!(play_body["current_track"]["format"], "flac");
+    assert_eq!(play_body["signal_path"]["source_format"], "FLAC");
+    assert_eq!(play_body["signal_path"]["transport_format"], "WAV");
 }
 
 #[tokio::test]

@@ -64,6 +64,71 @@ fn spotify_native_decoded_wav_is_not_claimed_lossless_or_bit_perfect() {
     );
 }
 
+#[test]
+fn decoded_source_and_wire_formats_are_distinct_without_promising_browser_bit_perfect() {
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("browser".into());
+    zone.output_device_id = None;
+    for (format, rate, depth, lossless) in [
+        ("flac", 44100, 16, true),
+        ("flac", 96000, 24, true),
+        ("ogg", 44100, 16, false),
+    ] {
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                source: "spotify".into(),
+                format: Some(format.into()),
+                sample_rate: Some(rate),
+                bit_depth: Some(depth),
+                ..Default::default()
+            }),
+            volume: 1.0,
+            ..Default::default()
+        };
+        let path = build_signal_path_pub(
+            &ps,
+            &zone,
+            &backend,
+            None,
+            "none",
+            Some(&wire("wav", rate, depth as u16)),
+        )
+        .unwrap();
+        assert_eq!(path["source_format"], format.to_uppercase());
+        assert_eq!(
+            path["transport_format"], "WAV",
+            "browser receives WAV, never the source FLAC/OGG container"
+        );
+        assert_eq!(
+            path["lossless"], lossless,
+            "lossless follows the source, not the WAV wire"
+        );
+        assert_eq!(
+            path["bit_perfect"], false,
+            "an unobserved browser mixer/DAC must not claim bit-perfect even at full volume"
+        );
+        assert_eq!(path["runtime_observed"], false);
+        assert!(step_desc(&path, "Transcoder").unwrap().contains("WAV"));
+        let conversion = path["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Transcoder")
+            .unwrap();
+        assert_eq!(
+            conversion["bit_perfect"], lossless,
+            "FLAC-to-PCM/WAV preserves both 16-bit and 24-bit samples; Vorbis stays lossy"
+        );
+        if rate == 44100 {
+            assert!(
+                step_desc(&path, "Source").unwrap().contains("44.1kHz"),
+                "44.1 kHz must not be rounded down to 44"
+            );
+        }
+    }
+}
+
 // Hi-res ALAC source, currently playing, with a live stream session.
 fn alac_hires_playing() -> ZoneState {
     let np = NowPlaying {
@@ -118,7 +183,7 @@ fn step_detail(v: &Value, name: &str) -> Option<String> {
 /// dans `plugins/tune-bandcamp/src/lib.rs` veut que ce débit soit
 /// « annoncé comme tel PARTOUT où il apparaît ». Il l'était sur l'écran
 /// Bandcamp et NULLE PART ailleurs : arrivée dans une zone, la piste
-/// s'affichait « MP3 44kHz/16bit », indiscernable d'un 320 devant un DAC
+/// s'affichait « MP3 44.1kHz/16bit », indiscernable d'un 320 devant un DAC
 /// de salon.
 #[test]
 fn a_lossy_source_announces_its_bitrate_in_the_signal_path() {
@@ -142,7 +207,7 @@ fn a_lossy_source_announces_its_bitrate_in_the_signal_path() {
 
     assert_eq!(
         step_desc(&sp, "Source").as_deref(),
-        Some("MP3 128 kbit/s 44kHz/16bit"),
+        Some("MP3 128 kbit/s 44.1kHz/16bit"),
         "le débit doit être lisible AVANT que le son n'atteigne le DAC"
     );
     assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
@@ -176,7 +241,7 @@ fn a_lossless_source_announces_no_bitrate() {
 
     assert_eq!(
         step_desc(&sp, "Source").as_deref(),
-        Some("FLAC 44kHz/16bit"),
+        Some("FLAC 44.1kHz/16bit"),
         "aucun débit ne doit apparaître sur un flux sans perte"
     );
 }
@@ -771,7 +836,7 @@ fn dsd_en_dop_affiche_l_etage_wav_du_fil() {
 
     assert_eq!(
         transcoder_desc(&sp).as_deref(),
-        Some("DSD128 5.6 MHz \u{2192} WAV 352kHz/24bit"),
+        Some("DSD128 5.6 MHz \u{2192} WAV 352.8kHz/24bit"),
         "le DoP est un vrai emballage : l'etage doit rester, avec les \
          chiffres du fil"
     );
@@ -795,7 +860,7 @@ fn dsd_transcode_en_pcm_affiche_bien_son_etage() {
 
     assert_eq!(
         transcoder_desc(&sp).as_deref(),
-        Some("DSD128 5.6 MHz \u{2192} FLAC 176kHz/24bit"),
+        Some("DSD128 5.6 MHz \u{2192} FLAC 176.4kHz/24bit"),
         "une conversion REELLE doit rester visible — supprimer le fantome \
          ne doit pas rendre le serveur muet sur ce qu'il fait vraiment"
     );
@@ -882,9 +947,9 @@ fn aucun_conteneur_pcm_ne_peut_porter_une_resolution_dsd() {
 #[test]
 fn le_garde_fou_laisse_passer_tout_le_pcm_legitime() {
     for (sr, bd, attendu) in [
-        (44_100, 16, "FLAC 44kHz/16bit"),
+        (44_100, 16, "FLAC 44.1kHz/16bit"),
         (96_000, 24, "FLAC 96kHz/24bit"),
-        (352_800, 24, "FLAC 352kHz/24bit"),
+        (352_800, 24, "FLAC 352.8kHz/24bit"),
         (768_000, 32, "FLAC 768kHz/32bit"),
     ] {
         assert_eq!(output_stage_label("FLAC", sr, bd), attendu);
@@ -1123,7 +1188,7 @@ fn no_wire_no_metadata_still_falls_back() {
     let sp = build_signal_path(&ps, &zone, &backend, Some("LHC"), "none", None).unwrap();
     assert_eq!(
         step_desc(&sp, "Source").as_deref(),
-        Some("FLAC 44kHz/16bit")
+        Some("FLAC 44.1kHz/16bit")
     );
 }
 

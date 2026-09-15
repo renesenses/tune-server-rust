@@ -350,7 +350,7 @@ pub(super) fn output_stage_label(container: &str, sample_rate: i32, bit_depth: i
     if sample_rate >= 1000 {
         format!(
             "{container} {sr}kHz/{bit_depth}bit",
-            sr = sample_rate / 1000
+            sr = f64::from(sample_rate) / 1000.0
         )
     } else {
         format!("{container} {sample_rate}Hz/{bit_depth}bit")
@@ -519,6 +519,7 @@ pub(super) fn build_signal_path(
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
+    let source_format = analyse.source.format_name;
     let etapes = assembler_les_etapes(
         ps,
         zone,
@@ -534,6 +535,8 @@ pub(super) fn build_signal_path(
         // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
         // bit-perfect but is still lossless — the UI must not call it "lossy".
         "lossless": is_lossless,
+        "source_format": source_format,
+        "transport_format": output_format_name,
         "summary": etapes.summary,
         "steps": etapes.steps,
         "runtime_observed": runtime_signal_path.is_some(),
@@ -618,7 +621,7 @@ fn assembler_les_etapes(
     } else if sample_rate >= 1000 {
         format!(
             "{format_name}{bitrate_label} {sr}kHz/{bit_depth}bit",
-            sr = sample_rate / 1000
+            sr = f64::from(sample_rate) / 1000.0
         )
     } else {
         format!("{format_name}{bitrate_label} {sample_rate}Hz/{bit_depth}bit")
@@ -666,8 +669,14 @@ fn assembler_les_etapes(
         // already fits the 16-bit LPCM cap — unless the zone opted into genuine
         // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
         let wav_output = wire_wav || dlna_lpcm || dlna_wav24;
+        let wav_preserves_resolution = match (wire_sample_rate, wire_bit_depth) {
+            (Some(rate), Some(depth)) if wire_wav => {
+                i64::from(rate) == i64::from(sample_rate) && i32::from(depth) >= bit_depth
+            }
+            _ => dlna_wav24 || bit_depth <= 16,
+        };
         let transcode_lossless = (is_oaat && is_lossless && !is_dsd)
-            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16));
+            || (wav_output && is_lossless && wav_preserves_resolution);
         // Reflect the OUTPUT resolution the renderer actually receives: 24-bit
         // for the opt-in 24-bit WAV path, 16-bit when the zone caps to 16-bit OR
         // serves the plain LPCM fallback (audio/L16 is 16-bit), and the
@@ -880,7 +889,11 @@ fn assembler_les_etapes(
         "name": "Transport",
         "description": transport_desc,
         "bit_perfect": transport_bit_perfect,
-        "detail": runtime_signal_path.and_then(runtime_signal_reason_detail),
+        "detail": if output_type == "browser" && wire_wav {
+            Some("Sortie audio finale du navigateur non mesurée".to_string())
+        } else {
+            runtime_signal_path.and_then(runtime_signal_reason_detail)
+        },
     }));
 
     let renderer_name = renderer_label
@@ -1133,6 +1146,9 @@ fn decrire_le_transport<'a>(
                 (true, transport, format_name)
             }
         }
+        // The HTTP container is observed; the browser mixer/DAC is not.
+        // Decoded PCM on the wire cannot prove end-to-end bit-perfect output.
+        "browser" if wire_wav => (false, "Browser", "WAV"),
         "browser" => (true, "Browser", format_name),
         "local" => {
             // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
@@ -1598,9 +1614,9 @@ fn decrire_la_source<'w>(
         .as_ref()
         .map(|f| f.is_lossless())
         .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
-    // The native prototype requests librespot's compressed 320 profile. WAV
-    // is its DECODED transport, not evidence of a lossless Spotify source.
-    // Do not generalize to future Spotify transports or change other sources.
+    // Legacy/unobserved Spotify PCM: WAV alone proves nothing about the
+    // source. A confirmed decoder now supplies FLAC or OGG in NowPlaying;
+    // retain this conservative guard when that observation is absent.
     #[cfg(feature = "spotify-native")]
     let is_lossless =
         is_lossless && !(np.source == "spotify" && source_format == Some(AudioFormat::Wav));
