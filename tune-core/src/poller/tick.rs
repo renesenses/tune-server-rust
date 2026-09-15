@@ -1953,6 +1953,7 @@ impl PositionPoller {
                         .as_ref()
                         .is_some_and(|np| np.source == "radio");
                     let mut fsm_pin = fsm::PlayingInput {
+                        realtime: status.realtime,
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
                         gapless_sent: ps.gapless_sent,
@@ -2364,11 +2365,15 @@ impl PositionPoller {
                             status.position_ms,
                             wall_elapsed,
                         );
-                    if past_end
-                        || reached_end_exclusive
-                        || wall_clock_past_end
-                        || chromecast_wall_clock_past_end
-                        || dlna_frozen_end
+                    // A non-realtime output may still be processing after the
+                    // nominal track duration. Only its actual completion can
+                    // end the track; renderer position/clock fallbacks cannot.
+                    if status.realtime
+                        && (past_end
+                            || reached_end_exclusive
+                            || wall_clock_past_end
+                            || chromecast_wall_clock_past_end
+                            || dlna_frozen_end)
                     {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
