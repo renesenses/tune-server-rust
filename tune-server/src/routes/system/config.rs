@@ -850,6 +850,47 @@ fn enables_volume_lock(body: &serde_json::Map<String, Value>) -> bool {
         .is_some_and(|value| value.as_bool() == Some(true) || value.as_str() == Some("true"))
 }
 
+/// Témoin posé quand c'est le choix d'ASIO qui a armé le mode exclusif —
+/// et non l'utilisateur par le sélecteur « partagé / exclusif ».
+const EXCLUSIF_ARME_PAR_ASIO: &str = "local_exclusive_mode_arme_par_asio";
+
+/// Ce que devient le mode exclusif quand le backend change (#4184).
+#[derive(Debug, PartialEq, Eq)]
+enum SuiteExclusif {
+    /// Rien à faire.
+    Inchange,
+    /// ASIO arrive et l'exclusif n'était pas armé avant : c'est ASIO qui
+    /// l'arme, on s'en souvient.
+    ArmeParAsio,
+    /// On quitte ASIO, et c'est ASIO qui avait armé l'exclusif : on le
+    /// désarme, même si la requête répète `true` — ce `true` est celui
+    /// qu'ASIO avait forcé, pas un choix.
+    DesarmeAvecAsio,
+}
+
+/// Choisir ASIO force `local_exclusive_mode = true` (le client l'envoie, et
+/// ASIO est exclusif par nature). Mais rien ne le remettait à `false` en
+/// quittant ASIO : le « WASAPI » d'après un aller-retour ASIO était devenu
+/// WASAPI **exclusif** — un chemin qui ne présente qu'un seul format au
+/// pilote (#3837) — sans que l'écran le dise, et « remettre comme avant »
+/// par le sélecteur ne rendait pas l'état initial (william, fil 1793,
+/// #4184 piste 2a). Un exclusif que l'utilisateur a armé LUI-MÊME, avant
+/// ASIO ou après en être sorti, n'est jamais touché.
+fn suite_de_l_exclusif(
+    backend_avant: &str,
+    backend_apres: &str,
+    exclusif_avant: bool,
+    arme_par_asio_avant: bool,
+) -> SuiteExclusif {
+    let avant_asio = backend_avant.trim().eq_ignore_ascii_case("asio");
+    let apres_asio = backend_apres.trim().eq_ignore_ascii_case("asio");
+    match (avant_asio, apres_asio) {
+        (false, true) if !exclusif_avant => SuiteExclusif::ArmeParAsio,
+        (true, false) if arme_par_asio_avant => SuiteExclusif::DesarmeAvecAsio,
+        _ => SuiteExclusif::Inchange,
+    }
+}
+
 fn take_full_volume_confirmation(body: &mut serde_json::Map<String, Value>) -> bool {
     body.remove(FULL_VOLUME_CONFIRMATION_FIELD)
         .and_then(|value| value.as_bool())
@@ -1087,6 +1128,38 @@ pub(super) async fn update_config(
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // Le mode exclusif suit le backend quand c'est ASIO qui l'avait armé
+    // (#4184). Décidé AVANT la boucle d'écriture, sur l'état stocké.
+    let mut exclusif_desarme_avec_asio = false;
+    if let Some(apres) = values
+        .get("local_audio_backend")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    {
+        let lire = |cle: &str| settings.get(cle).ok().flatten();
+        let avant =
+            lire("local_audio_backend").unwrap_or_else(|| state.config.local_audio_backend.clone());
+        let exclusif_avant = lire("local_exclusive_mode")
+            .map(|v| matches!(v.trim().to_lowercase().as_str(), "true" | "1" | "yes"))
+            .unwrap_or(state.config.local_exclusive_mode);
+        let arme_par_asio = lire(EXCLUSIF_ARME_PAR_ASIO).as_deref() == Some("true");
+        match suite_de_l_exclusif(&avant, &apres, exclusif_avant, arme_par_asio) {
+            SuiteExclusif::ArmeParAsio => {
+                values.insert(EXCLUSIF_ARME_PAR_ASIO.into(), json!("true"));
+            }
+            SuiteExclusif::DesarmeAvecAsio => {
+                values.insert("local_exclusive_mode".into(), json!("false"));
+                values.insert(EXCLUSIF_ARME_PAR_ASIO.into(), json!("false"));
+                exclusif_desarme_avec_asio = true;
+                tracing::info!(
+                    de = %avant,
+                    vers = %apres,
+                    "exclusif_desarme_en_quittant_asio — c'est ASIO qui l'avait armé (#4184)"
+                );
+            }
+            SuiteExclusif::Inchange => {}
+        }
+    }
 
     // 🔴 Retiré de la boucle générique AVANT qu'elle ne l'écrive sous le nom nu.
     //
@@ -1143,6 +1216,12 @@ pub(super) async fn update_config(
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
 
     let mut reponse = json!({"ok": true});
+    if exclusif_desarme_avec_asio {
+        // Le client a envoyé `local_exclusive_mode: true` (l'écho du forçage
+        // ASIO) : il doit apprendre ce qui a été écrit.
+        reponse["local_exclusive_mode"] = json!(false);
+        reponse["exclusif_desarme_avec_asio"] = json!(true);
+    }
     // Le conteneur porte l'information : le client sait si sa demande a pris
     // effet tout de suite, et n'a pas à supposer qu'un redémarrage l'attend.
     if let Some(applique) = annonce_appliquee {
@@ -4661,5 +4740,66 @@ mod ui_preferences_par_profil_tests {
         let state = etat();
         ecrire(&state, PERE, r#"{"avatarImage":"secret-du-pere"}"#).await;
         assert_eq!(lire(&state, FILS).await, None);
+    }
+}
+
+/// #4184 — le mode exclusif ne survit pas à ASIO quand c'est ASIO qui
+/// l'avait armé ; un exclusif choisi par l'utilisateur n'est jamais touché.
+#[cfg(test)]
+mod tests_exclusif_suit_asio_4184 {
+    use super::{SuiteExclusif, suite_de_l_exclusif};
+
+    #[test]
+    fn choisir_asio_sans_exclusif_prealable_le_marque_arme_par_asio() {
+        assert_eq!(
+            suite_de_l_exclusif("wasapi", "asio", false, false),
+            SuiteExclusif::ArmeParAsio
+        );
+        assert_eq!(
+            suite_de_l_exclusif("auto", "ASIO", false, false),
+            SuiteExclusif::ArmeParAsio,
+            "insensible à la casse"
+        );
+    }
+
+    #[test]
+    fn choisir_asio_quand_l_exclusif_etait_deja_a_l_utilisateur_ne_marque_rien() {
+        assert_eq!(
+            suite_de_l_exclusif("wasapi", "asio", true, false),
+            SuiteExclusif::Inchange
+        );
+    }
+
+    #[test]
+    fn quitter_asio_desarme_ce_qu_asio_avait_arme() {
+        assert_eq!(
+            suite_de_l_exclusif("asio", "wasapi", true, true),
+            SuiteExclusif::DesarmeAvecAsio
+        );
+        assert_eq!(
+            suite_de_l_exclusif("asio", "auto", true, true),
+            SuiteExclusif::DesarmeAvecAsio
+        );
+    }
+
+    #[test]
+    fn quitter_asio_laisse_un_exclusif_choisi_par_l_utilisateur() {
+        assert_eq!(
+            suite_de_l_exclusif("asio", "wasapi", true, false),
+            SuiteExclusif::Inchange,
+            "il l'avait armé lui-même avant ASIO : on ne touche pas"
+        );
+    }
+
+    #[test]
+    fn rester_sur_le_meme_backend_ne_change_rien() {
+        assert_eq!(
+            suite_de_l_exclusif("asio", "asio", true, true),
+            SuiteExclusif::Inchange
+        );
+        assert_eq!(
+            suite_de_l_exclusif("wasapi", "wasapi", true, false),
+            SuiteExclusif::Inchange
+        );
     }
 }
