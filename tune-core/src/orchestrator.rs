@@ -1346,6 +1346,10 @@ mod annonce_lire_contre_aleatoire;
 #[cfg(test)]
 mod wav_override_tests;
 
+/// #3183 — le plafond de fréquence désarme le passthrough ALAC (écart n° 1) ;
+/// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
+#[cfg(test)]
+mod alac_passthrough_tests;
 #[cfg(test)]
 mod plafond_16_bits_tests;
 /// #4016 — le plafond de 4 GiB de l en-tete RIFF, mesure puis route.

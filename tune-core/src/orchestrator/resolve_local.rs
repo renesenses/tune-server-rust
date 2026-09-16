@@ -1071,6 +1071,8 @@ impl PlaybackOrchestrator {
         let SourceEtZone {
             zone,
             zone_output_type,
+            sample_rate,
+            zone_max_sample_rate,
             ..
         } = source;
         let is_network_output = sorties.is_network_output;
@@ -1080,11 +1082,20 @@ impl PlaybackOrchestrator {
             dlna_cap_16bit,
             ..
         } = *forcages;
-        let alac_passthrough = source_format == Some(AudioFormat::Alac)
-            && is_network_output
-            && !dlna_force_wav
-            && !dlna_cap_16bit
-            && ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id);
+        // Par la MÊME fonction que le miroir du chemin du signal (#3183, écart
+        // n° 1) : le plafond de fréquence désarme le passthrough comme le
+        // plafond 16 bits — un ALAC 96 kHz ne se lit pas sur un renderer qui
+        // plafonne à 48 kHz, et le laisser « voulu » sautait la négociation
+        // FLAC (`will_be_flac`) tout en faisant mentir le panneau.
+        let alac_passthrough = alac_passthrough_applies(
+            zone_output_type.as_deref(),
+            source_format,
+            *sample_rate,
+            *zone_max_sample_rate,
+            dlna_force_wav,
+            dlna_cap_16bit,
+            || ZoneRepo::with_backend(self.db.clone()).get_alac_passthrough(req.zone_id),
+        );
         // Même mécanique pour l'AAC (Marco Polo, #1424) : un Marantz SR7009 ou
         // un Denon RC12 le décodent nativement, et le transcoder en FLAC ne fait
         // que retarder le premier son et consommer du processeur — l'AAC étant

@@ -2008,6 +2008,182 @@ async fn le_plafond_de_frequence_du_catalogue_fait_tomber_le_verdict_comme_l_orc
 }
 
 // ------------------------------------------------------------------
+// #3183 — les deux écarts qui restaient au tag v0.9.151, confrontés à la
+// VRAIE décision sur la même base, la même zone et la même piste.
+//
+// Écart n° 1 : « ALAC direct » coché ET un plafond de fréquence dépassé.
+// L'orchestrateur rééchantillonne (le renderer ne lit pas au-dessus du
+// plafond), donc transcode en FLAC ; ce miroir recopiait la condition du
+// passthrough à la main — CINQUIÈME copie — sans le plafond, et annonçait de
+// l'ALAC direct sur un fil de FLAC. Les deux côtés appellent désormais
+// `alac_passthrough_applies`.
+//
+// Écart n° 2 : une zone `diretta` n'est PAS une sortie réseau, et ce n'est
+// pas un oubli : c'est une sortie PULL qui décode elle-même. Le passthrough
+// n'y a pas d'objet, et l'y armer jetterait l'égaliseur (#1393). Les deux
+// côtés doivent le dire pareil, case cochée ou non.
+
+/// Un VRAI ALAC de la caisse, annoncé `sample_rate`/`bit_depth` en base.
+fn piste_alac(backend: &Arc<dyn DbBackend>, sample_rate: i32, bit_depth: i32) -> i64 {
+    let chemin = if sample_rate > 48_000 {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tune-core/tests/fixtures/alac/ref_24_96000_stereo.m4a"
+        )
+    } else {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tune-core/tests/fixtures/alac/ref_16_44100_stereo.m4a"
+        )
+    };
+    let mut t = tune_core::db::models::Track::new("Piste ALAC 3183".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some("alac".into());
+    t.sample_rate = Some(sample_rate);
+    t.bit_depth = Some(bit_depth);
+    t.channels = 2;
+    t.file_size = std::fs::metadata(chemin).ok().map(|m| m.len() as i64);
+    t.source = "local".into();
+    tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .create(&t)
+        .unwrap()
+}
+
+/// Écart n° 1 : ALAC 96 kHz/24 bits, « ALAC direct » coché, plafond de zone à
+/// 48 kHz. L'orchestrateur sert du FLAC 48 kHz ; le panneau doit montrer le
+/// même fil — un transcodage ALAC → FLAC 48 kHz, pas un ALAC direct
+/// rééchantillonné (un conteneur que Tune ne sait pas écrire).
+#[tokio::test]
+async fn alac_direct_au_dessus_du_plafond_de_frequence_est_transcode_comme_l_orchestrateur() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_alac_passthrough(zone_id, true).unwrap();
+    repo.update_max_sample_rate(zone_id, Some(48_000)).unwrap();
+    // Le miroir lit le plafond sur la zone : la relire après l'écriture.
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    let track_id = piste_alac(&backend, 96_000, 24);
+
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.mime_type, "audio/flac",
+        "l'orchestrateur ne sert pas un ALAC 96 kHz à une zone plafonnée à 48 kHz"
+    );
+    assert_eq!(r.sample_rate, Some(48_000));
+
+    let sp = build_signal_path(
+        &en_lecture(track_id, "alac", 96_000, 24),
+        &zone,
+        &backend,
+        Some("Renderer plafonné"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict(&sp),
+        Some(false),
+        "le fil porte du FLAC rééchantillonné : pas bit-perfect : {sp}"
+    );
+    assert_eq!(
+        transcoder_desc(&sp).as_deref(),
+        Some("ALAC 96kHz/24bit \u{2192} FLAC 48kHz/24bit"),
+        "le panneau annonçait un ALAC direct sur un fil de FLAC (#3183, écart n° 1) : {sp}"
+    );
+    assert_eq!(
+        step_desc(&sp, "Resampler").as_deref(),
+        Some("96kHz \u{2192} 48kHz")
+    );
+}
+
+/// Témoin de l'écart n° 1 : le MÊME réglage, plafond relevé à 96 kHz — la
+/// préférence s'applique, des deux côtés.
+#[tokio::test]
+async fn alac_direct_sous_le_plafond_de_frequence_part_tel_quel_comme_l_orchestrateur() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let repo = ZoneRepo::with_backend(backend.clone());
+    repo.update_alac_passthrough(zone_id, true).unwrap();
+    repo.update_max_sample_rate(zone_id, Some(96_000)).unwrap();
+    let zone = repo.get(zone_id).unwrap().unwrap();
+    let track_id = piste_alac(&backend, 96_000, 24);
+
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.mime_type, "audio/mp4",
+        "sous le plafond, l'ALAC part direct"
+    );
+
+    let sp = build_signal_path(
+        &en_lecture(track_id, "alac", 96_000, 24),
+        &zone,
+        &backend,
+        Some("Renderer plafonné"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(verdict(&sp), Some(true), "{sp}");
+    assert_eq!(transcoder_desc(&sp), None, "aucun transcodage : {sp}");
+    assert_eq!(step_desc(&sp, "Resampler"), None);
+}
+
+/// Écart n° 2 : ALAC 44,1/16, « ALAC direct » coché, zone `diretta`. Sans
+/// traitement, l'orchestrateur sert le fichier tel quel (la sortie PULL le
+/// décode) et le panneau le dit bit-perfect. Égaliseur armé, l'orchestrateur
+/// transcode pour qu'il s'entende (#1393) et le panneau annonce l'EQ actif.
+/// La case n'entre dans aucune des deux décisions — c'est ce qu'un ajout de
+/// `diretta` à `is_network_output_type` casserait, en rendant l'égaliseur
+/// muet sur le second cas.
+#[tokio::test]
+async fn alac_direct_sur_une_zone_diretta_suit_l_orchestrateur_avec_et_sans_eq() {
+    let (backend, zone) = diretta_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_alac_passthrough(zone_id, true)
+        .unwrap();
+    let track_id = piste_alac(&backend, 44_100, 16);
+
+    let sans_eq = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        sans_eq.mime_type, "audio/mp4",
+        "sans traitement, la sortie PULL reçoit le fichier tel quel"
+    );
+    let sp = build_signal_path(
+        &en_lecture(track_id, "alac", 44_100, 16),
+        &zone,
+        &backend,
+        Some("Diretta Host"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(verdict(&sp), Some(true), "fil intact : {sp}");
+    assert_eq!(transcoder_desc(&sp), None, "{sp}");
+
+    armer_l_eq(&backend, zone_id);
+    let avec_eq = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        avec_eq.mime_type, "audio/flac",
+        "égaliseur armé : la sortie PULL reçoit le flux traité, case ou pas \
+         (#1393) — `diretta` n'est pas une sortie réseau (#3183, écart n° 2)"
+    );
+    let sp = build_signal_path(
+        &en_lecture(track_id, "alac", 44_100, 16),
+        &zone,
+        &backend,
+        Some("Diretta Host"),
+        "",
+        None,
+    )
+    .unwrap();
+    assert_eq!(verdict(&sp), Some(false), "l'EQ touche le flux : {sp}");
+    let dsp = step_desc(&sp, "DSP").expect("l'étape DSP doit être présente");
+    assert!(dsp.starts_with("EQ actif"), "{dsp}");
+}
+
+// ------------------------------------------------------------------
 // #3183 — la QUATRIÈME copie à la main, celle que le tableau du ticket ne
 // comptait pas.
 //

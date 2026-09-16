@@ -1246,6 +1246,7 @@ fn decider_les_forcages(
         output_container,
         source_format,
         is_dsd,
+        sample_rate,
         bit_depth,
         ..
     } = *source;
@@ -1361,12 +1362,22 @@ fn decider_les_forcages(
         source_is_flac,
         native_flac_opt_in,
     );
-    let alac_passthrough = source_format == Some(AudioFormat::Alac)
-        && is_network_output
-        && !dlna_lpcm
-        && !dlna_wav24
-        && !dlna_cap_16bit
-        && ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id);
+    // #3183 (écart n° 1) — la CINQUIÈME copie à la main, et elle divergeait
+    // sur le plafond de fréquence : la décision rééchantillonne un ALAC qui
+    // dépasse `max_sample_rate` (le renderer ne le lit pas au-dessus), ce
+    // miroir annonçait de l'ALAC direct sur un fil qui porte du FLAC. Les
+    // deux côtés appellent désormais la MÊME fonction, qui désarme le
+    // passthrough sur les trois contraintes du renderer : forçage WAV,
+    // plafond 16 bits, plafond de fréquence.
+    let alac_passthrough = tune_core::orchestrator::alac_passthrough_applies(
+        Some(output_type),
+        source_format,
+        u32::try_from(sample_rate).unwrap_or(0),
+        max_sample_rate,
+        dlna_lpcm || dlna_wav24,
+        dlna_cap_16bit,
+        || ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id),
+    );
     // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
     let aac_passthrough = source_format == Some(AudioFormat::Aac)
         && is_network_output
