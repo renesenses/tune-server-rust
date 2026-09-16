@@ -23,6 +23,10 @@ for line in sys.stdin:
         nb = pairing_code.generate_nonce()
         client_id = b64url_encode(X25519PrivateKey.generate().public_key().public_bytes_raw())
         result = {"commit": pairing_code.commit(nb).hex(), "client_id": client_id}
+    elif q["op"] == "retry":
+        sid = b"sendspin-pair-pake-v1" + h + q["index"].to_bytes(4,"big") + q["round"].to_bytes(4,"big")
+        scenario = q.get("scenario", scenario)
+        result = {"ready": True}
     elif q["op"] == "code":
         na = bytes.fromhex(q["nonce_a"])
         if fmt == "static":

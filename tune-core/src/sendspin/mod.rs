@@ -60,6 +60,7 @@
 //! sur le TYPE du premier message, pas sur un échec — et une session qui
 //! l'emprunte est nommée comme telle dans le journal et au registre.
 
+pub mod appairage;
 pub mod identite;
 pub mod jeton;
 pub mod magasin;

@@ -453,3 +453,25 @@ Les resultats sont archives dans ci-a1f74d34 avec SHA256SUMS.
 
 Ces runs precedent le commit des jetons et ne valent pas resultat CI pour
 une tete ulterieure. La PR reste un brouillon, sans appairage complet ni son.
+
+## Orchestration en cours — point de sauvegarde avant renouvellement du cache
+
+JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing.
+
+La machine appairage.rs conduit les messages des trois methodes et emet des
+actions ordonnees : envoi chiffre, attente de geste, demande de code,
+persistance puis acquittement et promotion. Elle garde les nonces et le delai
+sur une reprise, borne les tours, rejette les champs interdits et les erreurs
+de sequence, et ignore les messages en vol apres annulation. Les entrees et
+sorties ne sont pas encore raccordees au WebSocket ni aux routes operateur.
+
+Une premiere version passe 71 tests internes sur Shrek. La garde du nouvel
+essai apres annulation et son treizieme test ont ete ajoutes ensuite ; ils
+restent a valider. Le nouveau banc de dix scenarios sur les messages de la
+machine, avec les primitives du client Python, reste aussi a executer.
+Il ne represente pas encore un parcours WebSocket ou SDK complet.
+Les contre-epreuves et Clippy de cette machine restent a faire.
+
+Ce point sauvegarde le code avant purge du seul target de cette session
+(22 Gio mesures), parce que l'espace libre partage est passe sous 120 Gio.
+La tete publiee de la PR reste 32a3198e jusqu'aux validations de cette etape.

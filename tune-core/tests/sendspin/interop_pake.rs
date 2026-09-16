@@ -183,3 +183,175 @@ fn i3326_pake_reference_vivante_sur_les_api_publiques() {
     }
     assert_eq!(total, 36);
 }
+
+fn charge_action(actions: &[tune_core::sendspin::appairage::ActionAppairage], typ: &str) -> Value {
+    actions
+        .iter()
+        .find_map(|a| match a {
+            tune_core::sendspin::appairage::ActionAppairage::Envoyer {
+                type_message,
+                payload,
+            } if *type_message == typ => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("message attendu : {typ}"))
+}
+
+#[test]
+#[ignore = "orchestration CPace : exige SENDSPIN_REFERENCE_PYTHON epingle"]
+fn i3326_appairage_reference_sequence_et_reprise_completes() {
+    use tune_core::sendspin::Identite;
+    use tune_core::sendspin::appairage::{ActionAppairage, AppairageServeur, MethodeAppairage};
+    use tune_core::sendspin::identite::{b64url, depuis_b64url};
+    use tune_core::sendspin::poignee::InfosPair;
+    use tune_core::sendspin::psk::CategoriePsk;
+    let mut total = 0;
+    for (nom, methode) in [
+        ("static", MethodeAppairage::Statique),
+        ("digits", MethodeAppairage::Dynamique),
+        ("qr", MethodeAppairage::Qr),
+    ] {
+        for suite in Suite::toutes() {
+            for reprise in [false, true] {
+                if nom == "static" && reprise {
+                    continue;
+                }
+                let mut reference = Reference::nouvelle();
+                let h = [42; 32];
+                let debut=reference.demander(json!({"op":"start","format":nom,"suite":if suite==Suite::AesGcm {"aes"} else {"chacha"},"scenario":if reprise {"wrong_code"} else {"ok"},"h":hex(&h),"index":3,"round":1}));
+                let infos = InfosPair {
+                    client_id: debut["client_id"].as_str().unwrap().to_owned(),
+                    server_id: Identite::depuis_prive([32; 32]).id(),
+                    suite,
+                    categorie_psk: CategoriePsk::Sentinelle,
+                    psk_id: tune_core::sendspin::psk::identifiant(
+                        &tune_core::sendspin::psk::sentinelle(),
+                    ),
+                    identifiant_perdu: false,
+                    condensat_poignee: h,
+                };
+                let maintenant = std::time::Instant::now();
+                let (mut s, activation) =
+                    AppairageServeur::commencer(infos, methode, 3, maintenant).unwrap();
+                assert_eq!(
+                    charge_action(&activation, "server/activate")["activities"],
+                    json!(["pairing"])
+                );
+                let mut init = json!({"pairing_index":3});
+                if nom != "static" {
+                    init["commit_B"] = json!(b64url(&bytes(&debut, "commit")));
+                }
+                let a = s.recevoir("client/pair-init", &init, maintenant).unwrap();
+                let nonce_a = if nom == "static" {
+                    vec![0; 32]
+                } else {
+                    depuis_b64url(
+                        charge_action(&a, "server/pair-init")["nonce_A"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap()
+                };
+                let mut premier_partage = None;
+                for tour in 1..=if reprise { 2 } else { 1 } {
+                    if tour == 2 {
+                        assert_eq!(
+                            reference.demander(
+                                json!({"op":"retry","index":3,"round":2,"scenario":"ok"})
+                            )["ready"],
+                            true
+                        );
+                    }
+                    let code = reference.demander(json!({"op":"code","nonce_a":hex(&nonce_a)}));
+                    let mut prs = bytes(&code, "code");
+                    if reprise && tour == 1 {
+                        if nom == "qr" {
+                            prs[0] ^= 1;
+                        } else {
+                            prs[0] = if prs[0] == b'0' { b'1' } else { b'0' };
+                        }
+                    }
+                    let saisie = if nom == "qr" {
+                        format!(
+                            "SP:1{}",
+                            data_encoding::BASE32_NOPAD.encode(&prs).replace('2', "9")
+                        )
+                    } else {
+                        String::from_utf8(prs).unwrap()
+                    };
+                    let a = s.saisir_code(&saisie, maintenant).unwrap();
+                    let ya = depuis_b64url(
+                        charge_action(&a, "server/pair-auth")["pake_msg_1"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if let Some(ancien) = premier_partage.as_ref() {
+                        assert_ne!(&ya, ancien, "une reprise tire un nouvel ephemere");
+                    }
+                    premier_partage = Some(ya.clone());
+                    assert_eq!(
+                        reference.demander(json!({"op":"share","share":hex(&ya)}))["ready"],
+                        true
+                    );
+                    let a = s
+                        .recevoir(
+                            "client/pair-auth",
+                            &json!({"pake_msg_2":b64url(&bytes(&code,"share"))}),
+                            maintenant,
+                        )
+                        .unwrap();
+                    let tag = depuis_b64url(
+                        charge_action(&a, "server/pair-confirm")["server_kc"]
+                            .as_str()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let fin = reference.demander(json!({"op":"confirm","tag":hex(&tag)}));
+                    if reprise && tour == 1 {
+                        assert_eq!(fin["verified"], false);
+                        let a = s
+                            .recevoir("client/pair-retry", &json!({}), maintenant)
+                            .unwrap();
+                        assert_eq!(
+                            charge_action(&a, "server/pair-init"),
+                            json!({}),
+                            "le nonce reste celui du premier tour"
+                        );
+                        continue;
+                    }
+                    assert_eq!(fin["verified"], true);
+                    let mut confirm = json!({"client_kc":b64url(&bytes(&fin,"tag"))});
+                    if nom != "static" {
+                        confirm["wrapped_nonce_B"] = json!(b64url(&bytes(&fin, "wrapped_nonce")));
+                    }
+                    assert!(
+                        s.recevoir("client/pair-confirm", &confirm, maintenant)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    let a = s
+                        .recevoir(
+                            "client/pair-finalize",
+                            &json!({"wrapped_psk":b64url(&bytes(&fin,"wrapped_psk"))}),
+                            maintenant,
+                        )
+                        .unwrap();
+                    assert_eq!(a.len(), 1, "pas d'acquittement avant le magasin");
+                    assert!(
+                        matches!(&a[0],ActionAppairage::Persister(p) if p.identifiant()==fin["psk_id"].as_str().unwrap())
+                    );
+                    let a = s.confirmer_persistance().unwrap();
+                    assert_eq!(charge_action(&a, "server/pair-finalize"), json!({}));
+                    assert!(
+                        matches!(&a[1],ActionAppairage::Promouvoir(p) if p.identifiant()==fin["psk_id"].as_str().unwrap())
+                    );
+                }
+                reference.finir();
+                total += 1;
+                println!("Sequence appairage {nom} {suite} reprise={reprise}: attendu");
+            }
+        }
+    }
+    assert_eq!(total, 10);
+}

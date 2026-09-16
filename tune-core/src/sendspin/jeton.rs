@@ -83,7 +83,7 @@ fn decoder(
         return Err(ErreurAppairage::Protocole("version du jeton"));
     }
     let mut corps = Zeroizing::new(texte[1..].replace('9', "2"));
-    while corps.len() % 8 != 0 {
+    while !corps.len().is_multiple_of(8) {
         corps.push('=');
     }
     let mut charge = Zeroizing::new(
