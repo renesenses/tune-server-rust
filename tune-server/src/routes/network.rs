@@ -47,6 +47,14 @@ pub fn router() -> Router<AppState> {
         .route("/mounts", get(list_mounts).post(create_mount))
         .route("/mounts/{id}", axum::routing::delete(delete_mount))
         .route("/media-servers", get(list_media_servers))
+        .route(
+            "/library-sources",
+            get(super::synchronisation_upnp::list).post(super::synchronisation_upnp::act),
+        )
+        .route(
+            "/media-servers/{id}/library-source",
+            post(super::synchronisation_upnp::subscribe),
+        )
         .route("/shares", get(list_shares))
         .route("/scan-host", get(scan_host))
         .route("/smb/discover", get(list_smb_shares).post(trigger_smb_scan))
@@ -201,7 +209,7 @@ async fn delete_mount(State(state): State<AppState>, Path(id): Path<i64>) -> imp
 ///
 /// Idempotent, quelques lignes au plus, et sans effet de bord visible : une
 /// observation ne réécrit ni `first_seen_at`, ni `active`.
-async fn synchroniser_le_registre(state: &AppState) {
+pub(super) async fn synchroniser_le_registre(state: &AppState) {
     use tune_core::db::media_server_repo::{
         MediaServerRepo, ObservationServeurRecue, horodatage_il_y_a,
     };
@@ -1176,91 +1184,187 @@ async fn browse_media_server(
 // liste est très incomplète (~100 sur x xxx)" (Pierre M). Loop over
 // StartingIndex, accumulating children until NumberReturned==0 or
 // StartingIndex>=TotalMatches, with a safety bound.
+/// Navigation keeps the successfully read pages; indexing also inspects `erreur`.
 pub(crate) async fn parcourir_les_enfants(
-    content_directory_url: &str,
-    nom_du_serveur: &str,
+    url: &str,
+    nom: &str,
     object_id: &str,
 ) -> (Vec<Value>, Vec<Value>, u32) {
-    const PAGE_SIZE: u32 = 200;
-    const MAX_PAGES: u32 = 500; // up to 100k children
-    // Client partagé (voir `tune_core::http::client`). Le délai d'attente de
-    // 30 s compte ici : la boucle ci-dessous peut enchaîner jusqu'à 500 pages,
-    // et un client reqwest nu n'impose aucune limite — un serveur DLNA qui
-    // accepte la connexion sans jamais répondre bloquait la requête sans fin.
-    let client = tune_core::http::client::shared();
-    let mut containers: Vec<Value> = Vec::new();
-    let mut items: Vec<Value> = Vec::new();
-    let mut starting_index: u32 = 0;
-    let mut total_matches: u32 = 0;
+    let p = parcourir_les_enfants_verifie(url, nom, object_id).await;
+    (p.conteneurs, p.items, p.total)
+}
 
-    for _page in 0..MAX_PAGES {
-        let soap_body = format!(
+pub(crate) struct ParcoursEnfants {
+    pub conteneurs: Vec<Value>,
+    pub items: Vec<Value>,
+    pub total: u32,
+    pub erreur: Option<String>,
+}
+
+/// Reject incomplete XML even when its counters happen to describe zero items.
+fn xml_complet(xml: &str, root: &[u8]) -> bool {
+    use quick_xml::{Reader, events::Event};
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0usize;
+    let mut seen = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if depth == 0 {
+                    if seen || e.local_name().as_ref() != root {
+                        return false;
+                    }
+                    seen = true;
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(e)) if depth == 0 => {
+                if seen || e.local_name().as_ref() != root {
+                    return false;
+                }
+                seen = true;
+            }
+            Ok(Event::End(_)) => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Text(e)) if depth == 0 && !e.iter().all(u8::is_ascii_whitespace) => {
+                return false;
+            }
+            Ok(Event::Eof) => return seen && depth == 0,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+/// A failed or truncated Browse must never authorize reconciliation.
+pub(crate) async fn parcourir_les_enfants_verifie(
+    content_directory_url: &str,
+    nom: &str,
+    object_id: &str,
+) -> ParcoursEnfants {
+    let mut p = ParcoursEnfants {
+        conteneurs: vec![],
+        items: vec![],
+        total: 0,
+        erreur: None,
+    };
+    let mut start = 0u32;
+    let mut update_id: Option<String> = None;
+    let mut total_annonce: Option<u32> = None;
+    let mut termine = false;
+    let object_id = object_id
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    for _ in 0..500 {
+        let body = format!(
             r#"<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
-<s:Body>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
 <u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
-<ObjectID>{object_id}</ObjectID>
-<BrowseFlag>BrowseDirectChildren</BrowseFlag>
-<Filter>*</Filter>
-<StartingIndex>{starting_index}</StartingIndex>
-<RequestedCount>{PAGE_SIZE}</RequestedCount>
-<SortCriteria></SortCriteria>
-</u:Browse>
-</s:Body>
-</s:Envelope>"#
+<ObjectID>{object_id}</ObjectID><BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter>
+<StartingIndex>{start}</StartingIndex><RequestedCount>200</RequestedCount><SortCriteria></SortCriteria>
+</u:Browse></s:Body></s:Envelope>"#
         );
-
-        let resp = match client
+        let response = tune_core::http::client::shared()
             .post(content_directory_url)
             .header("Content-Type", "text/xml; charset=utf-8")
             .header(
                 "SOAPAction",
                 "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
             )
-            .body(soap_body)
+            .body(body)
             .timeout(std::time::Duration::from_secs(10))
             .send()
-            .await
-        {
+            .await;
+        let response = match response.and_then(reqwest::Response::error_for_status) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(
-                    "browse_media_server soap_error server={nom_du_serveur} \
-                     start={starting_index} err={e}"
-                );
+                p.erreur = Some(format!("{nom} : échec de lecture à l’index {start} : {e}"));
                 break;
             }
         };
-
-        let body = resp.text().await.unwrap_or_default();
-        let (mut page_containers, mut page_items) = parse_didl_browse_response(&body);
-        let parsed = (page_containers.len() + page_items.len()) as u32;
-
-        // NumberReturned / TotalMatches are un-escaped siblings of the escaped
-        // DIDL <Result> in the SOAP body — no collision with the payload.
-        let number_returned: u32 = extract_xml_tag(&body, "NumberReturned")
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(parsed);
-        if let Some(tm) = extract_xml_tag(&body, "TotalMatches").and_then(|s| s.trim().parse().ok())
-        {
-            total_matches = tm;
-        }
-
-        containers.append(&mut page_containers);
-        items.append(&mut page_items);
-
-        if number_returned == 0 || parsed == 0 {
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => {
+                p.erreur = Some(format!("{nom} : réponse interrompue : {e}"));
+                break;
+            }
+        };
+        let returned =
+            extract_xml_tag(&body, "NumberReturned").and_then(|v| v.trim().parse::<u32>().ok());
+        let total =
+            extract_xml_tag(&body, "TotalMatches").and_then(|v| v.trim().parse::<u32>().ok());
+        let valid_result = extract_xml_tag(&body, "Result").is_some_and(|raw| {
+            if raw.trim().is_empty() {
+                return returned == Some(0) && total == Some(0);
+            }
+            if raw.trim_start().starts_with('<') {
+                return xml_complet(&raw, b"DIDL-Lite");
+            }
+            quick_xml::escape::unescape(&raw)
+                .is_ok_and(|decoded| xml_complet(&decoded, b"DIDL-Lite"))
+        });
+        if !xml_complet(&body, b"Envelope") || !valid_result {
+            p.erreur = Some(format!("{nom} : réponse XML incomplète ou invalide"));
             break;
         }
-        // Advance by what the server actually returned (robust against servers
-        // that page smaller than RequestedCount).
-        starting_index += number_returned.max(parsed);
-        if total_matches != 0 && starting_index >= total_matches {
+        let update = extract_xml_tag(&body, "UpdateID");
+        let (mut containers, mut items) = parse_didl_browse_response(&body);
+        let parsed = (containers.len() + items.len()) as u32;
+        // Missing counters, malformed XML/HTML and SOAP faults are not empty libraries.
+        let Some(returned) = returned else {
+            p.erreur = Some(format!("{nom} : réponse Browse sans compteur valide"));
+            break;
+        };
+        if returned != parsed || total.is_none() {
+            p.erreur = Some(format!(
+                "{nom} : réponse Browse incomplète ({parsed}/{returned})"
+            ));
+            break;
+        }
+        let total = total.unwrap();
+        if total_annonce.is_some_and(|t| t != total) || (start > 0 && update != update_id) {
+            p.erreur = Some(format!("{nom} : le catalogue a changé pendant le parcours"));
+            break;
+        }
+        total_annonce = Some(total);
+        update_id = update;
+        p.total = total;
+        p.conteneurs.append(&mut containers);
+        p.items.append(&mut items);
+        if returned == 0 {
+            if total != 0 && start < total {
+                p.erreur = Some(format!("{nom} : pagination interrompue ({start}/{total})"));
+            } else {
+                termine = true;
+            }
+            break;
+        }
+        let Some(next) = start.checked_add(returned) else {
+            p.erreur = Some(format!("{nom} : débordement de pagination"));
+            break;
+        };
+        start = next;
+        if total > 0 && start >= total {
+            if start == total {
+                termine = true;
+            } else {
+                p.erreur = Some(format!("{nom} : pagination incohérente ({start}/{total})"));
+            }
             break;
         }
     }
-
-    (containers, items, total_matches)
+    if !termine && p.erreur.is_none() {
+        p.erreur = Some(format!("{nom} : plafond de 500 pages atteint"));
+    }
+    if let Some(e) = &p.erreur {
+        tracing::warn!("{e}");
+    }
+    p
 }
 
 #[derive(serde::Deserialize)]

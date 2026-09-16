@@ -47,8 +47,8 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
-            id TEXT PRIMARY KEY DEFAULT nextval('streaming_favorites_id_seq')::text,\
-            profile_id TEXT NOT NULL DEFAULT '1',\
+            id BIGINT PRIMARY KEY DEFAULT nextval('streaming_favorites_id_seq'),\
+            profile_id BIGINT NOT NULL DEFAULT 1,\
             item_type TEXT NOT NULL,\
             service TEXT NOT NULL,\
             service_id TEXT NOT NULL,\
@@ -164,6 +164,9 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             created_at TEXT\
         )",
     "CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at)",
+    "CREATE TABLE IF NOT EXISTS upnp_library_sources (\n    source_key TEXT PRIMARY KEY,\n    udn TEXT NOT NULL,\n    container TEXT NOT NULL,\n    state_json TEXT NOT NULL\n)",
+    "CREATE TABLE IF NOT EXISTS upnp_library_members (\n    source_key TEXT NOT NULL REFERENCES upnp_library_sources(source_key) ON DELETE CASCADE,\n    track_id BIGINT NOT NULL,\n    generation TEXT NOT NULL,\n    PRIMARY KEY (source_key, track_id)\n)",
+    "CREATE INDEX IF NOT EXISTS idx_upnp_library_members_track ON upnp_library_members(track_id)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the

@@ -273,6 +273,8 @@ pub struct PlayingDecision {
 /// `gapless_enabled` are supplied by the caller (queue lookup / zone config).
 #[derive(Debug, Clone, Copy)]
 pub struct PlayingInput {
+    /// Position and elapsed time only imply completion for realtime renderers.
+    pub realtime: bool,
     pub gapless_advance_pending: bool,
     pub has_next: bool,
     pub gapless_sent: bool,
@@ -333,8 +335,9 @@ pub fn classify_playing(i: &PlayingInput) -> PlayingDecision {
                 i.position_ms,
                 i.wall_elapsed_secs,
             );
-    let past_end_track_ended =
-        reached_end && effective_past_end_ticks.saturating_add(1) >= POSITION_PAST_END_TICKS;
+    let past_end_track_ended = i.realtime
+        && reached_end
+        && effective_past_end_ticks.saturating_add(1) >= POSITION_PAST_END_TICKS;
     PlayingDecision {
         confirm_gapless_advance,
         transition_detected,
@@ -743,6 +746,7 @@ mod tests {
 
     fn pbase() -> PlayingInput {
         PlayingInput {
+            realtime: true,
             gapless_advance_pending: false,
             has_next: true,
             gapless_sent: false,

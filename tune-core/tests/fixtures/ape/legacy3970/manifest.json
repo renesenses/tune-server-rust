@@ -1,0 +1,98 @@
+[
+  {
+    "name": "stereo16_c4000",
+    "channels": 2,
+    "bits": 16,
+    "compression": 4000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "0365b453336ffa878e06bfba45c4c9e8f4573421dcf567242d334dde4c4aeb46",
+    "pcm_sha256": "b3565da2af2d1872ce4c8cc930de40d852c07e73dff85b3363a2a5271fa0e258",
+    "bytes": 14792,
+    "tune_pcm_sha256": "b3565da2af2d1872ce4c8cc930de40d852c07e73dff85b3363a2a5271fa0e258"
+  },
+  {
+    "name": "stereo16_c2000",
+    "channels": 2,
+    "bits": 16,
+    "compression": 2000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "59d2c62c46268e9ed0dd58c8bc34b6015a57c2030d8fa7ca3a2ad188d9e9c71f",
+    "pcm_sha256": "b3565da2af2d1872ce4c8cc930de40d852c07e73dff85b3363a2a5271fa0e258",
+    "bytes": 14716,
+    "tune_pcm_sha256": "b3565da2af2d1872ce4c8cc930de40d852c07e73dff85b3363a2a5271fa0e258"
+  },
+  {
+    "name": "mono16_c4000",
+    "channels": 1,
+    "bits": 16,
+    "compression": 4000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "d675e7361799983f32eb14691cca618822d8521b189145cf6c22460e2ff998e1",
+    "pcm_sha256": "0cc2bf37e9a506edf2f1211b38d71d11b7577d45600b184877cc5f54a9122e51",
+    "bytes": 5304,
+    "tune_pcm_sha256": "0cc2bf37e9a506edf2f1211b38d71d11b7577d45600b184877cc5f54a9122e51"
+  },
+  {
+    "name": "stereo24_c4000",
+    "channels": 2,
+    "bits": 24,
+    "compression": 4000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "88a3c24cbd678ee15d022cdc61b9d60a61511f120c948e1b6173cc341d9c42b4",
+    "pcm_sha256": "32a10612d942db6146735e46751a451f8672bb2e2a5dde1172748da05c824f23",
+    "bytes": 23708,
+    "tune_pcm_sha256": "32a10612d942db6146735e46751a451f8672bb2e2a5dde1172748da05c824f23"
+  },
+  {
+    "name": "stereo8_c4000",
+    "channels": 2,
+    "bits": 8,
+    "compression": 4000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "aed4f60fb6e83bb83097b3aa4178b9501d418bbe5eae5eafecf5a5dd3ba02f56",
+    "pcm_sha256": "d303fdda5863ed723b4eacaf18901e24441a68d95208d43f2784931dff275591",
+    "bytes": 6144,
+    "tune_pcm_sha256": "19791b0e3a765b97fd38f9180c09d4ee97a68505e7f793bcacae7acbbd83f80b"
+  },
+  {
+    "name": "pseudo16_c4000",
+    "channels": 2,
+    "bits": 16,
+    "compression": 4000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "6597e12fcb2e6eabd4c9d7e2f0ff7e56692b3b7fe3288f55d96771d1d27d8251",
+    "pcm_sha256": "92e06b11ce7e8db2cfca2603ea2adce72bb064f1a55b5f33c7ef9d8ac4324f36",
+    "bytes": 5308,
+    "tune_pcm_sha256": "92e06b11ce7e8db2cfca2603ea2adce72bb064f1a55b5f33c7ef9d8ac4324f36"
+  },
+  {
+    "name": "silence16_c4000",
+    "channels": 2,
+    "bits": 16,
+    "compression": 4000,
+    "blocks": 4096,
+    "frames": 1,
+    "ape_sha256": "35cd75052c76e86c0a879eee1a966ebcdcae4d2e26963fc2873664ee127e536f",
+    "pcm_sha256": "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe",
+    "bytes": 52,
+    "tune_pcm_sha256": "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe"
+  },
+  {
+    "name": "multiframe16_c4000",
+    "channels": 2,
+    "bits": 16,
+    "compression": 4000,
+    "blocks": 299008,
+    "frames": 2,
+    "ape_sha256": "87142125ffa3892f9cfef0c34d754aab2abc5e1b6e25b6d6bcc59fa0bdd5b679",
+    "pcm_sha256": "fdd65fb14724b01611b9486429c4aa9bf0e23c57271bef7d8606ad1b041deed9",
+    "bytes": 443732,
+    "tune_pcm_sha256": "fdd65fb14724b01611b9486429c4aa9bf0e23c57271bef7d8606ad1b041deed9"
+  }
+]

@@ -184,14 +184,21 @@ fn asio_warm_disabled_by_env() -> bool {
 /// Lance le préchauffage du cache ASIO, protégé par le témoin de plantage.
 #[cfg(feature = "local-audio")]
 fn spawn_asio_warm_scan() {
-    // `list_asio_devices()` ne fait rien hors Windows : pas de témoin, pas de
-    // thread, comportement inchangé sur macOS et Linux.
-    if !cfg!(target_os = "windows") {
+    // Sans hôte ASIO compilé, ne pas bloquer le repli WASAPI d'une ancienne
+    // préférence "asio", même si un témoin de crash existe encore (#4168).
+    if !tune_core::outputs::local::asio_available() {
         return;
     }
 
     let sentinel = asio_warm_sentinel_path();
     let decision = asio_warm_decision(&sentinel, asio_warm_disabled_by_env());
+
+    // Fermer la porte SYNCHRONEMENT avant de lancer le thread : une requête
+    // réglages/diagnostic ne doit pas profiter de son délai de démarrage.
+    // Réarmer le témoin autorisera le prochain processus, pas celui-ci.
+    if decision != AsioWarmDecision::Run {
+        tune_core::outputs::local::block_asio_device_enumeration();
+    }
 
     tokio::task::spawn_blocking(move || match decision {
         AsioWarmDecision::SkippedByEnv => {
@@ -272,6 +279,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     resolve_ytdlp(state).await;
     restore_convolvers(state).await;
     warm_sqlite_cache(state);
+    crate::routes::synchronisation_upnp::start(state.clone());
 
     // Re-register manually-added devices (BluOS, legacy DLNA renderers that
     // don't answer SSDP M-SEARCH). Done off the startup path so an offline
@@ -2857,6 +2865,29 @@ mod registre_executions_tests {
         assert!(
             apres.duration_ms.is_none(),
             "on n'a jamais vu la fin de cette passe"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "local-audio"))]
+mod asio_scan_boot_4168_tests {
+    #[test]
+    fn le_blocage_des_listes_precede_le_thread_de_prechauffage() {
+        let source = include_str!("startup.rs");
+        let body = source
+            .split_once("fn spawn_asio_warm_scan()")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let block = body
+            .find("block_asio_device_enumeration()")
+            .expect("le témoin de crash ne ferme plus les listes ASIO à la demande (#4168)");
+        assert!(body.find("if decision != AsioWarmDecision::Run").unwrap() < block);
+        assert!(
+            block < body.find("tokio::task::spawn_blocking").unwrap(),
+            "la fermeture ASIO doit précéder toute course avec une requête réglages"
         );
     }
 }

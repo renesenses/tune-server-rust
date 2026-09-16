@@ -64,6 +64,12 @@ impl PositionPoller {
                         // Clôture de panne (#2566) : muette si le sondage
                         // n'avait jamais échoué.
                         b.journal.succes(zone_id, &device_id);
+                        self.shared_metrics
+                            .lock()
+                            .await
+                            .entry(zone_id)
+                            .or_default()
+                            .echecs_sondage_repos = 0;
                         // Le curseur de volume est inerte tant que dure le DoP :
                         // l'état de zone doit le dire au client (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
@@ -87,6 +93,12 @@ impl PositionPoller {
                         // lui-même, lui, ne change pas d'un tick.
                         let skip_ticks = b.remaining;
                         b.journal.echec(zone_id, &device_id, &e, skip_ticks);
+                        self.shared_metrics
+                            .lock()
+                            .await
+                            .entry(zone_id)
+                            .or_default()
+                            .echecs_sondage_repos = b.journal.echecs();
                         continue;
                     }
                 }
@@ -909,6 +921,10 @@ impl PositionPoller {
                         total_polls: ps.total_polls,
                         total_errors: ps.total_errors,
                         consecutive_errors: ps.consecutive_errors,
+                        echecs_sondage_repos: idle_backoff
+                            .get(&zone_id)
+                            .map(|b| b.journal.echecs())
+                            .unwrap_or(0),
                         last_latency_ms: ps.last_latency_ms,
                         max_latency_ms: ps.max_latency_ms,
                         // Chemin RADIO : un flux sans fin ne depasse aucune
@@ -1953,6 +1969,7 @@ impl PositionPoller {
                         .as_ref()
                         .is_some_and(|np| np.source == "radio");
                     let mut fsm_pin = fsm::PlayingInput {
+                        realtime: status.realtime,
                         gapless_advance_pending: ps.gapless_advance_pending,
                         has_next: fsm_has_next,
                         gapless_sent: ps.gapless_sent,
@@ -2364,11 +2381,15 @@ impl PositionPoller {
                             status.position_ms,
                             wall_elapsed,
                         );
-                    if past_end
-                        || reached_end_exclusive
-                        || wall_clock_past_end
-                        || chromecast_wall_clock_past_end
-                        || dlna_frozen_end
+                    // A non-realtime output may still be processing after the
+                    // nominal track duration. Only its actual completion can
+                    // end the track; renderer position/clock fallbacks cannot.
+                    if status.realtime
+                        && (past_end
+                            || reached_end_exclusive
+                            || wall_clock_past_end
+                            || chromecast_wall_clock_past_end
+                            || dlna_frozen_end)
                     {
                         ps.past_end_ticks += 1;
                         if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
@@ -2539,6 +2560,10 @@ impl PositionPoller {
                     total_polls: ps.total_polls,
                     total_errors: ps.total_errors,
                     consecutive_errors: ps.consecutive_errors,
+                    echecs_sondage_repos: idle_backoff
+                        .get(&zone_id)
+                        .map(|b| b.journal.echecs())
+                        .unwrap_or(0),
                     last_latency_ms: ps.last_latency_ms,
                     max_latency_ms: ps.max_latency_ms,
                     lecture_au_dela_de_la_duree: ps.depassement_duree_signale,

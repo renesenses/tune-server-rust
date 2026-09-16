@@ -157,8 +157,8 @@ pub(super) fn zone_replaygain_step(
     track_id: Option<i64>,
 ) -> Option<ReplayGainStep> {
     use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_detail,
-        stored_gain_detail, stored_gain_source,
+        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_factor_with_peak,
+        stored_gain_source, stored_gain_with_peak,
     };
     // PURE : le PCM atteint la sortie intact, le gain n'est jamais appliqué.
     if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
@@ -166,13 +166,15 @@ pub(super) fn zone_replaygain_step(
     }
     let tid = track_id?;
     let settings = ReplayGainSettings::load(backend);
-    let (gain, source) = stored_gain_detail(backend, tid, settings.mode)?;
-    let (factor, retenue) = gain_factor_detail(gain, settings);
+    let (gain, source, peak_kind) = stored_gain_with_peak(backend, tid, settings.mode)?;
+    let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
+    let peak_headroom_db = peak_kind.headroom_db(settings);
+    let alters_audio = (factor - 1.0).abs() > 1e-6;
     let refus = retenue == RetenueAntiEcretage::GainPositifRefuseSansPic;
     // Même seuil que l'orchestrateur (`zone_replaygain_changes_audio`). Un
     // REFUS échappe au seuil : son facteur vaut justement 1,0, et c'est
     // précisément ce qu'il faut dire.
-    if !refus && (factor - 1.0).abs() <= 1e-6 {
+    if !refus && !alters_audio && peak_headroom_db == 0.0 {
         return None;
     }
     // Le dB affiché est celui qui multiplie réellement les échantillons
@@ -186,7 +188,7 @@ pub(super) fn zone_replaygain_step(
     // le mode demandé. Une base illisible ne doit rien inventer : on retombe
     // sur la description d'avant, sans mention d'origine.
     let origin = stored_gain_source(backend, tid, source);
-    let description = if refus {
+    let mut description = if refus {
         // Dire les DEUX choses : ce que les tags demandaient, et pourquoi ça
         // ne s'applique pas. Le gain demandé est celui du tag plus le
         // pré-ampli — ce que l'auditeur a réglé, pas ce que le garde-fou en a
@@ -204,13 +206,22 @@ pub(super) fn zone_replaygain_step(
             None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
         }
     };
+    if peak_headroom_db > 0.0 {
+        description.push_str(&format!(
+            " — pic d'échantillon, réserve estimée de {peak_headroom_db:.1} dB (crête vraie inconnue)"
+        ));
+    } else if peak_kind == tune_core::audio::replaygain::PeakKind::TruePeak {
+        description.push_str(" — crête vraie disponible");
+    }
     Some(ReplayGainStep {
         description,
         granularity: label,
         source: origin.map(GainSource::as_str),
         clipping_guard: retenue.as_str(),
         // Un refus ne touche pas un échantillon : le fil reste intact.
-        alters_audio: !refus,
+        alters_audio,
+        peak_kind: peak_kind.as_str(),
+        peak_headroom_db,
     })
 }
 
@@ -227,6 +238,8 @@ pub(super) struct ReplayGainStep {
     /// `"none"` / `"tagged_peak"` / `"refused_no_peak"` (#4072) : ce que
     /// l'anti-écrêtage a retenu sur le facteur demandé.
     clipping_guard: &'static str,
+    peak_kind: &'static str,
+    peak_headroom_db: f64,
     /// Cette étape multiplie-t-elle réellement les échantillons ? Faux pour un
     /// refus, qui laisse le fil intact.
     alters_audio: bool,
@@ -741,6 +754,8 @@ fn assembler_les_etapes(
             // #4072 : ce que l'anti-écrêtage a retenu, et ce que l'étage a
             // écrêté depuis le démarrage (portée processus, dite dans l'objet).
             "clipping_guard": rg.clipping_guard,
+            "peak_kind": rg.peak_kind,
+            "peak_headroom_db": rg.peak_headroom_db,
             "metrics": replaygain_ecretage_metrics(),
         }));
     }
