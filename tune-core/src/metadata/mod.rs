@@ -79,7 +79,25 @@ pub struct TrackMetadata {
     pub format: Option<String>,
     pub file_size: Option<u64>,
     pub bpm: Option<f64>,
-    pub compilation: bool,
+    /// Le tag « compilation » du fichier — `TCMP` en ID3, `COMPILATION` en
+    /// VorbisComment, `cpil` en MP4, tous trois rendus par
+    /// `ItemKey::FlagCompilation`.
+    ///
+    /// 🔴 TROIS états, et c'est tout l'objet de la phase 1 du chantier
+    /// « gestion du tag compilation » (arbitrage C1 de Bertrand, 14/09/2026 :
+    /// *le tag fait foi, la forme des dossiers sert de repli*) :
+    ///
+    /// - `Some(true)`  — le fichier DIT qu'il est dans une compilation ;
+    /// - `Some(false)` — le fichier DIT qu'il n'y est pas ;
+    /// - `None`        — le fichier ne dit rien, et c'est LÀ, et seulement là,
+    ///   que la forme des dossiers a le droit de trancher.
+    ///
+    /// Un `bool` confondait les deux derniers : « pas de tag » et « tag à
+    /// zéro » rendaient tous deux `false`, donc un coffret étiqueté
+    /// `COMPILATION=0` était indiscernable d'un coffret muet, et la forme des
+    /// dossiers le renversait sans que rien ne s'y oppose.
+    pub compilation: Option<bool>,
+
     pub label: Option<String>,
     pub catalog_number: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
@@ -1786,7 +1804,7 @@ fn dsf_dff_fallback_complete(
         // Même décodeur que le chemin lofty : voir `lire_drapeau_compilation`.
         let drapeau_compilation = lire_drapeau_compilation(tags.get("TCMP"));
         drapeau_compilation.journaliser(path);
-        let compilation = drapeau_compilation.actif();
+        let compilation = drapeau_compilation.tri_etat();
 
         let mut credits = Vec::new();
         if let Some(composer) = tags.composer() {
@@ -1848,7 +1866,8 @@ fn dsf_dff_fallback_complete(
             false,
             None,
             None,
-            false,
+            // `compilation` : aucune balise lue ici, donc ABSENCE de tag.
+            None,
             Vec::new(),
         )
     };
@@ -2056,7 +2075,8 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         duration_ms: None,
         bit_depth: None,
         bpm: None,
-        compilation: false,
+        // Aucun tag lu sur ce chemin : ABSENCE, et non « tag a zero ».
+        compilation: None,
         label: None,
         catalog_number: None,
         musicbrainz_recording_id: None,
@@ -2194,7 +2214,8 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         duration_ms: Some(props.duration().as_millis() as u64),
         bit_depth: props.bit_depth().map(|b| b as u16).or(probed_bit_depth),
         bpm: None,
-        compilation: false,
+        // Aucun tag lu sur ce chemin : ABSENCE, et non « tag a zero ».
+        compilation: None,
         label: None,
         catalog_number: None,
         musicbrainz_recording_id: None,
@@ -2265,7 +2286,8 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         duration_ms: None,
         bit_depth: None,
         bpm: None,
-        compilation: false,
+        // Aucun tag lu sur ce chemin : ABSENCE, et non « tag a zero ».
+        compilation: None,
         label: None,
         catalog_number: None,
         musicbrainz_recording_id: None,
@@ -2824,6 +2846,23 @@ impl DrapeauCompilation {
         matches!(self, DrapeauCompilation::Vrai)
     }
 
+    /// Le tri-état que [`TrackMetadata::compilation`] retient depuis la
+    /// phase 1 du chantier (C1) : `Some(true)` / `Some(false)` quand le
+    /// fichier affirme quelque chose, `None` sinon.
+    ///
+    /// `Illisible` vaut `None`, comme `Absent` : une graphie qu'on ne sait pas
+    /// lire n'est pas une intention et ne doit pas prendre le pas sur la forme
+    /// des dossiers. La différence entre les deux reste dite par
+    /// [`Self::journaliser`]. Fusion de #4148 et #4157, faite à la descente
+    /// de `batch/compilation-phase1` dans la v0.9.151.
+    pub(crate) fn tri_etat(&self) -> Option<bool> {
+        match self {
+            DrapeauCompilation::Vrai => Some(true),
+            DrapeauCompilation::Faux => Some(false),
+            DrapeauCompilation::Absent | DrapeauCompilation::Illisible(_) => None,
+        }
+    }
+
     /// Écrit dans le journal ce que le `bool` perd.
     ///
     /// Les noms d'évènement sont STABLES : la phase 0 du chantier compte
@@ -3021,7 +3060,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     let brut_compilation = get(ItemKey::FlagCompilation);
     let drapeau_compilation = lire_drapeau_compilation(brut_compilation.as_deref());
     drapeau_compilation.journaliser(path);
-    let compilation = drapeau_compilation.actif();
+    let compilation = drapeau_compilation.tri_etat();
 
     let bpm = get(ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
 
@@ -4436,7 +4475,7 @@ mod tests {
         assert!(md.title.is_none());
         assert!(md.artist.is_none());
         assert!(md.genres.is_empty());
-        assert!(!md.compilation);
+        assert_eq!(md.compilation, None);
         assert!(!md.has_cover);
         assert!(md.credits.is_empty());
     }
@@ -4997,7 +5036,35 @@ mod tests {
         assert!(json["sample_rate"].is_null());
         assert!(json["bit_depth"].is_null());
         assert!(json["duration_ms"].is_null());
-        assert_eq!(json["compilation"], false);
+        // `compilation` a TROIS états depuis la phase 1 du chantier du tag
+        // (C1) : l'ABSENCE de tag est `null`, et ne se confond plus avec un
+        // tag qui dit `false`. C'est précisément cette confusion qui rendait
+        // C1 inapplicable — voir `TrackMetadata::compilation`.
+        //
+        // Le champ ne figure dans aucun contrat client (`docs/contrat-web.json`
+        // ne le porte pas, et la route `?compilation=` est un filtre sans
+        // rapport) : le changement de forme ne traverse aucun écran.
+        assert!(
+            json["compilation"].is_null(),
+            "aucun tag lu ⇒ null, et non false"
+        );
+        assert_eq!(
+            serde_json::to_value(TrackMetadata {
+                compilation: Some(false),
+                ..Default::default()
+            })
+            .unwrap()["compilation"],
+            false,
+            "un tag qui DIT non se distingue de l'absence de tag"
+        );
+        assert_eq!(
+            serde_json::to_value(TrackMetadata {
+                compilation: Some(true),
+                ..Default::default()
+            })
+            .unwrap()["compilation"],
+            true
+        );
         assert_eq!(json["has_cover"], false);
     }
 
@@ -5015,7 +5082,7 @@ mod tests {
             bit_depth: Some(24),
             channels: Some(2),
             bpm: Some(120.5),
-            compilation: true,
+            compilation: Some(true),
             has_cover: true,
             cover_art: None,
             genres: vec!["Jazz".into(), "Fusion".into()],
