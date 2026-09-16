@@ -5296,6 +5296,7 @@ dependencies = [
  "criterion",
  "csv",
  "curve25519-elligator2",
+ "data-encoding",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",

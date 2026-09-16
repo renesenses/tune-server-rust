@@ -61,6 +61,7 @@
 //! l'emprunte est nommée comme telle dans le journal et au registre.
 
 pub mod identite;
+pub mod jeton;
 pub mod magasin;
 pub mod messages;
 pub mod pake;

@@ -74,6 +74,7 @@ hmac = "0.12" # meme famille digest 0.10 que sha2
 aes-gcm = "0.10"
 subtle = "2.6"
 zeroize = "1"
+data-encoding = "2.11"
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }

@@ -377,3 +377,79 @@ Les journaux finaux portent les préfixes `pake-core-`, `pake-server-`,
 `pake-interop-`, `clippy-pake.log` et `fmt-pake.log`.
 La batterie CI de la PR brouillon est une porte distincte, sans résultat
 revendiqué à cette étape.
+
+## Etape suivante : entrees operateur des jetons et codes
+
+JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing.
+
+Le module jeton lit les versions SP:0 (cle publique du client puis PSK
+provisoire) et SP:1 (24 octets de code QR). La PSK provisoire n'est obtenue
+qu'en fournissant l'identite correspondante de la connexion Noise.
+Les autres versions, les encodages malformes, les charges tronquees et
+les identites X25519 de faible ordre sont refuses. La Sentinelle ne peut
+pas etre promue en PSK d'appairage.
+
+Les saisies tolerent la casse, l'absence de prefixe, les espaces autour
+du jeton et la translitteration 9/2. Les octets d'extension sont ignores
+apres validation de l'encodage entier. Les codes chiffres acceptent les
+groupements par espaces et tirets, en conservant les zeros initiaux.
+Le QR fournit ses octets bruts a CPace, jamais le texte du jeton.
+
+data-encoding 2.11.0 devient une dependance directe ; cette version etait
+deja verrouillee. Aucun nouveau paquet ni mise a jour de paquet existant
+dans cette etape.
+
+Les deux vecteurs normatifs et 24 cas produits par les decodeurs du SDK
+epingle sont conserves dans jeton/ ; les 16 cas valides couvrent notamment
+les extensions, les 8 autres sont tronques. Un temoin du module PAKE
+inspecte les octets effectivement produits par la saisie normalisee.
+La reference, son script de regeneration et le SHA-256 sont documentes dans
+tune-core/src/sendspin/jeton/VECTORS.md.
+
+Le premier passage sur Shrek passe 59 tests internes (52 precedents et
+7 nouveaux), avec deux jobs et une priorite CPU basse sous forte charge.
+Cette entree operateur reste a brancher aux commandes authentifiees et
+a l'orchestration WebSocket avant de sortir la PR du brouillon.
+
+### Contre-epreuves des entrees operateur
+
+Commande : cargo test --locked -j2 -p tune-core --no-default-features
+--features oaat --lib i3326_jeton_ (priorite CPU 19).
+
+Deux gardes de production sont retirees dans une meme compilation :
+la comparaison entre identite saisie et identite de la connexion, et la
+troncature de la charge aux octets definis par la version du jeton.
+Compilation reussie, puis 4 tests verts et 2 rouges (code 101) :
+
+- i3326_jeton_identite_et_psk_sont_liees_au_transport :
+  « le secret du jeton ne doit jamais etre utilisable pour un autre client » ;
+- i3326_jeton_extensions_et_troncatures_concordent_avec_python :
+  « les octets d'extension sont reserves ».
+
+Les fichiers jeton/tests.rs, jeton/reference.json, pake/tests.rs et le
+generateur Python sont inchanges par SHA-256. Le code est restaure avec cp,
+puis --lib sendspin:: repasse 59 tests, aucun echec ni ignore.
+Le journal rouge est counter-jeton.log ; la sauvegarde est
+jeton.rs.before-counter ; le retour au vert est jeton-unit-final.log.
+
+Les 24 tests d'integration du coeur, les 17 tests serveur et les 46 scenarios
+d'interoperabilite restent les mesures de la tete a1f74d34, avant cette
+brique d'entree. Ils ne sont pas recomptes comme une nouvelle execution.
+
+Clippy de tune-core --lib passe sur la brique de saisie avec
+--locked --no-default-features --features oaat -D clippy::correctness.
+Le formatage du workspace et git diff --check passent egalement.
+Ces controles ne sont pas annonces sans avertissements : le depot en emet.
+
+### CI de la premiere tete du brouillon
+
+La tete a1f74d349b28f881758564f55dffe2ca52598a2c de la PR #4263
+passe la CI 35100091300 et PostgreSQL 35100091389.
+Les journaux du job Test montrent les 16 temoins CPace, les temoins de
+transport, de stockage et les cinq temoins de persistance serveur #3326.
+Les deux bancs Python restent ignores en CI et sont executes explicitement
+sur Shrek ; l'auxiliaire multiprocessus est appele par son test parent.
+Les resultats sont archives dans ci-a1f74d34 avec SHA256SUMS.
+
+Ces runs precedent le commit des jetons et ne valent pas resultat CI pour
+une tete ulterieure. La PR reste un brouillon, sans appairage complet ni son.

@@ -483,3 +483,34 @@ fn i3326_pake_ne_publie_pas_les_secrets_dans_debug() {
         }
     }
 }
+
+#[test]
+fn i3326_pake_saisie_operateur_preserve_les_octets_du_code() {
+    use crate::sendspin::jeton::lire_code;
+    for (saisie, format, attendu) in [
+        (" 0123-4567 ", FormatCode::Statique, b"01234567".as_slice()),
+        ("\t012-345\n", FormatCode::Dynamique, b"012345".as_slice()),
+        ("0 1 2 3 4 5", FormatCode::Dynamique, b"012345".as_slice()),
+    ] {
+        assert_eq!(
+            lire_code(saisie, format).unwrap().octets.as_slice(),
+            attendu
+        );
+    }
+    let qr = lire_code(
+        " sp:14dq6fy7e4xtop9hj5lv6z3po57ypd4xt6t97n5y ",
+        FormatCode::Qr,
+    )
+    .unwrap();
+    assert_eq!(qr.octets.as_slice(), &(0xe0..=0xf7).collect::<Vec<u8>>());
+    for code in [
+        "12345",
+        "1234567",
+        "１２３４５６",
+        "12x345",
+        "12\t345",
+        "12_345",
+    ] {
+        assert!(lire_code(code, FormatCode::Dynamique).is_err());
+    }
+}
