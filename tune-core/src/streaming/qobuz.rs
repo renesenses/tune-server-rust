@@ -2488,35 +2488,73 @@ impl StreamingService for QobuzService {
         /// `get_featured_playlists(tag)`, qui pagine.
         const PER_TAG: usize = 50;
 
+        /// Catégories interrogées EN MÊME TEMPS. Treize appels d'un coup
+        /// (`join_all`) faisaient tomber les derniers servis quand Qobuz
+        /// freine ; quatre à la fois suffisent à rendre la page en moins
+        /// d'une seconde sans le provoquer.
+        const EN_PARALLELE: usize = 4;
+        /// Une catégorie qui tombe est réessayée UNE fois, après cette pause.
+        const PAUSE_AVANT_REESSAI: std::time::Duration = std::time::Duration::from_millis(400);
+
+        // Fabien, fil 1780 (16/09/2026, point 6 ; tune-web-client#1059) :
+        // « il manque le widget des playlists Qobuz "Humeurs" ». Le .18 sert
+        // treize catégories, Humeurs comprise — mais chaque catégorie qui
+        // échouait (`.ok()?`) disparaissait SANS une ligne de journal, et
+        // les treize partaient en parallèle : la quatrième de la liste est
+        // exactement celle qui tombe quand Qobuz limite. Une catégorie
+        // absente était indiscernable d'une catégorie qui n'a jamais existé.
         let tags = self.get_playlist_tags().await?;
-        let rows = futures_util::future::join_all(tags.into_iter().map(|tag| async move {
-            let limit = PER_TAG.to_string();
-            let mut params: Vec<(&str, &str)> = vec![
-                ("type", "editor-picks"),
-                ("tags", tag.id.as_str()),
-                ("limit", &limit),
-            ];
-            if let Some(g) = genre {
-                params.push(("genre_ids", g));
-            }
-            let data = self
-                .api_get_editorial("/playlist/getFeatured", &params)
-                .await
-                .ok()?;
-            let playlists: Vec<StreamPlaylist> = data["playlists"]["items"]
-                .as_array()
-                .map(|items| items.iter().map(Self::map_featured_playlist).collect())
-                .unwrap_or_default();
-            if playlists.is_empty() {
-                return None;
-            }
-            Some(PlaylistTagGroup {
-                id: tag.id,
-                name: tag.name,
-                playlists,
+        use futures_util::StreamExt;
+        let rows: Vec<Option<PlaylistTagGroup>> = futures_util::stream::iter(tags.into_iter())
+            .map(|tag| async move {
+                let limit = PER_TAG.to_string();
+                let mut params: Vec<(&str, &str)> = vec![
+                    ("type", "editor-picks"),
+                    ("tags", tag.id.as_str()),
+                    ("limit", &limit),
+                ];
+                if let Some(g) = genre {
+                    params.push(("genre_ids", g));
+                }
+                let mut data = self
+                    .api_get_editorial("/playlist/getFeatured", &params)
+                    .await;
+                if let Err(e) = &data {
+                    tracing::warn!(tag = %tag.id, error = %e, "qobuz_categorie_playlists_echec_reessai");
+                    tokio::time::sleep(PAUSE_AVANT_REESSAI).await;
+                    data = self
+                        .api_get_editorial("/playlist/getFeatured", &params)
+                        .await;
+                }
+                let data = match data {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            tag = %tag.id,
+                            nom = %tag.name,
+                            error = %e,
+                            "qobuz_categorie_playlists_absente_de_la_reponse"
+                        );
+                        return None;
+                    }
+                };
+                let playlists: Vec<StreamPlaylist> = data["playlists"]["items"]
+                    .as_array()
+                    .map(|items| items.iter().map(Self::map_featured_playlist).collect())
+                    .unwrap_or_default();
+                if playlists.is_empty() {
+                    tracing::debug!(tag = %tag.id, "qobuz_categorie_playlists_vide");
+                    return None;
+                }
+                Some(PlaylistTagGroup {
+                    id: tag.id,
+                    name: tag.name,
+                    playlists,
+                })
             })
-        }))
-        .await;
+            .buffered(EN_PARALLELE)
+            .collect()
+            .await;
         Ok(rows.into_iter().flatten().collect())
     }
 
@@ -5718,5 +5756,94 @@ mod tests_pagination_detail {
             remaining_page_offsets_bornees(12, 12, TAILLE_PAGE_DETAIL, PLAFOND_ELEMENTS_DETAIL)
                 .is_empty()
         );
+    }
+}
+
+/// Fabien, fil 1780, point 6 (tune-web-client#1059) : « il manque le widget
+/// des playlists Qobuz "Humeurs" ». Contre un Qobuz simulé qui LIMITE — la
+/// première réponse à la catégorie `mood` est un 429 — la catégorie doit
+/// quand même sortir, par le réessai ; et une catégorie qui tombe deux fois
+/// sort du résultat sans emporter les autres.
+#[cfg(test)]
+mod tests_categories_qui_tombent {
+    use super::*;
+    use axum::extract::Query;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `echecs_mood` : combien de fois `mood` répond 429 avant de servir ;
+    /// `hires` échoue TOUJOURS.
+    async fn qobuz_qui_limite(echecs_mood: usize) -> (String, Arc<AtomicUsize>) {
+        let appels = Arc::new(AtomicUsize::new(0));
+        let restants = Arc::new(AtomicUsize::new(echecs_mood));
+        let compteur = Arc::clone(&appels);
+        let app = Router::new()
+            .route(
+                "/playlist/getTags",
+                get(|| async {
+                    Json(json!({"tags": [
+                        {"id": "hi-res", "name_json": "{\"fr\":\"Hi-Res\"}"},
+                        {"id": "new", "name_json": "{\"fr\":\"Nouveautés\"}"},
+                        {"id": "mood", "name_json": "{\"fr\":\"Humeurs\"}"},
+                    ]}))
+                }),
+            )
+            .route(
+                "/playlist/getFeatured",
+                get(move |Query(q): Query<Carte<String, String>>| {
+                    let compteur = Arc::clone(&compteur);
+                    let restants = Arc::clone(&restants);
+                    async move {
+                        compteur.fetch_add(1, Ordering::SeqCst);
+                        let tag = q.get("tags").cloned().unwrap_or_default();
+                        if tag == "hi-res" {
+                            return Err(StatusCode::TOO_MANY_REQUESTS);
+                        }
+                        if tag == "mood"
+                            && restants
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok()
+                        {
+                            return Err(StatusCode::TOO_MANY_REQUESTS);
+                        }
+                        Ok(Json(json!({"playlists": {"items": [
+                            {"id": 1, "name": format!("pl-{tag}"), "tracks_count": 3}
+                        ]}})))
+                    }
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), appels)
+    }
+
+    #[tokio::test]
+    async fn une_categorie_qui_tombe_une_fois_est_reessayee_et_servie() {
+        let (base, appels) = qobuz_qui_limite(1).await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let groupes = svc
+            .get_featured_playlists_by_tag(None)
+            .await
+            .expect("serveur simulé");
+        let ids: Vec<&str> = groupes.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["new", "mood"],
+            "Humeurs revient par le réessai, Hi-Res tombe deux fois et sort"
+        );
+        // new : 1 appel ; mood : 2 ; hi-res : 2 ⇒ 5.
+        assert_eq!(appels.load(Ordering::SeqCst), 5);
     }
 }
