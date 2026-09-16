@@ -37,10 +37,15 @@ const MAX_NOISE: usize = 65535;
 
 /// Monte le VRAI routeur du point d'accès, dans le mode demandé.
 async fn point_d_acces(mode: ModeTransition) -> String {
+    let temporaire = tempfile::tempdir().unwrap();
+    let contexte = tune_server::routes::sendspin::ContexteSendspin::nouveau(
+        temporaire.path().join("sendspin"),
+    );
+
     let app = axum::Router::new()
         .nest(
             "/sendspin",
-            tune_server::routes::sendspin::router::<()>(mode),
+            tune_server::routes::sendspin::router::<()>(mode, contexte),
         )
         .with_state(());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -48,6 +53,7 @@ async fn point_d_acces(mode: ModeTransition) -> String {
         .expect("socket ephemere");
     let adresse = ecoute.local_addr().expect("adresse");
     tokio::spawn(async move {
+        let _temporaire = temporaire;
         let _ = axum::serve(ecoute, app).await;
     });
     format!("ws://{adresse}/sendspin")
@@ -307,7 +313,7 @@ async fn avec_le_mode_de_transition_un_client_capable_de_noise_negocie_quand_mem
 
     // 4. message Noise 2.
     let mut tampon = vec![0u8; MAX_NOISE];
-    let n = etat.write_message(&[], &mut tampon).expect("noise 2");
+    let n = etat.write_message(b"{}", &mut tampon).expect("noise 2");
     tampon.truncate(n);
     ws.send(Message::Text(
         serde_json::json!({
@@ -453,6 +459,8 @@ async fn une_identite_deja_vue_en_noise_ne_peut_pas_revenir_en_clair() {
         client_id: id.clone(),
         suite: Some(Suite::ChaChaPoly.nom().to_string()),
         chiffre: true,
+        categorie_psk: Some(psk::CategoriePsk::Sentinelle),
+        cle_non_reconnue: false,
         nom: Some("Enceinte connue".into()),
         roles: vec!["player@v1".into()],
         player_support: None,

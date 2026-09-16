@@ -285,6 +285,7 @@ pub fn router_with_plugins(
     state: AppState,
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
+    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path);
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -500,7 +501,7 @@ pub fn router_with_plugins(
         // garde cette ligne pour ça.
         .nest(
             "/sendspin",
-            sendspin::router(tune_core::sendspin::ModeTransition::en_vigueur()),
+            sendspin::router(tune_core::sendspin::ModeTransition::en_vigueur(), contexte_sendspin.clone()),
         )
         .nest("/api/v1/ws", ws::router())
         .nest("/ws/bridge", bridge::router())
@@ -566,6 +567,7 @@ pub fn router_with_plugins(
         ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
     )
     .layer(axum::middleware::from_fn(cache_control_middleware))
+    .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new())
     .layer(CorsLayer::permissive())
 }

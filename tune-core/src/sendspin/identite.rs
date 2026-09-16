@@ -113,9 +113,24 @@ pub fn cle_publique_du_pair(identifiant: &str) -> Result<[u8; TAILLE_CLE], Erreu
     }
     let octets = depuis_b64url(identifiant)?;
     let taille = octets.len();
-    octets.try_into().map_err(|_| {
+    let cle = octets.try_into().map_err(|_| {
         ErreurSendspin::IdentifiantInvalide(format!("{TAILLE_CLE} octets attendus, {taille} recus"))
-    })
+    })?;
+    if !cle_contributive(&cle) {
+        return Err(ErreurSendspin::IdentifiantInvalide(
+            "cle X25519 de faible ordre".into(),
+        ));
+    }
+    Ok(cle)
+}
+
+/// Une cle de faible ordre donne un DH nul avec TOUT scalaire X25519 bride.
+/// Le scalaire de sonde est public : aucun secret de pair ne sert a ce test.
+/// snow 0.10 ne fait pas ce refus dans son resolveur par defaut.
+pub(super) fn cle_contributive(cle: &[u8; TAILLE_CLE]) -> bool {
+    StaticSecret::from([0x42; TAILLE_CLE])
+        .diffie_hellman(&PublicKey::from(*cle))
+        .was_contributory()
 }
 
 #[cfg(test)]

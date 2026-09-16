@@ -98,6 +98,7 @@ pub struct NoiseHandshake {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChargeMessageUn {
     pub psk_id: String,
+    pub psk_category: super::psk::CategoriePsk,
 }
 
 /// `server/hello` — première parole de Tune une fois le tuyau chiffré.

@@ -44,7 +44,7 @@ getrandom = "0.2"
 
 # --- Sendspin (#3326) : cryptographie et encodage, sur TOUTES les plateformes.
 #
-# Ces quatre caisses ne doivent PAS retourner sous
+# Ces dependances ne doivent PAS retourner sous
 # `[target.'cfg(unix)'.dependencies]`. Ce bloc-là existe pour l'appairage
 # AirPlay 2, qui est effectivement unix ; Sendspin, lui, tourne partout où Tune
 # tourne — Windows compris. La CI « Windows + ASIO » est la garde : elle a
@@ -67,6 +67,14 @@ snow = { version = "0.10", default-features = false, features = [
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 rand_core = { version = "0.6", features = ["getrandom"] }
+# S2-b : Elligator2 du groupe X25519, confirme contre CPace draft-21.
+# Version epinglee : le mode Legacy conserve le bit 254 requis par CPace.
+curve25519-elligator2 = { version = "=0.1.0-alpha.2", default-features = false, features = ["alloc", "digest", "zeroize"] }
+hmac = "0.12" # meme famille digest 0.10 que sha2
+aes-gcm = "0.10"
+subtle = "2.6"
+zeroize = "1"
+data-encoding = "2.11"
 blowfish = { workspace = true }
 chrono = { workspace = true }
 cbc = { workspace = true }

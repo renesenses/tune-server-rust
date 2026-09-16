@@ -1,16 +1,7 @@
-//! Les clés pré-partagées, et **seulement** celle que S2-a a le droit
-//! d'employer.
+//! PSK Sendspin : categorie de confiance et liaison a une identite de pair.
 //!
-//! Le protocole connaît trois catégories de PSK : `lt` (longue durée, née d'un
-//! appairage), `pr` (appairage en cours) et `sn` (**Sentinelle**). Les deux
-//! premières sont le sujet de S2-b et n'ont aucune place ici.
-//!
-//! La Sentinelle est une **constante publiée** : elle est identique chez tous
-//! les pairs, donc elle n'authentifie personne. Elle sert à ce que la couche
-//! Noise ait une PSK à mêler quand aucune autre ne s'applique — c'est-à-dire
-//! exactement la situation de S2-a, qui monte le tuyau chiffré avant que
-//! l'appairage n'existe. Le chiffrement et l'intégrité sont réels ; **la preuve
-//! d'identité, elle, ne l'est pas encore**, et c'est ce que S2-b apportera.
+//! La sentinelle est publique. Une PSK d'appairage ou longue duree ne doit
+//! jamais etre choisie pour une autre cle publique, meme si son secret coincide.
 
 use sha2::{Digest, Sha256};
 
@@ -45,6 +36,85 @@ pub fn identifiant(psk: &[u8; TAILLE_PSK]) -> String {
     hacheur.update(ETIQUETTE_PSK_ID);
     hacheur.update(psk);
     b64url(&hacheur.finalize())
+}
+
+/// La categorie fait partie de la charge authentifiee du message Noise 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CategoriePsk {
+    #[serde(rename = "sn")]
+    Sentinelle,
+    #[serde(rename = "pr")]
+    Appairage,
+    #[serde(rename = "lt")]
+    LongueDuree,
+}
+
+/// Un secret et sa destination. Debug ne montre jamais les octets de la PSK.
+#[derive(Clone)]
+pub struct PskPair {
+    secret: [u8; TAILLE_PSK],
+    categorie: CategoriePsk,
+    client_id: Option<String>,
+}
+
+impl std::fmt::Debug for PskPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PskPair")
+            .field("categorie", &self.categorie)
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PskPair {
+    pub fn sentinelle() -> Self {
+        Self {
+            secret: sentinelle(),
+            categorie: CategoriePsk::Sentinelle,
+            client_id: None,
+        }
+    }
+
+    pub fn pour_pair(
+        client_id: &str,
+        secret: [u8; TAILLE_PSK],
+        categorie: CategoriePsk,
+    ) -> Result<Self, super::ErreurSendspin> {
+        super::identite::cle_publique_du_pair(client_id)?;
+        if categorie == CategoriePsk::Sentinelle || secret == sentinelle() {
+            return Err(super::ErreurSendspin::EtatInattendu(
+                "une PSK privee ne peut pas etre la sentinelle publique",
+            ));
+        }
+        Ok(Self {
+            secret,
+            categorie,
+            client_id: Some(client_id.to_owned()),
+        })
+    }
+
+    pub fn categorie(&self) -> CategoriePsk {
+        self.categorie
+    }
+    pub fn identifiant(&self) -> String {
+        identifiant(&self.secret)
+    }
+    pub fn secret(&self) -> &[u8; TAILLE_PSK] {
+        &self.secret
+    }
+
+    pub(super) fn verifier_pair(&self, client_id: &str) -> Result<(), super::ErreurSendspin> {
+        if self
+            .client_id
+            .as_deref()
+            .is_some_and(|attendu| attendu != client_id)
+        {
+            return Err(super::ErreurSendspin::EtatInattendu(
+                "PSK liee a un autre client",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
