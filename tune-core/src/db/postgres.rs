@@ -47,7 +47,7 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
-            id TEXT PRIMARY KEY DEFAULT nextval('streaming_favorites_id_seq')::text,\
+            id BIGINT PRIMARY KEY DEFAULT nextval('streaming_favorites_id_seq'),\
             profile_id BIGINT NOT NULL DEFAULT 1,\
             item_type TEXT NOT NULL,\
             service TEXT NOT NULL,\
