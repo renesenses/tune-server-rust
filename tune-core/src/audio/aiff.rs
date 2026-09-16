@@ -782,4 +782,72 @@ mod tests {
         assert_eq!(decoded.bit_depth, 32);
         assert_eq!(decoded.pcm_bytes().len(), decoded.samples_i32.len() * 4);
     }
+
+    /// AIFF standard (grand-boutien), sans champ de compression : `COMM` fait
+    /// 18 octets et le `FORM` porte `AIFF`, pas `AIFC`.
+    fn synthetic_aiff(bits_per_sample: u16, pcm: &[u8]) -> Vec<u8> {
+        let channels = 1u16;
+        let bytes_per_sample = u32::from(bits_per_sample).div_ceil(8);
+        let num_frames = (pcm.len() as u32) / bytes_per_sample;
+        let mut comm = Vec::new();
+        comm.extend_from_slice(b"COMM");
+        comm.extend_from_slice(&18u32.to_be_bytes());
+        comm.extend_from_slice(&(channels as i16).to_be_bytes());
+        comm.extend_from_slice(&num_frames.to_be_bytes());
+        comm.extend_from_slice(&(bits_per_sample as i16).to_be_bytes());
+        comm.extend_from_slice(&[0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+        let mut ssnd = Vec::new();
+        ssnd.extend_from_slice(b"SSND");
+        ssnd.extend_from_slice(&(8u32 + pcm.len() as u32).to_be_bytes());
+        ssnd.extend_from_slice(&0u32.to_be_bytes());
+        ssnd.extend_from_slice(&0u32.to_be_bytes());
+        ssnd.extend_from_slice(pcm);
+        if pcm.len() % 2 != 0 {
+            ssnd.push(0);
+        }
+        let mut form = Vec::new();
+        form.extend_from_slice(b"FORM");
+        form.extend_from_slice(&(4u32 + comm.len() as u32 + ssnd.len() as u32).to_be_bytes());
+        form.extend_from_slice(b"AIFF");
+        form.extend_from_slice(&comm);
+        form.extend_from_slice(&ssnd);
+        form
+    }
+
+    /// #4266 — le bloc 8 bits du chemin AIFF standard n'avait aucun témoin.
+    /// AIFF est **signé** à 8 bits, contrairement à WAV : une lecture en non
+    /// signé (`(b as i16) - 128`) sortirait le silence à −32 768, pleine
+    /// amplitude négative. Les quatre octets choisis départagent les deux
+    /// lectures un à un.
+    #[test]
+    fn aiff_8_bits_grand_boutien_est_signe_et_sort_en_pcm_16_bits() {
+        let tmp = tempfile::Builder::new().suffix(".aiff").tempfile().unwrap();
+        std::fs::write(tmp.path(), synthetic_aiff(8, &[0x00, 0x7f, 0x80, 0xff])).unwrap();
+
+        let info = parse_aiff(tmp.path().to_str().unwrap()).unwrap();
+        assert!(
+            !info.is_aifc,
+            "le fichier témoin doit être un AIFF standard"
+        );
+        assert_eq!(info.compression, None);
+        assert_eq!(info.bits_per_sample, 8);
+
+        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
+        // Signé : 0x00 → 0, 0x7f → +127, 0x80 → −128, 0xff → −1, chacun
+        // décalé de 8 bits. En non signé on obtiendrait
+        // [−32 768, −256, 0, 32 512] — aucune valeur en commun.
+        assert_eq!(decoded.samples_i32, [0, 32_512, -32_768, -256]);
+        assert_eq!(decoded.bit_depth, 16);
+        assert_eq!(
+            decoded.pcm_bytes(),
+            [0x00, 0x00, 0x00, 0x7f, 0x00, 0x80, 0x00, 0xff]
+        );
+
+        // Porte publique : l'extension canonique `.aiff` doit atteindre ce
+        // parseur, pas seulement l'appel direct depuis le module (#4030).
+        let par_la_porte =
+            crate::audio::decode::decode_to_pcm(tmp.path().to_str().unwrap(), None, None, 0.0, 0.0)
+                .unwrap();
+        assert_eq!(par_la_porte.samples_i32, [0, 32_512, -32_768, -256]);
+    }
 }

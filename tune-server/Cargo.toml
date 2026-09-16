@@ -605,6 +605,16 @@ path = "tests/zones_auto_create_recension.rs"
 name = "serveur_media_didl_hors_auth_3933"
 path = "tests/serveur_media_didl_hors_auth_3933.rs"
 
+# #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
+# signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
+# refus des adresses internes APRÈS résolution DNS, redirections à la main.
+# Passe par le routeur monté (donc l'exemption DIDL de #3933), avec un amont
+# local et un résolveur factice — rien ne sort sur Internet. `autotests =
+# false` plus haut : sans cette entrée, le fichier ne serait JAMAIS compilé.
+[[test]]
+name = "artwork_proxy_relais_ferme_4260"
+path = "tests/artwork_proxy_relais_ferme_4260.rs"
+
 # #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
 # rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
 # jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
@@ -680,3 +690,17 @@ path = "tests/alarm_source_3715.rs"
 [[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
+
+# #3685 — « Remplacer » dans la récupération de playlist : le corps
+# `{replacements}` est lu, appliqué ou refusé nommément. `autotests = false`
+# plus haut : sans cette cible, le banc ne serait jamais compilé.
+[[test]]
+name = "recuperation_playlist_remplacer_3685"
+path = "tests/recuperation_playlist_remplacer_3685.rs"
+
+# #4261 — une panne de base ou de service dans `routes/playback.rs` ne se
+# présente jamais comme un résultat. `autotests = false` : sans cette cible,
+# le fichier ne serait jamais compilé.
+[[test]]
+name = "playback_panne_de_base_4261"
+path = "tests/playback_panne_de_base_4261.rs"

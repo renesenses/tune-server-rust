@@ -668,7 +668,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 }
                 // Le manque à écrire de ce lot, rendu au parcours à la fin de
                 // la fermeture — sœur exacte du scan manuel (#2939).
-                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                let mut ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
                     to_insert.len(),
                     batch_inserted as usize,
                 )
@@ -698,7 +698,19 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         }
                     }
                     if !meta_entries.is_empty() {
-                        meta_repo.set_batch_multi(&meta_entries).ok();
+                        // Le DR lu dans un `foo_dr.txt` voisin (#4186) ne se
+                        // compte que s'il est ENTRÉ en base — sœur exacte du
+                        // scan manuel.
+                        match meta_repo.set_batch_multi(&meta_entries) {
+                            Ok(()) => {
+                                ecritures = ecritures.avec_dr_des_rapports_voisins(
+                                    meta_entries.iter().map(|(_, m)| m),
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "auto_scan_extended_metadata_insert_failed");
+                            }
+                        }
                     }
                 }
 
@@ -1068,6 +1080,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Les fichiers de 0 octet (#2060) — même clé que le scan manuel.
             // Un compteur : il part chez les trois consommateurs.
             "skipped_empty_files": stats.empty_files,
+            // Le DR lu dans un `foo_dr.txt` voisin (#4186) — même clé que le
+            // scan manuel (`ChiffresDeFinDeScan::rapport`).
+            "dr_from_sidecar_file": stats.dr_from_sidecar,
+            // Les Matroska admis / écartés (#3633) — mêmes clés que le scan
+            // manuel (`ChiffresDeFinDeScan::rapport`).
+            "matroska_admitted": stats.matroska_admis,
+            "matroska_rejected": stats.matroska_ecartes,
             "skipped_unsupported_by_ext": skipped_by_ext,
             "skipped_unsupported_reasons": skipped_reasons,
             // Ce que les feuilles CUE décrivent (#1763) — mêmes clés que

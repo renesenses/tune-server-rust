@@ -4489,6 +4489,17 @@ impl OutputTarget for LocalOutput {
                         )
                     }
                 };
+                // #3632 — même règle que le chemin PCM (`BackendCpal::ouvrir`) :
+                // un flux compressé multicanal (FLAC 5.1 servi tel quel par un
+                // serveur multimédia) demande ses N voies au périphérique au
+                // lieu de prendre le défaut stéréo de cpal.
+                let output_config = ouvrir_les_canaux_de_la_source(
+                    &device,
+                    &device_name,
+                    host.id().name(),
+                    output_config,
+                    dec_ch,
+                );
 
                 // Cadence SOURCE : le second candidat de la cascade. Certaines
                 // plateformes (PipeWire) acceptent une cadence arbitraire là où
@@ -6399,6 +6410,14 @@ mod open_failure_tests;
 /// qui est tout son contrat.
 #[cfg(test)]
 mod relache_peripherique_i3575;
+
+/// #3632 — un FLAC 5.1 vers un ampli HDMI sortait en stéréo parce que le flux
+/// cpal prenait le nombre de canaux PAR DÉFAUT du périphérique. La décision
+/// (`choisir_les_canaux_de_sortie`, `resolution.rs`) est pure et éprouvée ici
+/// sur toute la famille 3..=32 ; la garde de site vérifie que les DEUX chemins
+/// cpal l'appliquent.
+#[cfg(test)]
+mod canaux_de_la_source_i3632;
 
 /// #3270 — « la piste ne joue pas, et rien ne le dit ».
 ///

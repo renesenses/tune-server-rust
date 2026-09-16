@@ -111,17 +111,21 @@ pub fn radio_audio_url(base_url: &str, radio_id: i64) -> String {
 ///   pas une URI : `<upnp:albumArtURI>01KV5Z...</upnp:albumArtURI>` n'est
 ///   resolvable par aucun point de controle. [`artwork_url`] sait deja le
 ///   changer en URL Tune — c'est ce qu'il fait pour la pochette d'une piste.
-pub fn radio_logo_url(base_url: &str, logo: &str) -> String {
+///
+/// #4260 : l'URL de relais est **signée** (`&sig=`, HMAC de l'adresse
+/// distante par `secret`, voir [`crate::library::artwork_proxy`]). Publier
+/// `proxy?url=…` en clair sur le LAN faisait de Tune un relais ouvert : tout
+/// appareil du réseau pouvait lui faire chercher n'importe quelle adresse, y
+/// compris interne. Le relais refuse désormais une URL non signée qui lui
+/// arrive par l'exemption DIDL (#3933).
+pub fn radio_logo_url(base_url: &str, logo: &str, secret: &str) -> String {
     let logo = logo.trim();
     if logo.starts_with("http://") || logo.starts_with("https://") {
         // Deja servi par nous : ne pas relayer notre propre adresse.
         if logo.starts_with(base_url) {
             return logo.to_string();
         }
-        return format!(
-            "{base_url}{API_PATH}/library/artwork/proxy?url={}",
-            urlencoding::encode(logo)
-        );
+        return crate::library::artwork_proxy::url_relais_signee(base_url, secret, logo);
     }
     artwork_url(base_url, logo)
 }
@@ -234,6 +238,12 @@ impl UpnpState {
 
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.server_ip(), self.server_port)
+    }
+
+    /// Le secret qui signe les URL de relais de pochette publiées dans la
+    /// DIDL (#4260) — celui de l'instance, créé au premier usage.
+    pub fn secret_relais(&self) -> String {
+        crate::library::artwork_proxy::secret(&self.backend)
     }
 }
 
@@ -1240,7 +1250,7 @@ fn search_containers_in_container(
                 .unwrap_or_default();
             let retenues = retenir_par_titre(stations, titres, |s| s.name.as_str());
             let (page, total) = paginer(retenues, start, count);
-            let mut didl = didl_radios(&page, &base_url);
+            let mut didl = didl_radios(&page, &base_url, &state.secret_relais());
             didl.total = total;
             Some(didl)
         }
@@ -1790,7 +1800,7 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     .ok()
                     .flatten()
             })
-            .map(|station| didl_radio_item(&station, &state.base_url())),
+            .map(|station| didl_radio_item(&station, &state.base_url(), &state.secret_relais())),
         id if id.starts_with("track/") => id
             .strip_prefix("track/")
             .and_then(|n| n.parse::<i64>().ok())
@@ -2489,7 +2499,7 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
     let (page, total) = paginer(stations, start, count);
-    let mut didl = didl_radios(&page, &state.base_url());
+    let mut didl = didl_radios(&page, &state.base_url(), &state.secret_relais());
     // `TotalMatches` dit la taille RÉELLE du dossier, pas celle de la page :
     // c'est de là que le point de contrôle sait qu'il reste des pages.
     didl.total = total;
@@ -2515,10 +2525,14 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 /// PARTAGE avec les pistes — ce que ce commentaire affirmait deja alors que le
 /// XML etait encore ecrit a la main juste en dessous. Voir la note de
 /// [`didl_radio_item`] pour ce que cette main manquait.
-fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
+fn didl_radios(
+    stations: &[crate::db::radio_repo::RadioStation],
+    base: &str,
+    secret: &str,
+) -> DidlResult {
     let mut inner = String::new();
     for station in stations {
-        inner.push_str(&didl_radio_item(station, base));
+        inner.push_str(&didl_radio_item(station, base, secret));
     }
     let total = stations.len() as u64;
     DidlResult {
@@ -2569,14 +2583,18 @@ const RADIO_MIME: &str = "audio/wav";
 /// `audioBroadcast`, le `protocolInfo` reste `http-get:*:audio/wav:*`
 /// ([`crate::outputs::didl::ProtocolStyle::Simple`], le style de tout le
 /// serveur media), et la pochette reste AVANT le `<res>`.
-fn didl_radio_item(station: &crate::db::radio_repo::RadioStation, base: &str) -> String {
+fn didl_radio_item(
+    station: &crate::db::radio_repo::RadioStation,
+    base: &str,
+    secret: &str,
+) -> String {
     let id = format!("radio/{}", station.id.unwrap_or(0));
     let logo = station
         .logo_url
         .as_deref()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|l| radio_logo_url(base, l));
+        .map(|l| radio_logo_url(base, l, secret));
     crate::outputs::didl::DidlBuilder::new(
         &station.name,
         &radio_audio_url(base, station.id.unwrap_or(0)),
@@ -5760,13 +5778,37 @@ mod ssdp_msearch_tests {
         );
 
         // --- TEMOIN : la pochette reste atteignable, relayee par Tune.
+        //
+        // #4260 : l'URL de relais porte la signature HMAC de l'adresse
+        // distante (`&sig=`, `&amp;` une fois dans le XML) — sans elle, le
+        // relais refuse ce qui lui arrive par l'exemption DIDL.
+        let distante = "https://mozaiklabs.fr/storage/radio-logos/abc.png";
         let attendue = format!(
-            "<upnp:albumArtURI>{base}/api/v1/library/artwork/proxy?url={}</upnp:albumArtURI>",
-            urlencoding::encode("https://mozaiklabs.fr/storage/radio-logos/abc.png")
+            "<upnp:albumArtURI>{base}/api/v1/library/artwork/proxy?url={}&amp;sig={}</upnp:albumArtURI>",
+            urlencoding::encode(distante),
+            crate::library::artwork_proxy::signature(&state.secret_relais(), distante)
         );
         assert!(
             didl.contains(&attendue),
-            "l'adresse d'origine n'est pas relayee : {didl}"
+            "l'adresse d'origine n'est pas relayee, ou pas signee : {didl}"
+        );
+    }
+
+    /// #4260 : le secret de signature est CELUI DE L'INSTANCE, persistant —
+    /// une URL mémorisée par un point de contrôle reste valable d'un Browse à
+    /// l'autre, et d'un redémarrage à l'autre (même base, même secret).
+    #[test]
+    fn le_secret_de_relais_est_stable_sur_la_meme_base() {
+        let state = state_du_releve_nd8006();
+        let a = state.secret_relais();
+        let b = state.secret_relais();
+        assert_eq!(a, b, "le secret doit être lu, pas régénéré");
+        assert_eq!(a.len(), 64, "32 octets aléatoires en hexadécimal");
+        let autre = state_du_releve_nd8006();
+        assert_ne!(
+            autre.secret_relais(),
+            a,
+            "deux instances n'ont pas le même secret"
         );
     }
 

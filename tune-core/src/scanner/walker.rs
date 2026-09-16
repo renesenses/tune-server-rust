@@ -571,6 +571,36 @@ pub struct ScanStats {
     /// LESQUELS, plafonnés par [`PLAFOND_CHEMINS_ECARTES`] comme les autres
     /// listes nominatives — un compteur ne dit jamais quel fichier recopier.
     pub empty_file_paths: Vec<String>,
+    /// Combien de pistes ont reçu leur plage dynamique d'un rapport
+    /// `foo_dr.txt` voisin de l'album (#4186) — la mesure du DR Meter de
+    /// foobar2000, que Tune ne savait pas lire.
+    ///
+    /// Comme les deux compteurs d'écriture ci-dessus, ce chiffre ne peut
+    /// venir que de la fermeture d'import : c'est elle qui lit les balises
+    /// étendues et voit la provenance (`dr_source = "sidecar"`). Il remonte
+    /// par [`EcrituresDuLot::dr_sidecar`]. Sans lui, la fonction existe et
+    /// personne ne peut dire si elle a servi : « le DR de Tades est-il lu ? »
+    /// n'aurait pour réponse qu'une requête SQL à la main.
+    pub dr_from_sidecar: usize,
+    /// Les Matroska (`.mkv`/`.mka`/`.webm`) dont la piste audio s'est révélée
+    /// décodable et qui sont ENTRÉS en bibliothèque (#3633, point 2).
+    ///
+    /// Un compteur à part, parce que la question du testeur est « mes MKV
+    /// sont-ils lus ? » et que `metadata_ok` ne la distingue pas : un scan de
+    /// 40 000 FLAC et 12 MKV admis dit `metadata_ok=40012`. Les Matroska
+    /// ÉCARTÉS, eux, sont dans [`Self::unsupported_by_ext`] sous la clé
+    /// `<ext>-codec-non-decodable-<codec>`, et additionnés dans
+    /// [`Self::matroska_ecartes`] — les deux chiffres se lisent l'un contre
+    /// l'autre.
+    pub matroska_admis: usize,
+    /// Les Matroska écartés dans la phase de métadonnées, tous motifs
+    /// confondus (codec sans décodeur, conteneur sans piste audio).
+    pub matroska_ecartes: usize,
+}
+
+/// Un fichier lu par le parcours est-il un Matroska ?
+fn est_matroska(file: &ScannedFile) -> bool {
+    crate::audio::matroska::est_chemin_matroska(Path::new(&file.path))
 }
 
 /// Le motif inscrit dans [`ScanStats::failed_paths`] pour un fichier vide.
@@ -644,6 +674,9 @@ pub struct EcrituresDuLot {
     pub insert_failed: usize,
     /// Lignes présentées à la mise à jour et refusées par la base.
     pub update_failed: usize,
+    /// Pistes dont la plage dynamique vient d'un `foo_dr.txt` voisin
+    /// (#4186) — voir [`ScanStats::dr_from_sidecar`].
+    pub dr_sidecar: usize,
 }
 
 impl EcrituresDuLot {
@@ -651,6 +684,7 @@ impl EcrituresDuLot {
     pub const SANS_PERTE: Self = Self {
         insert_failed: 0,
         update_failed: 0,
+        dr_sidecar: 0,
     };
 
     /// Le manque à écrire d'un lot : ce qui a été présenté moins ce qui est
@@ -660,6 +694,7 @@ impl EcrituresDuLot {
         Self {
             insert_failed: presentees_a_l_insertion.saturating_sub(insertions_reussies),
             update_failed: 0,
+            dr_sidecar: 0,
         }
     }
 
@@ -670,6 +705,24 @@ impl EcrituresDuLot {
         mises_a_jour_reussies: usize,
     ) -> Self {
         self.update_failed = presentees.saturating_sub(mises_a_jour_reussies);
+        self
+    }
+
+    /// Le nombre de pistes du lot dont le DR vient du rapport voisin (#4186).
+    ///
+    /// Compté UNE fois ici, sur les balises étendues que la fermeture vient
+    /// de lire, plutôt qu'à la main dans chacun des deux scans : c'est la
+    /// recopie qui diverge (#2012).
+    pub fn avec_dr_des_rapports_voisins<'a>(
+        mut self,
+        balises_etendues: impl IntoIterator<Item = &'a std::collections::HashMap<String, String>>,
+    ) -> Self {
+        self.dr_sidecar = balises_etendues
+            .into_iter()
+            .filter(|m| {
+                m.get("dr_source").map(String::as_str) == Some(crate::metadata::DR_SOURCE_SIDECAR)
+            })
+            .count();
         self
     }
 }
@@ -1663,7 +1716,7 @@ pub fn scan_files_parallel(
                     info!(
                         path = %path_str,
                         format = %unsupported.report_key,
-                        reason = unsupported.reason,
+                        reason = %unsupported.reason,
                         "scan_file_unsupported — format reconnu mais non décodable"
                     );
                     (None, None, Some(unsupported))
@@ -1737,8 +1790,17 @@ pub fn scan_files_parallel(
         // fermeture d'import (#2939).
         db_insert_failed: 0,
         db_update_failed: 0,
+        dr_from_sidecar: 0,
         empty_files: vides.compte(),
         empty_file_paths: vides.chemins(),
+        matroska_admis: results
+            .iter()
+            .filter(|f| f.metadata.is_some() && est_matroska(f))
+            .count(),
+        matroska_ecartes: results
+            .iter()
+            .filter(|f| f.unsupported.is_some() && est_matroska(f))
+            .count(),
     };
     if !failed.is_empty() {
         let listing: Vec<String> = failed
@@ -1972,7 +2034,7 @@ pub fn scan_files_batched(
                             info!(
                                 path = %path_str,
                                 format = %unsupported.report_key,
-                                reason = unsupported.reason,
+                                reason = %unsupported.reason,
                                 "scan_file_unsupported — format reconnu mais non décodable"
                             );
                             (None, None, Some(unsupported))
@@ -2017,6 +2079,17 @@ pub fn scan_files_batched(
             .count();
         aggregate.metadata_timeout += batch_timeouts;
         aggregate.hash_ok += batch.iter().filter(|f| f.audio_hash.is_some()).count();
+        // Sœur de la variante directe (#3633) : les deux parcours doivent
+        // rendre le même chiffre, sans quoi le rapport dépendrait de QUEL scan
+        // l'a produit.
+        aggregate.matroska_admis += batch
+            .iter()
+            .filter(|f| f.metadata.is_some() && est_matroska(f))
+            .count();
+        aggregate.matroska_ecartes += batch
+            .iter()
+            .filter(|f| f.unsupported.is_some() && est_matroska(f))
+            .count();
         // Les fichiers de 0 octet du lot (#2060). Sœur de la variante directe :
         // le décompte s'additionne sans plafond, l'échantillon nominatif garde
         // le sien.
@@ -2091,6 +2164,7 @@ pub fn scan_files_batched(
         let ecritures = on_batch(batch, batch_idx, total);
         aggregate.db_insert_failed += ecritures.insert_failed;
         aggregate.db_update_failed += ecritures.update_failed;
+        aggregate.dr_from_sidecar += ecritures.dr_sidecar;
         if ecritures.insert_failed > 0 || ecritures.update_failed > 0 {
             warn!(
                 batch = batch_idx,
@@ -2121,6 +2195,7 @@ pub fn scan_files_batched(
         metadata_timeout = aggregate.metadata_timeout,
         db_insert_failed = aggregate.db_insert_failed,
         db_update_failed = aggregate.db_update_failed,
+        dr_from_sidecar = aggregate.dr_from_sidecar,
         pistes_perdues = aggregate.a_perdu_des_pistes(),
         "batched_scan_complete"
     );
@@ -2508,78 +2583,163 @@ mod tests {
         );
     }
 
-    /// #3633 — un `.mkv` ressort du parcours AVEC un compteur et un motif.
+    /// #3633 (point 2) — un Matroska est ADMIS si sa piste se décode, ÉCARTÉ
+    /// et NOMMÉ sinon, et le rapport compte les deux séparément.
     ///
-    /// Même défaut que #2060 pour `.oga`, sur une autre extension : `.mkv`
-    /// n'était dans AUCUNE des trois listes de `audio::support`. Il retombait
-    /// donc sur `LibraryAudioSupport::NotAudio`, c'est-à-dire le `continue`
-    /// muet de la classification — aucune piste, aucun compteur, aucune ligne
-    /// de rapport. Un testeur qui a des MKV de concert constatait « des
-    /// fichiers absents », sans rien pour les chercher.
+    /// Le point 1 (PR #3932) mesurait l'inverse : `.mkv` compté dans les NON
+    /// LUS dès l'énumération. Ce point-ci le fait entrer au catalogue par
+    /// l'extension — sans lecture pendant le parcours, comme `.dff` — et le
+    /// tranche dans la phase de métadonnées, derrière `FILE_TIMEOUT` :
     ///
-    /// Le témoin `concert.mka` est le jumeau exact : MÊME conteneur Matroska,
-    /// même dossier, même appel, et il était DÉJÀ compté. S'il tombait avec
-    /// `.mkv`, ce test mesurerait la fixture et non le défaut. Le témoin
-    /// `album.flac` garde l'autre bord : le correctif ne doit pas avoir rendu
-    /// la liste des non lus assez large pour avaler un format catalogué.
+    /// - `concert.mka`, FLAC dans Matroska fabriqué par le muxer de test :
+    ///   ADMIS, avec le titre de sa balise, sa durée et sa cadence ;
+    /// - `concert.mkv`, piste annoncée `A_AC3` : ÉCARTÉ sous la clé
+    ///   `mkv-codec-non-decodable-ac3`, le codec dans le motif ;
+    /// - `album.flac` garde l'autre bord : rien n'a changé pour un format
+    ///   catalogué.
+    ///
+    /// Les deux parcours — direct et par lots — doivent rendre le même verdict
+    /// et les mêmes compteurs (#2012, #2050).
     #[test]
-    fn un_fichier_mkv_est_compte_dans_le_rapport_comme_son_jumeau_mka() {
+    fn un_matroska_est_admis_ou_ecarte_selon_sa_piste_et_compte_a_part() {
         // Pas sous temp_dir() : `is_tune_temp_file` y écarte TOUT.
         let base = crate::test_scratch::scratch_dir_in(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
-            "walker-mkv-3633",
+            "walker-matroska-3633",
         );
-        for name in ["concert.mka", "concert.mkv", "album.flac"] {
-            std::fs::write(base.join(name), b"fixture").unwrap();
-        }
-        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let flac = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/flac/ref_16_44100_stereo.flac");
+        std::fs::copy(&flac, base.join("album.flac")).unwrap();
+        std::fs::write(
+            base.join("concert.mka"),
+            crate::audio::matroska::muxer_de_test::mka_depuis_flac(
+                &flac,
+                2,
+                true,
+                &[("TITLE", "Live au Rocher"), ("ARTIST", "Les Témoins")],
+                &[("TITLE", "Ouverture"), ("PART_NUMBER", "1")],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("concert.mkv"),
+            crate::audio::matroska::muxer_de_test::mkv_a_codec("A_AC3", 6),
+        )
+        .unwrap();
 
-        // Témoin haut : le format catalogué entre toujours en bibliothèque.
-        let noms: Vec<String> = result
+        // L'énumération ne lit rien : les trois entrent dans `files`, aucun
+        // n'est compté non lu.
+        let listed = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let noms: Vec<String> = listed
             .files
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect();
+        for nom in ["album.flac", "concert.mka", "concert.mkv"] {
+            assert!(
+                noms.iter().any(|n| n == nom),
+                "« {nom} » doit passer l'énumération : le Matroska est admis par \
+                 l'extension et tranché par sa piste plus loin (#3633) : {noms:?}"
+            );
+        }
         assert!(
-            noms.iter().any(|n| n == "album.flac"),
-            "témoin album.flac perdu — la fixture ou le parcours est en cause, \
-             pas .mkv : {noms:?}"
+            listed.skipped_by_ext.is_empty(),
+            "plus rien n'est écarté à l'extension : {:?}",
+            listed.skipped_by_ext
         );
 
-        // Témoin bas : le jumeau `.mka` était déjà compté, il doit le rester.
+        // La phase de métadonnées tranche.
+        let (files, stats) = scan_files_parallel(&listed.files, false, None);
+        let par_nom = |nom: &str| {
+            files
+                .iter()
+                .find(|f| f.path.ends_with(nom))
+                .unwrap_or_else(|| panic!("{nom} absent des fichiers lus"))
+        };
+
+        let mka = par_nom("concert.mka");
+        let meta = mka.metadata.as_ref().unwrap_or_else(|| {
+            panic!(
+                "un FLAC dans Matroska doit ENTRER en bibliothèque : symphonia le \
+                 démuxe et le décode (#3633) — refus : {:?}",
+                mka.unsupported
+            )
+        });
         assert_eq!(
-            result.skipped_by_ext.get("mka"),
-            Some(&1),
-            "témoin .mka : le jumeau Matroska était déjà compté avant ce \
-             correctif — s'il tombe, c'est la liste entière qui a régressé : {:?}",
-            result.skipped_by_ext
+            meta.title.as_deref(),
+            Some("Ouverture"),
+            "titre de la balise"
+        );
+        assert_eq!(meta.album.as_deref(), Some("Live au Rocher"));
+        // `ARTIST` sous la cible album : artiste d'album pour symphonia, et
+        // l'artiste de piste s'y replie plutôt que sur le nom du dossier.
+        assert_eq!(meta.album_artist.as_deref(), Some("Les Témoins"));
+        assert_eq!(meta.artist.as_deref(), Some("Les Témoins"));
+        assert!(!meta.artist_from_path);
+        assert_eq!(meta.track_number, Some(1));
+        // La fixture dure 0,4 s (17 640 trames à 44,1 kHz).
+        assert_eq!(meta.duration_ms, Some(400));
+        assert_eq!(meta.sample_rate, Some(44_100));
+        assert_eq!(meta.channels, Some(2));
+        assert_eq!(meta.bit_depth, Some(16));
+        assert_eq!(meta.format.as_deref(), Some("mka"));
+
+        let mkv = par_nom("concert.mkv");
+        assert!(mkv.metadata.is_none(), "un MKV en AC-3 n'entre pas");
+        let refus = mkv.unsupported.as_ref().expect(
+            "un MKV en AC-3 doit être ÉCARTÉ et NOMMÉ : symphonia le démuxe \
+             mais aucun décodeur AC-3 n'est livré (#3633)",
+        );
+        assert_eq!(refus.report_key, "mkv-codec-non-decodable-ac3");
+        assert!(
+            refus.reason.contains("ac3"),
+            "le motif doit nommer le codec : {}",
+            refus.reason
         );
 
-        // LE DÉFAUT : `.mkv` doit être compté ET porter un motif.
+        assert!(par_nom("album.flac").metadata.is_some());
+
+        // Les compteurs : admis et écartés, SÉPARÉMENT.
+        assert_eq!(stats.matroska_admis, 1, "un seul Matroska admis");
+        assert_eq!(stats.matroska_ecartes, 1, "un seul Matroska écarté");
         assert_eq!(
-            result.skipped_by_ext.get("mkv"),
+            stats.unsupported_by_ext.get("mkv-codec-non-decodable-ac3"),
             Some(&1),
-            "un .mkv sort du parcours SANS COMPTEUR : `NotAudio` est un \
-             `continue` muet, le fichier disparaît sans une ligne de rapport \
-             où le chercher (#3633) — compteurs mesurés : {:?}",
-            result.skipped_by_ext
+            "compteurs mesurés : {:?}",
+            stats.unsupported_by_ext
         );
         assert!(
-            result
-                .skipped_reasons
-                .get("mkv")
-                .is_some_and(|motif| motif.contains("non pris en charge")),
-            "un compteur sans motif ne dit pas POURQUOI le fichier manque \
-             (#3633) — motifs mesurés : {:?}",
-            result.skipped_reasons
+            stats
+                .unsupported_reasons
+                .get("mkv-codec-non-decodable-ac3")
+                .is_some_and(|motif| motif.contains("ac3")),
+            "motifs mesurés : {:?}",
+            stats.unsupported_reasons
+        );
+        assert_eq!(
+            stats.metadata_failed, 0,
+            "un refus nommé n'est pas un échec"
         );
 
-        // Et il ne devient pas une piste cliquable impossible à décoder :
-        // symphonia démuxe le Matroska mais n'a aucun codec AC-3/TrueHD.
+        // Le chemin PAR LOTS — celui du serveur — rend le même verdict.
+        let mut batch_files = Vec::new();
+        let batch_stats = scan_files_batched(&listed.files, false, 2, |batch, _, _| {
+            batch_files.extend(batch);
+            EcrituresDuLot::SANS_PERTE
+        });
+        assert_eq!(batch_stats.matroska_admis, 1);
+        assert_eq!(batch_stats.matroska_ecartes, 1);
+        assert_eq!(
+            batch_stats
+                .unsupported_by_ext
+                .get("mkv-codec-non-decodable-ac3"),
+            Some(&1)
+        );
+        assert_eq!(batch_stats.metadata_failed, 0);
         assert!(
-            !noms.iter().any(|n| n == "concert.mkv"),
-            "un .mkv ne doit PAS entrer au catalogue : aucun décodeur livré \
-             ne lit son contenu — il serait une piste muette : {noms:?}"
+            batch_files
+                .iter()
+                .any(|f| f.path.ends_with("concert.mka") && f.metadata.is_some())
         );
     }
 

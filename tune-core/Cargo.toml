@@ -99,6 +99,10 @@ hostname = "0.4"
 # compile time — and the shared lib is loaded at runtime next to the model
 # (downloaded on activation). Feature-gated so the default build never pulls it.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+# Sonde de la dylib onnxruntime AVANT `ort::init_from` (#4248) : même version
+# que celle qu'`ort` rc.13 tire, pour que le `dlopen` de la sonde et le sien
+# soient le même appel — un fichier que la sonde ouvre, `ort` l'ouvrira.
+libloading = { version = "0.9", optional = true }
 # Runtime provisioning of the onnxruntime shared lib for `load-dynamic`: we fetch
 # Microsoft's official onnxruntime release archives (which ship real shared libs,
 # unlike ort's static-link dists) and unpack them — `.tgz` via flate2+tar,
@@ -187,6 +191,15 @@ path = "tests/journal_insertion_par_lot.rs"
 [[test]]
 name = "niveaux_sortie_pull_3807"
 path = "tests/niveaux_sortie_pull_3807.rs"
+
+# #3682 — spectre au plancher sur une zone LOCALE bit-perfect (capture de
+# Gilles OLIVE). Aucun temoin ne couvrait la premiere lecture explicite d'une
+# piste locale : ce banc cloue que `transcoder_en_session` nourrit bien
+# `playback.audio_levels`, par famille de decodeur. Meme garde que ci-dessus :
+# `autotests = false`, sans cette cible le fichier n'est jamais compile.
+[[test]]
+name = "niveaux_sortie_locale_3682"
+path = "tests/niveaux_sortie_locale_3682.rs"
 
 # #4144 — l'ecran Sante affichait `IDLE` pendant des heures de ReplayGain parce
 # que la passe ne publiait aucun compteur. Le temoin tient les deux bords : le
@@ -281,7 +294,7 @@ postgres = ["dep:sqlx"]
 # Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
-audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
+audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
 # transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.

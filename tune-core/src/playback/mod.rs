@@ -838,6 +838,18 @@ impl PlaybackManager {
         })
     }
 
+    /// Bancs d'essai : date le démarrage de la lecture `depuis` en arrière,
+    /// comme si la piste jouait depuis ce temps-là. Injection d'horloge — le
+    /// coalescement des relances (`RETAP_DEDUP_WINDOW`) lit cette date, et
+    /// un banc qui rejoue une fin de piste ne doit pas avoir à dormir.
+    #[cfg(test)]
+    pub(crate) async fn dater_le_demarrage(&self, zone_id: i64, depuis: std::time::Duration) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.last_play_started_at = Some(Instant::now() - depuis);
+        }
+    }
+
     /// Restore a saved playback position into the zone state.
     /// Called on startup to remember where playback left off.
     pub async fn restore_position(&self, zone_id: i64, position_ms: i64, np: NowPlaying) {
@@ -884,6 +896,39 @@ impl PlaybackManager {
         state.track_generation = state.track_generation.wrapping_add(1);
         state.play_seq = state.play_seq.wrapping_add(1);
         state.play_seq
+    }
+
+    /// Défait un [`bump_generation`](Self::bump_generation) dont la lecture
+    /// n'a **jamais démarré** — résolution en échec (« no url » Qobuz, fichier
+    /// introuvable…).
+    ///
+    /// `play()` incrémente la génération AVANT de résoudre, pour que le
+    /// sondeur remette son horloge à zéro sans attendre un transcodage. Quand
+    /// la résolution échoue, rien ne la rétablissait : la piste précédente
+    /// continuait de jouer sous une génération que plus personne ne suivait,
+    /// le sondeur voyait une « nouvelle piste » figée à 0:00, et le garde-fou
+    /// des zones figées l'arrêtait 600 s plus tard (Yacine, 0.9.150, fil 1805,
+    /// #4235).
+    ///
+    /// Ne rétablit que si `play_seq` vaut encore la valeur rendue par le bump
+    /// à défaire : une lecture plus récente a sinon pris la main, et c'est sa
+    /// génération à elle qu'il ne faut pas toucher. Rend `true` quand la
+    /// génération a été rétablie.
+    pub async fn restore_generation_after_failed_play(
+        &self,
+        zone_id: i64,
+        play_seq_du_bump: u64,
+    ) -> bool {
+        let mut zones = self.zones.lock().await;
+        let Some(state) = zones.get_mut(&zone_id) else {
+            return false;
+        };
+        if state.play_seq != play_seq_du_bump {
+            return false;
+        }
+        state.track_generation = state.track_generation.wrapping_sub(1);
+        state.play_seq = state.play_seq.wrapping_sub(1);
+        true
     }
 
     /// Current play-request sequence for a zone (0 if never played). Compared
@@ -2942,5 +2987,50 @@ mod detecteur_de_zones_figees_tests {
             "un flux live dure des heures sans changer de piste : le détecteur \
              ne doit jamais le couper"
         );
+    }
+}
+
+/// #4235 — une lecture dont la résolution échoue rend la zone dans l'état
+/// où elle l'a trouvée : le bump de génération est défait, sauf si une
+/// lecture plus récente a pris la main.
+#[cfg(test)]
+mod tests_generation_retablie_4235 {
+    use super::*;
+
+    async fn generation(p: &PlaybackManager, zone: i64) -> u64 {
+        p.get_state(zone).await.track_generation
+    }
+
+    #[tokio::test]
+    async fn un_echec_de_resolution_defait_le_bump() {
+        let p = PlaybackManager::new();
+        let seq0 = p.bump_generation(20).await; // une lecture qui a marché
+        let gen_avant = generation(&p, 20).await;
+        let seq = p.bump_generation(20).await; // la lecture qui va échouer
+        assert_eq!(generation(&p, 20).await, gen_avant + 1);
+        assert!(p.restore_generation_after_failed_play(20, seq).await);
+        assert_eq!(
+            generation(&p, 20).await,
+            gen_avant,
+            "la génération revient où elle était"
+        );
+        assert_eq!(p.current_play_seq(20).await, seq0, "play_seq aussi");
+    }
+
+    #[tokio::test]
+    async fn une_lecture_plus_recente_n_est_jamais_defaite() {
+        let p = PlaybackManager::new();
+        let seq_echec = p.bump_generation(20).await;
+        let seq_gagnante = p.bump_generation(20).await; // arrivée pendant la résolution
+        let gen_gagnante = generation(&p, 20).await;
+        assert!(!p.restore_generation_after_failed_play(20, seq_echec).await);
+        assert_eq!(generation(&p, 20).await, gen_gagnante);
+        assert_eq!(p.current_play_seq(20).await, seq_gagnante);
+    }
+
+    #[tokio::test]
+    async fn une_zone_inconnue_ne_cree_rien() {
+        let p = PlaybackManager::new();
+        assert!(!p.restore_generation_after_failed_play(99, 1).await);
     }
 }

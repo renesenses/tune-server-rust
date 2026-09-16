@@ -52,9 +52,18 @@ pub struct AppState {
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
     pub background_tasks: crate::background_tasks::BackgroundTasks,
+    /// La mesure de la plage dynamique à la demande (#4185) — un seul passage
+    /// à la fois, son relevé lisible. Tenu ici et non en `static` : la route
+    /// qui le lit a déjà l'état, et un test ne pollue pas le suivant.
+    pub passe_dr: Arc<tune_core::audio::replaygain::plage_dynamique::PasseDr>,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
+    /// Le relais de pochettes distantes (`/library/artwork/proxy`), avec sa
+    /// garde SSRF (#4260) : redirections à la main, résolveur qui refuse les
+    /// adresses internes. Champ public pour qu'un banc d'essai y pose un
+    /// relais à résolveur factice ([`tune_core::library::artwork_proxy::Relais::avec`]).
+    pub relais_pochettes: Arc<tune_core::library::artwork_proxy::Relais>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -444,9 +453,11 @@ impl AppState {
             scanner,
             event_bus,
             background_tasks,
+            passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
             upnp: Some(upnp),
             config: Arc::new(tune_config),
             http_client,
+            relais_pochettes: Arc::new(tune_core::library::artwork_proxy::Relais::production()),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),

@@ -359,12 +359,33 @@ impl PlaybackOrchestrator {
         self.playback.set_resolving(req.zone_id, true).await;
 
         let (resolved, resolve_ms) =
-            match self.resoudre_la_demande(&req, play_start, play_gen).await? {
-                ResoluOuFini::Resolu {
+            match self.resoudre_la_demande(&req, play_start, play_gen).await {
+                Ok(ResoluOuFini::Resolu {
                     resolved,
                     resolve_ms,
-                } => (resolved, resolve_ms),
-                ResoluOuFini::Fini(resultat) => return Ok(resultat),
+                }) => (resolved, resolve_ms),
+                Ok(ResoluOuFini::Fini(resultat)) => return Ok(resultat),
+                Err(e) => {
+                    // La lecture n'a jamais démarré : la zone doit être
+                    // rendue dans l'état où on l'a trouvée. Le bump de
+                    // génération ci-dessus est défait — sauf si une lecture
+                    // plus récente a pris la main entre-temps — et l'échec
+                    // s'écrit, ce que `next` faisait déjà et pas `play`
+                    // (#4235 : « no url » Qobuz, la piste précédente jouait
+                    // encore et la zone a été « rattrapée » comme figée).
+                    let retablie = self
+                        .playback
+                        .restore_generation_after_failed_play(req.zone_id, play_gen)
+                        .await;
+                    warn!(
+                        zone_id = req.zone_id,
+                        error = %e,
+                        generation_retablie = retablie,
+                        ancienne_session = ?old_stream_id,
+                        "play_resolution_failed"
+                    );
+                    return Err(e);
+                }
             };
 
         let habillage = Habillage {
@@ -1825,12 +1846,8 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return false;
         }
-        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
-            .get(&format!("ir_path_{zone_id}"))
-            .ok()
-            .flatten()
-            .map(|p| !p.is_empty() && std::path::Path::new(&p).exists())
-            .unwrap_or(false)
+        self.chemin_ir_configure(zone_id)
+            .is_some_and(|p| std::path::Path::new(&p).exists())
     }
 
     /// Durée de la rampe anti-« ploc » à la pause, à la reprise et à l'arrêt

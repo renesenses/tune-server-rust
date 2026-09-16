@@ -179,6 +179,19 @@ impl MockOutput {
             .map(|c| c.url.clone())
     }
 
+    /// Ce que le renderer RAPPORTE jouer (`TrackURI`), posé par l'épreuve.
+    /// `None` modélise un renderer muet sur son URI — le cas de beaucoup
+    /// d'appareils, où seuls les octets servis peuvent parler (#4173).
+    pub async fn set_current_uri(&self, uri: Option<String>) {
+        *self.current_uri.lock().await = uri;
+    }
+
+    /// L'URI armée par `set_next_media`, sans la consommer : ce que le
+    /// renderer tirerait s'il honorait le `SetNext` (#4173).
+    pub async fn next_uri(&self) -> Option<String> {
+        self.next_uri.lock().await.clone()
+    }
+
     /// Simulate a gapless transition: renderer moves to the next URI
     /// and reports the new track's duration/position.
     pub async fn simulate_gapless_transition(&self, new_duration_ms: u64) {

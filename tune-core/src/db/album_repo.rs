@@ -549,11 +549,21 @@ pub struct DynamicRangeAlbum {
 
 /// Les compteurs ne décrivent que les pistes entrant dans une moyenne.
 /// Quand un tag d'album gagne, ils sont nuls : aucune piste n'est moyennée.
+///
+/// `source` vaut le nom du seul producteur présent (`tag`, `analysis`,
+/// `sidecar`), `mixed` quand plusieurs contribuent, `unknown` dès qu'une
+/// piste n'a pas de provenance connue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DynamicRangeProvenance {
     pub source: &'static str,
     pub tag_tracks: i64,
     pub analysis_tracks: i64,
+    /// Pistes dont le DR vient d'un rapport `foo_dr.txt` voisin de l'album
+    /// (#4186) — `crate::metadata::DR_SOURCE_SIDECAR`. Troisième producteur ;
+    /// sans sa colonne il tomberait dans `unknown_tracks`, et l'agrégat
+    /// dirait « provenance inconnue » d'une valeur dont le scan connaît
+    /// exactement l'origine.
+    pub sidecar_tracks: i64,
     pub unknown_tracks: i64,
 }
 
@@ -2775,7 +2785,8 @@ impl AlbumRepo {
             "SELECT {}, {}, \
              SUM(CASE WHEN tm.key = 'dr_track' AND ds.value = 'tag' THEN 1 ELSE 0 END), \
              SUM(CASE WHEN tm.key = 'dr_track' AND ds.value = 'analysis' THEN 1 ELSE 0 END), \
-             SUM(CASE WHEN tm.key = 'dr_track' AND (ds.value IS NULL OR ds.value NOT IN ('tag', 'analysis')) THEN 1 ELSE 0 END) \
+             SUM(CASE WHEN tm.key = 'dr_track' AND ds.value = '{sidecar}' THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN tm.key = 'dr_track' AND (ds.value IS NULL OR ds.value NOT IN ('tag', 'analysis', '{sidecar}')) THEN 1 ELSE 0 END) \
              FROM track_metadata tm \
              JOIN tracks tdr ON tdr.id = tm.track_id \
              LEFT JOIN track_metadata ds ON ds.track_id = tm.track_id AND ds.key = 'dr_source' \
@@ -2784,6 +2795,10 @@ impl AlbumRepo {
             crate::db::facet_filter::DR_ALBUM_VALUE,
             crate::db::facet_filter::DR_ALBUM_FROM_TAG,
             crate::db::facet_filter::dr_tag_where(engine),
+            // La constante et non le littéral : c'est la valeur que le scan
+            // ÉCRIT (#4186), et deux orthographes rendraient ces pistes
+            // « unknown » sans qu'aucun test de compilation ne le voie.
+            sidecar = crate::metadata::DR_SOURCE_SIDECAR,
         );
         let params: [&dyn ToSqlValue; 1] = [&id];
         let Some(cols) = self.db.query_one(&sql, &params)? else {
@@ -2797,21 +2812,33 @@ impl AlbumRepo {
         };
         let depuis_le_tag_album = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0) == 1;
         let count = |index: usize| cols.get(index).and_then(|v| v.as_i64()).unwrap_or(0);
-        let (tag_tracks, analysis_tracks, unknown_tracks) = if depuis_le_tag_album {
-            (0, 0, 0)
+        let (tag_tracks, analysis_tracks, sidecar_tracks, unknown_tracks) = if depuis_le_tag_album {
+            (0, 0, 0, 0)
         } else {
-            (count(2), count(3), count(4))
+            (count(2), count(3), count(4), count(5))
         };
+        // Un seul producteur présent : son nom. Plusieurs : `mixed`. Une
+        // provenance inconnue l'emporte sur tout — on ne dit pas « tag »
+        // d'un agrégat dont une part vient d'on ne sait où.
+        let producteurs: Vec<&'static str> = [
+            ("tag", tag_tracks),
+            ("analysis", analysis_tracks),
+            (crate::metadata::DR_SOURCE_SIDECAR, sidecar_tracks),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(nom, _)| nom)
+        .collect();
         let source = if depuis_le_tag_album {
             "tag"
         } else if unknown_tracks > 0 {
             "unknown"
-        } else if tag_tracks > 0 && analysis_tracks > 0 {
-            "mixed"
-        } else if analysis_tracks > 0 {
-            "analysis"
         } else {
-            "tag"
+            match producteurs.as_slice() {
+                [seul] => seul,
+                [] => "tag",
+                _ => "mixed",
+            }
         };
         Ok(Some(DynamicRangeAlbum {
             valeur,
@@ -2820,6 +2847,7 @@ impl AlbumRepo {
                 source,
                 tag_tracks,
                 analysis_tracks,
+                sidecar_tracks,
                 unknown_tracks,
             },
         }))

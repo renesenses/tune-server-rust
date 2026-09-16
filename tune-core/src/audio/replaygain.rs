@@ -20,6 +20,12 @@
 /// pour cette passe-ci, et rien d'autre ne doit l'écrire.
 pub mod progression;
 
+/// La mesure de la plage dynamique À LA DEMANDE (#4185) : le geste qui
+/// manquait. La cascade de fond ci-dessous (ReplayGain → empreintes → plage
+/// dynamique) reste la passe nominale ; ce module en est le raccourci, borné
+/// au seul DR, que l'utilisateur peut lancer et suivre.
+pub mod plage_dynamique;
+
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
@@ -299,6 +305,14 @@ pub fn track_gain_db(lufs: f64) -> f64 {
 /// décodage. Couper l'analyse suspend le travail, elle ne le jette pas.
 pub fn analysis_enabled(backend: &Arc<dyn DbBackend>) -> bool {
     matches!(etat_de_l_analyse(backend), EtatAnalyse::Active)
+}
+
+/// POURQUOI la passe ne décode pas — la phrase du registre, `None` quand elle
+/// est active. Exposé pour la route qui lance la plage dynamique à la demande
+/// (#4185) : un refus qui dit « analyse désactivée » sans dire LEQUEL des deux
+/// réglages la coupe renvoie l'utilisateur chercher au hasard.
+pub fn motif_d_inaction(backend: &Arc<dyn DbBackend>) -> Option<&'static str> {
+    etat_de_l_analyse(backend).motif()
 }
 
 /// Pourquoi la passe décode — ou ne décode pas.
@@ -624,6 +638,29 @@ pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
     backend
         .query_one(
             &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_RG_WHERE}"),
+            &[&seuil_report as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
+/// Combien de pistes la passe tient à l'écart parce que **leur fichier ne
+/// répond pas** — report non expiré (#1865), même clé pour le ReplayGain et
+/// la plage dynamique.
+///
+/// Ce n'est ni « analysé » ni « à faire » : c'est « en attente d'un disque ».
+/// Sans ce chiffre, une bibliothèque entière sur un partage démonté se lisait
+/// « ReplayGain terminée » — `compter_les_candidats_replaygain` exclut ces
+/// pistes, à raison, et rendait `total = 0` (Benjithom, 0.9.151, #4254). Les
+/// cartes de la page Santé le montrent à côté de la jauge, avec sa cause.
+pub fn compter_les_reportees_par_chemin(backend: &Arc<dyn DbBackend>) -> i64 {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    backend
+        .query_one(
+            "SELECT COUNT(DISTINCT m.track_id) FROM track_metadata m \
+             WHERE m.key = 'rg_path_unresolved' AND m.value > ?",
             &[&seuil_report as &dyn ToSqlValue],
         )
         .ok()
@@ -1137,6 +1174,29 @@ const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?)";
+
+/// Combien de pistes le rattrapage de la plage dynamique prendrait MAINTENANT.
+///
+/// Même texte que la sélection de [`rattraper_un_lot_de_dr`] — c'est le
+/// dénominateur de la passe à la demande (#4185), et un compte recopié à la
+/// main finirait par viser une population que la passe ne traite pas (même
+/// montage que [`compter_les_candidats_a_empreinter`]). Une panne de base
+/// rend 0, journalisée : la route ne doit pas tomber pour une jauge.
+pub fn compter_les_candidats_dr(backend: &Arc<dyn DbBackend>) -> i64 {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    match backend.query_one(
+        &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_DR_WHERE}"),
+        &[&seuil_report as &dyn ToSqlValue],
+    ) {
+        Ok(row) => row
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0),
+        Err(e) => {
+            warn!(error = %e, "dr_candidate_count_failed");
+            0
+        }
+    }
+}
 
 /// Calcule la plage dynamique d'un lot de pistes que la passe nominale a
 /// laissées derrière elle. Rend combien de lignes ont AVANCÉ (0 ⇒ plus rien).
@@ -2557,7 +2617,9 @@ mod tests {
     /// ABSENT vaut « Désactivé » et [`analyze_track_batch`] rend 0 sans rien
     /// lire. Sans cette ligne, les tests #1865 passeraient au vert en ne
     /// testant plus rien.
-    fn base_avec_piste(chemin: &str) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+    pub(super) fn base_avec_piste(
+        chemin: &str,
+    ) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -2582,7 +2644,9 @@ mod tests {
         (db, backend)
     }
 
-    fn temoins(db: &crate::db::sqlite::SqliteDb) -> std::collections::HashMap<String, String> {
+    pub(super) fn temoins(
+        db: &crate::db::sqlite::SqliteDb,
+    ) -> std::collections::HashMap<String, String> {
         TrackMetadataRepo::new(db.clone()).get_all(42).unwrap()
     }
 
@@ -2633,7 +2697,7 @@ mod tests {
     /// Les trois blocs étant identiques : pic₂ = 1,0, et les 20 % les plus
     /// forts de 3 blocs font 1 bloc, donc RMS₂₀ = 0,3159.
     ///   DR = 20 · log₁₀(1,0 / 0,3159) = 10,01 → arrondi à 10.
-    fn wav_de_plage_connue(chemin: &std::path::Path) {
+    pub(super) fn wav_de_plage_connue(chemin: &std::path::Path) {
         use std::io::Write;
         const SR: u32 = 44_100;
         const BLOCS: u32 = 3;
@@ -4680,6 +4744,70 @@ mod garde_pic_hors_echelle {
         assert!(
             (sans - ferraille).abs() < 1e-12,
             "sans pic {sans} != pic hors échelle {ferraille}"
+        );
+    }
+}
+
+/// #4254 — les pistes que la passe REPORTE (fichier qui ne répond pas) sont
+/// comptées à part : ni « faites », ni « à faire ». Un report expiré ne
+/// compte plus — il redevient un candidat.
+#[cfg(test)]
+mod tests_reportees_par_chemin_4254 {
+    use std::sync::Arc;
+
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::library::local_path::{PATH_RETRY_AFTER_SECS, deferral_stamp};
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Bjork')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Homogenic', 1)",
+            &[],
+        )
+        .unwrap();
+        for id in 1..=3 {
+            db.execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+                     sample_rate, channels) VALUES ({id}, 'Piste {id}', 1, 1, \
+                     '/media/music/absent-{id}.flac', 300000, 44100, 2)"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        Arc::new(db)
+    }
+
+    fn reporter(backend: &Arc<dyn DbBackend>, track_id: i64, epoch: i64) {
+        let date = deferral_stamp(epoch);
+        backend
+            .execute(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'rg_path_unresolved', ?)",
+                &[&track_id as &dyn ToSqlValue, &date as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn compte_les_reports_vivants_et_oublie_les_expires() {
+        let backend = base();
+        assert_eq!(super::compter_les_reportees_par_chemin(&backend), 0);
+        let now = super::now_epoch_secs() as i64;
+        reporter(&backend, 1, now);
+        reporter(&backend, 2, now - 60);
+        // Expiré d'une seconde : la passe le retentera, il n'est plus « reporté ».
+        reporter(&backend, 3, now - PATH_RETRY_AFTER_SECS - 1);
+        assert_eq!(
+            super::compter_les_reportees_par_chemin(&backend),
+            2,
+            "deux reports vivants, un expiré"
         );
     }
 }
