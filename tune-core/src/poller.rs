@@ -779,6 +779,14 @@ mod famine_anneau_i3318;
 #[cfg(test)]
 mod rappel_arrete_3814;
 
+/// #3727 — un Tune Endpoint déjà tenu par un autre serveur ACCEPTE la
+/// connexion TCP puis se tait. Le banc dresse l'écouteur muet, une vraie
+/// sortie OAAT sur une vraie zone, et prouve que la boucle de connexion
+/// renonce en nommant la cause, que l'écran la reçoit, et que la zone ne
+/// reste pas `Playing` sans qu'un octet ne sorte.
+#[cfg(all(test, feature = "oaat"))]
+mod endpoint_oaat_muet_3727;
+
 #[cfg(test)]
 mod cadence_de_repos_tests;
 #[cfg(test)]
