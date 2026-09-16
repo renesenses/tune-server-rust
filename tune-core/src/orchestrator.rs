@@ -308,6 +308,12 @@ fn spawn_paced_levels_forwarder(
                     // portait. Sample peak, avant DSP, comme `peak_*_db`.
                     "peak_hold_left_db": peak_hold_left_db,
                     "peak_hold_right_db": peak_hold_right_db,
+                    // Surcharge = échantillons consécutifs à pleine échelle,
+                    // la seule que du PCM entier sache montrer (#4175).
+                    "over_left": lvl.over_left(),
+                    "over_right": lvl.over_right(),
+                    "over_run_left": lvl.over_run_left,
+                    "over_run_right": lvl.over_run_right,
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
