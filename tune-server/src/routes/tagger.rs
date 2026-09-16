@@ -6,7 +6,6 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
-use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -253,10 +252,10 @@ async fn auto_number_album(
     let rows = state
         .backend
         .query_many(
-            "SELECT id, path, title FROM tracks WHERE album_id = $1 ORDER BY path ASC",
+            "SELECT id, file_path, title FROM tracks WHERE album_id = $1 ORDER BY file_path ASC",
             &[&album_id as &dyn ToSqlValue],
         )
-        .ou_defaut_journalise();
+        .map_err(AppError::internal)?;
 
     let tracks: Vec<(i64, String, Option<String>)> = rows
         .into_iter()
@@ -298,7 +297,7 @@ async fn auto_number_album(
                 "UPDATE tracks SET track_number = $1 WHERE id = $2",
                 &[&track_num as &dyn ToSqlValue, track_id as &dyn ToSqlValue],
             )
-            .ok();
+            .map_err(AppError::internal)?;
 
         results.push(json!({
             "track_id": track_id,
@@ -330,10 +329,10 @@ async fn set_album_genre(
     let rows = state
         .backend
         .query_many(
-            "SELECT id, path FROM tracks WHERE album_id = $1",
+            "SELECT id, file_path FROM tracks WHERE album_id = $1",
             &[&album_id as &dyn ToSqlValue],
         )
-        .ou_defaut_journalise();
+        .map_err(AppError::internal)?;
     let paths: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|r| {
@@ -350,7 +349,7 @@ async fn set_album_genre(
             "UPDATE tracks SET genre = $1 WHERE album_id = $2",
             &[&body.genre as &dyn ToSqlValue, &album_id as &dyn ToSqlValue],
         )
-        .ok();
+        .map_err(AppError::internal)?;
 
     let mut file_errors: Vec<Value> = Vec::new();
     for (track_id, path) in &paths {
@@ -392,10 +391,10 @@ async fn set_album_year(
     let rows = state
         .backend
         .query_many(
-            "SELECT id, path FROM tracks WHERE album_id = $1",
+            "SELECT id, file_path FROM tracks WHERE album_id = $1",
             &[&album_id as &dyn ToSqlValue],
         )
-        .ou_defaut_journalise();
+        .map_err(AppError::internal)?;
     let paths: Vec<(i64, String)> = rows
         .into_iter()
         .filter_map(|r| {
@@ -411,7 +410,7 @@ async fn set_album_year(
             "UPDATE tracks SET year = $1 WHERE album_id = $2",
             &[&body.year as &dyn ToSqlValue, &album_id as &dyn ToSqlValue],
         )
-        .ok();
+        .map_err(AppError::internal)?;
 
     let year_num: Option<u16> = body.year.parse().ok();
     let mut file_errors: Vec<Value> = Vec::new();
@@ -759,4 +758,225 @@ async fn strip_extra_tags(
         "results": results,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod genre_consistency_3979 {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{Accessor, TagExt};
+    use tower::ServiceExt;
+
+    async fn request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let app = Router::new()
+            .nest("/tagger", router())
+            .nest("/library", crate::routes::library::router())
+            .with_state(state.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn genre_multiple_3979_ne_compte_pas_comme_manquant() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let cases: [(Option<&str>, Option<&str>, bool); 11] = [
+            (None, Some(r#"["Jazz", "Soul"]"#), false),
+            (Some("Rock"), None, false),
+            (None, None, true),
+            (Some(""), Some("[]"), true),
+            (None, Some("[ ]"), true),
+            (None, Some(r#"["", " "]"#), true),
+            (None, Some("broken"), true),
+            (None, Some("null"), true),
+            (None, Some(r#"{"genre":"Jazz"}"#), true),
+            (None, Some(r#"["Jazz", 1]"#), true),
+            (Some("Blues"), Some("broken"), false),
+        ];
+        let mut missing = Vec::new();
+        for (i, (genre, genres, absent)) in cases.iter().enumerate() {
+            let id = i as i64 + 1;
+            state
+                .backend
+                .execute(
+                    "INSERT INTO tracks(id,title,file_path,genre,genres) VALUES($1,$2,$3,$4,$5)",
+                    &[
+                        &id,
+                        &format!("Track {id}"),
+                        &format!("/missing/{id}.flac"),
+                        genre,
+                        genres,
+                    ],
+                )
+                .unwrap();
+            if *absent {
+                missing.push(id);
+            }
+        }
+        let (status, facets) = request(
+            &state,
+            "GET",
+            "/library/facets?fields=genre,untagged",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let count = facets["untagged"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["value"] == "genre")
+            .unwrap()["count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            count as usize,
+            missing.len(),
+            "le rail compte les genres multiples comme absents (#3979): {facets}"
+        );
+        let (status, tracks) = request(
+            &state,
+            "GET",
+            "/library/tracks?untagged=genre&limit=100",
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = tracks
+            .as_array()
+            .or_else(|| tracks["items"].as_array())
+            .unwrap();
+        let mut ids: Vec<_> = rows.iter().map(|v| v["id"].as_i64().unwrap()).collect();
+        ids.sort();
+        assert_eq!(
+            ids, missing,
+            "la liste Genre manquant diverge du rail (#3979): {tracks}"
+        );
+    }
+
+    fn fixture(state: &AppState, path: &std::path::Path) {
+        let mut encoder = tune_core::audio::encoder::AudioEncoder::new("flac", 44100, 16, 2);
+        encoder.start_sync().unwrap();
+        encoder.write_sync(&vec![0; 4096]).unwrap();
+        std::fs::write(path, encoder.finish_sync().unwrap()).unwrap();
+        let mut tag = lofty::tag::Tag::new(lofty::tag::TagType::VorbisComments);
+        tag.set_genre("Before".into());
+        tag.save_to_path(path, lofty::config::WriteOptions::default())
+            .unwrap();
+        state
+            .backend
+            .execute("INSERT INTO albums(id,title) VALUES(1,'Album')", &[])
+            .unwrap();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks(id,title,file_path,album_id) VALUES(1,'Track',$1,1)",
+                &[&path.to_string_lossy().to_string()],
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tagger_3979_ecrit_genre_annee_et_numero_dans_le_fichier() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.flac");
+        fixture(&state, &path);
+        for (action, body) in [
+            ("set-genre", json!({"genre":"Jazz"})),
+            ("set-year", json!({"year":"1997"})),
+            ("auto-number", Value::Null),
+        ] {
+            let (status, result) =
+                request(&state, "POST", &format!("/tagger/album/1/{action}"), body).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "le tagger ne trouve pas file_path (#3979): {result}"
+            );
+            if action != "auto-number" {
+                assert_eq!(
+                    result["tracks_updated"], 1,
+                    "le tagger ignore le fichier de l'album (#3979): {result}"
+                );
+                assert_eq!(result["file_errors"], json!([]));
+            } else {
+                assert_eq!(result["results"][0]["file_written"], true);
+            }
+        }
+        let tagged = lofty::read_from_path(&path).unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(
+            tag.genre().as_deref(),
+            Some("Jazz"),
+            "le genre n'a pas atteint le fichier (#3979)"
+        );
+        assert_eq!(tag.date().map(|d| d.year), Some(1997));
+        assert_eq!(tag.track(), Some(1));
+        let row = state
+            .backend
+            .query_one("SELECT genre,year,track_number FROM tracks WHERE id=1", &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(row[0].as_string().as_deref(), Some("Jazz"));
+        assert_eq!(row[1].as_i64(), Some(1997));
+        assert_eq!(row[2].as_i64(), Some(1));
+        std::fs::remove_file(&path).unwrap();
+        let (_, result) = request(
+            &state,
+            "POST",
+            "/tagger/album/1/set-genre",
+            json!({"genre":"Soul"}),
+        )
+        .await;
+        assert_eq!(
+            result["file_errors"].as_array().unwrap().len(),
+            1,
+            "le fichier inaccessible doit être signalé (#3979)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tagger_3979_ne_cache_pas_un_refus_sql() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.flac");
+        fixture(&state, &path);
+        state.backend.execute("CREATE TRIGGER deny_genre BEFORE UPDATE OF genre ON tracks BEGIN SELECT RAISE(FAIL,'test refusal'); END",&[]).unwrap();
+        let (status, result) = request(
+            &state,
+            "POST",
+            "/tagger/album/1/set-genre",
+            json!({"genre":"Jazz"}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "le refus SQL passe pour un succès (#3979): {result}"
+        );
+        let tagged = lofty::read_from_path(path).unwrap();
+        assert_eq!(
+            tagged.primary_tag().unwrap().genre().as_deref(),
+            Some("Before")
+        );
+    }
 }

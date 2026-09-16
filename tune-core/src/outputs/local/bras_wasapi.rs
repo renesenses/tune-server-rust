@@ -62,7 +62,7 @@ pub(super) struct EntreesWasapi {
     /// `data_offset` est le début du PCM.
     pub(super) header_buf: Vec<u8>,
     /// La réponse HTTP, positionnée après `header_buf`.
-    pub(super) reader: reqwest::blocking::Response,
+    pub(super) reader: super::LecteurHttpAnnulable,
     pub(super) seek_offset: u64,
     pub(super) my_generation: u64,
     pub(super) starvation: Arc<RingStarvation>,

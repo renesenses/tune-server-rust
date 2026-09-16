@@ -47,7 +47,7 @@ impl AudioFormat {
             "alac" => Some(Self::Alac),
             "ogg" | "oga" => Some(Self::Ogg),
             "opus" => Some(Self::Opus),
-            "aiff" | "aif" => Some(Self::Aiff),
+            "aiff" | "aif" | "aifc" => Some(Self::Aiff),
             "dsf" | "dff" | "dst" | "dsd" => Some(Self::Dsd),
             "wv" => Some(Self::WavPack),
             // 🔴 #3849 — `tracks.format` ne contient PAS toujours une extension.
@@ -682,6 +682,11 @@ mod tests {
     #[test]
     fn from_extension_aif() {
         assert_eq!(AudioFormat::from_extension("aif"), Some(AudioFormat::Aiff));
+    }
+
+    #[test]
+    fn from_extension_aifc() {
+        assert_eq!(AudioFormat::from_extension("aifc"), Some(AudioFormat::Aiff));
     }
 
     #[test]

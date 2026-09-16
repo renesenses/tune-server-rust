@@ -68,60 +68,9 @@ const BASE_DEMARRAGE: &str = "tune_ecrivains_demarrage";
 /// ⚠️ Ces lignes ne disent pas « c'est bien ». Elles disent « c'est connu, daté,
 /// et ça se traite une par une ». Le jour où une colonne est alignée, sa ligne
 /// doit disparaître d'ici — `aucune_divergence_perimee` le vérifie.
-const DIVERGENCES_TOLEREES: &[(&str, &str, &str, &str, &str)] = &[
-    // ── `queue_items` — quatre rédacteurs, et ils ne disent pas la même chose ──
-    //
-    // Relevé le 09/09/2026 par ce témoin, à sa première exécution, sur
-    // PostgreSQL 16.15. #3716 en annonçait UNE ; il y en a TROIS.
-    //
-    // | colonne     | 008 (scripts) | ensure_schema | PG_FULL_SCHEMA | SQLite  |
-    // |-------------|---------------|---------------|----------------|---------|
-    // | position    | INTEGER       | BIGINT        | TEXT           | INTEGER |
-    // | is_current  | SMALLINT      | BIGINT        | TEXT           | INTEGER |
-    // | duration_ms | INTEGER       | BIGINT        | TEXT           | INTEGER |
-    //
-    // Aucune ne fait tomber une requête : `bigint` est plus LARGE, pas plus
-    // étroit. Le défaut n'est pas la valeur, c'est la divergence — et elle est
-    // désormais NOMMÉE, ce qui était tout l'objet de #3716. L'alignement vient
-    // après la porte, colonne par colonne : c'est l'ordre que le ticket demande
-    // explicitement à son point 3.
-    (
-        "queue_items",
-        "position",
-        "integer",
-        "bigint",
-        "#3716 — la colonne citée par le ticket. 008 la déclare INTEGER, \
-         `ensure_schema` BIGINT ; c'est BIGINT que reçoit toute installation \
-         neuve, parce que les `CREATE TABLE IF NOT EXISTS` d'`ensure_schema` \
-         passent les premiers et que ceux de 008 sont alors des no-op. Sans \
-         conséquence mesurée : un rang de file tient dans les deux.",
-    ),
-    (
-        "queue_items",
-        "is_current",
-        "smallint",
-        "bigint",
-        "#3716 — TROIS déclarations pour un drapeau booléen : SMALLINT (008), \
-         BIGINT (`ensure_schema`), TEXT (`PG_FULL_SCHEMA`, et c'est délibéré, \
-         cf. l'en-tête de la 013). Sans conséquence mesurée. Le jour où on \
-         tranche, SMALLINT est la forme que portent déjà tous les autres \
-         booléens du schéma (`alarms.enabled`, `profiles.is_admin`, \
-         `radio_stations.is_favorite`).",
-    ),
-    (
-        "queue_items",
-        "duration_ms",
-        "integer",
-        "bigint",
-        "#3716 — le cas le plus parlant, et il n'était pas dans le ticket : la \
-         migration 013 déclare elle-même `['queue_items','duration_ms','bigint']` \
-         comme sa CIBLE, mais sa conversion ne se déclenche que \
-         `IF cur_type IN ('text','character varying')`. Sur le chemin NATIF, 008 \
-         a déjà posé INTEGER, donc 013 est un no-op et n'atteint JAMAIS sa propre \
-         cible. `ensure_schema` est ici le seul rédacteur qui ait raison. Sans \
-         conséquence mesurée — INTEGER plafonne à 24,8 jours de musique.",
-    ),
-];
+// #3716: migration 059 aligns all three queue columns to the startup BIGINT
+// representation. No exception remains; new drift still fails the real DB gate.
+const DIVERGENCES_TOLEREES: &[(&str, &str, &str, &str, &str)] = &[];
 
 fn url_vers_base(url: &str, base: &str) -> String {
     let (avant, apres) = match url.split_once('?') {
@@ -418,4 +367,123 @@ fn le_nom_de_base_est_remplace_dans_l_url() {
         ),
         "postgresql://tune:tune@localhost:5432/essai?sslmode=disable"
     );
+}
+
+/// Exercise the registered migration on existing rows, not just empty DDL.
+#[tokio::test]
+async fn pg_3716_queue_migration_preserves_rows_defaults_and_replay() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        return;
+    };
+    let migration = crate::db::migrations::PG_MIGRATIONS
+        .iter()
+        .find(|(v, _, _)| *v == 59)
+        .expect("queue migration must be registered")
+        .2;
+    let mut maintenance = connexion(&url).await;
+    let mut c = base_vierge(&mut maintenance, "tune_queue_types_3716", &url).await;
+    sqlx::raw_sql("CREATE TABLE schema_version (version integer PRIMARY KEY, name text)")
+        .execute(&mut c)
+        .await
+        .unwrap();
+    for (position, current, duration, large) in [
+        ("integer", "smallint", "integer", false),
+        ("bigint", "bigint", "bigint", true),
+        ("text", "text", "text", true),
+    ] {
+        sqlx::raw_sql("DROP TABLE IF EXISTS queue_items")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE queue_items (id bigint PRIMARY KEY, position {position} NOT NULL DEFAULT 0,              is_current {current} DEFAULT 0, duration_ms {duration} DEFAULT 0,              track_number bigint, disc_number bigint, title text);              INSERT INTO queue_items VALUES (1, '7', '1', '{}', 12, 2, 'kept'),              (2, '8', NULL, NULL, NULL, NULL, 'nullable')",
+            if large { "9223372036854775807" } else { "2147483647" }
+        ))).execute(&mut c).await.unwrap();
+        for _ in 0..2 {
+            sqlx::raw_sql(migration).execute(&mut c).await.unwrap();
+            let types = types_pg(&mut c).await;
+            for col in [
+                "position",
+                "is_current",
+                "duration_ms",
+                "track_number",
+                "disc_number",
+            ] {
+                assert_eq!(
+                    types["queue_items"][col], "bigint",
+                    "queue_items.{col}: the registered migration must align existing {position}/{current}/{duration} columns"
+                );
+            }
+            let row = sqlx::query("SELECT position, is_current, duration_ms, track_number, disc_number, title FROM queue_items WHERE id=1")
+                .fetch_one(&mut c).await.unwrap();
+            assert_eq!(row.get::<i64, _>(0), 7);
+            assert_eq!(row.get::<i64, _>(1), 1);
+            assert_eq!(
+                row.get::<i64, _>(2),
+                if large { i64::MAX } else { i32::MAX as i64 }
+            );
+            assert_eq!(row.get::<i64, _>(3), 12);
+            assert_eq!(row.get::<i64, _>(4), 2);
+            assert_eq!(row.get::<String, _>(5), "kept");
+            let nulls = sqlx::query("SELECT is_current, duration_ms FROM queue_items WHERE id=2")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            assert_eq!(nulls.get::<Option<i64>, _>(0), None);
+            assert_eq!(nulls.get::<Option<i64>, _>(1), None);
+        }
+        sqlx::query("INSERT INTO queue_items (id) VALUES (3)")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        let row =
+            sqlx::query("SELECT position, is_current, duration_ms FROM queue_items WHERE id=3")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        for i in 0..3 {
+            assert_eq!(row.get::<i64, _>(i), 0, "numeric default must survive");
+        }
+        // Same integer bindings/literals as PlayQueueRepo: both queue writers
+        // and current-item queries must remain valid after a legacy TEXT cast.
+        sqlx::query("UPDATE queue_items SET position=$1, is_current=$2 WHERE id=3")
+            .bind(9i64)
+            .bind(1i64)
+            .execute(&mut c)
+            .await
+            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM queue_items WHERE is_current='1'")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
+    }
+}
+
+#[tokio::test]
+async fn pg_3716_invalid_legacy_values_are_preserved() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        return;
+    };
+    let migration = crate::db::migrations::PG_MIGRATIONS
+        .iter()
+        .find(|(v, _, _)| *v == 59)
+        .unwrap()
+        .2;
+    let mut maintenance = connexion(&url).await;
+    let mut c = base_vierge(&mut maintenance, "tune_queue_invalid_3716", &url).await;
+    sqlx::raw_sql("CREATE TABLE schema_version (version integer PRIMARY KEY, name text);         CREATE TABLE queue_items (position text DEFAULT '0', is_current smallint DEFAULT 0, duration_ms text);         INSERT INTO queue_items VALUES ('not-a-number', 1, '9223372036854775808')")
+        .execute(&mut c).await.unwrap();
+    sqlx::raw_sql(migration).execute(&mut c).await.unwrap();
+    let types = types_pg(&mut c).await;
+    assert_eq!(types["queue_items"]["position"], "text");
+    assert_eq!(types["queue_items"]["duration_ms"], "text");
+    assert_eq!(types["queue_items"]["is_current"], "bigint");
+    let row = sqlx::query("SELECT position,duration_ms FROM queue_items")
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>(0), "not-a-number");
+    assert_eq!(row.get::<String, _>(1), "9223372036854775808");
 }

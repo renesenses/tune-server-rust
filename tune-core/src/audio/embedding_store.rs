@@ -301,6 +301,31 @@ pub fn eligible_count(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
+/// Pistes éligibles non traitées que la passe reporte temporairement (#4187).
+/// Le seuil et les deux prédicats de métadonnées sont ceux de la sélection
+/// des candidats : un report périmé redevient du travail à faire, et un ancien
+/// marqueur de report ne masque jamais une piste déjà traitée pour ce modèle.
+pub fn deferred_count(backend: &Arc<dyn DbBackend>, seuil_report: &str) -> i64 {
+    backend
+        .query_one(
+            &format!(
+                "SELECT COUNT(*) FROM tracks t WHERE {ELIGIBLE_WHERE} \
+          AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+            WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' AND m.value = ?) \
+          AND EXISTS (SELECT 1 FROM track_metadata m \
+            WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' AND m.value > ?)"
+            ),
+            &[
+                &MODEL_ID as &dyn ToSqlValue,
+                &seuil_report as &dyn ToSqlValue,
+            ],
+        )
+        .ok()
+        .flatten()
+        .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 /// Rank the library by cosine similarity to an arbitrary (already-normalised)
 /// query vector, most similar first. `exclude` drops one track id (the seed,
 /// when querying by track). Returns `(track_id, cosine)`. Works for any query in
@@ -631,6 +656,61 @@ mod progress_counter_tests {
                 &params,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn reports_4187_excluent_les_pistes_finies_et_expirent_comme_les_candidats() {
+        use crate::library::local_path::{
+            PATH_RETRY_AFTER_SECS, deferral_stamp, deferral_threshold,
+        };
+        let backend = setup();
+        let now = 1_800_000_000;
+        let ids: Vec<_> = (0..6).map(|n| mk_track(&backend, n)).collect();
+        stamp(&backend, ids[0], MODEL_ID);
+        stamp(&backend, ids[3], "ancien-modele");
+        backend
+            .execute("UPDATE tracks SET format = 'dsf' WHERE id = ?", &[&ids[4]])
+            .unwrap();
+        backend
+            .execute(
+                "UPDATE tracks SET file_path = NULL WHERE id = ?",
+                &[&ids[5]],
+            )
+            .unwrap();
+        for (i, id) in ids.iter().enumerate() {
+            let date = deferral_stamp(if i == 2 {
+                now - PATH_RETRY_AFTER_SECS
+            } else {
+                now
+            });
+            backend.execute("INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'audio_embed_path_unresolved', ?)", &[id, &date]).unwrap();
+        }
+        let threshold = deferral_threshold(now);
+        assert_eq!(
+            deferred_count(&backend, &threshold),
+            2,
+            "les pistes reportées restent confondues avec le travail disponible (#4187)"
+        );
+        assert_eq!(
+            processed_count(&backend),
+            1,
+            "un report n'est jamais une analyse terminée"
+        );
+        assert_eq!(eligible_count(&backend), 4);
+        let candidates = candidats_acoustiques(&backend, &threshold, 100).unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "le report à la frontière du délai est déjà périmé"
+        );
+        let expired = deferral_threshold(now + PATH_RETRY_AFTER_SECS);
+        assert_eq!(deferred_count(&backend, &expired), 0);
+        assert_eq!(
+            candidats_acoustiques(&backend, &expired, 100)
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     /// #1819, cas RÉEL de la machine .18 (16/08) : le modèle a été bumpé.

@@ -137,6 +137,17 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     if let Some(etat) = tune_core::slimproto::etat_ecoute() {
         components.insert("slimproto".to_string(), Value::Bool(etat.ecoute));
     }
+    for (nom, etat) in [
+        ("lms_cli", tune_core::slimproto::cli_server::etat_ecoute()),
+        (
+            "slimproto_udp",
+            tune_core::slimproto::discovery::etat_ecoute(),
+        ),
+    ] {
+        if let Some(etat) = etat {
+            components.insert(nom.to_string(), Value::Bool(etat.ecoute));
+        }
+    }
 
     (
         code,

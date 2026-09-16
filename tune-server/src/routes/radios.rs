@@ -2474,7 +2474,7 @@ pub fn alarms_router() -> Router<AppState> {
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let rows = state.backend.query_many(
-        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, source_id, source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids FROM alarms ORDER BY time",
+        "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids FROM alarms ORDER BY time",
         &[],
     ).map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows

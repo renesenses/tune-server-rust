@@ -2379,6 +2379,7 @@ mod tests {
         assert!(SUPPORTED_EXTENSIONS.contains(&"mp3"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"dsf"));
         assert!(SUPPORTED_EXTENSIONS.contains(&"ape"));
+        assert!(SUPPORTED_EXTENSIONS.contains(&"aifc"));
         assert!(!SUPPORTED_EXTENSIONS.contains(&"wma"));
         assert!(!SUPPORTED_EXTENSIONS.contains(&"dst"));
         assert!(!SUPPORTED_EXTENSIONS.contains(&"txt"));
