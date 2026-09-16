@@ -2505,7 +2505,7 @@ impl StreamingService for QobuzService {
         // absente était indiscernable d'une catégorie qui n'a jamais existé.
         let tags = self.get_playlist_tags().await?;
         use futures_util::StreamExt;
-        let rows: Vec<Option<PlaylistTagGroup>> = futures_util::stream::iter(tags.into_iter())
+        let rows: Vec<Option<PlaylistTagGroup>> = futures_util::stream::iter(tags)
             .map(|tag| async move {
                 let limit = PER_TAG.to_string();
                 let mut params: Vec<(&str, &str)> = vec![
