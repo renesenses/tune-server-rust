@@ -2228,7 +2228,7 @@ async fn une_session_de_transcodage_abandonnee_ne_se_confond_plus_avec_une_sessi
     std::fs::write(&tmp, b"pas du flac").expect("fichier temporaire de l'epreuve");
     let tmp_str = tmp.as_str().to_string();
 
-    abandonner_la_session_de_transcodage(&orch.streamer, &morte, &tmp_str).await;
+    abandonner_la_session_de_transcodage(&orch.streamer, &morte, Some(&tmp_str)).await;
 
     assert!(
         !orch.stream_session_alive(&morte).await,

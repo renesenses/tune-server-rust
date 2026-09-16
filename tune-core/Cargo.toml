@@ -6,6 +6,8 @@ license.workspace = true
 autotests = false
 
 [dependencies]
+# Temporary streaming downloads must be removed on cancellation (#4234).
+tempfile = "3"
 tune-output-api = { path = "../tune-output-api" }
 # Only for the plugin SDK's router registration — see the `plugin-http` feature.
 axum = { workspace = true, optional = true }
@@ -125,7 +127,6 @@ objc2-core-audio = { version = "0.3", default-features = false, features = ["std
 objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"], optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
 # Lean criterion (no plotters/rayon) — just the bench harness.
