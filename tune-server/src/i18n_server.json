@@ -1962,5 +1962,41 @@
     "ko": "전기 보강에는 Last.fm API 키가 필요합니다. \"lastfm_api_key\" 설정을 입력하면 활성화됩니다.",
     "ro": "Îmbogățirea biografiilor necesită o cheie API Last.fm. Completați setarea „lastfm_api_key” pentru a o activa.",
     "sv": "Berikning av biografier kräver en API-nyckel för Last.fm. Ange inställningen ”lastfm_api_key” för att aktivera den."
+  },
+  "playback.sessionLostAtPosition": {
+    "fr": "La lecture de « {title} » ne peut pas reprendre à {position} : sa session de flux n’est plus disponible. Les sessions expirent après {minutes} minutes sans lecture ; un redémarrage du serveur peut aussi les supprimer. Relancez la piste.",
+    "en": "“{title}” cannot resume at {position}: its playback session is no longer available. Sessions expire after {minutes} minutes without playback; restarting the server can also remove them. Start the track again.",
+    "de": "„{title}“ kann nicht bei {position} fortgesetzt werden: Die Wiedergabesitzung ist nicht mehr verfügbar. Sitzungen laufen nach {minutes} Minuten ohne Wiedergabe ab; auch ein Serverneustart kann sie entfernen. Starten Sie den Titel erneut.",
+    "es": "No se puede reanudar «{title}» en {position}: su sesión de reproducción ya no está disponible. Las sesiones caducan tras {minutes} minutos sin reproducción; reiniciar el servidor también puede eliminarlas. Vuelva a iniciar la pista.",
+    "it": "Impossibile riprendere «{title}» da {position}: la sessione di riproduzione non è più disponibile. Le sessioni scadono dopo {minutes} minuti senza riproduzione; anche un riavvio del server può eliminarle. Avvia di nuovo il brano.",
+    "zh": "无法从 {position} 继续播放“{title}”：播放会话已不可用。会话在停止播放 {minutes} 分钟后过期；重启服务器也可能使其丢失。请重新开始播放曲目。",
+    "ja": "「{title}」を {position} から再開できません。再生セッションが利用できなくなっています。セッションは再生されないまま {minutes} 分経つと失効し、サーバーの再起動でも失われることがあります。曲をもう一度再生してください。",
+    "ko": "“{title}”을(를) {position}에서 재개할 수 없습니다. 재생 세션을 더 이상 사용할 수 없습니다. 세션은 재생 없이 {minutes}분이 지나면 만료되며 서버를 다시 시작해도 사라질 수 있습니다. 트랙을 다시 재생하세요.",
+    "ro": "„{title}” nu poate fi reluată de la {position}: sesiunea de redare nu mai este disponibilă. Sesiunile expiră după {minutes} minute fără redare; repornirea serverului le poate elimina și ea. Porniți din nou piesa.",
+    "sv": "”{title}” kan inte återupptas vid {position}: uppspelningssessionen är inte längre tillgänglig. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen."
+  },
+  "playback.sessionLostBrowser": {
+    "fr": "La lecture de « {title} » ne peut pas reprendre là où elle en était : sa session de flux n’est plus disponible et le serveur ne connaît pas la position de lecture dans le navigateur. Les sessions expirent après {minutes} minutes sans lecture ; un redémarrage du serveur peut aussi les supprimer. Relancez la piste.",
+    "en": "“{title}” cannot resume where it stopped: its playback session is no longer available and the server does not know the playback position in the browser. Sessions expire after {minutes} minutes without playback; restarting the server can also remove them. Start the track again.",
+    "de": "„{title}“ kann nicht an der letzten Stelle fortgesetzt werden: Die Wiedergabesitzung ist nicht mehr verfügbar und der Server kennt die Wiedergabeposition im Browser nicht. Sitzungen laufen nach {minutes} Minuten ohne Wiedergabe ab; auch ein Serverneustart kann sie entfernen. Starten Sie den Titel erneut.",
+    "es": "No se puede reanudar «{title}» donde se detuvo: su sesión ya no está disponible y el servidor no conoce la posición de reproducción en el navegador. Las sesiones caducan tras {minutes} minutos sin reproducción; reiniciar el servidor también puede eliminarlas. Vuelva a iniciar la pista.",
+    "it": "Impossibile riprendere «{title}» dal punto di interruzione: la sessione non è più disponibile e il server non conosce la posizione di riproduzione nel browser. Le sessioni scadono dopo {minutes} minuti senza riproduzione; anche un riavvio del server può eliminarle. Avvia di nuovo il brano.",
+    "zh": "无法从上次停止的位置继续播放“{title}”：播放会话已不可用，服务器也不知道浏览器中的播放位置。会话在停止播放 {minutes} 分钟后过期；重启服务器也可能使其丢失。请重新开始播放曲目。",
+    "ja": "「{title}」を前回の位置から再開できません。再生セッションが利用できなくなっており、サーバーはブラウザーの再生位置を把握していません。セッションは再生されないまま {minutes} 分経つと失効し、サーバーの再起動でも失われることがあります。曲をもう一度再生してください。",
+    "ko": "“{title}”을(를) 멈춘 위치에서 재개할 수 없습니다. 재생 세션을 더 이상 사용할 수 없으며 서버는 브라우저의 재생 위치를 알지 못합니다. 세션은 재생 없이 {minutes}분이 지나면 만료되며 서버를 다시 시작해도 사라질 수 있습니다. 트랙을 다시 재생하세요.",
+    "ro": "„{title}” nu poate fi reluată din locul unde s-a oprit: sesiunea nu mai este disponibilă, iar serverul nu cunoaște poziția redării în browser. Sesiunile expiră după {minutes} minute fără redare; repornirea serverului le poate elimina și ea. Porniți din nou piesa.",
+    "sv": "”{title}” kan inte återupptas där det stoppades: sessionen är inte längre tillgänglig och servern känner inte till uppspelningspositionen i webbläsaren. Sessioner upphör efter {minutes} minuter utan uppspelning; en omstart av servern kan också ta bort dem. Starta spåret igen."
+  },
+  "playback.sessionLostCause": {
+    "fr": "Cause: {cause}",
+    "en": "Cause: {cause}",
+    "de": "Ursache: {cause}",
+    "es": "Causa: {cause}",
+    "it": "Causa: {cause}",
+    "zh": "原因: {cause}",
+    "ja": "原因: {cause}",
+    "ko": "원인: {cause}",
+    "ro": "Cauză: {cause}",
+    "sv": "Orsak: {cause}"
   }
 }

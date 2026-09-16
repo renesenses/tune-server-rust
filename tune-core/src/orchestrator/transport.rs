@@ -1922,9 +1922,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         titre: &str,
         position_ms: Option<u64>,
-        cause: Option<&str>,
+        message: String,
     ) -> OutputCommandError {
-        let message = message_session_perdue(titre, position_ms, cause);
         // `?position_ms` et non `position_ms` : le journal doit distinguer
         // `Some(137000)` de `None`, pas écrire un `0` de plus (#3244).
         warn!(zone_id, ?position_ms, %message, "resume_stream_session_lost");
@@ -1934,6 +1933,9 @@ impl PlaybackOrchestrator {
                 serde_json::json!({
                     "zone_id": zone_id,
                     "error": message.clone(),
+                    "code": "stream_session_lost",
+                    "title": titre,
+                    "position_ms": position_ms,
                     "fatal": true,
                 }),
             );
@@ -1994,6 +1996,21 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        self.resume_with_session_error_message(zone_id, device_id, message_session_perdue)
+            .await
+    }
+
+    /// Resume with the caller's translation for a lost stream session (#4193).
+    ///
+    /// HTTP knows the requested language; the core and other callers do not.
+    /// Format once, at the failure, so the HTTP error and broadcast event agree.
+    /// The formatter never changes the recovery decision or the saved position.
+    pub async fn resume_with_session_error_message(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
+    ) -> OutputCommandResult<()> {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
@@ -2140,7 +2157,7 @@ impl PlaybackOrchestrator {
                                     zone_id,
                                     &np.title,
                                     position_mesuree,
-                                    Some(&e),
+                                    session_message(&np.title, position_mesuree, Some(&e)),
                                 ));
                             }
                         }
@@ -2151,7 +2168,7 @@ impl PlaybackOrchestrator {
                             zone_id,
                             &np.title,
                             position_mesuree,
-                            None,
+                            session_message(&np.title, position_mesuree, None),
                         ));
                     }
                     // Radio dont on ne connaît aucune sortie : repli inchangé sur
