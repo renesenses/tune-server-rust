@@ -655,3 +655,7 @@ path = "tests/lecture_upnp_indexee_2219.rs"
 [[test]]
 name = "album_dr_provenance_3924"
 path = "tests/album_dr_provenance_3924.rs"
+
+[[test]]
+name = "idle_poll_diagnostics_2566"
+path = "tests/idle_poll_diagnostics_2566.rs"

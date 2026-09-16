@@ -11,6 +11,8 @@
 
 pub mod cli_server;
 pub mod discovery;
+mod ecoute;
+pub use ecoute::EtatEcoute;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
