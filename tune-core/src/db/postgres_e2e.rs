@@ -1712,3 +1712,36 @@ async fn pg_3039_fenetre_et_decompte_des_ajouts_recents() {
     );
     let _ = db.execute(&format!("DELETE FROM artists WHERE id = {artiste}"), &[]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_genres_manquants_3979() {
+    let db = pg_or_skip!();
+    let predicate = crate::db::facet_filter::untagged_condition_for_engine(
+        "genre",
+        crate::db::engine::Engine::Postgres,
+    )
+    .unwrap();
+    for (genre, genres, missing) in [
+        (None, Some(r#"["Jazz", "Soul"]"#), false),
+        (Some("Rock"), None, false),
+        (None, None, true),
+        (Some(""), Some("[]"), true),
+        (None, Some("[ ]"), true),
+        (None, Some(r#"["", " "]"#), true),
+        (None, Some("broken"), true),
+        (None, Some("null"), true),
+        (None, Some(r#"{"genre":"Jazz"}"#), true),
+        (None, Some(r#"["Jazz", 1]"#), true),
+        (Some("Blues"), Some("broken"), false),
+    ] {
+        let sql = format!(
+            "SELECT {predicate} AS missing FROM (SELECT $1::text AS genre, $2::text AS genres) t"
+        );
+        let row = db.query_one(&sql, &[&genre, &genres]).unwrap().unwrap();
+        assert_eq!(
+            row[0].as_bool(),
+            Some(missing),
+            "PostgreSQL compte mal les genres multiples (#3979): {genre:?} / {genres:?}"
+        );
+    }
+}
