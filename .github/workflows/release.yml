@@ -593,7 +593,13 @@ jobs:
           elif [ "$RUNNER_OS" = "macOS" ]; then
             echo "::warning::APPLE_TEAM_ID is unset — shipping an ad-hoc signed binary. macOS users will lose their Local Network grant on upgrade."
           fi
-          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG web/ plugins/
+          # Instructions beside the binary for users arriving through the tarball (#4233).
+          INSTRUCTIONS=""
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cp packaging/linux/README.txt package/README.txt
+            INSTRUCTIONS="README.txt"
+          fi
+          cd package && tar czf ../${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server $DAEMON $FFMPEG web/ plugins/ $INSTRUCTIONS
           cd ..
 
       # ── Signature Authenticode (Windows) ───────────────────────────────────
