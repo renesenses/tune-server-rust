@@ -1924,6 +1924,32 @@ impl AlbumRepo {
         Ok(par_id)
     }
 
+    /// Attache `added_at` à des albums lus par `select_album()`, qui la
+    /// laisse à `None`. Une requête groupée pour toute la liste. Un échec ne
+    /// casse pas la liste : elle reste sans date, et le journal le dit — un
+    /// album sans piste locale reste sans date, rien n'est inventé.
+    ///
+    /// Trois écrans en dépendent depuis le 16/09/2026 : les dossiers, la
+    /// recherche, la fiche artiste — tous trient par date d'ajout.
+    pub fn attacher_added_at(&self, albums: &mut [Album]) {
+        let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        match self.added_at_by_ids(&ids) {
+            Ok(par_id) => {
+                for a in albums.iter_mut() {
+                    if let Some(id) = a.id {
+                        a.added_at = par_id.get(&id).copied();
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "added_at_by_ids a échoué — liste sans date d'ajout")
+            }
+        }
+    }
+
     /// Jointure GROUPÉE qui donne le Dynamic Range de CHAQUE album en une
     /// passe, exposé sous l'alias `dr.dr` (#2144).
     ///

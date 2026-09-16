@@ -391,32 +391,13 @@ async fn federated_search(
 /// Attache `added_at` aux albums d'une page de résultats.
 ///
 /// `search_page` lit les albums par `select_album()`, qui laisse `added_at` à
-/// `None` (la colonne n'y est pas — voir `row_to_album`). L'écran de
-/// recherche trie désormais ses albums par date d'ajout (Bertrand,
-/// 16/09/2026) : sans cette passe, ce tri serait un tri sur rien, et l'écran
-/// ne verrait jamais la date. Une seule requête groupée pour la page
-/// (`added_at_by_ids`, #3397), comme pour les dossiers. Un échec ne casse
-/// pas la recherche : la page sort sans date, et le journal le dit.
+/// `None`. L'écran de recherche trie désormais ses albums par date d'ajout
+/// (Bertrand, 16/09/2026) : sans cette passe, ce tri serait un tri sur rien.
 fn avec_date_d_ajout(
     repo: &AlbumRepo,
     mut albums: Vec<tune_core::db::models::Album>,
 ) -> Vec<tune_core::db::models::Album> {
-    let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
-    if ids.is_empty() {
-        return albums;
-    }
-    match repo.added_at_by_ids(&ids) {
-        Ok(par_id) => {
-            for a in &mut albums {
-                if let Some(id) = a.id {
-                    a.added_at = par_id.get(&id).copied();
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "recherche: added_at_by_ids a échoué — page sans date d'ajout")
-        }
-    }
+    repo.attacher_added_at(&mut albums);
     albums
 }
 
