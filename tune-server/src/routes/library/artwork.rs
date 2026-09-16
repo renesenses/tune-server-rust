@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Extension, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -24,6 +24,10 @@ pub(super) fn is_hex_hash(s: &str) -> bool {
 #[derive(Deserialize)]
 pub(super) struct ProxyQuery {
     url: String,
+    /// La signature HMAC de `url` (#4260), que portent les URL de relais
+    /// publiées par le serveur lui-même (DIDL). Absente sur celles que le
+    /// client web bâtit.
+    sig: Option<String>,
 }
 
 /// Le `?size=` que le client envoie sur chaque vignette.
@@ -295,36 +299,79 @@ pub(super) async fn upload_album_artwork(
     }
 }
 
+/// Relaie une pochette distante — derrière la garde de
+/// [`tune_core::library::artwork_proxy`] (#4260).
+///
+/// Avant : `state.http_client.get(&q.url)` tel quel. Le serveur allait
+/// chercher N'IMPORTE QUELLE adresse donnée par le client, redirections
+/// comprises, et rendait le corps — un relais ouvert, que #4061 a publié au
+/// LAN dans la DIDL (les ressources de la DIDL sont exemptées de jeton, #3933).
+///
+/// Maintenant, dans l'ordre :
+/// * `sig` présent mais faux → 400 ; absent alors que l'appel est entré par
+///   l'exemption DIDL ([`ExemptionDidl`]) → 400 ;
+/// * schéma autre que http/https → 400 ;
+/// * adresse littérale interne (boucle locale, privée, lien-local…) → 403 ;
+/// * URL non signée vers un hôte hors [`HOTES_AUTORISES`] (et hors réglage
+///   `artwork_proxy_hosts`) → 403 ;
+/// * nom qui RÉSOUT en adresse interne → 403 (le résolveur du client refuse
+///   l'adresse, pas la chaîne) ;
+/// * redirection vers une URL que la même garde refuse → 403.
+///
+/// Le client web (`api.ts::artworkUrl`) n'est pas modifié : il bâtit des URL
+/// non signées, admises par la liste d'hôtes.
+///
+/// [`ExemptionDidl`]: crate::auth::ExemptionDidl
+/// [`HOTES_AUTORISES`]: tune_core::library::artwork_proxy::HOTES_AUTORISES
 pub(super) async fn proxy_artwork(
     State(state): State<AppState>,
+    exemption: Option<Extension<crate::auth::ExemptionDidl>>,
     Query(q): Query<ProxyQuery>,
 ) -> impl IntoResponse {
-    match state.http_client.get(&q.url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("image/jpeg")
-                .to_string();
-            match resp.bytes().await {
-                Ok(data) => {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(
-                        "Content-Type",
-                        HeaderValue::from_str(&content_type)
-                            .unwrap_or(HeaderValue::from_static("image/jpeg")),
-                    );
-                    headers.insert(
-                        "Cache-Control",
-                        HeaderValue::from_static("public, max-age=86400"),
-                    );
-                    (StatusCode::OK, headers, data.to_vec()).into_response()
-                }
-                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
-            }
+    use tune_core::library::artwork_proxy::{self, Demande, Echec};
+
+    let secret = artwork_proxy::secret(&state.backend);
+    let supplementaires = artwork_proxy::hotes_supplementaires(&state.backend);
+    let demande = Demande {
+        url: &q.url,
+        sig: q.sig.as_deref(),
+        secret: &secret,
+        signature_exigee: exemption.is_some(),
+        hotes_supplementaires: &supplementaires,
+    };
+    match state.relais_pochettes.relayer(&demande).await {
+        Ok(image) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Content-Type",
+                HeaderValue::from_str(&image.content_type)
+                    .unwrap_or(HeaderValue::from_static("image/jpeg")),
+            );
+            headers.insert(
+                "Cache-Control",
+                HeaderValue::from_static("public, max-age=86400"),
+            );
+            (StatusCode::OK, headers, image.octets).into_response()
         }
-        _ => StatusCode::BAD_GATEWAY.into_response(),
+        Err(Echec::Refus(refus)) => {
+            tracing::warn!(
+                url = %q.url,
+                signee = q.sig.is_some(),
+                exemption_didl = exemption.is_some(),
+                refus = %refus,
+                "{}",
+                refus.motif()
+            );
+            (
+                StatusCode::from_u16(refus.statut()).unwrap_or(StatusCode::FORBIDDEN),
+                Json(json!({ "error": refus.to_string(), "motif": refus.motif() })),
+            )
+                .into_response()
+        }
+        Err(Echec::Amont(erreur)) => {
+            tracing::debug!(url = %q.url, erreur = %erreur, "artwork_proxy_amont");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
     }
 }
 

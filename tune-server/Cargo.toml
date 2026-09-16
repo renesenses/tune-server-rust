@@ -605,6 +605,16 @@ path = "tests/zones_auto_create_recension.rs"
 name = "serveur_media_didl_hors_auth_3933"
 path = "tests/serveur_media_didl_hors_auth_3933.rs"
 
+# #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
+# signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
+# refus des adresses internes APRÈS résolution DNS, redirections à la main.
+# Passe par le routeur monté (donc l'exemption DIDL de #3933), avec un amont
+# local et un résolveur factice — rien ne sort sur Internet. `autotests =
+# false` plus haut : sans cette entrée, le fichier ne serait JAMAIS compilé.
+[[test]]
+name = "artwork_proxy_relais_ferme_4260"
+path = "tests/artwork_proxy_relais_ferme_4260.rs"
+
 # #2732 : la borne d'une collection intelligente. Deux trous sur la meme valeur —
 # rien ne gardait le NOM (le banc de contrats n'exige que la PRESENCE des champs,
 # jamais l'absence des autres : reintroduire `max_albums` laissait tout vert), et
