@@ -421,6 +421,8 @@ struct Attendu {
     marge_queue: i64,
 }
 
+// D3 (#4079) : RMS remesures apres correction de la somme de normalisation.
+// Reference, tolerances et seuil audiophile restent inchanges.
 const ATTENDU: [Attendu; 7] = [
     // 44,1 → 48 kHz — AVANT le correctif D1 : −10,31 dB à 20 kHz, bande
     // 18 550 Hz, erreur RMS −108,4 dB, délai annoncé 69 (noyau 128).
@@ -428,10 +430,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: 0.0026,
         pre_roll: 53,
         a_retirer: 196,
-        err_sinus_db: -121.4,
+        err_sinus_db: -135.7,
         err_sinus_brute_db: -69.5,
         thd_n_db: -136.8,
-        err_balayage_db: -108.4,
+        err_balayage_db: -107.2,
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
         rejection_db: -109.9,
@@ -447,10 +449,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: 0.0027,
         pre_roll: 155,
         a_retirer: 259,
-        err_sinus_db: -118.1,
+        err_sinus_db: -137.7,
         err_sinus_brute_db: -68.4,
         thd_n_db: -138.2,
-        err_balayage_db: -110.8,
+        err_balayage_db: -108.7,
         gain_20k_db: 0.0,
         bande_hz: 20_700.0,
         rejection_db: -122.6,
@@ -466,10 +468,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.0017,
         pre_roll: 36,
         a_retirer: 356,
-        err_sinus_db: -121.4,
+        err_sinus_db: -135.4,
         err_sinus_brute_db: -79.1,
         thd_n_db: -136.1,
-        err_balayage_db: -108.4,
+        err_balayage_db: -107.1,
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
         rejection_db: -107.4,
@@ -487,10 +489,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.002,
         pre_roll: 0,
         a_retirer: 63,
-        err_sinus_db: -88.4,
-        err_sinus_brute_db: -71.7,
+        err_sinus_db: -137.2,
+        err_sinus_brute_db: -71.8,
         thd_n_db: -146.3,
-        err_balayage_db: -88.4,
+        err_balayage_db: -118.4,
         gain_20k_db: 0.0,
         bande_hz: 22_050.0,
         rejection_db: -134.1,
@@ -506,10 +508,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.0034,
         pre_roll: 36,
         a_retirer: 713,
-        err_sinus_db: -121.4,
+        err_sinus_db: -135.3,
         err_sinus_brute_db: -79.1,
         thd_n_db: -135.9,
-        err_balayage_db: -108.4,
+        err_balayage_db: -107.2,
         gain_20k_db: 0.0,
         bande_hz: 20_750.0,
         rejection_db: -107.5,
@@ -527,10 +529,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: -0.0011,
         pre_roll: 19,
         a_retirer: 39,
-        err_sinus_db: -102.0,
+        err_sinus_db: -143.4,
         err_sinus_brute_db: -77.1,
         thd_n_db: -144.5,
-        err_balayage_db: -102.3,
+        err_balayage_db: -130.0,
         gain_20k_db: 0.0,
         bande_hz: 21_150.0,
         rejection_db: -144.3,
@@ -546,10 +548,10 @@ const ATTENDU: [Attendu; 7] = [
         delai: 0.0007,
         pre_roll: 27,
         a_retirer: 64,
-        err_sinus_db: -85.4,
-        err_sinus_brute_db: -79.3,
+        err_sinus_db: -144.5,
+        err_sinus_brute_db: -80.5,
         thd_n_db: -144.6,
-        err_balayage_db: -85.4,
+        err_balayage_db: -132.0,
         gain_20k_db: 0.0,
         bande_hz: 20_600.0,
         rejection_db: -145.8,
@@ -1180,7 +1182,6 @@ fn audiophile_erreur_1k_44_1_vers_96() {
     affirme_erreur(2);
 }
 #[test]
-#[ignore = "défaut connu, AGGRAVÉ par le correctif D1 : −88,4 dB en 96 → 48 kHz (était −99,1). L'écart est entièrement un gain en bande de +0,00033 dB (0,0038 %) — le THD+N reste à −146,3 dB, donc aucune distorsion ajoutée. C'est la normalisation de gain de la fenêtre, le même défaut que 192 → 44,1 ; il se traite à part"]
 fn audiophile_erreur_1k_96_vers_48() {
     affirme_erreur(3);
 }
@@ -1195,7 +1196,6 @@ fn audiophile_erreur_1k_176_4_vers_48() {
     affirme_erreur(5);
 }
 #[test]
-#[ignore = "défaut connu : −85,4 dB en 192 → 44,1 kHz (était −87,8 ; gain en bande −0,00047 dB, noyau 512). Comme en 96 → 48, l'écart est un GAIN, pas une distorsion : THD+N à −144,6 dB"]
 fn audiophile_erreur_1k_192_vers_44_1() {
     affirme_erreur(6);
 }
@@ -1209,5 +1209,27 @@ fn releve_de_tous_les_rapports() {
     for (i, r) in RAPPORTS.iter().enumerate() {
         let m = mesures(i);
         assert!(m.err_sinus_db.is_finite(), "{} : mesure non finie", r.nom);
+    }
+}
+
+/// Le signal continu verifie directement le gain du filtre, sans recalage de
+/// phase ni ajustement de sinus : les queues du sinc ne doivent pas biaiser
+/// le niveau constant. On exclut seulement les transitoires des deux bords.
+#[test]
+fn i4079_le_gain_continu_de_tune_reste_unitaire_sur_les_sept_rapports() {
+    for r in RAPPORTS {
+        let entree = vec![0.5f32; r.de as usize / 4];
+        let sortie = tune_piste(&entree, r.de, r.vers);
+        let milieu = &sortie[sortie.len() / 4..sortie.len() * 3 / 4];
+        let pire = milieu
+            .iter()
+            .map(|&x| (x as f64 / 0.5 - 1.0).abs())
+            .fold(0.0f64, f64::max);
+        eprintln!("[4079 DC] {} : erreur relative maximale {pire:.9e}", r.nom);
+        assert!(
+            pire < 1e-6,
+            "{} : gain continu relatif hors de 1 ± 1e-6 : {pire:.9e}",
+            r.nom
+        );
     }
 }

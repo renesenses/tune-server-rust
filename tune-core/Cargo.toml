@@ -73,9 +73,9 @@ cbc = { workspace = true }
 regex = { workspace = true }
 csv = { workspace = true }
 symphonia = { workspace = true }
-# SPIKE (#1145): pure-Rust Monkey's Audio (.ape) decoder, MIT/Apache-2.0.
-# Evaluated as a replacement for the "not supported" fallback. Not production.
-ape-decoder = "0.3.2"
+# Native Monkey's Audio decoder, MIT/Apache-2.0.
+# Local pre-3990 entropy support (#4191): vendor/ape-decoder/TUNE-PATCH.md.
+ape-decoder = { path = "../vendor/ape-decoder", version = "0.3.2" }
 opus = { workspace = true }
 rubato = { workspace = true }
 unicode-normalization = { workspace = true }
