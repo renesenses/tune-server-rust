@@ -1,0 +1,10 @@
+{
+  "version": "0.9.151",
+  "ready": true,
+  "components": {
+    "server": { "sha": "self", "tag": "v0.9.151" },
+    "web": { "sha": "ef8d37950eb55469129dd8ddeb8bacc3a9a09a66", "tag": "v0.9.151" },
+    "os": { "sha": "32ad736695964c3812a8b9aae9649d945d7a7c38", "tag": "tune-os-rpi-v0.9.151" },
+    "universal": { "sha": "cb1229a1376152d1e9b6504dddf5b4fc0fcc5826", "tag": "v0.9.151" }
+  }
+}
