@@ -1,3 +1,6 @@
+mod random;
+pub use random::generate_random_queue;
+
 use serde_json::{Value, json};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
