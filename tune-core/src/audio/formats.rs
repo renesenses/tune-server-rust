@@ -32,6 +32,17 @@ pub enum AudioFormat {
     WavPack,
     Ape,
     Wma,
+    /// Conteneur Matroska (`.mkv`, `.mka`, `.webm`) dont la piste audio est
+    /// décodable — FLAC, PCM, Vorbis, AAC, ALAC par symphonia, Opus par
+    /// libopus (#3633, point 2).
+    ///
+    /// Comme [`Self::M4a`], la variante dit ce qu'on sait — le conteneur — et
+    /// rien de ce qu'on ignore : `tracks.format` porte l'extension, pas le
+    /// codec, parce qu'écrire « flac » ferait servir le `.mka` BRUT sous
+    /// `audio/flac` à un renderer qui ne saurait pas l'ouvrir. Un Matroska
+    /// est donc toujours transcodé pour la sortie (DLNA, Chromecast,
+    /// navigateur), jamais servi tel quel.
+    Matroska,
 }
 
 impl AudioFormat {
@@ -69,6 +80,7 @@ impl AudioFormat {
             "vorbis" => Some(Self::Ogg),
             "ape" => Some(Self::Ape),
             "wma" | "asf" => Some(Self::Wma),
+            "mkv" | "mka" | "webm" | "weba" | "matroska" => Some(Self::Matroska),
             _ => None,
         }
     }
@@ -84,7 +96,7 @@ impl AudioFormat {
             Self::Ogg => "ogg",
             Self::Opus => "opus",
             Self::Aiff => "aiff",
-            Self::Dsd | Self::WavPack | Self::Ape | Self::Wma => "wav",
+            Self::Dsd | Self::WavPack | Self::Ape | Self::Wma | Self::Matroska => "wav",
         }
     }
 
@@ -104,6 +116,8 @@ impl AudioFormat {
             Self::Dsd => "pcm_s24le",
             Self::WavPack | Self::Ape => "pcm_s24le",
             Self::Wma => "pcm_s16le",
+            // Jamais une cible d'encodage : la valeur ne décide de rien.
+            Self::Matroska => "pcm_s24le",
         }
     }
 
@@ -123,6 +137,7 @@ impl AudioFormat {
             Self::WavPack => "audio/x-wavpack",
             Self::Ape => "audio/x-ape",
             Self::Wma => "audio/x-ms-wma",
+            Self::Matroska => "audio/x-matroska",
         }
     }
 }
@@ -289,6 +304,7 @@ impl AudioFormat {
             Self::WavPack => "WavPack",
             Self::Ape => "APE",
             Self::Wma => "WMA",
+            Self::Matroska => "MKV",
         }
     }
 
@@ -314,6 +330,9 @@ impl AudioFormat {
                 | Self::Dsd
                 | Self::Opus
                 | Self::Ogg
+                // Un renderer n'ouvre pas un Matroska : le conteneur est
+                // démuxé et la piste transcodée en FLAC (#3633).
+                | Self::Matroska
         )
     }
 

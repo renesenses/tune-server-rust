@@ -894,7 +894,8 @@ pub(super) fn est_sortie_locale(output_device_id: Option<&str>) -> bool {
 
 /// Une zone navigateur doit-elle recevoir la source décodée en WAV ? Oui pour
 /// tout format que `<audio>` ne décode pas — DSD avant tout (Reivax66, 0.9.44),
-/// WavPack, APE, WMA, AIFF, ALAC. Les codecs web restent servis direct.
+/// WavPack, APE, WMA, AIFF, ALAC, et Matroska (#3633 : `<audio>` n'ouvre pas
+/// un `.mka` FLAC). Les codecs web restent servis direct.
 pub(super) fn navigateur_exige_le_wav(
     is_browser_output: bool,
     source_format: Option<AudioFormat>,
@@ -908,6 +909,7 @@ pub(super) fn navigateur_exige_le_wav(
                 | Some(AudioFormat::Wma)
                 | Some(AudioFormat::Aiff)
                 | Some(AudioFormat::Alac)
+                | Some(AudioFormat::Matroska)
         )
 }
 
@@ -1033,6 +1035,7 @@ mod lecture_locale_tests {
             AudioFormat::Wma,
             AudioFormat::Aiff,
             AudioFormat::Alac,
+            AudioFormat::Matroska,
         ] {
             assert!(
                 navigateur_exige_le_wav(true, Some(exotique)),
