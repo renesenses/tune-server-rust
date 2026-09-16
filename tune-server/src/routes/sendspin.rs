@@ -19,7 +19,7 @@
 //! chiffree sans etre authentifiee ; une PSK longue duree doit correspondre
 //! au pair et au record courant. La perte d'une cle ne supprime pas le record.
 //! Aucun son, aucune commande ni donnee de bibliotheque n'est offert : la
-//! connexion s'arrete encore apres `server/activate`, sans activite audio.
+//! connexion reste disponible pour l'appairage apres `server/activate`, sans activite audio.
 //!
 //! ## Le mode de transition (11/09/2026)
 //!
@@ -52,6 +52,9 @@
 //! connexion), et elles appartiennent à Bertrand.
 
 mod contexte;
+pub(crate) mod operateur;
+mod pilote;
+mod sessions;
 pub use contexte::ContexteSendspin;
 
 use axum::Router;
@@ -106,14 +109,16 @@ async fn point_d_acces(
         )
             .into_response();
     }
-    ws.on_upgrade(move |socket| async move {
-        if let Err(e) = conduire(socket, mode, contexte).await {
-            // La specification n'a AUCUN message d'erreur applicatif : la seule
-            // reaction admise est de fermer sans rien dire au pair. Le motif
-            // reste donc chez nous, dans le journal.
-            warn!(error = %e, mode = mode.nom(), "sendspin_poignee_echouee");
-        }
-    })
+    ws.max_message_size(128 * 1024)
+        .max_frame_size(128 * 1024)
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = conduire(socket, mode, contexte).await {
+                // La specification n'a AUCUN message d'erreur applicatif : la seule
+                // reaction admise est de fermer sans rien dire au pair. Le motif
+                // reste donc chez nous, dans le journal.
+                warn!(error = %e, mode = mode.nom(), "sendspin_poignee_echouee");
+            }
+        })
 }
 
 /// Aiguille sur le TYPE du premier message, et rien d'autre.
@@ -269,10 +274,8 @@ async fn conduire_chiffre(
     envoyer_binaire(&mut socket, trame).await?;
     info!(client_id = %infos.client_id, "sendspin_server_activate_envoye");
 
-    // 8. Fin de S2-a. Rien a jouer, donc on rend la main proprement plutot que
-    //    de tenir une connexion qui ne servirait a rien.
-    let _ = socket.send(Message::Close(None)).await;
-    Ok(())
+    // S2-b garde le canal chiffre pour les commandes operateur.
+    pilote::conduire(socket, transport, infos, client_hello, contexte).await
 }
 
 /// Le **mode de transition** : un `client/hello` en clair comme premier message.
@@ -407,8 +410,24 @@ async fn conduire_en_clair(
     Ok(())
 }
 
+/// Les controles RFC6455 restent valides durant toutes les phases Noise.
+/// Un ping ne renouvelle pas le budget d'attente du message applicatif.
+async fn lire_message(
+    socket: &mut WebSocket,
+) -> Result<Option<Result<Message, axum::Error>>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(DELAI_MESSAGE, async {
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                message => return message,
+            }
+        }
+    })
+    .await
+}
+
 async fn lire_texte(socket: &mut WebSocket, quoi: &str) -> Result<String, ErreurSendspin> {
-    match tokio::time::timeout(DELAI_MESSAGE, socket.recv()).await {
+    match lire_message(socket).await {
         Ok(Some(Ok(Message::Text(t)))) => Ok(t.to_string()),
         Ok(Some(Ok(autre))) => Err(ErreurSendspin::MessageIllisible(format!(
             "{quoi} attendu en trame TEXTE, {} recue",
@@ -426,7 +445,7 @@ async fn lire_texte(socket: &mut WebSocket, quoi: &str) -> Result<String, Erreur
 }
 
 async fn lire_binaire(socket: &mut WebSocket, quoi: &str) -> Result<Vec<u8>, ErreurSendspin> {
-    match tokio::time::timeout(DELAI_MESSAGE, socket.recv()).await {
+    match lire_message(socket).await {
         Ok(Some(Ok(Message::Binary(b)))) => Ok(b.to_vec()),
         Ok(Some(Ok(autre))) => Err(ErreurSendspin::MessageIllisible(format!(
             "{quoi} attendu en trame BINAIRE, {} recue",

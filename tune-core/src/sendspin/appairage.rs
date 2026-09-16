@@ -341,7 +341,7 @@ impl AppairageServeur {
             "client/pair-retry"
                 if self.methode.dynamique() && matches!(self.etat, Etat::Confirmation(_)) =>
             {
-                if !objet.is_empty() || self.tour >= 20 {
+                if self.tour >= 20 {
                     return Err(protocole("reprise invalide ou limite de tours"));
                 }
                 self.tour += 1;

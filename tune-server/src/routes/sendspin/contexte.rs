@@ -9,6 +9,7 @@ use tune_core::sendspin::{ErreurSendspin, Identite};
 
 struct Interieur {
     dossier: PathBuf,
+    sessions: super::sessions::Sessions,
     magasin: OnceLock<Result<Mutex<MagasinAppairage>, String>>,
 }
 
@@ -19,6 +20,7 @@ impl ContexteSendspin {
     pub fn nouveau(dossier: PathBuf) -> Self {
         Self(Arc::new(Interieur {
             dossier,
+            sessions: super::sessions::Sessions::default(),
             magasin: OnceLock::new(),
         }))
     }
@@ -107,6 +109,46 @@ impl ContexteSendspin {
         Ok(())
     }
 
+    pub(super) fn sessions(&self) -> &super::sessions::Sessions {
+        &self.0.sessions
+    }
+
+    pub(super) async fn conserver(
+        &self,
+        client_id: &str,
+        psk: PskPair,
+        methode: tune_core::sendspin::appairage::MethodeAppairage,
+        revoque: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), ErreurSendspin> {
+        use tune_core::sendspin::appairage::MethodeAppairage as A;
+        use tune_core::sendspin::magasin::MethodeAppairage as M;
+        let methode = match methode {
+            A::Psk => M::Psk,
+            A::Statique => M::CodeStatique,
+            A::Dynamique | A::Qr => M::CodeDynamique,
+        };
+        let client_id = client_id.to_owned();
+        self.avec_magasin(move |m| {
+            // Meme section critique que l'ecriture : une revocation signalee
+            // avant la prise du magasin ne peut pas etre annulee par un finalize en vol.
+            if *revoque.borrow() {
+                return Err(ErreurMagasin::Invalide("session revoquee"));
+            }
+            m.conserver(&client_id, &psk, methode)
+        })
+        .await
+    }
+
+    pub(super) async fn revoquer(&self, client_id: &str) -> Result<bool, ErreurSendspin> {
+        self.0.sessions.revoquer(client_id);
+        let id = client_id.to_owned();
+        let resultat = self.avec_magasin(move |m| m.retirer(&id)).await;
+        // Capture aussi une inscription ayant croise l'ecriture. A l'inscription,
+        // le pilote reverifie une LT apres avoir rejoint ce registre.
+        self.0.sessions.revoquer(client_id);
+        resultat
+    }
+
     pub async fn decrire(&self) -> serde_json::Value {
         match self
             .avec_magasin(|m| Ok((m.identite().id(), m.lister()?)))
@@ -114,6 +156,7 @@ impl ContexteSendspin {
         {
             Ok((id, pairs)) => serde_json::json!({
                 "available":true, "server_id":id, "paired_clients":pairs,
+                "connections":self.0.sessions.lister(),
             }),
             Err(_) => serde_json::json!({
                 "available":false, "server_id":null, "error":"storage_unavailable",

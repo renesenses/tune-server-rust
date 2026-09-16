@@ -53,6 +53,7 @@ pub fn router() -> Router<AppState> {
         // joue pas encore fabriquerait une zone muette — le contraire de ce
         // que la phase 1 doit livrer.
         .route("/sendspin", get(list_sendspin_players))
+        .merge(super::sendspin::operateur::router())
         .route(
             "/{device_id}/ignore",
             post(ignore_device).delete(unignore_device),

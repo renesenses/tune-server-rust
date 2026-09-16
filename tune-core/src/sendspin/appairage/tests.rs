@@ -402,3 +402,15 @@ fn i3326_appairage_nouvel_essai_attend_la_reconnaissance_avant_les_messages_non_
         "un message hors sequence n'est plus ignore apres reconnaissance"
     );
 }
+
+#[test]
+fn i3326_appairage_reprise_ignore_les_champs_du_futur() {
+    let (mut s, t) = debut(MethodeAppairage::Dynamique);
+    confirmation(&mut s, t);
+    let a = s.recevoir("client/pair-retry", &json!({"future_extension":{"n":1}}), t);
+    assert!(
+        a.is_ok(),
+        "un champ payload inconnu doit etre ignore sans fermer le tour"
+    );
+    assert_eq!(s.tour, 2);
+}

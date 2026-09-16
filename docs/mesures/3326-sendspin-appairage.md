@@ -475,3 +475,84 @@ Les contre-epreuves et Clippy de cette machine restent a faire.
 Ce point sauvegarde le code avant purge du seul target de cette session
 (22 Gio mesures), parce que l'espace libre partage est passe sous 120 Gio.
 La tete publiee de la PR reste 32a3198e jusqu'aux validations de cette etape.
+
+## Raccordement HTTP et WebSocket — validation locale en cours
+
+JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing.
+
+La machine est maintenant appelee par le pilote WebSocket. Les commandes
+operateur sont montees sur la vraie API devices, avec RequireAdmin, une limite
+de corps de 16 Kio et une file bornee a huit commandes par connexion. Chaque
+instance de routeur possede son magasin et son registre de connexions. Les
+trois methodes ont leur commande de demarrage ; aucune activation audio ne
+fait partie de cette etape.
+
+Le premier passage complet du nouveau banc, sur Shrek avec six jobs et une
+priorite CPU 15, donne 15 tests verts et un banc materiel explicitement ignore.
+Commande : cargo test --locked -j6 -p tune-server --no-default-features
+--features oaat --test sendspin_point_d_acces_s2a.
+Journal : runtime-tests-second.log (compilation 3 min 17 s ; tests 23,19 s).
+
+Les cinq nouveaux temoins executent :
+
+- PSK : deux suites Noise, passage SN -> PR -> LT sur la meme connexion,
+  repetition des hello apres chaque re-echange, fichier persiste avant
+  acquittement, reconnexion LT puis revocation active ;
+- entrees HTTP invalides, jeton lie a un autre client et corps trop grand
+  refuses, puis echange d'horloge toujours utilisable ;
+- cinq commandes avec authentification active : 401 sans identite, 403
+  pour le role user et acces administrateur ;
+- revocation d'un client qui ne repond plus pendant le re-echange ;
+- ecriture atomique rendue impossible sur une fixture, sans acquittement
+  ni promotion LT.
+
+Le client de ce banc utilise snow directement : ce sont de vrais parcours
+HTTP/WebSocket, mais pas une preuve d'interoperabilite avec un lecteur tiers.
+Les Ping/Pong et un message chiffre deja en vol sont exerces pendant les
+poignees. Les contre-epreuves des nouvelles gardes serveur sont encore a
+executer avant de revendiquer leur couverture.
+
+La machine du coeur avait auparavant donne 72 tests verts et 56 scenarios
+d'interoperabilite en memoire (3 bancs explicitement selectionnes). Ses trois
+contre-epreuves avaient rougi sur : acquittement avant persistance, partage
+statique avant geste client et renouvellement indu du delai a la reprise.
+Les tests etaient inchanges et les sources restaurees par cp. La quatorzieme
+regression de machine, sur les champs inconnus de client/pair-retry, fait
+l'objet d'une validation separee.
+
+Restent notamment les parcours CPace complets via WebSocket et client tiers,
+les controles finaux du raccordement, et l'alignement des erreurs init avec
+server/error de la specification epinglee. Le banc historique de fermeture
+silencieuse sur un init malforme n'est pas une validation du nouveau contrat.
+La PR reste en brouillon et #3326 reste ouverte ; aucune zone ni lecture
+d'album synchronisee n'est revendiquee.
+
+### Champs inconnus a la reprise : contre-epreuve terminee
+
+Commande de depart et de retour au vert : cargo test --locked -j6
+-p tune-core --no-default-features --features oaat --lib sendspin::.
+Resultat : 73 tests verts, aucun ignore, avant et apres restauration.
+
+La mutation de production retablit le refus de tout champ dans
+client/pair-retry. Le test
+i3326_appairage_reprise_ignore_les_champs_du_futur compile puis echoue seul
+(code 101) : « un champ payload inconnu doit etre ignore sans fermer le tour ».
+Son fichier est inchange par SHA-256 ; restauration du code par cp.
+Journaux : appairage-73-initial.log, counter-compat-future.log,
+compat-tests-after.log et appairage-73-restored.log.
+
+### Contre-epreuve serveur interrompue par la garde d'espace
+
+Apres acquisition des 15 tests serveur verts et des 73 tests coeur verts,
+l'espace partage est descendu de 136 Gio a 119 Gio, puis 116 Gio. La tentative
+de contre-epreuve des trois gardes serveur a ete arretee avant execution des
+tests, uniquement sur les PID Cargo/rustc de cette unite. Ce journal ne vaut
+ni rouge de propriete ni regression. Les deux fichiers de production ont ete
+restaures par cp et compares a leurs sauvegardes ; les deux fichiers de
+tests sont inchanges par SHA-256.
+
+Aucune contre-epreuve serveur reussie n'est donc revendiquee a ce point.
+Le script verify-runtime-guards.sh et le journal counter-runtime-guards.log
+sont conserves dans les preuves Shrek pour reprise apres liberation du cache.
+Les trois tests internes du registre de sessions et Clippy serveur restent
+a executer ; les resultats verts ci-dessus ne les englobent pas.

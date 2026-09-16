@@ -273,10 +273,28 @@ async fn conversation_avec_cle(
     clair.truncate(n);
     let activate: serde_json::Value = serde_json::from_slice(&clair[1..]).expect("server/activate");
 
-    let fermeture = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+    // S2-b garde le canal ouvert. Un vrai aller-retour chiffre prouve que
+    // l'on peut encore agir apres l'activation vide, sans lancer d'audio.
+    let mut question = vec![0];
+    question.extend_from_slice(br#"{"type":"client/time","payload":{"client_transmitted":12345}}"#);
+    let mut sortie = vec![0; MAX_NOISE];
+    let n = transport.write_message(&question, &mut sortie).unwrap();
+    ws.send(Message::Binary(sortie[..n].to_vec().into()))
         .await
         .unwrap();
-    assert!(matches!(fermeture, Some(Ok(Message::Close(_))) | None));
+    let reponse = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .unwrap();
+    let b = binaire(reponse);
+    clair.resize(MAX_NOISE, 0);
+    let n = transport.read_message(&b, &mut clair).unwrap();
+    let reponse: serde_json::Value = serde_json::from_slice(&clair[1..n]).unwrap();
+    assert_eq!(
+        reponse["type"], "server/time",
+        "le canal doit rester disponible pour l'appairage"
+    );
+    assert_eq!(reponse["payload"]["client_transmitted"], 12345);
+    ws.close(None).await.unwrap();
     (server_id, activate.to_string())
 }
 
@@ -519,3 +537,6 @@ async fn banc_de_preuve_lecteur_reel() {
 
 #[path = "sendspin_persistance_3326.rs"]
 mod persistance_3326;
+
+#[path = "sendspin_runtime_3326.rs"]
+mod runtime_3326;
