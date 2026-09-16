@@ -110,14 +110,34 @@ CREATE
 CREATE
     OR REPLACE TRIGGER upnp_revision_radio_stations_delete AFTER DELETE ON radio_stations FOR EACH ROW EXECUTE FUNCTION upnp_catalog_changed();
 
+-- 🔴 Pas de clause WHEN ici : un WHEN qui nomme `is_favorite` enregistre une
+-- DÉPENDANCE de colonne, et PostgreSQL refuse alors tout changement de type
+-- de cette colonne (« cannot alter type of a column used in a trigger
+-- definition »). Or `is_favorite` est précisément la colonne que 062
+-- (radio_favorite_integer) convertit sur les bases héritées, et que le banc
+-- pg_3181 bascule TEXT ↔ SMALLINT. Le même filtre vit donc DANS la fonction,
+-- lu par `to_jsonb` : aucune dépendance, aucun plan figé sur un type.
 CREATE
-    OR REPLACE TRIGGER upnp_revision_radio_stations_update AFTER UPDATE ON radio_stations FOR EACH ROW WHEN (OLD.is_favorite IS DISTINCT FROM NEW.is_favorite
-    OR OLD.id IS DISTINCT FROM NEW.id
-    OR OLD.name IS DISTINCT FROM NEW.name
-    OR OLD.url IS DISTINCT FROM NEW.url
-    OR OLD.logo_url IS DISTINCT FROM NEW.logo_url
-    OR OLD.genre IS DISTINCT FROM NEW.genre
-    OR OLD.country IS DISTINCT FROM NEW.country) EXECUTE FUNCTION upnp_catalog_changed();
+    OR REPLACE FUNCTION upnp_radio_stations_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    avant JSONB := to_jsonb(OLD);
+    apres JSONB := to_jsonb(NEW);
+BEGIN
+    IF avant -> 'is_favorite' IS DISTINCT FROM apres -> 'is_favorite'
+        OR avant -> 'id' IS DISTINCT FROM apres -> 'id'
+        OR avant -> 'name' IS DISTINCT FROM apres -> 'name'
+        OR avant -> 'url' IS DISTINCT FROM apres -> 'url'
+        OR avant -> 'logo_url' IS DISTINCT FROM apres -> 'logo_url'
+        OR avant -> 'genre' IS DISTINCT FROM apres -> 'genre'
+        OR avant -> 'country' IS DISTINCT FROM apres -> 'country' THEN
+        UPDATE upnp_catalog_revision SET value = (value + 1) % 4294967296 WHERE id = 1;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+CREATE
+    OR REPLACE TRIGGER upnp_revision_radio_stations_update AFTER UPDATE ON radio_stations FOR EACH ROW EXECUTE FUNCTION upnp_radio_stations_changed();
 
 CREATE
     OR REPLACE TRIGGER upnp_revision_hidden_items_insert AFTER INSERT ON hidden_items FOR EACH ROW EXECUTE FUNCTION upnp_catalog_changed();

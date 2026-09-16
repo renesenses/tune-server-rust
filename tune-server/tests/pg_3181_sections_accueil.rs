@@ -333,21 +333,7 @@ async fn pg_3181_sections_accueil_rendent_les_memes_lignes_que_sqlite() {
 ///
 /// `USING` explicite : PostgreSQL ne convertit ni `text`→`smallint` ni
 /// l'inverse tout seul.
-///
-/// 🔴 #4201 — la migration 066 pose sur `radio_stations` un déclencheur dont le
-/// `WHEN` lit `is_favorite`, et PostgreSQL refuse de changer le type d'une
-/// colonne qu'un déclencheur emploie (« cannot alter type of a column used in
-/// a trigger definition »). On le retire le temps de la bascule, puis on le
-/// repose à partir du TEXTE de la migration elle-même — jamais une copie qui
-/// divergerait d'elle.
 fn basculer_is_favorite(state: &AppState, type_cible: &str) {
-    state
-        .backend
-        .execute(
-            &format!("DROP TRIGGER IF EXISTS {DECLENCHEUR_RADIOS} ON radio_stations"),
-            &[],
-        )
-        .unwrap_or_else(|e| panic!("retrait de {DECLENCHEUR_RADIOS} : {e}"));
     let sql = format!(
         "ALTER TABLE radio_stations \
          ALTER COLUMN is_favorite DROP DEFAULT, \
@@ -358,26 +344,6 @@ fn basculer_is_favorite(state: &AppState, type_cible: &str) {
         .backend
         .execute(&sql, &[])
         .unwrap_or_else(|e| panic!("bascule de is_favorite en {type_cible} : {e}"));
-    state
-        .backend
-        .execute(&declencheur_radios_de_la_migration(), &[])
-        .unwrap_or_else(|e| panic!("repose de {DECLENCHEUR_RADIOS} : {e}"));
-}
-
-/// Le déclencheur de révision UPnP qui lit `radio_stations.is_favorite`.
-const DECLENCHEUR_RADIOS: &str = "upnp_revision_radio_stations_update";
-
-/// L'ordre `CREATE OR REPLACE TRIGGER` de ce déclencheur, tel que la migration
-/// 066 l'écrit.
-fn declencheur_radios_de_la_migration() -> String {
-    let migration =
-        include_str!("../../tune-core/migrations/postgres/066_upnp_catalog_revision.sql");
-    let i = migration
-        .find(&format!("TRIGGER {DECLENCHEUR_RADIOS} "))
-        .expect("la migration 066 ne pose plus ce déclencheur");
-    let debut = migration[..i].rfind("CREATE").expect("CREATE introuvable");
-    let fin = i + migration[i..].find(';').expect("ordre non terminé");
-    migration[debut..fin].to_string()
 }
 
 /// « Radios récemment écoutées » : la non-favorite datée, et elle seule.
