@@ -256,6 +256,7 @@ fn t2_lecture_vers_arme_gapless() {
     ps.peak_position_ms = 275_000;
     ps.last_position_ms = 275_000;
     let entree = PlayingInput {
+        realtime: true,
         gapless_advance_pending: ps.gapless_advance_pending,
         has_next: true,
         gapless_sent: ps.gapless_sent,
@@ -315,6 +316,7 @@ fn t3_arme_vers_lecture_par_transition_detectee() {
     let mut ps = etat_arme(295_000);
     ps.past_end_ticks = 2;
     let decision = classify_playing(&PlayingInput {
+        realtime: true,
         gapless_advance_pending: false,
         has_next: true,
         gapless_sent: ps.gapless_sent,
@@ -466,6 +468,7 @@ fn t5_avance_pendante_et_playing_vers_lecture() {
     ps.gapless_stuck_ticks = 1;
     ps.scrobbled_key = Some("gen1:pos2".into());
     let decision = classify_playing(&PlayingInput {
+        realtime: true,
         gapless_advance_pending: ps.gapless_advance_pending,
         has_next: true,
         gapless_sent: false,
@@ -505,6 +508,7 @@ fn t5_avance_pendante_et_playing_vers_lecture() {
     // Sans piste suivante : le drapeau tombe quand même, sans avance.
     assert!(
         !classify_playing(&PlayingInput {
+            realtime: true,
             has_next: false,
             gapless_advance_pending: true,
             gapless_sent: false,
@@ -718,6 +722,7 @@ fn t9_lecture_au_dela_de_la_fin_vers_fin_de_piste() {
     let mut ps = etat_hors_grace_de_chargement(1);
     ps.peak_position_ms = 240_000;
     let entree = |ps: &ZonePollState, position_ms: u64| PlayingInput {
+        realtime: true,
         gapless_advance_pending: false,
         has_next: true,
         gapless_sent: false,
@@ -1267,6 +1272,7 @@ fn e2_premier_echantillon_plausible_neuve_vers_lecture() {
 fn e3_armement_accepte_ou_renonce() {
     let mut ps = etat_en_lecture(275_000);
     let decision = classify_playing(&PlayingInput {
+        realtime: true,
         gapless_advance_pending: false,
         has_next: true,
         gapless_sent: ps.gapless_sent,

@@ -17,11 +17,13 @@
 //! le rendu a changé, et c'est le changement qui doit se justifier.
 //!
 //! **Une seule chose peut légitimement les faire bouger** : un changement de
-//! rendu VOULU et MESURÉ ailleurs. C'est arrivé une fois, le 13/09/2026, avec
+//! rendu VOULU et MESURÉ ailleurs. C'est arrivé le 13/09/2026 avec
 //! le correctif D1 de #2218 (le rééchantillonneur rendait 20 kHz 10 dB trop
 //! bas aux sources 44,1 kHz) ; les deux empreintes qui rééchantillonnent ont
 //! été remesurées, les deux autres n'ont pas bougé d'un bit. Voir le bloc de
-//! constantes en fin de fichier.
+//! constantes en fin de fichier. Le 15/09, D3 (#4079) corrige la somme de
+//! normalisation du meme noyau : les deux empreintes sont remesurees apres
+//! les 83 temoins du banc independant, sans changer les comptes de trames.
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -224,7 +226,7 @@ fn le_puits_recoit_les_memes_octets_apres_reechantillonnage() {
     assert_eq!(
         empreinte, EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000,
         "le rééchantillonnage ne rend plus les mêmes octets que le relevé du \
-         13/09 : le noyau de `new_streaming_resampler` a changé. Si c'est \
+         15/09 : le noyau de `new_streaming_resampler` a changé. Si c'est \
          voulu, c'est un changement de RENDU — il se mesure au banc T10 \
          (`reechantillonnage_reference_2218.rs`) avant d'être acté ici"
     );
@@ -263,7 +265,7 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
     assert_eq!(
         empreinte, EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE,
         "la chaîne complète — adaptation de canaux PUIS rééchantillonnage — ne \
-         rend plus les mêmes octets que le relevé du 13/09. Si l'ordre a été \
+         rend plus les mêmes octets que le relevé du 15/09. Si l'ordre a été \
          inversé, le rééchantillonneur reçoit deux canaux entrelacés là où il \
          en attend un — mais le compte de mots ci-dessus l'aurait déjà dit. \
          Sinon, c'est le noyau sinc qui a changé : voir le banc T10."
@@ -379,9 +381,14 @@ fn un_flux_coupe_en_deux_rend_la_meme_empreinte_qu_entier() {
 // étages est intact — c'est ce que ces deux témoins gardent, et le compte de
 // mots, lui, n'a pas bougé d'une unité (8 914 pour la chaîne complète) : un
 // ordre inversé le ferait sauter avant même l'empreinte.
+// Releve du 15/09 (#4079) : la normalisation du meme noyau est corrigee
+// dans Rubato. Les 83 temoins du banc T10 sont verts, dont les seuils
+// independants RMS/DC et l'identite blocs/piste. Seules les deux empreintes
+// contenant du reechantillonnage changent ; le compte de 8 914 mots de la
+// chaine complete et les empreintes sans SRC restent inchanges.
 const EMPREINTE_IDENTITE_16_BITS_STEREO: u64 = 0x1433_8456_2279_0c63;
 const EMPREINTE_ADAPTATION_STEREO_VERS_MONO: u64 = 0x3557_16d1_b565_a7d6;
 // Était 0x4491_3fae_738e_a9ee avec le noyau 64 écrit à la main.
-const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: u64 = 0x7d6d_2c8f_4cee_4f8d;
+const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: u64 = 0xf7ab_d26d_0d56_3951;
 // Était 0x8c1c_f175_68c3_9aaa avec le noyau 64 écrit à la main.
-const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: u64 = 0x6cc3_fd32_3965_25ed;
+const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: u64 = 0xfff7_fe9f_cf74_84c6;

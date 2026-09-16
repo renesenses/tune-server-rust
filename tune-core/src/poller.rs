@@ -1074,3 +1074,6 @@ mod temoins_de_transitions_ref9;
 /// montent le vrai `tick` et rejouent la séquence.
 #[cfg(test)]
 mod position_de_la_piste_precedente_954;
+
+#[cfg(test)]
+mod fin_hors_temps_reel_tests;
