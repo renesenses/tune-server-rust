@@ -69,6 +69,10 @@ pub struct RepriseFavoris {
     pub deja_presents: usize,
     /// Types que le service n'a pas rendus (jeton expiré, panne réseau…).
     pub echecs: usize,
+    /// Favoris déjà connus dont la date a été REMISE à celle du service —
+    /// ceux qu'une reprise d'avant avait datés au même instant (fil 1780).
+    #[serde(default)]
+    pub redates: usize,
 }
 
 impl RepriseFavoris {
@@ -77,6 +81,7 @@ impl RepriseFavoris {
         self.ajoutes += autre.ajoutes;
         self.deja_presents += autre.deja_presents;
         self.echecs += autre.echecs;
+        self.redates += autre.redates;
     }
 }
 
@@ -88,6 +93,75 @@ struct Entree {
     artist: Option<String>,
     album: Option<String>,
     cover_url: Option<String>,
+    /// La date de mise en favori CHEZ LE SERVICE (ISO 8601), quand il la
+    /// donne. `None` = la reprise datera au « maintenant » du moteur.
+    created_at: Option<String>,
+}
+
+/// Les entrées DATÉES d'un type, par `get_user_favorites_dated` (#3489) —
+/// `None` quand le service ne date pas, et l'appelant retombe alors sur la
+/// lecture typée d'avant.
+///
+/// 🔴 Fabien, fil 1780 (16/09/2026) : « Favoris Qobuz : tri par ajout récent
+/// ne fonctionne pas, c'est l'ordre alphabétique, juste le dernier titre
+/// ajouté remonte en premier ». `get_user_favorites_dated` existait depuis
+/// #3489 et la route Streaming s'en servait — mais PAS cette reprise, qui
+/// posait `created_at = maintenant` sur tout ce qu'elle importait d'un coup.
+/// Cent favoris à la même seconde ⇒ égalité ⇒ départage alphabétique ; seul
+/// le favori ajouté APRÈS, daté à part, ressortait en tête. Exactement ce
+/// qu'il décrit.
+async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Vec<Entree>> {
+    let items = svc
+        .get_user_favorites_dated(fav_type)
+        .await
+        .ok()
+        .flatten()?;
+    let item_type: &'static str = match fav_type {
+        "tracks" => "track",
+        "albums" => "album",
+        _ => "artist",
+    };
+    let texte =
+        |v: &serde_json::Value, cle: &str| v.get(cle).and_then(|x| x.as_str()).map(str::to_string);
+    let id = |v: &serde_json::Value| match v.get("id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    Some(
+        items
+            .iter()
+            .map(|v| match item_type {
+                "track" => Entree {
+                    item_type,
+                    service_id: id(v),
+                    title: texte(v, "title"),
+                    artist: texte(v, "artist"),
+                    album: texte(v, "album"),
+                    cover_url: texte(v, "cover_path"),
+                    created_at: texte(v, "created_at"),
+                },
+                "album" => Entree {
+                    item_type,
+                    service_id: id(v),
+                    title: texte(v, "title"),
+                    artist: texte(v, "artist"),
+                    album: None,
+                    cover_url: texte(v, "cover_path"),
+                    created_at: texte(v, "created_at"),
+                },
+                _ => Entree {
+                    item_type,
+                    service_id: id(v),
+                    title: texte(v, "name"),
+                    artist: None,
+                    album: None,
+                    cover_url: texte(v, "image_path"),
+                    created_at: texte(v, "created_at"),
+                },
+            })
+            .collect(),
+    )
 }
 
 /// Reprend les favoris d'UN service dans le profil `profile_id`.
@@ -105,65 +179,80 @@ pub async fn reprendre_les_favoris_du_service(
     let repo = StreamingFavoritesRepo::with_backend(backend.clone());
     let mut total = RepriseFavoris::default();
 
-    let pistes = match svc.get_user_tracks().await {
-        Ok(items) => items
-            .into_iter()
-            .map(|t| Entree {
-                item_type: "track",
-                service_id: t.id,
-                title: Some(t.title),
-                artist: Some(t.artist),
-                album: t.album,
-                cover_url: t.cover_path,
-            })
-            .collect(),
-        Err(e) => {
-            warn!(service = %service, r#type = "tracks", erreur = %e, "reprise_favoris_service_illisible");
-            total.echecs += 1;
-            Vec::new()
+    let pistes = if let Some(datees) = entrees_datees(svc, "tracks").await {
+        datees
+    } else {
+        match svc.get_user_tracks().await {
+            Ok(items) => items
+                .into_iter()
+                .map(|t| Entree {
+                    item_type: "track",
+                    service_id: t.id,
+                    title: Some(t.title),
+                    artist: Some(t.artist),
+                    album: t.album,
+                    cover_url: t.cover_path,
+                    created_at: None,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(service = %service, r#type = "tracks", erreur = %e, "reprise_favoris_service_illisible");
+                total.echecs += 1;
+                Vec::new()
+            }
         }
     };
     total.cumuler(enregistrer(&repo, profile_id, &service, pistes));
 
-    let albums = match svc.get_user_albums().await {
-        Ok(items) => items
-            .into_iter()
-            .map(|a| Entree {
-                item_type: "album",
-                service_id: a.id,
-                // `title` porte le titre de l'album, `album` reste vide :
-                // c'est la forme qu'écrit déjà le cœur cliqué dans Tune, et la
-                // liste des favoris affiche `title`.
-                title: Some(a.title),
-                artist: Some(a.artist),
-                album: None,
-                cover_url: a.cover_path,
-            })
-            .collect(),
-        Err(e) => {
-            warn!(service = %service, r#type = "albums", erreur = %e, "reprise_favoris_service_illisible");
-            total.echecs += 1;
-            Vec::new()
+    let albums = if let Some(datees) = entrees_datees(svc, "albums").await {
+        datees
+    } else {
+        match svc.get_user_albums().await {
+            Ok(items) => items
+                .into_iter()
+                .map(|a| Entree {
+                    item_type: "album",
+                    service_id: a.id,
+                    // `title` porte le titre de l'album, `album` reste vide :
+                    // c'est la forme qu'écrit déjà le cœur cliqué dans Tune, et la
+                    // liste des favoris affiche `title`.
+                    title: Some(a.title),
+                    artist: Some(a.artist),
+                    album: None,
+                    cover_url: a.cover_path,
+                    created_at: None,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(service = %service, r#type = "albums", erreur = %e, "reprise_favoris_service_illisible");
+                total.echecs += 1;
+                Vec::new()
+            }
         }
     };
     total.cumuler(enregistrer(&repo, profile_id, &service, albums));
 
-    let artistes = match svc.get_user_artists().await {
-        Ok(items) => items
-            .into_iter()
-            .map(|a| Entree {
-                item_type: "artist",
-                service_id: a.id,
-                title: Some(a.name),
-                artist: None,
-                album: None,
-                cover_url: a.image_path,
-            })
-            .collect(),
-        Err(e) => {
-            warn!(service = %service, r#type = "artists", erreur = %e, "reprise_favoris_service_illisible");
-            total.echecs += 1;
-            Vec::new()
+    let artistes = if let Some(datees) = entrees_datees(svc, "artists").await {
+        datees
+    } else {
+        match svc.get_user_artists().await {
+            Ok(items) => items
+                .into_iter()
+                .map(|a| Entree {
+                    item_type: "artist",
+                    service_id: a.id,
+                    title: Some(a.name),
+                    artist: None,
+                    album: None,
+                    cover_url: a.image_path,
+                    created_at: None,
+                })
+                .collect(),
+            Err(e) => {
+                warn!(service = %service, r#type = "artists", erreur = %e, "reprise_favoris_service_illisible");
+                total.echecs += 1;
+                Vec::new()
+            }
         }
     };
     total.cumuler(enregistrer(&repo, profile_id, &service, artistes));
@@ -206,6 +295,19 @@ fn enregistrer(
         match repo.is_favorite(profile_id, entree.item_type, service, &entree.service_id) {
             Ok(true) => {
                 stats.deja_presents += 1;
+                // Déjà là, mais peut-être daté au « maintenant » d'une reprise
+                // d'avant : on lui rend la date du service. Idempotent.
+                if let Some(date) = entree.created_at.as_deref()
+                    && let Ok(true) = repo.dater(
+                        profile_id,
+                        entree.item_type,
+                        service,
+                        &entree.service_id,
+                        date,
+                    )
+                {
+                    stats.redates += 1;
+                }
                 continue;
             }
             Ok(false) => {}
@@ -215,7 +317,7 @@ fn enregistrer(
                 continue;
             }
         }
-        match repo.add(
+        match repo.add_date(
             profile_id,
             entree.item_type,
             service,
@@ -224,6 +326,7 @@ fn enregistrer(
             entree.artist.as_deref(),
             entree.album.as_deref(),
             entree.cover_url.as_deref(),
+            entree.created_at.as_deref(),
         ) {
             Ok(()) => stats.ajoutes += 1,
             Err(e) => {
@@ -233,4 +336,177 @@ fn enregistrer(
         }
     }
     stats
+}
+
+#[cfg(test)]
+mod tests_dates {
+    use super::*;
+    use crate::db::sqlite::SqliteDb;
+    use crate::streaming::traits::{StreamAlbum, StreamArtist, StreamTrack};
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    /// Un service qui date ses favoris comme Qobuz : deux pistes reprises
+    /// d'un coup, à des dates DIFFÉRENTES chez lui.
+    struct ServiceDate;
+    #[async_trait]
+    impl StreamingService for ServiceDate {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "qobuz"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(
+            &mut self,
+            _credentials: &serde_json::Value,
+        ) -> Result<crate::streaming::traits::AuthStatus, crate::error::TuneError> {
+            Ok(Default::default())
+        }
+        async fn auth_status(&self) -> crate::streaming::traits::AuthStatus {
+            Default::default()
+        }
+        async fn logout(&mut self) -> Result<(), crate::error::TuneError> {
+            Ok(())
+        }
+        async fn search(
+            &self,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<crate::streaming::traits::SearchResults, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track(&self, _id: &str) -> Result<StreamTrack, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(
+            &self,
+            _id: &str,
+            _quality: Option<&str>,
+        ) -> Result<crate::streaming::traits::StreamUrl, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _id: &str) -> Result<StreamAlbum, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(
+            &self,
+            _id: &str,
+        ) -> Result<Vec<StreamTrack>, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _id: &str) -> Result<StreamArtist, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist(
+            &self,
+            _id: &str,
+        ) -> Result<crate::streaming::traits::StreamPlaylist, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(
+            &self,
+            _id: &str,
+        ) -> Result<Vec<StreamTrack>, crate::error::TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(
+            &self,
+        ) -> Result<Vec<crate::streaming::traits::StreamPlaylist>, crate::error::TuneError>
+        {
+            Ok(Vec::new())
+        }
+        async fn get_user_favorites_dated(
+            &self,
+            fav_type: &str,
+        ) -> Result<Option<Vec<serde_json::Value>>, crate::error::TuneError> {
+            if fav_type != "tracks" {
+                return Ok(Some(Vec::new()));
+            }
+            Ok(Some(vec![
+                json!({"id": 1, "title": "Ancienne", "artist": "A", "album": "X",
+                       "cover_path": null, "created_at": "2025-01-01T00:00:00Z"}),
+                json!({"id": 2, "title": "Recente", "artist": "B", "album": "Y",
+                       "cover_path": null, "created_at": "2026-06-01T00:00:00Z"}),
+            ]))
+        }
+        async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, crate::error::TuneError> {
+            unreachable!("le chemin daté doit primer");
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, crate::error::TuneError> {
+            Ok(Vec::new())
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, crate::error::TuneError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn dates(backend: &Arc<dyn DbBackend>) -> Vec<(String, String)> {
+        backend
+            .query_many(
+                "SELECT service_id, created_at FROM streaming_favorites ORDER BY service_id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                    r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// La reprise écrit la date DU SERVICE, pas l'instant de la reprise —
+    /// et redate ce qu'une reprise d'avant avait daté au même instant.
+    #[tokio::test]
+    async fn la_reprise_ecrit_la_date_du_service_et_redate_l_existant() {
+        let backend = base();
+        let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+        // Une reprise « d'avant » : la piste 1 existe déjà, datée au moment
+        // de la reprise (ici : maintenant).
+        repo.add(
+            1,
+            "track",
+            "qobuz",
+            "1",
+            Some("Ancienne"),
+            Some("A"),
+            Some("X"),
+            None,
+        )
+        .unwrap();
+
+        let stats = reprendre_les_favoris_du_service(&ServiceDate, 1, &backend).await;
+        assert_eq!(
+            (stats.lus, stats.ajoutes, stats.deja_presents, stats.redates),
+            (2, 1, 1, 1),
+            "{stats:?}"
+        );
+        assert_eq!(
+            dates(&backend),
+            vec![
+                ("1".to_string(), "2025-01-01T00:00:00Z".to_string()),
+                ("2".to_string(), "2026-06-01T00:00:00Z".to_string()),
+            ]
+        );
+        // Seconde reprise : rien ne bouge, rien n'est redaté.
+        let stats = reprendre_les_favoris_du_service(&ServiceDate, 1, &backend).await;
+        assert_eq!((stats.ajoutes, stats.redates), (0, 0), "{stats:?}");
+    }
 }
