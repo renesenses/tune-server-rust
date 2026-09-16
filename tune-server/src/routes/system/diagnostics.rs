@@ -869,6 +869,8 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
     // `unwrap_or("sqlite")`, et `db_backend` — recopié dans `db.engine` plus
     // bas — annonçait « sqlite » sur toute installation PostgreSQL.
     let db_backend = state.backend.engine().as_str();
+    // Snapshot only: idle failures do not become a new alarm or stop policy.
+    let zone_poller_metrics = state.poller_metrics.lock().await.clone();
 
     Json(json!({
         "server_version": tune_core::version(),
@@ -886,6 +888,7 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         "memory_rss_mb": rss_mb,
         "db_backend": db_backend,
         "active_zones": zone_count,
+        "zone_poller_metrics": zone_poller_metrics,
         // DUP-1 (phase 0) : les zones qui désignent probablement le même appareil,
         // nommées avec leur raison. Le rapport ne fusionne rien : sur .18 le 05/09,
         // un Sonos, un Mac et un Eversolo avaient chacun deux zones.

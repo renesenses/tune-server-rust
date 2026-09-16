@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 struct Compteur {
     etat: Arc<std::sync::Mutex<TransportState>>,
     appels: Arc<AtomicU32>,
+    echoue: Arc<std::sync::atomic::AtomicBool>,
 }
 #[async_trait::async_trait]
 impl OutputTarget for Compteur {
@@ -44,6 +45,9 @@ impl OutputTarget for Compteur {
     }
     async fn get_status(&self) -> Result<OutputStatus, String> {
         self.appels.fetch_add(1, Ordering::Relaxed);
+        if self.echoue.load(Ordering::Relaxed) {
+            return Err("Cast command deadline elapsed".into());
+        }
         let state = *self.etat.lock().expect("état du renderer bouchonné");
         Ok(OutputStatus {
             state,
@@ -64,10 +68,12 @@ impl OutputTarget for Compteur {
 struct Banc {
     poller: PositionPoller,
     appels: Arc<AtomicU32>,
+    echoue: Arc<std::sync::atomic::AtomicBool>,
     etat: Arc<std::sync::Mutex<TransportState>>,
     poll_states: HashMap<i64, ZonePollState>,
     idle_backoff: HashMap<i64, IdlePollBackoff>,
     startup_at: Instant,
+    zone_id: i64,
 }
 
 impl Banc {
@@ -77,15 +83,17 @@ impl Banc {
         crate::db::migrations::run_migrations(&db).unwrap();
         let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
         let device_id = "test:compteur";
-        ZoneRepo::with_backend(db.clone())
+        let zone_id = ZoneRepo::with_backend(db.clone())
             .create("Salon", Some("test"), Some(device_id))
             .unwrap();
         let appels = Arc::new(AtomicU32::new(0));
+        let echoue = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let etat = Arc::new(std::sync::Mutex::new(etat));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         outputs.lock().await.register(Box::new(Compteur {
             etat: etat.clone(),
             appels: appels.clone(),
+            echoue: echoue.clone(),
         }));
         let playback = Arc::new(crate::playback::PlaybackManager::new());
         let orchestrator = Arc::new(PlaybackOrchestrator::new(
@@ -106,10 +114,12 @@ impl Banc {
         Self {
             poller,
             appels,
+            echoue,
             etat,
             poll_states: HashMap::new(),
             idle_backoff: HashMap::new(),
             startup_at: Instant::now(),
+            zone_id,
         }
     }
 
@@ -212,5 +222,76 @@ async fn une_pause_qui_repart_est_vue_puis_rend_le_plein_rythme() {
         banc.jouer(10).await,
         10,
         "une fois la lecture vue, plus aucun frein"
+    );
+}
+
+#[tokio::test]
+async fn i2566_les_echecs_au_repos_sont_publies_sans_compter_les_tours_sautes() {
+    let mut b = Banc::neuf(TransportState::Stopped).await;
+    b.echoue.store(true, Ordering::Relaxed);
+    b.poller.shared_metrics.lock().await.insert(
+        b.zone_id,
+        ZonePollerMetrics {
+            total_errors: 9,
+            consecutive_errors: 3,
+            ..Default::default()
+        },
+    );
+    assert_eq!(b.jouer(1).await, 1);
+    assert_eq!(
+        b.poller.shared_metrics.lock().await[&b.zone_id].echecs_sondage_repos,
+        1
+    );
+    assert_eq!(
+        b.jouer(2).await,
+        0,
+        "the original backoff must still skip two ticks"
+    );
+    assert_eq!(
+        b.poller.shared_metrics.lock().await[&b.zone_id].echecs_sondage_repos,
+        1
+    );
+    assert_eq!(b.jouer(1).await, 1);
+    let m = b.poller.shared_metrics.lock().await[&b.zone_id].clone();
+    assert_eq!(m.echecs_sondage_repos, 2);
+    assert_eq!(
+        m.total_errors, 9,
+        "idle polling must not rewrite playback statistics"
+    );
+    assert_eq!(m.consecutive_errors, 3);
+    b.echoue.store(false, Ordering::Relaxed);
+    assert_eq!(
+        b.jouer(5).await,
+        1,
+        "four skipped ticks then the successful retry"
+    );
+    assert_eq!(
+        b.poller.shared_metrics.lock().await[&b.zone_id].echecs_sondage_repos,
+        0
+    );
+}
+
+#[tokio::test]
+async fn i2566_un_sondage_reussi_sans_panne_publie_zero() {
+    let mut b = Banc::neuf(TransportState::Paused).await;
+    b.jouer(1).await;
+    assert_eq!(
+        b.poller.shared_metrics.lock().await[&b.zone_id].echecs_sondage_repos,
+        0
+    );
+}
+
+#[tokio::test]
+async fn i2566_le_compteur_ne_sature_pas_a_255_echecs() {
+    let mut b = Banc::neuf(TransportState::Stopped).await;
+    b.echoue.store(true, Ordering::Relaxed);
+    let appels = b.jouer(9_000).await;
+    assert!(
+        appels > 255,
+        "fixture must exceed an eight-bit counter: {appels}"
+    );
+    assert_eq!(
+        b.poller.shared_metrics.lock().await[&b.zone_id].echecs_sondage_repos,
+        appels
     );
 }

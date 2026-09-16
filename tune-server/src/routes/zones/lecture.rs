@@ -194,6 +194,7 @@ pub(super) fn corps_network_health(
         "poll_latency_ms": poller.last_latency_ms,
         "max_latency_ms": poller.max_latency_ms,
         "poll_errors": poller.total_errors,
+        "echecs_sondage_repos": poller.echecs_sondage_repos,
         "total_polls": poller.total_polls,
         // #3318 — ce que le DAC n'a pas reçu, par zone. Le cumul repart de
         // zéro à chaque piste, comme les compteurs de la sortie qu'il
