@@ -5276,6 +5276,7 @@ dependencies = [
  "if-addrs 0.13.4",
  "image",
  "libc",
+ "libloading 0.9.0",
  "lofty",
  "md-5 0.10.6",
  "mdns-sd",
