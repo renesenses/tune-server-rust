@@ -79,7 +79,11 @@ async fn device_catalog() -> Json<Value> {
 /// Chaque entrée le dit explicitement (`playable: false` et un motif), et
 /// `supported` en tête de la charge utile le dit pour la liste entière — un
 /// client n'a donc pas à déduire d'un tableau vide qu'il ne se passe rien.
-async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
+async fn list_sendspin_players(
+    State(state): State<AppState>,
+    axum::Extension(contexte): axum::Extension<super::sendspin::ContexteSendspin>,
+) -> Json<Value> {
+    let appairage = contexte.decrire().await;
     let players = state.discovered_sendspin_players().await;
     // #3326 S2-a — les pairs qui ont mené une poignée de main Noise jusqu'au
     // bout, avec ce qu'ils ont dit d'eux dans leur `client/hello`. C'est une
@@ -91,7 +95,8 @@ async fn list_sendspin_players(State(state): State<AppState>) -> Json<Value> {
         "service": tune_core::discovery::sendspin::SERVICE_LECTEUR,
         "server_service": tune_core::discovery::sendspin::SERVICE_SERVEUR,
         "server_path": tune_core::sendspin::CHEMIN_POINT_D_ACCES,
-        "server_id": tune_core::sendspin::identite_du_serveur().id(),
+        "server_id": appairage["server_id"],
+        "pairing": appairage,
         // S2-a monte le tuyau chiffré ; elle ne joue rien. Tant que c'est faux,
         // aucune zone Sendspin ne doit naître de cette liste.
         "playback_supported": false,

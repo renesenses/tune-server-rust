@@ -15,11 +15,13 @@
 //! `client/init` → `server/init` → `noise/handshake` ×2 → `server/hello` →
 //! `client/hello` → `server/activate`.
 //!
-//! Non livré, volontairement, et chacun dans sa brique :
-//! - l'**appairage** (PSK `lt` / `pr`, code d'appairage CPace, clip audio de
-//!   chiffres) — S2-b. Ici, seule la PSK **Sentinelle** est employée : c'est
-//!   une constante publiée, elle n'authentifie personne, et c'est exactement
-//!   son rôle dans la spécification (« used when no other PSK applies ») ;
+//! S2-b en cours : identite et PSK longue duree sont conservees dans le
+//! magasin prive. Le transport sait lier les cles aux pairs et mener un
+//! reechange. Les trois parcours d'appairage et leur interaction operateur
+//! restent a brancher. La Sentinelle publique n'authentifie pas un pair.
+//!
+//! Non livre :
+//! - l'appairage complet (PSK provisoire, CPace, codes) — S2-b ;
 //! - le **son** : horloge, cadrage, encodeur Opus, `stream/start` — S2-c ;
 //! - la **synchronisation** à plusieurs enceintes — S2-d ;
 //! - le branchement d'`OutputTarget` : deux décisions de produit ne sont pas
@@ -28,9 +30,10 @@
 //!
 //! ## D'où vient le contrat de fil
 //!
-//! De notre propre note de lecture, `docs/sendspin-protocole.md`. Le dépôt de
-//! spécification ne porte AUCUNE licence : rien ne nous autorise à en recopier
-//! le texte, et rien ici ne le fait. Aucune caisse Sendspin n'est au manifeste.
+//! De notre note de lecture, `docs/sendspin-protocole.md`, et de la revision
+//! `Sendspin/spec@8a8b1cbd6764ea116dcaa07e41544a97bc13080c` epinglee pour S2-b.
+//! Cette revision porte `Community-Spec-1.0`. Aucune caisse Sendspin n'est
+//! au manifeste ; la reference tierce sert aux tests d'interoperabilite.
 //!
 //! ## Le piège d'interopérabilité à ne jamais perdre de vue
 //!
@@ -45,7 +48,7 @@
 //!
 //! ## Le mode de transition (ajouté le 11/09/2026)
 //!
-//! Aucun lecteur PUBLIÉ ne parle encore le Sendspin chiffré : `aiosendspin`
+//! Au releve du 11/09/2026, le lecteur publie ne parlait pas le chiffre : `aiosendspin`
 //! 6.0.5 n'embarque aucun module `noise/` et ne connaît ni `client/init` ni
 //! `server/activate`. Tune, qui n'implémentait que la branche chiffrée, était
 //! conforme et incapable de parler à une enceinte installée.
@@ -57,6 +60,7 @@
 //! l'emprunte est nommée comme telle dans le journal et au registre.
 
 pub mod identite;
+pub mod magasin;
 pub mod messages;
 pub mod poignee;
 pub mod psk;
@@ -71,21 +75,6 @@ pub use registre::PairVu;
 pub use suite::Suite;
 pub use transition::ModeTransition;
 pub use transport::TransportNoise;
-
-/// L'identité Sendspin de ce serveur, pour la durée du processus.
-///
-/// **Elle n'est pas persistée**, et c'est délibéré : la clé de longue durée du
-/// serveur n'a de sens qu'avec l'appairage, qui est S2-b — c'est là qu'une
-/// enceinte appairée doit survivre à un redémarrage. Tant que seule la PSK
-/// Sentinelle est employée, un `server_id` qui change à chaque relance ne casse
-/// rien, puisque rien ne s'y était lié.
-///
-/// Le jour où S2-b arrivera, c'est cette fonction qu'il faudra faire lire un
-/// fichier — et pas ajouter une seconde source d'identité à côté.
-pub fn identite_du_serveur() -> &'static Identite {
-    static IDENTITE: std::sync::OnceLock<Identite> = std::sync::OnceLock::new();
-    IDENTITE.get_or_init(Identite::generer)
-}
 
 /// Version du cœur du protocole. La spécification la fixe à `1`, et les deux
 /// messages en clair la portent ; un pair qui annonce autre chose n'est pas

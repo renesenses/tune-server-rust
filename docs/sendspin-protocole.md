@@ -446,3 +446,43 @@ côté Tune :
 ```
 WARN sendspin_client_hello_en_clair_refuse reglage="TUNE_SENDSPIN_ALLOW_UNENCRYPTED"
 ```
+
+## 13. S2-b en cours : identité et magasin persistants (16/09/2026)
+
+Intervention : **JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing**.
+
+Cette étape remplace les limites de persistance décrites en 12.3 et 12.4.
+Le serveur charge son identité et les clés longue durée depuis
+`<TuneConfig.db_path>.sendspin/pairing.json`. Le chemin de données résolu
+reste la source de configuration, y compris avec une bibliothèque PostgreSQL.
+Le dossier est dédié ; aucune table ni migration musicale n'est ajoutée.
+
+Le magasin garde un verrou exclusif jusqu'à sa fermeture. Il écrit puis
+synchronise un fichier temporaire, le renomme et synchronise le dossier et
+son parent. Sur Unix, le dossier et les fichiers sont privés (0700/0600).
+Sur Windows, les ACL du dossier de données sont la frontière d'accès ; le
+comportement Windows n'a pas encore été exécuté pour cette étape.
+
+Un document perdu, corrompu, de version inconnue ou inaccessible ne déclenche
+pas de nouvelle identité. Une erreur d'écriture interdit toute réutilisation
+de l'instance jusqu'au rechargement. Le point d'accès renvoie 503 avant la
+mise à niveau WebSocket si le magasin est indisponible.
+
+La poignée initiale choisit la clé longue durée liée au client, sinon la
+sentinelle publique. Un signal de perte de clé ne détruit pas l'appairage.
+Le refus du retour en clair consulte les records persistés avant le registre
+des sessions observées. Il reste donc effectif après redémarrage pour les
+pairs appairés.
+
+`GET /api/v1/devices/sendspin` publie `pairing.available`, l'identité et les
+identifiants publics des pairs appairés. Il ne publie aucune clé privée.
+Le champ `handshaked[].authenticated` décrit une session ayant vérifié une
+clé longue durée ; `psk_category` et `credential_mismatch` distinguent les
+autres cas. Cette observation n'accorde aucun droit de lecture.
+
+Les trois parcours d'appairage et leur interface opérateur restent en cours.
+Aucun appairage de démonstration n'est provisionné au démarrage. Les fixtures
+de tests alimentent seules les records de cette étape. Le serveur n'offre
+toujours aucune activité audio (`playback_supported: false`).
+Les preuves et limites sont dans
+[la mesure S2-b](mesures/3326-sendspin-appairage.md).

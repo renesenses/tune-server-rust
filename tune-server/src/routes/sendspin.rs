@@ -14,13 +14,12 @@
 //! `client/init` en clair. L'authentification du pair est **le travail de la
 //! couche Noise**, pas celui d'un extracteur axum.
 //!
-//! Il faut donc être net sur ce que S2-a garantit : la PSK employée est la
-//! **Sentinelle**, une constante publiée. Le canal est chiffré et intègre ;
-//! **le pair n'est pas authentifié**. N'importe qui sur le réseau local peut
-//! mener cette poignée de main à bien. C'est acceptable ici parce que rien
-//! n'est offert derrière : aucun son, aucune commande, aucune donnée de
-//! bibliothèque — la connexion s'arrête juste après `server/activate`. Le jour
-//! où S2-c y branchera de l'audio, S2-b devra avoir apporté les PSK `lt`/`pr`.
+//! L'identite du serveur et les PSK longue duree proviennent du magasin
+//! persistant de S2-b. Une session utilisant la Sentinelle publique reste
+//! chiffree sans etre authentifiee ; une PSK longue duree doit correspondre
+//! au pair et au record courant. La perte d'une cle ne supprime pas le record.
+//! Aucun son, aucune commande ni donnee de bibliotheque n'est offert : la
+//! connexion s'arrete encore apres `server/activate`, sans activite audio.
 //!
 //! ## Le mode de transition (11/09/2026)
 //!
@@ -52,6 +51,9 @@
 //! Sendspin, et le fait que l'identité d'un appareil n'existe pas avant la
 //! connexion), et elles appartiennent à Bertrand.
 
+mod contexte;
+pub use contexte::ContexteSendspin;
+
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
@@ -59,9 +61,7 @@ use axum::routing::get;
 use tracing::{debug, info, warn};
 
 use tune_core::sendspin::transition::{self, ModeTransition};
-use tune_core::sendspin::{
-    ErreurSendspin, PoigneeServeur, VERSION_PROTOCOLE, identite_du_serveur, messages, psk, registre,
-};
+use tune_core::sendspin::{ErreurSendspin, PoigneeServeur, VERSION_PROTOCOLE, messages, registre};
 
 /// Délai maximal d'attente d'un message du pair.
 ///
@@ -72,30 +72,42 @@ const DELAI_MESSAGE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Le routeur du point d'accès.
 ///
-/// Générique sur l'état : ce parcours n'en lit aucun — l'identité du serveur
-/// vit dans `tune_core::sendspin`, et rien ici ne touche à la base ni aux
-/// zones. Le rendre générique n'est pas de la coquetterie : c'est ce qui
-/// permet au témoin de monter la VRAIE route, sans fabriquer un `AppState`
-/// complet dont la séquence ne dépend pas.
+/// Generique sur l'etat : le contexte fourni porte le magasin prive, sans
+/// dependance a la bibliotheque musicale ni aux zones. Les temoins peuvent
+/// monter la vraie route avec un magasin temporaire isole.
 ///
 /// Le mode est un **argument**, pas une lecture d'environnement enfouie ici.
 /// C'est la forme qu'a l'implémentation de référence (`allow_unencrypted` est
 /// un paramètre du constructeur de son serveur), et c'est ce qui permet à un
 /// témoin de mesurer les deux modes sans toucher à l'environnement du
 /// processus — `std::env::set_var` dans un test casse la suite `--workspace`.
-pub fn router<S>(mode: ModeTransition) -> Router<S>
+pub fn router<S>(mode: ModeTransition, contexte: ContexteSendspin) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     Router::new().route(
         "/",
-        get(move |ws: WebSocketUpgrade| async move { point_d_acces(ws, mode).await }),
+        get(move |ws: WebSocketUpgrade| {
+            let contexte = contexte.clone();
+            async move { point_d_acces(ws, mode, contexte).await }
+        }),
     )
 }
 
-async fn point_d_acces(ws: WebSocketUpgrade, mode: ModeTransition) -> impl IntoResponse {
+async fn point_d_acces(
+    ws: WebSocketUpgrade,
+    mode: ModeTransition,
+    contexte: ContexteSendspin,
+) -> axum::response::Response {
+    if contexte.identite().await.is_err() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Sendspin storage unavailable",
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = conduire(socket, mode).await {
+        if let Err(e) = conduire(socket, mode, contexte).await {
             // La specification n'a AUCUN message d'erreur applicatif : la seule
             // reaction admise est de fermer sans rien dire au pair. Le motif
             // reste donc chez nous, dans le journal.
@@ -110,11 +122,17 @@ async fn point_d_acces(ws: WebSocketUpgrade, mode: ModeTransition) -> impl IntoR
 /// c'est exactement cette forme. Le point important est que la décision se
 /// prend sur ce que le pair **demande**, jamais sur un échec : il n'existe
 /// aucune arête qui mène de « Noise a raté » à « tant pis, en clair ».
-async fn conduire(mut socket: WebSocket, mode: ModeTransition) -> Result<(), ErreurSendspin> {
+async fn conduire(
+    mut socket: WebSocket,
+    mode: ModeTransition,
+    contexte: ContexteSendspin,
+) -> Result<(), ErreurSendspin> {
     let premier = lire_texte(&mut socket, "premier message").await?;
     match messages::type_du_message(&premier).as_deref() {
-        Some(messages::TYPE_CLIENT_INIT) => conduire_chiffre(socket, premier).await,
-        Some(messages::TYPE_CLIENT_HELLO) => conduire_en_clair(socket, premier, mode).await,
+        Some(messages::TYPE_CLIENT_INIT) => conduire_chiffre(socket, premier, contexte).await,
+        Some(messages::TYPE_CLIENT_HELLO) => {
+            conduire_en_clair(socket, premier, mode, contexte).await
+        }
         autre => Err(ErreurSendspin::MessageIllisible(format!(
             "premier message : {} attendu ou {} (mode de transition), recu {}",
             messages::TYPE_CLIENT_INIT,
@@ -134,6 +152,7 @@ async fn conduire(mut socket: WebSocket, mode: ModeTransition) -> Result<(), Err
 async fn conduire_chiffre(
     mut socket: WebSocket,
     client_init_texte: String,
+    contexte: ContexteSendspin,
 ) -> Result<(), ErreurSendspin> {
     // 1. `client/init`, en clair. Le texte est garde TEL QUEL : il entre dans
     //    le prologue Noise octet pour octet.
@@ -144,11 +163,15 @@ async fn conduire_chiffre(
 
     // 2. La poignee de main est batie avant que quoi que ce soit ne parte : un
     //    pair que nous n'admettons pas ne doit pas meme voir notre server/init.
-    let mut poignee = PoigneeServeur::accueillir(
-        identite_du_serveur(),
-        &client_init_texte,
-        &psk::sentinelle(),
-    )?;
+    let enveloppe: messages::EnveloppeBrute = serde_json::from_str(&client_init_texte)
+        .map_err(|_| ErreurSendspin::MessageIllisible("client/init illisible".into()))?;
+    let id = enveloppe
+        .payload
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ErreurSendspin::MessageIllisible("client/init sans identite".into()))?;
+    let (identite, psk) = contexte.selectionner(id).await?;
+    let mut poignee = PoigneeServeur::accueillir_avec_psk(&identite, &client_init_texte, &psk)?;
     let client_id = poignee.client_id().to_string();
     let suite = poignee.suite();
     info!(%client_id, %suite, "sendspin_client_init_admis");
@@ -162,6 +185,7 @@ async fn conduire_chiffre(
     // 4. Le message Noise 2 ferme la poignee de main et ouvre le tuyau.
     let message_deux = lire_texte(&mut socket, "noise/handshake").await?;
     let (mut transport, infos) = poignee.message_deux(&message_deux)?;
+    contexte.verifier_longue_duree(&infos).await?;
     info!(
         client_id = %infos.client_id,
         suite = %infos.suite,
@@ -220,6 +244,8 @@ async fn conduire_chiffre(
         // Noise a mené jusqu'au bout : le `client_id` est une clé publique
         // PROUVÉE, et les trames sont chiffrées.
         chiffre: true,
+        categorie_psk: Some(infos.categorie_psk),
+        cle_non_reconnue: infos.identifiant_perdu,
         nom: client_hello.name.clone(),
         roles: client_hello.supported_roles.clone(),
         player_support: client_hello.support_du_lecteur().cloned(),
@@ -277,6 +303,7 @@ async fn conduire_en_clair(
     mut socket: WebSocket,
     hello_texte: String,
     mode: ModeTransition,
+    contexte: ContexteSendspin,
 ) -> Result<(), ErreurSendspin> {
     if !mode.accepte_le_clair() {
         // Le refus est l'etat NORMAL, pas une panne : il se journalise en
@@ -317,7 +344,7 @@ async fn conduire_en_clair(
     // PROTECTION CONTRE LA RETROGRADATION. Un pair qui a deja prouve qu'il sait
     // parler Noise ne redescend pas en clair : sinon n'importe qui sur le
     // reseau local usurperait une enceinte connue en recopiant son identifiant.
-    if registre::deja_vu_chiffre(&client_id) {
+    if contexte.est_appaire(&client_id).await? || registre::deja_vu_chiffre(&client_id) {
         warn!(%client_id, "sendspin_retrogradation_refusee");
         return Err(ErreurSendspin::RetrogradationRefusee(client_id));
     }
@@ -349,6 +376,8 @@ async fn conduire_en_clair(
         // ferait croire au contraire.
         suite: None,
         chiffre: false,
+        categorie_psk: None,
+        cle_non_reconnue: false,
         nom: client_hello.name.clone(),
         roles: client_hello.supported_roles.clone(),
         player_support: client_hello.support_du_lecteur().cloned(),
@@ -359,7 +388,7 @@ async fn conduire_en_clair(
     let herite = messages::Enveloppe::nouvelle(
         messages::TYPE_SERVER_HELLO,
         messages::ServerHelloHerite {
-            server_id: identite_du_serveur().id(),
+            server_id: contexte.identite().await?.id(),
             name: format!("Tune ({})", tune_core::discovery::system_hostname()),
             version: VERSION_PROTOCOLE,
             // Aucun role actif : S2-a ne joue rien, et une connexion en clair
