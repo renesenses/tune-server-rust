@@ -1,3 +1,9 @@
+#[cfg(test)]
+#[path = "playback/session_locale_tests.rs"]
+mod session_locale_tests;
+#[path = "playback/session_message.rs"]
+mod session_message;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -2422,7 +2428,11 @@ async fn resume(
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
-        .resume(zone_id, device_id.as_deref())
+        .resume_with_session_error_message(
+            zone_id,
+            device_id.as_deref(),
+            |title, position, cause| session_message::lost_session(&lang, title, position, cause),
+        )
         .await
     {
         Ok(()) => Json(build_zone_json(&state, zone_id).await).into_response(),
