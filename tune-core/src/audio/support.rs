@@ -9,9 +9,16 @@
 use std::path::Path;
 
 /// Extensions que le moteur de lecture sait réellement décoder dans ce binaire.
+///
+/// Matroska (`mkv`, `mka`, `webm`, `weba`) y figure depuis #3633 : symphonia
+/// démuxe le conteneur, et la PISTE décide — FLAC, PCM, Vorbis, AAC, ALAC par
+/// symphonia, Opus par libopus. Un conteneur dont la piste est en AC-3,
+/// E-AC-3 ou TrueHD est refusé fichier en main, par [`decoder_rejection`], le
+/// codec dans le motif. C'est le même contrat que `.dff` : l'extension
+/// promet, le contenu tranche.
 pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "oga", "opus", "aiff", "aif", "aifc", "dsf",
-    "dff", "wv", "ape",
+    "dff", "wv", "ape", "mkv", "mka", "webm", "weba",
 ];
 
 /// Extensions admises par le catalogue. `iso` est l'unique exception au
@@ -24,9 +31,14 @@ pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
 /// `network.rs`. Un `.oga` n'était donc ni catalogué ni déclaré non lu : il
 /// retombait sur `NotAudio`, un `continue` muet du parcours, et disparaissait
 /// de la bibliothèque sans un compteur ni une ligne de rapport (#2060).
+///
+/// Matroska (#3633) est admis PROVISOIREMENT par l'extension, comme `.dff` :
+/// l'énumération ne lit rien, et c'est la phase de métadonnées — derrière son
+/// délai maximal — qui sonde la piste et écarte, nommément, ce qu'aucun
+/// décodeur livré ne lit.
 pub const LIBRARY_AUDIO_EXTENSIONS: &[&str] = &[
     "flac", "mp3", "m4a", "ogg", "oga", "opus", "wav", "aiff", "aif", "aifc", "wv", "dsf", "dff",
-    "alac", "ape", "iso",
+    "alac", "ape", "iso", "mkv", "mka", "webm", "weba",
 ];
 
 /// Formats audio reconnus mais volontairement exclus du catalogue. Cette liste
@@ -40,19 +52,10 @@ pub const KNOWN_UNREAD_AUDIO_EXTENSIONS: &[&str] = &[
     "tta", "shn", "ofr", "ofs", // sans perte, formats de niche
     "m4b", "m4p", // livres audio, achats protégés
     "dts", "ac3", "eac3", // conteneurs plutôt vidéo/multicanal
-    // Matroska. `mka` (piste audio seule) y était déjà ; `mkv` ne l'était
-    // NULLE PART — ni ici, ni au catalogue, ni chez le décodeur. Il
-    // retombait donc sur `NotAudio`, c'est-à-dire le `continue` muet de
-    // `walker.rs` : aucune piste, aucun compteur, aucune ligne de rapport.
-    // C'est le défaut de #2060 pour `.oga`, reproduit à l'identique sur
-    // l'extension que Didier apporte (#3633, fil 1717).
-    //
-    // Il reste dans les NON LUS, pas au catalogue : symphonia démuxe bien
-    // le Matroska (feature `mkv` de `Cargo.toml`), mais un MKV de concert
-    // porte presque toujours de l'AC-3/E-AC-3/TrueHD, et symphonia 0.6 ne
-    // fournit AUCUN de ces codecs. Le cataloguer promettrait une lecture
-    // que le binaire ne sait pas tenir.
-    "mka", "mkv", // Matroska : conteneur démuxé, contenu non décodé (#3633)
+    // Matroska (`mka`, `mkv`, `webm`) n'est PLUS ici : depuis #3633 (point 2)
+    // il est catalogué par l'extension et tranché par sa piste audio — voir
+    // `NATIVE_DECODE_EXTENSIONS` et `decoder_rejection`. PR #3932 (point 1)
+    // l'avait d'abord posé ici pour cesser de le perdre en silence.
     "aac", // AAC brut : le catalogue exige aujourd'hui un conteneur m4a
     "ra", "rm", "amr", "spx",
 ];
@@ -62,7 +65,11 @@ pub struct UnsupportedLibraryAudio {
     /// Clé stable utilisée par les compteurs du rapport de scan.
     pub report_key: String,
     /// Motif destiné au rapport utilisateur, pas seulement aux journaux.
-    pub reason: &'static str,
+    ///
+    /// Une `String`, et non plus un `&'static str` : le refus d'un Matroska
+    /// nomme le CODEC de sa piste (« ac3 », « truehd »), lu dans le fichier —
+    /// une phrase figée ne peut pas le porter (#3633).
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,17 +93,18 @@ pub fn native_decoder_supports(path: &Path) -> bool {
 ///
 /// Cette frontière est volontairement distincte du catalogue : AAC brut est
 /// décodable mais n'est pas indexé aujourd'hui, tandis que WMA/DST ne sont ni
-/// catalogables ni décodables. DFF exige une inspection de contenu.
+/// catalogables ni décodables. DFF et Matroska exigent une inspection de
+/// contenu.
 pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
     let ext = extension(path)?;
     match ext.as_str() {
         "wma" | "asf" => Some(UnsupportedLibraryAudio {
             report_key: ext,
-            reason: "WMA/ASF : aucun décodeur n'est livré",
+            reason: "WMA/ASF : aucun décodeur n'est livré".into(),
         }),
         "dst" => Some(UnsupportedLibraryAudio {
             report_key: ext,
-            reason: "DST compressé : aucun décodeur n'est livré",
+            reason: "DST compressé : aucun décodeur n'est livré".into(),
         }),
         "dff"
             if path
@@ -106,10 +114,44 @@ pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
         {
             Some(UnsupportedLibraryAudio {
                 report_key: "dff-dst".into(),
-                reason: "DSDIFF compressé en DST : aucun décodeur DST n'est livré",
+                reason: "DSDIFF compressé en DST : aucun décodeur DST n'est livré".into(),
             })
         }
+        ext_mkv if super::matroska::est_extension_matroska(ext_mkv) => refus_matroska(&ext, path),
         _ => None,
+    }
+}
+
+/// Le refus NOMMÉ d'un Matroska dont la première piste audio n'est lisible
+/// par aucun décodeur livré (#3633, point 2).
+///
+/// La sonde lit l'en-tête et l'élément `Tracks`, jamais une trame. Trois
+/// verdicts :
+///
+/// - piste décodable (FLAC, PCM, Vorbis, AAC, ALAC, Opus) → `None`, le
+///   fichier est admis ;
+/// - piste nommée mais sans décodeur (AC-3, E-AC-3, TrueHD, DTS…) → clé
+///   `<ext>-codec-non-decodable-<codec>`, le codec dans le motif ;
+/// - aucune piste audio que symphonia sache nommer → `<ext>-sans-piste-audio`.
+///
+/// Une sonde qui ÉCHOUE (fichier tronqué, pas un Matroska) rend `None` : ce
+/// fichier est illisible, pas « non pris en charge », et c'est la lecture des
+/// métadonnées qui le comptera en échec, avec le message de symphonia.
+fn refus_matroska(ext: &str, path: &Path) -> Option<UnsupportedLibraryAudio> {
+    use super::matroska::PisteAudio;
+    match super::matroska::sonder(path).ok()?.piste {
+        PisteAudio::Decodable { .. } => None,
+        PisteAudio::NonDecodable { codec } => Some(UnsupportedLibraryAudio {
+            report_key: format!("{ext}-codec-non-decodable-{codec}"),
+            reason: format!(
+                "Matroska : piste audio « {codec} », aucun décodeur livré ne la lit \
+                 (FLAC, PCM, Vorbis, AAC, ALAC et Opus dans Matroska sont lus)"
+            ),
+        }),
+        PisteAudio::Aucune => Some(UnsupportedLibraryAudio {
+            report_key: format!("{ext}-sans-piste-audio"),
+            reason: "Matroska : aucune piste audio reconnue dans le conteneur".into(),
+        }),
     }
 }
 
@@ -145,7 +187,7 @@ pub fn library_audio_support_by_extension(path: &Path) -> LibraryAudioSupport {
 
     LibraryAudioSupport::Unsupported(UnsupportedLibraryAudio {
         report_key: ext,
-        reason,
+        reason: reason.into(),
     })
 }
 
@@ -210,12 +252,12 @@ pub fn refus_de_televersement(path: &Path) -> Option<String> {
     if !NATIVE_DECODE_EXTENSIONS.contains(&ext.as_str()) {
         return Some(motif_de_refus(&ext, None));
     }
-    decoder_rejection(path).map(|refus| motif_de_refus(&ext, Some(refus.reason)))
+    decoder_rejection(path).map(|refus| motif_de_refus(&ext, Some(&refus.reason)))
 }
 
 /// La phrase rendue à l'auditeur. Elle nomme ce qui est refusé ET ce qui est
 /// accepté : un refus qui n'indique pas la sortie est un cul-de-sac.
-fn motif_de_refus(ext: &str, precision: Option<&'static str>) -> String {
+fn motif_de_refus(ext: &str, precision: Option<&str>) -> String {
     let cause = match precision {
         Some(p) => p.to_string(),
         None => format!("aucun décodeur livré ne lit « .{ext} »"),
@@ -223,7 +265,8 @@ fn motif_de_refus(ext: &str, precision: Option<&'static str>) -> String {
     format!(
         "Ce fichier ne peut pas être lu : {cause}. Formats acceptés : \
          FLAC, WAV, AIFF, MP3, M4A/ALAC, AAC, OGG/Opus, DSF, DFF (DSD non \
-         compressé), WavPack, APE."
+         compressé), WavPack, APE, MKV/MKA/WebM (piste FLAC, PCM, Vorbis, \
+         AAC, ALAC ou Opus)."
     )
 }
 
@@ -422,37 +465,96 @@ mod tests {
         }
     }
 
-    /// #3633 — un `.mkv` est COMPTÉ, pas perdu.
+    /// #3633 (point 2) — un Matroska est ADMIS par l'extension et TRANCHÉ par
+    /// sa piste : le même contrat que `.dff`.
     ///
-    /// Le jumeau `.mka` est le témoin : même conteneur Matroska, même liste,
-    /// même appel. S'il tombait avec `.mkv`, ce test mesurerait la fonction et
-    /// non le défaut.
+    /// Le point 1 (PR #3932) avait posé `mkv` dans les non lus pour cesser
+    /// de le perdre en silence. Ce point-ci le fait entrer au catalogue : un
+    /// `.mka` dont la piste est en FLAC se lit, un `.mkv` en AC-3 est refusé
+    /// fichier en main, le codec dans le motif. Les deux verdicts sont
+    /// mesurés sur des fichiers FABRIQUÉS par le muxer de test ; le témoin
+    /// `cover.jpg` garde l'autre bord — la liste n'avale pas tout.
     #[test]
-    fn un_mkv_est_declare_non_lu_comme_son_jumeau_mka() {
-        for nom in ["concert.mka", "concert.mkv", "Concert.MKV"] {
-            let LibraryAudioSupport::Unsupported(refus) =
-                library_audio_support_by_extension(Path::new(nom))
-            else {
-                panic!(
-                    "« {nom} » doit être DÉCLARÉ non lu : `NotAudio` est un \
-                     `continue` muet du parcours — ni compteur, ni ligne de \
-                     rapport, le fichier disparaît sans trace (#3633)"
-                );
-            };
+    fn un_matroska_est_admis_par_extension_et_tranche_par_sa_piste() {
+        for nom in ["concert.mka", "concert.mkv", "Concert.MKV", "clip.webm"] {
+            assert!(
+                matches!(
+                    library_audio_support_by_extension(Path::new(nom)),
+                    LibraryAudioSupport::Supported
+                ),
+                "« {nom} » doit être admis PROVISOIREMENT par l'extension, comme \
+                 .dff : l'énumération ne lit rien, la phase de métadonnées \
+                 sonde la piste (#3633)"
+            );
             assert_eq!(
-                refus.report_key,
-                nom.rsplit('.').next().unwrap().to_lowercase()
+                refus_de_televersement_par_extension(nom),
+                None,
+                "l'extension seule ne peut pas voir le codec de la piste"
             );
         }
-        // CONTRE-ÉPREUVE : la liste ne s'est pas mise à tout avaler. Un format
-        // catalogué reste catalogué, et une pochette reste muette.
-        assert!(matches!(
-            library_audio_support_by_extension(Path::new("album.flac")),
-            LibraryAudioSupport::Supported
-        ));
         assert!(matches!(
             library_audio_support_by_extension(Path::new("cover.jpg")),
             LibraryAudioSupport::NotAudio
+        ));
+
+        let dossier = crate::test_scratch::scratch_dir("3633-support-matroska");
+
+        // FLAC dans Matroska : ADMIS, fichier en main.
+        let mka = dossier.path().join("concert.mka");
+        std::fs::write(
+            &mka,
+            crate::audio::matroska::muxer_de_test::mka_depuis_flac(
+                Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/flac/ref_16_44100_stereo.flac"
+                )),
+                1,
+                false,
+                &[],
+                &[],
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(library_audio_support(&mka), LibraryAudioSupport::Supported),
+            "un FLAC dans Matroska se décode : le refuser serait une régression"
+        );
+        assert!(native_decoder_supports_file(&mka));
+        assert_eq!(refus_de_televersement(&mka), None);
+
+        // AC-3 dans Matroska : REFUSÉ, le codec dans la clé ET dans le motif.
+        let mkv = dossier.path().join("concert.mkv");
+        std::fs::write(
+            &mkv,
+            crate::audio::matroska::muxer_de_test::mkv_a_codec("A_AC3", 6),
+        )
+        .unwrap();
+        let LibraryAudioSupport::Unsupported(refus) = library_audio_support(&mkv) else {
+            panic!(
+                "un MKV en AC-3 ne doit pas entrer au catalogue : symphonia le \
+                 démuxe mais aucun décodeur AC-3 n'est livré (#3633)"
+            );
+        };
+        assert_eq!(refus.report_key, "mkv-codec-non-decodable-ac3");
+        assert!(
+            refus.reason.contains("ac3"),
+            "le motif doit NOMMER le codec refusé : {}",
+            refus.reason
+        );
+        assert!(!native_decoder_supports_file(&mkv));
+        let motif = refus_de_televersement(&mkv).expect("fichier en main, l'AC-3 doit être refusé");
+        assert!(
+            motif.contains("ac3") && motif.contains("FLAC"),
+            "le refus nomme le codec ET la sortie : {motif}"
+        );
+
+        // Ce qui n'est pas un Matroska n'est pas « non pris en charge » : il
+        // est illisible, et c'est la lecture des métadonnées qui le dira.
+        let faux = dossier.path().join("faux.mkv");
+        std::fs::write(&faux, b"pas un conteneur").unwrap();
+        assert!(matches!(
+            library_audio_support(&faux),
+            LibraryAudioSupport::Supported
         ));
     }
 

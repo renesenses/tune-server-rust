@@ -1083,6 +1083,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             // Le DR lu dans un `foo_dr.txt` voisin (#4186) — même clé que le
             // scan manuel (`ChiffresDeFinDeScan::rapport`).
             "dr_from_sidecar_file": stats.dr_from_sidecar,
+            // Les Matroska admis / écartés (#3633) — mêmes clés que le scan
+            // manuel (`ChiffresDeFinDeScan::rapport`).
+            "matroska_admitted": stats.matroska_admis,
+            "matroska_rejected": stats.matroska_ecartes,
             "skipped_unsupported_by_ext": skipped_by_ext,
             "skipped_unsupported_reasons": skipped_reasons,
             // Ce que les feuilles CUE décrivent (#1763) — mêmes clés que

@@ -2232,6 +2232,109 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     }
 }
 
+/// Les métadonnées d'un Matroska (`.mkv`/`.mka`/`.webm`), lues par symphonia
+/// (#3633, point 2).
+///
+/// Trois sources, dans cet ordre, et rien n'est écrasé — le contrat de
+/// `dsf_dff_fallback_complete` (#3180) :
+///
+/// 1. les balises du conteneur (`Tags`, cibles album et piste) ;
+/// 2. la piste elle-même : cadence, canaux, profondeur, durée annoncée ;
+/// 3. le nom de fichier et l'arborescence, pour ce qui manque encore.
+///
+/// `Err` quand symphonia ne lit pas le conteneur : le fichier est ILLISIBLE et
+/// doit être compté comme tel, pas admis sous le nom de son fichier.
+///
+/// `format` porte l'EXTENSION (« mka »), pas le codec de la piste : voir
+/// `AudioFormat::Matroska` — écrire « flac » ferait servir le conteneur brut
+/// sous `audio/flac`.
+fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
+    let sonde = crate::audio::matroska::sonder(path)?;
+    let balises = sonde.balises;
+
+    let (numero_du_nom, titre_du_nom) = extract_title_from_filename(path);
+    let (album_du_chemin, artiste_du_chemin, disque_du_chemin) = album_artiste_du_chemin(path);
+    // `ARTIST` sous la cible album (50) est l'artiste d'ALBUM pour symphonia
+    // — et c'est là que mkvmerge et ffmpeg posent les balises globales d'un
+    // `.mka`. Un artiste d'album vaut mieux qu'un nom de dossier.
+    let artist_from_path = balises.artist.is_none() && balises.album_artist.is_none();
+    let artiste = balises
+        .artist
+        .clone()
+        .or_else(|| balises.album_artist.clone())
+        .or(artiste_du_chemin);
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mkv")
+        .to_lowercase();
+    let year = balises
+        .release_date
+        .as_deref()
+        .and_then(|d| d.get(..4)?.parse::<u32>().ok());
+    let genres = balises
+        .genre
+        .as_deref()
+        .map(|g| genres_from_tag_values(&[g]))
+        .unwrap_or_default();
+
+    tracing::debug!(
+        path = %path.display(),
+        piste = ?sonde.piste,
+        title = ?balises.title,
+        artist = ?balises.artist,
+        album = ?balises.album,
+        duration_ms = ?sonde.duration_ms,
+        "matroska_metadata"
+    );
+
+    Ok(TrackMetadata {
+        title: balises.title.or(titre_du_nom),
+        artist: artiste,
+        album: balises.album.or(album_du_chemin),
+        // Déduit du chemin, un nom de dossier n'est pas un artiste d'album
+        // (#1656, #3232) : seule la balise le renseigne.
+        album_artist: balises.album_artist,
+        album_artist_sort: None,
+        track_number: balises.track_number.or(numero_du_nom),
+        disc_number: balises.disc_number.or(disque_du_chemin),
+        total_tracks: balises.track_total,
+        total_discs: balises.disc_total,
+        disc_subtitle: None,
+        year,
+        original_year: None,
+        release_date: balises.release_date,
+        original_date: None,
+        genre: genres.first().cloned().or(balises.genre),
+        genres,
+        artist_from_path,
+        format: Some(ext),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
+        sample_rate: sonde.sample_rate,
+        channels: sonde.channels,
+        duration_ms: sonde.duration_ms,
+        bit_depth: sonde.bit_depth,
+        bpm: None,
+        // Le Matroska n'a pas de balise « compilation » normalisée : ABSENCE.
+        compilation: None,
+        label: None,
+        catalog_number: None,
+        musicbrainz_recording_id: None,
+        musicbrainz_release_id: None,
+        musicbrainz_artist_id: None,
+        musicbrainz_album_artist_id: None,
+        musicbrainz_release_group_id: None,
+        isrc: None,
+        has_cover: false,
+        cover_art: None,
+        credits: vec![],
+        comment: balises.comment,
+    })
+}
+
 /// Fallback when lofty cannot parse the file at all (no audio properties).
 /// Extracts everything from the filesystem.
 /// Path/filename-only metadata (no file I/O). Used as a last resort when the
@@ -2972,6 +3075,15 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
     use lofty::tag::{Accessor, ItemKey};
+
+    // Matroska AVANT lofty : lofty ne connaît pas ce conteneur, et l'y passer
+    // ne pouvait finir que dans `tagless_fallback_no_props` — un `.mka` FLAC
+    // 24/96 avec ses balises serait entré sous le nom de son fichier, sans
+    // durée ni cadence (#3633). symphonia démuxe déjà le Matroska : c'est lui
+    // qui lit les balises, la durée et la piste.
+    if crate::audio::matroska::est_chemin_matroska(path) {
+        return matroska_metadata(path);
+    }
 
     let tagged = match Probe::open(path).and_then(|p| {
         p.options(

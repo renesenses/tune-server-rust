@@ -45,6 +45,9 @@ pub mod http_range;
 pub mod iso_sacd;
 pub mod levels;
 pub mod m4a;
+/// Matroska (`.mkv`/`.mka`/`.webm`) : la sonde de la piste audio — admis si
+/// un décodeur livré la lit, compté-nommé sinon (#3633).
+pub mod matroska;
 pub mod mixer;
 /// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
 /// réglage `zone_{id}_mono_downmix` (#2362).

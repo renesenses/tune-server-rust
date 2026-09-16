@@ -933,6 +933,12 @@ impl ChiffresDeFinDeScan<'_> {
             // « 5 » sur 49 629 fichiers peut aussi bien désigner cinq fichiers
             // aux balises abîmées, et le testeur n'a aucun moyen de trancher.
             "skipped_empty_files": self.scan_stats.empty_files,
+            // Les Matroska (#3633) : ADMIS parce que leur piste se décode,
+            // ÉCARTÉS parce qu'elle ne se décode pas — deux compteurs, lus
+            // l'un contre l'autre. Le détail par codec des écartés est dans
+            // `skipped_unsupported_by_ext` (`mkv-codec-non-decodable-ac3`).
+            "matroska_admitted": self.scan_stats.matroska_admis,
+            "matroska_rejected": self.scan_stats.matroska_ecartes,
             // Des COMPTEURS, donc ils partent chez les trois consommateurs —
             // comme tous les autres. Seule la liste nominative des feuilles
             // écartées reste au fichier (`cue_sheets_skipped_paths`), pour la
