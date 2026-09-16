@@ -239,6 +239,12 @@ pub(super) async fn completeness_stats(
     let dr_from_analysis = get(14);
     let dr_from_tag = get(15);
     let dr_unavailable = get(16);
+    // Et celles que la passe REPORTE parce que leur fichier ne répond pas
+    // (#1865) : ni faites, ni écartées, ni à faire tant que le disque ne
+    // revient pas. Sans ce chiffre la carte Santé les comptait « en attente
+    // derrière ReplayGain » — faux sur un partage démonté (#4254).
+    let dr_deferred =
+        tune_core::audio::replaygain::compter_les_reportees_par_chemin(&state.backend);
     // Le client affiche ce nombre dans la pastille « Métadonnées douteuses ».
     // Réutiliser le compteur de la route `/metadata/doubtful` garantit que la
     // pastille et la liste comptent exactement la même population (#1897).
@@ -317,6 +323,7 @@ pub(super) async fn completeness_stats(
         "dynamic_range_from_analysis": dr_from_analysis,
         "dynamic_range_from_tag": dr_from_tag,
         "dynamic_range_unavailable": dr_unavailable,
+        "dynamic_range_deferred": dr_deferred,
         "dynamic_range_pct": if total_tracks > 0 {
             (with_dr as f64 / total_tracks as f64 * 100.0).round()
         } else {
