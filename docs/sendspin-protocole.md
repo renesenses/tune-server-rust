@@ -76,7 +76,7 @@ sans `server/activate` sous 30 s est abandonnée.
   passe en trames **binaires**, chaque message étant un chiffré Noise dont le
   premier octet déchiffré est le type.
 
-## 3. Types de messages binaires
+## 3. Types de messages binaires (releve historique, remplace par le § 15)
 
 `messaging.md` :
 
@@ -558,3 +558,41 @@ Les contre-épreuves et limites sont consignées dans la mesure S2-b.
 S2-c/S2-d, `OutputTarget` et l’album synchronisé sur deux enceintes restent
 nécessaires pour fermer #3326. Aucune version publiée ni acceptation matérielle
 n’est revendiquée ici.
+
+## 15. Fragmentation — revision du 16/09/2026
+
+Le contrat de cette brique S2-c est epingle sur
+[Sendspin/spec@cd9330ef0b4037570c3e2b2d39894ff259bc1487](https://github.com/Sendspin/spec/blob/cd9330ef0b4037570c3e2b2d39894ff259bc1487/messaging.md#fragmentation).
+Il remplace les relevés de fragmentation des § 3 et 11.2.
+
+Le type de fragment est 1. Un octet separe porte les bits premier (bit 1)
+et dernier (bit 0) ; les autres bits sont refuses. Seul le premier fragment
+porte le type original. Un seul message peut etre assemble par direction :
+un debut concurrent, une suite sans debut, un type original de fragmentation
+ou un message non fragmente intercale ferment la connexion.
+
+Le transport authentifie chaque fragment avant de l'ajouter au tampon.
+Le corps complet est livre une seule fois, puis le tampon est libere.
+Le JSON et son UTF-8 ne sont interpretes qu'apres reassemblage.
+La limite locale est de 1 Mio de corps par message (type exclu), a l'entree
+comme a la sortie ; un depassement est explicite. Le compteur se verifie
+avant allocation et le tampon est abandonne sur erreur. Une erreur rend
+le recepteur inutilisable, meme si un appelant omettait de fermer.
+
+Les entrees du vrai WebSocket passent par ce transport : hello initial,
+regime normal, ancien transport pendant un re-echange, puis hello sur les
+nouvelles cles. Les delais de hello et de re-echange couvrent le message
+entier, et non chaque fragment. Les commandes operateur et la revocation
+restent selectionnables pendant un message incomplet en regime normal.
+Il n'y a pas de nouveau delai d'inactivite dans ce regime ; le tampon y
+reste borne. Les ping/pong WebSocket restent possibles entre fragments.
+
+Les sorties JSON utilisent le meme decoupage, sans interlacement dans une
+direction. Les primitives de bas niveau chiffrer/dechiffrer restent limitees
+a une trame ; les messages applicatifs utilisent chiffrer_message et
+recevoir_message/recevoir_json. Une trame qui tient ne change pas de format.
+
+Cette brique ne declare aucun role audio, ne cree aucune zone et ne livre
+ni OutputTarget, ni album synchronise. Le plafond devra etre confronte aux
+formats audio negocies lors de cette etape ulterieure. La preuve de transport
+est detaillee dans [la mesure](mesures/3326-sendspin-fragmentation.md).
