@@ -475,6 +475,8 @@ impl PositionPoller {
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
                 ps.gapless_armed = None;
+                // Une piste lancée par `play()` n'a rien adopté (#4173).
+                ps.adoption_horloge = None;
                 ps.transition(fsm::Transition::NouvellePiste);
             }
 
@@ -1246,6 +1248,76 @@ impl PositionPoller {
                 .track_started_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
+
+            // ── #4173 — une adoption à l'horloge attend un signe de vie ──
+            //
+            // Placé AVANT `stale_start_position` : la position gelée à
+            // l'ancienne durée est, par construction, un échantillon « périmé »
+            // pour la piste adoptée, et le tour serait sauté sans que personne
+            // ne constate que le renderer ne bouge pas. Le renderer qui a
+            // réellement enchaîné rapporte une position qui repart (ou une URI
+            // qui nomme le flux adopté) : l'adoption est acquise. Celui qui
+            // reste gelé pendant `ADOPTION_HORLOGE_DELAI_SECS` n'a pas
+            // enchaîné : la piste ADOPTÉE est relancée (`play_from_queue`), et
+            // non la suivante — sans cette relance, la position gelée finirait
+            // par passer pour la fin de la piste adoptée et la file sauterait
+            // un titre. Une pause ou un arrêt de l'utilisateur pendant la
+            // fenêtre lève la surveillance : on ne relance rien contre lui.
+            if let Some(adoption) = ps.adoption_horloge.as_ref() {
+                if zone_state.state != PlayState::Playing {
+                    debug!(zone_id, etat = ?zone_state.state, "gapless_adoption_horloge_levee");
+                    ps.adoption_horloge = None;
+                } else {
+                    let age_secs = adoption.depuis.elapsed().as_secs();
+                    match decisions::suite_de_l_adoption(
+                        status.position_ms,
+                        adoption.position_figee_ms,
+                        status.current_uri.as_deref(),
+                        &adoption.flux,
+                        age_secs,
+                        ADOPTION_HORLOGE_DELAI_SECS,
+                    ) {
+                        decisions::SuiteAdoption::EnAttente => {}
+                        decisions::SuiteAdoption::Confirmee => {
+                            info!(
+                                zone_id,
+                                age_secs,
+                                position_ms = status.position_ms,
+                                position_figee_ms = adoption.position_figee_ms,
+                                uri = ?status.current_uri,
+                                preuve = ?adoption.preuve,
+                                "gapless_adoption_horloge_confirmee"
+                            );
+                            ps.adoption_horloge = None;
+                        }
+                        decisions::SuiteAdoption::Infirmee => {
+                            warn!(
+                                zone_id,
+                                age_secs,
+                                position_ms = status.position_ms,
+                                position_figee_ms = adoption.position_figee_ms,
+                                uri = ?status.current_uri,
+                                preuve = ?adoption.preuve,
+                                stream_id = %adoption.flux,
+                                "gapless_adoption_horloge_infirmee_relance"
+                            );
+                            ps.adoption_horloge = None;
+                            poll_states.remove(&zone_id);
+                            let position = zone_state.queue_position;
+                            if let Err(e) =
+                                self.orchestrator.play_from_queue(zone_id, position).await
+                            {
+                                warn!(zone_id, position, error = %e, "gapless_adoption_relance_echouee");
+                                let device_id_ref = self.get_zone_device_id(zone_id);
+                                self.orchestrator
+                                    .stop(zone_id, device_id_ref.as_deref())
+                                    .await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             // A non-realtime output is exempt: "position far ahead of the wall
             // clock" is a ghost only if playback runs at 1x. A recorder that
             // finished the capture reports position = duration straight away, so
@@ -2392,7 +2464,45 @@ impl PositionPoller {
                             || dlna_frozen_end)
                     {
                         ps.past_end_ticks += 1;
-                        if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
+                        // #4173 — la fin à l'horloge ne dit pas que le renderer
+                        // n'a PAS enchaîné. Le DMP-A6 de Villerio acquitte le
+                        // `SetNext` et TIRE le flux armé (34 s de connexion)
+                        // pendant que sa position reste gelée à la durée ;
+                        // relancer ici jetait ce flux (`stream_session_removed`)
+                        // et repartait en `SetAVTransportURI` + `Play` — 7,8 s
+                        // de blanc. On lit d'abord ce que le renderer dit jouer
+                        // et ce que le serveur de flux a servi ; l'enchaînement
+                        // attesté est ADOPTÉ, sous surveillance
+                        // (`adoption_horloge`). Rien d'attesté : le repli
+                        // d'avant, mot pour mot.
+                        let (enchainement, flux_arme, octets_tires) =
+                            if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
+                                self.enchainement_a_l_horloge(
+                                    zone_id,
+                                    is_dlna,
+                                    ps.gapless_sent,
+                                    &status,
+                                )
+                                .await
+                            } else {
+                                (decisions::EnchainementArme::Aucun, None, None)
+                            };
+                        if let Some(flux) =
+                            flux_arme.filter(|_| enchainement != decisions::EnchainementArme::Aucun)
+                        {
+                            self.adopter_l_enchainement_a_l_horloge(
+                                zone_id,
+                                zone_state,
+                                &status,
+                                ps,
+                                flux,
+                                enchainement,
+                                octets_tires,
+                                track_duration_ms,
+                                wall_elapsed,
+                            )
+                            .await;
+                        } else if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
                             info!(
                                 zone_id,
                                 position_ms = status.position_ms,
@@ -2403,6 +2513,7 @@ impl PositionPoller {
                                 wall_clock_end = wall_clock_past_end,
                                 cast_wall_clock_end = chromecast_wall_clock_past_end,
                                 dlna_frozen_end,
+                                enchainement = ?enchainement,
                                 "position_past_end_advancing"
                             );
                             track_ended = true;

@@ -12,6 +12,18 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Le flux pré-armé pour l'enchaînement de cette zone, s'il existe (#4173).
+    ///
+    /// C'est l'identifiant que `resolve_queue_item_url` a rangé sous la zone
+    /// en armant la piste suivante — celui que le renderer tire quand il
+    /// honore le `SetNextAVTransportURI`. Le sondeur le relit à la fin de
+    /// piste prononcée à l'horloge, pour savoir si le renderer a DÉJÀ
+    /// commencé à tirer ce flux avant de conclure qu'il n'a pas enchaîné.
+    /// Lecture seule : rien n'est retiré ni échangé ici.
+    pub async fn flux_pre_arme(&self, zone_id: i64) -> Option<String> {
+        self.gapless_sessions.lock().await.get(&zone_id).cloned()
+    }
+
     /// Pre-transcode the NEXT local queue track into the transcode cache while
     /// the current one plays, so its play is a cache hit — this masks the ~30s
     /// file-transcode latency across an album (the per-track transition gap

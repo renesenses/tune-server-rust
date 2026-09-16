@@ -153,6 +153,12 @@ pub(super) struct ZonePollState {
     /// de l'audio reellement en cours (`dlna_frozen_end=true`, journal Sandro
     /// du 01/09 a 14:23:10).
     pub(super) gapless_armed: Option<ArmedNext>,
+    /// Une avance prononcée à l'HORLOGE a adopté l'enchaînement du renderer
+    /// au lieu de le relancer (#4173) : ce que l'on surveille jusqu'à ce que
+    /// le renderer donne signe de vie sur la piste adoptée, ou que le délai
+    /// raisonnable expire. `None` hors de cette fenêtre — c'est-à-dire
+    /// presque toujours. Voir [`decisions::suite_de_l_adoption`].
+    pub(super) adoption_horloge: Option<AdoptionHorloge>,
     /// Suivi de la FAMINE de l'anneau audio de cette zone (#3318).
     ///
     /// Le sondeur est le seul endroit qui relise ces compteurs à intervalle
@@ -225,6 +231,7 @@ impl ZonePollState {
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
             gapless_armed: None,
+            adoption_horloge: None,
             famine: decisions::SuiviFamine::default(),
             famine_releve_at: None,
             etat: EtatDeLecture::Neuve,
@@ -254,6 +261,21 @@ pub(super) struct ArmedNext {
     /// La position occupee AU MOMENT de l'armement. Journalisee seule : elle
     /// dit de combien la file a glisse sous l'armement.
     pub(super) position: i64,
+}
+
+/// Une adoption prononcée à l'horloge, en attente d'un signe de vie du
+/// renderer sur la piste adoptée (#4173).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AdoptionHorloge {
+    /// L'instant de l'adoption : le délai raisonnable court à partir de là.
+    pub(super) depuis: Instant,
+    /// La position que le renderer rapportait, gelée, quand la fin a été
+    /// prononcée. Tout mouvement depuis cette valeur est un signe de vie.
+    pub(super) position_figee_ms: u64,
+    /// Le flux adopté : l'URI courante qui le porte confirme l'adoption.
+    pub(super) flux: String,
+    /// Ce qui a fondé l'adoption, pour le journal.
+    pub(super) preuve: decisions::EnchainementArme,
 }
 
 // ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────

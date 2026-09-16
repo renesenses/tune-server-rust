@@ -838,6 +838,18 @@ impl PlaybackManager {
         })
     }
 
+    /// Bancs d'essai : date le démarrage de la lecture `depuis` en arrière,
+    /// comme si la piste jouait depuis ce temps-là. Injection d'horloge — le
+    /// coalescement des relances (`RETAP_DEDUP_WINDOW`) lit cette date, et
+    /// un banc qui rejoue une fin de piste ne doit pas avoir à dormir.
+    #[cfg(test)]
+    pub(crate) async fn dater_le_demarrage(&self, zone_id: i64, depuis: std::time::Duration) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.last_play_started_at = Some(Instant::now() - depuis);
+        }
+    }
+
     /// Restore a saved playback position into the zone state.
     /// Called on startup to remember where playback left off.
     pub async fn restore_position(&self, zone_id: i64, position_ms: i64, np: NowPlaying) {
