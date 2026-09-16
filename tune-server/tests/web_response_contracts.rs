@@ -5,6 +5,9 @@
 //! ils chargent `docs/contrat-web.json`, appellent le vrai routeur Axum et
 //! confrontent la réponse à la carte commitée.
 
+#[path = "web_contracts/library_1897.rs"]
+mod library_1897;
+
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use serde::Deserialize;
