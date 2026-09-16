@@ -209,6 +209,31 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Une lecture en base qui échoue dans une route de lecture ne devient jamais
+/// une réponse nominale (#4261, famille #2861) : 500 JSON qui nomme le site et
+/// le motif, et un `warn!` du même nom. `site` désigne l'endroit du handler,
+/// pas la table — c'est le nom qu'on cherchera dans le journal.
+///
+/// Réservé au cas où la donnée est NÉCESSAIRE à la réponse. Quand la lecture
+/// a déjà démarré et que seul un compteur manque, l'appelant journalise et
+/// répond quand même (voir la reprise dans `play`).
+fn lecture_base_echouee(
+    site: &'static str,
+    zone_id: i64,
+    error: String,
+) -> axum::response::Response {
+    warn!(zone_id, site, %error, "playback_lecture_base_echouee");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "playback_lecture_base_echouee",
+            "site": site,
+            "message": error,
+        })),
+    )
+        .into_response()
+}
+
 /// Réponse stable des commandes de sortie. Une capacité absente est une
 /// requête impossible (422), pas une panne ; un backend qui refuse une
 /// capacité déclarée est une erreur de passerelle (502), jamais un faux 200.
@@ -1412,14 +1437,29 @@ async fn play(
                     Ok(result) => {
                         // Restore queue_length from DB so the poller can
                         // advance tracks (fixes repeat-all after restart).
+                        //
+                        // #4261 — la lecture a DÉMARRÉ : refuser la réponse
+                        // mentirait dans l'autre sens. Mais une file illisible
+                        // n'est pas une file vide : on le dit, et l'état en
+                        // mémoire n'est pas écrasé par un zéro inventé.
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                        let q_len = qr.count_all(zone_id).unwrap_or(0);
-                        if q_len > 0 {
-                            let cur_pos = state.playback.get_state(zone_id).await.queue_position;
-                            state
-                                .playback
-                                .update_queue_info(zone_id, cur_pos, q_len)
-                                .await;
+                        match qr.count_all(zone_id) {
+                            Ok(q_len) if q_len > 0 => {
+                                let cur_pos =
+                                    state.playback.get_state(zone_id).await.queue_position;
+                                state
+                                    .playback
+                                    .update_queue_info(zone_id, cur_pos, q_len)
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(
+                                zone_id,
+                                site = "play_reprise_longueur_file",
+                                error = %e,
+                                "playback_lecture_base_echouee — la lecture a démarré, \
+                                 mais la longueur de file n'a pas pu être relue"
+                            ),
                         }
                         persist_queue_async(&state, zone_id);
                         Json(build_zone_json_with_result(&state, zone_id, &result).await)
@@ -1428,71 +1468,123 @@ async fn play(
                     Err(e) => {
                         tracing::warn!(zone_id, error = %e, "play_resume_failed_trying_queue");
                         // Fallback: try to play from queue position 0
+                        //
+                        // #4261 — un repli qui échoue n'est plus muet : la
+                        // réponse reste le motif de la reprise (c'est lui que
+                        // l'auditeur a demandé), le repli dit le sien au
+                        // journal.
                         let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                        let q_len = qr.count_all(zone_id).unwrap_or(0);
-                        if q_len > 0 {
-                            let pos = current.queue_position.min(q_len - 1);
-                            state.playback.update_queue_info(zone_id, pos, q_len).await;
-                            if let Ok(result) =
-                                state.orchestrator.play_from_queue(zone_id, pos).await
-                            {
-                                return Json(
-                                    build_zone_json_with_result(&state, zone_id, &result).await,
-                                )
-                                .into_response();
+                        match qr.count_all(zone_id) {
+                            Ok(q_len) if q_len > 0 => {
+                                let pos = current.queue_position.min(q_len - 1);
+                                state.playback.update_queue_info(zone_id, pos, q_len).await;
+                                match state.orchestrator.play_from_queue(zone_id, pos).await {
+                                    Ok(result) => {
+                                        return Json(
+                                            build_zone_json_with_result(&state, zone_id, &result)
+                                                .await,
+                                        )
+                                        .into_response();
+                                    }
+                                    Err(repli) => warn!(
+                                        zone_id,
+                                        pos,
+                                        error = %repli,
+                                        "play_reprise_repli_file_echoue"
+                                    ),
+                                }
                             }
+                            Ok(_) => {}
+                            Err(base) => warn!(
+                                zone_id,
+                                site = "play_reprise_repli_longueur_file",
+                                error = %base,
+                                "playback_lecture_base_echouee — le repli sur la file \
+                                 n'a pas pu la compter"
+                            ),
                         }
                         (StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
                     }
                 };
             }
             // No now_playing — try queue fallback
+            //
+            // #4261 — trois `if let Ok` faisaient de toute panne un
+            // 400 « nothing to resume » : une file illisible, une file dont la
+            // lecture échoue, une zone illisible, une dernière piste dont la
+            // lecture échoue, tout se lisait « il n'y avait rien ». Chaque
+            // échec rend désormais SON motif : une panne de base en 500 nommé,
+            // un refus de l'orchestrateur par `play_error_response` (409 zone
+            // sans sortie, 404 fichier absent…), comme sur les autres chemins
+            // de ce gestionnaire. Le 400 reste réservé au cas où il n'y a
+            // vraiment rien : ni file, ni dernière piste.
             {
                 let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                let q_len = qr.count_all(zone_id).unwrap_or(0);
+                let q_len = match qr.count_all(zone_id) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return lecture_base_echouee("play_sans_source_longueur_file", zone_id, e);
+                    }
+                };
                 if q_len > 0 {
                     let current = state.playback.get_state(zone_id).await;
                     let pos = current.queue_position.min(q_len - 1);
                     state.playback.update_queue_info(zone_id, pos, q_len).await;
-                    if let Ok(result) = state.orchestrator.play_from_queue(zone_id, pos).await {
-                        return Json(build_zone_json_with_result(&state, zone_id, &result).await)
-                            .into_response();
-                    }
+                    return match state.orchestrator.play_from_queue(zone_id, pos).await {
+                        Ok(result) => {
+                            Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                                .into_response()
+                        }
+                        Err(e) => {
+                            warn!(zone_id, pos, q_len, error = %e, "play_sans_source_file_echoue");
+                            play_error_response(e, &lang)
+                        }
+                    };
                 }
             }
             // Last resort: resume from last_track saved in DB (after stop)
             {
                 let zone_repo =
                     tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
-                if let Ok(Some(zone)) = zone_repo.get(zone_id) {
-                    if let Some(track_id) = zone.last_track_id {
-                        let output_device_id = get_zone_device_id(&state, zone_id);
-                        let orch_req = tune_core::orchestrator::PlayRequest {
-                            zone_id,
-                            output_device_id,
-                            track_id: Some(track_id),
-                            source: zone.last_track_source.clone().filter(|s| s != "local"),
-                            source_id: zone.last_track_source_id.clone(),
-                            title: None,
-                            artist_name: None,
-                            album_title: None,
-                            cover_url: None,
-                            duration_ms: None,
-                            seek_ms: None,
-                            temp_file_path: None,
-                            sample_rate: None,
-                            bit_depth: None,
-                            media_format: None,
-                            track_number: None,
-                            disc_number: None,
-                        };
-                        if let Ok(result) = state.orchestrator.play(orch_req).await {
-                            return Json(
-                                build_zone_json_with_result(&state, zone_id, &result).await,
-                            )
-                            .into_response();
-                        }
+                let zone = match zone_repo.get(zone_id) {
+                    Ok(zone) => zone,
+                    Err(e) => {
+                        return lecture_base_echouee("play_sans_source_derniere_piste", zone_id, e);
                     }
+                };
+                if let Some(zone) = zone
+                    && let Some(track_id) = zone.last_track_id
+                {
+                    let output_device_id = get_zone_device_id(&state, zone_id);
+                    let orch_req = tune_core::orchestrator::PlayRequest {
+                        zone_id,
+                        output_device_id,
+                        track_id: Some(track_id),
+                        source: zone.last_track_source.clone().filter(|s| s != "local"),
+                        source_id: zone.last_track_source_id.clone(),
+                        title: None,
+                        artist_name: None,
+                        album_title: None,
+                        cover_url: None,
+                        duration_ms: None,
+                        seek_ms: None,
+                        temp_file_path: None,
+                        sample_rate: None,
+                        bit_depth: None,
+                        media_format: None,
+                        track_number: None,
+                        disc_number: None,
+                    };
+                    return match state.orchestrator.play(orch_req).await {
+                        Ok(result) => {
+                            Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                                .into_response()
+                        }
+                        Err(e) => {
+                            warn!(zone_id, track_id, error = %e, "play_sans_source_derniere_piste_echoue");
+                            play_error_response(e, &lang)
+                        }
+                    };
                 }
             }
             return (
@@ -1897,7 +1989,13 @@ async fn play(
         // utile.
         let repo = tune_core::db::playlist_repo::PlaylistRepo::with_backend(state.backend.clone());
         match crate::routes::playlists::owned_or_404_response(&repo, playlist_id, profile.id()) {
-            Ok(_) => repo.get_track_ids(playlist_id).unwrap_or_default(),
+            // #4261 — `.unwrap_or_default()` faisait d'une playlist ILLISIBLE
+            // une playlist vide, donc un 400 « no tracks to play » : la panne
+            // se lisait comme un choix de l'auditeur.
+            Ok(_) => match repo.get_track_ids(playlist_id) {
+                Ok(ids) => ids,
+                Err(e) => return lecture_base_echouee("play_pistes_de_playlist", zone_id, e),
+            },
             Err(r) => return r,
         }
     } else if let Some(ids) = body.track_ids {
@@ -1949,17 +2047,33 @@ async fn play(
             };
         }
         // No now_playing — try queue fallback (same as empty-body path)
+        //
+        // #4261 — même contrat que le corps vide : une file illisible est un
+        // 500 nommé, une file dont la lecture échoue rend le motif de
+        // l'orchestrateur. Le 400 ne dit « no track source specified » que
+        // quand la file est réellement vide.
         let qr_fallback = PlayQueueRepo::with_backend(state.backend.clone());
-        let q_len = qr_fallback.count_all(zone_id).unwrap_or(0);
+        let q_len = match qr_fallback.count_all(zone_id) {
+            Ok(n) => n,
+            Err(e) => {
+                return lecture_base_echouee("play_corps_sans_source_longueur_file", zone_id, e);
+            }
+        };
         if q_len > 0 {
             let current = state.playback.get_state(zone_id).await;
             let pos = current.queue_position.min(q_len - 1);
             state.playback.update_queue_info(zone_id, pos, q_len).await;
-            if let Ok(result) = state.orchestrator.play_from_queue(zone_id, pos).await {
-                persist_queue_async(&state, zone_id);
-                return Json(build_zone_json_with_result(&state, zone_id, &result).await)
-                    .into_response();
-            }
+            return match state.orchestrator.play_from_queue(zone_id, pos).await {
+                Ok(result) => {
+                    persist_queue_async(&state, zone_id);
+                    Json(build_zone_json_with_result(&state, zone_id, &result).await)
+                        .into_response()
+                }
+                Err(e) => {
+                    warn!(zone_id, pos, q_len, error = %e, "play_corps_sans_source_file_echoue");
+                    play_error_response(e, &lang)
+                }
+            };
         }
         return (StatusCode::BAD_REQUEST, "no track source specified").into_response();
     };
@@ -2781,6 +2895,13 @@ struct StreamingQueueMeta {
     duration_ms: i64,
     track_number: Option<i64>,
     disc_number: Option<i64>,
+    /// #4261 — pourquoi le titre est « Unknown », quand il l'est : le service
+    /// n'est pas enregistré, ou sa réponse a échoué (motif du service). `None`
+    /// quand les métadonnées sont celles du client ou du service. La réponse
+    /// de `queue_add` le rend (`unresolved[]`) : un titre « Unknown » n'est
+    /// jamais indistinguable d'un titre résolu, et une panne du service n'est
+    /// jamais indistinguable d'un service absent.
+    non_resolu: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2809,26 +2930,58 @@ async fn resolve_streaming_queue_meta(
             duration_ms: duration_ms.unwrap_or(0),
             track_number,
             disc_number,
+            non_resolu: None,
         };
     }
 
+    // #4261 — l'échec du service n'est plus avalé : il est journalisé et
+    // porté dans `non_resolu`. Le titre « Unknown » reste le repli (refuser
+    // l'enfilage pour une métadonnée manquante priverait l'auditeur d'une
+    // piste que la lecture sait encore résoudre), mais il ne se présente plus
+    // comme une réponse du service.
     let registry = state.services.lock().await;
-    if let Some(svc) = registry.get(source) {
-        let svc = svc.read().await;
-        if let Ok(t) = svc.get_track(source_id).await {
-            return StreamingQueueMeta {
-                title: t.title,
-                artist: t.artist,
-                album: t.album,
-                cover: t.cover_path,
-                duration_ms: t.duration_ms as i64,
-                // We are talking to the service anyway, so fill the numbering
-                // it reports — the client's value still wins when it sent one.
-                track_number: track_number.or(t.track_number.map(i64::from)),
-                disc_number: disc_number.or(t.disc_number.map(i64::from)),
-            };
+    let non_resolu = match registry.get(source) {
+        Some(svc) => {
+            let svc = svc.read().await;
+            match svc.get_track(source_id).await {
+                Ok(t) => {
+                    return StreamingQueueMeta {
+                        title: t.title,
+                        artist: t.artist,
+                        album: t.album,
+                        cover: t.cover_path,
+                        duration_ms: t.duration_ms as i64,
+                        // We are talking to the service anyway, so fill the
+                        // numbering it reports — the client's value still wins
+                        // when it sent one.
+                        track_number: track_number.or(t.track_number.map(i64::from)),
+                        disc_number: disc_number.or(t.disc_number.map(i64::from)),
+                        non_resolu: None,
+                    };
+                }
+                Err(e) => {
+                    let motif = e.to_string();
+                    warn!(
+                        source,
+                        source_id,
+                        error = %motif,
+                        "playback_metadonnees_service_echouees site=resolve_streaming_queue_meta \
+                         — la piste est enfilée sous « Unknown »"
+                    );
+                    motif
+                }
+            }
         }
-    }
+        None => {
+            warn!(
+                source,
+                source_id,
+                "playback_metadonnees_service_absent site=resolve_streaming_queue_meta \
+                 — la piste est enfilée sous « Unknown »"
+            );
+            format!("service non enregistré : {source}")
+        }
+    };
     StreamingQueueMeta {
         title: "Unknown".into(),
         artist: String::new(),
@@ -2837,6 +2990,7 @@ async fn resolve_streaming_queue_meta(
         duration_ms: 0,
         track_number,
         disc_number,
+        non_resolu: Some(non_resolu),
     }
 }
 
@@ -2928,6 +3082,10 @@ async fn queue_add(
     // streaming track added "next" while a local album plays now lands right
     // after the current track instead of at the end of the album (Sandro S1).
     let mut inputs: Vec<QueueInput> = Vec::new();
+    // #4261 — les pistes de service enfilées sous « Unknown » parce que le
+    // service n'a pas répondu (ou n'existe pas), avec le motif. Rendu tel quel
+    // dans la réponse : une panne de métadonnées n'est jamais silencieuse.
+    let mut non_resolues: Vec<serde_json::Value> = Vec::new();
 
     // Album entier : résolu par la MÊME fonction que la lecture, rattrapage de
     // la ligne sœur compris. On ne fait qu'obtenir les identifiants ici — ils
@@ -2967,6 +3125,13 @@ async fn queue_add(
             body.disc_number,
         )
         .await;
+        if let Some(motif) = &meta.non_resolu {
+            non_resolues.push(json!({
+                "source": source,
+                "source_id": source_id,
+                "error": motif,
+            }));
+        }
         inputs.push(QueueInput::Streaming {
             source: source.clone(),
             source_id: source_id.clone(),
@@ -2995,6 +3160,13 @@ async fn queue_add(
             item.disc_number,
         )
         .await;
+        if let Some(motif) = &meta.non_resolu {
+            non_resolues.push(json!({
+                "source": &item.source,
+                "source_id": &item.source_id,
+                "error": motif,
+            }));
+        }
         inputs.push(QueueInput::Streaming {
             source: item.source.clone(),
             source_id: item.source_id.clone(),
@@ -3117,11 +3289,16 @@ async fn queue_add(
         // après la piste en cours » calculé sur une file périmée réussit… en
         // ajoutant à la fin. Renvoyer la demande plutôt que le résultat
         // rendrait ces deux cas identiques, ce qui est exactement le défaut.
+        //
+        // `unresolved` (#4261) est additif lui aussi : la liste des pistes de
+        // service enfilées sous « Unknown » faute de réponse du service, avec
+        // le motif. Vide quand tout est résolu.
         Json(json!({
             "added": count,
             "queue_length": total,
             "position": start,
             "items": enfiles,
+            "unresolved": non_resolues,
         })),
     )
         .into_response()

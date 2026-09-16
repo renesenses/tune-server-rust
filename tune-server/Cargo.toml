@@ -687,3 +687,10 @@ path = "tests/history_context_4036.rs"
 [[test]]
 name = "recuperation_playlist_remplacer_3685"
 path = "tests/recuperation_playlist_remplacer_3685.rs"
+
+# #4261 — une panne de base ou de service dans `routes/playback.rs` ne se
+# présente jamais comme un résultat. `autotests = false` : sans cette cible,
+# le fichier ne serait jamais compilé.
+[[test]]
+name = "playback_panne_de_base_4261"
+path = "tests/playback_panne_de_base_4261.rs"
