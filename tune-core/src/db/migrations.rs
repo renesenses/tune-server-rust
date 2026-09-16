@@ -3675,6 +3675,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "radio_favorite_integer",
         include_str!("../../migrations/postgres/062_radio_favorite_integer.sql"),
     ),
+    (
+        63,
+        "alarm_source_text",
+        include_str!("../../migrations/postgres/063_alarm_source_text.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5636,7 +5641,7 @@ mod tests {
         // with the repository's integer bindings (#3715).
         // 61 repairs native streaming favorite IDs without rewinding the sequence.
         // 62 repairs radio favorite flags and their former boolean writer.
-        assert_eq!(pg_latest_version(), 62, "latest PG migration must be 62");
+        assert_eq!(pg_latest_version(), 63, "latest PG migration must be 63");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

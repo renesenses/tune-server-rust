@@ -2301,3 +2301,60 @@ async fn pg_3715_radio_invalid_flags_preserve_data_and_version() {
     drop(c);
     pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_3715_alarm_source_migration_preserves_ids_and_accepts_opaque_strings() {
+    for (case, typ) in [("alarm_native", "BIGINT"), ("alarm_import", "TEXT")] {
+        let Some(pool) = pg_3715_pool(case).await else {
+            return;
+        };
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE alarms (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, source_id {typ})"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql("INSERT INTO alarms (name,source_id) VALUES ('Legacy','9223372036854775807'),('Empty',NULL)").execute(&pool).await.unwrap();
+        for _ in 0..2 {
+            sqlx::raw_sql(include_str!(
+                "../../migrations/postgres/063_alarm_source_text.sql"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT name,source_id FROM alarms ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Legacy".into(), Some("9223372036854775807".into())),
+                ("Empty".into(), None)
+            ]
+        );
+        let db = PostgresBackend::new(pool.clone());
+        for source in ["qobuz:playlist:abc", "000123", "9223372036854775808"] {
+            db.execute(
+                "INSERT INTO alarms (name,source_id) VALUES ('New',?)",
+                &[&source],
+            )
+            .unwrap();
+            let got = db
+                .query_one("SELECT source_id FROM alarms ORDER BY id DESC LIMIT 1", &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(got[0].as_str(), Some(source));
+        }
+        let version: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM schema_version WHERE version=63")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(version, 1);
+        drop(db);
+        pool.close().await;
+    }
+}
