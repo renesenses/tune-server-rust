@@ -99,6 +99,11 @@ hostname = "0.4"
 # compile time — and the shared lib is loaded at runtime next to the model
 # (downloaded on activation). Feature-gated so the default build never pulls it.
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray"], optional = true }
+# Sonde de la dylib AVANT `ort::init_from` (#clap-oncelock, 16/09/2026) : un
+# `dlopen` + `dlsym(OrtGetApiBase)` à nous, dont l'échec reste un simple `Err`
+# — alors qu'un échec DANS `ort` empoisonne son `OnceLock` pour la vie du
+# processus (voir `audio/runtime.rs`). Déjà dans le graphe via `ort`.
+libloading = { version = "0.8", optional = true }
 # Runtime provisioning of the onnxruntime shared lib for `load-dynamic`: we fetch
 # Microsoft's official onnxruntime release archives (which ship real shared libs,
 # unlike ort's static-link dists) and unpack them — `.tgz` via flate2+tar,
@@ -281,7 +286,7 @@ postgres = ["dep:sqlx"]
 # Acoustic Smart Radio: CLAP audio embeddings via onnxruntime. NOT in default —
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
-audio-embedding = ["dep:ort", "dep:flate2", "dep:tar", "dep:tokenizers"]
+audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:tokenizers"]
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
 # transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.

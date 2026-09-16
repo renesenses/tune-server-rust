@@ -16,50 +16,118 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::OnceCell;
 
-/// Process-global guard so onnxruntime is initialised into `ort` exactly once,
-/// before any `Session` is built — no matter which subsystem reaches it first
-/// (the background audio-embedding sweep or the natural-language search
-/// endpoint). `ort::init_from().commit()` must run once and only once per
-/// process; a second commit is an error, so both paths funnel through here.
-static RUNTIME_LOADED: OnceCell<()> = OnceCell::const_new();
+/// Le VERDICT du chargement d'onnxruntime, pris UNE fois pour toute la vie du
+/// processus — succès ou échec, avec son message.
+///
+/// 🔴 Pourquoi l'échec est mémorisé, et non retenté (Yves, ticket 130, macOS
+/// aarch64, 0.9.150, 16/09/2026 : « CLAP ne démarre pas chez moi ») :
+///
+/// ```text
+/// audio_runtime_loaded dylib=embedding_models/onnxruntime/libonnxruntime.dylib
+/// audio_embedder_load_panicked … `OrtGetApiBase` must be present in ONNX
+///   Runtime dylib: DlSym { dlsym(0x0, OrtGetApiBase): invalid handle }
+/// ```
+///
+/// `dlsym(0x0, …)` : un handle NUL, alors que `init_from` venait de répondre
+/// `Ok`. La cause est dans `ort` 2.0.0-rc.13, `util::OnceLock::try_init_inner`
+/// : il passe par `Once::call_once_force`, qui marque le `Once` TERMINÉ même
+/// quand la fermeture a rendu `Err` — et le slot n'a jamais été écrit. Au
+/// second appel, `get()` voit `is_completed()` et rend une référence vers de
+/// la mémoire non initialisée : une `Library` au handle nul. La version
+/// précédente de cette fonction laissait son garde DÉSARMÉ sur un échec
+/// « pour qu'un appel suivant réessaie » — c'est précisément ce second appel
+/// qui déclenchait le comportement indéfini. Le premier échec (hors de la
+/// fenêtre du rapport) n'était que l'échec réel ; le second était une panique
+/// fabriquée par le retry.
+///
+/// Deux parades, toutes deux ici :
+///
+/// 1. la dylib est SONDÉE par nos soins (`dlopen` + `dlsym(OrtGetApiBase)`)
+///    avant qu'`ort` ne la voie : un environnement où elle ne charge pas
+///    produit un `Err` clair — chemin, cause — sans jamais entrer dans le
+///    `OnceLock` d'`ort` ;
+/// 2. le verdict, quel qu'il soit, est gardé : un échec se relit tel quel à
+///    chaque appel, sans rappeler `init_from`. Réessayer demande un
+///    redémarrage du serveur — et le message le dit.
+static RUNTIME_LOADED: OnceCell<Result<(), String>> = OnceCell::const_new();
+
+/// Sonde une dylib onnxruntime SANS passer par `ort` : `dlopen` puis
+/// `dlsym(OrtGetApiBase)`. Rend le message d'erreur du système, avec le
+/// chemin, quand l'un des deux échoue. La bibliothèque chargée n'est pas
+/// refermée (`forget`) : `ort` va l'ouvrir à son tour et le compte de
+/// références du chargeur fait le reste — la refermer ici ne rapporterait
+/// rien et pourrait, sur certains chargeurs, invalider le premier handle.
+pub fn sonder_dylib(dylib: &Path) -> Result<(), String> {
+    // SAFETY: charger une bibliothèque exécute ses constructeurs ; c'est la
+    // dylib officielle de Microsoft, vérifiée par SHA-256 à l'extraction, et
+    // c'est exactement ce qu'`ort::init_from` fera juste après.
+    let lib = unsafe { libloading::Library::new(dylib) }
+        .map_err(|e| format!("dlopen {}: {e}", dylib.display()))?;
+    // SAFETY: la signature déclarée est celle de l'API C d'onnxruntime.
+    let _base: libloading::Symbol<unsafe extern "C" fn() -> *const core::ffi::c_void> =
+        unsafe { lib.get(b"OrtGetApiBase") }
+            .map_err(|e| format!("dlsym OrtGetApiBase dans {}: {e}", dylib.display()))?;
+    std::mem::forget(lib);
+    Ok(())
+}
 
 /// Provision (download+verify+unpack on first use) the onnxruntime shared lib
 /// under `cache_root` and load it globally into `ort`, exactly once for the
-/// process. Concurrent callers coalesce onto a single init; on failure the guard
-/// stays unset so a later call retries.
+/// process. Concurrent callers coalesce onto a single init.
+///
+/// Deux sortes d'échec, deux durées de vie :
+/// - le TÉLÉCHARGEMENT (réseau absent au démarrage, disque plein) laisse le
+///   garde désarmé — un appel suivant réessaie, rien n'a touché `ort` ;
+/// - le CHARGEMENT (sonde ou `init_from`) est mémorisé pour la vie du
+///   processus — voir [`RUNTIME_LOADED`] : le rejouer serait rejouer le bug.
 pub async fn ensure_loaded(cache_root: &Path) -> Result<(), String> {
     RUNTIME_LOADED
         .get_or_try_init(|| async {
+            // `?` ici : un échec de provisionnement SORT sans poser de verdict.
             let dylib = ensure_runtime(cache_root).await?;
-            // Ceinture et bretelles pour le plafond de fils. `ort` documente que
-            // `with_intra_threads` est SANS EFFET si onnxruntime a été compilé
-            // avec OpenMP — et c'est justement les binaires préconstruits de
-            // Microsoft que l'on provisionne. Dans ce cas seule
-            // `OMP_NUM_THREADS` compte, et elle doit être posée AVANT que le
-            // moteur ne crée son pool, donc avant `init_from`.
-            //
-            // On ne l'écrase jamais : un opérateur qui l'a réglée à la main sur
-            // sa machine a le dernier mot. Sinon, la moitié des cœurs — le même
-            // arbitrage que le réglage `equilibre` de la passe acoustique.
-            if std::env::var_os("OMP_NUM_THREADS").is_none() {
-                let half = (std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(2)
-                    / 2)
-                .max(1);
-                // SAFETY: on est avant toute création de pool par onnxruntime,
-                // et `RUNTIME_LOADED` garantit qu'un seul fil passe ici.
-                unsafe { std::env::set_var("OMP_NUM_THREADS", half.to_string()) };
-                tracing::info!(omp_num_threads = half, "audio_runtime_omp_capped");
-            }
-            ort::init_from(&dylib)
-                .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
-                .commit();
-            tracing::info!(dylib = %dylib.display(), "audio_runtime_loaded");
-            Ok::<(), String>(())
+            Ok::<Result<(), String>, String>(charger_dans_ort(&dylib))
         })
-        .await
-        .map(|_| ())
+        .await?
+        .clone()
+        .map_err(|e| {
+            format!(
+                "{e} — l'analyse acoustique reste indisponible jusqu'au prochain redémarrage \
+                 du serveur (un second essai dans le même processus n'est pas possible)"
+            )
+        })
+}
+
+/// Le chargement proprement dit, synchrone : la sonde, le plafond de fils,
+/// puis `ort::init_from`. Appelé UNE fois par processus.
+fn charger_dans_ort(dylib: &Path) -> Result<(), String> {
+    // La sonde d'abord : un échec ICI ne touche pas `ort`.
+    sonder_dylib(dylib)?;
+    // Ceinture et bretelles pour le plafond de fils. `ort` documente que
+    // `with_intra_threads` est SANS EFFET si onnxruntime a été compilé
+    // avec OpenMP — et c'est justement les binaires préconstruits de
+    // Microsoft que l'on provisionne. Dans ce cas seule
+    // `OMP_NUM_THREADS` compte, et elle doit être posée AVANT que le
+    // moteur ne crée son pool, donc avant `init_from`.
+    //
+    // On ne l'écrase jamais : un opérateur qui l'a réglée à la main sur
+    // sa machine a le dernier mot. Sinon, la moitié des cœurs — le même
+    // arbitrage que le réglage `equilibre` de la passe acoustique.
+    if std::env::var_os("OMP_NUM_THREADS").is_none() {
+        let half = (std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            / 2)
+        .max(1);
+        // SAFETY: on est avant toute création de pool par onnxruntime,
+        // et `RUNTIME_LOADED` garantit qu'un seul fil passe ici.
+        unsafe { std::env::set_var("OMP_NUM_THREADS", half.to_string()) };
+        tracing::info!(omp_num_threads = half, "audio_runtime_omp_capped");
+    }
+    ort::init_from(dylib)
+        .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
+        .commit();
+    tracing::info!(dylib = %dylib.display(), "audio_runtime_loaded");
+    Ok(())
 }
 
 /// A platform's prebuilt onnxruntime: where to get it, its archive checksum, and
@@ -376,6 +444,56 @@ mod signature_macos_tests {
         assert!(
             RELEASE_YML.matches(CLE).count() >= 2,
             "release.yml ne cherche plus {CLE} dans les signatures produites (#1641)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sonde_dylib_tests {
+    use super::*;
+
+    /// Une dylib absente ou qui n'en est pas une donne un `Err` qui NOMME le
+    /// chemin — et surtout n'entre jamais dans `ort`.
+    #[test]
+    fn la_sonde_refuse_proprement_ce_qui_ne_charge_pas() {
+        let e = sonder_dylib(Path::new("/nulle/part/libonnxruntime.dylib")).unwrap_err();
+        assert!(
+            e.starts_with("dlopen /nulle/part/libonnxruntime.dylib"),
+            "{e}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let faux = dir.path().join("libonnxruntime.so");
+        std::fs::write(&faux, b"pas une bibliotheque").unwrap();
+        let e = sonder_dylib(&faux).unwrap_err();
+        assert!(e.starts_with("dlopen "), "{e}");
+    }
+
+    /// 🔴 La preuve du bug amont, telle qu'Yves l'a vécue : deux appels
+    /// d'`ort::init_from` sur un chemin qui ne charge pas. Le premier échoue
+    /// honnêtement ; le second ne DOIT PAS répondre `Ok` — et pourtant, avec
+    /// `ort` 2.0.0-rc.13, il le fait, parce que son `OnceLock` s'est marqué
+    /// terminé sur l'échec. C'est ce `Ok` mensonger qui menait ensuite à
+    /// `dlsym(0x0, …)`.
+    ///
+    /// `#[ignore]` : ce test EMPOISONNE le `OnceLock` d'`ort` pour tout le
+    /// processus de test — aucun autre test de ce binaire ne pourrait plus
+    /// charger onnxruntime après lui. À lancer seul :
+    /// `cargo test -p tune-core --features audio-embedding --lib -- --ignored
+    /// le_second_init_from_ment_apres_un_echec`. Le jour où il rougit, le bug
+    /// amont est corrigé et la mémorisation du verdict devient une ceinture
+    /// de plus, pas une nécessité.
+    #[test]
+    #[ignore]
+    fn le_second_init_from_ment_apres_un_echec() {
+        let chemin = Path::new("/nulle/part/libonnxruntime.so");
+        assert!(
+            ort::init_from(chemin).is_err(),
+            "le premier échec est honnête"
+        );
+        assert!(
+            ort::init_from(chemin).is_ok(),
+            "ort a corrigé son OnceLock : ce témoin peut disparaître"
         );
     }
 }
