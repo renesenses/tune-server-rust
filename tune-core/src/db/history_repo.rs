@@ -45,7 +45,7 @@ pub mod sql {
     /// Sans `album_id` sur la ligne, on préfère ne rien résoudre.
     const RECORD_COLS_RESOLUS: &str = "h.id, COALESCE(h.track_id, t.id) as track_id, h.title, \
          h.artist_name, h.album_title, h.source, h.source_id, h.album_id, h.duration_ms, \
-         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position";
+         h.listened_at, h.zone_id, h.context_type, h.context_id, h.context_position, h.cover_url";
 
     /// La jointure qui résout `track_id`, commune aux deux listes.
     const JOINTURE_PISTE: &str = " FROM listen_history h \
@@ -1340,7 +1340,7 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         duration_ms: cols.get(8).and_then(|v| v.as_i64()).unwrap_or(0),
         listened_at: cols.get(9).and_then(|v| v.as_string()),
         zone_id: cols.get(10).and_then(|v| v.as_i64()),
-        cover_url: None,
+        cover_url: cols.get(14).and_then(|v| v.as_string()),
         profile_id: None,
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
@@ -1358,6 +1358,46 @@ mod tests {
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
         HistoryRepo::new(db)
+    }
+
+    #[test]
+    fn historique_4041_restitue_la_pochette_sans_album_local() {
+        let repo = fresh_repo();
+        let mut rec = ecoute_locale_nue("Piste de service", None);
+        rec.source = "qobuz".into();
+        rec.source_id = Some("123456".into());
+        rec.cover_url = Some("https://static.qobuz.com/images/cover.jpg".into());
+        rec.context_type = Some("playlist".into());
+        rec.context_id = Some("playlist-service".into());
+        rec.context_position = Some(3);
+        repo.record(&rec).unwrap();
+
+        let recent = repo.recent(10).unwrap();
+        let (paginated, total) = repo.recent_paginated(10, 0).unwrap();
+        assert_eq!(total, 1);
+        for entry in [&recent[0], &paginated[0]] {
+            assert_eq!(entry.album_id, None);
+            assert_eq!(
+                entry.cover_url, rec.cover_url,
+                "la pochette persistée d'une écoute de streaming a été jetée (#4041)"
+            );
+            assert_eq!(entry.context_type, rec.context_type);
+            assert_eq!(entry.context_id, rec.context_id);
+            assert_eq!(entry.context_position, Some(3));
+        }
+        let mut without_cover = rec.clone();
+        without_cover.cover_url = None;
+        without_cover.title = "Sans pochette".into();
+        repo.record(&without_cover).unwrap();
+        let items = repo.recent(10).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .find(|i| i.title == "Sans pochette")
+                .unwrap()
+                .cover_url,
+            None
+        );
     }
 
     /// Un dépôt ET sa base : résoudre `track_id` demande de vraies pistes.
