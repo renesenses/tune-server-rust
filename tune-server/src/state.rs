@@ -92,6 +92,7 @@ pub struct AppState {
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
     pub rooms: Arc<Mutex<tune_core::collaborative::RoomManager>>,
+    pub upnp_index_lock: Arc<Mutex<()>>,
     pub media_servers: Arc<Mutex<HashMap<String, tune_core::discovery::ssdp::MediaServerInfo>>>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
@@ -469,6 +470,7 @@ impl AppState {
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_phase: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
+            upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),

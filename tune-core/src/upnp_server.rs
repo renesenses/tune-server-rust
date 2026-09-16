@@ -588,9 +588,17 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
             &format!("<SearchCaps>{SEARCH_CAPS}</SearchCaps>"),
         ),
         Some("Search") => search_action_response(state, soap_body),
-        Some("GetSystemUpdateID") => {
-            soap_action_response(CONTENT_DIRECTORY_URN, "GetSystemUpdateID", "<Id>1</Id>")
-        }
+        Some("GetSystemUpdateID") => match crate::db::upnp_revision::read(state.backend.as_ref()) {
+            Ok(id) => soap_action_response(
+                CONTENT_DIRECTORY_URN,
+                "GetSystemUpdateID",
+                &format!("<Id>{id}</Id>"),
+            ),
+            Err(e) => {
+                warn!(error = %e, "upnp_revision_unavailable");
+                soap_fault(501, "Action Failed")
+            }
+        },
         Some(other) => {
             let object_id = parse_content_directory_object_id(soap_body);
             warn!(
@@ -641,6 +649,14 @@ const SEARCH_CAPS: &str = "upnp:class,dc:title,@refID";
 /// La pagination des pistes est celle de `browse_all_tracks`, deja eprouvee —
 /// le client redemande par tranches, exactement comme sur « All Tracks ».
 fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
+    let update_id = match crate::db::upnp_revision::read(state.backend.as_ref()) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "upnp_revision_unavailable");
+            return soap_fault(501, "Action Failed");
+        }
+    };
+
     let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
     if !sort_criteria.trim().is_empty() {
         return soap_fault(709, "Unsupported or invalid sort criteria");
@@ -682,6 +698,10 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
         None => empty_didl(),
     };
 
+    if crate::db::upnp_revision::read(state.backend.as_ref()) != Ok(update_id) {
+        return soap_fault(720, "Cannot process the request: catalog changed");
+    }
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -690,7 +710,7 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
       <Result>{result}</Result>
       <NumberReturned>{returned}</NumberReturned>
       <TotalMatches>{total}</TotalMatches>
-      <UpdateID>1</UpdateID>
+      <UpdateID>{update_id}</UpdateID>
     </u:SearchResponse>
   </s:Body>
 </s:Envelope>"#,
@@ -1412,6 +1432,14 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64, String) {
 }
 
 fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
+    let update_id = match crate::db::upnp_revision::read(state.backend.as_ref()) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "upnp_revision_unavailable");
+            return soap_fault(501, "Action Failed");
+        }
+    };
+
     debug!(body_len = soap_body.len(), "upnp_content_directory_request");
 
     let (object_id, browse_flag, start, count) = parse_browse_request(soap_body);
@@ -1424,6 +1452,10 @@ fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
         browse_metadata(state, &object_id)
     };
 
+    if crate::db::upnp_revision::read(state.backend.as_ref()) != Ok(update_id) {
+        return soap_fault(720, "Cannot process the request: catalog changed");
+    }
+
     let total_matches = didl.total;
     let number_returned = didl.returned;
 
@@ -1435,7 +1467,7 @@ fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
       <Result>{result}</Result>
       <NumberReturned>{returned}</NumberReturned>
       <TotalMatches>{total}</TotalMatches>
-      <UpdateID>1</UpdateID>
+      <UpdateID>{update_id}</UpdateID>
     </u:BrowseResponse>
   </s:Body>
 </s:Envelope>"#,
@@ -2994,6 +3026,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_update_id_soap_suit_le_catalogue() {
+        let state = test_state();
+        let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
+        let browse = corps_browse("0", "BrowseDirectChildren");
+        let search = soap_body("Search", urn).replace("</u:Search>", "<ContainerID>0</ContainerID><SearchCriteria>*</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>100</RequestedCount><SortCriteria></SortCriteria></u:Search>");
+        let mut previous = None;
+        for sql in [
+            "INSERT INTO tracks (id,title) VALUES (87654,'Avant')",
+            "UPDATE tracks SET title = 'Après' WHERE id = 87654",
+            "DELETE FROM tracks WHERE id = 87654",
+        ] {
+            state.backend.execute_batch(sql).unwrap();
+            let value = crate::db::upnp_revision::read(state.backend.as_ref()).unwrap();
+            assert_ne!(
+                previous,
+                Some(value),
+                "la révision suit chaque modification"
+            );
+            previous = Some(value);
+            let get = build_browse_response(&state, &soap_body("GetSystemUpdateID", urn));
+            assert!(
+                get.contains(&format!("<Id>{value}</Id>")),
+                "GetSystemUpdateID figé : {get}"
+            );
+            for request in [browse.clone(), search.clone()] {
+                let response = build_browse_response(&state, &request);
+                assert!(
+                    response.contains(&format!("<UpdateID>{value}</UpdateID>")),
+                    "Browse/Search annonce un compteur périmé : {response}"
+                );
+            }
+        }
+        state
+            .backend
+            .execute_batch("DROP TABLE upnp_catalog_revision")
+            .unwrap();
+        for request in [soap_body("GetSystemUpdateID", urn), browse, search] {
+            assert!(
+                is_soap_fault(&build_browse_response(&state, &request)),
+                "compteur absent : erreur explicite, jamais de valeur inventée"
+            );
+        }
+    }
+
+    #[test]
+    fn system_update_id_refuse_une_page_modifiee_pendant_sa_lecture() {
+        use crate::db::backend::{DbBackend, DbTxHandle, SqlValue, ToSqlValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Une écriture réelle entre les deux lectures du compteur simule un
+        // scanner concurrent, sans minuterie ni dépendance à l'ordonnanceur.
+        struct ConcurrentWriter {
+            db: Arc<dyn DbBackend>,
+            reads: AtomicUsize,
+        }
+        impl DbBackend for ConcurrentWriter {
+            fn engine(&self) -> crate::db::engine::Engine {
+                self.db.engine()
+            }
+            fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+                self.db.execute(sql, p)
+            }
+            fn last_insert_rowid(&self) -> i64 {
+                self.db.last_insert_rowid()
+            }
+            fn query_one(
+                &self,
+                sql: &str,
+                p: &[&dyn ToSqlValue],
+            ) -> Result<Option<Vec<SqlValue>>, String> {
+                self.db.query_one(sql, p)
+            }
+            fn query_many(
+                &self,
+                sql: &str,
+                p: &[&dyn ToSqlValue],
+            ) -> Result<Vec<Vec<SqlValue>>, String> {
+                self.db.query_many(sql, p)
+            }
+            fn execute_batch(&self, sql: &str) -> Result<(), String> {
+                self.db.execute_batch(sql)
+            }
+            fn write_tx(
+                &self,
+                f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+            ) -> Result<(), String> {
+                self.db.write_tx(f)
+            }
+            fn query_one_strong(
+                &self,
+                sql: &str,
+                p: &[&dyn ToSqlValue],
+            ) -> Result<Option<Vec<SqlValue>>, String> {
+                if sql.contains("upnp_catalog_revision")
+                    && self.reads.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    self.db
+                        .execute_batch("INSERT INTO tracks (title) VALUES ('Ajout concurrent')")?;
+                }
+                self.db.query_one_strong(sql, p)
+            }
+        }
+        let search = soap_body("Search", "urn:schemas-upnp-org:service:ContentDirectory:1")
+            .replace(
+                "</u:Search>",
+                "<ContainerID>0</ContainerID><SearchCriteria>*</SearchCriteria></u:Search>",
+            );
+        for request in [corps_browse("0", "BrowseDirectChildren"), search] {
+            let mut state = test_state();
+            state.backend = Arc::new(ConcurrentWriter {
+                db: state.backend,
+                reads: AtomicUsize::new(0),
+            });
+            let response = build_browse_response(&state, &request);
+            assert!(
+                response.contains("<errorCode>720</errorCode>"),
+                "une page modifiée pendant la lecture ne doit pas être publiée : {response}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_browse_soap() {
         let soap = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -3081,6 +3234,8 @@ mod tests {
     fn test_state() -> UpnpState {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
         UpnpState::new(Arc::new(db), 8888, None)
     }
 
@@ -3120,6 +3275,8 @@ mod tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = AlbumRepo::with_backend(backend.clone());
         repo.create(&album_with_genre("Kind of Blue", "Jazz"))
@@ -3306,6 +3463,8 @@ mod tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = AlbumRepo::with_backend(backend.clone());
         for (titre, annee) in [
@@ -4263,7 +4422,10 @@ mod tests {
 
         let update = build_browse_response(&state, &soap_body("GetSystemUpdateID", urn));
         assert!(update.contains("<u:GetSystemUpdateIDResponse"));
-        assert!(update.contains("<Id>1</Id>"));
+        assert!(update.contains(&format!(
+            "<Id>{}</Id>",
+            crate::db::upnp_revision::read(state.backend.as_ref()).unwrap()
+        )));
 
         // `Search` REPOND desormais (#1516) : elle est declaree au SCPD et
         // servie. Ce test attendait un 401 — il encodait l'ancien
@@ -4826,6 +4988,8 @@ mod ssdp_msearch_tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         UpnpState::new(Arc::new(db), 8888, None)
     }
 
@@ -4999,6 +5163,8 @@ mod ssdp_msearch_tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let artist_repo = ArtistRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend.clone());
@@ -6110,6 +6276,8 @@ mod ssdp_msearch_tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let album_repo = AlbumRepo::with_backend(backend.clone());
         let track_repo = TrackRepo::with_backend(backend.clone());

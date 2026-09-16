@@ -45,6 +45,8 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+mod pochettes_upnp;
+pub mod synchronisation_upnp;
 // `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
 // extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
 // peut pas dependre de `tune-server` sans fabriquer un cycle.

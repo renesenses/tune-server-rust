@@ -77,7 +77,7 @@ fn le_banc_et_les_defauts_tiennent_debout() {
 // ── Le serveur ContentDirectory du banc ──────────────────────────────────────
 
 fn enveloppe_soap(didl: &str, nombre: usize) -> axum::response::Response<String> {
-    let echappe = didl
+    let echappe = format!("<DIDL-Lite>{didl}</DIDL-Lite>")
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
