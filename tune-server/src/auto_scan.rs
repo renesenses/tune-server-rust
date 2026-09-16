@@ -54,16 +54,16 @@ pub fn build_track_from_metadata_opts(
 ) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
+    // C1 — le tag fait foi, la forme sert de repli. Même règle que
+    // `scan_import::TrackImporter::import` ; cette voie-ci est celle du
+    // surveillant de fichiers.
     let is_compilation = compilation_override.unwrap_or_else(|| {
-        meta.compilation
-            || meta
-                .album_artist
+        meta.compilation.unwrap_or_else(|| {
+            meta.album_artist
                 .as_deref()
-                .map(|s| s.to_lowercase())
-                .map(|s| {
-                    s == "various artists" || s == "various" || s == "va" || s == "compilations"
-                })
+                .map(crate::scan_import::is_various_artists)
                 .unwrap_or(false)
+        })
     });
 
     let album_artist_name = if is_compilation {
@@ -1769,7 +1769,9 @@ pub fn spawn_file_watcher(
                                     .as_ref()
                                     .and_then(|meta| {
                                         let dir = std::path::Path::new(&sf.path).parent()?;
-                                        let mut comp = meta.compilation;
+                                        // Le TAG, en trois etats (C1).
+                                        let tag = meta.compilation;
+                                        let mut va_tague = false;
                                         let mut artists: std::collections::HashSet<String> =
                                             std::collections::HashSet::new();
                                         // La casse d'origine du premier artiste
@@ -1781,7 +1783,7 @@ pub fn spawn_file_watcher(
                                                 aa.map(str::trim).filter(|s| !s.is_empty())
                                             {
                                                 if crate::scan_import::is_various_artists(a) {
-                                                    comp = true;
+                                                    va_tague = true;
                                                 }
                                                 if artists.insert(a.to_lowercase())
                                                     && premier.is_none()
@@ -1808,7 +1810,11 @@ pub fn spawn_file_watcher(
                                         }
                                         let unique =
                                             if artists.len() == 1 { premier } else { None };
-                                        Some((Some(comp || artists.len() >= 2), unique))
+                                        // C1 : le tag tranche s'il existe ; sinon la forme.
+                                        Some((
+                                            Some(tag.unwrap_or(va_tague || artists.len() >= 2)),
+                                            unique,
+                                        ))
                                     })
                                     .unwrap_or((None, None));
                                 let Some((track, album_id)) = build_track_from_metadata_opts(
