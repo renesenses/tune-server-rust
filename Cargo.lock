@@ -310,9 +310,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.1"
+version = "1.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4342d8937fc7e5dd9b1c60292261c0670c882a2cd1719cfc11b1af41731e32ad"
+checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -320,9 +320,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.42.0"
+version = "0.45.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d9ceb1da931507a12f4fccea479dccd00da1943e1b4ae72d8e502d707361444"
+checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
 dependencies = [
  "cc",
  "cmake",
@@ -3848,9 +3848,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -3913,9 +3913,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -4719,7 +4719,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -5193,7 +5193,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-trait",
  "axum",
@@ -5207,7 +5207,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "axum",
  "bytes",
@@ -5228,7 +5228,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5242,7 +5242,7 @@ dependencies = [
 
 [[package]]
 name = "tune-concerts"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-trait",
  "axum",
@@ -5255,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "ape-decoder",
  "argon2",
@@ -5329,7 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-trait",
  "axum",
@@ -5341,7 +5341,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "axum",
  "serde_json",
@@ -5354,7 +5354,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "axum",
  "reqwest",
@@ -5365,7 +5365,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-trait",
  "axum",
@@ -5378,7 +5378,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-trait",
  "serde",
@@ -5387,7 +5387,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5396,7 +5396,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5452,7 +5452,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "axum",
  "serde",
@@ -5464,7 +5464,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-stream",
  "axum",
@@ -5479,7 +5479,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.149"
+version = "0.9.150"
 dependencies = [
  "async-stream",
  "async-trait",

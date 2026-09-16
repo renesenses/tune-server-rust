@@ -88,6 +88,17 @@ async fn recent_history(
     let offset = p.offset.unwrap_or(0);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     let (items, total) = repo.recent_paginated(limit, offset).unwrap_or_default();
+    let ids: Vec<i64> = items.iter().filter_map(|item| item.id).collect();
+    let names = repo.playlist_context_names(&ids).ou_defaut_journalise();
+    let items: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            let name = item.id.and_then(|id| names.get(&id));
+            let mut value = json!(item);
+            value["context_name"] = json!(name);
+            value
+        })
+        .collect();
     Json(json!({
         "items": items,
         "total": total,
