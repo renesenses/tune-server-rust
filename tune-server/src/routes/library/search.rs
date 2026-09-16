@@ -410,6 +410,27 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     #[cfg(not(feature = "audio-embedding"))]
     let failed = 0_i64;
 
+    // Une piste dont le fichier ne répond pas est reportée, jamais marquée
+    // analysée. Elle sort du travail disponible pendant le même délai que
+    // la requête des candidats, et reste comptée séparément (#4187).
+    #[cfg(feature = "audio-embedding")]
+    let deferred = {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tune_core::audio::embedding_store::deferred_count(
+            &state.backend,
+            &tune_core::library::local_path::deferral_threshold(now),
+        )
+    };
+    #[cfg(not(feature = "audio-embedding"))]
+    let deferred = 0_i64;
+    let total_eligible = eligible;
+    let eligible = (total_eligible - deferred).max(0);
+    let pending = (eligible - processed).max(0);
+    let waiting_reason = (pending == 0 && deferred > 0).then_some("unresolved_paths");
+
     let throttle = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
         .get("audio_embedding_throttle")
         .ok()
@@ -481,14 +502,60 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         "processed_tracks": processed,
         // Traitées sans embedding. L'interface doit les nommer, pas les taire.
         "failed_tracks": failed,
+        // Dénominateur de la passe disponible : les reports temporaires sont à part.
         "eligible_tracks": eligible,
         // Ce qui RESTE à faire, mesuré sur les pistes traitées et non sur les
         // embeddings : sinon les échecs restaient éternellement « en attente »
         // et la jauge ne finissait jamais (#1819).
-        "pending_tracks": (eligible - processed).max(0),
+        "pending_tracks": pending,
+        // Population totale, y compris les chemins temporairement reportés.
+        "total_eligible_tracks": total_eligible,
+        "deferred_tracks": deferred,
+        "waiting_reason": waiting_reason,
         "throttle": throttle,
         // Une requete libre en francais est-elle traduite avant d'atteindre la
         // tour texte ? `false` = elle part brute, et l'ecran doit le dire.
         "translation_available": translation_available,
     }))
+}
+
+#[cfg(all(test, feature = "audio-embedding"))]
+mod acoustic_reports_4187 {
+    use super::*;
+
+    #[tokio::test]
+    async fn la_route_4187_distingue_les_reports_et_les_remet_en_attente_a_expiration() {
+        use tune_core::audio::embedding_store::MODEL_ID;
+        use tune_core::db::{models::Track, track_repo::TrackRepo};
+        use tune_core::library::local_path::{PATH_RETRY_AFTER_SECS, deferral_stamp};
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let tracks = TrackRepo::with_backend(state.backend.clone());
+        let mut track = Track::new("Terminée".into());
+        track.format = Some("flac".into());
+        track.file_path = Some("/missing/finished.flac".into());
+        let finished = tracks.create(&track).unwrap();
+        track.title = "Reportée".into();
+        track.file_path = Some("/missing/deferred.flac".into());
+        let deferred = tracks.create(&track).unwrap();
+        state.backend.execute("INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'audio_embed_analyzed', ?)", &[&finished, &MODEL_ID]).unwrap();
+        let date = deferral_stamp(chrono::Utc::now().timestamp());
+        state.backend.execute("INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'audio_embed_path_unresolved', ?)", &[&deferred, &date]).unwrap();
+        let Json(body) = acoustic_status(State(state.clone())).await;
+        assert_eq!(
+            body["deferred_tracks"], 1,
+            "la route tait la piste reportée et fige la jauge sous 100 % (#4187)"
+        );
+        assert_eq!(body["processed_tracks"], 1);
+        assert_eq!(body["eligible_tracks"], 1);
+        assert_eq!(body["total_eligible_tracks"], 2);
+        assert_eq!(body["pending_tracks"], 0);
+        assert_eq!(body["waiting_reason"], "unresolved_paths");
+        let expired = deferral_stamp(chrono::Utc::now().timestamp() - PATH_RETRY_AFTER_SECS - 60);
+        state.backend.execute("UPDATE track_metadata SET value = ? WHERE track_id = ? AND key = 'audio_embed_path_unresolved'", &[&expired, &deferred]).unwrap();
+        let Json(body) = acoustic_status(State(state)).await;
+        assert_eq!(body["deferred_tracks"], 0);
+        assert_eq!(body["eligible_tracks"], 2);
+        assert_eq!(body["pending_tracks"], 1);
+        assert_eq!(body["waiting_reason"], Value::Null);
+    }
 }
