@@ -5424,6 +5424,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-pont-roon"
+version = "0.9.151"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+ "zip",
+]
+
+[[package]]
 name = "tune-server"
 version = "0.9.151"
 dependencies = [
@@ -5470,6 +5485,7 @@ dependencies = [
  "tune-http-types",
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
+ "tune-pont-roon",
  "tune-smart-http",
  "tune-stream-http",
  "tune-streaming-http",
