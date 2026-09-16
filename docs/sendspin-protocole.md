@@ -4,12 +4,19 @@ Relevé le 08/09/2026 sur `https://github.com/Sendspin/spec`, commit `e0a28529`
 (07/09/2026). Chantier #3326, phase 1. Tout ce qui suit est cité de la
 spécification ou vérifié par requête ; rien n'est déduit.
 
-> **Le dépôt de spécification ne porte AUCUNE licence.**
+> **Constat historique du 08/09/2026 : aucune licence identifiée à cette date.**
 > `https://api.github.com/repos/Sendspin/spec/license` → `404`,
 > `"license": null` sur le dépôt, aucun fichier `LICENSE` à la racine.
 > Les implémentations, elles, sont licenciées (voir § Écosystème).
 > Ce document est une NOTE DE LECTURE : il décrit ce que la spécification
 > demande, il n'en recopie pas le texte.
+
+**Actualisation du 16/09/2026 :** la révision
+[8a8b1cbd6764ea116dcaa07e41544a97bc13080c](https://github.com/Sendspin/spec/tree/8a8b1cbd6764ea116dcaa07e41544a97bc13080c)
+contient désormais `LICENSE.md` (`Community-Spec-1.0`). Les relevés ci-dessous
+restent datés ; le travail S2-b utilise cette révision précise et le suivi
+[3326-sendspin-appairage.md](mesures/3326-sendspin-appairage.md).
+Les anciens noms et formats d'appairage ne constituent donc pas son contrat.
 
 ## 0. Le renversement de vocabulaire, à lire en premier
 
@@ -439,3 +446,115 @@ côté Tune :
 ```
 WARN sendspin_client_hello_en_clair_refuse reglage="TUNE_SENDSPIN_ALLOW_UNENCRYPTED"
 ```
+
+## 13. S2-b : identité, magasin et appairage (16/09/2026)
+
+Intervention : **JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing**.
+
+Cette étape remplace les limites de persistance décrites en 12.3 et 12.4.
+Le serveur charge son identité et les clés longue durée depuis
+`<TuneConfig.db_path>.sendspin/pairing.json`. Le chemin de données résolu
+reste la source de configuration, y compris avec une bibliothèque PostgreSQL.
+Le dossier est dédié ; aucune table ni migration musicale n'est ajoutée.
+
+Le magasin garde un verrou exclusif jusqu'à sa fermeture. Il écrit puis
+synchronise un fichier temporaire, le renomme et synchronise le dossier et
+son parent. Sur Unix, le dossier et les fichiers sont privés (0700/0600).
+Sur Windows, les ACL du dossier de données sont la frontière d'accès ; le
+comportement Windows n'a pas encore été exécuté pour cette étape.
+
+Un document perdu, corrompu, de version inconnue ou inaccessible ne déclenche
+pas de nouvelle identité. Une erreur d'écriture interdit toute réutilisation
+de l'instance jusqu'au rechargement. Le point d'accès renvoie 503 avant la
+mise à niveau WebSocket si le magasin est indisponible.
+
+La poignée initiale choisit la clé longue durée liée au client, sinon la
+sentinelle publique. Un signal de perte de clé ne détruit pas l'appairage.
+Le refus du retour en clair consulte les records persistés avant le registre
+des sessions observées. Il reste donc effectif après redémarrage pour les
+pairs appairés.
+
+`GET /api/v1/devices/sendspin` publie `pairing.available`, l'identité et les
+identifiants publics des pairs appairés. Il ne publie aucune clé privée.
+Le champ `handshaked[].authenticated` décrit une session ayant vérifié une
+clé longue durée ; `psk_category` et `credential_mismatch` distinguent les
+autres cas. Cette observation n'accorde aucun droit de lecture.
+
+Les trois parcours d’appairage sont raccordés aux commandes opérateur décrites en 13.2.
+Aucun appairage de démonstration n'est provisionné au démarrage. Les fixtures
+de tests alimentent seules les records de cette étape. Le serveur n'offre
+toujours aucune activité audio (`playback_supported: false`).
+Les preuves et limites sont dans
+[la mesure S2-b](mesures/3326-sendspin-appairage.md).
+
+### 13.1 Cryptographie des codes, avant branchement des parcours
+
+Le module `sendspin::pake` est désormais présent pour les méthodes par code :
+CPACE-X25519-SHA512 avec confirmation mutuelle, liaison au condensat Noise,
+au compteur d'appairage et au numéro de tour. Les formats statique
+(huit chiffres), dynamique (six chiffres) et QR (vingt-quatre octets) sont
+éprouvés dans les deux suites de chiffrement.
+
+Il ne livre la PSK longue durée qu'après confirmation et, en dynamique,
+vérification de l'engagement du client et du code dérivé des nonces.
+La comparaison numérique et les contre-épreuves sont détaillées dans
+[la mesure S2-b](mesures/3326-sendspin-appairage.md#troisième-étape--cryptographie-des-codes).
+
+Le SDK aiosendspin épinglé omet encore le tour dans son SID d'appairage.
+Les bancs comparent donc ses objets cryptographiques et helpers aux API
+natives, avec le SID de la spécification épinglée ; ils ne valident pas
+son client complet. Le branchement HTTP/WebSocket, les tentatives et les
+reprises sont maintenant éprouvés par le banc décrit en 13.2.
+
+
+### 13.2 Commandes opérateur et parcours WebSocket S2-b
+
+Intervention : **JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing**.
+
+Les commandes suivent la politique administrateur de Tune (`RequireAdmin`).
+Lorsque l’authentification est activée, elles refusent une requête anonyme
+(401) ou un utilisateur sans rôle administrateur (403). La politique LAN de
+Tune reste applicable lorsque l’authentification est désactivée.
+
+| Route sous `/api/v1/devices/sendspin/{client_id}` | Opération |
+| --- | --- |
+| `GET /pair` | état de la connexion et de l’essai, sans clé privée |
+| `POST /pair` | démarrage PSK, code statique, chiffres dynamiques ou QR |
+| `POST /pair/code` | saisie du code demandé |
+| `DELETE /pair` | annulation de l’essai, transport conservé |
+| `DELETE /credentials` | retrait du record durable et révocation de la connexion |
+
+La PSK est écrite avant l’acquittement, puis la connexion passe en clé longue
+durée par un nouvel échange Noise. Un échec d’écriture interdit cette
+promotion. La révocation interrompt également un pair qui ne répond plus
+pendant un échange Noise. Le serveur ne publie aucune activité audio.
+
+Le banc Shrek conduit dix parcours sur le vrai routeur HTTP/WebSocket :
+statique dans chaque suite, chiffres et QR dans chaque suite avec succès ou
+reprise après mauvais code. Chacun vérifie l’attente du geste, l’annulation,
+un nouvel essai, le stockage avant acquittement, la reconnexion LT et la
+révocation. Le client de fixture combine Snow pour Noise, CPace Python et les
+helpers aiosendspin épinglés pour les codes et l’enveloppement des clés.
+Le SID inclut le numéro de tour imposé par la spécification. Ce résultat
+ne prétend pas valider le client aiosendspin complet ni une enceinte réelle.
+
+### 13.3 Refus init et erreurs cryptographiques
+
+La spécification épinglée distingue désormais deux familles de refus :
+
+- Un `client/init` mal formé reçoit `server/error` avec `malformed`, puis
+  la connexion ferme. Une version entière autre que 1 reçoit
+  `unsupported_version`, même si les autres champs sont absents ou invalides.
+  En version 1, la suite est vérifiée avant l’identité : une suite inconnue
+  reçoit `unsupported_suite`.
+- Une erreur ultérieure de Noise, d’authentification du transport ou une
+  trame en clair après Noise provoque une fermeture sans message applicatif.
+
+La validation conserve les octets bruts de l’init pour le prologue Noise ;
+elle tolère les champs d’extension. Les tests couvrent l’émission unique du
+refus, l’ordre de validation, les deux suites et les fermetures silencieuses.
+Les contre-épreuves et limites sont consignées dans la mesure S2-b.
+
+S2-c/S2-d, `OutputTarget` et l’album synchronisé sur deux enceintes restent
+nécessaires pour fermer #3326. Aucune version publiée ni acceptation matérielle
+n’est revendiquée ici.

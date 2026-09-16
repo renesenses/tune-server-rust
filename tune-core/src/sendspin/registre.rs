@@ -48,6 +48,9 @@ pub struct PairVu {
     /// clair sur le réseau local, `client_id` non prouvé, et mode de transition
     /// armé (sans quoi la session n'aurait pas eu lieu).
     pub chiffre: bool,
+    /// Categorie effectivement verifiee sur cette session.
+    pub categorie_psk: Option<super::psk::CategoriePsk>,
+    pub cle_non_reconnue: bool,
     /// Le nom qu'elle donne dans `client/hello` — qui fait foi sur le TXT mDNS.
     pub nom: Option<String>,
     /// Ses rôles versionnés, tels qu'annoncés.
@@ -104,11 +107,9 @@ pub fn pairs_vus() -> Vec<PairVu> {
 /// moyen d'usurper une enceinte connue en écrivant simplement son identifiant
 /// dans un `client/hello`.
 ///
-/// **Ce que cette garde ne couvre pas** : la mémoire du registre s'arrête au
-/// processus, et S2-a ne persiste aucune identité. Un redémarrage de Tune
-/// rouvre donc la fenêtre jusqu'à la prochaine connexion chiffrée du pair. Le
-/// magasin durable, c'est S2-b — l'implémentation de référence s'appuie, elle,
-/// sur son `pairing_store`.
+/// Cette observation reste en memoire. Le point d'acces consulte aussi le
+/// magasin d'appairage durable : un pair appaire reste interdit en clair
+/// apres redemarrage, meme avant sa premiere observation dans ce processus.
 #[must_use]
 pub fn deja_vu_chiffre(client_id: &str) -> bool {
     pairs_vus()
@@ -135,10 +136,14 @@ pub fn decrire() -> Vec<Value> {
                 // mot se filtre mal dans un tableau de bord.
                 "encrypted": p.chiffre,
                 "transport": if p.chiffre { "noise" } else { "clair" },
-                // Chiffre, la PSK Sentinelle est publique : rien n'authentifie
-                // ce pair. En clair, son `client_id` n'est meme plus qu'une
-                // pretention. Dans les deux cas : faux. S2-b s'en charge.
-                "authenticated": false,
+                // Seule une session ayant prouve la PSK longue duree est
+                // authentifiee. La sentinelle publique et le clair ne le sont
+                // pas. Ceci decrit la session observee, pas un droit de lecture.
+                "authenticated": p.chiffre
+                    && p.categorie_psk == Some(super::psk::CategoriePsk::LongueDuree)
+                    && !p.cle_non_reconnue,
+                "psk_category": p.categorie_psk,
+                "credential_mismatch": p.cle_non_reconnue,
                 "playable": false,
             })
         })
@@ -182,6 +187,8 @@ mod tests {
             client_id: id.to_string(),
             suite: Some("25519_ChaChaPoly_SHA256".into()),
             chiffre: true,
+            categorie_psk: Some(crate::sendspin::psk::CategoriePsk::Sentinelle),
+            cle_non_reconnue: false,
             nom: Some("Cuisine".into()),
             roles: vec!["player@v1".into()],
             player_support: None,
@@ -195,6 +202,7 @@ mod tests {
         PairVu {
             suite: None,
             chiffre: false,
+            categorie_psk: None,
             ..pair(id)
         }
     }
