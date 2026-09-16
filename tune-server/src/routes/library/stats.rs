@@ -195,7 +195,8 @@ pub(super) async fn completeness_stats(
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_track' AND value != ''), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'analysis'), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'tag'), \
-         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_indisponible')";
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_indisponible'), \
+         (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'sidecar')";
     let row = b
         .query_one(sql, &[])
         .map_err(AppError::internal)?
@@ -239,6 +240,10 @@ pub(super) async fn completeness_stats(
     let dr_from_analysis = get(14);
     let dr_from_tag = get(15);
     let dr_unavailable = get(16);
+    // Et celles lues dans un `foo_dr.txt` voisin de l'album (#4186) : ni
+    // mesurées par Tune, ni écrites dans le fichier — un troisième
+    // producteur, que la carte Santé doit nommer comme les deux autres.
+    let dr_from_sidecar = get(17);
     // Et celles que la passe REPORTE parce que leur fichier ne répond pas
     // (#1865) : ni faites, ni écartées, ni à faire tant que le disque ne
     // revient pas. Sans ce chiffre la carte Santé les comptait « en attente
@@ -322,6 +327,7 @@ pub(super) async fn completeness_stats(
         "with_dynamic_range": with_dr,
         "dynamic_range_from_analysis": dr_from_analysis,
         "dynamic_range_from_tag": dr_from_tag,
+        "dynamic_range_from_sidecar_file": dr_from_sidecar,
         "dynamic_range_unavailable": dr_unavailable,
         "dynamic_range_deferred": dr_deferred,
         "dynamic_range_pct": if total_tracks > 0 {

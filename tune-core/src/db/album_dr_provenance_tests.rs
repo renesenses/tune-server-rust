@@ -1,4 +1,6 @@
 //! #3924: the aggregate and its provenance use the same contributing rows.
+//! #4186: a third producer, the neighbouring `foo_dr.txt` report, has its own
+//! column — it must never be counted as `unknown`.
 use super::album_repo::AlbumRepo;
 use super::backend::DbBackend;
 use std::sync::Arc;
@@ -21,26 +23,34 @@ fn verify(db: Arc<dyn DbBackend>) {
     assert_eq!(repo.dynamic_range_detail(1).unwrap(), None);
     set(1, "dr_track", "10");
     set(2, "dr_track", "14");
+    // (source piste 1, source piste 2, verdict, (tag, analysis, sidecar, unknown))
     for (a, b, kind, counts) in [
-        ("tag", "tag", "tag", (2, 0, 0)),
-        ("analysis", "analysis", "analysis", (0, 2, 0)),
-        ("tag", "analysis", "mixed", (1, 1, 0)),
-        ("", "analysis", "unknown", (0, 1, 1)),
-        ("future-producer", "tag", "unknown", (1, 0, 1)),
+        ("tag", "tag", "tag", (2, 0, 0, 0)),
+        ("analysis", "analysis", "analysis", (0, 2, 0, 0)),
+        ("tag", "analysis", "mixed", (1, 1, 0, 0)),
+        ("", "analysis", "unknown", (0, 1, 0, 1)),
+        ("future-producer", "tag", "unknown", (1, 0, 0, 1)),
+        // #4186 — le rapport voisin est un producteur CONNU, pas « unknown ».
+        ("sidecar", "sidecar", "sidecar", (0, 0, 2, 0)),
+        ("sidecar", "tag", "mixed", (1, 0, 1, 0)),
+        ("sidecar", "analysis", "mixed", (0, 1, 1, 0)),
+        ("sidecar", "", "unknown", (0, 0, 1, 1)),
     ] {
         set(1, "dr_source", a);
         set(2, "dr_source", b);
         let dr = repo.dynamic_range_detail(1).unwrap().unwrap();
         assert_eq!(dr.valeur, 12);
         assert_eq!(dr.source(), "track_average");
-        assert_eq!(dr.provenance.source, kind);
+        assert_eq!(dr.provenance.source, kind, "sources ({a}, {b})");
         assert_eq!(
             (
                 dr.provenance.tag_tracks,
                 dr.provenance.analysis_tracks,
+                dr.provenance.sidecar_tracks,
                 dr.provenance.unknown_tracks
             ),
-            counts
+            counts,
+            "sources ({a}, {b})"
         );
     }
     db.execute("DELETE FROM track_metadata WHERE key='dr_source'", &[])
@@ -67,9 +77,10 @@ fn verify(db: Arc<dyn DbBackend>) {
         (
             dr.provenance.tag_tracks,
             dr.provenance.analysis_tracks,
+            dr.provenance.sidecar_tracks,
             dr.provenance.unknown_tracks
         ),
-        (0, 0, 0)
+        (0, 0, 0, 0)
     );
     db.execute("DELETE FROM track_metadata", &[]).unwrap();
     set(1, "dr_track", "bad");
