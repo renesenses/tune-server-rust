@@ -336,3 +336,80 @@ absente précisément quand le dossier porte plusieurs artistes, c'est-à-dire d
 où aucune étiquette ne vaut pour tout l'album. Les cinq témoins rouges de l'étape
 intermédiaire sont tous venus de ce repli, `un_coffret_dont_l_album_artist_varie_dans_un_
 dossier_ne_se_coupe_pas_en_deux_3855` compris — le dépôt gardait déjà ce cas.
+
+## 10. Phases 2 à 4 — livrées le 16/09/2026 (« RAF tag compilation : maintenant ! »)
+
+Base `rc/v0.9.151` (qui porte la phase 1). Trois gestes, dans l'ordre des arbitrages.
+
+### 10.1 C3 — le marqueur d'édition manuelle EXISTE
+
+`album_metadata.edition_manuelle` : un tableau JSON trié de noms de champs (`artist`,
+`title`, `genre`, `year`, `label`, et toute clé posée par `PUT /albums/{id}/metadata`).
+Posé par les trois routes d'édition — `PUT /albums/{id}`, `PUT /albums/{id}/metadata`,
+`POST /albums/batch` — au moment où l'utilisateur écrit. Cumulatif, idempotent, lisible par
+`GET /albums/{id}/metadata` sans route dédiée. Le marqueur lui-même ne se force pas par
+la route « metadata » : il dit ce que l'utilisateur a tenu, il n'est pas une valeur qu'il
+tient.
+
+Pas de colonne, pas de migration : le magasin clé-valeur existe sur les deux moteurs.
+
+### 10.2 Phase 4 — la réparation de l'existant, gardée par C3
+
+`GET|POST /library/compilations/reparation` (`routes/library/reparer_compilations.rs`),
+tâche de fond au registre (#2129), 409 si déjà en cours.
+
+Pour chaque album à pistes locales, **sauf ceux dont `artist` ou `is_compilation` est
+tenu par une édition manuelle** :
+
+1. relire le tag `compilation` et l'artiste d'album **dans les fichiers**
+   (`read_metadata`, le lecteur du scan — la base ne garde que le verdict d'alors) ;
+2. C1 : un tag qui parle tranche **dans les deux sens** (un vrai l'emporte sur un faux) ;
+   sinon la forme (un « Various Artists », ou deux artistes d'album distincts dans un même
+   dossier) ;
+3. C2 : compilation ⇒ l'unique artiste d'album tagué, sinon « Various Artists » ; pas
+   compilation ⇒ l'unique artiste tagué s'il y en a exactement un, sinon on n'invente rien ;
+4. n'écrire que si quelque chose change — `AlbumRepo::reparer_compilation`, **la seule porte
+   par laquelle le drapeau peut baisser hors d'un rescan complet** — et le journaliser
+   (`compilation_reparee`, avec `motif`).
+
+Un album dont aucun fichier n'est lisible n'est pas jugé. Le bilan (`repaired`,
+`unchanged`, `manual_skipped`, `unreadable`, `errors`) reste lisible après coup.
+
+Mesuré sur fixture réelle : le coffret de #3855 tel que l'ancienne règle l'a laissé en base
+(« Various Artists », drapeau levé, fichiers à `COMPILATION=0`) ressort **drapeau baissé,
+artiste `Fritz Reiner`** ; une seconde passe n'a plus rien à faire ; le même album marqué
+édité à la main n'est pas touché.
+
+⚠️ Pas encore de bouton dans le client : la route existe, l'écran suit.
+
+### 10.3 C4 — un coffret rangé en dossiers de disques fait UN album
+
+La forme mesurée d'un coffret est `Coffret/CD01/…`, `Coffret/CD02/…`. Elle tombait dans
+« autre dossier = autre édition » (`get_or_create_for_folder_with_track`) : un album par
+disque. Désormais, trois faits ENSEMBLE rattachent `CD02` au coffret que `CD01` a ouvert :
+
+- même titre et même artiste (c'est le candidat déjà trouvé) ;
+- deux **dossiers de disques frères** sous le même parent —
+  `scanner::compilation::sont_des_disques_du_meme_coffret` : un mot de la famille « disque »
+  (`cd`, `disc`, `disk`, `disque`, `vol`, `volume`) puis un nombre, en tête du nom ;
+- un **numéro de disque que l'album n'a pas encore** (`disc_numbers_of`). C'est ce qui
+  sépare un coffret de deux extractions identiques rangées côte à côte : elles se
+  disputent le disque 1.
+
+La pochette n'entre pas dans la règle : 63 disques, 63 pochettes — `COVER_DISTANCE_MAX`
+reste ce qu'il est pour l'autre forme (rangement par artiste, `is_scattered_sibling`), les
+deux formes ne se recouvrent jamais.
+
+Contre-épreuves tenues : seconde extraction (disque 1 déjà pris) ⇒ sa ligne ; frère sans nom
+de disque ⇒ sa ligne ; nom de disque sans numéro de disque dans les balises ⇒ sa ligne ;
+`/CD01` et `/CD02` à la racine ⇒ rien ne les relie.
+
+### 10.4 Ce qui reste
+
+- **Les deux graphies du chef** (réserve 1 de 9.4) : le bruit `BUG_album_artist_mismatch`
+  vient de deux `artist_id` demandés pour un même dossier. Ce n'est pas un défaut visible —
+  la ligne album reste une — mais une normalisation des graphies d'artiste à
+  `get_or_create` reste à faire. Hors de ce lot.
+- **Le client** : bouton « Réparer les compilations » (Métadonnées) et pastille « édité à la
+  main » sur la fiche album.
+- **#3179** reste hors de portée de ce chantier (artiste de repli, pas drapeau).
