@@ -280,6 +280,26 @@ fn spawn_mp3_duration_repair(state: &AppState) {
     });
 }
 
+/// Le nom d'évènement que la sortie OAAT publie dans `derniere_cause_de_connexion`
+/// quand le port accepte la connexion TCP et que l'application se tait
+/// (`CauseDeConnexion::EndpointMuet`, `outputs/oaat/cause_de_connexion.rs`).
+#[cfg(feature = "oaat")]
+const CAUSE_ENDPOINT_MUET: &str = "oaat_endpoint_muet_probablement_deja_tenu";
+
+/// Une relance vieille d'au moins `fenetre` peut être oubliée quand la sortie
+/// se dit saine : le compte des relances consécutives repart de zéro.
+///
+/// Plus jeune que ça, « saine » ne prouve rien — c'est la fenêtre de grâce
+/// que la relance vient d'ouvrir (#3727).
+#[cfg(feature = "oaat")]
+fn relance_assez_ancienne_pour_oublier(
+    derniere_relance: std::time::Instant,
+    maintenant: std::time::Instant,
+    fenetre: std::time::Duration,
+) -> bool {
+    maintenant.duration_since(derniere_relance) >= fenetre
+}
+
 #[cfg(feature = "oaat")]
 fn spawn_oaat_stall_supervisor(state: &AppState) {
     use std::collections::HashMap;
@@ -306,7 +326,7 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
 
             // Collect the device_id + current stall state of every OAAT output,
             // then release the registry lock before doing any stop/play I/O.
-            let mut states: Vec<(String, bool)> = Vec::new();
+            let mut states: Vec<(String, bool, Option<String>)> = Vec::new();
             {
                 let reg = outputs.lock().await;
                 for device_id in reg.list() {
@@ -324,21 +344,54 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                             let paused = snap["paused"].as_bool().unwrap_or(false);
                             let age = snap["last_packet_age_ms"].as_u64().unwrap_or(0);
                             let stalled = playing && !paused && age > STALL_MS;
-                            states.push((device_id.clone(), stalled));
+                            // #3727 — la cause du dernier délai de connexion
+                            // expiré, quand la sortie en a une.
+                            let cause = snap["derniere_cause_de_connexion"]
+                                .as_str()
+                                .map(str::to_owned);
+                            states.push((device_id.clone(), stalled, cause));
                         }
                     }
                 }
             }
 
-            for (device_id, stalled) in states {
+            for (device_id, stalled, cause) in states {
+                let now = Instant::now();
                 if !stalled {
                     // Healthy again → forget any prior restart history so the next
                     // isolated stall starts from a clean consecutive count.
-                    history.remove(&device_id);
+                    //
+                    // #3727 — mais pas avant `MIN_INTERVAL` : une relance remet
+                    // l'horloge de paquet à zéro (`play_media`), donc la sortie
+                    // se dit « saine » pendant les 30 s qui suivent SANS qu'un
+                    // octet ne soit sorti. Oublier l'historique à ce moment-là
+                    // ramenait le compte à `attempt=1` à chaque tour, et
+                    // `MAX_CONSECUTIVE` n'était jamais atteint : 4 relances en
+                    // 3 min sur le .42, toutes « attempt=1 », sans fin.
+                    if history.get(&device_id).is_none_or(|(last, _)| {
+                        relance_assez_ancienne_pour_oublier(*last, now, MIN_INTERVAL)
+                    }) {
+                        history.remove(&device_id);
+                    }
                     continue;
                 }
 
-                let now = Instant::now();
+                // #3727 — un endpoint qui ACCEPTE la connexion et se tait est
+                // probablement tenu par un autre serveur Tune. Relancer ne
+                // libère rien : ça rouvre la même boucle de connexion, qui
+                // repart de zéro et repousse d'autant le moment où elle renonce
+                // et remet son motif à l'écran. On la laisse conclure — elle le
+                // fait en trois verdicts (`SEUIL_DE_VERDICTS_MUETS`) — et on
+                // le dit, au lieu de relancer sans nommer.
+                if cause.as_deref() == Some(CAUSE_ENDPOINT_MUET) {
+                    tracing::warn!(
+                        device_id = %device_id,
+                        cause = CAUSE_ENDPOINT_MUET,
+                        "oaat_stall_supervisor_endpoint_muet_laisse_la_boucle_conclure"
+                    );
+                    continue;
+                }
+
                 let count = match history.get(&device_id) {
                     // Backing off: restarted this device too recently, wait.
                     Some((last, _)) if now.duration_since(*last) < MIN_INTERVAL => continue,
@@ -365,6 +418,7 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                     error!(
                         zone_id,
                         device_id = %device_id,
+                        cause = cause.as_deref().unwrap_or("-"),
                         "oaat_stall_supervisor_giving_up_stopping_zone"
                     );
                     orchestrator.stop(zone_id, Some(&device_id)).await;
@@ -376,6 +430,7 @@ fn spawn_oaat_stall_supervisor(state: &AppState) {
                     zone_id,
                     device_id = %device_id,
                     attempt = count + 1,
+                    cause = cause.as_deref().unwrap_or("-"),
                     "oaat_stall_supervisor_restarting_zone"
                 );
 
@@ -3905,6 +3960,77 @@ mod annonce_slimproto_tests {
             pos_tcp < pos_garde,
             "l'écoute TCP 3483 doit être armée AVANT la garde : sans elle, \
              aucune platine Squeezebox ne peut plus piloter Tune (#2938, #2349)"
+        );
+    }
+}
+
+/// #3727 — le superviseur de stall OAAT ne doit pas relancer en boucle rapide
+/// une zone dont l'endpoint est tenu ailleurs, ni perdre le compte de ses
+/// relances parce que chacune rouvre une fenêtre de grâce.
+#[cfg(all(test, feature = "oaat"))]
+mod superviseur_oaat_3727_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Une relance de 20 s est plus jeune que la fenêtre : la sortie se dit
+    /// « saine » uniquement parce que `play_media` a remis l'horloge de paquet
+    /// à zéro. L'historique se garde. Passé la fenêtre, il s'oublie.
+    #[test]
+    fn une_relance_plus_jeune_que_la_fenetre_garde_l_historique() {
+        let fenetre = Duration::from_secs(60);
+        let relance = Instant::now();
+        assert!(!relance_assez_ancienne_pour_oublier(
+            relance,
+            relance + Duration::from_secs(20),
+            fenetre
+        ));
+        assert!(!relance_assez_ancienne_pour_oublier(
+            relance,
+            relance + Duration::from_secs(59),
+            fenetre
+        ));
+        assert!(relance_assez_ancienne_pour_oublier(
+            relance,
+            relance + Duration::from_secs(60),
+            fenetre
+        ));
+    }
+
+    /// Le mot que le superviseur cherche est celui que la sortie publie : une
+    /// dérive de l'un ou de l'autre rendrait le chemin « laisse conclure »
+    /// inatteignable, et le superviseur relancerait de nouveau sans nommer.
+    #[test]
+    fn le_superviseur_lit_le_meme_evenement_que_la_sortie_publie() {
+        assert_eq!(
+            CAUSE_ENDPOINT_MUET,
+            tune_core::outputs::oaat::CauseDeConnexion::EndpointMuet.evenement()
+        );
+    }
+
+    /// Le chemin « laisse conclure » est bien BRANCHÉ dans la boucle du
+    /// superviseur, avant toute relance — un `const` défini et jamais comparé
+    /// ne garderait rien.
+    #[test]
+    fn le_chemin_endpoint_muet_precede_la_relance_dans_le_superviseur() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find(concat!(
+                "fn spawn_oaat_stall_",
+                "supervisor(state: &AppState"
+            ))
+            .expect("la fonction doit exister");
+        let corps = &source[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("la fonction doit se fermer")];
+        let pos_muet = corps
+            .find(concat!("Some(CAUSE_", "ENDPOINT_MUET)"))
+            .expect("le superviseur doit comparer la cause à l'endpoint muet (#3727)");
+        let pos_relance = corps
+            .find(concat!("\"oaat_stall_supervisor_", "restarting_zone\""))
+            .expect("la relance doit exister");
+        assert!(
+            pos_muet < pos_relance,
+            "la cause « endpoint muet » doit être lue AVANT la relance, sinon le \
+             superviseur relance encore en boucle sans la nommer (#3727)"
         );
     }
 }

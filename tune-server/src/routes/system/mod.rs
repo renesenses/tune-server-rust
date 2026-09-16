@@ -11,11 +11,17 @@ mod config_backup;
 mod convert;
 mod database;
 pub(crate) mod diagnostics;
-mod enrich;
+// `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
+// compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
+// pour épuiser le quota comme le serveur le compte.
+pub(crate) mod enrich;
 /// Périmètre de l'explorateur de dossiers (#1275).
 pub(crate) mod explorateur;
+mod import_pont_roon;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
+// #2507 : et par `/library/artwork/enrich*` — le bouton « Enrichir les images
+// artistes » était le dernier geste manuel sans garde.
 pub(crate) use enrich::gate_enrichment;
 // Même partage, même raison, pour la PORTÉE par répertoire (#1660) : les deux
 // routes d'enrichissement doivent valider un `path` à l'identique — refus des
@@ -24,6 +30,8 @@ pub(crate) use enrich::gate_enrichment;
 // finirait par diverger, et un repli silencieux enrichirait justement ce que
 // l'utilisateur voulait épargner.
 pub(crate) use enrich::resoudre_portee;
+/// #4185 — le geste qui LANCE la mesure de la plage dynamique, et sa jauge.
+mod dynamic_range;
 mod import;
 mod playlist_hub;
 mod plugins;
@@ -93,6 +101,18 @@ pub fn router() -> Router<AppState> {
         // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
         // de cette route.
         .route("/replaygain/progress", get(replaygain::replaygain_progress))
+        // #4185 — la plage dynamique n'avait AUCUN geste : sa mesure était le
+        // troisième rang de la cascade de fond, après le ReplayGain et les
+        // empreintes. Le `POST` la lance tout de suite (202 / 409), le `GET`
+        // est le pendant de `/replaygain/progress`.
+        .route(
+            "/dynamic-range/analyze",
+            post(dynamic_range::dynamic_range_analyze),
+        )
+        .route(
+            "/dynamic-range/progress",
+            get(dynamic_range::dynamic_range_progress),
+        )
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
         // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit

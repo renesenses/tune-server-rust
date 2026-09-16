@@ -427,6 +427,121 @@ impl PositionPoller {
         false
     }
 
+    /// #4173 — à la fin prononcée à l'HORLOGE, ce que l'on sait de
+    /// l'enchaînement : le verdict, le flux armé (s'il en est un), les octets
+    /// que le renderer en a tirés.
+    ///
+    /// Trois lectures, aucune écriture : le flux rangé sous la zone à
+    /// l'armement (`flux_pre_arme`), ses octets servis, et l'URI que le
+    /// renderer rapporte jouer. Voir `decisions::enchainement_sur_le_flux_arme`.
+    pub(super) async fn enchainement_a_l_horloge(
+        &self,
+        zone_id: i64,
+        is_dlna: bool,
+        gapless_sent: bool,
+        status: &OutputStatus,
+    ) -> (decisions::EnchainementArme, Option<String>, Option<u64>) {
+        if !is_dlna || !gapless_sent {
+            return (decisions::EnchainementArme::Aucun, None, None);
+        }
+        let flux_arme = self.orchestrator.flux_pre_arme(zone_id).await;
+        let octets_tires = match flux_arme.as_deref() {
+            Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
+            None => None,
+        };
+        let verdict = decisions::enchainement_sur_le_flux_arme(
+            is_dlna,
+            gapless_sent,
+            flux_arme.as_deref(),
+            status.current_uri.as_deref(),
+            octets_tires,
+        );
+        (verdict, flux_arme, octets_tires)
+    }
+
+    /// #4173 — la fin à l'horloge ADOPTE l'enchaînement du renderer.
+    ///
+    /// Même avance que `gapless_transition_detected` (`advance_queue_metadata`,
+    /// qui fait adopter le flux pré-armé à la zone, #3442) : ni
+    /// `SetAVTransportURI`, ni `Play`, ni `stream_session_removed` sur le flux
+    /// que le renderer tire. L'adoption est PROVISOIRE tant que le renderer
+    /// n'a pas donné signe de vie sur la piste adoptée : `adoption_horloge`
+    /// la surveille (`decisions::suite_de_l_adoption`), et le repli
+    /// `SetAVTransportURI` + `Play` reprend — sur la piste adoptée — si rien
+    /// ne vient dans `ADOPTION_HORLOGE_DELAI_SECS`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn adopter_l_enchainement_a_l_horloge(
+        &self,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+        status: &OutputStatus,
+        ps: &mut ZonePollState,
+        flux: String,
+        preuve: decisions::EnchainementArme,
+        octets_tires: Option<u64>,
+        track_duration_ms: u64,
+        wall_elapsed: u64,
+    ) {
+        info!(
+            zone_id,
+            position_ms = status.position_ms,
+            track_dur = track_duration_ms,
+            wall_secs = wall_elapsed,
+            past_end_ticks = ps.past_end_ticks,
+            stream_id = %flux,
+            uri = ?status.current_uri,
+            octets_tires = ?octets_tires,
+            preuve = ?preuve,
+            arm_to_advance_ms = ps
+                .gapless_sent_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0),
+            "gapless_adoption_a_l_horloge"
+        );
+        ps.gapless_sent = false;
+        ps.gapless_sent_at = None;
+        let arme_avant = ps.gapless_armed.take();
+        ps.peak_position_ms = 0;
+        ps.last_position_ms = 0;
+        ps.last_bytes_sent = 0;
+        ps.playing_stall_ticks = 0;
+        ps.stall_declines = 0;
+        ps.track_started_at = Some(Instant::now());
+        ps.stopped_ticks = 0;
+        ps.past_end_ticks = 0;
+        ps.gapless_advance_pending = false;
+        ps.gapless_stuck_ticks = 0;
+        ps.gapless_arm_logged = None;
+        ps.gapless_dsd_skip_pos = None;
+        ps.transition(fsm::Transition::TransitionDetectee);
+        match self
+            .position_a_avancer(zone_id, zone_state, arme_avant)
+            .await
+        {
+            Some(next_pos) => {
+                info!(zone_id, next_pos, "gapless_advance_metadata");
+                if let Err(e) = self
+                    .orchestrator
+                    .advance_queue_metadata(zone_id, next_pos)
+                    .await
+                {
+                    warn!(zone_id, error = %e, "gapless_advance_failed");
+                }
+                ps.gapless_cooldown = 4;
+                ps.scrobbled_key = None;
+                ps.adoption_horloge = Some(AdoptionHorloge {
+                    depuis: Instant::now(),
+                    position_figee_ms: status.position_ms,
+                    flux,
+                    preuve,
+                });
+            }
+            None => {
+                self.handle_track_end(zone_id, zone_state).await;
+            }
+        }
+    }
+
     pub(super) async fn resolve_gapless_next(
         &self,
         zone_id: i64,

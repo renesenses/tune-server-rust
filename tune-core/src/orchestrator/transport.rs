@@ -359,12 +359,33 @@ impl PlaybackOrchestrator {
         self.playback.set_resolving(req.zone_id, true).await;
 
         let (resolved, resolve_ms) =
-            match self.resoudre_la_demande(&req, play_start, play_gen).await? {
-                ResoluOuFini::Resolu {
+            match self.resoudre_la_demande(&req, play_start, play_gen).await {
+                Ok(ResoluOuFini::Resolu {
                     resolved,
                     resolve_ms,
-                } => (resolved, resolve_ms),
-                ResoluOuFini::Fini(resultat) => return Ok(resultat),
+                }) => (resolved, resolve_ms),
+                Ok(ResoluOuFini::Fini(resultat)) => return Ok(resultat),
+                Err(e) => {
+                    // La lecture n'a jamais démarré : la zone doit être
+                    // rendue dans l'état où on l'a trouvée. Le bump de
+                    // génération ci-dessus est défait — sauf si une lecture
+                    // plus récente a pris la main entre-temps — et l'échec
+                    // s'écrit, ce que `next` faisait déjà et pas `play`
+                    // (#4235 : « no url » Qobuz, la piste précédente jouait
+                    // encore et la zone a été « rattrapée » comme figée).
+                    let retablie = self
+                        .playback
+                        .restore_generation_after_failed_play(req.zone_id, play_gen)
+                        .await;
+                    warn!(
+                        zone_id = req.zone_id,
+                        error = %e,
+                        generation_retablie = retablie,
+                        ancienne_session = ?old_stream_id,
+                        "play_resolution_failed"
+                    );
+                    return Err(e);
+                }
             };
 
         let habillage = Habillage {
@@ -1806,10 +1827,44 @@ impl PlaybackOrchestrator {
                 );
                 return;
             };
-            match output.lock().await.checked_seek(position_ms).await {
+            let sortie = output.lock().await;
+            match sortie.checked_seek(position_ms).await {
                 Ok(()) => {
                     info!(zone_id, position_ms, motif, "seek_apres_reprise_envoye");
                     playback.seek(zone_id, position_ms as i64).await;
+                    // Fabien, fil 1780 (Devialet, renderer Rygel, 16/09/2026) :
+                    // « je perds le contrôle de la lecture, impossible de faire
+                    // pause ». Son journal montre deux `seek_apres_reprise_envoye`
+                    // à la MÊME position (80 741 ms) à 66 s d'intervalle : le
+                    // seek partait, et la position ne bougeait plus. Un Seek
+                    // reçu alors que le renderer est encore en
+                    // `PAUSED_PLAYBACK` — le Play envoyé 700 ms plus tôt n'a
+                    // pas encore pris — le laisse en pause : c'est le contrat
+                    // UPnP, pas un défaut du Devialet. Tune, lui, se croyait en
+                    // lecture, et chaque clic rejouait la même séquence.
+                    //
+                    // On relit donc l'état APRÈS le seek, et s'il est resté en
+                    // pause, on renvoie Play. Un renderer qui a bien repris
+                    // rend Playing et n'entend rien de plus.
+                    if let Ok(statut) = sortie.get_status().await
+                        && statut.state == crate::outputs::TransportState::Paused
+                    {
+                        match sortie.checked_resume().await {
+                            Ok(()) => info!(
+                                zone_id,
+                                position_ms,
+                                motif,
+                                "seek_apres_reprise_relance_play_renderer_reste_en_pause"
+                            ),
+                            Err(e) => warn!(
+                                zone_id,
+                                position_ms,
+                                motif,
+                                error = %e,
+                                "seek_apres_reprise_relance_play_echouee"
+                            ),
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(zone_id, position_ms, motif, error = %e, "seek_apres_reprise_echoue")
@@ -1825,12 +1880,8 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return false;
         }
-        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
-            .get(&format!("ir_path_{zone_id}"))
-            .ok()
-            .flatten()
-            .map(|p| !p.is_empty() && std::path::Path::new(&p).exists())
-            .unwrap_or(false)
+        self.chemin_ir_configure(zone_id)
+            .is_some_and(|p| std::path::Path::new(&p).exists())
     }
 
     /// Durée de la rampe anti-« ploc » à la pause, à la reprise et à l'arrêt
@@ -1922,9 +1973,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         titre: &str,
         position_ms: Option<u64>,
-        cause: Option<&str>,
+        message: String,
     ) -> OutputCommandError {
-        let message = message_session_perdue(titre, position_ms, cause);
         // `?position_ms` et non `position_ms` : le journal doit distinguer
         // `Some(137000)` de `None`, pas écrire un `0` de plus (#3244).
         warn!(zone_id, ?position_ms, %message, "resume_stream_session_lost");
@@ -1934,6 +1984,9 @@ impl PlaybackOrchestrator {
                 serde_json::json!({
                     "zone_id": zone_id,
                     "error": message.clone(),
+                    "code": "stream_session_lost",
+                    "title": titre,
+                    "position_ms": position_ms,
                     "fatal": true,
                 }),
             );
@@ -1994,6 +2047,21 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn resume(&self, zone_id: i64, device_id: Option<&str>) -> OutputCommandResult<()> {
+        self.resume_with_session_error_message(zone_id, device_id, message_session_perdue)
+            .await
+    }
+
+    /// Resume with the caller's translation for a lost stream session (#4193).
+    ///
+    /// HTTP knows the requested language; the core and other callers do not.
+    /// Format once, at the failure, so the HTTP error and broadcast event agree.
+    /// The formatter never changes the recovery decision or the saved position.
+    pub async fn resume_with_session_error_message(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
+    ) -> OutputCommandResult<()> {
         // Position is preserved across pause (playback state isn't reset), so we
         // know where to resume from.
         let state = self.playback.get_state(zone_id).await;
@@ -2140,7 +2208,7 @@ impl PlaybackOrchestrator {
                                     zone_id,
                                     &np.title,
                                     position_mesuree,
-                                    Some(&e),
+                                    session_message(&np.title, position_mesuree, Some(&e)),
                                 ));
                             }
                         }
@@ -2151,7 +2219,7 @@ impl PlaybackOrchestrator {
                             zone_id,
                             &np.title,
                             position_mesuree,
-                            None,
+                            session_message(&np.title, position_mesuree, None),
                         ));
                     }
                     // Radio dont on ne connaît aucune sortie : repli inchangé sur

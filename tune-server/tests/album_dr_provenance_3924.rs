@@ -56,7 +56,7 @@ async fn i3924_api_exposes_the_actual_mixed_average_then_album_tag() {
     assert_eq!(v["dynamic_range_source"], "track_average");
     assert_eq!(
         v["dynamic_range_provenance"],
-        json!({"source":"mixed","tag_tracks":1,"analysis_tracks":1,"unknown_tracks":0})
+        json!({"source":"mixed","tag_tracks":1,"analysis_tracks":1,"sidecar_tracks":0,"unknown_tracks":0})
     );
     s.backend
         .execute(
@@ -69,7 +69,7 @@ async fn i3924_api_exposes_the_actual_mixed_average_then_album_tag() {
     assert_eq!(v["dynamic_range_source"], "album_tag");
     assert_eq!(
         v["dynamic_range_provenance"],
-        json!({"source":"tag","tag_tracks":0,"analysis_tracks":0,"unknown_tracks":0})
+        json!({"source":"tag","tag_tracks":0,"analysis_tracks":0,"sidecar_tracks":0,"unknown_tracks":0})
     );
 }
 #[tokio::test]
@@ -87,6 +87,30 @@ async fn i3924_api_distinguishes_no_measurement_from_unknown_origin() {
     let v = detail(&s).await;
     assert_eq!(
         v["dynamic_range_provenance"],
-        json!({"source":"unknown","tag_tracks":0,"analysis_tracks":0,"unknown_tracks":1})
+        json!({"source":"unknown","tag_tracks":0,"analysis_tracks":0,"sidecar_tracks":0,"unknown_tracks":1})
+    );
+}
+/// #4186 — le rapport `foo_dr.txt` voisin est un TROISIEME producteur, et la
+/// fiche d'album le nomme : `sidecar`, dans sa propre colonne, jamais `unknown`.
+#[tokio::test]
+async fn i4186_api_names_the_sidecar_report_as_a_known_producer() {
+    let s = state();
+    for (id, dr, source) in [(1_i64, "10", "sidecar"), (2, "12", "sidecar")] {
+        for (key, value) in [("dr_track", dr), ("dr_source", source)] {
+            s.backend
+                .execute(
+                    "INSERT INTO track_metadata (track_id,key,value) VALUES (?,?,?)",
+                    &[&id, &key, &value],
+                )
+                .unwrap();
+        }
+    }
+    let v = detail(&s).await;
+    assert_eq!(v["dynamic_range"], "11");
+    assert_eq!(v["dynamic_range_source"], "track_average");
+    assert_eq!(
+        v["dynamic_range_provenance"],
+        json!({"source":"sidecar","tag_tracks":0,"analysis_tracks":0,"sidecar_tracks":2,"unknown_tracks":0}),
+        "#4186 : deux pistes lues dans foo_dr.txt, et l'agregat le DIT"
     );
 }

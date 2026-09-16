@@ -7,6 +7,16 @@ pub struct AudioLevels {
     pub rms_right: f64,
     pub peak_left: f64,
     pub peak_right: f64,
+    /// Plus longue suite d'échantillons **consécutifs à pleine échelle** dans
+    /// la fenêtre, par canal. C'est la seule mesure de surcharge qu'un flux
+    /// PCM entier permet : `peak_*` est borné à 0 dBFS par construction
+    /// (`|raw| ≤ 2^(n−1)`), donc « crête > 0 dBFS » n'arrive jamais et le
+    /// témoin rouge du client ne pouvait pas s'allumer (#4175, GgB, fil 1797).
+    /// Un enregistreur DAT allume son OVER sur une suite d'échantillons à
+    /// pleine échelle, pas sur une valeur impossible : même règle ici, voir
+    /// [`OVER_RUN_SAMPLES`].
+    pub over_run_left: u32,
+    pub over_run_right: u32,
     pub spectrum: Vec<f32>,
     /// Niveau ABSOLU de chaque bande, en dBFS.
     ///
@@ -53,7 +63,25 @@ pub struct AudioLevels {
     pub window: std::time::Duration,
 }
 
+/// Nombre d'échantillons consécutifs à pleine échelle à partir duquel on
+/// parle de surcharge. Trois, comme le témoin OVER des DAT Sony que le style
+/// « dat » du crête-mètre imite : un seul échantillon à pleine échelle est
+/// une crête légitime d'un master limité à 0,0 dBFS ; trois d'affilée, c'est
+/// un sommet aplati — de l'écrêtage, ou une limitation dure qui en a la
+/// forme.
+pub const OVER_RUN_SAMPLES: u32 = 3;
+
 impl AudioLevels {
+    /// Surcharge constatée sur le canal gauche dans cette fenêtre.
+    pub fn over_left(&self) -> bool {
+        self.over_run_left >= OVER_RUN_SAMPLES
+    }
+
+    /// Surcharge constatée sur le canal droit dans cette fenêtre.
+    pub fn over_right(&self) -> bool {
+        self.over_run_right >= OVER_RUN_SAMPLES
+    }
+
     pub fn rms_left_db(&self) -> f32 {
         to_db(self.rms_left)
     }
@@ -395,6 +423,13 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
     let mut peak_l: f64 = 0.0;
     let mut peak_r: f64 = 0.0;
     let mut frames: usize = 0;
+    // Pleine échelle, du côté positif : (2^(n−1) − 1) / 2^(n−1). Le côté
+    // négatif atteint −1,0 exactement ; `>=` couvre les deux (#4175).
+    let pleine_echelle = pleine_echelle_normalisee(bit_depth);
+    let mut suite_l: u32 = 0;
+    let mut suite_r: u32 = 0;
+    let mut over_l: u32 = 0;
+    let mut over_r: u32 = 0;
 
     let stereo = channels >= 2;
 
@@ -410,6 +445,18 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
         sum_sq_r += right * right;
         peak_l = peak_l.max(left.abs());
         peak_r = peak_r.max(right.abs());
+        suite_l = if left.abs() >= pleine_echelle {
+            suite_l + 1
+        } else {
+            0
+        };
+        suite_r = if right.abs() >= pleine_echelle {
+            suite_r + 1
+        } else {
+            0
+        };
+        over_l = over_l.max(suite_l);
+        over_r = over_r.max(suite_r);
         frames += 1;
     }
 
@@ -426,6 +473,8 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
         rms_right: (sum_sq_r / frames as f64).sqrt(),
         peak_left: peak_l,
         peak_right: peak_r,
+        over_run_left: over_l,
+        over_run_right: over_r,
         spectrum_db: spectrum.db,
         spectrum_hz: spectrum.hz,
         spectrum_fft_size: spectrum.fft_size,
@@ -439,6 +488,17 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
             std::time::Duration::ZERO
         },
     }
+}
+
+/// Le seuil « pleine échelle » dans l'unité de [`read_sample`] : l'échantillon
+/// positif le plus haut représentable, normalisé. Hors 16-32 bits,
+/// `read_sample` rend 0 : le seuil est alors inatteignable.
+fn pleine_echelle_normalisee(bit_depth: u16) -> f64 {
+    if !(16..=32).contains(&bit_depth) {
+        return f64::INFINITY;
+    }
+    let max_val = (1i64 << (bit_depth - 1)) as f64;
+    (max_val - 1.0) / max_val
 }
 
 fn read_sample(frame: &[u8], offset: usize, bytes: usize, bit_depth: u16) -> f64 {
@@ -1263,5 +1323,88 @@ mod tests {
             "axe perdu : {:?}",
             &s.hz[..]
         );
+    }
+}
+
+/// #4175 — la surcharge d'un flux PCM entier ne se lit pas sur `peak_*`
+/// (borné à 0 dBFS par construction) mais sur les échantillons consécutifs
+/// à pleine échelle. Ces témoins fixent la règle et son seuil.
+#[cfg(test)]
+mod tests_over_pleine_echelle_4175 {
+    use super::*;
+
+    /// Stéréo 16 bits : `gauche` et `droite` sont des suites d'échantillons
+    /// bruts, écrites telles quelles.
+    fn pcm_16(gauche: &[i16], droite: &[i16]) -> Vec<u8> {
+        assert_eq!(gauche.len(), droite.len());
+        let mut out = Vec::with_capacity(gauche.len() * 4);
+        for (l, r) in gauche.iter().zip(droite) {
+            out.extend_from_slice(&l.to_le_bytes());
+            out.extend_from_slice(&r.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn la_crete_ne_depasse_jamais_zero_dbfs_meme_a_pleine_echelle() {
+        let pcm = pcm_16(&[i16::MAX; 8], &[i16::MIN; 8]);
+        let lvl = compute_levels(&pcm, 16, 2, 44_100);
+        assert!(lvl.peak_left_db() <= 0.0, "{}", lvl.peak_left_db());
+        assert!(lvl.peak_right_db() <= 0.0, "{}", lvl.peak_right_db());
+        // Donc « rouge si crête > 0 » ne s'allumerait jamais : c'est le
+        // défaut. Ce que la fenêtre SAIT dire, c'est la suite à pleine échelle.
+        assert_eq!(lvl.over_run_left, 8);
+        assert_eq!(lvl.over_run_right, 8);
+        assert!(lvl.over_left() && lvl.over_right());
+    }
+
+    #[test]
+    fn un_seul_echantillon_a_pleine_echelle_est_une_crete_pas_une_surcharge() {
+        let g = [0, 1000, i16::MAX, 1000, 0, -20_000, i16::MIN, -20_000];
+        let pcm = pcm_16(&g, &[0; 8]);
+        let lvl = compute_levels(&pcm, 16, 2, 44_100);
+        assert_eq!(lvl.over_run_left, 1);
+        assert!(
+            !lvl.over_left(),
+            "un master limité à 0,0 dBFS n'est pas en surcharge"
+        );
+        assert_eq!(lvl.over_run_right, 0);
+    }
+
+    #[test]
+    fn trois_echantillons_consecutifs_allument_le_temoin_deux_non() {
+        let deux = [0, i16::MAX, i16::MAX, 0, i16::MAX, i16::MAX, 0, 0];
+        let lvl = compute_levels(&pcm_16(&deux, &[0; 8]), 16, 2, 44_100);
+        assert_eq!(lvl.over_run_left, 2);
+        assert!(!lvl.over_left());
+
+        let trois = [0, i16::MAX, i16::MAX, i16::MAX, 0, 0, 0, 0];
+        let lvl = compute_levels(&pcm_16(&trois, &[0; 8]), 16, 2, 44_100);
+        assert_eq!(lvl.over_run_left, OVER_RUN_SAMPLES);
+        assert!(lvl.over_left());
+        assert!(!lvl.over_right());
+    }
+
+    #[test]
+    fn un_sommet_aplati_du_cote_negatif_compte_aussi() {
+        let g = [0, i16::MIN, i16::MIN, i16::MIN, i16::MIN, 0, 0, 0];
+        let lvl = compute_levels(&pcm_16(&g, &[0; 8]), 16, 2, 44_100);
+        assert_eq!(lvl.over_run_left, 4);
+        assert!(lvl.over_left());
+    }
+
+    #[test]
+    fn a_un_lsb_sous_la_pleine_echelle_rien_ne_compte() {
+        let g = [i16::MAX - 1; 8];
+        let lvl = compute_levels(&pcm_16(&g, &[0; 8]), 16, 2, 44_100);
+        assert_eq!(lvl.over_run_left, 0);
+        assert!(!lvl.over_left());
+    }
+
+    #[test]
+    fn le_seuil_suit_la_profondeur() {
+        assert!((pleine_echelle_normalisee(16) - 32767.0 / 32768.0).abs() < 1e-12);
+        assert!((pleine_echelle_normalisee(24) - 8_388_607.0 / 8_388_608.0).abs() < 1e-12);
+        assert!(pleine_echelle_normalisee(8).is_infinite());
     }
 }

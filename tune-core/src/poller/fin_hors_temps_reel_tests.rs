@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Sortie {
     status: Arc<std::sync::Mutex<OutputStatus>>,
+    progress: Arc<std::sync::Mutex<Option<u64>>>,
     stops: Arc<AtomicUsize>,
 }
 
@@ -45,6 +46,9 @@ impl OutputTarget for Sortie {
     async fn get_status(&self) -> Result<OutputStatus, String> {
         Ok(self.status.lock().unwrap().clone())
     }
+    async fn processing_progress_bytes(&self) -> Option<u64> {
+        *self.progress.lock().unwrap()
+    }
     async fn is_available(&self) -> bool {
         true
     }
@@ -53,6 +57,7 @@ impl OutputTarget for Sortie {
 struct Banc {
     poller: PositionPoller,
     status: Arc<std::sync::Mutex<OutputStatus>>,
+    progress: Arc<std::sync::Mutex<Option<u64>>>,
     stops: Arc<AtomicUsize>,
     zone: i64,
     polls: HashMap<i64, ZonePollState>,
@@ -77,9 +82,11 @@ impl Banc {
             ..Default::default()
         }));
         let stops = Arc::new(AtomicUsize::new(0));
+        let progress = Arc::new(std::sync::Mutex::new(None));
         let outputs = Arc::new(Mutex::new(OutputRegistry::new()));
         outputs.lock().await.register(Box::new(Sortie {
             status: status.clone(),
+            progress: progress.clone(),
             stops: stops.clone(),
         }));
         let playback = Arc::new(crate::playback::PlaybackManager::new());
@@ -118,6 +125,7 @@ impl Banc {
         Self {
             poller,
             status,
+            progress,
             stops,
             zone,
             polls: HashMap::from([(zone, ps)]),
@@ -131,6 +139,71 @@ impl Banc {
                 .await;
         }
     }
+}
+
+#[tokio::test]
+async fn le_sondeur_transmet_les_octets_au_detecteur_hors_temps_reel() {
+    let mut b = Banc::new(false, 239_999).await;
+    *b.progress.lock().unwrap() = Some(100);
+    b.ticks(1).await;
+    let avant = b.poller.playback.get_state(b.zone).await;
+    assert_eq!(avant.progression_hors_temps_reel.unwrap().0, 100);
+
+    *b.progress.lock().unwrap() = Some(200);
+    b.ticks(1).await;
+    let mut apres = b.poller.playback.get_state(b.zone).await;
+    assert_eq!(
+        apres.position_ms, avant.position_ms,
+        "la position reste plafonnée"
+    );
+    assert_eq!(apres.progression_hors_temps_reel.unwrap().0, 200);
+    apres.derniere_avance_de_position = Instant::now().checked_sub(Duration::from_secs(643));
+    assert!(!crate::playback::zone_figee(
+        &apres,
+        Duration::from_secs(600)
+    ));
+
+    // Neither losing the byte measurement nor polling the same count again
+    // creates fake progress. The last real observation must age normally.
+    let stamp = apres.progression_hors_temps_reel.unwrap().1;
+    *b.progress.lock().unwrap() = None;
+    b.ticks(2).await;
+    assert_eq!(
+        b.poller
+            .playback
+            .get_state(b.zone)
+            .await
+            .progression_hors_temps_reel
+            .unwrap()
+            .1,
+        stamp
+    );
+
+    {
+        let mut status = b.status.lock().unwrap();
+        status.state = TransportState::Stopped;
+        status.ended_naturally = true;
+    }
+    b.ticks(1).await;
+    assert_eq!(
+        b.poller.playback.get_state(b.zone).await.state,
+        PlayState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn le_sondeur_ignore_les_octets_d_une_sortie_temps_reel() {
+    let mut b = Banc::new(true, 1_000).await;
+    *b.progress.lock().unwrap() = Some(200);
+    b.ticks(1).await;
+    assert!(
+        b.poller
+            .playback
+            .get_state(b.zone)
+            .await
+            .progression_hors_temps_reel
+            .is_none()
+    );
 }
 
 #[tokio::test]

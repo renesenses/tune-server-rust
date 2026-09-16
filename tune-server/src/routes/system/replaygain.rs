@@ -55,11 +55,25 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         (0, 0)
     };
 
+    // Pistes tenues à l'écart parce que leur fichier ne répond pas (#1865).
+    // Elles ne sont ni dans `total` ni dans `processed` : sans ce champ, une
+    // bibliothèque entière sur un partage démonté se lisait « terminée »
+    // (#4254). `waiting_reason` ne s'allume que si c'est la SEULE chose qui
+    // reste — même contrat que `/library/search/acoustic/status` (#4187).
+    let deferred = if enabled {
+        tune_core::audio::replaygain::compter_les_reportees_par_chemin(&state.backend)
+    } else {
+        0
+    };
+    let remaining = (total - processed).max(0);
+    let waiting_reason = (remaining == 0 && deferred > 0).then_some("unresolved_paths");
     Json(json!({
         "active": avancement.actif,
         "processed": processed,
         "total": total,
-        "remaining": (total - processed).max(0),
+        "remaining": remaining,
+        "deferred": deferred,
+        "waiting_reason": waiting_reason,
         "updated_at": avancement.maj_epoch,
         "reported": avancement.a_parle(),
         "enabled": enabled,

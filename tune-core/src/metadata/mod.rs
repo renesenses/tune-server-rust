@@ -7,6 +7,7 @@ pub mod credits_mb;
 pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
+pub mod foo_dr;
 pub mod instruments;
 pub mod lastfm;
 pub mod lyrics;
@@ -2231,6 +2232,109 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
     }
 }
 
+/// Les métadonnées d'un Matroska (`.mkv`/`.mka`/`.webm`), lues par symphonia
+/// (#3633, point 2).
+///
+/// Trois sources, dans cet ordre, et rien n'est écrasé — le contrat de
+/// `dsf_dff_fallback_complete` (#3180) :
+///
+/// 1. les balises du conteneur (`Tags`, cibles album et piste) ;
+/// 2. la piste elle-même : cadence, canaux, profondeur, durée annoncée ;
+/// 3. le nom de fichier et l'arborescence, pour ce qui manque encore.
+///
+/// `Err` quand symphonia ne lit pas le conteneur : le fichier est ILLISIBLE et
+/// doit être compté comme tel, pas admis sous le nom de son fichier.
+///
+/// `format` porte l'EXTENSION (« mka »), pas le codec de la piste : voir
+/// `AudioFormat::Matroska` — écrire « flac » ferait servir le conteneur brut
+/// sous `audio/flac`.
+fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
+    let sonde = crate::audio::matroska::sonder(path)?;
+    let balises = sonde.balises;
+
+    let (numero_du_nom, titre_du_nom) = extract_title_from_filename(path);
+    let (album_du_chemin, artiste_du_chemin, disque_du_chemin) = album_artiste_du_chemin(path);
+    // `ARTIST` sous la cible album (50) est l'artiste d'ALBUM pour symphonia
+    // — et c'est là que mkvmerge et ffmpeg posent les balises globales d'un
+    // `.mka`. Un artiste d'album vaut mieux qu'un nom de dossier.
+    let artist_from_path = balises.artist.is_none() && balises.album_artist.is_none();
+    let artiste = balises
+        .artist
+        .clone()
+        .or_else(|| balises.album_artist.clone())
+        .or(artiste_du_chemin);
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mkv")
+        .to_lowercase();
+    let year = balises
+        .release_date
+        .as_deref()
+        .and_then(|d| d.get(..4)?.parse::<u32>().ok());
+    let genres = balises
+        .genre
+        .as_deref()
+        .map(|g| genres_from_tag_values(&[g]))
+        .unwrap_or_default();
+
+    tracing::debug!(
+        path = %path.display(),
+        piste = ?sonde.piste,
+        title = ?balises.title,
+        artist = ?balises.artist,
+        album = ?balises.album,
+        duration_ms = ?sonde.duration_ms,
+        "matroska_metadata"
+    );
+
+    Ok(TrackMetadata {
+        title: balises.title.or(titre_du_nom),
+        artist: artiste,
+        album: balises.album.or(album_du_chemin),
+        // Déduit du chemin, un nom de dossier n'est pas un artiste d'album
+        // (#1656, #3232) : seule la balise le renseigne.
+        album_artist: balises.album_artist,
+        album_artist_sort: None,
+        track_number: balises.track_number.or(numero_du_nom),
+        disc_number: balises.disc_number.or(disque_du_chemin),
+        total_tracks: balises.track_total,
+        total_discs: balises.disc_total,
+        disc_subtitle: None,
+        year,
+        original_year: None,
+        release_date: balises.release_date,
+        original_date: None,
+        genre: genres.first().cloned().or(balises.genre),
+        genres,
+        artist_from_path,
+        format: Some(ext),
+        file_size: std::fs::metadata(&*crate::library::artwork::extended_path(path))
+            .ok()
+            .map(|m| m.len()),
+        sample_rate: sonde.sample_rate,
+        channels: sonde.channels,
+        duration_ms: sonde.duration_ms,
+        bit_depth: sonde.bit_depth,
+        bpm: None,
+        // Le Matroska n'a pas de balise « compilation » normalisée : ABSENCE.
+        compilation: None,
+        label: None,
+        catalog_number: None,
+        musicbrainz_recording_id: None,
+        musicbrainz_release_id: None,
+        musicbrainz_artist_id: None,
+        musicbrainz_album_artist_id: None,
+        musicbrainz_release_group_id: None,
+        isrc: None,
+        has_cover: false,
+        cover_art: None,
+        credits: vec![],
+        comment: balises.comment,
+    })
+}
+
 /// Fallback when lofty cannot parse the file at all (no audio properties).
 /// Extracts everything from the filesystem.
 /// Path/filename-only metadata (no file I/O). Used as a last resort when the
@@ -2707,6 +2811,19 @@ fn find_vorbis_comment(data: &[u8], field_name: &str) -> Option<String> {
 /// servent recopient la chaine sans l'interpreter (`dynamic_range_source`).
 pub(crate) const DR_SOURCE_TAG: &str = "tag";
 
+/// Provenance d'un `dr_track` LU DANS LE RAPPORT `foo_dr.txt` voisin de
+/// l'album (#4186) — la mesure du DR Meter de foobar2000, que son auteur a
+/// faite mais n'a pas écrite dans les fichiers (Tades, fil 1800).
+///
+/// Troisième valeur de `dr_source`, après `"tag"` et `"analysis"`. Elle est
+/// `pub` et non `pub(crate)` parce qu'elle a des LECTEURS hors de ce crate,
+/// à la différence des deux autres : le scan la compte dans son rapport
+/// (`tune-server`), et l'agrégat d'album la range dans sa propre colonne
+/// (`db::album_repo::dynamic_range_detail`). Un troisième producteur que
+/// l'agrégat ne connaîtrait pas serait compté « unknown » — la provenance
+/// existerait en base et mentirait à l'écran.
+pub const DR_SOURCE_SIDECAR: &str = "sidecar";
+
 /// Reduce a Dynamic Range tag to its bare digits.
 ///
 /// Tools disagree on the form: DROffline MK2 and foobar2000 write `12`, `DR12`
@@ -2958,6 +3075,15 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
     use lofty::tag::{Accessor, ItemKey};
+
+    // Matroska AVANT lofty : lofty ne connaît pas ce conteneur, et l'y passer
+    // ne pouvait finir que dans `tagless_fallback_no_props` — un `.mka` FLAC
+    // 24/96 avec ses balises serait entré sous le nom de son fichier, sans
+    // durée ni cadence (#3633). symphonia démuxe déjà le Matroska : c'est lui
+    // qui lit les balises, la durée et la piste.
+    if crate::audio::matroska::est_chemin_matroska(path) {
+        return matroska_metadata(path);
+    }
 
     let tagged = match Probe::open(path).and_then(|p| {
         p.options(
@@ -3298,7 +3424,7 @@ pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {
 /// ReplayGain values, MusicBrainz IDs, and other extended fields.
 pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     use lofty::config::{ParseOptions, ParsingMode};
-    use lofty::file::TaggedFileExt;
+    use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
     use lofty::tag::{Accessor, ItemKey};
 
@@ -3486,6 +3612,48 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
                 meta.insert("dr_source".into(), DR_SOURCE_TAG.into());
             }
             meta.insert("dr_track".into(), dr);
+        }
+    }
+    // TROISIÈME source de DR : le rapport `foo_dr.txt` que le DR Meter de
+    // foobar2000 pose dans le dossier de l'album (#4186, Tades, fil 1800 :
+    // « quand ils ont été mesurés on les trouve généralement dans un fichier
+    // foo_dr.txt (pas dans les tags) »). Il ne comble que le VIDE : un tag du
+    // fichier, lu juste au-dessus, prime toujours — c'est la valeur que le
+    // producteur du disque a mesurée et écrite, celle que
+    // `replaygain::peut_ecrire_le_dr` protège déjà de la passe d'analyse.
+    // Et cette passe ne vient qu'après : elle ne calcule que ce qui manque,
+    // donc un DR posé ici la tient à l'écart de la piste. La précédence
+    // complète est : tag > `foo_dr.txt` > mesure de Tune.
+    //
+    // Écrit avec sa provenance, comme le tag (#3924) : `dr_source =
+    // "sidecar"`. Sans elle, un 11 recopié d'un rapport tiers ne se
+    // distinguerait ni d'un tag ni d'un calcul.
+    //
+    // `dr_album` n'est PAS écrit depuis `Official DR value`, et c'est voulu :
+    // sur le SACD du fil 1800 cette valeur agrège les deux couches (DR9 pour
+    // des pistes stéréo à DR10-12), et `dr_album` n'a pas de provenance en
+    // base — la fiche dirait « album_tag », donc « lu dans les tags », d'une
+    // valeur qui n'y est pas. La moyenne des `dr_track` appariés donne le
+    // même chiffre que le rapport sur un album à une couche, et le bon sur
+    // un album à deux.
+    //
+    // Pas de lecture pour un fichier qui n'est pas dans un dossier, ni quand
+    // il n'y a pas de rapport : un `stat` par piste, rien de plus, pour
+    // l'immense majorité des bibliothèques qui n'en ont pas.
+    if !meta.contains_key("dr_track")
+        && let Some(rapport) = foo_dr::rapport_voisin(path)
+    {
+        let numero = tag.track().or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(foo_dr::numero_dans_le_nom)
+        });
+        let canaux = tagged.properties().channels().map(u16::from);
+        if let Some(dr) =
+            rapport.dr_pour_la_piste(numero, tag.disk(), tag.title().as_deref(), canaux)
+        {
+            meta.insert("dr_track".into(), dr.to_string());
+            meta.insert("dr_source".into(), DR_SOURCE_SIDECAR.into());
         }
     }
     if let Some(v) = get(ItemKey::CopyrightMessage) {
@@ -5823,6 +5991,153 @@ mod provenance_du_dr_3924 {
     // néanmoins écrite : un fichier étiqueté par un autre outil, ou un
     // `normalise_dr` retouché, peut rendre ce cas atteignable, et alors c'est
     // elle qui empêche d'annoncer la provenance d'un vide.
+}
+
+/// Le rapport `foo_dr.txt` voisin comme troisième source de DR (#4186).
+///
+/// Un VRAI FLAC (la fixture) dans un VRAI dossier, avec la pièce jointe
+/// RÉELLE du fil 1800 à côté : c'est `read_extended_metadata` entière qui est
+/// jugée, pas l'analyseur seul — le numéro de piste vient du tag du fichier,
+/// le nombre de canaux de ses propriétés, et la précédence est celle du scan.
+#[cfg(test)]
+mod foo_dr_voisin_4186 {
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::VorbisComments;
+    use std::path::Path;
+
+    const RAPPORT_TADES: &[u8] = include_bytes!("../../tests/fixtures/foo_dr_tades_1800.txt");
+
+    /// Un dossier d'album : la fixture FLAC copiée sous `nom`, taguée avec les
+    /// paires données, et — si fourni — un `foo_dr.txt` à côté.
+    fn album(
+        epreuve: &str,
+        nom: &str,
+        tags: &[(&str, &str)],
+        rapport: Option<&[u8]>,
+    ) -> (crate::test_scratch::ScratchDir, std::path::PathBuf) {
+        let dossier = crate::test_scratch::scratch_dir(&format!("foo-dr-4186-{epreuve}"));
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let piste = dossier.join(nom);
+        std::fs::copy(&source, &piste).expect("copie du gabarit");
+        if !tags.is_empty() {
+            let mut fh = std::fs::File::open(&piste).expect("ouverture du gabarit");
+            let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
+            drop(fh);
+            if flac.vorbis_comments().is_none() {
+                flac.set_vorbis_comments(VorbisComments::default());
+            }
+            let vc = flac.vorbis_comments_mut().expect("bloc Vorbis Comment");
+            for (k, v) in tags {
+                vc.insert(k.to_string(), v.to_string());
+            }
+            flac.save_to_path(&piste, WriteOptions::default())
+                .expect("écriture des tags");
+        }
+        if let Some(octets) = rapport {
+            std::fs::write(dossier.join(super::foo_dr::NOM_DU_RAPPORT), octets)
+                .expect("écriture du rapport");
+        }
+        (dossier, piste)
+    }
+
+    /// Le cas du fil 1800 : la piste 11 du Mahler, en stéréo, sans tag de DR,
+    /// avec le rapport de Tades à côté. Elle sort à DR10 — la valeur de la
+    /// couche STÉRÉO, pas le DR18 de la couche multicanal — et DITE `sidecar`.
+    #[test]
+    fn une_piste_sans_tag_prend_le_dr_du_rapport_voisin_avec_sa_provenance_4186() {
+        let (_dossier, piste) = album(
+            "voisin",
+            "11 - Mahler.flac",
+            &[
+                ("TRACKNUMBER", "11"),
+                ("TITLE", "Mahler Sym No 2: 5th Mov Etwas bewegter"),
+            ],
+            Some(RAPPORT_TADES),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("10"),
+            "#4186 — le DR mesuré par foobar2000 est dans `foo_dr.txt`, pas dans \
+             les tags : le scan doit l'y lire (piste 11, couche stéréo = DR10). \
+             Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("dr_source").map(String::as_str),
+            Some(super::DR_SOURCE_SIDECAR),
+            "la provenance s'écrit AVEC la valeur, comme pour le tag (#3924). \
+             Relevé : {meta:?}"
+        );
+    }
+
+    /// LE TAG PRIME. Le même dossier, la même piste, mais le fichier porte
+    /// `DYNAMIC RANGE=14` : c'est 14 qui sort, dit `tag`, et le rapport
+    /// voisin ne l'écrase pas.
+    #[test]
+    fn le_tag_du_fichier_prime_sur_le_rapport_voisin_4186() {
+        let (_dossier, piste) = album(
+            "tag-prime",
+            "11 - Mahler.flac",
+            &[("TRACKNUMBER", "11"), ("DYNAMIC RANGE", "14")],
+            Some(RAPPORT_TADES),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(meta.get("dr_track").map(String::as_str), Some("14"));
+        assert_eq!(
+            meta.get("dr_source").map(String::as_str),
+            Some("tag"),
+            "tag > foo_dr.txt : la provenance reste celle du tag. Relevé : {meta:?}"
+        );
+    }
+
+    /// TÉMOIN — sans rapport à côté, rien ne change : ni valeur ni provenance.
+    #[test]
+    fn sans_rapport_voisin_rien_n_est_invente_4186() {
+        let (_dossier, piste) = album(
+            "sans-rapport",
+            "11 - Mahler.flac",
+            &[("TRACKNUMBER", "11")],
+            None,
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(meta.get("dr_track"), None, "Relevé : {meta:?}");
+        assert_eq!(meta.get("dr_source"), None, "Relevé : {meta:?}");
+    }
+
+    /// Une piste que le rapport ne DÉSIGNE pas sans ambiguïté n'en reçoit
+    /// rien : la piste 12 n'existe pas dans le rapport, et un titre inconnu
+    /// ne s'apparie pas.
+    #[test]
+    fn une_piste_absente_du_rapport_ne_recoit_aucun_dr_4186() {
+        let (_dossier, piste) = album(
+            "absente",
+            "12 - Bonus.flac",
+            &[("TRACKNUMBER", "12"), ("TITLE", "Bonus inédit")],
+            Some(RAPPORT_TADES),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(meta.get("dr_track"), None, "Relevé : {meta:?}");
+        assert_eq!(meta.get("dr_source"), None, "Relevé : {meta:?}");
+    }
+
+    /// Sans tag de numéro, le NOM DE FICHIER le fournit (`03 - ….flac`).
+    #[test]
+    fn sans_tag_de_numero_le_nom_du_fichier_apparie_4186() {
+        let (_dossier, piste) = album(
+            "nom",
+            "03 - Troisieme mouvement.flac",
+            &[("TITLE", "x")],
+            Some(RAPPORT_TADES),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("12"),
+            "piste 3, couche stéréo : DR12. Relevé : {meta:?}"
+        );
+    }
 }
 
 /// Ces épreuves construisent de VRAIS fichiers dans les trois conteneurs qui

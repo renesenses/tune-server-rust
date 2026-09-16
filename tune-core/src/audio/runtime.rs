@@ -13,6 +13,7 @@
 //! `ort` 2.0.0-rc.13 bindings require, so the ABI matches.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use tokio::sync::OnceCell;
 
@@ -23,14 +24,40 @@ use tokio::sync::OnceCell;
 /// process; a second commit is an error, so both paths funnel through here.
 static RUNTIME_LOADED: OnceCell<()> = OnceCell::const_new();
 
+/// Cause d'un `ort::init_from` rendu en `Err` — **définitif pour le processus**.
+///
+/// Le `OnceLock` maison d'`ort` (`util/once_lock_std.rs`, rc.13 comme `main`)
+/// marque son `Once` complété même quand l'initialisation rend `Err` : la
+/// cellule reste à zéro, et le `get_or_try_init` suivant rend `Ok` sur une
+/// `Library { handle: 0x0 }`. Un second `init_from` « réussit » donc, puis
+/// la première `Session` panique sur `dlsym(0x0, OrtGetApiBase)` sous le
+/// verrou de `G_ENV`, qui reste empoisonné jusqu'au redémarrage (#4248,
+/// Sevy Tabroc, 16/09/2026 ; c'est la première panique que #3103 n'avait pas
+/// pu voir). Réessayer n'est donc pas neutre : c'est ce qui déclenche la
+/// panique. Après un `Err`, plus aucun appel ne part vers `ort`, et la cause
+/// d'origine est rejouée dans chaque refus au lieu d'un faux
+/// `audio_runtime_loaded`.
+static RUNTIME_CONDAMNE: OnceLock<String> = OnceLock::new();
+
 /// Provision (download+verify+unpack on first use) the onnxruntime shared lib
 /// under `cache_root` and load it globally into `ort`, exactly once for the
 /// process. Concurrent callers coalesce onto a single init; on failure the guard
 /// stays unset so a later call retries.
 pub async fn ensure_loaded(cache_root: &Path) -> Result<(), String> {
+    if let Some(cause) = RUNTIME_CONDAMNE.get() {
+        return Err(format!(
+            "onnxruntime abandonné jusqu'au redémarrage du serveur — un premier \
+             `ort::init_from` a échoué et `ort` ne sait pas réessayer (#4248) : {cause}"
+        ));
+    }
     RUNTIME_LOADED
         .get_or_try_init(|| async {
-            let dylib = ensure_runtime(cache_root).await?;
+            let dylib = chemin_absolu(&ensure_runtime(cache_root).await?);
+            // La sonde d'abord, `ort` ensuite : tout ce qui peut faire échouer
+            // le `dlopen` d'`ort` (fichier absent, tronqué, refusé par le
+            // système, runtime trop ancien) est constaté ICI, sans qu'`ort`
+            // n'ait rien vu — et reste donc réessayable au prochain cycle.
+            sonder_runtime(&dylib)?;
             // Ceinture et bretelles pour le plafond de fils. `ort` documente que
             // `with_intra_threads` est SANS EFFET si onnxruntime a été compilé
             // avec OpenMP — et c'est justement les binaires préconstruits de
@@ -52,14 +79,102 @@ pub async fn ensure_loaded(cache_root: &Path) -> Result<(), String> {
                 unsafe { std::env::set_var("OMP_NUM_THREADS", half.to_string()) };
                 tracing::info!(omp_num_threads = half, "audio_runtime_omp_capped");
             }
-            ort::init_from(&dylib)
-                .map_err(|e| format!("ort init_from {}: {e}", dylib.display()))?
-                .commit();
+            match ort::init_from(&dylib) {
+                Ok(env) => {
+                    env.commit();
+                }
+                Err(e) => {
+                    // Après la sonde, ce cas ne devrait plus arriver. S'il
+                    // arrive, `ort` est déjà poisonné : on le dit une fois,
+                    // et on ne lui reparle plus (cf. `RUNTIME_CONDAMNE`).
+                    let cause = format!("ort init_from {}: {e}", dylib.display());
+                    let _ = RUNTIME_CONDAMNE.set(cause.clone());
+                    tracing::error!(
+                        dylib = %dylib.display(),
+                        error = %e,
+                        "audio_runtime_init_failed_definitively — `ort` ne sait pas rejouer \
+                         un init en échec (#4248) ; l'analyse acoustique et la recherche \
+                         en langage naturel attendent un redémarrage du serveur"
+                    );
+                    return Err(cause);
+                }
+            }
             tracing::info!(dylib = %dylib.display(), "audio_runtime_loaded");
             Ok::<(), String>(())
         })
         .await
         .map(|_| ())
+}
+
+/// Chemin que `dlopen` résoudra **sans dépendre du répertoire de travail**.
+///
+/// Le cache vit sous `embedding_models/`, chemin relatif au cwd du serveur.
+/// `ort` tente d'abord `<dossier de l'exécutable>/<relatif>`, puis retombe sur
+/// le relatif tel quel — que `dlopen` interprète depuis le cwd. Deux appelants
+/// (passe acoustique, recherche en langage naturel) et un cwd qui peut changer
+/// (service, `.app`, ligne de commande) : mieux vaut donner à `ort` le chemin
+/// que `exists()` vient de valider. Sans `canonicalize` disponible (partage
+/// capricieux), on garde le chemin tel quel plutôt que d'échouer.
+fn chemin_absolu(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Ouvre la dylib et vérifie qu'elle est bien un onnxruntime que `ort` sait
+/// piloter — **avant** qu'`ort` ne l'ouvre lui-même.
+///
+/// Trois refus, chacun avec sa cause :
+/// - `dlopen` refuse (fichier absent ou tronqué, validation de bibliothèque,
+///   architecture) — c'est le message du système, celui qui manquait dans le
+///   journal de #4248 ;
+/// - `OrtGetApiBase` absent — ce n'est pas un onnxruntime ;
+/// - `GetApi(version d'ort)` rend nul — runtime plus ancien que les liaisons,
+///   ce qu'`ort` refuserait en `BadVersion`… en poisonnant son `OnceLock`.
+///
+/// La bibliothèque n'est **jamais refermée** : `dlclose` derrière un `dlopen`
+/// qu'`ort` va refaire une milliseconde plus tard n'apporte rien, et certains
+/// runtimes tolèrent mal d'être déchargés puis rechargés dans le même processus.
+fn sonder_runtime(dylib: &Path) -> Result<(), String> {
+    #[repr(C)]
+    struct ApiBase {
+        get_api: unsafe extern "system" fn(u32) -> *const core::ffi::c_void,
+        get_version_string: unsafe extern "system" fn() -> *const core::ffi::c_char,
+    }
+    // SAFETY : charger une bibliothèque exécute ses initialiseurs — exactement
+    // ce qu'`ort::init_from` fera juste après sur le même fichier. La sonde ne
+    // fait qu'avancer ce moment, avec un rapport d'erreur lisible.
+    let lib = unsafe { libloading::Library::new(dylib) }
+        .map_err(|e| format!("dlopen {} : {e}", dylib.display()))?;
+    // SAFETY : signature de `OrtGetApiBase` telle que déclarée par ort-sys
+    // (`unsafe extern "system" fn() -> *const OrtApiBase`), et `OrtApiBase`
+    // commence par ces deux pointeurs de fonction, dans cet ordre.
+    let base_getter: libloading::Symbol<unsafe extern "system" fn() -> *const ApiBase> =
+        unsafe { lib.get(b"OrtGetApiBase") }.map_err(|e| {
+            format!(
+                "{} n'exporte pas OrtGetApiBase — ce n'est pas un onnxruntime : {e}",
+                dylib.display()
+            )
+        })?;
+    let base = unsafe { base_getter() };
+    if base.is_null() {
+        return Err(format!("{} : OrtGetApiBase rend nul", dylib.display()));
+    }
+    let version = unsafe { std::ffi::CStr::from_ptr(((*base).get_version_string)()) }
+        .to_string_lossy()
+        .into_owned();
+    if unsafe { ((*base).get_api)(ort::MINOR_VERSION) }.is_null() {
+        return Err(format!(
+            "{} est un onnxruntime {version}, trop ancien pour ces liaisons (API 1.{} \
+             requise) — supprimer le dossier onnxruntime du cache pour le retélécharger",
+            dylib.display(),
+            ort::MINOR_VERSION
+        ));
+    }
+    tracing::debug!(dylib = %dylib.display(), version = %version, "audio_runtime_probed");
+    std::mem::forget(lib);
+    Ok(())
 }
 
 /// A platform's prebuilt onnxruntime: where to get it, its archive checksum, and
@@ -377,5 +492,51 @@ mod signature_macos_tests {
             RELEASE_YML.matches(CLE).count() >= 2,
             "release.yml ne cherche plus {CLE} dans les signatures produites (#1641)"
         );
+    }
+}
+
+/// Témoins de la sonde (#4248). Le vrai runtime n'est pas sur la CI : on
+/// prouve les refus, et que chacun porte sa cause — c'est la pièce qui
+/// manquait au journal de Sevy.
+#[cfg(test)]
+mod tests_sonde_4248 {
+    use super::*;
+
+    #[test]
+    fn un_fichier_absent_est_refuse_par_dlopen_et_le_dit() {
+        let base = tempfile::TempDir::new().unwrap();
+        let absent = base.path().join("nulle-part").join("libonnxruntime.so");
+        let err = sonder_runtime(&absent).expect_err("un fichier absent ne se sonde pas");
+        assert!(
+            err.starts_with("dlopen "),
+            "la cause doit nommer l'étape : {err}"
+        );
+        assert!(
+            err.contains("libonnxruntime.so"),
+            "la cause doit nommer le fichier : {err}"
+        );
+    }
+
+    #[test]
+    fn un_fichier_qui_nest_pas_une_bibliotheque_est_refuse() {
+        let base = tempfile::TempDir::new().unwrap();
+        let faux = base.path().join("libonnxruntime.so");
+        std::fs::write(&faux, b"<html>Not Found</html>").unwrap();
+        let err = sonder_runtime(&faux).expect_err("une page HTML n'est pas un onnxruntime");
+        assert!(err.starts_with("dlopen "), "{err}");
+    }
+
+    #[test]
+    fn un_chemin_deja_absolu_est_rendu_tel_quel() {
+        let base = tempfile::TempDir::new().unwrap();
+        let p = base.path().join("libonnxruntime.so");
+        std::fs::write(&p, b"x").unwrap();
+        assert_eq!(chemin_absolu(&p), p);
+    }
+
+    #[test]
+    fn un_chemin_relatif_introuvable_est_rendu_tel_quel() {
+        let p = Path::new("embedding_models/onnxruntime/nexiste-pas.so");
+        assert_eq!(chemin_absolu(p), p.to_path_buf());
     }
 }

@@ -118,7 +118,9 @@ fn ressources_publiees_par_la_didl() -> Vec<(&'static str, String)> {
         ("pochette", chemin(&artwork_url(BASE, CONDENSAT))),
         (
             "logo de station relayé",
-            chemin(&radio_logo_url(BASE, LOGO_DISTANT)),
+            // #4260 : l'URL de relais est signée ; le secret n'importe pas
+            // ici, seule la couche d'authentification est jugée.
+            chemin(&radio_logo_url(BASE, LOGO_DISTANT, "secret-de-banc")),
         ),
     ]
 }

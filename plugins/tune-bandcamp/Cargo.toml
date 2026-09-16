@@ -26,3 +26,6 @@ tokio = { workspace = true }
 # #3003 : dire qu'un onglet de recherche est arrivé vide sur une panne réseau
 # plutôt que de le laisser passer pour « Bandcamp n'a rien ».
 tracing = { workspace = true }
+# Lot 3 : les achats arrivent en `.zip` (album) — ouvert sur place, sans
+# jamais sortir de son dossier (`enclosed_name`).
+zip = { workspace = true }

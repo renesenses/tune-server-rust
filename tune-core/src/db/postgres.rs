@@ -164,6 +164,9 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             created_at TEXT\
         )",
     "CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at)",
+    "CREATE TABLE IF NOT EXISTS upnp_library_sources (\n    source_key TEXT PRIMARY KEY,\n    udn TEXT NOT NULL,\n    container TEXT NOT NULL,\n    state_json TEXT NOT NULL\n)",
+    "CREATE TABLE IF NOT EXISTS upnp_library_members (\n    source_key TEXT NOT NULL REFERENCES upnp_library_sources(source_key) ON DELETE CASCADE,\n    track_id BIGINT NOT NULL,\n    generation TEXT NOT NULL,\n    PRIMARY KEY (source_key, track_id)\n)",
+    "CREATE INDEX IF NOT EXISTS idx_upnp_library_members_track ON upnp_library_members(track_id)",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the

@@ -50,6 +50,7 @@ fn hors_aiff_les_deux_bras_sont_indiscernables() {
         AudioFormat::WavPack,
         AudioFormat::Ape,
         AudioFormat::Wma,
+        AudioFormat::Matroska,
     ] {
         assert_eq!(
             needs_transcode_for_output_applies(Some("chromecast"), Some(f), false, false, false),

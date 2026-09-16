@@ -982,6 +982,12 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
     meta.set(taguee, "dr_track", "8").expect("dr tague");
     meta.set(taguee, "dr_source", "tag").expect("source");
 
+    // Une piste dont le DR vient d'un `foo_dr.txt` voisin (#4186) : ni
+    // mesurée par Tune, ni écrite dans le fichier.
+    let rapportee = poser("dr-rapport-voisin");
+    meta.set(rapportee, "dr_track", "11").expect("dr rapporte");
+    meta.set(rapportee, "dr_source", "sidecar").expect("source");
+
     // Une piste que la passe a essayée et écartée pour de bon : elle ne doit
     // pas gonfler « ce qui reste à faire ».
     let ecartee = poser("dr-indisponible");
@@ -996,17 +1002,22 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
         .unwrap_or_else(|erreur| panic!("{erreur}"));
 
     assert_eq!(
-        p["with_dynamic_range"], 2,
-        "deux pistes portent un DR — la mesurée et la taguée. payload={p}"
+        p["with_dynamic_range"], 3,
+        "trois pistes portent un DR — la mesurée, la taguée et la rapportée. payload={p}"
     );
     assert_eq!(
         p["dynamic_range_from_analysis"], 1,
-        "une seule a été MESURÉE par Tune : mélanger les deux sources \
+        "une seule a été MESURÉE par Tune : mélanger les sources \
          laisserait croire à une bibliothèque homogène. payload={p}"
     );
     assert_eq!(
         p["dynamic_range_from_tag"], 1,
         "une seule vient des tags du fichier. payload={p}"
+    );
+    assert_eq!(
+        p["dynamic_range_from_sidecar_file"], 1,
+        "#4186 — une seule vient d'un `foo_dr.txt` voisin, et la carte Santé \
+         doit la nommer comme les deux autres. payload={p}"
     );
     assert_eq!(
         p["dynamic_range_unavailable"], 1,
@@ -1015,13 +1026,13 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
     );
 
     // Contre-épreuve — le pourcentage porte sur le TOTAL des pistes, pas sur
-    // celles qui ont un DR : 2 sur 4 vierges comprises.
+    // celles qui ont un DR : 3 sur 5 vierges comprises.
     assert_eq!(
-        p["dynamic_range_pct"], 50.0,
-        "2 pistes avec DR sur 4 au total. payload={p}"
+        p["dynamic_range_pct"], 60.0,
+        "3 pistes avec DR sur 5 au total. payload={p}"
     );
     assert_eq!(
-        p["total_tracks"], 4,
+        p["total_tracks"], 5,
         "le dénominateur est bien le total. payload={p}"
     );
 }

@@ -1289,6 +1289,19 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return None;
         }
+        self.eq_profile_configure(zone_id)
+    }
+
+    /// Le profil d'égaliseur ACTIVÉ de la zone, **sans regarder le mode
+    /// PURE** (#4004).
+    ///
+    /// C'est la lecture que [`Self::load_eq_profile`] fait derrière sa garde
+    /// PURE, sortie d'elle pour qu'une seule fonction lise la clé. Elle sert à
+    /// répondre à une autre question que « faut-il filtrer ? » : « la bascule
+    /// PURE changerait-elle quelque chose ? » — ce qui suppose de voir le
+    /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
+    /// le profil est désactivé.
+    pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
@@ -1300,6 +1313,59 @@ impl PlaybackOrchestrator {
             return None;
         }
         Some(profile)
+    }
+
+    /// Quel traitement, parmi ceux que le mode PURE gouverne sur un flux
+    /// TRANSCODÉ, est réellement armé sur cette zone — PURE ou pas (#4004).
+    ///
+    /// Sur une sortie réseau ou navigateur, PURE n'a qu'un seul effet sur les
+    /// octets servis : il fait rendre `None` aux quatre chargeurs que la
+    /// résolution consulte — égaliseur ([`Self::load_eq_profile`]),
+    /// correction de pièce ([`Self::chemin_ir`]), crossfeed
+    /// ([`Self::load_crossfeed_processor`]) et ReplayGain
+    /// ([`Self::zone_replaygain_changes_audio`], `load_streaming_dsp`, bras
+    /// fichier de `resolve_local.rs`). Le repli mono, la rampe et le verrou de
+    /// volume ne touchent que la sortie LOCALE ou la commande de volume, pas le
+    /// fichier. Comparer la résolution « avant » et « après » une bascule PURE
+    /// revient donc exactement à demander si l'un de ces quatre réglages est
+    /// configuré : s'il ne l'est pas, les deux résolutions produisent les mêmes
+    /// octets, et refabriquer le flux ne fait que couper le son (Jean Valjean,
+    /// Marantz ND8006 : 1,8 à 2,4 s de silence par bascule, sans aucun
+    /// traitement armé).
+    ///
+    /// Le crossfeed est compté même quand le bras fichier ne le cuit pas
+    /// (il ne l'est que sur le bras progressif, `dsp_progressif_reseau`) :
+    /// l'approximation va dans le sens sûr — au pire une relance qui aurait pu
+    /// être évitée, jamais une bascule qui n'atteint pas le son.
+    ///
+    /// Rend le NOM du premier traitement armé, pour le journal, ou `None`
+    /// quand la bascule ne change rien au signal effectif.
+    pub(super) fn traitement_que_pure_gouverne(
+        &self,
+        zone_id: i64,
+        track_id: Option<i64>,
+    ) -> Option<&'static str> {
+        if self
+            .eq_profile_configure(zone_id)
+            .is_some_and(|p| crate::audio::eq::EqProcessor::new(&p, 44100, 2).is_enabled())
+        {
+            return Some("egaliseur");
+        }
+        if self
+            .chemin_ir_configure(zone_id)
+            .is_some_and(|p| std::path::Path::new(&p).exists())
+        {
+            return Some("correction_de_piece");
+        }
+        if self.crossfeed_configure(zone_id).is_some() {
+            return Some("crossfeed");
+        }
+        if track_id.is_some_and(|tid| {
+            (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
+        }) {
+            return Some("replaygain");
+        }
+        None
     }
 
     /// Build the room-correction FIR convolver for a zone's TRANSCODED stream,
@@ -1314,6 +1380,15 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return None;
         }
+        self.chemin_ir_configure(zone_id)
+    }
+
+    /// Le chemin de réponse impulsionnelle CONFIGURÉ, sans regarder le mode
+    /// PURE (#4004) — la lecture de [`Self::chemin_ir`] derrière sa garde,
+    /// partagée avec [`Self::zone_has_active_ir`] et
+    /// [`Self::traitement_que_pure_gouverne`]. `None` si la clé est absente ou
+    /// vide ; l'existence du fichier n'est PAS vérifiée ici.
+    pub(super) fn chemin_ir_configure(&self, zone_id: i64) -> Option<String> {
         crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
             .get(&format!("ir_path_{zone_id}"))
             .ok()
@@ -1368,6 +1443,21 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return None;
         }
+        let (amount, delay_ms) = self.crossfeed_configure(zone_id)?;
+        Some(crate::audio::crossfeed::CrossfeedProcessor::new(
+            sample_rate,
+            amount,
+            delay_ms,
+        ))
+    }
+
+    /// Le crossfeed CONFIGURÉ de la zone — `(amount, delay_ms)` bornés — sans
+    /// regarder le mode PURE (#4004). C'est la lecture de
+    /// [`Self::load_crossfeed_processor`] derrière sa garde, sortie d'elle pour
+    /// que [`Self::traitement_que_pure_gouverne`] lise la même clé avec les
+    /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
+    /// ou un `amount` nul (identité).
+    pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let cfg: serde_json::Value = settings
             .get(&format!("zone_{zone_id}_crossfeed"))
@@ -1388,11 +1478,7 @@ impl PlaybackOrchestrator {
         }
         let delay_ms = cfg.get("delay_ms").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
         let delay_ms = delay_ms.clamp(0.0, 5.0);
-        Some(crate::audio::crossfeed::CrossfeedProcessor::new(
-            sample_rate,
-            amount,
-            delay_ms,
-        ))
+        Some((amount, delay_ms))
     }
 
     /// La zone demande-t-elle le repli mono sur sa sortie LOCALE ? (#2362)

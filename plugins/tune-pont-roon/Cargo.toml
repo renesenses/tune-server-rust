@@ -1,0 +1,23 @@
+[package]
+name = "tune-pont-roon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Extension « Pont Roon » (#3914, phase 3) — PREMIUM. Importe l'archive du
+# moissonneur (`export.json` + `images/`) : crédits par piste, images
+# d'artistes, pochettes. L'écriture elle-même vit dans
+# `tune_core::library::pont_roon_import`, partagée avec la route d'import.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+zip = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

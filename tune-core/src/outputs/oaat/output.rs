@@ -127,6 +127,13 @@ pub struct OaatDiagnostics {
     pub format_desc: std::sync::Mutex<String>,
     pub connected: AtomicBool,
     pub is_flac: AtomicBool,
+    /// La cause du DERNIER délai de connexion expiré (#3727), effacée dès
+    /// qu'une connexion aboutit. Publiée dans `diagnostics_snapshot()` sous
+    /// `derniere_cause_de_connexion` : le superviseur de stall la lit pour ne
+    /// pas relancer en boucle, sans la nommer, une boucle qui a déjà compris
+    /// que l'endpoint est tenu ailleurs.
+    pub derniere_cause_de_connexion:
+        std::sync::Mutex<Option<super::cause_de_connexion::CauseDeConnexion>>,
 }
 
 pub struct OaatOutput {
@@ -451,6 +458,13 @@ impl OaatOutput {
             "duration_ms": self.duration_ms.load(Ordering::Relaxed),
             "last_packet_age_ms": stale_ms,
             "stall_detected": playing && !self.paused.load(Ordering::Relaxed) && stale_ms > 5000,
+            "derniere_cause_de_connexion": self
+                .diag
+                .derniere_cause_de_connexion
+                .lock()
+                .ok()
+                .and_then(|c| *c)
+                .map(|c| c.evenement()),
         })
     }
 
@@ -678,6 +692,11 @@ impl OutputTarget for OaatOutput {
         if let Ok(mut place) = self.refus_negociation.lock() {
             *place = None;
         }
+        // Même raison pour la cause de connexion : elle décrit la boucle
+        // précédente, pas celle qui va s'ouvrir.
+        if let Ok(mut place) = self.diag.derniere_cause_de_connexion.lock() {
+            *place = None;
+        }
         let refus_negociation = self.refus_negociation.clone();
         let position_ms = self.position_ms.clone();
         let duration_ms_arc = self.duration_ms.clone();
@@ -747,6 +766,31 @@ impl OutputTarget for OaatOutput {
             // hanging on TCP SYN timeout (127s on Linux) when the endpoint
             // is restarting its listener after a track stop.
             let mut endpoint: Option<ConnectedEndpoint> = None;
+            // #3727 — les verdicts « accepté puis muet » de CETTE boucle.
+            let mut verdicts = super::cause_de_connexion::VerdictsDeConnexion::default();
+            // Quand la boucle renonce, elle le DIT : le motif part au
+            // sondeur par le même canal que les refus de négociation
+            // (`take_output_failure`), qui en fait un `zone.playback_error`
+            // `fatal: true` et arrête la zone. Sans cela, la zone restait
+            // `playing` sans qu'un octet ne sorte, et l'écran ne recevait
+            // rien (#3727, points 3 et 4).
+            let renoncer = |cause: super::cause_de_connexion::CauseDeConnexion, tentatives: u32| {
+                let motif = super::cause_de_connexion::motif_de_panne(
+                    cause,
+                    &device_name,
+                    endpoint_addr,
+                    tentatives,
+                );
+                signaler_refus_negociation(
+                    &refus_negociation,
+                    &RefusNegociation {
+                        stream_id: String::new(),
+                        raison: motif,
+                        reconnectable: false,
+                    },
+                );
+                playing.store(false, Ordering::SeqCst);
+            };
             for attempt in 1..=15u32 {
                 info!(device = %device_name, addr = %endpoint_addr, attempt, "oaat: connecting");
                 match tokio::time::timeout(
@@ -757,17 +801,23 @@ impl OutputTarget for OaatOutput {
                 {
                     Ok(Ok(ep)) => {
                         info!(device = %device_name, endpoint_name = %ep.info.endpoint_name, "oaat: connected");
+                        if let Ok(mut place) = diag.derniere_cause_de_connexion.lock() {
+                            *place = None;
+                        }
                         endpoint = Some(ep);
                         break;
                     }
                     Ok(Err(e)) => {
+                        verdicts.connexion_refusee();
                         if attempt < 15 {
                             let delay = 500 + 300 * attempt as u64;
                             info!(device = %device_name, error = %e, attempt, delay_ms = delay, "oaat: connect retry");
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         } else {
-                            error!(device = %device_name, error = %e, "oaat: connect failed after 15 attempts");
-                            playing.store(false, Ordering::SeqCst);
+                            let cause =
+                                super::cause_de_connexion::CauseDeConnexion::HoteInjoignable;
+                            error!(device = %device_name, addr = %endpoint_addr, error = %e, cause = cause.evenement(), "oaat: connect failed after 15 attempts");
+                            renoncer(cause, attempt);
                             return;
                         }
                     }
@@ -783,13 +833,34 @@ impl OutputTarget for OaatOutput {
                             super::cause_de_connexion::BUDGET_DE_SONDE,
                         )
                         .await;
+                        if let Ok(mut place) = diag.derniere_cause_de_connexion.lock() {
+                            *place = Some(cause);
+                        }
+                        // Un endpoint qui accepte et se tait ne « redémarre »
+                        // pas son écouteur : insister quinze fois ne changera
+                        // rien, et chaque tentative de plus est une tentative
+                        // pendant laquelle la zone prétend jouer. Trois
+                        // verdicts d'affilée, on renonce et on le dit.
+                        if verdicts.abandonner_apres(cause) {
+                            error!(
+                                device = %device_name,
+                                addr = %endpoint_addr,
+                                attempt,
+                                verdicts_muets = verdicts.muets_consecutifs(),
+                                cause = cause.evenement(),
+                                detail = cause.message(),
+                                "oaat_endpoint_muet_abandon_de_la_connexion"
+                            );
+                            renoncer(cause, attempt);
+                            return;
+                        }
                         if attempt < 15 {
                             let delay = 500 + 300 * attempt as u64;
                             info!(device = %device_name, addr = %endpoint_addr, attempt, delay_ms = delay, cause = cause.evenement(), detail = cause.message(), "oaat: connect timed out, retry");
                             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         } else {
                             error!(device = %device_name, addr = %endpoint_addr, cause = cause.evenement(), detail = cause.message(), "oaat: connect timed out after 15 attempts");
-                            playing.store(false, Ordering::SeqCst);
+                            renoncer(cause, attempt);
                             return;
                         }
                     }

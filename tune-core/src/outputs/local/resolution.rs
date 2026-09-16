@@ -911,3 +911,168 @@ pub(super) fn adapt_channels(samples: &[f32], from_ch: u16, to_ch: u16) -> Vec<f
         Vec::new()
     })
 }
+
+// ---------------------------------------------------------------------------
+// #3632 — un FLAC 5.1 vers un ampli HDMI : DEMANDER les canaux au périphérique
+//
+// Le moteur multicanal existe (`audio/channels`, 32 voies, matrices ITU
+// BS.775) et le décodage accepte 1..=32 canaux. Ce qui manquait n'était pas
+// le traitement du signal : Tune ne demandait jamais six ou huit voies à la
+// carte — il ouvrait le `StreamConfig` par défaut de cpal, stéréo sur à peu
+// près toutes les sorties HDMI, et `adapt_channels` repliait le 5.1 en 2.0
+// sans que rien ne le dise.
+//
+// La DÉCISION est pure et compilée sur toutes les cibles : elle ne voit que
+// trois nombres. Ce qui touche cpal est l'adaptateur en dessous.
+// ---------------------------------------------------------------------------
+
+/// Ce que l'ouverture décide du nombre de canaux (#3632).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChoixDeCanaux {
+    /// Rien à demander : source mono ou stéréo, ou périphérique dont le
+    /// défaut couvre déjà la source. Le nombre de canaux par défaut reste, et
+    /// le comportement est strictement celui d'avant.
+    Defaut(u16),
+    /// La source porte N > 2 voies et le périphérique les accepte : on ouvre
+    /// `canaux` — N exactement, ou le plus petit nombre accepté au-dessus de
+    /// N (les voies absentes reçoivent du silence, jamais un mixage).
+    Multicanal { canaux: u16 },
+    /// La source porte N > 2 voies et le périphérique ne les accepte pas : le
+    /// défaut reste, le mixage ITU vers la stéréo aussi — mais il est DIT.
+    RepliStereo {
+        defaut: u16,
+        demande: u16,
+        accepte: u16,
+    },
+}
+
+impl ChoixDeCanaux {
+    /// Le nombre de canaux que le flux ouvre réellement.
+    pub(crate) fn canaux(self) -> u16 {
+        match self {
+            Self::Defaut(n)
+            | Self::Multicanal { canaux: n }
+            | Self::RepliStereo { defaut: n, .. } => n,
+        }
+    }
+}
+
+/// Choisir le nombre de canaux à ouvrir, à partir de ce que la source porte,
+/// de ce que cpal ouvre par défaut et de ce que le périphérique ANNONCE à la
+/// cadence retenue (`canaux_acceptes`, vide quand l'énumération a échoué).
+///
+/// Dans l'ordre : une source mono ou stéréo ne change rien ; N annoncé
+/// s'ouvre tel quel ; un défaut déjà plus large que N reste (c'est un
+/// remplissage de silence, pas un repli) ; sinon la plus petite largeur
+/// annoncée au-dessus de N ; sinon le repli stéréo, nommé. Le résultat ne
+/// dépasse jamais ce que le périphérique annonce : `Multicanal` ne sort que
+/// de `canaux_acceptes`.
+pub(crate) fn choisir_les_canaux_de_sortie(
+    canaux_source: u16,
+    canaux_par_defaut: u16,
+    canaux_acceptes: &[u16],
+) -> ChoixDeCanaux {
+    if canaux_source <= 2 {
+        return ChoixDeCanaux::Defaut(canaux_par_defaut);
+    }
+    if canaux_acceptes.contains(&canaux_source) {
+        return ChoixDeCanaux::Multicanal {
+            canaux: canaux_source,
+        };
+    }
+    if canaux_par_defaut >= canaux_source {
+        return ChoixDeCanaux::Defaut(canaux_par_defaut);
+    }
+    if let Some(&plus_large) = canaux_acceptes.iter().filter(|&&c| c > canaux_source).min() {
+        return ChoixDeCanaux::Multicanal { canaux: plus_large };
+    }
+    let accepte = canaux_acceptes
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(canaux_par_defaut);
+    ChoixDeCanaux::RepliStereo {
+        defaut: canaux_par_defaut,
+        demande: canaux_source,
+        accepte,
+    }
+}
+
+/// Les largeurs (nombres de canaux) que cpal annonce pour ce périphérique à
+/// la cadence retenue, triées et dédoublonnées. Vide si l'énumération échoue
+/// (PipeWire en compatibilité ALSA) : une absence n'autorise rien.
+pub(super) fn canaux_annonces_a_la_cadence(device: &cpal::Device, sample_rate: u32) -> Vec<u16> {
+    let Ok(configs) = device.supported_output_configs() else {
+        return Vec::new();
+    };
+    let mut largeurs: Vec<u16> = configs
+        .filter(|c| c.min_sample_rate() <= sample_rate && c.max_sample_rate() >= sample_rate)
+        .map(|c| c.channels())
+        .collect();
+    largeurs.sort_unstable();
+    largeurs.dedup();
+    largeurs
+}
+
+/// Les couples (périphérique, largeur demandée) dont le repli stéréo a déjà
+/// été journalisé : une ligne par couple et par vie du processus, pas une par
+/// piste — un album 5.1 de douze plages n'a pas à écrire douze fois la même.
+static REPLIS_STEREO_SIGNALES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(String, u16)>>,
+> = std::sync::OnceLock::new();
+
+/// Appliquer [`choisir_les_canaux_de_sortie`] au `StreamConfig` que la
+/// décision de cadence vient de retenir, en journalisant ce qui change.
+///
+/// Pour une source mono ou stéréo, cpal n'est pas énuméré du tout : sur
+/// WASAPI l'énumération déroule 147 formats, sur ASIO elle touche le pilote,
+/// et le chemin stéréo — la quasi-totalité des lectures — n'a rien à y
+/// gagner.
+pub(super) fn ouvrir_les_canaux_de_la_source(
+    device: &cpal::Device,
+    device_name: &str,
+    backend: &str,
+    mut cfg: cpal::StreamConfig,
+    canaux_source: u16,
+) -> cpal::StreamConfig {
+    if canaux_source <= 2 {
+        return cfg;
+    }
+    let annonces = canaux_annonces_a_la_cadence(device, cfg.sample_rate);
+    let choix = choisir_les_canaux_de_sortie(canaux_source, cfg.channels, &annonces);
+    match choix {
+        ChoixDeCanaux::Defaut(_) => {}
+        ChoixDeCanaux::Multicanal { canaux } => {
+            info!(
+                device = %device_name,
+                backend = %backend,
+                demande = canaux_source,
+                ouvert = canaux,
+                sample_rate = cfg.sample_rate,
+                "local_multicanal_ouvert"
+            );
+        }
+        ChoixDeCanaux::RepliStereo {
+            demande, accepte, ..
+        } => {
+            let deja_dit = REPLIS_STEREO_SIGNALES
+                .get_or_init(Default::default)
+                .lock()
+                .map(|mut vus| !vus.insert((device_name.to_string(), demande)))
+                .unwrap_or(false);
+            if !deja_dit {
+                warn!(
+                    device = %device_name,
+                    backend = %backend,
+                    demande,
+                    accepte,
+                    annonces = ?annonces,
+                    sample_rate = cfg.sample_rate,
+                    "local_multicanal_replie_stereo"
+                );
+            }
+        }
+    }
+    cfg.channels = choix.canaux();
+    cfg
+}

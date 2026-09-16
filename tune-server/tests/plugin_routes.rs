@@ -1102,14 +1102,13 @@ async fn la_fiche_unitaire_porte_aussi_compatible() {
     assert_eq!(fiche["status"], "loaded", "{fiche}");
     assert_eq!(fiche["compatible"], true, "{fiche}");
 
-    // Inconnu de ce binaire : « pas installé » n'est pas « incompatible ».
-    // Le client doit pouvoir afficher la raison réelle, pas un badge rouge
-    // qui parle de version.
+    // #4265 : un nom absent ne promet plus une installation possible.
+    // Le motif distingue l'absence d'une incompatibilite de version.
     let (status, body) = body_of(&app, "/api/v1/plugins/inconnu").await;
     assert_eq!(status, StatusCode::OK);
     let fiche: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(fiche["status"], "not_installed", "{fiche}");
-    assert_eq!(fiche["compatible"], true, "{fiche}");
+    assert_eq!(fiche["compatible"], false, "{fiche}");
 }
 
 /// `GET /api/v1/system/plugins` est l'alias historique, et il lisait la clef
@@ -1214,4 +1213,96 @@ async fn un_greffon_reel_en_attente_de_redemarrage_reste_installe() {
     );
     assert_eq!(fiche["installed"], true);
     assert_eq!(fiche["enabled"], true);
+}
+
+#[tokio::test]
+async fn i4265_fiche_absente_et_installation_portent_le_meme_motif() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+    let app = tune_server::routes::router(state.clone());
+    let mut noms = vec!["absent_i4265"];
+    if !cfg!(feature = "bandcamp") {
+        noms.push("bandcamp");
+    }
+    for nom in noms {
+        let (status, body) = body_of(&app, &format!("/api/v1/plugins/{nom}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let fiche: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            fiche["compatible"], false,
+            "la fiche d'un greffon absent ne doit pas promettre sa compatibilite : {nom}"
+        );
+        assert_eq!(fiche["reason"], "not_compiled_into_this_server");
+        assert_eq!(fiche["status"], "not_installed");
+        for action in ["install", "update"] {
+            let (status, refus) =
+                post_json(&app, &format!("/api/v1/plugins/{nom}/{action}"), "{}").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(refus["error"], "plugin_inconnu");
+            assert_eq!(
+                refus["reason"], fiche["reason"],
+                "fiche et installation doivent partager le motif du refus"
+            );
+        }
+        assert_eq!(reglages_d_installation(&state, nom), (None, None));
+    }
+}
+
+#[tokio::test]
+async fn i4265_les_reglages_herites_ne_rendent_pas_un_absent_compatible() {
+    use_scratch_plugin_data_dir();
+    for (installed, enabled) in [(true, false), (false, true), (true, true)] {
+        let state = new_state();
+        tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set(
+                "plugin_absent_i4265_installed",
+                if installed { "true" } else { "false" },
+            )
+            .unwrap();
+        settings
+            .set(
+                "plugin_absent_i4265_enabled",
+                if enabled { "true" } else { "false" },
+            )
+            .unwrap();
+        let avant = reglages_d_installation(&state, "absent_i4265");
+        let app = tune_server::routes::router(state.clone());
+        let (_, body) = body_of(&app, "/api/v1/plugins/absent_i4265").await;
+        let fiche: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            fiche["compatible"], false,
+            "un reglage herite ne doit pas rendre un greffon absent compatible"
+        );
+        assert_eq!(fiche["reason"], "not_compiled_into_this_server");
+        assert_eq!(fiche["status"], "unavailable");
+        assert_eq!(fiche["installed"], false);
+        assert_eq!(fiche["enabled"], false);
+        assert_eq!(reglages_d_installation(&state, "absent_i4265"), avant);
+    }
+}
+
+#[tokio::test]
+async fn i4265_les_greffons_charges_et_dormants_restent_compatibles() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    tune_server::plugins::init(
+        &state,
+        "http://127.0.0.1:0",
+        vec![Box::new(Loads), Box::new(OptIn)],
+    )
+    .await;
+    let app = tune_server::routes::router(state);
+    for (nom, attendu) in [("loads", "loaded"), ("optin", "not_installed")] {
+        let (status, body) = body_of(&app, &format!("/api/v1/plugins/{nom}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let fiche: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(fiche["compatible"], true);
+        assert_eq!(fiche["status"], attendu);
+        assert!(fiche.get("reason").is_none());
+    }
+    let (status, _) = post_json(&app, "/api/v1/plugins/optin/install", "{}").await;
+    assert_eq!(status, StatusCode::OK);
 }

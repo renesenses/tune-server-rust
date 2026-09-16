@@ -55,6 +55,9 @@ use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 /// album entier. Deux faces du même service, un seul extracteur de page.
 pub mod service;
 
+/// Lot 3 — les achats en FLAC, derrière le cookie de session (`identity`).
+pub(crate) mod achats;
+
 pub use service::BandcampService;
 
 const BC_SEARCH_API: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
@@ -103,7 +106,7 @@ impl TunePlugin for BandcampPlugin {
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(router(self.backend.clone()));
+        ctx.register_router(router(self.backend.clone(), ctx.data_dir.clone()));
         Ok(())
     }
 
@@ -124,14 +127,37 @@ impl TunePlugin for BandcampPlugin {
 #[derive(Clone)]
 struct EtatBandcamp {
     backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    /// Le dossier de données du greffon : les achats descendent sous
+    /// `<data_dir>/achats/`, avant d'être confiés à l'assistant d'import.
+    dossier: std::path::PathBuf,
+    /// Les téléchargements en cours et faits (lot 3).
+    registre: achats::Registre,
 }
 
-pub fn router(backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>) -> Router<()> {
-    let etat = EtatBandcamp { backend };
+pub fn router(
+    backend: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    dossier: std::path::PathBuf,
+) -> Router<()> {
+    let etat = EtatBandcamp {
+        backend,
+        dossier,
+        registre: achats::Registre::default(),
+    };
     Router::new()
         // Lot 2 — la collection d'un acheteur.
         .route("/collection/link", axum::routing::post(bc_lier_compte))
         .route("/collection", get(bc_collection))
+        // Lot 3 — la session d'achat et les achats en FLAC.
+        .route(
+            "/collection/session",
+            get(bc_session_lue)
+                .post(bc_session_posee)
+                .delete(bc_session_oubliee),
+        )
+        .route(
+            "/collection/download",
+            get(bc_telechargements).post(bc_telecharger),
+        )
         // 🔴 #2778 — les favoris. Même enveloppe, même mise en forme, même
         // pagination par curseur : seul le point d'entrée amont change.
         .route("/wishlist", get(bc_wishlist))
@@ -1276,6 +1302,210 @@ async fn bc_lier_compte(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lot 3 — la session d'achat et les achats en FLAC (voir `achats.rs`)
+// ---------------------------------------------------------------------------
+
+/// Le cookie `identity` mémorisé, ou `None`. Une base illisible se lit comme
+/// une absence : l'appel de collection continue alors SANS session, avec ses
+/// extraits — et le journal le dit.
+fn identite_de_session(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Option<String> {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    match reglages.get(achats::CLE_IDENTITE) {
+        Ok(v) => v.filter(|s| !s.is_empty()),
+        Err(e) => {
+            tracing::warn!(erreur = %e, "bandcamp_session_illisible");
+            None
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionBody {
+    /// La valeur du cookie `identity` de bandcamp.com — ou la ligne entière
+    /// collée depuis l'inspecteur, `achats::nettoyer_identite` fait le tri.
+    identity: String,
+}
+
+/// `GET /collection/session` — la session est-elle posée ? Jamais sa valeur.
+async fn bc_session_lue(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+) -> impl IntoResponse {
+    Json(json!({ "session": identite_de_session(&etat.backend).is_some() }))
+}
+
+/// `POST /collection/session` — mémoriser le cookie `identity`.
+///
+/// Un secret : on ne le renvoie pas, on ne le journalise pas. La seule
+/// vérification faite ici est de forme ; la preuve qu'il ouvre bien les
+/// téléchargements, c'est `GET /collection` qui la donne, par
+/// `downloads_available`.
+async fn bc_session_posee(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+    Json(body): Json<SessionBody>,
+) -> impl IntoResponse {
+    let Some(identite) = achats::nettoyer_identite(&body.identity) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cookie identity vide ou mal formé" })),
+        )
+            .into_response();
+    };
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone());
+    match reglages.set(achats::CLE_IDENTITE, &identite) {
+        Ok(()) => {
+            tracing::info!("bandcamp_session_posee");
+            Json(json!({ "session": true })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(erreur = %e, "bandcamp_session_ecriture_en_echec");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("session non mémorisée : {e}"), "session": false })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `DELETE /collection/session` — oublier le cookie.
+async fn bc_session_oubliee(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+) -> impl IntoResponse {
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone());
+    match reglages.delete(achats::CLE_IDENTITE) {
+        Ok(()) => {
+            tracing::info!("bandcamp_session_oubliee");
+            Json(json!({ "session": false })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("session non oubliée : {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TelechargerBody {
+    /// La clé d'achat rendue par `GET /collection` (`sale_item`).
+    sale_item: String,
+}
+
+/// `GET /collection/download` — les téléchargements en cours et faits.
+async fn bc_telechargements(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+) -> impl IntoResponse {
+    Json(json!({ "downloads": etat.registre.liste() }))
+}
+
+/// `POST /collection/download` — descendre un achat en FLAC.
+///
+/// Retrouve la page de téléchargement de l'achat dans la collection (le bloc
+/// `redownload_urls` n'est PAS mémorisé : ses signatures expirent), puis lance
+/// la tâche. `202` avec l'état initial ; le client suit par `GET`.
+async fn bc_telecharger(
+    axum::extract::State(etat): axum::extract::State<EtatBandcamp>,
+    Json(body): Json<TelechargerBody>,
+) -> impl IntoResponse {
+    let Some(identite) = identite_de_session(&etat.backend) else {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({
+                "error": "aucune session Bandcamp",
+                "detail": "POST /collection/session avec {\"identity\": \"…\"} d'abord.",
+            })),
+        )
+            .into_response();
+    };
+    let fan_id = match compte_lie(&etat.backend) {
+        Ok(Some(c)) => c.fan_id,
+        Ok(None) => {
+            return (
+                StatusCode::PRECONDITION_REQUIRED,
+                Json(json!({ "error": "aucun compte Bandcamp lié" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "réglages Bandcamp illisibles", "detail": e })),
+            )
+                .into_response();
+        }
+    };
+    // Parcourir la collection jusqu'à l'achat : le bloc `redownload_urls` est
+    // rendu page par page, avec les articles de la page.
+    let mut jeton = BC_JETON_DEBUT.to_string();
+    let mut trouve: Option<(String, Value)> = None;
+    for _ in 0..40 {
+        let brut = match page_de_collection(fan_id, &jeton, 100, Some(&identite)).await {
+            Ok(b) => b,
+            Err(e) => return passerelle_en_echec(e),
+        };
+        if let Some(art) = brut["items"].as_array().and_then(|v| {
+            v.iter()
+                .find(|a| achats::cle_d_achat(a).as_deref() == Some(body.sale_item.as_str()))
+        }) {
+            match achats::url_de_retelechargement(&brut, art) {
+                Some(url) => trouve = Some((url, art.clone())),
+                None => {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": "cet achat n'a pas de page de téléchargement",
+                            "detail": "la session est absente ou périmée : reposez le cookie identity.",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            break;
+        }
+        if !brut["more_available"].as_bool().unwrap_or(false) {
+            break;
+        }
+        match brut["last_token"].as_str() {
+            Some(t) if t != jeton => jeton = t.to_string(),
+            _ => break,
+        }
+    }
+    let Some((url_page, article)) = trouve else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("achat {} introuvable dans la collection", body.sale_item) })),
+        )
+            .into_response();
+    };
+    let artiste = article["band_name"].as_str().unwrap_or("").to_string();
+    let titre = article["item_title"].as_str().unwrap_or("").to_string();
+    if !etat.registre.inscrire(&body.sale_item, &artiste, &titre) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "téléchargement déjà en cours", "download": etat.registre.lire(&body.sale_item) })),
+        )
+            .into_response();
+    }
+    tracing::info!(achat = %body.sale_item, artiste = %artiste, titre = %titre, "bandcamp_achat_demande");
+    tokio::spawn(achats::telecharger(
+        etat.registre.clone(),
+        achats::Commande {
+            cle: body.sale_item.clone(),
+            url_page,
+            identite,
+            racine: etat.dossier.clone(),
+        },
+    ));
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "download": etat.registre.lire(&body.sale_item) })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct CollectionQuery {
     /// Jeton de pagination rendu par l'appel précédent (`last_token`).
@@ -1327,7 +1557,8 @@ async fn bc_collection(
     let jeton = q
         .older_than_token
         .unwrap_or_else(|| BC_JETON_DEBUT.to_string());
-    match page_de_collection(fan_id, &jeton, q.count).await {
+    let identite = identite_de_session(&etat.backend);
+    match page_de_collection(fan_id, &jeton, q.count, identite.as_deref()).await {
         Ok(brut) => Json(collection_mise_en_forme(&brut, fan_id)).into_response(),
         Err(e) => passerelle_en_echec(e),
     }
@@ -1383,8 +1614,9 @@ pub(crate) async fn page_de_collection(
     fan_id: i64,
     jeton: &str,
     count: u32,
+    identite: Option<&str>,
 ) -> Result<Value, String> {
-    page_fancollection(BC_COLLECTION_API, fan_id, jeton, count).await
+    page_fancollection(BC_COLLECTION_API, fan_id, jeton, count, identite).await
 }
 /// Une page brute de la LISTE DE SOUHAITS — les favoris (#2778).
 pub(crate) async fn page_de_liste_de_souhaits(
@@ -1392,22 +1624,30 @@ pub(crate) async fn page_de_liste_de_souhaits(
     jeton: &str,
     count: u32,
 ) -> Result<Value, String> {
-    page_fancollection(BC_WISHLIST_API, fan_id, jeton, count).await
+    page_fancollection(BC_WISHLIST_API, fan_id, jeton, count, None).await
 }
 /// Une page de l'API `fancollection` de Bandcamp.
 ///
 /// `collection_items` et `wishlist_items` prennent le MÊME corps et rendent la
 /// MÊME enveloppe (mesuré le 11/09/2026, sans cookie) : un seul appel sortant
 /// à maintenir pour les deux, plutôt que deux copies qui divergeront.
+///
+/// Lot 3 : avec le cookie `identity`, `collection_items` rend EN PLUS le bloc
+/// `redownload_urls` — une page de téléchargement par achat. Sans lui, la
+/// même réponse, sans ce bloc : c'est ce que le lot 1 avait mesuré.
 async fn page_fancollection(
     api: &str,
     fan_id: i64,
     jeton: &str,
     count: u32,
+    identite: Option<&str>,
 ) -> Result<Value, String> {
     let client = tune_core::http::client::shared();
-    let reponse = client
-        .post(api)
+    let mut requete = client.post(api);
+    if let Some(id) = identite {
+        requete = requete.header("Cookie", achats::en_tete_cookie(id));
+    }
+    let reponse = requete
         .json(&json!({
             "fan_id": fan_id,
             "older_than_token": jeton,
@@ -1491,6 +1731,11 @@ pub fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
                 "qualite": BC_STREAM_QUALITY,
                 "lossless": false,
                 "source": "bandcamp",
+                // Lot 3 : la clé d'achat, et si Bandcamp offre le fichier.
+                // `downloadable` n'est vrai qu'avec la session — c'est le
+                // bouton « Télécharger en FLAC » du client.
+                "sale_item": achats::cle_d_achat(it),
+                "downloadable": achats::url_de_retelechargement(brut, it).is_some(),
             })
         })
         .collect();
@@ -1509,6 +1754,13 @@ pub fn collection_mise_en_forme(brut: &Value, fan_id: i64) -> Value {
         "qualite": BC_STREAM_QUALITY,
         "lossless": false,
         "quality_note": BC_NOTE_QUALITE,
+        // Lot 3 : la réponse portait-elle des pages de téléchargement ? Faux
+        // sans session, ou avec une session périmée — le client en fait un
+        // bandeau, pas une erreur.
+        "downloads_available": brut["redownload_urls"]
+            .as_object()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false),
     })
 }
 
@@ -1816,7 +2068,8 @@ mod tests {
         // (accolades dépareillées dans un motif de chemin) panique à la
         // construction, pas à la compilation.
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
-        let _ = router(std::sync::Arc::new(db));
+        let scratch = tune_core::test_scratch::scratch_dir("tune_bc_router");
+        let _ = router(std::sync::Arc::new(db), scratch.path().to_path_buf());
     }
 
     /// Fragment de page RÉEL, réduit : l'attribut tel que Bandcamp l'émet,

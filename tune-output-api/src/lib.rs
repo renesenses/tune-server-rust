@@ -1927,6 +1927,18 @@ pub trait OutputTarget: Send + Sync {
     async fn set_volume(&self, volume: f64) -> Result<(), String>;
     async fn set_mute(&self, muted: bool) -> Result<(), String>;
     async fn get_status(&self) -> Result<OutputStatus, String>;
+    /// Bytes actually processed for the current track by a non-realtime output.
+    ///
+    /// The host uses increases in this counter to detect activity when the
+    /// media position stops advancing. Return `Some(0)` while waiting for the
+    /// first bytes, and `None` when no measurement is available. Repeated
+    /// values are not a heartbeat; a genuinely stalled operation still expires.
+    /// Reset the counter when starting a new track. Realtime outputs ignore it.
+    ///
+    /// Kept outside `OutputStatus` to preserve existing plugin struct literals.
+    async fn processing_progress_bytes(&self) -> Option<u64> {
+        None
+    }
     async fn is_available(&self) -> bool;
 
     /// Entrées contrôlées utilisées par l'hôte. La capacité est vérifiée avant

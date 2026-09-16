@@ -182,6 +182,8 @@ const MIGRATION_TABLES: &[&str] = &[
     // sans cette ligne, la bascule SQLite -> PostgreSQL rendrait au registre
     // le defaut qu'on vient de lui retirer, une liste qui repart de zero.
     "media_servers",
+    "upnp_library_sources",
+    "upnp_library_members",
     "podcast_subscriptions",
     "offline_cache",
     "sync_links",
@@ -877,6 +879,20 @@ CREATE INDEX IF NOT EXISTS idx_bookmarks_track_id ON bookmarks(track_id);
 CREATE INDEX IF NOT EXISTS idx_favorites_profile ON favorites(profile_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_item_tags_item ON item_tags(item_type, item_id);
 CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id);
+CREATE TABLE IF NOT EXISTS upnp_library_sources (
+    source_key TEXT PRIMARY KEY,
+    udn TEXT NOT NULL,
+    container TEXT NOT NULL,
+    state_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS upnp_library_members (
+    source_key TEXT NOT NULL REFERENCES upnp_library_sources(source_key) ON DELETE CASCADE,
+    track_id BIGINT NOT NULL,
+    generation TEXT NOT NULL,
+    PRIMARY KEY (source_key, track_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_upnp_library_members_track ON upnp_library_members(track_id);
 CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);
 CREATE INDEX IF NOT EXISTS idx_album_ratings_album ON album_ratings(album_id);
 CREATE INDEX IF NOT EXISTS idx_track_metadata_key ON track_metadata(key);
@@ -1203,6 +1219,8 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         // Meme cas : pas de colonne `id`, la clef primaire est l'UDN — la
         // seule identite d'un appareil UPnP qui survive a un changement de
         // port (#2219, phase 1).
+        "upnp_library_sources" => "ON CONFLICT (source_key) DO NOTHING",
+        "upnp_library_members" => "ON CONFLICT (source_key, track_id) DO NOTHING",
         "media_servers" => "ON CONFLICT (udn) DO NOTHING",
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",

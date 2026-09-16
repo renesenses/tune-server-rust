@@ -1361,14 +1361,20 @@ pub fn decode_to_pcm(
     // symphonia ou par libopus, ou ne l'est pas du tout.
     //
     // Opus needs libopus (symphonia has no Opus codec). We route the explicit
-    // Opus/WebM extensions here, and ALSO sniff `.ogg`/`.oga` for OpusHead —
+    // Opus extension here, and ALSO sniff `.ogg`/`.oga` for OpusHead —
     // a `.ogg` file can carry Opus, and misrouting it to the Vorbis decoder
     // would fail (silence + 2 s loop). Vorbis/FLAC-in-Ogg fall through to
     // symphonia below.
+    //
+    // Matroska (`.mkv`/`.mka`/`.webm`/`.weba`, #3633) : la PISTE décide, pas
+    // l'extension. `.webm` partait chez libopus sans regarder — juste pour
+    // l'Opus de YouTube, faux pour un WebM Vorbis. La sonde lit le `CodecID`
+    // de la première piste audio : Opus → libopus ; FLAC, PCM, Vorbis, AAC,
+    // ALAC → symphonia, ci-dessous, qui démuxe déjà le conteneur.
     } else if ext == "opus"
-        || ext == "webm"
-        || ext == "weba"
         || ((ext == "ogg" || ext == "oga") && ogg_stream_is_opus(file_path))
+        || (super::matroska::est_extension_matroska(&ext)
+            && super::matroska::piste_audio_est_opus(file_path))
     {
         // symphonia demuxes the container (mkv/ogg features) but has no Opus
         // decoder, so the packets are fed to libopus via the `opus` crate. This gives
@@ -2053,8 +2059,15 @@ fn decode_to_pcm_streaming_inner(
     // make_audio_decoder, which failed → the stream produced no audio and (for
     // local files) looped every ~2 s. `.ogg`/`.oga` is sniffed: OpusHead → here,
     // Vorbis/FLAC-in-Ogg → the symphonia streaming path below.
-    if matches!(ext.as_str(), "opus" | "webm" | "weba")
+    //
+    // Matroska (#3633) : même sonde que `decode_to_pcm` — Opus → libopus,
+    // tout autre codec décodable → le chemin symphonia ci-dessous, paquet par
+    // paquet, seek compris (le démuxeur MKV suit les `Cues`, ou avance dans
+    // les clusters quand il n'y en a pas).
+    if ext == "opus"
         || ((ext == "ogg" || ext == "oga") && ogg_stream_is_opus(file_path))
+        || (super::matroska::est_extension_matroska(&ext)
+            && super::matroska::piste_audio_est_opus(file_path))
     {
         // Full decode (seek honoured) with the same exact target contract.
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, seek_s, 0.0)?;
