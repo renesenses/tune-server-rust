@@ -20,6 +20,7 @@ use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
+use tune_core::library::quality::libelle_cadence;
 
 use super::{Pagination, refus};
 
@@ -309,9 +310,28 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
     let dynamic_ranges = AlbumRepo::with_backend(state.backend.clone())
         .dynamic_range_values()
         .unwrap_or_default();
-    Ok(Json(
-        json!({ "formats": formats, "sample_rates": sample_rates, "dynamic_ranges": dynamic_ranges }),
-    ))
+    // #4171 (Cyrille Moutia, fil 1792) : `sample_rates` rend les hertz BRUTS,
+    // et un album DSD y figure bien — le scan écrit la cadence 1 bit
+    // (2 822 400 pour du DSD64) dans `tracks.sample_rate`, que
+    // `update_quality_from_tracks` remonte par `MAX` dans `albums.sample_rate`.
+    // Mais l'écran ne savait ni nommer ces valeurs ni les reconnaître comme du
+    // DSD. `sample_rate_labels` porte, dans le MÊME ordre que `sample_rates`,
+    // le libellé lisible (« DSD64 », « 96 kHz ») et le marqueur `dsd` ; la
+    // `value` est celle que le filtre reçoit. `sample_rates` est gardé tel
+    // quel : un client installé ne voit aucun changement.
+    let sample_rate_labels: Vec<Value> = sample_rates
+        .iter()
+        .map(|&sr| {
+            let l = libelle_cadence(sr);
+            json!({ "value": l.value, "label": l.label, "dsd": l.dsd })
+        })
+        .collect();
+    Ok(Json(json!({
+        "formats": formats,
+        "sample_rates": sample_rates,
+        "sample_rate_labels": sample_rate_labels,
+        "dynamic_ranges": dynamic_ranges,
+    })))
 }
 
 pub(super) async fn recent_albums(
@@ -2490,6 +2510,78 @@ mod tests_editions {
                 .await
                 .is_err()
         );
+    }
+}
+
+/// #4171 (Cyrille Moutia, fil 1792) : la facette des fréquences de
+/// `GET /library/albums/filters` porte un libellé lisible et reconnaît le DSD.
+#[cfg(test)]
+mod tests_facette_frequences {
+    use super::*;
+
+    /// Les albums DSD entrent dans `sample_rates` (cadence 1 bit brute,
+    /// contrat inchangé), et `sample_rate_labels`, dans le MÊME ordre, les
+    /// nomme DSD64/DSD128 avec `dsd: true` ; le PCM est en kHz, `dsd: false`.
+    #[tokio::test]
+    async fn la_facette_des_frequences_nomme_les_paliers_dsd() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let album = |titre: &str, format: &str, sr: i64, bd: i64| {
+            b.execute(
+                "INSERT INTO albums (title, format, sample_rate, bit_depth, track_count) \
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &format as &dyn ToSqlValue,
+                    &sr as &dyn ToSqlValue,
+                    &bd as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+        };
+        // Ce que le scan écrit : cadence 1 bit brute et `bit_depth = 1` pour
+        // un `.dsf`/`.dff` (`dsf_dff_fallback_complete`, `metadata/mod.rs`),
+        // remontées telles quelles dans `albums` par `update_quality_from_tracks`.
+        album("CD", "flac", 44_100, 16);
+        album("Hi-res", "flac", 96_000, 24);
+        album("SACD rip", "dsf", 2_822_400, 1);
+        album("DSD128", "dff", 5_644_800, 1);
+        // Un doublon de cadence ne fait qu'une entrée.
+        album("Autre SACD", "dsf", 2_822_400, 1);
+
+        let Json(v) = album_filters(State(state.clone()))
+            .await
+            .ok()
+            .expect("la route répond");
+
+        // Contrat existant, intact : les hertz bruts, croissants, distincts.
+        assert_eq!(
+            v["sample_rates"],
+            json!([44_100, 96_000, 2_822_400, 5_644_800]),
+            "{v}"
+        );
+        // Le nouveau champ, aligné sur `sample_rates`.
+        let labels = v["sample_rate_labels"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sample_rate_labels absent : {v}"));
+        let attendu = [
+            (44_100, "44.1 kHz", false),
+            (96_000, "96 kHz", false),
+            (2_822_400, "DSD64", true),
+            (5_644_800, "DSD128", true),
+        ];
+        assert_eq!(labels.len(), attendu.len(), "{v}");
+        for (entree, (valeur, libelle, dsd)) in labels.iter().zip(attendu) {
+            assert_eq!(entree["value"], valeur, "{entree}");
+            assert_eq!(
+                entree["label"], libelle,
+                "la cadence {valeur} doit se lire « {libelle} » — {entree}"
+            );
+            assert_eq!(
+                entree["dsd"], dsd,
+                "la cadence {valeur} doit porter dsd={dsd} — {entree}"
+            );
+        }
     }
 }
 

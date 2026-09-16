@@ -7,6 +7,7 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use tune_core::db::backend::SqlValue;
 use tune_core::db::engine::Engine;
 use tune_core::db::facet_filter::{Placeholders, TrackFilter, any_of, favorite_condition};
+use tune_core::library::quality::{libelle_cadence, libelle_profondeur};
 
 use super::query_multi::track_filter_from_raw;
 use crate::error::AppError;
@@ -530,11 +531,37 @@ pub(super) async fn library_facets(
         };
         let arr: Vec<Value> = rows
             .into_iter()
-            .map(|(value, count)| json!({ "value": value, "count": count }))
+            .map(|(value, count)| enrichir_entree(&field, value, count))
             .collect();
         out.insert(field, Value::Array(arr));
     }
     Ok(Json(Value::Object(out)))
+}
+
+/// Une entrée `{ value, count }` du rail, enrichie pour les deux facettes
+/// techniques que l'écran ne savait pas lire (#4171, Cyrille Moutia, fil 1792).
+///
+/// `sample_rate` rend la cadence BRUTE de `tracks.sample_rate` — pour un
+/// `.dsf`/`.dff` c'est la cadence 1 bit, 2 822 400 en DSD64 — et l'écran n'en
+/// faisait rien. On AJOUTE `label` (« DSD64 », « 96 kHz ») et `dsd` ; `value`
+/// reste la chaîne que le filtre `sample_rate=<value>` attend, et `count` ne
+/// bouge pas. `bit_depth` reçoit un `label` qui nomme `1` comme du DSD. Les
+/// autres facettes sont rendues telles quelles : même contrat qu'avant.
+///
+/// Jumelle de `sample_rate_labels` dans `GET /library/albums/filters`
+/// (`albums.rs`, `album_filters`) : les deux routes servent la même matière et
+/// doivent la nommer pareil.
+fn enrichir_entree(field: &str, value: String, count: i64) -> Value {
+    match (field, value.parse::<i64>()) {
+        ("sample_rate", Ok(sr)) => {
+            let l = libelle_cadence(sr);
+            json!({ "value": value, "count": count, "label": l.label, "dsd": l.dsd })
+        }
+        ("bit_depth", Ok(bd)) => {
+            json!({ "value": value, "count": count, "label": libelle_profondeur(bd) })
+        }
+        _ => json!({ "value": value, "count": count }),
+    }
 }
 
 /// Les cinq étiquettes surveillées, dans l'ordre où elles gênent l'écoute :
@@ -1355,6 +1382,118 @@ mod tests {
         assert_eq!(total, 2, "casse indifférente");
         let titres: Vec<&str> = pistes.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(titres, ["A", "B"]);
+    }
+
+    /// #4171 (Cyrille Moutia, fil 1792) : la facette `sample_rate` garde
+    /// `{ value, count }` tel quel et AJOUTE `label`/`dsd` ; `bit_depth`
+    /// nomme `1` comme du DSD ; et la valeur brute d'un palier DSD continue de
+    /// filtrer — la facette voisine comme la liste des pistes.
+    #[tokio::test]
+    async fn la_facette_des_frequences_nomme_le_dsd_et_le_filtre_encore() {
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let piste = |titre: &str, format: &str, sr: i64, bd: i64| {
+            b.execute(
+                "INSERT INTO tracks (title, file_path, format, sample_rate, bit_depth) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &format!("/m/{titre}.{format}") as &dyn ToSqlValue,
+                    &format as &dyn ToSqlValue,
+                    &sr as &dyn ToSqlValue,
+                    &bd as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+        };
+        // Ce que le scan écrit pour un `.dsf`/`.dff` : la cadence 1 bit brute
+        // et `bit_depth = 1` (`dsf_dff_fallback_complete`, `metadata/mod.rs`).
+        piste("cd-1", "flac", 44_100, 16);
+        piste("cd-2", "flac", 44_100, 16);
+        piste("hr-1", "flac", 96_000, 24);
+        piste("dsd64-1", "dsf", 2_822_400, 1);
+        piste("dsd64-2", "dsf", 2_822_400, 1);
+        piste("dsd128-1", "dff", 5_644_800, 1);
+
+        async fn facettes(state: &AppState, raw: &str) -> Value {
+            let fields = raw
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("fields="))
+                .map(str::to_string);
+            let Json(v) = library_facets(
+                Query(FacetQuery {
+                    fields,
+                    ..Default::default()
+                }),
+                RawQuery(Some(raw.to_string())),
+                State(state.clone()),
+            )
+            .await
+            .ok()
+            .expect("la route répond");
+            v
+        }
+        let entree = |v: &Value, champ: &str, valeur: &str| -> Value {
+            v[champ]
+                .as_array()
+                .unwrap_or_else(|| panic!("facette {champ} absente : {v}"))
+                .iter()
+                .find(|e| e["value"] == valeur)
+                .cloned()
+                .unwrap_or_else(|| panic!("{champ}={valeur} absent de la facette : {v}"))
+        };
+
+        let v = facettes(&state, "fields=sample_rate,bit_depth,genre").await;
+        // Contrat existant intact : `value` (chaîne) et `count`.
+        let dsd64 = entree(&v, "sample_rate", "2822400");
+        assert_eq!(dsd64["count"], 2, "{dsd64}");
+        assert_eq!(
+            dsd64["label"], "DSD64",
+            "la cadence 2 822 400 doit se lire « DSD64 » — {dsd64}"
+        );
+        assert_eq!(dsd64["dsd"], true, "{dsd64}");
+        let dsd128 = entree(&v, "sample_rate", "5644800");
+        assert_eq!(dsd128["label"], "DSD128", "{dsd128}");
+        assert_eq!(dsd128["dsd"], true, "{dsd128}");
+        let cd = entree(&v, "sample_rate", "44100");
+        assert_eq!(cd["count"], 2, "{cd}");
+        assert_eq!(cd["label"], "44.1 kHz", "{cd}");
+        assert_eq!(cd["dsd"], false, "{cd}");
+        // `bit_depth = 1` se reconnaît comme du DSD.
+        let un_bit = entree(&v, "bit_depth", "1");
+        assert_eq!(un_bit["count"], 3, "{un_bit}");
+        assert_eq!(un_bit["label"], "1 bit (DSD)", "{un_bit}");
+        assert_eq!(entree(&v, "bit_depth", "24")["label"], "24 bits");
+        // Les autres facettes ne reçoivent AUCUNE clé nouvelle.
+        assert!(
+            v["genre"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e.get("label").is_none()),
+            "{v}"
+        );
+
+        // Le filtre par la valeur brute d'un palier DSD resserre toujours la
+        // facette voisine…
+        let v = facettes(&state, "fields=format&sample_rate=2822400").await;
+        let formats = v["format"].as_array().unwrap();
+        assert_eq!(formats.len(), 1, "{v}");
+        assert_eq!(formats[0]["value"], "dsf");
+        assert_eq!(formats[0]["count"], 2);
+        // …et la liste des pistes.
+        let filtre = tune_core::db::facet_filter::TrackFilter {
+            sample_rates: vec![2_822_400],
+            ..Default::default()
+        };
+        let (pistes, total) =
+            tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+                .list_filtered(&filtre, 50, 0)
+                .unwrap();
+        assert_eq!(total, 2);
+        let titres: Vec<&str> = pistes.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titres, ["dsd64-1", "dsd64-2"]);
     }
 
     /// La liste des étiquettes surveillées est FERMÉE : c'est elle qui garantit
