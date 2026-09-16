@@ -74,6 +74,67 @@ pub fn dlna_cap_16bit_applies(
     is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
 }
 
+/// Le passthrough ALAC (« ALAC direct », opt-in par zone) s'applique-t-il à
+/// CETTE lecture ?
+///
+/// Servir le conteneur ALAC tel quel à un renderer qui le décode — bit-perfect,
+/// zéro processeur. Il s'applique sur une sortie RÉSEAU seulement : ailleurs,
+/// rien ne transcode l'ALAC pour la sortie, donc rien à désarmer (une sortie
+/// PULL comme `diretta` va chercher le fichier elle-même et le décode ; le
+/// Target Diretta ne reçoit que des échantillons, jamais un conteneur — le
+/// « passthrough » n'y a pas d'objet, et lister `diretta` parmi les sorties
+/// réseau rouvrirait le trou d'Eric, #1393 : l'égaliseur calculé puis jeté).
+///
+/// Trois contraintes du renderer PRIMENT sur la préférence, et elles la
+/// désarment plutôt que de coexister avec elle :
+///
+/// - le forçage WAV (`dlna_lpcm` / `dlna_wav24`, par [`wav_override_applies`]) —
+///   c'est LUI qui existe pour contourner le décodeur ALAC du renderer ;
+/// - le plafond 16 bits ([`dlna_cap_16bit_applies`]) — le Ruark R3 décode
+///   l'ALAC 24 bits en silence (#1137) ;
+/// - le plafond de fréquence (`max_sample_rate`, zone et catalogue combinés en
+///   `min`, par la MÊME fonction que `needs_downsample` :
+///   [`crate::audio::formats::needs_downsample_for_cap`]). Ce plafond est une
+///   limite PCM du renderer (Sonos One, WiiM Mini, Denon Home : 48 kHz au
+///   catalogue), et l'ALAC est du PCM compressé sans perte : un ALAC 96 kHz
+///   servi direct à un appareil qui plafonne à 48 kHz ne se lit pas. Le DSD
+///   natif, lui, est exempté du plafond (#380) parce qu'un train de bits DSD
+///   n'est PAS du PCM et que son passthrough est sondé chez le renderer ; rien
+///   de tel ne vaut pour l'ALAC.
+///
+/// Sans cette troisième garde, l'orchestrateur transcodait quand même (le
+/// rééchantillonnage force le transcodage, `needs_downsample`) mais avec
+/// `alac_passthrough = true` : la négociation FLAC du renderer était sautée
+/// (`will_be_flac` faux), et le miroir du chemin du signal — qui recopiait la
+/// condition à la main, CINQUIÈME copie — annonçait de l'ALAC sur un fil qui
+/// porte du FLAC (#3183, écart n° 1). Les deux côtés appellent désormais cette
+/// fonction ; `output_type` est OBLIGATOIRE, comme pour
+/// [`needs_transcode_for_output_applies`].
+///
+/// `zone_opt_in` est une fermeture : la lecture du réglage en base n'a lieu que
+/// si tout le reste tient, comme la condition d'origine le court-circuitait.
+pub fn alac_passthrough_applies(
+    output_type: Option<&str>,
+    source_format: Option<AudioFormat>,
+    sample_rate: u32,
+    zone_max_sample_rate: Option<u32>,
+    dlna_force_wav: bool,
+    dlna_cap_16bit: bool,
+    zone_opt_in: impl FnOnce() -> bool,
+) -> bool {
+    source_format == Some(AudioFormat::Alac)
+        && is_network_output_type(output_type)
+        && !dlna_force_wav
+        && !dlna_cap_16bit
+        && !crate::audio::formats::needs_downsample_for_cap(
+            source_format,
+            sample_rate,
+            zone_max_sample_rate,
+            false,
+        )
+        && zone_opt_in()
+}
+
 /// La source doit-elle etre transcodee POUR LA SORTIE ?
 ///
 /// Quatrieme condition partagee entre la decision
