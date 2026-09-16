@@ -1909,7 +1909,7 @@ impl AlbumRepo {
     /// s'inlinent sans marqueur, comme la matérialisation de la page juste
     /// en dessous, et par tranches pour la même raison (limite de longueur
     /// SQL de SQLite).
-    pub(crate) fn added_at_by_ids(
+    pub fn added_at_by_ids(
         &self,
         ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, f64>, TuneError> {
