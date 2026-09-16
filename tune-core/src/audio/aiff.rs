@@ -718,14 +718,19 @@ mod tests {
         form.extend_from_slice(&comm);
         form.extend_from_slice(&ssnd);
 
-        let tmp = tempfile::Builder::new().suffix(".aiff").tempfile().unwrap();
+        let tmp = tempfile::Builder::new().suffix(".aifc").tempfile().unwrap();
         std::fs::write(tmp.path(), &form).unwrap();
 
         let info = parse_aiff(tmp.path().to_str().unwrap()).unwrap();
         assert!(info.is_aifc);
         assert_eq!(info.compression.as_deref(), Some("sowt"));
 
-        let decoded = decode_aiff_to_pcm(tmp.path().to_str().unwrap(), 0.0, 0.0).unwrap();
+        // Passer par la porte publique : l'extension canonique `.aifc` doit
+        // atteindre ce parseur, pas seulement fonctionner quand on l'appelle
+        // directement depuis son propre module (#4030).
+        let decoded =
+            crate::audio::decode::decode_to_pcm(tmp.path().to_str().unwrap(), None, None, 0.0, 0.0)
+                .unwrap();
         assert_eq!(decoded.samples_i32.len(), 2);
         assert_eq!(decoded.samples_i32[0], 500);
         assert_eq!(decoded.samples_i32[1], -500);

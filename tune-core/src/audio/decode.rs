@@ -1326,7 +1326,7 @@ pub fn decode_to_pcm(
         .unwrap_or("")
         .to_lowercase();
 
-    let decoded = if ext == "aiff" || ext == "aif" {
+    let decoded = if matches!(ext.as_str(), "aiff" | "aif" | "aifc") {
         super::aiff::decode_aiff_to_pcm(file_path, seek_s, max_duration_s)
     } else if ext == "dsf" || ext == "dff" {
         decode_dsd_to_pcm(
@@ -2155,13 +2155,13 @@ fn decode_to_pcm_streaming_inner(
     // This still benefits from the session being created early.
     //
     // `.ape` en est SORTI (#2505) : il a désormais son propre chemin
-    // incrémental juste au-dessus. `aiff`/`aif`/`wv` restent ici parce que
+    // incrémental juste au-dessus. `aiff`/`aif`/`aifc`/`wv` restent ici parce que
     // leurs décodeurs (`audio::aiff::decode_aiff_to_pcm`,
     // `audio::wavpack::decode_wavpack_to_pcm`) n'exposent QUE le décodage
     // intégral : leur donner le même traitement demande de les réécrire en
     // décodeurs par blocs, ce qui est un autre chantier que #2505. Ils
     // souffrent du même défaut et il est nommé ici plutôt que tu.
-    if matches!(ext.as_str(), "aiff" | "aif" | "wv") {
+    if matches!(ext.as_str(), "aiff" | "aif" | "aifc" | "wv") {
         let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
@@ -4431,6 +4431,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(can_decode_native("song.opus"));
         assert!(can_decode_native("song.aiff"));
         assert!(can_decode_native("song.aif"));
+        assert!(can_decode_native("song.aifc"));
         assert!(can_decode_native("song.dsf"));
         assert!(can_decode_native("song.dff"));
         assert!(can_decode_native("song.ape"));
