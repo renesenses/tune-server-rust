@@ -179,11 +179,13 @@ async fn non_joignable_n_est_pas_encore_absent() {
          proposé.\n{liste}"
     );
 
-    // 6 000 s : au-delà de l'absence. Le plafond de bascule en masse ne
-    // s'applique pas — un seul serveur, sous le plancher de 3.
+    // 30 h : au-delà de l'absence — 24 h depuis l'arbitrage D2 (Bertrand,
+    // 14/09/2026), ramené le 16/09 ; c'était 6 000 s sous l'ancien seuil de
+    // 5 400 s. Le plafond de bascule en masse ne s'applique pas — un seul
+    // serveur, sous le plancher de 3.
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let app = tune_server::routes::router(state.clone());
-    observer_il_y_a(&state, "uuid:eteint", "192.168.1.42", 6_000);
+    observer_il_y_a(&state, "uuid:eteint", "192.168.1.42", 30 * 3_600);
     let (_, liste) = obtenir(&app, "/api/v1/network/media-servers").await;
     let s = ligne(&liste, "uuid:eteint");
     assert_eq!(s["reachable"], false, "{liste}");
@@ -203,7 +205,7 @@ async fn relire_la_liste_ne_ressuscite_pas_un_serveur_eteint() {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let app = tune_server::routes::router(state.clone());
 
-    observer_il_y_a(&state, "uuid:eteint", "192.168.1.42", 6_000);
+    observer_il_y_a(&state, "uuid:eteint", "192.168.1.42", 30 * 3_600);
 
     let (_, premiere) = obtenir(&app, "/api/v1/network/media-servers").await;
     let (_, seconde) = obtenir(&app, "/api/v1/network/media-servers").await;
