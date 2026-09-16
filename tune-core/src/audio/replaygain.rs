@@ -632,6 +632,29 @@ pub fn compter_les_candidats_replaygain(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
+/// Combien de pistes la passe tient à l'écart parce que **leur fichier ne
+/// répond pas** — report non expiré (#1865), même clé pour le ReplayGain et
+/// la plage dynamique.
+///
+/// Ce n'est ni « analysé » ni « à faire » : c'est « en attente d'un disque ».
+/// Sans ce chiffre, une bibliothèque entière sur un partage démonté se lisait
+/// « ReplayGain terminée » — `compter_les_candidats_replaygain` exclut ces
+/// pistes, à raison, et rendait `total = 0` (Benjithom, 0.9.151, #4254). Les
+/// cartes de la page Santé le montrent à côté de la jauge, avec sa cause.
+pub fn compter_les_reportees_par_chemin(backend: &Arc<dyn DbBackend>) -> i64 {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    backend
+        .query_one(
+            "SELECT COUNT(DISTINCT m.track_id) FROM track_metadata m \
+             WHERE m.key = 'rg_path_unresolved' AND m.value > ?",
+            &[&seuil_report as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+}
+
 /// Analyse up to `TRACK_BATCH` local tracks that have no ReplayGain yet. Returns
 /// how many were processed (0 ⇒ nothing left, caller idles).
 pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
@@ -4680,6 +4703,70 @@ mod garde_pic_hors_echelle {
         assert!(
             (sans - ferraille).abs() < 1e-12,
             "sans pic {sans} != pic hors échelle {ferraille}"
+        );
+    }
+}
+
+/// #4254 — les pistes que la passe REPORTE (fichier qui ne répond pas) sont
+/// comptées à part : ni « faites », ni « à faire ». Un report expiré ne
+/// compte plus — il redevient un candidat.
+#[cfg(test)]
+mod tests_reportees_par_chemin_4254 {
+    use std::sync::Arc;
+
+    use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::library::local_path::{PATH_RETRY_AFTER_SECS, deferral_stamp};
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'Bjork')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Homogenic', 1)",
+            &[],
+        )
+        .unwrap();
+        for id in 1..=3 {
+            db.execute(
+                &format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, \
+                     sample_rate, channels) VALUES ({id}, 'Piste {id}', 1, 1, \
+                     '/media/music/absent-{id}.flac', 300000, 44100, 2)"
+                ),
+                &[],
+            )
+            .unwrap();
+        }
+        Arc::new(db)
+    }
+
+    fn reporter(backend: &Arc<dyn DbBackend>, track_id: i64, epoch: i64) {
+        let date = deferral_stamp(epoch);
+        backend
+            .execute(
+                "INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'rg_path_unresolved', ?)",
+                &[&track_id as &dyn ToSqlValue, &date as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn compte_les_reports_vivants_et_oublie_les_expires() {
+        let backend = base();
+        assert_eq!(super::compter_les_reportees_par_chemin(&backend), 0);
+        let now = super::now_epoch_secs() as i64;
+        reporter(&backend, 1, now);
+        reporter(&backend, 2, now - 60);
+        // Expiré d'une seconde : la passe le retentera, il n'est plus « reporté ».
+        reporter(&backend, 3, now - PATH_RETRY_AFTER_SECS - 1);
+        assert_eq!(
+            super::compter_les_reportees_par_chemin(&backend),
+            2,
+            "deux reports vivants, un expiré"
         );
     }
 }
