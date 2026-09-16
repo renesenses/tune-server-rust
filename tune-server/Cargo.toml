@@ -663,3 +663,7 @@ path = "tests/idle_poll_diagnostics_2566.rs"
 [[test]]
 name = "alarm_source_3715"
 path = "tests/alarm_source_3715.rs"
+
+[[test]]
+name = "history_context_4036"
+path = "tests/history_context_4036.rs"

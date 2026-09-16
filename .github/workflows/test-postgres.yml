@@ -210,6 +210,11 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
 
+      - name: Noms de contexte historique sur PostgreSQL (#4036)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i4036_context_names_postgres -- --nocapture
+
       # #3248 -- l'INSERT conditionnel sterile, sur une VRAIE base.
       #
       # Les temoins de #3248 existent depuis le 03/09 et sont declares dans
