@@ -673,3 +673,41 @@ Aucun test n’a été désactivé pour masquer cet échec.
 
 La CI doit porter sur le commit publié de cette étape ; les succès de la
 tête précédente ef22a846 ne valent pas validation de cette nouvelle tête.
+
+### Rangement du banc après la CI de e472b93d
+
+La CI principale 35126457635 et PostgreSQL 35126457649 ont échoué sur le
+même témoin tests_orphelins. Le banc CPace était exécuté par le module runtime,
+mais son fichier à la racine de tests/ était invisible au recensement des
+agrégateurs directs. Il est déplacé dans tests/sendspin/cpace_runtime_3326.rs,
+le sous-dossier destiné aux modules, et son attribut path est mis à jour.
+
+Le code de tests_orphelins.rs et le contenu du banc CPace sont inchangés par
+SHA-256. Aucun test n’est exclu, aucun workflow ni garde n’est modifié.
+
+Sur Shrek, compilation directe du même test standard avec
+CARGO_MANIFEST_DIR fixé au paquet tune-server :
+
+    rustc --edition=2024 --test tune-server/tests/tests_orphelins.rs \
+      -o "$CARGO_TARGET_DIR/tests-orphelins"
+
+Avant déplacement : un rouge nommant sendspin_cpace_runtime_3326.rs.
+Après déplacement : un vert. Puis la cible réellement utilisée en CI passe :
+
+    cargo test --locked -j6 -p tune-server --no-default-features --features oaat \
+      --test server_contracts tests_orphelins::
+
+Résultat : un vert. La cible sendspin_point_d_acces_s2a repasse 19 tests
+(2 ignorés), et le filtre CPace exécuté explicitement repasse ses dix
+scénarios depuis le nouvel emplacement (107,51 s hors compilation).
+
+Un timeout de trois secondes a été observé sur le premier passage PSK de
+cette relance, pendant une forte attente disque (pression IO ~33 %, charge
+~34). Sa cause n’est pas isolée. Sans modifier le code ni les délais, le test
+isolé repasse, puis la suite complète repasse. Ce premier échec est conservé ;
+il n’est pas présenté comme une contre-épreuve ni effacé des mesures.
+
+Preuves : layout-before.log, layout-after.log, layout-hashes.json,
+layout-server-tests.log (timeout), layout-timeout-resources.log,
+layout-psk-isolated.log, layout-server-recheck.log, layout-cpace-tests.log et
+layout-orphan-cargo.log. Les journaux CI rouges sont sous ci-e472b93d/.

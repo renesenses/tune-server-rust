@@ -556,5 +556,5 @@ async fn i3326_runtime_transport_corrompu_ferme_sans_server_error() {
     }
 }
 
-#[path = "sendspin_cpace_runtime_3326.rs"]
+#[path = "sendspin/cpace_runtime_3326.rs"]
 mod cpace;
