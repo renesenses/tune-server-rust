@@ -148,21 +148,147 @@ pub async fn write_tags(file_path: &str, update: &TagUpdate) -> Result<WriteResu
         .map_err(|e| format!("join: {e}"))?
 }
 
-fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, String> {
-    let mut tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
-    let tag_type = tagged.primary_tag_type();
+/// Applique une modification au `Tag` GÉNÉRIQUE d'un fichier et l'enregistre,
+/// sans perdre ce que ce `Tag` ne sait pas représenter.
+///
+/// 🔴 MESURÉ le 16/09/2026 : `lofty::read_from_path` → `Tag` → `save_to`
+/// EFFAÇAIT tout champ Vorbis hors catalogue d'un FLAC à chaque écriture —
+/// `DYNAMIC RANGE`, `ALBUM DYNAMIC RANGE`, `SOURCE`, les champs maison des
+/// testeurs (Patatorz tague ses DR via Mp3tag, fil 1683). Un FLAC gravé
+/// `DYNAMIC RANGE=12`, puis un compositeur écrit par `write_tags` : le DR
+/// avait disparu. lofty 0.24 n'a pas d'`ItemKey::Unknown` : la conversion
+/// `VorbisComments → Tag` range ces champs dans un *reste* que `From` jette.
+///
+/// Pour FLAC / Ogg / Opus, on passe donc par le fichier CONCRET et par le
+/// couple `split_tag` / `merge_tag` que lofty prévoit exactement pour ça :
+/// le reste garde les champs inconnus (et le vendor), le `Tag` reçoit ce que
+/// l'appelant sait éditer, et la fusion réunit les deux. `FlacFile::save_to`
+/// réenchaîne aussi les blocs PICTURE, que `VorbisComments::save_to` seul
+/// retirerait. Les autres conteneurs (MP3, M4A, AIFF) gardent le chemin
+/// générique : lofty y conserve les trames inconnues (TXXX, atomes libres)
+/// dans le `Tag` lui-même.
+///
+/// `appliquer` rend le nombre de champs touchés ; à zéro, rien n'est écrit.
+fn ecrire_par_tag_generique(
+    file_path: &str,
+    appliquer: impl FnOnce(&mut lofty::tag::Tag) -> usize,
+) -> Result<usize, String> {
+    use std::io::Seek;
 
-    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
-        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
-    }
+    use lofty::config::ParseOptions;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::{OpusFile, VorbisComments, VorbisFile};
+    use lofty::tag::{MergeTag, SplitTag};
 
-    let has_primary = tagged.primary_tag().is_some();
-    let tag = if has_primary {
-        tagged.primary_tag_mut().unwrap()
-    } else {
-        tagged.first_tag_mut().unwrap()
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let ouvrir = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file_path)
+            .map_err(|e| format!("open: {e}"))
     };
 
+    /// Le tour commun aux trois conteneurs Vorbis : séparer, éditer, réunir.
+    fn tour(
+        vc: VorbisComments,
+        appliquer: impl FnOnce(&mut lofty::tag::Tag) -> usize,
+    ) -> (Option<VorbisComments>, usize) {
+        let (reste, mut tag) = vc.split_tag();
+        let n = appliquer(&mut tag);
+        if n == 0 {
+            return (None, 0);
+        }
+        (Some(reste.merge_tag(tag)), n)
+    }
+
+    match ext.as_str() {
+        "flac" => {
+            let mut file = ouvrir()?;
+            let mut f = FlacFile::read_from(&mut file, ParseOptions::new())
+                .map_err(|e| format!("lofty read: {e}"))?;
+            let vc = f
+                .vorbis_comments_mut()
+                .map(std::mem::take)
+                .unwrap_or_default();
+            let (fusion, n) = tour(vc, appliquer);
+            let Some(fusion) = fusion else { return Ok(0) };
+            f.set_vorbis_comments(fusion);
+            file.rewind().map_err(|e| format!("rewind: {e}"))?;
+            f.save_to(&mut file, WriteOptions::default())
+                .map_err(|e| format!("lofty save: {e}"))?;
+            Ok(n)
+        }
+        "opus" => {
+            let mut file = ouvrir()?;
+            let mut f = OpusFile::read_from(&mut file, ParseOptions::new())
+                .map_err(|e| format!("lofty read: {e}"))?;
+            let vc = std::mem::take(f.vorbis_comments_mut());
+            let (fusion, n) = tour(vc, appliquer);
+            let Some(fusion) = fusion else { return Ok(0) };
+            *f.vorbis_comments_mut() = fusion;
+            file.rewind().map_err(|e| format!("rewind: {e}"))?;
+            f.save_to(&mut file, WriteOptions::default())
+                .map_err(|e| format!("lofty save: {e}"))?;
+            Ok(n)
+        }
+        "ogg" | "oga" => {
+            let mut file = ouvrir()?;
+            let mut f = VorbisFile::read_from(&mut file, ParseOptions::new())
+                .map_err(|e| format!("lofty read: {e}"))?;
+            let vc = std::mem::take(f.vorbis_comments_mut());
+            let (fusion, n) = tour(vc, appliquer);
+            let Some(fusion) = fusion else { return Ok(0) };
+            *f.vorbis_comments_mut() = fusion;
+            file.rewind().map_err(|e| format!("rewind: {e}"))?;
+            f.save_to(&mut file, WriteOptions::default())
+                .map_err(|e| format!("lofty save: {e}"))?;
+            Ok(n)
+        }
+        _ => {
+            let mut tagged =
+                lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
+            let tag_type = tagged.primary_tag_type();
+            if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
+                tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+            }
+            let has_primary = tagged.primary_tag().is_some();
+            let tag = if has_primary {
+                tagged.primary_tag_mut().unwrap()
+            } else {
+                tagged.first_tag_mut().unwrap()
+            };
+            let n = appliquer(tag);
+            if n == 0 {
+                return Ok(0);
+            }
+            let mut file = ouvrir()?;
+            tagged
+                .save_to(&mut file, WriteOptions::default())
+                .map_err(|e| format!("lofty save: {e}"))?;
+            Ok(n)
+        }
+    }
+}
+
+fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, String> {
+    let count = ecrire_par_tag_generique(file_path, |tag| appliquer_update(tag, update))?;
+    if count > 0 {
+        info!(file = file_path, fields = count, "tags_written_lofty");
+    }
+    Ok(WriteResult {
+        file_path: file_path.into(),
+        fields_written: count,
+    })
+}
+
+/// Pose les champs d'un [`TagUpdate`] sur un `Tag` générique ; rend combien.
+fn appliquer_update(tag: &mut lofty::tag::Tag, update: &TagUpdate) -> usize {
     let mut count = 0usize;
     if let Some(ref v) = update.title {
         tag.set_title(v.clone());
@@ -199,63 +325,22 @@ fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, 
         tag.set_comment(v.clone());
         count += 1;
     }
-    if let Some(ref v) = update.composer {
-        tag.insert(lofty::tag::TagItem::new(
-            ItemKey::Composer,
-            lofty::tag::ItemValue::Text(v.clone()),
-        ));
-        count += 1;
+    for (cle, valeur) in [
+        (ItemKey::Composer, update.composer.clone()),
+        (ItemKey::Label, update.label.clone()),
+        (ItemKey::Isrc, update.isrc.clone()),
+        (ItemKey::Bpm, update.bpm.map(|b| b.to_string())),
+        (ItemKey::Lyrics, update.lyrics.clone()),
+    ] {
+        if let Some(v) = valeur {
+            tag.insert(lofty::tag::TagItem::new(
+                cle,
+                lofty::tag::ItemValue::Text(v),
+            ));
+            count += 1;
+        }
     }
-    if let Some(ref v) = update.label {
-        tag.insert(lofty::tag::TagItem::new(
-            ItemKey::Label,
-            lofty::tag::ItemValue::Text(v.clone()),
-        ));
-        count += 1;
-    }
-    if let Some(ref v) = update.isrc {
-        tag.insert(lofty::tag::TagItem::new(
-            ItemKey::Isrc,
-            lofty::tag::ItemValue::Text(v.clone()),
-        ));
-        count += 1;
-    }
-    if let Some(v) = update.bpm {
-        tag.insert(lofty::tag::TagItem::new(
-            ItemKey::Bpm,
-            lofty::tag::ItemValue::Text(v.to_string()),
-        ));
-        count += 1;
-    }
-    if let Some(ref v) = update.lyrics {
-        tag.insert(lofty::tag::TagItem::new(
-            ItemKey::Lyrics,
-            lofty::tag::ItemValue::Text(v.clone()),
-        ));
-        count += 1;
-    }
-
-    if count == 0 {
-        return Ok(WriteResult {
-            file_path: file_path.into(),
-            fields_written: 0,
-        });
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(file_path)
-        .map_err(|e| format!("open: {e}"))?;
-    tagged
-        .save_to(&mut file, WriteOptions::default())
-        .map_err(|e| format!("lofty save: {e}"))?;
-
-    info!(file = file_path, fields = count, "tags_written_lofty");
-    Ok(WriteResult {
-        file_path: file_path.into(),
-        fields_written: count,
-    })
+    count
 }
 
 /// La clé Vorbis du Dynamic Range d'une PISTE, telle que foobar2000 (DR
@@ -553,55 +638,27 @@ pub(crate) fn write_metadata_to_file_sync(
     fields: &HashMap<String, String>,
 ) -> Result<WriteResult, String> {
     let file_path = &graphie_sur_disque(file_path)?;
-    let mut tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
-    let tag_type = tagged.primary_tag_type();
-
-    // Ensure we have a tag to write to
-    if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
-        tagged.insert_tag(lofty::tag::Tag::new(tag_type));
-    }
-
-    let has_primary = tagged.primary_tag().is_some();
-    let tag = if has_primary {
-        tagged.primary_tag_mut().unwrap()
-    } else {
-        tagged.first_tag_mut().unwrap()
-    };
-
-    let mut count = 0usize;
-    for (key, value) in fields {
-        let Some(item_key) = tune_key_to_lofty(key) else {
-            debug!(key = key.as_str(), "tag_writer_unknown_key_skipped");
-            continue;
-        };
-
-        if value.is_empty() {
-            // Remove the tag item
-            tag.remove_key(item_key);
-        } else {
-            // Insert/replace the tag item
-            tag.insert_text(item_key, value.clone());
+    let count = ecrire_par_tag_generique(file_path, |tag| {
+        let mut count = 0usize;
+        for (key, value) in fields {
+            let Some(item_key) = tune_key_to_lofty(key) else {
+                debug!(key = key.as_str(), "tag_writer_unknown_key_skipped");
+                continue;
+            };
+            if value.is_empty() {
+                // Remove the tag item
+                tag.remove_key(item_key);
+            } else {
+                // Insert/replace the tag item
+                tag.insert_text(item_key, value.clone());
+            }
+            count += 1;
         }
-        count += 1;
+        count
+    })?;
+    if count > 0 {
+        info!(file = file_path, fields = count, "extended_tags_written");
     }
-
-    if count == 0 {
-        return Ok(WriteResult {
-            file_path: file_path.into(),
-            fields_written: 0,
-        });
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(file_path)
-        .map_err(|e| format!("open: {e}"))?;
-    tagged
-        .save_to(&mut file, WriteOptions::default())
-        .map_err(|e| format!("lofty save: {e}"))?;
-
-    info!(file = file_path, fields = count, "extended_tags_written");
     Ok(WriteResult {
         file_path: file_path.into(),
         fields_written: count,
@@ -984,5 +1041,134 @@ mod tests {
             (None, None),
             "une valeur refusee ne doit rien ecrire"
         );
+    }
+    // ------------------------------------------------------------------
+    // 🔴 Le graveur d'étiquettes ne doit plus EFFACER les champs Vorbis
+    // qu'il ne connaît pas. Mesuré le 16/09/2026 : DR=12 avant, None après
+    // une simple écriture de compositeur. Ces témoins relisent par le
+    // lecteur du scan, comme ceux du DR.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_tags_conserve_le_dynamic_range_sur_les_trois_conteneurs() {
+        for nom in ["test.flac", "test.opus", "test_vorbis.ogg"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cible = dir.path().join(nom);
+            std::fs::copy(fixture(nom), &cible).unwrap();
+            let chemin = cible.to_str().unwrap();
+            graver_dr(chemin, "12").await.unwrap();
+
+            let upd = TagUpdate {
+                composer: Some("Sonde".into()),
+                title: Some("Titre".into()),
+                ..Default::default()
+            };
+            let r = write_tags(chemin, &upd).await.unwrap();
+            assert_eq!(r.fields_written, 2, "{nom}");
+
+            let m = crate::metadata::read_extended_metadata(&cible);
+            assert_eq!(
+                m.get("dr_track").map(String::as_str),
+                Some("12"),
+                "{nom} : write_tags a efface le DYNAMIC RANGE"
+            );
+            assert_eq!(m.get("dr_source").map(String::as_str), Some("tag"), "{nom}");
+            // Et ce qu'on a demande est bien la.
+            assert_eq!(
+                m.get("composer").map(String::as_str),
+                Some("Sonde"),
+                "{nom}"
+            );
+            let t = crate::metadata::read_metadata(&cible).unwrap();
+            assert_eq!(t.title.as_deref(), Some("Titre"), "{nom}");
+        }
+    }
+
+    #[test]
+    fn l_editeur_de_tags_conserve_aussi_le_dynamic_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        let chemin = cible.to_str().unwrap();
+        // Gravure synchrone : meme fonction que le chemin asynchrone.
+        assert_eq!(graver_dr_lofty(chemin, "9").unwrap(), GravureDr::Ecrite);
+
+        let mut champs = HashMap::new();
+        champs.insert("composer".to_string(), "Sonde".to_string());
+        champs.insert("isrc".to_string(), String::new()); // suppression d'un champ
+        let r = write_metadata_to_file_sync(chemin, &champs).unwrap();
+        assert_eq!(r.fields_written, 2);
+
+        let m = crate::metadata::read_extended_metadata(&cible);
+        assert_eq!(
+            m.get("dr_track").map(String::as_str),
+            Some("9"),
+            "l'editeur a efface le DYNAMIC RANGE"
+        );
+        assert_eq!(m.get("composer").map(String::as_str), Some("Sonde"));
+    }
+
+    #[tokio::test]
+    async fn write_tags_conserve_la_pochette_et_les_champs_maison_du_flac() {
+        use lofty::config::ParseOptions;
+        use lofty::flac::FlacFile;
+        use lofty::ogg::OggPictureStorage;
+        use lofty::picture::{MimeType, Picture, PictureType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&cible)
+                .unwrap();
+            let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+            let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+            let pic = Picture::unchecked(png)
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Png)
+                .build();
+            flac.insert_picture(pic, Some(Default::default())).unwrap();
+            if flac.vorbis_comments().is_none() {
+                flac.set_vorbis_comments(Default::default());
+            }
+            flac.vorbis_comments_mut()
+                .unwrap()
+                .insert("MON CHAMP".into(), "valeur".into());
+            use std::io::Seek;
+            f.rewind().unwrap();
+            flac.save_to(&mut f, WriteOptions::default()).unwrap();
+        }
+        let upd = TagUpdate {
+            genre: Some("Jazz".into()),
+            ..Default::default()
+        };
+        write_tags(cible.to_str().unwrap(), &upd).await.unwrap();
+
+        let mut f = std::fs::File::open(&cible).unwrap();
+        let flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        assert_eq!(flac.pictures().len(), 1, "la pochette a saute");
+        let vc = flac.vorbis_comments().unwrap();
+        assert_eq!(
+            vc.get("MON CHAMP"),
+            Some("valeur"),
+            "un champ maison a saute"
+        );
+        assert_eq!(vc.get("GENRE"), Some("Jazz"));
+    }
+
+    #[tokio::test]
+    async fn write_tags_sans_rien_a_ecrire_ne_touche_pas_au_fichier() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        let avant = std::fs::read(&cible).unwrap();
+        let r = write_tags(cible.to_str().unwrap(), &TagUpdate::default())
+            .await
+            .unwrap();
+        assert_eq!(r.fields_written, 0);
+        assert_eq!(std::fs::read(&cible).unwrap(), avant);
     }
 }
