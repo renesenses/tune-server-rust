@@ -642,8 +642,16 @@ async fn recolter(
         }
         bilan.conteneurs_visites += 1;
 
+        // Un conteneur qui ne répond pas n'est plus un conteneur vide : il
+        // compte dans les erreurs du bilan, et la descente continue (#4134).
         let (sous_conteneurs, items, _total) =
-            super::network::parcourir_les_enfants(cd_url, nom, &conteneur).await;
+            match super::network::parcourir_les_enfants(cd_url, nom, &conteneur).await {
+                Ok(page) => page,
+                Err(e) => {
+                    bilan.erreurs.push(format!("conteneur {conteneur} : {e:?}"));
+                    continue;
+                }
+            };
         bilan.items_vus += items.len();
 
         for item in &items {

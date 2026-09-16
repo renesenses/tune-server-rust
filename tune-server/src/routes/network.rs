@@ -1128,36 +1128,92 @@ async fn browse_media_server(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<BrowseQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let object_id = q.object_id.as_deref().unwrap_or("0");
     let servers = state.media_servers.lock().await;
-    let ms = match servers.get(&id) {
-        Some(ms) => ms.clone(),
-        None => {
-            return Json(json!({
-                "object_id": object_id,
-                "containers": [],
-                "items": [],
-                "total_matches": 0,
-                "number_returned": 0,
-            }));
-        }
-    };
+    // Un serveur que la carte mémoire ne connaît pas (démarrage avant la
+    // première découverte, serveur oublié) sortait par la même porte qu'un
+    // dossier vide : 200, listes vides, pas un mot. L'écran affichait un
+    // dossier vide — lu « pas d'ouverture des dossiers » (Yacine, #4134).
+    let ms = servers
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| EchecParcours::ServeurInconnu(id.clone()).en_erreur_http("?"))?;
     drop(servers);
 
     let (containers, items, total_matches) =
-        parcourir_les_enfants(&ms.content_directory_url, &ms.name, object_id).await;
-
+        parcourir_les_enfants(&ms.content_directory_url, &ms.name, object_id)
+            .await
+            .map_err(|e| e.en_erreur_http(&ms.name))?;
     let fetched = containers.len() + items.len();
     let total = (total_matches as usize).max(fetched);
-
-    Json(json!({
+    Ok(Json(json!({
         "object_id": object_id,
         "containers": containers,
         "items": items,
         "total_matches": total,
         "number_returned": fetched,
-    }))
+    })))
+}
+
+/// Pourquoi un `Browse` n'a rien rendu — pour que l'écran puisse le dire au
+/// lieu d'afficher un dossier vide (#4134).
+///
+/// Jusqu'ici tout échec sortait par la porte du dossier vide : serveur absent
+/// de la carte, délai ou erreur de transport, réponse HTTP 500/401 ou SOAP
+/// Fault dont le corps partait dans l'analyseur DIDL, qui rendait `(0, 0)`.
+/// Un 200 à listes vides ne rejette pas côté client : `folderNoAnswer` ne
+/// s'affichait jamais.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EchecParcours {
+    /// L'identifiant n'est pas dans la carte mémoire des serveurs.
+    ServeurInconnu(String),
+    /// Le POST SOAP n'est pas parti ou n'est pas revenu (délai de 10 s compris).
+    Transport(String),
+    /// Le serveur a répondu, mais hors 2xx.
+    Statut(u16),
+    /// 2xx sans élément `<Result>` — un SOAP Fault, ou autre chose qu'un
+    /// ContentDirectory.
+    SansResultat,
+}
+
+impl EchecParcours {
+    /// La réponse HTTP de `GET /media-servers/{id}/browse` : 404 pour
+    /// l'inconnu, 504 pour le transport, 502 pour un serveur qui répond mal.
+    /// Le message nomme le serveur et la cause ; le code reste stable pour
+    /// les clients qui voudront le lire.
+    fn en_erreur_http(&self, nom_du_serveur: &str) -> AppError {
+        let (status, message) = match self {
+            EchecParcours::ServeurInconnu(id) => (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "serveur multimédia {id} inconnu du registre en mémoire — \
+                     pas encore découvert, ou oublié"
+                ),
+            ),
+            EchecParcours::Transport(e) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("{nom_du_serveur} n'a pas répondu au Browse : {e}"),
+            ),
+            EchecParcours::Statut(code) => (
+                StatusCode::BAD_GATEWAY,
+                format!("{nom_du_serveur} a répondu HTTP {code} au Browse"),
+            ),
+            EchecParcours::SansResultat => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a répondu sans élément <Result> au Browse \
+                     (SOAP Fault ?)"
+                ),
+            ),
+        };
+        warn!(serveur = nom_du_serveur, error = %message, "browse_media_server_failed");
+        AppError {
+            status,
+            message,
+            code: Some("media_server_browse_failed".into()),
+        }
+    }
 }
 
 /// Parcourt TOUTES les pages d'un conteneur d'un serveur ContentDirectory.
@@ -1180,7 +1236,7 @@ pub(crate) async fn parcourir_les_enfants(
     content_directory_url: &str,
     nom_du_serveur: &str,
     object_id: &str,
-) -> (Vec<Value>, Vec<Value>, u32) {
+) -> Result<(Vec<Value>, Vec<Value>, u32), EchecParcours> {
     const PAGE_SIZE: u32 = 200;
     const MAX_PAGES: u32 = 500; // up to 100k children
     // Client partagé (voir `tune_core::http::client`). Le délai d'attente de
@@ -1228,11 +1284,28 @@ pub(crate) async fn parcourir_les_enfants(
                     "browse_media_server soap_error server={nom_du_serveur} \
                      start={starting_index} err={e}"
                 );
+                // Première page : l'échec est celui du dossier, on le dit.
+                // Pages suivantes : on rend ce qu'on a, comme avant.
+                if starting_index == 0 {
+                    return Err(EchecParcours::Transport(e.to_string()));
+                }
                 break;
             }
         };
 
+        // Le statut n'était jamais examiné : le corps d'un 500 ou d'un SOAP
+        // Fault partait dans l'analyseur DIDL, qui rendait (0, 0) — un
+        // dossier vide, silencieux (#4134).
+        let statut = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        if starting_index == 0 {
+            if !statut.is_success() {
+                return Err(EchecParcours::Statut(statut.as_u16()));
+            }
+            if !reponse_porte_un_result(&body) {
+                return Err(EchecParcours::SansResultat);
+            }
+        }
         let (mut page_containers, mut page_items) = parse_didl_browse_response(&body);
         let parsed = (page_containers.len() + page_items.len()) as u32;
 
@@ -1260,7 +1333,13 @@ pub(crate) async fn parcourir_les_enfants(
         }
     }
 
-    (containers, items, total_matches)
+    Ok((containers, items, total_matches))
+}
+
+/// Une réponse de `Browse` porte un élément `<Result>` — vide pour un dossier
+/// vide, mais présent. Un SOAP Fault n'en a pas.
+fn reponse_porte_un_result(xml: &str) -> bool {
+    xml.contains("<Result>") || xml.contains("<Result ")
 }
 
 #[derive(serde::Deserialize)]
@@ -2162,5 +2241,104 @@ mod tests {
         .collect();
         let uniques: std::collections::HashSet<&&str> = m.iter().collect();
         assert_eq!(uniques.len(), 3, "{m:?}");
+    }
+}
+
+/// #4134 — un `Browse` qui échoue ne rend plus un dossier vide muet : il
+/// dit sa cause, et la route la traduit en 404 / 502 / 504.
+#[cfg(test)]
+mod tests_browse_dit_son_echec_4134 {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Un faux ContentDirectory qui rend toujours la même réponse HTTP.
+    async fn faux_serveur(statut: &'static str, corps: &'static str) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let reponse = format!(
+                        "HTTP/1.1 {statut}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{corps}",
+                        corps.len()
+                    );
+                    let _ = sock.write_all(reponse.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/cd/control")
+    }
+
+    const BROWSE_VIDE: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><Result>&lt;DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"/&gt;</Result><NumberReturned>0</NumberReturned><TotalMatches>0</TotalMatches><UpdateID>1</UpdateID></u:BrowseResponse></s:Body></s:Envelope>"#;
+    const SOAP_FAULT: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>701</errorCode><errorDescription>No such object</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#;
+
+    #[tokio::test]
+    async fn un_dossier_reellement_vide_reste_un_succes() {
+        let url = faux_serveur("200 OK", BROWSE_VIDE).await;
+        let (c, i, total) = parcourir_les_enfants(&url, "faux", "0")
+            .await
+            .expect("vide ≠ échec");
+        assert!(c.is_empty() && i.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[tokio::test]
+    async fn un_500_est_un_echec_nomme_pas_un_dossier_vide() {
+        let url = faux_serveur("500 Internal Server Error", "<html>boom</html>").await;
+        let err = parcourir_les_enfants(&url, "faux", "0")
+            .await
+            .expect_err("500 doit échouer");
+        assert_eq!(err, EchecParcours::Statut(500));
+        assert_eq!(err.en_erreur_http("Syno").status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn un_soap_fault_en_200_est_un_echec_nomme() {
+        let url = faux_serveur("200 OK", SOAP_FAULT).await;
+        let err = parcourir_les_enfants(&url, "faux", "0")
+            .await
+            .expect_err("un Fault n'est pas un dossier");
+        assert_eq!(err, EchecParcours::SansResultat);
+        assert_eq!(
+            err.en_erreur_http("Freebox").status,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[tokio::test]
+    async fn un_serveur_qui_ne_repond_pas_est_un_echec_de_transport() {
+        // Port libre, personne n'écoute : refus de connexion immédiat.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let url = format!("http://127.0.0.1:{port}/cd/control");
+        let err = parcourir_les_enfants(&url, "faux", "0")
+            .await
+            .expect_err("connexion refusée");
+        assert!(matches!(err, EchecParcours::Transport(_)), "{err:?}");
+        assert_eq!(
+            err.en_erreur_http("DESKTOP").status,
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn le_serveur_inconnu_rend_404_avec_son_identifiant() {
+        let e = EchecParcours::ServeurInconnu("uuid:abc".into()).en_erreur_http("?");
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        assert!(e.message.contains("uuid:abc"), "{}", e.message);
+        assert_eq!(e.code.as_deref(), Some("media_server_browse_failed"));
+    }
+
+    #[test]
+    fn reponse_porte_un_result_distingue_le_vide_du_fault() {
+        assert!(reponse_porte_un_result(BROWSE_VIDE));
+        assert!(!reponse_porte_un_result(SOAP_FAULT));
+        assert!(reponse_porte_un_result("<Result xmlns=\"x\"></Result>"));
     }
 }
