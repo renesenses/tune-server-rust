@@ -258,6 +258,144 @@ fn write_tags_lofty(file_path: &str, update: &TagUpdate) -> Result<WriteResult, 
     })
 }
 
+/// La clé Vorbis du Dynamic Range d'une PISTE, telle que foobar2000 (DR
+/// Meter) l'écrit et telle que le scan la RELIT.
+///
+/// 🔴 C'est la contrainte de tout ce bloc : « cette clé doit pouvoir être
+/// relue » (Bertrand, 16/09/2026). Le scan lit `DYNAMIC RANGE=` dans l'en-tête
+/// Vorbis (`read_vorbis_header` + `find_vorbis_comment`, dans `mod.rs`) et
+/// pose alors `dr_track` + `dr_source = "tag"`. Graver autre chose — une autre
+/// graphie, une autre famille de conteneur — produirait un tag que Tune
+/// lui-même ne verrait plus au scan suivant.
+pub const CLE_VORBIS_DR: &str = "DYNAMIC RANGE";
+
+/// Ce qu'une gravure de DR a fait du fichier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GravureDr {
+    /// La clé a été écrite avec la valeur demandée.
+    Ecrite,
+    /// Le fichier portait DÉJÀ une valeur non vide : elle est rendue telle
+    /// quelle, et rien n'a été écrit. Le tag du disque fait foi — même règle
+    /// que `replaygain::peut_ecrire_le_dr` dans l'autre sens.
+    DejaPresente(String),
+}
+
+/// Les conteneurs dont le scan relit l'en-tête Vorbis. La liste est celle de
+/// `read_vorbis_header`, et doit le rester : graver un format absent d'ici
+/// serait écrire ce que personne ne relit.
+pub fn format_dr_relu(file_path: &str) -> bool {
+    matches!(
+        Path::new(file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("flac" | "ogg" | "oga" | "opus")
+    )
+}
+
+/// Grave `DYNAMIC RANGE=<dr>` dans un FLAC, un Ogg Vorbis ou un Opus.
+///
+/// Passe par le `VorbisComments` CONCRET du fichier, jamais par le `Tag`
+/// générique de `write_tags` : lofty 0.24 n'a pas de `ItemKey` pour cette
+/// clé, et la conversion en `Tag` la laisserait tomber (c'est ce que dit le
+/// commentaire du lecteur, dans `mod.rs`). Et par `FlacFile::save_to`, jamais
+/// par `VorbisComments::save_to` seul : le premier réenchaîne les blocs
+/// PICTURE du fichier, le second les retirerait — un FLAC gravé perdrait sa
+/// pochette.
+///
+/// `dr` est écrit tel quel : c'est à l'appelant de donner l'entier normalisé
+/// (`"12"`), pas `"DR12"`.
+pub async fn graver_dr(file_path: &str, dr: &str) -> Result<GravureDr, String> {
+    if !format_dr_relu(file_path) {
+        return Err("unsupported format for DYNAMIC RANGE".into());
+    }
+    let dr = dr.trim();
+    if dr.is_empty() || !dr.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("invalid DR value: {dr:?}"));
+    }
+    let path = graphie_sur_disque(file_path)?;
+    let dr = dr.to_string();
+    tokio::task::spawn_blocking(move || graver_dr_lofty(&path, &dr))
+        .await
+        .map_err(|e| format!("join: {e}"))?
+}
+
+fn graver_dr_lofty(path: &str, dr: &str) -> Result<GravureDr, String> {
+    use std::io::Seek;
+
+    use lofty::config::ParseOptions;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::{OpusFile, VorbisComments, VorbisFile};
+
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open: {e}"))?;
+
+    // Une valeur déjà là, non vide, l'emporte : rendue à l'appelant pour qu'il
+    // aligne la base sur le disque plutôt que l'inverse.
+    fn deja(vc: &VorbisComments) -> Option<String> {
+        vc.get(CLE_VORBIS_DR)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    }
+
+    // `ParseOptions::new()` LIT les pochettes — il le faut : elles sont
+    // réécrites à partir de ce qui a été lu.
+    let opts = ParseOptions::new();
+    let resultat = match ext.as_str() {
+        "flac" => {
+            let mut f =
+                FlacFile::read_from(&mut file, opts).map_err(|e| format!("lofty read: {e}"))?;
+            if f.vorbis_comments().is_none() {
+                f.set_vorbis_comments(VorbisComments::default());
+            }
+            let vc = f.vorbis_comments_mut().expect("posé juste au-dessus");
+            if let Some(v) = deja(vc) {
+                return Ok(GravureDr::DejaPresente(v));
+            }
+            vc.insert(CLE_VORBIS_DR.to_string(), dr.to_string());
+            file.rewind().map_err(|e| format!("rewind: {e}"))?;
+            f.save_to(&mut file, WriteOptions::default())
+        }
+        "opus" => {
+            let mut f =
+                OpusFile::read_from(&mut file, opts).map_err(|e| format!("lofty read: {e}"))?;
+            if let Some(v) = deja(f.vorbis_comments()) {
+                return Ok(GravureDr::DejaPresente(v));
+            }
+            f.vorbis_comments_mut()
+                .insert(CLE_VORBIS_DR.to_string(), dr.to_string());
+            file.rewind().map_err(|e| format!("rewind: {e}"))?;
+            f.save_to(&mut file, WriteOptions::default())
+        }
+        "ogg" | "oga" => {
+            let mut f =
+                VorbisFile::read_from(&mut file, opts).map_err(|e| format!("lofty read: {e}"))?;
+            if let Some(v) = deja(f.vorbis_comments()) {
+                return Ok(GravureDr::DejaPresente(v));
+            }
+            f.vorbis_comments_mut()
+                .insert(CLE_VORBIS_DR.to_string(), dr.to_string());
+            file.rewind().map_err(|e| format!("rewind: {e}"))?;
+            f.save_to(&mut file, WriteOptions::default())
+        }
+        _ => return Err("unsupported format for DYNAMIC RANGE".into()),
+    };
+    resultat.map_err(|e| format!("lofty save: {e}"))?;
+    info!(file = path, dr, "dr_grave_lofty");
+    Ok(GravureDr::Ecrite)
+}
+
 pub async fn read_tags(file_path: &str) -> Result<HashMap<String, String>, String> {
     let path = graphie_sur_disque(file_path)?;
     tokio::task::spawn_blocking(move || read_tags_lofty(&path))
@@ -714,5 +852,137 @@ mod tests {
         );
 
         assert_eq!(r.unwrap_err(), "file not found");
+    }
+    // ------------------------------------------------------------------
+    // Graver le Dynamic Range — « cette clé doit pouvoir être relue »
+    // (Bertrand, 16/09/2026). Chaque témoin relit par le VRAI lecteur du
+    // scan, `read_extended_metadata`, jamais par lofty : c'est lui qui pose
+    // `dr_track` et `dr_source` en base, et c'est donc lui qui décide si la
+    // gravure existe.
+    // ------------------------------------------------------------------
+
+    fn fixture(nom: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(nom)
+    }
+
+    fn relu(chemin: &std::path::Path) -> (Option<String>, Option<String>) {
+        let m = crate::metadata::read_extended_metadata(chemin);
+        (m.get("dr_track").cloned(), m.get("dr_source").cloned())
+    }
+
+    #[tokio::test]
+    async fn dr_grave_est_relu_par_le_scan_sur_les_trois_conteneurs() {
+        for nom in ["test.flac", "test.opus", "test_vorbis.ogg"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cible = dir.path().join(nom);
+            std::fs::copy(fixture(nom), &cible).unwrap();
+            assert_eq!(
+                relu(&cible),
+                (None, None),
+                "{nom} : la fixture porte deja un DR"
+            );
+
+            let r = graver_dr(cible.to_str().unwrap(), "12").await.unwrap();
+            assert_eq!(r, GravureDr::Ecrite, "{nom}");
+
+            assert_eq!(
+                relu(&cible),
+                (Some("12".into()), Some("tag".into())),
+                "{nom} : le scan ne relit pas ce qui vient d'etre grave"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dr_deja_present_dans_le_fichier_fait_foi() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        let chemin = cible.to_str().unwrap();
+
+        graver_dr(chemin, "9").await.unwrap();
+        // Seconde gravure, valeur differente : refusee, et l'ancienne rendue.
+        let r = graver_dr(chemin, "14").await.unwrap();
+        assert_eq!(r, GravureDr::DejaPresente("9".into()));
+        assert_eq!(relu(&cible).0.as_deref(), Some("9"));
+    }
+
+    #[tokio::test]
+    async fn dr_grave_conserve_la_pochette_du_flac() {
+        use lofty::config::ParseOptions;
+        use lofty::flac::FlacFile;
+        use lofty::ogg::OggPictureStorage;
+        use lofty::picture::{MimeType, Picture, PictureInformation, PictureType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+
+        // Une pochette posee par lofty lui-meme : un PNG minimal suffit, on ne
+        // compte que les blocs PICTURE.
+        let png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&cible)
+                .unwrap();
+            let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+            let pic = Picture::unchecked(png)
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Png)
+                .build();
+            flac.insert_picture(pic, Some(PictureInformation::default()))
+                .unwrap();
+            use std::io::Seek;
+            f.rewind().unwrap();
+            flac.save_to(&mut f, WriteOptions::default()).unwrap();
+        }
+        let pochettes = |p: &std::path::Path| {
+            let mut f = std::fs::File::open(p).unwrap();
+            FlacFile::read_from(&mut f, ParseOptions::new())
+                .unwrap()
+                .pictures()
+                .len()
+        };
+        assert_eq!(pochettes(&cible), 1, "la pochette temoin n'a pas ete posee");
+
+        graver_dr(cible.to_str().unwrap(), "11").await.unwrap();
+
+        assert_eq!(
+            pochettes(&cible),
+            1,
+            "la gravure du DR a retire la pochette"
+        );
+        assert_eq!(relu(&cible).0.as_deref(), Some("11"));
+    }
+
+    #[tokio::test]
+    async fn dr_refuse_un_format_que_le_scan_ne_relit_pas() {
+        // MP3 : `read_vorbis_header` ne le lit pas, donc on n'y grave pas —
+        // ecrire ce que personne ne relit serait un faux « fait ».
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.mp3");
+        std::fs::copy(fixture("test.mp3"), &cible).unwrap();
+        let r = graver_dr(cible.to_str().unwrap(), "12").await;
+        assert!(r.is_err(), "{r:?}");
+        assert!(!format_dr_relu("x.mp3") && !format_dr_relu("x.m4a") && format_dr_relu("x.FLAC"));
+    }
+
+    #[tokio::test]
+    async fn dr_refuse_une_valeur_qui_nest_pas_un_entier() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("test.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        let chemin = cible.to_str().unwrap();
+        assert!(graver_dr(chemin, "").await.is_err());
+        assert!(graver_dr(chemin, "DR12").await.is_err());
+        assert_eq!(
+            relu(&cible),
+            (None, None),
+            "une valeur refusee ne doit rien ecrire"
+        );
     }
 }
