@@ -939,6 +939,9 @@ impl ChiffresDeFinDeScan<'_> {
             // même raison que les autres chemins : le bus d'événements est
             // diffusé à tous les clients connectés.
             "cue_sheets": self.cue_sheets(),
+            // Les pistes dont le DR vient d'un `foo_dr.txt` voisin (#4186).
+            // Un compteur : chez les trois consommateurs, comme les autres.
+            "dr_from_sidecar_file": self.scan_stats.dr_from_sidecar,
         })
     }
 
@@ -1704,7 +1707,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // de la fermeture : c'est LUI qui publie le résumé de fin de
                 // scan, et c'est ce résumé qui annonçait « sans erreur »
                 // pendant que quatorze pistes étaient refusées (#2939).
-                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                let mut ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
                     to_insert.len(),
                     batch_inserted as usize,
                 )
@@ -1732,8 +1735,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
 
                     if !meta_entries.is_empty() {
-                        if let Err(e) = meta_repo.set_batch_multi(&meta_entries) {
-                            tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
+                        match meta_repo.set_batch_multi(&meta_entries) {
+                            // Le DR lu dans un `foo_dr.txt` voisin (#4186) ne se
+                            // compte que s'il est ENTRÉ en base : un lot refusé
+                            // n'a rien livré, et le rapport ne doit pas dire
+                            // le contraire.
+                            Ok(()) => {
+                                ecritures = ecritures
+                                    .avec_dr_des_rapports_voisins(meta_entries.iter().map(|(_, m)| m));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
+                            }
                         }
                     }
                 }
@@ -3847,6 +3860,9 @@ mod rapport_de_fin_de_scan {
             // clé passerait sinon inaperçu.
             empty_files: 111,
             empty_file_paths: vec!["/Volumes/musique/copie-interrompue.flac".to_string()],
+            // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un chiffre
+            // distinct de tous les autres, pour la même raison.
+            dr_from_sidecar: 112,
             ..Default::default()
         }
     }
@@ -3965,6 +3981,9 @@ mod rapport_de_fin_de_scan {
             r["skipped_empty_file_paths"],
             serde_json::json!(["/Volumes/musique/copie-interrompue.flac"])
         );
+        // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un compteur, chez
+        // les trois consommateurs.
+        assert_eq!(r["dr_from_sidecar_file"], serde_json::json!(112));
         assert_eq!(
             r["skipped_unsupported_by_ext"],
             serde_json::json!({"mpc": 280})
@@ -4070,7 +4089,7 @@ mod rapport_de_fin_de_scan {
         /// Sous leur forme littérale de clé JSON. Chercher le mot nu
         /// attraperait le nom de la variable Rust et passerait sans qu'aucune
         /// clé ne soit publiée.
-        const CLES: [&str; 8] = [
+        const CLES: [&str; 9] = [
             "\"skipped_unsupported_paths\"",
             "\"skipped_no_metadata_paths\"",
             "\"skipped_duplicate_paths\"",
@@ -4087,6 +4106,9 @@ mod rapport_de_fin_de_scan {
             // la liste nominative par le seul fichier.
             "\"cue_sheets\"",
             "\"cue_sheets_skipped_paths\"",
+            // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un compteur,
+            // même clé des deux côtés.
+            "\"dr_from_sidecar_file\"",
         ];
 
         for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {

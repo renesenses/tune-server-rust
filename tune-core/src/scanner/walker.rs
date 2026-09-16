@@ -571,6 +571,17 @@ pub struct ScanStats {
     /// LESQUELS, plafonnés par [`PLAFOND_CHEMINS_ECARTES`] comme les autres
     /// listes nominatives — un compteur ne dit jamais quel fichier recopier.
     pub empty_file_paths: Vec<String>,
+    /// Combien de pistes ont reçu leur plage dynamique d'un rapport
+    /// `foo_dr.txt` voisin de l'album (#4186) — la mesure du DR Meter de
+    /// foobar2000, que Tune ne savait pas lire.
+    ///
+    /// Comme les deux compteurs d'écriture ci-dessus, ce chiffre ne peut
+    /// venir que de la fermeture d'import : c'est elle qui lit les balises
+    /// étendues et voit la provenance (`dr_source = "sidecar"`). Il remonte
+    /// par [`EcrituresDuLot::dr_sidecar`]. Sans lui, la fonction existe et
+    /// personne ne peut dire si elle a servi : « le DR de Tades est-il lu ? »
+    /// n'aurait pour réponse qu'une requête SQL à la main.
+    pub dr_from_sidecar: usize,
 }
 
 /// Le motif inscrit dans [`ScanStats::failed_paths`] pour un fichier vide.
@@ -644,6 +655,9 @@ pub struct EcrituresDuLot {
     pub insert_failed: usize,
     /// Lignes présentées à la mise à jour et refusées par la base.
     pub update_failed: usize,
+    /// Pistes dont la plage dynamique vient d'un `foo_dr.txt` voisin
+    /// (#4186) — voir [`ScanStats::dr_from_sidecar`].
+    pub dr_sidecar: usize,
 }
 
 impl EcrituresDuLot {
@@ -651,6 +665,7 @@ impl EcrituresDuLot {
     pub const SANS_PERTE: Self = Self {
         insert_failed: 0,
         update_failed: 0,
+        dr_sidecar: 0,
     };
 
     /// Le manque à écrire d'un lot : ce qui a été présenté moins ce qui est
@@ -660,6 +675,7 @@ impl EcrituresDuLot {
         Self {
             insert_failed: presentees_a_l_insertion.saturating_sub(insertions_reussies),
             update_failed: 0,
+            dr_sidecar: 0,
         }
     }
 
@@ -670,6 +686,24 @@ impl EcrituresDuLot {
         mises_a_jour_reussies: usize,
     ) -> Self {
         self.update_failed = presentees.saturating_sub(mises_a_jour_reussies);
+        self
+    }
+
+    /// Le nombre de pistes du lot dont le DR vient du rapport voisin (#4186).
+    ///
+    /// Compté UNE fois ici, sur les balises étendues que la fermeture vient
+    /// de lire, plutôt qu'à la main dans chacun des deux scans : c'est la
+    /// recopie qui diverge (#2012).
+    pub fn avec_dr_des_rapports_voisins<'a>(
+        mut self,
+        balises_etendues: impl IntoIterator<Item = &'a std::collections::HashMap<String, String>>,
+    ) -> Self {
+        self.dr_sidecar = balises_etendues
+            .into_iter()
+            .filter(|m| {
+                m.get("dr_source").map(String::as_str) == Some(crate::metadata::DR_SOURCE_SIDECAR)
+            })
+            .count();
         self
     }
 }
@@ -1737,6 +1771,7 @@ pub fn scan_files_parallel(
         // fermeture d'import (#2939).
         db_insert_failed: 0,
         db_update_failed: 0,
+        dr_from_sidecar: 0,
         empty_files: vides.compte(),
         empty_file_paths: vides.chemins(),
     };
@@ -2091,6 +2126,7 @@ pub fn scan_files_batched(
         let ecritures = on_batch(batch, batch_idx, total);
         aggregate.db_insert_failed += ecritures.insert_failed;
         aggregate.db_update_failed += ecritures.update_failed;
+        aggregate.dr_from_sidecar += ecritures.dr_sidecar;
         if ecritures.insert_failed > 0 || ecritures.update_failed > 0 {
             warn!(
                 batch = batch_idx,
@@ -2121,6 +2157,7 @@ pub fn scan_files_batched(
         metadata_timeout = aggregate.metadata_timeout,
         db_insert_failed = aggregate.db_insert_failed,
         db_update_failed = aggregate.db_update_failed,
+        dr_from_sidecar = aggregate.dr_from_sidecar,
         pistes_perdues = aggregate.a_perdu_des_pistes(),
         "batched_scan_complete"
     );

@@ -1,0 +1,42 @@
+foobar2000 v2.25.10 / DR Meter v1.0.8
+log date: 2026-09-14 07:00:23
+
+--------------------------------------------------------------------------------
+Analyzed: Stokowski LSO / Mahler Symphony 2 
+--------------------------------------------------------------------------------
+
+DR         Peak           RMS       Duration Track                                    DR (FL)      DR (FR)      DR (FC)     DR (LFE)      DR (BL)      DR (BR)     RMS (FL)     RMS (FR)     RMS (FC)    RMS (LFE)     RMS (BL)     RMS (BR)
+--------------------------------------------------------------------------------
+DR11      -6.69 dBFS   -24.47 dBFS     23:15 01-Mahler Sym No 2  1st Mov Alle(…)     11.05 dB     11.89 dB                                                      -24.50 dBFS  -24.45 dBFS                                                    
+DR12      -9.52 dBFS   -28.03 dBFS     10:18 02-Mahler Sym No 2  2nd Mov Anda(…)     11.31 dB     12.30 dB                                                      -28.11 dBFS  -27.95 dBFS                                                    
+DR12      -7.18 dBFS   -25.88 dBFS      9:52 03-Mahler Sym No 2  3rd Mov In r(…)     11.91 dB     12.13 dB                                                      -26.40 dBFS  -25.41 dBFS                                                    
+DR12     -11.77 dBFS   -29.10 dBFS      4:07 04-Mahler Sym No 2  4th Mov Urli(…)     11.16 dB     12.67 dB                                                      -28.53 dBFS  -29.76 dBFS                                                    
+DR10      -6.34 dBFS   -22.55 dBFS      1:27 05-Mahler Sym No 2  5th Mov  Im (…)      9.33 dB      9.86 dB                                                      -23.04 dBFS  -22.10 dBFS                                                    
+DR9      -18.75 dBFS   -34.94 dBFS      1:10 06-Mahler Sym No 2  5th Mov Lang(…)      9.79 dB      8.66 dB                                                      -34.77 dBFS  -35.13 dBFS                                                    
+DR10      -6.51 dBFS   -20.52 dBFS      9:57 07-Mahler Sym No 2  5th Mov Lang(…)      9.83 dB     10.30 dB                                                      -20.39 dBFS  -20.65 dBFS                                                    
+DR10      -7.32 dBFS   -22.68 dBFS      3:20 08-Mahler Sym No 2  5th Mov Wied(…)      9.62 dB      9.96 dB                                                      -22.52 dBFS  -22.83 dBFS                                                    
+DR12     -21.29 dBFS   -38.98 dBFS      1:52 09-Mahler Sym No 2  5th Mov Sehr(…)     12.15 dB     11.98 dB                                                      -38.87 dBFS  -39.09 dBFS                                                    
+DR11     -10.10 dBFS   -27.99 dBFS      6:31 10-Mahler Sym No 2  5th Mov Lang(…)     11.24 dB     11.71 dB                                                      -27.56 dBFS  -28.46 dBFS                                                    
+DR10      -6.45 dBFS   -20.60 dBFS      8:48 11-Mahler Sym No 2  5th Mov Etwa(…)      9.71 dB      9.60 dB                                                      -20.47 dBFS  -20.73 dBFS                                                    
+DR7       -8.86 dBFS   -27.42 dBFS     23:15 01-Mahler Sym No 2  1st Mov Alle(…)     10.73 dB     10.02 dB      0.00 dB      0.00 dB     11.03 dB     10.74 dB  -25.61 dBFS  -25.84 dBFS -139.55 dBFS -139.55 dBFS  -26.44 dBFS  -24.89 dBFS
+DR8       -9.81 dBFS   -30.65 dBFS     10:18 02-Mahler Sym No 2  2nd Mov Anda(…)     12.13 dB     12.40 dB      0.00 dB      0.00 dB     11.95 dB     11.05 dB  -29.69 dBFS  -30.36 dBFS -139.55 dBFS -139.55 dBFS  -29.27 dBFS  -27.03 dBFS
+DR8       -8.10 dBFS   -29.24 dBFS      9:54 03-Mahler Sym No 2  3rd Mov In r(…)     11.86 dB     12.26 dB      0.00 dB      0.00 dB     12.24 dB     11.56 dB  -27.90 dBFS  -28.68 dBFS -139.55 dBFS -139.55 dBFS  -27.85 dBFS  -25.98 dBFS
+DR8      -15.55 dBFS   -36.22 dBFS      4:08 04-Mahler Sym No 2  4th Mov Urli(…)     12.17 dB     11.17 dB      0.00 dB      0.00 dB     12.71 dB     12.29 dB  -33.04 dBFS  -32.62 dBFS -139.55 dBFS -139.55 dBFS  -40.51 dBFS  -35.26 dBFS
+DR6       -8.72 dBFS   -25.56 dBFS      1:26 05-Mahler Sym No 2  5th Mov  Im (…)      9.26 dB      9.29 dB      0.00 dB      0.00 dB      9.12 dB      8.68 dB  -24.42 dBFS  -24.61 dBFS -139.55 dBFS -139.55 dBFS  -24.28 dBFS  -22.30 dBFS
+DR6      -19.25 dBFS   -37.22 dBFS      1:11 06-Mahler Sym No 2  5th Mov Lang(…)      9.59 dB      9.35 dB      0.00 dB      0.00 dB     10.51 dB      9.26 dB  -39.22 dBFS  -34.71 dBFS -139.55 dBFS -139.55 dBFS  -37.68 dBFS  -32.92 dBFS
+DR7       -8.50 dBFS   -25.14 dBFS      9:57 07-Mahler Sym No 2  5th Mov Lang(…)     10.05 dB     10.11 dB      0.00 dB      0.00 dB     10.53 dB     10.63 dB  -23.62 dBFS  -23.52 dBFS -139.55 dBFS -139.55 dBFS  -24.14 dBFS  -22.41 dBFS
+DR6       -8.85 dBFS   -26.39 dBFS      3:22 08-Mahler Sym No 2  5th Mov Wied(…)      9.47 dB      9.01 dB      0.00 dB      0.00 dB      9.74 dB      9.21 dB  -25.44 dBFS  -25.63 dBFS -139.55 dBFS -139.55 dBFS  -24.67 dBFS  -23.22 dBFS
+DR7      -21.78 dBFS   -41.48 dBFS      1:53 09-Mahler Sym No 2  5th Mov Sehr(…)     10.58 dB     10.43 dB      0.00 dB      0.00 dB     11.15 dB      9.68 dB  -39.41 dBFS  -38.17 dBFS -139.55 dBFS -139.55 dBFS  -40.89 dBFS  -41.05 dBFS
+DR8      -12.25 dBFS   -33.40 dBFS      6:32 10-Mahler Sym No 2  5th Mov Lang(…)     12.47 dB     11.65 dB      0.00 dB      0.00 dB     10.59 dB     12.79 dB  -30.98 dBFS  -30.39 dBFS -139.55 dBFS -139.55 dBFS  -36.02 dBFS  -31.08 dBFS
+DR18      -8.19 dBFS   -25.42 dBFS      8:47 11-Mahler Sym No 2  5th Mov Etwa(…)      9.25 dB      9.14 dB     34.80 dB     34.80 dB     10.79 dB      9.93 dB  -22.69 dBFS  -22.87 dBFS -133.39 dBFS -133.39 dBFS  -26.21 dBFS  -23.70 dBFS
+--------------------------------------------------------------------------------
+
+Number of tracks:  22
+Official DR value: DR9
+
+Samplerate:        88200 Hz
+Channels:          2, 6
+Bits per sample:   1
+Bitrate:           11294 kbps
+Codec:             DST64
+================================================================================
