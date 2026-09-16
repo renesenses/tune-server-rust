@@ -1394,6 +1394,12 @@ mod annonce_apres_sortie_guard;
 #[cfg(test)]
 mod stop_scope_tests;
 
+/// #4283 — `play_from_queue` et `advance_queue_metadata` lisent l'entrée de
+/// file AVANT d'écrire le curseur : une position hors bornes est refusée en
+/// nommant la position et la longueur, et la ligne courante ne bouge pas.
+#[cfg(test)]
+mod curseur_intact_4283;
+
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
 ///
