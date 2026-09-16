@@ -7538,3 +7538,157 @@ fn famille_de_sortie_nomme_chaque_famille() {
     assert_eq!(famille_de_sortie("d:1", Some("diretta")), "pull");
     assert_eq!(famille_de_sortie("", None), "absente");
 }
+
+/// Fabien, fil 1780 (Devialet, renderer Rygel, 16/09/2026) : « je perds le
+/// contrôle de la lecture, impossible de faire pause ». Deux
+/// `seek_apres_reprise_envoye` à la MÊME position à 66 s d'intervalle : le
+/// Seek de reprise arrivait sur un renderer encore en `PAUSED_PLAYBACK`, qui
+/// y reste — contrat UPnP. Tune se croyait en lecture, le renderer était
+/// figé, chaque clic rejouait la séquence.
+///
+/// Le mock reproduit ce contrat (`with_seek_qui_laisse_en_pause`) : la
+/// reprise doit finir avec le renderer EN LECTURE, au prix d'un second Play.
+#[tokio::test]
+async fn une_reprise_dlna_relance_play_si_le_seek_a_laisse_le_renderer_en_pause() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("mock-salon"))
+        .unwrap();
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("mock-salon", "Devialet")
+            .with_type("dlna")
+            .with_seek_qui_laisse_en_pause(),
+    ));
+    let (sid, _tx, _ready) = orch
+        .streamer
+        .create_session(
+            crate::http::streamer::StreamInfo {
+                format: "flac".into(),
+                mime_type: "audio/flac".into(),
+                sample_rate: 44_100,
+                bit_depth: 16,
+                channels: 2,
+                ..Default::default()
+            },
+            false,
+            4,
+        )
+        .await;
+    orch.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                track_id: Some(8070),
+                title: "prayer remembered".into(),
+                source: "qobuz".into(),
+                stream_id: Some(sid.clone()),
+                duration_ms: 88_733,
+                ..Default::default()
+            },
+        )
+        .await;
+    // La position de Fabien, mot pour mot.
+    orch.playback.update_position(zone_id, 80_741).await;
+    orch.playback.pause(zone_id).await;
+
+    orch.resume(zone_id, Some("mock-salon"))
+        .await
+        .expect("la reprise ordinaire doit aboutir");
+    // Le seek de reprise est DÉTACHÉ (LAT-P2) : on lui laisse sa pose.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        super::session::RESUME_OUTPUT_SEEK_SETTLE_MS + 400,
+    ))
+    .await;
+
+    let outputs = orch.outputs.lock().await;
+    let guard = outputs.get("mock-salon").unwrap();
+    let guard = guard.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    let statut = crate::outputs::OutputTarget::get_status(mock)
+        .await
+        .unwrap();
+    assert_eq!(
+        statut.position_ms, 80_741,
+        "le seek de reprise est bien parti"
+    );
+    assert_eq!(
+        statut.state,
+        crate::outputs::TransportState::Playing,
+        "le renderer doit avoir REPRIS — un Seek en pause le laissait en pause"
+    );
+    assert_eq!(
+        mock.resume_call_count(),
+        2,
+        "un Play de reprise, puis la relance après le seek resté en pause"
+    );
+}
+
+/// CONTRE-ÉPREUVE : un renderer qui reprend normalement n'entend qu'UN Play.
+/// Sans elle, le correctif pourrait « marcher » en doublant tous les Play.
+#[tokio::test]
+async fn une_reprise_dlna_ordinaire_n_envoie_qu_un_seul_play() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Salon", Some("dlna"), Some("mock-salon"))
+        .unwrap();
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("mock-salon", "Renderer sain").with_type("dlna"),
+    ));
+    let (sid, _tx, _ready) = orch
+        .streamer
+        .create_session(
+            crate::http::streamer::StreamInfo {
+                format: "flac".into(),
+                mime_type: "audio/flac".into(),
+                sample_rate: 44_100,
+                bit_depth: 16,
+                channels: 2,
+                ..Default::default()
+            },
+            false,
+            4,
+        )
+        .await;
+    orch.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                track_id: Some(1),
+                title: "x".into(),
+                source: "local".into(),
+                stream_id: Some(sid.clone()),
+                duration_ms: 300_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    orch.playback.update_position(zone_id, 80_741).await;
+    orch.playback.pause(zone_id).await;
+    orch.resume(zone_id, Some("mock-salon")).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(
+        super::session::RESUME_OUTPUT_SEEK_SETTLE_MS + 400,
+    ))
+    .await;
+    let outputs = orch.outputs.lock().await;
+    let guard = outputs.get("mock-salon").unwrap();
+    let guard = guard.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert_eq!(
+        crate::outputs::OutputTarget::get_status(mock)
+            .await
+            .unwrap()
+            .state,
+        crate::outputs::TransportState::Playing
+    );
+    assert_eq!(
+        mock.resume_call_count(),
+        1,
+        "aucune relance quand le renderer a repris"
+    );
+}
