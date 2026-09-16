@@ -26,6 +26,7 @@ mod search;
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
 pub(crate) mod graver_dr;
+pub(crate) mod reparer_compilations;
 pub(crate) mod stats;
 mod tracks;
 pub(crate) mod write_tags;
@@ -438,6 +439,11 @@ pub fn router() -> Router<AppState> {
         .route(
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
+        )
+        // Phase 4 du chantier « tag compilation » : réparer l'existant (C3).
+        .route(
+            "/compilations/reparation",
+            get(reparer_compilations::statut).post(reparer_compilations::lancer),
         )
         .route("/artwork/rescan", post(artwork::rescan_all_artwork))
         .route("/rescan-metadata", post(tracks::rescan_metadata))

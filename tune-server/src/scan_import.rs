@@ -1028,6 +1028,10 @@ impl TrackImporter {
                     // dossier est l'éclat d'une compilation déjà indexée
                     // (#1440) : un numéro déjà pris ⇒ homonyme, pas éclat.
                     meta.track_number.map(|n| n as i32),
+                    // Le numéro de DISQUE sert UNIQUEMENT à rattacher un dossier
+                    // `CD02` au coffret que `CD01` a ouvert (C4) : un numéro
+                    // déjà pris ⇒ seconde extraction, pas second disque.
+                    meta.disc_number.map(|n| n as i32),
                 );
                 if let Err(ref e) = result {
                     tracing::warn!(

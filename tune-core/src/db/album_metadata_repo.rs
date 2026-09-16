@@ -42,6 +42,11 @@ pub mod sql {
     }
 }
 
+/// Clé, dans `album_metadata`, du marqueur d'édition manuelle (C3). Valeur :
+/// tableau JSON de noms de champs. Voir
+/// [`AlbumMetadataRepo::marquer_edition_manuelle`].
+pub const CLE_EDITION_MANUELLE: &str = "edition_manuelle";
+
 /// Album-level extended metadata (Vademecum k/v: conductor, performer,
 /// barcode, catalog_number…), symmetric with [`super::track_metadata_repo`].
 /// Before this store existed the web UI parked album-scoped fields on the
@@ -105,6 +110,47 @@ impl AlbumMetadataRepo {
             self.db.execute(&sql, &params)?;
         }
         Ok(())
+    }
+
+    /// Marque des champs de l'album comme ÉDITÉS À LA MAIN.
+    ///
+    /// Arbitrage **C3** du chantier « gestion du tag compilation » (Bertrand,
+    /// 14/09/2026) : « d'abord poser le marqueur d'édition manuelle, la
+    /// réparation des bibliothèques déjà indexées ensuite ». Rien ne
+    /// distinguait un champ corrigé par l'utilisateur d'un champ importé
+    /// (cherché : `manually_edited`, `metadata_source`, `override` — aucun),
+    /// donc aucune passe de réparation ne pouvait promettre de ne pas défaire
+    /// une correction.
+    ///
+    /// Le marqueur vit ICI, dans `album_metadata`, sous la clé
+    /// [`CLE_EDITION_MANUELLE`] : un tableau JSON trié de noms de champs
+    /// (`"artist"`, `"title"`, `"year"`, `"is_compilation"`…). Pas de colonne :
+    /// le magasin clé-valeur existe déjà sur les deux moteurs, et un tableau
+    /// dit QUELS champs sont tenus, pas seulement « quelque chose l'a été ».
+    ///
+    /// Idempotent et cumulatif : marquer `title` puis `artist` laisse les deux.
+    pub fn marquer_edition_manuelle(&self, album_id: i64, champs: &[&str]) -> Result<(), String> {
+        let mut tenus = self.champs_edites_a_la_main(album_id)?;
+        for c in champs {
+            let c = c.trim();
+            if !c.is_empty() && !tenus.iter().any(|t| t == c) {
+                tenus.push(c.to_string());
+            }
+        }
+        tenus.sort();
+        let json = serde_json::to_string(&tenus).map_err(|e| e.to_string())?;
+        self.set(album_id, CLE_EDITION_MANUELLE, &json)
+    }
+
+    /// Les champs de l'album tenus par une édition manuelle, triés. Vide si
+    /// personne n'y a touché — ou si la valeur stockée n'est pas lisible, ce
+    /// qui revient au même pour qui doit décider de réparer.
+    pub fn champs_edites_a_la_main(&self, album_id: i64) -> Result<Vec<String>, String> {
+        let tous = self.get_all(album_id)?;
+        Ok(tous
+            .get(CLE_EDITION_MANUELLE)
+            .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+            .unwrap_or_default())
     }
 
     /// Delete a single metadata field.
@@ -207,5 +253,36 @@ mod tests {
 
         let meta = repo.get_all(1).unwrap();
         assert!(meta.is_empty());
+    }
+    #[test]
+    fn le_marqueur_d_edition_manuelle_est_cumulatif_idempotent_et_trie() {
+        let repo = AlbumMetadataRepo::new(setup_db());
+        assert!(repo.champs_edites_a_la_main(1).unwrap().is_empty());
+        repo.marquer_edition_manuelle(1, &["title"]).unwrap();
+        repo.marquer_edition_manuelle(1, &["artist", "title", " ", "artist"])
+            .unwrap();
+        assert_eq!(
+            repo.champs_edites_a_la_main(1).unwrap(),
+            vec!["artist", "title"]
+        );
+        // Il vit dans le magasin ordinaire, sous sa clé : lisible par
+        // `GET /albums/{id}/metadata` sans route dédiée.
+        assert_eq!(
+            repo.get_all(1)
+                .unwrap()
+                .get(CLE_EDITION_MANUELLE)
+                .map(String::as_str),
+            Some(r#"["artist","title"]"#)
+        );
+    }
+
+    #[test]
+    fn une_valeur_illisible_vaut_aucun_champ_tenu() {
+        let repo = AlbumMetadataRepo::new(setup_db());
+        repo.set(1, CLE_EDITION_MANUELLE, "pas du json").unwrap();
+        assert!(repo.champs_edites_a_la_main(1).unwrap().is_empty());
+        // Et marquer par-dessus repart proprement.
+        repo.marquer_edition_manuelle(1, &["year"]).unwrap();
+        assert_eq!(repo.champs_edites_a_la_main(1).unwrap(), vec!["year"]);
     }
 }

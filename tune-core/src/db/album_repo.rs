@@ -167,6 +167,32 @@ pub mod sql {
         format!("SELECT name FROM artists WHERE id = {}", d.placeholder(1))
     }
 
+    /// Pose le drapeau « compilation » à une valeur DONNÉE, dans les deux sens.
+    ///
+    /// Littéral `1`/`0` et non un paramètre : la colonne est `INTEGER` sous
+    /// SQLite et `TEXT` sous PostgreSQL, et un paramètre entier lié sur une
+    /// colonne texte est refusé par PG là où un littéral est converti à
+    /// l'affectation. Même forme que [`mark_compilation`].
+    ///
+    /// Réservé à la passe de réparation (C3) — voir
+    /// [`AlbumRepo::reparer_compilation`].
+    pub fn set_compilation<D: SqlDialect>(d: &D, valeur: bool) -> String {
+        format!(
+            "UPDATE albums SET is_compilation = {} WHERE id = {}",
+            if valeur { 1 } else { 0 },
+            d.placeholder(1)
+        )
+    }
+
+    /// Les numéros de disque distincts déjà rangés sous un album (C4).
+    pub fn disc_numbers_of<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT DISTINCT disc_number FROM tracks \
+             WHERE album_id = {} AND disc_number IS NOT NULL",
+            d.placeholder(1)
+        )
+    }
+
     pub fn set_artist_id<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET artist_id = {} WHERE id = {}",
@@ -1129,12 +1155,19 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
     ) -> Result<Album, TuneError> {
-        self.get_or_create_for_folder_with_track(folder, title, artist_id, year, mbid, None)
+        self.get_or_create_for_folder_with_track(folder, title, artist_id, year, mbid, None, None)
     }
 
     /// Variante qui connaît le numéro de la piste en cours d'indexation, seule
     /// information permettant de recoller une compilation éparpillée par
-    /// artiste sans risquer de fusionner deux homonymes (#1440).
+    /// artiste sans risquer de fusionner deux homonymes (#1440) — et le numéro
+    /// de DISQUE, seule information permettant de recoller un coffret rangé
+    /// en dossiers `CD01/CD02/…` sans fusionner deux extractions du même
+    /// album (C4).
+    // Huit arguments : chacun est un FAIT distinct que la résolution pèse
+    // (dossier, titre, artiste, année, MBID, piste, disque). Les regrouper en
+    // structure déplacerait la liste sans la raccourcir.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_or_create_for_folder_with_track(
         &self,
         folder: &str,
@@ -1143,6 +1176,7 @@ impl AlbumRepo {
         year: Option<i32>,
         mbid: Option<&str>,
         track_number: Option<i32>,
+        disc_number: Option<i32>,
     ) -> Result<Album, TuneError> {
         if folder.is_empty() {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
@@ -1198,6 +1232,34 @@ impl AlbumRepo {
         match self.folder_path_of(id)? {
             // Already ours, or freshly created by the call above.
             Some(existing) if existing == folder => Ok(candidate),
+            // C4 (Bertrand, 14/09/2026) — « un coffret de 63 CD fait un album
+            // unique de 63 disques ». Avant cet arbitrage, le dossier `CD02`
+            // tombait ici, dans « autre dossier = autre édition », et le
+            // coffret sortait en autant d'albums que de disques. Trois faits
+            // doivent tenir ENSEMBLE : même titre et même artiste (c'est
+            // `candidate`), deux dossiers de disques frères sous le même
+            // parent, et un numéro de disque que l'album n'a pas encore. Le
+            // troisième sépare un coffret de deux extractions identiques
+            // rangées l'une à côté de l'autre : elles se disputent le disque 1.
+            // La pochette n'entre pas dans la règle — 63 disques, 63
+            // pochettes.
+            Some(existing)
+                if crate::scanner::compilation::sont_des_disques_du_meme_coffret(
+                    &existing, folder,
+                ) && disc_number.is_some_and(|d| {
+                    d > 0 && !self.disc_numbers_of(id).unwrap_or_default().contains(&d)
+                }) =>
+            {
+                tracing::info!(
+                    album_id = id,
+                    title,
+                    dossier_du_coffret = %existing,
+                    disque = %folder,
+                    ?disc_number,
+                    "coffret_disque_rattache"
+                );
+                Ok(candidate)
+            }
             // Another folder owns it: this is a distinct release that merely
             // shares title, artist and year. Give it its own row.
             Some(_) => {
@@ -1477,6 +1539,50 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
         self.db.execute(&sql, &params)?;
         self.mark_compilation(album_id)
+    }
+
+    /// Répare le drapeau « compilation » et, s'il est donné, l'artiste d'un
+    /// album déjà indexé — dans les DEUX sens, contrairement à
+    /// [`Self::mark_compilation`].
+    ///
+    /// C'est la seule porte par laquelle le drapeau peut BAISSER hors d'un
+    /// rescan complet. Elle n'existe que pour la passe de réparation du
+    /// chantier « gestion du tag compilation » (phase 4, arbitrage C3 de
+    /// Bertrand, 14/09/2026), qui la garde derrière le marqueur d'édition
+    /// manuelle : un album que l'utilisateur a corrigé n'y passe jamais. Le
+    /// scan, lui, continue de ne faire que lever.
+    pub fn reparer_compilation(
+        &self,
+        album_id: i64,
+        is_compilation: bool,
+        artist_id: Option<i64>,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(
+            |d| sql::set_compilation(d, is_compilation),
+            |d| sql::set_compilation(d, is_compilation),
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        if let Some(aid) = artist_id {
+            let sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+            let params: [&dyn ToSqlValue; 2] = [&aid, &album_id];
+            self.db.execute(&sql, &params)?;
+        }
+        Ok(())
+    }
+
+    /// Les numéros de disque distincts déjà rangés sous un album, triés (C4).
+    pub fn disc_numbers_of(&self, album_id: i64) -> Result<Vec<i32>, TuneError> {
+        let sql = self.dialect_sql(sql::disc_numbers_of, sql::disc_numbers_of);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let mut v: Vec<i32> = self
+            .db
+            .query_many_strong(&sql, &params)?
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()).map(|n| n as i32))
+            .collect();
+        v.sort_unstable();
+        Ok(v)
     }
 
     /// Like `get_by_title_and_artist` but uses `query_one_strong` to
@@ -3076,6 +3182,150 @@ mod tests {
     }
 
     /// Pose une piste numérotée sur un album, comme le fait le scan.
+    /// C4 — un coffret rangé en `CD01/CD02/CD03` sous un même parent, un seul
+    /// titre, un seul artiste, trois numéros de disque : UN album. Avant
+    /// l'arbitrage, « autre dossier = autre édition » en faisait trois.
+    #[test]
+    fn un_coffret_en_dossiers_de_disques_fait_un_seul_album() {
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let chef = artists.create(&Artist::new("Fritz Reiner".into())).unwrap();
+        const TITRE: &str = "The Complete RCA Album Collection";
+        let cd = |n: u32| format!("/m/Reiner/Coffret RCA/CD{n:02}");
+
+        let a1 = arepo
+            .get_or_create_for_folder_with_track(
+                &cd(1),
+                TITRE,
+                chef,
+                Some(1955),
+                None,
+                Some(1),
+                Some(1),
+            )
+            .unwrap();
+        let id = a1.id.unwrap();
+        seed_track_with_disc(&db, id, chef, 1, 1, &format!("{}/01.flac", cd(1)));
+
+        let a2 = arepo
+            .get_or_create_for_folder_with_track(
+                &cd(2),
+                TITRE,
+                chef,
+                Some(1955),
+                None,
+                Some(1),
+                Some(2),
+            )
+            .unwrap();
+        assert_eq!(a2.id, Some(id), "CD02 rejoint le coffret");
+        seed_track_with_disc(&db, id, chef, 1, 2, &format!("{}/01.flac", cd(2)));
+
+        let a3 = arepo
+            .get_or_create_for_folder_with_track(
+                &cd(3),
+                TITRE,
+                chef,
+                Some(1955),
+                None,
+                Some(1),
+                Some(3),
+            )
+            .unwrap();
+        assert_eq!(a3.id, Some(id), "CD03 aussi");
+        assert_eq!(arepo.disc_numbers_of(id).unwrap(), vec![1, 2]);
+    }
+
+    /// C4, contre-épreuves — ce qui ne DOIT PAS se coller :
+    /// - une seconde extraction du même coffret (le disque 1 est déjà pris) ;
+    /// - deux dossiers frères qui ne s'appellent pas « disque » ;
+    /// - un dossier de disque sans numéro de disque dans ses balises.
+    #[test]
+    fn un_coffret_ne_recolle_ni_une_seconde_extraction_ni_un_dossier_sans_disque() {
+        let db = test_db();
+        let arepo = AlbumRepo::new(db.clone());
+        let artists = ArtistRepo::new(db.clone());
+        let chef = artists.create(&Artist::new("Fritz Reiner".into())).unwrap();
+        const TITRE: &str = "Coffret";
+
+        let a1 = arepo
+            .get_or_create_for_folder_with_track(
+                "/m/X/Coffret/CD01",
+                TITRE,
+                chef,
+                None,
+                None,
+                Some(1),
+                Some(1),
+            )
+            .unwrap();
+        let id = a1.id.unwrap();
+        seed_track_with_disc(&db, id, chef, 1, 1, "/m/X/Coffret/CD01/01.flac");
+
+        // Seconde extraction, même disque 1 : sa propre ligne.
+        let bis = arepo
+            .get_or_create_for_folder_with_track(
+                "/m/X/Coffret/CD01 (hi-res)",
+                TITRE,
+                chef,
+                None,
+                None,
+                Some(1),
+                Some(1),
+            )
+            .unwrap();
+        assert_ne!(bis.id, Some(id), "disque 1 déjà pris : seconde extraction");
+
+        // Frère sans nom de disque : sa propre ligne.
+        let bonus = arepo
+            .get_or_create_for_folder_with_track(
+                "/m/X/Coffret/Bonus",
+                TITRE,
+                chef,
+                None,
+                None,
+                Some(1),
+                Some(2),
+            )
+            .unwrap();
+        assert_ne!(bonus.id, Some(id));
+
+        // Nom de disque mais aucun numéro de disque dans les balises : on
+        // ne devine pas.
+        let muet = arepo
+            .get_or_create_for_folder_with_track(
+                "/m/X/Coffret/CD02",
+                TITRE,
+                chef,
+                None,
+                None,
+                Some(1),
+                None,
+            )
+            .unwrap();
+        assert_ne!(muet.id, Some(id));
+    }
+
+    fn seed_track_with_disc(
+        db: &SqliteDb,
+        album_id: i64,
+        artist_id: i64,
+        n: i32,
+        disc: i32,
+        path: &str,
+    ) {
+        use crate::db::models::Track;
+        use crate::db::track_repo::TrackRepo;
+        let mut t = Track::new(format!("piste {n}"));
+        t.album_id = Some(album_id);
+        t.artist_id = Some(artist_id);
+        t.track_number = n;
+        t.disc_number = disc;
+        t.file_path = Some(path.to_string());
+        TrackRepo::new(db.clone()).create(&t).unwrap();
+    }
+
     fn seed_track(db: &SqliteDb, album_id: i64, artist_id: i64, n: i32, path: &str) {
         seed_track_with_album_artist(db, album_id, artist_id, n, path, None);
     }
@@ -3137,12 +3387,12 @@ mod tests {
         let f2 = dossier_avec_pochette(tmp.path(), "Alligator", TITLE, 1, 55);
 
         let first = arepo
-            .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1))
+            .get_or_create_for_folder_with_track(&f1, TITLE, a1, None, None, Some(1), None)
             .unwrap();
         seed_track(&db, first.id.unwrap(), a1, 1, &format!("{f1}/01.flac"));
 
         let second = arepo
-            .get_or_create_for_folder_with_track(&f2, TITLE, a2, None, None, Some(3))
+            .get_or_create_for_folder_with_track(&f2, TITLE, a2, None, None, Some(3), None)
             .unwrap();
         assert_eq!(second.id, first.id, "même disque, même pochette : un album");
     }
@@ -3168,6 +3418,7 @@ mod tests {
                 Some(2005),
                 None,
                 Some(1),
+                None,
             )
             .unwrap();
         seed_track(&db, first.id.unwrap(), a1, 1, &format!("{f1}/01.flac"));
@@ -3180,6 +3431,7 @@ mod tests {
                 Some(1992),
                 None,
                 Some(1),
+                None,
             )
             .unwrap();
         assert_ne!(second.id, first.id);
@@ -3217,7 +3469,15 @@ mod tests {
                 dossier_avec_pochette(tmp.path(), artiste, "ALLOPOP", vol as u32, 60 + (num as u8));
             let aid = artists.create(&Artist::new(artiste.into())).unwrap();
             let album = arepo
-                .get_or_create_for_folder_with_track(&f, "ALLOPOP", aid, None, None, Some(num))
+                .get_or_create_for_folder_with_track(
+                    &f,
+                    "ALLOPOP",
+                    aid,
+                    None,
+                    None,
+                    Some(num),
+                    None,
+                )
                 .unwrap();
             let id = album.id.unwrap();
             seed_track(&db, id, aid, num, &format!("{f}/{num:02}.flac"));
