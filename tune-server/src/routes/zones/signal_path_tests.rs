@@ -2270,6 +2270,68 @@ fn un_dsp_et_une_adaptation_de_canaux_mesures_portent_chacun_leur_etape() {
     );
 }
 
+/// #3632 — un FLAC 5.1 dont la sortie a ouvert les SIX voies, telles quelles :
+/// le chemin du signal le dit, nomme la disposition, et le verdict tient —
+/// aucun échantillon n'a été mixé. Contre-témoin dans le même test : la même
+/// source repliée en stéréo par le périphérique porte l'étape d'adaptation
+/// « 6 → 2 » et perd le verdict, comme avant.
+#[test]
+fn une_sortie_multicanal_mesuree_porte_son_etape_et_garde_le_verdict() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = flac_playing();
+    let entree_5_1 = AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier24, 6).unwrap();
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        entree_5_1,
+        FormatOuvert::new(96_000, 6),
+        false,
+    ));
+
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("HDMI"),
+        "CPAL",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        step_desc(&sp, "Canaux").as_deref(),
+        Some("6 canaux (5.1), sortie multicanal (mesuré)"),
+        "le périphérique a ouvert les six voies : le chemin doit le DIRE, sinon un \
+         5.1 joué en 5.1 et un 5.1 replié en stéréo affichent la même chose"
+    );
+    assert_eq!(
+        sp.get("bit_perfect").and_then(|b| b.as_bool()),
+        Some(true),
+        "six voies entrées, six voies ouvertes : rien n'a été mixé, le verdict tient"
+    );
+
+    // Contre-témoin : le même 5.1 replié en stéréo par le périphérique.
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        entree_5_1,
+        FormatOuvert::new(96_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("HDMI"),
+        "CPAL",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_desc(&sp, "Canaux").as_deref(),
+        Some("6 \u{2192} 2 canaux (mesuré)"),
+        "replié : l'étape d'adaptation, pas l'étape multicanal"
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // REF-6b côté PRODUCTEUR (#2219, REF-7) — la sortie locale remplit le contrat
 // que #3987 avait posé sans producteur : `EtageDeConversion::transformations()`

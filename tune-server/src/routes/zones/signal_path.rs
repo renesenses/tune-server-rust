@@ -890,6 +890,22 @@ fn assembler_les_etapes(
         }));
     }
 
+    // Sortie MULTICANAL mesurée (#3632) : le périphérique a ouvert les N > 2
+    // voies de la source, telles quelles — aucun mixage. Sans cette étape,
+    // un FLAC 5.1 joué en 5.1 et un FLAC 5.1 replié en stéréo affichaient
+    // le même chemin ; et c'est justement ce que Didier veut voir.
+    if let Some(t) = reel.filter(|t| !t.adaptation_canaux() && t.ouvert().canaux > 2) {
+        let canaux = t.ouvert().canaux;
+        let disposition = tune_core::audio::channels::channel_badge(canaux)
+            .map(|badge| format!(" ({badge})"))
+            .unwrap_or_default();
+        steps.push(json!({
+            "name": "Canaux",
+            "description": format!("{canaux} canaux{disposition}, sortie multicanal (mesuré)"),
+            "bit_perfect": true,
+        }));
+    }
+
     // Transport step
     steps.push(json!({
         "name": "Transport",
