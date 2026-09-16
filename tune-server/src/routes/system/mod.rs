@@ -24,6 +24,8 @@ pub(crate) use enrich::gate_enrichment;
 // finirait par diverger, et un repli silencieux enrichirait justement ce que
 // l'utilisateur voulait épargner.
 pub(crate) use enrich::resoudre_portee;
+/// #4185 — le geste qui LANCE la mesure de la plage dynamique, et sa jauge.
+mod dynamic_range;
 mod import;
 mod playlist_hub;
 mod plugins;
@@ -93,6 +95,18 @@ pub fn router() -> Router<AppState> {
         // L'écran Santé affichait `IDLE` pendant des heures de balayage faute
         // de cette route.
         .route("/replaygain/progress", get(replaygain::replaygain_progress))
+        // #4185 — la plage dynamique n'avait AUCUN geste : sa mesure était le
+        // troisième rang de la cascade de fond, après le ReplayGain et les
+        // empreintes. Le `POST` la lance tout de suite (202 / 409), le `GET`
+        // est le pendant de `/replaygain/progress`.
+        .route(
+            "/dynamic-range/analyze",
+            post(dynamic_range::dynamic_range_analyze),
+        )
+        .route(
+            "/dynamic-range/progress",
+            get(dynamic_range::dynamic_range_progress),
+        )
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
         // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit

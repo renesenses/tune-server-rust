@@ -20,6 +20,12 @@
 /// pour cette passe-ci, et rien d'autre ne doit l'écrire.
 pub mod progression;
 
+/// La mesure de la plage dynamique À LA DEMANDE (#4185) : le geste qui
+/// manquait. La cascade de fond ci-dessous (ReplayGain → empreintes → plage
+/// dynamique) reste la passe nominale ; ce module en est le raccourci, borné
+/// au seul DR, que l'utilisateur peut lancer et suivre.
+pub mod plage_dynamique;
+
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
@@ -299,6 +305,14 @@ pub fn track_gain_db(lufs: f64) -> f64 {
 /// décodage. Couper l'analyse suspend le travail, elle ne le jette pas.
 pub fn analysis_enabled(backend: &Arc<dyn DbBackend>) -> bool {
     matches!(etat_de_l_analyse(backend), EtatAnalyse::Active)
+}
+
+/// POURQUOI la passe ne décode pas — la phrase du registre, `None` quand elle
+/// est active. Exposé pour la route qui lance la plage dynamique à la demande
+/// (#4185) : un refus qui dit « analyse désactivée » sans dire LEQUEL des deux
+/// réglages la coupe renvoie l'utilisateur chercher au hasard.
+pub fn motif_d_inaction(backend: &Arc<dyn DbBackend>) -> Option<&'static str> {
+    etat_de_l_analyse(backend).motif()
 }
 
 /// Pourquoi la passe décode — ou ne décode pas.
@@ -1160,6 +1174,29 @@ const CANDIDATS_DR_WHERE: &str = "t.file_path IS NOT NULL AND t.file_path != '' 
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'rg_path_unresolved' \
                    AND m.value > ?)";
+
+/// Combien de pistes le rattrapage de la plage dynamique prendrait MAINTENANT.
+///
+/// Même texte que la sélection de [`rattraper_un_lot_de_dr`] — c'est le
+/// dénominateur de la passe à la demande (#4185), et un compte recopié à la
+/// main finirait par viser une population que la passe ne traite pas (même
+/// montage que [`compter_les_candidats_a_empreinter`]). Une panne de base
+/// rend 0, journalisée : la route ne doit pas tomber pour une jauge.
+pub fn compter_les_candidats_dr(backend: &Arc<dyn DbBackend>) -> i64 {
+    let seuil_report = deferral_threshold(now_epoch_secs() as i64);
+    match backend.query_one(
+        &format!("SELECT COUNT(*) FROM tracks t WHERE {CANDIDATS_DR_WHERE}"),
+        &[&seuil_report as &dyn ToSqlValue],
+    ) {
+        Ok(row) => row
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0),
+        Err(e) => {
+            warn!(error = %e, "dr_candidate_count_failed");
+            0
+        }
+    }
+}
 
 /// Calcule la plage dynamique d'un lot de pistes que la passe nominale a
 /// laissées derrière elle. Rend combien de lignes ont AVANCÉ (0 ⇒ plus rien).
@@ -2580,7 +2617,9 @@ mod tests {
     /// ABSENT vaut « Désactivé » et [`analyze_track_batch`] rend 0 sans rien
     /// lire. Sans cette ligne, les tests #1865 passeraient au vert en ne
     /// testant plus rien.
-    fn base_avec_piste(chemin: &str) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
+    pub(super) fn base_avec_piste(
+        chemin: &str,
+    ) -> (crate::db::sqlite::SqliteDb, Arc<dyn DbBackend>) {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
@@ -2605,7 +2644,9 @@ mod tests {
         (db, backend)
     }
 
-    fn temoins(db: &crate::db::sqlite::SqliteDb) -> std::collections::HashMap<String, String> {
+    pub(super) fn temoins(
+        db: &crate::db::sqlite::SqliteDb,
+    ) -> std::collections::HashMap<String, String> {
         TrackMetadataRepo::new(db.clone()).get_all(42).unwrap()
     }
 
@@ -2656,7 +2697,7 @@ mod tests {
     /// Les trois blocs étant identiques : pic₂ = 1,0, et les 20 % les plus
     /// forts de 3 blocs font 1 bloc, donc RMS₂₀ = 0,3159.
     ///   DR = 20 · log₁₀(1,0 / 0,3159) = 10,01 → arrondi à 10.
-    fn wav_de_plage_connue(chemin: &std::path::Path) {
+    pub(super) fn wav_de_plage_connue(chemin: &std::path::Path) {
         use std::io::Write;
         const SR: u32 = 44_100;
         const BLOCS: u32 = 3;
