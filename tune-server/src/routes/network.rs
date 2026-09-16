@@ -341,7 +341,7 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 //
                 // Les deux seuils restent distincts et cette hiérarchie est
                 // voulue : 900 s marque « plus revu depuis un moment » sans
-                // aucune conséquence, 5 400 s (`SERVEUR_ABSENT_APRES`) retire
+                // aucune conséquence, 24 h (`SERVEUR_ABSENT_APRES`, D2) retire
                 // des propositions. Un serveur peut donc être `reachable:
                 // false` et `proposable: true` — c'est la zone grise, et c'est
                 // exactement ce que le fil 1425 demandait de montrer.
