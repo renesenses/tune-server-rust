@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 oaat = ["tune-core/oaat"]
@@ -49,6 +49,10 @@ bandcamp = ["dep:tune-bandcamp"]
 # Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
 # coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
 concerts = ["dep:tune-concerts"]
+# Pont Roon (#3914) — Premium : importer l'archive du moissonneur (crédits,
+# images). Dans `default` comme Bandcamp : le greffon est opt-in à l'exécution
+# (`default_enabled = false`) et refuse sans licence.
+pont-roon = ["dep:tune-pont-roon"]
 
 [dependencies]
 libc = "0.2"
@@ -62,6 +66,7 @@ tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
+tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }

@@ -60,6 +60,10 @@ pub enum Feature {
     /// acoustique. C'est le traitement le plus lourd du serveur (décodage +
     /// inférence ONNX multi-thread, ~300 Mo résidents).
     AcousticAnalysis,
+    /// Pont Roon : importer ce que le moissonneur a récolté sur un Core Roon —
+    /// crédits par piste, images d'artistes, pochettes (Bertrand, 16/09/2026 :
+    /// « en plugin PREMIUM »).
+    PontRoon,
 }
 
 impl Feature {
@@ -93,6 +97,7 @@ impl Feature {
             Feature::PlaylistsHub,
             Feature::Declick,
             Feature::AcousticAnalysis,
+            Feature::PontRoon,
         ]
     }
 
@@ -110,6 +115,7 @@ impl Feature {
             Feature::MultiScrobbling => "Multi-Service Scrobbling",
             Feature::AiRecommendations => "AI Recommendations",
             Feature::AcousticAnalysis => "Acoustic Analysis",
+            Feature::PontRoon => "Roon Bridge",
             Feature::PlaylistTransfer => "Playlist Transfer",
             Feature::AdvancedAlarms => "Advanced Alarms",
             Feature::MultiProfiles => "Multi-User Profiles",
@@ -149,6 +155,7 @@ impl Feature {
             Feature::MultiScrobbling => "multi_scrobbling",
             Feature::AiRecommendations => "ai_recommendations",
             Feature::AcousticAnalysis => "acoustic_analysis",
+            Feature::PontRoon => "pont_roon",
             Feature::PlaylistTransfer => "playlist_transfer",
             Feature::AdvancedAlarms => "advanced_alarms",
             Feature::MultiProfiles => "multi_profiles",
@@ -1260,12 +1267,13 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentyfive_features() {
+    fn all_premium_has_twentysix_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
-        // rien et tournait sur des installations gratuites.
-        assert_eq!(Feature::all_premium().len(), 25);
+        // rien et tournait sur des installations gratuites ; puis à 26 avec
+        // `PontRoon` (16/09/2026, décision de Bertrand).
+        assert_eq!(Feature::all_premium().len(), 26);
     }
 
     #[test]

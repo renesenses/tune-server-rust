@@ -143,6 +143,20 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             },
         )))
         .await;
+
+    // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
+    // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
+    // images de l'archive sous le même condensat que tout le reste.
+    #[cfg(feature = "pont-roon")]
+    loader
+        .register(Box::new(tune_pont_roon::PontRoonPlugin::new(
+            tune_pont_roon::HostServices {
+                backend: state.backend.clone(),
+                license: state.license.clone(),
+                dossier_cache: crate::routes::library::artwork_cache_dir(),
+            },
+        )))
+        .await;
 }
 
 /// Builds the plugins an out-of-tree binary wants registered.

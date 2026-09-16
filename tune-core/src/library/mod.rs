@@ -14,6 +14,9 @@ pub mod local_path;
 pub mod lyrics_pass;
 pub mod m3u_parser;
 pub mod playlist_scan;
+pub mod pont_roon;
+/// Appliquer un export du pont Roon (crédits, images) contre la base.
+pub mod pont_roon_import;
 pub mod quality;
 pub mod smart_collections;
 pub mod track_matcher;
