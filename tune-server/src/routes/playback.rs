@@ -769,7 +769,38 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, O
 
 #[derive(Deserialize)]
 struct SeekRequest {
+    /// Signé pour ne pas changer le contrat de désérialisation ; le refus
+    /// d'une valeur négative est explicite (400 nommant le champ), voir
+    /// [`refuser_un_entier_negatif`] — #3966.
     position_ms: i64,
+}
+
+/// #3966 — un entier **signé** reçu du client et destiné à un `u64`/`usize`
+/// se refuse ICI, à la frontière HTTP, avant toute mutation de sortie ou de
+/// lecture.
+///
+/// Le défaut : `-1 as u64` vaut 18 446 744 073 709 551 615 ; le seek partait
+/// vers la sortie avec cette position, puis la borne de durée le posait en
+/// fin de piste. Jumeau : `start_index` de `POST /zones/{id}/play`, dont le
+/// `-1 as usize` borné par `.min(len - 1)` désignait la **dernière** piste de
+/// l'album ou de la playlist. Un client qui envoie un négatif a un bogue ; le
+/// lui dire (champ nommé, valeur reçue) vaut mieux que de deviner.
+fn refuser_un_entier_negatif(
+    champ: &'static str,
+    valeur: i64,
+) -> Result<(), axum::response::Response> {
+    if valeur >= 0 {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "negative_value",
+            "field": champ,
+            "message": format!("{champ} must be >= 0, got {valeur}"),
+        })),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -978,6 +1009,9 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
     }
     Json(v)
 }
+
+#[cfg(test)]
+mod refus_entier_negatif_3966;
 
 /// Replace a zone's queue after taking the SQLite user-write lane.
 ///
@@ -1315,6 +1349,17 @@ async fn play(
     // chaque requete : c'est elle qui decide dans quelle langue un refus se
     // lit (#3672). Relevee une fois, passee a tous les refus de ce handler.
     let lang = crate::i18n::lang_from_header(&headers);
+    // #3966 (jumeau du seek) — `start_index` négatif refusé avant la moindre
+    // écriture, y compris le marquage du profil de session juste dessous.
+    if let Err(refus) = body
+        .as_ref()
+        .and_then(|Json(b)| b.start_index)
+        .map_or(Ok(()), |index| {
+            refuser_un_entier_negatif("start_index", index)
+        })
+    {
+        return refus;
+    }
     // A user-initiated play starts (or takes over) the listening session on
     // this zone: stamp the caller's profile so record_listen — and every
     // autoplay / gapless advance that inherits it — tags listen_history to the
@@ -2501,13 +2546,19 @@ async fn seek(
     Path(zone_id): Path<i64>,
     Json(body): Json<SeekRequest>,
 ) -> impl IntoResponse {
+    // #3966 — refus AVANT la lecture de l'appareil et avant l'orchestrateur :
+    // rien n'a bougé quand le 400 part.
+    if let Err(refus) = refuser_un_entier_negatif("position_ms", body.position_ms) {
+        return refus;
+    }
+    let position_ms = body.position_ms as u64;
     let device_id = get_zone_device_id(&state, zone_id);
     match state
         .orchestrator
-        .seek(zone_id, body.position_ms as u64, device_id.as_deref())
+        .seek(zone_id, position_ms, device_id.as_deref())
         .await
     {
-        Ok(()) => Json(json!({ "position_ms": body.position_ms })).into_response(),
+        Ok(()) => Json(json!({ "position_ms": position_ms })).into_response(),
         Err(error) => output_command_error_response(error),
     }
 }
