@@ -51,7 +51,10 @@ pub mod sql {
         };
         let pg_conflict = match d.engine() {
             crate::db::engine::Engine::Sqlite => "",
-            crate::db::engine::Engine::Postgres => " ON CONFLICT (name, url) DO NOTHING",
+            // Match SQLite OR IGNORE without assuming a unique (name, url)
+            // constraint: neither shipped PostgreSQL schema defines one.
+            // Explicit RETURNING is required for an INSERT with ON CONFLICT.
+            crate::db::engine::Engine::Postgres => " ON CONFLICT DO NOTHING RETURNING id",
         };
         format!(
             "INSERT{conflict} INTO radio_stations (name, url, homepage, logo_url, country, language, genre, codec, bitrate, is_favorite) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}){pg_conflict}",
@@ -201,7 +204,7 @@ impl RadioRepo {
             &station.genre,
             &station.codec,
             &station.bitrate,
-            &station.is_favorite,
+            &i64::from(station.is_favorite),
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
