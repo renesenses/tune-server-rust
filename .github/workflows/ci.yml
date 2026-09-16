@@ -355,6 +355,8 @@ jobs:
           exit 1
       - run: cargo check -p tune-server --features audio-embedding
       - run: cargo test --no-fail-fast -p tune-core --features audio-embedding
+      # Le témoin HTTP des reports est derrière audio-embedding (#4187).
+      - run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features local-audio,oaat,cloud-relay,bandcamp,audio-embedding acoustic_reports_4187
 
   # Signal Windows sur TOUTE PR qui touche du Rust — plus seulement sur une PR
   # « complete » (#3123).

@@ -401,28 +401,49 @@ async fn uninstall_plugin(
     // Retrait et persistance dans la même transaction : le répertoire n'est
     // effacé qu'après, et seulement si l'enregistrement a bien disparu.
     let a_retirer = slug.clone();
-    let plugin_id = match settings.update_json_list::<InstalledRecord, _, _>(
+    let record = match settings.update_json_list::<InstalledRecord, _, _>(
         SETTINGS_KEY_INSTALLED,
         move |installed| {
-            let avant = installed.len();
-            let id = installed
+            // The manager lists manifest IDs; the store may use a different slug.
+            // Prefer an exact slug to avoid removing two installations on a collision.
+            let position = installed
                 .iter()
-                .find(|r| r.slug == a_retirer)
-                .and_then(|r| r.plugin_id.clone());
-            installed.retain(|r| r.slug != a_retirer);
-            Ok((installed.len() != avant).then_some(id))
+                .position(|r| r.slug == a_retirer)
+                .or_else(|| {
+                    installed
+                        .iter()
+                        .position(|r| r.plugin_id.as_deref() == Some(a_retirer.as_str()))
+                });
+            Ok(position.map(|index| installed.remove(index)))
         },
     ) {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "plugin_not_installed", "slug": slug })),
-            )
-                .into_response();
-        }
+        Ok(record) => record,
         Err(e) => return panne_de_stockage("desinstallation", e),
     };
+    let registered = record.is_some();
+    let (mut plugin_id, installed_slug) = match record {
+        Some(record) => (record.plugin_id, record.slug),
+        None => (None, slug.clone()),
+    };
+    if plugin_id.is_none() {
+        plugin_id = match wasm_installed_without_store_record(&installed_slug).await {
+            Ok(id) => id,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "uninstall_failed", "detail": e })),
+                )
+                    .into_response();
+            }
+        };
+    }
+    if !registered && plugin_id.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "plugin_not_installed", "slug": slug })),
+        )
+            .into_response();
+    }
 
     // Remove the on-disk wasm plugin, when this install wrote one. The loaded
     // instance (if any) lives until restart — the registry is a OnceLock.
@@ -441,7 +462,7 @@ async fn uninstall_plugin(
     }
 
     // Clean per-plugin settings keys (manifest id keys, plus legacy slug keys).
-    for key_base in plugin_id.iter().chain(std::iter::once(&slug)) {
+    for key_base in plugin_id.iter().chain(std::iter::once(&installed_slug)) {
         settings
             .delete(&format!("plugin_{key_base}_installed"))
             .ok();
@@ -456,6 +477,33 @@ async fn uninstall_plugin(
         "restart_required": removed_dir,
     }))
     .into_response()
+}
+
+/// Bundled/manual WASM installs are listed by /plugins but have no store record.
+/// Require the same safe directory identity as archive installation. A read or
+/// parse failure is not evidence of absence and must never authorize removal.
+async fn wasm_installed_without_store_record(id: &str) -> Result<Option<String>, String> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("unsafe plugin id: {id:?}"));
+    }
+    let Some(root) = crate::plugins::wasm_plugins_dir() else {
+        return Ok(None);
+    };
+    let bytes = match tokio::fs::read(root.join(id).join("manifest.json")).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read plugin manifest: {e}")),
+    };
+    let manifest: tune_core::plugins::PluginManifest =
+        serde_json::from_slice(&bytes).map_err(|e| format!("invalid plugin manifest: {e}"))?;
+    if manifest.id != id {
+        return Err("plugin manifest id does not match its installation directory".into());
+    }
+    Ok(Some(manifest.id))
 }
 
 // ---------------------------------------------------------------------------

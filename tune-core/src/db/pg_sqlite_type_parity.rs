@@ -146,6 +146,15 @@ fn famille_pg(t: &str) -> Famille {
 ///
 /// Le classement par danger est dans #2995.
 const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
+    // #2271 (2026-09-15): intentional TEXT for six named modes. SQLite's
+    // historical INTEGER affinity already preserves nonnumeric strings;
+    // PostgreSQL needs 064 to store the same values on both creation paths.
+    (
+        "native",
+        "zones",
+        "autoplay_enabled",
+        "named modes: PG TEXT, SQLite dynamic INTEGER affinity (#2271)",
+    ),
     // ── Base NATIVE ────────────────────────────────────────────────────────
     // `listen_history.profile_id` et `playlists.profile_id` étaient ici : elles
     // sont CONVERTIES par cette PR (migration 049 + `ENSURE_COLUMNS` en
@@ -181,7 +190,7 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
         "migree",
         "zones",
         "autoplay_enabled",
-        "TEXT vs INTEGER — 032 ajoute au lieu de convertir (#2995)",
+        "named modes: PG TEXT, SQLite dynamic INTEGER affinity (#2271)",
     ),
     (
         "migree",
@@ -230,12 +239,7 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
         "lyrics_offset_ms",
         "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
     ),
-    (
-        "migree",
-        "queue_items",
-        "is_current",
-        "TEXT vs INTEGER — jamais convertie sur le chemin migré (#2995)",
-    ),
+    // queue_items.is_current: converted by migration 059 (#3716).
     // ── #3715 — les NEUF qui restent, mesurees le 09/09/2026 ──────────────
     //
     // Quatre des treize lignes de #3715 ont ete CONVERTIES par la migration 053
@@ -250,27 +254,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     // affectation, mais accepte `bigint -> text`. Convertir une colonne dont un
     // redacteur lie du texte echangerait une lecture fausse contre une ecriture
     // refusee.
-    (
-        "native",
-        "streaming_favorites",
-        "id",
-        "TEXT vs INTEGER — la table n'est montee QUE par `ENSURE_TABLES`, en TEXT \
-         avec `nextval(...)::text`. MESURE 09/09/2026 : native=text, migree=bigint \
-         (la 012 convertit apres la copie). Convertir le natif exige de changer \
-         AUSSI la liaison du depot — c'est la table exacte de #1706, elle demande \
-         sa propre passe (#3715)",
-    ),
-    (
-        "native",
-        "streaming_favorites",
-        "profile_id",
-        "TEXT vs INTEGER — meme origine qu'`id`. MESURE : `StreamingFavoritesRepo` \
-         lie `pid` en TEXT, et sur une base MIGREE la colonne est bigint, donc \
-         `WHERE profile_id = $1` y rend `operator does not exist: bigint = text` — \
-         list/add/remove/is_favorite, tout le volet Favoris de streaming est mort \
-         sur le parc migre. Le sens de la reparation est INVERSE de ce que cette \
-         ligne suggere : aligner le natif sur bigint ET corriger la liaison (#3715)",
-    ),
     (
         "migree",
         "alarms",
@@ -297,18 +280,22 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
          `as_i64()` qui reparse le texte, ecrit par un entier lie. Convertible \
          sans urgence (#3715)",
     ),
+    // #3715: PostgreSQL 063 repairs the native writer by using TEXT.
+    // SQLite's historical INTEGER affinity is still present on installed DBs;
+    // the three readers now CAST to TEXT so numeric legacy IDs remain visible.
+    // Both exceptions document that remaining SQLite schema work, not a reason
+    // to turn opaque service identifiers back into PostgreSQL integers.
+    (
+        "native",
+        "alarms",
+        "source_id",
+        "TEXT vs INTEGER — PostgreSQL 063 accepte les identifiants opaques de service ; affinite SQLite historique a migrer (#3715)",
+    ),
     (
         "migree",
         "alarms",
         "source_id",
-        "TEXT vs INTEGER — c'est la declaration SQLITE qui a tort. Cette colonne \
-         porte un identifiant de SERVICE, donc une chaine : `radios.rs` la lie en \
-         `Option<String>` et la relit en `as_string()`. MESURE sur une base NATIVE, \
-         ou 008 la declare bigint : creer une alarme avec un source_id rend \
-         `column \"source_id\" is of type bigint but expression is of type text`, et \
-         la relecture rend `null` (`as_str()` sur un `SqlValue::Int`). Le degat est \
-         sur le chemin NATIF, en sens INVERSE : la reparation est TEXT des deux \
-         cotes, pas INTEGER (#3715)",
+        "TEXT vs INTEGER — import deja textuel ; affinite SQLite historique a migrer, lecteurs CAST en TEXT (#3715)",
     ),
     // `profiles.is_admin` était ici, avec pour motif « réparer la liaison
     // d'abord ». C'est fait : `routes/cloud.rs` lie un `i64` depuis le même
@@ -316,16 +303,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     // au-delà de `GET /auth/me` : `POST /auth/login` lit `is_admin` par
     // `as_bool().unwrap_or(false)`, qui rend `None` sur un `SqlValue::Text` —
     // un administrateur se connectait donc avec le rôle `user`, en silence.
-    (
-        "migree",
-        "radio_stations",
-        "is_favorite",
-        "TEXT vs INTEGER — aucun degat MESURE : #3181 a reecrit toutes les \
-         comparaisons en litteral texte (`= '1'`, `= '0'`), qui valent des deux \
-         cotes, la lecture passe par `as_i64()`, et `ORDER BY is_favorite DESC` \
-         donne le meme ordre sur '0'/'1' que sur 0/1. Convertible sans urgence \
-         mesuree, apres verification de chaque redacteur (#3715)",
-    ),
     // `zones.dsp_enabled` était ici, avec pour motif « réparer `update_dsp`
     // d'abord ». C'est fait dans le même commit : `update_dsp` lie désormais
     // `Option<i64>` et `i64` — il était mort sur TOUT PostgreSQL, natif compris,
@@ -757,8 +734,16 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        22,
-        // 4 côté natif, 18 côté migré. Le 31/08/2026 il valait 16 ; #3715 en a
+        20,
+        // #2271: AutoPlay named modes require TEXT on native PG too (19 -> 20).
+        // Four native, sixteen imported differences; the legacy SQLite
+        // INTEGER affinity preserves these names without a table rewrite.
+        // #3715 source_id natif devient TEXT : 3 natifs, 16 migrés.
+        // La declaration SQLite historique INTEGER reste a migrer.
+        // La passe précédente avait retiré streaming_favorites.id (20 -> 19).
+        // La passe précédente avait retiré profile_id natif (21 -> 20).
+        // #3716 avait retiré queue_items.is_current côté migré (22 -> 21).
+        // Le 31/08/2026 il valait 16 ; #3715 en a
         // retiré 2 (tolérances périmées, `zones.dlna_wav24` et
         // `zones.dlna_play_delay_ms`, réparées depuis) et inscrit les 9
         // divergences que la migration 053 ne convertit pas, d'où 23 ; #3726 en

@@ -151,7 +151,11 @@ fn subscribed(sid: &str, seconds: u64) -> Response {
 }
 
 async fn run(weak: Weak<Registry>, state: UpnpState) {
-    let client = match reqwest::Client::builder()
+    // Depuis le constructeur PARTAGÉ de `tune_core::http::client`, jamais
+    // celui de reqwest directement :
+    // la build FFI Android n'initialise pas le vérificateur TLS de plateforme,
+    // et la garde `http_client_seam` refuse tout client construit ailleurs.
+    let client = match tune_core::http::client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(3))

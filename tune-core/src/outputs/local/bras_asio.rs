@@ -74,7 +74,7 @@ pub(super) struct EntreesAsio {
     pub(super) header_buf: Vec<u8>,
     /// La réponse HTTP, positionnée après `header_buf`. Le bras la confie à
     /// son fil pompe.
-    pub(super) reader: reqwest::blocking::Response,
+    pub(super) reader: super::LecteurHttpAnnulable,
     pub(super) frame_bytes: usize,
     pub(super) bytes_per_sample: usize,
     pub(super) seek_offset: u64,
@@ -588,7 +588,7 @@ impl<'a> SourcePompee<'a> {
     /// EOF, sur une erreur non transitoire, ou quand cette `SourcePompee` est
     /// lâchée (le canal se ferme, `send` échoue).
     fn demarrer(
-        reader: reqwest::blocking::Response,
+        reader: super::LecteurHttpAnnulable,
         anneau: &'a dyn Fn() -> (usize, usize),
     ) -> Self {
         let profondeur = Arc::new(std::sync::atomic::AtomicUsize::new(0));

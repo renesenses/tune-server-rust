@@ -15,6 +15,13 @@ affirme le comportement attendu, à dé-ignorer par le correctif.
 > chacune le chiffre d'après. Voir la section « B » plus bas pour la formule
 > retenue et ce qu'elle coûte. A, C et D restent ouverts.
 
+> **Mise à jour du 15/09/2026 — #4074.** Le défaut C reçoit une réserve
+> estimée de 3 dB quand seul un pic d'échantillon est disponible, nommée
+> dans le chemin du signal. Le témoin passe désormais par les tags et la porte
+> de lecture réelle ; les 23 tests T9 passent sans témoin ignoré. Les relevés
+> historiques ci-dessous restent datés de leur mesure. Voir la dernière
+> section pour le nouveau contrat et ses limites.
+
 ## Les quatre questions, et la réponse en une ligne
 
 | # | question | réponse mesurée |
@@ -408,3 +415,54 @@ mutualisation du dither de l'égaliseur est neutre à l'octet.
 ```sh
 cargo test -p tune-core --test ecretage_compte_2218 -- --nocapture   # 8 verts
 ```
+
+
+## 15 septembre 2026 — #4074 : nature du pic et réserve de repli
+
+JP Robbe / OpenAI Codex / jp-robbe-20260915-205020-4074.
+
+Le témoin ignoré reproduit +2,10 dBTP sur la base 24123a4e.
+La lecture conserve maintenant la nature du pic après sélection piste/album :
+une crête vraie plausible prime ; sinon le pic d'échantillon reçoit une
+réserve estimée de **3 dB**, uniquement avec l'anti-écrêtage activé.
+Le plafond devient `10^((ceiling_db - 3)/20) / sample_peak`.
+Un gain déjà inférieur à cette borne reste inchangé : pas de cumul aveugle
+de 3 dB sur toutes les pistes. Sans pic, le refus du gain positif #4072 reste
+inchangé. PURE et ReplayGain désactivé restent inchangés.
+
+Les 3 dB couvrent le dépassement de 2,10 dB du carré T9 avec environ
+0,90 dB de réserve. C'est un compromis explicite en l'absence de mesure,
+**pas une garantie universelle de plafond dBTP** : des signaux adverses
+peuvent avoir des inter-échantillons plus élevés. Aucune analyse de fichier
+ni aucun limiteur temps réel n'est déclenché par ce correctif. Une crête
+vraie stockée remplace la réserve estimée sans atténuation supplémentaire.
+
+Le chemin du signal ajoute `peak_kind` (`sample_peak`, `true_peak`, `none`)
+et `peak_headroom_db`. Sa description dit « pic d'échantillon, réserve
+estimée de 3.0 dB (crête vraie inconnue) ». Même à facteur unité, cette
+information reste visible sans dégrader le verdict bit-perfect.
+
+Le témoin actif `q2_sample_peak_headroom_protects_the_square_through_playback`
+passe par de vrais tags SQLite, `playback_factor`, le traitement PCM 24 bits
+et le mètre FIR ×4 indépendant du banc. Il vérifie les plafonds 0 et −1 dBTP,
+puis la substitution du vrai pic sans réserve supplémentaire.
+Les anciens témoins Q2 du calcul scalaire `gain_factor` restent des mesures
+du calcul sans provenance ; ils ne décrivent plus la sélection des tags
+de production. Les clients de métadonnées emploient `stored_gain_with_peak`
+et `gain_factor_with_peak` ; les API scalaires historiques sont conservées.
+
+
+### Mesures du correctif sur Shrek
+
+| Carré 997 Hz, −0,05 dBFS, gain demandé +6 dB | Facteur | Crête vraie FIR ×4 |
+|---|---:|---:|
+| Pic d'échantillon, sans la réserve, plafond 0 | 1,005773 | +2,097 dBTP |
+| Pic d'échantillon, réserve 3 dB, plafond 0 | 0,712033 | −0,903 dBTP |
+| Pic d'échantillon, réserve 3 dB, plafond −1 | 0,634600 | −1,903 dBTP |
+
+Contre-épreuve : seul le retour de réserve de production passe de 3 à 0 dB,
+tests inchangés. Le témoin PCM compile puis échoue à +2,097 dBTP ; deux
+contrats serveur échouent (réserve 0 au lieu de 3, étape informative absente)
+et les 58 autres passent. Restauration par `cp` du fichier sauvegardé.
+Journaux : `/tmp/jp-4074-counterproof-{t9,server}.log` et
+`/tmp/jp-4074-t9-final.log` sur Shrek.

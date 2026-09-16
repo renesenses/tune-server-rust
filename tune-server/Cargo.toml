@@ -273,6 +273,19 @@ path = "tests/ajouts_recents_fenetre.rs"
 name = "adresse_annoncee_taches_de_fond_3867"
 path = "tests/adresse_annoncee_dans_les_taches_de_fond_3867.rs"
 
+# Chantier « gestion du tag compilation », phase 1 (C1/C2, arbitrage du
+# 14/09/2026) : le tag fait foi, la forme des dossiers sert de repli, et le
+# journal dit LEQUEL des deux a tranche. Binaire a lui seul, un seul test :
+# l abonne `tracing` y est GLOBAL (voir l en-tete du fichier).
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Posee ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "compilation_le_tag_fait_foi"
+path = "tests/compilation_le_tag_fait_foi.rs"
+
 # #3839 : l ecran Ambiance ne pouvait pas dire que la tour texte du CLAP est
 # anglaise et que la traduction depend d une cle IA — le client ne voit aucune
 # cle. Le statut acoustique le porte desormais. Sans cette cible, `autotests =
@@ -651,3 +664,19 @@ path = "tests/registre_serveurs_fraicheur_4125.rs"
 [[test]]
 name = "lecture_upnp_indexee_2219"
 path = "tests/lecture_upnp_indexee_2219.rs"
+
+[[test]]
+name = "album_dr_provenance_3924"
+path = "tests/album_dr_provenance_3924.rs"
+
+[[test]]
+name = "idle_poll_diagnostics_2566"
+path = "tests/idle_poll_diagnostics_2566.rs"
+
+[[test]]
+name = "alarm_source_3715"
+path = "tests/alarm_source_3715.rs"
+
+[[test]]
+name = "history_context_4036"
+path = "tests/history_context_4036.rs"

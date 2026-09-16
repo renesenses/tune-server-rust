@@ -231,7 +231,7 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 /// - le DSD sous la bascule `dsd_lpcm_stream` : en DSD256/512 le décodage
 ///   dépasse le budget du fichier temporaire et le renderer joue du silence ;
 /// - le Monkey's Audio (`.ape`) vers un renderer qui a ANNONCÉ le LPCM
-///   (#3311) — voir [`cible_wav_pour_ape_reseau`].
+///   (#3311) — voir [`cible_wav_pour_lossless_reseau`].
 ///
 /// `dsp_active` ne compte que si la cible n'est PAS du WAV. Depuis LAT-F1
 /// (phase 0) le bras progressif applique lui-même égaliseur, convolveur et
@@ -298,14 +298,17 @@ pub(super) fn use_file_transcode_for(
 /// `dlna_accepte_lpcm`) : le format servi sur le fil change, et une sonde
 /// inconcluante garde le FLAC. Même garde que [`cible_wav_pour_traitement`].
 ///
+/// #4120: WavPack dispose aussi de son décodeur par blocs et de cette exemption.
 /// Fonction pure, comme ses deux voisines : la matrice se teste sans
 /// orchestrateur.
-pub(super) fn cible_wav_pour_ape_reseau(
-    src_est_ape: bool,
+pub(super) fn cible_wav_pour_lossless_reseau(
+    src_format: Option<AudioFormat>,
     is_network: bool,
     renderer_accepte_lpcm: bool,
 ) -> bool {
-    src_est_ape && is_network && renderer_accepte_lpcm
+    matches!(src_format, Some(AudioFormat::Ape | AudioFormat::WavPack))
+        && is_network
+        && renderer_accepte_lpcm
 }
 
 /// LAT-F1 (phase 1) — une zone réseau à traitement actif dont la cible serait

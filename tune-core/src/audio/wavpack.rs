@@ -10,7 +10,7 @@
 //! - Adaptive entropy coding (3-median Golomb/Rice)
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 use tracing::{debug, warn};
 
@@ -1300,7 +1300,10 @@ pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
     let bits_per_sample = header.bits_per_sample();
 
     // Check for non-standard sample rate in sub-blocks
-    let data_size = header.block_size as usize - 24; // header fields after magic+size = 24 bytes
+    let data_size = header
+        .block_size
+        .checked_sub(24)
+        .ok_or("wavpack: invalid block size")? as usize;
     let mut block_data = vec![0u8; data_size];
     reader
         .read_exact(&mut block_data)
@@ -1336,6 +1339,99 @@ pub fn parse_wavpack(path: &str) -> Result<WavPackInfo, String> {
         bits_per_sample,
         total_samples,
     })
+}
+
+/// File-backed incremental decoder. Only one compressed block and its PCM are
+/// retained; the caller controls when the next block is read (#4120).
+pub(super) struct WavPackDecoder {
+    reader: BufReader<File>,
+    pub info: WavPackInfo,
+    skip_samples: u64,
+    position: u64,
+}
+
+impl WavPackDecoder {
+    pub fn open(path: &str, seek_s: f64) -> Result<Self, String> {
+        let info = parse_wavpack(path)?;
+        let reader = BufReader::new(File::open(path).map_err(|e| format!("wavpack open: {e}"))?);
+        let skip_samples = (seek_s.max(0.0) * info.sample_rate as f64) as u64;
+        Ok(Self {
+            reader,
+            info,
+            skip_samples,
+            position: 0,
+        })
+    }
+
+    pub fn next_pcm(&mut self) -> Result<Option<Vec<i32>>, String> {
+        loop {
+            if self.info.total_samples != 0 && self.position >= self.info.total_samples {
+                return Ok(None);
+            }
+            let pending = self
+                .reader
+                .fill_buf()
+                .map_err(|e| format!("wavpack read: {e}"))?;
+            if pending.is_empty() || pending.starts_with(b"APETAGEX") || pending.starts_with(b"TAG")
+            {
+                if self.info.total_samples != 0 && self.position < self.info.total_samples {
+                    return Err("wavpack: truncated audio before declared end".into());
+                }
+                return Ok(None);
+            }
+            let header = read_block_header(&mut self.reader)?;
+            let size = header
+                .block_size
+                .checked_sub(24)
+                .ok_or("wavpack: invalid block size")? as usize;
+            let mut data = vec![0; size];
+            self.reader
+                .read_exact(&mut data)
+                .map_err(|e| format!("wavpack block data: {e}"))?;
+            if header.block_samples == 0 {
+                continue;
+            }
+            let channels = if header.is_mono() && !header.is_false_stereo() {
+                1
+            } else {
+                2
+            };
+            if header.is_dsd()
+                || header.is_hybrid()
+                || channels != self.info.channels
+                || header.bits_per_sample() != self.info.bits_per_sample
+                || header.flags & (FLAG_INITIAL_BLOCK | FLAG_FINAL_BLOCK)
+                    != FLAG_INITIAL_BLOCK | FLAG_FINAL_BLOCK
+            {
+                return Err(
+                    "wavpack: unsupported block format change or multichannel stream".into(),
+                );
+            }
+            let start = header.block_index as u64;
+            if start != self.position {
+                return Err(format!(
+                    "wavpack: discontinuous block at {start}, expected {}",
+                    self.position
+                ));
+            }
+            self.position = start + header.block_samples as u64;
+            if self.position <= self.skip_samples {
+                continue;
+            }
+            // CRC must succeed before ANY sample from this block can be emitted.
+            let decoded =
+                decode_block(&header, &data).map_err(|e| format!("wavpack block {start}: {e}"))?;
+            let from = self.skip_samples.saturating_sub(start) as usize;
+            let mut pcm = Vec::with_capacity((decoded.left.len() - from) * channels as usize);
+            for i in from..decoded.left.len() {
+                pcm.push(decoded.left[i]);
+                if channels == 2 {
+                    pcm.push(decoded.right[i]);
+                }
+            }
+            return Ok(Some(pcm));
+        }
+    }
 }
 
 /// Decode a WavPack file to interleaved i32 PCM.
@@ -1511,6 +1607,227 @@ pub fn decode_wavpack_to_pcm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn stream_wavpack(
+        path: String,
+        rate: Option<u32>,
+        channels: Option<u32>,
+        depth: Option<u16>,
+        seek: f64,
+    ) -> (Vec<u8>, Result<(u16, u32), String>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (levels, _levels_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            super::super::decode::decode_to_pcm_streaming_seeked(
+                &path,
+                rate,
+                channels,
+                depth,
+                tx,
+                4093,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                levels,
+                seek,
+            )
+        });
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            let frame = depth.unwrap_or(16) as usize / 8 * channels.unwrap_or(2) as usize;
+            if !chunk.starts_with(b"RIFF") && depth.is_some() {
+                assert_eq!(chunk.len() % frame, 0, "partial PCM frame");
+            }
+            bytes.extend(chunk);
+        }
+        (bytes, worker.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn wavpack_streaming_promotes_8_bit_pcm_without_losing_samples() {
+        let path = fixture_path("mono_8_44100.wv");
+        let (pcm, result) = stream_wavpack(path.clone(), None, None, None, 0.0).await;
+        assert_eq!(
+            result.unwrap(),
+            (16, 44100),
+            "8-bit source must announce its actual 16-bit PCM output"
+        );
+        assert_eq!(pcm.len(), 4410 * 2);
+        let samples: Vec<i32> = pcm
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+            .collect();
+        assert_eq!(
+            empreinte_i32(&samples),
+            "d403bd7ea1f5daccac3cc5961c51e7fa",
+            "8-bit samples must widen losslessly"
+        );
+        let (bytes, result) = stream_wavpack(path, None, None, Some(8), 0.0).await;
+        assert!(
+            result.is_err(),
+            "8-bit output is not supported by the PCM writer"
+        );
+        assert!(
+            bytes.is_empty(),
+            "unsupported output must fail before the WAV header"
+        );
+    }
+
+    /// Two independent real blocks, with coherent sample indices and total.
+    fn wavpack_two_blocks() -> (Vec<u8>, usize, u32) {
+        let fixture = std::fs::read(fixture_path("rip_16_44100_stereo.wv")).unwrap();
+        let size = u32::from_le_bytes(fixture[4..8].try_into().unwrap()) as usize + 8;
+        let samples = u32::from_le_bytes(fixture[20..24].try_into().unwrap());
+        let mut block = fixture[..size].to_vec();
+        block[12..16].copy_from_slice(&(samples * 2).to_le_bytes());
+        let mut both = block.clone();
+        block[16..20].copy_from_slice(&samples.to_le_bytes());
+        both.extend(block);
+        (both, size, samples)
+    }
+
+    #[tokio::test]
+    async fn wavpack_streaming_matches_reference_pcm_and_seek() {
+        for (name, channels, rate, bits, _, _) in FIXTURES {
+            let path = fixture_path(name);
+            for seek in [0.0, 0.05] {
+                let expected = decode_wavpack_to_pcm(&path, None, None, seek, 0.0).unwrap();
+                let (pcm, result) = stream_wavpack(path.clone(), None, None, None, seek).await;
+                assert_eq!(result.unwrap(), (*bits, *rate), "{name}");
+                assert_eq!(
+                    pcm,
+                    expected.pcm_bytes(),
+                    "{name}: streaming must preserve verified PCM and seek ({channels} channels)"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn wavpack_streaming_emits_verified_pcm_before_later_crc_failure() {
+        let (mut bytes, second, frames) = wavpack_two_blocks();
+        bytes[second + 28] ^= 1;
+        let dir = crate::test_scratch::scratch_dir("wavpack-progressive-crc");
+        let path = dir.join("late-crc.wv");
+        std::fs::write(&path, bytes).unwrap();
+        let (pcm, result) =
+            stream_wavpack(path.to_string_lossy().into(), None, None, None, 0.0).await;
+        assert_eq!(
+            pcm.len(),
+            frames as usize * 4,
+            "first verified block must be emitted BEFORE the later corrupt block is decoded"
+        );
+        assert!(
+            result.unwrap_err().contains("CRC"),
+            "corrupt block must never be emitted"
+        );
+        let reference = decode_wavpack_to_pcm(
+            &fixture_path("rip_16_44100_stereo.wv"),
+            None,
+            None,
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(pcm, reference.pcm_bytes());
+    }
+
+    #[tokio::test]
+    async fn wavpack_streaming_seek_across_blocks_and_truncation() {
+        let (bytes, second, frames) = wavpack_two_blocks();
+        let dir = crate::test_scratch::scratch_dir("wavpack-progressive-seek");
+        let path = dir.join("two.wv");
+        std::fs::write(&path, &bytes).unwrap();
+        let seek = (frames + 101) as f64 / 44100.0;
+        let (pcm, result) =
+            stream_wavpack(path.to_string_lossy().into(), None, None, None, seek).await;
+        result.unwrap();
+        let expected =
+            decode_wavpack_to_pcm(path.to_str().unwrap(), None, None, seek, 0.0).unwrap();
+        assert_eq!(
+            pcm,
+            expected.pcm_bytes(),
+            "seek must skip the first block and part of the next"
+        );
+        std::fs::write(&path, &bytes[..second + 40]).unwrap();
+        let (pcm, result) =
+            stream_wavpack(path.to_string_lossy().into(), None, None, None, 0.0).await;
+        assert_eq!(pcm.len(), frames as usize * 4);
+        assert!(
+            result.unwrap_err().contains("block data"),
+            "truncated later audio must not become a successful EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn wavpack_streaming_adapts_rate_channels_depth_and_wav_header() {
+        let path = fixture_path("hires_24_96000_stereo.wv");
+        let (wav, result) = stream_wavpack(path.clone(), Some(48000), Some(1), Some(16), 0.0).await;
+        assert_eq!(result.unwrap(), (16, 48000));
+        assert_eq!(&wav[..4], b"RIFF");
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 48000);
+        assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16);
+        let reference =
+            super::super::decode::decode_to_pcm(&path, Some(48000), Some(1), 0.0, 0.0).unwrap();
+        let expected = super::super::decode::convert_pcm_bit_depth(
+            &reference.samples_i32,
+            reference.bit_depth,
+            16,
+        );
+        // Batch and streaming use distinct sinc filters. Their duration and
+        // format must agree; requiring identical filtered samples is incorrect.
+        assert_eq!(
+            wav.len() - 44,
+            expected.len(),
+            "resampling must halve the frame count"
+        );
+        assert!(
+            wav[44..].iter().any(|b| *b != 0),
+            "adapted audio must not be silent"
+        );
+        let (same_rate, result) =
+            stream_wavpack(path.clone(), Some(96000), Some(1), Some(16), 0.0).await;
+        result.unwrap();
+        let reference =
+            super::super::decode::decode_to_pcm(&path, Some(96000), Some(1), 0.0, 0.0).unwrap();
+        let expected = super::super::decode::convert_pcm_bit_depth(
+            &reference.samples_i32,
+            reference.bit_depth,
+            16,
+        );
+        assert_eq!(
+            &same_rate[44..],
+            expected.as_slice(),
+            "channel/depth adaptation must preserve the expected signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn wavpack_streaming_cancellation_stops_before_later_corruption() {
+        let (mut bytes, second, _) = wavpack_two_blocks();
+        bytes[second + 28] ^= 1;
+        let dir = crate::test_scratch::scratch_dir("wavpack-progressive-cancel");
+        let path = dir.join("cancel.wv");
+        std::fs::write(&path, bytes).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let worker = tokio::task::spawn_blocking(move || {
+            super::super::decode::decode_to_pcm_streaming(
+                path.to_str().unwrap(),
+                None,
+                None,
+                tx,
+                4096,
+            )
+        });
+        assert!(
+            rx.recv().await.is_some(),
+            "first PCM must precede the corrupt block"
+        );
+        drop(rx);
+        assert!(
+            worker.await.unwrap().is_ok(),
+            "consumer cancellation must stop further decoding"
+        );
+    }
 
     /// Build a minimal WavPack block header as bytes.
     fn build_block_header(block_samples: u32, total_samples: u32, flags: u32) -> Vec<u8> {

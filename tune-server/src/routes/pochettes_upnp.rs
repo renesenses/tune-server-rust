@@ -152,9 +152,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let client = reqwest::Client::new();
+        let client = tune_core::http::client::shared();
         assert_eq!(
-            recuperer(&client, cache.path(), &url).await,
+            recuperer(client, cache.path(), &url).await,
             Some(hash.clone()),
             "un rafraîchissement raté conserve la copie précédente"
         );
@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(tokio::fs::read(&path).await.unwrap(), image);
         tokio::fs::remove_file(path).await.unwrap();
         assert_eq!(
-            recuperer(&client, cache.path(), &url).await,
+            recuperer(client, cache.path(), &url).await,
             None,
             "un index seul ne prouve pas que l'image existe"
         );
@@ -188,7 +188,7 @@ mod tests {
         });
         let cache = tempfile::tempdir().unwrap();
         assert_eq!(
-            recuperer(&reqwest::Client::new(), cache.path(), &url).await,
+            recuperer(tune_core::http::client::shared(), cache.path(), &url).await,
             None
         );
         assert_eq!(

@@ -3662,15 +3662,51 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "media_servers_durables",
         include_str!("../../migrations/postgres/058_media_servers_durables.sql"),
     ),
+    // #3716: reconcile startup and numbered migrations without narrowing data.
     (
         59,
-        "upnp_library_sync",
-        include_str!("../../migrations/postgres/059_upnp_library_sync.sql"),
+        "queue_items_types",
+        include_str!("../../migrations/postgres/059_queue_items_types.sql"),
     ),
+    // #3715: streaming profile bindings and schema agree on i64.
     (
         60,
+        "streaming_profile_id",
+        include_str!("../../migrations/postgres/060_streaming_profile_id.sql"),
+    ),
+    (
+        61,
+        "streaming_favorite_ids",
+        include_str!("../../migrations/postgres/061_streaming_favorite_ids.sql"),
+    ),
+    (
+        62,
+        "radio_favorite_integer",
+        include_str!("../../migrations/postgres/062_radio_favorite_integer.sql"),
+    ),
+    (
+        63,
+        "alarm_source_text",
+        include_str!("../../migrations/postgres/063_alarm_source_text.sql"),
+    ),
+    // #2271: named AutoPlay modes require TEXT on native and imported databases.
+    (
+        64,
+        "zone_autoplay_mode_text",
+        include_str!("../../migrations/postgres/064_zone_autoplay_mode_text.sql"),
+    ),
+    // Pont UPnP (#4201) : 65 et 66, pas 59 et 60 — ces numeros-la sont
+    // partis en v0.9.151 (#3716, #3715) pendant que ce lot etait en PR, et
+    // un numero deja applique sur le .15 et le .18 ne se reprend jamais.
+    (
+        65,
+        "upnp_library_sync",
+        include_str!("../../migrations/postgres/065_upnp_library_sync.sql"),
+    ),
+    (
+        66,
         "upnp_catalog_revision",
-        include_str!("../../migrations/postgres/060_upnp_catalog_revision.sql"),
+        include_str!("../../migrations/postgres/066_upnp_catalog_revision.sql"),
     ),
 ];
 
@@ -3823,7 +3859,7 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // Ce rattrapage idempotent ne réinitialise jamais le compteur existant.
     // La sentinelle 99 des conversions est déjà traitée par la boucle ci-dessus.
     sqlx::raw_sql(include_str!(
-        "../../migrations/postgres/060_upnp_catalog_revision.sql"
+        "../../migrations/postgres/066_upnp_catalog_revision.sql"
     ))
     .execute(pool)
     .await
@@ -5639,7 +5675,14 @@ mod tests {
         // (`udn`), dates en TEXT des deux cotes comme `zones.last_seen_at`
         // (95 / PG 050). Le numero libre a ete remesure DANS LE CODE, entree
         // par entree, comme la 56 et la 57 l'imposent.
-        assert_eq!(pg_latest_version(), 60, "latest PG migration must be 60");
+        // 59 aligns queue types (#3716); 60 aligns streaming profile IDs
+        // with the repository's integer bindings (#3715).
+        // 61 repairs native streaming favorite IDs without rewinding the sequence.
+        // 62 repairs radio favorite flags and their former boolean writer.
+        // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
+        // 65 and 66 carry the UPnP library sync and catalog revision (#4201),
+        // renumbered from 59/60 after those shipped in v0.9.151.
+        assert_eq!(pg_latest_version(), 66, "latest PG migration must be 66");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

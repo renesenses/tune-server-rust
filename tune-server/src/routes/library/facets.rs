@@ -6,9 +6,7 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::backend::SqlValue;
 use tune_core::db::engine::Engine;
-use tune_core::db::facet_filter::{
-    Placeholders, TrackFilter, any_of, favorite_condition, untagged_condition,
-};
+use tune_core::db::facet_filter::{Placeholders, TrackFilter, any_of, favorite_condition};
 
 use super::query_multi::track_filter_from_raw;
 use crate::error::AppError;
@@ -395,7 +393,9 @@ fn build_facet_conditions(
         if let Some(c) = any_of(
             sel.untagged
                 .iter()
-                .filter_map(|f| untagged_condition(f))
+                .filter_map(|f| {
+                    tune_core::db::facet_filter::untagged_condition_for_engine(f, engine)
+                })
                 .map(str::to_string)
                 .collect(),
         ) {
@@ -731,7 +731,10 @@ fn untagged_facet(state: &AppState, conds: &[String], params: &[SqlValue]) -> Ve
         .collect();
     let mut out = Vec::new();
     for field in UNTAGGED_FIELDS {
-        let Some(missing) = untagged_condition(field) else {
+        let Some(missing) = tune_core::db::facet_filter::untagged_condition_for_engine(
+            field,
+            state.backend.engine(),
+        ) else {
             continue;
         };
         let mut all: Vec<String> = conds.to_vec();
@@ -1271,6 +1274,7 @@ fn kv_facet(
 mod tests {
     use super::*;
     use crate::routes::smart_refs::{EmptyResolver, RefCtx};
+    use tune_core::db::facet_filter::untagged_condition;
 
     /// CRD-6 : la facette « instrument » compte les pistes par instrument des
     /// crédits ; elle ne se filtre pas elle-même ; sa sélection resserre les

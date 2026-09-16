@@ -1349,120 +1349,65 @@ fn la_promotion_emporte_le_paquet_debian_dans_son_propre_run() {
     );
 }
 
-/// Le nom PUBLIE d'un manifeste — c'est LUI que `-p` designe, jamais le chemin.
+/// Les membres effectifs, par (nom de paquet, chemin relatif).
 ///
-/// `plugins/tune-bandcamp` se nomme `tune-bandcamp`, `tune-cli` porte un
-/// `[[bin]] name = "tune"` et `tune-ffi` un `[lib] name = "tuneserver"` : la
-/// lecture est bornee a la section `[package]`, sans quoi elle prendrait le
-/// premier `name` venu.
-fn nom_du_paquet(source: &str) -> Option<String> {
-    let mut dans_package = false;
-    for ligne in source.lines() {
-        let t = ligne.trim();
-        if t.starts_with('[') {
-            dans_package = t == "[package]";
-            continue;
-        }
-        if !dans_package || t.starts_with('#') {
-            continue;
-        }
-        if let Some(valeur) = t.strip_prefix("name")
-            && let Some(valeur) = valeur.trim_start().strip_prefix('=')
-        {
-            return Some(valeur.trim().trim_matches('"').to_string());
-        }
-    }
-    None
-}
-
-/// Tous les membres du workspace, par `(nom de paquet, chemin)`.
-///
-/// Deux sources, et la seconde est celle qui manquait a la garde `cargo test`
-/// jusqu'a #3266 bis :
-///
-/// 1. la liste `members` du manifeste racine — les membres DECLARES ;
-/// 2. les membres IMPLICITES : cargo promeut membre toute dependance `path`
-///    interne au workspace, meme absente de `members`. C'est ainsi que
-///    `tune-output-api` entre, via `tune-core`. Les rater, c'est laisser un
-///    trou exactement de la forme de celui que ces gardes doivent fermer.
-///
-/// Une fonction partagee plutot que deux lecteurs jumeaux : le trou de
-/// #3266 bis vient precisement de ce que la garde `clippy` savait resoudre les
-/// membres implicites et que la garde `cargo test` ne le savait pas.
+/// Cargo est l'autorité : les dépendances path internes peuvent devenir des
+/// membres implicites, mais une exclusion explicite interdit cette promotion.
+/// Le lecteur ad hoc suivait tous les path et inventait donc un membre pour
+/// ape-decoder malgré workspace.exclude (#4191). --no-deps évite le graphe
+/// externe ; --offline interdit toute requête réseau pendant cette garde.
 fn membres_du_workspace(racine: &Path) -> Vec<(String, String)> {
-    let manifeste = fs::read_to_string(racine.join("Cargo.toml"))
-        .unwrap_or_else(|e| panic!("Cargo.toml racine illisible : {e}"));
-    let debut = manifeste
-        .find("members = [")
-        .expect("`members = [` absent du Cargo.toml du workspace");
-    let reste = &manifeste[debut + "members = [".len()..];
-    let fin = reste
-        .find(']')
-        .expect("la liste `members` du workspace n'est pas fermee");
-
-    let mut a_visiter: Vec<String> = reste[..fin]
-        .split(',')
-        .map(|morceau| morceau.trim().trim_matches('"').to_string())
-        .filter(|morceau| !morceau.is_empty())
-        .collect();
-
+    let racine = racine
+        .canonicalize()
+        .expect("racine du workspace inaccessible");
+    let output = std::process::Command::new(env!("CARGO"))
+        .args([
+            "metadata",
+            "--no-deps",
+            "--offline",
+            "--format-version",
+            "1",
+        ])
+        .current_dir(&racine)
+        .output()
+        .expect("impossible de lire les membres avec cargo metadata");
     assert!(
-        a_visiter.len() >= 10,
-        "seulement {} membre(s) reconnu(s) dans le Cargo.toml du workspace — la \
-         forme de la liste `members` a change et ces tests ne gardent plus \
-         rien : {a_visiter:?}",
-        a_visiter.len()
+        output.status.success(),
+        "cargo metadata a échoué : {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-
-    let mut vus: Vec<String> = Vec::new();
-    let mut membres: Vec<(String, String)> = Vec::new();
-    while let Some(chemin) = a_visiter.pop() {
-        if vus.iter().any(|deja| *deja == chemin) {
-            continue;
-        }
-        let source = fs::read_to_string(racine.join(&chemin).join("Cargo.toml"))
-            .unwrap_or_else(|e| panic!("{chemin}/Cargo.toml illisible : {e}"));
-        let nom = nom_du_paquet(&source)
-            .unwrap_or_else(|| panic!("{chemin}/Cargo.toml : `[package] name` introuvable"));
-        vus.push(chemin.clone());
-        membres.push((nom, chemin.clone()));
-
-        for ligne in source.lines() {
-            let t = ligne.trim();
-            if t.starts_with('#') {
-                continue;
-            }
-            let Some(apres) = t.split_once("path = \"") else {
-                continue;
-            };
-            let Some((cible, _)) = apres.1.split_once('"') else {
-                continue;
-            };
-            // Resolu depuis le dossier du membre, puis ramene a la racine : un
-            // `../tune-output-api` depuis `tune-core` donne `tune-output-api`.
-            let mut pile: Vec<&str> = chemin.split('/').collect();
-            for element in cible.split('/') {
-                match element {
-                    "." | "" => {}
-                    ".." => {
-                        if pile.pop().is_none() {
-                            // Sort du depot : ce n'est pas un membre.
-                            pile.push("..");
-                        }
-                    }
-                    autre => pile.push(autre),
-                }
-            }
-            if pile.iter().any(|element| *element == "..") {
-                continue;
-            }
-            let resolu = pile.join("/");
-            if !resolu.is_empty() && racine.join(&resolu).join("Cargo.toml").is_file() {
-                a_visiter.push(resolu);
-            }
-        }
-    }
-
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("metadata Cargo invalide");
+    let ids = metadata["workspace_members"]
+        .as_array()
+        .expect("workspace_members absent");
+    let packages = metadata["packages"].as_array().expect("packages absent");
+    let mut membres: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let package = packages
+                .iter()
+                .find(|p| p["id"] == *id)
+                .expect("membre absent des packages Cargo");
+            let nom = package["name"].as_str().expect("nom absent").to_owned();
+            let manifeste = Path::new(
+                package["manifest_path"]
+                    .as_str()
+                    .expect("manifest_path absent"),
+            );
+            let dossier = manifeste
+                .parent()
+                .expect("manifeste sans dossier")
+                .canonicalize()
+                .expect("dossier du membre inaccessible");
+            let chemin = dossier
+                .strip_prefix(&racine)
+                .expect("membre en dehors du workspace")
+                .to_string_lossy()
+                .replace('\\', "/");
+            (nom, chemin)
+        })
+        .collect();
     membres.sort();
     membres
 }
@@ -2070,4 +2015,49 @@ fn la_garde_de_topologie_ne_juge_jamais_par_is_ancestor() {
 #[test]
 fn la_garde_de_topologie_passe_ses_contre_epreuves() {
     autotest("auditer-topologie-pr.sh", 26);
+}
+
+// #4191: path dependencies can be implicit members OR explicitly excluded.
+// Exercise a real Cargo workspace so the guard cannot invent membership.
+#[test]
+fn lecteur_workspace_respecte_dependance_implicite_et_exclusion() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let declared: Vec<_> = (0..10).map(|i| format!("member{i}")).collect();
+    fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[workspace]\nmembers = {:?}\nexclude = [\"vendor/external\"]\nresolver = \"2\"\n",
+            declared
+        ),
+    )
+    .unwrap();
+    let mut packages = declared.clone();
+    packages.extend(["implicit".into(), "vendor/external".into()]);
+    for relative in packages {
+        let path = root.join(&relative);
+        fs::create_dir_all(path.join("src")).unwrap();
+        let name = relative.rsplit('/').next().unwrap();
+        let dependencies = if relative == "member0" {
+            "[dependencies]\nimplicit = { path = \"../implicit\" }\nexternal = { path = \"../vendor/external\" }\n"
+        } else {
+            ""
+        };
+        fs::write(path.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}")
+        ).unwrap();
+        fs::write(path.join("src/lib.rs"), "").unwrap();
+    }
+    let members = membres_du_workspace(root);
+    assert!(
+        members
+            .iter()
+            .any(|(name, path)| name == "implicit" && path == "implicit"),
+        "an implicit path member must still be covered: {members:?}"
+    );
+    assert!(
+        !members.iter().any(|(name, _)| name == "external"),
+        "an excluded path dependency is not a Cargo workspace member: {members:?}"
+    );
+    assert_eq!(members.len(), 11);
 }
