@@ -135,6 +135,6 @@ CREATE
     OR OLD.value IS DISTINCT FROM NEW.value) AND (OLD.key = 'upnp_res_url'
     OR NEW.key = 'upnp_res_url')) EXECUTE FUNCTION upnp_catalog_changed();
 
-INSERT INTO schema_version (version, name) VALUES (60,'upnp_catalog_revision') ON CONFLICT(version) DO NOTHING;
+INSERT INTO schema_version (version, name) VALUES (66,'upnp_catalog_revision') ON CONFLICT(version) DO NOTHING;
 
 COMMIT;

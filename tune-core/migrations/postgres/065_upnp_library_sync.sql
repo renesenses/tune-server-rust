@@ -12,6 +12,6 @@ CREATE TABLE IF NOT EXISTS upnp_library_members (
     PRIMARY KEY (source_key, track_id)
 );
 
-INSERT INTO schema_version (version, name) VALUES (59, 'upnp_library_sync') ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_version (version, name) VALUES (65, 'upnp_library_sync') ON CONFLICT (version) DO NOTHING;
 CREATE INDEX IF NOT EXISTS idx_upnp_library_members_track ON upnp_library_members(track_id);
 COMMIT;
