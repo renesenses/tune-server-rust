@@ -426,19 +426,31 @@ fn source_est(alias: &str, operateur: &str) -> String {
 ///
 /// Un album LOCAL n'est jamais masqué : le premier terme le sort d'emblée.
 fn double_par_un_local(alias: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM albums loc WHERE {})",
+        condition_de_doublon(alias)
+    )
+}
+
+/// Le CORPS du rapprochement #4146 : l'album distant `{alias}` et l'album
+/// local `loc` sont le même disque. Sorti de [`double_par_un_local`] pour que
+/// la mention réciproque « aussi sur … » (phase 5 du chantier UPnP,
+/// [`super::album_repo::AlbumRepo::aussi_sur`]) rapproche EXACTEMENT ce que la
+/// grille masque — deux copies de la règle divergeraient au premier
+/// correctif, et un album serait masqué sans être signalé, ou l'inverse.
+pub(crate) fn condition_de_doublon(alias: &str) -> String {
     let nom_distant = nom_d_artiste(alias, "ar_dist");
     let nom_local = nom_d_artiste("loc", "ar_loc");
     let distant = source_est(alias, "<>");
     let local = source_est("loc", "=");
     let ambigu = source_est("amb", "=");
     format!(
-        "EXISTS (SELECT 1 FROM albums loc \
-         WHERE {distant} AND {local} \
-           AND LOWER(loc.title) = LOWER({alias}.title) \
-           AND (LOWER({nom_local}) = LOWER({nom_distant}) \
-                OR ({nom_distant} = '' \
-                    AND (SELECT COUNT(*) FROM albums amb \
-                         WHERE LOWER(amb.title) = LOWER({alias}.title) AND {ambigu}) = 1)))"
+        "{distant} AND {local} \
+         AND LOWER(loc.title) = LOWER({alias}.title) \
+         AND (LOWER({nom_local}) = LOWER({nom_distant}) \
+              OR ({nom_distant} = '' \
+                  AND (SELECT COUNT(*) FROM albums amb \
+                       WHERE LOWER(amb.title) = LOWER({alias}.title) AND {ambigu}) = 1))"
     )
 }
 

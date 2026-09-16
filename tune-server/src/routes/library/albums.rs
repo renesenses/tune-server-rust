@@ -2165,6 +2165,26 @@ pub(super) async fn update_album(
 
 // --- Album extended metadata endpoints ---
 
+/// GET /api/v1/library/albums/{id}/aussi-sur — phase 5 du chantier UPnP.
+///
+/// La mention « aussi sur … » (D1-b, Bertrand 14/09/2026) : pour un album
+/// local, les albums distants qui le doublent — ceux que la grille masque
+/// (#4146) —, avec le nom du serveur ; pour un album distant, l'album local.
+/// Aucune fusion. `{"aussi_sur": []}` quand il n'y a rien à dire.
+pub(super) async fn album_aussi_sur(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    match repo.aussi_sur(id) {
+        Ok(v) => Json(json!({ "aussi_sur": v })).into_response(),
+        Err(e) => {
+            tracing::warn!(album_id = id, erreur = %e, "album_aussi_sur_en_echec");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
 /// GET /api/v1/library/albums/{id}/metadata
 /// Returns all extended metadata key-value pairs for an album.
 pub(super) async fn album_metadata_get(
