@@ -271,18 +271,22 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
          `as_i64()` qui reparse le texte, ecrit par un entier lie. Convertible \
          sans urgence (#3715)",
     ),
+    // #3715: PostgreSQL 063 repairs the native writer by using TEXT.
+    // SQLite's historical INTEGER affinity is still present on installed DBs;
+    // the three readers now CAST to TEXT so numeric legacy IDs remain visible.
+    // Both exceptions document that remaining SQLite schema work, not a reason
+    // to turn opaque service identifiers back into PostgreSQL integers.
+    (
+        "native",
+        "alarms",
+        "source_id",
+        "TEXT vs INTEGER — PostgreSQL 063 accepte les identifiants opaques de service ; affinite SQLite historique a migrer (#3715)",
+    ),
     (
         "migree",
         "alarms",
         "source_id",
-        "TEXT vs INTEGER — c'est la declaration SQLITE qui a tort. Cette colonne \
-         porte un identifiant de SERVICE, donc une chaine : `radios.rs` la lie en \
-         `Option<String>` et la relit en `as_string()`. MESURE sur une base NATIVE, \
-         ou 008 la declare bigint : creer une alarme avec un source_id rend \
-         `column \"source_id\" is of type bigint but expression is of type text`, et \
-         la relecture rend `null` (`as_str()` sur un `SqlValue::Int`). Le degat est \
-         sur le chemin NATIF, en sens INVERSE : la reparation est TEXT des deux \
-         cotes, pas INTEGER (#3715)",
+        "TEXT vs INTEGER — import deja textuel ; affinite SQLite historique a migrer, lecteurs CAST en TEXT (#3715)",
     ),
     // `profiles.is_admin` était ici, avec pour motif « réparer la liaison
     // d'abord ». C'est fait : `routes/cloud.rs` lie un `i64` depuis le même
@@ -290,16 +294,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
     // au-delà de `GET /auth/me` : `POST /auth/login` lit `is_admin` par
     // `as_bool().unwrap_or(false)`, qui rend `None` sur un `SqlValue::Text` —
     // un administrateur se connectait donc avec le rôle `user`, en silence.
-    (
-        "migree",
-        "radio_stations",
-        "is_favorite",
-        "TEXT vs INTEGER — aucun degat MESURE : #3181 a reecrit toutes les \
-         comparaisons en litteral texte (`= '1'`, `= '0'`), qui valent des deux \
-         cotes, la lecture passe par `as_i64()`, et `ORDER BY is_favorite DESC` \
-         donne le meme ordre sur '0'/'1' que sur 0/1. Convertible sans urgence \
-         mesuree, apres verification de chaque redacteur (#3715)",
-    ),
     // `zones.dsp_enabled` était ici, avec pour motif « réparer `update_dsp`
     // d'abord ». C'est fait dans le même commit : `update_dsp` lie désormais
     // `Option<i64>` et `i64` — il était mort sur TOUT PostgreSQL, natif compris,
@@ -732,7 +726,9 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     assert_eq!(
         ECARTS_TOLERES.len(),
         19,
-        // #3715 retire aussi streaming_favorites.id natif : 2 natifs, 17 migrés.
+        // #3715 source_id natif devient TEXT : 3 natifs, 16 migrés.
+        // La declaration SQLite historique INTEGER reste a migrer.
+        // La passe précédente avait retiré streaming_favorites.id (20 -> 19).
         // La passe précédente avait retiré profile_id natif (21 -> 20).
         // #3716 avait retiré queue_items.is_current côté migré (22 -> 21).
         // Le 31/08/2026 il valait 16 ; #3715 en a

@@ -659,3 +659,7 @@ path = "tests/album_dr_provenance_3924.rs"
 [[test]]
 name = "idle_poll_diagnostics_2566"
 path = "tests/idle_poll_diagnostics_2566.rs"
+
+[[test]]
+name = "alarm_source_3715"
+path = "tests/alarm_source_3715.rs"

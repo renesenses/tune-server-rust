@@ -175,6 +175,11 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
 
+      - name: Sources des alarmes sur PostgreSQL (#3715)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test alarm_source_3715 i3715_alarm_postgres -- --nocapture
+
       # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
       # base. Ces requetes vivaient dans tune-server, que ce job ne compile
       # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
