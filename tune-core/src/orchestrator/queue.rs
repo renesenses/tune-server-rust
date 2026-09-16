@@ -310,6 +310,43 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Préfixe de la sentinelle « position hors file » (#4283), suivi de
+    /// `<position>:<longueur>`. `play_error_response` côté route la traduit
+    /// en réponse nommant le champ ; les autres appelants (sondeur, `next`,
+    /// `previous`) la journalisent telle quelle.
+    pub const QUEUE_POSITION_OUT_OF_RANGE: &str = "queue_position_out_of_range:";
+
+    /// #4283 — l'entrée de file à `position`, LUE avant toute écriture du
+    /// curseur.
+    ///
+    /// `play_from_queue` et `advance_queue_metadata` faisaient
+    /// `set_current_pos(position)` PUIS `get_at(position)`. Or
+    /// `set_current_pos` est « efface `is_current` sur toute la zone, pose-le
+    /// sur la ligne à `position` » : quand cette ligne n'existe pas (position
+    /// négative, ≥ longueur, file vide), la zone perdait son curseur — plus
+    /// aucune ligne courante — et l'erreur « no queue item at position »
+    /// arrivait APRÈS la mutation. Même motif que #3966 (mutation avant
+    /// validation à la frontière), autre site.
+    ///
+    /// Rend l'entrée et la longueur de la file ; en cas d'absence, la
+    /// sentinelle [`Self::QUEUE_POSITION_OUT_OF_RANGE`] portant la position
+    /// demandée et la longueur, sans avoir rien écrit.
+    fn entree_de_file_avant_le_curseur(
+        queue_repo: &PlayQueueRepo,
+        zone_id: i64,
+        position: i64,
+    ) -> Result<(crate::db::play_queue_repo::QueueEntry, i64), String> {
+        let total = queue_repo.count_all(zone_id)?;
+        let hors_file = || format!("{}{position}:{total}", Self::QUEUE_POSITION_OUT_OF_RANGE);
+        if position < 0 || position >= total {
+            return Err(hors_file());
+        }
+        let entry = queue_repo
+            .get_at(zone_id, position)?
+            .ok_or_else(hors_file)?;
+        Ok((entry, total))
+    }
+
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
@@ -324,11 +361,11 @@ impl PlaybackOrchestrator {
         // "try local, then offset into streaming by position - local_count",
         // which broke manual Next across a source boundary (Sandro S2: the local
         // "next" was never found after a Qobuz track, so the zone froze).
+        //
+        // #4283 — lecture PUIS écriture : le curseur ne bouge que si l'entrée
+        // existe.
+        let (entry, total) = Self::entree_de_file_avant_le_curseur(&queue_repo, zone_id, position)?;
         queue_repo.set_current_pos(zone_id, position).ok();
-        let total = queue_repo.count_all(zone_id)?;
-        let entry = queue_repo
-            .get_at(zone_id, position)?
-            .ok_or("no queue item at position")?;
 
         let req = if let Some(track_id) = entry.track_id {
             // Local track.
@@ -441,12 +478,10 @@ impl PlaybackOrchestrator {
 
     pub async fn advance_queue_metadata(&self, zone_id: i64, position: i64) -> Result<(), String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
+        // #4283 — jumelle de `play_from_queue` : lecture PUIS écriture du
+        // curseur.
+        let (entry, total) = Self::entree_de_file_avant_le_curseur(&queue_repo, zone_id, position)?;
         queue_repo.set_current_pos(zone_id, position).ok();
-
-        let total = queue_repo.count_all(zone_id)?;
-        let entry = queue_repo
-            .get_at(zone_id, position)?
-            .ok_or("no queue item at position")?;
 
         // #3442 — la zone ADOPTE le flux pre-arme.
         //

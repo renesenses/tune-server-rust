@@ -1013,6 +1013,10 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
 #[cfg(test)]
 mod refus_entier_negatif_3966;
 
+/// #4283 — `queue/jump` valide la position avant que le curseur ne bouge.
+#[cfg(test)]
+mod saut_hors_file_4283;
+
 /// Replace a zone's queue after taking the SQLite user-write lane.
 ///
 /// A library scan holds a per-batch write transaction on the shared SQLite
@@ -3209,6 +3213,11 @@ async fn queue_jump(
     Json(body): Json<QueueJumpRequest>,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
+    // #4283 — un `position` négatif se refuse ICI, à la frontière, en nommant
+    // le champ (400), comme `position_ms` et `start_index` (#3966).
+    if let Err(refus) = refuser_un_entier_negatif("position", body.position) {
+        return refus;
+    }
     match state
         .orchestrator
         .play_from_queue(zone_id, body.position)
@@ -3218,8 +3227,40 @@ async fn queue_jump(
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
         }
-        Err(e) => play_error_response(e, &lang),
+        Err(e) => refus_de_position_hors_file(&e).unwrap_or_else(|| play_error_response(e, &lang)),
     }
+}
+
+/// #4283 — la sentinelle « position hors file » de l'orchestrateur
+/// (`PlaybackOrchestrator::QUEUE_POSITION_OUT_OF_RANGE`, suivie de
+/// `<position>:<longueur>`) devient un 404 nommant le champ, la position
+/// reçue et la longueur de la file. Avant, ce motif tombait dans le
+/// fourre-tout 500 `playback_error` de `play_error_response` — et, plus grave,
+/// APRÈS que le curseur eut été déplacé sur une ligne inexistante.
+///
+/// `None` pour tout autre motif : l'appelant retombe alors sur
+/// `play_error_response`.
+fn refus_de_position_hors_file(erreur: &str) -> Option<axum::response::Response> {
+    let reste = erreur
+        .strip_prefix(tune_core::orchestrator::PlaybackOrchestrator::QUEUE_POSITION_OUT_OF_RANGE)?;
+    let (position, longueur) = reste.split_once(':')?;
+    let position: i64 = position.parse().ok()?;
+    let longueur: i64 = longueur.parse().ok()?;
+    Some(
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "queue_position_out_of_range",
+                "field": "position",
+                "position": position,
+                "queue_length": longueur,
+                "message": format!(
+                    "position {position} is out of range: the queue has {longueur} item(s)"
+                ),
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// 🔴 #3669 — « Vider la file » est un ORDRE D'ARRÊT, pas un repeint d'écran.
