@@ -1661,10 +1661,7 @@ fn les_seeks_apres_reprise_sont_detaches_et_gardes() {
         &apres[..fin]
     };
     for (nom, sig) in [
-        (
-            "resume",
-            "pub async fn resume(&self, zone_id: i64, device_id: Option<&str>)",
-        ),
+        ("resume", "pub async fn resume_with_session_error_message("),
         (
             "seek_output_after_replay",
             "pub(super) async fn seek_output_after_replay(",
