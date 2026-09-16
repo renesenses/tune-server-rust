@@ -655,7 +655,9 @@ Le **nom du serveur d'origine** reste utile pour distinguer deux pistes identiqu
 deux machines, mais il n'a pas sa place dans le badge : il ira dans l'infobulle ou dans le
 détail de la piste, à trancher au moment de l'écran.
 
-**D2 — Que faire quand un serveur disparaît ?**
+**D2 — Que faire quand un serveur disparaît ?** ✅ Tranché le 14/09/2026 : **24 h**,
+comme les zones (`SERVEUR_ABSENT_APRES`). La première implémentation avait posé
+5 400 s (trois `max-age`) ; ramenée à 24 h le 16/09 sur rappel de Bertrand.
 Le dépôt a déjà tranché quatre fois dans le même sens (marquer, jamais
 retirer ; ne pas croire un byebye ; ne supprimer qu'après une observation
 complète et saine ; plafonner toute purge à 20 %). La question posée à
