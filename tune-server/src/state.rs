@@ -52,6 +52,10 @@ pub struct AppState {
     /// Registry of in-progress background tasks (enrichment, artwork, bios) for
     /// the UI "tâches de fond" indicator. See [`crate::background_tasks`].
     pub background_tasks: crate::background_tasks::BackgroundTasks,
+    /// La mesure de la plage dynamique à la demande (#4185) — un seul passage
+    /// à la fois, son relevé lisible. Tenu ici et non en `static` : la route
+    /// qui le lit a déjà l'état, et un test ne pollue pas le suivant.
+    pub passe_dr: Arc<tune_core::audio::replaygain::plage_dynamique::PasseDr>,
     pub upnp: Option<UpnpState>,
     pub config: Arc<TuneConfig>,
     pub http_client: reqwest::Client,
@@ -444,6 +448,7 @@ impl AppState {
             scanner,
             event_bus,
             background_tasks,
+            passe_dr: Arc::new(tune_core::audio::replaygain::plage_dynamique::PasseDr::new()),
             upnp: Some(upnp),
             config: Arc::new(tune_config),
             http_client,
