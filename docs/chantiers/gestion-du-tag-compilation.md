@@ -56,14 +56,34 @@ Il y a **deux sources de vérité concurrentes**, et rien ne dit laquelle gagne 
 1. **le tag `TCMP` du fichier** — lu, transporté, jamais confronté au reste ;
 2. **la forme des dossiers** — le module `scanner::compilation`, qui devine.
 
-Et surtout : **`mark_compilation()` n'a aucun appelant de production identifié.** Toutes les
-occurrences relevées sont soit sa définition, soit des essais (`album_repo.rs:3984`, `:4022`
-à `:4024`), soit un appel interne l. 1454.
+### 🔴 DÉMENTI — « `mark_compilation()` n'a aucun appelant de production »
 
-👉 **C'est la vérification n° 1 de la phase 0** : si le drapeau n'est jamais levé hors essai,
-alors le tag est lu de bout en bout **et jeté à l'arrivée** — ce qui expliquerait #1656 mot
-pour mot. À prouver, pas à supposer : `git grep` ne fait pas autorité sur l'atteignabilité
-(cf. la leçon de `feedback_la_version_testee_nest_pas_celle_qui_tourne`).
+> *Ce paragraphe disait : « **`mark_compilation()` n'a aucun appelant de production
+> identifié.** Toutes les occurrences relevées sont soit sa définition, soit des essais
+> (`album_repo.rs:3984`, `:4022` à `:4024`), soit un appel interne l. 1454. » — et il en
+> tirait que le tag serait « lu de bout en bout et jeté à l'arrivée », ce qui expliquerait
+> #1656 mot pour mot.*
+
+**C'est faux.** Sur `origin/main` (`bcba767b`, v0.9.149), le drapeau est levé par **trois**
+chemins de production, dont deux distincts au niveau appelant :
+
+| appelant | chemin | ce qu'il couvre |
+|---|---|---|
+| `tune-server/src/scan_import.rs:933` | `self.album_repo.mark_compilation(aid)` | le scan par lots — manuel et au démarrage |
+| `tune-server/src/auto_scan.rs:207` | `album_repo.mark_compilation(aid)` | le **surveillant de fichiers** |
+| `tune-server/src/scan_import.rs:956` | `reclasser_en_compilation(aid, va, titre)` → `album_repo.rs:1454` → `mark_compilation` | la reprise d'une ligne née sous une décision partielle (#3232) |
+
+Les deux premiers sont gardés par le même `if let Some(aid) = album_id && is_compilation`.
+Le troisième est la voie #3232, qui réécrit artiste **et** titre avant de lever le drapeau.
+
+👉 **Conséquence sur le diagnostic** : le tag n'est pas « jeté à l'arrivée ». Il est jeté
+**bien avant**, dans le calcul de `is_compilation` lui-même — voir la mesure de la phase 1
+ci-dessous. La colonne, elle, est écrite fidèlement à la décision prise.
+
+⚠️ La leçon de méthode que ce paragraphe énonçait reste entière, et elle vient de se
+retourner contre lui : `git grep` ne fait autorité ni sur l'atteignabilité, **ni sur
+l'inatteignabilité**. Les trois appels ci-dessus étaient visibles d'un `grep` — c'est le
+relevé qui avait été incomplet, pas le code qui était mort.
 
 ## 4. Ce qui revient à Bertrand
 
@@ -212,3 +232,107 @@ arrive jusqu'à `metadata.compilation` et personne ne s'en sert. C'est la phase 
 (`mark_compilation()` a-t-il un appelant de production ?) devient la seule qui compte.
 
 ⚠️ Non mesurés : WAV et AIFF, 12 fichiers.
+
+## 9. Phase 1 — ce qui décidait réellement, mesuré puis corrigé
+
+Mesuré le 14/09/2026 sur `origin/main` `bcba767b` (**v0.9.149**), par le vrai `TrackImporter`,
+le vrai `begin_batch` et une base SQLite neuve — les trois formes montées à l'identique des
+signalements. Témoin : `tune-server/tests/compilation_le_tag_fait_foi.rs`.
+
+### 9.1 Ce que faisaient les trois cas AVANT
+
+| cas | forme jouée | `is_compilation` | artiste de l'album |
+|---|---|---|---|
+| **A** — #1656 | `VA-xxx/`, tag `1` sur les 3 pistes, aucun `ALBUMARTIST` | `true` | `Various Artists` |
+| **B** — #3855 | 1 dossier de disque, 1 titre, **tag `0`**, 2 graphies du chef | `true` | `Various Artists` |
+| **C** — #3855 | le même, **tag absent** | `true` | `Various Artists` |
+
+👉 **#1656 était déjà réglée sur la .149** : le tag est honoré et le titre de l'album n'est plus
+pris pour l'artiste (le point 2 l'avait été par `44111285`, v0.9.97). Le cas A ne change pas.
+
+👉 **B et C rendaient le MÊME résultat.** C'est la mesure qui tranche : un fichier qui déclare
+explicitement `COMPILATION=0` était **rigoureusement indiscernable** d'un fichier muet. Le tag
+n'avait aucun effet observable dans ce sens.
+
+### 9.2 Quelle règle décidait — et pourquoi le soupçon de départ était incomplet
+
+Le soupçon portait sur l'ordre des `||` de `scan_import.rs:681`, `folder_va` passant devant le
+tag. C'est vrai, mais ce n'est pas la cause suffisante, et s'y arrêter aurait manqué l'essentiel.
+
+Le tag était **déjà fondu** dans le deuxième étage. `decide_compilation_albums` rendait
+`flag || artists.len() >= 2`, où `flag` était mis à vrai par le tag. D'où :
+
+1. un tag à **vrai** allumait le drapeau — par `comp_decision`, sans avoir besoin du `||` ;
+2. un tag à **faux** n'avait **aucun chemin** vers la décision. `meta.compilation` n'était relu
+   que dans le `unwrap_or_else`, c'est-à-dire pour un album **absent** de la carte — ce qui
+   n'arrive jamais une fois `begin_batch` passé sur les pistes de cet album.
+
+**Le tag ne pouvait donc qu'ALLUMER le drapeau, jamais l'éteindre.** La règle qui décidait
+réellement, pour B comme pour C, était « deux artistes d'album distincts sous un même titre » —
+la FORME — et deux graphies d'un même chef d'orchestre lui suffisent.
+
+### 9.3 Ce que la phase 1 change
+
+- `TrackMetadata::compilation` passe de `bool` à **`Option<bool>`** : sans trois états, C1 est
+  inapplicable — « pas de tag » et « tag à zéro » étaient le même `false` ;
+- `decide_compilation_albums` ne fond plus les deux sources : elle rend un [`VerdictAlbum`]
+  où `tag` et `forme` restent **séparés** ;
+- la décision s'écrit en un seul endroit et dans l'ordre de **C1** — le tag tranche dans les
+  deux sens, la forme ne parle que s'il se tait ;
+- **C2** : l'artiste d'un album de compilation est l'unique artiste d'album **tagué du
+  DOSSIER** quand il n'y en a qu'un, `Various Artists` dès qu'il y en a deux ou plus ;
+- le journal émet `compilation_decidee` une fois par album et par scan, avec `motif=tag` ou
+  `motif=forme_des_dossiers`. **Rien ne le disait jusqu'ici.**
+
+| cas | après | artiste |
+|---|---|---|
+| **A** | `true` — `motif=tag` | `Various Artists` (aucun artiste tagué) |
+| **B** | **`false`** — `motif=tag` | **`Fritz Reiner`** |
+| **C** | `true` — `motif=forme_des_dossiers` | `Various Artists` |
+
+⚠️ **C3 est respecté : rien de déjà indexé n'est réparé.** `mark_compilation()` ne baisse
+jamais le drapeau, et l'amorçage depuis la base entre en `Some(true)` pour une ligne déjà
+marquée. Le correctif ne vaut que pour ce qui sera scanné **après**.
+
+### 9.4 Le coffret de 63 CD (#3855) — ni mieux ni moins bien, et pourquoi
+
+Mesuré : le coffret reste **UN seul album** après le changement. Ce n'est pas le drapeau
+« compilation » qui le tenait groupé — c'est la réattache par titre identique de
+`get_or_create` (`album_repo.rs:1327`). Retirer le drapeau ne le redécoupe donc pas, et
+l'artiste s'améliore : `Various Artists` → `Fritz Reiner`.
+
+Deux réserves, toutes deux de **phase 2**, à ne pas traiter ici :
+
+1. la réattache journalise un `BUG_album_artist_mismatch` par piste divergente — bruit
+   nouveau sur ce chemin, signe que les **deux graphies** du chef restent non normalisées ;
+2. `COVER_DISTANCE_MAX` (`scanner/compilation.rs:103`) regroupe par empreinte de pochette,
+   critère que **C4** condamne pour un coffret dont les 63 disques ont 63 pochettes. Ce lot
+   n'y touche pas.
+
+### 9.5 #3179 — hors de portée de C1/C2
+
+*Swingin' Young Scott* attribué à Warren Vaché ne passe pas par le drapeau « compilation » :
+un album jugé compilation s'afficherait sous `Various Artists`, pas sous un nom d'invité. Le
+mécanisme est celui de l'artiste de repli quand `ALBUMARTIST` manque (`folder_tagged_artist`,
+puis `dir_album_artist`). **Ni C1 ni C2 ne le déplacent** ; l'issue reste ouverte et son
+`bloque:terrain` tient.
+
+### 9.6 La portée de C2 — trois témoins rouges l'ont tranchée
+
+C2 dit « l'artiste d'album tagué s'il existe ». **Sur quel périmètre** cet artiste doit-il
+être unique ? La question n'est pas rhétorique : elle a trois réponses, et deux sont fausses.
+
+| portée | ce qu'elle donne sur une compilation FAITE MAIN (#3232) | verdict |
+|---|---|---|
+| la **piste** courante | chaque piste son artiste ⇒ le coffret de #3855 se recoupe en deux lignes album, et « Woodstock » prend l'artiste de sa première piste | ❌ |
+| l'**album** `(dossier, titre)` | chaque piste porte son propre titre d'album, donc chaque groupe n'a qu'une piste et donc qu'un artiste ⇒ une anthologie de vingt artistes sort sous « Aretha Franklin » | ❌ |
+| le **dossier** | l'unique artiste d'album étiqueté du dossier, quand il n'y en a qu'un ; deux ou plus ⇒ `Various Artists` | ✅ |
+
+La portée qui décide est celle **qui a fait la compilation** : le dossier. C'est
+`folder_tagged_artist`, qui existait déjà pour les fichiers sans balises (#3232).
+
+⚠️ Et **aucun repli sur la balise de la piste** quand cette valeur est absente : elle est
+absente précisément quand le dossier porte plusieurs artistes, c'est-à-dire dans le seul cas
+où aucune étiquette ne vaut pour tout l'album. Les cinq témoins rouges de l'étape
+intermédiaire sont tous venus de ce repli, `un_coffret_dont_l_album_artist_varie_dans_un_
+dossier_ne_se_coupe_pas_en_deux_3855` compris — le dépôt gardait déjà ce cas.

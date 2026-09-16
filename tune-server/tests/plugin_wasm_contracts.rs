@@ -12,5 +12,7 @@ fn lock_environment() -> std::sync::MutexGuard<'static, ()> {
 mod plugin_events;
 #[path = "plugin_party_e2e.rs"]
 mod plugin_party_e2e;
+#[path = "plugin_uninstall_4194.rs"]
+mod plugin_uninstall_4194;
 #[path = "plugin_wasm_routes.rs"]
 mod plugin_wasm_routes;

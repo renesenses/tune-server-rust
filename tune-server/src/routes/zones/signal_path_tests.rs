@@ -1214,7 +1214,10 @@ fn replaygain_active_shows_step_and_breaks_bit_perfect() {
 #[test]
 fn replaygain_off_shows_nothing_and_stays_bit_perfect() {
     let (backend, zone) = dlna_zone_migrated();
-    let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    let (tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+        .set(tid, "rg_track_peak", "0.95")
+        .unwrap();
 
     let sp = build_signal_path(
         &ps,
@@ -1295,7 +1298,10 @@ fn un_gain_positif_sans_pic_tague_est_refuse_et_le_panneau_le_dit() {
 #[test]
 fn le_meme_gain_positif_passe_quand_l_anti_ecretage_est_desarme() {
     let (backend, zone) = dlna_zone_migrated();
-    let (_tid, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
+    let (tid, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
+    tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+        .set(tid, "rg_track_peak", "0.95")
+        .unwrap();
     let settings = SettingsRepo::with_backend(backend.clone());
     settings
         .set(tune_core::audio::replaygain::MODE_KEY, "track")
@@ -1325,11 +1331,10 @@ fn le_meme_gain_positif_passe_quand_l_anti_ecretage_est_desarme() {
     assert_eq!(sp.get("bit_perfect").and_then(|b| b.as_bool()), Some(false));
 }
 
-/// Avec un pic TAGUÉ, le gain positif retrouve exactement sa retenue d'avant :
-/// borné à `1 / pic`, nommé `tagged_peak`, et le verdict tombe. Le correctif
-/// n'a touché que la branche « aucun pic ».
+/// Avec un pic d'échantillon, la borne inclut la réserve estimée de #4074.
+/// Le garde-fou et la nature du pic sont nommés séparément.
 #[test]
-fn un_gain_positif_avec_pic_tague_garde_sa_retenue_d_avant() {
+fn un_gain_positif_avec_sample_peak_affiche_sa_reserve_estimee() {
     let (backend, zone) = dlna_zone_migrated();
     let (tid, ps) = flac_track_with_rg_tag(&backend, "+6.00 dB");
     tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
@@ -1349,10 +1354,20 @@ fn un_gain_positif_avec_pic_tague_garde_sa_retenue_d_avant() {
     )
     .unwrap();
 
-    // 1 / 0,95 = ×1,0526 ⇒ +0,4 dB.
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "peak_kind").and_then(|v| v.as_str()),
+        Some("sample_peak")
+    );
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "peak_headroom_db").and_then(|v| v.as_f64()),
+        Some(3.0)
+    );
+    // Réserve de 3 dB : -3 - 20 log10(0,95) = -2,55 dB.
     assert_eq!(
         step_desc(&sp, "ReplayGain").as_deref(),
-        Some("ReplayGain (track, +0.4 dB, tags du fichier)")
+        Some(
+            "ReplayGain (track, -2.6 dB, tags du fichier) — pic d'échantillon, réserve estimée de 3.0 dB (crête vraie inconnue)"
+        )
     );
     assert_eq!(
         step_field(&sp, "ReplayGain", "clipping_guard").and_then(|v| v.as_str()),
@@ -1593,7 +1608,10 @@ fn replaygain_mode_on_without_stored_gain_shows_nothing() {
 #[test]
 fn replaygain_never_shown_in_pure_mode() {
     let (backend, zone) = dlna_zone_migrated();
-    let (_tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    let (tid, ps) = flac_track_with_rg_tag(&backend, "-4.20 dB");
+    tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+        .set(tid, "rg_track_peak", "0.95")
+        .unwrap();
     let settings = SettingsRepo::with_backend(backend.clone());
     settings
         .set(tune_core::audio::replaygain::MODE_KEY, "track")
@@ -2403,4 +2421,59 @@ fn le_fil_de_lecture_local_publie_ses_transformations_a_l_ouverture_et_a_chaque_
              précédente ne doit pas survivre à son arrêt"
         );
     }
+}
+
+#[test]
+fn replaygain_peak_kind_keeps_unity_informational_and_true_peak_exact() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (tid, ps) = flac_track_with_rg_tag(&backend, "0");
+    let meta = tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone());
+    meta.set(tid, "rg_track_peak", "0.5").unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "peak_headroom_db").and_then(|v| v.as_f64()),
+        Some(3.0)
+    );
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "bit_perfect").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(sp["bit_perfect"], true);
+
+    meta.set(tid, "rg_track_gain", "+6").unwrap();
+    meta.set(tid, "rg_track_true_peak", "1.2").unwrap();
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Node"),
+        "none",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "peak_kind").and_then(|v| v.as_str()),
+        Some("true_peak")
+    );
+    assert_eq!(
+        step_field(&sp, "ReplayGain", "peak_headroom_db").and_then(|v| v.as_f64()),
+        Some(0.0)
+    );
+    assert!(step_desc(&sp, "ReplayGain").unwrap().contains("-1.6 dB"));
+    assert!(
+        step_desc(&sp, "ReplayGain")
+            .unwrap()
+            .contains("crête vraie disponible")
+    );
 }

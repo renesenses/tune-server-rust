@@ -69,6 +69,17 @@ fn statut_json(enabled: bool, lms_host: &str, lms_discovered: bool, players: Vec
         "lms_host": lms_host,
         "lms_discovered": lms_discovered,
         "players": players,
+        "lms_cli": tune_core::slimproto::cli_server::etat_ecoute(),
+        "slimproto_udp": tune_core::slimproto::discovery::etat_ecoute(),
+    })
+}
+
+/// LMS répond, mais aucune platine n'est énumérée. Cela ne démontre pas
+/// pourquoi (éteinte, absente, pont non configuré) : ne pas inventer la cause.
+fn diagnostic_sans_platine(hote: &str) -> Value {
+    json!({
+        "code": "lms_sans_platine",
+        "message": format!("LMS ({hote}) répond mais n'annonce aucune platine. Vérifier les lecteurs et leur connexion à ce LMS. Pour HQPlayer, vérifier le pont qui doit le présenter comme platine à LMS."),
     })
 }
 
@@ -246,19 +257,31 @@ async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
             // répondre. Le recensement qui échoue ne fait pas échouer l'état —
             // le serveur répond bien, ce sont ses lecteurs qu'on n'a pas su lire,
             // et c'est une ligne de journal, pas un 502.
-            let players = match list_players_cli(&host, port) {
-                Ok(p) => p,
+            let (players, diagnostic) = match list_players_cli(&host, port) {
+                Ok(p) => {
+                    let diagnostic = p
+                        .is_empty()
+                        .then(|| diagnostic_sans_platine(&lms_host_display));
+                    (p, diagnostic)
+                }
                 Err(e) => {
                     tracing::warn!(
                         host = %host, port, error = %e,
                         "squeezebox_status: player listing failed"
                     );
-                    Vec::new()
+                    (
+                        Vec::new(),
+                        Some(json!({
+                            "code": "lms_recensement_impossible",
+                            "message": e,
+                        })),
+                    )
                 }
             };
             let mut body = statut_json(enabled, &lms_host_display, lms_discovered, players);
             if let Some(obj) = body.as_object_mut() {
                 // Champs historiques conservés : d'autres clients les lisent.
+                obj.insert("diagnostic".into(), json!(diagnostic));
                 obj.insert("status".into(), json!("ok"));
                 obj.insert("response".into(), json!(resp));
             }
@@ -285,10 +308,13 @@ fn list_players_cli(host: &str, port: u16) -> Result<Vec<Value>, String> {
     let count_resp = lms_cli_command(host, port, "player count ?")?;
     // Response: "player count 3"
     let count: usize = count_resp
-        .rsplit(' ')
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .strip_prefix("player count ")
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(|| {
+            format!(
+                "LMS ({host}:{port}) a répondu avec un nombre de platines invalide : {count_resp}"
+            )
+        })?;
 
     let mut players = Vec::new();
     for i in 0..count {
@@ -383,6 +409,18 @@ async fn discover_players(State(state): State<AppState>) -> impl IntoResponse {
         format!("{host}:{port}")
     };
     match discover_and_register(&state).await {
+        Ok(registered) if registered.is_empty() => {
+            // Un rafraîchissement ne peut enregistrer aucune sortie : le client
+            // affiche déjà le champ error des réponses HTTP non réussies.
+            // GET /status conserve, lui, le succès d'un LMS joignable.
+            let diagnostic = diagnostic_sans_platine(&lms_host_display);
+            let mut body = statut_json(enabled, &lms_host_display, lms_discovered, registered);
+            body["discovered"] = json!(0);
+            body["error"] = diagnostic["message"].clone();
+            body["code"] = diagnostic["code"].clone();
+            body["diagnostic"] = diagnostic;
+            (StatusCode::CONFLICT, Json(body)).into_response()
+        }
         // Le client attend ici la MÊME forme que sur `/status` : c'est le
         // résultat du bouton « Actualiser », et il remplace `squeezeboxStatus`
         // en entier. Rendre une forme différente sur deux routes qui alimentent

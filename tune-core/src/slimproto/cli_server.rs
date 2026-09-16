@@ -14,6 +14,12 @@ use tracing::{debug, info, warn};
 use super::PlayerRegistry;
 
 const CLI_PORT: u16 = 9090;
+static ETAT: super::ecoute::JournalEcoute = super::ecoute::JournalEcoute::new();
+
+/// Dernier bind CLI ; absent avant tentative et après arrêt de l'écoute.
+pub fn etat_ecoute() -> Option<super::EtatEcoute> {
+    ETAT.lire()
+}
 
 /// State shared across CLI connections.
 pub struct CliState {
@@ -30,15 +36,25 @@ pub async fn start_cli_server(state: Arc<CliState>) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(CLI_PORT);
 
+    start_cli_server_sur_port(state, port).await;
+}
+
+/// Même serveur avec port explicite, notamment pour une écoute éphémère (0).
+pub async fn start_cli_server_sur_port(state: Arc<CliState>, port: u16) {
+    let tentative = ETAT.commencer();
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
+            tentative.echec(port, "TCP", &e,
+                "Le pont de commande LMS de Tune est indisponible. Choisir un port libre avec TUNE_CLI_PORT puis redémarrer Tune et adapter les contrôleurs. Le LMS externe configuré dans les réglages est indépendant.");
             warn!(error = %e, port, "lms_cli_server_bind_failed");
             return;
         }
     };
 
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    tentative.ecoute(port, "TCP");
     info!(port, "lms_cli_server_started");
 
     loop {

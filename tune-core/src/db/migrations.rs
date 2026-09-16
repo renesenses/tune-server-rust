@@ -3653,6 +3653,39 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "media_servers_durables",
         include_str!("../../migrations/postgres/058_media_servers_durables.sql"),
     ),
+    // #3716: reconcile startup and numbered migrations without narrowing data.
+    (
+        59,
+        "queue_items_types",
+        include_str!("../../migrations/postgres/059_queue_items_types.sql"),
+    ),
+    // #3715: streaming profile bindings and schema agree on i64.
+    (
+        60,
+        "streaming_profile_id",
+        include_str!("../../migrations/postgres/060_streaming_profile_id.sql"),
+    ),
+    (
+        61,
+        "streaming_favorite_ids",
+        include_str!("../../migrations/postgres/061_streaming_favorite_ids.sql"),
+    ),
+    (
+        62,
+        "radio_favorite_integer",
+        include_str!("../../migrations/postgres/062_radio_favorite_integer.sql"),
+    ),
+    (
+        63,
+        "alarm_source_text",
+        include_str!("../../migrations/postgres/063_alarm_source_text.sql"),
+    ),
+    // #2271: named AutoPlay modes require TEXT on native and imported databases.
+    (
+        64,
+        "zone_autoplay_mode_text",
+        include_str!("../../migrations/postgres/064_zone_autoplay_mode_text.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5610,7 +5643,12 @@ mod tests {
         // (`udn`), dates en TEXT des deux cotes comme `zones.last_seen_at`
         // (95 / PG 050). Le numero libre a ete remesure DANS LE CODE, entree
         // par entree, comme la 56 et la 57 l'imposent.
-        assert_eq!(pg_latest_version(), 58, "latest PG migration must be 58");
+        // 59 aligns queue types (#3716); 60 aligns streaming profile IDs
+        // with the repository's integer bindings (#3715).
+        // 61 repairs native streaming favorite IDs without rewinding the sequence.
+        // 62 repairs radio favorite flags and their former boolean writer.
+        // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
+        assert_eq!(pg_latest_version(), 64, "latest PG migration must be 64");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

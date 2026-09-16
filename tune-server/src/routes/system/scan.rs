@@ -3572,11 +3572,22 @@ mod tests {
     fn decide<'a>(
         tracks: &'a [(&'a str, &'a str, Option<&'a str>, bool)],
     ) -> std::collections::HashMap<(String, String), bool> {
-        decide_compilation_albums(
-            tracks
-                .iter()
-                .map(|(dir, album, aa, flag)| (dir.to_string(), *album, *aa, *flag)),
-        )
+        decide_compilation_albums(tracks.iter().map(|(dir, album, aa, flag)| {
+            // Ces temoins parlent en « drapeau leve / pas de drapeau », ce qui
+            // est exactement `Some(true)` / `None` depuis que le tag porte
+            // trois etats (C1).
+            (
+                dir.to_string(),
+                *album,
+                *aa,
+                if *flag { Some(true) } else { None },
+            )
+        }))
+        .into_iter()
+        // La regle C1 ramenee au `bool` que ces temoins interrogent : le tag
+        // tranche s'il existe, la forme des dossiers seulement sinon.
+        .map(|(k, v)| (k, v.tag.unwrap_or(v.forme)))
+        .collect()
     }
 
     fn is_comp(
