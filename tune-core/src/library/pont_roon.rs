@@ -207,6 +207,12 @@ pub struct Rapport {
     /// Images : combien l'export en NOMME (clés), et combien il en PORTE.
     pub images_nommees: usize,
     pub images_portees: usize,
+    /// Artistes appariés, sans image chez Tune, dont l'archive porte l'image.
+    pub images_artistes_a_poser: usize,
+    pub images_artistes_posees: usize,
+    /// Albums appariés, sans pochette chez Tune, dont l'archive porte l'image.
+    pub images_albums_a_poser: usize,
+    pub images_albums_posees: usize,
 }
 
 /// Une piste de Tune, réduite à ce que l'appariement lit.

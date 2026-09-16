@@ -5276,6 +5276,7 @@ dependencies = [
  "if-addrs 0.13.4",
  "image",
  "libc",
+ "libloading 0.8.9",
  "lofty",
  "md-5 0.10.6",
  "mdns-sd",
@@ -5391,6 +5392,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-pont-roon"
+version = "0.9.151"
+dependencies = [
+ "async-trait",
+ "axum",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+ "zip",
+]
+
+[[package]]
 name = "tune-server"
 version = "0.9.151"
 dependencies = [
@@ -5437,6 +5453,7 @@ dependencies = [
  "tune-http-types",
  "tune-karaoke",
  "tune-plugin-runtime-wasm",
+ "tune-pont-roon",
  "tune-smart-http",
  "tune-stream-http",
  "tune-streaming-http",
