@@ -75,6 +75,13 @@ CREATE
     OR OLD.id IS DISTINCT FROM NEW.id
     OR OLD.name IS DISTINCT FROM NEW.name) EXECUTE FUNCTION upnp_catalog_changed();
 
+-- `playlists.profile_id` n'existe pas dans les scripts SQL numérotés : sur un
+-- serveur réel, `ENSURE_TABLES` (pg_migrate.rs) la pose au démarrage AVANT ces
+-- scripts ; sur une base rejouée par les seuls scripts — la CI PostgreSQL —
+-- elle manque, et le déclencheur ci-dessous refusait `OLD.profile_id`.
+-- Idempotent : déjà là sur tout serveur en service.
+ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id BIGINT NOT NULL DEFAULT 1;
+
 CREATE
     OR REPLACE TRIGGER upnp_revision_playlists_insert AFTER INSERT ON playlists FOR EACH ROW EXECUTE FUNCTION upnp_catalog_changed();
 
