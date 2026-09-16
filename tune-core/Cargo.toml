@@ -188,6 +188,15 @@ path = "tests/journal_insertion_par_lot.rs"
 name = "niveaux_sortie_pull_3807"
 path = "tests/niveaux_sortie_pull_3807.rs"
 
+# #3682 — spectre au plancher sur une zone LOCALE bit-perfect (capture de
+# Gilles OLIVE). Aucun temoin ne couvrait la premiere lecture explicite d'une
+# piste locale : ce banc cloue que `transcoder_en_session` nourrit bien
+# `playback.audio_levels`, par famille de decodeur. Meme garde que ci-dessus :
+# `autotests = false`, sans cette cible le fichier n'est jamais compile.
+[[test]]
+name = "niveaux_sortie_locale_3682"
+path = "tests/niveaux_sortie_locale_3682.rs"
+
 # #4144 — l'ecran Sante affichait `IDLE` pendant des heures de ReplayGain parce
 # que la passe ne publiait aucun compteur. Le temoin tient les deux bords : le
 # compteur avance, et l'annonce reste a cadence espacee. Binaire A LUI SEUL :
