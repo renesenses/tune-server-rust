@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::state::AppState;
 use tune_core::db::album_repo::AlbumRepo;
 
-use super::album_order::{CollectionSort, sort_albums};
+use super::album_order::{CollectionOrder, CollectionSort, sort_albums};
 use super::now_iso_utc;
 
 #[derive(Deserialize)]
@@ -68,8 +68,12 @@ pub(super) struct CollectionAlbumPath {
 
 #[derive(Deserialize, Default)]
 pub(super) struct CollectionAlbumsQuery {
-    /// `artist` (défaut), `title`, `year`, ou `added` pour l'ordre d'ajout.
+    /// `artist` (défaut), `title`, `year`, `release_date`, `added_at` (date
+    /// d'ajout à la bibliothèque), ou `added` pour l'ordre d'ajout au dossier.
     sort: Option<String>,
+    /// `asc` (défaut) ou `desc` — sur la clé principale seulement, les
+    /// valeurs manquantes restant en dernier (Bertrand, 16/09/2026).
+    order: Option<String>,
 }
 
 /// Les identifiants stockés d'un dossier, tels quels.
@@ -334,7 +338,28 @@ pub(super) async fn collection_albums(
             morts.len()
         );
     }
-    sort_albums(&mut albums, CollectionSort::parse(query.sort.as_deref()));
+    // `AlbumRepo::get` laisse `added_at` à `None` (la colonne n'est pas dans
+    // `select_album()`) : sans cette passe, le tri « date d'ajout » serait
+    // un tri sur rien, et l'écran ne verrait jamais la date. Une seule
+    // requête groupée pour tout le dossier (#3397). Un échec ne casse pas
+    // la liste : elle sort sans date, et le journal le dit.
+    match album_repo.added_at_by_ids(&album_ids) {
+        Ok(par_id) => {
+            for a in &mut albums {
+                if let Some(id) = a.id {
+                    a.added_at = par_id.get(&id).copied();
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("dossier {id}: added_at_by_ids a échoué — liste sans date d'ajout: {e}")
+        }
+    }
+    sort_albums(
+        &mut albums,
+        CollectionSort::parse(query.sort.as_deref()),
+        CollectionOrder::parse(query.order.as_deref()),
+    );
     let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
     Json(json!(albums)).into_response()
 }
