@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "resolve_stream_download.rs"]
+mod download;
+
 /// Ce qu'une branche de `resolve_streaming_url` rend : le flux à décrire (url
 /// servie, session, mime, taille), ou une résolution déjà complète (REF-2
 /// phase 2, #2219).
@@ -694,8 +697,10 @@ impl PlaybackOrchestrator {
             None
         };
 
-        // Sans source Range, conserver strictement le chemin existant :
-        // fichier DASH deja local ou telechargement complet vers un temp.
+        // Le fichier telecharge appartient a cette tache : son garde le
+        // supprime sur succes, erreur et annulation. Un fichier DASH appartient
+        // au cache du service et ne doit jamais etre supprime ici.
+        let mut downloaded_file = None;
         let tmp_file = if ranged_source.is_some() {
             None
         } else if is_dash_local {
@@ -707,90 +712,52 @@ impl PlaybackOrchestrator {
                 .ok()
                 .map(|m| m.len())
                 .unwrap_or(0);
-            info!(
-                path = %file_path,
-                file_size,
-                "streaming_dash_file_already_on_disk"
-            );
-            Some((file_path, false))
+            info!(path = %file_path, file_size, "streaming_dash_file_already_on_disk");
+            Some(file_path)
         } else {
-            let tmp_path = std::env::temp_dir()
-                .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
-                .to_string_lossy()
-                .to_string();
-            let tmp_path_clone = tmp_path.clone();
-            let upstream = upstream_url.clone();
-            // Deuxieme etape chronometree (#3568) : le telechargement
-            // COMPLET du flux compresse vers un fichier temporaire.
-            // `LocalOutput` ne decode pas de flux compresse, donc rien
-            // ne part vers la carte son avant que cette boucle soit
-            // finie. C'est la moitie de l'attente qu'Audirvana ne paie
-            // pas : lui lit l'adresse Tidal en progressif.
             let debut_telechargement = std::time::Instant::now();
-            let download_result = tokio::task::spawn_blocking(move || {
-                let resp = crate::http::client::blocking_builder()
-                    .timeout(std::time::Duration::from_secs(120))
-                    .build()
-                    .and_then(|c| c.get(&upstream).send());
-                match resp {
-                    Ok(mut r) if r.status().is_success() => {
-                        let mut file = match std::fs::File::create(&tmp_path_clone) {
-                            Ok(f) => f,
-                            Err(e) => return Err(format!("tmp create: {e}")),
-                        };
-                        match std::io::copy(&mut r, &mut file) {
-                            Ok(bytes) => {
-                                debug!(path = %tmp_path_clone, "streaming_download_target");
-                                Ok((tmp_path_clone, bytes))
-                            }
-                            Err(e) => Err(format!("download copy: {e}")),
-                        }
-                    }
-                    Ok(r) => Err(format!("upstream HTTP {}", r.status())),
-                    Err(e) => Err(format!("upstream fetch: {e}")),
-                }
-            })
-            .await;
-
-            match download_result {
-                Ok(Ok((path, octets))) => {
-                    // `info!`, et non plus `debug!` : au niveau livre,
-                    // le journal de FranckLeRouge ne portait AUCUNE
-                    // ligne entre l'ordre de lecture et la fin du
-                    // transcodage. Impossible d'attribuer l'attente
-                    // (#3568). Une ligne par piste, avec de quoi
-                    // separer « le reseau est lent » de « le fichier
-                    // est gros ».
+            match download::telecharger_pour_session(
+                &streamer_for_eof,
+                &session_id_for_eof,
+                &upstream_url,
+                &codec,
+                &std::env::temp_dir(),
+            )
+            .await
+            {
+                Ok(Some((file, octets))) => {
                     let ms = debut_telechargement.elapsed().as_millis() as u64;
                     info!(
+                        stream_id = %session_id_for_eof,
                         octets,
                         elapsed_ms = ms,
                         debit_kio_s = if ms > 0 { octets * 1000 / 1024 / ms } else { 0 },
                         "streaming_download_complete"
                     );
-                    Some((path, true))
+                    let path = file.path().to_string_lossy().into_owned();
+                    downloaded_file = Some(file);
+                    Some(path)
                 }
-                Ok(Err(e)) => {
-                    warn!(error = %e, "streaming_transcode_download_failed");
-                    // #3287 : ces deux sorties quittaient la tache
-                    // AVANT le `end_session_input` du bas, en se
-                    // contentant d'effacer le fichier temporaire. La
-                    // session restait donc inscrite, sans producteur,
-                    // canal ouvert — et le gapless s'y enchainait.
-                    abandonner_la_session_de_transcodage(
-                        &streamer_for_eof,
-                        &session_id_for_eof,
-                        &tmp_path,
-                    )
-                    .await;
+                Ok(None) => {
+                    info!(
+                        stream_id = %session_id_for_eof,
+                        zone_id,
+                        "streaming_download_cancelled_session_removed"
+                    );
                     return;
                 }
                 Err(e) => {
-                    warn!(error = %e, "streaming_transcode_task_join_failed");
+                    warn!(
+                        stream_id = %session_id_for_eof,
+                        error = %e,
+                        "streaming_transcode_download_failed"
+                    );
+                    // Aucun producteur ne suivra : ne pas garder une session
+                    // vide que le gapless pourrait adopter (#3287).
                     abandonner_la_session_de_transcodage(
                         &streamer_for_eof,
                         &session_id_for_eof,
-                        &tmp_path,
+                        None,
                     )
                     .await;
                     return;
@@ -823,7 +790,7 @@ impl PlaybackOrchestrator {
             })
             .await
         } else {
-            let tmp_file_clone = tmp_file.as_ref().unwrap().0.clone();
+            let tmp_file_clone = tmp_file.as_ref().unwrap().clone();
             tokio::task::spawn_blocking(move || {
                 crate::audio::decode::decode_to_pcm_streaming_seeked(
                     &tmp_file_clone,
@@ -840,20 +807,9 @@ impl PlaybackOrchestrator {
             .await
         };
 
-        // Clean up the temp file — but ONLY if WE downloaded it. For a
-        // file:// DASH source, tmp_file IS the Tidal-cache-owned
-        // tune-dash-*.mp4 that is still referenced by the cached stream
-        // URL. Deleting it here made every subsequent re-resolution
-        // (repeat=one, or a seek that recreates the local stream) see the
-        // file gone, mark the cache stale, and re-download the whole
-        // ~54MB DASH — while concurrent transcodes raced on the emptied
-        // file (file_size=0 → decode failed). That was the ASIO "repeat"
-        // runaway (also on Qobuz). Leave cache-owned files alone.
-        if let Some((tmp_file, owned)) = tmp_file
-            && owned
-        {
-            let _ = std::fs::remove_file(&tmp_file);
-        }
+        // Le decodeur a rendu son fichier. Le garde ne possede que les
+        // telechargements HTTP ; les fichiers DASH du cache restent intacts.
+        drop(downloaded_file);
 
         match decode_result {
             Ok(Ok((_bit_depth, actual_rate))) => {
