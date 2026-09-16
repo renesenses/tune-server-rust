@@ -3339,6 +3339,13 @@ async fn zone_locale_avec_eq(orch: &PlaybackOrchestrator) -> i64 {
             "DAC".to_string(),
         )));
 
+    armer_un_egaliseur_audible(orch, zone_id);
+    zone_id
+}
+
+/// Un profil d'égaliseur ACTIVÉ et audible (+8 dB à 80 Hz) en base pour la
+/// zone — le réglage que le mode PURE éteint.
+fn armer_un_egaliseur_audible(orch: &PlaybackOrchestrator, zone_id: i64) {
     let profil = crate::audio::eq::EqProfile {
         enabled: true,
         bands: vec![crate::audio::eq::EqBandSpec {
@@ -3356,7 +3363,6 @@ async fn zone_locale_avec_eq(orch: &PlaybackOrchestrator) -> i64 {
             &serde_json::to_string(&profil).unwrap(),
         )
         .unwrap();
-    zone_id
 }
 
 #[cfg(feature = "local-audio")]
@@ -3373,7 +3379,6 @@ async fn avec_sortie_locale<T>(
     f(local)
 }
 
-#[cfg(feature = "local-audio")]
 fn regler_pure(orch: &PlaybackOrchestrator, zone_id: i64, actif: bool) {
     crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
         .set(
@@ -5301,11 +5306,16 @@ async fn le_predicat_de_position_suit_la_presence_d_un_peripherique() {
 /// Cas NOMINAL, inchangé : sur une zone observée, la bascule reprend à la
 /// position mesurée. C'est la contre-épreuve de la garde — si elle mordait
 /// trop large, ce test tomberait.
+///
+/// Un égaliseur est armé sur la zone : depuis #4004, une bascule PURE qui ne
+/// change rien au signal ne refabrique plus le flux, et ce test veut
+/// justement la relecture.
 #[tokio::test]
 async fn la_bascule_pure_reprend_a_la_position_mesuree() {
     let (orch, zone_id, _dir) =
         zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-2595-temoin")).await;
     let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
     let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
     // Ce que le sondeur écrit chaque seconde sur une zone observée.
     orch.playback.update_position(zone_id, 137_000).await;
@@ -5335,10 +5345,15 @@ async fn la_bascule_pure_reprend_a_la_position_mesuree() {
 /// Avant le correctif, `position_ms` valait 0 — non parce que le morceau
 /// était au début, mais parce que personne ne l'avait jamais mesuré — et la
 /// relecture repartait de là.
+///
+/// Un égaliseur est armé sur la zone : sans lui, depuis #4004, la bascule
+/// s'arrête AVANT la garde de position (rien à refabriquer), et ce test ne
+/// prouverait plus que la garde #2595 refuse une position inconnue.
 #[tokio::test]
 async fn la_bascule_pure_sans_peripherique_ne_repart_pas_de_zero() {
     let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("browser"), None).await;
     let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
     let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
     assert_eq!(
         orch.playback.get_state(zone_id).await.position_ms,
@@ -5365,6 +5380,236 @@ async fn la_bascule_pure_sans_peripherique_ne_repart_pas_de_zero() {
     assert!(
         !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
         "la relecture ne doit même pas être armée quand la position est inconnue"
+    );
+}
+
+// ------------------------------------------------------------------
+// #4004 — la bascule PURE ne refabrique le flux DLNA que si elle change
+// le signal.
+// ------------------------------------------------------------------
+
+/// Ce que le renderer factice a REÇU : `(play_media, stop)`.
+///
+/// Sur un `DlnaOutput`, `play_media` est la séquence `Stop` →
+/// `SetAVTransportURI` → `Play` ; c'est elle qui coupe le son. Zéro appel est
+/// la réponse attendue du correctif, et c'est une réponse que l'état du
+/// serveur seul ne peut pas donner.
+async fn commandes_recues_par_le_renderer(
+    orch: &PlaybackOrchestrator,
+    device_id: &str,
+) -> (usize, u64) {
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).expect("sortie enregistrée");
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("la sortie factice");
+    (mock.play_call_count().await, mock.stop_call_count())
+}
+
+/// LE défaut de Jean Valjean (#4004, Marantz ND8006, 0.9.147) : aucun
+/// égaliseur, aucune correction de pièce, aucun crossfeed, aucun ReplayGain
+/// sur la zone ; le FLAC part en passthrough. Entrer en PURE ne change alors
+/// pas un octet du flux servi — et le serveur le refabriquait quand même :
+/// `SetAVTransportURI` + `Play` + `Seek`, 1,8 à 2,4 s de silence par
+/// bascule.
+///
+/// Ce test échoue sur le code d'avant : le renderer reçoit un `play_media`,
+/// la génération de piste change, et `apply_audiophile_change` rend `false`.
+#[tokio::test]
+async fn bascule_pure_sans_traitement_sur_dlna_conserve_le_flux() {
+    let device_id = "dlna:uuid-56fcb4ae-4004";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    orch.playback.update_position(zone_id, 154_000).await;
+    let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await,
+        (0, 0),
+        "point de départ : le renderer n'a encore rien reçu"
+    );
+
+    regler_pure(&orch, zone_id, true);
+    assert!(
+        orch.apply_audiophile_change(zone_id).await,
+        "sans traitement armé, le son EST déjà conforme : la bascule est appliquée immédiatement"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await,
+        (0, 0),
+        "le flux ne doit PAS être refabriqué : zéro SetAVTransportURI/Play, zéro Stop vers le renderer (#4004)"
+    );
+    let apres = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        apres.track_generation, generation_avant,
+        "la lecture continue sur le même flux, sans coupure"
+    );
+    assert!(
+        !orch.eq_replay_gen.lock().unwrap().contains_key(&zone_id),
+        "aucune relecture ne doit même être armée quand la bascule ne change rien au signal"
+    );
+
+    // Et la sortie de PURE, symétrique : toujours rien à refabriquer.
+    regler_pure(&orch, zone_id, false);
+    assert!(orch.apply_audiophile_change(zone_id).await);
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await,
+        (0, 0),
+        "sortir de PURE sans traitement armé ne refabrique pas davantage"
+    );
+}
+
+/// Témoin : quand la bascule change RÉELLEMENT le signal — un égaliseur
+/// audible est armé sur la zone —, la refabrication reste le seul moyen de
+/// l'appliquer à un renderer réseau, et elle doit avoir lieu, à la position
+/// mesurée. Le correctif ne doit pas transformer #4004 en #1986 (PURE
+/// allumé, égaliseur toujours dans le flux).
+#[tokio::test]
+async fn bascule_pure_avec_egaliseur_sur_dlna_refabrique_le_flux() {
+    let device_id = "dlna:uuid-56fcb4ae-4004-eq";
+    let (orch, zone_id, _dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    armer_un_egaliseur_audible(&orch, zone_id);
+    orch.playback.update_position(zone_id, 160_000).await;
+
+    regler_pure(&orch, zone_id, true);
+    assert!(
+        !orch.apply_audiophile_change(zone_id).await,
+        "l'égaliseur est gravé dans le flux : seule une relecture l'en retire, elle est programmée"
+    );
+    laisser_passer_l_anti_rebond().await;
+
+    let (plays, _stops) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    assert_eq!(
+        plays, 1,
+        "le renderer doit recevoir exactement une nouvelle URI (SetAVTransportURI + Play)"
+    );
+    assert_eq!(
+        attendre_la_position_vue_par_la_sortie(&orch, device_id, 160_000).await,
+        160_000,
+        "et le Seek vers la position mesurée qui suit la relecture (#2893)"
+    );
+}
+
+/// Les QUATRE réglages que PURE gouverne sur un flux transcodé sont vus par
+/// le prédicat, chacun seul, et PURE ne les lui cache pas : c'est la
+/// condition pour que la bascule dans un sens comme dans l'autre décide
+/// pareil. Un garde-fou qui ne testerait que l'égaliseur ne garderait que
+/// lui.
+#[tokio::test]
+async fn le_predicat_voit_chacun_des_quatre_traitements_que_pure_gouverne() {
+    let orch = test_orchestrator();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    let zr = ZoneRepo::with_backend(orch.db.clone());
+    let zone_vide = zr.create("Vide", Some("dlna"), Some("dlna:vide")).unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_vide, None),
+        None,
+        "sans réglage, rien n'est armé"
+    );
+
+    // Égaliseur — activé mais à gains nuls, il n'altère rien.
+    let zone_eq = zr.create("EQ", Some("dlna"), Some("dlna:eq")).unwrap();
+    let plat = crate::audio::eq::EqProfile {
+        enabled: true,
+        ..Default::default()
+    };
+    settings
+        .set(
+            &format!("zone_{zone_eq}_eq_profile"),
+            &serde_json::to_string(&plat).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_eq, None),
+        None,
+        "un profil activé mais inaudible ne change pas le signal"
+    );
+    armer_un_egaliseur_audible(&orch, zone_eq);
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_eq, None),
+        Some("egaliseur")
+    );
+    regler_pure(&orch, zone_eq, true);
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_eq, None),
+        Some("egaliseur"),
+        "PURE ne doit pas cacher le réglage au prédicat : c'est lui qui décide si PURE a un effet"
+    );
+
+    // Correction de pièce — la clé seule ne suffit pas, le fichier doit exister.
+    let zone_ir = zr.create("IR", Some("dlna"), Some("dlna:ir")).unwrap();
+    settings
+        .set(&format!("ir_path_{zone_ir}"), "/nulle/part/ir.wav")
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_ir, None),
+        None,
+        "un fichier absent ne sera pas convolué : rien ne change"
+    );
+    let ir = tempfile::Builder::new().suffix(".wav").tempfile().unwrap();
+    settings
+        .set(&format!("ir_path_{zone_ir}"), &ir.path().to_string_lossy())
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_ir, None),
+        Some("correction_de_piece")
+    );
+
+    // Crossfeed — coché avec un dosage non nul.
+    let zone_cf = zr.create("CF", Some("dlna"), Some("dlna:cf")).unwrap();
+    settings
+        .set(
+            &format!("zone_{zone_cf}_crossfeed"),
+            r#"{"enabled":true,"amount":0.0}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_cf, None),
+        None,
+        "amount nul = identité"
+    );
+    settings
+        .set(
+            &format!("zone_{zone_cf}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3}"#,
+        )
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_cf, None),
+        Some("crossfeed")
+    );
+
+    // ReplayGain — un gain tagué sur la piste ET le mode armé.
+    let zone_rg = zr.create("RG", Some("dlna"), Some("dlna:rg")).unwrap();
+    let mut piste = crate::db::models::Track::new("Piste".into());
+    piste.format = Some("flac".into());
+    let tid = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone())
+        .create(&piste)
+        .unwrap();
+    crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(orch.db.clone())
+        .set(tid, "rg_track_gain", "-6.00 dB")
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_rg, Some(tid)),
+        None,
+        "mode ReplayGain éteint : le gain tagué n'est pas appliqué"
+    );
+    settings
+        .set(crate::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_rg, Some(tid)),
+        Some("replaygain")
+    );
+    assert_eq!(
+        orch.traitement_que_pure_gouverne(zone_rg, None),
+        None,
+        "sans piste identifiée (radio), aucun gain ne s'applique"
     );
 }
 

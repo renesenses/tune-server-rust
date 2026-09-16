@@ -426,9 +426,23 @@ impl PlaybackOrchestrator {
     ///   remplacer ; seul un redémarrage du flux le re-rend, et c'est
     ///   exactement ce que [`Self::schedule_eq_replay`] sait faire — même
     ///   anti-rebond, même plancher, parce que c'est le même coût (environ une
-    ///   seconde de silence) et le même geste répétable.
+    ///   seconde de silence ; 1,8 à 2,4 s mesurés sur un Marantz ND8006,
+    ///   #4004) et le même geste répétable.
     ///
-    /// Rend `true` quand la bascule a atteint le son **immédiatement**. Un
+    /// **Sauf quand la bascule ne change rien au signal** (#4004). Sur un flux
+    /// transcodé, PURE n'agit qu'en éteignant l'égaliseur, la correction de
+    /// pièce, le crossfeed et le ReplayGain — voir
+    /// [`Self::traitement_que_pure_gouverne`]. Si aucun des quatre n'est
+    /// configuré sur la zone, la résolution « avant » et la résolution
+    /// « après » produisent les mêmes octets : le flux qui joue est déjà
+    /// celui que le nouvel état produirait. Le refabriquer ne re-rendait rien,
+    /// il coupait le son — quatre fois de suite chez Jean Valjean, sans un
+    /// seul traitement armé. Ici on garde le flux, on annonce `zone.updated`
+    /// pour que le panneau relise le chemin du signal, et on rend `true` : le
+    /// son EST déjà conforme à la bascule, immédiatement.
+    ///
+    /// Rend `true` quand la bascule a atteint le son **immédiatement** — par
+    /// le chemin local, ou parce qu'il n'y avait rien à changer. Un
     /// redémarrage programmé rend `false` : il n'a pas encore eu lieu.
     pub async fn apply_audiophile_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
         if self.refresh_zone_pure_dsp(zone_id).await {
@@ -436,11 +450,30 @@ impl PlaybackOrchestrator {
         }
         // Pas de chemin local vivant. Le redémarrage n'a de sens que si quelque
         // chose joue : sinon la prochaine lecture appliquera l'état toute seule.
-        let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
-        if joue {
-            self.schedule_eq_replay(zone_id);
+        let Some(np) = self.playback.get_state(zone_id).await.now_playing else {
+            return false;
+        };
+        let pure = self.zone_audiophile(zone_id);
+        match self.traitement_que_pure_gouverne(zone_id, np.track_id) {
+            Some(traitement) => {
+                info!(
+                    zone_id,
+                    pure, traitement, "pure_bascule_change_le_signal_flux_refabrique"
+                );
+                self.schedule_eq_replay(zone_id);
+                false
+            }
+            None => {
+                info!(
+                    zone_id,
+                    pure, "pure_bascule_sans_effet_sur_le_signal_flux_conserve"
+                );
+                if let Some(ref bus) = self.event_bus {
+                    bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                }
+                true
+            }
         }
-        false
     }
 
     pub(super) fn record_listen(

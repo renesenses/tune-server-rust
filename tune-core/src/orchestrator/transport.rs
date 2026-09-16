@@ -1825,12 +1825,8 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return false;
         }
-        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
-            .get(&format!("ir_path_{zone_id}"))
-            .ok()
-            .flatten()
-            .map(|p| !p.is_empty() && std::path::Path::new(&p).exists())
-            .unwrap_or(false)
+        self.chemin_ir_configure(zone_id)
+            .is_some_and(|p| std::path::Path::new(&p).exists())
     }
 
     /// Durée de la rampe anti-« ploc » à la pause, à la reprise et à l'arrêt
