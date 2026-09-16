@@ -1806,10 +1806,44 @@ impl PlaybackOrchestrator {
                 );
                 return;
             };
-            match output.lock().await.checked_seek(position_ms).await {
+            let sortie = output.lock().await;
+            match sortie.checked_seek(position_ms).await {
                 Ok(()) => {
                     info!(zone_id, position_ms, motif, "seek_apres_reprise_envoye");
                     playback.seek(zone_id, position_ms as i64).await;
+                    // Fabien, fil 1780 (Devialet, renderer Rygel, 16/09/2026) :
+                    // « je perds le contrôle de la lecture, impossible de faire
+                    // pause ». Son journal montre deux `seek_apres_reprise_envoye`
+                    // à la MÊME position (80 741 ms) à 66 s d'intervalle : le
+                    // seek partait, et la position ne bougeait plus. Un Seek
+                    // reçu alors que le renderer est encore en
+                    // `PAUSED_PLAYBACK` — le Play envoyé 700 ms plus tôt n'a
+                    // pas encore pris — le laisse en pause : c'est le contrat
+                    // UPnP, pas un défaut du Devialet. Tune, lui, se croyait en
+                    // lecture, et chaque clic rejouait la même séquence.
+                    //
+                    // On relit donc l'état APRÈS le seek, et s'il est resté en
+                    // pause, on renvoie Play. Un renderer qui a bien repris
+                    // rend Playing et n'entend rien de plus.
+                    if let Ok(statut) = sortie.get_status().await
+                        && statut.state == crate::outputs::TransportState::Paused
+                    {
+                        match sortie.checked_resume().await {
+                            Ok(()) => info!(
+                                zone_id,
+                                position_ms,
+                                motif,
+                                "seek_apres_reprise_relance_play_renderer_reste_en_pause"
+                            ),
+                            Err(e) => warn!(
+                                zone_id,
+                                position_ms,
+                                motif,
+                                error = %e,
+                                "seek_apres_reprise_relance_play_echouee"
+                            ),
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!(zone_id, position_ms, motif, error = %e, "seek_apres_reprise_echoue")

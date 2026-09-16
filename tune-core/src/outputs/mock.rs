@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
@@ -37,6 +37,12 @@ pub struct MockOutput {
     /// C'est pourtant exactement la question du mode bit-perfect, où le défaut
     /// était de RENVOYER 100 % à chaque piste à un appareil déjà à 100 %.
     volume_calls: Arc<Mutex<Vec<f64>>>,
+    /// Le comportement du Devialet (renderer Rygel, fil 1780) : un Seek reçu
+    /// en pause laisse l'appareil EN PAUSE — contrat UPnP. Armé, `seek`
+    /// repasse l'état à `Paused`.
+    seek_laisse_en_pause: Arc<AtomicBool>,
+    /// Chaque `resume` reçu, pour compter les relances.
+    resume_calls: Arc<AtomicU64>,
 }
 
 impl MockOutput {
@@ -57,6 +63,8 @@ impl MockOutput {
             stop_calls: Arc::new(AtomicU64::new(0)),
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
             volume_calls: Arc::new(Mutex::new(Vec::new())),
+            seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
+            resume_calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -84,6 +92,16 @@ impl MockOutput {
 
     pub fn set_duration(&self, ms: u64) {
         self.duration_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Reproduit un renderer qui reste en pause après un Seek (Devialet).
+    pub fn with_seek_qui_laisse_en_pause(self) -> Self {
+        self.seek_laisse_en_pause.store(true, Ordering::Relaxed);
+        self
+    }
+
+    pub fn resume_call_count(&self) -> u64 {
+        self.resume_calls.load(Ordering::Relaxed)
     }
 
     pub async fn play_call_count(&self) -> usize {
@@ -230,6 +248,7 @@ impl OutputTarget for MockOutput {
     }
 
     async fn resume(&self) -> Result<(), String> {
+        self.resume_calls.fetch_add(1, Ordering::Relaxed);
         *self.state.lock().await = TransportState::Playing;
         Ok(())
     }
@@ -243,6 +262,9 @@ impl OutputTarget for MockOutput {
 
     async fn seek(&self, position_ms: u64) -> Result<(), String> {
         self.position_ms.store(position_ms, Ordering::Relaxed);
+        if self.seek_laisse_en_pause.load(Ordering::Relaxed) {
+            *self.state.lock().await = TransportState::Paused;
+        }
         Ok(())
     }
 
