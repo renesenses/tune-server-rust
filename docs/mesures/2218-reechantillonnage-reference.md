@@ -25,6 +25,12 @@ Relevé du 12/09/2026 sur `origin/batch/bugs-12` à `49ecf1fe`, rubato 3.0.0.
 > Shrek. Les relevés des 12/13 septembre ci-dessous restent historiques ;
 > le nouveau relevé et le coût sont dans « Correctif du 15/09 — D3 ».
 
+> **Mise à jour du 16/09/2026 — garde du noyau 1 024 (#4080).** La garde des
+> 8 × 7 couples tourne bien en CI (preuve par le journal d'un run), deux
+> témoins **mesurés** sur 352,8 et 384 → 44,1 kHz s'ajoutent au banc
+> (**85/85**), et le coût du barreau 1 024 est chiffré sur Shrek — x86_64,
+> pas Raspberry Pi. Voir « Garde du noyau 1 024 (#4080) » en fin de document.
+
 ## Pourquoi une référence
 
 Le bilan du 12/09 : « le rééchantillonnage n'a aucune référence externe ; il
@@ -776,3 +782,146 @@ tests unitaires du rééchantillonneur, Clippy correctness et formatage réussis
 La résolution Cargo depuis un petit consommateur extérieur au workspace
 sélectionne bien la copie Rubato de ce dépôt (métadonnées vérifiées ;
 ce contrôle ne vaut pas compilation séparée du consommateur).
+
+## Garde du noyau 1 024 (#4080) — 16/09
+
+Bertrand / Claude Code / claude-ab67-20260916 / b14-4080. Base
+`origin/batch/bugs-14` à `3a2b710a`. Mesures sur Shrek.
+
+Le correctif #4027 a ajouté le barreau **1 024** au barème pour deux couples
+seulement, 352,8 et 384 → 44,1 kHz (le PCM de DSD256, ou du 384 kHz, servi à
+une zone à la cadence du CD), qui rendaient 19 698 et 19 526 Hz à 512. Cette
+section répond aux deux points ouverts par #4080 : la garde tourne-t-elle
+vraiment en CI, et que coûte ce barreau.
+
+### La garde des 8 × 7 couples tourne en CI — preuve par le journal
+
+La garde est `le_choix_du_noyau_suit_la_cadence_la_plus_basse`, un test
+**unitaire** de `tune-core/src/audio/resample.rs` (module `#[cfg(test)] mod
+tests`, aucune `feature` requise ; `audio::resample` est déclaré sans `cfg`
+dans `tune-core/src/audio/mod.rs`). Le banc T10 est la cible `[[test]]`
+`reechantillonnage_reference_2218` de `tune-core/Cargo.toml`, **sans
+`required-features`** — indispensable puisque `tune-core` porte
+`autotests = false`.
+
+Les deux sont exécutés par le job `Test` de `ci.yml` — job `test`, condition
+`needs.impact.outputs.rust == 'true'` seulement, **pas** `full` — dont la ligne
+est `cargo test --no-fail-fast -p tune-core … --no-default-features --features
+oaat,cloud-relay,bandcamp`. Ni la garde ni le banc ne dépendent de
+`local-audio`, absente de cette ligne.
+
+Preuve exécutée, pas déduite : run CI **35094052996** (PR
+`feat/4201-upnp-sync-codex`, 16/09/2026), job `Test` (**104787011751**), journal
+relu ligne à ligne :
+
+| ligne du journal | ce qu'elle dit |
+|---|---|
+| 1537 | `test audio::resample::tests::le_choix_du_noyau_suit_la_cadence_la_plus_basse ... ok` |
+| 5402 | unitaires de `tune-core` : `4553 passed; 0 failed; 4 ignored` |
+| 5750 | `Running tests/reechantillonnage_reference_2218.rs` |
+| 5837 | banc T10 : `83 passed; 0 failed; 0 ignored`, 25,9 s |
+
+Deux gardes de `tune-server/tests/workflows_bornes.rs` empêchent déjà que
+`-p tune-core` disparaisse de cette ligne
+(`tout_membre_du_workspace_est_execute_par_une_porte_cargo_test`, second
+verdict) ; `tune-core/tests/tests_orphelins.rs` empêche qu'un fichier de
+`tests/` perde sa cible `[[test]]`.
+
+### Deux témoins MESURÉS de plus (85/85)
+
+La garde unitaire exerce les 56 couples contre le **modèle**
+`bande_a_moins_0_1_db` (coupure × Nyquist bas − 2,82 · from / N), pas contre le
+filtre : quelqu'un qui retoucherait le barème **et** la constante 2,82 la
+laisserait verte. Aucun des sept rapports du banc ne mesurait ces deux couples.
+Deux témoins s'ajoutent, `audiophile_bande_20k_352_8_vers_44_1` et
+`audiophile_bande_20k_384_vers_44_1`, avec la même instrumentation que les sept
+rapports (impulsion → bande à −0,1 dB, sinus 20 kHz → gain) mais **sans la
+référence sinc** : ses 1 025 coefficients sont posés à la cadence d'entrée, et
+à 352,8 kHz sa transition (≈ 3 kHz) dépasserait les 2 050 Hz qui séparent
+20 kHz de Nyquist bas. Une bande et un gain ne demandent pas de référence.
+
+| rapport | noyau | bande −0,1 dB mesurée | modèle | gain 20 kHz | ondulation |
+|---|---:|---:|---:|---:|---:|
+| 352,8 → 44,1 kHz (PCM de DSD256) | 1 024 | **20 900 Hz** | 20 873 Hz | 0,000 dB | 0,0000 dB |
+| 384 → 44,1 kHz | 1 024 | **20 800 Hz** | 20 786 Hz | 0,000 dB | 0,0001 dB |
+
+Le modèle prédit la mesure à moins de 30 Hz, comme sur les sept autres. Les
+deux témoins tiennent en 1,8 s (debug) ; le banc passe de 83 à **85** tests.
+
+### Contre-épreuve
+
+Barreau précédent forcé pour 384 → 44,1 kHz dans `parametres_sinc` (deux
+lignes temporaires, `sinc_len = 512` pour ce seul couple), rsync + touch,
+puis :
+
+- `cargo test -p tune-core --no-default-features --features oaat,cloud-relay --lib -- le_choix_du_noyau_suit_la_cadence_la_plus_basse`
+  → **FAILED**, `resample.rs:647` :
+  `384000 → 44100 : noyau 512, bande à −0,1 dB = 19526 Hz — Tune promet 20 kHz`
+- `cargo test -p tune-core … --test reechantillonnage_reference_2218 -- audiophile_bande_20k_352_8_vers_44_1 audiophile_bande_20k_384_vers_44_1`
+  → **1 passed, 1 failed** : `384 → 44,1 kHz : noyau 512 coefficients, bande à
+  −0,1 dB MESURÉE = 19550 Hz, gain à 20 kHz = -0.39 dB ; Tune promet 20 kHz à
+  −0,1 dB …` — et 352,8 → 44,1, non saboté, reste vert : le témoin nomme le
+  bon couple.
+
+Restauration par `cp` depuis la sauvegarde, rsync + touch : vert.
+
+### Coût du barreau 1 024 — sur Shrek, x86_64, PAS sur Raspberry Pi
+
+**Machine** : Shrek, Intel Xeon E5-2630 v4 @ 2,20 GHz (Broadwell, 10 cœurs /
+20 fils par socket, 40 fils vus), **en régime partagé** : charge moyenne 80 à
+90 pendant les mesures, fréquence à 79 % du maximum. Un seul fil par mesure.
+**Ce n'est pas un Raspberry Pi** : le coût absolu ci-dessous ne s'y transpose
+pas ; seuls les **rapports** entre lignes (même boucle, même machine, même
+minute) ont un sens portable.
+
+**Protocole** (même que « Coût CPU et latence » du 13/09) : 5 minutes de
+stéréo, blocs de 1 024 trames, chemin du producteur `rubato_resample_chunk`
+puis `flush`, binaire `--release` (`opt-level=2`, LTO thin), génération du
+signal **exclue** du chronomètre (une seconde de sinus pré-calculée et
+rejouée), `/usr/bin/time` sur le processus entier. « prod » = le noyau que
+`parametres_sinc` choisit ; « 512 forcé » = mêmes paramètres (Blackman²,
+256 phases, interpolation linéaire) avec `sinc_len = 512`. Deux passages ;
+les deux sont donnés, l'écart entre eux (≤ 6 %) est le bruit de Shrek.
+
+| rapport | noyau | passage 1 | passage 2 | × temps réel | % d'un cœur | RSS max |
+|---|---:|---:|---:|---:|---:|---:|
+| 352,8 → 44,1 | **1 024 (prod)** | 7,66 s | 8,17 s | 37–39 × | **2,6–2,7 %** | 6,3 Mo |
+| 352,8 → 44,1 | 512 forcé | 4,76 s | 4,94 s | 61–63 × | 1,6–1,7 % | 5,8 Mo |
+| 384 → 44,1 | **1 024 (prod)** | 9,75 s | 9,47 s | 31–32 × | **3,2–3,3 %** | 6,6 Mo |
+| 384 → 44,1 | 512 forcé | 5,76 s | 5,74 s | 52 × | 1,9 % | 5,8 Mo |
+| 44,1 → 48 | 256 (prod) | 3,87 s | 3,74 s | 78–80 × | 1,2–1,3 % | 3,2 Mo |
+| 192 → 44,1 | 512 (prod) | 5,67 s | 5,70 s | 53 × | 1,9 % | 4,5 Mo |
+
+`user` = `elapsed` à 0,05 s près, `sys` = 0 : c'est du calcul pur, un fil.
+
+Lecture :
+
+* Le barreau 1 024 coûte **× 1,61 à 1,69** par rapport à 512 sur les deux
+  couples qu'il sert (7,9 s contre 4,9 s ; 9,6 s contre 5,7 s pour 5 minutes).
+  Pas × 2, parce qu'une part du coût (lecture des 352 800 trames d'entrée par
+  seconde, blocs, copies) ne dépend pas de la longueur du noyau.
+* Dans l'absolu, sur ce Xeon : **2,6 à 3,3 % d'un cœur par zone**, 31 à 39 ×
+  le temps réel. C'est le couple le plus cher de tout le barème — 2,5 × le
+  coût de 44,1 → 48 — et il ne concerne qu'une source DSD256 ou 384 kHz jouée
+  sur une zone à 44,1 kHz.
+* Le délai annoncé (`output_delay`) passe de 32 à **64 trames** (1,45 ms à
+  44,1 kHz) pour 352,8 → 44,1 et de 29 à **58 trames** (1,32 ms) pour
+  384 → 44,1.
+* La ligne 44,1 → 48 donne ici 3,7–3,9 s contre 2,07–2,15 s dans les tableaux
+  du 13 et du 15/09 : Shrek était nettement plus chargé (charge 80–90). Ne
+  comparer que les lignes d'un même tableau.
+
+**Ce qui n'est pas mesuré** : le coût sur ARM. Un Raspberry Pi 4 ou 5 n'a ni
+l'AVX2 ni la fréquence de ce Xeon ; le rapport × 1,6–1,7 entre 1 024 et 512
+devrait s'y retrouver (même boucle), mais le pourcentage d'un cœur, non.
+Pour le mesurer : compiler `tune-core` en `--release` sur le Pi (ou en
+croisé depuis Shrek, cible `aarch64-unknown-linux-gnu`), reprendre la recette
+ci-dessus (5 min de stéréo, `rubato_resample_chunk` par blocs de 1 024,
+`/usr/bin/time`) pour 352,8 → 44,1 en « prod » et en 512 forcé, et lire
+`user`. Tant que ce n'est pas fait, la seule borne connue est celle-ci : si
+le Pi est *k* fois plus lent que ce Xeon sur cette boucle, 352,8 → 44,1 lui
+coûte 2,7 · *k* % d'un cœur par zone.
+
+Journaux : `/tmp/b14-4080-build-cout.log` sur Shrek ; les deux passages
+dans le scratchpad de la session (`b14-4080/cout-noyau-shrek-run{1,2}.log`)
+et recopiés dans la PR.
