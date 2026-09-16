@@ -620,8 +620,9 @@ mod tests {
 
     #[test]
     fn le_zip_s_ouvre_dans_son_dossier_et_refuse_de_remonter() {
-        let tmp = std::env::temp_dir().join(format!("tune-bc-zip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        // #3030 : un dossier nettoyé par `Drop`, même quand le test échoue.
+        let scratch = tune_core::test_scratch::scratch_dir("tune_bc_zip");
+        let tmp = scratch.path().join("achat");
         std::fs::create_dir_all(&tmp).unwrap();
         let chemin = tmp.join("a.zip");
         {
@@ -640,7 +641,6 @@ mod tests {
         let n = dezipper(&chemin, &tmp).unwrap();
         assert_eq!(n, 2);
         assert!(tmp.join("01 - Un.flac").exists());
-        assert!(!tmp.parent().unwrap().join("evasion.txt").exists());
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!scratch.path().join("evasion.txt").exists());
     }
 }

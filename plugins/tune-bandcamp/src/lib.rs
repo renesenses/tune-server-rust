@@ -2068,7 +2068,8 @@ mod tests {
         // (accolades dépareillées dans un motif de chemin) panique à la
         // construction, pas à la compilation.
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
-        let _ = router(std::sync::Arc::new(db), std::env::temp_dir());
+        let scratch = tune_core::test_scratch::scratch_dir("tune_bc_router");
+        let _ = router(std::sync::Arc::new(db), scratch.path().to_path_buf());
     }
 
     /// Fragment de page RÉEL, réduit : l'attribut tel que Bandcamp l'émet,
