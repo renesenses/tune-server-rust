@@ -898,6 +898,139 @@ pub fn dlna_frozen_at_end_wall_clock(
         && wall_elapsed_secs.saturating_mul(1000) >= track_duration_ms.saturating_add(END_MARGIN_MS)
 }
 
+// ─────────────── fin à l'horloge : le renderer a-t-il déjà enchaîné ? ───────────────
+//
+// #4173 — Villerio, Eversolo DMP-A6 1.6.01, *The Dark Side of the Moon*, 14/09.
+//
+// Ce que le journal établit : `dlna_set_next` acquitté à 19:16:47, le
+// renderer TIRE le flux armé dès 19:16:50 (`stream_request … range="bytes=0-"`,
+// agent Lavf), et à 19:17:23 la fin de piste est prononcée à l'horloge
+// (`dlna_frozen_end=true`). L'avance passait alors par `handle_track_end` →
+// `play_from_queue` : `stream_session_removed` sur le flux que le renderer
+// tenait encore (34 s de connexion, 15,9 Mo), session NEUVE pour la même
+// piste, `SetAVTransportURI` + `Play`. Sept secondes huit de blanc, dont le
+// préchargement du renderer jeté.
+//
+// La fin à l'horloge ne dit qu'une chose : la piste précédente est finie.
+// Elle ne dit PAS que le renderer n'a pas enchaîné — `dlna_frozen_at_end_wall_clock`
+// a été écrit pour un appareil qui gèle sa position à la durée, et une position
+// gelée est muette sur ce qui joue. Avant de relancer, on regarde donc ce que
+// le renderer dit LUI-MÊME de ce qu'il joue, puis ce que le serveur de flux a
+// vu. Les trois verdicts, du plus sûr au moins sûr :
+//
+// - l'URI courante rapportée par le renderer porte le flux armé → il a
+//   enchaîné, on ADOPTE (même avance que `gapless_transition_detected`) ;
+// - l'URI courante porte encore le flux de la piste finie → il n'a PAS
+//   enchaîné, le repli `SetAVTransportURI` + `Play` reste de mise ;
+// - pas d'URI exploitable (beaucoup de renderers ne rapportent pas
+//   `TrackURI`) : le flux armé a été TIRÉ (octets servis > 0) → on adopte,
+//   à titre PROVISOIRE (voir `suite_de_l_adoption`) ; rien tiré → repli.
+
+/// Ce qu'on sait de l'enchaînement au moment où la fin est prononcée à
+/// l'horloge (#4173).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnchainementArme {
+    /// L'URI courante du renderer porte le flux armé.
+    Certain,
+    /// Le renderer ne dit pas quelle URI il joue, mais il a tiré le flux armé.
+    Probable,
+    /// Rien n'atteste l'enchaînement : le repli reste de mise.
+    Aucun,
+}
+
+/// Décide si la fin prononcée à l'horloge doit ADOPTER l'enchaînement du
+/// renderer plutôt que le relancer (#4173).
+///
+/// - `flux_arme` : l'identifiant de session rangé sous la zone à l'armement
+///   (`PlaybackOrchestrator::flux_pre_arme`) ; `None` = rien d'armé par flux ;
+/// - `current_uri` : ce que le renderer rapporte jouer (`TrackURI`) ;
+/// - `octets_tires` : octets servis sur le flux armé, `None` si la session
+///   n'existe plus.
+///
+/// Un renderer qui nomme encore le flux de la piste FINIE est cru sur
+/// parole : c'est le cas du 25/08 (« SetNext acquitté jamais honoré ») et le
+/// repli est la bonne réponse. Une URI qui ne nomme aucun des deux flux ne
+/// prouve rien non plus. Seule l'ABSENCE d'URI laisse les octets parler.
+pub fn enchainement_sur_le_flux_arme(
+    is_dlna: bool,
+    gapless_sent: bool,
+    flux_arme: Option<&str>,
+    current_uri: Option<&str>,
+    octets_tires: Option<u64>,
+) -> EnchainementArme {
+    if !is_dlna || !gapless_sent {
+        return EnchainementArme::Aucun;
+    }
+    let Some(arme) = flux_arme.filter(|s| !s.is_empty()) else {
+        return EnchainementArme::Aucun;
+    };
+    if let Some(uri) = current_uri.map(str::trim).filter(|u| !u.is_empty()) {
+        if uri.contains(arme) {
+            return EnchainementArme::Certain;
+        }
+        // Le flux de la piste finie, ou une URI qui n'est à personne : le
+        // renderer ne joue pas ce qu'on lui a armé.
+        return EnchainementArme::Aucun;
+    }
+    if octets_tires.is_some_and(|o| o > 0) {
+        EnchainementArme::Probable
+    } else {
+        EnchainementArme::Aucun
+    }
+}
+
+/// Ce que devient une adoption prononcée à l'horloge, tick après tick (#4173).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuiteAdoption {
+    /// Le renderer a donné signe de vie sur la nouvelle piste : l'adoption
+    /// est acquise, la surveillance cesse.
+    Confirmee,
+    /// Ni signe de vie ni délai écoulé : on attend encore.
+    EnAttente,
+    /// Le délai raisonnable est écoulé sans signe de vie : le renderer n'a
+    /// pas enchaîné, on relance la piste adoptée (`SetAVTransportURI` +
+    /// `Play`) — le repli, sur la BONNE piste.
+    Infirmee,
+}
+
+/// Position en deçà de laquelle un écart avec la position gelée ne compte
+/// pas comme un mouvement : un renderer qui gèle « exactement à la durée »
+/// peut trembler de quelques millisecondes.
+const MOUVEMENT_MINIMAL_MS: u64 = 1000;
+
+/// Surveille une adoption prononcée à l'horloge (#4173).
+///
+/// Signe de vie = l'URI courante porte désormais le flux adopté, ou la
+/// position a QUITTÉ la valeur sur laquelle elle était gelée (une nouvelle
+/// piste repart de zéro ; n'importe quel mouvement d'au moins une seconde
+/// suffit). Les octets tirés ne valent PAS confirmation : un renderer qui
+/// télécharge n'est pas un renderer qui joue.
+///
+/// Sans signe de vie pendant `delai_secs`, l'adoption est infirmée : le
+/// repli reprend, sur la piste adoptée et non sur la suivante — sans cette
+/// surveillance, une position gelée à l'ancienne durée finirait par passer
+/// pour la fin de la piste adoptée et la file sauterait un titre.
+pub fn suite_de_l_adoption(
+    position_ms: u64,
+    position_figee_ms: u64,
+    current_uri: Option<&str>,
+    flux_adopte: &str,
+    age_secs: u64,
+    delai_secs: u64,
+) -> SuiteAdoption {
+    let uri_confirme = !flux_adopte.is_empty()
+        && current_uri
+            .map(str::trim)
+            .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
+    if uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS {
+        SuiteAdoption::Confirmee
+    } else if age_secs >= delai_secs {
+        SuiteAdoption::Infirmee
+    } else {
+        SuiteAdoption::EnAttente
+    }
+}
+
 /// Wall-clock end-of-track for a DLNA renderer whose status poll is FAILING
 /// outright — the LMS UPnP bridge's `GetPositionInfo` SOAP call errors, so
 /// `get_status` returns `Err` and Tune gets NO transport state, position, or

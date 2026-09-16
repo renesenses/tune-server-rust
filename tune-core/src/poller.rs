@@ -248,6 +248,13 @@ const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 /// the output time to drain its buffer and report Stopped naturally.
 /// If it doesn't, this threshold forces the advance.
 const POSITION_PAST_END_TICKS: u8 = 3;
+/// Délai raisonnable (s) laissé au renderer, après une avance à l'horloge qui
+/// a ADOPTÉ son enchaînement (#4173), pour donner signe de vie sur la piste
+/// adoptée : position qui bouge, ou URI courante qui la nomme. Passé ce délai
+/// sans rien, l'adoption est infirmée et la piste adoptée est relancée par
+/// `SetAVTransportURI` + `Play` — le repli d'avant, sur la bonne piste. Voir
+/// [`decisions::suite_de_l_adoption`].
+const ADOPTION_HORLOGE_DELAI_SECS: u64 = 8;
 /// Minimum consecutive failed status polls before the DLNA wall-clock poll-fail
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.
@@ -1085,3 +1092,12 @@ mod position_de_la_piste_precedente_954;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+
+/// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
+/// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position
+/// gelée à la durée) au lieu de jeter le flux qu'il tient et de repartir en
+/// `SetAVTransportURI` + `Play`. Le banc monte le vrai `tick` avec un renderer
+/// factice et prouve les deux issues : adoption sans aucun `Play`, et repli
+/// inchangé quand rien n'atteste l'enchaînement.
+#[cfg(test)]
+mod adoption_a_l_horloge_4173;
