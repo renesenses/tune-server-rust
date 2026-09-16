@@ -45,22 +45,82 @@ pub(crate) fn is_various_artists(s: &str) -> bool {
 /// bascule l'album entier en compilation (#3232). Le filtrage se fait chez
 /// l'appelant, [`TrackImporter::begin_batch`].
 pub(crate) fn decide_compilation_albums<'a>(
-    items: impl Iterator<Item = (String, &'a str, Option<&'a str>, bool)>,
-) -> HashMap<(String, String), bool> {
-    let mut acc: HashMap<(String, String), (bool, HashSet<String>)> = HashMap::new();
-    for (dir, album, album_artist, comp_flag) in items {
-        let entry = acc.entry((dir, album.to_lowercase())).or_default();
+    items: impl Iterator<Item = (String, &'a str, Option<&'a str>, Option<bool>)>,
+) -> HashMap<(String, String), VerdictAlbum> {
+    // Par album : (un tag dit VRAI, un tag dit FAUX, un artiste « Various
+    // Artists », les graphies d'artiste d'album rencontrées).
+    let mut acc: HashMap<(String, String), (bool, bool, bool, HashSet<String>)> = HashMap::new();
+    for (dir, album, album_artist, tag) in items {
+        let e = acc.entry((dir, album.to_lowercase())).or_default();
+        match tag {
+            Some(true) => e.0 = true,
+            Some(false) => e.1 = true,
+            None => {}
+        }
         let aa = album_artist.map(|s| s.trim()).filter(|s| !s.is_empty());
-        if comp_flag || aa.map(is_various_artists).unwrap_or(false) {
-            entry.0 = true;
+        if aa.map(is_various_artists).unwrap_or(false) {
+            e.2 = true;
         }
         if let Some(aa) = aa {
-            entry.1.insert(aa.to_lowercase());
+            e.3.insert(aa.to_lowercase());
         }
     }
     acc.into_iter()
-        .map(|(k, (flag, artists))| (k, flag || artists.len() >= 2))
+        .map(|(k, (vrai, faux, va, artistes))| {
+            // Un dossier où deux fichiers se contredisent : le VRAI l'emporte.
+            // Le drapeau ne se baisse jamais (voir `mark_compilation`), et un
+            // album à demi étiqueté reste une compilation.
+            let tag = match (vrai, faux) {
+                (true, _) => Some(true),
+                (false, true) => Some(false),
+                (false, false) => None,
+            };
+            (
+                k,
+                VerdictAlbum {
+                    tag,
+                    forme: va || artistes.len() >= 2,
+                },
+            )
+        })
         .collect()
+}
+
+/// Ce que l'on sait d'un `(dossier, album)` quant à la compilation — les deux
+/// sources séparées, et non déjà fondues en un `bool`.
+///
+/// 🔴 Les fondre était le défaut : le tag et la forme entraient tous deux dans
+/// un même « ou », d'où le tag ne pouvait plus qu'ALLUMER le drapeau. C1
+/// demande l'inverse — que le tag puisse aussi l'ÉTEINDRE.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct VerdictAlbum {
+    /// Ce que les FICHIERS déclarent, en trois états. Fait foi (C1).
+    pub tag: Option<bool>,
+    /// Ce que la forme donne à DÉDUIRE : un artiste d'album « Various
+    /// Artists », ou deux artistes d'album distincts sous un même titre.
+    /// N'intervient que si `tag` est `None`.
+    pub forme: bool,
+}
+
+/// Qui a tranché, du tag ou de la forme des dossiers — ce que le journal nomme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MotifCompilation {
+    /// Les pistes portent le tag (`TCMP`, `COMPILATION` ou `cpil`). Il fait foi.
+    Tag,
+    /// Aucun tag : les dossiers sont éclatés, ou l'album porte deux artistes.
+    FormeDesDossiers,
+    /// Ni tag ni forme — ce n'est pas une compilation.
+    Aucun,
+}
+
+impl MotifCompilation {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Tag => "tag",
+            Self::FormeDesDossiers => "forme_des_dossiers",
+            Self::Aucun => "aucun",
+        }
+    }
 }
 
 /// Per-FOLDER compilation decision, complementing [`decide_compilation_albums`]
@@ -123,9 +183,10 @@ pub(crate) fn decide_compilation_folders<'a>(
 /// avec les pochettes d'un seul lot.
 #[derive(Default)]
 pub(crate) struct PreuvesDuDossier {
-    /// `(titre d'album, artiste d'album, drapeau compilation)` — ce que
-    /// [`decide_compilation_albums`] consomme.
-    par_album: HashSet<(String, Option<String>, bool)>,
+    /// `(titre d'album, artiste d'album, TAG compilation en trois états)` —
+    /// ce que [`decide_compilation_albums`] consomme. `None` = le fichier ne
+    /// dit rien, et c'est alors, et alors seulement, que la forme tranche.
+    par_album: HashSet<(String, Option<String>, Option<bool>)>,
     /// `(artiste, titre d'album)` — ce que [`decide_compilation_folders`]
     /// consomme. Un fichier sans balises entre en `(None, None)` : il fait
     /// savoir que le dossier existe sans y apporter d'artiste.
@@ -349,8 +410,13 @@ pub struct TrackImporter {
     /// Lignes album déjà reprises sous « Various Artists » pendant ce scan
     /// (#3232) : la reprise se fait UNE fois, pas à chaque piste du dossier.
     albums_reclasses: HashSet<i64>,
-    /// `(folder, album)` → is-compilation decision, dérivée de `preuves`.
-    comp_decision: HashMap<(String, String), bool>,
+    /// `(dossier, album)` dont la décision « compilation » a déjà été
+    /// journalisée pendant ce scan. Sans cette marque, un album de 63 CD
+    /// écrirait la même ligne huit cents fois.
+    decisions_journalisees: HashSet<(String, String)>,
+    /// `(folder, album)` → ce que l'on sait de cet album, tag et forme
+    /// SÉPARÉS (voir [`VerdictAlbum`]), dérivé de `preuves`.
+    comp_decision: HashMap<(String, String), VerdictAlbum>,
     /// Per-batch FOLDER → (various-artists, use-folder-name-as-title). Catches a
     /// hand-made compilation folder whose tracks span multiple album tags AND
     /// artists — which the `(folder, album)` decision above misses because mixed
@@ -409,6 +475,7 @@ impl TrackImporter {
             dir_album_artist: HashMap::new(),
             preuves,
             albums_reclasses: HashSet::new(),
+            decisions_journalisees: HashSet::new(),
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
             folder_tagged_artist: HashMap::new(),
@@ -508,7 +575,12 @@ impl TrackImporter {
             p.par_album.insert((
                 album.clone(),
                 preuve.album_artist.clone(),
-                preuve.compilation,
+                // `albums.is_compilation` est le VERDICT déjà rendu, pas le tag
+                // du fichier : la base ne garde pas ce que le fichier disait.
+                // Un drapeau levé entre donc comme `Some(true)` — le drapeau ne
+                // se baisse jamais (`mark_compilation`), et C3 interdit de
+                // réparer l'existant. Un drapeau baissé n'apprend rien : `None`.
+                if preuve.compilation { Some(true) } else { None },
             ));
             let artiste = preuve.album_artist.or(preuve.artiste);
             p.par_dossier.insert((artiste, Some(album)));
@@ -678,26 +750,96 @@ impl TrackImporter {
             .get(&album_dir)
             .copied()
             .unwrap_or((false, false));
-        let is_compilation = folder_va
+        // 🔴 C1 (Bertrand, 14/09/2026) — LE TAG FAIT FOI, la forme des dossiers
+        // n'est qu'un REPLI. La règle tient ici, et nulle part ailleurs.
+        //
+        // Ce que ce code faisait AVANT, et qui en était l'inverse : `folder_va`
+        // ouvrait une chaîne de `||`, et le tag n'était consulté que dans le
+        // `unwrap_or_else` — donc jamais quand l'album figurait déjà dans la
+        // décision, ce qui est le cas ordinaire. Pire, la décision elle-même
+        // fondait le tag et la forme dans un même « ou » : le tag ne pouvait
+        // ainsi qu'ALLUMER le drapeau, jamais l'éteindre. Un coffret dont les
+        // fichiers portent `COMPILATION=0` était renversé en « compilation »
+        // par deux graphies du nom de son chef d'orchestre, sans que rien ne
+        // s'y oppose ni ne le dise.
+        let verdict = meta.album.as_ref().and_then(|a| {
+            self.comp_decision
+                .get(&(album_dir.clone(), a.to_lowercase()))
+        });
+        // Le tag de CE fichier ne sert qu'en dernier recours : quand l'album
+        // n'est connu ni du scan ni de la base, il n'y a que lui.
+        let tag = verdict.and_then(|v| v.tag).or(meta.compilation);
+        let forme = verdict.map(|v| v.forme).unwrap_or(false)
+            || folder_va
             || meta
-                .album
-                .as_ref()
-                .and_then(|a| {
-                    self.comp_decision
-                        .get(&(album_dir.clone(), a.to_lowercase()))
-                        .copied()
-                })
-                .unwrap_or_else(|| {
-                    meta.compilation
-                        || meta
-                            .album_artist
-                            .as_deref()
-                            .map(is_various_artists)
-                            .unwrap_or(false)
-                });
+                .album_artist
+                .as_deref()
+                .map(is_various_artists)
+                .unwrap_or(false);
+        let (is_compilation, motif) = match tag {
+            // Le tag parle : il tranche, et dans les DEUX sens.
+            Some(oui) => (oui, MotifCompilation::Tag),
+            // Le tag se tait : la forme reprend la main. C'est le repli de C1.
+            None if forme => (true, MotifCompilation::FormeDesDossiers),
+            None => (false, MotifCompilation::Aucun),
+        };
+
+        // Le journal dit POURQUOI cet album est une compilation. Rien ne le
+        // disait : une bibliothèque entière rangée sous « Various Artists » ne
+        // laissait aucune trace de la règle qui l'y avait mise, et les trois
+        // signalements du chantier ont dû être reconstitués à la main. Une
+        // ligne par album et par scan — pas par piste.
+        if self
+            .decisions_journalisees
+            .insert((album_dir.clone(), meta.album.clone().unwrap_or_default()))
+        {
+            tracing::info!(
+                dossier = %album_dir,
+                album = %meta.album.as_deref().unwrap_or("<sans titre>"),
+                compilation = is_compilation,
+                motif = motif.as_str(),
+                tag = ?tag,
+                forme,
+                "compilation_decidee"
+            );
+        }
 
         let album_artist_name = if is_compilation {
-            "Various Artists".to_string()
+            // 🔴 C2 (Bertrand, 14/09/2026) — l'artiste d'album TAGUÉ s'il
+            // existe, « Various Artists » seulement à défaut. Un coffret d'un
+            // seul chef d'orchestre ne part plus sous « Various Artists »
+            // contre l'étiquette de ses propres fichiers.
+            //
+            // L'artiste retenu est l'unique artiste d'album étiqueté du
+            // DOSSIER, jamais celui de la piste courante. Deux raisons, et la
+            // seconde a été payée par trois témoins rouges :
+            //
+            // 1. piste par piste, deux graphies d'un même nom feraient deux
+            //    lignes album distinctes — le défaut même que décrit #3855 ;
+            // 2. album par album, une compilation FAITE MAIN — chaque piste son
+            //    propre titre d'album et son propre artiste (JP Borderies,
+            //    #3232) — ne montre qu'UN artiste dans chaque groupe
+            //    `(dossier, album)`, puisque chaque groupe n'a qu'une piste.
+            //    C2 y aurait rendu « Aretha Franklin » pour une anthologie qui
+            //    en porte vingt. La portée qui décide est celle qui a fait la
+            //    compilation : le DOSSIER.
+            //
+            // `folder_tagged_artist` est exactement cela, et il existe déjà :
+            // l'unique artiste d'album ÉTIQUETÉ du dossier, quand il n'y en a
+            // qu'un. Deux artistes ou plus ⇒ aucun ne vaut pour tous, et la
+            // convention reprend la main.
+            // ⚠️ AUCUN repli sur `meta.album_artist` ici, et c'est la règle
+            // entière : `folder_tagged_artist` est absent PRÉCISÉMENT quand le
+            // dossier porte plusieurs artistes — le cas où aucune étiquette ne
+            // vaut pour tout l'album. Y retomber sur la balise de la piste
+            // courante rendrait à chaque piste son propre artiste, donc au
+            // coffret de #3855 ses deux lignes album, et à « Woodstock »
+            // l'artiste de sa première piste. Deux artistes ou plus ⇒ la
+            // convention, et elle seule.
+            self.folder_tagged_artist
+                .get(&album_dir)
+                .cloned()
+                .unwrap_or_else(|| "Various Artists".to_string())
         } else if let Some(aa) = meta.album_artist.as_deref() {
             aa.to_string()
         } else if meta.artist_from_path {
@@ -1311,7 +1453,7 @@ mod tests {
                 album: Some("Jazz sur Seine".into()),
                 album_artist: Some((*artiste).to_string()),
                 track_number: Some(n as u32 + 1),
-                compilation: true,
+                compilation: Some(true),
                 ..Default::default()
             });
             anthologie.push(f);

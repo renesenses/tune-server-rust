@@ -336,6 +336,8 @@ pub struct OutputStatus {
     /// wall-clock plausibility guards do not apply to it: its
     /// `ended_naturally` + `Stopped` means the track really is done, one second
     /// into a five-minute piece.
+    /// When false, position or elapsed time reaching the nominal duration
+    /// does not imply completion. The host waits for the output to finish.
     pub realtime: bool,
     /// La sortie est en train de servir du **DoP** : un train DSD emballé dans
     /// du PCM 24 bits, reconnu à son marqueur alternant dans l'octet de poids

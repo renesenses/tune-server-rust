@@ -540,9 +540,21 @@ pub struct DynamicRangeAlbum {
     /// la v0.9.145 : `dr_track` a deux producteurs, le tag du fichier et le
     /// calcul de la passe d'analyse (`audio::replaygain`). Cette étiquette dit
     /// donc d'où sort l'agrégat — le tag d'album, ou les pistes — et JAMAIS
-    /// d'où sortent les pistes. Cette seconde question se lit piste par piste,
-    /// sous `dynamic_range_source` (#3924).
+    /// d'où sortent les pistes. `provenance` décrit cette seconde question
+    /// pour les valeurs qui contribuent effectivement à l'agrégat (#3924).
     pub depuis_le_tag_album: bool,
+    /// Origine des valeurs qui contribuent réellement à cet agrégat (#3924).
+    pub provenance: DynamicRangeProvenance,
+}
+
+/// Les compteurs ne décrivent que les pistes entrant dans une moyenne.
+/// Quand un tag d'album gagne, ils sont nuls : aucune piste n'est moyennée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DynamicRangeProvenance {
+    pub source: &'static str,
+    pub tag_tracks: i64,
+    pub analysis_tracks: i64,
+    pub unknown_tracks: i64,
 }
 
 impl DynamicRangeAlbum {
@@ -2760,8 +2772,13 @@ impl AlbumRepo {
             Engine::Postgres => "$1",
         };
         let sql = format!(
-            "SELECT {}, {} FROM track_metadata tm \
+            "SELECT {}, {}, \
+             SUM(CASE WHEN tm.key = 'dr_track' AND ds.value = 'tag' THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN tm.key = 'dr_track' AND ds.value = 'analysis' THEN 1 ELSE 0 END), \
+             SUM(CASE WHEN tm.key = 'dr_track' AND (ds.value IS NULL OR ds.value NOT IN ('tag', 'analysis')) THEN 1 ELSE 0 END) \
+             FROM track_metadata tm \
              JOIN tracks tdr ON tdr.id = tm.track_id \
+             LEFT JOIN track_metadata ds ON ds.track_id = tm.track_id AND ds.key = 'dr_source' \
              WHERE tdr.album_id = {marqueur} AND {} \
              GROUP BY tdr.album_id",
             crate::db::facet_filter::DR_ALBUM_VALUE,
@@ -2778,9 +2795,33 @@ impl AlbumRepo {
         let Some(valeur) = cols.first().and_then(|v| v.as_i64()) else {
             return Ok(None);
         };
+        let depuis_le_tag_album = cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+        let count = |index: usize| cols.get(index).and_then(|v| v.as_i64()).unwrap_or(0);
+        let (tag_tracks, analysis_tracks, unknown_tracks) = if depuis_le_tag_album {
+            (0, 0, 0)
+        } else {
+            (count(2), count(3), count(4))
+        };
+        let source = if depuis_le_tag_album {
+            "tag"
+        } else if unknown_tracks > 0 {
+            "unknown"
+        } else if tag_tracks > 0 && analysis_tracks > 0 {
+            "mixed"
+        } else if analysis_tracks > 0 {
+            "analysis"
+        } else {
+            "tag"
+        };
         Ok(Some(DynamicRangeAlbum {
             valeur,
-            depuis_le_tag_album: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0) == 1,
+            depuis_le_tag_album,
+            provenance: DynamicRangeProvenance {
+                source,
+                tag_tracks,
+                analysis_tracks,
+                unknown_tracks,
+            },
         }))
     }
 

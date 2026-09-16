@@ -305,29 +305,45 @@ fn text_of(soap_xml: &str, tag: &str) -> Option<String> {
     }
 }
 
-/// `H:MM:SS[.mmm]` → millisecondes. Tolère `HH:MM:SS` et les fractions.
+/// `H:MM:SS[.fraction]` ou `MM:SS[.fraction]` → millisecondes.
+/// Les décimales au-delà de la troisième sont tronquées. Les positions et
+/// durées de Tune sont signées : refuser aussi ce qui dépasserait i64::MAX.
 pub fn parse_upnp_time(s: &str) -> Option<u64> {
+    fn entier(s: &str) -> Option<u64> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    }
+
     let s = s.trim();
-    let (hms, frac) = match s.split_once('.') {
-        Some((a, b)) => (a, b.parse::<u64>().ok().map(|_| b)),
-        None => (s, None),
+    let (hms, fraction_ms) = match s.split_once('.') {
+        Some((hms, fraction)) => {
+            if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let mut digits = fraction.bytes();
+            let mut ms = 0u64;
+            for _ in 0..3 {
+                ms = ms * 10 + digits.next().map_or(0, |b| u64::from(b - b'0'));
+            }
+            (hms, ms)
+        }
+        None => (s, 0),
     };
     let parts: Vec<&str> = hms.split(':').collect();
-    let (h, m, sec): (u64, u64, u64) = match parts.as_slice() {
-        [h, m, s] => (h.parse().ok()?, m.parse().ok()?, s.parse().ok()?),
-        [m, s] => (0, m.parse().ok()?, s.parse().ok()?),
+    let (h, m, sec) = match parts.as_slice() {
+        [h, m, s] => (entier(h)?, entier(m)?, entier(s)?),
+        [m, s] => (0, entier(m)?, entier(s)?),
         _ => return None,
     };
-    let mut ms = (h * 3600 + m * 60 + sec) * 1000;
-    if let Some(f) = frac {
-        let scaled: u64 = f.parse().unwrap_or(0);
-        ms += match f.len() {
-            1 => scaled * 100,
-            2 => scaled * 10,
-            _ => scaled.min(999),
-        };
-    }
-    Some(ms)
+    let ms = h
+        .checked_mul(3600)?
+        .checked_add(m.checked_mul(60)?)?
+        .checked_add(sec)?
+        .checked_mul(1000)?
+        .checked_add(fraction_ms)?;
+    (ms <= i64::MAX as u64).then_some(ms)
 }
 
 /// Millisecondes → `H:MM:SS` (format UPnP).
@@ -734,6 +750,89 @@ mod tests {
             parse_renderer_command(&mute_missing),
             RendererCommand::Unsupported("SetMute".into())
         );
+    }
+
+    #[test]
+    fn temps_upnp_3971_fractions_decimales_et_entrees_malformees() {
+        for (fraction, expected) in [
+            ("1", 100),
+            ("12", 120),
+            ("123", 123),
+            ("1234", 123),
+            ("0001", 0),
+            ("123456789012345678901234567890", 123),
+        ] {
+            assert_eq!(
+                parse_upnp_time(&format!("0:00:00.{fraction}")),
+                Some(expected),
+                "la fraction UPnP doit être tronquée à la milliseconde (#3971)"
+            );
+        }
+        for value in [
+            "0:00:00.",
+            "0:00:00.x",
+            "0:00:00.1.2",
+            "0:00:00.+1",
+            "+1:00:00",
+            "0:-1:00",
+            "0::00",
+            "00",
+            "0:0:0:0",
+        ] {
+            assert_eq!(
+                parse_upnp_time(value),
+                None,
+                "temps malformé accepté : {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn temps_upnp_3971_debordements_et_limite_signee() {
+        let max = i64::MAX as u64;
+        let format_ms = |ms: u64| {
+            format!(
+                "{}:{:02}:{:02}.{:03}",
+                ms / 3_600_000,
+                ms / 60_000 % 60,
+                ms / 1000 % 60,
+                ms % 1000
+            )
+        };
+        assert_eq!(parse_upnp_time(&format_ms(max)), Some(max));
+        assert_eq!(
+            parse_upnp_time(&format_ms(max + 1)),
+            None,
+            "une durée UPnP ne doit pas devenir négative en i64 (#3971)"
+        );
+        for value in [
+            "18446744073709551615:00:00",
+            "00:18446744073709551615:00",
+            "00:00:18446744073709551615",
+            "00:00:18446744073709552",
+            "00:00:18446744073709551.999",
+        ] {
+            assert_eq!(
+                parse_upnp_time(value),
+                None,
+                "débordement UPnP accepté : {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn temps_upnp_3971_seek_et_didl_refusent_les_debordements() {
+        let body = soap("Seek", "<Target>18446744073709551615:00:00</Target>");
+        assert!(
+            matches!(
+                parse_renderer_command(&body),
+                RendererCommand::Unsupported(_)
+            ),
+            "un Seek débordant ne doit pas atteindre l'orchestrateur (#3971)"
+        );
+        assert_eq!(parse_didl_metadata(
+            r#"<DIDL-Lite><item><res duration="2562047788015:12:55.808">x</res></item></DIDL-Lite>"#
+        ).2, None, "la durée DIDL ne doit jamais être négative (#3971)");
     }
 
     #[test]

@@ -4,9 +4,7 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{
-    Placeholders, any_of, favorite_condition, hidden_tracks_excluded, untagged_condition,
-};
+use super::facet_filter::{Placeholders, any_of, favorite_condition, hidden_tracks_excluded};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -1859,7 +1857,10 @@ impl TrackRepo {
         if let Some(c) = any_of(
             f.untagged
                 .iter()
-                .filter_map(|k| untagged_condition(k).map(str::to_string))
+                .filter_map(|k| {
+                    crate::db::facet_filter::untagged_condition_for_engine(k, self.db.engine())
+                        .map(str::to_string)
+                })
                 .collect(),
         ) {
             conditions.push(c);

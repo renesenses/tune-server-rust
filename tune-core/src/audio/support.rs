@@ -10,8 +10,8 @@ use std::path::Path;
 
 /// Extensions que le moteur de lecture sait réellement décoder dans ce binaire.
 pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "oga", "opus", "aiff", "aif", "dsf", "dff",
-    "wv", "ape",
+    "flac", "mp3", "wav", "m4a", "aac", "alac", "ogg", "oga", "opus", "aiff", "aif", "aifc", "dsf",
+    "dff", "wv", "ape",
 ];
 
 /// Extensions admises par le catalogue. `iso` est l'unique exception au
@@ -25,8 +25,8 @@ pub const NATIVE_DECODE_EXTENSIONS: &[&str] = &[
 /// retombait sur `NotAudio`, un `continue` muet du parcours, et disparaissait
 /// de la bibliothèque sans un compteur ni une ligne de rapport (#2060).
 pub const LIBRARY_AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "m4a", "ogg", "oga", "opus", "wav", "aiff", "aif", "wv", "dsf", "dff", "alac",
-    "ape", "iso",
+    "flac", "mp3", "m4a", "ogg", "oga", "opus", "wav", "aiff", "aif", "aifc", "wv", "dsf", "dff",
+    "alac", "ape", "iso",
 ];
 
 /// Formats audio reconnus mais volontairement exclus du catalogue. Cette liste

@@ -88,6 +88,17 @@ async fn recent_history(
     let offset = p.offset.unwrap_or(0);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     let (items, total) = repo.recent_paginated(limit, offset).unwrap_or_default();
+    let ids: Vec<i64> = items.iter().filter_map(|item| item.id).collect();
+    let names = repo.playlist_context_names(&ids).ou_defaut_journalise();
+    let items: Vec<Value> = items
+        .into_iter()
+        .map(|item| {
+            let name = item.id.and_then(|id| names.get(&id));
+            let mut value = json!(item);
+            value["context_name"] = json!(name);
+            value
+        })
+        .collect();
     Json(json!({
         "items": items,
         "total": total,
@@ -230,4 +241,35 @@ async fn export_csv(
         ],
         csv,
     )
+}
+
+#[cfg(test)]
+mod historique_4041_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn la_route_historique_sert_la_pochette_persistee() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state.backend.execute(
+            "INSERT INTO listen_history (title, source, source_id, duration_ms, cover_url, context_type, context_id, context_position) VALUES ('Service', 'qobuz', '123', 90000, 'https://static.qobuz.com/cover.jpg', 'album', 'album-qobuz', 2)",
+            &[],
+        ).unwrap();
+        let Json(body) = recent_history(
+            State(state),
+            Query(HistoryParams {
+                limit: Some(20),
+                offset: Some(0),
+                period: None,
+            }),
+        )
+        .await;
+        assert_eq!(body["total"], 1);
+        assert_eq!(
+            body["items"][0]["cover_url"], "https://static.qobuz.com/cover.jpg",
+            "GET /library/history a perdu la pochette déjà stockée (#4041)"
+        );
+        assert_eq!(body["items"][0]["album_id"], Value::Null);
+        assert_eq!(body["items"][0]["context_id"], "album-qobuz");
+        assert_eq!(body["items"][0]["context_position"], 2);
+    }
 }

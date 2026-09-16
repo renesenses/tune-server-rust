@@ -123,6 +123,13 @@ async fn adresse_face_a(correspondant: std::net::SocketAddr) -> Option<String> {
     Some(sonde.local_addr().ok()?.ip().to_string())
 }
 
+static ETAT: super::ecoute::JournalEcoute = super::ecoute::JournalEcoute::new();
+
+/// État UDP uniquement ; absent avant tentative et lorsque l'annonce est arrêtée.
+pub fn etat_ecoute() -> Option<super::EtatEcoute> {
+    ETAT.lire()
+}
+
 /// Le répondeur en cours, s'il tourne.
 ///
 /// # #3809 — pourquoi une poignée de tâche, et pas un simple booléen
@@ -165,7 +172,9 @@ pub fn est_armee() -> bool {
 /// testeurs sur ce point exact, et la doctrine de #3809 est que le réglage ne
 /// gouverne que l'annonce.
 pub fn eteindre() -> bool {
-    let Some(tache) = verrou().take() else {
+    let mut place = verrou();
+    ETAT.effacer();
+    let Some(tache) = place.take() else {
         return false;
     };
     let tournait = !tache.is_finished();
@@ -186,21 +195,24 @@ pub fn eteindre() -> bool {
 /// répondeurs sur le même port, c'est le second qui échoue au bind et un
 /// journal qui accuse à tort un LMS voisin.
 pub fn spawn(identite: IdentiteServeur) {
+    spawn_sur_port(identite, super::port_slimproto());
+}
+
+/// Même répondeur avec port explicite. Le démarrage normal partage la résolution
+/// du port TCP via `port_slimproto`.
+pub fn spawn_sur_port(identite: IdentiteServeur, port: u16) {
     let mut place = verrou();
     if place.as_ref().is_some_and(|h| !h.is_finished()) {
         debug!("slimproto_discovery_deja_armee — second armement ignoré (#3809)");
         return;
     }
+    let tentative = ETAT.commencer();
     let tache = tokio::spawn(async move {
-        // La MEME resolution que le serveur TCP (`SlimProtoServer::resolve_port`).
-        // Une seconde lecture de la variable, ecrite a la main ici, laisserait le
-        // repondeur UDP et le serveur TCP diverger a la premiere retouche : la
-        // platine trouverait Tune par diffusion sur un port et ne pourrait pas
-        // s'y connecter sur l'autre.
-        let port: u16 = super::port_slimproto();
         let socket = match UdpSocket::bind(("0.0.0.0", port)).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
+                tentative.echec(port, "UDP", &e,
+                    "La découverte Squeezebox de Tune est indisponible. Vérifier le détenteur du port ou configurer TUNE_SLIMPROTO_PORT puis redémarrer Tune ; certains lecteurs exigent une adresse et un port saisis manuellement. L'état TCP est indépendant.");
                 // Un LMS déjà installé sur la machine tient peut-être ce port :
                 // le dire, plutôt qu'échouer en silence.
                 //
@@ -215,6 +227,8 @@ pub fn spawn(identite: IdentiteServeur) {
                 return;
             }
         };
+        let port = socket.local_addr().map(|a| a.port()).unwrap_or(port);
+        tentative.ecoute(port, "UDP");
         info!(port, "slimproto_discovery_started");
 
         let mut tampon = [0u8; 512];

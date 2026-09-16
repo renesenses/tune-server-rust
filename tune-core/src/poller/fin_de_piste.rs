@@ -64,11 +64,20 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
         device_id: Option<&str>,
     ) {
-        // Queue ended — check if autoplay is enabled for this zone
-        let autoplay_enabled = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .get_autoplay_enabled(zone_id);
+        use crate::db::zone_repo::{AutoplayMode, ZoneRepo};
+        let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
+        match mode {
+            AutoplayMode::RandomAlbum
+            | AutoplayMode::RandomArtist
+            | AutoplayMode::RandomYear
+            | AutoplayMode::RandomTracks => {
+                self.continuer_aleatoirement(zone_id, mode, device_id).await;
+                return;
+            }
+            AutoplayMode::Off | AutoplayMode::Similar => {}
+        }
 
-        if autoplay_enabled {
+        if mode == AutoplayMode::Similar {
             let mut seed_track_id = zone_state.now_playing.as_ref().and_then(|np| np.track_id);
             let mut seed_artist = zone_state
                 .now_playing
@@ -289,6 +298,73 @@ impl PositionPoller {
         );
         self.orchestrator.stop(zone_id, device_id.as_deref()).await;
         return;
+    }
+
+    async fn continuer_aleatoirement(
+        &self,
+        zone_id: i64,
+        mode: crate::db::zone_repo::AutoplayMode,
+        device_id: Option<&str>,
+    ) {
+        let result = (|| {
+            let generated = crate::playback::auto_dj::generate_random_queue(&self.db, mode)?;
+            let ids: Vec<i64> = generated
+                .iter()
+                .filter_map(|t| t["track_id"].as_i64())
+                .collect();
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+            let queue = PlayQueueRepo::with_backend(self.db.clone());
+            let items: Vec<_> = ids
+                .iter()
+                .map(|id| QueueInput::Local { track_id: *id })
+                .collect();
+            // Position et pistes retenues viennent de la transaction d'ajout :
+            // file vide, fin streaming, ajout concurrent ou rescan ne doivent
+            // pas nous faire jouer une ancienne position ni annoncer une piste perdue.
+            let outcome = queue.insert_at_bilan(zone_id, &items, None)?;
+            let Some(position) = outcome.start else {
+                return Ok(None);
+            };
+            let ids: Vec<_> = outcome.retenus.iter().map(|&i| ids[i]).collect();
+            let generated: Vec<_> = outcome
+                .retenus
+                .iter()
+                .map(|&i| generated[i].clone())
+                .collect();
+            Ok::<_, String>(Some((position, ids, generated)))
+        })();
+        match result {
+            Ok(Some((position, ids, generated))) => {
+                if let Some(ref bus) = self.event_bus {
+                    bus.emit(
+                        "playback.autoplay_tracks_added",
+                        serde_json::json!({
+                            "zone_id": zone_id, "autoplay_mode": mode.as_str(),
+                            "track_ids": ids, "tracks": generated,
+                            "seed_track_id": null, "seed_artist": null,
+                        }),
+                    );
+                }
+                match self.orchestrator.play_from_queue(zone_id, position).await {
+                    Ok(_) => return,
+                    Err(e) => {
+                        warn!(zone_id, mode = mode.as_str(), error = %e, "autoplay_play_failed")
+                    }
+                }
+            }
+            Ok(None) => info!(
+                zone_id,
+                mode = mode.as_str(),
+                "autoplay_no_local_candidates"
+            ),
+            Err(e) => {
+                warn!(zone_id, mode = mode.as_str(), error = %e, "autoplay_random_queue_failed")
+            }
+        }
+        self.orchestrator.stop(zone_id, device_id).await;
     }
 
     /// Avance : joue la position suivante, et saute les pistes qui échouent
@@ -647,5 +723,166 @@ impl PositionPoller {
                 GaplessPrep::NotArmed
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod autoplay_2271_tests {
+    use super::*;
+    use crate::db::{
+        backend::DbBackend,
+        play_queue_repo::PlayQueueRepo,
+        sqlite::SqliteDb,
+        zone_repo::{AutoplayMode, ZoneRepo},
+    };
+    use crate::outputs::mock::MockOutput;
+
+    async fn exercise(mode: AutoplayMode, with_previous: bool, with_library: bool) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zone_id = repo
+            .create("Autoplay", Some("mock"), Some("mock-autoplay"))
+            .unwrap();
+        repo.update_autoplay_mode(zone_id, mode).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        if with_library {
+            let path = tmp.path().join("track.wav");
+            let mut wav =
+                crate::audio::wav::build_wav_header_with_duration(2, 44100, 16, Some(1000))
+                    .to_vec();
+            wav.resize(wav.len() + 44100 * 4, 0);
+            std::fs::write(&path, wav).unwrap();
+            db.execute_batch(
+                "INSERT INTO artists (id, name) VALUES (1, 'Artist');
+                INSERT INTO albums (id, title, artist_id, year) VALUES (1, 'Album', 1, 2001);",
+            )
+            .unwrap();
+            db.execute("INSERT INTO tracks (id, title, artist_id, album_id, file_path, format, sample_rate, bit_depth, duration_ms) \
+                        VALUES (1, 'Random local', 1, 1, ?, 'wav', 44100, 16, 1000)", &[&path.to_str().unwrap()]).unwrap();
+        }
+        if with_previous {
+            db.execute(
+                "INSERT INTO queue_items (zone_id, position, source, source_id, title) \
+                        VALUES (?, 0, 'qobuz', 'previous', 'Previous streaming')",
+                &[&zone_id],
+            )
+            .unwrap();
+        }
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        let outputs = Arc::new(Mutex::new(crate::outputs::registry::OutputRegistry::new()));
+        outputs
+            .lock()
+            .await
+            .register(Box::new(MockOutput::new("mock-autoplay", "Autoplay")));
+        let orchestrator = Arc::new(crate::orchestrator::PlaybackOrchestrator::new(
+            db.clone(),
+            playback.clone(),
+            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+            Arc::new(Mutex::new(crate::streaming::ServiceRegistry::new())),
+            outputs.clone(),
+            None,
+        ));
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let mut events = bus.subscribe();
+        let poller = PositionPoller::new(
+            orchestrator,
+            playback.clone(),
+            outputs,
+            db.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_event_bus(bus);
+        let state = crate::playback::ZoneState {
+            zone_id,
+            queue_length: i64::from(with_previous),
+            queue_position: 0,
+            now_playing: with_previous.then(|| crate::playback::NowPlaying {
+                title: "Previous streaming".into(),
+                source: "qobuz".into(),
+                source_id: Some("previous".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Vraie entree de fin de piste : pas le generateur appele seul.
+        poller.handle_track_end(zone_id, &state).await;
+        let queue = PlayQueueRepo::with_backend(db);
+        let actual = playback.get_state(zone_id).await;
+        let expected = with_library && mode != AutoplayMode::Off;
+        assert_eq!(
+            queue.count_all(zone_id).unwrap(),
+            i64::from(with_previous) + i64::from(expected),
+            "{mode:?}"
+        );
+        if expected {
+            assert_eq!(
+                actual.state,
+                crate::playback::PlayState::Playing,
+                "{mode:?}: {actual:?}"
+            );
+            assert_eq!(actual.queue_position, i64::from(with_previous));
+            let target = poller.outputs.lock().await.get("mock-autoplay").unwrap();
+            let output_status = target.lock().await.get_status().await.unwrap();
+            assert_eq!(output_status.state, TransportState::Playing);
+            assert!(
+                output_status.current_uri.is_some(),
+                "la sortie a recu une URL a jouer"
+            );
+
+            assert_eq!(
+                actual.now_playing.as_ref().and_then(|np| np.track_id),
+                Some(1)
+            );
+            let mut added = None;
+            while let Ok(event) = events.try_recv() {
+                if event.event_type == "playback.autoplay_tracks_added" {
+                    added = Some(event.data);
+                }
+            }
+            let added = added.expect("evenement apres ajout effectif");
+            assert_eq!(added["autoplay_mode"], mode.as_str());
+            assert_eq!(added["track_ids"], serde_json::json!([1]));
+            // La continuation reste active au bout du lot ajoute.
+            poller.handle_track_end(zone_id, &actual).await;
+            let next = playback.get_state(zone_id).await;
+            assert_eq!(next.state, crate::playback::PlayState::Playing);
+            assert_eq!(next.queue_position, i64::from(with_previous) + 1);
+            assert_eq!(
+                queue.count_all(zone_id).unwrap(),
+                i64::from(with_previous) + 2
+            );
+        } else {
+            assert_eq!(actual.state, crate::playback::PlayState::Stopped);
+            assert!(events.try_recv().is_err(), "aucun faux ajout");
+        }
+    }
+
+    #[tokio::test]
+    async fn autoplay_2271_random_modes_start_without_seed_and_after_streaming() {
+        for mode in [
+            AutoplayMode::RandomAlbum,
+            AutoplayMode::RandomArtist,
+            AutoplayMode::RandomYear,
+            AutoplayMode::RandomTracks,
+        ] {
+            exercise(mode, false, true).await;
+            exercise(mode, true, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn autoplay_2271_empty_library_stops_and_off_never_fills_the_queue() {
+        for mode in [
+            AutoplayMode::RandomAlbum,
+            AutoplayMode::RandomArtist,
+            AutoplayMode::RandomYear,
+            AutoplayMode::RandomTracks,
+        ] {
+            exercise(mode, false, false).await;
+        }
+        exercise(AutoplayMode::Off, true, true).await;
     }
 }
