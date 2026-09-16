@@ -3665,6 +3665,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "streaming_profile_id",
         include_str!("../../migrations/postgres/060_streaming_profile_id.sql"),
     ),
+    (
+        61,
+        "streaming_favorite_ids",
+        include_str!("../../migrations/postgres/061_streaming_favorite_ids.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -5624,7 +5629,8 @@ mod tests {
         // par entree, comme la 56 et la 57 l'imposent.
         // 59 aligns queue types (#3716); 60 aligns streaming profile IDs
         // with the repository's integer bindings (#3715).
-        assert_eq!(pg_latest_version(), 60, "latest PG migration must be 60");
+        // 61 repairs native streaming favorite IDs without rewinding the sequence.
+        assert_eq!(pg_latest_version(), 61, "latest PG migration must be 61");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
