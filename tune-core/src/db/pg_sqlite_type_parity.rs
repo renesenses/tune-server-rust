@@ -256,17 +256,6 @@ const ECARTS_TOLERES: &[(&str, &str, &str, &str)] = &[
          sa propre passe (#3715)",
     ),
     (
-        "native",
-        "streaming_favorites",
-        "profile_id",
-        "TEXT vs INTEGER — meme origine qu'`id`. MESURE : `StreamingFavoritesRepo` \
-         lie `pid` en TEXT, et sur une base MIGREE la colonne est bigint, donc \
-         `WHERE profile_id = $1` y rend `operator does not exist: bigint = text` — \
-         list/add/remove/is_favorite, tout le volet Favoris de streaming est mort \
-         sur le parc migre. Le sens de la reparation est INVERSE de ce que cette \
-         ligne suggere : aligner le natif sur bigint ET corriger la liaison (#3715)",
-    ),
-    (
         "migree",
         "alarms",
         "enabled",
@@ -752,8 +741,9 @@ fn l_inventaire_des_ecarts_toleres_est_propre() {
     // exactement l'affaissement silencieux que ce garde-fou combat.
     assert_eq!(
         ECARTS_TOLERES.len(),
-        21,
-        // #3716 retire queue_items.is_current côté migré : 4 natifs, 17 migrés.
+        20,
+        // #3715 retire streaming_favorites.profile_id natif : 3 natifs, 17 migrés.
+        // #3716 avait retiré queue_items.is_current côté migré (22 -> 21).
         // Le 31/08/2026 il valait 16 ; #3715 en a
         // retiré 2 (tolérances périmées, `zones.dlna_wav24` et
         // `zones.dlna_play_delay_ms`, réparées depuis) et inscrit les 9
