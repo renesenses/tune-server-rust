@@ -465,7 +465,10 @@ pub(super) async fn artist_albums(
     Path(id): Path<i64>,
 ) -> Json<Value> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
-    let items = repo.list_by_artist(id).unwrap_or_default();
+    let mut items = repo.list_by_artist(id).unwrap_or_default();
+    // La fiche artiste trie ses albums par date d'ajout (Bertrand,
+    // 16/09/2026) ; `select_album()` ne porte pas la colonne.
+    repo.attacher_added_at(&mut items);
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
     Json(json!(items))
 }
