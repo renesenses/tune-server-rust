@@ -208,9 +208,12 @@ async fn federated_search(
             artist_repo
                 .search_page(&p.q, limit, offset)
                 .unwrap_or_default(),
-            album_repo
-                .search_page(&p.q, limit, offset)
-                .unwrap_or_default(),
+            avec_date_d_ajout(
+                &album_repo,
+                album_repo
+                    .search_page(&p.q, limit, offset)
+                    .unwrap_or_default(),
+            ),
             track_repo
                 .search_page(&p.q, limit, offset)
                 .unwrap_or_default(),
@@ -383,6 +386,81 @@ async fn federated_search(
         "radios": radios,
         "services": service_results,
     }))
+}
+
+/// Attache `added_at` aux albums d'une page de résultats.
+///
+/// `search_page` lit les albums par `select_album()`, qui laisse `added_at` à
+/// `None` (la colonne n'y est pas — voir `row_to_album`). L'écran de
+/// recherche trie désormais ses albums par date d'ajout (Bertrand,
+/// 16/09/2026) : sans cette passe, ce tri serait un tri sur rien, et l'écran
+/// ne verrait jamais la date. Une seule requête groupée pour la page
+/// (`added_at_by_ids`, #3397), comme pour les dossiers. Un échec ne casse
+/// pas la recherche : la page sort sans date, et le journal le dit.
+fn avec_date_d_ajout(
+    repo: &AlbumRepo,
+    mut albums: Vec<tune_core::db::models::Album>,
+) -> Vec<tune_core::db::models::Album> {
+    let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
+    if ids.is_empty() {
+        return albums;
+    }
+    match repo.added_at_by_ids(&ids) {
+        Ok(par_id) => {
+            for a in &mut albums {
+                if let Some(id) = a.id {
+                    a.added_at = par_id.get(&id).copied();
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "recherche: added_at_by_ids a échoué — page sans date d'ajout")
+        }
+    }
+    albums
+}
+
+#[cfg(test)]
+mod tests_date_d_ajout {
+    use super::*;
+
+    /// Une page de recherche porte la date d'ajout de ses albums locaux —
+    /// lue de la même source que la Bibliothèque (`file_first_seen`, sinon
+    /// mtime), jamais inventée : un album sans piste locale reste sans date.
+    #[test]
+    fn la_page_de_recherche_porte_la_date_d_ajout() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Nick Drake')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Pink Moon', 1), (2, 'Bryter Layter', 1)",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, file_path, file_mtime, source) \
+             VALUES ('Pink Moon', 1, 1, '/m/pink.flac', 1600000000, 'local')",
+            &[],
+        )
+        .unwrap();
+        let repo = AlbumRepo::with_backend(state.backend.clone());
+        let page = repo.search_page("Nick", 10, 0).unwrap();
+        assert_eq!(page.len(), 2, "{page:?}");
+        assert!(
+            page.iter().all(|a| a.added_at.is_none()),
+            "select_album() ne la porte pas"
+        );
+
+        let page = avec_date_d_ajout(&repo, page);
+        let pink = page.iter().find(|a| a.id == Some(1)).unwrap();
+        let bryter = page.iter().find(|a| a.id == Some(2)).unwrap();
+        assert!(pink.added_at.is_some_and(|t| t > 0.0), "{pink:?}");
+        assert_eq!(bryter.added_at, None, "aucune piste locale : aucune date");
+    }
 }
 
 #[cfg(test)]
