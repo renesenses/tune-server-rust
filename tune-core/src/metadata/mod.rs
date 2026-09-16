@@ -6078,9 +6078,12 @@ mod tests_drapeau_compilation {
 
     /// Un FLAC RÉEL sans le champ ne devient pas une compilation.
     #[test]
-    fn flac_reel_sans_champ_rend_faux() {
+    fn flac_reel_sans_champ_rend_absent() {
         let md = try_read_metadata(&fixture("test.flac")).unwrap();
-        assert!(!md.compilation);
+        assert_eq!(
+            md.compilation, None,
+            "sans le champ, le fichier n'affirme rien"
+        );
     }
 
     /// **La contre-épreuve.** Un FLAC réel portant `COMPILATION=1` rend
@@ -6092,14 +6095,16 @@ mod tests_drapeau_compilation {
 
         // Témoin négatif : la fixture nue, avant toute gravure.
         std::fs::copy(fixture("test.flac"), &p).unwrap();
-        assert!(
-            !try_read_metadata(&p).unwrap().compilation,
-            "témoin : sans le champ, ce doit être faux"
+        assert_eq!(
+            try_read_metadata(&p).unwrap().compilation,
+            None,
+            "témoin : sans le champ, ce doit être absent"
         );
 
         graver("test.flac", &p, "1");
-        assert!(
+        assert_eq!(
             try_read_metadata(&p).unwrap().compilation,
+            Some(true),
             "COMPILATION=1 dans un FLAC doit rendre vrai"
         );
     }
@@ -6111,7 +6116,11 @@ mod tests_drapeau_compilation {
         let base = tempfile::TempDir::new().unwrap();
         let p = base.path().join("zero.flac");
         graver("test.flac", &p, "0");
-        assert!(!try_read_metadata(&p).unwrap().compilation);
+        assert_eq!(
+            try_read_metadata(&p).unwrap().compilation,
+            Some(false),
+            "COMPILATION=0 est un faux EXPLICITE (C1), pas un absent"
+        );
         assert_eq!(
             lire_drapeau_compilation(raw_vorbis_comment(&p, "COMPILATION").as_deref()),
             DrapeauCompilation::Faux,
@@ -6142,8 +6151,9 @@ mod tests_drapeau_compilation {
         octets[pos..pos + apres.len()].copy_from_slice(apres);
         std::fs::write(&p, &octets).unwrap();
 
-        assert!(
+        assert_eq!(
             try_read_metadata(&p).unwrap().compilation,
+            Some(true),
             "`Compilation=1` doit se lire comme `COMPILATION=1`"
         );
     }
@@ -6157,15 +6167,17 @@ mod tests_drapeau_compilation {
 
         let vrai = base.path().join("vrai.m4a");
         graver("alac/ref_16_44100_stereo.m4a", &vrai, "1");
-        assert!(
+        assert_eq!(
             try_read_metadata(&vrai).unwrap().compilation,
+            Some(true),
             "cpil=1 doit rendre vrai"
         );
 
         let faux = base.path().join("faux.m4a");
         graver("alac/ref_16_44100_stereo.m4a", &faux, "0");
-        assert!(
-            !try_read_metadata(&faux).unwrap().compilation,
+        assert_eq!(
+            try_read_metadata(&faux).unwrap().compilation,
+            Some(false),
             "cpil=0 doit rendre faux"
         );
     }
