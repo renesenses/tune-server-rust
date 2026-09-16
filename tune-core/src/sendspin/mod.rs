@@ -1,4 +1,4 @@
-//! Sendspin — le rôle SERVEUR du protocole (#3326, phase 2, brique S2-a).
+//! Sendspin — le rôle SERVEUR du protocole (#3326, phase 2, briques S2-a/S2-b).
 //!
 //! Rappel du renversement de vocabulaire posé en phase 1 et vérifié depuis :
 //! dans Sendspin **le « client » est l'enceinte** et **le « serveur » est la
@@ -17,8 +17,9 @@
 //!
 //! S2-b en cours : identite et PSK longue duree sont conservees dans le
 //! magasin prive. Le transport sait lier les cles aux pairs et mener un
-//! reechange. Les trois parcours d'appairage et leur interaction operateur
-//! restent a brancher. La Sentinelle publique n'authentifie pas un pair.
+//! reechange. CPace et le wrapping des codes sont eprouves dans pake.
+//! Les trois parcours d'appairage et leur interaction operateur restent a
+//! brancher. La Sentinelle publique n'authentifie pas un pair.
 //!
 //! Non livre :
 //! - l'appairage complet (PSK provisoire, CPace, codes) — S2-b ;
@@ -62,6 +63,7 @@
 pub mod identite;
 pub mod magasin;
 pub mod messages;
+pub mod pake;
 pub mod poignee;
 pub mod psk;
 pub mod registre;

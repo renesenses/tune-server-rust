@@ -486,3 +486,22 @@ de tests alimentent seules les records de cette étape. Le serveur n'offre
 toujours aucune activité audio (`playback_supported: false`).
 Les preuves et limites sont dans
 [la mesure S2-b](mesures/3326-sendspin-appairage.md).
+
+### 13.1 Cryptographie des codes, avant branchement des parcours
+
+Le module `sendspin::pake` est désormais présent pour les méthodes par code :
+CPACE-X25519-SHA512 avec confirmation mutuelle, liaison au condensat Noise,
+au compteur d'appairage et au numéro de tour. Les formats statique
+(huit chiffres), dynamique (six chiffres) et QR (vingt-quatre octets) sont
+éprouvés dans les deux suites de chiffrement.
+
+Il ne livre la PSK longue durée qu'après confirmation et, en dynamique,
+vérification de l'engagement du client et du code dérivé des nonces.
+La comparaison numérique et les contre-épreuves sont détaillées dans
+[la mesure S2-b](mesures/3326-sendspin-appairage.md#troisième-étape--cryptographie-des-codes).
+
+Le SDK aiosendspin épinglé omet encore le tour dans son SID d'appairage.
+Les bancs comparent donc ses objets cryptographiques et helpers aux API
+natives, avec le SID de la spécification épinglée ; ils ne valident pas
+son parcours complet. Les commandes opérateur et les échanges WebSocket
+d'appairage restent à brancher, ainsi que la gestion des tentatives et reprises.

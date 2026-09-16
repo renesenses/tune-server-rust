@@ -11,6 +11,8 @@ Target propre : `jp-robbe-20260916-3326-pairing`, six jobs.
 ## Contrat épinglé et portée
 
 - Spécification : `Sendspin/spec@8a8b1cbd6764ea116dcaa07e41544a97bc13080c`.
+  Cette révision porte un fichier LICENSE.md avec l’identifiant Community-Spec-1.0 ;
+  les anciens constats d’absence de licence sont historiques.
 - Référence tierce : `Sendspin/aiosendspin@b6f8564d07b212d77bfb026b80baa23435d9e591`.
 - Ce travail continue S2-b. Il ne livre pas S2-c/S2-d et ne clôt pas #3326.
   La lecture reste indisponible ; aucun `OutputTarget` n'est ajouté.
@@ -124,7 +126,8 @@ le résultat Clippy porte sur la catégorie `correctness`.
 
 ## Recherche pour la suite CPace
 
-Aucune dépendance de production ajoutée à ce stade. Le banc séparé
+Au stade du banc initial, aucune dépendance de production n'était ajoutée.
+Le banc séparé
 `/srv/builds/jp-research/jp-robbe-20260916-3326-pairing/cpace-map-check`
 a comparé le mapping `Legacy` de `curve25519-elligator2 0.1.0-alpha.2`
 (feature `digest`) : un vecteur G_25519 du brouillon CPace et 128 générateurs
@@ -233,3 +236,144 @@ bibliothèques et les trois cibles de tests, avec `-D clippy::correctness` :
 succès. Des avertissements du dépôt restent présents. `cargo fmt --all --check`
 et `git diff --check` réussissent également. Journaux : `clippy-store.log` et
 `fmt-store.log`. Aucun check CI de PR n'est encore revendiqué pour S2-b.
+
+## Troisième étape : cryptographie des codes
+
+`tune-core/src/sendspin/pake.rs` implémente le rôle A de CPACE-X25519-SHA512
+avec confirmation mutuelle, selon
+[draft-irtf-cfrg-cpace-21](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-cpace-21)
+et la révision Sendspin épinglée. Le SID contient le condensat Noise,
+le compteur d'appairage et le numéro du tour en big endian ; CI est vide,
+les AD sont `server` et `client`.
+
+Le code statique a huit chiffres ASCII, le code dynamique six chiffres,
+et le format QR vingt-quatre octets bruts. Ce sont trois formats de code,
+pas les trois méthodes d'appairage : la méthode `pairing_psk` ne fait pas
+appel à CPace et reste à orchestrer avec les deux méthodes par code.
+
+Les états publics se consomment. Le scalaire vient du CSPRNG et ne peut pas
+être réemployé par le même objet. Le partage doit contribuer à X25519.
+L'objet donnant accès au champ PSK n'est constructible qu'après vérification
+de la confirmation client et, en dynamique, déchiffrement du nonce B,
+vérification de son engagement puis recalcul du code. Une confirmation
+incorrecte et une erreur de protocole restent deux erreurs distinctes, pour
+que la route puisse appliquer le comportement prévu.
+
+Les deux champs chiffrés ont des clés dérivées dans des domaines distincts.
+Le déchiffrement utilise l'AEAD négocié (AES-256-GCM ou ChaCha20-Poly1305),
+le nonce nul de douze octets et les données associées vides prévus par le
+protocole. La valeur finale est une PSK longue durée liée à l'identité du
+client. Aucun secret n'est exposé par Debug. Les champs de code et de clé
+possédés par ces objets utilisent Zeroizing ; ceci ne prétend pas effacer
+toutes les copies internes des primitives ou de la pile.
+
+### Dépendances et limites de la revue
+
+Deux paquets entrent dans le lockfile : `curve25519-elligator2 0.1.0-alpha.2`
+et `hmac 0.12.1` (compatible avec le graphe digest 0.10 de SHA-512).
+AES-GCM, subtle et zeroize étaient déjà transitifs et sont maintenant
+déclarés directement. Aucun autre paquet existant n'est mis à jour.
+Le choix accidentel de getrandom 0.4 pour tempfile lors de la résolution a
+été retiré ; `cargo check --locked` accepte le graphe précédent conservé.
+
+La caisse Elligator, sous BSD-3-Clause, est épinglée exactement. Elle dérive
+de Dalek ; Tune utilise son mapping, et conserve x25519-dalek pour les
+multiplications. Le chemin Legacy observé utilise les sélections
+conditionnelles du champ et la conversion Edwards → Montgomery ; il garde
+le bit 254 nécessaire à CPace. Cette inspection de code et les vecteurs ne
+constituent pas un audit cryptographique indépendant ni une mesure complète
+des canaux auxiliaires. La comparaison Python sert de référence numérique,
+pas d'implémentation de production ni de garantie de temps constant.
+
+### Preuves initiales
+
+`cargo test -j6 -p tune-core --no-default-features --features oaat --lib sendspin::pake::`
+
+Seize témoins passent : vecteur complet du brouillon (g, Ya, K, ISK),
+129 générateurs, 64 échanges/confirmations indépendants, trois formats
+dans les deux AEAD, erreurs de code/SID/tag, réflexion, engagement,
+liaison du code, domaines distincts, tailles et authenticité des champs,
+points de faible ordre et variantes valides RFC7748, fraîcheur et Debug.
+Les données sont incluses dans les tests internes réellement compilés.
+
+`tests/sendspin/generer_vecteurs_pake.py` reproduit les deux jeux de vecteurs
+dérivés avec les bibliothèques tierces, sans charger Tune. Une régénération
+dans un autre dossier est identique octet pour octet (journal
+`pake-regenerated.log`). La provenance et la licence de référence se trouvent
+dans `tune-core/src/sendspin/pake/VECTORS.md`.
+
+L'interopérabilité explicite appelle les API publiques de Tune depuis le
+constructeur qui tire son scalaire aléatoire. Un processus Python distinct
+exécute CPace 0.1.0, les helpers de code aiosendspin et les AEAD de cryptography.
+Un témoin réussit **36 scénarios** : six cas valides (3 formats × 2 suites)
+et trente refus attendus, avec confirmation côté client avant livraison
+de sa clé finale.
+
+```sh
+export SENDSPIN_REFERENCE_PYTHON=/srv/builds/jp-research/jp-robbe-20260916-3326-pairing/venv/bin/python3
+cargo test --locked -j6 -p tune-core --no-default-features --features oaat --test sendspin_poignee_s2a i3326_pake_reference_vivante -- --ignored --nocapture
+```
+
+**Limite précise de cette interopérabilité :** le parcours d'appairage du SDK
+aiosendspin épinglé, dans `noise/pairing.py::_pake_sid`, omet encore le tour.
+Le banc assemble ce champ selon la spécification épinglée et compare les
+objets CPace, les codes et le chiffrement des valeurs. Il ne prétend pas
+exécuter le parcours SDK complet. Tune ne retire pas le tour pour satisfaire
+une référence en retard sur ce point.
+
+L'orchestration des messages WebSocket et les commandes opérateur restent
+à réaliser. Aucun parcours de création d'appairage n'est encore offert par
+les routes et aucune activité audio n'est activée. La porte matérielle de
+#3326 reste ouverte.
+
+### Contre-épreuves natives
+
+Les neuf fichiers de tests, vecteurs et bancs Python sont identiques par
+SHA-256 pendant les deux séries de sabotage. Le code de production est
+restauré par copie entre les séries, puis avant le retour au vert.
+
+1. Filtre `i3326_pake_un_` : retrait de la vérification de confirmation,
+   du refus d'un commitment différent et du refus d'un code non lié.
+   Compilation réussie, puis **trois témoins échoués**, code 101 :
+   « un mauvais code ne doit pas donner acces a la cle finale »,
+   « le commitment doit etre verifie avant de lire une PSK » et
+   « le code saisi doit etre derive des deux nonces et de Noise avant toute PSK ».
+   Les témoins d'engagement et de liaison emploient un tag client valide :
+   le retrait simultané de la confirmation ne cause pas leur rouge.
+2. Filtre `i3326_pake_concorde_avec_129_generateurs` : effacement du bit 254
+   en plus du bit 255. Compilation réussie, puis **un témoin échoué**,
+   code 101 : « generateur de reference 0 : CPace ne masque que le bit 255 ».
+
+Commandes : `cargo test --locked -j6 -p tune-core --no-default-features --features oaat --lib <filtre>`.
+Journaux : `counter-pake-confirmations.log`, `counter-pake-generator.log`,
+sauvegarde `pake.rs.before-counter` et relevé `pake-tests-before-counter.sha256`.
+
+Après restauration, `--lib sendspin::` passe **52 tests** (36 existants et
+16 nouveaux ; 4 509 hors filtre) sur le lockfile conservant getrandom 0.3
+pour tempfile.
+
+### Vérification finale de la brique native
+
+Sur le code restauré, puis complété par la copie des valeurs publiques de
+liaison pour les futurs tours d'un même essai (les objets CPace restent
+non clonables), les commandes avec `--locked` donnent :
+
+- `--lib sendspin::` : **52 réussis**, aucun ignoré ;
+- `--test sendspin_poignee_s2a` : **24 réussis**, trois ignorés ;
+- les deux cibles serveur : **17 réussis**, un banc matériel ignoré ;
+- filtre `reference -- --ignored --nocapture` : **deux témoins réussis**,
+  dix scénarios Noise et trente-six scénarios CPace.
+
+Les trois entrées ignorées de la cible cœur sont les deux bancs tierces
+exécutés séparément et l'auxiliaire du témoin multiprocessus.
+La dernière relance des 24 tests utilise deux jobs, après la hausse de charge
+de Shrek ; la validation en cours a également reçu une priorité CPU réduite.
+Aucun processus d'une autre session n'a été modifié.
+
+Clippy, sur les bibliothèques et les trois cibles d'intégration, passe avec
+`-D clippy::correctness`. Des avertissements du dépôt subsistent.
+`cargo fmt --all --check` et `git diff --check` passent.
+Les journaux finaux portent les préfixes `pake-core-`, `pake-server-`,
+`pake-interop-`, `clippy-pake.log` et `fmt-pake.log`.
+La batterie CI de la PR brouillon est une porte distincte, sans résultat
+revendiqué à cette étape.

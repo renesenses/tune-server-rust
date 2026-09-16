@@ -337,3 +337,6 @@ mod interop_reference;
 
 #[path = "sendspin/magasin_appairage.rs"]
 mod magasin_appairage;
+
+#[path = "sendspin/interop_pake.rs"]
+mod interop_pake;
