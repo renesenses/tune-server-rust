@@ -5199,6 +5199,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tune-core",
+ "zip",
 ]
 
 [[package]]

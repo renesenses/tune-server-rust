@@ -464,7 +464,7 @@ impl StreamingService for BandcampService {
                      avec {\"username\": \"…\"} d'abord",
                 )
             })?;
-        let brut = page_de_collection(compte.fan_id, BC_JETON_DEBUT, BC_COLLECTION_PAGE)
+        let brut = page_de_collection(compte.fan_id, BC_JETON_DEBUT, BC_COLLECTION_PAGE, None)
             .await
             .map_err(TuneError::from)?;
         Ok(albums_de_collection(&brut))
