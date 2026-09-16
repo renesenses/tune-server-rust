@@ -19,6 +19,12 @@ Relevé du 12/09/2026 sur `origin/batch/bugs-12` à `49ecf1fe`, rubato 3.0.0.
 > « [Correctif du 13/09 — D1](#correctif-du-1309--d1-est-corrigé) » puis
 > « [Correctif du 13/09 — D2](#correctif-du-1309--d2-est-corrigé) ».
 
+> **Mise à jour du 15/09/2026 — D3 (#4079).** La somme de normalisation du
+> noyau Rubato est désormais compensée. Les deux témoins encore ignorés sont
+> exécutés et un témoin de gain continu est ajouté : **83/83 réussis** sur
+> Shrek. Les relevés des 12/13 septembre ci-dessous restent historiques ;
+> le nouveau relevé et le coût sont dans « Correctif du 15/09 — D3 ».
+
 ## Pourquoi une référence
 
 Le bilan du 12/09 : « le rééchantillonnage n'a aucune référence externe ; il
@@ -640,6 +646,133 @@ aujourd'hui), les 4 preuves de la référence, et le relevé
 
 ```sh
 cargo test -p tune-core --test reechantillonnage_reference_2218
-cargo test -p tune-core --test reechantillonnage_reference_2218 -- --ignored   # les défauts restants (D3)
+cargo test -p tune-core --test reechantillonnage_reference_2218 i4079         # gain continu
 cargo test -p tune-core --test reechantillonnage_reference_2218 releve -- --nocapture
 ```
+
+## Correctif du 15/09 — D3 : normalisation compensée (#4079)
+
+JP Robbe / OpenAI Codex / jp-robbe-20260915-201930-4079.
+Base serveur `24123a4e6b5589e7ce90bb1f3cbe7d132cc4d52e`. Mesures sur Shrek,
+Rust 1.98.0, six jobs, target propre à cette unité.
+
+### Cause et changement
+
+`rubato 3.0.0/src/sinc.rs::make_sincs` additionne les coefficients du noyau
+suréchantillonné dans le type de l'audio, ici `f32`, puis divise toute la table
+par cette somme. Les petites queues du sinc perdent de la précision lorsque
+la somme devient grande. L'erreur de normalisation se retrouve dans tous les
+coefficients : c'est le décalage de gain dominant à 1 kHz.
+
+Le correctif applique une sommation compensée de Kahan à cette seule somme.
+Les valeurs brutes des coefficients, la fenêtre Blackman², le nombre de
+coefficients, les 256 phases, l'interpolation linéaire et le calcul de délai
+restent identiques. Aucun coût arithmétique n'est ajouté dans la boucle audio ;
+la construction effectue trois opérations supplémentaires par coefficient.
+
+La copie `vendor/rubato` reste en version 3.0.0. Elle diffère de l'archive
+crates.io dans **un seul fichier source, `src/sinc.rs`** ; son origine, son
+SHA-256 et sa licence sont conservés dans `TUNE-PATCH.md`. La dépendance est
+un chemin interne, comme `rust_cast`, pour que les consommateurs externes de
+`tune-core` reçoivent aussi le correctif. La dernière version publiée 5.0.0,
+vérifiée le 15/09, conserve l'addition naïve.
+
+### Résultats contre la même référence
+
+| rapport | RMS 1 kHz avant / après (dB) | RMS balayage avant / après (dB) | THD+N après (dB) |
+|---|---:|---:|---:|
+| 44,1 → 48 kHz | -121.4 / **-135.7** | -108.4 / -107.2 | -136.8 |
+| 48 → 44,1 kHz | -118.2 / **-137.7** | -110.8 / -108.7 | -137.9 |
+| 44,1 → 96 kHz | -121.3 / **-135.4** | -108.4 / -107.1 | -136.3 |
+| 96 → 48 kHz | -88.4 / **-137.2** | -88.4 / -118.4 | -144.6 |
+| 44,1 → 192 kHz | -121.4 / **-135.3** | -108.4 / -107.2 | -136.3 |
+| 176,4 → 48 kHz (PCM de DSD64) | -102.1 / **-143.4** | -102.3 / -130.0 | -144.6 |
+| 192 → 44,1 kHz | -85.4 / **-144.5** | -85.4 / -132.0 | -144.6 |
+
+Les sept rapports passent le seuil inchangé de −100 dB à 1 kHz. La bande
+à −0,1 dB, la réjection, les bords, le délai, le nombre de trames et l'identité
+blocs 1 024 / 4 096 / piste restent dans leurs gardes antérieures.
+Le balayage se déplace de 1,2 à 2,1 dB vers une erreur un peu plus grande sur
+les trois montées depuis 44,1 et sur 48 → 44,1 ; il reste sous −107 dB.
+La suppression du biais global ne supprime pas l'erreur d'interpolation
+entre phases. Ces déplacements sont consignés, pas effacés par une tolérance
+plus large.
+
+Seuls les relevés attendus RMS (sinus aligné, sinus non recalé, balayage)
+ont été remesurés, avec leur tolérance précédente de ±1 dB. La référence,
+les seuils audiophiles et les autres tolérances n'ont pas changé.
+Le test de gain continu utilise une entrée constante et les trames centrales
+après transitoires : erreur relative maximale **4,77e−7**, seuil **1e−6**,
+sur les sept rapports. Il n'ajuste ni amplitude ni phase.
+
+### Coût sur Shrek
+
+Microbanc Rubato en release (`opt-level=2`, LTO thin, quatre unités de code),
+stéréo, blocs de 1 024 trames, 300 secondes d'audio par rapport. Médiane de
+trois passages alternés avant/après ; chaque mesure de construction regroupe
+30 créations. Les paramètres correspondent à ceux de Tune : 256 coefficients
+pour les trois premiers couples ci-dessous, 512 pour 192 → 44,1.
+
+| rapport | construction avant / après (ms) | flux avant / après (s) | ratio flux |
+|---|---:|---:|---:|
+| 44,1 → 48 | 5.849 / 6.509 | 2.071 / 2.087 | 1.008 |
+| 96 → 48 | 5.700 / 5.792 | 1.749 / 1.742 | 0.996 |
+| 176,4 → 48 | 5.604 / 5.727 | 1.960 / 1.975 | 1.008 |
+| 192 → 44,1 | 11.398 / 11.745 | 3.390 / 3.389 | 1.000 |
+
+La boucle en flux reste entre 0,996× et 1,008× dans ces médianes.
+La construction coûte jusqu'à environ 0,66 ms de plus dans ce relevé.
+Shrek est partagé : la variabilité visible entre passages empêche d'en faire
+une mesure fine de performance. Ce microbanc ne mesure ni le serveur entier,
+ni un Raspberry Pi, ni une sortie matérielle.
+
+Recette et résultats conservés sur Shrek :
+`/tmp/jp-robbe-20260915-201930-4079-experiments/bench-{baseline,kahan}`,
+`/tmp/jp-4079-bench-final-{baseline,kahan}-{1,2,3}.log`.
+Le premier essai de microbanc employait par erreur 512 coefficients pour
+176,4 → 48 ; il est exclu de ce tableau. Les fichiers `bench-final-*`
+correspondent au noyau de production de 256 coefficients.
+
+### Portée
+
+Les tests comparent le PCM produit par les API publiques de Tune à une
+référence indépendante. Ils ne prouvent pas le rendu d'un DAC, la performance
+ARM ou la latence système. L'arrondi de phase résiduel décrit dans D2 et les
+erreurs de bord restent mesurés ; ce correctif ne prétend pas les supprimer.
+
+
+### Contre-épreuve exécutée
+
+Les tests finaux sont conservés. Seul le fichier de production
+`vendor/rubato/src/sinc.rs` est remplacé par celui de l'archive 3.0.0.
+
+- Filtre `audiophile_erreur_1k` : compilation réussie, **2 rouges / 5 verts**,
+  sur 96 → 48 et 192 → 44,1, avec les erreurs initiales −88,4 et −85,4 dB.
+- Filtre `i4079` : **1 rouge**, gain continu relatif à 44,1 → 48 hors de
+  1 ± 1e−6 (erreur maximale 1,192e−6).
+- Restauration par `cp` du correctif puis banc complet : **83/83 verts**,
+  aucun test ignoré.
+
+Journaux Shrek : `/tmp/jp-4079-counterproof-d3.log`,
+`/tmp/jp-4079-counterproof-dc.log` et `/tmp/jp-4079-t10-final.log`.
+
+### Empreintes de sortie locale
+
+Après mesure indépendante, les deux empreintes contenant le rééchantillonnage
+sont remesurées dans `empreinte_du_puits_r1.rs`. Avant remesure : **270 verts /
+2 rouges** sur la suite locale ; seuls ces deux témoins changent de mots.
+Le compte de **8 914 mots** de la chaîne adaptation puis rééchantillonnage
+reste identique ; les empreintes sans rééchantillonnage passent déjà.
+
+- Rééchantillonnage seul : `0x7d6d2c8f4cee4f8d` → `0xf7abd26d0d563951`.
+- Adaptation puis rééchantillonnage : `0x6cc3fd32396525ed` → `0xfff7fe9fcf7484c6`.
+
+Le changement vient du gain de normalisation mesuré ci-dessus, pas d'une
+réorganisation des étages ou d'un nouveau noyau.
+
+
+Validation finale locale : **272/272** tests de sortie locale, **20/20**
+tests unitaires du rééchantillonneur, Clippy correctness et formatage réussis.
+La résolution Cargo depuis un petit consommateur extérieur au workspace
+sélectionne bien la copie Rubato de ce dépôt (métadonnées vérifiées ;
+ce contrôle ne vaut pas compilation séparée du consommateur).
