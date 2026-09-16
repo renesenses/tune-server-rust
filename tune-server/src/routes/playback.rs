@@ -852,6 +852,15 @@ struct RepeatQuery {
     mode: Option<String>,
 }
 
+/// Paramètre de `DELETE /{id}/queue` et `POST /{id}/queue/clear` (#4169).
+/// Même forme en chaîne de requête (`?keep_current=true`) et en corps JSON
+/// (`{"keep_current": true}`) ; la chaîne de requête prime si les deux sont
+/// posés. Absent ou `false` : « Vider la file » — tout s'arrête (#3669).
+#[derive(Deserialize, Default)]
+struct QueueClearQuery {
+    keep_current: Option<bool>,
+}
+
 #[derive(Deserialize)]
 struct QueueAddRequest {
     #[serde(default)]
@@ -3460,7 +3469,26 @@ fn refus_de_position_hors_file(erreur: &str) -> Option<axum::response::Response>
 /// qui est posé ici, et il vient EN PREMIER : `orchestrator.stop` a besoin du
 /// `now_playing` encore présent pour retrouver le `stream_id` de la session à
 /// fermer, que `stop_and_clear` met à `None` juste après.
-async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
+///
+/// 🔵 #4169 — le SECOND geste, « Vider la suite » : `?keep_current=true` (ou
+/// `{"keep_current": true}` dans le corps, pour la forme `POST …/queue/clear`
+/// qu'appelle le client web). Il ne touche ni à la piste en cours ni à son
+/// état de lecture, et n'envoie AUCUN `stop` — voir `queue_clear_suite`. Sans
+/// le paramètre, le geste d'arrêt ci-dessus est strictement inchangé : c'est
+/// l'arbitrage rendu sur l'issue, qui conserve #3669 et #4090.
+async fn queue_clear(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Query(q): Query<QueueClearQuery>,
+    body: Option<Json<QueueClearQuery>>,
+) -> impl IntoResponse {
+    let keep_current = q
+        .keep_current
+        .or_else(|| body.and_then(|Json(b)| b.keep_current))
+        .unwrap_or(false);
+    if keep_current {
+        return queue_clear_suite(&state, zone_id).await.into_response();
+    }
     let device_id = get_zone_device_id(&state, zone_id);
     state.orchestrator.stop(zone_id, device_id.as_deref()).await;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
@@ -3477,7 +3505,64 @@ async fn queue_clear(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
         "playback.queue.cleared",
         serde_json::json!({ "zone_id": zone_id }),
     );
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// « Vider la suite » (#4169, Cyrille, fil 1789) : retirer tout ce qui reste
+/// à jouer APRÈS le curseur, et rien d'autre.
+///
+/// Ce que ce geste ne fait PAS, et c'est tout son sens : ni
+/// `orchestrator.stop`, ni `stop_and_clear` — la piste en cours continue, son
+/// `now_playing`, sa position et son état de lecture restent ceux d'avant.
+/// Ce qui PRÉCÈDE le curseur reste aussi : on peut y remonter, comme
+/// l'arbitrage de #4170 l'a voulu pour l'album entier enfilé.
+///
+/// Ce qu'il fait : tronquer la file en base — locale et de service, la table
+/// est la même (`truncate_after`) —, jeter le préchargement (la piste
+/// suivante n'existe plus, ce que le tampon tenait est périmé), réaligner
+/// `queue_info` (`len = pos + 1`, `pos` inchangé) pour que le sondeur voie une
+/// fin de file au terme de la piste, et réécrire le fichier de reprise.
+///
+/// Le curseur est celui de l'état en mémoire, comme dans `queue_remove` : un
+/// ordinal dans la file affichée. Une file vide, ou un curseur déjà en
+/// dernière ligne, ne retire rien et répond quand même `204` — le geste est
+/// idempotent.
+async fn queue_clear_suite(state: &AppState, zone_id: i64) -> impl IntoResponse {
+    let avant = state.playback.get_state(zone_id).await;
+    let curseur = avant.queue_position;
+    let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    let retirees = match queue_repo.truncate_after(zone_id, curseur) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(zone_id, curseur, error = %e, "queue_clear_suite_failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    };
+    state.orchestrator.clear_prefetch().await;
+    // La longueur vraie est celle de la base ; si elle ne répond plus juste
+    // après avoir écrit, on le dit, et on retombe sur l'arithmétique du geste
+    // plutôt que sur une valeur inventée.
+    let longueur = match queue_repo.count_all(zone_id) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(zone_id, error = %e, "queue_clear_suite_count_failed");
+            (avant.queue_length - retirees as i64).max(0)
+        }
+    };
+    state
+        .playback
+        .update_queue_info(zone_id, curseur, longueur)
+        .await;
+    persist_queue_async(state, zone_id);
+    info!(
+        zone_id,
+        curseur, retirees, longueur, "queue_cleared_after_current"
+    );
+    state.event_bus.emit(
+        "playback.queue.cleared",
+        serde_json::json!({ "zone_id": zone_id, "keep_current": true, "removed": retirees }),
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn queue_remove(
@@ -6567,7 +6652,13 @@ mod vider_la_file_arrete_le_peripherique_3669 {
             "rien ne doit être arrêté avant le geste"
         );
 
-        let _ = super::queue_clear(State(state.clone()), Path(zone_id)).await;
+        let _ = super::queue_clear(
+            State(state.clone()),
+            Path(zone_id),
+            axum::extract::Query(Default::default()),
+            None,
+        )
+        .await;
 
         assert_eq!(
             arrets_recus(&state).await,
@@ -6602,6 +6693,341 @@ mod vider_la_file_arrete_le_peripherique_3669 {
             ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
             Some("stopped".into())
         );
+    }
+}
+
+/// 🔵 #4169 — « Vider la suite » : `keep_current=true` retire ce qui SUIT le
+/// curseur et ne touche à rien d'autre.
+///
+/// Gardes de ROUTE : chaque test passe par le routeur monté (`DELETE
+/// /api/v1/zones/{id}/queue?keep_current=true`, `POST …/queue/clear` avec un
+/// corps JSON), pour prouver que le paramètre est LU sous ses deux formes, pas
+/// seulement que la fonction interne sait tronquer. Ce qui est mesuré est ce
+/// qui SORT du serveur : le nombre de `Stop` reçus par la sortie, l'état de
+/// lecture écrit en base, la file en base, et `queue_info` en mémoire.
+///
+/// Sans la garde `keep_current` dans `queue_clear`, la route retombe sur le
+/// geste d'arrêt : `stop_call_count()` passe à 1 et la file est VIDE — c'est
+/// ce que nomme le premier message d'assertion de chaque test.
+#[cfg(test)]
+mod vider_la_suite_4169 {
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+    use tune_core::db::models::Track;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::track_repo::TrackRepo;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::outputs::mock::MockOutput;
+    use tune_core::playback::{NowPlaying, PlayState};
+
+    const APPAREIL: &str = "uuid:atoll-st300";
+
+    fn service(id: &str) -> QueueInput {
+        QueueInput::Streaming {
+            source: "qobuz".into(),
+            source_id: id.into(),
+            title: format!("Piste {id}"),
+            artist: "Artiste".into(),
+            album: None,
+            cover_url: None,
+            duration_ms: 200_000,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    /// Une zone DLNA qui JOUE la piste d'ordinal `curseur` d'une file de
+    /// `longueur` entrées, `last_play_state = "playing"` en base.
+    async fn zone_en_lecture(file: &[QueueInput], curseur: i64) -> (AppState, i64) {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Salon", Some("dlna"), Some(APPAREIL))
+            .expect("création de zone");
+        state.outputs.lock().await.register(Box::new(
+            MockOutput::new(APPAREIL, "Atoll ST300").with_type("dlna"),
+        ));
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, file)
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "En cours".into(),
+                    source: "qobuz".into(),
+                    source_id: Some(format!("s{curseur}")),
+                    duration_ms: 200_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state
+            .playback
+            .update_queue_info(zone_id, curseur, file.len() as i64)
+            .await;
+        repo.save_play_state(zone_id, "playing")
+            .expect("état de lecture initial");
+        (state, zone_id)
+    }
+
+    /// Trois pistes locales existantes en base.
+    fn trois_pistes_locales(state: &AppState) -> Vec<QueueInput> {
+        let tracks = TrackRepo::with_backend(state.backend.clone());
+        (0..3)
+            .map(|i| {
+                let mut t = Track::new(format!("Locale {i}"));
+                t.file_path = Some(format!("/musique/{i}.flac"));
+                QueueInput::Local {
+                    track_id: tracks.create(&t).expect("piste locale"),
+                }
+            })
+            .collect()
+    }
+
+    async fn arrets_recus(state: &AppState) -> u64 {
+        let registre = state.outputs.lock().await;
+        let arc = registre.get(APPAREIL).expect("sortie enregistrée");
+        let sortie = arc.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .expect("MockOutput")
+            .stop_call_count()
+    }
+
+    async fn envoyer(state: &AppState, requete: Request<Body>) -> StatusCode {
+        crate::routes::router(state.clone())
+            .oneshot(requete)
+            .await
+            .expect("réponse du routeur")
+            .status()
+    }
+
+    fn ordinaux(state: &AppState, zone_id: i64) -> Vec<i64> {
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .get_ordered(zone_id)
+            .expect("file")
+            .iter()
+            .map(|e| e.position)
+            .collect()
+    }
+
+    /// `DELETE …/queue?keep_current=true` sur une file de SERVICE, curseur au
+    /// milieu : la suite tombe, le curseur et ce qui le précède restent, et
+    /// la lecture n'est pas touchée.
+    #[tokio::test]
+    async fn delete_keep_current_tronque_la_file_de_service_sans_arreter() {
+        let file = [service("s0"), service("s1"), service("s2"), service("s3")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+
+        let statut = envoyer(
+            &state,
+            Request::delete(format!("/api/v1/zones/{zone_id}/queue?keep_current=true"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert_eq!(
+            arrets_recus(&state).await,
+            0,
+            "« vider la suite » ne doit envoyer AUCUN Stop au périphérique : \
+             sans la garde `keep_current`, la route retombe sur `orchestrator.stop`"
+        );
+        let apres = state.playback.get_state(zone_id).await;
+        assert_eq!(
+            apres.state,
+            PlayState::Playing,
+            "la piste en cours continue"
+        );
+        assert_eq!(
+            apres
+                .now_playing
+                .as_ref()
+                .and_then(|np| np.source_id.clone()),
+            Some("s1".into()),
+            "`now_playing` intact — `stop_and_clear` n'a pas dû passer"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("playing".into()),
+            "la base dit toujours « playing »"
+        );
+        let restantes = PlayQueueRepo::with_backend(state.backend.clone())
+            .get_ordered(zone_id)
+            .expect("file");
+        assert_eq!(
+            restantes
+                .iter()
+                .map(|e| e.source_id.clone().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["s0".to_string(), "s1".to_string()],
+            "il reste ce qui précède le curseur et le curseur lui-même"
+        );
+        assert_eq!(ordinaux(&state, zone_id), vec![0, 1]);
+        assert_eq!(
+            (apres.queue_position, apres.queue_length),
+            (1, 2),
+            "queue_info : pos inchangée, len = pos + 1 — c'est ce que lit le sondeur \
+             pour décider d'une fin de file"
+        );
+    }
+
+    /// `POST …/queue/clear` avec `{"keep_current": true}` dans le corps — la
+    /// forme qu'appelle le client web — sur une file LOCALE, curseur en tête.
+    #[tokio::test]
+    async fn post_clear_corps_json_keep_current_tronque_la_file_locale_sans_arreter() {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("AppState");
+        let file = trois_pistes_locales(&state);
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = repo
+            .create("Salon", Some("dlna"), Some(APPAREIL))
+            .expect("création de zone");
+        state.outputs.lock().await.register(Box::new(
+            MockOutput::new(APPAREIL, "Atoll ST300").with_type("dlna"),
+        ));
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .append(zone_id, &file)
+            .expect("mise en file");
+        state
+            .playback
+            .play(
+                zone_id,
+                NowPlaying {
+                    title: "Locale 0".into(),
+                    source: "local".into(),
+                    duration_ms: 200_000,
+                    ..Default::default()
+                },
+            )
+            .await;
+        state.playback.update_queue_info(zone_id, 0, 3).await;
+        repo.save_play_state(zone_id, "playing")
+            .expect("état de lecture initial");
+
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"keep_current": true}"#))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert_eq!(
+            arrets_recus(&state).await,
+            0,
+            "corps JSON `keep_current` : aucun Stop — sans la garde, \
+             `orchestrator.stop` est appelé"
+        );
+        let restantes = PlayQueueRepo::with_backend(state.backend.clone())
+            .get_ordered(zone_id)
+            .expect("file");
+        assert_eq!(restantes.len(), 1, "il ne reste que la piste en cours");
+        assert_eq!(
+            restantes[0].track_id,
+            file.first().and_then(|q| match q {
+                QueueInput::Local { track_id } => Some(*track_id),
+                _ => None,
+            }),
+            "et c'est bien la piste locale d'ordinal 0"
+        );
+        let apres = state.playback.get_state(zone_id).await;
+        assert_eq!(apres.state, PlayState::Playing);
+        assert_eq!((apres.queue_position, apres.queue_length), (0, 1));
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("playing".into())
+        );
+    }
+
+    /// Non-régression, par la ROUTE : sans le paramètre, `POST …/queue/clear`
+    /// (corps `{}` comme l'envoie le client web) arrête tout — le `Stop` part
+    /// et la file est vide. C'est #3669, conservé par l'arbitrage.
+    #[tokio::test]
+    async fn sans_keep_current_la_route_arrete_encore_tout() {
+        let file = [service("s0"), service("s1"), service("s2")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+
+        let statut = envoyer(
+            &state,
+            Request::post(format!("/api/v1/zones/{zone_id}/queue/clear"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert_eq!(
+            arrets_recus(&state).await,
+            1,
+            "sans `keep_current`, « vider la file » doit toujours envoyer UN Stop (#3669)"
+        );
+        assert_eq!(
+            PlayQueueRepo::with_backend(state.backend.clone())
+                .count_all(zone_id)
+                .unwrap_or(-1),
+            0,
+            "et la file est entièrement vidée"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone()).get_last_play_state(zone_id),
+            Some("stopped".into())
+        );
+    }
+
+    /// `keep_current=false` posé explicitement vaut absence : tout s'arrête.
+    #[tokio::test]
+    async fn keep_current_false_explicite_arrete_tout() {
+        let file = [service("s0"), service("s1")];
+        let (state, zone_id) = zone_en_lecture(&file, 0).await;
+
+        let statut = envoyer(
+            &state,
+            Request::delete(format!("/api/v1/zones/{zone_id}/queue?keep_current=false"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert_eq!(arrets_recus(&state).await, 1);
+        assert_eq!(
+            PlayQueueRepo::with_backend(state.backend.clone())
+                .count_all(zone_id)
+                .unwrap_or(-1),
+            0
+        );
+    }
+
+    /// Curseur déjà en dernière ligne : le geste ne retire rien, ne stoppe
+    /// rien, et répond quand même `204` — idempotent.
+    #[tokio::test]
+    async fn curseur_en_derniere_ligne_ne_change_rien() {
+        let file = [service("s0"), service("s1")];
+        let (state, zone_id) = zone_en_lecture(&file, 1).await;
+
+        let statut = envoyer(
+            &state,
+            Request::delete(format!("/api/v1/zones/{zone_id}/queue?keep_current=true"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(statut, StatusCode::NO_CONTENT);
+        assert_eq!(arrets_recus(&state).await, 0);
+        assert_eq!(ordinaux(&state, zone_id), vec![0, 1]);
+        let apres = state.playback.get_state(zone_id).await;
+        assert_eq!((apres.queue_position, apres.queue_length), (1, 2));
+        assert_eq!(apres.state, PlayState::Playing);
     }
 }
 

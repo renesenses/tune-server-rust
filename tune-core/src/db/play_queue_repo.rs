@@ -1203,6 +1203,48 @@ impl PlayQueueRepo {
         })
     }
 
+    /// « Vider la suite » (#4169) : retire tout ce qui SUIT l'ordinal
+    /// `position` dans la file unifiée — locale et de service confondues,
+    /// puisque les deux vivent dans la même table — et laisse intact ce qui
+    /// précède, curseur compris. Rend le nombre de lignes retirées.
+    ///
+    /// `position` est un ORDINAL dans l'ordre de `get_ordered`, comme pour
+    /// `remove_pos` et pour la même raison : la colonne `position` peut porter
+    /// des trous ou des doublons hérités, et un `DELETE WHERE position > ?`
+    /// raterait ou emporterait la mauvaise ligne. On résout donc les lignes à
+    /// retirer par leur `id`, puis on renumérote ce qui reste en `0..=position`
+    /// pour que la file se répare au passage. Un ordinal hors file (négatif,
+    /// ou au-delà de la dernière ligne) ne retire rien.
+    ///
+    /// Une seule écriture, engine-agnostique (`delete_by_id`,
+    /// `set_position_by_id`) : SQLite et PostgreSQL passent par le même code.
+    pub fn truncate_after(&self, zone_id: i64, position: i64) -> Result<usize, String> {
+        let entries = self.get_ordered(zone_id)?;
+        if position < 0 || position as usize >= entries.len() {
+            return Ok(0);
+        }
+        let garde = position as usize + 1;
+        let retirees = entries.len() - garde;
+        if retirees == 0 {
+            return Ok(0);
+        }
+        let delete_sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        self.db.write_tx(&mut |tx| {
+            for e in &entries[garde..] {
+                let dp: [&dyn ToSqlValue; 1] = [&e.id];
+                tx.execute(&delete_sql, &dp)?;
+            }
+            for (i, e) in entries[..garde].iter().enumerate() {
+                let pos = i as i64;
+                let p: [&dyn ToSqlValue; 2] = [&pos, &e.id];
+                tx.execute(&set_pos_sql, &p)?;
+            }
+            Ok(())
+        })?;
+        Ok(retirees)
+    }
+
     pub fn set_streaming_queue(
         &self,
         zone_id: i64,
@@ -2071,6 +2113,60 @@ mod tests {
         for (i, e) in q2.iter().enumerate() {
             assert_eq!(e.position, i as i64);
         }
+    }
+
+    /// #4169 — « vider la suite » sur une file MIXTE : ce qui suit le curseur
+    /// tombe, locale comme service ; ce qui précède reste, renuméroté.
+    #[test]
+    fn truncate_after_retire_la_suite_locale_et_service_et_garde_le_curseur() {
+        let db = test_db();
+        let track_repo = TrackRepo::new(db.clone());
+        let repo = PlayQueueRepo::new(db);
+        let mut t = Track::new("L0".into());
+        t.file_path = Some("/0.flac".into());
+        let tid = track_repo.create(&t).unwrap();
+        let mut t2 = Track::new("L3".into());
+        t2.file_path = Some("/3.flac".into());
+        let tid2 = track_repo.create(&t2).unwrap();
+        repo.append(
+            1,
+            &[
+                local(tid),
+                streaming("q1", "Q1"),
+                streaming("q2", "Q2"),
+                local(tid2),
+            ],
+        )
+        .unwrap();
+        // Une file héritée aux positions trouées : l'ordinal doit primer.
+        repo.db
+            .execute(
+                "UPDATE queue_items SET position = position * 10 WHERE zone_id = 1",
+                &[],
+            )
+            .unwrap();
+
+        assert_eq!(repo.truncate_after(1, 1).unwrap(), 2);
+        let q = repo.get_ordered(1).unwrap();
+        assert_eq!(q.len(), 2, "curseur en 1 : deux lignes restent");
+        assert_eq!(q[0].track_id, Some(tid));
+        assert_eq!(q[1].source_id.as_deref(), Some("q1"));
+        for (i, e) in q.iter().enumerate() {
+            assert_eq!(e.position, i as i64, "renumérotée en 0..=1");
+        }
+
+        // Curseur déjà en dernière ligne, ou hors file : rien ne bouge.
+        assert_eq!(repo.truncate_after(1, 1).unwrap(), 0);
+        assert_eq!(repo.truncate_after(1, 7).unwrap(), 0);
+        assert_eq!(repo.truncate_after(1, -1).unwrap(), 0);
+        assert_eq!(repo.count_all(1).unwrap(), 2);
+
+        // Curseur en tête : il ne reste que lui.
+        assert_eq!(repo.truncate_after(1, 0).unwrap(), 1);
+        let q = repo.get_ordered(1).unwrap();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].track_id, Some(tid));
+        assert_eq!(q[0].position, 0);
     }
 
     #[test]
