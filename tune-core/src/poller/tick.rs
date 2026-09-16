@@ -58,7 +58,7 @@ impl PositionPoller {
                     // Chemin « zone au repos » : rien ne joue, donc rien ne
                     // peut manquer à l'anneau. Le relevé de famine n'a de sens
                     // que sur le chemin de lecture, plus bas.
-                    Ok((s, signal_path, dsp_metrics, _famine, transformations)) => {
+                    Ok((s, signal_path, dsp_metrics, _famine, transformations, _progress)) => {
                         let b = idle_backoff.entry(zone_id).or_default();
                         b.record_success(s.state);
                         // Clôture de panne (#2566) : muette si le sondage
@@ -643,7 +643,15 @@ impl PositionPoller {
                     }
                 };
                 match get_status_with_signal_path_bounded(&output_arc, *STATUS_POLL_TIMEOUT).await {
-                    Ok((s, signal_path, dsp_metrics, famine, transformations)) => {
+                    Ok((s, signal_path, dsp_metrics, famine, transformations, progress)) => {
+                        self.playback
+                            .observe_processing_progress(
+                                zone_id,
+                                zone_state.track_generation,
+                                s.realtime,
+                                progress,
+                            )
+                            .await;
                         ps.consecutive_errors = 0;
                         ps.transition(fsm::Transition::SondeRetablie);
                         // Clôture de panne (#2566) : muette si le sondage

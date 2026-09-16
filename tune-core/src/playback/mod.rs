@@ -451,6 +451,12 @@ pub struct ZoneState {
     /// d'état on ne conclut rien.
     #[serde(skip)]
     pub derniere_avance_de_position: Option<Instant>,
+    /// Last observed byte count and its last advance for non-realtime work.
+    /// A fixed media position is normal while such an output processes a file.
+    /// This observation expires when the byte count stops advancing, even if
+    /// the output keeps answering status polls. Transport commands reset it.
+    #[serde(skip)]
+    pub progression_hors_temps_reel: Option<(u64, Instant)>,
     /// Instant où la question « quelqu'un observe-t-il cette zone avancer ? »
     /// a été ROUVERTE par une commande — le début de la fenêtre que
     /// [`Self::derniere_avance_de_position`] est chargée de remplir.
@@ -551,6 +557,7 @@ impl Default for ZoneState {
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,
+            progression_hors_temps_reel: None,
             observation_rouverte_a: None,
         }
     }
@@ -558,6 +565,8 @@ impl Default for ZoneState {
 
 /// Une zone annoncée `Playing` dont la position observée n'a plus bougé depuis
 /// `silence_max` est-elle FIGÉE ?
+/// Pour une sortie hors temps réel qui mesure ses octets, leur progression
+/// remplace celle de la position audio, qui peut légitimement être plafonnée.
 ///
 /// Le prédicat de #3581, et la seule question qu'on sache poser honnêtement à
 /// un état mémoire : *quelqu'un observe-t-il encore cette zone avancer ?*
@@ -586,6 +595,9 @@ pub fn zone_figee(state: &ZoneState, silence_max: std::time::Duration) -> bool {
         .unwrap_or(false);
     if est_radio {
         return false;
+    }
+    if let Some((_, avance)) = state.progression_hors_temps_reel {
+        return avance.elapsed() >= silence_max;
     }
     match state.derniere_avance_de_position {
         Some(t) => t.elapsed() >= silence_max,
@@ -1102,6 +1114,7 @@ impl PlaybackManager {
         // Nouveau flux : la mesure d'avance d'avant ne décrit plus rien, et
         // rien n'a encore été observé de celui-ci. « Je ne sais pas » (#3581).
         state.derniere_avance_de_position = None;
+        state.progression_hors_temps_reel = None;
         // … et la fenêtre d'observation s'ouvre ICI. Sans cette date, « je ne
         // sais pas » n'a pas de fin : c'est ce qui laissait une zone jamais
         // observée retenir la mise à jour sans aucune borne (#3581).
@@ -1174,6 +1187,7 @@ impl PlaybackManager {
             // La mesure d'avance date d'avant la pause : elle ne dit rien de
             // la lecture qui repart (#3581).
             state.derniere_avance_de_position = None;
+            state.progression_hors_temps_reel = None;
             // La reprise rouvre la fenêtre : ce qui reste à jouer se compte à
             // partir de maintenant, et de `position_ms` (#3581).
             state.observation_rouverte_a = Some(Instant::now());
@@ -1199,6 +1213,7 @@ impl PlaybackManager {
             state.paused_at = None;
             state.last_seek_at = None;
             state.derniere_avance_de_position = None;
+            state.progression_hors_temps_reel = None;
             state.observation_rouverte_a = None;
             // Keep position_ms and now_playing so the UI shows where
             // playback left off and can resume from the same position.
@@ -1255,9 +1270,12 @@ impl PlaybackManager {
             tracing::warn!(
                 zone_id = *zone_id,
                 immobile_secs = state
-                    .derniere_avance_de_position
+                    .progression_hors_temps_reel
+                    .map(|(_, t)| t)
+                    .or(state.derniere_avance_de_position)
                     .map(|t| t.elapsed().as_secs())
                     .unwrap_or_default(),
+                octets_traites = state.progression_hors_temps_reel.map(|(bytes, _)| bytes),
                 seuil_secs = silence_max.as_secs(),
                 "zone_figee_rattrapee"
             );
@@ -1268,6 +1286,7 @@ impl PlaybackManager {
             state.paused_at = None;
             state.last_seek_at = None;
             state.derniere_avance_de_position = None;
+            state.progression_hors_temps_reel = None;
             state.observation_rouverte_a = None;
             evenements.push(PlaybackEvent {
                 event: "stopped".into(),
@@ -1302,6 +1321,7 @@ impl PlaybackManager {
             state.pending_resume_ms = None;
             state.metadata_changed_at_ms = None;
             state.derniere_avance_de_position = None;
+            state.progression_hors_temps_reel = None;
             state.observation_rouverte_a = None;
         }
         self.sync_sleep_inhibition(&zones);
@@ -1365,6 +1385,7 @@ impl PlaybackManager {
             // observation repart d'ailleurs, la mesure d'avance d'avant ne
             // vaut plus (#3581).
             state.derniere_avance_de_position = None;
+            state.progression_hors_temps_reel = None;
             // Le déplacement rouvre la fenêtre, et il change ce qui reste à
             // jouer : les deux se lisent ensemble (#3581).
             state.observation_rouverte_a = Some(Instant::now());
@@ -1515,6 +1536,43 @@ impl PlaybackManager {
         z.session_context_type = context_type;
         z.session_context_id = context_id;
         z.session_context_source = context_source;
+    }
+
+    /// Observe actual work independently of the displayed media position.
+    /// Ignore a result from a previous track; a poll can overlap a command.
+    pub async fn observe_processing_progress(
+        &self,
+        zone_id: i64,
+        track_generation: u64,
+        realtime: bool,
+        bytes: Option<u64>,
+    ) {
+        let mut zones = self.zones.lock().await;
+        let Some(state) = zones.get_mut(&zone_id) else {
+            return;
+        };
+        if state.track_generation != track_generation || state.state != PlayState::Playing {
+            return;
+        }
+        if realtime {
+            state.progression_hors_temps_reel = None;
+            return;
+        }
+        // A missing measurement must not erase the last observation: if the
+        // output disappears or its file becomes unreadable, that observation
+        // still expires. It must not fall back to the synthetic media clock.
+        let Some(bytes) = bytes else {
+            return;
+        };
+        match &mut state.progression_hors_temps_reel {
+            Some((previous, advanced)) => {
+                if bytes > *previous {
+                    *advanced = Instant::now();
+                }
+                *previous = bytes;
+            }
+            None => state.progression_hors_temps_reel = Some((bytes, Instant::now())),
+        }
     }
 
     /// Publier une position OBSERVÉE sur le renderer, et rendre celle qui a
@@ -1739,6 +1797,9 @@ fn now_playing_event_data(state: &ZoneState) -> serde_json::Value {
 }
 
 #[cfg(test)]
+mod progression_hors_temps_reel_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1785,6 +1846,7 @@ mod tests {
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,
+            progression_hors_temps_reel: None,
             observation_rouverte_a: None,
         };
         let v = now_playing_event_data(&state);
@@ -2531,6 +2593,7 @@ mod zone_figee_tests {
                 ..Default::default()
             }),
             derniere_avance_de_position: None,
+            progression_hors_temps_reel: None,
             observation_rouverte_a: fenetre_ouverte_il_y_a
                 .map(|d| Instant::now().checked_sub(d).expect("horloge trop jeune")),
             ..Default::default()

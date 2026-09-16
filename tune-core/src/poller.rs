@@ -72,12 +72,18 @@ async fn get_status_with_signal_path_bounded(
         Option<OutputDspMetrics>,
         Option<OutputRingStarvation>,
         Option<TransformationsReelles>,
+        Option<u64>,
     ),
     String,
 > {
     let poll = async {
         let output = output_arc.lock().await;
         let status = output.get_status().await?;
+        let progress = if status.realtime {
+            None
+        } else {
+            output.processing_progress_bytes().await
+        };
         Ok((
             status,
             output.signal_path_status(),
@@ -86,6 +92,7 @@ async fn get_status_with_signal_path_bounded(
             // Même verrou, même tick (REF-6b, #2219) : ce que la sortie a
             // réellement fait au flux se relève à côté de sa sonde.
             output.transformations_reelles(),
+            progress,
         ))
     };
     match timeout {
