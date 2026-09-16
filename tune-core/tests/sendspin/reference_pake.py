@@ -60,7 +60,7 @@ for line in sys.stdin:
             if scenario == "wrong_tag": tag = bytes([tag[0]^1])+tag[1:]
             if scenario == "wrong_wrap": wp = bytes([wp[0]^1])+wp[1:]
             if scenario == "wrong_nonce_wrap": wn = bytes([wn[0]^1])+wn[1:]
-            result = {"verified": True, "tag":tag.hex(), "psk_id":psk_id_for(psk), "wrapped_psk":wp.hex(), "wrapped_nonce":wn.hex()}
+            result = {"verified": True, "tag":tag.hex(), "psk_id":psk_id_for(psk), "psk":psk.hex(), "wrapped_psk":wp.hex(), "wrapped_nonce":wn.hex()}
     elif q["op"] == "end":
         print(json.dumps({"ended":True}),flush=True)
         break

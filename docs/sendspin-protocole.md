@@ -447,7 +447,7 @@ côté Tune :
 WARN sendspin_client_hello_en_clair_refuse reglage="TUNE_SENDSPIN_ALLOW_UNENCRYPTED"
 ```
 
-## 13. S2-b en cours : identité et magasin persistants (16/09/2026)
+## 13. S2-b : identité, magasin et appairage (16/09/2026)
 
 Intervention : **JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing**.
 
@@ -480,7 +480,7 @@ Le champ `handshaked[].authenticated` décrit une session ayant vérifié une
 clé longue durée ; `psk_category` et `credential_mismatch` distinguent les
 autres cas. Cette observation n'accorde aucun droit de lecture.
 
-Les trois parcours d'appairage et leur interface opérateur restent en cours.
+Les trois parcours d’appairage sont raccordés aux commandes opérateur décrites en 13.2.
 Aucun appairage de démonstration n'est provisionné au démarrage. Les fixtures
 de tests alimentent seules les records de cette étape. Le serveur n'offre
 toujours aucune activité audio (`playback_supported: false`).
@@ -503,5 +503,58 @@ La comparaison numérique et les contre-épreuves sont détaillées dans
 Le SDK aiosendspin épinglé omet encore le tour dans son SID d'appairage.
 Les bancs comparent donc ses objets cryptographiques et helpers aux API
 natives, avec le SID de la spécification épinglée ; ils ne valident pas
-son parcours complet. Les commandes opérateur et les échanges WebSocket
-d'appairage restent à brancher, ainsi que la gestion des tentatives et reprises.
+son client complet. Le branchement HTTP/WebSocket, les tentatives et les
+reprises sont maintenant éprouvés par le banc décrit en 13.2.
+
+
+### 13.2 Commandes opérateur et parcours WebSocket S2-b
+
+Intervention : **JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing**.
+
+Les commandes suivent la politique administrateur de Tune (`RequireAdmin`).
+Lorsque l’authentification est activée, elles refusent une requête anonyme
+(401) ou un utilisateur sans rôle administrateur (403). La politique LAN de
+Tune reste applicable lorsque l’authentification est désactivée.
+
+| Route sous `/api/v1/devices/sendspin/{client_id}` | Opération |
+| --- | --- |
+| `GET /pair` | état de la connexion et de l’essai, sans clé privée |
+| `POST /pair` | démarrage PSK, code statique, chiffres dynamiques ou QR |
+| `POST /pair/code` | saisie du code demandé |
+| `DELETE /pair` | annulation de l’essai, transport conservé |
+| `DELETE /credentials` | retrait du record durable et révocation de la connexion |
+
+La PSK est écrite avant l’acquittement, puis la connexion passe en clé longue
+durée par un nouvel échange Noise. Un échec d’écriture interdit cette
+promotion. La révocation interrompt également un pair qui ne répond plus
+pendant un échange Noise. Le serveur ne publie aucune activité audio.
+
+Le banc Shrek conduit dix parcours sur le vrai routeur HTTP/WebSocket :
+statique dans chaque suite, chiffres et QR dans chaque suite avec succès ou
+reprise après mauvais code. Chacun vérifie l’attente du geste, l’annulation,
+un nouvel essai, le stockage avant acquittement, la reconnexion LT et la
+révocation. Le client de fixture combine Snow pour Noise, CPace Python et les
+helpers aiosendspin épinglés pour les codes et l’enveloppement des clés.
+Le SID inclut le numéro de tour imposé par la spécification. Ce résultat
+ne prétend pas valider le client aiosendspin complet ni une enceinte réelle.
+
+### 13.3 Refus init et erreurs cryptographiques
+
+La spécification épinglée distingue désormais deux familles de refus :
+
+- Un `client/init` mal formé reçoit `server/error` avec `malformed`, puis
+  la connexion ferme. Une version entière autre que 1 reçoit
+  `unsupported_version`, même si les autres champs sont absents ou invalides.
+  En version 1, la suite est vérifiée avant l’identité : une suite inconnue
+  reçoit `unsupported_suite`.
+- Une erreur ultérieure de Noise, d’authentification du transport ou une
+  trame en clair après Noise provoque une fermeture sans message applicatif.
+
+La validation conserve les octets bruts de l’init pour le prologue Noise ;
+elle tolère les champs d’extension. Les tests couvrent l’émission unique du
+refus, l’ordre de validation, les deux suites et les fermetures silencieuses.
+Les contre-épreuves et limites sont consignées dans la mesure S2-b.
+
+S2-c/S2-d, `OutputTarget` et l’album synchronisé sur deux enceintes restent
+nécessaires pour fermer #3326. Aucune version publiée ni acceptation matérielle
+n’est revendiquée ici.

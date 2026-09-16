@@ -556,3 +556,120 @@ Le script verify-runtime-guards.sh et le journal counter-runtime-guards.log
 sont conserves dans les preuves Shrek pour reprise apres liberation du cache.
 Les trois tests internes du registre de sessions et Clippy serveur restent
 a executer ; les resultats verts ci-dessus ne les englobent pas.
+
+
+## Reprise après nettoyage : contre-épreuves serveur et parcours CPace
+
+JP Robbe / OpenAI Codex / jp-robbe-20260916-3326-pairing.
+
+Cette section remplace les états « interrompu » et « à brancher » ci-dessus.
+Les mesures historiques restent datées par leurs étapes ; elles ne sont pas
+additionnées comme de nouvelles exécutions.
+
+### Trois gardes serveur éprouvées
+
+Commande : `cargo test --locked -j6 -p tune-server --no-default-features
+--features oaat --test sendspin_point_d_acces_s2a runtime_3326::`.
+
+La mutation retire les contrôles administrateur, ignore le résultat de
+persistance et suspend l’écoute de révocation pendant le rééchange.
+La compilation réussit ; **2 tests passent et les 3 témoins attendus échouent** :
+
+- `i3326_runtime_commandes_exigent_un_administrateur_quand_auth_active` :
+  `GET pair, role=Some("user")`, résultat 404 au lieu de 403 ;
+- `i3326_runtime_ecriture_impossible_ne_confirme_pas_l_appairage` :
+  « une ecriture impossible ne doit emettre ni acquittement ni re-echange LT » ;
+- `i3326_runtime_revocation_interrompt_un_reechange_sans_reponse` :
+  « la revocation doit interrompre le re-echange sans attendre le pair ».
+
+Les tests sont inchangés par SHA-256 pendant la contre-épreuve.
+Restauration des deux fichiers de production par `cp`, puis **15 tests
+passent et un banc matériel reste ignoré**. Journaux :
+`counter-runtime-guards.log`, `runtime-tests-restored.log`,
+`runtime-tests-after-counter.log`.
+
+### Init : émission et ordre du refus
+
+Commande de contre-épreuve : même commande Cargo, filtre `init_3326::`.
+
+- Retirer seulement l’envoi de `server/error` compile puis donne **1 vert /
+  3 rouges**. Les trois témoins nomment « un echec init exige server/error
+  avant fermeture ».
+- Vérifier `client_id` avant la version et la suite compile puis donne
+  **2 verts / 2 rouges**. Les témoins de priorité version/suite nomment
+  « l'ordre enveloppe/version/suite/identite doit determiner le refus ».
+
+Le témoin d’erreur Noise reste vert dans les deux mutations. Les fichiers de
+tests restent inchangés par SHA-256 ; restauration par `cp`, puis **19 verts /
+1 ignoré**. Journaux : `counter-init-emission.log`, `counter-init-ordre.log`,
+`init-tests-restored.log` et `init-tests-after-counter.log`.
+
+La matrice couvre JSON/enveloppe invalides, version absente ou non entière,
+versions futures et négatives jusqu’aux limites i64/u64, suite inconnue,
+identité invalide, fermeture après un unique refus, Noise invalide, erreur
+AEAD et texte après activation. Les échanges nominaux gardent un champ futur
+et des espaces dans le prologue brut, dans les deux suites.
+
+### CPace sur le vrai HTTP/WebSocket
+
+Commande : `SENDSPIN_REFERENCE_PYTHON=<venv épinglé>/bin/python3
+cargo test --locked -j6 -p tune-server --no-default-features --features oaat
+--test sendspin_point_d_acces_s2a i3326_cpace_websocket -- --ignored --nocapture`.
+
+**Un test exécute dix scénarios, tous verts** (23,64 s hors compilation) :
+
+- code statique dans chacune des deux suites ;
+- chiffres dynamiques dans chacune des suites, avec succès direct ou reprise ;
+- QR dans chacune des suites, avec succès direct ou reprise.
+
+Chaque scénario passe par attente de geste, échange d’horloge sans partage
+prématuré, annulation et nouveau compteur d’essai, appairage, fichier durable
+avant acquittement, rééchange LT, reconnexion LT puis révocation active.
+Une reprise conserve les nonces, change l’éphémère et le SID du tour, et
+accepte une extension future. Un mauvais code ou une annulation laisse le
+magasin initial inchangé.
+
+Le premier essai du banc supposait à tort que `pairing.json` n’existait pas
+avant le premier appairage : le magasin crée déjà le fichier avec l’identité.
+Le témoin compare maintenant les octets au magasin initial ; ce premier
+échec est une correction de fixture, pas une contre-épreuve de production.
+
+Journal : `cpace-runtime-second.log`. Le processus Python est une fixture
+bornée, utilisant CPace 0.1.0 et les helpers aiosendspin épinglés. Le transport
+client repose sur Snow. L’omission de `round` dans le SDK épinglé impose
+toujours le SID normatif dans le banc : **aucune interopérabilité du client
+SDK complet ou d’une enceinte réelle n’est annoncée**. Les secrets émis par
+l’auxiliaire Python sont générés uniquement pour ces fixtures éphémères.
+
+Le banc CPace est ignoré par défaut et exécuté explicitement sur Shrek.
+L’autre test ignoré est le banc matériel. Ils ne sont jamais comptés parmi
+les succès ordinaires de la CI.
+
+
+### Contrôles finaux de cette étape
+
+Sur le même worktree et le même graphe oaat, six jobs :
+
+- tune-server --test sendspin_point_d_acces_s2a : **19 verts / 2 ignorés** ;
+- tune-server --lib i3326_sessions : **3 verts**, aucun ignoré ;
+- tune-core --lib sendspin:: : **73 verts**, aucun ignoré ;
+- tune-core --test sendspin_poignee_s2a : **24 verts / 4 ignorés** ;
+- même cible cœur, filtre interop_ -- --ignored --nocapture :
+  **3 verts / 0 ignoré**, 56 scénarios tiers (43,77 s hors compilation) ;
+- cargo clippy --locked -j6 -p tune-server --no-default-features --features oaat
+  --all-targets -- -D clippy::correctness : **succès**, avertissements conservés ;
+- cargo fmt --all et git diff --check : **succès**.
+
+Journaux : final-server-tests.log, final-sessions-tests.log,
+final-core-tests.log, final-core-integration.log, final-interop-selected.log
+et final-clippy.log.
+
+Une première sélection --include-ignored a également lancé directement
+l’auxiliaire i3326_processus_magasin, sans les variables de sa fixture :
+27 verts / 1 rouge. Ce lancement est conservé dans final-core-interop.log
+comme erreur de sélection. Le test parent multiprocessus passe dans la suite
+normale ; les trois bancs tiers passent dans la sélection explicite corrigée.
+Aucun test n’a été désactivé pour masquer cet échec.
+
+La CI doit porter sur le commit publié de cette étape ; les succès de la
+tête précédente ef22a846 ne valent pas validation de cette nouvelle tête.

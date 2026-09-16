@@ -140,9 +140,12 @@ async fn conversation_avec_cle(
     // 1. `client/init` — l'enceinte ouvre et CHOISIT la suite.
     let init = serde_json::json!({
         "type": "client/init",
-        "payload": {"client_id": moi.id(), "version": 1, "suite": suite.nom()}
+        "payload": {"client_id": moi.id(), "version": 1, "suite": suite.nom(),
+            "extension_future": {"version": 2}}
     })
     .to_string();
+    // La validation ne doit ni rejeter les extensions ni reencoder le prologue.
+    let init = format!("  {init}  ");
     ws.send(Message::Text(init.clone().into()))
         .await
         .expect("envoi client/init");
@@ -351,29 +354,8 @@ async fn les_deux_suites_aboutissent_sur_une_vraie_connexion() {
     }
 }
 
-#[tokio::test]
-async fn un_client_init_illisible_fait_fermer_sans_reponse_applicative() {
-    // La specification n'a AUCUN message d'erreur applicatif : la seule
-    // reaction admise a un echec de poignee de main est de fermer le
-    // WebSocket. Un serveur qui repondrait « erreur » serait hors protocole.
-    let url = point_d_acces().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("connexion");
-    ws.send(Message::Text("ceci n'est pas du JSON".into()))
-        .await
-        .expect("envoi");
-
-    match ws.next().await {
-        None => {}
-        Some(Ok(Message::Close(_))) => {}
-        Some(Ok(autre)) => panic!(
-            "aucun message applicatif ne doit partir apres un echec de poignee \
-             de main, recu : {autre:?}"
-        ),
-        Some(Err(_)) => {}
-    }
-}
+#[path = "sendspin_init_3326.rs"]
+mod init_3326;
 
 /// Garde contre « écrit mais pas branché ».
 ///

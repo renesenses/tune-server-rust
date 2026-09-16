@@ -30,7 +30,7 @@
 //! |---|---|
 //! | `client/init` | poignée de main Noise — **toujours**, mode ou pas |
 //! | `client/hello` | admis **en clair** si et seulement si le mode de transition est armé |
-//! | autre chose | fermeture, sans message applicatif |
+//! | autre chose | server/error malformed, puis fermeture |
 //!
 //! Trois points sur lesquels ce fichier ne transige pas :
 //!
@@ -113,9 +113,8 @@ async fn point_d_acces(
         .max_frame_size(128 * 1024)
         .on_upgrade(move |socket| async move {
             if let Err(e) = conduire(socket, mode, contexte).await {
-                // La specification n'a AUCUN message d'erreur applicatif : la seule
-                // reaction admise est de fermer sans rien dire au pair. Le motif
-                // reste donc chez nous, dans le journal.
+                // Seuls les defauts du client/init en clair produisent server/error.
+                // Les echecs Noise et transport ferment sans message applicatif.
                 warn!(error = %e, mode = mode.nom(), "sendspin_poignee_echouee");
             }
         })
@@ -138,13 +137,56 @@ async fn conduire(
         Some(messages::TYPE_CLIENT_HELLO) => {
             conduire_en_clair(socket, premier, mode, contexte).await
         }
-        autre => Err(ErreurSendspin::MessageIllisible(format!(
-            "premier message : {} attendu ou {} (mode de transition), recu {}",
-            messages::TYPE_CLIENT_INIT,
-            messages::TYPE_CLIENT_HELLO,
-            autre.unwrap_or("un message sans type lisible")
-        ))),
+        _ => refuser_init(&mut socket, "malformed").await,
     }
+}
+
+/// L'ordre est normatif : enveloppe, version, suite, puis identite.
+/// Une version future peut redefinir tous les autres champs du payload.
+/// Le texte original reste intact pour le prologue Noise.
+fn identite_init(texte: &str) -> Result<String, &'static str> {
+    let brute: messages::EnveloppeBrute = serde_json::from_str(texte).map_err(|_| "malformed")?;
+    if brute.type_message != messages::TYPE_CLIENT_INIT || !brute.payload.is_object() {
+        return Err("malformed");
+    }
+    let version = brute.payload.get("version").ok_or("malformed")?;
+    if !version.is_i64() && !version.is_u64() {
+        return Err("malformed");
+    }
+    if version.as_u64() != Some(u64::from(VERSION_PROTOCOLE)) {
+        return Err("unsupported_version");
+    }
+    let suite = brute
+        .payload
+        .get("suite")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("malformed")?;
+    tune_core::sendspin::suite::Suite::depuis_nom(suite).map_err(|_| "unsupported_suite")?;
+    let id = brute
+        .payload
+        .get("client_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("malformed")?;
+    tune_core::sendspin::identite::cle_publique_du_pair(id).map_err(|_| "malformed")?;
+    Ok(id.to_owned())
+}
+
+/// Uniquement avant Noise : le motif public est une indication non authentifiee.
+/// Les erreurs du magasin, de Noise et du transport ne passent jamais ici.
+async fn refuser_init(socket: &mut WebSocket, raison: &'static str) -> Result<(), ErreurSendspin> {
+    let texte = serde_json::json!({
+        "type": "server/error",
+        "payload": {"reason": raison},
+    })
+    .to_string();
+    envoyer_texte(socket, texte).await?;
+    socket
+        .send(Message::Close(None))
+        .await
+        .map_err(|e| ErreurSendspin::MessageIllisible(format!("fermeture init : {e}")))?;
+    Err(ErreurSendspin::MessageIllisible(format!(
+        "client/init : {raison}"
+    )))
 }
 
 /// Mène la séquence complète de S2-a, **chiffrée**.
@@ -168,14 +210,11 @@ async fn conduire_chiffre(
 
     // 2. La poignee de main est batie avant que quoi que ce soit ne parte : un
     //    pair que nous n'admettons pas ne doit pas meme voir notre server/init.
-    let enveloppe: messages::EnveloppeBrute = serde_json::from_str(&client_init_texte)
-        .map_err(|_| ErreurSendspin::MessageIllisible("client/init illisible".into()))?;
-    let id = enveloppe
-        .payload
-        .get("client_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ErreurSendspin::MessageIllisible("client/init sans identite".into()))?;
-    let (identite, psk) = contexte.selectionner(id).await?;
+    let id = match identite_init(&client_init_texte) {
+        Ok(id) => id,
+        Err(raison) => return refuser_init(&mut socket, raison).await,
+    };
+    let (identite, psk) = contexte.selectionner(&id).await?;
     let mut poignee = PoigneeServeur::accueillir_avec_psk(&identite, &client_init_texte, &psk)?;
     let client_id = poignee.client_id().to_string();
     let suite = poignee.suite();

@@ -521,3 +521,40 @@ async fn i3326_runtime_ecriture_impossible_ne_confirme_pas_l_appairage() {
         "le fichier precedent reste non appaire"
     );
 }
+
+#[tokio::test]
+async fn i3326_runtime_transport_corrompu_ferme_sans_server_error() {
+    for suite in Suite::toutes() {
+        for clair in [false, true] {
+            let s = Serveur::nouveau().await;
+            let mut l = Lecteur::nouveau(
+                &s,
+                Identite::generer(),
+                suite,
+                &PskPair::sentinelle(),
+                json!({}),
+            )
+            .await;
+            let message = if clair {
+                Message::Text(
+                    json!({"type":"client/time","payload":{"client_transmitted":1}})
+                        .to_string()
+                        .into(),
+                )
+            } else {
+                Message::Binary(vec![0; 48].into())
+            };
+            l.ws.send(message).await.unwrap();
+            let recu = tokio::time::timeout(Duration::from_secs(2), l.ws.next())
+                .await
+                .expect("une trame invalide doit fermer le transport");
+            match recu {
+                None | Some(Ok(Message::Close(_))) | Some(Err(_)) => {}
+                autre => panic!("un echec de transport doit rester silencieux : {autre:?}"),
+            }
+        }
+    }
+}
+
+#[path = "sendspin_cpace_runtime_3326.rs"]
+mod cpace;
