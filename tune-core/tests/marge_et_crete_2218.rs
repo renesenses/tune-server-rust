@@ -18,7 +18,7 @@
 //!
 //! # Portes utilisées — toutes PUBLIQUES
 //!
-//! `audio::replaygain::{gain_factor, apply_gain_pcm}`,
+//! `audio::replaygain::{gain_factor, playback_factor, apply_gain_pcm}`,
 //! `audio::eq::{EqProfile, EqBandSpec, EqProcessor}`,
 //! `audio::mixer::PcmMixer::apply_gain`, `audio::convolver::Convolver`,
 //! `audio::crossfeed::CrossfeedProcessor`, `audio::decode::convert_pcm_bytes`.
@@ -685,7 +685,7 @@ fn q2_un_carre_a_moins_0_05_dbfs_depasse_deja_0_dbtp_avant_tout_traitement() {
 /// Tune écrit dans `rg_track_true_peak`), la crête vraie tient sous 0 dBTP :
 /// le mécanisme est juste, c'est le tag qui manque.
 #[test]
-fn q2_replaygain_avec_pic_d_echantillon_tague_pose_le_pic_au_rail_et_laisse_la_crete_vraie_au_dessus_de_0_dbtp()
+fn q2_calcul_scalaire_sans_provenance_pose_le_pic_au_rail_et_laisse_la_crete_vraie_au_dessus_de_0_dbtp()
  {
     let x = carre(997.0, -0.05, N);
     let pic_echantillon = crete_echantillon(&x);
@@ -750,24 +750,62 @@ fn q2_replaygain_avec_pic_d_echantillon_tague_pose_le_pic_au_rail_et_laisse_la_c
     );
 }
 
-/// Le comportement ATTENDU : `prevent_clipping` avec plafond 0 dBTP tient la
-/// crête VRAIE sous 0 dBTP, même quand seul un pic d'échantillon est tagué.
+/// #4074 : tags réels → porte de lecture → PCM → mètre FIR indépendant.
+/// La réserve estimée couvre ce carré ; elle n'est pas une garantie universelle.
 #[test]
-#[ignore = "défaut connu : avec un pic d'ÉCHANTILLON tagué (sans rg_track_true_peak), prevent_clipping laisse passer jusqu'à +2,1 dBTP (issue C)"]
-fn q2_defaut_connu_prevent_clipping_devrait_tenir_la_crete_vraie_sous_0_dbtp_avec_un_pic_d_echantillon()
- {
-    let x = carre(997.0, -0.05, N);
-    let gain = TrackGain {
-        gain_db: 6.0,
-        peak: Some(crete_echantillon(&x)),
+fn q2_sample_peak_headroom_protects_the_square_through_playback() {
+    use std::sync::Arc;
+    use tune_core::audio::replaygain::{MODE_KEY, TRUE_PEAK_CEILING_KEY, playback_factor};
+    use tune_core::db::{
+        backend::DbBackend, settings_repo::SettingsRepo, sqlite::SqliteDb,
+        track_metadata_repo::TrackMetadataRepo,
     };
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    tune_core::db::migrations::run_migrations(&db).unwrap();
+    db.execute("INSERT INTO artists (id, name) VALUES (1, 'T9')", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO albums (id, title, artist_id) VALUES (1, 'T9', 1)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO tracks (id, title, album_id, artist_id, file_path, duration_ms, sample_rate, channels) VALUES (42, 'T9', 1, 1, '/t9.flac', 1000, 44100, 1)", &[]).unwrap();
+    let backend: Arc<dyn DbBackend> = Arc::new(db);
+    let settings = SettingsRepo::with_backend(backend.clone());
+    settings.set(MODE_KEY, "track").unwrap();
+    let meta = TrackMetadataRepo::with_backend(backend.clone());
+    let x = carre(997.0, -0.05, N);
+    meta.set(42, "rg_track_gain", "+6").unwrap();
+    meta.set(42, "rg_track_peak", &crete_echantillon(&x).to_string())
+        .unwrap();
+    for ceiling in [0.0, -1.0] {
+        settings
+            .set(TRUE_PEAK_CEILING_KEY, &ceiling.to_string())
+            .unwrap();
+        let factor = playback_factor(&backend, 42);
+        let mut pcm = vers_pcm(&x, 24);
+        apply_gain_pcm(&mut pcm, 24, factor);
+        let tp = dbtp(&normalise(&depuis_pcm(&pcm, 24), 24));
+        eprintln!("sample peak: ceiling {ceiling}, factor {factor:.6}, true peak {tp:+.3} dBTP");
+        assert!(
+            tp <= ceiling && tp > ceiling - 1.0,
+            "crête vraie {tp:+.3} dBTP"
+        );
+    }
+    settings.set(TRUE_PEAK_CEILING_KEY, "0").unwrap();
+    meta.set(42, "rg_track_true_peak", &amplitude(dbtp(&x)).to_string())
+        .unwrap();
     let mut pcm = vers_pcm(&x, 24);
-    apply_gain_pcm(&mut pcm, 24, gain_factor(gain, reglages(true, 0.0)));
+    apply_gain_pcm(&mut pcm, 24, playback_factor(&backend, 42));
     let tp = dbtp(&normalise(&depuis_pcm(&pcm, 24), 24));
-    assert!(tp <= 0.0, "crête vraie {tp:+.2} dBTP");
+    assert!(
+        tp <= 0.005 && tp > -0.1,
+        "true peak must replace the estimate: {tp}"
+    );
 }
 
-/// La chaîne du bras progressif, dans son ordre : ReplayGain (+6 dB, pic
+/// Référence scalaire sans provenance (#4074), dans l’ordre du bras progressif : ReplayGain (+6 dB, pic
 /// d'échantillon tagué) PUIS égaliseur (+6 dB de crête à 3 kHz, réserve
 /// −7,13 dB depuis #4073 : la norme L1 d'une cloche de +6 dB vaut 7,13 dB,
 /// plus que la somme des gains), sur un sinus 997 Hz à −0,1 dBFS, 16 bits.

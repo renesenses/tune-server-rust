@@ -65,7 +65,7 @@ pub(super) struct EntreesCoreAudio {
     /// `data_offset` est le début du PCM.
     pub(super) header_buf: Vec<u8>,
     /// La réponse HTTP, positionnée après `header_buf`.
-    pub(super) reader: reqwest::blocking::Response,
+    pub(super) reader: super::LecteurHttpAnnulable,
     pub(super) frame_bytes: usize,
     pub(super) spec: AudioSpec,
     pub(super) seek_offset: u64,
