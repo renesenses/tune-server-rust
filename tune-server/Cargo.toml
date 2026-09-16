@@ -680,3 +680,10 @@ path = "tests/alarm_source_3715.rs"
 [[test]]
 name = "history_context_4036"
 path = "tests/history_context_4036.rs"
+
+# #3685 — « Remplacer » dans la récupération de playlist : le corps
+# `{replacements}` est lu, appliqué ou refusé nommément. `autotests = false`
+# plus haut : sans cette cible, le banc ne serait jamais compilé.
+[[test]]
+name = "recuperation_playlist_remplacer_3685"
+path = "tests/recuperation_playlist_remplacer_3685.rs"
