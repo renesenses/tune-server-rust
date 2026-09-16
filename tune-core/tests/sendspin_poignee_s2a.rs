@@ -102,7 +102,7 @@ impl Enceinte {
         let mut tampon = vec![0u8; MAX_NOISE];
         let n = self
             .etat
-            .write_message(&[], &mut tampon)
+            .write_message(b"{}", &mut tampon)
             .expect("ecriture du message noise 2");
         tampon.truncate(n);
         serde_json::json!({
@@ -328,3 +328,9 @@ fn le_transport_refuse_ce_qui_depasse_une_trame_au_lieu_de_le_tronquer() {
         "exactement une trame doit passer"
     );
 }
+
+#[path = "sendspin/appairage_transport.rs"]
+mod appairage_transport;
+
+#[path = "sendspin/interop_reference.rs"]
+mod interop_reference;

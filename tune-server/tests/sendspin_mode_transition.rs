@@ -307,7 +307,7 @@ async fn avec_le_mode_de_transition_un_client_capable_de_noise_negocie_quand_mem
 
     // 4. message Noise 2.
     let mut tampon = vec![0u8; MAX_NOISE];
-    let n = etat.write_message(&[], &mut tampon).expect("noise 2");
+    let n = etat.write_message(b"{}", &mut tampon).expect("noise 2");
     tampon.truncate(n);
     ws.send(Message::Text(
         serde_json::json!({

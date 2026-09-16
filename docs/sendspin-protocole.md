@@ -4,12 +4,19 @@ Relevé le 08/09/2026 sur `https://github.com/Sendspin/spec`, commit `e0a28529`
 (07/09/2026). Chantier #3326, phase 1. Tout ce qui suit est cité de la
 spécification ou vérifié par requête ; rien n'est déduit.
 
-> **Le dépôt de spécification ne porte AUCUNE licence.**
+> **Constat historique du 08/09/2026 : aucune licence identifiée à cette date.**
 > `https://api.github.com/repos/Sendspin/spec/license` → `404`,
 > `"license": null` sur le dépôt, aucun fichier `LICENSE` à la racine.
 > Les implémentations, elles, sont licenciées (voir § Écosystème).
 > Ce document est une NOTE DE LECTURE : il décrit ce que la spécification
 > demande, il n'en recopie pas le texte.
+
+**Actualisation du 16/09/2026 :** la révision
+[8a8b1cbd6764ea116dcaa07e41544a97bc13080c](https://github.com/Sendspin/spec/tree/8a8b1cbd6764ea116dcaa07e41544a97bc13080c)
+contient désormais `LICENSE.md` (`Community-Spec-1.0`). Les relevés ci-dessous
+restent datés ; le travail S2-b utilise cette révision précise et le suivi
+[3326-sendspin-appairage.md](mesures/3326-sendspin-appairage.md).
+Les anciens noms et formats d'appairage ne constituent donc pas son contrat.
 
 ## 0. Le renversement de vocabulaire, à lire en premier
 

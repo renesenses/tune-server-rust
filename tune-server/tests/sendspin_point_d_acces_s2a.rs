@@ -170,7 +170,7 @@ async fn conversation_complete(suite: Suite, nom: &str) -> (String, String) {
     let mut tampon = vec![0u8; MAX_NOISE];
     let n = enceinte
         .etat
-        .write_message(&[], &mut tampon)
+        .write_message(b"{}", &mut tampon)
         .expect("ecriture noise 2");
     tampon.truncate(n);
     let hs2 = serde_json::json!({

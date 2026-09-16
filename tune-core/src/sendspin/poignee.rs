@@ -14,14 +14,9 @@
 //! `snow`, implémentation pur Rust du cadre Noise. Ce fichier n'est que la
 //! machine à états qui l'alimente et le cadrage JSON autour.
 //!
-//! ## Ce qui n'est pas prouvé à ce stade
-//!
-//! S2-a n'emploie que la PSK **Sentinelle**, qui est publique. La confiance
-//! qu'on peut accorder au pair après cette poignée de main est donc celle d'un
-//! canal chiffré, **pas** celle d'un pair authentifié : n'importe qui sur le
-//! réseau peut la mener à bien. C'est S2-b, avec les PSK `lt` et `pr`, qui
-//! transformera ce tuyau en preuve d'identité. Rien dans ce module ne doit
-//! laisser croire l'inverse.
+//! Les PSK sont liees a la cle publique du client. La categorie et le
+//! condensat de poignee sont rendus seulement apres verification du message 2.
+//! Le re-echange utilise ce condensat comme prologue et interdit tout repli.
 
 use snow::{Builder, HandshakeState};
 
@@ -30,7 +25,7 @@ use super::messages::{
     ChargeMessageUn, ClientInit, Enveloppe, EnveloppeBrute, NoiseHandshake, ServerInit,
     TYPE_CLIENT_INIT, TYPE_NOISE_HANDSHAKE, TYPE_SERVER_INIT,
 };
-use super::psk::TAILLE_PSK;
+use super::psk::{CategoriePsk, PskPair, TAILLE_PSK};
 use super::suite::Suite;
 use super::transport::{MAX_MESSAGE_NOISE, TransportNoise};
 use super::{ErreurSendspin, VERSION_PROTOCOLE};
@@ -44,6 +39,13 @@ pub struct InfosPair {
     pub suite: Suite,
     /// L'identifiant de la PSK qui a admis la connexion.
     pub psk_id: String,
+    pub categorie_psk: CategoriePsk,
+    /// Le pair a prouve sa cle statique mais ne possede plus la PSK annoncee.
+    /// Ce signal ne supprime jamais un enregistrement ni n'autorise la lecture.
+    pub identifiant_perdu: bool,
+    pub server_id: String,
+    /// Prologue du re-echange et liaison de l'appairage CPace.
+    pub condensat_poignee: [u8; 32],
 }
 
 /// La machine à états de la poignée de main, côté serveur.
@@ -56,6 +58,9 @@ pub struct PoigneeServeur {
     suite: Suite,
     client_id: String,
     psk_id: String,
+    categorie_psk: CategoriePsk,
+    repli_autorise: bool,
+    server_id: String,
     server_init_texte: String,
     etat: HandshakeState,
     message_un_envoye: bool,
@@ -87,6 +92,21 @@ impl PoigneeServeur {
         client_init_texte: &str,
         psk: &[u8; TAILLE_PSK],
     ) -> Result<Self, ErreurSendspin> {
+        // Compatibilite S2-a : cet appel sans categorie n'admet que la
+        // sentinelle. Les cles privees exigent une destination explicite.
+        if psk != &super::psk::sentinelle() {
+            return Err(ErreurSendspin::EtatInattendu(
+                "PSK sans categorie ni liaison de pair",
+            ));
+        }
+        Self::accueillir_avec_psk(identite, client_init_texte, &PskPair::sentinelle())
+    }
+
+    pub fn accueillir_avec_psk(
+        identite: &Identite,
+        client_init_texte: &str,
+        psk: &PskPair,
+    ) -> Result<Self, ErreurSendspin> {
         let brute: EnveloppeBrute = serde_json::from_str(client_init_texte)
             .map_err(|e| ErreurSendspin::MessageIllisible(format!("client/init : {e}")))?;
         if brute.type_message != TYPE_CLIENT_INIT {
@@ -102,7 +122,8 @@ impl PoigneeServeur {
             return Err(ErreurSendspin::VersionInconnue(init.version));
         }
         let suite = Suite::depuis_nom(&init.suite)?;
-        let client_public = cle_publique_du_pair(&init.client_id)?;
+        cle_publique_du_pair(&init.client_id)?;
+        psk.verifier_pair(&init.client_id)?;
 
         // Le server/init est serialise UNE fois. C'est cette chaine-la qui
         // entre dans le prologue ET qui part sur le fil ; les deux ne peuvent
@@ -120,6 +141,52 @@ impl PoigneeServeur {
         prologue.extend_from_slice(client_init_texte.as_bytes());
         prologue.extend_from_slice(server_init_texte.as_bytes());
 
+        Self::construire(
+            identite,
+            &init.client_id,
+            suite,
+            psk,
+            &prologue,
+            server_init_texte,
+            true,
+        )
+    }
+
+    /// Re-echange a l'interieur du transport precedent, sans nouveaux init.
+    /// L'appelant chiffre les deux messages avec l'ancien transport, puis
+    /// bascule uniquement apres verification du message 2.
+    pub fn renouveler(
+        identite: &Identite,
+        precedente: &InfosPair,
+        psk: &PskPair,
+    ) -> Result<Self, ErreurSendspin> {
+        if identite.id() != precedente.server_id {
+            return Err(ErreurSendspin::EtatInattendu(
+                "identite serveur changee au re-echange",
+            ));
+        }
+        Self::construire(
+            identite,
+            &precedente.client_id,
+            precedente.suite,
+            psk,
+            &precedente.condensat_poignee,
+            String::new(),
+            false,
+        )
+    }
+
+    fn construire(
+        identite: &Identite,
+        client_id: &str,
+        suite: Suite,
+        psk: &PskPair,
+        prologue: &[u8],
+        server_init_texte: String,
+        repli_autorise: bool,
+    ) -> Result<Self, ErreurSendspin> {
+        psk.verifier_pair(client_id)?;
+        let client_public = cle_publique_du_pair(client_id)?;
         let motif = suite.motif_noise();
         let params = motif
             .parse()
@@ -131,17 +198,20 @@ impl PoigneeServeur {
             .map_err(|e| ErreurSendspin::Noise(format!("cle locale : {e}")))?
             .remote_public_key(&client_public)
             .map_err(|e| ErreurSendspin::Noise(format!("cle du pair : {e}")))?
-            .prologue(&prologue)
+            .prologue(prologue)
             .map_err(|e| ErreurSendspin::Noise(format!("prologue : {e}")))?
-            .psk(Suite::position_psk(), psk)
+            .psk(Suite::position_psk(), psk.secret())
             .map_err(|e| ErreurSendspin::Noise(format!("psk : {e}")))?
             .build_initiator()
             .map_err(|e| ErreurSendspin::Noise(format!("initiateur : {e}")))?;
 
         Ok(Self {
             suite,
-            client_id: init.client_id,
-            psk_id: super::psk::identifiant(psk),
+            client_id: client_id.to_owned(),
+            psk_id: psk.identifiant(),
+            categorie_psk: psk.categorie(),
+            server_id: identite.id(),
+            repli_autorise,
             server_init_texte,
             etat,
             message_un_envoye: false,
@@ -174,6 +244,7 @@ impl PoigneeServeur {
         }
         let charge = serde_json::to_vec(&ChargeMessageUn {
             psk_id: self.psk_id.clone(),
+            psk_category: self.categorie_psk,
         })
         .map_err(|e| ErreurSendspin::MessageIllisible(format!("charge du message 1 : {e}")))?;
 
@@ -218,17 +289,61 @@ impl PoigneeServeur {
             ErreurSendspin::MessageIllisible(format!("charge noise/handshake : {e}"))
         })?;
         let brut = depuis_b64url(&poignee.data)?;
+        // Le premier champ de KKpsk2 message 2 est l'ephemere X25519.
+        // Refuser avant le premier essai de PSK, et donc avant tout repli.
+        let ephemere = brut
+            .get(..32)
+            .and_then(|v| v.try_into().ok())
+            .ok_or_else(|| ErreurSendspin::Noise("ephemere absent du message 2".into()))?;
+        if !super::identite::cle_contributive(ephemere) {
+            return Err(ErreurSendspin::Noise(
+                "ephemere X25519 de faible ordre".into(),
+            ));
+        }
 
         let mut tampon = vec![0u8; MAX_MESSAGE_NOISE];
-        self.etat
-            .read_message(&brut, &mut tampon)
-            .map_err(|e| ErreurSendspin::Noise(format!("message 2 : {e}")))?;
+        let mut identifiant_perdu = false;
+        let taille = match self.etat.read_message(&brut, &mut tampon) {
+            Ok(taille) => taille,
+            Err(snow::Error::Decrypt)
+                if self.repli_autorise && self.categorie_psk != CategoriePsk::Sentinelle =>
+            {
+                // snow 0.10 restaure son etat symetrique apres un read_message
+                // echoue. KKpsk2 ne melange la PSK qu'au message 2 : rejouer
+                // exactement ces octets avec la sentinelle garde le prologue,
+                // les ephemeres et l'authentification de la cle statique.
+                self.etat
+                    .set_psk(
+                        usize::from(Suite::position_psk()),
+                        &super::psk::sentinelle(),
+                    )
+                    .map_err(|e| ErreurSendspin::Noise(format!("sentinelle : {e}")))?;
+                let taille = self
+                    .etat
+                    .read_message(&brut, &mut tampon)
+                    .map_err(|e| ErreurSendspin::Noise(format!("message 2 : {e}")))?;
+                self.categorie_psk = CategoriePsk::Sentinelle;
+                self.psk_id = super::psk::identifiant(&super::psk::sentinelle());
+                identifiant_perdu = true;
+                taille
+            }
+            Err(e) => return Err(ErreurSendspin::Noise(format!("message 2 : {e}"))),
+        };
+        if &tampon[..taille] != b"{}" {
+            return Err(ErreurSendspin::MessageIllisible(
+                "charge du message noise 2 : objet vide litteral attendu".into(),
+            ));
+        }
 
         if !self.etat.is_handshake_finished() {
             return Err(ErreurSendspin::Noise(
                 "la poignee de main n'est pas terminee apres le message 2".into(),
             ));
         }
+        let condensat_poignee =
+            self.etat.get_handshake_hash().try_into().map_err(|_| {
+                ErreurSendspin::Noise("condensat de poignee de taille invalide".into())
+            })?;
         let transport = self
             .etat
             .into_transport_mode()
@@ -240,6 +355,10 @@ impl PoigneeServeur {
                 client_id: self.client_id,
                 suite: self.suite,
                 psk_id: self.psk_id,
+                categorie_psk: self.categorie_psk,
+                identifiant_perdu,
+                server_id: self.server_id,
+                condensat_poignee,
             },
         ))
     }
@@ -319,7 +438,7 @@ pub(crate) mod repondeur_de_test {
             let mut tampon = vec![0u8; MAX_MESSAGE_NOISE];
             let n = self
                 .etat
-                .write_message(&[], &mut tampon)
+                .write_message(b"{}", &mut tampon)
                 .map_err(|e| ErreurSendspin::Noise(format!("message 2 : {e}")))?;
             tampon.truncate(n);
             serde_json::to_string(&Enveloppe::nouvelle(
