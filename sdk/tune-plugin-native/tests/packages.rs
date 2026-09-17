@@ -56,6 +56,13 @@ fn packaging_refuses_nonportable_and_reserved_assets() {
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("x.so");
     fs::write(&bin, b"x").unwrap();
+    let mut wrong_kind: tune_plugin_sdk::manifest::Manifest =
+        serde_json::from_str(include_str!("../../tune-plugin-equalizer/manifest.json")).unwrap();
+    wrong_kind.kind = tune_plugin_sdk::manifest::PluginKind::Batch;
+    assert!(
+        pack(wrong_kind, &bin, host_target(), &BTreeMap::new()).is_err(),
+        "batch tool accepted into a DSP slot"
+    );
     for name in [
         "../escape",
         "a//b",

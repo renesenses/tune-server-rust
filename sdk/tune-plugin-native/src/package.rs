@@ -126,6 +126,14 @@ fn unpack(bytes: &[u8], target: &str) -> Result<(Package, BTreeMap<String, Vec<u
         .manifest
         .validate()
         .map_err(|e| format!("manifest: {e:?}"))?;
+    let expected_kind = match package.manifest.id.as_str() {
+        "equalizer" | "crossfeed" => Some(tune_plugin_sdk::manifest::PluginKind::Dsp),
+        "converter" | "declick" => Some(tune_plugin_sdk::manifest::PluginKind::Batch),
+        _ => None,
+    };
+    if expected_kind.is_some_and(|kind| kind != package.manifest.kind) {
+        return Err("plugin kind differs from the feature slot".into());
+    }
     let caps = tune_plugin_sdk::manifest::reference_host_capabilities();
     package
         .manifest
