@@ -5,7 +5,10 @@ Cargo cdylib output names lack feature hashes. A source-only parity build can
 replace libfoo.so while the native fingerprint remains fresh. Separate targets
 prevent accidentally testing that stale public filename.
 """
-import json, os, pathlib, subprocess
+import argparse, json, os, pathlib, subprocess
+parser=argparse.ArgumentParser()
+parser.add_argument("--build-only", action="store_true", help="build native libraries; CI declares the test command separately")
+args=parser.parse_args()
 sdk=pathlib.Path(__file__).resolve().parents[1]
 meta=json.loads(subprocess.check_output(['cargo','metadata','--manifest-path',str(sdk/'Cargo.toml'),'--no-deps','--format-version','1']))
 env=os.environ.copy()
@@ -13,4 +16,5 @@ directory=pathlib.Path(meta['target_directory'])/'sdk-native'
 env['CARGO_TARGET_DIR']=str(directory)
 subprocess.run(['cargo','build','--manifest-path',str(sdk/'Cargo.toml'),'--workspace','--all-features','--locked'],check=True,env=env)
 env['TUNE_NATIVE_TEST_DIR']=str(directory/'debug')
-subprocess.run(['cargo','test','--manifest-path',str(sdk/'Cargo.toml'),'-p','tune-plugin-native','--features','native-conformance','--test','native','--locked'],check=True,env=env)
+if not args.build_only:
+ subprocess.run(['cargo','test','--manifest-path',str(sdk/'Cargo.toml'),'-p','tune-plugin-native','--features','native-conformance','--test','native','--locked'],check=True,env=env)

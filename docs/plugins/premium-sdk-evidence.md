@@ -75,3 +75,8 @@ Clôture de la parité : les compteurs locaux et le registre hôte d’écrêtag
 Le témoin utilise les sources historiques épinglées et ne partage pas le nouveau moteur.
 Sur Windows, les lecteurs de schémas et les flux de logs Python imposent UTF-8 ;
 les échecs cp1252 ont été identifiés séparément des résultats audio.
+
+La garde globale de reachabilité #2816 demandait une étape Cargo explicite pour
+`native-conformance`, malgré l’exécution réelle par `verify_native.py`. Le workflow
+sépare désormais la construction des cdylibs et l’étape Cargo avec feature et
+répertoire natif déclarés ; les assertions et la garde restent inchangées.

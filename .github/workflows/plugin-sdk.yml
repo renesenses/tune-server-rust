@@ -57,7 +57,12 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
           python sdk/scripts/verify_scaffolding.py --binary "$binary"
       - run: python sdk/scripts/verify_schemas.py
-      - run: python sdk/scripts/verify_native.py
+      - run: python sdk/scripts/verify_native.py --build-only
+      - name: Native ABI conformance with real libraries
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/sdk/target/sdk-native
+          TUNE_NATIVE_TEST_DIR: ${{ github.workspace }}/sdk/target/sdk-native/debug
+        run: cargo test --no-fail-fast --manifest-path sdk/Cargo.toml -p tune-plugin-native --features native-conformance --test native --locked
       - run: python sdk/scripts/verify_dsp_parity.py
       - uses: actions/setup-node@v4
         with:
