@@ -342,10 +342,15 @@ impl Banc {
     }
 
     /// 19:17:16 → 19:17:23 — la fin nominale est passée, le renderer gèle sa
-    /// position à sa durée et dit toujours `Playing` : trois sondages, le
-    /// nombre qu'il faut à `position_past_end_advancing`.
+    /// position à sa durée et dit toujours `Playing`.
+    ///
+    /// #4382 — le nombre de sondages vient de la SIGNATURE, pas d'une
+    /// constante unique : gelé à la durée avec `SetNext` accepté, un seul
+    /// sondage conclut (`seuil_ticks_de_fin`). Ce banc en est la preuve de
+    /// bout en bout : ce qui demandait trois sondages — et trois secondes de
+    /// silence chez Villerio — en demande un.
     async fn la_fin_a_l_horloge(&mut self) {
-        for _ in 0..POSITION_PAST_END_TICKS {
+        for _ in 0..crate::poller::decisions::seuil_ticks_de_fin(true, true) {
             self.renderer_a(POSITION_GELEE_MS, HORLOGE_A_LA_FIN_SECS)
                 .await;
             self.tic().await;
