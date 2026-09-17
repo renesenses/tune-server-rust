@@ -35,6 +35,11 @@ struct RendererSession {
     /// SetAVTransportURI l'efface : enchaîner après un arrêt voulu serait
     /// une surprise, pas du gapless.
     next: Option<NextItem>,
+    // Contexte UPnP et lecture effectivement démarrée par ce contexte.
+    // L'URI seule ne distingue pas deux lectures successives du même titre.
+    revision: u64,
+    play_seq: Option<u64>,
+    watcher_running: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -51,11 +56,10 @@ fn sessions() -> &'static Mutex<HashMap<i64, RendererSession>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Zones dont le watcher d'enchaînement tourne déjà — un seul par zone.
-fn watchers() -> &'static Mutex<std::collections::HashSet<i64>> {
-    static WATCHERS: std::sync::OnceLock<Mutex<std::collections::HashSet<i64>>> =
-        std::sync::OnceLock::new();
-    WATCHERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+fn nouvelle_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVISION: AtomicU64 = AtomicU64::new(1);
+    REVISION.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Réveil de l'annonceur SSDP : un opt-in fraîchement activé doit s'annoncer
@@ -289,6 +293,7 @@ async fn avtransport_control(
             if let Ok(mut s) = sessions().lock() {
                 // Nouveau contexte de lecture : la suivante en attente est
                 // celle de l'ANCIEN contexte, elle ne survit pas.
+                let watcher_running = s.get(&zone_id).is_some_and(|x| x.watcher_running);
                 s.insert(
                     zone_id,
                     RendererSession {
@@ -297,6 +302,9 @@ async fn avtransport_control(
                         artist,
                         duration_ms,
                         next: None,
+                        revision: nouvelle_revision(),
+                        play_seq: None,
+                        watcher_running,
                     },
                 );
             }
@@ -345,6 +353,7 @@ async fn avtransport_control(
                         .await
                     {
                         Ok(()) => {
+                            memoriser_lecture_renderer(&state, zone_id, &session).await;
                             info!(zone_id, uri = %session.uri, "upnp_renderer_play_resumed");
                             upnp_renderer::empty_response("Play")
                         }
@@ -368,7 +377,10 @@ async fn avtransport_control(
                         ..Default::default()
                     };
                     match state.orchestrator.play(req).await {
-                        Ok(_) => {
+                        Ok(result) => {
+                            if result.error.is_none() {
+                                memoriser_lecture_renderer(&state, zone_id, &session).await;
+                            }
                             info!(zone_id, uri = %session.uri, "upnp_renderer_play");
                             upnp_renderer::empty_response("Play")
                         }
@@ -397,17 +409,28 @@ async fn avtransport_control(
                 && let Some(session) = s.get_mut(&zone_id)
             {
                 session.next = None;
+                session.play_seq = None;
+                session.revision = nouvelle_revision();
             }
             state.orchestrator.stop(zone_id, device_id.as_deref()).await;
             upnp_renderer::empty_response("Stop")
         }
         RendererCommand::Seek(ms) => {
+            let session = sessions()
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&zone_id).cloned());
             match state
                 .orchestrator
                 .seek(zone_id, ms, device_id.as_deref())
                 .await
             {
-                Ok(()) => upnp_renderer::empty_response("Seek"),
+                Ok(()) => {
+                    if let Some(session) = session {
+                        memoriser_lecture_renderer(&state, zone_id, &session).await;
+                    }
+                    upnp_renderer::empty_response("Seek")
+                }
                 Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
             }
         }
@@ -534,80 +557,120 @@ fn doit_reprendre(
     etat == tune_core::playback::PlayState::Paused && uri_en_cours == Some(uri_de_session)
 }
 
-/// Enchaîne la piste posée par SetNextAVTransportURI quand la courante se
-/// termine (#1750, gapless v1). Aucun événement de fin de piste n'existe sur
-/// le bus (`playback.stopped` n'est jamais émis) : on observe l'état toutes
-/// les 2 s. Enchaînement = la zone était en LECTURE avec une suivante posée,
-/// et passe à STOPPED — un arrêt commandé via notre Stop a déjà effacé la
-/// suivante, donc ne relance rien.
-///
-/// v1 assumée : l'enchaînement passe par un play complet — le contrat UPnP
-/// (le point de contrôle n'a pas à re-commander) est tenu, le zéro-gap réel
-/// viendra avec le préchargement orchestrateur.
+fn lecture_de_session(session: &RendererSession, ps: &tune_core::playback::ZoneState) -> bool {
+    ps.now_playing.as_ref().is_some_and(|np| {
+        np.source == "upnp" && np.source_id.as_deref() == Some(session.uri.as_str())
+    })
+}
+
+/// Une commande UPnP qui réussit rattache sa lecture au contexte encore actif.
+/// Un SetURI/Stop intervenu pendant la résolution ne peut pas être réarmé
+/// par le résultat tardif d'une ancienne commande.
+async fn memoriser_lecture_renderer(state: &AppState, zone_id: i64, played: &RendererSession) {
+    let ps = state.playback.get_state(zone_id).await;
+    if let Ok(mut sessions) = sessions().lock()
+        && let Some(session) = sessions.get_mut(&zone_id)
+        && session.revision == played.revision
+        && lecture_de_session(session, &ps)
+    {
+        session.play_seq = Some(ps.play_seq);
+    }
+}
+
+/// #4324 : seul l'arrêt de la lecture appartenant encore au contexte UPnP
+/// peut consommer sa suivante. Le now-playing est conservé à l'arrêt ; une
+/// reprise Tune suivie d'un arrêt entre deux ticks reste donc détectable.
+/// SetNext avant Play est autorisé, mais n'arme aucune lecture étrangère.
 fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
     {
-        let Ok(mut w) = watchers().lock() else { return };
-        if !w.insert(zone_id) {
-            return; // déjà un watcher sur cette zone
+        let Ok(mut sessions) = sessions().lock() else {
+            return;
+        };
+        let Some(session) = sessions.get_mut(&zone_id) else {
+            return;
+        };
+        if session.watcher_running || session.next.is_none() {
+            return;
         }
+        session.watcher_running = true;
     }
     tokio::spawn(async move {
-        let mut was_playing = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let pending = sessions()
+            let observed = sessions()
                 .lock()
                 .ok()
-                .and_then(|s| s.get(&zone_id).and_then(|x| x.next.clone()));
-            let Some(next) = pending else { break };
-
+                .and_then(|sessions| sessions.get(&zone_id).map(|s| (s.revision, s.play_seq)));
             let ps = state.playback.get_state(zone_id).await;
-            match ps.state {
-                tune_core::playback::PlayState::Playing => was_playing = true,
-                tune_core::playback::PlayState::Paused => {}
-                tune_core::playback::PlayState::Stopped if was_playing => {
-                    // Fin naturelle : promouvoir la suivante et relancer.
-                    if let Ok(mut s) = sessions().lock() {
-                        s.insert(
-                            zone_id,
-                            RendererSession {
-                                uri: next.uri.clone(),
-                                title: next.title.clone(),
-                                artist: next.artist.clone(),
-                                duration_ms: next.duration_ms,
-                                next: None,
-                            },
-                        );
-                    }
-                    let device_id = ZoneRepo::with_backend(state.backend.clone())
-                        .get(zone_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|z| z.output_device_id);
-                    let req = tune_core::orchestrator::PlayRequest {
-                        zone_id,
-                        output_device_id: device_id,
-                        track_id: None,
-                        source: Some("upnp".into()),
-                        source_id: Some(next.uri.clone()),
-                        title: next.title,
-                        artist_name: next.artist,
-                        duration_ms: next.duration_ms,
-                        ..Default::default()
-                    };
-                    match state.orchestrator.play(req).await {
-                        Ok(_) => info!(zone_id, uri = %next.uri, "upnp_renderer_gapless_advance"),
-                        Err(e) => {
-                            warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed")
-                        }
-                    }
-                    break;
+            let promoted = {
+                let Ok(mut sessions) = sessions().lock() else {
+                    return;
+                };
+                let Some(session) = sessions.get_mut(&zone_id) else {
+                    return;
+                };
+                // Ne pas comparer un état lu avant un nouveau Play/SetURI
+                // avec le propriétaire installé pendant cette lecture.
+                if observed != Some((session.revision, session.play_seq)) {
+                    continue;
                 }
-                tune_core::playback::PlayState::Stopped => {}
+                if session.next.is_none() {
+                    // Même verrou que SetNext/spawn : aucune réinscription
+                    // ne peut se perdre entre le constat et la sortie.
+                    session.watcher_running = false;
+                    return;
+                }
+                let Some(owner) = session.play_seq else {
+                    continue;
+                };
+                if owner != ps.play_seq || !lecture_de_session(session, &ps) {
+                    session.next = None;
+                    session.play_seq = None;
+                    session.watcher_running = false;
+                    info!(zone_id, "upnp_renderer_next_discarded_after_takeover");
+                    return;
+                }
+                if ps.state != tune_core::playback::PlayState::Stopped {
+                    continue;
+                }
+                let next = session
+                    .next
+                    .take()
+                    .expect("next checked under the same lock");
+                session.uri = next.uri;
+                session.title = next.title;
+                session.artist = next.artist;
+                session.duration_ms = next.duration_ms;
+                session.revision = nouvelle_revision();
+                session.play_seq = None;
+                session.clone()
+            };
+            let device_id = ZoneRepo::with_backend(state.backend.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
+            let req = tune_core::orchestrator::PlayRequest {
+                zone_id,
+                output_device_id: device_id,
+                source: Some("upnp".into()),
+                source_id: Some(promoted.uri.clone()),
+                title: promoted.title.clone(),
+                artist_name: promoted.artist.clone(),
+                duration_ms: promoted.duration_ms,
+                ..Default::default()
+            };
+            match state.orchestrator.play(req).await {
+                Ok(result) => {
+                    if let Some(error) = result.error {
+                        warn!(zone_id, error, "upnp_renderer_gapless_advance_failed");
+                    } else {
+                        memoriser_lecture_renderer(&state, zone_id, &promoted).await;
+                        info!(zone_id, uri = %promoted.uri, "upnp_renderer_gapless_advance");
+                    }
+                }
+                Err(e) => warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed"),
             }
-        }
-        if let Ok(mut w) = watchers().lock() {
-            w.remove(&zone_id);
         }
     });
 }
@@ -906,3 +969,7 @@ mod temps_upnp_3971_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_4324.rs"]
+mod session_4324_tests;
