@@ -70,6 +70,7 @@ struct Lecteur {
     condensat: Vec<u8>,
     transport: snow::TransportState,
     methodes: Value,
+    fragmenter: bool,
 }
 async fn trame(ws: &mut Socket) -> Message {
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -96,6 +97,16 @@ impl Lecteur {
         suite: Suite,
         cle: &PskPair,
         methodes: Value,
+    ) -> Self {
+        Self::ouvrir(s, identite, suite, cle, methodes, false).await
+    }
+    async fn ouvrir(
+        s: &Serveur,
+        identite: Identite,
+        suite: Suite,
+        cle: &PskPair,
+        methodes: Value,
+        fragmenter: bool,
     ) -> Self {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/sendspin", s.adresse))
             .await
@@ -133,6 +144,7 @@ impl Lecteur {
             condensat,
             transport,
             methodes,
+            fragmenter,
         };
         l.saluer().await;
         l
@@ -156,9 +168,30 @@ impl Lecteur {
     }
     async fn envoyer(&mut self, typ: &str, charge: Value) {
         let texte = json!({"type":typ,"payload":charge}).to_string();
-        let brut = [&[0][..], texte.as_bytes()].concat();
+        if self.fragmenter {
+            let morceaux: Vec<_> = texte
+                .as_bytes()
+                .chunks((texte.len() / 2).clamp(1, 32000))
+                .collect();
+            for (i, donnees) in morceaux.iter().enumerate() {
+                let flags =
+                    (if i == 0 { 2 } else { 0 }) | (if i + 1 == morceaux.len() { 1 } else { 0 });
+                let mut brut = vec![1, flags];
+                if i == 0 {
+                    brut.push(0);
+                }
+                brut.extend_from_slice(donnees);
+                self.envoyer_brut(&brut).await;
+                self.ws.send(Message::Ping(vec![7].into())).await.unwrap();
+            }
+        } else {
+            self.envoyer_brut(&[&[0][..], texte.as_bytes()].concat())
+                .await;
+        }
+    }
+    async fn envoyer_brut(&mut self, brut: &[u8]) {
         let mut b = vec![0; MAX_NOISE];
-        let n = self.transport.write_message(&brut, &mut b).unwrap();
+        let n = self.transport.write_message(brut, &mut b).unwrap();
         b.truncate(n);
         self.ws.send(Message::Binary(b.into())).await.unwrap();
     }
@@ -176,7 +209,8 @@ impl Lecteur {
         self.envoyer(
             "client/hello",
             json!({"name":"Lecteur runtime 3326","supported_roles":[],
-            "supported_pair_methods":self.methodes}),
+            "supported_pair_methods":self.methodes,
+            "extension_fixture":if self.fragmenter { "x".repeat(70000) } else { String::new() }}),
         )
         .await;
         let v = self.lire().await;
@@ -230,6 +264,13 @@ fn jeton(id: &Identite, secret: &[u8; 32]) -> String {
 
 #[tokio::test]
 async fn i3326_runtime_psk_persiste_renouvelle_reconnecte_et_revoque() {
+    parcours_psk(false).await;
+}
+#[tokio::test]
+async fn i3326_fragments_websocket_hello_regime_et_renouvellements_noise() {
+    parcours_psk(true).await;
+}
+async fn parcours_psk(fragmenter: bool) {
     for suite in Suite::toutes() {
         let s = Serveur::nouveau().await;
         let id = Identite::generer();
@@ -238,12 +279,13 @@ async fn i3326_runtime_psk_persiste_renouvelle_reconnecte_et_revoque() {
         let pr = PskPair::pour_pair(&id_texte, [23; 32], CategoriePsk::Appairage).unwrap();
         let lt = PskPair::pour_pair(&id_texte, [41; 32], CategoriePsk::LongueDuree).unwrap();
         let token = jeton(&id, pr.secret());
-        let mut l = Lecteur::nouveau(
+        let mut l = Lecteur::ouvrir(
             &s,
             id,
             suite,
             &PskPair::sentinelle(),
             json!({"pairing_psk":{}}),
+            fragmenter,
         )
         .await;
         assert_eq!(s.disponible(&id_texte).await["authenticated"], false);
@@ -292,12 +334,13 @@ async fn i3326_runtime_psk_persiste_renouvelle_reconnecte_et_revoque() {
         })
         .await
         .unwrap();
-        let mut l = Lecteur::nouveau(
+        let mut l = Lecteur::ouvrir(
             &s,
             Identite::depuis_prive(prive),
             suite,
             &lt,
             json!({"pairing_psk":{}}),
+            fragmenter,
         )
         .await;
         assert_eq!(s.disponible(&id_texte).await["authenticated"], true);
@@ -558,3 +601,74 @@ async fn i3326_runtime_transport_corrompu_ferme_sans_server_error() {
 
 #[path = "sendspin/cpace_runtime_3326.rs"]
 mod cpace;
+
+#[tokio::test]
+async fn i3326_fragments_websocket_invalides_ferment_sans_reponse_applicative() {
+    for suite in Suite::toutes() {
+        for sequence in [
+            vec![vec![1]],
+            vec![vec![1, 0]],
+            vec![vec![1, 6, 0]],
+            vec![vec![1, 3, 1]],
+            vec![vec![1, 2, 0], vec![1, 2, 0]],
+            vec![vec![1, 2, 0], vec![0, b'x']],
+        ] {
+            let s = Serveur::nouveau().await;
+            let mut l = Lecteur::nouveau(
+                &s,
+                Identite::generer(),
+                suite,
+                &PskPair::sentinelle(),
+                json!({"pairing_psk":{}}),
+            )
+            .await;
+            for brut in sequence {
+                l.envoyer_brut(&brut).await;
+            }
+            let fin = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match l.ws.next().await {
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                        m => break m,
+                    }
+                }
+            })
+            .await
+            .expect("une fragmentation invalide doit fermer le WebSocket");
+            assert!(
+                !matches!(fin, Some(Ok(Message::Text(_) | Message::Binary(_)))),
+                "aucun message applicatif ne doit suivre une fragmentation invalide"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn i3326_fragments_incomplets_ne_bloquent_pas_la_revocation() {
+    let s = Serveur::nouveau().await;
+    let id = Identite::generer();
+    let nom = id.id();
+    let mut l = Lecteur::nouveau(
+        &s,
+        id,
+        Suite::ChaChaPoly,
+        &PskPair::sentinelle(),
+        json!({"pairing_psk":{}}),
+    )
+    .await;
+    s.disponible(&nom).await;
+    l.envoyer_brut(&[1, 2, 0, b'{']).await;
+    let r = reqwest::Client::new()
+        .delete(s.url(&nom, "credentials"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let fermeture = tokio::time::timeout(Duration::from_secs(2), l.ws.next())
+        .await
+        .expect("un message incomplet ne doit pas retenir la revocation");
+    assert!(
+        !matches!(fermeture, Some(Ok(Message::Text(_) | Message::Binary(_)))),
+        "la revocation doit fermer sans attendre le dernier fragment"
+    );
+}

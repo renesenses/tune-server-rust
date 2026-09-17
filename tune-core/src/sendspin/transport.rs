@@ -4,15 +4,14 @@
 //! **binaires**, chacune portant un message Noise chiffré. Le premier octet du
 //! déchiffré est le **type** ; `0` désigne un corps JSON en UTF-8.
 //!
-//! ## Ce que ce module ne fait pas
-//!
-//! La **fragmentation** au-delà d'une trame n'est pas ici. Elle n'a de raison
-//! d'être que pour l'audio et les pochettes, c'est-à-dire S2-c ; et le codage
-//! des types de fragment a changé sous nous entre la note de lecture de la
-//! phase 1 et l'état courant des implémentations de référence (voir le rapport
-//! de S2-a). L'écrire maintenant serait l'écrire contre une cible mouvante,
-//! sans rien pour l'exercer. [`TransportNoise::chiffrer`] refuse donc net ce
-//! qui dépasse une trame, plutôt que de tronquer en silence.
+//! Les messages applicatifs passent par recevoir_message/chiffrer_message :
+//! le cadrage Sendspin (type 1, drapeaux first/last) est distinct des trames
+//! WebSocket et de la limite Noise. Voir Sendspin/spec@cd9330ef, messaging.md.
+//! Le reassemblage est borne a 1 Mio ; une erreur invalide ce recepteur.
+
+mod fragmentation;
+pub use fragmentation::MAX_CORPS_MESSAGE;
+use fragmentation::Reassemblage;
 
 use snow::TransportState;
 
@@ -33,6 +32,7 @@ pub const TYPE_CORPS_JSON: u8 = 0;
 /// Le transport Noise établi, côté serveur.
 pub struct TransportNoise {
     etat: TransportState,
+    reassemblage: Reassemblage,
 }
 
 impl std::fmt::Debug for TransportNoise {
@@ -44,7 +44,10 @@ impl std::fmt::Debug for TransportNoise {
 
 impl TransportNoise {
     pub(super) fn nouveau(etat: TransportState) -> Self {
-        Self { etat }
+        Self {
+            etat,
+            reassemblage: Reassemblage::default(),
+        }
     }
 
     /// Chiffre une charge utile déjà préfixée de son octet de type.
@@ -55,11 +58,10 @@ impl TransportNoise {
             ));
         }
         if clair.len() > MAX_CLAIR {
-            // Refus explicite plutot que troncature : la fragmentation est le
-            // sujet de S2-c, et une trame coupee en silence produirait un flux
-            // corrompu que rien ne nommerait.
+            // Primitive d'une seule trame. chiffrer_message fragmente les
+            // messages applicatifs plus grands avant cet appel.
             return Err(ErreurSendspin::EtatInattendu(
-                "charge utile au-dela d'une trame : la fragmentation est S2-c",
+                "charge utile au-dela d'une trame : utiliser chiffrer_message",
             ));
         }
         let mut sortie = vec![0u8; clair.len() + TAILLE_TAG];
@@ -85,6 +87,50 @@ impl TransportNoise {
             ));
         };
         Ok((*type_message, corps.to_vec()))
+    }
+
+    /// Chiffre un message applicatif entier, sans entrelacer ses fragments.
+    pub fn chiffrer_message(
+        &mut self,
+        typ: u8,
+        corps: &[u8],
+    ) -> Result<Vec<Vec<u8>>, ErreurSendspin> {
+        fragmentation::decouper(typ, corps)?
+            .into_iter()
+            .map(|clair| self.chiffrer(&clair))
+            .collect()
+    }
+
+    /// Authentifie chaque trame avant de reassembler. Aucun corps partiel
+    /// n'est livre. Apres une erreur, l'appelant doit fermer la connexion.
+    pub fn recevoir_message(
+        &mut self,
+        chiffre: &[u8],
+    ) -> Result<Option<(u8, Vec<u8>)>, ErreurSendspin> {
+        let trame = self.dechiffrer(chiffre);
+        match trame {
+            Ok((typ, corps)) => self.reassemblage.accepter(typ, &corps),
+            Err(e) => {
+                self.reassemblage.invalider();
+                Err(e)
+            }
+        }
+    }
+
+    pub fn recevoir_json(&mut self, chiffre: &[u8]) -> Result<Option<String>, ErreurSendspin> {
+        let Some((typ, corps)) = self.recevoir_message(chiffre)? else {
+            return Ok(None);
+        };
+        if typ != TYPE_CORPS_JSON {
+            self.reassemblage.invalider();
+            return Err(ErreurSendspin::MessageIllisible(format!(
+                "type binaire {typ} au lieu de JSON"
+            )));
+        }
+        String::from_utf8(corps).map(Some).map_err(|e| {
+            self.reassemblage.invalider();
+            ErreurSendspin::MessageIllisible(format!("corps non UTF-8 : {e}"))
+        })
     }
 
     /// Chiffre un corps JSON (type `0`).
