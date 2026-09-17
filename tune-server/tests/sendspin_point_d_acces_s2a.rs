@@ -40,11 +40,17 @@ const MAX_NOISE: usize = 65535;
 /// par défaut de Tune. Un chemin chiffré qui n'aurait été mesuré qu'avec la
 /// porte du clair ouverte ne prouverait pas grand-chose.
 async fn point_d_acces() -> String {
+    let temporaire = tempfile::tempdir().unwrap();
+    let contexte = tune_server::routes::sendspin::ContexteSendspin::nouveau(
+        temporaire.path().join("sendspin"),
+    );
+
     let app = axum::Router::new()
         .nest(
             "/sendspin",
             tune_server::routes::sendspin::router::<()>(
                 tune_core::sendspin::ModeTransition::ChiffrementSeul,
+                contexte,
             ),
         )
         .with_state(());
@@ -53,6 +59,7 @@ async fn point_d_acces() -> String {
         .expect("socket ephemere");
     let adresse = ecoute.local_addr().expect("adresse");
     tokio::spawn(async move {
+        let _temporaire = temporaire;
         let _ = axum::serve(ecoute, app).await;
     });
     format!("ws://{adresse}/sendspin")
@@ -105,19 +112,40 @@ fn binaire(message: Option<Result<Message, tokio_tungstenite::tungstenite::Error
 /// Joue la séquence entière côté enceinte et rend le `server/activate` reçu.
 async fn conversation_complete(suite: Suite, nom: &str) -> (String, String) {
     let url = point_d_acces().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+    let moi = Identite::generer();
+    let (_, activate) = conversation_avec_cle(
+        &url,
+        &moi,
+        suite,
+        nom,
+        &psk::sentinelle(),
+        &psk::PskPair::sentinelle(),
+    )
+    .await;
+    (moi.id(), activate)
+}
+
+async fn conversation_avec_cle(
+    url: &str,
+    moi: &Identite,
+    suite: Suite,
+    nom: &str,
+    utilisee: &[u8; 32],
+    annoncee: &psk::PskPair,
+) -> (String, String) {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .expect("connexion au point d'acces");
-
-    let moi = Identite::generer();
-    let sentinelle = psk::sentinelle();
 
     // 1. `client/init` — l'enceinte ouvre et CHOISIT la suite.
     let init = serde_json::json!({
         "type": "client/init",
-        "payload": {"client_id": moi.id(), "version": 1, "suite": suite.nom()}
+        "payload": {"client_id": moi.id(), "version": 1, "suite": suite.nom(),
+            "extension_future": {"version": 2}}
     })
     .to_string();
+    // La validation ne doit ni rejeter les extensions ni reencoder le prologue.
+    let init = format!("  {init}  ");
     ws.send(Message::Text(init.clone().into()))
         .await
         .expect("envoi client/init");
@@ -144,7 +172,7 @@ async fn conversation_complete(suite: Suite, nom: &str) -> (String, String) {
     let mut prologue = Vec::new();
     prologue.extend_from_slice(init.as_bytes());
     prologue.extend_from_slice(server_init.as_bytes());
-    let mut enceinte = Enceinte::nouvelle(&moi, &serveur_public, &prologue, suite, &sentinelle);
+    let mut enceinte = Enceinte::nouvelle(moi, &serveur_public, &prologue, suite, utilisee);
 
     // 3. message Noise 1, qui porte le `psk_id`.
     let hs1 = texte(ws.next().await);
@@ -162,15 +190,20 @@ async fn conversation_complete(suite: Suite, nom: &str) -> (String, String) {
     let charge: serde_json::Value = serde_json::from_slice(&tampon).expect("charge noise 1");
     assert_eq!(
         charge["psk_id"].as_str().expect("psk_id"),
-        psk::identifiant(&sentinelle),
-        "S2-a annonce la Sentinelle, et rien d'autre"
+        annoncee.identifiant(),
+        "le point d'acces doit annoncer la cle choisie dans son magasin"
+    );
+
+    assert_eq!(
+        charge["psk_category"],
+        serde_json::to_value(annoncee.categorie()).unwrap()
     );
 
     // 4. message Noise 2 : la poignee de main se ferme.
     let mut tampon = vec![0u8; MAX_NOISE];
     let n = enceinte
         .etat
-        .write_message(&[], &mut tampon)
+        .write_message(b"{}", &mut tampon)
         .expect("ecriture noise 2");
     tampon.truncate(n);
     let hs2 = serde_json::json!({
@@ -243,7 +276,29 @@ async fn conversation_complete(suite: Suite, nom: &str) -> (String, String) {
     clair.truncate(n);
     let activate: serde_json::Value = serde_json::from_slice(&clair[1..]).expect("server/activate");
 
-    (moi.id(), activate.to_string())
+    // S2-b garde le canal ouvert. Un vrai aller-retour chiffre prouve que
+    // l'on peut encore agir apres l'activation vide, sans lancer d'audio.
+    let mut question = vec![0];
+    question.extend_from_slice(br#"{"type":"client/time","payload":{"client_transmitted":12345}}"#);
+    let mut sortie = vec![0; MAX_NOISE];
+    let n = transport.write_message(&question, &mut sortie).unwrap();
+    ws.send(Message::Binary(sortie[..n].to_vec().into()))
+        .await
+        .unwrap();
+    let reponse = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .unwrap();
+    let b = binaire(reponse);
+    clair.resize(MAX_NOISE, 0);
+    let n = transport.read_message(&b, &mut clair).unwrap();
+    let reponse: serde_json::Value = serde_json::from_slice(&clair[1..n]).unwrap();
+    assert_eq!(
+        reponse["type"], "server/time",
+        "le canal doit rester disponible pour l'appairage"
+    );
+    assert_eq!(reponse["payload"]["client_transmitted"], 12345);
+    ws.close(None).await.unwrap();
+    (server_id, activate.to_string())
 }
 
 #[tokio::test]
@@ -299,29 +354,8 @@ async fn les_deux_suites_aboutissent_sur_une_vraie_connexion() {
     }
 }
 
-#[tokio::test]
-async fn un_client_init_illisible_fait_fermer_sans_reponse_applicative() {
-    // La specification n'a AUCUN message d'erreur applicatif : la seule
-    // reaction admise a un echec de poignee de main est de fermer le
-    // WebSocket. Un serveur qui repondrait « erreur » serait hors protocole.
-    let url = point_d_acces().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .expect("connexion");
-    ws.send(Message::Text("ceci n'est pas du JSON".into()))
-        .await
-        .expect("envoi");
-
-    match ws.next().await {
-        None => {}
-        Some(Ok(Message::Close(_))) => {}
-        Some(Ok(autre)) => panic!(
-            "aucun message applicatif ne doit partir apres un echec de poignee \
-             de main, recu : {autre:?}"
-        ),
-        Some(Err(_)) => {}
-    }
-}
+#[path = "sendspin_init_3326.rs"]
+mod init_3326;
 
 /// Garde contre « écrit mais pas branché ».
 ///
@@ -421,21 +455,24 @@ async fn banc_de_preuve_lecteur_reel() {
         _ => tune_core::sendspin::ModeTransition::ClairAccepte,
     };
     println!("mode de transition du banc : {}", mode.nom());
+    let temporaire = tempfile::tempdir().unwrap();
+    let contexte = tune_server::routes::sendspin::ContexteSendspin::nouveau(
+        temporaire.path().join("sendspin"),
+    );
+
     let app = axum::Router::new()
         .nest(
             "/sendspin",
-            tune_server::routes::sendspin::router::<()>(mode),
+            tune_server::routes::sendspin::router::<()>(mode, contexte.clone()),
         )
         .with_state(());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:8927")
         .await
         .expect("le port 8927 doit etre libre");
     println!("banc de preuve : ws://127.0.0.1:8927/sendspin");
-    println!(
-        "server_id = {}",
-        tune_core::sendspin::identite_du_serveur().id()
-    );
+    println!("server_id = {}", contexte.identite().await.unwrap().id());
     tokio::spawn(async move {
+        let _temporaire = temporaire;
         let _ = axum::serve(ecoute, app).await;
     });
 
@@ -479,3 +516,9 @@ async fn banc_de_preuve_lecteur_reel() {
         "aucun lecteur ne s'est presente : la porte de sortie de S2-a n'est pas franchie"
     );
 }
+
+#[path = "sendspin_persistance_3326.rs"]
+mod persistance_3326;
+
+#[path = "sendspin_runtime_3326.rs"]
+mod runtime_3326;

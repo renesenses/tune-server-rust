@@ -38,6 +38,9 @@
 //! des repliements par un ton au-dessus de Nyquist de sortie, délai résiduel
 //! (par la phase à 1 kHz et à 10 kHz : phase linéaire ?), bords (64 premières
 //! et dernières trames), vidage du flux (`flush`) et identité blocs / piste.
+//! Deux couples de plus, 352,8 et 384 → 44,1 kHz (#4080), sont mesurés sans
+//! la référence — bande à −0,1 dB et gain à 20 kHz seulement — parce qu'ils
+//! sont les seuls à demander 1 024 coefficients et que rien ne le vérifiait.
 //!
 //! Chaque témoin AFFIRME la valeur mesurée aujourd'hui ; ceux marqués
 //! `#[ignore = "défaut connu : …"]` affirment ce qu'un rééchantillonneur
@@ -282,6 +285,48 @@ fn module_a(h: &[f64], sr: u32, f: f64) -> f64 {
 
 fn tune_piste(x: &[f32], de: u32, vers: u32) -> Vec<f64> {
     en_f64(&rubato_resample_track(x, de, vers, 1))
+}
+
+/// La réponse en fréquence RÉELLE de Tune pour ce couple : une impulsion
+/// passée par `rubato_resample_track`, fenêtrée à ±4 096 trames autour de son
+/// centre, puis le module de sa TFD à `f`, normalisé.
+///
+/// Ne dépend pas de la référence sinc : c'est ce qui permet de la mesurer aussi
+/// sur des couples que la référence ne couvre pas (#4080).
+fn reponse_de_tune(de: u32, vers: u32) -> impl Fn(f64) -> f64 {
+    let rapport = vers as f64 / de as f64;
+    let pos = de as usize / 10;
+    let xi = impulsion(de, 0.25, pos);
+    let h_tune = tune_piste(&xi, de, vers);
+    let centre = ((pos as f64 * rapport).round() as usize).min(h_tune.len());
+    let fen = 4_096.min(centre);
+    let h = h_tune[centre - fen..(centre + fen).min(h_tune.len())].to_vec();
+    // Un interpolateur à gain unité rend une impulsion dont la somme vaut le
+    // rapport de cadences : la TFD de sortie est normalisée par ce rapport.
+    move |f: f64| module_a(&h, vers, f) / rapport
+}
+
+/// Balaie `module` de 20 Hz à `nyq_utile` (pas de 20 Hz sous 1 kHz, 50 Hz
+/// au-dessus) : rend (bande à −0,1 dB en Hz, ondulation maximale sous 20 kHz
+/// en dB). Sans point sous −0,1 dB, la bande vaut `nyq_utile`.
+fn bande_et_ondulation(module: &dyn Fn(f64) -> f64, nyq_utile: f64) -> (f64, f64) {
+    let mut bande_01db_hz = 0.0;
+    let mut ondulation_db: f64 = 0.0;
+    let mut f = 20.0;
+    while f < nyq_utile {
+        let g = db(module(f));
+        if f <= 20_000.0 {
+            ondulation_db = ondulation_db.max(g.abs());
+        }
+        if g < -0.1 && bande_01db_hz == 0.0 {
+            bande_01db_hz = f;
+        }
+        f += if f < 1_000.0 { 20.0 } else { 50.0 };
+    }
+    if bande_01db_hz == 0.0 {
+        bande_01db_hz = nyq_utile;
+    }
+    (bande_01db_hz, ondulation_db)
 }
 
 /// Le chemin du producteur : blocs de `bloc` trames, puis `flush`. Rend
@@ -622,7 +667,6 @@ struct Mesures {
 
 fn mesurer(r: Rapport) -> Mesures {
     let Rapport { de, vers, .. } = r;
-    let rapport = vers as f64 / de as f64;
     let nyq_utile = 0.5 * de.min(vers) as f64;
 
     // ── sinus 1 kHz : délai, erreur brute, erreur alignée ──
@@ -667,32 +711,9 @@ fn mesurer(r: Rapport) -> Mesures {
     let err_balayage_db = erreur_rms_db(&pisteb, &yb, nb / 10, nb * 9 / 10);
 
     // ── impulsion : réponse en fréquence de Tune ──
-    let pos = de as usize / 10;
-    let xi = impulsion(de, 0.25, pos);
-    let h_tune = tune_piste(&xi, de, vers);
-    let centre = ((pos as f64 * rapport).round() as usize).min(h_tune.len());
-    let fen = 4_096.min(centre);
-    let h = &h_tune[centre - fen..(centre + fen).min(h_tune.len())];
-    // Un interpolateur à gain unité rend une impulsion dont la somme vaut le
-    // rapport de cadences : la TFD de sortie est normalisée par ce rapport.
-    let module = |f: f64| module_a(h, vers, f) / rapport;
+    let module = reponse_de_tune(de, vers);
     let gain_20k_impulsion_db = db(module(20_000.0));
-    let mut bande_01db_hz = 0.0;
-    let mut ondulation_db: f64 = 0.0;
-    let mut f = 20.0;
-    while f < nyq_utile {
-        let g = db(module(f));
-        if f <= 20_000.0 {
-            ondulation_db = ondulation_db.max(g.abs());
-        }
-        if g < -0.1 && bande_01db_hz == 0.0 {
-            bande_01db_hz = f;
-        }
-        f += if f < 1_000.0 { 20.0 } else { 50.0 };
-    }
-    if bande_01db_hz == 0.0 {
-        bande_01db_hz = nyq_utile;
-    }
+    let (bande_01db_hz, ondulation_db) = bande_et_ondulation(&module, nyq_utile);
     let gain_nyquist_db = db(module(nyq_utile));
 
     // ── réjection ──
@@ -1198,6 +1219,57 @@ fn audiophile_erreur_1k_176_4_vers_48() {
 #[test]
 fn audiophile_erreur_1k_192_vers_44_1() {
     affirme_erreur(6);
+}
+
+// ──────── #4080 : les deux couples que le barreau 1 024 sert, MESURÉS ────────
+//
+// `le_choix_du_noyau_suit_la_cadence_la_plus_basse` (`audio/resample.rs`)
+// exerce les 8 × 7 couples du produit, mais contre le MODÈLE
+// `bande_a_moins_0_1_db` (coupure × Nyquist bas − 2,82 · from / N), pas contre
+// le filtre. Un retoucheur qui changerait le barème ET la constante du modèle
+// le laisserait vert. Les deux témoins ci-dessous mesurent la réponse RÉELLE de
+// Tune — impulsion, puis sinus à 20 kHz, la même instrumentation que les sept
+// rapports — sur les deux seuls couples qui demandent 1 024 coefficients : le
+// PCM de DSD256 (352,8 kHz) ou de 384 kHz servi à une zone à la cadence du CD.
+// À 512 coefficients ils rendaient 19 698 et 19 526 Hz.
+//
+// Ils ne passent pas par la référence sinc : ses 1 025 coefficients sont posés
+// à la cadence d'ENTRÉE, et à 352,8 kHz sa transition (≈ 3 kHz) dépasserait
+// les 2 050 Hz qui séparent 20 kHz de Nyquist bas. Ce que ces témoins
+// affirment ne demande pas de référence : une bande et un gain, mesurés sur
+// Tune seul.
+
+fn affirme_bande_mesuree(de: u32, vers: u32, nom: &str) {
+    let module = reponse_de_tune(de, vers);
+    let nyq_utile = 0.5 * de.min(vers) as f64;
+    let (bande_hz, ondulation_db) = bande_et_ondulation(&module, nyq_utile);
+    let x20 = sinus(de, 20_000.0, DUREE_S);
+    let piste20 = tune_piste(&x20, de, vers);
+    let n20 = piste20.len();
+    let (amp_20k, _, _) = ajuster_sinus(&piste20, vers, 20_000.0, n20 / 10, n20 * 9 / 10);
+    let gain_20k_db = db(amp_20k / AMPLITUDE);
+    let noyau = parametres_sinc(de, vers).sinc_len;
+    eprintln!(
+        "[T10 #4080] {nom} : noyau {noyau}, bande à −0,1 dB = {bande_hz:.0} Hz, \
+         gain à 20 kHz = {gain_20k_db:.3} dB, ondulation {ondulation_db:.4} dB"
+    );
+    assert!(
+        bande_hz >= AUDIOPHILE_BANDE_HZ && gain_20k_db > -0.1,
+        "{nom} : noyau {noyau} coefficients, bande à −0,1 dB MESURÉE = {bande_hz:.0} Hz, \
+         gain à 20 kHz = {gain_20k_db:.2} dB ; Tune promet 20 kHz à −0,1 dB. Ce couple est \
+         l'un des deux qui demandent 1 024 coefficients (#4080) : 512 n'y rendent que \
+         19 698 / 19 526 Hz"
+    );
+}
+
+#[test]
+fn audiophile_bande_20k_352_8_vers_44_1() {
+    affirme_bande_mesuree(352_800, 44_100, "352,8 → 44,1 kHz (PCM de DSD256)");
+}
+
+#[test]
+fn audiophile_bande_20k_384_vers_44_1() {
+    affirme_bande_mesuree(384_000, 44_100, "384 → 44,1 kHz");
 }
 
 // ───────────────────────────── le relevé ─────────────────────────────

@@ -29,13 +29,19 @@ use std::time::Duration;
 /// Au-delà de ce silence, un serveur multimédia est **absent** : il reste dans
 /// le registre, il reste visible et cherchable, mais il cesse d'être proposé.
 ///
-/// # Pourquoi 5 400 s, et pas un chiffre deviné
+/// # 24 h — arbitrage D2 de Bertrand (14/09/2026), ramené le 16/09
 ///
-/// La valeur est TROIS FOIS le `max-age` que les serveurs du réseau annoncent
-/// réellement. Mesure du 13/09/2026, M-SEARCH `ST:
-/// urn:schemas-upnp-org:device:MediaServer:1` depuis le réseau local — les
-/// cinq serveurs multimédia joignables répondent en moins de 500 ms et
-/// annoncent tous la même chose :
+/// « Un serveur absent cesse d'être proposé à la lecture après **24 h**, comme
+/// les zones. Il reste visible et cherchable entre-temps. » C'est le même
+/// seuil que `RECENTE_SECS` (`zones/presence.rs`) : un serveur et une zone
+/// sont deux appareils du même réseau, et l'auditeur ne doit pas avoir deux
+/// horloges à retenir pour deux icônes qui se ressemblent.
+///
+/// ## Ce que ce module disait avant, et pourquoi ça ne tient plus
+///
+/// La première version fixait 5 400 s — trois fois le `max-age` de 1 800 s que
+/// tous les serveurs du réseau annoncent (mesure du 13/09/2026, M-SEARCH
+/// `ST: urn:schemas-upnp-org:device:MediaServer:1`) :
 ///
 /// ```text
 /// 192.168.1.18  Tune/0.9.147          CACHE-CONTROL: max-age=1800
@@ -45,24 +51,16 @@ use std::time::Duration;
 /// 192.168.1.19  Sonos/86.8-78270      CACHE-CONTROL: max-age = 1800
 /// ```
 ///
-/// 1 800 s est aussi le plancher qu'impose UPnP Device Architecture 1.1
-/// §1.2.2, qui demande au device de se réannoncer AVANT l'échéance. Un serveur
-/// conforme se manifeste donc au moins toutes les ~900 s, et le silence de
-/// 1 800 s est la tolérance que le protocole définit lui-même —
-/// c'est exactement le raisonnement de `MEDIA_SERVER_MIN_MAX_AGE`
-/// (`ssdp.rs:32`), qu'on ne refait pas, on le réutilise.
-///
-/// Trois fenêtres, donc, et pas une : `MEDIA_SERVER_STALE_AFTER` (900 s,
-/// `ssdp.rs:41`) marque déjà « non joignable », et ce marquage-là est
-/// cosmétique. L'absence, elle, RETIRE le serveur des propositions : elle doit
-/// coûter plus cher qu'un hoquet de Wi-Fi. Trois annonces manquées d'affilée
-/// ne sont plus un hoquet.
-///
-/// On ne prend pas les 24 h du précédent des zones (`RECENTE_SECS`,
-/// `zones/presence.rs:19`) : ce seuil-là qualifie sans agir — une zone
-/// « absente_depuis » reste proposée. Ici l'absence a une conséquence, donc
-/// elle se mesure sur l'horloge du protocole, pas sur celle de l'usage.
-pub const SERVEUR_ABSENT_APRES: Duration = Duration::from_secs(3 * 1_800);
+/// L'argument était : « l'absence a une conséquence, donc elle se mesure sur
+/// l'horloge du protocole ». Bertrand a tranché l'inverse, et il a une raison
+/// que le protocole ne voit pas : un NAS éteint la nuit, un serveur Tune
+/// coupé le week-end, reviennent — et pendant ce temps l'utilisateur ne doit
+/// pas voir sa source disparaître des propositions au bout de 90 minutes.
+/// La mesure du `max-age` reste vraie ; elle borne le marquage « non
+/// joignable » (`MEDIA_SERVER_STALE_AFTER`, 900 s, `ssdp.rs`), qui lui est
+/// cosmétique. Trois fenêtres, toujours : 900 s dit « plus revu », 24 h
+/// retire des propositions, et rien ne supprime.
+pub const SERVEUR_ABSENT_APRES: Duration = Duration::from_secs(24 * 3_600);
 
 /// Part du registre au-delà de laquelle une bascule en absence n'est plus
 /// crédible comme une somme d'extinctions individuelles.
@@ -366,7 +364,10 @@ mod tests {
     #[test]
     fn un_serveur_non_revu_bascule_au_delai_et_pas_avant() {
         let seuil = SERVEUR_ABSENT_APRES.as_secs() as i64;
-        assert_eq!(seuil, 5_400, "trois fenêtres de 1 800 s mesurées le 13/09");
+        assert_eq!(
+            seuil, 86_400,
+            "24 h — arbitrage D2 de Bertrand, comme les zones"
+        );
 
         // Une seconde avant : encore présent.
         let v = qualifier_le_registre(&[obs("a", seuil - 1)]);
@@ -388,12 +389,19 @@ mod tests {
             "silence_prolonge"
         );
 
-        // Les 84 194 s mesurées sur le `.18` le 13/09 : absent, évidemment.
+        // Les 84 194 s mesurées sur le `.18` le 13/09 (23 h 23) : sous les
+        // 24 h de D2, donc ENCORE proposé — c'est précisément ce que le seuil
+        // de 5 400 s faisait disparaître trop tôt. À 36 h : absent.
         let v = qualifier_le_registre(&[obs("a", 84_194)]);
+        assert!(
+            v.pour("a").unwrap().proposable(),
+            "23 h 23 < 24 h : encore proposé"
+        );
+        let v = qualifier_le_registre(&[obs("a", 36 * 3_600)]);
         assert!(!v.pour("a").unwrap().proposable());
     }
 
-    /// Le marquage cosmétique de #2139 (900 s) et l'absence (5 400 s) ne sont
+    /// Le marquage cosmétique de #2139 (900 s) et l'absence (24 h) ne sont
     /// pas le même seuil, et l'absence est le plus tolérant des deux.
     #[test]
     fn l_absence_est_plus_tolerante_que_le_marquage_non_joignable() {

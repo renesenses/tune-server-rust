@@ -12,6 +12,9 @@ use axum::routing::{any, get, post};
 
 use tune_core::upnp_server::UpnpState;
 
+#[path = "upnp_events.rs"]
+mod events;
+
 pub fn router() -> Router<UpnpState> {
     Router::new()
         .route("/description.xml", get(device_description))
@@ -19,7 +22,7 @@ pub fn router() -> Router<UpnpState> {
         // GENA : SUBSCRIBE/UNSUBSCRIBE sont des méthodes HTTP custom — `any`
         // les accepte là où `get` répondait 405 et faisait échouer des points
         // de contrôle stricts avant leur premier Browse.
-        .route("/ContentDirectory/event", any(event_subscription))
+        .route("/ContentDirectory/event", any(events::subscription))
         .route("/ContentDirectory/scpd.xml", get(content_directory_scpd))
         .route(
             "/ConnectionManager/control",
@@ -29,6 +32,9 @@ pub fn router() -> Router<UpnpState> {
         // dessus tombait sur le fallback SPA.
         .route("/ConnectionManager/event", any(event_subscription))
         .route("/ConnectionManager/scpd.xml", get(connection_manager_scpd))
+        .layer(axum::Extension(std::sync::Arc::new(
+            events::Registry::default(),
+        )))
 }
 
 /// Build a standalone Axum `Router` (with state already applied) suitable for
@@ -68,9 +74,8 @@ async fn content_directory_control(
     soap_response(tune_core::upnp_server::build_browse_response(&state, &body))
 }
 
-/// GENA minimal : on accepte l'abonnement (SID + TIMEOUT) sans conserver
-/// d'état — le serveur n'émet pas d'événements, mais un SUBSCRIBE refusé
-/// suffit à faire abandonner certains clients (JPLAY).
+/// Abonnement historique ConnectionManager, sans notification de ses variables.
+/// Les événements du catalogue sont gérés par `events::subscription`.
 async fn event_subscription(method: Method) -> Response {
     match method.as_str() {
         "SUBSCRIBE" => Response::builder()

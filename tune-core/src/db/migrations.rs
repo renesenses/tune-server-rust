@@ -1877,6 +1877,12 @@ CREATE TABLE IF NOT EXISTS media_servers (
 CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);
 ",
     },
+    Migration { version: 102, name: "upnp_library_sync",
+        up: include_str!("../../migrations/upnp_library_sync.sql"),
+    },
+    Migration { version: 103, name: "upnp_catalog_revision",
+        up: include_str!("../../migrations/upnp_catalog_revision.sql"),
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -3145,6 +3151,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     )
     .ok();
 
+    db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
+    db.execute_batch(include_str!("../../migrations/upnp_catalog_revision.sql"))?;
+
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
@@ -3686,6 +3695,19 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "zone_autoplay_mode_text",
         include_str!("../../migrations/postgres/064_zone_autoplay_mode_text.sql"),
     ),
+    // Pont UPnP (#4201) : 65 et 66, pas 59 et 60 — ces numeros-la sont
+    // partis en v0.9.151 (#3716, #3715) pendant que ce lot etait en PR, et
+    // un numero deja applique sur le .15 et le .18 ne se reprend jamais.
+    (
+        65,
+        "upnp_library_sync",
+        include_str!("../../migrations/postgres/065_upnp_library_sync.sql"),
+    ),
+    (
+        66,
+        "upnp_catalog_revision",
+        include_str!("../../migrations/postgres/066_upnp_catalog_revision.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -3832,6 +3854,16 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     }
 
     migration_status::advance("contrôles finaux", done);
+
+    // Réparer aussi les déclencheurs d'une base déjà marquée à jour.
+    // Ce rattrapage idempotent ne réinitialise jamais le compteur existant.
+    // La sentinelle 99 des conversions est déjà traitée par la boucle ci-dessus.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/066_upnp_catalog_revision.sql"
+    ))
+    .execute(pool)
+    .await
+    .map_err(|e| format!("pg upnp revision: {e}"))?;
 
     // Run ANALYZE on key tables for the query planner.
     sqlx::raw_sql("ANALYZE artists; ANALYZE albums; ANALYZE tracks;")
@@ -5648,7 +5680,9 @@ mod tests {
         // 61 repairs native streaming favorite IDs without rewinding the sequence.
         // 62 repairs radio favorite flags and their former boolean writer.
         // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
-        assert_eq!(pg_latest_version(), 64, "latest PG migration must be 64");
+        // 65 and 66 carry the UPnP library sync and catalog revision (#4201),
+        // renumbered from 59/60 after those shipped in v0.9.151.
+        assert_eq!(pg_latest_version(), 66, "latest PG migration must be 66");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

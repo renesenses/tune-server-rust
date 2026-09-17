@@ -413,8 +413,9 @@ fn plugin_available_snapshot(state: &AppState) -> &[tune_core::plugin_sdk::Avail
 /// exigence de version : c'est la seule que ce serveur puisse confronter, et
 /// elle doit répondre pareil sur `/plugins` et sur `/plugins/{nom}` — deux
 /// verdicts différents pour la même extension, c'est le défaut d'origine sous
-/// une autre forme. Pour tout autre nom (compilé, intégré, hérité), il n'y a
-/// rien à confronter : `true`.
+/// une autre forme. L'appelant a deja verifie que le nom est chargeable.
+/// Pour un greffon enregistre sans manifeste, il n'y a pas de version a
+/// confronter : true.
 async fn compatible_selon_le_disque(name: &str) -> bool {
     let Some(dir) = crate::plugins::wasm_plugins_dir() else {
         return true;
@@ -448,7 +449,7 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
         }));
     }
 
-    let compatible = compatible_selon_le_disque(&name).await;
+    let chargeable = peut_etre_installe(&state, &name).await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
@@ -480,21 +481,24 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
     // greffon arrive un jour le réglage reprend son sens tout seul. On cesse
     // seulement de confirmer une installation qui n'a rien chargé, et on le
     // DIT : `unavailable`, avec la raison (#2132).
-    if (installed || enabled) && !peut_etre_installe(&state, &name).await {
-        tracing::info!(plugin_name = %name, "plugin_installed_flag_names_nothing");
+    // Meme autorite que install/update, y compris sans reglages herites.
+    // L'absence d'un manifeste ne rend pas un nom absent compatible (#4265).
+    if !chargeable {
+        if installed || enabled {
+            tracing::info!(plugin_name = %name, "plugin_installed_flag_names_nothing");
+        }
         return Json(json!({
             "name": name,
             "installed": false,
             "enabled": false,
-            "status": "unavailable",
+            "status": if installed || enabled { "unavailable" } else { "not_installed" },
             "detail": "no plugin by that name is compiled into this server or installed on disk — nothing was ever loaded",
-            // Indisponible n'est PAS incompatible : `status` porte déjà la
-            // raison exacte. Émettre `false` ici collerait un second libellé,
-            // faux, sur une fiche déjà expliquée.
-            "compatible": true,
+            "compatible": false,
+            "reason": MOTIF_GREFFON_ABSENT,
         }));
     }
 
+    let compatible = compatible_selon_le_disque(&name).await;
     Json(json!({
         "name": name,
         "installed": installed,
@@ -611,6 +615,8 @@ async fn noms_chargeables(state: &AppState) -> std::collections::HashSet<String>
     noms
 }
 
+const MOTIF_GREFFON_ABSENT: &str = "not_compiled_into_this_server";
+
 /// 404 pour un nom que ce serveur ne porte pas — corps identique pour
 /// `install` et `update`, qui écrivaient tous les deux le même réglage.
 fn greffon_inconnu(name: &str) -> axum::response::Response {
@@ -619,6 +625,7 @@ fn greffon_inconnu(name: &str) -> axum::response::Response {
         StatusCode::NOT_FOUND,
         Json(json!({
             "error": "plugin_inconnu",
+            "reason": MOTIF_GREFFON_ABSENT,
             "name": name,
             "detail": "no plugin by that name is compiled into this server or installed on disk — nothing would load",
         })),

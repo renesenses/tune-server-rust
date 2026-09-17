@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::extract::{Multipart, Path, Query, State};
+use axum::extract::{Extension, Multipart, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
@@ -24,6 +24,10 @@ pub(super) fn is_hex_hash(s: &str) -> bool {
 #[derive(Deserialize)]
 pub(super) struct ProxyQuery {
     url: String,
+    /// La signature HMAC de `url` (#4260), que portent les URL de relais
+    /// publiées par le serveur lui-même (DIDL). Absente sur celles que le
+    /// client web bâtit.
+    sig: Option<String>,
 }
 
 /// Le `?size=` que le client envoie sur chaque vignette.
@@ -295,36 +299,79 @@ pub(super) async fn upload_album_artwork(
     }
 }
 
+/// Relaie une pochette distante — derrière la garde de
+/// [`tune_core::library::artwork_proxy`] (#4260).
+///
+/// Avant : `state.http_client.get(&q.url)` tel quel. Le serveur allait
+/// chercher N'IMPORTE QUELLE adresse donnée par le client, redirections
+/// comprises, et rendait le corps — un relais ouvert, que #4061 a publié au
+/// LAN dans la DIDL (les ressources de la DIDL sont exemptées de jeton, #3933).
+///
+/// Maintenant, dans l'ordre :
+/// * `sig` présent mais faux → 400 ; absent alors que l'appel est entré par
+///   l'exemption DIDL ([`ExemptionDidl`]) → 400 ;
+/// * schéma autre que http/https → 400 ;
+/// * adresse littérale interne (boucle locale, privée, lien-local…) → 403 ;
+/// * URL non signée vers un hôte hors [`HOTES_AUTORISES`] (et hors réglage
+///   `artwork_proxy_hosts`) → 403 ;
+/// * nom qui RÉSOUT en adresse interne → 403 (le résolveur du client refuse
+///   l'adresse, pas la chaîne) ;
+/// * redirection vers une URL que la même garde refuse → 403.
+///
+/// Le client web (`api.ts::artworkUrl`) n'est pas modifié : il bâtit des URL
+/// non signées, admises par la liste d'hôtes.
+///
+/// [`ExemptionDidl`]: crate::auth::ExemptionDidl
+/// [`HOTES_AUTORISES`]: tune_core::library::artwork_proxy::HOTES_AUTORISES
 pub(super) async fn proxy_artwork(
     State(state): State<AppState>,
+    exemption: Option<Extension<crate::auth::ExemptionDidl>>,
     Query(q): Query<ProxyQuery>,
 ) -> impl IntoResponse {
-    match state.http_client.get(&q.url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("image/jpeg")
-                .to_string();
-            match resp.bytes().await {
-                Ok(data) => {
-                    let mut headers = HeaderMap::new();
-                    headers.insert(
-                        "Content-Type",
-                        HeaderValue::from_str(&content_type)
-                            .unwrap_or(HeaderValue::from_static("image/jpeg")),
-                    );
-                    headers.insert(
-                        "Cache-Control",
-                        HeaderValue::from_static("public, max-age=86400"),
-                    );
-                    (StatusCode::OK, headers, data.to_vec()).into_response()
-                }
-                Err(_) => StatusCode::BAD_GATEWAY.into_response(),
-            }
+    use tune_core::library::artwork_proxy::{self, Demande, Echec};
+
+    let secret = artwork_proxy::secret(&state.backend);
+    let supplementaires = artwork_proxy::hotes_supplementaires(&state.backend);
+    let demande = Demande {
+        url: &q.url,
+        sig: q.sig.as_deref(),
+        secret: &secret,
+        signature_exigee: exemption.is_some(),
+        hotes_supplementaires: &supplementaires,
+    };
+    match state.relais_pochettes.relayer(&demande).await {
+        Ok(image) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Content-Type",
+                HeaderValue::from_str(&image.content_type)
+                    .unwrap_or(HeaderValue::from_static("image/jpeg")),
+            );
+            headers.insert(
+                "Cache-Control",
+                HeaderValue::from_static("public, max-age=86400"),
+            );
+            (StatusCode::OK, headers, image.octets).into_response()
         }
-        _ => StatusCode::BAD_GATEWAY.into_response(),
+        Err(Echec::Refus(refus)) => {
+            tracing::warn!(
+                url = %q.url,
+                signee = q.sig.is_some(),
+                exemption_didl = exemption.is_some(),
+                refus = %refus,
+                "{}",
+                refus.motif()
+            );
+            (
+                StatusCode::from_u16(refus.statut()).unwrap_or(StatusCode::FORBIDDEN),
+                Json(json!({ "error": refus.to_string(), "motif": refus.motif() })),
+            )
+                .into_response()
+        }
+        Err(Echec::Amont(erreur)) => {
+            tracing::debug!(url = %q.url, erreur = %erreur, "artwork_proxy_amont");
+            StatusCode::BAD_GATEWAY.into_response()
+        }
     }
 }
 
@@ -433,6 +480,13 @@ pub(super) async fn batch_enrich_artwork(State(state): State<AppState>) -> impl 
             "missing": 0,
         }))
         .into_response();
+    }
+
+    // #2507 — jumelle « pochettes » de `enrich-artists` : c'est la moitié
+    // pochettes de `POST /system/enrich`, qui est gardé. Même garde, après le
+    // raccourci « rien à faire ».
+    if let Err(refus) = crate::routes::system::gate_enrichment(&state).await {
+        return refus.into_response();
     }
 
     // Store initial status
@@ -748,6 +802,20 @@ pub(super) async fn batch_enrich_artist_artwork(
         .into_response();
     }
 
+    // #2507 — la MÊME garde que `/system/enrich*` et `/library/enrich-all` :
+    // Premium sans limite, palier gratuit sous quota journalier, 429 structuré
+    // une fois le quota épuisé. Ce bouton faisait jusqu'ici le travail complet
+    // — résolution des MBID comprise — sans licence ni quota, pendant que la
+    // passe automatique d'après scan exigeait Premium : trois chemins, trois
+    // règles, et rien pour le dire au testeur (Reivax66, fil 1570).
+    //
+    // Posée APRÈS le raccourci « rien à faire » ci-dessus : un geste qui n'a
+    // rien à enrichir ne consomme pas un des dix gestes du jour — même
+    // principe que la portée invalide de `enrich_all_library`.
+    if let Err(refus) = crate::routes::system::gate_enrichment(&state).await {
+        return refus.into_response();
+    }
+
     // Store initial status
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings
@@ -828,6 +896,12 @@ pub(super) async fn force_refetch_artist_artwork(
 ) -> impl IntoResponse {
     let cache_dir = artwork_cache_dir();
     let db = state.backend.clone();
+
+    // #2507 — même garde que la passe des manquantes ci-dessus : la reprise
+    // forcée refait TOUS les artistes, c'est le geste le plus coûteux des deux.
+    if let Err(refus) = crate::routes::system::gate_enrichment(&state).await {
+        return refus.into_response();
+    }
 
     let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
     let total_artists = artist_repo
@@ -1369,6 +1443,265 @@ mod garde_cablage_des_routes_images_artistes {
                  laisserait le bandeau du client ouvert pour toujours"
             );
         }
+    }
+}
+
+/// #2507 — une seule garde pour les gestes manuels d'enrichissement.
+///
+/// Trois chemins remplissent `artists.image_path`, et ils suivaient trois
+/// règles : Premium sec après un scan, quota journalier sur `/system/enrich*`,
+/// **rien** sur `POST /library/artwork/enrich-artists[/force]` — le bouton des
+/// Réglages faisait le travail complet, MBID compris, sans licence ni quota.
+/// Ces essais passent par le ROUTEUR de la famille `library`
+/// (`super::router()`), donc par les lignes `.route("/artwork/enrich-artists",
+/// …)` : démonter la garde du handler OU la route les fait rougir.
+///
+/// Ce qui s'éprouve ici se décide AVANT le `tokio::spawn` du handler : le
+/// statut, le corps du refus, le drapeau d'avancement et le registre des
+/// tâches. Les passes elles-mêmes partent interroger mozaiklabs.fr et
+/// MusicBrainz ; elles ne sont jamais attendues.
+#[cfg(test)]
+mod garde_de_licence_des_gestes_manuels_2507 {
+    use super::{DRAPEAU_AVANCEMENT_IMAGES_ARTISTES, TACHE_IMAGES_ARTISTES};
+    use crate::routes::system::enrich::QuotaDuJour;
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+    use tune_core::db::artist_repo::ArtistRepo;
+    use tune_core::db::settings_repo::SettingsRepo;
+
+    /// Un serveur en mémoire **sans licence** : le palier gratuit, celui du
+    /// ticket (Reivax66, TuneOS Fedora, « je n'ai pas de licence activée »).
+    fn etat_gratuit() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état en mémoire")
+    }
+
+    /// Un artiste sans image ni MBID : le bouton a du travail, le raccourci
+    /// « rien à faire » n'est pas pris.
+    fn un_artiste_sans_image(etat: &AppState) {
+        ArtistRepo::with_backend(etat.backend.clone())
+            .get_or_create("Reivax", None, None)
+            .expect("création de l'artiste");
+    }
+
+    /// Un album local sans pochette : même chose pour `/artwork/enrich`.
+    fn un_album_sans_pochette(etat: &AppState) {
+        un_artiste_sans_image(etat);
+        etat.backend
+            .execute(
+                "INSERT INTO albums (title, artist_id, source) VALUES ('Sans pochette', 1, 'local')",
+                &[],
+            )
+            .expect("insertion de l'album");
+    }
+
+    /// Épuise le quota du jour comme le fait `tests/enrichissement_audible_3810.rs` :
+    /// la date est posée par la lecture (pas de seconde implémentation de
+    /// « aujourd'hui »), puis le seul compteur est écrasé.
+    fn quota_epuise(etat: &AppState) {
+        let reglages = SettingsRepo::with_backend(etat.backend.clone());
+        let _ = QuotaDuJour::lire(&reglages);
+        reglages
+            .set("enrichment_daily_count", "999")
+            .expect("le compteur de quota s'écrit");
+    }
+
+    fn compteur(etat: &AppState) -> i64 {
+        QuotaDuJour::lire(&SettingsRepo::with_backend(etat.backend.clone())).used
+    }
+
+    async fn post(etat: &AppState, chemin: &str) -> (StatusCode, Value) {
+        let reponse = super::super::router()
+            .with_state(etat.clone())
+            .oneshot(Request::post(chemin).body(Body::empty()).expect("requête"))
+            .await
+            .expect("réponse");
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        (
+            statut,
+            serde_json::from_slice(&octets).unwrap_or(json!(null)),
+        )
+    }
+
+    /// Le corps que les TROIS chemins servent : celui de `refus_enrichissement`.
+    fn verifier_le_refus_de_quota(corps: &Value) {
+        assert_eq!(
+            corps["code"], "daily_quota_exhausted",
+            "le refus doit porter son code stable, celui que `api.ts` lit en \
+             premier (`body.code ?? body.error`) : {corps}"
+        );
+        assert_eq!(
+            corps["error"], "free_tier_daily_enrichment_limit_reached",
+            "la clé historique du 429 ne bouge pas (#3810) : {corps}"
+        );
+        assert_eq!(corps["premium"], false, "{corps}");
+        assert_eq!(corps["quota"]["limit"], 10, "{corps}");
+        assert_eq!(corps["quota"]["remaining"], 0, "{corps}");
+        assert!(
+            corps["quota"]["resets_at"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("T00:00:00Z")),
+            "la remise à zéro doit être datée (prochain minuit UTC) : {corps}"
+        );
+        assert!(
+            corps["retry_after"].as_u64().is_some_and(|s| s >= 1),
+            "le client web lit `retry_after` dans le corps d'un 429 (#2178) : {corps}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Palier gratuit, quota épuisé : les trois gestes refusent, en 429, sans
+    // rien lancer
+    // -----------------------------------------------------------------------
+
+    /// LE défaut du ticket : ce bouton ne demandait rien à personne.
+    #[tokio::test]
+    async fn quota_epuise_le_bouton_images_artistes_est_refuse_en_429() {
+        let etat = etat_gratuit();
+        un_artiste_sans_image(&etat);
+        quota_epuise(&etat);
+
+        let (statut, corps) = post(&etat, "/artwork/enrich-artists").await;
+
+        assert_eq!(
+            statut,
+            StatusCode::TOO_MANY_REQUESTS,
+            "sans garde, le bouton « Enrichir les images artistes » fait le \
+             travail complet sans licence ni quota (#2507) — corps : {corps}"
+        );
+        verifier_le_refus_de_quota(&corps);
+        // Rien n'a été lancé : ni drapeau, ni tâche de fond.
+        let reglages = SettingsRepo::with_backend(etat.backend.clone());
+        assert_ne!(
+            reglages
+                .get(DRAPEAU_AVANCEMENT_IMAGES_ARTISTES)
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("running"),
+            "un refus ne doit pas laisser un drapeau `running` en base"
+        );
+        assert!(
+            !etat
+                .background_tasks
+                .snapshot()
+                .iter()
+                .any(|t| t.id == TACHE_IMAGES_ARTISTES),
+            "un refus ne doit enregistrer aucune tâche de fond"
+        );
+    }
+
+    /// La reprise forcée est le geste le plus coûteux (TOUS les artistes).
+    #[tokio::test]
+    async fn quota_epuise_la_reprise_forcee_est_refusee_en_429() {
+        let etat = etat_gratuit();
+        quota_epuise(&etat);
+
+        let (statut, corps) = post(&etat, "/artwork/enrich-artists/force").await;
+
+        assert_eq!(
+            statut,
+            StatusCode::TOO_MANY_REQUESTS,
+            "la reprise forcée doit passer par la même garde : {corps}"
+        );
+        verifier_le_refus_de_quota(&corps);
+        assert!(
+            !etat
+                .background_tasks
+                .snapshot()
+                .iter()
+                .any(|t| t.id == TACHE_IMAGES_ARTISTES),
+            "un refus ne doit enregistrer aucune tâche de fond"
+        );
+    }
+
+    /// La jumelle « pochettes » — la moitié pochettes de `/system/enrich`,
+    /// qui est gardé — refuse de la même façon.
+    #[tokio::test]
+    async fn quota_epuise_les_pochettes_en_lot_sont_refusees_en_429() {
+        let etat = etat_gratuit();
+        un_album_sans_pochette(&etat);
+        quota_epuise(&etat);
+
+        let (statut, corps) = post(&etat, "/artwork/enrich").await;
+
+        assert_eq!(
+            statut,
+            StatusCode::TOO_MANY_REQUESTS,
+            "`/artwork/enrich` est la jumelle nue de `enrich-artists` : {corps}"
+        );
+        verifier_le_refus_de_quota(&corps);
+    }
+
+    // -----------------------------------------------------------------------
+    // Contrôles positifs : Premium passe, le gratuit consomme, un geste vide
+    // ne consomme rien
+    // -----------------------------------------------------------------------
+
+    /// Premium, compteur à 999 : la garde ne regarde pas le quota. Sans ce
+    /// témoin, une garde qui refuserait TOUT passerait les trois essais
+    /// ci-dessus.
+    #[tokio::test]
+    async fn premium_passe_malgre_un_compteur_epuise() {
+        let etat = etat_gratuit();
+        etat.license.set_account_premium(true, None).await;
+        quota_epuise(&etat);
+
+        let (statut, corps) = post(&etat, "/artwork/enrich-artists/force").await;
+
+        assert_eq!(
+            statut,
+            StatusCode::ACCEPTED,
+            "Premium n'a pas de quota : {corps}"
+        );
+        assert_eq!(corps["status"], "accepted", "{corps}");
+        assert!(
+            etat.background_tasks
+                .snapshot()
+                .iter()
+                .any(|t| t.id == TACHE_IMAGES_ARTISTES),
+            "la passe acceptée doit être au registre des tâches de fond"
+        );
+    }
+
+    /// Palier gratuit, quota disponible : le geste part ET consomme un des dix
+    /// gestes du jour — exactement ce que fait `/system/enrich`.
+    #[tokio::test]
+    async fn gratuit_avec_quota_le_geste_part_et_consomme_un_geste() {
+        let etat = etat_gratuit();
+        assert_eq!(compteur(&etat), 0);
+
+        let (statut, corps) = post(&etat, "/artwork/enrich-artists/force").await;
+
+        assert_eq!(statut, StatusCode::ACCEPTED, "{corps}");
+        assert_eq!(
+            compteur(&etat),
+            1,
+            "le geste manuel doit consommer le quota, comme `/system/enrich`"
+        );
+    }
+
+    /// Rien à enrichir : « skipped », et le quota n'est PAS entamé. Un clic à
+    /// vide n'est pas un geste.
+    #[tokio::test]
+    async fn sans_rien_a_faire_le_bouton_ne_consomme_pas_le_quota() {
+        let etat = etat_gratuit();
+        assert_eq!(compteur(&etat), 0);
+
+        let (statut, corps) = post(&etat, "/artwork/enrich-artists").await;
+
+        assert_eq!(statut, StatusCode::OK, "{corps}");
+        assert_eq!(corps["status"], "skipped", "{corps}");
+        assert_eq!(
+            compteur(&etat),
+            0,
+            "un geste qui n'a rien à faire ne doit pas coûter un des dix du jour"
+        );
     }
 }
 

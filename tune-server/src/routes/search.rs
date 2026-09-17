@@ -208,9 +208,12 @@ async fn federated_search(
             artist_repo
                 .search_page(&p.q, limit, offset)
                 .unwrap_or_default(),
-            album_repo
-                .search_page(&p.q, limit, offset)
-                .unwrap_or_default(),
+            avec_date_d_ajout(
+                &album_repo,
+                album_repo
+                    .search_page(&p.q, limit, offset)
+                    .unwrap_or_default(),
+            ),
             track_repo
                 .search_page(&p.q, limit, offset)
                 .unwrap_or_default(),
@@ -383,6 +386,62 @@ async fn federated_search(
         "radios": radios,
         "services": service_results,
     }))
+}
+
+/// Attache `added_at` aux albums d'une page de résultats.
+///
+/// `search_page` lit les albums par `select_album()`, qui laisse `added_at` à
+/// `None`. L'écran de recherche trie désormais ses albums par date d'ajout
+/// (Bertrand, 16/09/2026) : sans cette passe, ce tri serait un tri sur rien.
+fn avec_date_d_ajout(
+    repo: &AlbumRepo,
+    mut albums: Vec<tune_core::db::models::Album>,
+) -> Vec<tune_core::db::models::Album> {
+    repo.attacher_added_at(&mut albums);
+    albums
+}
+
+#[cfg(test)]
+mod tests_date_d_ajout {
+    use super::*;
+
+    /// Une page de recherche porte la date d'ajout de ses albums locaux —
+    /// lue de la même source que la Bibliothèque (`file_first_seen`, sinon
+    /// mtime), jamais inventée : un album sans piste locale reste sans date.
+    #[test]
+    fn la_page_de_recherche_porte_la_date_d_ajout() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Nick Drake')",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Pink Moon', 1), (2, 'Bryter Layter', 1)",
+            &[],
+        )
+        .unwrap();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, file_path, file_mtime, source) \
+             VALUES ('Pink Moon', 1, 1, '/m/pink.flac', 1600000000, 'local')",
+            &[],
+        )
+        .unwrap();
+        let repo = AlbumRepo::with_backend(state.backend.clone());
+        let page = repo.search_page("Nick", 10, 0).unwrap();
+        assert_eq!(page.len(), 2, "{page:?}");
+        assert!(
+            page.iter().all(|a| a.added_at.is_none()),
+            "select_album() ne la porte pas"
+        );
+
+        let page = avec_date_d_ajout(&repo, page);
+        let pink = page.iter().find(|a| a.id == Some(1)).unwrap();
+        let bryter = page.iter().find(|a| a.id == Some(2)).unwrap();
+        assert!(pink.added_at.is_some_and(|t| t > 0.0), "{pink:?}");
+        assert_eq!(bryter.added_at, None, "aucune piste locale : aucune date");
+    }
 }
 
 #[cfg(test)]

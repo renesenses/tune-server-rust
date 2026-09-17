@@ -591,6 +591,18 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             });
             chosen
         };
+        // #3632 — la cadence est décidée ; les CANAUX, eux, restaient ceux
+        // du défaut cpal (stéréo sur à peu près toute sortie HDMI), et un
+        // FLAC 5.1 se repliait en 2.0 sans que personne ne l'ait demandé.
+        // On demande N au périphérique quand il l'annonce ; sinon le repli
+        // reste, et il est journalisé.
+        let output_config = ouvrir_les_canaux_de_la_source(
+            &device,
+            &device_name,
+            host_id_name,
+            output_config,
+            channels,
+        );
 
         // Build output stream at the chosen rate.
         let silent_cb_outer = force_silent.clone();

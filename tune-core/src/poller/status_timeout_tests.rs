@@ -125,7 +125,7 @@ async fn hung_lock_holder_times_out_too() {
 #[tokio::test]
 async fn healthy_transport_passes_through() {
     let out = arc(Box::new(FastOutput));
-    let (status, signal_path, dsp_metrics, famine, transformations) =
+    let (status, signal_path, dsp_metrics, famine, transformations, progress) =
         get_status_with_signal_path_bounded(&out, Some(Duration::from_secs(5)))
             .await
             .unwrap();
@@ -138,13 +138,14 @@ async fn healthy_transport_passes_through() {
     // Même défaut de trait pour les transformations réelles (REF-6b) : une
     // sortie qui ne les publie pas rend `None`, pas une déclaration vide.
     assert!(transformations.is_none());
+    assert!(progress.is_none());
 }
 
 #[tokio::test]
 async fn timeout_disabled_preserves_unbounded_behavior() {
     // TUNE_POLLER_STATUS_TIMEOUT_SECS=0 → rollback to the pre-fix path.
     let out = arc(Box::new(FastOutput));
-    let (status, signal_path, dsp_metrics, _famine, _transformations) =
+    let (status, signal_path, dsp_metrics, _famine, _transformations, _progress) =
         get_status_with_signal_path_bounded(&out, None)
             .await
             .unwrap();

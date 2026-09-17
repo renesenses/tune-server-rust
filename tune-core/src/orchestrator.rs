@@ -308,6 +308,12 @@ fn spawn_paced_levels_forwarder(
                     // portait. Sample peak, avant DSP, comme `peak_*_db`.
                     "peak_hold_left_db": peak_hold_left_db,
                     "peak_hold_right_db": peak_hold_right_db,
+                    // Surcharge = échantillons consécutifs à pleine échelle,
+                    // la seule que du PCM entier sache montrer (#4175).
+                    "over_left": lvl.over_left(),
+                    "over_right": lvl.over_right(),
+                    "over_run_left": lvl.over_run_left,
+                    "over_run_right": lvl.over_run_right,
                     "rms_left": lvl.rms_left,
                     "rms_right": lvl.rms_right,
                     "spectrum": lvl.spectrum,
@@ -1340,6 +1346,10 @@ mod annonce_lire_contre_aleatoire;
 #[cfg(test)]
 mod wav_override_tests;
 
+/// #3183 — le plafond de fréquence désarme le passthrough ALAC (écart n° 1) ;
+/// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
+#[cfg(test)]
+mod alac_passthrough_tests;
 #[cfg(test)]
 mod plafond_16_bits_tests;
 /// #4016 — le plafond de 4 GiB de l en-tete RIFF, mesure puis route.
@@ -1387,6 +1397,12 @@ mod annonce_apres_sortie_guard;
 
 #[cfg(test)]
 mod stop_scope_tests;
+
+/// #4283 — `play_from_queue` et `advance_queue_metadata` lisent l'entrée de
+/// file AVANT d'écrire le curseur : une position hors bornes est refusée en
+/// nommant la position et la longueur, et la ligne courante ne bouge pas.
+#[cfg(test)]
+mod curseur_intact_4283;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).

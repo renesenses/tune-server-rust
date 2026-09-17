@@ -10,6 +10,8 @@ use unicode_normalization::UnicodeNormalization;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 
+use super::enrich::{MOTIF_PREMIUM_REQUIS, QuotaDuJour, refus_enrichissement};
+
 use crate::state::AppState;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -720,9 +722,18 @@ pub(super) async fn trigger_scan(
 /// n'existe pas pour l'utilisateur*.
 ///
 /// Ce type ne DÉCIDE d'aucune règle d'offre — il ne fait que nommer celle que
-/// le code applique déjà. Le bouton manuel « Enrichir les images artistes »
-/// (`POST /library/artwork/enrich-artists`) ne passe pas par ici et n'est,
-/// lui, soumis à aucune licence ; ce n'est pas à ce type de le changer.
+/// le code applique déjà : la passe AUTOMATIQUE est ce que Premium achète
+/// (`Feature::AutoEnrichment`, « Auto Metadata Enrichment »), comme le
+/// téléchargement automatique des biographies (`background::spawn_bio_sync`) et
+/// la passe automatique des crédits (`credits::passe_automatique_credits`).
+/// Le geste MANUEL, lui, est ouvert au palier gratuit sous quota journalier :
+/// depuis #2507, le bouton « Enrichir les images artistes »
+/// (`POST /library/artwork/enrich-artists[/force]`) passe par
+/// `gate_enrichment` comme `/system/enrich*` — une seule garde pour tous les
+/// gestes manuels, et le refus d'ici porte le MÊME bloc structuré que leur 429
+/// ([`refus_enrichissement`]), quota restant compris, pour que le client
+/// puisse dire « la passe automatique exige Premium ; il vous reste N gestes
+/// manuels aujourd'hui ».
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SuiteDuScan {
     /// La passe a été lancée.
@@ -769,10 +780,24 @@ impl SuiteDuScan {
     /// Construit UNE fois et inséré trois fois : les trois `json!` sont des
     /// copies manuelles qui ont déjà divergé deux fois (#2012, #2146), et une
     /// clé posée dans deux d'entre eux sur trois ne casse aucune compilation.
-    pub(crate) fn rapport(self) -> Value {
+    ///
+    /// `refus` (#2507) : le corps de [`refus_enrichissement`], identique au
+    /// 429 des routes manuelles, quand c'est l'OFFRE qui refuse — donc pour
+    /// `premium_required` seulement. Un réglage éteint n'est pas un refus
+    /// d'offre, et une passe partie n'a rien à refuser : `null` dans les deux
+    /// cas. `quota_gratuit` est le compteur du jour, lu par l'appelant sur le
+    /// palier gratuit ; il dit au client combien de gestes manuels restent.
+    pub(crate) fn rapport(self, quota_gratuit: Option<&QuotaDuJour>) -> Value {
+        let refus = match self {
+            Self::ReserveeAuPremium => {
+                Some(refus_enrichissement(MOTIF_PREMIUM_REQUIS, quota_gratuit))
+            }
+            Self::Demarree | Self::EteinteParReglage => None,
+        };
         json!({
             "started": self.demarree(),
             "skipped_reason": self.motif(),
+            "refus": refus,
         })
     }
 }
@@ -908,12 +933,21 @@ impl ChiffresDeFinDeScan<'_> {
             // « 5 » sur 49 629 fichiers peut aussi bien désigner cinq fichiers
             // aux balises abîmées, et le testeur n'a aucun moyen de trancher.
             "skipped_empty_files": self.scan_stats.empty_files,
+            // Les Matroska (#3633) : ADMIS parce que leur piste se décode,
+            // ÉCARTÉS parce qu'elle ne se décode pas — deux compteurs, lus
+            // l'un contre l'autre. Le détail par codec des écartés est dans
+            // `skipped_unsupported_by_ext` (`mkv-codec-non-decodable-ac3`).
+            "matroska_admitted": self.scan_stats.matroska_admis,
+            "matroska_rejected": self.scan_stats.matroska_ecartes,
             // Des COMPTEURS, donc ils partent chez les trois consommateurs —
             // comme tous les autres. Seule la liste nominative des feuilles
             // écartées reste au fichier (`cue_sheets_skipped_paths`), pour la
             // même raison que les autres chemins : le bus d'événements est
             // diffusé à tous les clients connectés.
             "cue_sheets": self.cue_sheets(),
+            // Les pistes dont le DR vient d'un `foo_dr.txt` voisin (#4186).
+            // Un compteur : chez les trois consommateurs, comme les autres.
+            "dr_from_sidecar_file": self.scan_stats.dr_from_sidecar,
         })
     }
 
@@ -1679,7 +1713,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // de la fermeture : c'est LUI qui publie le résumé de fin de
                 // scan, et c'est ce résumé qui annonçait « sans erreur »
                 // pendant que quatorze pistes étaient refusées (#2939).
-                let ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
+                let mut ecritures = tune_core::scanner::walker::EcrituresDuLot::manque(
                     to_insert.len(),
                     batch_inserted as usize,
                 )
@@ -1707,8 +1741,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
 
                     if !meta_entries.is_empty() {
-                        if let Err(e) = meta_repo.set_batch_multi(&meta_entries) {
-                            tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
+                        match meta_repo.set_batch_multi(&meta_entries) {
+                            // Le DR lu dans un `foo_dr.txt` voisin (#4186) ne se
+                            // compte que s'il est ENTRÉ en base : un lot refusé
+                            // n'a rien livré, et le rapport ne doit pas dire
+                            // le contraire.
+                            Ok(()) => {
+                                ecritures = ecritures
+                                    .avec_dr_des_rapports_voisins(meta_entries.iter().map(|(_, m)| m));
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");
+                            }
                         }
                     }
                 }
@@ -2358,6 +2402,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
         //
         // #1943 : ce que la purge a REFUSÉ de faire, et pourquoi, est publié
         // par `purge_refused*` — voir `ChiffresDeFinDeScan`.
+        //
+        // #2507 : le quota du jour est lu ICI, à la fin du scan, pas à sa
+        // décision — un scan dure des heures, et ce que le client doit
+        // afficher, c'est ce qu'il reste MAINTENANT de gestes manuels.
+        // Premium n'a pas de quota : `None`.
+        let quota_gratuit = (!enrichissement_sous_licence)
+            .then(|| QuotaDuJour::lire(&SettingsRepo::with_backend(db.clone())));
         let chiffres = ChiffresDeFinDeScan {
             total_discovered,
             missing_dirs: &missing_dirs,
@@ -2380,7 +2431,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             db_insert_failed,
             db_update_failed,
             artwork_extracted,
-            auto_enrichment: suite_du_scan.rapport(),
+            auto_enrichment: suite_du_scan.rapport(quota_gratuit.as_ref()),
             skipped_by_ext: &skipped_by_ext,
             skipped_reasons: &skipped_reasons,
             skipped_unsupported_paths: &skipped_unsupported_paths,
@@ -3793,7 +3844,7 @@ mod rapport_de_fin_de_scan {
             db_insert_failed: 108,
             db_update_failed: 109,
             artwork_extracted: 110,
-            auto_enrichment: SuiteDuScan::decider(true, true).rapport(),
+            auto_enrichment: SuiteDuScan::decider(true, true).rapport(None),
             skipped_by_ext: par_ext,
             skipped_reasons: motifs,
             skipped_unsupported_paths: non_lus,
@@ -3815,6 +3866,9 @@ mod rapport_de_fin_de_scan {
             // clé passerait sinon inaperçu.
             empty_files: 111,
             empty_file_paths: vec!["/Volumes/musique/copie-interrompue.flac".to_string()],
+            // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un chiffre
+            // distinct de tous les autres, pour la même raison.
+            dr_from_sidecar: 112,
             ..Default::default()
         }
     }
@@ -3933,6 +3987,9 @@ mod rapport_de_fin_de_scan {
             r["skipped_empty_file_paths"],
             serde_json::json!(["/Volumes/musique/copie-interrompue.flac"])
         );
+        // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un compteur, chez
+        // les trois consommateurs.
+        assert_eq!(r["dr_from_sidecar_file"], serde_json::json!(112));
         assert_eq!(
             r["skipped_unsupported_by_ext"],
             serde_json::json!({"mpc": 280})
@@ -4038,7 +4095,7 @@ mod rapport_de_fin_de_scan {
         /// Sous leur forme littérale de clé JSON. Chercher le mot nu
         /// attraperait le nom de la variable Rust et passerait sans qu'aucune
         /// clé ne soit publiée.
-        const CLES: [&str; 8] = [
+        const CLES: [&str; 9] = [
             "\"skipped_unsupported_paths\"",
             "\"skipped_no_metadata_paths\"",
             "\"skipped_duplicate_paths\"",
@@ -4055,6 +4112,9 @@ mod rapport_de_fin_de_scan {
             // la liste nominative par le seul fichier.
             "\"cue_sheets\"",
             "\"cue_sheets_skipped_paths\"",
+            // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un compteur,
+            // même clé des deux côtés.
+            "\"dr_from_sidecar_file\"",
         ];
 
         for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {
@@ -4620,7 +4680,7 @@ mod suite_du_scan_apres_scan {
     /// de licence. Le rapport doit porter le motif, pas un simple `false`.
     #[test]
     fn le_rapport_publie_started_et_le_motif() {
-        let rapport = SuiteDuScan::decider(true, false).rapport();
+        let rapport = SuiteDuScan::decider(true, false).rapport(None);
         assert_eq!(rapport["started"], serde_json::json!(false));
         assert_eq!(
             rapport["skipped_reason"],
@@ -4655,8 +4715,11 @@ mod suite_du_scan_apres_scan {
         let suite = SuiteDuScan::decider(true, true);
         assert!(suite.demarree());
         assert_eq!(suite.motif(), None);
-        assert_eq!(suite.rapport()["started"], serde_json::json!(true));
-        assert_eq!(suite.rapport()["skipped_reason"], serde_json::Value::Null);
+        assert_eq!(suite.rapport(None)["started"], serde_json::json!(true));
+        assert_eq!(
+            suite.rapport(None)["skipped_reason"],
+            serde_json::Value::Null
+        );
     }
 }
 
@@ -4680,7 +4743,7 @@ mod rapport_de_scan_publie_le_sort_de_lenrichissement {
             (true, false, Some("disabled_by_setting")),
             (false, true, Some("premium_required")),
         ] {
-            let bloc = SuiteDuScan::decider(reglage, sous_licence).rapport();
+            let bloc = SuiteDuScan::decider(reglage, sous_licence).rapport(None);
             assert_eq!(bloc["started"], serde_json::json!(motif.is_none()));
             assert_eq!(
                 bloc["skipped_reason"],
@@ -4690,6 +4753,69 @@ mod rapport_de_scan_publie_le_sort_de_lenrichissement {
                 },
                 "le motif doit rester lisible par le client (#2507)"
             );
+        }
+    }
+
+    /// #2507, second passage — le refus d'offre du scan porte le MÊME bloc
+    /// structuré que le 429 des gestes manuels : `code`, `quota` (utilisé,
+    /// plafond, restant, remise à zéro). C'est ce qui permet au client de dire
+    /// « la passe automatique exige Premium ; il vous reste N gestes manuels
+    /// aujourd'hui » au lieu d'un refus nu.
+    #[test]
+    fn le_refus_premium_du_scan_porte_le_quota_des_gestes_manuels() {
+        use crate::state::AppState;
+        use tune_core::db::settings_repo::SettingsRepo;
+
+        let etat = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let reglages = SettingsRepo::with_backend(etat.backend.clone());
+        // Trois gestes manuels déjà consommés aujourd'hui.
+        let quota = {
+            for _ in 0..3 {
+                super::super::enrich::increment_daily_enrichment(&reglages, 1);
+            }
+            super::super::enrich::QuotaDuJour::lire(&reglages)
+        };
+
+        let bloc = SuiteDuScan::decider(true, false).rapport(Some(&quota));
+        assert_eq!(bloc["skipped_reason"], "premium_required");
+        let refus = &bloc["refus"];
+        assert_eq!(
+            refus["code"], "premium_required",
+            "le refus du scan doit porter le code stable, comme le 429 : {bloc}"
+        );
+        assert_eq!(refus["premium"], false);
+        assert_eq!(refus["quota"]["used"], 3, "{bloc}");
+        assert_eq!(refus["quota"]["limit"], 10, "{bloc}");
+        assert_eq!(refus["quota"]["remaining"], 7, "{bloc}");
+        assert!(
+            refus["quota"]["resets_at"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("T00:00:00Z")),
+            "la remise à zéro est le prochain minuit UTC : {bloc}"
+        );
+        // Un refus Premium ne se lève pas en attendant : pas de `retry_after`.
+        assert!(refus["retry_after"].is_null(), "{bloc}");
+
+        // Le même bloc, mot pour mot, que celui que `gate_enrichment` sert.
+        assert_eq!(
+            *refus,
+            super::super::enrich::refus_enrichissement(
+                super::super::enrich::MOTIF_PREMIUM_REQUIS,
+                Some(&quota)
+            ),
+            "scan et routes doivent servir le MÊME corps de refus (#2507)"
+        );
+    }
+
+    /// Un réglage éteint n'est pas un refus d'offre, et une passe partie n'a
+    /// rien à refuser : `refus` est `null` dans les deux cas, même sur le
+    /// palier gratuit... qui, lui, ne peut pas être « éteint par réglage »
+    /// (le manque de licence l'emporte) — donc Premium des deux côtés.
+    #[test]
+    fn sans_refus_d_offre_le_bloc_refus_est_nul() {
+        for (reglage, sous_licence) in [(true, true), (false, true)] {
+            let bloc = SuiteDuScan::decider(reglage, sous_licence).rapport(None);
+            assert!(bloc["refus"].is_null(), "{bloc}");
         }
     }
 }

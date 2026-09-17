@@ -55,3 +55,4 @@ pub mod zone_repo;
 
 #[cfg(test)]
 mod album_dr_provenance_tests;
+pub mod upnp_revision;

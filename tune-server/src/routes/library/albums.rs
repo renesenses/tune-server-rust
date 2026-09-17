@@ -20,6 +20,7 @@ use tune_core::db::profile_repo::ProfileRepo;
 use tune_core::db::rating_repo::RatingRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
+use tune_core::library::quality::libelle_cadence;
 
 use super::{Pagination, refus};
 
@@ -309,9 +310,28 @@ pub(super) async fn album_filters(State(state): State<AppState>) -> Result<Json<
     let dynamic_ranges = AlbumRepo::with_backend(state.backend.clone())
         .dynamic_range_values()
         .unwrap_or_default();
-    Ok(Json(
-        json!({ "formats": formats, "sample_rates": sample_rates, "dynamic_ranges": dynamic_ranges }),
-    ))
+    // #4171 (Cyrille Moutia, fil 1792) : `sample_rates` rend les hertz BRUTS,
+    // et un album DSD y figure bien — le scan écrit la cadence 1 bit
+    // (2 822 400 pour du DSD64) dans `tracks.sample_rate`, que
+    // `update_quality_from_tracks` remonte par `MAX` dans `albums.sample_rate`.
+    // Mais l'écran ne savait ni nommer ces valeurs ni les reconnaître comme du
+    // DSD. `sample_rate_labels` porte, dans le MÊME ordre que `sample_rates`,
+    // le libellé lisible (« DSD64 », « 96 kHz ») et le marqueur `dsd` ; la
+    // `value` est celle que le filtre reçoit. `sample_rates` est gardé tel
+    // quel : un client installé ne voit aucun changement.
+    let sample_rate_labels: Vec<Value> = sample_rates
+        .iter()
+        .map(|&sr| {
+            let l = libelle_cadence(sr);
+            json!({ "value": l.value, "label": l.label, "dsd": l.dsd })
+        })
+        .collect();
+    Ok(Json(json!({
+        "formats": formats,
+        "sample_rates": sample_rates,
+        "sample_rate_labels": sample_rate_labels,
+        "dynamic_ranges": dynamic_ranges,
+    })))
 }
 
 pub(super) async fn recent_albums(
@@ -2158,9 +2178,46 @@ pub(super) async fn update_album(
         }
     }
 
-    repo.update(&album).ok();
+    if repo.update(&album).is_ok() {
+        // C3 — ce qui vient d'être écrit ICI l'a été par l'utilisateur, et
+        // aucune passe de réparation ne doit le défaire (voir
+        // `reparer_compilations.rs`). Un échec du marqueur ne fait pas
+        // échouer l'édition : il se lit au journal, pas à l'écran.
+        let champs = champs_edites_de(&body);
+        if !champs.is_empty()
+            && let Err(e) = tune_core::db::album_metadata_repo::AlbumMetadataRepo::with_backend(
+                state.backend.clone(),
+            )
+            .marquer_edition_manuelle(id, &champs)
+        {
+            tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
+        }
+    }
 
     Json(album.to_json()).into_response()
+}
+
+/// Les champs qu'une requête d'édition TOUCHE, sous le nom que le marqueur
+/// d'édition manuelle (C3) retient. `artist_id` et `artist_name` désignent le
+/// même champ : l'artiste de l'album.
+fn champs_edites_de(body: &AlbumUpdate) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if body.title.is_some() {
+        v.push("title");
+    }
+    if body.artist_id.is_some() || body.artist_name.is_some() {
+        v.push("artist");
+    }
+    if body.genre.is_some() {
+        v.push("genre");
+    }
+    if body.year.is_some() {
+        v.push("year");
+    }
+    if body.label.is_some() {
+        v.push("label");
+    }
+    v
 }
 
 // --- Album extended metadata endpoints ---
@@ -2199,8 +2256,19 @@ pub(super) async fn album_metadata_put(
     }
 
     let repo = AlbumMetadataRepo::with_backend(state.backend.clone());
+    // Le marqueur lui-même ne s'écrit pas par cette porte : il dit ce que
+    // l'utilisateur a tenu, il n'est pas une valeur qu'il tient.
+    let mut body = body;
+    body.remove(tune_core::db::album_metadata_repo::CLE_EDITION_MANUELLE);
     if let Err(e) = repo.set_batch(id, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    // C3 — chaque clé posée ici est une édition manuelle.
+    let champs: Vec<&str> = body.keys().map(String::as_str).collect();
+    if !champs.is_empty()
+        && let Err(e) = repo.marquer_edition_manuelle(id, &champs)
+    {
+        tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
     }
 
     Json(json!({"status": "ok", "fields": body.len()})).into_response()
@@ -2222,6 +2290,8 @@ pub(super) async fn batch_update_albums(
 ) -> impl IntoResponse {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let meta_repo =
+        tune_core::db::album_metadata_repo::AlbumMetadataRepo::with_backend(state.backend.clone());
     let mut updated = 0i64;
 
     let resolved_artist_id = if let Some(aid) = body.artist_id {
@@ -2261,6 +2331,25 @@ pub(super) async fn batch_update_albums(
         }
         if repo.update(&album).is_ok() {
             updated += 1;
+            // C3 — une édition en masse reste une édition de l'utilisateur.
+            let mut champs = Vec::new();
+            if body.genre.is_some() {
+                champs.push("genre");
+            }
+            if body.year.is_some() {
+                champs.push("year");
+            }
+            if body.label.is_some() {
+                champs.push("label");
+            }
+            if resolved_artist_id.is_some() {
+                champs.push("artist");
+            }
+            if !champs.is_empty()
+                && let Err(e) = meta_repo.marquer_edition_manuelle(id, &champs)
+            {
+                tracing::warn!(album_id = id, error = %e, "edition_manuelle_non_marquee");
+            }
         }
     }
 
@@ -2356,6 +2445,76 @@ mod tests_grouping {
 mod tests_editions {
     use super::*;
     use tune_core::db::album_distinct_repo::AlbumDistinctRepo;
+
+    /// C3 (Bertrand, 14/09/2026) — une édition passée par les trois routes
+    /// laisse un marqueur qui NOMME les champs tenus, lisible par
+    /// `GET /albums/{id}/metadata`. Sans lui, aucune passe de réparation ne
+    /// peut promettre de ne pas défaire une correction de l'utilisateur.
+    #[tokio::test]
+    async fn les_editions_de_l_utilisateur_laissent_un_marqueur_nomme() {
+        use tune_core::db::album_metadata_repo::{AlbumMetadataRepo, CLE_EDITION_MANUELLE};
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'X', 1), (2, 'Y', 1)",
+            &[],
+        )
+        .unwrap();
+        let meta = AlbumMetadataRepo::with_backend(state.backend.clone());
+
+        // Route 1 : PUT /albums/{id} — titre et artiste.
+        let _ = update_album(
+            State(state.clone()),
+            Path(1),
+            Json(AlbumUpdate {
+                title: Some("X2".into()),
+                artist_id: None,
+                artist_name: Some("B".into()),
+                genre: None,
+                year: None,
+                label: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            meta.champs_edites_a_la_main(1).unwrap(),
+            vec!["artist", "title"]
+        );
+
+        // Route 2 : PUT /albums/{id}/metadata — clés libres ; le marqueur
+        // lui-même n'est pas une clé qu'on peut y forcer.
+        let mut corps = std::collections::HashMap::new();
+        corps.insert("conductor".to_string(), "Fritz Reiner".to_string());
+        corps.insert(
+            CLE_EDITION_MANUELLE.to_string(),
+            "[\"is_compilation\"]".to_string(),
+        );
+        let _ = album_metadata_put(State(state.clone()), Path(1), Json(corps)).await;
+        assert_eq!(
+            meta.champs_edites_a_la_main(1).unwrap(),
+            vec!["artist", "conductor", "title"],
+            "le marqueur ne se force pas par la route"
+        );
+
+        // Route 3 : édition en masse.
+        let _ = batch_update_albums(
+            State(state.clone()),
+            Json(BatchAlbumUpdate {
+                album_ids: vec![2],
+                genre: Some("Jazz".into()),
+                year: None,
+                artist_id: None,
+                artist_name: None,
+                label: None,
+            }),
+        )
+        .await;
+        assert_eq!(meta.champs_edites_a_la_main(2).unwrap(), vec!["genre"]);
+        // Un album non touché ne porte rien.
+        assert!(meta.get_all(2).unwrap().get(CLE_EDITION_MANUELLE).is_some());
+    }
 
     /// BIB-B1 : l'étiquette d'édition est le suffixe après le délimiteur,
     /// sans parenthèse ni crochet fermant ; le titre de base n'en a pas ; un
@@ -2490,6 +2649,78 @@ mod tests_editions {
                 .await
                 .is_err()
         );
+    }
+}
+
+/// #4171 (Cyrille Moutia, fil 1792) : la facette des fréquences de
+/// `GET /library/albums/filters` porte un libellé lisible et reconnaît le DSD.
+#[cfg(test)]
+mod tests_facette_frequences {
+    use super::*;
+
+    /// Les albums DSD entrent dans `sample_rates` (cadence 1 bit brute,
+    /// contrat inchangé), et `sample_rate_labels`, dans le MÊME ordre, les
+    /// nomme DSD64/DSD128 avec `dsd: true` ; le PCM est en kHz, `dsd: false`.
+    #[tokio::test]
+    async fn la_facette_des_frequences_nomme_les_paliers_dsd() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let album = |titre: &str, format: &str, sr: i64, bd: i64| {
+            b.execute(
+                "INSERT INTO albums (title, format, sample_rate, bit_depth, track_count) \
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &format as &dyn ToSqlValue,
+                    &sr as &dyn ToSqlValue,
+                    &bd as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+        };
+        // Ce que le scan écrit : cadence 1 bit brute et `bit_depth = 1` pour
+        // un `.dsf`/`.dff` (`dsf_dff_fallback_complete`, `metadata/mod.rs`),
+        // remontées telles quelles dans `albums` par `update_quality_from_tracks`.
+        album("CD", "flac", 44_100, 16);
+        album("Hi-res", "flac", 96_000, 24);
+        album("SACD rip", "dsf", 2_822_400, 1);
+        album("DSD128", "dff", 5_644_800, 1);
+        // Un doublon de cadence ne fait qu'une entrée.
+        album("Autre SACD", "dsf", 2_822_400, 1);
+
+        let Json(v) = album_filters(State(state.clone()))
+            .await
+            .ok()
+            .expect("la route répond");
+
+        // Contrat existant, intact : les hertz bruts, croissants, distincts.
+        assert_eq!(
+            v["sample_rates"],
+            json!([44_100, 96_000, 2_822_400, 5_644_800]),
+            "{v}"
+        );
+        // Le nouveau champ, aligné sur `sample_rates`.
+        let labels = v["sample_rate_labels"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sample_rate_labels absent : {v}"));
+        let attendu = [
+            (44_100, "44.1 kHz", false),
+            (96_000, "96 kHz", false),
+            (2_822_400, "DSD64", true),
+            (5_644_800, "DSD128", true),
+        ];
+        assert_eq!(labels.len(), attendu.len(), "{v}");
+        for (entree, (valeur, libelle, dsd)) in labels.iter().zip(attendu) {
+            assert_eq!(entree["value"], valeur, "{entree}");
+            assert_eq!(
+                entree["label"], libelle,
+                "la cadence {valeur} doit se lire « {libelle} » — {entree}"
+            );
+            assert_eq!(
+                entree["dsd"], dsd,
+                "la cadence {valeur} doit porter dsd={dsd} — {entree}"
+            );
+        }
     }
 }
 

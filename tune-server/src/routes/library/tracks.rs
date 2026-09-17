@@ -2414,8 +2414,11 @@ mod contrat_dlna_de_la_route_audio_3579 {
             // et lui garde `audio/aac`.
             ("aac", "aac", "audio/aac"),
             ("dsf", "dsf", "application/x-dsd"),
-            // Le repli, et le seul chemin qui y mène.
-            ("mkv", "mkv", "application/octet-stream"),
+            // Un Matroska est catalogué depuis #3633 : il a son type.
+            ("mkv", "mkv", "audio/x-matroska"),
+            // Le repli, et le seul chemin qui y mène : un format que
+            // `from_extension` ne connaît pas.
+            ("xyz", "xyz", "application/octet-stream"),
         ] {
             let (state, id, _dir) = piste(etiquette, extension, 44_100, 16);
             let reponse = par_la_route(&state, id, "GET", &[]).await;

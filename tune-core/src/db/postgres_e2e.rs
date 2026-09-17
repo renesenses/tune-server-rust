@@ -2390,3 +2390,84 @@ async fn pg_3715_alarm_source_migration_preserves_ids_and_accepts_opaque_strings
         pool.close().await;
     }
 }
+
+/// #4201 — le compteur UPnP suit les radios SANS figer le type de
+/// `radio_stations.is_favorite`. Un WHEN qui nommait la colonne en faisait une
+/// dépendance : 062 rejouée (pg_2468) et le banc pg_3181 échouaient sur
+/// « cannot alter type of a column used in a trigger definition ».
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_4201_revision_radio_sans_dependance_de_colonne() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations");
+    async fn revision(pool: &sqlx::PgPool) -> i64 {
+        sqlx::query_scalar("SELECT value FROM upnp_catalog_revision WHERE id = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO radio_stations (name,url) VALUES ('R4201','http://example.invalid/4201') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let avant = revision(&pool).await;
+    sqlx::query("UPDATE radio_stations SET play_count = 42 WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        revision(&pool).await,
+        avant,
+        "un compteur d'écoute n'invalide pas le catalogue"
+    );
+
+    sqlx::query("UPDATE radio_stations SET is_favorite = 1 WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let apres = revision(&pool).await;
+    assert_ne!(apres, avant, "un favori change le catalogue publié");
+
+    // La régression : changer le type de la colonne doit rester possible.
+    sqlx::raw_sql(
+        "ALTER TABLE radio_stations ALTER COLUMN is_favorite DROP DEFAULT, \
+         ALTER COLUMN is_favorite TYPE TEXT USING is_favorite::text",
+    )
+    .execute(&pool)
+    .await
+    .expect("is_favorite doit rester convertible malgré le déclencheur UPnP");
+    sqlx::query("UPDATE radio_stations SET is_favorite = '0' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_ne!(
+        revision(&pool).await,
+        apres,
+        "le filtre suit la colonne après conversion"
+    );
+
+    sqlx::raw_sql(
+        "ALTER TABLE radio_stations ALTER COLUMN is_favorite TYPE BIGINT USING is_favorite::bigint, \
+         ALTER COLUMN is_favorite SET DEFAULT 0",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM radio_stations WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+}

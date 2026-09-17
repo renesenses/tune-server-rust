@@ -111,17 +111,21 @@ pub fn radio_audio_url(base_url: &str, radio_id: i64) -> String {
 ///   pas une URI : `<upnp:albumArtURI>01KV5Z...</upnp:albumArtURI>` n'est
 ///   resolvable par aucun point de controle. [`artwork_url`] sait deja le
 ///   changer en URL Tune — c'est ce qu'il fait pour la pochette d'une piste.
-pub fn radio_logo_url(base_url: &str, logo: &str) -> String {
+///
+/// #4260 : l'URL de relais est **signée** (`&sig=`, HMAC de l'adresse
+/// distante par `secret`, voir [`crate::library::artwork_proxy`]). Publier
+/// `proxy?url=…` en clair sur le LAN faisait de Tune un relais ouvert : tout
+/// appareil du réseau pouvait lui faire chercher n'importe quelle adresse, y
+/// compris interne. Le relais refuse désormais une URL non signée qui lui
+/// arrive par l'exemption DIDL (#3933).
+pub fn radio_logo_url(base_url: &str, logo: &str, secret: &str) -> String {
     let logo = logo.trim();
     if logo.starts_with("http://") || logo.starts_with("https://") {
         // Deja servi par nous : ne pas relayer notre propre adresse.
         if logo.starts_with(base_url) {
             return logo.to_string();
         }
-        return format!(
-            "{base_url}{API_PATH}/library/artwork/proxy?url={}",
-            urlencoding::encode(logo)
-        );
+        return crate::library::artwork_proxy::url_relais_signee(base_url, secret, logo);
     }
     artwork_url(base_url, logo)
 }
@@ -234,6 +238,12 @@ impl UpnpState {
 
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.server_ip(), self.server_port)
+    }
+
+    /// Le secret qui signe les URL de relais de pochette publiées dans la
+    /// DIDL (#4260) — celui de l'instance, créé au premier usage.
+    pub fn secret_relais(&self) -> String {
+        crate::library::artwork_proxy::secret(&self.backend)
     }
 }
 
@@ -578,9 +588,17 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
             &format!("<SearchCaps>{SEARCH_CAPS}</SearchCaps>"),
         ),
         Some("Search") => search_action_response(state, soap_body),
-        Some("GetSystemUpdateID") => {
-            soap_action_response(CONTENT_DIRECTORY_URN, "GetSystemUpdateID", "<Id>1</Id>")
-        }
+        Some("GetSystemUpdateID") => match crate::db::upnp_revision::read(state.backend.as_ref()) {
+            Ok(id) => soap_action_response(
+                CONTENT_DIRECTORY_URN,
+                "GetSystemUpdateID",
+                &format!("<Id>{id}</Id>"),
+            ),
+            Err(e) => {
+                warn!(error = %e, "upnp_revision_unavailable");
+                soap_fault(501, "Action Failed")
+            }
+        },
         Some(other) => {
             let object_id = parse_content_directory_object_id(soap_body);
             warn!(
@@ -631,6 +649,14 @@ const SEARCH_CAPS: &str = "upnp:class,dc:title,@refID";
 /// La pagination des pistes est celle de `browse_all_tracks`, deja eprouvee —
 /// le client redemande par tranches, exactement comme sur « All Tracks ».
 fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
+    let update_id = match crate::db::upnp_revision::read(state.backend.as_ref()) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "upnp_revision_unavailable");
+            return soap_fault(501, "Action Failed");
+        }
+    };
+
     let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
     if !sort_criteria.trim().is_empty() {
         return soap_fault(709, "Unsupported or invalid sort criteria");
@@ -672,6 +698,10 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
         None => empty_didl(),
     };
 
+    if crate::db::upnp_revision::read(state.backend.as_ref()) != Ok(update_id) {
+        return soap_fault(720, "Cannot process the request: catalog changed");
+    }
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
@@ -680,7 +710,7 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
       <Result>{result}</Result>
       <NumberReturned>{returned}</NumberReturned>
       <TotalMatches>{total}</TotalMatches>
-      <UpdateID>1</UpdateID>
+      <UpdateID>{update_id}</UpdateID>
     </u:SearchResponse>
   </s:Body>
 </s:Envelope>"#,
@@ -1240,7 +1270,7 @@ fn search_containers_in_container(
                 .unwrap_or_default();
             let retenues = retenir_par_titre(stations, titres, |s| s.name.as_str());
             let (page, total) = paginer(retenues, start, count);
-            let mut didl = didl_radios(&page, &base_url);
+            let mut didl = didl_radios(&page, &base_url, &state.secret_relais());
             didl.total = total;
             Some(didl)
         }
@@ -1402,6 +1432,14 @@ fn parse_search_request(soap_xml: &str) -> (String, String, u64, u64, String) {
 }
 
 fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
+    let update_id = match crate::db::upnp_revision::read(state.backend.as_ref()) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "upnp_revision_unavailable");
+            return soap_fault(501, "Action Failed");
+        }
+    };
+
     debug!(body_len = soap_body.len(), "upnp_content_directory_request");
 
     let (object_id, browse_flag, start, count) = parse_browse_request(soap_body);
@@ -1414,6 +1452,10 @@ fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
         browse_metadata(state, &object_id)
     };
 
+    if crate::db::upnp_revision::read(state.backend.as_ref()) != Ok(update_id) {
+        return soap_fault(720, "Cannot process the request: catalog changed");
+    }
+
     let total_matches = didl.total;
     let number_returned = didl.returned;
 
@@ -1425,7 +1467,7 @@ fn browse_action_response(state: &UpnpState, soap_body: &str) -> String {
       <Result>{result}</Result>
       <NumberReturned>{returned}</NumberReturned>
       <TotalMatches>{total}</TotalMatches>
-      <UpdateID>1</UpdateID>
+      <UpdateID>{update_id}</UpdateID>
     </u:BrowseResponse>
   </s:Body>
 </s:Envelope>"#,
@@ -1790,7 +1832,7 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     .ok()
                     .flatten()
             })
-            .map(|station| didl_radio_item(&station, &state.base_url())),
+            .map(|station| didl_radio_item(&station, &state.base_url(), &state.secret_relais())),
         id if id.starts_with("track/") => id
             .strip_prefix("track/")
             .and_then(|n| n.parse::<i64>().ok())
@@ -2489,7 +2531,7 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let stations = repo.list().unwrap_or_default();
     let (page, total) = paginer(stations, start, count);
-    let mut didl = didl_radios(&page, &state.base_url());
+    let mut didl = didl_radios(&page, &state.base_url(), &state.secret_relais());
     // `TotalMatches` dit la taille RÉELLE du dossier, pas celle de la page :
     // c'est de là que le point de contrôle sait qu'il reste des pages.
     didl.total = total;
@@ -2515,10 +2557,14 @@ fn browse_radios(state: &UpnpState, start: u64, count: u64) -> DidlResult {
 /// PARTAGE avec les pistes — ce que ce commentaire affirmait deja alors que le
 /// XML etait encore ecrit a la main juste en dessous. Voir la note de
 /// [`didl_radio_item`] pour ce que cette main manquait.
-fn didl_radios(stations: &[crate::db::radio_repo::RadioStation], base: &str) -> DidlResult {
+fn didl_radios(
+    stations: &[crate::db::radio_repo::RadioStation],
+    base: &str,
+    secret: &str,
+) -> DidlResult {
     let mut inner = String::new();
     for station in stations {
-        inner.push_str(&didl_radio_item(station, base));
+        inner.push_str(&didl_radio_item(station, base, secret));
     }
     let total = stations.len() as u64;
     DidlResult {
@@ -2569,14 +2615,18 @@ const RADIO_MIME: &str = "audio/wav";
 /// `audioBroadcast`, le `protocolInfo` reste `http-get:*:audio/wav:*`
 /// ([`crate::outputs::didl::ProtocolStyle::Simple`], le style de tout le
 /// serveur media), et la pochette reste AVANT le `<res>`.
-fn didl_radio_item(station: &crate::db::radio_repo::RadioStation, base: &str) -> String {
+fn didl_radio_item(
+    station: &crate::db::radio_repo::RadioStation,
+    base: &str,
+    secret: &str,
+) -> String {
     let id = format!("radio/{}", station.id.unwrap_or(0));
     let logo = station
         .logo_url
         .as_deref()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|l| radio_logo_url(base, l));
+        .map(|l| radio_logo_url(base, l, secret));
     crate::outputs::didl::DidlBuilder::new(
         &station.name,
         &radio_audio_url(base, station.id.unwrap_or(0)),
@@ -2976,6 +3026,127 @@ mod tests {
     use super::*;
 
     #[test]
+    fn system_update_id_soap_suit_le_catalogue() {
+        let state = test_state();
+        let urn = "urn:schemas-upnp-org:service:ContentDirectory:1";
+        let browse = corps_browse("0", "BrowseDirectChildren");
+        let search = soap_body("Search", urn).replace("</u:Search>", "<ContainerID>0</ContainerID><SearchCriteria>*</SearchCriteria><Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>100</RequestedCount><SortCriteria></SortCriteria></u:Search>");
+        let mut previous = None;
+        for sql in [
+            "INSERT INTO tracks (id,title) VALUES (87654,'Avant')",
+            "UPDATE tracks SET title = 'Après' WHERE id = 87654",
+            "DELETE FROM tracks WHERE id = 87654",
+        ] {
+            state.backend.execute_batch(sql).unwrap();
+            let value = crate::db::upnp_revision::read(state.backend.as_ref()).unwrap();
+            assert_ne!(
+                previous,
+                Some(value),
+                "la révision suit chaque modification"
+            );
+            previous = Some(value);
+            let get = build_browse_response(&state, &soap_body("GetSystemUpdateID", urn));
+            assert!(
+                get.contains(&format!("<Id>{value}</Id>")),
+                "GetSystemUpdateID figé : {get}"
+            );
+            for request in [browse.clone(), search.clone()] {
+                let response = build_browse_response(&state, &request);
+                assert!(
+                    response.contains(&format!("<UpdateID>{value}</UpdateID>")),
+                    "Browse/Search annonce un compteur périmé : {response}"
+                );
+            }
+        }
+        state
+            .backend
+            .execute_batch("DROP TABLE upnp_catalog_revision")
+            .unwrap();
+        for request in [soap_body("GetSystemUpdateID", urn), browse, search] {
+            assert!(
+                is_soap_fault(&build_browse_response(&state, &request)),
+                "compteur absent : erreur explicite, jamais de valeur inventée"
+            );
+        }
+    }
+
+    #[test]
+    fn system_update_id_refuse_une_page_modifiee_pendant_sa_lecture() {
+        use crate::db::backend::{DbBackend, DbTxHandle, SqlValue, ToSqlValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Une écriture réelle entre les deux lectures du compteur simule un
+        // scanner concurrent, sans minuterie ni dépendance à l'ordonnanceur.
+        struct ConcurrentWriter {
+            db: Arc<dyn DbBackend>,
+            reads: AtomicUsize,
+        }
+        impl DbBackend for ConcurrentWriter {
+            fn engine(&self) -> crate::db::engine::Engine {
+                self.db.engine()
+            }
+            fn execute(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<usize, String> {
+                self.db.execute(sql, p)
+            }
+            fn last_insert_rowid(&self) -> i64 {
+                self.db.last_insert_rowid()
+            }
+            fn query_one(
+                &self,
+                sql: &str,
+                p: &[&dyn ToSqlValue],
+            ) -> Result<Option<Vec<SqlValue>>, String> {
+                self.db.query_one(sql, p)
+            }
+            fn query_many(
+                &self,
+                sql: &str,
+                p: &[&dyn ToSqlValue],
+            ) -> Result<Vec<Vec<SqlValue>>, String> {
+                self.db.query_many(sql, p)
+            }
+            fn execute_batch(&self, sql: &str) -> Result<(), String> {
+                self.db.execute_batch(sql)
+            }
+            fn write_tx(
+                &self,
+                f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+            ) -> Result<(), String> {
+                self.db.write_tx(f)
+            }
+            fn query_one_strong(
+                &self,
+                sql: &str,
+                p: &[&dyn ToSqlValue],
+            ) -> Result<Option<Vec<SqlValue>>, String> {
+                if sql.contains("upnp_catalog_revision")
+                    && self.reads.fetch_add(1, Ordering::SeqCst) == 1
+                {
+                    self.db
+                        .execute_batch("INSERT INTO tracks (title) VALUES ('Ajout concurrent')")?;
+                }
+                self.db.query_one_strong(sql, p)
+            }
+        }
+        let search = soap_body("Search", "urn:schemas-upnp-org:service:ContentDirectory:1")
+            .replace(
+                "</u:Search>",
+                "<ContainerID>0</ContainerID><SearchCriteria>*</SearchCriteria></u:Search>",
+            );
+        for request in [corps_browse("0", "BrowseDirectChildren"), search] {
+            let mut state = test_state();
+            state.backend = Arc::new(ConcurrentWriter {
+                db: state.backend,
+                reads: AtomicUsize::new(0),
+            });
+            let response = build_browse_response(&state, &request);
+            assert!(
+                response.contains("<errorCode>720</errorCode>"),
+                "une page modifiée pendant la lecture ne doit pas être publiée : {response}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_browse_soap() {
         let soap = r#"<?xml version="1.0"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
@@ -3063,6 +3234,8 @@ mod tests {
     fn test_state() -> UpnpState {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
         UpnpState::new(Arc::new(db), 8888, None)
     }
 
@@ -3102,6 +3275,8 @@ mod tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = AlbumRepo::with_backend(backend.clone());
         repo.create(&album_with_genre("Kind of Blue", "Jazz"))
@@ -3288,6 +3463,8 @@ mod tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let repo = AlbumRepo::with_backend(backend.clone());
         for (titre, annee) in [
@@ -4245,7 +4422,10 @@ mod tests {
 
         let update = build_browse_response(&state, &soap_body("GetSystemUpdateID", urn));
         assert!(update.contains("<u:GetSystemUpdateIDResponse"));
-        assert!(update.contains("<Id>1</Id>"));
+        assert!(update.contains(&format!(
+            "<Id>{}</Id>",
+            crate::db::upnp_revision::read(state.backend.as_ref()).unwrap()
+        )));
 
         // `Search` REPOND desormais (#1516) : elle est declaree au SCPD et
         // servie. Ce test attendait un 401 — il encodait l'ancien
@@ -4808,6 +4988,8 @@ mod ssdp_msearch_tests {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         UpnpState::new(Arc::new(db), 8888, None)
     }
 
@@ -4981,6 +5163,8 @@ mod ssdp_msearch_tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let artist_repo = ArtistRepo::with_backend(backend.clone());
         let album_repo = AlbumRepo::with_backend(backend.clone());
@@ -5760,13 +5944,37 @@ mod ssdp_msearch_tests {
         );
 
         // --- TEMOIN : la pochette reste atteignable, relayee par Tune.
+        //
+        // #4260 : l'URL de relais porte la signature HMAC de l'adresse
+        // distante (`&sig=`, `&amp;` une fois dans le XML) — sans elle, le
+        // relais refuse ce qui lui arrive par l'exemption DIDL.
+        let distante = "https://mozaiklabs.fr/storage/radio-logos/abc.png";
         let attendue = format!(
-            "<upnp:albumArtURI>{base}/api/v1/library/artwork/proxy?url={}</upnp:albumArtURI>",
-            urlencoding::encode("https://mozaiklabs.fr/storage/radio-logos/abc.png")
+            "<upnp:albumArtURI>{base}/api/v1/library/artwork/proxy?url={}&amp;sig={}</upnp:albumArtURI>",
+            urlencoding::encode(distante),
+            crate::library::artwork_proxy::signature(&state.secret_relais(), distante)
         );
         assert!(
             didl.contains(&attendue),
-            "l'adresse d'origine n'est pas relayee : {didl}"
+            "l'adresse d'origine n'est pas relayee, ou pas signee : {didl}"
+        );
+    }
+
+    /// #4260 : le secret de signature est CELUI DE L'INSTANCE, persistant —
+    /// une URL mémorisée par un point de contrôle reste valable d'un Browse à
+    /// l'autre, et d'un redémarrage à l'autre (même base, même secret).
+    #[test]
+    fn le_secret_de_relais_est_stable_sur_la_meme_base() {
+        let state = state_du_releve_nd8006();
+        let a = state.secret_relais();
+        let b = state.secret_relais();
+        assert_eq!(a, b, "le secret doit être lu, pas régénéré");
+        assert_eq!(a.len(), 64, "32 octets aléatoires en hexadécimal");
+        let autre = state_du_releve_nd8006();
+        assert_ne!(
+            autre.secret_relais(),
+            a,
+            "deux instances n'ont pas le même secret"
         );
     }
 
@@ -6068,6 +6276,8 @@ mod ssdp_msearch_tests {
 
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch("DELETE FROM radio_stations;").unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
         let album_repo = AlbumRepo::with_backend(backend.clone());
         let track_repo = TrackRepo::with_backend(backend.clone());

@@ -1369,6 +1369,24 @@ async fn get_shared_playlist(
     .into_response()
 }
 
+/// Le fichier de cette piste est-il encore là ?
+///
+/// Une seule définition pour les DEUX lectures de la récupération —
+/// `recover_playlist` (« vérifier ») et `apply_recovery` (« encore
+/// manquante ») — sinon les deux écrans ne comptent pas la même chose.
+///
+/// - repli de graphie NFC/NFD (#1865) : un `Path::exists()` nu déclarait
+///   « indisponible » des pistes bien présentes, écrites en NFD par macOS ou
+///   un partage SMB ;
+/// - une piste de feuille CUE n'a PAS de `file_path` (`tracks.file_path` est
+///   `UNIQUE`, #3631) : son fichier est `cue_media_path`, et c'est lui qu'il
+///   faut chercher, comme le fait `resolve_local_track`.
+fn fichier_de_la_piste_present(t: &tune_core::db::models::Track) -> bool {
+    let media_cue = t.bornes_cue().map(|(media, _, _)| media);
+    let chemin = t.file_path.as_deref().or(media_cue.as_deref());
+    chemin.is_some_and(|p| !tune_core::library::local_path::resolve_local_path(p).is_missing())
+}
+
 /// Check availability of each track in a playlist ("vérifier la disponibilité").
 /// A local track is available when its file still exists on disk; a missing file
 /// (deleted/moved/unplugged drive) is reported unavailable. Previously this was
@@ -1384,7 +1402,12 @@ async fn recover_playlist(
         Err(r) => return r,
     };
 
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
+    // Une base illisible ne doit pas se lire « playlist vide, tout va bien »
+    // (#3685) : c'est l'écran qui dirait ensuite « 0 manquante ».
+    let track_ids = match repo.get_track_ids(id) {
+        Ok(ids) => ids,
+        Err(e) => return AppError::internal(e).into_response(),
+    };
     let trepo = TrackRepo::with_backend(state.backend.clone());
     let mut tracks = Vec::with_capacity(track_ids.len());
     let mut available = 0i64;
@@ -1393,14 +1416,7 @@ async fn recover_playlist(
     for tid in &track_ids {
         let (title, artist, present) = match trepo.get(*tid) {
             Ok(Some(t)) => {
-                // Repli de graphie NFC/NFD (#1865) : un `Path::exists()`
-                // nu declarait « indisponible » des pistes bien presentes,
-                // ecrites en NFD par macOS ou un partage SMB.
-                let ok = t
-                    .file_path
-                    .as_deref()
-                    .map(|p| !tune_core::library::local_path::resolve_local_path(p).is_missing())
-                    .unwrap_or(false);
+                let ok = fichier_de_la_piste_present(&t);
                 (t.title, t.artist_name.unwrap_or_default(), ok)
             }
             _ => (String::new(), String::new(), false),
@@ -1614,43 +1630,234 @@ async fn diff_playlists(
 // Recovery apply
 // ---------------------------------------------------------------------------
 
+/// Un remplacement demandé par « Remplacer » — le corps EXACT que
+/// `api.applyRecovery()` (tune-web-client) envoie : `{ replacements: [{
+/// track_id, new_source, new_source_id }] }`.
+#[derive(Deserialize)]
+struct Remplacement {
+    /// La piste de la playlist dont le fichier manque.
+    track_id: i64,
+    /// `"local"` pour une autre piste de la bibliothèque ; sinon le nom d'un
+    /// service (`qobuz`, `tidal`…).
+    new_source: String,
+    /// Pour `local`, l'identifiant `tracks.id` de la piste de remplacement,
+    /// en texte parce que le client le porte ainsi pour toutes les sources.
+    new_source_id: String,
+}
+
+#[derive(Deserialize)]
+struct ApplyRecoveryBody {
+    #[serde(default)]
+    replacements: Vec<Remplacement>,
+}
+
+/// Applique les remplacements de la récupération de playlist (#3685).
+///
+/// Ce handler ne prenait AUCUN corps : trois extracteurs, pas de `Json<…>`.
+/// Le client envoyait `{replacements}`, le serveur le jetait, recomptait les
+/// fichiers présents et répondait 200 — et l'écran, en optimiste, passait la
+/// piste à « disponible ». Un no-op déguisé en succès.
+///
+/// Ce que le schéma PEUT porter : une autre piste de la BIBLIOTHÈQUE
+/// (`new_source = "local"`), réécrite à la même position par
+/// `PlaylistRepo::replace_track`. Ce qu'il ne peut PAS porter : une piste de
+/// service — `playlist_tracks.track_id` est `NOT NULL REFERENCES tracks(id)`
+/// dans les trois définitions de schéma, une playlist locale n'a rien où
+/// ranger un `source_id` Qobuz. Même doctrine que #1848 (`add_tracks`) et
+/// #1959 : le refus est légitime, c'est de le déguiser en succès qui ne l'est
+/// pas. Il est donc rendu NOMMÉMENT, par piste, dans `rejected`.
+///
+/// Réponse : `applied` (ce qui a été écrit), `rejected` (ce qui ne l'a pas
+/// été, avec son motif), `still_missing` (recompté APRÈS les écritures). Un
+/// corps absent, illisible ou sans remplacement est un 400 explicite, pas un
+/// recomptage silencieux. Quand rien n'a pu être appliqué, la réponse est un
+/// 422 qui porte le même compte rendu : un client qui ne lit que le statut ne
+/// doit pas voir un succès.
 async fn apply_recovery(
     State(state): State<AppState>,
     profile: ActiveProfile,
     Path(id): Path<i64>,
+    body: Result<Json<ApplyRecoveryBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // Le cloisonnement par profil (#2794) se tranche AVANT de lire le corps :
+    // une playlist qui n'est pas à l'appelant répond 404 quoi qu'il envoie,
+    // et ne lui apprend même pas quel corps elle attendait.
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
         return r;
     }
-    let track_repo = TrackRepo::with_backend(state.backend.clone());
-    let track_ids = repo.get_track_ids(id).unwrap_or_default();
-    let mut recovered = 0i64;
-    let mut missing = 0i64;
+    let body = match body {
+        Ok(Json(b)) => b,
+        Err(rejet) => {
+            return AppError::bad_request(format!(
+                "Corps attendu : {{ \"replacements\": [{{ \"track_id\", \"new_source\", \
+                 \"new_source_id\" }}] }} — {}",
+                rejet.body_text()
+            ))
+            .into_response();
+        }
+    };
+    if body.replacements.is_empty() {
+        return AppError::bad_request(
+            "Aucun remplacement dans la demande : `replacements` est vide. \
+             Rien à appliquer, rien n'a été recompté.",
+        )
+        .into_response();
+    }
 
-    for tid in &track_ids {
-        match track_repo.get(*tid) {
-            Ok(Some(t)) if t.file_path.is_some() => {
-                let path = t.file_path.as_ref().unwrap();
-                // Meme repli qu'au-dessus (#1865) : « encore manquante » ne
-                // doit pas vouloir dire « ecrite dans l'autre forme Unicode ».
-                if tune_core::library::local_path::resolve_local_path(path).is_missing() {
-                    missing += 1;
-                } else {
-                    recovered += 1;
-                }
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    // Une base illisible ne doit pas se lire « playlist vide » : chaque
+    // remplacement serait alors rejeté « hors de la playlist », à tort.
+    let mut dans_la_playlist: HashSet<i64> = match repo.get_track_ids(id) {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => return AppError::internal(e).into_response(),
+    };
+
+    let mut applied: Vec<Value> = Vec::new();
+    let mut rejected: Vec<Value> = Vec::new();
+    let refus = |r: &Remplacement, motif: String| {
+        json!({
+            "track_id": r.track_id,
+            "new_source": r.new_source,
+            "new_source_id": r.new_source_id,
+            "reason": motif,
+        })
+    };
+
+    for r in &body.replacements {
+        if !dans_la_playlist.contains(&r.track_id) {
+            rejected.push(refus(
+                r,
+                format!("la piste {} n'est pas dans cette playlist", r.track_id),
+            ));
+            continue;
+        }
+        let source = r.new_source.trim();
+        let source_id = r.new_source_id.trim();
+        if source.is_empty() || source_id.is_empty() {
+            rejected.push(refus(
+                r,
+                "source ou identifiant de remplacement vide".to_string(),
+            ));
+            continue;
+        }
+        if source != "local" {
+            rejected.push(refus(
+                r,
+                format!(
+                    "« {source} » : une playlist locale ne référence que des pistes de \
+                     la bibliothèque, elle ne peut pas porter une piste de service \
+                     (#1848). Ajoutez d'abord ce titre à votre bibliothèque."
+                ),
+            ));
+            continue;
+        }
+        let nouvelle = match source_id.parse::<i64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                rejected.push(refus(
+                    r,
+                    format!("« {source_id} » n'est pas un identifiant de piste locale"),
+                ));
+                continue;
             }
-            _ => missing += 1,
+        };
+        if nouvelle == r.track_id {
+            rejected.push(refus(
+                r,
+                "la piste se remplacerait par elle-même".to_string(),
+            ));
+            continue;
+        }
+        let existe = match track_repo.get(nouvelle) {
+            Ok(t) => t.is_some(),
+            Err(e) => return AppError::internal(e.to_string()).into_response(),
+        };
+        if !existe {
+            rejected.push(refus(
+                r,
+                format!("la piste de remplacement {nouvelle} n'existe pas dans la bibliothèque"),
+            ));
+            continue;
+        }
+        // Une panne d'écriture n'est pas un refus : elle s'annonce comme
+        // telle, en nommant ce qui a déjà été appliqué avant elle.
+        let touchees = match repo.replace_track(id, r.track_id, nouvelle) {
+            Ok(n) => n,
+            Err(e) => {
+                return AppError::internal(format!(
+                    "remplacement de la piste {} par {nouvelle} refusé par la base \
+                     ({} déjà appliqué(s) avant) : {e}",
+                    r.track_id,
+                    applied.len()
+                ))
+                .into_response();
+            }
+        };
+        if touchees == 0 {
+            // La ligne a disparu entre notre lecture et l'écriture (autre
+            // client, autre onglet) : ne pas compter ce qui n'a pas été écrit.
+            rejected.push(refus(
+                r,
+                format!(
+                    "la piste {} n'est plus dans cette playlist au moment d'écrire",
+                    r.track_id
+                ),
+            ));
+            continue;
+        }
+        tracing::info!(
+            playlist_id = id,
+            ancienne = r.track_id,
+            nouvelle,
+            "playlist_recovery_track_replaced"
+        );
+        dans_la_playlist.remove(&r.track_id);
+        dans_la_playlist.insert(nouvelle);
+        applied.push(json!({
+            "track_id": r.track_id,
+            "new_source": "local",
+            "new_source_id": r.new_source_id,
+            "new_track_id": nouvelle,
+        }));
+    }
+
+    // Recompté APRÈS les écritures, sur la playlist telle qu'elle est en
+    // base — pas sur la liste lue avant.
+    let track_ids = match repo.get_track_ids(id) {
+        Ok(ids) => ids,
+        Err(e) => return AppError::internal(e).into_response(),
+    };
+    let mut still_missing = 0i64;
+    for tid in &track_ids {
+        let present = match track_repo.get(*tid) {
+            Ok(Some(t)) => fichier_de_la_piste_present(&t),
+            Ok(None) => false,
+            Err(e) => return AppError::internal(e.to_string()).into_response(),
+        };
+        if !present {
+            still_missing += 1;
         }
     }
 
-    Json(json!({
-        "playlist_id": id,
-        "total_tracks": track_ids.len(),
-        "recovered": recovered,
-        "still_missing": missing,
-    }))
-    .into_response()
+    let statut = if applied.is_empty() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::OK
+    };
+    (
+        statut,
+        Json(json!({
+            "playlist_id": id,
+            "total_tracks": track_ids.len(),
+            "applied": applied,
+            "rejected": rejected,
+            "applied_count": applied.len(),
+            "rejected_count": rejected.len(),
+            "still_missing": still_missing,
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

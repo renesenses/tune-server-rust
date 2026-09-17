@@ -579,9 +579,12 @@ pub(super) async fn transcode_source_to_file(
 pub(super) async fn abandonner_la_session_de_transcodage(
     streamer: &crate::http::streamer::AudioStreamer,
     session_id: &str,
-    tmp_path: &str,
+    tmp_path: Option<&str>,
 ) {
-    let _ = std::fs::remove_file(tmp_path);
+    // Un telechargement avec garde RAII a deja nettoye son fichier (#4234).
+    if let Some(tmp_path) = tmp_path {
+        let _ = std::fs::remove_file(tmp_path);
+    }
     streamer.remove_session(session_id).await;
     warn!(
         stream_id = session_id,

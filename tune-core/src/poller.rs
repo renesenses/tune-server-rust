@@ -72,12 +72,18 @@ async fn get_status_with_signal_path_bounded(
         Option<OutputDspMetrics>,
         Option<OutputRingStarvation>,
         Option<TransformationsReelles>,
+        Option<u64>,
     ),
     String,
 > {
     let poll = async {
         let output = output_arc.lock().await;
         let status = output.get_status().await?;
+        let progress = if status.realtime {
+            None
+        } else {
+            output.processing_progress_bytes().await
+        };
         Ok((
             status,
             output.signal_path_status(),
@@ -86,6 +92,7 @@ async fn get_status_with_signal_path_bounded(
             // Même verrou, même tick (REF-6b, #2219) : ce que la sortie a
             // réellement fait au flux se relève à côté de sa sonde.
             output.transformations_reelles(),
+            progress,
         ))
     };
     match timeout {
@@ -248,6 +255,13 @@ const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 /// the output time to drain its buffer and report Stopped naturally.
 /// If it doesn't, this threshold forces the advance.
 const POSITION_PAST_END_TICKS: u8 = 3;
+/// Délai raisonnable (s) laissé au renderer, après une avance à l'horloge qui
+/// a ADOPTÉ son enchaînement (#4173), pour donner signe de vie sur la piste
+/// adoptée : position qui bouge, ou URI courante qui la nomme. Passé ce délai
+/// sans rien, l'adoption est infirmée et la piste adoptée est relancée par
+/// `SetAVTransportURI` + `Play` — le repli d'avant, sur la bonne piste. Voir
+/// [`decisions::suite_de_l_adoption`].
+const ADOPTION_HORLOGE_DELAI_SECS: u64 = 8;
 /// Minimum consecutive failed status polls before the DLNA wall-clock poll-fail
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.
@@ -779,6 +793,14 @@ mod famine_anneau_i3318;
 #[cfg(test)]
 mod rappel_arrete_3814;
 
+/// #3727 — un Tune Endpoint déjà tenu par un autre serveur ACCEPTE la
+/// connexion TCP puis se tait. Le banc dresse l'écouteur muet, une vraie
+/// sortie OAAT sur une vraie zone, et prouve que la boucle de connexion
+/// renonce en nommant la cause, que l'écran la reçoit, et que la zone ne
+/// reste pas `Playing` sans qu'un octet ne sorte.
+#[cfg(all(test, feature = "oaat"))]
+mod endpoint_oaat_muet_3727;
+
 #[cfg(test)]
 mod cadence_de_repos_tests;
 #[cfg(test)]
@@ -1077,3 +1099,12 @@ mod position_de_la_piste_precedente_954;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+
+/// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
+/// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position
+/// gelée à la durée) au lieu de jeter le flux qu'il tient et de repartir en
+/// `SetAVTransportURI` + `Play`. Le banc monte le vrai `tick` avec un renderer
+/// factice et prouve les deux issues : adoption sans aucun `Play`, et repli
+/// inchangé quand rien n'atteste l'enchaînement.
+#[cfg(test)]
+mod adoption_a_l_horloge_4173;

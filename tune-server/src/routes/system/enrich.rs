@@ -58,12 +58,117 @@ fn get_daily_enrichment_usage(settings: &SettingsRepo) -> (i64, i64) {
 }
 
 /// Increment the daily enrichment counter by `n`.
-fn increment_daily_enrichment(settings: &SettingsRepo, n: i64) {
+pub(crate) fn increment_daily_enrichment(settings: &SettingsRepo, n: i64) {
     let (current, _) = get_daily_enrichment_usage(settings);
     let new_count = current + n;
     settings
         .set(ENRICHMENT_COUNT_KEY, &new_count.to_string())
         .ok();
+}
+
+// ---------------------------------------------------------------------------
+// Le refus d'enrichissement — UN corps, trois chemins (#2507)
+// ---------------------------------------------------------------------------
+
+/// Motif stable : la passe ou le geste exige Premium. C'est le mot que lit le
+/// client (`enrichissementApresScan.ts`) ; il ne change pas sans lui.
+pub(crate) const MOTIF_PREMIUM_REQUIS: &str = "premium_required";
+/// Motif stable : palier gratuit, quota du jour épuisé.
+pub(crate) const MOTIF_QUOTA_EPUISE: &str = "daily_quota_exhausted";
+
+/// Le quota journalier du palier gratuit, tel qu'un client peut l'afficher.
+///
+/// Trois chemins remplissent `artists.image_path` et, jusqu'à #2507, chacun
+/// disait son refus dans sa propre langue — ou ne le disait pas du tout. Ce
+/// type est la lecture UNIQUE du compteur ; [`refus_enrichissement`] en fait
+/// le bloc que les trois chemins publient à l'identique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuotaDuJour {
+    pub(crate) used: i64,
+    pub(crate) limit: i64,
+    /// Secondes UNIX de l'instant de lecture : la remise à zéro s'en déduit.
+    lu_a: u64,
+}
+
+impl QuotaDuJour {
+    /// Lit le compteur du jour (et le remet à zéro si la date a changé).
+    pub(crate) fn lire(settings: &SettingsRepo) -> Self {
+        let (used, limit) = get_daily_enrichment_usage(settings);
+        Self {
+            used,
+            limit,
+            lu_a: secondes_unix(),
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> i64 {
+        (self.limit - self.used).max(0)
+    }
+
+    pub(crate) fn epuise(&self) -> bool {
+        self.used >= self.limit
+    }
+
+    /// Le compteur se remet à zéro au changement de date UTC
+    /// (`get_daily_enrichment_usage`) : c'est le prochain minuit UTC.
+    pub(crate) fn resets_at(&self) -> String {
+        format!("{}T00:00:00Z", date_utc_depuis_secs(self.prochain_minuit()))
+    }
+
+    /// Secondes avant la remise à zéro — le `retry_after` que le client web
+    /// lit dans le corps d'un 429 (#2178) avant l'en-tête `Retry-After`.
+    pub(crate) fn retry_after_secs(&self) -> u64 {
+        self.prochain_minuit().saturating_sub(self.lu_a).max(1)
+    }
+
+    fn prochain_minuit(&self) -> u64 {
+        (self.lu_a / 86400 + 1) * 86400
+    }
+
+    pub(crate) fn json(&self) -> Value {
+        json!({
+            "used": self.used,
+            "limit": self.limit,
+            "remaining": self.remaining(),
+            "resets_at": self.resets_at(),
+        })
+    }
+}
+
+/// Le corps d'un refus d'enrichissement, IDENTIQUE sur les trois chemins :
+/// le 429 de `gate_enrichment` (routes `/system/enrich*`, `/library/enrich-all`,
+/// `/library/artwork/enrich*`) et le bloc `auto_enrichment.refus` du rapport de
+/// fin de scan (`SuiteDuScan::rapport`).
+///
+/// - `code` : le motif stable ([`MOTIF_PREMIUM_REQUIS`] ou
+///   [`MOTIF_QUOTA_EPUISE`]) — c'est ce que `api.ts` lit en premier
+///   (`body.code ?? body.error`) ;
+/// - `quota` : `used` / `limit` / `remaining` / `resets_at` — `null` pour un
+///   compte Premium, qui n'a pas de quota ;
+/// - `retry_after` : secondes avant la remise à zéro, seulement quand c'est
+///   le quota qui refuse ; un refus Premium ne se lève pas en attendant ;
+/// - `error`, `used`, `limit`, `upgrade` : les clés que les clients lisaient
+///   déjà dans le 429 (#3810) — conservées telles quelles.
+pub(crate) fn refus_enrichissement(code: &'static str, quota: Option<&QuotaDuJour>) -> Value {
+    let mut corps = json!({
+        "code": code,
+        "error": if code == MOTIF_QUOTA_EPUISE {
+            "free_tier_daily_enrichment_limit_reached"
+        } else {
+            code
+        },
+        "premium": false,
+        "quota": quota.map(QuotaDuJour::json),
+        "upgrade": "Premium unlocks unlimited auto enrichment",
+    });
+    if let Some(q) = quota {
+        corps["used"] = json!(q.used);
+        corps["limit"] = json!(q.limit);
+        if code == MOTIF_QUOTA_EPUISE {
+            corps["retry_after"] = json!(q.retry_after_secs());
+        }
+    }
+    corps
 }
 
 // ---------------------------------------------------------------------------
@@ -76,12 +181,17 @@ fn increment_daily_enrichment(settings: &SettingsRepo, n: i64) {
 /// `(is_premium, settings)` the caller needs on allow, or `Err(response)` to
 /// short-circuit with the quota error. Centralises four identical copies of
 /// this block — the single place to reason about the enrichment quota.
+///
+/// #2507 — c'est aussi la garde des gestes manuels de `routes/library`
+/// (`/enrich-all`, `/artwork/enrich`, `/artwork/enrich-artists[/force]`) :
+/// un geste d'enrichissement, une règle. Le corps du 429 est celui de
+/// [`refus_enrichissement`], le même bloc que le rapport de fin de scan.
 pub(crate) async fn gate_enrichment(state: &AppState) -> Result<bool, (StatusCode, Json<Value>)> {
     let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if !is_premium {
-        let (used, limit) = get_daily_enrichment_usage(&settings);
-        if used >= limit {
+        let quota = QuotaDuJour::lire(&settings);
+        if quota.epuise() {
             // #3810 — un refus de quota cesse d'être muet côté serveur.
             //
             // Le 429 partait sans une ligne de journal, et l'interface v2
@@ -90,18 +200,13 @@ pub(crate) async fn gate_enrichment(state: &AppState) -> Result<bool, (StatusCod
             // qui ne nomme pas la cause, et le serveur n'en gardait aucune
             // trace : le refus était invisible des DEUX côtés.
             tracing::warn!(
-                used,
-                limit,
+                used = quota.used,
+                limit = quota.limit,
                 "enrichissement_refuse_quota_gratuit — palier gratuit, quota du jour épuisé"
             );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": "free_tier_daily_enrichment_limit_reached",
-                    "used": used,
-                    "limit": limit,
-                    "upgrade": "Premium unlocks unlimited auto enrichment",
-                })),
+                Json(refus_enrichissement(MOTIF_QUOTA_EPUISE, Some(&quota))),
             ));
         }
         increment_daily_enrichment(&settings, 1);
@@ -342,7 +447,8 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
     let is_premium = state.license.check_feature(Feature::AutoEnrichment).await;
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let (daily_used, daily_limit) = get_daily_enrichment_usage(&settings);
+    let quota = QuotaDuJour::lire(&settings);
+    let (daily_used, daily_limit) = (quota.used, quota.limit);
 
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
@@ -433,6 +539,10 @@ pub(super) async fn enrichment_status(State(state): State<AppState>) -> Json<Val
         "premium": is_premium,
         "daily_used": daily_used,
         "daily_limit": if is_premium { null_i64() } else { Some(daily_limit) },
+        // #2507 — le même bloc que le 429 des routes et que le rapport de fin
+        // de scan : `used` / `limit` / `remaining` / `resets_at`. `null` en
+        // Premium, qui n'a pas de quota.
+        "quota": if is_premium { Value::Null } else { quota.json() },
         "stats": {
             "total_tracks": total_tracks,
             "total_artists": total_artists,
@@ -474,12 +584,21 @@ fn null_i64() -> Option<i64> {
     None
 }
 
-/// Return today's date as "YYYY-MM-DD" in UTC, without chrono dependency.
-fn today_utc_str() -> String {
-    let secs = std::time::SystemTime::now()
+/// Secondes UNIX de l'instant présent.
+fn secondes_unix() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+}
+
+/// Return today's date as "YYYY-MM-DD" in UTC, without chrono dependency.
+fn today_utc_str() -> String {
+    date_utc_depuis_secs(secondes_unix())
+}
+
+/// La date civile UTC (`YYYY-MM-DD`) d'un instant en secondes UNIX.
+fn date_utc_depuis_secs(secs: u64) -> String {
     // 86400 seconds per day; compute days since epoch and derive date components
     let days = secs / 86400;
     // Civil date from days since 1970-01-01 (Algorithm from Howard Hinnant)
@@ -498,11 +617,8 @@ fn today_utc_str() -> String {
 
 /// Return current UTC timestamp as ISO 8601, without chrono dependency.
 fn now_utc_str() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let date = today_utc_str();
+    let secs = secondes_unix();
+    let date = date_utc_depuis_secs(secs);
     let day_secs = secs % 86400;
     let h = day_secs / 3600;
     let m = (day_secs % 3600) / 60;
@@ -1014,5 +1130,130 @@ mod tests {
 
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.data["directory"].as_str(), Some("/music/Jazz"));
+    }
+}
+
+/// #2507 — la politique de la garde, éprouvée sur la garde elle-même.
+///
+/// Les essais de route (`routes/library/artwork.rs`,
+/// `tests/enrichissement_audible_3810.rs`) prouvent le CÂBLAGE ; ceux-ci
+/// prouvent la règle et la forme du refus, sans rien lancer.
+#[cfg(test)]
+mod garde_et_quota_2507 {
+    use super::*;
+
+    fn etat_gratuit() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).expect("état en mémoire")
+    }
+
+    /// Premium : la garde passe et ne touche pas au compteur, même « épuisé ».
+    #[tokio::test]
+    async fn premium_passe_sans_regarder_le_quota() {
+        let etat = etat_gratuit();
+        etat.license.set_account_premium(true, None).await;
+        let reglages = SettingsRepo::with_backend(etat.backend.clone());
+        let _ = QuotaDuJour::lire(&reglages);
+        reglages.set(ENRICHMENT_COUNT_KEY, "999").unwrap();
+
+        assert_eq!(gate_enrichment(&etat).await.ok(), Some(true));
+        assert_eq!(
+            QuotaDuJour::lire(&reglages).used,
+            999,
+            "Premium ne consomme pas le quota du palier gratuit"
+        );
+    }
+
+    /// Gratuit : chaque passage consomme un geste, jusqu'au dixième inclus ;
+    /// le onzième est refusé avec le corps structuré.
+    #[tokio::test]
+    async fn gratuit_dix_gestes_puis_un_refus_structure() {
+        let etat = etat_gratuit();
+        let reglages = SettingsRepo::with_backend(etat.backend.clone());
+
+        for n in 1..=FREE_DAILY_ENRICHMENT_LIMIT {
+            assert_eq!(
+                gate_enrichment(&etat).await.ok(),
+                Some(false),
+                "le geste n°{n} doit passer"
+            );
+            assert_eq!(QuotaDuJour::lire(&reglages).used, n);
+        }
+
+        let (statut, Json(corps)) = gate_enrichment(&etat)
+            .await
+            .err()
+            .expect("le onzième geste doit être refusé");
+        assert_eq!(statut, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(corps["code"], MOTIF_QUOTA_EPUISE, "{corps}");
+        assert_eq!(
+            corps["error"], "free_tier_daily_enrichment_limit_reached",
+            "{corps}"
+        );
+        assert_eq!(corps["used"], 10, "{corps}");
+        assert_eq!(corps["limit"], 10, "{corps}");
+        assert_eq!(corps["quota"]["used"], 10, "{corps}");
+        assert_eq!(corps["quota"]["remaining"], 0, "{corps}");
+        assert!(
+            corps["retry_after"]
+                .as_u64()
+                .is_some_and(|s| (1..=86400).contains(&s)),
+            "`retry_after` est le délai jusqu'au prochain minuit UTC : {corps}"
+        );
+        assert_eq!(
+            QuotaDuJour::lire(&reglages).used,
+            10,
+            "un refus ne consomme rien"
+        );
+    }
+
+    /// La remise à zéro suit la règle de `get_daily_enrichment_usage` (la date
+    /// UTC change) : `resets_at` est le prochain minuit UTC, `retry_after` la
+    /// distance jusqu'à lui. Instant fixé, donc rejouable à toute heure.
+    #[test]
+    fn la_remise_a_zero_est_le_prochain_minuit_utc() {
+        // 20 712 jours après l'époque, à 10 h 00 UTC.
+        let jour: u64 = 20_712;
+        let quota = QuotaDuJour {
+            used: 3,
+            limit: 10,
+            lu_a: jour * 86_400 + 10 * 3_600,
+        };
+        assert_eq!(
+            quota.resets_at(),
+            format!("{}T00:00:00Z", date_utc_depuis_secs((jour + 1) * 86_400))
+        );
+        assert_eq!(quota.retry_after_secs(), 14 * 3_600);
+        assert_eq!(quota.remaining(), 7);
+        assert!(!quota.epuise());
+
+        // Le dernier instant du jour : une seconde avant minuit.
+        let fin = QuotaDuJour {
+            used: 10,
+            limit: 10,
+            lu_a: (jour + 1) * 86_400 - 1,
+        };
+        assert_eq!(fin.retry_after_secs(), 1);
+        assert!(fin.epuise());
+    }
+
+    /// Le refus Premium (celui du rapport de scan) porte le quota mais pas de
+    /// `retry_after` : attendre ne le lève pas.
+    #[test]
+    fn le_refus_premium_porte_le_quota_sans_delai() {
+        let quota = QuotaDuJour {
+            used: 2,
+            limit: 10,
+            lu_a: 20_712 * 86_400,
+        };
+        let corps = refus_enrichissement(MOTIF_PREMIUM_REQUIS, Some(&quota));
+        assert_eq!(corps["code"], "premium_required");
+        assert_eq!(corps["error"], "premium_required");
+        assert_eq!(corps["quota"]["remaining"], 8);
+        assert!(corps["retry_after"].is_null());
+
+        // Sans quota (Premium n'en a pas) : `quota` est `null`, pas absent.
+        let sans = refus_enrichissement(MOTIF_PREMIUM_REQUIS, None);
+        assert!(sans["quota"].is_null());
+        assert!(sans.get("quota").is_some());
     }
 }

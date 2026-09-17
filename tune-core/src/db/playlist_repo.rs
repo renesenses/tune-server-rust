@@ -121,6 +121,43 @@ pub mod sql {
             d.placeholder(1)
         )
     }
+
+    /// Remplace une piste par une autre, À LA MÊME POSITION, dans une seule
+    /// playlist (#3685).
+    ///
+    /// Gardé par l'existence de la piste de remplacement, comme
+    /// `insert_local_at_if_exists` dans la file : `playlist_tracks.track_id`
+    /// porte `REFERENCES tracks(id)` sur SQLite mais PAS sur PostgreSQL
+    /// (`pg_migrate.rs`, `001_initial_schema.sql`) — sans cette garde, un
+    /// identifiant périmé serait REFUSÉ sur un moteur et ACCEPTÉ sur l'autre.
+    /// Ici les deux rendent `0` ligne.
+    pub fn replace_track<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE playlist_tracks SET track_id = {} \
+             WHERE playlist_id = {} AND track_id = {} \
+             AND EXISTS (SELECT 1 FROM tracks WHERE id = {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
+    pub fn delete_track_by_id<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM playlist_tracks WHERE playlist_id = {} AND track_id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    pub fn contains_track<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT 1 FROM playlist_tracks WHERE playlist_id = {} AND track_id = {} LIMIT 1",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +443,51 @@ impl PlaylistRepo {
         let params: [&dyn ToSqlValue; 2] = [&playlist_id, &position];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Remplace `ancienne` par `nouvelle` dans la playlist, à la même
+    /// position — le geste « Remplacer » de la récupération de playlist
+    /// (#3685). Rend le nombre de lignes RÉELLEMENT touchées : `0` quand
+    /// `ancienne` n'y figurait pas, ou quand `nouvelle` n'existe pas dans
+    /// `tracks` (voir `sql::replace_track`). L'appelant, qui a déjà tranché ces
+    /// deux cas pour nommer son motif, ne doit donc jamais lire `0` comme un
+    /// succès.
+    ///
+    /// Si `nouvelle` figure DÉJÀ dans la playlist, la ligne d'`ancienne` est
+    /// retirée au lieu d'être réécrite : c'est l'invariant d'`add_tracks_deduped`
+    /// — une playlist ne porte jamais deux fois la même piste — et un
+    /// remplacement ne doit pas être le chemin par lequel il se perd. Le
+    /// nombre rendu compte alors les lignes retirées.
+    ///
+    /// Une seule transaction : la lecture « est-elle déjà là ? » et l'écriture
+    /// qu'elle décide ne peuvent pas être séparées par une autre écriture.
+    pub fn replace_track(
+        &self,
+        playlist_id: i64,
+        ancienne: i64,
+        nouvelle: i64,
+    ) -> Result<usize, String> {
+        if ancienne == nouvelle {
+            return Ok(0);
+        }
+        let contains_sql = self.dialect_sql(sql::contains_track, sql::contains_track);
+        let replace_sql = self.dialect_sql(sql::replace_track, sql::replace_track);
+        let delete_sql = self.dialect_sql(sql::delete_track_by_id, sql::delete_track_by_id);
+        let mut touchees = 0usize;
+        let touchees_ref = &mut touchees;
+        self.db.write_tx(&mut |tx| {
+            let cp: [&dyn ToSqlValue; 2] = [&playlist_id, &nouvelle];
+            let deja_la = tx.query_one(&contains_sql, &cp)?.is_some();
+            *touchees_ref = if deja_la {
+                let dp: [&dyn ToSqlValue; 2] = [&playlist_id, &ancienne];
+                tx.execute(&delete_sql, &dp)?
+            } else {
+                let rp: [&dyn ToSqlValue; 4] = [&nouvelle, &playlist_id, &ancienne, &nouvelle];
+                tx.execute(&replace_sql, &rp)?
+            };
+            Ok(())
+        })?;
+        Ok(touchees)
     }
 
     /// Replace the whole playlist contents with `track_ids`, in order,
@@ -930,5 +1012,85 @@ mod tests {
             "l'ancienne séquence laissait une playlist vide — c'est le défaut #2798"
         );
         assert!(repo.get_track_ids(plid).unwrap().is_empty());
+    }
+
+    fn trois_pistes(track_repo: &crate::db::track_repo::TrackRepo) -> Vec<i64> {
+        ["/r1.flac", "/r2.flac", "/r3.flac"]
+            .iter()
+            .map(|p| {
+                let mut t = TrackModel::new((*p).into());
+                t.file_path = Some((*p).into());
+                track_repo.create(&t).unwrap()
+            })
+            .collect()
+    }
+
+    /// #3685 — « Remplacer » réécrit la ligne À LA MÊME POSITION.
+    #[test]
+    fn replace_track_reecrit_la_piste_a_la_meme_position() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+        let ids = trois_pistes(&track_repo);
+
+        let plid = repo.create("À récupérer", None, 1).unwrap();
+        repo.add_tracks(plid, &[ids[0], ids[1]], None).unwrap();
+
+        let touchees = repo.replace_track(plid, ids[0], ids[2]).unwrap();
+        assert_eq!(touchees, 1, "une ligne réécrite");
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[2], ids[1]],
+            "la piste de remplacement prend la place de la piste manquante, en tête"
+        );
+    }
+
+    /// Une piste absente de la playlist, ou une piste de remplacement qui
+    /// n'existe pas dans `tracks`, ne touchent AUCUNE ligne : c'est ce `0` que
+    /// la route lit pour ne pas annoncer un remplacement qui n'a pas eu lieu.
+    #[test]
+    fn replace_track_ne_touche_rien_hors_playlist_ni_vers_une_piste_inconnue() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+        let ids = trois_pistes(&track_repo);
+
+        let plid = repo.create("À récupérer", None, 1).unwrap();
+        repo.add_tracks(plid, &[ids[0]], None).unwrap();
+
+        // `ids[1]` n'est pas dans la playlist.
+        assert_eq!(repo.replace_track(plid, ids[1], ids[2]).unwrap(), 0);
+        // `999_999` n'existe pas dans `tracks` : la garde EXISTS rend 0 sur
+        // les deux moteurs, au lieu d'une clef étrangère qui ne parle que sur
+        // SQLite.
+        assert_eq!(repo.replace_track(plid, ids[0], 999_999).unwrap(), 0);
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[0]],
+            "rien ne doit avoir bougé"
+        );
+    }
+
+    /// Si la piste de remplacement est DÉJÀ dans la playlist, la ligne
+    /// manquante est retirée plutôt que réécrite en doublon (invariant
+    /// d'`add_tracks_deduped`).
+    #[test]
+    fn replace_track_vers_une_piste_deja_presente_retire_le_doublon() {
+        let db = test_db();
+        let track_repo = crate::db::track_repo::TrackRepo::new(db.clone());
+        let repo = PlaylistRepo::new(db);
+        let ids = trois_pistes(&track_repo);
+
+        let plid = repo.create("À récupérer", None, 1).unwrap();
+        repo.add_tracks(plid, &[ids[0], ids[1], ids[2]], None)
+            .unwrap();
+
+        let touchees = repo.replace_track(plid, ids[0], ids[2]).unwrap();
+        assert_eq!(touchees, 1, "la ligne de la piste manquante est retirée");
+        assert_eq!(
+            repo.get_track_ids(plid).unwrap(),
+            vec![ids[1], ids[2]],
+            "pas de doublon de la piste de remplacement"
+        );
     }
 }

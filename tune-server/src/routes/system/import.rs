@@ -935,10 +935,19 @@ pub(super) async fn import_roon_entree(State(state): State<AppState>, req: Reque
         };
     }
 
+    // L'en-tête `Accept-Language` sert au refus Premium du pont Roon, traduit.
+    let entetes = req.headers().clone();
     let texte = match fichier_televerse(req).await {
         Ok(t) => t,
         Err(reponse) => return reponse,
     };
+    // Phase 2 du pont Roon (#3914) : l'EXPORT DU MOISSONNEUR entre par la même
+    // porte que le CSV de Roon — c'est le même bouton à l'écran — mais il
+    // n'importe pas des pistes, il enrichit celles qu'on a (crédits, et à
+    // terme images). Reconnu à sa forme, avant toute lecture CSV.
+    if super::import_pont_roon::est_un_export_du_pont(&texte) {
+        return super::import_pont_roon::repondre(&state, &entetes, &texte, apercu).await;
+    }
     let pistes = parse_roon_csv(&texte);
     if pistes.is_empty() {
         return refus_dimport(

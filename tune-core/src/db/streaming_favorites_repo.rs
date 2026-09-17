@@ -52,6 +52,44 @@ pub mod sql {
         )
     }
 
+    /// Même insertion, la date de mise en favori DONNÉE par le service (#3489,
+    /// reprise des favoris) au lieu du « maintenant » du moteur.
+    pub fn add_date<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO streaming_favorites \
+             (profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT (profile_id, item_type, service, service_id) DO NOTHING",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+        )
+    }
+
+    /// Redate une ligne EXISTANTE avec la date du service — pour les favoris
+    /// repris avant que la reprise ne sache dater (tous au même instant).
+    pub fn dater<D: SqlDialect>(d: &D) -> String {
+        // La date est liée DEUX fois (1 et 6) : SQLite n'a que des `?`
+        // positionnels, un `?1` répété n'y est pas un placeholder numéroté.
+        format!(
+            "UPDATE streaming_favorites SET created_at = {} \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+               AND (created_at IS NULL OR created_at != {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+        )
+    }
+
     pub fn remove<D: SqlDialect>(d: &D) -> String {
         format!(
             "DELETE FROM streaming_favorites \
@@ -187,6 +225,66 @@ impl StreamingFavoritesRepo {
         ];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Ajoute un favori avec la date que le SERVICE lui donne (`created_at`,
+    /// ISO 8601 UTC). Sans date, c'est [`Self::add`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_date(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+        cover_url: Option<&str>,
+        created_at: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(date) = created_at else {
+            return self.add(
+                profile_id, item_type, service, service_id, title, artist, album, cover_url,
+            );
+        };
+        let sql = self.dialect_sql(sql::add_date, sql::add_date);
+        let pid = profile_id;
+        let params: [&dyn ToSqlValue; 9] = [
+            &pid,
+            &item_type,
+            &service,
+            &service_id,
+            &title,
+            &artist,
+            &album,
+            &cover_url,
+            &date,
+        ];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Redate un favori déjà en table avec la date du service. Rend `true`
+    /// si une ligne a changé.
+    pub fn dater(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+        created_at: &str,
+    ) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::dater, sql::dater);
+        let pid = profile_id;
+        let params: [&dyn ToSqlValue; 6] = [
+            &created_at,
+            &pid,
+            &item_type,
+            &service,
+            &service_id,
+            &created_at,
+        ];
+        Ok(self.db.execute(&sql, &params)? > 0)
     }
 
     pub fn remove(

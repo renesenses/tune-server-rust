@@ -262,6 +262,10 @@ pub async fn auth_middleware(
         && tune_core::upnp_server::est_ressource_didl(path)
         && appelant_sur_le_reseau_local(&request)
     {
+        // #4260 : le gestionnaire du relais de pochettes doit savoir que
+        // l'appel est entré SANS jeton, par cette exemption — il exige alors
+        // l'URL signée que la DIDL publie, et rien d'autre.
+        request.extensions_mut().insert(ExemptionDidl);
         return next.run(request).await;
     }
 
@@ -299,6 +303,17 @@ pub async fn auth_middleware(
         None => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
     }
 }
+
+/// Marqueur posé sur la requête quand elle est entrée par l'exemption DIDL
+/// (#3933) : sans jeton, depuis le LAN, sur une ressource que le serveur média
+/// publie. Le relais de pochettes (`proxy_artwork`) le lit pour exiger une URL
+/// signée (#4260) — un appelant authentifié, lui, n'a pas ce marqueur.
+///
+/// Posé UNIQUEMENT ici, quand l'authentification est active : avec
+/// `auth_enabled = false`, rien ne distingue le client web d'un renderer, et
+/// le relais retombe sur sa liste d'hôtes pour tout le monde.
+#[derive(Debug, Clone, Copy)]
+pub struct ExemptionDidl;
 
 /// L'appelant est-il sur le réseau local (ou la machine elle-même) ?
 ///

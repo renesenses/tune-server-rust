@@ -263,3 +263,57 @@ async fn loaded_wasm_uninstall_4194_legacy_record_requires_restart() {
         "the removed plugin must not load on the next server start"
     );
 }
+
+/// #4265 : le disque reste une autorite meme sans enregistrement SDK.
+#[tokio::test]
+async fn i4265_la_fiche_wasm_conserve_le_verdict_du_manifeste_et_refuse_l_absence() {
+    let _environment = crate::lock_environment();
+    let directory = PluginDirectory::new();
+    for (id, minimum, attendu) in [
+        ("present-i4265", None, true),
+        ("futur-i4265", Some("999.0.0"), false),
+    ] {
+        let plugin = directory.install(id);
+        let path = plugin.join("manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if let Some(minimum) = minimum {
+            manifest["min_server_version"] = json!(minimum);
+        } else {
+            manifest
+                .as_object_mut()
+                .unwrap()
+                .remove("min_server_version");
+        }
+        std::fs::write(path, manifest.to_string()).unwrap();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = tune_server::routes::router(state);
+        let (status, fiche) = call(&app, "GET", &format!("/api/v1/plugins/{id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            fiche["compatible"], attendu,
+            "le manifeste present doit garder son verdict"
+        );
+        assert!(fiche.get("reason").is_none());
+    }
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let app = tune_server::routes::router(state);
+    let (_, fiche) = call(&app, "GET", "/api/v1/plugins/absent_i4265").await;
+    assert_eq!(
+        fiche["compatible"], false,
+        "un dossier WASM ne rend pas un nom absent compatible"
+    );
+    assert_eq!(fiche["reason"], "not_compiled_into_this_server");
+
+    // Un scan impossible ne doit pas transformer l'absence en compatibilite.
+    let fichier = directory.dir.path().join("pas_un_dossier");
+    std::fs::write(&fichier, "fixture").unwrap();
+    unsafe {
+        std::env::set_var("TUNE_PLUGINS_DIR", &fichier);
+    }
+    let (_, fiche) = call(&app, "GET", "/api/v1/plugins/absent_i4265").await;
+    assert_eq!(
+        fiche["compatible"], false,
+        "un scan echoue ne doit pas promettre une compatibilite"
+    );
+    assert_eq!(fiche["reason"], "not_compiled_into_this_server");
+}

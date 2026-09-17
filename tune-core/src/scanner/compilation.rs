@@ -62,6 +62,82 @@ pub fn is_scattered_sibling(a: &str, b: &str) -> bool {
     }
 }
 
+/// Deux dossiers sont-ils deux DISQUES d'un même coffret ?
+///
+/// Arbitrage **C4** (Bertrand, 14/09/2026) : « un coffret de 63 CD fait un
+/// album unique de 63 disques ». La forme qu'un coffret prend sur le disque
+/// est celle-ci :
+///
+/// ```text
+/// racine/Reiner - Coffret RCA/CD01/01 - ….flac   ┐ frères sous le même
+/// racine/Reiner - Coffret RCA/CD02/01 - ….flac   ┘ parent
+/// ```
+///
+/// Vrai quand les deux dossiers ont le **même parent** et que leurs noms sont
+/// tous deux des noms de disque — `CD01`, `Disc 2`, `Disque 3`, `Vol. 4`,
+/// éventuellement suivis d'un sous-titre (`CD01 - Symphonie nº 1`). C'est le
+/// pendant de [`is_scattered_sibling`], qui reconnaît l'autre forme (rangement
+/// par artiste, parents différents) : les deux ne se recouvrent jamais.
+///
+/// La règle n'est qu'un des trois faits qu'exige le rattachement, avec le
+/// même titre d'album et un numéro de disque encore libre — voir
+/// `AlbumRepo::get_or_create_for_folder_with_track`. Deux extractions du même
+/// double album côte à côte (`Album [24-96]`, `Album [16-44]`) ne portent pas
+/// de nom de disque ; et deux coffrets identiques rangés l'un sous l'autre se
+/// disputent le disque 1.
+///
+/// 🔴 Ce que cette règle ne regarde PAS : la pochette. Les 63 disques d'un
+/// coffret ont 63 pochettes ; un regroupement par empreinte de pochette
+/// (`COVER_DISTANCE_MAX`) les tiendrait séparés — c'est le critère que C4
+/// condamne pour cette forme-là, et il n'entre pas ici.
+pub fn sont_des_disques_du_meme_coffret(a: &str, b: &str) -> bool {
+    let (pa, pb) = (Path::new(a), Path::new(b));
+    if pa == pb {
+        return false;
+    }
+    let (Some(parent_a), Some(parent_b)) = (pa.parent(), pb.parent()) else {
+        return false;
+    };
+    // Le parent doit être un VRAI dossier : la racine du système de fichiers
+    // n'en est pas un — deux dossiers `CD01` et `CD02` posés à `/` ne forment
+    // pas un coffret, ils n'ont rien qui les relie. Même garde que
+    // `is_scattered_sibling` pour le grand-parent.
+    if parent_a != parent_b || parent_a.as_os_str().is_empty() || parent_a.parent().is_none() {
+        return false;
+    }
+    let nom = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    match (nom(pa), nom(pb)) {
+        (Some(x), Some(y)) => nom_de_disque(&x) && nom_de_disque(&y),
+        _ => false,
+    }
+}
+
+/// Un nom de dossier désigne-t-il un disque d'un coffret ?
+///
+/// Un mot de la famille « disque » puis un nombre, le tout en TÊTE du nom :
+/// `CD1`, `CD 01`, `CD-3`, `Disc 2`, `Disk2`, `Disque 03`, `Vol. 4`,
+/// `Volume 12`, avec ou sans suite (`CD01 - Ouverture`). Rien d'autre : un
+/// dossier `1969 - Five Leaves Left` commence par un nombre mais pas par le
+/// mot, et `Discography` commence par le mot mais pas par un nombre.
+pub fn nom_de_disque(nom: &str) -> bool {
+    let bas = nom.trim().to_lowercase();
+    const MOTS: &[&str] = &["cd", "disc", "disk", "disque", "volume", "vol"];
+    let Some(mot) = MOTS.iter().find(|m| bas.starts_with(*m)) else {
+        return false;
+    };
+    let reste = bas[mot.len()..].trim_start_matches(['.', ' ', '-', '_', '#']);
+    let chiffres = reste.chars().take_while(char::is_ascii_digit).count();
+    if chiffres == 0 {
+        return false;
+    }
+    // Après le nombre : la fin, ou un séparateur — pas une lettre collée
+    // (`cd1x`), pas un chiffre de plus (déjà consommé).
+    reste[chiffres..]
+        .chars()
+        .next()
+        .is_none_or(|c| !c.is_alphanumeric())
+}
+
 /// Peut-on rattacher une piste portant `track_number` à un album qui occupe
 /// déjà les numéros `taken` ?
 ///
@@ -373,5 +449,59 @@ mod tests {
             "/r/Artiste A/Le Disque",
             "/r/Artiste B/LE DISQUE"
         ));
+    }
+    #[test]
+    fn les_noms_de_disque_sont_reconnus_et_les_autres_non() {
+        for oui in [
+            "CD1",
+            "CD 01",
+            "cd-3",
+            "Disc 2",
+            "Disk2",
+            "Disque 03",
+            "Vol. 4",
+            "Volume 12",
+            "CD01 - Ouverture",
+            "Disc 2 (Bonus)",
+            "CD_7",
+        ] {
+            assert!(nom_de_disque(oui), "{oui}");
+        }
+        for non in [
+            "1969 - Five Leaves Left",
+            "Discography",
+            "CD",
+            "Vol",
+            "cd1x",
+            "Live",
+            "Abbey Road",
+            "2 CD",
+            "Coffret RCA",
+            "",
+        ] {
+            assert!(!nom_de_disque(non), "{non}");
+        }
+    }
+
+    #[test]
+    fn deux_disques_d_un_coffret_sont_freres_sous_le_meme_parent() {
+        assert!(sont_des_disques_du_meme_coffret(
+            "/m/Reiner - Coffret RCA/CD01",
+            "/m/Reiner - Coffret RCA/CD02"
+        ));
+        assert!(sont_des_disques_du_meme_coffret(
+            "/m/Coffret/Disc 1 - Symphonie",
+            "/m/Coffret/Disc 2 - Concerto"
+        ));
+        // Même dossier : non. Parents différents : non (c'est l'autre forme,
+        // `is_scattered_sibling`). Noms sans « disque » : non.
+        assert!(!sont_des_disques_du_meme_coffret("/m/C/CD01", "/m/C/CD01"));
+        assert!(!sont_des_disques_du_meme_coffret("/m/A/CD01", "/m/B/CD01"));
+        assert!(!sont_des_disques_du_meme_coffret(
+            "/m/X/Album [24-96]",
+            "/m/X/Album [16-44]"
+        ));
+        assert!(!sont_des_disques_du_meme_coffret("/m/X/CD01", "/m/X/Bonus"));
+        assert!(!sont_des_disques_du_meme_coffret("/CD01", "/CD02"));
     }
 }
