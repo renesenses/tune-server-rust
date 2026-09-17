@@ -841,6 +841,10 @@ pub fn exclusive_mode_support(target_os: &str, asio_feature: bool) -> ExclusiveM
 /// When `supported_output_configs()` fails (PipeWire ALSA compat), falls back
 /// to `default_output_config()` and, as a last resort, returns a config with
 /// the requested parameters directly — PipeWire will accept and resample.
+///
+/// #3208 — quel que soit le bras, la période demandée au pilote est celle de
+/// [`super::periode::taille_de_periode`] : plus aucun `BufferSize` n'est écrit
+/// à la main ici.
 pub(super) fn find_matching_config(
     device: &cpal::Device,
     channels: u16,
@@ -855,11 +859,10 @@ pub(super) fn find_matching_config(
                     && config.min_sample_rate() <= sample_rate
                     && config.max_sample_rate() >= sample_rate
                 {
-                    return Some(cpal::StreamConfig {
-                        channels: channels.min(config.channels()),
+                    return Some(super::periode::config_de_flux(
+                        channels.min(config.channels()),
                         sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
-                    });
+                    ));
                 }
             }
             // Configs exist but none match the requested rate — let caller
@@ -876,15 +879,13 @@ pub(super) fn find_matching_config(
         // If the default config's rate matches what we want, use it directly.
         // Otherwise return the default config — the caller will resample.
         if cfg.sample_rate == sample_rate && cfg.channels >= channels {
-            return Some(cpal::StreamConfig {
-                channels,
-                sample_rate,
-                buffer_size: cpal::BufferSize::Default,
-            });
+            return Some(super::periode::config_de_flux(channels, sample_rate));
         }
         // Return default config even if rate differs — better than nothing.
         // Caller will set up resampling.
-        return Some(cfg);
+        // #3208 — `cfg` vient du périphérique : il porte le `buffer_size` de
+        // cpal, pas le nôtre. Sans période armée, il est rendu intact.
+        return Some(super::periode::avec_periode(cfg));
     }
 
     // Last resort: return the requested config directly.  PipeWire's ALSA
@@ -895,11 +896,7 @@ pub(super) fn find_matching_config(
         channels,
         sample_rate, "find_matching_config_using_direct_params_pipewire_fallback"
     );
-    Some(cpal::StreamConfig {
-        channels,
-        sample_rate,
-        buffer_size: cpal::BufferSize::Default,
-    })
+    Some(super::periode::config_de_flux(channels, sample_rate))
 }
 
 /// Adapt channel count between source and output through the single matrix in
