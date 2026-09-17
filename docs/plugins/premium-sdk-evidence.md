@@ -17,7 +17,9 @@ Validation Linux ciblée sur Shrek, Rust 1.98.0, unité isolée `jp-sdk-full-436
 - Hôte core : les seize combinaisons d'installation et la migration idempotente passent ; le vrai analyseur délivre un spectre sans plugins et refuse une époque périmée ou un point de mesure inexistant.
 - Format SDK, Clippy incluant tous les features avec `-D warnings`, Rustdoc avec `-D warnings` et inventaire de 45 exigences vérifiés.
 
-Les validations ciblées sont relancées après les derniers raccordements. Le résultat de la CI sur le SHA publié reste à lire dans la PR ; une CI antérieure n'est pas une preuve sur le dernier code.
+Après les derniers raccordements, 4 témoins hôtes serveur, 5 tests de la chaîne levels/spectre, les 32 contrats historiques du gestionnaire de plugins et la garde canonique des workflows passent. Le dernier changement fonctionnel complémentaire refuse une bibliothèque batch dans un slot DSP avant activation ; il est couvert par le test de packaging.
+
+La CI SDK du commit `cc78ef8f` réussit sous Linux et macOS. Sous Windows, les schémas comportant des descriptions françaises étaient lus avec l'encodage système ; les scripts imposent désormais UTF-8, y compris pour les sources historiques de la parité. La CI du dernier SHA publié reste la référence pour la validation finale multiplateforme.
 
 ## Contre-épreuves
 
@@ -36,6 +38,7 @@ La première tranche possède également ses trois contre-épreuves : capacité 
 - La fixture de migration n'avait pas créé la table settings : elle utilise désormais les migrations réelles. Les seize combinaisons passent après correction.
 - Le premier test natif EQ passait un profil incomplet : les champs historiques obligatoires sont maintenant explicites dans la fixture.
 - Cargo exposait sous le même nom un cdylib compilé avec/sans exports natifs. Le test chargeait ensuite un fichier sans `tune_audio_plugin_v1`. `verify_native.py` utilise désormais un sous-target dédié `sdk-native`, distinct des captures source et projets générés. Le problème est reproduit puis le chargement réel repasse.
+- Windows : une lecture des fichiers JSON avec l’encodage système altérait les descriptions françaises. Les lectures/écritures de vérification utilisent explicitement UTF-8.
 - La CI de la première tranche a détecté l'absence de `--no-fail-fast` dans la nouvelle porte SDK. Le workflow est corrigé ; le témoin canonique `workflows_bornes::toute_porte_cargo_test_va_jusqu_au_bout` est inclus dans la validation de cette suite.
 
 ## Reproduction

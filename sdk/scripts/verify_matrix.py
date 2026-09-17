@@ -7,7 +7,7 @@ import re
 import subprocess
 
 root = Path(__file__).resolve().parents[2]
-matrix = json.loads((root / "docs/plugins/premium-sdk-matrix.json").read_text())
+matrix = json.loads((root / "docs/plugins/premium-sdk-matrix.json").read_text(encoding="utf-8"))
 assert matrix["schema_version"] == 1
 assert matrix["sdk_status"] == "experimental"
 assert set(matrix["features"]) == {"equalizer", "crossfeed", "converter", "declick", "shared"}
@@ -29,7 +29,7 @@ for row in matrix["requirements"]:
         assert row["witnesses"], f"no witnesses for {row['id']}"
     for witness in row["witnesses"]:
         path, name = witness.split("::")
-        text = (root / path).read_text()
+        text = (root / path).read_text(encoding="utf-8")
         assert re.search(r"#\[(?:tokio::)?test(?:\([^]]*\))?\]\s*(?:async\s+)?fn\s+" + re.escape(name) + r"\s*\(", text), f"missing test: {witness}"
 
 for path, expected in matrix["baseline"]["files"].items():
