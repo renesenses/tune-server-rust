@@ -167,6 +167,7 @@ pub(crate) fn pistes_depuis_album(album: &Value) -> Vec<StreamTrack> {
                 track_number: t["num"].as_u64().map(|n| n as u32),
                 disc_number: None,
                 explicit: false,
+                disponible: None,
                 quality: Some(qualite_bandcamp()),
                 isrc: None,
                 composer: None,
@@ -186,6 +187,7 @@ pub(crate) fn album_depuis_json(album: &Value) -> StreamAlbum {
         cover_path: album["pochette"].as_str().map(str::to_string),
         year: None,
         track_count: album["track_count"].as_u64().unwrap_or(0) as u32,
+        released_at: None,
         quality: Some(qualite_bandcamp()),
     }
 }
@@ -215,6 +217,7 @@ pub(crate) fn albums_de_collection(brut: &Value) -> Vec<StreamAlbum> {
                 cover_path: pochette(it.get("item_art_id")),
                 year: None,
                 track_count: 0,
+                released_at: None,
                 quality: Some(qualite_bandcamp()),
             })
         })
@@ -235,6 +238,7 @@ pub(crate) fn albums_de_recherche(resultats: &[Value]) -> Vec<StreamAlbum> {
                 cover_path: r["pochette"].as_str().map(str::to_string),
                 year: None,
                 track_count: 0,
+                released_at: None,
                 quality: Some(qualite_bandcamp()),
             })
         })

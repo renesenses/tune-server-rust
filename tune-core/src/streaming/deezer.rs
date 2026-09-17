@@ -472,6 +472,7 @@ impl DeezerService {
             track_number: item["track_position"].as_u64().map(|n| n as u32),
             disc_number: item["disk_number"].as_u64().map(|n| n as u32),
             explicit: item["explicit_lyrics"].as_bool().unwrap_or(false),
+            disponible: None,
             isrc: item["isrc"].as_str().map(Into::into),
             composer: None,
             // Même nœud que le nom juste au-dessus : l'identifiant rendu est
@@ -505,6 +506,7 @@ impl DeezerService {
                 .as_str()
                 .and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["nb_tracks"].as_u64().unwrap_or(0) as u32,
+            released_at: None,
             quality: None,
         }
     }

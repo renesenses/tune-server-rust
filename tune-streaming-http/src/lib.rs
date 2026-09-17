@@ -1676,6 +1676,7 @@ mod tests_cache_utilisateur {
             track_number: None,
             disc_number: None,
             explicit: false,
+            disponible: None,
             quality: None,
             isrc: None,
             composer: None,
