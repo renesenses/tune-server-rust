@@ -60,8 +60,19 @@ pub type ReresolveFn = std::sync::Arc<
         + Sync,
 >;
 
+/// Codec and source resolution observed before the radio decoder produces WAV.
+/// Missing fields mean unknown, never an inference from the output container.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RadioSourceInfo {
+    pub format: Option<&'static str>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u16>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamInfo {
+    /// Some (even before probing) for decoded radio; None for other sessions.
+    pub radio_source: Option<RadioSourceInfo>,
     pub format: String,
     pub mime_type: String,
     pub sample_rate: u32,
@@ -119,6 +130,7 @@ impl StreamInfo {
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
+    detected_radio_source: std::sync::Mutex<Option<RadioSourceInfo>>,
     pub tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     /// Keeps the channel open until the session is removed, even after the
     /// decoder drops its tx. Without this, the HTTP stream ends as soon as
@@ -330,9 +342,21 @@ impl StreamSession {
         (channels != 0).then_some((sample_rate, channels))
     }
 
+    /// Publish the upstream codec separately from the PCM format we serve.
+    pub fn publish_radio_source(&self, source: RadioSourceInfo) {
+        *self
+            .detected_radio_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(source);
+    }
+
     fn effective_output_info(&self) -> StreamInfo {
         let mut info = self.info.clone();
         if self.is_radio {
+            info.radio_source = *self
+                .detected_radio_source
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some((sample_rate, channels)) = self.detected_output_format() {
                 info.sample_rate = sample_rate;
                 info.channels = channels;
@@ -347,6 +371,7 @@ impl StreamSession {
         Self {
             id,
             info,
+            detected_radio_source: std::sync::Mutex::new(None),
             tx: Mutex::new(Some(tx)),
             _keep_alive_tx: Mutex::new(Some(keep_alive)),
             rx: Mutex::new(rx),
@@ -1112,6 +1137,7 @@ impl AudioStreamer {
         let id = uuid::Uuid::new_v4().to_string();
         let mut session = StreamSession::new(id.clone(), info, false, buffer_size);
         session.is_radio = true;
+        session.publish_radio_source(RadioSourceInfo::default());
         let tx = session
             .tx
             .lock()
