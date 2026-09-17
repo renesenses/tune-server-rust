@@ -377,6 +377,44 @@ impl PlaybackOrchestrator {
         );
     }
 
+    /// #4362 — le serveur multimédia d'où vient cette piste est-il ABSENT, au
+    /// sens exact où la bibliothèque affiche « Serveur absent » ?
+    ///
+    /// Deux lectures étroites et sans effet : le `source_id` de la ligne (qui
+    /// porte l'UDN en préfixe depuis la phase 2 de #2219), puis le registre
+    /// durable des serveurs — quelques unités, jamais des dizaines de milliers
+    /// de lignes, et seulement sur le chemin d'une piste indexée.
+    ///
+    /// Le verdict lui-même n'est pas rendu ici : il est délégué à la
+    /// qualification que la route `/network/media-servers` appelle déjà
+    /// (`discovery/presence_serveur.rs`), plafond de bascule en masse compris.
+    /// Deux implémentations auraient fini par dire deux choses différentes du
+    /// même serveur, et l'auditeur aurait vu un badge qui contredit un refus.
+    ///
+    /// `None` à la moindre incertitude — piste sans `source_id` exploitable,
+    /// serveur inconnu du registre, base illisible. Un défaut de base ne doit
+    /// pas se muer en refus de lecture.
+    pub(super) fn serveur_de_la_piste_absent(
+        &self,
+        track_id: i64,
+    ) -> Option<super::serveur_source_absent_4362::ServeurAbsent> {
+        use crate::db::backend::ToSqlValue;
+        let source_id: String = self
+            .db
+            .query_one(
+                "SELECT source_id FROM tracks WHERE id = ?",
+                &[&track_id as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))?;
+        let udn = super::serveur_source_absent_4362::udn_de_la_piste(&source_id)?;
+        let registre = crate::db::media_server_repo::MediaServerRepo::with_backend(self.db.clone())
+            .lister()
+            .ok()?;
+        super::serveur_source_absent_4362::serveur_absent(&registre, udn)
+    }
+
     pub(super) async fn resolve_direct_url(
         &self,
         req: &PlayRequest,
@@ -460,6 +498,34 @@ impl PlaybackOrchestrator {
                 url = %raw_url,
                 "upnp_url_de_lecture_lue_dans_l_instantane"
             );
+        }
+        // #4362 — l'URL existe, mais le SERVEUR qui la sert répond-il encore ?
+        //
+        // La bibliothèque le savait déjà : le badge « Serveur absent » vient du
+        // registre durable `media_servers` et de la qualification qui en tire
+        // `presence` / `proposable` (`GET /network/media-servers`). Ce chemin-ci
+        // ne l'avait jamais consulté : il lisait l'adresse et la poussait. Avec
+        // Asset arrêté, l'Eversolo recevait une URL morte et jouait du silence
+        // sans qu'une seule ligne d'erreur soit écrite.
+        //
+        // La garde ne s'arme que sur `depuis_l_instantane`, c'est-à-dire sur une
+        // piste de BIBLIOTHÈQUE dont on a retrouvé l'adresse. Une URL NOMMÉE
+        // dans la demande — le chemin du renderer, qui reçoit un
+        // `SetAVTransportURI` et n'a pas de ligne en base — reste hors sujet et
+        // n'est pas contredite, exactement comme le dit la règle 1 plus haut.
+        if depuis_l_instantane
+            && let Some(track_id) = req.track_id
+            && let Some(absent) = self.serveur_de_la_piste_absent(track_id)
+        {
+            warn!(
+                track_id,
+                zone_id = req.zone_id,
+                url = %raw_url,
+                raison = absent.raison.code(),
+                depuis_secs = absent.depuis_secs,
+                "upnp_refus_serveur_source_absent"
+            );
+            return Err(super::serveur_source_absent_4362::motif_du_refus(&absent));
         }
         // A station is often published as an .m3u/.pls PLAYLIST file rather than a
         // direct stream. Dereference it to the real stream first, otherwise the

@@ -1029,6 +1029,24 @@ pub mod sql {
          WHERE t.source = 'local' AND t.file_path IS NOT NULL"
     }
 
+    /// La branche PLEIN TEXTE du prédicat, restreinte à ce qui identifie la
+    /// piste (#4367).
+    ///
+    /// Le ET est posé ICI, sur la seule branche plein texte, et non autour du
+    /// OU tout entier : les quatre autres branches (artiste, genre,
+    /// compositeur, ANNÉE) ne passent pas par l'index plein texte, et
+    /// l'année, en particulier, n'est dans aucun `tsvector`. Les rattacher à
+    /// la restriction les aurait toutes éteintes sous Postgres.
+    fn plein_texte_de_la_piste<D: SqlDialect>(d: &D) -> String {
+        let indexe = d.fts_where("tracks", "t", &d.placeholder(1));
+        let hors_album = d.fts_piste_hors_album("t", "ar", &d.placeholder(1));
+        if hors_album.is_empty() {
+            indexe
+        } else {
+            format!("({indexe} AND {hors_album})")
+        }
+    }
+
     /// Le PRÉDICAT de la recherche de pistes, sans projection ni bornes.
     ///
     /// Extrait pour que la LISTE rendue et le COMPTE annoncé portent
@@ -1043,7 +1061,7 @@ pub mod sql {
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
             "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {}",
-            d.fts_where("tracks", "t", &d.placeholder(1)),
+            plein_texte_de_la_piste(d),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
@@ -2061,7 +2079,7 @@ impl TrackRepo {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Track>, TuneError> {
-        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let fts_query = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
         let offset = offset.max(0);
@@ -2079,7 +2097,7 @@ impl TrackRepo {
     /// même prédicat, indépendant de `limit`. Un résultat égal à `plafond`
     /// signifie « au moins `plafond` », jamais « exactement ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
-        let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
+        let fts_query = crate::db::engine::format_fts_query_piste(self.db.engine(), query);
         let like = format!("%{query}%");
         let trimmed = query.trim();
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
@@ -3026,6 +3044,146 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// #4367 — la section **Titres** ne rend pas les autres pistes de
+    /// l'album dont le TITRE porte la requête.
+    ///
+    /// Le cas de FabienM, mot pour mot : « je recherche "Wish you were here"
+    /// et Tune retourne des titres comme […] "Have a cigar" de Pink Floyd.
+    /// Quel est le lien avec la recherche ? ». Le lien, c'était `tracks_fts`,
+    /// qui indexe `album_title` avec le reste, et un `MATCH` qui ne visait
+    /// aucune colonne.
+    ///
+    /// Le témoin, dans le même jeu : *I Wish You Were Here* de Simple Minds,
+    /// dont l'album ne s'appelle pas ainsi. Il doit RESTER — sans lui, une
+    /// garde verte prouverait seulement qu'on a cassé la recherche.
+    #[test]
+    fn la_recherche_de_titres_ne_rend_pas_les_autres_pistes_de_l_album() {
+        let db = test_db();
+        let artistes = ArtistRepo::new(db.clone());
+        let albums = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db.clone());
+
+        let floyd = artistes.create(&Artist::new("Pink Floyd".into())).unwrap();
+        let wywh = albums
+            .get_or_create("Wish You Were Here", floyd, None)
+            .unwrap()
+            .id
+            .unwrap();
+        for (n, titre) in [
+            "Shine On You Crazy Diamond (Parts 1-5)",
+            "Welcome To The Machine",
+            "Have A Cigar",
+            "Wish You Were Here",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut t = Track::new((*titre).to_string());
+            t.album_id = Some(wywh);
+            t.artist_id = Some(floyd);
+            t.file_path = Some(format!("/music/wywh/{n}.flac"));
+            repo.create(&t).unwrap();
+        }
+
+        let minds = artistes
+            .create(&Artist::new("Simple Minds".into()))
+            .unwrap();
+        let ouat = albums
+            .get_or_create("Once Upon A Time", minds, None)
+            .unwrap()
+            .id
+            .unwrap();
+        let mut temoin = Track::new("I Wish You Were Here".into());
+        temoin.album_id = Some(ouat);
+        temoin.artist_id = Some(minds);
+        temoin.file_path = Some("/music/ouat/i-wish.flac".into());
+        repo.create(&temoin).unwrap();
+
+        let titres: Vec<String> = repo
+            .search("Wish You Were Here", 50)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.title)
+            .collect();
+
+        for intrus in [
+            "Have A Cigar",
+            "Welcome To The Machine",
+            "Shine On You Crazy Diamond (Parts 1-5)",
+        ] {
+            assert!(
+                !titres.iter().any(|t| t == intrus),
+                "« {intrus} » ne porte pas la requête dans son TITRE : {titres:?}"
+            );
+        }
+        assert!(
+            titres.iter().any(|t| t == "Wish You Were Here"),
+            "la piste éponyme doit rester : {titres:?}"
+        );
+        assert!(
+            titres.iter().any(|t| t == "I Wish You Were Here"),
+            "le témoin d'un AUTRE album doit rester : {titres:?}"
+        );
+        // Et le compte annoncé sous la liste dit la même chose qu'elle.
+        assert_eq!(
+            repo.search_count("Wish You Were Here", 1_000).unwrap(),
+            titres.len() as i64
+        );
+    }
+
+    /// #4367, moitié PostgreSQL — Shrek n'a aucun PostgreSQL, la porte PG est
+    /// celle de la CI. Ce qui se vérifie ici est donc la FORME du prédicat :
+    /// le vecteur recalculé porte les quatre colonnes d'identité, pas le
+    /// titre de l'album, et il vient en ET du prédicat indexé — l'index GIN
+    /// choisit toujours les lignes.
+    #[test]
+    fn la_restriction_hors_album_est_posee_sur_les_deux_moteurs() {
+        use crate::db::engine::{Engine, PostgresDialect, SqliteDialect, format_fts_query_piste};
+
+        // SQLite : la restriction voyage dans la CHAÎNE du MATCH, donc le SQL
+        // ne change pas — et la chaîne, elle, porte le filtre de colonnes.
+        assert_eq!(
+            SqliteDialect.fts_piste_hors_album("t", "ar", "?"),
+            "",
+            "sous SQLite la restriction n'est pas dans le SQL"
+        );
+        assert_eq!(
+            format_fts_query_piste(Engine::Sqlite, "Wish You Were Here"),
+            "{title artist_name genre composer} : (Wish You Were Here*)"
+        );
+        assert_eq!(format_fts_query_piste(Engine::Sqlite, ""), "");
+
+        // Postgres : la chaîne reste une tsquery nue…
+        assert_eq!(
+            format_fts_query_piste(Engine::Postgres, "Wish You Were Here"),
+            "Wish & You & Were & Here:*"
+        );
+        // … et c'est le SQL qui restreint.
+        let pg = sql::search_where(&PostgresDialect);
+        assert!(
+            pg.contains("t.search_tsv @@ to_tsquery('simple', unaccent($1))"),
+            "le prédicat indexé doit rester en tête : {pg}"
+        );
+        for colonne in ["t.title", "ar.name", "t.genre", "t.composer"] {
+            assert!(
+                pg.contains(&format!("unaccent(COALESCE({colonne}, ''))")),
+                "{colonne} manque au vecteur recalculé : {pg}"
+            );
+        }
+        assert!(
+            !pg.contains("al.title"),
+            "le titre de l'album ne doit PAS entrer dans le vecteur des pistes : {pg}"
+        );
+        // L'ANNÉE ne passe par aucun vecteur : sa branche doit rester hors de
+        // la restriction, sinon elle s'éteint sous Postgres.
+        let (avant_le_ou, _) = pg.split_once(" OR LOWER(unaccent(ar.name))").unwrap();
+        assert!(
+            avant_le_ou.contains("to_tsvector"),
+            "la restriction doit être DANS la branche plein texte : {pg}"
+        );
+        assert!(pg.contains("CAST(al.year AS TEXT) = $5"));
     }
 
     /// #1391 — les pistes d'un album masqué sortent de la vue pistes (les
