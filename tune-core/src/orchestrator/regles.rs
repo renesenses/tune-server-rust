@@ -981,10 +981,10 @@ pub(super) struct MotifsDeTranscodage {
     pub(super) will_be_flac: bool,
     /// #3631 — une tranche de feuille CUE ne se sert jamais telle quelle.
     pub(super) est_une_tranche_cue: bool,
-    /// #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) vers une sortie
-    /// RÉSEAU ne part pas en passthrough : servi tel quel, l'Eversolo DMP-A8
-    /// lit ses en-têtes puis cale, muet. Ré-encodé par Tune, sans perte, il
-    /// joue. Voir `audio::flac_vendeur`.
+    /// #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5 vers une
+    /// sortie RÉSEAU ne part pas en passthrough : servi tel quel, l'Eversolo
+    /// DMP-A8 lit ses en-têtes puis cale, muet. Ré-encodé par Tune, sans perte,
+    /// il joue. Voir `audio::flac_vendeur`.
     pub(super) flac_ffmpeg_vers_le_reseau: bool,
 }
 
