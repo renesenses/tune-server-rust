@@ -574,6 +574,121 @@ async fn levels_chain_emits_audio_levels_on_bus() {
     );
 }
 
+/// #4384 (GgB, 0.9.152, Lenovo X230, fil 1797) — « preamp -6db led ambre
+/// s'allume, pas de changement dans le comportement, elle devrait ne jamais
+/// s'allumer ».
+///
+/// Le crête-mètre d'une zone LOCALE est alimenté par des fenêtres prélevées AU
+/// DÉCODEUR (`resolve_local::transcoder_en_session` attache le forwarder à
+/// `decode_to_pcm_streaming_tranche`), alors que le facteur
+/// « volume × ReplayGain » — préampli compris — n'est appliqué que dans les
+/// rappels de rendu de `LocalOutput`. L'instrument décrivait donc le FICHIER,
+/// et aucun des trois réglages ne déplaçait l'aiguille d'un seul dB.
+///
+/// Garde de COMPORTEMENT, pas de texte : une même fenêtre à PLEINE ÉCHELLE
+/// part deux fois dans la chaîne réelle (forwarder cadencé → bus), et c'est la
+/// valeur PUBLIÉE qui est lue.
+///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS, surcharge
+///     allumée : la mesure d'avant, inchangée ;
+///   * avec le gain de la sortie à 0,5 (−6,02 dB), elle vaut −6 dBFS et la
+///     surcharge S'ÉTEINT — ce que GgB attendait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_cretemetre_suit_le_gain_de_la_sortie() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 512 trames stéréo 16 bits collées à la butée négative : pleine échelle
+    /// exacte, donc `over_run` bien au-delà des 3 échantillons d'OVER.
+    fn pleine_echelle() -> Vec<u8> {
+        let mut pcm = Vec::with_capacity(512 * 4);
+        for _ in 0..512 {
+            for _ in 0..2 {
+                pcm.extend_from_slice(&i16::MIN.to_le_bytes());
+            }
+        }
+        pcm
+    }
+
+    /// Fait tourner la chaîne réelle et rend `(peak_left_db, over_left,
+    /// output_gain_db)` de la première fenêtre publiée.
+    async fn mesurer(zone_id: i64, gain: Option<Arc<AtomicU32>>) -> (f64, bool, f64) {
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        match gain {
+            Some(g) => playback.brancher_le_gain_de_sortie(zone_id, g),
+            None => playback.debrancher_le_gain_de_sortie(zone_id),
+        }
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            0,
+        );
+        let pcm = pleine_echelle();
+        crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, 2, 44_100);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let reste = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!reste.is_zero(), "aucun playback.audio_levels publié");
+            match tokio::time::timeout(reste, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => {
+                    return (
+                        ev.data["peak_left_db"].as_f64().expect("peak_left_db"),
+                        ev.data["over_left"].as_bool().expect("over_left"),
+                        ev.data["output_gain_db"].as_f64().expect("output_gain_db"),
+                    );
+                }
+                Ok(Ok(_)) => {}
+                autre => panic!("bus muet : {autre:?}"),
+            }
+        }
+    }
+
+    // Référence : aucun gain déclaré en aval — la mesure d'avant #4384.
+    let (brut_db, brut_over, brut_gain_db) = mesurer(987_660, None).await;
+    assert!(
+        brut_db > -0.1,
+        "une fenêtre à pleine échelle sans gain doit se lire à 0 dBFS, lu {brut_db}"
+    );
+    assert!(brut_over, "pleine échelle sans gain ⇒ surcharge");
+    assert_eq!(brut_gain_db, 0.0, "aucun gain déclaré ⇒ 0 dB annoncé");
+
+    // La même fenêtre, avec la sortie qui atténue de 6 dB (préampli −6 dB à
+    // volume plein, ou volume à 50 % : c'est le MÊME facteur, celui que les
+    // rappels de rendu multiplient).
+    let gain = Arc::new(AtomicU32::new(500));
+    let (attenue_db, attenue_over, attenue_gain_db) = mesurer(987_661, Some(gain.clone())).await;
+    assert!(
+        (attenue_db - (-6.02)).abs() < 0.2,
+        "gain ×0,5 ⇒ −6 dBFS attendu, lu {attenue_db}"
+    );
+    assert!(
+        !attenue_over,
+        "un signal atténué de 6 dB ne peut plus être en surcharge"
+    );
+    assert!(
+        (attenue_gain_db - (-6.02)).abs() < 0.2,
+        "le gain appliqué doit être ANNONCÉ, lu {attenue_gain_db}"
+    );
+
+    // Et il se lit à chaque fenêtre, pas au spawn : bouger le curseur en cours
+    // de piste déplace l'aiguille sans attendre la piste suivante.
+    gain.store(1000, Ordering::SeqCst);
+    let (rendu_db, rendu_over, rendu_gain_db) = mesurer(987_662, Some(gain)).await;
+    assert!(
+        rendu_db > -0.1,
+        "gain revenu à l'unité ⇒ 0 dBFS, lu {rendu_db}"
+    );
+    assert!(rendu_over, "gain revenu à l'unité ⇒ surcharge de retour");
+    assert_eq!(rendu_gain_db, 0.0);
+}
+
 /// #1110 : un forwarder créé pour une piste doit MOURIR quand la zone
 /// passe à la suivante, au lieu de publier son PCM sur l'horloge de la
 /// nouvelle. C'est ce que garantit l'épinglage de la génération au moment
@@ -2290,6 +2405,90 @@ fn les_reglages_de_sortie_locale_viennent_de_la_base() {
         (true, "asio".to_string()),
         "TUNE_LOCAL_AUDIO_BACKEND doit servir de repli comme dans \
          tune-server/src/config.rs"
+    );
+}
+
+/// #4384 — « écrit mais pas branché » : le corps de `send_to_output` DOIT
+/// appeler le branchement, sinon le forwarder lira toujours 1000 et la
+/// correction ne sortira jamais du laboratoire.
+///
+/// La découpe s'arrête au corps de `send_to_output` : la DÉFINITION de
+/// `brancher_le_gain_de_sortie`, plus haut dans le même fichier, est hors de
+/// la tranche — une garde satisfaite par la définition de ce qu'elle cherche
+/// ne garde rien.
+#[test]
+fn send_to_output_branche_le_gain_avant_de_jouer() {
+    const TRANSPORT: &str = include_str!("transport.rs");
+    const DEBUT: &str = "    pub(super) async fn send_to_output(";
+    const FIN: &str = "    pub(super) fn zone_audiophile(";
+    let debut = TRANSPORT
+        .find(DEBUT)
+        .expect("`send_to_output` a été renommée : cette garde ne garde plus rien");
+    let fin = TRANSPORT[debut..]
+        .find(FIN)
+        .expect("la fonction qui SUIT `send_to_output` a changé : redécouper");
+    let corps = &TRANSPORT[debut..debut + fin];
+    assert!(
+        !corps.contains("pub(super) async fn brancher_le_gain_de_sortie"),
+        "la tranche a avalé la définition : elle se satisferait elle-même"
+    );
+    assert!(
+        corps.contains("self.brancher_le_gain_de_sortie(zone_id, device_id).await"),
+        "`send_to_output` ne branche plus le gain de la sortie sur le \
+         crête-mètre : la mesure retombe au niveau du FICHIER (#4384)."
+    );
+}
+
+/// #4384 — le branchement lui-même, par la porte de l'orchestrateur : une
+/// sortie locale RÉELLE enregistrée dans le registre, et le gain que ses
+/// rappels de rendu multiplient qui arrive jusqu'au `PlaybackManager`.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn brancher_le_gain_suit_la_sortie_locale_puis_la_lache() {
+    use crate::outputs::traits::OutputTarget;
+
+    let orch = test_orchestrator();
+    let zone_id = 987_670;
+    let sortie = crate::outputs::local::LocalOutput::new("DAC de garde".to_string());
+    let device_id = sortie.device_id().to_string();
+    assert!(
+        device_id.starts_with("local:"),
+        "id inattendu : {device_id}"
+    );
+    {
+        let mut outputs = orch.outputs.lock().await;
+        outputs.register(Box::new(sortie));
+    }
+
+    assert_eq!(
+        orch.playback.gain_de_sortie_units(zone_id),
+        1000,
+        "rien de branché ⇒ mesure telle quelle"
+    );
+    orch.brancher_le_gain_de_sortie(zone_id, &device_id).await;
+    assert_eq!(orch.playback.gain_de_sortie_units(zone_id), 1000);
+
+    // Le curseur bouge APRÈS le branchement : c'est l'atomique partagé qui
+    // doit le porter, pas une valeur recopiée au moment du branchement.
+    {
+        let arc = orch.outputs.lock().await.get(&device_id).expect("sortie");
+        let sortie = arc.lock().await;
+        sortie.set_volume(0.25).await.expect("set_volume");
+    }
+    assert_eq!(
+        orch.playback.gain_de_sortie_units(zone_id),
+        250,
+        "le gain branché doit suivre la sortie sans nouveau branchement"
+    );
+
+    // La zone repart sur un rendu réseau : on LÂCHE, sinon le crête-mètre
+    // d'une zone DLNA hériterait du volume d'un DAC local.
+    orch.brancher_le_gain_de_sortie(zone_id, "dlna:uuid-quelconque")
+        .await;
+    assert_eq!(
+        orch.playback.gain_de_sortie_units(zone_id),
+        1000,
+        "sortie non locale ⇒ gain débranché"
     );
 }
 

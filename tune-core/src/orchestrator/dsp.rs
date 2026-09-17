@@ -1178,6 +1178,12 @@ impl PlaybackOrchestrator {
                 _ => 1.0,
             };
             local_output.set_replaygain_factor(rg);
+            // #4384 — une bascule PURE en cours d'écoute change le facteur
+            // ReplayGain sans passer par `send_to_output` : c'est ici que le
+            // crête-mètre d'une zone déjà en lecture apprend le gain de sa
+            // sortie. Idempotent — on repousse le même `Arc`.
+            self.playback
+                .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
             // `replace_*_live` et non `set_*` : la piste est en cours, donc
             // l'historique des biquads et les lignes à retard doivent survivre
             // au remplacement — sinon la bascule claque.
