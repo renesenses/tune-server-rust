@@ -8,6 +8,7 @@ pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
 pub mod smart_refs;
+mod source_streaming;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes intelligentes.
 ///

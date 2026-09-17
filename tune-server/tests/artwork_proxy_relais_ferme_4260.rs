@@ -635,3 +635,89 @@ async fn un_schema_autre_que_http_est_refuse() {
         assert_eq!(statut, StatusCode::BAD_REQUEST, "{url}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pochette ENREGISTRÉE d'un album de serveur UPnP (réseau local) — .18,
+// 17/09/2026 : les 39 pochettes UPnP étaient grises, `artwork_proxy_hote_refuse`
+// à chaque vignette. Admise si et seulement si l'URL est le `cover_path` d'un
+// album de la bibliothèque.
+// ---------------------------------------------------------------------------
+
+/// Le relais « réseau local » du banc : `mac-studio.lan` → 127.0.0.1 (l'amont
+/// du banc), boucle locale admise pour lui seul ; le relais général reste
+/// celui du banc, qui ne connaît pas ce nom et le refuse sur la liste d'hôtes.
+fn etat_avec_relais_lan() -> AppState {
+    let mut state = etat_du_banc();
+    state.relais_pochettes_lan = Arc::new(Relais::avec(
+        Arc::new(TableLocale(vec!["mac-studio.lan"])),
+        |ip| {
+            ip == IpAddr::from([127, 0, 0, 1])
+                || !adresse_interdite(ip)
+                || artwork_proxy::adresse_reseau_local(ip)
+        },
+    ));
+    state
+}
+
+fn inscrire_album(state: &AppState, cover_path: &str) {
+    let cp = cover_path.to_string();
+    state
+        .backend
+        .execute(
+            "INSERT INTO albums (title, cover_path, source) VALUES ('Kino Music', $1, 'upnp')",
+            &[&cp as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .expect("album inscrit");
+}
+
+#[tokio::test]
+async fn la_pochette_enregistree_d_un_album_upnp_est_relayee() {
+    let amont = amont().await;
+    let state = etat_avec_relais_lan();
+    let url = format!("http://mac-studio.lan:{}/logo.png", amont.port);
+    inscrire_album(&state, &url);
+    let app = app(&state, DISTANT);
+
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::OK, "{}", texte(&corps));
+    assert_eq!(corps, POCHETTE);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn la_meme_adresse_inconnue_de_la_bibliotheque_reste_refusee() {
+    let amont = amont().await;
+    let state = etat_avec_relais_lan();
+    // Un album existe, mais avec une AUTRE pochette : l'exception tient à
+    // l'égalité exacte, pas à l'hôte.
+    inscrire_album(
+        &state,
+        &format!("http://mac-studio.lan:{}/autre.png", amont.port),
+    );
+    let app = app(&state, DISTANT);
+
+    let url = format!("http://mac-studio.lan:{}/logo.png", amont.port);
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{}", texte(&corps));
+    assert_eq!(
+        amont.requetes.load(Ordering::SeqCst),
+        0,
+        "aucune requête ne doit partir"
+    );
+}
+
+#[tokio::test]
+async fn l_exemption_didl_ne_profite_pas_de_l_exception() {
+    // Par la DIDL, une URL non signée est refusée AVANT tout — même si c'est
+    // la pochette d'un album.
+    let amont = amont().await;
+    let state = etat_avec_relais_lan();
+    let url = format!("http://mac-studio.lan:{}/logo.png", amont.port);
+    inscrire_album(&state, &url);
+    enable_auth(&state);
+    let app = app(&state, RENDERER_LAN);
+
+    let (statut, _corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_ne!(statut, StatusCode::OK);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}

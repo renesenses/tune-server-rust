@@ -609,6 +609,9 @@ pub async fn handle_stream(
     let wav_header_included = session
         .wav_header_included
         .load(std::sync::atomic::Ordering::Relaxed);
+    let long_wav = is_wav
+        && !is_radio
+        && tune_core::audio::wav::wav_stream_needs_indeterminate_length(ch, sr, bd, dur_ms);
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
@@ -1060,6 +1063,21 @@ pub async fn handle_stream(
                             && chunk.starts_with(b"RIFF")
                             && session.wav_header_stash.get().is_none()
                         {
+                            // Progressive decoders emit an unknown-duration header
+                            // (~2 GiB), even when StreamInfo knows the full track.
+                            // Fix both size fields BEFORE stashing it, so probes
+                            // and reconnects receive the same unbounded container.
+                            // Preserve the producer's format and every PCM byte.
+                            if long_wav
+                                && debut_du_bloc == 0
+                                && &chunk[8..12] == b"WAVE"
+                                && &chunk[12..16] == b"fmt "
+                                && chunk[16..20] == 16u32.to_le_bytes()
+                                && &chunk[36..40] == b"data"
+                            {
+                                chunk[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+                                chunk[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+                            }
                             let _ = session.wav_header_stash.set(chunk[..44].to_vec());
                             // La connexion qui a demandé `bytes=44-` ne veut
                             // PAS l'en-tête : on ne transmet que la suite.
@@ -3893,3 +3911,6 @@ mod stream_url_distant_tests {
         assert_eq!(RELAIS_ORIGINE, "https://bridge.mozaiklabs.fr");
     }
 }
+
+#[cfg(test)]
+mod long_wav_4016;

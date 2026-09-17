@@ -64,7 +64,9 @@ use axum::routing::get;
 use tracing::{debug, info, warn};
 
 use tune_core::sendspin::transition::{self, ModeTransition};
-use tune_core::sendspin::{ErreurSendspin, PoigneeServeur, VERSION_PROTOCOLE, messages, registre};
+use tune_core::sendspin::{
+    ErreurSendspin, PoigneeServeur, TransportNoise, VERSION_PROTOCOLE, messages, registre,
+};
 
 /// Délai maximal d'attente d'un message du pair.
 ///
@@ -247,12 +249,10 @@ async fn conduire_chiffre(
     );
     let texte = serde_json::to_string(&hello)
         .map_err(|e| ErreurSendspin::MessageIllisible(format!("server/hello : {e}")))?;
-    let trame = transport.chiffrer_json(&texte)?;
-    envoyer_binaire(&mut socket, trame).await?;
+    envoyer_json_chiffre(&mut socket, &mut transport, &texte).await?;
 
     // 6. `client/hello` — LA PORTE DE SORTIE DE S2-a. On y apprend qui parle.
-    let recu = lire_binaire(&mut socket, "client/hello").await?;
-    let texte = transport.dechiffrer_json(&recu)?;
+    let texte = lire_json_chiffre(&mut socket, &mut transport, "client/hello").await?;
     let brute: messages::EnveloppeBrute = serde_json::from_str(&texte)
         .map_err(|e| ErreurSendspin::MessageIllisible(format!("client/hello : {e}")))?;
     if brute.type_message != messages::TYPE_CLIENT_HELLO {
@@ -309,8 +309,7 @@ async fn conduire_chiffre(
     );
     let texte = serde_json::to_string(&activate)
         .map_err(|e| ErreurSendspin::MessageIllisible(format!("server/activate : {e}")))?;
-    let trame = transport.chiffrer_json(&texte)?;
-    envoyer_binaire(&mut socket, trame).await?;
+    envoyer_json_chiffre(&mut socket, &mut transport, &texte).await?;
     info!(client_id = %infos.client_id, "sendspin_server_activate_envoye");
 
     // S2-b garde le canal chiffre pour les commandes operateur.
@@ -527,4 +526,33 @@ async fn envoyer_binaire(socket: &mut WebSocket, trame: Vec<u8>) -> Result<(), E
         .send(Message::Binary(trame.into()))
         .await
         .map_err(|e| ErreurSendspin::MessageIllisible(format!("envoi binaire : {e}")))
+}
+
+/// Le delai couvre le MESSAGE entier : les fragments ne le renouvellent pas.
+async fn lire_json_chiffre(
+    socket: &mut WebSocket,
+    transport: &mut TransportNoise,
+    quoi: &str,
+) -> Result<String, ErreurSendspin> {
+    tokio::time::timeout(DELAI_MESSAGE, async {
+        loop {
+            let b = lire_binaire(socket, quoi).await?;
+            if let Some(texte) = transport.recevoir_json(&b)? {
+                return Ok(texte);
+            }
+        }
+    })
+    .await
+    .map_err(|_| ErreurSendspin::MessageIllisible(format!("delai de reassemblage {quoi}")))?
+}
+
+async fn envoyer_json_chiffre(
+    socket: &mut WebSocket,
+    transport: &mut TransportNoise,
+    texte: &str,
+) -> Result<(), ErreurSendspin> {
+    for b in transport.chiffrer_message(0, texte.as_bytes())? {
+        envoyer_binaire(socket, b).await?;
+    }
+    Ok(())
 }

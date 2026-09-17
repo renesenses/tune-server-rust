@@ -79,11 +79,27 @@ pub fn build_wav_header_bounded_live(channels: u16, sample_rate: u32, bit_depth:
 }
 
 /// Build a 44-byte WAV header. When `duration_ms` is provided, the header
-/// contains the correct data size so DLNA renderers don't need to probe
-/// the stream end. Falls back to `UNKNOWN_DATA_SIZE` for unknown-length
-/// streams.
+/// contains the data size for short tracks and indeterminate size markers for
+/// tracks beyond the signed compatibility ceiling. Falls back to
+/// `UNKNOWN_DATA_SIZE` for unknown-length streams.
 pub fn build_wav_header(channels: u16, sample_rate: u32, bit_depth: u16) -> [u8; 44] {
     build_wav_header_with_duration(channels, sample_rate, bit_depth, None)
+}
+
+/// A known track must not advertise the signed compatibility ceiling as its
+/// end. Use the existing streaming sentinel beyond that ceiling (#4016);
+/// HTTP still supplies the real u64 length. Unknown lengths and bounded radio
+/// retain their signed-positive compatibility contract (#1689).
+pub fn wav_stream_needs_indeterminate_length(
+    channels: u16,
+    sample_rate: u32,
+    bit_depth: u16,
+    duration_ms: Option<u64>,
+) -> bool {
+    duration_ms.is_some_and(|duration| {
+        octets_pcm_attendus(duration, sample_rate, channels, bit_depth)
+            > u64::from(UNKNOWN_DATA_SIZE)
+    })
 }
 
 pub fn build_wav_header_with_duration(
@@ -92,6 +108,9 @@ pub fn build_wav_header_with_duration(
     bit_depth: u16,
     duration_ms: Option<u64>,
 ) -> [u8; 44] {
+    if wav_stream_needs_indeterminate_length(channels, sample_rate, bit_depth, duration_ms) {
+        return build_wav_header_streaming(channels, sample_rate, bit_depth);
+    }
     let data_size: u32 = if let Some(dur) = duration_ms {
         // Saturant : une durée aberrante (tag corrompu) débordait le produit et
         // faisait paniquer le constructeur d'en-tête en debug.
@@ -265,12 +284,11 @@ mod tests {
     }
 
     #[test]
-    fn wav_header_with_duration_is_clamped_below_the_signed_limit() {
-        // Même garantie quand une durée absurde est fournie : le plafond doit
-        // laisser la place aux 36 octets d'en-tête.
+    fn wav_header_with_extreme_duration_uses_streaming_sentinel() {
+        // A saturated duration must neither panic nor advertise a false end.
         let h = build_wav_header_with_duration(2, 192_000, 24, Some(u64::MAX / 1_000_000));
         let riff_size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
-        assert!(riff_size as i32 > 0, "RIFF size must be a positive i32");
+        assert_eq!(riff_size, u32::MAX);
     }
 
     #[test]

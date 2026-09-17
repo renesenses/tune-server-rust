@@ -135,8 +135,10 @@ impl Pilote {
                     return Err(sequence("message en clair apres Noise"));
                 }
                 Evenement::Message(Some(Ok(Message::Binary(b)))) => {
+                    let Some(texte) = self.transport.recevoir_json(&b)? else {
+                        continue;
+                    };
                     let recu = horloge();
-                    let texte = self.transport.dechiffrer_json(&b)?;
                     let message: EnveloppeBrute = serde_json::from_str(&texte)
                         .map_err(|_| sequence("JSON chiffre illisible"))?;
                     if !message.payload.is_object() {
@@ -331,23 +333,21 @@ impl Pilote {
     async fn envoyer(&mut self, typ: &str, payload: Value) -> Result<(), ErreurSendspin> {
         let texte = serde_json::to_string(&Enveloppe::nouvelle(typ, payload))
             .map_err(|_| sequence("serialisation"))?;
-        let b = self.transport.chiffrer_json(&texte)?;
-        super::envoyer_binaire(&mut self.socket, b).await
+        super::envoyer_json_chiffre(&mut self.socket, &mut self.transport, &texte).await
     }
 
     async fn reechanger(&mut self, cle: PskPair) -> Result<(), ErreurSendspin> {
         let identite = self.contexte.identite().await?;
         let mut poignee = PoigneeServeur::renouveler(&identite, &self.infos, &cle)?;
         let texte = poignee.message_un()?;
-        let chiffre = self.transport.chiffrer_json(&texte)?;
-        super::envoyer_binaire(&mut self.socket, chiffre).await?;
+        super::envoyer_json_chiffre(&mut self.socket, &mut self.transport, &texte).await?;
         let (transport, infos) = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let b = tokio::select! {
                     _ = self.inscription.revocation.changed() => return Err(sequence("session revoquee")),
                     b = super::lire_binaire(&mut self.socket, "re-echange Noise") => b?,
                 };
-                let (typ, clair) = self.transport.dechiffrer(&b)?;
+                let Some((typ, clair)) = self.transport.recevoir_message(&b)? else { continue; };
                 if typ != tune_core::sendspin::transport::TYPE_CORPS_JSON {
                     continue;
                 }
@@ -382,11 +382,10 @@ impl Pilote {
             serde_json::to_value(hello).map_err(|_| sequence("hello serveur"))?,
         )
         .await?;
-        let b = tokio::select! {
+        let texte = tokio::select! {
             _ = self.inscription.revocation.changed() => return Err(sequence("session revoquee")),
-            b = super::lire_binaire(&mut self.socket, "client/hello apres re-echange") => b?,
+            texte = super::lire_json_chiffre(&mut self.socket, &mut self.transport, "client/hello apres re-echange") => texte?,
         };
-        let texte = self.transport.dechiffrer_json(&b)?;
         let m: EnveloppeBrute =
             serde_json::from_str(&texte).map_err(|_| sequence("hello chiffre invalide"))?;
         if m.type_message != "client/hello" {

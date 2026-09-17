@@ -622,6 +622,20 @@ pub struct RapportDAbsorption {
     pub champs_repris: usize,
 }
 
+/// Clé `track_metadata` du nom convivial du serveur UPnP d'une piste indexée —
+/// posée par `tune-server` (`routes/indexation_upnp.rs`, `CLE_SERVEUR_NOM`).
+pub const CLE_UPNP_SERVEUR_NOM: &str = "upnp_serveur_nom";
+
+/// Une contrepartie d'album, pour la mention « aussi sur … » (phase 5 UPnP).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AussiSur {
+    pub album_id: i64,
+    /// Vrai : la contrepartie est l'album de la bibliothèque LOCALE.
+    pub local: bool,
+    /// Le nom du serveur UPnP, quand l'indexation l'a noté.
+    pub serveur: Option<String>,
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -900,6 +914,65 @@ impl AlbumRepo {
             Engine::Sqlite => sqlite(&SqliteDialect),
             Engine::Postgres => postgres(&PostgresDialect),
         }
+    }
+
+    /// « Aussi sur … » — phase 5 du chantier UPnP (D1-b, Bertrand 14/09/2026).
+    ///
+    /// La mention RÉCIPROQUE du masquage #4146 : pour un album LOCAL, les
+    /// albums distants qui le doublent (et que la grille masque) ; pour un
+    /// album DISTANT, l'album local qui le double. Aucune fusion : on dit, on
+    /// ne touche à rien.
+    ///
+    /// Le rapprochement est [`facet_filter::condition_de_doublon`], le MÊME
+    /// texte SQL que le masquage : deux homonymes d'artistes différents ne
+    /// sont pas rapprochés, et deux éditions (« Remastered », coffret) non
+    /// plus, puisque le titre diffère.
+    pub fn aussi_sur(&self, id: i64) -> Result<Vec<AussiSur>, TuneError> {
+        let cond = crate::db::facet_filter::condition_de_doublon("d");
+        let p = self.marque(1);
+        // Les deux sens, en une requête chacun ; un album n'est que l'un des deux.
+        let distants = format!(
+            "SELECT d.id FROM albums d \
+             WHERE EXISTS (SELECT 1 FROM albums loc WHERE loc.id = {p} AND {cond}) \
+             ORDER BY d.id"
+        );
+        let locaux = format!(
+            "SELECT loc.id FROM albums loc, albums d \
+             WHERE d.id = {p} AND {cond} ORDER BY loc.id"
+        );
+        let ids = |sql: &str| -> Result<Vec<i64>, TuneError> {
+            Ok(self
+                .db
+                .query_many(sql, &[&id as &dyn ToSqlValue])?
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                .collect())
+        };
+        let serveur = format!(
+            "SELECT tm.value FROM tracks t JOIN track_metadata tm ON tm.track_id = t.id \
+             WHERE t.album_id = {p} AND tm.key = '{CLE_UPNP_SERVEUR_NOM}' LIMIT 1"
+        );
+        let mut rendu = Vec::new();
+        for d in ids(&distants)? {
+            let nom = self
+                .db
+                .query_one(&serveur, &[&d as &dyn ToSqlValue])?
+                .and_then(|r| r.first().and_then(|v| v.as_string()))
+                .filter(|n| !n.trim().is_empty());
+            rendu.push(AussiSur {
+                album_id: d,
+                local: false,
+                serveur: nom,
+            });
+        }
+        for l in ids(&locaux)? {
+            rendu.push(AussiSur {
+                album_id: l,
+                local: true,
+                serveur: None,
+            });
+        }
+        Ok(rendu)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Album>, TuneError> {
@@ -3179,6 +3252,73 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// Phase 5 UPnP : la mention réciproque, et ses deux contre-épreuves
+    /// imposées par le chantier — homonymes d'artistes différents, éditions.
+    #[test]
+    fn aussi_sur_rapproche_ce_que_la_grille_masque_et_rien_d_autre() {
+        let db = test_db();
+        // `track_metadata` vient des migrations, pas du schéma de base.
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1, 'Kate Bush'), (2, 'Autre Artiste');
+             INSERT INTO albums (id, title, artist_id, source) VALUES
+               (10, 'Hounds of Love', 1, 'local'),
+               (11, 'hounds of love', 1, 'upnp'),
+               (12, 'Hounds of Love', 2, 'upnp'),
+               (13, 'Hounds of Love (Remastered)', 1, 'upnp'),
+               (14, 'Live', 1, 'local'),
+               (15, 'Live', 2, 'local'),
+               (16, 'Live', NULL, 'upnp');
+             INSERT INTO tracks (id, title, album_id, source, source_id) VALUES (100, 't', 11, 'upnp', 'k');
+             INSERT INTO track_metadata (track_id, key, value) VALUES (100, 'upnp_serveur_nom', 'Salon');",
+        )
+        .unwrap();
+        let repo = AlbumRepo::new(db.clone());
+
+        assert_eq!(
+            repo.aussi_sur(10).unwrap(),
+            vec![AussiSur {
+                album_id: 11,
+                local: false,
+                serveur: Some("Salon".into())
+            }],
+            "le local voit son distant ; ni l'homonyme d'un autre artiste (12), ni l'édition remastérisée (13)"
+        );
+        assert_eq!(
+            repo.aussi_sur(11).unwrap(),
+            vec![AussiSur {
+                album_id: 10,
+                local: true,
+                serveur: None
+            }],
+            "réciproque"
+        );
+        assert!(
+            repo.aussi_sur(12).unwrap().is_empty(),
+            "homonyme d'un autre artiste"
+        );
+        assert!(repo.aussi_sur(13).unwrap().is_empty(), "autre édition");
+        assert!(
+            repo.aussi_sur(16).unwrap().is_empty(),
+            "distant sans artiste, titre ambigu côté local : pas de rapprochement"
+        );
+
+        // Et c'est bien la règle du masquage : 11 est masqué, 12 et 13 non.
+        let visibles: Vec<i64> = db
+            .query_many(
+                &format!(
+                    "SELECT a.id FROM albums a WHERE {} ORDER BY a.id",
+                    crate::db::facet_filter::album_distant_double_exclu("a")
+                ),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        assert_eq!(visibles, vec![10, 12, 13, 14, 15, 16]);
     }
 
     /// Pose une piste numérotée sur un album, comme le fait le scan.
