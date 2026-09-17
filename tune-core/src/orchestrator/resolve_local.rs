@@ -1007,6 +1007,24 @@ impl PlaybackOrchestrator {
         } else {
             bit_depth
         };
+        // `dlna_wav24` ne décrit QUE la profondeur du WAV servi : il faut une
+        // source réellement plus profonde que 16 bits pour que l'en-tête
+        // annonce du 24 bits et que le DIDL lâche le profil LPCM. Le plafond
+        // 16 bits du LPCM est protecteur (#1137) et reste entier.
+        //
+        // Il ne décide PAS si le WAV est forcé — c'est `wav24_opt_in` qui le
+        // dit, et lui seul (#4297). Tant que le forçage passait par ce
+        // drapeau-ci, « Forcer le WAV = 24 bits » n'avait AUCUN effet sur une
+        // source 16 bits : sur l'ALAC 44,1/16 d'Yves, `bit_depth_wire` restait
+        // 16, `dlna_wav24` retombait à `false`, et comme le pavé « 16 bits »
+        // (`dlna_lpcm`) est exclusif du pavé « 24 bits », le forçage recevait
+        // deux `false`. L'ALAC repartait donc en FLAC natif — ce que
+        // l'afficheur du LHC-208 confirmait (`FLAC / PCM / 16/44k1`). Le
+        // libellé de l'interface, lui, ne parle que de la SOURCE :
+        // « "Forcer le WAV" ne s'applique qu'aux sources non-FLAC (ALAC,
+        // AAC…) », sans un mot sur la profondeur. C'est ce contrat-là qui fait
+        // foi : le pavé « 24 bits » choisit la profondeur du WAV produit quand
+        // la source la porte, pas les sources qui partent en WAV.
         let dlna_wav24 = wav24_opt_in && bit_depth_wire > 16;
         // Both WAV overrides force a transcode away from FLAC/ALAC passthrough.
         //
@@ -1026,8 +1044,11 @@ impl PlaybackOrchestrator {
         // L'exception exige l'opt-in `dlna_native_flac` : sans lui, une source
         // FLAC continue de suivre le forçage, ce dont ont besoin les renderers
         // qui ne savent pas lire le FLAC.
+        //
+        // `wav24_opt_in`, et non `dlna_wav24` : le forçage suit le RÉGLAGE de
+        // la zone, jamais la profondeur de la piste (#4297).
         let dlna_force_wav = wav_override_applies(
-            dlna_lpcm || dlna_wav24,
+            dlna_lpcm || wav24_opt_in,
             source_format == Some(AudioFormat::Flac),
             is_network_output
                 && ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id),
