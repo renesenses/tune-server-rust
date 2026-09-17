@@ -206,7 +206,7 @@ async fn create_preset(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -260,7 +260,7 @@ async fn update_preset(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -306,7 +306,7 @@ async fn delete_preset(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -387,7 +387,7 @@ async fn activate_preset(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,

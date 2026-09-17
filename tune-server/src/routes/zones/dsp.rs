@@ -255,17 +255,18 @@ pub(super) async fn set_zone_dsp(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Premium gate: DSP & EQ mutations require Premium. Le refus parle la
-    // langue de l'application (#2419) — c'est le même écran « Égaliseur » que
-    // `POST /zones/{id}/eq`, et il tire ses deux moitiés d'ici et de là.
-    if let Err(resp) = crate::premium_guard::require_premium_localise(
-        &state.license,
-        tune_core::license::Feature::DspEq,
-        &headers,
-    )
-    .await
-    {
-        return resp;
+    // Authorize the whole request before any write: EQ is free, crossfeed is
+    // separately Premium. A mixed request must never partially mutate EQ.
+    if body.get("crossfeed").is_some() {
+        if let Err(resp) = crate::premium_guard::require_premium_localise(
+            &state.license,
+            tune_core::license::Feature::Crossfeed,
+            &headers,
+        )
+        .await
+        {
+            return resp;
+        }
     }
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -294,7 +295,7 @@ pub(super) async fn set_zone_dsp(
     }
 
     // Handle crossfeed sub-object if present (local-output headphone effect).
-    // Same premium gate (Feature::DspEq) as the EQ path above. Ranges clamped:
+    // Separate Premium crossfeed gate above. Ranges clamped:
     // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;

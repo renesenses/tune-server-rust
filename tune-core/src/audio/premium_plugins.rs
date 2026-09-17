@@ -7,6 +7,9 @@ pub const MIGRATION: &str = "premium_audio_plugins_migration_v1";
 pub fn contains(id: &str) -> bool {
     IDS.contains(&id)
 }
+pub fn requires_premium(id: &str) -> bool {
+    contains(id) && id != "equalizer"
+}
 pub fn enabled(settings: &SettingsRepo, id: &str) -> bool {
     if !contains(id) || tune_plugin_native::failure(id).is_some() {
         return false;
@@ -31,8 +34,8 @@ pub fn enabled(settings: &SettingsRepo, id: &str) -> bool {
 pub fn migrate(settings: &SettingsRepo) -> Result<(), String> {
     migrate_for_account(settings, true)
 }
-/// Existing premium accounts retain access. Other accounts see the four
-/// installable entries without loading premium processors automatically.
+/// EQ stays installed for Free accounts. Premium access for the other slots
+/// is separate; preserve explicit user uninstall/disable choices.
 pub fn migrate_for_account(settings: &SettingsRepo, premium: bool) -> Result<(), String> {
     if settings.get(MIGRATION)?.as_deref() == Some("complete") {
         return Ok(());
@@ -41,7 +44,14 @@ pub fn migrate_for_account(settings: &SettingsRepo, premium: bool) -> Result<(),
         for suffix in ["installed", "enabled"] {
             let key = format!("plugin_{id}_{suffix}");
             if settings.get(&key)?.is_none() {
-                settings.set(&key, if premium { "true" } else { "false" })?;
+                settings.set(
+                    &key,
+                    if premium || !requires_premium(id) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )?;
             }
         }
     }
@@ -56,6 +66,26 @@ mod tests {
         db.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db).unwrap();
         SettingsRepo::with_backend(std::sync::Arc::new(db))
+    }
+    #[test]
+    fn premium_sdk_free_migration_keeps_eq_and_preserves_user_choices() {
+        let s = settings();
+        s.set("zone_1_eq_profile", "existing-free-profile").unwrap();
+        migrate_for_account(&s, false).unwrap();
+        assert!(enabled(&s, "equalizer"));
+        assert!(!enabled(&s, "converter"));
+        assert!(!requires_premium("equalizer"));
+        assert!(requires_premium("crossfeed"));
+        assert_eq!(
+            s.get("zone_1_eq_profile").unwrap().as_deref(),
+            Some("existing-free-profile")
+        );
+        s.set("plugin_equalizer_enabled", "false").unwrap();
+        migrate_for_account(&s, false).unwrap();
+        assert!(
+            !enabled(&s, "equalizer"),
+            "migration reset an explicit user choice"
+        );
     }
     #[test]
     fn premium_sdk_all_sixteen_installation_combinations_and_idempotent_migration() {

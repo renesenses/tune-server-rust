@@ -36,7 +36,8 @@ def main():
     binary, sdk = args.binary.resolve(), args.sdk.resolve()
     with tempfile.TemporaryDirectory(prefix="tune-sdk-conformance-") as scratch:
         root = Path(scratch)
-        for template in ("dsp", "batch", "equalizer", "crossfeed", "converter", "declick"):
+        catalog = json.loads((sdk / "plugins.json").read_text(encoding="utf-8"))
+        for template in ["dsp", "batch"] + [plugin["id"] for plugin in catalog["native"]]:
             project = root / f"external {template} plugin"
             command = (binary, "new", f"example-{template}", "--template", template, "--sdk-path", sdk, "--output", project)
             run(*command)

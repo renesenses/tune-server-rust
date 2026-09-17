@@ -56,32 +56,58 @@ fn scaffold(args: &[String]) -> Result<(), String> {
         "batch-with-ui" => "batch".to_string(),
         value => value.to_string(),
     };
-    if !matches!(
-        template.as_str(),
-        "dsp" | "batch" | "equalizer" | "crossfeed" | "converter" | "declick"
-    ) {
-        return Err("unknown plugin template".into());
-    }
     let sdk = fs::canonicalize(sdk.ok_or(USAGE)?).map_err(|e| e.to_string())?;
+    let concrete = !matches!(template.as_str(), "dsp" | "batch");
+    let catalog: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(sdk.join("plugins.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let reference = if concrete {
+        let entry = catalog["native"]
+            .as_array()
+            .ok_or("invalid native plugin catalog")?
+            .iter()
+            .find(|p| p["id"].as_str() == Some(template.as_str()))
+            .ok_or("unknown plugin template")?;
+        let directory = entry["crate"].as_str().ok_or("missing template crate")?;
+        if !valid_id(directory) {
+            return Err("invalid template crate".into());
+        }
+        sdk.join(directory)
+    } else {
+        sdk.join(format!("tune-plugin-{template}"))
+    };
+    let reference_manifest: serde_json::Value = if concrete {
+        serde_json::from_str(
+            &fs::read_to_string(reference.join("manifest.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        serde_json::Value::Null
+    };
+    let kind = if concrete {
+        reference_manifest["kind"]
+            .as_str()
+            .filter(|k| matches!(*k, "dsp" | "batch"))
+            .ok_or("invalid template kind")?
+    } else {
+        template.as_str()
+    };
     let output = PathBuf::from(output.ok_or(USAGE)?);
     for crate_name in ["tune-plugin-sdk", "tune-plugin-testkit"] {
         if !sdk.join(crate_name).join("Cargo.toml").is_file() {
             return Err(format!("missing SDK crate: {crate_name}"));
         }
     }
-    let concrete = !matches!(template.as_str(), "dsp" | "batch");
-    let kind = if matches!(template.as_str(), "dsp" | "equalizer" | "crossfeed") {
-        "dsp"
-    } else {
-        "batch"
-    };
-    let reference = sdk.join(format!("tune-plugin-{template}"));
     let mut extra_files = Vec::new();
     let (mut lib, tests) = if concrete {
         let lib = fs::read_to_string(reference.join("src/lib.rs")).map_err(|e| e.to_string())?;
         let tests = fs::read_to_string(reference.join("tests/conformance.rs"))
             .map_err(|e| e.to_string())?
-            .replace(&format!("tune_plugin_{template}"), "PLUGIN_CRATE");
+            .replace(
+                &format!("tune_plugin_{}", template.replace('-', "_")),
+                "PLUGIN_CRATE",
+            );
         for name in ["engine.rs", "sdk.rs"] {
             let source = reference.join("src").join(name);
             if source.is_file() {
@@ -153,7 +179,7 @@ fn scaffold(args: &[String]) -> Result<(), String> {
         let example = fs::read_to_string(reference.join("examples/schema.rs"))
             .map_err(|e| e.to_string())?
             .replace(
-                &format!("tune_plugin_{template}"),
+                &format!("tune_plugin_{}", template.replace('-', "_")),
                 &format!("tune_plugin_{}", id.replace('-', "_")),
             );
         extra_files.push(("examples/schema.rs".into(), example));

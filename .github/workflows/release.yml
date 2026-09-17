@@ -45,6 +45,11 @@ jobs:
     timeout-minutes: 20  # Build Web Client — <1 min
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify generated plugin lists
+        run: python scripts/plugin-catalog.py --check
       # Symetrique de « Verify web-client version matches release tag », plus
       # bas. Le client web avait sa garde ; le SERVEUR n'en avait aucune.
       # Vecu sur la v0.9.128 : le tag a ete pose alors que Cargo.toml declarait
@@ -161,7 +166,8 @@ jobs:
             platform: linux-aarch64
             ext: tar.gz
             cross: true
-            features: oaat,cloud-relay,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,pont-roon,audio-embedding
+            # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -171,7 +177,8 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            features: oaat,cloud-relay,dj,karaoke,bandcamp,concerts,plugins-wasm,pont-roon,audio-embedding
+            # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","plugins-wasm","audio-embedding"]}
+            features: oaat,cloud-relay,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -339,7 +346,8 @@ jobs:
 
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,pont-roon,audio-embedding
+        # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -352,11 +360,13 @@ jobs:
 
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,pont-roon,audio-embedding
+        # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding"]}
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,dj,karaoke,bandcamp,concerts,plugins-wasm,pont-roon,audio-embedding
+        # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding"]}
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.

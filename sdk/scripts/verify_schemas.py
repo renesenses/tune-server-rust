@@ -3,7 +3,8 @@
 import argparse,json,pathlib,subprocess
 sdk=pathlib.Path(__file__).resolve().parents[1]
 p=argparse.ArgumentParser();p.add_argument('--write',action='store_true');args=p.parse_args()
-for name in ['sdk','equalizer','crossfeed','converter','declick']:
+catalog=json.loads((sdk/'plugins.json').read_text(encoding='utf-8'))
+for name in ['sdk'] + [p['id'] for p in catalog['native']]:
  crate=sdk/('tune-plugin-'+name)
  schema=json.loads(subprocess.check_output(['cargo','run','--quiet','--manifest-path',str(crate/'Cargo.toml'),'--example','schema','--features','schemas']))
  items=schema.items() if name=='sdk' else [('config',schema)]

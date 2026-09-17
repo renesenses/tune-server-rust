@@ -6,7 +6,7 @@
   },
   "kind": "dsp",
   "config_version": 1,
-  "entitlement": "dsp_eq",
+  "entitlement": "crossfeed",
   "distribution": "source",
   "capabilities": [
     {

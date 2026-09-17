@@ -1,4 +1,4 @@
-# Extraction des quatre fonctionnalités premium — #4363
+# SDK audio : égaliseur FREE et trois greffons Premium — #4363
 
 L'égaliseur, le crossfeed, le convertisseur et Dé-ploc disposent de projets SDK indépendants, de templates exécutables et d'une distribution native signée. Les façades Tune gardent les points d'insertion audio et les API existantes. Le spectre reste produit par l'hôte, même lorsque les quatre plugins sont désinstallés.
 
@@ -27,6 +27,14 @@ Dé-ploc : même recherche de silence, rognage tête/queue, passage par zéro du
 
 Spectre : événement `playback.audio_levels` conservé avec ajout de `play_seq`, `generation`, point/provenance et format. Le client écarte les anciennes pistes, anciens seeks, autres zones et tableaux incomplets. Le point actuellement offert est `decoded_source` ; demander post-DSP retourne une absence de capacité. Les axes/résolutions proviennent de l'analyseur réel, jamais de la taille FFT rembourrée seule.
 
+## Catalogue et offre
+
+Le [catalogue unique](../../sdk/plugins.json) alimente 19 listes explicites dans CI, release et Docker, dont macOS et ARM64. `python scripts/plugin-catalog.py --write` les régénère ; chacun des trois workflows exécute `--check` avant compilation. Les gardes historiques restent actives ; les deux gardes Windows comparent les features des vraies commandes indépendamment de leur ordre, avec refus testé des omissions et commentaires. La CLI de scaffolding, les vérifications de schémas et de projets externes lisent aussi ce catalogue. L’ajout fictif d’un greffon et le retrait d’une feature de chacune des 19 listes servent de témoins et contre-épreuves.
+
+L’égaliseur est accessible aux comptes FREE, y compris ses profils, presets et mutations HTTP. La capacité historique `dsp_eq` reste annoncée vraie ; le crossfeed possède désormais sa propre capacité `crossfeed`. PURE conserve son bypass. La migration active l’EQ gratuit sans écraser une désactivation explicite.
+
+**Décision restante avant extraction :** traitement des comptes FREE qui utilisaient déjà le crossfeed (maintien, lecture seule, coupure ou délai). Le brouillon conserve leurs réglages mais désactive actuellement le fournisseur : cette politique n’est pas acceptée pour publication. Convertisseur et Dé-ploc restent Premium. La PR demeure en brouillon sur `batch/jp-sdk-premium-20260917`.
+
 ## Livraison et migration
 
 Les quatre implémentations sont réutilisées par les façades source et par leurs cdylibs. Cette transition préserve les installations existantes ; le code des références reste donc présent dans le binaire hôte. Un paquet natif installé remplace son fournisseur au prochain démarrage. Pas de compilation ou de clé privée sur le poste du client.
@@ -39,6 +47,6 @@ Les tâches déjà lancées terminent ou sont annulées explicitement. Un journa
 
 ## Preuves et portes d'acceptation
 
-La parité compare trois exécutions indépendantes : source historique extraite par `git show`, bibliothèque SDK et façades chargeant les vraies bibliothèques natives. Les tests de contrat vérifient les buffers, transitions, codecs hôtes, métadonnées, annulation, publication et erreurs. Les tests de paquets signent avec une clé publique de fixture non installée en production et vérifient succès puis refus d'altération.
+**4 644 864 octets identiques** dans la preuve DSP initiale (SHA-256 `cc87f7716466f522bd095a5d0aa76f7860be493fc128ae33c032a25ac0c4e49d`). La parité compare trois exécutions indépendantes : source historique extraite par `git show`, bibliothèque SDK et façades chargeant les vraies bibliothèques natives. Les tests de contrat vérifient les buffers, transitions, codecs hôtes, métadonnées, annulation, publication et erreurs. Les tests de paquets signent avec une clé publique de fixture non installée en production et vérifient succès puis refus d'altération.
 
 Les preuves locales sont consignées dans [premium-sdk-evidence.md](premium-sdk-evidence.md). La CI SDK utilise trois OS. Les tests matériels CoreAudio/WASAPI, les cibles réseau, la charge multi-zone et l'écoute restent des portes de qualification de release : une compilation Linux ou une capture PCM ne vaut pas leur acceptation. Aucun merge, déploiement, publication ni changement des clés de confiance n'est inclus dans cette implémentation.

@@ -80,3 +80,15 @@ La garde globale de reachabilité #2816 demandait une étape Cargo explicite pou
 `native-conformance`, malgré l’exécution réelle par `verify_native.py`. Le workflow
 sépare désormais la construction des cdylibs et l’étape Cargo avec feature et
 répertoire natif déclarés ; les assertions et la garde restent inchangées.
+
+
+## Suivi du 17 septembre : catalogue unique et EQ FREE
+
+Sur le lot `batch/jp-sdk-premium-20260917`, hors RC publiée :
+
+- Catalogue `sdk/plugins.json`, 19 expansions CI/release/Docker : cinq tests Python, ajout réel d’un membre Cargo fictif et retrait de chaque feature attendue. Désactiver le contrôle de dérive fait échouer les tests ; restauration verte.
+- Shrek, `TUNE_TARGET_KEY=jp-sdk-catalog-free-4363` : quatre tests core (migration, PCM FREE, PURE, spectre), dix tests HTTP (écriture/lecture EQ et presets FREE, requête mixte atomique, refus crossfeed localisés), 33 gardes workflows réussis. Les deux gardes Windows ont conservé leurs capacités exigées et comparent désormais les tokens plutôt que leur ordre.
+- Client web compagnon : trois tests sur l’écran réellement monté (curseur FREE → POST des bandes, avertissement PURE, ancien serveur 402), contre-épreuve par restauration du verrou Premium puis retour au vert. Validation complète conservée dans l’archive de suivi.
+- `actionlint` retrouve les mêmes cinq diagnostics préexistants dans `release.yml` qu’au parent, aucun diagnostic nouveau dans les quatre workflows modifiés.
+
+Les preuves du paragraphe précédent restent attachées à leur commit initial. Les nouveaux journaux sont conservés séparément dans `reports/sdk-premium-4363/catalog-free-20260917/`. Les anciens paquets Linux de l’archive initiale précèdent les nouveaux droits FREE/crossfeed ; ils ne représentent pas cette révision. La politique de migration du crossfeed FREE reste à décider avant sortie du brouillon.

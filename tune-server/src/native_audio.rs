@@ -145,6 +145,7 @@ async fn install(
 }
 pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
     match id {
+        "crossfeed" => tune_core::license::Feature::Crossfeed,
         "converter" => tune_core::license::Feature::BatchConverter,
         "declick" => tune_core::license::Feature::Declick,
         _ => tune_core::license::Feature::DspEq,

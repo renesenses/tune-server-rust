@@ -707,13 +707,13 @@ pub(super) async fn get_config(
     // plafond du tout, ce que le client web lit deja comme « illimite ».
     let zone_limit = json!(state.license.limite_zones().await);
     let mut premium_features = serde_json::Map::new();
-    for f in tune_core::license::Feature::all_premium() {
+    for f in tune_core::license::Feature::all_advertised() {
         let key = serde_json::to_value(f)
             .unwrap()
             .as_str()
             .unwrap()
             .to_string();
-        let enabled = state.license.check_feature(*f).await;
+        let enabled = state.license.check_feature(f).await;
         premium_features.insert(key, json!(enabled));
     }
     // Masked license key: show only the last 4 characters.

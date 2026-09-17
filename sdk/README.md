@@ -1,4 +1,4 @@
-# Tune premium audio SDK 0.1 — native ABI 1
+# Tune audio plugin SDK 0.1 — native ABI 1
 
 Independent Cargo workspace. Plugins import SDK crates, never `tune-core` or `tune-server`. The four reference implementations are equalizer, crossfeed, converter and Dé-ploc. Tune's host adapters preserve existing HTTP screens, profiles, presets, audio producers and file codecs. The source-composed providers preserve upgrades; installing a signed native package overrides the corresponding provider at the next startup. This SDK does not replace Tune's WASM plugin system.
 
@@ -47,14 +47,22 @@ Set `TUNE_AUDIO_PLUGINS_DIR`, or use `$TUNE_PLUGINS_DIR/audio` (default `plugins
 Authenticated admin API:
 
 - `GET /api/v1/audio-plugins/`: target, ABI, trust configuration, loaded providers and activation failures.
-- `POST /api/v1/audio-plugins/{id}/install`: ZIP body, `X-Tune-Plugin-Signature` carrying the detached signature with newlines encoded as literal `\n`. Requires the existing premium entitlement.
+- `POST /api/v1/audio-plugins/{id}/install`: ZIP body, `X-Tune-Plugin-Signature` carrying the detached signature with newlines encoded as literal `\n`. Requires the plugin entitlement: equalizer is Free; crossfeed, converter and Dé-ploc require Premium.
 - `POST /api/v1/audio-plugins/{id}/rollback`: verify the retained previous version, atomically switch next-startup activation.
 - `POST /api/v1/audio-plugins/{id}/uninstall` with `{"remove_native":true}`: disable the feature, deactivate the native version, preserve profiles/presets and retained versions.
 - `GET /api/v1/audio-plugins/{id}/assets/{name}`: only signed inventory-listed HTML/JS/CSS, with sandbox CSP. The host must use its authenticated asset delivery when mounting a UI; the existing Tune screens need no iframe.
 
 Installation verifies signature, target, ABI, SDK/capabilities, portable paths, file inventory and SHA-256 before extraction or execution. Libraries are verified again at startup. A corrupt installed provider is unavailable and does not silently fall back. Live instances pin their library until destruction. Replacing files cannot unload code in use. Activation is at restart; existing playback/jobs finish. The next activation checks installed/enabled state and current licence, with no network/licence checks per sample.
 
-The idempotent migration preserves `zone_*_eq_profile`, crossfeed settings and presets. Existing premium accounts retain the source-composed providers; new/free accounts see installable entries. A migration marker prevents resurrection after explicit uninstall. This transition intentionally keeps reference implementations in the server build: removal of that compatibility build is a separate release policy, not a promised binary secrecy boundary.
+The idempotent migration preserves `zone_*_eq_profile`, crossfeed settings and presets. The equalizer source-composed provider is enabled for Free and Premium accounts, preserving explicit user disable/uninstall choices. The `dsp_eq` capability remains advertised as enabled for backward compatibility; crossfeed uses its own `crossfeed` entitlement. Existing Premium accounts retain all source-composed providers. The migration policy for previously used crossfeed on Free accounts remains a product decision before extraction release; the draft currently preserves configuration but disables that provider for Free. A migration marker prevents resurrection after explicit uninstall. This transition intentionally keeps reference implementations in the server build: removal of that compatibility build is a separate release policy, not a promised binary secrecy boundary.
+
+## One plugin inventory for builds and templates
+
+[`plugins.json`](plugins.json) is the canonical inventory of in-tree and native plugins. CI, release (including macOS) and Docker (amd64/arm64) run `python scripts/plugin-catalog.py --check` before their builds. Their explicit Cargo commands are generated from this inventory, so independent historical CI guards can still inspect real package and feature lists.
+
+To add an in-tree plugin, create its Cargo workspace member, optional server dependency and feature, then add one `in_tree` entry with that feature and its `fast_test` policy. Run `python scripts/plugin-catalog.py --write` and commit the generated workflow diff. Platform markers hold only non-plugin features and the `all`/`fast` policy. All shipped builds include every in-tree plugin; the fast tests include the declared subset. New native plugins need a SDK member with a manifest, `native`/`schemas` features, a cdylib, schema generator, config schema and conformance test, then one `native` entry. The CLI discovers concrete templates there; schema and external-scaffold verification iterate the same inventory. Generic `dsp`/`batch` templates remain available.
+
+`--check` rejects missing inventory entries, stale expansions and unmanaged server build commands. `python -m unittest discover -s scripts/tests -p test_plugin_catalog.py` adds a fixture plugin through the real Cargo declarations and proves propagation to all workflows; removing a feature from any generated list is rejected. Native workspace tests and package checks still validate actual code: registration alone does not implement a plugin or authorize a new production slot.
 
 ## Qualification
 

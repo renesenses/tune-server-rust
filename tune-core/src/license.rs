@@ -33,7 +33,9 @@ impl std::fmt::Display for Tier {
 pub enum Feature {
     UnlimitedZones,
     MultiroomSync,
+    /// Equalizer is free; retain the historical wire name `dsp_eq`.
     DspEq,
+    Crossfeed,
     CloudRelay,
     OaatProtocol,
     CloudBackup,
@@ -72,7 +74,7 @@ impl Feature {
         &[
             Feature::UnlimitedZones,
             Feature::MultiroomSync,
-            Feature::DspEq,
+            Feature::Crossfeed,
             Feature::CloudRelay,
             // OAAT is free — open-source protocol, core feature
             // Feature::OaatProtocol,
@@ -101,12 +103,18 @@ impl Feature {
         ]
     }
 
+    /// Features exposed to clients, including the now-free historical EQ key.
+    pub fn all_advertised() -> impl Iterator<Item = Feature> {
+        Self::all_premium().iter().copied().chain([Self::DspEq])
+    }
+
     /// Human-readable display name.
     pub fn display_name(&self) -> &'static str {
         match self {
             Feature::UnlimitedZones => "Unlimited Zones",
             Feature::MultiroomSync => "Multiroom Sync",
-            Feature::DspEq => "DSP & EQ",
+            Feature::DspEq => "Equalizer",
+            Feature::Crossfeed => "Crossfeed",
             Feature::CloudRelay => "Cloud Relay",
             Feature::OaatProtocol => "OAAT Protocol",
             Feature::CloudBackup => "Cloud Backup",
@@ -147,6 +155,7 @@ impl Feature {
             Feature::UnlimitedZones => "unlimited_zones",
             Feature::MultiroomSync => "multiroom_sync",
             Feature::DspEq => "dsp_eq",
+            Feature::Crossfeed => "crossfeed",
             Feature::CloudRelay => "cloud_relay",
             Feature::OaatProtocol => "oaat_protocol",
             Feature::CloudBackup => "cloud_backup",
@@ -435,8 +444,8 @@ impl LicenseManager {
 
     /// Check whether a specific feature is enabled. All premium features require
     /// the effective Premium tier (license key or account premium).
-    pub async fn check_feature(&self, _feature: Feature) -> bool {
-        effective_tier(&*self.state.read().await) == Tier::Premium
+    pub async fn check_feature(&self, feature: Feature) -> bool {
+        feature == Feature::DspEq || effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
     /// Le plafond de zones **en vigueur** : `None` = illimité (Premium),
@@ -1618,7 +1627,8 @@ mod tests {
         let mgr = LicenseManager::new_with_limit(backend.clone(), 3);
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
-        assert!(!mgr.check_feature(Feature::DspEq).await);
+        assert!(mgr.check_feature(Feature::DspEq).await);
+        assert!(!mgr.check_feature(Feature::Crossfeed).await);
         // Free tier is capped at the configured limit (3 here).
         assert_eq!(mgr.limite_zones().await, Some(3));
         // Le plafond mesure lui-même son assiette (#3673) : ce n'est plus

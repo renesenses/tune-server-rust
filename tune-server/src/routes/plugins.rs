@@ -281,7 +281,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "enabled": info.enabled,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
-            "premium": tune_core::audio::premium_plugins::contains(&info.name),
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
             "activation_error": tune_plugin_native::failure(&info.name),
             "compatible": true,
         }));
@@ -314,7 +314,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
-            "premium": tune_core::audio::premium_plugins::contains(&info.name),
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
             "activation_error": tune_plugin_native::failure(&info.name),
             // 🔴 #3484 — le champ que la fiche wasm porte depuis toujours, et
             // que la fiche COMPILÉE n'a jamais porté (voir la boucle wasm plus
@@ -448,7 +448,7 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": info.enabled,
             "status": "loaded",
             "config_schema": info.config_schema,
-            "premium": tune_core::audio::premium_plugins::contains(&info.name),
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
             "activation_error": tune_plugin_native::failure(&info.name),
             // Il TOURNE dans ce processus : il a franchi la porte d'ABI.
             "compatible": true,

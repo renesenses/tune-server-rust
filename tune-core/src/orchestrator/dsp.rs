@@ -1302,13 +1302,6 @@ impl PlaybackOrchestrator {
     /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
-        if self
-            .license
-            .as_ref()
-            .is_some_and(|license| !license.premium_snapshot())
-        {
-            return None;
-        }
         if !crate::audio::premium_plugins::enabled(
             &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
             "equalizer",

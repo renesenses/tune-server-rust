@@ -7705,3 +7705,31 @@ async fn une_reprise_dlna_ordinaire_n_envoie_qu_un_seul_play() {
         "aucune relance quand le renderer a repris"
     );
 }
+
+#[tokio::test]
+async fn premium_sdk_free_equalizer_reaches_pcm_and_pure_still_bypasses() {
+    let mut orch = test_orchestrator();
+    orch.license = Some(Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    )));
+    assert!(!orch.license.as_ref().unwrap().is_premium().await);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    armer_un_egaliseur_audible(&orch, 1);
+    let profile = orch
+        .load_eq_profile(1)
+        .expect("FREE account lost its equalizer in playback");
+    let mut eq = crate::audio::eq::EqProcessor::new(&profile, 48000, 2);
+    let mut pcm: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let before = pcm.clone();
+    eq.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "FREE EQ did not process samples");
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":true}"#)
+        .unwrap();
+    assert!(
+        orch.load_eq_profile(1).is_none(),
+        "PURE must bypass the free EQ too"
+    );
+}

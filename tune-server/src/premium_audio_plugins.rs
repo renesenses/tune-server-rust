@@ -73,7 +73,7 @@ pub fn descriptor(id: &str) -> Value {
         "crossfeed" => (
             "crossfeed",
             vec!["/api/v1/zones/{zone}/dsp"],
-            "dsp_eq",
+            "crossfeed",
             "dsp",
         ),
         "converter" => (
@@ -85,7 +85,7 @@ pub fn descriptor(id: &str) -> Value {
         "declick" => ("declick", vec!["/api/v1/declick"], "declick", "batch"),
         _ => return Value::Null,
     };
-    json!({"sdk": {"major":0,"minor":1}, "kind":kind, "premium":true, "entitlement":entitlement, "configuration_version":1,"native_loaded":tune_plugin_native::provider(id).is_some(),"activation_error":tune_plugin_native::failure(id),
+    json!({"sdk": {"major":0,"minor":1}, "kind":kind, "premium":tune_core::audio::premium_plugins::requires_premium(id), "entitlement":entitlement, "configuration_version":1,"native_loaded":tune_plugin_native::provider(id).is_some(),"activation_error":tune_plugin_native::failure(id),
         "ui":{"view":view,"zone_scoped":kind=="dsp","endpoints":endpoints,"levels_event":"playback.audio_levels","levels_premium":false},
         "lifecycle":{"disable":"pending_restart","uninstall":"preserve_configuration","running_jobs":"finish_or_explicit_cancel"}})
 }

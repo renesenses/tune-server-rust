@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - 'sdk/**'
+      - 'scripts/plugin-catalog.py'
+      - 'scripts/tests/test_plugin_catalog.py'
       - 'tune-core/src/audio/**'
       - 'tune-core/src/orchestrator*'
       - 'tune-core/src/orchestrator/**'
@@ -14,6 +16,8 @@ on:
     branches: [main]
     paths:
       - 'sdk/**'
+      - 'scripts/plugin-catalog.py'
+      - 'scripts/tests/test_plugin_catalog.py'
       - 'tune-core/src/audio/**'
       - 'tune-core/src/orchestrator*'
       - 'tune-core/src/orchestrator/**'
@@ -46,6 +50,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - run: python scripts/plugin-catalog.py --check
+      - run: python -m unittest discover -s scripts/tests -p test_plugin_catalog.py
       - run: cargo fmt --manifest-path sdk/Cargo.toml --all -- --check
       - run: cargo clippy --manifest-path sdk/Cargo.toml --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --no-fail-fast --manifest-path sdk/Cargo.toml --workspace --locked
