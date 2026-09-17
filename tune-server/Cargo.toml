@@ -540,6 +540,16 @@ path = "tests/dispositions_de_canaux_3322.rs"
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
 
+# #4361 — le pont de commande LMS face a un port deja pris (Cockpit sur Tune OS
+# Fedora). Cible separee pour deux raisons : `cli_server::etat_ecoute()` est un
+# etat global au processus, et ce banc ecrit `TUNE_CLI_PORT` pour interroger
+# `start_cli_server()`, la fonction que le serveur appelle vraiment.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "pont_lms_repli_de_port_4361"
+path = "tests/pont_lms_repli_de_port_4361.rs"
+
 # #2718 — « plus de serveurs multimedia ». La fiche support et le rapport de
 # bogue decrivaient les zones jusqu'au modele du DAC et ne comptaient PAS les
 # serveurs multimedia : quatre tickets (61, 87, 97, 98) instruits sans jamais

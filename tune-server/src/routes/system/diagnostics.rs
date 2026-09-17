@@ -2089,6 +2089,17 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         ),
     ] {
         match etat {
+            // #4361 — une écoute PORTÉE AILLEURS que sur le port demandé est un
+            // service rendu, pas une panne : elle ne mérite pas le « HORS
+            // SERVICE ». Mais la taire ferait de ce rapport le complice du
+            // silence qu'on corrige — la télécommande de l'utilisateur vise
+            // encore l'ancien numéro. Le repli se reconnaît à son message.
+            Some(etat) if etat.ecoute && etat.message.is_some() => md.push_str(&format!(
+                "- **⚠ {nom} REPLIÉ** — en écoute sur {} {} : {}\n",
+                etat.protocole,
+                etat.port,
+                etat.message.as_deref().unwrap_or_default(),
+            )),
             Some(etat) if etat.ecoute => md.push_str(&format!(
                 "- {nom} : en écoute sur {} {}\n",
                 etat.protocole, etat.port
