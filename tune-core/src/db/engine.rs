@@ -132,6 +132,50 @@ pub fn format_fts_query(engine: Engine, raw: &str) -> String {
     }
 }
 
+/// Les colonnes de l'index plein texte des pistes qui identifient la PISTE
+/// elle-même — son titre, son artiste, son genre, son compositeur.
+///
+/// `album_title` en est ABSENT, et c'est tout le sujet de #4367. L'index
+/// `tracks_fts` le porte (voir `crate::library::full_text_search`), et le
+/// `MATCH` ne visait aucune colonne : une recherche « Wish You Were Here »
+/// rendait donc, en section **Titres**, *Have A Cigar*, *Welcome To The
+/// Machine* et *Shine On You Crazy Diamond* — dont pas un titre ne contient
+/// un mot de la requête. Mesuré le 17/09/2026 sur les deux serveurs de
+/// Bertrand, `sources=local` pour écarter les services : le .18 (SQLite) et
+/// le .15 (PostgreSQL) rendent tous deux *Have a Cigar*.
+///
+/// L'album, lui, continue d'être trouvé par la section **Albums**, qui est sa
+/// place — c'est l'argument du testeur : « l'album a déjà été trouvé dans la
+/// recherche d'albums ».
+pub const COLONNES_IDENTITE_PISTE: [&str; 4] = ["title", "artist_name", "genre", "composer"];
+
+/// La requête plein texte d'une recherche de PISTES.
+///
+/// C'est [`format_fts_query`], puis — sous SQLite — le filtre de colonnes
+/// FTS5 `{col …} : (expr)`, qui restreint la correspondance à
+/// [`COLONNES_IDENTITE_PISTE`]. Le filtre vit dans la CHAÎNE passée au
+/// `MATCH`, pas dans le SQL : la forme de la requête ne bouge pas d'un
+/// caractère, donc le plan d'exécution non plus, et aucune base existante
+/// n'a à être réindexée.
+///
+/// Postgres n'a pas d'équivalent dans `to_tsquery` — son `tsvector` est un
+/// seul sac, sans poids. Il reçoit donc la requête inchangée, et c'est
+/// [`SqlDialect::fts_piste_hors_album`] qui porte la restriction, en ET du
+/// prédicat indexé.
+///
+/// Une requête vide reste vide : `{col} : ()` serait une erreur de syntaxe
+/// FTS5 là où `` l'est déjà, et le repli du repo (`unwrap_or_default`) ne
+/// changerait pas de couleur pour autant.
+pub fn format_fts_query_piste(engine: Engine, raw: &str) -> String {
+    let base = format_fts_query(engine, raw);
+    match engine {
+        Engine::Sqlite if !base.is_empty() => {
+            format!("{{{}}} : ({})", COLONNES_IDENTITE_PISTE.join(" "), base)
+        }
+        _ => base,
+    }
+}
+
 /// AND the tokens together in `engine`'s dialect, prefix-marking the last.
 fn join_fts_tokens(engine: Engine, tokens: &[String]) -> String {
     let Some((last, head)) = tokens.split_last() else {
@@ -193,6 +237,30 @@ pub trait SqlDialect {
     /// FTS5 wants `term*`, tsquery wants `term:*`. The repos pass
     /// engine-specific strings in.
     fn fts_where(&self, table: &str, table_alias: &str, query_placeholder: &str) -> String;
+
+    /// Ce qu'il reste à vérifier, EN PLUS de [`Self::fts_where`], pour qu'une
+    /// piste doive sa correspondance à elle-même et non au titre de son
+    /// album (#4367). Chaîne vide = il n'y a rien à ajouter.
+    ///
+    /// SQLite rend la chaîne vide : la restriction est déjà DANS la chaîne
+    /// passée au `MATCH` (filtre de colonnes FTS5, voir
+    /// [`format_fts_query_piste`]).
+    ///
+    /// Postgres n'a qu'un `tsvector` par piste, sans poids, et rien dans `@@`
+    /// ne sait viser une colonne. La restriction est donc recalculée à la
+    /// volée sur les seules colonnes voulues. Elle vient en ET du prédicat
+    /// indexé, jamais à sa place : c'est l'index GIN qui CHOISIT les lignes,
+    /// ce second prédicat ne fait que les filtrer.
+    ///
+    /// `alias_piste` et `alias_artiste` sont les alias de la requête
+    /// englobante (`t` et `ar` dans la recherche de pistes) ; le `LEFT JOIN`
+    /// sur les artistes existe déjà, cette méthode n'en demande aucun.
+    fn fts_piste_hors_album(
+        &self,
+        alias_piste: &str,
+        alias_artiste: &str,
+        query_placeholder: &str,
+    ) -> String;
 
     /// JSON path extraction (returns text).
     /// SQLite: `json_extract(<column>, '<path>')`
@@ -297,6 +365,11 @@ impl SqlDialect for SqliteDialect {
         )
     }
 
+    fn fts_piste_hors_album(&self, _piste: &str, _artiste: &str, _placeholder: &str) -> String {
+        // Rien ici : le filtre de colonnes voyage dans la chaîne du `MATCH`.
+        String::new()
+    }
+
     fn json_extract_text(&self, column: &str, path: &str) -> String {
         // Caller is responsible for passing a path that is already
         // single-quote-safe (we don't allow user input here in practice;
@@ -372,6 +445,27 @@ impl SqlDialect for PostgresDialect {
         // matching the behaviour of FTS5's `tokenize='unicode61
         // remove_diacritics 2'`.
         format!("{table_alias}.search_tsv @@ to_tsquery('simple', unaccent({query_placeholder}))")
+    }
+
+    fn fts_piste_hors_album(
+        &self,
+        alias_piste: &str,
+        alias_artiste: &str,
+        query_placeholder: &str,
+    ) -> String {
+        // Le MÊME vecteur que celui de `tracks_search_tsv_refresh`
+        // (migrations/postgres/002_fts_tsvector.sql), moins `album_title`.
+        // Recalculé, et non lu dans `search_tsv` : la colonne stockée n'a pas
+        // de poids, donc rien n'y distingue plus le titre de l'album du
+        // reste, et lui en donner exigerait de réécrire le tsvector de toutes
+        // les pistes de toutes les bases.
+        format!(
+            "(to_tsvector('simple', unaccent(COALESCE({alias_piste}.title, ''))) \
+             || to_tsvector('simple', unaccent(COALESCE({alias_artiste}.name, ''))) \
+             || to_tsvector('simple', unaccent(COALESCE({alias_piste}.genre, ''))) \
+             || to_tsvector('simple', unaccent(COALESCE({alias_piste}.composer, '')))) \
+             @@ to_tsquery('simple', unaccent({query_placeholder}))"
+        )
     }
 
     fn json_extract_text(&self, column: &str, path: &str) -> String {
