@@ -1,6 +1,6 @@
 # Tune audio plugin SDK 0.1 — native ABI 1
 
-Independent Cargo workspace. Plugins import SDK crates, never `tune-core` or `tune-server`. The four reference implementations are equalizer, crossfeed, converter and Dé-ploc. Tune's host adapters preserve existing HTTP screens, profiles, presets, audio producers and file codecs. The source-composed providers preserve upgrades; installing a signed native package overrides the corresponding provider at the next startup. This SDK does not replace Tune's WASM plugin system.
+Independent Cargo workspace. Use a separate `CARGO_TARGET_DIR` for this workspace and the host workspace; sharing their output directory can leave incompatible Rust metadata in cached artifacts. Plugins import SDK crates, never `tune-core` or `tune-server`. The four reference implementations are equalizer, crossfeed, converter and Dé-ploc. Tune's host adapters preserve existing HTTP screens, profiles, presets, audio producers and file codecs. The source-composed providers preserve upgrades; installing a signed native package overrides the corresponding provider at the next startup. This SDK does not replace Tune's WASM plugin system.
 
 ## Author workflow
 
