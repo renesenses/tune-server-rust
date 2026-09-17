@@ -1,0 +1,174 @@
+name: Moissonneur Roon
+
+# Construit `moissonneur-roon` (tools/moissonneur-roon, HORS workspace — il
+# garde son propre Cargo.lock) et attache ses archives à la release du tag.
+#
+# Il tourne à côté du Core Roon, pas de Tune : c'est un outil du testeur, pas
+# une pièce du serveur. D'où un workflow à part, qui ne touche ni au train
+# (`release.yml`) ni à ses gardes.
+#
+# La release du tag naît en BROUILLON dans `release.yml`, après ses builds
+# (~30 min). Ce workflow ne la crée jamais — un second `create` fabriquerait un
+# brouillon homonyme (vécu sur les images OS, v0.9.128) : il l'attend.
+#
+# Signature macOS : Developer ID + runtime durci + horodatage, avec les mêmes
+# secrets que l'archive `tune-server` de `release.yml`. Comme cette archive-là,
+# le binaire n'est PAS notarisé : un binaire nu téléchargé par un navigateur
+# garde l'attribut de quarantaine (`xattr -d com.apple.quarantine`, voir
+# docs/pont-roon.md).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag de la release où attacher les archives (vide = artefacts du run seulement)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: moissonneur-roon-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Moissonneur ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            platform: macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-14
+            platform: macos-x86_64
+          # musl : binaire statique, aucune dépendance glibc (NAS, vieilles distributions).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            platform: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            platform: linux-aarch64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30  # Moissonneur ${{ matrix.platform }} — ~1 min de compilation
+    env:
+      ARCHIVE: moissonneur-roon-${{ inputs.tag || github.ref_name }}-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+          rustflags: ""
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/moissonneur-roon
+          key: moissonneur-${{ matrix.target }}
+
+      - name: Outils musl
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --manifest-path tools/moissonneur-roon/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Import signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "No certificate, skipping"; exit 0; fi
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import /tmp/certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+          rm /tmp/certificate.p12
+
+      - name: Package
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          SORTIE=tools/moissonneur-roon/target/${{ matrix.target }}/release
+          mkdir -p package
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp "$SORTIE/moissonneur-roon.exe" package/
+            cp docs/pont-roon.md package/
+            7z a "$ARCHIVE.zip" ./package/*
+            echo "FICHIER=$ARCHIVE.zip" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          cp "$SORTIE/moissonneur-roon" package/
+          cp docs/pont-roon.md package/
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+            # Même reprise que release.yml : sans réponse du serveur
+            # d'horodatage, codesign rend 0 sans horodatage et --verify rejette.
+            ok=0
+            for i in 1 2 3 4 5; do
+              if codesign --force --options runtime --timestamp \
+                   --identifier fr.mozaiklabs.moissonneur-roon \
+                   --sign "$IDENTITY" package/moissonneur-roon \
+                 && codesign --verify --strict --verbose=2 package/moissonneur-roon; then
+                ok=1; break
+              fi
+              echo "::warning::codesign a echoue (essai $i/5) — nouvelle tentative dans $((i * 15)) s"
+              sleep $((i * 15))
+            done
+            [ "$ok" = 1 ] || { echo "::error::codesign a echoue 5 fois"; exit 1; }
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            echo "::warning::APPLE_TEAM_ID absent — binaire macOS signé ad hoc seulement."
+          fi
+          tar -czf "$ARCHIVE.tar.gz" -C package .
+          echo "FICHIER=$ARCHIVE.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.FICHIER }}
+          if-no-files-found: error
+
+  publish:
+    name: Attacher à la release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 120  # Attente du brouillon créé par release.yml (~30-60 min), puis <1 min d'envoi
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: moissonneur-roon-*
+          path: archives
+          merge-multiple: true
+      - name: Attendre la release du tag
+        run: |
+          for i in $(seq 1 100); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "release $TAG trouvée"; exit 0
+            fi
+            echo "release $TAG absente (essai $i/100) — nouvel essai dans 60 s"
+            sleep 60
+          done
+          echo "::error::release $TAG introuvable après 100 min — relancer ce workflow avec tag=$TAG"
+          exit 1
+      - name: Envoyer les archives
+        run: |
+          ls -l archives
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber archives/*
