@@ -3996,6 +3996,29 @@ pub fn decode_dsd_to_dop_streaming(
     data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
     rt: &tokio::runtime::Handle,
 ) -> Result<(u16, u32), String> {
+    decode_dsd_to_dop_streaming_with_timeout(
+        file_path,
+        ext,
+        tx,
+        chunk_size,
+        first_chunk_sent,
+        data_ready,
+        rt,
+        std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_dsd_to_dop_streaming_with_timeout(
+    file_path: &str,
+    ext: &str,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    rt: &tokio::runtime::Handle,
+    send_timeout: std::time::Duration,
+) -> Result<(u16, u32), String> {
     use super::dsd_to_dop::DsdToDoP;
 
     let (dsd_rate, channels) = if ext == "dsf" {
@@ -4011,62 +4034,36 @@ pub fn decode_dsd_to_dop_streaming(
     let mut pcm_buf: Vec<u8> = Vec::with_capacity(chunk_size * 2);
     let flush_len = frame_aligned_chunk_len(chunk_size, 24, channels as u16);
 
-    let mut process_chunk = |dsd_chunk: &[u8]| -> Result<bool, String> {
+    let mut process_chunk = |dsd_chunk: &[u8]| -> Result<(), String> {
         let dop_bytes = encoder.feed(dsd_chunk);
         if dop_bytes.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
         pcm_buf.extend_from_slice(&dop_bytes);
         while pcm_buf.len() >= flush_len {
             let chunk: Vec<u8> = pcm_buf.drain(..flush_len).collect();
-            match rt.block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
-                tx.send(chunk),
-            )) {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return Ok(true),
-                Err(_) => {
-                    tracing::warn!(
-                        timeout_secs = SEND_TIMEOUT_SECS,
-                        "dop_streaming_send_timeout"
-                    );
-                    return Ok(true);
-                }
-            }
-            if !*first_chunk_sent {
-                *first_chunk_sent = true;
-                if let Some(n) = data_ready {
-                    n.notify_one();
-                }
-            }
+            send_dop_chunk(&tx, chunk, first_chunk_sent, data_ready, rt, send_timeout)?;
         }
-        Ok(false)
+        Ok(())
     };
 
     if ext == "dsf" {
         let info = super::dsf::parse_dsf(file_path)?;
         let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
-            if process_chunk(&dsd_chunk)? {
-                return Ok((24, dop_rate));
-            }
+            process_chunk(&dsd_chunk)?;
         }
     } else {
         let info = super::dff::parse_dff(file_path)?;
         let read_chunk = 32768 / channels * channels;
         let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
         while let Some(dsd_chunk) = reader.next_chunk()? {
-            if process_chunk(&dsd_chunk)? {
-                return Ok((24, dop_rate));
-            }
+            process_chunk(&dsd_chunk)?;
         }
     }
 
     if !pcm_buf.is_empty() {
-        let _ = rt.block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(SEND_TIMEOUT_SECS),
-            tx.send(pcm_buf),
-        ));
+        send_dop_chunk(&tx, pcm_buf, first_chunk_sent, data_ready, rt, send_timeout)?;
     }
 
     debug!(
@@ -4075,6 +4072,44 @@ pub fn decode_dsd_to_dop_streaming(
     );
     Ok((24, dop_rate))
 }
+
+// Every DoP payload block, including a short first/final block, follows the
+// same completion contract. A closed receiver is an interrupted stream (also
+// possible during a requested Stop), never a successfully completed decode.
+fn send_dop_chunk(
+    tx: &mpsc::Sender<Vec<u8>>,
+    chunk: Vec<u8>,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    rt: &tokio::runtime::Handle,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    match rt.block_on(tokio::time::timeout(timeout, tx.send(chunk))) {
+        Ok(Ok(())) => {
+            if !*first_chunk_sent {
+                *first_chunk_sent = true;
+                if let Some(notify) = data_ready {
+                    notify.notify_one();
+                }
+            }
+            Ok(())
+        }
+        Ok(Err(_)) => {
+            Err("dop_stream_consumer_closed: output ended before decode completed".into())
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = timeout.as_secs(),
+                "dop_streaming_send_timeout"
+            );
+            Err("dop_stream_send_timeout: output did not accept the complete stream".into())
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "dop_terminal_tests_2369.rs"]
+mod dop_terminal_tests_2369;
 
 /// Decode a DSD file (DSF or DFF) to PCM using streaming converter.
 ///
