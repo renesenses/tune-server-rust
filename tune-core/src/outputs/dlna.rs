@@ -1181,9 +1181,24 @@ impl DlnaOutput {
                     last_was_timeout = e.is_timeout();
                     last_err = format!("soap send: {}", http_error::chain(&e));
                 }
+                // Erreur DÉFINITIVE : ni connexion, ni délai, ni coupure —
+                // typiquement un `builder error`, c'est-à-dire une URL que
+                // reqwest refuse d'analyser. #4379 : « invalid port number »
+                // sans dire de QUELLE URL, le signalement de Yves n'a donc
+                // rien pu trancher. L'URL rejetée part maintenant avec le
+                // motif, dans le journal ET dans le message rendu à
+                // l'orchestrateur, qui est celui qu'affiche l'interface.
                 Err(e) => {
+                    let motif = http_error::chain(&e);
+                    warn!(
+                        device = %self.name,
+                        action,
+                        url,
+                        error = %motif,
+                        "dlna_soap_erreur_definitive"
+                    );
                     return IssueSoap::Echec {
-                        message: format!("soap send: {}", http_error::chain(&e)),
+                        message: format!("soap send: {motif} (url={url})"),
                         timeout: false,
                         refus: false,
                         apres_reessais: false,
