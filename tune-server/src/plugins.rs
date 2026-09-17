@@ -91,6 +91,7 @@ fn plugins_data_root() -> std::path::PathBuf {
 /// the wiring site.
 #[allow(unused_variables)]
 async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
+    crate::premium_audio_plugins::register(loader, state).await;
     // P5 (#917): DJ mode, extracted from the always-on core into a native
     // in-tree plugin. Host services are passed explicitly at construction so
     // DJ's real dependency (the DB backend) is visible here at the wiring site.

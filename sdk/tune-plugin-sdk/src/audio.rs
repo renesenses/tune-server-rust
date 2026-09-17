@@ -3,6 +3,7 @@
 use crate::{Error, Settings};
 use serde::{Deserialize, Serialize};
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleEncoding {
@@ -13,6 +14,7 @@ pub enum SampleEncoding {
     F64,
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelLayout {
@@ -139,6 +141,7 @@ impl<'a> AudioBlock<'a> {
     }
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
@@ -147,6 +150,7 @@ pub enum SourceKind {
     Streaming,
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
@@ -169,6 +173,7 @@ pub struct PlaybackContext {
     pub protected_bitstream: bool,
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BypassReason {
@@ -199,6 +204,7 @@ pub fn policy_bypass(ctx: &PlaybackContext, licensed: bool) -> Option<BypassReas
     }
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetReason {
@@ -215,8 +221,20 @@ pub struct BlockContext {
     pub position_frames: u64,
 }
 
+/// Cumulative clipping measurements since stream preparation/reset. Peak bits
+/// carry IEEE-754 f64 without imposing a foreign floating-point ABI layout.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClippingStats {
+    pub samples_seen: u64,
+    pub clipped_samples: u64,
+    pub max_excess_lsb: u64,
+    pub max_peak_bits: u64,
+    pub first_clip: Option<u64>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessReport {
+    pub clipping: Option<ClippingStats>,
     pub changed: bool,
     pub clipped_samples: u64,
     pub non_finite_samples: u64,
@@ -232,12 +250,28 @@ pub struct DrainReport {
 /// on every block or every parameter update. Hot updates are prepared off the
 /// audio thread as a new processor and committed by a host with an explicit
 /// transition policy. There is no generic hot-swap promise in this version.
-pub trait Processor: Send {
+pub trait Processor: Send + std::any::Any {
     fn process(
         &mut self,
         block: &mut AudioBlock<'_>,
         context: BlockContext,
     ) -> Result<ProcessReport, Error>;
+    /// Control/producer-thread update with exclusive ownership. May allocate;
+    /// never call from a device callback. Failure preserves previous settings.
+    /// Implementations transfer filter/delay state when compatible.
+    fn update(&mut self, _settings: &Settings) -> Result<(), Error> {
+        Err(Error::CapabilityMissing)
+    }
+    /// Control-thread transfer between instances of the same implementation.
+    /// Refuse incompatible providers; never reinterpret an opaque foreign state.
+    fn inherit_from(&mut self, _previous: &dyn Processor) -> Result<(), Error> {
+        Err(Error::CapabilityMissing)
+    }
+    /// Control-thread diagnostics. Feature schemas define the fields; the PCM
+    /// callback uses ProcessReport and never serializes JSON.
+    fn diagnostics(&self) -> Settings {
+        Settings::Null
+    }
     fn reset(&mut self, reason: ResetReason);
     fn latency_frames(&self) -> u32;
     /// Output capacity is `block.frames()`. Only `frames_written` are valid.
@@ -261,6 +295,7 @@ pub trait DspFactory: Send + Sync {
 }
 
 /// Requested settings and effective audio state are deliberately separate.
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum ApplicationState {

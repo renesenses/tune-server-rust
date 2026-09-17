@@ -16,8 +16,11 @@ for row in matrix["requirements"]:
     assert row["id"] not in ids, f"duplicate requirement: {row['id']}"
     ids.add(row["id"])
     assert row["feature"] in matrix["features"]
-    assert row["production_status"] == "pending", "this first tranche cannot certify production migration"
+    assert row["production_status"] == "pending", "hardware/multiplatform acceptance must be recorded separately"
     assert row["sdk_status"] in {"contract_test", "planned"}
+    assert row["implementation"] in {"implemented", "preserved", "qualification"}
+    for path in row["implementation_files"]:
+        assert (root / path).is_file(), f"missing implementation: {path}"
     assert row["requirement"].strip()
     assert row["baseline_files"]
     for path in row["baseline_files"]:
@@ -27,7 +30,7 @@ for row in matrix["requirements"]:
     for witness in row["witnesses"]:
         path, name = witness.split("::")
         text = (root / path).read_text()
-        assert re.search(r"#\[test\]\s*fn\s+" + re.escape(name) + r"\s*\(", text), f"missing test: {witness}"
+        assert re.search(r"#\[(?:tokio::)?test(?:\([^]]*\))?\]\s*(?:async\s+)?fn\s+" + re.escape(name) + r"\s*\(", text), f"missing test: {witness}"
 
 for path, expected in matrix["baseline"]["files"].items():
     data = subprocess.check_output(["git", "show", f"{matrix['baseline']['server_sha']}:{path}"], cwd=root)

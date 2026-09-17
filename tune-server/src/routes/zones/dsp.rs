@@ -270,6 +270,13 @@ pub(super) async fn set_zone_dsp(
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
+    for (key, plugin) in [("eq_profile", "equalizer"), ("crossfeed", "crossfeed")] {
+        if body.get(key).is_some() {
+            if let Err(response) = crate::premium_audio_plugins::require_installed(&state, plugin) {
+                return response;
+            }
+        }
+    }
     // Handle eq_profile if present
     let mut eq_applique_a_chaud = false;
     if let Some(eq_val) = body.get("eq_profile") {
@@ -369,4 +376,50 @@ pub(super) async fn set_zone_dsp(
         "crossfeed_applied_live": cf_applique_a_chaud,
     }))
     .into_response()
+}
+
+/// Preview the selected provider's prepared coefficients. The caller specifies
+/// the intended rate; this endpoint never labels a preview as live measurement.
+#[derive(serde::Deserialize)]
+pub(super) struct EqResponseQuery {
+    sample_rate: Option<u32>,
+    channels: Option<u16>,
+}
+pub(super) async fn eq_response(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    axum::extract::Query(query): axum::extract::Query<EqResponseQuery>,
+) -> axum::response::Response {
+    let sample_rate = query.sample_rate.unwrap_or(44100);
+    let channels = query.channels.unwrap_or(2);
+    if !(8000..=768000).contains(&sample_rate) || !(1..=32).contains(&channels) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_format"})),
+        )
+            .into_response();
+    }
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let profile = settings
+        .get(&format!("zone_{id}_eq_profile"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match tokio::task::spawn_blocking(move || {
+        tune_core::audio::eq::EqProcessor::new(&profile, sample_rate, channels)
+            .response(sample_rate)
+    })
+    .await
+    {
+        Ok(response) => {
+            Json(json!({"zone_id":id,"configuration_preview":true,"response":response}))
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":"response_failed"})),
+        )
+            .into_response(),
+    }
 }

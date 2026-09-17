@@ -15,6 +15,7 @@ pub mod converter;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
+mod premium_audio_host;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
@@ -382,6 +383,7 @@ pub fn router_with_plugins(
         .nest("/mqa", mqa::router())
         .nest("/roon-bridge", roon_bridge::router())
         .nest("/connect", connect::router())
+        .nest("/audio-plugins", crate::native_audio::router())
         .nest("/converter", converter::router())
         .nest("/declick", declick::router())
         .nest("/shazam", shazam::router())

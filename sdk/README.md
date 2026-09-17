@@ -1,105 +1,70 @@
-# Tune plugin SDK — experimental 0.1
+# Tune premium audio SDK 0.1 — native ABI 1
 
-This workspace builds independently of `tune-core` and `tune-server`. It is the
-first deliverable of #4363, not the stable SDK or an installable premium plugin.
-The released server does not load these interfaces yet.
+Independent Cargo workspace. Plugins import SDK crates, never `tune-core` or `tune-server`. The four reference implementations are equalizer, crossfeed, converter and Dé-ploc. Tune's host adapters preserve existing HTTP screens, profiles, presets, audio producers and file codecs. The source-composed providers preserve upgrades; installing a signed native package overrides the corresponding provider at the next startup. This SDK does not replace Tune's WASM plugin system.
 
-Implemented here:
+## Author workflow
 
-- typed PCM blocks, source/output context, processing lifecycle, explicit bypass;
-- requested versus effective configuration states;
-- version and required/optional capability negotiation;
-- spectrum provenance, true frequency resolution and stale-generation filtering;
-- file-job service traits with scoped identifiers, streaming reads, seek,
-  codec discovery, progress, cancellation and artifact publication;
-- versioned UI message types (no UI runtime);
-- an offline PCM capture host and an in-memory batch host;
-- a CLI generating two external projects with executable conformance tests.
+```sh
+cargo install --path sdk/cargo-tune-plugin --locked
+cargo tune-plugin new equalizer --template equalizer --sdk-path /absolute/tune/sdk --output /new/plugin-directory
+cargo tune-plugin check /new/plugin-directory
+cargo tune-plugin test /new/plugin-directory
+cargo tune-plugin dev /new/plugin-directory --input input.wav --output new-output.wav --settings settings.json
+cargo tune-plugin pack /new/plugin-directory --target x86_64-unknown-linux-gnu --output equalizer.tuneplugin
+minisign -S -s /operator/private-key -m equalizer.tuneplugin
+```
 
-Not implemented: production host adapters, hot parameter transitions, the four
-premium algorithms/plugins, legacy API adapters, license integration, native
-ABI/loading, signing, installation, UI panels or codec/hardware acceptance.
-Required fields are not a promise that the production host implements them.
+Templates: `dsp` (minimal gain), `batch` (minimal PCM copy), `equalizer`, `crossfeed`, `converter`, `declick` (real implementation plus its conformance tests). Generated projects own their workspace and include native exports, schemas generated from Rust configuration/command/event/job types, a sandbox UI example, TypeScript declarations, translation resources, conformance fixtures, documentation and CI commands. `verify_schemas.py` rejects drift from compiled types. Schema documents describe structural JSON; factories and host services additionally enforce semantic ranges/permissions. Paths with spaces work. Existing projects/output captures/packages are never overwritten. For Tune's four slots use their canonical IDs. Other IDs are useful for development; the server rejects installation into an unrelated slot.
 
-## Build and generate a plugin
+`dev` runs the **actual locally built native library** on integer WAV 16/24/32. Batch development only advertises equal-format WAV; set `format: "wav"` for converter or `output_format: "wav"` for Dé-ploc. This host does not certify production resampling, tags or artwork. Production uses the original Tune codecs and metadata adapter. The independent testkit's `pcm-test` is a PCM capture sink, not an encoder.
 
-Rust 1.98 is the reference toolchain (matching the server build host). The
-reference validation uses the project's Shrek environment. Follow the parent
-`AGENTS.md` for `TUNE_TARGET_KEY`, capacity checks and remote target cleanup.
+Build a separate artifact for each exact target. No Rust ABI crosses the library boundary. See [ABI ownership and lifetime](tune-plugin-abi/SAFETY.md). A signature is mandatory for installation; development does not create a production key or change server trust.
+
+## Host services and contracts
+
+Run `cargo doc --manifest-path sdk/Cargo.toml --workspace --no-deps --locked` for the compiled public API. Source manifest SDK 0.x requires the exact minor version; the enclosing native package independently declares ABI 1 and target. Required capabilities are negotiated before activation.
+
+| Service | Contract |
+|---|---|
+| `DspFactory::assess` | Resolve PCM requirement/applicability before choosing passthrough. PURE, DSD/DoP and entitlement bypass are host policy. |
+| `prepare` | Actual encoding/rate/channels, bounded max frames, validated finite settings; allocate off the device callback. |
+| `Processor` | Complete interleaved frames; persistent filter/dither/ring history; process, update, inherit, reset, drain, latency and diagnostics. One instance per stream/format. |
+| DSP formats | SDK represents S16, packed little endian S24, S32, F32, F64. Reference DSP supports the first four, refuses F64; crossfeed requires stereo. No implicit integer bypass conversion. |
+| Observation | Host-owned source PCM/spectrum/VU, independent of premium installation. Authorized zones, bounded queue, generation/position filtering, drop counts, real frequency axes and FFT resolution. Unsupported post-DSP observation is refused. |
+| `BatchHost` | Authorized source resolution, source format, readers/seek, discovered codecs, renderer/resampler, temporary writers, metadata, progress/cancellation, atomic publication and abort. Handles belong to one job. |
+| Batch lifecycle | Preserve source and existing destination; cancel between blocks and before publication. External encoder calls may finish before cancellation is observed. Partial failures are explicit. Restarted jobs are reported interrupted and are not resumed. |
+| `ui/client.mjs` | Feature-scoped configuration, EQ presets/AutoEq/bands, prepared coefficient response, batch jobs and spectrum. Host injects authenticated requests and event subscription. No server credentials enter plugin UI. |
+| `ui/bridge.mjs` | Opaque sandbox iframe, dedicated MessagePort, allowlisted commands, source checks, 16 in-flight request cap, timeout and subscription cleanup. Context includes zone, theme and locale. Existing Tune screens continue to work. |
+
+EQ settings are the existing `EqProfile` (all macro fields plus optional bands), crossfeed uses `enabled/amount/delay_ms`. Converter and Dé-ploc settings are their public `Options` types. The factory validates before constructing state. Diagnostics expose the actual prepared coefficients/headroom and scalar clipping counters; a preview curve is explicitly distinct from a live spectrum or measured hardware response.
+
+Source-level `UiRequest` describes semantic version/session checks; the JS transport uses `{id, method, args}` on a private port established by protocol-1 handshake. It exposes no arbitrary route, SQL, filesystem, shell or HTML injection command. `client.d.ts` documents the JS surface. Browser routing/navigation remains owned by Tune; a plugin cannot choose a privileged parent route.
+
+## Installation and lifecycle
+
+Set `TUNE_AUDIO_PLUGINS_DIR`, or use `$TUNE_PLUGINS_DIR/audio` (default `plugins/audio`). Trust comes from `TUNE_AUDIO_PLUGIN_TRUST` (JSON array of minisign public-key base64 strings) or `TUNE_AUDIO_PLUGIN_PUBLIC_KEY`. There is no default key or unsigned installation switch.
+
+Authenticated admin API:
+
+- `GET /api/v1/audio-plugins/`: target, ABI, trust configuration, loaded providers and activation failures.
+- `POST /api/v1/audio-plugins/{id}/install`: ZIP body, `X-Tune-Plugin-Signature` carrying the detached signature with newlines encoded as literal `\n`. Requires the existing premium entitlement.
+- `POST /api/v1/audio-plugins/{id}/rollback`: verify the retained previous version, atomically switch next-startup activation.
+- `POST /api/v1/audio-plugins/{id}/uninstall` with `{"remove_native":true}`: disable the feature, deactivate the native version, preserve profiles/presets and retained versions.
+- `GET /api/v1/audio-plugins/{id}/assets/{name}`: only signed inventory-listed HTML/JS/CSS, with sandbox CSP. The host must use its authenticated asset delivery when mounting a UI; the existing Tune screens need no iframe.
+
+Installation verifies signature, target, ABI, SDK/capabilities, portable paths, file inventory and SHA-256 before extraction or execution. Libraries are verified again at startup. A corrupt installed provider is unavailable and does not silently fall back. Live instances pin their library until destruction. Replacing files cannot unload code in use. Activation is at restart; existing playback/jobs finish. The next activation checks installed/enabled state and current licence, with no network/licence checks per sample.
+
+The idempotent migration preserves `zone_*_eq_profile`, crossfeed settings and presets. Existing premium accounts retain the source-composed providers; new/free accounts see installable entries. A migration marker prevents resurrection after explicit uninstall. This transition intentionally keeps reference implementations in the server build: removal of that compatibility build is a separate release policy, not a promised binary secrecy boundary.
+
+## Qualification
 
 ```sh
 cargo test --manifest-path sdk/Cargo.toml --workspace --locked
-cargo install --path sdk/cargo-tune-plugin --locked
-cargo tune-plugin new my-gain --template dsp --sdk-path /path/to/tune/sdk --output /path/to/my-gain
-cargo tune-plugin check /path/to/my-gain
-cargo tune-plugin test /path/to/my-gain
+python sdk/scripts/verify_native.py
+python sdk/scripts/verify_dsp_parity.py
+python sdk/scripts/verify_scaffolding.py --binary /target/debug/cargo-tune-plugin
+node --test sdk/ui/client.test.mjs sdk/ui/bridge.test.mjs
+python sdk/scripts/verify_matrix.py
 ```
 
-The output directory must not exist. Existing files, empty directories and
-symlinks are refused. A failed filesystem write can leave a partial *new*
-directory; inspect it before removing it. The generator never overwrites a
-project. Paths containing spaces are supported; no shell interpolation is used.
-
-Use `--template batch` for a PCM copy tool. The batch example requests a codec
-by name; tests use `pcm-test`, a capture sink rather than a real encoder. Both
-projects declare their own `[workspace]` and use explicit SDK paths. No package
-is published yet. Pin this repository's revision when sharing a scaffold.
-
-There is deliberately no `pack`, `install` or `dsp-with-ui` command yet. The
-manifest only accepts `distribution: "source"`. Native binaries need a separate
-C-compatible ABI; these Rust traits must never cross a dynamic library boundary.
-
-## Read the contracts
-
-```sh
-cargo doc --manifest-path sdk/Cargo.toml --workspace --no-deps --locked
-```
-
-The API reference is generated from the actual public types and their Rustdoc,
-not a second manually transcribed signature list. Protocol 0.x requires an exact
-minor match; additive compatibility is not presumed during experimentation.
-
-| Module | Author's obligations |
-|---|---|
-| `audio` | Complete interleaved frames; actual format; one stateful processor per stream. No I/O, allocation, blocking or license check in `process`. Declare unsupported formats. Preparation happens off the audio thread. |
-| `observation` | Declare measurement point and provenance. A source probe cannot claim post-DSP measurement. Frequencies come from the analyzer; resolution uses real signal frames, not padded FFT length. |
-| `batch` | Use host-scoped handles; preserve sources; check cancellation between blocks; abort unpublished writers on failure. Codecs and output permissions come from the host. |
-| `manifest` | Request only required capabilities plus explicitly optional ones. Negotiation fails before setup on any missing required capability. |
-| `ui` | Typed messages only. Session matching is not authorization: the future host must validate the sender, zone access and capability grants. |
-
-`AudioBlock` supports signed 16/24/32-bit PCM, f32 and f64 without conversion.
-The generated gain supports f32 only and returns `UnsupportedFormat` otherwise.
-Discrete channels are not implicitly L/R pairs. `PcmReader` exposes interleaved
-right-justified integers at the reported bit depth; it reports **frames**, not
-samples. Float input must be rejected by that reader interface.
-
-Stateful DSP must survive arbitrary chunk boundaries. The host calls `reset`
-on a discontinuity, not each block. Gapless continuity versus reset and hot
-configuration transfer remain pending per-processor contracts; `AppliedLive`
-must never be reported just because settings were saved.
-
-Drain returns the count of valid output frames; zero capacity or infinite
-draining cannot silently pass conformance. The capture host limits drain calls
-and checks finite samples. It does not simulate a hardware deadline or guarantee
-that native code cannot panic, abort or corrupt memory.
-
-## Verify scaffolding, not just template syntax
-
-```sh
-cargo build --manifest-path sdk/Cargo.toml -p cargo-tune-plugin --locked
-python3 sdk/scripts/verify_scaffolding.py --binary sdk/target/debug/cargo-tune-plugin
-python3 sdk/scripts/verify_matrix.py
-```
-
-If `CARGO_TARGET_DIR` is configured, pass its actual binary path (append `.exe`
-on Windows). The script generates both projects in a temporary directory outside
-the workspace, checks dependencies, compiles and **runs** their tests, then
-exercises overwrite/path/version refusals. The temporary projects are removed.
-
-CI runs this workspace and the external projects on Linux, macOS and Windows in
-`plugin-sdk.yml`. The server's `cargo test` alone does not execute this separate
-workspace. None of these jobs is a hardware/audio-device acceptance test.
-
-The [migration plan](../docs/plugins/premium-sdk.md) and
-[parity matrix](../docs/plugins/premium-sdk-matrix.json) track the remaining
-production work. A passing SDK contract is not a passing row for Tune runtime.
+Run native verification before parity (it produces the four libraries). CI runs on Linux, macOS and Windows. Server tests additionally exercise actual FLAC/WAV, no-clobber publication, source preservation, handle isolation, migration combinations and spectrum delivery. The matrix separates code/contract coverage from runtime/hardware acceptance; neither a capture host nor cross compilation proves CoreAudio/WASAPI/network device behavior. SDK 0.1 remains experimental until that acceptance is recorded.

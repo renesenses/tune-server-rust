@@ -1,0 +1,61 @@
+{
+  "$defs": {
+    "ArtifactHandle": {
+      "type": "string"
+    },
+    "FileFailure": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceHandle"
+        }
+      },
+      "required": [
+        "source",
+        "code"
+      ],
+      "type": "object"
+    },
+    "JobState": {
+      "enum": [
+        "running",
+        "completed",
+        "partial",
+        "failed",
+        "cancelled",
+        "interrupted"
+      ],
+      "type": "string"
+    },
+    "SourceHandle": {
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/ArtifactHandle"
+      },
+      "type": "array"
+    },
+    "failures": {
+      "items": {
+        "$ref": "#/$defs/FileFailure"
+      },
+      "type": "array"
+    },
+    "state": {
+      "$ref": "#/$defs/JobState"
+    }
+  },
+  "required": [
+    "state",
+    "artifacts",
+    "failures"
+  ],
+  "title": "JobResult",
+  "type": "object"
+}

@@ -562,7 +562,23 @@ async fn levels_chain_emits_audio_levels_on_bus() {
             break;
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => n += 1,
+            Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => {
+                let data = &ev.data;
+                let _: tune_plugin_sdk::ui::AudioLevelsEvent = serde_json::from_value(data.clone())
+                    .expect("audio_levels no longer satisfies the SDK event contract");
+                assert!(
+                    data["spectrum"].as_array().is_some_and(|v| !v.is_empty()),
+                    "source spectrum vanished without premium plugins"
+                );
+                assert_eq!(
+                    data["spectrum"].as_array().unwrap().len(),
+                    data["spectrum_hz"].as_array().unwrap().len()
+                );
+                assert_eq!(data["observation_point"], "decoded_source");
+                assert_eq!(data["play_seq"], play_seq);
+                assert!(data["spectrum_resolution_hz"].as_f64().unwrap() > 0.0);
+                n += 1;
+            }
             Ok(Ok(_)) => {}
             _ => break,
         }

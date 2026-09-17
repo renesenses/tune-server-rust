@@ -281,6 +281,8 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "enabled": info.enabled,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            "premium": tune_core::audio::premium_plugins::contains(&info.name),
+            "activation_error": tune_plugin_native::failure(&info.name),
             "compatible": true,
         }));
     }
@@ -312,6 +314,8 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            "premium": tune_core::audio::premium_plugins::contains(&info.name),
+            "activation_error": tune_plugin_native::failure(&info.name),
             // 🔴 #3484 — le champ que la fiche wasm porte depuis toujours, et
             // que la fiche COMPILÉE n'a jamais porté (voir la boucle wasm plus
             // bas : `"restart_required": enabled && !loaded`). Un greffon
@@ -444,6 +448,8 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": info.enabled,
             "status": "loaded",
             "config_schema": info.config_schema,
+            "premium": tune_core::audio::premium_plugins::contains(&info.name),
+            "activation_error": tune_plugin_native::failure(&info.name),
             // Il TOURNE dans ce processus : il a franchi la porte d'ABI.
             "compatible": true,
         }));
@@ -539,12 +545,19 @@ fn greffon_charge(state: &AppState, name: &str) -> bool {
 /// tourne réellement. Réactiver un greffon déjà chargé, ou désactiver un
 /// greffon déjà absent, ne demande aucun redémarrage — et le prétendre
 /// enverrait couper la musique pour rien.
-async fn enable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
+async fn enable_plugin(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+        return response;
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
     let restart_required = !greffon_charge(&state, &name);
     Json(json!({ "name": name, "enabled": true, "restart_required": restart_required }))
+        .into_response()
 }
 
 /// Le pendant de [`enable_plugin`] : un greffon qui tourne continue de tourner
@@ -651,6 +664,9 @@ async fn install_plugin(
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
     }
+    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+        return response;
+    }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
@@ -670,6 +686,9 @@ async fn update_plugin(
     // would leave the hole open through the "Update" button.
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+        return response;
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());

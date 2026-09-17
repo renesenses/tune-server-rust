@@ -3,6 +3,7 @@
 use crate::{Error, audio::AudioFormat};
 use serde::{Deserialize, Serialize};
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationPoint {
@@ -12,6 +13,7 @@ pub enum ObservationPoint {
     PreOutput,
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
@@ -114,4 +116,18 @@ impl ObservationCursor {
         self.position_frames = stamp.position_frames;
         true
     }
+}
+
+/// Control-thread subscription to host-owned observations. The host scopes
+/// this service to the authorized zones. Only advertised observation points
+/// may be requested; a missing post-DSP tap must be refused explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SubscriptionId(pub u64);
+pub trait ObservationHost {
+    fn points(&self) -> &[ObservationPoint];
+    fn subscribe(&mut self, zone_id: i64, point: ObservationPoint)
+    -> Result<SubscriptionId, Error>;
+    /// Poll without waiting. Lag is reported in the next frame's stamp.
+    fn try_next(&mut self, subscription: SubscriptionId) -> Result<Option<SpectrumFrame>, Error>;
+    fn unsubscribe(&mut self, subscription: SubscriptionId);
 }

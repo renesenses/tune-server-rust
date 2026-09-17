@@ -9,6 +9,9 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import wave
+import struct
+import zipfile
 
 
 def run(*args, expected=0, quiet=False):
@@ -28,7 +31,7 @@ def main():
     binary, sdk = args.binary.resolve(), args.sdk.resolve()
     with tempfile.TemporaryDirectory(prefix="tune-sdk-conformance-") as scratch:
         root = Path(scratch)
-        for template in ("dsp", "batch"):
+        for template in ("dsp", "batch", "equalizer", "crossfeed", "converter", "declick"):
             project = root / f"external {template} plugin"
             command = (binary, "new", f"example-{template}", "--template", template, "--sdk-path", sdk, "--output", project)
             run(*command)
@@ -38,6 +41,29 @@ def main():
             deps = {d["name"] for package in metadata["packages"] for d in package["dependencies"]}
             assert not deps.intersection({"tune-core", "tune-server"}), "plugin must depend only on public SDK crates"
             run(binary, "test", project)
+            run("cargo", "build", "--manifest-path", project / "Cargo.toml", "--features", "native")
+            if template == "equalizer":
+                source=root/"input.wav"
+                with wave.open(str(source),"wb") as w:
+                    w.setparams((2,2,48000,1024,"NONE","not compressed"))
+                    w.writeframes(b"".join(struct.pack("<h", (i%99-49)*200) for i in range(2048)))
+                settings=root/"settings.json"
+                settings.write_text(json.dumps(dict(enabled=True,listening="headphones",room_size="medium",speaker_placement="free_standing",bass_gain_db=-6,mid_gain_db=0,treble_gain_db=0,bands=[])))
+                capture=root/"captured.wav"
+                run(binary,"dev",project,"--input",source,"--output",capture,"--settings",settings)
+                with wave.open(str(source),"rb") as a, wave.open(str(capture),"rb") as b:
+                    assert a.getparams()==b.getparams()
+                    assert a.readframes(1024)!=b.readframes(1024), "native CLI must process WAV samples"
+                run(binary,"dev",project,"--input",source,"--output",capture,"--settings",settings,expected=1)
+                target=next(line.split(": ",1)[1] for line in run("rustc","-vV",quiet=True).splitlines() if line.startswith("host: "))
+                package=root/"equalizer.tuneplugin"
+                run(binary,"pack",project,"--target",target,"--output",package)
+                with zipfile.ZipFile(package) as z:
+                    metadata=json.loads(z.read("package.json"))
+                    assert metadata["target"]==target and metadata["abi"]==1
+                    assert b"tune-plugin-ready" in z.read("ui/index.html")
+                    assert metadata["binary"] in z.namelist()
+
             before = (project / "src/lib.rs").read_bytes()
             run(*command, expected=1)
             assert (project / "src/lib.rs").read_bytes() == before, "scaffolding must not overwrite a project"
@@ -47,7 +73,7 @@ def main():
             run(binary, "check", project, expected=1)
         run(binary, "new", "../escape", "--template", "dsp", "--sdk-path", sdk, "--output", root / "escape", expected=1)
         assert not (root / "escape").exists()
-    print("External DSP and batch scaffolding verified; production host, codecs and UI are not exercised.")
+    print("External DSP and batch scaffolding verified; native exports, WAV dev capture and packaging verified; hardware and production UI acceptance are separate.")
 
 
 if __name__ == "__main__":

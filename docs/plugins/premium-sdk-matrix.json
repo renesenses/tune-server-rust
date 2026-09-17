@@ -42,7 +42,13 @@
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::no_invalid_format_or_partial_frame_reaches_a_processor",
         "sdk/tune-plugin-sdk/tests/contracts.rs::integer_bypass_requires_no_float_conversion"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.negotiation",
@@ -55,7 +61,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::missing_required_capability_is_rejected_before_setup"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.versions",
@@ -68,7 +80,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::experimental_minor_versions_are_not_assumed_binary_compatible"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.spectral-truth",
@@ -83,7 +101,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::spectrum_requires_real_axes_resolution_and_measurement_provenance"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.stale-observations",
@@ -97,7 +121,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::old_track_or_other_zone_observations_are_not_displayed"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.observation-without-plugin",
@@ -110,8 +140,16 @@
       "sdk_status": "contract_test",
       "production_status": "pending",
       "witnesses": [
-        "sdk/tune-plugin-testkit/tests/capture.rs::spectrum_queue_works_without_a_plugin_and_drops_oldest"
-      ]
+        "sdk/tune-plugin-testkit/tests/capture.rs::spectrum_queue_works_without_a_plugin_and_drops_oldest",
+        "tune-core/src/audio/sdk_observation.rs::premium_sdk_real_spectrum_without_plugins_refuses_fake_points_and_stale_epochs"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "tune-core/src/audio/sdk_observation.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.state-and-drain",
@@ -125,7 +163,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/tune-plugin-testkit/tests/capture.rs::state_survives_block_boundaries_and_tail_is_captured"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.pcm-processing",
@@ -139,7 +183,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/cargo-tune-plugin/templates/dsp_tests.rs::gain_reaches_captured_samples_across_block_sizes"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.bypass",
@@ -153,7 +203,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/cargo-tune-plugin/templates/dsp_tests.rs::bypass_preserves_original_bits"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.ui-session",
@@ -166,7 +222,13 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::ui_messages_are_versioned_scoped_and_reject_unknown_commands"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.production-paths",
@@ -182,7 +244,13 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.realtime",
@@ -198,7 +266,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "qualification",
+      "implementation_files": [
+        "sdk/tune-plugin-native/src/stage.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.hot-update",
@@ -214,7 +287,13 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.signal-path",
@@ -230,7 +309,13 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.legacy-clients",
@@ -246,7 +331,13 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.entitlements",
@@ -262,7 +353,13 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.migration",
@@ -276,9 +373,18 @@
         "tune-server/src/routes/zones/signal_path.rs",
         "tune-server/src/routes/marketplace.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "tune-core/src/audio/premium_plugins.rs::premium_sdk_all_sixteen_installation_combinations_and_idempotent_migration"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.installation",
@@ -292,9 +398,18 @@
         "tune-server/src/routes/zones/signal_path.rs",
         "tune-server/src/routes/marketplace.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "tune-core/src/audio/premium_plugins.rs::premium_sdk_all_sixteen_installation_combinations_and_idempotent_migration"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.native-abi",
@@ -308,9 +423,18 @@
         "tune-server/src/routes/zones/signal_path.rs",
         "tune-server/src/routes/marketplace.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "sdk/tune-plugin-native/tests/native.rs::native_dsp_processes_real_buffers_preserves_history_and_library_lifetime"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "sdk/tune-plugin-native/tests/native.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.signed-bundles",
@@ -324,9 +448,18 @@
         "tune-server/src/routes/zones/signal_path.rs",
         "tune-server/src/routes/marketplace.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "sdk/tune-plugin-native/tests/packages.rs::signed_install_update_rollback_and_tamper_refusal"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "sdk/tune-plugin-native/tests/packages.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "shared.ui-runtime",
@@ -342,7 +475,13 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.macro",
@@ -357,7 +496,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.graphic",
@@ -372,7 +516,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.parametric",
@@ -387,7 +536,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.headroom",
@@ -402,7 +556,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.autoeq",
@@ -417,7 +576,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.presets",
@@ -432,7 +596,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.response",
@@ -445,9 +614,17 @@
         "tune-server/src/routes/zones/dsp.rs",
         "tune-server/src/routes/zones/signal_path.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "sdk/tune-plugin-equalizer/tests/conformance.rs::response_uses_prepared_coefficients_and_matches_steady_sine"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs",
+        "sdk/tune-plugin-equalizer/tests/conformance.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "equalizer.parity",
@@ -462,7 +639,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "crossfeed.algorithm",
@@ -476,7 +658,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "crossfeed.applicability",
@@ -490,7 +677,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "crossfeed.live",
@@ -504,7 +696,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "crossfeed.parity",
@@ -518,7 +715,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.codec-capabilities",
@@ -532,7 +734,12 @@
       "witnesses": [
         "sdk/tune-plugin-sdk/tests/contracts.rs::codec_support_includes_quality_and_format_not_just_its_name",
         "sdk/cargo-tune-plugin/templates/batch_tests.rs::unavailable_codec_is_an_explicit_file_failure"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.sample-metadata-copy",
@@ -545,7 +752,12 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/cargo-tune-plugin/templates/batch_tests.rs::batch_preserves_pcm_metadata_and_source"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.cancellation",
@@ -558,7 +770,12 @@
       "production_status": "pending",
       "witnesses": [
         "sdk/cargo-tune-plugin/templates/batch_tests.rs::cancellation_inside_a_file_never_publishes_partial_output"
-      ]
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.sources",
@@ -569,7 +786,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.real-codecs",
@@ -578,9 +800,17 @@
       "baseline_files": [
         "tune-server/src/routes/converter.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "tune-server/src/routes/premium_audio_host.rs::premium_sdk_real_flac_roundtrip_and_no_clobber"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs",
+        "tune-server/src/routes/premium_audio_host.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.delivery",
@@ -589,9 +819,17 @@
       "baseline_files": [
         "tune-server/src/routes/converter.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "tune-server/src/routes/premium_audio_host.rs::premium_sdk_real_flac_roundtrip_and_no_clobber"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs",
+        "tune-server/src/routes/premium_audio_host.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "converter.progress",
@@ -602,7 +840,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "declick.trim",
@@ -613,7 +856,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "declick.zero-cross",
@@ -624,7 +872,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "declick.defaults",
@@ -635,7 +888,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "declick.lossless",
@@ -644,9 +902,17 @@
       "baseline_files": [
         "tune-server/src/routes/declick.rs"
       ],
-      "sdk_status": "planned",
+      "sdk_status": "contract_test",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [
+        "tune-server/src/routes/premium_audio_host.rs::premium_sdk_real_declick_and_cancelled_output"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs",
+        "tune-server/src/routes/premium_audio_host.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     },
     {
       "id": "declick.jobs",
@@ -657,7 +923,12 @@
       ],
       "sdk_status": "planned",
       "production_status": "pending",
-      "witnesses": []
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
     }
   ]
 }

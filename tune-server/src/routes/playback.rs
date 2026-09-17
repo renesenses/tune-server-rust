@@ -3892,6 +3892,10 @@ async fn set_eq(
         return resp;
     }
 
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return response;
+    }
+
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let key = format!("zone_{zone_id}_eq_profile");
     let mut profile: tune_core::audio::eq::EqProfile = settings

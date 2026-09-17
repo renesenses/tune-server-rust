@@ -6,6 +6,11 @@ license.workspace = true
 autotests = false
 
 [dependencies]
+tune-plugin-native = { path = "../sdk/tune-plugin-native" }
+tune-plugin-sdk = { path = "../sdk/tune-plugin-sdk" }
+tune-plugin-audio-support = { path = "../sdk/tune-plugin-audio-support" }
+tune-plugin-equalizer = { path = "../sdk/tune-plugin-equalizer" }
+tune-plugin-crossfeed = { path = "../sdk/tune-plugin-crossfeed" }
 # Temporary streaming downloads must be removed on cancellation (#4234).
 tempfile = "3"
 tune-output-api = { path = "../tune-output-api" }

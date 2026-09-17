@@ -1,4 +1,5 @@
 [package]
+workspace = ".."
 name = "cargo-tune-plugin"
 version.workspace = true
 edition.workspace = true
@@ -10,3 +11,6 @@ description = "Scaffold external plugins against Tune's experimental SDK"
 [dependencies]
 tune-plugin-sdk.workspace = true
 serde_json.workspace = true
+tune-plugin-native = {path = "../tune-plugin-native"}
+tune-plugin-testkit.workspace = true
+hound = "3.5"

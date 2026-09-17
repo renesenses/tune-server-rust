@@ -1,4 +1,5 @@
 [package]
+workspace = ".."
 name = "tune-plugin-sdk"
 version.workspace = true
 edition.workspace = true
@@ -8,5 +9,13 @@ publish.workspace = true
 description = "Experimental typed contracts for Tune audio and batch plugins"
 
 [dependencies]
+schemars = { version = "1", optional = true }
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+schemas = ["dep:schemars"]
+
+[[example]]
+name = "schema"
+required-features = ["schemas"]

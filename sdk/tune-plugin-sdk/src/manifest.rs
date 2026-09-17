@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
@@ -21,6 +22,7 @@ impl Version {
     }
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginKind {
@@ -28,6 +30,7 @@ pub enum PluginKind {
     Batch,
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityRequest {
@@ -36,6 +39,7 @@ pub struct CapabilityRequest {
     pub required: bool,
 }
 
+#[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -46,7 +50,8 @@ pub struct Manifest {
     pub capabilities: Vec<CapabilityRequest>,
     /// Entitlement identifier; the host maps it to existing subscription tiers.
     pub entitlement: String,
-    /// Only source composition is supported by this experimental scaffold.
+    /// Implementation composition; native packages wrap this source manifest
+    /// with a separately versioned ABI and target envelope.
     pub distribution: String,
 }
 
@@ -117,4 +122,24 @@ impl Manifest {
         }
         Ok(granted)
     }
+}
+
+/// Versioned services implemented by Tune's premium audio host adapters.
+/// This inventory is shared by author checks, signed-package validation and
+/// startup negotiation. A new service also needs an adapter and matrix witness.
+pub fn reference_host_capabilities() -> BTreeMap<String, Version> {
+    [
+        "audio-process",
+        "audio-live-update",
+        "zone-settings",
+        "audio-observation",
+        "file-jobs",
+        "audio-codecs",
+        "metadata-copy",
+        "atomic-artifacts",
+        "cancellation",
+    ]
+    .into_iter()
+    .map(|id| (id.to_string(), SDK_VERSION))
+    .collect()
 }

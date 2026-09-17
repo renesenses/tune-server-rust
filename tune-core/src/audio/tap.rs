@@ -90,6 +90,8 @@ pub struct PcmTapFrame {
     /// `play_seq` no longer matches the current track (avoids two successive
     /// tracks emitting in parallel).
     pub play_seq: u64,
+    /// Analysis epoch, incremented when a track/seek supersedes a forwarder.
+    pub generation: u64,
 }
 
 /// The per-zone broadcast endpoint. Held by `Playback`; fans out to the core
@@ -125,11 +127,22 @@ impl ZoneTap {
 
     /// A publisher for one track playthrough, handed to the decoder.
     pub fn publisher(&self, zone_id: i64, format: PcmFormat, play_seq: u64) -> PcmPublisher {
+        self.publisher_for_epoch(zone_id, format, play_seq, 0)
+    }
+    /// Explicit seek/track observation epoch; it is not the play sequence.
+    pub fn publisher_for_epoch(
+        &self,
+        zone_id: i64,
+        format: PcmFormat,
+        play_seq: u64,
+        generation: u64,
+    ) -> PcmPublisher {
         PcmPublisher {
             sender: self.sender.clone(),
             zone_id,
             format,
             play_seq,
+            generation,
             position: Duration::ZERO,
         }
     }
@@ -144,6 +157,7 @@ pub struct PcmPublisher {
     zone_id: i64,
     format: PcmFormat,
     play_seq: u64,
+    generation: u64,
     position: Duration,
 }
 
@@ -174,6 +188,7 @@ impl PcmPublisher {
                     track_position: self.position,
                     window,
                     play_seq: self.play_seq,
+                    generation: self.generation,
                 });
             }
             self.position += window;
@@ -340,6 +355,7 @@ mod tests {
             track_position: Duration::ZERO,
             window: Duration::from_millis(40),
             play_seq: 0,
+            generation: 0,
         });
     }
 }

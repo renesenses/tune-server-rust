@@ -424,6 +424,15 @@ impl LicenseManager {
         self.tier().await == Tier::Premium
     }
 
+    /// Control-plane snapshot for synchronous DSP preparation. No network or
+    /// blocking lock. Existing processors/jobs finish; new preparation fails
+    /// closed if the licence is expired or a concurrent update holds the lock.
+    pub fn premium_snapshot(&self) -> bool {
+        self.state
+            .try_read()
+            .is_ok_and(|state| effective_tier(&state) == Tier::Premium)
+    }
+
     /// Check whether a specific feature is enabled. All premium features require
     /// the effective Premium tier (license key or account premium).
     pub async fn check_feature(&self, _feature: Feature) -> bool {

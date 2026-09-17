@@ -100,6 +100,7 @@ struct JobError {
 }
 
 struct ConvertJob {
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
     status: JobStatus,
     total: usize,
     completed: usize,
@@ -256,7 +257,7 @@ fn racines_d_ecriture(state: &AppState) -> Vec<String> {
 
 /// The payload behind `GET /capabilities`, split out so the contract can be
 /// asserted without going through an HTTP response body.
-async fn capabilities_payload(racines: &[String]) -> Value {
+pub(super) async fn capabilities_payload(racines: &[String]) -> Value {
     let ffmpeg = resolve_tool("ffmpeg");
     let lame = resolve_tool("lame");
     let encoders = match &ffmpeg {
@@ -335,6 +336,9 @@ async fn start_job(
     admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "converter") {
+        return Ok(response);
+    }
     // Premium gate: batch converter requires Premium
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
@@ -446,6 +450,7 @@ async fn start_job(
     }
 
     let job = Arc::new(Mutex::new(ConvertJob {
+        cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         status: JobStatus::Running,
         total,
         completed: 0,
@@ -456,6 +461,8 @@ async fn start_job(
         destination_serveur,
     }));
 
+    crate::audio_job_journal::write("converter", &job_id, "running", total, 0)
+        .map_err(AppError::internal)?;
     let store = job_store();
     {
         let mut map = store.lock().await;
@@ -469,6 +476,7 @@ async fn start_job(
     let target_sr = body.sample_rate;
     let target_bd = body.bit_depth;
 
+    let journal_job = job.clone();
     tokio::spawn(async move {
         run_conversion(
             job,
@@ -481,6 +489,14 @@ async fn start_job(
             destination_serveur,
         )
         .await;
+        let final_job = journal_job.lock().await;
+        if let Err(error) = crate::audio_job_journal::write_result(
+            "converter",
+            &jid,
+            &payload_statut(&jid, &final_job),
+        ) {
+            tracing::error!(%error, "audio_job_status_not_persisted");
+        }
         info!(job_id = %jid, "converter_job_finished");
     });
 
@@ -660,6 +676,11 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
 async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, AppError> {
     let store = job_store();
     let map = store.lock().await;
+    if !map.contains_key(&job_id) {
+        if let Some(status) = crate::audio_job_journal::recovered("converter", &job_id) {
+            return Ok(Json(status));
+        }
+    }
     let job_arc = map
         .get(&job_id)
         .ok_or_else(|| AppError::not_found(format!("job not found: {job_id}")))?
@@ -815,13 +836,17 @@ async fn cancel_job(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, A
     {
         let mut job = job_arc.lock().await;
         if job.status == JobStatus::Running {
+            job.cancellation
+                .store(true, std::sync::atomic::Ordering::Release);
             job.status = JobStatus::Cancelled;
         }
         // Clean up output directory
-        let dir = job.output_dir.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_dir_all(&dir).await;
-        });
+        if !job.destination_serveur {
+            let dir = job.output_dir.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+            });
+        }
     }
 
     map.remove(&job_id);
@@ -901,19 +926,19 @@ async fn run_conversion(
             continue;
         }
 
-        match convert_single_file(file_path, &out_path, format, quality, target_sr, target_bd).await
+        let cancellation = job.lock().await.cancellation.clone();
+        match convert_single_file(
+            file_path,
+            &out_path,
+            format,
+            quality,
+            target_sr,
+            target_bd,
+            cancellation,
+        )
+        .await
         {
             Ok(()) => {
-                // Copy tags from source to output
-                if let Err(e) = copy_tags(file_path, &out_path) {
-                    warn!(
-                        src = %file_path.display(),
-                        dst = %out_path.display(),
-                        error = %e,
-                        "converter_copy_tags_failed"
-                    );
-                }
-
                 // Taille du fichier qu'on vient d'écrire : elle alimente le
                 // « (ZIP, …) » du bouton de téléchargement (#3002). Un
                 // `metadata` illisible ne doit rien casser — on compte 0 et on
@@ -959,6 +984,32 @@ async fn run_conversion(
 // ---------------------------------------------------------------------------
 
 async fn convert_single_file(
+    input: &Path,
+    output: &Path,
+    format: &str,
+    quality: Option<&str>,
+    target_sr: Option<u32>,
+    target_bd: Option<u16>,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let input = input.to_path_buf();
+    let output = output.to_path_buf();
+    let options = json!({"format": format, "quality": quality, "sample_rate": target_sr, "bit_depth": target_bd});
+    tokio::task::spawn_blocking(move || {
+        super::premium_audio_host::run_installed(
+            "converter",
+            &tune_plugin_converter::Converter,
+            &input,
+            &output,
+            &options,
+            cancellation,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+pub(super) async fn encode_source(
     input: &Path,
     output: &Path,
     format: &str,
@@ -1196,7 +1247,7 @@ fn encode_opus_native(input: &str, output: &Path, quality: Option<&str>) -> Resu
 }
 
 /// Encode PCM bytes to WAV using the existing AudioEncoder from tune-core.
-fn encode_wav(
+pub(super) fn encode_wav(
     pcm: &[u8],
     sample_rate: u32,
     bit_depth: u32,
@@ -1213,7 +1264,7 @@ fn encode_wav(
 }
 
 /// Encode PCM bytes to FLAC using the existing native encoder from tune-core.
-fn encode_flac(
+pub(super) fn encode_flac(
     pcm: &[u8],
     sample_rate: u32,
     bit_depth: u32,
@@ -1233,7 +1284,7 @@ fn encode_flac(
 }
 
 /// Convert i32 samples from one bit depth to another, returning PCM bytes.
-fn convert_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<u8> {
+pub(super) fn convert_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<u8> {
     let bytes_per_sample = ((to_bd as usize) + 7) / 8;
     let mut output = Vec::with_capacity(samples.len() * bytes_per_sample);
 
@@ -1472,7 +1523,7 @@ async fn run_command(program: &Path, args: &[String]) -> Result<(), String> {
     }
 }
 
-fn output_extension(format: &str) -> &str {
+pub(super) fn output_extension(format: &str) -> &str {
     match format {
         "flac" => "flac",
         "wav" => "wav",
@@ -1524,7 +1575,7 @@ fn convertible_input(path: &str) -> bool {
 /// sinon (WMA/ASF) via le ffmpeg résolu. `target_sr` n'est honoré que par
 /// les décodeurs natifs qui le supportent — les appelants rééchantillonnent
 /// de toute façon quand `decoded.sample_rate` ne correspond pas.
-fn decode_for_convert(
+pub(super) fn decode_for_convert(
     input: &str,
     target_sr: Option<u32>,
 ) -> Result<tune_core::audio::decode::DecodedAudio, String> {
@@ -1621,7 +1672,7 @@ fn parse_ffmpeg_audio_banner(stderr: &str) -> Option<(u32, u32)> {
 }
 
 /// Copy metadata tags from source to destination using lofty.
-fn copy_tags(source: &Path, dest: &Path) -> Result<(), String> {
+pub(super) fn copy_tags(source: &Path, dest: &Path) -> Result<(), String> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::{Accessor, ItemKey, TagExt};
 
@@ -1953,6 +2004,7 @@ mod tests {
 
     fn job_temoin(status: JobStatus, completed: usize) -> ConvertJob {
         ConvertJob {
+            cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status,
             total: 4,
             completed,

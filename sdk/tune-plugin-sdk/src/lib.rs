@@ -32,6 +32,7 @@ pub enum Error {
     BlockTooLarge,
     UnsupportedFormat,
     InvalidSettings,
+    SilenceOnly,
     NonFinite,
     Cancelled,
     CapabilityMissing,
