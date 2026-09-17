@@ -38,7 +38,8 @@ from pathlib import Path
 # caractères : `${encodeURIComponent(id)}` contient des parenthèses, et les
 # exclure tronquait la route en plein milieu — 27 entrées sur 198 étaient
 # amputées avant ce correctif. La normalisation vient après, sur la chaîne
-# complète.
+# complète. La fin du motif ne fait pas foi : url_complete relit la chaîne
+# pour distinguer son délimiteur des gabarits imbriqués (#1897).
 MOTIF_APPEL = re.compile(
     # Ne jamais franchir un second `fetchJSON<`. Sans cette borne, la
     # déclaration `async function fetchJSON<T>(url: string)` peut commencer un
@@ -199,48 +200,140 @@ def dictionnaire_des_types(sources: dict[str, str]) -> dict[str, dict]:
     return types
 
 
-def normaliser_route(route: str) -> str:
-    """`/zones/${id}/dsp?x=1` → `/zones/{}/dsp` — la forme, pas les valeurs.
+def fin_chaine_js(texte: str, debut: int, niveau: int = 0) -> int | None:
+    """Position après le délimiteur final, en sautant les gabarits imbriqués.
 
-    Les interpolations sont remplacées d'abord : une route comme
-    `/devices/${encodeURIComponent(id)}?x=1` doit devenir `/devices/{}`, et
-    couper sur `?` avant de les réduire mutilerait celles qui en contiennent.
+    Petit lecteur lexical, sans évaluation de JavaScript. Une forme tronquée,
+    une expression régulière ou une imbrication excessive reste non résolue.
     """
-    # Remplacement à accolades ÉQUILIBRÉES : une interpolation peut en
-    # contenir une autre (`${qs ? `?${qs}` : ""}`), et une expression régulière
-    # simple s'arrête à la première fermante — produisant une route fausse.
+    if niveau > 64 or debut >= len(texte) or texte[debut] not in "'\"`":
+        return None
+    delim, i = texte[debut], debut + 1
+    while i < len(texte):
+        if texte[i] == "\\":
+            i += 2
+        elif texte[i] == delim:
+            return i + 1
+        elif delim == "`" and texte.startswith("${", i):
+            fin = fin_expression_js(texte, i + 1, niveau + 1)
+            if fin is None:
+                return None
+            i = fin
+        else:
+            i += 1
+    return None
+
+
+def fin_expression_js(texte: str, debut: int, niveau: int = 0) -> int | None:
+    """Saute un bloc {…}, chaînes et commentaires compris."""
+    profondeur, i = 1, debut + 1
+    while i < len(texte):
+        if texte[i] in "'\"`":
+            fin = fin_chaine_js(texte, i, niveau + 1)
+            if fin is None:
+                return None
+            i = fin
+        elif texte.startswith("//", i):
+            fin = texte.find("\n", i + 2)
+            if fin < 0:
+                return None
+            i = fin + 1
+        elif texte.startswith("/*", i):
+            fin = texte.find("*/", i + 2)
+            if fin < 0:
+                return None
+            i = fin + 2
+        elif texte[i] == "/":
+            # Distinguer division et regexp demanderait le parseur JS.
+            return None
+        elif texte[i] == "{":
+            profondeur += 1
+            i += 1
+        elif texte[i] == "}":
+            profondeur -= 1
+            i += 1
+            if profondeur == 0:
+                return i
+        else:
+            i += 1
+    return None
+
+
+def url_complete(source: str, appel: re.Match) -> tuple[str, int] | None:
+    """Le motif trouve le début ; seul le lecteur lexical trouve la fin."""
+    debut = appel.start("q")
+    fin = fin_chaine_js(source, debut)
+    if fin is None:
+        return None
+    valeur = source[debut + 1:fin - 1]
+    if not valeur.startswith("${BASE}"):
+        return None
+    return valeur[len("${BASE}"):], fin
+
+
+def suffixe_requete_conditionnel(expression: str) -> bool:
+    """Reconnaît deux branches littérales : chaîne vide ou commençant par ?.
+
+    On ne déduit jamais la valeur d'une variable ou d'un appel. Cette forme
+    couvre le suffixe de getAlbumTracks, pas une expression JS arbitraire.
+    """
+    condition = re.match(r"[^?'\"`]+\?\s*", expression.strip())
+    if condition is None:
+        return False
+    reste = expression.strip()[condition.end():]
+    branches = []
+    for numero in range(2):
+        fin = fin_chaine_js(reste, 0)
+        if fin is None:
+            return False
+        branches.append(reste[1:fin - 1])
+        reste = reste[fin:].strip()
+        if reste.startswith("+"):
+            # '?' + qs : préfixe de requête certain, sans lire la valeur de qs.
+            concat = re.match(r"\+\s*[A-Za-z_$][\w$]*", reste)
+            if concat is None or not branches[-1].startswith("?"):
+                return False
+            reste = reste[concat.end():].strip()
+        if numero == 0:
+            if not reste.startswith(":"):
+                return False
+            reste = reste[1:].strip()
+    return (not reste and any(b.startswith("?") for b in branches)
+            and all(not b or b.startswith("?") for b in branches))
+
+
+def normaliser_route(route: str) -> str:
+    """Réduit les paramètres du chemin, puis retire la requête hors expression."""
     sortie, i = [], 0
     while i < len(route):
+        if route[i] == "?":
+            break
         if route.startswith("${", i):
-            profondeur, j = 0, i + 1
-            while j < len(route):
-                if route[j] == "{":
-                    profondeur += 1
-                elif route[j] == "}":
-                    profondeur -= 1
-                    if profondeur == 0:
-                        break
-                j += 1
-            if j >= len(route):
-                return ""  # interpolation non fermée : route indigne de confiance
+            fin = fin_expression_js(route, i + 1)
+            if fin is None:
+                return ""
+            expression = route[i + 2:fin - 1]
+            if fin == len(route) and suffixe_requete_conditionnel(expression):
+                break
+            if i > 0 and route[i - 1] != "/" and "?" in expression:
+                return ""  # suffixe conditionnel pouvant changer le chemin
             sortie.append("{}")
-            i = j + 1
-            continue
-        sortie.append(route[i])
-        i += 1
-    route = "".join(sortie).split("?")[0]
-    route = re.sub(r"\{\}+", "{}", route)
-    return route.rstrip("/") or "/"
+            i = fin
+        else:
+            sortie.append(route[i])
+            i += 1
+    forme = re.sub(r"\{\}+", "{}", "".join(sortie))
+    return forme.rstrip("/") or "/"
 
 
-def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool]]:
-    """La seconde forme d'appel : `(route brute, méthode, corps du type, liste)`.
+def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool, bool]]:
+    """La seconde forme d'appel : `(route brute, méthode, corps du type, liste, URL valide)`.
 
     Voir `MOTIF_RETOUR_PROMESSE`. On ne retient que les appels **non typés** :
     une fonction peut parfaitement annoncer son retour ET écrire
     `fetchJSON<T>(…)`, auquel cas `MOTIF_APPEL` la cartographie déjà.
     """
-    trouves: list[tuple[str, str, str, bool]] = []
+    trouves: list[tuple[str, str, str, bool, bool]] = []
     for m in MOTIF_RETOUR_PROMESSE.finditer(api_ts):
         debut = m.end() - 1  # l'accolade ouvrante du type en ligne
         corps = corps_apres_accolade(api_ts, debut)
@@ -261,13 +354,16 @@ def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool]]:
 
         # La méthode vit dans les options, juste après l'URL — même fenêtre
         # bornée que pour la forme typée.
-        suite = apres[m_appel.end() : m_appel.end() + 400]
+        url = url_complete(apres, m_appel)
+        route, fin_url = url if url is not None else (m_appel.group("route"), m_appel.end())
+        suite = apres[fin_url : fin_url + 400]
         m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
         trouves.append((
-            m_appel.group("route"),
+            route,
             m_meth.group(1).upper() if m_meth else "GET",
             corps,
             bool(m.group("liste")),
+            url is not None,
         ))
     return trouves
 
@@ -285,17 +381,19 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
         # reproche à la réponse du GET les champs que le POST renvoie.
         # Fenêtre bornée, arrêtée au prochain appel pour ne pas lui voler sa
         # méthode.
-        suite = api_ts[m.end(): m.end() + 400]
+        url = url_complete(api_ts, m)
+        route_brute, fin_url = url if url is not None else (m.group("route"), m.end())
+        suite = api_ts[fin_url: fin_url + 400]
         coupe = suite.find("fetchJSON")
         if coupe != -1:
             suite = suite[:coupe]
         m_meth = re.search(r"method:\s*['\"`](GET|POST|PUT|PATCH|DELETE)['\"`]", suite, re.I)
         methode = m_meth.group(1).upper() if m_meth else "GET"
-        route = normaliser_route(m.group("route"))
+        route = normaliser_route(route_brute) if url is not None else ""
         if not route:
             non_resolus.append({
-                "route": m.group("route")[:60], "type": brut,
-                "raison": "interpolation non fermée — route non fiable",
+                "route": route_brute[:60], "type": brut,
+                "raison": "URL ou interpolation illisible — route non fiable",
             })
             continue
         nu = brut.removesuffix("[]").strip()
@@ -337,12 +435,12 @@ def carte(sources: dict[str, str], api_ts: str) -> tuple[list[dict], list[dict]]
         })
 
     # Seconde forme : le type est sur l'annotation de retour (#3002).
-    for route_brute, methode, corps, liste in appels_types_par_le_retour(api_ts):
-        route = normaliser_route(route_brute)
+    for route_brute, methode, corps, liste, url_valide in appels_types_par_le_retour(api_ts):
+        route = normaliser_route(route_brute) if url_valide else ""
         if not route:
             non_resolus.append({
                 "route": route_brute[:60], "type": "(retour de fonction)",
-                "raison": "interpolation non fermée — route non fiable",
+                "raison": "URL ou interpolation illisible — route non fiable",
             })
             continue
         obligatoires, optionnels = champs_du_bloc(corps)
@@ -527,7 +625,14 @@ def main() -> int:
     args = ap.parse_args()
 
     if args.self_test:
-        return self_test()
+        resultat = self_test()
+        if resultat:
+            return resultat
+        import subprocess
+        return subprocess.run([
+            sys.executable,
+            str(Path(__file__).resolve().parent / "tests/test_web_contract_urls_1897.py"),
+        ], check=False).returncode
     if not args.web:
         print("--web est requis (ou --self-test)", file=sys.stderr)
         return 2
