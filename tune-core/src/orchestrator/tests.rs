@@ -2432,16 +2432,56 @@ fn send_to_output_branche_le_gain_avant_de_jouer() {
         !corps.contains("pub(super) async fn brancher_le_gain_de_sortie"),
         "la tranche a avalé la définition : elle se satisferait elle-même"
     );
+    assert_eq!(
+        corps
+            .matches("self.brancher_le_gain_de_sortie(zone_id, device_id)")
+            .count(),
+        2,
+        "`send_to_output` doit brancher le gain sur SES DEUX chemins — la \
+         sortie déjà enregistrée, et celle que `recreate_local_and_play` vient \
+         de faire naître. Sinon la mesure retombe au niveau du FICHIER (#4384)."
+    );
+
+    // Et le helper doit LÂCHER une zone qui n'est pas sur une sortie locale
+    // vivante, sinon un rendu réseau hériterait du volume d'un ancien DAC.
+    // La tranche s'arrête au premier `\n    }` qui ferme la fonction.
+    let debut_helper = TRANSPORT
+        .find("    pub(super) async fn brancher_le_gain_de_sortie(")
+        .expect("`brancher_le_gain_de_sortie` a été renommée");
+    let fin_helper = TRANSPORT[debut_helper..]
+        .find("\n    }\n")
+        .expect("corps du helper introuvable");
+    let helper = &TRANSPORT[debut_helper..debut_helper + fin_helper];
     assert!(
-        corps.contains("self.brancher_le_gain_de_sortie(zone_id, device_id).await"),
-        "`send_to_output` ne branche plus le gain de la sortie sur le \
-         crête-mètre : la mesure retombe au niveau du FICHIER (#4384)."
+        helper.contains("self.playback.debrancher_le_gain_de_sortie(zone_id);"),
+        "le branchement ne débranche plus les sorties non locales (#4384)"
+    );
+    // Ce débranchement doit être le chemin de REPLI, donc HORS du bloc
+    // `#[cfg(feature = \"local-audio\")]` : une compilation sans la feature
+    // n'a aucune sortie locale et doit tout de même lâcher la zone.
+    let cfg = helper
+        .find("#[cfg(feature = \"local-audio\")]")
+        .expect("le bloc local-audio du helper a disparu");
+    let repli = helper
+        .find("self.playback.debrancher_le_gain_de_sortie(zone_id);")
+        .expect("repli introuvable");
+    assert!(
+        repli > cfg,
+        "le débranchement doit suivre le bloc gardé, pas y être enfermé"
     );
 }
 
 /// #4384 — le branchement lui-même, par la porte de l'orchestrateur : une
 /// sortie locale RÉELLE enregistrée dans le registre, et le gain que ses
 /// rappels de rendu multiplient qui arrive jusqu'au `PlaybackManager`.
+///
+/// ⚠️ Cette épreuve ne tourne PAS en CI : la porte `test` ne compile pas
+/// `tune-core` avec `local-audio`, donc tout ce qui est gardé ici est vert
+/// parce qu'il n'existe pas, pas parce qu'il passe. Elle a été exécutée à la
+/// main sur Shrek avec la feature. Les gardes qui protègent RÉELLEMENT #4384
+/// en CI sont `le_cretemetre_suit_le_gain_de_la_sortie` (comportement, chaîne
+/// réelle) et `send_to_output_branche_le_gain_avant_de_jouer` (l'appelant),
+/// toutes deux hors de toute feature.
 #[cfg(feature = "local-audio")]
 #[tokio::test]
 async fn brancher_le_gain_suit_la_sortie_locale_puis_la_lache() {
