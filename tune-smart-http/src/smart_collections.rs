@@ -9,6 +9,7 @@ use tune_core::db::backend::ToSqlValue;
 
 use crate::SmartHttpState;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
+use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
 
 #[derive(Deserialize)]
@@ -826,6 +827,42 @@ fn execute_album_query(
         .collect())
 }
 
+/// Ajoute les ALBUMS favoris des services que nomme une règle « Source »
+/// (#4299) — voir `source_streaming`. Les albums de la bibliothèque d'abord,
+/// puis ceux des services ; la borne s'applique à l'ensemble.
+#[allow(clippy::too_many_arguments)]
+fn avec_albums_de_service(
+    state: &SmartHttpState,
+    mut albums: Vec<Value>,
+    rules_json: &str,
+    match_mode: &str,
+    profile_id: i64,
+    sort_by: &str,
+    sort_order: &str,
+    max_limit: Option<i64>,
+) -> Result<Vec<Value>, AppError> {
+    let Some(sql) = source_streaming::requete(
+        rules_json,
+        match_mode,
+        Objet::Album,
+        profile_id,
+        sort_by,
+        sort_order,
+        max_limit,
+    ) else {
+        return Ok(albums);
+    };
+    let lignes = state
+        .backend
+        .query_many(&sql, &[])
+        .map_err(AppError::internal)?;
+    albums.extend(lignes.iter().map(|c| source_streaming::album_json(c)));
+    if let Some(n) = max_limit.filter(|n| *n >= 0) {
+        albums.truncate(n as usize);
+    }
+    Ok(albums)
+}
+
 /// Load a smart collection's criteria from the DB.
 fn load_collection_criteria(
     state: &SmartHttpState,
@@ -881,6 +918,16 @@ async fn resolve_albums(
         &ctx,
     );
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+    let albums = avec_albums_de_service(
+        &state,
+        albums,
+        &rules_json,
+        &match_mode,
+        profile.id(),
+        &sort_by,
+        &sort_order,
+        max_limit,
+    )?;
 
     // Return a bare array, matching the regular collections endpoint
     // (GET /library/collections/{id}/albums). The previous {"albums":[…],
@@ -916,6 +963,16 @@ async fn preview_albums(
         &ctx,
     );
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
+    let albums = avec_albums_de_service(
+        &state,
+        albums,
+        &rules_json,
+        match_mode,
+        profile.id(),
+        sort_by,
+        sort_order,
+        body.max_limit,
+    )?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
 }
