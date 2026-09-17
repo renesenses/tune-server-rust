@@ -5295,6 +5295,86 @@ mod tests_zones_qui_retiennent {
     }
 }
 
+/// #3887 — ce que `GET /system/update/status` DIT en phase
+/// `restart_pending_playback`, exercé par la route elle-même et non par une
+/// relecture du source.
+///
+/// Le serveur sait dire que le binaire est posé, QUI retient la relance et le
+/// geste qui la libère (#3581). Aucun client ne le lit — et, jusqu'ici, aucun
+/// témoin ne le gardait non plus : un champ renommé ou retiré serait passé sous
+/// toutes les portes. Ces épreuves fixent le contrat que l'écran
+/// (tune-web-client) doit lire au bout de sa boucle de sondage.
+#[cfg(test)]
+mod statut_de_relance_en_attente_3887 {
+    use super::update_status;
+    use axum::extract::State;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::NowPlaying;
+
+    fn etat() -> crate::state::AppState {
+        crate::state::AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    fn phase(state: &crate::state::AppState, p: Option<&str>) {
+        *state.update_phase.lock().unwrap() = p.map(str::to_string);
+    }
+
+    /// LE TÉMOIN : binaire acquis, zone nommée, geste annoncé.
+    #[tokio::test]
+    async fn en_phase_de_report_le_statut_nomme_la_zone_et_le_geste_qui_libere() {
+        let state = etat();
+        let id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Serenade", Some("dlna"), None)
+            .expect("création de zone");
+        // Jamais observée, aucune durée annoncée : le serveur la tient pour
+        // jouante — c'est exactement le fantôme de Tades.
+        state.playback.play(id, NowPlaying::default()).await;
+        phase(&state, Some("restart_pending_playback"));
+
+        let corps = update_status(State(state)).await.0;
+
+        assert_eq!(corps["phase"], "restart_pending_playback");
+        assert_eq!(
+            corps["update_in_progress"], true,
+            "la relance en attente est encore une mise à jour en cours"
+        );
+        assert_eq!(
+            corps["binary_installed"], true,
+            "le binaire est posé : le client ne doit pas conclure « échec »"
+        );
+        assert_eq!(
+            corps["recovery_hint"], "POST /zones/{id}/stop",
+            "le geste qui libère la relance doit être annoncé"
+        );
+        let zones = corps["restart_pending_zones"]
+            .as_array()
+            .expect("restart_pending_zones doit être une liste en phase de report");
+        assert_eq!(zones.len(), 1, "une seule zone retient");
+        assert_eq!(zones[0]["id"].as_i64(), Some(id));
+        assert_eq!(
+            zones[0]["name"].as_str(),
+            Some("Serenade"),
+            "la zone qui retient doit être NOMMÉE, pas seulement numérotée"
+        );
+    }
+
+    /// Contre-épreuve : hors de la phase de report, ces trois champs sont nuls
+    /// ou faux — même si une zone joue. Un client qui les lirait pendant le
+    /// téléchargement ou après un échec ne doit pas conclure « acquis ».
+    #[tokio::test]
+    async fn hors_de_la_phase_de_report_les_champs_de_relance_sont_nuls() {
+        let state = etat();
+        state.playback.play(7, NowPlaying::default()).await;
+        for p in [None, Some("downloading"), Some("failed: réseau")] {
+            phase(&state, p);
+            let corps = update_status(State(state.clone())).await.0;
+            assert_eq!(corps["binary_installed"], false, "phase {p:?}");
+            assert!(corps["restart_pending_zones"].is_null(), "phase {p:?}");
+            assert!(corps["recovery_hint"].is_null(), "phase {p:?}");
+        }
+    }
+}
+
 /// Ce que la mise à jour Homebrew EN PLACE doit tenir.
 ///
 /// Aucun de ces tests ne relit le source : ils construisent un faux Cellar sur
