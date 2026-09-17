@@ -94,7 +94,76 @@ pub fn fold_diacritics(s: &str) -> String {
 ///
 /// Returns an empty string if the input has no usable tokens, so the
 /// caller can short-circuit to a LIKE-only path.
+///
+/// Des DOUBLES GUILLEMETS demandent une phrase exacte (Yves Corbat, point 8,
+/// 17/09/2026) : `"kind of blue"` ne rend plus « Blue Kind Of… », ni les
+/// titres qui portent les trois mots dans le désordre. Voir [`phrases_et_reste`].
 pub fn format_fts_query(engine: Engine, raw: &str) -> String {
+    if !raw.contains('"') {
+        return format_fts_query_libre(engine, raw);
+    }
+    let (phrases, reste) = phrases_et_reste(raw);
+    let mut parties: Vec<String> = phrases
+        .iter()
+        .filter_map(|p| format_fts_phrase(engine, p))
+        .collect();
+    let libre = format_fts_query_libre(engine, &reste);
+    if !libre.is_empty() {
+        parties.push(if libre.contains(" OR ") || libre.contains(" | ") {
+            format!("({libre})")
+        } else {
+            libre
+        });
+    }
+    match engine {
+        Engine::Sqlite => parties.join(" "),
+        Engine::Postgres => parties.join(" & "),
+    }
+}
+
+/// Sépare les passages entre doubles guillemets du texte libre. Un guillemet
+/// resté ouvert court jusqu'à la fin : on tape `"kind of` avant de fermer, la
+/// recherche part à chaque frappe.
+pub fn phrases_et_reste(raw: &str) -> (Vec<String>, String) {
+    let mut phrases = Vec::new();
+    let mut reste = String::new();
+    for (i, morceau) in raw.split('"').enumerate() {
+        if i % 2 == 1 {
+            if !morceau.trim().is_empty() {
+                phrases.push(morceau.trim().to_string());
+            }
+        } else {
+            reste.push(' ');
+            reste.push_str(morceau);
+        }
+    }
+    (phrases, reste.trim().to_string())
+}
+
+/// Le motif `LIKE` d'une recherche : les guillemets ôtés. Laissés dans le
+/// motif, ils ne correspondraient à aucun titre — `%"kind of blue"%`.
+pub fn motif_like(raw: &str) -> String {
+    format!("%{}%", raw.replace('"', "").trim())
+}
+
+/// Une phrase exacte : SQLite FTS5 `"a b c"`, PostgreSQL `a <-> b <-> c`.
+/// Les jetons sont réduits aux alphanumériques, comme l'index les découpe —
+/// aucun caractère de la saisie n'atteint la syntaxe de requête.
+fn format_fts_phrase(engine: Engine, phrase: &str) -> Option<String> {
+    let jetons: Vec<&str> = phrase
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if jetons.is_empty() {
+        return None;
+    }
+    Some(match engine {
+        Engine::Sqlite => format!("\"{}\"", jetons.join(" ")),
+        Engine::Postgres => jetons.join(" <-> "),
+    })
+}
+
+fn format_fts_query_libre(engine: Engine, raw: &str) -> String {
     // Punctuation as separator — mirrors the index's own tokenisation.
     let split: Vec<&str> = raw
         .split(|c: char| !c.is_alphanumeric())
@@ -505,6 +574,37 @@ mod tests {
             p.fts_where("artists", "a", &p.placeholder(1)),
             "a.search_tsv @@ to_tsquery('simple', unaccent($1))"
         );
+    }
+
+    #[test]
+    fn des_guillemets_demandent_une_phrase_exacte() {
+        assert_eq!(
+            format_fts_query(Engine::Sqlite, "\"kind of blue\""),
+            "\"kind of blue\""
+        );
+        assert_eq!(
+            format_fts_query(Engine::Postgres, "\"kind of blue\""),
+            "kind <-> of <-> blue"
+        );
+        // Phrase ET mots libres : les deux s'imposent.
+        assert_eq!(
+            format_fts_query(Engine::Sqlite, "\"kind of blue\" miles"),
+            "\"kind of blue\" miles*"
+        );
+        assert_eq!(
+            format_fts_query(Engine::Postgres, "miles \"so what\""),
+            "so <-> what & miles:*"
+        );
+        // Guillemet resté ouvert pendant la frappe.
+        assert_eq!(format_fts_query(Engine::Sqlite, "\"kind of"), "\"kind of\"");
+        // Rien d'utilisable entre les guillemets : rien.
+        assert_eq!(format_fts_query(Engine::Sqlite, "\"  !! \""), "");
+        // Sans guillemets, rien ne change.
+        assert_eq!(
+            format_fts_query(Engine::Sqlite, "kind of blue"),
+            "kind of blue*"
+        );
+        assert_eq!(motif_like("\"kind of blue\""), "%kind of blue%");
     }
 
     #[test]

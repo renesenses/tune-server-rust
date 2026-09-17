@@ -1081,7 +1081,7 @@ impl ArtistRepo {
         offset: i64,
     ) -> Result<Vec<Artist>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
         let params: [&dyn ToSqlValue; 4] = [&fts_query, &like, &limit, &offset];
@@ -1093,7 +1093,7 @@ impl ArtistRepo {
     /// de `limit`. Rendre `plafond` signifie « au moins `plafond` ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
         let params: [&dyn ToSqlValue; 3] = [&fts_query, &like, &plafond];
         Ok(self

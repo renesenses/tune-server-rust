@@ -1882,7 +1882,7 @@ impl TrackRepo {
             // aujourd'hui (Oxygen filtre sa fenêtre côté navigateur, la
             // recherche passe par `/library/search`), ce qui explique que
             // personne ne l'ait signalé.
-            let like = format!("%{query}%");
+            let like = crate::db::engine::motif_like(query);
             let p = ph.take();
             let p2 = ph.take();
             conditions.push(format!(
@@ -2062,7 +2062,7 @@ impl TrackRepo {
         offset: i64,
     ) -> Result<Vec<Track>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
@@ -2080,7 +2080,7 @@ impl TrackRepo {
     /// signifie « au moins `plafond` », jamais « exactement ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
         let params: [&dyn ToSqlValue; 6] = [&fts_query, &like, &like, &like, &trimmed, &plafond];
@@ -2252,7 +2252,7 @@ impl TrackRepo {
         // Jumeau du prédicat `q` de `list_filtered` — deux marqueurs, deux
         // valeurs liées.
         if let Some(query) = terme.filter(|s| !s.is_empty()) {
-            let like = format!("%{query}%");
+            let like = crate::db::engine::motif_like(query);
             let p = ph.take();
             let p2 = ph.take();
             conditions.push(format!(
