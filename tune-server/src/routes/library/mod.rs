@@ -242,6 +242,7 @@ pub fn router() -> Router<AppState> {
             get(albums::get_album).put(albums::update_album),
         )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
+        .route("/albums/{id}/aussi-sur", get(albums::album_aussi_sur))
         .route(
             "/albums/{id}/metadata",
             get(albums::album_metadata_get).put(albums::album_metadata_put),
