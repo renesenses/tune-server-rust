@@ -738,13 +738,15 @@ pub mod sql {
     }
 
     /// Compteur de la VUE pistes : exclut les pistes d'albums masqués, comme
-    /// la liste qu'il pagine (#1391), et celles d'un album distant doublé par
-    /// un local (#4146). `count()` reste le compte COMPLET.
+    /// la liste qu'il pagine (#1391), celles d'un album distant doublé par
+    /// un local (#4146), et les copies de moindre qualité que la liste replie
+    /// (#4101). `count()` reste le compte COMPLET.
     pub fn count_visible() -> String {
         format!(
-            "SELECT COUNT(*) FROM tracks t WHERE {} AND {}",
+            "SELECT COUNT(*) FROM tracks t WHERE {} AND {} AND {}",
             crate::db::facet_filter::hidden_tracks_excluded(),
-            crate::db::facet_filter::pistes_album_distant_double_exclu()
+            crate::db::facet_filter::pistes_album_distant_double_exclu(),
+            crate::db::facet_filter::copie_de_moindre_qualite_exclue()
         )
     }
 
@@ -1596,14 +1598,17 @@ impl TrackRepo {
     /// Chemin NON facetté de `GET /library/tracks` : mêmes lignes et même
     /// ordre que [`Self::list`], moins les pistes d'albums masqués — le
     /// miroir du prédicat que `list_filtered` pose toujours, sans quoi la vue
-    /// par défaut fuirait ce que la vue facettée cache (#1391). `list` reste
-    /// ENTIER pour la maintenance (export, résolutions internes).
+    /// par défaut fuirait ce que la vue facettée cache (#1391) — et moins les
+    /// copies de moindre qualité que la fiche d'un album replie depuis #1362
+    /// (#4101). `list` reste ENTIER pour la maintenance (export, résolutions
+    /// internes).
     pub fn list_visible(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
-            "{} WHERE {} AND {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
+            "{} WHERE {} AND {} AND {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
             sql::select_track(),
             hidden_tracks_excluded(),
             crate::db::facet_filter::pistes_album_distant_double_exclu(),
+            crate::db::facet_filter::copie_de_moindre_qualite_exclue(),
             match self.db.engine() {
                 Engine::Sqlite => SqliteDialect.placeholder(1),
                 Engine::Postgres => PostgresDialect.placeholder(1),
@@ -1920,6 +1925,12 @@ impl TrackRepo {
         // l'équivalent LOCAL existe sortent de la vue, comme leur album sort
         // de la grille. Même statut que ci-dessus — socle, pas facette.
         conditions.push(crate::db::facet_filter::pistes_album_distant_double_exclu());
+        // Copie de moindre qualité (#4101) : le repli que la fiche d'album,
+        // la file et `albums.track_count` appliquent depuis #1362 manquait à
+        // cette route — la SEULE que la vue Oxygen appelle. Socle, pas
+        // facette : le compteur juste en dessous partage `where_clause`, donc
+        // la fenêtre suivante part du bon décalage.
+        conditions.push(crate::db::facet_filter::copie_de_moindre_qualite_exclue());
 
         let where_clause = if conditions.is_empty() {
             String::new()

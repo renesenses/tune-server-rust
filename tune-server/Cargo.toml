@@ -313,6 +313,21 @@ path = "tests/ambiance_traduction_annoncee_3839.rs"
 name = "portee_audit_repertoire_3101"
 path = "tests/portee_audit_repertoire_3101.rs"
 
+# #4101 : la vue Oxygen listait chaque piste de Led Zeppelin IV deux fois. Le
+# repli des copies de moindre qualite (#1362) etait pose sur la fiche d'album,
+# sur la file et sur `albums.track_count`, mais PAS sur `GET /library/tracks` —
+# la seule route qu'Oxygen appelle. Le temoin interroge les DEUX chemins de
+# cette route et compte des identifiants DISTINCTS, jamais des lignes : le
+# compteur de l'issue comptait les lignes, et c'est ce qui ne prouvait rien.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Posee ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "oxygen_pistes_en_double_4101"
+path = "tests/oxygen_pistes_en_double_4101.rs"
+
 # Canal stable / beta : quelles versions `/update/check` a le droit de proposer
 # (#2266). Le defaut `auto` reproduit le comportement d'avant.
 [[test]]
