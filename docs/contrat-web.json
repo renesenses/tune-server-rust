@@ -793,6 +793,48 @@
       ]
     },
     {
+      "route": "/library/albums/{}/tracks",
+      "methode": "GET",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "grouping",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id",
+        "dynamic_range",
+        "play_count",
+        "last_played_at"
+      ]
+    },
+    {
       "route": "/library/ambiances",
       "methode": "GET",
       "type": "(en ligne)",
@@ -2081,6 +2123,26 @@
     },
     {
       "route": "/radios",
+      "methode": "GET",
+      "type": "RadioStation",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "stream_url",
+        "favorite"
+      ],
+      "champs_optionnels": [
+        "logo_url",
+        "genre",
+        "tags",
+        "codec",
+        "country",
+        "homepage_url"
+      ]
+    },
+    {
+      "route": "/radios",
       "methode": "POST",
       "type": "RadioStation",
       "liste": false,
@@ -2153,26 +2215,6 @@
         "error",
         "state",
         "stream_url"
-      ]
-    },
-    {
-      "route": "/radios{}",
-      "methode": "GET",
-      "type": "RadioStation",
-      "liste": true,
-      "champs_obligatoires": [
-        "id",
-        "name",
-        "stream_url",
-        "favorite"
-      ],
-      "champs_optionnels": [
-        "logo_url",
-        "genre",
-        "tags",
-        "codec",
-        "country",
-        "homepage_url"
       ]
     },
     {
@@ -4595,11 +4637,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/library/albums/${id}/tracks${qs ? ",
-      "type": "Track[]",
-      "raison": "interpolation non fermée — route non fiable"
-    },
-    {
       "route": "/library/artists",
       "type": "any",
       "raison": "type non structurel"
@@ -5130,9 +5167,9 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/home/recently-added${qs ? ",
+      "route": "/home/recently-added",
       "type": "any[]",
-      "raison": "interpolation non fermée — route non fiable"
+      "raison": "type non structurel"
     },
     {
       "route": "/home/new-in-library",
@@ -5196,7 +5233,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 260,
-    "appels_non_resolus": 144
+    "routes_cartographiees": 261,
+    "appels_non_resolus": 143
   }
 }

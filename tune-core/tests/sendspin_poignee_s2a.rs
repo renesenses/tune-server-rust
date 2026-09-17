@@ -310,17 +310,16 @@ fn un_message_hors_sequence_est_refuse_en_nommant_ce_qui_etait_attendu() {
 
 #[test]
 fn le_transport_refuse_ce_qui_depasse_une_trame_au_lieu_de_le_tronquer() {
-    // La fragmentation est le sujet de S2-c. Tant qu'elle n'est pas ecrite, une
-    // charge trop grande doit etre REFUSEE : tronquer en silence produirait un
-    // flux corrompu que rien ne nommerait.
+    // La primitive d'une trame reste bornee ; chiffrer_message assure le
+    // decoupage applicatif avant le chiffrement.
     let (mut transport, _, _) = poignee_complete(Suite::ChaChaPoly);
     let trop = vec![0u8; MAX_CLAIR + 1];
     let erreur = transport
         .chiffrer(&trop)
         .expect_err("au-dela d'une trame, le refus doit etre explicite");
     assert!(
-        erreur.to_string().contains("S2-c"),
-        "le refus doit dire OU la fragmentation sera traitee : {erreur}"
+        erreur.to_string().contains("chiffrer_message"),
+        "le refus doit nommer la primitive qui fragmente : {erreur}"
     );
     // La borne elle-meme reste franchissable.
     assert!(
@@ -340,3 +339,6 @@ mod magasin_appairage;
 
 #[path = "sendspin/interop_pake.rs"]
 mod interop_pake;
+
+#[path = "sendspin/fragmentation_3326.rs"]
+mod fragmentation_3326;

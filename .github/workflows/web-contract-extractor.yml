@@ -1,0 +1,48 @@
+name: Contrats web — extracteur
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/web-contract-map.py'
+      - 'scripts/verifier-carte-web.py'
+      - 'scripts/tests/test_web_contract_urls_1897.py'
+      - 'docs/contrat-web.json'
+      - '.github/workflows/web-contract-extractor.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-contract-extractor-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  extracteur:
+    name: Extraction des contrats web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Contre-tests de l'extracteur et du comparateur
+        run: |
+          python3 scripts/web-contract-map.py --self-test
+          python3 scripts/verifier-carte-web.py --self-test
+      - name: Lire le client épinglé dans la carte
+        id: client
+        run: |
+          sha="$(jq -er '.genere_depuis.web_sha | select(test("^[0-9a-f]{40}$"))' docs/contrat-web.json)"
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: renesenses/tune-web-client
+          ref: ${{ steps.client.outputs.sha }}
+          path: .web-client
+          persist-credentials: false
+      - name: Vérifier la régénération exacte de la carte
+        env:
+          WEB_SHA: ${{ steps.client.outputs.sha }}
+        run: |
+          python3 scripts/web-contract-map.py --web .web-client --web-sha "$WEB_SHA" -o /tmp/contrat-web.json
+          diff -u docs/contrat-web.json /tmp/contrat-web.json
+          python3 scripts/verifier-carte-web.py --web .web-client --exiger-complet

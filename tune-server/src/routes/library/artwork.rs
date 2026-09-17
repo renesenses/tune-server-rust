@@ -339,7 +339,39 @@ pub(super) async fn proxy_artwork(
         signature_exigee: exemption.is_some(),
         hotes_supplementaires: &supplementaires,
     };
-    match state.relais_pochettes.relayer(&demande).await {
+    let mut resultat = state.relais_pochettes.relayer(&demande).await;
+
+    // Pochette de serveur UPnP de la bibliothèque (réseau local) : refusée par
+    // la garde générale, admise si — et seulement si — c'est l'adresse
+    // ENREGISTRÉE d'un album. Voir `artwork_proxy::pochette_de_bibliotheque`.
+    // Jamais par l'exemption DIDL, jamais pour une URL déjà signée.
+    if let Err(Echec::Refus(ref refus)) = resultat
+        && q.sig.is_none()
+        && exemption.is_none()
+        && matches!(
+            refus,
+            artwork_proxy::Refus::AdresseInterdite { .. } | artwork_proxy::Refus::HoteRefuse(_)
+        )
+        && artwork_proxy::pochette_de_bibliotheque(&state.backend, &q.url)
+    {
+        // La signature n'est PAS publiée : elle dit seulement au relais que
+        // l'URL a été jugée côté serveur, pour qu'il passe la liste d'hôtes.
+        // Sa politique d'adresse, elle, reste en vigueur.
+        let sig = artwork_proxy::signature(&secret, &q.url);
+        let demande_lan = Demande {
+            url: &q.url,
+            sig: Some(&sig),
+            secret: &secret,
+            signature_exigee: false,
+            hotes_supplementaires: &supplementaires,
+        };
+        resultat = state.relais_pochettes_lan.relayer(&demande_lan).await;
+        if resultat.is_ok() {
+            tracing::debug!(url = %q.url, "artwork_proxy_pochette_bibliotheque_reseau_local");
+        }
+    }
+
+    match resultat {
         Ok(image) => {
             let mut headers = HeaderMap::new();
             headers.insert(
