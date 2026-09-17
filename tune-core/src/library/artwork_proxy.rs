@@ -266,6 +266,55 @@ pub fn adresse_interdite(ip: IpAddr) -> bool {
     }
 }
 
+/// Une adresse du RÉSEAU LOCAL : plages privées IPv4 (10/8, 172.16/12,
+/// 192.168/16), leur forme IPv6 mappée, et les adresses uniques locales IPv6
+/// (fc00::/7).
+///
+/// Sous-ensemble STRICT de [`adresse_interdite`] : la boucle locale, le
+/// lien-local (169.254.x.x — dont les métadonnées d'un nuage), la
+/// multidiffusion et les réservées n'en font pas partie et restent refusées
+/// par [`Relais::reseau_local`]. Voir [`pochette_de_bibliotheque`].
+pub fn adresse_reseau_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(a) => a.is_private(),
+        IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => v4.is_private(),
+            None => (a.segments()[0] & 0xfe00) == 0xfc00,
+        },
+    }
+}
+
+/// L'URL est-elle la pochette ENREGISTRÉE d'un album de la bibliothèque ?
+///
+/// ## Pourquoi cette exception existe — bug du .18, 17/09/2026
+///
+/// Un serveur UPnP intégré à la bibliothèque (#4201) donne à ses albums une
+/// pochette sur SON adresse de réseau local —
+/// `http://192.168.1.41:26125/aa/334872490115648/cover.jpg` pour « Kino
+/// Music ». Le client la demande à ce relais, qui depuis #4260 refuse toute
+/// adresse privée : les 39 pochettes UPnP du .18 étaient grises, et le journal
+/// en répétait `artwork_proxy_hote_refuse` à chaque vignette.
+///
+/// ## Pourquoi elle ne rouvre pas le relais
+///
+/// L'adresse n'est pas celle que le CLIENT fournit, mais celle que la
+/// bibliothèque a ÉCRITE : la synchronisation d'une source UPnP que
+/// l'utilisateur a lui-même intégrée. Un appareil du réseau ne peut pas faire
+/// relayer une adresse de son choix : il lui faudrait d'abord la faire entrer
+/// en base comme pochette d'album. Et même alors, [`Relais::reseau_local`]
+/// n'admet que le réseau local — ni la boucle locale, ni le lien-local.
+pub fn pochette_de_bibliotheque(backend: &Arc<dyn DbBackend>, url: &str) -> bool {
+    let url = url.to_string();
+    backend
+        .query_one(
+            "SELECT 1 FROM albums WHERE cover_path = $1 LIMIT 1",
+            &[&url as &dyn crate::db::backend::ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 // ---------------------------------------------------------------------------
 // Résolution DNS gardée
 // ---------------------------------------------------------------------------
@@ -463,6 +512,16 @@ impl Relais {
         Self::avec(Arc::new(ResolveurSysteme), |ip| !adresse_interdite(ip))
     }
 
+    /// Le relais des pochettes de bibliothèque ([`pochette_de_bibliotheque`]) :
+    /// la politique de production, plus le RÉSEAU LOCAL
+    /// ([`adresse_reseau_local`]). La boucle locale et le lien-local restent
+    /// refusés.
+    pub fn reseau_local() -> Self {
+        Self::avec(Arc::new(ResolveurSysteme), |ip| {
+            !adresse_interdite(ip) || adresse_reseau_local(ip)
+        })
+    }
+
     /// Un relais avec un résolveur et une politique d'adresse donnés — pour
     /// les bancs d'essai, qui ne sortent pas sur Internet.
     pub fn avec<F>(resolveur: Arc<dyn Resolveur>, adresse_admise: F) -> Self
@@ -626,6 +685,45 @@ fn adresse_refusee(e: &reqwest::Error) -> Option<AdresseRefusee> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le RÉSEAU LOCAL admis pour une pochette de bibliothèque : les plages
+    /// privées et l'IPv6 unique locale — jamais la boucle locale, le
+    /// lien-local (métadonnées d'un nuage) ni une adresse publique.
+    #[test]
+    fn le_reseau_local_est_un_sous_ensemble_strict_des_adresses_interdites() {
+        let admises = [
+            "192.168.1.41",
+            "10.0.0.7",
+            "172.16.5.1",
+            "fd12::1",
+            "::ffff:192.168.0.9",
+        ];
+        for a in admises {
+            let ip: IpAddr = a.parse().unwrap();
+            assert!(adresse_reseau_local(ip), "{a} est du réseau local");
+            assert!(
+                adresse_interdite(ip),
+                "{a} reste interdite pour le relais général"
+            );
+        }
+        let refusees = [
+            "127.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "fe80::1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "100.64.0.1",
+        ];
+        for a in refusees {
+            let ip: IpAddr = a.parse().unwrap();
+            assert!(
+                !adresse_reseau_local(ip),
+                "{a} n'est PAS admise comme réseau local"
+            );
+        }
+        assert!(!adresse_reseau_local("203.0.113.7".parse().unwrap()));
+    }
     use std::collections::HashMap;
 
     /// Vecteur RFC 4231, cas 2 : clé `Jefe`, message

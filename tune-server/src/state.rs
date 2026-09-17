@@ -64,6 +64,10 @@ pub struct AppState {
     /// adresses internes. Champ public pour qu'un banc d'essai y pose un
     /// relais à résolveur factice ([`tune_core::library::artwork_proxy::Relais::avec`]).
     pub relais_pochettes: Arc<tune_core::library::artwork_proxy::Relais>,
+    /// Le relais des pochettes ENREGISTRÉES d'albums de la bibliothèque, qui
+    /// admet le réseau local (serveurs UPnP intégrés) — voir
+    /// `artwork_proxy::pochette_de_bibliotheque`.
+    pub relais_pochettes_lan: Arc<tune_core::library::artwork_proxy::Relais>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -459,6 +463,9 @@ impl AppState {
             config: Arc::new(tune_config),
             http_client,
             relais_pochettes: Arc::new(tune_core::library::artwork_proxy::Relais::production()),
+            relais_pochettes_lan: Arc::new(
+                tune_core::library::artwork_proxy::Relais::reseau_local(),
+            ),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),
