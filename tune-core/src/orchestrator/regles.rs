@@ -981,6 +981,11 @@ pub(super) struct MotifsDeTranscodage {
     pub(super) will_be_flac: bool,
     /// #3631 — une tranche de feuille CUE ne se sert jamais telle quelle.
     pub(super) est_une_tranche_cue: bool,
+    /// #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) vers une sortie
+    /// RÉSEAU ne part pas en passthrough : servi tel quel, l'Eversolo DMP-A8
+    /// lit ses en-têtes puis cale, muet. Ré-encodé par Tune, sans perte, il
+    /// joue. Voir `audio::flac_vendeur`.
+    pub(super) flac_ffmpeg_vers_le_reseau: bool,
 }
 
 /// La piste doit-elle être transcodée ? Un OU de tous les motifs, dans l'ordre
@@ -996,6 +1001,7 @@ pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
         || motifs.dsp_progressif_wav
         || (motifs.dlna_cap_16bit && motifs.will_be_flac)
         || motifs.est_une_tranche_cue
+        || motifs.flac_ffmpeg_vers_le_reseau
 }
 
 #[cfg(test)]
@@ -1158,6 +1164,7 @@ mod lecture_locale_tests {
             dlna_cap_16bit: false,
             will_be_flac: false,
             est_une_tranche_cue: false,
+            flac_ffmpeg_vers_le_reseau: false,
         }
     }
 
@@ -1173,7 +1180,7 @@ mod lecture_locale_tests {
 
     #[test]
     fn chaque_motif_seul_exige_le_transcodage() {
-        let seuls: [(&str, MotifsDeTranscodage); 9] = [
+        let seuls: [(&str, MotifsDeTranscodage); 10] = [
             (
                 "needs_transcode_for_output",
                 MotifsDeTranscodage {
@@ -1234,6 +1241,15 @@ mod lecture_locale_tests {
                 "tranche_cue",
                 MotifsDeTranscodage {
                     est_une_tranche_cue: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                // #4350 — FLAC de l'enregistreur (Lavf) muet en PURE sur le DMP-A8.
+                "flac_ffmpeg_vers_le_reseau",
+                MotifsDeTranscodage {
+                    flac_ffmpeg_vers_le_reseau: true,
+                    will_be_flac: true,
                     ..aucun_motif()
                 },
             ),
