@@ -5516,6 +5516,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "reqwest",
+ "symphonia",
  "tokio",
  "tracing",
  "tracing-subscriber",

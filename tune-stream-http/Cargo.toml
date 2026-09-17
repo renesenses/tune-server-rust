@@ -27,3 +27,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # declaration que `tune-core` et `tune-server`, qui portent deja des gardes
 # de journal (#3180, #3479, #3568).
 tracing-subscriber = { workspace = true }
+
+# Independent WAV reader for the long progressive stream regression (#4016).
+symphonia = { workspace = true }
