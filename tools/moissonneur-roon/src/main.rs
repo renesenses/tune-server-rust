@@ -398,9 +398,15 @@ async fn telecharger_images(core: &Core, export: &Export) -> (BilanImages, Vec<(
 /// `export.json` + `images/<clé>.jpg`, en une archive. Les JPEG sont rangés
 /// sans recompression : ils sont déjà compressés.
 fn ecrire_archive(chemin: &PathBuf, export: &Export, fichiers: &[(String, Vec<u8>)]) -> Result<()> {
-    use std::io::Write;
     let f = std::fs::File::create(chemin).with_context(|| format!("archive {}", chemin.display()))?;
-    let mut z = zip::ZipWriter::new(f);
+    ecrire_zip(f, export, fichiers)
+}
+
+/// Le contenu de l'archive, dans n'importe quel flux : un fichier en vrai, un
+/// tampon mémoire dans le test — aucun temporaire à nettoyer.
+fn ecrire_zip<W: std::io::Write + std::io::Seek>(w: W, export: &Export, fichiers: &[(String, Vec<u8>)]) -> Result<()> {
+    use std::io::Write;
+    let mut z = zip::ZipWriter::new(w);
     let json = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let brut = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     z.start_file("export.json", json)?;
@@ -439,14 +445,12 @@ mod tests {
 
     #[test]
     fn l_archive_porte_l_export_et_les_images() {
-        let dir = std::env::temp_dir().join(format!("moissonneur-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let chemin = dir.join("a.zip");
         let export = Export { source: "roon".into(), ..Default::default() };
-        ecrire_archive(&chemin, &export, &[("abc".into(), vec![0xFF, 0xD8, 0xFF])]).unwrap();
-        let mut z = zip::ZipArchive::new(std::fs::File::open(&chemin).unwrap()).unwrap();
+        let mut tampon = std::io::Cursor::new(Vec::new());
+        ecrire_zip(&mut tampon, &export, &[("abc".into(), vec![0xFF, 0xD8, 0xFF])]).unwrap();
+        tampon.set_position(0);
+        let mut z = zip::ZipArchive::new(tampon).unwrap();
         let noms: Vec<String> = (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_string()).collect();
         assert_eq!(noms, vec!["export.json".to_string(), "images/abc.jpg".to_string()]);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
