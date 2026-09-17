@@ -2111,39 +2111,62 @@ async fn play(
         return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
     }
 
-    match set_queue_retrying(
-        &queue_repo,
-        state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
-        zone_id,
-        &track_ids,
-    )
-    .await
-    {
-        // `n` valait `track_ids.len()` — le nombre DEMANDE, pas le nombre ecrit.
-        // Sur une file amputee (#3231) ce journal affirmait 190 la ou 5 lignes
-        // existaient : un compteur qui ment (#2394). Il dit maintenant les deux,
-        // et une perte non nulle sort en `warn`.
-        Ok(outcome) => {
-            if outcome.has_loss() {
-                warn!(
-                    zone_id,
-                    demandees = outcome.requested,
-                    inserees = outcome.inserted,
-                    absentes = outcome.skipped_count(),
-                    "set_queue_incomplet"
-                );
-            } else {
-                info!(zone_id, n = outcome.inserted, "set_queue_ok");
+    // #4298 : la barre de transport relance une piste locale par son id.
+    // Comme pour une piste de service (#2569), ce geste ne doit pas effacer
+    // le reste de la file. Un contenant explicite reste un remplacement.
+    // Une lecture en erreur ne prouve jamais que la piste est absente.
+    let file_conservee = if demande_nue {
+        let entries = match queue_repo.get_ordered(zone_id) {
+            Ok(entries) => entries,
+            Err(e) => return lecture_base_echouee("play_relance_locale_file", zone_id, e),
+        };
+        let cible =
+            |e: &&tune_core::db::play_queue_repo::QueueEntry| e.track_id == Some(track_ids[0]);
+        entries
+            .iter()
+            .filter(cible)
+            .find(|e| e.is_current)
+            .or_else(|| entries.iter().find(cible))
+            .map(|e| (e.position, entries.len() as i64))
+    } else {
+        None
+    };
+
+    if file_conservee.is_none() {
+        match set_queue_retrying(
+            &queue_repo,
+            state.backend.engine() == tune_core::db::engine::Engine::Sqlite,
+            zone_id,
+            &track_ids,
+        )
+        .await
+        {
+            // `n` valait `track_ids.len()` — le nombre DEMANDE, pas le nombre ecrit.
+            // Sur une file amputee (#3231) ce journal affirmait 190 la ou 5 lignes
+            // existaient : un compteur qui ment (#2394). Il dit maintenant les deux,
+            // et une perte non nulle sort en `warn`.
+            Ok(outcome) => {
+                if outcome.has_loss() {
+                    warn!(
+                        zone_id,
+                        demandees = outcome.requested,
+                        inserees = outcome.inserted,
+                        absentes = outcome.skipped_count(),
+                        "set_queue_incomplet"
+                    );
+                } else {
+                    info!(zone_id, n = outcome.inserted, "set_queue_ok");
+                }
             }
-        }
-        Err(e) => {
-            // Never proceed on the STALE queue: track 1 would play now and the
-            // natural-end advance would then resurrect whatever the DB still
-            // holds from yesterday (Villerio: album play drifting into old
-            // Qobuz autoplay leftovers). An emptied queue stops cleanly at the
-            // end of track 1 instead — the lesser evil, and diagnosable.
-            warn!(zone_id, error = %e, "set_queue_failed_clearing");
-            let _ = queue_repo.clear(zone_id);
+            Err(e) => {
+                // Never proceed on the STALE queue: track 1 would play now and the
+                // natural-end advance would then resurrect whatever the DB still
+                // holds from yesterday (Villerio: album play drifting into old
+                // Qobuz autoplay leftovers). An emptied queue stops cleanly at the
+                // end of track 1 instead — the lesser evil, and diagnosable.
+                warn!(zone_id, error = %e, "set_queue_failed_clearing");
+                let _ = queue_repo.clear(zone_id);
+            }
         }
     }
 
@@ -2155,7 +2178,14 @@ async fn play(
             .map(|pos| pos as i64)
             .unwrap_or(0)
     });
-    if start > 0 {
+    // La position dans la demande nue (0) n'est pas celle de la file
+    // conservée, qui peut aussi contenir des pistes de services.
+    let queue_position = file_conservee.map_or(start, |(position, _)| position);
+    if file_conservee.is_some() {
+        if let Err(e) = queue_repo.set_current_pos(zone_id, queue_position) {
+            return lecture_base_echouee("play_relance_locale_position", zone_id, e);
+        }
+    } else if start > 0 {
         queue_repo.set_current(zone_id, start).ok();
     }
 
@@ -2221,14 +2251,19 @@ async fn play(
         Ok(result) => {
             let qr = PlayQueueRepo::with_backend(state.backend.clone());
             let q_len = qr.count_all(zone_id).unwrap_or(0);
-            let q_len = if q_len > 0 {
-                q_len
-            } else {
-                track_ids.len() as i64
-            };
+            let q_len = file_conservee.map_or_else(
+                || {
+                    if q_len > 0 {
+                        q_len
+                    } else {
+                        track_ids.len() as i64
+                    }
+                },
+                |(_, longueur)| longueur,
+            );
             state
                 .playback
-                .update_queue_info(zone_id, start, q_len)
+                .update_queue_info(zone_id, queue_position, q_len)
                 .await;
             persist_queue_async(&state, zone_id);
             Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
