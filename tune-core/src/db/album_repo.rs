@@ -498,6 +498,22 @@ pub mod sql {
         )
     }
 
+    /// Les LABELS dont le nom contient la recherche, avec leur nombre
+    /// d'albums visibles (point 8, Yves Corbat, 17/09/2026). Un label n'a pas
+    /// d'identité en base : c'est la chaîne `albums.label`, comme dans
+    /// l'onglet Labels de la bibliothèque. Emplacements 1 (motif) et 2 (limite).
+    pub fn search_labels<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT a.label, COUNT(*) AS n FROM albums a \
+             WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' \
+             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} \
+             GROUP BY a.label ORDER BY n DESC, a.label LIMIT {}",
+            d.placeholder(1),
+            crate::db::facet_filter::hidden_albums_excluded(),
+            d.placeholder(2)
+        )
+    }
+
     /// Le NOMBRE d'albums correspondants, borné (emplacement 7). La borne est
     /// DANS la sous-requête : autour du `COUNT`, elle ne bornerait rien.
     pub fn search_count<D: SqlDialect>(d: &D) -> String {
@@ -3107,7 +3123,7 @@ impl AlbumRepo {
         offset: i64,
     ) -> Result<Vec<Album>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
@@ -3118,12 +3134,29 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// Labels correspondant à la recherche : `(nom, nombre d'albums)`, les
+    /// plus fournis d'abord.
+    pub fn search_labels(&self, query: &str, limit: i64) -> Result<Vec<(String, i64)>, TuneError> {
+        let like = crate::db::engine::motif_like(query);
+        let sql = self.dialect_sql(sql::search_labels, sql::search_labels);
+        let params: [&dyn ToSqlValue; 2] = [&like, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let nom = r.first().and_then(|v| v.as_string())?;
+                let n = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+                Some((nom, n))
+            })
+            .collect())
+    }
+
     /// Le nombre d'albums correspondants, borné à `plafond` — un `COUNT` sur
     /// le même prédicat, indépendant de `limit`. Rendre `plafond` signifie
     /// « au moins `plafond` ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
         let params: [&dyn ToSqlValue; 7] =
@@ -3978,6 +4011,62 @@ mod tests {
         let results = repo.search("dark", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "The Dark Side of the Moon");
+    }
+
+    /// Point 8 : la recherche rend les labels, comptés, sans les albums
+    /// masqués ni les labels vides.
+    #[test]
+    fn la_recherche_rend_les_labels_comptes() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        for (titre, label) in [
+            ("Kind of Blue", Some("Columbia")),
+            ("Bitches Brew", Some("Columbia")),
+            ("Köln Concert", Some("ECM Records")),
+            ("Sans label", None),
+        ] {
+            let mut a = Album::new(titre.into());
+            a.label = label.map(String::from);
+            repo.create(&a).unwrap();
+        }
+        assert_eq!(
+            repo.search_labels("colum", 10).unwrap(),
+            vec![("Columbia".to_string(), 2)]
+        );
+        assert_eq!(
+            repo.search_labels("\"ecm\"", 10).unwrap(),
+            vec![("ECM Records".to_string(), 1)]
+        );
+        let kob = repo.search("\"kind of blue\"", 10).unwrap();
+        assert_eq!(kob.len(), 1);
+        db.execute(
+            "INSERT INTO hidden_items (item_type, item_id) SELECT 'album', id FROM albums WHERE title = 'Köln Concert'",
+            &[],
+        )
+        .unwrap();
+        assert!(repo.search_labels("ecm", 10).unwrap().is_empty());
+    }
+
+    /// Point 8 : entre guillemets, l'ordre des mots compte.
+    #[test]
+    fn entre_guillemets_l_ordre_des_mots_compte() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        for titre in ["Kind of Blue", "Blue Kind of Day"] {
+            repo.create(&Album::new(titre.into())).unwrap();
+        }
+        assert_eq!(
+            repo.search("kind blue", 10).unwrap().len(),
+            2,
+            "témoin sans guillemets"
+        );
+        let exact: Vec<String> = repo
+            .search("\"kind of blue\"", 10)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(exact, vec!["Kind of Blue".to_string()]);
     }
 
     /// #1391 — un album masqué sort des vues de découverte (grille, compteur
