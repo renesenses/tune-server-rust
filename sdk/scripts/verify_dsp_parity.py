@@ -32,6 +32,13 @@ fn main() {
   let mut p=CrossfeedProcessor::new(sr,amount,delay);p.process_pcm(&mut pcm[..512*bps],bd,2);
   let mut next=CrossfeedProcessor::new(sr,amount,delay);next.inherit_state_from(&p);for block in pcm[512*bps..].chunks_mut(128*bps) {next.process_pcm(block,bd,2);}result.extend_from_slice(&pcm);
  }} }}
+ let profile=EqProfile{enabled:true,bands:vec![EqBandSpec{freq:1700.0,gain:-7.0,q:1.2,channel:Some(0),..Default::default()}],..Default::default()};
+ let mut processor=EqProcessor::new(&profile,48000,2);
+ let mut clipping=vec![2.5_f32;2000];clipping[0]=f32::NAN;
+ let stats=processor.process_interleaved(&mut clipping);let counters=processor.ecretage();
+ assert!(counters.echantillons_ecretes>0 && stats.non_finite_samples>0,"clipping fixture did not exercise diagnostics");
+ drop(processor);
+ eprintln!("TELEMETRY {}",serde_json::json!({"samples":counters.echantillons_vus,"clipped":counters.echantillons_ecretes,"excess":counters.exces_max_lsb,"peak_bits":counters.crete_max.to_bits(),"first":counters.premier_ecretage_a,"non_finite":stats.non_finite_samples,"registry":audio::ecretage::releve().egaliseur}));
  use std::io::Write;std::io::stdout().write_all(&result).unwrap();
 }
 '''
@@ -40,7 +47,8 @@ def execute(project, binary):
     metadata=json.loads(subprocess.check_output(['cargo','metadata','--no-deps','--format-version','1','--manifest-path',str(project/'Cargo.toml')]))
     import os
     path=Path(metadata['target_directory'])/'debug'/(binary+('.exe' if os.name=='nt' else ''))
-    return subprocess.check_output([str(path)])
+    result=subprocess.run([str(path)],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    return result.stdout,result.stderr
 def main():
  with tempfile.TemporaryDirectory(prefix='tune-dsp-parity-') as directory:
     root=Path(directory);outputs=[]
@@ -56,13 +64,13 @@ def main():
                 (p/f'src/audio/{name}.rs').write_text(source, encoding="utf-8")
             (p/'src/audio/mod.rs').write_text('pub mod eq; pub mod crossfeed; pub mod dither; pub mod ecretage;', encoding="utf-8")
         else:
-            for name in ['equalizer','crossfeed']:
+            for name in ['equalizer','crossfeed','audio-support']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
-            (p/'src/audio/mod.rs').write_text('pub use tune_plugin_equalizer as eq; pub use tune_plugin_crossfeed as crossfeed;', encoding="utf-8")
+            (p/'src/audio/mod.rs').write_text('pub use tune_plugin_equalizer as eq; pub use tune_plugin_crossfeed as crossfeed; pub use tune_plugin_audio_support::ecretage;', encoding="utf-8")
         runner=RUNNER
         if mode=='native':
             import os
-            for name in ['native','sdk','audio-support']:
+            for name in ['native','sdk']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
             for name in ['eq','crossfeed']:
                 source=(ROOT/f'tune-core/src/audio/{name}.rs').read_text(encoding="utf-8")
@@ -81,7 +89,8 @@ def main():
         (p/'Cargo.toml').write_text(f'[workspace]\n[package]\nname="{package}"\nversion="0.1.0"\nedition="2024"\n[dependencies]\n{deps}', encoding="utf-8")
         (p/'src/main.rs').write_text('#![allow(dead_code)]\nmod audio;\n'+runner, encoding="utf-8")
         outputs.append(execute(p,package))
-    assert outputs[0]==outputs[1]==outputs[2], 'PCM differs from the pinned pre-extraction implementations'
+    assert outputs[0]==outputs[1]==outputs[2], 'PCM or clipping telemetry differs from the pinned pre-extraction implementations'
     import hashlib
-    print(f'PARITY: {len(outputs[0])} bytes identical; SHA-256 {hashlib.sha256(outputs[0]).hexdigest()}; baseline {BASE}')
+    print(f'PARITY: {len(outputs[0][0])} bytes identical; SHA-256 {hashlib.sha256(outputs[0][0]).hexdigest()}; baseline {BASE}')
+    print(outputs[0][1].decode('utf-8'),end='')
 if __name__=='__main__':main()

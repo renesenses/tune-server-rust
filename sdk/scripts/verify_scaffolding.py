@@ -12,6 +12,11 @@ import tempfile
 import wave
 import struct
 import zipfile
+import sys
+
+# Cargo/CLI output is UTF-8 even when Windows redirects Python to a cp1252 pipe.
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 
 def run(*args, expected=0, quiet=False):

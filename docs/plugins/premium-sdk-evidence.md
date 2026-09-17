@@ -68,3 +68,10 @@ python3 sdk/scripts/verify_matrix.py
 Ces résultats prouvent les périmètres exécutés, pas une qualification de tous les codecs externes, cartes son ou appareils réseau. Les écrans métier existants restent intégrés ; le SDK fournit le montage et le panneau distribué de référence, dont la qualification navigateur complète reste à effectuer. La charge multizone, CoreAudio/WASAPI, l'écoute et l'acceptation métier restent distinctes. La matrice maintient les états de production `pending`.
 
 Les paquets de développement ne sont pas une publication. Aucune clé de signature de production, configuration de confiance, fusion, release ou installation chez un utilisateur n'a été effectuée.
+
+Clôture de la parité : les compteurs locaux et le registre hôte d’écrêtage sont
+équivalents entre historique, composé et natif (1 999 échantillons écrêtés, un
+échantillon non fini, première position, pic et journal de clôture conservés).
+Le témoin utilise les sources historiques épinglées et ne partage pas le nouveau moteur.
+Sur Windows, les lecteurs de schémas et les flux de logs Python imposent UTF-8 ;
+les échecs cp1252 ont été identifiés séparément des résultats audio.
