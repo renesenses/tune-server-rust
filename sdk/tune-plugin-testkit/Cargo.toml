@@ -1,0 +1,12 @@
+[package]
+name = "tune-plugin-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Offline PCM capture and file-job host for experimental Tune plugins"
+
+[dependencies]
+tune-plugin-sdk.workspace = true
+serde_json.workspace = true
