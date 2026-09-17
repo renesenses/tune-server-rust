@@ -1352,10 +1352,6 @@ impl PlaybackOrchestrator {
             .ok();
     }
 
-    /// Recreate a local (cpal) output on demand and play to it. Only the
-    /// `local-audio` build has `outputs::local`; without that feature there is
-    /// no local backend, so this is a no-op that reports the device as missing.
-    #[cfg(feature = "local-audio")]
     /// Donne au crête-mètre de la zone le gain que la sortie applique
     /// réellement entre le point de mesure et le DAC (#4384).
     ///
@@ -1394,6 +1390,10 @@ impl PlaybackOrchestrator {
         self.playback.debrancher_le_gain_de_sortie(zone_id);
     }
 
+    /// Recreate a local (cpal) output on demand and play to it. Only the
+    /// `local-audio` build has `outputs::local`; without that feature there is
+    /// no local backend, so this is a no-op that reports the device as missing.
+    #[cfg(feature = "local-audio")]
     pub(super) async fn recreate_local_and_play(
         &self,
         device_id: &str,
