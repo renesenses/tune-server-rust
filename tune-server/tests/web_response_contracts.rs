@@ -401,7 +401,7 @@ async fn objets_persistes_respectent_leurs_contrats_web() {
     assert_eq!(radio["favorite"], true);
 
     for (route_contrat, chemin_reel) in [
-        ("/radios{}", "/api/v1/radios".to_string()),
+        ("/radios", "/api/v1/radios".to_string()),
         ("/radios/{}", format!("/api/v1/radios/{radio_id}")),
     ] {
         let payload = get_json(&app, &chemin_reel)
@@ -846,7 +846,7 @@ fn la_sonde_distingue_un_parametre_de_chemin_d_une_chaine_de_requete() {
         chemin_de_sonde("/zones/{}/dsp").as_deref(),
         Some("/api/v1/zones/1/dsp")
     );
-    // `/radios{}` vient de `${BASE}/radios${qs ? '?' + qs : ''}` : le `{}` est
+    // Ancienne notation `/radios{}` : le `{}` est
     // une chaîne de requête, pas un segment. Le traiter comme un paramètre
     // interrogerait `/api/v1/radios/1`, qui existe, et la garde raterait une
     // vraie disparition de `/radios`.
@@ -1028,3 +1028,6 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
         "le dénominateur est bien le total. payload={p}"
     );
 }
+
+#[path = "web_contracts/album_tracks_1897.rs"]
+mod album_tracks_1897;
