@@ -15,7 +15,7 @@ import zipfile
 
 
 def run(*args, expected=0, quiet=False):
-    result = subprocess.run([str(arg) for arg in args], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = subprocess.run([str(arg) for arg in args], text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     if result.returncode != expected:
         raise AssertionError(f"{args!r}: expected exit {expected}, got {result.returncode}\n{result.stdout}")
     if not quiet:
@@ -48,7 +48,7 @@ def main():
                     w.setparams((2,2,48000,1024,"NONE","not compressed"))
                     w.writeframes(b"".join(struct.pack("<h", (i%99-49)*200) for i in range(2048)))
                 settings=root/"settings.json"
-                settings.write_text(json.dumps(dict(enabled=True,listening="headphones",room_size="medium",speaker_placement="free_standing",bass_gain_db=-6,mid_gain_db=0,treble_gain_db=0,bands=[])))
+                settings.write_text(json.dumps(dict(enabled=True,listening="headphones",room_size="medium",speaker_placement="free_standing",bass_gain_db=-6,mid_gain_db=0,treble_gain_db=0,bands=[])), encoding="utf-8")
                 capture=root/"captured.wav"
                 run(binary,"dev",project,"--input",source,"--output",capture,"--settings",settings)
                 with wave.open(str(source),"rb") as a, wave.open(str(capture),"rb") as b:
@@ -67,9 +67,9 @@ def main():
             before = (project / "src/lib.rs").read_bytes()
             run(*command, expected=1)
             assert (project / "src/lib.rs").read_bytes() == before, "scaffolding must not overwrite a project"
-            manifest = json.loads((project / "manifest.json").read_text())
+            manifest = json.loads((project / "manifest.json").read_text(encoding="utf-8"))
             manifest["sdk"]["minor"] = 999
-            (project / "manifest.json").write_text(json.dumps(manifest))
+            (project / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             run(binary, "check", project, expected=1)
         run(binary, "new", "../escape", "--template", "dsp", "--sdk-path", sdk, "--output", root / "escape", expected=1)
         assert not (root / "escape").exists()

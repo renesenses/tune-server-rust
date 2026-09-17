@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess,tempfile,shutil
 ROOT=Path(__file__).resolve().parents[2]
 def run(command):
- r=subprocess.run(command,cwd=ROOT,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+ r=subprocess.run(command,cwd=ROOT,text=True,encoding="utf-8",stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
  print(r.stdout,flush=True);return r
 
 def mutation(path,transform,command,witness):
@@ -15,7 +15,7 @@ def mutation(path,transform,command,witness):
   backup=Path(tmp)/'original';shutil.copyfile(path,backup)
   try:
    assert run(command).returncode==0,'baseline failed'
-   original=path.read_text();changed=transform(original);assert changed!=original,'mutation did not apply';path.write_text(changed)
+   original=path.read_text(encoding="utf-8");changed=transform(original);assert changed!=original,'mutation did not apply';path.write_text(changed, encoding="utf-8")
    red=run(command);assert red.returncode!=0 and witness in red.stdout and 'FAILED' in red.stdout,'must fail behaviorally in the named test'
   finally:shutil.copyfile(backup,path)
   assert run(command).returncode==0,'restoration failed'

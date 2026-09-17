@@ -10,6 +10,6 @@ for name in ['sdk','equalizer','crossfeed','converter','declick']:
  for filename,value in items:
   target=crate/'schemas'/(filename+'.json')
   if args.write:
-   target.parent.mkdir(exist_ok=True);target.write_text(json.dumps(value,indent=2,ensure_ascii=False)+'\n')
-  else:assert json.loads(target.read_text())==value,f'schema drift: {target}'
+   target.parent.mkdir(exist_ok=True);target.write_text(json.dumps(value,indent=2,ensure_ascii=False)+'\n', encoding="utf-8")
+  else:assert json.loads(target.read_text(encoding="utf-8"))==value,f'schema drift: {target}'
  print('Schema matches compiled types:',name)

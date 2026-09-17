@@ -53,22 +53,22 @@ def main():
                 source=subprocess.check_output(['git','show',f'{BASE}:tune-core/src/audio/{name}.rs'],cwd=ROOT).decode()
                 if name=='crossfeed':source=source[:source.index('/// Contrainte qui prive')]
                 else:source=source.split('#[cfg(test)]')[0]
-                (p/f'src/audio/{name}.rs').write_text(source)
-            (p/'src/audio/mod.rs').write_text('pub mod eq; pub mod crossfeed; pub mod dither; pub mod ecretage;')
+                (p/f'src/audio/{name}.rs').write_text(source, encoding="utf-8")
+            (p/'src/audio/mod.rs').write_text('pub mod eq; pub mod crossfeed; pub mod dither; pub mod ecretage;', encoding="utf-8")
         else:
             for name in ['equalizer','crossfeed']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
-            (p/'src/audio/mod.rs').write_text('pub use tune_plugin_equalizer as eq; pub use tune_plugin_crossfeed as crossfeed;')
+            (p/'src/audio/mod.rs').write_text('pub use tune_plugin_equalizer as eq; pub use tune_plugin_crossfeed as crossfeed;', encoding="utf-8")
         runner=RUNNER
         if mode=='native':
             import os
             for name in ['native','sdk','audio-support']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
             for name in ['eq','crossfeed']:
-                source=(ROOT/f'tune-core/src/audio/{name}.rs').read_text()
+                source=(ROOT/f'tune-core/src/audio/{name}.rs').read_text(encoding="utf-8")
                 if name=='crossfeed':source=source[:source.index('/// Contrainte qui prive')]
-                (p/f'src/audio/{name}.rs').write_text(source)
-            (p/'src/audio/mod.rs').write_text('pub mod eq;pub mod crossfeed;pub use tune_plugin_audio_support::ecretage;')
+                (p/f'src/audio/{name}.rs').write_text(source, encoding="utf-8")
+            (p/'src/audio/mod.rs').write_text('pub mod eq;pub mod crossfeed;pub use tune_plugin_audio_support::ecretage;', encoding="utf-8")
             meta=json.loads(subprocess.check_output(['cargo','metadata','--manifest-path',str(ROOT/'sdk/Cargo.toml'),'--format-version','1','--no-deps']))
             directory=Path(meta['target_directory'])/'sdk-native'/'debug'
             extension='dll' if os.name=='nt' else ('dylib' if __import__('sys').platform=='darwin' else 'so')
@@ -78,8 +78,8 @@ def main():
                 lib=str(directory/f'{prefix}tune_plugin_{name}.{extension}')
                 initialization+=f'tune_plugin_native::register(unsafe{{tune_plugin_native::Library::load_trusted(std::path::Path::new({json.dumps(lib)}))}}.unwrap()).unwrap();'
             runner=RUNNER.replace('fn main() {','fn main() {'+initialization)
-        (p/'Cargo.toml').write_text(f'[workspace]\n[package]\nname="{package}"\nversion="0.1.0"\nedition="2024"\n[dependencies]\n{deps}')
-        (p/'src/main.rs').write_text('#![allow(dead_code)]\nmod audio;\n'+runner)
+        (p/'Cargo.toml').write_text(f'[workspace]\n[package]\nname="{package}"\nversion="0.1.0"\nedition="2024"\n[dependencies]\n{deps}', encoding="utf-8")
+        (p/'src/main.rs').write_text('#![allow(dead_code)]\nmod audio;\n'+runner, encoding="utf-8")
         outputs.append(execute(p,package))
     assert outputs[0]==outputs[1]==outputs[2], 'PCM differs from the pinned pre-extraction implementations'
     import hashlib

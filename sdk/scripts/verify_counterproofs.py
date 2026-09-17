@@ -20,7 +20,7 @@ def run(command):
 
 
 def mutate(path, old, new, command, witness, scratch):
-    source = path.read_text()
+    source = path.read_text(encoding="utf-8")
     if source.count(old) != 1:
         raise AssertionError(f"mutation site ambiguous: {path}")
     # Cargo freshness uses mtimes. A source copied from an older snapshot must
@@ -32,7 +32,7 @@ def mutate(path, old, new, command, witness, scratch):
     backup = scratch / "source.backup"
     shutil.copy2(path, backup)
     try:
-        path.write_text(source.replace(old, new))
+        path.write_text(source.replace(old, new), encoding="utf-8")
         red = run(command)
         if red.returncode != 101 or f"{witness} ... FAILED" not in red.stdout or "error[E" in red.stdout:
             raise AssertionError(f"mutation was not a behavioral failure of {witness}")
