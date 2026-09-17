@@ -10,6 +10,7 @@ use tune_core::db::engine::Engine;
 
 use crate::SmartHttpState;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
+use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
 
 #[derive(Deserialize)]
@@ -430,6 +431,24 @@ pub(crate) fn build_smart_query(
                     value.replace('\'', "''")
                 )
             }
+            // « Source » — #4299. Il n'y avait AUCUN bras : la règle tombait sur
+            // `_ => continue` et la playlist ignorait la source en silence
+            // (FabienM, fil 1812, point 14). La colonne ne vaut que `local` ou
+            // `upnp` ; une source de SERVICE ne rend donc rien ICI, et c'est
+            // `source_streaming` qui ajoute les favoris du service au résultat.
+            // `COALESCE` : une piste sans provenance écrite est locale.
+            ("source", "eq") => {
+                format!("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) = LOWER('{val_clean}')")
+            }
+            ("source", "neq") => {
+                format!("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) != LOWER('{val_clean}')")
+            }
+            ("source", "contains") => format!(
+                "LOWER(COALESCE(NULLIF(t.source, ''), 'local')) LIKE LOWER('%{val_clean}%')"
+            ),
+            ("source", "starts_with") => {
+                format!("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) LIKE LOWER('{val_clean}%')")
+            }
             ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
             // "Format contient FLAC": case-insensitive so "flac"/"FLAC"/"flc"
             // all match. Was dropped before (#1008).
@@ -585,6 +604,46 @@ fn execute_smart_track_query(
         .collect())
 }
 
+/// Ajoute au résultat les pistes FAVORITES des services que nomme une règle
+/// « Source » (#4299), puis applique la borne sur l'ensemble.
+///
+/// Les pistes de la bibliothèque viennent d'abord, dans leur tri ; les favoris
+/// de service suivent, triés selon la même clé quand elle a un sens pour eux
+/// (titre, artiste, album, date d'ajout). Un tri propre à la bibliothèque —
+/// année, durée, écoutes — ne s'applique pas à une ligne qui n'a pas la donnée.
+#[allow(clippy::too_many_arguments)]
+fn avec_favoris_de_service(
+    state: &SmartHttpState,
+    mut pistes: Vec<Value>,
+    rules_json: &str,
+    match_mode: &str,
+    profile_id: i64,
+    sort_by: &str,
+    sort_order: &str,
+    max_tracks: Option<i64>,
+) -> Result<Vec<Value>, AppError> {
+    let Some(sql) = source_streaming::requete(
+        rules_json,
+        match_mode,
+        Objet::Piste,
+        profile_id,
+        sort_by,
+        sort_order,
+        max_tracks,
+    ) else {
+        return Ok(pistes);
+    };
+    let lignes = state
+        .backend
+        .query_many(&sql, &[])
+        .map_err(AppError::internal)?;
+    pistes.extend(lignes.iter().map(|c| source_streaming::piste_json(c)));
+    if let Some(n) = max_tracks.filter(|n| *n >= 0) {
+        pistes.truncate(n as usize);
+    }
+    Ok(pistes)
+}
+
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
 fn load_smart_criteria(
     state: &SmartHttpState,
@@ -640,6 +699,16 @@ async fn resolve_tracks(
         &ctx,
     );
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+    let items = avec_favoris_de_service(
+        &state,
+        items,
+        &rules_json,
+        &match_mode,
+        profile.id(),
+        &sort_by,
+        &sort_order,
+        max_tracks,
+    )?;
 
     Ok(Json(json!(items)).into_response())
 }
@@ -715,6 +784,16 @@ async fn preview_smart_collection(
         &ctx,
     );
     let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+    let items = avec_favoris_de_service(
+        &state,
+        items,
+        &rules_json,
+        match_mode,
+        profile.id(),
+        sort_by,
+        sort_order,
+        body.max_tracks,
+    )?;
 
     Ok(Json(json!({"tracks": items, "total": items.len()})))
 }
@@ -851,6 +930,18 @@ mod tests {
             "expected a non-empty WHERE, got: {w}"
         );
         assert_eq!(w.matches(" AND ").count(), 2, "three rules → two ANDs: {w}");
+    }
+
+    // #4299 — la règle « Source » était abandonnée (`_ => continue`).
+    #[test]
+    fn source_rule_is_applied_not_dropped() {
+        let w = where_of(r#"[{"field":"source","op":"equals","value":"upnp"}]"#);
+        assert!(
+            w.contains("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) = LOWER('upnp')"),
+            "got: {w}"
+        );
+        let w = where_of(r#"[{"field":"source","op":"not_equals","value":"local"}]"#);
+        assert!(w.contains("!= LOWER('local')"), "got: {w}");
     }
 
     #[test]
