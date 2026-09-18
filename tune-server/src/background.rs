@@ -558,17 +558,18 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                             service_urls.get("avtransport"),
                             service_urls.get("renderingcontrol"),
                         ) {
-                            let base = format!("http://{}:{}", d.host, d.port);
                             let cm_url = service_urls
                                 .get("connectionmanager")
                                 .or_else(|| service_urls.get("ConnectionManager"))
-                                .map(|p| format!("{base}{p}"));
+                                .map(|p| {
+                                    crate::discovery_setup::resolve_control_url(&d.host, d.port, p)
+                                });
                             let dlna = tune_core::outputs::dlna::DlnaOutput::new(
                                 d.name.clone(),
                                 d.id.clone(),
                                 d.host.clone(),
-                                format!("{base}{av}"),
-                                format!("{base}{rc}"),
+                                crate::discovery_setup::resolve_control_url(&d.host, d.port, av),
+                                crate::discovery_setup::resolve_control_url(&d.host, d.port, rc),
                                 cm_url,
                             )
                             .with_upnp_events(

@@ -207,6 +207,8 @@ mod teneur_du_pcm_branche_3575;
 mod tests_orphelins;
 #[path = "tranches_dynamic_range.rs"]
 mod tranches_dynamic_range;
+#[path = "transfert_de_zone_joue_sur_la_cible.rs"]
+mod transfert_de_zone_joue_sur_la_cible;
 #[path = "tri_aleatoire_albums.rs"]
 mod tri_aleatoire_albums;
 #[path = "tune_tested_telechargement.rs"]
@@ -225,3 +227,6 @@ mod web_response_contracts;
 mod workflows_bornes;
 #[path = "ws_auth.rs"]
 mod ws_auth;
+
+#[path = "relance_locale_file_4298.rs"]
+mod relance_locale_file_4298;
