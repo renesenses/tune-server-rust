@@ -234,6 +234,7 @@ fn assembler_la_decision(
     forcages: ForcagesReseau,
     transcodage: TranscodagePourLaSortie,
     traitement: Traitement,
+    flac_ffmpeg_vers_le_reseau: bool,
 ) -> DecisionLocale {
     let SourceEtZone {
         sample_rate,
@@ -296,7 +297,15 @@ fn assembler_la_decision(
         // passthrough enverrait le fichier image ENTIER : l'album complet
         // sous le nom d'une de ses pistes. Seul le décodage sait couper.
         est_une_tranche_cue: tranche_cue.is_some(),
+        flac_ffmpeg_vers_le_reseau,
     });
+    if flac_ffmpeg_vers_le_reseau {
+        info!(
+            zone_id = req.zone_id,
+            file = %file_path,
+            "flac_ffmpeg_transcode_au_lieu_du_passthrough"
+        );
+    }
     if eq_forces_transcode && !needs_transcode_for_output && !dlna_needs_wav {
         info!(zone_id = req.zone_id, "eq_active_forcing_network_transcode");
     }
@@ -751,6 +760,13 @@ impl PlaybackOrchestrator {
                 &transcodage,
             )
             .await;
+        // #4350 — lu UNE fois, et seulement quand il peut changer quelque
+        // chose : un FLAC entier vers une sortie réseau. La lecture saute les
+        // blocs de métadonnées sans les charger (quelques lectures d'octets).
+        let flac_ffmpeg_vers_le_reseau = sorties.is_network_output
+            && source_format == Some(AudioFormat::Flac)
+            && tranche_cue.is_none()
+            && crate::audio::flac_vendeur::flac_ecrit_par_ffmpeg(std::path::Path::new(&file_path));
         Ok(DecisionOuResolu::Decision(assembler_la_decision(
             req,
             track,
@@ -763,6 +779,7 @@ impl PlaybackOrchestrator {
             forcages,
             transcodage,
             traitement,
+            flac_ffmpeg_vers_le_reseau,
         )))
     }
 
