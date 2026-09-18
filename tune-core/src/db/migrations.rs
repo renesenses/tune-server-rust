@@ -3016,6 +3016,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // echouer TOUTES les requetes d'albums — bibliotheque vide, partout.
     add_column_if_missing(db, "albums", "is_compilation", "INTEGER DEFAULT 0");
 
+    // Decision MANUELLE sur ce meme drapeau (#4427). NULL = personne n'a
+    // tranche. Meme passe de surete que la colonne ci-dessus : `select_album`
+    // ne la nomme pas encore, mais la route qui l'ecrit, si — et une base
+    // arrivee ici sans elle refuserait toute pose a la main.
+    // PG : migration 067.
+    add_column_if_missing(db, "albums", "compilation_manuelle", "INTEGER");
+
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
     add_column_if_missing(db, "podcast_subscriptions", "source_id", "TEXT");

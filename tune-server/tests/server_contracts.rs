@@ -41,6 +41,8 @@ mod collections_ids_orphelins;
 mod collections_ordre_albums;
 #[path = "compilation_dans_les_reponses_album.rs"]
 mod compilation_dans_les_reponses_album;
+#[path = "compilation_manuelle_4427.rs"]
+mod compilation_manuelle_4427;
 #[path = "comptes_sous_dossiers_3857.rs"]
 mod comptes_sous_dossiers_3857;
 #[path = "config_secrets_et_roles.rs"]

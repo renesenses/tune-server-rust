@@ -155,10 +155,39 @@ pub mod sql {
     /// Lève le drapeau « compilation » (#1957). `COALESCE(is_compilation, 0)`
     /// et non `is_compilation = 0` : une base migrée peut porter des NULL, et
     /// `NULL = 0` est NULL — la ligne ne serait jamais mise à jour.
+    /// #4427 — `compilation_manuelle IS NULL` : le scan ne défait jamais une
+    /// décision prise à la main. Même règle que l'enrichissement.
     pub fn mark_compilation<D: SqlDialect>(d: &D) -> String {
         format!(
             "UPDATE albums SET is_compilation = 1 \
-             WHERE id = {} AND COALESCE(is_compilation, 0) = 0",
+             WHERE id = {} AND COALESCE(is_compilation, 0) = 0 \
+             AND compilation_manuelle IS NULL",
+            d.placeholder(1)
+        )
+    }
+
+    /// Pose la DÉCISION manuelle et aligne le drapeau déduit sur elle (#4427).
+    ///
+    /// Les deux colonnes bougent ensemble : la décision pour qu'elle survive au
+    /// prochain scan, le drapeau pour que tout ce qui le lit déjà — le
+    /// regroupement, la pastille, le SELECT commun — dise la même chose sans
+    /// qu'aucune de ces lectures ait à connaître la nouvelle colonne.
+    ///
+    /// Littéraux `1`/`0` et non des paramètres liés, pour la raison écrite sur
+    /// [`set_compilation`] : la colonne est `INTEGER` sous SQLite et peut être
+    /// `TEXT` sur une base issue de `migrate-to-postgres`.
+    pub fn set_compilation_manuelle<D: SqlDialect>(d: &D, valeur: bool) -> String {
+        let v = if valeur { 1 } else { 0 };
+        format!(
+            "UPDATE albums SET compilation_manuelle = {v}, is_compilation = {v} WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// La décision manuelle d'un album : `None` si personne n'a tranché.
+    pub fn compilation_manuelle_de<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT compilation_manuelle FROM albums WHERE id = {}",
             d.placeholder(1)
         )
     }
@@ -1646,6 +1675,12 @@ impl AlbumRepo {
         is_compilation: bool,
         artist_id: Option<i64>,
     ) -> Result<(), TuneError> {
+        // #4427 — une décision manuelle prime sur la réparation, comme elle
+        // prime sur le scan. Sans cette garde, la passe C3 défairait le geste
+        // de l'utilisateur au premier passage.
+        if self.compilation_manuelle(album_id)?.is_some() {
+            return Ok(());
+        }
         let sql = self.dialect_sql(
             |d| sql::set_compilation(d, is_compilation),
             |d| sql::set_compilation(d, is_compilation),
@@ -1658,6 +1693,28 @@ impl AlbumRepo {
             self.db.execute(&sql, &params)?;
         }
         Ok(())
+    }
+
+    /// Pose (ou retire) la décision manuelle « compilation » (#4427).
+    pub fn poser_compilation_manuelle(&self, album_id: i64, valeur: bool) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(
+            |d| sql::set_compilation_manuelle(d, valeur),
+            |d| sql::set_compilation_manuelle(d, valeur),
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
+    /// Ce que l'utilisateur a tranché pour cet album, `None` si personne.
+    pub fn compilation_manuelle(&self, album_id: i64) -> Result<Option<bool>, TuneError> {
+        let sql = self.dialect_sql(sql::compilation_manuelle_de, sql::compilation_manuelle_de);
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        Ok(self
+            .db
+            .query_one(&sql, &params)?
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .map(|n| n != 0))
     }
 
     /// Les numéros de disque distincts déjà rangés sous un album, triés (C4).

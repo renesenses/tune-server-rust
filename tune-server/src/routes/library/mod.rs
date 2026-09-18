@@ -7,6 +7,7 @@ mod artwork;
 mod better_quality;
 mod browse;
 mod collections;
+mod compilation;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
@@ -418,6 +419,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/merge-duplicates",
             post(albums::merge_duplicate_albums_route),
+        )
+        // #4427 — poser le drapeau « compilation » à la main, et qu'il tienne.
+        .route("/albums/compilation", post(compilation::poser_compilation))
+        .route(
+            "/albums/compilation/graver",
+            post(compilation::graver_compilation),
         )
         .route("/artists/{id}/image", get(artists::artist_image))
         .route("/artists/{id}/timeline", get(artists::artist_timeline))

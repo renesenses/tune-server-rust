@@ -397,7 +397,14 @@ CREATE TABLE IF NOT EXISTS albums (
     -- le scan, avec exactement la decision qui a produit le regroupement — donc
     -- la pastille explique toujours ce que l'utilisateur voit.
     -- PG : SMALLINT 0/1 (migration 028), meme convention que muted/is_hidden.
-    is_compilation INTEGER DEFAULT 0
+    is_compilation INTEGER DEFAULT 0,
+    -- #4427 — ce que l'UTILISATEUR a tranché, distinct de ce que le scan a
+    -- déduit dans `is_compilation`. NULL = personne n'a tranché, le scan
+    -- décide comme avant ; 0/1 = choix explicite, que le scan ne touche plus.
+    -- Deux colonnes et non une valeur spéciale : écraser la déduction par la
+    -- décision interdirait le retour en arrière.
+    -- PG : SMALLINT (migration 067).
+    compilation_manuelle INTEGER
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,
