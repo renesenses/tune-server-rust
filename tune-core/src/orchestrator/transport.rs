@@ -1366,6 +1366,44 @@ impl PlaybackOrchestrator {
             .ok();
     }
 
+    /// Donne au crête-mètre de la zone le gain que la sortie applique
+    /// réellement entre le point de mesure et le DAC (#4384).
+    ///
+    /// Les fenêtres de niveaux d'une zone LOCALE sont prélevées au décodeur
+    /// (`resolve_local::transcoder_en_session`) : ni le volume, ni le facteur
+    /// ReplayGain, ni le préampli n'y sont encore appliqués — ils le sont dans
+    /// les rappels de rendu de `LocalOutput`. Sans ce branchement, l'aiguille
+    /// décrit le FICHIER et ne bouge pas d'un dB quand l'auditeur touche l'un
+    /// de ces trois réglages (GgB, 0.9.152, fil 1797).
+    ///
+    /// On partage l'`AtomicU32` de la sortie, pas sa valeur : un curseur bougé
+    /// en cours de piste est donc suivi sans repousser quoi que ce soit.
+    ///
+    /// Toute zone qui n'est pas sur une sortie locale VIVANTE est DÉBRANCHÉE,
+    /// jamais laissée en place : une zone rebasculée sur un rendu réseau
+    /// garderait sinon le gain de son ancien DAC, et le crête-mètre mentirait
+    /// dans l'autre sens.
+    pub(super) async fn brancher_le_gain_de_sortie(&self, zone_id: i64, device_id: &str) {
+        #[cfg(feature = "local-audio")]
+        if device_id.starts_with("local:") {
+            let arc = { self.outputs.lock().await.get(device_id) };
+            if let Some(arc) = arc {
+                let output = arc.lock().await;
+                if let Some(local_output) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    self.playback
+                        .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
+                    return;
+                }
+            }
+        }
+        #[cfg(not(feature = "local-audio"))]
+        let _ = device_id;
+        self.playback.debrancher_le_gain_de_sortie(zone_id);
+    }
+
     /// Recreate a local (cpal) output on demand and play to it. Only the
     /// `local-audio` build has `outputs::local`; without that feature there is
     /// no local backend, so this is a no-op that reports the device as missing.
@@ -1491,6 +1529,9 @@ impl PlaybackOrchestrator {
                 None => (None, device_id.to_string()),
             }
         };
+        // #4384 — avant de jouer, dire au crête-mètre quel gain la sortie
+        // appliquera en aval de son point de mesure.
+        self.brancher_le_gain_de_sortie(zone_id, device_id).await;
         if let Some(output_arc) = output_arc {
             // For OAAT outputs, arm the start position before play: the
             // native DSD direct path reads the local file itself and must
@@ -1627,8 +1668,13 @@ impl PlaybackOrchestrator {
                 }
             }
         } else if device_id.starts_with("local:") {
-            self.recreate_local_and_play(device_id, media, start_position_ms)
-                .await
+            let issue = self
+                .recreate_local_and_play(device_id, media, start_position_ms)
+                .await;
+            // La sortie vient de NAÎTRE : le branchement fait plus haut n'avait
+            // rien trouvé à brancher (#4384).
+            self.brancher_le_gain_de_sortie(zone_id, device_id).await;
+            issue
         } else {
             warn!(device_id, "output_not_found");
             (
