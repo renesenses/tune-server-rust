@@ -227,3 +227,6 @@ mod web_response_contracts;
 mod workflows_bornes;
 #[path = "ws_auth.rs"]
 mod ws_auth;
+
+#[path = "relance_locale_file_4298.rs"]
+mod relance_locale_file_4298;

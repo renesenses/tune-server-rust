@@ -39,6 +39,37 @@ Règles non négociables :
 La PR indique l'issue, la RC, l'identité de l'agent, les preuves exécutées et
 ce qui n'est pas traité.
 
+## ⛔ Ce dépôt est PUBLIC — aucune revue de sécurité en issue
+
+`renesenses/tune-server-rust` est **public** et compte des forks. Toute analyse
+qui dit **où et comment contourner un contrôle** — licence, droits Premium,
+relais cloud, authentification — ne va **jamais** dans une issue ni dans un
+commentaire d'issue : c'est un mode d'emploi publié.
+
+Elle va dans un **avis de sécurité privé** (brouillon, invisible du public) :
+
+```bash
+gh api repos/renesenses/tune-server-rust --jq .visibility      # à vérifier AVANT d'écrire
+gh api -X POST repos/renesenses/tune-server-rust/security-advisories --input avis.json
+# avis.json : {summary, description, severity, vulnerabilities:[…]} — `vulnerabilities` est OBLIGATOIRE
+```
+
+Si une telle issue existe déjà : l'**archiver**, en recopier le contenu dans un
+avis privé, puis la **supprimer** — la fermer ne suffit pas, une issue close
+reste lisible :
+
+```bash
+ID=$(gh api repos/renesenses/tune-server-rust/issues/<n> --jq .node_id)
+gh api graphql -f query='mutation($id:ID!){deleteIssue(input:{issueId:$id}){repository{name}}}' -f id="$ID"
+```
+
+Et le dire sans fard : la suppression ferme la porte, elle ne rembobine pas —
+qui a synchronisé un fork pendant l'exposition a le texte.
+
+Vécu le 17/09/2026 : une revue de licence publiée en issue, avec chemins et
+numéros de ligne, restée publique deux heures. Un commentaire de réponse avait
+en plus annoncé qu'un contrôle de production était inactif.
+
 ## Ce qu'est une preuve
 
 « N tests réussis » mesure un **périmètre**, pas une propriété. Un vert ne

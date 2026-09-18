@@ -35,6 +35,10 @@ struct RendererSession {
     /// SetAVTransportURI l'efface : enchaîner après un arrêt voulu serait
     /// une surprise, pas du gapless.
     next: Option<NextItem>,
+    // Contexte UPnP et lecture effectivement démarrée par ce contexte.
+    // L'URI seule ne distingue pas deux lectures successives du même titre.
+    revision: u64,
+    play_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,10 +56,21 @@ fn sessions() -> &'static Mutex<HashMap<i64, RendererSession>> {
 }
 
 /// Zones dont le watcher d'enchaînement tourne déjà — un seul par zone.
+///
+/// Registre SÉPARÉ de `sessions` (#3967) : il survit au remplacement de la
+/// session par un nouveau `SetAVTransportURI`, et c'est lui qui sérialise la
+/// pose d'une suivante avec la libération du watcher — voir
+/// `try_release_watcher` pour l'ordre des verrous.
 fn watchers() -> &'static Mutex<std::collections::HashSet<i64>> {
     static WATCHERS: std::sync::OnceLock<Mutex<std::collections::HashSet<i64>>> =
         std::sync::OnceLock::new();
     WATCHERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+fn nouvelle_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVISION: AtomicU64 = AtomicU64::new(1);
+    REVISION.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Réveil de l'annonceur SSDP : un opt-in fraîchement activé doit s'annoncer
@@ -297,6 +312,8 @@ async fn avtransport_control(
                         artist,
                         duration_ms,
                         next: None,
+                        revision: nouvelle_revision(),
+                        play_seq: None,
                     },
                 );
             }
@@ -345,6 +362,7 @@ async fn avtransport_control(
                         .await
                     {
                         Ok(()) => {
+                            memoriser_lecture_renderer(&state, zone_id, &session).await;
                             info!(zone_id, uri = %session.uri, "upnp_renderer_play_resumed");
                             upnp_renderer::empty_response("Play")
                         }
@@ -368,7 +386,10 @@ async fn avtransport_control(
                         ..Default::default()
                     };
                     match state.orchestrator.play(req).await {
-                        Ok(_) => {
+                        Ok(result) => {
+                            if result.error.is_none() {
+                                memoriser_lecture_renderer(&state, zone_id, &session).await;
+                            }
                             info!(zone_id, uri = %session.uri, "upnp_renderer_play");
                             upnp_renderer::empty_response("Play")
                         }
@@ -397,17 +418,28 @@ async fn avtransport_control(
                 && let Some(session) = s.get_mut(&zone_id)
             {
                 session.next = None;
+                session.play_seq = None;
+                session.revision = nouvelle_revision();
             }
             state.orchestrator.stop(zone_id, device_id.as_deref()).await;
             upnp_renderer::empty_response("Stop")
         }
         RendererCommand::Seek(ms) => {
+            let session = sessions()
+                .lock()
+                .ok()
+                .and_then(|s| s.get(&zone_id).cloned());
             match state
                 .orchestrator
                 .seek(zone_id, ms, device_id.as_deref())
                 .await
             {
-                Ok(()) => upnp_renderer::empty_response("Seek"),
+                Ok(()) => {
+                    if let Some(session) = session {
+                        memoriser_lecture_renderer(&state, zone_id, &session).await;
+                    }
+                    upnp_renderer::empty_response("Seek")
+                }
                 Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
             }
         }
@@ -534,6 +566,31 @@ fn doit_reprendre(
     etat == tune_core::playback::PlayState::Paused && uri_en_cours == Some(uri_de_session)
 }
 
+/// La lecture en cours appartient-elle encore à CETTE session UPnP ? (#4324)
+///
+/// L'URI seule ne suffit pas à l'affirmer — c'est le rôle de `play_seq` —
+/// mais elle disqualifie tout de suite une lecture d'une autre source.
+fn lecture_de_session(session: &RendererSession, ps: &tune_core::playback::ZoneState) -> bool {
+    ps.now_playing.as_ref().is_some_and(|np| {
+        np.source == "upnp" && np.source_id.as_deref() == Some(session.uri.as_str())
+    })
+}
+
+/// Une commande UPnP qui réussit rattache sa lecture au contexte encore actif
+/// (#4324). Un SetURI/Stop intervenu pendant la résolution ne peut pas être
+/// réarmé par le résultat tardif d'une ancienne commande : la `revision` du
+/// contexte est comparée avant d'inscrire le `play_seq` propriétaire.
+async fn memoriser_lecture_renderer(state: &AppState, zone_id: i64, played: &RendererSession) {
+    let ps = state.playback.get_state(zone_id).await;
+    if let Ok(mut sessions) = sessions().lock()
+        && let Some(session) = sessions.get_mut(&zone_id)
+        && session.revision == played.revision
+        && lecture_de_session(session, &ps)
+    {
+        session.play_seq = Some(ps.play_seq);
+    }
+}
+
 /// Libère le watcher d'une zone — mais SEULEMENT s'il ne reste rien à
 /// enchaîner (#3967).
 ///
@@ -575,35 +632,49 @@ fn try_release_watcher(zone_id: i64) -> bool {
 
 /// Promeut la suivante en piste courante, de façon ATOMIQUE (#3967).
 ///
-/// Le watcher a lu la suivante en début de tour, puis a attendu l'état de
-/// transport (`get_state().await`). Pendant cette attente, un point de
-/// contrôle a pu REMPLACER la suivante. Relire ici, sous le verrou, évite de
-/// démarrer l'élément périmé — critère « replacement next URI [...] do not
-/// start a stale item » de #3967 — et évite du même coup que l'installation de
-/// la piste promue écrase ce remplacement.
+/// Le watcher a décidé de promouvoir en début de tour, puis a relâché le
+/// verrou. Pendant ce laps, un point de contrôle a pu REMPLACER la suivante.
+/// Relire ici, sous le verrou, évite de démarrer l'élément périmé — critère
+/// « replacement next URI [...] do not start a stale item » de #3967 — et
+/// évite du même coup que l'installation de la piste promue écrase ce
+/// remplacement.
 ///
-/// Rend la suivante réellement promue, ou `None` si elle a disparu entre-temps
-/// (un Stop commandé l'efface).
-fn promouvoir_la_suivante(zone_id: i64) -> Option<NextItem> {
+/// #4324 : la promotion ouvre un NOUVEAU contexte de lecture — `revision`
+/// avance et `play_seq` repart à `None`, si bien qu'aucun état observé avant
+/// la promotion ne peut être pris pour celui de la piste promue.
+///
+/// Rend la session promue (clonée pour `memoriser_lecture_renderer`), ou
+/// `None` si la suivante a disparu entre-temps (un Stop commandé l'efface).
+fn promouvoir_la_suivante(zone_id: i64) -> Option<RendererSession> {
     let mut carte = sessions().lock().ok()?;
     let session = carte.entry(zone_id).or_default();
     let promue = session.next.take()?;
-    *session = RendererSession {
-        uri: promue.uri.clone(),
-        title: promue.title.clone(),
-        artist: promue.artist.clone(),
-        duration_ms: promue.duration_ms,
-        next: None,
-    };
-    Some(promue)
+    session.uri = promue.uri;
+    session.title = promue.title;
+    session.artist = promue.artist;
+    session.duration_ms = promue.duration_ms;
+    session.revision = nouvelle_revision();
+    session.play_seq = None;
+    Some(session.clone())
+}
+
+/// Ce que le watcher doit faire à la fin d'un tour, décidé en UNE section
+/// critique sur `sessions` (#4324) : la comparaison du contexte, le constat
+/// « plus rien à enchaîner » et la détection de reprise ne doivent pas
+/// pouvoir s'entrelacer avec un Play/SetURI.
+enum SuiteDuTour {
+    /// Rien à faire ce tour-ci : on réobserve dans 2 s.
+    Attendre,
+    /// Plus rien à enchaîner : demander la libération (#3967).
+    Liberer,
+    /// Fin naturelle de la lecture possédée : promouvoir la suivante.
+    Promouvoir,
 }
 
 /// Enchaîne la piste posée par SetNextAVTransportURI quand la courante se
 /// termine (#1750, gapless v1). Aucun événement de fin de piste n'existe sur
 /// le bus (`playback.stopped` n'est jamais émis) : on observe l'état toutes
-/// les 2 s. Enchaînement = la zone était en LECTURE avec une suivante posée,
-/// et passe à STOPPED — un arrêt commandé via notre Stop a déjà effacé la
-/// suivante, donc ne relance rien.
+/// les 2 s.
 ///
 /// v1 assumée : l'enchaînement passe par un play complet — le contrat UPnP
 /// (le point de contrôle n'a pas à re-commander) est tenu, le zéro-gap réel
@@ -614,6 +685,13 @@ fn promouvoir_la_suivante(zone_id: i64) -> Option<NextItem> {
 /// comportement normal de BubbleUPnP sur un album — trouvait sinon un watcher
 /// déjà retiré, et la chaîne s'arrêtait là. La boucle continue donc tant que
 /// `try_release_watcher` refuse de la libérer.
+///
+/// #4324 : seul l'arrêt de la lecture appartenant ENCORE au contexte UPnP
+/// peut consommer sa suivante — d'où `play_seq`, le propriétaire inscrit par
+/// `memoriser_lecture_renderer`. Le now-playing est conservé à l'arrêt ; une
+/// reprise Tune suivie d'un arrêt entre deux ticks reste donc détectable, et
+/// la suivante périmée est abandonnée au lieu d'être lancée par-dessus. Un
+/// SetNext avant Play est autorisé, mais n'arme aucune lecture étrangère.
 fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
     {
         let Ok(mut w) = watchers().lock() else { return };
@@ -622,62 +700,88 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
         }
     }
     tokio::spawn(async move {
-        let mut was_playing = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let une_suivante_attend = sessions()
+            let observed = sessions()
                 .lock()
                 .ok()
-                .and_then(|s| s.get(&zone_id).map(|session| session.next.is_some()))
-                .unwrap_or(false);
-            if !une_suivante_attend {
+                .and_then(|sessions| sessions.get(&zone_id).map(|s| (s.revision, s.play_seq)));
+            let ps = state.playback.get_state(zone_id).await;
+            let suite = {
+                let Ok(mut sessions) = sessions().lock() else {
+                    return;
+                };
+                let Some(session) = sessions.get_mut(&zone_id) else {
+                    return;
+                };
+                // Ne pas comparer un état lu avant un nouveau Play/SetURI
+                // avec le propriétaire installé pendant cette lecture.
+                if observed != Some((session.revision, session.play_seq)) {
+                    SuiteDuTour::Attendre
+                } else if session.next.is_none() {
+                    SuiteDuTour::Liberer
+                } else if let Some(owner) = session.play_seq {
+                    if owner != ps.play_seq || !lecture_de_session(session, &ps) {
+                        // Tune a repris la zone : la suivante du renderer est
+                        // périmée, elle ne doit pas s'imposer par-dessus.
+                        session.next = None;
+                        session.play_seq = None;
+                        info!(zone_id, "upnp_renderer_next_discarded_after_takeover");
+                        SuiteDuTour::Liberer
+                    } else if ps.state != tune_core::playback::PlayState::Stopped {
+                        SuiteDuTour::Attendre
+                    } else {
+                        SuiteDuTour::Promouvoir
+                    }
+                } else {
+                    // SetNext posé avant Play : on attend la commande du
+                    // renderer, sans armer la lecture d'un autre.
+                    SuiteDuTour::Attendre
+                }
+            };
+            match suite {
+                SuiteDuTour::Attendre => continue,
+                SuiteDuTour::Liberer => {
+                    if try_release_watcher(zone_id) {
+                        return;
+                    }
+                    continue;
+                }
+                SuiteDuTour::Promouvoir => {}
+            }
+            // Fin naturelle : promouvoir la suivante et relancer.
+            let Some(promoted) = promouvoir_la_suivante(zone_id) else {
+                // Effacée entre-temps (Stop commandé) : rien à jouer.
                 if try_release_watcher(zone_id) {
                     return;
                 }
                 continue;
-            }
-
-            let ps = state.playback.get_state(zone_id).await;
-            match ps.state {
-                tune_core::playback::PlayState::Playing => was_playing = true,
-                tune_core::playback::PlayState::Paused => {}
-                tune_core::playback::PlayState::Stopped if was_playing => {
-                    // Fin naturelle : promouvoir la suivante et relancer.
-                    let Some(next) = promouvoir_la_suivante(zone_id) else {
-                        // Effacée entre-temps (Stop commandé) : rien à jouer.
-                        if try_release_watcher(zone_id) {
-                            return;
-                        }
-                        was_playing = false;
-                        continue;
-                    };
-                    let device_id = ZoneRepo::with_backend(state.backend.clone())
-                        .get(zone_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|z| z.output_device_id);
-                    let req = tune_core::orchestrator::PlayRequest {
-                        zone_id,
-                        output_device_id: device_id,
-                        track_id: None,
-                        source: Some("upnp".into()),
-                        source_id: Some(next.uri.clone()),
-                        title: next.title,
-                        artist_name: next.artist,
-                        duration_ms: next.duration_ms,
-                        ..Default::default()
-                    };
-                    match state.orchestrator.play(req).await {
-                        Ok(_) => info!(zone_id, uri = %next.uri, "upnp_renderer_gapless_advance"),
-                        Err(e) => {
-                            warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed")
-                        }
+            };
+            let device_id = ZoneRepo::with_backend(state.backend.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
+            let req = tune_core::orchestrator::PlayRequest {
+                zone_id,
+                output_device_id: device_id,
+                source: Some("upnp".into()),
+                source_id: Some(promoted.uri.clone()),
+                title: promoted.title.clone(),
+                artist_name: promoted.artist.clone(),
+                duration_ms: promoted.duration_ms,
+                ..Default::default()
+            };
+            match state.orchestrator.play(req).await {
+                Ok(result) => {
+                    if let Some(error) = result.error {
+                        warn!(zone_id, error, "upnp_renderer_gapless_advance_failed");
+                    } else {
+                        memoriser_lecture_renderer(&state, zone_id, &promoted).await;
+                        info!(zone_id, uri = %promoted.uri, "upnp_renderer_gapless_advance");
                     }
-                    // La piste promue repart de zéro : on réattend un passage
-                    // LECTURE → STOPPED avant la promotion suivante.
-                    was_playing = false;
                 }
-                tune_core::playback::PlayState::Stopped => {}
+                Err(e) => warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed"),
             }
         }
     });
@@ -1235,3 +1339,7 @@ mod enchainement_upnp_3967_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_4324.rs"]
+mod session_4324_tests;
