@@ -32,6 +32,9 @@
 //! dans `local.rs` parce que la branche compressée s'en sert aussi.
 
 use super::*;
+// #3208 — nommées explicitement plutôt que reprises du glob : ce module ouvre
+// le chemin PCM, et c'est ici que la période choisie doit atteindre cpal.
+use super::periode::{avec_periode, config_de_flux, garde_de_prechargement};
 use crate::outputs::traits::PuitsNatif;
 
 /// Ce que `play_url` sait au moment d'ouvrir, et rien de plus.
@@ -565,13 +568,8 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 // `AtSourceRateMeasured` sans `enumerated`, que
                 // `decide_local_rate_opening` ne peut pas produire.
                 _ => {
-                    let cfg = find_matching_config(&device, channels, sample_rate).unwrap_or(
-                        cpal::StreamConfig {
-                            channels,
-                            sample_rate,
-                            buffer_size: cpal::BufferSize::Default,
-                        },
-                    );
+                    let cfg = find_matching_config(&device, channels, sample_rate)
+                        .unwrap_or_else(|| config_de_flux(channels, sample_rate));
                     let opened = cfg.sample_rate;
                     info!(
                         source_sr = sample_rate,
@@ -603,6 +601,11 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             output_config,
             channels,
         );
+        // #3208 — la cadence et les canaux sont décidés ; la PÉRIODE ne l'était
+        // jamais. La configuration nominale sort de `default_output_config()`,
+        // donc avec le `buffer_size` de cpal : c'est cette ligne, et non les
+        // littéraux de repli, qui porte la période sur le chemin nominal.
+        let output_config = avec_periode(output_config);
 
         // Build output stream at the chosen rate.
         let silent_cb_outer = force_silent.clone();
@@ -652,8 +655,11 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
         ring_buf.clear(); // Defensive: zero-fill before callback can read
         // Minimum buffer: ~200ms of audio before the callback starts reading.
         // sr * ch / 5 = 200ms of interleaved samples.
-        let min_buffer =
+        // #3208 — compté en PÉRIODES dès qu'une période est imposée ; sinon ce
+        // compte-ci, au sample près.
+        let min_buffer_ms =
             (output_config.sample_rate as usize) * (output_config.channels as usize) / 5;
+        let min_buffer = garde_de_prechargement(&output_config, min_buffer_ms);
         let stream_result = build_stream(
             &output_config,
             ring_buf.clone(),
@@ -670,19 +676,16 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             Err(first_err) => {
                 // Last resort: try the source sample rate directly —
                 // some platforms (PipeWire) accept arbitrary rates.
-                let source_cfg = cpal::StreamConfig {
-                    channels,
-                    sample_rate,
-                    buffer_size: cpal::BufferSize::Default,
-                };
+                let source_cfg = config_de_flux(channels, sample_rate);
                 let ring_cap_fb =
                     (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) * 2;
                 starvation.begin_stream(source_cfg.sample_rate, source_cfg.channels);
                 let ring_fb = Arc::new(RingBuf::new_metered(ring_cap_fb, starvation.clone()));
                 ring_fb.clear();
                 data_started_shared.store(false, Ordering::SeqCst);
-                let min_buffer_fb =
+                let min_buffer_fb_ms =
                     (source_cfg.sample_rate as usize) * (source_cfg.channels as usize) / 2;
+                let min_buffer_fb = garde_de_prechargement(&source_cfg, min_buffer_fb_ms);
                 match build_stream(
                     &source_cfg,
                     ring_fb.clone(),
@@ -715,8 +718,9 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                             None;
                         'int_cascade: for cand in &candidates {
                             let cap = (cand.sample_rate as usize) * (cand.channels as usize) * 2;
-                            let min_buf =
+                            let min_buf_ms =
                                 (cand.sample_rate as usize) * (cand.channels as usize) / 5;
+                            let min_buf = garde_de_prechargement(cand, min_buf_ms);
                             for is_i32 in [true, false] {
                                 starvation.begin_stream(cand.sample_rate, cand.channels);
                                 let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));

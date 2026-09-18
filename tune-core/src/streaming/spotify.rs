@@ -211,6 +211,7 @@ impl SpotifyService {
             track_number: item["track_number"].as_u64().map(|n| n as u32),
             disc_number: item["disc_number"].as_u64().map(|n| n as u32),
             explicit: item["explicit"].as_bool().unwrap_or(false),
+            disponible: None,
             isrc: item["external_ids"]["isrc"].as_str().map(Into::into),
             composer: None,
             artist_id: None,
@@ -248,6 +249,7 @@ impl SpotifyService {
                 .as_str()
                 .and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["total_tracks"].as_u64().unwrap_or(0) as u32,
+            released_at: None,
             quality: None,
         }
     }
@@ -667,6 +669,7 @@ impl StreamingService for SpotifyService {
                             cover_path: t.cover_path.clone(),
                             year: None,
                             track_count: 0,
+                            released_at: None,
                             quality: None,
                         });
                         if albums.len() >= limit {

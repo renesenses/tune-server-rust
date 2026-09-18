@@ -16,6 +16,10 @@ use tune_core::event_types::EventType;
 use crate::config::TuneConfig;
 use crate::state::AppState;
 
+#[cfg(test)]
+#[path = "discovery_media_server_tests_3786.rs"]
+mod media_server_tests_3786;
+
 /// Resolve a UPnP service `controlURL` (from the device description) into an
 /// absolute URL usable by the SOAP client.
 ///
@@ -356,7 +360,7 @@ pub fn spawn_ssdp_handler(
     config: &TuneConfig,
     oh_listener: Option<Arc<UpnpEventListener>>,
 ) {
-    let (ssdp_tx, mut ssdp_rx) = tokio::sync::mpsc::channel(64);
+    let (ssdp_tx, ssdp_rx) = tokio::sync::mpsc::channel(64);
     {
         let scanner = state.scanner.clone();
         tokio::spawn(async move {
@@ -368,6 +372,18 @@ pub fn spawn_ssdp_handler(
         });
     }
 
+    spawn_ssdp_event_handler(state, config, oh_listener, ssdp_rx);
+}
+
+/// Le consommateur commun à la découverte réelle et au banc sans réseau.
+/// Séparer la réception des annonces du démarrage du scanner permet de tester
+/// l'inscription et la liste HTTP sans lancer de multicast sur le réseau.
+fn spawn_ssdp_event_handler(
+    state: &AppState,
+    config: &TuneConfig,
+    oh_listener: Option<Arc<UpnpEventListener>>,
+    mut ssdp_rx: tokio::sync::mpsc::Receiver<tune_core::discovery::ssdp::SsdpEvent>,
+) -> tokio::task::JoinHandle<()> {
     let outputs = state.outputs.clone();
     let db = state.backend.clone();
     let config = config.clone();
@@ -418,10 +434,9 @@ pub fn spawn_ssdp_handler(
                     info!(id = %id, kept_registered = soap_wakeable, "device_lost_zone_offline");
                 }
                 SsdpEvent::MediaServerDiscovered(ms) => {
-                    // Notre propre MediaServer : on ne se range pas dans sa
-                    // propre liste de serveurs du reseau (#3688). Le meme
-                    // rideau que pour les renderers, sur le chemin jumeau qui
-                    // n'en avait aucun.
+                    // Un MediaServer est une source navigable, pas une sortie.
+                    // #3786 : l'exclure comme un MediaRenderer a retiré Tune
+                    // de sa propre liste en v0.9.144, sans protéger aucune zone.
                     let notre_udn = tune_core::upnp_server::media_server_advert().map(|a| a.uuid);
                     if est_notre_propre_serveur_multimedia(
                         &ms,
@@ -429,25 +444,11 @@ pub fn spawn_ssdp_handler(
                         &nos_adresses(config.advertised_ip.as_deref()),
                         notre_udn.as_deref(),
                     ) {
-                        // INFO, pas DEBUG : ce rideau RETIRE une entree de la
-                        // liste « Serveurs multimedia » que le testeur voit.
-                        // Le journal du ticket support 61 montre Tune lui-meme
-                        // enregistre comme serveur multimedia et presente dans
-                        // sa liste (`media_server_registered`
-                        // id=uuid:c4467384-…, 0.9.119) ; le ticket 97 dit qu'il
-                        // lisait « depuis le nas freebox ET DEPUIS TUNE ».
-                        // Depuis #3688 cette entree disparait — a raison ou
-                        // non, ce n'est pas la question ici. Sous DEBUG, un
-                        // testeur qui redit « plus de serveurs multimedia »
-                        // joindrait un journal qui n'en porte pas la trace, et
-                        // l'instruction repartirait a zero comme pour #2718.
                         info!(
                             id = %ms.id,
                             name = %ms.name,
-                            location = %ms.location,
-                            "ssdp_notre_propre_serveur_multimedia_ignore"
+                            "ssdp_notre_propre_serveur_multimedia_conserve"
                         );
-                        continue;
                     }
                     let id = ms.id.clone();
                     // #2219 phase 1 — le registre DURABLE. Le serveur entre en
@@ -473,7 +474,7 @@ pub fn spawn_ssdp_handler(
                 }
             }
         }
-    });
+    })
 }
 
 /// Charge utile de `zone.created`, dans la forme que le client attend.
@@ -580,37 +581,14 @@ fn est_un_de_nos_udn_de_facade(db: &Arc<dyn DbBackend>, device_id: &str) -> bool
     !device_id.is_empty() && nos_udn_de_facade(db).iter().any(|u| u == device_id)
 }
 
-/// Reconnaitre notre PROPRE serveur multimedia dans une annonce SSDP.
+/// Identifier notre propre MediaServer pour le journal, sans l'exclure.
+/// Depuis #3786, cette identité n'empêche plus son inscription : il expose
+/// des dossiers, contrairement à une façade MediaRenderer qui crée une zone.
+/// Les protections de ces façades restent dans `handle_ssdp_discovered`.
 ///
-/// Le troisieme rideau. Les deux premiers — [`est_notre_propre_renderer`]
-/// (#2101, #2202) et [`est_un_de_nos_udn_de_facade`] (#2410) — ne gardent que
-/// le chemin `SsdpEvent::DeviceDiscovered`, celui des RENDERERS. Le chemin
-/// jumeau `SsdpEvent::MediaServerDiscovered` n'en avait aucun : il inserait
-/// dans le registre `media_servers` tout ce que le scanner lui donnait.
-///
-/// Or Tune publie AUSSI un MediaServer, et il l'annonce sur le meme groupe
-/// multicast que les appareils du reseau (`upnp_server::spawn_ssdp_advertiser`,
-/// `LOCATION` = [`tune_core::upnp_server::advert_location`]). Son propre
-/// ecouteur SSDP recoit cette annonce — et, depuis #1750, repond meme a ses
-/// propres M-SEARCH. Le serveur se rangeait donc dans sa propre liste de
-/// serveurs multimedia : « Tune Server » apparaissait dans Reglages > Serveurs
-/// multimedia comme un voisin, navigable par UPnP, alors que c'est la
-/// bibliotheque deja ouverte a l'ecran.
-///
-/// ⚠️ Ce rideau ne cree ni ne supprime aucune zone : un serveur multimedia
-/// n'est pas une sortie. Il ne repare donc PAS les zones fantomes deja
-/// persistees chez les testeurs de #3688 — voir le corps de la PR.
-///
-/// Les deux criteres, dans cet ordre, et pour la meme raison qu'au rideau des
-/// facades : l'UDN d'abord, parce qu'il ne depend d'aucune enumeration
-/// d'interfaces et survit a un `LOCATION` porte par un nom d'hote ; l'adresse
-/// ensuite, pour le cas ou l'annonceur n'a pas encore publie son UDN.
-///
-/// Et, comme pour les renderers, le test porte sur les TROIS a la fois —
-/// chemin de montage, port d'API, adresse locale. Le chemin et le port seuls
-/// ecarteraient aussi le MediaServer d'un AUTRE Tune du reseau, qui est, lui,
-/// un serveur parfaitement navigable : c'est nous qu'il faut exclure, pas nos
-/// semblables.
+/// L'UDN suffit même quand l'adresse change. À défaut, les trois critères
+/// chemin de montage, port d'API et adresse locale doivent correspondre.
+/// Un autre Tune du réseau reste identifié comme voisin.
 fn est_notre_propre_serveur_multimedia(
     ms: &tune_core::discovery::ssdp::MediaServerInfo,
     port_api: u16,
@@ -3077,19 +3055,9 @@ mod tests {
         }
     }
 
-    /// 🔴 #3688 — le troisieme rideau d'auto-exclusion.
-    ///
-    /// SITE D'APPEL GARDE : `spawn_ssdp_handler`, bras
-    /// `SsdpEvent::MediaServerDiscovered`, qui appelle
-    /// `est_notre_propre_serveur_multimedia(&ms, config.port, &nos_adresses(),
-    /// notre_udn.as_deref())` avant `media_servers.lock().await.insert(...)`.
-    ///
-    /// Les fixtures ne sont pas ecrites a la main : la `LOCATION` vient de
-    /// `tune_core::upnp_server::advert_location`, LA fonction qui compose ce
-    /// que l'annonceur publie, et l'`id` vient de la meme forme d'UDN que
-    /// `UpnpServer` tire au sort. Si la forme de l'annonce change, la garde
-    /// tombe avec elle au lieu de continuer a mesurer a vide.
-    mod auto_exclusion_du_serveur_multimedia {
+    /// L'identification pour le journal reste précise. L'inscription observable
+    /// du propre MediaServer est couverte par `media_server_tests_3786`.
+    mod identification_du_serveur_multimedia {
         use super::super::est_notre_propre_serveur_multimedia;
         use tune_core::discovery::ssdp::MediaServerInfo;
 
@@ -3157,14 +3125,8 @@ mod tests {
             );
         }
 
-        /// SECONDE MOITIE — la contre-epreuve. Trois voisins qui doivent tous
-        /// PASSER : un vrai serveur multimedia du reseau, un AUTRE Tune du
-        /// reseau (meme chemin, meme port, autre adresse), et notre propre
-        /// adresse mais sur un AUTRE port que celui de notre API.
-        ///
-        /// Sans elle, un rideau qui rendrait `true` en toutes circonstances
-        /// serait vert au premier test et ferait disparaitre tous les serveurs
-        /// multimedia des testeurs.
+        /// Trois voisins ne doivent pas être identifiés comme nous : un vrai
+        /// serveur du réseau, un autre Tune et un serveur sur un autre port.
         #[test]
         fn les_serveurs_du_reseau_et_nos_semblables_passent() {
             let a_nous = nos_adresses();

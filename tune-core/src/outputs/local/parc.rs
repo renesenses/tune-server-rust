@@ -808,9 +808,19 @@ pub(super) fn list_audio_devices_uncached(backend: &str) -> Vec<AudioDevice> {
                     hardware_detail_from_description(desc, &raw_name, &endpoint_id)
                 });
 
-                // Skip ALSA null/dummy sinks that produce no audio
-                if is_null_sink(&raw_name) {
-                    debug!(device = %raw_name, "local_audio_device_skipped_null_sink");
+                // Écarter les puits d'ALSA, qui ne produisent aucun son.
+                // La décision se prend sur le nom de PCM (`endpoint_id`), pas
+                // sur la description : c'est cette description-là qui s'était
+                // retrouvée affichée comme NOM de zone sur le .18
+                // (« Discard all samples (playback) or… »).
+                if is_null_sink(&endpoint_id, &raw_name) {
+                    // Écarter une sortie est une décision qui change ce que
+                    // l'écran propose : elle ne passe pas en silence (#3209).
+                    info!(
+                        device = %raw_name,
+                        endpoint_id = %endpoint_id,
+                        "local_audio_device_skipped_null_sink"
+                    );
                     continue;
                 }
 
