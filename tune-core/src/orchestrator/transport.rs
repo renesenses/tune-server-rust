@@ -335,6 +335,20 @@ impl PlaybackOrchestrator {
         // demandeur en fournit un, ce n'en est pas une.
         let zone_navigateur = self.resoudre_la_sortie_de_la_zone(&mut req).await?;
 
+        // #4323 — le MediaRenderer nous rend une URI, pas une piste.
+        //
+        // Quand cette URI est celle sous laquelle NOUS publions l'audio d'une
+        // piste de la bibliothèque, le `track_id` se relit dedans. Posé ICI,
+        // avant toute résolution : `resolve_stream` y prend le titre, le
+        // `now_playing` y prend la pochette et le format, et `record_listen` y
+        // prend l'album — les deux endroits que l'issue nomme, la lecture en
+        // cours ET l'historique, sont en aval de cette ligne et d'elle seule.
+        //
+        // Après `resoudre_la_sortie_de_la_zone`, qui est l'autre retouche de
+        // la demande, et avant le rebond de génération : rien entre les deux ne
+        // lit `req.track_id`.
+        self.resoudre_l_uri_en_piste_de_bibliotheque(&mut req);
+
         // Clean up any gapless-prepared session for this zone before
         // creating a new stream.
         self.cleanup_gapless_session(req.zone_id).await;

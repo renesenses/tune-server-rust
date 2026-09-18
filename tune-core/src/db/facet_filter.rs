@@ -484,6 +484,83 @@ pub fn pistes_album_distant_double_exclu() -> String {
     )
 }
 
+/// Prédicat « cette ligne n'est pas la copie de MOINDRE qualité d'une piste
+/// que la vue montre déjà » (#4101) — alias `t`, celui de
+/// `TrackRepo::sql::select_track()`.
+///
+/// ## Ce que JeromeQ voyait (forum 1781, 13/09/2026)
+///
+/// Led Zeppelin IV, huit pistes, **seize lignes** dans la vue Oxygen : chaque
+/// titre deux fois, avec le même numéro de piste. La fiche de l'album, elle,
+/// en montrait huit, et la file d'attente en enfilait huit.
+///
+/// ## Où naît le doublon, et pourquoi il ne se voyait QUE là
+///
+/// Pas dans une jointure : les trois jointures de `select_track()` portent sur
+/// des clés primaires et ne peuvent pas multiplier une ligne. Pas dans la
+/// pagination : le client écarte déjà les identifiants qu'il connaît. Ce sont
+/// **deux lignes `tracks` bien réelles**, une par fichier — le cas #1362 de
+/// Cyrille Moutia, un CD rippé posé à côté d'une copie récupérée ailleurs,
+/// dans le même dossier donc dans le même album.
+///
+/// Le repli de ces copies EXISTE depuis #1362, et il est posé sur les trois
+/// autres surfaces : la fiche d'un album
+/// ([`crate::db::track_repo::dedup_display_tracks`]), la file
+/// (`resoudre_pistes_d_album`) et le compteur `albums.track_count`
+/// ([`crate::db::track_repo::sql_compte_pistes_visibles`]). Il n'a jamais été
+/// posé sur `GET /library/tracks` — **la seule route que la vue Oxygen
+/// appelle**. Un dédoublonnage qui n'agit que sur un chemin : voilà le défaut.
+///
+/// ## Pourquoi en SQL et pas en repliant la page rendue
+///
+/// Parce que la vue est PAGINÉE. Replier la page après coup rendrait 195
+/// lignes pour une fenêtre de 200 en annonçant un `total` qui, lui, compterait
+/// les 200 : la fenêtre suivante partirait d'un mauvais décalage et sauterait
+/// des pistes. Même raison que [`album_distant_double_exclu`] — la liste et
+/// son compteur excluent EXACTEMENT le même ensemble.
+///
+/// ## La clé, et le survivant
+///
+/// La clé est celle de [`crate::db::track_repo::dedup_display_tracks`] mot
+/// pour mot : album, disque, numéro, titre en minuscules sans blancs de bord.
+/// Deux morceaux réellement distincts n'y collisionnent pas.
+///
+/// Le survivant est la copie de **meilleure qualité** (#1362 : l'AIFF, pas
+/// l'AAC), barème [`crate::library::quality::score_qualite`] transcrit par son
+/// jumeau SQL. À score égal, la ligne de plus petit `id` — un départage
+/// TOTAL, sans lequel deux copies jumelles se masqueraient l'une l'autre et la
+/// piste disparaîtrait entièrement.
+///
+/// ## Deux écarts DÉLIBÉRÉS avec le repli en mémoire
+///
+/// * une piste **sans album** (`t.album_id` NUL) n'est jamais repliée. En
+///   Rust la clé est un `Option<i64>` et `None == None` : deux pistes sans
+///   album qui partagent un numéro et un titre se replient l'une sur l'autre,
+///   à travers toute la bibliothèque. Ici `mieux.album_id = t.album_id` est
+///   NUL-sûr et ne rapproche rien — c'est la portée de
+///   [`crate::db::track_repo::sql_compte_pistes_visibles`], qui compte déjà
+///   par album ;
+/// * `LOWER` de SQLite ne replie que l'ASCII, là où `to_lowercase` de Rust
+///   replie tout l'Unicode : deux lignes qui ne diffèrent QUE par la casse
+///   d'une lettre accentuée restent deux lignes ici. Même écart, déjà
+///   documenté, que le compteur de pistes visibles — il ne fait pas
+///   apparaître de doublon qui n'existait pas, il en laisse passer un que
+///   l'autre chemin repliait.
+pub fn copie_de_moindre_qualite_exclue() -> String {
+    use crate::library::quality::{sql_meme_score, sql_strictement_meilleure};
+    format!(
+        "NOT EXISTS (SELECT 1 FROM tracks mieux \
+         WHERE t.album_id IS NOT NULL AND mieux.album_id = t.album_id \
+         AND mieux.id <> t.id \
+         AND COALESCE(mieux.disc_number, 1) = COALESCE(t.disc_number, 1) \
+         AND COALESCE(mieux.track_number, 0) = COALESCE(t.track_number, 0) \
+         AND LOWER(TRIM(COALESCE(mieux.title, ''))) = LOWER(TRIM(COALESCE(t.title, ''))) \
+         AND ({} OR ({} AND mieux.id < t.id)))",
+        sql_strictement_meilleure("mieux", "t"),
+        sql_meme_score("mieux", "t"),
+    )
+}
+
 /// Prédicat SQL d'une étiquette manquante. Liste FERMÉE : toute autre valeur
 /// rend `None` et ne filtre rien, plutôt que d'injecter quoi que ce soit.
 ///

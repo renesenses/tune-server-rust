@@ -507,14 +507,14 @@ pub(super) async fn register_dlna_output_from_device(
 
     let av_url = svc_urls
         .get("avtransport")
-        .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+        .map(|p| crate::discovery_setup::resolve_control_url(&dev.host, dev.port, p));
     let rc_url = svc_urls
         .get("renderingcontrol")
-        .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+        .map(|p| crate::discovery_setup::resolve_control_url(&dev.host, dev.port, p));
     let cm_url = svc_urls
         .get("connectionmanager")
         .or_else(|| svc_urls.get("ConnectionManager"))
-        .map(|p| format!("http://{}:{}{}", dev.host, dev.port, p));
+        .map(|p| crate::discovery_setup::resolve_control_url(&dev.host, dev.port, p));
 
     // If cached service URLs are available, use them
     if let (Some(av), Some(rc)) = (av_url, rc_url) {
@@ -556,11 +556,12 @@ pub(super) async fn register_dlna_output_from_device(
                     let av = service_urls.get("avtransport");
                     let rc = service_urls.get("renderingcontrol");
                     if let (Some(av_path), Some(rc_path)) = (av, rc) {
-                        let base = format!("http://{}:{}", dev.host, dev.port);
                         let cm_path = service_urls
                             .get("connectionmanager")
                             .or_else(|| service_urls.get("ConnectionManager"))
-                            .map(|p| format!("{base}{p}"));
+                            .map(|p| {
+                                crate::discovery_setup::resolve_control_url(&dev.host, dev.port, p)
+                            });
                         let delay = crate::config::resolve_play_delay(
                             &state.backend,
                             &state.config,
@@ -571,8 +572,12 @@ pub(super) async fn register_dlna_output_from_device(
                             dev.name.clone(),
                             dev.id.clone(),
                             dev.host.clone(),
-                            format!("{base}{av_path}"),
-                            format!("{base}{rc_path}"),
+                            crate::discovery_setup::resolve_control_url(
+                                &dev.host, dev.port, av_path,
+                            ),
+                            crate::discovery_setup::resolve_control_url(
+                                &dev.host, dev.port, rc_path,
+                            ),
                             cm_path,
                         )
                         .with_play_delay(delay)
@@ -659,5 +664,126 @@ mod correction_tests {
             p.get("oui").is_none(),
             "OUI fabriqué depuis une non-MAC : {p}"
         );
+    }
+}
+
+/// #4379 — Ruark R3 (Frontier Silicon) : la `controlURL` annoncée est ABSOLUE.
+///
+/// Le chemin de création de zone ci-dessus recollait `http://host:port` DEVANT
+/// cette URL sans séparateur : `http://192.168.68.60:80http://192.168.68.60:80/…`.
+/// L'autorité s'arrête au premier `/` : le jeton de port devenait `80http:`,
+/// `Url::parse` rendait `invalid port number`, et reqwest refusait de BÂTIR la
+/// requête. C'est le « soap send: builder error: invalid port number » de Yves
+/// (fil 1832) — aucun octet SOAP n'est jamais parti sur le réseau.
+///
+/// À distinguer de #4153 (`minimal_dmr`), qui insère un `/` avant de recoller :
+/// l'URL doublée qu'il produit est mal ciblée mais ANALYSABLE, donc elle ne
+/// peut pas rendre cette erreur-là.
+///
+/// La garde passe par le VRAI point d'entrée — `register_dlna_output_from_device`
+/// nourri d'un `DiscoveredDevice` tel que le scan SSDP le remplit — puis prouve
+/// que la requête est bel et bien arrivée sur le faux renderer.
+#[cfg(test)]
+mod url_de_controle_absolue_4379 {
+    use super::register_dlna_output_from_device;
+    use crate::state::AppState;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Faux renderer HTTP : accepte, note la ligne de requête, répond 200 avec
+    /// une enveloppe SOAP vide. Rend son port et le compteur de `POST` reçus.
+    async fn faux_renderer() -> (u16, Arc<AtomicUsize>, Arc<tokio::sync::Mutex<Vec<String>>>) {
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = ecoute.local_addr().unwrap().port();
+        let recus = Arc::new(AtomicUsize::new(0));
+        let lignes = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let c = recus.clone();
+        let l = lignes.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut flux, _)) = ecoute.accept().await else {
+                    return;
+                };
+                let c = c.clone();
+                let l = l.clone();
+                tokio::spawn(async move {
+                    let mut tampon = vec![0u8; 8192];
+                    let n = flux.read(&mut tampon).await.unwrap_or(0);
+                    let texte = String::from_utf8_lossy(&tampon[..n]).to_string();
+                    if let Some(premiere) = texte.lines().next() {
+                        l.lock().await.push(premiere.to_string());
+                    }
+                    c.fetch_add(1, Ordering::Relaxed);
+                    let corps = concat!(
+                        r#"<?xml version="1.0"?>"#,
+                        r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">"#,
+                        r#"<s:Body><u:StopResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"/>"#,
+                        "</s:Body></s:Envelope>"
+                    );
+                    let reponse = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{corps}",
+                        corps.len()
+                    );
+                    let _ = flux.write_all(reponse.as_bytes()).await;
+                    let _ = flux.flush().await;
+                });
+            }
+        });
+        (port, recus, lignes)
+    }
+
+    #[tokio::test]
+    async fn une_control_url_absolue_frontier_silicon_produit_une_requete_soap_reelle() {
+        let (port, recus, lignes) = faux_renderer().await;
+        let av = format!("http://127.0.0.1:{port}/upnp/control/AVTransport");
+        let rc = format!("http://127.0.0.1:{port}/upnp/control/RenderingControl");
+
+        // Ce que le scan SSDP dépose : l'hôte et le port de la LOCATION, et les
+        // `controlURL` du descriptif TELLES QUELLES — absolues ici.
+        let mut dev = tune_core::discovery::device::DiscoveredDevice::new(
+            "uuid:3DCC7100-F76C-11DD-87AF-305890748418".to_string(),
+            "Ruarkaudio R3".to_string(),
+            tune_core::discovery::device::OutputType::Dlna,
+            "127.0.0.1".to_string(),
+            port,
+        );
+        dev.capabilities.insert(
+            "service_urls".to_string(),
+            serde_json::json!({ "avtransport": av, "renderingcontrol": rc }),
+        );
+
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert!(
+            register_dlna_output_from_device(&dev, &state).await,
+            "le renderer Frontier Silicon doit être enregistré"
+        );
+
+        let sortie = state
+            .outputs
+            .lock()
+            .await
+            .get(&dev.id)
+            .expect("la sortie DLNA doit être au registre");
+        let issue = sortie.lock().await.stop().await;
+
+        if let Err(ref message) = issue {
+            assert!(
+                !message.contains("invalid port number"),
+                "#4379 : l'URL de contrôle n'est pas analysable, la requête SOAP \
+                 n'a jamais été bâtie : {message}"
+            );
+        }
+        assert!(
+            recus.load(Ordering::Relaxed) > 0,
+            "aucune requête n'a atteint le renderer : {issue:?}"
+        );
+        let vues = lignes.lock().await.clone();
+        assert!(
+            vues.iter()
+                .any(|l| l.starts_with("POST /upnp/control/AVTransport ")),
+            "la commande n'a pas visé la controlURL annoncée : {vues:?}"
+        );
+        issue.expect("le renderer a répondu 200, la commande doit réussir");
     }
 }
