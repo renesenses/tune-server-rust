@@ -20,7 +20,7 @@ struct DecisionLocale {
     /// #3311 : source `.ape`, zone réseau, renderer LPCM annoncé — la cible
     /// part en WAV progressif, seul bras qui décode le Monkey's Audio au fil
     /// de l'eau depuis #2505.
-    lossless_flux_wav: bool,
+    flux_wav_reseau: bool,
     is_chromecast: bool,
     is_local_output: bool,
     is_network_output: bool,
@@ -173,7 +173,7 @@ struct Traitement {
     eq_forces_transcode: bool,
     browser_needs_wav: bool,
     dsp_progressif_wav: bool,
-    lossless_flux_wav: bool,
+    flux_wav_reseau: bool,
 }
 
 /// Deuxième temps de `decider_la_lecture_locale` : les familles de sortie.
@@ -271,7 +271,7 @@ fn assembler_la_decision(
         eq_forces_transcode,
         browser_needs_wav,
         dsp_progressif_wav,
-        lossless_flux_wav,
+        flux_wav_reseau,
     } = traitement;
 
     let needs_transcode = transcodage_requis(&MotifsDeTranscodage {
@@ -325,7 +325,7 @@ fn assembler_la_decision(
         is_chromecast,
         is_local_output,
         dsp_progressif_wav,
-        lossless_flux_wav,
+        flux_wav_reseau,
         is_network_output,
         sortie_tire_le_flux,
         local_needs_wav,
@@ -1341,8 +1341,8 @@ impl PlaybackOrchestrator {
         // Le format servi sur le fil change : la sonde LPCM du renderer est
         // consultée d'abord, exactement comme pour `dsp_progressif_wav`, et
         // une sonde inconcluante garde le FLAC.
-        let lossless_flux_wav = {
-            let candidat = cible_wav_pour_lossless_reseau(source_format, is_network_output, true);
+        let flux_wav_reseau = {
+            let candidat = cible_wav_pour_le_reseau(source_format, is_network_output, true);
             let renderer_accepte_lpcm = if candidat {
                 let did = identifiant_du_renderer(
                     req.output_device_id.as_deref(),
@@ -1352,7 +1352,7 @@ impl PlaybackOrchestrator {
             } else {
                 false
             };
-            cible_wav_pour_lossless_reseau(source_format, is_network_output, renderer_accepte_lpcm)
+            cible_wav_pour_le_reseau(source_format, is_network_output, renderer_accepte_lpcm)
         };
         Traitement {
             needs_downsample,
@@ -1360,7 +1360,7 @@ impl PlaybackOrchestrator {
             eq_forces_transcode,
             browser_needs_wav,
             dsp_progressif_wav,
-            lossless_flux_wav,
+            flux_wav_reseau,
         }
     }
 
@@ -1696,7 +1696,7 @@ impl PlaybackOrchestrator {
             dlna_needs_wav,
             dlna_wav24,
             dsp_progressif_wav,
-            lossless_flux_wav,
+            flux_wav_reseau,
             eq_forces_transcode,
             is_browser_output,
             is_chromecast,
@@ -1762,16 +1762,16 @@ impl PlaybackOrchestrator {
             // catches FLAC-capable renderers (Linn) that were paying the full
             // ~80s stall for nothing.
             AudioFormat::Wav
-        } else if lossless_flux_wav {
+        } else if flux_wav_reseau {
             // #3311 / #4120 — APE et WavPack vers un renderer réseau : WAV progressif,
             // pas FLAC ré-encodé par le fichier entier. Même mécanisme que la
             // branche DSD juste au-dessus, un cran plus grave : le seul
             // décodeur `.ape` incrémental (#2505, livré en v0.9.131) est celui
             // du bras progressif, et le bras fichier REFUSE net au-delà de
             // 2 Gio de PCM déclaré (24/96 au-delà de ~52 min). Le renderer a
-            // ANNONCÉ le LPCM — sans quoi `lossless_flux_wav` serait faux et le
+            // ANNONCÉ le LPCM — sans quoi `flux_wav_reseau` serait faux et le
             // FLAC resterait la cible, comme avant.
-            info!(zone_id = req.zone_id, source = ?src_fmt, "lossless_flux_wav_target");
+            info!(zone_id = req.zone_id, source = ?src_fmt, "flux_wav_reseau_target");
             AudioFormat::Wav
         } else {
             // #3357 : l'encodeur n'écrit que WAV et FLAC ; une cible AIFF (ou
@@ -1929,11 +1929,11 @@ impl PlaybackOrchestrator {
         // Un `.ape` vers un renderer LPCM diffuse lui aussi, et pour une raison
         // plus dure encore que le DSD : le bras fichier n'a AUCUN décodeur
         // Monkey's Audio incrémental (#3311). La condition sur `target_fmt`
-        // vaut pour les deux issues — la branche `lossless_flux_wav` ci-dessus, et
+        // vaut pour les deux issues — la branche `flux_wav_reseau` ci-dessus, et
         // le WAV que `dlna_needs_wav` impose déjà à un renderer sans
         // `audio/flac`, que ce prédicat renvoyait au fichier.
         let wav_diffusable =
-            dsd_lpcm_streams || (lossless_flux_wav && target_fmt == AudioFormat::Wav);
+            dsd_lpcm_streams || (flux_wav_reseau && target_fmt == AudioFormat::Wav);
         // #4016 — le plafond de 4 GiB de l'en-tête RIFF, VU AVANT de décoder.
         //
         // Les quatre grandeurs qui le décident sont toutes connues ici : durée
