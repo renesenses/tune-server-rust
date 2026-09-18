@@ -725,6 +725,27 @@ fn assembler_les_etapes(
         }));
     }
 
+    // #4174 — pourquoi un DSD natif s'entend PLUS BAS qu'un PCM.
+    //
+    // Cyrille Moutia, fil 1784 : « rien d'anormal a priori, sauf un son faible
+    // pour un DSD 256 ». Son journal montre un passthrough natif — le `.dsf`
+    // part brut au renderer. La référence 0 dB du DSD (Scarlet Book) est posée
+    // 6 dB SOUS la pleine échelle PCM : tout le parc DSD sonne donc plus bas,
+    // et `DSD_SACD_GAIN` ne rattrape cet écart QUE sur la branche DSD→PCM
+    // (#1638) — celle du décimateur, qui touche les échantillons.
+    //
+    // Sur un passthrough, Tune ne peut pas le rattraper sans cesser d'être
+    // bit-perfect. L'écran n'avait aucun moyen de le dire : il montrait une
+    // chaîne parfaite, et l'auditeur en concluait une panne. L'étape dit ce
+    // que Tune NE FAIT PAS, et pourquoi c'est normal.
+    if is_dsd && !transcode_active {
+        steps.push(json!({
+            "name": "Niveau",
+            "description": "DSD natif : référence 6 dB sous le PCM (Scarlet Book), aucun gain appliqué",
+            "bit_perfect": true,
+        }));
+    }
+
     // Resampler step. MESURÉ d'abord (REF-6b) : la sortie a dit ce qu'elle a
     // ouvert, et c'est cet écart-là qui est nommé, pas le plafond réglé.
     // Sans déclaration, la règle historique : le plafond effectif de cadence.
