@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use tune_core::cloud::plugins::PluginMarketplace;
-use tune_core::cloud::sso::{MozaikAuth, PkceSession};
+use tune_core::cloud::sso::{MozaikAuth, PkceSession, ProfilCloud};
 use tune_core::cloud::telemetry::TelemetryReporter;
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -218,10 +218,47 @@ async fn sso_callback(
         }
     };
 
-    // Fetch user profile from mozaiklabs
-    let user = match auth.get_user(&token.access_token).await {
-        Ok(u) => u,
-        Err(e) => {
+    // Relecture du profil : c'est elle qui rapporte `modules`, les droits de
+    // MODULE payants. Sans elle, rien n'est enregistré plus bas — la liaison du
+    // compte échoue en entier.
+    let user = match auth.get_user(&settings, &token.access_token).await {
+        ProfilCloud::Profil(u) => *u,
+        // 🔴 Le cas vécu : trente requêtes par minute et par client côté
+        // mozaiklabs, et le testeur lisait `user profile fetch failed: 429 Too
+        // Many Requests` — un message qui ne dit ni que c'est passager, ni
+        // quand réessayer, pour une liaison qui échouait en entier et laissait
+        // donc `modules` vide (sortie Diretta absente de la découverte).
+        //
+        // ⛔ Pas de succès silencieux : le statut reste un statut d'ERREUR et
+        // aucun jeton n'est enregistré — la liaison n'a PAS eu lieu et
+        // l'utilisateur doit la relancer. Ce qui change, c'est qu'il sait
+        // maintenant que c'est passager et dans combien de temps.
+        ProfilCloud::Differe {
+            retry_after_seconds,
+        } => {
+            warn!(retry_after_seconds, "sso_user_fetch_rate_limited");
+            let mut reponse = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    // Code stable : c'est lui que le client traduit (ce dépôt
+                    // ne porte aucun catalogue de langues, cf. `refusal.code`
+                    // de `discovery_setup`).
+                    "code": "cloud_rate_limited",
+                    "retry_after_seconds": retry_after_seconds,
+                    "error": format!(
+                        "mozaiklabs.fr is rate-limiting this server;                          the account was NOT linked. Retry the login in {retry_after_seconds}s."
+                    ),
+                })),
+            )
+                .into_response();
+            if let Ok(valeur) = retry_after_seconds.to_string().parse() {
+                reponse
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, valeur);
+            }
+            return reponse;
+        }
+        ProfilCloud::Echec(e) => {
             warn!(error = %e, "sso_user_fetch_failed");
             return (StatusCode::BAD_GATEWAY, Json(json!({"error": e}))).into_response();
         }
