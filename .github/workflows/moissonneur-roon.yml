@@ -1,15 +1,15 @@
 name: Moissonneur Roon
 
 # Construit `moissonneur-roon` (tools/moissonneur-roon, HORS workspace — il
-# garde son propre Cargo.lock) et attache ses archives à la release du tag.
+# garde son propre Cargo.lock) et publie ses archives sur SA PROPRE release,
+# `moissonneur-<tag>` — jamais sur celle du serveur (voir le travail `publish`).
 #
 # Il tourne à côté du Core Roon, pas de Tune : c'est un outil du testeur, pas
 # une pièce du serveur. D'où un workflow à part, qui ne touche ni au train
 # (`release.yml`) ni à ses gardes.
 #
-# La release du tag naît en BROUILLON dans `release.yml`, après ses builds
-# (~30 min). Ce workflow ne la crée jamais — un second `create` fabriquerait un
-# brouillon homonyme (vécu sur les images OS, v0.9.128) : il l'attend.
+# Il ne touche plus à la release du serveur : il n'a donc plus à en attendre le
+# brouillon (`release.yml`, ~30 min). Sa propre release naît ici, tout de suite.
 #
 # Signature macOS : Developer ID + runtime durci + horodatage, avec les mêmes
 # secrets que l'archive `tune-server` de `release.yml`. Comme cette archive-là,
@@ -143,11 +143,11 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Attacher à la release
+    name: Publier le moissonneur
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-latest
-    timeout-minutes: 120  # Attente du brouillon créé par release.yml (~30-60 min), puis <1 min d'envoi
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag || github.ref_name }}
@@ -157,18 +157,46 @@ jobs:
           pattern: moissonneur-roon-*
           path: archives
           merge-multiple: true
-      - name: Attendre la release du tag
-        run: |
-          for i in $(seq 1 100); do
-            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "release $TAG trouvée"; exit 0
-            fi
-            echo "release $TAG absente (essai $i/100) — nouvel essai dans 60 s"
-            sleep 60
-          done
-          echo "::error::release $TAG introuvable après 100 min — relancer ce workflow avec tag=$TAG"
-          exit 1
-      - name: Envoyer les archives
+      # 🔴 SA PROPRE release, plus jamais celle du serveur.
+      #
+      # FabienM, 17/09/2026 : « la 153 ne s'installe pas sur mon serveur
+      # Linux ». Pour se mettre à jour, le serveur retient le PREMIER fichier
+      # de la release qui porte son système et son architecture — et GitHub les
+      # rend par ordre alphabétique. `moissonneur-roon-v0.9.153-linux-x86_64.tar.gz`
+      # (2,6 Mo) passait donc devant `tune-server-v0.9.153-linux-x86_64.tar.gz`
+      # (43 Mo). L'installation échouait à la vérification de signature — le
+      # moissonneur n'est pas dans `SHA256SUMS` —, et c'est cette garde qui a
+      # évité que Tune se remplace par un outil qui n'est pas lui.
+      #
+      # Les CINQ archives couvraient linux x86_64 et aarch64, macOS arm64 et
+      # x86_64, Windows : toutes les plateformes étaient touchées, et les
+      # serveurs DÉJÀ installés le restaient — leur binaire lit la release
+      # telle qu'elle est publiée. Le filtre posé côté serveur (l'archive doit
+      # s'appeler `tune-server…`) ne protège que les versions à venir : la
+      # séparation des releases, elle, protège tout le monde tout de suite.
+      #
+      # Le tag `moissonneur-<tag serveur>` est neuf à chaque version, ne porte
+      # aucun fichier `tune-server*`, et n'est donc jamais consulté par un
+      # serveur qui cherche sa mise à jour.
+      - name: Publier sur la release du moissonneur
         run: |
           ls -l archives
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber archives/*
+          RELEASE="moissonneur-$TAG"
+          if ! gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE" --repo "$GITHUB_REPOSITORY" \
+              --title "Moissonneur Roon $TAG" \
+              --notes "Outil du testeur, publié à part du serveur : une archive \`moissonneur-roon-*\` sur la release de Tune était prise pour l'archive du serveur par la mise à jour automatique (17/09/2026)." \
+              --latest=false
+          fi
+          gh release upload "$RELEASE" --repo "$GITHUB_REPOSITORY" --clobber archives/*
+      # Garde : la release du SERVEUR ne doit porter aucune archive du
+      # moissonneur. Un `upload` égaré s'y verrait immédiatement.
+      - name: Vérifier que la release du serveur est intacte
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+               --jq '[.assets[].name] | .[]' 2>/dev/null | grep -q '^moissonneur-roon-'; then
+            echo "::error::la release $TAG porte des archives du moissonneur — la mise à jour automatique des serveurs installés choisira la mauvaise"
+            exit 1
+          fi
+          echo "release $TAG : aucune archive du moissonneur"
+
