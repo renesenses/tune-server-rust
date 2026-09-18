@@ -802,6 +802,33 @@ impl SuiteDuScan {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct BilanSuppressionDuScan {
+    pub removed: i64,
+    pub db_delete_failed: i64,
+}
+
+/// Supprime uniquement les candidats déjà approuvés par la politique de purge.
+/// Une erreur SQL laisse la piste en base : elle doit rester visible dans le
+/// bilan, sans empêcher le traitement des autres candidats (#2147).
+pub(crate) fn supprimer_pistes_du_scan(
+    track_repo: &tune_core::db::track_repo::TrackRepo,
+    candidats: impl IntoIterator<Item = i64>,
+    scan: &'static str,
+) -> BilanSuppressionDuScan {
+    let mut bilan = BilanSuppressionDuScan::default();
+    for track_id in candidats {
+        match track_repo.delete(track_id) {
+            Ok(()) => bilan.removed += 1,
+            Err(error) => {
+                bilan.db_delete_failed += 1;
+                tracing::warn!(scan, track_id, error = %error, "scan_track_delete_failed");
+            }
+        }
+    }
+    bilan
+}
+
 /// Les chiffres d'un scan complet, rassemblés UNE fois pour les trois
 /// consommateurs du rapport de fin de scan (#2012).
 ///
@@ -858,6 +885,7 @@ pub(crate) struct ChiffresDeFinDeScan<'a> {
     pub(crate) skipped_unsupported: i64,
     pub(crate) db_insert_failed: i64,
     pub(crate) db_update_failed: i64,
+    pub(crate) db_delete_failed: i64,
     pub(crate) artwork_extracted: i64,
     /// Le sort de la passe d'enrichissement (#2507) — [`SuiteDuScan::rapport`].
     pub(crate) auto_enrichment: Value,
@@ -924,6 +952,7 @@ impl ChiffresDeFinDeScan<'_> {
             "skipped_unsupported": self.skipped_unsupported,
             "db_insert_failed": self.db_insert_failed,
             "db_update_failed": self.db_update_failed,
+            "db_delete_failed": self.db_delete_failed,
             "artwork_extracted": self.artwork_extracted,
             "auto_enrichment": self.auto_enrichment,
             "failed_paths": self.scan_stats.failed_paths,
@@ -1893,6 +1922,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // l'arrivée de `library.scan.completed` — si bien que le bandeau de fin
         // de scan annonçait « 0 supprimés » quoi que la purge ait fait (#2146).
         let mut pistes_supprimees = 0i64;
+        let mut db_delete_failed = 0i64;
         // > 0 quand le plafond a refusé : c'est le nombre à renvoyer dans
         // `?confirm_purge=` pour sortir de l'impasse. 0 = aucun refus.
         let mut purge_refusee_candidats = 0i64;
@@ -1937,7 +1967,6 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     "post_scan_root_went_empty — ce dossier contenait des pistes et n'en présente plus aucune. Montage absent ? Les pistes sont CONSERVÉES."
                 );
             }
-            let mut pruned = 0i64;
             let mut protected = 0i64;
             let mut hors_perimetre = 0i64;
             // Décider AVANT de supprimer : le plafond volumétrique a besoin de
@@ -2000,11 +2029,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
                      explicite de l'utilisateur."
                 );
             }
-            for track_id in a_supprimer {
-                if track_repo.delete(track_id).is_ok() {
-                    pruned += 1;
-                }
-            }
+            let bilan = supprimer_pistes_du_scan(&track_repo, a_supprimer, "manual");
+            let pruned = bilan.removed;
+            db_delete_failed = bilan.db_delete_failed;
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
             pistes_supprimees = pruned;
@@ -2390,6 +2417,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_unsupported,
             db_insert_failed,
             db_update_failed,
+            db_delete_failed,
             artwork = artwork_extracted,
             orphan_artists,
             "scan_and_import_complete"
@@ -2430,6 +2458,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
             skipped_unsupported,
             db_insert_failed,
             db_update_failed,
+            db_delete_failed,
             artwork_extracted,
             auto_enrichment: suite_du_scan.rapport(quota_gratuit.as_ref()),
             skipped_by_ext: &skipped_by_ext,
@@ -3843,6 +3872,7 @@ mod rapport_de_fin_de_scan {
             skipped_unsupported: 107,
             db_insert_failed: 108,
             db_update_failed: 109,
+            db_delete_failed: 113,
             artwork_extracted: 110,
             auto_enrichment: SuiteDuScan::decider(true, true).rapport(None),
             skipped_by_ext: par_ext,
@@ -3971,6 +4001,7 @@ mod rapport_de_fin_de_scan {
         assert_eq!(r["skipped_unsupported"], serde_json::json!(107));
         assert_eq!(r["db_insert_failed"], serde_json::json!(108));
         assert_eq!(r["db_update_failed"], serde_json::json!(109));
+        assert_eq!(r["db_delete_failed"], serde_json::json!(113));
         assert_eq!(r["artwork_extracted"], serde_json::json!(110));
         assert_eq!(r["auto_enrichment"]["started"], serde_json::json!(true));
         assert_eq!(r["missing_dirs"], serde_json::json!(["/Volumes/absent"]));
@@ -4899,3 +4930,7 @@ mod fin_de_scan_interrompu {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "scan_delete_tests_2147.rs"]
+mod scan_delete_tests_2147;
