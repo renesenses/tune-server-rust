@@ -103,3 +103,6 @@ Les preuves du paragraphe précédent restent attachées à leur commit initial.
 - Notes de version préparées dans `docs/release-notes/sdk-audio.md` : EQ gratuit embarqué, coupure nette du crossfeed FREE, conservation puis récupération des réglages. Aucune release existante n’est modifiée.
 
 Les journaux de ce suivi sont isolés dans `reports/sdk-premium-4363/offer-20260918/`. Les preuves DSP antérieures restent attachées à leurs révisions ; aucun algorithme DSP n’est modifié par ce suivi. Les checks GitHub du nouveau SHA et la qualification matérielle restent des validations distinctes.
+
+
+Le premier passage CI du suivi a signalé la garde #3030 : le nouveau témoin HTTP supprimait les sorties des jobs uniquement après succès. Le témoin possède désormais un garde `Drop`, construit dès réception de l’UUID du job ; il reprend uniquement le dossier créé par cette route et le supprime aussi lors d’une panique. La garde de dépôt reste inchangée. Les données du chargeur natif sont également rattachées au dossier temporaire du processus de test.

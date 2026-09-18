@@ -9,6 +9,15 @@ use tower::ServiceExt;
 use tune_core::db::{settings_repo::SettingsRepo, zone_repo::ZoneRepo};
 use tune_server::state::AppState;
 
+/// Own only the UUID directory produced by this test's real HTTP job. Clean
+/// even if polling times out or an assertion panics; never remove other jobs.
+struct JobOutputCleanup(std::path::PathBuf);
+impl Drop for JobOutputCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 async fn request(app: &axum::Router, method: &str, path: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()
@@ -172,6 +181,14 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
             );
             if premium {
                 let id = response["job_id"].as_str().unwrap();
+                uuid::Uuid::parse_str(id).unwrap();
+                let output = if tool == "converter" {
+                    "tune-convert"
+                } else {
+                    "tune-declick"
+                };
+                // tmp-autorise: dossier créé par la route réelle, repris et nettoyé par Drop, même sur panique.
+                let _cleanup = JobOutputCleanup(std::path::Path::new("/tmp").join(output).join(id));
                 let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                     loop {
                         let (_, result) = request(
@@ -189,12 +206,6 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
                 })
                 .await
                 .unwrap();
-                let output = if tool == "converter" {
-                    "tune-convert"
-                } else {
-                    "tune-declick"
-                };
-                let _ = std::fs::remove_dir_all(std::path::Path::new("/tmp").join(output).join(id));
                 assert_eq!(result["status"], "completed", "{tool}: {result}");
                 assert_eq!(result["completed"], 1, "{tool}: {result}");
             }
