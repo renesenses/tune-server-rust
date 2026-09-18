@@ -3726,6 +3726,7 @@ fn le_puits_alsa_est_ecarte_sur_son_pcm_pas_sur_sa_description() {
     ));
     assert!(!is_null_sink("Alsa:hw:CARD=DACZ8,DEV=0", "Eversolo DAC-Z8"));
     assert!(!is_null_sink("Alsa:default", "Default Audio Device"));
+}
 
 // -----------------------------------------------------------------------
 // #4384 — le gain que le crête-mètre doit connaître, et le rabot muet
