@@ -57,6 +57,11 @@ pub mod opus_ogg;
 /// Qui tient le PCM ALSA que nous n'arrivons pas à ouvrir (#3575) — lecture
 /// de /proc, aucun effet sur la chaîne audio.
 pub mod pcm_teneur;
+/// La période demandée au pilote local et la garde de préchargement qui s'en
+/// déduit (#3208). Hors `local-audio` par choix : la DÉCISION ne dépend ni de
+/// cpal ni d'une carte son, et c'est ce qui la rend éprouvable par la porte
+/// `test` de la CI, qui ne compile pas `local-audio`.
+pub mod periode_alsa;
 pub mod pipeline;
 pub mod replaygain;
 pub mod resample;

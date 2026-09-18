@@ -411,5 +411,68 @@ de disque ⇒ sa ligne ; nom de disque sans numéro de disque dans les balises �
   la ligne album reste une — mais une normalisation des graphies d'artiste à
   `get_or_create` reste à faire. Hors de ce lot.
 - **Le client** : bouton « Réparer les compilations » (Métadonnées) et pastille « édité à la
-  main » sur la fiche album.
+  main » sur la fiche album. La phase 5 (§11) y ajoute le bouton « Compilation » de la barre
+  de sélection, la gravure et la pastille — voir renesenses/tune-web-client#1172.
 - **#3179** reste hors de portée de ce chantier (artiste de repli, pas drapeau).
+
+## 11. Phase 5 — la main de l'utilisateur (18/09/2026, #4427)
+
+Demande de Bertrand, capture à l'appui : la compilation **Coco María Presents** occupe douze
+vignettes, une par artiste de piste. Il veut cocher ces albums dans l'écran Métadonnées et
+poser le drapeau dessus.
+
+Les phases 1 à 4 avaient donné au scan de quoi bien décider. Il manquait de quoi le
+**contredire**.
+
+### 11.1 Les trois arbitrages du 18/09
+
+- **Portée** : la base retient le choix tout de suite, et graver dans les fichiers est une
+  **seconde action, explicite**. L'utilisateur doit savoir quand Tune touche à ses fichiers.
+- **Regroupement** : poser le drapeau sur plusieurs albums propose de les réunir en un seul
+  disque — c'est le résultat attendu de la capture. Le décochage, lui, ne défait aucune
+  fusion.
+- **Unité** : on coche des **albums**, dans la barre de sélection qui sert déjà à l'artiste et
+  au genre. Pas de case par piste : douze fiches à ouvrir pour un geste unique.
+
+### 11.2 Le marqueur existait ; personne ne le lisait au scan
+
+`album_metadata.edition_manuelle` est posé depuis le 16/09 (§10.1) et la phase 4 le respecte.
+Mais `git grep champs_edites_a_la_main` ne rendait **qu'un** appelant : la passe de
+réparation. `mark_compilation` et `reclasser_en_compilation` passaient outre — et le drapeau
+ne sachant que MONTER, un album décoché à la main était recoché dès le fichier suivant vu par
+le surveillant.
+
+La garde est désormais dans le dépôt (`AlbumRepo::tenu_a_la_main`), pas chez les appelants :
+le scan par lots et le surveillant écrivent tous deux, et un troisième appelant écrira un
+jour. Une lecture en échec rend « personne n'a tranché » — le scan n'est jamais bloqué par une
+table de métadonnées illisible.
+
+### 11.3 Les deux routes
+
+- `PUT /albums/{id}` et `POST /albums/batch-update` acceptent `is_compilation`. Absent veut
+  dire « je n'y touche pas », jamais « faux » : on édite le titre d'un album sans lui reprendre
+  son drapeau. L'écriture passe par `reparer_compilation` — `repo.update()` ne porte pas le
+  drapeau, délibérément — et le marqueur est posé dans la foulée.
+- `POST /library/albums/compilation/graver` (`routes/library/graver_compilation.rs`) écrit
+  `1` ou `0` sous `ItemKey::FlagCompilation`, la clé exacte que le scan relit. **`0` est
+  écrit, pas effacé** : depuis C1, « pas de tag » et « tag à zéro » ne disent pas la même
+  chose, et c'est le `0` explicite qui empêche la forme des dossiers de reprendre la main sur
+  une compilation refusée. Un conteneur que le scan ne relit pas (WAV, DSF, DFF, Matroska) est
+  compté à part (`hors_format`), jamais gravé — même règle que `graver_dr`. Pas de tâche de
+  fond : la sélection est faite à la main, quelques centaines de fichiers au pire.
+
+Aucune fusion d'albums côté serveur : `POST /library/albums/merge` existe depuis longtemps,
+c'est le client qui l'enchaîne.
+
+### 11.4 Contre-épreuves
+
+Cinq points cassés un par un, cinq rouges : `mark_compilation` sans garde ;
+`reclasser_en_compilation` sans garde ; le lot qui n'écrit pas le drapeau ; le lot qui ne
+marque pas le champ tenu ; la gravure qui efface au lieu d'écrire `0`. La gravure est mesurée
+sur un **vrai FLAC**, relu par `read_metadata` — le lecteur du scan, pas une réplique.
+
+### 11.5 Ce qui reste après la phase 5
+
+- **L'écran**, suivi par renesenses/tune-web-client#1172 : le bouton de la barre de sélection,
+  l'enchaînement de la fusion, la gravure et la pastille.
+- **Le bouton « Réparer les compilations »** de la phase 4, toujours sans écran.

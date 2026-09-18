@@ -46,6 +46,7 @@ fn piste(id: &str, titre: &str, artiste: &str, album: &str) -> StreamTrack {
         track_number: None,
         disc_number: None,
         explicit: false,
+        disponible: None,
         quality: None,
         isrc: None,
         composer: None,
@@ -63,6 +64,7 @@ fn album(id: &str, titre: &str, artiste: &str) -> StreamAlbum {
         year: None,
         track_count: 10,
         quality: None,
+        released_at: None,
     }
 }
 

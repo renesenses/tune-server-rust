@@ -2136,6 +2136,11 @@ pub(super) struct AlbumUpdate {
     genre: Option<String>,
     year: Option<i32>,
     label: Option<String>,
+    /// #4427 — le drapeau « compilation », posé ou retiré À LA MAIN.
+    ///
+    /// Absent = « je n'y touche pas », et non « faux » : c'est ce qui permet à
+    /// l'écran d'éditer le titre d'un album sans lui reprendre son drapeau.
+    is_compilation: Option<bool>,
 }
 
 pub(super) async fn update_album(
@@ -2160,6 +2165,20 @@ pub(super) async fn update_album(
     }
     if let Some(ref v) = body.label {
         album.label = Some(v.clone());
+    }
+    // #4427 — le drapeau ne passe PAS par `repo.update()` : son `UPDATE` ne
+    // porte pas `is_compilation`, délibérément, parce que le scan en est le
+    // seul autre écrivain. `reparer_compilation` est la porte documentée qui
+    // sait le baisser, et le marqueur posé plus bas empêche le scan de
+    // revenir dessus.
+    if let Some(v) = body.is_compilation {
+        match repo.reparer_compilation(id, v, None) {
+            Ok(()) => album.is_compilation = v,
+            Err(e) => {
+                tracing::warn!(album_id = id, error = %e, "compilation_non_ecrite");
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
     }
     // artist_id takes priority; fall back to artist_name resolution
     if let Some(aid) = body.artist_id {
@@ -2216,6 +2235,9 @@ fn champs_edites_de(body: &AlbumUpdate) -> Vec<&'static str> {
     }
     if body.label.is_some() {
         v.push("label");
+    }
+    if body.is_compilation.is_some() {
+        v.push("is_compilation");
     }
     v
 }
@@ -2302,6 +2324,10 @@ pub(super) struct BatchAlbumUpdate {
     artist_id: Option<i64>,
     artist_name: Option<String>,
     label: Option<String>,
+    /// #4427 — c'est CE champ que la barre de sélection de l'écran
+    /// Métadonnées emploie : on coche les douze vignettes d'une compilation
+    /// éclatée, et un seul appel les marque toutes.
+    is_compilation: Option<bool>,
 }
 
 pub(super) async fn batch_update_albums(
@@ -2349,10 +2375,27 @@ pub(super) async fn batch_update_albums(
         if let Some(aid) = resolved_artist_id {
             album.artist_id = Some(aid);
         }
+        // #4427 — hors de `repo.update()`, pour la raison dite à
+        // `update_album` : l'`UPDATE` d'album ne porte pas le drapeau.
+        // Écrit AVANT, pour que l'échec d'une ligne ne laisse pas le marqueur
+        // promettre une valeur qui n'a pas été posée.
+        let compilation_ecrite = match body.is_compilation {
+            Some(v) => match repo.reparer_compilation(id, v, None) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(album_id = id, error = %e, "compilation_non_ecrite");
+                    false
+                }
+            },
+            None => false,
+        };
         if repo.update(&album).is_ok() {
             updated += 1;
             // C3 — une édition en masse reste une édition de l'utilisateur.
             let mut champs = Vec::new();
+            if compilation_ecrite {
+                champs.push("is_compilation");
+            }
             if body.genre.is_some() {
                 champs.push("genre");
             }
@@ -2495,6 +2538,7 @@ mod tests_editions {
                 genre: None,
                 year: None,
                 label: None,
+                is_compilation: None,
             }),
         )
         .await;
@@ -2528,12 +2572,89 @@ mod tests_editions {
                 artist_id: None,
                 artist_name: None,
                 label: None,
+                is_compilation: None,
             }),
         )
         .await;
         assert_eq!(meta.champs_edites_a_la_main(2).unwrap(), vec!["genre"]);
         // Un album non touché ne porte rien.
         assert!(meta.get_all(2).unwrap().get(CLE_EDITION_MANUELLE).is_some());
+    }
+
+    /// 🔴 #4427 — poser le drapeau « compilation » à la main, et qu'il TIENNE.
+    ///
+    /// Le cas de Bertrand (18/09) : douze vignettes « Coco María Presents »,
+    /// une par artiste de piste. Il les coche et les marque en une fois. Trois
+    /// choses doivent être vraies après ce geste, et c'est ce qu'on mesure —
+    /// la troisième est celle qui manquait.
+    #[tokio::test]
+    async fn le_drapeau_pose_a_la_main_tient_face_au_scan() {
+        use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Coco 1', 1), (2, 'Coco 2', 1)",
+            &[],
+        )
+        .unwrap();
+        let repo = AlbumRepo::with_backend(state.backend.clone());
+        let meta = AlbumMetadataRepo::with_backend(state.backend.clone());
+
+        // La barre de sélection : un seul appel pour les deux albums cochés.
+        let _ = batch_update_albums(
+            State(state.clone()),
+            Json(BatchAlbumUpdate {
+                album_ids: vec![1, 2],
+                genre: None,
+                year: None,
+                artist_id: None,
+                artist_name: None,
+                label: None,
+                is_compilation: Some(true),
+            }),
+        )
+        .await;
+
+        // 1. le drapeau est écrit — `repo.update()` ne le porte pas, donc
+        //    c'est bien `reparer_compilation` qui a travaillé ;
+        for id in [1, 2] {
+            assert!(
+                repo.get(id).unwrap().unwrap().is_compilation,
+                "album {id} : le drapeau doit être posé"
+            );
+            // 2. le marqueur NOMME le champ tenu ;
+            assert!(
+                meta.champs_edites_a_la_main(id)
+                    .unwrap()
+                    .iter()
+                    .any(|c| c == "is_compilation"),
+                "album {id} : le marqueur doit nommer is_compilation"
+            );
+        }
+
+        // 3. le scan n'y revient pas. Décoché à la main, puis un passage du
+        //    surveillant de fichiers : le drapeau reste baissé.
+        let _ = update_album(
+            State(state.clone()),
+            Path(1),
+            Json(AlbumUpdate {
+                title: None,
+                artist_id: None,
+                artist_name: None,
+                genre: None,
+                year: None,
+                label: None,
+                is_compilation: Some(false),
+            }),
+        )
+        .await;
+        repo.mark_compilation(1).unwrap();
+        assert!(
+            !repo.get(1).unwrap().unwrap().is_compilation,
+            "le scan ne doit pas relever un drapeau baissé à la main"
+        );
     }
 
     /// BIB-B1 : l'étiquette d'édition est le suffixe après le délimiteur,

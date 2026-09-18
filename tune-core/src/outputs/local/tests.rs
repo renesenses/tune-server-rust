@@ -3700,3 +3700,30 @@ fn test_list_audio_devices() {
     // On CI there may be no devices, but on dev machines there should be at least one
     let _ = devices.len();
 }
+
+/// Le CÂBLAGE, et non la règle : la règle est éprouvée dans
+/// `outputs::pseudo_peripherique_alsa`, qui vit hors de `local-audio` pour que
+/// la porte `test` de la CI la joue. Ce témoin-ci prouve que les deux sites de
+/// `local` — l'énumération (`parc::list_audio_devices_uncached`) et la
+/// résolution (`resolution::find_device_with_fallback`) — passent bien par
+/// elle, avec l'endpoint et non la seule description.
+///
+/// ⚠️ Il ne tourne QUE sous `--features local-audio`. La porte clippy compile
+/// cette feature, la porte `test` de la CI non.
+#[test]
+fn le_puits_alsa_est_ecarte_sur_son_pcm_pas_sur_sa_description() {
+    // Sens 1 : le puits du .18, même si sa description change.
+    assert!(is_null_sink(
+        "Alsa:null",
+        "Discard all samples (playback) or generate zero samples (capture)"
+    ));
+    assert!(is_null_sink("Alsa:null", "Jette tout"));
+    // Sens 2 — le piège : une vraie sortie survit, y compris la carte
+    // physique du .18 et un DAC USB.
+    assert!(!is_null_sink(
+        "Alsa:hw:CARD=0,DEV=0",
+        "HDA Intel PCH, CS4206 Analog"
+    ));
+    assert!(!is_null_sink("Alsa:hw:CARD=DACZ8,DEV=0", "Eversolo DAC-Z8"));
+    assert!(!is_null_sink("Alsa:default", "Default Audio Device"));
+}

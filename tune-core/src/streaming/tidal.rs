@@ -860,6 +860,7 @@ impl TidalService {
             track_number: item["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: item["volumeNumber"].as_u64().map(|n| n as u32),
             explicit: item["explicit"].as_bool().unwrap_or(false),
+            disponible: None,
             isrc: item["isrc"].as_str().map(Into::into),
             composer: None,
             // Même nœud que le nom : l'identifiant rendu appartient à l'artiste
@@ -900,6 +901,7 @@ impl TidalService {
                 .as_str()
                 .and_then(|d| d.get(..4)?.parse().ok()),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
+            released_at: None,
             quality: {
                 let tags = item["mediaMetadata"]["tags"].as_array();
                 let is_hires = tags.map_or(false, |t| {

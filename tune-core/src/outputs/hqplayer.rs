@@ -445,7 +445,7 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
 }
 
 /// L'état de transport **reconnu** dans une réponse `<Status>` de HQPlayer,
-/// ou `None` quand aucun des mots attendus n'y figure.
+/// ou `None` quand son champ d'état n'est pas reconnu.
 ///
 /// Séparé de [`parse_state_from_xml`] pour une raison précise : la valeur de
 /// repli est `Stopped`, et `Stopped` n'est pas un état neutre pour le
@@ -455,17 +455,68 @@ async fn probe_hqplayer(host: &str, port: u16) -> Result<bool, String> {
 /// lecteur est à l'arrêt » ne peuvent donc pas rendre la même chose sans que
 /// personne ne le sache : le repli reste, mais il est désormais **dit**.
 fn etat_reconnu(xml: &str) -> Option<TransportState> {
-    let lower = xml.to_lowercase();
-    if lower.contains("\"playing\"") || lower.contains(">playing<") {
-        Some(TransportState::Playing)
-    } else if lower.contains("\"paused\"") || lower.contains(">paused<") {
-        Some(TransportState::Paused)
-    } else if lower.contains("\"stopped\"") || lower.contains(">stopped<") {
-        Some(TransportState::Stopped)
-    } else if lower.contains("\"transitioning\"") || lower.contains("\"buffering\"") {
-        Some(TransportState::Transitioning)
-    } else {
-        None
+    use quick_xml::{Reader, events::Event};
+
+    fn state(value: &str) -> Option<TransportState> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "stopped" => Some(TransportState::Stopped),
+            "1" | "paused" => Some(TransportState::Paused),
+            "2" | "playing" => Some(TransportState::Playing),
+            // Signalyst STATE_STOPREQ: stop requested, not yet stopped.
+            // Wait for STATE_STOPPED before the poller considers a track end.
+            "3" | "transitioning" | "buffering" => Some(TransportState::Transitioning),
+            _ => None,
+        }
+    }
+
+    // Read the actual Status state, not another attribute or track metadata.
+    // The official control interface uses an integer attribute; retain the
+    // textual attribute / direct State child accepted by older integrations.
+    let mut reader = Reader::from_str(xml);
+    let mut depth = 0;
+    loop {
+        let event = reader.read_event().ok()?;
+        let empty = matches!(event, Event::Empty(_));
+        match event {
+            Event::Start(tag) | Event::Empty(tag) if depth == 0 => {
+                if !tag.name().as_ref().eq_ignore_ascii_case(b"Status") {
+                    return None;
+                }
+                for attribute in tag.attributes() {
+                    let attribute = attribute.ok()?;
+                    if attribute.key.as_ref().eq_ignore_ascii_case(b"state") {
+                        let value = attribute
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                reader.decoder(),
+                            )
+                            .ok()?;
+                        return state(&value);
+                    }
+                }
+                if empty {
+                    return None;
+                }
+                depth = 1;
+            }
+            Event::Start(tag) => {
+                if depth == 1 && tag.name().as_ref().eq_ignore_ascii_case(b"State") {
+                    let value = reader.read_text(tag.name()).ok()?;
+                    let decoded = value.decode().ok()?;
+                    let value = quick_xml::escape::unescape(&decoded).ok()?;
+                    return state(&value);
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    return None;
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
     }
 }
 
@@ -616,7 +667,7 @@ impl OutputTarget for HqplayerOutput {
         // #4023 — une réponse dont l'état n'est pas reconnu retombe sur
         // `Stopped`, et `Stopped` est ce qui fait avancer la file au bout de
         // cinq sondes puis arrêter la zone au bout de trente. Si un jour un
-        // HQPlayer répond dans une forme que ces mots ne couvrent pas, le
+        // HQPlayer répond dans une forme que ce parseur ne couvre pas, le
         // symptôme est « l'album s'arrête après une piste » et RIEN dans le
         // journal ne le dit. Une ligne, UNE seule par sortie : ce sondage
         // tourne en boucle et #4025 vient justement de le faire taire.
@@ -779,3 +830,7 @@ mod tests {
         assert!(!is_complete_xml("<Status><Title>x</Title>"));
     }
 }
+
+#[cfg(test)]
+#[path = "hqplayer_state_tests_4377.rs"]
+mod state_tests_4377;

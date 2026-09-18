@@ -25,6 +25,7 @@ mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
+pub(crate) mod graver_compilation;
 pub(crate) mod graver_dr;
 pub(crate) mod reparer_compilations;
 pub(crate) mod stats;
@@ -208,6 +209,13 @@ pub fn router() -> Router<AppState> {
             get(albums::list_albums).post(albums::create_album),
         )
         .route("/albums/batch-update", post(albums::batch_update_albums))
+        // #4427 — graver le drapeau « compilation » dans les fichiers.
+        // Segment statique AVANT `/albums/{id}`, même hygiène que
+        // `/albums/count` et `/albums/hidden`.
+        .route(
+            "/albums/compilation/graver",
+            post(graver_compilation::graver_compilation),
+        )
         .route("/albums/count", get(albums::album_count))
         // Masquage d'album (#1391). `/albums/hidden` AVANT `/albums/{id}` par
         // hygiène de lecture — axum fait de toute façon primer le segment

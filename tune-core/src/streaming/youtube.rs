@@ -1250,6 +1250,7 @@ impl YouTubeService {
             track_number: None,
             disc_number: None,
             explicit: false,
+            disponible: None,
             isrc: None,
             composer: None,
             artist_id: None,
@@ -1277,6 +1278,7 @@ impl YouTubeService {
             year: None,
             track_count: content["itemCount"].as_u64().unwrap_or(0) as u32,
             quality: None,
+            released_at: None,
         }
     }
 
@@ -1386,6 +1388,7 @@ impl YouTubeService {
             track_number: None,
             disc_number: None,
             explicit: item["isExplicit"].as_bool().unwrap_or(false),
+            disponible: None,
             isrc: None,
             composer: None,
             artist_id: None,
@@ -1451,6 +1454,7 @@ impl YouTubeService {
             year,
             track_count,
             quality: None,
+            released_at: None,
         }
     }
 
@@ -1568,6 +1572,7 @@ impl YouTubeService {
                         year: None,
                         track_count: 0,
                         quality: None,
+                        released_at: None,
                     });
                 } else if !video_id.is_empty() {
                     tracks.push(StreamTrack {
@@ -1581,6 +1586,7 @@ impl YouTubeService {
                         track_number: None,
                         disc_number: None,
                         explicit: false,
+                        disponible: None,
                         isrc: None,
                         composer: None,
                         artist_id: None,
@@ -1611,6 +1617,7 @@ impl YouTubeService {
                                 track_number: None,
                                 disc_number: None,
                                 explicit: false,
+                                disponible: None,
                                 isrc: None,
                                 composer: None,
                                 artist_id: None,
@@ -1706,6 +1713,7 @@ impl YouTubeService {
                             track_number: None,
                             disc_number: None,
                             explicit: false,
+                            disponible: None,
                             isrc: None,
                             composer: None,
                             artist_id: None,
@@ -1763,6 +1771,7 @@ impl YouTubeService {
                             year: None,
                             track_count: 0,
                             quality: None,
+                            released_at: None,
                         });
                     }
                 } else if section_type.contains("artist") {
@@ -1912,6 +1921,7 @@ impl YouTubeService {
                 track_number: None,
                 disc_number: None,
                 explicit: false,
+                disponible: None,
                 isrc: None,
                 composer: None,
                 artist_id: None,
@@ -2028,6 +2038,7 @@ impl YouTubeService {
                             track_number: Some((idx + 1) as u32),
                             disc_number: Some(1),
                             explicit: false,
+                            disponible: None,
                             isrc: None,
                             composer: None,
                             artist_id: None,
@@ -2107,6 +2118,7 @@ impl YouTubeService {
             year,
             track_count: 0, // Set from tracks count
             quality: None,
+            released_at: None,
         })
     }
 
@@ -2213,6 +2225,7 @@ impl YouTubeService {
                             year,
                             track_count: 0,
                             quality: None,
+                            released_at: None,
                         });
                     }
                 }
@@ -2336,6 +2349,7 @@ impl YouTubeService {
                 track_number: None,
                 disc_number: None,
                 explicit: false,
+                disponible: None,
                 isrc: None,
                 composer: None,
                 artist_id: None,
@@ -2435,6 +2449,7 @@ impl YouTubeService {
                             year: None,
                             track_count: 0,
                             quality: None,
+                            released_at: None,
                         });
                     }
                 }
@@ -2651,6 +2666,7 @@ impl StreamingService for YouTubeService {
                             year: None,
                             track_count: 0,
                             quality: None,
+                            released_at: None,
                         });
                     }
                     "youtube#channel" => {
@@ -2710,6 +2726,7 @@ impl StreamingService for YouTubeService {
             track_number: None,
             disc_number: None,
             explicit: false,
+            disponible: None,
             isrc: None,
             composer: None,
             artist_id: None,

@@ -107,6 +107,7 @@ mod tests {
             track_number: None,
             disc_number: None,
             explicit: false,
+            disponible: None,
             isrc: None,
             composer: None,
             artist_id: None,

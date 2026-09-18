@@ -736,11 +736,20 @@ impl QobuzService {
     /// qualité), `map_track` (titre, interprète, ISRC, numéro de piste),
     /// `get_album_context` (genre, label), `get_album_label` (label). **Aucun
     /// champ propre au compte n'est consulté** — ni `favorited_at`, ni
-    /// `purchasable`, ni `streamable`. Contrairement aux favoris ou aux
+    /// `purchasable`, ni `streamable` — voir l'exception ci-dessous.
+    /// Contrairement aux favoris ou aux
     /// playlists de l'utilisateur, resservir cette réponse ne peut donc pas
     /// faire réapparaître ce qu'il vient de retirer. Si un jour un mappeur se
     /// met à lire un champ dépendant du compte, ce cache devra sauter — c'est
     /// la seule condition, et elle est ici pour être relue.
+    ///
+    /// ⚠️ EXCEPTION assumée (point 10, Yves Corbat, 17/09/2026) : `map_track`
+    /// lit `streamable`, qui dit si la piste est écoutable AUJOURD'HUI. Ce
+    /// n'est pas un état que l'utilisateur modifie — il tient à la sortie du
+    /// disque et au territoire — et ce cache dure cinq minutes (`TTL_ALBUM`) :
+    /// une piste devenue écoutable le paraît au pire cinq minutes plus tard.
+    /// La condition reste entière pour les champs que l'utilisateur change,
+    /// eux seuls feraient réapparaître ce qu'il vient de retirer.
     async fn detail_album(&self, album_id: &str) -> Result<serde_json::Value, String> {
         if let Some(donnees) = self.album_en_cache(album_id) {
             debug!(album_id, "qobuz_album_cache_hit");
@@ -1249,6 +1258,9 @@ impl QobuzService {
             disc_number: item["media_number"].as_u64().map(|n| n as u32),
             explicit: item["parental_warning"].as_bool().unwrap_or(false),
             isrc: item["isrc"].as_str().map(Into::into),
+            // Point 10 — `streamable` tel que Qobuz le donne. Absent : on ne
+            // conclut rien.
+            disponible: item["streamable"].as_bool(),
             quality: Some(StreamQuality {
                 codec: "FLAC".into(),
                 sample_rate: item["maximum_sampling_rate"]
@@ -1295,6 +1307,11 @@ impl QobuzService {
                 bitrate: None,
                 channels: 2,
             }),
+            // Point 10 — la date que Qobuz annonce, telle quelle. Les
+            // nouveautés éditoriales mêlent des albums à paraître, dont les
+            // pistes répondent « no url » : l'écran a besoin de la date pour
+            // le dire, la lecture pour le refuser proprement.
+            released_at: item["released_at"].as_i64(),
         }
     }
 
@@ -3222,6 +3239,28 @@ mod tests {
     }
 
     #[test]
+    /// Point 10 — la disponibilité voyage jusqu'au client : dans un album
+    /// annoncé, le single sorti se joue et le reste est grisé.
+    #[test]
+    fn map_track_porte_la_disponibilite() {
+        let indispo = QobuzService::map_track(&json!({
+            "id": 1, "title": "À paraître", "performer": {"name": "X"},
+            "album": {"title": "A", "id": 9}, "streamable": false,
+        }));
+        assert_eq!(indispo.disponible, Some(false));
+        let dispo = QobuzService::map_track(&json!({
+            "id": 2, "title": "Single sorti", "performer": {"name": "X"},
+            "album": {"title": "A", "id": 9}, "streamable": true,
+        }));
+        assert_eq!(dispo.disponible, Some(true));
+        // Silence du service : aucune conclusion, donc aucun grisé.
+        let muet = QobuzService::map_track(&json!({
+            "id": 3, "title": "Sans mention", "performer": {"name": "X"},
+            "album": {"title": "A", "id": 9},
+        }));
+        assert_eq!(muet.disponible, None);
+    }
+
     fn map_track_basic() {
         let json = json!({
             "id": 12345,
@@ -3604,6 +3643,28 @@ mod tests {
             pistes[0].album.as_deref(),
             Some("Bach: Suites pour violoncelle")
         );
+    }
+
+    #[test]
+    /// Point 10 — la date de sortie voyage : un album à paraître se reconnaît
+    /// à elle seule (les pistes, elles, ne se résolvent pas encore).
+    #[test]
+    fn map_album_porte_la_date_de_sortie() {
+        let a_paraitre = QobuzService::map_album(&json!({
+            "id": 1,
+            "title": "À paraître",
+            "artist": {"name": "X"},
+            "released_at": 4_102_444_800i64,
+        }));
+        assert_eq!(a_paraitre.released_at, Some(4_102_444_800));
+        // Sans le champ, rien n'est inventé.
+        let sans = QobuzService::map_album(&json!({
+            "id": 2,
+            "title": "Sans date",
+            "artist": {"name": "X"},
+            "release_date_original": "1959-12-14",
+        }));
+        assert_eq!(sans.released_at, None);
     }
 
     #[test]
