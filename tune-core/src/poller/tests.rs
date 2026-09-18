@@ -41,6 +41,39 @@ mod plancher_de_detection {
             plancher_de_detection_ms(motif_fin::POSITION_AU_DELA_DE_LA_FIN),
             6_000
         );
+        // #4382 — la même fin sur la signature GELÉE : deux secondes de moins.
+        assert_eq!(
+            plancher_de_detection_ms(motif_fin::POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA),
+            4_000
+        );
+    }
+
+    /// #4382 — Villerio, Eversolo DMP-A6 : position gelée à la durée, `SetNext`
+    /// accepté. Trois sondages de plus n'apprennent rien d'une position qui ne
+    /// bouge plus ; ils coûtaient deux secondes de silence.
+    ///
+    /// Le raccourci est BORNÉ à cette signature : sans `gapless_sent`, ou sans
+    /// le gel DLNA, le seuil ordinaire tient — c'est lui qui protège un
+    /// renderer lent qui vide encore son tampon.
+    #[test]
+    fn la_signature_gelee_avec_setnext_conclut_en_un_sondage() {
+        use crate::poller::decisions::{motif_position_au_dela, seuil_ticks_de_fin};
+        assert_eq!(seuil_ticks_de_fin(true, true), 1);
+        assert_eq!(
+            motif_position_au_dela(true, true),
+            motif_fin::POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA
+        );
+        for (gele, gapless) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                seuil_ticks_de_fin(gele, gapless),
+                3,
+                "gele={gele} gapless={gapless} : le seuil ordinaire doit tenir"
+            );
+            assert_eq!(
+                motif_position_au_dela(gele, gapless),
+                motif_fin::POSITION_AU_DELA_DE_LA_FIN
+            );
+        }
     }
 
     /// Un motif que la table ne connaît pas rend `0` : le journal n'annonce

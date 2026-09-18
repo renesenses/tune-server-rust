@@ -96,7 +96,7 @@ use super::{
     DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
     GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
     MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
-    POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD,
+    POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD, TICKS_GELE_DLNA_AVEC_SETNEXT,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -122,6 +122,34 @@ pub mod motif_fin {
     pub const AVANCE_GAPLESS_BLOQUEE: &str = "gapless_advance_stuck";
     /// La position a dépassé la fin sans que le renderer s'arrête.
     pub const POSITION_AU_DELA_DE_LA_FIN: &str = "position_past_end";
+    /// La même fin, prononcée sur la signature GELÉE d'un renderer DLNA qui a
+    /// accepté un `SetNext` (#4382) : un sondage au lieu de trois.
+    pub const POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA: &str = "position_past_end_frozen_dlna";
+}
+
+/// Sondages à tenir avant de prononcer la fin « position au-delà de la fin ».
+///
+/// Le cas GELÉ (#4382) n'en demande qu'un : `dlna_frozen_at_end_wall_clock` a
+/// déjà exigé l'horloge au-delà de `durée + END_MARGIN_MS` ET la position
+/// collée à la fin. Un renderer qui aurait réellement enchaîné aurait une
+/// position repartie de zéro — il ne passerait donc pas par ici.
+pub fn seuil_ticks_de_fin(dlna_gele_a_la_fin: bool, gapless_envoye: bool) -> u8 {
+    if dlna_gele_a_la_fin && gapless_envoye {
+        TICKS_GELE_DLNA_AVEC_SETNEXT
+    } else {
+        POSITION_PAST_END_TICKS
+    }
+}
+
+/// Le motif à journaliser pour cette même fin : deux branches, deux planchers,
+/// donc deux noms — un seul nom ferait annoncer 6 000 ms là où on en attend
+/// 4 000.
+pub fn motif_position_au_dela(dlna_gele_a_la_fin: bool, gapless_envoye: bool) -> &'static str {
+    if dlna_gele_a_la_fin && gapless_envoye {
+        motif_fin::POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA
+    } else {
+        motif_fin::POSITION_AU_DELA_DE_LA_FIN
+    }
 }
 
 /// Plancher de silence, en millisecondes, imposé par la BRANCHE de
@@ -158,6 +186,9 @@ pub fn plancher_de_detection_ms(motif: &str) -> u64 {
         // `POSITION_PAST_END_TICKS` sondages.
         motif_fin::POSITION_AU_DELA_DE_LA_FIN => {
             END_MARGIN_MS + POSITION_PAST_END_TICKS as u64 * tick
+        }
+        motif_fin::POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA => {
+            END_MARGIN_MS + TICKS_GELE_DLNA_AVEC_SETNEXT as u64 * tick
         }
         _ => 0,
     }

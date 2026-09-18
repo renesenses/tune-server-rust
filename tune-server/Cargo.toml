@@ -313,6 +313,21 @@ path = "tests/ambiance_traduction_annoncee_3839.rs"
 name = "portee_audit_repertoire_3101"
 path = "tests/portee_audit_repertoire_3101.rs"
 
+# #4101 : la vue Oxygen listait chaque piste de Led Zeppelin IV deux fois. Le
+# repli des copies de moindre qualite (#1362) etait pose sur la fiche d'album,
+# sur la file et sur `albums.track_count`, mais PAS sur `GET /library/tracks` —
+# la seule route qu'Oxygen appelle. Le temoin interroge les DEUX chemins de
+# cette route et compte des identifiants DISTINCTS, jamais des lignes : le
+# compteur de l'issue comptait les lignes, et c'est ce qui ne prouvait rien.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+#
+# Posee ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "oxygen_pistes_en_double_4101"
+path = "tests/oxygen_pistes_en_double_4101.rs"
+
 # Canal stable / beta : quelles versions `/update/check` a le droit de proposer
 # (#2266). Le defaut `auto` reproduit le comportement d'avant.
 [[test]]
@@ -540,6 +555,16 @@ path = "tests/dispositions_de_canaux_3322.rs"
 name = "sante_slimproto_i3462"
 path = "tests/sante_slimproto_i3462.rs"
 
+# #4361 — le pont de commande LMS face a un port deja pris (Cockpit sur Tune OS
+# Fedora). Cible separee pour deux raisons : `cli_server::etat_ecoute()` est un
+# etat global au processus, et ce banc ecrit `TUNE_CLI_PORT` pour interroger
+# `start_cli_server()`, la fonction que le serveur appelle vraiment.
+# `autotests = false` plus haut : sans cette cible, le fichier ne serait JAMAIS
+# compile, donc vert contre rien.
+[[test]]
+name = "pont_lms_repli_de_port_4361"
+path = "tests/pont_lms_repli_de_port_4361.rs"
+
 # #2718 — « plus de serveurs multimedia ». La fiche support et le rapport de
 # bogue decrivaient les zones jusqu'au modele du DAC et ne comptaient PAS les
 # serveurs multimedia : quatre tickets (61, 87, 97, 98) instruits sans jamais
@@ -679,6 +704,13 @@ path = "tests/registre_serveurs_fraicheur_4125.rs"
 [[test]]
 name = "lecture_upnp_indexee_2219"
 path = "tests/lecture_upnp_indexee_2219.rs"
+
+# #4362 — une piste dont le SERVEUR est absent ne part pas au renderer. Sans
+# cette cible, `autotests = false` laisserait le fichier hors compilation et la
+# garde ne serait executee par personne.
+[[test]]
+name = "lecture_serveur_absent_4362"
+path = "tests/lecture_serveur_absent_4362.rs"
 
 [[test]]
 name = "album_dr_provenance_3924"

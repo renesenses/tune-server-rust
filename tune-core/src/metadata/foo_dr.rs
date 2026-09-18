@@ -61,9 +61,66 @@
 //! Le rapport n'est jamais rejeté pour son encodage : BOM UTF-8 retiré, UTF-8
 //! sinon, Windows-1252 en repli — l'outil tourne sous Windows, et un accent
 //! dans un titre ne doit pas faire disparaître les 22 mesures de l'album.
+//!
+//! # Les autres mesureurs (#4352) : c'est la DÉCOUVERTE qui était étroite
+//!
+//! L'analyseur ci-dessus n'exige aucun en-tête « foobar2000 » : il lit une
+//! mise en page, celle du TT DR. Jusqu'à #4352, [`rapport_voisin`] ne
+//! demandait pourtant qu'UN seul nom, `foo_dr.txt`, exact et sensible à la
+//! casse. Un rapport écrit par un autre outil — la même mise en page, un
+//! autre nom — n'était jamais ouvert.
+//!
+//! Ce que l'on sait des noms réellement écrits, et d'où on le tient :
+//!
+//! - **DR Meter de foobar2000** → `foo_dr.txt`. Établi par la pièce jointe du
+//!   fil 1800 (#4186), lue octet par octet.
+//! - **`dr14_t.meter`** (simon-r) → `dr14.txt` jusqu'au commit `30d571f4`
+//!   (05/10/2020), puis `dr14-DR<n>.txt` (le DR d'album est DANS le nom) ;
+//!   aussi `dr14_bbcode.txt` et `dr14_mediawiki.txt`, qui sont du BALISAGE et
+//!   non cette mise en page. Établi sur la source : `dr14tmeter/dr14_utils.py`,
+//!   table `tables_list` de `write_results`, écrite dans le dossier analysé.
+//! - **`dr_meter` de DeaDBeeF** (`dakeryas/deadbeef-dr-meter`) → **aucun nom
+//!   fixe**. `dr_plugin_gui/src/save_button.c` ouvre un `GtkFileChooser` en
+//!   mode `SAVE` **sans nom par défaut** : c'est l'utilisateur qui nomme le
+//!   fichier. Sa mise en page, elle, est exactement celle du TT DR :
+//!   `dr_meter/src/dr_log_printer.c` écrit
+//!   `DR         Peak         RMS     Duration Track` puis
+//!   `Official DR value: DRn`, et les mesures au format
+//!   `DR%-2.0f %10.2f dB %8.2f dB` (`DEFAULT_DR_FORMAT`,
+//!   `dr_plugin/src/dr_meter_plugin.c`).
+//! - **MAAT DROffline MkII** → **nom NON ÉTABLI, et rien n'a été ajouté pour
+//!   lui.** Son manuel (`DROfflineMkII_UM.pdf`, sections « Settings » et
+//!   « Global Tab ») décrit une case *Create Log File*, un dossier de sortie
+//!   au choix (dossier source, *Analysis Folder* ou *Alternate Folder*) et un
+//!   format « plain ASCII text, where commas are used to create structure » ou
+//!   TSV — mais **ne donne ni le nom du fichier, ni un exemple de mise en
+//!   page**. Une sortie à virgules ou tabulée n'est PAS la mise en page du TT
+//!   DR ; l'analyseur ne la lirait probablement pas. Tant qu'un rapport réel
+//!   n'est pas en main, on n'invente ni son nom ni son format.
+//!
+//! # Comment on élargit sans lire n'importe quoi
+//!
+//! Un nom de plus ne suffit pas : DeaDBeeF n'en a pas. Mais accepter tout
+//! `.txt` d'un dossier d'album prendrait le livret pour un rapport. D'où
+//! **deux régimes**, et un seul juge — l'analyseur :
+//!
+//! 1. **Nom établi** (`foo_dr.txt`, `dr14.txt`, `dr14-dr*.txt`, la casse ne
+//!    comptant plus) : c'est une déclaration d'intention. Il suffit au
+//!    fichier de porter une mesure, exactement comme avant #4352.
+//! 2. **Tout autre `.txt`** : il doit FAIRE SES PREUVES, c'est-à-dire porter
+//!    au moins une mesure **et** une marque de rapport — la ligne d'en-tête
+//!    `DR … Peak … RMS`, ou la ligne `Official DR value:`
+//!    ([`RapportDr::est_signe`]). Une fiche de release où quelqu'un a recopié
+//!    `DR12  -0.5 dB  -12.4 dB   01-So What` a beau donner une ligne
+//!    analysable, qui désigne la piste 1 sans ambiguïté : sans en-tête ni
+//!    total, elle n'est pas retenue.
+//!
+//! Ce module ne fait que **lire**. Il n'ouvre aucun fichier audio et n'écrit
+//! aucun tag : le piège de #4238 (une écriture de métadonnées qui efface les
+//! champs Vorbis qu'elle ne connaît pas) ne le concerne pas.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -100,6 +157,11 @@ pub struct RapportDr {
     /// `Official DR value: DR9`. Lu, pas écrit : voir le module.
     pub dr_album: Option<u8>,
     pub lignes: Vec<LigneDr>,
+    /// Vrai quand le texte portait la ligne d'en-tête de colonnes
+    /// `DR … Peak … RMS`. C'est, avec `dr_album`, ce qui distingue un
+    /// RAPPORT d'un texte où des lignes ressemblent à des mesures — voir
+    /// [`RapportDr::est_signe`].
+    pub entete: bool,
 }
 
 /// `01-Titre`, `01. Titre`, `01 - Titre`, `01 Titre`, `01_Titre`.
@@ -186,6 +248,9 @@ pub fn analyser(texte: &str) -> RapportDr {
         }
         if propre.starts_with("DR") && propre.contains("Peak") && propre.contains("RMS") {
             entete_multicanal = propre.contains("(FL)") || propre.contains("(FR)");
+            // La marque d'un rapport : c'est cette ligne, ou `Official DR
+            // value:`, qui autorise à ouvrir un fichier au nom inconnu.
+            rapport.entete = true;
             continue;
         }
         if let Some(l) = analyser_ligne(ligne, entete_multicanal) {
@@ -427,6 +492,19 @@ pub fn numero_dans_le_nom(nom_sans_extension: &str) -> Option<u32> {
 }
 
 impl RapportDr {
+    /// Vrai quand le texte porte les marques d'un **rapport** DR, et pas
+    /// seulement des lignes qui ressemblent à des mesures.
+    ///
+    /// C'est le juge de la découverte élargie (#4352) : un fichier au nom
+    /// inconnu n'est retenu que s'il a au moins une mesure **et** une
+    /// signature — la ligne d'en-tête `DR … Peak … RMS`, ou le total
+    /// `Official DR value:`. Les deux mesureurs dont la sortie est établie
+    /// (`dr14_t.meter`, `dr_meter` de DeaDBeeF) écrivent les DEUX ; un texte
+    /// de notes qui aligne `DR12  -0.5 dB  -12.4 dB` n'en écrit aucune.
+    pub fn est_signe(&self) -> bool {
+        !self.lignes.is_empty() && (self.entete || self.dr_album.is_some())
+    }
+
     /// Le DR d'UNE piste de l'album, ou `None` si le rapport ne permet pas
     /// de la désigner sans ambiguïté.
     ///
@@ -515,20 +593,99 @@ impl RapportDr {
     }
 }
 
+/// Au-delà, ce n'est plus un rapport d'album : celui du fil 1800, 22 pistes
+/// et deux couches, pèse 6 232 octets. La borne écarte le livret, les paroles
+/// ou le texte d'un coffret sans avoir à les lire.
+const TAILLE_MAX: u64 = 1024 * 1024;
+
+/// Combien de `.txt` au nom NON établi on accepte d'ouvrir dans un dossier.
+/// Un dossier d'album en porte un ou deux ; au-delà c'est un dossier de
+/// documents, et on ne va pas tout relire à chaque piste.
+const CANDIDATS_MAX: usize = 8;
+
+/// Le rang d'un nom de rapport **établi**, ou `None` si le nom ne dit rien.
+///
+/// `nom_minuscule` est le nom de fichier en minuscules, extension comprise ;
+/// c'est ce qui rend la recherche insensible à la casse — un `FOO_DR.TXT`
+/// recopié depuis un partage Windows était invisible avant #4352.
+///
+/// Le rang ordonne : `foo_dr.txt` d'abord, c'est le nom du fil 1800 et celui
+/// que Tune documente. Les sources de ces noms sont en tête de module.
+fn rang_du_nom_etabli(nom_minuscule: &str) -> Option<u8> {
+    if nom_minuscule == NOM_DU_RAPPORT {
+        return Some(0);
+    }
+    // `dr14_t.meter` : `dr14.txt` avant le 05/10/2020, `dr14-DR<n>.txt`
+    // depuis. `dr14_bbcode.txt` et `dr14_mediawiki.txt` sont du BALISAGE et
+    // ne sont pas des noms établis pour CETTE mise en page : s'ils sont là,
+    // ils passeront par la porte des candidats et seront refusés.
+    if nom_minuscule == "dr14.txt" || nom_minuscule.starts_with("dr14-dr") {
+        return Some(1);
+    }
+    None
+}
+
 /// Le rapport posé à côté d'un fichier audio, s'il y en a un.
 ///
-/// `None` quand il n'y a pas de `foo_dr.txt` dans le dossier — le cas de
-/// l'immense majorité des bibliothèques, et il ne coûte qu'un `stat`. `None`
-/// aussi quand le fichier existe mais ne contient aucune ligne de mesure :
-/// un rapport vide n'est pas une source.
+/// Cherche dans le dossier du fichier, parmi les seuls `.txt` (la casse ne
+/// compte pas) d'au plus [`TAILLE_MAX`] :
+///
+/// 1. les **noms établis** d'abord, dans l'ordre de [`rang_du_nom_etabli`] —
+///    il leur suffit de porter une mesure ;
+/// 2. puis, au plus [`CANDIDATS_MAX`] autres `.txt` par ordre alphabétique,
+///    retenus seulement s'ils sont [`RapportDr::est_signe`] — c'est le cas de
+///    DeaDBeeF, dont le journal n'a pas de nom fixe (voir le module).
+///
+/// `None` quand rien ne correspond : le cas de l'immense majorité des
+/// bibliothèques. Il en coûte alors un `read_dir` par piste — le scan vient
+/// d'ouvrir et de décoder les tags du fichier audio, c'est sans commune
+/// mesure — et aucune lecture de contenu s'il n'y a pas de `.txt`.
 pub fn rapport_voisin(fichier_audio: &Path) -> Option<RapportDr> {
-    let chemin = fichier_audio.parent()?.join(NOM_DU_RAPPORT);
-    let octets = std::fs::read(&chemin).ok()?;
-    let rapport = analyser_octets(&octets);
-    if rapport.lignes.is_empty() {
-        return None;
+    let dossier = fichier_audio.parent()?;
+    let mut etablis: Vec<(u8, PathBuf)> = Vec::new();
+    let mut candidats: Vec<PathBuf> = Vec::new();
+    for entree in std::fs::read_dir(dossier).ok()?.flatten() {
+        let brut = entree.file_name();
+        let Some(nom) = brut.to_str() else { continue };
+        let minuscule = nom.to_ascii_lowercase();
+        if !minuscule.ends_with(".txt") {
+            continue;
+        }
+        match entree.metadata() {
+            Ok(m) if m.is_file() && m.len() <= TAILLE_MAX => {}
+            _ => continue,
+        }
+        match rang_du_nom_etabli(&minuscule) {
+            Some(rang) => etablis.push((rang, entree.path())),
+            None => candidats.push(entree.path()),
+        }
     }
-    Some(rapport)
+    // `read_dir` ne promet aucun ordre : on le fixe, sinon deux scans du même
+    // dossier pourraient retenir deux fichiers différents.
+    etablis.sort();
+    candidats.sort();
+
+    for (_, chemin) in &etablis {
+        if let Some(rapport) = lire_le_rapport(chemin)
+            && !rapport.lignes.is_empty()
+        {
+            return Some(rapport);
+        }
+    }
+    for chemin in candidats.iter().take(CANDIDATS_MAX) {
+        if let Some(rapport) = lire_le_rapport(chemin)
+            && rapport.est_signe()
+        {
+            return Some(rapport);
+        }
+    }
+    None
+}
+
+/// Lit et analyse un fichier. `None` si la lecture échoue — un fichier
+/// illisible n'est pas une erreur du scan, c'est une absence de rapport.
+fn lire_le_rapport(chemin: &Path) -> Option<RapportDr> {
+    Some(analyser_octets(&std::fs::read(chemin).ok()?))
 }
 
 #[cfg(test)]
@@ -877,5 +1034,134 @@ DR14      -0.20 dBFS  -16.53 dBFS    4:12 03 - Silverside.flac\n",
         std::fs::write(dossier.join(NOM_DU_RAPPORT), STEREO).unwrap();
         let r = rapport_voisin(&audio).expect("le rapport voisin se lit");
         assert_eq!(r.lignes.len(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // #4352 — les autres mesureurs. Sources des mises en page : en tête de
+    // module, avec le fichier et la ligne de chaque outil.
+    // ------------------------------------------------------------------
+
+    /// Le journal du greffon `dr_meter` de DeaDBeeF, mis en page par
+    /// `dr_log_printer.c`.
+    const DEADBEEF: &[u8] = include_bytes!("../../tests/fixtures/dr_deadbeef_4352.txt");
+    /// La table texte de `dr14_t.meter` (cellules séparées par des
+    /// tabulations, `TextTable` de `dr14tmeter/table.py`).
+    const DR14: &[u8] = include_bytes!("../../tests/fixtures/dr14_tmeter_4352.txt");
+    /// Une fiche de release où quelqu'un a RECOPIÉ une ligne de rapport,
+    /// sans en-tête de colonnes ni total : le faux positif réaliste.
+    const NOTES: &[u8] = include_bytes!("../../tests/fixtures/pas_un_rapport_dr_4352.txt");
+
+    /// Un dossier d'album jetable, avec un faux fichier audio.
+    fn dossier_avec_audio(etiquette: &str) -> (crate::test_scratch::ScratchDir, PathBuf) {
+        let dossier = crate::test_scratch::scratch_dir(etiquette);
+        let audio = dossier.join("01 - So What.flac");
+        std::fs::write(&audio, b"pas un vrai flac").unwrap();
+        (dossier, audio)
+    }
+
+    /// L'analyseur lisait DÉJÀ ces deux mises en page — c'est la découverte
+    /// qui ne les trouvait pas. On le montre avant tout le reste.
+    #[test]
+    fn l_analyseur_lisait_deja_les_deux_autres_mesureurs_4352() {
+        let d = analyser_octets(DEADBEEF);
+        assert_eq!(d.lignes.len(), 3, "DeaDBeeF : trois pistes. Relevé : {d:?}");
+        assert_eq!(d.dr_album, Some(13));
+        assert_eq!(d.lignes[0].dr, 13);
+        assert_eq!(d.lignes[0].numero, Some(1));
+        assert_eq!(d.lignes[0].titre, "So What");
+        assert!(d.entete, "l'en-tête de colonnes de DeaDBeeF est reconnu");
+
+        let t = analyser_octets(DR14);
+        assert_eq!(
+            t.lignes.len(),
+            2,
+            "dr14_t.meter : deux pistes. Relevé : {t:?}"
+        );
+        assert_eq!(t.dr_album, Some(11));
+        assert_eq!(t.lignes[1].dr, 11);
+        assert_eq!(t.lignes[1].numero, Some(2));
+        assert_eq!(t.lignes[1].titre, "No Reply At All.flac");
+    }
+
+    /// LE CAS DE JeromeQ — le greffon de DeaDBeeF n'a AUCUN nom par défaut
+    /// (`save_button.c` ouvre un sélecteur de fichier vide) : c'est
+    /// l'utilisateur qui nomme. Seule la découverte par CONTENU le trouve.
+    #[test]
+    fn un_journal_deadbeef_sans_nom_fixe_est_trouve_et_lu_4352() {
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-deadbeef");
+        std::fs::write(dossier.join("mes mesures DR.txt"), DEADBEEF).unwrap();
+        let r = rapport_voisin(&audio).expect("#4352 — un nom libre reste un rapport");
+        assert_eq!(r.dr_album, Some(13));
+        assert_eq!(r.lignes.len(), 3);
+    }
+
+    /// LE FAUX POSITIF — le vrai risque. Des lignes analysables, mais ni
+    /// en-tête de colonnes ni `Official DR value:` : ce n'est pas un rapport,
+    /// et on ne colle pas DR12 sur la piste 1 de l'album.
+    #[test]
+    fn un_texte_de_notes_n_est_pas_pris_pour_un_rapport_4352() {
+        // L'ANALYSEUR, lui, en tire bien trois lignes : sans la signature,
+        // élargir la découverte à tout `.txt` aurait lu ce fichier.
+        let brut = analyser_octets(NOTES);
+        assert_eq!(
+            brut.lignes.len(),
+            1,
+            "le piège est réel : cette ligne S'ANALYSE, et elle désigne la \
+             piste 1 sans ambiguïté. Relevé : {brut:?}"
+        );
+        assert_eq!(brut.lignes[0].dr, 12);
+        assert_eq!(brut.lignes[0].numero, Some(1));
+        assert!(
+            !brut.est_signe(),
+            "ni en-tête `DR … Peak … RMS` ni `Official DR value:` : pas un rapport"
+        );
+
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-notes");
+        std::fs::write(dossier.join("notes.txt"), NOTES).unwrap();
+        assert!(
+            rapport_voisin(&audio).is_none(),
+            "#4352 — un texte posé dans le dossier n'est pas une source de DR"
+        );
+    }
+
+    /// La CASSE ne cache plus rien : `join("foo_dr.txt")` était une
+    /// correspondance exacte, et un `FOO_DR.TXT` venu d'un partage Windows
+    /// restait invisible. Ce cas ne rougit que sur un système de fichiers
+    /// SENSIBLE à la casse (Linux, la CI) : sous macOS, APFS répond déjà à
+    /// `foo_dr.txt` pour un fichier nommé `FOO_DR.TXT`.
+    #[test]
+    fn la_casse_du_nom_ne_cache_plus_le_rapport_4352() {
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-casse");
+        std::fs::write(dossier.join("FOO_DR.TXT"), STEREO).unwrap();
+        let r = rapport_voisin(&audio).expect("#4352 — la casse du nom ne compte plus");
+        assert_eq!(r.lignes.len(), 3);
+    }
+
+    /// Le nom de `dr14_t.meter` depuis 2020 porte le DR dans le nom :
+    /// `dr14-DR11.txt`. Un nom établi n'a pas à porter de signature.
+    #[test]
+    fn le_nom_de_dr14_tmeter_est_un_nom_etabli_4352() {
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-dr14");
+        std::fs::write(dossier.join("dr14-DR11.txt"), DR14).unwrap();
+        let r = rapport_voisin(&audio).expect("#4352 — `dr14-DR<n>.txt` est un nom établi");
+        assert_eq!(r.dr_album, Some(11));
+        assert_eq!(r.lignes.len(), 2);
+    }
+
+    /// Deux rapports dans le même dossier : le nom ÉTABLI passe devant, quel
+    /// que soit l'ordre que rend `read_dir`.
+    #[test]
+    fn le_nom_etabli_prime_sur_un_candidat_4352() {
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-priorite");
+        std::fs::write(dossier.join("aaa mesures.txt"), DEADBEEF).unwrap();
+        std::fs::write(dossier.join(NOM_DU_RAPPORT), STEREO).unwrap();
+        let r = rapport_voisin(&audio).expect("le rapport se lit");
+        assert_eq!(
+            r.dr_album,
+            Some(11),
+            "`foo_dr.txt` (Autechre, DR11) a été retenu, pas le journal \
+             DeaDBeeF (Miles Davis, DR13). Relevé : {r:?}"
+        );
+        assert_eq!(r.lignes[0].titre, "Foil");
     }
 }

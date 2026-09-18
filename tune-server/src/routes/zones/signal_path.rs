@@ -628,6 +628,13 @@ fn assembler_les_etapes(
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
         dsd_resolution_label(sample_rate)
+    } else if sample_rate == 0 {
+        format_name.to_string()
+    } else if bit_depth == 0 {
+        format!(
+            "{format_name}{bitrate_label} {sr}kHz",
+            sr = sample_rate / 1000
+        )
     } else if sample_rate >= 1000 {
         format!(
             "{format_name}{bitrate_label} {sr}kHz/{bit_depth}bit",
@@ -679,8 +686,12 @@ fn assembler_les_etapes(
         // already fits the 16-bit LPCM cap — unless the zone opted into genuine
         // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
         let wav_output = wire_wav || dlna_lpcm || dlna_wav24;
-        let transcode_lossless = (is_oaat && is_lossless && !is_dsd)
-            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16));
+        let transcode_lossless = ((is_oaat && is_lossless && !is_dsd)
+            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16)))
+            && ps
+                .now_playing
+                .as_ref()
+                .is_none_or(|np| radio_wire_preserves_source(np, &analyse.source));
         // Reflect the OUTPUT resolution the renderer actually receives: 24-bit
         // for the opt-in 24-bit WAV path, 16-bit when the zone caps to 16-bit OR
         // serves the plain LPCM fallback (audio/L16 is 16-bit), and the
@@ -1014,6 +1025,7 @@ fn rendre_les_verdicts(
     // fil est intact, l'étape ne fait que l'expliquer.
     let replaygain_altere = replaygain_step.is_some_and(|rg| rg.alters_audio);
     let bit_perfect = is_lossless
+        && radio_wire_preserves_source(np, source)
         && transport_bit_perfect
         && !dsp_applique
         && !resampling_active
@@ -1522,6 +1534,19 @@ struct Source<'w> {
     is_lossless: bool,
 }
 
+/// The radio decoder emits 16-bit PCM and can adapt low source rates.
+/// Downstream runtime measurements start after that conversion.
+fn radio_wire_preserves_source(np: &tune_core::playback::NowPlaying, source: &Source) -> bool {
+    np.source != "radio"
+        || source.output_container != Some("wav")
+        || (source.sample_rate > 0
+            && source.wire_sample_rate == Some(source.sample_rate as u32)
+            && source.bit_depth > 0
+            && source
+                .wire_bit_depth
+                .is_some_and(|bits| i32::from(bits) >= source.bit_depth))
+}
+
 /// Lit la piste, le fil et la lecture en cours pour décrire la source.
 fn decrire_la_source<'w>(
     np: &tune_core::playback::NowPlaying,
@@ -1535,11 +1560,37 @@ fn decrire_la_source<'w>(
     // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
     let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
     let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
-    // A decoded live radio has no library row and its NowPlaying resolution is
-    // only the bootstrap value chosen before the decoder opens the upstream.
-    // Once the session publishes its detected PCM format, that observation is
-    // authoritative for the source line too (France Musique: 48 kHz, not the
-    // 44.1 kHz bootstrap value from session creation — #2427).
+    // A radio decoded to WAV must retain its upstream codec (#4346).
+    // No session/observation yet is unknown, never proof of a lossless source.
+    let radio_source = (np.source == "radio")
+        .then(|| {
+            wire.and_then(|w| w.radio_source).or_else(|| {
+                (np.format
+                    .as_deref()
+                    .is_none_or(|f| matches!(f, "wav" | "audio/wav")))
+                .then_some(tune_core::http::streamer::RadioSourceInfo::default())
+            })
+        })
+        .flatten();
+    if let Some(radio) = radio_source {
+        let source_format = radio.format.and_then(AudioFormat::from_extension);
+        return Source {
+            output_container,
+            wire_sample_rate,
+            wire_bit_depth,
+            source_format,
+            is_dsd: false,
+            sample_rate: radio.sample_rate.unwrap_or(0) as i32,
+            bit_depth: radio.bit_depth.unwrap_or(0) as i32,
+            format_name: source_format
+                .as_ref()
+                .map_or("Unknown", AudioFormat::display_name),
+            is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
+        };
+    }
+    // Verbatim proxy radios keep their existing wire/NowPlaying metadata
+    // fallback. Decoded radios returned above using the upstream observation,
+    // separately from any output rate conversion (#2427, #4346).
     let radio_wire_sample_rate = (np.source == "radio")
         .then_some(wire_sample_rate)
         .flatten()

@@ -7689,3 +7689,115 @@ async fn une_reprise_dlna_ordinaire_n_envoie_qu_un_seul_play() {
         "aucune relance quand le renderer a repris"
     );
 }
+
+/// **#4323 — « Tune vient d'inventer la notion d'Episode » (Tades, fil 1819).**
+///
+/// Le MediaRenderer reçoit un `SetAVTransportURI` dont l'URI est
+/// `…/api/v1/library/tracks/187500/audio` — l'adresse que le serveur média de
+/// Tune publie LUI-MÊME dans le `<res>` de cette piste —, et un DIDL sans
+/// `dc:title` lisible. Il construisait alors un `PlayRequest` avec
+/// `track_id: None` et `title: None` ; `resolve_direct_url_de_source` retombait
+/// sur son repli podcast/radio et la piste s'appelait « Episode », dans la
+/// lecture en cours COMME dans l'historique.
+///
+/// L'épreuve passe par `orchestrator.play()`, la porte qu'emprunte le
+/// renderer (`upnp_media_renderer.rs`, `upnp_renderer_play` et
+/// `upnp_renderer_gapless_advance` construisent tous deux cette demande-là) :
+/// ce qui est mesuré n'est pas la résolution prise à part, mais CE QUE LA
+/// ZONE AFFICHE et CE QUE L'HISTORIQUE GARDE.
+///
+/// Les trois assertions sont les trois symptômes du fil : le titre de la
+/// lecture en cours, le lien vers la piste (d'où viennent pochette et format,
+/// absents des cartes de Tades), et la ligne d'historique.
+#[tokio::test]
+async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
+    let device_id = "dlna-4323";
+    let orch = test_orchestrator();
+
+    orch.db
+        .execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Quartetto Italiano')",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'The Middle Quartets', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (187500, 'Quartet No. 10', 1, 1, '/aucun/chemin/4323.flac', 'flac', \
+             300000, 44100, 16, 2)",
+            &[],
+        )
+        .unwrap();
+
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("DDC-0 C19", Some("dlna"), Some(device_id))
+        .unwrap();
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new(device_id, "DDC-0 C19").with_type("dlna"),
+    ));
+
+    // L'URI n'est pas écrite à la main : c'est le constructeur du `<res>` qui
+    // la rend, celui-là même que le point de contrôle a recopié.
+    let uri = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", 187_500);
+
+    // La demande EXACTE que `upnp_media_renderer.rs` construit sur un DIDL
+    // vide : aucun titre, aucun artiste, aucun `track_id`.
+    orch.play(PlayRequest {
+        zone_id,
+        output_device_id: Some(device_id.into()),
+        track_id: None,
+        source: Some("upnp".into()),
+        source_id: Some(uri.clone()),
+        title: None,
+        artist_name: None,
+        duration_ms: None,
+        ..Default::default()
+    })
+    .await
+    .expect("la lecture doit aboutir");
+
+    let np = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .expect("la zone doit avoir une lecture en cours");
+    assert_eq!(
+        np.title, "Quartet No. 10",
+        "la lecture en cours doit porter le titre de la piste, pas « Episode »"
+    );
+    assert_eq!(
+        np.track_id,
+        Some(187_500),
+        "l'URI désigne une piste de la bibliothèque : son `track_id` doit être \
+         résolu, sans quoi ni la pochette ni le format n'ont de source"
+    );
+    assert_eq!(
+        np.source_id.as_deref(),
+        Some(uri.as_str()),
+        "la session du renderer se reconnaît à son URI (`doit_reprendre`) : \
+         `source_id` ne doit PAS avoir bougé"
+    );
+
+    // L'historique — l'autre moitié du fil : la rangée « Récemment joué ».
+    let titre_historise = orch
+        .db
+        .query_one(
+            "SELECT title FROM listen_history ORDER BY id DESC LIMIT 1",
+            &[],
+        )
+        .unwrap()
+        .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))
+        .expect("une ligne d'historique doit avoir été écrite");
+    assert_eq!(
+        titre_historise, "Quartet No. 10",
+        "« Récemment joué » ne doit plus aligner des cartes « Episode »"
+    );
+}

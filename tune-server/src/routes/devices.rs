@@ -586,7 +586,6 @@ pub async fn register_manual_device(
                 );
             };
 
-            let base = format!("http://{}:{}", dev.host, dev.port);
             let device_name = dev
                 .name
                 .clone()
@@ -600,14 +599,14 @@ pub async fn register_manual_device(
             let cm_url = service_urls
                 .get("connectionmanager")
                 .or_else(|| service_urls.get("ConnectionManager"))
-                .map(|p| format!("{base}{p}"));
+                .map(|p| crate::discovery_setup::resolve_control_url(&dev.host, dev.port, p));
 
             let dlna = DlnaOutput::new(
                 device_name.clone(),
                 device_id.clone(),
                 dev.host.clone(),
-                format!("{base}{av}"),
-                format!("{base}{rc}"),
+                crate::discovery_setup::resolve_control_url(&dev.host, dev.port, av),
+                crate::discovery_setup::resolve_control_url(&dev.host, dev.port, rc),
                 cm_url,
             )
             .with_play_delay(delay)
@@ -1158,7 +1157,6 @@ async fn register_discovered_dlna(
     ) else {
         return Err(ReprobeFailure::NotARenderer);
     };
-    let base = format!("http://{}:{}", dev.host, dev.port);
     let device_name = if dev.name.is_empty() {
         format!("DLNA {}", dev.host)
     } else {
@@ -1169,13 +1167,13 @@ async fn register_discovered_dlna(
     let cm_url = service_urls
         .get("connectionmanager")
         .or_else(|| service_urls.get("ConnectionManager"))
-        .map(|p| format!("{base}{p}"));
+        .map(|p| crate::discovery_setup::resolve_control_url(&dev.host, dev.port, p));
     let dlna = DlnaOutput::new(
         device_name.clone(),
         dev.uuid.clone(),
         dev.host.clone(),
-        format!("{base}{av}"),
-        format!("{base}{rc}"),
+        crate::discovery_setup::resolve_control_url(&dev.host, dev.port, av),
+        crate::discovery_setup::resolve_control_url(&dev.host, dev.port, rc),
         cm_url,
     )
     .with_play_delay(delay)
@@ -1311,7 +1309,6 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                 let rc_url = service_urls.get("renderingcontrol");
 
                 if let (Some(av), Some(rc)) = (av_url, rc_url) {
-                    let base = format!("http://{}:{}", d.host, d.port);
                     let delay = crate::config::resolve_play_delay(
                         &state.backend,
                         &state.config,
@@ -1321,13 +1318,13 @@ async fn scan_devices(State(state): State<AppState>) -> Json<Value> {
                     let cm_url = service_urls
                         .get("connectionmanager")
                         .or_else(|| service_urls.get("ConnectionManager"))
-                        .map(|p| format!("{base}{p}"));
+                        .map(|p| crate::discovery_setup::resolve_control_url(&d.host, d.port, p));
                     let dlna = DlnaOutput::new(
                         d.name.clone(),
                         d.id.clone(),
                         d.host.clone(),
-                        format!("{base}{av}"),
-                        format!("{base}{rc}"),
+                        crate::discovery_setup::resolve_control_url(&d.host, d.port, av),
+                        crate::discovery_setup::resolve_control_url(&d.host, d.port, rc),
                         cm_url,
                     )
                     .with_play_delay(delay)

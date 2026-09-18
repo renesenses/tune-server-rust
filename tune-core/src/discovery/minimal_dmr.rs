@@ -131,10 +131,16 @@ async fn try_xml_description(
             let after = &block[ctrl_start + 12..];
             if let Some(ctrl_end) = after.find("</controlURL>") {
                 let mut path = after[..ctrl_end].trim().to_string();
-                if !path.starts_with('/') {
-                    path = format!("/{path}");
-                }
-                let full_url = format!("{base}{path}");
+                // Comme la découverte principale (#707), conserver une URL
+                // absolue : la préfixer à nouveau casse les deux services (#4153).
+                let full_url = if path.starts_with("http://") || path.starts_with("https://") {
+                    path
+                } else {
+                    if !path.starts_with('/') {
+                        path = format!("/{path}");
+                    }
+                    format!("{base}{path}")
+                };
                 if block.contains("AVTransport:1") {
                     avt_url = Some(full_url);
                 } else if block.contains("RenderingControl:1") {
@@ -232,5 +238,113 @@ mod tests {
             &[("CurrentURI", "http://x.com/a&b")],
         );
         assert!(body.contains("&amp;b"));
+    }
+
+    /// Le vrai point d'entrée découvre un descripteur servi sur loopback.
+    /// Les URL de contrôle sont seulement lues : aucun renderer réel contacté.
+    async fn discover_description(xml: impl FnOnce(&str) -> String) -> (ProbeResult, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let description = xml(&base);
+        let app = axum::Router::new().route(
+            "/description.xml",
+            axum::routing::get(move || {
+                let body = description.clone();
+                async move { ([("content-type", "text/xml")], body) }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            probe_minimal_dmr(
+                &format!("{base}/"),
+                Some(&format!("{base}/description.xml")),
+                "Fallback",
+            ),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        (
+            result
+                .expect("la découverte XML doit terminer")
+                .expect("renderer découvert"),
+            base,
+        )
+    }
+
+    fn description(avt: &str, rc: &str) -> String {
+        format!(
+            "<root><device><friendlyName>Renderer de banc</friendlyName><serviceList>\
+             <service><serviceType>{AVT_NS}</serviceType><controlURL> {avt} </controlURL></service>\
+             <service><serviceType>{RC_NS}</serviceType><controlURL> {rc} </controlURL></service>\
+             </serviceList></device></root>"
+        )
+    }
+
+    #[tokio::test]
+    async fn absolute_http_control_urls_survive_minimal_discovery() {
+        let (result, base) = discover_description(|base| {
+            description(
+                &format!("{base}/avt"),
+                "http://renderer.invalid:8080/volume",
+            )
+        })
+        .await;
+        assert_eq!(
+            result.av_transport_url,
+            format!("{base}/avt"),
+            "#4153 : la découverte minimale a doublé l'origine HTTP d'AVTransport"
+        );
+        assert_eq!(
+            result.rendering_control_url.as_deref(),
+            Some("http://renderer.invalid:8080/volume"),
+            "#4153 : RenderingControl absolu doit conserver son propre hôte"
+        );
+        assert_eq!(result.name, "Renderer de banc");
+    }
+
+    #[tokio::test]
+    async fn absolute_https_control_urls_survive_minimal_discovery() {
+        let (result, _) = discover_description(|_| {
+            description(
+                "https://renderer.invalid:8443/avt%20control",
+                "https://renderer.invalid/volume",
+            )
+        })
+        .await;
+        assert_eq!(
+            result.av_transport_url, "https://renderer.invalid:8443/avt%20control",
+            "#4153 : une controlURL HTTPS ne doit pas devenir un chemin HTTP"
+        );
+        assert_eq!(
+            result.rendering_control_url.as_deref(),
+            Some("https://renderer.invalid/volume")
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_control_urls_keep_the_existing_base() {
+        let (result, base) = discover_description(|_| description("/avt", "volume")).await;
+        assert_eq!(result.av_transport_url, format!("{base}/avt"));
+        assert_eq!(result.rendering_control_url, Some(format!("{base}/volume")));
+    }
+
+    #[tokio::test]
+    async fn tune_renderer_description_keeps_its_absolute_service_urls() {
+        let (result, base) = discover_description(|base| {
+            crate::upnp_renderer::renderer_description_xml("Salon", "uuid:test-4153", base, 5)
+        })
+        .await;
+        assert_eq!(
+            result.av_transport_url,
+            format!("{base}/upnp/renderer/5/AVTransport/control"),
+            "#4153 : le descripteur Tune ne doit pas produire http://h:p/http://h:p/..."
+        );
+        assert_eq!(
+            result.rendering_control_url,
+            Some(format!("{base}/upnp/renderer/5/RenderingControl/control"))
+        );
+        assert_eq!(result.name, "Salon");
     }
 }
