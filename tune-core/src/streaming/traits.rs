@@ -23,6 +23,18 @@ pub struct StreamTrack {
     /// `#[serde(default)]` so older serialized results without the field still load.
     #[serde(default)]
     pub isrc: Option<String>,
+    /// La piste est-elle écoutable AUJOURD'HUI ?
+    ///
+    /// Point 10 (Yves Corbat, 17/09/2026) : « Nouveautés Qobuz à paraître :
+    /// les titres indisponibles ne sont pas grisés ». Un album annoncé est
+    /// rarement tout noir ou tout blanc — ses singles sortis se jouent, le
+    /// reste répond « no url » (502). C'est donc la PISTE qui porte la
+    /// réponse, pas l'album.
+    ///
+    /// `None` = le service ne dit rien, et on ne conclut pas : seul
+    /// `Some(false)` grise une ligne.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disponible: Option<bool>,
     /// Compositeur de la piste, quand le service l'expose (Qobuz : `composer.name`).
     /// Champ propre : il ne sert JAMAIS de valeur d'« artist » — en classique,
     /// compositeur ≠ interprète (#1407). `#[serde(default)]` comme `isrc`, pour
@@ -65,6 +77,20 @@ pub struct StreamAlbum {
     pub year: Option<u32>,
     pub track_count: u32,
     pub quality: Option<StreamQuality>,
+    /// Date de sortie annoncée par le service, en secondes d'époque.
+    ///
+    /// Point 10 (Yves Corbat, 17/09/2026) : les nouveautés Qobuz contiennent
+    /// des albums **à paraître**, dont les pistes ne se résolvent pas encore
+    /// (« no url », 502). Rien à l'écran ne les distinguait. Qobuz la porte
+    /// sur `released_at` ; les autres services laissent `None` — une absence
+    /// ne s'invente pas.
+    ///
+    /// ⚠️ C'est un champ de CATALOGUE, pas de compte : `detail_album` met en
+    /// cache la réponse `/album/get` en s'appuyant sur le fait qu'aucun
+    /// mappeur ne lit `favorited_at`, `purchasable` ni `streamable`. Lire
+    /// `released_at` ne touche pas à cette condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,6 +672,7 @@ mod tests {
             track_number: Some(1),
             disc_number: Some(1),
             explicit: false,
+            disponible: None,
             isrc: Some("USSM19900001".into()),
             composer: None,
             artist_id: None,
@@ -694,6 +721,7 @@ mod tests {
             year: Some(1959),
             track_count: 5,
             quality: None,
+            released_at: None,
         };
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["source_id"], "789");
@@ -924,6 +952,7 @@ mod tests_limite_sans_pagination {
             track_number: None,
             disc_number: None,
             explicit: false,
+            disponible: None,
             quality: None,
             isrc: None,
             composer: None,

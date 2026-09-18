@@ -191,6 +191,7 @@ impl AmazonMusicService {
             track_number: data["trackNumber"].as_u64().map(|n| n as u32),
             disc_number: data["discNumber"].as_u64().map(|n| n as u32),
             explicit: data["explicit"].as_bool().unwrap_or(false),
+            disponible: None,
             isrc: data["isrc"].as_str().map(Into::into),
             composer: None,
             artist_id: None,
@@ -227,6 +228,7 @@ impl AmazonMusicService {
             cover_path: data["artworkUrl"].as_str().map(Into::into),
             year: data["year"].as_u64().map(|y| y as u32),
             track_count: data["trackCount"].as_u64().unwrap_or(0) as u32,
+            released_at: None,
             quality: None,
         }
     }
