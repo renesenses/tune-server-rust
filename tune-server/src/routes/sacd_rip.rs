@@ -12,9 +12,31 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(sacd_status))
+        .route("/iso-status", get(sacd_iso_status))
         .route("/disc", get(sacd_disc_info))
         .route("/rip", post(start_sacd_rip))
         .route("/rip/status", get(sacd_rip_status))
+}
+
+// The diagnostic never queues an unbounded series of external processes.
+// A busy or timed-out probe is unknown, not "tool missing".
+static ISO_PROBE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+async fn sacd_iso_status() -> Result<Json<Value>, AppError> {
+    iso_status_with_probe(tune_core::audio::iso_sacd::sacd_extract_available()).await
+}
+
+async fn iso_status_with_probe(
+    probe: impl std::future::Future<Output = Result<bool, String>>,
+) -> Result<Json<Value>, AppError> {
+    let _permit = ISO_PROBE
+        .try_acquire()
+        .map_err(|_| AppError::service_unavailable("SACD ISO extractor probe already running"))?;
+    let available = probe.await.map_err(AppError::service_unavailable)?;
+    Ok(Json(json!({
+        "available": available,
+        "tool": if available { "sacd_extract" } else { "none" },
+    })))
 }
 
 /// Check if sacd_extract or similar tool is available.
@@ -122,5 +144,91 @@ async fn sacd_rip_status(State(state): State<AppState>) -> Json<Value> {
             "status": "idle",
             "message": "No SACD rip in progress",
         })),
+    }
+}
+
+#[cfg(test)]
+mod iso_status_tests_3234 {
+    use super::*;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn iso_status_http_contract_and_busy_probe_remains_unknown() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let app = router().with_state(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/iso-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        let available = json["available"].as_bool().expect("explicit availability");
+        assert_eq!(
+            json["tool"],
+            if available { "sacd_extract" } else { "none" }
+        );
+        assert!(
+            json.get("requirements").is_none(),
+            "ISO is not a physical drive"
+        );
+
+        let permit = ISO_PROBE.acquire().await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/iso-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert!(
+            json.get("available").is_none(),
+            "a concurrent request must not claim absence"
+        );
+        drop(permit);
+
+        // Exercise the same HTTP handler's failure conversion, without
+        // changing PATH or requiring a globally installed fake tool.
+        use axum::response::IntoResponse;
+        let timeout_response =
+            iso_status_with_probe(async { Err("SACD ISO extractor probe timed out".into()) })
+                .await
+                .into_response();
+        assert_eq!(timeout_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(timeout_response.into_body(), 4096).await.unwrap())
+                .unwrap();
+        assert!(body.get("available").is_none());
+        assert_eq!(
+            ISO_PROBE.available_permits(),
+            1,
+            "failure releases the permit"
+        );
+        let next = app
+            .oneshot(
+                Request::builder()
+                    .uri("/iso-status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.status(), StatusCode::OK);
     }
 }
