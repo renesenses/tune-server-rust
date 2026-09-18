@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::metadata::enrichment::{MetadataEnricher, RecordingDetails};
 
+use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
 use crate::state::AppState;
 
 const MUSICBRAINZ_API: &str = "https://musicbrainz.org/ws/2";
@@ -144,15 +145,21 @@ fn restreindre_a_la_portee(
 /// (`startBatchEnrich` → `POST /library/enrich-all`), et non
 /// `/system/enrichment/run`. Un `path` limité au sous-arbre demandé restreint
 /// la sélection des candidats ; sans `path`, rien ne change.
+///
+/// 🔴 #4447 — le corps est optionnel POUR DE BON. `Option<Json<…>>` ne rendait
+/// `None` que si `Content-Type` était absent ; le client web annonçait
+/// `application/json` sans rien envoyer et récoltait un 400
+/// « EOF while parsing a value ». [`CorpsJsonOptionnel`] lit les octets et ne
+/// désérialise que s'il y en a.
 pub(super) async fn enrich_all_library(
     State(state): State<AppState>,
-    body: Option<Json<EnrichAllBody>>,
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<EnrichAllBody>,
 ) -> impl IntoResponse {
     // Portée résolue AVANT le gate de quota : un chemin invalide ne doit rien
     // consommer. Refus franc, jamais de repli sur la bibliothèque entière —
     // le repli enrichirait exactement ce que l'utilisateur voulait épargner.
     let scope = match body
-        .and_then(|Json(b)| b.path)
+        .and_then(|b| b.path)
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
     {

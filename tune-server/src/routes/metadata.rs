@@ -16,6 +16,7 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::metadata::auto_fix::AutoFixEngine;
 use tune_core::metadata::{MetadataUpdate, write_metadata};
 
+use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
 use crate::state::AppState;
 
 /// Le moteur porte l'état d'un balayage en cours : il doit donc survivre à la
@@ -2563,14 +2564,18 @@ struct AutoFixBody {
 }
 
 /// POST /metadata/auto-fix — démarre un balayage en tâche de fond.
+///
+/// 🔴 #4447 — corps optionnel POUR DE BON : le client web poste sans charge
+/// utile mais annonce `application/json`, ce qu'`Option<Json<…>>` rejetait en
+/// 400. Voir [`CorpsJsonOptionnel`].
 async fn start_auto_fix(
     State(state): State<AppState>,
-    body: Option<Json<AutoFixBody>>,
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<AutoFixBody>,
 ) -> impl IntoResponse {
     let Some(engine) = auto_fix_engine(&state) else {
         return auto_fix_unavailable();
     };
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
 
     match engine
         .start_scan(b.threshold.unwrap_or(0.9), b.batch_size.unwrap_or(50))

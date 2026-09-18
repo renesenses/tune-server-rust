@@ -170,6 +170,7 @@ mod tests {
                 channels: 2,
             },
             expires_at: None,
+            headers: Vec::new(),
         };
 
         let observation = StreamingQualityPreference::Hires.observe("tidal", &delivered);
