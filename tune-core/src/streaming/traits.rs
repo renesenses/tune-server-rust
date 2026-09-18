@@ -135,6 +135,18 @@ pub struct StreamUrl {
     pub mime_type: String,
     pub quality: StreamQuality,
     pub expires_at: Option<u64>,
+    /// En-têtes HTTP à REJOUER pour aller chercher cette URL.
+    ///
+    /// #4366 — FabienM, fil 1829 : `AAC download failed: upstream HTTP 403
+    /// Forbidden`. yt-dlp rend une URL `googlevideo` en deux secondes, puis
+    /// un `GET` **nu** est refusé en 36 ms. L'URL est résolue par un
+    /// processus et consommée par un autre client HTTP, qui ne rejoue rien du
+    /// contexte de la résolution — ni User-Agent, ni Origin, ni Referer.
+    ///
+    /// Vide par défaut : aucun autre service ne change de comportement, et
+    /// `#[serde(default)]` laisse relire les résultats déjà sérialisés.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -792,6 +804,7 @@ mod tests {
                 channels: 2,
             },
             expires_at: Some(1700000000),
+            headers: Vec::new(),
         };
         let json = serde_json::to_value(&url).unwrap();
         assert_eq!(json["url"], "https://stream.example.com/track.flac");
