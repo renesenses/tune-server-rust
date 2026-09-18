@@ -610,9 +610,9 @@ fn assembler_les_etapes(
     let Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
-        dlna_lpcm,
         dlna_cap_16bit,
         dlna_wav24,
+        dlna_force_wav,
         needs_transcode_for_output,
         is_oaat,
         oaat_transcodes,
@@ -668,8 +668,9 @@ fn assembler_les_etapes(
         // AirPlay 2 encode en ALAC 44,1/16 comme AirPlay 1 : l'étape est la
         // même, et elle manquait ici aussi (#2189).
         || matches!(output_type, "airplay" | "airplay2")
-        || dlna_lpcm
-        || dlna_wav24
+        // Le FORÇAGE, pas la profondeur : « Forcer le WAV = 24 bits » sur une
+        // source 16 bits transcode aussi, et l'étape doit le dire (#4297).
+        || dlna_force_wav
         || dlna_cap_16bit
         || wire_transcode;
     if transcode_active {
@@ -678,7 +679,7 @@ fn assembler_les_etapes(
         // WAV/LPCM output likewise preserves the samples only when the source
         // already fits the 16-bit LPCM cap — unless the zone opted into genuine
         // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
-        let wav_output = wire_wav || dlna_lpcm || dlna_wav24;
+        let wav_output = wire_wav || dlna_force_wav;
         let transcode_lossless = (is_oaat && is_lossless && !is_dsd)
             || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16));
         // Reflect the OUTPUT resolution the renderer actually receives: 24-bit
@@ -1067,8 +1068,8 @@ fn decrire_le_transport<'a>(
     } = *source;
     let Forcages {
         wire_wav,
-        dlna_lpcm,
         dlna_wav24,
+        dlna_force_wav,
         dlna_cap_16bit,
         needs_transcode_for_output,
         oaat_transcodes,
@@ -1076,7 +1077,7 @@ fn decrire_le_transport<'a>(
     } = *forcages;
     match output_type {
         "dlna" | "openhome" => {
-            if wire_wav || dlna_lpcm || dlna_wav24 {
+            if wire_wav || dlna_force_wav {
                 // Renderer served WAV/LPCM, not FLAC — the signal path must say
                 // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
                 // "→ FLAC" label, LHC). Three causes, same wire: the zone forces
@@ -1221,9 +1222,13 @@ fn decrire_le_transport<'a>(
 struct Forcages {
     dsp_applique: bool,
     dsp_contourne_par_le_dsd: bool,
-    dlna_lpcm: bool,
     dlna_cap_16bit: bool,
+    /// L'opt-in 24 bits SERVI : la zone l'a demandé ET la source le porte.
+    /// Décrit la profondeur du WAV, jamais le fait de forcer le WAV (#4297).
     dlna_wav24: bool,
+    /// Le forçage WAV lui-même (« Forcer le WAV », 16 ou 24 bits), exception
+    /// FLAC natif comprise — le miroir de `dlna_force_wav` de l'orchestrateur.
+    dlna_force_wav: bool,
     needs_transcode_for_output: bool,
     is_oaat: bool,
     oaat_transcodes: bool,
@@ -1338,12 +1343,24 @@ fn decider_les_forcages(
         zone.max_sample_rate,
         device_quirks.max_sample_rate,
     );
-    // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
-    // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
-    // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
-    let dlna_wav24 = is_network_output
-        && bit_depth > 16
+    // Zone opt-in « Forcer le WAV = 24 bits ». Miroir de `orchestrator.rs` :
+    // le RÉGLAGE force le WAV (`wav24_opt_in`, quelle que soit la profondeur
+    // de la source), et la profondeur de la source décide seulement si le WAV
+    // servi garde ses 24 bits (`dlna_wav24`) ou retombe sur le LPCM 16 bits.
+    //
+    // Les deux étaient confondus ici comme dans la décision : sur l'ALAC
+    // 44,1/16 d'Yves, le panneau annonçait `ALAC → FLAC` parce que ce miroir
+    // exigeait `bit_depth > 16` pour armer le forçage (#4297).
+    //
+    // `!dsd_passthrough`, comme `dlna_lpcm` juste au-dessus : l'orchestrateur ne
+    // peut pas forcer le WAV sur un flux DSD servi brut (`dlna_needs_wav` exige
+    // `will_be_flac`, faux dès que `needs_transcode_for_output` tombe). Le
+    // plafond `bit_depth > 16` écartait le DSD par accident ; en le retirant du
+    // forçage, il faut nommer la précédence.
+    let wav24_opt_in = is_network_output
+        && !dsd_passthrough
         && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
+    let dlna_wav24 = wav24_opt_in && bit_depth > 16;
     // Même règle que l'orchestrateur, par la MÊME fonction : sur une source
     // FLAC dont la zone demande le FLAC natif, le forçage WAV ne s'applique pas
     // — il vise le décodeur ALAC du renderer. Sans ce miroir, le chemin du
@@ -1352,8 +1369,11 @@ fn decider_les_forcages(
     let source_is_flac = source_format == Some(AudioFormat::Flac);
     let native_flac_opt_in =
         is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_native_flac(zone_id);
-    let dlna_lpcm = tune_core::orchestrator::wav_override_applies(
-        dlna_lpcm,
+    // Le forçage WAV du miroir, par la MÊME fonction et sur les MÊMES entrées
+    // que `dlna_force_wav` de l'orchestrateur : les deux pavés du tri-état en
+    // OU, l'exception FLAC natif par-dessus.
+    let dlna_force_wav = tune_core::orchestrator::wav_override_applies(
+        dlna_lpcm || wav24_opt_in,
         source_is_flac,
         native_flac_opt_in,
     );
@@ -1374,15 +1394,14 @@ fn decider_les_forcages(
         source_format,
         u32::try_from(sample_rate).unwrap_or(0),
         max_sample_rate,
-        dlna_lpcm || dlna_wav24,
+        dlna_force_wav,
         dlna_cap_16bit,
         || ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id),
     );
     // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
     let aac_passthrough = source_format == Some(AudioFormat::Aac)
         && is_network_output
-        && !dlna_lpcm
-        && !dlna_wav24
+        && !dlna_force_wav
         && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
     // #3183 — la QUATRIEME copie a la main, et celle qui avait deja derive :
     // ce miroir n'appelait que `needs_transcode_for_dlna()`, la decision
@@ -1413,9 +1432,9 @@ fn decider_les_forcages(
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
-        dlna_lpcm,
         dlna_cap_16bit,
         dlna_wav24,
+        dlna_force_wav,
         needs_transcode_for_output,
         is_oaat,
         oaat_transcodes,
