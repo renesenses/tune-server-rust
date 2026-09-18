@@ -1647,12 +1647,29 @@ impl AlbumRepo {
     /// Écriture ciblée, et non un `update` complet : la ligne a pu recevoir
     /// entre-temps sa pochette et ses dates, qu'un `UPDATE` de toutes les
     /// colonnes depuis une copie en cache effacerait.
+    /// 🔴 #4427 — une décision manuelle arrête aussi cette reprise, et pas
+    /// seulement le drapeau.
+    ///
+    /// `mark_compilation` est gardé par `compilation_manuelle IS NULL` dans son
+    /// SQL, mais l'`UPDATE` d'artiste et de titre ci-dessous ne l'était pas.
+    /// Or le déclencheur, côté scan, est précisément `!bon_artiste ||
+    /// !bon_titre` (`scan_import.rs`) : c'est l'état d'un album que
+    /// l'utilisateur vient de réunir à la main, puisqu'il porte le titre et
+    /// l'artiste QU'IL a choisis et non ceux que le scan déduit du dossier. Le
+    /// drapeau tenait, le nom non — et le scan suivant défaisait la moitié du
+    /// geste, en silence.
+    ///
+    /// Même règle que `reparer_compilations` (C3) : ce qui est tenu à la main
+    /// n'est pas repris.
     pub fn reclasser_en_compilation(
         &self,
         album_id: i64,
         artist_id: i64,
         titre: &str,
     ) -> Result<(), TuneError> {
+        if self.compilation_manuelle(album_id)?.is_some() {
+            return Ok(());
+        }
         let sql = self.dialect_sql(sql::set_artist_and_title, sql::set_artist_and_title);
         let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
         self.db.execute(&sql, &params)?;
@@ -4678,6 +4695,64 @@ mod tests {
         repo.mark_compilation(id).unwrap();
 
         assert!(repo.get(id).unwrap().unwrap().is_compilation);
+    }
+
+    /// 🔴 #4427 — la reprise du scan ne touche pas un album tenu à la main,
+    /// et pas seulement son drapeau.
+    ///
+    /// `mark_compilation` était gardé par `compilation_manuelle IS NULL` dans
+    /// son SQL ; l'`UPDATE` d'artiste et de titre de
+    /// `reclasser_en_compilation`, lui, ne l'était pas. Le déclencheur côté
+    /// scan est pourtant `!bon_artiste || !bon_titre` — c'est-à-dire l'état
+    /// exact d'un album que l'utilisateur vient de réunir à la main. Le drapeau
+    /// tenait, le NOM était repris, en silence.
+    ///
+    /// L'épreuve mesure les trois champs, parce que c'est la divergence des
+    /// trois qui faisait le défaut : un test sur le seul drapeau serait passé
+    /// au vert avant le correctif.
+    #[test]
+    fn le_scan_ne_reprend_pas_le_nom_d_un_album_tenu_a_la_main() {
+        let db = test_db();
+        let artistes = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db);
+        // De vrais artistes : la colonne porte une clé étrangère.
+        let du_dossier = artistes
+            .create(&Artist::new("Various Artists".into()))
+            .unwrap();
+        let choisi = artistes.create(&Artist::new("Coco María".into())).unwrap();
+
+        // Témoin : sans décision manuelle, la reprise fait son travail.
+        let libre = repo.create(&Album::new("Disque un".into())).unwrap();
+        repo.reclasser_en_compilation(libre, du_dossier, "Titre du dossier")
+            .unwrap();
+        let t = repo.get(libre).unwrap().unwrap();
+        assert_eq!(
+            t.title, "Titre du dossier",
+            "sans décision, le scan reprend"
+        );
+        assert_eq!(t.artist_id, Some(du_dossier));
+        assert!(t.is_compilation);
+
+        // L'album que l'utilisateur vient de réunir : titre et artiste choisis.
+        let mut a = Album::new("Coco María Presents".into());
+        a.artist_id = Some(choisi);
+        let tenu = repo.create(&a).unwrap();
+        repo.poser_compilation_manuelle(tenu, true).unwrap();
+
+        repo.reclasser_en_compilation(tenu, du_dossier, "Titre imposé par le scan")
+            .unwrap();
+
+        let apres = repo.get(tenu).unwrap().unwrap();
+        assert_eq!(
+            apres.title, "Coco María Presents",
+            "le titre choisi à la main ne doit pas être repris"
+        );
+        assert_eq!(
+            apres.artist_id,
+            Some(choisi),
+            "l'artiste choisi à la main ne doit pas être repris"
+        );
+        assert!(apres.is_compilation, "et le drapeau reste posé");
     }
 
     /// `create` doit transporter le drapeau : sans ça, un album créé
