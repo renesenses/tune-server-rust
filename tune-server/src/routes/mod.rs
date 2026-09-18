@@ -12,6 +12,7 @@ pub mod cloud_error;
 pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
+pub(crate) mod corps_json_optionnel;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;

@@ -23,6 +23,7 @@ use tune_core::streaming::quality::StreamingQualityPreference;
 
 use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
+use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
 use crate::state::AppState;
 
 /// La clé i18n du refus « plafond de zones du gratuit », dans
@@ -3525,11 +3526,13 @@ async fn queue_clear(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     Query(q): Query<QueueClearQuery>,
-    body: Option<Json<QueueClearQuery>>,
+    // 🔴 #4447 — `Option<Json<…>>` rejetait en 400 le POST sans corps mais
+    // annoncé `application/json` que fait le client web (`clearQueue`).
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<QueueClearQuery>,
 ) -> impl IntoResponse {
     let keep_current = q
         .keep_current
-        .or_else(|| body.and_then(|Json(b)| b.keep_current))
+        .or_else(|| body.and_then(|b| b.keep_current))
         .unwrap_or(false);
     if keep_current {
         return queue_clear_suite(&state, zone_id).await.into_response();
@@ -6710,7 +6713,7 @@ mod vider_la_file_arrete_le_peripherique_3669 {
             State(state.clone()),
             Path(zone_id),
             axum::extract::Query(Default::default()),
-            None,
+            crate::routes::corps_json_optionnel::CorpsJsonOptionnel(None),
         )
         .await;
 
