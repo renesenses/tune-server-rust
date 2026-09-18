@@ -3726,4 +3726,77 @@ fn le_puits_alsa_est_ecarte_sur_son_pcm_pas_sur_sa_description() {
     ));
     assert!(!is_null_sink("Alsa:hw:CARD=DACZ8,DEV=0", "Eversolo DAC-Z8"));
     assert!(!is_null_sink("Alsa:default", "Default Audio Device"));
+
+// -----------------------------------------------------------------------
+// #4384 — le gain que le crête-mètre doit connaître, et le rabot muet
+// -----------------------------------------------------------------------
+
+/// `gain_de_rendu()` doit rendre l'`AtomicU32` que les rappels de rendu
+/// multiplient VRAIMENT — pas une copie datée du moment de l'appel.
+///
+/// C'est toute la solidité du branchement de #4384 : la sortie partage son
+/// atomique une fois, à la lecture, et volume, sourdine, ReplayGain et
+/// préampli suivent ensuite sans qu'aucun appelant n'ait à les repousser.
+#[tokio::test]
+async fn le_gain_de_rendu_partage_l_atomique_des_rappels() {
+    use crate::outputs::traits::OutputTarget;
+
+    let sortie = LocalOutput::new("DAC test".to_string());
+    let gain = sortie.gain_de_rendu();
+    assert_eq!(gain.load(Ordering::SeqCst), 1000, "volume plein au départ");
+
+    // Le curseur bouge : l'atomique DÉJÀ distribué doit suivre.
+    sortie.set_volume(0.5).await.expect("set_volume");
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        500,
+        "l'atomique partagé doit suivre le curseur, sans nouvel appel"
+    );
+
+    // Une atténuation ReplayGain se compose avec lui.
+    sortie.set_replaygain_factor(0.5);
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        250,
+        "volume × ReplayGain, comme les rappels le calculent"
+    );
+
+    // La sourdine aussi : le crête-mètre d'une zone muette doit tomber au
+    // plancher, pas continuer à décrire le fichier.
+    sortie.set_mute(true).await.expect("set_mute");
+    assert_eq!(gain.load(Ordering::SeqCst), 0, "sourdine ⇒ gain nul");
+}
+
+/// Le rabot à l'unité de `effective_volume_units`, celui que GgB a rencontré
+/// sans le savoir : « preamp +6db la led rouge ne s'allume pas, pas de
+/// changement dans le comportement ».
+///
+/// À volume PLEIN, un facteur ReplayGain de 1,995 (+6 dB de préampli) ne
+/// produit rien du tout — le gain de rendu reste à l'unité. Le même facteur
+/// agit dès que le curseur descend. Cette garde fige l'asymétrie : elle ne la
+/// corrige pas (le rabot protège d'une distorsion que personne n'a demandée),
+/// elle documente ce que le crête-mètre affiche désormais fidèlement, et ce
+/// que la ligne `local_gain_rabote_a_l_unite` dit maintenant au journal.
+#[tokio::test]
+async fn un_preampli_positif_est_rabote_a_volume_plein_mais_pas_a_mi_course() {
+    use crate::outputs::traits::OutputTarget;
+
+    let sortie = LocalOutput::new("DAC test".to_string());
+    let gain = sortie.gain_de_rendu();
+
+    // Volume plein + préampli +6 dB : raboté, donc strictement inerte.
+    sortie.set_replaygain_factor(1.995);
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        1000,
+        "à volume plein, un préampli positif est raboté à l'unité"
+    );
+
+    // Curseur à 50 % : le MÊME préampli passe presque entier.
+    sortie.set_volume(0.5).await.expect("set_volume");
+    assert_eq!(
+        gain.load(Ordering::SeqCst),
+        998,
+        "à mi-course, le même +6 dB est appliqué (0,5 × 1,995)"
+    );
 }

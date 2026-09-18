@@ -616,6 +616,37 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
     ((user * rg).clamp(0.0, 1.0) * 1000.0).round() as u32
 }
 
+/// Dit à voix haute que le produit « volume × ReplayGain » a été RABOTÉ à
+/// l'unité (#4384).
+///
+/// Le clamp d'[`effective_volume_units`] est délibéré, mais il était muet : à
+/// volume plein, un préampli ReplayGain positif ne produit strictement rien,
+/// ni au son ni à la mesure, et rien nulle part ne le disait — « preamp +6db,
+/// pas de changement dans le comportement » (GgB, 0.9.152, fil 1797). Le même
+/// +6 dB agit pourtant dès que le curseur descend un peu, ce qui rend le
+/// réglage inexplicable depuis l'écran.
+///
+/// Une ligne par recalcul, et seulement quand le rabot mord : le recalcul
+/// n'arrive qu'au changement de volume, de piste ou de bascule DoP, jamais par
+/// bloc audio — ce n'est pas un `warn!` dans un rappel temps réel.
+fn dire_le_clamp_a_l_unite(device: &str, user_units: u32, rg_units: u32, dop: bool, applique: u32) {
+    if dop {
+        return;
+    }
+    let demande = (user_units as f64 / 1000.0) * (rg_units as f64 / 1000.0);
+    if demande <= 1.0 {
+        return;
+    }
+    warn!(
+        device,
+        volume_units = user_units,
+        replaygain_units = rg_units,
+        demande_db = 20.0 * demande.log10(),
+        applique_db = 20.0 * (applique as f64 / 1000.0).log10(),
+        "local_gain_rabote_a_l_unite"
+    );
+}
+
 /// Reporte une bascule DoP sur le facteur que lisent les callbacks de rendu.
 ///
 /// Appelée depuis les trois boucles d'alimentation, dont celle du bras ASIO,
@@ -664,12 +695,25 @@ impl LocalOutput {
     }
 
     fn recompute_effective_volume(&self) {
-        let v = effective_volume_units(
-            self.user_volume.load(Ordering::SeqCst),
-            self.rg_factor.load(Ordering::SeqCst),
-            self.dop_active.load(Ordering::Relaxed),
-        );
+        let user = self.user_volume.load(Ordering::SeqCst);
+        let rg = self.rg_factor.load(Ordering::SeqCst);
+        let dop = self.dop_active.load(Ordering::Relaxed);
+        let v = effective_volume_units(user, rg, dop);
+        dire_le_clamp_a_l_unite(&self.device_name, user, rg, dop, v);
         self.volume.store(v, Ordering::SeqCst);
+    }
+
+    /// L'`AtomicU32` que les rappels de rendu multiplient réellement — pas une
+    /// copie (#4384).
+    ///
+    /// Le partager, c'est donner au crête-mètre le gain EXACT qui sépare le
+    /// point de mesure du DAC : volume utilisateur, sourdine, facteur
+    /// ReplayGain, préampli et la règle DoP y sont déjà composés par
+    /// [`effective_volume_units`], et tout changement ultérieur y arrive sans
+    /// qu'aucun appelant ait à le repousser. Voir
+    /// `PlaybackManager::brancher_le_gain_de_sortie`.
+    pub fn gain_de_rendu(&self) -> Arc<AtomicU32> {
+        self.volume.clone()
     }
 
     /// Create a new `LocalOutput` with explicit exclusive-mode control.

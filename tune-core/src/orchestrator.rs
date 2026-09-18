@@ -282,11 +282,21 @@ fn spawn_paced_levels_forwarder(
                 play_seq,
             });
 
-            let lvl = crate::audio::levels::compute_levels(
+            // #4384 — mesurer ce qui SORT, pas ce qui entre. Le gain que la
+            // sortie applique en aval du point de prélèvement (volume ×
+            // ReplayGain, préampli compris, règle DoP incluse) est lu ICI, à
+            // chaque fenêtre : un curseur bougé en cours de piste déplace donc
+            // l'aiguille sans attendre la piste suivante. `1000` — soit ×1,0 —
+            // sur tous les chemins qui n'en déclarent pas, ce qui laisse leur
+            // mesure inchangée.
+            let gain_units = playback.gain_de_sortie_units(zone_id);
+            let gain = gain_units as f64 / 1000.0;
+            let lvl = crate::audio::levels::compute_levels_avec_gain(
                 &pcm,
                 raw.bit_depth,
                 raw.channels,
                 raw.sample_rate,
+                gain,
             );
             let (peak_hold_left_db, peak_hold_right_db) =
                 peak_hold.update(lvl.window, lvl.peak_left, lvl.peak_right);
@@ -305,9 +315,24 @@ fn spawn_paced_levels_forwarder(
                     // Crête TENUE (max glissant ~300 ms) — champ ADDITIF
                     // (#1694) : un client ancien l'ignore, un client neuf y
                     // lit le transitoire même s'il a raté la trame qui le
-                    // portait. Sample peak, avant DSP, comme `peak_*_db`.
+                    // portait. Sample peak, sur la même échelle que
+                    // `peak_*_db` : gain de sortie compris (#4384), traitements
+                    // non scalaires de `apply_local_dsp` exclus.
                     "peak_hold_left_db": peak_hold_left_db,
                     "peak_hold_right_db": peak_hold_right_db,
+                    // Gain DÉJÀ compris dans tous les champs ci-dessus, en dB
+                    // (#4384) : ce que la sortie multiplie entre le décodeur
+                    // et le DAC. `0.0` = mesure brute du décodeur. Champ
+                    // ADDITIF — un client ancien l'ignore, un client neuf peut
+                    // dire à l'écran pourquoi l'aiguille est plus basse que le
+                    // fichier, et voir qu'un préampli positif à plein volume
+                    // ne monte pas (clamp à l'unité, voir
+                    // `outputs::local::effective_volume_units`).
+                    "output_gain_db": if gain_units == 1000 {
+                        0.0_f32
+                    } else {
+                        crate::audio::levels::gain_units_en_db(gain_units)
+                    },
                     // Surcharge = échantillons consécutifs à pleine échelle,
                     // la seule que du PCM entier sache montrer (#4175).
                     "over_left": lvl.over_left(),
