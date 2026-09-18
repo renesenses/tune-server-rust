@@ -708,7 +708,7 @@ use crate::streaming::registry::ServiceRegistry;
 
 use super::{
     PlayRequest, PlaybackOrchestrator, RepriseDeSession, StreamingDsp, cible_encodable,
-    cible_wav_pour_lossless_reseau, cible_wav_pour_traitement, is_network_output_type,
+    cible_wav_pour_le_reseau, cible_wav_pour_traitement, is_network_output_type,
     is_pull_dsp_output_type, is_push_uri_output_type, message_session_perdue,
     passthrough_didl_duration_ms, pull_output_needs_dsp_transcode, relais_dsp_progressif,
     replay_needs_output_seek, reprise_de_session, reprise_toujours_la_notre,
@@ -1265,32 +1265,83 @@ async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
 /// #3311 — la cible WAV d'un `.ape` sur une zone RÉSEAU exige les TROIS
 /// conditions. En retirer une seule rend au FLAC, donc au fichier.
 #[test]
-fn la_cible_wav_pour_lossless_reseau_exige_les_trois_conditions() {
-    assert!(cible_wav_pour_lossless_reseau(
-        Some(AudioFormat::Ape),
-        true,
-        true
-    ));
+fn la_cible_wav_pour_le_reseau_exige_les_trois_conditions() {
+    assert!(cible_wav_pour_le_reseau(Some(AudioFormat::Ape), true, true));
     // Source non `.ape` : rien ne bouge, le FLAC reste la cible de tout le
     // reste du catalogue.
-    assert!(!cible_wav_pour_lossless_reseau(
+    assert!(!cible_wav_pour_le_reseau(
         Some(AudioFormat::Flac),
         true,
         true
     ));
     // Sortie locale / OAAT / navigateur : elles sont DÉJÀ en WAV par leurs
     // propres branches, et prennent déjà le décodeur incrémental.
-    assert!(!cible_wav_pour_lossless_reseau(
+    assert!(!cible_wav_pour_le_reseau(
         Some(AudioFormat::Ape),
         false,
         true
     ));
     // Sonde LPCM négative ou inconcluante : le format servi ne change pas.
-    assert!(!cible_wav_pour_lossless_reseau(
+    assert!(!cible_wav_pour_le_reseau(
         Some(AudioFormat::Ape),
         true,
         false
     ));
+}
+
+/// #4409 — Marco Polo, fil 1835 : « OGG → FLAC » sur sa capture du chemin du
+/// signal. Ré-encoder en FLAC un flux décodé d'une source AVEC PERTE n'achète
+/// rien — le FLAC ne rend pas ce qui a été jeté, et la cible FICHIER impose la
+/// piste entière avant le premier octet.
+///
+/// Sa seconde critique est traitée ici aussi : la règle est une TABLE, pas un
+/// cas par cas. Les quatre formats avec perte que les renderers n'ouvrent pas
+/// suivent la même logique, et les sans-perte gardent la leur.
+#[test]
+fn les_sources_avec_perte_partent_en_wav_sur_le_reseau() {
+    for f in [
+        AudioFormat::Ogg,
+        AudioFormat::Opus,
+        AudioFormat::Aac,
+        AudioFormat::Wma,
+    ] {
+        assert!(
+            cible_wav_pour_le_reseau(Some(f), true, true),
+            "{f:?} : une source avec perte ne doit pas être ré-encodée en FLAC"
+        );
+        // La garde reste entière : sans LPCM annoncé, le FLAC demeure.
+        assert!(
+            !cible_wav_pour_le_reseau(Some(f), true, false),
+            "{f:?} : sonde LPCM négative, le format servi ne doit pas changer"
+        );
+        // Sortie locale : elle a déjà sa propre branche.
+        assert!(!cible_wav_pour_le_reseau(Some(f), false, true), "{f:?}");
+    }
+}
+
+/// Le témoin, et il compte autant que le correctif : ce qui ne doit PAS
+/// basculer ne bascule pas.
+///
+/// - MP3 : les renderers l'ouvrent nativement, il n'est pas transcodé du tout ;
+/// - M4A : codec NON déterminé (#3605), il peut porter de l'ALAC — servir deux
+///   fois le débit d'un FLAC pour une source sans perte serait un mauvais
+///   échange ;
+/// - ALAC, FLAC, AIFF, Matroska : sans perte, le FLAC reste la bonne cible.
+#[test]
+fn les_formats_sans_perte_gardent_le_flac() {
+    for f in [
+        AudioFormat::Mp3,
+        AudioFormat::M4a,
+        AudioFormat::Alac,
+        AudioFormat::Flac,
+        AudioFormat::Aiff,
+        AudioFormat::Matroska,
+    ] {
+        assert!(
+            !cible_wav_pour_le_reseau(Some(f), true, true),
+            "{f:?} ne doit pas passer en WAV sur le réseau"
+        );
+    }
 }
 
 /// #3311, de bout en bout sur la DÉCISION — le cœur du ticket.
