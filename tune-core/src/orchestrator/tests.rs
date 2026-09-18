@@ -3370,12 +3370,17 @@ fn armer_un_egaliseur_audible(orch: &PlaybackOrchestrator, zone_id: i64) {
         }],
         ..Default::default()
     };
-    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
         .set(
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&profil).unwrap(),
         )
         .unwrap();
+    // L'égaliseur est un greffon facultatif (v0.9.156) : un profil ne suffit
+    // plus, il faut l'avoir installé — ce que fait ici la clé que pose la route
+    // `POST /plugins/equalizer/install`.
+    settings.set("plugin_equalizer_installed", "true").unwrap();
 }
 
 #[cfg(feature = "local-audio")]

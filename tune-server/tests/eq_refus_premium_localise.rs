@@ -14,6 +14,7 @@ const DSP: &str = "/api/v1/zones/1/dsp";
 /// Un serveur en mémoire **sans licence** — le palier Free, celui du ticket.
 async fn app_gratuit() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    installer_l_egaliseur(&state);
     tune_server::routes::router(state)
 }
 
@@ -21,7 +22,17 @@ async fn app_gratuit() -> axum::Router {
 async fn app_premium() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
     state.license.set_account_premium(true, None).await;
+    installer_l_egaliseur(&state);
     tune_server::routes::router(state)
+}
+
+/// L'égaliseur est un greffon facultatif (v0.9.156) : Free ou Premium, il faut
+/// l'avoir installé depuis le catalogue — la clé que pose
+/// `POST /plugins/equalizer/install`.
+fn installer_l_egaliseur(state: &tune_server::state::AppState) {
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
 }
 
 async fn lire(app: &axum::Router, chemin: &str) -> (StatusCode, Value) {
