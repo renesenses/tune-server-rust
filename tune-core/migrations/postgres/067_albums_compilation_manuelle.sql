@@ -23,6 +23,34 @@ BEGIN;
 
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS compilation_manuelle SMALLINT;
 
+-- Le bloc qui suit vise les bases nées de `tune db migrate-to-postgres` : ce
+-- chemin crée TOUTES les colonnes en TEXT (`PG_FULL_SCHEMA`, pg_migrate.rs, à
+-- dessein — la copie lie chaque valeur SQLite en texte), et compte sur les
+-- migrations pour restaurer les vrais types. Sans lui, la colonne resterait
+-- TEXT sur ces bases, et `UPDATE albums SET compilation_manuelle = 1` y serait
+-- REFUSÉ par PostgreSQL (« column is of type text but expression is of type
+-- integer ») : la pose à la main échouerait précisément là. Même forme que 028,
+-- à la nuance près que NULL est ici porteur de sens et doit le rester.
+
+DO $migration$
+DECLARE
+  cur_type TEXT;
+BEGIN
+  SELECT data_type INTO cur_type
+    FROM information_schema.columns
+   WHERE table_name = 'albums' AND column_name = 'compilation_manuelle';
+
+  IF cur_type IN ('text', 'character varying') THEN
+    ALTER TABLE albums
+      ALTER COLUMN compilation_manuelle TYPE SMALLINT
+      USING (CASE WHEN compilation_manuelle IS NULL OR compilation_manuelle = '' THEN NULL
+                  WHEN compilation_manuelle ~ '^-?[0-9]+$'
+                  THEN LEAST(GREATEST(compilation_manuelle::integer, 0), 1)
+                  ELSE NULL END)::smallint;
+  END IF;
+END
+$migration$;
+
 INSERT INTO schema_version (version, name) VALUES (67, 'albums_compilation_manuelle')
     ON CONFLICT (version) DO NOTHING;
 

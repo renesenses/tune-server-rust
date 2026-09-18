@@ -3715,6 +3715,16 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "upnp_catalog_revision",
         include_str!("../../migrations/postgres/066_upnp_catalog_revision.sql"),
     ),
+    // #4427 — la DÉCISION manuelle sur le drapeau « compilation », distincte
+    // du verdict du scan. Déclarée ICI et pas seulement posée dans le dossier :
+    // `pg_latest_version()` lit la dernière entrée de cette table, et le
+    // rapport de diagnostic annonce cette version (#3182). Un fichier ajouté
+    // sans sa ligne fait diverger les deux, et c'est le test PG qui l'a dit.
+    (
+        67,
+        "albums_compilation_manuelle",
+        include_str!("../../migrations/postgres/067_albums_compilation_manuelle.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
