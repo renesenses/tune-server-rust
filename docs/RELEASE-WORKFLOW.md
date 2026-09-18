@@ -3,11 +3,34 @@
 `main` est la source de vérité. La branche permanente `release/v0.9` n'est
 plus utilisée pour préparer ou taguer les releases.
 
+## Base des PR par dépôt
+
+L'intégration quotidienne et la publication d'une version sont deux étapes
+distinctes. Les bases des PR ne sont pas identiques dans les deux dépôts publics :
+
+| Dépôt | PR de correctif | Entrée dans `main` |
+|---|---|---|
+| `tune-server-rust` | Lot `batch/*` assigné, sinon RC assignée | Seulement `rc/* -> main`, contrôlé par `release-gate` |
+| `tune-web-client` | `main` par défaut ; lot `batch/*` ou RC si explicitement assigné | PR de correctif, de lot ou de RC avec les checks web verts, fusionnée par un humain |
+
+Une branche de travail part du SHA actualisé de sa base d'intégration.
+Les lots déjà engagés gardent leur cible : cet alignement ne les redirige pas
+automatiquement vers `main`. Une PR intégrée n'est pas encore un correctif
+livré : le train doit épingler son SHA dans un artefact publié.
+
+Les circuits d'OS et d'Universal restent décrits par leurs propres consignes ;
+cette distinction serveur/web ne modifie pas leurs règles.
+
 ## 1. Correctifs
 
+### Serveur
+
 ```text
-fix/* ou feat/* -> PR -> batch/<thème> -> PR -> rc/vX.Y.Z
+fix/* ou feat/* -> PR -> batch/<thème> -> PR -> [integration/vX.Y.Z] -> PR -> rc/vX.Y.Z
 ```
+
+`integration/*` est une étape facultative pour réunir plusieurs lots ; elle
+ne remplace pas la RC et ne peut pas être promue directement vers `main`.
 
 Les correctifs sont groupés par thème dans une branche de lot `batch/*`. Chaque
 correctif y entre par sa propre PR ; le lot entre ensuite dans la RC par une PR
@@ -19,14 +42,30 @@ vers `batch/*` comme vers `rc/*` exécute le profil rapide — formatage, analys
 statique, tests unitaires et régressions ciblées. Toute autre base, tout push et
 toute entrée inconnue basculent en batterie complète : le routage est fail-closed.
 Le label `ci:full` force la batterie complète pour un changement transversal ou
-risqué. Aucun bump de version n'est fait dans une PR unitaire.
+risqué. Une PR vers `integration/*` suit le profil complet du classifieur
+actuel. Aucun bump de version n'est fait dans une PR unitaire.
 
 Avant d'ouvrir un lot, vérifier qu'aucun lot déjà ouvert ne touche les mêmes
 fichiers : deux lots qui modifient le même fichier n'entrent en conflit qu'au
 moment de la RC, c'est-à-dire au pire moment. S'y rattacher plutôt qu'en créer un
 second.
 
+### Client web
+
+Une PR web vise `main` par défaut, sans créer une RC uniquement pour y déposer
+un correctif. Si un lot ou une RC lui a été explicitement assigné, elle garde
+cette base. La CI web exécute `npm ci`, `npm test` et `npm run build` pour
+toutes les PR : le profil rapide du classifieur **serveur** ne s'y applique pas.
+`ci:full` reste demandé pour les changements CI, release ou transversaux ;
+ce label n'allège pas les contrôles déjà exécutés par le web.
+
+L'intégration dans `main` ne crée aucun tag et ne publie aucun canal. Le
+responsable de release fige ensuite la version et le SHA web du train,
+conformément au [runbook](RELEASE-OPERATIONS.md#2-préparer-un-train).
+
 ## 2. Candidat de release
+
+Cette porte est celle du **dépôt serveur**.
 
 La RC contient tous les correctifs retenus, les versions et les références
 immuables des composants. Quand elle est prête :
@@ -182,11 +221,20 @@ instruits dans #3089.
 
 ## Coordination des agents
 
-OpenAI/Codex, Claude et les humains suivent le même circuit. Avant d'écrire,
-un agent crée le label atomique `verrou:issue-N`, ajoute `en-cours` à l'issue
-et indique dans la PR son fournisseur, son run, l'issue, la branche et le SHA
-de base. Si la création échoue, l'agent vérifie le label exact : présent,
-l'issue est prise ; absent, l'infrastructure est en erreur et l'agent s'arrête.
+OpenAI/Codex, Claude et les humains suivent le circuit **du dépôt concerné**.
+Avant d'écrire, consulter les refs, issues, commentaires, PR et fichiers
+modifiés, puis les labels globaux `verrou:issue-*`. Créer atomiquement le
+verrou dans ce dépôt, sans `--force`, puis l'attacher avec `en-cours`.
+Un verrou existe même s'il n'est pas attaché à l'issue. Une création échouée
+impose de vérifier le label exact : présent ou incertain, ne pas commencer
+cette issue ; poursuivre une tâche indépendante. La réservation n’est acquise
+qu’après une création réussie.
+
+Le commentaire de prise en charge indique personne, fournisseur, run unique,
+périmètre, fichiers, branche, SHA de base et worktree Shrek. Pour JP :
+`JP Robbe / OpenAI Codex / jp-robbe-<date>-<run-unique>`.
+Conserver les verrous pendant la revue ; ni l'ancienneté ni le même fournisseur
+ne permettent de reprendre une autre session sans transfert explicite.
 
 Une consigne locale peut renforcer ces règles, jamais autoriser un push direct
 sur `main`/`rc/*`, un merge, un tag ou une publication.

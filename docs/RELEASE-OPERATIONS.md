@@ -8,7 +8,25 @@ les responsabilités sont fixées dans
 l'ancien circuit. Ne jamais exécuter `git tag` ou `git push --tags` pour une
 release normale.
 
+## Intégration quotidienne : choisir la bonne base
+
+La [table de routage](RELEASE-WORKFLOW.md#base-des-pr-par-dépôt) distingue les
+deux dépôts publics :
+
+- **Serveur** : correctif vers `batch/*`, sinon RC assignée ; les lots peuvent
+  être réunis dans `integration/*`, puis la RC est la seule entrée dans `main`.
+- **Web** : correctif vers `main` par défaut, ou vers le lot/la RC explicitement
+  assigné. Sa CI teste et construit toutes les PR.
+
+Les lots existants gardent leur cible. Le gel d'une RC web dans le train
+ci-dessous ne rend pas les RC obligatoires pour ses correctifs quotidiens.
+Une fusion dans `main` n'est ni un tag, ni une publication. Les agents
+préparent les PR ; les fusions et les opérations de release restent humaines.
+
 ## Vue d'ensemble
+
+Le chemin jusqu'à `main` dessiné ci-dessous est celui du **serveur** ; les
+étapes de tags, staging et promotion concernent ensuite les quatre composants.
 
 ```mermaid
 flowchart LR
@@ -28,9 +46,11 @@ flowchart LR
 
 ### Vue Git — plan de métro
 
-Ce graphe superpose le trajet commun des quatre dépôts sur trois trains. Les
-libellés courts gardent les lignes lisibles : `clients` désigne web, Universal
-et OS. La branche `batch/*` est facultative, comme le montre le train `.129`.
+Ce graphe illustre la préparation des RC et la publication sur trois trains,
+pas la base de chaque PR de correctif web. `clients` désigne les SHA web,
+Universal et OS figés pour le train. La branche `batch/*` est facultative,
+comme le montre le train `.129` ; l'étape serveur `integration/*`, également
+facultative, est omise pour garder le dessin lisible.
 
 ```mermaid
 %%{init: { "gitGraph": { "mainBranchName": "main", "showCommitLabel": true, "rotateCommitLabel": false } } }%%
@@ -142,10 +162,15 @@ restent dans leurs environnements existants.
 ## 2. Préparer un train
 
 1. Créer `rc/vX.Y.Z` dans chacun des quatre dépôts depuis la base décidée.
-2. Faire viser les PR de travail vers leur branche de lot ou la RC assignée.
-   Les PR unitaires exécutent leurs tests ciblés.
-3. Intégrer chaque lot dans la RC par commit de fusion. La RC porte la batterie
-   d'intégration, pas chaque petit correctif pris isolément.
+2. Appliquer les bases de la table de routage : les correctifs serveur visent
+   leur lot ou leur RC assignée ; les correctifs web visent `main` par défaut
+   et gardent un lot ou une RC explicitement assigné. Les PR de préparation
+   de version visent la RC du train, sans bump dans les correctifs unitaires.
+3. Intégrer les lots serveur dans la RC par PR, éventuellement via
+   `integration/vX.Y.Z`. Le classifieur serveur lance la batterie complète
+   vers `integration/*` ; les PR vers `batch/*` ou `rc/*` restent rapides
+   sauf `ci:full`. Les lots web sont intégrés avant de figer leur SHA pour
+   le train ; la CI web teste et construit chaque PR, quelle que soit sa base.
 4. Réconcilier chaque RC avec son `main` par PR. Une RC ne doit retirer aucun
    correctif déjà présent dans `main`.
 5. Bumper les versions web et serveur dans leurs fichiers canoniques.
