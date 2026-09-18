@@ -292,7 +292,7 @@ pub fn est_dsd_brut(mime_type: &str) -> bool {
 /// - le DSD sous la bascule `dsd_lpcm_stream` : en DSD256/512 le décodage
 ///   dépasse le budget du fichier temporaire et le renderer joue du silence ;
 /// - le Monkey's Audio (`.ape`) vers un renderer qui a ANNONCÉ le LPCM
-///   (#3311) — voir [`cible_wav_pour_lossless_reseau`].
+///   (#3311, #4409) — voir [`cible_wav_pour_le_reseau`].
 ///
 /// `dsp_active` ne compte que si la cible n'est PAS du WAV. Depuis LAT-F1
 /// (phase 0) le bras progressif applique lui-même égaliseur, convolveur et
@@ -360,16 +360,50 @@ pub(super) fn use_file_transcode_for(
 /// inconcluante garde le FLAC. Même garde que [`cible_wav_pour_traitement`].
 ///
 /// #4120: WavPack dispose aussi de son décodeur par blocs et de cette exemption.
+///
+/// ## #4409 — et les sources AVEC PERTE, pour la même cible
+///
+/// Marco Polo, fil 1835 (18/09/2026), capture du chemin du signal à l'appui :
+/// `OGG 44kHz/16bit → FLAC 44kHz/16bit`. Sa critique porte, et elle porte
+/// deux fois :
+///
+/// > « Il faudrait faire comme avec tous les autres formats non supportés
+/// > nativement et les diffuser directement en WAV (PCM), non ? […] N'auriez-vous
+/// > pas dû réviser TOUS les formats non supportés par les renderers et tous les
+/// > ajuster pour qu'ils suivent la même logique ? »
+///
+/// **Ré-encoder un flux déjà décodé d'une source avec perte en FLAC n'achète
+/// rien.** Le FLAC ne rend pas ce que l'encodage avec perte a jeté : il
+/// compresse sans perte un signal déjà dégradé, au prix d'un encodage à chaque
+/// lecture et du bras FICHIER (piste entière avant le premier octet). Le WAV,
+/// lui, part au fil de l'eau. La qualité servie est identique au bit près —
+/// c'est le même PCM décodé.
+///
+/// Sont visés les formats **avec perte** que le renderer ne sait pas ouvrir :
+/// OGG Vorbis, Opus, AAC, WMA. Pas le MP3, que les renderers lisent
+/// nativement (il n'est pas dans `needs_transcode_for_dlna`). Pas `M4a`, dont
+/// le codec n'est PAS déterminé (#3605) : il peut porter de l'ALAC, et servir
+/// deux fois le débit d'un FLAC pour une source sans perte serait un mauvais
+/// échange. Pas l'ALAC ni le Matroska, sans perte eux aussi.
+///
+/// La garde reste entière : le renderer doit avoir ANNONCÉ le LPCM, sinon le
+/// FLAC demeure la cible.
+///
 /// Fonction pure, comme ses deux voisines : la matrice se teste sans
 /// orchestrateur.
-pub(super) fn cible_wav_pour_lossless_reseau(
+pub(super) fn cible_wav_pour_le_reseau(
     src_format: Option<AudioFormat>,
     is_network: bool,
     renderer_accepte_lpcm: bool,
 ) -> bool {
-    matches!(src_format, Some(AudioFormat::Ape | AudioFormat::WavPack))
-        && is_network
-        && renderer_accepte_lpcm
+    let vise = matches!(
+        src_format,
+        // Sans perte, décodeur par blocs : #3311 (APE), #4120 (WavPack).
+        Some(AudioFormat::Ape | AudioFormat::WavPack)
+            // Avec perte : #4409. Le FLAC ne rendrait rien de ce qui est perdu.
+            | Some(AudioFormat::Ogg | AudioFormat::Opus | AudioFormat::Aac | AudioFormat::Wma)
+    );
+    vise && is_network && renderer_accepte_lpcm
 }
 
 /// LAT-F1 (phase 1) — une zone réseau à traitement actif dont la cible serait
