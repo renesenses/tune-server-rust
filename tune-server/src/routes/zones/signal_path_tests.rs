@@ -1021,11 +1021,9 @@ fn passthrough_without_metadata_reads_the_wire_not_a_default() {
     );
 }
 
-// #2427: radio resolution is unknown when NowPlaying is created. Its
-// 44.1 kHz value is only a bootstrap for the WAV session; after probing,
-// the wire reports the PCM rate actually served and must win.
+// #2427/#4346: the probe, not the bootstrap WAV, describes the radio source.
 #[test]
-fn decoded_radio_source_uses_the_detected_wire_rate() {
+fn decoded_radio_source_uses_the_detected_source_rate() {
     let (backend, zone) = dlna_zone();
     let np = NowPlaying {
         title: "France Musique".into(),
@@ -1049,11 +1047,18 @@ fn decoded_radio_source_uses_the_detected_wire_rate() {
         &backend,
         Some("Renderer"),
         "none",
-        Some(&wire("wav", 48_000, 16)),
+        Some(&StreamInfo {
+            radio_source: Some(tune_core::http::streamer::RadioSourceInfo {
+                format: Some("mp3"),
+                sample_rate: Some(48_000),
+                bit_depth: None,
+            }),
+            ..wire("wav", 48_000, 16)
+        }),
     )
     .unwrap();
 
-    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("WAV 48kHz/16bit"));
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("MP3 48kHz"));
 }
 
 // Sans session ET sans métadonnées, il n'y a rien à lire : le repli reste
@@ -2714,4 +2719,158 @@ fn replaygain_peak_kind_keeps_unity_informational_and_true_peak_exact() {
             .unwrap()
             .contains("crête vraie disponible")
     );
+}
+
+// #4346: use the public JSON builder, including its global verdict.
+#[test]
+fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    for (codec, rate, bits, expected, lossless) in [
+        (Some("mp3"), Some(44_100), None, "MP3 44kHz", false),
+        (Some("aac"), Some(22_050), None, "AAC 22kHz", false),
+        (
+            Some("flac"),
+            Some(48_000),
+            Some(16),
+            "FLAC 48kHz/16bit",
+            true,
+        ),
+        (None, None, None, "Unknown", false),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                format: codec,
+                sample_rate: rate,
+                bit_depth: bits,
+            }),
+            ..wire("wav", rate.unwrap_or(44_100).max(44_100), 16)
+        };
+        for output in ["local", "oaat", "dlna"] {
+            zone.output_type = Some(output.into());
+            let sp = build_signal_path(
+                &ps,
+                &zone,
+                &backend,
+                Some("Renderer"),
+                "none",
+                Some(&stream),
+            )
+            .unwrap();
+            assert_eq!(
+                step_desc(&sp, "Source").as_deref(),
+                Some(expected),
+                "radio source codec, not WAV"
+            );
+            assert_eq!(
+                sp["lossless"], lossless,
+                "WAV decoding must not make a lossy radio lossless"
+            );
+            if !lossless {
+                assert_eq!(
+                    sp["bit_perfect"], false,
+                    "lossy or unknown radio cannot claim bit-perfect"
+                );
+            }
+            assert!(step_desc(&sp, "Decoder").is_some());
+        }
+    }
+}
+
+#[test]
+fn radio_4346_without_probe_cannot_claim_lossless() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for stream in [None, Some(wire("wav", 44_100, 16))] {
+        let sp = build_signal_path(&ps, &zone, &backend, None, "none", stream.as_ref()).unwrap();
+        assert_eq!(
+            sp["lossless"], false,
+            "pending radio codec must not be inferred from WAV"
+        );
+        assert_eq!(sp["bit_perfect"], false);
+        assert_eq!(step_desc(&sp, "Source").as_deref(), Some("Unknown"));
+    }
+}
+
+#[test]
+fn radio_4346_verbatim_proxy_retains_its_known_codec() {
+    let (backend, zone) = dlna_zone();
+    for (codec, lossless) in [("mp3", false), ("flac", true)] {
+        let ps = ZoneState {
+            state: PlayState::Playing,
+            now_playing: Some(NowPlaying {
+                source: "radio".into(),
+                format: Some(codec.into()),
+                sample_rate: Some(48_000),
+                bit_depth: Some(16),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            None,
+            "none",
+            Some(&wire(codec, 48_000, 16)),
+        )
+        .unwrap();
+        assert_eq!(
+            sp["lossless"], lossless,
+            "verbatim proxy source must keep its codec"
+        );
+    }
+}
+
+#[test]
+fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for output in ["local", "oaat", "dlna"] {
+        zone.output_type = Some(output.into());
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                format: Some("flac"),
+                sample_rate: Some(96_000),
+                bit_depth: Some(24),
+            }),
+            ..wire("wav", 96_000, 16)
+        };
+        let sp = build_signal_path(&ps, &zone, &backend, None, "ALSA", Some(&stream)).unwrap();
+        assert_eq!(sp["lossless"], true, "FLAC remains a lossless source");
+        assert_eq!(
+            sp["bit_perfect"], false,
+            "{output}: 24-bit source truncated to 16-bit before output"
+        );
+    }
 }
