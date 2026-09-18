@@ -169,6 +169,25 @@ pub(super) async fn enrich_all_library(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    // La sélection locale doit réussir avant le 202 et avant toute annonce
+    // de tâche (#3810). Une panne SQL n'est pas une bibliothèque vide.
+    // Le gate reste en amont : sa politique de quota est inchangée, y compris
+    // si cette sélection échoue. Aucun appel MusicBrainz n'a lieu ici.
+    let backend_selection = state.backend.clone();
+    let selection = tokio::task::spawn_blocking(move || {
+        backend_selection.query_many(&sql_candidats_enrichissement(), &[])
+    })
+    .await;
+    let track_rows = match selection {
+        Ok(Ok(rows)) => rows,
+        erreur => {
+            warn!(error = ?erreur, "enrich_all_selection_failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "enrichment_candidates_unavailable"})),
+            );
+        }
+    };
     let scope_tache = scope.clone();
     let task_id = uuid::Uuid::new_v4().to_string();
 
@@ -215,15 +234,6 @@ pub(super) async fn enrich_all_library(
     );
     tokio::spawn(async move {
         let _task_guard = task_guard; // ends the task when this future completes
-        // Find tracks with missing metadata: no MB ID OR missing genre/year/label
-        let track_rows: Vec<Vec<tune_core::db::backend::SqlValue>> = backend2
-            .query_many(&sql_candidats_enrichissement(), &[])
-            .unwrap_or_else(|e| {
-                // Never swallow a query failure to total=0 again — surface it.
-                warn!(error = %e, "enrich_all query failed — reporting 0 tracks");
-                Vec::new()
-            });
-
         // La portée s'applique ICI, sur la sélection des candidats, avant que
         // `total` ne soit calculé : la barre d'avancement compte alors les
         // seules pistes du répertoire, et la boucle ne part sur MusicBrainz
@@ -1045,3 +1055,7 @@ mod tests_avancement_enrichissement {
         assert_eq!(charge_avancement_enrichissement(5, 100)["processed"], 5);
     }
 }
+
+#[cfg(test)]
+#[path = "enrich_selection_tests_3810.rs"]
+mod enrich_selection_tests_3810;
