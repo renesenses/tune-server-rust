@@ -399,6 +399,12 @@ impl PeakHold {
     }
 }
 
+/// Un gain en millièmes (1000 = ×1,0) dit en dB, sur la même échelle et avec
+/// le même plancher que `peak_*_db` (#4384).
+pub fn gain_units_en_db(units: u32) -> f32 {
+    to_db(units as f64 / 1000.0)
+}
+
 fn to_db(linear: f64) -> f32 {
     if linear <= 0.0 {
         -96.0
@@ -408,6 +414,49 @@ fn to_db(linear: f64) -> f32 {
 }
 
 pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u32) -> AudioLevels {
+    compute_levels_avec_gain(pcm, bit_depth, channels, sample_rate, 1.0)
+}
+
+/// Les mêmes niveaux, mesurés APRÈS un gain scalaire appliqué en aval du point
+/// de mesure (#4384).
+///
+/// # Pourquoi ce paramètre existe
+///
+/// Sur une sortie locale, les fenêtres qui alimentent le crête-mètre sont
+/// prélevées AU DÉCODEUR (`resolve_local::transcoder_en_session` attache le
+/// forwarder à `decode_to_pcm_streaming_tranche`), alors que le facteur
+/// « volume utilisateur × ReplayGain » — préampli compris — n'est appliqué
+/// qu'au tout dernier moment, dans les rappels de rendu de
+/// [`crate::outputs::local::LocalOutput`]. L'instrument montrait donc le
+/// niveau du FICHIER et non celui envoyé au DAC : à −6 dB de préampli le
+/// témoin de voisinage du plein restait allumé, à +6 dB rien ne bougeait
+/// (GgB, 0.9.152, fil 1797).
+///
+/// Le gain est un SCALAIRE, donc l'appliquer à chaque échantillon avant la
+/// mesure est exact — crêtes, RMS, suites à pleine échelle et niveaux de
+/// bandes compris — et coûte une multiplication par échantillon dans une
+/// boucle qui en fait déjà quatre.
+///
+/// `gain` est un facteur linéaire (1,0 = intouché). Une valeur non finie ou
+/// nulle est traitée comme 1,0 : une mesure fausse vaut mieux qu'une mesure
+/// absente, et un `NaN` empoisonnerait toute la fenêtre.
+///
+/// Le seuil de pleine échelle reste celui de la profondeur SOURCE : c'est
+/// l'échelle dans laquelle [`read_sample`] normalise, et le gain s'y applique
+/// après. Un signal atténué ne peut donc plus déclarer de surcharge, ce qui
+/// est précisément ce qu'on veut dire.
+pub fn compute_levels_avec_gain(
+    pcm: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    sample_rate: u32,
+    gain: f64,
+) -> AudioLevels {
+    let gain = if gain.is_finite() && gain > 0.0 {
+        gain
+    } else {
+        1.0
+    };
     if pcm.is_empty() || channels == 0 {
         return AudioLevels::default();
     }
@@ -434,9 +483,9 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
     let stereo = channels >= 2;
 
     for frame in pcm.chunks_exact(frame_size) {
-        let left = read_sample(frame, 0, bytes_per_sample, bit_depth);
+        let left = read_sample(frame, 0, bytes_per_sample, bit_depth) * gain;
         let right = if stereo {
-            read_sample(frame, bytes_per_sample, bytes_per_sample, bit_depth)
+            read_sample(frame, bytes_per_sample, bytes_per_sample, bit_depth) * gain
         } else {
             left
         };
@@ -466,7 +515,16 @@ pub fn compute_levels(pcm: &[u8], bit_depth: u16, channels: u16, sample_rate: u3
 
     // Une seule FFT pour les deux formes : les recalculer séparément
     // doublerait le coût d'analyse, déjà en cause dans #1110.
-    let spectrum = analyze_spectrum(pcm, bit_depth, channels, SPECTRUM_BANDS, sample_rate);
+    let mut spectrum = analyze_spectrum(pcm, bit_depth, channels, SPECTRUM_BANDS, sample_rate);
+    // Le gain est scalaire : il déplace chaque bande du même nombre de dB.
+    // `spectrum.shape` est normalisée trame par trame, donc invariante — on ne
+    // corrige que l'échelle ABSOLUE, et sans redescendre sous le plancher.
+    if gain != 1.0 {
+        let gain_db = 20.0 * (gain as f32).log10();
+        for bande in spectrum.db.iter_mut() {
+            *bande = (*bande + gain_db).max(SPECTRUM_FLOOR_DB);
+        }
+    }
 
     AudioLevels {
         rms_left: (sum_sq_l / frames as f64).sqrt(),
@@ -860,6 +918,95 @@ mod tests {
             pcm.extend_from_slice(&[b[0], b[1], b[2]]);
         }
         pcm
+    }
+
+    #[test]
+    fn le_gain_deplace_la_mesure_et_eteint_la_surcharge() {
+        // 256 trames stéréo 16 bits à la butée négative : pleine échelle
+        // exacte, donc `over_run` très au-delà des 3 échantillons d'OVER.
+        let mut pcm = Vec::with_capacity(256 * 4);
+        for _ in 0..256 {
+            for _ in 0..2 {
+                pcm.extend_from_slice(&i16::MIN.to_le_bytes());
+            }
+        }
+
+        // Référence — le comportement d'avant #4384, que `compute_levels`
+        // continue de rendre à l'identique.
+        let brut = compute_levels(&pcm, 16, 2, 44_100);
+        assert!(brut.peak_left_db() > -0.01, "{}", brut.peak_left_db());
+        assert!(brut.over_left() && brut.over_right());
+        assert_eq!(
+            brut.peak_left,
+            compute_levels_avec_gain(&pcm, 16, 2, 44_100, 1.0).peak_left
+        );
+
+        // −6,02 dB en aval (préampli −6 dB, ou curseur à 50 % : c'est le même
+        // facteur). La crête SUIT, la surcharge s'éteint — un signal atténué
+        // ne peut plus toucher la pleine échelle.
+        let attenue = compute_levels_avec_gain(&pcm, 16, 2, 44_100, 0.5);
+        assert!(
+            (attenue.peak_left_db() - (-6.02)).abs() < 0.05,
+            "crête attendue à −6,02 dBFS, lue {}",
+            attenue.peak_left_db()
+        );
+        assert!((attenue.rms_left_db() - (-6.02)).abs() < 0.05);
+        assert_eq!(attenue.over_run_left, 0, "atténué ⇒ plus aucune surcharge");
+        assert!(!attenue.over_left() && !attenue.over_right());
+        // Le spectre ABSOLU descend du même nombre de dB ; la FORME, elle, est
+        // normalisée trame par trame et ne bouge pas. Sur une SINUSOÏDE : la
+        // butée continue ci-dessus n'a aucune raie à montrer (tout au plancher).
+        let sinus = sine_pcm(1_000.0, 0.5, 44_100, 2048);
+        let s_brut = compute_levels(&sinus, 16, 2, 44_100);
+        let s_attenue = compute_levels_avec_gain(&sinus, 16, 2, 44_100, 0.5);
+        assert_eq!(
+            s_brut.spectrum, s_attenue.spectrum,
+            "la FORME du spectre est invariante par gain"
+        );
+        let plus_haut = |l: &AudioLevels| l.spectrum_db.iter().cloned().fold(f32::MIN, f32::max);
+        let (avant, apres) = (plus_haut(&s_brut), plus_haut(&s_attenue));
+        assert!(
+            avant > SPECTRUM_FLOOR_DB + 12.0,
+            "témoin inutilisable : bande la plus forte à {avant} dBFS"
+        );
+        assert!(
+            (avant - apres - 6.02).abs() < 0.05,
+            "bande la plus forte : {avant} puis {apres}"
+        );
+
+        // Un gain qui POUSSE rend la surcharge que le fichier seul ne montrait
+        // pas : c'est l'autre moitié de la plainte (« preamp +6db la led rouge
+        // ne s'allume pas »).
+        let a_mi_echelle: Vec<u8> = (0..256)
+            .flat_map(|_| {
+                let mut f = Vec::new();
+                for _ in 0..2 {
+                    f.extend_from_slice(&(-16_384i16).to_le_bytes());
+                }
+                f
+            })
+            .collect();
+        let sage = compute_levels(&a_mi_echelle, 16, 2, 44_100);
+        assert!(!sage.over_left(), "−6 dBFS n'est pas une surcharge");
+        let pousse = compute_levels_avec_gain(&a_mi_echelle, 16, 2, 44_100, 2.0);
+        assert!(
+            pousse.over_left() && pousse.over_right(),
+            "+6 dB sur un signal à −6 dBFS ⇒ pleine échelle tenue"
+        );
+
+        // Garde-fou : une valeur absurde ne doit pas empoisonner la fenêtre.
+        for absurde in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let l = compute_levels_avec_gain(&pcm, 16, 2, 44_100, absurde);
+            assert_eq!(l.peak_left, brut.peak_left, "gain {absurde} ⇒ repli à 1,0");
+        }
+    }
+
+    #[test]
+    fn gain_units_en_db_dit_les_millemes() {
+        assert!((gain_units_en_db(1000) - 0.0).abs() < 1e-6);
+        assert!((gain_units_en_db(500) - (-6.02)).abs() < 0.01);
+        assert!((gain_units_en_db(1995) - 6.0).abs() < 0.05);
+        assert_eq!(gain_units_en_db(0), -96.0, "sourdine ⇒ plancher");
     }
 
     #[test]
