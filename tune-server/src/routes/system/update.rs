@@ -794,6 +794,25 @@ fn homebrew_mismatch_result(installation: &HomebrewInstallation, current: &str) 
     }))
 }
 
+/// Le préfixe que porte TOUTE archive du serveur — `tune-server-v0.9.153-…`
+/// comme l'alias stable `tune-server-linux-x86_64.tar.gz`.
+///
+/// 🔴 Sans lui, `find_archive_asset` prenait le PREMIER fichier qui portait le
+/// bon système et la bonne architecture. Depuis le 16/09/2026 la release
+/// embarque aussi le moissonneur Roon, et GitHub rend ses fichiers par ordre
+/// alphabétique : `moissonneur-roon-v0.9.153-linux-x86_64.tar.gz` (2,6 Mo)
+/// passait devant `tune-server-v0.9.153-linux-x86_64.tar.gz` (43 Mo).
+///
+/// Mesuré chez FabienM le 17/09/2026, journal à l'appui :
+/// `update_download_starting asset=moissonneur-roon-v0.9.153-linux-x86_64.tar.gz
+/// size=2661012` puis `update_release_incomplete error=… not listed in signed
+/// SHA256SUMS`. Le refus de signature est ce qui a sauvé l'installation : sans
+/// lui, le serveur se serait remplacé par le moissonneur.
+///
+/// Les CINQ archives du moissonneur couvrent linux x86_64 et aarch64, macOS
+/// arm64 et x86_64, Windows x86_64 : toutes les plateformes étaient touchées.
+const PREFIXE_ARCHIVE_SERVEUR: &str = "tune-server";
+
 /// Find the extractable archive asset (tar.gz or zip) for the current platform.
 /// Excludes .dmg and .exe installers — we want the raw archive containing the binary + web/.
 fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
@@ -808,6 +827,12 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
             return false;
         }
 
+        // L'archive DU SERVEUR, et pas un autre binaire publié sur la même
+        // release (voir `PREFIXE_ARCHIVE_SERVEUR`).
+        if !name.starts_with(PREFIXE_ARCHIVE_SERVEUR) {
+            return false;
+        }
+
         // Exclude installer-only files
         if name.contains("setup") || name.contains("installer") {
             return false;
@@ -819,6 +844,24 @@ fn find_archive_asset(release: &ReleaseInfo) -> Option<&ReleaseAsset> {
             "windows" => name.contains("windows"),
             _ => false,
         };
+
+        // 🔴 La BIBLIOTHÈQUE C doit être celle avec laquelle ce binaire a été
+        // construit (Bertrand, 17/09/2026).
+        //
+        // Linux publie deux archives aarch64 : `…-linux-aarch64.tar.gz` (glibc)
+        // et `…-linux-aarch64-musl.tar.gz`. Le filtre ne regardait que
+        // l'architecture, et GitHub rend ses fichiers par ordre alphabétique :
+        // `-musl` passait d'abord. Un Raspberry Pi sous Debian, installé en
+        // glibc, se mettait donc à jour avec le binaire musl à chaque fois.
+        //
+        // `cfg!(target_env = "musl")` est la BONNE question : ce n'est pas
+        // « cette machine a-t-elle la musl ? » mais « avec quoi CE binaire
+        // a-t-il été lié ? ». Une image musl reste en musl, une install glibc
+        // reste en glibc, et aucune des deux ne bascule sans qu'on le veuille.
+        let musl_attendu = cfg!(target_env = "musl");
+        if os == "linux" && name.contains("musl") != musl_attendu {
+            return false;
+        }
         let arch_match = match arch {
             "aarch64" => name.contains("aarch64") || name.contains("arm64"),
             "x86_64" => name.contains("x86_64") || name.contains("amd64"),
@@ -861,7 +904,7 @@ fn update_release_payload(
 
 #[cfg(test)]
 mod update_availability_tests {
-    use super::{HomebrewInstallation, update_release_payload};
+    use super::{HomebrewInstallation, UpdateBlame, find_archive_asset, update_release_payload};
     use std::path::PathBuf;
     use tune_core::updater::{ReleaseAsset, ReleaseInfo};
 
@@ -914,6 +957,157 @@ mod update_availability_tests {
         assert_eq!(payload["update_available"], true);
         assert_eq!(payload["asset_name"], name);
         assert_eq!(payload["unavailable_reason"], serde_json::Value::Null);
+    }
+
+    /// La liste EXACTE des fichiers de la v0.9.153, dans l'ordre où GitHub les
+    /// rend (alphabétique). Les cinq archives du moissonneur Roon y passent
+    /// AVANT celles du serveur.
+    /// Une release portant exactement ces fichiers, dans cet ordre.
+    fn release_avec(noms: &[&str]) -> ReleaseInfo {
+        let mut r = release_with("placeholder.tar.gz");
+        r.assets = noms
+            .iter()
+            .map(|n| ReleaseAsset {
+                name: (*n).into(),
+                browser_download_url: format!("https://example.invalid/{n}"),
+                size: 42,
+                content_type: "application/octet-stream".into(),
+            })
+            .collect();
+        r
+    }
+
+    fn release_v0_9_153() -> ReleaseInfo {
+        let noms = [
+            "moissonneur-roon-v0.9.153-linux-aarch64.tar.gz",
+            "moissonneur-roon-v0.9.153-linux-x86_64.tar.gz",
+            "moissonneur-roon-v0.9.153-macos-arm64.tar.gz",
+            "moissonneur-roon-v0.9.153-macos-x86_64.tar.gz",
+            "moissonneur-roon-v0.9.153-windows-x86_64.zip",
+            "SHA256SUMS",
+            "SHA256SUMS.minisig",
+            "tune-server-linux-aarch64-musl.tar.gz",
+            "tune-server-linux-aarch64.tar.gz",
+            "tune-server-linux-x86_64.tar.gz",
+            "tune-server-v0.9.153-linux-aarch64-musl.tar.gz",
+            "tune-server-v0.9.153-linux-aarch64.tar.gz",
+            "tune-server-v0.9.153-linux-x86_64.tar.gz",
+            "tune-server-v0.9.153-macos-aarch64.dmg",
+            "tune-server-v0.9.153-macos-aarch64.tar.gz",
+            "tune-server-v0.9.153-macos-x86_64.dmg",
+            "tune-server-v0.9.153-macos-x86_64.tar.gz",
+            "tune-server-v0.9.153-windows-x86_64-setup.exe",
+            "tune-server-v0.9.153-windows-x86_64.zip",
+            "tune-server_0.9.153_amd64.deb",
+        ];
+        release_avec(&noms)
+    }
+
+    /// 🔴 FabienM, 17/09/2026 : « la 153 ne s'installe pas sur mon serveur
+    /// Linux ». Son journal montre `asset=moissonneur-roon-v0.9.153-linux-x86_64.tar.gz
+    /// size=2661012`, puis le refus de signature — le moissonneur n'est pas
+    /// dans `SHA256SUMS`.
+    ///
+    /// L'archive retenue doit être celle du SERVEUR, quelle que soit la place
+    /// des autres binaires publiés sur la même release.
+    #[test]
+    fn l_archive_choisie_est_celle_du_serveur_pas_le_moissonneur() {
+        let release = release_v0_9_153();
+        let asset = find_archive_asset(&release).expect("une archive pour cette machine");
+        assert!(
+            asset.name.starts_with("tune-server"),
+            "archive retenue : {} — le moissonneur Roon n'est pas le serveur",
+            asset.name
+        );
+        assert!(
+            !asset.name.contains("moissonneur"),
+            "archive retenue : {}",
+            asset.name
+        );
+        // Et le contrat public dit la même chose.
+        let payload = update_release_payload("0.9.152", &release_v0_9_153(), None);
+        assert_eq!(payload["update_available"], true);
+        assert!(
+            payload["asset_name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("tune-server")),
+            "asset_name : {}",
+            payload["asset_name"]
+        );
+    }
+
+    /// 🔴 Bertrand, 17/09/2026 : « corrige le musl ». Linux publie DEUX
+    /// archives aarch64, glibc et musl, et `-musl` passe en premier dans
+    /// l'ordre alphabétique : un Pi sous Debian se mettait à jour avec le
+    /// binaire musl.
+    ///
+    /// Le critère n'est pas la machine mais CE binaire : une image musl reste
+    /// en musl, une install glibc reste en glibc.
+    #[test]
+    fn la_bibliotheque_c_choisie_est_celle_de_ce_binaire() {
+        let r = release_avec(&[
+            "tune-server-v0.9.153-linux-aarch64-musl.tar.gz",
+            "tune-server-v0.9.153-linux-aarch64.tar.gz",
+            "tune-server-v0.9.153-linux-x86_64.tar.gz",
+            "tune-server-v0.9.153-macos-aarch64.tar.gz",
+            "tune-server-v0.9.153-windows-x86_64.zip",
+        ]);
+        let Some(asset) = find_archive_asset(&r) else {
+            // Plateforme sans archive dans cette liste (macOS x86_64) : rien à
+            // juger, et surtout pas une archive inventée.
+            return;
+        };
+        if std::env::consts::OS == "linux" {
+            assert_eq!(
+                asset.name.contains("musl"),
+                cfg!(target_env = "musl"),
+                "archive retenue : {} — elle doit suivre la bibliothèque C de CE binaire",
+                asset.name
+            );
+        }
+    }
+
+    /// Une release qui n'a QUE l'archive musl ne se propose pas à un binaire
+    /// glibc : mieux vaut aucune mise à jour qu'un binaire qui ne démarre pas.
+    #[test]
+    fn une_archive_musl_seule_ne_se_propose_pas_a_un_binaire_glibc() {
+        if std::env::consts::OS != "linux" || cfg!(target_env = "musl") {
+            return;
+        }
+        let r = release_avec(&["tune-server-v0.9.153-linux-aarch64-musl.tar.gz"]);
+        assert!(find_archive_asset(&r).is_none());
+    }
+
+    /// Les deux causes ne se disent plus de la même façon : une publication
+    /// inachevée invite à réessayer, une archive hors signature dit que
+    /// réessayer n'y changera rien (FabienM a réessayé quatre fois).
+    #[test]
+    fn une_archive_hors_signature_ne_dit_plus_reessayez_plus_tard() {
+        let incomplete = UpdateBlame::ReleaseIncomplete.user_message();
+        let hors_signature = UpdateBlame::ArchiveHorsSignature.user_message();
+        assert!(incomplete.contains("réessayez plus tard"));
+        assert!(!hors_signature.contains("réessayez plus tard"));
+        assert!(hors_signature.contains("n'y changera"));
+        assert_ne!(
+            UpdateBlame::ReleaseIncomplete.marker(),
+            UpdateBlame::ArchiveHorsSignature.marker(),
+            "un grep doit pouvoir les séparer dans le journal"
+        );
+        // Ni l'une ni l'autre n'accuse la signature : le fichier est absent de
+        // la liste, pas contredit par elle.
+        assert_ne!(hors_signature, UpdateBlame::Untrusted.user_message());
+    }
+
+    /// Le témoin : une release qui ne porte QUE le moissonneur n'offre aucune
+    /// mise à jour — plutôt que d'en offrir une fausse.
+    #[test]
+    fn une_release_sans_archive_de_serveur_n_en_propose_aucune() {
+        let mut r = release_v0_9_153();
+        r.assets.retain(|a| a.name.starts_with("moissonneur"));
+        assert!(find_archive_asset(&r).is_none());
+        let payload = update_release_payload("0.9.152", &r, None);
+        assert_eq!(payload["update_available"], false);
+        assert_eq!(payload["unavailable_reason"], "no_compatible_asset");
     }
 
     #[test]
@@ -1026,6 +1220,15 @@ pub(crate) enum UpdateBlame {
     Unreachable,
     /// Le serveur a répondu, mais le fichier n'est pas là. Chez nous.
     ReleaseIncomplete,
+    /// L'archive téléchargée n'est pas couverte par la liste SIGNÉE de cette
+    /// version : ce n'est pas la nôtre, ou ce n'est pas celle qu'il fallait
+    /// prendre. Chez nous, et réessayer n'y change rien.
+    ///
+    /// Séparée de [`Self::ReleaseIncomplete`] le 17/09/2026 : les deux
+    /// partageaient un message qui disait « réessayez plus tard », et c'était
+    /// faux ici — FabienM a réessayé quatre fois en six minutes pendant que le
+    /// serveur retéléchargeait, à chaque tentative, la même mauvaise archive.
+    ArchiveHorsSignature,
     /// Le serveur a répondu qu'il allait mal (5xx, quota). Ni l'un ni l'autre.
     ServerError,
     /// Signature ou empreinte qui ne concorde pas. On refuse d'installer.
@@ -1038,6 +1241,7 @@ impl UpdateBlame {
         match self {
             Self::Unreachable => "update_server_unreachable",
             Self::ReleaseIncomplete => "update_release_incomplete",
+            Self::ArchiveHorsSignature => "update_archive_hors_signature",
             Self::ServerError => "update_server_error",
             Self::Untrusted => "update_untrusted_archive",
         }
@@ -1053,6 +1257,12 @@ impl UpdateBlame {
             Self::ReleaseIncomplete => {
                 "Le serveur a répondu, mais cette version n'est pas complètement publiée. \
                  Ce n'est pas un problème de votre côté : réessayez plus tard."
+            }
+            Self::ArchiveHorsSignature => {
+                "Le fichier téléchargé n'est pas celui que cette version publie : \
+                 il n'est pas couvert par sa signature, l'installation est refusée. \
+                 Ce n'est pas un problème de votre côté, et réessayer n'y changera \
+                 rien — signalez-le nous."
             }
             Self::ServerError => {
                 "Le serveur de mises à jour est momentanément indisponible. \
@@ -1200,14 +1410,21 @@ async fn verify_update_signature(
                 None
             }
         })
-        // Absent de la liste SIGNÉE : la release est incomplète, pas
-        // frauduleuse. C'est exactement l'état de la v0.9.71 — SHA256SUMS
-        // publié en ne couvrant que 5 fichiers sur 13. Accuser la signature
-        // ici ferait croire à une attaque là où il n'y a qu'une publication
-        // inachevée.
+        // Absent de la liste SIGNÉE. Deux histoires très différentes, et
+        // elles ne se disent plus de la même façon (17/09/2026) :
+        //
+        // - la v0.9.71 : `SHA256SUMS` publié en ne couvrant que 5 fichiers sur
+        //   13 — une publication inachevée, que le temps répare ;
+        // - la v0.9.153 : le serveur a téléchargé une archive qui n'est PAS la
+        //   sienne (le moissonneur Roon, pris pour l'archive du serveur). La
+        //   signature ne la couvre pas, et pour cause. Réessayer refait
+        //   exactement la même chose.
+        //
+        // Aucune des deux n'accuse la signature : dans les deux cas le fichier
+        // est absent de la liste, pas contredit par elle.
         .ok_or_else(|| {
             UpdateError::new(
-                UpdateBlame::ReleaseIncomplete,
+                UpdateBlame::ArchiveHorsSignature,
                 format!("{archive_name} not listed in signed SHA256SUMS"),
             )
         })?;
