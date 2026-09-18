@@ -1112,6 +1112,58 @@ fn wire_resolution_wins_over_mirrored_rule() {
     );
 }
 
+/// #4297 — le miroir doit suivre l'élargissement du forçage WAV.
+///
+/// Sur la zone d'Yves (darTZeel LHC-208 : « Forcer le WAV = 24 bits » ET
+/// « FLAC natif »), la source est un ALAC 44,1/16. Aucune session de flux n'est
+/// fournie : c'est donc bien la RÈGLE de ce miroir qui parle, et non le fil.
+/// Elle exigeait `bit_depth > 16` pour armer le forçage, comme la décision, et
+/// annonçait « ALAC → FLAC » — l'écart de panneau de la famille #3183, sur
+/// exactement le même écran que la capture du testeur.
+#[test]
+fn le_forcage_wav_24_s_affiche_aussi_sur_une_source_16_bits() {
+    let (backend, zone) = dlna_zone();
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = zone.id.unwrap();
+    repo.update_dlna_wav24(id, true).unwrap();
+    repo.update_dlna_native_flac(id, true).unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+
+    let sp = build_signal_path(
+        &alac_16_playing(),
+        &zone,
+        &backend,
+        Some("darTZeel LHC-208"),
+        "none",
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(
+        transcoder_desc(&sp).as_deref(),
+        Some("ALAC 44kHz/16bit \u{2192} WAV 44kHz/16bit"),
+        "« Forcer le WAV » coché : le panneau annonce le WAV, pas un FLAC"
+    );
+}
+
+/// Source ALAC 44,1/16 en lecture, sans session de flux : le cas d'Yves.
+fn alac_16_playing() -> ZoneState {
+    let np = NowPlaying {
+        title: "Guided By The Moon".into(),
+        format: Some("alac".into()),
+        sample_rate: Some(44_100),
+        bit_depth: Some(16),
+        stream_id: Some("sid-1".into()),
+        ..Default::default()
+    };
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(np),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn wav_wire_native_wav_is_bit_perfect_any_depth() {
     assert!(wav_wire_bit_perfect(true, true, false, 24)); // native WAV 24-bit, flag off

@@ -325,6 +325,12 @@ mod etage_natif;
 mod backend;
 use backend::{BackendCpal, BackendLocal, DemandeDOuverture, Puits};
 
+// #3208 — la période demandée au pilote, et la garde de préchargement qui s'en
+// déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
+// dans ce fichier ni dans ses modules.
+mod periode;
+use periode::{avec_periode, config_de_flux, garde_de_prechargement};
+
 // ---------------------------------------------------------------------------
 // Gapless: pending next track for seamless chaining
 // ---------------------------------------------------------------------------
@@ -4480,13 +4486,8 @@ impl OutputTarget for LocalOutput {
                         );
                         cfg
                     } else {
-                        find_matching_config(&device, dec_ch, dec_sr).unwrap_or(
-                            cpal::StreamConfig {
-                                channels: dec_ch,
-                                sample_rate: dec_sr,
-                                buffer_size: cpal::BufferSize::Default,
-                            },
-                        )
+                        find_matching_config(&device, dec_ch, dec_sr)
+                            .unwrap_or_else(|| config_de_flux(dec_ch, dec_sr))
                     }
                 };
                 // #3632 — même règle que le chemin PCM (`BackendCpal::ouvrir`) :
@@ -4500,15 +4501,17 @@ impl OutputTarget for LocalOutput {
                     output_config,
                     dec_ch,
                 );
+                // #3208 — la configuration nominale vient de
+                // `default_output_config()` : son `buffer_size` est celui de
+                // cpal, pas le nôtre. C'est ICI que la période choisie atteint
+                // le chemin le plus fréquent ; sans cette ligne, seuls les
+                // littéraux de repli l'auraient portée.
+                let output_config = avec_periode(output_config);
 
                 // Cadence SOURCE : le second candidat de la cascade. Certaines
                 // plateformes (PipeWire) acceptent une cadence arbitraire là où
                 // la cadence par défaut du périphérique est refusée.
-                let source_config = cpal::StreamConfig {
-                    channels: dec_ch,
-                    sample_rate: dec_sr,
-                    buffer_size: cpal::BufferSize::Default,
-                };
+                let source_config = config_de_flux(dec_ch, dec_sr);
 
                 // Gate: output silence until enough real data has been buffered.
                 // Prevents stale/garbage audio during track transitions.
@@ -4527,7 +4530,10 @@ impl OutputTarget for LocalOutput {
                     std::cell::RefCell::new(None);
                 let ouverture = ouvrir_premier_format_accepte(&tentatives, |cfg, format| {
                     let cap = (cfg.sample_rate as usize) * (cfg.channels as usize) * 2;
-                    let min_buf = (cfg.sample_rate as usize) * (cfg.channels as usize) / 2; // ~500ms
+                    // ~500 ms — le compte d'origine, inchangé tant qu'aucune
+                    // période n'est imposée (#3208).
+                    let min_buf_ms = (cfg.sample_rate as usize) * (cfg.channels as usize) / 2;
+                    let min_buf = garde_de_prechargement(cfg, min_buf_ms);
                     starvation.begin_stream(cfg.sample_rate, cfg.channels);
                     let r = Arc::new(RingBuf::new_metered(cap, starvation.clone()));
                     r.clear(); // Defensive: zero-fill before callback can read
@@ -6402,6 +6408,13 @@ mod tests;
 
 #[cfg(test)]
 mod open_failure_tests;
+
+/// #3208 — la période demandée au pilote, telle que le backend l'emploie.
+/// La décision pure et la garde de branchement vivent dans
+/// `crate::audio::periode_alsa` : elles tournent dans la porte `test` de la CI,
+/// qui ne compile pas `local-audio`.
+#[cfg(test)]
+mod periode_alsa_i3208;
 /// #3575 — le PCM exclusif que Tune se prend a lui-meme.
 ///
 /// Les fonctions eprouvees ici sont PURES et compilees sur toutes les cibles :

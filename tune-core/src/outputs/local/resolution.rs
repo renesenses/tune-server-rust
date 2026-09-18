@@ -295,8 +295,17 @@ pub(super) fn disambiguate_display_name(
 /// Puits nuls d'ALSA, qui ne produisent aucun son. Écartés à la découverte
 /// **et** à la résolution : les deux doivent voir exactement la même liste,
 /// faute de quoi les rangs `(n)` qu'elles calculent peuvent diverger.
-pub(super) fn is_null_sink(raw_name: &str) -> bool {
-    raw_name.contains("Discard all samples") || raw_name.contains("Dummy")
+///
+/// 🔴 La règle a changé le 18/09/2026. Elle lisait la DESCRIPTION
+/// (`contains("Discard all samples")`), c'est-à-dire le texte libre
+/// d'`alsa-lib` — le même texte qui s'est retrouvé affiché comme NOM de zone
+/// sur le `.18`. Elle lit désormais le nom de PCM porté par `endpoint_id` :
+/// `null`, et la carte `Dummy` du module noyau `snd-dummy`. La décision, ses
+/// deux sens et ses épreuves vivent dans
+/// [`crate::outputs::pseudo_peripherique_alsa`], hors de la feature
+/// `local-audio` — sans quoi aucune porte de CI ne les jouerait.
+pub(super) fn is_null_sink(endpoint_id: &str, raw_name: &str) -> bool {
+    crate::outputs::pseudo_peripherique_alsa::est_un_puits(endpoint_id, raw_name)
 }
 
 /// Le nom demandé porte-t-il un suffixe de rang `(n)` posé par la découverte ?
@@ -370,7 +379,7 @@ pub(super) fn find_device_with_fallback(
             };
             (device, identity)
         })
-        .filter(|(_, identity)| !is_null_sink(&identity.raw_name))
+        .filter(|(_, identity)| !is_null_sink(&identity.endpoint_id, &identity.raw_name))
         .unzip();
 
     let resolution = resolve_device(
@@ -602,14 +611,7 @@ pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
 /// (`hw:CARD=…`, `dmix:CARD=…`). On ne retire donc QUE le préfixe d'hôte, et
 /// seulement s'il est présent : certains enregistrements ne portent que le PCM.
 pub(super) fn alsa_pcm_name(endpoint_id: &str) -> &str {
-    let Some((tete, reste)) = endpoint_id.split_once(':') else {
-        return endpoint_id;
-    };
-    if tete.eq_ignore_ascii_case("alsa") {
-        reste
-    } else {
-        endpoint_id
-    }
+    crate::outputs::pseudo_peripherique_alsa::pcm_alsa(endpoint_id)
 }
 
 /// Ce PCM ALSA parle-t-il au MATÉRIEL, ou à un convertisseur logiciel ?
@@ -841,6 +843,10 @@ pub fn exclusive_mode_support(target_os: &str, asio_feature: bool) -> ExclusiveM
 /// When `supported_output_configs()` fails (PipeWire ALSA compat), falls back
 /// to `default_output_config()` and, as a last resort, returns a config with
 /// the requested parameters directly — PipeWire will accept and resample.
+///
+/// #3208 — quel que soit le bras, la période demandée au pilote est celle de
+/// [`super::periode::taille_de_periode`] : plus aucun `BufferSize` n'est écrit
+/// à la main ici.
 pub(super) fn find_matching_config(
     device: &cpal::Device,
     channels: u16,
@@ -855,11 +861,10 @@ pub(super) fn find_matching_config(
                     && config.min_sample_rate() <= sample_rate
                     && config.max_sample_rate() >= sample_rate
                 {
-                    return Some(cpal::StreamConfig {
-                        channels: channels.min(config.channels()),
+                    return Some(super::periode::config_de_flux(
+                        channels.min(config.channels()),
                         sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
-                    });
+                    ));
                 }
             }
             // Configs exist but none match the requested rate — let caller
@@ -876,15 +881,13 @@ pub(super) fn find_matching_config(
         // If the default config's rate matches what we want, use it directly.
         // Otherwise return the default config — the caller will resample.
         if cfg.sample_rate == sample_rate && cfg.channels >= channels {
-            return Some(cpal::StreamConfig {
-                channels,
-                sample_rate,
-                buffer_size: cpal::BufferSize::Default,
-            });
+            return Some(super::periode::config_de_flux(channels, sample_rate));
         }
         // Return default config even if rate differs — better than nothing.
         // Caller will set up resampling.
-        return Some(cfg);
+        // #3208 — `cfg` vient du périphérique : il porte le `buffer_size` de
+        // cpal, pas le nôtre. Sans période armée, il est rendu intact.
+        return Some(super::periode::avec_periode(cfg));
     }
 
     // Last resort: return the requested config directly.  PipeWire's ALSA
@@ -895,11 +898,7 @@ pub(super) fn find_matching_config(
         channels,
         sample_rate, "find_matching_config_using_direct_params_pipewire_fallback"
     );
-    Some(cpal::StreamConfig {
-        channels,
-        sample_rate,
-        buffer_size: cpal::BufferSize::Default,
-    })
+    Some(super::periode::config_de_flux(channels, sample_rate))
 }
 
 /// Adapt channel count between source and output through the single matrix in

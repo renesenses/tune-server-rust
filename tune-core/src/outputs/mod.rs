@@ -29,6 +29,10 @@ pub mod oaat;
 pub mod oh_events;
 pub mod openhome;
 pub mod openhome_pins;
+/// Les pseudo-périphériques ALSA (le PCM `null`, la carte `snd-dummy`). Hors
+/// de `local-audio` à dessein : la porte `test` de la CI ne compile pas cette
+/// feature pour `tune-core`, et cette décision-ci doit pouvoir y être jugée.
+pub mod pseudo_peripherique_alsa;
 pub mod registry;
 pub mod slimproto;
 pub mod squeezebox;
