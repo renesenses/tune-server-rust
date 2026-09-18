@@ -336,9 +336,6 @@ async fn start_job(
     admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "converter") {
-        return Ok(response);
-    }
     // Premium gate: batch converter requires Premium
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
@@ -347,6 +344,9 @@ async fn start_job(
     .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "converter") {
+        return Ok(response);
     }
 
     // Validate format

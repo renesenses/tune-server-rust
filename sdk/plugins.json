@@ -8,9 +8,9 @@
     {"id": "pont-roon", "crate": "../plugins/tune-pont-roon", "feature": "pont-roon", "fast_test": false}
   ],
   "native": [
-    {"id": "equalizer", "crate": "tune-plugin-equalizer"},
-    {"id": "crossfeed", "crate": "tune-plugin-crossfeed"},
-    {"id": "converter", "crate": "tune-plugin-converter"},
-    {"id": "declick", "crate": "tune-plugin-declick"}
+    {"id": "equalizer", "crate": "tune-plugin-equalizer", "bundled_in": "tune-core"},
+    {"id": "crossfeed", "crate": "tune-plugin-crossfeed", "bundled_in": "tune-core"},
+    {"id": "converter", "crate": "tune-plugin-converter", "bundled_in": "tune-server"},
+    {"id": "declick", "crate": "tune-plugin-declick", "bundled_in": "tune-server"}
   ]
 }

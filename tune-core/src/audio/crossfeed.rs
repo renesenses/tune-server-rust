@@ -108,6 +108,10 @@ impl CrossfeedProcessor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrossfeedConstraint {
+    /// The saved configuration survives the Free -> Premium transition.
+    PremiumRequired,
+    /// Entitled, but the provider is disabled, uninstalled, or failed to load.
+    PluginUnavailable,
     /// La zone ne joue ni par une sortie LOCALE, ni par une sortie RÉSEAU :
     /// OAAT, navigateur, sorties PULL, ou zone dont aucun périphérique n'est
     /// résolu (elle ne joue nulle part).
@@ -141,6 +145,8 @@ impl CrossfeedConstraint {
     /// Code stable, celui que porte la charge utile JSON.
     pub fn code(self) -> &'static str {
         match self {
+            Self::PremiumRequired => "premium_required",
+            Self::PluginUnavailable => "plugin_unavailable",
             Self::NonLocalOutput => "non_local_output",
             Self::PureMode => "pure_mode",
             Self::NetworkProgressiveOff => "network_progressive_off",
@@ -152,6 +158,12 @@ impl CrossfeedConstraint {
     /// déjà ses `detail` en français.
     pub fn detail(self) -> &'static str {
         match self {
+            Self::PremiumRequired => {
+                "Le crossfeed fait désormais partie de Tune Premium. Vos réglages sont conservés pour sa réactivation avec Premium."
+            }
+            Self::PluginUnavailable => {
+                "Le greffon crossfeed est indisponible. Réactivez-le dans les greffons ; vos réglages sont conservés."
+            }
             Self::NonLocalOutput => {
                 "Le crossfeed est un effet de casque : il n'est appliqué que par \
                  une sortie LOCALE (DAC USB ou carte son de la machine). Cette \
@@ -181,7 +193,9 @@ impl CrossfeedConstraint {
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
     /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
+        Self::PremiumRequired,
+        Self::PluginUnavailable,
         Self::NonLocalOutput,
         Self::PureMode,
         Self::NetworkProgressiveOff,

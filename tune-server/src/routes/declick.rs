@@ -143,15 +143,15 @@ async fn start_job(
     State(state): State<AppState>,
     Json(body): Json<StartJobRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "declick") {
-        return Ok(response);
-    }
     // Premium gate FIRST.
     if let Err(resp) =
         crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::Declick)
             .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "declick") {
+        return Ok(response);
     }
 
     // Resolve options + output format.

@@ -32,6 +32,8 @@ class PluginCatalog(unittest.TestCase):
 
     def test_current_workflows_match_catalog(self):
         self.assertEqual(catalog.generate(self.root), 19)
+        entries = json.loads((self.root / "sdk/plugins.json").read_text())["native"]
+        self.assertEqual(next(p for p in entries if p["id"] == "equalizer")["bundled_in"], "tune-core")
 
     def test_next_plugin_reaches_test_clippy_macos_and_docker_arm64(self):
         # Add a real Cargo member/dependency and ONE catalog entry. No workflow edit.
@@ -96,3 +98,22 @@ class PluginCatalog(unittest.TestCase):
         path.write_text(source.replace("python scripts/plugin-catalog.py --check", "true"), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "missing catalog check"):
             catalog.generate(self.root)
+
+    def test_bundled_equalizer_cannot_become_optional_or_disappear(self):
+        path = self.root / "tune-core/Cargo.toml"
+        original = path.read_text(encoding="utf-8")
+        dependency = 'tune-plugin-equalizer = { path = "../sdk/tune-plugin-equalizer" }'
+        self.assertIn(dependency, original)
+        for replacement in ("", dependency.replace(" }", ", optional = true }")):
+            path.write_text(original.replace(dependency, replacement), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "unconditional bundled dependency: equalizer"):
+                catalog.generate(self.root)
+        path.write_text(original, encoding="utf-8")
+
+    def test_shipping_manifests_match_the_commercial_offer(self):
+        # Independent business oracle: never derive expected access from the
+        # manifest under test. The SDK workflow runs this before expensive builds.
+        for plugin, entitlement in {"equalizer": "free", "crossfeed": "crossfeed",
+                                    "converter": "batch_converter", "declick": "declick"}.items():
+            manifest = json.loads((self.root / f"sdk/tune-plugin-{plugin}/manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["entitlement"], entitlement, plugin)

@@ -7733,3 +7733,41 @@ async fn premium_sdk_free_equalizer_reaches_pcm_and_pure_still_bypasses() {
         "PURE must bypass the free EQ too"
     );
 }
+
+#[tokio::test]
+async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivation() {
+    let mut orch = test_orchestrator();
+    let license = Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    ));
+    orch.license = Some(license.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
+    settings.set("zone_1_crossfeed", saved).unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    // Even installed/enabled flags cannot grant Free accounts the processor.
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    license.set_account_premium(true, None).await;
+    let mut processor = orch
+        .load_crossfeed_processor(1, 48000)
+        .expect("Premium reactivation");
+    assert_eq!(processor.amount(), 0.37);
+    let mut pcm = vec![0.0; 4096];
+    pcm[0] = 1.0;
+    let before = pcm.clone();
+    processor.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "reactivated crossfeed must reach PCM");
+    license.set_account_premium(false, None).await;
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "downgrade must cut immediately"
+    );
+    assert_eq!(
+        settings.get("zone_1_crossfeed").unwrap().as_deref(),
+        Some(saved)
+    );
+}

@@ -216,6 +216,32 @@ pub(super) async fn crossfeed_status_de_zone(
     zone_id: i64,
     requested: bool,
 ) -> tune_core::audio::crossfeed::CrossfeedStatus {
+    use tune_core::audio::crossfeed::{CrossfeedConstraint, CrossfeedStatus};
+    // Match the playback guards before checking physical output constraints.
+    // Never rewrite the user's stored crossfeed settings when access changes.
+    let reason = if !state
+        .license
+        .check_feature(tune_core::license::Feature::Crossfeed)
+        .await
+    {
+        Some(CrossfeedConstraint::PremiumRequired)
+    } else if !tune_core::audio::premium_plugins::enabled(
+        &SettingsRepo::with_backend(state.backend.clone()),
+        "crossfeed",
+    ) {
+        Some(CrossfeedConstraint::PluginUnavailable)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return CrossfeedStatus {
+            requested,
+            effective: false,
+            unavailable: true,
+            reason: Some(reason),
+            detail: Some(reason.detail()),
+        };
+    }
     let backend = &state.backend;
     let zone = ZoneRepo::with_backend(backend.clone())
         .get(zone_id)

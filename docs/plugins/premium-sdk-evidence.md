@@ -91,4 +91,15 @@ Sur le lot `batch/jp-sdk-premium-20260917`, hors RC publiée :
 - Client web compagnon : trois tests sur l’écran réellement monté (curseur FREE → POST des bandes, avertissement PURE, ancien serveur 402), contre-épreuve par restauration du verrou Premium puis retour au vert. Validation complète conservée dans l’archive de suivi.
 - `actionlint` retrouve les mêmes cinq diagnostics préexistants dans `release.yml` qu’au parent, aucun diagnostic nouveau dans les quatre workflows modifiés.
 
-Les preuves du paragraphe précédent restent attachées à leur commit initial. Les nouveaux journaux sont conservés séparément dans `reports/sdk-premium-4363/catalog-free-20260917/`. Les anciens paquets Linux de l’archive initiale précèdent les nouveaux droits FREE/crossfeed ; ils ne représentent pas cette révision. La politique de migration du crossfeed FREE reste à décider avant sortie du brouillon.
+Les preuves du paragraphe précédent restent attachées à leur commit initial. Les nouveaux journaux sont conservés séparément dans `reports/sdk-premium-4363/catalog-free-20260917/`. Les anciens paquets Linux de l’archive initiale précèdent les nouveaux droits FREE/crossfeed ; ils ne représentent pas cette révision. À cette date, la politique de migration du crossfeed FREE restait à décider. La décision du suivi du 18 septembre est désormais la coupure nette, avec conservation des réglages.
+
+## Suivi du 18 septembre : livraison embarquée et offre commerciale
+
+- `bundled_in` rend explicite le lien obligatoire des quatre fournisseurs dans le binaire. Le catalogue refuse la suppression de la dépendance EQ ou son passage en dépendance optionnelle ; aucun paquet natif n’est nécessaire pour le démarrage FREE.
+- Sept tests Python passent. Inverser successivement l’entitlement de chacun des quatre manifests fait échouer le témoin commercial ; restaurer les fichiers par copie rétablit le vert.
+- Shrek, unité `jp-sdk-offer-4363` : le contrat HTTP `audio_offer_free_eq_and_premium_four_survive_real_startup` passe. Il démarre le vrai chargeur sans paquet natif, écrit EQ/preset pour les deux offres, refuse crossfeed/convertisseur/Dé-ploc en FREE et termine les deux tâches WAV en Premium. Les réglages historiques du crossfeed restent identiques en base après la migration et le refus ; le passage Premium suivi de la réactivation les retrouve.
+- Un témoin supplémentaire de l’orchestrateur protège la préparation PCM contre un contournement de licence par les drapeaux d’installation, puis vérifie le traitement Premium et la rétrogradation.
+- Client : 449 fichiers et 4 808 tests passent, avec les gardes Svelte/i18n et onze traductions complètes. Les écrans EQ et Crossfeed v2 sont réellement montés. Retirer l’écran de coupure FREE fait échouer son témoin ; restauration verte. Le panneau Lecture en cours utilise le même motif et la même traduction.
+- Notes de version préparées dans `docs/release-notes/sdk-audio.md` : EQ gratuit embarqué, coupure nette du crossfeed FREE, conservation puis récupération des réglages. Aucune release existante n’est modifiée.
+
+Les journaux de ce suivi sont isolés dans `reports/sdk-premium-4363/offer-20260918/`. Les preuves DSP antérieures restent attachées à leurs révisions ; aucun algorithme DSP n’est modifié par ce suivi. Les checks GitHub du nouveau SHA et la qualification matérielle restent des validations distinctes.

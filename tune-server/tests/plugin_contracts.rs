@@ -66,6 +66,7 @@ fn use_scratch_plugin_data_dir() {
         // the caller constructs an AppState that can read the variable.
         unsafe {
             std::env::set_var("TUNE_PLUGINS_DATA_DIR", dir.path());
+            std::env::set_var("TUNE_AUDIO_PLUGINS_DIR", dir.path().join("audio"));
         }
         dir
     });
@@ -84,3 +85,6 @@ mod plugin_routes;
 // le dit lui-meme.
 #[path = "plugin_output_provider_seam.rs"]
 mod plugin_output_provider_seam;
+
+#[path = "audio_offer_contract.rs"]
+mod audio_offer_contract;

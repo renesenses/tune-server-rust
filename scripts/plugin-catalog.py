@@ -64,6 +64,14 @@ def inventory(root):
         if (manifest["id"] != plugin["id"] or "cdylib" not in cargo["lib"]["crate-type"]
                 or not {"native", "schemas"}.issubset(cargo["features"])):
             raise ValueError(f"missing native exports/schema contract: {plugin['id']}")
+        # Native describes the ABI, not an installation requirement. Bundled
+        # source providers must reach EVERY published binary, without features.
+        if "bundled_in" in plugin:
+            host = root / plugin["bundled_in"]
+            dep = read_toml(host / "Cargo.toml")["dependencies"].get(cargo["package"]["name"], {})
+            if (dep.get("optional", False) or "path" not in dep
+                    or (host / dep["path"]).resolve() != crate.resolve()):
+                raise ValueError(f"missing unconditional bundled dependency: {plugin['id']}")
         for file in ("tests/conformance.rs", "examples/schema.rs", "schemas/config.json"):
             if not (crate / file).is_file():
                 raise ValueError(f"missing native plugin witness: {crate / file}")
