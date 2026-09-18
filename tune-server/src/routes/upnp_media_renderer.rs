@@ -534,6 +534,70 @@ fn doit_reprendre(
     etat == tune_core::playback::PlayState::Paused && uri_en_cours == Some(uri_de_session)
 }
 
+/// Libère le watcher d'une zone — mais SEULEMENT s'il ne reste rien à
+/// enchaîner (#3967).
+///
+/// C'est le point de rendez-vous de la course décrite dans #3967. Le handler
+/// `SetNextAVTransportURI` pose la suivante (verrou `sessions`, relâché) PUIS
+/// demande un watcher (verrou `watchers`). Cet ordre-là est imposé ; ici on
+/// prend les verrous dans le MÊME ordre relatif — `watchers` d'abord,
+/// `sessions` ensuite — si bien que les deux sections critiques sont
+/// sérialisées par `watchers` :
+///
+/// * la suivante est posée avant que l'on prenne `watchers` → on la voit et on
+///   refuse de se libérer : ce watcher-ci en reste responsable ;
+/// * on s'est libéré avant que le handler prenne `watchers` → il ne nous
+///   trouve plus et redémarre un watcher.
+///
+/// Aucun entre-deux. Avant le correctif, le watcher se retirait SANS condition
+/// à la sortie de sa boucle : une suivante posée pendant l'`await` de la
+/// promotion restait en attente sans personne pour l'enchaîner, et la chaîne
+/// s'arrêtait après la piste promue.
+///
+/// Rend `true` quand le watcher est libéré (il doit alors s'arrêter), `false`
+/// quand une suivante l'attend (il doit continuer sa boucle).
+fn try_release_watcher(zone_id: i64) -> bool {
+    let Ok(mut w) = watchers().lock() else {
+        // Verrou empoisonné : plus rien à garantir, on s'arrête.
+        return true;
+    };
+    let encore_une_suivante = sessions()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(&zone_id).map(|session| session.next.is_some()))
+        .unwrap_or(false);
+    if encore_une_suivante {
+        return false;
+    }
+    w.remove(&zone_id);
+    true
+}
+
+/// Promeut la suivante en piste courante, de façon ATOMIQUE (#3967).
+///
+/// Le watcher a lu la suivante en début de tour, puis a attendu l'état de
+/// transport (`get_state().await`). Pendant cette attente, un point de
+/// contrôle a pu REMPLACER la suivante. Relire ici, sous le verrou, évite de
+/// démarrer l'élément périmé — critère « replacement next URI [...] do not
+/// start a stale item » de #3967 — et évite du même coup que l'installation de
+/// la piste promue écrase ce remplacement.
+///
+/// Rend la suivante réellement promue, ou `None` si elle a disparu entre-temps
+/// (un Stop commandé l'efface).
+fn promouvoir_la_suivante(zone_id: i64) -> Option<NextItem> {
+    let mut carte = sessions().lock().ok()?;
+    let session = carte.entry(zone_id).or_default();
+    let promue = session.next.take()?;
+    *session = RendererSession {
+        uri: promue.uri.clone(),
+        title: promue.title.clone(),
+        artist: promue.artist.clone(),
+        duration_ms: promue.duration_ms,
+        next: None,
+    };
+    Some(promue)
+}
+
 /// Enchaîne la piste posée par SetNextAVTransportURI quand la courante se
 /// termine (#1750, gapless v1). Aucun événement de fin de piste n'existe sur
 /// le bus (`playback.stopped` n'est jamais émis) : on observe l'état toutes
@@ -544,6 +608,12 @@ fn doit_reprendre(
 /// v1 assumée : l'enchaînement passe par un play complet — le contrat UPnP
 /// (le point de contrôle n'a pas à re-commander) est tenu, le zéro-gap réel
 /// viendra avec le préchargement orchestrateur.
+///
+/// #3967 : le watcher ne s'arrête plus après UNE promotion. Un point de
+/// contrôle qui pose la piste N+2 pendant qu'on démarre la piste N+1 — le
+/// comportement normal de BubbleUPnP sur un album — trouvait sinon un watcher
+/// déjà retiré, et la chaîne s'arrêtait là. La boucle continue donc tant que
+/// `try_release_watcher` refuse de la libérer.
 fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
     {
         let Ok(mut w) = watchers().lock() else { return };
@@ -555,11 +625,17 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
         let mut was_playing = false;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let pending = sessions()
+            let une_suivante_attend = sessions()
                 .lock()
                 .ok()
-                .and_then(|s| s.get(&zone_id).and_then(|x| x.next.clone()));
-            let Some(next) = pending else { break };
+                .and_then(|s| s.get(&zone_id).map(|session| session.next.is_some()))
+                .unwrap_or(false);
+            if !une_suivante_attend {
+                if try_release_watcher(zone_id) {
+                    return;
+                }
+                continue;
+            }
 
             let ps = state.playback.get_state(zone_id).await;
             match ps.state {
@@ -567,18 +643,14 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
                 tune_core::playback::PlayState::Paused => {}
                 tune_core::playback::PlayState::Stopped if was_playing => {
                     // Fin naturelle : promouvoir la suivante et relancer.
-                    if let Ok(mut s) = sessions().lock() {
-                        s.insert(
-                            zone_id,
-                            RendererSession {
-                                uri: next.uri.clone(),
-                                title: next.title.clone(),
-                                artist: next.artist.clone(),
-                                duration_ms: next.duration_ms,
-                                next: None,
-                            },
-                        );
-                    }
+                    let Some(next) = promouvoir_la_suivante(zone_id) else {
+                        // Effacée entre-temps (Stop commandé) : rien à jouer.
+                        if try_release_watcher(zone_id) {
+                            return;
+                        }
+                        was_playing = false;
+                        continue;
+                    };
                     let device_id = ZoneRepo::with_backend(state.backend.clone())
                         .get(zone_id)
                         .ok()
@@ -601,13 +673,12 @@ fn spawn_gapless_watcher(state: AppState, zone_id: i64) {
                             warn!(zone_id, error = %e, "upnp_renderer_gapless_advance_failed")
                         }
                     }
-                    break;
+                    // La piste promue repart de zéro : on réattend un passage
+                    // LECTURE → STOPPED avant la promotion suivante.
+                    was_playing = false;
                 }
                 tune_core::playback::PlayState::Stopped => {}
             }
-        }
-        if let Ok(mut w) = watchers().lock() {
-            w.remove(&zone_id);
         }
     });
 }
@@ -904,5 +975,263 @@ mod temps_upnp_3971_tests {
                 "un Seek UPnP refusé a modifié la position (#3971)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod enchainement_upnp_3967_tests {
+    use super::*;
+
+    /// Enveloppe SOAP réelle, telle qu'un point de contrôle l'émet.
+    fn enveloppe(action: &str, corps: &str) -> String {
+        format!(
+            r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:{action} xmlns:u="urn:schemas-upnp-org:service:AVTransport:1"><InstanceID>0</InstanceID>{corps}</u:{action}></s:Body></s:Envelope>"#
+        )
+    }
+
+    /// Passe la commande par la ROUTE réelle (`avtransport_control`) et rend le
+    /// corps XML servi. Rien n'est construit à la main côté session : c'est le
+    /// parseur et le handler de production qui posent l'URI et la suivante.
+    async fn commande(state: &AppState, zone_id: i64, action: &str, corps: &str) -> String {
+        let reponse = avtransport_control(
+            State(state.clone()),
+            Path(zone_id),
+            enveloppe(action, corps),
+        )
+        .await;
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&octets).to_string()
+    }
+
+    fn suivante_posee(zone_id: i64) -> Option<String> {
+        sessions().lock().ok().and_then(|s| {
+            s.get(&zone_id)
+                .and_then(|x| x.next.as_ref().map(|n| n.uri.clone()))
+        })
+    }
+
+    fn watcher_arme(zone_id: i64) -> bool {
+        watchers()
+            .lock()
+            .map(|w| w.contains(&zone_id))
+            .unwrap_or(false)
+    }
+
+    /// 🔴 #3967 — une suivante posée pendant la promotion restait SANS watcher,
+    /// et la chaîne s'arrêtait après la piste promue.
+    ///
+    /// `sessions()` et `watchers()` sont des statiques de PROCESSUS, partagées
+    /// par tout le binaire de tests de `tune-server`. On écarte donc nos zones
+    /// de la plage basse (la zone 1 sert déjà à `temps_upnp_3971_tests`) en
+    /// créant quelques zones de garde, et tout ce témoin tient dans UN seul
+    /// `#[tokio::test]` — deux témoins parallèles se marcheraient dessus.
+    #[tokio::test]
+    async fn une_suivante_posee_pendant_la_promotion_garde_son_watcher() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        // Zones de garde : on ne veut ni la 1 ni la 2.
+        let _ = repo.create("garde 1", None, None).unwrap();
+        let _ = repo.create("garde 2", None, None).unwrap();
+        let zone_avec = repo.create("avec suivante", None, None).unwrap();
+        let zone_sans = repo.create("sans suivante", None, None).unwrap();
+        let zone_remplacee = repo.create("suivante remplacee", None, None).unwrap();
+        for id in [zone_avec, zone_sans, zone_remplacee] {
+            reglages
+                .set(&format!("zone_{id}_upnp_renderer"), "true")
+                .unwrap();
+        }
+
+        // ── Cas 1 : le point de contrôle POSE une suivante ────────────────
+        commande(
+            &state,
+            zone_avec,
+            "SetAVTransportURI",
+            "<CurrentURI>http://cp/piste-1.flac</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+        )
+        .await;
+        commande(
+            &state,
+            zone_avec,
+            "SetNextAVTransportURI",
+            "<NextURI>http://cp/piste-2.flac</NextURI><NextURIMetaData></NextURIMetaData>",
+        )
+        .await;
+        assert_eq!(
+            suivante_posee(zone_avec).as_deref(),
+            Some("http://cp/piste-2.flac"),
+            "la route SOAP réelle doit avoir posé la suivante"
+        );
+        assert!(
+            watcher_arme(zone_avec),
+            "poser une suivante doit armer un watcher d'enchaînement"
+        );
+
+        // Le point du défaut. Le watcher sort de sa boucle après la promotion
+        // de la piste 2 ; pendant l'`await` de ce `play()`, le point de
+        // contrôle a posé la piste 3 — c'est ce que fait BubbleUPnP sur un
+        // album. `try_release_watcher` est la fonction que le watcher appelle
+        // RÉELLEMENT pour se retirer : elle doit REFUSER tant qu'une suivante
+        // attend, sinon la piste 3 reste orpheline et l'album s'arrête.
+        assert!(
+            !try_release_watcher(zone_avec),
+            "#3967 : le watcher s'est retiré alors qu'une suivante attendait — \
+             plus personne pour l'enchaîner, l'album s'arrête là"
+        );
+        assert!(
+            watcher_arme(zone_avec),
+            "#3967 : refuser la libération doit LAISSER la zone dans `watchers`"
+        );
+
+        // ── Cas 2 : le point de contrôle NE pose PAS de suivante ──────────
+        // Le pendant entrant de « ne pas envoyer une commande optionnelle à un
+        // appareil qui ne l'annonce pas » : sans `SetNextAVTransportURI`, aucun
+        // watcher ne tourne, donc aucun enchaînement ne peut être inventé.
+        commande(
+            &state,
+            zone_sans,
+            "SetAVTransportURI",
+            "<CurrentURI>http://cp/seule.flac</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+        )
+        .await;
+        assert_eq!(
+            suivante_posee(zone_sans),
+            None,
+            "aucune suivante ne doit exister sans SetNextAVTransportURI"
+        );
+        assert!(
+            !watcher_arme(zone_sans),
+            "aucun watcher ne doit être armé sans SetNextAVTransportURI : \
+             enchaîner de nous-mêmes serait une surprise, pas du gapless"
+        );
+        assert!(
+            try_release_watcher(zone_sans),
+            "sans rien en attente, la libération doit être accordée — sinon le \
+             watcher tournerait pour toujours"
+        );
+
+        // Contre-épreuve sur la zone 1 : un Stop COMMANDÉ efface la suivante
+        // (chemin SOAP réel), et la libération doit alors être accordée.
+        commande(&state, zone_avec, "Stop", "").await;
+        assert_eq!(
+            suivante_posee(zone_avec),
+            None,
+            "un Stop commandé doit effacer la suivante (#1766)"
+        );
+        assert!(
+            try_release_watcher(zone_avec),
+            "une fois la suivante effacée, le watcher doit pouvoir se retirer"
+        );
+        assert!(
+            !watcher_arme(zone_avec),
+            "la libération accordée doit retirer la zone de `watchers`"
+        );
+
+        // ── Cas 3 : suivante REMPLACÉE — ne pas démarrer l'élément périmé ──
+        commande(
+            &state,
+            zone_remplacee,
+            "SetAVTransportURI",
+            "<CurrentURI>http://cp/a.flac</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>",
+        )
+        .await;
+        commande(
+            &state,
+            zone_remplacee,
+            "SetNextAVTransportURI",
+            "<NextURI>http://cp/perimee.flac</NextURI><NextURIMetaData></NextURIMetaData>",
+        )
+        .await;
+        // Le remplacement arrive pendant que le watcher attend l'état de
+        // transport, donc APRÈS qu'il a cloné la suivante périmée.
+        commande(
+            &state,
+            zone_remplacee,
+            "SetNextAVTransportURI",
+            "<NextURI>http://cp/voulue.flac</NextURI><NextURIMetaData></NextURIMetaData>",
+        )
+        .await;
+        let promue = promouvoir_la_suivante(zone_remplacee).expect("une suivante attendait");
+        assert_eq!(
+            promue.uri, "http://cp/voulue.flac",
+            "#3967 : la promotion a démarré l'élément PÉRIMÉ au lieu du \
+             remplacement — « do not start a stale item »"
+        );
+        let courante = sessions().lock().ok().and_then(|s| {
+            s.get(&zone_remplacee)
+                .map(|x| (x.uri.clone(), x.next.is_some()))
+        });
+        assert_eq!(
+            courante,
+            Some(("http://cp/voulue.flac".to_string(), false)),
+            "la piste promue doit devenir la courante, et la suivante être \
+             consommée — sinon le watcher la rejouerait au tour d'après"
+        );
+
+        // Et la promotion d'une zone sans suivante ne doit rien inventer.
+        assert!(
+            promouvoir_la_suivante(zone_sans).is_none(),
+            "sans suivante posée, la promotion ne doit rien rendre"
+        );
+    }
+
+    /// Le watcher passe-t-il encore par ces deux décisions ?
+    ///
+    /// Sans cette garde, le témoin ci-dessus testerait des fonctions que plus
+    /// personne n'appelle — un vert qui ne garde rien. On cherche les APPELS,
+    /// pas le nom : `fn try_release_watcher(` contient la sous-chaîne et
+    /// suffirait à satisfaire un `contains` naïf.
+    #[test]
+    fn le_watcher_passe_bien_par_les_deux_decisions() {
+        let source = include_str!("upnp_media_renderer.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]")
+            .expect("le module de tests doit exister")];
+        let appels = |nom: &str| {
+            production
+                .lines()
+                .filter(|l| l.contains(nom) && !l.trim_start().starts_with("fn "))
+                .count()
+        };
+        assert!(
+            appels("try_release_watcher(") >= 2,
+            "les DEUX sorties de la boucle du watcher doivent passer par \
+             `try_release_watcher` : une sortie inconditionnelle laisserait une \
+             suivante orpheline (#3967).\nappels hors définition : {}",
+            appels("try_release_watcher(")
+        );
+        assert!(
+            appels("promouvoir_la_suivante(") >= 1,
+            "la promotion doit passer par `promouvoir_la_suivante` : relire la \
+             suivante sous le verrou est ce qui évite de démarrer l'élément \
+             périmé (#3967)."
+        );
+
+        // Le retrait du watcher ne doit exister QU'À un seul endroit : dans
+        // `try_release_watcher`, sous condition. C'est exactement le retrait
+        // inconditionnel de fin de boucle qui était le défaut.
+        assert_eq!(
+            production.matches("w.remove(&zone_id)").count(),
+            1,
+            "`watchers` ne doit être purgé que par `try_release_watcher` : \
+             tout autre retrait rouvre la course de #3967."
+        );
+
+        // Et la boucle ne doit plus s'arrêter après UNE promotion.
+        let debut = production
+            .find("fn spawn_gapless_watcher(")
+            .expect("le watcher doit exister");
+        let fin = production
+            .find("/// Annonceur SSDP des renderers")
+            .expect("l'annonceur doit suivre le watcher");
+        let corps = &production[debut..fin];
+        assert!(
+            !corps.contains("break"),
+            "la boucle du watcher ne doit plus contenir de `break` : elle \
+             s'arrêtait après une seule promotion, et la piste suivante posée \
+             entre-temps restait sans personne (#3967)."
+        );
     }
 }
