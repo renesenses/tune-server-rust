@@ -1036,10 +1036,30 @@ pub(super) async fn track_waveform(
 
 /// Combien de pistes accumulées avant d'écrire le magasin étendu.
 ///
-/// Écrire piste par piste ferait une transaction par fichier sur une
-/// bibliothèque de dizaines de milliers d'entrées ; tout garder en mémoire
-/// jusqu'à la fin ferait perdre la passe entière à la moindre interruption.
+/// Borne le tampon avant écriture. set_batch_multi effectue des upserts
+/// successifs, sans transaction de lot ; un refus peut laisser des champs
+/// déjà écrits et empêche de déduire un nombre de pistes en échec.
 const LOT_METADONNEES_ETENDUES: usize = 500;
+
+/// Écrit une fois le lot, conserve les écritures partielles et retourne
+/// exactement un refus de lot, sans le convertir en nombre de pistes (#4420).
+fn ecrire_lot_etendu(
+    repo: &TrackMetadataRepo,
+    lot: &mut Vec<(i64, std::collections::HashMap<String, String>)>,
+) -> usize {
+    if lot.is_empty() {
+        return 0;
+    }
+    let refus = match repo.set_batch_multi(lot) {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "rescan_extended_metadata_insert_failed");
+            1
+        }
+    };
+    lot.clear();
+    refus
+}
 
 /// POST /api/v1/library/rescan-metadata
 ///
@@ -1099,6 +1119,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             let mut updated = 0usize;
             let mut skipped = 0usize;
             let mut errors = 0usize;
+            let mut extended_metadata_failed_batches = 0usize;
             taches.update_progress(TACHE_RESCAN_METADATA, 0, total as u64, "Métadonnées");
 
             for track in tracks {
@@ -1148,10 +1169,8 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                     }
                 }
                 if etendues.len() >= LOT_METADONNEES_ETENDUES {
-                    if let Err(e) = meta_repo.set_batch_multi(&etendues) {
-                        tracing::warn!(error = %e, "rescan_extended_metadata_insert_failed");
-                    }
-                    etendues.clear();
+                    extended_metadata_failed_batches +=
+                        ecrire_lot_etendu(&meta_repo, &mut etendues);
                 }
 
                 let Some(meta) = tune_core::metadata::read_metadata(path) else {
@@ -1174,10 +1193,8 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             // Le reliquat : sans lui, une bibliothèque de moins de
             // LOT_METADONNEES_ETENDUES pistes n'écrirait jamais rien.
             if !etendues.is_empty() {
-                if let Err(e) = meta_repo.set_batch_multi(&etendues) {
-                    tracing::warn!(error = %e, "rescan_extended_metadata_insert_failed");
-                }
-                etendues.clear();
+                extended_metadata_failed_batches +=
+                    ecrire_lot_etendu(&meta_repo, &mut etendues);
             }
 
             // Refresh album genre/quality from their tracks
@@ -1192,31 +1209,28 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             )
             .ok();
 
+            // errors compte toujours les pistes et sert à l'avancement.
+            // Un lot étendu peut être partiellement écrit : ne pas additionner
+            // ses candidats aux erreurs de pistes. Les deux sorties exposent
+            // le même bilan, y compris ces refus auparavant seulement journalisés.
+            let has_errors = errors > 0 || extended_metadata_failed_batches > 0;
+            let bilan = serde_json::json!({
+                "total": total,
+                "updated": updated,
+                "skipped": skipped,
+                "errors": errors,
+                "extended_metadata_failed_batches": extended_metadata_failed_batches,
+                "has_errors": has_errors,
+            });
             settings.set("rescan_metadata_status", "idle").ok();
-            settings
-                .set(
-                    "rescan_metadata_result",
-                    &serde_json::json!({
-                        "total": total,
-                        "updated": updated,
-                        "skipped": skipped,
-                        "errors": errors,
-                    })
-                    .to_string(),
-                )
-                .ok();
+            settings.set("rescan_metadata_result", &bilan.to_string()).ok();
 
-            tracing::info!(total, updated, skipped, errors, "rescan_metadata_complete");
-
-            event_bus.emit(
-                "library.rescan_metadata.completed",
-                serde_json::json!({
-                    "total": total,
-                    "updated": updated,
-                    "skipped": skipped,
-                    "errors": errors,
-                }),
+            tracing::info!(
+                total, updated, skipped, errors, extended_metadata_failed_batches,
+                has_errors, "rescan_metadata_complete"
             );
+
+            event_bus.emit("library.rescan_metadata.completed", bilan);
         })
         .await;
 
@@ -2724,3 +2738,7 @@ mod magasin_etendu_relu_par_la_passe_3816 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "rescan_metadata_errors_3816.rs"]
+mod rescan_metadata_errors_3816;
