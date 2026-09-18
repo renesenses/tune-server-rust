@@ -295,8 +295,17 @@ pub(super) fn disambiguate_display_name(
 /// Puits nuls d'ALSA, qui ne produisent aucun son. Écartés à la découverte
 /// **et** à la résolution : les deux doivent voir exactement la même liste,
 /// faute de quoi les rangs `(n)` qu'elles calculent peuvent diverger.
-pub(super) fn is_null_sink(raw_name: &str) -> bool {
-    raw_name.contains("Discard all samples") || raw_name.contains("Dummy")
+///
+/// 🔴 La règle a changé le 18/09/2026. Elle lisait la DESCRIPTION
+/// (`contains("Discard all samples")`), c'est-à-dire le texte libre
+/// d'`alsa-lib` — le même texte qui s'est retrouvé affiché comme NOM de zone
+/// sur le `.18`. Elle lit désormais le nom de PCM porté par `endpoint_id` :
+/// `null`, et la carte `Dummy` du module noyau `snd-dummy`. La décision, ses
+/// deux sens et ses épreuves vivent dans
+/// [`crate::outputs::pseudo_peripherique_alsa`], hors de la feature
+/// `local-audio` — sans quoi aucune porte de CI ne les jouerait.
+pub(super) fn is_null_sink(endpoint_id: &str, raw_name: &str) -> bool {
+    crate::outputs::pseudo_peripherique_alsa::est_un_puits(endpoint_id, raw_name)
 }
 
 /// Le nom demandé porte-t-il un suffixe de rang `(n)` posé par la découverte ?
@@ -370,7 +379,7 @@ pub(super) fn find_device_with_fallback(
             };
             (device, identity)
         })
-        .filter(|(_, identity)| !is_null_sink(&identity.raw_name))
+        .filter(|(_, identity)| !is_null_sink(&identity.endpoint_id, &identity.raw_name))
         .unzip();
 
     let resolution = resolve_device(
@@ -602,14 +611,7 @@ pub fn sample_rate_evidence(backend: &str) -> SampleRateEvidence {
 /// (`hw:CARD=…`, `dmix:CARD=…`). On ne retire donc QUE le préfixe d'hôte, et
 /// seulement s'il est présent : certains enregistrements ne portent que le PCM.
 pub(super) fn alsa_pcm_name(endpoint_id: &str) -> &str {
-    let Some((tete, reste)) = endpoint_id.split_once(':') else {
-        return endpoint_id;
-    };
-    if tete.eq_ignore_ascii_case("alsa") {
-        reste
-    } else {
-        endpoint_id
-    }
+    crate::outputs::pseudo_peripherique_alsa::pcm_alsa(endpoint_id)
 }
 
 /// Ce PCM ALSA parle-t-il au MATÉRIEL, ou à un convertisseur logiciel ?
