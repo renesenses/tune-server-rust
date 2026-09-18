@@ -118,6 +118,7 @@ impl StreamingService for ServiceDeBanc {
                 track_number: Some(1),
                 disc_number: Some(1),
                 explicit: false,
+                disponible: None,
                 quality: None,
                 isrc: None,
                 composer: None,
