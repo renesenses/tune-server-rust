@@ -4158,9 +4158,7 @@ async fn do_transfer(
     let source_position_ms = current.position_ms.max(0) as u64;
     let source_paused = current.state == tune_core::playback::PlayState::Paused;
 
-    // Transfer now-playing and playback state
     let np = current.now_playing.unwrap();
-    state.playback.play(target_zone, np).await;
     let target_db_zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(target_zone)
         .ok()
@@ -4180,6 +4178,17 @@ async fn do_transfer(
 
     // Start playback on the target device via the orchestrator if a device is assigned
     let target_device = target_db_zone.and_then(|z| z.output_device_id);
+    if target_device.is_none() {
+        // Zone sans appareil côté serveur (navigateur) : c'est l'état qui porte
+        // la lecture, le client la reprend de là.
+        state.playback.play(target_zone, np).await;
+    }
+    // 🔴 L'état de la cible n'est PAS posé avant l'orchestrateur quand un
+    // appareil l'attend. `playback.play` la marquait « en lecture » sur le même
+    // morceau, à l'instant : `orchestrator.play` y voyait un second appui dans
+    // `RETAP_DEDUP_WINDOW` et rendait la main sans rien envoyer
+    // (`orchestrator_play_retap_deduped_same_inflight_track`). Mesuré sur la .18
+    // le 17/09/2026 : Eversolo → Décodeur TV, rien sur la cible, source arrêtée.
     if let Some(ref did) = target_device {
         match state
             .orchestrator
