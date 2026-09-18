@@ -1814,6 +1814,7 @@ impl QobuzService {
                 channels: 2,
             },
             expires_at: None,
+            headers: Vec::new(),
         })
     }
 

@@ -69,6 +69,21 @@ struct TranscodageEnTache {
     use_http_range: bool,
 }
 
+/// Rejoue sur une requête les en-têtes rendus par le résolveur (#4366).
+///
+/// Fonction plutôt que méthode : elle est appelée dans un `spawn_blocking`, et
+/// une paire `(nom, valeur)` vide laisse la requête EXACTEMENT telle qu'elle
+/// était — c'est ce qui garantit que les autres services ne changent pas.
+fn rejouer_les_entetes(
+    mut requete: reqwest::blocking::RequestBuilder,
+    entetes: &[(String, String)],
+) -> reqwest::blocking::RequestBuilder {
+    for (nom, valeur) in entetes {
+        requete = requete.header(nom, valeur);
+    }
+    requete
+}
+
 impl PlaybackOrchestrator {
     /// Crée le flux WAV éphémère demandé par un renderer qui parcourt les
     /// radios du MediaServer.
@@ -1583,7 +1598,13 @@ impl PlaybackOrchestrator {
             // au contrat rendu honnête en 0.9.106 — démarre dès les
             // premiers blocs décodés. Seul le téléchargement du fichier
             // AAC reste devant le play : quelques secondes.
+            // #4366 — l'URL est résolue par un processus (yt-dlp) et
+            // consommée ici par un autre client HTTP. Sans rejouer les en-têtes
+            // du format, `googlevideo` refuse en 403 : mesuré chez FabienM,
+            // URL rendue en 2 s, GET nu refusé en 36 ms. La liste est vide pour
+            // tout service qui n'en fournit pas — rien ne change ailleurs.
             let upstream_url = stream_data.url.clone();
+            let upstream_headers = stream_data.headers.clone();
             let codec = codec_lower.clone();
             let tmp_dl = std::env::temp_dir()
                 .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
@@ -1594,7 +1615,9 @@ impl PlaybackOrchestrator {
                 let resp = crate::http::client::blocking_builder()
                     .timeout(std::time::Duration::from_secs(120))
                     .build()
-                    .and_then(|c| c.get(&upstream_url).send())
+                    .and_then(|c| {
+                        rejouer_les_entetes(c.get(&upstream_url), &upstream_headers).send()
+                    })
                     .map_err(|e| format!("upstream fetch: {e}"))?;
                 if !resp.status().is_success() {
                     return Err(format!("upstream HTTP {}", resp.status()));
@@ -1793,6 +1816,9 @@ impl PlaybackOrchestrator {
                 );
 
                 let upstream_url = stream_data.url.clone();
+                // #4366 — même rejeu qu'au canal AAC : ce chemin télécharge la
+                // même URL, il tomberait sur le même 403.
+                let upstream_headers = stream_data.headers.clone();
                 let tmp_dl = std::env::temp_dir()
                     .join(format!(
                         "tune-stream-{}.{}",
@@ -1820,7 +1846,9 @@ impl PlaybackOrchestrator {
                     let resp = crate::http::client::blocking_builder()
                         .timeout(std::time::Duration::from_secs(120))
                         .build()
-                        .and_then(|c| c.get(&upstream_url).send())
+                        .and_then(|c| {
+                            rejouer_les_entetes(c.get(&upstream_url), &upstream_headers).send()
+                        })
                         .map_err(|e| format!("upstream fetch: {e}"))?;
                     if !resp.status().is_success() {
                         return Err(format!("upstream HTTP {}", resp.status()));
