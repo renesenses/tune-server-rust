@@ -1843,7 +1843,7 @@ fn parse_res_elements(element: &str) -> Vec<DidlRes> {
         let Some(close_rel) = element[tag_end..].find("</res>") else {
             break;
         };
-        let url = element[tag_end + 1..tag_end + close_rel].trim().to_string();
+        let url = texte_didl(element[tag_end + 1..tag_end + close_rel].trim());
         if !url.is_empty() {
             out.push(DidlRes {
                 url,
@@ -1979,6 +1979,27 @@ fn extract_attr(element: &str, name: &str) -> Option<String> {
     Some(element[start..end].to_string())
 }
 
+/// Le texte d'un nœud DIDL, ses entités rendues à leur caractère.
+///
+/// 🔴 Le DIDL arrive ÉCHAPPÉ DEUX FOIS, et n'était désechappé qu'une.
+/// `parse_didl_browse_response` désechappe le contenu de `<Result>` pour
+/// obtenir le document DIDL ; dans CE document, les textes portent encore
+/// leur propre échappement. « Polo &amp;amp; Pan » devenait donc
+/// « Polo &amp;amp; Pan » → « Polo &amp; Pan », affiché tel quel sous la
+/// pochette (Bertrand, .18, 17/09/2026, capture à l'appui).
+///
+/// Une URL `<res>` souffre du même mal : `…?id=1&amp;type=flac` désigne une
+/// autre ressource que `…?id=1&type=flac` — celle-là, le serveur ne la
+/// connaît pas.
+///
+/// `unescape` échoue sur une entité inconnue (`&toto;`) : on rend alors le
+/// texte tel quel, plutôt que rien.
+fn texte_didl(brut: &str) -> String {
+    quick_xml::escape::unescape(brut)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| brut.to_string())
+}
+
 fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
     let open_full = format!("<{tag}>");
     let open_attr = format!("<{tag} ");
@@ -1992,7 +2013,7 @@ fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
         return None;
     };
     let content_end = element[content_start..].find(&close)? + content_start;
-    Some(element[content_start..content_end].to_string())
+    Some(texte_didl(&element[content_start..content_end]))
 }
 
 #[derive(Deserialize)]
@@ -2191,6 +2212,41 @@ mod tests {
             Some("Moby"),
             "dc:creator doit survivre jusqu'au JSON du conteneur"
         );
+    }
+
+    /// 🔴 Le DIDL est échappé DEUX fois, et n'était désechappé qu'une.
+    ///
+    /// Bertrand, .18, 17/09/2026, capture à l'appui : « Polo &amp; Pan »
+    /// s'affichait sous la pochette de *Canopée*, artiste et barre de lecture
+    /// comprises. Le contenu de `<Result>` est désechappé pour obtenir le
+    /// document DIDL ; les TEXTES de ce document portent encore le leur.
+    ///
+    /// L'URL `<res>` souffrait du même mal, et c'est plus grave qu'un
+    /// affichage : `…?id=1&amp;amp;type=flac` désigne une ressource que le
+    /// serveur ne connaît pas.
+    #[test]
+    fn les_entites_du_didl_sont_rendues_a_leur_caractere() {
+        let soap = format!(
+            "<Envelope><Body><BrowseResponse><Result>{}</Result></BrowseResponse></Body></Envelope>",
+            xml_escape(
+                r#"<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/"><item id="42" parentID="7" restricted="1"><dc:title>Canop&#233;e</dc:title><upnp:artist>Polo &amp; Pan</upnp:artist><upnp:album>Caravelle</upnp:album><res protocolInfo="http-get:*:audio/flac:*" duration="0:04:36">http://192.168.1.19:9000/stream?id=1&amp;type=flac</res></item></DIDL-Lite>"#
+            )
+        );
+        let (_containers, items) = parse_didl_browse_response(&soap);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]["artist"].as_str(),
+            Some("Polo & Pan"),
+            "l'esperluette doit redevenir une esperluette — sans le correctif : « Polo &amp; Pan »"
+        );
+        assert_eq!(items[0]["title"].as_str(), Some("Canopée"));
+        assert_eq!(
+            items[0]["res_url"].as_str(),
+            Some("http://192.168.1.19:9000/stream?id=1&type=flac"),
+            "une URL mal désechappée désigne une ressource qui n'existe pas"
+        );
+        // Témoin : un texte sans entité traverse inchangé.
+        assert_eq!(items[0]["album"].as_str(), Some("Caravelle"));
     }
 
     #[test]
