@@ -177,6 +177,7 @@ impl StreamingService for ServiceFactice {
             mime_type: MIME.into(),
             quality: Self::qualite(),
             expires_at: None,
+            headers: Vec::new(),
         })
     }
 

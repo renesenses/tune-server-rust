@@ -398,6 +398,7 @@ impl StreamingService for BandcampService {
             mime_type: "audio/mpeg".into(),
             quality: qualite_bandcamp(),
             expires_at: None,
+            headers: Vec::new(),
         })
     }
 

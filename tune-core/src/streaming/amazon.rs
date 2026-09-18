@@ -438,6 +438,7 @@ impl StreamingService for AmazonMusicService {
                     channels: 2,
                 },
                 expires_at: None,
+                headers: Vec::new(),
             });
         }
 
@@ -498,6 +499,7 @@ impl StreamingService for AmazonMusicService {
                 channels: 2,
             },
             expires_at: None,
+            headers: Vec::new(),
         })
     }
 

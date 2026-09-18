@@ -140,9 +140,49 @@ struct PendingDeviceAuth {
 }
 
 /// Cached stream URL entry.
-#[derive(Clone)]
+/// Une URL de flux et les en-têtes HTTP qui la rendent servable (#4366).
+#[derive(Debug, Clone)]
+pub(crate) struct FluxYoutube {
+    pub(crate) url: String,
+    pub(crate) headers: Vec<(String, String)>,
+}
+
+/// Lit la sortie de `yt-dlp --print "%(urls)s" --print "%(http_headers)j"`.
+///
+/// Deux lignes attendues : l'URL, puis un objet JSON d'en-têtes. On ne se fie
+/// pas à l'ORDRE — une version de yt-dlp qui inverserait les deux, ou qui
+/// n'imprimerait pas les en-têtes (option absente), ne doit pas faire perdre
+/// l'URL. Une ligne qui commence par `{` est lue comme les en-têtes ; la
+/// première ligne restante non vide est l'URL.
+///
+/// `None` seulement s'il n'y a aucune URL : c'est le seul cas d'échec, les
+/// en-têtes étant un bonus.
+pub(crate) fn analyser_sortie_ytdlp(brut: &str) -> Option<FluxYoutube> {
+    let mut url = None;
+    let mut headers = Vec::new();
+    for ligne in brut.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if ligne.starts_with('{') {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(ligne) {
+                headers = map
+                    .into_iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                    // `Accept-Encoding` rejoué tel quel ferait promettre au
+                    // serveur un encodage que notre client ne négocie pas.
+                    .filter(|(k, _)| !k.eq_ignore_ascii_case("accept-encoding"))
+                    .collect();
+            }
+        } else if url.is_none() {
+            url = Some(ligne.to_string());
+        }
+    }
+    url.map(|url| FluxYoutube { url, headers })
+}
+
 struct CachedUrl {
     url: String,
+    /// #4366 — les en-têtes voyagent AVEC l'URL, sinon un simple succès de
+    /// cache les perdrait et le 403 reviendrait une lecture sur deux.
+    headers: Vec<(String, String)>,
     created: Instant,
 }
 
@@ -669,7 +709,13 @@ impl YouTubeService {
     ///
     /// Used when native `/player` API extraction fails (e.g., geo-restricted
     /// content, age-gated videos). Requires `yt-dlp` installed on PATH.
-    async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<String, String> {
+    /// Ce que yt-dlp rend : l'URL, et les en-têtes qui vont avec.
+    ///
+    /// #4366 — `--get-url` ne rendait que l'URL. Le format choisi porte aussi
+    /// un `http_headers` (User-Agent en tête), et l'URL `googlevideo` est
+    /// servie à qui les rejoue. Les demander coûte un `--print` de plus, sur
+    /// le même appel.
+    async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<FluxYoutube, String> {
         // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
         // playback" button). None means the user hasn't enabled it yet.
         let ytdlp = crate::ytdlp::binary().ok_or_else(|| {
@@ -692,7 +738,11 @@ impl YouTubeService {
                     // only covers the first segment ~50s), then anything.
                     "-f",
                     "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio",
-                    "--get-url",
+                    // Deux lignes en sortie : l'URL, puis ses en-têtes en JSON.
+                    "--print",
+                    "%(urls)s",
+                    "--print",
+                    "%(http_headers)j",
                     "--no-playlist",
                     "--no-warnings",
                     "-q",
@@ -716,17 +766,19 @@ impl YouTubeService {
             return Err(format!("yt-dlp failed for {track_id}: {stderr}"));
         }
 
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        if url.is_empty() {
-            return Err(format!("yt-dlp returned empty URL for {track_id}"));
-        }
-
-        Ok(url)
+        let brut = String::from_utf8_lossy(&output.stdout);
+        let flux = analyser_sortie_ytdlp(&brut)
+            .ok_or_else(|| format!("yt-dlp returned empty URL for {track_id}"))?;
+        info!(
+            track_id,
+            entetes = flux.headers.len(),
+            "ytdlp_url_et_entetes_resolues"
+        );
+        Ok(flux)
     }
 
     /// Extract audio stream URL with native API as primary + yt-dlp fallback.
-    async fn extract_audio_url(&self, track_id: &str) -> Result<String, String> {
+    async fn extract_audio_url(&self, track_id: &str) -> Result<FluxYoutube, String> {
         // Bypass is useful only when the fallback actually exists. Without the
         // managed helper, always retain the chance that this particular track
         // still works through InnerTube.
@@ -752,7 +804,12 @@ impl YouTubeService {
             match self.extract_audio_url_native(track_id).await {
                 Ok(url) => {
                     self.native_extraction_circuit.lock().await.record_success();
-                    return Ok(url);
+                    // Chemin natif : l'URL est signée pour NOTRE client, il n'y
+                    // a rien à rejouer.
+                    return Ok(FluxYoutube {
+                        url,
+                        headers: Vec::new(),
+                    });
                 }
                 Err(e) => {
                     self.native_extraction_circuit
@@ -2681,6 +2738,7 @@ impl StreamingService for YouTubeService {
             if let Some(cached) = cache.get(track_id) {
                 debug!(track_id, "youtube_stream_url_cached");
                 let (mime_type, codec) = youtube_mime_codec(&cached.url);
+                let entetes = cached.headers.clone();
                 return Ok(StreamUrl {
                     url: cached.url.clone(),
                     mime_type: mime_type.into(),
@@ -2692,12 +2750,13 @@ impl StreamingService for YouTubeService {
                         channels: 2,
                     },
                     expires_at: None,
+                    headers: entetes,
                 });
             }
         }
 
         // Extract via native API (primary) + yt-dlp (fallback)
-        let url = self
+        let FluxYoutube { url, headers } = self
             .extract_audio_url(track_id)
             .await
             .map_err(|e| TuneError::Streaming(e))?;
@@ -2715,12 +2774,19 @@ impl StreamingService for YouTubeService {
                 track_id.to_string(),
                 CachedUrl {
                     url: url.clone(),
+                    headers: headers.clone(),
                     created: Instant::now(),
                 },
             );
         }
 
-        info!(track_id, mime_type, codec, "youtube_stream_url_resolved");
+        info!(
+            track_id,
+            mime_type,
+            codec,
+            entetes = headers.len(),
+            "youtube_stream_url_resolved"
+        );
 
         Ok(StreamUrl {
             url,
@@ -2733,6 +2799,7 @@ impl StreamingService for YouTubeService {
                 channels: 2,
             },
             expires_at: None,
+            headers,
         })
     }
 
@@ -3491,6 +3558,52 @@ mod tests {
         assert!(!svc.is_authenticated());
     }
 
+    /// #4366 — FabienM, fil 1829 : `AAC download failed: upstream HTTP 403`.
+    /// yt-dlp rend l'URL ET les en-têtes du format ; les deux doivent arriver.
+    #[test]
+    fn la_sortie_ytdlp_rend_l_url_et_ses_entetes() {
+        let brut = "https://rr3---sn-x.googlevideo.com/videoplayback?expire=1\n                    {\"User-Agent\": \"Mozilla/5.0\", \"Origin\": \"https://www.youtube.com\"}\n";
+        let flux = analyser_sortie_ytdlp(brut).expect("une URL");
+        assert!(flux.url.starts_with("https://rr3---sn-x.googlevideo.com/"));
+        assert_eq!(
+            flux.headers,
+            vec![
+                ("Origin".to_string(), "https://www.youtube.com".to_string()),
+                ("User-Agent".to_string(), "Mozilla/5.0".to_string()),
+            ],
+            "les en-têtes sont rendus triés par le JSON, peu importe l'ordre d'écriture"
+        );
+    }
+
+    /// L'ORDRE des deux lignes n'est pas un contrat de yt-dlp : inversées, on
+    /// doit toujours retrouver l'URL. Et sans ligne d'en-têtes — une version
+    /// qui ignorerait `%(http_headers)j` — l'URL seule suffit à jouer.
+    #[test]
+    fn l_url_survit_a_l_ordre_et_a_l_absence_d_entetes() {
+        let inverse = "{\"User-Agent\": \"Mozilla/5.0\"}\nhttps://exemple.invalide/a.m4a";
+        let flux = analyser_sortie_ytdlp(inverse).expect("une URL");
+        assert_eq!(flux.url, "https://exemple.invalide/a.m4a");
+        assert_eq!(flux.headers.len(), 1);
+
+        let sans = analyser_sortie_ytdlp("https://exemple.invalide/b.m4a\n").expect("une URL");
+        assert!(sans.headers.is_empty());
+
+        // Rien d'exploitable : c'est le SEUL cas d'échec.
+        assert!(analyser_sortie_ytdlp("   \n\n").is_none());
+    }
+
+    /// `Accept-Encoding` n'est pas rejoué : promettre au serveur un encodage
+    /// que notre client ne négocie pas rendrait un corps illisible.
+    #[test]
+    fn accept_encoding_n_est_pas_rejoue() {
+        let brut = "https://exemple.invalide/c.m4a\n                    {\"Accept-Encoding\": \"gzip, deflate, br\", \"User-Agent\": \"UA\"}";
+        let flux = analyser_sortie_ytdlp(brut).expect("une URL");
+        assert_eq!(
+            flux.headers,
+            vec![("User-Agent".to_string(), "UA".to_string())]
+        );
+    }
+
     #[test]
     fn url_cache_basic() {
         let mut cache = UrlCache::new(3600);
@@ -3499,6 +3612,7 @@ mod tests {
         cache.set(
             "abc".into(),
             CachedUrl {
+                headers: Vec::new(),
                 url: "https://example.com/stream".into(),
                 created: Instant::now(),
             },
@@ -3513,6 +3627,7 @@ mod tests {
         cache.set(
             "abc".into(),
             CachedUrl {
+                headers: Vec::new(),
                 url: "https://example.com/stream".into(),
                 created: Instant::now() - Duration::from_secs(1),
             },
