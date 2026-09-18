@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OpenFlags};
 use tracing::info;
 
+#[path = "sqlite_open_diagnostic.rs"]
+mod open_diagnostic;
+
 use crate::db::engine::{Engine, SqliteDialect};
 
 /// Number of read connections in the pool.
@@ -150,7 +153,7 @@ impl SqliteDb {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
 
         let conn = Connection::open_with_flags(path, flags)
-            .map_err(|e| format!("sqlite open {path}: {e}"))?;
+            .map_err(|e| open_diagnostic::describe(path, &e))?;
         conn.execute_batch(&pragmas)
             .map_err(|e| format!("pragma: {e}"))?;
         register_functions(&conn)?;
