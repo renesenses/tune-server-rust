@@ -1,7 +1,9 @@
 //! Identite et PSK longue duree, dans un magasin prive local.
 //!
 //! Le dossier est choisi par le serveur, sous son repertoire de donnees.
-//! Le verrou reste pris jusqu'au Drop. Ecrire/flusher un fichier temporaire,
+//! Le verrou est pris a l'ouverture et relache explicitement a la fin de la
+//! vie du magasin, avant meme la fermeture du descripteur (#4331).
+//! Ecrire/flusher un fichier temporaire,
 //! puis le renommer, evite de publier un document partiel. Une erreur d'ecriture
 //! rend l'instance inutilisable : apres un rename suivi d'un fsync en echec,
 //! seul un rechargement peut determiner l'etat reel du disque.
@@ -84,9 +86,29 @@ pub struct PairAppaire {
     pub methodes: BTreeSet<MethodeAppairage>,
 }
 
+/// Verrou exclusif du magasin, relache explicitement a la fin de sa vie.
+///
+/// `flock` appartient a la *description de fichier ouverte*, pas au descripteur.
+/// Un `fork()` concurrent -- n'importe quel `Command::spawn` lance par un autre
+/// fil du meme processus -- en duplique une copie dans l'enfant, et cette copie
+/// ne disparait qu'a l'`exec()`. Fermer notre seul descripteur ne relacherait
+/// donc rien pendant cette fenetre : rouvrir le magasin echouerait en `Occupe`
+/// alors qu'aucun autre magasin n'est reellement ouvert. `LOCK_UN` porte au
+/// contraire sur la description elle-meme et vaut pour toutes ses copies : la
+/// liberation devient immediate et independante de l'ordonnancement (#4331).
+struct Verrou(File);
+
+impl Drop for Verrou {
+    fn drop(&mut self) {
+        // Un echec ne laisse pas le magasin dans un etat pire que la fermeture
+        // seule, qui suit immediatement : rien a signaler ici.
+        let _ = self.0.unlock();
+    }
+}
+
 pub struct MagasinAppairage {
     dossier: PathBuf,
-    _verrou: File,
+    _verrou: Verrou,
     identite: Identite,
     document: Document,
     en_panne: bool,
@@ -120,7 +142,7 @@ impl MagasinAppairage {
         verifier_chemin(dossier, true)?;
         verifier_fichier_si_present(&dossier.join(VERROU))?;
         let mut options = options_privees();
-        let mut verrou = options
+        let verrou = options
             .read(true)
             .write(true)
             .create(true)
@@ -131,6 +153,9 @@ impl MagasinAppairage {
             fs::TryLockError::WouldBlock => ErreurMagasin::Occupe,
             fs::TryLockError::Error(e) => ErreurMagasin::Io(e),
         })?;
+        // Des que le verrou est pris il vit dans sa garde : les sorties en
+        // erreur de cette fonction le relachent alors elles aussi.
+        let mut verrou = Verrou(verrou);
 
         let chemin = dossier.join(FICHIER);
         verifier_fichier_si_present(&chemin)?;
@@ -146,7 +171,7 @@ impl MagasinAppairage {
                     .map_err(|_| ErreurMagasin::Invalide("document illisible"))?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if verrou.metadata()?.len() != 0 {
+                if verrou.0.metadata()?.len() != 0 {
                     return Err(ErreurMagasin::Invalide(
                         "document perdu apres initialisation",
                     ));
@@ -165,9 +190,9 @@ impl MagasinAppairage {
         document.verifier()?;
         // Le verrou contient aussi un marqueur durable d'initialisation.
         // Un JSON manquant ensuite n'est jamais interprete comme un premier boot.
-        if verrou.metadata()?.len() == 0 {
-            verrou.write_all(b"1")?;
-            verrou.sync_all()?;
+        if verrou.0.metadata()?.len() == 0 {
+            verrou.0.write_all(b"1")?;
+            verrou.0.sync_all()?;
             synchroniser_dossier(dossier)?;
         }
         // Le fsync du dossier rend ses fichiers durables ; celui du parent
