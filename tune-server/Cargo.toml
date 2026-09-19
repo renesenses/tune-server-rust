@@ -64,6 +64,9 @@ tune-plugin-declick = { path = "../sdk/tune-plugin-declick" }
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-http-types = { path = "../tune-http-types" }
+# #4473 — CatalogueDuRegistre implémente le trait asynchrone que
+# tune-smart-http déclare. Il était jusqu'ici en dépendance de TEST seulement.
+async-trait = { workspace = true }
 tune-smart-http = { path = "../tune-smart-http" }
 tune-stream-http = { path = "../tune-stream-http" }
 tune-streaming-http = { path = "../tune-streaming-http" }
