@@ -3766,12 +3766,12 @@ version = "3.0.0"
 dependencies = [
  "audioadapter",
  "audioadapter-buffers",
+ "libm",
  "num-complex",
  "num-integer",
  "num-traits",
  "realfft",
  "visibility",
- "windowfunctions",
 ]
 
 [[package]]
@@ -5212,7 +5212,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "axum",
@@ -5227,7 +5227,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "axum",
  "bytes",
@@ -5248,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5262,7 +5262,7 @@ dependencies = [
 
 [[package]]
 name = "tune-concerts"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "axum",
@@ -5275,7 +5275,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "aes-gcm",
  "ape-decoder",
@@ -5361,7 +5361,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "axum",
@@ -5373,7 +5373,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "axum",
  "serde_json",
@@ -5386,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "axum",
  "reqwest",
@@ -5397,7 +5397,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "axum",
@@ -5410,7 +5410,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "serde",
@@ -5488,7 +5488,7 @@ dependencies = [
 
 [[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5505,7 +5505,7 @@ dependencies = [
 
 [[package]]
 name = "tune-pont-roon"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "axum",
@@ -5520,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5581,7 +5581,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-trait",
  "axum",
@@ -5595,7 +5595,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-stream",
  "axum",
@@ -5611,7 +5611,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.157"
+version = "0.9.158"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -6248,15 +6248,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "windowfunctions"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90628d739333b7c5d2ee0b70210b97b8cddc38440c682c96fd9e2c24c2db5f3a"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]

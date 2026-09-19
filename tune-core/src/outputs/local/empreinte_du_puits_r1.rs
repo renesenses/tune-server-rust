@@ -24,6 +24,9 @@
 //! constantes en fin de fichier. Le 15/09, D3 (#4079) corrige la somme de
 //! normalisation du meme noyau : les deux empreintes sont remesurees apres
 //! les 83 temoins du banc independant, sans changer les comptes de trames.
+//! Le 19/09 (#4532), les deux mêmes sont remesurées PAR NOYAU de rubato, une
+//! fois la table rendue indépendante de la libm du système : voir le bloc de
+//! constantes.
 
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
@@ -224,11 +227,13 @@ fn le_puits_recoit_les_memes_octets_apres_reechantillonnage() {
         "le rééchantillonneur doit rendre du signal, pas du vide"
     );
     assert_eq!(
-        empreinte, EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000,
+        empreinte,
+        EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000.pour(noyau_de_rubato()),
         "le rééchantillonnage ne rend plus les mêmes octets que le relevé du \
-         15/09 : le noyau de `new_streaming_resampler` a changé. Si c'est \
-         voulu, c'est un changement de RENDU — il se mesure au banc T10 \
-         (`reechantillonnage_reference_2218.rs`) avant d'être acté ici"
+         19/09 pour le noyau {:?} : le noyau de `new_streaming_resampler` a \
+         changé. Si c'est voulu, c'est un changement de RENDU — il se mesure au \
+         banc T10 (`reechantillonnage_reference_2218.rs`) avant d'être acté ici",
+        noyau_de_rubato()
     );
 }
 
@@ -263,12 +268,15 @@ fn le_puits_recoit_les_memes_octets_apres_adaptation_puis_reechantillonnage() {
          l'ordre a changé"
     );
     assert_eq!(
-        empreinte, EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE,
+        empreinte,
+        EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE.pour(noyau_de_rubato()),
         "la chaîne complète — adaptation de canaux PUIS rééchantillonnage — ne \
-         rend plus les mêmes octets que le relevé du 15/09. Si l'ordre a été \
-         inversé, le rééchantillonneur reçoit deux canaux entrelacés là où il \
-         en attend un — mais le compte de mots ci-dessus l'aurait déjà dit. \
-         Sinon, c'est le noyau sinc qui a changé : voir le banc T10."
+         rend plus les mêmes octets que le relevé du 19/09 pour le noyau {:?}. \
+         Si l'ordre a été inversé, le rééchantillonneur reçoit deux canaux \
+         entrelacés là où il en attend un — mais le compte de mots ci-dessus \
+         l'aurait déjà dit. Sinon, c'est le noyau sinc qui a changé : voir le \
+         banc T10.",
+        noyau_de_rubato()
     );
 }
 
@@ -386,9 +394,101 @@ fn un_flux_coupe_en_deux_rend_la_meme_empreinte_qu_entier() {
 // independants RMS/DC et l'identite blocs/piste. Seules les deux empreintes
 // contenant du reechantillonnage changent ; le compte de 8 914 mots de la
 // chaine complete et les empreintes sans SRC restent inchanges.
+//
+// Relevé du 19/09 (#4532) : ces deux empreintes n'étaient vraies que sur
+// x86_64 Linux, et pour DEUX raisons distinctes.
+//
+// 1. La table des sincs dépendait de la libm DU SYSTÈME : `f32::sin` dans
+//    `rubato::sinc::sinc`, `f64::cos` dans la fenêtre. glibc, le CRT MSVC et la
+//    libm d'Apple ne rendent pas les mêmes derniers bits : même CPU AVX, la
+//    .42 (Windows) et Shrek (Linux) calculaient deux tables différentes, donc
+//    deux rendus. C'était un défaut du CODE, corrigé dans `vendor/rubato`
+//    (`libm`, Rust pur — voir TUNE-PATCH.md). La table est désormais la même,
+//    au bit près, sur Linux, Windows et macOS (mesuré sur les trois).
+//    Conséquence voulue et mesurée : le rendu Linux bouge au dernier bit f32,
+//    banc T10 rejoué vert ; l'ancienne valeur glibc était 0xf7ab_d26d_0d56_3951
+//    (rééchantillonnage) et 0xfff7_fe9f_cf74_84c6 (chaîne complète).
+//
+// 2. Rubato choisit son produit scalaire À L'EXÉCUTION selon le processeur :
+//    AVX+FMA (8 voies, multiplication-addition fusionnée), sinon SSE3 (4 voies)
+//    sur x86_64, NEON sur aarch64, scalaire (8 accumulateurs) ailleurs. Même
+//    table, autre ordre de sommation, autres derniers bits. Ce n'est pas un
+//    défaut : c'est le contrat de rubato. D'où UN relevé par noyau, choisi par
+//    la même détection que rubato ([`noyau_de_rubato`]).
+//
+// Provenance des relevés (19/09, Tune sur `batch/tests-windows-20260919`) :
+// - AVX+FMA : Shrek (Linux, Xeon E5-2630 v4) ET la .42 (Windows, Raptor Lake),
+//   identiques — c'est la preuve que la libm ne compte plus ;
+// - NEON : le Mac (Apple M1 Max, macOS) ;
+// - SSE3 : Shrek, rubato forcé temporairement sur son noyau SSE (aucune machine
+//   x86_64 sans AVX+FMA au banc) ;
+// - scalaire : Shrek ET le Mac, rubato forcé sur son noyau scalaire —
+//   identiques sur x86_64 et aarch64, seconde preuve que la table est portable.
 const EMPREINTE_IDENTITE_16_BITS_STEREO: u64 = 0x1433_8456_2279_0c63;
 const EMPREINTE_ADAPTATION_STEREO_VERS_MONO: u64 = 0x3557_16d1_b565_a7d6;
 // Était 0x4491_3fae_738e_a9ee avec le noyau 64 écrit à la main.
-const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: u64 = 0xf7ab_d26d_0d56_3951;
+const EMPREINTE_REECHANTILLONNAGE_44100_VERS_48000: RelevesParNoyau = RelevesParNoyau {
+    avx_fma: 13_845_619_951_895_521_272,
+    sse3: 12_081_719_003_251_702_559,
+    neon: 7_823_019_637_321_928_767,
+    scalaire: 8_691_608_775_236_771_879,
+};
 // Était 0x8c1c_f175_68c3_9aaa avec le noyau 64 écrit à la main.
-const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: u64 = 0xfff7_fe9f_cf74_84c6;
+const EMPREINTE_ADAPTATION_PUIS_REECHANTILLONNAGE: RelevesParNoyau = RelevesParNoyau {
+    avx_fma: 6_036_393_677_556_695_676,
+    sse3: 16_064_891_628_025_049_697,
+    neon: 5_446_340_049_408_367_490,
+    scalaire: 5_331_791_831_370_548_251,
+};
+
+/// Le produit scalaire que rubato retient pour ce processeur (#4532).
+///
+/// Même ordre de détection que `rubato::asynchro_sinc::make_interpolator` :
+/// AVX+FMA, puis SSE3 sur x86_64 ; NEON sur aarch64 ; scalaire sinon.
+// Selon l'architecture, une partie des noyaux n'est jamais construite.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum NoyauSinc {
+    AvxFma,
+    Sse3,
+    Neon,
+    Scalaire,
+}
+
+fn noyau_de_rubato() -> NoyauSinc {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma") {
+            return NoyauSinc::AvxFma;
+        }
+        if is_x86_feature_detected!("sse3") {
+            return NoyauSinc::Sse3;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            return NoyauSinc::Neon;
+        }
+    }
+    NoyauSinc::Scalaire
+}
+
+/// Un relevé d'empreinte par noyau de rubato — chacun MESURÉ, aucun déduit.
+struct RelevesParNoyau {
+    avx_fma: u64,
+    sse3: u64,
+    neon: u64,
+    scalaire: u64,
+}
+
+impl RelevesParNoyau {
+    fn pour(&self, noyau: NoyauSinc) -> u64 {
+        match noyau {
+            NoyauSinc::AvxFma => self.avx_fma,
+            NoyauSinc::Sse3 => self.sse3,
+            NoyauSinc::Neon => self.neon,
+            NoyauSinc::Scalaire => self.scalaire,
+        }
+    }
+}

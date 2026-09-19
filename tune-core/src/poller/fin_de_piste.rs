@@ -376,7 +376,15 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
         next_pos: i64,
     ) -> bool {
-        let mut attempt_pos = next_pos;
+        // #4362 (point 2) — les pistes d'un serveur multimédia ABSENT sont
+        // enjambées d'un coup, et dites en nommant le serveur, plutôt qu'une
+        // à une par la boucle d'échecs ci-dessous (qui ne dit que le motif
+        // brut, et s'arrête au 25e).
+        let mut attempt_pos = self
+            .orchestrator
+            .enjamber_les_serveurs_absents(zone_id, next_pos)
+            .await
+            .map_or(next_pos, |(position, _)| position);
         let mut skipped = 0u32;
         loop {
             match self
