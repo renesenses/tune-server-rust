@@ -1681,7 +1681,7 @@ pub(super) async fn rassembler_versions(
     let e = state.backend.engine();
     let sql = format!(
         "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, ''), \
-                t.isrc, t.duration_ms, al.year \
+                t.isrc, t.duration_ms, al.year, t.source \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -1701,6 +1701,9 @@ pub(super) async fn rassembler_versions(
         isrc: cols.get(3).and_then(|v| v.as_string()),
         duree_ms: cols.get(4).and_then(|v| v.as_i64()),
         annee: cols.get(5).and_then(|v| v.as_i64()),
+        // #4443 — d'où part la question : l'édition du MÊME album chez un
+        // autre service est une version, pas le même enregistrement.
+        source: cols.get(6).and_then(|v| v.as_string()),
     };
 
     // ⚠️ La ligne `tracks` ci-dessus est lue QUOI QU'IL ARRIVE, meme quand le
@@ -1757,6 +1760,222 @@ pub(super) async fn track_versions(
     match rassembler_versions(&state, id, limite, avec_streaming, &filtre).await {
         Some(v) => Json(v).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// #4443 — le témoin de bout en bout : une piste LOCALE, un service qui
+/// répond comme Qobuz, et ce que la route en rend.
+#[cfg(test)]
+mod tests_versions_piste_i4443 {
+    use super::rassembler_versions;
+    use crate::routes::filtre_sources::FiltreSources;
+    use crate::state::AppState;
+    use tune_core::TuneError;
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
+        StreamUrl, StreamingService,
+    };
+
+    fn piste(id: &str, titre: &str, artiste: &str, album: &str, duree_ms: u64) -> StreamTrack {
+        StreamTrack {
+            id: id.to_string(),
+            title: titre.to_string(),
+            artist: artiste.to_string(),
+            album: Some(album.to_string()),
+            album_id: Some(format!("alb-{id}")),
+            duration_ms: duree_ms,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            disponible: None,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    /// Un « Qobuz » qui répond à toute recherche ce que le vrai rend pour
+    /// « Pink Floyd Shine On You Crazy Diamond (Parts 1-5) » (fil 1839) :
+    /// l'édition Qobuz de l'album SOURCE, écrite à sa manière ; une reprise
+    /// réelle (Geoff Tate) ; un autre album du même groupe ; et une piste
+    /// sans rapport.
+    struct QobuzDeFabien;
+
+    #[async_trait::async_trait]
+    impl StreamingService for QobuzDeFabien {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "qobuz"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+            Ok(self.auth_status().await)
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus {
+                authenticated: true,
+                ..Default::default()
+            }
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Ok(SearchResults {
+                tracks: vec![
+                    piste(
+                        "q-wywh",
+                        "Shine on You Crazy Diamond, Pts. 1-5",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                        812_000,
+                    ),
+                    piste(
+                        "q-tate",
+                        "Shine On You Crazy Diamond (Parts 1-5)",
+                        "Geoff Tate",
+                        "Kings & Thieves",
+                        540_000,
+                    ),
+                    piste(
+                        "q-pulse",
+                        "Shine On You Crazy Diamond, Pts. 1-5 (Live)",
+                        "Pink Floyd",
+                        "Pulse",
+                        815_000,
+                    ),
+                    piste(
+                        "q-cigar",
+                        "Have a Cigar",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                        307_000,
+                    ),
+                ],
+                albums: vec![],
+                artists: vec![],
+                playlists: vec![],
+            })
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Ok(vec![])
+        }
+    }
+
+    /// La bibliothèque de FabienM, réduite : *Wish You Were Here* en FLAC.
+    fn wish_you_were_here_local(state: &AppState) -> i64 {
+        let b = &state.backend;
+        b.execute("INSERT INTO artists (name) VALUES ('Pink Floyd')", &[])
+            .unwrap();
+        let pf = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO albums (title, artist_id, year) VALUES ('Wish You Were Here', ?1, 1975)",
+            &[&pf as &dyn ToSqlValue],
+        )
+        .unwrap();
+        let wywh = b.last_insert_rowid();
+        b.execute(
+            "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path, source) \
+             VALUES ('Shine On You Crazy Diamond (Parts 1-5)', ?1, ?2, 811000, '/pf/01.flac', 'local')",
+            &[&wywh as &dyn ToSqlValue, &pf as &dyn ToSqlValue],
+        )
+        .unwrap();
+        b.last_insert_rowid()
+    }
+
+    /// ⭐ Le fil 1839, point 3, rejoué : l'édition Qobuz de l'album source
+    /// DOIT sortir, en tête, comme une version ; la reprise de Geoff Tate
+    /// reste une reprise assumée ; « Have a Cigar » ne sort pas.
+    #[tokio::test]
+    async fn depuis_une_piste_locale_l_edition_qobuz_du_meme_album_est_une_version() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .services
+            .lock()
+            .await
+            .register(Box::new(QobuzDeFabien));
+        let id = wish_you_were_here_local(&state);
+
+        let v = rassembler_versions(&state, id, 50, true, &FiltreSources::tout())
+            .await
+            .expect("la piste existe");
+        let streaming = v["streaming"].as_array().expect("un tableau `streaming`");
+        let rendues: Vec<(String, String, String)> = streaming
+            .iter()
+            .map(|s| {
+                (
+                    s["source_id"].as_str().unwrap_or_default().to_string(),
+                    s["album_title"].as_str().unwrap_or_default().to_string(),
+                    s["kind"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+
+        let wywh = rendues.iter().find(|(id, _, _)| id == "q-wywh");
+        assert_eq!(
+            wywh.map(|(_, album, kind)| (album.as_str(), kind.as_str())),
+            Some(("Wish You Were Here", "version")),
+            "l'édition Qobuz de l'album source manque ou est mal classée (#4443) : {rendues:?}"
+        );
+        assert_eq!(
+            rendues.first().map(|(id, _, _)| id.as_str()),
+            Some("q-wywh"),
+            "le même master (durée à 1 s près, même album) doit sortir en tête : {rendues:?}"
+        );
+        assert!(
+            rendues
+                .iter()
+                .any(|(id, _, kind)| id == "q-tate" && kind == "reprise"),
+            "la reprise de Geoff Tate est une reprise assumée : {rendues:?}"
+        );
+        assert!(
+            rendues
+                .iter()
+                .any(|(id, _, kind)| id == "q-pulse" && kind == "version"),
+            "Pulse reste une version : {rendues:?}"
+        );
+        assert!(
+            !rendues.iter().any(|(id, _, _)| id == "q-cigar"),
+            "un autre titre du même album n'a rien à faire là : {rendues:?}"
+        );
     }
 }
 
