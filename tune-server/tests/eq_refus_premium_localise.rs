@@ -1,35 +1,6 @@
-//! L'égaliseur sans licence : ce qui reste LISIBLE, et ce qui doit REFUSER — #2419.
-//!
-//! Le ticket dit « EQ cliquable sans licence, le 402 est avalé ». Deux moitiés,
-//! et elles ne se corrigent pas dans le même sens :
-//!
-//! 1. **La lecture reste gratuite.** `GET /zones/{id}/eq` n'a pas de garde, et
-//!    ne doit pas en recevoir. `EqualizerView.svelte` l'appelle dans son
-//!    `onMount` SANS condition de licence, pour dessiner la courbe réelle
-//!    derrière le bandeau `premium-gate` qu'il affiche quand `!$isPremium`. La
-//!    garder ferait deux dégâts d'un coup : l'écran perdrait son contenu, et la
-//!    fenêtre premium de `fetchJSON` s'ouvrirait à la simple OUVERTURE de
-//!    l'égaliseur. C'est aussi la règle uniforme du domaine — `get_zone_dsp`,
-//!    `eq_status`, `list_presets`, `get_bands` lisent sans droit.
-//!    Les tests de ce fichier VERROUILLENT cette gratuité : quelqu'un qui
-//!    « corrigerait » #2419 en gardant la lecture les fait rougir.
-//!
-//! 2. **L'écriture refuse, et son refus se lit.** Le 402 existait déjà, mais sa
-//!    phrase était composée en anglais (`"… requires Tune Premium"`) et le
-//!    client web l'affiche telle quelle (`api.ts` : `notifications.error(
-//!    body?.message)`). Dans une interface traduite en dix langues. Le refus
-//!    porte désormais un `code` stable ET une phrase qui suit
-//!    l'`Accept-Language`.
-//!
-//! Et le témoin, sans lequel tout le reste ne prouve rien : **une licence
-//! valide ne voit RIEN changer**, ni en lecture ni en écriture.
-//!
-//! Tout passe par `tune_server::routes::router(state)` — le routeur réel, son
-//! préfixe `/api/v1` et son repli 404 — et par les chemins exacts que tape le
-//! client. Aucune transcription de la logique de garde.
-//!
-//! ⚠️ `tune-server` porte `autotests = false` : ce fichier n'est compilé que
-//! parce qu'il est déclaré dans l'agrégateur `server_contracts.rs`.
+//! EQ is free (#4363). Crossfeed keeps its separate Premium entitlement.
+//! Preserve #2419's localized refusal witnesses on the paid operation;
+//! exercise real routes, persisted settings, mixed-request atomicity and presets.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -157,41 +128,57 @@ async fn la_lecture_du_dsp_de_zone_reste_ouverte_sans_licence() {
 // 2. L'écriture REFUSE, et son refus est lisible.
 // ---------------------------------------------------------------------------
 
-/// Sans licence, `POST /zones/{id}/eq` répond **402** — et le refus est nommé.
 #[tokio::test]
-async fn l_ecriture_de_l_egaliseur_refuse_sans_licence_et_se_nomme() {
+async fn premium_sdk_free_equalizer_writes_and_reads_real_bands() {
     let app = app_gratuit().await;
-    let (status, corps) = ecrire(&app, EQ, bandes(), Some("fr")).await;
-
-    assert_eq!(
-        status,
-        StatusCode::PAYMENT_REQUIRED,
-        "écrire l'égaliseur sans droit doit refuser : {corps}"
-    );
-    assert_eq!(corps["error"], "premium_required");
-    assert_eq!(
-        corps["code"], "dsp_eq",
-        "le refus doit porter le CODE stable que le client traduit : {corps}"
-    );
-    assert_eq!(corps["upgrade_url"], "https://mozaiklabs.fr/pricing");
+    let (status, value) = ecrire(&app, EQ, bandes(), Some("fr")).await;
+    assert_eq!(status, StatusCode::OK, "FREE EQ refused: {value}");
+    let (_, stored) = lire(&app, EQ).await;
+    assert_eq!(stored["enabled"], true);
+    assert_eq!(stored["bands"][0]["gain"], 3.0);
+    let (status, value) = ecrire(
+        &app,
+        "/api/v1/eq/presets",
+        json!({"name":"Free preset","bands":bandes()["bands"]}),
+        Some("fr"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "FREE preset refused: {value}");
+    let (_, config) = lire(&app, "/api/v1/system/config").await;
+    assert_eq!(config["premium_features"]["dsp_eq"], true, "{config}");
+    assert_eq!(config["premium_features"]["crossfeed"], false, "{config}");
 }
 
-/// Le refus n'a **rien écrit** : la relecture gratuite rend toujours la courbe
-/// plate. Un 402 qui persisterait quand même serait le pire des deux mondes.
 #[tokio::test]
-async fn le_refus_d_ecriture_ne_persiste_aucune_bande() {
+async fn premium_sdk_mixed_free_request_refuses_crossfeed_without_writing_eq() {
     let app = app_gratuit().await;
-    let (status, _) = ecrire(&app, EQ, bandes(), Some("fr")).await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
-
-    let (status, corps) = lire(&app, EQ).await;
-    assert_eq!(status, StatusCode::OK);
+    let profile = tune_core::audio::eq::EqProfile {
+        enabled: true,
+        bass_gain_db: 4.0,
+        ..Default::default()
+    };
+    let (status, value) = ecrire_put(
+        &app,
+        DSP,
+        json!({"eq_profile": profile, "crossfeed":{"enabled":true}}),
+        Some("fr"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{value}");
+    assert_eq!(value["code"], "crossfeed");
+    let (_, stored) = lire(&app, EQ).await;
     assert_eq!(
-        corps["bands"].as_array().map(|b| b.len()),
-        Some(0),
-        "un refus ne doit rien laisser derrière lui : {corps}"
+        stored["enabled"], false,
+        "mixed request partially persisted EQ: {stored}"
     );
-    assert_eq!(corps["enabled"], false, "corps : {corps}");
+    let (status, value) = ecrire_put(&app, DSP, json!({"eq_profile": profile}), Some("fr")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "EQ-only DSP request refused: {value}"
+    );
+    let (_, stored) = lire(&app, DSP).await;
+    assert_eq!(stored["eq_profile"]["bass_gain_db"], 4.0, "{stored}");
 }
 
 // ---------------------------------------------------------------------------
@@ -208,10 +195,22 @@ async fn le_refus_d_ecriture_ne_persiste_aucune_bande() {
 async fn la_phrase_du_refus_suit_l_entete_accept_language() {
     let app = app_gratuit().await;
 
-    let (_, fr) = ecrire(&app, EQ, bandes(), Some("fr-FR,fr;q=0.9")).await;
-    let (_, de) = ecrire(&app, EQ, bandes(), Some("de")).await;
-    let (_, en) = ecrire(&app, EQ, bandes(), Some("en-US,en;q=0.8")).await;
-    let (_, ja) = ecrire(&app, EQ, bandes(), Some("ja")).await;
+    let (_, fr) = ecrire_put(
+        &app,
+        DSP,
+        json!({"crossfeed":{"enabled":true}}),
+        Some("fr-FR,fr;q=0.9"),
+    )
+    .await;
+    let (_, de) = ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), Some("de")).await;
+    let (_, en) = ecrire_put(
+        &app,
+        DSP,
+        json!({"crossfeed":{"enabled":true}}),
+        Some("en-US,en;q=0.8"),
+    )
+    .await;
+    let (_, ja) = ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), Some("ja")).await;
 
     let phrase = |v: &Value| v["message"].as_str().unwrap_or_default().to_string();
 
@@ -240,10 +239,10 @@ async fn la_phrase_du_refus_suit_l_entete_accept_language() {
     // Le nom du droit reste un nom de produit, il traverse les traductions.
     for v in [&fr, &de, &en, &ja] {
         assert!(
-            phrase(v).contains("DSP & EQ"),
+            phrase(v).contains("Crossfeed"),
             "le refus doit nommer le droit manquant : {v}"
         );
-        assert_eq!(v["code"], "dsp_eq", "le code ne se traduit PAS : {v}");
+        assert_eq!(v["code"], "crossfeed", "le code ne se traduit PAS : {v}");
     }
 }
 
@@ -252,7 +251,13 @@ async fn la_phrase_du_refus_suit_l_entete_accept_language() {
 #[tokio::test]
 async fn une_locale_inconnue_retombe_sur_le_francais() {
     let app = app_gratuit().await;
-    let (_, corps) = ecrire(&app, EQ, bandes(), Some("kl-GL")).await;
+    let (_, corps) = ecrire_put(
+        &app,
+        DSP,
+        json!({"crossfeed":{"enabled":true}}),
+        Some("kl-GL"),
+    )
+    .await;
     let phrase = corps["message"].as_str().unwrap_or_default();
 
     assert!(
@@ -270,7 +275,7 @@ async fn une_locale_inconnue_retombe_sur_le_francais() {
 #[tokio::test]
 async fn un_refus_sans_entete_de_langue_reste_une_phrase() {
     let app = app_gratuit().await;
-    let (status, corps) = ecrire(&app, EQ, bandes(), None).await;
+    let (status, corps) = ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), None).await;
 
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let phrase = corps["message"].as_str().unwrap_or_default();
@@ -279,7 +284,7 @@ async fn un_refus_sans_entete_de_langue_reste_une_phrase() {
         !phrase.contains("premium.required"),
         "clé de traduction non résolue : {corps}"
     );
-    assert_eq!(corps["code"], "dsp_eq");
+    assert_eq!(corps["code"], "crossfeed");
 }
 
 /// `PUT /zones/{id}/dsp` est l'autre moitié du même écran : son refus se lit
@@ -287,11 +292,12 @@ async fn un_refus_sans_entete_de_langue_reste_une_phrase() {
 #[tokio::test]
 async fn le_refus_du_dsp_de_zone_se_lit_comme_celui_de_l_egaliseur() {
     let app = app_gratuit().await;
-    let (status, corps) = ecrire_put(&app, DSP, json!({ "dsp_enabled": true }), Some("de")).await;
+    let (status, corps) =
+        ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), Some("de")).await;
 
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "corps : {corps}");
     assert_eq!(corps["error"], "premium_required");
-    assert_eq!(corps["code"], "dsp_eq");
+    assert_eq!(corps["code"], "crossfeed");
     assert!(
         corps["message"]
             .as_str()

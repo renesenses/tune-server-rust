@@ -1,0 +1,121 @@
+{
+  "$defs": {
+    "ObservationPoint": {
+      "enum": [
+        "decoded_source",
+        "pre_dsp",
+        "post_dsp",
+        "pre_output"
+      ],
+      "type": "string"
+    },
+    "Provenance": {
+      "oneOf": [
+        {
+          "const": "pipeline",
+          "description": "PCM observed in the actual rendering pipeline at `point`.",
+          "type": "string"
+        },
+        {
+          "const": "source_probe",
+          "description": "Independent decode for analysis; does NOT measure the renderer output.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Additive wire shape of the existing playback.audio_levels event. Arrays\nshare a frequency axis. Resolution refers to actual signal frames. Clients\nmust also validate finite numbers, equal lengths and zone/epoch freshness.",
+  "properties": {
+    "bit_depth": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "channels": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "generation": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "observation_point": {
+      "$ref": "#/$defs/ObservationPoint"
+    },
+    "play_seq": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "position_ms": {
+      "format": "double",
+      "type": "number"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "sample_rate": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "spectrum": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "type": "array"
+    },
+    "spectrum_db": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "type": "array"
+    },
+    "spectrum_hz": {
+      "items": {
+        "format": "double",
+        "type": "number"
+      },
+      "type": "array"
+    },
+    "spectrum_resolution_hz": {
+      "format": "double",
+      "type": "number"
+    },
+    "spectrum_resolved": {
+      "items": {
+        "type": "boolean"
+      },
+      "type": "array"
+    },
+    "zone_id": {
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "zone_id",
+    "play_seq",
+    "generation",
+    "position_ms",
+    "sample_rate",
+    "channels",
+    "bit_depth",
+    "observation_point",
+    "provenance",
+    "spectrum",
+    "spectrum_db",
+    "spectrum_hz",
+    "spectrum_resolved",
+    "spectrum_resolution_hz"
+  ],
+  "title": "AudioLevelsEvent",
+  "type": "object"
+}

@@ -280,6 +280,7 @@ fn spawn_paced_levels_forwarder(
                 track_position: position,
                 window,
                 play_seq,
+                generation: gen_at_spawn,
             });
 
             let lvl = crate::audio::levels::compute_levels(
@@ -294,6 +295,14 @@ fn spawn_paced_levels_forwarder(
                 "playback.audio_levels",
                 serde_json::json!({
                     "zone_id": zone_id,
+                    "play_seq": play_seq,
+                    "generation": gen_at_spawn,
+                    "observation_point": "decoded_source",
+                    "provenance": "source_probe",
+                    "sample_rate": raw.sample_rate,
+                    "channels": raw.channels,
+                    "bit_depth": raw.bit_depth,
+
                     // Début de la fenêtre analysée, dans le référentiel de la
                     // piste — les clients s'alignent sur la position rapportée
                     // par le renderer pour compenser son tampon de sortie.

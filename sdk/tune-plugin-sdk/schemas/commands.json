@@ -1,0 +1,272 @@
+{
+  "$defs": {
+    "ObservationPoint": {
+      "enum": [
+        "decoded_source",
+        "pre_dsp",
+        "post_dsp",
+        "pre_output"
+      ],
+      "type": "string"
+    },
+    "UiCommand": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "get_configuration",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "set_configuration",
+              "type": "string"
+            },
+            "configuration": true
+          },
+          "required": [
+            "command",
+            "configuration"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "get_context",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "codec_capabilities",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "start_job",
+              "type": "string"
+            },
+            "options": true
+          },
+          "required": [
+            "command",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": true,
+            "command": {
+              "const": "equalizer_operation",
+              "type": "string"
+            },
+            "method": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "path",
+            "method"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "command": {
+              "const": "frequency_response",
+              "type": "string"
+            },
+            "sample_rate": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command",
+            "sample_rate",
+            "channels"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "subscribe_levels",
+              "type": "string"
+            },
+            "point": {
+              "$ref": "#/$defs/ObservationPoint"
+            },
+            "zone_id": {
+              "format": "int64",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "command",
+            "zone_id",
+            "point"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "unsubscribe",
+              "type": "string"
+            },
+            "subscription_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "subscription_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "job_status",
+              "type": "string"
+            },
+            "job_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "const": "cancel_job",
+              "type": "string"
+            },
+            "job_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_id": {
+              "type": "string"
+            },
+            "command": {
+              "const": "download",
+              "type": "string"
+            }
+          },
+          "required": [
+            "command",
+            "artifact_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Version": {
+      "additionalProperties": false,
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/UiCommand"
+    },
+    "plugin_id": {
+      "type": "string"
+    },
+    "protocol": {
+      "$ref": "#/$defs/Version"
+    },
+    "request_id": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "protocol",
+    "request_id",
+    "plugin_id",
+    "action"
+  ],
+  "title": "UiRequest",
+  "type": "object"
+}

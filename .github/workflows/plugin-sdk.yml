@@ -1,0 +1,77 @@
+name: Plugin SDK contracts
+
+on:
+  pull_request:
+    paths:
+      - 'sdk/**'
+      - 'scripts/plugin-catalog.py'
+      - 'scripts/tests/test_plugin_catalog.py'
+      - 'tune-core/src/audio/**'
+      - 'tune-core/src/orchestrator*'
+      - 'tune-core/src/orchestrator/**'
+      - 'tune-server/src/**'
+      - 'docs/plugins/premium-sdk*'
+      - '.github/workflows/plugin-sdk.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'sdk/**'
+      - 'scripts/plugin-catalog.py'
+      - 'scripts/tests/test_plugin_catalog.py'
+      - 'tune-core/src/audio/**'
+      - 'tune-core/src/orchestrator*'
+      - 'tune-core/src/orchestrator/**'
+      - 'tune-server/src/**'
+      - 'docs/plugins/premium-sdk*'
+      - '.github/workflows/plugin-sdk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: SDK source contracts (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/sdk/target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: python scripts/plugin-catalog.py --check
+      - run: python -m unittest discover -s scripts/tests -p test_plugin_catalog.py
+      - run: cargo fmt --manifest-path sdk/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path sdk/Cargo.toml --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --no-fail-fast --manifest-path sdk/Cargo.toml --workspace --locked
+      - run: cargo build --manifest-path sdk/Cargo.toml -p cargo-tune-plugin --locked
+      - name: External projects and actual generated tests
+        shell: bash
+        run: |
+          binary="$CARGO_TARGET_DIR/debug/cargo-tune-plugin"
+          if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
+          python sdk/scripts/verify_scaffolding.py --binary "$binary"
+      - run: python sdk/scripts/verify_schemas.py
+      - run: python sdk/scripts/verify_native.py --build-only
+      - name: Native ABI conformance with real libraries
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/sdk/target/sdk-native
+          TUNE_NATIVE_TEST_DIR: ${{ github.workspace }}/sdk/target/sdk-native/debug
+        run: cargo test --no-fail-fast --manifest-path sdk/Cargo.toml -p tune-plugin-native --features native-conformance --test native --locked
+      - run: python sdk/scripts/verify_dsp_parity.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test sdk/ui/client.test.mjs sdk/ui/bridge.test.mjs
+      - run: python sdk/scripts/verify_matrix.py
