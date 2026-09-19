@@ -5,6 +5,9 @@ pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
 pub mod autoeq;
+pub mod canaux_declares;
+
+pub mod bitperfect_strict;
 pub mod channels;
 pub mod convolver;
 pub mod crossfeed;
@@ -54,6 +57,10 @@ pub mod mixer;
 /// réglage `zone_{id}_mono_downmix` (#2362).
 pub mod mono_downmix;
 pub mod opus_ogg;
+/// L'ordonnancement temps réel du fil de rendu local (#3206). Hors
+/// `local-audio` pour la même raison que `periode_alsa` : la décision de
+/// priorité et l'appel au noyau ne dépendent ni de cpal ni d'une carte son.
+pub mod ordonnancement_rt;
 /// Qui tient le PCM ALSA que nous n'arrivons pas à ouvrir (#3575) — lecture
 /// de /proc, aucun effet sur la chaîne audio.
 pub mod pcm_teneur;

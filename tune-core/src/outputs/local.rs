@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 
 use super::traits::{
     AudioSpec, BlocPcm, FormatOuvert, OutputCapabilities, OutputDspMetrics, OutputRingStarvation,
-    OutputSignalPathStatus, OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation,
-    TransformationsReelles, TransportState,
+    OutputSignalPathStatus, OutputStatus, OutputTarget, ProfondeurPcm, PuitsDEchantillons,
+    RingStarvation, TransformationsReelles, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -77,6 +77,36 @@ enum OpenFailure {
 /// Matching is loose on purpose: cpal wraps the backend message and the wording
 /// varies by platform, so anything unrecognised falls through to `Unknown`
 /// rather than to a confident wrong answer.
+/// #3973 — le site « changement de cadence en cours de flux » de la règle
+/// bit-perfect ([`crate::audio::bitperfect_strict::decision_bitperfect`]).
+///
+/// `true` : la piste enchaînée ne doit PAS être convertie vers la cadence du
+/// flux ouvert — l'enchaînement gapless est abandonné, la piste courante se
+/// termine proprement, et la suivante repasse par l'ouverture, où la même
+/// règle juge contre ce que le périphérique sait réellement faire. Un refus
+/// posé ICI serait faux : le flux ouvert à 96 kHz ne dit rien de la capacité
+/// du DAC à ouvrir 192 kHz.
+fn enchainement_refuse_par_le_strict(
+    nouvelle_sr: u32,
+    sortie_sr: u32,
+    strict: bool,
+    device_name: &str,
+) -> bool {
+    let Some(refus) =
+        crate::audio::bitperfect_strict::decision_bitperfect(nouvelle_sr, sortie_sr, strict)
+            .refus()
+    else {
+        return false;
+    };
+    info!(
+        device = %device_name,
+        requested_sr = refus.demandee_hz,
+        stream_sr = refus.sortie_hz,
+        "local_audio_gapless_bitperfect_strict_reopen"
+    );
+    true
+}
+
 fn classify_open_failure(err: &str) -> OpenFailure {
     let e = err.to_ascii_lowercase();
     if e.contains("host is down")
@@ -471,6 +501,12 @@ pub struct LocalOutput {
     /// ne peut plus rien enchaîner, quoi qu'elle ait su faire une seconde plus
     /// tôt. Remis à zéro par `play_url()`, qui démarre un fil neuf.
     chain_exhausted: Arc<AtomicBool>,
+    /// #4177 — la pause a RENDU le périphérique (exclusif Windows : WASAPI
+    /// exclusif ou ASIO). `get_status` continue de dire `Paused`, et
+    /// `device_released_on_pause()` dit à l'orchestrateur de rétablir la
+    /// lecture par `play_url` à la position conservée plutôt que de reprendre
+    /// « sur place » un flux qui n'existe plus. Effacé par `play_url()`.
+    peripherique_rendu_en_pause: AtomicBool,
     /// Zone equalizer for the zone currently playing on this output, applied
     /// BEFORE the room-correction convolver — the same order as the transcoded
     /// path (`transcode_source_to_file`: ReplayGain → EQ → convolver).
@@ -504,6 +540,11 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
+    /// Armé, une conversion de fréquence (ouverture cpal ou changement de
+    /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
+    /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
+    strict_bitperfect: Arc<AtomicBool>,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -812,11 +853,13 @@ impl LocalOutput {
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
             chain_exhausted: Arc::new(AtomicBool::new(false)),
+            peripherique_rendu_en_pause: AtomicBool::new(false),
             eq: Arc::new(std::sync::Mutex::new(None)),
             current_format: Arc::new(AtomicU32::new(0)),
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
@@ -877,6 +920,19 @@ impl LocalOutput {
     ///
     /// Sert à rebâtir un `EqProcessor` aux bons coefficients SANS attendre la
     /// piste suivante (#1725).
+    /// #4176 — un flux est-il en train de DÉMARRER : fil de lecture lancé,
+    /// périphérique pas encore ouvert (donc pas de format) ?
+    ///
+    /// Le trou dans lequel une bascule PURE tombait : `current_format()` rend
+    /// `None`, `refresh_zone_pure_dsp` concluait « rien en cours » et
+    /// l'orchestrateur RELANÇAIT le flux — une seconde ouverture exclusive
+    /// pendant que la première attendait encore son premier octet
+    /// (`0x8889000A`, zone arrêtée ; Jean Valjean, fil 1798). Or un flux qui
+    /// démarre lit `pure_bypass` à l'ouverture : il n'y a rien à relancer.
+    pub fn flux_en_demarrage(&self) -> bool {
+        self.playing.load(Ordering::SeqCst) && self.current_format().is_none()
+    }
+
     pub fn current_format(&self) -> Option<(u32, u16)> {
         let empaquete = self.current_format.load(Ordering::Relaxed);
         if empaquete == 0 {
@@ -981,6 +1037,18 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+    }
+
+    /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
+    /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture, à
+    /// côté de `set_pure_bypass`.
+    pub fn set_strict_bitperfect(&self, strict: bool) {
+        self.strict_bitperfect.store(strict, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strict_bitperfect_for_test(&self) -> bool {
+        self.strict_bitperfect.load(Ordering::Relaxed)
     }
 
     /// Armer (ou désarmer) le repli mono de la zone qui joue sur cette sortie
@@ -2377,9 +2445,11 @@ where
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
     // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
     let famine_cb = ring_cb.starvation();
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     device.build_output_stream(
         cfg,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             render_local_shared_integer_callback(
                 &ring_cb,
                 &vol_cb,
@@ -2420,9 +2490,11 @@ fn build_compressed_f32_stream(
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
     // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
     let famine_cb = ring_cb.starvation();
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     device.build_output_stream(
         cfg,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             render_local_shared_f32_callback(
                 &ring_cb,
                 &vol_cb,
@@ -2599,49 +2671,6 @@ fn record_compressed_decode_failure(
     }
 }
 
-/// Last preparation step before the f32 ring used by Windows exclusive
-/// backends.
-///
-/// `must_classify_24_bit` is true until the first complete 32-frame probe has
-/// ruled out DoP. Returning `Ok(None)` quarantines those initial bytes: the
-/// caller must keep them in its raw-byte `leftover` buffer and must not feed
-/// the ring. Every later, sufficiently large 24-bit chunk is checked too, so a
-/// malformed stream cannot switch to DoP unnoticed at a chunk boundary.
-#[cfg(any(target_os = "windows", test))]
-#[allow(clippy::too_many_arguments)]
-fn prepare_windows_exclusive_pcm(
-    bytes: &[u8],
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: bool,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
-    let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
-    if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
-        return Ok(None);
-    }
-    if bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels) {
-        return Err(WindowsExclusivePcmError::DopUnsupported);
-    }
-
-    let mut samples = pcm_bytes_to_f32(bytes, bit_depth);
-    apply_local_dsp(
-        &mut samples,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
-        channels,
-        false,
-    );
-    Ok(Some(samples))
-}
-
 /// At EOF, an initial 24-bit probe that never reached 32 frames is not proof
 /// of PCM. Failing closed avoids treating a tiny DoP payload as ordinary audio.
 #[cfg(any(target_os = "windows", test))]
@@ -2654,232 +2683,6 @@ fn finish_windows_exclusive_probe(
         Err(WindowsExclusivePcmError::DopCheckIncomplete)
     } else {
         Ok(())
-    }
-}
-
-/// Consume every complete frame currently staged in `leftover`, but only
-/// after the shared DoP/DSP preparation step has authorised it.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_windows_exclusive_leftover(
-    leftover: &mut Vec<u8>,
-    frame_bytes: usize,
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: &mut bool,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    ring: &RingBuf,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) -> Result<u64, WindowsExclusivePcmError> {
-    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-    if aligned_len == 0 {
-        return Ok(0);
-    }
-    let Some(samples) = prepare_windows_exclusive_pcm(
-        &leftover[..aligned_len],
-        bit_depth,
-        channels,
-        *must_classify_24_bit,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
-    )?
-    else {
-        // The raw bytes remain staged until the first 24-bit probe reaches a
-        // conclusive length. In particular, no f32 sample has been produced.
-        return Ok(0);
-    };
-
-    *must_classify_24_bit = false;
-    feed_ring_abortable(ring, &samples, stop_rx, paused, Some(force_silent));
-    leftover.drain(..aligned_len);
-    Ok((aligned_len / frame_bytes) as u64)
-}
-
-#[cfg(target_os = "windows")]
-struct NativeFeedOutcome {
-    frames: u64,
-    dop: bool,
-    bit_perfect: bool,
-}
-
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy)]
-enum WindowsExclusiveRingRef<'a> {
-    Float(&'a RingBuf),
-    Native(&'a NativePcmRing),
-}
-
-#[cfg(target_os = "windows")]
-impl WindowsExclusiveRingRef<'_> {
-    fn capacity(self) -> usize {
-        match self {
-            Self::Float(ring) => ring.capacity(),
-            Self::Native(ring) => ring.capacity(),
-        }
-    }
-
-    fn available(self) -> usize {
-        match self {
-            Self::Float(ring) => ring.available(),
-            Self::Native(ring) => ring.available(),
-        }
-    }
-}
-
-/// Integer twin of [`feed_windows_exclusive_leftover`]. The producer resolves
-/// DoP, DSP and volume before it publishes left-aligned words; the backend
-/// callback can therefore remain a pure native serializer.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_windows_native_exclusive_leftover(
-    leftover: &mut Vec<u8>,
-    frame_bytes: usize,
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: &mut bool,
-    dop_latched: &mut bool,
-    volume_units: u32,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    ring: &NativePcmRing,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) -> Option<NativeFeedOutcome> {
-    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-    if aligned_len == 0 {
-        return None;
-    }
-    let prepared = prepare_windows_native_pcm(
-        &leftover[..aligned_len],
-        bit_depth,
-        channels,
-        *must_classify_24_bit,
-        *dop_latched,
-        volume_units,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
-    )?;
-
-    *must_classify_24_bit = false;
-    *dop_latched = prepared.dop;
-    feed_native_ring_abortable(ring, &prepared.samples, stop_rx, paused, Some(force_silent));
-    leftover.drain(..aligned_len);
-    Some(NativeFeedOutcome {
-        frames: (aligned_len / frame_bytes) as u64,
-        dop: prepared.dop,
-        bit_perfect: prepared.bit_perfect,
-    })
-}
-
-/// Route staged bytes to the callback representation selected from the
-/// driver's advertised native format. The legacy float route remains
-/// fail-closed for DoP; the native route carries DoP and identity PCM exactly.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_selected_windows_exclusive_leftover(
-    leftover: &mut Vec<u8>,
-    frame_bytes: usize,
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: &mut bool,
-    dop_latched: &mut bool,
-    volume_units: u32,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    ring: WindowsExclusiveRingRef<'_>,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) -> Result<Option<NativeFeedOutcome>, WindowsExclusivePcmError> {
-    match ring {
-        WindowsExclusiveRingRef::Native(ring) => Ok(feed_windows_native_exclusive_leftover(
-            leftover,
-            frame_bytes,
-            bit_depth,
-            channels,
-            must_classify_24_bit,
-            dop_latched,
-            volume_units,
-            eq,
-            convolver,
-            crossfeed,
-            pure_bypass,
-            mono_downmix,
-            ring,
-            stop_rx,
-            paused,
-            force_silent,
-        )),
-        WindowsExclusiveRingRef::Float(ring) => {
-            let frames = feed_windows_exclusive_leftover(
-                leftover,
-                frame_bytes,
-                bit_depth,
-                channels,
-                must_classify_24_bit,
-                eq,
-                convolver,
-                crossfeed,
-                pure_bypass,
-                mono_downmix,
-                ring,
-                stop_rx,
-                paused,
-                force_silent,
-            )?;
-            Ok((frames > 0).then_some(NativeFeedOutcome {
-                frames,
-                dop: false,
-                bit_perfect: false,
-            }))
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_selected_windows_exclusive_tail(
-    ring: WindowsExclusiveRingRef<'_>,
-    mut samples: Vec<f32>,
-    bit_depth: u16,
-    volume_units: u32,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) {
-    match ring {
-        WindowsExclusiveRingRef::Float(ring) => {
-            feed_ring_abortable(ring, &samples, stop_rx, paused, Some(force_silent));
-        }
-        WindowsExclusiveRingRef::Native(ring) => {
-            let volume = volume_units as f32 / 1000.0;
-            if volume != 1.0 {
-                for sample in &mut samples {
-                    *sample *= volume;
-                }
-            }
-            let native = f32_to_native_i32(&samples, bit_depth);
-            feed_native_ring_abortable(ring, &native, stop_rx, paused, Some(force_silent));
-        }
     }
 }
 
@@ -3123,9 +2926,13 @@ pub(crate) fn pcm_bytes_to_native_i32(bytes: &[u8], bit_depth: u16) -> Vec<i32> 
 }
 
 /// Write left-aligned native words back to their exact 16/24/32-bit PCM byte
-/// representation. This is the WASAPI callback's final serialization step and
-/// also the inverse used by the backend-boundary countertests.
-#[cfg(any(target_os = "windows", test))]
+/// representation: the inverse used by the backend-boundary countertests.
+///
+/// REF-10 (#2219) : plus aucun appelant de production — le fil de rendu WASAPI
+/// resérialise par `NativePcmRing::pop_pcm_bytes`, et la compilation Windows
+/// (`cargo check -p tune-core --lib`, avec et sans `asio`) la déclarait morte.
+/// Elle reste l'oracle des témoins, d'où `cfg(test)` seul.
+#[cfg(test)]
 pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut [u8]) -> usize {
     let bytes_per_sample = usize::from(bit_depth / 8);
     if !matches!(bit_depth, 16 | 24 | 32) {
@@ -3504,19 +3311,15 @@ impl EtageDeConversion<'_> {
     /// en contournement pur ; sinon un égaliseur, un convolveur, un crossfeed
     /// (stéréo seulement) ou le repli mono (stéréo seulement) posés.
     fn dsp_actif(&self) -> bool {
-        fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
-            m.lock().map(|g| g.is_some()).unwrap_or(false)
-        }
-        if self.pcm.dop_active.load(Ordering::Relaxed)
-            || self.pcm.pure_bypass.load(Ordering::Relaxed)
-        {
-            return false;
-        }
-        let stereo = self.spec.canaux() == 2;
-        pose(self.pcm.eq)
-            || pose(self.pcm.convolver)
-            || (stereo && pose(self.pcm.crossfeed))
-            || (stereo && self.pcm.mono_downmix.load(Ordering::Relaxed))
+        dsp_touche_le_signal(
+            self.spec.canaux(),
+            self.pcm.dop_active,
+            self.pcm.pure_bypass,
+            self.pcm.eq,
+            self.pcm.convolver,
+            self.pcm.crossfeed,
+            self.pcm.mono_downmix,
+        )
     }
 
     /// **L'unique écriture au puits** de l'étage flottant (REF-7, #2219).
@@ -3709,6 +3512,35 @@ pub(super) trait Etage {
 /// déduction (#3987). Appelée à l'ouverture et à chaque frontière gapless :
 /// entre les deux, ni le format d'entrée, ni le format ouvert, ni le DSP posé
 /// ne changent sans repasser par là.
+/// Le DSP touche-t-il les échantillons ? La règle unique des deux chemins de
+/// sortie flottants (PCM et compressé) — c'est ce que `dsp_actif` publie dans
+/// [`TransformationsReelles`] et que le chemin du signal affiche « (mesuré) ».
+///
+/// DoP ou PURE : rien ne touche le signal, quoi qu'il y ait d'armé. Sinon :
+/// égaliseur ou convolveur, et — en stéréo seulement, comme `apply_local_dsp`
+/// les applique — crossfeed ou repli mono.
+fn dsp_touche_le_signal(
+    canaux: u16,
+    dop_active: &AtomicBool,
+    pure_bypass: &AtomicBool,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    mono_downmix: &AtomicBool,
+) -> bool {
+    fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
+        m.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+    if dop_active.load(Ordering::Relaxed) || pure_bypass.load(Ordering::Relaxed) {
+        return false;
+    }
+    let stereo = canaux == 2;
+    pose(eq)
+        || pose(convolver)
+        || (stereo && pose(crossfeed))
+        || (stereo && mono_downmix.load(Ordering::Relaxed))
+}
+
 fn publier_les_transformations(
     creneau: &std::sync::Mutex<Option<TransformationsReelles>>,
     etage: &impl Etage,
@@ -4000,6 +3832,27 @@ impl BoucleProducteur<'_> {
     }
 }
 
+/// #4176 — après une attente bloquante (première lecture HTTP), le fil doit-il
+/// encore ouvrir le périphérique ? Non dès que `stop()` est passé : par le
+/// drapeau de silence forcé ou par le canal d'arrêt.
+pub(crate) fn ouverture_encore_voulue(force_silent: bool, stop_recu: bool) -> bool {
+    !force_silent && !stop_recu
+}
+
+/// #4177 — la pause doit-elle RENDRE le périphérique ?
+///
+/// Règle pure : sous Windows, en mode exclusif (WASAPI exclusif comme ASIO,
+/// les deux tiennent le point de sortie pour eux seuls), et seulement quand un
+/// flux joue. Le chemin partagé (mixeur Windows), macOS et Linux ne changent
+/// pas : leur pause reste un booléen, et une pause sans flux n'a rien à rendre.
+pub(crate) fn la_pause_rend_le_peripherique(
+    windows: bool,
+    exclusive_mode: bool,
+    playing: bool,
+) -> bool {
+    windows && exclusive_mode && playing
+}
+
 #[async_trait::async_trait]
 impl OutputTarget for LocalOutput {
     fn name(&self) -> &str {
@@ -4214,6 +4067,10 @@ impl OutputTarget for LocalOutput {
         // Clear the natural-end flag and generation for the new track.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        // #4177 — un flux neuf tient (ou non) le périphérique : la pause
+        // précédente ne l'a plus rendu.
+        self.peripherique_rendu_en_pause
+            .store(false, Ordering::SeqCst);
         // Un fil neuf a une boucle d'enchaînement intacte : la sonde repart de
         // zéro. **Après** l'incrément de `play_generation`, et c'est tout
         // l'intérêt : l'ancien fil ne lève son drapeau que s'il est encore la
@@ -4272,6 +4129,9 @@ impl OutputTarget for LocalOutput {
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
+        // #3973 — lu UNE fois par piste, comme le reste de ce que
+        // l'orchestrateur pose avant `play_url`.
+        let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         let mono_downmix = self.mono_downmix.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
@@ -4691,6 +4551,45 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing"
                 );
 
+                // #4347 — ce chemin (radio décodée en local) rééchantillonne
+                // vers la cadence du périphérique comme l'autre — mais il ne
+                // PUBLIAIT jamais ses transformations : le chemin du signal
+                // restait « Sans perte », sans étape Resampler, alors que le
+                // 44,1 kHz partait à 192 kHz. Une relance du flux (bascule
+                // PURE, sonde radio en échec…) passait par le chemin PCM, qui
+                // publie, et l'étape « 44kHz → 192kHz (mesuré) » apparaissait
+                // « sans raison » et ne repartait plus (Jean Valjean, fil
+                // 1825). Même publication, mêmes règles : entrée décodée
+                // (flottant 32 bits), format réellement ouvert, DSP mesuré.
+                if let Some(entree) =
+                    AudioSpec::nouvelle(dec_sr, ProfondeurPcm::FlottantIeee32, dec_ch)
+                {
+                    let dsp_actif = dsp_touche_le_signal(
+                        dec_ch,
+                        &dop_active,
+                        &pure_bypass,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &mono_downmix,
+                    );
+                    if let Ok(mut slot) = transformations_reelles.lock() {
+                        *slot = Some(TransformationsReelles::nouvelles(
+                            entree,
+                            FormatOuvert::new(output_sr, output_ch),
+                            dsp_actif,
+                        ));
+                    }
+                    info!(
+                        dec_sr,
+                        output_sr,
+                        dec_ch,
+                        output_ch,
+                        dsp_actif,
+                        "local_audio_compressed_transformations_published"
+                    );
+                }
+
                 // Chaine DSP de la zone : egaliseur, correction de piece,
                 // crossfeed.
                 //
@@ -4946,6 +4845,27 @@ impl OutputTarget for LocalOutput {
             };
 
             // ------- Exclusive mode path (macOS only) -------
+            // #4176 — le fil vient de passer jusqu'à 10 s bloqué dans la
+            // première lecture HTTP, sans regarder `stop()`. S'il a été arrêté
+            // entre-temps, il ne doit PAS ouvrir le périphérique : sur un
+            // chemin exclusif, son ouverture tardive entrait en collision avec
+            // celle du flux relancé (`0x8889000A`), écrivait l'échec dans le
+            // créneau partagé et le sondeur arrêtait la zone.
+            if !ouverture_encore_voulue(
+                force_silent.load(Ordering::SeqCst),
+                stop_rx.try_recv().is_ok(),
+            ) {
+                info!(
+                    device = %device_name,
+                    generation = my_generation,
+                    "local_audio_open_skipped_stream_stopped_before_device"
+                );
+                if play_generation.load(Ordering::SeqCst) == my_generation {
+                    playing.store(false, Ordering::SeqCst);
+                }
+                return;
+            }
+
             #[cfg(target_os = "macos")]
             if exclusive_mode {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
@@ -5083,6 +5003,7 @@ impl OutputTarget for LocalOutput {
                 origin_host: origin_host.as_deref(),
                 audio_backend: &audio_backend,
                 exclusive: exclusive_mode,
+                strict_bitperfect,
                 stop_rx: &stop_rx,
                 paused: &paused,
                 force_silent: &force_silent,
@@ -5597,6 +5518,22 @@ impl OutputTarget for LocalOutput {
                 let prev_sr = etage.sample_rate();
                 let prev_ch = etage.channels();
                 let prev_needs_resample = etage.needs_resample;
+                // #3973 — le site « changement de cadence en cours de flux » :
+                // la piste enchaînée demande une cadence que le flux OUVERT ne
+                // tient pas. Strict ⇒ on ne la convertit pas : on n'enchaîne
+                // pas, exactement comme un flux non-WAV, et la fin de piste
+                // normale relance la suivante par `play_url` — dont
+                // l'ouverture (`refus_strict_a_l_ouverture`) juge alors contre
+                // la cadence RÉELLE du périphérique : il la joue telle quelle
+                // s'il la lit, il la refuse en le disant sinon.
+                if enchainement_refuse_par_le_strict(
+                    new_sr,
+                    output_sr,
+                    strict_bitperfect,
+                    &device_name,
+                ) {
+                    break;
+                }
                 let next_needs_resample = output_sr != new_sr;
                 let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
 
@@ -5948,13 +5885,57 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
+        // #4177 — en exclusif Windows (WASAPI exclusif ou ASIO), la pause ne
+        // posait qu'un booléen : le fil de rendu poussait du silence et le
+        // périphérique restait PRIS — plus un son d'aucune autre application
+        // sur ce point de sortie tant que Tune était en pause (Jean Valjean,
+        // fil 1798 : « impossible d'écouter un clip sur YouTube »). On rend
+        // le périphérique ; l'orchestrateur lit `device_released_on_pause()`
+        // à la reprise et rouvre à la position conservée
+        // (`RepriseDeSession::RetablirALaPosition`).
+        if la_pause_rend_le_peripherique(
+            cfg!(target_os = "windows"),
+            self.exclusive_mode,
+            self.playing.load(Ordering::SeqCst),
+        ) {
+            let position_ms = self.position_ms.load(Ordering::SeqCst);
+            let duration_ms = self.duration_ms.load(Ordering::SeqCst);
+            info!(
+                device = %self.device_name,
+                backend = %self.audio_backend,
+                position_ms,
+                "local_audio_exclusive_device_released_on_pause"
+            );
+            self.stop().await?;
+            // `stop()` remet la position à zéro ; une pause, elle, la garde :
+            // c'est ce que le sondeur relit pendant la pause.
+            self.position_ms.store(position_ms, Ordering::SeqCst);
+            self.duration_ms.store(duration_ms, Ordering::SeqCst);
+            self.peripherique_rendu_en_pause
+                .store(true, Ordering::SeqCst);
+        }
         self.paused.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
+        if self.peripherique_rendu_en_pause.load(Ordering::SeqCst) {
+            // L'orchestrateur rétablit par `play_url` (qui efface le drapeau) ;
+            // arriver ici, c'est reprendre « sur place » un flux rendu : le
+            // dire, pour que le journal explique le silence qui suivrait.
+            warn!(
+                device = %self.device_name,
+                "local_audio_resume_without_device_reopen"
+            );
+        }
         self.paused.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// #4177 — lu par `PlaybackOrchestrator::resume` AVANT de décider entre
+    /// « reprendre sur place » et « rétablir à la position ».
+    fn device_released_on_pause(&self) -> bool {
+        self.peripherique_rendu_en_pause.load(Ordering::SeqCst)
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -6150,6 +6131,12 @@ impl OutputTarget for LocalOutput {
             } else {
                 TransportState::Playing
             }
+        } else if self.paused.load(Ordering::Relaxed)
+            && self.peripherique_rendu_en_pause.load(Ordering::Relaxed)
+        {
+            // #4177 — le fil est parti parce que la pause a RENDU le
+            // périphérique, pas parce que la piste est finie : c'est une pause.
+            TransportState::Paused
         } else {
             TransportState::Stopped
         };
@@ -6254,6 +6241,66 @@ impl OutputTarget for LocalOutput {
 /// On macOS CoreAudio the callback typically never fires on unplug (the
 /// AudioUnit just stops rendering); the feed-stall and drain deadlines in the
 /// playback thread cover that case.
+/// #3206 — la demande d'ordonnancement temps réel du fil de rendu, faite
+/// UNE fois, à la première période du rappel cpal.
+///
+/// Sous ALSA, cpal crée lui-même le fil du rappel : il n'existe aucun point
+/// d'entrée avant son premier passage, d'où cette sentinelle capturée par la
+/// fermeture, à côté de la rampe et de la famine. La demande ne refuse jamais
+/// une lecture : refusée, elle laisse le fil en `SCHED_OTHER` et le dit, une
+/// ligne de journal et l'état `LocalBackendStatus.realtime`.
+///
+/// Hors Linux la demande est sans objet : rien n'est journalisé ni enregistré.
+struct PromotionDuFilDeRendu {
+    faite: bool,
+}
+
+impl PromotionDuFilDeRendu {
+    fn nouvelle() -> Self {
+        Self { faite: false }
+    }
+
+    /// À appeler en tête de chaque période ; n'agit qu'à la première.
+    fn a_la_premiere_periode(&mut self) {
+        if self.faite {
+            return;
+        }
+        self.faite = true;
+        let issue = crate::audio::ordonnancement_rt::demander_pour_le_fil_courant();
+        journaliser_l_ordonnancement(&issue);
+        note_realtime_scheduling(issue);
+    }
+}
+
+/// La ligne de journal du ticket : obtenu ou refusé, et pourquoi. Une fois par
+/// fil de rendu, avant que la porte de préchargement ne laisse passer le son.
+fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::OrdonnancementTempsReel) {
+    use crate::audio::ordonnancement_rt::OrdonnancementTempsReel;
+    match issue {
+        OrdonnancementTempsReel::Obtenu {
+            policy,
+            priority,
+            rlimit_rtprio,
+        } => info!(
+            policy,
+            priority,
+            rlimit_rtprio = ?rlimit_rtprio,
+            "local_audio_realtime_scheduling — ordonnancement temps réel obtenu pour le fil de rendu (#3206)"
+        ),
+        OrdonnancementTempsReel::Refuse {
+            priority,
+            rlimit_rtprio,
+            cause,
+        } => warn!(
+            priority,
+            rlimit_rtprio = ?rlimit_rtprio,
+            cause = %cause,
+            "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER (#3206)"
+        ),
+        OrdonnancementTempsReel::SansObjet => {}
+    }
+}
+
 fn make_stream_error_cb(
     device_gone: Arc<AtomicBool>,
     starvation: Arc<RingStarvation>,
@@ -6392,45 +6439,6 @@ fn drain_deadline_for(
     )
 }
 
-#[cfg(target_os = "windows")]
-fn feed_native_ring_abortable(
-    ring: &NativePcmRing,
-    samples: &[i32],
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    abort: Option<&AtomicBool>,
-) -> bool {
-    let mut offset = 0;
-    let mut last_progress_at = std::time::Instant::now();
-    while offset < samples.len() {
-        if stop_rx.try_recv().is_ok() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
-            return true;
-        }
-        while paused.load(Ordering::Relaxed) {
-            if stop_rx.try_recv().is_ok() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            last_progress_at = std::time::Instant::now();
-        }
-        let written = ring.push(&samples[offset..]);
-        offset += written;
-        if written == 0 {
-            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
-                warn!(
-                    remaining_samples = samples.len() - offset,
-                    "windows_native_feed_ring_stall_timeout"
-                );
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        } else {
-            last_progress_at = std::time::Instant::now();
-        }
-    }
-    true
-}
-
 mod resolution;
 pub use resolution::*;
 
@@ -6452,6 +6460,16 @@ mod tests;
 
 #[cfg(test)]
 mod open_failure_tests;
+
+/// #3206 — la sentinelle qui demande l'ordonnancement temps réel du fil de
+/// rendu, et l'état qu'elle publie. La décision de priorité et l'appel au
+/// noyau vivent dans `crate::audio::ordonnancement_rt`, hors `local-audio`.
+#[cfg(test)]
+mod ordonnancement_rt_i3206;
+
+// #3973 — « bit-perfect strict » : sites ouverture cpal et enchaînement gapless.
+#[cfg(test)]
+mod bitperfect_strict_3973;
 
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans
@@ -6518,6 +6536,20 @@ mod backends_supportes_tests;
 
 #[cfg(test)]
 mod format_courant_tests;
+
+/// #4347 — le chemin compressé publie ses transformations comme le chemin PCM.
+#[cfg(test)]
+mod chemin_compresse_publie_ses_transformations_4347;
+
+/// #4176 — une bascule PURE pendant qu'un flux démarre ne relance rien, et
+/// un fil arrêté pendant sa première lecture n'ouvre plus le périphérique.
+#[cfg(test)]
+mod bascule_pure_flux_en_demarrage_4176;
+
+/// #4177 — en exclusif Windows, la pause rend le périphérique au lieu de le
+/// garder en poussant du silence.
+#[cfg(test)]
+mod pause_rend_le_peripherique_4177;
 
 #[cfg(test)]
 mod chemin_compresse_dsp_tests;

@@ -212,6 +212,31 @@ struct PatchZone {
     /// donc PAS derrière la barrière Premium : c'est une compensation de
     /// câblage, pas un effet de confort.
     mono_downmix: Option<bool>,
+    /// La DISPOSITION DE CANAUX déclarée pour l'appareil de cette zone —
+    /// chantier « multicanal », demandé par Bertrand le 19/09/2026 pour des
+    /// utilisateurs en 5.1 qu'aucun de nous ne peut observer.
+    ///
+    /// Le nom stable d'une [`ChannelLayout`] (`stereo`, `surround51`,
+    /// `surround714`…), ou la chaîne vide pour revenir à « suivre
+    /// l'appareil ». Persisté en setting `zone_{id}_channel_layout` ; absent
+    /// par défaut, donc rien ne change tant que personne ne choisit.
+    ///
+    /// 🔴 C'est une DÉCLARATION, pas un forçage : elle sert à proposer et à
+    /// étiqueter, jamais à fabriquer des canaux. Voir
+    /// `tune_core::audio::canaux_declares`.
+    ///
+    /// **Sortie LOCALE uniquement.** Comme pour `mono_downmix`, le réglage se
+    /// persiste sur n'importe quelle zone mais ne vaut que là où la chaîne
+    /// locale existe — `channel_layout_status` le DIT plutôt que de le taire
+    /// (#3254).
+    channel_layout: Option<String>,
+
+    /// #3973 — « Bit-perfect strict » : quand la sortie ne lit pas la
+    /// fréquence de la source, REFUSER la lecture (en disant pourquoi) au lieu
+    /// de convertir. Persisté en setting `zone_{id}_strict_bitperfect` ;
+    /// défaut off — sans lui Tune convertit et le DIT dans le chemin du
+    /// signal. Pris en compte à la lecture suivante.
+    strict_bitperfect: Option<bool>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -324,6 +349,15 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3973 — « bit-perfect strict ». TOUJOURS publié : sa présence est ce qui
+    // dit au client que ce serveur connaît le réglage (un vieux serveur ne
+    // l'a pas, et l'interrupteur n'apparaît pas).
+    obj.insert(
+        "strict_bitperfect".into(),
+        json!(tune_core::audio::bitperfect_strict::zone_enabled(
+            backend, zone_id
+        )),
+    );
     // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
     // était accepté et relu pour n'importe quelle zone, alors que les trois
     // seuls sites qui poussent le repli exigent une sortie `local:` et un
@@ -336,6 +370,52 @@ fn inject_device_identity(
     // Même vocabulaire que `local_exclusive_mode_status` (#3192) : `reason`
     // stable pour la machine, `detail` en clair pour un écran sans table de
     // traduction.
+    // Disposition de canaux DÉCLARÉE (chantier multicanal). Lue telle qu'elle
+    // est persistée : c'est l'état du sélecteur que le client doit afficher.
+    let channel_layout = settings
+        .get(&format!("zone_{zone_id}_channel_layout"))
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            tune_core::audio::channels::ChannelLayout::TOUTES
+                .iter()
+                .copied()
+                .find(|d| d.as_str() == v)
+        });
+    obj.insert(
+        "channel_layout".into(),
+        json!(channel_layout.map(|d| d.as_str())),
+    );
+    // …et ce que cette déclaration VAUT ici. Même forme que le statut du repli
+    // mono juste en dessous, et pour la même raison (#3254) : un renderer
+    // réseau négocie son propre format, lui déclarer 5.1 ne l'atteint pas.
+    obj.insert(
+        "channel_layout_status".into(),
+        json!(tune_core::audio::canaux_declares::canaux_status(
+            channel_layout,
+            tune_core::audio::canaux_declares::canaux_portes_par_la_sortie(output_device_id),
+            obj.get("output_capabilities")
+                .and_then(|c| c.get("max_channels"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u16),
+        )),
+    );
+    // Les dispositions à PROPOSER — la liste complète quand l'appareil se
+    // tait, ce qui est le cas de toutes les zones mesurées.
+    obj.insert(
+        "channel_layouts_offered".into(),
+        json!(
+            tune_core::audio::canaux_declares::dispositions_a_proposer(
+                obj.get("output_capabilities")
+                    .and_then(|c| c.get("max_channels"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u16),
+            )
+            .iter()
+            .map(|d| json!({"id": d.as_str(), "canaux": d.channel_count()}))
+            .collect::<Vec<_>>()
+        ),
+    );
     obj.insert(
         "mono_downmix_status".into(),
         json!(tune_core::audio::mono_downmix::mono_downmix_status(

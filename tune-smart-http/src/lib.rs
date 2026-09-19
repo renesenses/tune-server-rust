@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use tune_core::db::backend::DbBackend;
 
+pub mod catalogue;
+pub(crate) mod regles_sql;
 pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
@@ -17,10 +19,26 @@ mod source_streaming;
 #[derive(Clone)]
 pub struct SmartHttpState {
     pub(crate) backend: Arc<dyn DbBackend>,
+    /// De quoi interroger le CATALOGUE d'un service (#4473).
+    ///
+    /// `None` partout où le registre des services n'existe pas — en épreuve,
+    /// et dans tout appelant qui n'en a pas. Une règle `catalogue:<service>`
+    /// est alors REFUSÉE, jamais silencieusement vide : c'est la leçon de
+    /// #4469, où une règle non traduite valait « vrai pour tout ».
+    pub(crate) catalogue: Option<Arc<dyn catalogue::CatalogueDistant>>,
 }
 
 impl SmartHttpState {
     pub fn new(backend: Arc<dyn DbBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            catalogue: None,
+        }
+    }
+
+    /// Le même état, muni de quoi interroger les catalogues.
+    pub fn avec_catalogue(mut self, c: Arc<dyn catalogue::CatalogueDistant>) -> Self {
+        self.catalogue = Some(c);
+        self
     }
 }

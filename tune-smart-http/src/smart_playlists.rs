@@ -9,6 +9,7 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::Engine;
 
 use crate::SmartHttpState;
+use crate::regles_sql;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -365,13 +366,11 @@ pub(crate) fn build_smart_query(
             .get("op")
             .and_then(|v| v.as_str())
             .unwrap_or("contains");
-        let op = match raw_op {
-            "greater_than" | ">=" | "gte" => "gte",
-            "less_than" | "<=" | "lte" => "lte",
-            "equals" => "eq",
-            "not_equals" => "neq",
-            other => other,
-        };
+        // 🔴 #1231 — la normalisation du module partagé, qui connaît AUSSI
+        // `=`, `!=`, `<`, `>` et `is_empty`. Celle d'avant n'en reconnaissait
+        // que quatre formes : une règle écrite `{"op": "="}` tombait donc sur
+        // `_ => continue` et la playlist rendait toute la bibliothèque.
+        let op = regles_sql::normaliser_op(raw_op);
         let value = rule.get("value").and_then(|v| v.as_str()).unwrap_or("");
 
         // --- règles « référence » (collection / playlist / favori) ---
@@ -384,135 +383,48 @@ pub(crate) fn build_smart_query(
         let val_unaccented = strip_accents(&val_clean);
         let has_accents = val_clean != val_unaccented;
 
-        let cond = match (field, op) {
-            ("genre", "eq") => {
-                if has_accents {
-                    format!("(t.genre = '{val_clean}' OR t.genre = '{val_unaccented}')")
-                } else {
-                    format!("(t.genre = '{val_clean}' OR t.genre LIKE '{val_clean}')")
-                }
-            }
-            ("genre", "contains") => {
-                format!("(t.genre LIKE '%{val_clean}%' OR t.genre LIKE '%{val_unaccented}%')")
-            }
-            ("artist", "eq") => {
-                if has_accents {
-                    format!("(ar.name = '{val_clean}' OR ar.name = '{val_unaccented}')")
-                } else {
-                    format!("(ar.name = '{val_clean}' OR ar.name LIKE '{val_clean}')")
-                }
-            }
-            ("artist", "contains") => {
-                format!("(ar.name LIKE '%{val_clean}%' OR ar.name LIKE '%{val_unaccented}%')")
-            }
-            // Album rules were missing entirely, so "Album contient LUX" fell
-            // through to `_ => continue` and silently applied no filter — the
-            // playlist then returned every track (forum #1008, Sergio). al is
-            // joined in the query, so al.title is available here.
-            ("album", "eq") => {
-                if has_accents {
-                    format!("(al.title = '{val_clean}' OR al.title = '{val_unaccented}')")
-                } else {
-                    format!("(al.title = '{val_clean}' OR al.title LIKE '{val_clean}')")
-                }
-            }
-            ("album", "contains") => {
-                format!("(al.title LIKE '%{val_clean}%' OR al.title LIKE '%{val_unaccented}%')")
-            }
-            ("year", "eq") => format!("t.year = {}", value.parse::<i32>().unwrap_or(0)),
-            ("year", "gte") => format!("t.year >= {}", value.parse::<i32>().unwrap_or(0)),
-            ("year", "lte") => format!("t.year <= {}", value.parse::<i32>().unwrap_or(0)),
-            // "Année contient 2025": year is stored as an integer, so match on
-            // its text form (also lets "202" match a decade). Without this arm
-            // the rule was dropped (#1008).
-            ("year", "contains") => {
+        // Les deux champs qui ne sont pas une colonne : ils se comptent
+        // ailleurs, dans l'historique d'écoute.
+        let cond = if field == "play_count" {
+            let n = value.parse::<i64>().unwrap_or(0);
+            let comparateur = match op {
+                "=" => "=",
+                ">=" => ">=",
+                ">" => ">",
+                "<=" => "<=",
+                "<" => "<",
+                _ => "=",
+            };
+            if n == 0 && comparateur == "=" {
+                // « Jamais écoutée » : l'absence de ligne, pas un compte nul.
+                "t.id NOT IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL)"
+                    .to_string()
+            } else {
                 format!(
-                    "CAST(t.year AS TEXT) LIKE '%{}%'",
-                    value.replace('\'', "''")
+                    "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL \
+                     GROUP BY track_id HAVING COUNT(*) {comparateur} {n})"
                 )
             }
-            // « Source » — #4299. Il n'y avait AUCUN bras : la règle tombait sur
-            // `_ => continue` et la playlist ignorait la source en silence
-            // (FabienM, fil 1812, point 14). La colonne ne vaut que `local` ou
-            // `upnp` ; une source de SERVICE ne rend donc rien ICI, et c'est
-            // `source_streaming` qui ajoute les favoris du service au résultat.
-            // `COALESCE` : une piste sans provenance écrite est locale.
-            ("source", "eq") => {
-                format!("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) = LOWER('{val_clean}')")
-            }
-            ("source", "neq") => {
-                format!("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) != LOWER('{val_clean}')")
-            }
-            ("source", "contains") => format!(
-                "LOWER(COALESCE(NULLIF(t.source, ''), 'local')) LIKE LOWER('%{val_clean}%')"
-            ),
-            ("source", "starts_with") => {
-                format!("LOWER(COALESCE(NULLIF(t.source, ''), 'local')) LIKE LOWER('{val_clean}%')")
-            }
-            ("format", "eq") => format!("t.format = '{}'", value.replace('\'', "''")),
-            // "Format contient FLAC": case-insensitive so "flac"/"FLAC"/"flc"
-            // all match. Was dropped before (#1008).
-            ("format", "contains") => {
-                format!(
-                    "UPPER(t.format) LIKE UPPER('%{}%')",
-                    value.replace('\'', "''")
-                )
-            }
-            ("sample_rate", "gte") | ("sample_rate", "gt") => {
-                format!("t.sample_rate > {}", value.parse::<i32>().unwrap_or(0))
-            }
-            ("sample_rate", "lte") | ("sample_rate", "lt") => {
-                format!("t.sample_rate < {}", value.parse::<i32>().unwrap_or(0))
-            }
-            ("sample_rate", "eq") => {
-                format!("t.sample_rate = {}", value.parse::<i32>().unwrap_or(0))
-            }
-            ("bit_depth", "gte") => format!("t.bit_depth >= {}", value.parse::<i32>().unwrap_or(0)),
-            ("bit_depth", "lte") => format!("t.bit_depth <= {}", value.parse::<i32>().unwrap_or(0)),
-            ("bit_depth", "gt") => format!("t.bit_depth > {}", value.parse::<i32>().unwrap_or(0)),
-            ("bit_depth", "lt") => format!("t.bit_depth < {}", value.parse::<i32>().unwrap_or(0)),
-            ("bit_depth", "eq") => format!("t.bit_depth = {}", value.parse::<i32>().unwrap_or(0)),
-            ("duration_ms", "gte") => {
-                format!("t.duration_ms >= {}", value.parse::<i64>().unwrap_or(0))
-            }
-            ("duration_ms", "lte") => {
-                format!("t.duration_ms <= {}", value.parse::<i64>().unwrap_or(0))
-            }
-            ("title", "contains") => {
-                format!("(t.title LIKE '%{val_clean}%' OR t.title LIKE '%{val_unaccented}%')")
-            }
-            ("comments", "contains") => {
-                format!("t.comments LIKE '%{}%'", value.replace('\'', "''"))
-            }
-            ("comments", "eq") | ("comments", "equals") => {
-                format!("t.comments = '{}'", value.replace('\'', "''"))
-            }
-            ("comments", "starts_with") => {
-                format!("t.comments LIKE '{}%'", value.replace('\'', "''"))
-            }
-            ("comments", "ends_with") => {
-                format!("t.comments LIKE '%{}'", value.replace('\'', "''"))
-            }
-            ("comments", "is_empty") => "(t.comments IS NULL OR t.comments = '')".to_string(),
-            ("comments", "is_not_empty") => {
-                "(t.comments IS NOT NULL AND t.comments != '')".to_string()
-            }
-            ("play_count", "eq") => {
-                let n = value.parse::<i64>().unwrap_or(0);
-                if n == 0 {
-                    "t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL)".into()
-                } else {
-                    format!(
-                        "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id HAVING COUNT(*) = {})",
-                        n
-                    )
+        } else {
+            // 🔴 #1231 — une règle qu'on ne sait pas traduire rend FAUX, jamais
+            // « pas de condition ». Le `_ => continue` d'avant valait « vrai
+            // pour tout » : l'utilisateur voulait restreindre et obtenait la
+            // bibliothèque entière. Soixante-six combinaisons que l'éditeur
+            // propose passaient par là — dont `composer` en entier et `title`
+            // avec tout autre opérateur que « contient ».
+            match regles_sql::colonne_piste(field)
+                .and_then(|col| regles_sql::condition(col, op, &value))
+            {
+                Some(c) => c,
+                None => {
+                    tracing::warn!(
+                        champ = %field,
+                        operateur = %op,
+                        "regle_intraduisible_playlist_faux"
+                    );
+                    regles_sql::FAUX.to_string()
                 }
             }
-            ("play_count", "gte") => format!(
-                "t.id IN (SELECT track_id FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id HAVING COUNT(*) >= {})",
-                value.parse::<i64>().unwrap_or(0)
-            ),
-            _ => continue,
         };
         conditions.push(cond);
     }
@@ -798,7 +710,7 @@ async fn preview_smart_collection(
     Ok(Json(json!({"tracks": items, "total": items.len()})))
 }
 
-fn strip_accents(s: &str) -> String {
+pub(crate) fn strip_accents(s: &str) -> String {
     s.chars()
         .map(|c| match c {
             'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => {
@@ -889,6 +801,75 @@ mod tests {
         let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None, &ctx);
         w
     }
+    /// 🔴 #1231 — une règle que le moteur ne sait pas traduire rendait
+    /// « pas de condition », c'est-à-dire VRAI pour tout.
+    ///
+    /// Mesuré sur le .18 le 19/09/2026 : `composer = Mozart` rendait les
+    /// 47 118 pistes de la bibliothèque, et `title = <n'importe quoi>` aussi.
+    /// Soixante-six combinaisons que l'éditeur propose tombaient dans le
+    /// `_ => continue` final. L'utilisateur voulait restreindre ; il obtenait
+    /// tout.
+    #[test]
+    fn une_regle_intraduisible_rend_faux_jamais_tout() {
+        let w = where_of(r#"[{"field":"zzz_inexistant","op":"equals","value":"x"}]"#);
+        assert!(
+            w.contains("1 = 0"),
+            "un champ inconnu doit rendre FAUX, pas rien — obtenu : {w:?}"
+        );
+        assert!(
+            !w.is_empty(),
+            "une clause vide vaut « toute la bibliothèque »"
+        );
+    }
+
+    /// Le champ que l'éditeur proposait et que le moteur ignorait en entier.
+    #[test]
+    fn le_compositeur_filtre_enfin() {
+        let w = where_of(r#"[{"field":"composer","op":"equals","value":"Mozart"}]"#);
+        assert!(w.contains("t.composer"), "{w}");
+        assert!(w.contains("LOWER"), "la comparaison ignore la casse : {w}");
+        assert!(
+            !w.contains("1 = 0"),
+            "la règle doit être TRADUITE, pas refusée : {w}"
+        );
+    }
+
+    /// « Titre = X » ne rendait que « contient » ; tout le reste tombait.
+    #[test]
+    fn le_titre_accepte_autre_chose_que_contient() {
+        for op in ["equals", "not_equals", "starts_with", "is_empty"] {
+            let regle = format!(r#"[{{"field":"title","op":"{op}","value":"Kind of Blue"}}]"#);
+            let w = where_of(&regle);
+            assert!(w.contains("t.title"), "opérateur {op} : {w}");
+            assert!(
+                !w.contains("1 = 0"),
+                "opérateur {op} doit être traduit : {w}"
+            );
+        }
+    }
+
+    /// Les graphies d'opérateur qui circulent — éditeur, semis, anciennes
+    /// règles — mènent au même SQL.
+    #[test]
+    fn les_graphies_d_operateur_se_rejoignent() {
+        let a = where_of(r#"[{"field":"artist","op":"="  ,"value":"Coltrane"}]"#);
+        let b = where_of(r#"[{"field":"artist","op":"eq" ,"value":"Coltrane"}]"#);
+        let c = where_of(r#"[{"field":"artist","op":"equals","value":"Coltrane"}]"#);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert!(a.contains("ar.name"), "{a}");
+    }
+
+    /// « Jamais écoutée » reste l'absence de ligne d'historique, pas un
+    /// compte nul — la remise à plat ne devait pas l'emporter.
+    #[test]
+    fn jamais_ecoutee_reste_l_absence_d_historique() {
+        let w = where_of(r#"[{"field":"play_count","op":"equals","value":"0"}]"#);
+        assert!(
+            w.contains("NOT IN (SELECT track_id FROM listen_history"),
+            "{w}"
+        );
+    }
 
     // #1008: "Album/Année/Format contient X" produced no WHERE at all (the
     // (field, op) pairs were unhandled → `_ => continue`), so every rule was
@@ -896,8 +877,20 @@ mod tests {
     // build a real condition on the right column.
     #[test]
     fn album_contains_builds_condition() {
+        // #1231 — la forme a changé : la traduction générique compare en
+        // minuscules des DEUX côtés, ce que l'ancienne ne faisait pas pour
+        // l'album. « lux » trouve désormais « LUX ». On tient le comportement,
+        // pas la graphie du SQL.
         let w = where_of(r#"[{"field":"album","op":"contains","value":"LUX"}]"#);
-        assert!(w.contains("al.title LIKE '%LUX%'"), "got: {w}");
+        assert!(w.contains("al.title"), "got: {w}");
+        assert!(
+            w.contains("LOWER"),
+            "la comparaison doit ignorer la casse : {w}"
+        );
+        assert!(
+            w.contains("'%LUX%'") || w.contains("LOWER('%LUX%')"),
+            "got: {w}"
+        );
     }
 
     #[test]
@@ -908,9 +901,11 @@ mod tests {
 
     #[test]
     fn format_contains_is_case_insensitive() {
+        // #1231 — `LOWER`/`LOWER` au lieu de `UPPER`/`UPPER` : même
+        // insensibilité, une seule façon de l'écrire pour tous les champs.
         let w = where_of(r#"[{"field":"format","op":"contains","value":"flac"}]"#);
         assert!(
-            w.contains("UPPER(t.format) LIKE UPPER('%flac%')"),
+            w.contains("LOWER(t.format) LIKE LOWER('%flac%')"),
             "got: {w}"
         );
     }

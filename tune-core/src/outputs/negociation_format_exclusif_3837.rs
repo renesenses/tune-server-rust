@@ -121,6 +121,31 @@ pub(crate) const REPLIS_EXCLUSIFS: [CandidatFormat; 3] = [
     CandidatFormat::plein(16),
 ];
 
+/// `AUDCLNT_E_DEVICE_IN_USE` : l'endpoint est déjà tenu en exclusif (#3067).
+pub(crate) const AUDCLNT_E_DEVICE_IN_USE: i32 = 0x8889000Au32 as i32;
+
+/// #3067 — le refus « périphérique occupé », dit en clair.
+///
+/// Relevé sur la .42 : avec le réglage Windows par défaut (« donner la
+/// priorité aux applications en mode exclusif »), un flux PARTAGÉ — un onglet
+/// de navigateur, un son système — n'empêche pas l'exclusif, il perd le
+/// périphérique. `AUDCLNT_E_DEVICE_IN_USE` veut donc dire qu'un autre
+/// programme tient déjà l'endpoint EN EXCLUSIF, ou que ce réglage est décoché.
+/// Le message d'avant — un `HRESULT` nu, ou « aucun format PCM accepté » quand
+/// le refus tombait dès `IsFormatSupported` — envoyait chercher du côté du
+/// format ou du pilote.
+///
+/// `None` pour tout autre code : ceux-là restent rapportés tels quels.
+pub(crate) fn message_peripherique_occupe(hr: i32) -> Option<String> {
+    (hr == AUDCLNT_E_DEVICE_IN_USE).then(|| {
+        format!(
+            "le périphérique est déjà tenu en mode exclusif par une autre application \
+             (0x{hr:08X}, AUDCLNT_E_DEVICE_IN_USE) — un autre lecteur (Audirvana, foobar2000…) \
+             ou une lecture précédente qui ne l'a pas rendu. Fermez-la, puis relancez la lecture"
+        )
+    })
+}
+
 /// Nombre maximal de sondes, y compris les formats proposés par le pilote.
 /// Une borne dure : un pilote qui proposerait en boucle ne fait pas boucler
 /// l'ouverture d'une zone.
@@ -248,6 +273,12 @@ where
                 });
             }
             ResultatSonde::Refuse { hr, propose } => {
+                // Un endpoint occupé refuse tous les formats pour la même
+                // raison : inutile de descendre la liste, et surtout ne pas
+                // conclure « aucun format accepté » (#3067).
+                if let Some(occupe) = message_peripherique_occupe(hr) {
+                    return Err(occupe);
+                }
                 refus.push(format!("{candidat} → 0x{hr:08X}"));
                 if let Some(propose) = propose {
                     ranger_le_format_propose(&mut candidats, index, propose);
@@ -305,6 +336,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #3067 — `AUDCLNT_E_DEVICE_IN_USE` : l'endpoint est déjà tenu en
+    /// exclusif. Ce n'est pas le format qui est refusé : descendre la liste des profondeurs n'y change rien, et le
+    /// message « aucun format PCM accepté » envoyait chercher au mauvais
+    /// endroit.
+    #[test]
+    fn un_peripherique_occupe_arrete_la_negociation_et_se_nomme() {
+        let mut sondes = 0usize;
+        let erreur = negocier_format_exclusif(32, 2, 44_100, |_| {
+            sondes += 1;
+            ResultatSonde::Refuse {
+                hr: AUDCLNT_E_DEVICE_IN_USE,
+                propose: None,
+            }
+        })
+        .expect_err("un périphérique occupé ne s'ouvre pas");
+        assert_eq!(
+            sondes, 1,
+            "le premier refus « occupé » suffit : les replis de format ne libèrent pas le périphérique"
+        );
+        assert!(
+            erreur.contains("déjà tenu en mode exclusif"),
+            "le message doit nommer la cause : {erreur}"
+        );
+        assert!(erreur.contains("0x8889000A"), "{erreur}");
     }
 
     #[test]

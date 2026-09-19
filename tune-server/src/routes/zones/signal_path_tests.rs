@@ -3001,3 +3001,123 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
         );
     }
 }
+
+// ── #4172 — WASAPI sans contrat exclusif = mode partagé, nommé et non bit-perfect ──
+
+/// Le témoin : « WASAPI » sans contrat de signal se nomme partagé et n'est
+/// pas intact — avant, il se nommait « WASAPI » tout court et passait pour
+/// bit-perfect, quelle que soit la cadence à laquelle le mixeur Windows
+/// sortait réellement.
+#[test]
+fn wasapi_sans_contrat_exclusif_se_nomme_partage_et_n_est_pas_bit_perfect_4172() {
+    use super::signal_path::{etiquette_du_transport_local, transport_partage_est_intact};
+    assert_eq!(
+        etiquette_du_transport_local("WASAPI", false),
+        "WASAPI (shared \u{2014} Windows mixer)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("WASAPI", true),
+        "WASAPI (exclusive)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("ASIO", true),
+        "ASIO (exclusive)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("CoreAudio", false),
+        "CoreAudio"
+    );
+    assert_eq!(etiquette_du_transport_local("ALSA", false), "ALSA");
+    assert!(!transport_partage_est_intact("WASAPI"), "mixeur Windows");
+    assert!(transport_partage_est_intact("CoreAudio"), "inchangé");
+    assert!(transport_partage_est_intact("ALSA"), "inchangé");
+}
+
+/// La garde du BRANCHEMENT : le bras `"local"` de `decrire_le_transport`
+/// passe par l'étiquette et, sans contrat, par le verdict du mode partagé.
+#[test]
+fn le_transport_local_dit_son_mode_et_son_verdict_4172() {
+    let src = include_str!("signal_path.rs");
+    let bras = src.find("\"local\" => {").expect("le bras local");
+    let bloc = &src[bras..bras + 1_500];
+    assert!(
+        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe)"),
+        "le nom vient de l'étiquette"
+    );
+    assert!(
+        bloc.contains("None => transport_partage_est_intact(audio_backend)"),
+        "sans contrat, le verdict est celui du mode partagé"
+    );
+}
+
+// ── #3973 — « jouer, et le dire » : PURE dégradé par une conversion ──
+
+/// Zone en PURE, la sortie a MESURÉ une conversion 96 → 48 kHz : le chemin du
+/// signal publie la conversion (de, vers), l'étape porte son code, et PURE
+/// est déclaré DÉGRADÉ — au lieu d'un badge PURE allumé sur un signal
+/// rééchantillonné.
+#[test]
+fn pure_avec_conversion_mesuree_est_declare_degrade_3973() {
+    let (backend, zone) = local_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(48_000, 2, false));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(sp["pure"], serde_json::json!(true), "{sp}");
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(true),
+        "PURE + conversion de fréquence = PURE dégradé : {sp}"
+    );
+    assert_eq!(
+        sp["rate_conversion"],
+        serde_json::json!({"from_hz": 96_000, "to_hz": 48_000}),
+        "{sp}"
+    );
+    assert_eq!(sp["bit_perfect"], serde_json::json!(false));
+    assert_eq!(sp["strict_bitperfect"], serde_json::json!(false));
+    let etape = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Resampler")
+        .expect("l'étape Resampler");
+    assert_eq!(etape["code"], "rate_conversion", "{etape}");
+}
+
+/// Même zone en PURE, aucune conversion : PURE n'est PAS dégradé, et
+/// `rate_conversion` est nul — la garde contre un correctif qui crierait au
+/// loup.
+#[test]
+fn pure_sans_conversion_n_est_pas_degrade_3973() {
+    let (backend, zone) = local_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(96_000, 2, false));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(sp["pure"], serde_json::json!(true));
+    assert_eq!(sp["pure_degraded"], serde_json::json!(false), "{sp}");
+    assert!(sp["rate_conversion"].is_null(), "{sp}");
+}

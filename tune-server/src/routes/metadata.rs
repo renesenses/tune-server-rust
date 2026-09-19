@@ -9,8 +9,12 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
+use std::sync::Arc;
+
+use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
+use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::metadata::auto_fix::AutoFixEngine;
@@ -2546,6 +2550,105 @@ struct MergeAlbumsRequest {
     album_ids: Vec<i64>,
 }
 
+/// L'artiste d'album des compilations — celui que le scan pose lui-même
+/// (`tune_core::library::ingest::fields_for`, `auto_scan.rs`). La fusion
+/// manuelle ne l'invente pas : elle le reprend.
+const ARTISTE_DES_COMPILATIONS: &str = "Various Artists";
+
+/// Bilan de [`fusionner_les_albums`].
+struct BilanDeFusion {
+    master_id: i64,
+    tracks_moved: i64,
+    total_tracks: i64,
+    merged_ids: Vec<i64>,
+    /// L'artiste posé sur l'album réuni quand c'est une compilation.
+    artiste_generique: Option<String>,
+}
+
+/// #4436 — réunit des albums en un seul, par la fusion qui existe déjà
+/// ([`AlbumRepo::absorber`], celle de `POST /library/albums/{cible}/absorber`).
+///
+/// Avant : trois requêtes à la main qui ne migraient que `tracks` — favoris,
+/// notes, étiquettes et le marqueur d'édition manuelle des albums absorbés
+/// mouraient avec eux — et qui laissaient à l'album réuni l'artiste de
+/// l'album le plus fourni. Les douze vignettes « Coco María Presents »
+/// devenaient UNE vignette… sous « Raz Olsher » (mesuré sur le .18 le
+/// 19/09/2026 : `album_artist: Raz Olsher`, `is_compilation: true`). #4427
+/// demandait « un seul disque, artiste d'album générique ».
+///
+/// La cible est l'album qui a le plus de pistes, le premier de la liste à
+/// égalité — règle d'origine de cette route, inchangée. Si l'album réuni est
+/// une compilation (le client pose le drapeau AVANT de fusionner, c'est
+/// l'ordre de son onglet « Compilations »), il prend l'artiste que le scan
+/// donne aux compilations, et ce choix est marqué tenu à la main (C3) : ni la
+/// passe de réparation ni `reclasser_en_compilation` ne le reprendront. Un
+/// album réuni SANS drapeau (onglet « Doublons ») garde son artiste : rien
+/// n'est deviné à la place de l'utilisateur.
+fn fusionner_les_albums(
+    backend: &Arc<dyn DbBackend>,
+    album_ids: &[i64],
+) -> Result<BilanDeFusion, String> {
+    let track_repo = TrackRepo::with_backend(backend.clone());
+    let album_repo = AlbumRepo::with_backend(backend.clone());
+
+    let mut best_id = album_ids[0];
+    let mut best_count = 0usize;
+    for &aid in album_ids {
+        let cnt = track_repo.list_by_album(aid).map(|t| t.len()).unwrap_or(0);
+        if cnt > best_count {
+            best_count = cnt;
+            best_id = aid;
+        }
+    }
+
+    let mut tracks_moved = 0i64;
+    let mut merged_ids = Vec::new();
+    for &aid in album_ids {
+        if aid == best_id || merged_ids.contains(&aid) {
+            continue;
+        }
+        match album_repo.absorber(best_id, aid) {
+            Ok(rapport) => {
+                tracks_moved += rapport.pistes as i64;
+                merged_ids.push(aid);
+            }
+            Err(e) => {
+                tracing::warn!(cible = best_id, doublon = aid, error = %e, "albums_merge_absorption_failed");
+            }
+        }
+    }
+
+    let artiste_generique = match album_repo.get(best_id).map_err(|e| e.to_string())? {
+        Some(album) if album.is_compilation => {
+            let divers = ArtistRepo::with_backend(backend.clone())
+                .get_or_create(ARTISTE_DES_COMPILATIONS, None, None)
+                .map_err(|e| e.to_string())?;
+            let divers_id = divers.id.ok_or("artiste des compilations sans id")?;
+            if album.artist_id != Some(divers_id) {
+                album_repo
+                    .reparer_compilation(best_id, true, Some(divers_id))
+                    .map_err(|e| e.to_string())?;
+                AlbumMetadataRepo::with_backend(backend.clone())
+                    .marquer_edition_manuelle(best_id, &["artist"])?;
+            }
+            Some(ARTISTE_DES_COMPILATIONS.to_string())
+        }
+        _ => None,
+    };
+
+    let total_tracks = track_repo
+        .list_by_album(best_id)
+        .map(|t| t.len() as i64)
+        .unwrap_or(0);
+    Ok(BilanDeFusion {
+        master_id: best_id,
+        tracks_moved,
+        total_tracks,
+        merged_ids,
+        artiste_generique,
+    })
+}
+
 async fn merge_albums(
     State(state): State<AppState>,
     Json(body): Json<MergeAlbumsRequest>,
@@ -2557,70 +2660,21 @@ async fn merge_albums(
         )
             .into_response();
     }
-
-    let track_repo = TrackRepo::with_backend(state.backend.clone());
-
-    let mut best_id = body.album_ids[0];
-    let mut best_count = 0i64;
-    for &aid in &body.album_ids {
-        let cnt = track_repo
-            .list_by_album(aid)
-            .map(|t| t.len() as i64)
-            .unwrap_or(0);
-        if cnt > best_count {
-            best_count = cnt;
-            best_id = aid;
-        }
+    match fusionner_les_albums(&state.backend, &body.album_ids) {
+        Ok(b) => Json(json!({
+            "master_id": b.master_id,
+            "tracks_moved": b.tracks_moved,
+            "total_tracks": b.total_tracks,
+            "merged_ids": b.merged_ids,
+            "album_artist": b.artiste_generique,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
-
-    let mut tracks_moved = 0i64;
-    let mut merged_ids = Vec::new();
-    for &aid in &body.album_ids {
-        if aid == best_id {
-            continue;
-        }
-        let moved = state
-            .backend
-            .execute(
-                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                &[
-                    &best_id as &dyn tune_core::db::backend::ToSqlValue,
-                    &aid as &dyn tune_core::db::backend::ToSqlValue,
-                ],
-            )
-            .unwrap_or(0) as i64;
-        tracks_moved += moved;
-        state
-            .backend
-            .execute(
-                "DELETE FROM albums WHERE id = ?",
-                &[&aid as &dyn tune_core::db::backend::ToSqlValue],
-            )
-            .ok();
-        merged_ids.push(aid);
-    }
-
-    state
-        .backend
-        .execute_batch(&format!(
-            "UPDATE albums SET track_count = {}",
-            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
-        ))
-        .ok();
-
-    let total_tracks = track_repo
-        .list_by_album(best_id)
-        .map(|t| t.len() as i64)
-        .unwrap_or(0);
-
-    Json(json!({
-        "master_id": best_id,
-        "tracks_moved": tracks_moved,
-        "total_tracks": total_tracks,
-        "merged_ids": merged_ids,
-    }))
-    .into_response()
 }
+
+#[cfg(test)]
+mod tests_fusion_compilation;
 
 #[cfg(test)]
 mod year_path_tests {
