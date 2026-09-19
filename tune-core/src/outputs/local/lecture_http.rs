@@ -160,6 +160,12 @@ mod tests {
                         Err(e) => panic!("accept: {e}"),
                     }
                 };
+                // Sous Windows et macOS, le socket accepté HÉRITE du mode non
+                // bloquant de l'écouteur (Linux, lui, rend un socket bloquant).
+                // Sans ce retour explicite au mode bloquant, la lecture de la
+                // requête rend `WouldBlock` dès que ses octets ne sont pas encore
+                // arrivés, le serveur se tait, et le test échoue au hasard (#4531).
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
