@@ -1804,6 +1804,34 @@ mod tests_cache_utilisateur {
             Ok(())
         }
 
+        /// #4444 — ce que Qobuz rend pour Cat Power : le même « Try Me »
+        /// (2:19) sous deux identifiants — deux éditions de l'album —, et
+        /// un troisième doublon par identifiant strict. Les vrais morceaux
+        /// distincts restent dans l'ordre du service.
+        async fn get_artist_top_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            let mut try_me = piste("q-1", "Try Me", "Cat Power");
+            try_me.duration_ms = 139_000;
+            let mut could_we = piste("q-2", "Could We", "Cat Power");
+            could_we.duration_ms = 131_000;
+            let mut nothing = piste("q-3", "Nothing Compares 2 U", "Cat Power");
+            nothing.duration_ms = 357_000;
+            let mut try_me_bis = piste("q-4", "Try Me", "Cat Power");
+            try_me_bis.duration_ms = 139_000;
+            let mut try_me_ter = piste("q-1", "Try Me", "Cat Power");
+            try_me_ter.duration_ms = 139_000;
+            // Même titre, mais une AUTRE prise : 40 s de plus, elle reste.
+            let mut try_me_live = piste("q-5", "Try Me", "Cat Power");
+            try_me_live.duration_ms = 179_000;
+            Ok(vec![
+                try_me,
+                could_we,
+                nothing,
+                try_me_bis,
+                try_me_ter,
+                try_me_live,
+            ])
+        }
+
         /// #3489 — un connecteur qui date ses albums, comme Qobuz et Tidal.
         /// `None` quand `date_brute` est vide : c'est le repli que doivent
         /// suivre tous les connecteurs qui ne surchargent rien.
@@ -1827,6 +1855,50 @@ mod tests_cache_utilisateur {
             );
             Ok(Some(vec![element]))
         }
+    }
+
+    /// #4444 — la route des titres phares ne rend pas deux fois le même
+    /// morceau. Le service en donne six lignes dont trois « Try Me » 2:19 ;
+    /// l'écran doit en voir un seul, à son rang, et garder la prise live.
+    #[tokio::test]
+    async fn les_titres_phares_ne_portent_pas_deux_fois_le_meme_morceau() {
+        let etat = etat_essai(
+            "essai-titres-phares",
+            Arc::new(AtomicUsize::new(0)),
+            Duration::ZERO,
+        );
+        let r = service_artist_top_tracks(
+            State(etat),
+            Path((
+                String::from("essai-titres-phares"),
+                String::from("cat-power"),
+            )),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        let v: Value = serde_json::from_slice(&octets).unwrap();
+        let titres: Vec<(String, u64)> = v
+            .as_array()
+            .expect("une liste de pistes")
+            .iter()
+            .map(|p| {
+                (
+                    p["title"].as_str().unwrap_or_default().to_string(),
+                    p["duration_ms"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            titres,
+            vec![
+                ("Try Me".to_string(), 139_000),
+                ("Could We".to_string(), 131_000),
+                ("Nothing Compares 2 U".to_string(), 357_000),
+                ("Try Me".to_string(), 179_000),
+            ],
+            "« Try Me » 2:19 doit sortir UNE fois, au rang 1 ; la prise de 2:59 est un autre enregistrement (#4444)"
+        );
     }
 
     fn etat_essai(nom: &str, lectures: Arc<AtomicUsize>, delai: Duration) -> StreamingHttpState {
