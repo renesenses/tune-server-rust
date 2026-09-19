@@ -103,6 +103,7 @@ use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::streaming::traits::{SearchResults, StreamTrack};
 
 use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
@@ -158,6 +159,86 @@ const LIMITE_PAR_DEFAUT: i64 = 20;
 /// a été voulue par quelqu'un.
 fn limite_pour_les_services(limit: i64) -> usize {
     usize::try_from(limit).unwrap_or(LIMITE_PAR_DEFAUT as usize)
+}
+
+/// #4441 — la règle de #4367, appliquée aux pistes venues d'un SERVICE.
+///
+/// FabienM (fil 1839, point 4), après la v0.9.154 : « wish you were here »
+/// rend toujours *Have a Cigar* en section Titres. #4367 avait retiré
+/// `album_title` de ce que l'index LOCAL rapproche (`COLONNES_IDENTITE_PISTE`)
+/// — et la capture le confirme, la bibliothèque passe de 10 à 6 lignes. Mais
+/// les lignes restantes portent le badge QOBUZ : `/catalog/search` de Qobuz
+/// rapproche lui aussi sur le titre d'album, et cette route recopiait sa
+/// réponse telle quelle.
+///
+/// La même règle vaut donc ici, après réception : une piste de service reste
+/// en section Titres si TOUS les jetons de la requête se retrouvent dans ce
+/// qui l'identifie — titre, interprète, compositeur —, jamais dans son album.
+/// L'album, lui, reste trouvé par la section Albums, qui est sa place.
+///
+/// Les jetons sont ceux de l'index local (`format_fts_query` : alphanumériques,
+/// la ponctuation sépare), les guillemets de FabienM tombent donc d'eux-mêmes,
+/// et les accents sont pliés des deux côtés — Qobuz trouve « Déjà Vu » pour
+/// « deja vu », on ne le lui reprend pas. Le rapprochement est par
+/// sous-chaîne, comme le préfixe FTS : « floy » retient encore Pink Floyd.
+/// Une requête sans jeton ne filtre rien.
+///
+/// Ce qui est perdu, et assumé : la tolérance aux fautes de frappe de Qobuz.
+/// Une piste rendue pour « wish you where here » sans qu'aucun mot ne
+/// corresponde ne peut plus rester.
+fn ne_garder_que_les_pistes_qui_repondent(requete: &str, resultats: &mut SearchResults) -> usize {
+    let jetons = jetons_de_recherche(requete);
+    if jetons.is_empty() {
+        return 0;
+    }
+    let avant = resultats.tracks.len();
+    resultats
+        .tracks
+        .retain(|piste| piste_de_service_repond(&jetons, piste));
+    avant - resultats.tracks.len()
+}
+
+/// Minuscules, sans accents (NFD, marques combinantes retirées).
+fn plier(texte: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    texte
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Les jetons alphanumériques d'un texte plié, dans l'ordre.
+fn jetons_plies(texte: &str) -> Vec<String> {
+    plier(texte)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|jeton| !jeton.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn jetons_de_recherche(requete: &str) -> Vec<String> {
+    jetons_plies(requete)
+}
+
+/// Tous les jetons de la requête se retrouvent dans ce qui identifie la
+/// piste — jamais dans son album.
+///
+/// Deux formes sont regardées, comme `format_fts_query_libre` le fait pour
+/// l'index : les jetons séparés d'un espace, et collés — « acdc » retient
+/// « AC/DC ».
+fn piste_de_service_repond(jetons: &[String], piste: &StreamTrack) -> bool {
+    let identite = jetons_plies(&format!(
+        "{} {} {}",
+        piste.title,
+        piste.artist,
+        piste.composer.as_deref().unwrap_or_default()
+    ));
+    let separee = identite.join(" ");
+    let collee = identite.concat();
+    jetons
+        .iter()
+        .all(|jeton| separee.contains(jeton.as_str()) || collee.contains(jeton.as_str()))
 }
 
 #[derive(Deserialize)]
@@ -346,7 +427,17 @@ async fn federated_search(
                 //
                 // « Tel quel » s'arrête au SIGNE : voir
                 // [`limite_pour_les_services`] (#2160).
-                if let Ok(results) = svc.search(&p.q, limite_pour_les_services(limit)).await {
+                if let Ok(mut results) = svc.search(&p.q, limite_pour_les_services(limit)).await {
+                    // #4441 — voir `ne_garder_que_les_pistes_qui_repondent`.
+                    let ecartees = ne_garder_que_les_pistes_qui_repondent(&p.q, &mut results);
+                    if ecartees > 0 {
+                        tracing::debug!(
+                            service = %svc_name,
+                            ecartees,
+                            gardees = results.tracks.len(),
+                            "search_pistes_de_service_hors_identite_ecartees"
+                        );
+                    }
                     service_results.insert(svc_name, json!(results));
                 }
             }
@@ -655,5 +746,32 @@ mod tests_pistes_de_service_i4441 {
         );
         assert_eq!(pistes_qobuz_pour("beyonce deja vu").await, vec!["q-deja"]);
         assert_eq!(pistes_qobuz_pour("Déjà").await, vec!["q-deja"]);
+    }
+
+    /// Les pièces du filtre : guillemets et ponctuation tombent, la forme
+    /// collée retient « AC/DC », une requête vide ne filtre rien.
+    #[test]
+    fn les_jetons_et_la_forme_collee() {
+        use super::{jetons_de_recherche, ne_garder_que_les_pistes_qui_repondent};
+        assert_eq!(
+            jetons_de_recherche("\"Wish You Were Here\""),
+            vec!["wish", "you", "were", "here"]
+        );
+        assert_eq!(jetons_de_recherche("Beyoncé"), vec!["beyonce"]);
+        assert!(jetons_de_recherche("\"\" - ").is_empty());
+
+        let mut r = SearchResults {
+            tracks: vec![
+                piste("acdc", "Back in Black", "AC/DC", "Back in Black"),
+                piste("cigar", "Have a Cigar", "Pink Floyd", "Wish You Were Here"),
+            ],
+            albums: vec![],
+            artists: vec![],
+            playlists: vec![],
+        };
+        assert_eq!(ne_garder_que_les_pistes_qui_repondent("acdc", &mut r), 1);
+        assert_eq!(r.tracks.len(), 1);
+        assert_eq!(r.tracks[0].id, "acdc");
+        assert_eq!(ne_garder_que_les_pistes_qui_repondent("  ", &mut r), 0);
     }
 }
