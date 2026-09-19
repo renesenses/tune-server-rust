@@ -532,6 +532,26 @@ pub trait StreamingService: Send + Sync {
         let _ = (genre_id, limit);
         Ok(vec![])
     }
+    /// Une rubrique éditoriale (`section_id`, un identifiant de
+    /// [`get_featured_sections`](Self::get_featured_sections)) restreinte à un
+    /// genre (#3481).
+    ///
+    /// Par défaut : la rubrique « nouveautés » est ce que rend déjà
+    /// [`get_genre_albums`](Self::get_genre_albums) ; toute autre rubrique est
+    /// vide, pour un service qui ne sait pas filtrer ses rubriques par genre.
+    /// Qobuz la surcharge : son `/album/getFeatured` honore `genre_ids` pour
+    /// chacun de ses `type`.
+    async fn get_genre_section(
+        &self,
+        genre_id: &str,
+        section_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        if section_id == "new-releases" {
+            return self.get_genre_albums(genre_id, limit).await;
+        }
+        Ok(vec![])
+    }
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         Ok(vec![])
     }
