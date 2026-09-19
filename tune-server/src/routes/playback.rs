@@ -2273,10 +2273,27 @@ async fn play(
         queue_repo.set_current(zone_id, start).ok();
     }
 
-    let target_id = track_ids
+    let mut target_id = track_ids
         .get(start as usize)
         .copied()
         .unwrap_or(track_ids[0]);
+    // #4362 (point 2) — un « Tout lire » (album, liste, `track_ids`) dont la
+    // piste de départ vient d'un serveur multimédia ABSENT enjambe les pistes
+    // injoignables et part sur la première jouable, en le disant, au lieu de
+    // rendre le refus et de ne rien jouer. Une demande nue (une seule piste
+    // relancée) garde le refus : c'est CETTE piste qui a été demandée.
+    let mut queue_position = queue_position;
+    if !demande_nue
+        && file_conservee.is_none()
+        && let Some((position, Some(track_id))) = state
+            .orchestrator
+            .enjamber_les_serveurs_absents(zone_id, queue_position)
+            .await
+    {
+        queue_repo.set_current(zone_id, position).ok();
+        queue_position = position;
+        target_id = track_id;
+    }
     let track = track_repo.get(target_id).ok().flatten();
 
     let output_device_id = body.output_device_id.or_else(|| {
@@ -2687,6 +2704,14 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
         return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
     };
 
+    // #4362 (point 2) — « Suivant » enjambe les pistes dont le serveur
+    // multimédia est absent au lieu de s'arrêter sur la première. Hors du
+    // bloc détaché : la garde #3270 borne ce bloc à l'annonce de son échec.
+    let next_pos = state
+        .orchestrator
+        .enjamber_les_serveurs_absents(zone_id, next_pos)
+        .await
+        .map_or(next_pos, |(position, _)| position);
     let s = state.clone();
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {

@@ -298,4 +298,64 @@ async fn un_serveur_absent_refuse_la_lecture_au_lieu_de_jouer_du_silence() {
              nommer QUI laisse l'auditeur devant sa bibliothèque entière — {corps}"
         );
     }
+
+    // --- 5. « TOUT LIRE » SUR UNE FILE MIXTE (point 2 de #4362) ---
+    //
+    // Même piste injoignable EN TÊTE, suivie d'une piste locale. Avant le
+    // correctif, la route rendait le refus de la première et rien ne partait :
+    // toute la file était perdue pour une piste. Elle doit maintenant ENJAMBER
+    // la piste injoignable et partir sur la suivante.
+    //
+    // La piste locale pointe un fichier absent : ce qui compte ici n'est pas
+    // qu'elle SONNE, c'est que la route ait quitté la piste injoignable — le
+    // refus « ne répond pas » ne doit plus être la réponse, et le curseur de
+    // la file doit être sur la position 1.
+    etat.backend
+        .execute_batch(
+            "INSERT INTO tracks (id, title, file_path, source) \
+               VALUES (9001, 'Piste locale du banc', '/banc-4362/absent.flac', 'local');",
+        )
+        .expect("une piste locale");
+    let (_statut, corps) = appel(
+        &app,
+        Request::post("/api/v1/zones/3/play")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({ "track_ids": [track_id, 9001] }).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !corps.contains("ne répond pas"),
+        "« Tout lire » sur une file mixte ne doit plus buter sur la première \
+         piste injoignable : elle est enjambée — {corps}"
+    );
+    let file = tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(etat.backend.clone())
+        .get_ordered(3)
+        .expect("file lisible");
+    assert_eq!(file.len(), 2, "la file garde les deux pistes");
+    let courante = file
+        .iter()
+        .find(|e| e.is_current)
+        .map(|e| (e.position, e.track_id));
+    assert_eq!(
+        courante,
+        Some((1, Some(9001))),
+        "le curseur doit être sur la piste jouable, pas sur l'injoignable"
+    );
+
+    // --- 6. Rien de jouable après : le refus ordinaire parle, comme avant ---
+    let (statut, corps) = appel(
+        &app,
+        Request::post("/api/v1/zones/3/play")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "track_ids": [track_id] }).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        (statut.is_client_error() || statut.is_server_error()) && corps.contains("ne répond pas"),
+        "une file sans aucune piste jouable garde le refus nommé (statut {statut}) — {corps}"
+    );
 }
