@@ -2371,10 +2371,17 @@ impl AlbumRepo {
                 .map(|id| id.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            // `tracks` d'ABORD (`CROSS JOIN`) : SQLite n'y réordonne pas les
+            // tables. Sans cela il partait de `idx_track_metadata_key` — TOUTES
+            // les lignes DR de la bibliothèque — pour n'en garder que la page :
+            // 42 ms pour 50 albums sur 20 000 (mesure #4521). Ici :
+            // `idx_tracks_album_id`, puis la clé primaire `(track_id, key)`.
+            // PostgreSQL traite ce `CROSS JOIN … WHERE` comme une jointure
+            // ordinaire et reste libre de son plan.
             let sql = format!(
                 "SELECT tdr.album_id, {} \
-                   FROM track_metadata tm JOIN tracks tdr ON tdr.id = tm.track_id \
-                  WHERE tdr.album_id IN ({id_list}) AND {} \
+                   FROM tracks tdr CROSS JOIN track_metadata tm \
+                  WHERE tm.track_id = tdr.id AND tdr.album_id IN ({id_list}) AND {} \
                   GROUP BY tdr.album_id",
                 crate::db::facet_filter::DR_ALBUM_VALUE,
                 crate::db::facet_filter::dr_tag_where(engine),
