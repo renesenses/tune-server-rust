@@ -208,6 +208,47 @@ fn i3326_un_temporaire_abandonne_n_est_pas_un_magasin_de_secours() {
     );
 }
 
+/// Le verrou `flock` appartient a la *description de fichier ouverte*, pas au
+/// descripteur : un `fork()` concurrent en duplique une copie que la fermeture
+/// du notre n'annule pas. C'est exactement ce que laisse, le temps d'un
+/// `exec()`, tout `Command::spawn` lance par un fil voisin -- le temoin
+/// multiprocessus juste au-dessus, entre autres. Sans relachement explicite du
+/// verrou, rouvrir le magasin aussitot apres un `drop` rend `Occupe` sans
+/// qu'aucun autre magasin ne soit ouvert : le faux rouge de #4331, visible sur
+/// les runners GitHub ou la fenetre fork->exec dure, et invisible ailleurs.
+#[cfg(unix)]
+#[test]
+fn i4331_un_fork_concurrent_ne_retient_pas_le_verrou_apres_le_drop() {
+    let t = tempfile::tempdir().unwrap();
+    let dossier = t.path().join("sendspin");
+    let magasin = MagasinAppairage::ouvrir(&dossier).unwrap();
+    let id = magasin.identite().id();
+    // L'enfant se contente d'attendre : apres un fork depuis un processus
+    // multi-fils, rien d'autre n'est sur. Il detient une copie du descripteur.
+    let enfant = unsafe { libc::fork() };
+    assert!(enfant >= 0, "fork impossible");
+    if enfant == 0 {
+        unsafe {
+            libc::sleep(30);
+            libc::_exit(0);
+        }
+    }
+    drop(magasin);
+    let relu = MagasinAppairage::ouvrir(&dossier);
+    // Reprendre l'enfant avant toute assertion : un echec ne doit pas laisser
+    // de processus derriere lui.
+    unsafe {
+        libc::kill(enfant, libc::SIGKILL);
+        libc::waitpid(enfant, std::ptr::null_mut(), 0);
+    }
+    let relu = relu.expect("le verrou doit etre relache malgre un fork concurrent");
+    assert_eq!(
+        relu.identite().id(),
+        id,
+        "le magasin rouvert est bien le meme"
+    );
+}
+
 #[test]
 fn i3326_le_verrou_et_la_reprise_sont_verifies_entre_processus_distincts() {
     let t = tempfile::tempdir().unwrap();

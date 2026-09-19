@@ -295,6 +295,126 @@ impl PlaybackOrchestrator {
             .filter(|u| est_une_url_http(u))
     }
 
+    /// **#4323 — une URI qui désigne une piste de NOTRE bibliothèque doit
+    /// retrouver son `track_id`, et donc son vrai titre.**
+    ///
+    /// Le MediaRenderer reçoit un `SetAVTransportURI` et construit un
+    /// `PlayRequest` avec `track_id: None`, `source_id: Some(<URI>)` et un
+    /// `title` qui vient UNIQUEMENT du DIDL envoyé par le point de contrôle.
+    /// Quand ce DIDL est vide — ou illisible —, `resolve_direct_url_de_source`
+    /// retombe sur « Episode », le repli du chemin podcast/radio. Chez Tades
+    /// (fil 1819), neuf cartes « Episode » sans pochette dans « Récemment
+    /// joué », pour des lectures dont l'URI était
+    /// `http://192.168.0.167:8888/api/v1/library/tracks/187500/audio` :
+    /// c'est-à-dire des pistes que Tune connaît par cœur.
+    ///
+    /// Cette URI n'est pas quelconque : c'est EXACTEMENT ce que le serveur
+    /// média de Tune publie dans le `<res>` de chaque piste
+    /// ([`crate::upnp_server::track_audio_url`]). Le point de contrôle l'a
+    /// recopiée telle quelle. On la relit donc à l'envers, et on repose sur la
+    /// demande ce que la ligne de bibliothèque dit déjà.
+    ///
+    /// Trois choix, tous restrictifs :
+    ///
+    /// 1. **On ne contredit jamais le demandeur.** Un `track_id` déjà posé, un
+    ///    titre déjà nommé par le DIDL, un artiste déjà là : on ne comble que
+    ///    des silences. Un point de contrôle qui envoie de bonnes métadonnées
+    ///    garde les siennes.
+    /// 2. **`source` et `source_id` ne bougent PAS.** Le renderer reconnaît sa
+    ///    session en comparant `now_playing.source_id` à l'URI de la session
+    ///    (`doit_reprendre`), et la reprise après pause en dépend. Le chemin
+    ///    des octets reste celui d'aujourd'hui : `url_nommee` l'emporte dans
+    ///    `resolve_direct_url_de_source`, l'URI est jouée telle quelle.
+    /// 3. **L'hôte doit être le nôtre** ([`hote_de_cette_machine`]). Un second
+    ///    Tune sur le même réseau publie SES `<res>` avec SON adresse, et
+    ///    l'identifiant 187500 n'y désigne pas la même piste. Afficher un
+    ///    titre FAUX serait pire que « Episode ». Quand l'hôte ne se
+    ///    reconnaît pas, on ne fait rien et le comportement d'avant demeure.
+    pub(super) fn resoudre_l_uri_en_piste_de_bibliotheque(&self, req: &mut PlayRequest) {
+        if req.track_id.is_some() {
+            return;
+        }
+        let Some(track_id) = req
+            .source_id
+            .as_deref()
+            .and_then(track_id_dans_une_url_audio_de_tune)
+        else {
+            return;
+        };
+        let Some(piste) = crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .ok()
+            .flatten()
+        else {
+            // L'URL a la bonne forme mais la ligne n'existe pas (piste
+            // supprimée, base d'un autre serveur derrière la même adresse) :
+            // rien n'est affirmé.
+            return;
+        };
+        let titre_etait_vide = req.title.is_none();
+        req.track_id = Some(track_id);
+        if req.title.is_none() {
+            req.title = Some(piste.title.clone());
+        }
+        if req.artist_name.is_none() {
+            req.artist_name = piste.artist_name.clone();
+        }
+        if req.album_title.is_none() {
+            req.album_title = piste.album_title.clone();
+        }
+        if req.cover_url.is_none() {
+            req.cover_url = piste.cover_path.clone();
+        }
+        if req.duration_ms.is_none() && piste.duration_ms > 0 {
+            req.duration_ms = Some(piste.duration_ms);
+        }
+        info!(
+            zone_id = req.zone_id,
+            track_id,
+            titre_etait_vide,
+            titre = %piste.title,
+            "uri_du_renderer_resolue_en_piste_de_bibliotheque"
+        );
+    }
+
+    /// #4362 — le serveur multimédia d'où vient cette piste est-il ABSENT, au
+    /// sens exact où la bibliothèque affiche « Serveur absent » ?
+    ///
+    /// Deux lectures étroites et sans effet : le `source_id` de la ligne (qui
+    /// porte l'UDN en préfixe depuis la phase 2 de #2219), puis le registre
+    /// durable des serveurs — quelques unités, jamais des dizaines de milliers
+    /// de lignes, et seulement sur le chemin d'une piste indexée.
+    ///
+    /// Le verdict lui-même n'est pas rendu ici : il est délégué à la
+    /// qualification que la route `/network/media-servers` appelle déjà
+    /// (`discovery/presence_serveur.rs`), plafond de bascule en masse compris.
+    /// Deux implémentations auraient fini par dire deux choses différentes du
+    /// même serveur, et l'auditeur aurait vu un badge qui contredit un refus.
+    ///
+    /// `None` à la moindre incertitude — piste sans `source_id` exploitable,
+    /// serveur inconnu du registre, base illisible. Un défaut de base ne doit
+    /// pas se muer en refus de lecture.
+    pub(super) fn serveur_de_la_piste_absent(
+        &self,
+        track_id: i64,
+    ) -> Option<super::serveur_source_absent_4362::ServeurAbsent> {
+        use crate::db::backend::ToSqlValue;
+        let source_id: String = self
+            .db
+            .query_one(
+                "SELECT source_id FROM tracks WHERE id = ?",
+                &[&track_id as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))?;
+        let udn = super::serveur_source_absent_4362::udn_de_la_piste(&source_id)?;
+        let registre = crate::db::media_server_repo::MediaServerRepo::with_backend(self.db.clone())
+            .lister()
+            .ok()?;
+        super::serveur_source_absent_4362::serveur_absent(&registre, udn)
+    }
+
     pub(super) async fn resolve_direct_url(
         &self,
         req: &PlayRequest,
@@ -378,6 +498,34 @@ impl PlaybackOrchestrator {
                 url = %raw_url,
                 "upnp_url_de_lecture_lue_dans_l_instantane"
             );
+        }
+        // #4362 — l'URL existe, mais le SERVEUR qui la sert répond-il encore ?
+        //
+        // La bibliothèque le savait déjà : le badge « Serveur absent » vient du
+        // registre durable `media_servers` et de la qualification qui en tire
+        // `presence` / `proposable` (`GET /network/media-servers`). Ce chemin-ci
+        // ne l'avait jamais consulté : il lisait l'adresse et la poussait. Avec
+        // Asset arrêté, l'Eversolo recevait une URL morte et jouait du silence
+        // sans qu'une seule ligne d'erreur soit écrite.
+        //
+        // La garde ne s'arme que sur `depuis_l_instantane`, c'est-à-dire sur une
+        // piste de BIBLIOTHÈQUE dont on a retrouvé l'adresse. Une URL NOMMÉE
+        // dans la demande — le chemin du renderer, qui reçoit un
+        // `SetAVTransportURI` et n'a pas de ligne en base — reste hors sujet et
+        // n'est pas contredite, exactement comme le dit la règle 1 plus haut.
+        if depuis_l_instantane
+            && let Some(track_id) = req.track_id
+            && let Some(absent) = self.serveur_de_la_piste_absent(track_id)
+        {
+            warn!(
+                track_id,
+                zone_id = req.zone_id,
+                url = %raw_url,
+                raison = absent.raison.code(),
+                depuis_secs = absent.depuis_secs,
+                "upnp_refus_serveur_source_absent"
+            );
+            return Err(super::serveur_source_absent_4362::motif_du_refus(&absent));
         }
         // A station is often published as an .m3u/.pls PLAYLIST file rather than a
         // direct stream. Dereference it to the real stream first, otherwise the
@@ -1280,5 +1428,153 @@ mod temoins_de_l_url_indexee {
             "la clé lue par la lecture a changé : verifier \
              `routes/indexation_upnp.rs::CLE_URL_DE_LECTURE`"
         );
+    }
+}
+
+/// **L'inverse de [`crate::upnp_server::track_audio_url`].**
+///
+/// Rend l'identifiant de piste quand `url` est l'adresse SOUS LAQUELLE CETTE
+/// INSTANCE publie l'audio d'une de ses pistes, et `None` dans tous les autres
+/// cas — autre hôte, autre chemin, identifiant illisible.
+///
+/// Le chemin n'est pas réécrit à la main : il est construit à partir de
+/// [`crate::upnp_server::API_PATH`], la même constante que le constructeur.
+/// Le témoin `l_aller_et_le_retour_parlent_de_la_meme_url` fait l'aller-retour
+/// sur le constructeur lui-même, pour qu'un changement de route rougisse ici
+/// plutôt que de rendre silencieusement « Episode ».
+fn track_id_dans_une_url_audio_de_tune(url: &str) -> Option<i64> {
+    let url = url.trim();
+    let sans_schema = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let (hote, chemin) = sans_schema.split_at(sans_schema.find('/')?);
+    if !hote_de_cette_machine(hote) {
+        return None;
+    }
+    let chemin = chemin.split(['?', '#']).next().unwrap_or(chemin);
+    chemin
+        .strip_prefix(crate::upnp_server::API_PATH)?
+        .strip_prefix("/library/tracks/")?
+        .strip_suffix("/audio")?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+/// Cet hôte d'URL est-il une adresse de CETTE machine ?
+///
+/// La question tient en un mot : l'identifiant de piste porté par l'URL
+/// n'a de sens que dans la base d'un serveur donné. Un autre Tune du même
+/// réseau publie ses `<res>` avec son adresse à lui, et son `187500` est une
+/// autre piste. Répondre « non » ne coûte que le repli d'aujourd'hui ;
+/// répondre « oui » à tort afficherait un titre faux.
+///
+/// La boucle locale et `localhost` passent (c'est l'accès depuis la machine
+/// même), puis les adresses IPv4 réellement portées par les interfaces
+/// (`local_ipv4_addresses`, qui exclut la boucle — d'où le test séparé).
+/// Un NOM d'hôte ne passe pas : le résoudre demanderait un appel DNS sur le
+/// chemin de lecture, et l'échec est sans dommage.
+fn hote_de_cette_machine(hote: &str) -> bool {
+    let sans_port = match hote.strip_prefix('[') {
+        // IPv6 littéral : `[::1]:8888`
+        Some(reste) => reste.split(']').next().unwrap_or(reste),
+        None => hote.split(':').next().unwrap_or(hote),
+    };
+    if sans_port.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(ip) = sans_port.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    if ip.is_loopback() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => crate::discovery::ssdp::local_ipv4_addresses().contains(&v4),
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod temoins_de_l_uri_du_renderer {
+    use super::{hote_de_cette_machine, track_id_dans_une_url_audio_de_tune};
+
+    /// L'URI que Tades a vue passer (fil 1819), à l'adresse près : une piste
+    /// de la bibliothèque, servie par Tune lui-même.
+    #[test]
+    fn une_url_de_piste_de_tune_rend_son_identifiant() {
+        for url in [
+            "http://127.0.0.1:8888/api/v1/library/tracks/187500/audio",
+            "https://127.0.0.1:8888/api/v1/library/tracks/187500/audio",
+            "http://localhost:8888/api/v1/library/tracks/187500/audio",
+            "  http://127.0.0.1/api/v1/library/tracks/187500/audio  ",
+            "http://[::1]:8888/api/v1/library/tracks/187500/audio",
+            "http://127.0.0.1:8888/api/v1/library/tracks/187500/audio?x=1",
+        ] {
+            assert_eq!(
+                track_id_dans_une_url_audio_de_tune(url),
+                Some(187_500),
+                "« {url} » désigne la piste 187500 de cette bibliothèque"
+            );
+        }
+    }
+
+    /// **La contre-épreuve.** Rien d'autre ne doit être pris pour une piste
+    /// d'ici : un titre faux serait pire que le repli « Episode ».
+    #[test]
+    fn rien_d_autre_ne_passe() {
+        for url in [
+            // Un AUTRE serveur — Tune ou non. `198.51.100.7` est réservé à la
+            // documentation (RFC 5737) : aucune interface ne le porte.
+            "http://198.51.100.7:8888/api/v1/library/tracks/187500/audio",
+            // Un nom d'hôte : non résolu, donc non reconnu.
+            "http://tune.local:8888/api/v1/library/tracks/187500/audio",
+            // Le serveur média d'un tiers.
+            "http://127.0.0.1:26125/content/c2/b16/f44100/d61-coX.flac",
+            // Nos autres routes : une radio n'est pas une piste.
+            "http://127.0.0.1:8888/api/v1/radios/12/audio.wav",
+            "http://127.0.0.1:8888/api/v1/library/tracks/187500/metadata",
+            "http://127.0.0.1:8888/api/v1/library/tracks/187500",
+            // Identifiants illisibles ou absurdes.
+            "http://127.0.0.1:8888/api/v1/library/tracks/abc/audio",
+            "http://127.0.0.1:8888/api/v1/library/tracks/0/audio",
+            "http://127.0.0.1:8888/api/v1/library/tracks/-3/audio",
+            "http://127.0.0.1:8888/api/v1/library/tracks//audio",
+            // Pas une URL du tout — le condensat d'identité de la phase 2.
+            "uuid:258FC2D5-E2C3-B734-0-123456789abc|85944171f73967e8",
+            "",
+        ] {
+            assert_eq!(
+                track_id_dans_une_url_audio_de_tune(url),
+                None,
+                "« {url} » ne désigne PAS une piste de cette bibliothèque"
+            );
+        }
+    }
+
+    /// Le chemin lu ici et le chemin publié dans la DIDL sont le MÊME contrat.
+    /// L'aller-retour passe par le constructeur : si la route
+    /// `/tracks/{id}/audio` ou `API_PATH` changeait, ce témoin rougirait — et
+    /// non l'affichage, huit mois plus tard, chez un testeur.
+    #[test]
+    fn l_aller_et_le_retour_parlent_de_la_meme_url() {
+        let url = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", 187_500);
+        assert_eq!(
+            track_id_dans_une_url_audio_de_tune(&url),
+            Some(187_500),
+            "l'URL publiée dans le <res> doit se relire : {url}"
+        );
+    }
+
+    /// La boucle locale est nous ; l'adresse de documentation ne l'est pas.
+    #[test]
+    fn l_hote_se_reconnait_ou_se_tait() {
+        assert!(hote_de_cette_machine("127.0.0.1:8888"));
+        assert!(hote_de_cette_machine("127.0.0.1"));
+        assert!(hote_de_cette_machine("LocalHost:8888"));
+        assert!(hote_de_cette_machine("[::1]:8888"));
+        assert!(!hote_de_cette_machine("198.51.100.7:8888"));
+        assert!(!hote_de_cette_machine("tune.local:8888"));
+        assert!(!hote_de_cette_machine(""));
     }
 }

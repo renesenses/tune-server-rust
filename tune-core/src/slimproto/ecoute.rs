@@ -85,6 +85,29 @@ impl Tentative<'_> {
         });
     }
 
+    /// Écoute obtenue sur un AUTRE port que celui demandé (#4361).
+    ///
+    /// Ce n'est pas une panne — le service est rendu, `ecoute` reste vrai et le
+    /// composant de santé reste vert — mais c'est un dégradé : les
+    /// télécommandes déjà configurées visent le mauvais numéro. La `cause` le
+    /// nomme (`port_de_repli`) et le `message` porte les deux ports, pour que
+    /// les écrans et le rapport de bogue puissent le DIRE au lieu de laisser
+    /// l'utilisateur devant une télécommande muette.
+    ///
+    /// Pas d'`erreur_systeme` : l'erreur de bind qui a provoqué le repli est
+    /// déjà dans le journal, et la retenir ici ferait passer une écoute vivante
+    /// pour un échec aux yeux de tout lecteur pressé.
+    pub fn ecoute_de_repli(&self, port: u16, protocole: &'static str, message: String) {
+        self.retenir(EtatEcoute {
+            port,
+            protocole,
+            ecoute: true,
+            cause: Some("port_de_repli"),
+            message: Some(message),
+            erreur_systeme: None,
+        });
+    }
+
     pub fn echec(&self, port: u16, protocole: &'static str, erreur: &io::Error, consequence: &str) {
         // Un échec UDP ne permet pas d'identifier le détenteur, ni de conclure
         // quoi que ce soit sur le TCP du même numéro.

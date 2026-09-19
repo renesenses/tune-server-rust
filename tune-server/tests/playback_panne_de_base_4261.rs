@@ -204,6 +204,7 @@ impl StreamingService for ServiceDeBanc {
             track_number: Some(3),
             disc_number: Some(1),
             explicit: false,
+            disponible: None,
             quality: None,
             isrc: None,
             composer: None,
@@ -668,5 +669,50 @@ async fn un_service_absent_est_nomme_dans_la_reponse_d_enfilage() {
             .unwrap_or("")
             .contains("service non enregistré"),
         "{texte}"
+    );
+}
+
+// #4298 : une panne de lecture n'est pas une file vide.
+#[tokio::test]
+async fn relance_locale_file_illisible_4298_ne_l_efface_pas() {
+    let state = etat();
+    let zone = zone_orpheline(&state, "Relance");
+    let a = piste(&state, "A");
+    let b = piste(&state, "B");
+    let repo = PlayQueueRepo::with_backend(state.backend.clone());
+    repo.set_queue(zone, &[a, b]).unwrap();
+    let before: Vec<_> = repo
+        .get_ordered(zone)
+        .unwrap()
+        .iter()
+        .map(|e| e.id)
+        .collect();
+    let app = appli_en_panne(&state, "SELECT q.id, q.zone_id, q.track_id");
+    let response = app
+        .oneshot(
+            Request::post(format!("/api/v1/zones/{zone}/play"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"track_id": b}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "la panne doit être nommée"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains(REFUS));
+    assert_eq!(
+        repo.get_ordered(zone)
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>(),
+        before,
+        "#4298 : une lecture en erreur a effacé la file"
     );
 }

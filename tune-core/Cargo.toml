@@ -41,7 +41,7 @@ futures-util = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 urlencoding = { workspace = true }
-cpal = { version = "0.17", optional = true }
+cpal = { path = "../vendor/cpal", version = "0.17.3", optional = true }
 rust_cast = { workspace = true }
 sha2 = { workspace = true }
 # Authenticated backup encryption (audit item 7): Argon2id KDF + XChaCha20-Poly1305.
@@ -517,3 +517,9 @@ path = "tests/hqplayer_declaration_xml_unique_4023.rs"
 [[test]]
 name = "hqplayer_avance_album_4023"
 path = "tests/hqplayer_avance_album_4023.rs"
+
+# #4295: real ALSA worker/poll with private null PCM and child-only fault shim.
+[[test]]
+name = "alsa_poll_recovery_4295"
+path = "tests/alsa_poll_recovery_4295.rs"
+required-features = ["local-audio"]

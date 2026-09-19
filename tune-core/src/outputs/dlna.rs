@@ -16,6 +16,45 @@ use crate::http::error as http_error;
 const AV_TRANSPORT_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 const RENDERING_CONTROL_URN: &str = "urn:schemas-upnp-org:service:RenderingControl:1";
 const SOAP_MAX_RETRIES: usize = 2;
+/// Corrèle les commandes simultanées, y compris deux zones de même nom.
+static DLNA_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[path = "dlna_command_tests_4258.rs"]
+mod command_tests_4258;
+
+/// Une faute SOAP reste un corps HTTP lisible. Les chemins Play avec reprise
+/// doivent pouvoir l'inspecter ; pause/resume, eux, doivent la rendre en erreur.
+fn faute_commande_soap(response: &str) -> bool {
+    let mut reader = quick_xml::Reader::from_str(response);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e))
+                if matches!(
+                    e.local_name().as_ref(),
+                    b"Fault" | b"UPnPError" | b"errorCode"
+                ) =>
+            {
+                return true;
+            }
+            Ok(quick_xml::events::Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
+}
+
+fn acquitter_commande_soap(action: &str, response: String) -> Result<(), String> {
+    if faute_commande_soap(&response) {
+        Err(format!(
+            "{action} rejected: SOAP fault (UPnP code {})",
+            extract_tag(&response, "errorCode")
+                .as_deref()
+                .unwrap_or("unknown")
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// Convertit une durée UPnP `H:MM:SS[.mmm]` en millisecondes. `0` si la forme
 /// n'est pas reconnue — ce que rend aussi `NOT_IMPLEMENTED`, la réponse
@@ -1181,9 +1220,24 @@ impl DlnaOutput {
                     last_was_timeout = e.is_timeout();
                     last_err = format!("soap send: {}", http_error::chain(&e));
                 }
+                // Erreur DÉFINITIVE : ni connexion, ni délai, ni coupure —
+                // typiquement un `builder error`, c'est-à-dire une URL que
+                // reqwest refuse d'analyser. #4379 : « invalid port number »
+                // sans dire de QUELLE URL, le signalement de Yves n'a donc
+                // rien pu trancher. L'URL rejetée part maintenant avec le
+                // motif, dans le journal ET dans le message rendu à
+                // l'orchestrateur, qui est celui qu'affiche l'interface.
                 Err(e) => {
+                    let motif = http_error::chain(&e);
+                    warn!(
+                        device = %self.name,
+                        action,
+                        url,
+                        error = %motif,
+                        "dlna_soap_erreur_definitive"
+                    );
                     return IssueSoap::Echec {
-                        message: format!("soap send: {}", http_error::chain(&e)),
+                        message: format!("soap send: {motif} (url={url})"),
                         timeout: false,
                         refus: false,
                         apres_reessais: false,
@@ -1236,8 +1290,47 @@ impl DlnaOutput {
         }
     }
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
-        self.soap_action(VoieSoap::AvTransport, AV_TRANSPORT_URN, action, body)
-            .await
+        // Mesure l'appel logique complet : réessais et redécouverte inclus.
+        // Un acquittement SOAP ne prouve ni l'état du renderer ni l'arrêt du son.
+        let mesure = matches!(action, "Pause" | "Play").then(|| {
+            let command_id = DLNA_COMMAND_ID.fetch_add(1, Ordering::Relaxed);
+            let started = std::time::Instant::now();
+            info!(device = %self.name, device_id = %self.device_id, action, command_id,
+                "dlna_command_sending");
+            (command_id, started)
+        });
+        let result = self
+            .soap_action(VoieSoap::AvTransport, AV_TRANSPORT_URN, action, body)
+            .await;
+        if let Some((command_id, started)) = mesure {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match &result {
+                Ok(response) if faute_commande_soap(response) => {
+                    warn!(device = %self.name, device_id = %self.device_id, action,
+                        command_id, elapsed_ms, outcome = "soap_fault",
+                        upnp_code = extract_tag(response, "errorCode").as_deref().unwrap_or("unknown"),
+                        "dlna_command_finished");
+                }
+                Ok(_) => {
+                    info!(device = %self.name, device_id = %self.device_id, action,
+                        command_id, elapsed_ms, outcome = "response_received",
+                        "dlna_command_finished");
+                }
+                Err(error) => {
+                    let error_kind = if error.starts_with(SOAP_TIMEOUT_PREFIX) {
+                        "timeout"
+                    } else if error.starts_with(SOAP_HTTP_SANS_CORPS_PREFIX) {
+                        "http_without_body"
+                    } else {
+                        "transport"
+                    };
+                    warn!(device = %self.name, device_id = %self.device_id, action,
+                        command_id, elapsed_ms, outcome = "transport_error", error_kind,
+                        "dlna_command_finished");
+                }
+            }
+        }
+        result
     }
     async fn rc_action(&self, action: &str, body: &str) -> Result<String, String> {
         self.soap_action(
@@ -1955,15 +2048,17 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
-        self.av_action("Pause", "<InstanceID>0</InstanceID>")
+        let response = self
+            .av_action("Pause", "<InstanceID>0</InstanceID>")
             .await?;
-        Ok(())
+        acquitter_commande_soap("Pause", response)
     }
 
     async fn resume(&self) -> Result<(), String> {
-        self.av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+        let response = self
+            .av_action("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
             .await?;
-        Ok(())
+        acquitter_commande_soap("Play", response)
     }
 
     async fn stop(&self) -> Result<(), String> {

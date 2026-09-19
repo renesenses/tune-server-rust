@@ -196,7 +196,7 @@ impl TrackMetadataRepo {
         query: &str,
         limit: i64,
     ) -> Result<Vec<(i64, String, String)>, String> {
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let sql = self.dialect_sql(sql::search_by_value, sql::search_by_value);
         let params: [&dyn ToSqlValue; 2] = [&like, &limit];
         let rows = self.db.query_many(&sql, &params)?;

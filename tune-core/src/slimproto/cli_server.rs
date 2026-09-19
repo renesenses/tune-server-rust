@@ -14,6 +14,18 @@ use tracing::{debug, info, warn};
 use super::PlayerRegistry;
 
 const CLI_PORT: u16 = 9090;
+
+/// Combien de ports consécutifs sont essayés après le port préféré avant de
+/// laisser le système en choisir un (#4361).
+///
+/// Pourquoi une suite ARRÊTÉE plutôt qu'un port éphémère tout de suite : un
+/// port qui change à chaque démarrage oblige à reconfigurer les contrôleurs à
+/// chaque redémarrage. `9090` pris par Cockpit un jour l'est encore le
+/// lendemain, donc Tune retombe sur `9091` aujourd'hui comme demain. Le port
+/// éphémère reste le dernier recours — servir sur un port imprévisible vaut
+/// mieux que ne pas servir du tout.
+const REPLIS_CONSECUTIFS: u16 = 8;
+
 static ETAT: super::ecoute::JournalEcoute = super::ecoute::JournalEcoute::new();
 
 /// Dernier bind CLI ; absent avant tentative et après arrêt de l'écoute.
@@ -29,25 +41,115 @@ pub struct CliState {
     pub local_ip: String,
 }
 
-/// Start the CLI telnet server on port 9090.
-pub async fn start_cli_server(state: Arc<CliState>) {
-    let port = std::env::var("TUNE_CLI_PORT")
+/// Ce qu'un échec définitif du pont coûte à l'utilisateur, et ce qu'il peut y
+/// faire. Sert aussi bien au journal qu'à l'état lu par les écrans.
+const INDISPONIBLE: &str = "Le pont de commande LMS de Tune est indisponible. Choisir un port libre avec TUNE_CLI_PORT puis redémarrer Tune et adapter les contrôleurs. Le LMS externe configuré dans les réglages est indépendant.";
+
+/// Le port que la configuration demande : `TUNE_CLI_PORT`, sinon 9090.
+fn port_prefere() -> u16 {
+    std::env::var("TUNE_CLI_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(CLI_PORT);
-
-    start_cli_server_sur_port(state, port).await;
+        .unwrap_or(CLI_PORT)
 }
 
-/// Même serveur avec port explicite, notamment pour une écoute éphémère (0).
+/// Les ports essayés, dans l'ordre, pour un port préféré donné.
+///
+/// Fonction pure : la règle de repli se lit et se teste sans ouvrir de socket.
+/// Un port préféré à 0 (écoute éphémère demandée explicitement) n'a pas de
+/// repli — c'est déjà « le système choisit ».
+fn candidats(prefere: u16) -> Vec<u16> {
+    if prefere == 0 {
+        return vec![0];
+    }
+    let mut ports = vec![prefere];
+    for pas in 1..=REPLIS_CONSECUTIFS {
+        match prefere.checked_add(pas) {
+            Some(p) => ports.push(p),
+            None => break,
+        }
+    }
+    // Dernier recours : que le système en trouve un, plutôt que pas de pont.
+    ports.push(0);
+    ports
+}
+
+/// Démarre le pont de commande LMS, en se repliant sur un autre port si le port
+/// demandé est déjà tenu (#4361).
+///
+/// 🔴 Le défaut mesuré : sur l'image Tune OS Fedora, **Cockpit** écoute déjà sur
+/// 9090. Le bind échouait, le pont ne démarrait pas, et toute télécommande
+/// Squeezebox (Squeeze-LX, iPeng, Material) restait sans effet — le seul témoin
+/// était une ligne de journal que personne ne lit.
+///
+/// Deux conséquences distinctes, traitées ici toutes les deux :
+///
+/// 1. **la collision** : Tune choisit désormais un port plutôt que d'abandonner ;
+/// 2. **le silence** : le repli est retenu dans l'état d'écoute avec sa cause
+///    (`port_de_repli`) et un message qui nomme les DEUX ports. Cet état sort
+///    déjà par `/api/v1/system/diagnostics/network`, `/api/v1/squeezebox/status`
+///    et le rapport de bogue : on remplit le contrat existant, on n'en invente
+///    pas un second.
+///
+/// Le port principal du serveur (8888), lui, ne se déplace pas : il échoue et le
+/// dit (`bootstrap.rs`). La différence n'est pas une incohérence — déplacer le
+/// port HTTP couperait tous les clients d'un coup, alors qu'ici le pont est de
+/// toute façon MORT si l'on n'en change pas.
+pub async fn start_cli_server(state: Arc<CliState>) {
+    let prefere = port_prefere();
+    let tentative = ETAT.commencer();
+
+    let mut dernier_echec: Option<(u16, std::io::Error)> = None;
+    let mut retenu: Option<TcpListener> = None;
+    for candidat in candidats(prefere) {
+        match TcpListener::bind(format!("0.0.0.0:{candidat}")).await {
+            Ok(l) => {
+                retenu = Some(l);
+                break;
+            }
+            Err(e) => {
+                warn!(error = %e, port = candidat, "lms_cli_server_bind_failed");
+                dernier_echec = Some((candidat, e));
+            }
+        }
+    }
+
+    let Some(listener) = retenu else {
+        // Tous les candidats refusés : ce n'est plus une collision de numéro
+        // (permission, pile réseau…), et là il n'y a rien à replier.
+        if let Some((port, e)) = dernier_echec.as_ref() {
+            tentative.echec(*port, "TCP", e, INDISPONIBLE);
+        }
+        return;
+    };
+
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(prefere);
+    if prefere != 0 && port != prefere {
+        // Le dégradé est DIT : il ne se subit pas en silence.
+        warn!(port, port_prefere = prefere, "lms_cli_server_port_de_repli");
+        tentative.ecoute_de_repli(port, "TCP", format!(
+            "Le port {prefere} du pont de commande LMS est déjà pris par un autre service (sur Tune OS Fedora, c'est Cockpit). Tune a replié son pont sur le port {port} : configurer les télécommandes Squeezebox (Squeeze-LX, iPeng, Material…) sur ce port, ou imposer un port libre avec TUNE_CLI_PORT puis redémarrer Tune. Le LMS externe configuré dans les réglages est indépendant."
+        ));
+    } else {
+        tentative.ecoute(port, "TCP");
+    }
+    info!(port, "lms_cli_server_started");
+
+    servir(listener, state).await;
+}
+
+/// Même serveur avec port explicite et SANS repli : le port demandé, ou rien.
+///
+/// Réservé aux appels qui savent déjà quel port ils veulent (écoute éphémère
+/// avec 0, bancs d'essai qui doivent voir l'échec). Le démarrage de production
+/// passe par [`start_cli_server`], qui se replie.
 pub async fn start_cli_server_sur_port(state: Arc<CliState>, port: u16) {
     let tentative = ETAT.commencer();
     let addr = format!("0.0.0.0:{port}");
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
-            tentative.echec(port, "TCP", &e,
-                "Le pont de commande LMS de Tune est indisponible. Choisir un port libre avec TUNE_CLI_PORT puis redémarrer Tune et adapter les contrôleurs. Le LMS externe configuré dans les réglages est indépendant.");
+            tentative.echec(port, "TCP", &e, INDISPONIBLE);
             warn!(error = %e, port, "lms_cli_server_bind_failed");
             return;
         }
@@ -57,6 +159,11 @@ pub async fn start_cli_server_sur_port(state: Arc<CliState>, port: u16) {
     tentative.ecoute(port, "TCP");
     info!(port, "lms_cli_server_started");
 
+    servir(listener, state).await;
+}
+
+/// La boucle d'acceptation, commune aux deux entrées.
+async fn servir(listener: TcpListener, state: Arc<CliState>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {

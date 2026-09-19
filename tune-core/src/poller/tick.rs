@@ -2483,8 +2483,13 @@ impl PositionPoller {
                         // attesté est ADOPTÉ, sous surveillance
                         // (`adoption_horloge`). Rien d'attesté : le repli
                         // d'avant, mot pour mot.
+                        // #4382 — le seuil dépend de la SIGNATURE. Gelé à la
+                        // durée avec un `SetNext` accepté : un sondage suffit,
+                        // et l'auditeur récupère deux secondes de musique.
+                        let seuil_ticks =
+                            decisions::seuil_ticks_de_fin(dlna_frozen_end, ps.gapless_sent);
                         let (enchainement, flux_arme, octets_tires) =
-                            if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
+                            if ps.past_end_ticks >= seuil_ticks {
                                 self.enchainement_a_l_horloge(
                                     zone_id,
                                     is_dlna,
@@ -2495,6 +2500,10 @@ impl PositionPoller {
                             } else {
                                 (decisions::EnchainementArme::Aucun, None, None)
                             };
+                        // Gardé pour le journal du repli : le `filter`
+                        // ci-dessous consomme `flux_arme`, et c'est justement
+                        // sa présence ou son absence qui nomme la branche.
+                        let flux_arme_journal = flux_arme.clone().unwrap_or_default();
                         if let Some(flux) =
                             flux_arme.filter(|_| enchainement != decisions::EnchainementArme::Aucun)
                         {
@@ -2510,7 +2519,9 @@ impl PositionPoller {
                                 wall_elapsed,
                             )
                             .await;
-                        } else if ps.past_end_ticks >= POSITION_PAST_END_TICKS {
+                        } else if ps.past_end_ticks >= seuil_ticks {
+                            let motif_de_la_fin =
+                                decisions::motif_position_au_dela(dlna_frozen_end, ps.gapless_sent);
                             info!(
                                 zone_id,
                                 position_ms = status.position_ms,
@@ -2522,11 +2533,20 @@ impl PositionPoller {
                                 cast_wall_clock_end = chromecast_wall_clock_past_end,
                                 dlna_frozen_end,
                                 enchainement = ?enchainement,
+                                // #4382 — sans ces trois champs, le journal ne
+                                // dit pas LAQUELLE des trois branches a conclu
+                                // `Aucun` : flux armé absent, URI du renderer
+                                // qui nomme encore la piste finie, ou aucun
+                                // octet tiré. Le rapport de Villerio du 17/09
+                                // s'est arrêté là.
+                                flux_arme = flux_arme_journal.as_str(),
+                                uri_courante = status.current_uri.as_deref().unwrap_or(""),
+                                octets_tires = octets_tires.unwrap_or(0),
                                 "position_past_end_advancing"
                             );
                             track_ended = true;
                             fsm_pact.past_end_track_ended = true;
-                            motif_fin_de_piste = decisions::motif_fin::POSITION_AU_DELA_DE_LA_FIN;
+                            motif_fin_de_piste = motif_de_la_fin;
                             ps.transition(fsm::Transition::PositionAuDelaDeLaFin);
                         }
                     } else {

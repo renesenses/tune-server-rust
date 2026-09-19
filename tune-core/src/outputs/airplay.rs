@@ -1,3 +1,6 @@
+#[path = "airplay_timing.rs"]
+mod timing;
+
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -147,6 +150,7 @@ struct RtspSession {
     session_id: Option<String>,
     server_port: u16,
     timing_port: u16,
+    auxiliary_udp: Option<timing::AuxiliaryUdp>,
 }
 
 impl AirplayOutput {
@@ -219,6 +223,7 @@ impl RtspSession {
             session_id: None,
             server_port: 0,
             timing_port: 0,
+            auxiliary_udp: None,
         })
     }
 
@@ -325,11 +330,10 @@ impl RtspSession {
         Ok(())
     }
 
-    async fn setup(&mut self, local_port: u16) -> Result<(), String> {
+    async fn setup(&mut self, control_port: u16, timing_port: u16) -> Result<(), String> {
         let transport = format!(
             "RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port={};timing_port={}",
-            local_port + 1,
-            local_port + 2
+            control_port, timing_port
         );
 
         let (code, headers, _) = self
@@ -399,6 +403,9 @@ impl RtspSession {
     }
 
     async fn teardown(&mut self) -> Result<(), String> {
+        if let Some(auxiliary) = self.auxiliary_udp.take() {
+            auxiliary.close().await;
+        }
         let mut headers: Vec<(&str, &str)> = Vec::new();
         let session_id = self.session_id.clone().unwrap_or_default();
         if !session_id.is_empty() {
@@ -570,9 +577,20 @@ impl OutputTarget for AirplayOutput {
 
         // Bind UDP socket for RTP
         let udp = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("udp bind: {e}"))?;
-        let local_port = udp.local_addr().map(|a| a.port()).unwrap_or(6000);
+        let peer = session
+            .stream
+            .peer_addr()
+            .map_err(|e| format!("RTSP peer: {e}"))?;
+        let auxiliary = timing::AuxiliaryUdp::bind(peer.ip()).await?;
+        let (control_port, timing_port) = auxiliary.ports();
+        session.auxiliary_udp = Some(auxiliary);
 
-        session.announce().await?;
+        if let Err(reason) = session.announce().await {
+            if let Some(auxiliary) = session.auxiliary_udp.take() {
+                auxiliary.close().await;
+            }
+            return Err(reason);
+        }
 
         // A partir d'ici l'appareil a ACCEPTE un ANNOUNCE : une session RTSP
         // lui est ouverte. Tout echec de la suite du dialogue doit la lui
@@ -583,7 +601,7 @@ impl OutputTarget for AirplayOutput {
         // session parce que le canal de controle se ferme (RFC 2326, l'etat
         // de session est independant de la connexion) : c'est donc NOUS qui
         // fabriquions l'« appareil occupe » de la tentative suivante (#2217).
-        if let Err(raison) = session.setup(local_port).await {
+        if let Err(raison) = session.setup(control_port, timing_port).await {
             self.rendre_session_annoncee(&mut session, "SETUP", &raison)
                 .await;
             return Err(raison);
@@ -1560,3 +1578,7 @@ mod tests {
         assert_eq!(i16::from_be_bytes([l16[2], l16[3]]), i16::MIN);
     }
 }
+
+#[cfg(test)]
+#[path = "airplay_timing_tests_2217.rs"]
+mod timing_tests_2217;

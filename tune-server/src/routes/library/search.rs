@@ -72,6 +72,14 @@ pub(super) async fn search(
         .search(&q.q, limit)
         .unwrap_or_default();
     let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
+    // Point 8 (17/09/2026) : restreindre la recherche aux LABELS suppose de
+    // les rendre. Champ nouveau, les clients antérieurs l'ignorent.
+    let labels: Vec<Value> = AlbumRepo::with_backend(state.backend.clone())
+        .search_labels(&q.q, limit)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, album_count)| json!({ "name": name, "album_count": album_count }))
+        .collect();
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .search(&q.q, limit)
         .unwrap_or_default();
@@ -152,6 +160,7 @@ pub(super) async fn search(
     Json(json!({
         "artists": artists,
         "albums": albums,
+        "labels": labels,
         "tracks": track_results,
     }))
 }

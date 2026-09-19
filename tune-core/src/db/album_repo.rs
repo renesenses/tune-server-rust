@@ -498,6 +498,22 @@ pub mod sql {
         )
     }
 
+    /// Les LABELS dont le nom contient la recherche, avec leur nombre
+    /// d'albums visibles (point 8, Yves Corbat, 17/09/2026). Un label n'a pas
+    /// d'identité en base : c'est la chaîne `albums.label`, comme dans
+    /// l'onglet Labels de la bibliothèque. Emplacements 1 (motif) et 2 (limite).
+    pub fn search_labels<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT a.label, COUNT(*) AS n FROM albums a \
+             WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' \
+             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} \
+             GROUP BY a.label ORDER BY n DESC, a.label LIMIT {}",
+            d.placeholder(1),
+            crate::db::facet_filter::hidden_albums_excluded(),
+            d.placeholder(2)
+        )
+    }
+
     /// Le NOMBRE d'albums correspondants, borné (emplacement 7). La borne est
     /// DANS la sous-requête : autour du `COUNT`, elle ne bornerait rien.
     pub fn search_count<D: SqlDialect>(d: &D) -> String {
@@ -1574,17 +1590,51 @@ impl AlbumRepo {
     ///   reprend pas. Le drapeau décrit ce regroupement — il doit avoir la même
     ///   durée de vie, sans quoi la pastille contredirait l'écran.
     ///
-    /// La voie de réparation d'un faux positif reste le rescan complet, qui
-    /// repart d'un `DELETE FROM albums` (`track_repo::delete_all`) : les lignes
-    /// sont reconstruites, drapeau compris, d'après les tags du moment.
+    /// ⭐ #4427 — une SECONDE voie existe depuis : la décision de
+    /// l'utilisateur. Un album dont le drapeau porte le marqueur d'édition
+    /// manuelle ([`Self::tenu_a_la_main`]) n'est plus touché ici, dans aucun
+    /// sens. C'est ce qui rend le bouton « Compilation » de l'écran
+    /// Métadonnées durable : sans cette garde, le prochain fichier vu par le
+    /// surveillant relèverait le drapeau que l'utilisateur vient de baisser.
+    /// Le rescan complet, qui repart d'un `DELETE FROM albums`
+    /// (`track_repo::delete_all`), reste la voie qui efface tout — marqueur
+    /// compris, puisque la ligne album disparaît.
     ///
     /// Idempotent : la clause `COALESCE(is_compilation, 0) = 0` fait de tout
     /// appel suivant un no-op, donc aucun coût sur un rescan.
     pub fn mark_compilation(&self, album_id: i64) -> Result<(), TuneError> {
+        if self.tenu_a_la_main(album_id, "is_compilation") {
+            return Ok(());
+        }
         let sql = self.dialect_sql(sql::mark_compilation, sql::mark_compilation);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Un champ de cet album est-il tenu par une édition manuelle (C3) ?
+    ///
+    /// 🔴 #4427 — la garde qui rend le geste de l'utilisateur DURABLE. Le
+    /// marqueur existait depuis le 14/09 (`album_metadata.edition_manuelle`),
+    /// mais seule la passe de réparation le consultait : le scan, lui, passait
+    /// outre. Un album décoché à la main était donc recoché au prochain
+    /// fichier vu par le surveillant — le drapeau ne sachant que MONTER
+    /// (`mark_compilation`), la correction ne tenait pas une minute.
+    ///
+    /// La garde est posée ICI, dans le dépôt, et non chez les appelants :
+    /// `mark_compilation` et `reclasser_en_compilation` sont appelés depuis le
+    /// scan par lots ET depuis le surveillant de fichiers, et un troisième
+    /// appelant écrit un jour. Une garde qui voyage avec l'écriture ne
+    /// s'oublie pas.
+    ///
+    /// Un défaut de lecture rend `false` : on ne bloque pas le scan sur une
+    /// table de métadonnées illisible, on retombe sur le comportement d'avant.
+    fn tenu_a_la_main(&self, album_id: i64, champ: &str) -> bool {
+        crate::db::album_metadata_repo::AlbumMetadataRepo::with_backend(self.db.clone())
+            .champs_edites_a_la_main(album_id)
+            .unwrap_or_default()
+            .iter()
+            .any(|c| c == champ)
     }
 
     /// Reprend une ligne album créée sous une décision « compilation »
@@ -1608,6 +1658,16 @@ impl AlbumRepo {
         artist_id: i64,
         titre: &str,
     ) -> Result<(), TuneError> {
+        // #4427 — même garde que `mark_compilation`, et sur les DEUX champs
+        // que cette reprise écrit : elle repose l'artiste d'album et le titre
+        // en plus du drapeau. La règle est celle de `reparer_compilations`
+        // (C3) : un album dont l'artiste OU le drapeau est tenu à la main
+        // n'est pas repris.
+        if self.tenu_a_la_main(album_id, "is_compilation")
+            || self.tenu_a_la_main(album_id, "artist")
+        {
+            return Ok(());
+        }
         let sql = self.dialect_sql(sql::set_artist_and_title, sql::set_artist_and_title);
         let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
         self.db.execute(&sql, &params)?;
@@ -3107,7 +3167,7 @@ impl AlbumRepo {
         offset: i64,
     ) -> Result<Vec<Album>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
@@ -3118,12 +3178,29 @@ impl AlbumRepo {
         Ok(rows.iter().map(row_to_album).collect())
     }
 
+    /// Labels correspondant à la recherche : `(nom, nombre d'albums)`, les
+    /// plus fournis d'abord.
+    pub fn search_labels(&self, query: &str, limit: i64) -> Result<Vec<(String, i64)>, TuneError> {
+        let like = crate::db::engine::motif_like(query);
+        let sql = self.dialect_sql(sql::search_labels, sql::search_labels);
+        let params: [&dyn ToSqlValue; 2] = [&like, &limit];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let nom = r.first().and_then(|v| v.as_string())?;
+                let n = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+                Some((nom, n))
+            })
+            .collect())
+    }
+
     /// Le nombre d'albums correspondants, borné à `plafond` — un `COUNT` sur
     /// le même prédicat, indépendant de `limit`. Rendre `plafond` signifie
     /// « au moins `plafond` ».
     pub fn search_count(&self, query: &str, plafond: i64) -> Result<i64, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
-        let like = format!("%{query}%");
+        let like = crate::db::engine::motif_like(query);
         let trimmed = query.trim();
         let sql = self.dialect_sql(sql::search_count, sql::search_count);
         let params: [&dyn ToSqlValue; 7] =
@@ -3980,6 +4057,62 @@ mod tests {
         assert_eq!(results[0].title, "The Dark Side of the Moon");
     }
 
+    /// Point 8 : la recherche rend les labels, comptés, sans les albums
+    /// masqués ni les labels vides.
+    #[test]
+    fn la_recherche_rend_les_labels_comptes() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        for (titre, label) in [
+            ("Kind of Blue", Some("Columbia")),
+            ("Bitches Brew", Some("Columbia")),
+            ("Köln Concert", Some("ECM Records")),
+            ("Sans label", None),
+        ] {
+            let mut a = Album::new(titre.into());
+            a.label = label.map(String::from);
+            repo.create(&a).unwrap();
+        }
+        assert_eq!(
+            repo.search_labels("colum", 10).unwrap(),
+            vec![("Columbia".to_string(), 2)]
+        );
+        assert_eq!(
+            repo.search_labels("\"ecm\"", 10).unwrap(),
+            vec![("ECM Records".to_string(), 1)]
+        );
+        let kob = repo.search("\"kind of blue\"", 10).unwrap();
+        assert_eq!(kob.len(), 1);
+        db.execute(
+            "INSERT INTO hidden_items (item_type, item_id) SELECT 'album', id FROM albums WHERE title = 'Köln Concert'",
+            &[],
+        )
+        .unwrap();
+        assert!(repo.search_labels("ecm", 10).unwrap().is_empty());
+    }
+
+    /// Point 8 : entre guillemets, l'ordre des mots compte.
+    #[test]
+    fn entre_guillemets_l_ordre_des_mots_compte() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db);
+        for titre in ["Kind of Blue", "Blue Kind of Day"] {
+            repo.create(&Album::new(titre.into())).unwrap();
+        }
+        assert_eq!(
+            repo.search("kind blue", 10).unwrap().len(),
+            2,
+            "témoin sans guillemets"
+        );
+        let exact: Vec<String> = repo
+            .search("\"kind of blue\"", 10)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.title)
+            .collect();
+        assert_eq!(exact, vec!["Kind of Blue".to_string()]);
+    }
+
     /// #1391 — un album masqué sort des vues de découverte (grille, compteur
     /// de pagination, récents, artiste, genre, recherche), mais PAS de
     /// `get()` : masqué n'est pas supprimé, il doit rester jouable et
@@ -4470,6 +4603,78 @@ mod tests {
 
         let desc = repo.list_sorted(100, 0, "artist", "desc").unwrap();
         assert_eq!(desc[0].title, "Hot Rats");
+    }
+
+    /// 🔴 #4427 — la décision de l'utilisateur doit SURVIVRE au scan.
+    ///
+    /// Le marqueur d'édition manuelle existait depuis le 14/09 (C3), mais
+    /// seule la passe de réparation le consultait. `mark_compilation` ne
+    /// sachant que LEVER le drapeau, un album décoché à la main était recoché
+    /// dès le fichier suivant vu par le surveillant — la correction ne tenait
+    /// pas. Cette épreuve mesure les deux sens.
+    #[test]
+    fn le_scan_ne_touche_plus_un_drapeau_tenu_a_la_main() {
+        use crate::db::album_metadata_repo::AlbumMetadataRepo;
+
+        let db = test_db();
+        // `album_metadata` naît d'une migration (v68), pas de `CORE_SCHEMA` :
+        // la base d'épreuve ne l'a pas. Une base réelle l'a toujours, et
+        // `tenu_a_la_main` retombe de toute façon sur « personne n'a tranché »
+        // si la lecture échoue — le scan n'est jamais bloqué par le marqueur.
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS album_metadata (
+                     album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                     key TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY (album_id, key)
+                 );",
+            )
+            .unwrap();
+        let repo = AlbumRepo::new(db.clone());
+        let marqueur = AlbumMetadataRepo::new(db);
+
+        // Témoin : sans marqueur, le scan lève le drapeau comme avant.
+        let libre = repo.create(&Album::new("Sans décision".into())).unwrap();
+        repo.mark_compilation(libre).unwrap();
+        assert!(
+            repo.get(libre).unwrap().unwrap().is_compilation,
+            "sans marqueur, le scan doit continuer de lever le drapeau"
+        );
+
+        // Sens 1 — l'utilisateur REFUSE la compilation. Le scan la reproposait.
+        let refuse = repo
+            .create(&Album::new("Coco María Presents".into()))
+            .unwrap();
+        repo.mark_compilation(refuse).unwrap();
+        repo.reparer_compilation(refuse, false, None).unwrap();
+        marqueur
+            .marquer_edition_manuelle(refuse, &["is_compilation"])
+            .unwrap();
+        repo.mark_compilation(refuse).unwrap();
+        assert!(
+            !repo.get(refuse).unwrap().unwrap().is_compilation,
+            "un drapeau baissé à la main ne doit pas être relevé par le scan"
+        );
+
+        // Sens 2 — l'utilisateur POSE la compilation. `reclasser_en_compilation`
+        // repose artiste, titre et drapeau : il ne doit rien reprendre.
+        let pose = repo.create(&Album::new("Anthologie".into())).unwrap();
+        repo.reparer_compilation(pose, true, None).unwrap();
+        marqueur
+            .marquer_edition_manuelle(pose, &["is_compilation"])
+            .unwrap();
+        // L'identifiant d'artiste importe peu ici : rien ne doit bouger.
+        repo.reclasser_en_compilation(pose, 1, "Titre imposé par le scan")
+            .unwrap();
+        let apres = repo.get(pose).unwrap().unwrap();
+        assert!(apres.is_compilation, "le drapeau posé à la main doit tenir");
+        assert_eq!(
+            apres.title, "Anthologie",
+            "le titre ne doit pas être repris par le scan sur un album tenu à la main"
+        );
     }
 
     /// Le drapeau « compilation » doit SURVIVRE à l'écriture (#1957). Il était

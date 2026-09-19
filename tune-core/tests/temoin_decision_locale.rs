@@ -226,6 +226,56 @@ async fn l_opt_in_wav_24_bits_de_la_zone_sert_un_wav_en_24_bits() {
     assert!(r.stream_id.is_some());
 }
 
+/// #4297 — « Forcer le WAV = 24 bits » sur un ALAC **16 bits**.
+///
+/// Le pavé « 24 bits » du tri-état écrit `dlna_wav24` seul (`dlna_lpcm` lui est
+/// exclusif). Tant que le forçage WAV lisait ce drapeau APRÈS son plafond
+/// `bit_depth_wire > 16`, une source 16 bits le faisait retomber à `false` :
+/// les deux pavés valaient `false`, « FLAC natif » reprenait la main et l'ALAC
+/// partait en FLAC — ce que l'afficheur du darTZeel LHC-208 d'Yves montrait
+/// (`FLAC / PCM / 16/44k1`) pendant que sa case « Forcer le WAV » était cochée.
+///
+/// Le libellé de l'interface ne parle que de la SOURCE (« ne s'applique qu'aux
+/// sources non-FLAC ») : le forçage suit le réglage, la profondeur ne décide
+/// que de celle du WAV produit — ici 16 bits, le plafond LPCM protecteur de
+/// #1137 restant entier.
+#[tokio::test]
+async fn l_opt_in_wav_24_bits_force_aussi_le_wav_sur_une_source_16_bits() {
+    let b = banc("dlna", "uuid:renderer-inconnu").await;
+    b.zones()
+        .update_dlna_wav24(b.zone_id, true)
+        .expect("dlna_wav24");
+    // La zone d'Yves : « FLAC natif » coché en même temps que « Forcer le WAV ».
+    b.zones()
+        .update_dlna_native_flac(b.zone_id, true)
+        .expect("dlna_native_flac");
+    let id = b.piste(ALAC, "alac", 44_100, 16);
+
+    let r = b.resoudre(id).await.expect("résolution");
+
+    assert_eq!(
+        r.mime_type, "audio/wav",
+        "« Forcer le WAV » coché : un ALAC 16 bits part en WAV, pas en FLAC"
+    );
+    assert_eq!(extension(&r.url), "wav", "{}", r.url);
+    assert_eq!(
+        r.bit_depth,
+        Some(16),
+        "la source est 16 bits : le WAV l'est aussi, le plafond LPCM de #1137 tient"
+    );
+    assert!(r.stream_id.is_some());
+
+    // Contraste, dans la même zone : le FLAC natif garde le FLAC (#1437). Le
+    // forçage vise le décodeur du renderer sur les sources non-FLAC, et
+    // l'élargir ne doit pas manger cette exception-là.
+    let flac = b.piste(FLAC, "flac", 44_100, 16);
+    let r = b.resoudre(flac).await.expect("résolution");
+    assert_eq!(
+        r.mime_type, "audio/flac",
+        "« FLAC natif » coché : une source FLAC reste du FLAC"
+    );
+}
+
 /// Bloc `alac_passthrough` : sans l'opt-in, l'ALAC est transcodé en FLAC pour
 /// le réseau ; avec, il part tel quel en `audio/mp4`, à la taille du fichier.
 #[tokio::test]

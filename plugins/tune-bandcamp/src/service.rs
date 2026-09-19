@@ -167,6 +167,7 @@ pub(crate) fn pistes_depuis_album(album: &Value) -> Vec<StreamTrack> {
                 track_number: t["num"].as_u64().map(|n| n as u32),
                 disc_number: None,
                 explicit: false,
+                disponible: None,
                 quality: Some(qualite_bandcamp()),
                 isrc: None,
                 composer: None,
@@ -186,6 +187,7 @@ pub(crate) fn album_depuis_json(album: &Value) -> StreamAlbum {
         cover_path: album["pochette"].as_str().map(str::to_string),
         year: None,
         track_count: album["track_count"].as_u64().unwrap_or(0) as u32,
+        released_at: None,
         quality: Some(qualite_bandcamp()),
     }
 }
@@ -215,8 +217,34 @@ pub(crate) fn albums_de_collection(brut: &Value) -> Vec<StreamAlbum> {
                 cover_path: pochette(it.get("item_art_id")),
                 year: None,
                 track_count: 0,
+                released_at: None,
                 quality: Some(qualite_bandcamp()),
             })
+        })
+        .collect()
+}
+
+/// Chaque date reste attachée à l'article qui l'a fournie (#2778).
+///
+/// La conversion commune peut écarter un article sans adresse jouable. Zipper
+/// ensuite ses albums avec les articles bruts attribuerait la date de l'article
+/// rejeté au favori suivant. Convertir un article à la fois conserve ce lien
+/// sans modifier les règles de conversion des albums.
+fn favoris_dates_de_collection(brut: &Value) -> Vec<Value> {
+    brut["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|article| {
+            let page = serde_json::json!({ "items": [article] });
+            let album = albums_de_collection(&page).into_iter().next()?;
+            let mut element = serde_json::to_value(album).unwrap_or(Value::Null);
+            if let (Some(objet), Some(date)) =
+                (element.as_object_mut(), crate::date_ajout_bandcamp(article))
+            {
+                objet.insert("created_at".to_string(), Value::String(date));
+            }
+            Some(element)
         })
         .collect()
 }
@@ -235,6 +263,7 @@ pub(crate) fn albums_de_recherche(resultats: &[Value]) -> Vec<StreamAlbum> {
                 cover_path: r["pochette"].as_str().map(str::to_string),
                 year: None,
                 track_count: 0,
+                released_at: None,
                 quality: Some(qualite_bandcamp()),
             })
         })
@@ -515,18 +544,7 @@ impl StreamingService for BandcampService {
             crate::page_de_liste_de_souhaits(compte.fan_id, BC_JETON_DEBUT, BC_COLLECTION_PAGE)
                 .await
                 .map_err(TuneError::from)?;
-        let articles = brut["items"].as_array().cloned().unwrap_or_default();
-        let mut sortie = Vec::new();
-        for (album, article) in albums_de_collection(&brut).into_iter().zip(articles.iter()) {
-            let mut element = serde_json::to_value(album).unwrap_or(Value::Null);
-            if let (Some(objet), Some(date)) =
-                (element.as_object_mut(), crate::date_ajout_bandcamp(article))
-            {
-                objet.insert("created_at".to_string(), Value::String(date));
-            }
-            sortie.push(element);
-        }
-        Ok(Some(sortie))
+        Ok(Some(favoris_dates_de_collection(&brut)))
     }
     /// Ajouter un favori demande une session d'achat. Tune n'en a aucune.
     ///
@@ -858,5 +876,107 @@ mod tests {
         db.init_schema().unwrap();
         tune_core::db::migrations::run_migrations(&db).unwrap();
         BandcampService::new(Arc::new(db))
+    }
+}
+
+#[cfg(test)]
+mod dates_favoris_2778 {
+    use super::*;
+    use serde_json::json;
+
+    fn article(nom: &str, date: Option<&str>) -> Value {
+        json!({
+            "item_url": format!("https://exemple.bandcamp.com/album/{nom}"),
+            "item_title": nom,
+            "band_name": "Artiste",
+            "added": date,
+        })
+    }
+
+    #[test]
+    fn un_article_ecarte_ne_decale_pas_les_dates_des_favoris_suivants() {
+        let resultat = favoris_dates_de_collection(&json!({
+            "items": [
+                {"item_title": "sans adresse", "added": "01 Sep 2026 00:00:00 GMT"},
+                article("premier", Some("11 Sep 2026 12:34:56 GMT")),
+                {"item_url": "https://example.invalid/album/rejete",
+                 "added": "02 Sep 2026 00:00:00 GMT"},
+                article("second", Some("15 Sep 2026 06:07:08 GMT")),
+            ]
+        }));
+        assert_eq!(
+            resultat.len(),
+            2,
+            "les articles non jouables restent exclus"
+        );
+        assert_eq!(resultat[0]["title"], "premier");
+        assert_eq!(
+            resultat[0]["created_at"], "2026-09-11T12:34:56Z",
+            "le premier favori a reçu la date d'un article écarté"
+        );
+        assert_eq!(resultat[1]["title"], "second");
+        assert_eq!(
+            resultat[1]["created_at"], "2026-09-15T06:07:08Z",
+            "le second favori doit garder sa propre date malgré les rejets"
+        );
+    }
+
+    #[test]
+    fn un_favori_sans_date_n_herite_pas_de_celle_d_un_article_ecarte() {
+        let resultat = favoris_dates_de_collection(&json!({
+            "items": [
+                {"added": "01 Sep 2026 00:00:00 GMT"},
+                article("sans-date", None),
+                article("date-invalide", Some("illisible")),
+            ]
+        }));
+        assert_eq!(resultat.len(), 2);
+        for favori in &resultat {
+            assert!(
+                favori.get("created_at").is_none(),
+                "une date absente ou illisible ne doit pas être empruntée : {favori}"
+            );
+        }
+    }
+
+    #[test]
+    fn sans_rejet_ordre_et_dates_restent_inchanges() {
+        let resultat = favoris_dates_de_collection(&json!({
+            "items": [
+                article("recent", Some("15 Sep 2026 06:07:08 GMT")),
+                article("ancien", Some("11 Sep 2026 12:34:56 GMT")),
+                article("sans-date", None),
+            ]
+        }));
+        assert_eq!(resultat.len(), 3);
+        assert_eq!(resultat[0]["title"], "recent");
+        assert_eq!(resultat[0]["created_at"], "2026-09-15T06:07:08Z");
+        assert_eq!(resultat[1]["title"], "ancien");
+        assert_eq!(resultat[1]["created_at"], "2026-09-11T12:34:56Z");
+        assert_eq!(resultat[2]["title"], "sans-date");
+        assert!(resultat[2].get("created_at").is_none());
+        assert!(favoris_dates_de_collection(&json!({})).is_empty());
+        assert!(favoris_dates_de_collection(&json!({"items": []})).is_empty());
+    }
+
+    /// Garde de raccord : les témoins de conversion ci-dessus ne suffiraient
+    /// pas si la méthode du service continuait à utiliser l'ancien zip.
+    #[test]
+    fn la_methode_du_service_utilise_la_conversion_eprouvee() {
+        let source = include_str!("service.rs");
+        let debut = ["async fn get_user_", "favorites_dated("].concat();
+        let fin = ["async fn add_", "favorite("].concat();
+        let methode = source
+            .split_once(&debut)
+            .unwrap()
+            .1
+            .split_once(&fin)
+            .unwrap()
+            .0;
+        let appel = ["favoris_dates_", "de_collection(&brut)"].concat();
+        assert!(
+            methode.contains(&appel),
+            "la méthode de service doit employer la conversion qui conserve la date de chaque article"
+        );
     }
 }
