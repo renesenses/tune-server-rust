@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 
 use super::traits::{
     AudioSpec, BlocPcm, FormatOuvert, OutputCapabilities, OutputDspMetrics, OutputRingStarvation,
-    OutputSignalPathStatus, OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation,
-    TransformationsReelles, TransportState,
+    OutputSignalPathStatus, OutputStatus, OutputTarget, ProfondeurPcm, PuitsDEchantillons,
+    RingStarvation, TransformationsReelles, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -471,6 +471,12 @@ pub struct LocalOutput {
     /// ne peut plus rien enchaîner, quoi qu'elle ait su faire une seconde plus
     /// tôt. Remis à zéro par `play_url()`, qui démarre un fil neuf.
     chain_exhausted: Arc<AtomicBool>,
+    /// #4177 — la pause a RENDU le périphérique (exclusif Windows : WASAPI
+    /// exclusif ou ASIO). `get_status` continue de dire `Paused`, et
+    /// `device_released_on_pause()` dit à l'orchestrateur de rétablir la
+    /// lecture par `play_url` à la position conservée plutôt que de reprendre
+    /// « sur place » un flux qui n'existe plus. Effacé par `play_url()`.
+    peripherique_rendu_en_pause: AtomicBool,
     /// Zone equalizer for the zone currently playing on this output, applied
     /// BEFORE the room-correction convolver — the same order as the transcoded
     /// path (`transcode_source_to_file`: ReplayGain → EQ → convolver).
@@ -812,6 +818,7 @@ impl LocalOutput {
             track_ended_generation: Arc::new(AtomicU64::new(0)),
             next_media: Arc::new(std::sync::Mutex::new(None)),
             chain_exhausted: Arc::new(AtomicBool::new(false)),
+            peripherique_rendu_en_pause: AtomicBool::new(false),
             eq: Arc::new(std::sync::Mutex::new(None)),
             current_format: Arc::new(AtomicU32::new(0)),
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
@@ -877,6 +884,19 @@ impl LocalOutput {
     ///
     /// Sert à rebâtir un `EqProcessor` aux bons coefficients SANS attendre la
     /// piste suivante (#1725).
+    /// #4176 — un flux est-il en train de DÉMARRER : fil de lecture lancé,
+    /// périphérique pas encore ouvert (donc pas de format) ?
+    ///
+    /// Le trou dans lequel une bascule PURE tombait : `current_format()` rend
+    /// `None`, `refresh_zone_pure_dsp` concluait « rien en cours » et
+    /// l'orchestrateur RELANÇAIT le flux — une seconde ouverture exclusive
+    /// pendant que la première attendait encore son premier octet
+    /// (`0x8889000A`, zone arrêtée ; Jean Valjean, fil 1798). Or un flux qui
+    /// démarre lit `pure_bypass` à l'ouverture : il n'y a rien à relancer.
+    pub fn flux_en_demarrage(&self) -> bool {
+        self.playing.load(Ordering::SeqCst) && self.current_format().is_none()
+    }
+
     pub fn current_format(&self) -> Option<(u32, u16)> {
         let empaquete = self.current_format.load(Ordering::Relaxed);
         if empaquete == 0 {
@@ -3508,19 +3528,15 @@ impl EtageDeConversion<'_> {
     /// en contournement pur ; sinon un égaliseur, un convolveur, un crossfeed
     /// (stéréo seulement) ou le repli mono (stéréo seulement) posés.
     fn dsp_actif(&self) -> bool {
-        fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
-            m.lock().map(|g| g.is_some()).unwrap_or(false)
-        }
-        if self.pcm.dop_active.load(Ordering::Relaxed)
-            || self.pcm.pure_bypass.load(Ordering::Relaxed)
-        {
-            return false;
-        }
-        let stereo = self.spec.canaux() == 2;
-        pose(self.pcm.eq)
-            || pose(self.pcm.convolver)
-            || (stereo && pose(self.pcm.crossfeed))
-            || (stereo && self.pcm.mono_downmix.load(Ordering::Relaxed))
+        dsp_touche_le_signal(
+            self.spec.canaux(),
+            self.pcm.dop_active,
+            self.pcm.pure_bypass,
+            self.pcm.eq,
+            self.pcm.convolver,
+            self.pcm.crossfeed,
+            self.pcm.mono_downmix,
+        )
     }
 
     /// **L'unique écriture au puits** de l'étage flottant (REF-7, #2219).
@@ -3713,6 +3729,35 @@ pub(super) trait Etage {
 /// déduction (#3987). Appelée à l'ouverture et à chaque frontière gapless :
 /// entre les deux, ni le format d'entrée, ni le format ouvert, ni le DSP posé
 /// ne changent sans repasser par là.
+/// Le DSP touche-t-il les échantillons ? La règle unique des deux chemins de
+/// sortie flottants (PCM et compressé) — c'est ce que `dsp_actif` publie dans
+/// [`TransformationsReelles`] et que le chemin du signal affiche « (mesuré) ».
+///
+/// DoP ou PURE : rien ne touche le signal, quoi qu'il y ait d'armé. Sinon :
+/// égaliseur ou convolveur, et — en stéréo seulement, comme `apply_local_dsp`
+/// les applique — crossfeed ou repli mono.
+fn dsp_touche_le_signal(
+    canaux: u16,
+    dop_active: &AtomicBool,
+    pure_bypass: &AtomicBool,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    mono_downmix: &AtomicBool,
+) -> bool {
+    fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
+        m.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+    if dop_active.load(Ordering::Relaxed) || pure_bypass.load(Ordering::Relaxed) {
+        return false;
+    }
+    let stereo = canaux == 2;
+    pose(eq)
+        || pose(convolver)
+        || (stereo && pose(crossfeed))
+        || (stereo && mono_downmix.load(Ordering::Relaxed))
+}
+
 fn publier_les_transformations(
     creneau: &std::sync::Mutex<Option<TransformationsReelles>>,
     etage: &impl Etage,
@@ -4004,6 +4049,27 @@ impl BoucleProducteur<'_> {
     }
 }
 
+/// #4176 — après une attente bloquante (première lecture HTTP), le fil doit-il
+/// encore ouvrir le périphérique ? Non dès que `stop()` est passé : par le
+/// drapeau de silence forcé ou par le canal d'arrêt.
+pub(crate) fn ouverture_encore_voulue(force_silent: bool, stop_recu: bool) -> bool {
+    !force_silent && !stop_recu
+}
+
+/// #4177 — la pause doit-elle RENDRE le périphérique ?
+///
+/// Règle pure : sous Windows, en mode exclusif (WASAPI exclusif comme ASIO,
+/// les deux tiennent le point de sortie pour eux seuls), et seulement quand un
+/// flux joue. Le chemin partagé (mixeur Windows), macOS et Linux ne changent
+/// pas : leur pause reste un booléen, et une pause sans flux n'a rien à rendre.
+pub(crate) fn la_pause_rend_le_peripherique(
+    windows: bool,
+    exclusive_mode: bool,
+    playing: bool,
+) -> bool {
+    windows && exclusive_mode && playing
+}
+
 #[async_trait::async_trait]
 impl OutputTarget for LocalOutput {
     fn name(&self) -> &str {
@@ -4218,6 +4284,10 @@ impl OutputTarget for LocalOutput {
         // Clear the natural-end flag and generation for the new track.
         self.track_ended_naturally.store(false, Ordering::SeqCst);
         self.track_ended_generation.store(0, Ordering::SeqCst);
+        // #4177 — un flux neuf tient (ou non) le périphérique : la pause
+        // précédente ne l'a plus rendu.
+        self.peripherique_rendu_en_pause
+            .store(false, Ordering::SeqCst);
         // Un fil neuf a une boucle d'enchaînement intacte : la sonde repart de
         // zéro. **Après** l'incrément de `play_generation`, et c'est tout
         // l'intérêt : l'ancien fil ne lève son drapeau que s'il est encore la
@@ -4695,6 +4765,45 @@ impl OutputTarget for LocalOutput {
                     "local_audio_compressed_playing"
                 );
 
+                // #4347 — ce chemin (radio décodée en local) rééchantillonne
+                // vers la cadence du périphérique comme l'autre — mais il ne
+                // PUBLIAIT jamais ses transformations : le chemin du signal
+                // restait « Sans perte », sans étape Resampler, alors que le
+                // 44,1 kHz partait à 192 kHz. Une relance du flux (bascule
+                // PURE, sonde radio en échec…) passait par le chemin PCM, qui
+                // publie, et l'étape « 44kHz → 192kHz (mesuré) » apparaissait
+                // « sans raison » et ne repartait plus (Jean Valjean, fil
+                // 1825). Même publication, mêmes règles : entrée décodée
+                // (flottant 32 bits), format réellement ouvert, DSP mesuré.
+                if let Some(entree) =
+                    AudioSpec::nouvelle(dec_sr, ProfondeurPcm::FlottantIeee32, dec_ch)
+                {
+                    let dsp_actif = dsp_touche_le_signal(
+                        dec_ch,
+                        &dop_active,
+                        &pure_bypass,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &mono_downmix,
+                    );
+                    if let Ok(mut slot) = transformations_reelles.lock() {
+                        *slot = Some(TransformationsReelles::nouvelles(
+                            entree,
+                            FormatOuvert::new(output_sr, output_ch),
+                            dsp_actif,
+                        ));
+                    }
+                    info!(
+                        dec_sr,
+                        output_sr,
+                        dec_ch,
+                        output_ch,
+                        dsp_actif,
+                        "local_audio_compressed_transformations_published"
+                    );
+                }
+
                 // Chaine DSP de la zone : egaliseur, correction de piece,
                 // crossfeed.
                 //
@@ -4950,6 +5059,27 @@ impl OutputTarget for LocalOutput {
             };
 
             // ------- Exclusive mode path (macOS only) -------
+            // #4176 — le fil vient de passer jusqu'à 10 s bloqué dans la
+            // première lecture HTTP, sans regarder `stop()`. S'il a été arrêté
+            // entre-temps, il ne doit PAS ouvrir le périphérique : sur un
+            // chemin exclusif, son ouverture tardive entrait en collision avec
+            // celle du flux relancé (`0x8889000A`), écrivait l'échec dans le
+            // créneau partagé et le sondeur arrêtait la zone.
+            if !ouverture_encore_voulue(
+                force_silent.load(Ordering::SeqCst),
+                stop_rx.try_recv().is_ok(),
+            ) {
+                info!(
+                    device = %device_name,
+                    generation = my_generation,
+                    "local_audio_open_skipped_stream_stopped_before_device"
+                );
+                if play_generation.load(Ordering::SeqCst) == my_generation {
+                    playing.store(false, Ordering::SeqCst);
+                }
+                return;
+            }
+
             #[cfg(target_os = "macos")]
             if exclusive_mode {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
@@ -5952,13 +6082,57 @@ impl OutputTarget for LocalOutput {
     }
 
     async fn pause(&self) -> Result<(), String> {
+        // #4177 — en exclusif Windows (WASAPI exclusif ou ASIO), la pause ne
+        // posait qu'un booléen : le fil de rendu poussait du silence et le
+        // périphérique restait PRIS — plus un son d'aucune autre application
+        // sur ce point de sortie tant que Tune était en pause (Jean Valjean,
+        // fil 1798 : « impossible d'écouter un clip sur YouTube »). On rend
+        // le périphérique ; l'orchestrateur lit `device_released_on_pause()`
+        // à la reprise et rouvre à la position conservée
+        // (`RepriseDeSession::RetablirALaPosition`).
+        if la_pause_rend_le_peripherique(
+            cfg!(target_os = "windows"),
+            self.exclusive_mode,
+            self.playing.load(Ordering::SeqCst),
+        ) {
+            let position_ms = self.position_ms.load(Ordering::SeqCst);
+            let duration_ms = self.duration_ms.load(Ordering::SeqCst);
+            info!(
+                device = %self.device_name,
+                backend = %self.audio_backend,
+                position_ms,
+                "local_audio_exclusive_device_released_on_pause"
+            );
+            self.stop().await?;
+            // `stop()` remet la position à zéro ; une pause, elle, la garde :
+            // c'est ce que le sondeur relit pendant la pause.
+            self.position_ms.store(position_ms, Ordering::SeqCst);
+            self.duration_ms.store(duration_ms, Ordering::SeqCst);
+            self.peripherique_rendu_en_pause
+                .store(true, Ordering::SeqCst);
+        }
         self.paused.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn resume(&self) -> Result<(), String> {
+        if self.peripherique_rendu_en_pause.load(Ordering::SeqCst) {
+            // L'orchestrateur rétablit par `play_url` (qui efface le drapeau) ;
+            // arriver ici, c'est reprendre « sur place » un flux rendu : le
+            // dire, pour que le journal explique le silence qui suivrait.
+            warn!(
+                device = %self.device_name,
+                "local_audio_resume_without_device_reopen"
+            );
+        }
         self.paused.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// #4177 — lu par `PlaybackOrchestrator::resume` AVANT de décider entre
+    /// « reprendre sur place » et « rétablir à la position ».
+    fn device_released_on_pause(&self) -> bool {
+        self.peripherique_rendu_en_pause.load(Ordering::SeqCst)
     }
 
     async fn stop(&self) -> Result<(), String> {
@@ -6154,6 +6328,12 @@ impl OutputTarget for LocalOutput {
             } else {
                 TransportState::Playing
             }
+        } else if self.paused.load(Ordering::Relaxed)
+            && self.peripherique_rendu_en_pause.load(Ordering::Relaxed)
+        {
+            // #4177 — le fil est parti parce que la pause a RENDU le
+            // périphérique, pas parce que la piste est finie : c'est une pause.
+            TransportState::Paused
         } else {
             TransportState::Stopped
         };
@@ -6587,6 +6767,20 @@ mod backends_supportes_tests;
 
 #[cfg(test)]
 mod format_courant_tests;
+
+/// #4347 — le chemin compressé publie ses transformations comme le chemin PCM.
+#[cfg(test)]
+mod chemin_compresse_publie_ses_transformations_4347;
+
+/// #4176 — une bascule PURE pendant qu'un flux démarre ne relance rien, et
+/// un fil arrêté pendant sa première lecture n'ouvre plus le périphérique.
+#[cfg(test)]
+mod bascule_pure_flux_en_demarrage_4176;
+
+/// #4177 — en exclusif Windows, la pause rend le périphérique au lieu de le
+/// garder en poussant du silence.
+#[cfg(test)]
+mod pause_rend_le_peripherique_4177;
 
 #[cfg(test)]
 mod chemin_compresse_dsp_tests;

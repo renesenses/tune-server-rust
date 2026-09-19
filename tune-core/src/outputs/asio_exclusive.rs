@@ -180,6 +180,9 @@ pub struct AsioExclusiveOutput {
     #[allow(dead_code)]
     paused: Arc<AtomicBool>,
     counters: Arc<RealtimeCounters>,
+    /// Le périphérique cpal, gardé pour relire la cadence du pilote après la
+    /// libération (#4184, piste 2b). Déclaré APRÈS `stream` : il lui survit.
+    device: cpal::Device,
     /// Held for the whole session so no other ASIO stream can open on the
     /// device concurrently. Released (with a settle delay) in `Drop`.
     #[allow(dead_code)]
@@ -409,7 +412,55 @@ impl AsioExclusiveOutput {
             counters.clone(),
         )?;
 
+        // -- 6. Relire la cadence RÉELLE du pilote (#4184) --------------------
+        //
+        // cpal a demandé `set_sample_rate(sample_rate)` en bâtissant le flux ;
+        // le pilote a dit oui. Mais dire oui et basculer sont deux choses :
+        // une sortie S/PDIF verrouillée ou un pilote générique gardent leur
+        // cadence, et le flux poussé à 96 kHz ressort à 44,1 — « la musique
+        // passe au ralenti » (william, fil 1793). Avant ce point, la cadence
+        // journalisée était celle que Tune avait DEMANDÉE, jamais relue.
+        // `default_output_config()` sur ASIO = `driver.sample_rate()`, la
+        // cadence courante du pilote. On la relit et on refuse de jouer de
+        // travers : le refus remonte par `record_exclusive_open_failure`.
+        let cadence_relue = device
+            .default_output_config()
+            .ok()
+            .map(|c| c.config().sample_rate);
+        match verdict_cadence_relue(sample_rate, cadence_relue) {
+            VerdictCadence::Confirmee(relue) => {
+                info!(
+                    device = %resolved_name,
+                    requested_sample_rate = sample_rate,
+                    driver_sample_rate = relue,
+                    "asio_exclusive_rate_verified"
+                );
+            }
+            VerdictCadence::Inconnue => {
+                warn!(
+                    device = %resolved_name,
+                    requested_sample_rate = sample_rate,
+                    "asio_exclusive_rate_unverifiable"
+                );
+            }
+            VerdictCadence::Divergente(relue) => {
+                warn!(
+                    device = %resolved_name,
+                    requested_sample_rate = sample_rate,
+                    driver_sample_rate = relue,
+                    "asio_exclusive_rate_mismatch_after_open"
+                );
+                drop(stream);
+                return Err(message_cadence_divergente(
+                    &resolved_name,
+                    sample_rate,
+                    relue,
+                ));
+            }
+        }
+
         Ok(Self {
+            device,
             device_name: resolved_name,
             original_sample_rate,
             current_sample_rate: sample_rate,
@@ -514,6 +565,23 @@ impl AsioExclusiveOutput {
                     to = orig_sr,
                     device = %self.device_name,
                     "asio_exclusive_sample_rate_will_restore_on_driver_release"
+                );
+                // #4184, piste 2b — l'espérance ci-dessus, MESURÉE : la
+                // cadence que le pilote annonce une fois le flux rendu. Tune
+                // ne la réécrit pas (cpal n'expose pas `set_sample_rate` hors
+                // construction d'un flux) ; ce relevé dit au moins si le
+                // matériel est resté déplacé après la session ASIO.
+                let relue = self
+                    .device
+                    .default_output_config()
+                    .ok()
+                    .map(|c| c.config().sample_rate);
+                info!(
+                    device = %self.device_name,
+                    original_sample_rate = orig_sr,
+                    driver_sample_rate = ?relue,
+                    restored = relue == Some(orig_sr),
+                    "asio_exclusive_rate_after_release"
                 );
             }
         }
@@ -834,6 +902,42 @@ impl AsioExclusiveOutput {
     }
 }
 
+/// Ce que la relecture de la cadence du pilote, après ouverture, autorise
+/// (#4184).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerdictCadence {
+    /// Le pilote annonce la cadence demandée : on joue.
+    Confirmee(u32),
+    /// Le pilote n'a pas su dire sa cadence : on joue, en le disant.
+    Inconnue,
+    /// Le pilote annonce une AUTRE cadence : jouer sortirait au ralenti ou en
+    /// accéléré. On refuse.
+    Divergente(u32),
+}
+
+/// La règle, pure, du refus d'ouverture ASIO sur cadence divergente (#4184).
+///
+/// `demandee` est la cadence de la source, celle que `find_exclusive_config`
+/// a posée dans le `StreamConfig` ; `relue` est ce que `driver.sample_rate()`
+/// rend une fois le flux bâti — `None` si l'appel a échoué.
+pub(crate) fn verdict_cadence_relue(demandee: u32, relue: Option<u32>) -> VerdictCadence {
+    match relue {
+        None => VerdictCadence::Inconnue,
+        Some(r) if r == demandee => VerdictCadence::Confirmee(r),
+        Some(r) => VerdictCadence::Divergente(r),
+    }
+}
+
+/// Le texte du refus, celui que `record_exclusive_open_failure("ASIO", …)`
+/// écrit à l'écran : la cadence demandée, celle du pilote, et le symptôme
+/// évité — pas un code d'erreur nu.
+pub(crate) fn message_cadence_divergente(device: &str, demandee: u32, relue: u32) -> String {
+    format!(
+        "ASIO device {device} stayed at {relue} Hz after {demandee} Hz was requested: \
+         refusing to play at the wrong speed (the driver accepted the rate but did not switch)"
+    )
+}
+
 impl Drop for AsioExclusiveOutput {
     fn drop(&mut self) {
         if let Err(e) = self.release() {
@@ -1002,5 +1106,72 @@ mod tests {
     #[test]
     fn i24_zero_est_le_silence() {
         assert_eq!(I24_ZERO.inner(), 0);
+    }
+
+    // ── #4184 : la cadence relue après ouverture ──────────────────────────
+    //
+    // Sans ASIO sur le banc (la .42 n'a aucun pilote), le pilote ne peut pas
+    // être interrogé ici : ces tests figent la RÈGLE, et le site d'appel est
+    // gardé par texte plus bas.
+
+    /// Le témoin : un pilote resté à 44,1 kHz quand on a demandé 96 kHz est
+    /// un refus — c'est le « au ralenti » de william. Avant le correctif,
+    /// `new` ne relisait rien et jouait.
+    #[test]
+    fn cadence_relue_divergente_refuse_l_ouverture_4184() {
+        assert_eq!(
+            verdict_cadence_relue(96_000, Some(44_100)),
+            VerdictCadence::Divergente(44_100)
+        );
+        let msg = message_cadence_divergente("Xonar", 96_000, 44_100);
+        assert!(msg.contains("44100 Hz"), "{msg}");
+        assert!(msg.contains("96000 Hz"), "{msg}");
+        assert!(msg.contains("wrong speed"), "{msg}");
+    }
+
+    /// Le pilote qui a bien basculé joue ; celui qui ne sait pas dire sa
+    /// cadence joue aussi — refuser sur une inconnue casserait des pilotes
+    /// sains qui ne répondent pas à `getSampleRate`.
+    #[test]
+    fn cadence_relue_confirmee_ou_inconnue_laisse_jouer_4184() {
+        assert_eq!(
+            verdict_cadence_relue(96_000, Some(96_000)),
+            VerdictCadence::Confirmee(96_000)
+        );
+        assert_eq!(
+            verdict_cadence_relue(96_000, None),
+            VerdictCadence::Inconnue
+        );
+    }
+
+    /// La garde du BRANCHEMENT : `new` relit la cadence après
+    /// `build_native_stream` et rend l'erreur sur `Divergente`. Coupée au
+    /// premier `#[cfg(test)]` pour ne pas être satisfaite par ce test-ci.
+    #[test]
+    fn new_relit_la_cadence_du_pilote_apres_ouverture_4184() {
+        let src = include_str!("asio_exclusive.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let ouverture = prod.find("Self::build_native_stream(").unwrap();
+        let apres = &prod[ouverture..];
+        let relecture = apres
+            .find("verdict_cadence_relue(sample_rate, cadence_relue)")
+            .unwrap();
+        let refus = apres
+            .find("return Err(message_cadence_divergente(")
+            .unwrap();
+        let ok_self = apres.find("Ok(Self {").unwrap();
+        assert!(
+            relecture < ok_self,
+            "la relecture doit précéder la construction"
+        );
+        assert!(refus < ok_self, "le refus doit précéder la construction");
+        assert!(
+            apres[..ok_self].contains("asio_exclusive_rate_mismatch_after_open"),
+            "le marqueur de divergence doit être journalisé avant de refuser"
+        );
+        assert!(
+            prod.contains("\"asio_exclusive_rate_after_release\""),
+            "release() doit relire la cadence après la libération (piste 2b)"
+        );
     }
 }

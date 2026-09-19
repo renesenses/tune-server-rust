@@ -1455,6 +1455,11 @@ mod stop_scope_tests;
 #[cfg(test)]
 mod curseur_intact_4283;
 
+/// #4177 — une sortie exclusive Windows rend son périphérique à la pause ; la
+/// reprise rétablit à la position au lieu de reprendre « sur place ».
+#[cfg(test)]
+mod pause_rend_le_peripherique_4177;
+
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
 ///
