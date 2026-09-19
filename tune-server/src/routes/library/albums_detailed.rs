@@ -26,6 +26,32 @@ use super::facets::{FacetQuery, build_conditions, resolve_collection};
 /// unique ne veut rien dire. Elles restent visibles dans la table détaillée.
 const ONLY_REAL_ALBUMS: &str = "t.album_id IS NOT NULL";
 
+/// L'artiste affiché sur une carte d'album.
+///
+/// 🔴 #4427 — sur une COMPILATION, l'artiste de la carte est celui de l'album,
+/// pas le maximum alphabétique de ce que portent ses pistes.
+///
+/// Mesuré le 18/09/2026 sur le .18 : les douze lignes « Coco María Presents
+/// Club Coco ¡AHORA! » réunies en un disque portent bien
+/// `albums.artist_id → « Various Artists »`, et la carte affichait
+/// **« Ronald Snijders »** — un invité, dernier par ordre alphabétique.
+///
+/// La cause n'est pas dans la ligne album, qui est juste, mais ici : la
+/// requête ne lisait que `t.album_artist`, la colonne que chaque piste garde
+/// de son album d'ORIGINE. Et la fusion d'albums ne la met jamais à jour —
+/// elle ne fait que `UPDATE tracks SET album_id = ?`. Après une fusion, les
+/// pistes portent donc encore N noms différents.
+///
+/// Corriger ici plutôt que dans la fusion répare aussi les bibliothèques
+/// **déjà** fusionnées, sans réécrire une seule piste.
+///
+/// Limité aux compilations à dessein : pour un album ordinaire,
+/// `t.album_artist` reste ce que les fichiers déclarent, et c'est la valeur
+/// que les écrans montrent depuis toujours. `ar_al.name` peut être NUL (album
+/// sans `artist_id`) — le `COALESCE` retombe alors sur l'ancien comportement.
+const ARTISTE_DE_CARTE: &str = "COALESCE(CASE WHEN COALESCE(al.is_compilation, 0) <> 0 \
+     THEN ar_al.name END, t.album_artist, ar.name)";
+
 pub(super) async fn albums_detailed(
     Query(q): Query<FacetQuery>,
     RawQuery(raw): RawQuery,
@@ -77,7 +103,7 @@ pub(super) async fn albums_detailed(
     let sql = format!(
         "SELECT t.album_id, \
                 MAX(al.title), \
-                MAX(COALESCE(t.album_artist, ar.name)), \
+                MAX({ARTISTE_DE_CARTE}), \
                 MAX(al.cover_path), \
                 MAX(t.label), \
                 MAX(t.year), \
@@ -90,9 +116,10 @@ pub(super) async fn albums_detailed(
                 MAX(al.is_compilation) \
          FROM tracks t \
          LEFT JOIN albums al ON al.id = t.album_id \
-         LEFT JOIN artists ar ON ar.id = t.artist_id{where_clause} \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         LEFT JOIN artists ar_al ON ar_al.id = al.artist_id{where_clause} \
          GROUP BY t.album_id \
-         ORDER BY MAX(COALESCE(t.album_artist, ar.name)), MAX(al.title) \
+         ORDER BY MAX({ARTISTE_DE_CARTE}), MAX(al.title) \
          LIMIT {limit} OFFSET {offset}"
     );
 
@@ -151,6 +178,7 @@ pub(super) async fn albums_detailed(
 #[cfg(test)]
 mod tests {
     use super::ONLY_REAL_ALBUMS;
+    use serde_json::Value;
 
     /// Le garde-fou qui empêche les pistes orphelines de former une carte
     /// fantôme. S'il disparaît, `GROUP BY t.album_id` produit un groupe NULL
@@ -158,6 +186,162 @@ mod tests {
     #[test]
     fn les_pistes_sans_album_sont_ecartees() {
         assert!(ONLY_REAL_ALBUMS.contains("album_id IS NOT NULL"));
+    }
+
+    /// 🔴 #4427 — une compilation s'affiche sous l'artiste de son ALBUM.
+    ///
+    /// Sans le `CASE`, la requête rend le maximum alphabétique de
+    /// `t.album_artist` : après une fusion, chaque piste garde le nom de son
+    /// album d'origine et la carte sort sous un invité — « Ronald Snijders »
+    /// pour « Club Coco ¡AHORA! », mesuré le 18/09 sur le .18.
+    #[test]
+    fn une_compilation_porte_l_artiste_de_son_album() {
+        use super::ARTISTE_DE_CARTE;
+        // La compilation lit l'artiste de la ligne album…
+        assert!(ARTISTE_DE_CARTE.contains("al.is_compilation"));
+        assert!(ARTISTE_DE_CARTE.contains("ar_al.name"));
+        // …et rien d'autre ne passe devant lui.
+        let i = ARTISTE_DE_CARTE
+            .find("ar_al.name")
+            .expect("artiste d'album");
+        let j = ARTISTE_DE_CARTE
+            .find("t.album_artist")
+            .expect("repli piste");
+        assert!(
+            i < j,
+            "l'artiste de l'album doit primer sur celui des pistes"
+        );
+        // Un album ORDINAIRE garde le comportement d'avant : le CASE ne rend
+        // `ar_al.name` que si le drapeau est levé, et le COALESCE retombe.
+        assert!(ARTISTE_DE_CARTE.contains("t.album_artist, ar.name"));
+    }
+
+    /// Le tri suit l'affichage. S'ils divergent, la pagination range les cartes
+    /// sous un nom qu'elles ne montrent pas.
+    #[test]
+    fn le_tri_emploie_le_meme_artiste_que_l_affichage() {
+        let fichier = include_str!("albums_detailed.rs");
+        let sql = fichier
+            .split("let sql = format!(")
+            .nth(1)
+            .expect("la requête");
+        assert_eq!(
+            sql.matches("MAX({ARTISTE_DE_CARTE})").count(),
+            2,
+            "une fois pour la colonne, une fois pour l'ORDER BY"
+        );
+    }
+
+    /// 🔴 L'épreuve qui MESURE, par la route et une vraie base — les deux
+    /// ci-dessus ne lisent que du texte.
+    ///
+    /// On reconstitue le cas du .18 : douze lignes réunies en un album marqué
+    /// compilation, dont la ligne porte « Various Artists », et des pistes qui
+    /// gardent chacune l'artiste de leur album d'origine. C'est l'état que la
+    /// fusion laisse derrière elle (`UPDATE tracks SET album_id = ?`, et rien
+    /// sur `album_artist`).
+    #[tokio::test]
+    async fn la_carte_d_une_compilation_ne_sort_pas_sous_un_invite() {
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::db::backend::ToSqlValue;
+
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Various Artists'), (2, 'Ronald Snijders'), (3, 'Acid Coco')",
+            &[],
+        )
+        .expect("artistes");
+        // La ligne album est JUSTE : compilation, sous Various Artists.
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id, is_compilation) VALUES (1, 'Club Coco', 1, 1)",
+            &[],
+        )
+        .expect("album");
+        // Les pistes, elles, gardent le nom de leur album d'origine.
+        for (t, a, aa) in [("Uno", 3, "Acid Coco"), ("Dos", 2, "Ronald Snijders")] {
+            b.execute(
+                "INSERT INTO tracks (title, artist_id, album_id, album_artist, source, file_path) \
+                 VALUES (?1, ?2, 1, ?3, 'local', ?4)",
+                &[
+                    &t as &dyn ToSqlValue,
+                    &(a as i64),
+                    &aa,
+                    &format!("/m/{t}.flac"),
+                ],
+            )
+            .expect("piste");
+        }
+
+        let reponse = super::super::router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/albums-detailed?limit=10")
+                    .body(Body::empty())
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse");
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        let v: Value = serde_json::from_slice(&octets).expect("json");
+        let carte = &v["items"][0];
+        assert_eq!(
+            carte["album_artist"], "Various Artists",
+            "la carte doit porter l'artiste de l'album, pas le dernier invité par ordre alphabétique"
+        );
+        assert_eq!(carte["is_compilation"], true);
+    }
+
+    /// Un album ORDINAIRE garde le comportement d'avant : c'est ce que ses
+    /// fichiers déclarent qui s'affiche, pas la ligne album.
+    #[tokio::test]
+    async fn un_album_ordinaire_garde_l_artiste_de_ses_fichiers() {
+        use crate::state::AppState;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        use tune_core::db::backend::ToSqlValue;
+
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Ligne Album'), (2, 'Étiquette Fichier')",
+            &[],
+        )
+        .expect("artistes");
+        b.execute(
+            "INSERT INTO albums (id, title, artist_id, is_compilation) VALUES (1, 'Disque', 1, 0)",
+            &[],
+        )
+        .expect("album");
+        b.execute(
+            "INSERT INTO tracks (title, artist_id, album_id, album_artist, source, file_path) \
+             VALUES ('Une', 2, 1, 'Étiquette Fichier', 'local', '/m/u.flac')",
+            &[] as &[&dyn ToSqlValue],
+        )
+        .expect("piste");
+
+        let reponse = super::super::router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/albums-detailed?limit=10")
+                    .body(Body::empty())
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse");
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        let v: Value = serde_json::from_slice(&octets).expect("json");
+        assert_eq!(v["items"][0]["album_artist"], "Étiquette Fichier");
     }
 
     /// Marqueur de contrat : le total pagine des ALBUMS. Compter des pistes
