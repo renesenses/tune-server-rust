@@ -301,6 +301,10 @@ fn faux_lms(reponses: Vec<(&'static str, &'static str)>) -> (u16, std::thread::J
                     Err(e) => panic!("{e}"),
                 }
             };
+            // Sous Windows et macOS, le socket accepté HÉRITE du mode non bloquant de
+            // l'écouteur (Linux rend un socket bloquant) : `read_line` rendrait
+            // `WouldBlock` si la commande n'est pas encore arrivée (#4531).
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
