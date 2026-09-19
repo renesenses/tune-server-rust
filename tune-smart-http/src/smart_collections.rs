@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 
 use crate::SmartHttpState;
+use crate::catalogue;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -929,6 +930,67 @@ fn load_collection_criteria(
     }))
 }
 
+/// Les albums du CATALOGUE d'un service que les règles demandent — #4473.
+///
+/// Rend `Ok(albums)` inchangé quand aucune règle ne demande de catalogue.
+///
+/// 🔴 Trois refus EXPLICITES, parce qu'une règle qu'on ne sait pas honorer ne
+/// doit ni rendre tout ni rendre vide en silence (leçon de #4469) :
+///
+/// * aucune cible — ni artiste ni album nommé par une égalité : un service ne
+///   sait pas énumérer son catalogue, il n'y a pas de requête à faire ;
+/// * pas de registre de services — l'état n'en porte pas ;
+/// * le service demandé ne répond pas : là, on rend une liste vide SANS
+///   refuser, car une panne de réseau ne doit pas faire échouer une collection
+///   qui a par ailleurs des albums locaux.
+async fn avec_albums_de_catalogue(
+    state: &SmartHttpState,
+    mut albums: Vec<Value>,
+    rules_json: &str,
+    max_limit: Option<i64>,
+) -> Result<Vec<Value>, AppError> {
+    let Some(service) = catalogue::service_du_catalogue(rules_json) else {
+        return Ok(albums);
+    };
+    let Some(cible) = catalogue::cible(rules_json) else {
+        return Err(AppError::bad_request(
+            "Une règle « catalogue » doit nommer un artiste ou un album : \
+             aucun service ne sait énumérer son catalogue.",
+        ));
+    };
+    // 🔴 On CLONE l'Arc au lieu d'en garder une référence : ce qui vit en
+    // travers d'un `.await` doit être `Send`, et une référence à l'état ne
+    // l'est pas ici. Sans ça, axum refuse le handler tout entier.
+    let Some(distant) = state.catalogue.clone() else {
+        return Err(AppError::bad_request(
+            "Le catalogue des services n'est pas disponible ici.",
+        ));
+    };
+
+    let trouves = match &cible {
+        catalogue::Cible::Artiste(nom) => distant.albums_par_artiste(&service, nom).await,
+        catalogue::Cible::Album(titre) => distant.albums_par_titre(&service, titre).await,
+    };
+    albums.extend(trouves.into_iter().map(|a| {
+        json!({
+            "id": Value::Null,
+            "source": a.service,
+            "source_id": a.source_id,
+            "title": a.title,
+            "artist_name": a.artist,
+            "year": a.year,
+            "cover_path": a.cover_url,
+            "genre": Value::Null,
+            "track_count": 0,
+            "is_compilation": false,
+        })
+    }));
+    if let Some(n) = max_limit.filter(|n| *n >= 0) {
+        albums.truncate(n as usize);
+    }
+    Ok(albums)
+}
+
 async fn resolve_albums(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
@@ -940,16 +1002,21 @@ async fn resolve_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
-    let (where_clause, order, limit_clause) = build_album_query(
-        &rules_json,
-        &match_mode,
-        &sort_by,
-        &sort_order,
-        max_limit,
-        &ctx,
-    );
+    // Le résolveur et son contexte tiennent des RÉFÉRENCES à l'état : ils
+    // doivent mourir avant le `.await` du catalogue, sinon le futur n'est plus
+    // `Send` et axum refuse le handler.
+    let (where_clause, order, limit_clause) = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        build_album_query(
+            &rules_json,
+            &match_mode,
+            &sort_by,
+            &sort_order,
+            max_limit,
+            &ctx,
+        )
+    };
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
     let albums = avec_albums_de_service(
         &state,
@@ -961,6 +1028,7 @@ async fn resolve_albums(
         &sort_order,
         max_limit,
     )?;
+    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?;
 
     // Return a bare array, matching the regular collections endpoint
     // (GET /library/collections/{id}/albums). The previous {"albums":[…],
@@ -1469,5 +1537,132 @@ mod tests {
             "la collection annonce ses favoris ALBUM : {}",
             reponse.0[0]
         );
+    }
+
+    /// 🔴 #4473 — le catalogue d'un service, et ses trois refus.
+    ///
+    /// Un service simulé : la garde porte sur ce que le module DÉCIDE, pas sur
+    /// ce que Qobuz répond. Aucun réseau, aucune clé, et le comportement se
+    /// mesure quand même.
+    mod catalogue_de_service {
+        use crate::SmartHttpState;
+        use crate::catalogue::{AlbumDistant, CatalogueDistant, PisteDistante};
+        use std::sync::Arc;
+        use tune_core::db::sqlite::SqliteDb;
+
+        struct ServiceSimule;
+
+        #[async_trait::async_trait]
+        impl CatalogueDistant for ServiceSimule {
+            async fn albums_par_artiste(&self, service: &str, nom: &str) -> Vec<AlbumDistant> {
+                vec![AlbumDistant {
+                    service: service.into(),
+                    source_id: "a1".into(),
+                    title: format!("Best of {nom}"),
+                    artist: nom.into(),
+                    cover_url: None,
+                    year: Some(1960),
+                }]
+            }
+            async fn albums_par_titre(&self, service: &str, titre: &str) -> Vec<AlbumDistant> {
+                vec![AlbumDistant {
+                    service: service.into(),
+                    source_id: "a2".into(),
+                    title: titre.into(),
+                    artist: "X".into(),
+                    cover_url: None,
+                    year: None,
+                }]
+            }
+            async fn pistes_par_artiste(&self, _s: &str, _n: &str) -> Vec<PisteDistante> {
+                Vec::new()
+            }
+        }
+
+        fn etat(avec_service: bool) -> SmartHttpState {
+            let db = SqliteDb::open_in_memory().expect("base");
+            db.init_schema().expect("schéma");
+            let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+            let e = SmartHttpState::new(backend);
+            if avec_service {
+                e.avec_catalogue(Arc::new(ServiceSimule))
+            } else {
+                e
+            }
+        }
+
+        const AVEC_ARTISTE: &str = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                                       {"field":"artist","op":"=","value":"John Coltrane"}]"#;
+
+        #[tokio::test]
+        async fn les_albums_du_service_rejoignent_ceux_de_la_bibliotheque() {
+            let locaux = vec![serde_json::json!({"id": 1, "title": "Un album local"})];
+            let r = super::super::avec_albums_de_catalogue(&etat(true), locaux, AVEC_ARTISTE, None)
+                .await;
+            let Ok(r) = r else {
+                panic!("le catalogue doit répondre")
+            };
+            assert_eq!(r.len(), 2, "le local et le distant : {r:?}");
+            assert_eq!(r[1]["source"], "qobuz");
+            assert_eq!(r[1]["title"], "Best of John Coltrane");
+            assert_eq!(
+                r[1]["id"],
+                serde_json::Value::Null,
+                "un album distant n'a pas d'id local"
+            );
+        }
+
+        #[tokio::test]
+        async fn sans_regle_de_catalogue_rien_ne_change() {
+            let locaux = vec![serde_json::json!({"id": 1})];
+            let r = super::super::avec_albums_de_catalogue(
+                &etat(true),
+                locaux.clone(),
+                r#"[{"field":"year","op":"=","value":"2025"}]"#,
+                None,
+            )
+            .await;
+            let Ok(r) = r else {
+                panic!("aucun catalogue demandé")
+            };
+            assert_eq!(r, locaux);
+        }
+
+        #[tokio::test]
+        async fn sans_cible_on_refuse_au_lieu_de_rendre_tout_ou_rien() {
+            // « catalogue Qobuz ET année 2025 » : aucun service ne sait
+            // énumérer son catalogue. Refuser est la seule réponse honnête —
+            // rendre vide ferait croire à une bibliothèque sans rien, rendre
+            // tout est le défaut de #4469.
+            let sans = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                           {"field":"year","op":"=","value":"2025"}]"#;
+            let r =
+                super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), sans, None).await;
+            assert!(r.is_err(), "doit refuser");
+        }
+
+        #[tokio::test]
+        async fn sans_registre_on_refuse_aussi() {
+            let r = super::super::avec_albums_de_catalogue(
+                &etat(false),
+                Vec::new(),
+                AVEC_ARTISTE,
+                None,
+            )
+            .await;
+            assert!(r.is_err(), "sans service, on ne fait pas semblant");
+        }
+
+        #[tokio::test]
+        async fn la_borne_de_la_collection_s_applique_au_distant() {
+            let locaux = vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})];
+            let r =
+                super::super::avec_albums_de_catalogue(&etat(true), locaux, AVEC_ARTISTE, Some(2))
+                    .await;
+            let Ok(r) = r else {
+                panic!("le catalogue doit répondre")
+            };
+            assert_eq!(r.len(), 2, "le plafond vaut pour tout le résultat");
+        }
     }
 }

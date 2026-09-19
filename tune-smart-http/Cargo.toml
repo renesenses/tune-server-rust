@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tune-core = { path = "../tune-core", default-features = false }
+async-trait = { workspace = true }
 tune-http-types = { path = "../tune-http-types" }
 
 # Pour éprouver le HANDLER, et pas seulement les fonctions qu'il appelle : le
