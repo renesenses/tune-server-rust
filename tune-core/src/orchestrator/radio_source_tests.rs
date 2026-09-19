@@ -2,6 +2,19 @@ use super::*;
 use crate::http::streamer::{AudioStreamer, RadioSourceInfo, StreamInfo};
 
 async fn observe_station(bytes: &'static [u8], extension: &str) -> StreamInfo {
+    let (wire, preparation) = preparer_contre_la_station(bytes, extension, false).await;
+    assert!(preparation.is_ok());
+    wire
+}
+
+/// La station factice, sondée puis passée à `preparer_la_sortie` avec le
+/// réglage « bit-perfect strict » voulu (#3973). Rend le fil publié et le
+/// verdict de la préparation (`Err(Some(motif))` pour un refus rendu).
+async fn preparer_contre_la_station(
+    bytes: &'static [u8],
+    extension: &str,
+    strict_bitperfect: bool,
+) -> (StreamInfo, Result<(), Option<String>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "http://{}/station.{extension}",
@@ -33,7 +46,7 @@ async fn observe_station(bytes: &'static [u8], extension: &str) -> StreamInfo {
         Some(RadioSourceInfo::default()),
         "unprobed decoded radio must be explicitly unknown"
     );
-    tokio::task::spawn_blocking(move || {
+    let preparation = tokio::task::spawn_blocking(move || {
         // Exercise the actual network probe, codec detection, decoder creation,
         // and publication before PCM delivery. Never contact a real station.
         let sonde = sonder_la_station(&url).unwrap();
@@ -54,15 +67,63 @@ async fn observe_station(bytes: &'static [u8], extension: &str) -> StreamInfo {
             eq_profile: &None,
             levels_tx: &None,
             rt: &rt,
+            strict_bitperfect,
         };
-        assert!(preparer_la_sortie(&mut etat, &url, &canaux, &sonde).is_ok());
+        match preparer_la_sortie(&mut etat, &url, &canaux, &sonde) {
+            Ok(_) => Ok(()),
+            Err(SuiteRadio::Rendre(Err(motif))) => Err(Some(motif)),
+            Err(_) => Err(None),
+        }
     })
     .await
     .unwrap();
     let wire = streamer.stream_output_wire(&id).await.unwrap();
     server.abort();
     streamer.remove_session(&id).await;
-    wire
+    (wire, preparation)
+}
+
+/// Un WAV PCM 16 bits stéréo d'une seconde à `cadence` Hz — une station
+/// HE-AAC décodée à son cœur AAC-LC ressemble à ça (22 050 Hz).
+fn wav_a(cadence: u32) -> &'static [u8] {
+    let trames = cadence as usize;
+    let donnees = trames * 4;
+    let mut v = Vec::with_capacity(44 + donnees);
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&((36 + donnees) as u32).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes());
+    v.extend_from_slice(&2u16.to_le_bytes());
+    v.extend_from_slice(&cadence.to_le_bytes());
+    v.extend_from_slice(&(cadence * 4).to_le_bytes());
+    v.extend_from_slice(&4u16.to_le_bytes());
+    v.extend_from_slice(&16u16.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&(donnees as u32).to_le_bytes());
+    for i in 0..trames {
+        let e = ((i as f32 * 0.05).sin() * 8000.0) as i16;
+        v.extend_from_slice(&e.to_le_bytes());
+        v.extend_from_slice(&e.to_le_bytes());
+    }
+    Box::leak(v.into_boxed_slice())
+}
+
+/// #3973 — site « décodage radio » : une station à 22 050 Hz que le décodeur
+/// relèverait à 44 100 Hz (`renderer_safe_wav_rate`). Zone en bit-perfect
+/// strict ⇒ la préparation REFUSE, avec la sentinelle qui nomme les deux
+/// fréquences ; sans strict ⇒ elle prépare, comme avant.
+#[tokio::test]
+async fn radio_3973_strict_refuse_de_relever_la_cadence() {
+    let (_, strict) = preparer_contre_la_station(wav_a(22_050), "wav", true).await;
+    assert_eq!(
+        strict,
+        Err(Some("bitperfect_strict_refused:22050:44100".to_string())),
+        "bit-perfect strict : la radio à 22,05 kHz ne doit pas être relevée à 44,1 kHz en silence"
+    );
+    let (wire, defaut) = preparer_contre_la_station(wav_a(22_050), "wav", false).await;
+    assert_eq!(defaut, Ok(()), "sans strict, la conversion est jouée");
+    assert_eq!(wire.sample_rate, 44_100);
 }
 
 #[tokio::test]

@@ -77,6 +77,36 @@ enum OpenFailure {
 /// Matching is loose on purpose: cpal wraps the backend message and the wording
 /// varies by platform, so anything unrecognised falls through to `Unknown`
 /// rather than to a confident wrong answer.
+/// #3973 — le site « changement de cadence en cours de flux » de la règle
+/// bit-perfect ([`crate::audio::bitperfect_strict::decision_bitperfect`]).
+///
+/// `true` : la piste enchaînée ne doit PAS être convertie vers la cadence du
+/// flux ouvert — l'enchaînement gapless est abandonné, la piste courante se
+/// termine proprement, et la suivante repasse par l'ouverture, où la même
+/// règle juge contre ce que le périphérique sait réellement faire. Un refus
+/// posé ICI serait faux : le flux ouvert à 96 kHz ne dit rien de la capacité
+/// du DAC à ouvrir 192 kHz.
+fn enchainement_refuse_par_le_strict(
+    nouvelle_sr: u32,
+    sortie_sr: u32,
+    strict: bool,
+    device_name: &str,
+) -> bool {
+    let Some(refus) =
+        crate::audio::bitperfect_strict::decision_bitperfect(nouvelle_sr, sortie_sr, strict)
+            .refus()
+    else {
+        return false;
+    };
+    info!(
+        device = %device_name,
+        requested_sr = refus.demandee_hz,
+        stream_sr = refus.sortie_hz,
+        "local_audio_gapless_bitperfect_strict_reopen"
+    );
+    true
+}
+
 fn classify_open_failure(err: &str) -> OpenFailure {
     let e = err.to_ascii_lowercase();
     if e.contains("host is down")
@@ -510,6 +540,11 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
+    /// Armé, une conversion de fréquence (ouverture cpal ou changement de
+    /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
+    /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
+    strict_bitperfect: Arc<AtomicBool>,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -824,6 +859,7 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
@@ -1001,6 +1037,18 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+    }
+
+    /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
+    /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture, à
+    /// côté de `set_pure_bypass`.
+    pub fn set_strict_bitperfect(&self, strict: bool) {
+        self.strict_bitperfect.store(strict, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strict_bitperfect_for_test(&self) -> bool {
+        self.strict_bitperfect.load(Ordering::Relaxed)
     }
 
     /// Armer (ou désarmer) le repli mono de la zone qui joue sur cette sortie
@@ -4081,6 +4129,9 @@ impl OutputTarget for LocalOutput {
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let pure_bypass = self.pure_bypass.clone();
+        // #3973 — lu UNE fois par piste, comme le reste de ce que
+        // l'orchestrateur pose avant `play_url`.
+        let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
         let mono_downmix = self.mono_downmix.clone();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
@@ -4952,6 +5003,7 @@ impl OutputTarget for LocalOutput {
                 origin_host: origin_host.as_deref(),
                 audio_backend: &audio_backend,
                 exclusive: exclusive_mode,
+                strict_bitperfect,
                 stop_rx: &stop_rx,
                 paused: &paused,
                 force_silent: &force_silent,
@@ -5466,6 +5518,22 @@ impl OutputTarget for LocalOutput {
                 let prev_sr = etage.sample_rate();
                 let prev_ch = etage.channels();
                 let prev_needs_resample = etage.needs_resample;
+                // #3973 — le site « changement de cadence en cours de flux » :
+                // la piste enchaînée demande une cadence que le flux OUVERT ne
+                // tient pas. Strict ⇒ on ne la convertit pas : on n'enchaîne
+                // pas, exactement comme un flux non-WAV, et la fin de piste
+                // normale relance la suivante par `play_url` — dont
+                // l'ouverture (`refus_strict_a_l_ouverture`) juge alors contre
+                // la cadence RÉELLE du périphérique : il la joue telle quelle
+                // s'il la lit, il la refuse en le disant sinon.
+                if enchainement_refuse_par_le_strict(
+                    new_sr,
+                    output_sr,
+                    strict_bitperfect,
+                    &device_name,
+                ) {
+                    break;
+                }
                 let next_needs_resample = output_sr != new_sr;
                 let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
 
@@ -6398,6 +6466,11 @@ mod open_failure_tests;
 /// noyau vivent dans `crate::audio::ordonnancement_rt`, hors `local-audio`.
 #[cfg(test)]
 mod ordonnancement_rt_i3206;
+
+// #3973 — « bit-perfect strict » : sites ouverture cpal et enchaînement gapless.
+#[cfg(test)]
+mod bitperfect_strict_3973;
+
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans
 /// `crate::audio::periode_alsa` : elles tournent dans la porte `test` de la CI,

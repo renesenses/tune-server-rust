@@ -778,6 +778,20 @@ async fn persister_le_son(
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
         state.orchestrator.refresh_zone_mono_downmix(id).await;
     }
+    // #3973 — « bit-perfect strict » → setting zone_{id}_strict_bitperfect.
+    // Même forme que `mono_downmix` : clé supprimée à la désactivation, pour
+    // que l'absence et le défaut désarmé soient un seul état. Lu à chaque
+    // lecture (`send_to_output`, résolution, radio) : rien à rafraîchir en vol.
+    if let Some(enabled) = body.strict_bitperfect {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::audio::bitperfect_strict::cle_de_zone(id);
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("strict_bitperfect", enabled, r);
+    }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {
         let settings = SettingsRepo::with_backend(state.backend.clone());

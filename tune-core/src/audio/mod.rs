@@ -6,6 +6,8 @@ pub mod ape;
 pub mod audiophile;
 pub mod autoeq;
 pub mod canaux_declares;
+
+pub mod bitperfect_strict;
 pub mod channels;
 pub mod convolver;
 pub mod crossfeed;

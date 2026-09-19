@@ -230,6 +230,13 @@ struct PatchZone {
     /// locale existe — `channel_layout_status` le DIT plutôt que de le taire
     /// (#3254).
     channel_layout: Option<String>,
+
+    /// #3973 — « Bit-perfect strict » : quand la sortie ne lit pas la
+    /// fréquence de la source, REFUSER la lecture (en disant pourquoi) au lieu
+    /// de convertir. Persisté en setting `zone_{id}_strict_bitperfect` ;
+    /// défaut off — sans lui Tune convertit et le DIT dans le chemin du
+    /// signal. Pris en compte à la lecture suivante.
+    strict_bitperfect: Option<bool>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -342,6 +349,15 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3973 — « bit-perfect strict ». TOUJOURS publié : sa présence est ce qui
+    // dit au client que ce serveur connaît le réglage (un vieux serveur ne
+    // l'a pas, et l'interrupteur n'apparaît pas).
+    obj.insert(
+        "strict_bitperfect".into(),
+        json!(tune_core::audio::bitperfect_strict::zone_enabled(
+            backend, zone_id
+        )),
+    );
     // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
     // était accepté et relu pour n'importe quelle zone, alors que les trois
     // seuls sites qui poussent le repli exigent une sortie `local:` et un
