@@ -243,66 +243,83 @@ pub enum RendererCommand {
 
 /// Extrait le texte du premier élément nommé `tag` (sans préfixe) du corps.
 ///
-/// quick_xml ≥ 0.37 découpe les entités (`&lt;` …) en événements `GeneralRef`
-/// séparés : un CurrentURIMetaData — du DIDL intégralement échappé — arrive en
-/// une ALTERNANCE de Text et de GeneralRef. On accumule jusqu'à la fermeture
-/// de l'élément visé, sinon on ne lirait que le premier fragment.
+/// Le contenu est lu BRUT (`read_text`, jusqu'à la fermeture appariée) puis
+/// décodé par `decoder_le_contenu`. Trois formes réelles de
+/// `CurrentURIMetaData` passent ainsi toutes :
+///
+/// - DIDL intégralement ÉCHAPPÉ (`&lt;DIDL-Lite…`) — le cas JPlay d'origine ;
+/// - DIDL en XML BRUT, non échappé : l'ancienne lecture événement par
+///   événement remettait `inside` à faux au premier élément imbriqué
+///   (`<DIDL-Lite>`) et rendait `None` — donc aucun titre, donc « Episode »
+///   (#4323) ;
+/// - DIDL dans une section `<![CDATA[…]]>`, que l'ancienne lecture ignorait
+///   (aucun bras `Event::CData`) — même effet.
+///
+/// Le premier élément du bon nom l'emporte ; un élément vide rend `Some("")`.
 fn text_of(soap_xml: &str, tag: &str) -> Option<String> {
     let mut reader = quick_xml::Reader::from_str(soap_xml);
-    reader.config_mut().trim_text(true);
-    let mut buf = Vec::new();
-    let mut inside = false;
-    let mut acc = String::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event() {
             Ok(Event::Start(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
-                inside = name.rsplit(':').next().unwrap_or(&name) == tag;
-                if inside {
-                    acc.clear();
+                if name.rsplit(':').next().unwrap_or(&name) != tag {
+                    continue;
                 }
+                let end = e.to_end().into_owned();
+                let raw = reader.read_text(end.name()).ok()?;
+                let raw = String::from_utf8_lossy(raw.as_ref()).to_string();
+                return Some(decoder_le_contenu(&raw));
             }
-            Ok(Event::Text(t)) if inside => {
-                let decoded = t.decode().unwrap_or_default();
-                match unescape(&decoded) {
-                    Ok(c) => acc.push_str(&c),
-                    Err(_) => acc.push_str(&decoded),
-                }
-            }
-            Ok(Event::GeneralRef(r)) if inside => {
-                let name = String::from_utf8_lossy(r.as_ref()).to_string();
-                match name.as_str() {
-                    "lt" => acc.push('<'),
-                    "gt" => acc.push('>'),
-                    "amp" => acc.push('&'),
-                    "quot" => acc.push('"'),
-                    "apos" => acc.push('\''),
-                    n if n.starts_with('#') => {
-                        let code = n.trim_start_matches('#');
-                        let v = if let Some(hex) =
-                            code.strip_prefix('x').or_else(|| code.strip_prefix('X'))
-                        {
-                            u32::from_str_radix(hex, 16).ok()
-                        } else {
-                            code.parse::<u32>().ok()
-                        };
-                        if let Some(c) = v.and_then(char::from_u32) {
-                            acc.push(c);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(Event::End(_)) => {
-                if inside {
-                    return Some(acc);
+            Ok(Event::Empty(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                if name.rsplit(':').next().unwrap_or(&name) == tag {
+                    return Some(String::new());
                 }
             }
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
         }
-        buf.clear();
     }
+}
+
+/// Contenu brut d'un élément → texte.
+///
+/// Hors des sections CDATA, les entités sont décodées (`&lt;` → `<`,
+/// `&#233;` → `é`) ; une entité inconnue laisse le fragment tel quel plutôt
+/// que de le perdre. Le contenu d'une section CDATA est rendu à la lettre.
+/// Du XML brut imbriqué (DIDL non échappé) reste du XML, entités comprises :
+/// `parse_didl_metadata` le relit ensuite comme n'importe quel DIDL.
+fn decoder_le_contenu(raw: &str) -> String {
+    fn hors_cdata(fragment: &str, acc: &mut String) {
+        // Du balisage brut (DIDL non échappé) : NE PAS décoder ses entités, sinon
+        // un `&amp;` de titre deviendrait un `&` nu et casserait la relecture.
+        if fragment.contains('<') {
+            acc.push_str(fragment);
+            return;
+        }
+        match unescape(fragment) {
+            Ok(c) => acc.push_str(&c),
+            Err(_) => acc.push_str(fragment),
+        }
+    }
+    let mut acc = String::new();
+    let mut reste = raw;
+    while let Some(debut) = reste.find("<![CDATA[") {
+        hors_cdata(&reste[..debut], &mut acc);
+        let apres = &reste[debut + "<![CDATA[".len()..];
+        match apres.find("]]>") {
+            Some(fin) => {
+                acc.push_str(&apres[..fin]);
+                reste = &apres[fin + "]]>".len()..];
+            }
+            None => {
+                acc.push_str(apres);
+                reste = "";
+            }
+        }
+    }
+    hors_cdata(reste, &mut acc);
+    acc.trim().to_string()
 }
 
 /// `H:MM:SS[.fraction]` ou `MM:SS[.fraction]` → millisecondes.
@@ -684,6 +701,53 @@ mod tests {
             }
             other => panic!("attendu SetUri, obtenu {other:?}"),
         }
+    }
+
+    /// #4323 — le DIDL d'un point de contrôle n'arrive pas toujours échappé.
+    /// Chacune de ces trois formes rendait `title: None` avant le correctif,
+    /// donc une lecture appelée « Episode » dans l'historique.
+    fn titre_et_artiste_de(meta: &str) -> (Option<String>, Option<String>) {
+        let body = soap(
+            "SetAVTransportURI",
+            &format!(
+                "<InstanceID>0</InstanceID><CurrentURI>http://srv/t.flac</CurrentURI>\
+                 <CurrentURIMetaData>{meta}</CurrentURIMetaData>"
+            ),
+        );
+        match parse_renderer_command(&body) {
+            RendererCommand::SetUri { title, artist, .. } => (title, artist),
+            other => panic!("attendu SetUri, obtenu {other:?}"),
+        }
+    }
+
+    const DIDL_BRUT: &str = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+        xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+        xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+        <item><dc:title>Kind &amp; Blue</dc:title>\
+        <upnp:artist>Miles Davis</upnp:artist>\
+        <res duration=\"0:09:22\">http://x/a.flac</res></item></DIDL-Lite>";
+
+    #[test]
+    fn didl_non_echappe_4323() {
+        let (title, artist) = titre_et_artiste_de(DIDL_BRUT);
+        assert_eq!(title.as_deref(), Some("Kind & Blue"));
+        assert_eq!(artist.as_deref(), Some("Miles Davis"));
+    }
+
+    #[test]
+    fn didl_en_cdata_4323() {
+        let (title, artist) = titre_et_artiste_de(&format!("<![CDATA[{DIDL_BRUT}]]>"));
+        assert_eq!(title.as_deref(), Some("Kind & Blue"));
+        assert_eq!(artist.as_deref(), Some("Miles Davis"));
+    }
+
+    #[test]
+    fn titre_en_cdata_dans_un_didl_echappe_4323() {
+        let didl = "&lt;DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\"&gt;\
+                    &lt;item&gt;&lt;dc:title&gt;&lt;![CDATA[Été]]&gt;&lt;/dc:title&gt;\
+                    &lt;/item&gt;&lt;/DIDL-Lite&gt;";
+        let (title, _) = titre_et_artiste_de(didl);
+        assert_eq!(title.as_deref(), Some("Été"));
     }
 
     #[test]
