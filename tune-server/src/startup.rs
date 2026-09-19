@@ -1409,7 +1409,20 @@ async fn resolve_ytdlp(state: &AppState) {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let configured = settings.get("yt_dlp_path").ok().flatten();
     match tune_core::ytdlp::resolve(configured.as_deref()).await {
-        Some(path) => info!(path = %path.display(), "youtube_ytdlp_ready"),
+        Some(path) => {
+            info!(path = %path.display(), "youtube_ytdlp_ready");
+            // #4366 — un 403 `googlevideo` peut venir d'un yt-dlp périmé : le
+            // binaire n'est téléchargé qu'une fois, jamais rafraîchi, et sa
+            // version manquait à chaque journal de testeur. `--version` coûte
+            // une à deux secondes (binaire autoextractible) : hors séquence.
+            tokio::spawn(async move {
+                let version = tune_core::ytdlp::version_of(&path).await;
+                info!(
+                    version = version.as_deref().unwrap_or("inconnue"),
+                    "youtube_ytdlp_version"
+                );
+            });
+        }
         None => info!("youtube_ytdlp_absent — YouTube playback not enabled"),
     }
 }
