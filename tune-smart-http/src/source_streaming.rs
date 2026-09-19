@@ -238,6 +238,38 @@ pub(crate) fn requete(
     ))
 }
 
+/// COMBIEN de favoris de service satisfont les règles — la même sélection que
+/// [`requete`], comptée au lieu d'être listée.
+///
+/// 🔴 #1231 — Bertrand, 18/09/2026 : « Smart Collection, source qobuz retourne
+/// 0 album ». Mesuré sur le .18 : la collection rend bien ses **3** albums
+/// Qobuz quand on l'ouvre, et la liste des collections annonce
+/// `"album_count": 0`. Le compte est fait dans la table `albums`
+/// (`smart_collections.rs`), où un favori de service n'est jamais : il vient
+/// de `streaming_favorites`, ajouté APRÈS le SQL par [`requete`]. La liste
+/// était juste, son compteur mentait.
+///
+/// Sans limite : un compteur dit l'appartenance entière, pas la vue plafonnée.
+pub(crate) fn requete_compte(
+    rules_json: &str,
+    match_mode: &str,
+    objet: Objet,
+    profile_id: i64,
+) -> Option<String> {
+    if !demande_un_service(rules_json) {
+        return None;
+    }
+    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    let joiner = if match_mode == "any" { " OR " } else { " AND " };
+    let conditions: Vec<String> = rules.iter().map(|r| condition(r, objet)).collect();
+    Some(format!(
+        "SELECT COUNT(*) FROM streaming_favorites sf \
+         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds})",
+        item = objet.item_type(),
+        conds = conditions.join(joiner),
+    ))
+}
+
 /// Une ligne de la requête, mise à la forme d'une PISTE de playlist
 /// intelligente : mêmes clés que les pistes de la bibliothèque, `id` nul, et la
 /// paire `source` + `source_id` qui permet au client de l'ouvrir et de la jouer.
@@ -365,5 +397,79 @@ mod tests {
                     {"field":"favorite","op":"is","value":"album"}]"#;
         let sql = requete(r, "all", Objet::Piste, 1, "title", "asc", None).unwrap();
         assert!(sql.contains("AND 1=0"), "{sql}");
+    }
+
+    /// 🔴 #1231 — le compteur d'une collection ignorait les favoris de service.
+    ///
+    /// Mesuré sur le .18 le 19/09/2026 : une collection dont la seule règle est
+    /// `source = qobuz` rend ses **3** albums quand on l'ouvre, et la liste des
+    /// collections annonce `"album_count": 0`. La liste était juste, son
+    /// compteur mentait — c'est très probablement le « retourne 0 album » de
+    /// Bertrand.
+    #[test]
+    fn le_compte_des_favoris_de_service_existe_et_vise_le_bon_type() {
+        let regles = r#"[{"field":"source","op":"=","value":"qobuz"}]"#;
+        let sql = requete_compte(regles, "all", Objet::Album, 1).expect("une règle de service");
+        assert!(sql.contains("COUNT(*)"), "{sql}");
+        assert!(sql.contains("FROM streaming_favorites sf"), "{sql}");
+        assert!(
+            sql.contains("sf.item_type = 'album'"),
+            "un compte d'ALBUMS : {sql}"
+        );
+        assert!(sql.contains("sf.profile_id = 1"), "{sql}");
+        // Un compteur dit l'appartenance ENTIÈRE : pas de plafond.
+        assert!(
+            !sql.contains("LIMIT"),
+            "un compte ne se plafonne pas : {sql}"
+        );
+        // Et il vise le même ensemble que la liste.
+        let liste =
+            requete(regles, "all", Objet::Album, 1, "title", "asc", None).expect("la liste");
+        let ou_compte = sql.split("WHERE").nth(1).unwrap();
+        let ou_liste = liste.split("WHERE").nth(1).unwrap();
+        assert_eq!(
+            ou_compte.trim(),
+            ou_liste.split("ORDER BY").next().unwrap().trim(),
+            "le compte et la liste doivent sélectionner la MÊME chose"
+        );
+    }
+
+    /// Une playlist compte des PISTES, une collection des ALBUMS.
+    #[test]
+    fn une_playlist_compte_des_pistes() {
+        let sql = requete_compte(
+            r#"[{"field":"source","op":"=","value":"qobuz"}]"#,
+            "all",
+            Objet::Piste,
+            7,
+        )
+        .expect("une règle de service");
+        assert!(sql.contains("sf.item_type = 'track'"), "{sql}");
+        assert!(sql.contains("sf.profile_id = 7"), "{sql}");
+    }
+
+    /// Sans règle de service, il n'y a rien à compter là — et surtout rien à
+    /// AJOUTER au compte de la bibliothèque.
+    #[test]
+    fn sans_regle_de_service_aucun_compte_supplementaire() {
+        assert!(
+            requete_compte(
+                r#"[{"field":"year","op":"=","value":"2025"}]"#,
+                "all",
+                Objet::Album,
+                1
+            )
+            .is_none()
+        );
+        assert!(
+            requete_compte(
+                r#"[{"field":"source","op":"=","value":"local"}]"#,
+                "all",
+                Objet::Album,
+                1
+            )
+            .is_none()
+        );
+        assert!(requete_compte("[]", "all", Objet::Album, 1).is_none());
     }
 }

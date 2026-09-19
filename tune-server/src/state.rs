@@ -175,7 +175,12 @@ impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpStat
 
 impl axum::extract::FromRef<AppState> for tune_smart_http::SmartHttpState {
     fn from_ref(state: &AppState) -> Self {
-        Self::new(state.backend.clone())
+        // #4473 — le module des règles ne connaît aucun service ; c'est ici,
+        // où le registre existe, qu'on lui donne de quoi interroger un
+        // catalogue. La frontière de crate reste fermée.
+        Self::new(state.backend.clone()).avec_catalogue(std::sync::Arc::new(
+            crate::catalogue_services::CatalogueDuRegistre::new(state.services.clone()),
+        ))
     }
 }
 
