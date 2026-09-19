@@ -14,8 +14,8 @@ use tracing::{debug, info, warn};
 
 use super::traits::{
     AudioSpec, BlocPcm, FormatOuvert, OutputCapabilities, OutputDspMetrics, OutputRingStarvation,
-    OutputSignalPathStatus, OutputStatus, OutputTarget, PuitsDEchantillons, RingStarvation,
-    TransformationsReelles, TransportState,
+    OutputSignalPathStatus, OutputStatus, OutputTarget, ProfondeurPcm, PuitsDEchantillons,
+    RingStarvation, TransformationsReelles, TransportState,
 };
 #[cfg(any(target_os = "windows", test))]
 use super::traits::{OutputDspState, OutputSampleTransport, OutputSignalReason, OutputVolumeState};
@@ -3511,19 +3511,15 @@ impl EtageDeConversion<'_> {
     /// en contournement pur ; sinon un égaliseur, un convolveur, un crossfeed
     /// (stéréo seulement) ou le repli mono (stéréo seulement) posés.
     fn dsp_actif(&self) -> bool {
-        fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
-            m.lock().map(|g| g.is_some()).unwrap_or(false)
-        }
-        if self.pcm.dop_active.load(Ordering::Relaxed)
-            || self.pcm.pure_bypass.load(Ordering::Relaxed)
-        {
-            return false;
-        }
-        let stereo = self.spec.canaux() == 2;
-        pose(self.pcm.eq)
-            || pose(self.pcm.convolver)
-            || (stereo && pose(self.pcm.crossfeed))
-            || (stereo && self.pcm.mono_downmix.load(Ordering::Relaxed))
+        dsp_touche_le_signal(
+            self.spec.canaux(),
+            self.pcm.dop_active,
+            self.pcm.pure_bypass,
+            self.pcm.eq,
+            self.pcm.convolver,
+            self.pcm.crossfeed,
+            self.pcm.mono_downmix,
+        )
     }
 
     /// **L'unique écriture au puits** de l'étage flottant (REF-7, #2219).
@@ -3716,6 +3712,35 @@ pub(super) trait Etage {
 /// déduction (#3987). Appelée à l'ouverture et à chaque frontière gapless :
 /// entre les deux, ni le format d'entrée, ni le format ouvert, ni le DSP posé
 /// ne changent sans repasser par là.
+/// Le DSP touche-t-il les échantillons ? La règle unique des deux chemins de
+/// sortie flottants (PCM et compressé) — c'est ce que `dsp_actif` publie dans
+/// [`TransformationsReelles`] et que le chemin du signal affiche « (mesuré) ».
+///
+/// DoP ou PURE : rien ne touche le signal, quoi qu'il y ait d'armé. Sinon :
+/// égaliseur ou convolveur, et — en stéréo seulement, comme `apply_local_dsp`
+/// les applique — crossfeed ou repli mono.
+fn dsp_touche_le_signal(
+    canaux: u16,
+    dop_active: &AtomicBool,
+    pure_bypass: &AtomicBool,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    mono_downmix: &AtomicBool,
+) -> bool {
+    fn pose<T>(m: &std::sync::Mutex<Option<T>>) -> bool {
+        m.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+    if dop_active.load(Ordering::Relaxed) || pure_bypass.load(Ordering::Relaxed) {
+        return false;
+    }
+    let stereo = canaux == 2;
+    pose(eq)
+        || pose(convolver)
+        || (stereo && pose(crossfeed))
+        || (stereo && mono_downmix.load(Ordering::Relaxed))
+}
+
 fn publier_les_transformations(
     creneau: &std::sync::Mutex<Option<TransformationsReelles>>,
     etage: &impl Etage,
@@ -4715,6 +4740,45 @@ impl OutputTarget for LocalOutput {
                     samples = decoded_len,
                     "local_audio_compressed_playing"
                 );
+
+                // #4347 — ce chemin (radio décodée en local) rééchantillonne
+                // vers la cadence du périphérique comme l'autre — mais il ne
+                // PUBLIAIT jamais ses transformations : le chemin du signal
+                // restait « Sans perte », sans étape Resampler, alors que le
+                // 44,1 kHz partait à 192 kHz. Une relance du flux (bascule
+                // PURE, sonde radio en échec…) passait par le chemin PCM, qui
+                // publie, et l'étape « 44kHz → 192kHz (mesuré) » apparaissait
+                // « sans raison » et ne repartait plus (Jean Valjean, fil
+                // 1825). Même publication, mêmes règles : entrée décodée
+                // (flottant 32 bits), format réellement ouvert, DSP mesuré.
+                if let Some(entree) =
+                    AudioSpec::nouvelle(dec_sr, ProfondeurPcm::FlottantIeee32, dec_ch)
+                {
+                    let dsp_actif = dsp_touche_le_signal(
+                        dec_ch,
+                        &dop_active,
+                        &pure_bypass,
+                        &eq,
+                        &convolver,
+                        &crossfeed,
+                        &mono_downmix,
+                    );
+                    if let Ok(mut slot) = transformations_reelles.lock() {
+                        *slot = Some(TransformationsReelles::nouvelles(
+                            entree,
+                            FormatOuvert::new(output_sr, output_ch),
+                            dsp_actif,
+                        ));
+                    }
+                    info!(
+                        dec_sr,
+                        output_sr,
+                        dec_ch,
+                        output_ch,
+                        dsp_actif,
+                        "local_audio_compressed_transformations_published"
+                    );
+                }
 
                 // Chaine DSP de la zone : egaliseur, correction de piece,
                 // crossfeed.
@@ -6593,6 +6657,10 @@ mod backends_supportes_tests;
 
 #[cfg(test)]
 mod format_courant_tests;
+
+/// #4347 — le chemin compressé publie ses transformations comme le chemin PCM.
+#[cfg(test)]
+mod chemin_compresse_publie_ses_transformations_4347;
 
 /// #4177 — en exclusif Windows, la pause rend le périphérique au lieu de le
 /// garder en poussant du silence.
