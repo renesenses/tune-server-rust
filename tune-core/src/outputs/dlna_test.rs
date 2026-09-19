@@ -1140,6 +1140,81 @@ mod tests {
         handle.abort();
     }
 
+    /// Récupère la sortie `tracing` d'une commande : c'est le journal, et lui
+    /// seul, que le support aura entre les mains.
+    #[derive(Clone, Default)]
+    struct JournalCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #4442 — `Seek` est le seul verbe AVTransport dont le journal ne disait
+    /// ni le départ ni l'issue : `Play` et `Pause` ont leur couple
+    /// `dlna_command_sending` / `dlna_command_finished`, `Stop` son
+    /// `dlna_stop`, `SetAVTransportURI` son `dlna_set_uri_ok`. Un transfert
+    /// vers une zone DLNA qui « repart du début » (FabienM, Devialet Phantom,
+    /// 0.9.154) ne pouvait donc pas être instruit sur pièces : rien ne disait
+    /// si le `Seek` de `do_transfer` était parti, ni ce que le renderer en
+    /// avait fait. Même mesure que `Play`/`Pause`, mêmes champs.
+    #[tokio::test]
+    async fn dlna_seek_laisse_son_issue_dans_le_journal() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let garde = tracing::subscriber::set_default(abonne);
+        output.seek(161_000).await.unwrap();
+        drop(garde);
+
+        let texte = journal.texte();
+        let issue = texte
+            .lines()
+            .find(|l| l.contains("dlna_command_finished") && l.contains("action=\"Seek\""));
+        let Some(issue) = issue else {
+            panic!(
+                "aucune ligne `dlna_command_finished … action=\"Seek\"` : le journal ne dit \
+                 pas ce que le renderer a fait du Seek — journal capturé :\n{texte}"
+            );
+        };
+        assert!(
+            issue.contains("outcome=\"response_received\""),
+            "l'issue du Seek doit être nommée : {issue}"
+        );
+        assert!(
+            texte
+                .lines()
+                .any(|l| l.contains("dlna_command_sending") && l.contains("action=\"Seek\"")),
+            "le départ du Seek doit aussi être journalisé — journal capturé :\n{texte}"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn dlna_set_volume() {
         let state = MockState::default();
