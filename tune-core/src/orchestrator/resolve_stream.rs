@@ -620,13 +620,7 @@ impl PlaybackOrchestrator {
         // Detect file:// URLs from DASH multi-segment downloads — the fMP4
         // is already on disk, skip the HTTP download step.
         let is_dash_local = upstream_url.starts_with("file://");
-        // Le CDN YouTube accepte les requetes Range. Un M4A peut garder son
-        // atome `moov` a la fin : une source HTTP seekable permet a
-        // Symphonia de lire cet index puis de revenir aux premiers paquets,
-        // sans attendre le telechargement complet (#1885). Les autres
-        // services gardent leur chemin eprouve dans cette premiere vague.
-        let use_http_range = service_name.eq_ignore_ascii_case("youtube")
-            && matches!(codec.as_str(), "m4a" | "mp4" | "aac");
+        let use_http_range = decodage_progressif_par_range(service_name, &codec, &upstream_url);
         TranscodageEnTache {
             upstream_url,
             codec,
@@ -2081,5 +2075,87 @@ impl PlaybackOrchestrator {
             }
         };
         Ok(flux)
+    }
+}
+
+/// Faut-il décoder la piste **au fil de l'eau**, par requêtes HTTP `Range`,
+/// au lieu d'attendre que le fichier entier soit sur disque ?
+///
+/// - **YouTube, M4A/MP4/AAC** (#1885) : l'atome `moov` peut être en fin de
+///   fichier, une source seekable permet à Symphonia d'aller le lire.
+/// - **Tidal et Qobuz, FLAC servi par URL** (#3568) : sur une sortie locale,
+///   la première note attendait le **dernier octet** du FLAC — 48,6 s de
+///   téléchargement seul pour un 192 kHz de 8 min (Benjithom, 0.9.148), là où
+///   Audirvana part dès les premières secondes. Le FLAC se décode dans l'ordre
+///   du fichier : les premiers paquets suffisent pour la première note.
+///
+/// Ce n'est qu'une **permission de sonder** : `HttpRangeSource::open` demande
+/// d'abord un octet, et un CDN qui ne répond pas `206` renvoie au chemin
+/// historique par fichier temporaire, sans qu'aucun octet ait rejoint la
+/// session (`streaming_http_range_unavailable_falling_back`).
+///
+/// Un `file://` n'est jamais concerné : c'est le fMP4 que le DASH Tidal
+/// multi-segments (Hi-Res) a déjà assemblé sur disque — ce délai-là est dans
+/// `get_track_url`, pas ici.
+pub(crate) fn decodage_progressif_par_range(service: &str, codec: &str, url: &str) -> bool {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return false;
+    }
+    let codec = codec.to_ascii_lowercase();
+    if service.eq_ignore_ascii_case("youtube") {
+        return matches!(codec.as_str(), "m4a" | "mp4" | "aac");
+    }
+    (service.eq_ignore_ascii_case("tidal") || service.eq_ignore_ascii_case("qobuz"))
+        && codec == "flac"
+}
+
+#[cfg(test)]
+mod decodage_progressif_3568_tests {
+    use super::decodage_progressif_par_range as progressif;
+
+    const CDN: &str = "https://cdn.example/piste?token=secret";
+
+    /// Le témoin de #3568 : un FLAC Tidal ou Qobuz servi par URL attendait
+    /// son dernier octet avant la première note.
+    #[test]
+    fn un_flac_tidal_ou_qobuz_servi_par_url_se_decode_au_fil_de_l_eau_3568() {
+        assert!(progressif("tidal", "flac", CDN), "Tidal FLAC (BTS, 16/44)");
+        assert!(
+            progressif("Tidal", "FLAC", CDN),
+            "casse du service et du codec"
+        );
+        assert!(progressif("qobuz", "flac", CDN), "Qobuz FLAC");
+    }
+
+    #[test]
+    fn youtube_garde_son_perimetre_de_1885() {
+        for codec in ["m4a", "mp4", "aac"] {
+            assert!(progressif("youtube", codec, CDN), "{codec}");
+        }
+        assert!(!progressif("youtube", "webm", CDN));
+        assert!(!progressif("youtube", "opus", CDN));
+    }
+
+    #[test]
+    fn le_fmp4_dash_deja_sur_disque_n_est_pas_concerne() {
+        assert!(!progressif(
+            "tidal",
+            "flac",
+            "file:///tmp/tidal-dash-42.mp4"
+        ));
+    }
+
+    #[test]
+    fn les_autres_services_et_codecs_gardent_le_telechargement_complet() {
+        assert!(
+            !progressif("tidal", "aac", CDN),
+            "Tidal AAC (HIGH) : non mesuré"
+        );
+        assert!(!progressif("qobuz", "mp3", CDN));
+        assert!(
+            !progressif("deezer", "flac", CDN),
+            "Deezer chiffre ses blocs"
+        );
+        assert!(!progressif("amazon", "flac", CDN));
     }
 }
