@@ -2301,12 +2301,14 @@ mod tests {
         assert!(!session_presente(&streamer, &id).await);
     }
 
-    /// La radio reste hors du ramasse-miettes, comme avant.
+    /// Une radio qu'un client a tirée reste hors du ramasse-miettes, comme
+    /// avant : infinie par nature, elle ne se rejoue pas.
     #[tokio::test]
-    async fn la_radio_reste_exemptee_des_deux_bornes() {
+    async fn une_radio_deja_lue_reste_exemptee_des_deux_bornes() {
         let streamer = AudioStreamer::new(8080);
         let (id, _tx, _ready, _session) = streamer.create_radio_session(info_de_test(), 8).await;
 
+        servir_des_octets(&streamer, &id).await;
         patienter(300).await;
         let retires = streamer
             .cleanup_stale_sessions_with(
@@ -2317,6 +2319,44 @@ mod tests {
 
         assert_eq!(retires, 0);
         assert!(session_presente(&streamer, &id).await);
+    }
+
+    /// #3580 — le flux qu'un renderer a acquitté sans jamais venir le chercher.
+    ///
+    /// L'orchestrateur garde désormais la session d'une radio dont le `Play` a
+    /// été acquitté sans effet (`command_may_have_landed`), pour l'ampli qui
+    /// finirait de sortir de veille après la borne d'attente. Une radio était
+    /// jusqu'ici exemptée du ramasse-miettes sans condition : gardée, elle
+    /// aurait tenu sa connexion Icecast pour toujours. Personne ne l'a jamais
+    /// lue — elle suit la borne d'inactivité, et son canal est FERMÉ pour que
+    /// le décodeur lâche l'amont.
+    #[tokio::test]
+    async fn une_radio_que_personne_n_a_jamais_lue_est_ramassee_et_son_canal_ferme() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready, session) = streamer.create_radio_session(info_de_test(), 8).await;
+        assert!(
+            session.channel_fill().await.is_some(),
+            "canal ouvert à la création"
+        );
+
+        patienter(900).await;
+        let retires = streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+
+        assert_eq!(
+            retires, 1,
+            "une radio que personne n'a jamais tirée ne doit pas vivre pour toujours"
+        );
+        assert!(!session_presente(&streamer, &id).await);
+        assert!(
+            session.channel_fill().await.is_none(),
+            "le canal doit être fermé : sinon le décodeur reste bloqué sur un \
+             `tx.send()` plein et la connexion Icecast avec lui"
+        );
     }
 
     // ────────────── #2991 — par où le renderer apprend le changement ─────────
