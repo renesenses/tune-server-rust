@@ -18,6 +18,19 @@ rustflags = ["-C", "target-feature=+crt-static"]
 [target.i686-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
+# Cible musl arm64 : `-lc` en FIN de ligne de lien (#3621).
+#
+# Sur cette cible, rustc lie en `-static` et la libc musl est parcourue une
+# seule fois, AVANT les bibliotheques natives des caisses. `libasound.a` (la
+# sortie audio locale, `local-audio` -> cpal -> alsa-sys) arrive donc apres, et
+# les symboles de libc que rien d'autre ne tirait restent sans definition :
+# `strncasecmp`, `strtod`, `scandir`, `semop`, `getgrnam_r`… — mesure le
+# 19/09/2026 sur Shrek. Un second `-lc`, en queue, les resout ; sans
+# `local-audio` il ne fait rien (la libc est deja la). Voir Cross.toml pour la
+# recette complete de la cible.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "link-arg=-lc"]
+
 # CMake < 3.5 compatibility shim.
 #
 # CMake 4.x (macOS/Windows GitHub runners, modern dev machines) removed

@@ -936,6 +936,7 @@ impl PlaybackOrchestrator {
                     file_path.to_string(),
                     source.zone_max_sample_rate,
                     is_local_output,
+                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
                 )
                 .await;
         }
@@ -1395,6 +1396,7 @@ impl PlaybackOrchestrator {
         file_path: String,
         zone_max_sample_rate: Option<u32>,
         is_local_output: bool,
+        strict_bitperfect: bool,
     ) -> Result<Option<ResolvedStream>, String> {
         // La cadence et le nombre de canaux se lisent DANS LE FICHIER,
         // pas dans la base.
@@ -1444,6 +1446,21 @@ impl PlaybackOrchestrator {
         let zone_max_sr = zone_max_sample_rate;
         if let Some(max_sr) = zone_max_sr {
             if dop_rate > max_sr {
+                // #3973 — le DoP dépasse le plafond : le chemin ordinaire
+                // convertirait en PCM plafonné. Strict ⇒ refuser, en le disant.
+                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                    dop_rate,
+                    max_sr,
+                    strict_bitperfect,
+                )
+                .refus()
+                {
+                    warn!(
+                        dsd_rate,
+                        dop_rate, max_sr, "dsd_dop_rate_exceeds_zone_max_bitperfect_strict_refused"
+                    );
+                    return Err(refus.sentinelle());
+                }
                 info!(
                     dsd_rate,
                     dop_rate, max_sr, "dsd_dop_rate_exceeds_zone_max_falling_back_to_pcm"
@@ -1597,7 +1614,7 @@ impl PlaybackOrchestrator {
         ),
         String,
     > {
-        let format = self.decider_le_format_de_sortie(req, decision);
+        let format = self.decider_le_format_de_sortie(req, decision)?;
         if format.use_file_transcode {
             self.transcoder_vers_fichier(req, decision, format).await
         } else {
@@ -1637,7 +1654,7 @@ impl PlaybackOrchestrator {
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
-                Ok(self.decider_le_format_de_sortie(req, &decision))
+                self.decider_le_format_de_sortie(req, &decision)
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
         }
@@ -1688,7 +1705,7 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Decision(d) => d,
             DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
         };
-        let format = self.decider_le_format_de_sortie(req, &decision);
+        let format = self.decider_le_format_de_sortie(req, &decision)?;
         let dsp =
             self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
         let actif = dsp.is_active();
@@ -1707,7 +1724,7 @@ impl PlaybackOrchestrator {
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
-    ) -> FormatDeSortie {
+    ) -> Result<FormatDeSortie, String> {
         let DecisionLocale {
             bit_depth,
             bit_depth_wire,
@@ -1803,6 +1820,23 @@ impl PlaybackOrchestrator {
         // Apply zone max_sample_rate cap
         if let Some(max_sr) = zone_max_sample_rate {
             if out_sr > max_sr {
+                // #3973 — le site « plafond de zone » de la règle bit-perfect :
+                // strict ⇒ refuser plutôt que transcoder vers le plafond.
+                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                    out_sr,
+                    max_sr,
+                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+                )
+                .refus()
+                {
+                    warn!(
+                        zone_id = req.zone_id,
+                        source_rate = out_sr,
+                        max_rate = max_sr,
+                        "zone_max_sample_rate_bitperfect_strict_refused"
+                    );
+                    return Err(refus.sentinelle());
+                }
                 info!(
                     zone_id = req.zone_id,
                     source_rate = out_sr,
@@ -2068,7 +2102,7 @@ impl PlaybackOrchestrator {
             );
         }
 
-        FormatDeSortie {
+        Ok(FormatDeSortie {
             out_sr,
             out_bd,
             out_mime,
@@ -2076,7 +2110,7 @@ impl PlaybackOrchestrator {
             target_format_str,
             use_file_transcode,
             info,
-        }
+        })
     }
 
     /// Deuxième temps, sorties réseau : décodage → encodage → fichier

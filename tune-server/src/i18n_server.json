@@ -1998,5 +1998,17 @@
     "ko": "원인: {cause}",
     "ro": "Cauză: {cause}",
     "sv": "Orsak: {cause}"
+  },
+  "bitperfect.strict.refused": {
+    "fr": "Bit-perfect strict : lecture refusée — la sortie ne lit pas le {requested} kHz sans conversion (elle tourne à {device} kHz). Désactivez « Bit-perfect strict » dans les réglages de la zone pour jouer avec conversion.",
+    "en": "Strict bit-perfect: playback refused — the output cannot play {requested} kHz without conversion (it runs at {device} kHz). Turn off “Strict bit-perfect” in the zone settings to play with conversion.",
+    "de": "Striktes Bit-perfect: Wiedergabe abgelehnt — der Ausgang kann {requested} kHz nicht ohne Umwandlung wiedergeben (er läuft mit {device} kHz). Deaktivieren Sie „Striktes Bit-perfect“ in den Zoneneinstellungen, um mit Umwandlung abzuspielen.",
+    "es": "Bit-perfect estricto: reproducción rechazada — la salida no puede reproducir {requested} kHz sin conversión (funciona a {device} kHz). Desactive «Bit-perfect estricto» en los ajustes de la zona para reproducir con conversión.",
+    "it": "Bit-perfect rigoroso: riproduzione rifiutata — l'uscita non può riprodurre {requested} kHz senza conversione (funziona a {device} kHz). Disattiva «Bit-perfect rigoroso» nelle impostazioni della zona per riprodurre con conversione.",
+    "zh": "严格比特完美：已拒绝播放 — 该输出无法在不转换的情况下播放 {requested} kHz（其运行于 {device} kHz）。如需转换后播放，请在区域设置中关闭“严格比特完美”。",
+    "ja": "厳格ビットパーフェクト：再生を拒否しました — この出力は変換なしで {requested} kHz を再生できません（{device} kHz で動作しています）。変換して再生するには、ゾーン設定で「厳格ビットパーフェクト」をオフにしてください。",
+    "ko": "엄격한 비트퍼펙트: 재생이 거부되었습니다 — 이 출력은 변환 없이 {requested} kHz를 재생할 수 없습니다({device} kHz로 동작 중). 변환하여 재생하려면 존 설정에서 '엄격한 비트퍼펙트'를 끄세요.",
+    "ro": "Bit-perfect strict: redare refuzată — ieșirea nu poate reda {requested} kHz fără conversie (funcționează la {device} kHz). Dezactivați „Bit-perfect strict” din setările zonei pentru a reda cu conversie.",
+    "sv": "Strikt bitperfekt: uppspelning nekad — utgången kan inte spela {requested} kHz utan konvertering (den körs på {device} kHz). Stäng av ”Strikt bitperfekt” i zonens inställningar för att spela med konvertering."
   }
 }

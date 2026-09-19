@@ -287,6 +287,51 @@ mod tests {
         }
     }
 
+    /// Weiss — #4178 (Kimon, fil 1799) : la marque manquait aux 25 du
+    /// catalogue, donc absente des menus marque/modèle et ramenée à la saisie
+    /// libre « Autre », sans profil. Modèles sourcés sur weiss.ch/products le
+    /// 19/09/2026 (DAC501/502 et leurs MK2, DAC204/205, DSP501/502, HELIOS,
+    /// MAN301/301R, DAC301, DAC202, MEDUS), profil de quirks **neutre** :
+    /// aucune mesure terrain sur ce matériel — en poser un serait une
+    /// supposition, même règle que NAD/Samsung ci-dessus.
+    #[test]
+    fn weiss_est_catalogue_sans_quirk_invente() {
+        let names: Vec<&str> = catalog().brands.iter().map(|b| b.name.as_str()).collect();
+        assert!(
+            names.contains(&"Weiss"),
+            "Weiss absent du catalogue : {names:?}"
+        );
+        for model in [
+            "DAC501",
+            "DAC502",
+            "DAC501-MK2",
+            "DAC502-MK2",
+            "DAC204",
+            "DAC204-MK2",
+            "DAC205-MK2",
+            "DSP501",
+            "DSP502",
+            "HELIOS",
+            "MAN301",
+            "MAN301R",
+            "DAC301",
+            "DAC202",
+            "MEDUS",
+        ] {
+            assert!(
+                find_model("Weiss", model).is_some(),
+                "modèle Weiss absent : {model}"
+            );
+            assert_eq!(
+                quirks_for("Weiss", model),
+                DeviceQuirks::default(),
+                "Weiss {model} ne doit porter aucun quirk supposé"
+            );
+        }
+        // Même tolérance de casse que le reste du catalogue.
+        assert!(find_model("weiss", "dac502-mk2").is_some());
+    }
+
     #[test]
     fn lookup_is_case_insensitive() {
         assert!(find_model("sonos", "one").is_some());

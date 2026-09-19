@@ -48,6 +48,16 @@ pub(super) fn emit_radio_playback_error(
     let Some(bus) = bus else { return };
     // Le flux répond, mais ce n'est pas de l'audio : on dit ce qui est arrivé
     // en clair plutôt que de recopier une erreur de décodeur.
+    // #3973 — un refus « bit-perfect strict » porte son code et ses deux
+    // fréquences : le client le traduit.
+    if let Some(refus) = crate::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(error)
+    {
+        bus.emit(
+            "zone.playback_error",
+            crate::audio::bitperfect_strict::charge_utile_de_refus(zone_id, &refus),
+        );
+        return;
+    }
     let message = if error.starts_with(RADIO_NOT_AUDIO) {
         format!(
             "« {station} » n'émet plus d'audio : le serveur renvoie une page web à la place du flux. La station a probablement changé d'adresse."
@@ -251,6 +261,9 @@ struct CanauxRadio<'a> {
     eq_profile: &'a Option<crate::audio::eq::EqProfile>,
     levels_tx: &'a Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
     rt: &'a tokio::runtime::Handle,
+    /// #3973 — « bit-perfect strict » de la zone : une cadence que le décodeur
+    /// devrait relever (`renderer_safe_wav_rate`) est refusée, pas convertie.
+    strict_bitperfect: bool,
 }
 
 /// Ce que rend une connexion sondée : le lecteur de conteneur, le décodeur
@@ -314,6 +327,9 @@ pub(super) fn decode_radio_stream_to_pcm(
     // fichier), donc le décodage-pour-niveaux des pistes locales ne s'applique
     // pas — on tappe ici le PCM déjà décodé. `None` = pas de bus (tests).
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>>,
+    // #3973 — « bit-perfect strict » de la zone qui écoute (faux hors zone :
+    // serveur de médias).
+    strict_bitperfect: bool,
 ) -> Result<(), String> {
     // HLS s'arrête ici, avant le moindre octet de réseau (#2307). Ce
     // décodeur fait un GET unique ; il n'a aucun chargeur de segments, aucun
@@ -347,6 +363,7 @@ pub(super) fn decode_radio_stream_to_pcm(
         eq_profile: &eq_profile,
         levels_tx: &levels_tx,
         rt: &rt,
+        strict_bitperfect,
     };
 
     'reconnect: loop {
@@ -595,6 +612,23 @@ fn preparer_la_sortie(
     // rate (e.g. 22050 Hz) which many DLNA renderers reject as silence. We
     // upsample sub-44.1 kHz streams to 44100 Hz; 44.1/48 kHz+ pass through.
     let output_sample_rate = renderer_safe_wav_rate(source_sample_rate);
+    // #3973 — le site « décodage radio » de la règle bit-perfect : relever la
+    // cadence EST une conversion. Strict ⇒ refuser, en le disant.
+    if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+        source_sample_rate,
+        output_sample_rate,
+        canaux.strict_bitperfect,
+    )
+    .refus()
+    {
+        warn!(
+            url = %url,
+            requested_sr = refus.demandee_hz,
+            output_sr = refus.sortie_hz,
+            "radio_bitperfect_strict_refused"
+        );
+        return Err(SuiteRadio::Rendre(Err(refus.sentinelle())));
+    }
     let needs_resample = output_sample_rate != source_sample_rate;
     if etat.radio_eq.is_none() {
         etat.radio_eq = canaux.eq_profile.as_ref().and_then(|profile| {

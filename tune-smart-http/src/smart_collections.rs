@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tune_core::db::backend::ToSqlValue;
 
 use crate::SmartHttpState;
+use crate::catalogue;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
 use tune_http_types::{ActiveProfile, AppError};
@@ -102,6 +103,40 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     })
 }
 
+/// Le nombre d'albums d'une collection : ceux de la bibliothèque, **plus** les
+/// favoris de service que la même règle sélectionne.
+///
+/// 🔴 #1231 — Bertrand, 18/09/2026 : « Smart Collection, source qobuz retourne
+/// 0 album ». Mesuré sur le .18 : la collection rend bien ses 3 albums Qobuz
+/// quand on l'ouvre, et la liste annonçait `"album_count": 0`. Le SQL ci-dessus
+/// compte dans `albums`, où un favori de service n'est jamais — il vient de
+/// `streaming_favorites`, ajouté APRÈS par `source_streaming`. La liste était
+/// juste, son compteur mentait.
+///
+/// Fonction à part, et synchrone, pour être éprouvée : une garde textuelle
+/// laissait passer le débranchement de l'addition sans rien voir.
+pub(crate) fn compte_albums(
+    backend: &dyn tune_core::db::backend::DbBackend,
+    sql_bibliotheque: &str,
+    rules_json: &str,
+    match_mode: &str,
+    profile_id: i64,
+) -> i64 {
+    let un = |sql: &str| {
+        backend
+            .query_many(sql, &[])
+            .ok()
+            .and_then(|rs| rs.first().and_then(|r| r.first()).and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    };
+    let en_base = un(sql_bibliotheque);
+    let en_service =
+        source_streaming::requete_compte(rules_json, match_mode, Objet::Album, profile_id)
+            .map(|sql| un(&sql))
+            .unwrap_or(0);
+    en_base + en_service
+}
+
 async fn list_collections(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
@@ -145,14 +180,13 @@ async fn list_collections(
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
                  LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
             );
-            if let Ok(rs) = state.backend.query_many(&album_count_sql, &[]) {
-                col["album_count"] = json!(
-                    rs.first()
-                        .and_then(|r| r.first())
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                );
-            }
+            col["album_count"] = json!(compte_albums(
+                &*state.backend,
+                &album_count_sql,
+                &rules_str,
+                match_mode,
+                profile.id(),
+            ));
             let track_count_sql = format!(
                 "SELECT COUNT(DISTINCT t.id) FROM albums al \
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -896,6 +930,67 @@ fn load_collection_criteria(
     }))
 }
 
+/// Les albums du CATALOGUE d'un service que les règles demandent — #4473.
+///
+/// Rend `Ok(albums)` inchangé quand aucune règle ne demande de catalogue.
+///
+/// 🔴 Trois refus EXPLICITES, parce qu'une règle qu'on ne sait pas honorer ne
+/// doit ni rendre tout ni rendre vide en silence (leçon de #4469) :
+///
+/// * aucune cible — ni artiste ni album nommé par une égalité : un service ne
+///   sait pas énumérer son catalogue, il n'y a pas de requête à faire ;
+/// * pas de registre de services — l'état n'en porte pas ;
+/// * le service demandé ne répond pas : là, on rend une liste vide SANS
+///   refuser, car une panne de réseau ne doit pas faire échouer une collection
+///   qui a par ailleurs des albums locaux.
+async fn avec_albums_de_catalogue(
+    state: &SmartHttpState,
+    mut albums: Vec<Value>,
+    rules_json: &str,
+    max_limit: Option<i64>,
+) -> Result<Vec<Value>, AppError> {
+    let Some(service) = catalogue::service_du_catalogue(rules_json) else {
+        return Ok(albums);
+    };
+    let Some(cible) = catalogue::cible(rules_json) else {
+        return Err(AppError::bad_request(
+            "Une règle « catalogue » doit nommer un artiste ou un album : \
+             aucun service ne sait énumérer son catalogue.",
+        ));
+    };
+    // 🔴 On CLONE l'Arc au lieu d'en garder une référence : ce qui vit en
+    // travers d'un `.await` doit être `Send`, et une référence à l'état ne
+    // l'est pas ici. Sans ça, axum refuse le handler tout entier.
+    let Some(distant) = state.catalogue.clone() else {
+        return Err(AppError::bad_request(
+            "Le catalogue des services n'est pas disponible ici.",
+        ));
+    };
+
+    let trouves = match &cible {
+        catalogue::Cible::Artiste(nom) => distant.albums_par_artiste(&service, nom).await,
+        catalogue::Cible::Album(titre) => distant.albums_par_titre(&service, titre).await,
+    };
+    albums.extend(trouves.into_iter().map(|a| {
+        json!({
+            "id": Value::Null,
+            "source": a.service,
+            "source_id": a.source_id,
+            "title": a.title,
+            "artist_name": a.artist,
+            "year": a.year,
+            "cover_path": a.cover_url,
+            "genre": Value::Null,
+            "track_count": 0,
+            "is_compilation": false,
+        })
+    }));
+    if let Some(n) = max_limit.filter(|n| *n >= 0) {
+        albums.truncate(n as usize);
+    }
+    Ok(albums)
+}
+
 async fn resolve_albums(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
@@ -907,16 +1002,21 @@ async fn resolve_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
-    let (where_clause, order, limit_clause) = build_album_query(
-        &rules_json,
-        &match_mode,
-        &sort_by,
-        &sort_order,
-        max_limit,
-        &ctx,
-    );
+    // Le résolveur et son contexte tiennent des RÉFÉRENCES à l'état : ils
+    // doivent mourir avant le `.await` du catalogue, sinon le futur n'est plus
+    // `Send` et axum refuse le handler.
+    let (where_clause, order, limit_clause) = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        build_album_query(
+            &rules_json,
+            &match_mode,
+            &sort_by,
+            &sort_order,
+            max_limit,
+            &ctx,
+        )
+    };
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
     let albums = avec_albums_de_service(
         &state,
@@ -928,6 +1028,7 @@ async fn resolve_albums(
         &sort_order,
         max_limit,
     )?;
+    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, max_limit).await?;
 
     // Return a bare array, matching the regular collections endpoint
     // (GET /library/collections/{id}/albums). The previous {"albums":[…],
@@ -1311,5 +1412,257 @@ mod tests {
         // Missing / empty -> default.
         assert_eq!(normalize_sort_order(None), "asc");
         assert_eq!(normalize_sort_order(Some(String::new())), "asc");
+    }
+
+    /// 🔴 #1231 — le compteur d'une collection compte AUSSI les favoris de
+    /// service.
+    ///
+    /// Mesuré sur le .18 le 19/09/2026 : une collection dont la seule règle est
+    /// `source = qobuz` rend ses 3 albums quand on l'ouvre, et la liste des
+    /// collections annonçait `"album_count": 0`. La liste était juste, son
+    /// compteur mentait — c'est le « retourne 0 album » de Bertrand.
+    ///
+    /// L'épreuve passe par le HANDLER, avec une vraie base : une garde
+    /// textuelle laissait passer le débranchement (`en_base + en_service`
+    /// remplacé par `en_base`) sans rien voir.
+    #[test]
+    fn le_compteur_voit_les_favoris_de_service() {
+        use super::compte_albums;
+        use std::sync::Arc;
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);",
+            )
+            .expect("table");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        for (t, svc) in [
+            ("album", "qobuz"),
+            ("album", "qobuz"),
+            ("track", "qobuz"),
+            ("album", "tidal"),
+        ] {
+            backend
+                .execute(
+                    "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title) \
+                     VALUES (1, ?1, ?2, 'x', 'y')",
+                    &[&t as &dyn ToSqlValue, &svc],
+                )
+                .expect("favori");
+        }
+
+        let regles = r#"[{"field":"source","op":"=","value":"qobuz"}]"#;
+        // La bibliothèque ne rend rien : aucun album local n'est « qobuz ».
+        let vide = "SELECT COUNT(*) FROM albums WHERE 1 = 0";
+        assert_eq!(
+            compte_albums(&*backend, vide, regles, "all", 1),
+            2,
+            "les DEUX favoris ALBUM Qobuz doivent être comptés — ni la piste, ni l'album Tidal"
+        );
+
+        // Et le compte de la bibliothèque s'y ajoute, il ne le remplace pas.
+        let un = "SELECT 5";
+        assert_eq!(compte_albums(&*backend, un, regles, "all", 1), 7);
+
+        // Sans règle de service, rien ne s'ajoute.
+        let sans = r#"[{"field":"year","op":"=","value":"2025"}]"#;
+        assert_eq!(compte_albums(&*backend, un, sans, "all", 1), 5);
+    }
+
+    /// 🔴 Et le handler l'APPELLE vraiment.
+    ///
+    /// La garde précédente éprouve `compte_albums` ; celle-ci éprouve qu'il est
+    /// branché. Sans elle, remplacer l'appel par `0 * compte_albums(...)`
+    /// passait au vert — le défaut « écrit mais pas branché », en plus petit.
+    #[tokio::test]
+    async fn la_liste_des_collections_porte_ce_compte() {
+        use crate::SmartHttpState;
+        use std::sync::Arc;
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::sqlite::SqliteDb;
+        use tune_http_types::ActiveProfile;
+
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS smart_collections (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
+                     match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                 CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);",
+            )
+            .expect("tables");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        backend
+            .execute(
+                "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order) \
+                 VALUES ('Qobuz', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"source","op":"=","value":"qobuz"}]"# as &dyn ToSqlValue],
+            )
+            .expect("collection");
+        for t in ["album", "album", "track"] {
+            backend
+                .execute(
+                    "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title) \
+                     VALUES (1, ?1, 'qobuz', 'x', 'y')",
+                    &[&t as &dyn ToSqlValue],
+                )
+                .expect("favori");
+        }
+
+        let etat = SmartHttpState::new(backend);
+        let Ok(reponse) =
+            super::list_collections(axum::extract::State(etat), ActiveProfile(1)).await
+        else {
+            panic!("la liste doit répondre");
+        };
+        assert_eq!(
+            reponse.0[0]["album_count"].as_i64(),
+            Some(2),
+            "la collection annonce ses favoris ALBUM : {}",
+            reponse.0[0]
+        );
+    }
+
+    /// 🔴 #4473 — le catalogue d'un service, et ses trois refus.
+    ///
+    /// Un service simulé : la garde porte sur ce que le module DÉCIDE, pas sur
+    /// ce que Qobuz répond. Aucun réseau, aucune clé, et le comportement se
+    /// mesure quand même.
+    mod catalogue_de_service {
+        use crate::SmartHttpState;
+        use crate::catalogue::{AlbumDistant, CatalogueDistant, PisteDistante};
+        use std::sync::Arc;
+        use tune_core::db::sqlite::SqliteDb;
+
+        struct ServiceSimule;
+
+        #[async_trait::async_trait]
+        impl CatalogueDistant for ServiceSimule {
+            async fn albums_par_artiste(&self, service: &str, nom: &str) -> Vec<AlbumDistant> {
+                vec![AlbumDistant {
+                    service: service.into(),
+                    source_id: "a1".into(),
+                    title: format!("Best of {nom}"),
+                    artist: nom.into(),
+                    cover_url: None,
+                    year: Some(1960),
+                }]
+            }
+            async fn albums_par_titre(&self, service: &str, titre: &str) -> Vec<AlbumDistant> {
+                vec![AlbumDistant {
+                    service: service.into(),
+                    source_id: "a2".into(),
+                    title: titre.into(),
+                    artist: "X".into(),
+                    cover_url: None,
+                    year: None,
+                }]
+            }
+            async fn pistes_par_artiste(&self, _s: &str, _n: &str) -> Vec<PisteDistante> {
+                Vec::new()
+            }
+        }
+
+        fn etat(avec_service: bool) -> SmartHttpState {
+            let db = SqliteDb::open_in_memory().expect("base");
+            db.init_schema().expect("schéma");
+            let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+            let e = SmartHttpState::new(backend);
+            if avec_service {
+                e.avec_catalogue(Arc::new(ServiceSimule))
+            } else {
+                e
+            }
+        }
+
+        const AVEC_ARTISTE: &str = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                                       {"field":"artist","op":"=","value":"John Coltrane"}]"#;
+
+        #[tokio::test]
+        async fn les_albums_du_service_rejoignent_ceux_de_la_bibliotheque() {
+            let locaux = vec![serde_json::json!({"id": 1, "title": "Un album local"})];
+            let r = super::super::avec_albums_de_catalogue(&etat(true), locaux, AVEC_ARTISTE, None)
+                .await;
+            let Ok(r) = r else {
+                panic!("le catalogue doit répondre")
+            };
+            assert_eq!(r.len(), 2, "le local et le distant : {r:?}");
+            assert_eq!(r[1]["source"], "qobuz");
+            assert_eq!(r[1]["title"], "Best of John Coltrane");
+            assert_eq!(
+                r[1]["id"],
+                serde_json::Value::Null,
+                "un album distant n'a pas d'id local"
+            );
+        }
+
+        #[tokio::test]
+        async fn sans_regle_de_catalogue_rien_ne_change() {
+            let locaux = vec![serde_json::json!({"id": 1})];
+            let r = super::super::avec_albums_de_catalogue(
+                &etat(true),
+                locaux.clone(),
+                r#"[{"field":"year","op":"=","value":"2025"}]"#,
+                None,
+            )
+            .await;
+            let Ok(r) = r else {
+                panic!("aucun catalogue demandé")
+            };
+            assert_eq!(r, locaux);
+        }
+
+        #[tokio::test]
+        async fn sans_cible_on_refuse_au_lieu_de_rendre_tout_ou_rien() {
+            // « catalogue Qobuz ET année 2025 » : aucun service ne sait
+            // énumérer son catalogue. Refuser est la seule réponse honnête —
+            // rendre vide ferait croire à une bibliothèque sans rien, rendre
+            // tout est le défaut de #4469.
+            let sans = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                           {"field":"year","op":"=","value":"2025"}]"#;
+            let r =
+                super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), sans, None).await;
+            assert!(r.is_err(), "doit refuser");
+        }
+
+        #[tokio::test]
+        async fn sans_registre_on_refuse_aussi() {
+            let r = super::super::avec_albums_de_catalogue(
+                &etat(false),
+                Vec::new(),
+                AVEC_ARTISTE,
+                None,
+            )
+            .await;
+            assert!(r.is_err(), "sans service, on ne fait pas semblant");
+        }
+
+        #[tokio::test]
+        async fn la_borne_de_la_collection_s_applique_au_distant() {
+            let locaux = vec![serde_json::json!({"id": 1}), serde_json::json!({"id": 2})];
+            let r =
+                super::super::avec_albums_de_catalogue(&etat(true), locaux, AVEC_ARTISTE, Some(2))
+                    .await;
+            let Ok(r) = r else {
+                panic!("le catalogue doit répondre")
+            };
+            assert_eq!(r.len(), 2, "le plafond vaut pour tout le résultat");
+        }
     }
 }

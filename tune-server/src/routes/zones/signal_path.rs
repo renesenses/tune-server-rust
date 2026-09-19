@@ -535,6 +535,8 @@ pub(super) fn build_signal_path(
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
+    let zone_id_courant = zone.id.unwrap_or(0);
+    let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id_courant);
     let etapes = assembler_les_etapes(
         ps,
         zone,
@@ -555,7 +557,24 @@ pub(super) fn build_signal_path(
         "runtime_observed": runtime_signal_path.is_some(),
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": etapes.dsp_metrics,
+        // #3973 — « jouer, et le dire ». PURE promet un chemin intouché ;
+        // une conversion de fréquence le dégrade, et l'écran doit le dire au
+        // lieu d'allumer le badge. `strict_bitperfect` : la zone refuserait
+        // plutôt que convertir (la lecture n'aurait alors pas démarré).
+        "pure": pure,
+        "pure_degraded": pure_degraded(pure, etapes.rate_conversion),
+        "strict_bitperfect": tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id_courant),
+        "rate_conversion": etapes.rate_conversion.map(|(de, vers)| json!({
+            "from_hz": de,
+            "to_hz": vers,
+        })),
     }))
+}
+
+/// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
+/// fréquence a lieu : la décision « jouer, et le dire » de Bertrand (19/09).
+pub(super) fn pure_degraded(pure: bool, rate_conversion: Option<(u32, u32)>) -> bool {
+    pure && rate_conversion.is_some_and(|(de, vers)| de != vers)
 }
 
 /// Tout ce que `build_signal_path` a établi, prêt à être décrit en étapes
@@ -577,6 +596,9 @@ struct Etapes {
     steps: Vec<Value>,
     summary: String,
     dsp_metrics: Option<Value>,
+    /// #3973 — la conversion de fréquence nommée par l'étape `Resampler`
+    /// (de, vers), en Hz. `None` : aucune conversion.
+    rate_conversion: Option<(u32, u32)>,
 }
 
 /// Assemble les étapes du chemin de signal ; sixième bloc de
@@ -752,19 +774,32 @@ fn assembler_les_etapes(
     // Resampler step. MESURÉ d'abord (REF-6b) : la sortie a dit ce qu'elle a
     // ouvert, et c'est cet écart-là qui est nommé, pas le plafond réglé.
     // Sans déclaration, la règle historique : le plafond effectif de cadence.
+    //
+    // #3973 — l'étape porte `code: "rate_conversion"` et ses deux fréquences :
+    // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
+    // elle qui fait dire « PURE dégradé » (`pure_degraded`).
+    let mut rate_conversion: Option<(u32, u32)> = None;
     if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
         let src_khz = t.entree().cadence() / 1000;
         let dst_khz = t.ouvert().cadence / 1000;
+        rate_conversion = Some((t.entree().cadence(), t.ouvert().cadence));
         steps.push(json!({
             "name": "Resampler",
+            "code": "rate_conversion",
+            "from_hz": t.entree().cadence(),
+            "to_hz": t.ouvert().cadence,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz (mesuré)"),
             "bit_perfect": false,
         }));
     } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
         let src_khz = sample_rate / 1000;
         let dst_khz = max_sr / 1000;
+        rate_conversion = Some((sample_rate as u32, max_sr));
         steps.push(json!({
             "name": "Resampler",
+            "code": "rate_conversion",
+            "from_hz": sample_rate as u32,
+            "to_hz": max_sr,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
         }));
@@ -972,6 +1007,7 @@ fn assembler_les_etapes(
         steps,
         summary,
         dsp_metrics,
+        rate_conversion,
     }
 }
 
@@ -1087,6 +1123,37 @@ fn rendre_les_verdicts(
 /// Le transport par type de sortie : bit-perfect ou non, son libellé, le
 /// format réellement émis. Quatrième bloc de `build_signal_path`, le `match`
 /// sorti tel quel (REF-4 phase 2, #2219). Rend le triplet que l'hôte liait.
+/// #4172 — le nom du transport d'une sortie locale, mode compris.
+///
+/// `exclusif_observe` : un contrat de signal a été publié par le bras exclusif
+/// (`publish_windows_signal_path_status`). Sans lui, un transport WASAPI est
+/// le mode partagé, et on le NOMME : c'est la seule ligne du panneau qui dise
+/// à l'auditeur que « Mode Audiophile » n'a pas pris le périphérique — le
+/// réglage qui le prend s'appelle « Exclusif (bit-perfect) », ailleurs.
+pub(super) fn etiquette_du_transport_local<'a>(
+    audio_backend: &'a str,
+    exclusif_observe: bool,
+) -> &'a str {
+    match audio_backend {
+        "ASIO" => "ASIO (exclusive)",
+        "WASAPI" if exclusif_observe => "WASAPI (exclusive)",
+        "WASAPI" => "WASAPI (shared \u{2014} Windows mixer)",
+        "CoreAudio" => "CoreAudio",
+        "ALSA" => "ALSA",
+        other => other,
+    }
+}
+
+/// #4172 — sans contrat de signal, le transport local est-il intact ?
+///
+/// WASAPI : non — le mode partagé passe par le mixeur Windows (flottant,
+/// volume de session, mélange, cadence du mixeur). CoreAudio et ALSA sans
+/// contrat : inchangé, `true` — ces chemins n'ont pas de mixeur imposé de la
+/// même façon et rien de mesuré ne dit le contraire.
+pub(super) fn transport_partage_est_intact(audio_backend: &str) -> bool {
+    audio_backend != "WASAPI"
+}
+
 fn decrire_le_transport<'a>(
     output_type: &'a str,
     audio_backend: &'a str,
@@ -1203,21 +1270,21 @@ fn decrire_le_transport<'a>(
         }
         "browser" => (true, "Browser", format_name),
         "local" => {
-            // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
-            let transport = match audio_backend {
-                "ASIO" => "ASIO (exclusive)",
-                "WASAPI" => "WASAPI",
-                "CoreAudio" => "CoreAudio",
-                "ALSA" => "ALSA",
-                other => other,
+            // #4172 — le contrat de signal (`runtime_signal_path`) n'est
+            // publié QUE par les bras exclusifs (WASAPI exclusif, ASIO). Un
+            // transport « WASAPI » sans contrat, c'est le mode partagé : le
+            // mixeur Windows convertit en flottant, applique le volume de
+            // session, mélange et reconvertit à SA cadence — l'ampli de
+            // william restait à 44,1 kHz quelle que soit la source, et le
+            // panneau disait « WASAPI », bit-perfect. Il dit désormais le
+            // mode, et le verdict qui va avec.
+            let exclusif_observe = runtime_signal_path.is_some();
+            let transport = etiquette_du_transport_local(audio_backend, exclusif_observe);
+            let intact = match runtime_signal_path {
+                Some(status) => runtime_transport_is_intact(status),
+                None => transport_partage_est_intact(audio_backend),
             };
-            (
-                runtime_signal_path
-                    .map(runtime_transport_is_intact)
-                    .unwrap_or(true),
-                transport,
-                format_name,
-            )
+            (intact, transport, format_name)
         }
         // Tout le reste est une sortie PULL : elle va CHERCHER le flux
         // elle-même et reçoit nos octets TELS QUELS — `hqplayer`, `diretta`,

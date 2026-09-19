@@ -217,6 +217,26 @@
       "models": [
         { "name": "S95B", "quirks": {} }
       ]
+    },
+    {
+      "name": "Weiss",
+      "models": [
+        { "name": "DAC501", "quirks": {} },
+        { "name": "DAC502", "quirks": {} },
+        { "name": "DAC501-MK2", "quirks": {} },
+        { "name": "DAC502-MK2", "quirks": {} },
+        { "name": "DAC204", "quirks": {} },
+        { "name": "DAC204-MK2", "quirks": {} },
+        { "name": "DAC205-MK2", "quirks": {} },
+        { "name": "DSP501", "quirks": {} },
+        { "name": "DSP502", "quirks": {} },
+        { "name": "HELIOS", "quirks": {} },
+        { "name": "MAN301", "quirks": {} },
+        { "name": "MAN301R", "quirks": {} },
+        { "name": "DAC301", "quirks": {} },
+        { "name": "DAC202", "quirks": {} },
+        { "name": "MEDUS", "quirks": {} }
+      ]
     }
   ]
 }

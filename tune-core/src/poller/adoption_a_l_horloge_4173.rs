@@ -663,3 +663,8 @@ fn la_surveillance_pure() {
         SuiteAdoption::Infirmee
     );
 }
+
+/// #4382, cas 2 — la séquence du 18/09 rejouée sondage par sondage : ce
+/// banc, sans l'horloge de fin injectée d'un bloc.
+#[cfg(test)]
+mod eversolo_epingle_4382;

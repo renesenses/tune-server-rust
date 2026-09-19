@@ -203,3 +203,35 @@ async fn la_famille_upnp_est_persistee_par_la_route() {
         "désactiver doit SUPPRIMER la clé, pas écrire « false »"
     );
 }
+
+/// #3973 — « bit-perfect strict » : présent sur la fiche dès le départ (c'est
+/// sa PRÉSENCE qui fait apparaître l'interrupteur côté client), armé par la
+/// route, persisté sous `zone_{id}_strict_bitperfect`, désarmé en SUPPRIMANT
+/// la clé.
+#[tokio::test]
+async fn bitperfect_strict_3973_est_persiste_par_la_route() {
+    let (app, state) = serveur();
+    let id = zone_dlna(&app).await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = tune_core::audio::bitperfect_strict::cle_de_zone(id);
+
+    let avant = fiche(&app, id).await;
+    assert_eq!(
+        avant["strict_bitperfect"],
+        json!(false),
+        "le champ doit être publié, désarmé par défaut : {avant}"
+    );
+
+    let (statut, reponse) = patch(&app, id, json!({ "strict_bitperfect": true })).await;
+    assert_eq!(statut, StatusCode::OK, "PATCH refusé : {reponse}");
+    assert_eq!(fiche(&app, id).await["strict_bitperfect"], json!(true));
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("true"));
+
+    let (statut, reponse) = patch(&app, id, json!({ "strict_bitperfect": false })).await;
+    assert_eq!(statut, StatusCode::OK, "PATCH refusé : {reponse}");
+    assert_eq!(fiche(&app, id).await["strict_bitperfect"], json!(false));
+    assert!(
+        reglages.get(&cle).unwrap().is_none(),
+        "désactiver SUPPRIME la clé"
+    );
+}

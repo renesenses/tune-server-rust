@@ -64,6 +64,9 @@ tune-plugin-declick = { path = "../sdk/tune-plugin-declick" }
 libc = "0.2"
 tune-core = { path = "../tune-core", default-features = false, features = ["plugin-http"] }
 tune-http-types = { path = "../tune-http-types" }
+# #4473 — CatalogueDuRegistre implémente le trait asynchrone que
+# tune-smart-http déclare : `async-trait` est déjà en dépendance normale plus haut
+# (SDK audio, v0.9.156) — une seconde déclaration casse le manifeste.
 tune-smart-http = { path = "../tune-smart-http" }
 tune-stream-http = { path = "../tune-stream-http" }
 tune-streaming-http = { path = "../tune-streaming-http" }

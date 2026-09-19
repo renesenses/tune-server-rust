@@ -391,6 +391,9 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         origin_host: None,
         audio_backend: "coreaudio",
         exclusive: true,
+        // #3973 — non lu par ce bras : un transport exclusif ouvre à la
+        // cadence de la source ou refuse, il ne rééchantillonne pas.
+        strict_bitperfect: false,
         stop_rx: &stop_rx,
         paused: &paused,
         force_silent: &force_silent,
