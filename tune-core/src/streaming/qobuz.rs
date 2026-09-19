@@ -2241,12 +2241,46 @@ impl StreamingService for QobuzService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
+        self.get_genre_section(genre_id, "new-releases", limit)
+            .await
+    }
+
+    /// Une rubrique éditoriale — palmarès, distinctions de la presse,
+    /// discothèque idéale, Qobuzissimes… — restreinte à un genre (#3481).
+    ///
+    /// Jusqu'ici l'écran d'un genre ne montrait que les nouveautés : le `type`
+    /// était écrit en dur à `new-releases`, tandis que les autres rubriques
+    /// passaient par la même route **sans** `genre_ids`.
+    ///
+    /// **Mesuré contre l'API réelle le 19/09/2026**, `app_id` public, genre
+    /// Jazz (`80`) — `total` rendu, sans genre puis avec :
+    ///
+    /// ```text
+    /// type                sans genre   genre_ids=80
+    /// press-awards              9257            415
+    /// ideal-discography         3520            422
+    /// qobuzissims                321             40
+    /// editor-picks              3836            461
+    /// best-sellers               109            194
+    /// most-streamed              101            100
+    /// ```
+    ///
+    /// Chaque rubrique change de contenu sous le genre, et les premiers
+    /// albums rendus sont tous du jazz : `genre_ids` est honoré pour tous les
+    /// `type`, pas seulement pour les nouveautés. Un `type` inconnu vaut un
+    /// 400 de Qobuz, rendu tel quel en erreur.
+    async fn get_genre_section(
+        &self,
+        genre_id: &str,
+        section_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
         let limit_str = limit.to_string();
         let data = self
             .api_get_editorial(
                 "/album/getFeatured",
                 &[
-                    ("type", "new-releases"),
+                    ("type", section_id),
                     ("genre_ids", genre_id),
                     ("limit", &limit_str),
                 ],
@@ -5907,5 +5941,121 @@ mod tests_categories_qui_tombent {
         );
         // new : 1 appel ; mood : 2 ; hi-res : 2 ⇒ 5.
         assert_eq!(appels.load(Ordering::SeqCst), 5);
+    }
+}
+
+/// Rubriques éditoriales par genre (#3481).
+///
+/// Serveur simulé sur `127.0.0.1:0` : il NOTE les paramètres de chaque
+/// `/album/getFeatured` reçu et rend un album dont le titre dit ce qu'il a
+/// reçu (`type` et `genre_ids`). Aucun appel à l'API Qobuz.
+#[cfg(test)]
+mod tests_rubriques_par_genre {
+    use super::*;
+    use axum::extract::Query;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap as Carte;
+    use std::sync::{Arc, Mutex};
+
+    type Vus = Arc<Mutex<Vec<Carte<String, String>>>>;
+
+    async fn qobuz_rubriques_simule() -> (String, Vus) {
+        let vus: Vus = Arc::default();
+        let note = vus.clone();
+        let app = Router::new().route(
+            "/album/getFeatured",
+            get(move |Query(q): Query<Carte<String, String>>| {
+                let note = note.clone();
+                async move {
+                    let titre = format!(
+                        "{}|{}",
+                        q.get("type").cloned().unwrap_or_default(),
+                        q.get("genre_ids").cloned().unwrap_or_else(|| "-".into())
+                    );
+                    note.lock().expect("verrou d'essai").push(q);
+                    Json(json!({"albums": {"items": [
+                        {"id": "a1", "title": titre, "artist": {"name": "Miles Davis"}}
+                    ], "total": 1}}))
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), vus)
+    }
+
+    /// LE défaut de #3481 : l'écran d'un genre ne pouvait montrer que les
+    /// nouveautés. Une rubrique demandée sous un genre doit partir chez Qobuz
+    /// avec SON `type` ET le `genre_ids`.
+    #[tokio::test]
+    async fn une_rubrique_demandee_sous_un_genre_porte_son_type_et_le_genre() {
+        let (base, vus) = qobuz_rubriques_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let albums = svc
+            .get_genre_section("80", "press-awards", 5)
+            .await
+            .expect("serveur simulé");
+
+        let vus = vus.lock().expect("verrou d'essai").clone();
+        assert_eq!(vus.len(), 1, "un seul appel amont");
+        assert_eq!(
+            vus[0].get("type").map(String::as_str),
+            Some("press-awards"),
+            "la rubrique demandée doit parvenir à Qobuz, pas `new-releases` en dur (#3481)"
+        );
+        assert_eq!(
+            vus[0].get("genre_ids").map(String::as_str),
+            Some("80"),
+            "le genre doit accompagner la rubrique (#3481)"
+        );
+        assert_eq!(vus[0].get("limit").map(String::as_str), Some("5"));
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].title, "press-awards|80");
+    }
+
+    /// Non-régression : l'écran de genre actuel (sans rubrique) reçoit
+    /// toujours les nouveautés du genre.
+    #[tokio::test]
+    async fn sans_rubrique_le_genre_rend_toujours_ses_nouveautes() {
+        let (base, vus) = qobuz_rubriques_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let albums = svc
+            .get_genre_albums("10", 50)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(albums[0].title, "new-releases|10");
+        let vus = vus.lock().expect("verrou d'essai").clone();
+        assert_eq!(vus[0].get("limit").map(String::as_str), Some("50"));
+    }
+
+    /// Deux rubriques du même genre ne se confondent pas dans le cache
+    /// éditorial : la clé porte le `type`.
+    #[tokio::test]
+    async fn deux_rubriques_du_meme_genre_ne_se_confondent_pas_en_cache() {
+        let (base, vus) = qobuz_rubriques_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let presse = svc
+            .get_genre_section("80", "press-awards", 5)
+            .await
+            .expect("serveur simulé");
+        let ideale = svc
+            .get_genre_section("80", "ideal-discography", 5)
+            .await
+            .expect("serveur simulé");
+
+        assert_eq!(presse[0].title, "press-awards|80");
+        assert_eq!(ideale[0].title, "ideal-discography|80");
+        assert_eq!(vus.lock().expect("verrou d'essai").len(), 2);
     }
 }
