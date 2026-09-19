@@ -74,6 +74,33 @@ pub fn dlna_cap_16bit_applies(
     is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
 }
 
+/// #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5 part-il
+/// ré-encodé plutôt qu'en passthrough vers CETTE sortie ?
+///
+/// Seulement un FLAC ENTIER (pas une tranche de feuille CUE, qui transcode
+/// déjà) vers une sortie réseau. Le fichier n'est lu qu'en dernier, et
+/// seulement si les trois premières conditions tiennent : `chemin` est
+/// paresseux pour qu'un appelant fréquent (le panneau du chemin du signal)
+/// n'ouvre pas le fichier à chaque rafraîchissement d'une zone locale.
+///
+/// `pub` pour la même raison que [`dlna_cap_16bit_applies`] : le chemin du
+/// signal (`tune-server/src/routes/zones/signal_path.rs`) doit rendre le MÊME
+/// verdict que la décision. Sans ce miroir, il annonçait un passthrough
+/// FLAC → DLNA bit-perfect là où Tune réécrivait le conteneur.
+pub fn flac_ffmpeg_vers_le_reseau_applies(
+    is_network_output: bool,
+    source_format: Option<AudioFormat>,
+    est_une_tranche_cue: bool,
+    chemin: impl FnOnce() -> Option<String>,
+) -> bool {
+    is_network_output
+        && source_format == Some(AudioFormat::Flac)
+        && !est_une_tranche_cue
+        && chemin().is_some_and(|c| {
+            crate::audio::flac_vendeur::flac_ecrit_par_ffmpeg(std::path::Path::new(&c))
+        })
+}
+
 /// Le passthrough ALAC (« ALAC direct », opt-in par zone) s'applique-t-il à
 /// CETTE lecture ?
 ///
@@ -1317,5 +1344,41 @@ mod lecture_locale_tests {
             }),
             "plafond sans FLAC direct : l'ALAC transcode déjà par ailleurs (#1137)"
         );
+    }
+}
+
+#[cfg(test)]
+mod flac_ffmpeg_tests {
+    use super::*;
+
+    /// #4350 — la porte partagée par la décision et le chemin du signal : le
+    /// fichier n'est lu que pour un FLAC entier vers le réseau.
+    #[test]
+    fn le_fichier_n_est_lu_que_pour_un_flac_entier_vers_le_reseau() {
+        let jamais = || -> Option<String> { panic!("fichier lu hors de propos") };
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            false,
+            Some(AudioFormat::Flac),
+            false,
+            jamais
+        ));
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            true,
+            Some(AudioFormat::Alac),
+            false,
+            jamais
+        ));
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            true,
+            Some(AudioFormat::Flac),
+            true,
+            jamais
+        ));
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            true,
+            Some(AudioFormat::Flac),
+            false,
+            || None
+        ));
     }
 }
