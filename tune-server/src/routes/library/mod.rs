@@ -245,6 +245,12 @@ pub fn router() -> Router<AppState> {
         // #4471 — les coffrets CD1/CD2 dont les numéros se marchent dessus.
         // AVANT `/albums/{id}`, pour la même raison qu'`eclates`.
         .route("/albums/disques-abimes", get(albums::disques_abimes))
+        // Coffrets ÉCLATÉS en un album par disque. AVANT `/albums/{id}`.
+        .route("/albums/coffrets", get(albums::coffrets_eclates))
+        .route(
+            "/albums/coffrets/{cible}/regrouper",
+            post(albums::regrouper_coffret),
+        )
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),

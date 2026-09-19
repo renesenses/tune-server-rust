@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets};
 use tune_core::metadata::disques_abimes::{Correction, PisteAExaminer, corrections};
 use tune_http_types::panne_sql::OuDefautJournalise;
 
@@ -3474,4 +3475,125 @@ pub(super) async fn reparer_disques(
         );
     }
     Ok(Json(rapport_disques(&corr, true)))
+}
+
+// ---------------------------------------------------------------------------
+// Coffrets ÉCLATÉS en un album par disque — chantier « coffrets »
+// ---------------------------------------------------------------------------
+
+/// Un album et le dossier d'une de ses pistes.
+///
+/// 🔴 `MIN(file_path)` : les disques d'un coffret n'ont qu'un dossier chacun,
+/// et prendre le plus petit chemin rend un résultat STABLE d'un appel à
+/// l'autre. Sans agrégat, l'ordre des lignes dépendrait du plan de requête et
+/// deux aperçus successifs pourraient ne pas se ressembler.
+const SQL_ALBUMS_ET_DOSSIER: &str = "\
+    SELECT t.album_id, al.title, MIN(t.file_path) \
+    FROM tracks t JOIN albums al ON al.id = t.album_id \
+    WHERE t.file_path IS NOT NULL AND t.file_path <> '' \
+    GROUP BY t.album_id, al.title";
+
+fn albums_a_grouper(state: &AppState) -> Vec<AlbumAGrouper> {
+    state
+        .backend
+        .query_many(SQL_ALBUMS_ET_DOSSIER, &[])
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|r| {
+            let chemin = r.get(2).and_then(|v| v.as_string())?;
+            let dossier = chemin.rsplit_once('/').map(|(d, _)| d.to_string())?;
+            Some(AlbumAGrouper {
+                id: r.first().and_then(|v| v.as_i64())?,
+                titre: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                dossier,
+            })
+        })
+        .collect()
+}
+
+fn rapport_coffret(c: &Coffret) -> Value {
+    json!({
+        "titre": c.titre,
+        "dossier": c.parent,
+        "cible": c.cible(),
+        "disques": c.disques.iter().map(|(n, id)| json!({"disque": n, "album_id": id})).collect::<Vec<_>>(),
+    })
+}
+
+/// `GET /library/albums/coffrets` — les coffrets éclatés, sans rien regrouper.
+pub(super) async fn coffrets_eclates(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let trouves = coffrets(&albums_a_grouper(&state));
+    Ok(Json(json!({
+        "count": trouves.len(),
+        "albums": trouves.iter().map(|c| c.disques.len()).sum::<usize>(),
+        "coffrets": trouves.iter().map(rapport_coffret).collect::<Vec<_>>(),
+    })))
+}
+
+/// `POST /library/albums/coffrets/{cible}/regrouper` — réunit UN coffret.
+///
+/// ⚠️ Un coffret à la fois, désigné par son disque 1. Un bouton « tout
+/// regrouper » sur vingt-cinq disques est un geste qu'on ne peut pas relire
+/// avant de le faire ; l'écran propose coffret par coffret.
+///
+/// 🔴 Ce geste ne passe PAS par la route `absorber`, et ce n'est pas un
+/// contournement : cette route garde `dossiers_differents`, qui exige un
+/// dossier COMMUN. Un coffret est par construction en dossiers FRÈRES — le
+/// garde y est juste pour un doublon et faux ici. On appelle donc le dépôt
+/// directement, après avoir établi la preuve qui vaut pour un coffret : des
+/// dossiers frères sous un même parent, aux noms identiques au marqueur près.
+pub(super) async fn regrouper_coffret(
+    State(state): State<AppState>,
+    Path(cible): Path<i64>,
+) -> axum::response::Response {
+    let trouves = coffrets(&albums_a_grouper(&state));
+    let Some(c) = trouves.into_iter().find(|c| c.cible() == Some(cible)) else {
+        return refus(
+            StatusCode::NOT_FOUND,
+            "coffret_inconnu",
+            format!("l'album {cible} n'est pas le premier disque d'un coffret éclaté"),
+        );
+    };
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let mut absorbes = 0usize;
+    for id in c.absorbes() {
+        if let Err(e) = repo.absorber(cible, id) {
+            return AppError::internal(format!("regroupement du disque {id} : {e}"))
+                .into_response();
+        }
+        absorbes += 1;
+    }
+    // Le titre du coffret, marqueur retiré : l'album survivant s'appelait
+    // « … , Disc 1 » et porte désormais tout le coffret.
+    //
+    // ⚠️ Un titre non renommé n'annule PAS le regroupement : les pistes sont
+    // déjà réunies, et refuser ici laisserait la bibliothèque à mi-chemin.
+    // On le journalise, l'utilisateur peut renommer à la main.
+    {
+        let (p1, p2) = match state.backend.engine() {
+            Engine::Postgres => (
+                PostgresDialect.placeholder(1),
+                PostgresDialect.placeholder(2),
+            ),
+            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+        };
+        if let Err(e) = state.backend.execute(
+            &format!("UPDATE albums SET title = {p1} WHERE id = {p2}"),
+            &[&c.titre as &dyn ToSqlValue, &cible],
+        ) {
+            tracing::warn!(album = cible, erreur = %e, "coffret_titre_non_renomme");
+        }
+    }
+    state.event_bus.emit(
+        tune_core::event_types::EventType::LibraryUpdated.as_str(),
+        json!({ "source": "coffrets_regrouper", "cible": cible }),
+    );
+    tracing::info!(cible, absorbes, titre = %c.titre, "coffret_regroupe");
+    (
+        StatusCode::OK,
+        Json(json!({ "cible": cible, "absorbes": absorbes, "titre": c.titre })),
+    )
+        .into_response()
 }
