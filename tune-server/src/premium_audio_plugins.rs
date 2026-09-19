@@ -203,10 +203,35 @@ mod tests {
 
     /// Les greffons rangent leur état sous `TUNE_PLUGINS_DATA_DIR` ; sans lui,
     /// `setup_all` créerait `plugins/data` dans l'arbre de travail.
+    /// Fait supprimer `chemin` quand le processus se termine — même motif que
+    /// `tests/plugin_contracts.rs` : `Drop` ne s'exécute pas sur un `static`,
+    /// `atexit` se déclenche à la sortie de `libtest`, suite réussie ou non.
+    #[cfg(unix)]
+    fn menage_a_la_sortie_du_processus(chemin: std::path::PathBuf) {
+        static CHEMIN: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        extern "C" fn balayer() {
+            if let Some(chemin) = CHEMIN.get() {
+                let _ = std::fs::remove_dir_all(chemin);
+            }
+        }
+        if CHEMIN.set(chemin).is_ok() {
+            // Safety: `atexit` n'est appelé qu'une fois (`OnceLock::set` ne rend
+            // `Ok` qu'au premier passage) et `balayer` ne lit que `CHEMIN`.
+            unsafe {
+                libc::atexit(balayer);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    fn menage_a_la_sortie_du_processus(_chemin: std::path::PathBuf) {}
+
+    // Le dossier doit survivre à tous les tests du binaire, donc à toute portée.
+    // tmp-autorise: repris par `menage_a_la_sortie_du_processus`, pas abandonné.
     static DOSSIER_DE_DONNEES: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
     fn dossier_de_donnees_jetable() {
         DOSSIER_DE_DONNEES.get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
+            menage_a_la_sortie_du_processus(dir.path().to_path_buf());
             // Safety : seule écriture de ces variables dans ce processus, faite
             // avant la construction de l'AppState qui les lit (même motif que
             // tests/plugin_contracts.rs).
