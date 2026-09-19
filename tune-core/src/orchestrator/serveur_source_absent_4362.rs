@@ -151,6 +151,36 @@ pub(super) fn motif_du_refus(absent: &ServeurAbsent) -> String {
     )
 }
 
+/// #4362 (point 2) — ce qui est DIT quand une file enjambe des pistes dont le
+/// serveur est absent, au lieu de refuser tout « Tout lire » sur la première.
+///
+/// `absent` est le serveur de la PREMIÈRE piste enjambée : une file mixte en
+/// compte rarement plusieurs, et nommer le premier suffit à rendre le message
+/// actionnable. `reprise` est le titre de la piste qui part à la place.
+pub(super) fn motif_de_l_enjambee(
+    absent: &ServeurAbsent,
+    n: usize,
+    reprise: Option<&str>,
+) -> String {
+    let ou = match &absent.hote {
+        Some(h) => format!(" ({h})"),
+        None => String::new(),
+    };
+    let pistes = if n == 1 {
+        "1 piste sautée".to_string()
+    } else {
+        format!("{n} pistes sautées")
+    };
+    let suite = match reprise.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => format!(" Lecture reprise à « {t} »."),
+        None => String::new(),
+    };
+    format!(
+        "{pistes} : le serveur multimédia « {}{ou} » ne répond pas.{suite}",
+        absent.nom
+    )
+}
+
 /// Une durée en secondes, dite comme on la dit à voix haute.
 ///
 /// Trois paliers seulement : l'auditeur veut savoir si c'est « tout à l'heure »
@@ -246,6 +276,20 @@ mod tests {
             None,
             "sous le plafond de bascule en masse, la lecture reste permise"
         );
+    }
+
+    #[test]
+    fn l_enjambee_se_dit_en_nommant_le_serveur_et_la_reprise() {
+        let registre = vec![serveur("uuid:a", "Asset UPnP: Mac-Studio-6", 2 * 86_400)];
+        let absent = serveur_absent(&registre, "uuid:a").expect("absent");
+        let m = motif_de_l_enjambee(&absent, 3, Some("So What"));
+        assert!(m.starts_with("3 pistes sautées"), "{m}");
+        assert!(
+            m.contains("Asset UPnP: Mac-Studio-6") && m.contains("192.168.1.41"),
+            "{m}"
+        );
+        assert!(m.contains("« So What »"), "{m}");
+        assert!(motif_de_l_enjambee(&absent, 1, None).starts_with("1 piste sautée :"));
     }
 
     #[test]
