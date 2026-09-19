@@ -23,6 +23,7 @@
 //! | `local`                  | rendu             | aucun                  |
 //! | `all`                    | rendu             | tous ceux authentifies |
 //! | `qobuz` (un service)     | **vide**          | ce service             |
+//! | `streaming`              | **vide**          | tous ceux authentifies |
 //! | `local,qobuz`            | rendu             | ce service             |
 //! | valeur inconnue, ou vide | **vide**          | aucun                  |
 //!
@@ -83,6 +84,27 @@ pub(crate) const JETON_LOCAL: &str = "local";
 /// rendrait MOINS que `sources` absent.
 pub(crate) const JETON_TOUTES: &str = "all";
 
+/// « Tous les services, SANS le local » — le deuxieme temps de la recherche.
+///
+/// Bertrand, 19/09/2026 : « La recherche se fait en deux temps : local puis
+/// streaming. Il ne faut pas faire patienter l'utilisateur ».
+///
+/// L'ecran de recherche tient son local de `/library/search` (0,24 s mesurees
+/// sur le .18) et JETAIT celui de la reponse federee — il ne lit que
+/// `r.services`. Or `/search` sans `sources` refait tout le bloc local :
+/// 0,95 s de requetes SQL pour rien, a chaque frappe deboncee.
+///
+/// Il manquait le jeton pour le dire. Nommer les services un par un
+/// (`sources=qobuz,tidal,…`) l'aurait fait, mais obligeait le client a
+/// CONNAITRE la liste avant de chercher — une dependance a
+/// `/streaming/services` dont l'echec rendait zero resultat de streaming, sans
+/// un mot. Le serveur sait deja quels services sont authentifies ; c'est a lui
+/// de le dire.
+///
+/// ⚠️ Il ne remplace pas `all` : `all` rend le local EN PLUS. Les deux jetons
+/// disent deux choses differentes, et c'est voulu.
+pub(crate) const JETON_SERVICES: &str = "streaming";
+
 /// La lecture de `sources`, faite une seule fois.
 ///
 /// `None` = parametre absent = « Tous ». `Some(liste)` = selection explicite,
@@ -134,7 +156,75 @@ impl FiltreSources {
     pub(crate) fn service_demande(&self, nom: &str) -> bool {
         match &self.0 {
             None => true,
-            Some(liste) => liste.iter().any(|s| s == nom || s == JETON_TOUTES),
+            Some(liste) => liste
+                .iter()
+                .any(|s| s == nom || s == JETON_TOUTES || s == JETON_SERVICES),
         }
+    }
+}
+
+/// Le jeton `streaming` — le deuxieme temps de la recherche, sans le local.
+///
+/// Bertrand, 19/09/2026 : « La recherche se fait en deux temps : local puis
+/// streaming. Il ne faut pas faire patienter l'utilisateur ».
+#[cfg(test)]
+mod tests_jeton_services {
+    use super::*;
+
+    const SERVICES: [&str; 4] = ["qobuz", "tidal", "youtube", "bandcamp"];
+
+    #[test]
+    fn streaming_prend_tous_les_services() {
+        let f = FiltreSources::depuis(Some(JETON_SERVICES));
+        for s in SERVICES {
+            assert!(f.service_demande(s), "{s} devrait repondre");
+        }
+    }
+
+    #[test]
+    fn streaming_ne_rend_pas_le_local() {
+        // 🔴 C'est TOUTE la raison d'etre du jeton : l'ecran tient son local
+        // de `/library/search` et jetait celui de la federee. Si `streaming`
+        // ramenait le local, les 0,95 s qu'on veut economiser reviendraient.
+        assert!(!FiltreSources::depuis(Some(JETON_SERVICES)).local_demande());
+    }
+
+    #[test]
+    fn all_reste_ce_qu_il_etait_lui_rend_le_local() {
+        // Les deux jetons disent deux choses differentes, et `all` ne bouge
+        // pas : c'est le temoin de non-regression de #3226.
+        let f = FiltreSources::depuis(Some(JETON_TOUTES));
+        assert!(f.local_demande());
+        for s in SERVICES {
+            assert!(f.service_demande(s));
+        }
+    }
+
+    #[test]
+    fn les_autres_lignes_du_contrat_ne_bougent_pas() {
+        let absent = FiltreSources::depuis(None);
+        assert!(absent.local_demande());
+        assert!(absent.service_demande("qobuz"));
+
+        let local = FiltreSources::depuis(Some(JETON_LOCAL));
+        assert!(local.local_demande());
+        assert!(!local.service_demande("qobuz"));
+
+        let un = FiltreSources::depuis(Some("qobuz"));
+        assert!(!un.local_demande());
+        assert!(un.service_demande("qobuz"));
+        assert!(!un.service_demande("tidal"));
+
+        let inconnu = FiltreSources::depuis(Some("service-inexistant"));
+        assert!(!inconnu.local_demande());
+        assert!(!inconnu.service_demande("qobuz"));
+    }
+
+    #[test]
+    fn streaming_se_combine_avec_local_comme_les_autres() {
+        // `local,streaming` = tout : la regle generale, sans cas particulier.
+        let f = FiltreSources::depuis(Some("local, streaming"));
+        assert!(f.local_demande());
+        assert!(f.service_demande("qobuz"));
     }
 }

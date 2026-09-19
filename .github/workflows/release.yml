@@ -139,10 +139,13 @@ jobs:
           # ligne `features:` reprend donc `local-audio`. L'etape « Verify
           # local-audio is compiled into the ARM binary » plus bas la tient.
           #
-          # `aarch64-unknown-linux-musl` reste SANS `local-audio`, et ce n'est
-          # pas un oubli : `alsa-sys` code le lien DYNAMIQUE en dur dans son
-          # `build.rs` (`pkg_config…statik(false)`), ce qu'une cible musl
-          # statique refuse par construction. Residu ouvert : #3621.
+          # `aarch64-unknown-linux-musl` reprend `local-audio` depuis #3621 :
+          # Cross.toml compile une alsa-lib STATIQUE contre la chaine musl de
+          # l'image et `.cargo/config.toml` ajoute `-lc` en fin de lien. Le
+          # binaire reste sans NEEDED ni interpreteur (mesure sur Shrek le
+          # 19/09/2026) ; l'etape « Verify musl binary is statically linked »
+          # le tient toujours, et « Verify local-audio is compiled into the
+          # musl binary » lit le symbole `snd_pcm_open` dans l'ELF.
           #
           # Mesure sur les archives PUBLIEES,
           # `readelf -d tune-server | grep -c 'libasound\.so'` :
@@ -151,6 +154,9 @@ jobs:
           #   linux-x86_64                1          1          1
           #   linux-aarch64               0          0          1   <- #3620
           #   linux-aarch64-musl          0          0          0   <- #3621
+          #
+          # (La ligne musl restera a 0 : ALSA y est liee en STATIQUE, il n'y a
+          # pas de `libasound.so` a declarer — c'est le symbole qui fait foi.)
           #
           # Toute AUTRE fonctionnalite du `default` de tune-server doit
           # figurer dans chaque `features:` ci-dessous et dans chaque ligne
@@ -177,8 +183,8 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+            # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding"]}
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -288,6 +294,25 @@ jobs:
             exit 1
           fi
           echo "libasound.so déclaré en NEEDED : la sortie locale est bien dans l'artefact."
+
+      # Garde-fou #3621 : la sortie audio LOCALE doit être DANS le binaire musl
+      # livré. ALSA y est liée en STATIQUE, donc aucun `libasound.so` en NEEDED
+      # à compter : c'est le symbole `snd_pcm_open` — celui que cpal appelle
+      # pour ouvrir un DAC — qui fait foi. `readelf -s` lit la table des
+      # symboles d'un ELF arm64 sur un runner x86_64, et le profil `release`
+      # ne retire que les infos de débogage (`strip = "debuginfo"`), pas les
+      # symboles.
+      - name: Verify local-audio is compiled into the musl binary
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/tune-server"
+          SYM="$(readelf -sW "$BIN" 2>/dev/null | grep -c ' snd_pcm_open$' || true)"
+          if [ "${SYM:-0}" -eq 0 ]; then
+            echo "::error::Le binaire linux-aarch64-musl ne porte pas snd_pcm_open : la sortie audio locale est ABSENTE de l'artefact publié (#3621)."
+            exit 1
+          fi
+          echo "snd_pcm_open présent dans l'ELF : la sortie locale est bien dans l'artefact musl."
 
       # Garde-fou #1288 : la cible musl n'a d'intérêt que si le binaire est
       # RÉELLEMENT statique (NAS à vieille userland, Alpine ARM). Une dépendance

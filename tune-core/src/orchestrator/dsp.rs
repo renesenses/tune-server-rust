@@ -805,9 +805,20 @@ impl PlaybackOrchestrator {
             // Pas de chemin local vivant. Reste le redémarrage — mais uniquement si
             // quelque chose joue : sinon la prochaine lecture rebâtira l'EQ toute
             // seule, et redémarrer un flux inexistant n'a aucun sens.
-            let joue = self.playback.get_state(zone_id).await.now_playing.is_some();
-            chemin = if !joue {
+            let np = self.playback.get_state(zone_id).await.now_playing;
+            chemin = if np.is_none() {
                 "rien_ne_joue"
+            } else if np
+                .as_ref()
+                .is_some_and(|np| self.flux_porte_deja_ce_traitement(zone_id, np))
+            {
+                // #4407 — le flux qui joue porte déjà exactement ce traitement :
+                // le refabriquer rendrait les mêmes octets et couperait le son
+                // (2,787 s sur une radio DLNA, Marantz ND8006). Jumeau de la
+                // garde PURE de #4004, mais comparé au flux SERVI, pas au
+                // réglage en base : une relance abandonnée laisse l'ancien
+                // traitement dans le flux, et la comparaison le voit.
+                "flux_conserve_signal_identique"
             } else if self.schedule_eq_replay(zone_id) {
                 "replay_programme"
             } else {
@@ -828,7 +839,88 @@ impl PlaybackOrchestrator {
         if let Some(ref bus) = self.event_bus {
             bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
         }
-        applique_a_chaud
+        // Un flux conservé parce qu'il porte déjà ce traitement : le son EST
+        // conforme au réglage, immédiatement — comme la bascule PURE sans
+        // effet (#4004).
+        applique_a_chaud || chemin == "flux_conserve_signal_identique"
+    }
+
+    /// Combien de flux résolus une zone garde en mémoire (#4407) : celui qui
+    /// joue, celui qu'on pré-arme pour l'enchaînement, et de la marge.
+    pub(crate) const FLUX_TRAITES_PAR_ZONE: usize = 4;
+
+    /// L'empreinte du traitement qu'un flux bâti MAINTENANT pour cette zone
+    /// porterait dans ses octets (#4407). Mêmes lectures que
+    /// [`Self::traitement_que_pure_gouverne`], mais les VALEURS et non les
+    /// noms : deux profils d'égaliseur différents donnent deux empreintes, un
+    /// profil sans effet (`EqProcessor::is_enabled() == false`, grave,
+    /// médium, aigu et bandes compris) n'en laisse aucune — c'est ce qui
+    /// distingue « `bandes=0` » d'« égaliseur inactif », que JP Robbe a
+    /// rappelé sur le ticket. PURE fait rendre `None` aux quatre chargeurs.
+    ///
+    /// Approximation dans le sens sûr : la radio ne cuit que l'égaliseur, le
+    /// bras fichier ne cuit pas le crossfeed — une empreinte qui bouge sur ces
+    /// étages relance un flux qui n'en avait pas besoin, jamais l'inverse.
+    pub(super) fn empreinte_du_traitement(&self, zone_id: i64, track_id: Option<i64>) -> String {
+        if self.zone_audiophile(zone_id) {
+            return "pure".to_string();
+        }
+        let eq = self
+            .eq_profile_configure(zone_id)
+            .filter(|p| crate::audio::eq::EqProcessor::new(p, 44100, 2).is_enabled())
+            .map(|p| serde_json::to_string(&p).unwrap_or_else(|_| format!("{p:?}")))
+            .unwrap_or_default();
+        let ir = self
+            .chemin_ir_configure(zone_id)
+            .filter(|p| std::path::Path::new(p).exists())
+            .unwrap_or_default();
+        let crossfeed = self
+            .crossfeed_configure(zone_id)
+            .map(|(amount, delay_ms)| format!("{amount}:{delay_ms}"))
+            .unwrap_or_default();
+        let replaygain = track_id
+            .map(|tid| crate::audio::replaygain::playback_factor(&self.db, tid))
+            .filter(|f| (f - 1.0).abs() > 1e-6)
+            .map(|f| f.to_bits().to_string())
+            .unwrap_or_default();
+        format!("eq={eq}\u{1f}ir={ir}\u{1f}cf={crossfeed}\u{1f}rg={replaygain}")
+    }
+
+    /// Retenir le traitement avec lequel le flux `stream_id` a été résolu.
+    pub(super) fn noter_traitement_du_flux(
+        &self,
+        zone_id: i64,
+        stream_id: &str,
+        empreinte: String,
+    ) {
+        let mut flux = self.traitement_des_flux.lock().unwrap();
+        let notes = flux.entry(zone_id).or_default();
+        notes.retain(|(sid, _)| sid != stream_id);
+        notes.push((stream_id.to_string(), empreinte));
+        let trop = notes.len().saturating_sub(Self::FLUX_TRAITES_PAR_ZONE);
+        notes.drain(..trop);
+    }
+
+    /// Le flux que la zone JOUE porte-t-il déjà le traitement qu'elle demande ?
+    ///
+    /// Inconnu — pas de `stream_id` (URL directe, fichier déposé), flux résolu
+    /// avant le démarrage du serveur ou sorti de la mémoire — ⇒ `false` : on
+    /// relance, comme avant.
+    pub(super) fn flux_porte_deja_ce_traitement(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> bool {
+        let Some(ref sid) = np.stream_id else {
+            return false;
+        };
+        let servi = self
+            .traitement_des_flux
+            .lock()
+            .unwrap()
+            .get(&zone_id)
+            .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
+        servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.track_id))
     }
 
     /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).
@@ -1165,6 +1257,18 @@ impl PlaybackOrchestrator {
             // toute façon, et bâtir des filtres pour un format inconnu donnerait
             // des coefficients faux. Même garde que les deux jumelles.
             let Some((taux, canaux)) = local_output.current_format() else {
+                // #4176 — « rien en cours » n'est pas la seule lecture d'un
+                // format absent : le fil peut être LANCÉ et attendre encore son
+                // premier octet (jusqu'à 10 s sur une radio). Il lira
+                // `pure_bypass` à l'ouverture : on le pose, on ne relance rien
+                // — la relance ouvrait le périphérique exclusif une seconde
+                // fois et perdait la course (`0x8889000A`, zone arrêtée).
+                if local_output.flux_en_demarrage() {
+                    let pure = self.zone_audiophile(zone_id);
+                    local_output.set_pure_bypass(pure);
+                    info!(zone_id, pure, "zone_pure_reportee_au_flux_qui_demarre");
+                    return true;
+                }
                 return false;
             };
 

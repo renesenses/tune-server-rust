@@ -88,6 +88,7 @@ async fn le_decodeur_radio_rend_le_pcm_du_mp3_servi() {
             session_pour_le_decodeur,
             None,
             Some(levels_tx),
+            false,
         )
     });
 
@@ -149,7 +150,15 @@ async fn la_fin_du_flux_amont_reconnecte_la_meme_session() {
     let data_ready = Arc::new(tokio::sync::Notify::new());
     let session_pour_le_decodeur = session.clone();
     let decodeur = tokio::task::spawn_blocking(move || {
-        decode_radio_stream_to_pcm(url, tx, data_ready, session_pour_le_decodeur, None, None)
+        decode_radio_stream_to_pcm(
+            url,
+            tx,
+            data_ready,
+            session_pour_le_decodeur,
+            None,
+            None,
+            false,
+        )
     });
 
     // On draine tout ce qui vient, en comptant, jusqu'à ce que la station ait
@@ -220,7 +229,15 @@ async fn une_page_web_a_la_reconnexion_est_dite_sans_attendre() {
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
     let session_pour_le_decodeur = session.clone();
     let decodeur = tokio::task::spawn_blocking(move || {
-        decode_radio_stream_to_pcm(url, tx, data_ready, session_pour_le_decodeur, None, None)
+        decode_radio_stream_to_pcm(
+            url,
+            tx,
+            data_ready,
+            session_pour_le_decodeur,
+            None,
+            None,
+            false,
+        )
     });
 
     let verdict = tokio::time::timeout(Duration::from_secs(20), decodeur)

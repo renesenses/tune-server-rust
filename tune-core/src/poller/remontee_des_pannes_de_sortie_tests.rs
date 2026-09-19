@@ -246,3 +246,44 @@ async fn un_echec_deja_remonte_ne_recoupe_pas_la_lecture_suivante() {
         "la piste relancée ne doit pas mourir de l'erreur de la précédente"
     );
 }
+
+/// #3973 — le refus « bit-perfect strict » posé par l'ouverture cpal
+/// (`RefusDOuverture::BitPerfectStrict`) arrive en SENTINELLE : il doit
+/// partir à l'écran avec son `code` stable et ses deux fréquences — le client
+/// compose la phrase dans sa langue —, la phrase française en `error`, et
+/// `fatal`. Sans la branche de `tick()`, l'écran recevrait la sentinelle
+/// brute « bitperfect_strict_refused:192000:96000 ».
+#[tokio::test]
+async fn un_refus_bitperfect_strict_part_avec_son_code_et_ses_frequences_3973() {
+    let mut banc = Banc::monter(Some("bitperfect_strict_refused:192000:96000")).await;
+    banc.un_tick().await;
+    let mut charge = None;
+    while let Ok(ev) = banc.recu.try_recv() {
+        if ev.event_type == "zone.playback_error" {
+            charge = Some(ev.data.clone());
+        }
+    }
+    let charge = charge.expect("le refus doit atteindre l'écran");
+    assert_eq!(
+        charge.get("code").and_then(|v| v.as_str()),
+        Some("bitperfect_strict_refused"),
+        "le refus doit porter son code stable : {charge}"
+    );
+    assert_eq!(
+        charge.get("requested_hz").and_then(|v| v.as_u64()),
+        Some(192_000)
+    );
+    assert_eq!(
+        charge.get("device_hz").and_then(|v| v.as_u64()),
+        Some(96_000)
+    );
+    assert_eq!(charge.get("fatal").and_then(|v| v.as_bool()), Some(true));
+    let texte = charge
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        texte.contains("192 kHz") && texte.contains("96 kHz"),
+        "la phrase de repli doit nommer les deux fréquences : {texte}"
+    );
+}

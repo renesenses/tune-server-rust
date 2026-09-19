@@ -1343,15 +1343,18 @@ impl PlaybackOrchestrator {
         // certainement PAS été exécutée. Sur un timeout, elle a pu atteindre
         // un renderer lent : détruire le flux garantit alors qu'il tombe sur
         // un 404 en allant le chercher, et affiche « chanson non trouvée ».
-        // On la laisse vivre — la GC des sessions périmées la ramassera si
-        // personne ne la consomme.
+        // Même règle pour un `Play` ACQUITTÉ dont l'URI reste vide (#3580) :
+        // « pas encore exécuté » n'est pas « jamais reçu », et l'ampli qui
+        // finit de se réveiller après la borne doit trouver le flux, pas un
+        // 404. On la laisse vivre — la GC des sessions périmées la ramassera
+        // si personne ne la consomme (la radio jamais tirée comprise).
         let may_have_landed = output_error.as_deref().is_some_and(command_may_have_landed);
         if let Some(ref sid) = resolved.stream_id {
             if may_have_landed {
                 info!(
                     zone_id = req.zone_id,
                     stream_id = %sid,
-                    "output_send_timed_out_keeping_stream_session"
+                    "output_send_uncertain_keeping_stream_session"
                 );
             } else {
                 self.streamer.remove_session(sid).await;
@@ -1593,6 +1596,12 @@ impl PlaybackOrchestrator {
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    // #3973 — « bit-perfect strict » de la zone, posé à chaque
+                    // lecture comme PURE : c'est lui que `play_url` transmet à
+                    // l'ouverture cpal (`DemandeDOuverture::strict_bitperfect`).
+                    local_output.set_strict_bitperfect(
+                        crate::audio::bitperfect_strict::zone_enabled(&self.db, zone_id),
+                    );
                     // ReplayGain, applied by the output itself for a local DAC.
                     // A PURE zone is left strictly alone: applying a gain would
                     // multiply every sample and the path would no longer be
@@ -2207,7 +2216,29 @@ impl PlaybackOrchestrator {
                 Some(sid) => !self.streamer.session_alive(sid).await,
                 None => false,
             };
-            let decision = reprise_de_session(est_radio, rejouable, pause_longue, session_morte);
+            // #4177 — une sortie exclusive Windows a RENDU son périphérique à
+            // la pause : reprendre « sur place » ne rouvrirait rien. Elle le
+            // dit elle-même ; toutes les autres sorties répondent `false`.
+            let peripherique_rendu = match device_id {
+                Some(did) => match { self.outputs.lock().await.get(did) } {
+                    Some(sortie) => sortie.lock().await.device_released_on_pause(),
+                    None => false,
+                },
+                None => false,
+            };
+            if peripherique_rendu {
+                info!(
+                    zone_id,
+                    position_ms, "resume_after_exclusive_device_released"
+                );
+            }
+            let decision = reprise_de_session(
+                est_radio,
+                rejouable,
+                pause_longue,
+                session_morte,
+                peripherique_rendu,
+            );
             if decision != RepriseDeSession::SurPlace {
                 let did = device_id.map(str::to_string).or_else(|| {
                     ZoneRepo::with_backend(self.db.clone())

@@ -67,9 +67,48 @@
 # l'image : `pkg-config` refuse par defaut de repondre en compilation croisee,
 # et un `cross build` local doit se comporter comme la CI.
 #
-# La cible **musl** n'est deliberement PAS traitee : voir l'exemption motivee
-# de `tune-server/tests/features_livrees_3355.rs` — `alsa-sys` code en dur un
-# lien DYNAMIQUE, incompatible avec la garantie statique de cette cible.
+# ## Depuis #3621 : une alsa-lib STATIQUE pour la cible musl
+#
+# Le « lien dynamique code en dur » d'`alsa-sys` n'en etait pas un. Son
+# `build.rs` emet `cargo:rustc-link-lib=asound` — SANS `static=`, mais sans
+# `dylib=` non plus. Or la cible musl lie en `-static` : le linker n'y cherche
+# que des archives, et une `libasound.a` posee dans le sysroot est prise telle
+# quelle. MESURE le 19/09/2026 sur Shrek (chaine musl.cc 11.2.1, alsa-lib
+# 1.2.14 configuree `--host=aarch64-linux-musl --enable-static
+# --disable-shared`) : `cargo build --target aarch64-unknown-linux-musl
+# -p tune-server --no-default-features --features <ligne musl de release.yml>,
+# local-audio` PASSE, et le binaire produit porte `NEEDED: 0`, `INTERP: 0`,
+# `strings | grep -c cpal` = 1202, `nm | grep ' T snd_pcm_open$'` = 1.
+#
+# Aucun fork, aucune surcharge de script de build : il suffit que le
+# conteneur `cross` porte `alsa.pc` + `libasound.a` POUR LA CIBLE, et que
+# `pkg-config` accepte de repondre en compilation croisee. C'est ce que fait
+# le `pre-build` ci-dessous : il compile alsa-lib contre la chaine musl de
+# l'image (`aarch64-linux-musl-gcc`, deja dans le PATH) et l'installe sous
+# `/usr/local/alsa-musl-aarch64`, prefixe prive qui ne peut pas etre confondu
+# avec une bibliotheque de l'hote. `--datarootdir=/usr/share` fixe le chemin
+# que la bibliotheque cherchera a l'EXECUTION (`/usr/share/alsa/alsa.conf`,
+# l'emplacement standard ; `ALSA_CONFIG_PATH` le surcharge). L'archive est
+# verifiee par son SHA-256 : un `pre-build` telecharge sans controle est une
+# porte ouverte dans la chaine de livraison.
+#
+# Le complement indispensable est dans `.cargo/config.toml` : `-lc` en FIN de
+# ligne de lien pour cette cible. Sans lui, la libc statique est parcourue
+# AVANT `libasound.a` et le lien echoue sur `strncasecmp`, `strtod`,
+# `scandir`, `semop`… (mesure, meme jour).
+#
+# Ce que ce fichier ne prouve PAS : qu'un DAC s'ouvre sur un NAS reel a
+# userland musl. Une alsa-lib statique n'a pas de `dlopen`, donc pas de
+# greffons externes ; `hw:`, `plughw:`, `plug`, le reechantillonnage integre
+# et `dmix` sont compiles DEDANS, et c'est le chemin qu'emprunte cpal.
+[target.aarch64-unknown-linux-musl]
+pre-build = [
+    "apt-get update && apt-get --assume-yes --no-install-recommends install ca-certificates curl bzip2 make",
+    "curl -fsSL -o /tmp/alsa-lib.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.14.tar.bz2",
+    "echo 'be9c88a0b3604367dd74167a2b754a35e142f670292ae47a2fdef27a2ee97a32  /tmp/alsa-lib.tar.bz2' | sha256sum -c -",
+    "mkdir -p /tmp/alsa-lib && tar -xjf /tmp/alsa-lib.tar.bz2 -C /tmp/alsa-lib --strip-components=1",
+    "cd /tmp/alsa-lib && ./configure --host=aarch64-linux-musl --prefix=/usr/local/alsa-musl-aarch64 --datarootdir=/usr/share --enable-static --disable-shared --disable-python --without-debug --disable-topology --disable-ucm CFLAGS='-O2 -fPIE' && make -j\"$(nproc)\" && make install",
+]
 [target.aarch64-unknown-linux-gnu]
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
@@ -81,6 +120,9 @@ passthrough = [
 ]
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
+    # `alsa.pc` + `libasound.a` de la CIBLE, poses par le `pre-build` (#3621).
+    "PKG_CONFIG_ALLOW_CROSS=1",
+    "PKG_CONFIG_PATH=/usr/local/alsa-musl-aarch64/lib/pkgconfig",
     "LIBOPUS_STATIC=1",
     "LIBOPUS_NO_PKG=1",
     # Le CMakeLists de la libopus vendored déclare un `cmake_minimum_required`

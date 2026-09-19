@@ -172,14 +172,23 @@ fn les_chemins_de_fin_de_piste_drainent_le_convolveur() {
          puis drainer sa fin de piste"
     );
 
-    let preparation_windows = prod
-        .split("fn prepare_windows_exclusive_pcm(")
+    // REF-10 (#2219) : la préparation flottante Windows d'AVANT
+    // (`prepare_windows_exclusive_pcm`) n'avait plus d'appelant de production
+    // et a été retirée. La route flottante qui part au pilote est la route
+    // traitée d'ASIO : l'étage de R1 monté sur la frontière PCM commune. La
+    // garde suit donc CE site — le bras monte `EtageDeConversion` avec un
+    // `LocalPcmProcessor` — et la frontière commune doit passer par le DSP
+    // (`preparation_locale`, ci-dessus). Même propriété, sur le code vivant.
+    let route_flottante_asio = bras_asio
+        .split("EtageDeConversion {")
         .nth(1)
-        .and_then(|s| s.split("fn finish_windows_exclusive_probe(").next())
-        .expect("la préparation Windows partagée doit rester identifiable");
+        .and_then(|s| s.split("needs_resample").next())
+        .expect("la route flottante d'ASIO doit monter l'étage de R1");
     assert!(
-        preparation_windows.contains("apply_local_dsp("),
-        "la préparation Windows partagée ne passe plus par le DSP"
+        route_flottante_asio.contains("pcm: LocalPcmProcessor {")
+            && preparation_locale.contains("apply_local_dsp("),
+        "la préparation Windows flottante ne passe plus par le DSP : la route traitée \
+         d'ASIO doit monter l'étage de R1 sur la frontière PCM commune (REF-10, #2219)"
     );
 
     let preparation_windows_native = prod
