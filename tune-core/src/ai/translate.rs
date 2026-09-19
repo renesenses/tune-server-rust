@@ -32,6 +32,13 @@ pub async fn translate_query(settings: &SettingsRepo, query: &str) -> Option<Str
     if q.is_empty() {
         return None;
     }
+    // #3836 — un NOM DE GENRE se traduit sans clé : « Rock progressif » et
+    // « Progressive rock » doivent partir vers la tour texte sous le MÊME
+    // texte, sinon deux saisies d'un même genre rendent deux listes.
+    if let Some(genre) = nom_de_genre_en_anglais(q) {
+        debug!(query = q, translated = genre, "ambiance_translate_genre");
+        return Some(genre.to_string());
+    }
     if let Some(hit) = cache_get(settings, q) {
         debug!(query = q, translated = %hit, "ambiance_translate_cache_hit");
         return Some(hit);
@@ -48,6 +55,88 @@ pub async fn translate_query(settings: &SettingsRepo, query: &str) -> Option<Str
     cache_put(settings, q, &t);
     debug!(query = q, translated = %t, "ambiance_translate_ok");
     Some(t)
+}
+
+/// Noms de genre français (repliés : minuscules, sans accents, espaces
+/// simples, tirets en espaces) → graphie anglaise de la hiérarchie des genres
+/// (`library::genre_tree`). Seuls les noms dont la forme française DIFFÈRE
+/// sont listés ; un nom déjà anglais passe par `genre_tree::nom_canonique`.
+///
+/// Correspondance de la requête ENTIÈRE, jamais d'un fragment : « jazz doux
+/// pour le soir » n'est pas un nom de genre et garde son chemin (clé IA ou
+/// requête brute). Un mot qui est aussi une humeur (« romantique ») n'y est
+/// pas : le remplacer par un genre changerait le sens de la recherche.
+const GENRES_EN_FRANCAIS: &[(&str, &str)] = &[
+    ("rock progressif", "Progressive Rock"),
+    ("rock progressive", "Progressive Rock"),
+    ("rock prog", "Progressive Rock"),
+    ("rock alternatif", "Alternative Rock"),
+    ("rock independant", "Indie Rock"),
+    ("rock inde", "Indie Rock"),
+    ("rock classique", "Classic Rock"),
+    ("rock psychedelique", "Psychedelic Rock"),
+    ("rock garage", "Garage Rock"),
+    ("post rock", "Post-Rock"),
+    ("metal progressif", "Progressive Metal"),
+    ("metal symphonique", "Symphonic Metal"),
+    ("jazz vocal", "Vocal Jazz"),
+    ("jazz latin", "Latin Jazz"),
+    ("jazz manouche", "Gypsy Jazz"),
+    ("musique electronique", "Electronic"),
+    ("electronique", "Electronic"),
+    ("musique classique", "Classical"),
+    ("classique", "Classical"),
+    ("musique baroque", "Baroque"),
+    ("musique contemporaine", "Contemporary Classical"),
+    ("opera", "Opera"),
+    ("musique de chambre", "Chamber Music"),
+    ("musique orchestrale", "Orchestral"),
+    ("musique chorale", "Choral"),
+    ("minimalisme", "Minimalism"),
+    ("musique du monde", "World"),
+    ("musiques du monde", "World"),
+    ("bande originale", "Soundtrack"),
+    ("musique de film", "Film Score"),
+    ("musique de jeu video", "Video Game"),
+    ("comedie musicale", "Musical"),
+    ("chanson francaise", "French Chanson"),
+    ("celtique", "Celtic"),
+    ("folk independant", "Indie Folk"),
+    ("pop independante", "Indie Pop"),
+    ("blues electrique", "Electric Blues"),
+    ("musique arabe", "Arabic"),
+    ("musique classique indienne", "Indian Classical"),
+    ("rai", "Raï"),
+];
+
+/// Replie une saisie pour la comparer au glossaire : minuscules, accents
+/// retirés, tirets et soulignés en espaces, espaces simples.
+fn replier(q: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let sans_accents: String = q
+        .nfkd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect();
+    sans_accents
+        .to_lowercase()
+        .replace(['-', '_'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Le nom anglais canonique d'une requête qui est EXACTEMENT un nom de genre,
+/// français ou anglais, quelle que soit sa casse. `None` pour tout le reste.
+pub fn nom_de_genre_en_anglais(q: &str) -> Option<&'static str> {
+    if let Some(nom) = crate::library::genre_tree::nom_canonique(q) {
+        return Some(nom);
+    }
+    let replie = replier(q);
+    GENRES_EN_FRANCAIS
+        .iter()
+        .find(|(fr, _)| *fr == replie)
+        .map(|(_, en)| *en)
+        .or_else(|| crate::library::genre_tree::nom_canonique(&replie))
 }
 
 /// Les cles API que la traduction sait employer, dans l'ordre de preference :
@@ -258,6 +347,47 @@ mod tests {
             assert!(cle_disponible(&s), "cle posee sur {nom}");
             s.delete(nom).unwrap();
             assert!(!cle_disponible(&s), "cle retiree de {nom}");
+        }
+    }
+
+    /// #3836 — JeromeQ, fil 1751 : « Progressive rock » et « Rock progressif »
+    /// rendaient deux listes, parce que la seconde partait BRUTE (pas de clé)
+    /// et que la tour texte distingue même la casse. Un nom de genre doit
+    /// arriver au CLAP sous un seul et même texte, avec ou sans clé.
+    #[tokio::test]
+    async fn deux_saisies_du_meme_genre_partent_sous_le_meme_texte_sans_cle() {
+        let s = repo();
+        assert!(!cle_disponible(&s), "le témoin exige l'absence de clé");
+        let attendu = Some("Progressive Rock".to_string());
+        for saisie in [
+            "Progressive rock",
+            "progressive rock",
+            "Rock progressif",
+            "rock progressive",
+            "  ROCK   Progressif ",
+        ] {
+            assert_eq!(translate_query(&s, saisie).await, attendu, "{saisie:?}");
+        }
+        assert_eq!(
+            translate_query(&s, "Musique classique").await.as_deref(),
+            Some("Classical")
+        );
+        assert_eq!(translate_query(&s, "opéra").await.as_deref(), Some("Opera"));
+        assert_eq!(translate_query(&s, "Raï").await.as_deref(), Some("Raï"));
+    }
+
+    /// Contre-épreuve : le glossaire ne touche ni une phrase libre qui
+    /// CONTIENT un genre, ni un mot d'humeur, ni un genre inconnu.
+    #[tokio::test]
+    async fn une_phrase_libre_n_est_pas_un_nom_de_genre() {
+        let s = repo();
+        for saisie in [
+            "rock progressif des années 70",
+            "romantique",
+            "jazz doux pour le soir",
+            "zouk",
+        ] {
+            assert_eq!(translate_query(&s, saisie).await, None, "{saisie:?}");
         }
     }
 
