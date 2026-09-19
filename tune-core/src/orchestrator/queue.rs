@@ -548,12 +548,21 @@ impl PlaybackOrchestrator {
             // from the library row via `from_track` (single source of the
             // source-over-output bit-depth rule); display fields come from the
             // queue-entry cache and source is pinned local.
+            // #4446 — le condensat TEL QUEL, comme au démarrage
+            // (`transport.rs`, `habillage.cover_path`). Passé par
+            // `resolve_cover_url`, il devenait `http://<ip-lan>:8888/…` : le
+            // client web tient toute URL absolue pour une pochette distante,
+            // l'envoie au relais, et la garde d'adresse de #4260 la refuse
+            // (`artwork_proxy_hote_refuse`) — pochette grise dès le deuxième
+            // morceau enchaîné. Les renderers réseau reçoivent leur URL
+            // absolue par `PlayRequest.cover_url` → `resolve_cover_url`, ce
+            // chemin-ci ne leur sert pas.
             crate::playback::NowPlaying {
                 track_id: Some(track_id),
                 title: entry.title.clone().unwrap_or_default(),
                 artist_name: entry.artist_name.clone(),
                 album_title: entry.album_title.clone(),
-                cover_path: self.resolve_cover_url(cover_path.as_deref()),
+                cover_path,
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
@@ -584,7 +593,8 @@ impl PlaybackOrchestrator {
                 title: entry.title.clone().unwrap_or_default(),
                 artist_name: entry.artist_name.clone(),
                 album_title: entry.album_title.clone(),
-                cover_path: self.resolve_cover_url(entry.cover_path.as_deref()),
+                // #4446 — même règle : la valeur de la file, non résolue.
+                cover_path: entry.cover_path.clone(),
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source,
                 source_id: entry.source_id.clone(),
