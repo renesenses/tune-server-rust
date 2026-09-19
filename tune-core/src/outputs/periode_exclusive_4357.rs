@@ -63,13 +63,16 @@ mod tests {
     /// ne retient plus la minimale en premier.
     #[test]
     fn l_ouverture_exclusive_passe_par_la_regle() {
-        const SOURCE: &str = include_str!("wasapi_exclusive.rs");
+        // Comparé sans blancs : rustfmt coupe librement un appel long.
+        let source: String = include_str!("wasapi_exclusive.rs")
+            .split_whitespace()
+            .collect();
         assert!(
-            SOURCE.contains("periode_exclusive_100ns(default_period, min_period)"),
+            source.contains("periode_exclusive_100ns(default_period,min_period)"),
             "wasapi_exclusive.rs doit choisir sa période par periode_exclusive_100ns"
         );
         assert!(
-            !SOURCE.contains("let period = if min_period > 0 {"),
+            !source.contains("letperiod=ifmin_period>0{"),
             "l'ancienne règle « minimale d'abord » est encore présente"
         );
     }
