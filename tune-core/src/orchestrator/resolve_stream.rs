@@ -114,7 +114,8 @@ impl PlaybackOrchestrator {
         );
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None, None)
+                // Serveur de médias : aucune zone, donc aucun réglage strict (#3973).
+                decode_radio_stream_to_pcm(radio_url, tx, data_ready, session, None, None, false)
             })
             .await;
 
@@ -448,7 +449,7 @@ impl PlaybackOrchestrator {
             let upstream_url = stream_data.url.clone();
             let codec = stream_data.quality.codec.to_lowercase();
             let (sr, bd, wav_info) =
-                self.decider_le_wav_de_sortie(req, stream_data, is_local_stream);
+                self.decider_le_wav_de_sortie(req, stream_data, is_local_stream)?;
 
             Self::verifier_le_fichier_dash(&upstream_url)?;
 
@@ -479,12 +480,12 @@ impl PlaybackOrchestrator {
     /// Premier temps : le WAV que la sortie recevra — cadence plafonnée au
     /// `max_sample_rate` de la zone, profondeur 32 bits en local ou plafonnée
     /// en OAAT — et la description de session qui en découle.
-    fn decider_le_wav_de_sortie(
+    pub(super) fn decider_le_wav_de_sortie(
         &self,
         req: &PlayRequest,
         stream_data: &crate::streaming::StreamUrl,
         is_local_stream: bool,
-    ) -> (u32, u16, StreamInfo) {
+    ) -> Result<(u32, u16, StreamInfo), String> {
         // Cap the WAV rate to the zone's max_sample_rate (e.g. an OAAT
         // endpoint whose DAC tops out at 96k). resolve_local_track applies
         // this cap for local files; the streaming path historically did NOT,
@@ -501,6 +502,23 @@ impl PlaybackOrchestrator {
         let mut sr = stream_data.quality.sample_rate;
         if let Some(max_sr) = zone_max_sample_rate {
             if sr > max_sr {
+                // #3973 — même plafond de zone, même règle bit-perfect que
+                // `resolve_local` : strict ⇒ refuser plutôt que plafonner.
+                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                    sr,
+                    max_sr,
+                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+                )
+                .refus()
+                {
+                    warn!(
+                        zone_id = req.zone_id,
+                        source_rate = sr,
+                        max_rate = max_sr,
+                        "streaming_zone_max_sample_rate_bitperfect_strict_refused"
+                    );
+                    return Err(refus.sentinelle());
+                }
                 info!(
                     zone_id = req.zone_id,
                     source_rate = sr,
@@ -529,7 +547,7 @@ impl PlaybackOrchestrator {
             duration_ms: None,
             ..Default::default()
         };
-        (sr, bd, wav_info)
+        Ok((sr, bd, wav_info))
     }
 
     /// Deuxième temps : un fMP4 DASH déjà sur disque doit encore y être ;

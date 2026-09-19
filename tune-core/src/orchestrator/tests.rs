@@ -313,6 +313,7 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
             session,
             None,
             None,
+            false,
         )
     })
     .await
@@ -8196,5 +8197,169 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     assert_eq!(
         titre_historise, "Quartet No. 10",
         "« Récemment joué » ne doit plus aligner des cartes « Episode »"
+    );
+}
+
+// ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
+
+/// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision
+/// se prend sur la ligne `tracks`, comme pour `piste_3234`).
+fn piste_192k_3973(orch: &PlaybackOrchestrator) {
+    orch.db
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (1, 'Piste 192k', 1, 1, '/m/3973/piste.flac', 'flac', 300000, 192000, 24, 2)",
+            &[],
+        )
+        .unwrap();
+}
+
+/// Site « plafond de zone » (`decider_le_format_de_sortie`) : 192 kHz sur une
+/// zone plafonnée à 96 kHz. Par défaut, plafonné — la conversion est jouée ;
+/// en bit-perfect strict, la résolution REFUSE avec la sentinelle qui nomme
+/// les deux fréquences, au lieu de transcoder vers le plafond.
+#[tokio::test]
+async fn plafond_de_zone_3973_strict_refuse_au_lieu_de_plafonner() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("DAC 96k", Some("dlna"), Some("uuid:dac-3973"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(96_000)).unwrap();
+    piste_192k_3973(&orch);
+    let req = requete_locale_3234(zone_id, 1);
+
+    let defaut = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(defaut.out_sr, 96_000, "sans strict : plafonné, comme avant");
+
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    let refus = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .map(|f| f.out_sr);
+    assert_eq!(
+        refus,
+        Err("bitperfect_strict_refused:192000:96000".to_string()),
+        "bit-perfect strict : la zone plafonnée doit refuser le 192 kHz, pas le transcoder en 96 kHz"
+    );
+}
+
+/// Site « plafond de zone », bras DoP (`anticiper_le_dop`) : un DSD64 servi en
+/// DoP demande 176,4 kHz ; zone locale plafonnée à 88,2 kHz. Par défaut le DoP
+/// est abandonné pour du PCM plafonné ; en strict, refus nommé.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn dop_au_dela_du_plafond_3973_strict_refuse() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("DAC DoP", Some("local"), Some("local:dac-3973"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(88_200)).unwrap();
+    zones.update_dsd_mode(zone_id, "dop").unwrap();
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dsd/ref_dsd64_stereo.dsf"
+    );
+    orch.db
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (1, 'DSD64', 1, 1, ?, 'dsf', 1000, 2822400, 1, 2)",
+            &[&chemin.to_string() as &dyn crate::db::backend::ToSqlValue],
+        )
+        .unwrap();
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some("local:dac-3973".into());
+
+    let defaut = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .map(|f| f.out_sr);
+    assert!(
+        !matches!(&defaut, Err(e) if e.contains("bitperfect_strict_refused")),
+        "sans strict, aucun refus : {defaut:?}"
+    );
+
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    let refus = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .map(|f| f.out_sr);
+    assert_eq!(
+        refus,
+        Err("bitperfect_strict_refused:176400:88200".to_string()),
+        "bit-perfect strict : le DoP 176,4 kHz au-delà du plafond doit être refusé, pas converti en PCM"
+    );
+}
+
+/// Site « plafond de zone », chemin des services (`decider_le_wav_de_sortie`,
+/// Qobuz/Tidal) : le même plafond, la même règle.
+#[tokio::test]
+async fn plafond_de_zone_des_services_3973_strict_refuse() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("OAAT 96k", Some("oaat"), Some("oaat:3973"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(96_000)).unwrap();
+    let flux = crate::streaming::StreamUrl {
+        url: "https://exemple.invalid/piste.flac".into(),
+        mime_type: "audio/flac".into(),
+        quality: crate::streaming::StreamQuality {
+            codec: "flac".into(),
+            sample_rate: 192_000,
+            bit_depth: 24,
+            bitrate: None,
+            channels: 2,
+        },
+        expires_at: None,
+        headers: Vec::new(),
+    };
+    let req = requete_locale_3234(zone_id, 1);
+    let (sr, _, _) = orch
+        .decider_le_wav_de_sortie(&req, &flux, false)
+        .expect("sans strict : plafonné");
+    assert_eq!(sr, 96_000);
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    assert_eq!(
+        orch.decider_le_wav_de_sortie(&req, &flux, false)
+            .map(|(sr, _, _)| sr),
+        Err("bitperfect_strict_refused:192000:96000".to_string()),
+        "bit-perfect strict : le flux 192 kHz ne doit pas être plafonné en silence"
     );
 }

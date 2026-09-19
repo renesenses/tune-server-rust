@@ -616,14 +616,20 @@ impl PositionPoller {
                         // Without this flag the message would be swallowed and
                         // the user would be left with a spinner and nothing
                         // else — worse than the silence this whole change fixes.
-                        bus.emit(
-                            "zone.playback_error",
-                            serde_json::json!({
+                        // #3973 — un refus « bit-perfect strict » arrive en
+                        // sentinelle : il part avec son code et ses deux
+                        // fréquences, et la phrase française en repli.
+                        let charge = match crate::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(&msg) {
+                            Some(refus) => crate::audio::bitperfect_strict::charge_utile_de_refus(
+                                zone_id, &refus,
+                            ),
+                            None => serde_json::json!({
                                 "zone_id": zone_id,
                                 "error": msg,
                                 "fatal": true,
                             }),
-                        );
+                        };
+                        bus.emit("zone.playback_error", charge);
                     }
                     poll_states.remove(&zone_id);
                     let device_id_ref = self.get_zone_device_id(zone_id);
