@@ -851,6 +851,51 @@ mod tests {
         assert!(!titres_equivalents("Somebody", "Somebody To Love"));
     }
 
+    /// ⭐ #4443 — FabienM (fil 1839, point 3) : le même morceau, écrit comme
+    /// Qobuz l'écrit. « Shine On You Crazy Diamond (Parts 1-5) » en local,
+    /// « Shine on You Crazy Diamond, Pts. 1-5 » sur l'édition Qobuz de *Wish
+    /// You Were Here* — celle que Roon place en tête et que Tune oubliait.
+    /// Les formes de Gov't Mule (« , Pts. 1 - 5 ») et de David Gilmour
+    /// (« (Pts. 1-5) (Live) ») convergent aussi.
+    #[test]
+    fn parts_et_pts_designent_le_meme_morceau() {
+        let local = "Shine On You Crazy Diamond (Parts 1-5)";
+        assert!(titres_equivalents(
+            local,
+            "Shine on You Crazy Diamond, Pts. 1-5"
+        ));
+        assert!(titres_equivalents(
+            "Shine on You Crazy Diamond, Pts. 1-5",
+            local
+        ));
+        assert!(titres_equivalents(
+            local,
+            "Shine On You Crazy Diamond, Pts. 1 - 5"
+        ));
+        assert!(titres_equivalents(
+            local,
+            "Shine On You Crazy Diamond (Pts. 1-5) (Live At Pompeii)"
+        ));
+    }
+
+    /// Contre-épreuve de #4443 : ni un rapprochement flou, ni un `contains`.
+    /// Les parties 6-9 restent un autre morceau, et les pièges de FabienM
+    /// (« Somebody » / « Somebody To Love », « Hero » / « Heroes ») tiennent.
+    #[test]
+    fn le_noyau_ne_rapproche_pas_deux_morceaux_differents() {
+        assert!(!titres_equivalents(
+            "Shine On You Crazy Diamond (Parts 1-5)",
+            "Shine On You Crazy Diamond (Parts 6-9)"
+        ));
+        assert!(!titres_equivalents(
+            "Shine On You Crazy Diamond, Pts. 1-5",
+            "Shine On You Crazy Diamond, Pts. 6-9"
+        ));
+        assert!(!titres_equivalents("Somebody", "Somebody, To Love"));
+        assert!(!titres_equivalents("Hero", "Heroes"));
+        assert!(!titres_equivalents("Cross", "Cross-Eyed Mary"));
+    }
+
     #[test]
     fn le_predicat_titre_n_utilise_aucun_joker_like() {
         let p = predicat_titres_equivalents("t.title", "$1");
