@@ -5212,7 +5212,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tune-bandcamp"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-trait",
  "axum",
@@ -5227,7 +5227,7 @@ dependencies = [
 
 [[package]]
 name = "tune-bridge"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "axum",
  "bytes",
@@ -5248,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "tune-cli"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "clap",
  "clap_complete",
@@ -5262,7 +5262,7 @@ dependencies = [
 
 [[package]]
 name = "tune-concerts"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-trait",
  "axum",
@@ -5275,7 +5275,7 @@ dependencies = [
 
 [[package]]
 name = "tune-core"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "aes-gcm",
  "ape-decoder",
@@ -5343,6 +5343,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tune-output-api",
+ "tune-plugin-audio-support",
+ "tune-plugin-crossfeed",
+ "tune-plugin-equalizer",
+ "tune-plugin-native",
+ "tune-plugin-sdk",
  "unicode-normalization",
  "urlencoding",
  "uuid",
@@ -5356,7 +5361,7 @@ dependencies = [
 
 [[package]]
 name = "tune-dj"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-trait",
  "axum",
@@ -5368,7 +5373,7 @@ dependencies = [
 
 [[package]]
 name = "tune-ffi"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "axum",
  "serde_json",
@@ -5381,7 +5386,7 @@ dependencies = [
 
 [[package]]
 name = "tune-http-types"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "axum",
  "reqwest",
@@ -5392,7 +5397,7 @@ dependencies = [
 
 [[package]]
 name = "tune-karaoke"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-trait",
  "axum",
@@ -5405,7 +5410,7 @@ dependencies = [
 
 [[package]]
 name = "tune-output-api"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-trait",
  "serde",
@@ -5413,8 +5418,77 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-abi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-audio-support"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "tune-plugin-converter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-crossfeed"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-declick"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-equalizer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-audio-support",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-native"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "minisign-verify",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tune-plugin-abi",
+ "tune-plugin-sdk",
+ "zip",
+]
+
+[[package]]
 name = "tune-plugin-runtime-wasm"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -5422,8 +5496,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tune-pont-roon"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-trait",
  "axum",
@@ -5438,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "tune-server"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "argon2",
  "async-stream",
@@ -5482,7 +5564,11 @@ dependencies = [
  "tune-dj",
  "tune-http-types",
  "tune-karaoke",
+ "tune-plugin-converter",
+ "tune-plugin-declick",
+ "tune-plugin-native",
  "tune-plugin-runtime-wasm",
+ "tune-plugin-sdk",
  "tune-pont-roon",
  "tune-smart-http",
  "tune-stream-http",
@@ -5495,7 +5581,7 @@ dependencies = [
 
 [[package]]
 name = "tune-smart-http"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "axum",
  "serde",
@@ -5507,7 +5593,7 @@ dependencies = [
 
 [[package]]
 name = "tune-stream-http"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-stream",
  "axum",
@@ -5523,7 +5609,7 @@ dependencies = [
 
 [[package]]
 name = "tune-streaming-http"
-version = "0.9.155"
+version = "0.9.156"
 dependencies = [
  "async-stream",
  "async-trait",

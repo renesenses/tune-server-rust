@@ -148,21 +148,50 @@ pub fn refus_de_lecture(path: &Path) -> Option<&'static str> {
     })
 }
 
+const SACD_EXTRACT_CANDIDATES: [&str; 4] = [
+    "sacd_extract",
+    "/usr/local/bin/sacd_extract",
+    "/usr/bin/sacd_extract",
+    "/opt/homebrew/bin/sacd_extract",
+];
+
+fn usable_probe_output(output: &std::process::Output) -> bool {
+    output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty()
+}
+
 fn find_sacd_extract() -> Option<PathBuf> {
-    let candidates = [
-        "sacd_extract",
-        "/usr/local/bin/sacd_extract",
-        "/usr/bin/sacd_extract",
-        "/opt/homebrew/bin/sacd_extract",
-    ];
-    for name in &candidates {
+    for name in &SACD_EXTRACT_CANDIDATES {
         if let Ok(output) = Command::new(name).arg("--help").output() {
-            if output.status.success() || !output.stdout.is_empty() || !output.stderr.is_empty() {
+            if usable_probe_output(&output) {
                 return Some(PathBuf::from(name));
             }
         }
     }
     None
+}
+
+/// Availability of the ISO extractor, using the extraction path's candidates
+/// and --help criterion. This says nothing about a particular disc or file.
+/// Unlike extraction, an HTTP diagnostic must finish promptly (#3234).
+pub async fn sacd_extract_available() -> Result<bool, String> {
+    probe_candidates(&SACD_EXTRACT_CANDIDATES, std::time::Duration::from_secs(2)).await
+}
+
+async fn probe_candidates(
+    candidates: &[&str],
+    budget: std::time::Duration,
+) -> Result<bool, String> {
+    let deadline = tokio::time::Instant::now() + budget;
+    for name in candidates {
+        let mut command = tokio::process::Command::new(name);
+        command.arg("--help").kill_on_drop(true);
+        match tokio::time::timeout_at(deadline, command.output()).await {
+            Ok(Ok(output)) if usable_probe_output(&output) => return Ok(true),
+            Ok(_) => {}
+            Err(_) => return Err("SACD ISO extractor probe timed out".into()),
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -239,5 +268,92 @@ mod tests {
         // fait le parcours de bibliothèque qui appelle cette fonction.
         let majuscules = image_iso(dossier.path(), "ALBUM.ISO", Some(SIGNATURE_MASTER_TOC_SACD));
         assert!(is_sacd_iso(&majuscules));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod iso_status_tests_3234 {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn tool(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/usr/bin/python3\nimport sys, time, os\nassert sys.argv[1:] == ['--help']\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn iso_status_accepts_the_same_help_output_as_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("success", "sys.exit(0)"),
+            ("help", "print('help', file=sys.stderr); sys.exit(1)"),
+        ] {
+            let path = tool(dir.path(), name, body);
+            assert!(
+                probe_candidates(&[path.to_str().unwrap()], Duration::from_secs(1))
+                    .await
+                    .unwrap()
+            );
+            assert!(usable_probe_output(
+                &Command::new(&path).arg("--help").output().unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn iso_status_ignores_missing_and_silent_failed_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let failed = tool(dir.path(), "failed", "sys.exit(1)");
+        let candidates = [missing.to_str().unwrap(), failed.to_str().unwrap()];
+        assert!(
+            !probe_candidates(&candidates, Duration::from_secs(1))
+                .await
+                .unwrap()
+        );
+        let found = tool(dir.path(), "found", "print('help')");
+        assert!(
+            probe_candidates(
+                &[candidates[0], candidates[1], found.to_str().unwrap()],
+                Duration::from_secs(1)
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn iso_status_timeout_is_unknown_and_kills_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let path = tool(
+            dir.path(),
+            "slow",
+            &format!(
+                "open({:?}, 'w').write(str(os.getpid()))\ntime.sleep(30)",
+                pidfile.to_str().unwrap()
+            ),
+        );
+        let start = std::time::Instant::now();
+        let result = probe_candidates(&[path.to_str().unwrap()], Duration::from_secs(1)).await;
+        assert!(
+            result.is_err(),
+            "a timeout must not claim the tool is absent"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        #[cfg(target_os = "linux")]
+        {
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            for _ in 0..30 {
+                if !Path::new(&format!("/proc/{pid}")).exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            panic!("timed-out probe still present: {pid}");
+        }
     }
 }

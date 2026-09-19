@@ -791,6 +791,20 @@ pub struct PlaybackManager {
     /// gapless : contrairement à `play_seq`, elle invalide les niveaux sans
     /// toucher à la sémantique des lectures en cours.
     levels_gens: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU64>>>,
+    /// Gain appliqué par la sortie de la zone APRÈS le point de mesure des
+    /// niveaux, en millièmes (1000 = ×1,0) — #4384.
+    ///
+    /// Sur une sortie locale, les fenêtres du crête-mètre sont prélevées au
+    /// décodeur alors que le facteur « volume × ReplayGain » (préampli
+    /// compris) n'est appliqué que dans les rappels de rendu : l'instrument
+    /// montrait le niveau du FICHIER, pas celui envoyé au DAC. La sortie
+    /// PARTAGE ici l'`AtomicU32` que ses rappels multiplient réellement —
+    /// pas une copie — si bien que volume, sourdine, ReplayGain, préampli et
+    /// la règle DoP suivent sans qu'aucun site n'ait à les repousser.
+    ///
+    /// Absent = aucun gain connu en aval : le forwarder mesure alors tel quel,
+    /// ce qui est le comportement de tous les chemins non locaux.
+    gains_de_sortie: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU32>>>,
 }
 
 impl Default for PlaybackManager {
@@ -808,7 +822,43 @@ impl PlaybackManager {
             sleep_inhibitor: crate::system_sleep::SystemSleepInhibitor::new(),
             zone_taps: std::sync::Mutex::new(HashMap::new()),
             levels_gens: std::sync::Mutex::new(HashMap::new()),
+            gains_de_sortie: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Partage l'`AtomicU32` de gain de la sortie locale qui va jouer cette
+    /// zone (#4384). Voir [`Self::gain_de_sortie_units`].
+    pub fn brancher_le_gain_de_sortie(
+        &self,
+        zone_id: i64,
+        gain: Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.gains_de_sortie
+            .lock()
+            .expect("gains_de_sortie lock")
+            .insert(zone_id, gain);
+    }
+
+    /// Oublie le gain de la zone : elle ne joue plus sur une sortie locale.
+    ///
+    /// Sans cet appel, une zone rebasculée sur un rendu réseau garderait le
+    /// gain de son ancien DAC et le crête-mètre mentirait dans l'autre sens.
+    pub fn debrancher_le_gain_de_sortie(&self, zone_id: i64) {
+        self.gains_de_sortie
+            .lock()
+            .expect("gains_de_sortie lock")
+            .remove(&zone_id);
+    }
+
+    /// Le gain en aval du point de mesure, en millièmes. `1000` quand rien
+    /// n'est branché — c'est-à-dire « mesure telle quelle ».
+    pub fn gain_de_sortie_units(&self, zone_id: i64) -> u32 {
+        self.gains_de_sortie
+            .lock()
+            .expect("gains_de_sortie lock")
+            .get(&zone_id)
+            .map(|g| g.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(1000)
     }
 
     /// La génération de niveaux d'une zone (créée au premier accès).

@@ -276,6 +276,11 @@ impl Banc {
                 &serde_json::to_string(&profile).unwrap(),
             )
             .unwrap();
+        // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut
+        // l'avoir installé — la clé que pose `POST /plugins/equalizer/install`.
+        crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .set("plugin_equalizer_installed", "true")
+            .unwrap();
     }
 }
 

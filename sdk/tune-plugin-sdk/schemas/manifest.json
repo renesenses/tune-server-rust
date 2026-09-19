@@ -1,0 +1,96 @@
+{
+  "$defs": {
+    "CapabilityRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "version": {
+          "$ref": "#/$defs/Version"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "required"
+      ],
+      "type": "object"
+    },
+    "PluginKind": {
+      "enum": [
+        "dsp",
+        "batch"
+      ],
+      "type": "string"
+    },
+    "Version": {
+      "additionalProperties": false,
+      "properties": {
+        "major": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capabilities": {
+      "items": {
+        "$ref": "#/$defs/CapabilityRequest"
+      },
+      "type": "array"
+    },
+    "config_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "distribution": {
+      "description": "Implementation composition; native packages wrap this source manifest\nwith a separately versioned ABI and target envelope.",
+      "type": "string"
+    },
+    "entitlement": {
+      "description": "Entitlement identifier; the host maps it to existing subscription tiers.",
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/PluginKind"
+    },
+    "sdk": {
+      "$ref": "#/$defs/Version"
+    }
+  },
+  "required": [
+    "id",
+    "sdk",
+    "kind",
+    "config_version",
+    "capabilities",
+    "entitlement",
+    "distribution"
+  ],
+  "title": "Manifest",
+  "type": "object"
+}

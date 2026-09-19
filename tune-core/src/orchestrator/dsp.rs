@@ -1178,6 +1178,12 @@ impl PlaybackOrchestrator {
                 _ => 1.0,
             };
             local_output.set_replaygain_factor(rg);
+            // #4384 — une bascule PURE en cours d'écoute change le facteur
+            // ReplayGain sans passer par `send_to_output` : c'est ici que le
+            // crête-mètre d'une zone déjà en lecture apprend le gain de sa
+            // sortie. Idempotent — on repousse le même `Arc`.
+            self.playback
+                .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
             // `replace_*_live` et non `set_*` : la piste est en cours, donc
             // l'historique des biquads et les lignes à retard doivent survivre
             // au remplacement — sinon la bascule claque.
@@ -1302,6 +1308,12 @@ impl PlaybackOrchestrator {
     /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
+        if !crate::audio::premium_plugins::enabled(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            "equalizer",
+        ) {
+            return None;
+        }
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
@@ -1458,6 +1470,19 @@ impl PlaybackOrchestrator {
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
+        if self
+            .license
+            .as_ref()
+            .is_some_and(|license| !license.premium_snapshot())
+        {
+            return None;
+        }
+        if !crate::audio::premium_plugins::enabled(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            "crossfeed",
+        ) {
+            return None;
+        }
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let cfg: serde_json::Value = settings
             .get(&format!("zone_{zone_id}_crossfeed"))

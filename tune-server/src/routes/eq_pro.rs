@@ -76,7 +76,16 @@ struct ExpertSettingsBody {
 async fn set_expert_settings(
     State(state): State<AppState>,
     Json(body): Json<ExpertSettingsBody>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<axum::response::Response, AppError> {
+    if let Err(response) =
+        crate::premium_guard::require_premium(&state.license, tune_core::license::Feature::DspEq)
+            .await
+    {
+        return Ok(response);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return Ok(response);
+    }
     if !EQ_EXPERT_BAND_CHOICES.contains(&body.expert_bands) {
         return Err(AppError::bad_request(format!(
             "expert_bands doit être 10, 15 ou 31 (reçu {})",
@@ -85,7 +94,7 @@ async fn set_expert_settings(
     }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("eq_expert_bands", &body.expert_bands.to_string())?;
-    Ok(Json(json!({ "expert_bands": body.expert_bands })))
+    Ok(Json(json!({ "expert_bands": body.expert_bands })).into_response())
 }
 
 fn load_presets(state: &AppState) -> Vec<Value> {
@@ -197,7 +206,7 @@ async fn create_preset(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -206,6 +215,9 @@ async fn create_preset(
     .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return Ok(response);
     }
 
     let mut presets = load_presets(&state);
@@ -248,7 +260,7 @@ async fn update_preset(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreatePresetBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -257,6 +269,9 @@ async fn update_preset(
     .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return Ok(response);
     }
 
     let mut presets = load_presets(&state);
@@ -291,7 +306,7 @@ async fn delete_preset(
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -300,6 +315,9 @@ async fn delete_preset(
     .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return Ok(response);
     }
 
     let mut presets = load_presets(&state);
@@ -369,7 +387,7 @@ async fn activate_preset(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    // Premium gate: DSP & EQ mutations require Premium
+    // The historical EQ entitlement is now available to Free accounts.
     if let Err(resp) = crate::premium_guard::require_premium_localise(
         &state.license,
         tune_core::license::Feature::DspEq,
@@ -378,6 +396,9 @@ async fn activate_preset(
     .await
     {
         return resp;
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return response;
     }
 
     let presets = load_presets(&state);
@@ -548,6 +569,9 @@ async fn import_autoeq(
     .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "equalizer") {
+        return Ok(response);
     }
 
     if body.text.len() > TAILLE_MAX_PROFIL {

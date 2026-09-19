@@ -16,6 +16,7 @@ use tune_core::db::track_repo::TrackRepo;
 use tune_core::metadata::auto_fix::AutoFixEngine;
 use tune_core::metadata::{MetadataUpdate, write_metadata};
 
+use crate::routes::corps_json_optionnel::CorpsJsonOptionnel;
 use crate::state::AppState;
 
 /// Le moteur porte l'état d'un balayage en cours : il doit donc survivre à la
@@ -173,6 +174,8 @@ pub fn router() -> Router<AppState> {
         .route("/albums/merge", post(merge_albums))
         // Batch rename artist (used by web client)
         .route("/batch/rename-artist", post(batch_rename_artist))
+        // #1199 — affecter un artiste à des pistes, en lot.
+        .route("/batch/artist", post(batch_set_artist))
 }
 
 /// Extract a plausible release year (1900–2099) from a file/folder path — e.g.
@@ -727,6 +730,107 @@ async fn edit_artist(
 }
 
 // ---------------------------------------------------------------------------
+/// Corps de `POST /metadata/batch/artist`.
+#[derive(Debug, Deserialize)]
+struct BatchSetArtist {
+    track_ids: Vec<i64>,
+    artist_name: String,
+}
+
+/// `POST /metadata/batch/artist` — affecter UN artiste à des pistes.
+///
+/// 🔴 #1199 — l'édition en lot des pistes (`batch_edit_tracks`) accepte genre,
+/// année, compositeur, label et BPM, mais **pas l'artiste**. Sans cette route,
+/// réparer les 1 496 pistes sans artiste du .18 demanderait 1 496 requêtes.
+///
+/// **L'artiste existant est RÉUTILISÉ, jamais doublé** (arbitrage de Bertrand,
+/// 18/09) : `get_by_name` compare déjà en `LOWER(name) = LOWER(?)`, donc
+/// « art blakey » retrouve « Art Blakey ». On ne crée que si personne ne
+/// répond — sinon on fabriquerait les homographes que l'onglet « Doublons »
+/// devrait ensuite absorber.
+///
+/// Aucun rapprochement flou : « Art Blakey » et « Art Blakey & The Jazz
+/// Messengers » sont deux artistes, et c'est à l'utilisateur de le dire.
+async fn batch_set_artist(
+    State(state): State<AppState>,
+    Json(body): Json<BatchSetArtist>,
+) -> impl IntoResponse {
+    let nom = body.artist_name.trim().to_string();
+    if nom.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "artist_name cannot be empty"})),
+        )
+            .into_response();
+    }
+    if body.track_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "track_ids cannot be empty"})),
+        )
+            .into_response();
+    }
+
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let (artiste, cree) = match artist_repo.get_by_name(&nom) {
+        Ok(Some(a)) => (a, false),
+        _ => match artist_repo.get_or_create(&nom, None, None) {
+            Ok(a) => (a, true),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let Some(artist_id) = artiste.id else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "artist has no id"})),
+        )
+            .into_response();
+    };
+
+    let mut updated = 0i64;
+    let mut echecs = 0i64;
+    for id in &body.track_ids {
+        let params: [&dyn tune_core::db::backend::ToSqlValue; 2] = [&artist_id, id];
+        match state
+            .backend
+            .execute("UPDATE tracks SET artist_id = ?1 WHERE id = ?2", &params)
+        {
+            Ok(n) => updated += n as i64,
+            Err(e) => {
+                tracing::warn!(track_id = *id, error = %e, "batch_set_artist_echec");
+                echecs += 1;
+            }
+        }
+    }
+
+    tracing::info!(
+        artiste = %nom,
+        artist_id,
+        cree,
+        updated,
+        echecs,
+        "batch_set_artist_done"
+    );
+    (
+        StatusCode::OK,
+        Json(json!({
+            "updated": updated,
+            "errors": echecs,
+            "artist_id": artist_id,
+            "artist_name": artiste.name,
+            // L'écran le dit : rattaché à un artiste existant, ou nouveau.
+            "created": cree,
+        })),
+    )
+        .into_response()
+}
+
 // POST /batch/rename-artist — rename an artist by ID or name
 // ---------------------------------------------------------------------------
 
@@ -883,6 +987,14 @@ async fn list_doubtful_metadata(
                 "album_title": t.album_title,
                 "duration_ms": t.duration_ms,
                 "reasons": reasons,
+                // 🔴 Le chemin, parce que c'est LUI qui porte l'artiste
+                // manquant. Mesuré sur le .18 le 18/09/2026 : sur 1 592 pistes
+                // sans artiste, 1 496 — 94 % — ont un dossier grand-parent
+                // exploitable (`…/Prince/Ultimate/01 - ….m4a`), pour 26 noms
+                // distincts seulement. Le titre ne sert à rien : son préfixe
+                // « 01 - » est un numéro de piste, pas un nom, et l'album ne
+                // connaît l'artiste que 33 fois sur 1 592.
+                "file_path": t.file_path,
             })
         })
         .collect();
@@ -2563,14 +2675,18 @@ struct AutoFixBody {
 }
 
 /// POST /metadata/auto-fix — démarre un balayage en tâche de fond.
+///
+/// 🔴 #4447 — corps optionnel POUR DE BON : le client web poste sans charge
+/// utile mais annonce `application/json`, ce qu'`Option<Json<…>>` rejetait en
+/// 400. Voir [`CorpsJsonOptionnel`].
 async fn start_auto_fix(
     State(state): State<AppState>,
-    body: Option<Json<AutoFixBody>>,
+    CorpsJsonOptionnel(body): CorpsJsonOptionnel<AutoFixBody>,
 ) -> impl IntoResponse {
     let Some(engine) = auto_fix_engine(&state) else {
         return auto_fix_unavailable();
     };
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
 
     match engine
         .start_scan(b.threshold.unwrap_or(0.9), b.batch_size.unwrap_or(50))
@@ -3090,5 +3206,178 @@ mod tests_pistes_cue {
             "la tranche déjà pourvue en genre n'est plus candidate ; vues : {ids:?}"
         );
         assert!(ids.contains(&21), "l'autre tranche l'est toujours");
+    }
+}
+
+/// 🔴 #1199 — réparer les pistes sans artiste.
+///
+/// Mesuré sur le .18 le 18/09/2026 : l'onglet « Albums douteux » annonce
+/// 1 595 entrées, et ce ne sont pas des albums mais des PISTES — 1 592 pour
+/// une seule raison, l'artiste manque. 932 d'Art Blakey, 445 de Prince, des
+/// captures de l'enregistreur qui n'ont jamais porté d'étiquette.
+///
+/// L'information vit dans le CHEMIN (`…/Prince/Ultimate/01 - ….m4a`) : 1 496
+/// des 1 592 ont un dossier grand-parent exploitable, pour 26 noms distincts.
+/// D'où les deux ajouts : le chemin dans la réponse, et une route qui affecte
+/// un artiste à un lot de pistes.
+#[cfg(test)]
+mod artiste_des_pistes_douteuses_1199 {
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use tune_core::db::backend::ToSqlValue;
+
+    async fn par_la_route(
+        state: &AppState,
+        methode: &str,
+        uri: &str,
+        corps: &str,
+    ) -> (StatusCode, Value) {
+        let r = super::router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(corps.to_string()))
+                    .expect("requête"),
+            )
+            .await
+            .expect("réponse");
+        let code = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        let v = serde_json::from_slice(&octets).unwrap_or(Value::Null);
+        (code, v)
+    }
+
+    fn etat() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        let b = &state.backend;
+        b.execute(
+            "INSERT INTO artists (id, name) VALUES (1, 'Unknown Artist')",
+            &[],
+        )
+        .expect("artiste inconnu");
+        b.execute("INSERT INTO albums (id, title) VALUES (1, 'Ultimate')", &[])
+            .expect("album");
+        for (i, f) in [
+            (
+                1i64,
+                "/data/recordings/Tidal/Prince/Ultimate/01 - I Wanna Be Your Lover.m4a",
+            ),
+            (2, "/data/recordings/Tidal/Prince/Ultimate/02 - Uptown.m4a"),
+        ] {
+            b.execute(
+                "INSERT INTO tracks (id, title, artist_id, album_id, source, file_path) \
+                 VALUES (?1, 'x', 1, 1, 'local', ?2)",
+                &[&i as &dyn ToSqlValue, &f],
+            )
+            .expect("piste");
+        }
+        state
+    }
+
+    /// Sans le chemin, l'écran ne peut RIEN deviner : le titre ne porte qu'un
+    /// numéro de piste, et l'album ne connaît pas l'artiste non plus.
+    #[tokio::test]
+    async fn la_liste_des_douteuses_rend_le_chemin() {
+        let state = etat();
+        let (code, v) = par_la_route(&state, "GET", "/doubtful?limit=10", "").await;
+        assert_eq!(code, StatusCode::OK);
+        let p = v["items"][0]["file_path"].as_str().unwrap_or_default();
+        assert!(p.contains("/Prince/Ultimate/"), "chemin rendu : {p:?}");
+        assert!(
+            v["items"][0]["reasons"]
+                .as_array()
+                .expect("raisons")
+                .iter()
+                .any(|r| r == "missing_artist")
+        );
+    }
+
+    /// Le geste qui répare : un nom, des pistes, un seul appel.
+    #[tokio::test]
+    async fn affecter_un_artiste_a_un_lot_de_pistes() {
+        let state = etat();
+        let (code, v) = par_la_route(
+            &state,
+            "POST",
+            "/batch/artist",
+            r#"{"track_ids":[1,2],"artist_name":"Prince"}"#,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "réponse : {v}");
+        assert_eq!(v["updated"], 2);
+        assert_eq!(v["created"], true, "« Prince » n'existait pas encore");
+
+        // Et les pistes ne sont plus douteuses.
+        let (_, apres) = par_la_route(&state, "GET", "/doubtful?limit=10", "").await;
+        assert_eq!(apres["total"], 0, "il reste : {apres}");
+    }
+
+    /// 🔴 L'artiste existant est RÉUTILISÉ, jamais doublé — y compris sous une
+    /// autre casse. Sans ça on fabrique les homographes que l'onglet
+    /// « Doublons » devra ensuite absorber.
+    #[tokio::test]
+    async fn un_artiste_existant_est_reutilise_pas_double() {
+        let state = etat();
+        state
+            .backend
+            .execute("INSERT INTO artists (id, name) VALUES (7, 'Prince')", &[])
+            .expect("artiste existant");
+
+        let (_, v) = par_la_route(
+            &state,
+            "POST",
+            "/batch/artist",
+            r#"{"track_ids":[1],"artist_name":"  prince  "}"#,
+        )
+        .await;
+        assert_eq!(v["artist_id"], 7, "doit rejoindre l'artiste existant");
+        assert_eq!(v["created"], false);
+        assert_eq!(
+            v["artist_name"], "Prince",
+            "la graphie existante est gardée"
+        );
+
+        let n = state
+            .backend
+            .query_one(
+                "SELECT COUNT(*) FROM artists WHERE LOWER(name) = 'prince'",
+                &[],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(-1);
+        assert_eq!(n, 1, "un seul « Prince » en base");
+    }
+
+    /// Un nom vide ou une liste vide ne passent pas : on n'affecte pas
+    /// « rien » à des pistes, et on ne crée pas un artiste sans nom.
+    #[tokio::test]
+    async fn un_nom_vide_ou_aucune_piste_sont_refuses() {
+        let state = etat();
+        let (c1, _) = par_la_route(
+            &state,
+            "POST",
+            "/batch/artist",
+            r#"{"track_ids":[1],"artist_name":"   "}"#,
+        )
+        .await;
+        assert_eq!(c1, StatusCode::BAD_REQUEST);
+        let (c2, _) = par_la_route(
+            &state,
+            "POST",
+            "/batch/artist",
+            r#"{"track_ids":[],"artist_name":"Prince"}"#,
+        )
+        .await;
+        assert_eq!(c2, StatusCode::BAD_REQUEST);
     }
 }

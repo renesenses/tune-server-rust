@@ -1537,6 +1537,7 @@ impl StreamingService for TidalService {
                             channels: 2,
                         },
                         expires_at: None,
+                        headers: Vec::new(),
                     });
                 }
                 tracing::info!(
@@ -1884,6 +1885,7 @@ impl StreamingService for TidalService {
                 channels: 2,
             },
             expires_at: None,
+            headers: Vec::new(),
         })
     }
 

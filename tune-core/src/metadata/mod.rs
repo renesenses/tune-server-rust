@@ -527,8 +527,7 @@ pub fn probe_m4a_props(path: &std::path::Path) -> Option<(String, Option<u16>)> 
     // Depuis que #2327 a restauré `panic = "unwind"`, `catch_unwind` intercepte
     // vraiment ce panic — on calque le durcissement déjà en place dans le chemin
     // de LECTURE (`audio/decode.rs`) : un fichier qui panique est SAUTÉ (None)
-    // avec un `warn!`, jamais propagé. `probe_m4a_props` est le SEUL appel
-    // symphonia du chemin de scan (`try_read_metadata` passe par lofty).
+    // avec un `warn!`, jamais propagé. Le repli Ogg protège également sa sonde.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe_m4a_props_inner(path)))
         .unwrap_or_else(|_| {
             tracing::warn!(
@@ -3120,6 +3119,103 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
     Ok(metadata)
 }
 
+// Only the failed-Lofty Ogg fallback needs this extra content check (#4412).
+// A bound reached while reading a large header is inconclusive, not invalid audio.
+const OGG_FALLBACK_PROBE_BYTES: u64 = 1024 * 1024;
+
+fn ogg_fallback_has_audio(path: &Path) -> Option<bool> {
+    use std::io::Read;
+    use symphonia::core::{
+        formats::{FormatOptions, TrackType, probe::Hint},
+        io::{MediaSourceStream, ReadOnlySource},
+        meta::MetadataOptions,
+    };
+    let Ok(file) = std::fs::File::open(&*crate::library::artwork::extended_path(path)) else {
+        return Some(false);
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(OGG_FALLBACK_PROBE_BYTES)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return Some(false);
+    }
+    // Only an actual BOS page (including its CRC) makes exhaustion inconclusive.
+    // A large HTML dump must not inherit the exception for large Ogg comments.
+    // Searching also preserves leading junk/ID3 that the existing probe tolerates.
+    let bounded_ogg =
+        bytes.len() == OGG_FALLBACK_PROBE_BYTES as usize && has_valid_ogg_bos_page(&bytes);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Non-seekable: no tail scan. The mapper recognizes Opus without asking
+        // for its external decoder, and no complete audio decode is performed.
+        let source = ReadOnlySource::new(std::io::Cursor::new(bytes));
+        let mss = MediaSourceStream::new(Box::new(source), Default::default());
+        let mut hint = Hint::new();
+        hint.with_extension("ogg");
+        symphonia::default::get_probe()
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
+            .is_ok_and(|reader| reader.default_track(TrackType::Audio).is_some())
+    }))
+    .unwrap_or(false);
+    if result {
+        Some(true)
+    } else if bounded_ogg {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn has_valid_ogg_bos_page(bytes: &[u8]) -> bool {
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, marker)| *marker == b"OggS")
+        .any(|(offset, _)| {
+            let page = &bytes[offset..];
+            if page.len() < 27 || page[4] != 0 || page[5] != 2 {
+                return false;
+            }
+            let header_len = 27 + page[26] as usize;
+            if page.len() < header_len {
+                return false;
+            }
+            let page_len = header_len
+                + page[27..header_len]
+                    .iter()
+                    .map(|n| *n as usize)
+                    .sum::<usize>();
+            if page.len() < page_len || page_len == header_len {
+                return false;
+            }
+            let mut crc = 0u32;
+            for (index, byte) in page[..page_len].iter().enumerate() {
+                crc ^= if (22..26).contains(&index) {
+                    0
+                } else {
+                    (*byte as u32) << 24
+                };
+                for _ in 0..8 {
+                    crc = if crc & 0x8000_0000 != 0 {
+                        (crc << 1) ^ 0x04c1_1db7
+                    } else {
+                        crc << 1
+                    };
+                }
+            }
+            crc == u32::from_le_bytes(page[22..26].try_into().expect("four CRC bytes"))
+        })
+}
+
+#[cfg(test)]
+mod ogg_fallback_tests_4412;
+
 fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -3172,6 +3268,14 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             // Only apply the fallback if the file actually exists (a missing
             // file should still return Err).
             if is_known_audio_ext(path) && path.exists() {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if ["ogg", "oga", "opus"]
+                    .iter()
+                    .any(|ogg| ext.eq_ignore_ascii_case(ogg))
+                    && ogg_fallback_has_audio(path) == Some(false)
+                {
+                    return Err(format!("Ogg audio probe failed after metadata error: {e}"));
+                }
                 tracing::debug!(
                     path = %path.display(),
                     error = %e,

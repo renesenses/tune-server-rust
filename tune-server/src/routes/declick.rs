@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use tune_core::audio::decode::{can_decode_native, decode_to_pcm};
+use tune_core::audio::decode::can_decode_native;
 use tune_core::db::track_repo::TrackRepo;
 
 use crate::error::AppError;
@@ -104,6 +104,7 @@ struct JobError {
 }
 
 struct DeclickJob {
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
     status: JobStatus,
     total: usize,
     completed: usize,
@@ -148,6 +149,9 @@ async fn start_job(
             .await
     {
         return Ok(resp);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_installed(&state, "declick") {
+        return Ok(response);
     }
 
     // Resolve options + output format.
@@ -221,6 +225,7 @@ async fn start_job(
         .map_err(|e| AppError::internal(format!("failed to create output dir: {e}")))?;
 
     let job = Arc::new(Mutex::new(DeclickJob {
+        cancellation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         status: JobStatus::Running,
         total,
         completed: 0,
@@ -229,6 +234,8 @@ async fn start_job(
         output_dir: output_dir.clone(),
     }));
 
+    crate::audio_job_journal::write("declick", &job_id, "running", total, 0)
+        .map_err(AppError::internal)?;
     let store = job_store();
     {
         let mut map = store.lock().await;
@@ -237,8 +244,17 @@ async fn start_job(
 
     // Spawn the background worker.
     let jid = job_id.clone();
+    let journal_job = job.clone();
     tokio::spawn(async move {
         run_declick(job, file_paths, opts, out_format, &output_dir).await;
+        let final_job = journal_job.lock().await;
+        if let Err(error) = crate::audio_job_journal::write_result(
+            "declick",
+            &jid,
+            &json!({"job_id":jid,"status":final_job.status.as_str(),"total":final_job.total,"completed":final_job.completed,"errors":final_job.errors.iter().map(|e|json!({"path":e.path,"error":e.error})).collect::<Vec<_>>()}),
+        ) {
+            tracing::error!(%error, "audio_job_status_not_persisted");
+        }
         info!(job_id = %jid, "declick_job_finished");
     });
 
@@ -259,6 +275,11 @@ async fn start_job(
 async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, AppError> {
     let store = job_store();
     let map = store.lock().await;
+    if !map.contains_key(&job_id) {
+        if let Some(status) = crate::audio_job_journal::recovered("declick", &job_id) {
+            return Ok(Json(status));
+        }
+    }
     let job_arc = map
         .get(&job_id)
         .ok_or_else(|| AppError::not_found(format!("job not found: {job_id}")))?
@@ -335,6 +356,8 @@ async fn cancel_job(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, A
     {
         let mut job = job_arc.lock().await;
         if job.status == JobStatus::Running {
+            job.cancellation
+                .store(true, std::sync::atomic::Ordering::Release);
             job.status = JobStatus::Cancelled;
         }
         let dir = job.output_dir.clone();
@@ -390,23 +413,15 @@ async fn run_declick(
 
         let input_owned = file_path.clone();
         let output_owned = out_path.clone();
+        let cancellation = job.lock().await.cancellation.clone();
         let result = tokio::task::spawn_blocking(move || {
-            process_single_file(&input_owned, &output_owned, opts, out_format)
+            process_single_file(&input_owned, &output_owned, opts, out_format, cancellation)
         })
         .await
         .unwrap_or_else(|e| Err(format!("spawn_blocking join error: {e}")));
 
         match result {
             Ok(()) => {
-                // Carry the source tags across to the cleaned file.
-                if let Err(e) = copy_tags(file_path, &out_path) {
-                    warn!(
-                        src = %file_path.display(),
-                        dst = %out_path.display(),
-                        error = %e,
-                        "declick_copy_tags_failed"
-                    );
-                }
                 let mut j = job.lock().await;
                 j.completed += 1;
             }
@@ -444,177 +459,16 @@ fn process_single_file(
     output: &Path,
     opts: ResolvedOptions,
     out_format: &str,
+    cancellation: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    let input_str = input
-        .to_str()
-        .ok_or_else(|| "invalid input path".to_string())?;
-
-    // Native decode of any supported input to interleaved i32 PCM.
-    let decoded = decode_to_pcm(input_str, None, None, 0.0, f64::MAX)?;
-
-    let channels = decoded.channels.max(1) as usize;
-    let bit_depth = decoded.bit_depth;
-    let sample_rate = decoded.sample_rate;
-    let samples = &decoded.samples_i32;
-
-    if samples.is_empty() {
-        return Err("decoded audio is empty".to_string());
-    }
-
-    let total_frames = samples.len() / channels;
-    if total_frames == 0 {
-        return Err("decoded audio has no complete frames".to_string());
-    }
-
-    // samples_i32 are RIGHT-JUSTIFIED at `bit_depth` (a 16-bit sample lives in
-    // bits 0..15, 24-bit in 0..23), so digital full scale is 2^(bit_depth-1).
-    // Linear silence threshold amplitude = 10^(dB/20) * full_scale.
-    let full_scale = (1i64 << (bit_depth.saturating_sub(1)).max(1)) as f64;
-    let threshold_lin = 10f64.powf(opts.threshold_db as f64 / 20.0) * full_scale;
-
-    // A frame is "loud" if ANY channel exceeds the threshold.
-    let frame_is_loud = |f: usize| -> bool {
-        let base = f * channels;
-        for c in 0..channels {
-            if (samples[base + c].unsigned_abs() as f64) > threshold_lin {
-                return true;
-            }
-        }
-        false
-    };
-
-    // Leading edge.
-    let mut lead_start = 0usize;
-    if opts.trim_lead {
-        match (0..total_frames).find(|&f| frame_is_loud(f)) {
-            Some(f) => lead_start = f,
-            None => {
-                // Whole track is below threshold: nothing meaningful to keep.
-                return Err("track is entirely below the silence threshold".to_string());
-            }
-        }
-        if opts.zero_cross && lead_start > 0 {
-            lead_start = snap_zero_crossing_back(samples, channels, lead_start);
-        }
-    }
-
-    // Trailing edge (inclusive frame index of the last kept frame).
-    let mut tail_end = total_frames - 1;
-    if opts.trim_tail {
-        match (0..total_frames).rev().find(|&f| frame_is_loud(f)) {
-            Some(f) => tail_end = f,
-            None => {
-                return Err("track is entirely below the silence threshold".to_string());
-            }
-        }
-        if opts.zero_cross && tail_end + 1 < total_frames {
-            tail_end = snap_zero_crossing_fwd(samples, channels, tail_end, total_frames);
-        }
-    }
-
-    // Validate the window before slicing — never emit empty/garbage output.
-    if lead_start > tail_end {
-        return Err(format!(
-            "invalid trim window (lead_start {lead_start} > tail_end {tail_end})"
-        ));
-    }
-
-    let slice = &samples[lead_start * channels..(tail_end + 1) * channels];
-    if slice.is_empty() {
-        return Err("trimmed audio is empty".to_string());
-    }
-
-    // Reuse DecodedAudio::pcm_bytes() to serialize the trimmed slice at its
-    // native bit depth, then hand it to the native encoder.
-    let trimmed = tune_core::audio::decode::DecodedAudio {
-        samples_i32: slice.to_vec(),
-        bit_depth,
-        sample_rate,
-        channels: channels as u32,
-        duration_s: slice.len() as f64 / channels as f64 / sample_rate.max(1) as f64,
-        integrite: Default::default(),
-    };
-    let pcm = trimmed.pcm_bytes();
-
-    let encoded = encode_native(
-        &pcm,
-        sample_rate,
-        bit_depth as u32,
-        channels as u32,
-        out_format,
-    )?;
-
-    std::fs::write(output, &encoded)
-        .map_err(|e| format!("failed to write {}: {e}", output.display()))
-}
-
-/// Move a leading edge earlier to the nearest zero crossing on channel 0, so the
-/// cleaned file starts on a zero-valued sample rather than a step (the "ploc").
-/// Searches back up to ~50 ms; returns the original index if none is found.
-fn snap_zero_crossing_back(samples: &[i32], channels: usize, start: usize) -> usize {
-    let window = start; // scan the whole lead-in silence; it's short by construction
-    let ch0 = |f: usize| samples[f * channels];
-    let mut f = start;
-    let lo = start.saturating_sub(window);
-    while f > lo {
-        let cur = ch0(f);
-        let prev = ch0(f - 1);
-        if cur == 0 {
-            return f;
-        }
-        // Sign change between prev and cur → crossing sits at f.
-        if (prev <= 0 && cur >= 0) || (prev >= 0 && cur <= 0) {
-            return f;
-        }
-        f -= 1;
-    }
-    start
-}
-
-/// Extend a trailing edge later to the nearest zero crossing on channel 0, so the
-/// cleaned file ends on a zero-valued sample rather than a step.
-fn snap_zero_crossing_fwd(
-    samples: &[i32],
-    channels: usize,
-    end: usize,
-    total_frames: usize,
-) -> usize {
-    let ch0 = |f: usize| samples[f * channels];
-    let mut f = end;
-    while f + 1 < total_frames {
-        let cur = ch0(f);
-        let next = ch0(f + 1);
-        if cur == 0 {
-            return f;
-        }
-        if (cur <= 0 && next >= 0) || (cur >= 0 && next <= 0) {
-            return f;
-        }
-        f += 1;
-    }
-    end
-}
-
-/// Encode PCM bytes to FLAC or WAV using the native `AudioEncoder`.
-fn encode_native(
-    pcm: &[u8],
-    sample_rate: u32,
-    bit_depth: u32,
-    channels: u32,
-    format: &str,
-) -> Result<Vec<u8>, String> {
-    let fmt = if format == "wav" { "wav" } else { "flac" };
-    let mut encoder =
-        tune_core::audio::encoder::AudioEncoder::new(fmt, sample_rate, bit_depth, channels);
-
-    // The encoder API is async but CPU-bound internally; we're already on a
-    // blocking thread (spawn_blocking) with a live Tokio handle.
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(async {
-        encoder.start().await?;
-        encoder.write(pcm).await?;
-        encoder.finish().await
-    })
+    super::premium_audio_host::run_installed(
+        "declick",
+        &tune_plugin_declick::Declick,
+        input,
+        output,
+        &json!({"threshold_db": opts.threshold_db, "trim_lead": opts.trim_lead, "trim_tail": opts.trim_tail, "zero_cross": opts.zero_cross, "output_format": out_format}),
+        cancellation,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -636,104 +490,6 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
             }
         }
     }
-}
-
-/// Copy metadata tags (and cover art) from source to destination using lofty.
-fn copy_tags(source: &Path, dest: &Path) -> Result<(), String> {
-    use lofty::file::TaggedFileExt;
-    use lofty::tag::{Accessor, ItemKey, TagExt};
-
-    let src_tagged =
-        lofty::read_from_path(source).map_err(|e| format!("lofty read source: {e}"))?;
-
-    let src_tag = match src_tagged.primary_tag() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
-    let mut dst_tagged =
-        lofty::read_from_path(dest).map_err(|e| format!("lofty read dest: {e}"))?;
-
-    let tag_type = dst_tagged.primary_tag().map(|t| t.tag_type());
-    let dst_tag = if let Some(tt) = tag_type {
-        dst_tagged.tag_mut(tt).ok_or("cannot get dest tag")?
-    } else {
-        let tt = src_tag.tag_type();
-        dst_tagged.insert_tag(lofty::tag::Tag::new(tt));
-        dst_tagged.tag_mut(tt).ok_or("cannot create dest tag")?
-    };
-
-    if let Some(v) = src_tag.title() {
-        dst_tag.set_title(v.into_owned());
-    }
-    if let Some(v) = src_tag.artist() {
-        dst_tag.set_artist(v.into_owned());
-    }
-    if let Some(v) = src_tag.album() {
-        dst_tag.set_album(v.into_owned());
-    }
-    if let Some(v) = src_tag.genre() {
-        dst_tag.set_genre(v.into_owned());
-    }
-    if let Some(v) = src_tag.track() {
-        dst_tag.set_track(v);
-    }
-    if let Some(v) = src_tag.disk() {
-        dst_tag.set_disk(v);
-    }
-
-    for key in [
-        ItemKey::Composer,
-        ItemKey::Conductor,
-        ItemKey::Lyricist,
-        ItemKey::Performer,
-        ItemKey::Remixer,
-        ItemKey::Producer,
-        ItemKey::Isrc,
-        ItemKey::Label,
-        ItemKey::CatalogNumber,
-        ItemKey::Barcode,
-        ItemKey::Comment,
-        ItemKey::AlbumArtist,
-        ItemKey::AlbumArtistSortOrder,
-        ItemKey::TrackArtistSortOrder,
-        ItemKey::AlbumTitleSortOrder,
-        ItemKey::Year,
-        ItemKey::ReleaseDate,
-        ItemKey::OriginalReleaseDate,
-        ItemKey::Bpm,
-        ItemKey::Mood,
-        ItemKey::ContentGroup,
-        ItemKey::CopyrightMessage,
-        ItemKey::Language,
-        ItemKey::EncodedBy,
-        ItemKey::FlagCompilation,
-        ItemKey::Lyrics,
-        ItemKey::MusicBrainzRecordingId,
-        ItemKey::MusicBrainzReleaseId,
-        ItemKey::MusicBrainzArtistId,
-        ItemKey::MusicBrainzReleaseArtistId,
-        ItemKey::MusicBrainzReleaseGroupId,
-        ItemKey::MusicBrainzWorkId,
-        ItemKey::ReplayGainTrackGain,
-        ItemKey::ReplayGainTrackPeak,
-        ItemKey::ReplayGainAlbumGain,
-        ItemKey::ReplayGainAlbumPeak,
-    ] {
-        if let Some(item) = src_tag.get(key.clone()) {
-            dst_tag.push(item.clone());
-        }
-    }
-
-    for pic in src_tag.pictures() {
-        dst_tag.push_picture(pic.clone());
-    }
-
-    dst_tag
-        .save_to_path(dest, lofty::config::WriteOptions::default())
-        .map_err(|e| format!("lofty save: {e}"))?;
-
-    Ok(())
 }
 
 /// Build a ZIP archive (Stored, no compression) from all files in `dir`.

@@ -1,0 +1,28 @@
+[package]
+workspace = ".."
+name = "tune-plugin-converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+schemas = ["dep:schemars", "tune-plugin-sdk/schemas"]
+native = ["dep:tune-plugin-abi"]
+
+[dependencies]
+schemars = { version = "1", optional = true }
+tune-plugin-abi = {path = "../tune-plugin-abi", optional = true}
+serde.workspace = true
+serde_json.workspace = true
+tune-plugin-sdk.workspace = true
+
+[dev-dependencies]
+tune-plugin-testkit.workspace = true
+
+[[example]]
+name = "schema"
+required-features = ["schemas"]

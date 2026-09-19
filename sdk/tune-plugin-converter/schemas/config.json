@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Options",
+  "type": "object",
+  "properties": {
+    "bit_depth": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "destination": {
+      "$ref": "#/$defs/Destination",
+      "default": {
+        "kind": "download"
+      }
+    },
+    "format": {
+      "type": "string"
+    },
+    "quality": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sample_rate": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "format"
+  ],
+  "$defs": {
+    "Destination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "download"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "grant": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "directory_grant"
+            }
+          },
+          "required": [
+            "kind",
+            "grant"
+          ]
+        }
+      ]
+    }
+  }
+}
