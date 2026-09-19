@@ -215,6 +215,14 @@ mod tests {
 
     impl RangeServer {
         fn start(body: &'static [u8]) -> Self {
+            Self::start_au_rythme(body, std::time::Duration::from_millis(1))
+        }
+
+        /// `pause` entre deux blocs de 1 Kio : un CDN lent, pour qu'un fichier
+        /// de quelques dizaines de Kio mette assez longtemps à arriver et que
+        /// la propriété « premier PCM avant le dernier octet » soit observable
+        /// sans course.
+        fn start_au_rythme(body: &'static [u8], pause: std::time::Duration) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
@@ -231,7 +239,7 @@ mod tests {
                     if stop_bg.load(Ordering::SeqCst) {
                         break;
                     }
-                    serve_range(stream, body, &requests_bg, &full_bg);
+                    serve_range(stream, body, &requests_bg, &full_bg, pause);
                 }
             });
             Self {
@@ -263,6 +271,7 @@ mod tests {
         body: &[u8],
         requests: &Mutex<Vec<String>>,
         full_body_completed: &AtomicBool,
+        pause: std::time::Duration,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut lines = Vec::new();
@@ -305,7 +314,7 @@ mod tests {
             }
             // Rendre observable la propriete recherchee : le decodeur doit
             // produire du PCM pendant que le corps principal arrive encore.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(pause);
         }
         if complete && start == 0 && end + 1 == body.len() {
             full_body_completed.store(true, Ordering::SeqCst);
@@ -398,5 +407,59 @@ mod tests {
 
         while rx.recv().await.is_some() {}
         assert_eq!(decoder.await.unwrap().unwrap(), (32, 44_100));
+    }
+    /// #3568 — le même chemin, pour un FLAC : ce que Tidal (BTS) et Qobuz
+    /// servent. Le FLAC se lit dans l'ordre du fichier ; le premier bloc PCM
+    /// doit sortir alors que le CDN (lent : 10 ms par Kio) n'a pas fini
+    /// d'envoyer le corps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_premier_pcm_d_un_flac_arrive_avant_son_dernier_octet_3568() {
+        static FLAC: &[u8] = include_bytes!("../../tests/fixtures/flac/ref_16_44100_stereo.flac");
+        let server = RangeServer::start_au_rythme(FLAC, std::time::Duration::from_millis(10));
+        let url = server.url.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let (levels_tx, _levels_rx) = tokio::sync::mpsc::unbounded_channel();
+        let decoder = tokio::task::spawn_blocking(move || {
+            let source = HttpRangeSource::open(&url).unwrap();
+            crate::audio::decode::decode_http_range_to_pcm_streaming_seeked(
+                source,
+                "flac",
+                Some(44_100),
+                Some(2),
+                Some(32),
+                tx,
+                1_024,
+                ready,
+                levels_tx,
+                0.0,
+            )
+        });
+
+        let header = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("entete WAV sans attendre le FLAC entier")
+            .expect("entete WAV");
+        assert_eq!(header.len(), 44);
+        let pcm = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("premier PCM sans attendre le FLAC entier")
+            .expect("premier bloc PCM");
+        assert!(!pcm.is_empty());
+        assert!(
+            !server.full_body_completed.load(Ordering::SeqCst),
+            "le premier PCM a attendu le dernier octet du FLAC; ranges={:?}",
+            server.requests.lock().unwrap()
+        );
+
+        let mut octets_pcm = pcm.len();
+        while let Some(bloc) = rx.recv().await {
+            octets_pcm += bloc.len();
+        }
+        assert_eq!(decoder.await.unwrap().unwrap(), (32, 44_100));
+        assert!(
+            octets_pcm > 44_100,
+            "tout le FLAC decode: {octets_pcm} octets"
+        );
     }
 }
