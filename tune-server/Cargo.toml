@@ -9,6 +9,8 @@ autotests = false
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
+# #4378 : lecture des DSDIFF compressés DST (désarmée, décision de licence).
+dst = ["tune-core/dst"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]
 postgres = ["tune-core/postgres"]
