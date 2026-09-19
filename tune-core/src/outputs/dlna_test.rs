@@ -1140,6 +1140,81 @@ mod tests {
         handle.abort();
     }
 
+    /// Récupère la sortie `tracing` d'une commande : c'est le journal, et lui
+    /// seul, que le support aura entre les mains.
+    #[derive(Clone, Default)]
+    struct JournalCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// #4442 — `Seek` est le seul verbe AVTransport dont le journal ne disait
+    /// ni le départ ni l'issue : `Play` et `Pause` ont leur couple
+    /// `dlna_command_sending` / `dlna_command_finished`, `Stop` son
+    /// `dlna_stop`, `SetAVTransportURI` son `dlna_set_uri_ok`. Un transfert
+    /// vers une zone DLNA qui « repart du début » (FabienM, Devialet Phantom,
+    /// 0.9.154) ne pouvait donc pas être instruit sur pièces : rien ne disait
+    /// si le `Seek` de `do_transfer` était parti, ni ce que le renderer en
+    /// avait fait. Même mesure que `Play`/`Pause`, mêmes champs.
+    #[tokio::test]
+    async fn dlna_seek_laisse_son_issue_dans_le_journal() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let garde = tracing::subscriber::set_default(abonne);
+        output.seek(161_000).await.unwrap();
+        drop(garde);
+
+        let texte = journal.texte();
+        let issue = texte
+            .lines()
+            .find(|l| l.contains("dlna_command_finished") && l.contains("action=\"Seek\""));
+        let Some(issue) = issue else {
+            panic!(
+                "aucune ligne `dlna_command_finished … action=\"Seek\"` : le journal ne dit \
+                 pas ce que le renderer a fait du Seek — journal capturé :\n{texte}"
+            );
+        };
+        assert!(
+            issue.contains("outcome=\"response_received\""),
+            "l'issue du Seek doit être nommée : {issue}"
+        );
+        assert!(
+            texte
+                .lines()
+                .any(|l| l.contains("dlna_command_sending") && l.contains("action=\"Seek\"")),
+            "le départ du Seek doit aussi être journalisé — journal capturé :\n{texte}"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn dlna_set_volume() {
         let state = MockState::default();
@@ -2431,6 +2506,60 @@ mod tests {
                 texte.contains("veille"),
                 "le message doit nommer la conduite qui debloque : un ampli en \
                  veille reseau, a rallumer : {texte:?}"
+            );
+            handle.abort();
+        }
+
+        /// #3580 — le flux SURVIT à un `Play` acquitté sans effet.
+        ///
+        /// Ticket support 141 (Reivax66, AVR-X1600H, 0.9.151, après une nuit
+        /// de veille) : `output_send_failed_stopping_zone_immediately` puis
+        /// `stream_session_removed`, à la même milliseconde. Tune détruisait
+        /// le flux que l'ampli venait de se voir ordonner d'aller chercher —
+        /// le même ampli qui, au ticket 109, a fini par tenir l'URI à 47 s.
+        /// `SetAVTransportURI` et `Play` ont été acquittés : la commande a été
+        /// REÇUE, seul son effet manque ; c'est la règle du timeout, pas celle
+        /// du refus.
+        #[tokio::test]
+        async fn le_flux_survit_a_un_play_acquitte_sans_effet() {
+            let state = MockState::default();
+            *state.media_info_fige.lock().await = true;
+            *state.current_uri.lock().await = String::new();
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, _recu, _dir) =
+                banc_avec(make_dlna(&base).with_budget_reveil_ms(300)).await;
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("play() rend Ok");
+            assert!(
+                !resultat.output_sent,
+                "le renderer ne tient rien : la lecture doit être refusée"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le Play doit avoir été ACQUITTÉ : c'est le cas mesuré"
+            );
+            let url = resultat
+                .stream_url
+                .clone()
+                .expect("une lecture refusée nomme quand même son URL de flux");
+            let sid = url
+                .rsplit('/')
+                .next()
+                .and_then(|f| f.split('.').next())
+                .expect("…/stream/<id>.<ext>")
+                .to_string();
+            assert!(
+                orch.stream_session_alive(&sid).await,
+                "la session {sid} a été détruite alors que le renderer a ACQUITTÉ \
+                 SetAVTransportURI et Play : l'ampli qui finit de sortir de veille \
+                 trouvera un 404 là où on vient de l'envoyer (#3580)"
             );
             handle.abort();
         }
