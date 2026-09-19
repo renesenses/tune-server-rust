@@ -43,6 +43,9 @@ use serde::Serialize;
 /// le pilote avant le producteur. Jamais 99 : c'est la bande des fils de
 /// migration et de chien de garde du noyau.
 pub const PRIORITE_VISEE: u32 = 70;
+// La cible reste sous le plafond de Tune OS (`LimitRTPRIO=95`) et au-dessus des
+// IRQ filées du noyau (50) : jugé à la compilation.
+const _: () = assert!(PRIORITE_VISEE < 95 && PRIORITE_VISEE > 50);
 
 /// Nom de la politique demandée, tel qu'il paraît dans le journal et l'état.
 pub const POLITIQUE: &str = "SCHED_FIFO";
@@ -200,13 +203,6 @@ mod tests {
     fn le_maximum_de_la_politique_borne_aussi() {
         assert_eq!(priorite_bornee(None, 32), 32);
         assert_eq!(priorite_bornee(Some(95), 0), 1);
-    }
-
-    /// La cible reste sous le plafond de Tune OS et hors de la bande du noyau.
-    #[test]
-    fn la_cible_tient_sous_le_plafond_de_tune_os() {
-        assert!(PRIORITE_VISEE < 95, "au-dessus de LimitRTPRIO=95");
-        assert!(PRIORITE_VISEE > 50, "sous les IRQ filées du noyau");
     }
 
     /// L'état se sérialise avec un discriminant lisible par un écran.
