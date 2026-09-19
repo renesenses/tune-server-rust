@@ -202,12 +202,37 @@ async fn sans_parametre_la_liste_d_albums_est_inchangee_2144() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(total(&body), 6, "le total reste celui de la bibliothèque");
     assert_eq!(titres(&body).len(), 6, "les six albums sont rendus");
-    // Et aucune clé nouvelle ne s'invite dans la charge utile d'un album.
-    let premier = &body["items"][0];
-    assert!(
-        premier.get("dynamic_range").is_none(),
-        "le contrat de la GRILLE ne change pas : le DR se lit sur la fiche \
-         album (#1809) et par piste (#1388), pas dans la liste"
+    // #4521 — la GRILLE porte désormais le DR de chaque album : sans lui, le
+    // client v2 ne voyait aucun album porteur et cachait son tri. Même règle
+    // et même type que la fiche ; `null` sans DR, jamais `0`. (Ce test
+    // exigeait jusque-là l'ABSENCE de la clé — contrat renversé à dessein.)
+    let items = body["items"].as_array().expect("items");
+    let dr_de_l_album = |titre: &str| -> Value {
+        items
+            .iter()
+            .find(|a| a["title"] == titre)
+            .unwrap_or_else(|| panic!("album « {titre} » absent"))
+            .get("dynamic_range")
+            .cloned()
+            .unwrap_or_else(|| panic!("« {titre} » : clé `dynamic_range` absente de la liste"))
+    };
+    assert_eq!(
+        dr_de_l_album("Alpha"),
+        Value::from("6"),
+        "le tag d'album prime"
+    );
+    assert_eq!(dr_de_l_album("Bravo"), Value::from("14"));
+    assert_eq!(dr_de_l_album("Charlie"), Value::from("9"));
+    assert_eq!(dr_de_l_album("Delta"), Value::Null, "sans DR : null");
+    assert_eq!(
+        dr_de_l_album("Echo"),
+        Value::Null,
+        "« DR12.5 » n'est pas un DR"
+    );
+    assert_eq!(
+        dr_de_l_album("Foxtrot"),
+        Value::from("0"),
+        "DR0 est une mesure"
     );
 }
 
