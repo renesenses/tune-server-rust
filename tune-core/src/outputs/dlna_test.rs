@@ -2434,6 +2434,60 @@ mod tests {
             );
             handle.abort();
         }
+
+        /// #3580 — le flux SURVIT à un `Play` acquitté sans effet.
+        ///
+        /// Ticket support 141 (Reivax66, AVR-X1600H, 0.9.151, après une nuit
+        /// de veille) : `output_send_failed_stopping_zone_immediately` puis
+        /// `stream_session_removed`, à la même milliseconde. Tune détruisait
+        /// le flux que l'ampli venait de se voir ordonner d'aller chercher —
+        /// le même ampli qui, au ticket 109, a fini par tenir l'URI à 47 s.
+        /// `SetAVTransportURI` et `Play` ont été acquittés : la commande a été
+        /// REÇUE, seul son effet manque ; c'est la règle du timeout, pas celle
+        /// du refus.
+        #[tokio::test]
+        async fn le_flux_survit_a_un_play_acquitte_sans_effet() {
+            let state = MockState::default();
+            *state.media_info_fige.lock().await = true;
+            *state.current_uri.lock().await = String::new();
+            let (base, handle) = start_mock(state.clone()).await;
+            let (orch, zone_id, _recu, _dir) =
+                banc_avec(make_dlna(&base).with_budget_reveil_ms(300)).await;
+            let resultat = orch
+                .play(PlayRequest {
+                    zone_id,
+                    track_id: Some(1),
+                    source: Some("local".into()),
+                    ..Default::default()
+                })
+                .await
+                .expect("play() rend Ok");
+            assert!(
+                !resultat.output_sent,
+                "le renderer ne tient rien : la lecture doit être refusée"
+            );
+            assert!(
+                state.play_count.load(Ordering::Relaxed) >= 1,
+                "le Play doit avoir été ACQUITTÉ : c'est le cas mesuré"
+            );
+            let url = resultat
+                .stream_url
+                .clone()
+                .expect("une lecture refusée nomme quand même son URL de flux");
+            let sid = url
+                .rsplit('/')
+                .next()
+                .and_then(|f| f.split('.').next())
+                .expect("…/stream/<id>.<ext>")
+                .to_string();
+            assert!(
+                orch.stream_session_alive(&sid).await,
+                "la session {sid} a été détruite alors que le renderer a ACQUITTÉ \
+                 SetAVTransportURI et Play : l'ampli qui finit de sortir de veille \
+                 trouvera un 404 là où on vient de l'envoyer (#3580)"
+            );
+            handle.abort();
+        }
     }
     // ───────────────────────────────────────────────────────────────────────
     // #3829 — le renderer a redémarré sur un AUTRE port : Tune doit le
