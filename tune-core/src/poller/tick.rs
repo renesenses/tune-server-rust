@@ -2461,6 +2461,29 @@ impl PositionPoller {
                             status.position_ms,
                             wall_elapsed,
                         );
+                    // #4382, cas 2 — le même DMP-A6, lu sur SA propre horloge :
+                    // position épinglée sur sa durée depuis un sondage, et le
+                    // renderer nomme encore le flux de la piste finie. Il
+                    // n'enchaînera pas (25/08 : PLAYING éternel) ; attendre
+                    // `durée + END_MARGIN_MS` sur l'horloge de Tune n'ajoutait
+                    // que du silence.
+                    let epingle_piste_finie = !in_seek_grace
+                        && decisions::dlna_epingle_sur_la_piste_finie(
+                            is_dlna,
+                            ps.gapless_sent,
+                            played_enough,
+                            track_duration_ms,
+                            status.duration_ms,
+                            status.position_ms,
+                            prev_position_ms,
+                            decisions::uri_nomme_le_flux(
+                                status.current_uri.as_deref(),
+                                zone_state
+                                    .now_playing
+                                    .as_ref()
+                                    .and_then(|np| np.stream_id.as_deref()),
+                            ),
+                        );
                     // A non-realtime output may still be processing after the
                     // nominal track duration. Only its actual completion can
                     // end the track; renderer position/clock fallbacks cannot.
@@ -2469,7 +2492,8 @@ impl PositionPoller {
                             || reached_end_exclusive
                             || wall_clock_past_end
                             || chromecast_wall_clock_past_end
-                            || dlna_frozen_end)
+                            || dlna_frozen_end
+                            || epingle_piste_finie)
                     {
                         ps.past_end_ticks += 1;
                         // #4173 — la fin à l'horloge ne dit pas que le renderer
@@ -2486,8 +2510,21 @@ impl PositionPoller {
                         // #4382 — le seuil dépend de la SIGNATURE. Gelé à la
                         // durée avec un `SetNext` accepté : un sondage suffit,
                         // et l'auditeur récupère deux secondes de musique.
-                        let seuil_ticks =
+                        let seuil_horloge =
                             decisions::seuil_ticks_de_fin(dlna_frozen_end, ps.gapless_sent);
+                        // #4382, cas 2 — l'épinglage conclut sur son propre
+                        // compte de sondages, sans attendre l'horloge de Tune.
+                        let seuil_epingle = decisions::ticks_epingle_sur_la_piste_finie(
+                            track_duration_ms,
+                            status.duration_ms,
+                        );
+                        let conclu_par_epingle =
+                            epingle_piste_finie && ps.past_end_ticks >= seuil_epingle;
+                        let seuil_ticks = if conclu_par_epingle {
+                            seuil_epingle
+                        } else {
+                            seuil_horloge
+                        };
                         let (enchainement, flux_arme, octets_tires) =
                             if ps.past_end_ticks >= seuil_ticks {
                                 self.enchainement_a_l_horloge(
@@ -2520,8 +2557,11 @@ impl PositionPoller {
                             )
                             .await;
                         } else if ps.past_end_ticks >= seuil_ticks {
-                            let motif_de_la_fin =
-                                decisions::motif_position_au_dela(dlna_frozen_end, ps.gapless_sent);
+                            let motif_de_la_fin = if conclu_par_epingle {
+                                decisions::motif_fin::POSITION_EPINGLEE_PISTE_FINIE_DLNA
+                            } else {
+                                decisions::motif_position_au_dela(dlna_frozen_end, ps.gapless_sent)
+                            };
                             info!(
                                 zone_id,
                                 position_ms = status.position_ms,
@@ -2532,6 +2572,12 @@ impl PositionPoller {
                                 wall_clock_end = wall_clock_past_end,
                                 cast_wall_clock_end = chromecast_wall_clock_past_end,
                                 dlna_frozen_end,
+                                // #4382 — la fin lue sur l'horloge du renderer,
+                                // et ce qu'il rapportait : sa durée, sa position
+                                // au sondage d'avant.
+                                epingle_piste_finie,
+                                duree_renderer = status.duration_ms,
+                                position_precedente = prev_position_ms,
                                 enchainement = ?enchainement,
                                 // #4382 — sans ces trois champs, le journal ne
                                 // dit pas LAQUELLE des trois branches a conclu

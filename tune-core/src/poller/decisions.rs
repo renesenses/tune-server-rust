@@ -125,6 +125,10 @@ pub mod motif_fin {
     /// La même fin, prononcée sur la signature GELÉE d'un renderer DLNA qui a
     /// accepté un `SetNext` (#4382) : un sondage au lieu de trois.
     pub const POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA: &str = "position_past_end_frozen_dlna";
+    /// La même fin, prononcée sur l'horloge du RENDERER (#4382, cas 2) :
+    /// position épinglée sur sa durée, URI de la piste finie, `SetNext`
+    /// accepté — sans attendre `END_MARGIN_MS` sur l'horloge de Tune.
+    pub const POSITION_EPINGLEE_PISTE_FINIE_DLNA: &str = "position_pinned_finished_uri_dlna";
 }
 
 /// Sondages à tenir avant de prononcer la fin « position au-delà de la fin ».
@@ -190,6 +194,9 @@ pub fn plancher_de_detection_ms(motif: &str) -> u64 {
         motif_fin::POSITION_AU_DELA_DE_LA_FIN_GELE_DLNA => {
             END_MARGIN_MS + TICKS_GELE_DLNA_AVEC_SETNEXT as u64 * tick
         }
+        // Un sondage pour voir la position inchangée sur la durée rapportée
+        // (au moins un de plus quand le bout caché par l'arrondi est long).
+        motif_fin::POSITION_EPINGLEE_PISTE_FINIE_DLNA => tick,
         _ => 0,
     }
 }
@@ -927,6 +934,84 @@ pub fn dlna_frozen_at_end_wall_clock(
         && track_duration_ms > END_MARGIN_MS
         && position_ms.saturating_add(2000) >= track_duration_ms
         && wall_elapsed_secs.saturating_mul(1000) >= track_duration_ms.saturating_add(END_MARGIN_MS)
+}
+
+/// Marge exigée, au-delà de la durée de la FILE, sur l'horloge du renderer
+/// déduite de sa position épinglée (#4382) : couvre le bout de piste que
+/// l'arrondi de `RelTime` à la seconde cache (237 000 affiché pour 237 651).
+pub const MARGE_QUEUE_EPINGLEE_MS: u64 = 250;
+
+/// #4382, cas 2 — le renderer DLNA a accepté un `SetNext`, sa position est
+/// ÉPINGLÉE sur SA durée (elle n'a pas bougé depuis le sondage précédent) et
+/// il nomme LUI-MÊME encore le flux de la piste finie.
+///
+/// Le journal du 18/09 (Villerio, DMP-A6, 0.9.155) : `reported_duration_ms=237000`,
+/// position 207 000 à 20:11:47.186 puis +1 000 par sondage, donc épinglée à
+/// 237 000 dès ~20:12:17 ; `uri_courante` = le flux de « Speak to Me/Breathe ».
+/// Le 25/08, le même appareil laissé à lui-même est resté PLAYING à la durée
+/// pour toujours : il n'enchaîne pas. Chaque seconde passée à attendre
+/// `durée de la file + END_MARGIN_MS` sur l'horloge de TUNE — qui, sur cet
+/// appareil, avance ~2 s devant celle du renderer (Play à 20:08:17.28,
+/// position 0 vers 20:08:19.7) — est une seconde de silence : la fin n'était
+/// prononcée qu'à 20:12:20.219.
+///
+/// Ici, c'est l'horloge du RENDERER qui décide : une position épinglée depuis
+/// un sondage entier sur une durée arrondie à la seconde prouve que le bout
+/// de piste est joué (voir [`ticks_epingle_sur_la_piste_finie`]).
+///
+/// Garde-fous : DLNA, `SetNext` envoyé, pic honnête ; durée rapportée non
+/// nulle et au plus 2 s sous celle de la file (un renderer qui plafonne sa
+/// position sur une durée fausse ne passe pas) ; position ≥ durée rapportée
+/// et INCHANGÉE (un renderer qui joue encore avance) ; URI courante = flux de
+/// la piste finie (un renderer qui enchaîne nomme le flux armé ; un renderer
+/// muet sur son URI garde le chemin à l'horloge).
+#[allow(clippy::too_many_arguments)]
+pub fn dlna_epingle_sur_la_piste_finie(
+    is_dlna: bool,
+    gapless_sent: bool,
+    played_enough: bool,
+    track_duration_ms: u64,
+    reported_duration_ms: u64,
+    position_ms: u64,
+    position_precedente_ms: u64,
+    uri_nomme_la_piste_finie: bool,
+) -> bool {
+    is_dlna
+        && gapless_sent
+        && played_enough
+        && uri_nomme_la_piste_finie
+        && reported_duration_ms > END_MARGIN_MS
+        && reported_duration_ms <= track_duration_ms
+        && reported_duration_ms.saturating_add(2000) >= track_duration_ms
+        && position_ms >= reported_duration_ms
+        && position_ms == position_precedente_ms
+}
+
+/// Sondages épinglés à tenir avant de conclure (#4382). Le premier sondage
+/// qui voit la position INCHANGÉE sur la durée rapportée arrive au moins un
+/// sondage après que le renderer a atteint cette durée ; au n-ième, son
+/// horloge a donc passé `durée rapportée + n × POLL_INTERVAL_MS`. On exige
+/// qu'elle ait passé la durée de la file + [`MARGE_QUEUE_EPINGLEE_MS`] :
+/// 237 000 / 237 651 → un sondage.
+pub fn ticks_epingle_sur_la_piste_finie(track_duration_ms: u64, reported_duration_ms: u64) -> u8 {
+    let reste = track_duration_ms
+        .saturating_add(MARGE_QUEUE_EPINGLEE_MS)
+        .saturating_sub(reported_duration_ms);
+    reste
+        .div_ceil(POLL_INTERVAL_MS)
+        .clamp(1, POSITION_PAST_END_TICKS as u64) as u8
+}
+
+/// Le renderer nomme-t-il encore le flux de la piste qui vient de finir ?
+/// `false` sans URI ou sans flux connu : on ne devine pas.
+pub fn uri_nomme_le_flux(current_uri: Option<&str>, stream_id: Option<&str>) -> bool {
+    match (
+        current_uri.map(str::trim).filter(|u| !u.is_empty()),
+        stream_id.filter(|s| !s.is_empty()),
+    ) {
+        (Some(uri), Some(flux)) => uri.contains(flux),
+        _ => false,
+    }
 }
 
 // ─────────────── fin à l'horloge : le renderer a-t-il déjà enchaîné ? ───────────────
