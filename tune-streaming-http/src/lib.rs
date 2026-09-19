@@ -624,7 +624,54 @@ async fn service_artist_top_tracks(
 ) -> Response {
     with_svc!(&state, &service, |svc| svc
         .get_artist_top_tracks(&artist_id)
-        .await)
+        .await
+        .map(dedoublonner_titres_phares))
+}
+
+/// Écart de durée sous lequel deux titres phares de même nom et de même
+/// interprète sont tenus pour le MÊME enregistrement — la même tolérance que
+/// `POINTS_DUREE_QUASI_EGALE` du rapprochement des versions (« le même master,
+/// ou son remaster »).
+const TOLERANCE_DUREE_TITRES_PHARES_MS: u64 = 2_000;
+
+/// #4444 — FabienM (fil 1839, point 11) : sur la page artiste de Cat Power,
+/// « Try Me » (2:19) sort aux rangs 1 ET 4 des TITRES PHARES, sur les DEUX
+/// présentations de la page — le doublon est donc en amont du rendu, ici.
+///
+/// Qobuz (`artist/get?extra=tracks`) rend le même enregistrement une fois par
+/// ÉDITION de l'album qui le porte : même titre, même interprète, même durée,
+/// même pochette, deux identifiants de piste. Une liste de titres phares est
+/// une liste de MORCEAUX ; deux éditions du même morceau y sont une place
+/// perdue. On garde la première occurrence — l'ordre est celui du service,
+/// par popularité.
+///
+/// Deux clefs, dans l'ordre : l'identifiant (le même id deux fois est un
+/// doublon quelle que soit sa fiche), puis (titre, interprète) à la casse
+/// près avec une durée à [`TOLERANCE_DUREE_TITRES_PHARES_MS`] près. Une durée
+/// inconnue (0) ne rapproche rien : elle n'est pas un signal.
+pub(crate) fn dedoublonner_titres_phares(
+    pistes: Vec<tune_core::streaming::traits::StreamTrack>,
+) -> Vec<tune_core::streaming::traits::StreamTrack> {
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut gardees: Vec<tune_core::streaming::traits::StreamTrack> =
+        Vec::with_capacity(pistes.len());
+    for piste in pistes {
+        if !piste.id.is_empty() && !ids.insert(piste.id.clone()) {
+            continue;
+        }
+        let meme_morceau = |g: &tune_core::streaming::traits::StreamTrack| {
+            g.duration_ms > 0
+                && piste.duration_ms > 0
+                && g.duration_ms.abs_diff(piste.duration_ms) <= TOLERANCE_DUREE_TITRES_PHARES_MS
+                && g.title.trim().eq_ignore_ascii_case(piste.title.trim())
+                && g.artist.trim().eq_ignore_ascii_case(piste.artist.trim())
+        };
+        if gardees.iter().any(meme_morceau) {
+            continue;
+        }
+        gardees.push(piste);
+    }
+    gardees
 }
 
 async fn service_playlists(
