@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::metadata::disques_abimes::{Correction, PisteAExaminer, corrections};
 use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::error::AppError;
@@ -3358,4 +3359,119 @@ mod tests_tri_added_at {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Coffrets ripés en CD1/CD2 : réparer le numéro de disque — #4471
+// ---------------------------------------------------------------------------
+
+/// Les pistes d'un album dont deux se marchent dessus, telles que la
+/// réparation a besoin de les voir.
+///
+/// 🔴 La requête ne ramène QUE les albums abîmés. Partir de « tous les albums
+/// à plusieurs dossiers de disque » ferait relire une bibliothèque entière
+/// pour, dans l'immense majorité des cas, ne rien trouver : un coffret bien
+/// tagué a lui aussi des dossiers `CD1/`, `CD2/`, et n'a rien à réparer.
+const SQL_PISTES_ABIMEES: &str = "\
+    SELECT t.id, t.album_id, t.file_path, t.disc_number, t.track_number \
+    FROM tracks t \
+    WHERE t.album_id IN ( \
+        SELECT album_id FROM tracks \
+        WHERE album_id IS NOT NULL AND track_number IS NOT NULL \
+        GROUP BY album_id, COALESCE(disc_number, 1), track_number \
+        HAVING COUNT(*) > 1 \
+    ) AND t.file_path IS NOT NULL AND t.file_path <> ''";
+
+fn pistes_abimees(state: &AppState) -> Vec<PisteAExaminer> {
+    state
+        .backend
+        .query_many(SQL_PISTES_ABIMEES, &[])
+        .ou_defaut_journalise()
+        .into_iter()
+        .filter_map(|r| {
+            Some(PisteAExaminer {
+                id: r.first().and_then(|v| v.as_i64())?,
+                album_id: r.get(1).and_then(|v| v.as_i64())?,
+                file_path: r.get(2).and_then(|v| v.as_string())?,
+                disc_number: r.get(3).and_then(|v| v.as_i64()).map(|n| n as u32),
+                track_number: r.get(4).and_then(|v| v.as_i64()).map(|n| n as u32),
+            })
+        })
+        .collect()
+}
+
+/// Le compte rendu, identique en aperçu et après écriture : l'utilisateur voit
+/// la même chose avant et après, et peut comparer.
+fn rapport_disques(corr: &[Correction], applique: bool) -> Value {
+    let mut par_album: std::collections::BTreeMap<i64, Vec<&Correction>> = Default::default();
+    for c in corr {
+        par_album.entry(c.album_id).or_default().push(c);
+    }
+    let albums: Vec<Value> = par_album
+        .iter()
+        .map(|(id, v)| {
+            let mut disques: Vec<u32> = v.iter().map(|c| c.apres).collect();
+            disques.sort_unstable();
+            disques.dedup();
+            json!({
+                "album_id": id,
+                "pistes": v.len(),
+                "disques": disques,
+            })
+        })
+        .collect();
+    json!({
+        "applique": applique,
+        "albums": albums.len(),
+        "pistes": corr.len(),
+        "details": albums,
+    })
+}
+
+/// `GET /library/albums/disques-abimes` — CE QUI SERAIT CHANGÉ, sans rien changer.
+///
+/// L'aperçu et l'application partagent la même détection : ce que l'écran
+/// montre est exactement ce que l'écriture fera.
+pub(super) async fn disques_abimes(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let corr = corrections(&pistes_abimees(&state));
+    Ok(Json(rapport_disques(&corr, false)))
+}
+
+/// `POST /library/albums/disques-abimes/reparer` — écrit les numéros de disque.
+///
+/// ⚠️ N'écrit QUE `tracks.disc_number`, et seulement sur les pistes que la
+/// détection nomme. Les tags des fichiers ne sont pas touchés : réparer la
+/// base est réversible d'un rescan, réécrire un FLAC ne l'est pas.
+pub(super) async fn reparer_disques(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let corr = corrections(&pistes_abimees(&state));
+    for c in &corr {
+        let (p1, p2) = match state.backend.engine() {
+            Engine::Postgres => (
+                PostgresDialect.placeholder(1),
+                PostgresDialect.placeholder(2),
+            ),
+            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+        };
+        state
+            .backend
+            .execute(
+                &format!("UPDATE tracks SET disc_number = {p1} WHERE id = {p2}"),
+                &[&(c.apres as i64) as &dyn ToSqlValue, &c.track_id],
+            )
+            .map_err(AppError::internal)?;
+    }
+    if !corr.is_empty() {
+        tracing::info!(
+            albums = corr
+                .iter()
+                .map(|c| c.album_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            pistes = corr.len(),
+            "disques_abimes_repares"
+        );
+    }
+    Ok(Json(rapport_disques(&corr, true)))
 }
