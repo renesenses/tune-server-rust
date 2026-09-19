@@ -1969,6 +1969,68 @@ mod tests_versions_piste {
         );
     }
 
+    /// #4468 — une version LOCALE transporte `artist_name`, sous le MÊME nom
+    /// que le chemin service. La requête joignait déjà les deux tables
+    /// d'artistes (il en faut pour rapprocher) mais n'en sélectionnait aucune :
+    /// l'écran affichait l'album sans l'interprète, là où une reprise de
+    /// service l'affichait. Le nom rendu est celui de la PISTE (`ar2`), pas
+    /// celui de l'album : sur une compilation créditée « Artistes divers »,
+    /// c'est l'interprète qui distingue une version.
+    #[tokio::test]
+    async fn une_version_locale_transporte_le_nom_de_l_interprete() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+
+        b.execute("INSERT INTO artists (name) VALUES ('Kate Bush')", &[])
+            .unwrap();
+        let kate = b.last_insert_rowid();
+        b.execute("INSERT INTO artists (name) VALUES ('Artistes divers')", &[])
+            .unwrap();
+        let divers = b.last_insert_rowid();
+
+        let album = |titre: &str, artiste: i64| {
+            b.execute(
+                "INSERT INTO albums (title, artist_id) VALUES (?1, ?2)",
+                &[&titre as &dyn ToSqlValue, &artiste as &dyn ToSqlValue],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let hounds = album("Hounds Of Love", kate);
+        let compilation = album("Hit Collection", divers);
+
+        let piste = |titre: &str, album_id: i64, chemin: &str| {
+            b.execute(
+                "INSERT INTO tracks (title, album_id, artist_id, duration_ms, file_path) \
+                 VALUES (?1, ?2, ?3, 296000, ?4)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album_id as &dyn ToSqlValue,
+                    &kate as &dyn ToSqlValue,
+                    &chemin as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+            b.last_insert_rowid()
+        };
+        let seed = piste("Running Up That Hill", hounds, "/hounds.flac");
+        // La version vit sur une compilation dont l'ARTISTE D'ALBUM n'est
+        // pas Kate Bush : seule la table jointe sur la piste dit la vérité.
+        piste("Running Up That Hill", compilation, "/hit.flac");
+
+        let v = rassembler_versions(&state, seed, 50, false, &FiltreSources::tout())
+            .await
+            .expect("la piste existe");
+        let versions = v["versions"].as_array().expect("versions locales");
+        assert_eq!(versions.len(), 1, "versions rendues : {versions:?}");
+        assert_eq!(
+            versions[0]["artist_name"].as_str(),
+            Some("Kate Bush"),
+            "une version locale doit porter l'interprète de la PISTE : {:?}",
+            versions[0]
+        );
+    }
+
     /// « Beat It » n'a aucune autre version : un groupe VIDE, pas une erreur.
     /// Le client en tire « aucune autre version connue ».
     #[tokio::test]
