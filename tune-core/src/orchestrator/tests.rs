@@ -8198,3 +8198,80 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
         "« Récemment joué » ne doit plus aligner des cartes « Episode »"
     );
 }
+
+/// #4311 — Bandcamp sur la SORTIE LOCALE : spectre et bargraphe inertes
+/// (GgB, 0.9.153, « HDA Intel PCH, ALC269VC Analog »). Le bras local rendait
+/// l'URL amont telle quelle sans lancer aucune sonde : aucun
+/// `playback.audio_levels` ne partait pour la zone. Le flux est un serveur
+/// WAV local one-shot ; l'URL n'a pas de marqueur de qualité Bandcamp, donc
+/// l'indice de codec est le repli `mp3` — le sondeur reconnaît le conteneur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bandcamp_en_sortie_locale_emet_des_niveaux() {
+    let url = spawn_oneshot_wav_server(3);
+    let mut orch = test_orchestrator();
+    let bus = Arc::new(EventBus::new());
+    orch.event_bus = Some(bus.clone());
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 4311", Some("local"), None)
+        .unwrap();
+    orch.playback
+        .play(zone_id, crate::playback::NowPlaying::default())
+        .await;
+    let mut rx = bus.subscribe();
+
+    let req = super::PlayRequest {
+        zone_id,
+        output_device_id: None,
+        track_id: None,
+        source: Some("bandcamp".into()),
+        source_id: Some(url.clone()),
+        title: Some("Move (You Make Me Feel)".into()),
+        artist_name: Some("Framewerk".into()),
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(3_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: Some("mp3".into()),
+        track_number: None,
+        disc_number: None,
+    };
+    let resolved = orch.resolve_stream(&req).await.unwrap();
+    assert_eq!(
+        resolved.url, url,
+        "sortie locale : l'URL amont reste servie telle quelle, la sonde n'est qu'un observateur"
+    );
+    assert!(
+        resolved.stream_id.is_none(),
+        "aucune session proxy sur ce bras"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let restant = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !restant.is_zero(),
+            "aucun playback.audio_levels pour la zone {zone_id} en 5 s : la sortie locale Bandcamp ne mesure rien"
+        );
+        match tokio::time::timeout(restant, rx.recv()).await {
+            Ok(Ok(ev))
+                if ev.event_type == "playback.audio_levels"
+                    && ev.data["zone_id"].as_i64() == Some(zone_id) =>
+            {
+                assert_eq!(ev.data["observation_point"], "decoded_source");
+                assert!(
+                    ev.data["spectrum"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty()),
+                    "spectre vide"
+                );
+                break;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => continue,
+            Err(_) => panic!("aucun playback.audio_levels pour la zone {zone_id} en 5 s"),
+        }
+    }
+}
