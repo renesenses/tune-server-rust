@@ -804,6 +804,17 @@ pub struct PlaybackOrchestrator {
     /// Verrous std : accès très courts, jamais tenus à travers un await.
     eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
     eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// Le traitement que chaque flux RÉSOLU porte dans ses octets (#4407) :
+    /// `zone_id → [(stream_id, empreinte)]`, les plus récents en dernier,
+    /// bornés à [`Self::FLUX_TRAITES_PAR_ZONE`].
+    ///
+    /// L'empreinte est lue AVANT la résolution, par `resolve_stream` — le seul
+    /// passage commun de la lecture, de la relance et du pré-armement gapless.
+    /// `apply_eq_change` la retrouve par le `stream_id` que la zone JOUE : une
+    /// relance abandonnée (anti-rebond, plancher) ne change pas ce flux, donc
+    /// pas son empreinte ; un flux adopté en gapless apporte la sienne.
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    traitement_des_flux: std::sync::Mutex<std::collections::HashMap<i64, Vec<(String, String)>>>,
     /// Per-zone record of the last track pushed to a NETWORK renderer:
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
@@ -1156,6 +1167,7 @@ impl PlaybackOrchestrator {
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
+            traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             #[cfg(feature = "local-audio")]

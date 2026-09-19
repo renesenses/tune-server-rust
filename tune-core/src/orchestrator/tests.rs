@@ -8292,3 +8292,213 @@ async fn bandcamp_en_sortie_locale_emet_des_niveaux() {
         }
     }
 }
+
+// ------------------------------------------------------------------
+// #4407 — un changement d'égaliseur ne refabrique le flux réseau que si
+// le flux qui JOUE ne porte pas déjà ce traitement.
+// ------------------------------------------------------------------
+
+fn relances_programmees_4407(orch: &PlaybackOrchestrator, zone_id: i64) -> u64 {
+    orch.eq_replay_gen
+        .lock()
+        .unwrap()
+        .get(&zone_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn ecrire_profil_4407(
+    orch: &PlaybackOrchestrator,
+    zone_id: i64,
+    profil: &crate::audio::eq::EqProfile,
+) {
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(profil).unwrap(),
+        )
+        .unwrap();
+    settings.set("plugin_equalizer_installed", "true").unwrap();
+}
+
+fn profil_audible_4407(gain: f64) -> crate::audio::eq::EqProfile {
+    crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 80.0,
+            gain,
+            q: 0.71,
+            band_type: "low_shelf".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// Zone DLNA dont le flux a été servi par le VRAI chemin de lecture
+/// (`replay_zone_at_position` → `play` → `resolve_stream`), position mesurée.
+async fn zone_dlna_servie_4407(
+    device_id: &str,
+) -> (Arc<PlaybackOrchestrator>, i64, tempfile::TempDir) {
+    let (orch, zone_id, dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    orch.playback.update_position(zone_id, 29_000).await;
+    orch.replay_zone_at_position(zone_id, 29_000, "temoin_4407")
+        .await
+        .expect("le flux de départ doit partir vers le renderer");
+    assert!(
+        orch.playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id)
+            .is_some(),
+        "point de départ : la zone joue un flux identifié"
+    );
+    (orch, zone_id, dir)
+}
+
+/// LE défaut de Jean Valjean (#4407, Marantz ND8006, fil 1771) : un profil
+/// d'égaliseur ACTIVÉ mais sans effet (`bandes=0`, gains nuls) est écrit ;
+/// le flux qui joue ne porte aucun traitement et n'en porterait pas
+/// davantage après — et le serveur le refabriquait quand même (2,787 s de
+/// silence par geste sur une radio).
+///
+/// Sur le code d'avant : `apply_eq_change` rend `false`, une relance est
+/// programmée et le renderer reçoit un nouveau `SetAVTransportURI` + `Play`.
+#[tokio::test]
+async fn egaliseur_sans_effet_sur_dlna_ne_refabrique_pas_le_flux_4407() {
+    let device_id = "dlna:uuid-56fcb4ae-4407";
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407(device_id).await;
+    let (play_avant, stop_avant) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+
+    ecrire_profil_4407(
+        &orch,
+        zone_id,
+        &crate::audio::eq::EqProfile {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !orch.zone_has_active_eq(zone_id),
+        "prémisse : ce profil activé n'a aucun effet sur le signal"
+    );
+    assert!(
+        orch.apply_eq_change(zone_id).await,
+        "le flux porte déjà ce (non-)traitement : le son est conforme, immédiatement"
+    );
+    assert_eq!(
+        relances_programmees_4407(&orch, zone_id),
+        0,
+        "aucune relance ne doit être programmée quand le flux servi ne changerait pas"
+    );
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await,
+        (play_avant, stop_avant),
+        "zéro SetAVTransportURI/Play, zéro Stop : le flux n'est pas refabriqué (#4407)"
+    );
+    assert_eq!(
+        orch.playback.get_state(zone_id).await.track_generation,
+        generation_avant,
+        "la lecture continue sur le même flux, sans coupure"
+    );
+}
+
+/// Les contre-épreuves de la garde, bout à bout sur le même flux :
+/// - un égaliseur qui CHANGE le signal relance, comme avant ;
+/// - renvoyer le profil que le flux porte désormais ne relance plus ;
+/// - l'objection de JP Robbe : une relance ABANDONNÉE au plancher laisse
+///   l'ancien traitement dans le flux — renvoyer le même nouveau profil
+///   doit alors relancer encore, alors qu'il est déjà en base ;
+/// - éteindre l'égaliseur que le flux porte (actif → inactif) relance.
+#[tokio::test]
+async fn la_garde_4407_relance_tout_ce_qui_change_le_flux_servi() {
+    let device_id = "dlna:uuid-4407-contre-epreuve";
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407(device_id).await;
+
+    // 1. Activer un égaliseur audible : le flux doit le recevoir.
+    ecrire_profil_4407(&orch, zone_id, &profil_audible_4407(8.0));
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 1);
+    let (play_1, _) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    laisser_passer_l_anti_rebond().await;
+    let (play_2, _) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    assert_eq!(
+        play_2,
+        play_1 + 1,
+        "le flux est refabriqué avec l'égaliseur"
+    );
+
+    // 2. Le même profil, renvoyé : le flux le porte déjà.
+    assert!(orch.apply_eq_change(zone_id).await);
+    assert_eq!(
+        relances_programmees_4407(&orch, zone_id),
+        1,
+        "le flux servi porte déjà ce profil : pas de relance"
+    );
+
+    // 3. Un autre profil, dans le plancher de 5 s : relance programmée puis
+    //    abandonnée. Le flux qui joue garde l'ancien traitement.
+    let flux_avant = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .and_then(|np| np.stream_id);
+    ecrire_profil_4407(&orch, zone_id, &profil_audible_4407(-3.0));
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 2);
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await.0,
+        play_2,
+        "prémisse : la relance a été abandonnée au plancher"
+    );
+    assert_eq!(
+        orch.playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id),
+        flux_avant
+    );
+    // Le même profil (-3 dB), déjà en base, renvoyé : le flux porte +8 dB.
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(
+        relances_programmees_4407(&orch, zone_id),
+        3,
+        "le flux servi porte encore l'ancien traitement : il faut relancer"
+    );
+
+    // 4. Éteindre l'égaliseur que le flux porte : retirer le traitement du
+    //    flux exige de le refabriquer.
+    let mut eteint = profil_audible_4407(-3.0);
+    eteint.enabled = false;
+    ecrire_profil_4407(&orch, zone_id, &eteint);
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 4);
+}
+
+/// Flux inconnu (état posé sans passer par la résolution : serveur relancé,
+/// URL directe) : on relance, comme avant #4407.
+#[tokio::test]
+async fn sans_flux_connu_le_changement_d_egaliseur_relance_comme_avant_4407() {
+    let (orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-4407-inconnu")).await;
+    let orch = Arc::new(orch);
+    orch.playback.update_position(zone_id, 29_000).await;
+    ecrire_profil_4407(
+        &orch,
+        zone_id,
+        &crate::audio::eq::EqProfile {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 1);
+}
