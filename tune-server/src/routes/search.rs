@@ -53,10 +53,12 @@
 //! registre : quatre appels réseau à la file, du premier au dernier. Mesuré sur
 //! le .18 (0.9.155), requête « coltrane », à chaud :
 //!
-//!     qobuz     0,13 s      les quatre ensemble, à la file : 1,20 s
-//!     tidal     0,03 s      le plus lent seul              : 0,42 s
-//!     youtube   0,42 s
-//!     bandcamp  0,30 s
+//! ```text
+//! qobuz     0,13 s      les quatre ensemble, à la file : 1,20 s
+//! tidal     0,03 s      le plus lent seul              : 0,42 s
+//! youtube   0,42 s
+//! bandcamp  0,30 s
+//! ```
 //!
 //! Le deuxième temps coûtait donc la SOMME au lieu du MAXIMUM, et l'écart
 //! grandit avec chaque service ajouté.
