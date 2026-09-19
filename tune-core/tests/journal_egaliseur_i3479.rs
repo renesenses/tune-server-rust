@@ -156,6 +156,9 @@ async fn un_changement_d_eq_dit_la_zone_la_sortie_le_format_et_le_premier_echec(
             )
             .unwrap();
     }
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    reglages.set("plugin_equalizer_installed", "true").unwrap();
     // Rien de ce qui précède n'a le droit de parler au nom de l'égaliseur.
     let _ = capture.vider();
 

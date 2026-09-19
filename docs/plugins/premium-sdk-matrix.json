@@ -1,0 +1,934 @@
+{
+  "schema_version": 1,
+  "sdk_status": "experimental",
+  "features": [
+    "equalizer",
+    "crossfeed",
+    "converter",
+    "declick",
+    "shared"
+  ],
+  "baseline": {
+    "server_sha": "af70d7e251735d8be2c5d7ddc9d6539f61e2ac34",
+    "web_sha": "e7787947c31d52f381cb36de85b826e5a93816bb",
+    "files": {
+      "tune-core/src/plugin_sdk.rs": "8a8be0b4a597260f4482a958bfab38b77cfd1b6d039fe9261f1834625e68e4cb",
+      "tune-core/src/audio/eq.rs": "2af417c5a16b49b9c6682df18a6d354e02b441e1574e12e816b75ad5cf9fec7b",
+      "tune-core/src/audio/crossfeed.rs": "310aff82314d50f6c037422ac1bcb4802d4fa90ec7fe8ddf52b6e9084b32c48b",
+      "tune-core/src/audio/tap.rs": "5c03c2ecd62aa1248e098f4213098cb6b1e4a672220852aa490168bdfc5dfa98",
+      "tune-core/src/audio/levels.rs": "a619b93d8ebefb6e8b0c32cd7d0e203b6c5c28a1af9b2ae9d8c4301c82b2ed01",
+      "tune-core/src/orchestrator.rs": "573f17b17ec3c725c256123d1be15548e33c3ded81145886b1822cd3fe83f4b0",
+      "tune-core/src/orchestrator/dsp.rs": "b7c4d9d3da851207bcbbfcc50cd91feb1cd3268e9fa1fa9ead9168323db8aae7",
+      "tune-core/src/outputs/local.rs": "6cbfe6a83ea1f0da2b01eacf78f655ca85cff037856c7b06abf1cbb6e7a06bbc",
+      "tune-server/src/routes/eq_pro.rs": "5d219c0a9e06b010317b3b4a9eab9be7c7d70e77475c8c1f26cba882fbeeb998",
+      "tune-server/src/routes/converter.rs": "2057646d39d4130ebe8afc76e87a0719f15bcd1fbca9ceba72c43d8803cb0adb",
+      "tune-server/src/routes/declick.rs": "06206ec8483e12c24882532ff04528a65f938f58079c550bea11e7db98d4fe2b",
+      "tune-server/src/routes/zones/dsp.rs": "85cc22ba6b5e8f597f23cc81d450c671d352b079db4821ecf12c9d5f80cdb918",
+      "tune-server/src/routes/zones/signal_path.rs": "5941cb615f628b4041262aa58afd7c26156b30adf30ea91d197d376a0cf4f872",
+      "tune-server/src/routes/marketplace.rs": "619e2ebdb51115fd47ca5af94d2dc11dc0315602cc4c02ce8143b8eef8079b2d"
+    }
+  },
+  "requirements": [
+    {
+      "id": "shared.formats",
+      "feature": "shared",
+      "requirement": "Complete frames; truthful encoding, rate and channel layout; no implicit integer-to-float bypass.",
+      "baseline_files": [
+        "tune-core/src/audio/tap.rs",
+        "tune-core/src/outputs/local.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::no_invalid_format_or_partial_frame_reaches_a_processor",
+        "sdk/tune-plugin-sdk/tests/contracts.rs::integer_bypass_requires_no_float_conversion"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.negotiation",
+      "feature": "shared",
+      "requirement": "Missing required capabilities fail before setup; optional and unrequested capabilities are not granted.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::missing_required_capability_is_rejected_before_setup"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.versions",
+      "feature": "shared",
+      "requirement": "Reject incompatible SDK versions and unsupported distribution modes.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::experimental_minor_versions_are_not_assumed_binary_compatible"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.spectral-truth",
+      "feature": "shared",
+      "requirement": "Preserve actual frequencies, dBFS, real signal resolution and measurement provenance.",
+      "baseline_files": [
+        "tune-core/src/audio/tap.rs",
+        "tune-core/src/audio/levels.rs",
+        "tune-core/src/orchestrator.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::spectrum_requires_real_axes_resolution_and_measurement_provenance"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.stale-observations",
+      "feature": "shared",
+      "requirement": "Drop old track, seek and other-zone observations.",
+      "baseline_files": [
+        "tune-core/src/audio/tap.rs",
+        "tune-core/src/orchestrator.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::old_track_or_other_zone_observations_are_not_displayed"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.observation-without-plugin",
+      "feature": "shared",
+      "requirement": "Observation delivery independent of premium plugin installation; bounded slow-consumer queue.",
+      "baseline_files": [
+        "tune-core/src/audio/tap.rs",
+        "tune-core/src/orchestrator.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-testkit/tests/capture.rs::spectrum_queue_works_without_a_plugin_and_drops_oldest",
+        "tune-core/src/audio/sdk_observation.rs::premium_sdk_real_spectrum_without_plugins_refuses_fake_points_and_stale_epochs"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "tune-core/src/audio/sdk_observation.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.state-and-drain",
+      "feature": "shared",
+      "requirement": "Keep processor state across blocks and capture end-of-stream tail.",
+      "baseline_files": [
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/outputs/local.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-testkit/tests/capture.rs::state_survives_block_boundaries_and_tail_is_captured"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.pcm-processing",
+      "feature": "shared",
+      "requirement": "Samples must reach the processing callback and the capture output for arbitrary blocks.",
+      "baseline_files": [
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/outputs/local.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/cargo-tune-plugin/templates/dsp_tests.rs::gain_reaches_captured_samples_across_block_sizes"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.bypass",
+      "feature": "shared",
+      "requirement": "PURE, protected bitstreams and entitlement policy bypass processing without sample conversion.",
+      "baseline_files": [
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/cargo-tune-plugin/templates/dsp_tests.rs::bypass_preserves_original_bits"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.ui-session",
+      "feature": "shared",
+      "requirement": "Versioned messages scoped to the plugin session; no unrestricted shell command.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::ui_messages_are_versioned_scoped_and_reject_unknown_commands"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.production-paths",
+      "feature": "shared",
+      "requirement": "Wire every supported playback path including local, browser, radio, network progressive/file and streaming.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.realtime",
+      "feature": "shared",
+      "requirement": "Measure per-block deadline, bounded memory and starvation under multi-zone and batch load.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "qualification",
+      "implementation_files": [
+        "sdk/tune-plugin-native/src/stage.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.hot-update",
+      "feature": "shared",
+      "requirement": "Prepare changes off the audio thread, preserve state, apply at block boundaries and report the effective revision.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.signal-path",
+      "feature": "shared",
+      "requirement": "Publish actual effects, latencies, headroom and clipping instead of configured intent.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.legacy-clients",
+      "feature": "shared",
+      "requirement": "Preserve deployed HTTP and audio_levels contracts for web and native clients.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.entitlements",
+      "feature": "shared",
+      "requirement": "Enforce rights host-side for mutations and activation, including expiry during playback/job.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.migration",
+      "feature": "shared",
+      "requirement": "Version configuration; preserve old presets/settings through rollback and reinstall.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "tune-core/src/audio/premium_plugins.rs::premium_sdk_all_sixteen_installation_combinations_and_idempotent_migration"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.installation",
+      "feature": "shared",
+      "requirement": "Qualify all 16 installation combinations, missing/incompatible plugins, disable and uninstall.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "tune-core/src/audio/premium_plugins.rs::premium_sdk_all_sixteen_installation_combinations_and_idempotent_migration"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.native-abi",
+      "feature": "shared",
+      "requirement": "Implement versioned C ABI with explicit ownership; qualify OS/architecture loading.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-native/tests/native.rs::native_dsp_processes_real_buffers_preserves_history_and_library_lifetime"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "sdk/tune-plugin-native/tests/native.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.signed-bundles",
+      "feature": "shared",
+      "requirement": "Authenticated atomic installation and rollback; no unloading a live processor/job.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-native/tests/packages.rs::signed_install_update_rollback_and_tamper_refusal"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs",
+        "sdk/tune-plugin-native/tests/packages.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.ui-runtime",
+      "feature": "shared",
+      "requirement": "Mount real panels with theme, locale, navigation, spectrum and accessible controls.",
+      "baseline_files": [
+        "tune-core/src/plugin_sdk.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-core/src/outputs/local.rs",
+        "tune-server/src/routes/zones/signal_path.rs",
+        "tune-server/src/routes/marketplace.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/audio.rs",
+        "tune-core/src/audio/premium_plugins.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.macro",
+      "feature": "equalizer",
+      "requirement": "Preserve assistant/environment and bass/mid/treble controls.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.graphic",
+      "feature": "equalizer",
+      "requirement": "Preserve 10/15/31-band grids and left/right split.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.parametric",
+      "feature": "equalizer",
+      "requirement": "Preserve all existing band types, frequency/gain/Q and channel selection.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.headroom",
+      "feature": "equalizer",
+      "requirement": "Preserve pre-gain, clipping/nonfinite diagnostics and bypass of neutral profiles.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.autoeq",
+      "feature": "equalizer",
+      "requirement": "Preserve AutoEq import and explicit ignored-line diagnostics.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.presets",
+      "feature": "equalizer",
+      "requirement": "Preserve preset create/read/update/delete/activate and old stored profiles.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.response",
+      "feature": "equalizer",
+      "requirement": "Show the response of the actual processor independently of the live spectrum.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-equalizer/tests/conformance.rs::response_uses_prepared_coefficients_and_matches_steady_sine"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs",
+        "sdk/tune-plugin-equalizer/tests/conformance.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "equalizer.parity",
+      "feature": "equalizer",
+      "requirement": "Compare original and extracted PCM at multiple rates/formats and hot settings.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/eq_pro.rs",
+        "tune-server/src/routes/zones/dsp.rs",
+        "tune-server/src/routes/zones/signal_path.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-equalizer/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "crossfeed.algorithm",
+      "feature": "crossfeed",
+      "requirement": "Preserve stereo delay, amount, mono identity and Mid below clipping.",
+      "baseline_files": [
+        "tune-core/src/audio/crossfeed.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/zones/dsp.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "crossfeed.applicability",
+      "feature": "crossfeed",
+      "requirement": "Include source kind as well as output; distinguish streaming pretranscode from library-file transcode.",
+      "baseline_files": [
+        "tune-core/src/audio/crossfeed.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/zones/dsp.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "preserved",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "crossfeed.live",
+      "feature": "crossfeed",
+      "requirement": "Preserve delay-line history for compatible live changes and truthful applied status.",
+      "baseline_files": [
+        "tune-core/src/audio/crossfeed.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/zones/dsp.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "crossfeed.parity",
+      "feature": "crossfeed",
+      "requirement": "Compare original/extracted samples across formats, block sizes and supported paths.",
+      "baseline_files": [
+        "tune-core/src/audio/crossfeed.rs",
+        "tune-core/src/orchestrator.rs",
+        "tune-core/src/orchestrator/dsp.rs",
+        "tune-server/src/routes/zones/dsp.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-crossfeed/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.codec-capabilities",
+      "feature": "converter",
+      "requirement": "Quality, bit depth and sample rate must be supported by the chosen backend.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::codec_support_includes_quality_and_format_not_just_its_name",
+        "sdk/cargo-tune-plugin/templates/batch_tests.rs::unavailable_codec_is_an_explicit_file_failure"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.sample-metadata-copy",
+      "feature": "converter",
+      "requirement": "Preserve source PCM and metadata through a host-managed output.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/cargo-tune-plugin/templates/batch_tests.rs::batch_preserves_pcm_metadata_and_source"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.cancellation",
+      "feature": "converter",
+      "requirement": "Cancellation inside a file aborts unpublished output and preserves sources.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/cargo-tune-plugin/templates/batch_tests.rs::cancellation_inside_a_file_never_publishes_partial_output"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.sources",
+      "feature": "converter",
+      "requirement": "Resolve tracks, albums and directory selections without losing files or duplicating unsafe writes.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.real-codecs",
+      "feature": "converter",
+      "requirement": "Decode and re-open native/external encoded results; validate requested quality/rate/depth.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "tune-server/src/routes/premium_audio_host.rs::premium_sdk_real_flac_roundtrip_and_no_clobber"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs",
+        "tune-server/src/routes/premium_audio_host.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.delivery",
+      "feature": "converter",
+      "requirement": "Validate real destination grants, non-overwrite, tags/artwork, ZIP download and cleanup.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "tune-server/src/routes/premium_audio_host.rs::premium_sdk_real_flac_roundtrip_and_no_clobber"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs",
+        "tune-server/src/routes/premium_audio_host.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "converter.progress",
+      "feature": "converter",
+      "requirement": "Preserve both legacy state/status response forms and explicit partial/failure/restart states.",
+      "baseline_files": [
+        "tune-server/src/routes/converter.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-converter/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "declick.trim",
+      "feature": "declick",
+      "requirement": "Preserve threshold, lead/tail trim, silence-only and one-active-channel cases.",
+      "baseline_files": [
+        "tune-server/src/routes/declick.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "declick.zero-cross",
+      "feature": "declick",
+      "requirement": "Preserve channel-zero search and bounded behavior when no crossing exists.",
+      "baseline_files": [
+        "tune-server/src/routes/declick.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "declick.defaults",
+      "feature": "declick",
+      "requirement": "Retain server -60 dBFS and explicit web -40 dBFS until an intentional product change.",
+      "baseline_files": [
+        "tune-server/src/routes/declick.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "declick.lossless",
+      "feature": "declick",
+      "requirement": "Re-open FLAC/WAV results and compare retained PCM, metadata, bit depth/rate/channels.",
+      "baseline_files": [
+        "tune-server/src/routes/declick.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "tune-server/src/routes/premium_audio_host.rs::premium_sdk_real_declick_and_cancelled_output"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs",
+        "tune-server/src/routes/premium_audio_host.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "declick.jobs",
+      "feature": "declick",
+      "requirement": "Preserve status/completed/errors fields, cancellation, per-file failures and ZIP results.",
+      "baseline_files": [
+        "tune-server/src/routes/declick.rs"
+      ],
+      "sdk_status": "planned",
+      "production_status": "pending",
+      "witnesses": [],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-declick/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    }
+  ]
+}

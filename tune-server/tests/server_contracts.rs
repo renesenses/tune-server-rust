@@ -107,6 +107,8 @@ mod import_roon_multipart_3914;
 // pris de part et d'autre de l'appel.
 #[path = "import_apercu_et_rapport_3914.rs"]
 mod import_apercu_et_rapport_3914;
+#[path = "index_recherche_visible_4319.rs"]
+mod index_recherche_visible_4319;
 #[path = "integration.rs"]
 mod integration;
 #[path = "journal_pcm_alsa_ouvert.rs"]

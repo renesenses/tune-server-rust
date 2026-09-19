@@ -562,7 +562,23 @@ async fn levels_chain_emits_audio_levels_on_bus() {
             break;
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => n += 1,
+            Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => {
+                let data = &ev.data;
+                let _: tune_plugin_sdk::ui::AudioLevelsEvent = serde_json::from_value(data.clone())
+                    .expect("audio_levels no longer satisfies the SDK event contract");
+                assert!(
+                    data["spectrum"].as_array().is_some_and(|v| !v.is_empty()),
+                    "source spectrum vanished without premium plugins"
+                );
+                assert_eq!(
+                    data["spectrum"].as_array().unwrap().len(),
+                    data["spectrum_hz"].as_array().unwrap().len()
+                );
+                assert_eq!(data["observation_point"], "decoded_source");
+                assert_eq!(data["play_seq"], play_seq);
+                assert!(data["spectrum_resolution_hz"].as_f64().unwrap() > 0.0);
+                n += 1;
+            }
             Ok(Ok(_)) => {}
             _ => break,
         }
@@ -572,6 +588,121 @@ async fn levels_chain_emits_audio_levels_on_bus() {
         n >= 40,
         "3 s d'audio ⇒ ~75 fenêtres de 40 ms sur le bus ; reçu {n}"
     );
+}
+
+/// #4384 (GgB, 0.9.152, Lenovo X230, fil 1797) — « preamp -6db led ambre
+/// s'allume, pas de changement dans le comportement, elle devrait ne jamais
+/// s'allumer ».
+///
+/// Le crête-mètre d'une zone LOCALE est alimenté par des fenêtres prélevées AU
+/// DÉCODEUR (`resolve_local::transcoder_en_session` attache le forwarder à
+/// `decode_to_pcm_streaming_tranche`), alors que le facteur
+/// « volume × ReplayGain » — préampli compris — n'est appliqué que dans les
+/// rappels de rendu de `LocalOutput`. L'instrument décrivait donc le FICHIER,
+/// et aucun des trois réglages ne déplaçait l'aiguille d'un seul dB.
+///
+/// Garde de COMPORTEMENT, pas de texte : une même fenêtre à PLEINE ÉCHELLE
+/// part deux fois dans la chaîne réelle (forwarder cadencé → bus), et c'est la
+/// valeur PUBLIÉE qui est lue.
+///   * sans gain branché — tout chemin non local — elle vaut 0 dBFS, surcharge
+///     allumée : la mesure d'avant, inchangée ;
+///   * avec le gain de la sortie à 0,5 (−6,02 dB), elle vaut −6 dBFS et la
+///     surcharge S'ÉTEINT — ce que GgB attendait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_cretemetre_suit_le_gain_de_la_sortie() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// 512 trames stéréo 16 bits collées à la butée négative : pleine échelle
+    /// exacte, donc `over_run` bien au-delà des 3 échantillons d'OVER.
+    fn pleine_echelle() -> Vec<u8> {
+        let mut pcm = Vec::with_capacity(512 * 4);
+        for _ in 0..512 {
+            for _ in 0..2 {
+                pcm.extend_from_slice(&i16::MIN.to_le_bytes());
+            }
+        }
+        pcm
+    }
+
+    /// Fait tourner la chaîne réelle et rend `(peak_left_db, over_left,
+    /// output_gain_db)` de la première fenêtre publiée.
+    async fn mesurer(zone_id: i64, gain: Option<Arc<AtomicU32>>) -> (f64, bool, f64) {
+        let playback = Arc::new(crate::playback::PlaybackManager::new());
+        match gain {
+            Some(g) => playback.brancher_le_gain_de_sortie(zone_id, g),
+            None => playback.debrancher_le_gain_de_sortie(zone_id),
+        }
+        playback
+            .play(zone_id, crate::playback::NowPlaying::default())
+            .await;
+        let bus = Arc::new(super::EventBus::new());
+        let mut rx = bus.subscribe();
+        let play_seq = playback.current_play_seq(zone_id).await;
+        let levels_tx = super::spawn_paced_levels_forwarder(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            0,
+        );
+        let pcm = pleine_echelle();
+        crate::audio::tap::send_windowed_pcm(&levels_tx, &pcm, 16, 2, 44_100);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let reste = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!reste.is_zero(), "aucun playback.audio_levels publié");
+            match tokio::time::timeout(reste, rx.recv()).await {
+                Ok(Ok(ev)) if ev.event_type == "playback.audio_levels" => {
+                    return (
+                        ev.data["peak_left_db"].as_f64().expect("peak_left_db"),
+                        ev.data["over_left"].as_bool().expect("over_left"),
+                        ev.data["output_gain_db"].as_f64().expect("output_gain_db"),
+                    );
+                }
+                Ok(Ok(_)) => {}
+                autre => panic!("bus muet : {autre:?}"),
+            }
+        }
+    }
+
+    // Référence : aucun gain déclaré en aval — la mesure d'avant #4384.
+    let (brut_db, brut_over, brut_gain_db) = mesurer(987_660, None).await;
+    assert!(
+        brut_db > -0.1,
+        "une fenêtre à pleine échelle sans gain doit se lire à 0 dBFS, lu {brut_db}"
+    );
+    assert!(brut_over, "pleine échelle sans gain ⇒ surcharge");
+    assert_eq!(brut_gain_db, 0.0, "aucun gain déclaré ⇒ 0 dB annoncé");
+
+    // La même fenêtre, avec la sortie qui atténue de 6 dB (préampli −6 dB à
+    // volume plein, ou volume à 50 % : c'est le MÊME facteur, celui que les
+    // rappels de rendu multiplient).
+    let gain = Arc::new(AtomicU32::new(500));
+    let (attenue_db, attenue_over, attenue_gain_db) = mesurer(987_661, Some(gain.clone())).await;
+    assert!(
+        (attenue_db - (-6.02)).abs() < 0.2,
+        "gain ×0,5 ⇒ −6 dBFS attendu, lu {attenue_db}"
+    );
+    assert!(
+        !attenue_over,
+        "un signal atténué de 6 dB ne peut plus être en surcharge"
+    );
+    assert!(
+        (attenue_gain_db - (-6.02)).abs() < 0.2,
+        "le gain appliqué doit être ANNONCÉ, lu {attenue_gain_db}"
+    );
+
+    // Et il se lit à chaque fenêtre, pas au spawn : bouger le curseur en cours
+    // de piste déplace l'aiguille sans attendre la piste suivante.
+    gain.store(1000, Ordering::SeqCst);
+    let (rendu_db, rendu_over, rendu_gain_db) = mesurer(987_662, Some(gain)).await;
+    assert!(
+        rendu_db > -0.1,
+        "gain revenu à l'unité ⇒ 0 dBFS, lu {rendu_db}"
+    );
+    assert!(rendu_over, "gain revenu à l'unité ⇒ surcharge de retour");
+    assert_eq!(rendu_gain_db, 0.0);
 }
 
 /// #1110 : un forwarder créé pour une piste doit MOURIR quand la zone
@@ -974,6 +1105,11 @@ async fn une_piste_aiff_transcodee_pour_un_renderer_est_servie_en_flac_annonce_f
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
         .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     piste_3234(&orch, "/m/cyrille/01 - Morceau.aiff", "aiff");
     let req = requete_locale_3234(zone_id, 1);
     let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
@@ -1227,6 +1363,11 @@ async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
     let req = requete_locale_3234(zone_id, 1);
 
@@ -1516,6 +1657,11 @@ async fn une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
     let mut req = requete_locale_3234(zone_id, 1);
     req.output_device_id = Some("local:Realtek HD".into());
@@ -2341,6 +2487,130 @@ fn les_reglages_de_sortie_locale_viennent_de_la_base() {
         (true, "asio".to_string()),
         "TUNE_LOCAL_AUDIO_BACKEND doit servir de repli comme dans \
          tune-server/src/config.rs"
+    );
+}
+
+/// #4384 — « écrit mais pas branché » : le corps de `send_to_output` DOIT
+/// appeler le branchement, sinon le forwarder lira toujours 1000 et la
+/// correction ne sortira jamais du laboratoire.
+///
+/// La découpe s'arrête au corps de `send_to_output` : la DÉFINITION de
+/// `brancher_le_gain_de_sortie`, plus haut dans le même fichier, est hors de
+/// la tranche — une garde satisfaite par la définition de ce qu'elle cherche
+/// ne garde rien.
+#[test]
+fn send_to_output_branche_le_gain_avant_de_jouer() {
+    const TRANSPORT: &str = include_str!("transport.rs");
+    const DEBUT: &str = "    pub(super) async fn send_to_output(";
+    const FIN: &str = "    pub(super) fn zone_audiophile(";
+    let debut = TRANSPORT
+        .find(DEBUT)
+        .expect("`send_to_output` a été renommée : cette garde ne garde plus rien");
+    let fin = TRANSPORT[debut..]
+        .find(FIN)
+        .expect("la fonction qui SUIT `send_to_output` a changé : redécouper");
+    let corps = &TRANSPORT[debut..debut + fin];
+    assert!(
+        !corps.contains("pub(super) async fn brancher_le_gain_de_sortie"),
+        "la tranche a avalé la définition : elle se satisferait elle-même"
+    );
+    assert_eq!(
+        corps
+            .matches("self.brancher_le_gain_de_sortie(zone_id, device_id)")
+            .count(),
+        2,
+        "`send_to_output` doit brancher le gain sur SES DEUX chemins — la \
+         sortie déjà enregistrée, et celle que `recreate_local_and_play` vient \
+         de faire naître. Sinon la mesure retombe au niveau du FICHIER (#4384)."
+    );
+
+    // Et le helper doit LÂCHER une zone qui n'est pas sur une sortie locale
+    // vivante, sinon un rendu réseau hériterait du volume d'un ancien DAC.
+    // La tranche s'arrête au premier `\n    }` qui ferme la fonction.
+    let debut_helper = TRANSPORT
+        .find("    pub(super) async fn brancher_le_gain_de_sortie(")
+        .expect("`brancher_le_gain_de_sortie` a été renommée");
+    let fin_helper = TRANSPORT[debut_helper..]
+        .find("\n    }\n")
+        .expect("corps du helper introuvable");
+    let helper = &TRANSPORT[debut_helper..debut_helper + fin_helper];
+    assert!(
+        helper.contains("self.playback.debrancher_le_gain_de_sortie(zone_id);"),
+        "le branchement ne débranche plus les sorties non locales (#4384)"
+    );
+    // Ce débranchement doit être le chemin de REPLI, donc HORS du bloc
+    // `#[cfg(feature = \"local-audio\")]` : une compilation sans la feature
+    // n'a aucune sortie locale et doit tout de même lâcher la zone.
+    let cfg = helper
+        .find("#[cfg(feature = \"local-audio\")]")
+        .expect("le bloc local-audio du helper a disparu");
+    let repli = helper
+        .find("self.playback.debrancher_le_gain_de_sortie(zone_id);")
+        .expect("repli introuvable");
+    assert!(
+        repli > cfg,
+        "le débranchement doit suivre le bloc gardé, pas y être enfermé"
+    );
+}
+
+/// #4384 — le branchement lui-même, par la porte de l'orchestrateur : une
+/// sortie locale RÉELLE enregistrée dans le registre, et le gain que ses
+/// rappels de rendu multiplient qui arrive jusqu'au `PlaybackManager`.
+///
+/// ⚠️ Cette épreuve ne tourne PAS en CI : la porte `test` ne compile pas
+/// `tune-core` avec `local-audio`, donc tout ce qui est gardé ici est vert
+/// parce qu'il n'existe pas, pas parce qu'il passe. Elle a été exécutée à la
+/// main sur Shrek avec la feature. Les gardes qui protègent RÉELLEMENT #4384
+/// en CI sont `le_cretemetre_suit_le_gain_de_la_sortie` (comportement, chaîne
+/// réelle) et `send_to_output_branche_le_gain_avant_de_jouer` (l'appelant),
+/// toutes deux hors de toute feature.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn brancher_le_gain_suit_la_sortie_locale_puis_la_lache() {
+    use crate::outputs::traits::OutputTarget;
+
+    let orch = test_orchestrator();
+    let zone_id = 987_670;
+    let sortie = crate::outputs::local::LocalOutput::new("DAC de garde".to_string());
+    let device_id = sortie.device_id().to_string();
+    assert!(
+        device_id.starts_with("local:"),
+        "id inattendu : {device_id}"
+    );
+    {
+        let mut outputs = orch.outputs.lock().await;
+        outputs.register(Box::new(sortie));
+    }
+
+    assert_eq!(
+        orch.playback.gain_de_sortie_units(zone_id),
+        1000,
+        "rien de branché ⇒ mesure telle quelle"
+    );
+    orch.brancher_le_gain_de_sortie(zone_id, &device_id).await;
+    assert_eq!(orch.playback.gain_de_sortie_units(zone_id), 1000);
+
+    // Le curseur bouge APRÈS le branchement : c'est l'atomique partagé qui
+    // doit le porter, pas une valeur recopiée au moment du branchement.
+    {
+        let arc = orch.outputs.lock().await.get(&device_id).expect("sortie");
+        let sortie = arc.lock().await;
+        sortie.set_volume(0.25).await.expect("set_volume");
+    }
+    assert_eq!(
+        orch.playback.gain_de_sortie_units(zone_id),
+        250,
+        "le gain branché doit suivre la sortie sans nouveau branchement"
+    );
+
+    // La zone repart sur un rendu réseau : on LÂCHE, sinon le crête-mètre
+    // d'une zone DLNA hériterait du volume d'un DAC local.
+    orch.brancher_le_gain_de_sortie(zone_id, "dlna:uuid-quelconque")
+        .await;
+    assert_eq!(
+        orch.playback.gain_de_sortie_units(zone_id),
+        1000,
+        "sortie non locale ⇒ gain débranché"
     );
 }
 
@@ -3405,12 +3675,17 @@ fn armer_un_egaliseur_audible(orch: &PlaybackOrchestrator, zone_id: i64) {
         }],
         ..Default::default()
     };
-    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
         .set(
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&profil).unwrap(),
         )
         .unwrap();
+    // L'égaliseur est un greffon facultatif (v0.9.156) : un profil ne suffit
+    // plus, il faut l'avoir installé — ce que fait ici la clé que pose la route
+    // `POST /plugins/equalizer/install`.
+    settings.set("plugin_equalizer_installed", "true").unwrap();
 }
 
 #[cfg(feature = "local-audio")]
@@ -6725,6 +7000,11 @@ async fn browser_radio_with_eq_is_forced_through_the_wav_session() {
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
         .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     let source = "http://127.0.0.1:9/station.mp3";
     let req = super::PlayRequest {
         zone_id,
@@ -7738,6 +8018,72 @@ async fn une_reprise_dlna_ordinaire_n_envoie_qu_un_seul_play() {
         mock.resume_call_count(),
         1,
         "aucune relance quand le renderer a repris"
+    );
+}
+
+#[tokio::test]
+async fn premium_sdk_free_equalizer_reaches_pcm_and_pure_still_bypasses() {
+    let mut orch = test_orchestrator();
+    orch.license = Some(Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    )));
+    assert!(!orch.license.as_ref().unwrap().is_premium().await);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    armer_un_egaliseur_audible(&orch, 1);
+    let profile = orch
+        .load_eq_profile(1)
+        .expect("FREE account lost its equalizer in playback");
+    let mut eq = crate::audio::eq::EqProcessor::new(&profile, 48000, 2);
+    let mut pcm: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.01).sin() * 0.1).collect();
+    let before = pcm.clone();
+    eq.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "FREE EQ did not process samples");
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":true}"#)
+        .unwrap();
+    assert!(
+        orch.load_eq_profile(1).is_none(),
+        "PURE must bypass the free EQ too"
+    );
+}
+
+#[tokio::test]
+async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivation() {
+    let mut orch = test_orchestrator();
+    let license = Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    ));
+    orch.license = Some(license.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
+    settings.set("zone_1_crossfeed", saved).unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    // Even installed/enabled flags cannot grant Free accounts the processor.
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    license.set_account_premium(true, None).await;
+    let mut processor = orch
+        .load_crossfeed_processor(1, 48000)
+        .expect("Premium reactivation");
+    assert_eq!(processor.amount(), 0.37);
+    let mut pcm = vec![0.0; 4096];
+    pcm[0] = 1.0;
+    let before = pcm.clone();
+    processor.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "reactivated crossfeed must reach PCM");
+    license.set_account_premium(false, None).await;
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "downgrade must cut immediately"
+    );
+    assert_eq!(
+        settings.get("zone_1_crossfeed").unwrap().as_deref(),
+        Some(saved)
     );
 }
 

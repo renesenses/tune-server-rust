@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EqProfile",
+  "description": "User-facing EQ profile combining room macro settings + perceptual sliders.",
+  "type": "object",
+  "properties": {
+    "bands": {
+      "description": "Expert-mode bands (graphic 10/15/31 or parametric). When non-empty they\nREPLACE the 3-tilt cascade above — the two modes are alternative UIs\nover the same per-zone profile. `default` keeps every profile persisted\nbefore this field deserializing unchanged.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/EqBandSpec"
+      }
+    },
+    "bass_gain_db": {
+      "description": "Perceptual sliders: -12.0 to +12.0 dB",
+      "type": "number",
+      "format": "double"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "listening": {
+      "description": "Macro environment",
+      "$ref": "#/$defs/ListeningMode"
+    },
+    "mid_gain_db": {
+      "type": "number",
+      "format": "double"
+    },
+    "room_size": {
+      "$ref": "#/$defs/RoomSize"
+    },
+    "speaker_placement": {
+      "$ref": "#/$defs/SpeakerPlacement"
+    },
+    "treble_gain_db": {
+      "type": "number",
+      "format": "double"
+    }
+  },
+  "required": [
+    "enabled",
+    "listening",
+    "room_size",
+    "speaker_placement",
+    "bass_gain_db",
+    "mid_gain_db",
+    "treble_gain_db"
+  ],
+  "$defs": {
+    "EqBandSpec": {
+      "description": "One expert-mode filter band (RBJ biquad).",
+      "type": "object",
+      "properties": {
+        "channel": {
+          "description": "Le canal auquel cette bande s'applique. `None` = TOUS les canaux.\n\nC'est le defaut, et c'est ce qui rend les preregla­ges existants\ninchanges : un profil enregistre avant cette version n'a pas ce champ,\n`serde` le laisse a `None`, et la bande s'applique partout — exactement\ncomme avant.\n\n`Some(0)` = gauche, `Some(1)` = droite. Une piece dissymetrique — un mur\nd'un cote, une ouverture de l'autre — ne se corrige pas avec la meme\ncourbe des deux cotes : c'est la demande d'Alexander Jam, abonne\nPremium, qui venait chercher l'equivalent de ce que fait Roon.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "freq": {
+          "description": "Center/corner frequency in Hz",
+          "type": "number",
+          "format": "double"
+        },
+        "gain": {
+          "description": "Gain in dB (shelves/peak; ignored by pass/notch)",
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "q": {
+          "type": "number",
+          "format": "double",
+          "default": 1.0
+        },
+        "type": {
+          "description": "\"peak\" | \"low_shelf\" | \"high_shelf\" | \"low_pass\" | \"high_pass\" | \"notch\"",
+          "type": "string",
+          "default": "peak"
+        }
+      },
+      "required": [
+        "freq"
+      ]
+    },
+    "ListeningMode": {
+      "type": "string",
+      "enum": [
+        "headphones",
+        "speakers"
+      ]
+    },
+    "RoomSize": {
+      "type": "string",
+      "enum": [
+        "small",
+        "medium",
+        "large"
+      ]
+    },
+    "SpeakerPlacement": {
+      "type": "string",
+      "enum": [
+        "near_wall",
+        "free_standing"
+      ]
+    }
+  }
+}
