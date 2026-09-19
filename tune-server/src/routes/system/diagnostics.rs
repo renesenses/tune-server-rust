@@ -1821,6 +1821,42 @@ fn valeur_lisible(valeur: &Value) -> String {
     }
 }
 
+/// Ce que l'index de recherche couvre RÉELLEMENT, table par table.
+///
+/// #4319 — Tades, fil 1841 : « quand je regarde répertoire j'ai bien 2 albums
+/// Mahler par Mehta, la 2 et la 3 ; quand je fais une recherche je ne trouve
+/// que la 2 ». Un album présent en base et absent de la recherche a deux
+/// explications très différentes — le mot cherché ne correspond pas, ou la
+/// ligne manque à l'index — et le rapport ne permettait de trancher ni l'une
+/// ni l'autre : il donnait le nombre d'albums, jamais le nombre d'albums
+/// INDEXÉS.
+///
+/// Rendu en `(albums, albums indexés, pistes, pistes indexées, artistes,
+/// artistes indexés)`. Chaque champ vaut `None` quand le compte n'a pas pu
+/// être lu — une table FTS absente sur un moteur qui n'en a pas (PostgreSQL
+/// indexe par `tsvector`, pas par table miroir) ne doit pas faire mentir le
+/// rapport avec un zéro.
+fn couverture_de_l_index(state: &AppState) -> Vec<(&'static str, Option<i64>)> {
+    if state.backend.engine() != tune_core::db::engine::Engine::Sqlite {
+        // PostgreSQL : l'index vit dans une COLONNE `search_tsv`, il n'y a pas
+        // de table miroir à compter. On ne rend rien plutôt qu'un chiffre qui
+        // ne voudrait rien dire.
+        return Vec::new();
+    }
+    ["albums", "tracks", "artists"]
+        .into_iter()
+        .map(|table| {
+            let n = state
+                .backend
+                .query_one(&format!("SELECT COUNT(*) FROM {table}_fts"), &[])
+                .ok()
+                .flatten()
+                .and_then(|c| c.first().and_then(|v| v.as_i64()));
+            (table, n)
+        })
+        .collect()
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -1993,7 +2029,34 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Albums: {albums}\n"));
     md.push_str(&format!("- Artists: {artists}\n"));
     md.push_str(&format!("- Music dirs: {}\n", music_dirs.join(", ")));
-    md.push_str(&format!("- Scan status: {scan_status}\n\n"));
+    md.push_str(&format!("- Scan status: {scan_status}\n"));
+    // #4319 — « je le vois dans Répertoires, la recherche ne le trouve pas ».
+    // Le nombre d'entrées INDEXÉES tranche entre « le mot ne correspond pas »
+    // et « la ligne manque à l'index ». Muet sur PostgreSQL, qui indexe par
+    // colonne et n'a pas de table miroir à compter.
+    let couverture = couverture_de_l_index(&state);
+    if !couverture.is_empty() {
+        md.push_str("- Index de recherche : ");
+        let attendu = |t: &str| match t {
+            "albums" => albums,
+            "tracks" => tracks,
+            _ => artists,
+        };
+        let lignes: Vec<String> = couverture
+            .iter()
+            .map(|(table, n)| match n {
+                Some(n) => {
+                    let total = attendu(table);
+                    let ecart = if *n == total { "" } else { " ⚠" };
+                    format!("{table} {n}/{total}{ecart}")
+                }
+                None => format!("{table} illisible"),
+            })
+            .collect();
+        md.push_str(&lignes.join(", "));
+        md.push('\n');
+    }
+    md.push('\n');
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
     for z in &zones {
@@ -2306,6 +2369,12 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
             "artists": artists,
             "music_dirs": music_dirs,
             "scan_status": scan_status,
+            // #4319 — ce que la RECHERCHE voit, à côté de ce que la
+            // bibliothèque contient. Absent sur PostgreSQL.
+            "search_index": couverture_de_l_index(&state)
+                .into_iter()
+                .map(|(t, n)| (t.to_string(), json!(n)))
+                .collect::<serde_json::Map<_, _>>(),
         },
         "zones": {
             "count": zone_count,

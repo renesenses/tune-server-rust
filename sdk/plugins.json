@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "in_tree": [
+    {"id": "dj", "crate": "../plugins/tune-dj", "feature": "dj", "fast_test": false},
+    {"id": "karaoke", "crate": "../plugins/tune-karaoke", "feature": "karaoke", "fast_test": false},
+    {"id": "bandcamp", "crate": "../plugins/tune-bandcamp", "feature": "bandcamp", "fast_test": true},
+    {"id": "concerts", "crate": "../plugins/tune-concerts", "feature": "concerts", "fast_test": false},
+    {"id": "pont-roon", "crate": "../plugins/tune-pont-roon", "feature": "pont-roon", "fast_test": false}
+  ],
+  "native": [
+    {"id": "equalizer", "crate": "tune-plugin-equalizer", "bundled_in": "tune-core"},
+    {"id": "crossfeed", "crate": "tune-plugin-crossfeed", "bundled_in": "tune-core"},
+    {"id": "converter", "crate": "tune-plugin-converter", "bundled_in": "tune-server"},
+    {"id": "declick", "crate": "tune-plugin-declick", "bundled_in": "tune-server"}
+  ]
+}

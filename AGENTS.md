@@ -6,28 +6,53 @@ canonique est
 et le runbook opératoire est `docs/RELEASE-OPERATIONS.md`. Ils s'appliquent
 aux agents OpenAI/Codex, Claude et aux humains.
 
-Avant toute modification :
+## Base des PR dans ce dépôt
 
-1. mettre les refs à jour et travailler dans un worktree isolé ;
-2. vérifier que le correctif n'existe pas déjà par contenu ;
-3. acquérir le verrou avec `gh label create verrou:issue-N` ;
-4. ajouter `en-cours` à l'issue et annoncer fournisseur, run, branche et SHA de
-   base.
+Ces consignes concernent **tune-server-rust** : un correctif vise le lot
+`batch/*` assigné, ou la RC assignée si aucun lot ne porte le sujet. Un lot
+peut passer par `integration/vX.Y.Z` avant la RC ; seule une branche `rc/*`
+peut ensuite viser `main`, conformément au `release-gate` serveur.
+
+Le client web a un circuit distinct : PR vers `main` par défaut, ou vers le
+lot/la RC explicitement assigné. Voir la
+[table de routage par dépôt](docs/RELEASE-WORKFLOW.md#base-des-pr-par-dépôt).
+Ne pas appliquer au web l'exclusivité `rc/* -> main` du serveur et ne pas
+changer la cible d'un lot déjà engagé à l'occasion de cet alignement.
+
+## Avant toute modification
+
+1. actualiser les refs et travailler dans un worktree isolé depuis le SHA de
+   base du lot ou de la RC assigné ;
+2. consulter les issues, commentaires, PR ouvertes et fichiers concernés ;
+   vérifier par contenu si le correctif existe déjà et éviter les chevauchements ;
+3. lister les labels globaux `verrou:issue-*`, puis acquérir le verrou avec
+   `gh label create verrou:issue-N`, **sans `--force`** ;
+4. ajouter `en-cours` et le verrou à l'issue ; publier l'identité complète
+   (personne / fournisseur / run unique), le périmètre, les fichiers prévus,
+   la branche, le SHA de base et le worktree Shrek.
+
+Pour une session JP : `JP Robbe / OpenAI Codex / jp-robbe-<date>-<run-unique>`.
+« OpenAI/Codex » seul n'identifie pas une session.
 
 ```sh
-gh label create "verrou:issue-N" --repo renesenses/tune-server-rust --color 5319E7 --description "fournisseur/run"
+gh api 'repos/renesenses/tune-server-rust/labels?per_page=100' --paginate --jq '.[] | select(.name | startswith("verrou:issue-")) | {name,description}'
+gh label create "verrou:issue-N" --repo renesenses/tune-server-rust --color 5319E7 --description "personne / fournisseur / run-unique"
 gh issue edit N --repo renesenses/tune-server-rust --add-label "verrou:issue-N" --add-label en-cours
 ```
 
-Si la création échoue, vérifier l'existence du label exact. Label présent :
-issue prise. Label absent : panne d'infrastructure, donc arrêt sans écrire.
+Un label existant réserve l'issue même s'il n'y est pas attaché. Si sa création
+échoue, vérifier son existence exacte : présent ou incertain, ne pas commencer
+cette issue et passer à une tâche indépendante. Ne jamais reprendre un verrou
+d'une autre session sans transfert explicite, même s'il est ancien. Conserver
+les verrous pendant la revue ; leur libération suit les règles du dépôt.
+La réservation n'est acquise qu'après une création réussie.
 
 Règles non négociables :
 
 - une PR unitaire cible le lot courant `batch/<thème>`, ou la RC `rc/vX.Y.Z`
   quand aucun lot ne porte le sujet ; elle ne contient pas de bump de version ;
 - `ci:full` est obligatoire pour les changements CI, release ou transversaux ;
-- seule une RC peut cibler `main` ;
+- dans **ce dépôt serveur**, seule une RC peut cibler `main` ;
 - un agent de correctif ne merge pas, ne tague pas et ne publie pas ;
 - sans instruction humaine explicite portant sur l'étape précise, aucun agent
   ne modifie ruleset, environnement, secret ou variable d'armement ;

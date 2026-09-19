@@ -33,13 +33,15 @@ const HD_650: &str = include_str!("../../tune-core/tests/fixtures/autoeq/sennhei
 
 const CHEMIN: &str = "/api/v1/eq/import/autoeq";
 
-/// Un serveur en mémoire, **Premium** — la route est derrière la même porte que
-/// `POST /eq/presets`.
-///
-/// Sans ce droit la route répond 402 : c'est déjà la preuve qu'elle est montée,
-/// mais pas qu'elle fonctionne. On veut le 201.
+/// Un serveur en mémoire Premium ; le dernier témoin couvre également FREE.
 async fn app_premium() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // Greffon facultatif (v0.9.156) : la route d'import est gardée par
+    // `require_installed("equalizer")` — on l'installe comme le fait
+    // `POST /plugins/equalizer/install`.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     state.license.set_account_premium(true, None).await;
     tune_server::routes::router(state)
 }
@@ -258,17 +260,29 @@ async fn un_profil_trop_long_est_refuse_et_non_tronque() {
     );
 }
 
-/// Sans Premium, la route répond 402 — et surtout PAS 404.
-///
-/// Ce test vaut aussi comme second témoin du montage : il atteint le chemin
-/// sans licence, et prouve que c'est bien la porte payante qui répond, pas le
-/// repli `api_not_found`.
+/// L’ouverture FREE de l’EQ inclut AutoEq : vérifier le profil réellement
+/// importé et conservé, pas seulement la disparition du refus Premium.
 #[tokio::test]
-async fn sans_premium_la_route_repond_402_et_non_404() {
+async fn sans_premium_autoeq_importe_et_conserve_les_dix_bandes() {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // Greffon facultatif (v0.9.156) : la route d'import est gardée par
+    // `require_installed("equalizer")` — on l'installe comme le fait
+    // `POST /plugins/equalizer/install`.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     let app = tune_server::routes::router(state);
     let (status, corps) = post(&app, CHEMIN, json!({ "text": HD_650 })).await;
-    assert_ne!(status, StatusCode::NOT_FOUND, "corps : {corps}");
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "corps : {corps}");
-    assert_eq!(corps["error"], "premium_required");
+    assert_eq!(status, StatusCode::CREATED, "corps : {corps}");
+    assert_eq!(corps["band_count"], 10);
+    assert_eq!(corps["preset"]["source"], "autoeq");
+    let (status, liste) = get(&app, "/api/v1/eq/presets").await;
+    assert_eq!(status, StatusCode::OK);
+    let saved = liste["presets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|preset| preset["id"] == corps["preset"]["id"])
+        .expect("FREE import must persist its preset");
+    assert_eq!(saved["bands"], corps["preset"]["bands"]);
 }

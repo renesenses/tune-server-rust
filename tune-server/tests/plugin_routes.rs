@@ -21,7 +21,14 @@ use tune_server::state::AppState;
 const SECRET: &str = "test-jwt-secret";
 
 fn new_state() -> AppState {
-    AppState::new(":memory:", 0, Default::default()).unwrap()
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // L'égaliseur est un greffon facultatif (v0.9.156) : ces témoins comptent
+    // sur lui comme greffon SDK chargé, donc ils l'installent comme la route
+    // `POST /plugins/equalizer/install` le ferait.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
+    state
 }
 
 /// A plugin router with a plain route and one whose path deliberately collides
@@ -317,8 +324,18 @@ async fn the_enabled_setting_keeps_a_plugin_out() {
 
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
 
-    let reported = state.plugin_info.get().map(|v| v.len()).unwrap_or_default();
-    assert_eq!(reported, 0, "a disabled plugin must not be reported");
+    let names: Vec<_> = state
+        .plugin_info
+        .get()
+        .unwrap()
+        .iter()
+        .map(|plugin| plugin.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["equalizer"],
+        "FREE EQ loads by default; the explicitly disabled injected plugin must stay absent"
+    );
 }
 
 /// A plugin handed to `init` from outside the tree loads on equal terms with a
@@ -332,17 +349,23 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
         tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(ServesRoutes)])
             .await;
 
-    assert_eq!(routers.len(), 1, "the injected plugin contributed a router");
-    assert_eq!(routers[0].0, "injected", "mount name comes from the plugin");
+    let mut mounts: Vec<_> = routers.iter().map(|(name, _)| name.as_str()).collect();
+    mounts.sort_unstable();
+    assert_eq!(
+        mounts,
+        vec!["equalizer", "injected"],
+        "FREE EQ and injected plugin both contribute their own router"
+    );
 
-    let names: Vec<&str> = state
+    let mut names: Vec<&str> = state
         .plugin_info
         .get()
         .expect("init publishes the snapshot")
         .iter()
         .map(|p| p.name.as_str())
         .collect();
-    assert_eq!(names, vec!["injected"]);
+    names.sort_unstable();
+    assert_eq!(names, vec!["equalizer", "injected"]);
 
     // End to end: the router it registered actually serves, under its own name.
     let app = tune_server::routes::router_with_plugins(state.clone(), routers);

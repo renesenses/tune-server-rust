@@ -24,7 +24,7 @@
 use tune_core::audio::eq::{EqProcessor, EqProfile, ListeningMode, RoomSize, SpeakerPlacement};
 
 /// Le source du module d'égalisation, lu à la compilation.
-const SOURCE_EQ: &str = include_str!("../src/audio/eq.rs");
+const SOURCE_EQ: &str = include_str!("../../sdk/tune-plugin-equalizer/src/engine.rs");
 
 /// Le source de la VRAIE correction de pièce, celle qui part d'une mesure.
 const SOURCE_ROOM_CORRECTION: &str = include_str!("../src/room_correction.rs");

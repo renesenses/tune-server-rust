@@ -15,11 +15,11 @@ members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tu
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI
 # (cargo fmt --all, tests, clippy) or its build matrix.
-exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast", "vendor/rubato", "vendor/ape-decoder", "vendor/cpal", "tools/moissonneur-roon"]
+exclude = ["tune-desktop", "tune-widget", "vendor/rust_cast", "vendor/rubato", "vendor/ape-decoder", "vendor/cpal", "tools/moissonneur-roon", "sdk"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.155"
+version = "0.9.156"
 edition = "2024"
 # Business Source License 1.1 (see LICENSE). SPDX id BUSL-1.1 — NOT MIT: the
 # old value misdeclared far broader rights to audit/SBOM tools (issue #1147).

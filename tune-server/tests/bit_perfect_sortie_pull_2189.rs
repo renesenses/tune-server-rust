@@ -137,6 +137,11 @@ fn armer_l_eq(state: &AppState, zone_id: i64) {
             &serde_json::to_string(&profile).unwrap(),
         )
         .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
 }
 
 /// Le chemin du signal tel que la ROUTE le publie.

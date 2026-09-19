@@ -167,6 +167,11 @@ fn armer_l_eq(backend: &Arc<dyn DbBackend>, zone_id: i64) {
             &serde_json::to_string(&profile).unwrap(),
         )
         .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    SettingsRepo::with_backend(backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
 }
 
 /// Source DSD128 en lecture, avec une session vivante.
@@ -309,6 +314,11 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&profile).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    SettingsRepo::with_backend(backend.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
 
     let sp = build_signal_path(
@@ -681,6 +691,71 @@ fn dsd_natif_sur_le_fil_n_affiche_aucun_transcodage() {
     assert!(
         !summary.contains("FLAC"),
         "le resume invente encore un FLAC : {summary}"
+    );
+}
+
+/// #4174 — un DSD natif s'entend plus bas qu'un PCM, et l'écran doit le DIRE.
+///
+/// Cyrille Moutia, fil 1784 : « rien d'anormal a priori, sauf un son faible
+/// pour un DSD 256 ». Son journal montre un passthrough : Tune ne touche à
+/// rien, et la référence 0 dB du DSD est posée 6 dB sous la pleine échelle
+/// PCM. Sans cette étape, le chemin du signal montrait une chaîne parfaite et
+/// l'auditeur en concluait une panne.
+#[test]
+fn le_dsd_natif_annonce_sa_reference_de_niveau() {
+    let (backend, zone) = dlna_zone();
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A6"),
+        "none",
+        Some(&wire_mime("dsf", "application/x-dsd", 5_644_800, 1)),
+    )
+    .unwrap();
+
+    let niveau = step_desc(&sp, "Niveau").expect("l'étape Niveau doit exister sur un DSD natif");
+    assert!(
+        niveau.contains("6 dB"),
+        "l'étape doit nommer l'écart, pas le suggérer : {niveau}"
+    );
+    assert!(
+        niveau.contains("aucun gain"),
+        "elle doit dire que Tune NE FAIT RIEN — c'est la question posée : {niveau}"
+    );
+    // Ne rien faire n'est pas une dégradation : l'étape ne doit pas peindre le
+    // chemin en rouge ni contredire le verdict bit-perfect (#2053).
+    assert_eq!(
+        sp.get("bit_perfect").and_then(Value::as_bool),
+        Some(true),
+        "dire le niveau ne change pas le verdict"
+    );
+}
+
+/// ⭐ Le témoin, et il compte autant : dès que Tune TOUCHE au flux, l'étape
+/// disparaît. Sur la branche DSD→PCM, `DSD_SACD_GAIN` rattrape déjà les 6 dB
+/// (#1638) — l'annoncer là serait faux.
+#[test]
+fn un_dsd_transcode_n_annonce_aucune_reference_de_niveau() {
+    let (backend, zone) = dlna_zone();
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("Renderer PCM"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
+    )
+    .unwrap();
+
+    assert!(
+        transcoder_desc(&sp).is_some(),
+        "témoin de mise en place : ce cas DOIT transcoder"
+    );
+    assert_eq!(
+        step_desc(&sp, "Niveau"),
+        None,
+        "sur la branche transcodée, le gain SACD est appliqué : l'annonce serait fausse"
     );
 }
 
