@@ -484,9 +484,9 @@ pub(super) fn build_signal_path(
 
     let np = ps.now_playing.as_ref()?;
 
-    let source = decrire_la_source(np, backend, wire);
-
     let output_type = zone.output_type.as_deref().unwrap_or("local");
+
+    let source = decrire_la_source(np, backend, wire, output_type);
     // Pour une sortie locale qui sait observer son dernier callback, le réel
     // prime sur toute déduction depuis les réglages. Les autres sorties
     // conservent le calcul historique jusqu'à ce qu'elles publient leur propre
@@ -622,6 +622,7 @@ fn assembler_les_etapes(
         bit_depth,
         format_name,
         is_lossless,
+        flac_ffmpeg_vers_le_reseau,
         ..
     } = analyse.source;
     let Traitements {
@@ -704,7 +705,11 @@ fn assembler_les_etapes(
         // source 16 bits transcode aussi, et l'étape doit le dire (#4297).
         || dlna_force_wav
         || dlna_cap_16bit
-        || wire_transcode;
+        || wire_transcode
+        // #4350 — le conteneur est RÉÉCRIT : Tune décode puis ré-encode ce
+        // FLAC. Sans cette ligne, le panneau annonçait un passthrough qui
+        // n'avait pas lieu, et le seul témoin était une ligne de journal.
+        || flac_ffmpeg_vers_le_reseau;
     if transcode_active {
         // OAAT lossless PCM → WAV preserves all audio data, but DSD → WAV is a
         // lossy domain conversion (see the "oaat" transport arm above). A DLNA
@@ -712,8 +717,16 @@ fn assembler_les_etapes(
         // already fits the 16-bit LPCM cap — unless the zone opted into genuine
         // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
         let wav_output = wire_wav || dlna_force_wav;
+        // #4350 — seule, la réécriture d'un FLAC ffmpeg est un FLAC → FLAC sans
+        // perte : mêmes échantillons, conteneur neuf. Toute autre cause
+        // (plafond 16 bits, WAV forcé) garde son propre verdict.
+        let conteneur_seul_reecrit = flac_ffmpeg_vers_le_reseau
+            && !wav_output
+            && !dlna_cap_16bit
+            && !needs_transcode_for_output;
         let transcode_lossless = ((is_oaat && is_lossless && !is_dsd)
-            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16)))
+            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16))
+            || conteneur_seul_reecrit)
             && ps
                 .now_playing
                 .as_ref()
@@ -743,11 +756,20 @@ fn assembler_les_etapes(
         // mesurés. Une résolution DSD ne peut donc pas sortir d'ici sous un
         // nom de conteneur PCM, quelle que soit la cible de transcodage.
         let out_desc = output_stage_label(output_format_name, out_sample_rate, out_bit_depth);
-        steps.push(json!({
+        let mut etape = json!({
             "name": "Transcoder",
             "description": format!("{source_desc} \u{2192} {out_desc}"),
             "bit_perfect": transcode_lossless,
-        }));
+        });
+        if flac_ffmpeg_vers_le_reseau {
+            // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
+            // même résolution ressemble à une erreur d'affichage.
+            etape["code"] = json!("flac_container_rewritten");
+            etape["detail"] = json!(
+                "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte"
+            );
+        }
+        steps.push(etape);
     }
 
     // #4174 — pourquoi un DSD natif s'entend PLUS BAS qu'un PCM.
@@ -1642,6 +1664,11 @@ struct Source<'w> {
     bit_depth: i32,
     format_name: &'static str,
     is_lossless: bool,
+    /// #4350 — FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5, vers une
+    /// sortie réseau : l'orchestrateur le RÉ-ENCODE au lieu de le servir tel
+    /// quel (le DMP-A8 cale sur ces en-têtes). Même fonction que la décision,
+    /// `flac_ffmpeg_vers_le_reseau_applies`.
+    flac_ffmpeg_vers_le_reseau: bool,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -1662,6 +1689,7 @@ fn decrire_la_source<'w>(
     np: &tune_core::playback::NowPlaying,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     wire: Option<&'w StreamInfo>,
+    output_type: &str,
 ) -> Source<'w> {
     // Conteneur réellement servi (None hors session : sortie locale, démarrage).
     let output_container = wire.map(|w| w.format.as_str());
@@ -1696,6 +1724,7 @@ fn decrire_la_source<'w>(
                 .as_ref()
                 .map_or("Unknown", AudioFormat::display_name),
             is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
+            flac_ffmpeg_vers_le_reseau: false,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -1801,6 +1830,20 @@ fn decrire_la_source<'w>(
         .as_ref()
         .map(|f| f.is_lossless())
         .unwrap_or_else(|| matches!(format_name, "ALAC" | "FLAC" | "WAV"));
+    // #4350 — la MÊME porte que `resolve_local_track`, sur le MÊME fichier
+    // (chemin de la base, orthographe réelle sur disque) : le fichier n'est
+    // ouvert que pour un FLAC entier vers une sortie réseau.
+    let flac_ffmpeg_vers_le_reseau = tune_core::orchestrator::flac_ffmpeg_vers_le_reseau_applies(
+        tune_core::orchestrator::is_network_output_type(Some(output_type)),
+        source_format,
+        track.as_ref().is_some_and(|t| t.bornes_cue().is_some()),
+        || {
+            track
+                .as_ref()
+                .and_then(|t| t.file_path.as_deref())
+                .and_then(tune_core::library::local_path::resolve_existing_local_path)
+        },
+    );
     Source {
         output_container,
         wire_sample_rate,
@@ -1811,5 +1854,6 @@ fn decrire_la_source<'w>(
         bit_depth,
         format_name,
         is_lossless,
+        flac_ffmpeg_vers_le_reseau,
     }
 }
