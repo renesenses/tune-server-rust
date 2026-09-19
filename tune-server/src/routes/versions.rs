@@ -402,7 +402,7 @@ pub(crate) fn versions_locales(
     // une constante, part dans le texte de la requete.
     let sql = format!(
         "SELECT t.id, al.id, al.title, al.cover_path, t.duration_ms, t.format, al.year, \
-                t.title, t.isrc \
+                t.title, t.isrc, COALESCE(ar2.name, ar.name) \
          FROM tracks t \
          JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -463,6 +463,11 @@ pub(crate) fn versions_locales(
                 // desormais une version de « Smooth Operator », et l'ecran ne
                 // peut plus supposer que les deux libelles coincident.
                 "title": titre_trouve,
+                // #4468 — l'interprete de la PISTE (`ar2`), l'artiste d'album
+                // en repli : sous le MEME nom que le chemin service, pour que
+                // l'ecran n'ait pas deux formes a traiter. Les deux tables
+                // etaient jointes pour rapprocher, jamais selectionnees.
+                "artist_name": cols.get(9).and_then(|v| v.as_string()),
                 "score": score,
             })
         })
