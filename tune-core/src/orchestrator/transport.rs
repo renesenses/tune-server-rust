@@ -2207,7 +2207,29 @@ impl PlaybackOrchestrator {
                 Some(sid) => !self.streamer.session_alive(sid).await,
                 None => false,
             };
-            let decision = reprise_de_session(est_radio, rejouable, pause_longue, session_morte);
+            // #4177 — une sortie exclusive Windows a RENDU son périphérique à
+            // la pause : reprendre « sur place » ne rouvrirait rien. Elle le
+            // dit elle-même ; toutes les autres sorties répondent `false`.
+            let peripherique_rendu = match device_id {
+                Some(did) => match { self.outputs.lock().await.get(did) } {
+                    Some(sortie) => sortie.lock().await.device_released_on_pause(),
+                    None => false,
+                },
+                None => false,
+            };
+            if peripherique_rendu {
+                info!(
+                    zone_id,
+                    position_ms, "resume_after_exclusive_device_released"
+                );
+            }
+            let decision = reprise_de_session(
+                est_radio,
+                rejouable,
+                pause_longue,
+                session_morte,
+                peripherique_rendu,
+            );
             if decision != RepriseDeSession::SurPlace {
                 let did = device_id.map(str::to_string).or_else(|| {
                     ZoneRepo::with_backend(self.db.clone())
