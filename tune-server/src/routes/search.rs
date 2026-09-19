@@ -44,6 +44,41 @@
 //! intact — la pagination d'un service passe par `SearchPage`, pas par cette
 //! route.
 //!
+//! # Les services sont interrogés ENSEMBLE, et le registre n'est plus tenu
+//!
+//! Bertrand, 19/09/2026 : « La recherche se fait en deux temps : local puis
+//! streaming. Il ne faut pas faire patienter l'utilisateur ».
+//!
+//! La boucle des services portait son `await` À L'INTÉRIEUR, sous le verrou du
+//! registre : quatre appels réseau à la file, du premier au dernier. Mesuré sur
+//! le .18 (0.9.155), requête « coltrane », à chaud :
+//!
+//! ```text
+//! qobuz     0,13 s      les quatre ensemble, à la file : 1,20 s
+//! tidal     0,03 s      le plus lent seul              : 0,42 s
+//! youtube   0,42 s
+//! bandcamp  0,30 s
+//! ```
+//!
+//! Le deuxième temps coûtait donc la SOMME au lieu du MAXIMUM, et l'écart
+//! grandit avec chaque service ajouté.
+//!
+//! Deux corrections, et la seconde n'est pas cosmétique :
+//!
+//! 1. les poignées (`Arc<RwLock<…>>`, clonées par `registry.get`) sont
+//!    ramassées d'abord, le verrou du registre tombe, PUIS les recherches
+//!    partent sous `join_all` ;
+//! 2. le `Mutex` du registre n'est donc plus tenu pendant des appels RÉSEAU.
+//!    Il l'était : toute autre route qui demandait le registre — statut des
+//!    services, favoris, catalogue — faisait la queue derrière une recherche
+//!    Qobuz. Ce n'est pas la recherche qu'on accélère là, c'est le serveur
+//!    qu'on arrête de bloquer.
+//!
+//! Ce qui ne change pas : le filtre `sources`, la limite par service, l'ordre
+//! des clés (`service_results` est une `Map` JSON dont l'écran ordonne
+//! lui-même les blocs, cf. `ordonnerSources` côté client), et le fait qu'un
+//! service non authentifié ou en échec n'apparaît simplement pas.
+//!
 //! # #3226 — `sources` ne gouvernait QUE la moitié streaming
 //!
 //! Reivax66 (forum, fil 1647, 02/09/2026 — 0.9.130 Windows/SQLite) : dans la
@@ -103,10 +138,39 @@ use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::streaming::traits::{SearchResults, StreamTrack};
+use tune_core::streaming::traits::{SearchResults, StreamTrack, StreamingService};
 
 use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
+
+/// Lancer toutes les recherches de service EN MÊME TEMPS, et ranger ce qu'elles
+/// rendent par nom de service.
+///
+/// 🔴 Extraite pour être MESURABLE. Le défaut qu'elle corrige est un défaut de
+/// TEMPS : une boucle qui `await` en son sein rend exactement les mêmes octets
+/// qu'un `join_all`, simplement plus tard. Aucune assertion sur le contenu ne
+/// peut donc la voir — seul un banc qui chronomètre sait rougir.
+///
+/// Un service qui rend `None` (non authentifié, ou en échec) n'entre pas dans
+/// la réponse : c'est la règle d'avant, et elle ne bouge pas.
+async fn recherches_concurrentes<F>(travaux: Vec<(String, F)>) -> serde_json::Map<String, Value>
+where
+    F: std::future::Future<Output = Option<Value>>,
+{
+    let mut out = serde_json::Map::new();
+    for (nom, trouve) in futures_util::future::join_all(
+        travaux
+            .into_iter()
+            .map(|(nom, travail)| async move { (nom, travail.await) }),
+    )
+    .await
+    {
+        if let Some(v) = trouve {
+            out.insert(nom, v);
+        }
+    }
+    out
+}
 
 /// Plafond des `COUNT` de la bibliothèque locale.
 ///
@@ -407,19 +471,35 @@ async fn federated_search(
 
     // La moitié streaming ne change pas d'un octet : la liste blanche est la
     // même, lue plus haut, et la règle qu'elle applique ici est celle d'avant.
-    let mut service_results: serde_json::Map<String, Value> = serde_json::Map::new();
+    let service_results: serde_json::Map<String, Value>;
 
-    {
+    // Les poignées d'abord, le verrou ensuite — puis les quatre recherches
+    // EN MÊME TEMPS. Voir la note « Les services sont interrogés ensemble »
+    // en tête de fichier.
+    let poignees: Vec<(
+        String,
+        std::sync::Arc<tokio::sync::RwLock<Box<dyn StreamingService>>>,
+    )> = {
         let registry = state.services.lock().await;
-        for svc_name in registry.list() {
-            if !filtre.service_demande(&svc_name) {
-                continue;
-            }
+        registry
+            .list()
+            .into_iter()
+            .filter(|nom| filtre.service_demande(nom))
+            .filter_map(|nom| registry.get(&nom).map(|svc| (nom, svc)))
+            .collect()
+    };
 
-            if let Some(svc) = registry.get(&svc_name) {
+    let limite = limite_pour_les_services(limit);
+    let requete = p.q.clone();
+    let travaux: Vec<_> = poignees
+        .into_iter()
+        .map(|(nom, svc)| {
+            let requete = requete.clone();
+            let nom_log = nom.clone();
+            (nom, async move {
                 let svc = svc.read().await;
                 if !svc.auth_status().await.authenticated {
-                    continue;
+                    return None;
                 }
                 // `limit` tel quel, sans `offset` : le plafond de page d'un
                 // service (Qobuz : 50) est SA contrainte, et #2036 dit qu'on la
@@ -427,22 +507,23 @@ async fn federated_search(
                 //
                 // « Tel quel » s'arrête au SIGNE : voir
                 // [`limite_pour_les_services`] (#2160).
-                if let Ok(mut results) = svc.search(&p.q, limite_pour_les_services(limit)).await {
-                    // #4441 — voir `ne_garder_que_les_pistes_qui_repondent`.
-                    let ecartees = ne_garder_que_les_pistes_qui_repondent(&p.q, &mut results);
-                    if ecartees > 0 {
-                        tracing::debug!(
-                            service = %svc_name,
-                            ecartees,
-                            gardees = results.tracks.len(),
-                            "search_pistes_de_service_hors_identite_ecartees"
-                        );
-                    }
-                    service_results.insert(svc_name, json!(results));
+                let mut results = svc.search(&requete, limite).await.ok()?;
+                // #4441 — voir `ne_garder_que_les_pistes_qui_repondent` : le filtre
+                // s'applique à chaque service, dans sa tâche, avant la réunion.
+                let ecartees = ne_garder_que_les_pistes_qui_repondent(&requete, &mut results);
+                if ecartees > 0 {
+                    tracing::debug!(
+                        service = %nom_log,
+                        ecartees,
+                        gardees = results.tracks.len(),
+                        "search_pistes_de_service_hors_identite_ecartees"
+                    );
                 }
-            }
-        }
-    }
+                Some(json!(results))
+            })
+        })
+        .collect();
+    service_results = recherches_concurrentes(travaux).await;
 
     Json(json!({
         "local": {
@@ -773,5 +854,97 @@ mod tests_pistes_de_service_i4441 {
         assert_eq!(r.tracks.len(), 1);
         assert_eq!(r.tracks[0].id, "acdc");
         assert_eq!(ne_garder_que_les_pistes_qui_repondent("  ", &mut r), 0);
+
+/// Les services sont interrogés ENSEMBLE — Bertrand, 19/09/2026.
+///
+/// « La recherche se fait en deux temps : local puis streaming. Il ne faut pas
+/// faire patienter l'utilisateur ».
+///
+/// 🔴 Ce banc CHRONOMÈTRE, et c'est le seul moyen de garder la propriété : une
+/// boucle qui `await` en son sein rend exactement les mêmes octets qu'un
+/// `join_all`, simplement plus tard. Toute assertion sur le contenu resterait
+/// verte sous le défaut.
+#[cfg(test)]
+mod tests_services_en_parallele {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Quatre services qui mettent chacun `DELAI` à répondre.
+    ///
+    /// À la file : 4 × DELAI. Ensemble : ≈ DELAI. Le seuil est posé à la
+    /// MOITIÉ de la somme — assez bas pour qu'un enchaînement séquentiel le
+    /// franchisse à coup sûr, assez haut pour ne pas rougir sur une machine
+    /// chargée (Shrek compile souvent à 60 tâches).
+    const DELAI: Duration = Duration::from_millis(150);
+    const NOMBRE: usize = 4;
+
+    fn travaux() -> Vec<(String, impl std::future::Future<Output = Option<Value>>)> {
+        (0..NOMBRE)
+            .map(|i| {
+                let nom = format!("service{i}");
+                (nom.clone(), async move {
+                    tokio::time::sleep(DELAI).await;
+                    Some(json!({ "nom": nom }))
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn les_quatre_partent_en_meme_temps() {
+        let debut = Instant::now();
+        let out = recherches_concurrentes(travaux()).await;
+        let ecoule = debut.elapsed();
+
+        assert_eq!(out.len(), NOMBRE, "les quatre réponses doivent être là");
+        let a_la_file = DELAI * NOMBRE as u32;
+        assert!(
+            ecoule < a_la_file / 2,
+            "les services sont interrogés À LA FILE : {ecoule:?} pour {NOMBRE} \
+             services à {DELAI:?} (à la file : {a_la_file:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn chaque_reponse_est_rangee_sous_son_propre_service() {
+        // Concurrent ne veut pas dire mélangé : `join_all` préserve
+        // l'appariement, et c'est ce qui est vérifié ici.
+        let out = recherches_concurrentes(travaux()).await;
+        for i in 0..NOMBRE {
+            let nom = format!("service{i}");
+            assert_eq!(
+                out.get(&nom)
+                    .and_then(|v| v.get("nom"))
+                    .and_then(|v| v.as_str()),
+                Some(nom.as_str()),
+                "{nom} mal apparié"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn un_service_muet_n_entre_pas_dans_la_reponse() {
+        // Non authentifié, ou en échec : la règle d'avant, inchangée.
+        // 🔴 Les deux travaux sortent de LA MÊME fermeture : deux blocs
+        // `async` écrits séparément, même identiques au caractère près, n'ont
+        // pas le même type et ne tiennent pas dans un `Vec`.
+        let travaux: Vec<(String, _)> = [("qui_repond", true), ("qui_se_tait", false)]
+            .into_iter()
+            .map(|(nom, repond)| {
+                (nom.to_string(), async move {
+                    repond.then(|| json!({ "ok": true }))
+                })
+            })
+            .collect();
+        let out = recherches_concurrentes(travaux).await;
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("qui_repond"));
+        assert!(!out.contains_key("qui_se_tait"));
+    }
+
+    #[tokio::test]
+    async fn sans_service_demande_la_reponse_est_vide_pas_absente() {
+        let travaux: Vec<(String, std::future::Ready<Option<Value>>)> = vec![];
+        assert!(recherches_concurrentes(travaux).await.is_empty());
     }
 }
