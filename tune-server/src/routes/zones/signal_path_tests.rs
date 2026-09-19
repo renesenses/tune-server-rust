@@ -167,6 +167,11 @@ fn armer_l_eq(backend: &Arc<dyn DbBackend>, zone_id: i64) {
             &serde_json::to_string(&profile).unwrap(),
         )
         .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    SettingsRepo::with_backend(backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
 }
 
 /// Source DSD128 en lecture, avec une session vivante.
@@ -309,6 +314,11 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&profile).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    SettingsRepo::with_backend(backend.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
 
     let sp = build_signal_path(
