@@ -77,6 +77,9 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
         let key = format!("zone_{zone}_crossfeed");
         let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
         settings.set(&key, saved).unwrap(); // A pre-SDK user's configuration.
+        // The equalizer is optional since v0.9.156: install it as the catalogue
+        // route would, so the Free tier still gets it in this witness.
+        settings.set("plugin_equalizer_installed", "true").unwrap();
         let routers = tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
         let loaded = state.plugin_info.get().unwrap();
         for id in ["equalizer", "crossfeed", "converter", "declick"] {

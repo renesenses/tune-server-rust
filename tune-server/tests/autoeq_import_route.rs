@@ -36,6 +36,12 @@ const CHEMIN: &str = "/api/v1/eq/import/autoeq";
 /// Un serveur en mémoire Premium ; le dernier témoin couvre également FREE.
 async fn app_premium() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // Greffon facultatif (v0.9.156) : la route d'import est gardée par
+    // `require_installed("equalizer")` — on l'installe comme le fait
+    // `POST /plugins/equalizer/install`.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     state.license.set_account_premium(true, None).await;
     tune_server::routes::router(state)
 }
@@ -259,6 +265,12 @@ async fn un_profil_trop_long_est_refuse_et_non_tronque() {
 #[tokio::test]
 async fn sans_premium_autoeq_importe_et_conserve_les_dix_bandes() {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // Greffon facultatif (v0.9.156) : la route d'import est gardée par
+    // `require_installed("equalizer")` — on l'installe comme le fait
+    // `POST /plugins/equalizer/install`.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     let app = tune_server::routes::router(state);
     let (status, corps) = post(&app, CHEMIN, json!({ "text": HD_650 })).await;
     assert_eq!(status, StatusCode::CREATED, "corps : {corps}");
