@@ -124,6 +124,19 @@ pub fn service_du_catalogue(rules_json: &str) -> Option<String> {
 ///
 /// Seule l'égalité compte. « Artiste **contient** Col » n'est pas une requête
 /// qu'un service sait honorer : il chercherait « Col » et rendrait autre chose.
+///
+/// 🔴 `title` compte comme titre d'ALBUM, et c'est propre à ce chemin. Une
+/// collection intelligente porte sur des albums : son éditeur écrit
+/// `{field:"title"}` pour le titre de l'album (`CHAMPS` de
+/// `smartRegles.ts`, libellé `smartCollection.fieldAlbumTitle`), et
+/// `build_album_query` le traduit par `al.title` (`"album" | "album_title" |
+/// "title"`). Sans cette entrée, « catalogue Qobuz + titre = Blue Train »
+/// serait refusé alors que l'écran vient de l'accepter.
+///
+/// Le jour où une PLAYLIST ira au catalogue, `title` y désignera le titre de
+/// la PISTE : il faudra alors passer l'objet en paramètre plutôt que
+/// d'élargir cette liste. Aujourd'hui `cible` n'est appelée que depuis
+/// `smart_collections::avec_albums_de_catalogue`.
 pub fn cible(rules_json: &str) -> Option<Cible> {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
     let egalite = |r: &Value| {
@@ -150,7 +163,7 @@ pub fn cible(rules_json: &str) -> Option<Cible> {
     if let Some(a) = nomme(&["artist", "artist_name"]) {
         return Some(Cible::Artiste(a));
     }
-    nomme(&["album", "album_title"]).map(Cible::Album)
+    nomme(&["album", "album_title", "title"]).map(Cible::Album)
 }
 
 #[cfg(test)]
@@ -201,6 +214,24 @@ mod tests {
         assert_eq!(cible(deux), Some(Cible::Artiste("Coltrane".into())));
         let seul_album = r#"[{"field":"album","op":"equals","value":"Blue Train"}]"#;
         assert_eq!(cible(seul_album), Some(Cible::Album("Blue Train".into())));
+    }
+
+    /// 🔴 Le champ que l'ÉCRAN des collections écrit réellement.
+    ///
+    /// `CHAMPS` de `smartRegles.ts` nomme le titre d'album `title` (libellé
+    /// `smartCollection.fieldAlbumTitle`), pas `album`. Une collection
+    /// « catalogue Qobuz + titre = Blue Train » partait donc sans cible, et le
+    /// serveur la refusait après que l'écran l'avait acceptée.
+    #[test]
+    fn le_titre_d_une_collection_est_un_titre_d_album() {
+        for champ in ["album", "album_title", "title"] {
+            let r = format!(r#"[{{"field":"{champ}","op":"=","value":"Blue Train"}}]"#);
+            assert_eq!(
+                cible(&r),
+                Some(Cible::Album("Blue Train".into())),
+                "{champ}"
+            );
+        }
     }
 
     #[test]
