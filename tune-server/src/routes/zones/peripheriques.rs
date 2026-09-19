@@ -176,19 +176,22 @@ pub(super) async fn push_device_preset(state: &AppState, zone_id: i64) {
         return;
     };
     let settings_map = renderer_settings_snapshot(state, zone_id);
-    if settings_map.is_empty() {
-        return;
-    }
-    let zone = ZoneRepo::with_backend(state.backend.clone())
+    let quirks = tune_core::device_catalog::resolve_zone_quirks(&state.backend, zone_id);
+    let output_type = ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
-        .flatten();
-    let payload = json!({
-        "brand": brand,
-        "model": model,
-        "output_type": zone.and_then(|z| z.output_type),
-        "settings": Value::Object(settings_map),
-    });
+        .flatten()
+        .and_then(|z| z.output_type);
+    let charges = charges_utiles_preset(
+        &brand,
+        &model,
+        output_type.as_deref(),
+        settings_map,
+        &quirks,
+    );
+    if charges.is_empty() {
+        return;
+    }
     tokio::spawn(async move {
         let Ok(client) = tune_core::http::client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -196,16 +199,104 @@ pub(super) async fn push_device_preset(state: &AppState, zone_id: i64) {
         else {
             return;
         };
-        match client
-            .post("https://mozaiklabs.fr/api/v1/community/devices/presets")
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(r) => tracing::debug!(status = %r.status(), "device_preset_pushed"),
-            Err(e) => tracing::debug!(error = %e, "device_preset_push_failed"),
+        for payload in charges {
+            let vocabulaire = payload["vocabulary"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            match client
+                .post("https://mozaiklabs.fr/api/v1/community/devices/presets")
+                .json(&payload)
+                .send()
+                .await
+            {
+                Ok(r) => {
+                    tracing::debug!(status = %r.status(), vocabulaire, "device_preset_pushed")
+                }
+                Err(e) => tracing::debug!(error = %e, vocabulaire, "device_preset_push_failed"),
+            }
         }
     });
+}
+
+/// Vocabulaire des réglages de l'écran Réglages/appareil — ce que les
+/// instances envoient depuis toujours (absent = celui-ci, côté site).
+pub(super) const VOCABULAIRE_REGLAGES: &str = tune_core::cloud::tune_tested::VOCABULAIRE_CONNU;
+
+/// Vocabulaire des quirks du catalogue embarqué. Le site l'accepte depuis le
+/// 08/09/2026 (`POST /devices/presets`, champ `vocabulary`).
+pub(super) const VOCABULAIRE_QUIRKS: &str = "tune.quirks.v1";
+
+/// Les charges utiles d'un partage de pré-réglages, **sans réseau** — zéro,
+/// une ou deux, une par vocabulaire.
+///
+/// #3589, décision de Bertrand du 08/09/2026 : la préconfiguration applique
+/// les réglages de zone ET les quirks, donc « les quirks remontent AUSSI ».
+/// Jusqu'ici seuls les réglages de zone partaient, sans dire leur
+/// vocabulaire. Les deux familles partent en DEUX envois : côté site le
+/// vocabulaire fait partie de la ligne, et un envoi qui mélangerait les clés
+/// ferait une ligne hybride qui ne compterait pour personne.
+pub(super) fn charges_utiles_preset(
+    brand: &str,
+    model: &str,
+    output_type: Option<&str>,
+    reglages: serde_json::Map<String, Value>,
+    quirks: &tune_core::device_catalog::DeviceQuirks,
+) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (vocabulaire, settings) in [
+        (VOCABULAIRE_REGLAGES, reglages),
+        (VOCABULAIRE_QUIRKS, quirks_en_reglages(quirks)),
+    ] {
+        if settings.is_empty() {
+            continue;
+        }
+        out.push(json!({
+            "brand": brand,
+            "model": model,
+            "output_type": output_type,
+            "settings": Value::Object(settings),
+            "vocabulary": vocabulaire,
+        }));
+    }
+    out
+}
+
+/// Les quirks d'une zone dans le vocabulaire `tune.quirks.v1` du site. Seul
+/// ce qui est AFFIRMÉ part : un booléen à `false` est la valeur neutre de
+/// `DeviceQuirks`, il ne dit rien — même règle que `renderer_settings_snapshot`
+/// et que `device_preconfig::preconfigurer`.
+///
+/// 🔴 `force_16bit` part sous son nom retenu, `dlna_cap_16bit` : c'est le
+/// même réglage (Bertrand, 08/09), et deux graphies feraient deux lignes côté
+/// site — le compteur de foyers se scinderait, aucune moitié ne paraîtrait
+/// majoritaire.
+fn quirks_en_reglages(
+    q: &tune_core::device_catalog::DeviceQuirks,
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for (cle, affirme) in [
+        ("dlna_native_flac", q.dlna_native_flac),
+        ("dlna_no_extra_headers", q.dlna_no_extra_headers),
+        ("dlna_wav24", q.dlna_wav24),
+        ("dlna_cap_16bit", q.force_16bit),
+        ("no_gapless", q.no_gapless),
+        ("pcm_only", q.pcm_only),
+    ] {
+        if affirme {
+            out.insert(cle.into(), json!(true));
+        }
+    }
+    if let Some(hz) = q.max_sample_rate {
+        out.insert("max_sample_rate".into(), json!(hz));
+    }
+    if let Some(ms) = q.dlna_play_delay_ms {
+        out.insert("dlna_play_delay_ms".into(), json!(ms));
+    }
+    if let Some(mime) = q.force_mime.as_deref() {
+        out.insert("force_mime".into(), json!(mime));
+    }
+    out
 }
 
 /// La charge utile d'une correction de marque/modèle, **sans réseau** — pour
@@ -664,6 +755,86 @@ mod correction_tests {
             p.get("oui").is_none(),
             "OUI fabriqué depuis une non-MAC : {p}"
         );
+    }
+}
+
+#[cfg(test)]
+mod preset_tests {
+    use super::{VOCABULAIRE_QUIRKS, VOCABULAIRE_REGLAGES, charges_utiles_preset};
+    use serde_json::json;
+    use tune_core::device_catalog::{DeviceQuirks, quirks_for};
+
+    fn reglages(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    /// #3589 — les quirks remontent AUSSI, dans leur vocabulaire, et
+    /// `force_16bit` part sous `dlna_cap_16bit`, jamais sous son nom interne.
+    #[test]
+    fn les_quirks_partent_dans_leur_vocabulaire_et_force_16bit_sous_son_nom_retenu() {
+        let ruark = quirks_for("Ruark Audio", "R3");
+        assert!(
+            ruark.force_16bit,
+            "le témoin suppose le quirk câblé du R3 (#1137)"
+        );
+        let charges = charges_utiles_preset(
+            "Ruark Audio",
+            "R3",
+            Some("dlna"),
+            reglages(json!({ "gain_trim_db": -3 })),
+            &ruark,
+        );
+        assert_eq!(charges.len(), 2, "{charges:?}");
+        assert_eq!(charges[0]["vocabulary"], VOCABULAIRE_REGLAGES);
+        assert_eq!(charges[0]["settings"]["gain_trim_db"], -3);
+        assert_eq!(charges[1]["vocabulary"], VOCABULAIRE_QUIRKS);
+        assert_eq!(charges[1]["settings"]["dlna_cap_16bit"], true);
+        assert!(
+            charges[1]["settings"].get("force_16bit").is_none(),
+            "deux graphies = deux lignes côté site : {charges:?}"
+        );
+        for c in &charges {
+            assert_eq!(c["brand"], "Ruark Audio");
+            assert_eq!(c["model"], "R3");
+            assert_eq!(c["output_type"], "dlna");
+        }
+    }
+
+    /// Seul ce qui est AFFIRMÉ part : Sonos One n'a que son plafond 48 kHz,
+    /// et un profil neutre n'envoie rien du tout.
+    #[test]
+    fn seul_ce_qui_est_affirme_part() {
+        let sonos = quirks_for("Sonos", "One");
+        let charges = charges_utiles_preset("Sonos", "One", None, reglages(json!({})), &sonos);
+        assert_eq!(charges.len(), 1, "{charges:?}");
+        assert_eq!(charges[0]["vocabulary"], VOCABULAIRE_QUIRKS);
+        assert_eq!(charges[0]["settings"], json!({ "max_sample_rate": 48000 }));
+        assert!(
+            charges_utiles_preset(
+                "X",
+                "Y",
+                None,
+                reglages(json!({})),
+                &DeviceQuirks::default()
+            )
+            .is_empty()
+        );
+    }
+
+    /// Ce que les instances envoyaient déjà part inchangé — en le disant.
+    #[test]
+    fn les_reglages_de_zone_disent_leur_vocabulaire() {
+        let charges = charges_utiles_preset(
+            "Eversolo",
+            "DMP-A8",
+            Some("dlna"),
+            reglages(json!({ "dlna_native_flac": true })),
+            &DeviceQuirks::default(),
+        );
+        assert_eq!(charges.len(), 1);
+        assert_eq!(charges[0]["vocabulary"], VOCABULAIRE_REGLAGES);
+        assert_eq!(charges[0]["vocabulary"], "tune.renderer.v1");
+        assert_eq!(charges[0]["settings"]["dlna_native_flac"], true);
     }
 }
 
