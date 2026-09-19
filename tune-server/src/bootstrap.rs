@@ -200,24 +200,7 @@ pub async fn run_with(opts: RunOptions) {
         "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
     );
     let timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
-
-    let env_filter = EnvFilter::from_default_env()
-        .add_directive(format!("tune_server={}", config.log_level).parse().unwrap())
-        .add_directive(format!("tune_core={}", config.log_level).parse().unwrap())
-        // Cap chatty dependencies so a `debug` level (config or RUST_LOG=debug)
-        // doesn't drown the useful lines. At debug, sqlx::query logs every SQL
-        // statement and reqwest/hyper log every outbound connection: Elie's
-        // 1000-line "Export logs" covered barely 7 seconds, ~95% of it sqlx +
-        // reqwest::connect noise, burying the playback events we actually needed.
-        // These crates are never useful for diagnosing Tune. Target-specific
-        // directives win over the global level, so this holds even at RUST_LOG=debug.
-        .add_directive("sqlx=warn".parse().unwrap())
-        .add_directive("reqwest=info".parse().unwrap())
-        .add_directive("hyper=info".parse().unwrap())
-        .add_directive("hyper_util=info".parse().unwrap())
-        .add_directive("h2=info".parse().unwrap())
-        .add_directive("rustls=info".parse().unwrap())
-        .add_directive("mio=info".parse().unwrap());
+    let env_filter = filtre_du_journal(&config.log_level);
 
     // Write logs to a file on every platform (Linux included) so the
     // Diagnostics "Export logs" button and /system/logs work even when not
@@ -836,6 +819,44 @@ fn version_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
     args.into_iter().any(|a| a == "--version" || a == "-V")
 }
 
+/// Le filtre du journal : le niveau demandé pour tout ce qui vient du dépôt,
+/// un plafond pour les dépendances bavardes. `RUST_LOG` garde le dernier mot
+/// (`from_default_env`), comme avant.
+fn filtre_du_journal(niveau: &str) -> EnvFilter {
+    poser_les_directives(EnvFilter::from_default_env(), niveau)
+}
+/// Les directives, séparées de la lecture de `RUST_LOG` pour être témoignables.
+///
+/// Le niveau porte sur le PRÉFIXE `tune` : `tune_server` et `tune_core`, mais
+/// aussi `tune_stream_http`, `tune_streaming_http`, `tune_smart_http`,
+/// `tune_http_types` et les greffons (`tune_bandcamp`, `tune_pont_roon`…).
+/// Depuis la scission du transport des flux (6487be4e, v0.9.114), seules les
+/// deux premières étaient nommées : tout ce que `tune_stream_http` écrit sous
+/// `info!` et `warn!` — `stream_request` avec le Range et l'agent du renderer,
+/// `icy_metadata_negotiated`, `radio_bounded_live_response`, les corps
+/// abandonnés — tombait sous le niveau par défaut du filtre (`error`) et
+/// n'atteignait ni journald ni l'export de diagnostic. #4480 (DMP-A8 : 34 Mo
+/// tirés, puis Stopped à 23 s) n'a laissé AUCUNE ligne HTTP pour cette raison.
+/// Une directive par caisse serait à refaire à chaque scission ; le préfixe
+/// couvre les suivantes.
+fn poser_les_directives(filtre: EnvFilter, niveau: &str) -> EnvFilter {
+    filtre
+        .add_directive(format!("tune={niveau}").parse().unwrap())
+        // Cap chatty dependencies so a `debug` level (config or RUST_LOG=debug)
+        // doesn't drown the useful lines. At debug, sqlx::query logs every SQL
+        // statement and reqwest/hyper log every outbound connection: Elie's
+        // 1000-line "Export logs" covered barely 7 seconds, ~95% of it sqlx +
+        // reqwest::connect noise, burying the playback events we actually needed.
+        // These crates are never useful for diagnosing Tune. Target-specific
+        // directives win over the global level, so this holds even at RUST_LOG=debug.
+        .add_directive("sqlx=warn".parse().unwrap())
+        .add_directive("reqwest=info".parse().unwrap())
+        .add_directive("hyper=info".parse().unwrap())
+        .add_directive("hyper_util=info".parse().unwrap())
+        .add_directive("h2=info".parse().unwrap())
+        .add_directive("rustls=info".parse().unwrap())
+        .add_directive("mio=info".parse().unwrap())
+}
 #[cfg(test)]
 mod tests {
     use super::version_requested;
@@ -874,5 +895,69 @@ mod tests {
     #[test]
     fn les_arguments_de_la_sonde_wasm_ne_declenchent_rien() {
         assert!(!version_requested(args(&["--wasm-probe", "/tmp/x.wasm"])));
+    }
+    /// Le journal capté pendant le test.
+    #[derive(Clone, Default)]
+    struct JournalCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl JournalCapture {
+        fn texte(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("journal utf-8")
+        }
+    }
+    impl std::io::Write for JournalCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalCapture {
+        type Writer = JournalCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    /// #4480 : le journal du .18 ne portait AUCUNE ligne de `tune_stream_http`
+    /// — le filtre ne nommait que `tune_server` et `tune_core`, et tout ce que
+    /// les caisses HTTP scindées écrivaient restait sous `error`. Le niveau
+    /// demandé doit couvrir toutes les caisses du dépôt, et le plafond des
+    /// dépendances bavardes doit tenir.
+    #[test]
+    fn le_niveau_demande_couvre_toutes_les_caisses_du_depot() {
+        let journal = JournalCapture::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_env_filter(super::poser_les_directives(
+                tracing_subscriber::EnvFilter::default(),
+                "info",
+            ))
+            .finish();
+        tracing::subscriber::with_default(abonne, || {
+            tracing::info!(target: "tune_stream_http", "temoin_stream_request");
+            tracing::info!(target: "tune_streaming_http", "temoin_streaming_request");
+            tracing::info!(target: "tune_smart_http", "temoin_smart_request");
+            tracing::info!(target: "tune_core::poller::tick", "temoin_sondeur_info");
+            tracing::debug!(target: "tune_core::poller::tick", "temoin_sondeur_debug");
+            tracing::info!(target: "sqlx::query", "temoin_sqlx_info");
+        });
+        let ecrit = journal.texte();
+        for attendu in [
+            "temoin_stream_request",
+            "temoin_streaming_request",
+            "temoin_smart_request",
+            "temoin_sondeur_info",
+        ] {
+            assert!(
+                ecrit.contains(attendu),
+                "{attendu} absent du journal :\n{ecrit}"
+            );
+        }
+        // Le niveau demandé est `info` : le debug du dépôt reste dehors, et le
+        // plafond `sqlx=warn` tient.
+        assert!(!ecrit.contains("temoin_sondeur_debug"), "{ecrit}");
+        assert!(!ecrit.contains("temoin_sqlx_info"), "{ecrit}");
     }
 }
