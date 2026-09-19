@@ -2623,49 +2623,6 @@ fn record_compressed_decode_failure(
     }
 }
 
-/// Last preparation step before the f32 ring used by Windows exclusive
-/// backends.
-///
-/// `must_classify_24_bit` is true until the first complete 32-frame probe has
-/// ruled out DoP. Returning `Ok(None)` quarantines those initial bytes: the
-/// caller must keep them in its raw-byte `leftover` buffer and must not feed
-/// the ring. Every later, sufficiently large 24-bit chunk is checked too, so a
-/// malformed stream cannot switch to DoP unnoticed at a chunk boundary.
-#[cfg(any(target_os = "windows", test))]
-#[allow(clippy::too_many_arguments)]
-fn prepare_windows_exclusive_pcm(
-    bytes: &[u8],
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: bool,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
-    let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
-    if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
-        return Ok(None);
-    }
-    if bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels) {
-        return Err(WindowsExclusivePcmError::DopUnsupported);
-    }
-
-    let mut samples = pcm_bytes_to_f32(bytes, bit_depth);
-    apply_local_dsp(
-        &mut samples,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
-        channels,
-        false,
-    );
-    Ok(Some(samples))
-}
-
 /// At EOF, an initial 24-bit probe that never reached 32 frames is not proof
 /// of PCM. Failing closed avoids treating a tiny DoP payload as ordinary audio.
 #[cfg(any(target_os = "windows", test))]
@@ -2678,232 +2635,6 @@ fn finish_windows_exclusive_probe(
         Err(WindowsExclusivePcmError::DopCheckIncomplete)
     } else {
         Ok(())
-    }
-}
-
-/// Consume every complete frame currently staged in `leftover`, but only
-/// after the shared DoP/DSP preparation step has authorised it.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_windows_exclusive_leftover(
-    leftover: &mut Vec<u8>,
-    frame_bytes: usize,
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: &mut bool,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    ring: &RingBuf,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) -> Result<u64, WindowsExclusivePcmError> {
-    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-    if aligned_len == 0 {
-        return Ok(0);
-    }
-    let Some(samples) = prepare_windows_exclusive_pcm(
-        &leftover[..aligned_len],
-        bit_depth,
-        channels,
-        *must_classify_24_bit,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
-    )?
-    else {
-        // The raw bytes remain staged until the first 24-bit probe reaches a
-        // conclusive length. In particular, no f32 sample has been produced.
-        return Ok(0);
-    };
-
-    *must_classify_24_bit = false;
-    feed_ring_abortable(ring, &samples, stop_rx, paused, Some(force_silent));
-    leftover.drain(..aligned_len);
-    Ok((aligned_len / frame_bytes) as u64)
-}
-
-#[cfg(target_os = "windows")]
-struct NativeFeedOutcome {
-    frames: u64,
-    dop: bool,
-    bit_perfect: bool,
-}
-
-#[cfg(target_os = "windows")]
-#[derive(Clone, Copy)]
-enum WindowsExclusiveRingRef<'a> {
-    Float(&'a RingBuf),
-    Native(&'a NativePcmRing),
-}
-
-#[cfg(target_os = "windows")]
-impl WindowsExclusiveRingRef<'_> {
-    fn capacity(self) -> usize {
-        match self {
-            Self::Float(ring) => ring.capacity(),
-            Self::Native(ring) => ring.capacity(),
-        }
-    }
-
-    fn available(self) -> usize {
-        match self {
-            Self::Float(ring) => ring.available(),
-            Self::Native(ring) => ring.available(),
-        }
-    }
-}
-
-/// Integer twin of [`feed_windows_exclusive_leftover`]. The producer resolves
-/// DoP, DSP and volume before it publishes left-aligned words; the backend
-/// callback can therefore remain a pure native serializer.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_windows_native_exclusive_leftover(
-    leftover: &mut Vec<u8>,
-    frame_bytes: usize,
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: &mut bool,
-    dop_latched: &mut bool,
-    volume_units: u32,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    ring: &NativePcmRing,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) -> Option<NativeFeedOutcome> {
-    let aligned_len = (leftover.len() / frame_bytes) * frame_bytes;
-    if aligned_len == 0 {
-        return None;
-    }
-    let prepared = prepare_windows_native_pcm(
-        &leftover[..aligned_len],
-        bit_depth,
-        channels,
-        *must_classify_24_bit,
-        *dop_latched,
-        volume_units,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
-    )?;
-
-    *must_classify_24_bit = false;
-    *dop_latched = prepared.dop;
-    feed_native_ring_abortable(ring, &prepared.samples, stop_rx, paused, Some(force_silent));
-    leftover.drain(..aligned_len);
-    Some(NativeFeedOutcome {
-        frames: (aligned_len / frame_bytes) as u64,
-        dop: prepared.dop,
-        bit_perfect: prepared.bit_perfect,
-    })
-}
-
-/// Route staged bytes to the callback representation selected from the
-/// driver's advertised native format. The legacy float route remains
-/// fail-closed for DoP; the native route carries DoP and identity PCM exactly.
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_selected_windows_exclusive_leftover(
-    leftover: &mut Vec<u8>,
-    frame_bytes: usize,
-    bit_depth: u16,
-    channels: u16,
-    must_classify_24_bit: &mut bool,
-    dop_latched: &mut bool,
-    volume_units: u32,
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    ring: WindowsExclusiveRingRef<'_>,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) -> Result<Option<NativeFeedOutcome>, WindowsExclusivePcmError> {
-    match ring {
-        WindowsExclusiveRingRef::Native(ring) => Ok(feed_windows_native_exclusive_leftover(
-            leftover,
-            frame_bytes,
-            bit_depth,
-            channels,
-            must_classify_24_bit,
-            dop_latched,
-            volume_units,
-            eq,
-            convolver,
-            crossfeed,
-            pure_bypass,
-            mono_downmix,
-            ring,
-            stop_rx,
-            paused,
-            force_silent,
-        )),
-        WindowsExclusiveRingRef::Float(ring) => {
-            let frames = feed_windows_exclusive_leftover(
-                leftover,
-                frame_bytes,
-                bit_depth,
-                channels,
-                must_classify_24_bit,
-                eq,
-                convolver,
-                crossfeed,
-                pure_bypass,
-                mono_downmix,
-                ring,
-                stop_rx,
-                paused,
-                force_silent,
-            )?;
-            Ok((frames > 0).then_some(NativeFeedOutcome {
-                frames,
-                dop: false,
-                bit_perfect: false,
-            }))
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[allow(clippy::too_many_arguments)]
-fn feed_selected_windows_exclusive_tail(
-    ring: WindowsExclusiveRingRef<'_>,
-    mut samples: Vec<f32>,
-    bit_depth: u16,
-    volume_units: u32,
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    force_silent: &AtomicBool,
-) {
-    match ring {
-        WindowsExclusiveRingRef::Float(ring) => {
-            feed_ring_abortable(ring, &samples, stop_rx, paused, Some(force_silent));
-        }
-        WindowsExclusiveRingRef::Native(ring) => {
-            let volume = volume_units as f32 / 1000.0;
-            if volume != 1.0 {
-                for sample in &mut samples {
-                    *sample *= volume;
-                }
-            }
-            let native = f32_to_native_i32(&samples, bit_depth);
-            feed_native_ring_abortable(ring, &native, stop_rx, paused, Some(force_silent));
-        }
     }
 }
 
@@ -3147,9 +2878,13 @@ pub(crate) fn pcm_bytes_to_native_i32(bytes: &[u8], bit_depth: u16) -> Vec<i32> 
 }
 
 /// Write left-aligned native words back to their exact 16/24/32-bit PCM byte
-/// representation. This is the WASAPI callback's final serialization step and
-/// also the inverse used by the backend-boundary countertests.
-#[cfg(any(target_os = "windows", test))]
+/// representation: the inverse used by the backend-boundary countertests.
+///
+/// REF-10 (#2219) : plus aucun appelant de production — le fil de rendu WASAPI
+/// resérialise par `NativePcmRing::pop_pcm_bytes`, et la compilation Windows
+/// (`cargo check -p tune-core --lib`, avec et sans `asio`) la déclarait morte.
+/// Elle reste l'oracle des témoins, d'où `cfg(test)` seul.
+#[cfg(test)]
 pub(crate) fn native_i32_to_pcm_bytes(samples: &[i32], bit_depth: u16, out: &mut [u8]) -> usize {
     let bytes_per_sample = usize::from(bit_depth / 8);
     if !matches!(bit_depth, 16 | 24 | 32) {
@@ -6634,45 +6369,6 @@ fn drain_deadline_for(
     std::time::Duration::from_millis(
         (queued_samples as u64 * 1000) / (sample_rate.max(1) * channels.max(1)) + 5000,
     )
-}
-
-#[cfg(target_os = "windows")]
-fn feed_native_ring_abortable(
-    ring: &NativePcmRing,
-    samples: &[i32],
-    stop_rx: &std::sync::mpsc::Receiver<()>,
-    paused: &AtomicBool,
-    abort: Option<&AtomicBool>,
-) -> bool {
-    let mut offset = 0;
-    let mut last_progress_at = std::time::Instant::now();
-    while offset < samples.len() {
-        if stop_rx.try_recv().is_ok() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
-            return true;
-        }
-        while paused.load(Ordering::Relaxed) {
-            if stop_rx.try_recv().is_ok() || abort.is_some_and(|a| a.load(Ordering::Relaxed)) {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            last_progress_at = std::time::Instant::now();
-        }
-        let written = ring.push(&samples[offset..]);
-        offset += written;
-        if written == 0 {
-            if last_progress_at.elapsed() >= std::time::Duration::from_secs(5) {
-                warn!(
-                    remaining_samples = samples.len() - offset,
-                    "windows_native_feed_ring_stall_timeout"
-                );
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        } else {
-            last_progress_at = std::time::Instant::now();
-        }
-    }
-    true
 }
 
 mod resolution;
