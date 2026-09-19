@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
@@ -1170,6 +1170,7 @@ async fn serve_file(
             .and_then(|s| if s.is_empty() { None } else { s.parse().ok() })
             .unwrap_or(file_size - 1);
         let length = end - start + 1;
+        noter_range_hors_trame(&session, info, start);
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1227,6 +1228,78 @@ async fn serve_file(
 
     let body = build_file_body(faststart, path.to_string(), 0, file_size, session.clone());
     (StatusCode::OK, headers, body).into_response()
+}
+
+/// Taille de l'en-tête que TOUS les WAV de Tune portent
+/// (`tune_core::audio::wav::build_wav_header*` rendent un `[u8; 44]`).
+const EN_TETE_WAV: u64 = 44;
+
+/// Reprises signalées au niveau WARN par session ; au-delà, DEBUG. Un
+/// renderer qui boucle en produirait des centaines par minute.
+const RANGES_HORS_TRAME_AU_JOURNAL: u32 = 3;
+
+/// #4455 — de combien d'octets une reprise `Range: bytes=N-` d'un WAV tombe
+/// À CÔTÉ de la grille des trames PCM. `0` : alignée, ou dans l'en-tête, ou
+/// trame inconnue.
+///
+/// Sevy Tabroc (fil 1843, darTZeel LHC-208 en DLNA, ALAC → WAV 48 kHz 24 bits) :
+/// « soudainement est apparu un souffle alors que le morceau continue à être
+/// joué ». Rien dans le journal joint : les 200 dernières lignes ne portent
+/// aucune ligne du chemin de service du fichier. Or c'est le SEUL étage qui
+/// puisse changer quelque chose au milieu d'un fichier déjà transcodé en
+/// entier — le DSP, le gain et l'encodage sont faits avant la première note.
+/// Un renderer qui reprend le flux à un offset qu'il a calculé lui-même et
+/// qui n'est pas un multiple de la trame (6 octets en 24 bits stéréo) lit
+/// dès lors l'octet de poids faible comme un octet de poids fort : tous les
+/// mots sont déphasés, le signal devient un bruit sous lequel la musique
+/// reste reconnaissable — exactement la famille que `rognage_de_phase`
+/// documente pour les tuyaux (#1894). Le serveur sert ici l'octet demandé,
+/// comme il le doit ; il le DIT désormais, pour que le prochain journal
+/// tranche.
+fn decalage_de_trame(debut: u64, en_tete: u64, trame: u64) -> u64 {
+    if trame <= 1 || debut <= en_tete {
+        return 0;
+    }
+    (debut - en_tete) % trame
+}
+
+/// Trace une reprise hors trame sur une session de fichier WAV — WARN les
+/// premières fois, DEBUG ensuite (voir [`decalage_de_trame`]).
+fn noter_range_hors_trame(session: &StreamSession, info: &StreamInfo, debut: u64) {
+    if info.format != "wav" {
+        return;
+    }
+    let trame = u64::from(info.channels) * u64::from(info.bit_depth / 8);
+    let decalage = decalage_de_trame(debut, EN_TETE_WAV, trame);
+    if decalage == 0 {
+        return;
+    }
+    let occurrence = session
+        .ranges_hors_trame
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    if occurrence <= RANGES_HORS_TRAME_AU_JOURNAL {
+        warn!(
+            stream_id = %session.id,
+            debut,
+            trame,
+            decalage,
+            occurrence,
+            bit_depth = info.bit_depth,
+            channels = info.channels,
+            "stream_range_hors_trame — le renderer reprend le WAV entre deux trames ; \
+             servi tel quel, mais ses mots PCM seront déphasés (#4455)"
+        );
+    } else {
+        debug!(
+            stream_id = %session.id,
+            debut,
+            trame,
+            decalage,
+            occurrence,
+            "stream_range_hors_trame"
+        );
+    }
 }
 
 /// Stream `length` bytes starting at virtual offset `start` of a file session.
@@ -1896,8 +1969,29 @@ pub fn router(sessions: SharedSessions) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::{
-        ICY_METAINT, accepts_chunked_live_stream, corps_compte, decoupe_icy, parse_range_start,
+        ICY_METAINT, accepts_chunked_live_stream, corps_compte, decalage_de_trame, decoupe_icy,
+        parse_range_start,
     };
+
+    /// #4455 — la grille des trames d'un WAV 24 bits stéréo (6 octets) après
+    /// ses 44 octets d'en-tête : les reprises alignées ne disent rien, les
+    /// autres disent de combien elles tombent à côté. L'en-tête et le début
+    /// de fichier ne sont jamais « hors trame », ni une trame inconnue.
+    #[test]
+    fn le_decalage_de_trame_ne_signale_que_les_reprises_entre_deux_trames() {
+        assert_eq!(decalage_de_trame(0, 44, 6), 0);
+        assert_eq!(decalage_de_trame(44, 44, 6), 0);
+        assert_eq!(decalage_de_trame(44 + 6 * 1_000, 44, 6), 0);
+        assert_eq!(decalage_de_trame(44 + 6 * 1_000 + 1, 44, 6), 1);
+        assert_eq!(decalage_de_trame(44 + 6 * 1_000 + 3, 44, 6), 3);
+        // Dans l'en-tête : la sonde `bytes=1-` d'un renderer, pas une reprise.
+        assert_eq!(decalage_de_trame(12, 44, 6), 0);
+        // 16 bits stéréo : trame de 4.
+        assert_eq!(decalage_de_trame(44 + 4 * 10 + 2, 44, 4), 2);
+        // Trame inconnue ou d'un octet : rien à mesurer.
+        assert_eq!(decalage_de_trame(1_000_001, 44, 0), 0);
+        assert_eq!(decalage_de_trame(1_000_001, 44, 1), 0);
+    }
 
     /// La sonde du DMP-A8, en modèle réduit : une connexion ouvre le flux
     /// d'une conversion (DSD→WAV), puis une seconde arrive pendant que la

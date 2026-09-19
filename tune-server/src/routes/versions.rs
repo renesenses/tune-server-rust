@@ -108,7 +108,62 @@ pub(crate) const DELIMITEURS_D_EDITION: [&str; 3] = [" (", " [", " - "];
 pub(crate) fn titres_equivalents(a: &str, b: &str) -> bool {
     let a = a.trim().to_lowercase();
     let b = b.trim().to_lowercase();
-    a == b || titre_est_base_de(&a, &b) || titre_est_base_de(&b, &a)
+    a == b || titre_est_base_de(&a, &b) || titre_est_base_de(&b, &a) || noyaux_equivalents(&a, &b)
+}
+
+/// #4443 — le même morceau, écrit autrement d'un catalogue à l'autre.
+///
+/// FabienM (fil 1839, point 3) : depuis son « Shine On You Crazy Diamond
+/// (Parts 1-5) » local, « Autres versions » oublie l'édition Qobuz de *Wish
+/// You Were Here* — où la piste s'appelle « Shine on You Crazy Diamond, Pts.
+/// 1-5 ». Roon, lui, la place en tête. Rien de flou là-dedans : ce sont les
+/// MÊMES mots, avec une virgule pour une parenthèse et « Pts. » pour
+/// « Parts » — la convention de Qobuz pour les œuvres en parties, que l'on
+/// retrouve sur Gov't Mule (« , Pts. 1 - 5 ») et David Gilmour (« (Pts. 1-5)
+/// (Live) »).
+///
+/// Le noyau d'un titre : ses jetons alphanumériques, en minuscules, avec
+/// l'abréviation « pt(s) » dépliée. Toute la ponctuation tombe — virgules,
+/// parenthèses, points, tirets —, donc « 1-5 », « 1 - 5 » et « 1–5 » font le
+/// même noyau. Ce n'est PAS un rapprochement flou : deux titres n'ont le même
+/// noyau que s'ils portent exactement les mêmes mots dans le même ordre ;
+/// « Somebody » reste étranger à « Somebody To Love », et « Parts 1-5 » à
+/// « Parts 6-9 ».
+pub(crate) fn noyau_de_titre(titre: &str) -> String {
+    titre
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|jeton| !jeton.is_empty())
+        .map(|jeton| match jeton.to_lowercase().as_str() {
+            "pts" => "parts".to_string(),
+            "pt" => "part".to_string(),
+            autre => autre.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Le titre sans son DERNIER suffixe d'édition — « X, Pts. 1-5 (Live) »
+/// devient « X, Pts. 1-5 ». `None` quand il n'y a rien à retirer.
+fn sans_dernier_suffixe(titre: &str) -> Option<&str> {
+    DELIMITEURS_D_EDITION
+        .iter()
+        .filter_map(|d| titre.rfind(d))
+        .max()
+        .map(|pos| titre[..pos].trim_end())
+}
+
+/// Deux titres ont le même noyau, directement ou l'un d'eux une fois
+/// délesté de son dernier suffixe d'édition (la symétrie de
+/// [`titre_est_base_de`], appliquée au noyau).
+fn noyaux_equivalents(a: &str, b: &str) -> bool {
+    let na = noyau_de_titre(a);
+    let nb = noyau_de_titre(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    na == nb
+        || sans_dernier_suffixe(b).is_some_and(|b_nu| noyau_de_titre(b_nu) == na)
+        || sans_dernier_suffixe(a).is_some_and(|a_nu| noyau_de_titre(a_nu) == nb)
 }
 
 fn titre_est_base_de(base: &str, variante: &str) -> bool {
@@ -194,6 +249,43 @@ pub(crate) struct Reference {
     pub isrc: Option<String>,
     pub duree_ms: Option<i64>,
     pub annee: Option<i64>,
+    /// D'OÙ vient la référence — `local`, ou le nom d'un service (#4443).
+    /// `None` quand l'appelant ne le sait pas (la section d'accueil, dont
+    /// le vivier est l'historique) : la règle d'avant s'applique alors.
+    pub source: Option<String>,
+}
+
+/// #4443 — ce qu'un candidat venu d'un SERVICE devient dans la liste.
+///
+/// `classer_version` écarte « même artiste, même album » comme le même
+/// enregistrement : c'est juste quand référence et candidat viennent du même
+/// catalogue. Quand la référence est un fichier LOCAL et le candidat la
+/// piste Qobuz du même album, c'est au contraire l'autre version la plus
+/// attendue — l'édition du service, en haute résolution, celle que Roon
+/// place en tête et que FabienM cherchait (fil 1839, point 3). L'album ne
+/// suffit donc à écarter que si les deux viennent de la même source ; entre
+/// deux sources, c'est une version.
+///
+/// `None` : rien à proposer (hors sujet, ou même enregistrement de la même
+/// source).
+pub(crate) fn genre_de_version_de_service(
+    classe: &ClasseVersion,
+    reference: &Reference,
+    nom_service: &str,
+) -> Option<&'static str> {
+    match classe {
+        ClasseVersion::AutreVersion => Some("version"),
+        ClasseVersion::Reprise => Some("reprise"),
+        ClasseVersion::MemeEnregistrement
+            if reference
+                .source
+                .as_deref()
+                .is_some_and(|source| !source.eq_ignore_ascii_case(nom_service)) =>
+        {
+            Some("version")
+        }
+        ClasseVersion::MemeEnregistrement | ClasseVersion::SansRapport => None,
+    }
 }
 
 /// Les signaux d'un CANDIDAT, locaux ou venus d'un service.
@@ -591,10 +683,9 @@ pub(crate) async fn versions_streaming(
                 let a = piste["artist_name"].as_str().unwrap_or_default();
                 let al = piste["album_title"].as_str().unwrap_or_default();
                 let classe = classer_version(titre, artiste, album, t, a, al);
-                let genre = match classe {
-                    ClasseVersion::AutreVersion => "version",
-                    ClasseVersion::Reprise => "reprise",
-                    _ => continue,
+                let Some(genre) = genre_de_version_de_service(&classe, reference, nom_service)
+                else {
+                    continue;
                 };
                 let source_id = piste["source_id"].as_str().unwrap_or_default().to_string();
                 if !deja.insert((nom_service.to_string(), source_id)) {
@@ -661,10 +752,9 @@ pub(crate) async fn versions_streaming(
                 let a = piste["artist_name"].as_str().unwrap_or_default();
                 let al = piste["album_title"].as_str().unwrap_or_default();
                 let classe = classer_version(titre, artiste, album, t, a, al);
-                let genre = match classe {
-                    ClasseVersion::AutreVersion => "version",
-                    ClasseVersion::Reprise => "reprise",
-                    _ => continue,
+                let Some(genre) = genre_de_version_de_service(&classe, reference, "bandcamp")
+                else {
+                    continue;
                 };
                 let url = piste["url"].as_str().unwrap_or_default().to_string();
                 if !deja.insert(("bandcamp".to_string(), url)) {
@@ -710,7 +800,8 @@ mod tests {
     use super::{
         ClasseVersion, POINTS_ANNEE_DIFFERENTE, POINTS_DUREE_PROCHE, POINTS_DUREE_QUASI_EGALE,
         POINTS_DUREE_VOISINE, POINTS_ISRC_IDENTIQUE, POINTS_TITRE_EXACT, POINTS_TITRE_SUFFIXE,
-        Reference, Signaux, classer_version, limite_recherche_versions, predicat_rapprochement,
+        Reference, Signaux, classer_version, genre_de_version_de_service,
+        limite_recherche_versions, noyau_de_titre, predicat_rapprochement,
         predicat_titres_equivalents, requetes_versions, score_version, titres_equivalents,
     };
 
@@ -854,6 +945,110 @@ mod tests {
         assert!(!titres_equivalents("Cross", "Cross -Eyed Mary"));
         assert!(!titres_equivalents("Cross", "Cross- Eyed Mary"));
         assert!(!titres_equivalents("Somebody", "Somebody To Love"));
+    }
+
+    /// ⭐ #4443 — FabienM (fil 1839, point 3) : le même morceau, écrit comme
+    /// Qobuz l'écrit. « Shine On You Crazy Diamond (Parts 1-5) » en local,
+    /// « Shine on You Crazy Diamond, Pts. 1-5 » sur l'édition Qobuz de *Wish
+    /// You Were Here* — celle que Roon place en tête et que Tune oubliait.
+    /// Les formes de Gov't Mule (« , Pts. 1 - 5 ») et de David Gilmour
+    /// (« (Pts. 1-5) (Live) ») convergent aussi.
+    #[test]
+    fn parts_et_pts_designent_le_meme_morceau() {
+        let local = "Shine On You Crazy Diamond (Parts 1-5)";
+        assert!(titres_equivalents(
+            local,
+            "Shine on You Crazy Diamond, Pts. 1-5"
+        ));
+        assert!(titres_equivalents(
+            "Shine on You Crazy Diamond, Pts. 1-5",
+            local
+        ));
+        assert!(titres_equivalents(
+            local,
+            "Shine On You Crazy Diamond, Pts. 1 - 5"
+        ));
+        assert!(titres_equivalents(
+            local,
+            "Shine On You Crazy Diamond (Pts. 1-5) (Live At Pompeii)"
+        ));
+    }
+
+    /// Contre-épreuve de #4443 : ni un rapprochement flou, ni un `contains`.
+    /// Les parties 6-9 restent un autre morceau, et les pièges de FabienM
+    /// (« Somebody » / « Somebody To Love », « Hero » / « Heroes ») tiennent.
+    #[test]
+    fn le_noyau_ne_rapproche_pas_deux_morceaux_differents() {
+        assert!(!titres_equivalents(
+            "Shine On You Crazy Diamond (Parts 1-5)",
+            "Shine On You Crazy Diamond (Parts 6-9)"
+        ));
+        assert!(!titres_equivalents(
+            "Shine On You Crazy Diamond, Pts. 1-5",
+            "Shine On You Crazy Diamond, Pts. 6-9"
+        ));
+        assert!(!titres_equivalents("Somebody", "Somebody, To Love"));
+        assert!(!titres_equivalents("Hero", "Heroes"));
+        assert!(!titres_equivalents("Cross", "Cross-Eyed Mary"));
+    }
+
+    /// Le noyau, pièce par pièce : ponctuation et casse tombent, « pt(s) »
+    /// se déplie, l'ordre des mots reste.
+    #[test]
+    fn le_noyau_d_un_titre_deplie_pts_et_oublie_la_ponctuation() {
+        assert_eq!(
+            noyau_de_titre("Shine on You Crazy Diamond, Pts. 1-5"),
+            "shine on you crazy diamond parts 1 5"
+        );
+        assert_eq!(
+            noyau_de_titre("Shine On You Crazy Diamond (Parts 1-5)"),
+            "shine on you crazy diamond parts 1 5"
+        );
+        assert_eq!(
+            noyau_de_titre("Rock and Roll, Pt. 2"),
+            "rock and roll part 2"
+        );
+        assert_eq!(noyau_de_titre("  "), "");
+    }
+
+    /// #4443 — même artiste, même album, mais chez un AUTRE catalogue que la
+    /// référence : une version. Même catalogue : rien, comme avant. Sans
+    /// source connue (l'accueil) : rien non plus, la règle d'avant.
+    #[test]
+    fn le_meme_album_chez_un_autre_service_est_une_version() {
+        let locale = Reference {
+            source: Some("local".into()),
+            ..reference("Shine On You Crazy Diamond (Parts 1-5)")
+        };
+        let meme = ClasseVersion::MemeEnregistrement;
+        assert_eq!(
+            genre_de_version_de_service(&meme, &locale, "qobuz"),
+            Some("version")
+        );
+        let qobuz = Reference {
+            source: Some("qobuz".into()),
+            ..locale.clone()
+        };
+        assert_eq!(genre_de_version_de_service(&meme, &qobuz, "qobuz"), None);
+        assert_eq!(genre_de_version_de_service(&meme, &qobuz, "Qobuz"), None);
+        let inconnue = Reference {
+            source: None,
+            ..locale.clone()
+        };
+        assert_eq!(genre_de_version_de_service(&meme, &inconnue, "qobuz"), None);
+        // Les autres classes ne bougent pas.
+        assert_eq!(
+            genre_de_version_de_service(&ClasseVersion::AutreVersion, &inconnue, "qobuz"),
+            Some("version")
+        );
+        assert_eq!(
+            genre_de_version_de_service(&ClasseVersion::Reprise, &qobuz, "qobuz"),
+            Some("reprise")
+        );
+        assert_eq!(
+            genre_de_version_de_service(&ClasseVersion::SansRapport, &locale, "qobuz"),
+            None
+        );
     }
 
     #[test]
