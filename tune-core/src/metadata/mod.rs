@@ -4,6 +4,7 @@ pub mod auto_fix;
 pub mod batch;
 pub mod bio_batch;
 pub mod credits_mb;
+pub mod disques_abimes;
 pub mod enrich_scope;
 pub mod enrichment;
 pub mod fingerprint;
@@ -1946,7 +1947,8 @@ fn dsf_dff_fallback_complete(
     // d'album_artist → artiste de la première piste du dossier » de
     // `scan_import.rs` ne s'exécutait jamais. Le laisser absent rend au scan
     // l'information dont il a besoin : ce champ est absent (#1656).
-    let disc_number = disc_number.or(disque_du_chemin);
+    // 🔴 #4471 — le DOSSIER tranche : voir `disque_arbitre`.
+    let disc_number = disque_arbitre(disc_number, disque_du_chemin);
 
     // Extract MusicBrainz IDs from TXXX frames
     let (
@@ -2125,6 +2127,52 @@ pub fn numero_de_disque(nom: &str) -> Option<u32> {
 /// Le numéro de disque est rendu avec le reste, et pas seulement pour
 /// l'affichage : fusionner CD1 et CD2 en un seul album sans lui ferait
 /// collisionner les numéros de piste.
+/// Le numéro de disque, quand le TAG et le DOSSIER ne disent pas la même chose.
+///
+/// # Pourquoi le dossier l'emporte
+///
+/// Mesuré sur le .18 le 19/09/2026, trois coffrets ripés en sous-dossiers
+/// `CD1/`, `CD2/` :
+///
+/// ```text
+/// n°1 disc=1 [CD 1] Rock And Roll
+/// n°1 disc=1 [CD 2] No Quarter        ← même album, même disque, même numéro
+/// n°2 disc=1 [CD 1] Celebration Day
+/// n°2 disc=1 [CD 2] Stairway To Heaven
+/// ```
+///
+/// *Pulse (Live)* portait onze paires de numéros identiques, *Delicate Sound
+/// Of Thunder* sept, *The Song Remains The Same* quatre. L'album se lit alors
+/// dans un ordre indéfini et paraît plein de doublons.
+///
+/// La cause était `disc_number.or(disque_du_chemin)` : le dossier n'était
+/// consulté que si le tag s'était tu. Or un vieux rip dont les fichiers de CD2
+/// portent `disc = 1` — ou rien, ramené à 1 — écrase ainsi un dossier qui, lui,
+/// est juste.
+///
+/// # Ce que ce renversement ne fait pas
+///
+/// Il ne renverse RIEN quand le dossier se tait : un tag juste reste maître, et
+/// c'est le cas général. Le signal « dossier » n'existe que si le dossier
+/// contenant porte littéralement un numéro de disque — `CD2`, `Disc 3`,
+/// `Disque 2` (voir [`numero_de_disque`]). Ce n'est pas une déduction, c'est un
+/// choix de rangement délibéré de celui qui a rippé.
+///
+/// ⚠️ Le cas qu'il retourne, et qu'on assume : un disque 3 classé à la main
+/// dans un dossier nommé `CD1`. Le tag avait raison, il perd. C'est rare, c'est
+/// contradictoire en soi, et le dommage inverse — des numéros qui se marchent
+/// dessus sur tout un coffret — est bien plus fréquent et bien plus visible.
+///
+/// Quand les deux s'accordent, il n'y a rien à arbitrer : c'est le cas de
+/// *Bitches Brew* sur cette même bibliothèque, dont les quatre disques étaient
+/// déjà justes.
+pub(crate) fn disque_arbitre(tag: Option<u32>, chemin: Option<u32>) -> Option<u32> {
+    match chemin {
+        Some(d) => Some(d),
+        None => tag,
+    }
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
@@ -2298,7 +2346,8 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         album_artist: balises.album_artist,
         album_artist_sort: None,
         track_number: balises.track_number.or(numero_du_nom),
-        disc_number: balises.disc_number.or(disque_du_chemin),
+        // 🔴 #4471 — le DOSSIER tranche : voir `disque_arbitre`.
+        disc_number: disque_arbitre(balises.disc_number, disque_du_chemin),
         total_tracks: balises.track_total,
         total_discs: balises.disc_total,
         disc_subtitle: None,
@@ -3313,7 +3362,8 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         album = album_du_chemin;
     }
     let track_number = tag.track().or(fname_track);
-    let disc_number = tag.disk().or(disque_du_chemin);
+    // 🔴 #4471 — le DOSSIER tranche : voir `disque_arbitre`.
+    let disc_number = disque_arbitre(tag.disk(), disque_du_chemin);
 
     Ok(TrackMetadata {
         title,
