@@ -350,8 +350,20 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     let mut backend = match BackendWasapi::ouvrir(&demande) {
         Ok(backend) => backend,
         Err(refus) => {
-            refus.rapporter(&device_name, &open_failure);
-            playing.store(false, Ordering::SeqCst);
+            // #4176 — seul le flux COURANT a le droit d'écrire l'échec dans le
+            // créneau partagé et d'éteindre `playing` : un fil périmé qui perd
+            // la course au périphérique (`0x8889000A`) ne doit pas faire
+            // arrêter la zone que son successeur joue déjà.
+            if play_generation.load(Ordering::SeqCst) == my_generation {
+                refus.rapporter(&device_name, &open_failure);
+                playing.store(false, Ordering::SeqCst);
+            } else {
+                warn!(
+                    device = %device_name,
+                    generation = my_generation,
+                    "local_audio_stale_exclusive_open_failure_ignored"
+                );
+            }
             return;
         }
     };

@@ -814,8 +814,18 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     let mut backend = match BackendAsio::ouvrir(&demande) {
         Ok(backend) => backend,
         Err(refus) => {
-            refus.rapporter(&device_name, &open_failure);
-            playing.store(false, Ordering::SeqCst);
+            // #4176 — même règle que le bras WASAPI : un fil périmé ne rapporte
+            // pas son échec d'ouverture et n'éteint pas `playing`.
+            if play_generation.load(Ordering::SeqCst) == my_generation {
+                refus.rapporter(&device_name, &open_failure);
+                playing.store(false, Ordering::SeqCst);
+            } else {
+                warn!(
+                    device = %device_name,
+                    generation = my_generation,
+                    "local_audio_stale_exclusive_open_failure_ignored"
+                );
+            }
             return;
         }
     };

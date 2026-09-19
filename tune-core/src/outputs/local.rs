@@ -884,6 +884,19 @@ impl LocalOutput {
     ///
     /// Sert à rebâtir un `EqProcessor` aux bons coefficients SANS attendre la
     /// piste suivante (#1725).
+    /// #4176 — un flux est-il en train de DÉMARRER : fil de lecture lancé,
+    /// périphérique pas encore ouvert (donc pas de format) ?
+    ///
+    /// Le trou dans lequel une bascule PURE tombait : `current_format()` rend
+    /// `None`, `refresh_zone_pure_dsp` concluait « rien en cours » et
+    /// l'orchestrateur RELANÇAIT le flux — une seconde ouverture exclusive
+    /// pendant que la première attendait encore son premier octet
+    /// (`0x8889000A`, zone arrêtée ; Jean Valjean, fil 1798). Or un flux qui
+    /// démarre lit `pure_bypass` à l'ouverture : il n'y a rien à relancer.
+    pub fn flux_en_demarrage(&self) -> bool {
+        self.playing.load(Ordering::SeqCst) && self.current_format().is_none()
+    }
+
     pub fn current_format(&self) -> Option<(u32, u16)> {
         let empaquete = self.current_format.load(Ordering::Relaxed);
         if empaquete == 0 {
@@ -4007,6 +4020,13 @@ impl BoucleProducteur<'_> {
     }
 }
 
+/// #4176 — après une attente bloquante (première lecture HTTP), le fil doit-il
+/// encore ouvrir le périphérique ? Non dès que `stop()` est passé : par le
+/// drapeau de silence forcé ou par le canal d'arrêt.
+pub(crate) fn ouverture_encore_voulue(force_silent: bool, stop_recu: bool) -> bool {
+    !force_silent && !stop_recu
+}
+
 /// #4177 — la pause doit-elle RENDRE le périphérique ?
 ///
 /// Règle pure : sous Windows, en mode exclusif (WASAPI exclusif comme ASIO,
@@ -4971,6 +4991,27 @@ impl OutputTarget for LocalOutput {
             };
 
             // ------- Exclusive mode path (macOS only) -------
+            // #4176 — le fil vient de passer jusqu'à 10 s bloqué dans la
+            // première lecture HTTP, sans regarder `stop()`. S'il a été arrêté
+            // entre-temps, il ne doit PAS ouvrir le périphérique : sur un
+            // chemin exclusif, son ouverture tardive entrait en collision avec
+            // celle du flux relancé (`0x8889000A`), écrivait l'échec dans le
+            // créneau partagé et le sondeur arrêtait la zone.
+            if !ouverture_encore_voulue(
+                force_silent.load(Ordering::SeqCst),
+                stop_rx.try_recv().is_ok(),
+            ) {
+                info!(
+                    device = %device_name,
+                    generation = my_generation,
+                    "local_audio_open_skipped_stream_stopped_before_device"
+                );
+                if play_generation.load(Ordering::SeqCst) == my_generation {
+                    playing.store(false, Ordering::SeqCst);
+                }
+                return;
+            }
+
             #[cfg(target_os = "macos")]
             if exclusive_mode {
                 // R6 bis (#2219) : le bras vit dans `local/bras_coreaudio.rs`.
@@ -6593,6 +6634,11 @@ mod backends_supportes_tests;
 
 #[cfg(test)]
 mod format_courant_tests;
+
+/// #4176 — une bascule PURE pendant qu'un flux démarre ne relance rien, et
+/// un fil arrêté pendant sa première lecture n'ouvre plus le périphérique.
+#[cfg(test)]
+mod bascule_pure_flux_en_demarrage_4176;
 
 /// #4177 — en exclusif Windows, la pause rend le périphérique au lieu de le
 /// garder en poussant du silence.
