@@ -1343,15 +1343,18 @@ impl PlaybackOrchestrator {
         // certainement PAS été exécutée. Sur un timeout, elle a pu atteindre
         // un renderer lent : détruire le flux garantit alors qu'il tombe sur
         // un 404 en allant le chercher, et affiche « chanson non trouvée ».
-        // On la laisse vivre — la GC des sessions périmées la ramassera si
-        // personne ne la consomme.
+        // Même règle pour un `Play` ACQUITTÉ dont l'URI reste vide (#3580) :
+        // « pas encore exécuté » n'est pas « jamais reçu », et l'ampli qui
+        // finit de se réveiller après la borne doit trouver le flux, pas un
+        // 404. On la laisse vivre — la GC des sessions périmées la ramassera
+        // si personne ne la consomme (la radio jamais tirée comprise).
         let may_have_landed = output_error.as_deref().is_some_and(command_may_have_landed);
         if let Some(ref sid) = resolved.stream_id {
             if may_have_landed {
                 info!(
                     zone_id = req.zone_id,
                     stream_id = %sid,
-                    "output_send_timed_out_keeping_stream_session"
+                    "output_send_uncertain_keeping_stream_session"
                 );
             } else {
                 self.streamer.remove_session(sid).await;

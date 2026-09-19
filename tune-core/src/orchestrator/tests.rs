@@ -4972,6 +4972,23 @@ fn timeout_marker_survives_the_send_to_output_wrapper() {
     );
 }
 
+/// #3580 — un `Play` ACQUITTÉ dont l'URI reste vide : la commande a été reçue,
+/// seul son effet manque. Même décision que le timeout ; un REFUS reste concluant.
+#[test]
+fn un_play_acquitte_sans_effet_peut_avoir_atteint_le_renderer() {
+    let err = format!(
+        "Output device error: {} après 30 s (ni CurrentURI ni TrackURI) : il ne joue pas autre chose",
+        crate::outputs::dlna::URI_RESTEE_VIDE_PREFIX
+    );
+    assert!(
+        super::command_may_have_landed(&err),
+        "acquitté = reçu ; détruire le flux garantit le 404 à l'ampli qui se réveille"
+    );
+    assert!(!super::command_may_have_landed(
+        "Output device error: Le renderer a REFUSÉ le Play de la relance (701 « Transition not available »)"
+    ));
+}
+
 /// Sortie dont `play_media` expire — le renderer lent qui reçoit peut-être la
 /// commande, mais dont la réponse n'arrive pas (Cyrus Stream X2 de JP).
 struct TimingOutOutput {

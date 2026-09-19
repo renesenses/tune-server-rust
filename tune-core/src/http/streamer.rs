@@ -1307,8 +1307,9 @@ impl AudioStreamer {
     /// l'inactivité pour libérer, [`SESSION_ABSOLUTE_CAP`] en filet pour
     /// qu'aucune session ne devienne éternelle.
     ///
-    /// La radio reste exemptée des deux, comme avant : elle est infinie par
-    /// nature et son flux ne se rejoue pas.
+    /// La radio reste exemptée des deux dès qu'un client l'a tirée : elle est
+    /// infinie par nature et son flux ne se rejoue pas. Une radio que
+    /// PERSONNE n'a jamais lue, elle, suit la borne d'inactivité (#3580).
     pub async fn cleanup_stale_sessions(&self) -> usize {
         self.cleanup_stale_sessions_with(SESSION_IDLE_TIMEOUT, SESSION_ABSOLUTE_CAP)
             .await
@@ -1326,8 +1327,19 @@ impl AudioStreamer {
         let before = sessions.len();
         // Collect temp files to clean up from stale sessions
         let mut temp_files_to_remove: Vec<String> = Vec::new();
+        // Les radios reprises : leur canal doit être FERMÉ hors du verrou,
+        // sinon le décodeur reste bloqué sur un `tx.send()` plein et la
+        // connexion Icecast avec lui — c'est ce que `remove_session` fait déjà.
+        let mut radios_reprises: Vec<Arc<StreamSession>> = Vec::new();
         sessions.retain(|id, s| {
-            if s.is_radio {
+            // Une radio qu'un client a tirée au moins une fois est une écoute :
+            // hors des deux bornes, comme toujours. Une radio que personne n'a
+            // JAMAIS lue n'en est pas une : c'est le flux qu'un renderer a
+            // acquitté sans venir le chercher, que l'orchestrateur garde exprès
+            // pour l'ampli qui finirait de sortir de veille (#3580,
+            // `command_may_have_landed`). Sans borne, chaque tentative manquée
+            // laisserait une connexion Icecast ouverte pour toujours.
+            if s.is_radio && s.bytes_sent.load(Relaxed) > 0 {
                 return true;
             }
             let age = s.created_at.elapsed();
@@ -1362,12 +1374,19 @@ impl AudioStreamer {
                 age_secs = age.as_secs(),
                 idle_secs = idle.as_secs(),
                 reason,
+                is_radio = s.is_radio,
                 "stale_session_removed"
             );
+            if s.is_radio {
+                radios_reprises.push(s.clone());
+            }
             false
         });
         let after = sessions.len();
         drop(sessions);
+        for radio in &radios_reprises {
+            radio.close_sender().await;
+        }
         // Clean up temp files outside the sessions lock
         for path in &temp_files_to_remove {
             if let Err(e) = std::fs::remove_file(path) {
@@ -2301,12 +2320,14 @@ mod tests {
         assert!(!session_presente(&streamer, &id).await);
     }
 
-    /// La radio reste hors du ramasse-miettes, comme avant.
+    /// Une radio qu'un client a tirée reste hors du ramasse-miettes, comme
+    /// avant : infinie par nature, elle ne se rejoue pas.
     #[tokio::test]
-    async fn la_radio_reste_exemptee_des_deux_bornes() {
+    async fn une_radio_deja_lue_reste_exemptee_des_deux_bornes() {
         let streamer = AudioStreamer::new(8080);
         let (id, _tx, _ready, _session) = streamer.create_radio_session(info_de_test(), 8).await;
 
+        servir_des_octets(&streamer, &id).await;
         patienter(300).await;
         let retires = streamer
             .cleanup_stale_sessions_with(
@@ -2317,6 +2338,44 @@ mod tests {
 
         assert_eq!(retires, 0);
         assert!(session_presente(&streamer, &id).await);
+    }
+
+    /// #3580 — le flux qu'un renderer a acquitté sans jamais venir le chercher.
+    ///
+    /// L'orchestrateur garde désormais la session d'une radio dont le `Play` a
+    /// été acquitté sans effet (`command_may_have_landed`), pour l'ampli qui
+    /// finirait de sortir de veille après la borne d'attente. Une radio était
+    /// jusqu'ici exemptée du ramasse-miettes sans condition : gardée, elle
+    /// aurait tenu sa connexion Icecast pour toujours. Personne ne l'a jamais
+    /// lue — elle suit la borne d'inactivité, et son canal est FERMÉ pour que
+    /// le décodeur lâche l'amont.
+    #[tokio::test]
+    async fn une_radio_que_personne_n_a_jamais_lue_est_ramassee_et_son_canal_ferme() {
+        let streamer = AudioStreamer::new(8080);
+        let (id, _tx, _ready, session) = streamer.create_radio_session(info_de_test(), 8).await;
+        assert!(
+            session.channel_fill().await.is_some(),
+            "canal ouvert à la création"
+        );
+
+        patienter(900).await;
+        let retires = streamer
+            .cleanup_stale_sessions_with(
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_secs(3_600),
+            )
+            .await;
+
+        assert_eq!(
+            retires, 1,
+            "une radio que personne n'a jamais tirée ne doit pas vivre pour toujours"
+        );
+        assert!(!session_presente(&streamer, &id).await);
+        assert!(
+            session.channel_fill().await.is_none(),
+            "le canal doit être fermé : sinon le décodeur reste bloqué sur un \
+             `tx.send()` plein et la connexion Icecast avec lui"
+        );
     }
 
     // ────────────── #2991 — par où le renderer apprend le changement ─────────
