@@ -7845,6 +7845,8 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     assert_eq!(
         settings.get("zone_1_crossfeed").unwrap().as_deref(),
         Some(saved)
+    );
+}
 
 /// **#4323 — « Tune vient d'inventer la notion d'Episode » (Tades, fil 1819).**
 ///
