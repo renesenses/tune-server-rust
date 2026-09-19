@@ -77,32 +77,14 @@ const HORS_PORTE: &[(&str, &str, &str)] = &[
     // `cross` (`Cross.toml`, `pre-build`), et un garde-fou de release lit
     // l'ELF publie pour verifier que `libasound.so` y est bien declaree en
     // NEEDED. C'etait la cible que l'image Tune OS du Raspberry Pi installe.
-    (
-        "local-audio",
-        "release.yml / linux-aarch64-musl",
-        "Hors de portee tant que personne n'a construit `alsa-lib` contre musl \
-         aarch64 (#3613, remesure le 11/09/2026 sur `alsa-sys 0.4.0`). Le \
-         `build.rs` de la caisse est \
-         `pkg_config::Config::new().statik(false).probe(\"alsa\")` : le \
-         `statik(false)` est un LITTERAL, pas une variable d'environnement \
-         comme le `LIBOPUS_STATIC` de #1288. Elle emet donc toujours un lien \
-         DYNAMIQUE vers `libasound`, ce que l'etape « Verify musl binary is \
-         statically linked » de `release.yml` refuse par construction — et \
-         cette garantie statique est la raison d'etre de la cible (NAS a vieille \
-         userland, Synology DSM). Un NAS n'a par ailleurs pas de DAC. \
-         CORRECTION du mot « impossible » porte ici jusqu'au 11/09/2026 : le \
-         fork n'est PAS la seule voie. `alsa-sys` declare `links = \"alsa\"`, \
-         et cargo documente pour toute caisse a `links` une surcharge de script \
-         de build — `[target.aarch64-unknown-linux-musl.alsa]` dans \
-         `.cargo/config.toml`, avec `rustc-link-lib = [\"static=asound\"]` — qui \
-         REMPLACE la sortie du script, lequel n'est alors pas execute. Aucun \
-         en-tete n'est requis non plus : sans la fonctionnalite `use-bindgen` \
-         (elle n'est pas activee), les liaisons sont pre-generees dans la \
-         caisse. Ce qui reste non mesure, et qui est le vrai verrou : qu'une \
-         `libasound.a` musl aarch64 se lie dans un binaire `static-pie`, et \
-         qu'une alsa-lib statique — donc sans `dlopen`, donc sans ses greffons \
-         — serve a autre chose qu'un `hw:` direct.",
-    ),
+    // L'exemption `release.yml / linux-aarch64-musl` a ete LEVEE par #3621 :
+    // le « lien dynamique code en dur » d'`alsa-sys` n'en etait pas un
+    // (`rustc-link-lib=asound`, sans genre : en `-static`, le linker prend la
+    // `libasound.a` du sysroot). Cross.toml compile alsa-lib 1.2.14 contre la
+    // chaine musl de l'image, `.cargo/config.toml` ajoute `-lc` en fin de
+    // lien, et la ligne musl reprend `local-audio`. Mesure sur Shrek le
+    // 19/09/2026 : binaire sans NEEDED ni interpreteur, `snd_pcm_open`
+    // present. Un garde-fou de release lit ce symbole dans l'ELF publie.
     (
         "local-audio",
         "docker.yml / Build tune-server (amd64, native)",
