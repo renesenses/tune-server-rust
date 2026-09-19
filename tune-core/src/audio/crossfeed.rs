@@ -301,9 +301,143 @@ pub fn crossfeed_status(
     }
 }
 
+/// Ajoute les DROITS (licence, greffon) au statut que la sortie impose — #4511.
+///
+/// L'ordre des motifs est une promesse faite à l'utilisateur : on nomme d'abord
+/// ce qu'aucun geste ne lèvera. Une sortie qui ne portera jamais le crossfeed
+/// (`NonLocalOutput` : Diretta et les autres sorties pull, OAAT, navigateur ;
+/// `NetworkRendererNoLpcm` : un renderer qui ne lit pas le PCM) le dit AVANT
+/// de parler de licence. Sinon l'écran invite à passer Premium ou à activer un
+/// greffon pour un effet que cette zone n'entendra de toute façon pas — c'est
+/// ce qu'a vu Ludovic Audouin sur sa zone Diretta en 0.9.156.
+///
+/// Viennent ensuite les droits, puis ce que l'utilisateur lève d'un geste sur
+/// la zone elle-même (`PureMode`, `NetworkProgressiveOff`), déjà rangés par
+/// [`crossfeed_status`].
+pub fn avec_les_droits(
+    sortie: CrossfeedStatus,
+    premium: bool,
+    greffon_actif: bool,
+) -> CrossfeedStatus {
+    if matches!(
+        sortie.reason,
+        Some(CrossfeedConstraint::NonLocalOutput | CrossfeedConstraint::NetworkRendererNoLpcm)
+    ) {
+        return sortie;
+    }
+    let droit = if !premium {
+        Some(CrossfeedConstraint::PremiumRequired)
+    } else if !greffon_actif {
+        Some(CrossfeedConstraint::PluginUnavailable)
+    } else {
+        None
+    };
+    match droit {
+        Some(reason) => CrossfeedStatus {
+            requested: sortie.requested,
+            effective: false,
+            unavailable: true,
+            reason: Some(reason),
+            detail: Some(reason.detail()),
+        },
+        None => sortie,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // #4511 — les droits ne passent plus devant la sortie.
+    // -----------------------------------------------------------------
+
+    /// Le cas de Ludovic : zone Diretta (sortie pull, ni locale ni réseau),
+    /// licence Free. L'écran doit dire que la SORTIE ne porte pas l'effet, pas
+    /// l'inviter à payer pour rien.
+    #[test]
+    fn une_sortie_pull_sans_premium_dit_la_sortie_pas_la_licence() {
+        let sortie = crossfeed_status(true, false, false, false, false, false);
+        let s = avec_les_droits(sortie, false, false);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalOutput));
+        assert!(s.unavailable && !s.effective);
+    }
+
+    #[test]
+    fn un_renderer_sans_lpcm_prime_aussi_sur_le_greffon() {
+        let sortie = crossfeed_status(true, false, true, false, true, false);
+        assert_eq!(
+            sortie.reason,
+            Some(CrossfeedConstraint::NetworkRendererNoLpcm)
+        );
+        let s = avec_les_droits(sortie, true, false);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NetworkRendererNoLpcm));
+    }
+
+    /// Contre-épreuve : sur une sortie qui PEUT porter le crossfeed, les droits
+    /// restent nommés — sinon on aurait simplement tu la licence.
+    #[test]
+    fn sur_une_sortie_locale_les_droits_restent_nommes() {
+        let locale = crossfeed_status(true, true, false, false, false, false);
+        let s = avec_les_droits(locale.clone(), false, true);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::PremiumRequired));
+        assert!(!s.effective && s.unavailable && s.requested);
+        assert_eq!(
+            s.detail,
+            Some(CrossfeedConstraint::PremiumRequired.detail())
+        );
+        let s = avec_les_droits(locale.clone(), true, false);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::PluginUnavailable));
+        assert_eq!(avec_les_droits(locale.clone(), true, true), locale);
+    }
+
+    /// Les droits passent devant ce qui se lève d'un geste sur la zone : PURE
+    /// désactivé, un utilisateur Free n'entendrait toujours rien.
+    #[test]
+    fn les_droits_passent_devant_pure_et_l_opt_in_reseau() {
+        let pure = crossfeed_status(true, true, false, true, false, false);
+        assert_eq!(pure.reason, Some(CrossfeedConstraint::PureMode));
+        assert_eq!(
+            avec_les_droits(pure, false, true).reason,
+            Some(CrossfeedConstraint::PremiumRequired)
+        );
+        let opt_in = crossfeed_status(true, false, true, false, false, false);
+        assert_eq!(
+            opt_in.reason,
+            Some(CrossfeedConstraint::NetworkProgressiveOff)
+        );
+        assert_eq!(
+            avec_les_droits(opt_in, true, false).reason,
+            Some(CrossfeedConstraint::PluginUnavailable)
+        );
+    }
+
+    /// Le branchement : la route calcule la sortie AVANT les droits et passe
+    /// par `avec_les_droits`. Coupé au corps de la fonction pour qu'une
+    /// mention ailleurs dans le fichier ne satisfasse pas la garde.
+    #[test]
+    fn la_route_passe_par_avec_les_droits() {
+        const ROUTE: &str = include_str!("../../../tune-server/src/routes/zones/dsp.rs");
+        let debut = ROUTE
+            .find("async fn crossfeed_status_de_zone(")
+            .expect("la route du statut crossfeed existe");
+        let corps = &ROUTE[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("fin de la fonction")];
+        let sortie = corps
+            .find("crossfeed::crossfeed_status(")
+            .expect("la route calcule le statut de la sortie");
+        let droits = corps
+            .find("avec_les_droits(")
+            .expect("la route applique les droits par avec_les_droits");
+        assert!(
+            sortie < droits,
+            "la sortie doit être évaluée AVANT les droits"
+        );
+        assert!(
+            !corps.contains("return CrossfeedStatus {"),
+            "plus de retour anticipé sur la licence avant la sortie"
+        );
+    }
     // -----------------------------------------------------------------
     // #2742 — le réglage « crossfeed » ne doit plus MENTIR.
     //

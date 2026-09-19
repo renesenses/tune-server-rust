@@ -763,10 +763,14 @@ impl PlaybackOrchestrator {
         // #4350 — lu UNE fois, et seulement quand il peut changer quelque
         // chose : un FLAC entier vers une sortie réseau. La lecture saute les
         // blocs de métadonnées sans les charger (quelques lectures d'octets).
-        let flac_ffmpeg_vers_le_reseau = sorties.is_network_output
-            && source_format == Some(AudioFormat::Flac)
-            && tranche_cue.is_none()
-            && crate::audio::flac_vendeur::flac_ecrit_par_ffmpeg(std::path::Path::new(&file_path));
+        // La MÊME fonction que le chemin du signal : les deux verdicts ne
+        // peuvent plus diverger.
+        let flac_ffmpeg_vers_le_reseau = flac_ffmpeg_vers_le_reseau_applies(
+            sorties.is_network_output,
+            source_format,
+            tranche_cue.is_some(),
+            || Some(file_path.clone()),
+        );
         Ok(DecisionOuResolu::Decision(assembler_la_decision(
             req,
             track,

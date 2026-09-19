@@ -585,18 +585,19 @@ impl WasapiExclusiveOutput {
                     return Err(format!("IAudioClient::GetDevicePeriod failed: 0x{hr:08X}"));
                 }
             }
-            let period = if min_period > 0 {
-                min_period
-            } else {
-                default_period
+            // #4357 — la période PAR DÉFAUT, plus la minimale : voir
+            // `periode_exclusive_4357`. Les deux sont journalisées.
+            let period = match super::periode_exclusive_4357::periode_exclusive_100ns(
+                default_period,
+                min_period,
+            ) {
+                Ok(period) => period,
+                Err(error) => {
+                    release(audio_client);
+                    release(device);
+                    return Err(error);
+                }
             };
-            if period <= 0 {
-                release(audio_client);
-                release(device);
-                return Err(format!(
-                    "IAudioClient::GetDevicePeriod a renvoyé une période invalide : {period}"
-                ));
-            }
 
             // 7. Initialize in exclusive event-driven mode. Windows can reject
             // the requested period solely because its frame count is not
@@ -727,6 +728,8 @@ impl WasapiExclusiveOutput {
                 channels,
                 buffer_frames = buffer_frame_count,
                 period_100ns = selected_period,
+                periode_par_defaut_100ns = default_period,
+                periode_minimale_100ns = min_period,
                 "wasapi_exclusive_initialized"
             );
 

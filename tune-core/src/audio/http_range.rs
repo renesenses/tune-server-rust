@@ -14,9 +14,29 @@ use symphonia::core::io::MediaSource;
 pub struct HttpRangeSource {
     client: reqwest::blocking::Client,
     url: String,
+    /// En-têtes rendus par le résolveur, rejoués à CHAQUE requête Range
+    /// (sonde, lecture, reprise après seek) — #4366.
+    entetes: Vec<(String, String)>,
     len: u64,
     pos: u64,
     response: Option<reqwest::blocking::Response>,
+}
+
+/// Rejoue les en-têtes du résolveur sur une requête Range (#4366).
+///
+/// `Range` et `Accept-Encoding` restent ceux que cette source pose elle-même :
+/// ce sont eux qui font le contrat `206` octet pour octet.
+fn rejouer(
+    mut requete: reqwest::blocking::RequestBuilder,
+    entetes: &[(String, String)],
+) -> reqwest::blocking::RequestBuilder {
+    for (nom, valeur) in entetes {
+        if nom.eq_ignore_ascii_case("range") || nom.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        requete = requete.header(nom, valeur);
+    }
+    requete
 }
 
 impl HttpRangeSource {
@@ -24,13 +44,20 @@ impl HttpRangeSource {
     /// est refuse : le chemin appelant conserve alors son repli historique par
     /// telechargement complet.
     pub fn open(url: &str) -> Result<Self, String> {
+        Self::open_avec_entetes(url, &[])
+    }
+
+    /// Comme [`Self::open`], en rejouant les en-têtes que le résolveur a
+    /// associés à l'URL (#4366 : une URL `googlevideo` rendue par yt-dlp est
+    /// refusée en 403 à qui ne rejoue pas son User-Agent). Liste vide ⇒
+    /// requêtes identiques à `open`.
+    pub fn open_avec_entetes(url: &str, entetes: &[(String, String)]) -> Result<Self, String> {
         let client = crate::http::client::blocking_builder()
             .timeout(None)
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| format!("http range client: {e}"))?;
-        let response = client
-            .get(url)
+        let response = rejouer(client.get(url), entetes)
             .header(ACCEPT_ENCODING, "identity")
             .header(RANGE, "bytes=0-0")
             .send()
@@ -57,6 +84,7 @@ impl HttpRangeSource {
         Ok(Self {
             client,
             url: url.to_string(),
+            entetes: entetes.to_vec(),
             len,
             pos: 0,
             // La reponse de sonde ne contient qu'un octet. La premiere vraie
@@ -72,9 +100,7 @@ impl HttpRangeSource {
             return Ok(());
         }
         let range = format!("bytes={}-", self.pos);
-        let response = self
-            .client
-            .get(&self.url)
+        let response = rejouer(self.client.get(&self.url), &self.entetes)
             .header(ACCEPT_ENCODING, "identity")
             .header(RANGE, range)
             .send()

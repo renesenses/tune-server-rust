@@ -43,6 +43,9 @@ where
     const PI: Self;
 
     /// Calculate the sine of `self`.
+    ///
+    /// Tune (#4532): portable `libm`, not the platform libm, so that the sinc
+    /// tables hold the same bits on Linux, Windows and macOS.
     fn sin(self) -> Self;
 
     /// Calculate the cosine of `self`.
@@ -63,11 +66,11 @@ impl Sample for f32 {
     const PI: Self = std::f32::consts::PI;
 
     fn sin(self) -> Self {
-        f32::sin(self)
+        libm::sinf(self)
     }
 
     fn cos(self) -> Self {
-        f32::cos(self)
+        libm::cosf(self)
     }
 }
 
@@ -75,11 +78,11 @@ impl Sample for f64 {
     const PI: Self = std::f64::consts::PI;
 
     fn sin(self) -> Self {
-        f64::sin(self)
+        libm::sin(self)
     }
 
     fn cos(self) -> Self {
-        f64::cos(self)
+        libm::cos(self)
     }
 }
 

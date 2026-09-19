@@ -13,6 +13,7 @@ pub(super) async fn telecharger_pour_session(
     streamer: &AudioStreamer,
     session_id: &str,
     upstream: &str,
+    entetes: &[(String, String)],
     codec: &str,
     directory: &Path,
 ) -> Result<Option<(NamedTempFile, u64)>, String> {
@@ -26,8 +27,13 @@ pub(super) async fn telecharger_pour_session(
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|e| format!("upstream client: {e}"))?;
-        let mut response = client
-            .get(upstream)
+        // #4366 — les en-têtes du résolveur (yt-dlp) : sans eux, `googlevideo`
+        // refuse l'URL en 403. Vide pour tout autre service.
+        let mut requete = client.get(upstream);
+        for (nom, valeur) in entetes {
+            requete = requete.header(nom, valeur);
+        }
+        let mut response = requete
             .send()
             .await
             .map_err(|e| format!("upstream fetch: {e}"))?;
@@ -181,7 +187,7 @@ mod tests {
         let upstream = peer.url.clone();
         let path = dir.path().to_path_buf();
         let mut task = Task(tokio::spawn(async move {
-            telecharger_pour_session(&cloned, &task_sid, &upstream, "flac", &path).await
+            telecharger_pour_session(&cloned, &task_sid, &upstream, &[], "flac", &path).await
         }));
         peer.ready().await;
         if body_started {
@@ -243,6 +249,7 @@ mod tests {
                 &streamer,
                 "already-removed",
                 &format!("http://{}/track", listener.local_addr().unwrap()),
+                &[],
                 "flac",
                 dir.path(),
             ),
@@ -270,7 +277,7 @@ mod tests {
         let payload = (0..250_000).map(|i| (i % 251) as u8).collect::<Vec<_>>();
         let mut peer = Peer::new(Some(response(200, payload.len(), &payload)), false).await;
         let (file, bytes) =
-            telecharger_pour_session(&streamer, &sid, &peer.url, "flac", dir.path())
+            telecharger_pour_session(&streamer, &sid, &peer.url, &[], "flac", dir.path())
                 .await
                 .unwrap()
                 .expect("live preloaded/paused session must not be cancelled");
@@ -293,7 +300,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let mut peer = Peer::new(Some(response(403, 0, b"")), false).await;
-        let error = telecharger_pour_session(&streamer, &sid, &peer.url, "flac", dir.path())
+        let error = telecharger_pour_session(&streamer, &sid, &peer.url, &[], "flac", dir.path())
             .await
             .unwrap_err();
         assert!(error.contains("upstream HTTP 403"), "{error}");
@@ -309,7 +316,7 @@ mod tests {
             .await;
         let dir = tempfile::tempdir().unwrap();
         let peer = Peer::new(Some(response(200, 100_000, b"truncated")), true).await;
-        let error = telecharger_pour_session(&streamer, &sid, &peer.url, "flac", dir.path())
+        let error = telecharger_pour_session(&streamer, &sid, &peer.url, &[], "flac", dir.path())
             .await
             .unwrap_err();
         assert!(error.contains("download read:"), "{error}");
@@ -328,6 +335,7 @@ mod tests {
         super::super::TranscodageEnTache {
             is_dash_local: upstream.starts_with("file://"),
             upstream_url: upstream,
+            upstream_headers: Vec::new(),
             codec: "wav".into(),
             sr: 44100,
             bd: 16,
@@ -468,6 +476,160 @@ mod tests {
             std::fs::read(file.path()).unwrap(),
             before,
             "a DASH cache file must never be deleted or modified by transcode cleanup"
+        );
+    }
+
+    // ── #4366 : la sortie locale/OAAT rejoue les en-têtes du résolveur ──
+    //
+    // Un amont qui, comme `googlevideo`, refuse en 403 l'URL rendue par yt-dlp
+    // à qui ne rejoue pas les en-têtes associés. Il sert le corps en 200, ou
+    // en 206 sur `Range` (la sonde et la lecture de `HttpRangeSource`).
+    const ENTETE_4366: (&str, &str) = ("x-temoin-4366", "yt-dlp");
+
+    struct Gardien {
+        url: String,
+        /// (en-tête présent, `Range` demandé) pour chaque requête reçue.
+        requetes: Arc<std::sync::Mutex<Vec<(bool, bool)>>>,
+        _task: Task<()>,
+    }
+
+    impl Gardien {
+        async fn new(corps: Vec<u8>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/track.wav", listener.local_addr().unwrap());
+            let requetes = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let journal = requetes.clone();
+            let task = tokio::spawn(async move {
+                loop {
+                    let Ok((mut socket, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut brut = Vec::new();
+                    while !brut.ends_with(b"\r\n\r\n") {
+                        let mut octet = [0; 1];
+                        if socket.read_exact(&mut octet).await.is_err() {
+                            break;
+                        }
+                        brut.push(octet[0]);
+                    }
+                    let texte = String::from_utf8_lossy(&brut).to_ascii_lowercase();
+                    let autorise = texte.contains(&format!("{}: {}", ENTETE_4366.0, ENTETE_4366.1));
+                    let range = texte
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .map(|r| r.trim().to_string());
+                    journal.lock().unwrap().push((autorise, range.is_some()));
+                    let reponse = if !autorise {
+                        response(403, 0, b"")
+                    } else if let Some(r) = range {
+                        let (debut, fin) = r.split_once('-').unwrap();
+                        let debut: usize = debut.parse().unwrap();
+                        let fin: usize = if fin.is_empty() {
+                            corps.len() - 1
+                        } else {
+                            fin.parse::<usize>().unwrap().min(corps.len() - 1)
+                        };
+                        let tranche = &corps[debut..=fin];
+                        let mut r = format!(
+                            "HTTP/1.1 206 Partial\r\nContent-Length: {}\r\nContent-Range: bytes {debut}-{fin}/{}\r\nConnection: close\r\n\r\n",
+                            tranche.len(),
+                            corps.len()
+                        )
+                        .into_bytes();
+                        r.extend_from_slice(tranche);
+                        r
+                    } else {
+                        response(200, corps.len(), &corps)
+                    };
+                    let _ = socket.write_all(&reponse).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+            Self {
+                url,
+                requetes,
+                _task: Task(task),
+            }
+        }
+    }
+
+    /// Fait tourner la VRAIE tâche locale/OAAT contre le gardien ; rend les
+    /// octets WAV reçus par la session (vide si l'amont a refusé).
+    async fn produire_4366(
+        upstream: String,
+        entetes: Vec<(String, String)>,
+        use_http_range: bool,
+    ) -> Vec<u8> {
+        let streamer = Arc::new(AudioStreamer::new(0));
+        let (sid, tx, ready) = streamer
+            .create_session(StreamInfo::default(), false, 256)
+            .await;
+        let session = streamer.sessions_state().lock().await[&sid].clone();
+        let mut tache = task(streamer.clone(), sid.clone(), upstream);
+        tache.upstream_headers = entetes;
+        tache.use_http_range = use_http_range;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::super::PlaybackOrchestrator::transcoder_le_flux_en_wav(tache, tx, ready),
+        )
+        .await
+        .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(chunk) = session.recv_chunk().await {
+                bytes.extend(chunk);
+            }
+        })
+        .await
+        .expect("la tâche doit fermer l'entrée de sa session");
+        bytes
+    }
+
+    fn entetes_4366() -> Vec<(String, String)> {
+        vec![(ENTETE_4366.0.to_string(), ENTETE_4366.1.to_string())]
+    }
+
+    /// Contre-épreuve du banc : sans les en-têtes, le gardien refuse bien —
+    /// sinon les deux témoins suivants ne prouveraient rien.
+    #[tokio::test]
+    async fn i4366_le_gardien_refuse_une_requete_nue() {
+        let gardien = Gardien::new(wav()).await;
+        let octets = produire_4366(gardien.url.clone(), Vec::new(), false).await;
+        assert!(
+            octets.is_empty(),
+            "requête nue : l'amont doit refuser (403)"
+        );
+        assert!(gardien.requetes.lock().unwrap().iter().all(|(ok, _)| !ok));
+    }
+
+    /// Chemin par téléchargement complet (repli historique).
+    #[tokio::test]
+    async fn i4366_le_telechargement_local_rejoue_les_entetes_du_resolveur() {
+        let gardien = Gardien::new(wav()).await;
+        let octets = produire_4366(gardien.url.clone(), entetes_4366(), false).await;
+        assert!(
+            octets.starts_with(b"RIFF") && octets.len() >= 44 + 4410 * 4,
+            "l'URL servie à qui rejoue ses en-têtes doit se décoder (reçu {} octets)",
+            octets.len()
+        );
+    }
+
+    /// Chemin par `Range` — celui que prend un M4A YouTube sur sortie locale
+    /// (#1885) : la sonde ET les lectures doivent rejouer les en-têtes, et
+    /// c'est bien ce chemin qui a servi (pas le repli par fichier).
+    #[tokio::test]
+    async fn i4366_la_source_range_rejoue_les_entetes_du_resolveur() {
+        let gardien = Gardien::new(wav()).await;
+        let octets = produire_4366(gardien.url.clone(), entetes_4366(), true).await;
+        assert!(
+            octets.starts_with(b"RIFF") && octets.len() >= 44 + 4410 * 4,
+            "la source Range doit décoder l'URL gardée (reçu {} octets)",
+            octets.len()
+        );
+        let requetes = gardien.requetes.lock().unwrap().clone();
+        assert!(
+            requetes.len() >= 2 && requetes.iter().all(|&(ok, range)| ok && range),
+            "sonde + lecture, toutes en Range et toutes avec les en-têtes : {requetes:?}"
         );
     }
 }
