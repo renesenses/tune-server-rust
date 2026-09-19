@@ -102,6 +102,40 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     })
 }
 
+/// Le nombre d'albums d'une collection : ceux de la bibliothèque, **plus** les
+/// favoris de service que la même règle sélectionne.
+///
+/// 🔴 #1231 — Bertrand, 18/09/2026 : « Smart Collection, source qobuz retourne
+/// 0 album ». Mesuré sur le .18 : la collection rend bien ses 3 albums Qobuz
+/// quand on l'ouvre, et la liste annonçait `"album_count": 0`. Le SQL ci-dessus
+/// compte dans `albums`, où un favori de service n'est jamais — il vient de
+/// `streaming_favorites`, ajouté APRÈS par `source_streaming`. La liste était
+/// juste, son compteur mentait.
+///
+/// Fonction à part, et synchrone, pour être éprouvée : une garde textuelle
+/// laissait passer le débranchement de l'addition sans rien voir.
+pub(crate) fn compte_albums(
+    backend: &dyn tune_core::db::backend::DbBackend,
+    sql_bibliotheque: &str,
+    rules_json: &str,
+    match_mode: &str,
+    profile_id: i64,
+) -> i64 {
+    let un = |sql: &str| {
+        backend
+            .query_many(sql, &[])
+            .ok()
+            .and_then(|rs| rs.first().and_then(|r| r.first()).and_then(|v| v.as_i64()))
+            .unwrap_or(0)
+    };
+    let en_base = un(sql_bibliotheque);
+    let en_service =
+        source_streaming::requete_compte(rules_json, match_mode, Objet::Album, profile_id)
+            .map(|sql| un(&sql))
+            .unwrap_or(0);
+    en_base + en_service
+}
+
 async fn list_collections(
     State(state): State<SmartHttpState>,
     profile: ActiveProfile,
@@ -145,14 +179,13 @@ async fn list_collections(
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
                  LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
             );
-            if let Ok(rs) = state.backend.query_many(&album_count_sql, &[]) {
-                col["album_count"] = json!(
-                    rs.first()
-                        .and_then(|r| r.first())
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
-                );
-            }
+            col["album_count"] = json!(compte_albums(
+                &*state.backend,
+                &album_count_sql,
+                &rules_str,
+                match_mode,
+                profile.id(),
+            ));
             let track_count_sql = format!(
                 "SELECT COUNT(DISTINCT t.id) FROM albums al \
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -1311,5 +1344,130 @@ mod tests {
         // Missing / empty -> default.
         assert_eq!(normalize_sort_order(None), "asc");
         assert_eq!(normalize_sort_order(Some(String::new())), "asc");
+    }
+
+    /// 🔴 #1231 — le compteur d'une collection compte AUSSI les favoris de
+    /// service.
+    ///
+    /// Mesuré sur le .18 le 19/09/2026 : une collection dont la seule règle est
+    /// `source = qobuz` rend ses 3 albums quand on l'ouvre, et la liste des
+    /// collections annonçait `"album_count": 0`. La liste était juste, son
+    /// compteur mentait — c'est le « retourne 0 album » de Bertrand.
+    ///
+    /// L'épreuve passe par le HANDLER, avec une vraie base : une garde
+    /// textuelle laissait passer le débranchement (`en_base + en_service`
+    /// remplacé par `en_base`) sans rien voir.
+    #[test]
+    fn le_compteur_voit_les_favoris_de_service() {
+        use super::compte_albums;
+        use std::sync::Arc;
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);",
+            )
+            .expect("table");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        for (t, svc) in [
+            ("album", "qobuz"),
+            ("album", "qobuz"),
+            ("track", "qobuz"),
+            ("album", "tidal"),
+        ] {
+            backend
+                .execute(
+                    "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title) \
+                     VALUES (1, ?1, ?2, 'x', 'y')",
+                    &[&t as &dyn ToSqlValue, &svc],
+                )
+                .expect("favori");
+        }
+
+        let regles = r#"[{"field":"source","op":"=","value":"qobuz"}]"#;
+        // La bibliothèque ne rend rien : aucun album local n'est « qobuz ».
+        let vide = "SELECT COUNT(*) FROM albums WHERE 1 = 0";
+        assert_eq!(
+            compte_albums(&*backend, vide, regles, "all", 1),
+            2,
+            "les DEUX favoris ALBUM Qobuz doivent être comptés — ni la piste, ni l'album Tidal"
+        );
+
+        // Et le compte de la bibliothèque s'y ajoute, il ne le remplace pas.
+        let un = "SELECT 5";
+        assert_eq!(compte_albums(&*backend, un, regles, "all", 1), 7);
+
+        // Sans règle de service, rien ne s'ajoute.
+        let sans = r#"[{"field":"year","op":"=","value":"2025"}]"#;
+        assert_eq!(compte_albums(&*backend, un, sans, "all", 1), 5);
+    }
+
+    /// 🔴 Et le handler l'APPELLE vraiment.
+    ///
+    /// La garde précédente éprouve `compte_albums` ; celle-ci éprouve qu'il est
+    /// branché. Sans elle, remplacer l'appel par `0 * compte_albums(...)`
+    /// passait au vert — le défaut « écrit mais pas branché », en plus petit.
+    #[tokio::test]
+    async fn la_liste_des_collections_porte_ce_compte() {
+        use crate::SmartHttpState;
+        use std::sync::Arc;
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::sqlite::SqliteDb;
+        use tune_http_types::ActiveProfile;
+
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS smart_collections (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
+                     match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                 CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);",
+            )
+            .expect("tables");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        backend
+            .execute(
+                "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order) \
+                 VALUES ('Qobuz', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"source","op":"=","value":"qobuz"}]"# as &dyn ToSqlValue],
+            )
+            .expect("collection");
+        for t in ["album", "album", "track"] {
+            backend
+                .execute(
+                    "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title) \
+                     VALUES (1, ?1, 'qobuz', 'x', 'y')",
+                    &[&t as &dyn ToSqlValue],
+                )
+                .expect("favori");
+        }
+
+        let etat = SmartHttpState::new(backend);
+        let Ok(reponse) =
+            super::list_collections(axum::extract::State(etat), ActiveProfile(1)).await
+        else {
+            panic!("la liste doit répondre");
+        };
+        assert_eq!(
+            reponse.0[0]["album_count"].as_i64(),
+            Some(2),
+            "la collection annonce ses favoris ALBUM : {}",
+            reponse.0[0]
+        );
     }
 }

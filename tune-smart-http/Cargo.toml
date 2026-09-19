@@ -11,3 +11,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tune-core = { path = "../tune-core", default-features = false }
 tune-http-types = { path = "../tune-http-types" }
+
+# Pour éprouver le HANDLER, et pas seulement les fonctions qu'il appelle : le
+# débranchement d'un appel ne se voit dans aucune garde textuelle (#1231).
+[dev-dependencies]
+tokio = { workspace = true }
