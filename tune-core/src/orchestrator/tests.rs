@@ -2765,6 +2765,72 @@ async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
     assert_eq!(history[0].context_position, Some(1));
 }
 
+/// #4446 — la pochette du `NowPlaying` d'une avance gapless doit être de la
+/// MÊME nature que celle d'un démarrage : le condensat de la bibliothèque,
+/// tel quel. Le démarrage (`transport.rs`, `habillage.cover_path`) pose le
+/// condensat ; l'avance le passait par `resolve_cover_url`, qui fabrique
+/// `http://<ip-lan>:8888/api/v1/library/artwork/<condensat>`. Le client web
+/// tient toute URL absolue pour une pochette DISTANTE et la fait passer par
+/// le relais, dont la garde d'adresse (#4260) refuse le LAN :
+/// `artwork_proxy_hote_refuse` ×4 chez Sevy Tabroc, pochette grise dès le
+/// deuxième morceau chez JeromeQ. Les renderers réseau, eux, reçoivent leur
+/// URL absolue par `PlayRequest.cover_url` → `resolve_cover_url`, comme au
+/// démarrage : rien ne leur manque.
+#[tokio::test]
+async fn avance_gapless_garde_le_condensat_de_pochette() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 4446", Some("local"), None)
+        .unwrap();
+
+    let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let mut ids = Vec::new();
+    for n in 1..=2 {
+        let mut piste = crate::db::models::Track::new(format!("Pochette {n}"));
+        piste.file_path = Some(format!("/aucun/chemin/4446/piste{n}.m4a"));
+        piste.track_number = n;
+        piste.duration_ms = 180_000;
+        piste.cover_path = Some("c9b9f3adf2a78c5e".into());
+        ids.push(pistes.create(&piste).unwrap());
+    }
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &ids)
+        .unwrap();
+
+    orch.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                track_id: Some(ids[0]),
+                title: "Pochette 1".into(),
+                cover_path: Some("c9b9f3adf2a78c5e".into()),
+                duration_ms: 180_000,
+                source: "local".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    orch.playback.update_queue_info(zone_id, 0, 2).await;
+
+    orch.advance_queue_metadata(zone_id, 1)
+        .await
+        .expect("l'avance gapless doit aboutir");
+
+    let np = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .expect("une piste en cours après l'avance");
+    assert_eq!(np.title, "Pochette 2");
+    assert_eq!(
+        np.cover_path.as_deref(),
+        Some("c9b9f3adf2a78c5e"),
+        "après une avance gapless la pochette doit rester le condensat, \
+         comme au démarrage — pas une URL absolue vers l'adresse LAN (#4446)"
+    );
+}
+
 // ------------------------------------------------------------------
 // #1541 — VU-mètres après une avance gapless, DSD local compris.
 // ------------------------------------------------------------------

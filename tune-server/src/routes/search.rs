@@ -103,6 +103,7 @@ use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::radio_repo::RadioRepo;
 use tune_core::db::track_metadata_repo::TrackMetadataRepo;
 use tune_core::db::track_repo::TrackRepo;
+use tune_core::streaming::traits::{SearchResults, StreamTrack};
 
 use crate::routes::filtre_sources::FiltreSources;
 use crate::state::AppState;
@@ -158,6 +159,86 @@ const LIMITE_PAR_DEFAUT: i64 = 20;
 /// a été voulue par quelqu'un.
 fn limite_pour_les_services(limit: i64) -> usize {
     usize::try_from(limit).unwrap_or(LIMITE_PAR_DEFAUT as usize)
+}
+
+/// #4441 — la règle de #4367, appliquée aux pistes venues d'un SERVICE.
+///
+/// FabienM (fil 1839, point 4), après la v0.9.154 : « wish you were here »
+/// rend toujours *Have a Cigar* en section Titres. #4367 avait retiré
+/// `album_title` de ce que l'index LOCAL rapproche (`COLONNES_IDENTITE_PISTE`)
+/// — et la capture le confirme, la bibliothèque passe de 10 à 6 lignes. Mais
+/// les lignes restantes portent le badge QOBUZ : `/catalog/search` de Qobuz
+/// rapproche lui aussi sur le titre d'album, et cette route recopiait sa
+/// réponse telle quelle.
+///
+/// La même règle vaut donc ici, après réception : une piste de service reste
+/// en section Titres si TOUS les jetons de la requête se retrouvent dans ce
+/// qui l'identifie — titre, interprète, compositeur —, jamais dans son album.
+/// L'album, lui, reste trouvé par la section Albums, qui est sa place.
+///
+/// Les jetons sont ceux de l'index local (`format_fts_query` : alphanumériques,
+/// la ponctuation sépare), les guillemets de FabienM tombent donc d'eux-mêmes,
+/// et les accents sont pliés des deux côtés — Qobuz trouve « Déjà Vu » pour
+/// « deja vu », on ne le lui reprend pas. Le rapprochement est par
+/// sous-chaîne, comme le préfixe FTS : « floy » retient encore Pink Floyd.
+/// Une requête sans jeton ne filtre rien.
+///
+/// Ce qui est perdu, et assumé : la tolérance aux fautes de frappe de Qobuz.
+/// Une piste rendue pour « wish you where here » sans qu'aucun mot ne
+/// corresponde ne peut plus rester.
+fn ne_garder_que_les_pistes_qui_repondent(requete: &str, resultats: &mut SearchResults) -> usize {
+    let jetons = jetons_de_recherche(requete);
+    if jetons.is_empty() {
+        return 0;
+    }
+    let avant = resultats.tracks.len();
+    resultats
+        .tracks
+        .retain(|piste| piste_de_service_repond(&jetons, piste));
+    avant - resultats.tracks.len()
+}
+
+/// Minuscules, sans accents (NFD, marques combinantes retirées).
+fn plier(texte: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    texte
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Les jetons alphanumériques d'un texte plié, dans l'ordre.
+fn jetons_plies(texte: &str) -> Vec<String> {
+    plier(texte)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|jeton| !jeton.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn jetons_de_recherche(requete: &str) -> Vec<String> {
+    jetons_plies(requete)
+}
+
+/// Tous les jetons de la requête se retrouvent dans ce qui identifie la
+/// piste — jamais dans son album.
+///
+/// Deux formes sont regardées, comme `format_fts_query_libre` le fait pour
+/// l'index : les jetons séparés d'un espace, et collés — « acdc » retient
+/// « AC/DC ».
+fn piste_de_service_repond(jetons: &[String], piste: &StreamTrack) -> bool {
+    let identite = jetons_plies(&format!(
+        "{} {} {}",
+        piste.title,
+        piste.artist,
+        piste.composer.as_deref().unwrap_or_default()
+    ));
+    let separee = identite.join(" ");
+    let collee = identite.concat();
+    jetons
+        .iter()
+        .all(|jeton| separee.contains(jeton.as_str()) || collee.contains(jeton.as_str()))
 }
 
 #[derive(Deserialize)]
@@ -346,7 +427,17 @@ async fn federated_search(
                 //
                 // « Tel quel » s'arrête au SIGNE : voir
                 // [`limite_pour_les_services`] (#2160).
-                if let Ok(results) = svc.search(&p.q, limite_pour_les_services(limit)).await {
+                if let Ok(mut results) = svc.search(&p.q, limite_pour_les_services(limit)).await {
+                    // #4441 — voir `ne_garder_que_les_pistes_qui_repondent`.
+                    let ecartees = ne_garder_que_les_pistes_qui_repondent(&p.q, &mut results);
+                    if ecartees > 0 {
+                        tracing::debug!(
+                            service = %svc_name,
+                            ecartees,
+                            gardees = results.tracks.len(),
+                            "search_pistes_de_service_hors_identite_ecartees"
+                        );
+                    }
                     service_results.insert(svc_name, json!(results));
                 }
             }
@@ -472,5 +563,215 @@ mod tests_limite_services {
         for demandee in [0i64, 1, 20, 50, 200, 5_000] {
             assert_eq!(limite_pour_les_services(demandee), demandee as usize);
         }
+    }
+}
+
+/// #4441 — la section Titres et les pistes venues d'un SERVICE.
+#[cfg(test)]
+mod tests_pistes_de_service_i4441 {
+    use super::{SearchParams, federated_search};
+    use axum::extract::{Query, State};
+    use tune_core::TuneError;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
+        StreamUrl, StreamingService,
+    };
+
+    fn piste(id: &str, titre: &str, artiste: &str, album: &str) -> StreamTrack {
+        StreamTrack {
+            id: id.to_string(),
+            title: titre.to_string(),
+            artist: artiste.to_string(),
+            album: Some(album.to_string()),
+            album_id: None,
+            duration_ms: 300_000,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            disponible: None,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    /// Un « Qobuz » qui répond comme le vrai à « wish you were here » (fil
+    /// 1839, capture `cJ0FqgEA…`) : les trois pistes de l'album, dont deux
+    /// dont le titre ne porte aucun mot de la requête — Qobuz rapproche sur
+    /// le titre d'album. Plus une piste accentuée, pour la pliure.
+    struct QobuzDeFabien;
+
+    #[async_trait::async_trait]
+    impl StreamingService for QobuzDeFabien {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "qobuz"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+            Ok(self.auth_status().await)
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus {
+                authenticated: true,
+                ..Default::default()
+            }
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Ok(SearchResults {
+                tracks: vec![
+                    piste(
+                        "q-machine",
+                        "Welcome to the Machine",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                    ),
+                    piste(
+                        "q-cigar",
+                        "Have a Cigar",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                    ),
+                    piste(
+                        "q-wywh",
+                        "Wish You Were Here",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                    ),
+                    piste("q-deja", "Déjà Vu", "Beyoncé", "B'Day"),
+                ],
+                albums: vec![],
+                artists: vec![],
+                playlists: vec![],
+            })
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Les identifiants des pistes Qobuz que `GET /search?q=…&sources=qobuz`
+    /// rend, dans l'ordre.
+    async fn pistes_qobuz_pour(q: &str) -> Vec<String> {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .services
+            .lock()
+            .await
+            .register(Box::new(QobuzDeFabien));
+        let reponse = federated_search(
+            State(state),
+            Query(SearchParams {
+                q: q.to_string(),
+                limit: None,
+                offset: None,
+                sources: Some("qobuz".into()),
+            }),
+        )
+        .await;
+        reponse.0["services"]["qobuz"]["tracks"]
+            .as_array()
+            .expect("un tableau de pistes Qobuz")
+            .iter()
+            .map(|p| p["source_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// ⭐ Le fil 1839, point 4 : « Tune retourne toujours "Have a cigar" dans
+    /// les titres ». La règle de #4367 — une piste est trouvée par ce qui
+    /// l'identifie, pas par son album — vaut pour les pistes de service
+    /// comme pour l'index local. Guillemets compris : c'est ainsi que FabienM
+    /// l'a saisie.
+    #[tokio::test]
+    async fn une_piste_de_service_n_est_pas_retenue_par_son_seul_titre_d_album() {
+        assert_eq!(
+            pistes_qobuz_pour("\"wish you were here\"").await,
+            vec!["q-wywh".to_string()],
+            "seule la piste dont le TITRE porte la requête doit rester (#4441)"
+        );
+        assert_eq!(
+            pistes_qobuz_pour("wish you were here").await,
+            vec!["q-wywh"]
+        );
+    }
+
+    /// Contre-épreuve : l'artiste identifie la piste — « pink floyd » garde
+    /// les trois ; et la pliure des accents rend « beyonce deja vu » capable
+    /// de trouver « Déjà Vu » de Beyoncé, comme Qobuz sait le faire.
+    #[tokio::test]
+    async fn l_artiste_et_les_accents_plies_identifient_toujours_la_piste() {
+        assert_eq!(
+            pistes_qobuz_pour("pink floyd").await,
+            vec!["q-machine", "q-cigar", "q-wywh"]
+        );
+        assert_eq!(pistes_qobuz_pour("beyonce deja vu").await, vec!["q-deja"]);
+        assert_eq!(pistes_qobuz_pour("Déjà").await, vec!["q-deja"]);
+    }
+
+    /// Les pièces du filtre : guillemets et ponctuation tombent, la forme
+    /// collée retient « AC/DC », une requête vide ne filtre rien.
+    #[test]
+    fn les_jetons_et_la_forme_collee() {
+        use super::{jetons_de_recherche, ne_garder_que_les_pistes_qui_repondent};
+        assert_eq!(
+            jetons_de_recherche("\"Wish You Were Here\""),
+            vec!["wish", "you", "were", "here"]
+        );
+        assert_eq!(jetons_de_recherche("Beyoncé"), vec!["beyonce"]);
+        assert!(jetons_de_recherche("\"\" - ").is_empty());
+
+        let mut r = SearchResults {
+            tracks: vec![
+                piste("acdc", "Back in Black", "AC/DC", "Back in Black"),
+                piste("cigar", "Have a Cigar", "Pink Floyd", "Wish You Were Here"),
+            ],
+            albums: vec![],
+            artists: vec![],
+            playlists: vec![],
+        };
+        assert_eq!(ne_garder_que_les_pistes_qui_repondent("acdc", &mut r), 1);
+        assert_eq!(r.tracks.len(), 1);
+        assert_eq!(r.tracks[0].id, "acdc");
+        assert_eq!(ne_garder_que_les_pistes_qui_repondent("  ", &mut r), 0);
     }
 }
