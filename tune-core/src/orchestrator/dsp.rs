@@ -1308,6 +1308,12 @@ impl PlaybackOrchestrator {
     /// réglage que PURE cache. `None` si la clé est absente, illisible ou si
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
+        if !crate::audio::premium_plugins::enabled(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            "equalizer",
+        ) {
+            return None;
+        }
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let key = format!("zone_{zone_id}_eq_profile");
         let profile: crate::audio::eq::EqProfile = settings
@@ -1464,6 +1470,19 @@ impl PlaybackOrchestrator {
     /// mêmes bornes. `None` sur la case décochée, une clé absente ou illisible,
     /// ou un `amount` nul (identité).
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
+        if self
+            .license
+            .as_ref()
+            .is_some_and(|license| !license.premium_snapshot())
+        {
+            return None;
+        }
+        if !crate::audio::premium_plugins::enabled(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            "crossfeed",
+        ) {
+            return None;
+        }
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         let cfg: serde_json::Value = settings
             .get(&format!("zone_{zone_id}_crossfeed"))

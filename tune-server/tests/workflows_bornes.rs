@@ -352,6 +352,41 @@ fn la_voie_rapide_est_reservee_aux_bases_integration() {
     assert!(postgres.contains("contains(github.event.pull_request.labels.*.name, 'ci:full')"));
 }
 
+// Le catalogue peut réordonner les features, mais doit garder les DEUX
+// commandes Windows et leurs capacités. Lire une vraie commande, pas un commentaire.
+fn commande_windows_contient_features(source: &str, attendues: &str, asio: bool) -> bool {
+    source.lines().any(|line| {
+        let line = line.trim().trim_start_matches("- ");
+        if !line.starts_with("run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features ") {
+            return false;
+        }
+        let features: Vec<_> = line.split("--features ").nth(1).unwrap_or("")
+            .split_whitespace().next().unwrap_or("").split(',').collect();
+        features.contains(&"asio") == asio
+            && attendues.split(',').all(|f| features.contains(&f))
+    })
+}
+
+#[test]
+fn catalogue_windows_ordre_libre_mais_omissions_et_faux_commentaires_refuses() {
+    let command = "run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features plugins-wasm,bandcamp,postgres,oaat,cloud-relay,dj,karaoke";
+    let required = "oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm";
+    assert!(commande_windows_contient_features(command, required, false));
+    for feature in required.split(',') {
+        let broken = command.replace(feature, "missing-feature");
+        assert!(
+            !commande_windows_contient_features(&broken, required, false),
+            "{feature}"
+        );
+    }
+    assert!(!commande_windows_contient_features(
+        &format!("# {command}"),
+        required,
+        false
+    ));
+    assert!(!commande_windows_contient_features(command, required, true));
+}
+
 #[test]
 fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
     let source = workflow("ci.yml");
@@ -365,11 +400,15 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
 
     let windows = corps("windows-pr");
     assert!(windows.contains("if: github.event_name == 'pull_request'"));
-    assert!(
-        windows.contains("--features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm")
-    );
-    assert!(windows.contains(
-        "--features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm"
+    assert!(commande_windows_contient_features(
+        windows,
+        "oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm",
+        false
+    ));
+    assert!(commande_windows_contient_features(
+        windows,
+        "oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm",
+        true
     ));
 
     let macos = corps("macos-pr");
@@ -823,11 +862,15 @@ fn les_deux_plateformes_compilent_sur_toute_pr_rust() {
     // Rien n'est RETIRE : les deux jobs gardent leurs configurations, et
     // `release-gate` continue de les exiger verts pour promouvoir vers main.
     let windows = corps("windows-pr");
-    assert!(
-        windows.contains("--features oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm")
-    );
-    assert!(windows.contains(
-        "--features oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm"
+    assert!(commande_windows_contient_features(
+        windows,
+        "oaat,cloud-relay,postgres,dj,karaoke,bandcamp,plugins-wasm",
+        false
+    ));
+    assert!(commande_windows_contient_features(
+        windows,
+        "oaat,cloud-relay,local-audio,asio,postgres,dj,karaoke,bandcamp,plugins-wasm",
+        true
     ));
     assert!(corps("macos-pr").contains("cargo check --package tune-server"));
     let porte = corps("release-gate");
