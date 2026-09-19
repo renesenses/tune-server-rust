@@ -318,19 +318,19 @@ pub(crate) fn genres_de_l_album(
     genres: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut noms: Vec<String> = Vec::new();
-    if let Some(json_str) = genres {
-        if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
-            noms = arr
-                .into_iter()
-                .map(|g| g.trim().to_string())
-                .filter(|g| !g.is_empty())
-                .collect();
-        }
+    if let Some(json_str) = genres
+        && let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str)
+    {
+        noms = arr
+            .into_iter()
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .collect();
     }
-    if noms.is_empty() {
-        if let Some(brut) = genre {
-            noms = tune_core::metadata::split_genre_tag(brut);
-        }
+    if noms.is_empty()
+        && let Some(brut) = genre
+    {
+        noms = tune_core::metadata::split_genre_tag(brut);
     }
     let mut vues: std::collections::HashSet<String> = std::collections::HashSet::new();
     noms.into_iter()
@@ -517,9 +517,10 @@ mod genres_de_l_album_4527 {
                 )
                 .unwrap();
         }
-        let Json(v) = list_genres(State(state), Query(GenreQuery { query: None }))
-            .await
-            .unwrap();
+        // `AppError` n'implémente pas `Debug` : pas de `.unwrap()` ici.
+        let Ok(Json(v)) = list_genres(State(state), Query(GenreQuery { query: None })).await else {
+            panic!("GET /library/genres a échoué");
+        };
         let rangs = v.as_array().unwrap();
         assert_eq!(rangs.len(), 2, "trip hop (2 albums) + jazz (1) : {v}");
         let trip = rangs
