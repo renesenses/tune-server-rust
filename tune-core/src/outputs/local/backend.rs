@@ -625,9 +625,11 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
                 // Prélevé AVANT la fermeture de rendu (#3205).
                 let famine_cb = ring_cb.starvation();
+                let mut promotion = PromotionDuFilDeRendu::nouvelle();
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        promotion.a_la_premiere_periode();
                         // Le corps est partagé avec le chemin compressé
                         // (`render_local_shared_f32_callback`) : c'était deux
                         // copies identiques, et le faux rouge de #3814 vivait
