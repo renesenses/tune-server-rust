@@ -2704,15 +2704,16 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
         return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
     };
 
+    // #4362 (point 2) — « Suivant » enjambe les pistes dont le serveur
+    // multimédia est absent au lieu de s'arrêter sur la première. Hors du
+    // bloc détaché : la garde #3270 borne ce bloc à l'annonce de son échec.
+    let next_pos = state
+        .orchestrator
+        .enjamber_les_serveurs_absents(zone_id, next_pos)
+        .await
+        .map_or(next_pos, |(position, _)| position);
     let s = state.clone();
     tokio::spawn(async move {
-        // #4362 (point 2) — « Suivant » enjambe les pistes dont le serveur
-        // multimédia est absent au lieu de s'arrêter sur la première.
-        let next_pos = s
-            .orchestrator
-            .enjamber_les_serveurs_absents(zone_id, next_pos)
-            .await
-            .map_or(next_pos, |(position, _)| position);
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
             tracing::warn!(zone_id, error = %e, "next_play_failed");
             // #3270 (point 2) — la réponse HTTP est déjà partie en disant
