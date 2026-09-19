@@ -2010,6 +2010,19 @@ pub trait OutputTarget: Send + Sync {
         None
     }
 
+    /// #4177 — la sortie a-t-elle RENDU son périphérique pendant la pause ?
+    ///
+    /// Une sortie locale Windows en mode exclusif (WASAPI exclusif, ASIO) tient
+    /// le point de sortie pour elle seule : garder le flux ouvert en pause,
+    /// c'est priver tout le poste de son. Une telle sortie ferme donc son flux
+    /// à `pause()` et répond `true` ici ; l'orchestrateur rétablit alors la
+    /// lecture à la position conservée (`play_url`) au lieu d'un `resume()` sur
+    /// place qui ne rouvrirait rien. Défaut `false` : toutes les autres sorties
+    /// reprennent comme avant.
+    fn device_released_on_pause(&self) -> bool {
+        false
+    }
+
     fn host(&self) -> Option<&str> {
         None
     }

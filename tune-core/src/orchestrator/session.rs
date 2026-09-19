@@ -89,19 +89,26 @@ pub(crate) enum RepriseDeSession {
 /// qu'on l'ait laissée trente secondes ou trois heures. Seule la mort de la
 /// session — le ramasse-miettes est passé — justifie de rétablir quoi que ce
 /// soit, et alors on rétablit à la position, pas au début.
+///
+/// `peripherique_rendu` (#4177) : la sortie a fermé son flux à la pause pour
+/// rendre un périphérique exclusif (WASAPI exclusif, ASIO sous Windows). Il n'y
+/// a plus rien « sur place » : on rétablit comme si la session était morte —
+/// la piste à sa position, la radio en direct.
 pub(crate) fn reprise_de_session(
     est_radio: bool,
     rejouable: bool,
     pause_longue: bool,
     session_morte: bool,
+    peripherique_rendu: bool,
 ) -> RepriseDeSession {
+    let rien_sur_place = session_morte || peripherique_rendu;
     if est_radio {
-        if rejouable && (pause_longue || session_morte) {
+        if rejouable && (pause_longue || rien_sur_place) {
             RepriseDeSession::RejouerLeDirect
         } else {
             RepriseDeSession::SurPlace
         }
-    } else if !session_morte {
+    } else if !rien_sur_place {
         RepriseDeSession::SurPlace
     } else if rejouable {
         RepriseDeSession::RetablirALaPosition
