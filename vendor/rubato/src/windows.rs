@@ -1,5 +1,22 @@
 use crate::Sample;
-use windowfunctions::{window, Symmetry, WindowFunction as ImportedWindowFunction};
+
+/// Periodic cosine-sum window, evaluated exactly as `windowfunctions` 0.1.1
+/// does (same coefficients, same operation order), but with the portable
+/// `libm::cos` instead of the platform libm (#4532, see TUNE-PATCH.md).
+/// The system `cos` differs in the last bit between glibc, the MSVC CRT and
+/// Apple's libm, which made the resampler tables platform-dependent.
+fn cosine_window(npoints: usize, a: f64, b: f64, c: f64, d: f64, e: f64) -> Vec<f64> {
+    let pi = core::f64::consts::PI;
+    let len = npoints as f64;
+    (0..npoints)
+        .map(|index| {
+            let x = index as f64;
+            a - b * libm::cos(2.0 * pi * x / len) + c * libm::cos(4.0 * pi * x / len)
+                - d * libm::cos(6.0 * pi * x / len)
+                + e * libm::cos(8.0 * pi * x / len)
+        })
+        .collect()
+}
 
 /// Different window functions that can be used to window the sinc function.
 #[derive(Debug, Clone, Copy)]
@@ -25,12 +42,9 @@ where
     T: Sample,
 {
     trace!("Making a BlackmanHarris windows with {} points", npoints);
-    window::<f64>(
-        npoints,
-        ImportedWindowFunction::BlackmanHarris,
-        Symmetry::Periodic,
-    )
-    .map(|v| T::coerce(v))
+    cosine_window(npoints, 0.35875, 0.48829, 0.14128, 0.01168, 0.0)
+        .into_iter()
+        .map(|v| T::coerce(v))
     .collect()
 }
 
@@ -41,12 +55,9 @@ where
     T: Sample,
 {
     trace!("Making a Blackman windows with {} points", npoints);
-    window::<f64>(
-        npoints,
-        ImportedWindowFunction::Blackman,
-        Symmetry::Periodic,
-    )
-    .map(|v| T::coerce(v))
+    cosine_window(npoints, 0.42, 0.5, 0.08, 0.0, 0.0)
+        .into_iter()
+        .map(|v| T::coerce(v))
     .collect()
 }
 
@@ -57,7 +68,8 @@ where
     T: Sample,
 {
     trace!("Making a Hann windows with {} points", npoints);
-    window::<f64>(npoints, ImportedWindowFunction::Hann, Symmetry::Periodic)
+    cosine_window(npoints, 0.5, 0.5, 0.0, 0.0, 0.0)
+        .into_iter()
         .map(|v| T::coerce(v))
         .collect()
 }

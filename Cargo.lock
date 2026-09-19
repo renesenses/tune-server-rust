@@ -3766,12 +3766,12 @@ version = "3.0.0"
 dependencies = [
  "audioadapter",
  "audioadapter-buffers",
+ "libm",
  "num-complex",
  "num-integer",
  "num-traits",
  "realfft",
  "visibility",
- "windowfunctions",
 ]
 
 [[package]]
@@ -6246,15 +6246,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "windowfunctions"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90628d739333b7c5d2ee0b70210b97b8cddc38440c682c96fd9e2c24c2db5f3a"
-dependencies = [
- "num-traits",
 ]
 
 [[package]]
