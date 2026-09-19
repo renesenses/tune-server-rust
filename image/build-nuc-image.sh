@@ -271,12 +271,10 @@ fi
 EOF
 chmod 0644 "${ROOTFS}/etc/profile.d/tune-password-notice.sh"
 
-# ALSA: set USB audio as default if present
-cat > "${ROOTFS}/etc/asound.conf" <<'EOF'
-# Tune OS: prefer USB audio device if available
-defaults.pcm.card 0
-defaults.ctl.card 0
-EOF
+# Aucune configuration ALSA globale (#3210) : l'ancienne épinglait la carte 0
+# — le HDA interne sur un mini-PC — sous un commentaire qui promettait l'USB.
+# Tune ouvre ses périphériques par nom ; le « default » ALSA reste celui
+# d'ALSA, comme sur l'image RPi. Gardé par image/test-tune-os-asound.sh.
 
 # Real-time audio priority for tune user
 cat > "${ROOTFS}/etc/security/limits.d/tune-audio.conf" <<EOF
