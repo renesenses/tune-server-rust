@@ -4007,7 +4007,6 @@ impl BoucleProducteur<'_> {
     }
 }
 
-#[async_trait::async_trait]
 /// #4177 — la pause doit-elle RENDRE le périphérique ?
 ///
 /// Règle pure : sous Windows, en mode exclusif (WASAPI exclusif comme ASIO,
@@ -4022,6 +4021,7 @@ pub(crate) fn la_pause_rend_le_peripherique(
     windows && exclusive_mode && playing
 }
 
+#[async_trait::async_trait]
 impl OutputTarget for LocalOutput {
     fn name(&self) -> &str {
         &self.device_name
