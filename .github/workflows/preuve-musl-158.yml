@@ -1,0 +1,25 @@
+# Branche jetable : prouve que la cible aarch64-unknown-linux-musl de release.yml
+# compile avec le correctif #4544, avant de taguer la v0.9.158. À supprimer.
+name: Preuve musl v0.9.158
+on:
+  push:
+    branches: ["test/preuve-musl-158"]
+permissions:
+  contents: read
+jobs:
+  musl:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-unknown-linux-musl
+          rustflags: ""
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-ubuntu-22.04-aarch64-unknown-linux-musl
+      - uses: taiki-e/install-action@cross
+      - name: Build (cross) — ligne identique à release.yml
+        run: cross build --release --package tune-server --target aarch64-unknown-linux-musl --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+      - run: file target/aarch64-unknown-linux-musl/release/tune-server
