@@ -822,6 +822,8 @@ impl PlaybackOrchestrator {
         // De quoi DIRE l'échec plutôt que de le laisser au journal.
         let err_bus = self.event_bus.clone();
         let err_zone = req.zone_id;
+        // #3973 — lu avant la tâche détachée, comme la zone elle-même.
+        let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let err_station = title.clone();
         // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
         // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
@@ -843,6 +845,7 @@ impl PlaybackOrchestrator {
                         radio_eq_profile.clone()
                     },
                     radio_levels_tx,
+                    radio_strict,
                 )
             })
             .await;
@@ -932,6 +935,7 @@ impl PlaybackOrchestrator {
             self.streamer.create_radio_session(wav_info, 256).await;
         info!(url = %audio_url, "bandcamp_decode_to_wav_for_oaat_output");
         let bc_url = audio_url.to_string();
+        let bc_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let bc_levels_tx = if let Some(ref bus) = self.event_bus {
             let play_seq = self.playback.current_play_seq(req.zone_id).await;
             Some(spawn_paced_levels_forwarder(
@@ -947,7 +951,15 @@ impl PlaybackOrchestrator {
         let session_for_done = session.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm(bc_url, tx, data_ready, session, None, bc_levels_tx)
+                decode_radio_stream_to_pcm(
+                    bc_url,
+                    tx,
+                    data_ready,
+                    session,
+                    None,
+                    bc_levels_tx,
+                    bc_strict,
+                )
             })
             .await;
             session_for_done
@@ -1187,6 +1199,8 @@ impl PlaybackOrchestrator {
             // Même dette que le chemin local : l'échec restait au journal.
             let err_bus = self.event_bus.clone();
             let err_zone = req.zone_id;
+            // #3973 — lu avant la tâche détachée, comme la zone elle-même.
+            let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
             let err_station = title.clone();
             // #3756 — même mémoire que le chemin local/OAAT. Le journal du
             // ticket vient d'une sortie ALSA, mais rien dans la boucle de
@@ -1203,6 +1217,7 @@ impl PlaybackOrchestrator {
                         session,
                         radio_eq_profile.clone(),
                         radio_levels_tx,
+                        radio_strict,
                     )
                 })
                 .await;

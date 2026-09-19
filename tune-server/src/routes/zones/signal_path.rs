@@ -535,6 +535,8 @@ pub(super) fn build_signal_path(
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
+    let zone_id_courant = zone.id.unwrap_or(0);
+    let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id_courant);
     let etapes = assembler_les_etapes(
         ps,
         zone,
@@ -555,7 +557,24 @@ pub(super) fn build_signal_path(
         "runtime_observed": runtime_signal_path.is_some(),
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": etapes.dsp_metrics,
+        // #3973 — « jouer, et le dire ». PURE promet un chemin intouché ;
+        // une conversion de fréquence le dégrade, et l'écran doit le dire au
+        // lieu d'allumer le badge. `strict_bitperfect` : la zone refuserait
+        // plutôt que convertir (la lecture n'aurait alors pas démarré).
+        "pure": pure,
+        "pure_degraded": pure_degraded(pure, etapes.rate_conversion),
+        "strict_bitperfect": tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id_courant),
+        "rate_conversion": etapes.rate_conversion.map(|(de, vers)| json!({
+            "from_hz": de,
+            "to_hz": vers,
+        })),
     }))
+}
+
+/// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
+/// fréquence a lieu : la décision « jouer, et le dire » de Bertrand (19/09).
+pub(super) fn pure_degraded(pure: bool, rate_conversion: Option<(u32, u32)>) -> bool {
+    pure && rate_conversion.is_some_and(|(de, vers)| de != vers)
 }
 
 /// Tout ce que `build_signal_path` a établi, prêt à être décrit en étapes
@@ -577,6 +596,9 @@ struct Etapes {
     steps: Vec<Value>,
     summary: String,
     dsp_metrics: Option<Value>,
+    /// #3973 — la conversion de fréquence nommée par l'étape `Resampler`
+    /// (de, vers), en Hz. `None` : aucune conversion.
+    rate_conversion: Option<(u32, u32)>,
 }
 
 /// Assemble les étapes du chemin de signal ; sixième bloc de
@@ -752,19 +774,32 @@ fn assembler_les_etapes(
     // Resampler step. MESURÉ d'abord (REF-6b) : la sortie a dit ce qu'elle a
     // ouvert, et c'est cet écart-là qui est nommé, pas le plafond réglé.
     // Sans déclaration, la règle historique : le plafond effectif de cadence.
+    //
+    // #3973 — l'étape porte `code: "rate_conversion"` et ses deux fréquences :
+    // c'est elle que le client affiche « 192 → 96 kHz, pas bit-perfect », et
+    // elle qui fait dire « PURE dégradé » (`pure_degraded`).
+    let mut rate_conversion: Option<(u32, u32)> = None;
     if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
         let src_khz = t.entree().cadence() / 1000;
         let dst_khz = t.ouvert().cadence / 1000;
+        rate_conversion = Some((t.entree().cadence(), t.ouvert().cadence));
         steps.push(json!({
             "name": "Resampler",
+            "code": "rate_conversion",
+            "from_hz": t.entree().cadence(),
+            "to_hz": t.ouvert().cadence,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz (mesuré)"),
             "bit_perfect": false,
         }));
     } else if let Some(max_sr) = max_sample_rate.filter(|_| resampling_active) {
         let src_khz = sample_rate / 1000;
         let dst_khz = max_sr / 1000;
+        rate_conversion = Some((sample_rate as u32, max_sr));
         steps.push(json!({
             "name": "Resampler",
+            "code": "rate_conversion",
+            "from_hz": sample_rate as u32,
+            "to_hz": max_sr,
             "description": format!("{src_khz}kHz \u{2192} {dst_khz}kHz"),
             "bit_perfect": false,
         }));
@@ -972,6 +1007,7 @@ fn assembler_les_etapes(
         steps,
         summary,
         dsp_metrics,
+        rate_conversion,
     }
 }
 

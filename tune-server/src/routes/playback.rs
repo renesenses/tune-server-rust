@@ -74,6 +74,36 @@ fn refus_plafond_zones(actives: i64, limite: i64, lang: &str) -> axum::response:
 /// plafond de zones est la seule branche qui s'en serve aujourd'hui, mais elle
 /// est passée à TOUS les appelants pour que la suivante n'ait pas à rouvrir
 /// cinq signatures.
+/// #3973 — la réponse d'un refus « bit-perfect strict » : code stable, phrase
+/// traduite, et les deux fréquences pour un client qui compose la sienne.
+fn refus_bitperfect_strict(
+    refus: &tune_core::audio::bitperfect_strict::RefusBitPerfect,
+    lang: &str,
+) -> axum::response::Response {
+    // Virgule décimale sauf là où l'usage est le point.
+    let khz = |hz: u32| {
+        let texte = tune_core::audio::bitperfect_strict::khz(hz);
+        if matches!(lang, "en" | "zh" | "ja" | "ko") {
+            texte.replace(',', ".")
+        } else {
+            texte
+        }
+    };
+    let message = crate::i18n::t(lang, "bitperfect.strict.refused")
+        .replace("{requested}", &khz(refus.demandee_hz))
+        .replace("{device}", &khz(refus.sortie_hz));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": tune_core::audio::bitperfect_strict::CODE_REFUS,
+            "message": message,
+            "requested_hz": refus.demandee_hz,
+            "device_hz": refus.sortie_hz,
+        })),
+    )
+        .into_response()
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
@@ -91,6 +121,15 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         return refus_plafond_zones(actives, limite, lang);
+    }
+    // #3973 — « bit-perfect strict » : la zone interdit de convertir et la
+    // sortie (ou son plafond) ne lit pas la fréquence de la source. 422 comme
+    // `format_not_playable` : une capacité absente, pas une panne. La phrase
+    // se compose ICI, dans la langue de la requête, à partir des deux
+    // fréquences de la sentinelle.
+    if let Some(refus) = tune_core::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(&e)
+    {
+        return refus_bitperfect_strict(&refus, lang);
     }
     // Orphan-zone sentinel from orchestrator.play(): the zone row has no
     // output_device_id, so playback can never produce sound (Yacine, 24/07).
@@ -1171,6 +1210,50 @@ mod sqlite_scan_queue_arbitration_tests {
                 .collect::<Vec<_>>(),
             vec![first_id, second_id],
             "the requested queue must survive the scan arbitration intact"
+        );
+    }
+}
+
+#[cfg(test)]
+mod refus_bitperfect_strict_3973 {
+    use super::play_error_response;
+    use axum::http::StatusCode;
+    use serde_json::Value;
+
+    async fn corps(e: &str, lang: &str) -> (StatusCode, Value) {
+        let reponse = play_error_response(e.to_string(), lang);
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap())
+    }
+
+    /// #3973 — le refus de la résolution (plafond de zone, DoP, services)
+    /// sort de la route en 422 avec son code stable, ses deux fréquences et
+    /// une phrase DANS LA LANGUE de la requête — pas en 500 avec la
+    /// sentinelle brute.
+    #[tokio::test]
+    async fn la_route_traduit_le_refus_bitperfect_strict() {
+        let (statut, fr) = corps("bitperfect_strict_refused:192000:96000", "fr").await;
+        assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "{fr}");
+        assert_eq!(fr["error"], "bitperfect_strict_refused", "{fr}");
+        assert_eq!(fr["requested_hz"], 192_000);
+        assert_eq!(fr["device_hz"], 96_000);
+        let message = fr["message"].as_str().unwrap();
+        assert!(
+            message.contains("192 kHz")
+                && message.contains("96 kHz")
+                && message.contains("refusée"),
+            "{message}"
+        );
+        let (_, en) = corps("bitperfect_strict_refused:22050:44100", "en").await;
+        let message = en["message"].as_str().unwrap();
+        assert!(
+            message.contains("22.05 kHz")
+                && message.contains("44.1 kHz")
+                && message.contains("refused"),
+            "{message}"
         );
     }
 }
