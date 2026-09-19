@@ -854,6 +854,8 @@ mod tests_pistes_de_service_i4441 {
         assert_eq!(r.tracks.len(), 1);
         assert_eq!(r.tracks[0].id, "acdc");
         assert_eq!(ne_garder_que_les_pistes_qui_repondent("  ", &mut r), 0);
+    }
+}
 
 /// Les services sont interrogés ENSEMBLE — Bertrand, 19/09/2026.
 ///
