@@ -45,7 +45,7 @@ where
     cosine_window(npoints, 0.35875, 0.48829, 0.14128, 0.01168, 0.0)
         .into_iter()
         .map(|v| T::coerce(v))
-    .collect()
+        .collect()
 }
 
 /// Helper function. Standard Blackman window.
@@ -58,7 +58,7 @@ where
     cosine_window(npoints, 0.42, 0.5, 0.08, 0.0, 0.0)
         .into_iter()
         .map(|v| T::coerce(v))
-    .collect()
+        .collect()
 }
 
 /// Helper function. Standard Hann window.
