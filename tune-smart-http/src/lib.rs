@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use tune_core::db::backend::DbBackend;
 
+pub(crate) mod regles_sql;
 pub mod smart_ai;
 pub mod smart_collections;
 pub mod smart_playlists;
