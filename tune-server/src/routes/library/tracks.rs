@@ -1681,7 +1681,7 @@ pub(super) async fn rassembler_versions(
     let e = state.backend.engine();
     let sql = format!(
         "SELECT t.title, COALESCE(ar2.name, ar.name, ''), COALESCE(al.title, ''), \
-                t.isrc, t.duration_ms, al.year \
+                t.isrc, t.duration_ms, al.year, t.source \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON al.artist_id = ar.id \
@@ -1701,6 +1701,9 @@ pub(super) async fn rassembler_versions(
         isrc: cols.get(3).and_then(|v| v.as_string()),
         duree_ms: cols.get(4).and_then(|v| v.as_i64()),
         annee: cols.get(5).and_then(|v| v.as_i64()),
+        // #4443 — d'où part la question : l'édition du MÊME album chez un
+        // autre service est une version, pas le même enregistrement.
+        source: cols.get(6).and_then(|v| v.as_string()),
     };
 
     // ⚠️ La ligne `tracks` ci-dessus est lue QUOI QU'IL ARRIVE, meme quand le
