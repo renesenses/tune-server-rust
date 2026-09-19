@@ -55,6 +55,8 @@ enum DashOuFini<'a> {
 /// l'orchestrateur (REF-2 phase 2, #2219).
 struct TranscodageEnTache {
     upstream_url: String,
+    /// En-têtes du résolveur à rejouer au téléchargement amont (#4366).
+    upstream_headers: Vec<(String, String)>,
     codec: String,
     sr: u32,
     bd: u16,
@@ -461,6 +463,7 @@ impl PlaybackOrchestrator {
                 req,
                 service_name,
                 upstream_url,
+                stream_data.headers.clone(),
                 codec,
                 sr,
                 bd,
@@ -616,6 +619,7 @@ impl PlaybackOrchestrator {
         req: &PlayRequest,
         service_name: &str,
         upstream_url: String,
+        upstream_headers: Vec<(String, String)>,
         codec: String,
         sr: u32,
         bd: u16,
@@ -641,6 +645,7 @@ impl PlaybackOrchestrator {
         let use_http_range = decodage_progressif_par_range(service_name, &codec, &upstream_url);
         TranscodageEnTache {
             upstream_url,
+            upstream_headers,
             codec,
             sr,
             bd,
@@ -666,6 +671,7 @@ impl PlaybackOrchestrator {
     ) {
         let TranscodageEnTache {
             upstream_url,
+            upstream_headers,
             codec,
             sr,
             bd,
@@ -702,8 +708,9 @@ impl PlaybackOrchestrator {
         // historique par fichier temporaire reste parfaitement propre.
         let ranged_source = if use_http_range {
             let upstream = upstream_url.clone();
+            let entetes = upstream_headers.clone();
             match tokio::task::spawn_blocking(move || {
-                crate::audio::http_range::HttpRangeSource::open(&upstream)
+                crate::audio::http_range::HttpRangeSource::open_avec_entetes(&upstream, &entetes)
             })
             .await
             {
@@ -747,6 +754,7 @@ impl PlaybackOrchestrator {
                 &streamer_for_eof,
                 &session_id_for_eof,
                 &upstream_url,
+                &upstream_headers,
                 &codec,
                 &std::env::temp_dir(),
             )
