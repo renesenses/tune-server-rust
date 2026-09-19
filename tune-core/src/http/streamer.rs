@@ -198,6 +198,13 @@ pub struct StreamSession {
     pub octets_du_canal: std::sync::atomic::AtomicU64,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// #4455 — reprises `Range` d'un fichier WAV dont le premier octet ne
+    /// tombe PAS sur une frontière de trame PCM. Servies telles quelles
+    /// (le fichier est adressable à l'octet), mais un renderer qui les
+    /// place dans sa grille entend tous ses mots déphasés : du bruit, la
+    /// musique restant audible dessous. Compté par session pour que le
+    /// journal en dise la première et n'en répète pas cent.
+    pub ranges_hors_trame: std::sync::atomic::AtomicU32,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
     ///
     /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
@@ -392,6 +399,7 @@ impl StreamSession {
             octets_du_canal: std::sync::atomic::AtomicU64::new(0),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            ranges_hors_trame: std::sync::atomic::AtomicU32::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
