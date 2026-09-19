@@ -1165,6 +1165,18 @@ impl PlaybackOrchestrator {
             // toute façon, et bâtir des filtres pour un format inconnu donnerait
             // des coefficients faux. Même garde que les deux jumelles.
             let Some((taux, canaux)) = local_output.current_format() else {
+                // #4176 — « rien en cours » n'est pas la seule lecture d'un
+                // format absent : le fil peut être LANCÉ et attendre encore son
+                // premier octet (jusqu'à 10 s sur une radio). Il lira
+                // `pure_bypass` à l'ouverture : on le pose, on ne relance rien
+                // — la relance ouvrait le périphérique exclusif une seconde
+                // fois et perdait la course (`0x8889000A`, zone arrêtée).
+                if local_output.flux_en_demarrage() {
+                    let pure = self.zone_audiophile(zone_id);
+                    local_output.set_pure_bypass(pure);
+                    info!(zone_id, pure, "zone_pure_reportee_au_flux_qui_demarre");
+                    return true;
+                }
                 return false;
             };
 
