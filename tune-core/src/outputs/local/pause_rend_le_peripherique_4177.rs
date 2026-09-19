@@ -64,8 +64,11 @@ async fn sans_peripherique_rendu_un_fil_parti_reste_un_arret_4177() {
 /// `stop()`, garde la position et lève le drapeau ; `play_url()` l'efface.
 #[test]
 fn pause_rend_le_peripherique_sous_la_regle_et_garde_la_position_4177() {
-    let src = include_str!("../local.rs");
-    let prod = src.split("#[cfg(test)]").next().unwrap();
+    // `local.rs` porte des `#[cfg(test)]` bien avant `pause()` : on lit le
+    // fichier ENTIER (ce module-ci est un fichier à part, il ne s'y trouve
+    // pas), et aucun motif ne dépend des fins de ligne — le clone Windows du
+    // banc est en CRLF.
+    let prod = include_str!("../local.rs");
     let debut = prod
         .find("async fn pause(&self) -> Result<(), String> {")
         .expect("pause() de LocalOutput");
