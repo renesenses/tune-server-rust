@@ -115,7 +115,9 @@ mod linux {
         Some(lim.rlim_cur.min(u32::MAX as libc::rlim_t) as u32)
     }
 
-    /// Politique et priorité du fil courant, telles que le noyau les tient.
+    /// Politique et priorité du fil courant, telles que le noyau les tient —
+    /// la lecture qui fait le témoin, jamais appelée hors des épreuves.
+    #[cfg(test)]
     pub fn politique_du_fil_courant() -> (libc::c_int, libc::c_int) {
         let mut politique: libc::c_int = 0;
         let mut param = libc::sched_param { sched_priority: 0 };

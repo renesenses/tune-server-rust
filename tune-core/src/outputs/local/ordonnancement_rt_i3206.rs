@@ -19,6 +19,10 @@ static UNE_A_LA_FOIS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn la_sentinelle_demande_une_fois_et_publie_l_etat() {
     let _seul = UNE_A_LA_FOIS.lock().unwrap_or_else(|e| e.into_inner());
+    // Repartir de RIEN : sans cela, l'état laissé par une autre épreuve
+    // satisferait `is_some()` et la sentinelle pourrait ne rien publier sans
+    // que ce témoin rougisse — constaté à la contre-épreuve.
+    *OBSERVED_REALTIME.write().unwrap() = None;
     let (issue_publiee, statut) = std::thread::spawn(|| {
         let mut promotion = PromotionDuFilDeRendu::nouvelle();
         assert!(!promotion.faite);
