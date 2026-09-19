@@ -103,6 +103,25 @@ pub fn parse_upnp_time(time_str: &str) -> u64 {
 /// `orchestrator::command_may_have_landed`.
 pub const SOAP_TIMEOUT_PREFIX: &str = "soap timeout:";
 
+/// Tête des erreurs « le renderer a ACQUITTÉ `Play` et ne tient toujours
+/// rien » — verdict [`UriVerdict::PasEncore`] (#3580).
+///
+/// `SetAVTransportURI` et `Play` ont tous deux répondu `200` : la commande a
+/// certainement été REÇUE ; ce qui n'est pas établi, c'est qu'elle ait été
+/// EXÉCUTÉE. L'orchestrateur traitait ce cas comme un refus et détruisait la
+/// session de flux à la même milliseconde que l'échec (ticket support 141 :
+/// `output_send_failed_stopping_zone_immediately` puis
+/// `stream_session_removed`, 08:40:04.150 toutes deux). Un AVR-X1600H qui
+/// finit de basculer sur son entrée réseau à 47 s (ticket 109, cycle 3)
+/// trouvait alors un 404 là où on venait de lui ordonner d'aller chercher.
+///
+/// Comme [`SOAP_TIMEOUT_PREFIX`], cette tête est lue par
+/// `orchestrator::command_may_have_landed` : toute modification doit y
+/// suivre. Le ramasse-miettes borne ce qui est ainsi gardé — voir
+/// `AudioStreamer::cleanup_stale_sessions_with`.
+pub const URI_RESTEE_VIDE_PREFIX: &str =
+    "Le renderer a acquitté Play mais ne tient toujours AUCUN média";
+
 /// Préfixe des erreurs « statut HTTP d'échec SANS corps SOAP ».
 ///
 /// Un défaut SOAP légitime voyage DANS un 500 avec un corps `UPnPError` — le
@@ -1292,7 +1311,11 @@ impl DlnaOutput {
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
         // Mesure l'appel logique complet : réessais et redécouverte inclus.
         // Un acquittement SOAP ne prouve ni l'état du renderer ni l'arrêt du son.
-        let mesure = matches!(action, "Pause" | "Play").then(|| {
+        // `Seek` aussi (#4442) : c'était le seul verbe de transport sans trace
+        // de départ ni d'issue — `Stop` a `dlna_stop`, `SetAVTransportURI` a
+        // `dlna_set_uri_ok`. Un transfert qui « repart du début » sur un
+        // renderer ne pouvait pas être instruit sur pièces.
+        let mesure = matches!(action, "Pause" | "Play" | "Seek").then(|| {
             let command_id = DLNA_COMMAND_ID.fetch_add(1, Ordering::Relaxed);
             let started = std::time::Instant::now();
             info!(device = %self.name, device_id = %self.device_id, action, command_id,
@@ -2012,13 +2035,12 @@ impl OutputTarget for DlnaOutput {
                 let secondes = verif.attente_ms / 1000;
                 return Err(if verif.soap_muet {
                     format!(
-                        "Le renderer a acquitté Play, n'a jamais appliqué l'URI (CurrentURI resté vide) \
-                         puis a CESSÉ de répondre en SOAP au bout de {secondes} s — appareil éteint, \
-                         débranché ou sorti du réseau ?"
+                        "{URI_RESTEE_VIDE_PREFIX} (CurrentURI resté vide) et a CESSÉ de répondre en \
+                         SOAP au bout de {secondes} s — appareil éteint, débranché ou sorti du réseau ?"
                     )
                 } else {
                     format!(
-                        "Le renderer a acquitté Play mais ne tient toujours AUCUN média après {secondes} s \
+                        "{URI_RESTEE_VIDE_PREFIX} après {secondes} s \
                          (ni CurrentURI ni TrackURI) : il ne joue pas autre chose, il n'a rien chargé. \
                          Tune ne peut pas dire POURQUOI : l'appareil répond et n'exécute pas. Sur un ampli \
                          en veille réseau (Denon/HEOS, Marantz), relancer aussitôt aboutit souvent — la \

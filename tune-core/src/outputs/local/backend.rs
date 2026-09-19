@@ -57,6 +57,10 @@ pub(super) struct DemandeDOuverture<'a> {
     /// ce drapeau dans `play_url` ; le backend le reçoit pour ne pas avoir
     /// à le redemander.
     pub(super) exclusive: bool,
+    /// #3973 — « bit-perfect strict » armé sur la zone : une ouverture qui
+    /// devrait rééchantillonner vers la cadence du périphérique est REFUSÉE
+    /// ([`refus_strict_a_l_ouverture`]) au lieu d'être convertie en silence.
+    pub(super) strict_bitperfect: bool,
     /// Les trois témoins d'arrêt du fil de lecture, relus par le puits.
     pub(super) stop_rx: &'a std::sync::mpsc::Receiver<()>,
     pub(super) paused: &'a Arc<AtomicBool>,
@@ -108,6 +112,36 @@ pub(super) enum RefusDOuverture {
     },
     /// Le périphérique est ouvert mais refuse de démarrer le rendu.
     DemarrageRefuse { erreur: String },
+    /// #3973 — bit-perfect strict : le périphérique ne tourne pas à la
+    /// cadence de la source, et la zone interdit de convertir. Rien n'est
+    /// ouvert.
+    BitPerfectStrict(crate::audio::bitperfect_strict::RefusBitPerfect),
+}
+
+/// #3973 — le site « ouverture cpal » de la règle bit-perfect.
+///
+/// Seul le bras `ResampleToDeviceRate` de [`decide_local_rate_opening`]
+/// convertit : c'est lui, et lui seul, que la règle
+/// ([`crate::audio::bitperfect_strict::decision_bitperfect`]) peut refuser.
+/// Les trois autres ouvrent à la cadence de la source.
+pub(super) fn refus_strict_a_l_ouverture(
+    decision: LocalRateOpening,
+    source_sr: u32,
+    strict: bool,
+) -> Option<crate::audio::bitperfect_strict::RefusBitPerfect> {
+    match decision {
+        LocalRateOpening::ResampleToDeviceRate {
+            device_sample_rate, ..
+        } => crate::audio::bitperfect_strict::decision_bitperfect(
+            source_sr,
+            device_sample_rate,
+            strict,
+        )
+        .refus(),
+        LocalRateOpening::DeviceAlreadyAtSourceRate
+        | LocalRateOpening::AtSourceRateMeasured
+        | LocalRateOpening::LastResortSourceRate => None,
+    }
 }
 
 impl RefusDOuverture {
@@ -158,6 +192,19 @@ impl RefusDOuverture {
             RefusDOuverture::DemarrageRefuse { erreur } => {
                 warn!(error = %erreur, "audio_stream_play_failed");
             }
+            RefusDOuverture::BitPerfectStrict(refus) => {
+                warn!(
+                    device = %device_name,
+                    requested_sr = refus.demandee_hz,
+                    device_sr = refus.sortie_hz,
+                    "local_audio_bitperfect_strict_refused"
+                );
+                // La SENTINELLE, pas la phrase : le sondeur la relit pour
+                // émettre `code`, et le client la traduit (#3973).
+                if let Ok(mut slot) = open_failure.lock() {
+                    *slot = Some(refus.sentinelle());
+                }
+            }
         }
     }
 }
@@ -182,6 +229,7 @@ impl std::fmt::Display for RefusDOuverture {
                 write!(f, "{backend}: {erreur}")
             }
             RefusDOuverture::DemarrageRefuse { erreur } => f.write_str(erreur),
+            RefusDOuverture::BitPerfectStrict(refus) => f.write_str(&refus.message_fr()),
         }
     }
 }
@@ -460,6 +508,13 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 enumerated.is_some(),
                 rate_evidence,
             );
+            // #3973 — bit-perfect strict : une décision de rééchantillonner
+            // est refusée ICI, avant qu'un flux soit construit.
+            if let Some(refus) =
+                refus_strict_a_l_ouverture(decision, sample_rate, demande.strict_bitperfect)
+            {
+                return Err(RefusDOuverture::BitPerfectStrict(refus));
+            }
 
             // Ce que la décision ouvre RÉELLEMENT — la seule chose qu'on ait
             // le droit de remonter.
@@ -625,9 +680,11 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
                 let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
                 // Prélevé AVANT la fermeture de rendu (#3205).
                 let famine_cb = ring_cb.starvation();
+                let mut promotion = PromotionDuFilDeRendu::nouvelle();
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        promotion.a_la_premiere_periode();
                         // Le corps est partagé avec le chemin compressé
                         // (`render_local_shared_f32_callback`) : c'était deux
                         // copies identiques, et le faux rouge de #3814 vivait

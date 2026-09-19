@@ -102,6 +102,30 @@ async fn fetch_radio_metadata_depuis(
         return fetch_bbc_metadata(BBC_RMS_BASE, station_name, &service_id).await;
     }
 
+    // KEXP — quatrième famille (#2486). Mesuré le 19/09/2026 : le flux
+    // `kexp-mp3-128.streamguys1.com/kexp128.mp3` annonce bien `icy-metaint`,
+    // mais son bloc ICY ne porte qu'un « Artiste - Titre » sans pochette. L'API
+    // publique de la station (`api.kexp.org/v2/plays/`) donne le morceau,
+    // l'artiste, l'album et la miniature de la pochette — sans clef ni compte.
+    if kexp_reconnue(station_name, stream_url) {
+        return fetch_kexp_metadata(KEXP_API_BASE, station_name).await;
+    }
+
+    // AzuraCast — cinquième famille (#2486), reconnue à la FORME de l'URL et
+    // non à une station : `https://<hôte>/listen/<code>/<montage>` est le
+    // chemin canonique de ce logiciel de diffusion, et il publie son
+    // now-playing sur `https://<hôte>/api/nowplaying/<code>`, sans clef.
+    // Trois stations du catalogue livré (jamminvibezradio.com) en sont.
+    //
+    // La forme peut mentir : un `/listen/x/y` qui n'est PAS un AzuraCast
+    // répond 404 à l'API. On retombe alors sur l'ICY, comme avant — jamais
+    // sur une absence que ce correctif aurait fabriquée.
+    if let Some(api) = azuracast_now_playing_url(stream_url)
+        && let Some(meta) = fetch_azuracast_metadata(&api, station_name).await
+    {
+        return Some(meta);
+    }
+
     // Fallback: raw ICY metadata
     fetch_icy_metadata(stream_url).await
 }
@@ -884,6 +908,200 @@ async fn fetch_bbc_metadata(
 
     let body: serde_json::Value = resp.json().await.ok()?;
     lire_now_playing_bbc(&body, station_name)
+}
+
+// ---------------------------------------------------------------------------
+// KEXP (#2486)
+// ---------------------------------------------------------------------------
+
+/// Racine de l'API publique de KEXP (Seattle) — sans clef ni compte.
+const KEXP_API_BASE: &str = "https://api.kexp.org";
+
+/// L'hôte d'une URL, sans schéma, sans chemin, sans port.
+fn hote_de_l_url(url: &str) -> Option<&str> {
+    let sans_schema = url.split_once("://")?.1;
+    let hote = sans_schema.split(['/', '?', '#']).next()?;
+    let hote = hote.rsplit_once('@').map_or(hote, |(_, h)| h);
+    let hote = hote.split(':').next()?;
+    (!hote.is_empty()).then_some(hote)
+}
+
+/// KEXP se reconnaît à son hôte — `live-mp3-128.kexp.org` comme le relais
+/// `kexp-mp3-128.streamguys1.com` du catalogue livré — ou, à défaut, au nom
+/// de la station pris comme un JETON ENTIER : « KEXP » oui, « Kexpo » non.
+fn kexp_reconnue(station_name: &str, stream_url: &str) -> bool {
+    let url = stream_url.to_lowercase();
+    if let Some(hote) = hote_de_l_url(&url) {
+        if hote == "kexp.org" || hote.ends_with(".kexp.org") {
+            return true;
+        }
+        if hote
+            .split('.')
+            .next()
+            .is_some_and(|premier| premier == "kexp" || premier.starts_with("kexp-"))
+        {
+            return true;
+        }
+    }
+    station_name
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|mot| mot == "kexp")
+}
+
+/// Lire le morceau **en cours** dans la réponse `v2/plays/`.
+///
+/// `results[0]` est la dernière entrée d'antenne, pas forcément un morceau :
+/// mesuré le 19/09/2026, une entrée sur huit est un `airbreak` — sans
+/// `artist`, sans `song`, sans image. Rendre alors `results[1]` afficherait un
+/// morceau terminé depuis quatre minutes, avec l'assurance d'un vrai
+/// now-playing. On rend `None` : l'écran garde le logo de la station.
+///
+/// Le titre est `song`, l'artiste `artist`, la pochette `thumbnail_uri` — une
+/// adresse `archive.org` en `.jpg` quand la station l'a, une chaîne VIDE sinon
+/// (mesuré sur « Live on KEXP »). Le filtre de pochette du fichier écarte la
+/// chaîne vide de lui-même.
+fn lire_now_playing_kexp(body: &serde_json::Value, station_name: &str) -> Option<IcyMetadata> {
+    let dernier = body.get("results")?.as_array()?.first()?;
+    if dernier.get("play_type").and_then(|v| v.as_str()) != Some("trackplay") {
+        return None;
+    }
+
+    let title = dernier.get("song").and_then(|v| v.as_str())?.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    let artist = dernier
+        .get("artist")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    Some(IcyMetadata {
+        title: title.to_string(),
+        artist,
+        station: Some(station_name.to_string()),
+        cover_url: pochette_de_stream_url(dernier.get("thumbnail_uri").and_then(|v| v.as_str())),
+    })
+}
+
+/// `base` est un paramètre pour que la contre-épreuve puisse dresser un faux
+/// service : aucun test de ce dépôt n'appelle une vraie radio.
+async fn fetch_kexp_metadata(base: &str, station_name: &str) -> Option<IcyMetadata> {
+    let url = format!("{base}/v2/plays/?limit=1");
+    let client = crate::http::client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        debug!(station = %station_name, status = %resp.status(), "kexp_api_error");
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    lire_now_playing_kexp(&body, station_name)
+}
+
+// ---------------------------------------------------------------------------
+// AzuraCast (#2486)
+// ---------------------------------------------------------------------------
+
+/// L'adresse du now-playing AzuraCast portée par la FORME d'une URL de flux.
+///
+/// `https://<hôte>/listen/<code>/<montage>` (ou `/hls/<code>/…`) est le chemin
+/// canonique de ce logiciel : le `<code>` est l'identifiant court de la
+/// station, celui que l'API attend dans `/api/nowplaying/<code>`. Il faut les
+/// TROIS segments — un `/listen/flux.mp3` à deux segments n'a pas de code, et
+/// n'est pas un AzuraCast. L'origine (schéma, hôte, port) est reprise telle
+/// quelle : l'API vit sur le même hôte que le flux.
+fn azuracast_now_playing_url(stream_url: &str) -> Option<String> {
+    let (schema, reste) = stream_url.split_once("://")?;
+    if schema != "http" && schema != "https" {
+        return None;
+    }
+    let (hote, chemin) = reste.split_once('/')?;
+    if hote.is_empty() {
+        return None;
+    }
+    let mut segments = chemin.split(['?', '#']).next()?.split('/');
+    let premier = segments.next()?;
+    if premier != "listen" && premier != "hls" {
+        return None;
+    }
+    let code = segments.next()?;
+    let montage = segments.next()?;
+    let code_valide = !code.is_empty()
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !code_valide || montage.is_empty() {
+        return None;
+    }
+    Some(format!("{schema}://{hote}/api/nowplaying/{code}"))
+}
+
+/// La pochette qu'AzuraCast publie pour le morceau en cours — et seulement
+/// celle-là.
+///
+/// `song.art` porte deux formes : l'image du morceau, servie par
+/// `/api/station/<code>/art/<id>.jpg` (mesuré le 19/09/2026 sur
+/// `online.jamminvibezradio.com`), et, quand la station n'en a pas, une image
+/// GÉNÉRIQUE du logiciel (`/static/img/generic_song.jpg` ou une
+/// `album_art.<n>.png` téléversée pour toute la station). Servir la seconde
+/// remplacerait le logo de la station — juste — par un visuel qui ne dit rien
+/// du morceau. On ne retient que le chemin `/art/`.
+fn pochette_azuracast(art: Option<&str>) -> Option<String> {
+    let url = pochette_de_stream_url(art)?;
+    let chemin = url.split_once("://")?.1.split_once('/')?.1;
+    let chemin = chemin.split(['?', '#']).next().unwrap_or(chemin);
+    chemin.contains("/art/").then_some(url)
+}
+
+/// Lire `now_playing.song` — titre, artiste, pochette. Sans titre, `None` :
+/// le champ `text` (« Artiste - Album - Titre ») n'est pas repris, il mêle
+/// trois choses que les champs structurés donnent déjà séparées.
+fn lire_now_playing_azuracast(body: &serde_json::Value, station_name: &str) -> Option<IcyMetadata> {
+    let song = body.get("now_playing")?.get("song")?;
+    let title = song.get("title").and_then(|v| v.as_str())?.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    let artist = song
+        .get("artist")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    Some(IcyMetadata {
+        title: title.to_string(),
+        artist,
+        station: Some(station_name.to_string()),
+        cover_url: pochette_azuracast(song.get("art").and_then(|v| v.as_str())),
+    })
+}
+
+/// `api_url` sort de [`azuracast_now_playing_url`] : la contre-épreuve dresse
+/// un faux hôte et passe une URL de flux qui pointe dessus.
+async fn fetch_azuracast_metadata(api_url: &str, station_name: &str) -> Option<IcyMetadata> {
+    let client = crate::http::client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .ok()?;
+
+    let resp = client.get(api_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        debug!(station = %station_name, status = %resp.status(), "azuracast_api_error");
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    lire_now_playing_azuracast(&body, station_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1796,7 +2014,13 @@ mod tests {
     /// Un faux flux : `avec_metaint` décide s'il annonce ses métadonnées.
     /// Sans l'en-tête, c'est ce que sert BBC Radio 3 (mesuré).
     async fn faux_flux(avec_metaint: bool) -> String {
-        let app = axum::Router::new().fallback(move || async move {
+        faux_distant(routeur_faux_flux(avec_metaint)).await
+    }
+
+    /// Le même faux flux, en routeur : les témoins AzuraCast le montent SOUS
+    /// une route d'API pour établir qui, de l'API ou de l'ICY, sert l'écran.
+    fn routeur_faux_flux(avec_metaint: bool) -> axum::Router {
+        axum::Router::new().fallback(move || async move {
             let mut corps: Vec<u8> = vec![0xAA; 16];
             corps.push(2); // 2 × 16 = 32 octets de bloc
             let mut bloc = b"StreamTitle='A - B';".to_vec();
@@ -1814,8 +2038,7 @@ mod tests {
                     .insert("icy-metaint", axum::http::HeaderValue::from_static("16"));
             }
             reponse
-        });
-        faux_distant(app).await
+        })
     }
 
     /// **Le rouge, tel qu'il se mesure aujourd'hui.** Un flux qui n'annonce
@@ -2487,5 +2710,290 @@ mod tests {
                 "« {nom} » doit rester sur son canal `pull` {canal}"
             );
         }
+    }
+
+    // --- KEXP (#2486) ---
+
+    /// Faux service KEXP qui rend `corps` sur la route des passages.
+    async fn faux_kexp(corps: Value) -> String {
+        let app = axum::Router::new().route(
+            "/v2/plays/",
+            axum::routing::get(move || {
+                let c = corps.clone();
+                async move { axum::Json(c) }
+            }),
+        );
+        faux_distant(app).await
+    }
+
+    /// Un passage d'antenne KEXP, à la forme mesurée le 19/09/2026.
+    fn passage_kexp(
+        play_type: &str,
+        artist: Option<&str>,
+        song: Option<&str>,
+        thumb: &str,
+    ) -> Value {
+        json!({
+            "id": 3709218,
+            "airdate": "2026-09-19T03:49:38-07:00",
+            "show": 67834,
+            "image_uri": thumb.replace("_thumb250", "_thumb500"),
+            "thumbnail_uri": thumb,
+            "song": song,
+            "artist": artist,
+            "album": "Premiers Symptômes",
+            "release_date": "1997-07-29",
+            "play_type": play_type,
+        })
+    }
+
+    const MINIATURE_KEXP: &str = "https://dn711001.ca.archive.org/0/items/mbid-a6e48744-b193-4d84-b8a5-4f5d7627e4cf/mbid-a6e48744-b193-4d84-b8a5-4f5d7627e4cf-22471663759_thumb250.jpg";
+
+    /// **Le vert.** La charge utile relevée le 19/09/2026 à 10:53 UTC sur
+    /// `api.kexp.org/v2/plays/?limit=1` : Air, « Modular Mix », miniature
+    /// `archive.org`. Titre, artiste et pochette sortent tels quels.
+    #[tokio::test]
+    async fn une_station_kexp_rend_le_morceau_en_cours_et_sa_pochette() {
+        let corps = json!({ "next": null, "previous": null, "results": [
+            passage_kexp("trackplay", Some("Air"), Some("Modular Mix"), MINIATURE_KEXP),
+        ]});
+        let base = faux_kexp(corps).await;
+        let meta = fetch_kexp_metadata(&base, "KEXP")
+            .await
+            .expect("le morceau en cours doit sortir du service");
+
+        assert_eq!(meta.title, "Modular Mix");
+        assert_eq!(meta.artist.as_deref(), Some("Air"));
+        assert_eq!(meta.station.as_deref(), Some("KEXP"));
+        assert_eq!(meta.cover_url.as_deref(), Some(MINIATURE_KEXP));
+    }
+
+    /// **L'absence propre.** Mesuré le 19/09/2026 : sur huit passages, un
+    /// `airbreak` — `song`, `artist` et `thumbnail_uri` absents ou vides. Le
+    /// morceau d'AVANT la pause ne doit pas ressusciter à l'écran.
+    #[tokio::test]
+    async fn une_pause_antenne_kexp_ne_ressuscite_pas_le_morceau_precedent() {
+        let corps = json!({ "next": null, "previous": null, "results": [
+            { "id": 3709215, "airdate": "2026-09-19T03:37:19-07:00", "show": 67834,
+              "image_uri": "", "thumbnail_uri": "", "comment": "", "play_type": "airbreak" },
+            passage_kexp("trackplay", Some("Craft Spells"), Some("Breaking the Angle Against the Tide"), MINIATURE_KEXP),
+        ]});
+        let base = faux_kexp(corps).await;
+        assert!(
+            fetch_kexp_metadata(&base, "KEXP").await.is_none(),
+            "pendant une pause antenne, rien ne joue : rien ne sort"
+        );
+    }
+
+    /// Une miniature VIDE — « Live on KEXP », mesuré — ne devient pas une
+    /// pochette vide ; le titre et l'artiste sortent quand même.
+    #[test]
+    fn une_miniature_kexp_vide_laisse_le_logo_de_la_station() {
+        let corps = json!({ "results": [
+            passage_kexp("trackplay", Some("Ladytron"), Some("Destroy Everything You Touch"), ""),
+        ]});
+        let meta = lire_now_playing_kexp(&corps, "KEXP").expect("un morceau joue");
+        assert_eq!(meta.title, "Destroy Everything You Touch");
+        assert_eq!(meta.artist.as_deref(), Some("Ladytron"));
+        assert!(meta.cover_url.is_none());
+    }
+
+    /// KEXP se reconnaît à l'hôte — le relais `streamguys1.com` du catalogue
+    /// comme le domaine propre — ou au nom pris en jeton entier. Rien d'autre.
+    #[test]
+    fn kexp_se_reconnait_a_l_hote_ou_au_nom_et_a_rien_d_autre() {
+        assert!(kexp_reconnue(
+            "KEXP",
+            "https://kexp-mp3-128.streamguys1.com/kexp128.mp3"
+        ));
+        assert!(kexp_reconnue(
+            "Radio",
+            "https://live-mp3-128.kexp.org/kexp128.mp3"
+        ));
+        assert!(kexp_reconnue(
+            "KEXP 90.3 FM",
+            "http://exemple.invalid/flux.mp3"
+        ));
+        assert!(kexp_reconnue(
+            "kexp seattle",
+            "http://exemple.invalid/flux.mp3"
+        ));
+
+        assert!(!kexp_reconnue(
+            "Kexpo Radio",
+            "http://exemple.invalid/flux.mp3"
+        ));
+        assert!(!kexp_reconnue(
+            "Radio",
+            "http://exemple.invalid/kexp128.mp3"
+        ));
+        assert!(!kexp_reconnue(
+            "Radio Paradise",
+            "http://stream.radioparadise.com/aac-128"
+        ));
+        assert!(!kexp_reconnue(
+            "FIP",
+            "https://icecast.radiofrance.fr/fip-hifi.aac"
+        ));
+        assert!(!kexp_reconnue(
+            "BBC Radio 3",
+            "http://stream.live.vc.bbcmedia.co.uk/bbc_radio_three"
+        ));
+    }
+
+    // --- AzuraCast (#2486) ---
+
+    /// La charge utile relevée le 19/09/2026 à 10:56 UTC sur
+    /// `online.jamminvibezradio.com/api/nowplaying/reggae`, réduite aux champs
+    /// que Tune lit — et à `text`, pour établir qu'il n'est PAS repris.
+    fn charge_azuracast(art: &str) -> Value {
+        json!({
+            "station": { "id": 1, "name": "Reggae Classics Mix", "shortcode": "reggae" },
+            "live": { "is_live": false, "streamer_name": "", "art": null },
+            "now_playing": {
+                "sh_id": 49352, "played_at": 1789815337, "duration": 281, "elapsed": 13,
+                "song": {
+                    "id": "bbf3f53c35284ab0c3abc1072167753a",
+                    "art": art,
+                    "text": "Joshua Kesler - Rock I Stand - Rock I Stand",
+                    "artist": "Joshua Kesler",
+                    "title": "Rock I Stand",
+                    "album": "Rock I Stand",
+                }
+            }
+        })
+    }
+
+    const POCHETTE_AZURACAST: &str = "https://online.jamminvibezradio.com/api/station/reggae/art/572f8e5324df3d43645624e4-1786762267.jpg";
+
+    /// Un faux hôte AzuraCast : l'API sur `/api/nowplaying/<code>`, et un flux
+    /// ICY partout ailleurs, qui dit « A - B ».
+    async fn faux_azuracast(code: &str, corps: Value) -> String {
+        let app = routeur_faux_flux(true).route(
+            &format!("/api/nowplaying/{code}"),
+            axum::routing::get(move || {
+                let c = corps.clone();
+                async move { axum::Json(c) }
+            }),
+        );
+        faux_distant(app).await
+    }
+
+    /// **Le témoin, par la porte publique.** Une station du catalogue —
+    /// `…/listen/reggae/live.flac` — passe par l'API de son hôte, pas par le
+    /// bloc ICY du flux : le titre est celui de l'API, pas « B ».
+    ///
+    /// Rouge avant ce correctif : rien ne reconnaissait la forme `/listen/`,
+    /// l'écran affichait le « A - B » de l'ICY, sans pochette.
+    #[tokio::test]
+    async fn une_station_azuracast_est_servie_par_l_api_de_son_hote() {
+        let base = faux_azuracast("reggae", charge_azuracast(POCHETTE_AZURACAST)).await;
+        let meta = fetch_radio_metadata(
+            "Reggae Classic Mix",
+            &format!("{base}/listen/reggae/live.flac"),
+        )
+        .await
+        .expect("le morceau en cours doit sortir de l'API");
+
+        assert_eq!(meta.title, "Rock I Stand");
+        assert_eq!(meta.artist.as_deref(), Some("Joshua Kesler"));
+        assert_eq!(meta.station.as_deref(), Some("Reggae Classic Mix"));
+        assert_eq!(meta.cover_url.as_deref(), Some(POCHETTE_AZURACAST));
+    }
+
+    /// **La forme peut mentir.** Un `/listen/x/y` dont l'hôte répond 404 à
+    /// l'API n'est pas un AzuraCast : on lit l'ICY du flux, exactement comme
+    /// avant. Aucune absence n'est fabriquée.
+    #[tokio::test]
+    async fn un_listen_qui_n_est_pas_un_azuracast_laisse_la_main_au_repli_icy() {
+        let base = faux_distant(routeur_faux_flux(true)).await; // pas d'API
+        let meta = fetch_radio_metadata("Faux Flux", &format!("{base}/listen/foo/bar.mp3"))
+            .await
+            .expect("le repli ICY sert toujours");
+        assert_eq!(meta.title, "B");
+        assert_eq!(meta.artist.as_deref(), Some("A"));
+    }
+
+    /// L'adresse de l'API se déduit de l'URL de flux — les trois stations du
+    /// catalogue livré (19/09/2026) — et de rien d'autre.
+    #[test]
+    fn l_url_de_flux_azuracast_donne_l_adresse_du_now_playing() {
+        for (flux, api) in [
+            (
+                "https://online.jamminvibezradio.com/listen/reggae/live.flac",
+                "https://online.jamminvibezradio.com/api/nowplaying/reggae",
+            ),
+            (
+                "https://online.jamminvibezradio.com/listen/oldies/live.flac",
+                "https://online.jamminvibezradio.com/api/nowplaying/oldies",
+            ),
+            (
+                "https://online.jamminvibezradio.com/listen/caribbean/live.flac",
+                "https://online.jamminvibezradio.com/api/nowplaying/caribbean",
+            ),
+            (
+                "https://online.jamminvibezradio.com/hls/reggae/live.m3u8",
+                "https://online.jamminvibezradio.com/api/nowplaying/reggae",
+            ),
+            (
+                "http://radio.exemple.invalid:8000/listen/ma_radio/stream.aac?x=1",
+                "http://radio.exemple.invalid:8000/api/nowplaying/ma_radio",
+            ),
+        ] {
+            assert_eq!(
+                azuracast_now_playing_url(flux).as_deref(),
+                Some(api),
+                "{flux}"
+            );
+        }
+
+        for flux in [
+            "https://icecast.radiofrance.fr/fip-hifi.aac",
+            "http://stream.radioparadise.com/aac-128",
+            "https://kexp-mp3-128.streamguys1.com/kexp128.mp3",
+            "http://exemple.invalid/listen/flux.mp3",
+            "http://exemple.invalid/listen//flux.mp3",
+            "http://exemple.invalid/listen/a b/flux.mp3",
+            "http://exemple.invalid/listen/reggae/",
+            "rtsp://exemple.invalid/listen/reggae/live",
+            "https://mscp3.live-streams.nl:8340/jazz-high.aac",
+        ] {
+            assert_eq!(azuracast_now_playing_url(flux), None, "{flux}");
+        }
+    }
+
+    /// L'image GÉNÉRIQUE du logiciel n'est pas une pochette : le logo de la
+    /// station — juste — reste à l'écran.
+    #[test]
+    fn une_image_generique_azuracast_n_est_pas_une_pochette() {
+        let sans = lire_now_playing_azuracast(
+            &charge_azuracast("https://online.jamminvibezradio.com/static/img/generic_song.jpg"),
+            "Reggae Classic Mix",
+        )
+        .expect("le titre sort quand même");
+        assert_eq!(sans.title, "Rock I Stand");
+        assert!(sans.cover_url.is_none());
+
+        let televersee = lire_now_playing_azuracast(
+            &charge_azuracast(
+                "https://online.jamminvibezradio.com/static/uploads/album_art.1610425816.png",
+            ),
+            "Reggae Classic Mix",
+        )
+        .expect("le titre sort quand même");
+        assert!(televersee.cover_url.is_none());
+
+        let avec =
+            lire_now_playing_azuracast(&charge_azuracast(POCHETTE_AZURACAST), "Reggae Classic Mix")
+                .expect("le titre sort");
+        assert_eq!(avec.cover_url.as_deref(), Some(POCHETTE_AZURACAST));
+    }
+
+    /// Sans `title`, rien ne sort — `text` n'est pas un titre de rechange.
+    #[test]
+    fn un_azuracast_sans_titre_ne_promeut_pas_le_champ_text() {
+        let mut corps = charge_azuracast(POCHETTE_AZURACAST);
+        corps["now_playing"]["song"]["title"] = json!("");
+        assert!(lire_now_playing_azuracast(&corps, "Reggae Classic Mix").is_none());
     }
 }

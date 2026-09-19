@@ -1,6 +1,5 @@
 #![recursion_limit = "256"]
 
-/// L'adresse de première connexion, imprimée au démarrage (#1272).
 mod adresse_d_accueil;
 pub mod auth;
 pub mod auto_resume;
@@ -11,6 +10,8 @@ pub mod background_tasks;
 pub mod bandcamp_sweep;
 pub mod boot_status;
 pub mod bootstrap;
+/// L'adresse de première connexion, imprimée au démarrage (#1272).
+pub mod catalogue_services;
 /// Pourquoi un dossier configuré est-il injoignable, et que peut y faire
 /// l'utilisateur. Voir [`chemin_inaccessible`] pour le cas Windows.
 pub mod chemin_inaccessible;

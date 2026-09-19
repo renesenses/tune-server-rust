@@ -180,10 +180,11 @@ impl<'a> EtageNatif<'a> {
     /// aligné (`prepare_windows_native_pcm` : sonde DoP, volume, DSP, mot
     /// natif), pousser.
     ///
-    /// C'est `feed_windows_native_exclusive_leftover` de `local.rs`, avec les
-    /// quatre variables d'état du bras à l'intérieur du type. Même ordre :
-    /// préparation, puis `must_classify_24_bit = false` et `dop_latched`,
-    /// puis poussée, puis `drain` de l'attente.
+    /// C'était `feed_windows_native_exclusive_leftover` de `local.rs` (retiré
+    /// par REF-10, #2219), avec les quatre variables d'état du bras à
+    /// l'intérieur du type. Même ordre : préparation, puis
+    /// `must_classify_24_bit = false` et `dop_latched`, puis poussée, puis
+    /// `drain` de l'attente.
     pub(super) fn decoder_et_pousser(
         &mut self,
         octets: &[u8],
@@ -399,12 +400,10 @@ impl PuitsNatif for PuitsAnneauNatif<'_> {
 /// Pousse `samples` dans l'anneau en attendant qu'il se libère ; rend `true`
 /// sur arrêt demandé, `false` après cinq secondes sans qu'un mot ne parte.
 ///
-/// C'est `feed_native_ring_abortable` de `local.rs`, mot pour mot — le même
-/// nom d'événement, `windows_native_feed_ring_stall_timeout`. L'original est
-/// `cfg(target_os = "windows")` seul et ne peut donc pas être appelé par un
-/// puits jugé sur Shrek ; il garde un appelant, le bras ASIO. Quand ASIO
-/// passera par [`PuitsAnneauNatif`], il perdra son dernier appelant et
-/// disparaîtra — un seul exemplaire, ici.
+/// C'était `feed_native_ring_abortable` de `local.rs`, mot pour mot — le même
+/// nom d'événement, `windows_native_feed_ring_stall_timeout`. ASIO passe
+/// désormais par [`PuitsAnneauNatif`] : l'original a perdu son dernier
+/// appelant et REF-10 (#2219) l'a retiré — un seul exemplaire, ici.
 fn pousser_dans_l_anneau_natif(
     ring: &NativePcmRing,
     samples: &[i32],

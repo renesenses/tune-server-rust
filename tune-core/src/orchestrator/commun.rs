@@ -160,6 +160,18 @@ impl PlaybackOrchestrator {
     }
 
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
+        // #4407 — le traitement lu AVANT la résolution : si un réglage change
+        // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
+        // prochain changement relancera. Jamais l'inverse.
+        let empreinte = self.empreinte_du_traitement(req.zone_id, req.track_id);
+        let resolu = self.resolve_stream_sans_noter(req).await?;
+        if let Some(ref sid) = resolu.stream_id {
+            self.noter_traitement_du_flux(req.zone_id, sid, empreinte);
+        }
+        Ok(resolu)
+    }
+
+    async fn resolve_stream_sans_noter(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         if let Some(ref source) = req.source
             && source != "local"
         {

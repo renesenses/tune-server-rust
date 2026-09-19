@@ -313,6 +313,7 @@ async fn le_decodeur_de_production_refuse_le_hls_avant_tout_appel_reseau() {
             session,
             None,
             None,
+            false,
         )
     })
     .await
@@ -2765,6 +2766,72 @@ async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
     assert_eq!(history[0].context_position, Some(1));
 }
 
+/// #4446 — la pochette du `NowPlaying` d'une avance gapless doit être de la
+/// MÊME nature que celle d'un démarrage : le condensat de la bibliothèque,
+/// tel quel. Le démarrage (`transport.rs`, `habillage.cover_path`) pose le
+/// condensat ; l'avance le passait par `resolve_cover_url`, qui fabrique
+/// `http://<ip-lan>:8888/api/v1/library/artwork/<condensat>`. Le client web
+/// tient toute URL absolue pour une pochette DISTANTE et la fait passer par
+/// le relais, dont la garde d'adresse (#4260) refuse le LAN :
+/// `artwork_proxy_hote_refuse` ×4 chez Sevy Tabroc, pochette grise dès le
+/// deuxième morceau chez JeromeQ. Les renderers réseau, eux, reçoivent leur
+/// URL absolue par `PlayRequest.cover_url` → `resolve_cover_url`, comme au
+/// démarrage : rien ne leur manque.
+#[tokio::test]
+async fn avance_gapless_garde_le_condensat_de_pochette() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 4446", Some("local"), None)
+        .unwrap();
+
+    let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let mut ids = Vec::new();
+    for n in 1..=2 {
+        let mut piste = crate::db::models::Track::new(format!("Pochette {n}"));
+        piste.file_path = Some(format!("/aucun/chemin/4446/piste{n}.m4a"));
+        piste.track_number = n;
+        piste.duration_ms = 180_000;
+        piste.cover_path = Some("c9b9f3adf2a78c5e".into());
+        ids.push(pistes.create(&piste).unwrap());
+    }
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &ids)
+        .unwrap();
+
+    orch.playback
+        .play(
+            zone_id,
+            NowPlaying {
+                track_id: Some(ids[0]),
+                title: "Pochette 1".into(),
+                cover_path: Some("c9b9f3adf2a78c5e".into()),
+                duration_ms: 180_000,
+                source: "local".into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    orch.playback.update_queue_info(zone_id, 0, 2).await;
+
+    orch.advance_queue_metadata(zone_id, 1)
+        .await
+        .expect("l'avance gapless doit aboutir");
+
+    let np = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .expect("une piste en cours après l'avance");
+    assert_eq!(np.title, "Pochette 2");
+    assert_eq!(
+        np.cover_path.as_deref(),
+        Some("c9b9f3adf2a78c5e"),
+        "après une avance gapless la pochette doit rester le condensat, \
+         comme au démarrage — pas une URL absolue vers l'adresse LAN (#4446)"
+    );
+}
+
 // ------------------------------------------------------------------
 // #1541 — VU-mètres après une avance gapless, DSD local compris.
 // ------------------------------------------------------------------
@@ -4970,6 +5037,23 @@ fn timeout_marker_survives_the_send_to_output_wrapper() {
         super::command_may_have_landed(&err),
         "le marqueur doit être reconnu même enveloppé"
     );
+}
+
+/// #3580 — un `Play` ACQUITTÉ dont l'URI reste vide : la commande a été reçue,
+/// seul son effet manque. Même décision que le timeout ; un REFUS reste concluant.
+#[test]
+fn un_play_acquitte_sans_effet_peut_avoir_atteint_le_renderer() {
+    let err = format!(
+        "Output device error: {} après 30 s (ni CurrentURI ni TrackURI) : il ne joue pas autre chose",
+        crate::outputs::dlna::URI_RESTEE_VIDE_PREFIX
+    );
+    assert!(
+        super::command_may_have_landed(&err),
+        "acquitté = reçu ; détruire le flux garantit le 404 à l'ampli qui se réveille"
+    );
+    assert!(!super::command_may_have_landed(
+        "Output device error: Le renderer a REFUSÉ le Play de la relance (701 « Transition not available »)"
+    ));
 }
 
 /// Sortie dont `play_media` expire — le renderer lent qui reçoit peut-être la
@@ -8196,5 +8280,456 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     assert_eq!(
         titre_historise, "Quartet No. 10",
         "« Récemment joué » ne doit plus aligner des cartes « Episode »"
+    );
+}
+
+/// #4311 — Bandcamp sur la SORTIE LOCALE : spectre et bargraphe inertes
+/// (GgB, 0.9.153, « HDA Intel PCH, ALC269VC Analog »). Le bras local rendait
+/// l'URL amont telle quelle sans lancer aucune sonde : aucun
+/// `playback.audio_levels` ne partait pour la zone. Le flux est un serveur
+/// WAV local one-shot ; l'URL n'a pas de marqueur de qualité Bandcamp, donc
+/// l'indice de codec est le repli `mp3` — le sondeur reconnaît le conteneur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bandcamp_en_sortie_locale_emet_des_niveaux() {
+    let url = spawn_oneshot_wav_server(3);
+    let mut orch = test_orchestrator();
+    let bus = Arc::new(EventBus::new());
+    orch.event_bus = Some(bus.clone());
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Zone 4311", Some("local"), None)
+        .unwrap();
+    orch.playback
+        .play(zone_id, crate::playback::NowPlaying::default())
+        .await;
+    let mut rx = bus.subscribe();
+
+    let req = super::PlayRequest {
+        zone_id,
+        output_device_id: None,
+        track_id: None,
+        source: Some("bandcamp".into()),
+        source_id: Some(url.clone()),
+        title: Some("Move (You Make Me Feel)".into()),
+        artist_name: Some("Framewerk".into()),
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(3_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: Some("mp3".into()),
+        track_number: None,
+        disc_number: None,
+    };
+    let resolved = orch.resolve_stream(&req).await.unwrap();
+    assert_eq!(
+        resolved.url, url,
+        "sortie locale : l'URL amont reste servie telle quelle, la sonde n'est qu'un observateur"
+    );
+    assert!(
+        resolved.stream_id.is_none(),
+        "aucune session proxy sur ce bras"
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let restant = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !restant.is_zero(),
+            "aucun playback.audio_levels pour la zone {zone_id} en 5 s : la sortie locale Bandcamp ne mesure rien"
+        );
+        match tokio::time::timeout(restant, rx.recv()).await {
+            Ok(Ok(ev))
+                if ev.event_type == "playback.audio_levels"
+                    && ev.data["zone_id"].as_i64() == Some(zone_id) =>
+            {
+                assert_eq!(ev.data["observation_point"], "decoded_source");
+                assert!(
+                    ev.data["spectrum"]
+                        .as_array()
+                        .is_some_and(|v| !v.is_empty()),
+                    "spectre vide"
+                );
+                break;
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => continue,
+            Err(_) => panic!("aucun playback.audio_levels pour la zone {zone_id} en 5 s"),
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// #4407 — un changement d'égaliseur ne refabrique le flux réseau que si
+// le flux qui JOUE ne porte pas déjà ce traitement.
+// ------------------------------------------------------------------
+
+fn relances_programmees_4407(orch: &PlaybackOrchestrator, zone_id: i64) -> u64 {
+    orch.eq_replay_gen
+        .lock()
+        .unwrap()
+        .get(&zone_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn ecrire_profil_4407(
+    orch: &PlaybackOrchestrator,
+    zone_id: i64,
+    profil: &crate::audio::eq::EqProfile,
+) {
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_eq_profile"),
+            &serde_json::to_string(profil).unwrap(),
+        )
+        .unwrap();
+    settings.set("plugin_equalizer_installed", "true").unwrap();
+}
+
+fn profil_audible_4407(gain: f64) -> crate::audio::eq::EqProfile {
+    crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: vec![crate::audio::eq::EqBandSpec {
+            freq: 80.0,
+            gain,
+            q: 0.71,
+            band_type: "low_shelf".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// Zone DLNA dont le flux a été servi par le VRAI chemin de lecture
+/// (`replay_zone_at_position` → `play` → `resolve_stream`), position mesurée.
+async fn zone_dlna_servie_4407(
+    device_id: &str,
+) -> (Arc<PlaybackOrchestrator>, i64, tempfile::TempDir) {
+    let (orch, zone_id, dir) = zone_qui_joue_un_flac(Some("dlna"), Some(device_id)).await;
+    let orch = Arc::new(orch);
+    orch.playback.update_position(zone_id, 29_000).await;
+    orch.replay_zone_at_position(zone_id, 29_000, "temoin_4407")
+        .await
+        .expect("le flux de départ doit partir vers le renderer");
+    assert!(
+        orch.playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id)
+            .is_some(),
+        "point de départ : la zone joue un flux identifié"
+    );
+    (orch, zone_id, dir)
+}
+
+/// LE défaut de Jean Valjean (#4407, Marantz ND8006, fil 1771) : un profil
+/// d'égaliseur ACTIVÉ mais sans effet (`bandes=0`, gains nuls) est écrit ;
+/// le flux qui joue ne porte aucun traitement et n'en porterait pas
+/// davantage après — et le serveur le refabriquait quand même (2,787 s de
+/// silence par geste sur une radio).
+///
+/// Sur le code d'avant : `apply_eq_change` rend `false`, une relance est
+/// programmée et le renderer reçoit un nouveau `SetAVTransportURI` + `Play`.
+#[tokio::test]
+async fn egaliseur_sans_effet_sur_dlna_ne_refabrique_pas_le_flux_4407() {
+    let device_id = "dlna:uuid-56fcb4ae-4407";
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407(device_id).await;
+    let (play_avant, stop_avant) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    let generation_avant = orch.playback.get_state(zone_id).await.track_generation;
+
+    ecrire_profil_4407(
+        &orch,
+        zone_id,
+        &crate::audio::eq::EqProfile {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !orch.zone_has_active_eq(zone_id),
+        "prémisse : ce profil activé n'a aucun effet sur le signal"
+    );
+    assert!(
+        orch.apply_eq_change(zone_id).await,
+        "le flux porte déjà ce (non-)traitement : le son est conforme, immédiatement"
+    );
+    assert_eq!(
+        relances_programmees_4407(&orch, zone_id),
+        0,
+        "aucune relance ne doit être programmée quand le flux servi ne changerait pas"
+    );
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await,
+        (play_avant, stop_avant),
+        "zéro SetAVTransportURI/Play, zéro Stop : le flux n'est pas refabriqué (#4407)"
+    );
+    assert_eq!(
+        orch.playback.get_state(zone_id).await.track_generation,
+        generation_avant,
+        "la lecture continue sur le même flux, sans coupure"
+    );
+}
+
+/// Les contre-épreuves de la garde, bout à bout sur le même flux :
+/// - un égaliseur qui CHANGE le signal relance, comme avant ;
+/// - renvoyer le profil que le flux porte désormais ne relance plus ;
+/// - l'objection de JP Robbe : une relance ABANDONNÉE au plancher laisse
+///   l'ancien traitement dans le flux — renvoyer le même nouveau profil
+///   doit alors relancer encore, alors qu'il est déjà en base ;
+/// - éteindre l'égaliseur que le flux porte (actif → inactif) relance.
+#[tokio::test]
+async fn la_garde_4407_relance_tout_ce_qui_change_le_flux_servi() {
+    let device_id = "dlna:uuid-4407-contre-epreuve";
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407(device_id).await;
+
+    // 1. Activer un égaliseur audible : le flux doit le recevoir.
+    ecrire_profil_4407(&orch, zone_id, &profil_audible_4407(8.0));
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 1);
+    let (play_1, _) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    laisser_passer_l_anti_rebond().await;
+    let (play_2, _) = commandes_recues_par_le_renderer(&orch, device_id).await;
+    assert_eq!(
+        play_2,
+        play_1 + 1,
+        "le flux est refabriqué avec l'égaliseur"
+    );
+
+    // 2. Le même profil, renvoyé : le flux le porte déjà.
+    assert!(orch.apply_eq_change(zone_id).await);
+    assert_eq!(
+        relances_programmees_4407(&orch, zone_id),
+        1,
+        "le flux servi porte déjà ce profil : pas de relance"
+    );
+
+    // 3. Un autre profil, dans le plancher de 5 s : relance programmée puis
+    //    abandonnée. Le flux qui joue garde l'ancien traitement.
+    let flux_avant = orch
+        .playback
+        .get_state(zone_id)
+        .await
+        .now_playing
+        .and_then(|np| np.stream_id);
+    ecrire_profil_4407(&orch, zone_id, &profil_audible_4407(-3.0));
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 2);
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        commandes_recues_par_le_renderer(&orch, device_id).await.0,
+        play_2,
+        "prémisse : la relance a été abandonnée au plancher"
+    );
+    assert_eq!(
+        orch.playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id),
+        flux_avant
+    );
+    // Le même profil (-3 dB), déjà en base, renvoyé : le flux porte +8 dB.
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(
+        relances_programmees_4407(&orch, zone_id),
+        3,
+        "le flux servi porte encore l'ancien traitement : il faut relancer"
+    );
+
+    // 4. Éteindre l'égaliseur que le flux porte : retirer le traitement du
+    //    flux exige de le refabriquer.
+    let mut eteint = profil_audible_4407(-3.0);
+    eteint.enabled = false;
+    ecrire_profil_4407(&orch, zone_id, &eteint);
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 4);
+}
+
+/// Flux inconnu (état posé sans passer par la résolution : serveur relancé,
+/// URL directe) : on relance, comme avant #4407.
+#[tokio::test]
+async fn sans_flux_connu_le_changement_d_egaliseur_relance_comme_avant_4407() {
+    let (orch, zone_id, _dir) =
+        zone_qui_joue_un_flac(Some("dlna"), Some("dlna:uuid-4407-inconnu")).await;
+    let orch = Arc::new(orch);
+    orch.playback.update_position(zone_id, 29_000).await;
+    ecrire_profil_4407(
+        &orch,
+        zone_id,
+        &crate::audio::eq::EqProfile {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    assert!(!orch.apply_eq_change(zone_id).await);
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 1);
+}
+
+// ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
+
+/// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision
+/// se prend sur la ligne `tracks`, comme pour `piste_3234`).
+fn piste_192k_3973(orch: &PlaybackOrchestrator) {
+    orch.db
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (1, 'Piste 192k', 1, 1, '/m/3973/piste.flac', 'flac', 300000, 192000, 24, 2)",
+            &[],
+        )
+        .unwrap();
+}
+
+/// Site « plafond de zone » (`decider_le_format_de_sortie`) : 192 kHz sur une
+/// zone plafonnée à 96 kHz. Par défaut, plafonné — la conversion est jouée ;
+/// en bit-perfect strict, la résolution REFUSE avec la sentinelle qui nomme
+/// les deux fréquences, au lieu de transcoder vers le plafond.
+#[tokio::test]
+async fn plafond_de_zone_3973_strict_refuse_au_lieu_de_plafonner() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("DAC 96k", Some("dlna"), Some("uuid:dac-3973"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(96_000)).unwrap();
+    piste_192k_3973(&orch);
+    let req = requete_locale_3234(zone_id, 1);
+
+    let defaut = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(defaut.out_sr, 96_000, "sans strict : plafonné, comme avant");
+
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    let refus = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .map(|f| f.out_sr);
+    assert_eq!(
+        refus,
+        Err("bitperfect_strict_refused:192000:96000".to_string()),
+        "bit-perfect strict : la zone plafonnée doit refuser le 192 kHz, pas le transcoder en 96 kHz"
+    );
+}
+
+/// Site « plafond de zone », bras DoP (`anticiper_le_dop`) : un DSD64 servi en
+/// DoP demande 176,4 kHz ; zone locale plafonnée à 88,2 kHz. Par défaut le DoP
+/// est abandonné pour du PCM plafonné ; en strict, refus nommé.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn dop_au_dela_du_plafond_3973_strict_refuse() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("DAC DoP", Some("local"), Some("local:dac-3973"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(88_200)).unwrap();
+    zones.update_dsd_mode(zone_id, "dop").unwrap();
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dsd/ref_dsd64_stereo.dsf"
+    );
+    orch.db
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'Artiste')", &[])
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    orch.db
+        .execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
+             duration_ms, sample_rate, bit_depth, channels) \
+             VALUES (1, 'DSD64', 1, 1, ?, 'dsf', 1000, 2822400, 1, 2)",
+            &[&chemin.to_string() as &dyn crate::db::backend::ToSqlValue],
+        )
+        .unwrap();
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some("local:dac-3973".into());
+
+    let defaut = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .map(|f| f.out_sr);
+    assert!(
+        !matches!(&defaut, Err(e) if e.contains("bitperfect_strict_refused")),
+        "sans strict, aucun refus : {defaut:?}"
+    );
+
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    let refus = orch
+        .format_de_sortie_pour_test(&req)
+        .await
+        .map(|f| f.out_sr);
+    assert_eq!(
+        refus,
+        Err("bitperfect_strict_refused:176400:88200".to_string()),
+        "bit-perfect strict : le DoP 176,4 kHz au-delà du plafond doit être refusé, pas converti en PCM"
+    );
+}
+
+/// Site « plafond de zone », chemin des services (`decider_le_wav_de_sortie`,
+/// Qobuz/Tidal) : le même plafond, la même règle.
+#[tokio::test]
+async fn plafond_de_zone_des_services_3973_strict_refuse() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("OAAT 96k", Some("oaat"), Some("oaat:3973"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(96_000)).unwrap();
+    let flux = crate::streaming::StreamUrl {
+        url: "https://exemple.invalid/piste.flac".into(),
+        mime_type: "audio/flac".into(),
+        quality: crate::streaming::StreamQuality {
+            codec: "flac".into(),
+            sample_rate: 192_000,
+            bit_depth: 24,
+            bitrate: None,
+            channels: 2,
+        },
+        expires_at: None,
+        headers: Vec::new(),
+    };
+    let req = requete_locale_3234(zone_id, 1);
+    let (sr, _, _) = orch
+        .decider_le_wav_de_sortie(&req, &flux, false)
+        .expect("sans strict : plafonné");
+    assert_eq!(sr, 96_000);
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    assert_eq!(
+        orch.decider_le_wav_de_sortie(&req, &flux, false)
+            .map(|(sr, _, _)| sr),
+        Err("bitperfect_strict_refused:192000:96000".to_string()),
+        "bit-perfect strict : le flux 192 kHz ne doit pas être plafonné en silence"
     );
 }

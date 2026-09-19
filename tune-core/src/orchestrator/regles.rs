@@ -255,14 +255,20 @@ pub(super) async fn probe_local_duration_ms(
 ///
 /// Un timeout SOAP (voir [`crate::outputs::dlna::SOAP_TIMEOUT_PREFIX`]) ne prouve
 /// rien : la requête a pu atteindre un renderer lent et être honorée, seule la
-/// réponse a manqué. Un refus de connexion, lui, est concluant — rien n'est
-/// parti. Ce prédicat décide si l'on conserve la session de flux.
+/// réponse a manqué. Un `Play` ACQUITTÉ dont l'URI reste vide
+/// ([`crate::outputs::dlna::URI_RESTEE_VIDE_PREFIX`], #3580) ne prouve pas
+/// davantage : `SetAVTransportURI` et `Play` ont répondu `200`, la commande a
+/// été reçue, seul son effet manque encore — un ampli qui finit de sortir de
+/// veille viendra peut-être chercher le flux après la borne d'attente. Un
+/// refus de connexion, lui, est concluant — rien n'est parti ; un `Play`
+/// REFUSÉ (701) aussi. Ce prédicat décide si l'on conserve la session de flux.
 pub(crate) fn command_may_have_landed(err: &str) -> bool {
     // `contains` et non `starts_with` : send_to_output enveloppe l'erreur de la
     // sortie dans « Output device error: {e} », le marqueur n'est donc jamais en
     // tête. Un test couvre précisément ce chemin — s'y fier plutôt qu'à la forme
     // supposée de la chaîne.
     err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
+        || err.contains(crate::outputs::dlna::URI_RESTEE_VIDE_PREFIX)
 }
 
 /// Le flux qui part sur le fil est-il du DSD BRUT ?
