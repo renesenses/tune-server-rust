@@ -2700,50 +2700,106 @@ fn native_windows_preparation_marks_processed_pcm_as_not_bitperfect() {
     assert!(!prepared.dop);
     assert!(!prepared.bit_perfect);
 }
+/// REF-10 (#2219) : la route flottante des sorties Windows exclusives (ASIO
+/// `Processed*`), telle que `bras_asio.rs` la monte depuis REF-8 — l'étage de
+/// R1 au format source, la frontière PCM commune (`LocalPcmProcessor`), et la
+/// fermeture qui refuse tout porteur DoP. Ces témoins appelaient
+/// `prepare_windows_exclusive_pcm`, la préparation d'AVANT, que la
+/// compilation Windows (avec et sans `asio`) déclarait morte et que REF-10 a
+/// retirée ; ils gardent la même propriété sur la route qui part au pilote.
+struct DspDeLaRouteFlottanteWindows {
+    eq: std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: AtomicBool,
+    mono_downmix: AtomicBool,
+    dop_active: AtomicBool,
+    volume: AtomicU32,
+    user_volume: AtomicU32,
+    rg_factor: AtomicU32,
+}
+
+impl DspDeLaRouteFlottanteWindows {
+    fn avec_eq(eq: Option<crate::audio::eq::EqProcessor>) -> Self {
+        Self {
+            eq: std::sync::Mutex::new(eq),
+            convolver: std::sync::Mutex::new(None),
+            crossfeed: std::sync::Mutex::new(None),
+            pure_bypass: AtomicBool::new(false),
+            mono_downmix: AtomicBool::new(false),
+            dop_active: AtomicBool::new(false),
+            volume: AtomicU32::new(1000),
+            user_volume: AtomicU32::new(1000),
+            rg_factor: AtomicU32::new(1000),
+        }
+    }
+
+    /// Stéréo 44,1 kHz, ouvert au format source : pas de rééchantillonnage,
+    /// comme la route traitée d'ASIO.
+    fn etage(&self, octets: Vec<u8>, bit_depth: u16) -> EtageDeConversion<'_> {
+        let spec = crate::outputs::traits::AudioSpec::depuis_entete(44_100, bit_depth, 2)
+            .expect("stéréo 44,1 kHz");
+        EtageDeConversion {
+            pcm: LocalPcmProcessor {
+                eq: &self.eq,
+                convolver: &self.convolver,
+                crossfeed: &self.crossfeed,
+                pure_bypass: &self.pure_bypass,
+                mono_downmix: &self.mono_downmix,
+                dop_active: &self.dop_active,
+                volume: &self.volume,
+                user_volume: &self.user_volume,
+                rg_factor: &self.rg_factor,
+            },
+            en_attente: octets,
+            resampler: None,
+            resample_leftover: Vec::new(),
+            pcm_kind: LocalPcmKind::for_bit_depth(bit_depth),
+            spec,
+            sortie: crate::outputs::traits::FormatOuvert::new(44_100, 2),
+            needs_resample: false,
+        }
+    }
+}
+
+/// Un puits qui garde les `f32` qu'il reçoit : ce que l'anneau flottant
+/// rendrait au rappel ASIO.
+struct PuitsMemoireWindows(Vec<f32>);
+
+impl crate::outputs::traits::PuitsDEchantillons for PuitsMemoireWindows {
+    fn ecrire(&mut self, mots: &[f32]) -> bool {
+        self.0.extend_from_slice(mots);
+        true
+    }
+}
+
 #[test]
 fn windows_float_exclusive_rejects_dop_before_the_ring() {
     let fixture = versioned_dop_fixture();
-    let eq = std::sync::Mutex::new(Some(test_eq()));
-    let convolver = std::sync::Mutex::new(None);
-    let crossfeed = std::sync::Mutex::new(None);
-    let pure = AtomicBool::new(false);
-    let ring = RingBuf::new(4096);
+    let dsp = DspDeLaRouteFlottanteWindows::avec_eq(Some(test_eq()));
 
     // 31 frames do not prove either PCM or DoP: they stay in the raw-byte
     // quarantine and absolutely nothing reaches the f32 ring.
     let first_31_frames = 31 * 2 * 3;
-    let pending = prepare_windows_exclusive_pcm(
-        &fixture[..first_31_frames],
-        24,
-        2,
-        true,
-        &eq,
-        &convolver,
-        &crossfeed,
-        &pure,
-        &AtomicBool::new(false),
-    );
-    assert!(matches!(pending, Ok(None)));
-    assert_eq!(ring.available(), 0);
+    let mut etage = dsp.etage(fixture[..first_31_frames].to_vec(), 24);
+    let mut puits = PuitsMemoireWindows(Vec::new());
+    assert!(matches!(
+        etage.pousser(&mut puits, &mut |dop, _, _| dop, &mut |_| {}),
+        PousseeVersLePuits::RienAPousser
+    ));
+    assert!(etage.pcm_kind.is_awaiting_probe());
+    assert_eq!(etage.en_attente.len(), first_31_frames);
+    assert!(puits.0.is_empty());
 
     // Once the byte window is conclusive, rejection happens at the last
     // preparation boundary — still before conversion, DSP and ring feed.
-    let rejected = prepare_windows_exclusive_pcm(
-        &fixture,
-        24,
-        2,
-        true,
-        &eq,
-        &convolver,
-        &crossfeed,
-        &pure,
-        &AtomicBool::new(false),
-    );
+    let mut etage = dsp.etage(fixture, 24);
+    let mut puits = PuitsMemoireWindows(Vec::new());
     assert!(matches!(
-        rejected,
-        Err(WindowsExclusivePcmError::DopUnsupported)
+        etage.pousser(&mut puits, &mut |dop, _, _| dop, &mut |_| {}),
+        PousseeVersLePuits::PorteurDopRefuse
     ));
-    assert_eq!(ring.available(), 0);
+    assert!(puits.0.is_empty());
 }
 
 #[test]
@@ -2784,29 +2840,18 @@ fn windows_float_exclusive_applies_pcm_dsp_before_the_ring() {
         }
     }
     let before = pcm_bytes_to_f32(&pcm, 24);
-    let eq = std::sync::Mutex::new(Some(test_eq()));
-    let convolver = std::sync::Mutex::new(None);
-    let crossfeed = std::sync::Mutex::new(None);
-    let pure = AtomicBool::new(false);
+    let dsp = DspDeLaRouteFlottanteWindows::avec_eq(Some(test_eq()));
+    let mut etage = dsp.etage(pcm, 24);
+    let mut puits = PuitsMemoireWindows(Vec::new());
 
-    let prepared = prepare_windows_exclusive_pcm(
-        &pcm,
-        24,
-        2,
-        true,
-        &eq,
-        &convolver,
-        &crossfeed,
-        &pure,
-        &AtomicBool::new(false),
-    )
-    .expect("PCM ordinaire accepté")
-    .expect("fenêtre de détection complète");
-
-    let ring = RingBuf::new(prepared.len());
-    assert_eq!(ring.push(&prepared), prepared.len());
-    let mut observed_at_backend_boundary = vec![0.0; prepared.len()];
-    assert_eq!(ring.pop(&mut observed_at_backend_boundary), prepared.len());
+    assert!(matches!(
+        etage.pousser(&mut puits, &mut |dop, _, _| dop, &mut |_| {}),
+        PousseeVersLePuits::Poussee {
+            trames_source: 4096
+        }
+    ));
+    let observed_at_backend_boundary = puits.0;
+    assert_eq!(observed_at_backend_boundary.len(), before.len());
 
     let before_rms = rms(&before[1024..]);
     let after_rms = rms(&observed_at_backend_boundary[1024..]);
@@ -2816,7 +2861,6 @@ fn windows_float_exclusive_applies_pcm_dsp_before_the_ring() {
         "le PCM WASAPI/ASIO exclusif doit traverser l'EQ avant le ring ; mesuré {delta_db:.1} dB"
     );
 }
-
 #[test]
 fn dop_is_recognised_on_real_encoder_output() {
     for ch in [2usize, 1, 6] {
