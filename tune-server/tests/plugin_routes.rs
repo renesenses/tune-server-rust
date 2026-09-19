@@ -21,7 +21,14 @@ use tune_server::state::AppState;
 const SECRET: &str = "test-jwt-secret";
 
 fn new_state() -> AppState {
-    AppState::new(":memory:", 0, Default::default()).unwrap()
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // L'égaliseur est un greffon facultatif (v0.9.156) : ces témoins comptent
+    // sur lui comme greffon SDK chargé, donc ils l'installent comme la route
+    // `POST /plugins/equalizer/install` le ferait.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
+    state
 }
 
 /// A plugin router with a plain route and one whose path deliberately collides

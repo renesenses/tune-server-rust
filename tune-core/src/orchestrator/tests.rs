@@ -1105,6 +1105,11 @@ async fn une_piste_aiff_transcodee_pour_un_renderer_est_servie_en_flac_annonce_f
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
         .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
+        .unwrap();
     piste_3234(&orch, "/m/cyrille/01 - Morceau.aiff", "aiff");
     let req = requete_locale_3234(zone_id, 1);
     let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
@@ -1358,6 +1363,11 @@ async fn une_zone_dlna_avec_egaliseur_part_en_wav_progressif_sur_opt_in() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
     let req = requete_locale_3234(zone_id, 1);
 
@@ -1647,6 +1657,11 @@ async fn une_zone_locale_avec_egaliseur_ne_traite_pas_deux_fois() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
     let mut req = requete_locale_3234(zone_id, 1);
     req.output_device_id = Some("local:Realtek HD".into());
@@ -3660,12 +3675,17 @@ fn armer_un_egaliseur_audible(orch: &PlaybackOrchestrator, zone_id: i64) {
         }],
         ..Default::default()
     };
-    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
         .set(
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&profil).unwrap(),
         )
         .unwrap();
+    // L'égaliseur est un greffon facultatif (v0.9.156) : un profil ne suffit
+    // plus, il faut l'avoir installé — ce que fait ici la clé que pose la route
+    // `POST /plugins/equalizer/install`.
+    settings.set("plugin_equalizer_installed", "true").unwrap();
 }
 
 #[cfg(feature = "local-audio")]
@@ -6979,6 +6999,11 @@ async fn browser_radio_with_eq_is_forced_through_the_wav_session() {
             &format!("zone_{zone_id}_eq_profile"),
             &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
         )
+        .unwrap();
+    // Greffon facultatif (v0.9.156) : un profil ne suffit plus, il faut l'avoir
+    // installé — la clé que pose `POST /plugins/equalizer/install`.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set("plugin_equalizer_installed", "true")
         .unwrap();
     let source = "http://127.0.0.1:9/station.mp3";
     let req = super::PlayRequest {
