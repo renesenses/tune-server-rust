@@ -1087,6 +1087,37 @@ fn rendre_les_verdicts(
 /// Le transport par type de sortie : bit-perfect ou non, son libellé, le
 /// format réellement émis. Quatrième bloc de `build_signal_path`, le `match`
 /// sorti tel quel (REF-4 phase 2, #2219). Rend le triplet que l'hôte liait.
+/// #4172 — le nom du transport d'une sortie locale, mode compris.
+///
+/// `exclusif_observe` : un contrat de signal a été publié par le bras exclusif
+/// (`publish_windows_signal_path_status`). Sans lui, un transport WASAPI est
+/// le mode partagé, et on le NOMME : c'est la seule ligne du panneau qui dise
+/// à l'auditeur que « Mode Audiophile » n'a pas pris le périphérique — le
+/// réglage qui le prend s'appelle « Exclusif (bit-perfect) », ailleurs.
+pub(super) fn etiquette_du_transport_local<'a>(
+    audio_backend: &'a str,
+    exclusif_observe: bool,
+) -> &'a str {
+    match audio_backend {
+        "ASIO" => "ASIO (exclusive)",
+        "WASAPI" if exclusif_observe => "WASAPI (exclusive)",
+        "WASAPI" => "WASAPI (shared \u{2014} Windows mixer)",
+        "CoreAudio" => "CoreAudio",
+        "ALSA" => "ALSA",
+        other => other,
+    }
+}
+
+/// #4172 — sans contrat de signal, le transport local est-il intact ?
+///
+/// WASAPI : non — le mode partagé passe par le mixeur Windows (flottant,
+/// volume de session, mélange, cadence du mixeur). CoreAudio et ALSA sans
+/// contrat : inchangé, `true` — ces chemins n'ont pas de mixeur imposé de la
+/// même façon et rien de mesuré ne dit le contraire.
+pub(super) fn transport_partage_est_intact(audio_backend: &str) -> bool {
+    audio_backend != "WASAPI"
+}
+
 fn decrire_le_transport<'a>(
     output_type: &'a str,
     audio_backend: &'a str,
@@ -1203,21 +1234,21 @@ fn decrire_le_transport<'a>(
         }
         "browser" => (true, "Browser", format_name),
         "local" => {
-            // Show the actual audio backend (ASIO / WASAPI / CoreAudio / ALSA)
-            let transport = match audio_backend {
-                "ASIO" => "ASIO (exclusive)",
-                "WASAPI" => "WASAPI",
-                "CoreAudio" => "CoreAudio",
-                "ALSA" => "ALSA",
-                other => other,
+            // #4172 — le contrat de signal (`runtime_signal_path`) n'est
+            // publié QUE par les bras exclusifs (WASAPI exclusif, ASIO). Un
+            // transport « WASAPI » sans contrat, c'est le mode partagé : le
+            // mixeur Windows convertit en flottant, applique le volume de
+            // session, mélange et reconvertit à SA cadence — l'ampli de
+            // william restait à 44,1 kHz quelle que soit la source, et le
+            // panneau disait « WASAPI », bit-perfect. Il dit désormais le
+            // mode, et le verdict qui va avec.
+            let exclusif_observe = runtime_signal_path.is_some();
+            let transport = etiquette_du_transport_local(audio_backend, exclusif_observe);
+            let intact = match runtime_signal_path {
+                Some(status) => runtime_transport_is_intact(status),
+                None => transport_partage_est_intact(audio_backend),
             };
-            (
-                runtime_signal_path
-                    .map(runtime_transport_is_intact)
-                    .unwrap_or(true),
-                transport,
-                format_name,
-            )
+            (intact, transport, format_name)
         }
         // Tout le reste est une sortie PULL : elle va CHERCHER le flux
         // elle-même et reçoit nos octets TELS QUELS — `hqplayer`, `diretta`,

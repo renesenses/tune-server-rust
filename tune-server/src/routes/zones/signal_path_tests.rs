@@ -3001,3 +3001,51 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
         );
     }
 }
+
+// ── #4172 — WASAPI sans contrat exclusif = mode partagé, nommé et non bit-perfect ──
+
+/// Le témoin : « WASAPI » sans contrat de signal se nomme partagé et n'est
+/// pas intact — avant, il se nommait « WASAPI » tout court et passait pour
+/// bit-perfect, quelle que soit la cadence à laquelle le mixeur Windows
+/// sortait réellement.
+#[test]
+fn wasapi_sans_contrat_exclusif_se_nomme_partage_et_n_est_pas_bit_perfect_4172() {
+    use super::signal_path::{etiquette_du_transport_local, transport_partage_est_intact};
+    assert_eq!(
+        etiquette_du_transport_local("WASAPI", false),
+        "WASAPI (shared \u{2014} Windows mixer)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("WASAPI", true),
+        "WASAPI (exclusive)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("ASIO", true),
+        "ASIO (exclusive)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("CoreAudio", false),
+        "CoreAudio"
+    );
+    assert_eq!(etiquette_du_transport_local("ALSA", false), "ALSA");
+    assert!(!transport_partage_est_intact("WASAPI"), "mixeur Windows");
+    assert!(transport_partage_est_intact("CoreAudio"), "inchangé");
+    assert!(transport_partage_est_intact("ALSA"), "inchangé");
+}
+
+/// La garde du BRANCHEMENT : le bras `"local"` de `decrire_le_transport`
+/// passe par l'étiquette et, sans contrat, par le verdict du mode partagé.
+#[test]
+fn le_transport_local_dit_son_mode_et_son_verdict_4172() {
+    let src = include_str!("signal_path.rs");
+    let bras = src.find("\"local\" => {").expect("le bras local");
+    let bloc = &src[bras..bras + 1_500];
+    assert!(
+        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe)"),
+        "le nom vient de l'étiquette"
+    );
+    assert!(
+        bloc.contains("None => transport_partage_est_intact(audio_backend)"),
+        "sans contrat, le verdict est celui du mode partagé"
+    );
+}
