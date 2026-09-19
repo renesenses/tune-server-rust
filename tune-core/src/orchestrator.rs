@@ -1209,6 +1209,11 @@ mod resolve_local;
 mod dsp;
 
 mod resolve_direct;
+
+/// #4362 — le chemin de lecture consulte le registre des serveurs multimédia
+/// avant d'envoyer l'URL d'une piste indexée à une sortie.
+mod serveur_source_absent_4362;
+
 /// D4 — ce que vaut la lecture d'une piste de serveur UPnP, sortie par sortie.
 /// Publique : `routes/playback.rs` lit la MÊME table que le refus de
 /// `resolve_direct`, pour que les deux ne puissent pas diverger.

@@ -613,9 +613,9 @@ fn assembler_les_etapes(
     let Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
-        dlna_lpcm,
         dlna_cap_16bit,
         dlna_wav24,
+        dlna_force_wav,
         needs_transcode_for_output,
         is_oaat,
         oaat_transcodes,
@@ -631,6 +631,13 @@ fn assembler_les_etapes(
     let source_desc = if is_dsd {
         // DSD rates are in MHz range — display as e.g. "DSD64 2.8 MHz" or "DSD128 5.6 MHz"
         dsd_resolution_label(sample_rate)
+    } else if sample_rate == 0 {
+        format_name.to_string()
+    } else if bit_depth == 0 {
+        format!(
+            "{format_name}{bitrate_label} {sr}kHz",
+            sr = sample_rate / 1000
+        )
     } else if sample_rate >= 1000 {
         format!(
             "{format_name}{bitrate_label} {sr}kHz/{bit_depth}bit",
@@ -671,8 +678,9 @@ fn assembler_les_etapes(
         // AirPlay 2 encode en ALAC 44,1/16 comme AirPlay 1 : l'étape est la
         // même, et elle manquait ici aussi (#2189).
         || matches!(output_type, "airplay" | "airplay2")
-        || dlna_lpcm
-        || dlna_wav24
+        // Le FORÇAGE, pas la profondeur : « Forcer le WAV = 24 bits » sur une
+        // source 16 bits transcode aussi, et l'étape doit le dire (#4297).
+        || dlna_force_wav
         || dlna_cap_16bit
         || wire_transcode;
     if transcode_active {
@@ -681,9 +689,13 @@ fn assembler_les_etapes(
         // WAV/LPCM output likewise preserves the samples only when the source
         // already fits the 16-bit LPCM cap — unless the zone opted into genuine
         // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
-        let wav_output = wire_wav || dlna_lpcm || dlna_wav24;
-        let transcode_lossless = (is_oaat && is_lossless && !is_dsd)
-            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16));
+        let wav_output = wire_wav || dlna_force_wav;
+        let transcode_lossless = ((is_oaat && is_lossless && !is_dsd)
+            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16)))
+            && ps
+                .now_playing
+                .as_ref()
+                .is_none_or(|np| radio_wire_preserves_source(np, &analyse.source));
         // Reflect the OUTPUT resolution the renderer actually receives: 24-bit
         // for the opt-in 24-bit WAV path, 16-bit when the zone caps to 16-bit OR
         // serves the plain LPCM fallback (audio/L16 is 16-bit), and the
@@ -1017,6 +1029,7 @@ fn rendre_les_verdicts(
     // fil est intact, l'étape ne fait que l'expliquer.
     let replaygain_altere = replaygain_step.is_some_and(|rg| rg.alters_audio);
     let bit_perfect = is_lossless
+        && radio_wire_preserves_source(np, source)
         && transport_bit_perfect
         && !dsp_applique
         && !resampling_active
@@ -1070,8 +1083,8 @@ fn decrire_le_transport<'a>(
     } = *source;
     let Forcages {
         wire_wav,
-        dlna_lpcm,
         dlna_wav24,
+        dlna_force_wav,
         dlna_cap_16bit,
         needs_transcode_for_output,
         oaat_transcodes,
@@ -1079,7 +1092,7 @@ fn decrire_le_transport<'a>(
     } = *forcages;
     match output_type {
         "dlna" | "openhome" => {
-            if wire_wav || dlna_lpcm || dlna_wav24 {
+            if wire_wav || dlna_force_wav {
                 // Renderer served WAV/LPCM, not FLAC — the signal path must say
                 // so (a renderer showing "WAV/PCM" otherwise contradicted Tune's
                 // "→ FLAC" label, LHC). Three causes, same wire: the zone forces
@@ -1224,9 +1237,13 @@ fn decrire_le_transport<'a>(
 struct Forcages {
     dsp_applique: bool,
     dsp_contourne_par_le_dsd: bool,
-    dlna_lpcm: bool,
     dlna_cap_16bit: bool,
+    /// L'opt-in 24 bits SERVI : la zone l'a demandé ET la source le porte.
+    /// Décrit la profondeur du WAV, jamais le fait de forcer le WAV (#4297).
     dlna_wav24: bool,
+    /// Le forçage WAV lui-même (« Forcer le WAV », 16 ou 24 bits), exception
+    /// FLAC natif comprise — le miroir de `dlna_force_wav` de l'orchestrateur.
+    dlna_force_wav: bool,
     needs_transcode_for_output: bool,
     is_oaat: bool,
     oaat_transcodes: bool,
@@ -1341,12 +1358,24 @@ fn decider_les_forcages(
         zone.max_sample_rate,
         device_quirks.max_sample_rate,
     );
-    // Zone opt-in: serve genuine 24-bit WAV (audio/L24) instead of the 16-bit
-    // LPCM fallback. Mirrors orchestrator.rs `dlna_wav24` so the signal path
-    // shows a lossless 24-bit WAV wire (not a phantom 16-bit truncation).
-    let dlna_wav24 = is_network_output
-        && bit_depth > 16
+    // Zone opt-in « Forcer le WAV = 24 bits ». Miroir de `orchestrator.rs` :
+    // le RÉGLAGE force le WAV (`wav24_opt_in`, quelle que soit la profondeur
+    // de la source), et la profondeur de la source décide seulement si le WAV
+    // servi garde ses 24 bits (`dlna_wav24`) ou retombe sur le LPCM 16 bits.
+    //
+    // Les deux étaient confondus ici comme dans la décision : sur l'ALAC
+    // 44,1/16 d'Yves, le panneau annonçait `ALAC → FLAC` parce que ce miroir
+    // exigeait `bit_depth > 16` pour armer le forçage (#4297).
+    //
+    // `!dsd_passthrough`, comme `dlna_lpcm` juste au-dessus : l'orchestrateur ne
+    // peut pas forcer le WAV sur un flux DSD servi brut (`dlna_needs_wav` exige
+    // `will_be_flac`, faux dès que `needs_transcode_for_output` tombe). Le
+    // plafond `bit_depth > 16` écartait le DSD par accident ; en le retirant du
+    // forçage, il faut nommer la précédence.
+    let wav24_opt_in = is_network_output
+        && !dsd_passthrough
         && ZoneRepo::with_backend(backend.clone()).get_dlna_wav24(zone_id);
+    let dlna_wav24 = wav24_opt_in && bit_depth > 16;
     // Même règle que l'orchestrateur, par la MÊME fonction : sur une source
     // FLAC dont la zone demande le FLAC natif, le forçage WAV ne s'applique pas
     // — il vise le décodeur ALAC du renderer. Sans ce miroir, le chemin du
@@ -1355,8 +1384,11 @@ fn decider_les_forcages(
     let source_is_flac = source_format == Some(AudioFormat::Flac);
     let native_flac_opt_in =
         is_network_output && ZoneRepo::with_backend(backend.clone()).get_dlna_native_flac(zone_id);
-    let dlna_lpcm = tune_core::orchestrator::wav_override_applies(
-        dlna_lpcm,
+    // Le forçage WAV du miroir, par la MÊME fonction et sur les MÊMES entrées
+    // que `dlna_force_wav` de l'orchestrateur : les deux pavés du tri-état en
+    // OU, l'exception FLAC natif par-dessus.
+    let dlna_force_wav = tune_core::orchestrator::wav_override_applies(
+        dlna_lpcm || wav24_opt_in,
         source_is_flac,
         native_flac_opt_in,
     );
@@ -1377,15 +1409,14 @@ fn decider_les_forcages(
         source_format,
         u32::try_from(sample_rate).unwrap_or(0),
         max_sample_rate,
-        dlna_lpcm || dlna_wav24,
+        dlna_force_wav,
         dlna_cap_16bit,
         || ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id),
     );
     // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
     let aac_passthrough = source_format == Some(AudioFormat::Aac)
         && is_network_output
-        && !dlna_lpcm
-        && !dlna_wav24
+        && !dlna_force_wav
         && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
     // #3183 — la QUATRIEME copie a la main, et celle qui avait deja derive :
     // ce miroir n'appelait que `needs_transcode_for_dlna()`, la decision
@@ -1416,9 +1447,9 @@ fn decider_les_forcages(
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
-        dlna_lpcm,
         dlna_cap_16bit,
         dlna_wav24,
+        dlna_force_wav,
         needs_transcode_for_output,
         is_oaat,
         oaat_transcodes,
@@ -1525,6 +1556,19 @@ struct Source<'w> {
     is_lossless: bool,
 }
 
+/// The radio decoder emits 16-bit PCM and can adapt low source rates.
+/// Downstream runtime measurements start after that conversion.
+fn radio_wire_preserves_source(np: &tune_core::playback::NowPlaying, source: &Source) -> bool {
+    np.source != "radio"
+        || source.output_container != Some("wav")
+        || (source.sample_rate > 0
+            && source.wire_sample_rate == Some(source.sample_rate as u32)
+            && source.bit_depth > 0
+            && source
+                .wire_bit_depth
+                .is_some_and(|bits| i32::from(bits) >= source.bit_depth))
+}
+
 /// Lit la piste, le fil et la lecture en cours pour décrire la source.
 fn decrire_la_source<'w>(
     np: &tune_core::playback::NowPlaying,
@@ -1538,11 +1582,37 @@ fn decrire_la_source<'w>(
     // des valeurs renseignées, sans quoi l'affichage annoncerait « 0kHz/0bit ».
     let wire_sample_rate = wire.map(|w| w.sample_rate).filter(|v| *v > 0);
     let wire_bit_depth = wire.map(|w| w.bit_depth).filter(|v| *v > 0);
-    // A decoded live radio has no library row and its NowPlaying resolution is
-    // only the bootstrap value chosen before the decoder opens the upstream.
-    // Once the session publishes its detected PCM format, that observation is
-    // authoritative for the source line too (France Musique: 48 kHz, not the
-    // 44.1 kHz bootstrap value from session creation — #2427).
+    // A radio decoded to WAV must retain its upstream codec (#4346).
+    // No session/observation yet is unknown, never proof of a lossless source.
+    let radio_source = (np.source == "radio")
+        .then(|| {
+            wire.and_then(|w| w.radio_source).or_else(|| {
+                (np.format
+                    .as_deref()
+                    .is_none_or(|f| matches!(f, "wav" | "audio/wav")))
+                .then_some(tune_core::http::streamer::RadioSourceInfo::default())
+            })
+        })
+        .flatten();
+    if let Some(radio) = radio_source {
+        let source_format = radio.format.and_then(AudioFormat::from_extension);
+        return Source {
+            output_container,
+            wire_sample_rate,
+            wire_bit_depth,
+            source_format,
+            is_dsd: false,
+            sample_rate: radio.sample_rate.unwrap_or(0) as i32,
+            bit_depth: radio.bit_depth.unwrap_or(0) as i32,
+            format_name: source_format
+                .as_ref()
+                .map_or("Unknown", AudioFormat::display_name),
+            is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
+        };
+    }
+    // Verbatim proxy radios keep their existing wire/NowPlaying metadata
+    // fallback. Decoded radios returned above using the upstream observation,
+    // separately from any output rate conversion (#2427, #4346).
     let radio_wire_sample_rate = (np.source == "radio")
         .then_some(wire_sample_rate)
         .flatten()

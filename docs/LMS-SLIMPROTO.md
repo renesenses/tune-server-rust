@@ -22,6 +22,32 @@ n'altère pas l'adresse du LMS externe dans les réglages. Si Lyrion tient
 déjà 9090, le client de Tune peut atteindre Lyrion alors que le pont CLI de
 Tune échoue à démarrer sur ce même numéro.
 
+## Le pont CLI se replie quand 9090 est pris (#4361)
+
+Sur l'image **Tune OS Fedora**, **Cockpit** écoute déjà sur 9090 — c'est le
+défaut de Fedora Server, pas un choix de Tune. Le pont de commande ne renonce
+plus : il essaie le port demandé, puis les huit suivants (9091, 9092, …), et
+en dernier recours un port que le système choisit. Tune sert donc toujours ses
+télécommandes, sur un numéro stable d'un démarrage à l'autre tant que
+l'occupant du 9090 ne bouge pas.
+
+Ce repli est **annoncé**, jamais subi en silence :
+
+- journal : `lms_cli_server_port_de_repli` avec `port` et `port_prefere` ;
+- `GET /api/v1/system/diagnostics/network` et `GET /api/v1/squeezebox/status` :
+  `lms_cli.ecoute = true`, `lms_cli.cause = "port_de_repli"` et un `message`
+  qui nomme les deux ports ;
+- rapport de bogue : une ligne « Pont CLI LMS **REPLIÉ** » avec ce message.
+
+Le composant de santé `lms_cli` reste **vrai** : le pont sert. C'est la `cause`
+qui dit qu'il ne sert pas où on l'attendait.
+
+**Les contrôleurs doivent viser le port réellement obtenu.** Pour figer un
+numéro une fois pour toutes — et ne plus dépendre de qui occupe 9090 —, poser
+`TUNE_CLI_PORT` sur un port libre, par exemple dans l'unité systemd de l'image
+Tune OS, puis redémarrer Tune. Un `TUNE_CLI_PORT` explicite bénéficie du même
+repli s'il est lui aussi occupé.
+
 Sur un port SlimProto différent de 3483, certains lecteurs n'utilisent pas
 la découverte automatique : leur configurer manuellement l'adresse **et le
 port** de Tune, lorsque le lecteur le permet. Adapter également le port des

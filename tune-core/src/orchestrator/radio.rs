@@ -261,6 +261,7 @@ struct Sonde {
     track_id: u32,
     source_channels: u16,
     source_sample_rate: u32,
+    source_info: crate::http::streamer::RadioSourceInfo,
 }
 
 /// Le format de sortie décidé pour une connexion (voir `renderer_safe_wav_rate`).
@@ -528,7 +529,30 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("radio decoder init failed: {e}"))?;
 
+    use symphonia::core::codecs::audio::well_known::*;
+    let source_format = match audio_params.codec {
+        CODEC_ID_MP3 => Some("mp3"),
+        CODEC_ID_AAC => Some("aac"),
+        CODEC_ID_FLAC => Some("flac"),
+        CODEC_ID_ALAC => Some("alac"),
+        CODEC_ID_VORBIS => Some("ogg"),
+        CODEC_ID_OPUS => Some("opus"),
+        _ => None,
+    };
+    let source_info = crate::http::streamer::RadioSourceInfo {
+        format: source_format,
+        sample_rate: audio_params.sample_rate.filter(|rate| *rate > 0),
+        // Lossy codecs do not have a source PCM bit depth. The 16-bit WAV
+        // quantization belongs to the output, not to the MP3/AAC station.
+        bit_depth: matches!(audio_params.codec, CODEC_ID_FLAC | CODEC_ID_ALAC)
+            .then_some(audio_params.bits_per_sample)
+            .flatten()
+            .and_then(|bits| u16::try_from(bits).ok())
+            .filter(|bits| *bits > 0),
+    };
+
     Ok(Sonde {
+        source_info,
         format,
         decoder,
         track_id,
@@ -579,6 +603,8 @@ fn preparer_la_sortie(
             if eq.is_enabled() { Some(eq) } else { None }
         });
     }
+
+    canaux.session.publish_radio_source(sonde.source_info);
 
     // Publish the OUTPUT format so the HTTP handler advertises the WAV rate
     // that matches the PCM we actually feed (FIP is 48000 → advertised as
@@ -759,3 +785,7 @@ fn reprendre_apres_coupure(
     std::thread::sleep(std::time::Duration::from_millis(500));
     SuiteRadio::Reconnecter
 }
+
+#[cfg(test)]
+#[path = "radio_source_tests.rs"]
+mod radio_source_tests;

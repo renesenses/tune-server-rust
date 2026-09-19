@@ -15,6 +15,7 @@ fn session_de_test() -> StreamSession {
             file_size: None,
             duration_ms: None,
             seek_ms: None,
+            ..Default::default()
         },
         true,
         8,

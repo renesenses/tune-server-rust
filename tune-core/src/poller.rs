@@ -255,6 +255,17 @@ const POSITION_SAVE_INTERVAL_TICKS: u64 = 10;
 /// the output time to drain its buffer and report Stopped naturally.
 /// If it doesn't, this threshold forces the advance.
 const POSITION_PAST_END_TICKS: u8 = 3;
+/// Sondages exigés quand le renderer DLNA est GELÉ à la durée alors qu'il a
+/// accepté un `SetNext` (#4382, Villerio, DMP-A6).
+///
+/// `dlna_frozen_at_end_wall_clock` n'est vrai qu'une fois l'horloge de Tune
+/// passée de `END_MARGIN_MS` au-delà de la durée, position collée à la fin :
+/// trois sondages de plus n'apprennent rien d'un appareil dont la position ne
+/// bouge plus, et coûtent trois secondes de silence à l'auditeur. Un seul
+/// sondage suffit à confirmer que rien n'a bougé — l'adoption de
+/// l'enchaînement (`enchainement_a_l_horloge`) reste consultée AVANT tout
+/// repli, elle seule décide s'il faut relancer.
+const TICKS_GELE_DLNA_AVEC_SETNEXT: u8 = 1;
 /// Délai raisonnable (s) laissé au renderer, après une avance à l'horloge qui
 /// a ADOPTÉ son enchaînement (#4173), pour donner signe de vie sur la piste
 /// adoptée : position qui bouge, ou URI courante qui la nomme. Passé ce délai

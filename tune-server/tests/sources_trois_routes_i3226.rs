@@ -145,6 +145,7 @@ impl StreamingService for Doublure {
                 track_number: Some(1),
                 disc_number: Some(1),
                 explicit: false,
+                disponible: None,
                 quality: None,
                 isrc: None,
                 composer: None,
@@ -169,6 +170,7 @@ impl StreamingService for Doublure {
             year: Some(2026),
             track_count: 9,
             quality: None,
+            released_at: None,
         }])
     }
 

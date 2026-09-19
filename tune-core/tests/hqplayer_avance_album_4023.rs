@@ -207,10 +207,10 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
             };
             tokio::spawn(async move {
                 let mut tampon = [0u8; 4096];
-                // Un `state` NUMÉRIQUE : bien formé, mais aucun des mots que
-                // `etat_reconnu` cherche.
+                // Valeur hors enum Signalyst (0..=3) : le diagnostic
+                // des états réellement inconnus doit rester présent.
                 while socket.read(&mut tampon).await.unwrap_or(0) > 0 {
-                    let reponse = r#"<Status state="2" position="12.5" duration="300.0"/>"#;
+                    let reponse = r#"<Status state="99" position="12.5" duration="300.0"/>"#;
                     if socket.write_all(reponse.as_bytes()).await.is_err() {
                         return;
                     }
@@ -247,7 +247,7 @@ async fn un_album_qui_avance_pose_quatre_commandes_lisibles_sur_une_connexion() 
          Journal :\n{texte}"
     );
     assert!(
-        texte.contains("state=\\\"2\\\"") || texte.contains("state=\"2\""),
+        texte.contains("state=\\\"99\\\"") || texte.contains("state=\"99\""),
         "la ligne doit citer la réponse reçue, sinon elle ne mesure rien :\n{texte}"
     );
 }

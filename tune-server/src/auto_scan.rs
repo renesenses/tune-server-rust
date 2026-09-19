@@ -798,6 +798,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // sur ce chemin-là également. Hissé pour que le rapport puisse le
         // publier (#2146).
         let mut pistes_supprimees = 0i64;
+        let mut db_delete_failed = 0i64;
         if crate::routes::system::scan::scan_cancel_requested() {
             info!("auto_scan_prune_skipped_cancelled");
         } else {
@@ -848,7 +849,6 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 PART_MAX_PURGE, SEUIL_SOUS_ARBRE_VIDE, VerdictPurge, purge_trop_massive,
                 verdict_purge,
             };
-            let mut pruned = 0i64;
             let mut protected = 0i64;
             let mut hors_perimetre = 0i64;
             let mut a_supprimer: Vec<i64> = Vec::new();
@@ -890,11 +890,13 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 protected += a_supprimer.len() as i64;
                 a_supprimer.clear();
             }
-            for track_id in a_supprimer {
-                if track_repo.delete(track_id).is_ok() {
-                    pruned += 1;
-                }
-            }
+            let bilan = crate::routes::system::scan::supprimer_pistes_du_scan(
+                &track_repo,
+                a_supprimer,
+                "auto",
+            );
+            let pruned = bilan.removed;
+            db_delete_failed = bilan.db_delete_failed;
             if hors_perimetre > 0 {
                 tracing::warn!(
                     hors_perimetre,
@@ -1033,6 +1035,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             skipped_unsupported,
             db_insert_failed,
             db_update_failed,
+            db_delete_failed,
             artwork = artwork_extracted,
             orphan_albums,
             "auto_scan_complete"
@@ -1075,6 +1078,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             "skipped_unsupported": skipped_unsupported,
             "db_insert_failed": db_insert_failed,
             "db_update_failed": db_update_failed,
+            "db_delete_failed": db_delete_failed,
             "artwork_extracted": artwork_extracted,
             "failed_paths": stats.failed_paths,
             // Les fichiers de 0 octet (#2060) — même clé que le scan manuel.

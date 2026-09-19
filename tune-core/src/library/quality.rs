@@ -28,6 +28,55 @@ pub fn score_qualite(
     (sans_perte, sr.saturating_mul(bd))
 }
 
+/// Le JUMEAU SQL de [`score_qualite`], pour les prédicats qui doivent choisir
+/// entre deux copies SANS remonter les lignes en mémoire (#4101).
+///
+/// ## Pourquoi un jumeau, alors que l'en-tête de ce module interdit deux barèmes
+///
+/// Justement pour qu'il n'y en ait qu'un. Le repli d'affichage
+/// ([`crate::db::track_repo::dedup_display_tracks`]) trie en Rust une liste
+/// DÉJÀ rendue : c'est possible sur les pistes d'UN album, pas sur une vue
+/// paginée de toute la bibliothèque, où la liste et son `total` doivent
+/// exclure le même ensemble ou la pagination saute des pages. Le prédicat qui
+/// sert cette vue est donc du SQL — et il est écrit ICI, à côté du barème
+/// qu'il transcrit, avec une épreuve qui compare les deux verdicts terme à
+/// terme (`le_barème_sql_dit_la_même_chose_que_le_barème_rust`). Écrit
+/// ailleurs, il aurait divergé au premier correctif.
+///
+/// Rend l'expression `1`/`0` de « cette copie est sans perte ». Un `format`
+/// NUL vaut `0`, comme le `unwrap_or(false)` de [`score_qualite`].
+pub fn sql_sans_perte(alias: &str) -> String {
+    format!(
+        "(CASE WHEN {alias}.format IS NOT NULL AND LOWER({alias}.format)          NOT IN ('mp3', 'aac', 'ogg', 'opus', 'wma') THEN 1 ELSE 0 END)"
+    )
+}
+
+/// Le débit comparable de [`score_qualite`] : `sample_rate × bit_depth`, avec
+/// les mêmes valeurs par défaut (44 100 et 16) et le même plancher à 1.
+pub fn sql_debit(alias: &str) -> String {
+    format!(
+        "((CASE WHEN COALESCE({alias}.sample_rate, 44100) < 1 THEN 1          ELSE COALESCE({alias}.sample_rate, 44100) END)          * (CASE WHEN COALESCE({alias}.bit_depth, 16) < 1 THEN 1          ELSE COALESCE({alias}.bit_depth, 16) END))"
+    )
+}
+
+/// « La copie `a` est STRICTEMENT de meilleure qualité que la copie `b`. »
+/// L'ordre lexicographique du couple `(sans_perte, débit)`, écrit en deux
+/// termes plutôt qu'en comparaison de n-uplets : les valeurs de ligne
+/// (`(x, y) > (z, w)`) n'existent pas dans toutes les versions de SQLite que
+/// les testeurs font tourner.
+pub fn sql_strictement_meilleure(a: &str, b: &str) -> String {
+    let (sa, sb) = (sql_sans_perte(a), sql_sans_perte(b));
+    let (da, db) = (sql_debit(a), sql_debit(b));
+    format!("({sa} > {sb} OR ({sa} = {sb} AND {da} > {db}))")
+}
+
+/// « Les deux copies se valent » — le cas où il faut un départage stable.
+pub fn sql_meme_score(a: &str, b: &str) -> String {
+    let (sa, sb) = (sql_sans_perte(a), sql_sans_perte(b));
+    let (da, db) = (sql_debit(a), sql_debit(b));
+    format!("({sa} = {sb} AND {da} = {db})")
+}
+
 /// Cadence 1 bit du DSD64 : la base de tous les paliers de la famille 44,1 kHz
 /// (`2 822 400 = 64 × 44 100`). Même valeur que `audio/dsf.rs` et
 /// `audio/dff.rs` figent dans leurs tests.
@@ -102,7 +151,87 @@ pub fn libelle_profondeur(bit_depth: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{libelle_cadence, libelle_profondeur, score_qualite};
+    use super::{
+        libelle_cadence, libelle_profondeur, score_qualite, sql_meme_score,
+        sql_strictement_meilleure,
+    };
+
+    /// 🔴 #4101 — **la seule épreuve qui empêche les deux barèmes de diverger.**
+    ///
+    /// Le repli d'affichage trie en Rust ; le prédicat de la vue paginée trie
+    /// en SQL. Les deux doivent rendre le MÊME verdict sur chaque paire, sinon
+    /// l'écran montrerait une copie que la lecture n'irait pas chercher —
+    /// exactement ce que l'en-tête de ce module interdit.
+    ///
+    /// Le SQL est évalué par le vrai moteur, sur la vraie table `tracks` : une
+    /// transcription relue à l'œil ne prouve rien.
+    #[test]
+    fn le_bareme_sql_dit_la_meme_chose_que_le_bareme_rust() {
+        use crate::db::backend::{DbBackend, ToSqlValue};
+        use crate::db::models::Track;
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::track_repo::TrackRepo;
+
+        // Les copies du rapport #1362 et les arbitrages documentés plus haut :
+        // sans-perte contre avec-perte, débit à famille égale, DSD, et les
+        // colonnes absentes d'une base ancienne.
+        const COPIES: [(&str, Option<&str>, Option<i32>, Option<i32>); 8] = [
+            ("aiff 44/16", Some("aiff"), Some(44100), Some(16)),
+            ("aac 48/24", Some("aac"), Some(48000), Some(24)),
+            ("flac 44/16", Some("flac"), Some(44100), Some(16)),
+            ("flac 96/24", Some("flac"), Some(96000), Some(24)),
+            ("flac 192/24", Some("flac"), Some(192_000), Some(24)),
+            ("dsf DSD64", Some("dsf"), Some(2_822_400), Some(1)),
+            ("mp3 44/16", Some("mp3"), Some(44100), Some(16)),
+            ("sans colonnes", None, None, None),
+        ];
+
+        let db = SqliteDb::open_in_memory().expect("base en mémoire");
+        db.init_schema().expect("schéma");
+        let repo = TrackRepo::new(db.clone());
+        let mut ids: Vec<i64> = Vec::new();
+        for (nom, format, sr, bd) in COPIES {
+            let mut t = Track::new(nom.to_string());
+            t.format = format.map(str::to_string);
+            t.sample_rate = sr;
+            t.bit_depth = bd;
+            t.file_path = Some(format!("/musique/{nom}.bin"));
+            ids.push(repo.create(&t).expect("piste"));
+        }
+
+        let sql = format!(
+            "SELECT {}, {} FROM tracks a, tracks b WHERE a.id = ? AND b.id = ?",
+            sql_strictement_meilleure("a", "b"),
+            sql_meme_score("a", "b"),
+        );
+        for (i, (nom_a, fa, sa, ba)) in COPIES.iter().enumerate() {
+            for (j, (nom_b, fb, sb, bb)) in COPIES.iter().enumerate() {
+                let params: [&dyn ToSqlValue; 2] = [&ids[i], &ids[j]];
+                let cols = db
+                    .query_one(&sql, &params)
+                    .expect("requête de comparaison")
+                    .expect("une ligne");
+                let sql_meilleure = cols[0].as_i64().unwrap_or(0) != 0;
+                let sql_egales = cols[1].as_i64().unwrap_or(0) != 0;
+
+                let rust_a = score_qualite(*fa, sa.map(i64::from), ba.map(i64::from));
+                let rust_b = score_qualite(*fb, sb.map(i64::from), bb.map(i64::from));
+
+                assert_eq!(
+                    sql_meilleure,
+                    rust_a > rust_b,
+                    "« {nom_a} » vs « {nom_b} » : le barème SQL et le barème Rust \
+                     ne disent pas la même chose sur « strictement meilleure »"
+                );
+                assert_eq!(
+                    sql_egales,
+                    rust_a == rust_b,
+                    "« {nom_a} » vs « {nom_b} » : le barème SQL et le barème Rust \
+                     ne disent pas la même chose sur « se valent »"
+                );
+            }
+        }
+    }
 
     /// #4171 : les quatre paliers de l'issue, la famille 48k distinguée, et le
     /// PCM lisible — chaque libellé porte la valeur brute, pour que le filtre

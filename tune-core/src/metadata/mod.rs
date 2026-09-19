@@ -6010,12 +6010,14 @@ mod foo_dr_voisin_4186 {
     const RAPPORT_TADES: &[u8] = include_bytes!("../../tests/fixtures/foo_dr_tades_1800.txt");
 
     /// Un dossier d'album : la fixture FLAC copiée sous `nom`, taguée avec les
-    /// paires données, et — si fourni — un `foo_dr.txt` à côté.
+    /// paires données, et — si fourni — un rapport DR posé à côté, sous le
+    /// NOM demandé. Le nom est un paramètre depuis #4352 : c'est lui, et non
+    /// le contenu, qui décidait de tout avant ce correctif.
     fn album(
         epreuve: &str,
         nom: &str,
         tags: &[(&str, &str)],
-        rapport: Option<&[u8]>,
+        rapport: Option<(&str, &[u8])>,
     ) -> (crate::test_scratch::ScratchDir, std::path::PathBuf) {
         let dossier = crate::test_scratch::scratch_dir(&format!("foo-dr-4186-{epreuve}"));
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
@@ -6035,9 +6037,8 @@ mod foo_dr_voisin_4186 {
             flac.save_to_path(&piste, WriteOptions::default())
                 .expect("écriture des tags");
         }
-        if let Some(octets) = rapport {
-            std::fs::write(dossier.join(super::foo_dr::NOM_DU_RAPPORT), octets)
-                .expect("écriture du rapport");
+        if let Some((nom_du_rapport, octets)) = rapport {
+            std::fs::write(dossier.join(nom_du_rapport), octets).expect("écriture du rapport");
         }
         (dossier, piste)
     }
@@ -6054,7 +6055,7 @@ mod foo_dr_voisin_4186 {
                 ("TRACKNUMBER", "11"),
                 ("TITLE", "Mahler Sym No 2: 5th Mov Etwas bewegter"),
             ],
-            Some(RAPPORT_TADES),
+            Some((super::foo_dr::NOM_DU_RAPPORT, RAPPORT_TADES)),
         );
         let meta = super::read_extended_metadata(&piste);
         assert_eq!(
@@ -6081,7 +6082,7 @@ mod foo_dr_voisin_4186 {
             "tag-prime",
             "11 - Mahler.flac",
             &[("TRACKNUMBER", "11"), ("DYNAMIC RANGE", "14")],
-            Some(RAPPORT_TADES),
+            Some((super::foo_dr::NOM_DU_RAPPORT, RAPPORT_TADES)),
         );
         let meta = super::read_extended_metadata(&piste);
         assert_eq!(meta.get("dr_track").map(String::as_str), Some("14"));
@@ -6115,7 +6116,7 @@ mod foo_dr_voisin_4186 {
             "absente",
             "12 - Bonus.flac",
             &[("TRACKNUMBER", "12"), ("TITLE", "Bonus inédit")],
-            Some(RAPPORT_TADES),
+            Some((super::foo_dr::NOM_DU_RAPPORT, RAPPORT_TADES)),
         );
         let meta = super::read_extended_metadata(&piste);
         assert_eq!(meta.get("dr_track"), None, "Relevé : {meta:?}");
@@ -6129,13 +6130,117 @@ mod foo_dr_voisin_4186 {
             "nom",
             "03 - Troisieme mouvement.flac",
             &[("TITLE", "x")],
-            Some(RAPPORT_TADES),
+            Some((super::foo_dr::NOM_DU_RAPPORT, RAPPORT_TADES)),
         );
         let meta = super::read_extended_metadata(&piste);
         assert_eq!(
             meta.get("dr_track").map(String::as_str),
             Some("12"),
             "piste 3, couche stéréo : DR12. Relevé : {meta:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #4352 — d'autres mesureurs que foobar2000, par le CHEMIN RÉEL du
+    // scan. Patatorz demande DROffline MkII (fil 1800), JeromeQ DeaDBeeF
+    // (fil 1781). Les mises en page et leurs sources sont documentées en
+    // tête de `metadata::foo_dr`.
+    // ------------------------------------------------------------------
+
+    /// Le journal du greffon `dr_meter` de DeaDBeeF, sous un nom que
+    /// l'utilisateur a choisi lui-même : ce greffon n'écrit AUCUN nom par
+    /// défaut, il ouvre un sélecteur de fichier. Avant #4352,
+    /// `read_extended_metadata` ne l'ouvrait jamais.
+    #[test]
+    fn un_journal_deadbeef_au_nom_libre_donne_son_dr_a_la_piste_4352() {
+        let (_dossier, piste) = album(
+            "deadbeef",
+            "01 - So What.flac",
+            &[("TRACKNUMBER", "1"), ("TITLE", "So What")],
+            Some((
+                "Miles Davis - Kind of Blue DR.txt",
+                include_bytes!("../../tests/fixtures/dr_deadbeef_4352.txt"),
+            )),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("13"),
+            "#4352 — le rapport d'un AUTRE mesureur, trouvé par son contenu \
+             et non par son nom. Relevé : {meta:?}"
+        );
+        assert_eq!(
+            meta.get("dr_source").map(String::as_str),
+            Some(super::DR_SOURCE_SIDECAR),
+            "la provenance reste `sidecar`. Relevé : {meta:?}"
+        );
+    }
+
+    /// `dr14_t.meter` écrit `dr14-DR<n>.txt` depuis octobre 2020 : un nom
+    /// ÉTABLI, une table à tabulations, et la piste 2 vaut DR11.
+    #[test]
+    fn le_rapport_dr14_tmeter_donne_son_dr_a_la_piste_4352() {
+        let (_dossier, piste) = album(
+            "dr14",
+            "02 - No Reply At All.flac",
+            &[("TRACKNUMBER", "2"), ("TITLE", "No Reply At All")],
+            Some((
+                "dr14-DR11.txt",
+                include_bytes!("../../tests/fixtures/dr14_tmeter_4352.txt"),
+            )),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("11"),
+            "#4352 — `dr14-DR11.txt` est un nom établi. Relevé : {meta:?}"
+        );
+    }
+
+    /// L'AUTRE SENS, et c'est le vrai risque : un fichier texte posé dans le
+    /// dossier de l'album, qui aligne des lignes ressemblant à des mesures,
+    /// ne doit RIEN donner à la piste. Élargir la découverte à tout `.txt`
+    /// sans juge aurait collé DR12 sur cette piste.
+    #[test]
+    fn un_texte_du_dossier_ne_donne_aucun_dr_a_la_piste_4352() {
+        let (_dossier, piste) = album(
+            "notes",
+            "01 - So What.flac",
+            &[("TRACKNUMBER", "1"), ("TITLE", "So What")],
+            Some((
+                "notes.txt",
+                include_bytes!("../../tests/fixtures/pas_un_rapport_dr_4352.txt"),
+            )),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("dr_track"),
+            None,
+            "#4352 — la découverte propose, l'analyseur dispose : sans en-tête \
+             de colonnes ni `Official DR value:`, ce n'est pas un rapport. \
+             Relevé : {meta:?}"
+        );
+        assert_eq!(meta.get("dr_source"), None, "Relevé : {meta:?}");
+    }
+
+    /// La CASSE du nom. Sensible au système de fichiers : rouge sur Linux et
+    /// sur la CI, déjà vert sur un macOS insensible à la casse.
+    #[test]
+    fn un_rapport_en_majuscules_est_trouve_4352() {
+        let (_dossier, piste) = album(
+            "majuscules",
+            "11 - Mahler.flac",
+            &[
+                ("TRACKNUMBER", "11"),
+                ("TITLE", "Mahler Sym No 2: 5th Mov Etwas bewegter"),
+            ],
+            Some(("FOO_DR.TXT", RAPPORT_TADES)),
+        );
+        let meta = super::read_extended_metadata(&piste);
+        assert_eq!(
+            meta.get("dr_track").map(String::as_str),
+            Some("10"),
+            "#4352 — `FOO_DR.TXT` est le même rapport. Relevé : {meta:?}"
         );
     }
 }
