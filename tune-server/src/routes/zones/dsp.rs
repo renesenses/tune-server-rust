@@ -216,32 +216,16 @@ pub(super) async fn crossfeed_status_de_zone(
     zone_id: i64,
     requested: bool,
 ) -> tune_core::audio::crossfeed::CrossfeedStatus {
-    use tune_core::audio::crossfeed::{CrossfeedConstraint, CrossfeedStatus};
-    // Match the playback guards before checking physical output constraints.
-    // Never rewrite the user's stored crossfeed settings when access changes.
-    let reason = if !state
+    // #4511 — la sortie d'abord, les droits ensuite : voir `avec_les_droits`.
+    // Ne jamais réécrire les réglages stockés quand l'accès change.
+    let premium = state
         .license
         .check_feature(tune_core::license::Feature::Crossfeed)
-        .await
-    {
-        Some(CrossfeedConstraint::PremiumRequired)
-    } else if !tune_core::audio::premium_plugins::enabled(
+        .await;
+    let greffon_actif = tune_core::audio::premium_plugins::enabled(
         &SettingsRepo::with_backend(state.backend.clone()),
         "crossfeed",
-    ) {
-        Some(CrossfeedConstraint::PluginUnavailable)
-    } else {
-        None
-    };
-    if let Some(reason) = reason {
-        return CrossfeedStatus {
-            requested,
-            effective: false,
-            unavailable: true,
-            reason: Some(reason),
-            detail: Some(reason.detail()),
-        };
-    }
+    );
     let backend = &state.backend;
     let zone = ZoneRepo::with_backend(backend.clone())
         .get(zone_id)
@@ -265,14 +249,15 @@ pub(super) async fn crossfeed_status_de_zone(
         }
         _ => false,
     };
-    tune_core::audio::crossfeed::crossfeed_status(
+    let sortie = tune_core::audio::crossfeed::crossfeed_status(
         requested,
         tune_core::audio::crossfeed::crossfeed_runs_on_output(device.as_deref()),
         est_reseau,
         tune_core::audio::audiophile::zone_enabled(backend, zone_id),
         progressif_arme,
         renderer_accepte_lpcm,
-    )
+    );
+    tune_core::audio::crossfeed::avec_les_droits(sortie, premium, greffon_actif)
 }
 
 pub(super) async fn set_zone_dsp(
