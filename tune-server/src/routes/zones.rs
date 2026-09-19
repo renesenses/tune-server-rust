@@ -377,6 +377,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/device-presets", get(get_device_presets))

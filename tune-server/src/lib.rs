@@ -40,3 +40,8 @@ pub mod windows_migrate;
 /// The whole server startup, so out-of-tree binaries can compose it with their
 /// own plugins. See [`bootstrap::run`].
 pub use bootstrap::run;
+
+mod premium_audio_plugins;
+
+mod audio_job_journal;
+mod native_audio;

@@ -34,6 +34,11 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify generated plugin lists
+        run: python scripts/plugin-catalog.py --check
 
       - name: Verifier la ref et lire le manifeste
         id: train
@@ -121,7 +126,8 @@ jobs:
           CARGO_TARGET_DIR: target-amd64
         run: |
           sudo apt-get update && sudo apt-get install -y libasound2-dev
-          cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,bandcamp,dj,karaoke,plugins-wasm,pont-roon,audio-embedding
+          # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","plugins-wasm","audio-embedding"]}
+          cargo build --release --package tune-server --no-default-features --features oaat,cloud-relay,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
           mkdir -p dist/amd64 && cp target-amd64/release/tune-server dist/amd64/tune-server
 
       # Party (WASM) plugin — arch-independent, staged once and COPYied into the
@@ -135,8 +141,8 @@ jobs:
 
       - name: Build tune-server (arm64, cross)
         run: |
-          cross build --release --package tune-server \
-            --target aarch64-unknown-linux-gnu --no-default-features --features oaat,cloud-relay,bandcamp,dj,karaoke,plugins-wasm,pont-roon,audio-embedding
+          # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","plugins-wasm","audio-embedding"]}
+          cross build --release --package tune-server --target aarch64-unknown-linux-gnu --no-default-features --features oaat,cloud-relay,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
           mkdir -p dist/arm64 && cp target/aarch64-unknown-linux-gnu/release/tune-server dist/arm64/tune-server
 
       # Garde-fou #3355, moitie Docker : les deux binaires qui entrent dans

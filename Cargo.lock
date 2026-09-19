@@ -5343,6 +5343,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tune-output-api",
+ "tune-plugin-audio-support",
+ "tune-plugin-crossfeed",
+ "tune-plugin-equalizer",
+ "tune-plugin-native",
+ "tune-plugin-sdk",
  "unicode-normalization",
  "urlencoding",
  "uuid",
@@ -5413,12 +5418,89 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-abi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-audio-support"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
+]
+
+[[package]]
+name = "tune-plugin-converter"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-crossfeed"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-declick"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-equalizer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-audio-support",
+ "tune-plugin-sdk",
+]
+
+[[package]]
+name = "tune-plugin-native"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "minisign-verify",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tune-plugin-abi",
+ "tune-plugin-sdk",
+ "zip",
+]
+
+[[package]]
 name = "tune-plugin-runtime-wasm"
 version = "0.9.155"
 dependencies = [
  "serde_json",
  "tempfile",
  "wasmtime",
+]
+
+[[package]]
+name = "tune-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5482,7 +5564,11 @@ dependencies = [
  "tune-dj",
  "tune-http-types",
  "tune-karaoke",
+ "tune-plugin-converter",
+ "tune-plugin-declick",
+ "tune-plugin-native",
  "tune-plugin-runtime-wasm",
+ "tune-plugin-sdk",
  "tune-pont-roon",
  "tune-smart-http",
  "tune-stream-http",

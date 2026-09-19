@@ -1,0 +1,53 @@
+{
+  "id": "converter",
+  "sdk": {
+    "major": 0,
+    "minor": 1
+  },
+  "kind": "batch",
+  "config_version": 1,
+  "entitlement": "batch_converter",
+  "distribution": "source",
+  "capabilities": [
+    {
+      "id": "file-jobs",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "audio-codecs",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "metadata-copy",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "atomic-artifacts",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "cancellation",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CrossfeedSettings",
+  "type": "object",
+  "properties": {
+    "amount": {
+      "type": "number",
+      "format": "float",
+      "default": 0.30000001192092896
+    },
+    "delay_ms": {
+      "type": "number",
+      "format": "float",
+      "default": 0.30000001192092896
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}
