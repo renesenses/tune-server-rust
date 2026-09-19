@@ -474,3 +474,186 @@ mod tests_limite_services {
         }
     }
 }
+
+/// #4441 — la section Titres et les pistes venues d'un SERVICE.
+#[cfg(test)]
+mod tests_pistes_de_service_i4441 {
+    use super::{SearchParams, federated_search};
+    use axum::extract::{Query, State};
+    use tune_core::TuneError;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
+        StreamUrl, StreamingService,
+    };
+
+    fn piste(id: &str, titre: &str, artiste: &str, album: &str) -> StreamTrack {
+        StreamTrack {
+            id: id.to_string(),
+            title: titre.to_string(),
+            artist: artiste.to_string(),
+            album: Some(album.to_string()),
+            album_id: None,
+            duration_ms: 300_000,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            disponible: None,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    /// Un « Qobuz » qui répond comme le vrai à « wish you were here » (fil
+    /// 1839, capture `cJ0FqgEA…`) : les trois pistes de l'album, dont deux
+    /// dont le titre ne porte aucun mot de la requête — Qobuz rapproche sur
+    /// le titre d'album. Plus une piste accentuée, pour la pliure.
+    struct QobuzDeFabien;
+
+    #[async_trait::async_trait]
+    impl StreamingService for QobuzDeFabien {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "qobuz"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+            Ok(self.auth_status().await)
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus {
+                authenticated: true,
+                ..Default::default()
+            }
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Ok(SearchResults {
+                tracks: vec![
+                    piste(
+                        "q-machine",
+                        "Welcome to the Machine",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                    ),
+                    piste(
+                        "q-cigar",
+                        "Have a Cigar",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                    ),
+                    piste(
+                        "q-wywh",
+                        "Wish You Were Here",
+                        "Pink Floyd",
+                        "Wish You Were Here",
+                    ),
+                    piste("q-deja", "Déjà Vu", "Beyoncé", "B'Day"),
+                ],
+                albums: vec![],
+                artists: vec![],
+                playlists: vec![],
+            })
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Les identifiants des pistes Qobuz que `GET /search?q=…&sources=qobuz`
+    /// rend, dans l'ordre.
+    async fn pistes_qobuz_pour(q: &str) -> Vec<String> {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .services
+            .lock()
+            .await
+            .register(Box::new(QobuzDeFabien));
+        let reponse = federated_search(
+            State(state),
+            Query(SearchParams {
+                q: q.to_string(),
+                limit: None,
+                offset: None,
+                sources: Some("qobuz".into()),
+            }),
+        )
+        .await;
+        reponse.0["services"]["qobuz"]["tracks"]
+            .as_array()
+            .expect("un tableau de pistes Qobuz")
+            .iter()
+            .map(|p| p["source_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// ⭐ Le fil 1839, point 4 : « Tune retourne toujours "Have a cigar" dans
+    /// les titres ». La règle de #4367 — une piste est trouvée par ce qui
+    /// l'identifie, pas par son album — vaut pour les pistes de service
+    /// comme pour l'index local. Guillemets compris : c'est ainsi que FabienM
+    /// l'a saisie.
+    #[tokio::test]
+    async fn une_piste_de_service_n_est_pas_retenue_par_son_seul_titre_d_album() {
+        assert_eq!(
+            pistes_qobuz_pour("\"wish you were here\"").await,
+            vec!["q-wywh".to_string()],
+            "seule la piste dont le TITRE porte la requête doit rester (#4441)"
+        );
+        assert_eq!(
+            pistes_qobuz_pour("wish you were here").await,
+            vec!["q-wywh"]
+        );
+    }
+
+    /// Contre-épreuve : l'artiste identifie la piste — « pink floyd » garde
+    /// les trois ; et la pliure des accents rend « beyonce deja vu » capable
+    /// de trouver « Déjà Vu » de Beyoncé, comme Qobuz sait le faire.
+    #[tokio::test]
+    async fn l_artiste_et_les_accents_plies_identifient_toujours_la_piste() {
+        assert_eq!(
+            pistes_qobuz_pour("pink floyd").await,
+            vec!["q-machine", "q-cigar", "q-wywh"]
+        );
+        assert_eq!(pistes_qobuz_pour("beyonce deja vu").await, vec!["q-deja"]);
+        assert_eq!(pistes_qobuz_pour("Déjà").await, vec!["q-deja"]);
+    }
+}
