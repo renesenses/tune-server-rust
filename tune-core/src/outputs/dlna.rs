@@ -1292,7 +1292,11 @@ impl DlnaOutput {
     async fn av_action(&self, action: &str, body: &str) -> Result<String, String> {
         // Mesure l'appel logique complet : réessais et redécouverte inclus.
         // Un acquittement SOAP ne prouve ni l'état du renderer ni l'arrêt du son.
-        let mesure = matches!(action, "Pause" | "Play").then(|| {
+        // `Seek` aussi (#4442) : c'était le seul verbe de transport sans trace
+        // de départ ni d'issue — `Stop` a `dlna_stop`, `SetAVTransportURI` a
+        // `dlna_set_uri_ok`. Un transfert qui « repart du début » sur un
+        // renderer ne pouvait pas être instruit sur pièces.
+        let mesure = matches!(action, "Pause" | "Play" | "Seek").then(|| {
             let command_id = DLNA_COMMAND_ID.fetch_add(1, Ordering::Relaxed);
             let started = std::time::Instant::now();
             info!(device = %self.name, device_id = %self.device_id, action, command_id,
