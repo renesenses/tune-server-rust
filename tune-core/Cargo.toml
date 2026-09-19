@@ -109,6 +109,13 @@ webpki-roots = "0.26"
 # env-only derivation collided every instance on "tune-server" (#1112, #1127).
 # Already in the lockfile transitively, so this is a near-free direct dep.
 hostname = "0.4"
+# Décodeur DST (DSD compressé sans perte des SACD), pur Rust, sans FFmpeg (#4378).
+# Sortie vérifiée bit à bit contre libdstdec (référence ISO/Philips) et, en
+# PCM flottant, contre FFmpeg, sur l'échantillon FATE `dst-64fs44-2ch.dff`.
+# DÉSARMÉ par défaut : son README reproduit l'en-tête ISO/Philips du code de
+# référence (« Copyright is not released for non MPEG-4 Audio conforming
+# products ») — l'armer dans une version livrée est une décision de licence.
+dst-decoder = { version = "0.1.2", optional = true }
 # ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
 # keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
 # compile time — and the shared lib is loaded at runtime next to the model
@@ -309,6 +316,8 @@ postgres = ["dep:sqlx"]
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:tokenizers"]
+# #4378 : lecture des DSDIFF compressés DST. NOT in default — voir la dépendance.
+dst = ["dep:dst-decoder"]
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
 # transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.
