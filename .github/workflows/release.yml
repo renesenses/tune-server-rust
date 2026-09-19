@@ -183,8 +183,8 @@ jobs:
             platform: linux-aarch64-musl
             ext: tar.gz
             cross: true
-            # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+            # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding"]}
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
