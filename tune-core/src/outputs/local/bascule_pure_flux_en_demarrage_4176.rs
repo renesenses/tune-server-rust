@@ -70,8 +70,11 @@ fn une_bascule_pure_pendant_le_demarrage_ne_relance_pas_le_flux_4176() {
 /// HTTP et avant tout bras exclusif, `ouverture_encore_voulue` est consultée.
 #[test]
 fn le_fil_verifie_l_arret_avant_d_ouvrir_le_peripherique_4176() {
-    let src = include_str!("../local.rs");
-    let prod = src.split("#[cfg(test)]").next().unwrap();
+    // `local.rs` porte des `#[cfg(test)]` bien avant le fil de lecture : on
+    // lit le fichier ENTIER (ce module-ci est un fichier à part, il ne s'y
+    // trouve pas) ; aucun motif ne dépend des fins de ligne (clone Windows en
+    // CRLF).
+    let prod = include_str!("../local.rs");
     let premiere_lecture = prod
         .find("\"local_audio_first_read\"")
         .expect("la première lecture HTTP");
