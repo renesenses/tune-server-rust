@@ -4076,7 +4076,7 @@ fn le_temoin_radio_1629_ne_bouge_pas() {
         (true, true, RepriseDeSession::RejouerLeDirect),
     ] {
         assert_eq!(
-            reprise_de_session(true, true, pause_longue, session_morte),
+            reprise_de_session(true, true, pause_longue, session_morte, false),
             attendu,
             "radio (pause_longue={pause_longue}, session_morte={session_morte})"
         );
@@ -4087,7 +4087,7 @@ fn le_temoin_radio_1629_ne_bouge_pas() {
         [(false, false), (true, false), (false, true), (true, true)]
     {
         assert_eq!(
-            reprise_de_session(true, false, pause_longue, session_morte),
+            reprise_de_session(true, false, pause_longue, session_morte, false),
             RepriseDeSession::SurPlace,
             "radio sans URL (pause_longue={pause_longue}, session_morte={session_morte})"
         );
@@ -4103,12 +4103,12 @@ fn le_temoin_radio_1629_ne_bouge_pas() {
 #[test]
 fn la_duree_d_une_pause_ne_relance_jamais_une_piste() {
     assert_eq!(
-        reprise_de_session(false, true, true, false),
+        reprise_de_session(false, true, true, false, false),
         RepriseDeSession::SurPlace,
         "session vivante : une pause longue ne justifie AUCUN redémarrage"
     );
     assert_eq!(
-        reprise_de_session(false, false, true, false),
+        reprise_de_session(false, false, true, false, false),
         RepriseDeSession::SurPlace
     );
 }
@@ -4118,11 +4118,11 @@ fn la_duree_d_une_pause_ne_relance_jamais_une_piste() {
 #[test]
 fn une_piste_dont_la_session_est_morte_est_retablie_a_sa_position() {
     assert_eq!(
-        reprise_de_session(false, true, false, true),
+        reprise_de_session(false, true, false, true, false),
         RepriseDeSession::RetablirALaPosition
     );
     assert_eq!(
-        reprise_de_session(false, true, true, true),
+        reprise_de_session(false, true, true, true, false),
         RepriseDeSession::RetablirALaPosition
     );
 }
@@ -4132,7 +4132,7 @@ fn une_piste_dont_la_session_est_morte_est_retablie_a_sa_position() {
 #[test]
 fn une_piste_irrejouable_ne_se_tait_pas() {
     assert_eq!(
-        reprise_de_session(false, false, false, true),
+        reprise_de_session(false, false, false, true, false),
         RepriseDeSession::Expliquer
     );
 }
