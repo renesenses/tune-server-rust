@@ -271,7 +271,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     // event dispatch holds the loader's lock across every plugin's `on_event`,
     // so reaching for it here would let one slow plugin hang this endpoint.
     for info in plugin_snapshot(&state) {
-        plugins.push(serde_json::json!({
+        let mut card = serde_json::json!({
             "name": info.name,
             "display_name": info.name,
             "description": info.description,
@@ -281,8 +281,14 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "enabled": info.enabled,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
+            "activation_error": tune_plugin_native::failure(&info.name),
             "compatible": true,
-        }));
+        });
+        // Greffons audio premium : `installed`, `install_proposed`,
+        // `existing_configuration` à la racine, lus en base à chaque appel.
+        crate::premium_audio_plugins::annotate(&settings, &info.name, &mut card);
+        plugins.push(card);
     }
 
     // Compiled-in plugins that did not load: opt-in ones the user has not
@@ -301,7 +307,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         } else {
             true
         };
-        plugins.push(serde_json::json!({
+        let mut card = serde_json::json!({
             "name": info.name,
             "display_name": info.name,
             "description": info.description,
@@ -312,6 +318,8 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
+            "activation_error": tune_plugin_native::failure(&info.name),
             // 🔴 #3484 — le champ que la fiche wasm porte depuis toujours, et
             // que la fiche COMPILÉE n'a jamais porté (voir la boucle wasm plus
             // bas : `"restart_required": enabled && !loaded`). Un greffon
@@ -325,7 +333,9 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             // fiche sur laquelle l'écran doit proposer « Installer ». La dire
             // incompatible grisait le seul bouton qui la rende utile.
             "compatible": true,
-        }));
+        });
+        crate::premium_audio_plugins::annotate(&settings, &info.name, &mut card);
+        plugins.push(card);
     }
 
     // Wasm plugins installed on disk (marketplace installs or bundled).
@@ -434,8 +444,9 @@ async fn compatible_selon_le_disque(name: &str) -> bool {
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Some(info) = plugin_snapshot(&state).iter().find(|p| p.name == name) {
-        return Json(json!({
+        let mut card = json!({
             "name": info.name,
             "description": info.description,
             "version": info.version,
@@ -444,14 +455,19 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": info.enabled,
             "status": "loaded",
             "config_schema": info.config_schema,
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
+            "activation_error": tune_plugin_native::failure(&info.name),
             // Il TOURNE dans ce processus : il a franchi la porte d'ABI.
             "compatible": true,
-        }));
+        });
+        // Greffons audio premium : `installed`, `install_proposed`,
+        // `existing_configuration` à la racine — le contrat du client web.
+        crate::premium_audio_plugins::annotate(&settings, &info.name, &mut card);
+        return Json(card);
     }
 
     let chargeable = peut_etre_installe(&state, &name).await;
 
-    let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
     let installed = settings
         .get(&key)
@@ -499,13 +515,15 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
     }
 
     let compatible = compatible_selon_le_disque(&name).await;
-    Json(json!({
+    let mut card = json!({
         "name": name,
         "installed": installed,
         "enabled": enabled,
         "status": if installed { "installed" } else { "not_installed" },
         "compatible": compatible,
-    }))
+    });
+    crate::premium_audio_plugins::annotate(&settings, &name, &mut card);
+    Json(card)
 }
 
 /// Le greffon `name` tourne-t-il DANS ce processus, en ce moment ?
@@ -539,12 +557,19 @@ fn greffon_charge(state: &AppState, name: &str) -> bool {
 /// tourne réellement. Réactiver un greffon déjà chargé, ou désactiver un
 /// greffon déjà absent, ne demande aucun redémarrage — et le prétendre
 /// enverrait couper la musique pour rien.
-async fn enable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
+async fn enable_plugin(
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+        return response;
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
     let restart_required = !greffon_charge(&state, &name);
     Json(json!({ "name": name, "enabled": true, "restart_required": restart_required }))
+        .into_response()
 }
 
 /// Le pendant de [`enable_plugin`] : un greffon qui tourne continue de tourner
@@ -651,6 +676,9 @@ async fn install_plugin(
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
     }
+    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+        return response;
+    }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("plugin_{name}_installed");
@@ -670,6 +698,9 @@ async fn update_plugin(
     // would leave the hole open through the "Update" button.
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
+    }
+    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+        return response;
     }
 
     let settings = SettingsRepo::with_backend(state.backend.clone());

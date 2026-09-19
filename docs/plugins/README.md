@@ -4,21 +4,29 @@
 
 Tune supports plugins that react to server events, read/write configuration,
 and extend behaviour without modifying core code.  Plugins are implemented as
-Rust types that satisfy the `TunePlugin` trait.
+Rust types that satisfy the `TunePlugin` trait in the native composition model
+described here. For the separate experimental audio/batch SDK and scaffolding,
+see [premium SDK status](premium-sdk.md) and [SDK usage](../../sdk/README.md).
+That SDK is not connected to the production host yet.
 
 ### Loading model
 
-Plugins are **compiled into the server** behind cargo features.  There is no
-`libloading` and no wasm runtime — `docs/ARCHITECTURE-CIBLE-v0.9.md` lists
-dynamic loading as a target, not the current state.  Adding a plugin is three
-lines in `tune-server`: a feature, an optional dependency, and an arm in
-`register_builtin_plugins` (`tune-server/src/plugins.rs`).
+Native plugins are **compiled into the server**, either behind cargo features
+or through downstream composition. There is no native dynamic-library loader.
+Adding an in-tree native plugin requires a feature, an optional dependency,
+and registration in `register_builtin_plugins` (`tune-server/src/plugins.rs`).
+
+A separate **WASM runtime does exist**, behind `plugins-wasm`, in
+`tune-plugin-runtime-wasm` and `tune-server/src/plugins_host.rs`. It scans enabled
+plugin manifests and exposes a limited, permission-gated host API. The native
+`TunePlugin` model below and that WASM protocol are distinct; neither currently
+implements the experimental audio/batch SDK.
 
 One cargo constraint to know before you reference an out-of-tree plugin by
 path: **cargo resolves optional path dependencies while writing the lockfile**,
 so a `path` dependency pointing at a directory that is not in the clone breaks
-`cargo check` for everyone, feature enabled or not.  That is why no concrete
-plugin is referenced in this repository.
+`cargo check` for everyone, feature enabled or not. This restriction applies to
+absent out-of-tree plugins, not the in-tree plugin crates already in this repo.
 
 ### Plugins that live outside this repository
 
@@ -60,8 +68,8 @@ building, and there is no cargo feature to add here.
 
 ### 1. manifest.json
 
-Every plugin lives in its own directory under `plugins/`.  The directory must
-contain a `manifest.json`:
+The following is the registry/WASM manifest shape. A native composed plugin
+does not need this file for `PluginLoader::register` to work:
 
 ```json
 {
@@ -76,12 +84,11 @@ contain a `manifest.json`:
 }
 ```
 
-> **The server does not read this file yet.** Plugins are compiled in (see
-> *Loading model* below), so the loader never scans manifests: `permissions` is
-> not enforced and `min_server_version` is not compared to anything. Ship a
-> manifest anyway — it is the forward-compatible shape — but do not rely on it
-> for anything today. The version check that *is* enforced is
-> `protocol_version` on the trait.
+> **The native `PluginLoader` does not read this file.** Its version check is
+> `protocol_version` on the trait; manifest permissions are not a sandbox for
+> native code. The WASM registry does read manifests and gates its host imports
+> by permissions. Its installed entry point is normally `main.wasm`. Neither
+> manifest should be confused with the experimental source SDK's manifest.
 
 | Field                | Required | Description                                        |
 |----------------------|----------|----------------------------------------------------|

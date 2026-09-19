@@ -78,6 +78,9 @@ pub(super) fn active_zone_eq_profile(
     zone_id: i64,
 ) -> Option<tune_core::audio::eq::EqProfile> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+    if !tune_core::audio::premium_plugins::enabled(&settings, "equalizer") {
+        return None;
+    }
     // PURE : le PCM atteint la sortie intact, l'égaliseur n'est jamais construit.
     if tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;

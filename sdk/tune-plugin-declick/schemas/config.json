@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Options",
+  "type": "object",
+  "properties": {
+    "destination": {
+      "$ref": "#/$defs/Destination",
+      "default": {
+        "kind": "download"
+      }
+    },
+    "output_format": {
+      "type": "string",
+      "default": "flac"
+    },
+    "threshold_db": {
+      "type": "number",
+      "format": "float",
+      "default": -60.0
+    },
+    "trim_lead": {
+      "type": "boolean",
+      "default": true
+    },
+    "trim_tail": {
+      "type": "boolean",
+      "default": true
+    },
+    "zero_cross": {
+      "type": "boolean",
+      "default": true
+    }
+  },
+  "$defs": {
+    "Destination": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "download"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "grant": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "directory_grant"
+            }
+          },
+          "required": [
+            "kind",
+            "grant"
+          ]
+        }
+      ]
+    }
+  }
+}

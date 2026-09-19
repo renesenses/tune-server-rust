@@ -909,8 +909,8 @@ async fn bridge_disable(State(state): State<AppState>) -> Json<Value> {
 async fn license_status(State(state): State<AppState>) -> Json<Value> {
     let ls = state.license.license_state().await;
     let mut features = serde_json::Map::new();
-    for f in tune_core::license::Feature::all_premium() {
-        let enabled = state.license.check_feature(*f).await;
+    for f in tune_core::license::Feature::all_advertised() {
+        let enabled = state.license.check_feature(f).await;
         features.insert(
             serde_json::to_value(f)
                 .unwrap()
