@@ -2377,9 +2377,11 @@ where
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
     // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
     let famine_cb = ring_cb.starvation();
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     device.build_output_stream(
         cfg,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             render_local_shared_integer_callback(
                 &ring_cb,
                 &vol_cb,
@@ -2420,9 +2422,11 @@ fn build_compressed_f32_stream(
     let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
     // Prélevé AVANT la fermeture de rendu, qui consomme `ring_cb` (#3205).
     let famine_cb = ring_cb.starvation();
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     device.build_output_stream(
         cfg,
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             render_local_shared_f32_callback(
                 &ring_cb,
                 &vol_cb,
@@ -6254,6 +6258,66 @@ impl OutputTarget for LocalOutput {
 /// On macOS CoreAudio the callback typically never fires on unplug (the
 /// AudioUnit just stops rendering); the feed-stall and drain deadlines in the
 /// playback thread cover that case.
+/// #3206 — la demande d'ordonnancement temps réel du fil de rendu, faite
+/// UNE fois, à la première période du rappel cpal.
+///
+/// Sous ALSA, cpal crée lui-même le fil du rappel : il n'existe aucun point
+/// d'entrée avant son premier passage, d'où cette sentinelle capturée par la
+/// fermeture, à côté de la rampe et de la famine. La demande ne refuse jamais
+/// une lecture : refusée, elle laisse le fil en `SCHED_OTHER` et le dit, une
+/// ligne de journal et l'état `LocalBackendStatus.realtime`.
+///
+/// Hors Linux la demande est sans objet : rien n'est journalisé ni enregistré.
+struct PromotionDuFilDeRendu {
+    faite: bool,
+}
+
+impl PromotionDuFilDeRendu {
+    fn nouvelle() -> Self {
+        Self { faite: false }
+    }
+
+    /// À appeler en tête de chaque période ; n'agit qu'à la première.
+    fn a_la_premiere_periode(&mut self) {
+        if self.faite {
+            return;
+        }
+        self.faite = true;
+        let issue = crate::audio::ordonnancement_rt::demander_pour_le_fil_courant();
+        journaliser_l_ordonnancement(&issue);
+        note_realtime_scheduling(issue);
+    }
+}
+
+/// La ligne de journal du ticket : obtenu ou refusé, et pourquoi. Une fois par
+/// fil de rendu, avant que la porte de préchargement ne laisse passer le son.
+fn journaliser_l_ordonnancement(issue: &crate::audio::ordonnancement_rt::OrdonnancementTempsReel) {
+    use crate::audio::ordonnancement_rt::OrdonnancementTempsReel;
+    match issue {
+        OrdonnancementTempsReel::Obtenu {
+            policy,
+            priority,
+            rlimit_rtprio,
+        } => info!(
+            policy,
+            priority,
+            rlimit_rtprio = ?rlimit_rtprio,
+            "local_audio_realtime_scheduling — ordonnancement temps réel obtenu pour le fil de rendu (#3206)"
+        ),
+        OrdonnancementTempsReel::Refuse {
+            priority,
+            rlimit_rtprio,
+            cause,
+        } => warn!(
+            priority,
+            rlimit_rtprio = ?rlimit_rtprio,
+            cause = %cause,
+            "local_audio_realtime_scheduling — ordonnancement temps réel refusé, le fil de rendu reste en SCHED_OTHER (#3206)"
+        ),
+        OrdonnancementTempsReel::SansObjet => {}
+    }
+}
+
 fn make_stream_error_cb(
     device_gone: Arc<AtomicBool>,
     starvation: Arc<RingStarvation>,
@@ -6453,6 +6517,11 @@ mod tests;
 #[cfg(test)]
 mod open_failure_tests;
 
+/// #3206 — la sentinelle qui demande l'ordonnancement temps réel du fil de
+/// rendu, et l'état qu'elle publie. La décision de priorité et l'appel au
+/// noyau vivent dans `crate::audio::ordonnancement_rt`, hors `local-audio`.
+#[cfg(test)]
+mod ordonnancement_rt_i3206;
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans
 /// `crate::audio::periode_alsa` : elles tournent dans la porte `test` de la CI,

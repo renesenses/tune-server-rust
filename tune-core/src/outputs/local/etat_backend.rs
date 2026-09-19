@@ -171,6 +171,26 @@ pub(super) struct ObservedDevice {
 pub(super) static OBSERVED_RATE: std::sync::RwLock<Option<ObservedRate>> =
     std::sync::RwLock::new(None);
 
+/// Ce que le noyau a répondu à la DERNIÈRE demande d'ordonnancement temps
+/// réel du fil de rendu (#3206). `None` = aucun fil de rendu n'a encore tourné
+/// depuis le démarrage, ou plateforme où la question ne se pose pas.
+///
+/// ⚠️ Comme `OBSERVED_RATE`, porte la dernière observation et n'est pas effacé
+/// à l'arrêt.
+pub(super) static OBSERVED_REALTIME: std::sync::RwLock<
+    Option<crate::audio::ordonnancement_rt::OrdonnancementTempsReel>,
+> = std::sync::RwLock::new(None);
+
+/// Enregistre la réponse du noyau à la demande d'ordonnancement temps réel.
+/// Appelé par la sentinelle du fil de rendu, une fois par fil (#3206).
+pub(super) fn note_realtime_scheduling(
+    issue: crate::audio::ordonnancement_rt::OrdonnancementTempsReel,
+) {
+    if let Ok(mut slot) = OBSERVED_REALTIME.write() {
+        *slot = Some(issue);
+    }
+}
+
 /// Ce que la dernière ouverture partagée a demandé comme cadence, et ce qu'elle
 /// a ouvert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,6 +410,15 @@ pub struct LocalBackendStatus {
     /// deux autres : une zone peut jouer sur le bon backend, le bon
     /// périphérique, et à une autre cadence que la source.
     pub rate: Option<LocalRateStatus>,
+    /// L'ordonnancement du fil de rendu (#3206) : `state` = `obtenu`
+    /// (`policy`, `priority`) ou `refuse` (`cause`), avec la limite
+    /// `rlimit_rtprio` lue au moment de la demande.
+    ///
+    /// `None` = aucun fil de rendu n'a encore tourné depuis le démarrage, ou
+    /// plateforme où la question ne se pose pas (CoreAudio, WASAPI). Absent
+    /// plutôt que faux, comme `device` et `rate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<crate::audio::ordonnancement_rt::OrdonnancementTempsReel>,
 }
 
 /// Ce que la sortie locale a réellement OUVERT, face à ce que la zone
@@ -648,12 +677,14 @@ pub fn active_backend_name(backend: &str) -> &'static str {
 /// n'a toujours aucun moyen de savoir s'il s'est trompé de réglage ou si le
 /// serveur a basculé — ni pourquoi.
 pub fn active_backend_status(requested: &str) -> LocalBackendStatus {
-    backend_status_with_rate(
+    let mut status = backend_status_with_rate(
         OBSERVED_BACKEND.read().ok().and_then(|g| *g),
         OBSERVED_DEVICE.read().ok().and_then(|g| g.clone()),
         OBSERVED_RATE.read().ok().and_then(|g| *g),
         requested,
-    )
+    );
+    status.realtime = OBSERVED_REALTIME.read().ok().and_then(|g| g.clone());
+    status
 }
 
 /// Règle d'arbitrage entre observé et demandé, isolée pour être testable sans
@@ -731,5 +762,6 @@ pub(super) fn backend_status_with_rate(
         fallback_detail: fallback_reason.map(LocalBackendFallback::detail),
         device: observed_device.map(LocalDeviceStatus::from_observed),
         rate: observed_rate.map(LocalRateStatus::from_observed),
+        realtime: None,
     }
 }
