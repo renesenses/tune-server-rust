@@ -125,6 +125,7 @@ POST /api/v1/library/ingest/jobs/{id}/undo
 GET  /api/v1/zones
 POST /api/v1/zones/{id}/play
 POST /api/v1/zones/{id}/pause
+POST /api/v1/zones/{id}/playpause  # one-call toggle, for one-button remotes
 
 GET  /api/v1/playlists
 GET  /api/v1/streaming/services
