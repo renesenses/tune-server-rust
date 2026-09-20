@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets};
+use tune_core::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets, titre_commun};
 use tune_core::metadata::disques_abimes::{Correction, PisteAExaminer, corrections};
 use tune_http_types::panne_sql::OuDefautJournalise;
 
@@ -3530,6 +3530,147 @@ pub(super) async fn coffrets_eclates(
         "albums": trouves.iter().map(|c| c.disques.len()).sum::<usize>(),
         "coffrets": trouves.iter().map(rapport_coffret).collect::<Vec<_>>(),
     })))
+}
+
+/// Ce que le client envoie pour composer un coffret à la main.
+#[derive(serde::Deserialize)]
+pub(super) struct CoffretManuel {
+    /// Les albums à réunir, DANS L'ORDRE DES DISQUES. Deux au minimum.
+    pub album_ids: Vec<i64>,
+}
+
+/// `POST /library/albums/coffret` — composer un coffret À LA MAIN.
+///
+/// Bertrand, 20/09/2026, capture à l'appui : « je voudrais créer un coffret
+/// pour 101 de Depeche Mode », dont la bibliothèque porte *101 - Disc A*
+/// (9 pistes) et *101 - Disc B* (11 pistes). « Et je veux l'interface pour le
+/// faire, proche de Compilations. »
+///
+/// # Pourquoi la détection automatique ne pouvait pas le faire
+///
+/// Deux raisons, toutes deux mesurées dans le code :
+///
+/// 1. [`tune_core::metadata::coffrets::marqueur_final`] ne lit que des
+///    CHIFFRES. *Disc A* et *Disc B* lui sont invisibles.
+/// 2. Elle groupe par DOSSIERS FRÈRES. Un coffret rangé autrement — un seul
+///    dossier, ou des dossiers qui ne se ressemblent pas — lui échappe, quel
+///    que soit son marqueur.
+///
+/// Ce geste-ci ne suppose RIEN : c'est l'utilisateur qui désigne les albums,
+/// et l'ordre de sa liste est l'ordre des disques.
+///
+/// # Ce qu'il écrit
+///
+/// Le numéro de disque de chaque album — `1`, `2`, … dans l'ordre reçu — puis
+/// la fusion par [`AlbumRepo::absorber`], celle-là même qu'emploie le
+/// regroupement automatique. Rien n'est écrit dans les FICHIERS : réparer la
+/// base est réversible d'un rescan, réécrire un FLAC ne l'est pas.
+///
+/// ⚠️ Le titre du coffret est le plus long préfixe COMMUN des titres réunis
+/// ([`titre_commun`]) — « 101 » pour les deux disques de Bertrand. Faute de
+/// préfixe utilisable, l'album cible garde son titre : on ne l'invente pas.
+/// Comme pour le regroupement automatique, un titre non renommé n'annule pas
+/// la réunion — les pistes sont déjà ensemble, et refuser laisserait la
+/// bibliothèque à mi-chemin.
+pub(super) async fn composer_coffret(
+    State(state): State<AppState>,
+    Json(body): Json<CoffretManuel>,
+) -> axum::response::Response {
+    // Dédoublonner SANS trier : l'ordre reçu est l'ordre des disques.
+    let mut vus = std::collections::BTreeSet::new();
+    let ids: Vec<i64> = body
+        .album_ids
+        .into_iter()
+        .filter(|id| vus.insert(*id))
+        .collect();
+    if ids.len() < 2 {
+        return refus(
+            StatusCode::BAD_REQUEST,
+            "coffret_trop_court",
+            "un coffret réunit au moins deux albums".to_string(),
+        );
+    }
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    // 🔴 TOUT VÉRIFIER AVANT D'ÉCRIRE. Un identifiant inconnu au milieu de la
+    // liste laisserait sinon un coffret à moitié composé, que rien ne défait.
+    let mut titres = Vec::with_capacity(ids.len());
+    for &id in &ids {
+        match repo.get(id) {
+            Ok(Some(a)) => titres.push(a.title),
+            Ok(None) => {
+                return refus(
+                    StatusCode::NOT_FOUND,
+                    "album_inconnu",
+                    format!("l'album {id} n'existe pas"),
+                );
+            }
+            Err(e) => {
+                return AppError::internal(format!("lecture de l'album {id} : {e}"))
+                    .into_response();
+            }
+        }
+    }
+    let cible = ids[0];
+
+    // Le numéro de disque, dans l'ordre reçu — y compris pour la cible, qui
+    // devient le disque 1 même si ses pistes se déclaraient autre chose.
+    for (rang, &id) in ids.iter().enumerate() {
+        let (p1, p2) = match state.backend.engine() {
+            Engine::Postgres => (
+                PostgresDialect.placeholder(1),
+                PostgresDialect.placeholder(2),
+            ),
+            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+        };
+        if let Err(e) = state.backend.execute(
+            &format!("UPDATE tracks SET disc_number = {p1} WHERE album_id = {p2}"),
+            &[&((rang + 1) as i64) as &dyn ToSqlValue, &id],
+        ) {
+            return AppError::internal(format!("numérotation du disque {id} : {e}"))
+                .into_response();
+        }
+    }
+
+    let mut absorbes = 0usize;
+    for &id in &ids[1..] {
+        if let Err(e) = repo.absorber(cible, id) {
+            return AppError::internal(format!("réunion du disque {id} : {e}")).into_response();
+        }
+        absorbes += 1;
+    }
+
+    let titre = titre_commun(&titres);
+    if let Some(t) = titre.as_deref() {
+        let (p1, p2) = match state.backend.engine() {
+            Engine::Postgres => (
+                PostgresDialect.placeholder(1),
+                PostgresDialect.placeholder(2),
+            ),
+            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+        };
+        if let Err(e) = state.backend.execute(
+            &format!("UPDATE albums SET title = {p1} WHERE id = {p2}"),
+            &[&t.to_string() as &dyn ToSqlValue, &cible],
+        ) {
+            tracing::warn!(album = cible, erreur = %e, "coffret_manuel_titre_non_renomme");
+        }
+    }
+    state.event_bus.emit(
+        tune_core::event_types::EventType::LibraryUpdated.as_str(),
+        json!({ "source": "coffret_manuel", "cible": cible }),
+    );
+    let titre_rendu = titre.unwrap_or_else(|| titres[0].clone());
+    tracing::info!(cible, absorbes, disques = ids.len(), titre = %titre_rendu, "coffret_compose");
+    (
+        StatusCode::OK,
+        Json(json!({
+            "cible": cible,
+            "absorbes": absorbes,
+            "disques": ids.len(),
+            "titre": titre_rendu,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /library/albums/coffrets/{cible}/regrouper` — réunit UN coffret.
