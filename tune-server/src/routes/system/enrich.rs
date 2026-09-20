@@ -22,7 +22,7 @@ use crate::state::AppState;
 pub(super) async fn background_tasks_status(State(state): State<AppState>) -> Json<Value> {
     // `tasks` reste ce qu'il a toujours été — l'instantané du registre RAII,
     // lu par la bannière de la barre latérale. Le bloc `pausable` s'y AJOUTE
-    // (#4573) : l'état de chacun des traitements suspendables et l'état de
+    // (#4574) : l'état de chacun des traitements suspendables et l'état de
     // l'interrupteur général, dans le même aller-retour. Un client d'avant ne
     // voit pas la différence ; l'écran « État du serveur » n'a pas à sonder
     // une seconde route pour savoir quelles cartes portent « En pause ».

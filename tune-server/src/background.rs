@@ -13,7 +13,7 @@ use crate::state::AppState;
 /// token refresh, UPnP advertiser, alarm scheduler, Deezer proxy config, desktop notifications,
 /// and RSS memory diagnostics.
 pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
-    // AVANT tout spawn (#4573). Les passes de fond relisent leur pause dans un
+    // AVANT tout spawn (#4574). Les passes de fond relisent leur pause dans un
     // miroir en mémoire qui part à zéro ; sans cette relecture, une pause posée
     // hier serait oubliée au redémarrage et le décodage repartirait tout seul —
     // précisément ce que la persistance existe pour empêcher. Les passes dorment

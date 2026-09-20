@@ -46,7 +46,7 @@ mod replaygain;
 // garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
 // expressément.
 pub mod scan;
-/// Pause et reprise des traitements de fond (#4573) — voir le module.
+/// Pause et reprise des traitements de fond (#4574) — voir le module.
 pub(crate) mod taches_de_fond;
 mod tags;
 pub(crate) mod update;
@@ -117,7 +117,7 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
-        // Suspendre et reprendre les traitements de fond (#4573). Le scan avait
+        // Suspendre et reprendre les traitements de fond (#4574). Le scan avait
         // `/scan/cancel` ; le ReplayGain, la plage dynamique, l'analyse
         // acoustique, l'enrichissement et les images d'artistes n'avaient
         // AUCUN geste, alors qu'ils tournent des heures. Un identifiant par

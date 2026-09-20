@@ -169,7 +169,7 @@ path = "tests/integration_contracts.rs"
 
 # `autotests = false` en tete de ce manifeste : sans cette cible, le temoin de
 # la pause des traitements de fond ne serait JAMAIS compile et la porte rendrait
-# un vert contre rien (#4573). Binaire a lui seul : la pause est un etat de
+# un vert contre rien (#4574). Binaire a lui seul : la pause est un etat de
 # PROCESSUS (masque de bits atomique), comme l'avancement ReplayGain — un voisin
 # qui suspendrait une passe dans le meme binaire le rendrait intermittent.
 [[test]]
