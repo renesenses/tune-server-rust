@@ -554,11 +554,23 @@ impl StreamingService for BandcampService {
     /// se LIT sans session ; elle ne s'écrit pas. Le refus par défaut du trait
     /// dit « not supported », ce qui se lit comme un oubli — celui-ci dit
     /// pourquoi, et où le geste existe vraiment.
+    ///
+    /// 🔴 #4577 — ce refus n'est PAS ce qui empêchait le cœur de FabienM de
+    /// tenir. Le favori d'un objet de service est tenu par Tune, dans
+    /// `streaming_favorites`, par `POST /profiles/{id}/favorites/streaming/add`
+    /// ; cette méthode-ci n'est que la RECOPIE vers le service, et il n'y a
+    /// rien à recopier chez Bandcamp. Ce qui perdait le favori était la clé :
+    /// l'URL de flux, resignée à chaque lecture de page — voir
+    /// [`tune_core::streaming::favorites_identity`]. Le client, de son côté,
+    /// n'émet plus cette recopie pour Bandcamp, donc ce refus ne sort plus dans
+    /// le journal ; il reste pour tout appelant direct de la route, et il dit
+    /// où le favori vit réellement.
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
         Err(TuneError::Unsupported(
             "Bandcamp : ajouter un favori demande une session d'achat, que Tune n'a pas. \
-             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit."
+             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit. \
+             Le cœur posé dans Tune, lui, est conservé par Tune."
                 .into(),
         ))
     }
@@ -566,7 +578,8 @@ impl StreamingService for BandcampService {
         let _ = (fav_type, item_id);
         Err(TuneError::Unsupported(
             "Bandcamp : retirer un favori demande une session d'achat, que Tune n'a pas. \
-             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit."
+             La liste de souhaits se modifie sur bandcamp.com ; Tune la lit. \
+             Le cœur posé dans Tune, lui, se retire dans Tune."
                 .into(),
         ))
     }
