@@ -139,31 +139,87 @@ pub fn service_du_catalogue(rules_json: &str) -> Option<String> {
 /// `smart_collections::avec_albums_de_catalogue`.
 pub fn cible(rules_json: &str) -> Option<Cible> {
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
-    let egalite = |r: &Value| {
-        matches!(
-            crate::regles_sql::normaliser_op(
-                r.get("op")
-                    .or_else(|| r.get("operator"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("contains"),
-            ),
-            "="
-        )
-    };
     let nomme = |quoi: &[&str]| -> Option<String> {
         rules.iter().find_map(|r| {
             let c = champ(r);
-            if !quoi.contains(&c.as_str()) || !egalite(r) {
+            if !quoi.contains(&c.as_str()) || !est_egalite(r) {
                 return None;
             }
             let v = valeur(r);
             (!v.is_empty()).then_some(v)
         })
     };
-    if let Some(a) = nomme(&["artist", "artist_name"]) {
+    if let Some(a) = nomme(CHAMPS_ARTISTE) {
         return Some(Cible::Artiste(a));
     }
-    nomme(&["album", "album_title", "title"]).map(Cible::Album)
+    nomme(CHAMPS_ALBUM).map(Cible::Album)
+}
+
+/// Les champs qui nomment un ARTISTE, pour le catalogue.
+const CHAMPS_ARTISTE: &[&str] = &["artist", "artist_name"];
+/// Les champs qui nomment un titre d'ALBUM (voir [`cible`] pour `title`).
+const CHAMPS_ALBUM: &[&str] = &["album", "album_title", "title"];
+/// Tout ce qu'un service sait chercher.
+const CHAMPS_CIBLES: &[&str] = &["artist", "artist_name", "album", "album_title", "title"];
+
+fn est_egalite(r: &Value) -> bool {
+    matches!(
+        crate::regles_sql::normaliser_op(
+            r.get("op")
+                .or_else(|| r.get("operator"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("contains"),
+        ),
+        "="
+    )
+}
+
+/// Les règles qu'un service ne sait PAS honorer à côté d'un catalogue — #4473.
+///
+/// Le service répond à « les albums de cet artiste » ou « l'album de ce
+/// titre », rien d'autre. Une règle de format, de fréquence, d'année, de
+/// nombre d'écoutes, de dossier ou de favori n'a aucun sens à distance : les
+/// albums rendus par le service ne la respecteraient pas, et la collection
+/// afficherait sous « FLAC 24 bits » des albums qui ne le sont pas. Même chose
+/// pour un artiste ou un titre qui n'est pas une ÉGALITÉ (« contient Col »).
+///
+/// Rend la liste lisible de ces règles (`champ opérateur`), vide quand tout
+/// est honorable. L'appelant REFUSE si elle ne l'est pas — l'arbitrage de
+/// l'issue, et la leçon de #4469 : une règle non traduite ne vaut jamais
+/// « vrai pour tout ».
+pub fn regles_hors_service(rules_json: &str) -> Vec<String> {
+    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    rules
+        .iter()
+        .filter(|r| {
+            let c = champ(r);
+            if c == "source" && valeur(r).to_lowercase().starts_with(PREFIXE_CATALOGUE) {
+                return false;
+            }
+            !(CHAMPS_CIBLES.contains(&c.as_str()) && est_egalite(r))
+        })
+        .map(|r| {
+            let op = r
+                .get("op")
+                .or_else(|| r.get("operator"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("contains");
+            format!("{} {op}", champ(r))
+        })
+        .collect()
+}
+
+/// Le titre d'album qu'une règle nomme À CÔTÉ d'un artiste.
+///
+/// « catalogue Qobuz, artiste Coltrane, album Blue Train » : la recherche part
+/// de l'artiste ([`cible`]), et ce titre-ci doit encore TRIER ce que le
+/// service rend — sinon la collection montrerait toute la discographie.
+pub fn titre_exige(rules_json: &str) -> Option<String> {
+    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    rules.iter().find_map(|r| {
+        let v = valeur(r);
+        (CHAMPS_ALBUM.contains(&champ(r).as_str()) && est_egalite(r) && !v.is_empty()).then_some(v)
+    })
 }
 
 #[cfg(test)]
@@ -255,6 +311,42 @@ mod tests {
             let r = format!(r#"[{{"field":"artist","op":"{op}","value":"Coltrane"}}]"#);
             assert_eq!(cible(&r), None, "opérateur {op}");
         }
+    }
+
+    /// 🔴 #4473 — ce que le service ne sait pas filtrer est NOMMÉ, pour être
+    /// refusé : « catalogue Qobuz + Coltrane + FLAC » rendrait sinon des
+    /// albums Qobuz sous une règle de format qu'ils ne respectent pas.
+    #[test]
+    fn les_regles_qu_un_service_ne_sait_pas_honorer_sont_nommees() {
+        let honorable = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                            {"field":"artist","op":"=","value":"John Coltrane"},
+                            {"field":"title","op":"equals","value":"Blue Train"}]"#;
+        assert!(regles_hors_service(honorable).is_empty());
+
+        let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                    {"field":"artist","op":"=","value":"John Coltrane"},
+                    {"field":"format","op":"=","value":"FLAC"},
+                    {"field":"play_count","op":">=","value":"3"},
+                    {"field":"album","op":"contains","value":"Blue"}]"#;
+        assert_eq!(
+            regles_hors_service(r),
+            vec!["format =", "play_count >=", "album contains"]
+        );
+        // Une seconde règle de source (« local ») n'a pas de sens à distance.
+        let deux = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                       {"field":"source","op":"=","value":"local"}]"#;
+        assert_eq!(regles_hors_service(deux), vec!["source ="]);
+    }
+
+    #[test]
+    fn le_titre_exige_a_cote_d_un_artiste() {
+        let r = r#"[{"field":"artist","op":"=","value":"Coltrane"},
+                    {"field":"album","op":"=","value":"Blue Train"}]"#;
+        assert_eq!(titre_exige(r).as_deref(), Some("Blue Train"));
+        assert_eq!(
+            titre_exige(r#"[{"field":"artist","op":"=","value":"C"}]"#),
+            None
+        );
     }
 
     #[test]
