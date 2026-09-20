@@ -37,6 +37,30 @@ async fn appel(app: &axum::Router, methode: &str, chemin: &str) -> (StatusCode, 
     )
 }
 
+/// Le même appel, avec un CORPS JSON — la composition manuelle en a un.
+async fn appel_corps(
+    app: &axum::Router,
+    methode: &str,
+    chemin: &str,
+    corps: Value,
+) -> (StatusCode, Value) {
+    let requete = Request::builder()
+        .method(methode)
+        .uri(chemin)
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_vec(&corps).unwrap()))
+        .unwrap();
+    let reponse = app.clone().oneshot(requete).await.unwrap();
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        statut,
+        serde_json::from_slice(&octets).unwrap_or(Value::Null),
+    )
+}
+
 fn inserer(state: &Etat, sql: &str, params: &[&dyn ToSqlValue]) -> i64 {
     state.backend.execute(sql, params).unwrap();
     state.backend.last_insert_rowid()
@@ -951,4 +975,146 @@ async fn un_groupe_de_trois_perd_le_membre_ecarte_et_garde_les_autres() {
         ),
         2
     );
+}
+
+// ---------------------------------------------------------------------------
+// Composer un coffret À LA MAIN — `POST /library/albums/coffret`
+// ---------------------------------------------------------------------------
+
+/// Le cas EXACT de Bertrand, 20/09/2026, capture à l'appui : deux albums
+/// Depeche Mode, *101 - Disc A* (9 pistes) et *101 - Disc B* (11 pistes).
+fn le_101_de_depeche_mode(state: &Etat) -> (i64, i64) {
+    let dm = artiste(state, "Depeche Mode");
+    let a = album(state, "101 - Disc A", dm);
+    let b = album(state, "101 - Disc B", dm);
+    for n in 1..=9 {
+        piste(state, a, dm, n, &format!("/m/DM/101 A/{n:02}.flac"));
+    }
+    for n in 1..=11 {
+        piste(state, b, dm, n, &format!("/m/DM/101 B/{n:02}.flac"));
+    }
+    (a, b)
+}
+
+#[tokio::test]
+async fn le_101_devient_un_album_a_deux_disques() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+
+    // 🔴 CONTRE-ÉPREUVE D'ABORD : la détection AUTOMATIQUE ne voit rien. Le
+    // marqueur est une LETTRE, et `marqueur_final` ne lit que des chiffres.
+    // Sans ce constat, ce banc pourrait être vert contre un coffret que
+    // l'ancien chemin aurait déjà réuni.
+    let (statut, corps) = appel(&app, "GET", "/api/v1/library/albums/coffrets").await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(
+        corps["coffrets"].as_array().map(|v| v.len()),
+        Some(0),
+        "la détection automatique voit le coffret : ce banc ne prouve plus rien"
+    );
+
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [a, b] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "corps = {corps}");
+    assert_eq!(corps["cible"].as_i64(), Some(a));
+    assert_eq!(corps["absorbes"].as_i64(), Some(1));
+    assert_eq!(corps["disques"].as_i64(), Some(2));
+    // Le titre perd son marqueur : « 101 », pas « 101 - Disc A ».
+    assert_eq!(corps["titre"].as_str(), Some("101"));
+
+    // UN seul album survit, avec les 20 pistes.
+    assert!(album_existe(&state, a));
+    assert!(!album_existe(&state, b), "le disque B n'a pas été absorbé");
+    assert_eq!(
+        compte(&state, "SELECT COUNT(*) FROM tracks WHERE album_id = ?", a),
+        20
+    );
+
+    // Et DEUX disques, pas un seul : c'est toute la différence avec
+    // « Réunir en un seul disque » de l'onglet Compilations.
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ? AND disc_number = 1",
+            a
+        ),
+        9
+    );
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ? AND disc_number = 2",
+            a
+        ),
+        11
+    );
+}
+
+#[tokio::test]
+async fn l_ordre_recu_est_l_ordre_des_disques() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+    // B d'abord : c'est LUI qui devient le disque 1, et la cible.
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [b, a] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(corps["cible"].as_i64(), Some(b));
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ? AND disc_number = 1",
+            b
+        ),
+        11,
+        "le disque 1 n'est pas celui que l'utilisateur a mis en tête"
+    );
+}
+
+#[tokio::test]
+async fn rien_n_est_ecrit_quand_un_album_est_inconnu() {
+    let (app, state) = serveur();
+    let (a, b) = le_101_de_depeche_mode(&state);
+    let (statut, corps) = appel_corps(
+        &app,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        json!({ "album_ids": [a, 999_999, b] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::NOT_FOUND);
+    assert_eq!(corps["error"].as_str(), Some("album_inconnu"));
+    // 🔴 Le coffret n'est pas à moitié composé : les deux albums vivent
+    // encore, et aucune piste n'a changé de disque.
+    assert!(album_existe(&state, a));
+    assert!(album_existe(&state, b));
+    assert_eq!(
+        compte(
+            &state,
+            "SELECT COUNT(*) FROM tracks WHERE album_id = ? AND disc_number = 2",
+            a
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn un_seul_album_n_est_pas_un_coffret() {
+    let (app, state) = serveur();
+    let (a, _b) = le_101_de_depeche_mode(&state);
+    for corps_envoye in [json!({ "album_ids": [a] }), json!({ "album_ids": [a, a] })] {
+        let (statut, corps) =
+            appel_corps(&app, "POST", "/api/v1/library/albums/coffret", corps_envoye).await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST);
+        assert_eq!(corps["error"].as_str(), Some("coffret_trop_court"));
+    }
 }
