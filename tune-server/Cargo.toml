@@ -187,6 +187,16 @@ path = "tests/albums_upnp_visibles_4146.rs"
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
 
+# #4577 — un favori Bandcamp posé une fois se retrouve la fois suivante.
+# `autotests = false` en tête de ce manifeste : sans cette cible le fichier ne
+# serait JAMAIS compilé, et la garde ne serait exécutée par personne.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "favori_bandcamp_survit_a_la_resignature_4577"
+path = "tests/favori_bandcamp_survit_a_la_resignature_4577.rs"
+
 # #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
 # qui DISENT quand ils mordent. Mesuré sur les routes montées.
 #
