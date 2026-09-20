@@ -149,6 +149,32 @@ fn base_du_marqueur(json: &str) -> Option<Vec<String>> {
     Some(decouper(&json[ouvre + 1..ferme]))
 }
 
+/// Recolle les interpolations `${{ … }}` d'un YAML en UN seul mot.
+///
+/// 🔴 Trou mesuré le 20/09/2026, sabotage n°4 de la contre-épreuve : la ligne
+/// `--features ${{ matrix.features }},dst` se découpait en `--features`, `${{`,
+/// `matrix.features`, `}},dst`. Le lecteur prenait `${{` pour la valeur du
+/// drapeau et le `,dst` tombait dans un mot que personne ne regardait — la
+/// garde passait au VERT sur le raccourci le plus évident pour allumer `dst`
+/// sur les deux cibles ARM d'un coup. Sans interpolation, la ligne est rendue
+/// telle quelle.
+fn normaliser_interpolations(ligne: &str) -> String {
+    let mut sortie = String::with_capacity(ligne.len());
+    let mut reste = ligne;
+    while let Some(debut) = reste.find("${{") {
+        sortie.push_str(&reste[..debut]);
+        let apres = &reste[debut..];
+        let Some(fin) = apres.find("}}") else {
+            sortie.push_str(apres);
+            return sortie;
+        };
+        sortie.extend(apres[..fin + 2].chars().filter(|c| !c.is_whitespace()));
+        reste = &apres[fin + 2..];
+    }
+    sortie.push_str(reste);
+    sortie
+}
+
 /// Les fonctionnalités passées par `--features` / `-F` dans une commande déjà
 /// découpée en mots. `--features a,b` comme `--features=a,b`, et les
 /// répétitions s'additionnent : c'est ainsi que cargo les lit.
@@ -236,7 +262,8 @@ fn listes(fichier: &str, source: &str) -> Vec<Liste> {
 
         // 3. Une commande de build de tune-server.
         if construit_tune_server(t) {
-            let mots: Vec<&str> = t.split_whitespace().collect();
+            let recollee = normaliser_interpolations(t);
+            let mots: Vec<&str> = recollee.split_whitespace().collect();
             let features = drapeaux_features(&mots);
             if !features.is_empty() {
                 let relais = features.iter().any(|f| f.contains("${{"));
@@ -348,6 +375,48 @@ fn dst_n_est_dans_aucune_ligne_de_build_publiee() {
          JURIDIQUE de Bertrand, pas une ligne de workflow.\n\
          Pour compiler `dst` sans rien publier, c'est `ci.yml` — hors portée de \
          cette garde."
+    );
+}
+
+/// 🔴 #4378 — le trou du 20/09/2026, figé.
+///
+/// La contre-épreuve à la main a trouvé que `--features ${{ matrix.features
+/// }},dst` passait au VERT. Une contre-épreuve ne se rejoue pas toute seule :
+/// ce témoin la garde. Il exerce l'extracteur sur la ligne du sabotage, sans
+/// toucher au dépôt.
+#[test]
+fn un_dst_colle_derriere_une_interpolation_est_vu() {
+    let saboteur = "run: cross build --release --package tune-server --target \
+                    ${{ matrix.target }} --no-default-features --features \
+                    ${{ matrix.features }},dst";
+    let relevees = listes("témoin", saboteur);
+    assert_eq!(
+        relevees.len(),
+        1,
+        "la ligne du sabotage doit rendre exactement une liste — {relevees:?}"
+    );
+    assert!(
+        relevees[0].relais,
+        "la ligne doit être reconnue comme un relais — {:?}",
+        relevees[0]
+    );
+    assert!(
+        relevees[0].features.iter().any(|f| est_dst(f)),
+        "`dst` collé derrière l'interpolation n'est pas vu — {:?}",
+        relevees[0]
+    );
+
+    // Sens NÉGATIF : la même ligne, telle qu'elle est écrite aujourd'hui, ne
+    // doit rien signaler. Un témoin qui rougit toujours ne prouve rien.
+    let propre = "run: cross build --release --package tune-server --target \
+                  ${{ matrix.target }} --no-default-features --features \
+                  ${{ matrix.features }}";
+    let relevees = listes("témoin", propre);
+    assert_eq!(relevees.len(), 1, "{relevees:?}");
+    assert!(
+        !relevees[0].features.iter().any(|f| est_dst(f)),
+        "faux positif sur la ligne de relais réelle — {:?}",
+        relevees[0]
     );
 }
 
