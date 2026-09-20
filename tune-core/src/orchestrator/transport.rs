@@ -28,6 +28,41 @@ pub(crate) fn nom_lisible_de_l_appareil(dev_id: &str) -> Option<String> {
     Some(reste.to_string())
 }
 
+/// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
+///
+/// `blocage` est ce que l'appelant a MESURÉ du coupe-circuit ASIO (#4556) :
+/// `None` = refus ordinaire, la phrase de #3737 mot pour mot. `Some` = le
+/// serveur sait qu'il n'a pas regardé, et il le dit.
+///
+/// Pure exprès : l'état du coupe-circuit est un état de PROCESSUS, et le muter
+/// depuis un test empoisonnerait en parallèle les dizaines de tests de ce
+/// module qui attendent l'ancienne phrase.
+pub(crate) fn refus_de_zone_hors_ligne(
+    appareil: Option<&str>,
+    zone: &str,
+    blocage: Option<&crate::outputs::asio_blocage_4556::BlocageAsio>,
+) -> (String, Option<&'static str>) {
+    if let Some(blocage) = blocage {
+        let phrase = blocage.message_fr(appareil, zone);
+        return (blocage.sentinelle(&phrase), Some(blocage.motif.code()));
+    }
+    // 🔴 #3737 — nommer l'APPAREIL, pas seulement la zone.
+    //
+    // Jean-Luc Cassé a DEUX zones nommées « audio-gd USB audio (local) » : le
+    // nom de zone ne lui dit pas laquelle est en cause, ni ce qui a disparu.
+    let phrase = match appareil {
+        Some(appareil) => format!(
+            "zone_output_unavailable:La sortie « {appareil} » de la zone « {zone} » n'est plus disponible. \
+             Vérifiez qu'elle est branchée et allumée, ou choisissez une autre sortie dans les réglages de la zone."
+        ),
+        None => format!(
+            "zone_output_unavailable:La sortie de cette zone n'est plus disponible. \
+             Choisissez une sortie dans les réglages de la zone « {zone} »."
+        ),
+    };
+    (phrase, None)
+}
+
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
 pub(super) struct Habillage {
@@ -143,7 +178,9 @@ impl PlaybackOrchestrator {
     /// `Ok(Some(id))` — the zone was re-bound to `id`, which the caller must use
     /// as the request's `output_device_id`.
     /// `Err(msg)` — playback must be refused; `msg` carries the
-    /// `zone_output_unavailable:` sentinel the API maps to a 409.
+    /// `zone_output_unavailable:` sentinel the API maps to a 409, ou — quand
+    /// c'est le coupe-circuit ASIO qui a vidé le parc (#4556) — celle de
+    /// [`crate::outputs::asio_blocage_4556`], qui porte en plus un code stable.
     pub(super) async fn gate_or_rebind_offline_zone(
         &self,
         zone_id: i64,
@@ -271,35 +308,47 @@ impl PlaybackOrchestrator {
             return Ok(Some(new_id));
         }
 
-        // 🔴 #3737 — nommer l'APPAREIL, pas seulement la zone.
+        // La phrase est composée par `refus_de_zone_hors_ligne` — #3737
+        // (nommer l'APPAREIL, pas seulement la zone) y est écrit en toutes
+        // lettres. Ici on ne décide que d'UNE chose : y a-t-il quelque chose
+        // de plus honnête à dire que « vérifiez qu'elle est branchée » ?
         //
-        // Jean-Luc Cassé a DEUX zones nommées « audio-gd USB audio (local) » :
-        // le nom de zone ne lui dit pas laquelle est en cause, ni ce qui a
-        // disparu. Le serveur, lui, connaît les deux bouts — il les écrit déjà
-        // au journal juste au-dessus. Les mettre dans le message ne coûte rien
-        // et transforme « une sortie » en « votre DAC ».
-        let msg = match nom_lisible_de_l_appareil(dev_id) {
-            Some(appareil) => format!(
-                "zone_output_unavailable:La sortie « {appareil} » de la zone « {} » n'est plus disponible. \
-                 Vérifiez qu'elle est branchée et allumée, ou choisissez une autre sortie dans les réglages de la zone.",
-                zone.name
-            ),
-            None => format!(
-                "zone_output_unavailable:La sortie de cette zone n'est plus disponible. \
-                 Choisissez une sortie dans les réglages de la zone « {} ».",
-                zone.name
-            ),
-        };
+        // 🔴 #4556 — ne pas accuser le matériel quand le serveur SAIT qu'il
+        // n'a pas regardé.
+        //
+        // Marco Polo (fil 1852, SMSL SU-1) : son témoin de plantage ASIO est
+        // posé, le balayage de démarrage est suspendu, le parc local publié
+        // est un repli WASAPI — donc `local:USB DAC ASIO` ne peut PAS y être,
+        // quoi qu'il advienne de son DAC. Lui écrire « vérifiez qu'elle est
+        // branchée et allumée » désigne le câble et lui fait conclure que son
+        // appareil est mort. Le refus reste (rouvrir un pilote ASIO qui a
+        // emporté le processus précédent n'est pas une option), mais il dit
+        // enfin la vérité, nomme le témoin et donne le geste — et il porte un
+        // CODE, pour que le bouton « Réarmer ASIO » s'affiche là où le défaut
+        // se manifeste au lieu d'être enterré dans l'écran Diagnostics.
+        //
+        // Les deux conditions sont exigées ensemble par
+        // `blocage_expliquant_un_parc_de_repli` : porte fermée ET repli
+        // mesuré. Un témoin oublié sur une machine réglée en WASAPI garde donc
+        // l'ancien message — là, l'absence est vraiment mesurée.
+        let blocage_asio = dev_id
+            .starts_with("local:")
+            .then(crate::outputs::asio_blocage_4556::blocage_expliquant_un_parc_de_repli)
+            .flatten();
+        let (msg, code_du_refus) = refus_de_zone_hors_ligne(
+            nom_lisible_de_l_appareil(dev_id).as_deref(),
+            &zone.name,
+            blocage_asio.as_ref(),
+        );
         warn!(
             zone_id,
             zone_name = %zone.name,
             device = dev_id,
+            motif_asio = code_du_refus.unwrap_or("-"),
             "play_rejected_zone_offline"
         );
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
+            let mut charge = serde_json::json!({
                     "zone_id": zone_id,
                     "error": msg,
                     // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
@@ -316,8 +365,25 @@ impl PlaybackOrchestrator {
                     // Une sortie disparue ne revient pas dans les 30 s : ce refus
                     // est fatal par nature.
                     "fatal": true,
-                }),
-            );
+            });
+            // #4556 — le code stable, comme `bitperfect_strict_refused` : c'est
+            // par CE canal que le refus atteint réellement l'écran (voir
+            // `fatal` ci-dessus), donc c'est ici que le bouton « Réarmer ASIO »
+            // doit trouver à quoi s'accrocher. Ajouté seulement quand il y a
+            // quelque chose à dire : un refus ordinaire garde sa charge utile
+            // d'avant, au champ près.
+            if let (Some(code), Some(objet)) = (code_du_refus, charge.as_object_mut()) {
+                objet.insert("code".into(), code.into());
+                objet.insert(
+                    "can_rearm".into(),
+                    crate::outputs::asio_blocage_4556::code_rearmable(code).into(),
+                );
+                objet.insert(
+                    "rearm_endpoint".into(),
+                    crate::outputs::asio_blocage_4556::ROUTE_DE_REARMEMENT.into(),
+                );
+            }
+            bus.emit("zone.playback_error", charge);
         }
         Err(msg)
     }
