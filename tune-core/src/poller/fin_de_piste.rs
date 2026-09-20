@@ -467,6 +467,52 @@ impl PositionPoller {
         (verdict, flux_arme, octets_tires)
     }
 
+    /// #3967 — demander au renderer de basculer LUI-MÊME sur la suivante
+    /// qu'il tient déjà, au lieu de détruire son flux armé et de tout
+    /// relancer.
+    ///
+    /// Rend `true` seulement si l'appareil a ACQUITTÉ la consigne. Un refus,
+    /// un SOAP muet, une sortie absente du registre : `false`, et l'appelant
+    /// reprend le repli d'aujourd'hui sans rien avoir changé.
+    ///
+    /// La consigne n'est pas une preuve : l'adoption qui la suit est
+    /// surveillée sur [`BASCULE_DELAI_SECS`] et relance la piste ADOPTÉE si
+    /// le renderer n'a pas bougé.
+    pub(super) async fn demander_la_bascule(&self, zone_id: i64, device_id: &str) -> bool {
+        let output_arc = {
+            let outputs = self.outputs.lock().await;
+            outputs.get(device_id)
+        };
+        let Some(output_arc) = output_arc else {
+            return false;
+        };
+        let t0 = Instant::now();
+        let issue = {
+            let output = output_arc.lock().await;
+            output.basculer_sur_la_suivante_preparee().await
+        };
+        match issue {
+            Ok(()) => {
+                info!(
+                    zone_id,
+                    device = %device_id,
+                    next_ms = t0.elapsed().as_millis() as u64,
+                    "gapless_bascule_demandee"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    zone_id,
+                    device = %device_id,
+                    error = %e,
+                    "gapless_bascule_refusee"
+                );
+                false
+            }
+        }
+    }
+
     /// #4173 — la fin à l'horloge ADOPTE l'enchaînement du renderer.
     ///
     /// Même avance que `gapless_transition_detected` (`advance_queue_metadata`,
@@ -542,6 +588,13 @@ impl PositionPoller {
                     position_figee_ms: status.position_ms,
                     flux,
                     preuve,
+                    // #3967 — une bascule COMMANDÉE se juge en trois sondages,
+                    // pas en huit : le renderer n'a rien à charger.
+                    delai_secs: if preuve == decisions::EnchainementArme::Bascule {
+                        BASCULE_DELAI_SECS
+                    } else {
+                        ADOPTION_HORLOGE_DELAI_SECS
+                    },
                 });
             }
             None => {
@@ -678,7 +731,9 @@ impl PositionPoller {
                             resolve_ms = t0.elapsed().as_millis() as u64,
                             "gapless_next_set_local_file"
                         );
-                        GaplessPrep::Armed(arme)
+                        // Chemin FICHIER LOCAL (OAAT en DSD natif) : aucune
+                        // suivante à vérifier auprès d'un renderer réseau.
+                        GaplessPrep::Armed(arme, SuivantePreparee::Inconnue)
                     }
                     Err(e) => {
                         warn!(zone_id, error = %e, "gapless_set_next_local_file_failed");
@@ -823,14 +878,24 @@ impl PositionPoller {
                         warn!(zone_id, error = %e, resolve_ms, "gapless_set_next_failed");
                         GaplessPrep::NotArmed
                     } else {
+                        // #3967 — l'acquittement ne prouve rien. On demande
+                        // maintenant à l'appareil ce qu'il RETIENT et ce qu'il
+                        // DÉCLARE pouvoir faire ; c'est la seule chose qui
+                        // autorisera, en fin de piste, une bascule par `Next`
+                        // au lieu de tout relancer. Une sortie qui ne sait pas
+                        // répondre rend `Inconnue` et rien ne change.
+                        let t_verif = Instant::now();
+                        let tenue = output.suivante_preparee(&resolved.url).await;
                         info!(
                             zone_id,
                             title = %resolved.title,
                             resolve_ms,
                             streaming = is_streaming,
+                            suivante = ?tenue,
+                            verif_ms = t_verif.elapsed().as_millis() as u64,
                             "gapless_next_set"
                         );
-                        GaplessPrep::Armed(arme)
+                        GaplessPrep::Armed(arme, tenue)
                     }
                 } else {
                     GaplessPrep::NotArmed
