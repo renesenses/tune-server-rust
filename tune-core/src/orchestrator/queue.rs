@@ -789,6 +789,9 @@ impl PlaybackOrchestrator {
                     nature: etat.session_context_type.as_deref(),
                     id: etat.session_context_id.as_deref(),
                     rang: rang_a_retenir(etat.shuffle, etat.queue_position),
+                    service: etat.session_context_source.as_deref(),
+                    titre: etat.session_context_title.as_deref(),
+                    pochette: etat.session_context_cover.as_deref(),
                 },
             );
         }

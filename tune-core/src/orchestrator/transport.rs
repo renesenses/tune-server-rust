@@ -1255,7 +1255,13 @@ impl PlaybackOrchestrator {
             // position reellement atteinte, avance automatique comprise. En
             // aleatoire il reste vide — on re-tirera (#2441).
             let rang = rang_a_retenir(etat.shuffle, etat.queue_position);
-            let context = (etat.session_context_type, etat.session_context_id);
+            let context = (
+                etat.session_context_type,
+                etat.session_context_id,
+                etat.session_context_source,
+                etat.session_context_title,
+                etat.session_context_cover,
+            );
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -1277,6 +1283,9 @@ impl PlaybackOrchestrator {
                     nature: context.0.as_deref(),
                     id: context.1.as_deref(),
                     rang,
+                    service: context.2.as_deref(),
+                    titre: context.3.as_deref(),
+                    pochette: context.4.as_deref(),
                 },
             );
         }

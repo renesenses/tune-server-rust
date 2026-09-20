@@ -763,6 +763,9 @@ async fn pg_history_round_trip() {
         context_type: None,
         context_id: None,
         context_position: None,
+        context_source: None,
+        context_title: None,
+        context_cover: None,
     };
     repo.record(&rec).unwrap();
     repo.record(&rec).unwrap();
