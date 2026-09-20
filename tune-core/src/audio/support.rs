@@ -106,11 +106,13 @@ pub fn decoder_rejection(path: &Path) -> Option<UnsupportedLibraryAudio> {
             report_key: ext,
             reason: "DST compressé : aucun décodeur n'est livré".into(),
         }),
+        // #4378 : avec la feature `dst`, `DffStreamReader` décode ces trames.
         "dff"
-            if path
-                .to_str()
-                .and_then(|path| super::dff::parse_dff(path).ok())
-                .is_some_and(|info| info.is_dst()) =>
+            if cfg!(not(feature = "dst"))
+                && path
+                    .to_str()
+                    .and_then(|path| super::dff::parse_dff(path).ok())
+                    .is_some_and(|info| info.is_dst()) =>
         {
             Some(UnsupportedLibraryAudio {
                 report_key: "dff-dst".into(),
@@ -383,6 +385,7 @@ mod tests {
     /// n'est livré. C'est ce que la variante « fichier en main » attrape et que
     /// la variante « extension seule » ne peut pas voir — les deux moitiés du
     /// même contrat.
+    #[cfg(not(feature = "dst"))]
     #[test]
     fn un_dff_compresse_en_dst_est_refuse_par_le_contenu() {
         // #3030 — `test_scratch` et rien d'autre : un chemin composé à la main
@@ -585,6 +588,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "dst"))]
     #[test]
     fn dff_compresse_dst_est_detecte_par_son_contenu() {
         let dir = tempfile::tempdir().unwrap();

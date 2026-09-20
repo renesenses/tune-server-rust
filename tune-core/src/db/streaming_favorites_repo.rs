@@ -6,6 +6,7 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 use crate::favorites_sort::{self, CleDeTri, TriFavoris};
+use crate::streaming::favorites_identity::identite_de_favori;
 
 /// A favorited streaming item (Tidal/Qobuz/…). Unlike local `favorites` (keyed
 /// on an INTEGER `item_id`), streaming items use string `service_id`s, so they
@@ -174,6 +175,21 @@ pub mod sql {
     }
 }
 
+/// Le dépôt des favoris de service **tenus par Tune**.
+///
+/// 🔴 #4577 — toute méthode qui porte une clé fait passer le `service_id` par
+/// [`identite_de_favori`], en écriture comme en lecture. La raison est
+/// mesurée et elle tient en une phrase : l'identifiant d'un titre Bandcamp est
+/// son URL de flux, et Bandcamp la RESIGNE à chaque lecture de la page. Une
+/// ligne écrite sous une signature n'était donc jamais retrouvée sous la
+/// suivante — le cœur de FabienM repartait vide à chaque rechargement (fil
+/// 1862, point 4).
+///
+/// La normalisation est posée ICI, et pas chez les appelants : ils sont
+/// quatre — la route de profil, la reprise (#3419), le tri manuel (#2001) et
+/// la règle de collection intelligente — et il suffit qu'un seul l'oublie pour
+/// que sa clé cesse de tomber sur celle des autres. Elle est idempotente, donc
+/// la repasser ne coûte rien.
 pub struct StreamingFavoritesRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -213,6 +229,8 @@ impl StreamingFavoritesRepo {
         let sql = self.dialect_sql(sql::add, sql::add);
         // Native and migrated PostgreSQL profiles are BIGINT after migration 060.
         let pid = profile_id;
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
         let params: [&dyn ToSqlValue; 8] = [
             &pid,
             &item_type,
@@ -249,6 +267,8 @@ impl StreamingFavoritesRepo {
         };
         let sql = self.dialect_sql(sql::add_date, sql::add_date);
         let pid = profile_id;
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
         let params: [&dyn ToSqlValue; 9] = [
             &pid,
             &item_type,
@@ -276,6 +296,8 @@ impl StreamingFavoritesRepo {
     ) -> Result<bool, String> {
         let sql = self.dialect_sql(sql::dater, sql::dater);
         let pid = profile_id;
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
         let params: [&dyn ToSqlValue; 6] = [
             &created_at,
             &pid,
@@ -296,6 +318,8 @@ impl StreamingFavoritesRepo {
     ) -> Result<(), String> {
         let sql = self.dialect_sql(sql::remove, sql::remove);
         let pid = profile_id;
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
         let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
         self.db.execute(&sql, &params)?;
         Ok(())
@@ -310,6 +334,8 @@ impl StreamingFavoritesRepo {
     ) -> Result<bool, String> {
         let sql = self.dialect_sql(sql::count_one, sql::count_one);
         let pid = profile_id;
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
         let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
         let n = self
             .db
@@ -422,7 +448,9 @@ impl StreamingFavoritesRepo {
                 // Rang lié en TEXTE : position reste TEXT sur PostgreSQL
                 // (migration 057), indépendamment du profil entier.
                 let rang = (rang as i64 + 1).to_string();
-                let params: [&dyn ToSqlValue; 5] = [&rang, &pid, &item_type, service, service_id];
+                let cle = identite_de_favori(service_id);
+                let service_id: &str = cle.as_ref();
+                let params: [&dyn ToSqlValue; 5] = [&rang, &pid, &item_type, service, &service_id];
                 ranges += tx.execute(&pose, &params)?;
             }
             Ok(())

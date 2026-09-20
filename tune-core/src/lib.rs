@@ -68,6 +68,9 @@ pub mod social;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;
+/// Pause des traitements de fond — voir le module pour le pourquoi : les
+/// passes durent des heures et seul le scan avait un geste pour les arrêter.
+pub mod taches_de_fond;
 /// Temporisation des boucles d'ecoute reseau apres une erreur — voir le module
 /// pour le pourquoi (issue #2156 : une erreur persistante sur `accept()`
 /// saturait un coeur et remplissait le disque au repos).

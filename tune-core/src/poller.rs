@@ -1119,3 +1119,12 @@ mod fin_hors_temps_reel_tests;
 /// inchangé quand rien n'atteste l'enchaînement.
 #[cfg(test)]
 mod adoption_a_l_horloge_4173;
+
+/// #4559 — Jean Valjean, fil 1857 : le panneau annonce « WASAPI (shared —
+/// Windows mixer) » pendant que le journal montre le bras exclusif ouvert et
+/// `bit_perfect=true`. Le contrat de signal arrive à l'ouverture du
+/// périphérique, après que le client a relu la zone, et AUCUNE charge utile
+/// poussée ne le porte. Les témoins montent le vrai `tick` et prouvent que
+/// l'arrivée du contrat s'annonce — une fois, et une seule.
+#[cfg(test)]
+mod annonce_du_contrat_de_signal_4559;

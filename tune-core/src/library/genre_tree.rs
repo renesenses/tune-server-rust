@@ -252,6 +252,19 @@ pub fn find_parent_genre(genre: &str) -> Option<&'static str> {
     None
 }
 
+/// La graphie de la hiérarchie pour un nom de genre, casse indifférente
+/// (« progressive rock » → « Progressive Rock »). `None` si le nom n'y est
+/// pas. Sert à ramener deux saisies d'un même genre au MÊME texte avant la
+/// tour texte du CLAP, qui distingue la casse (#3836).
+pub fn nom_canonique(genre: &str) -> Option<&'static str> {
+    let lower = genre.trim().to_lowercase();
+    GENRE_HIERARCHY
+        .iter()
+        .flat_map(|(parent, children)| std::iter::once(parent).chain(children.iter()))
+        .find(|nom| nom.to_lowercase() == lower)
+        .copied()
+}
+
 fn genre_counts(db: &Arc<dyn DbBackend>) -> HashMap<String, i64> {
     let mut counts = HashMap::new();
 

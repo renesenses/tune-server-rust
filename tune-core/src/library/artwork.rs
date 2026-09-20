@@ -678,6 +678,10 @@ pub async fn batch_enrich_artwork_scoped(
     let mut failed = 0u32;
 
     for (album_id, title, artist_name, mbid) in &albums {
+        // Même traitement, même carte à l'écran que les images d'artistes :
+        // « Pochettes d'artistes » couvre les deux passes de `library::artwork`.
+        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::ImagesArtistes)
+            .await;
         let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
 
         // Step 1: Determine MBID — use existing or search MusicBrainz
@@ -1697,6 +1701,13 @@ async fn batch_enrich_artist_artwork_inner(
     let total_images = artists.len();
 
     for (i, (artist_id, name, mbid)) in artists.iter().enumerate() {
+        // Pause demandée par l'utilisateur : on GARE la passe entre deux
+        // artistes. La liste est calculée à l'ouverture et n'existe qu'en
+        // mémoire ; en sortir terminerait la tâche au lieu de la suspendre.
+        // L'artiste précédent a son image écrite et son avancement publié —
+        // la frontière est propre, et la reprise repart au même `i`.
+        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::ImagesArtistes)
+            .await;
         // Rate limit: short delay between community lookups (no rate limit),
         // longer delay only when hitting external APIs (MusicBrainz etc.)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

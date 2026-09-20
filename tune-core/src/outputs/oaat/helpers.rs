@@ -584,6 +584,53 @@ pub(super) enum BaseDeTempsOaat {
     OctetsADebitConstant,
 }
 
+/// Retard à partir duquel un paquet est compté comme tardif.
+///
+/// Un paquet PCM porte 10 ms d'audio ; 20 ms de retard, c'est donc deux
+/// paquets de marge déjà mangés. En dessous, l'endpoint absorbe sans qu'on
+/// l'entende.
+pub(super) const SEUIL_RETARD_MS: u64 = 20;
+
+/// #4567 — la mesure du CADENCEMENT de l'envoi OAAT.
+///
+/// L'envoi dort jusqu'à l'heure de présentation de chaque paquet ; quand il
+/// est EN RETARD, il ne dort pas — et ne le disait à personne. Une micro-
+/// coupure ne laissait donc aucune trace : le guetteur ne réagit qu'après
+/// 10 s de silence, et `playback complete` ne publiait que la durée.
+/// Trois micro-coupures sur la .18 le 19 et le 20/09/2026 (Bertrand, zone
+/// Tune Endpoint) n'ont rien laissé dans le journal.
+///
+/// Ne change rien au son : on mesure, on ne corrige pas.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MesureDeCadence {
+    pub(super) paquets: u64,
+    pub(super) paquets_en_retard: u64,
+    pub(super) retard_max_ms: u64,
+}
+
+impl MesureDeCadence {
+    /// Observe un paquet. Rend `Some(retard_ms)` quand ce paquet est tardif
+    /// ET bat le record : l'appelant journalise alors une ligne, pas une par
+    /// paquet — un flux qui décroche en produirait des centaines.
+    pub(super) fn observer(
+        &mut self,
+        prevu: std::time::Duration,
+        ecoule: std::time::Duration,
+    ) -> Option<u64> {
+        self.paquets += 1;
+        let retard = ecoule.saturating_sub(prevu).as_millis() as u64;
+        if retard < SEUIL_RETARD_MS {
+            return None;
+        }
+        self.paquets_en_retard += 1;
+        if retard <= self.retard_max_ms {
+            return None;
+        }
+        self.retard_max_ms = retard;
+        Some(retard)
+    }
+}
+
 pub(super) fn duree_audio_envoyee(
     base: BaseDeTempsOaat,
     sample_offset: u64,
@@ -1355,5 +1402,56 @@ mod tests_trames_flac {
             "un CRC faux doit écarter la trame : les données compressées sont \
              pleines de pseudo-synchros"
         );
+    }
+}
+
+#[cfg(test)]
+mod mesure_de_cadence_4567 {
+    use super::{MesureDeCadence, SEUIL_RETARD_MS};
+    use std::time::Duration;
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn un_envoi_a_l_heure_ou_en_avance_ne_compte_aucun_retard() {
+        let mut m = MesureDeCadence::default();
+        assert_eq!(m.observer(MS(1000), MS(1000)), None);
+        assert_eq!(m.observer(MS(1000), MS(990)), None);
+        assert_eq!(m.paquets, 2);
+        assert_eq!(m.paquets_en_retard, 0);
+        assert_eq!(m.retard_max_ms, 0);
+    }
+
+    #[test]
+    fn un_retard_sous_le_seuil_est_ignore() {
+        let mut m = MesureDeCadence::default();
+        assert_eq!(m.observer(MS(1000), MS(1000 + SEUIL_RETARD_MS - 1)), None);
+        assert_eq!(m.paquets_en_retard, 0);
+    }
+
+    /// Le cas des micro-coupures : un paquet très tardif, nommé une fois.
+    #[test]
+    fn un_paquet_tardif_est_compte_et_nomme_une_seule_fois() {
+        let mut m = MesureDeCadence::default();
+        assert_eq!(m.observer(MS(1000), MS(1350)), Some(350));
+        // Le même retard ne rouvre pas la bouche : une ligne, pas un torrent.
+        assert_eq!(m.observer(MS(2000), MS(2350)), None);
+        // Un retard PIRE se dit, lui.
+        assert_eq!(m.observer(MS(3000), MS(3500)), Some(500));
+        assert_eq!(m.paquets, 3);
+        assert_eq!(m.paquets_en_retard, 3);
+        assert_eq!(m.retard_max_ms, 500);
+    }
+
+    /// Contre-épreuve : l'envoi normal d'une piste entière ne journalise rien
+    /// et ne compte rien — la mesure doit rester muette quand tout va bien.
+    #[test]
+    fn une_piste_entiere_a_l_heure_reste_muette() {
+        let mut m = MesureDeCadence::default();
+        for i in 0..1000u64 {
+            assert_eq!(m.observer(MS(i * 10), MS(i * 10)), None);
+        }
+        assert_eq!(m.paquets, 1000);
+        assert_eq!(m.paquets_en_retard, 0);
     }
 }

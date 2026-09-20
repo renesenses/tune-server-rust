@@ -9,6 +9,10 @@ autotests = false
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
+# #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
+# de toute ligne de build publiée (licence de `dst-decoder` non tranchée,
+# arbitrage de Bertrand). Garde : tune-core/tests/dst_desarmee_4378.rs.
+dst = ["tune-core/dst"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]
 postgres = ["tune-core/postgres"]
@@ -182,6 +186,16 @@ path = "tests/albums_upnp_visibles_4146.rs"
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
+
+# #4577 — un favori Bandcamp posé une fois se retrouve la fois suivante.
+# `autotests = false` en tête de ce manifeste : sans cette cible le fichier ne
+# serait JAMAIS compilé, et la garde ne serait exécutée par personne.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "favori_bandcamp_survit_a_la_resignature_4577"
+path = "tests/favori_bandcamp_survit_a_la_resignature_4577.rs"
 
 # #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
 # qui DISENT quand ils mordent. Mesuré sur les routes montées.
@@ -755,3 +769,24 @@ path = "tests/playback_panne_de_base_4261.rs"
 [[test]]
 name = "corps_vide_4447"
 path = "tests/corps_vide_4447.rs"
+
+# #4566 — la bascule lecture/pause en un appel (`POST /zones/{id}/playpause`).
+# `autotests = false` en tête de ce manifeste : sans cette cible, le témoin du
+# refus sur zone vide ne serait JAMAIS compilé.
+[[test]]
+name = "playpause_un_appel_4566"
+path = "tests/playpause_un_appel_4566.rs"
+
+# #4565 — le dénominateur de la ligne « Index de recherche ». `autotests =
+# false` en tête de ce manifeste : sans cette cible, ni le témoin du faux ⚠
+# ni sa contre-épreuve ne seraient jamais compilés.
+[[test]]
+name = "index_recherche_denominateur_4565"
+path = "tests/index_recherche_denominateur_4565.rs"
+
+# #4564 — les captures du signalement forum. `autotests = false` en tête de ce
+# manifeste : sans cette cible, ni la garde du nom `images[]` ni les refus
+# bornés ne seraient jamais compilés.
+[[test]]
+name = "bug_report_captures_4564"
+path = "tests/bug_report_captures_4564.rs"

@@ -763,8 +763,15 @@ jobs:
       #
       # Garde : `toute_caisse_du_workspace_est_nommee_par_une_porte_clippy`
       # (tune-server/tests/workflows_bornes.rs).
-      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon -- -D clippy::correctness
+      # #4378 : `dst` est dans cette base — et NULLE PART ailleurs. La porte
+      # clippy est le seul endroit où le décodeur DST doit être compilé :
+      # ci.yml ne publie rien. La feature reste hors de `default` et hors de
+      # toutes les lignes de build de release.yml / docker.yml / Dockerfile,
+      # parce que la licence de `dst-decoder` n'est pas tranchée
+      # (Apache-2.0 déclarée contre en-tête ISO/Philips). Garde :
+      # tune-core/tests/dst_desarmee_4378.rs.
+      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst"],"packages":"workspace"}
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,dj,karaoke,bandcamp,concerts,pont-roon -- -D clippy::correctness
 
   audit:
     name: Security Audit

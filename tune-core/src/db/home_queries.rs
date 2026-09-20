@@ -365,6 +365,32 @@ pub fn recently_added(engine: Engine) -> String {
     )
 }
 
+/// « Nouveau dans la bibliotheque » (`/home/new-in-library`) : les albums par
+/// date d'AJOUT, la plus recente d'abord.
+///
+/// Triait sur `MAX(t.file_mtime)` : un album dont on retouche les etiquettes
+/// voit ses fichiers recrits, leur `mtime` avance, et l'album passait en tete
+/// de la rangee comme s'il venait d'arriver (#4546, Jean Valjean). Meme date
+/// que [`recently_added`] et que le tri « Ajout recent » de la bibliotheque.
+///
+/// `$1` : le nombre d'albums. Colonnes rendues : `id, title, artist_id,
+/// artist_name, cover_path, source, added_at`.
+pub fn nouveautes(engine: Engine) -> String {
+    let p1 = ph(engine, 1);
+    format!(
+        "SELECT al.id, al.title, al.artist_id, ar.name, al.cover_path, al.source, \
+                MAX({DATE_D_AJOUT}) AS added_at \
+        FROM tracks t \
+        JOIN albums al ON t.album_id = al.id \
+        LEFT JOIN artists ar ON al.artist_id = ar.id \
+        {JOINTURE_PREMIERE_VUE} \
+        WHERE {DATE_D_AJOUT} IS NOT NULL \
+        GROUP BY al.id, al.title, al.artist_id, ar.name, al.cover_path, al.source \
+        ORDER BY added_at DESC \
+        LIMIT {p1}"
+    )
+}
+
 /// Le decompte de la meme fenetre : combien d'albums, combien de pistes,
 /// combien de temps.
 ///

@@ -3,7 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
-use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{
+    OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, PlayMedia,
+    TransportState,
+};
 
 #[derive(Debug, Clone)]
 pub struct PlayCall {
@@ -43,6 +46,13 @@ pub struct MockOutput {
     seek_laisse_en_pause: Arc<AtomicBool>,
     /// Chaque `resume` reçu, pour compter les relances.
     resume_calls: Arc<AtomicU64>,
+    /// Le contrat de signal que la sortie PUBLIE (#4559).
+    ///
+    /// Une sortie locale Windows ne le pose qu'à l'ouverture effective du bras
+    /// exclusif, plusieurs centaines de millisecondes après le `play_media`
+    /// qui l'a effacé. C'est cette fenêtre — et elle seule — que les témoins
+    /// de #4559 rejouent : `None` d'abord, `Some(...)` ensuite.
+    signal_path: Arc<std::sync::Mutex<Option<OutputSignalPathStatus>>>,
 }
 
 impl MockOutput {
@@ -65,7 +75,13 @@ impl MockOutput {
             volume_calls: Arc::new(Mutex::new(Vec::new())),
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
             resume_calls: Arc::new(AtomicU64::new(0)),
+            signal_path: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Poser (ou retirer) le contrat de signal publié par la sortie (#4559).
+    pub fn set_signal_path_status(&self, status: Option<OutputSignalPathStatus>) {
+        *self.signal_path.lock().unwrap() = status;
     }
 
     /// Override the reported `output_type` (default "mock"), so tests can model
@@ -316,6 +332,10 @@ impl OutputTarget for MockOutput {
 
     async fn is_available(&self) -> bool {
         true
+    }
+
+    fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
+        self.signal_path.lock().unwrap().clone()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

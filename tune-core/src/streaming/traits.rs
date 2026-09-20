@@ -532,6 +532,26 @@ pub trait StreamingService: Send + Sync {
         let _ = (genre_id, limit);
         Ok(vec![])
     }
+    /// Une rubrique éditoriale (`section_id`, un identifiant de
+    /// [`get_featured_sections`](Self::get_featured_sections)) restreinte à un
+    /// genre (#3481).
+    ///
+    /// Par défaut : la rubrique « nouveautés » est ce que rend déjà
+    /// [`get_genre_albums`](Self::get_genre_albums) ; toute autre rubrique est
+    /// vide, pour un service qui ne sait pas filtrer ses rubriques par genre.
+    /// Qobuz la surcharge : son `/album/getFeatured` honore `genre_ids` pour
+    /// chacun de ses `type`.
+    async fn get_genre_section(
+        &self,
+        genre_id: &str,
+        section_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamAlbum>, TuneError> {
+        if section_id == "new-releases" {
+            return self.get_genre_albums(genre_id, limit).await;
+        }
+        Ok(vec![])
+    }
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
         Ok(vec![])
     }
@@ -620,6 +640,21 @@ pub trait StreamingService: Send + Sync {
         let _ = fav_type;
         Ok(None)
     }
+    /// #4577 — ce service accepte-t-il qu'on ÉCRIVE ses favoris ?
+    ///
+    /// Bandcamp lit sa liste de souhaits sans session, mais ne l'écrit pas :
+    /// l'ajout demande une session d'achat que Tune n'a pas, et
+    /// [`Self::add_favorite`] y rend `Unsupported`. Le client, lui, l'ignorait
+    /// et proposait un cœur cochable : FabienM, 0.9.158, cochait un titre
+    /// Bandcamp, le serveur répondait `501`, et rien n'était conservé — ni
+    /// expliqué (fil forum 1862, point 4 ; cinq refus dans son journal).
+    ///
+    /// Le refus est légitime ; ce qui manquait, c'est de l'ANNONCER, pour que
+    /// l'écran n'offre pas un geste qui ne peut pas aboutir.
+    fn favoris_ecrivables(&self) -> bool {
+        true
+    }
+
     async fn add_favorite(&mut self, fav_type: &str, item_id: &str) -> Result<(), TuneError> {
         let _ = (fav_type, item_id);
         Err(TuneError::Unsupported("not supported".into()))

@@ -3055,6 +3055,7 @@ mod tests {
         assert_eq!(courte[0], "/musique/0.mpc");
     }
 
+    #[cfg(not(feature = "dst"))]
     #[test]
     fn dff_dst_est_inventorie_sans_io_puis_refuse_dans_la_phase_bornee() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

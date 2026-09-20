@@ -200,6 +200,10 @@ async fn list_collections(
                         .unwrap_or(0)
                 );
             }
+            // #4473, arbitrage 2 : le catalogue n'est PAS compté (un appel
+            // réseau par collection et par affichage), mais la liste le dit,
+            // pour que l'écran annonce « + catalogue Qobuz » sans chiffre.
+            col["catalogue_service"] = json!(catalogue::service_du_catalogue(&rules_str));
             col
         })
         .collect();
@@ -958,6 +962,15 @@ async fn avec_albums_de_catalogue(
              aucun service ne sait énumérer son catalogue.",
         ));
     };
+    // Ce que le service ne saurait pas filtrer : refusé, et nommé (#4473).
+    let hors_service = catalogue::regles_hors_service(rules_json);
+    if !hors_service.is_empty() {
+        return Err(AppError::bad_request(format!(
+            "Le catalogue d'un service ne sait chercher qu'un artiste ou un album \
+             (égalité). Ces règles ne peuvent pas s'y appliquer : {}.",
+            hors_service.join(", ")
+        )));
+    }
     // 🔴 On CLONE l'Arc au lieu d'en garder une référence : ce qui vit en
     // travers d'un `.await` doit être `Send`, et une référence à l'état ne
     // l'est pas ici. Sans ça, axum refuse le handler tout entier.
@@ -967,10 +980,18 @@ async fn avec_albums_de_catalogue(
         ));
     };
 
-    let trouves = match &cible {
+    let mut trouves = match &cible {
         catalogue::Cible::Artiste(nom) => distant.albums_par_artiste(&service, nom).await,
         catalogue::Cible::Album(titre) => distant.albums_par_titre(&service, titre).await,
     };
+    // « artiste Coltrane ET album Blue Train » : la recherche part de
+    // l'artiste, le titre trie encore ce qu'elle rend.
+    if let (catalogue::Cible::Artiste(_), Some(titre)) =
+        (&cible, catalogue::titre_exige(rules_json))
+    {
+        let titre = titre.to_lowercase();
+        trouves.retain(|a| a.title.trim().to_lowercase() == titre);
+    }
     albums.extend(trouves.into_iter().map(|a| {
         json!({
             "id": Value::Null,
@@ -1053,16 +1074,20 @@ async fn preview_albums(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
-    let (where_clause, order, limit_clause) = build_album_query(
-        &rules_json,
-        match_mode,
-        sort_by,
-        sort_order,
-        body.max_limit,
-        &ctx,
-    );
+    // Les références à l'état meurent avant le `.await` du catalogue (voir
+    // `resolve_albums`).
+    let (where_clause, order, limit_clause) = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        build_album_query(
+            &rules_json,
+            match_mode,
+            sort_by,
+            sort_order,
+            body.max_limit,
+            &ctx,
+        )
+    };
     let albums = execute_album_query(&state, &where_clause, &order, &limit_clause)?;
     let albums = avec_albums_de_service(
         &state,
@@ -1074,6 +1099,10 @@ async fn preview_albums(
         sort_order,
         body.max_limit,
     )?;
+    // 🔴 #4473 — l'aperçu de l'éditeur est ce que la collection rendra : sans
+    // cet appel, une règle « catalogue » s'y montrait VIDE et sans refus, puis
+    // la collection enregistrée rendait des albums, ou un 400.
+    let albums = avec_albums_de_catalogue(&state, albums, &rules_json, body.max_limit).await?;
 
     Ok(Json(json!({"albums": albums, "total": albums.len()})))
 }
@@ -1515,6 +1544,15 @@ mod tests {
                 &[&r#"[{"field":"source","op":"=","value":"qobuz"}]"# as &dyn ToSqlValue],
             )
             .expect("collection");
+        backend
+            .execute(
+                "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order) \
+                 VALUES ('Z Coltrane chez Qobuz', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                       {"field":"artist","op":"=","value":"John Coltrane"}]"#
+                    as &dyn ToSqlValue],
+            )
+            .expect("collection catalogue");
         for t in ["album", "album", "track"] {
             backend
                 .execute(
@@ -1536,6 +1574,14 @@ mod tests {
             Some(2),
             "la collection annonce ses favoris ALBUM : {}",
             reponse.0[0]
+        );
+        // Des FAVORIS, pas un catalogue : rien à annoncer en plus (#4473).
+        assert_eq!(reponse.0[0]["catalogue_service"], serde_json::Value::Null);
+        // Un catalogue : la liste le DIT, sans le compter (#4473, arbitrage 2).
+        assert_eq!(
+            reponse.0[1]["catalogue_service"], "qobuz",
+            "{}",
+            reponse.0[1]
         );
     }
 
@@ -1651,6 +1697,85 @@ mod tests {
             )
             .await;
             assert!(r.is_err(), "sans service, on ne fait pas semblant");
+        }
+
+        /// L'aperçu de l'éditeur, par la route elle-même.
+        async fn apercu(
+            regles: &str,
+        ) -> Result<axum::Json<serde_json::Value>, tune_http_types::AppError> {
+            let e = etat(true);
+            e.backend
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS streaming_favorites (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                         item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                         artist TEXT, album TEXT, cover_url TEXT, created_at TEXT,
+                         position TEXT)",
+                    &[],
+                )
+                .expect("favoris");
+            super::super::preview_albums(
+                axum::extract::State(e),
+                tune_http_types::ActiveProfile(1),
+                axum::Json(super::super::PreviewRequest {
+                    rules: serde_json::from_str(regles).expect("json"),
+                    match_mode: None,
+                    sort_by: None,
+                    sort_order: None,
+                    max_limit: None,
+                }),
+            )
+            .await
+        }
+
+        /// 🔴 #4473 — l'aperçu montre le catalogue que la collection rendra.
+        ///
+        /// Rouge avant : `preview_albums` n'appelait pas le catalogue, l'éditeur
+        /// affichait zéro album pour « catalogue Qobuz + Coltrane ».
+        #[tokio::test]
+        async fn l_apercu_de_l_editeur_montre_le_catalogue() {
+            let Ok(r) = apercu(AVEC_ARTISTE).await else {
+                panic!("l'aperçu doit répondre")
+            };
+            assert_eq!(r.0["total"], 1, "{}", r.0);
+            assert_eq!(r.0["albums"][0]["title"], "Best of John Coltrane");
+        }
+
+        /// … et il REFUSE ce que la collection refusera, au moment où on
+        /// l'écrit, pas après l'enregistrement.
+        #[tokio::test]
+        async fn l_apercu_refuse_comme_la_collection() {
+            let sans = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                           {"field":"year","op":"=","value":"2025"}]"#;
+            assert!(apercu(sans).await.is_err(), "sans cible : refus");
+        }
+
+        /// 🔴 Une règle que le service ne sait pas filtrer est refusée — elle
+        /// ne s'applique pas en silence au local seulement.
+        #[tokio::test]
+        async fn une_regle_de_format_a_cote_du_catalogue_est_refusee() {
+            let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                        {"field":"artist","op":"=","value":"John Coltrane"},
+                        {"field":"format","op":"=","value":"FLAC"}]"#;
+            let r = super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), r, None).await;
+            assert!(r.is_err(), "format : le service ne sait pas le filtrer");
+        }
+
+        /// Artiste ET titre : le titre trie ce que la recherche par artiste rend.
+        #[tokio::test]
+        async fn le_titre_trie_la_discographie_de_l_artiste() {
+            let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                        {"field":"artist","op":"=","value":"John Coltrane"},
+                        {"field":"album","op":"=","value":"Blue Train"}]"#;
+            let Ok(r) =
+                super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), r, None).await
+            else {
+                panic!("doit répondre")
+            };
+            assert!(
+                r.is_empty(),
+                "« Best of John Coltrane » n'est pas « Blue Train » : {r:?}"
+            );
         }
 
         #[tokio::test]

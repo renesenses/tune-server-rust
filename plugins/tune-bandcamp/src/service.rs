@@ -547,6 +547,11 @@ impl StreamingService for BandcampService {
                 .map_err(TuneError::from)?;
         Ok(Some(favoris_dates_de_collection(&brut)))
     }
+    /// #4577 — et on l'ANNONCE : le client cachait son cœur derrière un 501.
+    fn favoris_ecrivables(&self) -> bool {
+        false
+    }
+
     /// Ajouter un favori demande une session d'achat. Tune n'en a aucune.
     ///
     /// [`crate::lier_compte`] résout un pseudo en `fan_id` sur une page de
@@ -820,6 +825,17 @@ mod tests {
             "le refus doit nommer le geste qui manque : {message}"
         );
     }
+    /// #4577 — et le service l'ANNONCE, au lieu de le laisser découvrir par un
+    /// 501. FabienM, 0.9.158 : cinq refus dans son journal pour un cœur qui
+    /// restait cochable, et un favori jamais conservé (fil 1862, point 4).
+    #[tokio::test]
+    async fn bandcamp_annonce_des_favoris_non_ecrivables() {
+        assert!(
+            !service_de_test().favoris_ecrivables(),
+            "Bandcamp ne sait pas écrire ses favoris : il doit le dire"
+        );
+    }
+
     /// 🔴 #2778 — écrire un favori est IMPOSSIBLE, et le refus le dit.
     ///
     /// `lier_compte` résout un pseudo sur une page de profil publique : Tune
