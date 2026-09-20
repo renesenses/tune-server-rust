@@ -44,6 +44,10 @@ pub mod pseudo_peripherique_alsa;
 pub mod registry;
 pub mod slimproto;
 pub mod squeezebox;
+/// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,
+/// éprouvé contre un vrai serveur SOAP.
+#[cfg(test)]
+mod suivante_verifiee_3967;
 pub mod traits;
 #[cfg(all(target_os = "windows", feature = "local-audio"))]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -52,5 +56,5 @@ pub mod wasapi_exclusive;
 pub use registry::OutputRegistry;
 pub use traits::{
     OutputCapabilities, OutputCommand, OutputCommandError, OutputCommandResult, OutputStatus,
-    OutputTarget, PlayMedia, TransportState, VolumeResolution,
+    OutputTarget, PlayMedia, SuivantePreparee, TransportState, VolumeResolution,
 };

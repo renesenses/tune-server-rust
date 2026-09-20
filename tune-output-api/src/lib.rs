@@ -309,6 +309,34 @@ pub enum TransportState {
     Transitioning,
 }
 
+/// #3967 — ce que l'appareil dit de la suivante qu'on vient de lui poser.
+///
+/// Trois verdicts, et un seul ouvre une conduite nouvelle. Le mot de l'issue
+/// est *vérifié* : un `200` sur `SetNextAVTransportURI` ne dit rien de plus
+/// que « la requête est bien formée ». La spécification AVTransport, elle,
+/// offre deux témoins que le renderer écrit lui-même :
+///
+/// - `GetMediaInfo` → `NextURI` : l'URL qu'il RETIENT comme suivante ;
+/// - `GetCurrentTransportActions` → `Actions` : les actions qu'il DÉCLARE
+///   disponibles à cet instant. `Next` n'y figure que s'il se sait capable
+///   d'avancer.
+///
+/// Les deux ensemble valent [`Self::Tenue`]. Tout le reste retombe sur le
+/// repli existant — c'est la règle : mieux vaut un blanc de trois secondes
+/// qu'une piste sautée.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuivantePreparee {
+    /// L'appareil NOMME notre URL en suivante et DÉCLARE l'action `Next`.
+    Tenue,
+    /// L'appareil a acquitté, mais sa suivante est vide ou en désigne une
+    /// autre : la consigne est perdue chez lui.
+    Perdue,
+    /// L'appareil ne répond pas à ces lectures (action absente, SOAP muet,
+    /// champ non publié) : on ne conclut rien.
+    Inconnue,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputStatus {
     pub state: TransportState,
@@ -2049,6 +2077,30 @@ pub trait OutputTarget: Send + Sync {
     async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         self.set_next_url(media.url, media.mime_type, media.title, media.artist)
             .await
+    }
+
+    /// #3967 — ce que l'appareil dit LUI-MÊME de la suivante qu'on vient de
+    /// lui poser, une fois le `set_next_media` acquitté.
+    ///
+    /// Un acquittement n'est pas une promesse : le renderer peut répondre 200
+    /// et n'avoir rien retenu. Cette lecture pose les deux seules questions
+    /// que le protocole permet de poser à l'appareil — « nommes-tu l'URL que
+    /// je viens de te donner ? » et « déclares-tu pouvoir y passer ? » — et
+    /// rend [`SuivantePreparee::Tenue`] seulement si les DEUX répondent oui.
+    ///
+    /// Défaut [`SuivantePreparee::Inconnue`] : une sortie qui ne sait pas
+    /// répondre garde exactement la conduite d'avant, c'est-à-dire le repli.
+    async fn suivante_preparee(&self, _url: &str) -> SuivantePreparee {
+        SuivantePreparee::Inconnue
+    }
+
+    /// #3967 — demander à l'appareil de passer LUI-MÊME à la suivante qu'il a
+    /// déjà préparée, sans rien relancer ni redétruire.
+    ///
+    /// N'a de sens qu'après un [`Self::suivante_preparee`] rendu
+    /// [`SuivantePreparee::Tenue`]. Défaut : refus, donc le repli.
+    async fn basculer_sur_la_suivante_preparee(&self) -> Result<(), String> {
+        Err("cette sortie ne prepare pas la suivante".to_string())
     }
 
     fn diagnostics_json(&self) -> Option<serde_json::Value> {
