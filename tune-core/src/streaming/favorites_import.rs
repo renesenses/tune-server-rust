@@ -37,6 +37,23 @@
 //! aujourd'hui les deux origines. Trancher cela demande une colonne d'origine
 //! et un arbitrage produit ; ajouter n'en demande aucun.
 //!
+//! # Deux dates, et une seule qui ne bouge pas
+//!
+//! Depuis renesenses/tune-web-client#1060, chaque ligne porte DEUX dates :
+//!
+//! * `created_at` — celle du SERVICE, reprise telle quelle, et **redatée** à
+//!   chaque passage si le service la change ;
+//! * `first_seen_at` — celle où TUNE a vu le favori pour la première fois,
+//!   posée une fois et **jamais réécrite**.
+//!
+//! La seconde existe parce que la première n'est pas ce qu'elle a l'air
+//! d'être. Mesure du 19/09/2026 sur le serveur de Bertrand : vingt et un
+//! favoris Qobuz, vingt et une dates distinctes, toutes dans une fenêtre de
+//! SEIZE SECONDES. Ce n'est pas l'histoire d'un auditeur, c'est l'instant où
+//! une recopie les a recréés chez Qobuz. Trier « Ajout récent » là-dessus rend
+//! l'ordre d'une boucle — indiscernable du hasard, et c'est ce que Fabien
+//! décrit depuis la 0.9.151.
+//!
 //! Enfin la **date** : `add` inscrit l'instant de la reprise, car les routes de
 //! favoris des services ne transportent aucune date (#3489, mesuré le
 //! 06/09/2026 sur les trois listes). C'est la date à laquelle Tune l'a appris,
@@ -311,6 +328,17 @@ fn enregistrer(
         match repo.is_favorite(profile_id, entree.item_type, service, &entree.service_id) {
             Ok(true) => {
                 stats.deja_presents += 1;
+                // Déjà là mais SANS date locale (ligne d'avant la migration
+                // 104 / PG 067, ou base montée par `ensure_schema`) : on la
+                // pose. La requête porte `AND first_seen_at IS NULL`, donc ce
+                // passage-ci ne peut pas réécrire une date déjà posée — c'est
+                // exactement ce que renesenses/tune-web-client#1060 exige.
+                let _ = repo.premiere_vue_si_absente(
+                    profile_id,
+                    entree.item_type,
+                    service,
+                    &entree.service_id,
+                );
                 // Déjà là, mais peut-être daté au « maintenant » d'une reprise
                 // d'avant : on lui rend la date du service. Idempotent.
                 if let Some(date) = entree.created_at.as_deref()
@@ -376,18 +404,30 @@ mod tests_dates {
         service: &'static str,
         /// Albums et artistes aussi, ou les pistes seules.
         trois_types: bool,
+        /// Le `favorited_at` que le service rend pour TOUTES ses pistes, en
+        /// epoch — `None` = celui de la charge d'origine.
+        ///
+        /// C'est le levier du témoin de renesenses/tune-web-client#1060 : un
+        /// ré-import chez Qobuz recrée les favoris et les REDATE tous à la
+        /// même poignée de secondes.
+        redate_epoch: Option<i64>,
     }
 
     const QOBUZ: ServiceDate = ServiceDate {
         service: "qobuz",
         trois_types: false,
+        redate_epoch: None,
     };
 
     /// Ce que `/favorite/getUserFavorites` rend chez Qobuz (brut), passé
     /// par la projection datée du connecteur.
-    fn favoris_qobuz(fav_type: &str, trois_types: bool) -> Vec<serde_json::Value> {
+    fn favoris_qobuz(
+        fav_type: &str,
+        trois_types: bool,
+        redate_epoch: Option<i64>,
+    ) -> Vec<serde_json::Value> {
         use crate::streaming::qobuz::QobuzService;
-        let bruts = match fav_type {
+        let mut bruts = match fav_type {
             "tracks" => vec![
                 json!({"id": 1, "title": "Ancienne", "performer": {"name": "A"},
                        "album": {"title": "X"}, "duration": 100,
@@ -403,6 +443,11 @@ mod tests_dates {
                 "favorited_at": 1_700_000_000})],
             _ => Vec::new(),
         };
+        if let Some(epoch) = redate_epoch {
+            for b in &mut bruts {
+                b["favorited_at"] = json!(epoch);
+            }
+        }
         bruts
             .iter()
             .map(|b| QobuzService::favori_date(b, fav_type))
@@ -510,7 +555,7 @@ mod tests_dates {
         ) -> Result<Option<Vec<serde_json::Value>>, crate::error::TuneError> {
             Ok(Some(match self.service {
                 "tidal" => favoris_tidal(fav_type),
-                _ => favoris_qobuz(fav_type, self.trois_types),
+                _ => favoris_qobuz(fav_type, self.trois_types, self.redate_epoch),
             }))
         }
         async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, crate::error::TuneError> {
@@ -531,10 +576,19 @@ mod tests_dates {
         Arc::new(db)
     }
 
+    /// `(service_id, first_seen_at)` — la date LOCALE, celle que TUNE pose.
+    fn vues(backend: &Arc<dyn DbBackend>) -> Vec<(String, String)> {
+        colonne(backend, "first_seen_at")
+    }
+
     fn dates(backend: &Arc<dyn DbBackend>) -> Vec<(String, String)> {
+        colonne(backend, "created_at")
+    }
+
+    fn colonne(backend: &Arc<dyn DbBackend>, nom: &str) -> Vec<(String, String)> {
         backend
             .query_many(
-                "SELECT service_id, created_at FROM streaming_favorites ORDER BY service_id",
+                &format!("SELECT service_id, {nom} FROM streaming_favorites ORDER BY service_id"),
                 &[],
             )
             .unwrap()
@@ -611,6 +665,7 @@ mod tests_dates {
         let qobuz = ServiceDate {
             service: "qobuz",
             trois_types: true,
+            redate_epoch: None,
         };
         let stats = reprendre_les_favoris_du_service(&qobuz, 1, &backend).await;
         assert_eq!((stats.lus, stats.ajoutes), (4, 4), "{stats:?}");
@@ -644,6 +699,7 @@ mod tests_dates {
         let tidal = ServiceDate {
             service: "tidal",
             trois_types: true,
+            redate_epoch: None,
         };
         let stats = reprendre_les_favoris_du_service(&tidal, 1, &backend).await;
         assert_eq!((stats.lus, stats.ajoutes), (3, 3), "{stats:?}");
@@ -668,5 +724,87 @@ mod tests_dates {
                 ],
             ]
         );
+    }
+
+    /// 🔴 Le témoin de renesenses/tune-web-client#1060 — celui qui compte.
+    ///
+    /// Mesure du 19/09/2026 sur le serveur de Bertrand : vingt et un favoris
+    /// Qobuz, vingt et un `created_at` DISTINCTS, tous dans une fenêtre de
+    /// SEIZE SECONDES (`2026-09-16T08:11:50Z` … `08:12:06Z`). La date du
+    /// service n'est pas celle où l'auditeur a aimé le morceau, c'est celle où
+    /// la recopie l'a (re)créé chez Qobuz : trier là-dessus rend l'ordre d'une
+    /// boucle, et c'est ce que Fabien lit comme « ça ne marche pas ».
+    ///
+    /// Ce que ce test exige : quand le service REDATE tout, `created_at` suit
+    /// — la date du service lui appartient — mais `first_seen_at`, l'instant
+    /// où TUNE a vu le favori pour la première fois, ne bouge pas. Un champ
+    /// recalculé à chaque passe reproduirait exactement le défaut.
+    #[tokio::test]
+    async fn la_resynchronisation_ne_reecrit_pas_la_date_locale() {
+        let backend = base();
+        reprendre_les_favoris_du_service(&QOBUZ, 1, &backend).await;
+        let avant = vues(&backend);
+        assert!(
+            avant.len() == 2 && avant.iter().all(|(_, d)| !d.is_empty()),
+            "la reprise doit poser une date locale sur chaque favori : {avant:?}"
+        );
+
+        // Qobuz ré-importe : les deux favoris y sont recréés à la MÊME seconde
+        // (2026-09-16T08:11:50Z, la première des vingt et une mesurées).
+        let redate = ServiceDate {
+            service: "qobuz",
+            trois_types: false,
+            redate_epoch: Some(1_789_546_310),
+        };
+        let stats = reprendre_les_favoris_du_service(&redate, 1, &backend).await;
+        assert_eq!((stats.ajoutes, stats.redates), (0, 2), "{stats:?}");
+
+        // La date du SERVICE a suivi — c'est la sienne, il la porte…
+        assert_eq!(
+            dates(&backend),
+            vec![
+                ("1".to_string(), "2026-09-16T08:11:50Z".to_string()),
+                ("2".to_string(), "2026-09-16T08:11:50Z".to_string()),
+            ]
+        );
+        // …et la date LOCALE, non. C'est tout le sujet.
+        assert_eq!(
+            vues(&backend),
+            avant,
+            "la resynchronisation a réécrit la date locale"
+        );
+    }
+
+    /// Un favori déjà en table SANS date locale — ligne d'avant la migration,
+    /// ou base PostgreSQL montée par `ensure_schema` — en reçoit une à la
+    /// première reprise qui le revoit, et UNE SEULE FOIS.
+    #[tokio::test]
+    async fn la_date_locale_absente_est_posee_une_fois_puis_ne_bouge_plus() {
+        let backend = base();
+        let repo = StreamingFavoritesRepo::with_backend(backend.clone());
+        repo.add(1, "track", "qobuz", "1", Some("Ancienne"), None, None, None)
+            .unwrap();
+        backend
+            .execute(
+                "UPDATE streaming_favorites SET first_seen_at = NULL WHERE service_id = '1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(vues(&backend), vec![("1".to_string(), String::new())]);
+
+        reprendre_les_favoris_du_service(&QOBUZ, 1, &backend).await;
+        let posee = vues(&backend);
+        assert!(
+            posee.iter().all(|(_, d)| !d.is_empty()),
+            "la reprise doit combler la date locale absente : {posee:?}"
+        );
+
+        let redate = ServiceDate {
+            service: "qobuz",
+            trois_types: false,
+            redate_epoch: Some(1_789_546_310),
+        };
+        reprendre_les_favoris_du_service(&redate, 1, &backend).await;
+        assert_eq!(vues(&backend), posee, "la date locale a été reposée");
     }
 }
