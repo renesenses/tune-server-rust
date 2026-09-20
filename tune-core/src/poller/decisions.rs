@@ -247,13 +247,16 @@ pub fn renderer_could_have_finished(
 
 /// Cette sortie non temps réel n'a-t-elle tout simplement jamais DÉMARRÉ ?
 ///
-/// [`renderer_could_have_finished`] tranche sur les octets que **Tune a
-/// servis**. Une sortie qui va chercher le flux elle-même — sortie de
-/// greffon, passerelle — n'ouvre aucune session de streaming : son
-/// `stream_id` est `None`, donc `total_bytes` aussi, et le garde-fou rend
-/// `true` par sa première branche sans avoir rien vérifié. Ce `None => true`
-/// est juste pour son cas d'origine (radio, flux décodé : faute de total
-/// connu, on ne juge pas) ; il est faux ici.
+/// [`renderer_could_have_finished`] rend `true` par sa première branche dès
+/// que `total_bytes` est `None` : faute de total connu, il ne juge pas. C'est
+/// juste pour son cas d'origine (radio, flux décodé). Ça ne l'est plus quand
+/// la sortie n'a **rien produit du tout** — le total est alors inconnu parce
+/// que la session n'a encore rien servi, pas parce que le flux est sans fin.
+///
+/// ⚠️ Le discriminant n'est PAS l'absence de session de flux. Mesuré en
+/// production, une zone servie par un greffon porte bien un `stream_id` : un
+/// veto conditionné à son absence ne se déclenche jamais. Le seul critère
+/// fiable est ce que la sortie a effectivement produit.
 ///
 /// Car sur une telle sortie, `Stopped` ne veut pas dire « la piste est
 /// finie » mais « la capture n'a pas encore commencé » : ouvrir un flux
@@ -276,15 +279,17 @@ pub fn renderer_could_have_finished(
 /// boucle une piste de cinq minutes en deux secondes.
 ///
 /// [`OutputTarget::processing_progress_bytes`]: tune_output_api::OutputTarget::processing_progress_bytes
-pub fn sortie_autonome_jamais_demarree(
+pub fn sortie_non_temps_reel_jamais_demarree(
     realtime: bool,
-    tune_sert_le_flux: bool,
     peak_position_ms: u64,
     progress_bytes: Option<u64>,
 ) -> bool {
-    if realtime || tune_sert_le_flux {
+    if realtime {
         return false;
     }
+    // Une piste réellement capturée a fait avancer la position — la sortie
+    // annonce `Playing` pendant qu'elle écrit — ou le compteur d'octets.
+    // Ni l'une ni l'autre : elle n'a pas commencé.
     peak_position_ms == 0 && progress_bytes.unwrap_or(0) == 0
 }
 
@@ -295,29 +300,23 @@ pub fn sortie_autonome_jamais_demarree(
 /// à lire — et pour que la composition elle-même soit sous test :
 ///
 /// 1. la sortie a-t-elle seulement DÉMARRÉ
-///    ([`sortie_autonome_jamais_demarree`], #4623) ;
+///    ([`sortie_non_temps_reel_jamais_demarree`], #4623) ;
 /// 2. le renderer a-t-il reçu de quoi finir
 ///    ([`renderer_could_have_finished`]).
 ///
 /// L'ordre compte : le second rend `true` sans rien vérifier quand aucun
-/// total d'octets n'est connu, ce qui est exactement le cas d'une sortie qui
-/// tire son flux elle-même. Le premier est ce qui referme ce passage.
-#[allow(clippy::too_many_arguments)]
+/// total d'octets n'est connu — l'état d'une session qui n'a encore rien
+/// servi. Le premier est ce qui referme ce passage.
 pub fn accepter_fin_apres_stopped(
     realtime: bool,
-    tune_sert_le_flux: bool,
     peak_position_ms: u64,
     progress_bytes: Option<u64>,
     bytes_sent: u64,
     total_bytes: Option<u64>,
     seeked: bool,
 ) -> bool {
-    !sortie_autonome_jamais_demarree(
-        realtime,
-        tune_sert_le_flux,
-        peak_position_ms,
-        progress_bytes,
-    ) && renderer_could_have_finished(bytes_sent, total_bytes, seeked)
+    !sortie_non_temps_reel_jamais_demarree(realtime, peak_position_ms, progress_bytes)
+        && renderer_could_have_finished(bytes_sent, total_bytes, seeked)
 }
 
 pub fn played_enough(track_duration_ms: u64, peak_position_ms: u64, wall_elapsed: u64) -> bool {

@@ -1911,15 +1911,13 @@ impl PositionPoller {
                                     // « fini », il dit « pas encore parti »
                                     // (#4623).
                                     let jamais_demarree =
-                                        decisions::sortie_autonome_jamais_demarree(
+                                        decisions::sortie_non_temps_reel_jamais_demarree(
                                             status.realtime,
-                                            sid.is_some(),
                                             ps.peak_position_ms,
                                             progression_octets,
                                         );
                                     if decisions::accepter_fin_apres_stopped(
                                         status.realtime,
-                                        sid.is_some(),
                                         ps.peak_position_ms,
                                         progression_octets,
                                         sent,
