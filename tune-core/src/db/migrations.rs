@@ -5727,7 +5727,13 @@ mod tests {
         // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
         // 65 and 66 carry the UPnP library sync and catalog revision (#4201),
         // renumbered from 59/60 after those shipped in v0.9.151.
-        assert_eq!(pg_latest_version(), 66, "latest PG migration must be 66");
+        // 67 : `listen_history_contexte_service_et_nom`, jumelle de la SQLite
+        // 104. Pose `context_source` / `context_title` / `context_cover` — sans
+        // elle, aucune base PostgreSQL ne recevrait les trois colonnes que
+        // `continue_listening_contextes` NOMME desormais, et la section
+        // « Continuer l'ecoute » disparaitrait sur tout ce parc : c'est la
+        // forme exacte de #2860.
+        assert_eq!(pg_latest_version(), 67, "latest PG migration must be 67");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
