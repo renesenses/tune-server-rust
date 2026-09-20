@@ -1394,14 +1394,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(
-            profile.automatic_headroom_db(0),
-            -2.461_945_232_181_620_6
-        );
-        assert_eq!(
-            profile.automatic_headroom_db(1),
-            -3.884_722_078_857_195_4
-        );
+        assert_eq!(profile.automatic_headroom_db(0), -2.461_945_232_181_620_6);
+        assert_eq!(profile.automatic_headroom_db(1), -3.884_722_078_857_195_4);
         let eq = EqProcessor::new(&profile, 44_100, 2);
         assert_eq!(eq.preamp_db(0), Some(-2.461_945_232_181_620_6));
         assert_eq!(eq.preamp_db(1), Some(-3.884_722_078_857_195_4));
