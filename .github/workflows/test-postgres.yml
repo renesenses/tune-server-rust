@@ -205,6 +205,11 @@ jobs:
       # pas. Descendues dans tune-core (db/home_queries.rs), elles sont
       # desormais EXECUTEES ici. Le test exige les memes nombres que le test
       # SQLite jumeau : 3/5, 2/5, 1/5 de disque ecoute.
+      - name: DR de la liste d'albums sur PostgreSQL (#4521)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i4521_dr_liste_postgres -- --nocapture
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
