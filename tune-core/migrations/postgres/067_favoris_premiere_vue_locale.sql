@@ -33,13 +33,31 @@
 
 BEGIN;
 
-ALTER TABLE streaming_favorites
-    ADD COLUMN IF NOT EXISTS first_seen_at TEXT;
+-- `streaming_favorites` n'est PAS garantie ici : elle naît de `PG_FULL_SCHEMA`
+-- (base neuve ou bascule) ou de `ENSURE_TABLES` (postgres.rs), jamais d'une
+-- migration numérotée. Un `ALTER TABLE` nu fait donc échouer TOUTE cette
+-- migration — donc le démarrage — sur une base où elle n'existe pas encore.
+-- Mesuré : la porte « Test (PostgreSQL) » de cette PR est partie ROUGE sur
+-- `ERROR: relation "streaming_favorites" does not exist`, le lanceur jouant les
+-- scripts numérotés SEULS sur une base vierge.
+--
+-- Le garde `to_regclass` rend NULL au lieu de lever, contrairement à un
+-- `ALTER TABLE IF EXISTS` qui n'avertit que par un NOTICE et laisserait la
+-- colonne manquante en silence. Même forme, mot pour mot, que la migration 057
+-- (`favoris_ordre_manuel`), qui a payé exactement ce prix pour `position`.
+DO $premiere_vue$
+BEGIN
+    IF to_regclass('streaming_favorites') IS NOT NULL THEN
+        ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS first_seen_at TEXT;
 
-UPDATE streaming_favorites
-   SET first_seen_at = created_at
- WHERE first_seen_at IS NULL
-   AND created_at IS NOT NULL;
+        UPDATE streaming_favorites
+           SET first_seen_at = created_at
+         WHERE first_seen_at IS NULL
+           AND created_at IS NOT NULL;
+    ELSE
+        RAISE NOTICE 'migration 067 : streaming_favorites absente, rien a dater';
+    END IF;
+END $premiere_vue$;
 
 INSERT INTO schema_version (version, name) VALUES (67, 'favoris_premiere_vue_locale')
     ON CONFLICT (version) DO NOTHING;
