@@ -902,6 +902,14 @@ async fn handle_ssdp_discovered(
         tracing::debug!(name = %dev.name, id = %dev.id, "ssdp_zone_hidden_skipping");
         return;
     }
+    // Le type annonce par cette identite SSDP. Releve AVANT la chaine de
+    // rattachement : le filet par MAC (#4580) doit exiger le meme type, et la
+    // creation plus bas le relit.
+    let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
+        "openhome"
+    } else {
+        "dlna"
+    };
     if let Ok(Some(zone)) = zone_repo.get_by_device_id(&dev.id) {
         seen_hosts.insert(dev.host.clone());
         set_zone_online(event_bus, db, &dev.id, true);
@@ -955,6 +963,64 @@ async fn handle_ssdp_discovered(
                 "name": &dev.name,
                 "host": &dev.host,
             }),
+        );
+    } else if let Some((zid, masquee)) = zone_reseau_a_reancrer_par_mac(&zone_repo, dev, type_str) {
+        // 🔴 #4580 / #4601 — le filet par MAC manquait ICI, et NULLE PART
+        // ailleurs.
+        //
+        // Deux testeurs ont supprime leur zone et l'ont recreee pour qu'elle
+        // refonctionne (fil 1861). Ce chemin-ci est celui qui les y menait.
+        //
+        // La chaine de rattachement SSDP n'avait que DEUX barreaux :
+        // `get_by_device_id` (meme UUID) et `zone_id_by_host` (meme adresse).
+        // Un renderer DLNA qui redemarre change d'UUID — c'est le defaut
+        // d'origine de #942, un Denon Ceol N12 — et un bail DHCP renouvele
+        // (routeur redemarre, appareil eteint la nuit) change son adresse.
+        // Les deux ensemble mettent les deux barreaux en defaut le meme
+        // matin : la zone garde un `uuid:` mort, reste hors ligne, et la
+        // decouverte n'a plus qu'a creer un DOUBLON a cote — ou a ne rien
+        // faire du tout quand un garde de nom l'en empeche. Vu de l'ecran :
+        // « l'appareil est la, ma zone ne marche plus, je la supprime ».
+        //
+        // La cote mDNS a ce barreau depuis #3919 (`mdns_zone_reancree_par_mac`)
+        // et la regle est deja eprouvee : meme MAC normalisee, meme type de
+        // sortie, une SEULE candidate, identifiant neuf pas deja pris. Une MAC
+        // ne peut pas designer un autre appareil physique — c'est l'asymetrie
+        // qui la rend recevable la ou l'adresse ne l'est pas (voir
+        // [`zone_a_reancrer_par_mac`]). Rien n'est devine : quand la MAC est
+        // inconnue ou la candidate ambigue, le filet ne s'arme pas et le flux
+        // retombe exactement sur ce qu'il faisait avant.
+        //
+        // Place APRES les deux barreaux existants : il ne prend jamais la
+        // place d'un rattrapage qui fonctionne deja.
+        seen_hosts.insert(dev.host.clone());
+        let _ = zone_repo.update_device_id(zid, &dev.id);
+        let _ = zone_repo.set_identity(zid, &dev.host, dev.mac_address.as_deref());
+        // Une zone SUPPRIMEE se re-ancre sans se demasquer : la suppression
+        // reste une suppression, et `is_device_hidden` redevient operant des le
+        // tour suivant (meme regle que la cote mDNS).
+        if !masquee {
+            set_zone_online(event_bus, db, &dev.id, true);
+            if let Some(vol) = zone_repo.get(zid).ok().flatten().map(|z| z.volume / 100.0) {
+                playback.set_volume(zid, vol).await;
+            }
+            event_bus.emit(
+                "device.reconnected",
+                serde_json::json!({
+                    "device_id": &dev.id,
+                    "name": &dev.name,
+                    "host": &dev.host,
+                }),
+            );
+        }
+        info!(
+            name = %dev.name,
+            id = %dev.id,
+            host = %dev.host,
+            zone_id = zid,
+            hidden = masquee,
+            mac = ?dev.mac_address,
+            "ssdp_zone_reancree_par_mac"
         );
     } else if !is_tv {
         // Check zone_auto_create setting — #3529 : lecture unique, portée par
@@ -1023,12 +1089,6 @@ async fn handle_ssdp_discovered(
             tracing::debug!(name = %zone_name, id = %dev.id, host = %dev.host, "ssdp_zone_name_exists_skipping_duplicate");
             return;
         }
-
-        let type_str = if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
-            "openhome"
-        } else {
-            "dlna"
-        };
 
         // Cross-protocol duplicate guard (Phase B, #1239) — the SSDP path
         // never had one: a Node already owning a BluOS zone (created by the
@@ -2606,6 +2666,184 @@ fn reancrage_a_differer(
         None => false,
         Some(None) => true,
         Some(Some(etat)) => matches!(etat, TransportState::Playing | TransportState::Paused),
+    }
+}
+
+/// 🔴 #4580 / #4601 — « j'ai dû supprimer la zone et la remettre ».
+///
+/// Le filet par MAC sur le chemin **SSDP**. La règle et sa base sont déjà
+/// éprouvées côté mDNS (#3919) ; ce qui manquait est qu'un renderer DLNA y
+/// passe. Deux témoins :
+///
+/// 1. Le cas de terrain, joué sur une base réelle : les DEUX barreaux qui
+///    existaient (UUID, adresse) sont mis en défaut ensemble, et le troisième
+///    rattrape.
+/// 2. Que la chaîne SSDP l'appelle bien, et AU BON RANG — après les deux
+///    autres, avant la création automatique. Un filet écrit et non branché ne
+///    répare rien.
+#[cfg(test)]
+mod filet_par_mac_ssdp_4580 {
+    use super::{zone_a_reancrer_par_mac, zone_reseau_a_reancrer_par_mac};
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    const MAC_DU_RENDERER: &str = "AA:BB:CC:11:22:33";
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(db)
+    }
+
+    fn renderer_dlna(id: &str, hote: &str, mac: Option<&str>) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(
+            id.to_string(),
+            "Salon".to_string(),
+            OutputType::Dlna,
+            hote.to_string(),
+            8080,
+        );
+        dev.mac_address = mac.map(str::to_string);
+        dev
+    }
+
+    /// Le matin du 20/09 : le renderer a redémarré (nouvel UUID UPnP, #942) ET
+    /// le bail DHCP a changé (nouvelle adresse). Les deux barreaux du chemin
+    /// SSDP tombent ensemble, la zone garde un `uuid:` mort — et le testeur la
+    /// supprime.
+    #[test]
+    fn un_renderer_dlna_revenu_sous_un_autre_uuid_a_une_autre_adresse_retrouve_sa_zone() {
+        let db = base();
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zid = repo
+            .create("Salon", Some("dlna"), Some("uuid:avant-redemarrage"))
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.50", Some(MAC_DU_RENDERER))
+            .unwrap();
+
+        let dev = renderer_dlna(
+            "uuid:apres-redemarrage",
+            "192.168.1.77",
+            Some(MAC_DU_RENDERER),
+        );
+
+        // Les deux barreaux qui existaient — c'est leur double échec qui fait
+        // le défaut, pas l'un ou l'autre.
+        assert!(
+            matches!(repo.get_by_device_id(&dev.id), Ok(None)),
+            "le barreau par UUID doit manquer : c'est l'hypothèse du témoin"
+        );
+        assert_eq!(
+            repo.zone_id_by_host(&dev.host),
+            None,
+            "le barreau par adresse doit manquer : c'est l'hypothèse du témoin"
+        );
+
+        // Le troisième.
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &dev, "dlna"),
+            Some((zid, false)),
+            "la MAC n'a pas bougé : la zone doit se rattacher seule, sans que \
+             personne n'ait à la supprimer puis à la recréer"
+        );
+    }
+
+    /// Et il ne s'arme pas quand il n'est pas sûr : pas de MAC (table ARP
+    /// froide), ou un autre protocole sur la même MAC — un Eversolo est DLNA
+    /// *et* AirPlay, les réunir serait une fusion de zones. Mieux vaut rester
+    /// hors ligne que jouer sur le mauvais appareil.
+    #[test]
+    fn le_filet_ne_sarme_pas_quand_l_identite_n_est_pas_certaine() {
+        let db = base();
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zid = repo
+            .create("Salon", Some("dlna"), Some("uuid:avant"))
+            .unwrap();
+        repo.set_identity(zid, "192.168.1.50", Some(MAC_DU_RENDERER))
+            .unwrap();
+
+        let sans_mac = renderer_dlna("uuid:apres", "192.168.1.77", None);
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &sans_mac, "dlna"),
+            None,
+            "sans MAC, rien n'identifie l'appareil"
+        );
+
+        let avec_mac = renderer_dlna("uuid:apres", "192.168.1.77", Some(MAC_DU_RENDERER));
+        assert_eq!(
+            zone_reseau_a_reancrer_par_mac(&repo, &avec_mac, "airplay"),
+            None,
+            "même MAC mais autre protocole : deux sorties RÉELLES pour un appareil, \
+             les réunir serait une fusion de zones (#3747)"
+        );
+
+        // Deux zones DLNA sur la même MAC : les départager serait un tirage au
+        // sort. La règle pure le dit, sans base.
+        let deux = [
+            tune_core::db::zone_repo::ZoneParMac {
+                id: 1,
+                output_device_id: "uuid:a".into(),
+                output_type: "dlna".into(),
+                masquee: false,
+            },
+            tune_core::db::zone_repo::ZoneParMac {
+                id: 2,
+                output_device_id: "uuid:b".into(),
+                output_type: "dlna".into(),
+                masquee: false,
+            },
+        ];
+        assert_eq!(
+            zone_a_reancrer_par_mac(&deux, "uuid:apres", false, "dlna"),
+            None
+        );
+    }
+
+    /// Le filet est-il BRANCHÉ sur la chaîne SSDP, et au bon rang ?
+    ///
+    /// Le témoin du dessus juge la règle ; celui-ci juge le câblage. Il est
+    /// borné au corps de `handle_ssdp_discovered` (coupé au marqueur du
+    /// gestionnaire mDNS qui suit), sinon l'appel de la côté mDNS le
+    /// satisferait tout seul. Les positions sont comparées APRÈS avoir exigé
+    /// que chacune existe : un `find` absent rendrait `None` et toute
+    /// comparaison serait vraie pour de mauvaises raisons.
+    #[test]
+    fn le_filet_est_bien_branche_sur_la_chaine_ssdp_entre_l_hote_et_la_creation() {
+        let source = include_str!("discovery_setup.rs");
+        let debut = source
+            .find("async fn handle_ssdp_discovered(")
+            .expect("le gestionnaire SSDP doit exister");
+        let fin = source
+            .find("pub fn spawn_mdns_handler(")
+            .expect("le gestionnaire mDNS borne le corps SSDP");
+        assert!(debut < fin, "bornes du corps SSDP dans le mauvais ordre");
+        let corps = &source[debut..fin];
+
+        let par_hote = corps
+            .find("zone_device_reconnected_by_host")
+            .expect("le barreau par adresse doit être dans la chaîne SSDP");
+        let par_mac = corps.find("zone_reseau_a_reancrer_par_mac(").expect(
+            "le filet par MAC doit être APPELÉ depuis la chaîne SSDP : sans lui, un \
+                 renderer revenu sous un autre UUID à une autre adresse laisse sa zone \
+                 hors ligne, et la seule issue connue des testeurs est de la supprimer \
+                 puis de la recréer (#4580, #4601)",
+        );
+        let creation = corps
+            .find("ssdp_zone_auto_create_disabled_skipping")
+            .expect("la création automatique doit être dans la chaîne SSDP");
+
+        assert!(
+            par_hote < par_mac,
+            "le filet par MAC doit passer APRÈS les barreaux existants : il ne prend \
+             jamais la place d'un rattrapage qui fonctionne"
+        );
+        assert!(
+            par_mac < creation,
+            "et AVANT la création automatique : c'est elle qui fabriquait le doublon"
+        );
     }
 }
 
