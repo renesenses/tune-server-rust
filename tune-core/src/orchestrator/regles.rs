@@ -74,6 +74,33 @@ pub fn dlna_cap_16bit_applies(
     is_network_output && bit_depth > 16 && (zone_cap_16bit || catalogue_force_16bit)
 }
 
+/// #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5 part-il
+/// ré-encodé plutôt qu'en passthrough vers CETTE sortie ?
+///
+/// Seulement un FLAC ENTIER (pas une tranche de feuille CUE, qui transcode
+/// déjà) vers une sortie réseau. Le fichier n'est lu qu'en dernier, et
+/// seulement si les trois premières conditions tiennent : `chemin` est
+/// paresseux pour qu'un appelant fréquent (le panneau du chemin du signal)
+/// n'ouvre pas le fichier à chaque rafraîchissement d'une zone locale.
+///
+/// `pub` pour la même raison que [`dlna_cap_16bit_applies`] : le chemin du
+/// signal (`tune-server/src/routes/zones/signal_path.rs`) doit rendre le MÊME
+/// verdict que la décision. Sans ce miroir, il annonçait un passthrough
+/// FLAC → DLNA bit-perfect là où Tune réécrivait le conteneur.
+pub fn flac_ffmpeg_vers_le_reseau_applies(
+    is_network_output: bool,
+    source_format: Option<AudioFormat>,
+    est_une_tranche_cue: bool,
+    chemin: impl FnOnce() -> Option<String>,
+) -> bool {
+    is_network_output
+        && source_format == Some(AudioFormat::Flac)
+        && !est_une_tranche_cue
+        && chemin().is_some_and(|c| {
+            crate::audio::flac_vendeur::flac_ecrit_par_ffmpeg(std::path::Path::new(&c))
+        })
+}
+
 /// Le passthrough ALAC (« ALAC direct », opt-in par zone) s'applique-t-il à
 /// CETTE lecture ?
 ///
@@ -255,14 +282,20 @@ pub(super) async fn probe_local_duration_ms(
 ///
 /// Un timeout SOAP (voir [`crate::outputs::dlna::SOAP_TIMEOUT_PREFIX`]) ne prouve
 /// rien : la requête a pu atteindre un renderer lent et être honorée, seule la
-/// réponse a manqué. Un refus de connexion, lui, est concluant — rien n'est
-/// parti. Ce prédicat décide si l'on conserve la session de flux.
+/// réponse a manqué. Un `Play` ACQUITTÉ dont l'URI reste vide
+/// ([`crate::outputs::dlna::URI_RESTEE_VIDE_PREFIX`], #3580) ne prouve pas
+/// davantage : `SetAVTransportURI` et `Play` ont répondu `200`, la commande a
+/// été reçue, seul son effet manque encore — un ampli qui finit de sortir de
+/// veille viendra peut-être chercher le flux après la borne d'attente. Un
+/// refus de connexion, lui, est concluant — rien n'est parti ; un `Play`
+/// REFUSÉ (701) aussi. Ce prédicat décide si l'on conserve la session de flux.
 pub(crate) fn command_may_have_landed(err: &str) -> bool {
     // `contains` et non `starts_with` : send_to_output enveloppe l'erreur de la
     // sortie dans « Output device error: {e} », le marqueur n'est donc jamais en
     // tête. Un test couvre précisément ce chemin — s'y fier plutôt qu'à la forme
     // supposée de la chaîne.
     err.contains(crate::outputs::dlna::SOAP_TIMEOUT_PREFIX)
+        || err.contains(crate::outputs::dlna::URI_RESTEE_VIDE_PREFIX)
 }
 
 /// Le flux qui part sur le fil est-il du DSD BRUT ?
@@ -1311,5 +1344,41 @@ mod lecture_locale_tests {
             }),
             "plafond sans FLAC direct : l'ALAC transcode déjà par ailleurs (#1137)"
         );
+    }
+}
+
+#[cfg(test)]
+mod flac_ffmpeg_tests {
+    use super::*;
+
+    /// #4350 — la porte partagée par la décision et le chemin du signal : le
+    /// fichier n'est lu que pour un FLAC entier vers le réseau.
+    #[test]
+    fn le_fichier_n_est_lu_que_pour_un_flac_entier_vers_le_reseau() {
+        let jamais = || -> Option<String> { panic!("fichier lu hors de propos") };
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            false,
+            Some(AudioFormat::Flac),
+            false,
+            jamais
+        ));
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            true,
+            Some(AudioFormat::Alac),
+            false,
+            jamais
+        ));
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            true,
+            Some(AudioFormat::Flac),
+            true,
+            jamais
+        ));
+        assert!(!flac_ffmpeg_vers_le_reseau_applies(
+            true,
+            Some(AudioFormat::Flac),
+            false,
+            || None
+        ));
     }
 }

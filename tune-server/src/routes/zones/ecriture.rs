@@ -703,6 +703,35 @@ async fn persister_le_son(
     // `upnp_renderer` juste au-dessus : la clé est supprimée à la désactivation
     // plutôt qu'écrite à « false », pour que l'absence de clé et le défaut
     // désarmé soient un seul et même état.
+    // Disposition de canaux DÉCLARÉE (chantier multicanal) → setting
+    // `zone_{id}_channel_layout`. Même forme que le repli mono : la clé est
+    // SUPPRIMÉE quand on revient à « suivre l'appareil », pour que l'absence
+    // de clé et le défaut soient un seul et même état.
+    //
+    // 🔴 Un nom inconnu est REFUSÉ plutôt qu'écrit. Le sélecteur n'offre que
+    // les neuf noms stables ; une valeur venue d'ailleurs ne serait jamais
+    // relue par `GET /zones` (qui cherche la correspondance dans `TOUTES`) et
+    // dormirait en base en faisant croire à un choix enregistré.
+    if let Some(nom) = body.channel_layout.as_deref() {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = format!("zone_{id}_channel_layout");
+        let nom = nom.trim();
+        if nom.is_empty() {
+            let r = settings.delete(&key);
+            ecrire!("channel_layout", "", r);
+        } else if tune_core::audio::channels::ChannelLayout::TOUTES
+            .iter()
+            .any(|d| d.as_str() == nom)
+        {
+            let r = settings.set(&key, nom);
+            ecrire!("channel_layout", nom, r);
+        } else {
+            return Err(crate::error::AppError::bad_request(format!(
+                "disposition de canaux inconnue : « {nom} »"
+            ))
+            .into_response());
+        }
+    }
     if let Some(enabled) = body.mono_downmix {
         let settings = SettingsRepo::with_backend(state.backend.clone());
         let key = format!("zone_{id}_mono_downmix");
@@ -748,6 +777,20 @@ async fn persister_le_son(
         // changerait rien avant la piste suivante (#1725, #1786). Or ce
         // réglage-ci se vérifie précisément à l'oreille, musique en cours.
         state.orchestrator.refresh_zone_mono_downmix(id).await;
+    }
+    // #3973 — « bit-perfect strict » → setting zone_{id}_strict_bitperfect.
+    // Même forme que `mono_downmix` : clé supprimée à la désactivation, pour
+    // que l'absence et le défaut désarmé soient un seul état. Lu à chaque
+    // lecture (`send_to_output`, résolution, radio) : rien à rafraîchir en vol.
+    if let Some(enabled) = body.strict_bitperfect {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::audio::bitperfect_strict::cle_de_zone(id);
+        let r = if enabled {
+            settings.set(&key, "true")
+        } else {
+            settings.delete(&key)
+        };
+        ecrire!("strict_bitperfect", enabled, r);
     }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {

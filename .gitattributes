@@ -1,0 +1,8 @@
+# Les sources Rust sont extraites en LF sur toutes les plateformes (#4533).
+#
+# Git pour Windows installe `core.autocrlf=true` au niveau système : sans cette
+# ligne, les `.rs` arrivent en CRLF sur un poste ou un runner Windows. Les gardes
+# de texte (`include_str!` qui cherchent `"\n}\n"`) y deviennent rouges, et les
+# littéraux multilignes compilés n'y ont pas les mêmes octets que sous Linux.
+# Portée limitée aux `.rs` : certaines fixtures sont CRLF à dessein.
+*.rs text eol=lf

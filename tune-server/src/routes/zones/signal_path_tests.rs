@@ -3001,3 +3001,253 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
         );
     }
 }
+
+// ── #4172 — WASAPI sans contrat exclusif = mode partagé, nommé et non bit-perfect ──
+
+/// Le témoin : « WASAPI » sans contrat de signal se nomme partagé et n'est
+/// pas intact — avant, il se nommait « WASAPI » tout court et passait pour
+/// bit-perfect, quelle que soit la cadence à laquelle le mixeur Windows
+/// sortait réellement.
+#[test]
+fn wasapi_sans_contrat_exclusif_se_nomme_partage_et_n_est_pas_bit_perfect_4172() {
+    use super::signal_path::{etiquette_du_transport_local, transport_partage_est_intact};
+    assert_eq!(
+        etiquette_du_transport_local("WASAPI", false),
+        "WASAPI (shared \u{2014} Windows mixer)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("WASAPI", true),
+        "WASAPI (exclusive)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("ASIO", true),
+        "ASIO (exclusive)"
+    );
+    assert_eq!(
+        etiquette_du_transport_local("CoreAudio", false),
+        "CoreAudio"
+    );
+    assert_eq!(etiquette_du_transport_local("ALSA", false), "ALSA");
+    assert!(!transport_partage_est_intact("WASAPI"), "mixeur Windows");
+    assert!(transport_partage_est_intact("CoreAudio"), "inchangé");
+    assert!(transport_partage_est_intact("ALSA"), "inchangé");
+}
+
+/// La garde du BRANCHEMENT : le bras `"local"` de `decrire_le_transport`
+/// passe par l'étiquette et, sans contrat, par le verdict du mode partagé.
+#[test]
+fn le_transport_local_dit_son_mode_et_son_verdict_4172() {
+    let src = include_str!("signal_path.rs");
+    let bras = src.find("\"local\" => {").expect("le bras local");
+    let bloc = &src[bras..bras + 1_500];
+    assert!(
+        bloc.contains("etiquette_du_transport_local(audio_backend, exclusif_observe)"),
+        "le nom vient de l'étiquette"
+    );
+    assert!(
+        bloc.contains("None => transport_partage_est_intact(audio_backend)"),
+        "sans contrat, le verdict est celui du mode partagé"
+    );
+}
+
+// ── #3973 — « jouer, et le dire » : PURE dégradé par une conversion ──
+
+/// Zone en PURE, la sortie a MESURÉ une conversion 96 → 48 kHz : le chemin du
+/// signal publie la conversion (de, vers), l'étape porte son code, et PURE
+/// est déclaré DÉGRADÉ — au lieu d'un badge PURE allumé sur un signal
+/// rééchantillonné.
+#[test]
+fn pure_avec_conversion_mesuree_est_declare_degrade_3973() {
+    let (backend, zone) = local_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(48_000, 2, false));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(sp["pure"], serde_json::json!(true), "{sp}");
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(true),
+        "PURE + conversion de fréquence = PURE dégradé : {sp}"
+    );
+    assert_eq!(
+        sp["rate_conversion"],
+        serde_json::json!({"from_hz": 96_000, "to_hz": 48_000}),
+        "{sp}"
+    );
+    assert_eq!(sp["bit_perfect"], serde_json::json!(false));
+    assert_eq!(sp["strict_bitperfect"], serde_json::json!(false));
+    let etape = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Resampler")
+        .expect("l'étape Resampler");
+    assert_eq!(etape["code"], "rate_conversion", "{etape}");
+}
+
+/// Même zone en PURE, aucune conversion : PURE n'est PAS dégradé, et
+/// `rate_conversion` est nul — la garde contre un correctif qui crierait au
+/// loup.
+#[test]
+fn pure_sans_conversion_n_est_pas_degrade_3973() {
+    let (backend, zone) = local_zone_migrated();
+    let zone_id = zone.id.unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+    let mut ps = flac_playing();
+    ps.transformations_reelles = Some(transformations_mesurees(96_000, 2, false));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        Some(&wire("flac", 96_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(sp["pure"], serde_json::json!(true));
+    assert_eq!(sp["pure_degraded"], serde_json::json!(false), "{sp}");
+    assert!(sp["rate_conversion"].is_null(), "{sp}");
+}
+
+// #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5 part ré-encodé
+// vers une sortie réseau (`flac_ffmpeg_vers_le_reseau_applies`). Le panneau
+// annonçait pourtant un passthrough : « À signaler dans le chemin du signal
+// (“conteneur réécrit”), pour ne pas afficher un passthrough qui n'en est pas
+// un » — la moitié du ticket restée ouverte après la v0.9.154.
+
+/// Un en-tête FLAC de la forme exacte de l'enregistreur (mesurée sur le .18) :
+/// STREAMINFO à MD5 nul (ou non), puis VORBIS_COMMENT au vendeur donné. Le
+/// panneau ne lit que ces blocs ; aucune trame n'est décodée.
+fn fichier_flac(dir: &std::path::Path, nom: &str, vendeur: &str, md5_nul: bool) -> String {
+    let mut f = b"fLaC".to_vec();
+    let mut streaminfo = [0u8; 34];
+    if !md5_nul {
+        streaminfo[18..34].copy_from_slice(&[0x5a; 16]);
+    }
+    f.extend_from_slice(&[0x00, 0, 0, 34]);
+    f.extend_from_slice(&streaminfo);
+    let mut vorbis = (vendeur.len() as u32).to_le_bytes().to_vec();
+    vorbis.extend_from_slice(vendeur.as_bytes());
+    vorbis.extend_from_slice(&0u32.to_le_bytes());
+    let l = vorbis.len() as u32;
+    f.extend_from_slice(&[0x80 | 4, (l >> 16) as u8, (l >> 8) as u8, l as u8]);
+    f.extend_from_slice(&vorbis);
+    f.extend_from_slice(&[0xFF, 0xF8, 0x69, 0x18]);
+    let chemin = dir.join(nom);
+    std::fs::write(&chemin, f).unwrap();
+    chemin.to_string_lossy().into_owned()
+}
+
+fn piste_en_fichier(backend: &Arc<dyn DbBackend>, chemin: &str) -> i64 {
+    let mut t = tune_core::db::models::Track::new("Enregistrement".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some("flac".into());
+    t.sample_rate = Some(44_100);
+    t.bit_depth = Some(16);
+    t.channels = 2;
+    t.source = "local".into();
+    TrackRepo::with_backend(backend.clone()).create(&t).unwrap()
+}
+
+fn etape<'v>(sp: &'v Value, nom: &str) -> Option<&'v Value> {
+    sp["steps"].as_array()?.iter().find(|e| e["name"] == nom)
+}
+
+/// Le cas du ticket : FLAC de l'enregistreur, zone DLNA. Le panneau doit
+/// montrer la réécriture — et la dire sans perte, parce qu'elle l'est.
+#[test]
+fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
+    let dir = tempfile::tempdir().unwrap();
+    let chemin = fichier_flac(dir.path(), "enregistrement.flac", "Lavf60.16.100", true);
+    let (backend, zone) = dlna_zone();
+    let tid = piste_en_fichier(&backend, &chemin);
+    let sp = build_signal_path(
+        &en_lecture(tid, "flac", 44_100, 16),
+        &zone,
+        &backend,
+        Some("Eversolo DMP-A8"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    let transcoder = etape(&sp, "Transcoder").unwrap_or_else(|| {
+        panic!("le conteneur est réécrit : l'étape Transcoder doit paraître — {sp}")
+    });
+    assert_eq!(
+        transcoder["code"], "flac_container_rewritten",
+        "{transcoder}"
+    );
+    assert_eq!(
+        transcoder["description"], "FLAC 44kHz/16bit \u{2192} FLAC 44kHz/16bit",
+        "{transcoder}"
+    );
+    assert_eq!(
+        transcoder["bit_perfect"],
+        serde_json::json!(true),
+        "ré-encodé sans perte : mêmes échantillons, {transcoder}"
+    );
+    assert!(
+        sp["summary"].as_str().unwrap().contains("transcode"),
+        "le résumé ne doit plus annoncer un passthrough : {sp}"
+    );
+    assert_eq!(verdict(&sp), Some(true), "aucun échantillon touché : {sp}");
+}
+
+/// Les contre-épreuves : ce qui ne part PAS ré-encodé ne doit pas l'annoncer.
+/// Même vendeur AVEC un MD5 réel (le FLAC de référence du dépôt), un FLAC
+/// libFLAC à MD5 nul, et le fichier de l'enregistreur sur une sortie LOCALE.
+#[test]
+fn le_conteneur_reecrit_ne_s_annonce_que_la_ou_il_a_lieu_4350() {
+    let dir = tempfile::tempdir().unwrap();
+    let lavf_md5 = fichier_flac(dir.path(), "lavf-md5.flac", "Lavf62.12.101", false);
+    let libflac = fichier_flac(dir.path(), "libflac.flac", "reference libFLAC 1.4.3", true);
+    let lavf_nul = fichier_flac(dir.path(), "lavf-nul.flac", "Lavf60.16.100", true);
+
+    let (backend, zone) = dlna_zone();
+    for chemin in [&lavf_md5, &libflac] {
+        let tid = piste_en_fichier(&backend, chemin);
+        let sp = build_signal_path(
+            &en_lecture(tid, "flac", 44_100, 16),
+            &zone,
+            &backend,
+            Some("Eversolo DMP-A8"),
+            "",
+            Some(&wire("flac", 44_100, 16)),
+        )
+        .unwrap();
+        assert!(
+            etape(&sp, "Transcoder").is_none(),
+            "{chemin} part en passthrough, le panneau ne doit pas dire autre chose : {sp}"
+        );
+    }
+
+    let (backend, zone) = local_zone_migrated();
+    let tid = piste_en_fichier(&backend, &lavf_nul);
+    let sp = build_signal_path(
+        &en_lecture(tid, "flac", 44_100, 16),
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CoreAudio",
+        None,
+    )
+    .unwrap();
+    assert!(
+        etape(&sp, "Transcoder").is_none(),
+        "sortie locale : aucune réécriture de conteneur — {sp}"
+    );
+}

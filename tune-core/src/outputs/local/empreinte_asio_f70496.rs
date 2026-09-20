@@ -16,6 +16,10 @@
 //!   rendait des `f32` que `feed_ring_abortable` poussait dans `RingBuf` ;
 //!   après, c'est l'étage de R1 (`EtageDeConversion::pousser`) avec une
 //!   fermeture qui refuse TOUT porteur DoP. Même relevé, même comparaison.
+//!   REF-10 (#2219) a retiré `prepare_windows_exclusive_pcm`, morte en
+//!   production : ce qu'elle rendait est FIGÉ dans les relevés (mesurés à
+//!   nouveau sur `23199ab4` juste avant le retrait), et la route traitée
+//!   d'après n'est plus comparée qu'à eux.
 //!
 //! Les constantes sont des RELEVÉS pris sur `49ecf1fe` (tête de
 //! `batch/bugs-12`, `986d2f0f` compris), pas des valeurs attendues qu'on
@@ -162,26 +166,6 @@ impl Dsp {
             spec,
             FormatOuvert::new(spec.cadence(), spec.canaux()),
             &self.volume,
-            &self.eq,
-            &self.convolver,
-            &self.crossfeed,
-            &self.pure_bypass,
-            &self.mono_downmix,
-        )
-    }
-
-    /// La chaîne d'AVANT sur la route traitée : `prepare_windows_exclusive_pcm`
-    /// — quarantaine 24 bits, refus DoP, `pcm_bytes_to_f32`, DSP.
-    fn avant_flottante(
-        &self,
-        octets: &[u8],
-        spec: AudioSpec,
-    ) -> Result<Option<Vec<f32>>, WindowsExclusivePcmError> {
-        prepare_windows_exclusive_pcm(
-            octets,
-            spec.profondeur().bits_declares(),
-            spec.canaux(),
-            spec.profondeur().bits_declares() == 24,
             &self.eq,
             &self.convolver,
             &self.crossfeed,
@@ -364,21 +348,27 @@ fn route_native_a_volume_reduit_quantifie_une_fois_avant_l_anneau() {
 
 /// Route traitée : AVANT = `prepare_windows_exclusive_pcm`, APRÈS = l'étage
 /// de R1 avec la fermeture qui refuse tout porteur. Mêmes `f32`.
+///
+/// REF-10 (#2219) : `prepare_windows_exclusive_pcm` n'avait plus d'appelant
+/// de production (compilation Windows, avec et sans `asio`) et a été retirée.
+/// Ce qu'elle rendait sur ces signaux est FIGÉ dans `releve` : mesuré sur
+/// `23199ab4` (tête de `batch/refonte-ref10-20260919`, v0.9.156), sur Shrek,
+/// par `cargo test -p tune-core --features local-audio --lib outputs::local
+/// -- --nocapture` avec un `eprintln!` provisoire de `empreinte_avant` —
+/// 16 bits `0xbb0ab2e4f3bdaf91`, 24 bits `0xe9003ca2aef3dbdd`, les deux
+/// relevés de `49ecf1fe` à l'identique.
 fn route_traitee_identite(bit_depth: u16, releve: u64) {
     let spec = stereo(bit_depth);
     let octets = source(bit_depth);
     let dsp = Dsp::au_repos(1000);
 
-    let avant = dsp
-        .avant_flottante(&octets, spec)
-        .expect("PCM ordinaire : accepté")
-        .expect("fenêtre complète");
+    // Au repos, la chaîne d'avant rendait `pcm_bytes_to_f32` tel quel : cet
+    // oracle, toujours vivant, doit retomber sur le relevé figé.
+    let empreinte_avant = empreinte_des_f32(spec, &pcm_bytes_to_f32(&octets, bit_depth));
     assert_eq!(
-        avant,
-        pcm_bytes_to_f32(&octets, bit_depth),
-        "au repos, la route traitée rend pcm_bytes_to_f32 tel quel"
+        empreinte_avant, releve,
+        "au repos, la route traitée rend pcm_bytes_to_f32 tel quel ({bit_depth} bits)"
     );
-    let empreinte_avant = empreinte_des_f32(spec, &avant);
 
     let mut capture = CaptureOutput::ouvert(FormatOuvert::new(CADENCE, 2));
     let mut etage = dsp.etage_flottant(octets, spec);
@@ -390,7 +380,7 @@ fn route_traitee_identite(bit_depth: u16, releve: u64) {
     assert_eq!(
         capture.empreinte(),
         empreinte_avant,
-        "l'étage de R1 ne rend pas ce que prepare_windows_exclusive_pcm rendait"
+        "l'étage de R1 ne rend pas ce que prepare_windows_exclusive_pcm rendait (relevé figé)"
     );
     assert_eq!(
         capture.empreinte(),
@@ -414,16 +404,15 @@ fn route_traitee_24_bits_par_l_etage_de_r1_rend_les_memes_f32() {
 /// Le refus DoP de la route traitée SURVIT à la migration : AVANT
 /// `DopUnsupported` avant conversion, APRÈS `PorteurDopRefuse` avant
 /// conversion — et rien n'atteint le puits dans les deux cas.
+///
+/// REF-10 (#2219) : le verdict d'AVANT (`Err(DopUnsupported)` rendu par
+/// `prepare_windows_exclusive_pcm` sur la fixture entière) est figé ici en
+/// commentaire, mesuré vert sur `23199ab4` avant le retrait de la fonction.
 #[test]
 fn route_traitee_refuse_le_porteur_dop_avant_toute_conversion() {
     let spec = stereo(24);
     let octets = porteur_dop();
     let dsp = Dsp::au_repos(1000);
-
-    assert_eq!(
-        dsp.avant_flottante(&octets, spec),
-        Err(WindowsExclusivePcmError::DopUnsupported)
-    );
 
     let mut capture = CaptureOutput::ouvert(FormatOuvert::new(CADENCE, 2));
     let mut etage = dsp.etage_flottant(octets, spec);
@@ -444,13 +433,15 @@ fn route_traitee_refuse_le_porteur_dop_avant_toute_conversion() {
 
 /// 31 trames 24 bits ne prouvent ni PCM ni DoP : quarantaine sur les deux
 /// chaînes, et à l'EOF la sonde incomplète reste un refus (`DopCheckIncomplete`).
+///
+/// REF-10 (#2219) : le verdict d'AVANT (`Ok(None)`, quarantaine, rendu par
+/// `prepare_windows_exclusive_pcm` sur 31 trames) est figé ici en
+/// commentaire, mesuré vert sur `23199ab4` avant le retrait de la fonction.
 #[test]
 fn route_traitee_quarantaine_puis_refus_a_l_eof_si_la_sonde_est_incomplete() {
     let spec = stereo(24);
     let octets = porteur_dop()[..31 * 6].to_vec();
     let dsp = Dsp::au_repos(1000);
-
-    assert!(matches!(dsp.avant_flottante(&octets, spec), Ok(None)));
 
     let mut capture = CaptureOutput::ouvert(FormatOuvert::new(CADENCE, 2));
     let mut etage = dsp.etage_flottant(octets.clone(), spec);

@@ -534,7 +534,15 @@ impl PlaybackOrchestrator {
         // failure. Applies to every downstream radio path (local and network).
         let resolved_playlist = self.resolve_playlist_url(raw_url).await;
         let audio_url: &str = resolved_playlist.as_deref().unwrap_or(raw_url);
-        let title = req.title.clone().unwrap_or_else(|| "Episode".into());
+        // #4323 — « Episode » n'est le bon repli que pour un podcast. Une
+        // lecture UPnP sans `dc:title` (ou une radio sans nom) prend le nom
+        // de fichier de son URL, à défaut l'hôte qui la sert : c'est ce
+        // libellé qui entre dans la lecture en cours ET dans l'historique.
+        let title = req
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| titre_de_repli(&source_apparente, audio_url));
         let artist = req.artist_name.clone();
         let album = req.album_title.clone();
         let cover_url = req.cover_url.clone();
@@ -671,6 +679,11 @@ impl PlaybackOrchestrator {
                 && !is_local_output
                 && (req.output_device_id.is_some() || is_browser_output)
             {
+                // 🔴 #4311 — le relais passe les octets VERBATIM : rien n'est
+                // décodé côté serveur, donc aucun niveau n'était mesuré.
+                let codec = d.bc_quality.as_ref().map(|q| q.codec).unwrap_or("mp3");
+                self.sonder_les_niveaux_bandcamp(req.zone_id, d.audio_url, codec)
+                    .await;
                 self.relayer_bandcamp_au_reseau(d).await
             } else if is_radio {
                 self.servir_la_radio_au_reseau(req, d).await
@@ -684,6 +697,16 @@ impl PlaybackOrchestrator {
                 // (44,1 kHz / 16 bits est ce que le mp3-128 de Bandcamp décode) :
                 // le chemin du signal doit annoncer « MP3 — Avec perte », et non
                 // hériter d'une valeur par défaut qu'on n'aurait pas choisie.
+                //
+                // 🔴 #4311 — « rien à interposer » valait pour le FLUX, pas
+                // pour les NIVEAUX : `LocalOutput` décode mais ne mesure rien
+                // (`outputs/local.rs` n'a aucune occurrence de `levels`), et
+                // ce bras ne lançait aucune sonde. Spectre et bargraphe
+                // restaient au plancher sur toute lecture Bandcamp en sortie
+                // locale (GgB, 0.9.153, « HDA Intel PCH »).
+                let codec = bc_quality.as_ref().map(|q| q.codec).unwrap_or("mp3");
+                self.sonder_les_niveaux_bandcamp(req.zone_id, audio_url, codec)
+                    .await;
                 (
                     audio_url.to_string(),
                     None,
@@ -822,6 +845,8 @@ impl PlaybackOrchestrator {
         // De quoi DIRE l'échec plutôt que de le laisser au journal.
         let err_bus = self.event_bus.clone();
         let err_zone = req.zone_id;
+        // #3973 — lu avant la tâche détachée, comme la zone elle-même.
+        let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let err_station = title.clone();
         // #3756 — de quoi RETENIR l'échec, pas seulement le dire. Le sondeur
         // ne voit que le `Ok` de `play()` ; sans cette mémoire il relance une
@@ -843,6 +868,7 @@ impl PlaybackOrchestrator {
                         radio_eq_profile.clone()
                     },
                     radio_levels_tx,
+                    radio_strict,
                 )
             })
             .await;
@@ -903,6 +929,21 @@ impl PlaybackOrchestrator {
     }
 
     /// Bandcamp vers une sortie OAAT : même décodage en WAV, sans égaliseur.
+    /// #4311 — niveaux d'une lecture Bandcamp que le serveur NE DÉCODE PAS :
+    /// sortie locale (`LocalOutput` décode lui-même et ne mesure rien) et
+    /// relais réseau/navigateur (octets verbatim). Sans sonde, aucun
+    /// `playback.audio_levels` ne partait pour la zone — spectre et bargraphe
+    /// inertes, les deux à la fois, exactement ce que GgB décrit. Même geste
+    /// que le proxy Qobuz/Tidal (`resolve_stream.rs`, #1106) : une seconde
+    /// connexion décodée pour les seuls niveaux, le flux joué n'est pas
+    /// touché. L'indice de codec vient de l'URL (`mp3-128`, `flac`), repli
+    /// `mp3` de l'écoute libre ; le sondeur reconnaît de toute façon le
+    /// conteneur.
+    async fn sonder_les_niveaux_bandcamp(&self, zone_id: i64, audio_url: &str, codec: &str) {
+        self.spawn_proxy_levels_probe(zone_id, audio_url.to_string(), codec.to_string())
+            .await;
+    }
+
     async fn decoder_bandcamp_en_wav(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
         let Directe { audio_url, .. } = d;
         // Un endpoint OAAT ne consomme que du PCM en conteneur WAV : son
@@ -932,6 +973,7 @@ impl PlaybackOrchestrator {
             self.streamer.create_radio_session(wav_info, 256).await;
         info!(url = %audio_url, "bandcamp_decode_to_wav_for_oaat_output");
         let bc_url = audio_url.to_string();
+        let bc_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
         let bc_levels_tx = if let Some(ref bus) = self.event_bus {
             let play_seq = self.playback.current_play_seq(req.zone_id).await;
             Some(spawn_paced_levels_forwarder(
@@ -947,7 +989,15 @@ impl PlaybackOrchestrator {
         let session_for_done = session.clone();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                decode_radio_stream_to_pcm(bc_url, tx, data_ready, session, None, bc_levels_tx)
+                decode_radio_stream_to_pcm(
+                    bc_url,
+                    tx,
+                    data_ready,
+                    session,
+                    None,
+                    bc_levels_tx,
+                    bc_strict,
+                )
             })
             .await;
             session_for_done
@@ -1187,6 +1237,8 @@ impl PlaybackOrchestrator {
             // Même dette que le chemin local : l'échec restait au journal.
             let err_bus = self.event_bus.clone();
             let err_zone = req.zone_id;
+            // #3973 — lu avant la tâche détachée, comme la zone elle-même.
+            let radio_strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
             let err_station = title.clone();
             // #3756 — même mémoire que le chemin local/OAAT. Le journal du
             // ticket vient d'une sortie ALSA, mais rien dans la boucle de
@@ -1203,6 +1255,7 @@ impl PlaybackOrchestrator {
                         session,
                         radio_eq_profile.clone(),
                         radio_levels_tx,
+                        radio_strict,
                     )
                 })
                 .await;
@@ -1257,6 +1310,116 @@ impl PlaybackOrchestrator {
             };
             (direct_url, None, mime_type.to_string(), None, None, None)
         }
+    }
+}
+
+/// Titre d'une lecture directe dont la demande n'en porte aucun (#4323).
+///
+/// Un podcast garde « Episode », son contrat d'origine. Toute autre source
+/// — au premier chef `upnp`, le MediaRenderer piloté par un point de contrôle
+/// qui n'envoie pas de `dc:title` lisible — prend :
+///
+/// 1. le dernier segment du chemin de l'URL, décodé, sans extension, s'il
+///    ressemble à un nom (au moins une lettre, pas un mot générique comme
+///    `audio` ou `stream`) ;
+/// 2. sinon l'hôte qui sert le flux, sans port ;
+/// 3. sinon « Episode », faute de mieux.
+fn titre_de_repli(source: &str, url: &str) -> String {
+    const REPLI: &str = "Episode";
+    if source == "podcast" {
+        return REPLI.into();
+    }
+    let url = url.trim();
+    let sans_schema = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let sans_requete = sans_schema.split(['?', '#']).next().unwrap_or(sans_schema);
+    let (hote, chemin) = match sans_requete.find('/') {
+        Some(i) => sans_requete.split_at(i),
+        None => (sans_requete, ""),
+    };
+    const GENERIQUES: [&str; 12] = [
+        "audio", "stream", "file", "track", "play", "listen", "content", "media", "download",
+        "index", "get", "resource",
+    ];
+    let nom = chemin
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .map(|seg| {
+            urlencoding::decode(seg)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| seg.to_string())
+        })
+        .map(|seg| match seg.rsplit_once('.') {
+            Some((base, ext))
+                if !base.is_empty()
+                    && (1..=5).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            {
+                base.to_string()
+            }
+            _ => seg,
+        })
+        .map(|seg| seg.replace('_', " ").trim().to_string())
+        .filter(|seg| {
+            seg.chars().any(char::is_alphabetic)
+                && !GENERIQUES.contains(&seg.to_ascii_lowercase().as_str())
+        });
+    if let Some(nom) = nom {
+        return nom;
+    }
+    let hote = hote.rsplit('@').next().unwrap_or(hote);
+    let hote = match hote.strip_prefix('[') {
+        Some(reste) => reste.split(']').next().unwrap_or(reste),
+        None => hote.split(':').next().unwrap_or(hote),
+    };
+    if hote.is_empty() {
+        REPLI.into()
+    } else {
+        hote.to_string()
+    }
+}
+
+#[cfg(test)]
+mod temoins_du_titre_de_repli {
+    use super::titre_de_repli;
+
+    /// #4323 — une lecture UPnP sans titre ne s'appelle plus « Episode ».
+    #[test]
+    fn une_lecture_upnp_sans_titre_prend_le_nom_du_fichier() {
+        assert_eq!(
+            titre_de_repli(
+                "upnp",
+                "http://192.168.1.41:26125/music/01%20So_What.flac?x=1"
+            ),
+            "01 So What"
+        );
+        assert_eq!(
+            titre_de_repli("upnp", "http://nas.local:9000/audio/Kind%20of%20Blue"),
+            "Kind of Blue"
+        );
+    }
+
+    #[test]
+    fn un_chemin_sans_nom_retombe_sur_l_hote() {
+        assert_eq!(
+            titre_de_repli("upnp", "http://192.168.1.41:26125/content/4711.flac"),
+            "192.168.1.41"
+        );
+        assert_eq!(
+            titre_de_repli(
+                "upnp",
+                "http://192.168.0.167:8888/api/v1/library/tracks/187500/audio"
+            ),
+            "192.168.0.167"
+        );
+        assert_eq!(titre_de_repli("radio", "http://[fe80::1]:8000/"), "fe80::1");
+    }
+
+    #[test]
+    fn un_podcast_garde_episode() {
+        assert_eq!(
+            titre_de_repli("podcast", "https://cdn.example/show/ep42.mp3"),
+            "Episode"
+        );
     }
 }
 

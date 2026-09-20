@@ -242,6 +242,19 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/editions", get(albums::album_editions))
         // BIB-A2 (phase 0) : `/albums/eclates` AVANT `/albums/{id}`, comme `hidden`.
         .route("/albums/eclates", get(albums::albums_eclates))
+        // #4471 — les coffrets CD1/CD2 dont les numéros se marchent dessus.
+        // AVANT `/albums/{id}`, pour la même raison qu'`eclates`.
+        .route("/albums/disques-abimes", get(albums::disques_abimes))
+        // Coffrets ÉCLATÉS en un album par disque. AVANT `/albums/{id}`.
+        .route("/albums/coffrets", get(albums::coffrets_eclates))
+        .route(
+            "/albums/coffrets/{cible}/regrouper",
+            post(albums::regrouper_coffret),
+        )
+        .route(
+            "/albums/disques-abimes/reparer",
+            post(albums::reparer_disques),
+        )
         // BIB-A2 (phase 1) : un album éclaté absorbe son doublon, à la demande.
         .route(
             "/albums/{cible}/absorber/{doublon}",

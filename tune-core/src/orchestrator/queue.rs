@@ -347,6 +347,116 @@ impl PlaybackOrchestrator {
         Ok((entry, total))
     }
 
+    /// Plafond de pistes enjambées d'un seul geste (#4362). Au-delà, on cesse
+    /// de chercher et la première piste est laissée au refus ordinaire : une
+    /// file de 5 000 pistes d'un serveur éteint ne doit pas se lire en entier
+    /// sur le chemin d'un appui sur Lecture.
+    pub const PLAFOND_ENJAMBEE_SERVEUR_ABSENT: usize = 50;
+
+    /// **#4362 (point 2) — « Tout lire » / Suivant sur une file mixte enjambe
+    /// les pistes dont le serveur multimédia est ABSENT, et le dit.**
+    ///
+    /// Depuis #4399, jouer une piste dont le serveur est absent est refusé en
+    /// nommant ce serveur (plus de silence). Mais une file mixte butait alors
+    /// sur sa première piste injoignable : « Tout lire » rendait l'erreur et
+    /// rien ne partait, alors que la piste suivante — locale, ou d'un serveur
+    /// présent — était jouable.
+    ///
+    /// Parcourt la file vers l'avant à partir de `position`. Rend
+    /// `Some((position, track_id))` de la première piste jouable (`track_id`
+    /// vaut `None` pour une ligne de streaming) quand AU MOINS
+    /// une piste a été enjambée — après avoir émis un `playback.track_skipped`
+    /// par piste (le même événement que l'avance automatique) et un
+    /// `zone.playback_error` qui NOMME le serveur. Rend `None` quand il n'y a
+    /// rien à enjamber, ou quand AUCUNE piste jouable n'est trouvée (fin de
+    /// file, plafond) : l'appelant garde alors sa position et le refus
+    /// ordinaire parle, comme avant.
+    ///
+    /// Le verdict « absent » est exactement celui du refus de lecture
+    /// (`serveur_de_la_piste_absent`), donc celui du badge « Serveur absent ».
+    /// Une piste sans `track_id` (service de streaming) ou d'un serveur inconnu
+    /// du registre n'est jamais enjambée.
+    pub async fn enjamber_les_serveurs_absents(
+        &self,
+        zone_id: i64,
+        position: i64,
+    ) -> Option<(i64, Option<i64>)> {
+        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
+        let total = queue_repo.count_all(zone_id).ok()?;
+        let mut p = position.max(0);
+        let mut enjambees: Vec<(i64, Option<String>)> = Vec::new();
+        let mut premier_absent = None;
+        let (cible, titre_cible) = loop {
+            if p >= total || enjambees.len() >= Self::PLAFOND_ENJAMBEE_SERVEUR_ABSENT {
+                if !enjambees.is_empty() {
+                    warn!(
+                        zone_id,
+                        position,
+                        enjambees = enjambees.len(),
+                        "file_sans_piste_jouable_apres_serveur_absent"
+                    );
+                }
+                return None;
+            }
+            let entry = queue_repo.get_at(zone_id, p).ok().flatten()?;
+            match entry
+                .track_id
+                .and_then(|id| self.serveur_de_la_piste_absent(id))
+            {
+                Some(absent) => {
+                    premier_absent.get_or_insert(absent);
+                    enjambees.push((p, entry.title.clone()));
+                    p += 1;
+                }
+                None if enjambees.is_empty() => return None,
+                // Une ligne de streaming (sans `track_id`) est jouable aussi :
+                // `play_from_queue` sait la lancer.
+                None => break (entry.track_id, entry.title.clone()),
+            }
+        };
+        let absent = premier_absent?;
+        let motif = super::serveur_source_absent_4362::motif_de_l_enjambee(
+            &absent,
+            enjambees.len(),
+            titre_cible.as_deref(),
+        );
+        warn!(
+            zone_id,
+            depuis = position,
+            reprise = p,
+            enjambees = enjambees.len(),
+            serveur = %absent.nom,
+            "file_enjambe_serveur_absent"
+        );
+        if let Some(ref bus) = self.event_bus {
+            for (pos, titre) in &enjambees {
+                bus.emit(
+                    "playback.track_skipped",
+                    serde_json::json!({
+                        "zone_id": zone_id,
+                        "position": pos,
+                        "title": titre,
+                        "reason": "serveur_source_absent",
+                    }),
+                );
+            }
+            // `fatal: true` ne veut pas dire « la zone s'arrête » : c'est le
+            // drapeau qui empêche le client de masquer l'annonce derrière le
+            // « chargement… » de la fenêtre de grâce qui suit un appui sur
+            // Lecture — exactement la fenêtre où cette annonce tombe.
+            bus.emit(
+                "zone.playback_error",
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "error": motif,
+                    "fatal": true,
+                    "pistes_enjambees": enjambees.len(),
+                }),
+            );
+        }
+        Some((p, cible))
+    }
+
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
@@ -548,12 +658,21 @@ impl PlaybackOrchestrator {
             // from the library row via `from_track` (single source of the
             // source-over-output bit-depth rule); display fields come from the
             // queue-entry cache and source is pinned local.
+            // #4446 — le condensat TEL QUEL, comme au démarrage
+            // (`transport.rs`, `habillage.cover_path`). Passé par
+            // `resolve_cover_url`, il devenait `http://<ip-lan>:8888/…` : le
+            // client web tient toute URL absolue pour une pochette distante,
+            // l'envoie au relais, et la garde d'adresse de #4260 la refuse
+            // (`artwork_proxy_hote_refuse`) — pochette grise dès le deuxième
+            // morceau enchaîné. Les renderers réseau reçoivent leur URL
+            // absolue par `PlayRequest.cover_url` → `resolve_cover_url`, ce
+            // chemin-ci ne leur sert pas.
             crate::playback::NowPlaying {
                 track_id: Some(track_id),
                 title: entry.title.clone().unwrap_or_default(),
                 artist_name: entry.artist_name.clone(),
                 album_title: entry.album_title.clone(),
-                cover_path: self.resolve_cover_url(cover_path.as_deref()),
+                cover_path,
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source: "local".into(),
                 source_id: None,
@@ -584,7 +703,8 @@ impl PlaybackOrchestrator {
                 title: entry.title.clone().unwrap_or_default(),
                 artist_name: entry.artist_name.clone(),
                 album_title: entry.album_title.clone(),
-                cover_path: self.resolve_cover_url(entry.cover_path.as_deref()),
+                // #4446 — même règle : la valeur de la file, non résolue.
+                cover_path: entry.cover_path.clone(),
                 duration_ms: entry.duration_ms.unwrap_or(0),
                 source,
                 source_id: entry.source_id.clone(),

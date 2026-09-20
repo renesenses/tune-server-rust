@@ -20,7 +20,7 @@ use super::local::{
 };
 #[cfg(target_os = "windows")]
 use super::negociation_format_exclusif_3837::{
-    CandidatFormat, ResultatSonde, negocier_format_exclusif,
+    CandidatFormat, ResultatSonde, message_peripherique_occupe, negocier_format_exclusif,
 };
 
 #[cfg(target_os = "windows")]
@@ -585,18 +585,19 @@ impl WasapiExclusiveOutput {
                     return Err(format!("IAudioClient::GetDevicePeriod failed: 0x{hr:08X}"));
                 }
             }
-            let period = if min_period > 0 {
-                min_period
-            } else {
-                default_period
+            // #4357 — la période PAR DÉFAUT, plus la minimale : voir
+            // `periode_exclusive_4357`. Les deux sont journalisées.
+            let period = match super::periode_exclusive_4357::periode_exclusive_100ns(
+                default_period,
+                min_period,
+            ) {
+                Ok(period) => period,
+                Err(error) => {
+                    release(audio_client);
+                    release(device);
+                    return Err(error);
+                }
             };
-            if period <= 0 {
-                release(audio_client);
-                release(device);
-                return Err(format!(
-                    "IAudioClient::GetDevicePeriod a renvoyé une période invalide : {period}"
-                ));
-            }
 
             // 7. Initialize in exclusive event-driven mode. Windows can reject
             // the requested period solely because its frame count is not
@@ -649,17 +650,21 @@ impl WasapiExclusiveOutput {
                     if retry_hr != S_OK {
                         release(audio_client);
                         release(device);
-                        return Err(format!(
-                            "IAudioClient::Initialize(EXCLUSIVE, aligned) failed: 0x{retry_hr:08X}"
-                        ));
+                        return Err(message_peripherique_occupe(retry_hr).unwrap_or_else(|| {
+                            format!(
+                                "IAudioClient::Initialize(EXCLUSIVE, aligned) failed: 0x{retry_hr:08X}"
+                            )
+                        }));
                     }
                 }
                 WasapiInitDecision::Fail(hr) => {
                     release(audio_client);
                     release(device);
-                    return Err(format!(
-                        "IAudioClient::Initialize(EXCLUSIVE) failed: 0x{hr:08X}"
-                    ));
+                    // #3067 : l'endpoint tenu par un autre programme se dit
+                    // en clair, pas en `HRESULT`.
+                    return Err(message_peripherique_occupe(hr).unwrap_or_else(|| {
+                        format!("IAudioClient::Initialize(EXCLUSIVE) failed: 0x{hr:08X}")
+                    }));
                 }
             }
             release(device);
@@ -723,6 +728,8 @@ impl WasapiExclusiveOutput {
                 channels,
                 buffer_frames = buffer_frame_count,
                 period_100ns = selected_period,
+                periode_par_defaut_100ns = default_period,
+                periode_minimale_100ns = min_period,
                 "wasapi_exclusive_initialized"
             );
 
@@ -1032,6 +1039,82 @@ impl WasapiExclusiveOutput {
         _paused: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         Err("WASAPI Exclusive is only available on Windows".into())
+    }
+}
+
+/// #3067 — banc Windows réel (la .42). Aucun job de CI n'exécute WASAPI :
+/// ces témoins se lancent à la main, `--ignored`, sur une machine qui a une
+/// sortie par défaut. Aucun ne produit de son : l'exclusif est initialisé,
+/// jamais démarré, et le flux partagé ne joue que du silence.
+#[cfg(all(test, target_os = "windows"))]
+mod banc_windows_3067 {
+    use super::*;
+    use cpal::traits::StreamTrait;
+
+    fn ouvrir_l_exclusif_par_defaut() -> Result<WasapiExclusiveOutput, String> {
+        WasapiExclusiveOutput::new(
+            "default",
+            None,
+            44_100,
+            32,
+            2,
+            Arc::new(NativePcmRing::new(44_100 * 2 * 2)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Le cas qui rend `AUDCLNT_E_DEVICE_IN_USE` : l'endpoint est déjà tenu
+    /// EN EXCLUSIF — un autre lecteur, ou une lecture précédente de Tune qui
+    /// ne l'a pas rendu (#4176). Le refus doit se dire en clair, pas en
+    /// « aucun format PCM accepté ».
+    #[test]
+    #[ignore = "banc Windows réel : ouvre deux fois l'exclusif sur la sortie par défaut"]
+    fn une_sortie_deja_tenue_en_exclusif_refuse_la_seconde_ouverture_en_le_disant() {
+        let premiere = ouvrir_l_exclusif_par_defaut().expect("première ouverture exclusive");
+        let seconde = ouvrir_l_exclusif_par_defaut();
+        drop(premiere);
+        let erreur = match seconde {
+            Ok(_) => panic!("Windows a accordé deux fois l'exclusif sur le même endpoint"),
+            Err(erreur) => erreur,
+        };
+        eprintln!("refus de la seconde ouverture : {erreur}");
+        assert!(
+            erreur.contains("déjà tenu en mode exclusif"),
+            "le refus doit nommer la cause, pas un code ni un format : {erreur}"
+        );
+    }
+
+    /// Le fait relevé sur la .42 pour #3067 : un flux PARTAGÉ — ce que fait un
+    /// onglet de navigateur qui joue la zone « Cet ordinateur » — n'empêche
+    /// PAS l'exclusif quand Windows donne la priorité aux applications en mode
+    /// exclusif (réglage par défaut) : c'est le flux partagé qui perd le
+    /// périphérique. L'hypothèse « la zone navigateur bloque la zone locale »
+    /// tombe donc dans ce réglage.
+    #[test]
+    #[ignore = "banc Windows réel : tient la sortie par défaut en partagé"]
+    fn un_flux_partage_ne_bloque_pas_l_exclusif_quand_windows_lui_donne_la_priorite() {
+        let host = cpal::host_from_id(cpal::HostId::Wasapi).expect("hôte WASAPI");
+        let device = host.default_output_device().expect("sortie par défaut");
+        let config = device.default_output_config().expect("format partagé");
+        let stream = device
+            .build_output_stream(
+                &config.config(),
+                |data: &mut [f32], _| data.fill(0.0),
+                |e| eprintln!("flux partagé : {e}"),
+                None,
+            )
+            .expect("flux partagé ouvert");
+        stream.play().expect("flux partagé démarré");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let exclusif = ouvrir_l_exclusif_par_defaut();
+        drop(stream);
+        if let Err(erreur) = &exclusif {
+            eprintln!("refus exclusif : {erreur}");
+        }
+        assert!(
+            exclusif.is_ok(),
+            "réglage « priorité aux applications en mode exclusif » décoché sur cette machine ?"
+        );
     }
 }
 

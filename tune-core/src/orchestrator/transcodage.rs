@@ -477,6 +477,17 @@ pub(super) async fn transcode_source_to_file(
 
     let mut pcm_bytes = decoded.pcm_bytes();
     let mut actual_bd = decoded.bit_depth;
+    // #4455 — ce que la ligne de synthèse doit DIRE de la chaîne : la
+    // profondeur décodée, le gain appliqué, les étages actifs. Le rapport
+    // de Sevy Tabroc ne permettait pas de savoir si le WAV 24 bits servi au
+    // LHC-208 venait d'une source 24 bits ou d'un 16 bits élargi, ni si un
+    // gain ou un égaliseur avait touché les échantillons.
+    let source_bd = actual_bd;
+    let replaygain_db = replaygain
+        .filter(|f| *f > 0.0)
+        .map(|f| (20.0 * f.log10() * 100.0).round() / 100.0);
+    let egaliseur = eq.is_some();
+    let convolution = convolver.is_some();
 
     // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
     //
@@ -553,6 +564,13 @@ pub(super) async fn transcode_source_to_file(
         ecriture_ms = total_ms - decode_ms - traitement_ms - encode_ms,
         total_ms,
         octets = file_size,
+        sample_rate = decoded.sample_rate,
+        channels = decoded.channels,
+        source_bd,
+        cible_bd = actual_bd,
+        replaygain_db = ?replaygain_db,
+        egaliseur,
+        convolution,
         "transcode_to_temp_file_stages"
     );
 

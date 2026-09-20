@@ -74,6 +74,36 @@ fn refus_plafond_zones(actives: i64, limite: i64, lang: &str) -> axum::response:
 /// plafond de zones est la seule branche qui s'en serve aujourd'hui, mais elle
 /// est passée à TOUS les appelants pour que la suivante n'ait pas à rouvrir
 /// cinq signatures.
+/// #3973 — la réponse d'un refus « bit-perfect strict » : code stable, phrase
+/// traduite, et les deux fréquences pour un client qui compose la sienne.
+fn refus_bitperfect_strict(
+    refus: &tune_core::audio::bitperfect_strict::RefusBitPerfect,
+    lang: &str,
+) -> axum::response::Response {
+    // Virgule décimale sauf là où l'usage est le point.
+    let khz = |hz: u32| {
+        let texte = tune_core::audio::bitperfect_strict::khz(hz);
+        if matches!(lang, "en" | "zh" | "ja" | "ko") {
+            texte.replace(',', ".")
+        } else {
+            texte
+        }
+    };
+    let message = crate::i18n::t(lang, "bitperfect.strict.refused")
+        .replace("{requested}", &khz(refus.demandee_hz))
+        .replace("{device}", &khz(refus.sortie_hz));
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": tune_core::audio::bitperfect_strict::CODE_REFUS,
+            "message": message,
+            "requested_hz": refus.demandee_hz,
+            "device_hz": refus.sortie_hz,
+        })),
+    )
+        .into_response()
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // Sentinelle « plafond de zones » de orchestrator.play() → 402 traduit,
     // avec le code stable et les deux nombres. Le format est
@@ -91,6 +121,15 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
         return refus_plafond_zones(actives, limite, lang);
+    }
+    // #3973 — « bit-perfect strict » : la zone interdit de convertir et la
+    // sortie (ou son plafond) ne lit pas la fréquence de la source. 422 comme
+    // `format_not_playable` : une capacité absente, pas une panne. La phrase
+    // se compose ICI, dans la langue de la requête, à partir des deux
+    // fréquences de la sentinelle.
+    if let Some(refus) = tune_core::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(&e)
+    {
+        return refus_bitperfect_strict(&refus, lang);
     }
     // Orphan-zone sentinel from orchestrator.play(): the zone row has no
     // output_device_id, so playback can never produce sound (Yacine, 24/07).
@@ -1176,6 +1215,50 @@ mod sqlite_scan_queue_arbitration_tests {
 }
 
 #[cfg(test)]
+mod refus_bitperfect_strict_3973 {
+    use super::play_error_response;
+    use axum::http::StatusCode;
+    use serde_json::Value;
+
+    async fn corps(e: &str, lang: &str) -> (StatusCode, Value) {
+        let reponse = play_error_response(e.to_string(), lang);
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap())
+    }
+
+    /// #3973 — le refus de la résolution (plafond de zone, DoP, services)
+    /// sort de la route en 422 avec son code stable, ses deux fréquences et
+    /// une phrase DANS LA LANGUE de la requête — pas en 500 avec la
+    /// sentinelle brute.
+    #[tokio::test]
+    async fn la_route_traduit_le_refus_bitperfect_strict() {
+        let (statut, fr) = corps("bitperfect_strict_refused:192000:96000", "fr").await;
+        assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "{fr}");
+        assert_eq!(fr["error"], "bitperfect_strict_refused", "{fr}");
+        assert_eq!(fr["requested_hz"], 192_000);
+        assert_eq!(fr["device_hz"], 96_000);
+        let message = fr["message"].as_str().unwrap();
+        assert!(
+            message.contains("192 kHz")
+                && message.contains("96 kHz")
+                && message.contains("refusée"),
+            "{message}"
+        );
+        let (_, en) = corps("bitperfect_strict_refused:22050:44100", "en").await;
+        let message = en["message"].as_str().unwrap();
+        assert!(
+            message.contains("22.05 kHz")
+                && message.contains("44.1 kHz")
+                && message.contains("refused"),
+            "{message}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod refus_de_format_3234 {
     use super::play_error_response;
     use axum::http::StatusCode;
@@ -2190,10 +2273,27 @@ async fn play(
         queue_repo.set_current(zone_id, start).ok();
     }
 
-    let target_id = track_ids
+    let mut target_id = track_ids
         .get(start as usize)
         .copied()
         .unwrap_or(track_ids[0]);
+    // #4362 (point 2) — un « Tout lire » (album, liste, `track_ids`) dont la
+    // piste de départ vient d'un serveur multimédia ABSENT enjambe les pistes
+    // injoignables et part sur la première jouable, en le disant, au lieu de
+    // rendre le refus et de ne rien jouer. Une demande nue (une seule piste
+    // relancée) garde le refus : c'est CETTE piste qui a été demandée.
+    let mut queue_position = queue_position;
+    if !demande_nue
+        && file_conservee.is_none()
+        && let Some((position, Some(track_id))) = state
+            .orchestrator
+            .enjamber_les_serveurs_absents(zone_id, queue_position)
+            .await
+    {
+        queue_repo.set_current(zone_id, position).ok();
+        queue_position = position;
+        target_id = track_id;
+    }
     let track = track_repo.get(target_id).ok().flatten();
 
     let output_device_id = body.output_device_id.or_else(|| {
@@ -2604,6 +2704,14 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
         return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
     };
 
+    // #4362 (point 2) — « Suivant » enjambe les pistes dont le serveur
+    // multimédia est absent au lieu de s'arrêter sur la première. Hors du
+    // bloc détaché : la garde #3270 borne ce bloc à l'annonce de son échec.
+    let next_pos = state
+        .orchestrator
+        .enjamber_les_serveurs_absents(zone_id, next_pos)
+        .await
+        .map_or(next_pos, |(position, _)| position);
     let s = state.clone();
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
