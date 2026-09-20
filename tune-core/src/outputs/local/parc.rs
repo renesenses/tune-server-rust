@@ -26,9 +26,10 @@ impl AsioScanGate {
         if backend.eq_ignore_ascii_case("asio")
             && self.blocked.load(std::sync::atomic::Ordering::Acquire)
         {
-            // #4556 — c'était un `debug!`, donc RIEN dans un export de journal
-            // de terrain (INFO et au-dessus), alors que ce chemin-ci mène tout
-            // droit à un refus de lecture chez l'utilisateur.
+            // #4556 — ce chemin-ci mène tout droit à un refus de lecture chez
+            // l'utilisateur : il se dit au niveau WARN, avec le nombre
+            // d'appareils servis. Un journal de mise au point n'existe pas
+            // dans un export de terrain, qui ne porte que l'INFO et au-dessus.
             let du_cache = cached();
             journaliser_enumeration_asio_bloquee(backend, du_cache.len());
             return du_cache;
