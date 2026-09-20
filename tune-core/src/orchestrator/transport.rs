@@ -28,6 +28,120 @@ pub(crate) fn nom_lisible_de_l_appareil(dev_id: &str) -> Option<String> {
     Some(reste.to_string())
 }
 
+/// La forme d'un nom de périphérique qui survit à un renommage de pilote.
+///
+/// Windows suffixe l'endpoint du taux d'échantillonnage courant
+/// (« audio-gd USB audio (44,1 kHz) », #2269, DEvir) et plusieurs backends
+/// parenthèsent le nom du contrôleur. Ce qui reste devant la première
+/// parenthèse est la partie stable. Comparaison sans casse ni espaces
+/// redondants.
+///
+/// ⚠️ Cette forme ne sert qu'à NOMMER un candidat dans un message. Elle ne
+/// vaut PAS identité : deux appareils peuvent partager « Haut-parleurs », et
+/// c'est précisément pourquoi rien ne se ré-associe sur elle.
+fn forme_stable_du_nom(nom: &str) -> String {
+    let avant_parenthese = nom.split('(').next().unwrap_or(nom);
+    avant_parenthese
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// L'unique sortie locale vivante dont le nom est une variante de `attendu`,
+/// s'il y en a exactement une et qu'elle ne porte pas déjà ce nom exact.
+///
+/// Zéro candidat : rien à dire. Deux candidats ou plus : les départager serait
+/// un tirage au sort, et un message qui nomme le mauvais appareil est pire que
+/// pas de message du tout.
+fn candidat_renomme(attendu: &str, noms_vivants: &[String]) -> Option<String> {
+    let cible = forme_stable_du_nom(attendu);
+    if cible.is_empty() {
+        return None;
+    }
+    let mut trouves = noms_vivants
+        .iter()
+        .filter(|n| n.as_str() != attendu && forme_stable_du_nom(n) == cible);
+    let premier = trouves.next()?;
+    if trouves.next().is_some() {
+        return None;
+    }
+    Some(premier.clone())
+}
+
+/// Le refus de lecture d'une zone dont la sortie a disparu — CAUSE PROBABLE et
+/// GESTE UTILE, pas seulement le constat (#4580, #4601).
+///
+/// ## Pourquoi cette fonction existe
+///
+/// Deux testeurs ont supprimé leur zone et l'ont recréée pour qu'elle
+/// refonctionne (Cyrille Moutia sur macOS, Kimon sur Linux, fil 1861). Ce
+/// geste n'est jamais le bon : il jette le volume, la file, le mode DSD, le
+/// délai de synchronisation et l'historique de la zone, et il ne répare rien
+/// que le retour de l'appareil n'aurait réparé tout seul. Ils l'ont fait parce
+/// que le message qu'ils lisaient — « La sortie de cette zone n'est plus
+/// disponible » — accuse la SORTIE sans dire pourquoi ni quoi faire, et que la
+/// seule action qu'un écran de réglages propose alors est de supprimer.
+///
+/// Le serveur, lui, sait distinguer trois situations, et chacune appelle un
+/// geste différent :
+///
+/// 1. **L'appareil est là, sous un autre nom.** Windows renomme l'endpoint au
+///    changement de taux d'échantillonnage (#2269) ; un flash de micrologiciel
+///    renomme un DAC. Une seule sortie vivante porte une variante du nom
+///    attendu : on la NOMME, et on laisse l'utilisateur la choisir. On ne la
+///    branche pas — rien ne prouve que c'est le même appareil, et se tromper
+///    enverrait le son ailleurs.
+/// 2. **Sortie locale absente du parc.** L'énumération a eu lieu (le garde
+///    d'appel exige un parc local non vide avant d'en arriver là, #3737) et le
+///    nom n'y est pas : débranché, éteint, ou tenu en exclusif par une autre
+///    application — c'est la cause la plus fréquente sous Windows.
+/// 3. **Sortie réseau jamais revue.** L'appareil ne s'est pas annoncé depuis
+///    le démarrage. Rien à faire côté Tune, et surtout rien à supprimer : la
+///    découverte le rattache seule à son retour, y compris s'il a changé
+///    d'adresse ou d'identifiant UPnP.
+///
+/// Dans les trois cas le message le dit : **supprimer la zone ne sert à rien.**
+/// C'est la phrase qui manquait.
+///
+/// La sentinelle `zone_output_unavailable:` est conservée telle quelle — la
+/// couche HTTP la mappe sur un 409 (`tune-server/src/routes/playback.rs`).
+pub(crate) fn message_de_refus_de_zone(
+    dev_id: &str,
+    zone_name: &str,
+    noms_locaux_vivants: &[String],
+) -> String {
+    const SENTINELLE: &str = "zone_output_unavailable:";
+    const INUTILE_DE_SUPPRIMER: &str = "Inutile de supprimer la zone puis de la recréer : \
+         elle se rattache seule dès que l'appareil réapparaît, et la recréer perdrait \
+         son volume, sa file et ses réglages.";
+
+    match nom_lisible_de_l_appareil(dev_id) {
+        Some(appareil) => match candidat_renomme(&appareil, noms_locaux_vivants) {
+            Some(candidat) => format!(
+                "{SENTINELLE}La zone « {zone_name} » attend la sortie « {appareil} », \
+                 qui n'est plus énumérée sous ce nom. Une sortie « {candidat} » est \
+                 présente : c'est probablement le même appareil, renommé par son pilote. \
+                 Sélectionnez-la dans les réglages de la zone — Tune ne le fait pas seul, \
+                 rien ne prouve qu'il s'agit bien du même appareil. {INUTILE_DE_SUPPRIMER}"
+            ),
+            None => format!(
+                "{SENTINELLE}La sortie « {appareil} » de la zone « {zone_name} » n'est plus \
+                 dans la liste des sorties audio de cette machine. Vérifiez qu'elle est \
+                 branchée et allumée, et qu'aucune autre application ne la tient en mode \
+                 exclusif ; sinon, choisissez une autre sortie dans les réglages de la \
+                 zone. {INUTILE_DE_SUPPRIMER}"
+            ),
+        },
+        None => format!(
+            "{SENTINELLE}L'appareil de la zone « {zone_name} » ne s'est pas annoncé sur le \
+             réseau depuis le démarrage du serveur. Vérifiez qu'il est allumé et sur le même \
+             réseau que Tune ; sinon, choisissez une autre sortie dans les réglages de la \
+             zone. {INUTILE_DE_SUPPRIMER}"
+        ),
+    }
+}
+
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
 pub(super) struct Habillage {
@@ -181,11 +295,23 @@ impl PlaybackOrchestrator {
         // refusé. Seule une zone à la fois HORS LIGNE et ABSENTE du registre
         // atteint désormais le rebond puis le refus nommé — comme toutes les
         // autres familles de sorties depuis #1287.
+        // Les noms des sorties LOCALES vivantes, relevés sous le même verrou
+        // que le test de présence : c'est la matière du message de refus, qui
+        // doit pouvoir dire « une sortie « X » est présente, c'est
+        // probablement votre appareil renommé » (#4580, #4601). Un
+        // `output_device_id` local EST `local:{nom}`, donc le nom se lit sur
+        // l'identifiant sans toucher à l'API du registre.
+        let noms_locaux_vivants: Vec<String>;
         {
             let registre = self.outputs.lock().await;
             if dev_id.is_empty() || registre.contains(dev_id) {
                 return Ok(None);
             }
+            noms_locaux_vivants = registre
+                .list()
+                .iter()
+                .filter_map(|id| id.strip_prefix("local:").map(str::to_string))
+                .collect();
             // 🔴 #3737 — un parc VIDE n'est pas une preuve d'absence.
             //
             // #3738 a remplacé l'exemption `local:` par le seul critère qui
@@ -226,9 +352,7 @@ impl PlaybackOrchestrator {
             // reste refusée comme avant, et une zone locale l'est toujours dès
             // qu'un seul autre appareil local répond : le parc n'est pas vide,
             // l'énumération a donc bien eu lieu, et l'absence est mesurée.
-            if dev_id.starts_with("local:")
-                && !registre.list().iter().any(|id| id.starts_with("local:"))
-            {
+            if dev_id.starts_with("local:") && noms_locaux_vivants.is_empty() {
                 warn!(
                     zone_id,
                     zone_name = %zone.name,
@@ -278,18 +402,12 @@ impl PlaybackOrchestrator {
         // disparu. Le serveur, lui, connaît les deux bouts — il les écrit déjà
         // au journal juste au-dessus. Les mettre dans le message ne coûte rien
         // et transforme « une sortie » en « votre DAC ».
-        let msg = match nom_lisible_de_l_appareil(dev_id) {
-            Some(appareil) => format!(
-                "zone_output_unavailable:La sortie « {appareil} » de la zone « {} » n'est plus disponible. \
-                 Vérifiez qu'elle est branchée et allumée, ou choisissez une autre sortie dans les réglages de la zone.",
-                zone.name
-            ),
-            None => format!(
-                "zone_output_unavailable:La sortie de cette zone n'est plus disponible. \
-                 Choisissez une sortie dans les réglages de la zone « {} ».",
-                zone.name
-            ),
-        };
+        //
+        // 🔴 #4580 / #4601 — et NOMMER la cause probable, pas seulement
+        // l'appareil. Deux testeurs ont supprimé puis recréé leur zone parce
+        // que le message se bornait au constat. Voir
+        // [`message_de_refus_de_zone`].
+        let msg = message_de_refus_de_zone(dev_id, &zone.name, &noms_locaux_vivants);
         warn!(
             zone_id,
             zone_name = %zone.name,
@@ -301,7 +419,25 @@ impl PlaybackOrchestrator {
                 "zone.playback_error",
                 serde_json::json!({
                     "zone_id": zone_id,
-                    "error": msg,
+                    // 🔴 #4580 — `error` porte la PHRASE, jamais la sentinelle.
+                    //
+                    // `msg` commence par `zone_output_unavailable:`, que la
+                    // couche HTTP retire avant de composer son 409
+                    // (`routes/playback.rs`). Cet événement-ci, lui, partait
+                    // avec : le client affiche `data.message || data.error`
+                    // tel quel (`App.svelte`), et la bulle lue par l'auditeur
+                    // commençait donc par « zone_output_unavailable: ». Un
+                    // message qui s'ouvre sur un identifiant de code se lit
+                    // comme une panne du logiciel, pas comme une consigne —
+                    // et c'est la bulle que les deux testeurs du fil 1861 ont
+                    // eue sous les yeux avant de supprimer leur zone.
+                    //
+                    // La convention du dépôt est déjà celle-ci partout
+                    // ailleurs : `error` = la phrase, `code` = l'identifiant
+                    // stable (`audio::bitperfect_strict::charge_utile_de_refus`,
+                    // `poller/tick.rs`). Seul cet émetteur y dérogeait.
+                    "error": msg.strip_prefix("zone_output_unavailable:").unwrap_or(&msg),
+                    "code": "zone_output_unavailable",
                     // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
                     //
                     // Le client ouvre une fenêtre de grâce de 30 s AVANT l'appel
