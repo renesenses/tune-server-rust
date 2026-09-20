@@ -838,6 +838,70 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, O
     (None, None, None)
 }
 
+/// Le NOM et la POCHETTE de l'objet demande, quand cette base ne peut pas les
+/// rendre elle-meme.
+///
+/// # Le defaut mesure (Alex Campbell, 20/09/2026)
+///
+/// Apres avoir lance une playlist Qobuz, la vignette « Reprendre l'ecoute »
+/// montrait « une pochette et un titre d'album qui ne sont ni la premiere
+/// piste de la playlist, ni aucune piste ayant joue ». Ce n'etait pas une
+/// confusion d'identifiants : la playlist de service n'a de nom NULLE PART
+/// dans cette base, donc `home.rs` rendait `title: null` et le client
+/// repliait sur l'album de la derniere ligne d'historique (#3425).
+///
+/// Mesure du 20/09/2026 sur le .18, `GET /home/continue-listening?limit=200` :
+/// **16 vignettes de playlist sur 16** portaient ainsi un titre et une
+/// pochette d'album etrangers a la playlist.
+///
+/// # Pourquoi ici, et pas a l'affichage
+///
+/// #3425 ecartait deja l'idee d'interroger le service a l'affichage : ce
+/// serait un aller-retour PAR VIGNETTE sur le chemin du premier ecran. Ici,
+/// c'est UN appel, au moment ou l'auditeur clique « Lire » — un geste qui va
+/// de toute facon chercher les pistes de cette playlist chez le meme service.
+/// Le nom est ensuite ECRIT dans `listen_history` et ne se redemande plus.
+///
+/// # Ce que cette fonction ne fait PAS
+///
+/// Elle ne repond que pour une playlist de SERVICE. Un objet local a son nom
+/// dans sa table, que `home.rs` relit a chaque affichage : en figer une copie
+/// ferait vivre un nom perime apres un renommage. Un album de service, lui,
+/// porte deja son titre sur chaque ligne d'historique (`album_title`), qui
+/// EST le sien.
+///
+/// Un echec du service ne fait rien echouer : la lecture part, la vignette
+/// retombe sur le comportement d'avant. Le nom est un confort d'affichage, il
+/// ne bloque pas le son.
+async fn nom_du_contexte(
+    state: &AppState,
+    nature: Option<&str>,
+    id: Option<&str>,
+    service: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let (Some("playlist"), Some(id), Some(service)) = (nature, id, service) else {
+        return (None, None);
+    };
+    if service == "local" {
+        return (None, None);
+    }
+    let registre = state.services.lock().await;
+    let Some(svc) = registre.get(service) else {
+        return (None, None);
+    };
+    let svc = svc.read().await;
+    match svc.get_playlist(id).await {
+        Ok(p) => (
+            Some(p.name).filter(|n| !n.trim().is_empty()),
+            p.cover_path.filter(|c| !c.trim().is_empty()),
+        ),
+        Err(e) => {
+            warn!(service, playlist = id, error = %e, "contexte_nom_playlist_indisponible");
+            (None, None)
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct SeekRequest {
     /// Signé pour ne pas changer le contrat de désérialisation ; le refus
@@ -1710,9 +1774,23 @@ async fn play(
     // Le corps VIDE (retour au-dessus) ne passe pas ici : une reprise apres
     // Stop n'est pas un nouveau geste, elle garde le contexte en cours.
     let (contexte_type, contexte_id, contexte_service) = contexte_de_lecture(&body);
+    let (contexte_titre, contexte_pochette) = nom_du_contexte(
+        &state,
+        contexte_type.as_deref(),
+        contexte_id.as_deref(),
+        contexte_service.as_deref(),
+    )
+    .await;
     state
         .playback
-        .set_session_context(zone_id, contexte_type, contexte_id, contexte_service)
+        .set_session_context(
+            zone_id,
+            contexte_type,
+            contexte_id,
+            contexte_service,
+            contexte_titre,
+            contexte_pochette,
+        )
         .await;
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());

@@ -228,9 +228,29 @@ pub const CONTEXTES_AFFICHES: [&str; 5] = ["album", "playlist", "artist", "label
 /// `zone_filter` est injecte tel quel par l'appelant (`AND lh.zone_id = N `,
 /// ou vide) : c'est un entier formate, pas une saisie.
 ///
+/// # Un contexte est identifie par son ESPACE DE NOMS, pas par `source`
+///
+/// `context_id` est un nombre nu : `66898771` ne designe rien tant qu'on ne
+/// dit pas chez QUI il a un sens. Le regroupement porte donc sur
+/// `(context_type, context_id, context_source)`.
+///
+/// La colonne `source` de la meme ligne ne peut PAS y servir : c'est celle de
+/// la PISTE qui a joue, pas de l'objet demande. Mesure du 20/09/2026 sur le
+/// .18 — la playlist Qobuz `66898771` porte 18 lignes `source = 'qobuz'` et
+/// 3 lignes `source = 'local'`, trois titres de la bibliotheque glisses dans
+/// une playlist de service. Grouper sur `source` couperait cette playlist en
+/// DEUX vignettes concurrentes, et la ligne retenue par le `MAX` dependrait de
+/// la provenance du dernier morceau ecoute.
+///
+/// `COALESCE(context_source, '')` et non `context_source` nu : sur les lignes
+/// d'avant la migration 104 la colonne est NULL, et `NULL = NULL` est faux en
+/// SQL — la jointure les perdrait toutes, c'est-a-dire tout l'historique
+/// existant. Elles se regroupent donc ensemble sous l'espace vide, exactement
+/// comme avant ce changement.
+///
 /// Colonnes rendues, dans l'ordre : `context_type, context_id, listened_at,
 /// context_position, title, artist_name, album_title, cover_url, album_id,
-/// source`.
+/// source, context_source, context_title, context_cover`.
 pub fn continue_listening_contextes(engine: Engine, zone_filter: &str) -> String {
     let p1 = ph(engine, 1);
     let natures = CONTEXTES_AFFICHES
@@ -246,16 +266,20 @@ pub fn continue_listening_contextes(engine: Engine, zone_filter: &str) -> String
     format!(
         "SELECT lh.context_type, lh.context_id, lh.listened_at, \
                 lh.context_position, lh.title, lh.artist_name, lh.album_title, \
-                lh.cover_url, lh.album_id, lh.source \
+                lh.cover_url, lh.album_id, lh.source, \
+                lh.context_source, lh.context_title, lh.context_cover \
          FROM listen_history lh \
-         JOIN (SELECT context_type, context_id, MAX(listened_at) as dernier \
+         JOIN (SELECT context_type, context_id, \
+                      COALESCE(context_source, '') as espace, \
+                      MAX(listened_at) as dernier \
                FROM listen_history lh \
                WHERE lh.context_type IN ({natures}) \
                  AND lh.context_id IS NOT NULL \
                  {zone_filter}\
-               GROUP BY context_type, context_id) d \
+               GROUP BY context_type, context_id, COALESCE(context_source, '')) d \
            ON d.context_type = lh.context_type \
           AND d.context_id = lh.context_id \
+          AND d.espace = COALESCE(lh.context_source, '') \
           AND d.dernier = lh.listened_at \
          WHERE lh.context_type IN ({natures}) \
          {zone_filter}\

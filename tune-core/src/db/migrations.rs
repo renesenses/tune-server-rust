@@ -1883,6 +1883,39 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
     Migration { version: 103, name: "upnp_catalog_revision",
         up: include_str!("../../migrations/upnp_catalog_revision.sql"),
     },
+    Migration {
+        version: 104,
+        name: "listen_history_contexte_service_et_nom",
+        // Rendre a l'objet demande son ESPACE DE NOMS et son NOM.
+        //
+        // La migration 84 avait pose `context_type` / `context_id`, la 94 le
+        // rang. Il manquait de quoi s'en servir sans se tromper d'objet :
+        //
+        // * `context_id` est un nombre nu. Rien ne disait DE QUI il est
+        //   l'identifiant, et `source` ne repond pas a cette question — c'est
+        //   celui de la PISTE. Mesure du 20/09/2026 sur le .18 : la playlist
+        //   Qobuz `66898771` porte 18 lignes `source = 'qobuz'` et 3 lignes
+        //   `source = 'local'` (trois titres de la bibliotheque glissees dans
+        //   une playlist de service). Grouper ou resoudre sur `source`, c'est
+        //   couper cette playlist en deux, ou aller chercher `66898771` dans
+        //   la table `albums`.
+        // * le nom d'une playlist de service n'est ecrit dans AUCUNE table de
+        //   cette base. « Continuer l'ecoute » rendait donc `title: null` et
+        //   le client repliait sur l'album de la derniere piste : 16 vignettes
+        //   de playlist sur 16 portaient un titre et une pochette etrangers a
+        //   ce qui avait ete ecoute (Alex Campbell, 20/09/2026).
+        //
+        // Les lignes existantes gardent NULL. L'historique d'avant n'a jamais
+        // su d'ou venaient ses contextes et rien ici ne pretend le
+        // reconstituer — les lecteurs traitent NULL comme « inconnu » et
+        // gardent pour ces lignes-la le comportement d'avant.
+        //
+        // Colonnes posees par add_column_if_missing dans le bloc de version,
+        // PAS par un ALTER TABLE ici : meme regle qu'aux migrations 79 et 84,
+        // un ALTER planterait le runner en « duplicate column name » sur une
+        // base qui les a deja.
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2993,6 +3026,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // (ligne d'avant la migration) OU tirage aleatoire, cas ou l'on RE-TIRE
     // au lieu de rejouer le meme ordre.
     add_column_if_missing(db, "listen_history", "context_position", "INTEGER");
+    // L'espace de noms de `context_id`, et le libelle que cette base ne sait
+    // pas retrouver (migration 104). `source` ci-dessus est celui de la
+    // PISTE : une playlist Qobuz ecrit des lignes `local` pour les morceaux
+    // de bibliotheque qu'elle contient, sans changer d'espace de noms.
+    add_column_if_missing(db, "listen_history", "context_source", "TEXT");
+    add_column_if_missing(db, "listen_history", "context_title", "TEXT");
+    add_column_if_missing(db, "listen_history", "context_cover", "TEXT");
 
     // Playlists scoped per profile (migration v55). Safety pass so DBs from any
     // prior version get the column regardless of which migration they came from.
@@ -3707,6 +3747,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         66,
         "upnp_catalog_revision",
         include_str!("../../migrations/postgres/066_upnp_catalog_revision.sql"),
+    ),
+    (
+        67,
+        "listen_history_contexte_service_et_nom",
+        include_str!("../../migrations/postgres/067_listen_history_contexte_service_et_nom.sql"),
     ),
 ];
 
