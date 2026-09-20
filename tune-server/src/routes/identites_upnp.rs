@@ -556,15 +556,26 @@ mod tests {
 
         for passe in 1..=3 {
             let bilan = indexer(&state, "u", std::slice::from_ref(&a));
-            assert!(bilan.erreurs.is_empty(), "passe {passe} : {:?}", bilan.erreurs);
+            assert!(
+                bilan.erreurs.is_empty(),
+                "passe {passe} : {:?}",
+                bilan.erreurs
+            );
             assert_eq!(bilan.albums_ajoutes, 0, "passe {passe} : aucun jumeau");
         }
         let restants = state
             .backend
-            .query_many("SELECT id, source_id FROM albums WHERE source = 'upnp'", &[])
+            .query_many(
+                "SELECT id, source_id FROM albums WHERE source = 'upnp'",
+                &[],
+            )
             .unwrap();
         assert_eq!(restants.len(), 1, "un seul album distant : {restants:?}");
-        assert_eq!(restants[0][0].as_i64(), Some(id), "le MÊME, pas un successeur");
+        assert_eq!(
+            restants[0][0].as_i64(),
+            Some(id),
+            "le MÊME, pas un successeur"
+        );
         assert_eq!(
             restants[0][1].as_string().as_deref(),
             Some(cle.as_str()),
@@ -599,7 +610,11 @@ mod tests {
         assert!(bilan.erreurs.is_empty(), "{:?}", bilan.erreurs);
         assert_eq!(bilan.albums_vides_retires, 1);
         assert!(albums.get(a_retirer).unwrap().is_none(), "la coquille part");
-        for (quoi, id) in [("le favori", favori), ("un autre serveur", ailleurs), ("le local", local)] {
+        for (quoi, id) in [
+            ("le favori", favori),
+            ("un autre serveur", ailleurs),
+            ("le local", local),
+        ] {
             assert!(albums.get(id).unwrap().is_some(), "{quoi} reste");
         }
         // L'album que la passe vient d'écrire porte sa piste : il reste.
