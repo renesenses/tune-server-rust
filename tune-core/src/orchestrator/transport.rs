@@ -142,6 +142,51 @@ pub(crate) fn message_de_refus_de_zone(
     }
 }
 
+/// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
+///
+/// Les deux travaux de la soirée se rencontrent ici, et ils COEXISTENT :
+///
+/// * `blocage = None` — refus ordinaire. La phrase est celle de
+///   [`message_de_refus_de_zone`] (#4580 / #4601) : trois causes nommées et
+///   « inutile de supprimer la zone ». Rien n'est retiré.
+/// * `blocage = Some` — le coupe-circuit ASIO a vidé le parc (#4556). Le
+///   serveur SAIT qu'il n'a pas regardé : il le dit, nomme le témoin et donne
+///   le geste. Nommer ici l'une des trois causes de #4580 serait un mensonge —
+///   aucune n'a été mesurée, puisqu'aucune énumération ASIO n'a eu lieu.
+///
+/// Pure exprès : l'état du coupe-circuit est un état de PROCESSUS, et le muter
+/// depuis un test empoisonnerait en parallèle les dizaines de tests de ce
+/// module qui attendent l'autre phrase.
+pub(crate) fn refus_de_zone_hors_ligne(
+    dev_id: &str,
+    zone_name: &str,
+    noms_locaux_vivants: &[String],
+    blocage: Option<&crate::outputs::asio_blocage_4556::BlocageAsio>,
+) -> (String, Option<&'static str>) {
+    if let Some(blocage) = blocage {
+        let phrase = blocage.message_fr(nom_lisible_de_l_appareil(dev_id).as_deref(), zone_name);
+        return (blocage.sentinelle(&phrase), Some(blocage.motif.code()));
+    }
+    (
+        message_de_refus_de_zone(dev_id, zone_name, noms_locaux_vivants),
+        None,
+    )
+}
+
+/// La PHRASE que lit l'auditeur, quelle que soit la sentinelle qui la porte.
+///
+/// #4580 a sorti `zone_output_unavailable:` de la bulle `zone.playback_error`
+/// (un message qui s'ouvre sur un identifiant de code se lit comme une panne
+/// du logiciel) ; #4556 a ajouté une SECONDE sentinelle,
+/// `zone_output_unavailable_asio:<code>:`. Un `strip_prefix` sur la seule
+/// première laisserait donc repasser la seconde en entier dans la bulle.
+pub(crate) fn phrase_sans_sentinelle(msg: &str) -> &str {
+    if let Some((_, phrase)) = crate::outputs::asio_blocage_4556::depuis_sentinelle(msg) {
+        return phrase;
+    }
+    msg.strip_prefix("zone_output_unavailable:").unwrap_or(msg)
+}
+
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
 pub(super) struct Habillage {
@@ -257,7 +302,9 @@ impl PlaybackOrchestrator {
     /// `Ok(Some(id))` — the zone was re-bound to `id`, which the caller must use
     /// as the request's `output_device_id`.
     /// `Err(msg)` — playback must be refused; `msg` carries the
-    /// `zone_output_unavailable:` sentinel the API maps to a 409.
+    /// `zone_output_unavailable:` sentinel the API maps to a 409, ou — quand
+    /// c'est le coupe-circuit ASIO qui a vidé le parc (#4556) — celle de
+    /// [`crate::outputs::asio_blocage_4556`], qui porte en plus un code stable.
     pub(super) async fn gate_or_rebind_offline_zone(
         &self,
         zone_id: i64,
@@ -407,17 +454,43 @@ impl PlaybackOrchestrator {
         // l'appareil. Deux testeurs ont supprimé puis recréé leur zone parce
         // que le message se bornait au constat. Voir
         // [`message_de_refus_de_zone`].
-        let msg = message_de_refus_de_zone(dev_id, &zone.name, &noms_locaux_vivants);
+        //
+        // 🔴 #4556 — sauf quand le serveur SAIT qu'il n'a pas regardé.
+        //
+        // Marco Polo (fil 1852, SMSL SU-1) : son témoin de plantage ASIO est
+        // posé, le balayage de démarrage est suspendu, le parc local publié
+        // est un repli WASAPI — donc `local:USB DAC ASIO` ne peut PAS y être,
+        // quoi qu'il advienne de son DAC. Lui proposer l'une des trois causes
+        // de #4580 serait un mensonge de plus : aucune n'est mesurée, puisque
+        // aucune énumération ASIO n'a eu lieu. Le refus reste (rouvrir un
+        // pilote ASIO qui a emporté le processus précédent n'est pas une
+        // option), mais il dit la vérité, nomme le témoin, donne le geste, et
+        // porte un motif pour que le bouton « Réarmer ASIO » s'affiche là où
+        // le défaut se manifeste au lieu d'être enterré dans les Diagnostics.
+        //
+        // Les deux conditions sont exigées ensemble par
+        // `blocage_expliquant_un_parc_de_repli` : porte fermée ET repli
+        // mesuré. Un témoin oublié sur une machine réglée en WASAPI retombe
+        // donc sur le message de #4580 — là, l'absence est vraiment mesurée.
+        let blocage_asio = dev_id
+            .starts_with("local:")
+            .then(crate::outputs::asio_blocage_4556::blocage_expliquant_un_parc_de_repli)
+            .flatten();
+        let (msg, motif_asio) = refus_de_zone_hors_ligne(
+            dev_id,
+            &zone.name,
+            &noms_locaux_vivants,
+            blocage_asio.as_ref(),
+        );
         warn!(
             zone_id,
             zone_name = %zone.name,
             device = dev_id,
+            motif_asio = motif_asio.unwrap_or("-"),
             "play_rejected_zone_offline"
         );
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
+            let mut charge = serde_json::json!({
                     "zone_id": zone_id,
                     // 🔴 #4580 — `error` porte la PHRASE, jamais la sentinelle.
                     //
@@ -436,7 +509,13 @@ impl PlaybackOrchestrator {
                     // ailleurs : `error` = la phrase, `code` = l'identifiant
                     // stable (`audio::bitperfect_strict::charge_utile_de_refus`,
                     // `poller/tick.rs`). Seul cet émetteur y dérogeait.
-                    "error": msg.strip_prefix("zone_output_unavailable:").unwrap_or(&msg),
+                    //
+                    // #4556 — et la phrase est retirée de la BONNE sentinelle :
+                    // il y en a désormais deux (`zone_output_unavailable:` et
+                    // `zone_output_unavailable_asio:<code>:`), et un
+                    // `strip_prefix` sur la seule première laissait repasser la
+                    // seconde en entier dans la bulle.
+                    "error": phrase_sans_sentinelle(&msg),
                     "code": "zone_output_unavailable",
                     // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
                     //
@@ -452,8 +531,31 @@ impl PlaybackOrchestrator {
                     // Une sortie disparue ne revient pas dans les 30 s : ce refus
                     // est fatal par nature.
                     "fatal": true,
-                }),
-            );
+            });
+            // #4556 — de quoi accrocher le bouton « Réarmer ASIO » : c'est par
+            // CE canal que le refus atteint réellement l'écran (voir `fatal`
+            // ci-dessus). Ajouté seulement quand il y a quelque chose à dire ;
+            // un refus ordinaire garde la charge utile de #4580, au champ près.
+            //
+            // ⚠️ ARBITRAGE de la fusion des deux lots : `code` reste
+            // `zone_output_unavailable`. C'est l'identifiant STABLE de la
+            // FAMILLE de refus, celui que #4580 vient d'introduire et que sa
+            // garde vérifie ; le motif ASIO, lui, voyage dans `reason`. Le
+            // corps du 409 HTTP dit déjà exactement cela
+            // (`error: "zone_output_unavailable"` + `reason`), les deux canaux
+            // sont donc symétriques et un client n'a qu'une règle à retenir.
+            if let (Some(code), Some(objet)) = (motif_asio, charge.as_object_mut()) {
+                objet.insert("reason".into(), code.into());
+                objet.insert(
+                    "can_rearm".into(),
+                    crate::outputs::asio_blocage_4556::code_rearmable(code).into(),
+                );
+                objet.insert(
+                    "rearm_endpoint".into(),
+                    crate::outputs::asio_blocage_4556::ROUTE_DE_REARMEMENT.into(),
+                );
+            }
+            bus.emit("zone.playback_error", charge);
         }
         Err(msg)
     }
