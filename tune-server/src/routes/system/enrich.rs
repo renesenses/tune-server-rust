@@ -20,7 +20,13 @@ use crate::state::AppState;
 /// over the `system.background_tasks` WebSocket event; this endpoint provides
 /// the initial snapshot for a client that connects mid-task.
 pub(super) async fn background_tasks_status(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "tasks": state.background_tasks.snapshot() }))
+    // `tasks` reste ce qu'il a toujours été — l'instantané du registre RAII,
+    // lu par la bannière de la barre latérale. Le bloc `pausable` s'y AJOUTE
+    // (#4573) : l'état de chacun des traitements suspendables et l'état de
+    // l'interrupteur général, dans le même aller-retour. Un client d'avant ne
+    // voit pas la différence ; l'écran « État du serveur » n'a pas à sonder
+    // une seconde route pour savoir quelles cartes portent « En pause ».
+    Json(super::taches_de_fond::instantane(&state))
 }
 
 // ---------------------------------------------------------------------------

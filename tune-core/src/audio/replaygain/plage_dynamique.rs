@@ -61,6 +61,9 @@ pub struct Cadence {
     pub report_lecture: Duration,
     /// Attente quand la machine est trop chaude (#1576).
     pub report_chaleur: Duration,
+    /// Attente quand l'utilisateur a suspendu le traitement. Plus courte que
+    /// le report thermique : « Reprendre » doit se voir tout de suite.
+    pub report_pause: Duration,
     /// Respiration entre deux lots — les pauses par fichier bornent déjà le
     /// travail lui-même.
     pub entre_lots: Duration,
@@ -74,6 +77,7 @@ impl Default for Cadence {
         Self {
             report_lecture: Duration::from_secs(PLAYBACK_BACKOFF_SECS),
             report_chaleur: Duration::from_secs(super::THERMAL_RETRY_SECS),
+            report_pause: Duration::from_secs(super::SIESTE_EN_PAUSE_SECS),
             entre_lots: Duration::from_secs(2),
             garde_thermique: true,
         }
@@ -97,6 +101,11 @@ pub enum Attente {
     /// Le créneau d'analyse est tenu par une autre passe (ReplayGain,
     /// empreintes, acoustique) : on attend son lot.
     Creneau,
+    /// L'utilisateur a SUSPENDU la plage dynamique depuis l'écran « État du
+    /// serveur ». Distincte des trois autres : celles-ci se lèvent toutes
+    /// seules quand la machine ou la lecture le permet, celle-ci n'attend que
+    /// le bouton « Reprendre » — elle survit même au redémarrage.
+    Pause,
 }
 
 impl Attente {
@@ -107,6 +116,7 @@ impl Attente {
             Self::Lecture => "playback",
             Self::Chaleur => "thermal",
             Self::Creneau => "analysis_slot",
+            Self::Pause => "paused",
         }
     }
 }
@@ -327,6 +337,15 @@ impl PasseDr {
             if !analysis_enabled(&backend) {
                 break Fin::AnalyseDesactivee;
             }
+            // Pause demandée, AVANT la garde thermique et la garde lecture :
+            // c'est une décision de l'utilisateur, elle prime sur les gardes
+            // automatiques. Le passage n'est pas refermé — sa jauge reste où
+            // elle est et il repart du même point à la reprise.
+            if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::PlageDynamique) {
+                self.attendre(Attente::Pause, &mut sur_avancement);
+                tokio::time::sleep(cadence.report_pause).await;
+                continue;
+            }
             if cadence.garde_thermique && thermal.should_hold("dynamic_range") {
                 self.attendre(Attente::Chaleur, &mut sur_avancement);
                 tokio::time::sleep(cadence.report_chaleur).await;
@@ -365,7 +384,10 @@ impl PasseDr {
             if compter_les_candidats_dr(&backend) <= 0 {
                 break Fin::Terminee;
             }
-            if !analysis_enabled(&backend) || any_zone_playing(&backend) {
+            if !analysis_enabled(&backend)
+                || any_zone_playing(&backend)
+                || crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::PlageDynamique)
+            {
                 continue;
             }
             lots_vides += 1;
@@ -416,6 +438,7 @@ mod tests {
         Cadence {
             report_lecture: Duration::from_millis(20),
             report_chaleur: Duration::from_millis(20),
+            report_pause: Duration::from_millis(20),
             entre_lots: Duration::from_millis(5),
             garde_thermique: false,
         }

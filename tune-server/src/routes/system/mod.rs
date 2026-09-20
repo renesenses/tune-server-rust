@@ -46,6 +46,8 @@ mod replaygain;
 // garde pas. Les items du module restent `pub(crate)` sauf ceux exposés
 // expressément.
 pub mod scan;
+/// Pause et reprise des traitements de fond (#4573) — voir le module.
+pub(crate) mod taches_de_fond;
 mod tags;
 pub(crate) mod update;
 mod youtube;
@@ -115,6 +117,36 @@ pub fn router() -> Router<AppState> {
         )
         .route("/artist-split-preview", get(scan::artist_split_preview))
         .route("/background-tasks", get(enrich::background_tasks_status))
+        // Suspendre et reprendre les traitements de fond (#4573). Le scan avait
+        // `/scan/cancel` ; le ReplayGain, la plage dynamique, l'analyse
+        // acoustique, l'enrichissement et les images d'artistes n'avaient
+        // AUCUN geste, alors qu'ils tournent des heures. Un identifiant par
+        // traitement (`replaygain`, `fingerprints`, `dynamic_range`,
+        // `acoustic`, `enrichment`, `artist_images`), plus l'interrupteur
+        // général. La pause est coopérative — honorée à la frontière de la
+        // piste suivante — et PERSISTANTE : elle survit au redémarrage, sans
+        // quoi elle ne servirait à rien sur une passe de huit heures.
+        //
+        // ⚠️ Les deux routes générales sont déclarées AVANT `/{id}/...` :
+        // `pause-all` n'est pas un identifiant de tâche, et un `{id}` posé
+        // d'abord n'en changerait rien ici (les gabarits ne se recouvrent pas)
+        // mais l'ordre dit l'intention à la lecture.
+        .route(
+            "/background-tasks/pause-all",
+            post(taches_de_fond::tout_suspendre),
+        )
+        .route(
+            "/background-tasks/resume-all",
+            post(taches_de_fond::tout_reprendre),
+        )
+        .route(
+            "/background-tasks/{id}/pause",
+            post(taches_de_fond::pause_tache),
+        )
+        .route(
+            "/background-tasks/{id}/resume",
+            post(taches_de_fond::reprendre_tache),
+        )
         // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit
         // que leur present (#2080). Survit au redemarrage, borne en taille.
         .route("/task-runs", get(diagnostics::task_runs))
