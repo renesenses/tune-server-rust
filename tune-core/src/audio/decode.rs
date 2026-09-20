@@ -4614,6 +4614,7 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
         assert!(!can_decode_native("song.wma")); // aucun décodeur WMA livré
     }
 
+    #[cfg(not(feature = "dst"))]
     #[test]
     fn dff_dst_n_est_jamais_annonce_ni_envoye_comme_decodable() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tune_decode_dff_dst_test");
