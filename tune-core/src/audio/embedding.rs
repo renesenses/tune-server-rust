@@ -494,6 +494,13 @@ pub async fn analyze_embedding_batch(
             );
             break;
         }
+        // La pause peut tomber EN PLEIN LOT, et un lot est long : décodage plus
+        // inférence ONNX sur chaque piste. La frontière propre est ici, entre
+        // deux pistes — celle qui vient d'être calculée est déjà écrite.
+        if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::Acoustique) {
+            info!("audio_embed_pause_utilisateur_mid_lot — arrêt à la frontière de piste");
+            break;
+        }
         let (track_id, path, debut_s, duree_s) = match r {
             CandidatAcoustique::Pret {
                 track_id,
@@ -795,6 +802,11 @@ pub enum PauseAcoustique {
     Memoire,
     /// Fonction réservée au premium ; le réglage reste actif.
     NonPremium,
+    /// L'utilisateur a SUSPENDU l'analyse acoustique depuis l'écran « État du
+    /// serveur ». Les cinq autres causes se lèvent d'elles-mêmes quand la
+    /// machine ou la lecture le permet ; celle-ci n'attend que « Reprendre »,
+    /// et elle survit au redémarrage du serveur.
+    Utilisateur,
 }
 
 impl PauseAcoustique {
@@ -808,6 +820,7 @@ impl PauseAcoustique {
             PauseAcoustique::Thermique => Some("thermal"),
             PauseAcoustique::Memoire => Some("low_memory"),
             PauseAcoustique::NonPremium => Some("not_premium"),
+            PauseAcoustique::Utilisateur => Some("paused"),
         }
     }
 }
@@ -822,6 +835,7 @@ fn poser_pause(raison: PauseAcoustique) {
         PauseAcoustique::Memoire => 3,
         PauseAcoustique::NonPremium => 4,
         PauseAcoustique::ScanBibliotheque => 5,
+        PauseAcoustique::Utilisateur => 6,
     };
     PAUSE_ACOUSTIQUE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
@@ -848,7 +862,12 @@ fn pause_libere_session(pause: PauseAcoustique) -> bool {
         // c'est la deuxième pause la plus longue après la lecture, et garder
         // 1,2 Go de modèle CLAP résidents pendant qu'on veut justement libérer
         // la machine pour le scan serait exactement à contresens.
-        | PauseAcoustique::ScanBibliotheque => true,
+        | PauseAcoustique::ScanBibliotheque
+        // La plus longue de toutes : elle dure jusqu'à ce que l'utilisateur
+        // clique « Reprendre », et survit même au redémarrage. Garder 1,2 Go
+        // de modèle CLAP résidents pendant une pause qu'on a justement
+        // demandée pour rendre la machine à la musique serait un contresens.
+        | PauseAcoustique::Utilisateur => true,
     }
 }
 
@@ -881,6 +900,19 @@ fn sieste_de_fin_de_tour(une_zone_joue: bool) -> u64 {
     if une_zone_joue { 2 } else { IDLE_SLEEP_SECS }
 }
 
+/// Le dernier lot acoustique a-t-il rendu du travail ?
+///
+/// C'est le signal d'activité de cette passe, et il n'en existait aucun :
+/// `pause_acoustique()` dit pourquoi elle NE travaille PAS, jamais qu'elle
+/// travaille. Le registre des traitements de fond en a besoin pour distinguer
+/// « en cours » de « au repos » sans payer un `COUNT(*)` à chaque sondage de
+/// l'écran.
+pub fn balayage_acoustique_en_cours() -> bool {
+    BALAYAGE_EN_COURS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static BALAYAGE_EN_COURS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Ce qui empêche la passe acoustique de travailler, s'il y a quelque chose.
 pub fn pause_acoustique() -> PauseAcoustique {
     match PAUSE_ACOUSTIQUE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -889,6 +921,7 @@ pub fn pause_acoustique() -> PauseAcoustique {
         3 => PauseAcoustique::Memoire,
         4 => PauseAcoustique::NonPremium,
         5 => PauseAcoustique::ScanBibliotheque,
+        6 => PauseAcoustique::Utilisateur,
         _ => PauseAcoustique::Aucune,
     }
 }
@@ -1111,6 +1144,10 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // Latch for the playback hold, same style as `low_memory`: one line on
         // the way in, one on the way out, silence in between.
         let mut playback_hold = false;
+        // Même loquet, même raison, pour la pause demandée à la main : une
+        // ligne à l'entrée, une à la sortie, et rien entre les deux pendant
+        // les heures que peut durer une pause.
+        let mut pause_utilisateur = false;
         // Vrai tant que la passe est en retrait devant un scan. N'existe que
         // pour ne journaliser l'entrée et la sortie de retrait qu'UNE fois, et
         // non toutes les 30 s pendant une heure de scan — même rôle que
@@ -1222,6 +1259,22 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 // the server at ~380 % CPU, the WS event_bus lagged by
                 // thousands of messages and the output pacing jittered into
                 // audible micro-dropouts at the endpoint.
+                // Pause demandée par l'utilisateur, AVANT les gardes
+                // automatiques : une décision explicite prime sur elles, et
+                // elle relâche la session ONNX comme les autres.
+                if crate::taches_de_fond::est_en_pause(crate::taches_de_fond::Tache::Acoustique) {
+                    if !pause_utilisateur {
+                        pause_utilisateur = true;
+                        info!("audio_embed_pause_utilisateur — analyse acoustique suspendue");
+                    }
+                    entrer_en_pause(&mut embedder, PauseAcoustique::Utilisateur);
+                    tokio::time::sleep(crate::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+                    continue;
+                }
+                if pause_utilisateur {
+                    pause_utilisateur = false;
+                    info!("audio_embed_reprise_utilisateur");
+                }
                 if crate::audio::replaygain::any_zone_playing(&backend) {
                     if !playback_hold {
                         playback_hold = true;
@@ -1479,6 +1532,13 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         let _slot = crate::audio::replaygain::ANALYSIS_SLOT.lock().await;
                         analyze_embedding_batch(&backend, emb).await
                     };
+                    // Le seul signal d'activité que cette passe publiait était
+                    // sa RAISON DE PAUSE, et `Aucune` reste posée pendant les
+                    // 15 minutes de sieste d'une passe drainée : lu comme « en
+                    // cours », il aurait affiché un balayage perpétuel. Le
+                    // dernier lot a-t-il rendu quelque chose : voilà la
+                    // question, et voilà la réponse.
+                    BALAYAGE_EN_COURS.store(did > 0, std::sync::atomic::Ordering::Relaxed);
                     if did > 0 {
                         // More to do — loop promptly; the per-file pauses throttle.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
