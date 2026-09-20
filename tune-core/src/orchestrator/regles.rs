@@ -1053,6 +1053,13 @@ pub(super) struct MotifsDeTranscodage {
     /// DMP-A8 lit ses en-têtes puis cale, muet. Ré-encodé par Tune, sans perte,
     /// il joue. Voir `audio::flac_vendeur`.
     pub(super) flac_ffmpeg_vers_le_reseau: bool,
+    /// #4573 — la source a PLUS de canaux que le renderer n'en annonce. Servir
+    /// le fichier tel quel laisse l'ampli se débrouiller : le Denon
+    /// AVR-X1600H de Xavier replie le 5.1 en stéréo avec son propre mélange,
+    /// muet sur ce qu'il fait, et un renderer moins conciliant refuserait la
+    /// piste. Seul le décodage sait replier proprement (ITU-R BS.775), donc le
+    /// passthrough est désarmé. Voir [`crate::audio::canaux_reseau_4573`].
+    pub(super) reduction_de_canaux: bool,
 }
 
 /// La piste doit-elle être transcodée ? Un OU de tous les motifs, dans l'ordre
@@ -1069,6 +1076,7 @@ pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
         || (motifs.dlna_cap_16bit && motifs.will_be_flac)
         || motifs.est_une_tranche_cue
         || motifs.flac_ffmpeg_vers_le_reseau
+        || motifs.reduction_de_canaux
 }
 
 #[cfg(test)]
@@ -1232,6 +1240,7 @@ mod lecture_locale_tests {
             will_be_flac: false,
             est_une_tranche_cue: false,
             flac_ffmpeg_vers_le_reseau: false,
+            reduction_de_canaux: false,
         }
     }
 
@@ -1247,7 +1256,7 @@ mod lecture_locale_tests {
 
     #[test]
     fn chaque_motif_seul_exige_le_transcodage() {
-        let seuls: [(&str, MotifsDeTranscodage); 10] = [
+        let seuls: [(&str, MotifsDeTranscodage); 11] = [
             (
                 "needs_transcode_for_output",
                 MotifsDeTranscodage {
@@ -1317,6 +1326,14 @@ mod lecture_locale_tests {
                 MotifsDeTranscodage {
                     flac_ffmpeg_vers_le_reseau: true,
                     will_be_flac: true,
+                    ..aucun_motif()
+                },
+            ),
+            (
+                // #4573 — 5.1 vers un renderer qui n'annonce que deux canaux.
+                "reduction_de_canaux",
+                MotifsDeTranscodage {
+                    reduction_de_canaux: true,
                     ..aucun_motif()
                 },
             ),
