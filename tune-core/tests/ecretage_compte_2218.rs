@@ -64,6 +64,15 @@ const N: usize = 44_100;
 // échantillons écrêtés dur. Ce qui n'a PAS bougé, et que ce fichier continue de
 // prouver : l'endroit du clamp, son ordre (clamp PUIS dither) et ses seuils —
 // le compteur d'écrêtage reste exactement le compteur d'overs.
+//
+// #4594 (20/09) les a fait bouger une seconde fois, pour la même raison : la
+// réserve n'est plus le plus grand de la somme des gains et de la norme L1,
+// mais la **norme L1 seule**, plus 0,01 dB de marge de troncature. Anciennes
+// valeurs : 0x0646_ad5a_8ffa_ac80 pour le plateau, 0x1c77_57f5_32af_6cdc pour
+// la chaîne ReplayGain→égaliseur. Les DEUX empreintes du passe-bas Q = 4
+// (`B_EQ_LOWPASS_Q4_24B`, `B_EQ_FLOTTANT_Q4`) sont inchangées au bit près, et
+// c'est la contre-épreuve du correctif : un profil sans aucune bande à gain ne
+// réserve que sa RÉSONANCE, que #4594 ne touche pas.
 
 const A_RG_PLUS6_16B: u64 = 0x70ed_00f1_327a_171f;
 const A_RG_PLUS6_24B: u64 = 0x28b2_9fa3_c47f_2f8e;
@@ -77,10 +86,10 @@ const E_MIXEUR_MOINS1_24B: u64 = 0x53bc_d36e_bb4c_14c0;
 const E_MIXEUR_MOINS1_32B: u64 = 0x204e_851d_0428_4df5;
 const B_EQ_LOWPASS_Q4_24B: u64 = 0x9116_d8c0_b1ce_21f7;
 const B_EQ_LOWPASS_Q4_OVERS: u64 = 0;
-const B_EQ_LOWSHELF_CARRE_24B: u64 = 0x0646_ad5a_8ffa_ac80;
+const B_EQ_LOWSHELF_CARRE_24B: u64 = 0x973a_86ec_67c2_a68d;
 const B_EQ_LOWSHELF_CARRE_OVERS: u64 = 0;
 const B_EQ_FLOTTANT_Q4: u64 = 0xe7ef_1090_2da3_b1da;
-const Q2_CHAINE_RG_EQ_16B: u64 = 0x1c77_57f5_32af_6cdc;
+const Q2_CHAINE_RG_EQ_16B: u64 = 0x0466_5d75_3de1_a39e;
 /// Le passe-haut de Butterworth sur un carré 50 Hz : ce que l'égaliseur écrête
 /// ENCORE après #4073, par un choix assumé (la norme L1 d'un filtre `pass` de
 /// +7,02 dB n'est pas réservée, sans quoi tout coupe-bas coûterait 7 dB). C'est

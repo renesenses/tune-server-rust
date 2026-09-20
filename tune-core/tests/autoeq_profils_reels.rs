@@ -114,13 +114,14 @@ fn le_hd_650_est_traduit_ligne_a_ligne() {
 
 /// LE point de vigilance : un profil AutoEq pousse, et sans marge il ecrete.
 ///
-/// Tune reserve la somme des gains positifs
-/// (`EqProfile::automatic_headroom_db`, d423c16b ; depuis #4073, le plus grand
-/// de cette somme et de la norme L1 de la cascade). Cette somme majore toujours
-/// le maximum de la reponse combinee, que le `Preamp` d'AutoEq vient
-/// compenser : la marge reservee est donc au moins aussi protectrice que celle
-/// que le fichier demande. Ce test le VERIFIE sur les trois profils plutot que
-/// de le supposer.
+/// Tune reserve la **norme L1** de la cascade
+/// (`EqProfile::automatic_headroom_db` ; la somme des gains positifs jusqu'a
+/// #4073, le plus grand des deux jusqu'a #4594, la L1 seule depuis). La L1
+/// majore toujours le maximum de la reponse combinee, que le `Preamp` d'AutoEq
+/// vient compenser : la marge reservee reste donc au moins aussi protectrice
+/// que celle que le fichier demande. Ce test le VERIFIE sur les trois profils
+/// plutot que de le supposer — c'est la contre-epreuve du passage a la borne
+/// vraie, qui a fait REMONTER la reserve de 3,5 a 9,8 dB.
 #[test]
 fn la_marge_reservee_par_tune_couvre_le_preamp_de_chaque_profil() {
     for (nom, texte) in tous() {
@@ -139,14 +140,26 @@ fn la_marge_reservee_par_tune_couvre_le_preamp_de_chaque_profil() {
 ///
 /// Elle n'est pas un defaut — rien n'ecrete — mais elle s'entend : un profil
 /// AutoEq joue plus bas dans Tune que dans un lecteur qui applique le `Preamp`
-/// du fichier. L'ecart va de 5 a 16 dB sur ces trois casques. Ce test le fige
-/// pour que personne ne decouvre le chiffre a l'oreille.
+/// du fichier. Ce test fige l'ecart pour que personne ne le decouvre a
+/// l'oreille.
+///
+/// #4594 a divise cet ecart par deux a trois : la reserve n'est plus la somme
+/// des gains positifs mais la **borne vraie** (norme L1 de la cascade). Les
+/// trois casques y gagnent du niveau, et le test du dessus verifie qu'ils
+/// couvrent toujours le `Preamp` du fichier :
+///
+/// ```text
+/// casque              Preamp    avant #4594    apres #4594    rendu
+/// Sennheiser HD 650   −6,1 dB     −13,8 dB      −10,274 dB    +3,5 dB
+/// AKG K701            −6,1 dB     −16,7 dB      −10,418 dB    +6,3 dB
+/// Etymotic ER4SR      −6,4 dB     −22,2 dB      −12,445 dB    +9,8 dB
+/// ```
 #[test]
 fn l_ecart_entre_la_marge_de_tune_et_le_preamp_est_connu_et_chiffre() {
     let mesures: [(&str, &str, f64, f64); 3] = [
-        ("Sennheiser HD 650", HD_650, -6.1, -13.8),
-        ("AKG K701", K701, -6.1, -16.7),
-        ("Etymotic ER4SR", ER4SR, -6.4, -22.2),
+        ("Sennheiser HD 650", HD_650, -6.1, -10.274_060_182_678_957),
+        ("AKG K701", K701, -6.1, -10.418_443_289_746_019),
+        ("Etymotic ER4SR", ER4SR, -6.4, -12.444_778_835_334_407),
     ];
     for (nom, texte, preamp, marge) in mesures {
         let profil = analyser(texte).unwrap();
