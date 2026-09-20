@@ -62,6 +62,9 @@ impl ServiceRegistry {
                 "authenticated": status.authenticated,
                 "username": status.username,
                 "subscription": status.subscription,
+                // #4577 — annoncer ce que le service refuse, pour que l'écran
+                // n'offre pas un cœur qui rendra 501.
+                "favoris_ecrivables": svc.favoris_ecrivables(),
             }));
         }
         results
