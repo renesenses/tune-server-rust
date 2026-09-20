@@ -1303,3 +1303,163 @@ fn q4_les_etages_desarmes_sont_l_identite_octet_pour_octet() {
     CrossfeedProcessor::new(FS, 0.0, 0.3).process_interleaved(&mut flottant);
     assert_eq!(flottant, original, "chemin flottant désarmé");
 }
+
+// ═══════════ #4594 — la réserve et la cascade doivent voir les MÊMES bandes ═══════════
+
+/// La grille ISO à 10 bandes, celle des préréglages livrés.
+const GRILLE_10: [f64; 10] = [
+    31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
+
+fn dix_cloches(band_type: &str, gain: f64) -> EqProfile {
+    profil(
+        GRILLE_10
+            .iter()
+            .map(|f| bande(band_type, *f, gain, 1.0))
+            .collect(),
+    )
+}
+
+/// #4594 — un `type` de bande NON CANONIQUE pousse, et ne réservait RIEN.
+///
+/// `EqBandSpec::coeffs` range tout type inconnu en `peaking_eq` (son bras
+/// `_ =>`), et `POST /zones/{id}/eq` ne valide pas ce champ : `band_type` est
+/// un `String` nu, désérialisé par `filter_map(.. .ok())`. `"peaking"`,
+/// `"Peak"` ou `"bell"` traversent donc l'API, sont montés en cloches qui
+/// POUSSENT — et la somme des gains positifs les filtrait par LISTE BLANCHE
+/// (`"peak" | "low_shelf" | "high_shelf"`) là où la cascade les filtrait par
+/// LISTE NOIRE. Somme à zéro, terme L1 éteint avec elle (il n'entre que si au
+/// moins une bande pousse) : réserve 0 dB sur dix cloches à +6 dB.
+///
+/// **Mesuré avant le correctif**, sur `origin/main` 34227d75, sinus 1 kHz à
+/// −6 dBFS, 2 s, stéréo, à travers le chemin flottant qui ne sature pas :
+/// crête en sortie **1,731 (+4,77 dBFS)** et **107 192 overs sur 176 400 —
+/// 60,8 % des échantillons écrêtés dur**. Les mêmes bandes en `"peak"` :
+/// réserve −60,00 dB, crête 0,001731, **zéro** over.
+///
+/// Après : une seule porte, `EqBandSpec::est_une_bande_a_gain`, pour la somme
+/// comme pour la cascade.
+#[test]
+fn un_type_de_bande_non_canonique_reserve_comme_une_cloche_4594() {
+    // Le type non canonique franchit bien la porte d'entrée : c'est ce qui
+    // rend le défaut atteignable, pas seulement pensable.
+    let depuis_l_api: EqBandSpec =
+        serde_json::from_str(r#"{"freq":1000.0,"gain":6.0,"q":1.0,"type":"bell"}"#)
+            .expect("l'API accepte un type de bande quelconque");
+    assert_eq!(
+        depuis_l_api.band_type, "bell",
+        "le type est conservé tel quel, sans validation"
+    );
+
+    let canonique = dix_cloches("peak", 6.0).automatic_headroom_db(0);
+    assert!(
+        canonique <= -20.0,
+        "dix cloches canoniques à +6 dB réservent des dizaines de dB : {canonique}"
+    );
+
+    for etiquette in ["peaking", "PEAK", "bell", "Peak", "cloche"] {
+        let reserve = dix_cloches(etiquette, 6.0).automatic_headroom_db(0);
+        assert_eq!(
+            reserve, canonique,
+            "type «{etiquette}» : monté en cloche par coeffs(), il doit réserver \
+             comme une cloche — mesuré {reserve} dB au lieu de {canonique} dB"
+        );
+
+        // L'effet audible, et pas le raisonnement : plus un seul échantillon
+        // hors du rail sur le signal qui en écrêtait 60,8 %.
+        let mut eq = EqProcessor::new(&dix_cloches(etiquette, 6.0), FS, 2);
+        let mut buf = vec![0.0f32; N * 2];
+        for i in 0..N {
+            let v = (amplitude(-6.0) * (2.0 * PI * 1000.0 * i as f64 / FS as f64).sin()) as f32;
+            buf[i * 2] = v;
+            buf[i * 2 + 1] = v;
+        }
+        let stats = eq.process_interleaved(&mut buf);
+        assert_eq!(
+            stats.overs, 0,
+            "type «{etiquette}» : sinus 1 kHz à −6 dBFS, aucun échantillon ne doit \
+             sortir du rail après l'étage d'égalisation"
+        );
+        let crete = buf[N..].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            crete < 1.0,
+            "type «{etiquette}» : crête en sortie {crete} ({:.2} dBFS)",
+            dbfs(crete as f64)
+        );
+    }
+
+    // ── Contre-épreuves : la réserve ne s'est pas mise à apparaître partout ──
+
+    // Un profil de cloches non canoniques qui ne fait que CREUSER ne réserve
+    // rigoureusement rien — sinon ce correctif atténuerait un profil purement
+    // soustractif, ce que personne ne demande.
+    for etiquette in ["peak", "peaking", "bell"] {
+        let reserve = dix_cloches(etiquette, -6.0).automatic_headroom_db(0);
+        assert!(
+            reserve.abs() < 1e-9,
+            "type «{etiquette}» à −6 dB : aucune marge à réserver, mesuré {reserve}"
+        );
+    }
+
+    // Les `pass` et le `notch` restent HORS de la somme : leur champ `gain`
+    // n'est pas lu par `coeffs`, le réserver serait réserver pour rien. Un
+    // `low_pass` ne réserve que sa RÉSONANCE, inchangée.
+    for etiquette in ["low_pass", "high_pass", "notch"] {
+        let plat = profil(vec![bande(etiquette, 3000.0, 12.0, FRAC_1_SQRT_2)]);
+        assert!(
+            plat.automatic_headroom_db(0).abs() < 1e-9,
+            "type «{etiquette}» à Butterworth : son champ gain ne doit rien réserver"
+        );
+    }
+    let resonant = profil(vec![bande("low_pass", 3000.0, 0.0, 4.0)]);
+    assert!(
+        (resonant.automatic_headroom_db(0) - (-15.051_499_783_199_058)).abs() < 1e-9,
+        "le témoin voisin du passe-bas Q=4 est inchangé : {}",
+        resonant.automatic_headroom_db(0)
+    );
+}
+
+/// #4594 — le parc ne bouge pas d'un dB.
+///
+/// Tous les producteurs livrés écrivent des types canoniques : le client web
+/// (`ParametricEq.svelte`), les préréglages serveur, l'import AutoEq
+/// (`PK`/`PEQ` → `"peak"`), `room_correction` et `dac_calibration`. Le
+/// correctif de #4594 élargit la somme des gains positifs aux types inconnus ;
+/// il ne doit donc RIEN changer pour eux. Les valeurs ci-dessous sont celles
+/// mesurées sur `origin/main` 34227d75, AVANT le correctif : si l'une bouge,
+/// le volume perçu de tout le parc a bougé avec elle.
+#[test]
+fn le_correctif_4594_ne_deplace_le_niveau_d_aucun_prereglage_livre() {
+    let attendu = [
+        ("flat", 0.0),
+        ("bass_boost", -20.0),
+        ("treble_boost", -24.0),
+        ("loudness", -27.0),
+        ("rock", -28.0),
+        ("jazz", -18.0),
+        ("classical", 0.0),
+    ];
+    for (nom, reserve_attendue) in attendu {
+        let bandes = tune_core::audio::eq_presets::bandes(nom)
+            .unwrap_or_else(|| panic!("préréglage livré «{nom}»"));
+        let mesuree = profil(bandes).automatic_headroom_db(0);
+        assert!(
+            (mesuree - reserve_attendue).abs() < 1e-9,
+            "préréglage «{nom}» : réserve {mesuree} dB, attendu {reserve_attendue} dB — \
+             le niveau de tout le parc vient de bouger"
+        );
+    }
+
+    // Les trois curseurs du profileur (aucune bande expert) : inchangés eux aussi.
+    let curseurs = EqProfile {
+        enabled: true,
+        bass_gain_db: 6.0,
+        treble_gain_db: 3.0,
+        ..Default::default()
+    };
+    assert!(
+        (curseurs.automatic_headroom_db(0) - (-9.0)).abs() < 1e-9,
+        "curseurs graves +6 / aigus +3 : {}",
+        curseurs.automatic_headroom_db(0)
+    );
+}
