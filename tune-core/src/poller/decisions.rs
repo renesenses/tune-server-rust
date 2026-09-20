@@ -96,7 +96,8 @@ use super::{
     DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
     GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
     MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
-    POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD, TICKS_GELE_DLNA_AVEC_SETNEXT,
+    POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD, SuivantePreparee,
+    TICKS_GELE_DLNA_AVEC_SETNEXT,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -1050,8 +1051,40 @@ pub enum EnchainementArme {
     Certain,
     /// Le renderer ne dit pas quelle URI il joue, mais il a tiré le flux armé.
     Probable,
+    /// #3967 — il n'avait pas enchaîné SEUL, mais il avait prouvé à
+    /// l'armement qu'il TIENT la suivante et DÉCLARE l'action `Next` : on la
+    /// lui a demandée, et il l'a acquittée. Pas un constat, une CONSIGNE —
+    /// donc surveillée plus court que les deux autres (voir
+    /// [`super::BASCULE_DELAI_SECS`]).
+    Bascule,
     /// Rien n'atteste l'enchaînement : le repli reste de mise.
     Aucun,
+}
+
+/// #3967 — a-t-on le droit de demander au renderer de basculer LUI-MÊME sur
+/// la suivante, plutôt que de tout relancer ?
+///
+/// Quatre conditions, toutes nécessaires, aucune devinée :
+///
+/// 1. c'est un renderer réseau (`dlna`) — seul protocole qui expose `Next` ;
+/// 2. il y a un flux ARMÉ sous la zone, donc quelque chose vers quoi passer ;
+/// 3. rien n'atteste qu'il ait déjà enchaîné tout seul (sinon on adopte, on
+///    ne commande pas) ;
+/// 4. à l'armement, il a NOMMÉ notre URL en suivante ET DÉCLARÉ l'action
+///    `Next` — [`SuivantePreparee::Tenue`], et rien d'autre.
+///
+/// Un appareil qui n'annonce pas l'action, qui ne la retient pas, ou dont on
+/// n'a rien pu lire garde le repli d'aujourd'hui, mot pour mot.
+pub fn bascule_sur_la_suivante_autorisee(
+    is_dlna: bool,
+    suivante: SuivantePreparee,
+    flux_arme: Option<&str>,
+    enchainement: EnchainementArme,
+) -> bool {
+    is_dlna
+        && enchainement == EnchainementArme::Aucun
+        && suivante == SuivantePreparee::Tenue
+        && flux_arme.is_some_and(|f| !f.is_empty())
 }
 
 /// Décide si la fin prononcée à l'horloge doit ADOPTER l'enchaînement du

@@ -28,6 +28,165 @@ pub(crate) fn nom_lisible_de_l_appareil(dev_id: &str) -> Option<String> {
     Some(reste.to_string())
 }
 
+/// La forme d'un nom de périphérique qui survit à un renommage de pilote.
+///
+/// Windows suffixe l'endpoint du taux d'échantillonnage courant
+/// (« audio-gd USB audio (44,1 kHz) », #2269, DEvir) et plusieurs backends
+/// parenthèsent le nom du contrôleur. Ce qui reste devant la première
+/// parenthèse est la partie stable. Comparaison sans casse ni espaces
+/// redondants.
+///
+/// ⚠️ Cette forme ne sert qu'à NOMMER un candidat dans un message. Elle ne
+/// vaut PAS identité : deux appareils peuvent partager « Haut-parleurs », et
+/// c'est précisément pourquoi rien ne se ré-associe sur elle.
+fn forme_stable_du_nom(nom: &str) -> String {
+    let avant_parenthese = nom.split('(').next().unwrap_or(nom);
+    avant_parenthese
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// L'unique sortie locale vivante dont le nom est une variante de `attendu`,
+/// s'il y en a exactement une et qu'elle ne porte pas déjà ce nom exact.
+///
+/// Zéro candidat : rien à dire. Deux candidats ou plus : les départager serait
+/// un tirage au sort, et un message qui nomme le mauvais appareil est pire que
+/// pas de message du tout.
+fn candidat_renomme(attendu: &str, noms_vivants: &[String]) -> Option<String> {
+    let cible = forme_stable_du_nom(attendu);
+    if cible.is_empty() {
+        return None;
+    }
+    let mut trouves = noms_vivants
+        .iter()
+        .filter(|n| n.as_str() != attendu && forme_stable_du_nom(n) == cible);
+    let premier = trouves.next()?;
+    if trouves.next().is_some() {
+        return None;
+    }
+    Some(premier.clone())
+}
+
+/// Le refus de lecture d'une zone dont la sortie a disparu — CAUSE PROBABLE et
+/// GESTE UTILE, pas seulement le constat (#4580, #4601).
+///
+/// ## Pourquoi cette fonction existe
+///
+/// Deux testeurs ont supprimé leur zone et l'ont recréée pour qu'elle
+/// refonctionne (Cyrille Moutia sur macOS, Kimon sur Linux, fil 1861). Ce
+/// geste n'est jamais le bon : il jette le volume, la file, le mode DSD, le
+/// délai de synchronisation et l'historique de la zone, et il ne répare rien
+/// que le retour de l'appareil n'aurait réparé tout seul. Ils l'ont fait parce
+/// que le message qu'ils lisaient — « La sortie de cette zone n'est plus
+/// disponible » — accuse la SORTIE sans dire pourquoi ni quoi faire, et que la
+/// seule action qu'un écran de réglages propose alors est de supprimer.
+///
+/// Le serveur, lui, sait distinguer trois situations, et chacune appelle un
+/// geste différent :
+///
+/// 1. **L'appareil est là, sous un autre nom.** Windows renomme l'endpoint au
+///    changement de taux d'échantillonnage (#2269) ; un flash de micrologiciel
+///    renomme un DAC. Une seule sortie vivante porte une variante du nom
+///    attendu : on la NOMME, et on laisse l'utilisateur la choisir. On ne la
+///    branche pas — rien ne prouve que c'est le même appareil, et se tromper
+///    enverrait le son ailleurs.
+/// 2. **Sortie locale absente du parc.** L'énumération a eu lieu (le garde
+///    d'appel exige un parc local non vide avant d'en arriver là, #3737) et le
+///    nom n'y est pas : débranché, éteint, ou tenu en exclusif par une autre
+///    application — c'est la cause la plus fréquente sous Windows.
+/// 3. **Sortie réseau jamais revue.** L'appareil ne s'est pas annoncé depuis
+///    le démarrage. Rien à faire côté Tune, et surtout rien à supprimer : la
+///    découverte le rattache seule à son retour, y compris s'il a changé
+///    d'adresse ou d'identifiant UPnP.
+///
+/// Dans les trois cas le message le dit : **supprimer la zone ne sert à rien.**
+/// C'est la phrase qui manquait.
+///
+/// La sentinelle `zone_output_unavailable:` est conservée telle quelle — la
+/// couche HTTP la mappe sur un 409 (`tune-server/src/routes/playback.rs`).
+pub(crate) fn message_de_refus_de_zone(
+    dev_id: &str,
+    zone_name: &str,
+    noms_locaux_vivants: &[String],
+) -> String {
+    const SENTINELLE: &str = "zone_output_unavailable:";
+    const INUTILE_DE_SUPPRIMER: &str = "Inutile de supprimer la zone puis de la recréer : \
+         elle se rattache seule dès que l'appareil réapparaît, et la recréer perdrait \
+         son volume, sa file et ses réglages.";
+
+    match nom_lisible_de_l_appareil(dev_id) {
+        Some(appareil) => match candidat_renomme(&appareil, noms_locaux_vivants) {
+            Some(candidat) => format!(
+                "{SENTINELLE}La zone « {zone_name} » attend la sortie « {appareil} », \
+                 qui n'est plus énumérée sous ce nom. Une sortie « {candidat} » est \
+                 présente : c'est probablement le même appareil, renommé par son pilote. \
+                 Sélectionnez-la dans les réglages de la zone — Tune ne le fait pas seul, \
+                 rien ne prouve qu'il s'agit bien du même appareil. {INUTILE_DE_SUPPRIMER}"
+            ),
+            None => format!(
+                "{SENTINELLE}La sortie « {appareil} » de la zone « {zone_name} » n'est plus \
+                 dans la liste des sorties audio de cette machine. Vérifiez qu'elle est \
+                 branchée et allumée, et qu'aucune autre application ne la tient en mode \
+                 exclusif ; sinon, choisissez une autre sortie dans les réglages de la \
+                 zone. {INUTILE_DE_SUPPRIMER}"
+            ),
+        },
+        None => format!(
+            "{SENTINELLE}L'appareil de la zone « {zone_name} » ne s'est pas annoncé sur le \
+             réseau depuis le démarrage du serveur. Vérifiez qu'il est allumé et sur le même \
+             réseau que Tune ; sinon, choisissez une autre sortie dans les réglages de la \
+             zone. {INUTILE_DE_SUPPRIMER}"
+        ),
+    }
+}
+
+/// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
+///
+/// Les deux travaux de la soirée se rencontrent ici, et ils COEXISTENT :
+///
+/// * `blocage = None` — refus ordinaire. La phrase est celle de
+///   [`message_de_refus_de_zone`] (#4580 / #4601) : trois causes nommées et
+///   « inutile de supprimer la zone ». Rien n'est retiré.
+/// * `blocage = Some` — le coupe-circuit ASIO a vidé le parc (#4556). Le
+///   serveur SAIT qu'il n'a pas regardé : il le dit, nomme le témoin et donne
+///   le geste. Nommer ici l'une des trois causes de #4580 serait un mensonge —
+///   aucune n'a été mesurée, puisqu'aucune énumération ASIO n'a eu lieu.
+///
+/// Pure exprès : l'état du coupe-circuit est un état de PROCESSUS, et le muter
+/// depuis un test empoisonnerait en parallèle les dizaines de tests de ce
+/// module qui attendent l'autre phrase.
+pub(crate) fn refus_de_zone_hors_ligne(
+    dev_id: &str,
+    zone_name: &str,
+    noms_locaux_vivants: &[String],
+    blocage: Option<&crate::outputs::asio_blocage_4556::BlocageAsio>,
+) -> (String, Option<&'static str>) {
+    if let Some(blocage) = blocage {
+        let phrase = blocage.message_fr(nom_lisible_de_l_appareil(dev_id).as_deref(), zone_name);
+        return (blocage.sentinelle(&phrase), Some(blocage.motif.code()));
+    }
+    (
+        message_de_refus_de_zone(dev_id, zone_name, noms_locaux_vivants),
+        None,
+    )
+}
+
+/// La PHRASE que lit l'auditeur, quelle que soit la sentinelle qui la porte.
+///
+/// #4580 a sorti `zone_output_unavailable:` de la bulle `zone.playback_error`
+/// (un message qui s'ouvre sur un identifiant de code se lit comme une panne
+/// du logiciel) ; #4556 a ajouté une SECONDE sentinelle,
+/// `zone_output_unavailable_asio:<code>:`. Un `strip_prefix` sur la seule
+/// première laisserait donc repasser la seconde en entier dans la bulle.
+pub(crate) fn phrase_sans_sentinelle(msg: &str) -> &str {
+    if let Some((_, phrase)) = crate::outputs::asio_blocage_4556::depuis_sentinelle(msg) {
+        return phrase;
+    }
+    msg.strip_prefix("zone_output_unavailable:").unwrap_or(msg)
+}
+
 /// Ce que la demande impose par-dessus le flux résolu : pochette et album
 /// demandés, sinon ceux du flux. Relevés une fois, lus par trois temps.
 pub(super) struct Habillage {
@@ -143,7 +302,9 @@ impl PlaybackOrchestrator {
     /// `Ok(Some(id))` — the zone was re-bound to `id`, which the caller must use
     /// as the request's `output_device_id`.
     /// `Err(msg)` — playback must be refused; `msg` carries the
-    /// `zone_output_unavailable:` sentinel the API maps to a 409.
+    /// `zone_output_unavailable:` sentinel the API maps to a 409, ou — quand
+    /// c'est le coupe-circuit ASIO qui a vidé le parc (#4556) — celle de
+    /// [`crate::outputs::asio_blocage_4556`], qui porte en plus un code stable.
     pub(super) async fn gate_or_rebind_offline_zone(
         &self,
         zone_id: i64,
@@ -181,11 +342,23 @@ impl PlaybackOrchestrator {
         // refusé. Seule une zone à la fois HORS LIGNE et ABSENTE du registre
         // atteint désormais le rebond puis le refus nommé — comme toutes les
         // autres familles de sorties depuis #1287.
+        // Les noms des sorties LOCALES vivantes, relevés sous le même verrou
+        // que le test de présence : c'est la matière du message de refus, qui
+        // doit pouvoir dire « une sortie « X » est présente, c'est
+        // probablement votre appareil renommé » (#4580, #4601). Un
+        // `output_device_id` local EST `local:{nom}`, donc le nom se lit sur
+        // l'identifiant sans toucher à l'API du registre.
+        let noms_locaux_vivants: Vec<String>;
         {
             let registre = self.outputs.lock().await;
             if dev_id.is_empty() || registre.contains(dev_id) {
                 return Ok(None);
             }
+            noms_locaux_vivants = registre
+                .list()
+                .iter()
+                .filter_map(|id| id.strip_prefix("local:").map(str::to_string))
+                .collect();
             // 🔴 #3737 — un parc VIDE n'est pas une preuve d'absence.
             //
             // #3738 a remplacé l'exemption `local:` par le seul critère qui
@@ -226,9 +399,7 @@ impl PlaybackOrchestrator {
             // reste refusée comme avant, et une zone locale l'est toujours dès
             // qu'un seul autre appareil local répond : le parc n'est pas vide,
             // l'énumération a donc bien eu lieu, et l'absence est mesurée.
-            if dev_id.starts_with("local:")
-                && !registre.list().iter().any(|id| id.starts_with("local:"))
-            {
+            if dev_id.starts_with("local:") && noms_locaux_vivants.is_empty() {
                 warn!(
                     zone_id,
                     zone_name = %zone.name,
@@ -278,30 +449,74 @@ impl PlaybackOrchestrator {
         // disparu. Le serveur, lui, connaît les deux bouts — il les écrit déjà
         // au journal juste au-dessus. Les mettre dans le message ne coûte rien
         // et transforme « une sortie » en « votre DAC ».
-        let msg = match nom_lisible_de_l_appareil(dev_id) {
-            Some(appareil) => format!(
-                "zone_output_unavailable:La sortie « {appareil} » de la zone « {} » n'est plus disponible. \
-                 Vérifiez qu'elle est branchée et allumée, ou choisissez une autre sortie dans les réglages de la zone.",
-                zone.name
-            ),
-            None => format!(
-                "zone_output_unavailable:La sortie de cette zone n'est plus disponible. \
-                 Choisissez une sortie dans les réglages de la zone « {} ».",
-                zone.name
-            ),
-        };
+        //
+        // 🔴 #4580 / #4601 — et NOMMER la cause probable, pas seulement
+        // l'appareil. Deux testeurs ont supprimé puis recréé leur zone parce
+        // que le message se bornait au constat. Voir
+        // [`message_de_refus_de_zone`].
+        //
+        // 🔴 #4556 — sauf quand le serveur SAIT qu'il n'a pas regardé.
+        //
+        // Marco Polo (fil 1852, SMSL SU-1) : son témoin de plantage ASIO est
+        // posé, le balayage de démarrage est suspendu, le parc local publié
+        // est un repli WASAPI — donc `local:USB DAC ASIO` ne peut PAS y être,
+        // quoi qu'il advienne de son DAC. Lui proposer l'une des trois causes
+        // de #4580 serait un mensonge de plus : aucune n'est mesurée, puisque
+        // aucune énumération ASIO n'a eu lieu. Le refus reste (rouvrir un
+        // pilote ASIO qui a emporté le processus précédent n'est pas une
+        // option), mais il dit la vérité, nomme le témoin, donne le geste, et
+        // porte un motif pour que le bouton « Réarmer ASIO » s'affiche là où
+        // le défaut se manifeste au lieu d'être enterré dans les Diagnostics.
+        //
+        // Les deux conditions sont exigées ensemble par
+        // `blocage_expliquant_un_parc_de_repli` : porte fermée ET repli
+        // mesuré. Un témoin oublié sur une machine réglée en WASAPI retombe
+        // donc sur le message de #4580 — là, l'absence est vraiment mesurée.
+        let blocage_asio = dev_id
+            .starts_with("local:")
+            .then(crate::outputs::asio_blocage_4556::blocage_expliquant_un_parc_de_repli)
+            .flatten();
+        let (msg, motif_asio) = refus_de_zone_hors_ligne(
+            dev_id,
+            &zone.name,
+            &noms_locaux_vivants,
+            blocage_asio.as_ref(),
+        );
         warn!(
             zone_id,
             zone_name = %zone.name,
             device = dev_id,
+            motif_asio = motif_asio.unwrap_or("-"),
             "play_rejected_zone_offline"
         );
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
+            let mut charge = serde_json::json!({
                     "zone_id": zone_id,
-                    "error": msg,
+                    // 🔴 #4580 — `error` porte la PHRASE, jamais la sentinelle.
+                    //
+                    // `msg` commence par `zone_output_unavailable:`, que la
+                    // couche HTTP retire avant de composer son 409
+                    // (`routes/playback.rs`). Cet événement-ci, lui, partait
+                    // avec : le client affiche `data.message || data.error`
+                    // tel quel (`App.svelte`), et la bulle lue par l'auditeur
+                    // commençait donc par « zone_output_unavailable: ». Un
+                    // message qui s'ouvre sur un identifiant de code se lit
+                    // comme une panne du logiciel, pas comme une consigne —
+                    // et c'est la bulle que les deux testeurs du fil 1861 ont
+                    // eue sous les yeux avant de supprimer leur zone.
+                    //
+                    // La convention du dépôt est déjà celle-ci partout
+                    // ailleurs : `error` = la phrase, `code` = l'identifiant
+                    // stable (`audio::bitperfect_strict::charge_utile_de_refus`,
+                    // `poller/tick.rs`). Seul cet émetteur y dérogeait.
+                    //
+                    // #4556 — et la phrase est retirée de la BONNE sentinelle :
+                    // il y en a désormais deux (`zone_output_unavailable:` et
+                    // `zone_output_unavailable_asio:<code>:`), et un
+                    // `strip_prefix` sur la seule première laissait repasser la
+                    // seconde en entier dans la bulle.
+                    "error": phrase_sans_sentinelle(&msg),
+                    "code": "zone_output_unavailable",
                     // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
                     //
                     // Le client ouvre une fenêtre de grâce de 30 s AVANT l'appel
@@ -316,8 +531,31 @@ impl PlaybackOrchestrator {
                     // Une sortie disparue ne revient pas dans les 30 s : ce refus
                     // est fatal par nature.
                     "fatal": true,
-                }),
-            );
+            });
+            // #4556 — de quoi accrocher le bouton « Réarmer ASIO » : c'est par
+            // CE canal que le refus atteint réellement l'écran (voir `fatal`
+            // ci-dessus). Ajouté seulement quand il y a quelque chose à dire ;
+            // un refus ordinaire garde la charge utile de #4580, au champ près.
+            //
+            // ⚠️ ARBITRAGE de la fusion des deux lots : `code` reste
+            // `zone_output_unavailable`. C'est l'identifiant STABLE de la
+            // FAMILLE de refus, celui que #4580 vient d'introduire et que sa
+            // garde vérifie ; le motif ASIO, lui, voyage dans `reason`. Le
+            // corps du 409 HTTP dit déjà exactement cela
+            // (`error: "zone_output_unavailable"` + `reason`), les deux canaux
+            // sont donc symétriques et un client n'a qu'une règle à retenir.
+            if let (Some(code), Some(objet)) = (motif_asio, charge.as_object_mut()) {
+                objet.insert("reason".into(), code.into());
+                objet.insert(
+                    "can_rearm".into(),
+                    crate::outputs::asio_blocage_4556::code_rearmable(code).into(),
+                );
+                objet.insert(
+                    "rearm_endpoint".into(),
+                    crate::outputs::asio_blocage_4556::ROUTE_DE_REARMEMENT.into(),
+                );
+            }
+            bus.emit("zone.playback_error", charge);
         }
         Err(msg)
     }

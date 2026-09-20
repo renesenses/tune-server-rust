@@ -9,7 +9,9 @@ use tracing::{debug, info, warn};
 
 use super::didl::{DidlBuilder, ProtocolStyle};
 use super::oh_events::{EventState, UpnpEventListener};
-use super::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, TransportState};
+use super::traits::{
+    OutputCapabilities, OutputStatus, OutputTarget, PlayMedia, SuivantePreparee, TransportState,
+};
 use crate::discovery::redecouverte::{self, UrlsDeControle};
 use crate::http::error as http_error;
 
@@ -2469,6 +2471,107 @@ impl OutputTarget for DlnaOutput {
         info!(device = %self.name, url = media.url, "dlna_set_next");
         Ok(())
     }
+
+    /// #3967 — ce que l'appareil dit LUI-MÊME de la suivante qu'on vient de
+    /// lui poser. Deux lectures, aucune écriture, une seule fois par piste
+    /// (à l'armement, ~30 s avant la fin) — rien sur le chemin chaud.
+    ///
+    /// Le journal de Villerio (#4382) montre l'exacte raison d'être de cette
+    /// fonction : `dlna_set_next` acquitté, flux armé TIRÉ par le renderer —
+    /// et malgré tout aucun enchaînement. L'acquittement ne prouvait rien ;
+    /// ces deux lectures-ci sont ce que le protocole permet de prouver.
+    async fn suivante_preparee(&self, url: &str) -> SuivantePreparee {
+        // 1. La suivante qu'il RETIENT. `GetMediaInfo` est obligatoire dans
+        //    AVTransport:1 ; un renderer qui n'y répond pas (#2749) reste
+        //    `Inconnue`, c'est-à-dire strictement la conduite d'avant.
+        let Ok(xml) = self
+            .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
+            .await
+        else {
+            debug!(device = %self.name, "dlna_suivante_get_media_info_muet");
+            return SuivantePreparee::Inconnue;
+        };
+        let Some(retenue) = extract_tag(&xml, "NextURI") else {
+            // Le champ n'est pas publié du tout : on ne conclut rien.
+            debug!(device = %self.name, "dlna_suivante_nexturi_non_publie");
+            return SuivantePreparee::Inconnue;
+        };
+        if !meme_url(&retenue, url) {
+            warn!(
+                device = %self.name,
+                posee = url,
+                retenue = %retenue.trim(),
+                "dlna_suivante_non_retenue"
+            );
+            return SuivantePreparee::Perdue;
+        }
+        // 2. Les actions qu'il DÉCLARE disponibles MAINTENANT. `Next` n'y
+        //    figure que s'il se sait capable d'avancer : c'est la seule
+        //    déclaration de capacité que la spécification met à notre portée
+        //    sans relire son descripteur de service.
+        let Ok(xml) = self
+            .av_action("GetCurrentTransportActions", "<InstanceID>0</InstanceID>")
+            .await
+        else {
+            debug!(device = %self.name, "dlna_suivante_actions_muettes");
+            return SuivantePreparee::Inconnue;
+        };
+        let Some(actions) = extract_tag(&xml, "Actions") else {
+            return SuivantePreparee::Inconnue;
+        };
+        if actions
+            .split(',')
+            .any(|a| a.trim().eq_ignore_ascii_case("Next"))
+        {
+            info!(
+                device = %self.name,
+                url,
+                actions = %actions.trim(),
+                "dlna_suivante_tenue"
+            );
+            SuivantePreparee::Tenue
+        } else {
+            // Il la retient mais ne déclare pas savoir y passer : le repli.
+            info!(
+                device = %self.name,
+                actions = %actions.trim(),
+                "dlna_suivante_retenue_sans_action_next"
+            );
+            SuivantePreparee::Inconnue
+        }
+    }
+
+    /// #3967 — `Next` : le renderer passe à la suivante qu'il tient DÉJÀ, avec
+    /// le tampon qu'il a déjà rempli. Ni `SetAVTransportURI`, ni `Play`, ni
+    /// session de flux détruite : c'est là que les secondes se gagnent.
+    async fn basculer_sur_la_suivante_preparee(&self) -> Result<(), String> {
+        let resp = self.av_action("Next", "<InstanceID>0</InstanceID>").await?;
+        if resp.contains("UPnPError") || resp.contains("<errorCode>") {
+            warn!(device = %self.name, response = %resp, "dlna_bascule_suivante_refusee");
+            return Err(format!("Next rejected: {resp}"));
+        }
+        info!(device = %self.name, "dlna_bascule_sur_la_suivante_preparee");
+        Ok(())
+    }
+}
+
+/// Deux URL désignent-elles la même ressource ? (#3967)
+///
+/// Le renderer nous rend la nôtre telle qu'il l'a rangée : entités XML
+/// éventuellement ré-encodées, espaces de bordure. On compare sur le texte
+/// dés-échappé, jamais sur une inclusion — « contient » rendrait `Tenue` un
+/// préfixe commun d'un tout autre flux.
+pub(super) fn meme_url(retenue: &str, posee: &str) -> bool {
+    fn nettoyer(u: &str) -> String {
+        u.trim()
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+    }
+    let retenue = nettoyer(retenue);
+    !retenue.is_empty() && retenue == nettoyer(posee)
 }
 
 impl DlnaOutput {
