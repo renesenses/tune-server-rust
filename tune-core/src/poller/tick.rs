@@ -459,6 +459,13 @@ impl PositionPoller {
                 ps.gapless_sent_at = None;
                 ps.gapless_cooldown = 0;
                 ps.stopped_ticks = 0;
+                // #4559 — la piste neuve a effacé les deux verdicts dans
+                // l'état de zone ; le client relit la zone sur
+                // `playback.started` et voit donc `None`. La référence de
+                // l'annonce repart du même point, faute de quoi le contrat
+                // republié à l'identique d'une piste à l'autre ne serait
+                // jamais annoncé.
+                ps.reprendre_le_contrat_a_zero();
                 ps.track_generation = zone_state.track_generation;
                 ps.tenue_etrangere_ticks = 0;
                 ps.tenue_signalee = false;
@@ -672,6 +679,22 @@ impl PositionPoller {
                         // flux peut entrer ou sortir du DoP d'une piste à
                         // l'autre sans changement d'état de zone (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
+                        // #4559 — LA sortie publie son contrat, ENCORE FAUT-IL
+                        // LE DIRE. Le verdict est relevé ici à chaque tour,
+                        // mais aucune charge utile poussée ne le porte : ni
+                        // l'évènement `playback.*` (il n'a pas ce champ), ni
+                        // l'instantané WebSocket (émis à la connexion, pas à
+                        // l'ouverture du périphérique). Les deux seules
+                        // surfaces qui portent `signal_path` sont des RÉPONSES,
+                        // et le client les a déjà lues — trop tôt, pendant que
+                        // le bras exclusif ouvrait encore le DAC. Sans cette
+                        // annonce, le panneau de Jean Valjean reste sur
+                        // « WASAPI (shared — Windows mixer) » jusqu'à ce qu'il
+                        // touche au volume.
+                        let contrat_a_change = ps.contrat_de_signal_a_change(
+                            signal_path.as_ref(),
+                            transformations.as_ref(),
+                        );
                         self.playback
                             .set_output_signal_path(zone_id, signal_path)
                             .await;
@@ -681,6 +704,22 @@ impl PositionPoller {
                         self.playback
                             .set_transformations_reelles(zone_id, transformations)
                             .await;
+                        if contrat_a_change {
+                            if let Some(ref bus) = self.event_bus {
+                                info!(
+                                    zone_id,
+                                    device = %device_id,
+                                    "contrat_de_signal_publie_annonce"
+                                );
+                                // `zone.updated` sans données inline : le
+                                // client relit toutes ses zones (branche de
+                                // repli des évènements `zone.*` d'App.svelte).
+                                // Même mécanique que #2280 pour
+                                // `levels_available` — pas de nouveau type
+                                // d'évènement, rien à changer côté web.
+                                bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                            }
+                        }
                         (s, famine)
                     }
                     Err(e) => {
