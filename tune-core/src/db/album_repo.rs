@@ -2344,6 +2344,60 @@ impl AlbumRepo {
             .collect())
     }
 
+    /// Le Dynamic Range des albums de la PAGE, en une requête groupée (#4521).
+    ///
+    /// La liste `GET /library/albums` triait et filtrait par DR sans jamais le
+    /// rendre : le client v2 ne voyait aucun album porteur et cachait son tri.
+    ///
+    /// La règle est celle de la fiche ([`Self::dynamic_range_detail`]), du tri
+    /// et de la tranche, AU CARACTÈRE PRÈS : [`crate::db::facet_filter::DR_ALBUM_VALUE`]
+    /// sous [`crate::db::facet_filter::dr_tag_where`] — tag d'album prioritaire,
+    /// sinon moyenne arrondie des `dr_track`, quel que soit leur producteur
+    /// (tag, analyse de Tune, rapport voisin : #3924). Recopiée, elle dériverait
+    /// et la liste afficherait un DR que la fiche contredit.
+    ///
+    /// Bornée aux identifiants déjà retenus, comme [`Self::added_at_by_ids`] :
+    /// jamais toute la bibliothèque, jamais une requête par album. Un album sans
+    /// DR est ABSENT de la table rendue — l'appelant le lit `null`, jamais `0`.
+    pub fn dynamic_range_by_ids(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, TuneError> {
+        let engine = self.db.engine();
+        let mut par_id = std::collections::HashMap::new();
+        for chunk in ids.chunks(5000) {
+            let id_list = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            // `tracks` d'ABORD (`CROSS JOIN`) : SQLite n'y réordonne pas les
+            // tables. Sans cela il partait de `idx_track_metadata_key` — TOUTES
+            // les lignes DR de la bibliothèque — pour n'en garder que la page :
+            // 42 ms pour 50 albums sur 20 000 (mesure #4521). Ici :
+            // `idx_tracks_album_id`, puis la clé primaire `(track_id, key)`.
+            // PostgreSQL traite ce `CROSS JOIN … WHERE` comme une jointure
+            // ordinaire et reste libre de son plan.
+            let sql = format!(
+                "SELECT tdr.album_id, {} \
+                   FROM tracks tdr CROSS JOIN track_metadata tm \
+                  WHERE tm.track_id = tdr.id AND tdr.album_id IN ({id_list}) AND {} \
+                  GROUP BY tdr.album_id",
+                crate::db::facet_filter::DR_ALBUM_VALUE,
+                crate::db::facet_filter::dr_tag_where(engine),
+            );
+            for row in &self.db.query_many(&sql, &[])? {
+                if let (Some(id), Some(dr)) = (
+                    row.first().and_then(|v| v.as_i64()),
+                    row.get(1).and_then(|v| v.as_i64()),
+                ) {
+                    par_id.insert(id, dr);
+                }
+            }
+        }
+        Ok(par_id)
+    }
+
     /// Module de l'arithmetique du tri aleatoire : 2^31 - 1, premier de
     /// Mersenne.
     ///
