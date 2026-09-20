@@ -838,6 +838,81 @@ fn contexte_de_lecture(body: &PlayRequest) -> (Option<String>, Option<String>, O
     (None, None, None)
 }
 
+/// La premiere piste reellement JOUABLE a partir de `depart`.
+///
+/// 🔴 Alex Campbell, 20/09/2026 — « I have a playlist on Qobuz that is 1000+
+/// songs and that seems to break my session, I don't hear audio. »
+///
+/// MESURE, en lecture seule sur le .18, `GET /streaming/qobuz/playlists/
+/// 70304708/tracks` (la playlist qu'Alex a donnee) : 1454 pistes rendues en
+/// 3,9 s, aucune troncature, aucun `source_id` manquant — mais **186 pistes
+/// (12 %) que Qobuz annonce INJOUABLES**, et la PREMIERE en fait partie :
+/// « Hallogallo » de NEU!, `source_id` 104123972. La troisieme aussi. La
+/// premiere piste jouable est a l'indice **1**.
+///
+/// Contre-epreuve sur la playlist qui, elle, ne casse rien — « Classic » de
+/// Bertrand (58698086), 1999 pistes : 31 injouables (1 %), et **les dix
+/// premieres sont jouables**. La taille n'est donc pas le depart du mal ;
+/// c'est le RANG de la premiere piste injouable.
+///
+/// `StreamTrack::disponible` existait deja — `qobuz.rs` le renseigne depuis
+/// `streamable` — mais RIEN ne le lisait : un balayage de `tune-core/src` et
+/// `tune-server/src` ne trouvait aucun lecteur hors de ses propres tests
+/// unitaires. Le gestionnaire prenait `tracks[start]` sans le consulter, la
+/// resolution Qobuz repondait « no url », et `play_inner` rendait `Err`
+/// (`play_resolution_failed`) — alors que la file de 1454 pistes etait DEJA
+/// ecrite et que `update_queue_info` avait deja annonce sa longueur.
+/// L'auditeur voit sa playlist chargee, la zone ne joue pas, et rien ne dit
+/// pourquoi : c'est mot pour mot « that seems to break my session ».
+///
+/// Le sondeur sait deja faire : `avancer_avec_reprises`
+/// (`tune-core/src/poller/fin_de_piste.rs`) enjambe les pistes qui echouent
+/// jusqu'a `MAX_CONSECUTIVE_SKIPS` et emet `playback.track_skipped`. C'est la
+/// MEME regle, appliquee au premier depart — a un detail pres qui est tout
+/// l'interet : ici le service a DEJA DIT que la piste est injouable, on n'a
+/// donc pas a le decouvrir par un aller-retour rate.
+///
+/// ⚠️ Reserve a ne pas escamoter : `streamable` est calcule par le compte
+/// Qobuz du serveur, avec sa region et son abonnement. La disponibilite vue
+/// depuis le compte d'un autre auditeur peut differer. Ce drapeau ne sert
+/// donc qu'a CHOISIR un meilleur point de depart, jamais a retirer une piste
+/// de la file : la file garde ses 1454 entrees, et une piste qu'on a eu tort
+/// d'enjamber reste atteignable a la main.
+///
+/// Seul `Some(false)` fait enjamber. `None` — le service ne dit rien — ne
+/// conclut pas, comme le veut la documentation de `disponible` : « seul
+/// `Some(false)` grise une ligne ».
+///
+/// Rend `None` quand AUCUNE piste n'est jouable a partir de `depart` : c'est
+/// un refus a DIRE, pas un silence a servir.
+fn premiere_piste_jouable(
+    tracks: &[tune_core::streaming::traits::StreamTrack],
+    depart: usize,
+) -> Option<usize> {
+    (depart..tracks.len()).find(|&i| tracks[i].disponible != Some(false))
+}
+
+/// Le refus rendu quand la demande ne porte sur AUCUNE piste jouable.
+///
+/// 422 et non 502 : la playlist a bien ete recuperee, le service a bien
+/// repondu. C'est une capacite absente — la meme famille que
+/// `format_not_playable` — et le code est stable pour que le client puisse
+/// composer sa propre phrase.
+fn refus_aucune_piste_jouable(depuis: usize, examinees: usize) -> axum::response::Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "error": "no_playable_track",
+            "message": format!(
+                "the service reports every one of the {examinees} track(s) from position {depuis} as unavailable"
+            ),
+            "from_index": depuis,
+            "examined": examinees,
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 struct SeekRequest {
     /// Signé pour ne pas changer le contrat de désérialisation ; le refus
@@ -1743,8 +1818,38 @@ async fn play(
             return (StatusCode::BAD_REQUEST, "album has no tracks").into_response();
         }
 
-        let start = body.start_index.unwrap_or(0) as usize;
-        let start = start.min(tracks.len() - 1);
+        let demande = body.start_index.unwrap_or(0) as usize;
+        let demande = demande.min(tracks.len() - 1);
+        // 🔴 Alex Campbell, 20/09/2026 — enjamber ce que le service annonce
+        // INJOUABLE, et le DIRE.
+        // Voir `premiere_piste_jouable` : la playlist d'Alex Campbell commence
+        // par une piste `streamable: false`, et le depart echouait donc alors
+        // que 1268 de ses 1454 pistes sont jouables.
+        let start = match premiere_piste_jouable(&tracks, demande) {
+            Some(i) => i,
+            None => return refus_aucune_piste_jouable(demande, tracks.len() - demande),
+        };
+        let enjambees = start - demande;
+        // Compte sur la file ENTIERE, pas seulement sur les pistes enjambees :
+        // c'est ce nombre-la qui dit a l'auditeur pourquoi son ecoute va
+        // trebucher plus loin, et il part dans la reponse.
+        let injouables = tracks
+            .iter()
+            .filter(|t| t.disponible == Some(false))
+            .count();
+        if enjambees > 0 {
+            warn!(
+                zone_id,
+                source = %source,
+                album_id = %album_id,
+                demande,
+                retenue = start,
+                enjambees,
+                injouables,
+                total = tracks.len(),
+                "depart_injouable_enjambe"
+            );
+        }
         let first = &tracks[start];
 
         let output_device_id = body.output_device_id.clone().or_else(|| {
@@ -1814,7 +1919,16 @@ async fn play(
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
                 persist_queue_async(&state, zone_id);
-                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
+                // DIRE ce qui a ete enjambe. Une piste indisponible passee sous
+                // silence est exactement ce qui fait croire a une panne : Alex
+                // n'a eu ni son ni message. Les deux champs sont ADDITIFS — un
+                // client deploye qui les ignore lit la reponse comme avant.
+                let mut zone = build_zone_json_with_result(&state, zone_id, &result).await;
+                if let Some(o) = zone.as_object_mut() {
+                    o.insert("unavailable_skipped".into(), json!(enjambees));
+                    o.insert("unavailable_in_queue".into(), json!(injouables));
+                }
+                Json(zone).into_response()
             }
             Err(e) => play_error_response(e, &lang).into_response(),
         };
@@ -1845,8 +1959,38 @@ async fn play(
             return (StatusCode::BAD_REQUEST, "playlist has no tracks").into_response();
         }
 
-        let start = body.start_index.unwrap_or(0) as usize;
-        let start = start.min(tracks.len() - 1);
+        let demande = body.start_index.unwrap_or(0) as usize;
+        let demande = demande.min(tracks.len() - 1);
+        // 🔴 Alex Campbell, 20/09/2026 — enjamber ce que le service annonce
+        // INJOUABLE, et le DIRE.
+        // Voir `premiere_piste_jouable` : la playlist d'Alex Campbell commence
+        // par une piste `streamable: false`, et le depart echouait donc alors
+        // que 1268 de ses 1454 pistes sont jouables.
+        let start = match premiere_piste_jouable(&tracks, demande) {
+            Some(i) => i,
+            None => return refus_aucune_piste_jouable(demande, tracks.len() - demande),
+        };
+        let enjambees = start - demande;
+        // Compte sur la file ENTIERE, pas seulement sur les pistes enjambees :
+        // c'est ce nombre-la qui dit a l'auditeur pourquoi son ecoute va
+        // trebucher plus loin, et il part dans la reponse.
+        let injouables = tracks
+            .iter()
+            .filter(|t| t.disponible == Some(false))
+            .count();
+        if enjambees > 0 {
+            warn!(
+                zone_id,
+                source = %source,
+                playlist_id = %playlist_id,
+                demande,
+                retenue = start,
+                enjambees,
+                injouables,
+                total = tracks.len(),
+                "depart_injouable_enjambe"
+            );
+        }
         let first = &tracks[start];
 
         let output_device_id = body.output_device_id.clone().or_else(|| {
@@ -1916,7 +2060,16 @@ async fn play(
                     .update_queue_info(zone_id, start as i64, tracks.len() as i64)
                     .await;
                 persist_queue_async(&state, zone_id);
-                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
+                // DIRE ce qui a ete enjambe. Une piste indisponible passee sous
+                // silence est exactement ce qui fait croire a une panne : Alex
+                // n'a eu ni son ni message. Les deux champs sont ADDITIFS — un
+                // client deploye qui les ignore lit la reponse comme avant.
+                let mut zone = build_zone_json_with_result(&state, zone_id, &result).await;
+                if let Some(o) = zone.as_object_mut() {
+                    o.insert("unavailable_skipped".into(), json!(enjambees));
+                    o.insert("unavailable_in_queue".into(), json!(injouables));
+                }
+                Json(zone).into_response()
             }
             Err(e) => play_error_response(e, &lang).into_response(),
         };
@@ -7321,6 +7474,188 @@ mod tests_qualite_streaming {
                 r#"{"max_sample_rate":96000,"max_bit_depth":24,"prefer_hires":true}"#
             )),
             StreamingQualityPreference::Max
+        );
+    }
+}
+
+/// Le depart d'une playlist de service doit etre une piste que le service dit
+/// JOUABLE (Alex Campbell, 20/09/2026). Voir `premiere_piste_jouable` pour la
+/// mesure qui l'etablit.
+#[cfg(test)]
+mod tests_depart_jouable {
+    use super::premiere_piste_jouable;
+    use tune_core::streaming::traits::StreamTrack;
+
+    // ------------------------------------------------------------------
+    // 🔴 « I don't hear audio » sur une playlist Qobuz de 1000+ titres
+    // (Alex Campbell, 20/09/2026).
+    //
+    // Les fixtures ci-dessous ne sont pas inventees : ce sont les douze
+    // premieres pistes REELLES des deux playlists, relevees en lecture seule
+    // sur le .18 le 20/09/2026, avec le drapeau `streamable` que Qobuz rend.
+    // ------------------------------------------------------------------
+
+    fn piste_dispo(id: &str, titre: &str, disponible: Option<bool>) -> StreamTrack {
+        StreamTrack {
+            id: id.to_string(),
+            title: titre.to_string(),
+            artist: String::new(),
+            album: None,
+            album_id: None,
+            duration_ms: 0,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            disponible,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    fn en_pistes(brut: &[(&str, &str, Option<bool>)]) -> Vec<StreamTrack> {
+        brut.iter()
+            .map(|(id, titre, d)| piste_dispo(id, titre, *d))
+            .collect()
+    }
+
+    /// Les DOUZE premieres de la playlist d'Alex — Qobuz 70304708, 1454
+    /// pistes, 186 injouables (12 %).
+    fn tete_playlist_alex() -> Vec<StreamTrack> {
+        en_pistes(&[
+            ("104123972", "Hallogallo", Some(false)),    // NEU!
+            ("20778258", "Dan Té Dinyé La", Some(true)), // Nahawa Doumbia
+            ("42460014", "In Dreams", Some(false)),      // Tomemitsu
+            ("34218865", "Program", Some(true)),         // Silver Apples
+            ("3879108", "I Heard It Through The Grapevine", Some(true)), // The Slits
+            ("318016611", "Carmensita", Some(true)),     // Devendra Banhart
+            ("53113575", "Eye", Some(true)),             // The Smashing Pumpkins
+            ("2524672", "Heaps Of Sheeps", Some(true)),  // Robert Wyatt
+            ("105959284", "Mother of Earth", Some(true)), // Gun Club
+            ("356291", "Redondo Beach", Some(true)),     // PATTI SMITH
+            ("173127883", "Love Is Not Love", Some(true)), // Cate le Bon
+            ("4395601", "The True Wheel", Some(true)),   // Brian Eno
+        ])
+    }
+
+    /// Les douze premieres de « Classic » — Qobuz 58698086, 1999 pistes, 31
+    /// injouables (1,6 %), la premiere au rang **54**.
+    fn tete_playlist_classic() -> Vec<StreamTrack> {
+        en_pistes(&[
+            ("45107037", "Abacab", Some(true)),
+            ("45107038", "No Reply at All", Some(true)),
+            ("45107039", "Me and Sarah Jane", Some(true)),
+            ("45107040", "Keep It Dark", Some(true)),
+            ("45107041", "Dodo / Lurker", Some(true)),
+            ("45107042", "Who Dunnit?", Some(true)),
+            ("45107043", "Man on the Corner", Some(true)),
+            ("45107044", "Like It or Not", Some(true)),
+            ("45107045", "Another Record", Some(true)),
+            ("83593", "Wake Up", Some(true)),
+            ("83594", "X-Ray Mind", Some(true)),
+            ("83595", "River Of Deceit", Some(true)),
+        ])
+    }
+
+    /// LE TEMOIN. La playlist d'Alex commence par une piste que Qobuz annonce
+    /// injouable : le depart ne peut pas etre l'indice 0.
+    ///
+    /// AVANT le correctif, le gestionnaire prenait `tracks[start]` sans
+    /// regarder `disponible` : il partait sur « Hallogallo », Qobuz repondait
+    /// « no url », `play_inner` rendait `Err` — file de 1454 pistes deja
+    /// ecrite, zone muette, aucun message.
+    #[test]
+    fn le_depart_enjambe_la_premiere_piste_injouable_dalex() {
+        let tracks = tete_playlist_alex();
+
+        // Ce que le service DIT, et que personne ne lisait.
+        assert_eq!(
+            tracks[0].disponible,
+            Some(false),
+            "« Hallogallo » (NEU!, source_id 104123972) est la premiere piste \
+             de la playlist 70304708 et Qobuz l'annonce injouable — c'est la \
+             mesure du 20/09/2026 sur le .18, pas une hypothese."
+        );
+
+        let retenue = premiere_piste_jouable(&tracks, 0)
+            .expect("1268 des 1454 pistes sont jouables : il y a un depart");
+        assert_eq!(
+            retenue, 1,
+            "la premiere piste jouable est « Dan Té Dinyé La » (indice 1). \
+             Rendre 0 est le defaut d'origine : partir sur une piste dont on \
+             SAIT qu'elle ne peut pas sortir."
+        );
+        assert_eq!(tracks[retenue].id, "20778258");
+    }
+
+    /// La troisieme aussi est injouable : un auditeur qui clique DIRECTEMENT
+    /// dessus doit lui aussi etre porte plus loin, pas laisse dans le silence.
+    #[test]
+    fn un_clic_direct_sur_une_piste_injouable_avance_aussi() {
+        let tracks = tete_playlist_alex();
+        assert_eq!(tracks[2].disponible, Some(false), "« In Dreams »");
+        assert_eq!(
+            premiere_piste_jouable(&tracks, 2),
+            Some(3),
+            "depuis l'indice 2, le premier depart tenable est le 3"
+        );
+    }
+
+    /// CONTRE-EPREUVE — la playlist qui, elle, ne casse rien.
+    ///
+    /// « Classic » est PLUS GROSSE (1999 pistes contre 1454) et le depart y
+    /// est intact. La taille n'est donc pas le depart du mal : c'est le RANG
+    /// de la premiere piste injouable. Sans ce test, « playlist de 1000+
+    /// titres » resterait une cause plausible et fausse.
+    #[test]
+    fn la_playlist_temoin_plus_grosse_part_a_son_premier_rang() {
+        let tracks = tete_playlist_classic();
+        assert_eq!(
+            premiere_piste_jouable(&tracks, 0),
+            Some(0),
+            "les dix premieres de « Classic » sont jouables (mesure du \
+             20/09) : le correctif ne doit RIEN deplacer ici"
+        );
+    }
+
+    /// `None` ne conclut pas. Les services qui ne disent rien — Tidal,
+    /// Deezer, Spotify, YouTube posent tous `disponible: None` — ne doivent
+    /// subir AUCUN saut, sinon le correctif casserait quatre services pour en
+    /// reparer un.
+    #[test]
+    fn le_service_muet_ne_fait_enjamber_personne() {
+        let tracks = en_pistes(&[("a", "A", None), ("b", "B", None)]);
+        assert_eq!(
+            premiere_piste_jouable(&tracks, 0),
+            Some(0),
+            "seul Some(false) fait enjamber — c'est la regle que porte deja \
+             la documentation de StreamTrack::disponible"
+        );
+    }
+
+    /// Tout injouable = un refus a DIRE. Rendre `None` fait repondre 422
+    /// `no_playable_track` au lieu de laisser la zone muette.
+    #[test]
+    fn aucune_piste_jouable_se_dit_au_lieu_de_se_taire() {
+        let tracks = en_pistes(&[("a", "A", Some(false)), ("b", "B", Some(false))]);
+        assert_eq!(premiere_piste_jouable(&tracks, 0), None);
+    }
+
+    /// La file GARDE ses pistes injouables : `disponible` est calcule avec le
+    /// compte Qobuz du serveur, et la disponibilite vue par un autre auditeur
+    /// peut differer. Le drapeau choisit un DEPART, il ne filtre pas la file.
+    #[test]
+    fn le_drapeau_choisit_un_depart_il_ne_retire_rien() {
+        let tracks = tete_playlist_alex();
+        let avant = tracks.len();
+        let _ = premiere_piste_jouable(&tracks, 0);
+        assert_eq!(
+            tracks.len(),
+            avant,
+            "12 entrees entrent, 12 entrees restent : la piste enjambee \
+             demeure atteignable a la main"
         );
     }
 }
