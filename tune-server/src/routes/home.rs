@@ -1929,21 +1929,10 @@ async fn new_in_library(
     Query(p): Query<HomeParams>,
 ) -> Result<Json<Value>, AppError> {
     let limit = p.limit.unwrap_or(30);
-    let engine = state.backend.engine();
-    let p1 = ph(engine, 1);
-    // MAX(file_mtime) dates an album by its most recently imported track, so a
-    // record whose files arrived together stays together in the ordering.
-    let sql = format!(
-        "SELECT al.id, al.title, al.artist_id, ar.name, al.cover_path, al.source, \
-                MAX(t.file_mtime) AS newest \
-        FROM tracks t \
-        JOIN albums al ON t.album_id = al.id \
-        LEFT JOIN artists ar ON al.artist_id = ar.id \
-        WHERE t.file_mtime IS NOT NULL \
-        GROUP BY al.id, al.title, al.artist_id, ar.name, al.cover_path, al.source \
-        ORDER BY newest DESC \
-        LIMIT {p1}"
-    );
+    // Date d'AJOUT (premiere vue, repli mtime), pas `MAX(file_mtime)` : une
+    // retouche d'etiquettes ne fait plus passer un album pour une nouveaute
+    // (#4546).
+    let sql = home_queries::nouveautes(state.backend.engine());
     let params: [&dyn ToSqlValue; 1] = [&limit];
     let items: Vec<Value> = state
         .backend
@@ -1958,6 +1947,8 @@ async fn new_in_library(
                 "artist_name": cols.get(3).and_then(|v| v.as_string()),
                 "cover_path": cols.get(4).and_then(|v| v.as_string()),
                 "source": cols.get(5).and_then(|v| v.as_string()),
+                // Nom garde pour les clients deployes ; la valeur est la date
+                // d'ajout (#4546).
                 "file_mtime": cols.get(6).and_then(|v| v.as_f64()),
             })
         })
