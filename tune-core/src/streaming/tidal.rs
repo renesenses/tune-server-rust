@@ -793,7 +793,10 @@ impl TidalService {
     ///
     /// `None` quand l'enveloppe ne contient pas d'objet : c'est déjà ce que
     /// faisaient les trois lecteurs typés (`filter_map`).
-    fn favori_date(enveloppe: &serde_json::Value, fav_type: &str) -> Option<serde_json::Value> {
+    pub(crate) fn favori_date(
+        enveloppe: &serde_json::Value,
+        fav_type: &str,
+    ) -> Option<serde_json::Value> {
         let brut = enveloppe.get("item")?;
         let mut element = match fav_type {
             "tracks" => serde_json::to_value(Self::map_track(brut)),
