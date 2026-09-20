@@ -112,6 +112,12 @@ async fn faux_forum() -> FauxForum {
         ),
     );
 
+    // 🔴 Le plafond de corps PAR DÉFAUT d'axum est de 2 Mio : sans cette
+    // couche, le faux service rendait 413 sur une capture de 4 Mio — pourtant
+    // DANS les bornes — et la contre-épreuve tombait pour une raison qui
+    // n'appartenait qu'au banc. C'est elle qui l'a montré.
+    let app = app.layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
