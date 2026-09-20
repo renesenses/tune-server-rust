@@ -208,6 +208,46 @@ JSON
 jouer grace
 verifier "etat de sortie 0 (delai de grace non echu)" "0" "$ETAT"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Le faux vert que le fil groupe du moissonneur fabriquerait.
+#
+# « Moissonneur Roon v0.9.160 a v0.9.161 — Notes de version » contient
+# « 0.9.160 » et « 0.9.161 » avec les bornes qu'`annoncee()` exige : le « v »
+# qui precede n'est ni un chiffre ni un point. Sans le retrait des fils du
+# moissonneur, ce SEUL fil vaudrait annonce pour deux versions du SERVEUR qui
+# n'en ont aucune. Ici, la sonde doit accuser les deux.
+# ─────────────────────────────────────────────────────────────────────────────
+echo
+echo "4. un fil du moissonneur nomme v0.9.160 et v0.9.161 — il n'annonce pas Tune"
+poser_decor fauxvert <<'JSON'
+[
+ {"tagName":"v0.9.161","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:45:00Z"},
+ {"tagName":"v0.9.160","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-20T15:40:00Z"},
+ {"tagName":"v0.9.155","isDraft":false,"isPrerelease":false,"publishedAt":"2026-09-18T13:59:41Z"}
+]
+JSON
+# Le fil du moissonneur s'ajoute au decor commun, sans rien en retirer.
+python3 - "$RACINE/fauxvert/fils.json" <<'PY'
+import json, sys
+chemin = sys.argv[1]
+with open(chemin, encoding="utf-8") as f:
+    d = json.load(f)
+d["threads"].insert(0, {
+    "title": "Moissonneur Roon v0.9.160 a v0.9.161 — Notes de version",
+    "type": "release",
+    "created_at": "2026-09-20T16:00:00+00:00",
+    "is_pinned": False,
+})
+with open(chemin, "w", encoding="utf-8") as f:
+    json.dump(d, f)
+PY
+jouer fauxvert
+verifier "etat de sortie 1 (deux versions de Tune sans fil)" "1" "$ETAT"
+for v in 160 161; do
+  N=$(printf '%s' "$SORTIE" | grep -c "^| \`v0\.9\.$v\` |")
+  verifier "la v0.9.$v est accusee malgre le fil du moissonneur" "1" "$N"
+done
+
 echo
 if [ "$rate" -eq 0 ]; then
   echo "Contre-epreuve #4461 : tout est vert."

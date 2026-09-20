@@ -119,6 +119,19 @@ with open(os.environ["MANQ_FILS"], encoding="utf-8") as f:
 tous = fils.get("threads", [])
 titres = [t.get("title") or "" for t in tous if t.get("type") == "release"]
 
+# Symetrique du filtre pose sur les tags (#4461) : un fil du MOISSONNEUR
+# n'annonce pas une version de Tune, et doit etre retire d'ici avant tout
+# rapprochement.
+#
+# Sans ce retrait, le fil groupe « Moissonneur Roon v0.9.155 a v0.9.159 — Notes
+# de version » vaudrait annonce pour les versions v0.9.155 ET v0.9.159 DU
+# SERVEUR : il contient « 0.9.155 » et « 0.9.159 », precedes d'un « v » qui
+# n'est ni un chiffre ni un point, donc avec les bornes que `annoncee()`
+# exige. La sonde se tairait sur deux versions de Tune reellement non
+# annoncees — un vert qui ne garde rien, et le pire des deux erreurs
+# possibles ici.
+titres = [t for t in titres if not re.search(r"moissonneur", t, re.IGNORECASE)]
+
 # Jusqu'ou cette page voit-elle ?
 #
 # L'API rend une page, pas l'histoire. Au-dela de son fil non epingle le plus
