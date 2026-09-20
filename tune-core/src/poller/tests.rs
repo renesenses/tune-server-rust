@@ -2000,3 +2000,114 @@ fn gapless_stuck_cleared_on_playing() {
     assert!(!ps.gapless_advance_pending);
     assert_eq!(ps.gapless_stuck_ticks, 0);
 }
+
+// ── #4623 — une sortie non temps réel qui n'a jamais démarré ──────────────
+//
+// Le défaut mesuré : la file défilait d'une piste toutes les cinq secondes,
+// 4 pistes perdues sur 5, sans une ligne au journal. `renderer_could_have_
+// finished` rendait `true` parce qu'une sortie qui tire elle-même son flux
+// n'a pas de session de streaming — `total_bytes: None`, première branche,
+// verdict rendu sans rien avoir vérifié.
+
+#[test]
+fn sortie_autonome_sans_octet_ni_position_na_pas_demarre() {
+    // Le cas mesuré : greffon hors temps réel, Tune ne sert pas le flux,
+    // la capture n'a pas commencé.
+    assert!(
+        decisions::sortie_autonome_jamais_demarree(false, false, 0, Some(0)),
+        "0 octet traité et position 0 : la sortie n'a pas démarré, ce n'est pas une fin"
+    );
+    // `None` = la sortie n'a rien ouvert du tout, ou ne sait pas mesurer.
+    // Elle n'apporte aucune preuve de démarrage, et la position ne la
+    // contredit pas.
+    assert!(
+        decisions::sortie_autonome_jamais_demarree(false, false, 0, None),
+        "aucune mesure disponible et position 0 : toujours aucune preuve de démarrage"
+    );
+}
+
+#[test]
+fn un_seul_octet_ou_une_seule_position_suffit_a_prouver_le_demarrage() {
+    // Le veto doit rester étroit : une sortie hors temps réel qui boucle une
+    // piste de cinq minutes en deux secondes est son mode de marche NORMAL
+    // (cf. `natural_end`). Le correctif ne doit pas le casser.
+    assert!(
+        !decisions::sortie_autonome_jamais_demarree(false, false, 0, Some(1)),
+        "un octet traité prouve le démarrage"
+    );
+    assert!(
+        !decisions::sortie_autonome_jamais_demarree(false, false, 1, Some(0)),
+        "une position non nulle prouve le démarrage"
+    );
+}
+
+#[test]
+fn le_veto_ne_mord_ni_sur_le_temps_reel_ni_quand_tune_sert_le_flux() {
+    // Une sortie temps réel garde ses propres garde-fous d'horloge murale.
+    assert!(
+        !decisions::sortie_autonome_jamais_demarree(true, false, 0, Some(0)),
+        "sortie temps réel : hors périmètre"
+    );
+    // Quand Tune sert le flux, `renderer_could_have_finished` a un vrai
+    // total d'octets à opposer : ce chemin-là n'a pas besoin du veto et ne
+    // doit pas être perturbé.
+    assert!(
+        !decisions::sortie_autonome_jamais_demarree(false, true, 0, Some(0)),
+        "Tune sert le flux : les octets servis tranchent déjà"
+    );
+}
+
+#[test]
+fn le_veto_est_ce_qui_manquait_au_garde_fou_des_octets_servis() {
+    // La démonstration du défaut, en une ligne : sans session de streaming,
+    // le garde-fou existant laisse passer une sortie qui n'a rien produit.
+    let sent = 0;
+    let total = None; // pas de stream_id : la sortie tire elle-même
+    let seeked = false;
+    assert!(
+        decisions::renderer_could_have_finished(sent, total, seeked),
+        "c'est le trou : `None => true`, la fin est déclarée sans preuve"
+    );
+    // Le veto est précisément ce qui le referme, sans toucher à ce garde-fou
+    // (dont le `None => true` reste juste pour la radio et les flux décodés).
+    assert!(decisions::sortie_autonome_jamais_demarree(
+        false,
+        total.is_some(),
+        0,
+        Some(0)
+    ));
+}
+
+#[test]
+fn une_sortie_autonome_jamais_demarree_ne_voit_pas_sa_fin_acceptee() {
+    // LE témoin du correctif #4623 : la décision COMPOSÉE, telle que le
+    // poller la lit. Le cas mesuré en production — sortie hors temps réel,
+    // pas de session de streaming (`total_bytes: None`), position 0, aucun
+    // octet traité — était accepté comme une fin naturelle et la piste
+    // partait sans avoir commencé.
+    assert!(
+        !decisions::accepter_fin_apres_stopped(
+            false,   // realtime : non
+            false,   // Tune sert le flux : non, la sortie le tire elle-même
+            0,       // position jamais sortie de zéro
+            Some(0), // aucun octet traité
+            0,       // aucun octet servi par Tune
+            None,    // et aucun total connu — la porte ouverte
+            false,   // pas de saut
+        ),
+        "une sortie qui n'a produit aucun octet n'a pas fini sa piste : elle ne l'a jamais commencée"
+    );
+
+    // Et la contre-partie : dès qu'elle a démarré, la fin passe comme avant.
+    assert!(
+        decisions::accepter_fin_apres_stopped(false, false, 0, Some(1), 0, None, false),
+        "un octet traité suffit : le veto ne doit pas retenir une vraie fin"
+    );
+
+    // Les chemins historiques ne bougent pas : Tune sert le flux et a servi
+    // la totalité des octets.
+    assert!(
+        decisions::accepter_fin_apres_stopped(true, true, 180_000, None, 1_000, Some(1_000), false),
+        "chemin renderer classique : inchangé"
+    );
+}
