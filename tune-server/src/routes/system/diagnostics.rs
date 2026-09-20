@@ -138,6 +138,27 @@ fn periode_couverte(extrait: &str) -> Option<String> {
 /// `/api/v1/community/*` family as the DAC-profile / covers endpoints.
 const BUG_REPORT_SUBMIT_URL: &str = "https://mozaiklabs.fr/api/v1/community/bug-report";
 
+/// Racine du service communautaire, `mozaiklabs.fr` sauf réglage contraire.
+///
+/// Le réglage `mozaik_base_url` existe déjà et sert le même office pour l'API
+/// support (`routes/support.rs::base_url`) : on le RÉUTILISE plutôt que d'en
+/// inventer un second. Sans lui, le contrat sortant de #4564 — les captures
+/// posées sous `images[]` — ne serait éprouvé par personne : un `const` en dur
+/// ne se remplace pas dans un banc, et une garde qui n'observe pas les octets
+/// qui sortent ne garde rien.
+fn bug_report_url(state: &AppState) -> String {
+    let base = SettingsRepo::with_backend(state.backend.clone())
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    match base {
+        Some(base) => format!("{base}/api/v1/community/bug-report"),
+        None => BUG_REPORT_SUBMIT_URL.to_string(),
+    }
+}
+
 /// The community endpoint caps the thread body at 50k chars; keep headroom.
 const BUG_REPORT_MAX_BODY_CHARS: usize = 49_000;
 
@@ -2481,6 +2502,138 @@ pub(super) struct BugReportSubmitBody {
     description: String,
 }
 
+// ---------------------------------------------------------------------------
+// #4564 — les captures du signalement forum
+// ---------------------------------------------------------------------------
+
+/// Au plus trois captures. Le point d'entrée communautaire est OUVERT (aucun
+/// jeton, `throttle:5,60` côté site) : la borne n'est pas cosmétique.
+const BUG_REPORT_MAX_IMAGES: usize = 3;
+
+/// 4 Mio par capture — exactement le plafond de l'éditeur du forum
+/// (`ThreadController::uploadImage`, `image|max:4096`), lui qui exige pourtant
+/// une session authentifiée.
+const BUG_REPORT_MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Des IMAGES, et rien d'autre.
+///
+/// Ce n'est pas une prudence de principe : les captures sont posées **en ligne**
+/// dans le corps du fil, en `<img>`. Un `.log` ou un `.zip` n'y a aucune forme
+/// d'existence — la table `forum_attachments` a été SUPPRIMÉE côté site
+/// (migration `2026_03_07_100001`). Accepter un journal ici reviendrait à le
+/// ranger sur le disque sans que rien ne le montre jamais.
+const BUG_REPORT_IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
+
+/// Une capture reçue du navigateur, déjà bornée.
+struct CaptureJointe {
+    file_name: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+fn extension_de(nom: &str) -> String {
+    nom.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn mime_image(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
+/// 400 avec un code machine ET une phrase lisible : c'est elle que l'écran
+/// montre au testeur. Un refus muet le renverrait ouvrir un second fil à la
+/// main — précisément ce que #4564 supprime.
+fn refus_de_capture(code: &str, message: &str) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": code, "message": message })),
+    )
+        .into_response()
+}
+
+/// Lit le `multipart/form-data` du signalement : la `description`, et les
+/// captures sous `images[]`.
+///
+/// Nombre, taille et type sont vérifiés **ici**, avant tout relais, pour que le
+/// refus soit une phrase et non un 422 amont. Le nombre et le type sont jugés
+/// AVANT de bufferiser l'octet : un envoi hors bornes ne coûte pas sa taille en
+/// mémoire.
+async fn lire_captures(
+    mut multipart: axum::extract::Multipart,
+) -> Result<(String, Vec<CaptureJointe>), axum::response::Response> {
+    let mut description = String::new();
+    let mut images: Vec<CaptureJointe> = Vec::new();
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return Err(refus_de_capture("invalid_multipart", &e.to_string())),
+        };
+
+        let name = field.name().unwrap_or("").to_string();
+        let file_name = field.file_name().map(str::to_string);
+        let declared_ct = field.content_type().map(str::to_string);
+
+        match file_name {
+            Some(fname) if !fname.is_empty() => {
+                if images.len() >= BUG_REPORT_MAX_IMAGES {
+                    return Err(refus_de_capture(
+                        "too_many_images",
+                        &format!("Trop de captures : {BUG_REPORT_MAX_IMAGES} images au maximum."),
+                    ));
+                }
+                let ext = extension_de(&fname);
+                if !BUG_REPORT_IMAGE_EXT.contains(&ext.as_str()) {
+                    return Err(refus_de_capture(
+                        "image_type",
+                        &format!(
+                            "« {fname} » n'est pas une image. Formats acceptés : {}.",
+                            BUG_REPORT_IMAGE_EXT.join(", ")
+                        ),
+                    ));
+                }
+                let bytes = match field.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => return Err(refus_de_capture("image_read", &e.to_string())),
+                };
+                if bytes.len() > BUG_REPORT_MAX_IMAGE_BYTES {
+                    return Err(refus_de_capture(
+                        "image_too_large",
+                        &format!(
+                            "« {fname} » dépasse {} Mo.",
+                            BUG_REPORT_MAX_IMAGE_BYTES / (1024 * 1024)
+                        ),
+                    ));
+                }
+                images.push(CaptureJointe {
+                    content_type: declared_ct.unwrap_or_else(|| mime_image(&ext).to_string()),
+                    file_name: fname,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            _ => {
+                let value = match field.text().await {
+                    Ok(v) => v,
+                    Err(e) => return Err(refus_de_capture("invalid_field", &e.to_string())),
+                };
+                if name == "description" {
+                    description = value;
+                }
+            }
+        }
+    }
+
+    Ok((description, images))
+}
+
 /// POST /system/bug-report/submit — build the local bug report (diagnostics +
 /// recent logs), prepend the user's free-text description, and forward it to the
 /// mozaiklabs.fr community bug endpoint, which creates a *moderated* (pending)
@@ -2488,22 +2641,87 @@ pub(super) struct BugReportSubmitBody {
 /// server-to-server (this Rust process, not the browser) so it dodges the cloud's
 /// CORS origin allow-list and can attach the instance id / version / OS the
 /// browser doesn't have. The distributed server never holds a forum admin token.
+///
+/// # #4564 — les captures
+///
+/// Un seul point d'entrée, deux formats, choisis d'après le `Content-Type`
+/// entrant — même patron que `routes/support.rs` et que `/import/roon` :
+/// `application/json` (chemin historique, sans capture) ou
+/// `multipart/form-data` avec `images[]`.
+///
+/// **Ce que le forum accepte réellement — vérifié dans `site-mozaiklabs` avant
+/// d'écrire ce contrat, et non supposé.** `BugReportController::store` ne
+/// validait que `{title?, body, os?, version?, instance_id?}` : une clé inconnue
+/// est jetée en silence par `validate()`. La voie voisine du même écran, le
+/// ticket de support, accepte bien `attachments[]` — mais c'est une AUTRE chaîne
+/// (`SupportTicketController`, authentifiée premium, avec un modèle
+/// `SupportAttachment`). Un fil de forum, lui, n'a plus de pièces jointes du
+/// tout : la table `forum_attachments` a été supprimée (migration
+/// `2026_03_07_100001`) et un fil porte ses images EN LIGNE, déposées par
+/// `ThreadController::uploadImage` — qui exige une session authentifiée, donc
+/// inatteignable depuis ce relais serveur-à-serveur sans jeton.
+///
+/// Le champ s'appelle donc `images[]` et non `attachments[]`, et le point
+/// d'entrée communautaire a été étendu pour l'accepter (PR site-mozaiklabs
+/// jumelle). Sans elle, ce code enverrait des fichiers que le site jetterait
+/// sans le dire.
 pub(super) async fn submit_bug_report(
     State(state): State<AppState>,
-    Json(body): Json<BugReportSubmitBody>,
-) -> (axum::http::StatusCode, Json<Value>) {
+    req: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::RequestExt;
+    use axum::response::IntoResponse;
+
+    let est_multipart = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.starts_with("multipart/form-data"));
+
+    let (description, images) = if est_multipart {
+        let multipart = match req.extract::<axum::extract::Multipart, _>().await {
+            Ok(m) => m,
+            Err(rej) => return rej.into_response(),
+        };
+        match lire_captures(multipart).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    } else {
+        match req.extract::<Json<BugReportSubmitBody>, _>().await {
+            Ok(Json(b)) => (b.description, Vec::new()),
+            Err(rej) => return rej.into_response(),
+        }
+    };
+
+    let (code, corps) = envoyer_le_rapport(state, description, images).await;
+    (code, Json(corps)).into_response()
+}
+
+/// Le corps du signalement, une fois le format d'entrée résolu.
+///
+/// Séparé du handler pour une raison : c'est ici que vit tout ce qui était déjà
+/// éprouvé — composition du fil, titre, troncature à 50 000 caractères,
+/// identifiant d'instance —, et les captures ne devaient RIEN y changer d'autre
+/// que le transport.
+async fn envoyer_le_rapport(
+    state: AppState,
+    description: String,
+    images: Vec<CaptureJointe>,
+) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
 
-    let description = body.description.trim().to_string();
+    let description = description.trim().to_string();
 
     // Build the diagnostics + logs report (same content as the preview/markdown).
     let backend = state.backend.clone();
+    let url = bug_report_url(&state);
     let Json(report) = generate_bug_report(State(state)).await;
     let report_md = report["markdown"].as_str().unwrap_or("").to_string();
     if report_md.trim().is_empty() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "empty bug report" })),
+            json!({ "error": "empty bug report" }),
         );
     }
 
@@ -2543,14 +2761,15 @@ pub(super) async fn submit_bug_report(
         .flatten()
         .unwrap_or_default();
 
-    // Contract of the community bug-report endpoint: { title?, body, os?, version?, instance_id? }.
-    let payload = json!({
-        "title": title,
-        "body": body_md,
-        "os": platform,
-        "version": version,
-        "instance_id": instance_id,
-    });
+    // Contract of the community bug-report endpoint: { title?, body, os?,
+    // version?, instance_id? } — plus `images[]` depuis #4564.
+    let champs: [(&str, String); 5] = [
+        ("title", title),
+        ("body", body_md),
+        ("os", platform.to_string()),
+        ("version", version.to_string()),
+        ("instance_id", instance_id),
+    ];
 
     let client = match tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -2560,43 +2779,98 @@ pub(super) async fn submit_bug_report(
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("http client: {e}") })),
+                json!({ "error": format!("http client: {e}") }),
             );
         }
     };
 
-    match client
-        .post(BUG_REPORT_SUBMIT_URL)
-        .json(&payload)
-        .send()
-        .await
-    {
+    // Sans capture, le fil part EXACTEMENT comme avant : un corps JSON. #4564
+    // n'ajoute un multipart que lorsqu'il y a quelque chose à transporter — un
+    // serveur qui ne joint rien ne change donc rien à ce qu'il émettait.
+    let nb_images = images.len();
+    // `Accept: application/json`, et ce n'est pas décoratif : sans lui, Laravel
+    // répond à un refus de validation par une REDIRECTION 302 vers la page
+    // précédente au lieu d'un 422. `reqwest` la suit, tombe sur une page HTML
+    // en 200, et le refus se lirait « envoyé » — le testeur croirait sa capture
+    // partie. Mesuré sur le banc Pest de la PR jumelle `site-mozaiklabs`.
+    let requete = if images.is_empty() {
+        let payload: serde_json::Map<String, Value> = champs
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), Value::String(v)))
+            .collect();
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&payload)
+    } else {
+        let mut form = reqwest::multipart::Form::new();
+        for (k, v) in champs {
+            form = form.text(k, v);
+        }
+        for image in images {
+            let part = match reqwest::multipart::Part::bytes(image.bytes)
+                .file_name(image.file_name)
+                .mime_str(&image.content_type)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "image_invalid_mime", "message": e.to_string() }),
+                    );
+                }
+            };
+            // `images[]` — le nom exact qu'attend la règle Laravel `images.*`.
+            // Sous un autre nom, le site accepterait la requête et jetterait
+            // les fichiers EN SILENCE : le testeur croirait sa capture partie.
+            form = form.part("images[]", part);
+        }
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .multipart(form)
+    };
+
+    match requete.send().await {
         Ok(resp) if resp.status().is_success() => {
-            // Site responds { status, thread: { id, slug, url } }.
+            // Site responds { status, images, thread: { id, slug, url } }.
             let data: Value = resp.json().await.unwrap_or_else(|_| json!({}));
             let thread = &data["thread"];
+            // #4564 — le nombre que le SITE dit avoir rangé, pas celui qu'on a
+            // envoyé : l'écran annonce ce qui est arrivé, pas ce qu'on espérait.
+            // Un site antérieur à la PR jumelle ne rend pas la clé — on ne
+            // fabrique alors aucun chiffre.
+            let images_rangees = data.get("images").and_then(Value::as_u64);
+            if images_rangees.is_some_and(|n| n as usize != nb_images) {
+                tracing::warn!(
+                    envoyees = nb_images,
+                    rangees = images_rangees,
+                    "bug_report_captures_partielles"
+                );
+            }
             (
                 StatusCode::OK,
-                Json(json!({
+                json!({
                     "status": "ok",
                     "url": thread.get("url").and_then(|v| v.as_str()).unwrap_or(""),
                     "slug": thread.get("slug").and_then(|v| v.as_str()).unwrap_or(""),
-                })),
+                    "images": images_rangees,
+                }),
             )
         }
         Ok(resp) => {
             let status = resp.status().as_u16();
-            tracing::warn!(status, "bug_report_submit_rejected");
+            tracing::warn!(status, images = nb_images, "bug_report_submit_rejected");
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "cloud rejected the report", "status": status })),
+                json!({ "error": "cloud rejected the report", "status": status }),
             )
         }
         Err(e) => {
             tracing::warn!(error = %e, "bug_report_submit_failed");
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": format!("could not reach the bug service: {e}") })),
+                json!({ "error": format!("could not reach the bug service: {e}") }),
             )
         }
     }

@@ -769,3 +769,10 @@ path = "tests/playpause_un_appel_4566.rs"
 [[test]]
 name = "index_recherche_denominateur_4565"
 path = "tests/index_recherche_denominateur_4565.rs"
+
+# #4564 — les captures du signalement forum. `autotests = false` en tête de ce
+# manifeste : sans cette cible, ni la garde du nom `images[]` ni les refus
+# bornés ne seraient jamais compilés.
+[[test]]
+name = "bug_report_captures_4564"
+path = "tests/bug_report_captures_4564.rs"
