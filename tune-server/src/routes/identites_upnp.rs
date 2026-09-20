@@ -533,12 +533,22 @@ mod tests {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let albums = AlbumRepo::with_backend(state.backend.clone());
         let a = piste("A", "a");
-        assert_eq!(indexer(&state, "u", std::slice::from_ref(&a)).albums_ajoutes, 1);
+        let b = piste("B", "b");
+        assert_eq!(indexer(&state, "u", &[a.clone(), b]).albums_ajoutes, 1);
         let cle = cle_d_identite_album("u", "Album", Some("Artiste"));
         let id = album_existant(&state, &cle).unwrap();
 
-        // La divergence qui armait le piège : la ligne garde sa clé, mais son
-        // artiste ne permet plus de la recalculer.
+        // Le piège demande DEUX conditions, et les voici toutes les deux.
+        //
+        // 1. La ligne garde sa clé, mais son artiste ne permet plus de la
+        //    recalculer : le plan ne la retrouve pas par (titre, artiste).
+        // 2. Le rattrapage par renommage ne joue pas non plus — il exige que
+        //    le groupe entrant couvre TOUTES les pistes de l'album, et les
+        //    passes suivantes n'en rapportent qu'une sur deux.
+        //
+        // Reste alors `album_existant`, qui la retrouve, lui, par sa clé
+        // persistée. C'est exactement l'état du .18 : un album que le plan
+        // manque et que la clé trouve.
         state
             .backend
             .execute("UPDATE albums SET artist_id = NULL WHERE id = ?", &[&id])
