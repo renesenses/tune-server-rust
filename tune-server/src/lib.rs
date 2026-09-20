@@ -20,6 +20,7 @@ pub mod discovery_setup;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;
+pub mod lien_de_partage;
 pub mod plugins;
 /// P2 of the plugin ABI: AppState-backed [`HostContext`] plus the registry of
 /// loaded wasm plugins. Gated behind `plugins-wasm`; absent from default builds.
