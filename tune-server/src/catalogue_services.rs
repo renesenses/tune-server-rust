@@ -30,6 +30,10 @@ use tune_smart_http::catalogue::{AlbumDistant, CatalogueDistant, PisteDistante};
 /// album par son nom. Au-delà, ce ne sont plus des homonymes mais du bruit.
 const CANDIDATS: usize = 20;
 
+/// Combien d'ÉDITIONS d'un même titre d'album on développe en pistes. Au-delà,
+/// ce sont des rééditions et des compilations, et chacune coûte un appel.
+const ALBUMS_DEVELOPPES: usize = 3;
+
 pub struct CatalogueDuRegistre {
     services: Arc<Mutex<ServiceRegistry>>,
 }
@@ -119,17 +123,50 @@ impl CatalogueDistant for CatalogueDuRegistre {
         let Ok(pistes) = garde.get_artist_top_tracks(&artiste.id).await else {
             return Vec::new();
         };
+        pistes.into_iter().map(|t| piste(service, t)).collect()
+    }
+
+    /// Les pistes de l'album de ce titre — #4473, second volet.
+    ///
+    /// Même marche que [`CatalogueDuRegistre::albums_par_titre`] : on cherche,
+    /// on ne garde que les correspondances EXACTES de titre, puis on demande
+    /// leurs pistes.
+    ///
+    /// 🔴 Borné à [`ALBUMS_DEVELOPPES`] : un titre courant (« Live », « Greatest
+    /// Hits ») rapproche des dizaines d'éditions, et chacune coûterait un
+    /// aller-retour réseau avant que l'écran n'affiche quoi que ce soit.
+    async fn pistes_par_album(&self, service: &str, titre: &str) -> Vec<PisteDistante> {
+        let Some(s) = self.service(service).await else {
+            return Vec::new();
+        };
+        let garde = s.read().await;
+        let Ok(res) = garde.search(titre, CANDIDATS).await else {
+            return Vec::new();
+        };
+        let mut pistes = Vec::new();
+        for a in res
+            .albums
+            .iter()
+            .filter(|a| meme_nom(&a.title, titre))
+            .take(ALBUMS_DEVELOPPES)
+        {
+            let Ok(p) = garde.get_album_tracks(&a.id).await else {
+                continue;
+            };
+            pistes.extend(p.into_iter().map(|t| piste(service, t)));
+        }
         pistes
-            .into_iter()
-            .map(|t| PisteDistante {
-                service: service.to_string(),
-                source_id: t.id,
-                title: t.title,
-                artist: t.artist,
-                album: t.album.unwrap_or_default(),
-                cover_url: t.cover_path,
-                duration_ms: i64::try_from(t.duration_ms).ok(),
-            })
-            .collect()
+    }
+}
+
+fn piste(service: &str, t: tune_core::streaming::StreamTrack) -> PisteDistante {
+    PisteDistante {
+        service: service.to_string(),
+        source_id: t.id,
+        title: t.title,
+        artist: t.artist,
+        album: t.album.unwrap_or_default(),
+        cover_url: t.cover_path,
+        duration_ms: i64::try_from(t.duration_ms).ok(),
     }
 }
