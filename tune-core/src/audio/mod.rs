@@ -6,6 +6,7 @@ pub mod ape;
 pub mod audiophile;
 pub mod autoeq;
 pub mod canaux_declares;
+pub mod canaux_reseau_4573;
 
 pub mod bitperfect_strict;
 pub mod channels;
