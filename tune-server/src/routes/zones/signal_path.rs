@@ -623,6 +623,8 @@ fn assembler_les_etapes(
         format_name,
         is_lossless,
         flac_ffmpeg_vers_le_reseau,
+        canaux_source,
+        canaux_du_fil,
         ..
     } = analyse.source;
     let Traitements {
@@ -963,6 +965,40 @@ fn assembler_les_etapes(
         steps.push(json!({
             "name": "Mono",
             "description": desc,
+            "bit_perfect": false,
+        }));
+    }
+
+    // #4573 — la réduction de canaux du chemin RÉSEAU, dite à l'écran.
+    //
+    // Ce panneau était FERMÉ à ce que fait une zone non locale : la sonde
+    // `runtime_signal_path` ne vaut que pour `local`, `transformations_reelles`
+    // n'est publiée que par la sortie locale, et `wire.channels` — le nombre
+    // de canaux réellement servis — n'était lu NULLE PART. Les deux étapes
+    // « Canaux » ci-dessous restaient donc muettes sur un renderer DLNA, quoi
+    // qu'il arrive au flux.
+    //
+    // Ce qui suit n'est pas une étiquette collée sur une décision : c'est la
+    // comparaison de deux MESURES — la ligne `tracks` de la piste jouée, et
+    // la session de flux qui alimente le renderer. Quand le second est plus
+    // petit que le premier sur une zone réseau, c'est que le repli de #4573 a
+    // eu lieu, et rien d'autre ne réduit les canaux sur ce chemin.
+    //
+    // `reel.is_none()` : une sortie qui MESURE son propre repli garde ses deux
+    // étapes d'origine, plus précises. Aucune zone réseau n'en publie
+    // aujourd'hui ; le jour où l'une le fera, elle ne se décrira pas deux fois.
+    if reel.is_none()
+        && tune_core::orchestrator::is_network_output_type(Some(output_type))
+        && let (Some(entree), Some(sortie)) = (canaux_source, canaux_du_fil)
+        && let Some(etiquette) =
+            tune_core::audio::canaux_reseau_4573::etiquette_de_reduction(entree, Some(sortie))
+    {
+        steps.push(json!({
+            "name": "Canaux",
+            "description": etiquette,
+            // Un repli BS.775 mélange les voies : le fil ne porte plus les
+            // échantillons du fichier. Le dire « bit-perfect » serait
+            // exactement le mensonge que ce dossier corrige.
             "bit_perfect": false,
         }));
     }
@@ -1669,6 +1705,14 @@ struct Source<'w> {
     /// quel (le DMP-A8 cale sur ces en-têtes). Même fonction que la décision,
     /// `flac_ffmpeg_vers_le_reseau_applies`.
     flac_ffmpeg_vers_le_reseau: bool,
+    /// #4573 — les canaux de la SOURCE, lus dans la ligne `tracks`. `None`
+    /// pour une radio ou une piste absente de la base : on ne compare alors
+    /// rien, et aucune étape « Canaux » n'apparaît.
+    canaux_source: Option<u16>,
+    /// #4573 — les canaux qui partent RÉELLEMENT sur le fil, lus dans la
+    /// session (`StreamInfo.channels`). C'est une mesure, pas une déduction :
+    /// le même nombre que le `nrAudioChannels` annoncé au renderer.
+    canaux_du_fil: Option<u16>,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -1725,6 +1769,9 @@ fn decrire_la_source<'w>(
                 .map_or("Unknown", AudioFormat::display_name),
             is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
             flac_ffmpeg_vers_le_reseau: false,
+            // Une radio n'a pas de ligne `tracks` : rien à comparer.
+            canaux_source: None,
+            canaux_du_fil: None,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -1855,5 +1902,13 @@ fn decrire_la_source<'w>(
         format_name,
         is_lossless,
         flac_ffmpeg_vers_le_reseau,
+        // #4573 — un `0` en base veut dire « le scan ne l'a pas lu », pas
+        // « zéro voie » : filtré ici plutôt que comparé plus loin.
+        canaux_source: track
+            .as_ref()
+            .map(|t| t.channels)
+            .filter(|c| *c > 0)
+            .map(|c| c as u16),
+        canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
     }
 }

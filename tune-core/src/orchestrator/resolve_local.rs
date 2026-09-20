@@ -162,6 +162,11 @@ struct TranscodagePourLaSortie {
     needs_transcode_for_output: bool,
     will_be_flac: bool,
     dlna_needs_wav: bool,
+    /// #4573 — le nombre de canaux à SERVIR quand le renderer en annonce moins
+    /// que la source n'en porte. `None` dans tous les autres cas, y compris
+    /// celui — le plus fréquent — où le renderer ne déclare rien : la piste
+    /// part alors intacte, ignorance n'est pas déclaration.
+    canaux_reduits: Option<u16>,
 }
 
 /// Sixième temps : le traitement et ses cibles — rééchantillonnage, égaliseur,
@@ -239,7 +244,7 @@ fn assembler_la_decision(
     let SourceEtZone {
         sample_rate,
         bit_depth,
-        channels,
+        channels: canaux_source,
         zone,
         zone_max_sample_rate,
         ..
@@ -263,8 +268,16 @@ fn assembler_la_decision(
         needs_transcode_for_output,
         will_be_flac,
         dlna_needs_wav,
+        canaux_reduits,
         ..
     } = transcodage;
+    // #4573 — à partir d'ici, `channels` est ce qui part SUR LE FIL. Les deux
+    // bras qui décodent (`transcode_source_to_file` et
+    // `decode_to_pcm_streaming_tranche`) le portent jusqu'à
+    // `adapt_channels_i32`, qui applique la matrice ITU-R BS.775 ; et
+    // `StreamInfo.channels` le porte jusqu'au `nrAudioChannels` du DIDL, donc
+    // jusqu'à l'écran du chemin du signal.
+    let channels = canaux_reduits.unwrap_or(canaux_source);
     let Traitement {
         needs_downsample,
         sortie_tire_le_flux,
@@ -298,6 +311,10 @@ fn assembler_la_decision(
         // sous le nom d'une de ses pistes. Seul le décodage sait couper.
         est_une_tranche_cue: tranche_cue.is_some(),
         flac_ffmpeg_vers_le_reseau,
+        // #4573 — sans ce motif, le repli serait décidé puis jamais emprunté :
+        // le passthrough enverrait le FLAC 5.1 intact et `channels` mentirait
+        // dans le DIDL. Seul le décodage sait replier.
+        reduction_de_canaux: canaux_reduits.is_some(),
     });
     if flac_ffmpeg_vers_le_reseau {
         info!(
@@ -1116,8 +1133,10 @@ impl PlaybackOrchestrator {
             zone_output_type,
             sample_rate,
             zone_max_sample_rate,
+            channels: canaux_source,
             ..
         } = source;
+        let canaux_source = *canaux_source;
         let is_network_output = sorties.is_network_output;
         let ForcagesReseau {
             dsd_passthrough,
@@ -1202,12 +1221,61 @@ impl PlaybackOrchestrator {
         } else {
             false
         };
+        // #4573 — la seconde moitié du dossier : ADAPTER le flux à ce que le
+        // renderer a déclaré, et pas seulement le lire.
+        //
+        // Mesure de Xavier Joly (20/09/2026, Denon AVR-X1600H) : le Sink
+        // annonce du LPCM en `channels=1` et `channels=2`, et `audio/flac:*`
+        // sans aucun `channels=`. Tune servait le FLAC 5.1 TEL QUEL — le
+        // journal du 20/09 le montre, `dlna_set_uri_ok … advertised_mime=
+        // audio/flac` sur un fichier à six voies. L'ampli s'en sort en
+        // repliant lui-même (« Le Denon lit le flac 5.1 en stereo »), avec son
+        // mélange à lui et sans un mot ; un renderer moins conciliant
+        // refuserait la piste.
+        //
+        // 🔴 Trois gardes, et chacune compte :
+        // - `is_network_output` : la sortie LOCALE replie déjà, et le dit
+        //   (`local_audio_stream_config input_ch=6 output_ch=2`) ;
+        // - `!dsd_passthrough` : replier un DSD exigerait de le décoder, donc
+        //   de casser un passthrough que le renderer a lui-même annoncé ;
+        // - `canaux_annonces_du_renderer` rend `None` dès que le Sink est
+        //   muet sur ses canaux. On ne réduit JAMAIS sur une ignorance : ce
+        //   serait faire taire quatre voies sur six chez quelqu'un qui n'a
+        //   rien demandé.
+        //
+        // La sonde SOAP ne part que pour une piste MULTICANALE sur une zone
+        // réseau : une bibliothèque stéréo n'en voit jamais une, et la
+        // réponse est de toute façon mémorisée par renderer.
+        let canaux_renderer = if is_network_output && !dsd_passthrough && canaux_source > 2 {
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+            );
+            self.canaux_annonces_du_renderer(did).await
+        } else {
+            None
+        };
+        let canaux_reduits = crate::audio::canaux_reseau_4573::canaux_a_servir(
+            is_network_output,
+            dsd_passthrough,
+            canaux_source,
+            canaux_renderer,
+        );
+        if let Some(cible) = canaux_reduits {
+            info!(
+                zone_id = req.zone_id,
+                canaux_source,
+                canaux_cible = cible,
+                "reduction_de_canaux_pour_le_renderer"
+            );
+        }
         TranscodagePourLaSortie {
             alac_passthrough,
             is_chromecast,
             needs_transcode_for_output,
             will_be_flac,
             dlna_needs_wav,
+            canaux_reduits,
         }
     }
 

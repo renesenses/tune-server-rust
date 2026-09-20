@@ -9,6 +9,7 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::Engine;
 
 use crate::SmartHttpState;
+use crate::catalogue;
 use crate::regles_sql;
 use crate::smart_refs::{self, DbRefResolver, RefCtx, RefKind, RefResolver};
 use crate::source_streaming::{self, Objet};
@@ -556,6 +557,97 @@ fn avec_favoris_de_service(
     Ok(pistes)
 }
 
+/// Les pistes du CATALOGUE d'un service que les règles demandent — #4473,
+/// second volet.
+///
+/// ## Pourquoi les deux chemins avaient divergé
+///
+/// La v0.9.158 a porté le catalogue au chemin des ALBUMS
+/// (`smart_collections::avec_albums_de_catalogue`), la v0.9.159 à son aperçu.
+/// Le chemin des PISTES, lui, n'a jamais rien su : `regles_sql::colonne_piste`
+/// traduit `source` par `COALESCE(NULLIF(t.source,''),'local')`, donc
+/// `catalogue:qobuz` devenait `t.source = 'catalogue:qobuz'` — une condition
+/// que rien ne satisfait, puisqu'une piste de service n'est pas dans `tracks`.
+/// La playlist d'essai `Test Qobuz Coltrane` rendait zéro piste, et c'est
+/// précisément le cas d'origine de l'issue.
+///
+/// ## Ce qui est RÉUTILISÉ
+///
+/// La lecture des règles est celle des collections, à l'identique :
+/// [`catalogue::lire`] décide du service, de la cible et des refus. Seul
+/// l'aller-retour change, parce que l'objet rendu change — une playlist veut
+/// des pistes.
+///
+/// ## Comment on obtient des PISTES
+///
+/// * artiste seul → les titres phares de l'artiste chez ce service
+///   (`get_artist_top_tracks`). Un service n'offre pas « toutes les pistes de
+///   cet artiste » d'un bloc : il faudrait un aller-retour par album.
+/// * un album nommé (seul, ou à côté d'un artiste) → les pistes de cet album
+///   (`get_album_tracks`), ce qui est exact et borné. L'artiste, s'il est
+///   nommé, TRIE encore le résultat.
+/// * un titre de piste nommé → il trie le résultat, comme le titre d'album
+///   trie une discographie côté collections.
+async fn avec_pistes_de_catalogue(
+    state: &SmartHttpState,
+    mut pistes: Vec<Value>,
+    rules_json: &str,
+    max_tracks: Option<i64>,
+) -> Result<Vec<Value>, AppError> {
+    let demande = match catalogue::lire(rules_json, catalogue::Objet::Piste) {
+        catalogue::Lecture::Aucune => return Ok(pistes),
+        catalogue::Lecture::Refus(motif) => return Err(AppError::bad_request(motif)),
+        catalogue::Lecture::Demande(d) => d,
+    };
+    // Cloné, pas emprunté : ce qui vit en travers d'un `.await` doit être
+    // `Send` (même raison que `smart_collections::avec_albums_de_catalogue`).
+    let Some(distant) = state.catalogue.clone() else {
+        return Err(AppError::bad_request(
+            "Le catalogue des services n'est pas disponible ici.",
+        ));
+    };
+
+    let service = demande.service;
+    let egal = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
+    let mut trouves = match (&demande.cible, &demande.titre_album) {
+        // Un album nommé : ses pistes, c'est exact et borné.
+        (catalogue::Cible::Album(titre), _) => distant.pistes_par_album(&service, titre).await,
+        (catalogue::Cible::Artiste(nom), Some(titre)) => {
+            let mut p = distant.pistes_par_album(&service, titre).await;
+            // L'artiste était nommé aussi : il trie les éditions homonymes.
+            p.retain(|t| egal(&t.artist, nom));
+            p
+        }
+        (catalogue::Cible::Artiste(nom), None) => distant.pistes_par_artiste(&service, nom).await,
+    };
+    if let Some(titre) = &demande.titre_piste {
+        trouves.retain(|t| egal(&t.title, titre));
+    }
+    // La même forme qu'une piste de service (`source_streaming::piste_json`) :
+    // pas d'`id` local, une provenance et un identifiant de service.
+    pistes.extend(trouves.into_iter().map(|t| {
+        json!({
+            "id": Value::Null,
+            "source": t.service,
+            "source_id": t.source_id,
+            "title": t.title,
+            "artist_name": t.artist,
+            "album_title": t.album,
+            "cover_path": t.cover_url,
+            "duration_ms": t.duration_ms.unwrap_or(0),
+            "format": Value::Null,
+            "genre": Value::Null,
+            "year": Value::Null,
+            "album_id": Value::Null,
+            "is_compilation": false,
+        })
+    }));
+    if let Some(n) = max_tracks.filter(|n| *n >= 0) {
+        pistes.truncate(n as usize);
+    }
+    Ok(pistes)
+}
+
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
 fn load_smart_criteria(
     state: &SmartHttpState,
@@ -600,27 +692,36 @@ async fn resolve_tracks(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
-    let (where_clause, order, limit_clause) = build_smart_query(
-        &rules_json,
-        &match_mode,
-        &sort_by,
-        &sort_order,
-        max_tracks,
-        &ctx,
-    );
-    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
-    let items = avec_favoris_de_service(
-        &state,
-        items,
-        &rules_json,
-        &match_mode,
-        profile.id(),
-        &sort_by,
-        &sort_order,
-        max_tracks,
-    )?;
+    // Le résolveur et son contexte tiennent des RÉFÉRENCES à l'état : ils
+    // doivent mourir avant le `.await` du catalogue, sinon le futur n'est plus
+    // `Send` et axum refuse le handler (même contrainte que
+    // `smart_collections::resolve_albums`).
+    let items = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        let (where_clause, order, limit_clause) = build_smart_query(
+            &rules_json,
+            &match_mode,
+            &sort_by,
+            &sort_order,
+            max_tracks,
+            &ctx,
+        );
+        let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+        avec_favoris_de_service(
+            &state,
+            items,
+            &rules_json,
+            &match_mode,
+            profile.id(),
+            &sort_by,
+            &sort_order,
+            max_tracks,
+        )?
+    };
+    // 🔴 #4473 — le catalogue du service, comme le chemin des ALBUMS le fait
+    // depuis la v0.9.158. Sans cet appel, `Test Qobuz Coltrane` rend 0 piste.
+    let items = avec_pistes_de_catalogue(&state, items, &rules_json, max_tracks).await?;
 
     Ok(Json(json!(items)).into_response())
 }
@@ -636,39 +737,63 @@ async fn smart_collection_albums(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
-    let (where_clause, order, limit_clause) = build_smart_query(
-        &rules_json,
-        &match_mode,
-        &sort_by,
-        &sort_order,
-        max_tracks,
-        &ctx,
-    );
-    let tracks = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+    // Les références à l'état meurent avant le `.await` du catalogue (voir
+    // `resolve_tracks`).
+    let tracks = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        let (where_clause, order, limit_clause) = build_smart_query(
+            &rules_json,
+            &match_mode,
+            &sort_by,
+            &sort_order,
+            max_tracks,
+            &ctx,
+        );
+        execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?
+    };
+    // 🔴 #4473 — cette vue regroupe les pistes de la playlist : elle doit voir
+    // le catalogue et surtout porter les MÊMES refus. Sans cet appel, une
+    // règle « catalogue » y serait ignorée en silence, ce qui est exactement
+    // le défaut que l'issue reproche au chemin des pistes.
+    let tracks = avec_pistes_de_catalogue(&state, tracks, &rules_json, max_tracks).await?;
 
-    // Group tracks by album_id, dedup albums
+    // Group tracks by album_id, dedup albums. Une piste de service n'a pas
+    // d'`album_id` : son album se reconnaît à son titre et à son artiste.
     let mut seen = std::collections::HashSet::new();
     let mut albums: Vec<Value> = Vec::new();
     for track in &tracks {
-        if let Some(album_id) = track.get("album_id").and_then(|v| v.as_i64()) {
-            if seen.insert(album_id) {
-                albums.push(json!({
-                    "album_id": album_id,
-                    "album_title": track.get("album_title"),
-                    "artist_name": track.get("artist_name"),
-                    "cover_path": track.get("cover_path"),
-                    "year": track.get("year"),
-                    // #1957 — l'album que cette vue sert porte son drapeau,
-                    // comme partout ailleurs. Toujours un booléen : la ligne
-                    // vient du même décodeur, qui ne rend jamais `null`.
-                    "is_compilation": track
-                        .get("is_compilation")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false),
-                }));
+        let clef = match track.get("album_id").and_then(|v| v.as_i64()) {
+            Some(id) => format!("id:{id}"),
+            None => {
+                let texte = |c: &str| {
+                    track
+                        .get(c)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_lowercase()
+                };
+                if texte("album_title").is_empty() {
+                    continue;
+                }
+                format!("distant:{}|{}", texte("album_title"), texte("artist_name"))
             }
+        };
+        if seen.insert(clef) {
+            albums.push(json!({
+                "album_id": track.get("album_id").cloned().unwrap_or(Value::Null),
+                "album_title": track.get("album_title"),
+                "artist_name": track.get("artist_name"),
+                "cover_path": track.get("cover_path"),
+                "year": track.get("year"),
+                // #1957 — l'album que cette vue sert porte son drapeau,
+                // comme partout ailleurs. Toujours un booléen : la ligne
+                // vient du même décodeur, qui ne rend jamais `null`.
+                "is_compilation": track
+                    .get("is_compilation")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            }));
         }
     }
 
@@ -685,27 +810,34 @@ async fn preview_smart_collection(
     let sort_by = body.sort_by.as_deref().unwrap_or("title");
     let sort_order = body.sort_order.as_deref().unwrap_or("asc");
 
-    let resolver = DbRefResolver::new(&state.backend);
-    let ctx = RefCtx::root(&resolver, Some(profile.id()));
-    let (where_clause, order, limit_clause) = build_smart_query(
-        &rules_json,
-        match_mode,
-        sort_by,
-        sort_order,
-        body.max_tracks,
-        &ctx,
-    );
-    let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
-    let items = avec_favoris_de_service(
-        &state,
-        items,
-        &rules_json,
-        match_mode,
-        profile.id(),
-        sort_by,
-        sort_order,
-        body.max_tracks,
-    )?;
+    // Les références à l'état meurent avant le `.await` du catalogue (voir
+    // `resolve_tracks`).
+    let items = {
+        let resolver = DbRefResolver::new(&state.backend);
+        let ctx = RefCtx::root(&resolver, Some(profile.id()));
+        let (where_clause, order, limit_clause) = build_smart_query(
+            &rules_json,
+            match_mode,
+            sort_by,
+            sort_order,
+            body.max_tracks,
+            &ctx,
+        );
+        let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+        avec_favoris_de_service(
+            &state,
+            items,
+            &rules_json,
+            match_mode,
+            profile.id(),
+            sort_by,
+            sort_order,
+            body.max_tracks,
+        )?
+    };
+    // 🔴 #4473 — l'aperçu est ce que la playlist rendra : sans cet appel, une
+    // règle « catalogue » s'y montrerait vide et sans refus.
+    let items = avec_pistes_de_catalogue(&state, items, &rules_json, body.max_tracks).await?;
 
     Ok(Json(json!({"tracks": items, "total": items.len()})))
 }
@@ -957,5 +1089,283 @@ mod tests {
             w.contains("t.id NOT IN (SELECT track_id FROM playlist_tracks"),
             "{w}"
         );
+    }
+}
+
+/// 🔴 #4473, second volet — le CATALOGUE d'un service dans une PLAYLIST.
+///
+/// Le cas d'origine de Bertrand, `Test Qobuz Coltrane`, est une playlist. Au
+/// tag `v0.9.159`, `git grep catalogue -- tune-smart-http/src/regles_sql.rs`
+/// ne rendait rien : la règle `source = catalogue:qobuz` se traduisait en
+/// `COALESCE(NULLIF(t.source,''),'local') = 'catalogue:qobuz'`, une condition
+/// que rien ne satisfait — zéro piste, sans un mot.
+///
+/// Un service simulé : la garde porte sur ce que le module DÉCIDE, pas sur ce
+/// que Qobuz répond. Aucun réseau, aucune clé.
+#[cfg(test)]
+mod catalogue_de_service {
+    use crate::SmartHttpState;
+    use crate::catalogue::{AlbumDistant, CatalogueDistant, PisteDistante};
+    use std::sync::Arc;
+    use tune_core::db::sqlite::SqliteDb;
+
+    struct ServiceSimule;
+
+    fn p(service: &str, titre: &str, artiste: &str, album: &str) -> PisteDistante {
+        PisteDistante {
+            service: service.into(),
+            source_id: format!("t-{titre}"),
+            title: titre.into(),
+            artist: artiste.into(),
+            album: album.into(),
+            cover_url: None,
+            duration_ms: Some(300_000),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CatalogueDistant for ServiceSimule {
+        async fn albums_par_artiste(&self, _s: &str, _n: &str) -> Vec<AlbumDistant> {
+            Vec::new()
+        }
+        async fn albums_par_titre(&self, _s: &str, _t: &str) -> Vec<AlbumDistant> {
+            Vec::new()
+        }
+        async fn pistes_par_artiste(&self, service: &str, nom: &str) -> Vec<PisteDistante> {
+            vec![
+                p(service, "Giant Steps", nom, "Giant Steps"),
+                p(service, "Naima", nom, "Giant Steps"),
+            ]
+        }
+        async fn pistes_par_album(&self, service: &str, titre: &str) -> Vec<PisteDistante> {
+            vec![
+                p(service, "Blue Train", "John Coltrane", titre),
+                // Une réédition d'un homonyme : c'est l'artiste nommé par la
+                // règle qui doit trancher.
+                p(service, "Blue Train", "Un hommage", titre),
+            ]
+        }
+    }
+
+    fn etat(avec_service: bool) -> SmartHttpState {
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let e = SmartHttpState::new(backend);
+        if avec_service {
+            e.avec_catalogue(Arc::new(ServiceSimule))
+        } else {
+            e
+        }
+    }
+
+    /// Les règles exactes de `Test Qobuz Coltrane`.
+    const FABIENM: &str = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                              {"field":"artist","op":"=","value":"John Coltrane"}]"#;
+
+    /// 🔴 Le témoin : rouge avant (0 piste), vert après.
+    #[tokio::test]
+    async fn la_playlist_de_fabienm_rend_des_pistes_du_catalogue() {
+        let locales = vec![serde_json::json!({"id": 1, "title": "Une piste locale"})];
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), locales, FABIENM, None).await
+        else {
+            panic!("le catalogue doit répondre")
+        };
+        assert_eq!(r.len(), 3, "la piste locale et les deux distantes : {r:?}");
+        assert_eq!(r[1]["source"], "qobuz");
+        assert_eq!(r[1]["title"], "Giant Steps");
+        assert_eq!(r[1]["artist_name"], "John Coltrane");
+        assert_eq!(
+            r[1]["id"],
+            serde_json::Value::Null,
+            "une piste distante n'a pas d'id local"
+        );
+        assert_eq!(r[1]["duration_ms"], 300_000, "la durée du service");
+    }
+
+    /// La contre-épreuve : sans règle `catalogue:`, rien ne bouge — une
+    /// playlist « source = qobuz » reste les FAVORIS, et l'ancienne valeur ne
+    /// change pas de sens.
+    #[tokio::test]
+    async fn sans_regle_de_catalogue_rien_ne_change() {
+        let locales = vec![serde_json::json!({"id": 1})];
+        for regles in [
+            r#"[{"field":"source","op":"=","value":"qobuz"},
+                {"field":"artist","op":"=","value":"John Coltrane"}]"#,
+            r#"[{"field":"artist","op":"=","value":"John Coltrane"}]"#,
+        ] {
+            let Ok(r) =
+                super::avec_pistes_de_catalogue(&etat(true), locales.clone(), regles, None).await
+            else {
+                panic!("aucun catalogue demandé : {regles}")
+            };
+            assert_eq!(r, locales, "{regles}");
+        }
+    }
+
+    /// Les mêmes bornes que le premier volet : sans artiste ni album nommé,
+    /// on REFUSE — on ne rend ni tout ni rien (leçon de #4469).
+    #[tokio::test]
+    async fn sans_cible_la_playlist_est_refusee() {
+        let sans = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                       {"field":"year","op":"=","value":"2025"}]"#;
+        let Err(e) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), sans, None).await
+        else {
+            panic!("sans cible, il faut refuser")
+        };
+        assert_eq!(e.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            e.message.contains("artiste ou un album"),
+            "le refus doit dire ce qui manque : {}",
+            e.message
+        );
+    }
+
+    /// Une règle que le service ne sait pas filtrer est NOMMÉE, jamais
+    /// ignorée en silence. C'est le cas MIXTE : une règle locale à côté d'une
+    /// règle de service.
+    #[tokio::test]
+    async fn une_regle_locale_a_cote_du_catalogue_est_refusee_en_la_nommant() {
+        let mixte = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                        {"field":"artist","op":"=","value":"John Coltrane"},
+                        {"field":"format","op":"=","value":"FLAC"},
+                        {"field":"play_count","op":">=","value":"3"}]"#;
+        let Err(e) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), mixte, None).await
+        else {
+            panic!("une règle hors service doit être refusée")
+        };
+        let m = e.message;
+        assert!(m.contains("format ="), "la règle doit être nommée : {m}");
+        assert!(
+            m.contains("play_count >="),
+            "les deux, pas la première : {m}"
+        );
+    }
+
+    /// 🔴 Le champ `title` d'une PLAYLIST est le titre de la PISTE : il trie
+    /// ce que le service rend, il ne cherche pas un album de ce nom.
+    #[tokio::test]
+    async fn le_titre_de_piste_trie_ce_que_le_service_rend() {
+        let r = format!(
+            r#"[{{"field":"source","op":"=","value":"catalogue:qobuz"}},
+                {{"field":"artist","op":"=","value":"John Coltrane"}},
+                {{"field":"title","op":"=","value":"Naima"}}]"#
+        );
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), &r, None).await else {
+            panic!("demande valide")
+        };
+        assert_eq!(r.len(), 1, "une seule piste porte ce titre : {r:?}");
+        assert_eq!(r[0]["title"], "Naima");
+    }
+
+    /// Un album nommé à côté d'un artiste : ce sont les pistes de l'ALBUM, et
+    /// l'artiste écarte l'édition homonyme.
+    #[tokio::test]
+    async fn un_album_nomme_rend_ses_pistes_et_l_artiste_tranche() {
+        let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                    {"field":"artist","op":"=","value":"John Coltrane"},
+                    {"field":"album","op":"=","value":"Blue Train"}]"#;
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), r, None).await else {
+            panic!("demande valide")
+        };
+        assert_eq!(r.len(), 1, "l'hommage homonyme est écarté : {r:?}");
+        assert_eq!(r[0]["album_title"], "Blue Train");
+        assert_eq!(r[0]["artist_name"], "John Coltrane");
+    }
+
+    /// Sans registre de services — en épreuve, et partout où il n'existe pas —
+    /// on refuse plutôt que de rendre vide en silence.
+    #[tokio::test]
+    async fn sans_registre_on_refuse_au_lieu_de_rendre_vide() {
+        let Err(e) = super::avec_pistes_de_catalogue(&etat(false), Vec::new(), FABIENM, None).await
+        else {
+            panic!("sans registre, il faut refuser")
+        };
+        assert!(
+            e.message.contains("pas disponible"),
+            "le refus doit se lire : {}",
+            e.message
+        );
+    }
+
+    /// 🔴 Le témoin par la ROUTE : « écrit mais pas branché » est le défaut
+    /// que cette issue reproche déjà une fois. L'aperçu de l'éditeur de
+    /// playlists doit appeler le catalogue, pas seulement le savoir faire.
+    async fn apercu(
+        regles: &str,
+    ) -> Result<axum::Json<serde_json::Value>, tune_http_types::AppError> {
+        let e = etat(true);
+        e.backend
+            .execute(
+                "CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT,
+                     position TEXT)",
+                &[],
+            )
+            .expect("favoris");
+        super::preview_smart_collection(
+            axum::extract::State(e),
+            tune_http_types::ActiveProfile(1),
+            axum::Json(super::PreviewRequest {
+                rules: serde_json::from_str(regles).expect("json"),
+                match_mode: None,
+                sort_by: None,
+                sort_order: None,
+                max_tracks: None,
+            }),
+        )
+        .await
+    }
+
+    /// 🔴 Rouge au tag `v0.9.159` : l'aperçu rendait `total = 0`, parce que la
+    /// seule traduction de `catalogue:qobuz` était
+    /// `COALESCE(NULLIF(t.source,''),'local') = 'catalogue:qobuz'`.
+    #[tokio::test]
+    async fn l_apercu_d_une_playlist_montre_le_catalogue() {
+        let Ok(r) = apercu(FABIENM).await else {
+            panic!("l'aperçu doit répondre")
+        };
+        assert_eq!(r.0["total"], 2, "{}", r.0);
+        assert_eq!(r.0["tracks"][0]["title"], "Giant Steps");
+        assert_eq!(r.0["tracks"][0]["source"], "qobuz");
+    }
+
+    /// … et il REFUSE ce que la playlist refusera, au moment où on l'écrit.
+    #[tokio::test]
+    async fn l_apercu_d_une_playlist_refuse_comme_elle() {
+        let sans = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                       {"field":"year","op":"=","value":"2025"}]"#;
+        assert!(apercu(sans).await.is_err(), "sans cible : refus");
+    }
+
+    /// 🔴 La contre-épreuve du DÉFAUT lui-même : la traduction SQL locale,
+    /// seule, ne peut RIEN rendre. C'est elle qui rendait 0 piste au tag
+    /// `v0.9.159`, et elle n'a pas changé — c'est l'étape d'après qui manquait.
+    #[test]
+    fn la_traduction_sql_seule_ne_peut_rien_rendre() {
+        use crate::smart_refs::{EmptyResolver, RefCtx};
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let (w, _, _) = super::build_smart_query(FABIENM, "all", "title", "asc", None, &ctx);
+        assert!(
+            w.contains("'catalogue:qobuz'"),
+            "la règle se traduit toujours en une condition sur t.source : {w}"
+        );
+        assert!(
+            w.contains("COALESCE(NULLIF(t.source, ''), 'local')"),
+            "et aucune piste de la table `tracks` ne porte cette provenance : {w}"
+        );
+    }
+
+    /// La borne de la playlist s'applique à l'ENSEMBLE, local et distant.
+    #[tokio::test]
+    async fn la_borne_coupe_l_ensemble() {
+        let locales = vec![serde_json::json!({"id": 1})];
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), locales, FABIENM, Some(2)).await
+        else {
+            panic!("demande valide")
+        };
+        assert_eq!(r.len(), 2, "une locale et une distante : {r:?}");
     }
 }

@@ -80,6 +80,53 @@ impl PlaybackOrchestrator {
         self.dlna_lpcm_accepte.lock().await.insert(cle, accepte);
         accepte
     }
+
+    /// #4573 — combien de canaux ce renderer ANNONCE-t-il, au plus ?
+    ///
+    /// `None` veut toujours dire « on ne sait pas », et jamais « deux » :
+    /// sortie absente du registre, sortie qui n'est pas un `DlnaOutput` donc
+    /// sans Sink à lire, sonde inconcluante, ou Sink lu mais sans aucun
+    /// `channels=` — le cas du Denon AVR-X1600H de Xavier pour `audio/flac:*`.
+    /// C'est la règle de [`crate::audio::canaux_reseau_4573`] : on ne réduit
+    /// une piste multicanale que sur une déclaration.
+    ///
+    /// Les réponses CONCLUANTES sont mémorisées par renderer — une sonde SOAP
+    /// par session, pas par morceau. Une sonde inconcluante ne l'est pas : la
+    /// lecture suivante re-sonde, comme pour `dlna_accepte_lpcm`.
+    pub async fn canaux_annonces_du_renderer(&self, device_id: &str) -> Option<u16> {
+        if device_id.is_empty() {
+            return None;
+        }
+        if let Some(connu) = self.dlna_canaux_max.lock().await.get(device_id) {
+            return *connu;
+        }
+        let arc = { self.outputs.lock().await.get(device_id) };
+        let output = arc?;
+        let caps = {
+            let locked = output.lock().await;
+            let dlna = locked
+                .as_any()
+                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()?;
+            dlna.probe_capabilities().await
+        };
+        if !caps.probed {
+            // Inconcluante : surtout ne pas mémoriser. Un renderer injoignable
+            // une fois ne doit pas être réputé muet sur ses canaux pour la
+            // session entière.
+            return None;
+        }
+        let canaux = caps.canaux_max;
+        tracing::info!(
+            device_id,
+            canaux_max = ?canaux,
+            "dlna_canaux_annonces_sondes"
+        );
+        self.dlna_canaux_max
+            .lock()
+            .await
+            .insert(device_id.to_string(), canaux);
+        canaux
+    }
 }
 
 impl PlaybackOrchestrator {
