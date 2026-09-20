@@ -9,6 +9,22 @@ from pathlib import Path
 import argparse, json, subprocess, tempfile
 ROOT = Path(__file__).resolve().parents[2]
 BASE = 'af70d7e251735d8be2c5d7ddc9d6539f61e2ac34'
+# The one place where the extracted engine is ALLOWED to differ from the pinned
+# pre-extraction source, and the only one: #4594 made the automatic headroom the
+# true bound (the cascade's L1 norm) instead of the larger of that norm and the
+# sum of the positive gains, and added 0.01 dB so the bound is not reserved flush
+# against the rail. That is a deliberate, arbitrated change in what the DSP
+# RENDERS -- not a side effect of the extraction -- so the historical oracle is
+# taught the same change here rather than the gate being weakened. Every other
+# line of the pinned sources still has to match byte for byte, and each
+# substitution below is asserted to actually apply: a patch that silently misses
+# its target would turn this oracle into a gate that guards nothing.
+INTENTIONAL_DIVERGENCE = {'eq': [
+    ('if l1 > 1.0 { 20.0 * l1.log10() } else { 0.0 }',
+     'if l1 > 1.0 { 20.0 * l1.log10() + 0.01 } else { 0.0 }'),
+    ('-(somme_positive_db.max(l1_db) + resonance_db)',
+     '-(l1_db + resonance_db)'),
+]}
 RUNNER = r'''
 use audio::eq::{EqProfile,EqBandSpec,EqProcessor};
 use audio::crossfeed::CrossfeedProcessor;
@@ -61,6 +77,9 @@ def main():
                 source=subprocess.check_output(['git','show',f'{BASE}:tune-core/src/audio/{name}.rs'],cwd=ROOT).decode()
                 if name=='crossfeed':source=source[:source.index('/// Contrainte qui prive')]
                 else:source=source.split('#[cfg(test)]')[0]
+                for motif,remplacement in INTENTIONAL_DIVERGENCE.get(name,[]):
+                    assert motif in source, f'{name}.rs @ {BASE}: motif absent, {motif!r}'
+                    source=source.replace(motif,remplacement)
                 (p/f'src/audio/{name}.rs').write_text(source, encoding="utf-8")
             (p/'src/audio/mod.rs').write_text('pub mod eq; pub mod crossfeed; pub mod dither; pub mod ecretage;', encoding="utf-8")
         else:
@@ -91,6 +110,7 @@ def main():
         outputs.append(execute(p,package))
     assert outputs[0]==outputs[1]==outputs[2], 'PCM or clipping telemetry differs from the pinned pre-extraction implementations'
     import hashlib
-    print(f'PARITY: {len(outputs[0][0])} bytes identical; SHA-256 {hashlib.sha256(outputs[0][0]).hexdigest()}; baseline {BASE}')
+    divergences=sum(len(v) for v in INTENTIONAL_DIVERGENCE.values())
+    print(f'PARITY: {len(outputs[0][0])} bytes identical; SHA-256 {hashlib.sha256(outputs[0][0]).hexdigest()}; baseline {BASE} + {divergences} intentional substitution(s), see INTENTIONAL_DIVERGENCE')
     print(outputs[0][1].decode('utf-8'),end='')
 if __name__=='__main__':main()

@@ -31,10 +31,15 @@ pub enum CloudScope {
     MetadataProposalsRead,
     /// `POST /cloud-library/{server}/proposals/decisions` : les décisions renvoyées (CLD-1).
     MetadataDecisionsWrite,
+    /// `GET /api/v1/user` : la relecture du profil du compte lié, celle qui
+    /// rapporte `premium` ET les droits de MODULE payants (`modules`).
+    /// Trente requêtes par minute et par client côté mozaiklabs : le refus est
+    /// transitoire par construction, jamais un verdict sur le compte.
+    UserProfile,
 }
 
 impl CloudScope {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Telemetry,
         Self::InstanceHeartbeat,
         Self::BiosWrite,
@@ -48,6 +53,7 @@ impl CloudScope {
         Self::LibrarySync,
         Self::MetadataProposalsRead,
         Self::MetadataDecisionsWrite,
+        Self::UserProfile,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -65,6 +71,7 @@ impl CloudScope {
             Self::LibrarySync => "library_sync",
             Self::MetadataProposalsRead => "metadata_proposals_read",
             Self::MetadataDecisionsWrite => "metadata_decisions_write",
+            Self::UserProfile => "user_profile",
         }
     }
 
@@ -257,6 +264,9 @@ mod tests {
             ("telemetry", include_str!("telemetry.rs")),
             ("metadata_proposals", include_str!("metadata_proposals.rs")),
             ("bio_sync", include_str!("bio_sync.rs")),
+            // 🔴 Le profil du compte est la porte des droits de MODULE :
+            // un 429 relu comme un echec faisait disparaitre une cible payee.
+            ("sso", include_str!("sso.rs")),
         ] {
             // La partie de PRODUCTION seule : un témoin peut légitimement
             // poser une échéance avec `defer_from_headers`.

@@ -295,6 +295,52 @@ pub(super) async fn rename_genre(
     })))
 }
 
+/// Les genres d'UN album, chacun avec sa clé canonique — `(clé, libellé)`.
+///
+/// 🔴 LA définition du genre dans Tune, et il n'en existe qu'une. Deux routes
+/// l'appellent : `GET /library/genres` (les genres de la bibliothèque) et
+/// `GET /dashboard/stats` (les genres ÉCOUTÉS, #4527). Les deux cartes se
+/// retrouvent côte à côte sur l'accueil : si elles ne découpaient pas les
+/// genres de la même façon, « Genres 115 » et « Genres écoutés 40 » ne
+/// seraient pas comparables, et personne ne le verrait. Une seule fonction,
+/// donc, et pas deux copies libres de diverger au premier correctif.
+///
+/// La règle, reprise telle qu'elle était dans `list_genres` :
+///
+/// * le tableau JSON `albums.genres` d'abord, s'il est lisible et non vide ;
+/// * sinon la colonne héritée `albums.genre`, découpée par `split_genre_tag` ;
+/// * chaque genre ramené à `genre_key`, pour que « Trip Hop » et
+///   « Trip-Hop » ne fassent qu'un (#1161) ;
+/// * dédoublonné DANS l'album : un album qui porte deux graphies d'un même
+///   genre ne compte qu'une fois pour lui.
+pub(crate) fn genres_de_l_album(
+    genre: Option<&str>,
+    genres: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut noms: Vec<String> = Vec::new();
+    if let Some(json_str) = genres
+        && let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str)
+    {
+        noms = arr
+            .into_iter()
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .collect();
+    }
+    if noms.is_empty()
+        && let Some(brut) = genre
+    {
+        noms = tune_core::metadata::split_genre_tag(brut);
+    }
+    let mut vues: std::collections::HashSet<String> = std::collections::HashSet::new();
+    noms.into_iter()
+        .filter_map(|g| {
+            let cle = tune_core::metadata::genre_key(&g);
+            (!cle.is_empty() && vues.insert(cle.clone())).then_some((cle, g))
+        })
+        .collect()
+}
+
 pub(super) async fn list_genres(
     State(state): State<AppState>,
     Query(params): Query<GenreQuery>,
@@ -324,31 +370,7 @@ pub(super) async fn list_genres(
     let mut groups: std::collections::BTreeMap<String, std::collections::BTreeMap<String, i64>> =
         std::collections::BTreeMap::new();
     for (genre_col, genres_col) in &raw {
-        let mut genres_for_album: Vec<String> = Vec::new();
-        // Prefer the structured genres JSON array if present
-        if let Some(json_str) = genres_col {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
-                genres_for_album = arr
-                    .into_iter()
-                    .map(|g| g.trim().to_string())
-                    .filter(|g| !g.is_empty())
-                    .collect();
-            }
-        }
-        // Fall back to splitting the legacy genre column
-        if genres_for_album.is_empty() {
-            if let Some(raw_genre) = genre_col {
-                genres_for_album = tune_core::metadata::split_genre_tag(raw_genre);
-            }
-        }
-        // Dedup within this album by canonical key so an album that tags the
-        // same genre under two spellings still counts once toward it.
-        let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for g in genres_for_album {
-            let key = tune_core::metadata::genre_key(&g);
-            if key.is_empty() || !seen_keys.insert(key.clone()) {
-                continue;
-            }
+        for (key, g) in genres_de_l_album(genre_col.as_deref(), genres_col.as_deref()) {
             *groups.entry(key).or_default().entry(g).or_insert(0) += 1;
         }
     }
@@ -423,5 +445,98 @@ mod tests {
         assert_eq!(gs, r#"["Rock","Pop"]"#);
         // no match → None (row left untouched)
         assert!(rewrite_row(Some("Jazz"), Some(r#"["Pop"]"#), &k, "Rock").is_none());
+    }
+}
+
+/// `genres_de_l_album` — LA définition du genre, partagée depuis #4527.
+///
+/// Elle a été extraite de `list_genres` pour que `/dashboard/stats` compte les
+/// genres écoutés exactement comme la bibliothèque compte les siens. Aucun
+/// banc ne gardait le comptage de `list_genres` avant l'extraction : ceux-ci
+/// le font, sur la fonction ET sur la route.
+#[cfg(test)]
+mod genres_de_l_album_4527 {
+    use super::*;
+
+    fn cles(genre: Option<&str>, genres: Option<&str>) -> Vec<String> {
+        genres_de_l_album(genre, genres)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    #[test]
+    fn le_tableau_json_prime_sur_la_colonne_heritee() {
+        let v = genres_de_l_album(Some("Ignoré"), Some(r#"["Jazz","Blues"]"#));
+        let noms: Vec<&str> = v.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(noms, ["Jazz", "Blues"]);
+    }
+
+    #[test]
+    fn sans_tableau_la_colonne_heritee_est_decoupee() {
+        assert_eq!(cles(Some("Rock; Jazz"), None).len(), 2);
+    }
+
+    #[test]
+    fn un_tableau_illisible_ou_vide_retombe_sur_la_colonne() {
+        assert_eq!(cles(Some("Jazz"), Some("pas du json")).len(), 1);
+        assert_eq!(cles(Some("Jazz"), Some("[]")).len(), 1);
+    }
+
+    #[test]
+    fn deux_graphies_dans_un_meme_album_comptent_une_fois() {
+        // #1161 : « Trip Hop » et « Trip-Hop » ont la même clé canonique.
+        assert_eq!(cles(None, Some(r#"["Trip Hop","Trip-Hop"]"#)).len(), 1);
+    }
+
+    #[test]
+    fn rien_ne_rend_rien() {
+        assert!(cles(None, None).is_empty());
+        assert!(cles(Some(""), Some("")).is_empty());
+    }
+
+    /// 🔴 La route elle-même : l'extraction n'a rien changé à ce qu'elle rend.
+    #[tokio::test]
+    async fn la_route_fusionne_les_graphies_et_compte_les_albums() {
+        use tune_core::db::artist_repo::ArtistRepo;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let ar = ArtistRepo::with_backend(state.backend.clone())
+            .get_or_create("Artiste", None, None)
+            .unwrap();
+        for (titre, genre) in [("A", "Trip Hop"), ("B", "Trip-Hop"), ("C", "Jazz")] {
+            let id = AlbumRepo::with_backend(state.backend.clone())
+                .get_or_create(titre, ar.id.unwrap(), None)
+                .unwrap()
+                .id
+                .unwrap();
+            state
+                .backend
+                .execute(
+                    "UPDATE albums SET genre = ? WHERE id = ?",
+                    &[&genre.to_string(), &id],
+                )
+                .unwrap();
+        }
+        // `AppError` n'implémente pas `Debug` : pas de `.unwrap()` ici.
+        let Ok(Json(v)) = list_genres(State(state), Query(GenreQuery { query: None })).await else {
+            panic!("GET /library/genres a échoué");
+        };
+        let rangs = v.as_array().unwrap();
+        assert_eq!(rangs.len(), 2, "trip hop (2 albums) + jazz (1) : {v}");
+        let trip = rangs
+            .iter()
+            .find(|r| {
+                r["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .starts_with("trip")
+            })
+            .expect("la carte Trip Hop a disparu");
+        assert_eq!(
+            trip["count"],
+            json!(2),
+            "les deux graphies doivent se fondre en UNE carte de 2 albums"
+        );
     }
 }

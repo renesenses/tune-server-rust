@@ -1883,6 +1883,36 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
     Migration { version: 103, name: "upnp_catalog_revision",
         up: include_str!("../../migrations/upnp_catalog_revision.sql"),
     },
+    // renesenses/tune-web-client#1060 — la date que TUNE pose lui-meme sur un
+    // favori de service, a la premiere fois qu'il le voit.
+    //
+    // `created_at` porte la date du SERVICE, et le service la refait : mesure
+    // du 19/09/2026 sur le .18, vingt et un favoris Qobuz portant vingt et une
+    // dates distinctes reparties sur SEIZE SECONDES. Ce n'est pas l'histoire
+    // d'un auditeur, c'est l'instant ou une recopie les a recrees chez Qobuz.
+    // Le tri « Ajout recent » rend alors l'ordre d'une boucle.
+    //
+    // `first_seen_at` est pose a l'insertion et n'est JAMAIS reecrit : ni par
+    // `dater`, qui ne le nomme pas, ni par `premiere_vue_si_absente`, dont le
+    // `WHERE … IS NULL` est toute la garde. Meme lecon que `first_seen_at` sur
+    // `media_servers` (migration 101) et `zones.last_seen_at` (95).
+    //
+    // REGLE DE MIGRATION, ecrite et non devinee : les lignes deja en base
+    // recoivent `first_seen_at = created_at`. C'est la seule date dont on
+    // dispose au moment de la migration ; elle est fausse pour les favoris que
+    // le service a redates, mais elle est MESUREE, pas fabriquee, et elle ne
+    // peut pas etre pire que ce que l'ecran lit aujourd'hui. Une ligne sans
+    // `created_at` reste a NULL — le client retombe alors sur la date du
+    // service, exactement comme avant. Rien n'est invente en silence.
+    //
+    // Colonne posee par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95, 96,
+    // 99 et 100.
+    Migration {
+        version: 104,
+        name: "favoris_premiere_vue_locale",
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2691,6 +2721,19 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Per-track cover — see migration 71 and forum #1312.
             add_column_if_missing(db, "tracks", "cover_path", "TEXT");
         }
+        if migration.version == 104 {
+            // La colonne d'abord (la table peut ne pas avoir ete touchee
+            // depuis la 58), la reprise ensuite. `WHERE first_seen_at IS NULL`
+            // : cette migration ne REECRIT jamais une date deja posee, meme
+            // rejouee.
+            add_column_if_missing(db, "streaming_favorites", "first_seen_at", "TEXT");
+            if let Err(e) = db.execute_batch(
+                "UPDATE streaming_favorites SET first_seen_at = created_at \
+                 WHERE first_seen_at IS NULL AND created_at IS NOT NULL",
+            ) {
+                warn!(erreur = %e, "migration_104_reprise_first_seen_at");
+            }
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -3123,6 +3166,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
     // table vient seulement d'etre garantie. PG : migration 057.
     add_column_if_missing(db, "streaming_favorites", "position", "INTEGER");
+    // Date de PREMIERE VUE locale (migration 104, web #1060) — posee ICI aussi,
+    // et pour la meme raison que `position` juste au-dessus : les requetes de
+    // lecture la NOMMENT desormais, donc une base qui arriverait sans elle
+    // rendrait la liste des favoris VIDE. Aucune reprise de valeur ici : le
+    // remplissage est le travail de la migration 104, qui ne tourne qu'une
+    // fois. PG : migration 067.
+    add_column_if_missing(db, "streaming_favorites", "first_seen_at", "TEXT");
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -3707,6 +3757,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         66,
         "upnp_catalog_revision",
         include_str!("../../migrations/postgres/066_upnp_catalog_revision.sql"),
+    ),
+    // Jumelle de la SQLite 104 (web #1060). Numero libre remesure DANS LE
+    // CODE, entree par entree de cette liste — un `ls migrations/postgres` ment
+    // ici depuis la 54, qui est une entree `concat!` sans fichier.
+    (
+        67,
+        "favoris_premiere_vue_locale",
+        include_str!("../../migrations/postgres/067_favoris_premiere_vue_locale.sql"),
     ),
 ];
 
@@ -5682,7 +5740,12 @@ mod tests {
         // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
         // 65 and 66 carry the UPnP library sync and catalog revision (#4201),
         // renumbered from 59/60 after those shipped in v0.9.151.
-        assert_eq!(pg_latest_version(), 66, "latest PG migration must be 66");
+        // 67 : `favoris_premiere_vue_locale` (web #1060), jumelle de la SQLite
+        // 104. Pose `first_seen_at` sur `streaming_favorites` et la remplit
+        // depuis `created_at` — la seule date disponible au moment de la
+        // migration. Sans elle, aucune base PostgreSQL deja creee ne recevrait
+        // la colonne, que les requetes de lecture NOMMENT desormais.
+        assert_eq!(pg_latest_version(), 67, "latest PG migration must be 67");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

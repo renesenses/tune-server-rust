@@ -139,12 +139,27 @@ pub(super) async fn list_albums(
             Vec::new()
         }
     };
+    // #4521 — le DR de chaque album de la page, par la règle de la fiche, en
+    // UNE requête groupée sur les identifiants déjà bornés. Même type que la
+    // fiche (chaîne) ; `null` sans DR, jamais `0` — DR0 est une vraie mesure.
+    // Un échec ne vide pas la grille : la page part sans DR, et le journal
+    // le dit.
+    let ids: Vec<i64> = items.iter().filter_map(|a| a.id).collect();
+    let dr_par_id = repo.dynamic_range_by_ids(&ids).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "dynamic_range_by_ids a échoué — page servie sans DR");
+        std::collections::HashMap::new()
+    });
     let items: Vec<Value> = items
         .iter()
         .map(|a| {
             let mut j = a.to_json();
             if let Some(obj) = j.as_object_mut() {
                 obj.remove("bio");
+                let dr =
+                    a.id.and_then(|id| dr_par_id.get(&id))
+                        .map(|v| Value::String(v.to_string()))
+                        .unwrap_or(Value::Null);
+                obj.insert("dynamic_range".into(), dr);
             }
             j
         })

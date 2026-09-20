@@ -608,6 +608,8 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (
 -- ci-dessus ne la corrige pas. Même raison que les trois colonnes d'identité de
 -- `favorites` juste au-dessus (#2111).
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT;
+-- Date de première vue LOCALE (web #1060) — même rattrapage, même raison.
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS first_seen_at TEXT;
 
 CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
