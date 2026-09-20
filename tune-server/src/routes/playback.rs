@@ -5119,9 +5119,18 @@ async fn share_now_playing(
     settings
         .set(&format!("share_{token}"), &data.to_string())
         .ok();
+    // Le chemin RELATIF reste rendu tel quel (clients antérieurs), et le lien
+    // ABSOLU l'accompagne quand le serveur a mieux à offrir qu'une boucle
+    // locale : le client collait `location.origin`, donc `http://localhost:8888`
+    // pour qui ouvre Tune sur sa propre machine — un partage illisible partout
+    // ailleurs (Xavier Joly, 20/09/2026).
+    let chemin = format!("/shared/{token}");
+    let lien =
+        crate::lien_de_partage::lien_de_partage(&state.config.server_ip(), state.port, &chemin);
     Json(json!({
         "token": token,
-        "url": format!("/shared/{token}"),
+        "url": chemin,
+        "url_absolue": lien,
         "track": data,
     }))
     .into_response()
