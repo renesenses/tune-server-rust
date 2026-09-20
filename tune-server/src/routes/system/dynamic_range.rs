@@ -157,6 +157,10 @@ pub(crate) async fn dynamic_range_analyze(State(state): State<AppState>) -> impl
             (true, Some(Attente::Lecture)) => "en attente : lecture en cours",
             (true, Some(Attente::Chaleur)) => "en attente : machine trop chaude",
             (true, Some(Attente::Creneau)) => "en attente : une autre analyse décode",
+            // #4573 — suspendue à la main depuis l'écran « État du serveur ».
+            // Le passage reste OUVERT : sa jauge ne bouge pas et il repartira
+            // au même point, d'où « en pause » et non « terminé ».
+            (true, Some(Attente::Pause)) => "en pause",
             (true, None) => "Plage dynamique",
         };
         registre.update_progress(
@@ -224,6 +228,7 @@ mod tests_4185 {
         state.passe_dr.cadence_pour_les_essais(Cadence {
             report_lecture: Duration::from_millis(20),
             report_chaleur: Duration::from_millis(20),
+            report_pause: Duration::from_millis(20),
             entre_lots: Duration::from_millis(5),
             garde_thermique: false,
         });

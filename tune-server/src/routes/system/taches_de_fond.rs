@@ -69,7 +69,15 @@ fn etat_de(state: &AppState, tache: Tache) -> Etat {
     let en_cours = match tache {
         Tache::ReplayGain | Tache::Empreintes => cascade,
         Tache::PlageDynamique => state.passe_dr.releve().actif || cascade,
+        // Le module `embedding` est derrière `audio-embedding` : sans la
+        // feature, la passe acoustique n'existe pas, donc elle ne tourne pas.
+        // La suspendre reste possible et sans effet — plutôt qu'un identifiant
+        // qui disparaîtrait du relevé selon la recette de compilation, ce que
+        // le client n'a aucun moyen de deviner.
+        #[cfg(feature = "audio-embedding")]
         Tache::Acoustique => tune_core::audio::embedding::balayage_acoustique_en_cours(),
+        #[cfg(not(feature = "audio-embedding"))]
+        Tache::Acoustique => false,
         Tache::Enrichissement => inscrite(state, &["enrich_all", "bios", "credits_enrich_auto"]),
         Tache::ImagesArtistes => inscrite(state, &["artist_artwork", "artwork"]),
     };
