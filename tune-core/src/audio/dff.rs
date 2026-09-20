@@ -551,6 +551,17 @@ impl DffStreamReader {
 
 /// Décodage DST au fil de l'eau (#4378), trame par trame.
 ///
+/// ⚖️ **Pourquoi la feature `dst` est DÉSARMÉE (décision de Bertrand,
+/// 20/09/2026).** Le crate `dst-decoder` se déclare Apache-2.0 (crates.io,
+/// GitHub, fichier `LICENSE`) mais son README reproduit l'en-tête ISO/Philips
+/// du code de référence — « Copyright is not released for non MPEG-4 Audio
+/// conforming products » — et un avertissement brevets. La question n'est pas
+/// tranchée. Le code part donc écrit, mesuré, et allumable par personne : la
+/// feature n'est dans aucun `default` ni dans aucune ligne de build publiée.
+/// Pour l'allumer il faut UN arbitrage juridique de Bertrand, pas une ligne de
+/// workflow — et la garde `tune-core/tests/dst_desarmee_4378.rs` rougit si on
+/// essaie sans.
+///
 /// Une trame DST (1/75 s sur un SACD) se décode SEULE : filtres et tables de
 /// probabilité voyagent dans chaque trame. La recherche saute donc les
 /// en-têtes des trames précédentes sans les décoder, puis jette le début de

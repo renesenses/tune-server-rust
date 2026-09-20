@@ -9,7 +9,9 @@ autotests = false
 default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
-# #4378 : lecture des DSDIFF compressés DST (désarmée, décision de licence).
+# #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
+# de toute ligne de build publiée (licence de `dst-decoder` non tranchée,
+# arbitrage de Bertrand). Garde : tune-core/tests/dst_desarmee_4378.rs.
 dst = ["tune-core/dst"]
 oaat = ["tune-core/oaat"]
 cloud-relay = ["tune-core/cloud-relay"]

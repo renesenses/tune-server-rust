@@ -316,7 +316,11 @@ postgres = ["dep:sqlx"]
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:tokenizers"]
-# #4378 : lecture des DSDIFF compressés DST. NOT in default — voir la dépendance.
+# #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
+# de toute ligne de build publiée : la licence de `dst-decoder` n'est pas
+# tranchée (Apache-2.0 déclarée contre l'en-tête ISO/Philips reproduit dans
+# son README). L'allumer demande un arbitrage juridique de Bertrand. Garde :
+# tests/dst_desarmee_4378.rs.
 dst = ["dep:dst-decoder"]
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
@@ -532,3 +536,16 @@ path = "tests/hqplayer_avance_album_4023.rs"
 name = "alsa_poll_recovery_4295"
 path = "tests/alsa_poll_recovery_4295.rs"
 required-features = ["local-audio"]
+
+# #4378 — la garde qui tient la fonctionnalité `dst` DÉSARMÉE : hors de tout
+# `default`, tirée par aucune autre fonctionnalité, et absente des lignes
+# `--features` de toutes les recettes qui PUBLIENT un artefact (release.yml,
+# docker.yml, Dockerfile), bases `plugin-catalog` comprises. La licence du
+# crate `dst-decoder` n'est pas tranchée (Apache-2.0 déclarée contre en-tête
+# ISO/Philips) : l'allumer est un arbitrage de Bertrand. Sans feature requise :
+# la garde lit des FICHIERS, elle doit tourner dans toutes les configurations.
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier ne
+# serait JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "dst_desarmee_4378"
+path = "tests/dst_desarmee_4378.rs"
