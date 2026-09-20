@@ -755,3 +755,10 @@ path = "tests/playback_panne_de_base_4261.rs"
 [[test]]
 name = "corps_vide_4447"
 path = "tests/corps_vide_4447.rs"
+
+# #4565 — le dénominateur de la ligne « Index de recherche ». `autotests =
+# false` en tête de ce manifeste : sans cette cible, ni le témoin du faux ⚠
+# ni sa contre-épreuve ne seraient jamais compilés.
+[[test]]
+name = "index_recherche_denominateur_4565"
+path = "tests/index_recherche_denominateur_4565.rs"
