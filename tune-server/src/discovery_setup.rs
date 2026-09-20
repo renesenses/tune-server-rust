@@ -1673,7 +1673,45 @@ pub fn spawn_mdns_handler(
                                 // device_id (device_id may have changed after a firmware
                                 // update / re-pairing).
                                 let same_name_zone = existing.iter().find(|z| z.name == dev.name);
-                                if let Some(z) = same_name_zone
+                                // #4520 — la sortie que la zone quitte est-elle
+                                // encore EN SERVICE ? Un Endpoint OAAT qui
+                                // redemarre s'annonce sous un nouvel identifiant,
+                                // au meme hote : re-ancrer en pleine lecture
+                                // laissait le sondeur surveiller la nouvelle
+                                // sortie, inactive, et couper la bonne.
+                                let ancienne_en_service = match same_name_zone
+                                    .and_then(|z| z.output_device_id.as_deref())
+                                {
+                                    Some(ancien) if ancien != dev.id => {
+                                        let etat = match reg.get(ancien) {
+                                            // Verrou tenu = sortie occupee par
+                                            // l'orchestrateur : en service.
+                                            Some(sortie) => match sortie.try_lock() {
+                                                Ok(s) => Some(
+                                                    s.get_status().await.map(|st| st.state).ok(),
+                                                ),
+                                                Err(_) => Some(None),
+                                            },
+                                            None => None,
+                                        };
+                                        reancrage_a_differer(
+                                            reg.type_of(ancien).as_deref(),
+                                            reg.host_of(ancien).as_deref(),
+                                            output_type_str,
+                                            &dev.host,
+                                            etat,
+                                        )
+                                    }
+                                    _ => false,
+                                };
+                                if ancienne_en_service {
+                                    info!(
+                                        name = %dev.name,
+                                        id = %dev.id,
+                                        old_id = ?same_name_zone.and_then(|z| z.output_device_id.clone()),
+                                        "mdns_zone_device_update_deferred_while_in_use"
+                                    );
+                                } else if let Some(z) = same_name_zone
                                     && let Some(zid) = z.id
                                 {
                                     let _ = zone_repo.update_output_device(zid, &dev.id);
@@ -2538,6 +2576,134 @@ pub fn declencher_la_recherche_a_la_connexion(state: &AppState) -> bool {
         info!(appareils, "ssdp_recherche_a_la_connexion_d_un_client");
     });
     true
+}
+
+/// #4520 — différer le ré-ancrage « même nom » d'une zone quand la sortie
+/// qu'elle quitte est encore en service.
+///
+/// Seulement pour le même type d'appareil, au même hôte : c'est le cas d'un
+/// Endpoint OAAT qui redémarre et s'annonce sous un nouvel identifiant.
+/// L'ancienne sortie joue toujours au même hôte:port ; arracher la zone à
+/// elle en pleine lecture fait surveiller par le sondeur une sortie neuve et
+/// inactive, qui finit par couper la bonne (`playback_failure_stopping_zone`,
+/// `peak_pos=0`). Une annonce ultérieure fera le ré-ancrage, zone libre.
+///
+/// `etat_ancienne` : `None` si l'ancienne sortie n'est plus enregistrée,
+/// `Some(None)` si son état est illisible ou son verrou tenu — traité comme
+/// « en service », parce que se tromper dans ce sens ne coupe rien.
+fn reancrage_a_differer(
+    type_ancienne: Option<&str>,
+    hote_ancienne: Option<&str>,
+    type_nouvelle: &str,
+    hote_nouvelle: &str,
+    etat_ancienne: Option<Option<tune_core::outputs::traits::TransportState>>,
+) -> bool {
+    use tune_core::outputs::traits::TransportState;
+    if type_ancienne != Some(type_nouvelle) || hote_ancienne != Some(hote_nouvelle) {
+        return false;
+    }
+    match etat_ancienne {
+        None => false,
+        Some(None) => true,
+        Some(Some(etat)) => matches!(etat, TransportState::Playing | TransportState::Paused),
+    }
+}
+
+#[cfg(test)]
+mod reancrage_4520 {
+    use super::reancrage_a_differer;
+    use tune_core::outputs::traits::TransportState;
+
+    /// Le cas de la .18 : Endpoint OAAT redémarré, même hôte, lecture en cours.
+    #[test]
+    fn un_endpoint_redemarre_en_pleine_lecture_n_est_pas_re_ancre() {
+        assert!(reancrage_a_differer(
+            Some("oaat"),
+            Some("192.168.1.44"),
+            "oaat",
+            "192.168.1.44",
+            Some(Some(TransportState::Playing)),
+        ));
+        assert!(reancrage_a_differer(
+            Some("oaat"),
+            Some("192.168.1.44"),
+            "oaat",
+            "192.168.1.44",
+            Some(Some(TransportState::Paused)),
+        ));
+    }
+
+    /// Verrou tenu ou état illisible : on ne sait pas, donc on ne coupe pas.
+    #[test]
+    fn une_sortie_occupee_ou_muette_compte_comme_en_service() {
+        assert!(reancrage_a_differer(
+            Some("oaat"),
+            Some("192.168.1.44"),
+            "oaat",
+            "192.168.1.44",
+            Some(None),
+        ));
+    }
+
+    /// Contre-épreuves : zone libre, autre hôte, autre type, ancienne sortie
+    /// disparue — le ré-ancrage se fait tout de suite, comme avant.
+    #[test]
+    fn hors_du_cas_le_re_ancrage_reste_immediat() {
+        let h = Some("192.168.1.44");
+        assert!(!reancrage_a_differer(
+            Some("oaat"),
+            h,
+            "oaat",
+            "192.168.1.44",
+            Some(Some(TransportState::Stopped))
+        ));
+        assert!(!reancrage_a_differer(
+            Some("oaat"),
+            Some("192.168.1.50"),
+            "oaat",
+            "192.168.1.44",
+            Some(Some(TransportState::Playing))
+        ));
+        assert!(!reancrage_a_differer(
+            Some("dlna"),
+            h,
+            "oaat",
+            "192.168.1.44",
+            Some(Some(TransportState::Playing))
+        ));
+        assert!(!reancrage_a_differer(
+            Some("oaat"),
+            h,
+            "oaat",
+            "192.168.1.44",
+            None
+        ));
+    }
+
+    /// Le branchement : le filet « même nom » consulte la règle AVANT de
+    /// réécrire l'identifiant de la zone.
+    #[test]
+    fn le_filet_meme_nom_consulte_la_regle_avant_d_ecrire() {
+        // Coupé AVANT la règle : ses témoins, plus bas dans ce même fichier,
+        // portent les mêmes littéraux et satisferaient la garde à eux seuls.
+        let complet: String = include_str!("discovery_setup.rs")
+            .split_whitespace()
+            .collect();
+        let source = &complet[..complet
+            .find("fnreancrage_a_differer(")
+            .expect("la règle est définie dans ce fichier")];
+        let regle = source
+            .find("letancienne_en_service=matchsame_name_zone")
+            .expect("le filet même nom calcule ancienne_en_service");
+        let differe = source
+            .find("\"mdns_zone_device_update_deferred_while_in_use\"")
+            .expect("le report est journalisé");
+        let ecrit = source[differe..]
+            .find("zone_repo.update_output_device(zid,&dev.id)")
+            .map(|i| i + differe)
+            .expect("l'écriture suit le report");
+        assert!(regle < differe && differe < ecrit);
+    }
 }
 
 #[cfg(test)]

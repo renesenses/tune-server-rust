@@ -103,6 +103,18 @@ pub fn priorite_bornee(limite_douce: Option<u32>, max_de_la_politique: u32) -> u
 mod linux {
     use super::{OrdonnancementTempsReel, POLITIQUE, priorite_bornee};
 
+    /// `sched_param` à la priorité donnée, les autres champs à zéro. Jamais
+    /// par littéral : la structure de musl porte quatre champs de plus
+    /// (`sched_ss_*`) que celle de glibc, et le littéral ne compile que sur
+    /// glibc — la v0.9.157 a échoué sur `aarch64-unknown-linux-musl`.
+    fn sched_param(priority: libc::c_int) -> libc::sched_param {
+        // SAFETY : `sched_param` est une structure C de simples entiers, pour
+        // laquelle le tout-zéro est une valeur valide.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        param.sched_priority = priority;
+        param
+    }
+
     /// Limite douce `RLIMIT_RTPRIO` du processus ; `None` = illimitée.
     pub fn limite_rtprio() -> Option<u32> {
         let mut lim = libc::rlimit {
@@ -123,7 +135,7 @@ mod linux {
     #[cfg(test)]
     pub fn politique_du_fil_courant() -> (libc::c_int, libc::c_int) {
         let mut politique: libc::c_int = 0;
-        let mut param = libc::sched_param { sched_priority: 0 };
+        let mut param = sched_param(0);
         // SAFETY : les deux sorties sont des valeurs locales valides ;
         // pthread_self() est toujours un fil vivant.
         unsafe {
@@ -138,9 +150,7 @@ mod linux {
         // SAFETY : appel sans argument ni effet de bord.
         let max = unsafe { libc::sched_get_priority_max(libc::SCHED_FIFO) };
         let priority = priorite_bornee(rlimit_rtprio, u32::try_from(max).unwrap_or(1));
-        let param = libc::sched_param {
-            sched_priority: priority as libc::c_int,
-        };
+        let param = sched_param(priority as libc::c_int);
         // SAFETY : `param` est valide le temps de l'appel ; pthread_self() est
         // le fil courant, qui ne peut pas disparaître pendant qu'il s'exécute.
         let rc =

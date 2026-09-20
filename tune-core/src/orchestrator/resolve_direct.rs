@@ -534,7 +534,15 @@ impl PlaybackOrchestrator {
         // failure. Applies to every downstream radio path (local and network).
         let resolved_playlist = self.resolve_playlist_url(raw_url).await;
         let audio_url: &str = resolved_playlist.as_deref().unwrap_or(raw_url);
-        let title = req.title.clone().unwrap_or_else(|| "Episode".into());
+        // #4323 — « Episode » n'est le bon repli que pour un podcast. Une
+        // lecture UPnP sans `dc:title` (ou une radio sans nom) prend le nom
+        // de fichier de son URL, à défaut l'hôte qui la sert : c'est ce
+        // libellé qui entre dans la lecture en cours ET dans l'historique.
+        let title = req
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| titre_de_repli(&source_apparente, audio_url));
         let artist = req.artist_name.clone();
         let album = req.album_title.clone();
         let cover_url = req.cover_url.clone();
@@ -1302,6 +1310,116 @@ impl PlaybackOrchestrator {
             };
             (direct_url, None, mime_type.to_string(), None, None, None)
         }
+    }
+}
+
+/// Titre d'une lecture directe dont la demande n'en porte aucun (#4323).
+///
+/// Un podcast garde « Episode », son contrat d'origine. Toute autre source
+/// — au premier chef `upnp`, le MediaRenderer piloté par un point de contrôle
+/// qui n'envoie pas de `dc:title` lisible — prend :
+///
+/// 1. le dernier segment du chemin de l'URL, décodé, sans extension, s'il
+///    ressemble à un nom (au moins une lettre, pas un mot générique comme
+///    `audio` ou `stream`) ;
+/// 2. sinon l'hôte qui sert le flux, sans port ;
+/// 3. sinon « Episode », faute de mieux.
+fn titre_de_repli(source: &str, url: &str) -> String {
+    const REPLI: &str = "Episode";
+    if source == "podcast" {
+        return REPLI.into();
+    }
+    let url = url.trim();
+    let sans_schema = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let sans_requete = sans_schema.split(['?', '#']).next().unwrap_or(sans_schema);
+    let (hote, chemin) = match sans_requete.find('/') {
+        Some(i) => sans_requete.split_at(i),
+        None => (sans_requete, ""),
+    };
+    const GENERIQUES: [&str; 12] = [
+        "audio", "stream", "file", "track", "play", "listen", "content", "media", "download",
+        "index", "get", "resource",
+    ];
+    let nom = chemin
+        .rsplit('/')
+        .find(|seg| !seg.is_empty())
+        .map(|seg| {
+            urlencoding::decode(seg)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| seg.to_string())
+        })
+        .map(|seg| match seg.rsplit_once('.') {
+            Some((base, ext))
+                if !base.is_empty()
+                    && (1..=5).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+            {
+                base.to_string()
+            }
+            _ => seg,
+        })
+        .map(|seg| seg.replace('_', " ").trim().to_string())
+        .filter(|seg| {
+            seg.chars().any(char::is_alphabetic)
+                && !GENERIQUES.contains(&seg.to_ascii_lowercase().as_str())
+        });
+    if let Some(nom) = nom {
+        return nom;
+    }
+    let hote = hote.rsplit('@').next().unwrap_or(hote);
+    let hote = match hote.strip_prefix('[') {
+        Some(reste) => reste.split(']').next().unwrap_or(reste),
+        None => hote.split(':').next().unwrap_or(hote),
+    };
+    if hote.is_empty() {
+        REPLI.into()
+    } else {
+        hote.to_string()
+    }
+}
+
+#[cfg(test)]
+mod temoins_du_titre_de_repli {
+    use super::titre_de_repli;
+
+    /// #4323 — une lecture UPnP sans titre ne s'appelle plus « Episode ».
+    #[test]
+    fn une_lecture_upnp_sans_titre_prend_le_nom_du_fichier() {
+        assert_eq!(
+            titre_de_repli(
+                "upnp",
+                "http://192.168.1.41:26125/music/01%20So_What.flac?x=1"
+            ),
+            "01 So What"
+        );
+        assert_eq!(
+            titre_de_repli("upnp", "http://nas.local:9000/audio/Kind%20of%20Blue"),
+            "Kind of Blue"
+        );
+    }
+
+    #[test]
+    fn un_chemin_sans_nom_retombe_sur_l_hote() {
+        assert_eq!(
+            titre_de_repli("upnp", "http://192.168.1.41:26125/content/4711.flac"),
+            "192.168.1.41"
+        );
+        assert_eq!(
+            titre_de_repli(
+                "upnp",
+                "http://192.168.0.167:8888/api/v1/library/tracks/187500/audio"
+            ),
+            "192.168.0.167"
+        );
+        assert_eq!(titre_de_repli("radio", "http://[fe80::1]:8000/"), "fe80::1");
+    }
+
+    #[test]
+    fn un_podcast_garde_episode() {
+        assert_eq!(
+            titre_de_repli("podcast", "https://cdn.example/show/ep42.mp3"),
+            "Episode"
+        );
     }
 }
 
