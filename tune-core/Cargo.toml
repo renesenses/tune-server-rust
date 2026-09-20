@@ -109,6 +109,13 @@ webpki-roots = "0.26"
 # env-only derivation collided every instance on "tune-server" (#1112, #1127).
 # Already in the lockfile transitively, so this is a near-free direct dep.
 hostname = "0.4"
+# Décodeur DST (DSD compressé sans perte des SACD), pur Rust, sans FFmpeg (#4378).
+# Sortie vérifiée bit à bit contre libdstdec (référence ISO/Philips) et, en
+# PCM flottant, contre FFmpeg, sur l'échantillon FATE `dst-64fs44-2ch.dff`.
+# DÉSARMÉ par défaut : son README reproduit l'en-tête ISO/Philips du code de
+# référence (« Copyright is not released for non MPEG-4 Audio conforming
+# products ») — l'armer dans une version livrée est une décision de licence.
+dst-decoder = { version = "0.1.2", optional = true }
 # ONNX runtime for the CLAP audio embedder (acoustic Smart Radio). `load-dynamic`
 # keeps the BUILD pure-Rust — no target-specific onnxruntime binary fetched at
 # compile time — and the shared lib is loaded at runtime next to the model
@@ -318,6 +325,12 @@ postgres = ["dep:sqlx"]
 # only builds that opt in pull `ort`, so the standard 6-target matrix is
 # untouched. The onnxruntime shared lib + model are provided at runtime.
 audio-embedding = ["dep:ort", "dep:libloading", "dep:flate2", "dep:tar", "dep:tokenizers"]
+# #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
+# de toute ligne de build publiée : la licence de `dst-decoder` n'est pas
+# tranchée (Apache-2.0 déclarée contre l'en-tête ISO/Philips reproduit dans
+# son README). L'allumer demande un arbitrage juridique de Bertrand. Garde :
+# tests/dst_desarmee_4378.rs.
+dst = ["dep:dst-decoder"]
 
 # #3248 : sur PostgreSQL, un INSERT conditionnel qui n'ecrit rien annulait la
 # transaction entiere, et la branche `returning` rendait `Ok(1)` en dur.
@@ -532,3 +545,16 @@ path = "tests/hqplayer_avance_album_4023.rs"
 name = "alsa_poll_recovery_4295"
 path = "tests/alsa_poll_recovery_4295.rs"
 required-features = ["local-audio"]
+
+# #4378 — la garde qui tient la fonctionnalité `dst` DÉSARMÉE : hors de tout
+# `default`, tirée par aucune autre fonctionnalité, et absente des lignes
+# `--features` de toutes les recettes qui PUBLIENT un artefact (release.yml,
+# docker.yml, Dockerfile), bases `plugin-catalog` comprises. La licence du
+# crate `dst-decoder` n'est pas tranchée (Apache-2.0 déclarée contre en-tête
+# ISO/Philips) : l'allumer est un arbitrage de Bertrand. Sans feature requise :
+# la garde lit des FICHIERS, elle doit tourner dans toutes les configurations.
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier ne
+# serait JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "dst_desarmee_4378"
+path = "tests/dst_desarmee_4378.rs"

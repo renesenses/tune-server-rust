@@ -1373,6 +1373,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dst-decoder"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d22ef63dfde0eac89eca20926f8bb64eec4bf12016647274a51d3bb11f6147c"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5296,6 +5305,7 @@ dependencies = [
  "csv",
  "curve25519-elligator2",
  "data-encoding",
+ "dst-decoder",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
