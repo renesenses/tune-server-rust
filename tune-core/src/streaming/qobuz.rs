@@ -1218,7 +1218,7 @@ impl QobuzService {
     ///
     /// Un `fav_type` qui n'est ni `tracks` ni `albums` est traité en artiste :
     /// le seul appelant a déjà écarté les autres.
-    fn favori_date(brut: &serde_json::Value, fav_type: &str) -> serde_json::Value {
+    pub(crate) fn favori_date(brut: &serde_json::Value, fav_type: &str) -> serde_json::Value {
         let mut element = match fav_type {
             "tracks" => serde_json::to_value(Self::map_track(brut)),
             "albums" => serde_json::to_value(Self::map_album(brut)),
