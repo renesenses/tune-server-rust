@@ -519,6 +519,109 @@ mod tests {
         assert!(!resultat.erreurs.is_empty());
         assert_eq!(resultat.mises_a_jour, 0);
     }
+    /// 🔴 #4581 — mesuré sur le .18 le 20/09/2026 : 45 tuiles
+    /// « (Unknown Album) », dont 44 SANS AUCUNE PISTE, une par passe de la
+    /// synchronisation horaire depuis le 15/09.
+    ///
+    /// Le déclencheur : le plan retrouve un album par son (titre, artiste)
+    /// COURANT, `album_existant` par sa CLÉ persistée. Les deux divergent dès
+    /// que l'artiste de la ligne passe à NULL. La version précédente créait
+    /// alors un jumeau sous un `UUID v4` — un album invisible à sa propre clé,
+    /// donc un de plus à chaque passe, sans fin.
+    #[test]
+    fn identites_upnp_un_album_deja_porteur_de_la_cle_est_reutilise_et_les_coquilles_partent() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let albums = AlbumRepo::with_backend(state.backend.clone());
+        let a = piste("A", "a");
+        let b = piste("B", "b");
+        assert_eq!(indexer(&state, "u", &[a.clone(), b]).albums_ajoutes, 1);
+        let cle = cle_d_identite_album("u", "Album", Some("Artiste"));
+        let id = album_existant(&state, &cle).unwrap();
+
+        // Le piège demande DEUX conditions, et les voici toutes les deux.
+        //
+        // 1. La ligne garde sa clé, mais son artiste ne permet plus de la
+        //    recalculer : le plan ne la retrouve pas par (titre, artiste).
+        // 2. Le rattrapage par renommage ne joue pas non plus — il exige que
+        //    le groupe entrant couvre TOUTES les pistes de l'album, et les
+        //    passes suivantes n'en rapportent qu'une sur deux.
+        //
+        // Reste alors `album_existant`, qui la retrouve, lui, par sa clé
+        // persistée. C'est exactement l'état du .18 : un album que le plan
+        // manque et que la clé trouve.
+        state
+            .backend
+            .execute("UPDATE albums SET artist_id = NULL WHERE id = ?", &[&id])
+            .unwrap();
+
+        for passe in 1..=3 {
+            let bilan = indexer(&state, "u", std::slice::from_ref(&a));
+            assert!(
+                bilan.erreurs.is_empty(),
+                "passe {passe} : {:?}",
+                bilan.erreurs
+            );
+            assert_eq!(bilan.albums_ajoutes, 0, "passe {passe} : aucun jumeau");
+        }
+        let restants = state
+            .backend
+            .query_many(
+                "SELECT id, source_id FROM albums WHERE source = 'upnp'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(restants.len(), 1, "un seul album distant : {restants:?}");
+        assert_eq!(
+            restants[0][0].as_i64(),
+            Some(id),
+            "le MÊME, pas un successeur"
+        );
+        assert_eq!(
+            restants[0][1].as_string().as_deref(),
+            Some(cle.as_str()),
+            "la clé d'identité reste celle de l'album"
+        );
+    }
+
+    /// Le retrait des coquilles est borné : ce serveur, sans piste, hors favori.
+    #[test]
+    fn identites_upnp_le_retrait_des_coquilles_epargne_favori_autre_serveur_et_local() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let albums = AlbumRepo::with_backend(state.backend.clone());
+        let coquille = |cle: &str| {
+            let mut album = Album::new("Vide".into());
+            album.source = "upnp".into();
+            album.source_id = Some(cle.into());
+            albums.create(&album).unwrap()
+        };
+        let a_retirer = coquille("u|coquille");
+        let favori = coquille("u|favori");
+        let ailleurs = coquille("autre|coquille");
+        let local = albums.create(&Album::new("Album local".into())).unwrap();
+        state
+            .backend
+            .execute(
+                "INSERT INTO favorites (profile_id,item_type,item_id) VALUES (1,'album',?)",
+                &[&favori.to_string()],
+            )
+            .unwrap();
+
+        let bilan = indexer(&state, "u", &[piste("A", "a")]);
+        assert!(bilan.erreurs.is_empty(), "{:?}", bilan.erreurs);
+        assert_eq!(bilan.albums_vides_retires, 1);
+        assert!(albums.get(a_retirer).unwrap().is_none(), "la coquille part");
+        for (quoi, id) in [
+            ("le favori", favori),
+            ("un autre serveur", ailleurs),
+            ("le local", local),
+        ] {
+            assert!(albums.get(id).unwrap().is_some(), "{quoi} reste");
+        }
+        // L'album que la passe vient d'écrire porte sa piste : il reste.
+        let vivant = album_existant(&state, &cle_d_identite_album("u", "Album", Some("Artiste")));
+        assert!(albums.get(vivant.unwrap()).unwrap().is_some());
+    }
+
     #[test]
     fn identites_upnp_un_album_local_ne_peut_pas_etre_renomme_par_une_piste_distante() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();

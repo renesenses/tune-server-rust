@@ -82,10 +82,14 @@
 //!
 //! # Ce que cette passe écrit, et ce qu'elle n'écrit jamais
 //!
-//! Purement **additive** : `INSERT` ou `UPDATE` de l'instantané, **aucun
-//! `DELETE`**, jamais — la réconciliation et ses quatre gardes de purge sont la
-//! phase 4. Relancer l'indexation deux fois de suite ne crée pas de doublon et
-//! ne supprime rien.
+//! `INSERT` ou `UPDATE` de l'instantané. Aucune piste n'est jamais supprimée —
+//! la réconciliation et ses quatre gardes de purge sont la phase 4. Relancer
+//! l'indexation deux fois de suite ne crée pas de doublon.
+//!
+//! **Une seule exception, ajoutée par #4581** : les albums distants de CE
+//! serveur restés sans aucune piste sont retirés en fin de passe (voir
+//! [`retirer_les_albums_vides`]). Ce ne sont pas des données — ce sont des
+//! coquilles qu'une version précédente fabriquait, une par passe.
 //!
 //! Les lignes posées portent `source = 'upnp'` et `file_path = NULL`. Elles
 //! sont donc hors de portée du scan local, qui ne connaît que les chemins :
@@ -452,6 +456,8 @@ struct Bilan {
     sans_url: usize,
     sans_taille: usize,
     albums_ajoutes: usize,
+    /// #4581 — les coquilles distantes retirées par cette passe.
+    albums_vides_retires: usize,
     plafond_atteint: Option<&'static str>,
     /// La valeur du plafond qui a mordu (#4154) — `u64::MAX` pour « sans
     /// limite ». Rangée ici parce que `reserves()` ne reçoit que le bilan, et
@@ -583,6 +589,7 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
             "sans_res_size": bilan.sans_taille,
         },
         "albums_ajoutes": bilan.albums_ajoutes,
+        "albums_vides_retires": bilan.albums_vides_retires,
         "pochettes_en_cache": nb_pochettes,
         "supprimees": 0,
         "erreurs": bilan.erreurs,
@@ -836,20 +843,43 @@ fn ecrire(
                 match albums_vus.get(&cle_album) {
                     Some(id) => Some(*id),
                     None => {
-                        let trouve = plan.albums.get(&cle_album).copied();
+                        // 🔴 #4581 — un album qui porte DÉJÀ cette clé EST cet
+                        // album. On le réutilise.
+                        //
+                        // Le plan ne retrouve un album que par son (titre,
+                        // artiste) COURANT ; `album_existant` le retrouve par
+                        // sa CLÉ persistée. Les deux peuvent diverger — un
+                        // artiste passé à NULL suffit. La version précédente
+                        // créait alors un jumeau et lui donnait un `UUID v4`
+                        // pour esquiver la collision de `source_id`. Ce jumeau
+                        // naissait invisible à sa propre clé d'identité : la
+                        // passe suivante refaisait le même constat et ajoutait
+                        // encore un album.
+                        //
+                        // Mesuré sur le .18 le 20/09/2026 : 45 lignes
+                        // « (Unknown Album) », dont 44 SANS AUCUNE PISTE, une
+                        // par passe de la synchronisation horaire depuis le
+                        // 15/09. Aucune ne portait
+                        // `cle_d_identite_album("(Unknown Album)", "Unknown
+                        // Artist")`, donc la réconciliation de #4201 ne
+                        // pouvait jamais les rattraper.
+                        //
+                        // Réutiliser évite la collision au lieu de la
+                        // contourner, et tient la promesse de #4201 :
+                        // l'identifiant, la clé source et les liens
+                        // utilisateur ne bougent pas.
+                        let trouve = plan
+                            .albums
+                            .get(&cle_album)
+                            .copied()
+                            .or_else(|| album_existant(state, &cle_album));
                         let id = match trouve {
                             Some(id) => Some(id),
                             None => {
                                 let mut album = Album::new(titre_album.to_string());
                                 album.artist_id = artiste_id;
                                 album.source = SOURCE_UPNP.to_string();
-                                // L'ancien nom peut être une clé durable encore utilisée.
-                                album.source_id =
-                                    Some(if album_existant(state, &cle_album).is_some() {
-                                        format!("{udn}|{}", uuid::Uuid::new_v4())
-                                    } else {
-                                        cle_album.clone()
-                                    });
+                                album.source_id = Some(cle_album.clone());
                                 // Adresse locale du contenu : aucune requête
                                 // vers le serveur UPnP pendant l'affichage.
                                 album.cover_path = pochette_album.clone();
@@ -1007,6 +1037,50 @@ fn ecrire(
                 .erreurs
                 .push(format!("instantané de « {} » : {e}", piste.titre));
         }
+    }
+
+    retirer_les_albums_vides(state, udn, bilan);
+}
+
+/// 🔴 #4581 — les coquilles que les passes précédentes ont laissées.
+///
+/// Un album distant SANS AUCUNE PISTE n'est rien : pas de pochette, pas de
+/// piste à lire, une fiche qui s'ouvre vide. Il n'occupe qu'une tuile dans la
+/// grille. Sur le .18, 44 d'entre elles s'étaient accumulées, toutes titrées
+/// « (Unknown Album) », toutes en tête du tri A–Z.
+///
+/// Le retrait est le SEUL `DELETE` de cette passe, et il est borné trois fois :
+///
+/// - `source = 'upnp'` et `source_id LIKE '<udn>|%'` — CE serveur seulement ;
+///   un album local, ou celui d'un autre serveur, n'est jamais touché ;
+/// - aucune piste ne le réclame ;
+/// - il n'est pas en favori.
+///
+/// C'est exactement la garde de `remove_missing` (`synchronisation_upnp.rs`),
+/// qui nettoie déjà les mêmes coquilles — mais seulement à la fin d'une
+/// synchronisation COMPLÈTE. Les 44 du .18 y ont survécu, d'où ce second point
+/// de passage, joué à chaque indexation.
+fn retirer_les_albums_vides(state: &AppState, udn: &str, bilan: &mut Bilan) {
+    let filtre = format!(
+        "{}|%",
+        udn.replace('!', "!!").replace('%', "!%").replace('_', "!_")
+    );
+    let param = match state.backend.engine() {
+        tune_core::db::engine::Engine::Sqlite => "?",
+        tune_core::db::engine::Engine::Postgres => "$1",
+    };
+    let sql = format!(
+        "DELETE FROM albums WHERE source = '{SOURCE_UPNP}' \
+         AND source_id LIKE {param} ESCAPE '!' \
+         AND NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id) \
+         AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.item_type = 'album' \
+         AND f.item_id = CAST(albums.id AS TEXT))"
+    );
+    match state.backend.execute(&sql, &[&filtre as &dyn ToSqlValue]) {
+        Ok(retires) => bilan.albums_vides_retires = retires,
+        Err(e) => bilan
+            .erreurs
+            .push(format!("retrait des albums distants vides : {e}")),
     }
 }
 
