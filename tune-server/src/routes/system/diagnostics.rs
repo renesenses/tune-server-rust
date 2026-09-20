@@ -1852,28 +1852,53 @@ fn valeur_lisible(valeur: &Value) -> String {
 /// ni l'autre : il donnait le nombre d'albums, jamais le nombre d'albums
 /// INDEXÉS.
 ///
-/// Rendu en `(albums, albums indexés, pistes, pistes indexées, artistes,
-/// artistes indexés)`. Chaque champ vaut `None` quand le compte n'a pas pu
-/// être lu — une table FTS absente sur un moteur qui n'en a pas (PostgreSQL
-/// indexe par `tsvector`, pas par table miroir) ne doit pas faire mentir le
-/// rapport avec un zéro.
-fn couverture_de_l_index(state: &AppState) -> Vec<(&'static str, Option<i64>)> {
+/// Rendu en `(table, lignes indexées, lignes en base)`. Chaque compte vaut
+/// `None` quand il n'a pas pu être lu — une table FTS absente sur un moteur qui
+/// n'en a pas (PostgreSQL indexe par `tsvector`, pas par table miroir) ne doit
+/// pas faire mentir le rapport avec un zéro.
+///
+/// 🔴 #4565 — **les deux chiffres se lisent ici, et nulle part ailleurs.**
+///
+/// Le dénominateur venait des compteurs de la bibliothèque (`ArtistRepo::count`
+/// & co) affichés juste au-dessus dans le rapport. Or `ArtistRepo::count()` ne
+/// compte PAS la table `artists` : il compte les artistes **porteurs d'au moins
+/// un album** (`WHERE id IN (SELECT DISTINCT artist_id FROM albums …)`), tandis
+/// que le déclencheur `artists_fts_insert` indexe **chaque** insertion dans
+/// `artists`, sans condition. Les deux ensembles n'étaient pas comparables, et
+/// tout serveur portant un seul artiste sans album (piste seule, compilation,
+/// featuring — l'ordinaire) affichait un ⚠ permanent sur une ligne saine :
+/// `artists 1826/1824 ⚠` chez Jean Valjean en 0.9.158, premier retour de
+/// terrain de l'instrumentation posée par #4319 — qui mentait donc dès son
+/// premier usage. `albums` et `tracks` tombaient juste parce que LEURS
+/// `count()` sont, eux, non filtrés.
+///
+/// Le dénominateur est désormais `SELECT COUNT(*) FROM {table}` : la ligne
+/// mesure l'INDEX — combien de lignes de la table source lui manquent — ce qui
+/// est exactement la question que #4319 sert à trancher (« le mot cherché ne
+/// correspond pas » vs « la ligne manque à l'index »). Le titre de la ligne dit
+/// ce qui est comparé, pour qu'on ne la confonde plus avec le compteur
+/// `Artists:` du dessus, qui répond à une autre question.
+fn couverture_de_l_index(state: &AppState) -> Vec<(&'static str, Option<i64>, Option<i64>)> {
     if state.backend.engine() != tune_core::db::engine::Engine::Sqlite {
         // PostgreSQL : l'index vit dans une COLONNE `search_tsv`, il n'y a pas
         // de table miroir à compter. On ne rend rien plutôt qu'un chiffre qui
         // ne voudrait rien dire.
         return Vec::new();
     }
+    let compte = |sql: String| -> Option<i64> {
+        state
+            .backend
+            .query_one(&sql, &[])
+            .ok()
+            .flatten()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()))
+    };
     ["albums", "tracks", "artists"]
         .into_iter()
         .map(|table| {
-            let n = state
-                .backend
-                .query_one(&format!("SELECT COUNT(*) FROM {table}_fts"), &[])
-                .ok()
-                .flatten()
-                .and_then(|c| c.first().and_then(|v| v.as_i64()));
-            (table, n)
+            let indexees = compte(format!("SELECT COUNT(*) FROM {table}_fts"));
+            let en_base = compte(format!("SELECT COUNT(*) FROM {table}"));
+            (table, indexees, en_base)
         })
         .collect()
 }
@@ -2055,26 +2080,34 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // Le nombre d'entrées INDEXÉES tranche entre « le mot ne correspond pas »
     // et « la ligne manque à l'index ». Muet sur PostgreSQL, qui indexe par
     // colonne et n'a pas de table miroir à compter.
+    //
+    // #4565 — le dénominateur est le nombre de lignes de la table SOURCE, lu
+    // par `couverture_de_l_index` elle-même : deux ensembles comparables. Il ne
+    // vient plus des compteurs de bibliothèque ci-dessus, dont celui des
+    // artistes est FILTRÉ (artistes porteurs d'un album) et levait un ⚠
+    // permanent sur une ligne saine. Le titre dit ce qui est comparé.
     let couverture = couverture_de_l_index(&state);
     if !couverture.is_empty() {
         md.push_str("- Index de recherche : ");
-        let attendu = |t: &str| match t {
-            "albums" => albums,
-            "tracks" => tracks,
-            _ => artists,
-        };
         let lignes: Vec<String> = couverture
             .iter()
-            .map(|(table, n)| match n {
-                Some(n) => {
-                    let total = attendu(table);
-                    let ecart = if *n == total { "" } else { " ⚠" };
+            .map(|(table, indexees, en_base)| match (indexees, en_base) {
+                (Some(n), Some(total)) => {
+                    let ecart = if n == total { "" } else { " ⚠" };
                     format!("{table} {n}/{total}{ecart}")
                 }
-                None => format!("{table} illisible"),
+                // Une moitié illisible n'est pas un écart : on ne compare pas
+                // un chiffre à une absence, et surtout on ne lève pas de ⚠.
+                (Some(n), None) => format!("{table} {n}/? (base illisible)"),
+                (None, _) => format!("{table} illisible"),
             })
             .collect();
         md.push_str(&lignes.join(", "));
+        // Ce que les deux chiffres SONT, écrit sur la ligne. Sans cela on la
+        // compare aux compteurs `Albums:`/`Artists:` du dessus, qui ne
+        // répondent pas à la même question — c'est précisément ce que #4565
+        // a coûté.
+        md.push_str(" (indexées/en base)");
         md.push('\n');
     }
     md.push('\n');
@@ -2392,9 +2425,19 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
             "scan_status": scan_status,
             // #4319 — ce que la RECHERCHE voit, à côté de ce que la
             // bibliothèque contient. Absent sur PostgreSQL.
-            "search_index": couverture_de_l_index(&state)
-                .into_iter()
-                .map(|(t, n)| (t.to_string(), json!(n)))
+            //
+            // #4565 — `search_index_total` est le SEUL dénominateur juste :
+            // le nombre de lignes de la table source. Les compteurs
+            // `library.artists` & co ci-dessus répondent à une autre question
+            // (`ArtistRepo::count()` ne compte que les artistes porteurs d'un
+            // album) ; les comparer à l'index levait un ⚠ permanent.
+            "search_index": couverture
+                .iter()
+                .map(|(t, indexees, _)| ((*t).to_string(), json!(indexees)))
+                .collect::<serde_json::Map<_, _>>(),
+            "search_index_total": couverture
+                .iter()
+                .map(|(t, _, en_base)| ((*t).to_string(), json!(en_base)))
                 .collect::<serde_json::Map<_, _>>(),
         },
         "zones": {
