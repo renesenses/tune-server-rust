@@ -5,6 +5,7 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
 use super::facet_filter::{Placeholders, any_of, favorite_condition, hidden_tracks_excluded};
+use super::home_queries::{DATE_D_AJOUT, JOINTURE_PREMIERE_VUE};
 use super::models::Track;
 use super::sqlite::SqliteDb;
 use crate::TuneError;
@@ -1309,6 +1310,94 @@ pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
 }
 
+/// La date d'ajout d'une piste ne doit pas suivre ses réécritures (#4546).
+///
+/// « Ajouté récemment » (accueil, tri de la bibliothèque) lit
+/// `file_first_seen.first_seen_at`, et retombe sur `tracks.file_mtime` quand
+/// la piste n'y a pas de ligne ([`DATE_D_AJOUT`]). Or ce repli était la règle
+/// et non l'exception : `create_batch` — le chemin du SCAN — n'a jamais écrit
+/// dans `file_first_seen` (il est antérieur à la table, 7303a570 n'a câblé que
+/// `create`). Une piste scannée était donc datée par son `mtime`, que toute
+/// modification des étiquettes fait avancer, et que le rescan recopie : Jean
+/// Valjean retouche un album, l'album remonte en tête des ajouts récents.
+///
+/// Trois gestes ferment la brèche, tous par la même table :
+/// * une piste INSÉRÉE par lot reçoit sa première vue, comme par `create` ;
+/// * avant qu'une mise à jour ne récrive `file_mtime`, la date d'ajout
+///   COURANTE est figée ([`sql_figer_premiere_vue`]) — pour une piste déjà
+///   datée, rien ne bouge ; pour une piste d'avant, c'est le `mtime` qu'on
+///   lui affichait jusque-là, et plus la date de la retouche ;
+/// * `delete_all` fige de même toute la bibliothèque avant de la vider, sans
+///   quoi le rescan complet qui suit daterait « aujourd'hui » chaque piste
+///   restée sans ligne.
+///
+/// Un fichier RENOMMÉ ou déplacé hors de Tune reste un nouveau chemin, donc
+/// un nouvel ajout : la table est clée par chemin.
+fn sql_figer_premiere_vue(engine: Engine, cle: &str) -> String {
+    let (p1, p2) = match engine {
+        Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+        Engine::Postgres => (
+            PostgresDialect.placeholder(1),
+            PostgresDialect.placeholder(2),
+        ),
+    };
+    let selection = format!(
+        "SELECT CAST({p1} AS TEXT), {DATE_D_AJOUT} FROM tracks t {JOINTURE_PREMIERE_VUE} \
+         WHERE t.{cle} = {p2} AND {DATE_D_AJOUT} IS NOT NULL"
+    );
+    match engine {
+        Engine::Sqlite => {
+            format!("INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) {selection}")
+        }
+        Engine::Postgres => format!(
+            "INSERT INTO file_first_seen (file_path, first_seen_at) {selection} \
+             ON CONFLICT (file_path) DO NOTHING"
+        ),
+    }
+}
+
+/// Fige la date d'ajout de TOUTES les pistes locales sans ligne (#4546).
+fn sql_figer_toutes_les_premieres_vues(engine: Engine) -> String {
+    let selection = format!(
+        "SELECT t.file_path, {DATE_D_AJOUT} FROM tracks t {JOINTURE_PREMIERE_VUE} \
+         WHERE ffs.file_path IS NULL AND t.file_path IS NOT NULL AND t.file_path <> '' \
+         AND t.file_path NOT LIKE 'http%' AND {DATE_D_AJOUT} IS NOT NULL"
+    );
+    match engine {
+        Engine::Sqlite => {
+            format!("INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) {selection}")
+        }
+        Engine::Postgres => format!(
+            "INSERT INTO file_first_seen (file_path, first_seen_at) {selection} \
+             ON CONFLICT (file_path) DO NOTHING"
+        ),
+    }
+}
+
+/// Première vue « maintenant » d'un chemin qui entre dans la bibliothèque.
+fn sql_premiere_vue_maintenant(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Postgres => {
+            "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2) ON CONFLICT (file_path) DO NOTHING"
+        }
+        Engine::Sqlite => {
+            "INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) VALUES (?, ?)"
+        }
+    }
+}
+
+/// Un chemin de fichier LOCAL, le seul qui ait une date d'ajout.
+fn chemin_local(chemin: Option<&str>) -> Option<&str> {
+    chemin.filter(|p| !p.is_empty() && !p.starts_with("http"))
+}
+
+fn maintenant_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 impl TrackRepo {
     pub fn backend(&self) -> &dyn DbBackend {
         &*self.db
@@ -1443,23 +1532,12 @@ impl TrackRepo {
         // path in a side table that survives a full rescan (delete_all wipes
         // tracks/albums but not file_first_seen). Best-effort: never fail track
         // creation over this. Streaming tracks (http URLs / no path) are skipped.
-        if let Some(path) = track.file_path.as_deref() {
-            if !path.is_empty() && !path.starts_with("http") {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                let fs_sql = match self.db.engine() {
-                    Engine::Postgres => {
-                        "INSERT INTO file_first_seen (file_path, first_seen_at) VALUES ($1, $2) ON CONFLICT (file_path) DO NOTHING"
-                    }
-                    Engine::Sqlite => {
-                        "INSERT OR IGNORE INTO file_first_seen (file_path, first_seen_at) VALUES (?, ?)"
-                    }
-                };
-                let fs_params: [&dyn ToSqlValue; 2] = [&path, &now];
-                let _ = self.db.execute(fs_sql, &fs_params);
-            }
+        if let Some(path) = chemin_local(track.file_path.as_deref()) {
+            let now = maintenant_epoch();
+            let fs_params: [&dyn ToSqlValue; 2] = [&path, &now];
+            let _ = self
+                .db
+                .execute(sql_premiere_vue_maintenant(self.db.engine()), &fs_params);
         }
 
         Ok(id)
@@ -1501,6 +1579,13 @@ impl TrackRepo {
             &track.comments,
             &id,
         ];
+        // #4546 : figer la date d'ajout AVANT que `file_mtime` ne soit récrit.
+        if let Some(chemin) = chemin_local(track.file_path.as_deref()) {
+            let figer: [&dyn ToSqlValue; 2] = [&chemin, &id];
+            let _ = self
+                .db
+                .execute(&sql_figer_premiere_vue(self.db.engine(), "id"), &figer);
+        }
         self.db.execute(&sql, &params).map_err(TuneError::Db)?;
         Ok(())
     }
@@ -1532,7 +1617,11 @@ impl TrackRepo {
         // 4 sequential DELETEs — wrap in write_tx for atomicity.
         let mut count: u64 = 0;
         let count_ref = &mut count;
+        // #4546 : le rescan complet qui suit ne doit pas dater « aujourd'hui »
+        // les pistes restées sans première vue.
+        let figer = sql_figer_toutes_les_premieres_vues(self.db.engine());
         self.db.write_tx(&mut |tx| {
+            let _ = tx.execute(&figer, &[]);
             *count_ref = tx.execute(sql::delete_all(), &[])? as u64;
             let _ = tx.execute("DELETE FROM albums", &[]);
             let _ = tx.execute("DELETE FROM artists", &[]);
@@ -1980,6 +2069,14 @@ impl TrackRepo {
         file_size: i64,
     ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mtime_and_size, sql::update_mtime_and_size);
+        // #4546 : c'est ici que la retouche d'étiquettes avance le `mtime`.
+        if let Some(chemin) = chemin_local(Some(file_path)) {
+            let figer: [&dyn ToSqlValue; 2] = [&chemin, &chemin];
+            let _ = self.db.execute(
+                &sql_figer_premiere_vue(self.db.engine(), "file_path"),
+                &figer,
+            );
+        }
         let params: [&dyn ToSqlValue; 3] = [&mtime, &file_size, &file_path];
         self.db.execute(&sql, &params)?;
         Ok(())
@@ -2477,12 +2574,19 @@ impl TrackRepo {
         // One backend call for the whole batch: on Postgres this reuses a
         // single connection + prepared statement instead of a per-row
         // runtime hop (see DbBackend::execute_many).
+        let mut premieres_vues: Vec<Vec<SqlValue>> = Vec::new();
+        let maintenant = maintenant_epoch();
         for (track, res) in tracks
             .iter()
             .zip(self.db.execute_many(&insert_sql, &row_params))
         {
             match res {
-                Ok(_) => count += 1,
+                Ok(_) => {
+                    count += 1;
+                    if let Some(chemin) = chemin_local(track.file_path.as_deref()) {
+                        premieres_vues.push(vec![chemin.to_sql_value(), maintenant.to_sql_value()]);
+                    }
+                }
                 // Previously this failure was swallowed silently: the scanner
                 // reported "files=N errors=0" while the tracks never landed in
                 // the library (JP Borderies: ~205 tracks in DB vs ~779 on disk
@@ -2515,6 +2619,15 @@ impl TrackRepo {
                 detaillees = ECHECS_DETAILLES,
                 pistes = tracks.len(),
                 "track_insert_failures_truncated"
+            );
+        }
+        // #4546 : la première vue, comme `create` — le scan passe par ICI, et
+        // sans elle la date d'ajout retombait sur un `mtime` que chaque
+        // retouche d'étiquettes fait avancer. Au mieux, jamais bloquant.
+        if !premieres_vues.is_empty() {
+            let _ = self.db.execute_many(
+                sql_premiere_vue_maintenant(self.db.engine()),
+                &premieres_vues,
             );
         }
         // ── Ce que la sonde retirée voulait voir (#2890) ──────────────────
@@ -2575,6 +2688,7 @@ impl TrackRepo {
         // Rows without an id are skipped, so collect the params first and
         // batch them through one execute_many call (see create_batch).
         let mut row_params: Vec<Vec<SqlValue>> = Vec::with_capacity(tracks.len());
+        let mut figer_params: Vec<Vec<SqlValue>> = Vec::new();
         for track in tracks {
             let Some(id) = track.id else { continue };
             let params: [&dyn ToSqlValue; 25] = [
@@ -2605,6 +2719,16 @@ impl TrackRepo {
                 &id,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
+            if let Some(chemin) = chemin_local(track.file_path.as_deref()) {
+                figer_params.push(vec![chemin.to_sql_value(), id.to_sql_value()]);
+            }
+        }
+        // #4546 : figer la date d'ajout AVANT que le lot ne récrive `file_mtime`.
+        if !figer_params.is_empty() {
+            let _ = self.db.execute_many(
+                &sql_figer_premiere_vue(self.db.engine(), "id"),
+                &figer_params,
+            );
         }
         let mut echecs = 0usize;
         for res in self.db.execute_many(&update_sql, &row_params) {
@@ -3061,7 +3185,7 @@ mod tests {
     use super::*;
     use crate::db::album_repo::AlbumRepo;
     use crate::db::artist_repo::ArtistRepo;
-    use crate::db::models::Artist;
+    use crate::db::models::{Album, Artist};
 
     fn test_db() -> SqliteDb {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -4145,5 +4269,176 @@ mod tests {
                 "et sur le même total (terme = {terme:?})"
             );
         }
+    }
+
+    // ── #4546 : une retouche d'étiquettes n'est pas un ajout ──────────────
+
+    /// La date d'ajout d'un album, telle que l'accueil et le tri la lisent.
+    fn date_d_ajout(repo: &TrackRepo, album: i64) -> Option<f64> {
+        let sql = format!(
+            "SELECT MAX({DATE_D_AJOUT}) FROM tracks t {JOINTURE_PREMIERE_VUE} \
+             WHERE t.album_id = ?"
+        );
+        let p: [&dyn ToSqlValue; 1] = [&album];
+        repo.backend()
+            .query_one(&sql, &p)
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_f64()))
+    }
+
+    /// Deux albums scannés (par LOT, le chemin du scan), le plus ancien en
+    /// premier. Rend `(repo, ancien, récent)` et les pistes relues.
+    fn deux_albums_scannes(db: &SqliteDb) -> (TrackRepo, i64, i64) {
+        let albums = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db.clone());
+        let ancien = albums.create(&Album::new("Ancien".into())).unwrap();
+        let recent = albums.create(&Album::new("Récent".into())).unwrap();
+        let mut lot = Vec::new();
+        for (album, chemin, mtime) in [
+            (ancien, "/music/ancien/01.flac", 1_000.0),
+            (recent, "/music/recent/01.flac", 2_000.0),
+        ] {
+            let mut t = Track::new("t".into());
+            t.album_id = Some(album);
+            t.file_path = Some(chemin.into());
+            t.file_mtime = Some(mtime);
+            lot.push(t);
+        }
+        assert_eq!(repo.create_batch(&lot).unwrap(), 2);
+        (repo, ancien, recent)
+    }
+
+    /// Le chemin du SCAN écrit la première vue, comme `create`.
+    ///
+    /// Rouge avant #4546 : `create_batch` n'écrivait rien dans
+    /// `file_first_seen`, la date d'ajout de toute piste scannée ÉTAIT son
+    /// `mtime`.
+    #[test]
+    fn le_scan_par_lot_ecrit_la_premiere_vue_4546() {
+        let db = test_db();
+        let (repo, ancien, _) = deux_albums_scannes(&db);
+        let lignes = repo
+            .backend()
+            .query_one("SELECT COUNT(*) FROM file_first_seen", &[])
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_i64()));
+        assert_eq!(lignes, Some(2), "create_batch doit dater ses pistes");
+        let date = date_d_ajout(&repo, ancien).unwrap();
+        assert!(
+            date > 1_000_000_000.0,
+            "la date d'ajout d'une piste scannée est sa première vue, pas son \
+             mtime (1000) : {date}"
+        );
+    }
+
+    /// Le cas de Jean Valjean, sur les TROIS chemins qui récrivent le
+    /// `mtime` : une piste scannée avant la correction (donc sans première
+    /// vue) garde la date qu'on lui affichait, et ne remonte pas.
+    #[test]
+    fn retoucher_les_etiquettes_ne_date_pas_l_album_4546() {
+        for chemin_de_mise_a_jour in ["update", "update_batch", "update_mtime_and_size"] {
+            let db = test_db();
+            let (repo, ancien, _) = deux_albums_scannes(&db);
+            // Une bibliothèque scannée avant #4546 : aucune première vue.
+            db.execute_batch("DELETE FROM file_first_seen;").unwrap();
+            assert_eq!(date_d_ajout(&repo, ancien), Some(1_000.0));
+
+            // La retouche : le fichier est récrit, son mtime avance.
+            let mut piste = repo.list_by_album(ancien).unwrap().remove(0);
+            piste.file_mtime = Some(9_000.0);
+            match chemin_de_mise_a_jour {
+                "update" => repo.update(&piste).unwrap(),
+                "update_batch" => {
+                    assert_eq!(repo.update_batch(&[piste]).unwrap(), 1);
+                }
+                _ => repo
+                    .update_mtime_and_size("/music/ancien/01.flac", 9_000.0, 1)
+                    .unwrap(),
+            }
+
+            let mtime: Option<f64> = repo
+                .list_by_album(ancien)
+                .unwrap()
+                .first()
+                .and_then(|t| t.file_mtime);
+            assert_eq!(mtime, Some(9_000.0), "la retouche a bien eu lieu");
+            assert_eq!(
+                date_d_ajout(&repo, ancien),
+                Some(1_000.0),
+                "via `{chemin_de_mise_a_jour}` : l'album retouché est daté de la \
+                 retouche — il passe pour un ajout récent (#4546)"
+            );
+
+            // Et la rangée « Nouveau dans la bibliothèque » ne le met pas en tête.
+            let sql = crate::db::home_queries::nouveautes(Engine::Sqlite);
+            let limite: i64 = 10;
+            let p: [&dyn ToSqlValue; 1] = [&limite];
+            let ordre: Vec<String> = repo
+                .backend()
+                .query_many(&sql, &p)
+                .unwrap()
+                .iter()
+                .filter_map(|c| c.get(1).and_then(|v| v.as_string()))
+                .collect();
+            assert_eq!(
+                ordre,
+                vec!["Récent".to_string(), "Ancien".to_string()],
+                "via `{chemin_de_mise_a_jour}` : /home/new-in-library"
+            );
+        }
+    }
+
+    /// Contre-épreuve : une piste qui a DÉJÀ sa première vue la garde, et un
+    /// fichier réellement nouveau reste daté de son arrivée.
+    #[test]
+    fn une_premiere_vue_existante_n_est_pas_ecrasee_4546() {
+        let db = test_db();
+        let (repo, ancien, _) = deux_albums_scannes(&db);
+        db.execute_batch(
+            "UPDATE file_first_seen SET first_seen_at = 500.0 \
+             WHERE file_path = '/music/ancien/01.flac';",
+        )
+        .unwrap();
+        repo.update_mtime_and_size("/music/ancien/01.flac", 9_000.0, 1)
+            .unwrap();
+        assert_eq!(date_d_ajout(&repo, ancien), Some(500.0));
+    }
+
+    /// Vider la bibliothèque puis tout rescanner ne date pas « aujourd'hui »
+    /// les pistes d'avant la première vue.
+    #[test]
+    fn vider_la_bibliotheque_fige_les_dates_d_ajout_4546() {
+        let db = test_db();
+        let (repo, _, _) = deux_albums_scannes(&db);
+        db.execute_batch("DELETE FROM file_first_seen;").unwrap();
+        repo.delete_all().unwrap();
+        let date = repo
+            .backend()
+            .query_one(
+                "SELECT first_seen_at FROM file_first_seen \
+                 WHERE file_path = '/music/ancien/01.flac'",
+                &[],
+            )
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_f64()));
+        assert_eq!(date, Some(1_000.0));
+    }
+
+    /// Les deux moteurs : la requête PostgreSQL ne porte ni `OR IGNORE` ni
+    /// place `?`, et SQLite ni `ON CONFLICT` ni `$n`.
+    #[test]
+    fn le_figeage_parle_le_dialecte_de_chaque_moteur_4546() {
+        for cle in ["id", "file_path"] {
+            let pg = sql_figer_premiere_vue(Engine::Postgres, cle);
+            assert!(pg.contains("ON CONFLICT (file_path) DO NOTHING") && pg.contains("$2"));
+            assert!(!pg.contains("OR IGNORE") && !pg.contains('?'), "{pg}");
+            let lite = sql_figer_premiere_vue(Engine::Sqlite, cle);
+            assert!(
+                lite.starts_with("INSERT OR IGNORE") && !lite.contains('$'),
+                "{lite}"
+            );
+        }
+        let pg = sql_figer_toutes_les_premieres_vues(Engine::Postgres);
+        assert!(pg.contains("ON CONFLICT (file_path) DO NOTHING"), "{pg}");
     }
 }

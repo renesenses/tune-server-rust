@@ -478,6 +478,17 @@ impl PositionPoller {
                 // Une piste lancée par `play()` n'a rien adopté (#4173).
                 ps.adoption_horloge = None;
                 ps.transition(fsm::Transition::NouvellePiste);
+                // #4559 — la piste neuve a effacé les deux verdicts dans
+                // l'état de zone, et le client vient de relire une zone qui
+                // n'en porte aucun : la référence de l'annonce repart du même
+                // point. Sans cela, un contrat republié à l'identique d'une
+                // piste à l'autre ne serait jamais annoncé, et le panneau
+                // resterait « shared » pour toute la piste.
+                //
+                // Volontairement APRÈS la transition REF-9 : le témoin
+                // `e1_nouvelle_piste_ramene_a_neuve` borne à 34 lignes la
+                // distance entre le marqueur de journal et cet appel-là.
+                ps.reprendre_le_contrat_a_zero();
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -672,6 +683,22 @@ impl PositionPoller {
                         // flux peut entrer ou sortir du DoP d'une piste à
                         // l'autre sans changement d'état de zone (#1735).
                         self.playback.set_dop_active(zone_id, s.dop_active).await;
+                        // #4559 — LA sortie publie son contrat, ENCORE FAUT-IL
+                        // LE DIRE. Le verdict est relevé ici à chaque tour,
+                        // mais aucune charge utile poussée ne le porte : ni
+                        // l'évènement `playback.*` (il n'a pas ce champ), ni
+                        // l'instantané WebSocket (émis à la connexion, pas à
+                        // l'ouverture du périphérique). Les deux seules
+                        // surfaces qui portent `signal_path` sont des RÉPONSES,
+                        // et le client les a déjà lues — trop tôt, pendant que
+                        // le bras exclusif ouvrait encore le DAC. Sans cette
+                        // annonce, le panneau de Jean Valjean reste sur
+                        // « WASAPI (shared — Windows mixer) » jusqu'à ce qu'il
+                        // touche au volume.
+                        let contrat_a_change = ps.contrat_de_signal_a_change(
+                            signal_path.as_ref(),
+                            transformations.as_ref(),
+                        );
                         self.playback
                             .set_output_signal_path(zone_id, signal_path)
                             .await;
@@ -681,6 +708,22 @@ impl PositionPoller {
                         self.playback
                             .set_transformations_reelles(zone_id, transformations)
                             .await;
+                        if contrat_a_change {
+                            if let Some(ref bus) = self.event_bus {
+                                info!(
+                                    zone_id,
+                                    device = %device_id,
+                                    "contrat_de_signal_publie_annonce"
+                                );
+                                // `zone.updated` sans données inline : le
+                                // client relit toutes ses zones (branche de
+                                // repli des évènements `zone.*` d'App.svelte).
+                                // Même mécanique que #2280 pour
+                                // `levels_available` — pas de nouveau type
+                                // d'évènement, rien à changer côté web.
+                                bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+                            }
+                        }
                         (s, famine)
                     }
                     Err(e) => {

@@ -2350,6 +2350,11 @@ impl OutputTarget for OaatOutput {
             let mut prefetch_rx: Option<tokio::sync::oneshot::Receiver<Option<NextTrackPrefetch>>> =
                 None;
 
+            // #4567 — mesure du cadencement de CETTE boucle d'envoi (PCM/FLAC
+            // sur HTTP), la seule qui serve les zones OAAT en lecture normale.
+            // On note les paquets partis en retard ; l'envoi lui-même ne change
+            // pas d'un iota.
+            let mut cadence = super::helpers::MesureDeCadence::default();
             let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(10));
             watchdog.tick().await; // skip first immediate tick
 
@@ -3089,6 +3094,17 @@ impl OutputTarget for OaatOutput {
                                     bytes_per_frame,
                                 );
                                 let elapsed = start.elapsed();
+                                // #4567 — on MESURE le retard, on ne corrige
+                                // rien : le sommeil ci-dessous est inchangé.
+                                if let Some(retard_ms) = cadence.observer(expected, elapsed) {
+                                    warn!(
+                                        device = %device_name,
+                                        retard_ms,
+                                        paquets = cadence.paquets,
+                                        paquets_en_retard = cadence.paquets_en_retard,
+                                        "oaat: paquet envoye en retard"
+                                    );
+                                }
                                 if expected > elapsed {
                                     tokio::time::sleep(expected - elapsed).await;
                                 }
@@ -3123,7 +3139,16 @@ impl OutputTarget for OaatOutput {
             } else {
                 sample_offset / PCM_SAMPLES_PER_PACKET as u64
             };
-            info!(device = %device_name, samples = sample_offset, packets, duration_s = format!("{duration_s:.1}"), "oaat: playback complete");
+            info!(
+                device = %device_name,
+                samples = sample_offset,
+                packets,
+                duration_s = format!("{duration_s:.1}"),
+                paquets_cadences = cadence.paquets,
+                paquets_en_retard = cadence.paquets_en_retard,
+                retard_max_ms = cadence.retard_max_ms,
+                "oaat: playback complete"
+            );
         });
         *self.play_task.lock().await = Some(task);
 

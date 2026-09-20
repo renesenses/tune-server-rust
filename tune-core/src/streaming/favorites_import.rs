@@ -121,12 +121,28 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
         "albums" => "album",
         _ => "artist",
     };
-    let texte =
-        |v: &serde_json::Value, cle: &str| v.get(cle).and_then(|x| x.as_str()).map(str::to_string);
-    let id = |v: &serde_json::Value| match v.get("id") {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Number(n)) => n.to_string(),
-        _ => String::new(),
+    // 🔴 #4552 — les clés sont celles que la projection SÉRIALISE, pas les
+    // noms de champs Rust. `StreamTrack` / `StreamAlbum` sortent `id` sous
+    // `source_id`, `artist` sous `artist_name`, `album` sous `album_title`
+    // (`traits.rs`, `rename(serialize = …)`) ; `StreamArtist` garde `id` et
+    // `name`. Lire `id` / `artist` / `album` donnait un `service_id` VIDE à
+    // chaque entrée Qobuz et Tidal, que `enregistrer` écarte : la reprise
+    // répondait `lus: 0` (.18, 19/09 : 36 pistes datées chez Qobuz). La
+    // première clé est la forme réelle, les suivantes les formes anciennes.
+    let texte = |v: &serde_json::Value, cles: &[&str]| {
+        cles.iter()
+            .find_map(|c| v.get(*c).and_then(|x| x.as_str()))
+            .map(str::to_string)
+    };
+    let id = |v: &serde_json::Value| {
+        ["source_id", "id"]
+            .iter()
+            .find_map(|c| match v.get(*c) {
+                Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+                Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            })
+            .unwrap_or_default()
     };
     Some(
         items
@@ -135,29 +151,29 @@ async fn entrees_datees(svc: &dyn StreamingService, fav_type: &str) -> Option<Ve
                 "track" => Entree {
                     item_type,
                     service_id: id(v),
-                    title: texte(v, "title"),
-                    artist: texte(v, "artist"),
-                    album: texte(v, "album"),
-                    cover_url: texte(v, "cover_path"),
-                    created_at: texte(v, "created_at"),
+                    title: texte(v, &["title"]),
+                    artist: texte(v, &["artist_name", "artist"]),
+                    album: texte(v, &["album_title", "album"]),
+                    cover_url: texte(v, &["cover_path"]),
+                    created_at: texte(v, &["created_at"]),
                 },
                 "album" => Entree {
                     item_type,
                     service_id: id(v),
-                    title: texte(v, "title"),
-                    artist: texte(v, "artist"),
+                    title: texte(v, &["title"]),
+                    artist: texte(v, &["artist_name", "artist"]),
                     album: None,
-                    cover_url: texte(v, "cover_path"),
-                    created_at: texte(v, "created_at"),
+                    cover_url: texte(v, &["cover_path"]),
+                    created_at: texte(v, &["created_at"]),
                 },
                 _ => Entree {
                     item_type,
                     service_id: id(v),
-                    title: texte(v, "name"),
+                    title: texte(v, &["name"]),
                     artist: None,
                     album: None,
-                    cover_url: texte(v, "image_path"),
-                    created_at: texte(v, "created_at"),
+                    cover_url: texte(v, &["image_path"]),
+                    created_at: texte(v, &["created_at"]),
                 },
             })
             .collect(),
@@ -346,9 +362,74 @@ mod tests_dates {
     use async_trait::async_trait;
     use serde_json::json;
 
-    /// Un service qui date ses favoris comme Qobuz : deux pistes reprises
-    /// d'un coup, à des dates DIFFÉRENTES chez lui.
-    struct ServiceDate;
+    /// Un service qui date ses favoris : deux pistes reprises d'un coup, à des
+    /// dates DIFFÉRENTES chez lui.
+    ///
+    /// 🔴 #4552 — la charge n'est PLUS écrite à la main. Elle sort de la
+    /// projection RÉELLE du connecteur (`QobuzService::favori_date`,
+    /// `TidalService::favori_date`) appliquée à ce que l'API du service rend.
+    /// L'ancien témoin fabriquait `{"id", "artist", "album"}` — la forme que
+    /// le code attendait, pas celle que Qobuz rend (`source_id`,
+    /// `artist_name`, `album_title`) — et restait vert pendant que la reprise
+    /// répondait `lus: 0` sur le .18.
+    struct ServiceDate {
+        service: &'static str,
+        /// Albums et artistes aussi, ou les pistes seules.
+        trois_types: bool,
+    }
+
+    const QOBUZ: ServiceDate = ServiceDate {
+        service: "qobuz",
+        trois_types: false,
+    };
+
+    /// Ce que `/favorite/getUserFavorites` rend chez Qobuz (brut), passé
+    /// par la projection datée du connecteur.
+    fn favoris_qobuz(fav_type: &str, trois_types: bool) -> Vec<serde_json::Value> {
+        use crate::streaming::qobuz::QobuzService;
+        let bruts = match fav_type {
+            "tracks" => vec![
+                json!({"id": 1, "title": "Ancienne", "performer": {"name": "A"},
+                       "album": {"title": "X"}, "duration": 100,
+                       "favorited_at": 1_735_689_600}),
+                json!({"id": 2, "title": "Recente", "performer": {"name": "B"},
+                       "album": {"title": "Y"}, "duration": 200,
+                       "favorited_at": 1_780_272_000}),
+            ],
+            "albums" if trois_types => vec![json!({"id": 999, "title": "Time Out",
+                "artist": {"name": "Dave Brubeck", "id": 42}, "tracks_count": 7,
+                "favorited_at": 1_700_000_000})],
+            "artists" if trois_types => vec![json!({"id": 42, "name": "Dave Brubeck",
+                "favorited_at": 1_700_000_000})],
+            _ => Vec::new(),
+        };
+        bruts
+            .iter()
+            .map(|b| QobuzService::favori_date(b, fav_type))
+            .collect()
+    }
+
+    /// Ce que `/v1/users/{id}/favorites/{type}` rend chez Tidal (enveloppes),
+    /// passé par la projection datée du connecteur.
+    fn favoris_tidal(fav_type: &str) -> Vec<serde_json::Value> {
+        use crate::streaming::tidal::TidalService;
+        let enveloppes = match fav_type {
+            "tracks" => vec![json!({"created": "2019-04-18T09:53:31.000+0000",
+                "item": {"id": 7, "title": "So What", "duration": 545,
+                         "artist": {"name": "Miles Davis", "id": 42},
+                         "album": {"id": 789, "title": "Kind of Blue"}}})],
+            "albums" => vec![json!({"created": "2019-04-18T09:53:31.000+0000",
+                "item": {"id": 789, "title": "Kind of Blue",
+                         "artist": {"name": "Miles Davis", "id": 42},
+                         "numberOfTracks": 5}})],
+            _ => vec![json!({"created": "2019-04-18T09:53:31.000+0000",
+                "item": {"id": 42, "name": "Miles Davis"}})],
+        };
+        enveloppes
+            .iter()
+            .filter_map(|e| TidalService::favori_date(e, fav_type))
+            .collect()
+    }
     #[async_trait]
     impl StreamingService for ServiceDate {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -358,7 +439,7 @@ mod tests_dates {
             self
         }
         fn name(&self) -> &str {
-            "qobuz"
+            self.service
         }
         fn enabled(&self) -> bool {
             true
@@ -427,15 +508,10 @@ mod tests_dates {
             &self,
             fav_type: &str,
         ) -> Result<Option<Vec<serde_json::Value>>, crate::error::TuneError> {
-            if fav_type != "tracks" {
-                return Ok(Some(Vec::new()));
-            }
-            Ok(Some(vec![
-                json!({"id": 1, "title": "Ancienne", "artist": "A", "album": "X",
-                       "cover_path": null, "created_at": "2025-01-01T00:00:00Z"}),
-                json!({"id": 2, "title": "Recente", "artist": "B", "album": "Y",
-                       "cover_path": null, "created_at": "2026-06-01T00:00:00Z"}),
-            ]))
+            Ok(Some(match self.service {
+                "tidal" => favoris_tidal(fav_type),
+                _ => favoris_qobuz(fav_type, self.trois_types),
+            }))
         }
         async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, crate::error::TuneError> {
             unreachable!("le chemin daté doit primer");
@@ -492,7 +568,7 @@ mod tests_dates {
         )
         .unwrap();
 
-        let stats = reprendre_les_favoris_du_service(&ServiceDate, 1, &backend).await;
+        let stats = reprendre_les_favoris_du_service(&QOBUZ, 1, &backend).await;
         assert_eq!(
             (stats.lus, stats.ajoutes, stats.deja_presents, stats.redates),
             (2, 1, 1, 1),
@@ -506,7 +582,91 @@ mod tests_dates {
             ]
         );
         // Seconde reprise : rien ne bouge, rien n'est redaté.
-        let stats = reprendre_les_favoris_du_service(&ServiceDate, 1, &backend).await;
+        let stats = reprendre_les_favoris_du_service(&QOBUZ, 1, &backend).await;
         assert_eq!((stats.ajoutes, stats.redates), (0, 0), "{stats:?}");
+    }
+
+    /// Ce que la table a retenu : `(type, id, titre, artiste, album)`.
+    fn lignes(backend: &Arc<dyn DbBackend>) -> Vec<[String; 5]> {
+        backend
+            .query_many(
+                "SELECT item_type, service_id, title, artist, album FROM streaming_favorites \
+                 ORDER BY item_type, service_id",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| {
+                std::array::from_fn(|i| r.get(i).and_then(|v| v.as_string()).unwrap_or_default())
+            })
+            .collect()
+    }
+
+    /// 🔴 #4552 — la reprise LIT ce que Qobuz rend : les trois types, leurs
+    /// libellés, leur date. Rouge avant : `lus: 0`, table vide — les favoris
+    /// posés dans l'application Qobuz n'arrivaient plus dans Tune.
+    #[tokio::test]
+    async fn la_reprise_lit_la_forme_reelle_de_qobuz() {
+        let backend = base();
+        let qobuz = ServiceDate {
+            service: "qobuz",
+            trois_types: true,
+        };
+        let stats = reprendre_les_favoris_du_service(&qobuz, 1, &backend).await;
+        assert_eq!((stats.lus, stats.ajoutes), (4, 4), "{stats:?}");
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            lignes(&backend),
+            vec![
+                [
+                    s("album"),
+                    s("999"),
+                    s("Time Out"),
+                    s("Dave Brubeck"),
+                    s("")
+                ],
+                [s("artist"), s("42"), s("Dave Brubeck"), s(""), s("")],
+                [s("track"), s("1"), s("Ancienne"), s("A"), s("X")],
+                [s("track"), s("2"), s("Recente"), s("B"), s("Y")],
+            ]
+        );
+        assert!(
+            dates(&backend).contains(&(s("1"), s("2025-01-01T00:00:00Z"))),
+            "la date de Qobuz : {:?}",
+            dates(&backend)
+        );
+    }
+
+    /// Même lecture pour Tidal, dont la projection sort les mêmes clés.
+    #[tokio::test]
+    async fn la_reprise_lit_la_forme_reelle_de_tidal() {
+        let backend = base();
+        let tidal = ServiceDate {
+            service: "tidal",
+            trois_types: true,
+        };
+        let stats = reprendre_les_favoris_du_service(&tidal, 1, &backend).await;
+        assert_eq!((stats.lus, stats.ajoutes), (3, 3), "{stats:?}");
+        let s = |x: &str| x.to_string();
+        assert_eq!(
+            lignes(&backend),
+            vec![
+                [
+                    s("album"),
+                    s("789"),
+                    s("Kind of Blue"),
+                    s("Miles Davis"),
+                    s("")
+                ],
+                [s("artist"), s("42"), s("Miles Davis"), s(""), s("")],
+                [
+                    s("track"),
+                    s("7"),
+                    s("So What"),
+                    s("Miles Davis"),
+                    s("Kind of Blue")
+                ],
+            ]
+        );
     }
 }

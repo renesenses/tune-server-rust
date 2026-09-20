@@ -247,11 +247,40 @@ pub fn choose_output_rate(dsd_rate: u32) -> u32 {
 ///
 /// Unlike `DsdToPcmConverter::process()` which loads the entire DSD file
 /// into memory (causing OOM for large DSD files -- a 5-min DSD64 stereo
-/// file expands to ~13 GB of f64 arrays), this converter maintains a small
-/// sliding buffer of just `filter_len` DSD samples per channel and produces
-/// PCM output incrementally.
+/// file expands to ~13 GB of f64 arrays), this converter keeps only the
+/// DSD history the next FIR windows still need, and produces PCM output
+/// incrementally.
 ///
-/// Memory usage: O(filter_len * channels) ≈ 16 KB regardless of file size.
+/// Memory usage: O((filter_len + chunk) * channels), independent of file size.
+///
+/// ## Ce que calcule le convertisseur, et dans quel ordre (#4354)
+///
+/// La sortie `n` d'un canal vaut
+/// `y[n] = Σ_{k=0}^{L-1} c[k] · x(n·D + D/2 − L/2 + k)`, sommée **dans l'ordre
+/// k croissant**, avec `x(p) = ±1` pour un bit du flux et `x(p) = 0` hors du
+/// flux (avant le premier bit, et après le dernier au `flush`). C'est le modèle
+/// du convertisseur de référence [`DsdToPcmConverter::process`].
+///
+/// Jusqu'à la v0.9.157, chaque sortie était calculée seule, à l'instant où son
+/// dernier bit arrivait : 256 additions f64 **enchaînées** (DSD128 → 352,8 kHz)
+/// dont chacune attend la précédente. La boucle était bornée par la LATENCE de
+/// l'additionneur, pas par son débit. C'est le seul point chaud de la chaîne
+/// DSD → WAV réseau (lecture DSF : < 0,3 % du temps) ; mesuré en release par
+/// `examples/banc_dsd_4354.rs` sur DSD128 → 352,8 kHz : 4,1× le temps réel sur
+/// un Xeon E5-2630 v4 (Shrek), 11× sur un cœur P et 5× sur un cœur E du Core
+/// i5-1340P du .42. Après ce changement : 9,9× (Shrek), 23× (cœur P) et 11,8×
+/// (cœur E), PCM inchangé. Aucun hôte ARM ou NAS n'a été mesuré.
+///
+/// Les sorties voisines sont pourtant indépendantes. `feed` pousse désormais
+/// tout le bloc dans un historique linéaire, puis calcule les sorties prêtes
+/// **par lots de huit** ([`fir_lot`]) : huit accumulateurs indépendants avancent
+/// ensemble, le processeur les entrelace. Chaque accumulateur garde exactement
+/// sa suite d'opérations — mêmes produits `x·c` (exacts : `x = ±1`), même ordre
+/// k croissant —, donc le PCM est **identique au bit près** à l'ancien calcul,
+/// ce que verrouillent `streamer_identique_au_bit_a_la_reference_*` (contre
+/// [`DsdToPcmConverter::process`]) et l'empreinte figée
+/// `streamer_empreinte_figee_dsd128` (calculée par l'ancien code). Retirer un
+/// seul tap les fait tomber toutes les deux.
 pub struct DsdToPcmStreamer {
     /// How many DSD bits map to one PCM sample.
     decimation_ratio: usize,
@@ -265,21 +294,58 @@ pub struct DsdToPcmStreamer {
     pub output_depth: u32,
     /// Whether input DSD bits are LSB-first (DSF) or MSB-first (DFF).
     lsb_first: bool,
-    /// Per-channel ring buffer of DSD sample values (+1.0 / -1.0).
-    /// Length = filter_len per channel. We only keep as many samples
-    /// as needed for the FIR filter window.
-    ring_bufs: Vec<Vec<f64>>,
-    /// Write position in the ring buffer (wraps at filter_len).
-    ring_pos: usize,
-    /// `filter_len - 1`. filter_len is always a power of two (256/512/1024/2048),
-    /// so ring wrapping is `pos & ring_mask` instead of `pos % filter_len` — a
-    /// real integer division per DSD sample (millions/sec) turned into a mask.
-    /// Bit-identical result.
-    ring_mask: usize,
+    /// Historique linéaire par canal des échantillons DSD (+1.0 / −1.0) :
+    /// `hist[ch][i]` est la position absolue `hist_base + i`. Les positions
+    /// négatives valent 0.0 — le bourrage que voit le filtre avant le début
+    /// du flux. Tronqué en tête après chaque bloc à la fenêtre de la
+    /// prochaine sortie.
+    hist: Vec<Vec<f64>>,
+    /// Position absolue de `hist[ch][0]` (négative tant que le bourrage
+    /// initial est encore là).
+    hist_base: isize,
     /// Total DSD samples fed so far (across all calls to `feed`), per channel.
     total_dsd_samples: usize,
     /// Number of PCM output samples already emitted per channel.
     output_sample_idx: usize,
+}
+
+/// Nombre de sorties calculées ensemble par [`fir_lot`].
+const LOT_FIR: usize = 8;
+
+/// Huit sorties FIR voisines d'un même canal, d'un seul passage sur les
+/// coefficients. `x` commence à la fenêtre de la première sortie ; la sortie
+/// `j` lit `x[j·d .. j·d + L]`. Chaque accumulateur suit l'ordre k croissant,
+/// exactement comme [`fir_une`] : seul l'entrelacement change, pas les
+/// opérations de chaque somme.
+#[inline]
+fn fir_lot(x: &[f64], d: usize, c: &[f64]) -> [f64; LOT_FIR] {
+    let l = c.len();
+    let fenetres: [&[f64]; LOT_FIR] = std::array::from_fn(|j| &x[j * d..j * d + l]);
+    let mut acc = [0.0f64; LOT_FIR];
+    for (k, &ck) in c.iter().enumerate() {
+        for j in 0..LOT_FIR {
+            acc[j] += fenetres[j][k] * ck;
+        }
+    }
+    acc
+}
+
+/// Une sortie FIR seule (reliquat d'un lot incomplet), même ordre k croissant.
+#[inline]
+fn fir_une(x: &[f64], c: &[f64]) -> f64 {
+    let mut s = 0.0f64;
+    for (xk, ck) in x[..c.len()].iter().zip(c) {
+        s += *xk * *ck;
+    }
+    s
+}
+
+/// Échantillon filtré → 24 bits LE, échelle SACD et saturation comprises.
+#[inline]
+fn pousser_24(sortie: &mut Vec<u8>, somme: f64) {
+    let clamped = (somme * DSD_SACD_GAIN).clamp(-1.0, 1.0);
+    let pcm_val = (clamped * 8_388_607.0) as i32;
+    sortie.extend_from_slice(&pcm_val.to_le_bytes()[..3]);
 }
 
 impl DsdToPcmStreamer {
@@ -301,23 +367,71 @@ impl DsdToPcmStreamer {
         };
 
         let filter_coeffs = design_lowpass_fir(filter_len, decimation_ratio);
-        debug_assert!(
-            filter_len.is_power_of_two(),
-            "ring_mask wrapping requires a power-of-two filter_len"
-        );
+
+        // La fenêtre de la sortie 0 commence à D/2 − L/2 : autant de zéros de
+        // bourrage devant le premier bit.
+        let bourrage = (filter_len / 2).saturating_sub(decimation_ratio / 2);
 
         DsdToPcmStreamer {
             decimation_ratio,
-            filter_coeffs: filter_coeffs.clone(),
+            filter_coeffs,
             channels,
             output_rate: target_rate,
             output_depth: 24,
             lsb_first,
-            ring_bufs: vec![vec![0.0f64; filter_len]; channels],
-            ring_pos: 0,
-            ring_mask: filter_len - 1,
+            hist: vec![vec![0.0f64; bourrage]; channels],
+            hist_base: -(bourrage as isize),
             total_dsd_samples: 0,
             output_sample_idx: 0,
+        }
+    }
+
+    /// Position absolue du premier tap de la sortie `n`.
+    fn debut_fenetre(&self, n: usize) -> isize {
+        (n * self.decimation_ratio + self.decimation_ratio / 2) as isize
+            - (self.filter_coeffs.len() / 2) as isize
+    }
+
+    /// Calcule `nombre` sorties à partir de `output_sample_idx`, entrelacées
+    /// par canal, puis libère l'historique devenu inutile. L'historique doit
+    /// couvrir la fenêtre de la dernière de ces sorties.
+    fn emettre(&mut self, nombre: usize, sortie: &mut Vec<u8>) {
+        let channels = self.channels;
+        let d = self.decimation_ratio;
+        let coeffs = &self.filter_coeffs;
+        let mut sommes = vec![[0.0f64; LOT_FIR]; channels];
+        let mut fait = 0usize;
+        while fait < nombre {
+            let n = self.output_sample_idx + fait;
+            let depart = (self.debut_fenetre(n) - self.hist_base) as usize;
+            let lot = (nombre - fait).min(LOT_FIR);
+            for (ch, somme) in sommes.iter_mut().enumerate() {
+                let x = &self.hist[ch][depart..];
+                if lot == LOT_FIR {
+                    *somme = fir_lot(x, d, coeffs);
+                } else {
+                    for (j, s) in somme.iter_mut().take(lot).enumerate() {
+                        *s = fir_une(&x[j * d..], coeffs);
+                    }
+                }
+            }
+            for j in 0..lot {
+                for somme in &sommes {
+                    pousser_24(sortie, somme[j]);
+                }
+            }
+            fait += lot;
+        }
+        self.output_sample_idx += nombre;
+
+        // Rien avant la fenêtre de la prochaine sortie ne servira plus.
+        let garder_depuis = self.debut_fenetre(self.output_sample_idx) - self.hist_base;
+        if garder_depuis > 0 {
+            let a_jeter = (garder_depuis as usize).min(self.hist.first().map_or(0, Vec::len));
+            for h in &mut self.hist {
+                h.drain(..a_jeter);
+            }
+            self.hist_base += a_jeter as isize;
         }
     }
 
@@ -330,200 +444,85 @@ impl DsdToPcmStreamer {
     ///
     /// Call this repeatedly with successive chunks from the file. The converter
     /// maintains internal state between calls. The chunk size can vary.
+    /// A trailing partial frame (fewer bytes than `channels`) is ignored.
     pub fn feed(&mut self, dsd_chunk: &[u8]) -> Vec<u8> {
         let channels = self.channels;
         if channels == 0 || dsd_chunk.is_empty() {
             return Vec::new();
         }
-
-        let filter_len = self.filter_coeffs.len();
-        let half_filter = filter_len / 2;
-
-        // Parse input bytes into DSD sample values and push into ring buffers
         let total_bytes = dsd_chunk.len() / channels;
+        if total_bytes == 0 {
+            return Vec::new();
+        }
 
-        // Estimate max output samples from this chunk
-        let new_dsd_samples = total_bytes * 8;
-        let total_after = self.total_dsd_samples + new_dsd_samples;
-        let max_new_output = total_after / self.decimation_ratio;
-        let new_outputs = max_new_output.saturating_sub(self.output_sample_idx);
-        let mut output = Vec::with_capacity(new_outputs * channels * 3);
-
-        for byte_idx in 0..total_bytes {
-            // Read the DSD byte for each channel at this byte position.
-            // Each byte contains 8 DSD samples (1-bit each).
-            // We must process one DSD sample at a time across ALL channels
-            // (bit-interleaved) so that ring_pos advances uniformly.
-            // The old code iterated `for ch { for bit }` which caused
-            // all 8 bits of channel 0 to overwrite the same ring position
-            // before ring_pos advanced — destroying 7/8 of channel 0's data.
-            let mut ch_bytes = [0u8; 8]; // max 8 channels
-            let mut valid_channels = channels;
-            for ch in 0..channels {
-                let src_idx = byte_idx * channels + ch;
-                if src_idx >= dsd_chunk.len() {
-                    valid_channels = ch;
-                    break;
-                }
-                ch_bytes[ch] = dsd_chunk[src_idx];
-            }
-            if valid_channels == 0 {
-                break;
-            }
-
-            for bit in 0..8u8 {
-                // Write one DSD sample from each channel into its ring buffer
-                for ch in 0..valid_channels {
+        // 1 bit DSD → ±1.0, par canal, dans l'ordre du flux.
+        for (ch, hist) in self.hist.iter_mut().enumerate() {
+            hist.reserve(total_bytes * 8);
+            for byte_idx in 0..total_bytes {
+                let byte = dsd_chunk[byte_idx * channels + ch];
+                for bit in 0..8u8 {
                     let bit_val = if self.lsb_first {
-                        (ch_bytes[ch] >> bit) & 1
+                        (byte >> bit) & 1
                     } else {
-                        (ch_bytes[ch] >> (7 - bit)) & 1
+                        (byte >> (7 - bit)) & 1
                     };
-                    let sample = if bit_val == 1 { 1.0 } else { -1.0 };
-                    self.ring_bufs[ch][self.ring_pos & self.ring_mask] = sample;
-                }
-
-                // Advance ring_pos once per DSD sample position (all channels written)
-                self.ring_pos += 1;
-                self.total_dsd_samples += 1;
-
-                // Check if we can emit a new PCM sample.
-                // An output sample at index `n` is centered at DSD position:
-                //   center = n * decimation_ratio + decimation_ratio / 2
-                // We need all filter taps to be available, i.e. we need
-                //   center + half_filter <= total_dsd_samples
-                let next_center =
-                    self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
-                let needed = next_center + half_filter;
-
-                while needed <= self.total_dsd_samples && self.total_dsd_samples >= filter_len {
-                    // Emit one PCM sample per channel
-                    let center =
-                        self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
-
-                    // Steady-state fast path: every emitted sample satisfies
-                    // `center + half_filter == total_dsd_samples` (the emit loop
-                    // fires as soon as `needed <= total`, and total increments by
-                    // one, so equality is exact).  With filter_len == 2*half_filter
-                    // the FIR window is then *exactly* the ring buffer contents
-                    // [total-filter_len, total-1]: all taps are valid and map to a
-                    // contiguous walk of the ring starting at the oldest sample
-                    // (index ring_pos % filter_len).  That lets us drop the per-tap
-                    // modulo + two bounds branches (the dominant cost) via a
-                    // two-slice dot product.  Bit-identical to the general path
-                    // below (same f64 values, same summation order k = 0..L-1).
-                    // Only the handful of warm-up samples at stream start are
-                    // misaligned (center + half_filter < total) and take the
-                    // general path.
-                    let aligned = center + half_filter == self.total_dsd_samples;
-                    let ring_start = self.ring_pos & self.ring_mask;
-
-                    for emit_ch in 0..channels {
-                        let sum = if aligned {
-                            let ring = &self.ring_bufs[emit_ch];
-                            let coeffs = &self.filter_coeffs;
-                            let (head, tail) = ring.split_at(ring_start);
-                            let split = tail.len(); // == filter_len - ring_start
-                            let mut s = 0.0f64;
-                            for (x, c) in tail.iter().zip(&coeffs[..split]) {
-                                s += *x * *c;
-                            }
-                            for (x, c) in head.iter().zip(&coeffs[split..]) {
-                                s += *x * *c;
-                            }
-                            s
-                        } else {
-                            // General path (warm-up / partial window). Absolute
-                            // position `p` maps to ring index p % filter_len; taps
-                            // outside the ring window are zero-padded.
-                            let mut s = 0.0f64;
-                            for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
-                                let pos = (center as isize) - (half_filter as isize) + (k as isize);
-                                if pos >= 0 && (pos as usize) < self.total_dsd_samples {
-                                    let age = self.total_dsd_samples - pos as usize;
-                                    if age <= filter_len {
-                                        let ring_idx =
-                                            (self.ring_pos + filter_len - age) & self.ring_mask;
-                                        s += self.ring_bufs[emit_ch][ring_idx] * coeff;
-                                    }
-                                }
-                            }
-                            s
-                        };
-
-                        let clamped = (sum * DSD_SACD_GAIN).clamp(-1.0, 1.0);
-                        let pcm_val = (clamped * 8_388_607.0) as i32;
-                        let bytes = pcm_val.to_le_bytes();
-                        output.push(bytes[0]);
-                        output.push(bytes[1]);
-                        output.push(bytes[2]);
-                    }
-
-                    self.output_sample_idx += 1;
-
-                    // Re-check for next output sample
-                    let next_center =
-                        self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
-                    if next_center + half_filter > self.total_dsd_samples {
-                        break;
-                    }
+                    hist.push(if bit_val == 1 { 1.0 } else { -1.0 });
                 }
             }
         }
+        self.total_dsd_samples += total_bytes * 8;
 
+        // Une sortie est prête quand le dernier bit de sa fenêtre est arrivé
+        // (n·D + D/2 + L/2 ≤ total) — et, comme avant, pas avant que le flux
+        // ait rempli une fenêtre entière.
+        let filter_len = self.filter_coeffs.len();
+        let d = self.decimation_ratio;
+        let reach = d / 2 + filter_len / 2;
+        if self.total_dsd_samples < filter_len || self.total_dsd_samples < reach {
+            return Vec::new();
+        }
+        let pretes = (self.total_dsd_samples - reach) / d + 1;
+        let nouvelles = pretes.saturating_sub(self.output_sample_idx);
+        let mut output = Vec::with_capacity(nouvelles * channels * 3);
+        if nouvelles > 0 {
+            self.emettre(nouvelles, &mut output);
+        }
         output
     }
 
     /// Flush any remaining samples at the end of the stream.
     /// Produces PCM for any DSD samples that haven't been output yet
-    /// (due to the FIR filter needing future samples that don't exist).
+    /// (due to the FIR filter needing future samples that don't exist:
+    /// those taps read zero).
     pub fn flush(&mut self) -> Vec<u8> {
         let channels = self.channels;
-        let filter_len = self.filter_coeffs.len();
-        let half_filter = filter_len / 2;
-
-        // How many more output samples could we theoretically produce?
-        // The maximum output index is total_dsd_samples / decimation_ratio
-        let max_outputs = if self.total_dsd_samples > 0 {
-            self.total_dsd_samples / self.decimation_ratio
-        } else {
-            0
-        };
-
+        if channels == 0 {
+            return Vec::new();
+        }
+        let max_outputs = self.total_dsd_samples / self.decimation_ratio;
         let remaining = max_outputs.saturating_sub(self.output_sample_idx);
         if remaining == 0 {
             return Vec::new();
         }
 
-        let mut output = Vec::with_capacity(remaining * channels * 3);
-
-        for _ in 0..remaining {
-            let center = self.output_sample_idx * self.decimation_ratio + self.decimation_ratio / 2;
-
-            for ch in 0..channels {
-                let mut sum = 0.0f64;
-                for (k, &coeff) in self.filter_coeffs.iter().enumerate() {
-                    let pos = (center as isize) - (half_filter as isize) + (k as isize);
-                    if pos >= 0 && (pos as usize) < self.total_dsd_samples {
-                        let age = self.total_dsd_samples - pos as usize;
-                        if age <= filter_len {
-                            let ring_idx = (self.ring_pos + filter_len - age) % filter_len;
-                            sum += self.ring_bufs[ch][ring_idx] * coeff;
-                        }
-                    }
-                }
-
-                let clamped = (sum * DSD_SACD_GAIN).clamp(-1.0, 1.0);
-                let pcm_val = (clamped * 8_388_607.0) as i32;
-                let bytes = pcm_val.to_le_bytes();
-                output.push(bytes[0]);
-                output.push(bytes[1]);
-                output.push(bytes[2]);
+        // Bourrage de fin : les taps au-delà du dernier bit lisent 0.0.
+        let fin_reelle = self.hist_base + self.hist[0].len() as isize;
+        let fin_voulue = self.debut_fenetre(max_outputs - 1) + self.filter_coeffs.len() as isize;
+        if fin_voulue > fin_reelle {
+            let longueur = (fin_voulue - self.hist_base) as usize;
+            for h in &mut self.hist {
+                h.resize(longueur, 0.0);
             }
-
-            self.output_sample_idx += 1;
         }
 
+        let mut output = Vec::with_capacity(remaining * channels * 3);
+        self.emettre(remaining, &mut output);
+
+        // Retirer le bourrage : l'historique ne garde que des bits réels.
+        let longueur_reelle = (fin_reelle - self.hist_base).max(0) as usize;
+        for h in &mut self.hist {
+            h.truncate(longueur_reelle);
+        }
         output
     }
 
@@ -1077,6 +1076,103 @@ mod tests {
         assert!(
             max_diff <= 1,
             "batch and streaming mono outputs should match (max sample diff = {max_diff})"
+        );
+    }
+
+    // --- #4354 : le calcul par lots rend le MÊME PCM, au bit près ---
+
+    /// Octets DSD pseudo-aléatoires déterministes (même LCG que le banc).
+    fn dsd_lcg(octets: usize, graine: u32) -> Vec<u8> {
+        let mut s = graine;
+        (0..octets)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn verifier_identique_a_la_reference(dsd_rate: u32, pcm_rate: u32, channels: usize, lsb: bool) {
+        // Blocs alignés sur la trame : le convertisseur de référence n'a pas
+        // de notion de bloc, un reliquat de trame n'aurait pas de sens ici.
+        let data = dsd_lcg(6000 * channels, 0x5eed_0000 ^ dsd_rate ^ channels as u32);
+        let reference = DsdToPcmConverter::new(dsd_rate, pcm_rate, channels, lsb).process(&data);
+
+        let mut d_un_bloc = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
+        let mut en_une_fois = d_un_bloc.feed(&data);
+        en_une_fois.extend_from_slice(&d_un_bloc.flush());
+        assert_eq!(
+            en_une_fois, reference,
+            "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : un seul bloc doit rendre la référence au bit près"
+        );
+
+        // Blocs irréguliers, mais chacun aligné sur la trame de `channels` octets.
+        let mut st = DsdToPcmStreamer::new(dsd_rate, pcm_rate, channels, lsb);
+        let mut sortie = Vec::new();
+        let tailles = [1usize, 7, 4096, 3, 250, 2, 9000, 5];
+        let (mut pos, mut i) = (0usize, 0usize);
+        while pos < data.len() {
+            let fin = (pos + tailles[i % tailles.len()] * channels).min(data.len());
+            sortie.extend_from_slice(&st.feed(&data[pos..fin]));
+            pos = fin;
+            i += 1;
+        }
+        sortie.extend_from_slice(&st.flush());
+        assert_eq!(
+            sortie, reference,
+            "{dsd_rate}->{pcm_rate} {channels} canal(aux) lsb={lsb} : le découpage en blocs ne doit rien changer"
+        );
+    }
+
+    #[test]
+    fn streamer_identique_au_bit_a_la_reference_dsd64() {
+        verifier_identique_a_la_reference(2_822_400, 176_400, 2, true);
+        verifier_identique_a_la_reference(2_822_400, 176_400, 1, false);
+        verifier_identique_a_la_reference(2_822_400, 88_200, 2, true);
+    }
+
+    #[test]
+    fn streamer_identique_au_bit_a_la_reference_dsd128() {
+        verifier_identique_a_la_reference(5_644_800, 352_800, 2, true);
+        verifier_identique_a_la_reference(5_644_800, 176_400, 2, false);
+        verifier_identique_a_la_reference(5_644_800, 352_800, 6, true);
+    }
+
+    #[test]
+    fn streamer_identique_au_bit_a_la_reference_dsd256_et_512() {
+        verifier_identique_a_la_reference(11_289_600, 352_800, 2, true);
+        verifier_identique_a_la_reference(22_579_200, 352_800, 2, false);
+        verifier_identique_a_la_reference(11_289_600, 44_100, 2, true);
+    }
+
+    /// Empreinte SHA-256 du PCM rendu pour une seconde de DSD128 stéréo
+    /// pseudo-aléatoire, calculée par le convertisseur d'AVANT #4354 (v0.9.157,
+    /// calcul sortie par sortie). Toute modification numérique du convertisseur
+    /// — ordre de sommation, fusion multiplication-addition, précision — la
+    /// fait tomber : c'est le contrat « même PCM au bit près ».
+    #[test]
+    fn streamer_empreinte_figee_dsd128() {
+        use sha2::{Digest, Sha256};
+        let data = dsd_lcg(5_644_800 / 8 * 2, 0x1234_5678);
+        let mut st = DsdToPcmStreamer::new(5_644_800, 352_800, 2, true);
+        // Blocs de 8192 octets : un super-bloc DSF stéréo, comme en lecture.
+        let mut pcm = Vec::new();
+        for bloc in data.chunks(8192) {
+            pcm.extend_from_slice(&st.feed(bloc));
+        }
+        pcm.extend_from_slice(&st.flush());
+        assert_eq!(
+            pcm.len(),
+            352_800 * 2 * 3,
+            "une seconde de 352,8 kHz stéréo 24 bits"
+        );
+        let empreinte: String = Sha256::digest(&pcm)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            empreinte,
+            "33c0695ff1067c2d12c41e455de0e2c28d4ae1954055e6e9364672a4510436a0"
         );
     }
 }

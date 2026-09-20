@@ -48,11 +48,6 @@ impl StreamingHttpState {
     }
 }
 
-#[derive(Deserialize)]
-struct LimitQuery {
-    limit: Option<usize>,
-}
-
 /// Look up a service by name. Locks the registry only long enough to clone
 /// the Arc, so callers never hold the registry lock across await points.
 async fn get_svc(
@@ -804,15 +799,30 @@ async fn service_genres(
     with_svc_editorial!(&state, &service, |svc| svc.get_genres(pid).await)
 }
 
+#[derive(Deserialize)]
+struct GenreAlbumsQuery {
+    limit: Option<usize>,
+    /// Rubrique éditoriale à restreindre au genre (#3481) : un identifiant de
+    /// `/{service}/featured/sections` (`press-awards`, `ideal-discography`…).
+    /// Absente : les nouveautés du genre, ce que tous les clients d'avant
+    /// reçoivent.
+    section: Option<String>,
+}
+
 async fn service_genre_albums(
     State(state): State<StreamingHttpState>,
     Path((service, genre_id)): Path<(String, String)>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<GenreAlbumsQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(50);
-    with_svc_editorial!(&state, &service, |svc| svc
-        .get_genre_albums(&genre_id, limit)
-        .await)
+    match q.section.as_deref() {
+        None => with_svc_editorial!(&state, &service, |svc| svc
+            .get_genre_albums(&genre_id, limit)
+            .await),
+        Some(section) => with_svc_editorial!(&state, &service, |svc| svc
+            .get_genre_section(&genre_id, section, limit)
+            .await),
+    }
 }
 
 async fn service_featured_sections(
@@ -1902,6 +1912,34 @@ mod tests_cache_utilisateur {
             );
             Ok(Some(vec![element]))
         }
+
+        /// #3481 — les nouveautés d'un genre, reconnaissables à leur titre.
+        async fn get_genre_albums(
+            &self,
+            genre_id: &str,
+            _limit: usize,
+        ) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![StreamAlbum {
+                id: "n1".into(),
+                title: format!("nouveautes|{genre_id}"),
+                ..StreamAlbum::default()
+            }])
+        }
+
+        /// #3481 — une rubrique d'un genre : le titre dit ce qui est arrivé
+        /// au connecteur (rubrique, genre, limite).
+        async fn get_genre_section(
+            &self,
+            genre_id: &str,
+            section_id: &str,
+            limit: usize,
+        ) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![StreamAlbum {
+                id: "r1".into(),
+                title: format!("{section_id}|{genre_id}|{limit}"),
+                ..StreamAlbum::default()
+            }])
+        }
     }
 
     /// #4444 — la route des titres phares ne rend pas deux fois le même
@@ -2828,5 +2866,61 @@ mod temoin_statut_du_refus_i859 {
                 "{panne} doit garder le statut par defaut de l'appelant"
             );
         }
+    }
+}
+
+/// #3481 — `?section=` sur `/{service}/genres/{genre_id}/albums`.
+#[cfg(test)]
+mod tests_route_rubrique_par_genre {
+    use super::tests_cache_utilisateur::{RecherchesVues, etat_essai_complet};
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    async fn titres(nom: &str, limit: Option<usize>, section: Option<&str>) -> Vec<String> {
+        let etat = etat_essai_complet(
+            nom,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::ZERO,
+            RecherchesVues::default(),
+        );
+        let r = service_genre_albums(
+            State(etat),
+            Path((nom.to_string(), "80".to_string())),
+            Query(GenreAlbumsQuery {
+                limit,
+                section: section.map(str::to_string),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let corps = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .expect("corps lisible");
+        let v: Value = serde_json::from_slice(&corps).expect("JSON");
+        v.as_array()
+            .expect("un tableau d'albums")
+            .iter()
+            .map(|a| a["title"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// LE défaut de #3481 : la rubrique demandée doit parvenir au connecteur,
+    /// avec le genre et la limite.
+    #[tokio::test]
+    async fn la_rubrique_demandee_parvient_au_connecteur() {
+        let vus = titres("essai-genre-rubrique", Some(5), Some("press-awards")).await;
+        assert_eq!(
+            vus,
+            vec![String::from("press-awards|80|5")],
+            "`?section=` doit choisir la rubrique du genre, pas les nouveautés (#3481)"
+        );
+    }
+
+    /// Non-régression : sans `?section=`, la route rend les nouveautés du
+    /// genre, comme pour tous les clients installés.
+    #[tokio::test]
+    async fn sans_rubrique_la_route_rend_les_nouveautes() {
+        let vus = titres("essai-genre-defaut", None, None).await;
+        assert_eq!(vus, vec![String::from("nouveautes|80")]);
     }
 }

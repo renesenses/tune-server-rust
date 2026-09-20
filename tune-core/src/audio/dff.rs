@@ -16,6 +16,10 @@
 //! qui suffit à annoncer la bonne durée et à refuser la lecture par un message
 //! juste — au lieu de prétendre que le fichier n'a pas de données audio.
 //!
+//! Avec la feature `dst` (désarmée par défaut, #4378), `DffStreamReader` décode
+//! ces trames au fil de l'eau avec le crate `dst-decoder` et rend du DSD brut,
+//! identique bit à bit à libdstdec, la référence ISO/Philips.
+//!
 //! All multi-byte values are big-endian.
 //! DSD bit ordering: MSB first within each byte.
 
@@ -423,6 +427,9 @@ pub struct DffStreamReader {
     chunk_buf: Vec<u8>,
     data_offset: u64,
     data_size: usize,
+    /// Trames DST décodées au fil de l'eau (#4378). `None` pour du DSD brut.
+    #[cfg(feature = "dst")]
+    dst: Option<LecteurDst>,
 }
 
 impl DffStreamReader {
@@ -430,10 +437,16 @@ impl DffStreamReader {
     ///
     /// `read_chunk_size`: how many bytes to read per `next_chunk()` call.
     /// Must be a multiple of `channels` to maintain byte alignment.
+    /// Un DSDIFF compressé DST (feature `dst` seulement) rend une trame
+    /// décodée par appel, quelle que soit cette valeur.
     pub fn open(path: &str, info: &DffInfo, read_chunk_size: usize) -> Result<Self, String> {
         // Seul point de passage vers `DsdToPcmStreamer` et `DsdToDoP` pour un
         // DFF (decode.rs:1971, 2103, 2252) : c'est ici que le refus doit être
         // à la fois SÛR et EXPLICABLE.
+        #[cfg(feature = "dst")]
+        if info.is_dst() {
+            return Self::open_dst(path, info);
+        }
         info.ensure_raw_dsd()?;
 
         let mut file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
@@ -446,6 +459,49 @@ impl DffStreamReader {
             chunk_buf: vec![0u8; read_chunk_size],
             data_offset: info.data_offset,
             data_size: info.data_size as usize,
+            #[cfg(feature = "dst")]
+            dst: None,
+        })
+    }
+
+    /// Ouvre l'enveloppe DST : `data_offset`/`data_size` y désignent le
+    /// CONTENU du chunk `DST ` (FRTE, DSTF, DSTC…), jamais du DSD. Les trames
+    /// sont lues et décodées une à une par `next_chunk` ; `data_size` devient
+    /// ici la taille DÉCODÉE annoncée par FRTE, pour que la recherche par
+    /// octet entrelacé garde le même sens qu'en DSD brut.
+    #[cfg(feature = "dst")]
+    fn open_dst(path: &str, info: &DffInfo) -> Result<Self, String> {
+        let decodeur = dst_decoder::decoder::DstDecoder::new(
+            info.channels as usize,
+            info.sample_rate as usize,
+        )
+        .map_err(|e| {
+            format!(
+                "DFF: cannot decode DST audio at {} Hz × {} channels: {e}",
+                info.sample_rate, info.channels
+            )
+        })?;
+        let octets_par_trame = decodeur.dsd_frame_bytes();
+        let file = File::open(path).map_err(|e| format!("dff open: {e}"))?;
+        let decode_total = info.dst_frames.map_or(usize::MAX, |n| {
+            (n as usize).saturating_mul(octets_par_trame)
+        });
+        Ok(DffStreamReader {
+            file,
+            remaining: 0,
+            chunk_buf: Vec::new(),
+            data_offset: info.data_offset,
+            data_size: decode_total,
+            dst: Some(LecteurDst {
+                decodeur,
+                octets_par_trame,
+                debut: info.data_offset,
+                fin: info.data_offset.saturating_add(info.data_size),
+                curseur: info.data_offset,
+                trame: 0,
+                a_jeter: 0,
+                compresse: Vec::new(),
+            }),
         })
     }
 
@@ -459,6 +515,10 @@ impl DffStreamReader {
         channels: usize,
     ) -> Result<usize, String> {
         let aligned = (target / channels * channels).min(self.data_size);
+        #[cfg(feature = "dst")]
+        if let Some(dst) = self.dst.as_mut() {
+            return dst.rechercher(&mut self.file, aligned);
+        }
         self.file
             .seek(SeekFrom::Start(self.data_offset + aligned as u64))
             .map_err(|e| format!("dff seek: {e}"))?;
@@ -470,6 +530,10 @@ impl DffStreamReader {
     ///
     /// Returns `Ok(Some(chunk))` or `Ok(None)` at EOF.
     pub fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, String> {
+        #[cfg(feature = "dst")]
+        if let Some(dst) = self.dst.as_mut() {
+            return dst.trame_suivante(&mut self.file);
+        }
         if self.remaining == 0 {
             return Ok(None);
         }
@@ -482,6 +546,120 @@ impl DffStreamReader {
         self.remaining -= to_read;
 
         Ok(Some(buf.to_vec()))
+    }
+}
+
+/// Décodage DST au fil de l'eau (#4378), trame par trame.
+///
+/// ⚖️ **Pourquoi la feature `dst` est DÉSARMÉE (décision de Bertrand,
+/// 20/09/2026).** Le crate `dst-decoder` se déclare Apache-2.0 (crates.io,
+/// GitHub, fichier `LICENSE`) mais son README reproduit l'en-tête ISO/Philips
+/// du code de référence — « Copyright is not released for non MPEG-4 Audio
+/// conforming products » — et un avertissement brevets. La question n'est pas
+/// tranchée. Le code part donc écrit, mesuré, et allumable par personne : la
+/// feature n'est dans aucun `default` ni dans aucune ligne de build publiée.
+/// Pour l'allumer il faut UN arbitrage juridique de Bertrand, pas une ligne de
+/// workflow — et la garde `tune-core/tests/dst_desarmee_4378.rs` rougit si on
+/// essaie sans.
+///
+/// Une trame DST (1/75 s sur un SACD) se décode SEULE : filtres et tables de
+/// probabilité voyagent dans chaque trame. La recherche saute donc les
+/// en-têtes des trames précédentes sans les décoder, puis jette le début de
+/// la trame d'arrivée — la position atteinte est exacte à l'octet près.
+#[cfg(feature = "dst")]
+struct LecteurDst {
+    decodeur: dst_decoder::decoder::DstDecoder,
+    octets_par_trame: usize,
+    /// Début et fin (exclue) du contenu du chunk `DST `.
+    debut: u64,
+    fin: u64,
+    /// Position du prochain sous-chunk à lire.
+    curseur: u64,
+    /// Rang de la prochaine trame DSTF.
+    trame: u64,
+    /// Octets décodés à jeter en tête de la prochaine trame (recherche).
+    a_jeter: usize,
+    compresse: Vec<u8>,
+}
+
+#[cfg(feature = "dst")]
+impl LecteurDst {
+    /// Lit l'en-tête du prochain sous-chunk et avance le curseur au-delà.
+    /// Rend son identifiant et la taille de sa charge utile, ou `None` à la
+    /// fin de l'enveloppe.
+    fn sous_chunk_suivant(&mut self, file: &mut File) -> Result<Option<([u8; 4], u64)>, String> {
+        if self.curseur.saturating_add(12) > self.fin {
+            return Ok(None);
+        }
+        file.seek(SeekFrom::Start(self.curseur))
+            .map_err(|e| format!("dff seek: {e}"))?;
+        let mut entete = [0u8; 12];
+        file.read_exact(&mut entete)
+            .map_err(|e| format!("dff read DST sub-chunk: {e}"))?;
+        let id = [entete[0], entete[1], entete[2], entete[3]];
+        let taille = read_u64_be(&entete, 4);
+        let occupe = taille_avec_remplissage(taille);
+        borner_dans_le_parent(
+            &id,
+            taille,
+            occupe,
+            self.fin - self.curseur - 12,
+            "le chunk DST",
+        )?;
+        self.curseur += 12 + occupe;
+        Ok(Some((id, taille)))
+    }
+
+    fn trame_suivante(&mut self, file: &mut File) -> Result<Option<Vec<u8>>, String> {
+        while let Some((id, taille)) = self.sous_chunk_suivant(file)? {
+            if &id != b"DSTF" {
+                continue; // FRTE, DSTC (CRC)… : rien à décoder
+            }
+            // Une trame compressée ne dépasse guère la trame décodée (le DST
+            // bascule sur du DSD brut quand il ne gagne rien) : au double, le
+            // fichier ment, et on refuse avant d'allouer.
+            if taille as usize > self.octets_par_trame.saturating_mul(2) {
+                return Err(format!(
+                    "DFF: DST frame {} declares {taille} bytes, more than twice a decoded frame ({})",
+                    self.trame, self.octets_par_trame
+                ));
+            }
+            file.seek(SeekFrom::Start(
+                self.curseur - taille_avec_remplissage(taille),
+            ))
+            .map_err(|e| format!("dff seek: {e}"))?;
+            self.compresse.resize(taille as usize, 0);
+            file.read_exact(&mut self.compresse)
+                .map_err(|e| format!("dff read DST frame: {e}"))?;
+            let mut dsd = vec![0u8; self.octets_par_trame];
+            self.decodeur
+                .decode_frame(&self.compresse, &mut dsd)
+                .map_err(|e| format!("DFF: cannot decode DST frame {}: {e}", self.trame))?;
+            self.trame += 1;
+            let jeter = std::mem::take(&mut self.a_jeter).min(dsd.len());
+            if jeter > 0 {
+                dsd.drain(..jeter);
+            }
+            return Ok(Some(dsd));
+        }
+        Ok(None)
+    }
+
+    fn rechercher(&mut self, file: &mut File, cible: usize) -> Result<usize, String> {
+        let trame_cible = (cible / self.octets_par_trame) as u64;
+        self.curseur = self.debut;
+        self.trame = 0;
+        self.a_jeter = 0;
+        while self.trame < trame_cible {
+            match self.sous_chunk_suivant(file)? {
+                Some((id, _)) if &id == b"DSTF" => self.trame += 1,
+                Some(_) => {}
+                // Cible au-delà de la dernière trame : on s'arrête à la fin.
+                None => return Ok(self.trame as usize * self.octets_par_trame),
+            }
+        }
+        self.a_jeter = cible - trame_cible as usize * self.octets_par_trame;
+        Ok(cible)
     }
 }
 
@@ -789,6 +967,7 @@ mod tests {
     /// « FRTE », « DSTF » et des trames à codage arithmétique dans le
     /// convertisseur DSD→PCM/DoP. Contre-épreuve : retirer la ligne
     /// `compression = Some("DST ")` de la branche `b"DST "` rend ce test ROUGE.
+    #[cfg(not(feature = "dst"))]
     #[test]
     fn dst_without_cmpr_is_still_recognised_and_refused() {
         let bytes = build_dff_dst_opt_cmpr(2, 2_822_400, 4500, 75, false);
@@ -817,6 +996,7 @@ mod tests {
     /// `DffStreamReader::open`, le message redevient « unsupported compression
     /// 'DST ' » — sans le mot DST en clair, sans la durée, sans remède — et ce
     /// test passe au ROUGE.
+    #[cfg(not(feature = "dst"))]
     #[test]
     fn dst_refusal_names_the_format_and_the_remedy() {
         let bytes = build_dff_dst(2, 2_822_400, 4500, 75);
@@ -1016,5 +1196,129 @@ mod tests {
     fn parse_dff_too_short() {
         let result = parse_dff_from_bytes(&[0u8; 10]);
         assert!(result.is_err());
+    }
+}
+
+/// #4378 : un DSDIFF compressé DST se LIT avec la feature `dst`.
+#[cfg(all(test, feature = "dst"))]
+mod tests_dst {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// Échantillon de la suite FATE de FFmpeg (`fate-suite/dst/dst-64fs44-2ch.dff`) :
+    /// 10 trames DST, DSD64 stéréo, 47 564 octets.
+    fn fixture() -> String {
+        format!(
+            "{}/tests/fixtures/dsd/dst_fate_dsd64_stereo.dff",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    /// SHA-256 des 94 080 octets DSD que rend libdstdec (sacd-ripper, code de
+    /// référence ISO/Philips, compilé sur Shrek le 19/09/2026) pour ce
+    /// fichier. Contre-oracle : FFmpeg (`dstdec`) rend, de ce DSD rembobiné en
+    /// DSDIFF brut et du fichier DST d'origine, le même PCM flottant — écart
+    /// nul sur 94 080 échantillons.
+    const SHA256_REFERENCE: &str =
+        "ee40773c17776868b67c4690e9d7a0ea8b253bd11c44f876eaed85db6d231f0c";
+
+    fn tout_lire(lecteur: &mut DffStreamReader) -> Vec<u8> {
+        let mut tout = Vec::new();
+        while let Some(morceau) = lecteur.next_chunk().expect("trame DST illisible") {
+            tout.extend_from_slice(&morceau);
+        }
+        tout
+    }
+
+    fn ouvrir() -> DffStreamReader {
+        let chemin = fixture();
+        let info = parse_dff(&chemin).expect("parse_dff");
+        assert!(info.is_dst(), "la fixture doit être compressée DST");
+        DffStreamReader::open(&chemin, &info, 4096).unwrap_or_else(|e| {
+            panic!("avec la feature `dst`, un DSDIFF compressé DST doit s'ouvrir : {e}")
+        })
+    }
+
+    #[test]
+    fn dff_dst_se_decode_bit_a_bit_comme_la_reference() {
+        let dsd = tout_lire(&mut ouvrir());
+        assert_eq!(
+            dsd.len(),
+            10 * 588 * 64 / 8 * 2,
+            "10 trames DSD64 stéréo de 9 408 octets"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&dsd)),
+            SHA256_REFERENCE,
+            "le DSD décodé doit être celui de la référence ISO/Philips, bit à bit"
+        );
+    }
+
+    /// La recherche saute des trames SANS les décoder, puis décode celle
+    /// d'arrivée avec un décodeur qui n'a pas vu les précédentes : ce test
+    /// prouve aussi qu'une trame DST se décode seule.
+    #[test]
+    fn dff_dst_recherche_au_milieu_d_une_trame() {
+        let sequentiel = tout_lire(&mut ouvrir());
+        let cible = 5 * 9_408 + 1_000;
+        let mut lecteur = ouvrir();
+        assert_eq!(lecteur.seek_to_interleaved_byte(cible, 2).unwrap(), cible);
+        assert_eq!(
+            tout_lire(&mut lecteur),
+            sequentiel[cible..],
+            "après une recherche, le flux doit reprendre à l'octet exact"
+        );
+        // Retour en arrière, puis au-delà de la fin.
+        assert_eq!(lecteur.seek_to_interleaved_byte(0, 2).unwrap(), 0);
+        assert_eq!(tout_lire(&mut lecteur), sequentiel);
+        let fin = lecteur.seek_to_interleaved_byte(usize::MAX / 2, 2).unwrap();
+        assert_eq!(fin, sequentiel.len(), "on s'arrête à la fin du flux");
+        assert!(lecteur.next_chunk().unwrap().is_none());
+    }
+
+    /// Des trames qui ne sont pas du DST doivent faire ÉCHOUER la lecture,
+    /// jamais passer pour du DSD (le décodeur rendrait sinon du silence 0x55
+    /// sans rien dire).
+    #[test]
+    fn dff_dst_trame_corrompue_est_une_erreur_nommee() {
+        let mut octets = std::fs::read(fixture()).unwrap();
+        // Première trame DSTF : charge utile juste après son en-tête.
+        let debut = octets.windows(4).position(|w| w == b"DSTF").unwrap() + 12;
+        for o in &mut octets[debut..debut + 64] {
+            *o = 0xFF;
+        }
+        let tmp = tempfile::Builder::new().suffix(".dff").tempfile().unwrap();
+        std::fs::write(tmp.path(), &octets).unwrap();
+        let chemin = tmp.path().to_str().unwrap();
+        let info = parse_dff(chemin).unwrap();
+        let mut lecteur = DffStreamReader::open(chemin, &info, 4096).unwrap();
+        let err = lecteur
+            .next_chunk()
+            .err()
+            .expect("une trame corrompue doit être refusée");
+        assert!(
+            err.contains("DST frame 0"),
+            "la trame doit être nommée : {err}"
+        );
+    }
+    /// Bout en bout : le catalogue ne refuse plus le fichier, et la chaîne de
+    /// lecture réelle (`decode_to_pcm` → `DffStreamReader` → DSD→PCM) rend du
+    /// PCM stéréo de la bonne durée.
+    #[test]
+    fn dff_dst_traverse_toute_la_chaine_de_decodage() {
+        let chemin = fixture();
+        assert!(
+            crate::audio::support::decoder_rejection(std::path::Path::new(&chemin)).is_none(),
+            "avec la feature `dst`, un DSDIFF DST n'est plus refusé au catalogue"
+        );
+        assert!(crate::audio::decode::can_decode_native(&chemin));
+        let pcm = crate::audio::decode::decode_to_pcm(&chemin, None, None, 0.0, 0.0)
+            .unwrap_or_else(|e| panic!("la lecture d'un DSDIFF DST doit aboutir : {e}"));
+        assert_eq!(pcm.channels, 2);
+        let secondes = pcm.samples_i32.len() as f64 / 2.0 / pcm.sample_rate as f64;
+        assert!(
+            (secondes - 10.0 / 75.0).abs() < 0.01,
+            "10 trames à 75 trames/s = 133 ms, obtenu {secondes:.3} s"
+        );
     }
 }

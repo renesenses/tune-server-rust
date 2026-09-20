@@ -2639,6 +2639,19 @@ pub struct RendererCapabilities {
     pub aac: bool,
     pub mp3: bool,
     pub dsd: bool,
+    /// #4573 — le nombre de canaux le plus élevé que le Sink ANNONCE, tous
+    /// formats confondus (`audio/L16;rate=…;channels=2`).
+    ///
+    /// `None` quand aucune entrée ne porte `channels=` : c'est « on ne sait
+    /// pas », et surtout pas « deux ». La différence commande tout : on ne
+    /// réduit une piste multicanale que sur une déclaration, jamais sur une
+    /// ignorance.
+    ///
+    /// Mesuré par Xavier Joly le 20/09/2026 sur un Denon AVR-X1600H : LPCM
+    /// annoncé en `channels=1` et `channels=2` seulement, `audio/flac:*` sans
+    /// `channels=` — un FLAC 5.1 n'y passera jamais tel quel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canaux_max: Option<u16>,
     /// Raw Sink entries, for an advanced/debug view.
     pub sink: Vec<String>,
 }
@@ -2650,6 +2663,32 @@ impl RendererCapabilities {
             ..Self::default()
         }
     }
+}
+
+/// #4573 — le plus grand `channels=` annoncé par le Sink, ou `None`.
+///
+/// Les entrées LPCM portent leurs paramètres après le MIME
+/// (`http-get:*:audio/L16;rate=44100;channels=2:*`). Une entrée sans
+/// `channels=` ne dit RIEN du nombre de canaux : elle est ignorée, elle ne
+/// vaut pas deux.
+pub fn canaux_annonces_par_le_sink(sink: &[String]) -> Option<u16> {
+    let mut max: Option<u16> = None;
+    for entree in sink {
+        let bas = entree.to_lowercase();
+        for morceau in bas.split(';').skip(1) {
+            let Some(valeur) = morceau.trim().strip_prefix("channels=") else {
+                continue;
+            };
+            // `channels=2:*` — le champ du protocolInfo continue après le MIME.
+            let valeur = valeur.split(':').next().unwrap_or(valeur).trim();
+            if let Ok(n) = valeur.parse::<u16>()
+                && n > 0
+            {
+                max = Some(max.map_or(n, |m: u16| m.max(n)));
+            }
+        }
+    }
+    max
 }
 
 /// Pure Sink → capabilities mapping (unit-tested; `probe_capabilities` wraps it
@@ -2696,6 +2735,7 @@ fn renderer_caps_from_sink(sink: Vec<String>) -> RendererCapabilities {
         aac: has("audio/aac") || has("audio/mp4"),
         mp3: has("audio/mpeg"),
         dsd,
+        canaux_max: canaux_annonces_par_le_sink(&sink),
         sink,
     }
 }
@@ -4544,5 +4584,70 @@ mod tests {
             0,
             "quatre minutes plus tard, le renderer réel est remis à l'épreuve"
         );
+    }
+}
+
+/// #4573 — les canaux ANNONCÉS par le Sink, lus sur des chaînes réelles.
+#[cfg(test)]
+mod canaux_annonces_4573 {
+    use super::{canaux_annonces_par_le_sink, renderer_caps_from_sink};
+
+    fn v(entrees: &[&str]) -> Vec<String> {
+        entrees.iter().map(|e| e.to_string()).collect()
+    }
+
+    /// Le Sink relevé par Xavier Joly sur le Denon AVR-X1600H (20/09/2026) :
+    /// LPCM en 1 et 2 canaux, FLAC sans `channels=`.
+    #[test]
+    fn le_denon_de_xavier_annonce_deux_canaux_au_plus() {
+        let sink = v(&[
+            "http-get:*:audio/L16;rate=44100;channels=1:*",
+            "http-get:*:audio/L16;rate=44100;channels=2:*",
+            "http-get:*:audio/L16;rate=48000;channels=2:*",
+            "http-get:*:audio/flac:*",
+            "http-get:*:audio/mpeg:*",
+        ]);
+        assert_eq!(canaux_annonces_par_le_sink(&sink), Some(2));
+        let caps = renderer_caps_from_sink(sink);
+        assert_eq!(caps.canaux_max, Some(2));
+        assert!(caps.flac, "le FLAC reste annoncé — mais en deux canaux");
+    }
+
+    /// 🔴 Aucune entrée ne porte `channels=` : c'est « on ne sait pas », et la
+    /// règle ne réduira rien. Surtout pas « deux par défaut ».
+    #[test]
+    fn un_sink_sans_channels_ne_declare_rien() {
+        let sink = v(&["http-get:*:audio/flac:*", "http-get:*:audio/wav:*"]);
+        assert_eq!(canaux_annonces_par_le_sink(&sink), None);
+        assert_eq!(renderer_caps_from_sink(sink).canaux_max, None);
+    }
+
+    #[test]
+    fn un_lecteur_multicanal_annonce_son_maximum() {
+        let sink = v(&[
+            "http-get:*:audio/L16;rate=48000;channels=2:*",
+            "http-get:*:audio/L24;rate=96000;channels=6:*",
+            "http-get:*:audio/L24;rate=96000;channels=8:*",
+        ]);
+        assert_eq!(canaux_annonces_par_le_sink(&sink), Some(8));
+    }
+
+    /// Les valeurs illisibles ou absurdes ne comptent pas, et ne cassent rien.
+    #[test]
+    fn une_valeur_illisible_est_ignoree() {
+        let sink = v(&[
+            "http-get:*:audio/L16;rate=44100;channels=deux:*",
+            "http-get:*:audio/L16;rate=44100;channels=:*",
+            "http-get:*:audio/L16;rate=44100;channels=0:*",
+        ]);
+        assert_eq!(canaux_annonces_par_le_sink(&sink), None);
+    }
+
+    /// Le champ `channels=` ne vit qu'APRÈS le MIME : un `channels=` dans le
+    /// nom du profil ne doit pas être pris pour une déclaration.
+    #[test]
+    fn la_casse_et_les_espaces_ne_trompent_pas_la_lecture() {
+        let sink = v(&["HTTP-GET:*:AUDIO/L16;RATE=44100; CHANNELS=6 :*"]);
+        assert_eq!(canaux_annonces_par_le_sink(&sink), Some(6));
     }
 }

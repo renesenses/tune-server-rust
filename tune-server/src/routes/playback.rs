@@ -988,6 +988,9 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/play", post(play))
         .route("/{id}/pause", post(pause))
         .route("/{id}/resume", post(resume))
+        // #4566 — la bascule en un appel, pour les boutons physiques qui n'ont
+        // qu'une touche. Même patron que `/{id}/shuffle`.
+        .route("/{id}/playpause", post(playpause))
         .route("/{id}/stop", post(stop))
         .route("/{id}/next", post(next))
         .route("/{id}/previous", post(previous))
@@ -2371,6 +2374,92 @@ async fn play(
         }
         Err(e) => play_error_response(e, &lang),
     }
+}
+
+/// POST /zones/{id}/playpause — la bascule lecture/pause en UN appel (#4566).
+///
+/// Steve Taylor pilote Tune avec une télécommande infrarouge (récepteur FLIRC +
+/// `triggerhappy`, fil forum 1854). Un bouton physique n'a qu'une touche
+/// `KEY_PLAYPAUSE` pour les deux gestes : il a dû écrire un `GET /zones/{id}`,
+/// lire `.state` avec `jq`, puis poster `pause` ou `resume`. `shuffle` avait
+/// déjà sa bascule (`toggle_shuffle`), la lecture non.
+///
+/// Deux choses que le script shell ne peut pas faire, et que celle-ci fait :
+///  - **un seul aller-retour**, ce qui se voit sur un bouton physique ;
+///  - **pas de course** — entre le GET et le POST du script, la piste peut
+///    finir ou un autre client agir, et le bouton fait alors l'inverse de ce
+///    qu'on attend. Ici l'état est lu et la décision prise dans le même appel.
+///
+/// **Elle n'invente aucun comportement** : elle DÉLÈGUE aux deux handlers
+/// existants, sans les recopier. Ce qui vaut pour `pause` et `resume` vaut donc
+/// mot pour mot pour elle — y compris sur une radio, où la bascule fait
+/// exactement ce que font les boutons Pause et Lecture d'aujourd'hui.
+///
+/// Table, exhaustive : `PlayState` n'a que trois valeurs (`tune-core`).
+///  - `Playing` → `pause`
+///  - `Paused`  → `resume`
+///  - `Stopped` → `resume`, **mais seulement s'il y a quelque chose à
+///    reprendre** (voir ci-dessous). `resume` sait relancer une zone arrêtée :
+///    piste en mémoire rejouée à sa position de reprise, sinon première piste
+///    de la file (#2876).
+///
+/// # ⚠️ La zone à l'arrêt ET VIDE
+///
+/// Déléguer sans condition aurait été faux, et c'est MESURÉ, pas déduit : la
+/// garde retirée, le témoin `zone_a_l_arret_et_vide_…` rend **200**. `resume`
+/// traverse alors toutes ses branches sans rien trouver à relancer, puis écrit
+/// `save_play_state(zone_id, "playing")` — la BASE annonce une zone en lecture
+/// où rien ne joue — et répond un JSON de zone banal, indistinguable d'un
+/// succès. Un appui qui ne fait rien et le dit « réussi » est supportable
+/// derrière un bouton d'écran, qu'on n'appuie pas sur une zone vide ; pas
+/// derrière une touche `KEY_PLAYPAUSE`, qu'on presse précisément sans regarder.
+/// Cette bascule refuse donc en **409** quand la zone est à l'arrêt, sans piste
+/// en mémoire et sans file — sans rien écrire. `POST /zones/{id}/resume` n'est
+/// pas touché : c'est la bascule qui se borne, pas le geste existant.
+///
+/// Une file ILLISIBLE n'est pas une file vide (#4261) : on ne fabrique pas un
+/// refus à partir d'une panne de base, on délègue comme avant et on le journalise.
+///
+/// La réponse est celle du geste effectué — le JSON de zone que rendent déjà
+/// `pause` et `resume` —, donc l'appelant lit l'état obtenu sans second appel.
+async fn playpause(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let current = state.playback.get_state(zone_id).await;
+    if current.state == tune_core::playback::PlayState::Playing {
+        return pause(State(state), Path(zone_id)).await.into_response();
+    }
+
+    if current.state == tune_core::playback::PlayState::Stopped && current.now_playing.is_none() {
+        let file = PlayQueueRepo::with_backend(state.backend.clone()).count_all(zone_id);
+        match file {
+            Ok(0) => {
+                return (
+                    axum::http::StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "nothing to play: the zone is stopped and its queue is empty",
+                        "code": "zone_vide",
+                        "state": "stopped",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(_) => {}
+            Err(e) => warn!(
+                zone_id,
+                site = "playpause_longueur_file",
+                error = %e,
+                "playback_lecture_base_echouee — file illisible : on délègue à \
+                 `resume` plutôt que d'inventer un refus"
+            ),
+        }
+    }
+
+    resume(State(state), Path(zone_id), headers)
+        .await
+        .into_response()
 }
 
 async fn pause(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl IntoResponse {
@@ -5030,9 +5119,18 @@ async fn share_now_playing(
     settings
         .set(&format!("share_{token}"), &data.to_string())
         .ok();
+    // Le chemin RELATIF reste rendu tel quel (clients antérieurs), et le lien
+    // ABSOLU l'accompagne quand le serveur a mieux à offrir qu'une boucle
+    // locale : le client collait `location.origin`, donc `http://localhost:8888`
+    // pour qui ouvre Tune sur sa propre machine — un partage illisible partout
+    // ailleurs (Xavier Joly, 20/09/2026).
+    let chemin = format!("/shared/{token}");
+    let lien =
+        crate::lien_de_partage::lien_de_partage(&state.config.server_ip(), state.port, &chemin);
     Json(json!({
         "token": token,
-        "url": format!("/shared/{token}"),
+        "url": chemin,
+        "url_absolue": lien,
         "track": data,
     }))
     .into_response()
