@@ -8733,3 +8733,120 @@ async fn plafond_de_zone_des_services_3973_strict_refuse() {
         "bit-perfect strict : le flux 192 kHz ne doit pas être plafonné en silence"
     );
 }
+
+// ─── #4580 / #4601 — « j'ai dû supprimer la zone et la remettre » ──────────
+
+/// 🔴 Le refus nomme la CAUSE PROBABLE et le GESTE UTILE, et il dit que
+/// supprimer la zone ne sert à rien.
+///
+/// Deux testeurs ont supprimé leur zone pour qu'elle refonctionne (Cyrille
+/// Moutia sur macOS, Kimon sur Linux, fil 1861, réponse 6576). Le message
+/// qu'ils lisaient — « La sortie de cette zone n'est plus disponible » —
+/// accuse la sortie et s'arrête là : rien n'y dit pourquoi, rien n'y dit quoi
+/// faire, et la seule action qu'un écran de réglages propose alors est de
+/// supprimer. Recréer la zone jette son volume, sa file et ses réglages, et ne
+/// répare rien que le retour de l'appareil n'aurait réparé tout seul.
+///
+/// Sabotage qui rend ce témoin ROUGE : rétablir l'ancien `format!` à deux
+/// branches dans `gate_or_rebind_offline_zone`.
+#[tokio::test]
+async fn le_refus_dit_la_cause_probable_et_que_recreer_la_zone_ne_sert_a_rien() {
+    use super::transport::message_de_refus_de_zone;
+
+    // 1. L'appareil est là, sous un autre nom. Windows suffixe l'endpoint du
+    //    taux d'échantillonnage courant (#2269, DEvir) : « audio-gd USB audio »
+    //    devient « audio-gd USB audio (44,1 kHz) ». Le message le NOMME —
+    //    il ne le branche pas : rien ne prouve que c'est le même appareil.
+    let renomme = message_de_refus_de_zone(
+        "local:audio-gd USB audio",
+        "Salon",
+        &[
+            "audio-gd USB audio (44,1 kHz)".to_string(),
+            "Haut-parleurs".to_string(),
+        ],
+    );
+    assert!(renomme.starts_with("zone_output_unavailable:"), "{renomme}");
+    assert!(
+        renomme.contains("audio-gd USB audio (44,1 kHz)"),
+        "le candidat doit être NOMMÉ, c'est le renseignement qui manquait : {renomme}"
+    );
+    assert!(
+        renomme.contains("réglages de la zone"),
+        "et le geste doit être dit : {renomme}"
+    );
+
+    // 2. Deux candidats : les départager serait un tirage au sort, donc on
+    //    n'en nomme aucun. Un message qui désigne le mauvais appareil est pire
+    //    que pas de message.
+    let ambigu = message_de_refus_de_zone(
+        "local:Haut-parleurs",
+        "Salon",
+        &[
+            "Haut-parleurs (Realtek)".to_string(),
+            "Haut-parleurs (audio-gd)".to_string(),
+        ],
+    );
+    assert!(
+        !ambigu.contains("probablement"),
+        "deux candidats : rien ne doit être suggéré — {ambigu}"
+    );
+
+    // 3. Sortie locale absente d'un parc pourtant énuméré : débranchée,
+    //    éteinte, ou tenue en exclusif par une autre application.
+    let absente = message_de_refus_de_zone(
+        "local:audio-gd USB audio",
+        "Salon",
+        &["Haut-parleurs".to_string()],
+    );
+    assert!(
+        absente.contains("audio-gd USB audio") && absente.contains("exclusif"),
+        "la cause la plus fréquente sous Windows doit être nommée : {absente}"
+    );
+
+    // 4. Sortie réseau : l'appareil ne s'est pas annoncé. Il n'y a rien à
+    //    faire côté Tune — et surtout rien à supprimer.
+    let reseau = message_de_refus_de_zone("uuid:abcd-1234", "Salon", &[]);
+    assert!(
+        reseau.contains("réseau"),
+        "une sortie réseau absente doit être dite comme telle : {reseau}"
+    );
+
+    // 5. LA phrase qui manquait, dans TOUS les cas — c'est elle qui coupe le
+    //    geste que les deux testeurs ont fait.
+    for msg in [&renomme, &ambigu, &absente, &reseau] {
+        assert!(
+            msg.contains("Inutile de supprimer la zone"),
+            "le refus doit dire que supprimer la zone ne sert à rien : {msg}"
+        );
+        assert!(
+            msg.starts_with("zone_output_unavailable:"),
+            "la sentinelle que la couche HTTP mappe sur un 409 est conservée : {msg}"
+        );
+    }
+}
+
+/// Et le refus servi par le garde lui-même porte bien ce message — le témoin
+/// du dessus juge la règle, celui-ci juge le câblage.
+#[tokio::test]
+async fn le_garde_sert_bien_le_message_diagnostique() {
+    let orch = test_orchestrator();
+    let zone_id = zone_locale_hors_ligne(&orch, "Salon", "local:audio-gd USB audio");
+    // Un parc local NON vide (sinon #3737 laisse passer), et un nom qui n'est
+    // pas une variante du nom attendu (sinon c'est le cas « renommé »).
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:haut-parleurs", "Haut-parleurs").with_type("local"),
+    ));
+
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_id, &zone)
+        .await
+        .expect_err("une zone locale hors ligne dont l'appareil a disparu doit refuser");
+    assert!(
+        err.contains("Inutile de supprimer la zone"),
+        "le garde doit servir le message diagnostique, pas l'ancien constat : {err}"
+    );
+}
