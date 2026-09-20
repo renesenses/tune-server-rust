@@ -2745,12 +2745,20 @@ async fn envoyer_le_rapport(
     // n'ajoute un multipart que lorsqu'il y a quelque chose à transporter — un
     // serveur qui ne joint rien ne change donc rien à ce qu'il émettait.
     let nb_images = images.len();
+    // `Accept: application/json`, et ce n'est pas décoratif : sans lui, Laravel
+    // répond à un refus de validation par une REDIRECTION 302 vers la page
+    // précédente au lieu d'un 422. `reqwest` la suit, tombe sur une page HTML
+    // en 200, et le refus se lirait « envoyé » — le testeur croirait sa capture
+    // partie. Mesuré sur le banc Pest de la PR jumelle `site-mozaiklabs`.
     let requete = if images.is_empty() {
         let payload: serde_json::Map<String, Value> = champs
             .into_iter()
             .map(|(k, v)| (k.to_string(), Value::String(v)))
             .collect();
-        client.post(&url).json(&payload)
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&payload)
     } else {
         let mut form = reqwest::multipart::Form::new();
         for (k, v) in champs {
@@ -2774,7 +2782,10 @@ async fn envoyer_le_rapport(
             // les fichiers EN SILENCE : le testeur croirait sa capture partie.
             form = form.part("images[]", part);
         }
-        client.post(&url).multipart(form)
+        client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .multipart(form)
     };
 
     match requete.send().await {

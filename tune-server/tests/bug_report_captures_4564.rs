@@ -57,6 +57,7 @@ use tune_server::state::AppState;
 #[derive(Default)]
 struct Recu {
     content_type: String,
+    accept: String,
     corps: Vec<u8>,
 }
 
@@ -91,8 +92,14 @@ async fn faux_forum() -> FauxForum {
                     // Combien de parties `images[]` ? Compté sur les octets.
                     let texte = String::from_utf8_lossy(&corps).to_string();
                     let n = texte.matches("name=\"images[]\"").count();
+                    let accept = headers
+                        .get(axum::http::header::ACCEPT)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
                     *d.lock().await = Recu {
                         content_type: ct,
+                        accept,
                         corps: corps.to_vec(),
                     };
                     axum::Json(json!({
@@ -225,6 +232,15 @@ async fn les_captures_partent_au_forum_sous_images() {
     // Et la description du testeur ouvre bien le corps du fil.
     assert!(texte.contains("La liste saute quand je descends."));
 
+    // 🔴 `Accept: application/json`. Sans lui, Laravel répond à un refus de
+    // validation par une REDIRECTION 302 ; `reqwest` la suit, tombe sur une
+    // page HTML en 200, et le refus se lirait « envoyé ». Mesuré sur le banc
+    // Pest de la PR jumelle `site-mozaiklabs`.
+    assert_eq!(
+        recu.accept, "application/json",
+        "sans cet en-tête, un refus du forum revient en 302 et se lit « envoyé »"
+    );
+
     // 4 — le nombre rendu est celui que le SITE annonce.
     assert_eq!(
         reponse["images"].as_u64(),
@@ -256,6 +272,7 @@ async fn sans_capture_le_corps_reste_du_json() {
         "sans capture, le relais doit rester JSON ; il a envoyé : {}",
         recu.content_type
     );
+    assert_eq!(recu.accept, "application/json");
     let corps: Value = serde_json::from_slice(&recu.corps).unwrap();
     assert!(
         corps["body"]
