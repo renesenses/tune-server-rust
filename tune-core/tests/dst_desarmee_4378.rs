@@ -192,6 +192,13 @@ fn construit_tune_server(ligne: &str) -> bool {
 struct Liste {
     ancre: String,
     features: Vec<String>,
+    /// La ligne `cross build … --features ${{ matrix.features }}` de
+    /// `release.yml` ne porte aucun nom à elle : elle RELAIE les entrées de
+    /// matrice, relevées séparément. Ses « fonctionnalités » sont les morceaux
+    /// de l'interpolation, pas des noms — elles sont donc écartées des
+    /// contrôles de forme. La recherche de `dst` la traverse quand même : un
+    /// `--features ${{ matrix.features }},dst` serait le raccourci évident.
+    relais: bool,
 }
 
 /// Toutes les listes de fonctionnalités d'une recette.
@@ -212,6 +219,7 @@ fn listes(fichier: &str, source: &str) -> Vec<Liste> {
             relevees.push(Liste {
                 ancre: format!("{fichier}:{n} (base plugin-catalog)"),
                 features: base,
+                relais: false,
             });
             continue;
         }
@@ -221,6 +229,7 @@ fn listes(fichier: &str, source: &str) -> Vec<Liste> {
             relevees.push(Liste {
                 ancre: format!("{fichier}:{n} (entrée de matrice)"),
                 features: decouper(valeur),
+                relais: false,
             });
             continue;
         }
@@ -230,9 +239,16 @@ fn listes(fichier: &str, source: &str) -> Vec<Liste> {
             let mots: Vec<&str> = t.split_whitespace().collect();
             let features = drapeaux_features(&mots);
             if !features.is_empty() {
+                let relais = features.iter().any(|f| f.contains("${{"));
+                let quoi = if relais {
+                    "relais de matrice"
+                } else {
+                    "ligne de build"
+                };
                 relevees.push(Liste {
-                    ancre: format!("{fichier}:{n} (ligne de build)"),
+                    ancre: format!("{fichier}:{n} ({quoi})"),
                     features,
+                    relais,
                 });
             }
         }
@@ -282,6 +298,15 @@ fn dst_n_est_dans_aucune_ligne_de_build_publiee() {
         "seulement {avec_oaat} liste(s) citent `oaat` — l'extracteur rend des \
          listes vides ou tronquées, et la recherche de `dst` ne prouverait rien"
     );
+    // La ligne qui relaie `${{ matrix.features }}` doit être VUE, et vue comme
+    // un relais : c'est elle qui construit les deux cibles ARM. Si elle
+    // disparaissait du relevé, un `,dst` collé derrière l'interpolation ne
+    // serait lu par personne.
+    assert!(
+        toutes.iter().filter(|l| l.relais).count() >= 1,
+        "aucun relais `${{{{ matrix.features }}}}` relevé — la ligne `cross \
+         build` de release.yml a changé de forme et n'est plus lue"
+    );
     let bases = toutes
         .iter()
         .filter(|l| l.ancre.contains("base plugin-catalog"))
@@ -292,13 +317,17 @@ fn dst_n_est_dans_aucune_ligne_de_build_publiee() {
          base, pas la ligne `--features`, que `plugin-catalog.py --write` \
          recopie. Sans elles la garde serait effacée au premier --write"
     );
-    // Sens NÉGATIF : un drapeau n'est pas une fonctionnalité.
+    // Sens NÉGATIF : un drapeau n'est pas une fonctionnalité. Hors relais,
+    // dont les « fonctionnalités » sont les morceaux de l'interpolation.
     for intrus in ["--no-default-features", "--features", "${{"] {
+        let coupable = toutes
+            .iter()
+            .filter(|l| !l.relais)
+            .find(|l| l.features.iter().any(|f| f == intrus));
         assert!(
-            !toutes
-                .iter()
-                .any(|l| l.features.iter().any(|f| f == intrus)),
-            "extracteur cassé : `{intrus}` compte comme une fonctionnalité"
+            coupable.is_none(),
+            "extracteur cassé : `{intrus}` compte comme une fonctionnalité — \
+             {coupable:?}"
         );
     }
 
@@ -344,6 +373,18 @@ fn aucune_recette_de_publication_n_echappe_a_la_garde() {
             if !entree.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
+            // Une recette est un fichier EXÉCUTÉ. `MIGRATION.md` et
+            // `README.md` citent tous deux une ligne `cargo build --package
+            // tune-server` : de la documentation, pas une recette — les
+            // compter aurait fait rougir cette garde contre de la prose.
+            let nom = entree.file_name().to_string_lossy().into_owned();
+            let est_recette = nom.starts_with("Dockerfile")
+                || [".yml", ".yaml", ".sh", ".py"]
+                    .iter()
+                    .any(|e| nom.ends_with(e));
+            if !est_recette {
+                continue;
+            }
             let Ok(contenu) = std::fs::read_to_string(entree.path()) else {
                 continue; // binaire : pas une recette
             };
@@ -354,9 +395,9 @@ fn aucune_recette_de_publication_n_echappe_a_la_garde() {
                 continue;
             }
             let relatif = if *repertoire == "." {
-                entree.file_name().to_string_lossy().into_owned()
+                nom
             } else {
-                format!("{repertoire}/{}", entree.file_name().to_string_lossy())
+                format!("{repertoire}/{nom}")
             };
             trouves.insert(relatif);
         }
