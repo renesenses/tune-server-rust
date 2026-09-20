@@ -513,7 +513,29 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 // la boucle inscrirait au registre un « rien à faire » faux et
                 // dormirait 15 minutes au lieu des 30 s de report lecture.
                 let playing = playing || any_zone_playing(&backend);
-                let albums = analyze_album_batch(&backend);
+                // #4567 — la passe d'album n'est pas « du calcul pur » : elle
+                // ÉCRIT quatre clés par piste (jusqu'à ~60 écritures SQLite
+                // d'affilée pour un album de 15 titres), et elle le faisait
+                // sur le fil de l'exécuteur asynchrone. Trois micro-coupures
+                // de la .18 les 19 et 20/09/2026 tombent à la seconde sur une
+                // ligne `replaygain_album`. On la sort donc sur un fil
+                // bloquant, comme tout travail synchrone de base de données —
+                // et on journalise sa durée quand elle dépasse la moitié d'un
+                // tampon d'endpoint.
+                let debut_album = std::time::Instant::now();
+                let backend_album = backend.clone();
+                let albums =
+                    tokio::task::spawn_blocking(move || analyze_album_batch(&backend_album))
+                        .await
+                        .unwrap_or(0);
+                let duree_album = debut_album.elapsed();
+                if albums > 0 && duree_album >= std::time::Duration::from_millis(50) {
+                    info!(
+                        duree_ms = duree_album.as_millis() as u64,
+                        en_lecture = playing,
+                        "replaygain_album_passe_longue"
+                    );
+                }
 
                 if did > 0 || albums > 0 {
                     // Du travail : ouvrir la campagne si elle ne l'est pas déjà.
