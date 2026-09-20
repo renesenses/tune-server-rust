@@ -8850,3 +8850,67 @@ async fn le_garde_sert_bien_le_message_diagnostique() {
         "le garde doit servir le message diagnostique, pas l'ancien constat : {err}"
     );
 }
+
+/// 🔴 #4580 — la bulle affichée à l'auditeur ne commence pas par
+/// « zone_output_unavailable: ».
+///
+/// `Err(msg)` porte la sentinelle : la couche HTTP la retire avant de composer
+/// son 409 (`routes/playback.rs`). L'événement, lui, partait avec — et le
+/// client affiche `data.message || data.error` tel quel (`App.svelte`). La
+/// phrase lue commençait donc par un identifiant de code, ce qui se lit comme
+/// une panne du logiciel et non comme une consigne.
+///
+/// La convention du dépôt est `error` = la phrase, `code` = l'identifiant
+/// stable (`audio::bitperfect_strict::charge_utile_de_refus`,
+/// `poller/tick.rs`). Seul cet émetteur y dérogeait.
+///
+/// Sabotage qui rend ce témoin ROUGE : remettre `"error": msg` dans le
+/// `bus.emit` de `gate_or_rebind_offline_zone`.
+#[tokio::test]
+async fn la_bulle_de_refus_ne_montre_pas_la_sentinelle_de_code() {
+    let bus = Arc::new(EventBus::new());
+    let mut orch = test_orchestrator();
+    orch.event_bus = Some(bus.clone());
+    let zone_id = zone_locale_hors_ligne(&orch, "Salon", "local:audio-gd USB audio");
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:haut-parleurs", "Haut-parleurs").with_type("local"),
+    ));
+
+    let mut rx = bus.subscribe();
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_id, &zone)
+        .await
+        .expect_err("l'appareil a disparu : la lecture doit être refusée");
+    // L'erreur RENDUE garde la sentinelle : la route en dépend pour son 409.
+    assert!(err.starts_with("zone_output_unavailable:"), "{err}");
+
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("aucun zone.playback_error n'a été émis dans les 2 s")
+        .expect("bus fermé");
+    let affiche = ev
+        .data
+        .get("error")
+        .and_then(|v| v.as_str())
+        .expect("l'événement doit porter la phrase");
+    assert!(
+        !affiche.starts_with("zone_output_unavailable:"),
+        "la bulle affichée à l'auditeur ne doit pas s'ouvrir sur un identifiant \
+         de code : {affiche}"
+    );
+    assert!(
+        affiche.contains("audio-gd USB audio") && affiche.contains("Inutile de supprimer"),
+        "et elle doit porter la phrase entière, appareil nommé et geste dit : {affiche}"
+    );
+    // Le code reste disponible, sur son propre champ — c'est la convention du
+    // dépôt, et c'est ce dont un client a besoin pour traduire.
+    assert_eq!(
+        ev.data.get("code").and_then(|v| v.as_str()),
+        Some("zone_output_unavailable"),
+        "le code stable doit voyager à part, pas collé devant la phrase"
+    );
+}

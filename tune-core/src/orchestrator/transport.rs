@@ -419,7 +419,25 @@ impl PlaybackOrchestrator {
                 "zone.playback_error",
                 serde_json::json!({
                     "zone_id": zone_id,
-                    "error": msg,
+                    // 🔴 #4580 — `error` porte la PHRASE, jamais la sentinelle.
+                    //
+                    // `msg` commence par `zone_output_unavailable:`, que la
+                    // couche HTTP retire avant de composer son 409
+                    // (`routes/playback.rs`). Cet événement-ci, lui, partait
+                    // avec : le client affiche `data.message || data.error`
+                    // tel quel (`App.svelte`), et la bulle lue par l'auditeur
+                    // commençait donc par « zone_output_unavailable: ». Un
+                    // message qui s'ouvre sur un identifiant de code se lit
+                    // comme une panne du logiciel, pas comme une consigne —
+                    // et c'est la bulle que les deux testeurs du fil 1861 ont
+                    // eue sous les yeux avant de supprimer leur zone.
+                    //
+                    // La convention du dépôt est déjà celle-ci partout
+                    // ailleurs : `error` = la phrase, `code` = l'identifiant
+                    // stable (`audio::bitperfect_strict::charge_utile_de_refus`,
+                    // `poller/tick.rs`). Seul cet émetteur y dérogeait.
+                    "error": msg.strip_prefix("zone_output_unavailable:").unwrap_or(&msg),
+                    "code": "zone_output_unavailable",
                     // 🔴 #3737 — SANS ce drapeau, le message n'atteint personne.
                     //
                     // Le client ouvre une fenêtre de grâce de 30 s AVANT l'appel
