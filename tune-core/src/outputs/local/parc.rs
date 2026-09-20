@@ -1179,4 +1179,49 @@ mod asio_scan_gate_4168_tests {
             );
         }
     }
+
+    /// #4556 — l'étape qui FABRIQUE le refus doit se voir dans un journal de
+    /// terrain.
+    ///
+    /// Un export de journal ne porte que l'INFO et au-dessus : le `debug!` qui
+    /// était ici n'existait pas pour le support, et le rapport de Marco Polo
+    /// (fil 1852) ne contenait donc aucune trace de la bascule qui a produit
+    /// son « zone_output_unavailable ».
+    #[test]
+    fn le_coupe_circuit_dit_au_niveau_warn_combien_d_appareils_il_a_servi() {
+        let source = include_str!("parc.rs");
+        let porte = source
+            .split_once("    fn run<T>(")
+            .expect("la porte a changé de forme")
+            .1
+            .split_once("\n    }\n")
+            .expect("fin de la porte introuvable")
+            .0;
+        assert!(
+            porte.contains("journaliser_enumeration_asio_bloquee(backend, du_cache.len())"),
+            "la porte ne dit plus combien d'appareils elle a servi (#4556) : {porte}"
+        );
+        assert!(
+            !porte.contains("debug!"),
+            "le chemin qui mène à un refus utilisateur est redescendu en debug! (#4556)"
+        );
+
+        let journal = source
+            .split_once("fn journaliser_enumeration_asio_bloquee(")
+            .expect("le journal du blocage a disparu")
+            .1
+            .split_once("\n}\n")
+            .expect("fin du journal introuvable")
+            .0;
+        assert!(
+            journal.contains("warn!"),
+            "le blocage ASIO doit être dit au niveau WARN (#4556)"
+        );
+        for champ in ["temoin", "appareils", "motif"] {
+            assert!(
+                journal.contains(champ),
+                "le champ « {champ} » a disparu du journal du blocage ASIO (#4556)"
+            );
+        }
+    }
 }
