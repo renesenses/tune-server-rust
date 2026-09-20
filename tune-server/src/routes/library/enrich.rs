@@ -322,6 +322,18 @@ pub(super) async fn enrich_all_library(
             std::collections::HashSet::new();
 
         for row in &track_rows {
+            // Pause demandée par l'utilisateur. On GARE la passe ici au lieu
+            // d'en sortir : la liste de candidats a été calculée une fois, à
+            // l'ouverture, et elle n'est nulle part en base. Sortir de la
+            // boucle terminerait la tâche, et « Reprendre » n'aurait plus rien
+            // à reprendre. Endormie ici, elle repart au MÊME index.
+            //
+            // La frontière est propre : la piste précédente est enrichie et
+            // écrite, aucune requête MusicBrainz n'est en vol.
+            tune_core::taches_de_fond::attendre_la_reprise(
+                tune_core::taches_de_fond::Tache::Enrichissement,
+            )
+            .await;
             // En TETE de boucle, pas en queue : le corps sort par `continue` des
             // qu'une recherche MusicBrainz ne rend rien, et une bibliotheque
             // entiere peut sortir par la. Annonce en queue, la barre serait

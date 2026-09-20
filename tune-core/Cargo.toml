@@ -167,6 +167,15 @@ path = "tests/sendspin_poignee_s2a.rs"
 name = "integration_contracts"
 path = "tests/integration_contracts.rs"
 
+# `autotests = false` en tete de ce manifeste : sans cette cible, le temoin de
+# la pause des traitements de fond ne serait JAMAIS compile et la porte rendrait
+# un vert contre rien (#4574). Binaire a lui seul : la pause est un etat de
+# PROCESSUS (masque de bits atomique), comme l'avancement ReplayGain — un voisin
+# qui suspendrait une passe dans le meme binaire le rendrait intermittent.
+[[test]]
+name = "pause_taches_de_fond"
+path = "tests/pause_taches_de_fond.rs"
+
 # `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
 # tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
 # que tune_core, déjà construit (#2213).
