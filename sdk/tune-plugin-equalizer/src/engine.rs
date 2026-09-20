@@ -158,6 +158,21 @@ pub const DEBIT_DE_REFERENCE_HZ: f64 = 44_100.0;
 /// l'unité et rien n'est à réserver.
 const Q_SANS_RESONANCE: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
+/// Ce qu'on ajoute à la norme L1 pour ne pas réserver la borne au ras.
+///
+/// Depuis #4594 la L1 n'est plus doublée par la somme des gains : elle EST la
+/// réserve, et elle est **atteinte** — le signal `x[n] = signe(h[−n])` sort
+/// exactement à 1,000000. Le compteur d'écrêtage de Tune teste
+/// `!(-1.0..1.0).contains(&s)` : l'égalité compte comme un over, et un
+/// échantillon pile au rail n'a de toute façon plus rien devant lui.
+///
+/// 0,01 dB — un facteur 0,998849 — écarte le rail sans s'entendre (le pas de
+/// volume le plus fin de l'interface vaut 0,5 dB), et couvre du même coup la
+/// queue que [`norme_l1`] tronque : celle-ci pèse moins de 10⁻⁴ dB, mille fois
+/// moins. Mesuré : crête 0,998849 et zéro over sur le signal adverse, contre
+/// 1,000000 et un over sans cette marge.
+const MARGE_DE_TRONCATURE_DB: f64 = 0.01;
+
 /// Bornes de la réponse impulsionnelle sommée par [`norme_l1`].
 const LONGUEUR_L1_MIN: usize = 4_096;
 const LONGUEUR_L1_MAX: usize = 1 << 19;
@@ -257,28 +272,50 @@ impl EqProfile {
 
     /// Réserve automatique d'un canal, en dB (négative ou nulle), au débit donné.
     ///
-    /// Trois termes, et seulement trois — chacun répond à un défaut mesuré
-    /// (#4073, `docs/mesures/2218-marge-ecretage-crete-vraie.md`) :
+    /// **Deux** termes, et seulement deux — chacun répond à un défaut mesuré
+    /// (#4073, #4594, `docs/mesures/2218-marge-ecretage-crete-vraie.md`) :
     ///
-    /// 1. **La somme des gains positifs** des bandes `peak` / `low_shelf` /
-    ///    `high_shelf`, telle qu'elle est depuis d423c16b. Les biquads se
-    ///    cascadent : leurs gains se multiplient en linéaire, s'additionnent en
-    ///    dB, et cette somme majore toujours le maximum de la réponse en
-    ///    FRÉQUENCE. Elle est conservée telle quelle, parce que sur un profil à
-    ///    plusieurs bandes elle majore aussi — largement — le terme suivant.
-    /// 2. **La norme L1 de la cascade à gain**, en dB. `max|y| ≤ ‖h‖₁·max|x|`
-    ///    est la seule borne VRAIE pour une entrée bornée quelconque, et c'est
-    ///    une réponse en TEMPS, pas en fréquence. Un plateau grave de +6 dB a
-    ///    un maximum fréquentiel de 6,000 dB et une norme L1 de 6,505 dB : sur
-    ///    un carré, la somme des gains est courte de 0,50 dB et 40 % des
-    ///    échantillons sortaient du rail. On retient le PLUS GRAND des deux
-    ///    termes : jamais moins que l'historique, jamais moins que la borne.
-    /// 3. **La résonance des `low_pass` / `high_pass`**, `20·log10(Q/0,707)`
+    /// 1. **La norme L1 de la cascade à gain**, en dB. `max|y| ≤ ‖h‖₁·max|x|`
+    ///    est la borne VRAIE pour une entrée bornée quelconque — et c'est une
+    ///    réponse en TEMPS, pas en fréquence : elle voit la sonnerie d'un
+    ///    plateau sur un front, que le maximum de la réponse en fréquence ne
+    ///    voit pas. Un plateau grave de +6 dB a un maximum fréquentiel de
+    ///    6,000 dB et une norme L1 de 6,505 dB ; sur un carré, 40 % des
+    ///    échantillons sortaient du rail avec la première valeur. Réserver la
+    ///    L1 rend l'écrêtage **impossible** : l'entrée PCM est bornée à 1,0,
+    ///    donc `|y| ≤ ‖h‖₁ · (1/‖h‖₁) = 1`.
+    /// 2. **La résonance des `low_pass` / `high_pass`**, `20·log10(Q/0,707)`
     ///    pour Q > 0,707, zéro sinon. Un passe-bas RBJ vaut |H(fc)| = Q :
     ///    à Q = 4 il pousse de 12,04 dB et la réserve valait… 0 dB, pour 83,7 %
     ///    d'overs écrêtés dur. La formule rend 15,05 dB, soit le maximum
     ///    fréquentiel EXACT (Q/√(1−1/4Q²) = 12,11 dB) plus une marge qui couvre
     ///    aussi la norme L1 du même filtre (14,19 dB).
+    ///
+    /// ## Ce que la somme des gains positifs faisait ici, et pourquoi elle en est partie
+    ///
+    /// Jusqu'à #4594, un troisième terme entrait en `max()` avec la L1 : la
+    /// **somme des gains positifs** des bandes à gain (d423c16b). Elle majore
+    /// bien le maximum de la réponse en fréquence — les biquads se cascadent,
+    /// leurs gains s'additionnent en dB — mais très grossièrement dès qu'il y a
+    /// plusieurs bandes, parce qu'elle suppose que toutes poussent à la même
+    /// fréquence. Sur un égaliseur graphique, où les bandes sont disjointes par
+    /// construction, elle domine systématiquement la borne vraie et atténue
+    /// pour rien. Mesuré :
+    ///
+    /// ```text
+    /// préréglage      somme (appliquée)   L1 (borne vraie)   max en fréquence
+    /// bass_boost           −20,00 dB          −13,40 dB          +10,29 dB
+    /// rock                 −28,00 dB          −13,64 dB           +7,64 dB
+    /// loudness             −27,00 dB          −13,73 dB           +7,24 dB
+    /// dix cloches à +6 dB  −60,00 dB          −16,53 dB          +10,85 dB
+    /// ```
+    ///
+    /// Choisir « Rock » en un geste coûtait 28 dB pour un besoin de 13,64 : le
+    /// symptôme que les testeurs décrivent en « pas de son quand j'active
+    /// l'égaliseur » (#1640), « Egaliseur » (#3479) et « il baisse le volume au
+    /// minimum » (#4407). La L1 seule reste une borne vraie — **strictement**
+    /// plus sûre que le maximum fréquentiel, qu'elle majore toujours — et rend
+    /// le niveau. Arbitré par Bertrand le 20/09 pour la v0.9.160.
     ///
     /// **Ce qui n'est volontairement PAS réservé** : la norme L1 des filtres
     /// `pass` et `notch` eux-mêmes. Un passe-haut de Butterworth (Q = 0,707,
@@ -294,12 +331,40 @@ impl EqProfile {
     /// réserver là-dessus atténuerait un profil purement soustractif — ce que
     /// personne ne demande et que `un_profil_uniquement_attenuateur_ne_reserve_aucune_marge`
     /// interdit. Le terme L1 ne s'applique donc que lorsqu'au moins une bande
-    /// pousse.
+    /// pousse — c'est le booléen que rend [`Self::cascade_a_gain`], et c'est
+    /// désormais son seul rôle : il ouvre la porte, il ne fixe plus la valeur.
+    ///
+    /// Cette porte-là a été **remesurée** en passant à la borne vraie (#4594),
+    /// parce qu'elle laisse passer un écrêtage réel : le préréglage `classical`
+    /// (que des creux) a une norme L1 de 2,171 dB et sort 16 864 échantillons
+    /// du rail sur un carré pleine échelle. La tentation était de fermer la
+    /// porte. Ce que coûterait sa fermeture a été mesuré avant d'y toucher :
+    ///
+    /// ```text
+    /// profil PUREMENT soustractif           L1 qu'il faudrait réserver
+    /// classical (livré)                          2,171 dB
+    /// une cloche −3 dB Q=1                       2,544 dB
+    /// curseurs −12/−12/−12                       5,294 dB
+    /// plateau grave −12 dB                       5,516 dB
+    /// une cloche −24 dB Q=1                      6,957 dB
+    /// dix cloches −24 dB Q=10                   13,346 dB
+    /// ```
+    ///
+    /// Jusqu'à **13,3 dB retirés à un profil qui ne fait que creuser** : c'est
+    /// exactement le défaut qu'on vient de corriger ailleurs, réintroduit par
+    /// l'autre bout. La porte reste donc ouverte, pour la même raison, chiffrée,
+    /// que la norme L1 des `pass` reste hors réserve. Un profil sans aucun
+    /// gain positif peut dépasser le rail sur un signal adverse ; c'était vrai
+    /// avant #4594 et ça l'est encore, à l'échantillon près.
     pub fn automatic_headroom_db_at(&self, channel: u16, sample_rate: f64) -> f64 {
-        let (somme_positive_db, cascade) = self.cascade_a_gain(channel, sample_rate);
-        let l1_db = if somme_positive_db > 0.0 {
+        let (au_moins_une_bande_pousse, cascade) = self.cascade_a_gain(channel, sample_rate);
+        let l1_db = if au_moins_une_bande_pousse {
             let l1 = norme_l1(&cascade);
-            if l1 > 1.0 { 20.0 * l1.log10() } else { 0.0 }
+            if l1 > 1.0 {
+                20.0 * l1.log10() + MARGE_DE_TRONCATURE_DB
+            } else {
+                0.0
+            }
         } else {
             0.0
         };
@@ -312,10 +377,10 @@ impl EqProfile {
                 .map(EqBandSpec::reserve_de_resonance_db)
                 .sum()
         };
-        -(somme_positive_db.max(l1_db) + resonance_db)
+        -(l1_db + resonance_db)
     }
 
-    /// La somme des gains positifs et la cascade des bandes à GAIN
+    /// Au moins une bande POUSSE-t-elle, et la cascade des bandes à GAIN
     /// (`peak` / `low_shelf` / `high_shelf`, et tout type inconnu — que
     /// [`EqBandSpec::coeffs`] traite en `peaking_eq`), exactement celle que
     /// construit [`EqProcessor::new`] pour ce canal, amputée des `pass` et des
@@ -326,13 +391,19 @@ impl EqProfile {
     /// [`EqBandSpec::est_une_bande_a_gain`]. Elles ne le faisaient pas : la
     /// somme filtrait par liste blanche et la cascade par liste noire, si bien
     /// qu'un type non canonique poussait sans rien réserver (#4594).
-    fn cascade_a_gain(&self, channel: u16, sample_rate: f64) -> (f64, Vec<BiquadCoeffs>) {
+    ///
+    /// Le premier membre était la SOMME des gains positifs, et elle servait de
+    /// réserve. Depuis #4594 elle n'est plus qu'un **booléen** — « au moins une
+    /// bande pousse-t-elle ? » — qui ouvre la porte du terme L1 : la valeur,
+    /// elle, vient entièrement de la borne vraie. Une somme et une cascade,
+    /// c'étaient deux réponses à la même question, et celle qui gagnait le
+    /// `max()` n'était pas celle qui mesure.
+    fn cascade_a_gain(&self, channel: u16, sample_rate: f64) -> (bool, Vec<BiquadCoeffs>) {
         if self.bands.is_empty() {
             let (bass, mid, treble) = self.effective_gains();
-            let somme: f64 = [bass, mid, treble]
+            let pousse = [bass, mid, treble]
                 .into_iter()
-                .filter(|gain| gain.is_finite() && *gain > 0.0)
-                .sum();
+                .any(|gain| gain.is_finite() && gain > 0.0);
             let utilisable = [bass, mid, treble].iter().all(|g| g.is_finite());
             let actif = bass.abs() > 0.01 || mid.abs() > 0.01 || treble.abs() > 0.01;
             let cascade = if utilisable && actif && sample_rate.is_finite() && sample_rate > 0.0 {
@@ -344,20 +415,15 @@ impl EqProfile {
             } else {
                 Vec::new()
             };
-            return (somme, cascade);
+            return (pousse, cascade);
         }
 
-        let somme: f64 = self
-            .bands
-            .iter()
-            .filter(|band| {
-                band.vise_le_canal(channel)
-                    && band.est_une_bande_a_gain()
-                    && band.gain.is_finite()
-                    && band.gain > 0.0
-            })
-            .map(|band| band.gain.clamp(0.0, 24.0))
-            .sum();
+        let pousse = self.bands.iter().any(|band| {
+            band.vise_le_canal(channel)
+                && band.est_une_bande_a_gain()
+                && band.gain.is_finite()
+                && band.gain > 0.0
+        });
 
         let cascade = if sample_rate.is_finite() && sample_rate > 0.0 {
             self.bands
@@ -375,7 +441,7 @@ impl EqProfile {
         } else {
             Vec::new()
         };
-        (somme, cascade)
+        (pousse, cascade)
     }
 
     /// Tone preset for the DECLARED listening environment.
@@ -463,10 +529,16 @@ impl BiquadState {
 /// La somme est tronquée, jamais infinie : la longueur vient du pôle le plus
 /// lent de la cascade (|p|² = a₂ pour une paire conjuguée), assez loin pour
 /// que l'enveloppe soit tombée à 10⁻⁹, bornée à [`LONGUEUR_L1_MIN`] …
-/// [`LONGUEUR_L1_MAX`]. Une troncature ne peut que SOUS-estimer, et
-/// [`EqProfile::automatic_headroom_db_at`] prend le maximum avec la somme
-/// historique des gains : la garantie d'avant ne peut pas être perdue par
-/// cette borne-ci. Rendue en linéaire ; une cascade vide vaut 1,0 (0 dB).
+/// [`LONGUEUR_L1_MAX`]. Une troncature ne peut que SOUS-estimer — et depuis
+/// #4594 cette valeur n'est plus doublée par la somme des gains : elle EST la
+/// réserve. La borne de longueur est donc la garantie elle-même, et c'est
+/// pourquoi elle vise 10⁻⁹ et non un compte rond : la queue laissée dehors
+/// pèse moins que le LSB d'un 32 bits. Ce que la troncature laisse dehors est
+/// témoigné là où il se verrait — en sortie :
+/// `aucun_prereglage_livre_n_ecrete_meme_sur_le_signal_adverse_4594` injecte
+/// le signal `x[n] = signe(h[−n])` qui ATTEINT la borne, et vérifie qu'aucun
+/// échantillon ne sort du rail. Rendue en linéaire ; une cascade vide vaut
+/// 1,0 (0 dB).
 fn norme_l1(cascade: &[BiquadCoeffs]) -> f64 {
     if cascade.is_empty() {
         return 1.0;
@@ -1288,8 +1360,18 @@ mod tests {
         assert!(treble > 0.0, "large room should boost treble");
     }
 
+    /// La réserve est la borne vraie, et elle est calculée PAR CANAL.
+    ///
+    /// Les trois bandes sont à 1 kHz, Q = 1 : elles se recouvrent
+    /// exactement. Le canal gauche voit +6, +3 et −12 (réponse nette −3 dB), le
+    /// droit +6 et −12 (nette −6 dB). Jusqu'à #4594 la réserve valait la somme
+    /// des gains positifs — 9 dB à gauche, 6 à droite — alors qu'aucune de ces
+    /// deux cascades ne pousse de plus de 3 dB nulle part. La norme L1 voit
+    /// ce que la somme ne voyait pas : 2,462 dB à gauche, 3,885 à droite, et
+    /// c'est le canal le PLUS creusé qui réserve le plus, parce qu'un creux
+    /// profond sonne longtemps.
     #[test]
-    fn automatic_headroom_sums_positive_gains_per_channel() {
+    fn automatic_headroom_is_the_true_bound_per_channel() {
         let profile = EqProfile {
             enabled: true,
             bands: vec![
@@ -1312,11 +1394,17 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(profile.automatic_headroom_db(0), -9.0);
-        assert_eq!(profile.automatic_headroom_db(1), -6.0);
+        assert_eq!(
+            profile.automatic_headroom_db(0),
+            -2.461_945_232_181_620_6
+        );
+        assert_eq!(
+            profile.automatic_headroom_db(1),
+            -3.884_722_078_857_195_4
+        );
         let eq = EqProcessor::new(&profile, 44_100, 2);
-        assert_eq!(eq.preamp_db(0), Some(-9.0));
-        assert_eq!(eq.preamp_db(1), Some(-6.0));
+        assert_eq!(eq.preamp_db(0), Some(-2.461_945_232_181_620_6));
+        assert_eq!(eq.preamp_db(1), Some(-3.884_722_078_857_195_4));
     }
 
     #[test]
@@ -1364,7 +1452,9 @@ mod tests {
         }
 
         let mut eq = EqProcessor::new(&profile, 44_100, 1);
-        assert_eq!(eq.preamp_db(0), Some(-36.0));
+        // #4594 : 19,970 dB (la borne vraie) et non plus 36 (12 + 12 + 12).
+        // Ce qui compte pour ce témoin n'a pas bougé d'un iota : `overs == 0`.
+        assert_eq!(eq.preamp_db(0), Some(-19.969_591_046_242_122));
         let stats = eq.process_pcm(&mut pcm, 32);
         assert_eq!(stats.overs, 0);
         assert_eq!(stats.non_finite_samples, 0);
