@@ -331,10 +331,15 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
     )
     .unwrap();
 
-    // #4073 : la réserve est le PLUS GRAND de la somme des gains positifs
-    // (9,0 / 6,0 dB) et de la norme L1 de la cascade — ici 10,476 / 7,165 dB,
-    // parce que deux cloches empilées à 1 kHz sonnent au-delà de leur gain
-    // crête. Le panneau annonce ce qui est RÉELLEMENT retiré au signal.
+    // La réserve est la norme L1 de la cascade — ici 10,486 / 7,175 dB, marge
+    // de troncature comprise — et non plus la somme des gains positifs
+    // (9,0 / 6,0 dB) : deux cloches empilées à 1 kHz sonnent au-delà de leur
+    // gain crête, et depuis #4594 c'est cette borne-là, seule, qui est
+    // réservée. Le panneau lit `automatic_headroom_db` à chaud : il annonce
+    // donc toujours ce qui est RÉELLEMENT retiré au signal, sans qu'une
+    // valeur soit recopiée quelque part. Le verdict bit-perfect, lui, ne
+    // dépend pas du chiffre mais de l'EXISTENCE d'un EQ actif
+    // (`zone_eq_alters_signal`) : il reste faux.
     assert_eq!(
         step_desc(&sp, "DSP").as_deref(),
         Some("EQ actif (pré-gain auto G -10.5 dB / D -7.2 dB, sans limiteur)")

@@ -59,18 +59,24 @@
 //! qui pousse de +6 dB écrête. C'est une vraie contrainte, et l'ignorer
 //! saturerait.
 //!
-//! Tune la traite déjà, et plus sévèrement. Depuis d423c16b,
-//! [`crate::audio::eq::EqProfile::automatic_headroom_db`] réserve la **somme de tous les gains
-//! positifs** de la cascade, appliquée en pré-gain par canal avant les
-//! biquads ; depuis #4073 elle réserve le **plus grand** de cette somme et de
-//! la **norme L1** de la cascade, qui est la seule borne vraie de sa réponse
-//! en temps. Or la somme des gains positifs majore toujours le maximum de la
-//! réponse combinée, que le `Preamp` d'AutoEq vient précisément compenser :
-//! la marge que Tune réserve est donc toujours au moins aussi grande que celle
-//! qu'AutoEq demande. Sur le HD 650 d'oratory1990, AutoEq demande −6,1 dB et
-//! Tune en réserve −13,8 — inchangé par #4073, la somme des gains (13,8 dB)
-//! majorant largement la norme L1 du même profil (10,3 dB) dès que les bandes
-//! sont nombreuses et étalées.
+//! Tune la traite déjà, et plus sévèrement.
+//! [`crate::audio::eq::EqProfile::automatic_headroom_db`] réserve la **norme
+//! L1** de la cascade, appliquée en pré-gain par canal avant les biquads :
+//! c'est la borne VRAIE de sa réponse en temps, `max|y| ≤ ‖h‖₁·max|x|`. Elle
+//! majore toujours le maximum de la réponse combinée, que le `Preamp` d'AutoEq
+//! vient précisément compenser : la marge que Tune réserve est donc toujours
+//! au moins aussi grande que celle qu'AutoEq demande — et ce n'est pas supposé,
+//! `tune-core/tests/autoeq_profils_reels.rs` le vérifie sur trois profils
+//! publiés. Sur le HD 650 d'oratory1990, AutoEq demande −6,1 dB et Tune en
+//! réserve −10,3.
+//!
+//! L'histoire de cette valeur : la **somme des gains positifs** depuis
+//! d423c16b, le **plus grand** de cette somme et de la norme L1 depuis #4073,
+//! la **norme L1 seule** depuis #4594. La somme majorait le maximum
+//! fréquentiel, mais grossièrement — elle supposait que toutes les bandes
+//! poussent à la même fréquence — et sur un profil AutoEq étalé elle coûtait
+//! jusqu'à 9,8 dB de niveau pour rien (ER4SR : −22,2 réservés pour une borne
+//! vraie de −12,4).
 //!
 //! Ajouter le `Preamp` par-dessus atténuerait donc **deux fois**. Ce module se
 //! contente de le lire et de le rendre dans [`ProfilAutoEq::preamp_db`], pour
@@ -627,10 +633,12 @@ mod tests {
         // aucune marge (#4073 : la réserve d'un passe est sa RÉSONANCE,
         // 20·log10(Q/0,707), nulle ici comme pour le `LPQ` à Q 0,5). Le rejet
         // non plus. Seule la cloche de +3 dB réserve, à hauteur de sa norme
-        // L1 (3,717 dB) plutôt que de son seul gain crête.
+        // L1 (3,717 dB) plutôt que de son seul gain crête — plus les 0,01 dB
+        // de `MARGE_DE_TRONCATURE_DB` que #4594 ajoute pour ne pas réserver la
+        // borne au ras du rail.
         assert_eq!(profil.bandes[0].gain, 0.0);
         assert!(
-            (profil.marge_reservee_db() + 3.717_159).abs() < 1e-5,
+            (profil.marge_reservee_db() + 3.727_159).abs() < 1e-5,
             "marge réservée : {}",
             profil.marge_reservee_db()
         );
@@ -792,11 +800,24 @@ mod tests {
 
     // --- La marge de gain ---
 
+    /// La marge est la BORNE VRAIE de la cascade, pas la somme de ses gains.
+    ///
+    /// Jusqu'à #4594 ce témoin affirmait −11,5 dB, soit 6,4 + 5,1 : la somme
+    /// des deux gains, comme si le plateau grave et la cloche à 8,8 kHz
+    /// poussaient au même endroit. Ils ne se rencontrent jamais. La norme L1
+    /// de la cascade — la seule borne qu'un signal quelconque ne peut pas
+    /// dépasser — vaut 9,911 dB : 1,6 dB de niveau rendus, sans qu'un
+    /// échantillon sorte du rail.
     #[test]
-    fn la_marge_reservee_est_la_somme_des_gains_positifs() {
+    fn la_marge_reservee_est_la_borne_vraie_de_la_cascade() {
         let profil = analyser(DEUX_LIGNES).unwrap();
-        // 6.4 + 5.1
-        assert!((profil.marge_reservee_db() - (-11.5)).abs() < 1e-9);
+        assert!(
+            (profil.marge_reservee_db() - (-9.911_190_856_935_006)).abs() < 1e-9,
+            "marge réservée : {}",
+            profil.marge_reservee_db()
+        );
+        // Elle couvre toujours le `Preamp` du fichier (−6,1 dB).
+        assert!(profil.marge_de_tune_couvre_le_preamp());
     }
 
     #[test]
