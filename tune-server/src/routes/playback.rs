@@ -152,6 +152,30 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // would be a guess). 409 like the orphan-zone case: well-formed request, the
     // zone's state makes it impossible. The message is already actionable, the
     // client just surfaces it.
+    // #4556 — même refus, mais le serveur sait qu'il n'a PAS regardé du côté
+    // d'ASIO : le coupe-circuit de démarrage était fermé et le parc local
+    // publié est un repli WASAPI. Le `reason` est le code stable que le client
+    // attend pour proposer « Réarmer ASIO » là où le défaut se manifeste, au
+    // lieu de laisser l'utilisateur trouver l'écran Diagnostics tout seul.
+    //
+    // `error` reste `zone_output_unavailable` : c'est la même impossibilité,
+    // les clients qui ne connaissent pas encore le code continuent d'afficher
+    // `message` — lequel dit désormais la vérité. Testé AVANT le refus
+    // ordinaire, même si les deux préfixes sont disjoints (`…_asio:` contre
+    // `…:`), pour que l'ordre de lecture suive l'ordre de spécificité.
+    if let Some((code, msg)) = tune_core::outputs::asio_blocage_4556::depuis_sentinelle(&e) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zone_output_unavailable",
+                "reason": code,
+                "message": msg,
+                "can_rearm": tune_core::outputs::asio_blocage_4556::code_rearmable(code),
+                "rearm_endpoint": tune_core::outputs::asio_blocage_4556::ROUTE_DE_REARMEMENT,
+            })),
+        )
+            .into_response();
+    }
     if let Some(msg) = e.strip_prefix("zone_output_unavailable:") {
         return (
             StatusCode::CONFLICT,
@@ -6179,6 +6203,75 @@ mod tests {
         assert_eq!(
             body["message"],
             "La sortie de cette zone n'est plus disponible."
+        );
+        assert!(
+            body.get("reason").is_none(),
+            "un refus ordinaire ne doit pas se voir coller un motif ASIO : {body}"
+        );
+    }
+
+    /// #4556 — le refus qui SAIT pourquoi il ne trouve rien porte un motif, et
+    /// le client y accroche son bouton « Réarmer ASIO ».
+    ///
+    /// `error` reste `zone_output_unavailable` : c'est la même impossibilité,
+    /// et les clients qui ne connaissent pas encore le code continuent
+    /// d'afficher `message`.
+    #[tokio::test]
+    async fn le_refus_par_coupe_circuit_asio_porte_son_motif_et_la_route_de_rearmement() {
+        use tune_core::outputs::asio_blocage_4556 as asio;
+
+        let blocage = asio::BlocageAsio {
+            motif: asio::MotifDeBlocage::ApresPlantage,
+            temoin: Some(r"C:\Users\Marco\AppData\Local\TuneServer\asio-warm.pending".into()),
+        };
+        let phrase = blocage.message_fr(Some("USB DAC ASIO"), "USB DAC ASIO");
+        let (status, body) = parts(&blocage.sentinelle(&phrase)).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_output_unavailable");
+        assert_eq!(body["reason"], asio::CODE_APRES_PLANTAGE);
+        assert_eq!(body["can_rearm"], true);
+        assert_eq!(body["rearm_endpoint"], asio::ROUTE_DE_REARMEMENT);
+        assert_eq!(
+            body["message"], phrase,
+            "la phrase doit traverser ENTIÈRE — elle contient un chemin Windows, \
+             donc des « : » : {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains(r"C:\Users\Marco"),
+            "{body}"
+        );
+
+        // Contre-épreuve : coupé par l'environnement, pas de bouton.
+        let par_env = asio::BlocageAsio {
+            motif: asio::MotifDeBlocage::ParEnvironnement,
+            temoin: None,
+        };
+        let phrase = par_env.message_fr(None, "Salon");
+        let (status, body) = parts(&par_env.sentinelle(&phrase)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["reason"], asio::CODE_PAR_ENVIRONNEMENT);
+        assert_eq!(
+            body["can_rearm"], false,
+            "un bouton ne doit pas contourner un coupe-circuit posé par l'exploitant"
+        );
+    }
+
+    /// La route annoncée au client doit être celle qui est MONTÉE. Le
+    /// commentaire de triage de #4556 la donnait sans le segment `audio` ; un
+    /// bouton qui appelle une 404 serait pire que pas de bouton.
+    #[test]
+    fn la_route_de_rearmement_annoncee_est_bien_montee() {
+        let montage = include_str!("system/mod.rs");
+        let suffixe = tune_core::outputs::asio_blocage_4556::ROUTE_DE_REARMEMENT
+            .strip_prefix("/api/v1/system")
+            .expect("la route de réarmement doit vivre sous /api/v1/system");
+        assert!(
+            montage.contains(&format!("\"{suffixe}\"")),
+            "la route « {suffixe} » n'est pas montée par routes/system/mod.rs (#4556)"
         );
     }
 }

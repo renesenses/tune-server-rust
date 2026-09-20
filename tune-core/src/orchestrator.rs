@@ -1499,3 +1499,12 @@ mod recreation_locale_guard;
 
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
+
+/// #4556 — le refus de lecture quand le coupe-circuit ASIO a vidé le parc.
+///
+/// Hors de toute `feature` : `refus_de_zone_hors_ligne` est une fonction pure
+/// et la garde du site d'appel lit le TEXTE de `transport.rs`, si bien que
+/// l'ensemble tourne dans le jeu `--no-default-features` du job `test` de la
+/// CI — celui des PR vers `batch/*` — et pas seulement sous `local-audio`.
+#[cfg(test)]
+mod refus_asio_bloque_4556;

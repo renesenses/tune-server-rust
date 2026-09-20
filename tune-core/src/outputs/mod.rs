@@ -1,5 +1,11 @@
 pub mod airplay;
 pub mod airplay2;
+/// #4556 — l'état du coupe-circuit ASIO, et le refus qui sait le raconter.
+///
+/// Volontairement HORS de tout `cfg` : le refus est rendu par
+/// `orchestrator::transport`, qui se compile aussi sans `local-audio`, et relu
+/// par la route HTTP. Sans blocage posé, tout y rend `None` et rien ne change.
+pub mod asio_blocage_4556;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub mod asio_exclusive;
 pub mod bluos;

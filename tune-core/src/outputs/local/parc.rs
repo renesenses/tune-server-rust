@@ -14,15 +14,50 @@ impl AsioScanGate {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn run<T>(&self, backend: &str, cached: impl FnOnce() -> T, probe: impl FnOnce() -> T) -> T {
+    /// Les deux listes rendent un `Vec` : le type de retour est resserré pour
+    /// que la porte puisse dire COMBIEN d'appareils elle a servi (#4556) sans
+    /// toucher à la forme des deux sites d'appel.
+    fn run<T>(
+        &self,
+        backend: &str,
+        cached: impl FnOnce() -> Vec<T>,
+        probe: impl FnOnce() -> Vec<T>,
+    ) -> Vec<T> {
         if backend.eq_ignore_ascii_case("asio")
             && self.blocked.load(std::sync::atomic::Ordering::Acquire)
         {
-            debug!("asio_device_enumeration_blocked_after_boot_decision");
-            return cached();
+            // #4556 — c'était un `debug!`, donc RIEN dans un export de journal
+            // de terrain (INFO et au-dessus), alors que ce chemin-ci mène tout
+            // droit à un refus de lecture chez l'utilisateur.
+            let du_cache = cached();
+            journaliser_enumeration_asio_bloquee(backend, du_cache.len());
+            return du_cache;
         }
         probe()
     }
+}
+
+/// #4556 — rendre visible l'étape qui fabrique le refus.
+///
+/// Marco Polo (fil 1852, SMSL SU-1) : `requested=asio, active=WASAPI`, ASIO en
+/// `blocked_after_crash`. Côté serveur, la seule trace de la bascule était un
+/// `debug!` — donc rien, dans son rapport. Ce `warn!` nomme le motif, le
+/// témoin à supprimer, et le nombre d'appareils que la liste a vraiment rendus
+/// (zéro sur un processus neuf, puisque le cache est vide au démarrage).
+fn journaliser_enumeration_asio_bloquee(backend: &str, appareils: usize) {
+    let blocage = crate::outputs::asio_blocage_4556::blocage();
+    warn!(
+        backend = %backend,
+        motif = blocage.as_ref().map(|b| b.motif.code()).unwrap_or("unknown"),
+        temoin = blocage
+            .as_ref()
+            .and_then(|b| b.temoin.as_deref())
+            .unwrap_or("-"),
+        appareils,
+        "asio_device_enumeration_blocked_serving_cache — le balayage ASIO est suspendu pour ce \
+         processus : la liste rendue vient du cache, elle ne prouve RIEN sur les appareils ASIO \
+         branchés. Réarmez le balayage puis redémarrez Tune."
+    );
 }
 
 static ASIO_SCAN_GATE: AsioScanGate = AsioScanGate {
@@ -31,7 +66,15 @@ static ASIO_SCAN_GATE: AsioScanGate = AsioScanGate {
 
 /// Interdit l'énumération ASIO jusqu'au prochain démarrage, y compris depuis
 /// les réglages et les diagnostics. Les autres backends restent disponibles.
-pub fn block_asio_device_enumeration() {
+///
+/// #4556 — le MOTIF et le TÉMOIN voyagent avec le blocage. Un seul site
+/// d'appel ferme les deux verrous (la porte de ce module et l'état global lu
+/// par le refus de lecture) : ils ne peuvent pas diverger.
+pub fn block_asio_device_enumeration(
+    motif: crate::outputs::asio_blocage_4556::MotifDeBlocage,
+    temoin: Option<&str>,
+) {
+    crate::outputs::asio_blocage_4556::bloquer(motif, temoin);
     ASIO_SCAN_GATE.block();
 }
 
