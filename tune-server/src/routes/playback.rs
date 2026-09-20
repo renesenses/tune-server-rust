@@ -2405,15 +2405,17 @@ async fn play(
 ///
 /// # ⚠️ La zone à l'arrêt ET VIDE
 ///
-/// Déléguer sans condition aurait été faux. Sur une zone sans sortie
-/// enregistrée, `resume` traverse toutes ses branches sans rien trouver à
-/// relancer et finit par `playback.resume()` + `save_play_state("playing")` :
-/// la zone est alors annoncée **en lecture alors que rien ne joue**. C'est
-/// supportable derrière un bouton d'écran, qu'on n'appuie pas sur une zone
-/// vide ; ça ne l'est pas derrière une touche `KEY_PLAYPAUSE`, qu'on presse
-/// précisément sans regarder. Cette bascule refuse donc en **409** quand la
-/// zone est à l'arrêt, sans piste en mémoire et sans file — sans rien écrire.
-/// Le comportement de `POST /zones/{id}/resume` n'est pas touché.
+/// Déléguer sans condition aurait été faux, et c'est MESURÉ, pas déduit : la
+/// garde retirée, le témoin `zone_a_l_arret_et_vide_…` rend **200**. `resume`
+/// traverse alors toutes ses branches sans rien trouver à relancer, puis écrit
+/// `save_play_state(zone_id, "playing")` — la BASE annonce une zone en lecture
+/// où rien ne joue — et répond un JSON de zone banal, indistinguable d'un
+/// succès. Un appui qui ne fait rien et le dit « réussi » est supportable
+/// derrière un bouton d'écran, qu'on n'appuie pas sur une zone vide ; pas
+/// derrière une touche `KEY_PLAYPAUSE`, qu'on presse précisément sans regarder.
+/// Cette bascule refuse donc en **409** quand la zone est à l'arrêt, sans piste
+/// en mémoire et sans file — sans rien écrire. `POST /zones/{id}/resume` n'est
+/// pas touché : c'est la bascule qui se borne, pas le geste existant.
 ///
 /// Une file ILLISIBLE n'est pas une file vide (#4261) : on ne fabrique pas un
 /// refus à partir d'une panne de base, on délègue comme avant et on le journalise.
