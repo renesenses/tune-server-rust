@@ -247,6 +247,9 @@ pub fn router() -> Router<AppState> {
         .route("/albums/disques-abimes", get(albums::disques_abimes))
         // Coffrets ÉCLATÉS en un album par disque. AVANT `/albums/{id}`.
         .route("/albums/coffrets", get(albums::coffrets_eclates))
+        // Composer un coffret À LA MAIN — ce que la détection automatique ne
+        // peut pas voir : marqueurs en lettres (« Disc A »), rangement libre.
+        .route("/albums/coffret", post(albums::composer_coffret))
         .route(
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),
