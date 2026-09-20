@@ -183,6 +183,26 @@ pub(super) struct ZonePollState {
     /// contre les drapeaux par [`ZonePollState::coherent`] en fin de tour.
     /// AUCUNE décision de `tick` ne le lit.
     pub(super) etat: EtatDeLecture,
+    /// #4559 — le dernier couple (contrat de signal, transformations réelles)
+    /// ANNONCÉ au client pour cette piste.
+    ///
+    /// Il part à `(None, None)`, et c'est tout le point : c'est EXACTEMENT ce
+    /// que le client tient au moment où la lecture commence. `PlaybackManager::
+    /// play` efface les deux champs de l'état de zone (« le verdict appartient
+    /// au flux qui l'a produit »), et les deux seules charges utiles qui
+    /// portent `signal_path` à cet instant — la réponse HTTP du `play` et le
+    /// `GET /zones/{id}` que le client déclenche sur `playback.started` —
+    /// sont donc bâties SANS contrat. Un bras exclusif Windows, lui, ne publie
+    /// le sien qu'à l'ouverture effective du périphérique : `output_ms=236` et
+    /// `output_ms=2219` sur les deux enchaînements du journal de Jean Valjean
+    /// (fil 1857). Après quoi plus aucun évènement ne portait la nouvelle, et
+    /// le panneau restait sur « WASAPI (shared — Windows mixer) » jusqu'à ce
+    /// qu'un geste quelconque — un aller-retour du volume, une bascule PURE —
+    /// provoque une relecture de la zone.
+    pub(super) contrat_annonce: (
+        Option<OutputSignalPathStatus>,
+        Option<TransformationsReelles>,
+    ),
 }
 
 impl ZonePollState {
@@ -235,7 +255,33 @@ impl ZonePollState {
             famine: decisions::SuiviFamine::default(),
             famine_releve_at: None,
             etat: EtatDeLecture::Neuve,
+            contrat_annonce: (None, None),
         }
+    }
+
+    /// Ce que la sortie publie diffère-t-il de ce que le client a été mis en
+    /// mesure de connaître ? Met la référence à jour au passage (#4559).
+    ///
+    /// Rend `true` UNE seule fois par changement : une sortie qui republie le
+    /// même verdict à chaque tampon — ce que fait le bras WASAPI exclusif —
+    /// ne doit pas faire refetch le client toutes les secondes.
+    pub(super) fn contrat_de_signal_a_change(
+        &mut self,
+        chemin: Option<&OutputSignalPathStatus>,
+        transformations: Option<&TransformationsReelles>,
+    ) -> bool {
+        let observe = (chemin.cloned(), transformations.copied());
+        if self.contrat_annonce == observe {
+            return false;
+        }
+        self.contrat_annonce = observe;
+        true
+    }
+
+    /// Piste neuve : le client vient de relire la zone, et la zone ne porte
+    /// plus aucun contrat (`play` les a effacés). La référence repart de là.
+    pub(super) fn reprendre_le_contrat_a_zero(&mut self) {
+        self.contrat_annonce = (None, None);
     }
 }
 
