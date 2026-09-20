@@ -274,7 +274,7 @@ fn t2_lecture_vers_arme_gapless() {
     assert!(!decision.transition_detected);
     assert!(!decision.past_end_track_ended);
 
-    // tick.rs:2163-2169 — `GaplessPrep::Armed(arme)`.
+    // tick.rs:2163-2169 — `GaplessPrep::Armed(arme, tenue)`.
     let arme = Some(ArmedNext {
         row_id: 42,
         position: 3,
@@ -285,12 +285,12 @@ fn t2_lecture_vers_arme_gapless() {
     assert_eq!(drapeaux(&ps), [true, false, false, false, false]);
     assert_eq!(ps.gapless_armed.map(|a| a.row_id), Some(42));
     ecriture_suit_le_marqueur(
-        "GaplessPrep::Armed(arme) => {",
+        "GaplessPrep::Armed(arme, tenue) => {",
         "ps.gapless_sent = true;",
         4,
     );
     ecriture_suit_le_marqueur(
-        "GaplessPrep::Armed(arme) => {",
+        "GaplessPrep::Armed(arme, tenue) => {",
         "ps.gapless_armed = arme;",
         8,
     );
@@ -1226,7 +1226,9 @@ fn e1_nouvelle_piste_ramene_a_neuve() {
     appel_suit_le_marqueur(
         "poller_track_generation_changed_resetting_state",
         "ps.transition(fsm::Transition::NouvellePiste);",
-        34,
+        // #3967 — trois lignes de plus dans la remise à zéro : le verdict de
+        // la suivante y est effacé avec les autres.
+        37,
         Some(&sans),
     );
 }
@@ -1286,7 +1288,7 @@ fn e3_armement_accepte_ou_renonce() {
         wall_elapsed_secs: 275,
     });
     assert!(decision.arm_gapless);
-    // tick.rs, `GaplessPrep::Armed(arme)`
+    // tick.rs, `GaplessPrep::Armed(arme, tenue)`
     let arme = LIGNE_42;
     ps.gapless_sent_at = Some(Instant::now());
     ps.gapless_sent = true;
@@ -1302,9 +1304,11 @@ fn e3_armement_accepte_ou_renonce() {
     );
     ps.coherent().unwrap();
     appel_suit_le_marqueur(
-        "GaplessPrep::Armed(arme) => {",
+        "GaplessPrep::Armed(arme, tenue) => {",
         "ps.transition(fsm::armement_accepte(arme));",
-        9,
+        // #3967 — deux lignes de plus dans le bras : le verdict de la
+        // suivante s'y range avant la transition.
+        12,
         Some(&sans),
     );
 

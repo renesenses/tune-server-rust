@@ -153,6 +153,14 @@ pub(super) struct ZonePollState {
     /// de l'audio reellement en cours (`dlna_frozen_end=true`, journal Sandro
     /// du 01/09 a 14:23:10).
     pub(super) gapless_armed: Option<ArmedNext>,
+    /// #3967 — ce que l'appareil a dit LUI-MÊME de la suivante, juste après
+    /// l'avoir acceptée : la nomme-t-il, et déclare-t-il savoir y passer ?
+    ///
+    /// Relevé UNE fois par armement (deux lectures SOAP, ~30 s avant la fin),
+    /// jamais sur le chemin chaud. C'est la seule chose qui autorise la
+    /// bascule par `Next` au lieu du repli ; `Inconnue` — le défaut de toute
+    /// sortie qui ne sait pas répondre — laisse la conduite d'avant intacte.
+    pub(super) suivante_preparee: SuivantePreparee,
     /// Une avance prononcée à l'HORLOGE a adopté l'enchaînement du renderer
     /// au lieu de le relancer (#4173) : ce que l'on surveille jusqu'à ce que
     /// le renderer donne signe de vie sur la piste adoptée, ou que le délai
@@ -251,6 +259,7 @@ impl ZonePollState {
             gapless_arm_logged: None,
             gapless_dsd_skip_pos: None,
             gapless_armed: None,
+            suivante_preparee: SuivantePreparee::Inconnue,
             adoption_horloge: None,
             famine: decisions::SuiviFamine::default(),
             famine_releve_at: None,
@@ -293,7 +302,9 @@ pub(super) enum GaplessPrep {
     /// Le renderer a accepte la piste suivante. Porte la LIGNE de file
     /// reellement envoyee (`None` si la file n'a pas su la rendre) : c'est
     /// elle, et non l'index, qui decide ou avancer a la transition (#3026).
-    Armed(Option<ArmedNext>),
+    /// #3967 — et ce que l'appareil a dit de cette suivante-là, sitôt
+    /// acceptée : la tient-il vraiment ?
+    Armed(Option<ArmedNext>, SuivantePreparee),
     DsdNextSkipped,
     NotArmed,
 }
@@ -322,6 +333,10 @@ pub(super) struct AdoptionHorloge {
     pub(super) flux: String,
     /// Ce qui a fondé l'adoption, pour le journal.
     pub(super) preuve: decisions::EnchainementArme,
+    /// #3967 — le délai raisonnable accordé à CETTE adoption-ci. Un constat
+    /// (#4173) en vaut huit ; une consigne `Next` sur un tampon déjà rempli
+    /// n'en vaut que trois. Voir [`super::BASCULE_DELAI_SECS`].
+    pub(super) delai_secs: u64,
 }
 
 // ── REF-9 (#2219) — l'énumération d'états, en ombre ─────────────────────

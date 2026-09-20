@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 
 use super::traits::{
     OutputCapabilities, OutputSignalPathStatus, OutputStatus, OutputTarget, PlayMedia,
-    TransportState,
+    SuivantePreparee, TransportState,
 };
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,15 @@ pub struct MockOutput {
     /// qui l'a effacé. C'est cette fenêtre — et elle seule — que les témoins
     /// de #4559 rejouent : `None` d'abord, `Some(...)` ensuite.
     signal_path: Arc<std::sync::Mutex<Option<OutputSignalPathStatus>>>,
+    /// #3967 — ce que l'appareil RÉPONDRA quand on lui demandera s'il tient la
+    /// suivante. Défaut `Inconnue` : le comportement d'avant, pour tous les
+    /// témoins déjà écrits.
+    suivante_preparee: Arc<std::sync::Mutex<SuivantePreparee>>,
+    /// #3967 — chaque `Next` reçu.
+    bascule_calls: Arc<AtomicU64>,
+    /// #3967 — le `Next` fait-il VRAIMENT avancer l'appareil ? Un renderer qui
+    /// acquitte `Next` sans bouger est le cas que le repli doit rattraper.
+    bascule_honoree: Arc<AtomicBool>,
 }
 
 impl MockOutput {
@@ -76,6 +85,9 @@ impl MockOutput {
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
             resume_calls: Arc::new(AtomicU64::new(0)),
             signal_path: Arc::new(std::sync::Mutex::new(None)),
+            suivante_preparee: Arc::new(std::sync::Mutex::new(SuivantePreparee::Inconnue)),
+            bascule_calls: Arc::new(AtomicU64::new(0)),
+            bascule_honoree: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -226,6 +238,22 @@ impl MockOutput {
         self.next_uri.lock().await.clone()
     }
 
+    /// #3967 — ce que l'appareil répondra à `suivante_preparee`.
+    pub fn poser_suivante_preparee(&self, verdict: SuivantePreparee) {
+        *self.suivante_preparee.lock().unwrap() = verdict;
+    }
+
+    /// #3967 — le `Next` sera-t-il HONORÉ (l'appareil bascule) ou seulement
+    /// acquitté (il reste figé, et le repli doit rattraper) ?
+    pub fn bascule_honoree(&self, honoree: bool) {
+        self.bascule_honoree.store(honoree, Ordering::Relaxed);
+    }
+
+    /// #3967 — nombre de `Next` reçus.
+    pub fn bascule_call_count(&self) -> u64 {
+        self.bascule_calls.load(Ordering::Relaxed)
+    }
+
     /// Simulate a gapless transition: renderer moves to the next URI
     /// and reports the new track's duration/position.
     pub async fn simulate_gapless_transition(&self, new_duration_ms: u64) {
@@ -348,6 +376,34 @@ impl OutputTarget for MockOutput {
             url: media.url.to_string(),
             title: media.title.map(String::from),
         });
+        Ok(())
+    }
+
+    async fn suivante_preparee(&self, url: &str) -> SuivantePreparee {
+        // Le verdict posé par le témoin ne vaut que si l'appareil tient bien
+        // CETTE url : un mock qui a été réarmé entre-temps ne doit pas mentir.
+        let annonce = *self.suivante_preparee.lock().unwrap();
+        if annonce != SuivantePreparee::Tenue {
+            return annonce;
+        }
+        if self.next_uri.lock().await.as_deref() == Some(url) {
+            SuivantePreparee::Tenue
+        } else {
+            SuivantePreparee::Perdue
+        }
+    }
+
+    async fn basculer_sur_la_suivante_preparee(&self) -> Result<(), String> {
+        self.bascule_calls.fetch_add(1, Ordering::Relaxed);
+        if !self.bascule_honoree.load(Ordering::Relaxed) {
+            // Acquitté, jamais honoré : exactement le DMP-A6.
+            return Ok(());
+        }
+        let next = self.next_uri.lock().await.take();
+        if let Some(uri) = next {
+            *self.current_uri.lock().await = Some(uri);
+        }
+        self.position_ms.store(0, Ordering::Relaxed);
         Ok(())
     }
 }
