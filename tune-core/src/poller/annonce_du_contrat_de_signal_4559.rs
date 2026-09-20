@@ -368,10 +368,11 @@ fn l_annonce_vit_dans_le_bras_ok_du_sondage_de_lecture() {
 #[test]
 fn la_reference_repart_a_chaque_changement_de_piste() {
     let changement = position("// Detect track change: if the generation changed");
+    let transition = position("ps.transition(fsm::Transition::NouvellePiste);");
     let remise = position("ps.reprendre_le_contrat_a_zero();");
-    let apres = position("ps.track_generation = zone_state.track_generation;");
+    let fin_du_bloc = position("if ps.backoff_remaining > 0 {");
     assert!(
-        changement < remise && remise < apres,
+        changement < transition && transition < remise && remise < fin_du_bloc,
         "la référence d'annonce n'est plus remise à zéro au changement de \
          piste : un contrat republié à l'identique d'une piste à l'autre ne \
          serait jamais annoncé, et le panneau resterait « shared » (#4559)."

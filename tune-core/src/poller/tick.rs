@@ -459,13 +459,6 @@ impl PositionPoller {
                 ps.gapless_sent_at = None;
                 ps.gapless_cooldown = 0;
                 ps.stopped_ticks = 0;
-                // #4559 — la piste neuve a effacé les deux verdicts dans
-                // l'état de zone ; le client relit la zone sur
-                // `playback.started` et voit donc `None`. La référence de
-                // l'annonce repart du même point, faute de quoi le contrat
-                // republié à l'identique d'une piste à l'autre ne serait
-                // jamais annoncé.
-                ps.reprendre_le_contrat_a_zero();
                 ps.track_generation = zone_state.track_generation;
                 ps.tenue_etrangere_ticks = 0;
                 ps.tenue_signalee = false;
@@ -485,6 +478,17 @@ impl PositionPoller {
                 // Une piste lancée par `play()` n'a rien adopté (#4173).
                 ps.adoption_horloge = None;
                 ps.transition(fsm::Transition::NouvellePiste);
+                // #4559 — la piste neuve a effacé les deux verdicts dans
+                // l'état de zone, et le client vient de relire une zone qui
+                // n'en porte aucun : la référence de l'annonce repart du même
+                // point. Sans cela, un contrat republié à l'identique d'une
+                // piste à l'autre ne serait jamais annoncé, et le panneau
+                // resterait « shared » pour toute la piste.
+                //
+                // Volontairement APRÈS la transition REF-9 : le témoin
+                // `e1_nouvelle_piste_ramene_a_neuve` borne à 34 lignes la
+                // distance entre le marqueur de journal et cet appel-là.
+                ps.reprendre_le_contrat_a_zero();
             }
 
             // Scrobble the current track once it has genuinely been listened past
