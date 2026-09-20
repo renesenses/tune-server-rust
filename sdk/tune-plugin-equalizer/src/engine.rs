@@ -97,6 +97,34 @@ impl EqBandSpec {
         }
     }
 
+    /// Cette bande est-elle une bande **à gain** — celle dont [`Self::coeffs`]
+    /// fait un plateau ou une cloche, et dont le champ `gain` pousse vraiment
+    /// le signal ?
+    ///
+    /// La réponse est une LISTE NOIRE, pas une liste blanche, et c'est le
+    /// fond du sujet (#4594). `coeffs` range **tout type inconnu** en
+    /// `peaking_eq` — c'est son bras `_ =>`. Un `"peaking"`, un `"Peak"`, un
+    /// `"bell"` — la casse et les synonymes que `POST /zones/{id}/eq` accepte
+    /// sans les valider, `band_type` n'étant qu'un `String` — est donc monté
+    /// par [`EqProcessor::new`] en cloche qui POUSSE de son gain.
+    ///
+    /// La somme des gains positifs, elle, demandait
+    /// `matches!(.., "peak" | "low_shelf" | "high_shelf")` : elle répondait
+    /// « non » pour ces types-là et les comptait pour zéro. Et comme le terme
+    /// L1 de [`EqProfile::automatic_headroom_db_at`] n'entre en jeu que
+    /// lorsqu'au moins une bande pousse, la borne vraie s'éteignait avec elle :
+    /// la réserve ENTIÈRE tombait à 0 dB. Mesuré sur dix cloches à +6 dB, un
+    /// sinus 1 kHz à −6 dBFS ressortait à +4,77 dBFS avec **60,8 %**
+    /// d'échantillons écrêtés dur, là où les mêmes bandes en `"peak"`
+    /// réservaient 60 dB et n'écrêtaient rien.
+    ///
+    /// Poser la question ICI, une seule fois, est ce qui empêche la somme et
+    /// la cascade de diverger à nouveau. Témoin :
+    /// `un_type_de_bande_non_canonique_reserve_comme_une_cloche_4594`.
+    fn est_une_bande_a_gain(&self) -> bool {
+        !matches!(self.band_type.as_str(), "low_pass" | "high_pass" | "notch")
+    }
+
     /// Ce que cette bande demande de réserver pour sa RÉSONANCE, en dB (≥ 0).
     ///
     /// Un `low_pass` / `high_pass` RBJ vaut |H(fc)| = Q : au-dessus de
@@ -293,6 +321,11 @@ impl EqProfile {
     /// construit [`EqProcessor::new`] pour ce canal, amputée des `pass` et des
     /// `notch` dont la norme L1 n'est pas réservée (voir
     /// [`Self::automatic_headroom_db_at`]).
+    ///
+    /// Les deux réponses viennent de la MÊME porte,
+    /// [`EqBandSpec::est_une_bande_a_gain`]. Elles ne le faisaient pas : la
+    /// somme filtrait par liste blanche et la cascade par liste noire, si bien
+    /// qu'un type non canonique poussait sans rien réserver (#4594).
     fn cascade_a_gain(&self, channel: u16, sample_rate: f64) -> (f64, Vec<BiquadCoeffs>) {
         if self.bands.is_empty() {
             let (bass, mid, treble) = self.effective_gains();
@@ -319,7 +352,7 @@ impl EqProfile {
             .iter()
             .filter(|band| {
                 band.vise_le_canal(channel)
-                    && matches!(band.band_type.as_str(), "peak" | "low_shelf" | "high_shelf")
+                    && band.est_une_bande_a_gain()
                     && band.gain.is_finite()
                     && band.gain > 0.0
             })
@@ -332,7 +365,7 @@ impl EqProfile {
                 .filter(|band| {
                     band.vise_le_canal(channel)
                         && !band.is_neutral()
-                        && !matches!(band.band_type.as_str(), "low_pass" | "high_pass" | "notch")
+                        && band.est_une_bande_a_gain()
                         && band.freq.is_finite()
                         && band.gain.is_finite()
                         && band.q.is_finite()
