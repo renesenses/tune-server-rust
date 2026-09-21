@@ -184,6 +184,10 @@ async fn delete_service_playlist(
 
     match svc.delete_playlist(&playlist_id).await {
         Ok(()) => {
+            // 🔴 La liste des playlists du service est MÉMORISÉE 2 minutes.
+            // Sans cet oubli, la carte supprimée resterait affichée, et un
+            // rechargement de l'écran la ferait « revenir ».
+            crate::routes::streaming::purge_contenu_utilisateur(&service);
             tracing::info!(%service, %playlist_id, "service_playlist_deleted");
             Json(json!({ "deleted": true, "service": service, "playlist_id": playlist_id }))
                 .into_response()
@@ -1358,6 +1362,9 @@ async fn fusion_chez_le_service(
 
     match svc.add_tracks_to_playlist(&nouvelle, &ids).await {
         Ok(ajoutees) => {
+            // Même raison que pour la suppression : la playlist EXISTE chez
+            // le service, mais la liste mémorisée ne la connaît pas encore.
+            crate::routes::streaming::purge_contenu_utilisateur(cible);
             tracing::info!(service = %cible, playlist = %nouvelle, ajoutees, "playlists_merged_on_service");
             Json(json!({
                 "playlist_id": nouvelle,

@@ -230,3 +230,22 @@ async fn la_cible_de_fusion_est_lue_et_non_jetee_par_serde() {
         "le refus doit venir de la cible, pas du local : {corps}"
     );
 }
+
+/// 🔴 « Je ne vois pas la playlist résultant du merge ! »
+///
+/// Elle EXISTAIT chez Qobuz — le journal du .18 le disait
+/// (`playlists_merged_on_service service=qobuz playlist=70557265 ajoutees=3`)
+/// — mais `GET /streaming/{service}/playlists` sert une liste **mémorisée
+/// 2 minutes**. Les routes d'écriture de `tune-streaming-http` l'oublient
+/// après chaque écriture ; la fusion et la suppression vivent ailleurs et
+/// appellent le service directement : elles n'oubliaient rien.
+///
+/// Ce témoin ne rejoue pas la fusion (elle demande un compte) : il garde le
+/// point exact qui manquait — l'oubli est ATTEIGNABLE depuis ce module, donc
+/// il peut être appelé. Sans `pub`, ce fichier ne compilerait pas.
+#[test]
+fn l_oubli_de_la_liste_memorisee_est_atteignable_depuis_le_gestionnaire() {
+    // Aucun service nommé « essai-oubli-fusion » n'existe : l'appel est sans
+    // effet, et c'est sa seule JOIGNABILITÉ qui est en jeu.
+    tune_streaming_http::purge_contenu_utilisateur("essai-oubli-fusion");
+}
