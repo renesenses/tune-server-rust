@@ -246,6 +246,80 @@ pub fn renderer_could_have_finished(
     }
 }
 
+/// Cette sortie non temps réel n'a-t-elle tout simplement jamais DÉMARRÉ ?
+///
+/// [`renderer_could_have_finished`] rend `true` par sa première branche dès
+/// que `total_bytes` est `None` : faute de total connu, il ne juge pas. C'est
+/// juste pour son cas d'origine (radio, flux décodé). Ça ne l'est plus quand
+/// la sortie n'a **rien produit du tout** — le total est alors inconnu parce
+/// que la session n'a encore rien servi, pas parce que le flux est sans fin.
+///
+/// ⚠️ Le discriminant n'est PAS l'absence de session de flux. Mesuré en
+/// production, une zone servie par un greffon porte bien un `stream_id` : un
+/// veto conditionné à son absence ne se déclenche jamais. Le seul critère
+/// fiable est ce que la sortie a effectivement produit.
+///
+/// Car sur une telle sortie, `Stopped` ne veut pas dire « la piste est
+/// finie » mais « la capture n'a pas encore commencé » : ouvrir un flux
+/// distant dépasse volontiers [`STOPPED_TICKS_THRESHOLD`] sondes. La piste
+/// était alors déclarée finie **avant d'avoir produit un octet**, et la file
+/// défilait à raison d'une piste toutes les cinq secondes — mesuré à 4 pistes
+/// perdues sur 5, sans le moindre message au journal (#4623).
+///
+/// La preuve de démarrage est celle que la sortie publie déjà depuis #4237 :
+/// [`OutputTarget::processing_progress_bytes`], relevée au même verrou et au
+/// même tick que le statut. `Some(0)` = « la capture existe, rien n'est
+/// encore arrivé » ; `None` = la sortie ne sait pas mesurer, ou n'a rien
+/// ouvert du tout — dans les deux cas elle n'a apporté aucune preuve d'avoir
+/// démarré, et une position restée à zéro ne la contredit pas.
+///
+/// Le veto reste étroit : il suffit d'**un** octet traité ou d'**une**
+/// position non nulle pour qu'une fin normale passe. Il ne mord donc jamais
+/// sur une sortie qui a joué, si vite qu'elle ait fini — ce qui préserve le
+/// mode de marche décrit dans [`natural_end`], où une sortie hors temps réel
+/// boucle une piste de cinq minutes en deux secondes.
+///
+/// [`OutputTarget::processing_progress_bytes`]: tune_output_api::OutputTarget::processing_progress_bytes
+pub fn sortie_non_temps_reel_jamais_demarree(
+    realtime: bool,
+    peak_position_ms: u64,
+    progress_bytes: Option<u64>,
+) -> bool {
+    if realtime {
+        return false;
+    }
+    // Une piste réellement capturée a fait avancer la position — la sortie
+    // annonce `Playing` pendant qu'elle écrit — ou le compteur d'octets.
+    // Ni l'une ni l'autre : elle n'a pas commencé.
+    peak_position_ms == 0 && progress_bytes.unwrap_or(0) == 0
+}
+
+/// Après [`STOPPED_TICKS_THRESHOLD`] sondes `Stopped` et un
+/// [`natural_end`] négatif : accepter cette fin, ou non ?
+///
+/// Les deux verrous en un seul point, pour que le poller n'ait qu'un verdict
+/// à lire — et pour que la composition elle-même soit sous test :
+///
+/// 1. la sortie a-t-elle seulement DÉMARRÉ
+///    ([`sortie_non_temps_reel_jamais_demarree`], #4623) ;
+/// 2. le renderer a-t-il reçu de quoi finir
+///    ([`renderer_could_have_finished`]).
+///
+/// L'ordre compte : le second rend `true` sans rien vérifier quand aucun
+/// total d'octets n'est connu — l'état d'une session qui n'a encore rien
+/// servi. Le premier est ce qui referme ce passage.
+pub fn accepter_fin_apres_stopped(
+    realtime: bool,
+    peak_position_ms: u64,
+    progress_bytes: Option<u64>,
+    bytes_sent: u64,
+    total_bytes: Option<u64>,
+    seeked: bool,
+) -> bool {
+    !sortie_non_temps_reel_jamais_demarree(realtime, peak_position_ms, progress_bytes)
+        && renderer_could_have_finished(bytes_sent, total_bytes, seeked)
+}
+
 pub fn played_enough(track_duration_ms: u64, peak_position_ms: u64, wall_elapsed: u64) -> bool {
     if track_duration_ms == 0 {
         peak_position_ms >= MIN_PEAK_UNKNOWN_DURATION_MS && wall_elapsed >= MIN_TRACK_WALL_SECS

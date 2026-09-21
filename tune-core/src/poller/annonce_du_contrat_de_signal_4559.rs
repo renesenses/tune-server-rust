@@ -352,7 +352,9 @@ fn position(motif: &str) -> usize {
 /// aucun panneau n'est affiché pour une zone arrêtée.
 #[test]
 fn l_annonce_vit_dans_le_bras_ok_du_sondage_de_lecture() {
-    let sondage_de_lecture = position("let (status, famine_anneau) = {");
+    // #4623 a ajouté la progression d'octets au tuple : le motif suit le
+    // remaniement, comme le demande le message de `position()`.
+    let sondage_de_lecture = position("let (status, famine_anneau, progression_octets) = {");
     let releve = position(".contrat_de_signal_a_change(");
     let emission = position("\"contrat_de_signal_publie_annonce\"");
     let bras_erreur = position("ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);");

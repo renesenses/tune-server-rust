@@ -654,7 +654,7 @@ impl PositionPoller {
                 }
             }
 
-            let (status, famine_anneau) = {
+            let (status, famine_anneau, progression_octets) = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     match outputs.get(&device_id) {
@@ -727,7 +727,7 @@ impl PositionPoller {
                                 bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
                             }
                         }
-                        (s, famine)
+                        (s, famine, progress)
                     }
                     Err(e) => {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
@@ -1906,8 +1906,27 @@ impl PositionPoller {
                                         None => (0, None),
                                     };
                                     let seeked = zone_state.last_seek_at.is_some();
-                                    if decisions::renderer_could_have_finished(sent, total, seeked)
-                                    {
+                                    // Une sortie qui tire elle-même son flux
+                                    // n'a pas de session de streaming : les
+                                    // octets servis ci-dessus valent (0, None)
+                                    // et le garde-fou la laisserait passer sans
+                                    // rien vérifier. Son `Stopped` ne dit pas
+                                    // « fini », il dit « pas encore parti »
+                                    // (#4623).
+                                    let jamais_demarree =
+                                        decisions::sortie_non_temps_reel_jamais_demarree(
+                                            status.realtime,
+                                            ps.peak_position_ms,
+                                            progression_octets,
+                                        );
+                                    if decisions::accepter_fin_apres_stopped(
+                                        status.realtime,
+                                        ps.peak_position_ms,
+                                        progression_octets,
+                                        sent,
+                                        total,
+                                        seeked,
+                                    ) {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
                                         ps.gapless_armed = None;
@@ -1927,6 +1946,13 @@ impl PositionPoller {
                                                 track_dur = track_duration_ms,
                                                 bytes_sent = sent,
                                                 bytes_total = total.unwrap_or(0),
+                                                // Sans ce témoin, une sortie
+                                                // qui ne démarre pas se lit
+                                                // comme un renderer qui cale :
+                                                // deux pannes distinctes,
+                                                // même ligne (#4623).
+                                                jamais_demarree,
+                                                progress_bytes = progression_octets.unwrap_or(0),
                                                 "renderer_stopped_on_incomplete_stream_waiting"
                                             );
                                         }
