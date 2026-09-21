@@ -113,6 +113,16 @@ pub struct StreamPlaylist {
     pub cover_path: Option<String>,
     pub track_count: u32,
     pub owner: Option<String>,
+    /// Jusqu'à QUATRE pochettes distinctes, pour la mosaïque 2×2.
+    ///
+    /// Bertrand, 21/09 : « Est-il possible d'associer 4 covers distinctes à
+    /// toutes les playlists Qobuz ? ». Qobuz les donne DÉJÀ — `images300`,
+    /// `images150`, `images` sont des TABLEAUX, les pochettes des albums de la
+    /// playlist — mais seule la première était gardée. Vide pour les services
+    /// qui ne rendent qu'une image, et pour les playlists éditoriales dont
+    /// l'illustration dessinée (`image_rectangle`) doit rester entière.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub covers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -812,6 +822,7 @@ mod tests {
             cover_path: None,
             track_count: 10,
             owner: Some("testuser".into()),
+            covers: Vec::new(),
         };
         let json = serde_json::to_value(&playlist).unwrap();
         assert_eq!(json["source_id"], "pl-1");
