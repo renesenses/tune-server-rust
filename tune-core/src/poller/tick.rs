@@ -1975,6 +1975,9 @@ impl PositionPoller {
                                         );
                                         track_ended = false;
                                         force_stop = true;
+                                        ps.transition(fsm::Transition::PanneDeLecture {
+                                            cause: CauseDeCoupure::RendererCale,
+                                        });
                                         // #4645 — le renderer s'est tu sur un
                                         // flux incomplet. Couper la zone ici
                                         // terminait la file : c'est l'« arrêt
@@ -1989,9 +1992,6 @@ impl PositionPoller {
                                             sent,
                                             total,
                                         ));
-                                        ps.transition(fsm::Transition::PanneDeLecture {
-                                            cause: CauseDeCoupure::RendererCale,
-                                        });
                                     }
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
