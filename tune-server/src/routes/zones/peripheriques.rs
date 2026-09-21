@@ -958,3 +958,125 @@ mod url_de_controle_absolue_4379 {
         issue.expect("le renderer a répondu 200, la commande doit réussir");
     }
 }
+
+/// Taille maximale d'une photo d'appareil. Même borne que l'image d'artiste :
+/// c'est une photo, pas une pochette de master.
+const IMAGE_APPAREIL_MAX_OCTETS: usize = 8 * 1024 * 1024;
+
+/// `POST /zones/{id}/image` — la photo de l'appareil de cette zone.
+///
+/// Demandé par Bertrand le 20/09/2026 : « l'image d'une device… et je dois
+/// pouvoir la changer en cliquant dessus ». Première tranche : la photo reste
+/// LOCALE. L'envoi vers le catalogue mozaiklabs viendra ensuite, avec son
+/// consentement et sa file de modération (#1394) — et rien ne redescend chez
+/// personne avant approbation, c'est sa règle.
+///
+/// 🔴 Stockée dans les `settings`, sous `zone_{id}_image`, comme la marque et
+/// le modèle (`zone_{id}_brand` / `_model`). Pas de colonne, donc pas de
+/// migration : l'identité d'appareil d'une zone vit déjà là depuis #406.
+///
+/// Le reste calque `enregistrer_image_artiste`, pour hériter de ses leçons
+/// plutôt que de les réapprendre :
+///
+///  - le FORMAT vient des octets, jamais du `content-type` annoncé par le
+///    client (#3102) — sinon un WebP part en `.jpg` et n'est plus servable ;
+///  - la clef est un condensat de CONTENU et non `zone-{id}` (#1444) : sous
+///    une clef figée, remplacer la photo gardait la même URL servie
+///    `immutable`, et l'ancienne restait à l'écran ;
+///  - une écriture en base qui échoue ne rend pas 200.
+pub(super) async fn zone_image_upload(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    let mut donnees: Option<Vec<u8>> = None;
+    while let Ok(Some(champ)) = multipart.next_field().await {
+        let nom = champ.name().unwrap_or("").to_string();
+        if nom == "image" || nom == "file" {
+            donnees = champ.bytes().await.ok().map(|b| b.to_vec());
+        }
+    }
+
+    let Some(data) = donnees else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "no image provided"})),
+        )
+            .into_response();
+    };
+
+    if data.len() > IMAGE_APPAREIL_MAX_OCTETS {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "image too large",
+                "size": data.len(),
+                "max_size": IMAGE_APPAREIL_MAX_OCTETS,
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(ext) = tune_core::library::artwork::sniff_image_ext(&data) else {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({
+                "error": "unsupported image format",
+                "supported": tune_core::library::artwork::FORMATS_IMAGE_SERVABLES,
+            })),
+        )
+            .into_response();
+    };
+
+    let cache = crate::routes::library::artwork_cache_dir();
+    let hash = tune_core::library::artwork::content_hash(&data);
+    if tune_core::library::artwork::save_to_cache(&data, &cache, &hash, ext).is_none() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "failed to save image"})),
+        )
+            .into_response();
+    }
+
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = settings.set(&format!("zone_{id}_image"), &hash) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("update failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    // On rend ce que la PROCHAINE lecture verra, pas ce qu'on croit avoir
+    // écrit — même précaution que pour l'image d'artiste.
+    match settings.get(&format!("zone_{id}_image")) {
+        Ok(Some(relu)) if relu == hash => {
+            Json(json!({ "zone_id": id, "image_path": hash, "size": data.len() })).into_response()
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "image saved but not indexed"})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /zones/{id}/image` — retirer la photo, revenir au pictogramme.
+///
+/// Le FICHIER du cache n'est pas effacé : sa clef est un condensat de contenu,
+/// donc la même photo posée sur deux zones partage un seul fichier. L'effacer
+/// pour l'une aveuglerait l'autre.
+pub(super) async fn zone_image_delete(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    match settings.delete(&format!("zone_{id}_image")) {
+        Ok(_) => Json(json!({ "zone_id": id, "image_path": null })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("delete failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
