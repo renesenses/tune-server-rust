@@ -2987,6 +2987,10 @@ impl StreamingService for QobuzService {
         self.user_auth_token.is_some()
     }
 
+    fn supports_playlist_delete(&self) -> bool {
+        self.user_auth_token.is_some()
+    }
+
     async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         let items = self.favoris_bruts("albums").await?;
         Ok(items.iter().map(Self::map_album).collect())

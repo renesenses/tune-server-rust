@@ -2127,7 +2127,25 @@ impl StreamingService for TidalService {
         Ok(added)
     }
 
+    /// DELETE /playlists/{uuid} — supprime la playlist chez Tidal.
+    ///
+    /// L'identifiant Tidal d'une playlist est un uuid, pas l'entier des
+    /// pistes ; c'est celui que `map_playlist` remonte et que l'interface
+    /// renvoie.
+    async fn delete_playlist(&self, playlist_id: &str) -> Result<(), TuneError> {
+        if self.user_id.is_none() {
+            return Err("tidal: not authenticated (no user_id)".into());
+        }
+        self.api_delete(&format!("/playlists/{playlist_id}"))
+            .await?;
+        Ok(())
+    }
+
     fn supports_write(&self) -> bool {
+        self.user_id.is_some()
+    }
+
+    fn supports_playlist_delete(&self) -> bool {
         self.user_id.is_some()
     }
 
@@ -2665,6 +2683,43 @@ mod tests {
                 ..Default::default()
             }],
         )
+    }
+
+    /*
+    | La suppression d'une playlist Tidal.
+    |
+    | `delete_playlist` avait l'implémentation par défaut du trait : elle
+    | rendait `Unsupported` sans jamais rien appeler. Le gestionnaire de
+    | playlists n'offrait donc aucun bouton « supprimer » sur une carte Tidal,
+    | alors que l'écran en pose un sur chaque playlist locale.
+    |
+    | Ces deux témoins portent sur la CAPACITÉ annoncée, pas sur le réseau :
+    | c'est elle qui décide si l'interface pose le bouton, et un bouton posé
+    | sans compte rendrait 501 au clic.
+    */
+
+    #[test]
+    fn sans_compte_tidal_la_suppression_nest_pas_annoncee() {
+        let svc = TidalService::new();
+        assert!(svc.user_id.is_none());
+        assert!(!svc.supports_playlist_delete());
+    }
+
+    #[tokio::test]
+    async fn sans_compte_la_suppression_echoue_sans_toucher_au_reseau() {
+        let svc = TidalService::new();
+        let err = svc.delete_playlist("uuid-quelconque").await.unwrap_err();
+        assert!(
+            err.to_string().contains("not authenticated"),
+            "motif inattendu : {err}"
+        );
+    }
+
+    #[test]
+    fn avec_un_compte_la_suppression_est_annoncee() {
+        let mut svc = TidalService::new();
+        svc.user_id = Some(4242);
+        assert!(svc.supports_playlist_delete());
     }
 
     #[test]

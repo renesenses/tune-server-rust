@@ -33,6 +33,10 @@ pub fn router() -> Router<AppState> {
         .route("/merge", post(merge_playlists))
         .route("/export", post(export_playlists))
         .route("/import", post(import_playlists))
+        .route(
+            "/playlists/{service}/{playlist_id}",
+            axum::routing::delete(delete_service_playlist),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -115,25 +119,84 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
             .get("authenticated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let write = if let Some(svc) = registry.get(name) {
-            svc.read().await.supports_write()
+        let (write, delete) = if let Some(svc) = registry.get(name) {
+            let svc = svc.read().await;
+            (svc.supports_write(), svc.supports_playlist_delete())
         } else {
-            false
+            (false, false)
         };
         services.insert(
             name.to_string(),
             json!({
                 "authenticated": authenticated,
                 "supports_write": write,
+                "supports_delete": delete,
             }),
         );
     }
     drop(registry);
     services.insert(
         "local".to_string(),
-        json!({ "authenticated": true, "supports_write": true }),
+        json!({ "authenticated": true, "supports_write": true, "supports_delete": true }),
     );
     Json(json!(services))
+}
+
+/// DELETE /playlist-manager/playlists/{service}/{playlist_id}
+///
+/// Supprime une playlist CHEZ le service de streaming. Les playlists locales
+/// passent par `DELETE /playlists/{id}` ; ici on ne parle qu'aux services.
+///
+/// Le geste est définitif chez le service : on refuse tout de suite (501) si
+/// le service ne sait pas le faire, plutôt que de laisser l'appel partir et
+/// rendre une erreur opaque.
+async fn delete_service_playlist(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if service == "local" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "use DELETE /playlists/{id} for local playlists" })),
+        )
+            .into_response();
+    }
+
+    let registry = state.services.lock().await;
+    let Some(svc_arc) = registry.get(&service) else {
+        drop(registry);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown service: {service}") })),
+        )
+            .into_response();
+    };
+    drop(registry);
+
+    let svc = svc_arc.read().await;
+    if !svc.supports_playlist_delete() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": format!("{service} does not support playlist deletion") })),
+        )
+            .into_response();
+    }
+
+    match svc.delete_playlist(&playlist_id).await {
+        Ok(()) => {
+            tracing::info!(%service, %playlist_id, "service_playlist_deleted");
+            Json(json!({ "deleted": true, "service": service, "playlist_id": playlist_id }))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(%service, %playlist_id, error = %e, "service_playlist_delete_failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
