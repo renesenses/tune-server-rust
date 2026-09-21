@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "4d812e8c491c40beadf4cd3f9ae1c7e015caa50e",
+    "web_sha": "f94eff8b2903e02be07a2a1988a04d76a26c95e5",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -125,6 +125,21 @@
       "champs_optionnels": [
         "download_size",
         "error"
+      ]
+    },
+    {
+      "route": "/dashboard/stats",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "total_listens",
+        "total_duration_ms",
+        "unique_tracks",
+        "unique_artists"
+      ],
+      "champs_optionnels": [
+        "unique_genres"
       ]
     },
     {
@@ -388,7 +403,9 @@
         "more_available",
         "last_token"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "downloads_available"
+      ]
     },
     {
       "route": "/ext/bandcamp/collection/link",
@@ -475,6 +492,17 @@
       ]
     },
     {
+      "route": "/ext/pont-roon",
+      "methode": "GET",
+      "type": "EtatPontRoon",
+      "liste": false,
+      "champs_obligatoires": [
+        "premium",
+        "dernier_rapport"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/home",
       "methode": "GET",
       "type": "(en ligne)",
@@ -529,35 +557,12 @@
     {
       "route": "/library/albums",
       "methode": "GET",
-      "type": "Album",
+      "type": "(en ligne)",
       "liste": true,
-      "champs_obligatoires": [
-        "id",
-        "title"
-      ],
+      "champs_obligatoires": [],
       "champs_optionnels": [
-        "added_at",
-        "artist_id",
-        "artist_name",
-        "year",
-        "original_year",
-        "release_date",
-        "original_date",
-        "genre",
-        "disc_count",
-        "track_count",
-        "cover_path",
-        "source",
-        "source_id",
-        "sample_rate",
-        "bit_depth",
-        "format",
-        "quality",
-        "label",
-        "catalog_number",
-        "dynamic_range",
-        "is_compilation",
-        "dynamic_range_source"
+        "items",
+        "total"
       ]
     },
     {
@@ -579,6 +584,69 @@
       "champs_obligatoires": [
         "updated",
         "total"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/coffret",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "cible",
+        "absorbes",
+        "disques",
+        "titre"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/coffrets",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "count",
+        "albums",
+        "coffrets"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/coffrets/{}/regrouper",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "cible",
+        "absorbes",
+        "titre"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/disques-abimes",
+      "methode": "GET",
+      "type": "DisquesAbimes",
+      "liste": false,
+      "champs_obligatoires": [
+        "applique",
+        "albums",
+        "pistes",
+        "details"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/albums/disques-abimes/reparer",
+      "methode": "POST",
+      "type": "DisquesAbimes",
+      "liste": false,
+      "champs_obligatoires": [
+        "applique",
+        "albums",
+        "pistes",
+        "details"
       ],
       "champs_optionnels": []
     },
@@ -611,6 +679,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -645,6 +714,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -679,6 +749,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -776,6 +847,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -813,6 +885,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -933,6 +1008,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -1016,6 +1092,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -1035,6 +1114,20 @@
         "dynamic_range",
         "play_count",
         "last_played_at"
+      ]
+    },
+    {
+      "route": "/library/artwork/enrich",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "albums_to_process",
+        "missing",
+        "message"
       ]
     },
     {
@@ -1070,6 +1163,17 @@
       "champs_obligatoires": [
         "result",
         "artists_without_image"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/library/artwork/enrich/status",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "result",
+        "albums_without_cover"
       ],
       "champs_optionnels": []
     },
@@ -1143,6 +1247,17 @@
       "champs_optionnels": [
         "errors"
       ]
+    },
+    {
+      "route": "/library/genres",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": true,
+      "champs_obligatoires": [
+        "name",
+        "count"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/library/history",
@@ -1261,6 +1376,7 @@
         "artists"
       ],
       "champs_optionnels": [
+        "labels",
         "playlists",
         "totals",
         "totals_capped",
@@ -1279,7 +1395,15 @@
         "enabled",
         "analysed_tracks"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "processed_tracks",
+        "eligible_tracks",
+        "total_eligible_tracks",
+        "pending_tracks",
+        "deferred_tracks",
+        "failed_tracks",
+        "waiting_reason"
+      ]
     },
     {
       "route": "/library/smart-collections",
@@ -1429,7 +1553,13 @@
         "doubtful_count"
       ],
       "champs_optionnels": [
-        "albums_without_artist"
+        "albums_without_artist",
+        "with_dynamic_range",
+        "dynamic_range_from_analysis",
+        "dynamic_range_from_tag",
+        "dynamic_range_unavailable",
+        "dynamic_range_deferred",
+        "dynamic_range_pct"
       ]
     },
     {
@@ -1453,6 +1583,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -1590,20 +1723,57 @@
       ]
     },
     {
+      "route": "/metadata/batch/artist",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "updated",
+        "errors",
+        "artist_id",
+        "artist_name",
+        "created"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/metadata/doubtful",
       "methode": "GET",
-      "type": "DoubtfulAlbum",
+      "type": "(en ligne)",
       "liste": true,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "items",
+        "total"
+      ]
+    },
+    {
+      "route": "/network/library-sources",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
       "champs_obligatoires": [
-        "id",
-        "title",
-        "artist_name",
-        "artist_resolved",
-        "genre",
-        "year",
-        "cover_path",
-        "source",
-        "reasons"
+        "items"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/library-sources",
+      "methode": "POST",
+      "type": "UpnpLibrarySource",
+      "liste": false,
+      "champs_obligatoires": [
+        "key",
+        "udn",
+        "container",
+        "name",
+        "enabled",
+        "status",
+        "last_attempt",
+        "last_success",
+        "generation",
+        "pending_count",
+        "report"
       ],
       "champs_optionnels": []
     },
@@ -1618,6 +1788,46 @@
         "items",
         "total_matches",
         "number_returned"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/media-servers/{}/indexer",
+      "methode": "POST",
+      "type": "IndexationUpnpResultat",
+      "liste": false,
+      "champs_obligatoires": [
+        "indexe"
+      ],
+      "champs_optionnels": [
+        "raison",
+        "detail",
+        "serveur",
+        "conteneur",
+        "parcours",
+        "pistes",
+        "albums_ajoutes",
+        "erreurs",
+        "reserves"
+      ]
+    },
+    {
+      "route": "/network/media-servers/{}/library-source",
+      "methode": "POST",
+      "type": "UpnpLibrarySource",
+      "liste": false,
+      "champs_obligatoires": [
+        "key",
+        "udn",
+        "container",
+        "name",
+        "enabled",
+        "status",
+        "last_attempt",
+        "last_success",
+        "generation",
+        "pending_count",
+        "report"
       ],
       "champs_optionnels": []
     },
@@ -1678,18 +1888,6 @@
         "mount_state",
         "last_mount_error",
         "smb_version"
-      ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/offline/status",
-      "methode": "GET",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "total",
-        "size_bytes",
-        "pending"
       ],
       "champs_optionnels": []
     },
@@ -1876,7 +2074,10 @@
       "champs_obligatoires": [
         "playlist_id",
         "total_tracks",
-        "recovered",
+        "applied",
+        "rejected",
+        "applied_count",
+        "rejected_count",
         "still_missing"
       ],
       "champs_optionnels": []
@@ -1913,6 +2114,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -1992,7 +2196,19 @@
         "max_tune_version",
         "is_featured",
         "marketplace",
-        "slug"
+        "slug",
+        "install_proposed",
+        "existing_configuration"
+      ]
+    },
+    {
+      "route": "/plugins/docs",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "url"
       ]
     },
     {
@@ -2036,7 +2252,9 @@
         "max_tune_version",
         "is_featured",
         "marketplace",
-        "slug"
+        "slug",
+        "install_proposed",
+        "existing_configuration"
       ]
     },
     {
@@ -2118,7 +2336,8 @@
         "artist",
         "album",
         "cover_url",
-        "created_at"
+        "created_at",
+        "first_seen_at"
       ]
     },
     {
@@ -2423,6 +2642,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -2434,12 +2654,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -2523,6 +2748,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -2586,6 +2814,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -2623,6 +2852,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -2682,6 +2914,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -2719,6 +2952,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -2750,7 +2986,8 @@
       ],
       "champs_optionnels": [
         "verification_url",
-        "user_code"
+        "user_code",
+        "error"
       ]
     },
     {
@@ -2861,6 +3098,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -2895,6 +3133,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -2943,6 +3182,7 @@
         "release_date",
         "original_date",
         "genre",
+        "genres",
         "disc_count",
         "track_count",
         "cover_path",
@@ -2977,6 +3217,28 @@
       ]
     },
     {
+      "route": "/streaming/{}/playlists",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "id"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/{}/playlists/{}",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "name",
+        "cover_path",
+        "source_id"
+      ]
+    },
+    {
       "route": "/streaming/{}/playlists/{}/tracks",
       "methode": "GET",
       "type": "Track",
@@ -2997,6 +3259,9 @@
         "track_number",
         "duration_ms",
         "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
         "format",
         "sample_rate",
         "bit_depth",
@@ -3017,6 +3282,16 @@
         "play_count",
         "last_played_at"
       ]
+    },
+    {
+      "route": "/streaming/{}/playlists/{}/tracks",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "added"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/streaming/{}/search",
@@ -3147,6 +3422,18 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/api-docs",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "version",
+        "total_endpoints",
+        "endpoints"
+      ]
+    },
+    {
       "route": "/system/audio/asio-warm-scan/rearm",
       "methode": "POST",
       "type": "(en ligne)",
@@ -3162,12 +3449,16 @@
     {
       "route": "/system/background-tasks",
       "methode": "GET",
-      "type": "(en ligne)",
+      "type": "InstantaneTachesDeFond",
       "liste": false,
       "champs_obligatoires": [
         "tasks"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "pausable",
+        "all_paused",
+        "scan_pausable"
+      ]
     },
     {
       "route": "/system/backups",
@@ -3204,6 +3495,31 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/cleanup",
+      "methode": "POST",
+      "type": "ResultatNettoyage",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "duplicate_albums_merged",
+        "orphan_albums_deleted",
+        "orphan_artists_deleted",
+        "duplicate_tracks_removed",
+        "orphan_artwork_deleted",
+        "db_optimized"
+      ]
+    },
+    {
+      "route": "/system/clear-cache",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "cleared"
+      ]
+    },
+    {
       "route": "/system/config/import",
       "methode": "POST",
       "type": "(en ligne)",
@@ -3212,6 +3528,24 @@
         "imported"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/system/database/migrate",
+      "methode": "POST",
+      "type": "ResultatMigrationBase",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "status",
+        "restarting",
+        "env_path",
+        "tables_migrated",
+        "total_rows",
+        "duration_ms",
+        "errors",
+        "error",
+        "hint"
+      ]
     },
     {
       "route": "/system/database/rebuild-fts",
@@ -3224,6 +3558,20 @@
         "message"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/system/database/test-connection",
+      "methode": "POST",
+      "type": "EssaiConnexionBase",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "ok",
+        "version",
+        "database_created",
+        "error",
+        "hint"
+      ]
     },
     {
       "route": "/system/diagnostics",
@@ -3321,6 +3669,30 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/log-level",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "level",
+        "available"
+      ]
+    },
+    {
+      "route": "/system/log-level",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "status",
+        "level",
+        "note",
+        "error"
+      ]
+    },
+    {
       "route": "/system/music-dirs/remove",
       "methode": "POST",
       "type": "RetraitDossier",
@@ -3392,6 +3764,24 @@
       ]
     },
     {
+      "route": "/system/replaygain/progress",
+      "methode": "GET",
+      "type": "AvancementReplayGain",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "active",
+        "processed",
+        "total",
+        "remaining",
+        "updated_at",
+        "reported",
+        "enabled",
+        "deferred",
+        "waiting_reason"
+      ]
+    },
+    {
       "route": "/system/restart",
       "methode": "POST",
       "type": "(en ligne)",
@@ -3421,7 +3811,14 @@
         "missing_dirs",
         "missing_dir_reasons",
         "error_dirs",
-        "failed_paths"
+        "failed_paths",
+        "skipped_unsupported_paths",
+        "skipped_no_metadata_paths",
+        "skipped_duplicate_paths",
+        "skipped_empty_file_paths",
+        "cue_sheets_skipped_paths",
+        "skipped_paths_truncated",
+        "cue_sheets"
       ]
     },
     {
@@ -3537,6 +3934,20 @@
         "id"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/tags/for-streaming",
+      "methode": "GET",
+      "type": "UserTag",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "color"
+      ],
+      "champs_optionnels": [
+        "count"
+      ]
     },
     {
       "route": "/tags/for/{}/{}",
@@ -3673,6 +4084,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -3684,12 +4096,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -3731,6 +4148,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -3742,12 +4160,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -3855,6 +4278,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -3866,12 +4290,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -3913,6 +4342,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -3924,12 +4354,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -4072,6 +4507,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -4083,12 +4519,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -4142,6 +4583,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -4153,12 +4595,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -4193,7 +4640,9 @@
       "champs_obligatoires": [
         "queue_length"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "unresolved"
+      ]
     },
     {
       "route": "/zones/{}/queue/jump",
@@ -4234,6 +4683,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -4245,12 +4695,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -4334,6 +4789,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -4345,12 +4801,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -4373,7 +4834,9 @@
         "url",
         "track"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "url_absolue"
+      ]
     },
     {
       "route": "/zones/{}/shuffle",
@@ -4437,6 +4900,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -4448,12 +4912,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     },
     {
@@ -4495,6 +4964,7 @@
         "lyrics_offset_ms",
         "dlna_native_flac",
         "max_sample_rate",
+        "gapless_enabled",
         "fixed_volume",
         "alac_passthrough",
         "aac_passthrough",
@@ -4506,12 +4976,17 @@
         "upnp_renderer",
         "gain_trim_db",
         "mono_downmix",
+        "strict_bitperfect",
+        "channel_layout",
+        "channel_layout_status",
+        "channel_layouts_offered",
         "brand",
         "model",
         "resolving",
         "dop_active",
         "detected_manufacturer",
-        "detected_model"
+        "detected_model",
+        "identite_appareil_effacee"
       ]
     }
   ],
@@ -4637,6 +5112,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/albums/filters",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/library/artists",
       "type": "any",
       "raison": "type non structurel"
@@ -4697,6 +5177,16 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/tags/{}/streaming-items",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/tags/{}/streaming-items/remove",
+      "type": "void",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/library/artists/{}/timeline",
       "type": "any[]",
       "raison": "type non structurel"
@@ -4750,6 +5240,16 @@
       "route": "/system/music-dirs",
       "type": "any",
       "raison": "type non structurel"
+    },
+    {
+      "route": "/cloud/telemetry/status",
+      "type": "ReponseTelemetrie & {\n    server_id?: string | null;\n    instance_id?: string | null;\n    rate_limits?: { retry_after_seconds?: number }[];\n  }",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "${routeDeBascule(souhait)}",
+      "type": "ReponseTelemetrie",
+      "raison": "URL ou interpolation illisible — route non fiable"
     },
     {
       "route": "/system/peers/{}/browse",
@@ -4899,6 +5399,11 @@
     {
       "route": "/profiles/{}/favorites/check",
       "type": "Array<{ item_id: number; is_favorite: boolean }>",
+      "raison": "type non structurel"
+    },
+    {
+      "route": "/system/changelog",
+      "type": "unknown",
       "raison": "type non structurel"
     },
     {
@@ -5162,6 +5667,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/system/import/status/{}",
+      "type": "EtatImport",
+      "raison": "type introuvable dans les sources"
+    },
+    {
       "route": "/home/continue-listening",
       "type": "any[]",
       "raison": "type non structurel"
@@ -5197,11 +5707,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/offline/downloads",
-      "type": "any[]",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/support/tickets/{}/reply",
       "type": "any",
       "raison": "type non structurel"
@@ -5233,7 +5738,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 261,
-    "appels_non_resolus": 143
+    "routes_cartographiees": 288,
+    "appels_non_resolus": 149
   }
 }
