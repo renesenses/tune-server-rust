@@ -58,7 +58,7 @@ async fn lis(app: &axum::Router, chemin: &str) -> Value {
 async fn la_route_existe_et_ne_rend_pas_404() {
     let state = etat();
     let app = appli(&state);
-    let (statut, _) = supprime(&app, "/api/playlist-manager/playlists/tidal/uuid-x").await;
+    let (statut, _) = supprime(&app, "/api/v1/playlist-manager/playlists/tidal/uuid-x").await;
     assert_ne!(
         statut,
         StatusCode::NOT_FOUND,
@@ -73,7 +73,7 @@ async fn la_route_existe_et_ne_rend_pas_404() {
 async fn un_service_sans_compte_refuse_avant_tout_appel() {
     let state = etat();
     let app = appli(&state);
-    let (statut, corps) = supprime(&app, "/api/playlist-manager/playlists/tidal/uuid-x").await;
+    let (statut, corps) = supprime(&app, "/api/v1/playlist-manager/playlists/tidal/uuid-x").await;
     assert_eq!(statut, StatusCode::NOT_IMPLEMENTED, "corps : {corps}");
 }
 
@@ -83,7 +83,7 @@ async fn un_service_sans_compte_refuse_avant_tout_appel() {
 async fn local_est_renvoye_vers_sa_propre_route() {
     let state = etat();
     let app = appli(&state);
-    let (statut, corps) = supprime(&app, "/api/playlist-manager/playlists/local/7").await;
+    let (statut, corps) = supprime(&app, "/api/v1/playlist-manager/playlists/local/7").await;
     assert_eq!(statut, StatusCode::BAD_REQUEST);
     assert!(
         corps["error"]
@@ -98,7 +98,7 @@ async fn local_est_renvoye_vers_sa_propre_route() {
 async fn un_service_inconnu_est_refuse() {
     let state = etat();
     let app = appli(&state);
-    let (statut, corps) = supprime(&app, "/api/playlist-manager/playlists/napster/42").await;
+    let (statut, corps) = supprime(&app, "/api/v1/playlist-manager/playlists/napster/42").await;
     assert_eq!(statut, StatusCode::BAD_REQUEST);
     assert!(
         corps["error"]
@@ -115,7 +115,7 @@ async fn un_service_inconnu_est_refuse() {
 async fn services_annonce_la_capacite_de_suppression() {
     let state = etat();
     let app = appli(&state);
-    let corps = lis(&app, "/api/playlist-manager/services").await;
+    let corps = lis(&app, "/api/v1/playlist-manager/services").await;
     assert_eq!(
         corps["local"]["supports_delete"],
         Value::Bool(true),
