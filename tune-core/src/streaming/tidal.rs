@@ -1098,30 +1098,81 @@ impl TidalService {
         path: &str,
         form: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
+        self.api_post_form_etiquette(path, form, None).await
+    }
+
+    /// L'ÉTIQUETTE d'une playlist Tidal (`ETag`).
+    ///
+    /// 🔴 Tidal refuse toute modification du CONTENU d'une playlist sans
+    /// `If-None-Match` :
+    ///
+    /// ```text
+    /// 412 {"subStatus":7002,"userMessage":"You must send the correct Etag
+    ///      value in the If-None-Match header to modify a playlist"}
+    /// ```
+    ///
+    /// Elle change à chaque modification : on la relit avant CHAQUE lot, sans
+    /// quoi le deuxième lot d'une playlist de plus de 100 titres échouerait.
+    async fn etiquette_playlist(&self, playlist_id: &str) -> Result<String, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let url = format!("{API_BASE}/playlists/{playlist_id}");
         let resp = self
             .client
-            .post(&url)
+            .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .query(&[("countryCode", &self.country_code)])
-            .form(form)
             .send()
             .await
-            .map_err(|e| format!("tidal post: {e}"))?;
+            .map_err(|e| format!("tidal etag: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "tidal etag {playlist_id}: {}",
+                resp.status().as_u16()
+            ));
+        }
+        resp.headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("tidal etag {playlist_id}: en-tête absent"))
+    }
+
+    async fn api_post_form_etiquette(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+        etiquette: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let token = self.get_access_token().await?;
+        let url = format!("{API_BASE}{path}");
+        let poser = |req: reqwest::RequestBuilder| match etiquette {
+            Some(e) => req.header(reqwest::header::IF_NONE_MATCH, e),
+            None => req,
+        };
+        let resp = poser(
+            self.client
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .query(&[("countryCode", &self.country_code)])
+                .form(form),
+        )
+        .send()
+        .await
+        .map_err(|e| format!("tidal post: {e}"))?;
 
         if resp.status() == 401 {
             if let Ok(true) = self.do_refresh_token().await {
                 let new_token = self.get_access_token().await?;
-                let retry_resp = self
-                    .client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {new_token}"))
-                    .query(&[("countryCode", &self.country_code)])
-                    .form(form)
-                    .send()
-                    .await
-                    .map_err(|e| format!("tidal post retry: {e}"))?;
+                let retry_resp = poser(
+                    self.client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {new_token}"))
+                        .query(&[("countryCode", &self.country_code)])
+                        .form(form),
+                )
+                .send()
+                .await
+                .map_err(|e| format!("tidal post retry: {e}"))?;
                 if !retry_resp.status().is_success() {
                     let status = retry_resp.status().as_u16();
                     let body = retry_resp.text().await.unwrap_or_default();
@@ -2116,10 +2167,13 @@ impl StreamingService for TidalService {
     ) -> Result<usize, TuneError> {
         let mut added = 0;
         for chunk in track_ids.chunks(100) {
+            // Relue à chaque tour : l'ajout précédent l'a changée.
+            let etiquette = self.etiquette_playlist(playlist_id).await?;
             let ids_csv = chunk.join(",");
-            self.api_post_form(
+            self.api_post_form_etiquette(
                 &format!("/playlists/{playlist_id}/items"),
                 &[("trackIds", &ids_csv)],
+                Some(&etiquette),
             )
             .await?;
             added += chunk.len();
@@ -2720,6 +2774,53 @@ mod tests {
         let mut svc = TidalService::new();
         svc.user_id = Some(4242);
         assert!(svc.supports_playlist_delete());
+    }
+
+    /*
+    | L'ÉTIQUETTE (`ETag`) exigée par Tidal pour modifier une playlist.
+    |
+    | 🔴 Bertrand, 21/09, en fusionnant deux playlists Tidal :
+    |
+    |   Merge error: tidal /playlists/c7366b98-…/items: 412
+    |   {"subStatus":7002,"userMessage":"You must send the correct Etag value
+    |    in the If-None-Match header to modify a playlist"}
+    |
+    | La playlist était créée, et restait VIDE. `add_tracks_to_playlist`
+    | postait sans `If-None-Match`.
+    |
+    | L'étiquette se relit avant CHAQUE lot de 100 : l'ajout précédent l'a
+    | changée, donc une playlist de plus de 100 titres échouerait au deuxième
+    | tour si on la relisait une seule fois.
+    */
+
+    #[tokio::test]
+    async fn sans_compte_l_etiquette_ne_peut_pas_etre_lue() {
+        let svc = TidalService::new();
+        let err = svc
+            .etiquette_playlist("c7366b98-bff1-4ed4-9aa7-849185b3d702")
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty(), "un échec doit porter un motif");
+    }
+
+    #[test]
+    fn l_ajout_de_pistes_relit_l_etiquette_a_chaque_lot() {
+        // Garde de source : la relecture est DANS la boucle. Écrite parce que
+        // la poser au-dessus paraît plus économique et casse au 101ᵉ titre,
+        // ce qu'aucun essai sans compte ne montrerait.
+        let source = include_str!("tidal.rs");
+        let debut = source
+            .find("async fn add_tracks_to_playlist")
+            .expect("add_tracks_to_playlist introuvable");
+        let corps = &source[debut..debut + 900];
+        let boucle = corps.find("for chunk in").expect("plus de lots");
+        let relecture = corps
+            .find("self.etiquette_playlist(playlist_id)")
+            .expect("l'étiquette n'est plus lue");
+        assert!(
+            relecture > boucle,
+            "l'étiquette est lue HORS de la boucle : le deuxième lot échouera"
+        );
     }
 
     #[test]
