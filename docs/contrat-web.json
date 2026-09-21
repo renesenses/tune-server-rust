@@ -5247,6 +5247,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "${routeDeBascule(souhait)}",
+      "type": "ReponseTelemetrie",
+      "raison": "URL ou interpolation illisible — route non fiable"
+    },
+    {
       "route": "/system/peers/{}/browse",
       "type": "any",
       "raison": "type non structurel"
@@ -5734,6 +5739,6 @@
   ],
   "resume": {
     "routes_cartographiees": 288,
-    "appels_non_resolus": 148
+    "appels_non_resolus": 149
   }
 }

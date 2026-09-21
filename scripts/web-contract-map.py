@@ -323,7 +323,15 @@ def normaliser_route(route: str) -> str:
             sortie.append(route[i])
             i += 1
     forme = re.sub(r"\{\}+", "{}", "".join(sortie))
-    return forme.rstrip("/") or "/"
+    forme = forme.rstrip("/") or "/"
+    # 🔴 Une route entièrement interpolée (`${...}` seul) ne désigne AUCUN
+    # chemin : elle se réduit à « {} ». Cartographiée, elle faisait sonder
+    # `/api/v1/1` au banc `web_response_contracts`, qui échouait sur une route
+    # que le serveur ne sert pas et ne peut pas servir. On la renvoie comme
+    # non résolue, ce qu'elle est.
+    if forme.strip("{}/") == "" and "{}" in forme:
+        return ""
+    return forme
 
 
 def appels_types_par_le_retour(api_ts: str) -> list[tuple[str, str, str, bool, bool]]:
