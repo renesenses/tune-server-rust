@@ -224,7 +224,10 @@ const VAGUE_INITIALE: &[(&str, &str)] = &[
         "/library/enrich-all/status",
         "/api/v1/library/enrich-all/status",
     ),
-    ("/offline/status", "/api/v1/offline/status"),
+    // 🔴 #1332 — « Écoute hors-ligne » a été retiré du client : plus aucun écran
+    // n'appelle /offline/status, la carte ne le cartographie donc plus. Sonder
+    // ici une route absente de la carte fait échouer le banc sur SA propre
+    // liste, pas sur le serveur. La route reste servie pour les clients anciens.
     ("/onboarding/status", "/api/v1/onboarding/status"),
     // `/radios/search` a quitté cette liste le 11/09/2026 : le client web ne
     // l'appelle plus du tout, donc la carte ne la décrit plus et le contrat
