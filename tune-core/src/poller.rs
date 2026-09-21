@@ -169,6 +169,17 @@ const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
 /// foulée signifie « l'appareil est vraiment planté, on coupe » ; assez
 /// courte pour redonner sa chance à l'album suivant.
 const DEAD_START_RETRY_COOLDOWN_SECS: u64 = 180;
+/// Fenêtre minimale entre deux reprises automatiques après décrochage du
+/// renderer EN COURS de lecture (#4645) sur une même zone. Même ordre de
+/// grandeur que la relance « démarrage mort » : un second décrochage dans la
+/// foulée dit que l'appareil ou le réseau ne suit pas, et la zone est coupée
+/// comme avant plutôt que harcelée.
+const RENDERER_CALE_REPRISE_COOLDOWN_SECS: u64 = 180;
+/// Durée de musique qui doit RESTER après la position atteinte pour qu'une
+/// reprise ait un sens. En dessous, ce qui manque tient dans la marge de
+/// détection : on coupe plutôt que de renvoyer un ordre de lecture pour
+/// quelques secondes.
+const RENDERER_CALE_RESTE_MIN_MS: u64 = 15_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -428,6 +439,12 @@ pub struct PositionPoller {
     /// relance au plus par fenêtre de DEAD_START_RETRY_COOLDOWN_SECS ; si la
     /// relance échoue à son tour, la zone est coupée comme avant.
     relances_demarrage_mort: Mutex<std::collections::HashMap<i64, Instant>>,
+    /// Horodatage de la dernière reprise automatique après décrochage du
+    /// renderer en cours de lecture (#4645), par zone. Vit HORS de
+    /// ZonePollState pour exactement la même raison que
+    /// `relances_demarrage_mort` : la reprise recrée l'état de sondage, un
+    /// drapeau posé dedans repartirait à zéro et bouclerait.
+    reprises_renderer_cale: Mutex<std::collections::HashMap<i64, Instant>>,
 }
 
 impl PositionPoller {
@@ -446,6 +463,7 @@ impl PositionPoller {
             shared_metrics,
             event_bus: None,
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
+            reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
