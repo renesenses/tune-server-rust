@@ -134,7 +134,7 @@ async fn services_annonce_la_capacite_de_suppression() {
 // ---------------------------------------------------------------------------
 
 /// Bertrand, 21/09 : « Cela merge en local : erreur !! » — huit playlists
-/// Qobuz cochées, et la fusion créait une playlist LOCALE. Vide.
+/// Qobuz cochées, et la fusion créait une playlist locale. Vide.
 ///
 /// Deux défauts qui s'additionnaient :
 ///
@@ -147,8 +147,14 @@ async fn services_annonce_la_capacite_de_suppression() {
 ///
 /// Un succès creux est pire qu'un refus : c'est lui qui a fait dire « la
 /// fusion ne marche pas ».
+///
+/// ⚠️ Depuis « Quand je vais merger des playlists de Tidal et Qobuz, quand
+/// vais-je choisir la cible ? », une source de service VERS LE LOCAL n'est
+/// plus refusée : elle passe par le rapprochement dans la bibliothèque. Ce
+/// témoin garde donc ce qui reste vrai — la route ne crée RIEN quand elle
+/// n'a pas pu lire ses sources.
 #[tokio::test]
-async fn fusionner_des_playlists_de_service_dans_le_local_est_refuse() {
+async fn une_source_illisible_ne_cree_aucune_playlist() {
     let state = etat();
     let app = appli(&state);
     let req = Request::builder()
@@ -173,17 +179,49 @@ async fn fusionner_des_playlists_de_service_dans_le_local_est_refuse() {
         .await
         .unwrap();
     let corps: Value = serde_json::from_slice(&octets).unwrap_or(Value::Null);
-    assert_eq!(
+    assert_ne!(
         statut,
-        StatusCode::BAD_REQUEST,
-        "une source de service ne peut pas être fusionnée en local sans appariement : {corps}"
+        StatusCode::OK,
+        "sans compte, aucune source n'est lisible : rien ne doit être créé — {corps}"
     );
+}
+
+/// Le mélange est ACCEPTÉ par le contrat : deux sources de services
+/// différents ne sont plus rejetées d'entrée.
+///
+/// Sans compte, l'essai s'arrête à la lecture de la première source — mais
+/// il s'y arrête, et non sur un « source on qobuz cannot merge into tidal »
+/// qui était le refus d'avant.
+#[tokio::test]
+async fn deux_services_differents_ne_sont_plus_rejetes_d_entree() {
+    let state = etat();
+    let app = appli(&state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/playlist-manager/merge")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "playlists": [
+                    { "service": "qobuz", "playlist_id": "1" },
+                    { "service": "tidal", "playlist_id": "u-u-i-d" }
+                ],
+                "target_name": "Fusion croisée",
+                "target_service": "tidal",
+                "deduplicate": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let octets = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let corps: Value = serde_json::from_slice(&octets).unwrap_or(Value::Null);
+    let motif = corps["error"].as_str().unwrap_or_default();
     assert!(
-        corps["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("qobuz"),
-        "{corps}"
+        !motif.contains("cannot merge into"),
+        "le mélange de services est de nouveau refusé d'entrée : {corps}"
     );
 }
 
