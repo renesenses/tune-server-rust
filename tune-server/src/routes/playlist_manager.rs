@@ -1375,18 +1375,42 @@ async fn fusion_chez_le_service(
             }))
             .into_response()
         }
-        // La playlist EXISTE déjà chez le service : le dire, plutôt que de
-        // laisser croire que rien n'a été fait.
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({
-                "error": e.to_string(),
-                "playlist_id": nouvelle,
-                "service": cible,
-                "partial": true,
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            // 🔴 La playlist a été CRÉÉE avant que l'ajout échoue. Laissée
+            // telle quelle, elle encombre le compte — Bertrand en a récolté
+            // une, vide, au premier essai Tidal (412 sur l'étiquette).
+            //
+            // On ne la retire QUE si elle est vraiment vide : un ajout peut
+            // échouer au deuxième lot de 100, et la supprimer alors perdrait
+            // les cent premiers titres.
+            let vide = match svc.get_playlist_tracks(&nouvelle).await {
+                Ok(pistes) => pistes.is_empty(),
+                // Dans le doute, on ne détruit rien.
+                Err(_) => false,
+            };
+            let retiree = if vide {
+                svc.delete_playlist(&nouvelle).await.is_ok()
+            } else {
+                false
+            };
+            if retiree {
+                tune_streaming_http::purge_contenu_utilisateur(cible);
+            }
+            tracing::warn!(service = %cible, playlist = %nouvelle, %retiree, error = %e, "merge_add_tracks_failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": e.to_string(),
+                    "playlist_id": nouvelle,
+                    "service": cible,
+                    // La playlist vide a-t-elle été retirée ? Si non, elle
+                    // est restée chez le service, et l'écran doit le dire.
+                    "rolled_back": retiree,
+                    "partial": !retiree,
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
