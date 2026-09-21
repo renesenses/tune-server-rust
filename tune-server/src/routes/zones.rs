@@ -305,6 +305,14 @@ fn inject_device_identity(
         .flatten();
     obj.insert("brand".into(), json!(brand));
     obj.insert("model".into(), json!(model));
+    // La photo de l'appareil, posée par l'utilisateur (#1394). Sert de socle à
+    // la vignette de la carte de zone quand rien ne joue.
+    let image_path = settings
+        .get(&format!("zone_{zone_id}_image"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    obj.insert("image_path".into(), json!(image_path));
     let trim = settings
         .get(&format!("zone_{zone_id}_gain_trim_db"))
         .ok()
@@ -461,6 +469,13 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/device-presets", get(get_device_presets))
+        // #1394 — la photo de l'appareil de cette zone. Locale pour
+        // l'instant : rien ne part au catalogue communautaire sans le
+        // consentement de l'utilisateur ET l'approbation de Bertrand.
+        .route(
+            "/{id}/image",
+            post(zone_image_upload).delete(zone_image_delete),
+        )
         .route("/{id}/name", put(rename_zone))
         // #1361 — l'album de ce qui joue, et chez qui l'ouvrir, en UNE
         // réponse. Deux orthographes pour la même route : le dépôt en est à
