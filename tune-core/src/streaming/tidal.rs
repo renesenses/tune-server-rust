@@ -1991,15 +1991,33 @@ impl StreamingService for TidalService {
         Ok(Self::map_playlist(&data))
     }
 
+    /// 🔴 Paginé. La version d'avant demandait `?limit=100` et s'arrêtait là :
+    /// une playlist de 1 454 titres en rendait 100, sans rien dire. Invisible
+    /// à la lecture — on écoute rarement au-delà — mais la FUSION, elle, en
+    /// perdait les neuf dixièmes.
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
-            .api_get(&format!("/playlists/{playlist_id}/tracks?limit=100"))
-            .await?;
-        let tracks = data["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        Ok(tracks)
+        let mut toutes: Vec<StreamTrack> = Vec::new();
+        let mut offset = 0u32;
+        let page = 100u32;
+        loop {
+            let data = self
+                .api_get(&format!(
+                    "/playlists/{playlist_id}/tracks?limit={page}&offset={offset}"
+                ))
+                .await?;
+            let lot: Vec<StreamTrack> = data["items"]
+                .as_array()
+                .map(|items| items.iter().map(Self::map_track).collect())
+                .unwrap_or_default();
+            let recues = lot.len();
+            toutes.extend(lot);
+            let total = data["totalNumberOfItems"].as_u64().unwrap_or(0) as usize;
+            offset += page;
+            if recues == 0 || toutes.len() >= total {
+                break;
+            }
+        }
+        Ok(toutes)
     }
 
     async fn get_genres(&self, _parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
@@ -2170,13 +2188,34 @@ impl StreamingService for TidalService {
             // Relue à chaque tour : l'ajout précédent l'a changée.
             let etiquette = self.etiquette_playlist(playlist_id).await?;
             let ids_csv = chunk.join(",");
-            self.api_post_form_etiquette(
-                &format!("/playlists/{playlist_id}/items"),
-                &[("trackIds", &ids_csv)],
-                Some(&etiquette),
-            )
-            .await?;
-            added += chunk.len();
+            // 🔴 `onArtifactNotFound` vaut `FAIL` par défaut : UNE piste
+            // introuvable dans le pays du compte — retirée du catalogue, ou
+            // jamais distribuée là — et Tidal refuse le LOT ENTIER :
+            //
+            //   404 {"subStatus":2001,"userMessage":"Track not found"}
+            //
+            // Les vieilles playlists en contiennent toujours. `SKIP` ajoute
+            // ce qui existe et laisse le reste, ce qui vaut mieux que de ne
+            // rien ajouter du tout. `onDupes=SKIP` par symétrie : les
+            // doublons sont déjà écartés en amont, et une playlist n'a pas à
+            // grossir d'un titre en double si elle passe deux fois ici.
+            let reponse = self
+                .api_post_form_etiquette(
+                    &format!("/playlists/{playlist_id}/items"),
+                    &[
+                        ("trackIds", &ids_csv),
+                        ("onArtifactNotFound", "SKIP"),
+                        ("onDupes", "SKIP"),
+                    ],
+                    Some(&etiquette),
+                )
+                .await?;
+            // Compter ce que Tidal a VRAIMENT ajouté : avec `SKIP`, annoncer
+            // la taille du lot mentirait dès qu'une piste manque.
+            added += reponse["addedItemIds"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(chunk.len());
         }
         Ok(added)
     }
@@ -2820,6 +2859,55 @@ mod tests {
         assert!(
             relecture > boucle,
             "l'étiquette est lue HORS de la boucle : le deuxième lot échouera"
+        );
+    }
+
+    /*
+    | 🔴 « Merge error: tidal /playlists/…/items: 404 {"subStatus":2001,
+    | "userMessage":"Track not found"} » — Bertrand, 21/09, après le correctif
+    | de l'étiquette.
+    |
+    | Les identifiants envoyés étaient BONS (mesurés sur le .18 : 175461939,
+    | 20055000, 29280241…). C'est `onArtifactNotFound` qui vaut `FAIL` par
+    | défaut : une seule piste introuvable dans le pays du compte, et Tidal
+    | refuse le lot entier. Les vieilles playlists en contiennent toujours.
+    |
+    | Deux gardes de source : le drapeau est envoyé, et le compte rendu vient
+    | de Tidal. Sans la seconde, on annoncerait « 7 ajoutées » alors que SKIP
+    | en aurait laissé trois de côté.
+    */
+
+    #[test]
+    fn l_ajout_de_pistes_ne_capitule_pas_sur_une_piste_introuvable() {
+        let source = include_str!("tidal.rs");
+        let debut = source
+            .find("async fn add_tracks_to_playlist")
+            .expect("add_tracks_to_playlist introuvable");
+        let corps = &source[debut..debut + 2200];
+        assert!(
+            corps.contains("(\"onArtifactNotFound\", \"SKIP\")"),
+            "sans SKIP, une piste retirée du catalogue fait échouer tout le lot"
+        );
+        assert!(
+            corps.contains("addedItemIds"),
+            "le compte doit venir de Tidal, pas de la taille du lot"
+        );
+    }
+
+    #[test]
+    fn les_pistes_d_une_playlist_sont_paginees() {
+        let source = include_str!("tidal.rs");
+        let debut = source
+            .find("async fn get_playlist_tracks")
+            .expect("get_playlist_tracks introuvable");
+        let corps = &source[debut..debut + 1200];
+        assert!(
+            corps.contains("offset={offset}"),
+            "sans offset, une playlist de plus de 100 titres est tronquée en silence"
+        );
+        assert!(
+            corps.contains("totalNumberOfItems"),
+            "il faut une borne, sinon la boucle ne s'arrête jamais"
         );
     }
 
