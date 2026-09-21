@@ -4988,17 +4988,6 @@
         "detected_model",
         "identite_appareil_effacee"
       ]
-    },
-    {
-      "route": "{}",
-      "methode": "POST",
-      "type": "ReponseTelemetrie",
-      "liste": false,
-      "champs_obligatoires": [],
-      "champs_optionnels": [
-        "enabled",
-        "env_override"
-      ]
     }
   ],
   "non_resolus": [
@@ -5744,7 +5733,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 289,
+    "routes_cartographiees": 288,
     "appels_non_resolus": 148
   }
 }
