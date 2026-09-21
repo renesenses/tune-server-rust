@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "f94eff8b2903e02be07a2a1988a04d76a26c95e5",
+    "web_sha": "d70fbb91c2bf0b1947e6b1c4fb7f5a4d39368db7",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -2660,6 +2660,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4102,6 +4103,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4166,6 +4168,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4296,6 +4299,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4360,6 +4364,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4457,6 +4462,16 @@
       "champs_optionnels": []
     },
     {
+      "route": "/zones/{}/image",
+      "methode": "DELETE",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "image_path"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/zones/{}/next",
       "methode": "POST",
       "type": "(en ligne)",
@@ -4525,6 +4540,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4601,6 +4617,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4701,6 +4718,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4807,6 +4825,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4918,6 +4937,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -4982,6 +5002,7 @@
         "channel_layouts_offered",
         "brand",
         "model",
+        "image_path",
         "resolving",
         "dop_active",
         "detected_manufacturer",
@@ -5738,7 +5759,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 288,
+    "routes_cartographiees": 289,
     "appels_non_resolus": 149
   }
 }
