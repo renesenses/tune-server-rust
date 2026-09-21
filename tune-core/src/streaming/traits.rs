@@ -513,6 +513,16 @@ pub trait StreamingService: Send + Sync {
         false
     }
 
+    /// Le service sait-il SUPPRIMER une playlist chez lui ?
+    ///
+    /// `delete_playlist` a une implémentation par défaut qui échoue : sans ce
+    /// drapeau, l'interface poserait un bouton « supprimer » sur les cartes de
+    /// tous les services et le clic rendrait un 501. On le laisse à `false` et
+    /// chaque service qui sait vraiment le faire le relève.
+    fn supports_playlist_delete(&self) -> bool {
+        false
+    }
+
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
     }
