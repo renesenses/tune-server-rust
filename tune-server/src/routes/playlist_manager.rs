@@ -1260,7 +1260,7 @@ async fn rassembler_les_sources(
                     titre: t.title.clone(),
                     artiste: t.artist_name.clone().unwrap_or_default(),
                     isrc: String::new(),
-                    duree_ms: t.duration_ms.unwrap_or(0) as u64,
+                    duree_ms: t.duration_ms.max(0) as u64,
                     id_source: t.id.map(|i| i.to_string()).unwrap_or_default(),
                     service: "local".into(),
                 });
