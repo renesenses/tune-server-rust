@@ -128,3 +128,105 @@ async fn services_annonce_la_capacite_de_suppression() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// La fusion, « au même endroit »
+// ---------------------------------------------------------------------------
+
+/// Bertrand, 21/09 : « Cela merge en local : erreur !! » — huit playlists
+/// Qobuz cochées, et la fusion créait une playlist LOCALE. Vide.
+///
+/// Deux défauts qui s'additionnaient :
+///
+/// 1. `MergeRequest` ne déclarait pas `target_service`. Le client l'envoyait
+///    depuis le début ; serde jette en silence un champ non déclaré, donc la
+///    cible était TOUJOURS la bibliothèque.
+/// 2. La boucle des sources « sautait pour le moment » toute source de
+///    service. La playlist créée n'avait donc aucune piste — et la route
+///    répondait `200`.
+///
+/// Un succès creux est pire qu'un refus : c'est lui qui a fait dire « la
+/// fusion ne marche pas ».
+#[tokio::test]
+async fn fusionner_des_playlists_de_service_dans_le_local_est_refuse() {
+    let state = etat();
+    let app = appli(&state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/playlist-manager/merge")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "playlists": [
+                    { "service": "qobuz", "playlist_id": "1" },
+                    { "service": "qobuz", "playlist_id": "2" }
+                ],
+                "target_name": "Fusion",
+                "deduplicate": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let statut = resp.status();
+    let octets = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let corps: Value = serde_json::from_slice(&octets).unwrap_or(Value::Null);
+    assert_eq!(
+        statut,
+        StatusCode::BAD_REQUEST,
+        "une source de service ne peut pas être fusionnée en local sans appariement : {corps}"
+    );
+    assert!(
+        corps["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("qobuz"),
+        "{corps}"
+    );
+}
+
+/// `target_service` doit être LU. S'il retombait dans l'oubli de serde, la
+/// fusion repartirait dans la bibliothèque sans que rien ne le signale.
+#[tokio::test]
+async fn la_cible_de_fusion_est_lue_et_non_jetee_par_serde() {
+    let state = etat();
+    let app = appli(&state);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/playlist-manager/merge")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "playlists": [
+                    { "service": "qobuz", "playlist_id": "1" },
+                    { "service": "qobuz", "playlist_id": "2" }
+                ],
+                "target_name": "Fusion",
+                "target_service": "qobuz",
+                "deduplicate": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let statut = resp.status();
+    let octets = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let corps: Value = serde_json::from_slice(&octets).unwrap_or(Value::Null);
+    // Sans compte Qobuz, l'essai s'arrête au refus d'écriture — mais il
+    // s'arrête CHEZ QOBUZ, et c'est tout ce qu'on veut prouver ici : la cible
+    // n'est plus la bibliothèque.
+    assert_ne!(
+        statut,
+        StatusCode::OK,
+        "une playlist locale a encore été créée : {corps}"
+    );
+    let motif = corps["error"].as_str().unwrap_or_default();
+    assert!(
+        motif.contains("qobuz") || motif.contains("Qobuz"),
+        "le refus doit venir de la cible, pas du local : {corps}"
+    );
+}
