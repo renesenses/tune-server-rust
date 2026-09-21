@@ -804,3 +804,11 @@ path = "tests/bug_report_captures_4564.rs"
 [[test]]
 name = "suppression_playlist_de_service"
 path = "tests/suppression_playlist_de_service.rs"
+
+# Le cloisonnement par profil du gestionnaire de playlists — dont la FUSION.
+# Le fichier existait depuis #3073, mais `autotests = false` plus haut le
+# laissait hors compilation : la garde qui interdit de fusionner la playlist
+# d'un autre profil n'était exécutée par personne.
+[[test]]
+name = "playlist_manager_cloisonnement_par_profil"
+path = "tests/playlist_manager_cloisonnement_par_profil.rs"
