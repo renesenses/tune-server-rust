@@ -32,7 +32,7 @@ fn browser_playing_since(started_ago: Duration) -> ZoneState {
 fn zone_sans_sortie_est_signalee_avant_le_clic() {
     let zone = zone_with(Some("local"), None);
     assert_eq!(
-        output_reach_of(&zone, &ZoneState::default(), false),
+        output_reach_of(&zone, &ZoneState::default(), false, Some(true)),
         "no_output"
     );
 }
@@ -40,7 +40,10 @@ fn zone_sans_sortie_est_signalee_avant_le_clic() {
 #[test]
 fn zone_avec_sortie_ne_signale_rien() {
     let zone = zone_with(Some("dlna"), Some("dev-1"));
-    assert_eq!(output_reach_of(&zone, &ZoneState::default(), false), "ok");
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, Some(true)),
+        "ok"
+    );
 }
 
 #[test]
@@ -48,7 +51,10 @@ fn zone_navigateur_a_larret_ne_signale_rien() {
     // Une zone navigateur n'a jamais de périphérique : sans lecture en
     // cours il n'y a rien à reprocher.
     let zone = zone_with(Some("browser"), None);
-    assert_eq!(output_reach_of(&zone, &ZoneState::default(), false), "ok");
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, Some(true)),
+        "ok"
+    );
 }
 
 #[test]
@@ -56,7 +62,7 @@ fn zone_navigateur_qui_demarre_beneficie_du_delai() {
     let zone = zone_with(Some("browser"), None);
     let ps = browser_playing_since(Duration::from_secs(2));
     assert_eq!(
-        output_reach_of(&zone, &ps, false),
+        output_reach_of(&zone, &ps, false, Some(true)),
         "ok",
         "un onglet qui vient de recevoir stream_url n'a pas encore tiré d'octets"
     );
@@ -66,7 +72,7 @@ fn zone_navigateur_qui_demarre_beneficie_du_delai() {
 fn zone_navigateur_ecoutee_ne_signale_rien() {
     let zone = zone_with(Some("browser"), None);
     let ps = browser_playing_since(Duration::from_secs(60));
-    assert_eq!(output_reach_of(&zone, &ps, true), "ok");
+    assert_eq!(output_reach_of(&zone, &ps, true, Some(true)), "ok");
 }
 
 #[test]
@@ -74,7 +80,7 @@ fn zone_navigateur_sans_personne_au_bout_est_signalee() {
     let zone = zone_with(Some("browser"), None);
     let ps = browser_playing_since(Duration::from_secs(60));
     assert_eq!(
-        output_reach_of(&zone, &ps, false),
+        output_reach_of(&zone, &ps, false, Some(true)),
         "browser_unattended",
         "une minute de lecture sans un octet tiré : personne n'écoute"
     );
@@ -92,7 +98,7 @@ fn le_bandeau_bascule_a_linstant_ou_le_poller_renonce() {
     let zone = zone_with(Some("browser"), None);
     let seuil = tune_core::poller::DELAI_SILENCE_ETABLI;
     assert_eq!(
-        output_reach_of(&zone, &browser_playing_since(seuil), false),
+        output_reach_of(&zone, &browser_playing_since(seuil), false, Some(true)),
         "browser_unattended",
         "à l'échéance du poller, le client doit déjà savoir pourquoi"
     );
@@ -100,7 +106,8 @@ fn le_bandeau_bascule_a_linstant_ou_le_poller_renonce() {
         output_reach_of(
             &zone,
             &browser_playing_since(seuil - Duration::from_secs(1)),
-            false
+            false,
+            Some(true)
         ),
         "ok",
         "une seconde avant, l'onglet peut encore démarrer"
@@ -121,7 +128,7 @@ fn le_constat_de_silence_survit_a_larret() {
     ps.state = PlayState::Stopped;
     ps.browser_unattended_at = Some(Instant::now());
     assert_eq!(
-        output_reach_of(&zone, &ps, false),
+        output_reach_of(&zone, &ps, false, Some(true)),
         "browser_unattended",
         "arrêtée juste après le constat, la zone doit encore dire pourquoi"
     );
@@ -134,7 +141,7 @@ fn le_constat_de_silence_finit_par_se_taire() {
     ps.state = PlayState::Stopped;
     ps.browser_unattended_at =
         Instant::now().checked_sub(BROWSER_UNATTENDED_RETENTION + Duration::from_secs(1));
-    assert_eq!(output_reach_of(&zone, &ps, false), "ok");
+    assert_eq!(output_reach_of(&zone, &ps, false, Some(true)), "ok");
 }
 /// Une zone à l'arrêt qui n'a jamais rien eu à expliquer se tait.
 ///
@@ -146,7 +153,7 @@ fn zone_a_larret_sans_constat_ne_dit_rien() {
     let mut ps = browser_playing_since(Duration::from_secs(60));
     ps.state = PlayState::Stopped;
     assert_eq!(
-        output_reach_of(&zone, &ps, false),
+        output_reach_of(&zone, &ps, false, Some(true)),
         "ok",
         "aucun silence constaté : rien à dire"
     );
@@ -161,7 +168,7 @@ fn une_lecture_recue_ignore_le_constat_precedent() {
     let zone = zone_with(Some("browser"), None);
     let mut ps = browser_playing_since(Duration::from_secs(60));
     ps.browser_unattended_at = Some(Instant::now());
-    assert_eq!(output_reach_of(&zone, &ps, true), "ok");
+    assert_eq!(output_reach_of(&zone, &ps, true, Some(true)), "ok");
 }
 #[test]
 fn etat_restaure_ne_conclut_rien() {
@@ -178,5 +185,68 @@ fn etat_restaure_ne_conclut_rien() {
         last_play_started_at: None,
         ..Default::default()
     };
-    assert_eq!(output_reach_of(&zone, &ps, false), "ok");
+    assert_eq!(output_reach_of(&zone, &ps, false, Some(true)), "ok");
+}
+
+// ---------------------------------------------------------------------------
+// #4601 / #4580 — l'appareil est nommé, mais le registre vivant l'a perdu
+// ---------------------------------------------------------------------------
+
+/// Deux testeurs ont SUPPRIMÉ ET RECRÉÉ une zone pour la faire refonctionner.
+/// `output_reach` ne savait dire que « pas de sortie du tout » et « l'onglet
+/// ne tire rien ». Une zone dont l'appareil a disparu du registre — renderer
+/// DLNA qui change d'identifiant en redémarrant, bail DHCP renouvelé —
+/// rendait `ok`, et l'écran n'avait rien à dire.
+#[test]
+fn un_appareil_disparu_du_registre_se_dit() {
+    let zone = zone_with(Some("dlna"), Some("uuid:eversolo-a8"));
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, Some(false)),
+        "output_missing"
+    );
+}
+
+#[test]
+fn le_meme_appareil_present_ne_dit_rien() {
+    // Contre-épreuve du cas ci-dessus : c'est bien l'ABSENCE qui parle, pas
+    // le type de sortie ni l'identifiant.
+    let zone = zone_with(Some("dlna"), Some("uuid:eversolo-a8"));
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, Some(true)),
+        "ok"
+    );
+}
+
+#[test]
+fn ne_rien_savoir_ne_vaut_pas_absent() {
+    // 🔴 `None` = on n'a pas regardé. On préfère taire un défaut réel que
+    // d'en inventer un — la même discipline que `last_play_started_at`.
+    let zone = zone_with(Some("dlna"), Some("uuid:eversolo-a8"));
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, None),
+        "ok"
+    );
+}
+
+#[test]
+fn une_zone_sans_appareil_reste_no_output() {
+    // L'ordre des tests compte : « pas d'appareil du tout » prime sur
+    // « appareil introuvable », sinon la zone jamais configurée recevrait le
+    // message qui promet un rattachement automatique.
+    let zone = zone_with(Some("local"), None);
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, Some(false)),
+        "no_output"
+    );
+}
+
+#[test]
+fn une_zone_navigateur_ne_cherche_aucun_appareil() {
+    // Sa sortie est un onglet, pas une entrée du registre : même en lui
+    // affirmant l'absence, elle garde son propre verdict.
+    let zone = zone_with(Some("browser"), Some("browser"));
+    assert_eq!(
+        output_reach_of(&zone, &ZoneState::default(), false, Some(false)),
+        "ok"
+    );
 }
