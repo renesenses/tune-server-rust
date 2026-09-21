@@ -196,8 +196,25 @@ fn spawn_asio_warm_scan() {
     // Fermer la porte SYNCHRONEMENT avant de lancer le thread : une requête
     // réglages/diagnostic ne doit pas profiter de son délai de démarrage.
     // Réarmer le témoin autorisera le prochain processus, pas celui-ci.
-    if decision != AsioWarmDecision::Run {
-        tune_core::outputs::local::block_asio_device_enumeration();
+    //
+    // #4556 — le MOTIF et le chemin du TÉMOIN partent avec le blocage. Sans
+    // eux, le refus de lecture qui en découlera trois étapes plus loin ne peut
+    // ni nommer la cause ni indiquer le geste, et l'utilisateur lit « vérifiez
+    // qu'elle est branchée et allumée » pour un DAC parfaitement branché.
+    match decision {
+        AsioWarmDecision::Run => {}
+        AsioWarmDecision::SkippedByEnv => {
+            tune_core::outputs::local::block_asio_device_enumeration(
+                tune_core::outputs::asio_blocage_4556::MotifDeBlocage::ParEnvironnement,
+                None,
+            );
+        }
+        AsioWarmDecision::SkippedAfterCrash => {
+            tune_core::outputs::local::block_asio_device_enumeration(
+                tune_core::outputs::asio_blocage_4556::MotifDeBlocage::ApresPlantage,
+                Some(&sentinel.display().to_string()),
+            );
+        }
     }
 
     tokio::task::spawn_blocking(move || match decision {
@@ -1554,7 +1571,22 @@ pub async fn register_local_outputs(state: &AppState) {
     // When ASIO is selected AND the host actually responded but exposed no devices,
     // also enumerate WASAPI so the user still has fallback outputs available.
     if devices.is_empty() && scan.is_some() && audio_backend.eq_ignore_ascii_case("asio") {
-        warn!("asio_returned_no_devices — also enumerating WASAPI as fallback");
+        // #4556 — dire POURQUOI l'hôte ASIO n'a rien rendu.
+        //
+        // Deux causes très différentes tombaient sur la même ligne : l'hôte a
+        // répondu « aucun pilote », ou le coupe-circuit de démarrage a servi un
+        // cache vide sans ouvrir quoi que ce soit. Dans le second cas le parc
+        // publié pour tout ce démarrage est un REPLI : c'est la constatation —
+        // mesurée, pas déduite d'un fichier qui traîne — qui autorise le refus
+        // de lecture à nommer ASIO au lieu d'accuser le câble.
+        let coupe_circuit = tune_core::outputs::asio_blocage_4556::enumeration_bloquee();
+        warn!(
+            coupe_circuit,
+            "asio_returned_no_devices — also enumerating WASAPI as fallback"
+        );
+        if coupe_circuit {
+            tune_core::outputs::asio_blocage_4556::noter_repli_wasapi_apres_blocage();
+        }
         devices = scan_devices("wasapi".to_string()).await.unwrap_or_default();
     }
     if !devices.is_empty() {
@@ -2895,12 +2927,72 @@ mod asio_scan_boot_4168_tests {
             .unwrap()
             .0;
         let block = body
-            .find("block_asio_device_enumeration()")
+            .find("block_asio_device_enumeration(")
             .expect("le témoin de crash ne ferme plus les listes ASIO à la demande (#4168)");
-        assert!(body.find("if decision != AsioWarmDecision::Run").unwrap() < block);
+        assert!(body.find("match decision {").unwrap() < block);
         assert!(
             block < body.find("tokio::task::spawn_blocking").unwrap(),
             "la fermeture ASIO doit précéder toute course avec une requête réglages"
+        );
+    }
+}
+
+/// #4556 — les gardes de texte du coupe-circuit ASIO.
+///
+/// HORS de `feature = "local-audio"` à dessein : le job `test` de la CI
+/// compile `--no-default-features`, et une garde posée derrière cette
+/// fonctionnalité ne serait jamais exécutée sur une PR. `include_str!` lit le
+/// texte du fichier quelles que soient les `cfg`.
+#[cfg(test)]
+mod asio_blocage_4556_guard {
+    /// #4556 — le blocage doit partir AVEC son motif et le chemin du témoin.
+    ///
+    /// Sans eux, `gate_or_rebind_offline_zone` n'a rien à raconter et
+    /// l'utilisateur relit « vérifiez qu'elle est branchée et allumée » sur un
+    /// DAC que Windows voit parfaitement (Marco Polo, fil 1852).
+    #[test]
+    fn le_blocage_emporte_son_motif_et_le_chemin_du_temoin() {
+        let source = include_str!("startup.rs");
+        let body = source
+            .split_once("fn spawn_asio_warm_scan()")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        for attendu in [
+            "MotifDeBlocage::ParEnvironnement",
+            "MotifDeBlocage::ApresPlantage",
+            "Some(&sentinel.display().to_string())",
+        ] {
+            assert!(
+                body.contains(attendu),
+                "le blocage ASIO ne porte plus « {attendu} » : le refus de lecture \
+                 redeviendrait muet sur la cause (#4556)"
+            );
+        }
+    }
+
+    /// Le repli WASAPI doit être NOTÉ, et seulement quand le coupe-circuit est
+    /// bien la cause : un témoin oublié sur une machine réglée en WASAPI ne
+    /// doit pas faire accuser ASIO.
+    #[test]
+    fn le_repli_wasapi_est_note_quand_le_coupe_circuit_est_ferme() {
+        let source = include_str!("startup.rs");
+        let repli = source
+            .find("asio_returned_no_devices")
+            .expect("le repli WASAPI a disparu de register_local_outputs");
+        let suite = &source[repli..];
+        let note = suite
+            .find("noter_repli_wasapi_apres_blocage()")
+            .expect("le repli WASAPI n'est plus noté : le refus ne pourra pas nommer ASIO (#4556)");
+        let garde = suite
+            .find("if coupe_circuit {")
+            .expect("le repli doit n'être noté que si le coupe-circuit est fermé (#4556)");
+        assert!(
+            garde < note,
+            "la note doit être GARDÉE par l'état du coupe-circuit, sinon un parc \
+             WASAPI légitime ferait accuser ASIO"
         );
     }
 }

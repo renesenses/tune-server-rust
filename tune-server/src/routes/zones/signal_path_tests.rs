@@ -331,10 +331,15 @@ fn eq_step_exposes_per_channel_headroom_and_no_limiter() {
     )
     .unwrap();
 
-    // #4073 : la réserve est le PLUS GRAND de la somme des gains positifs
-    // (9,0 / 6,0 dB) et de la norme L1 de la cascade — ici 10,476 / 7,165 dB,
-    // parce que deux cloches empilées à 1 kHz sonnent au-delà de leur gain
-    // crête. Le panneau annonce ce qui est RÉELLEMENT retiré au signal.
+    // La réserve est la norme L1 de la cascade — ici 10,486 / 7,175 dB, marge
+    // de troncature comprise — et non plus la somme des gains positifs
+    // (9,0 / 6,0 dB) : deux cloches empilées à 1 kHz sonnent au-delà de leur
+    // gain crête, et depuis #4594 c'est cette borne-là, seule, qui est
+    // réservée. Le panneau lit `automatic_headroom_db` à chaud : il annonce
+    // donc toujours ce qui est RÉELLEMENT retiré au signal, sans qu'une
+    // valeur soit recopiée quelque part. Le verdict bit-perfect, lui, ne
+    // dépend pas du chiffre mais de l'EXISTENCE d'un EQ actif
+    // (`zone_eq_alters_signal`) : il reste faux.
     assert_eq!(
         step_desc(&sp, "DSP").as_deref(),
         Some("EQ actif (pré-gain auto G -10.5 dB / D -7.2 dB, sans limiteur)")
@@ -3249,5 +3254,178 @@ fn le_conteneur_reecrit_ne_s_annonce_que_la_ou_il_a_lieu_4350() {
     assert!(
         etape(&sp, "Transcoder").is_none(),
         "sortie locale : aucune réécriture de conteneur — {sp}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #4573 — la réduction de canaux du chemin RÉSEAU, dite à l'écran.
+//
+// Mesure de Xavier Joly (20/09/2026, Denon AVR-X1600H) : le Sink annonce du
+// LPCM en `channels=1` et `channels=2` seulement. Avant ce lot, Tune lui
+// servait le FLAC 5.1 tel quel et l'écran n'en disait rien — `wire.channels`
+// n'était lu NULLE PART dans ce panneau, et la sonde `runtime_signal_path`
+// est fermée aux zones non locales.
+// ---------------------------------------------------------------------------
+
+/// Une piste multicanale en base, et l'état qui la joue. `canaux_du_fil` est
+/// ce que la SESSION sert vraiment au renderer : 2 après le repli, 6 sans.
+fn piste_multicanale(backend: &Arc<dyn DbBackend>, canaux_source: i32) -> (i64, ZoneState) {
+    let mut t = tune_core::db::models::Track::new("Piste 5.1".into());
+    t.format = Some("flac".into());
+    t.sample_rate = Some(48_000);
+    t.bit_depth = Some(24);
+    t.channels = canaux_source;
+    let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+    let np = NowPlaying {
+        title: "Piste 5.1".into(),
+        track_id: Some(tid),
+        format: Some("flac".into()),
+        sample_rate: Some(48_000),
+        bit_depth: Some(24),
+        stream_id: Some("sid-1".into()),
+        ..Default::default()
+    };
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(np),
+        volume: 1.0,
+        ..Default::default()
+    };
+    (tid, ps)
+}
+
+fn fil_de_canaux(format: &str, canaux: u16) -> StreamInfo {
+    StreamInfo {
+        format: format.into(),
+        sample_rate: 48_000,
+        bit_depth: 24,
+        channels: canaux,
+        ..Default::default()
+    }
+}
+
+/// 🔴 LE témoin : 5.1 en base, deux canaux sur le fil, zone DLNA — l'écran le
+/// dit. Rouge avant ce lot : aucune étape « Canaux » n'existait pour une zone
+/// réseau, quel que soit le contenu du fil.
+#[test]
+fn le_repli_en_stereo_vers_un_renderer_est_dit_a_l_ecran() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = piste_multicanale(&backend, 6);
+    let v = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        "CoreAudio",
+        Some(&fil_de_canaux("wav", 2)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_desc(&v, "Canaux").as_deref(),
+        Some("6 \u{2192} 2 canaux (annoncés par le lecteur)")
+    );
+    let etape = v["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "Canaux")
+        .unwrap();
+    assert_eq!(
+        etape["bit_perfect"], false,
+        "un mélange BS.775 n'est pas un passthrough"
+    );
+}
+
+/// 🔴 La contre-épreuve qui compte : le fil porte les SIX voies — le renderer
+/// n'a rien déclaré, donc rien n'a été replié. Pas d'étape, pas d'étiquette.
+#[test]
+fn un_fil_qui_porte_toutes_les_voies_n_affiche_aucune_reduction() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = piste_multicanale(&backend, 6);
+    let v = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        "CoreAudio",
+        Some(&fil_de_canaux("flac", 6)),
+    )
+    .unwrap();
+    assert_eq!(step_desc(&v, "Canaux"), None);
+}
+
+/// Une stéréo ordinaire — l'immense majorité des lectures — ne gagne aucune
+/// étape. Sans cette garde, le panneau se serait mis à parler de canaux sur
+/// chaque piste.
+#[test]
+fn une_stereo_ordinaire_ne_gagne_aucune_etape_de_canaux() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = piste_multicanale(&backend, 2);
+    let v = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        "CoreAudio",
+        Some(&fil_de_canaux("flac", 2)),
+    )
+    .unwrap();
+    assert_eq!(step_desc(&v, "Canaux"), None);
+}
+
+/// Une session qui ne connaît pas encore ses canaux (`StreamInfo::default`,
+/// `channels = 0`) n'est pas une déclaration de silence : rien à dire.
+#[test]
+fn un_fil_muet_sur_ses_canaux_n_affiche_rien() {
+    let (backend, zone) = dlna_zone_migrated();
+    let (_tid, ps) = piste_multicanale(&backend, 6);
+    let v = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        "CoreAudio",
+        Some(&fil_de_canaux("flac", 0)),
+    )
+    .unwrap();
+    assert_eq!(step_desc(&v, "Canaux"), None);
+}
+
+/// 🔴 #4573 — LA contre-épreuve du branchement, par la porte publique de
+/// l'orchestrateur : une piste déclarée à SIX voies en base, une zone DLNA
+/// dont l'appareil n'est dans AUCUN registre — donc personne pour déclarer
+/// quoi que ce soit. Rien ne doit être replié.
+///
+/// C'est le cas de l'immense majorité du parc : un renderer dont le Sink ne
+/// porte aucun `channels=` (le Denon de Xavier pour `audio/flac:*`) ou qu'on
+/// n'a pas pu sonder. Réduire là-dessus ferait taire quatre voies sur six
+/// chez quelqu'un qui n'a rien demandé.
+#[tokio::test]
+async fn sans_declaration_du_renderer_un_51_garde_ses_six_voies() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/test.flac"
+    );
+    let mut t = tune_core::db::models::Track::new("Piste 5.1".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some("flac".into());
+    t.sample_rate = Some(48_000);
+    t.bit_depth = Some(24);
+    // Ce que la DÉCISION lit : la ligne `tracks`, pas le fichier.
+    t.channels = 6;
+    t.file_size = std::fs::metadata(chemin).ok().map(|m| m.len() as i64);
+    t.source = "local".into();
+    let track_id = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .create(&t)
+        .unwrap();
+
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.channels,
+        Some(6),
+        "aucun renderer n'a déclaré ses canaux : la piste part intacte"
     );
 }

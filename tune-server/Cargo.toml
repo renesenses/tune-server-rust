@@ -171,6 +171,12 @@ path = "tests/server_contracts.rs"
 name = "album_lecture_en_double"
 path = "tests/album_lecture_en_double.rs"
 
+# #4521 — le DR de chaque album de `GET /library/albums`, par la règle de la
+# fiche, et son coût sur une base synthétique (épreuve `#[ignore]`).
+[[test]]
+name = "dr_liste_albums_4521"
+path = "tests/dr_liste_albums_4521.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois

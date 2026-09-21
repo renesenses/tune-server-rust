@@ -27,7 +27,7 @@ use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
     OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransformationsReelles, TransportState,
+    SuivantePreparee, TransformationsReelles, TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
@@ -273,6 +273,15 @@ const TICKS_GELE_DLNA_AVEC_SETNEXT: u8 = 1;
 /// `SetAVTransportURI` + `Play` — le repli d'avant, sur la bonne piste. Voir
 /// [`decisions::suite_de_l_adoption`].
 const ADOPTION_HORLOGE_DELAI_SECS: u64 = 8;
+/// #3967 — le même délai, mais pour une adoption qui suit une CONSIGNE et non
+/// un constat : on vient d'envoyer `Next` à un renderer qui tient déjà la
+/// suivante et son tampon. S'il l'honore, il repart en un ou deux sondages —
+/// il n'a rien à télécharger. Trois secondes bornent donc ce que coûte un
+/// appareil qui acquitte `Next` sans bouger : trois secondes, puis le repli
+/// d'aujourd'hui, à l'identique et sur la BONNE piste. Les huit secondes de
+/// [`ADOPTION_HORLOGE_DELAI_SECS`] couvrent un cas différent — un renderer
+/// qu'on a seulement OBSERVÉ, et qui peut encore être en train de charger.
+const BASCULE_DELAI_SECS: u64 = 3;
 /// Minimum consecutive failed status polls before the DLNA wall-clock poll-fail
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.

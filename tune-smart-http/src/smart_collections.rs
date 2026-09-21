@@ -953,24 +953,14 @@ async fn avec_albums_de_catalogue(
     rules_json: &str,
     max_limit: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
-    let Some(service) = catalogue::service_du_catalogue(rules_json) else {
-        return Ok(albums);
+    // 🔴 La lecture des règles est celle de `catalogue::lire`, partagée avec le
+    // chemin des PISTES : le service, la cible et les refus se décident à un
+    // seul endroit (#4473, second volet).
+    let demande = match catalogue::lire(rules_json, catalogue::Objet::Album) {
+        catalogue::Lecture::Aucune => return Ok(albums),
+        catalogue::Lecture::Refus(motif) => return Err(AppError::bad_request(motif)),
+        catalogue::Lecture::Demande(d) => d,
     };
-    let Some(cible) = catalogue::cible(rules_json) else {
-        return Err(AppError::bad_request(
-            "Une règle « catalogue » doit nommer un artiste ou un album : \
-             aucun service ne sait énumérer son catalogue.",
-        ));
-    };
-    // Ce que le service ne saurait pas filtrer : refusé, et nommé (#4473).
-    let hors_service = catalogue::regles_hors_service(rules_json);
-    if !hors_service.is_empty() {
-        return Err(AppError::bad_request(format!(
-            "Le catalogue d'un service ne sait chercher qu'un artiste ou un album \
-             (égalité). Ces règles ne peuvent pas s'y appliquer : {}.",
-            hors_service.join(", ")
-        )));
-    }
     // 🔴 On CLONE l'Arc au lieu d'en garder une référence : ce qui vit en
     // travers d'un `.await` doit être `Send`, et une référence à l'état ne
     // l'est pas ici. Sans ça, axum refuse le handler tout entier.
@@ -980,15 +970,14 @@ async fn avec_albums_de_catalogue(
         ));
     };
 
-    let mut trouves = match &cible {
+    let service = demande.service;
+    let mut trouves = match &demande.cible {
         catalogue::Cible::Artiste(nom) => distant.albums_par_artiste(&service, nom).await,
         catalogue::Cible::Album(titre) => distant.albums_par_titre(&service, titre).await,
     };
     // « artiste Coltrane ET album Blue Train » : la recherche part de
     // l'artiste, le titre trie encore ce qu'elle rend.
-    if let (catalogue::Cible::Artiste(_), Some(titre)) =
-        (&cible, catalogue::titre_exige(rules_json))
-    {
+    if let (catalogue::Cible::Artiste(_), Some(titre)) = (&demande.cible, &demande.titre_album) {
         let titre = titre.to_lowercase();
         trouves.retain(|a| a.title.trim().to_lowercase() == titre);
     }
@@ -1623,6 +1612,9 @@ mod tests {
             async fn pistes_par_artiste(&self, _s: &str, _n: &str) -> Vec<PisteDistante> {
                 Vec::new()
             }
+            async fn pistes_par_album(&self, _s: &str, _t: &str) -> Vec<PisteDistante> {
+                Vec::new()
+            }
         }
 
         fn etat(avec_service: bool) -> SmartHttpState {
@@ -1757,8 +1749,17 @@ mod tests {
             let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
                         {"field":"artist","op":"=","value":"John Coltrane"},
                         {"field":"format","op":"=","value":"FLAC"}]"#;
-            let r = super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), r, None).await;
-            assert!(r.is_err(), "format : le service ne sait pas le filtrer");
+            let Err(e) =
+                super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), r, None).await
+            else {
+                panic!("format : le service ne sait pas le filtrer")
+            };
+            // Refusée en la NOMMANT, jamais ignorée en silence (#4473).
+            assert!(
+                e.message.contains("format ="),
+                "le refus doit nommer la règle : {}",
+                e.message
+            );
         }
 
         /// Artiste ET titre : le titre trie ce que la recherche par artiste rend.

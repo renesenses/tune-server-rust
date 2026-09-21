@@ -58,12 +58,19 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             cover_url TEXT,\
             created_at TEXT,\
             position TEXT,\
+            first_seen_at TEXT,\
             UNIQUE(profile_id, item_type, service, service_id)\
         )",
     // Rang manuel (#2001 piste 2) sur une base ou la table PRE-EXISTE : le
     // CREATE IF NOT EXISTS ci-dessus ne l'a alors pas ajoutee. Instruction
     // separee, car une table qui echoue ne doit jamais bloquer la suivante.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT",
+    // Date de premiere vue LOCALE (web #1060, migration PG 067). Instruction
+    // separee, meme raison que `position` : une table qui echoue ne doit
+    // jamais bloquer la suivante. Aucune valeur n'est reprise ici — c'est le
+    // travail de la migration 067, qui ne tourne qu'une fois ; laisser NULL
+    // fait simplement retomber le client sur la date du service.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS first_seen_at TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so

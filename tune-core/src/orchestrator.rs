@@ -782,6 +782,14 @@ pub struct PlaybackOrchestrator {
     /// LAT-F1 (phase 1) : réponses CONCLUANTES de `dlna_accepte_lpcm`, par
     /// `device_id|profondeur`. Les sondes inconcluantes n'y entrent pas.
     dlna_lpcm_accepte: Mutex<HashMap<String, bool>>,
+    /// #4573 — ce que le Sink du renderer ANNONCE en nombre de canaux, par
+    /// `device_id`. `Some(None)` veut dire « le Sink a été lu, il ne porte
+    /// aucun `channels=` » : une ignorance MESURÉE, qui ne fait rien réduire
+    /// mais qu'il est inutile de re-sonder à chaque piste. Une sonde
+    /// INCONCLUANTE (SOAP en échec, Sink vide) n'entre jamais dans cette
+    /// table — même règle que `dlna_lpcm_accepte` : un renderer endormi au
+    /// démarrage ne doit pas se voir coller un verdict pour la session.
+    dlna_canaux_max: Mutex<HashMap<String, Option<u16>>>,
     /// Zones dont une résolution gapless est en cours : les sessions créées
     /// pendant cette fenêtre pré-chargent la piste SUIVANTE — leur attacher
     /// un forwarder de niveaux daterait les fenêtres avec l'horloge de la
@@ -1164,6 +1172,7 @@ impl PlaybackOrchestrator {
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
+            dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashSet::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1499,3 +1508,12 @@ mod recreation_locale_guard;
 
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
+
+/// #4556 — le refus de lecture quand le coupe-circuit ASIO a vidé le parc.
+///
+/// Hors de toute `feature` : `refus_de_zone_hors_ligne` est une fonction pure
+/// et la garde du site d'appel lit le TEXTE de `transport.rs`, si bien que
+/// l'ensemble tourne dans le jeu `--no-default-features` du job `test` de la
+/// CI — celui des PR vers `batch/*` — et pas seulement sous `local-audio`.
+#[cfg(test)]
+mod refus_asio_bloque_4556;

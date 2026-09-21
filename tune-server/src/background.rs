@@ -1872,7 +1872,7 @@ async fn refresh_account_premium(
     license: &Arc<tune_core::license::LicenseManager>,
     services: &Arc<tokio::sync::Mutex<tune_core::streaming::ServiceRegistry>>,
 ) {
-    use tune_core::cloud::sso::{DEFAULT_CLIENT_ID, MozaikAuth};
+    use tune_core::cloud::sso::{DEFAULT_CLIENT_ID, MozaikAuth, ProfilCloud};
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
 
@@ -1899,9 +1899,29 @@ async fn refresh_account_premium(
     let auth = MozaikAuth::new(client_id, base_url.as_deref());
 
     // Try the current token; if it fails (likely expired), refresh once & retry.
-    let user = match auth.get_user(&token).await {
-        Ok(u) => Some(u),
-        Err(_) => {
+    //
+    // 🔴 « Likely expired » n'est vrai que d'un VRAI échec. Un 429 n'apprend
+    // rien sur le jeton : le relire comme une expiration déclenchait une ronde
+    // `refresh_token` pour rien — elle FAIT TOURNER le jeton de rafraîchissement
+    // — puis un second `GET /api/v1/user` refusé par le même throttle. Deux
+    // requêtes de plus sur une porte déjà fermée. Un report se rend tout de
+    // suite, sans rien réécrire.
+    let user = match auth.get_user(&settings, &token).await {
+        ProfilCloud::Profil(u) => Some(*u),
+        ProfilCloud::Differe {
+            retry_after_seconds,
+        } => {
+            // ⛔ Sortie SANS écriture : `mozaik_user` garde sa valeur, et la
+            // licence garde `premium` comme `modules`. Un throttle d'une minute
+            // ne doit pas faire disparaître une sortie payée de la découverte.
+            debug!(
+                retry_after_seconds,
+                "mozaik_account_refresh_deferred_rate_limit"
+            );
+            return;
+        }
+        ProfilCloud::Echec(e) => {
+            debug!(error = %e, "mozaik_user_fetch_failed");
             let refresh = settings
                 .get("mozaik_refresh_token")
                 .ok()
@@ -1914,7 +1934,7 @@ async fn refresh_account_premium(
                         if let Some(ref new_rt) = tok.refresh_token {
                             settings.set("mozaik_refresh_token", new_rt).ok();
                         }
-                        auth.get_user(&tok.access_token).await.ok()
+                        auth.get_user(&settings, &tok.access_token).await.profil()
                     }
                     Err(e) => {
                         debug!(error = %e, "mozaik_token_refresh_failed");
@@ -4039,6 +4059,186 @@ mod superviseur_oaat_3727_tests {
             pos_muet < pos_relance,
             "la cause « endpoint muet » doit être lue AVANT la relance, sinon le \
              superviseur relance encore en boucle sans la nommer (#3727)"
+        );
+    }
+}
+
+/// 🔴 Le point qui décide si un throttle d'une minute coûte un appareil payé :
+/// le BATTEMENT, celui qui relit le profil du compte toutes les heures.
+///
+/// L'inspection de source ne suffisait pas ici — on éprouve la fonction pour
+/// de vrai, contre un `mozaiklabs` local (`mozaik_base_url`).
+#[cfg(test)]
+mod tests_battement_profil_throttle {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use axum::http::{HeaderValue, StatusCode, header};
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::migrations;
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::license::LicenseManager;
+    use tune_core::streaming::registry::ServiceRegistry;
+
+    const JETON_INITIAL: &str = "jeton-initial";
+    const JETON_NEUF: &str = "jeton-neuf";
+
+    /// Un `mozaiklabs` local : `/api/v1/user` rend `statut_profil`, et
+    /// `/oauth/token` rend toujours un jeton NEUF (pour que la rotation, si
+    /// elle a lieu, soit visible dans les réglages).
+    async fn mozaiklabs_local(statut_profil: u16) -> (String, Arc<AtomicU64>) {
+        let profils = Arc::new(AtomicU64::new(0));
+        let compteur = profils.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/user",
+                axum::routing::get(move || {
+                    let compteur = compteur.clone();
+                    async move {
+                        compteur.fetch_add(1, Ordering::SeqCst);
+                        let mut reponse =
+                            axum::response::Response::new(axum::body::Body::from("{}"));
+                        *reponse.status_mut() = StatusCode::from_u16(statut_profil).unwrap();
+                        reponse.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                        if statut_profil == 429 {
+                            reponse
+                                .headers_mut()
+                                .insert(header::RETRY_AFTER, HeaderValue::from_static("47"));
+                        }
+                        reponse
+                    }
+                }),
+            )
+            .route(
+                "/oauth/token",
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({
+                        "access_token": JETON_NEUF,
+                        "refresh_token": "rafraichi-neuf",
+                        "expires_in": 3600,
+                    }))
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), profils)
+    }
+
+    /// Un serveur déjà connecté, dont le compte possède le module « diretta ».
+    fn banc(base_url: &str) -> (Arc<dyn DbBackend>, Arc<LicenseManager>, SettingsRepo) {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        settings.set("mozaik_base_url", base_url).unwrap();
+        settings.set("mozaik_access_token", JETON_INITIAL).unwrap();
+        settings
+            .set("mozaik_refresh_token", "rafraichi-initial")
+            .unwrap();
+        settings
+            .set(
+                "mozaik_user",
+                r#"{"id":7,"email":"ludovic@exemple.test","display_name":"Ludovic","is_admin":false,"premium":true,"modules":["diretta"]}"#,
+            )
+            .unwrap();
+        let license = Arc::new(LicenseManager::new(backend.clone()));
+        (backend, license, settings)
+    }
+
+    async fn battre(backend: &Arc<dyn DbBackend>, license: &Arc<LicenseManager>) {
+        let services = Arc::new(tokio::sync::Mutex::new(ServiceRegistry::new()));
+        super::refresh_account_premium(backend, license, &services).await;
+    }
+
+    /// PREMIER SENS — un 429 ne doit RIEN coûter à l'acquis.
+    ///
+    /// `modules` porte les SKU payants et `discovery_setup` garde la découverte
+    /// des sorties derrière eux : si un throttle d'une minute vidait cet acquis,
+    /// la cible Diretta du testeur disparaîtrait de la découverte.
+    ///
+    /// La garde éprouve AUSSI la conséquence la plus discrète : avant, un 429
+    /// était lu comme « jeton probablement expiré », ce qui déclenchait une
+    /// ronde `refresh_token` — donc une ROTATION du jeton de rafraîchissement —
+    /// puis un second `GET /api/v1/user` refusé par le même throttle. Deux
+    /// requêtes de plus sur une porte fermée, et un jeton brûlé pour rien.
+    #[tokio::test]
+    async fn un_429_conserve_les_modules_et_ne_fait_pas_tourner_le_jeton() {
+        let (base, profils) = mozaiklabs_local(429).await;
+        let (backend, license, settings) = banc(&base);
+        license.set_modules(vec!["diretta".to_string()]).await;
+
+        battre(&backend, &license).await;
+
+        assert!(
+            license.has_module("diretta").await,
+            "un 429 transitoire a vide les droits de MODULE : la sortie Diretta \
+             disparait de la decouverte"
+        );
+        assert_eq!(
+            settings.get("mozaik_access_token").unwrap().as_deref(),
+            Some(JETON_INITIAL),
+            "le 429 a ete lu comme une expiration de jeton : la ronde \
+             `refresh_token` est partie et a fait tourner le jeton pour rien"
+        );
+        assert_eq!(
+            settings.get("mozaik_refresh_token").unwrap().as_deref(),
+            Some("rafraichi-initial"),
+            "le jeton de rafraichissement a ete brule sur un simple throttle"
+        );
+        assert_eq!(
+            profils.load(Ordering::SeqCst),
+            1,
+            "un throttle ne doit pas etre suivi d'un second appel au meme profil"
+        );
+        assert_eq!(
+            tune_core::cloud::rate_limit::active(
+                &settings,
+                tune_core::cloud::rate_limit::CloudScope::UserProfile
+            )
+            .map(|b| b.scope),
+            Some("user_profile"),
+            "l'echeance du 429 doit etre memorisee par le chemin borne commun"
+        );
+    }
+
+    /// SECOND SENS — sans lui, la correction aurait éteint l'alarme.
+    ///
+    /// Un 401 reste un jeton mort : la ronde `refresh_token` DOIT partir, sinon
+    /// un serveur dont le jeton a expiré ne se relèverait plus jamais.
+    #[tokio::test]
+    async fn un_401_declenche_toujours_le_rafraichissement_du_jeton() {
+        let (base, profils) = mozaiklabs_local(401).await;
+        let (backend, license, settings) = banc(&base);
+
+        battre(&backend, &license).await;
+
+        assert_eq!(
+            settings.get("mozaik_access_token").unwrap().as_deref(),
+            Some(JETON_NEUF),
+            "un 401 doit toujours declencher la ronde `refresh_token`"
+        );
+        assert_eq!(
+            profils.load(Ordering::SeqCst),
+            2,
+            "le profil doit etre retente avec le jeton rafraichi"
+        );
+        assert!(
+            tune_core::cloud::rate_limit::active(
+                &settings,
+                tune_core::cloud::rate_limit::CloudScope::UserProfile
+            )
+            .is_none(),
+            "un 401 ne doit RIEN retenir : le prochain cycle doit repartir"
         );
     }
 }

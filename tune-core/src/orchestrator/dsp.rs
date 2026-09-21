@@ -76,13 +76,13 @@ pub(crate) struct RapportEqAChaud {
     /// Le pré-gain automatique, en dB, canal gauche puis droit.
     ///
     /// C'est la marge que l'égaliseur RETIRE au signal pour ne pas écrêter
-    /// (`EqProfile::automatic_headroom_db`, qui réserve le PLUS GRAND de la
-    /// somme des gains positifs et de la norme L1 de la cascade, plus la
-    /// résonance des `low_pass` / `high_pass` — #4073). Sur un profil qui
-    /// pousse beaucoup, c'est de lui
-    /// que vient une chute de niveau — mesurée jusqu'à -22,2 dB sur un profil
-    /// AutoEq réel (`tune-core/tests/autoeq_profils_reels.rs`) — et il ne se
-    /// lisait jusqu'ici dans aucun journal.
+    /// (`EqProfile::automatic_headroom_db`, qui réserve la norme L1 de la
+    /// cascade — la borne vraie — plus la résonance des `low_pass` /
+    /// `high_pass` ; #4073 puis #4594). Sur un profil qui pousse beaucoup,
+    /// c'est de lui que vient une chute de niveau — mesurée jusqu'à −12,4 dB
+    /// sur un profil AutoEq réel (`tune-core/tests/autoeq_profils_reels.rs`,
+    /// où elle valait −22,2 dB avant #4594) — et il ne se lisait jusqu'ici
+    /// dans aucun journal.
     pub(crate) preamp_db: Option<f64>,
     pub(crate) preamp_db_droite: Option<f64>,
 }

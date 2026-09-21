@@ -584,8 +584,9 @@ fn q1_un_carre_a_moins_0_05_dbfs_sous_un_plateau_grave_tient_grace_a_la_norme_l1
     let mut eq = EqProcessor::new(&p, FS, 1);
     let reserve = eq.preamp_db(0).expect("un canal");
     assert!(
-        (reserve + 6.5049).abs() < 1e-3,
-        "réserve = norme L1 du plateau, plus grande que la somme des gains (−6,0) : {reserve}"
+        (reserve + 6.5149).abs() < 1e-3,
+        "réserve = norme L1 du plateau (6,505 dB) plus la marge de troncature de \
+         #4594 (0,01), là où la somme des gains ne disait que 6,0 : {reserve}"
     );
     let x = carre(50.0, -0.05, N);
     let mut pcm = vers_pcm(&x, 24);
@@ -831,8 +832,9 @@ fn q2_la_chaine_replaygain_puis_egaliseur_sur_un_sinus_a_moins_0_1_dbfs() {
     let mut eq = EqProcessor::new(&profil(vec![bande("peak", 3000.0, 6.0, 1.0)]), FS, 1);
     let reserve = eq.preamp_db(0).expect("un canal");
     assert!(
-        (reserve + 7.1308).abs() < 1e-3,
-        "réserve = norme L1 de la cloche (7,13 dB), pas sa somme de gains (6,0) : {reserve}"
+        (reserve + 7.1408).abs() < 1e-3,
+        "réserve = norme L1 de la cloche (7,131 dB) plus la marge de troncature de \
+         #4594 (0,01), pas sa somme de gains (6,0) : {reserve}"
     );
     let stats = eq.process_pcm(&mut pcm, 16);
     let apres_eq = normalise(&depuis_pcm(&pcm, 16), 16);
@@ -1302,4 +1304,376 @@ fn q4_les_etages_desarmes_sont_l_identite_octet_pour_octet() {
     EqProcessor::new(&EqProfile::default(), FS, 1).process_interleaved(&mut flottant);
     CrossfeedProcessor::new(FS, 0.0, 0.3).process_interleaved(&mut flottant);
     assert_eq!(flottant, original, "chemin flottant désarmé");
+}
+
+// ═══════════ #4594 — la réserve et la cascade doivent voir les MÊMES bandes ═══════════
+
+/// La grille ISO à 10 bandes, celle des préréglages livrés
+/// (`tune_core::audio::eq_presets::GRILLE_10`, recopiée pour que ce fichier
+/// reste lisible seul).
+const GRILLE_10: [f64; 10] = [
+    31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+];
+
+fn dix_cloches(band_type: &str, gain: f64) -> EqProfile {
+    profil(
+        GRILLE_10
+            .iter()
+            .map(|f| bande(band_type, *f, gain, 1.0))
+            .collect(),
+    )
+}
+
+/// #4594 — un `type` de bande NON CANONIQUE pousse, et ne réservait RIEN.
+///
+/// `EqBandSpec::coeffs` range tout type inconnu en `peaking_eq` (son bras
+/// `_ =>`), et `POST /zones/{id}/eq` ne valide pas ce champ : `band_type` est
+/// un `String` nu, désérialisé par `filter_map(.. .ok())`. `"peaking"`,
+/// `"Peak"` ou `"bell"` traversent donc l'API, sont montés en cloches qui
+/// POUSSENT — et la somme des gains positifs les filtrait par LISTE BLANCHE
+/// (`"peak" | "low_shelf" | "high_shelf"`) là où la cascade les filtrait par
+/// LISTE NOIRE. Somme à zéro, terme L1 éteint avec elle (il n'entre que si au
+/// moins une bande pousse) : réserve 0 dB sur dix cloches à +6 dB.
+///
+/// **Mesuré avant le correctif**, sur `origin/main` 34227d75, sinus 1 kHz à
+/// −6 dBFS, 2 s, stéréo, à travers le chemin flottant qui ne sature pas :
+/// crête en sortie **1,731 (+4,77 dBFS)** et **107 192 overs sur 176 400 —
+/// 60,8 % des échantillons écrêtés dur**. Les mêmes bandes en `"peak"` :
+/// réserve −60,00 dB, crête 0,001731, **zéro** over.
+///
+/// Après : une seule porte, `EqBandSpec::est_une_bande_a_gain`, pour la somme
+/// comme pour la cascade.
+#[test]
+fn un_type_de_bande_non_canonique_reserve_comme_une_cloche_4594() {
+    // Le type non canonique franchit bien la porte d'entrée : c'est ce qui
+    // rend le défaut atteignable, pas seulement pensable.
+    let depuis_l_api: EqBandSpec =
+        serde_json::from_str(r#"{"freq":1000.0,"gain":6.0,"q":1.0,"type":"bell"}"#)
+            .expect("l'API accepte un type de bande quelconque");
+    assert_eq!(
+        depuis_l_api.band_type, "bell",
+        "le type est conservé tel quel, sans validation"
+    );
+
+    let canonique = dix_cloches("peak", 6.0).automatic_headroom_db(0);
+    assert!(
+        canonique <= -10.0,
+        "dix cloches canoniques à +6 dB réservent la borne vraie de leur \
+         cascade, −16,54 dB : {canonique}"
+    );
+
+    for etiquette in ["peaking", "PEAK", "bell", "Peak", "cloche"] {
+        let reserve = dix_cloches(etiquette, 6.0).automatic_headroom_db(0);
+        assert_eq!(
+            reserve, canonique,
+            "type «{etiquette}» : monté en cloche par coeffs(), il doit réserver \
+             comme une cloche — mesuré {reserve} dB au lieu de {canonique} dB"
+        );
+
+        // L'effet audible, et pas le raisonnement : plus un seul échantillon
+        // hors du rail sur le signal qui en écrêtait 60,8 %.
+        let mut eq = EqProcessor::new(&dix_cloches(etiquette, 6.0), FS, 2);
+        let mut buf = vec![0.0f32; N * 2];
+        for i in 0..N {
+            let v = (amplitude(-6.0) * (2.0 * PI * 1000.0 * i as f64 / FS as f64).sin()) as f32;
+            buf[i * 2] = v;
+            buf[i * 2 + 1] = v;
+        }
+        let stats = eq.process_interleaved(&mut buf);
+        assert_eq!(
+            stats.overs, 0,
+            "type «{etiquette}» : sinus 1 kHz à −6 dBFS, aucun échantillon ne doit \
+             sortir du rail après l'étage d'égalisation"
+        );
+        let crete = buf[N..].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            crete < 1.0,
+            "type «{etiquette}» : crête en sortie {crete} ({:.2} dBFS)",
+            dbfs(crete as f64)
+        );
+    }
+
+    // ── Contre-épreuves : la réserve ne s'est pas mise à apparaître partout ──
+
+    // Un profil de cloches non canoniques qui ne fait que CREUSER ne réserve
+    // rigoureusement rien — sinon ce correctif atténuerait un profil purement
+    // soustractif, ce que personne ne demande.
+    for etiquette in ["peak", "peaking", "bell"] {
+        let reserve = dix_cloches(etiquette, -6.0).automatic_headroom_db(0);
+        assert!(
+            reserve.abs() < 1e-9,
+            "type «{etiquette}» à −6 dB : aucune marge à réserver, mesuré {reserve}"
+        );
+    }
+
+    // Les `pass` et le `notch` restent HORS de la somme : leur champ `gain`
+    // n'est pas lu par `coeffs`, le réserver serait réserver pour rien. Un
+    // `low_pass` ne réserve que sa RÉSONANCE, inchangée.
+    for etiquette in ["low_pass", "high_pass", "notch"] {
+        let plat = profil(vec![bande(etiquette, 3000.0, 12.0, FRAC_1_SQRT_2)]);
+        assert!(
+            plat.automatic_headroom_db(0).abs() < 1e-9,
+            "type «{etiquette}» à Butterworth : son champ gain ne doit rien réserver"
+        );
+    }
+    let resonant = profil(vec![bande("low_pass", 3000.0, 0.0, 4.0)]);
+    assert!(
+        (resonant.automatic_headroom_db(0) - (-15.051_499_783_199_058)).abs() < 1e-9,
+        "le témoin voisin du passe-bas Q=4 est inchangé : {}",
+        resonant.automatic_headroom_db(0)
+    );
+}
+
+// ══════ #4594 — la réserve est la BORNE VRAIE, et le niveau revient ══════
+
+/// Le pire signal possible pour cette cascade : `x[n] = signe(h[−n])`.
+///
+/// C'est celui qui ATTEINT `‖h‖₁`, la borne dont `automatic_headroom_db_at`
+/// fait sa réserve. Aucune musique ne ressemble à ça — c'est le but : si la
+/// réserve tient ici, elle tient partout. `h` est pris sur le processeur
+/// EFFECTIVEMENT monté, réserve comprise, donc la sortie attendue vaut 1,0 au
+/// facteur de `MARGE_DE_TRONCATURE_DB` près.
+fn signal_adverse(p: &EqProfile, sr: u32, n: usize) -> Vec<f32> {
+    let mut eq = EqProcessor::new(p, sr, 1);
+    let mut h = vec![0.0f32; n];
+    h[0] = 1.0;
+    eq.process_interleaved(&mut h);
+    (0..n)
+        .map(|i| if h[n - 1 - i] >= 0.0 { 1.0f32 } else { -1.0f32 })
+        .collect()
+}
+
+fn carre_pleine_echelle(n: usize, sr: u32, freq: f64) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            if (2.0 * PI * freq * i as f64 / sr as f64).sin() >= 0.0 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
+}
+
+/// Bruit blanc pleine échelle, xorshift — déterministe, sans dépendance.
+fn bruit_pleine_echelle(n: usize) -> Vec<f32> {
+    let mut x = 0x2545_f491_4f6c_dd1d_u64;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32
+        })
+        .collect()
+}
+
+/// Crête et nombre d'overs après l'étage d'égalisation, chemin flottant.
+fn crete_et_overs(p: &EqProfile, sr: u32, signal: &[f32]) -> (f64, u64) {
+    let mut eq = EqProcessor::new(p, sr, 1);
+    let mut buf = signal.to_vec();
+    let stats = eq.process_interleaved(&mut buf);
+    let crete = buf.iter().fold(0.0f64, |m, s| m.max((*s as f64).abs()));
+    (crete, stats.overs)
+}
+
+/// #4594 — la réserve vaut la borne vraie, et les valeurs sont figées ici.
+///
+/// Arbitrage de Bertrand du 20/09 pour la v0.9.160 : la réserve n'est plus le
+/// `max()` de la somme des gains positifs et de la norme L1, mais **la norme
+/// L1 seule** — la seule borne qu'un signal borné ne peut pas dépasser. La
+/// somme majorait le maximum fréquentiel comme si toutes les bandes
+/// poussaient au même endroit ; sur un égaliseur graphique, où elles sont
+/// disjointes par construction, elle atténuait pour rien.
+///
+/// **Ce que l'auditeur entend** : le son REMONTE — de 6,6 dB sur `bass_boost`,
+/// 14,3 dB sur `rock`, 43,5 dB sur un profil expert de dix bandes à +6 dB. Qui
+/// avait compensé au volume devra le rebaisser d'autant.
+///
+/// ```text
+/// profil (44 100 Hz)      avant #4594   après #4594   rendu
+/// flat                        0,000 dB      0,000 dB   —
+/// bass_boost                −20,000 dB    −13,408 dB   +6,6 dB
+/// treble_boost              −24,000 dB    −12,334 dB  +11,7 dB
+/// loudness                  −27,000 dB    −13,741 dB  +13,3 dB
+/// rock                      −28,000 dB    −13,653 dB  +14,3 dB
+/// jazz                      −18,000 dB     −9,630 dB   +8,4 dB
+/// classical                   0,000 dB      0,000 dB   —
+/// dix cloches à +6 dB       −60,000 dB    −16,542 dB  +43,5 dB
+/// curseurs +6/+3             −9,000 dB     −8,272 dB   +0,7 dB
+/// curseurs +12/+12/+12      −36,000 dB    −19,970 dB  +16,0 dB
+/// ```
+#[test]
+fn la_reserve_de_chaque_prereglage_livre_est_la_borne_vraie_4594() {
+    let attendu = [
+        ("flat", 0.0),
+        ("bass_boost", -13.407_932_007_318_667_19),
+        ("treble_boost", -12.334_241_217_122_317_02),
+        ("loudness", -13.741_067_957_532_147_05),
+        ("rock", -13.653_372_806_391_917_75),
+        ("jazz", -9.629_790_433_680_865_29),
+        ("classical", 0.0),
+    ];
+    for (nom, reserve_attendue) in attendu {
+        let bandes = tune_core::audio::eq_presets::bandes(nom)
+            .unwrap_or_else(|| panic!("préréglage livré «{nom}»"));
+        let mesuree = profil(bandes).automatic_headroom_db(0);
+        assert!(
+            (mesuree - reserve_attendue).abs() < 1e-6,
+            "préréglage «{nom}» : réserve {mesuree} dB, attendu {reserve_attendue} dB — \
+             le niveau perçu de tout le parc vient de bouger"
+        );
+    }
+
+    // Les trois curseurs du profileur, sans aucune bande expert.
+    let curseurs = EqProfile {
+        enabled: true,
+        bass_gain_db: 6.0,
+        treble_gain_db: 3.0,
+        ..Default::default()
+    };
+    assert!(
+        (curseurs.automatic_headroom_db(0) - (-8.271_562_619_384_957)).abs() < 1e-6,
+        "curseurs graves +6 / aigus +3 : {}",
+        curseurs.automatic_headroom_db(0)
+    );
+
+    // Dix bandes expert à +6 dB : 60 dB réservés hier, 16,5 aujourd'hui.
+    assert!(
+        (dix_cloches("peak", 6.0).automatic_headroom_db(0) - (-16.541_839_731_104_73)).abs() < 1e-6,
+        "dix cloches à +6 dB : {}",
+        dix_cloches("peak", 6.0).automatic_headroom_db(0)
+    );
+
+    // La résonance d'un `pass` n'est pas une norme L1 : ce terme-là n'a pas
+    // bougé, et le témoin voisin du passe-bas Q=4 le dit.
+    let resonant = profil(vec![bande("low_pass", 3000.0, 0.0, 4.0)]);
+    assert!(
+        (resonant.automatic_headroom_db(0) - (-15.051_499_783_199_058)).abs() < 1e-9,
+        "passe-bas Q=4 : {}",
+        resonant.automatic_headroom_db(0)
+    );
+}
+
+/// #4594 — la contre-épreuve qui compte : **rien n'écrête**.
+///
+/// Rendre 6 à 43 dB de niveau ne vaut que si pas un échantillon ne sort du
+/// rail. Ce témoin le MESURE, sur les sept préréglages livrés, les trois
+/// curseurs et le profil expert de dix bandes à +6 dB, à 44,1 / 96 / 192 kHz,
+/// et avec quatre signaux pleine échelle — dont celui qui atteint la borne.
+///
+/// Mesuré : crête **0,998849** et **zéro** over partout. Le signal adverse
+/// sort exactement au facteur de `MARGE_DE_TRONCATURE_DB` sous le rail, ce qui
+/// est la démonstration que la réserve vaut bien la borne — ni plus, ni moins.
+///
+/// `classical` et `flat` sont HORS de cette garde, et c'est délibéré : ils ne
+/// poussent nulle part, donc ne réservent rien, donc peuvent dépasser sur un
+/// signal adverse (mesuré : 16 864 overs sur un carré pleine échelle pour
+/// `classical`). C'était vrai à l'identique avant #4594 — même réserve de
+/// 0,000 dB, mêmes 16 864 overs — et fermer cette porte coûterait jusqu'à
+/// 13,3 dB à un profil qui ne fait QUE creuser. Voir
+/// `EqProfile::automatic_headroom_db_at`.
+#[test]
+fn aucun_prereglage_livre_n_ecrete_meme_sur_le_signal_adverse_4594() {
+    let mut cas: Vec<(String, EqProfile)> = Vec::new();
+    for nom in ["bass_boost", "treble_boost", "loudness", "rock", "jazz"] {
+        cas.push((
+            nom.to_string(),
+            profil(tune_core::audio::eq_presets::bandes(nom).unwrap()),
+        ));
+    }
+    cas.push(("dix cloches à +6 dB".into(), dix_cloches("peak", 6.0)));
+    cas.push((
+        "dix cloches «bell» à +6 dB".into(),
+        dix_cloches("bell", 6.0),
+    ));
+    cas.push((
+        "curseurs +6/+3".into(),
+        EqProfile {
+            enabled: true,
+            bass_gain_db: 6.0,
+            treble_gain_db: 3.0,
+            ..Default::default()
+        },
+    ));
+    cas.push((
+        "curseurs +12/+12/+12".into(),
+        EqProfile {
+            enabled: true,
+            bass_gain_db: 12.0,
+            mid_gain_db: 12.0,
+            treble_gain_db: 12.0,
+            ..Default::default()
+        },
+    ));
+
+    let n = 1 << 15;
+    for sr in [44_100u32, 96_000, 192_000] {
+        for (nom, p) in &cas {
+            let mut signaux: Vec<(&str, Vec<f32>)> = vec![
+                ("adverse", signal_adverse(p, sr, n)),
+                ("carré 100 Hz", carre_pleine_echelle(n, sr, 100.0)),
+                ("bruit blanc", bruit_pleine_echelle(n)),
+            ];
+            for freq in GRILLE_10 {
+                signaux.push((
+                    "sinus",
+                    (0..n)
+                        .map(|i| (2.0 * PI * freq * i as f64 / sr as f64).sin() as f32)
+                        .collect(),
+                ));
+            }
+            for (quoi, signal) in signaux {
+                let (crete, overs) = crete_et_overs(p, sr, &signal);
+                assert_eq!(
+                    overs, 0,
+                    "{nom} à {sr} Hz, {quoi} : {overs} échantillons hors du rail \
+                     (crête {crete})"
+                );
+                assert!(
+                    crete < 1.0,
+                    "{nom} à {sr} Hz, {quoi} : crête {crete} au rail"
+                );
+            }
+        }
+    }
+}
+
+/// #4594 — un profil qui ne fait QUE creuser ne réserve toujours rien.
+///
+/// La porte « au moins une bande pousse » est la dernière divergence de
+/// `automatic_headroom_db_at`, et elle est délibérée. Ce témoin fige les deux
+/// faces : rien n'est réservé, ET ce que sa fermeture coûterait est mesuré, de
+/// sorte que personne ne la ferme sans voir le prix.
+#[test]
+fn un_profil_qui_ne_fait_que_creuser_ne_reserve_rien_4594() {
+    for gains in [-3.0, -6.0, -24.0] {
+        let creux = dix_cloches("peak", gains);
+        assert_eq!(
+            creux.automatic_headroom_db(0),
+            -0.0,
+            "dix cloches à {gains} dB ne poussent nulle part"
+        );
+    }
+    assert_eq!(
+        profil(tune_core::audio::eq_presets::bandes("classical").unwrap()).automatic_headroom_db(0),
+        -0.0,
+        "«classical» ne fait que creuser"
+    );
+
+    // Le prix de la fermeture, mesuré : la norme L1 d'une cascade purement
+    // soustractive dépasse l'unité — elle sonne — et la réserver retirerait
+    // jusqu'à 13,3 dB à qui ne demandait qu'à creuser. C'est le défaut qu'on
+    // vient de corriger, par l'autre bout.
+    let creux_profonds = dix_cloches("peak", -24.0);
+    let mut eq = EqProcessor::new(&creux_profonds, FS, 1);
+    assert_eq!(eq.preamp_db(0), Some(-0.0), "aucun préampli sur ce chemin");
+    let mut h = vec![0.0f32; 1 << 18];
+    h[0] = 1.0;
+    eq.process_interleaved(&mut h);
+    let l1_db = 20.0 * h.iter().map(|v| (*v as f64).abs()).sum::<f64>().log10();
+    assert!(
+        l1_db > 5.0,
+        "une cascade purement soustractive sonne : L1 = {l1_db} dB"
+    );
 }

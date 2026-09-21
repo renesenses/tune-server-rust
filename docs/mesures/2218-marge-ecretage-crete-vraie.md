@@ -250,6 +250,75 @@ dépassement que seul un signal adverse atteint. Une réserve trop large abîme 
 son autant qu'une réserve trop courte : la ligne est tracée là, et elle est
 témoignée par `q1_un_passe_haut_de_butterworth_ne_reserve_rien_et_c_est_assume`.
 
+#### Reprise du 20/09 (#4594) : la somme des gains quitte le calcul
+
+Le tableau ci-dessus dit « zéro dB coûté sur un profil ORDINAIRE, la somme des
+gains majore déjà la norme L1 ». C'est exact, et c'est précisément le défaut :
+**la somme majore trop.** Elle suppose que toutes les bandes poussent à la même
+fréquence, alors que sur un égaliseur graphique elles sont disjointes par
+construction. Elle ne coûtait pas zéro dB — elle coûtait tout l'écart entre
+elle et la borne vraie, et personne ne l'avait chiffré.
+
+Chiffré, sur Shrek, à 44,1 kHz (norme L1 mesurée par réponse impulsionnelle,
+maximum fréquentiel par balayage sinusoïdal) :
+
+| profil | somme réservée | L1 (borne vraie) | max en fréquence | perdu pour rien |
+|---|---|---|---|---|
+| `bass_boost` | −20,00 dB | 13,40 dB | +10,29 dB | **6,6 dB** |
+| `treble_boost` | −24,00 dB | 12,32 dB | +9,29 dB | **11,7 dB** |
+| `loudness` | −27,00 dB | 13,73 dB | +7,24 dB | **13,3 dB** |
+| `rock` | −28,00 dB | 13,64 dB | +7,64 dB | **14,3 dB** |
+| `jazz` | −18,00 dB | 9,62 dB | +5,42 dB | **8,4 dB** |
+| dix cloches à +6 dB | −60,00 dB | 16,53 dB | +10,85 dB | **43,5 dB** |
+| curseurs +12/+12/+12 | −36,00 dB | 19,96 dB | — | **16,0 dB** |
+| AutoEq HD 650 | −13,80 dB | 10,26 dB | — | **3,5 dB** |
+| AutoEq K701 | −16,70 dB | 10,41 dB | — | **6,3 dB** |
+| AutoEq ER4SR | −22,20 dB | 12,43 dB | — | **9,8 dB** |
+
+Choisir « Rock » en un geste retirait donc **28 dB** là où 13,64 suffisent à
+garantir qu'aucun échantillon ne sort du rail. C'est, mot pour mot, ce que les
+testeurs décrivent : « pas de son quand j'active égaliseur » (#1640),
+« Egaliseur » (#3479), « il baisse le volume au minimum pour le morceau en
+cours » (#4407, 18/09).
+
+**Arbitré par Bertrand le 20/09, livré en v0.9.160.** La réserve vaut désormais
+la **norme L1 seule**, plus `MARGE_DE_TRONCATURE_DB` = 0,01 dB pour ne pas
+réserver la borne au ras du rail. La somme des gains ne sert plus qu'à répondre
+« au moins une bande pousse-t-elle ? » : `cascade_a_gain` rend un booléen.
+
+**Rien n'écrête, et c'est mesuré.** Les sept préréglages livrés, les trois
+curseurs et le profil expert de dix bandes à +6 dB, dans quatre signaux pleine
+échelle — dont `x[n] = signe(h[−n])`, celui qui ATTEINT la borne — à 44,1 / 96 /
+192 kHz : crête **0,998849** et **zéro** over partout. C'est exactement le
+facteur de la marge de troncature : la réserve vaut la borne, ni plus ni moins.
+Sans cette marge, le signal adverse sortait à 1,000000 pile, et le compteur
+d'overs — dont l'intervalle est semi-ouvert — en comptait un.
+Témoin : `aucun_prereglage_livre_n_ecrete_meme_sur_le_signal_adverse_4594`.
+
+**La porte laissée ouverte, et son prix.** Un profil sans aucune bande à gain
+positif ne réserve toujours rien, et peut donc dépasser : `classical` (que des
+creux) sort 16 864 échantillons du rail sur un carré pleine échelle —
+identique avant et après #4594, même réserve de 0,000 dB. La fermer a été
+envisagé, puis mesuré avant d'y toucher :
+
+| profil **purement soustractif** | L1 qu'il faudrait réserver |
+|---|---|
+| `classical` (livré) | 2,171 dB |
+| une cloche −3 dB Q=1 | 2,544 dB |
+| curseurs −12/−12/−12 | 5,294 dB |
+| plateau grave −12 dB | 5,516 dB |
+| une cloche −24 dB Q=1 | 6,957 dB |
+| dix cloches −24 dB Q=10 | **13,346 dB** |
+
+Jusqu'à 13,3 dB retirés à qui ne demandait qu'à creuser : le défaut qu'on vient
+de corriger, réintroduit par l'autre bout. La porte reste ouverte, pour la même
+raison chiffrée que la norme L1 des `pass` reste hors réserve. Témoin :
+`un_profil_qui_ne_fait_que_creuser_ne_reserve_rien_4594`.
+
+**Ce que l'auditeur entend** : le son remonte de 6 à 43 dB selon le profil. Qui
+avait compensé au volume devra le rebaisser d'autant — c'est une ligne des
+notes de version, pas un détail d'implémentation.
+
 ### C — ReplayGain : avec un pic d'échantillon tagué, `prevent_clipping` laisse passer les inter-échantillons
 
 Mesuré : +2,10 dBTP sur un carré, +0,000 dBTP sur un sinus ; le plafond
