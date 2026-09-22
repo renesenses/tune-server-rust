@@ -25,9 +25,16 @@ modifie aucun réglage de Roon.
 
 ## 1. Télécharger le moissonneur
 
-Les archives sont attachées à la release GitHub de Tune
-(<https://github.com/renesenses/tune-server-rust/releases>), à côté de celles
-du serveur :
+Le moissonneur a **sa propre release**, séparée de celle du serveur : cherchez
+`Moissonneur Roon v0.9.x` dans la
+[liste des releases](https://github.com/renesenses/tune-server-rust/releases),
+et non pas les archives du serveur.
+
+Pourquoi à part : quand ces archives voyageaient sur la release de Tune, la
+mise à jour automatique du serveur y prenait `moissonneur-roon-…` pour
+`tune-server-…` et échouait. La séparation est ce qui l'en empêche — une
+release du moissonneur ne contient aucun fichier `tune-server…`, donc aucun
+serveur ne la consultera jamais.
 
 | système | archive |
 |---|---|
