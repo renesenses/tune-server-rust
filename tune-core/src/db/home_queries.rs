@@ -243,7 +243,7 @@ pub const CONTEXTES_AFFICHES: [&str; 5] = ["album", "playlist", "artist", "label
 /// la provenance du dernier morceau ecoute.
 ///
 /// `COALESCE(context_source, '')` et non `context_source` nu : sur les lignes
-/// d'avant la migration 104 la colonne est NULL, et `NULL = NULL` est faux en
+/// d'avant la migration 105 la colonne est NULL, et `NULL = NULL` est faux en
 /// SQL — la jointure les perdrait toutes, c'est-a-dire tout l'historique
 /// existant. Elles se regroupent donc ensemble sous l'espace vide, exactement
 /// comme avant ce changement.

@@ -558,3 +558,22 @@ required-features = ["local-audio"]
 [[test]]
 name = "dst_desarmee_4378"
 path = "tests/dst_desarmee_4378.rs"
+
+# #4573 — le témoin du REPLI lui-même : un fichier à six voies, une cible à
+# deux, et ce qui sort mesuré voie par voie contre ITU-R BS.775. La .159
+# n'avait livré que la LECTURE de ce que le renderer déclare ; sans cette
+# cible, le bras qui replie n'aurait aucune garde.
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier ne
+# serait JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "canaux_reseau_repli_4573"
+path = "tests/canaux_reseau_repli_4573.rs"
+
+# #4573 — le BRANCHEMENT de bout en bout : vrai serveur SOAP, vrai Sink de
+# Denon AVR-X1600H, vraie zone, vraie file. C'est la garde de ce que la .159
+# n'avait pas livré (« écrit, pas branché »).
+# `autotests = false` en tête de ce manifeste : sans cette cible, le fichier ne
+# serait JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "canaux_reseau_branchement_4573"
+path = "tests/canaux_reseau_branchement_4573.rs"

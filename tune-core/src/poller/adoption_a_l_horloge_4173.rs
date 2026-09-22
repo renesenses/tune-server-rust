@@ -668,3 +668,8 @@ fn la_surveillance_pure() {
 /// banc, sans l'horloge de fin injectée d'un bloc.
 #[cfg(test)]
 mod eversolo_epingle_4382;
+
+/// #3967 — l'enchaînement VÉRIFIÉ : ce même banc, mais l'appareil a prouvé
+/// qu'il TIENT la suivante, et on la lui demande au lieu de tout relancer.
+#[cfg(test)]
+mod bascule_sur_la_suivante_3967;

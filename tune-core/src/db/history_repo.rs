@@ -281,7 +281,7 @@ pub struct ListenRecord {
     /// l'espace de noms du contexte, c'est resoudre un identifiant Qobuz
     /// dans les tables locales.
     ///
-    /// `None` sur toute ligne anterieure a la migration 104 : l'historique
+    /// `None` sur toute ligne anterieure a la migration 105 : l'historique
     /// d'avant ne l'a jamais su, et rien ici ne pretend le reconstituer.
     pub context_source: Option<String>,
     /// Le NOM de l'objet demande, tel que sa source le donnait au clic.
@@ -583,6 +583,158 @@ impl HistoryRepo {
     /// `period`: "today", "7d", "30d", "90d", "all" (default 30d).
     /// `zone_id`: optional filter.
     /// `top_n`: how many items per top list.
+    /// Les clefs d'un lot, en minuscules, prêtes pour un `IN (?, ?, …)`.
+    ///
+    /// 🔴 Paramétré, jamais concaténé : un titre d'album peut contenir une
+    /// apostrophe, et le backend Postgres traduit `?` en `$n` tout seul.
+    fn lot_in(n: usize) -> String {
+        vec!["?"; n].join(", ")
+    }
+
+    /// La pochette de chaque artiste nommé — UNE requête pour tout le lot.
+    ///
+    /// L'image de l'artiste d'abord, la pochette d'un de ses albums à défaut :
+    /// même ordre de préférence qu'avant, mais résolu pour les N gagnants au
+    /// lieu de l'être groupe par groupe pendant l'agrégation.
+    fn pochettes_par_artiste(&self, noms: &[String]) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        if noms.is_empty() {
+            return out;
+        }
+        let bas: Vec<String> = noms.iter().map(|n| n.to_lowercase()).collect();
+        let params: Vec<Box<dyn ToSqlValue>> = bas
+            .iter()
+            .map(|n| Box::new(n.clone()) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let dans = Self::lot_in(bas.len());
+
+        // 1. l'image de l'artiste, quand la fiche existe
+        let sql = format!(
+            "SELECT LOWER(name), image_path FROM artists \
+             WHERE image_path IS NOT NULL AND LOWER(name) IN ({dans})"
+        );
+        if let Ok(rows) = self.db.query_many(&sql, &refs) {
+            for r in rows {
+                if let (Some(n), Some(img)) = (
+                    r.first().and_then(|v| v.as_string()),
+                    r.get(1).and_then(|v| v.as_string()),
+                ) {
+                    out.insert(n, img);
+                }
+            }
+        }
+
+        // 2. à défaut, la pochette d'un album de cet artiste
+        let manquants: Vec<&String> = bas.iter().filter(|n| !out.contains_key(*n)).collect();
+        if !manquants.is_empty() {
+            let params2: Vec<Box<dyn ToSqlValue>> = manquants
+                .iter()
+                .map(|n| Box::new((*n).clone()) as Box<dyn ToSqlValue>)
+                .collect();
+            let refs2: Vec<&dyn ToSqlValue> = params2.iter().map(|p| p.as_ref()).collect();
+            let dans2 = Self::lot_in(manquants.len());
+            let sql2 = format!(
+                "SELECT LOWER(t.album_artist), MIN(a.cover_path) FROM albums a \
+                 JOIN tracks t ON t.album_id = a.id \
+                 WHERE a.cover_path IS NOT NULL AND LOWER(t.album_artist) IN ({dans2}) \
+                 GROUP BY LOWER(t.album_artist)"
+            );
+            if let Ok(rows) = self.db.query_many(&sql2, &refs2) {
+                for r in rows {
+                    if let (Some(n), Some(c)) = (
+                        r.first().and_then(|v| v.as_string()),
+                        r.get(1).and_then(|v| v.as_string()),
+                    ) {
+                        out.entry(n).or_insert(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// L'album de bibliothèque correspondant à chaque titre d'album nommé —
+    /// UNE requête pour tout le lot, au lieu d'une jointure `LOWER() = LOWER()`
+    /// qui balaie la table des albums pour chaque ligne d'historique.
+    fn albums_par_titre(
+        &self,
+        titres: &[String],
+    ) -> std::collections::HashMap<String, (Option<i64>, Option<String>)> {
+        let mut out = std::collections::HashMap::new();
+        if titres.is_empty() {
+            return out;
+        }
+        let bas: Vec<String> = titres.iter().map(|t| t.to_lowercase()).collect();
+        let params: Vec<Box<dyn ToSqlValue>> = bas
+            .iter()
+            .map(|t| Box::new(t.clone()) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let dans = Self::lot_in(bas.len());
+        let sql = format!(
+            "SELECT LOWER(title), MAX(id), MAX(cover_path) FROM albums \
+             WHERE LOWER(title) IN ({dans}) GROUP BY LOWER(title)"
+        );
+        if let Ok(rows) = self.db.query_many(&sql, &refs) {
+            for r in rows {
+                if let Some(t) = r.first().and_then(|v| v.as_string()) {
+                    out.insert(
+                        t,
+                        (
+                            r.get(1).and_then(|v| v.as_i64()),
+                            r.get(2).and_then(|v| v.as_string()),
+                        ),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    /// La piste de bibliothèque correspondant à chaque titre écouté — UNE
+    /// requête pour tout le lot. La clef est (titre, artiste) en minuscules,
+    /// comme la sous-requête corrélée qu'elle remplace.
+    fn pistes_par_titre(
+        &self,
+        titres: &[String],
+    ) -> std::collections::HashMap<(String, String), (Option<i64>, Option<String>)> {
+        let mut out = std::collections::HashMap::new();
+        if titres.is_empty() {
+            return out;
+        }
+        let bas: Vec<String> = titres.iter().map(|t| t.to_lowercase()).collect();
+        let params: Vec<Box<dyn ToSqlValue>> = bas
+            .iter()
+            .map(|t| Box::new(t.clone()) as Box<dyn ToSqlValue>)
+            .collect();
+        let refs: Vec<&dyn ToSqlValue> = params.iter().map(|p| p.as_ref()).collect();
+        let dans = Self::lot_in(bas.len());
+        let sql = format!(
+            "SELECT LOWER(t.title), LOWER(COALESCE(t.album_artist, '')), MAX(t.id), MAX(a.cover_path) \
+             FROM tracks t LEFT JOIN albums a ON t.album_id = a.id \
+             WHERE LOWER(t.title) IN ({dans}) \
+             GROUP BY LOWER(t.title), LOWER(COALESCE(t.album_artist, ''))"
+        );
+        if let Ok(rows) = self.db.query_many(&sql, &refs) {
+            for r in rows {
+                if let (Some(t), Some(a)) = (
+                    r.first().and_then(|v| v.as_string()),
+                    r.get(1).and_then(|v| v.as_string()),
+                ) {
+                    out.insert(
+                        (t, a),
+                        (
+                            r.get(2).and_then(|v| v.as_i64()),
+                            r.get(3).and_then(|v| v.as_string()),
+                        ),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     pub fn full_dashboard(
         &self,
         period: &str,
@@ -704,28 +856,44 @@ impl HistoryRepo {
         } else {
             "AND source != 'radio' AND"
         };
+        // 🔴 LA POCHETTE N'EST PLUS RÉSOLUE PENDANT L'AGRÉGATION.
+        //
+        // Cette requête portait une sous-requête CORRÉLÉE sur `tracks ⋈ albums`
+        // et une jointure `LOWER(ar.name) = LOWER(lh.artist_name)`. Deux
+        // `LOWER()` sur des colonnes : aucun index ne s'applique, et le moteur
+        // balaie 47 118 pistes et 2 528 artistes par groupe.
+        //
+        // Mesuré sur le .18 le 20/09/2026, sept jours, douze artistes :
+        //
+        //     requête telle quelle ................. 3,07 s
+        //     même agrégation sans les pochettes ... 0,012 s
+        //     + les deux passes de résolution ...... 0,28 s au total
+        //
+        // Soit 256× sur l'agrégation, 11× sur l'ensemble. Le coût était PAR
+        // ENTRÉE, pas par ligne d'historique — c'est ce qui faisait échouer
+        // les widgets d'accueil, dont le budget est de 8 s.
         let artists_sql = format!(
-            "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
-                    COALESCE(ar.image_path, (
-                        SELECT a2.cover_path FROM albums a2
-                        JOIN tracks t2 ON t2.album_id = a2.id
-                        WHERE LOWER(t2.album_artist) = LOWER(lh.artist_name) AND a2.cover_path IS NOT NULL
-                        LIMIT 1
-                    )) as cover_path
+            "SELECT lh.artist_name, COUNT(*) as plays, CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms
              FROM listen_history lh
-             LEFT JOIN artists ar ON LOWER(ar.name) = LOWER(lh.artist_name)
              {simple_where} {no_radio_and} lh.artist_name IS NOT NULL
-             GROUP BY lh.artist_name, ar.image_path ORDER BY plays DESC LIMIT {top_n}",
+             GROUP BY lh.artist_name ORDER BY plays DESC LIMIT {top_n}",
         );
-        let top_artists: Vec<TopArtistEntry> = self
-            .db
-            .query_many(&artists_sql, &[])?
+        let artistes_bruts = self.db.query_many(&artists_sql, &[])?;
+        let noms_artistes: Vec<String> = artistes_bruts
+            .iter()
+            .filter_map(|c| c.first().and_then(|v| v.as_string()))
+            .collect();
+        let pochettes_artistes = self.pochettes_par_artiste(&noms_artistes);
+        let top_artists: Vec<TopArtistEntry> = artistes_bruts
             .into_iter()
             .map(|cols| TopArtistEntry {
                 artist_name: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
                 plays: cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 listening_ms: cols.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
-                cover_path: cols.get(3).and_then(|v| v.as_string()),
+                cover_path: cols
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .and_then(|n| pochettes_artistes.get(&n.to_lowercase()).cloned()),
             })
             .collect();
 
@@ -735,66 +903,95 @@ impl HistoryRepo {
         } else {
             "AND h.source != 'radio' AND"
         };
+        // Même correction que pour les artistes : la jointure
+        // `LOWER(a.title) = LOWER(h.album_title)` balayait les 4 363 albums
+        // pour chaque ligne d'historique de la période.
+        //
+        // 🔴 Et elle CASSAIT le regroupement : `GROUP BY … COALESCE(a.cover_path,
+        // h.cover_url)` séparait un même album en plusieurs lignes dès que deux
+        // écoutes portaient des pochettes différentes — un album pouvait ainsi
+        // occuper deux rangs du classement avec ses lectures coupées en deux.
         let albums_sql = format!(
-            "SELECT h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url) as cover_path, COUNT(*) as plays, MAX(a.id) as album_id,
+            "SELECT h.album_title, h.artist_name, MAX(h.cover_url) as cover_url, COUNT(*) as plays,
                     MAX(h.source) as source, MAX(h.source_id) as source_id
              FROM listen_history h
-             LEFT JOIN albums a ON LOWER(a.title) = LOWER(h.album_title)
              {where_clause} {no_radio_and_h} h.album_title IS NOT NULL
-             GROUP BY h.album_title, h.artist_name, COALESCE(a.cover_path, h.cover_url)
+             GROUP BY h.album_title, h.artist_name
              ORDER BY plays DESC LIMIT {top_n}",
         );
-        let top_albums: Vec<TopAlbumEntry> = self
-            .db
-            .query_many(&albums_sql, &[])?
+        let albums_bruts = self.db.query_many(&albums_sql, &[])?;
+        let titres_albums: Vec<String> = albums_bruts
+            .iter()
+            .filter_map(|c| c.first().and_then(|v| v.as_string()))
+            .collect();
+        let fiches_albums = self.albums_par_titre(&titres_albums);
+        let top_albums: Vec<TopAlbumEntry> = albums_bruts
             .into_iter()
-            .map(|cols| TopAlbumEntry {
-                album_title: cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
-                artist_name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                cover_path: cols.get(2).and_then(|v| v.as_string()),
-                plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
-                album_id: cols.get(4).and_then(|v| v.as_i64()),
-                source: cols.get(5).and_then(|v| v.as_string()),
-                source_id: cols.get(6).and_then(|v| v.as_string()),
+            .map(|cols| {
+                let titre = cols.first().and_then(|v| v.as_string()).unwrap_or_default();
+                let fiche = fiches_albums.get(&titre.to_lowercase());
+                TopAlbumEntry {
+                    album_title: titre.clone(),
+                    artist_name: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                    // La pochette de la BIBLIOTHÈQUE d'abord, celle de l'historique
+                    // à défaut : l'ordre de `COALESCE(a.cover_path, h.cover_url)`.
+                    cover_path: fiche
+                        .and_then(|f| f.1.clone())
+                        .or_else(|| cols.get(2).and_then(|v| v.as_string())),
+                    plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                    album_id: fiche.and_then(|f| f.0),
+                    source: cols.get(4).and_then(|v| v.as_string()),
+                    source_id: cols.get(5).and_then(|v| v.as_string()),
+                }
             })
             .collect();
 
         // ── Top tracks (exclude radio) ──
         let tracks_sql = format!(
-            "SELECT COALESCE(MAX(lh.track_id), (
-                        SELECT t3.id FROM tracks t3
-                        WHERE LOWER(t3.title) = LOWER(lh.title)
-                          AND LOWER(COALESCE(t3.album_artist, '')) = LOWER(COALESCE(lh.artist_name, ''))
-                        LIMIT 1
-                    )) as track_id,
+            "SELECT MAX(lh.track_id) as track_id,
                     lh.title, lh.artist_name, COUNT(*) as plays,
                     CAST(COALESCE(SUM(lh.duration_ms), 0) AS BIGINT) as ms,
-                    COALESCE(MAX(lh.cover_url), (
-                        SELECT a2.cover_path FROM tracks t2
-                        JOIN albums a2 ON t2.album_id = a2.id
-                        WHERE LOWER(t2.title) = LOWER(lh.title)
-                          AND LOWER(COALESCE(t2.album_artist, '')) = LOWER(COALESCE(lh.artist_name, ''))
-                          AND a2.cover_path IS NOT NULL
-                        LIMIT 1
-                    )) as cover_path,
+                    MAX(lh.cover_url) as cover_url,
                     MAX(lh.source) as source, MAX(lh.source_id) as source_id
              FROM listen_history lh
              {simple_where} {no_radio_and} lh.title IS NOT NULL
              GROUP BY lh.title, lh.artist_name ORDER BY plays DESC LIMIT {top_n}"
         );
-        let top_tracks: Vec<TopTrackEntry> = self
-            .db
-            .query_many(&tracks_sql, &[])?
+        // Ce bloc portait DEUX sous-requêtes corrélées sur `tracks` (47 118
+        // lignes), l'une pour retrouver l'identifiant de piste, l'autre pour la
+        // pochette — chacune avec `LOWER()` des deux côtés. Les deux sont
+        // remplacées par une seule requête pour tout le lot.
+        let pistes_brutes = self.db.query_many(&tracks_sql, &[])?;
+        let titres_pistes: Vec<String> = pistes_brutes
+            .iter()
+            .filter_map(|c| c.get(1).and_then(|v| v.as_string()))
+            .collect();
+        let fiches_pistes = self.pistes_par_titre(&titres_pistes);
+        let top_tracks: Vec<TopTrackEntry> = pistes_brutes
             .into_iter()
-            .map(|cols| TopTrackEntry {
-                track_id: cols.first().and_then(|v| v.as_i64()),
-                title: cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                artist_name: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
-                plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
-                listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
-                cover_path: cols.get(5).and_then(|v| v.as_string()),
-                source: cols.get(6).and_then(|v| v.as_string()),
-                source_id: cols.get(7).and_then(|v| v.as_string()),
+            .map(|cols| {
+                let titre = cols.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                let artiste = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                let fiche = fiches_pistes.get(&(titre.to_lowercase(), artiste.to_lowercase()));
+                TopTrackEntry {
+                    // L'identifiant vu dans l'historique d'abord, la
+                    // correspondance de bibliothèque à défaut : l'ordre du
+                    // `COALESCE(MAX(lh.track_id), …)` d'origine.
+                    track_id: cols
+                        .first()
+                        .and_then(|v| v.as_i64())
+                        .or_else(|| fiche.and_then(|f| f.0)),
+                    title: titre.clone(),
+                    artist_name: artiste.clone(),
+                    plays: cols.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
+                    listening_ms: cols.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                    cover_path: cols
+                        .get(5)
+                        .and_then(|v| v.as_string())
+                        .or_else(|| fiche.and_then(|f| f.1.clone())),
+                    source: cols.get(6).and_then(|v| v.as_string()),
+                    source_id: cols.get(7).and_then(|v| v.as_string()),
+                }
             })
             .collect();
 
@@ -1946,7 +2143,7 @@ mod tests {
         // 17 colonnes : aux onze d'origine se sont ajoutees `context_type` et
         // `context_id` (migration 84, #2441), `context_position`
         // (migration 94), puis `context_source`, `context_title` et
-        // `context_cover` (migration 104).
+        // `context_cover` (migration 105).
         assert!(
             sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         );

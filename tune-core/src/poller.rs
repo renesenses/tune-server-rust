@@ -27,7 +27,7 @@ use crate::orchestrator::PlaybackOrchestrator;
 use crate::outputs::registry::OutputRegistry;
 use crate::outputs::traits::{
     OutputDspMetrics, OutputRingStarvation, OutputSignalPathStatus, OutputStatus, OutputTarget,
-    TransformationsReelles, TransportState,
+    SuivantePreparee, TransformationsReelles, TransportState,
 };
 use crate::playback::{PlayState, PlaybackManager, RepeatMode};
 
@@ -169,6 +169,17 @@ const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
 /// foulée signifie « l'appareil est vraiment planté, on coupe » ; assez
 /// courte pour redonner sa chance à l'album suivant.
 const DEAD_START_RETRY_COOLDOWN_SECS: u64 = 180;
+/// Fenêtre minimale entre deux reprises automatiques après décrochage du
+/// renderer EN COURS de lecture (#4645) sur une même zone. Même ordre de
+/// grandeur que la relance « démarrage mort » : un second décrochage dans la
+/// foulée dit que l'appareil ou le réseau ne suit pas, et la zone est coupée
+/// comme avant plutôt que harcelée.
+const RENDERER_CALE_REPRISE_COOLDOWN_SECS: u64 = 180;
+/// Durée de musique qui doit RESTER après la position atteinte pour qu'une
+/// reprise ait un sens. En dessous, ce qui manque tient dans la marge de
+/// détection : on coupe plutôt que de renvoyer un ordre de lecture pour
+/// quelques secondes.
+const RENDERER_CALE_RESTE_MIN_MS: u64 = 15_000;
 const STOPPED_TICKS_THRESHOLD: u8 = 5;
 /// Part du fichier qui doit avoir été servie pour qu'un `Stopped` annoncé par le
 /// renderer puisse passer pour une fin de morceau. En dessous, il n'a pas pu
@@ -217,6 +228,20 @@ const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// systemic — expired credentials, no network — where retrying once per queued
 /// item would just hammer the service.
 const MAX_CONSECUTIVE_SKIPS: u32 = 25;
+/// Combien de pistes que le SERVICE LUI-MÊME déclare injouables on enjambe
+/// avant de renoncer.
+///
+/// Séparé de [`MAX_CONSECUTIVE_SKIPS`] et volontairement large : ce n'est pas
+/// le même risque. Là-bas on se protège d'un jeton expiré ou d'un réseau mort,
+/// qu'il ne faut pas marteler une fois par piste de la file ; ici le service a
+/// répondu et a dit non pour CETTE piste — l'enjamber ne coûte rien et ne
+/// prouve rien sur les suivantes.
+///
+/// Mesuré : la playlist d'Alex Campbell porte 186 pistes injouables sur 1454,
+/// et l'indisponibilité Qobuz est GROUPÉE (un label, un album retiré d'un
+/// coup). 500 couvre largement ce cas sans jamais devenir une boucle infinie
+/// en répétition intégrale — la seule raison pour laquelle ce plafond existe.
+const PLAFOND_PISTES_INJOUABLES: u32 = 500;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
@@ -273,6 +298,15 @@ const TICKS_GELE_DLNA_AVEC_SETNEXT: u8 = 1;
 /// `SetAVTransportURI` + `Play` — le repli d'avant, sur la bonne piste. Voir
 /// [`decisions::suite_de_l_adoption`].
 const ADOPTION_HORLOGE_DELAI_SECS: u64 = 8;
+/// #3967 — le même délai, mais pour une adoption qui suit une CONSIGNE et non
+/// un constat : on vient d'envoyer `Next` à un renderer qui tient déjà la
+/// suivante et son tampon. S'il l'honore, il repart en un ou deux sondages —
+/// il n'a rien à télécharger. Trois secondes bornent donc ce que coûte un
+/// appareil qui acquitte `Next` sans bouger : trois secondes, puis le repli
+/// d'aujourd'hui, à l'identique et sur la BONNE piste. Les huit secondes de
+/// [`ADOPTION_HORLOGE_DELAI_SECS`] couvrent un cas différent — un renderer
+/// qu'on a seulement OBSERVÉ, et qui peut encore être en train de charger.
+const BASCULE_DELAI_SECS: u64 = 3;
 /// Minimum consecutive failed status polls before the DLNA wall-clock poll-fail
 /// fallback (`decisions::poll_failed_past_end`) will end the track. Requiring a
 /// couple of failures avoids acting on a single transient SOAP blip.
@@ -419,6 +453,12 @@ pub struct PositionPoller {
     /// relance au plus par fenêtre de DEAD_START_RETRY_COOLDOWN_SECS ; si la
     /// relance échoue à son tour, la zone est coupée comme avant.
     relances_demarrage_mort: Mutex<std::collections::HashMap<i64, Instant>>,
+    /// Horodatage de la dernière reprise automatique après décrochage du
+    /// renderer en cours de lecture (#4645), par zone. Vit HORS de
+    /// ZonePollState pour exactement la même raison que
+    /// `relances_demarrage_mort` : la reprise recrée l'état de sondage, un
+    /// drapeau posé dedans repartirait à zéro et bouclerait.
+    reprises_renderer_cale: Mutex<std::collections::HashMap<i64, Instant>>,
 }
 
 impl PositionPoller {
@@ -437,6 +477,7 @@ impl PositionPoller {
             shared_metrics,
             event_bus: None,
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
+            reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -784,6 +825,7 @@ impl PositionPoller {
 mod radio;
 
 mod fin_de_piste;
+mod refus_de_piste;
 
 mod tick;
 

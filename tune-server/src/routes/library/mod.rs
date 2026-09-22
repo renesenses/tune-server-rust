@@ -14,6 +14,9 @@ mod enrich;
 mod facets;
 mod folder_facet;
 mod genres;
+// LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
+// fonction, pour que « Genres » et « Genres écoutés » se comparent.
+pub(crate) use genres::genres_de_l_album;
 mod ingest;
 mod lyrics_pass;
 mod proposals;
@@ -247,6 +250,9 @@ pub fn router() -> Router<AppState> {
         .route("/albums/disques-abimes", get(albums::disques_abimes))
         // Coffrets ÉCLATÉS en un album par disque. AVANT `/albums/{id}`.
         .route("/albums/coffrets", get(albums::coffrets_eclates))
+        // Composer un coffret À LA MAIN — ce que la détection automatique ne
+        // peut pas voir : marqueurs en lettres (« Disc A »), rangement libre.
+        .route("/albums/coffret", post(albums::composer_coffret))
         .route(
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),

@@ -88,19 +88,38 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
         .and_then(|v| v.as_string())
         .unwrap_or_else(|| "[]".into());
     let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-    json!({
+    let nom = r.get(1).and_then(|v| v.as_string());
+    let description = r.get(7).and_then(|v| v.as_string());
+    let mut objet = json!({
         "id": r.get(0).and_then(|v| v.as_i64()),
-        "name": r.get(1).and_then(|v| v.as_string()),
+        "name": nom,
         "rules": rules,
         "match_mode": r.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
         "sort_by": r.get(4).and_then(|v| v.as_string()),
         "sort_order": normalize_sort_order(r.get(5).and_then(|v| v.as_string())),
         "max_limit": r.get(6).and_then(|v| v.as_i64()),
-        "description": r.get(7).and_then(|v| v.as_string()),
+        "description": description,
         "icon": r.get(8).and_then(|v| v.as_string()),
         "color": r.get(9).and_then(|v| v.as_string()),
         "created_at": r.get(10).and_then(|v| v.as_string()),
-    })
+    });
+    // Les seize collections du semis sont nommées en français en base
+    // (`tune-core/src/db/migrations.rs:546` et `:614`). Leur clé stable part
+    // À CÔTÉ du nom, jamais à sa place : le client la traduit et retombe sur
+    // `name` quand elle manque. Une collection renommée par l'utilisateur ne
+    // ressemble plus au semis et n'en reçoit aucune — c'est ainsi que
+    // « ne rien renommer » est tenu, sans écrire une ligne en base.
+    let (cle_nom, cle_description) = crate::collections_par_defaut::cles(
+        nom.as_deref().unwrap_or_default(),
+        description.as_deref(),
+    );
+    if let Some(cle) = cle_nom {
+        objet["name_key"] = json!(cle);
+    }
+    if let Some(cle) = cle_description {
+        objet["description_key"] = json!(cle);
+    }
+    objet
 }
 
 /// Le nombre d'albums d'une collection : ceux de la bibliothèque, **plus** les
@@ -953,24 +972,14 @@ async fn avec_albums_de_catalogue(
     rules_json: &str,
     max_limit: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
-    let Some(service) = catalogue::service_du_catalogue(rules_json) else {
-        return Ok(albums);
+    // 🔴 La lecture des règles est celle de `catalogue::lire`, partagée avec le
+    // chemin des PISTES : le service, la cible et les refus se décident à un
+    // seul endroit (#4473, second volet).
+    let demande = match catalogue::lire(rules_json, catalogue::Objet::Album) {
+        catalogue::Lecture::Aucune => return Ok(albums),
+        catalogue::Lecture::Refus(motif) => return Err(AppError::bad_request(motif)),
+        catalogue::Lecture::Demande(d) => d,
     };
-    let Some(cible) = catalogue::cible(rules_json) else {
-        return Err(AppError::bad_request(
-            "Une règle « catalogue » doit nommer un artiste ou un album : \
-             aucun service ne sait énumérer son catalogue.",
-        ));
-    };
-    // Ce que le service ne saurait pas filtrer : refusé, et nommé (#4473).
-    let hors_service = catalogue::regles_hors_service(rules_json);
-    if !hors_service.is_empty() {
-        return Err(AppError::bad_request(format!(
-            "Le catalogue d'un service ne sait chercher qu'un artiste ou un album \
-             (égalité). Ces règles ne peuvent pas s'y appliquer : {}.",
-            hors_service.join(", ")
-        )));
-    }
     // 🔴 On CLONE l'Arc au lieu d'en garder une référence : ce qui vit en
     // travers d'un `.await` doit être `Send`, et une référence à l'état ne
     // l'est pas ici. Sans ça, axum refuse le handler tout entier.
@@ -980,15 +989,14 @@ async fn avec_albums_de_catalogue(
         ));
     };
 
-    let mut trouves = match &cible {
+    let service = demande.service;
+    let mut trouves = match &demande.cible {
         catalogue::Cible::Artiste(nom) => distant.albums_par_artiste(&service, nom).await,
         catalogue::Cible::Album(titre) => distant.albums_par_titre(&service, titre).await,
     };
     // « artiste Coltrane ET album Blue Train » : la recherche part de
     // l'artiste, le titre trie encore ce qu'elle rend.
-    if let (catalogue::Cible::Artiste(_), Some(titre)) =
-        (&cible, catalogue::titre_exige(rules_json))
-    {
+    if let (catalogue::Cible::Artiste(_), Some(titre)) = (&demande.cible, &demande.titre_album) {
         let titre = titre.to_lowercase();
         trouves.retain(|a| a.title.trim().to_lowercase() == titre);
     }
@@ -1623,6 +1631,9 @@ mod tests {
             async fn pistes_par_artiste(&self, _s: &str, _n: &str) -> Vec<PisteDistante> {
                 Vec::new()
             }
+            async fn pistes_par_album(&self, _s: &str, _t: &str) -> Vec<PisteDistante> {
+                Vec::new()
+            }
         }
 
         fn etat(avec_service: bool) -> SmartHttpState {
@@ -1757,8 +1768,17 @@ mod tests {
             let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
                         {"field":"artist","op":"=","value":"John Coltrane"},
                         {"field":"format","op":"=","value":"FLAC"}]"#;
-            let r = super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), r, None).await;
-            assert!(r.is_err(), "format : le service ne sait pas le filtrer");
+            let Err(e) =
+                super::super::avec_albums_de_catalogue(&etat(true), Vec::new(), r, None).await
+            else {
+                panic!("format : le service ne sait pas le filtrer")
+            };
+            // Refusée en la NOMMANT, jamais ignorée en silence (#4473).
+            assert!(
+                e.message.contains("format ="),
+                "le refus doit nommer la règle : {}",
+                e.message
+            );
         }
 
         /// Artiste ET titre : le titre trie ce que la recherche par artiste rend.

@@ -305,6 +305,14 @@ fn inject_device_identity(
         .flatten();
     obj.insert("brand".into(), json!(brand));
     obj.insert("model".into(), json!(model));
+    // La photo de l'appareil, posée par l'utilisateur (#1394). Sert de socle à
+    // la vignette de la carte de zone quand rien ne joue.
+    let image_path = settings
+        .get(&format!("zone_{zone_id}_image"))
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    obj.insert("image_path".into(), json!(image_path));
     let trim = settings
         .get(&format!("zone_{zone_id}_gain_trim_db"))
         .ok()
@@ -461,6 +469,13 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
         .route("/{id}/device-presets", get(get_device_presets))
+        // #1394 — la photo de l'appareil de cette zone. Locale pour
+        // l'instant : rien ne part au catalogue communautaire sans le
+        // consentement de l'utilisateur ET l'approbation de Bertrand.
+        .route(
+            "/{id}/image",
+            post(zone_image_upload).delete(zone_image_delete),
+        )
         .route("/{id}/name", put(rename_zone))
         // #1361 — l'album de ce qui joue, et chez qui l'ouvrir, en UNE
         // réponse. Deux orthographes pour la même route : le dépôt en est à
@@ -1106,7 +1121,29 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
     } else {
         false
     };
-    let reach = output_reach_of(zone, ps, pulled);
+    // 🔴 #4601 / #4580 — LA ZONE A UN APPAREIL, MAIS PLUS PERSONNE NE LE VOIT.
+    //
+    // Deux testeurs ont supprimé puis recréé une zone pour la faire
+    // refonctionner. `output_reach` ne savait dire que deux choses : « pas de
+    // sortie du tout » et « l'onglet ne tire rien ». Une zone dont l'appareil
+    // a disparu du registre vivant — renderer DLNA qui a changé
+    // d'identifiant en redémarrant, bail DHCP renouvelé — rendait `ok`, et
+    // l'écran n'avait rien à dire.
+    //
+    // ⚠️ La question ne se pose PAS pour une zone navigateur : sa sortie est
+    // un onglet, pas une entrée du registre. Et `None` veut dire « on ne sait
+    // pas », jamais « absent » : la même discipline que
+    // `last_play_started_at` plus bas — on préfère taire un défaut réel que
+    // d'en inventer un.
+    let appareil_vu = if zone.output_type.as_deref() == Some("browser") {
+        None
+    } else {
+        match zone.output_device_id.as_deref() {
+            Some(id) => Some(state.outputs.lock().await.get(id).is_some()),
+            None => None,
+        }
+    };
+    let reach = output_reach_of(zone, ps, pulled, appareil_vu);
     // Le serveur ne dit pas `browser_unattended` à un client sans en garder
     // trace : c'est cette trace, et elle seule, qui permet au bandeau de
     // survivre à l'arrêt de la lecture (#2588). Rafraîchie tant que le
@@ -1180,7 +1217,12 @@ pub(crate) fn sortie_annoncee_sans_appareil(
 }
 
 /// La décision seule, sans I/O — c'est elle que les tests couvrent.
-fn output_reach_of(zone: &Zone, ps: &ZoneState, browser_stream_pulled: bool) -> &'static str {
+fn output_reach_of(
+    zone: &Zone,
+    ps: &ZoneState,
+    browser_stream_pulled: bool,
+    appareil_vu: Option<bool>,
+) -> &'static str {
     if zone_sans_appareil(
         zone.output_type.as_deref(),
         zone.output_device_id.as_deref(),
@@ -1188,7 +1230,13 @@ fn output_reach_of(zone: &Zone, ps: &ZoneState, browser_stream_pulled: bool) -> 
         return "no_output";
     }
     if zone.output_type.as_deref() != Some("browser") {
-        return "ok";
+        // #4601 / #4580 — l'appareil est nommé, mais le registre vivant ne le
+        // connaît plus. `None` = on ne sait pas, donc on ne conclut rien.
+        return if appareil_vu == Some(false) {
+            "output_missing"
+        } else {
+            "ok"
+        };
     }
 
     // Zone navigateur : la sortie, c'est l'onglet. On ne peut pas la

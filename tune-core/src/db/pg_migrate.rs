@@ -611,6 +611,8 @@ CREATE TABLE IF NOT EXISTS streaming_favorites (
 -- ci-dessus ne la corrige pas. Même raison que les trois colonnes d'identité de
 -- `favorites` juste au-dessus (#2111).
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS position TEXT;
+-- Date de première vue LOCALE (web #1060) — même rattrapage, même raison.
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS first_seen_at TEXT;
 
 CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
@@ -983,7 +985,7 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_id TEXT;
 -- #2441). TEXT comme album_id / profile_id ici : ce schema porte tout en TEXT.
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_position TEXT;
 -- listen_history: l'espace de noms de context_id, et le nom d'une playlist de
--- service que cette base ne sait pas retrouver (SQLite migration v104).
+-- service que cette base ne sait pas retrouver (SQLite migration v105).
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_source TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_title TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS context_cover TEXT;

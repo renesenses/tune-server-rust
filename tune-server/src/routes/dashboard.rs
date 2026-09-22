@@ -28,10 +28,61 @@ pub fn router() -> Router<AppState> {
         .route("/wrapped", get(wrapped))
 }
 
+/// Les albums de la bibliothèque qui ont été ÉCOUTÉS, avec leurs colonnes de
+/// genre — une ligne par album distinct.
+///
+/// `listen_history` ne porte AUCUNE colonne genre : on passe par l'album de
+/// l'écoute, `listen_history.album_id` s'il est connu, sinon l'album de la
+/// piste écoutée. Une écoute de service (Qobuz…) sans album local n'a pas de
+/// genre connu : elle ne compte pas — limite assumée, dite dans #4527.
+///
+/// `genres` est `TEXT` sous SQLite comme sous PostgreSQL : le `DISTINCT` sur
+/// les deux colonnes est portable.
+const ALBUMS_ECOUTES: &str = "SELECT DISTINCT al.genre, al.genres \
+     FROM listen_history lh \
+     LEFT JOIN tracks t ON t.id = lh.track_id \
+     JOIN albums al ON al.id = COALESCE(lh.album_id, t.album_id)";
+
+/// Le nombre de GENRES ÉCOUTÉS — #4527.
+///
+/// 🔴 Même notion de genre que `GET /library/genres`, par la MÊME fonction
+/// (`genres_de_l_album`) : les deux chiffres voisinent sur l'accueil et
+/// doivent se comparer.
+///
+/// `None` si la requête échoue — et le champ est alors ABSENT de la réponse,
+/// pas mis à zéro. Un « 0 » serait un mensonge que l'écran afficherait tel
+/// quel ; un champ absent, l'écran sait le taire.
+fn genres_ecoutes(state: &AppState) -> Option<i64> {
+    let lignes = match state.backend.query_many(ALBUMS_ECOUTES, &[]) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard_genres_ecoutes_error");
+            return None;
+        }
+    };
+    let mut cles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lignes {
+        let genre = l.first().and_then(|v| v.as_string());
+        let genres = l.get(1).and_then(|v| v.as_string());
+        for (cle, _) in
+            crate::routes::library::genres_de_l_album(genre.as_deref(), genres.as_deref())
+        {
+            cles.insert(cle);
+        }
+    }
+    Some(cles.len() as i64)
+}
+
 async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
     let repo = HistoryRepo::with_backend(state.backend.clone());
     match repo.dashboard() {
-        Ok(s) => Json(json!(s)),
+        Ok(s) => {
+            let mut v = json!(s);
+            if let Some(n) = genres_ecoutes(&state) {
+                v["unique_genres"] = json!(n);
+            }
+            Json(v)
+        }
         Err(e) => {
             tracing::warn!(error = %e, "dashboard_stats_error");
             Json(json!({
@@ -282,4 +333,168 @@ async fn wrapped(
         "top_artists": top_artists,
         "top_tracks": top_tracks,
     })))
+}
+
+/// Les GENRES ÉCOUTÉS de `/dashboard/stats` — #4527.
+///
+/// Chantier accueil, Bertrand, 19/09/2026 : la ligne de chiffres de l'accueil
+/// devient configurable, et la carte « Genres » existe aussi en version
+/// écoutée. Elle voisine avec « Genres » de la bibliothèque (115 sur le .18) :
+/// les deux doivent compter de la même façon.
+#[cfg(test)]
+mod genres_ecoutes_4527 {
+    use super::*;
+
+    fn etat() -> AppState {
+        AppState::new(":memory:", 0, Default::default()).unwrap()
+    }
+
+    /// Un album au genre donné — `genres` est le tableau JSON, `genre` la
+    /// colonne héritée.
+    fn album(state: &AppState, titre: &str, genre: Option<&str>, genres: Option<&str>) -> i64 {
+        use tune_core::db::album_repo::AlbumRepo;
+        use tune_core::db::artist_repo::ArtistRepo;
+        let ar = ArtistRepo::with_backend(state.backend.clone())
+            .get_or_create("Artiste", None, None)
+            .unwrap();
+        let id = AlbumRepo::with_backend(state.backend.clone())
+            .get_or_create(titre, ar.id.unwrap(), None)
+            .unwrap()
+            .id
+            .unwrap();
+        state
+            .backend
+            .execute(
+                "UPDATE albums SET genre = ?, genres = ? WHERE id = ?",
+                &[&genre.map(str::to_string), &genres.map(str::to_string), &id],
+            )
+            .unwrap();
+        id
+    }
+
+    fn ecoute_d_album(state: &AppState, album_id: i64) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history (title, source, duration_ms, album_id) VALUES ('t', 'local', 1000, ?)",
+                &[&album_id],
+            )
+            .unwrap();
+    }
+
+    async fn stats(state: AppState) -> Value {
+        let Json(v) = dashboard_stats(State(state)).await;
+        v
+    }
+
+    #[tokio::test]
+    async fn sans_ecoute_le_champ_vaut_zero_et_c_est_vrai() {
+        // Ici 0 n'est pas un repli : il n'y a vraiment rien d'écouté. Le
+        // champ est PRÉSENT — seul un échec de requête le fait disparaître.
+        let s = stats(etat()).await;
+        assert_eq!(s["unique_genres"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn deux_graphies_d_un_meme_genre_ne_font_qu_un() {
+        // 🔴 LE témoin de « même notion que la bibliothèque ». Un
+        // `COUNT(DISTINCT genre)` naïf rendrait 2 ici ; `/library/genres`
+        // rend UNE carte « Trip Hop » (#1161). Les deux cartes voisines de
+        // l'accueil se contrediraient.
+        let st = etat();
+        let a = album(&st, "A", Some("Trip Hop"), None);
+        let b = album(&st, "B", Some("Trip-Hop"), None);
+        ecoute_d_album(&st, a);
+        ecoute_d_album(&st, b);
+        assert_eq!(
+            stats(st).await["unique_genres"],
+            json!(1),
+            "« Trip Hop » et « Trip-Hop » doivent compter pour UN genre, comme dans /library/genres"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_album_non_ecoute_ne_compte_pas() {
+        let st = etat();
+        let ecoute = album(&st, "Écouté", Some("Jazz"), None);
+        album(&st, "Jamais écouté", Some("Rock"), None);
+        ecoute_d_album(&st, ecoute);
+        assert_eq!(stats(st).await["unique_genres"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn plusieurs_genres_par_album_et_le_tableau_json_d_abord() {
+        // Le tableau `genres` prime sur la colonne héritée — la règle de
+        // `list_genres`, reprise par la fonction partagée.
+        let st = etat();
+        let a = album(&st, "A", Some("Ignoré"), Some(r#"["Jazz","Blues"]"#));
+        let b = album(&st, "B", Some("Rock; Jazz"), None);
+        ecoute_d_album(&st, a);
+        ecoute_d_album(&st, b);
+        // Jazz, Blues, Rock — « Ignoré » ne compte pas, le tableau l'emporte.
+        assert_eq!(stats(st).await["unique_genres"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn une_ecoute_sans_album_passe_par_sa_piste() {
+        // `listen_history.album_id` peut manquer : l'album vient alors de la
+        // piste écoutée.
+        let st = etat();
+        let alb = album(&st, "Par la piste", Some("Blues"), None);
+        let piste = st
+            .backend
+            .execute_returning_id(
+                "INSERT INTO tracks (title, album_id) VALUES ('Piste', ?)",
+                &[&alb],
+            )
+            .unwrap();
+        st.backend
+            .execute(
+                "INSERT INTO listen_history (title, source, duration_ms, track_id) VALUES ('Piste', 'local', 1000, ?)",
+                &[&piste],
+            )
+            .unwrap();
+        assert_eq!(stats(st).await["unique_genres"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn un_album_ecoute_dix_fois_compte_une_fois() {
+        let st = etat();
+        let a = album(&st, "A", Some("Jazz"), None);
+        for _ in 0..10 {
+            ecoute_d_album(&st, a);
+        }
+        assert_eq!(stats(st).await["unique_genres"], json!(1));
+    }
+
+    #[tokio::test]
+    async fn une_ecoute_de_service_sans_album_local_ne_compte_pas() {
+        // Limite ASSUMÉE (#4527) : une écoute Qobuz sans album local n'a pas
+        // de genre connu. Elle ne fait pas planter le calcul pour autant.
+        let st = etat();
+        st.backend
+            .execute(
+                "INSERT INTO listen_history (title, source, source_id, duration_ms) VALUES ('Q', 'qobuz', '42', 1000)",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(stats(st).await["unique_genres"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn les_autres_champs_ne_bougent_pas() {
+        // L'ajout n'enlève rien : l'écran d'aujourd'hui lit ces quatre-là.
+        let s = stats(etat()).await;
+        for champ in [
+            "total_listens",
+            "total_duration_ms",
+            "unique_tracks",
+            "unique_artists",
+        ] {
+            assert!(
+                s.get(champ).is_some(),
+                "{champ} a disparu de /dashboard/stats"
+            );
+        }
+    }
 }

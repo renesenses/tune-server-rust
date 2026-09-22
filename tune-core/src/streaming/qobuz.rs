@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -82,9 +82,24 @@ struct EntreeCache {
 /// quelque chose que personne ne remarque.
 const TTL_EDITORIAL: Duration = Duration::from_secs(1800);
 
-/// Au-delà, on purge les entrées expirées. Une poignée de clés suffit à couvrir
-/// la page découverte ; ce plafond n'existe que pour qu'un cache oublié ne
-/// grossisse pas indéfiniment.
+/// Fenêtre pendant laquelle une réponse éditoriale PÉRIMÉE reste servable en
+/// REPLI, quand l'amont vient d'échouer (signalement Levente, 20/09/2026).
+///
+/// Ce n'est pas une seconde durée de fraîcheur : passé [`TTL_EDITORIAL`], on
+/// retourne toujours interroger Qobuz. Cette borne-ci ne dit qu'une chose —
+/// jusqu'où il reste honnête de resservir la dernière liste connue plutôt que
+/// de faire disparaître une rangée de l'accueil. Vingt-quatre heures, parce
+/// que les sélections Qobuz changent au mieux une fois par jour : au-delà,
+/// « dernière valeur connue » ne voudrait plus rien dire et l'échec doit
+/// redevenir franc.
+const TTL_REPLI_EDITORIAL: Duration = Duration::from_secs(86_400);
+
+/// Nombre d'entrées éditoriales gardées en mémoire.
+///
+/// Ce plafond est TENU : on purge d'abord ce qui est sorti de la fenêtre de
+/// repli ([`TTL_REPLI_EDITORIAL`]), puis, s'il le faut, on évince la plus
+/// ancienne. Une poignée de clés suffit à couvrir la page découverte ; ce
+/// plafond n'existe que pour qu'un cache oublié ne grossisse pas indéfiniment.
 const MAX_ENTREES_CACHE: usize = 64;
 
 /// Durée de vie du détail d'album en cache.
@@ -98,8 +113,7 @@ const TTL_ALBUM: Duration = Duration::from_secs(300);
 
 /// Nombre d'albums gardés en mémoire.
 ///
-/// Ce plafond est TENU, contrairement à [`MAX_ENTREES_CACHE`] qui ne purge que
-/// les entrées expirées et peut donc croître si elles sont toutes fraîches.
+/// Ce plafond est TENU, comme celui de [`MAX_ENTREES_CACHE`].
 /// Une liste de pistes pèse, et une navigation d'une heure traverse facilement
 /// des centaines d'albums : ici on évince la plus ancienne.
 const MAX_ALBUMS_CACHE: usize = 32;
@@ -670,12 +684,43 @@ impl QobuzService {
         })
     }
 
+    /// La dernière réponse connue pour cette clé, même PÉRIMÉE, tant qu'elle
+    /// tient dans [`TTL_REPLI_EDITORIAL`]. Rend aussi son âge, pour le journal.
+    ///
+    /// Distincte de [`cache_get`](Self::cache_get) et jamais appelée à sa
+    /// place : celle-ci ne sert QUE de repli, après un échec amont. Les
+    /// confondre reviendrait à ne plus jamais rafraîchir l'éditorial.
+    fn cache_pour_repli(&self, cle: &str) -> Option<(serde_json::Value, Duration)> {
+        let cache = self.cache_editorial.lock().ok()?;
+        cache.get(cle).and_then(|e| {
+            let age = e.cree.elapsed();
+            (age < TTL_REPLI_EDITORIAL).then(|| (e.donnees.clone(), age))
+        })
+    }
+
     fn cache_set(&self, cle: String, donnees: serde_json::Value) {
         let Ok(mut cache) = self.cache_editorial.lock() else {
             return;
         };
         if cache.len() >= MAX_ENTREES_CACHE {
-            cache.retain(|_, e| e.cree.elapsed() < TTL_EDITORIAL);
+            // `TTL_REPLI_EDITORIAL` et non `TTL_EDITORIAL` : au-delà de trente
+            // minutes une entrée n'est plus FRAÎCHE, mais elle reste la
+            // dernière valeur connue — celle qui évite de faire disparaître
+            // une rangée de l'accueil quand Qobuz hoquette. La purger ici
+            // déferait le repli en silence.
+            cache.retain(|_, e| e.cree.elapsed() < TTL_REPLI_EDITORIAL);
+        }
+        if cache.len() >= MAX_ENTREES_CACHE {
+            // Garder les entrées plus longtemps oblige à TENIR le plafond :
+            // sinon la table croîtrait. On évince la plus ancienne, comme le
+            // cache d'albums.
+            if let Some(plus_ancienne) = cache
+                .iter()
+                .min_by_key(|(_, e)| e.cree)
+                .map(|(cle, _)| cle.clone())
+            {
+                cache.remove(&plus_ancienne);
+            }
         }
         cache.insert(
             cle,
@@ -715,9 +760,30 @@ impl QobuzService {
             debug!(path, "qobuz_editorial_cache_hit");
             return Ok(donnees);
         }
-        let donnees = self.api_get(path, params).await?;
-        self.cache_set(cle, donnees.clone());
-        Ok(donnees)
+        match self.api_get(path, params).await {
+            Ok(donnees) => {
+                self.cache_set(cle, donnees.clone());
+                Ok(donnees)
+            }
+            // Repli sur la dernière liste connue (signalement Levente,
+            // 20/09/2026). Un 500 passager de Qobuz sur `/playlist/getTags`
+            // vidait l'accueil de ses catégories et levait un bandeau rouge.
+            Err(e) => match self.cache_pour_repli(&cle) {
+                Some((donnees, age)) => {
+                    warn!(
+                        path,
+                        age_s = age.as_secs(),
+                        erreur = %e,
+                        "qobuz_editorial_repli_derniere_valeur"
+                    );
+                    Ok(donnees)
+                }
+                // Rien en mémoire : l'échec reste FRANC. On ne transforme pas
+                // une panne totale en succès muet, ni en liste vide présentée
+                // comme vraie.
+                None => Err(e),
+            },
+        }
     }
 
     /// La réponse de `/album/get` pour cet album — une seule fois par album.
@@ -1913,6 +1979,11 @@ impl QobuzService {
     /// (30 min). Pas de nouvel état, pas de nouvelle purge à écrire — et si
     /// Qobuz finit par peupler ce sous-genre, le chevron revient au plus tard
     /// une demi-heure plus tard.
+    ///
+    /// ⚠️ La table, elle, garde ses entrées jusqu'à [`TTL_REPLI_EDITORIAL`]
+    /// (24 h) depuis le repli éditorial. Le démenti ne suit PAS : le test
+    /// d'âge ci-dessous est explicite et reste sur `TTL_EDITORIAL`. Un vide
+    /// constaté hier n'autorise pas à retirer un chevron aujourd'hui.
     fn retirer_les_chevrons_dementis(&self, genres: &mut [StreamGenre]) {
         if !genres.iter().any(|g| g.has_children) {
             return;
@@ -2443,28 +2514,56 @@ impl StreamingService for QobuzService {
                         // 13 catégories ne trouvait son nom et toutes
                         // retombaient sur leur slug : les rangées s'appelaient
                         // « artist », « mood », « label ».
-                        let localized = |v: &serde_json::Value| -> Option<String> {
+                        //
+                        // 🔴 Fuites de français : l'objet localisé porte le
+                        // libellé dans PLUSIEURS langues — `{"fr": …, "en": …}`
+                        // — et cette fonction n'en gardait qu'une, le français,
+                        // pour tout le monde. Un testeur roumain sur un compte
+                        // « Qobuz UK » lisait « Histoires de labels » et
+                        // « Nouveautés » alors que l'anglais était dans la même
+                        // réponse. Le faisceau entier est désormais retenu, et
+                        // le choix se fait au plus près de l'affichage, d'après
+                        // la langue de la requête.
+                        let faisceau = |v: &serde_json::Value| -> Option<BTreeMap<String, String>> {
                             let obj = v.as_object()?;
-                            obj.get("fr")
-                                .or_else(|| obj.get("en"))
-                                .or_else(|| obj.values().next())
-                                .and_then(|s| s.as_str())
-                                .map(String::from)
+                            let table: BTreeMap<String, String> = obj
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.to_lowercase(), s.to_string()))
+                                })
+                                .collect();
+                            (!table.is_empty()).then_some(table)
                         };
-                        let name = item["name"]
-                            .as_str()
-                            .map(String::from)
-                            .or_else(|| localized(&item["name"]))
+                        let name_i18n = faisceau(&item["name"])
                             .or_else(|| {
                                 item["name_json"]
                                     .as_str()
                                     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                                     .as_ref()
-                                    .and_then(localized)
+                                    .and_then(faisceau)
                             })
-                            .or_else(|| localized(&item["name_json"]))
+                            .or_else(|| faisceau(&item["name_json"]));
+                        // `name` garde la valeur d'avant — le français quand
+                        // Qobuz le sert. C'est le champ que cite le contrat
+                        // web ; un client qui ignore `name_i18n` ne voit aucune
+                        // différence.
+                        let name = item["name"]
+                            .as_str()
+                            .map(String::from)
+                            .or_else(|| {
+                                name_i18n.as_ref().and_then(|t| {
+                                    t.get("fr")
+                                        .or_else(|| t.get("en"))
+                                        .or_else(|| t.values().next())
+                                        .cloned()
+                                })
+                            })
                             .unwrap_or_else(|| id.clone());
-                        Some(PlaylistTag { id, name })
+                        Some(PlaylistTag {
+                            id,
+                            name,
+                            name_i18n,
+                        })
                     })
                     .collect()
             })
@@ -2601,6 +2700,7 @@ impl StreamingService for QobuzService {
                 Some(PlaylistTagGroup {
                     id: tag.id,
                     name: tag.name,
+                    name_i18n: tag.name_i18n,
                     playlists,
                 })
             })
@@ -4038,26 +4138,61 @@ mod tests {
         );
     }
 
-    /// Le plafond d'entrées purge les périmées au lieu de croître sans fin.
+    /// Le plafond d'entrées purge les oubliées au lieu de croître sans fin.
+    ///
+    /// La borne de purge est désormais [`TTL_REPLI_EDITORIAL`] et non
+    /// `TTL_EDITORIAL` : une entrée périmée reste la dernière valeur connue.
     #[test]
-    fn le_cache_purge_les_perimees_quand_il_est_plein() {
+    fn le_cache_purge_les_oubliees_quand_il_est_plein() {
         let svc = QobuzService::new("app".into(), "secret".into());
         {
             let mut cache = svc.cache_editorial.lock().unwrap();
             for i in 0..MAX_ENTREES_CACHE {
                 cache.insert(
-                    format!("perimee-{i}"),
+                    format!("oubliee-{i}"),
                     EntreeCache {
                         donnees: json!(i),
-                        cree: Instant::now() - TTL_EDITORIAL - Duration::from_secs(1),
+                        cree: Instant::now() - TTL_REPLI_EDITORIAL - Duration::from_secs(1),
                     },
                 );
             }
         }
         svc.cache_set("fraiche".into(), json!("ok"));
         let cache = svc.cache_editorial.lock().unwrap();
-        assert_eq!(cache.len(), 1, "les périmées ont été purgées");
+        assert_eq!(cache.len(), 1, "les oubliées ont été purgées");
         assert!(cache.contains_key("fraiche"));
+    }
+
+    /// Allonger la rétention ne doit pas laisser la table grossir : quand
+    /// toutes les entrées sont encore des replis valables, on évince la plus
+    /// ANCIENNE. Sans ce second passage, le plafond ne serait plus tenu.
+    #[test]
+    fn le_plafond_tient_meme_quand_tout_est_encore_un_repli_valable() {
+        let svc = QobuzService::new("app".into(), "secret".into());
+        {
+            let mut cache = svc.cache_editorial.lock().unwrap();
+            for i in 0..MAX_ENTREES_CACHE {
+                cache.insert(
+                    format!("repli-{i}"),
+                    EntreeCache {
+                        donnees: json!(i),
+                        // Périmées pour la fraîcheur, mais toutes servables
+                        // en repli : la purge n'en retire aucune.
+                        cree: Instant::now()
+                            - TTL_EDITORIAL
+                            - Duration::from_secs(60 * (i as u64 + 1)),
+                    },
+                );
+            }
+        }
+        svc.cache_set("fraiche".into(), json!("ok"));
+        let cache = svc.cache_editorial.lock().unwrap();
+        assert_eq!(cache.len(), MAX_ENTREES_CACHE, "le plafond est tenu");
+        assert!(cache.contains_key("fraiche"));
+        assert!(
+            !cache.contains_key(&format!("repli-{}", MAX_ENTREES_CACHE - 1)),
+            "c'est la plus ancienne qui est partie"
+        );
     }
 
     #[test]
@@ -6057,5 +6192,248 @@ mod tests_rubriques_par_genre {
         assert_eq!(presse[0].title, "press-awards|80");
         assert_eq!(ideale[0].title, "ideal-discography|80");
         assert_eq!(vus.lock().expect("verrou d'essai").len(), 2);
+    }
+}
+
+/// Le repli sur la dernière liste éditoriale connue (signalement Levente,
+/// 20/09/2026).
+///
+/// Le testeur voyait, en ouvrant l'ACCUEIL, un bandeau rouge portant la charge
+/// brute de Qobuz :
+///
+/// ```text
+/// Server error: qobuz /playlist/getTags: 500 {"message":"An unexpected error
+/// occurred (Root=1-6ab00353-…)","status":"error","code":500}
+/// ```
+///
+/// `Root=1-…` est un identifiant de trace AWS : le 500 vient de chez Qobuz.
+/// Mesuré sur le .18 le 20/09, la même route rend 200 en 4 ms et 13
+/// catégories — la panne est donc INTERMITTENTE. Une liste de catégories
+/// éditoriales qui change au mieux une fois par jour n'a aucune raison de
+/// disparaître parce que l'amont a hoqueté une fois.
+///
+/// Aucun de ces essais ne touche l'API Qobuz : ils parlent à un serveur simulé
+/// lié sur `127.0.0.1:0`, qui COMPTE ses appels et qu'on fait tomber à la
+/// demande.
+#[cfg(test)]
+mod tests_repli_editorial {
+    use super::*;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// La charge que Qobuz a réellement rendue à Levente.
+    const CORPS_500: &str = r#"{"message":"An unexpected error occurred (Root=1-6ab00353-78b03a4041ebe03408857ce0)","status":"error","code":500}"#;
+
+    /// Les 13 catégories mesurées sur le .18 le 20/09/2026, dans leur forme
+    /// réelle : le libellé arrive en `name_json`, pas en `name`.
+    fn treize_categories() -> serde_json::Value {
+        let noms = [
+            ("mood", "Humeurs"),
+            ("focus", "Focus"),
+            ("genre", "Genres"),
+            ("label", "Labels"),
+            ("artist", "Artistes"),
+            ("decade", "Décennies"),
+            ("theme", "Thèmes"),
+            ("activity", "Activités"),
+            ("instrument", "Instruments"),
+            ("country", "Pays"),
+            ("era", "Époques"),
+            ("chart", "Classements"),
+            ("event", "Événements"),
+        ];
+        let tags: Vec<serde_json::Value> = noms
+            .iter()
+            .map(|(slug, fr)| {
+                json!({
+                    "id": slug,
+                    "slug": slug,
+                    "name_json": json!({"fr": fr, "en": slug}).to_string(),
+                })
+            })
+            .collect();
+        json!({ "tags": tags })
+    }
+
+    /// Un Qobuz simulé pour `/playlist/getTags`. `en_panne` le fait rendre
+    /// 500 — exactement le corps que Levente a lu — et `appels` compte les
+    /// allers-retours réellement payés.
+    async fn qobuz_tags_simule() -> (String, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let en_panne = Arc::new(AtomicBool::new(false));
+        let appels = Arc::new(AtomicUsize::new(0));
+        let drapeau = en_panne.clone();
+        let compteur = appels.clone();
+
+        let app = Router::new().route(
+            "/playlist/getTags",
+            get(move || {
+                let drapeau = drapeau.clone();
+                let compteur = compteur.clone();
+                async move {
+                    compteur.fetch_add(1, Ordering::SeqCst);
+                    if drapeau.load(Ordering::SeqCst) {
+                        (StatusCode::INTERNAL_SERVER_ERROR, CORPS_500).into_response()
+                    } else {
+                        Json(treize_categories()).into_response()
+                    }
+                }
+            }),
+        );
+
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), en_panne, appels)
+    }
+
+    /// Vieillit l'entrée éditoriale au-delà de sa fraîcheur, pour que l'appel
+    /// suivant reparte VRAIMENT sur le réseau.
+    ///
+    /// Sans ce vieillissement l'essai serait un faux vert : le cache frais
+    /// (30 min) servirait le deuxième appel sans jamais toucher à l'amont, et
+    /// il passerait aussi bien SANS le correctif.
+    fn vieillir(svc: &QobuzService, path: &str, age: Duration) {
+        let cle = QobuzService::cle_cache(path, &[]);
+        let mut cache = svc.cache_editorial.lock().expect("verrou d'essai");
+        let entree = cache
+            .get_mut(&cle)
+            .expect("l'appel réussi a rempli le cache");
+        entree.cree = Instant::now() - age;
+    }
+
+    /// 🔴 Fuites de français — le faisceau multilingue survit à l'extraction.
+    ///
+    /// Le libellé arrive de Qobuz en `name_json`, sous forme d'objet
+    /// `{"fr": …, "en": …}`. La lecture n'en gardait qu'une langue, toujours
+    /// le français : l'anglais était dans la même réponse, et jeté. Un testeur
+    /// roumain lisait « Humeurs » et « Nouveautés » sur un compte Qobuz UK.
+    ///
+    /// Deux propriétés, dont la seconde est la contre-épreuve :
+    ///
+    /// 1. les DEUX langues parviennent à l'appelant, dans `name_i18n` ;
+    /// 2. `name` garde exactement sa valeur d'avant — c'est le champ que cite
+    ///    le contrat web, et un client qui ignore `name_i18n` ne doit voir
+    ///    aucune différence.
+    #[tokio::test]
+    async fn le_faisceau_multilingue_parvient_a_l_appelant() {
+        let (base, _en_panne, _appels) = qobuz_tags_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let tags = svc.get_playlist_tags().await.expect("Qobuz répond");
+        let humeurs = tags
+            .iter()
+            .find(|t| t.id == "mood")
+            .expect("la catégorie « mood » est servie");
+
+        let faisceau = humeurs
+            .name_i18n
+            .as_ref()
+            .expect("le libellé multilingue doit voyager, pas seulement le français");
+        assert_eq!(faisceau.get("fr").map(String::as_str), Some("Humeurs"));
+        assert_eq!(
+            faisceau.get("en").map(String::as_str),
+            Some("mood"),
+            "l'anglais était dans la réponse de Qobuz : il ne doit plus être jeté"
+        );
+
+        // Contre-épreuve de rétro-compatibilité : rien n'a bougé sur `name`.
+        assert_eq!(humeurs.name, "Humeurs");
+
+        // Et TOUTES les catégories portent leur faisceau, pas seulement une.
+        let sans_faisceau: Vec<&str> = tags
+            .iter()
+            .filter(|t| t.name_i18n.is_none())
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(
+            sans_faisceau.is_empty(),
+            "catégories sans libellé multilingue : {sans_faisceau:?}"
+        );
+    }
+
+    /// LE défaut du signalement. Qobuz a déjà rendu la liste une fois ; il
+    /// tombe ; l'accueil doit encore afficher ses catégories.
+    #[tokio::test]
+    async fn un_500_de_qobuz_ne_fait_pas_disparaitre_les_categories_connues() {
+        let (base, en_panne, appels) = qobuz_tags_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let premier = svc.get_playlist_tags().await.expect("Qobuz répond");
+        assert_eq!(premier.len(), 13, "les 13 catégories mesurées sur le .18");
+        assert!(premier.iter().any(|t| t.name == "Humeurs"));
+
+        // Le cache a expiré, et Qobuz s'est mis à rendre 500.
+        vieillir(
+            &svc,
+            "/playlist/getTags",
+            TTL_EDITORIAL + Duration::from_secs(1),
+        );
+        en_panne.store(true, Ordering::SeqCst);
+
+        let second = svc
+            .get_playlist_tags()
+            .await
+            .expect("la dernière liste connue doit être servie malgré le 500 amont");
+        assert_eq!(second.len(), 13, "la liste n'a pas maigri");
+        assert!(second.iter().any(|t| t.name == "Humeurs"));
+        // Le repli n'est pas un cache qui dort : l'amont a bien été retenté.
+        // Mesuré : 3 appels. Le premier, réussi, en vaut un ; le second en
+        // vaut deux, car `api_get` rejoue un 5xx sur l'endpoint de secours —
+        // que `base_forcee` confond ici avec le primaire.
+        assert!(
+            appels.load(Ordering::SeqCst) >= 2,
+            "l'amont n'a pas été retenté : {} appel(s)",
+            appels.load(Ordering::SeqCst)
+        );
+    }
+
+    /// La contre-épreuve : sans valeur antérieure, l'échec reste franc. On ne
+    /// transforme pas une panne totale en succès muet, ni en liste vide.
+    #[tokio::test]
+    async fn sans_valeur_anterieure_le_500_reste_une_erreur() {
+        let (base, en_panne, _) = qobuz_tags_simule().await;
+        en_panne.store(true, Ordering::SeqCst);
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let erreur = svc
+            .get_playlist_tags()
+            .await
+            .expect_err("rien en mémoire : l'échec doit sortir");
+        let texte = erreur.to_string();
+        assert!(
+            texte.contains("/playlist/getTags"),
+            "l'erreur doit désigner l'appel amont, lu : {texte}"
+        );
+    }
+
+    /// Le repli est borné : une liste oubliée depuis plus d'un jour ne
+    /// ressort pas. Sans cette borne, « dernière valeur connue » finirait par
+    /// vouloir dire « n'importe quand ».
+    #[tokio::test]
+    async fn un_repli_trop_vieux_ne_ressort_pas() {
+        let (base, en_panne, _) = qobuz_tags_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        svc.get_playlist_tags().await.expect("Qobuz répond");
+        vieillir(
+            &svc,
+            "/playlist/getTags",
+            TTL_REPLI_EDITORIAL + Duration::from_secs(1),
+        );
+        en_panne.store(true, Ordering::SeqCst);
+
+        assert!(
+            svc.get_playlist_tags().await.is_err(),
+            "au-delà de la fenêtre de repli, l'échec redevient franc"
+        );
     }
 }

@@ -1883,8 +1883,43 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
     Migration { version: 103, name: "upnp_catalog_revision",
         up: include_str!("../../migrations/upnp_catalog_revision.sql"),
     },
+    // renesenses/tune-web-client#1060 — la date que TUNE pose lui-meme sur un
+    // favori de service, a la premiere fois qu'il le voit.
+    //
+    // `created_at` porte la date du SERVICE, et le service la refait : mesure
+    // du 19/09/2026 sur le .18, vingt et un favoris Qobuz portant vingt et une
+    // dates distinctes reparties sur SEIZE SECONDES. Ce n'est pas l'histoire
+    // d'un auditeur, c'est l'instant ou une recopie les a recrees chez Qobuz.
+    // Le tri « Ajout recent » rend alors l'ordre d'une boucle.
+    //
+    // `first_seen_at` est pose a l'insertion et n'est JAMAIS reecrit : ni par
+    // `dater`, qui ne le nomme pas, ni par `premiere_vue_si_absente`, dont le
+    // `WHERE … IS NULL` est toute la garde. Meme lecon que `first_seen_at` sur
+    // `media_servers` (migration 101) et `zones.last_seen_at` (95).
+    //
+    // REGLE DE MIGRATION, ecrite et non devinee : les lignes deja en base
+    // recoivent `first_seen_at = created_at`. C'est la seule date dont on
+    // dispose au moment de la migration ; elle est fausse pour les favoris que
+    // le service a redates, mais elle est MESUREE, pas fabriquee, et elle ne
+    // peut pas etre pire que ce que l'ecran lit aujourd'hui. Une ligne sans
+    // `created_at` reste a NULL — le client retombe alors sur la date du
+    // service, exactement comme avant. Rien n'est invente en silence.
+    //
+    // Colonne posee par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95, 96,
+    // 99 et 100.
     Migration {
         version: 104,
+        name: "favoris_premiere_vue_locale",
+        up: "",
+    },
+
+    // Renumerotee 104 -> 105 a la promotion vers rc/v0.9.162 (PR #4735) :
+    // la 104 est partie a `favoris_premiere_vue_locale` (web #1060) pendant
+    // que ce lot etait en PR. Un numero deja applique sur une base ne se
+    // reprend jamais — meme regle que les PG 65/66 renumerotees depuis 59/60.
+    Migration {
+        version: 105,
         name: "listen_history_contexte_service_et_nom",
         // Rendre a l'objet demande son ESPACE DE NOMS et son NOM.
         //
@@ -2724,6 +2759,19 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Per-track cover — see migration 71 and forum #1312.
             add_column_if_missing(db, "tracks", "cover_path", "TEXT");
         }
+        if migration.version == 104 {
+            // La colonne d'abord (la table peut ne pas avoir ete touchee
+            // depuis la 58), la reprise ensuite. `WHERE first_seen_at IS NULL`
+            // : cette migration ne REECRIT jamais une date deja posee, meme
+            // rejouee.
+            add_column_if_missing(db, "streaming_favorites", "first_seen_at", "TEXT");
+            if let Err(e) = db.execute_batch(
+                "UPDATE streaming_favorites SET first_seen_at = created_at \
+                 WHERE first_seen_at IS NULL AND created_at IS NOT NULL",
+            ) {
+                warn!(erreur = %e, "migration_104_reprise_first_seen_at");
+            }
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -3027,7 +3075,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // au lieu de rejouer le meme ordre.
     add_column_if_missing(db, "listen_history", "context_position", "INTEGER");
     // L'espace de noms de `context_id`, et le libelle que cette base ne sait
-    // pas retrouver (migration 104). `source` ci-dessus est celui de la
+    // pas retrouver (migration 105). `source` ci-dessus est celui de la
     // PISTE : une playlist Qobuz ecrit des lignes `local` pour les morceaux
     // de bibliotheque qu'elle contient, sans changer d'espace de noms.
     add_column_if_missing(db, "listen_history", "context_source", "TEXT");
@@ -3163,6 +3211,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // jumelle de `favorites.position` posee plus haut, mais ICI parce que la
     // table vient seulement d'etre garantie. PG : migration 057.
     add_column_if_missing(db, "streaming_favorites", "position", "INTEGER");
+    // Date de PREMIERE VUE locale (migration 104, web #1060) — posee ICI aussi,
+    // et pour la meme raison que `position` juste au-dessus : les requetes de
+    // lecture la NOMMENT desormais, donc une base qui arriverait sans elle
+    // rendrait la liste des favoris VIDE. Aucune reprise de valeur ici : le
+    // remplissage est le travail de la migration 104, qui ne tourne qu'une
+    // fois. PG : migration 067.
+    add_column_if_missing(db, "streaming_favorites", "first_seen_at", "TEXT");
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
@@ -3748,10 +3803,22 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "upnp_catalog_revision",
         include_str!("../../migrations/postgres/066_upnp_catalog_revision.sql"),
     ),
+    // Jumelle de la SQLite 104 (web #1060). Numero libre remesure DANS LE
+    // CODE, entree par entree de cette liste — un `ls migrations/postgres` ment
+    // ici depuis la 54, qui est une entree `concat!` sans fichier.
     (
         67,
+        "favoris_premiere_vue_locale",
+        include_str!("../../migrations/postgres/067_favoris_premiere_vue_locale.sql"),
+    ),
+    // Jumelle de la SQLite 105 (PR #4630). Renumerotee 67 -> 68 a la promotion
+    // vers rc/v0.9.162 (PR #4735) : la 67 est partie a
+    // `favoris_premiere_vue_locale` pendant que ce lot etait en PR, et la
+    // contiguite de cette liste impose que le rang suive la place.
+    (
+        68,
         "listen_history_contexte_service_et_nom",
-        include_str!("../../migrations/postgres/067_listen_history_contexte_service_et_nom.sql"),
+        include_str!("../../migrations/postgres/068_listen_history_contexte_service_et_nom.sql"),
     ),
 ];
 
@@ -5413,6 +5480,121 @@ mod tests {
         assert_eq!(count, latest_version());
     }
 
+    /// PR #4735 — la promotion du lot « reprise du contexte de service » vers
+    /// `rc/v0.9.162` a trouve DEUX migrations portant le numero 104 : celle de
+    /// la rc (`favoris_premiere_vue_locale`, web #1060) et celle du lot
+    /// (`listen_history_contexte_service_et_nom`, PR #4630). La seconde a ete
+    /// renumerotee en 105 — et PG 67 -> 68 pour sa jumelle.
+    ///
+    /// Ce test prouve, sur une base NEUVE, que les deux s'appliquent, DANS CET
+    /// ORDRE, et que chacune laisse ses colonnes. Un renumerotage rate ne se
+    /// voit pas a la compilation : la premiere des deux entrees gagnerait la
+    /// ligne `_migrations` (clef primaire sur `version`) et la seconde serait
+    /// sautee en silence sur tout le parc des testeurs.
+    #[test]
+    fn les_deux_migrations_104_renumerotees_s_appliquent_dans_l_ordre() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let appliquees: Vec<(i32, String)> = {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT version, name FROM _migrations ORDER BY version")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, i32>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // Contiguite reelle : 1..=latest, sans trou ni doublon. C'est la garde
+        // qu'un numero reutilise fait tomber.
+        let attendues: Vec<i32> = (1..=latest_version()).collect();
+        let vues: Vec<i32> = appliquees.iter().map(|(v, _)| *v).collect();
+        assert_eq!(
+            vues,
+            attendues,
+            "les versions appliquees ne couvrent pas 1..={} sans trou",
+            latest_version()
+        );
+
+        let nom = |v: i32| {
+            appliquees
+                .iter()
+                .find(|(version, _)| *version == v)
+                .map(|(_, n)| n.as_str())
+                .unwrap_or("<absente>")
+        };
+        assert_eq!(
+            nom(104),
+            "favoris_premiere_vue_locale",
+            "la 104 appartient a la rc (web #1060) ; elle est deja appliquee \
+             sur les bases des testeurs et ne se reprend pas"
+        );
+        assert_eq!(
+            nom(105),
+            "listen_history_contexte_service_et_nom",
+            "la migration du lot doit venir APRES la 104 de la rc"
+        );
+
+        // Et les colonnes des DEUX sont bien la : une entree enregistree mais
+        // sans effet serait un faux vert.
+        let colonnes = |table: &str| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        let favoris = colonnes("streaming_favorites");
+        assert!(
+            favoris.iter().any(|c| c == "first_seen_at"),
+            "104 : `streaming_favorites.first_seen_at` manque ({favoris:?})"
+        );
+        let historique = colonnes("listen_history");
+        for attendue in ["context_source", "context_title", "context_cover"] {
+            assert!(
+                historique.iter().any(|c| c == attendue),
+                "105 : `listen_history.{attendue}` manque ({historique:?})"
+            );
+        }
+
+        // Jumelles PostgreSQL. Ce test lit les SOURCES, donc il vaut sans la
+        // feature `postgres` — meme technique que
+        // `les_etiquettes_de_streaming_existent_sur_les_quatre_chemins`.
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ce_fichier = include_str!("migrations.rs");
+        for (fichier, rang) in [
+            ("067_favoris_premiere_vue_locale.sql", "(\n        67,"),
+            (
+                "068_listen_history_contexte_service_et_nom.sql",
+                "(\n        68,",
+            ),
+        ] {
+            assert!(
+                racine.join("migrations/postgres").join(fichier).exists(),
+                "la jumelle PG {fichier} n'existe pas"
+            );
+            assert!(
+                ce_fichier.contains(fichier),
+                "{fichier} n'est pas enregistree dans PG_MIGRATIONS"
+            );
+            assert!(ce_fichier.contains(rang), "le rang PG attendu a bouge");
+        }
+        // Le numero ecrit DANS le script doit etre celui de son entree : c'est
+        // lui qui marque `schema_version` cote PostgreSQL.
+        let sql_pg = std::fs::read_to_string(
+            racine.join("migrations/postgres/068_listen_history_contexte_service_et_nom.sql"),
+        )
+        .unwrap();
+        assert!(
+            sql_pg.contains("VALUES (68, 'listen_history_contexte_service_et_nom')"),
+            "le script PG marque encore l'ancien numero dans schema_version"
+        );
+    }
+
     #[test]
     fn default_smart_collections_are_not_duplicated() {
         // Regression for migration 47 re-seeding without a UNIQUE guard: the
@@ -5727,13 +5909,21 @@ mod tests {
         // 64 stores named AutoPlay modes and preserves legacy 0/1 values.
         // 65 and 66 carry the UPnP library sync and catalog revision (#4201),
         // renumbered from 59/60 after those shipped in v0.9.151.
-        // 67 : `listen_history_contexte_service_et_nom`, jumelle de la SQLite
-        // 104. Pose `context_source` / `context_title` / `context_cover` — sans
+        // 67 : `favoris_premiere_vue_locale` (web #1060), jumelle de la SQLite
+        // 104. Pose `first_seen_at` sur `streaming_favorites` et la remplit
+        // depuis `created_at` — la seule date disponible au moment de la
+        // migration. Sans elle, aucune base PostgreSQL deja creee ne recevrait
+        // la colonne, que les requetes de lecture NOMMENT desormais.
+        // 68 : `listen_history_contexte_service_et_nom`, jumelle de la SQLite
+        // 105. Pose `context_source` / `context_title` / `context_cover` — sans
         // elle, aucune base PostgreSQL ne recevrait les trois colonnes que
         // `continue_listening_contextes` NOMME desormais, et la section
         // « Continuer l'ecoute » disparaitrait sur tout ce parc : c'est la
         // forme exacte de #2860.
-        assert_eq!(pg_latest_version(), 67, "latest PG migration must be 67");
+        // Renumerotee 67 -> 68 a la promotion vers rc/v0.9.162 (PR #4735) :
+        // la 67 etait prise par `favoris_premiere_vue_locale` (web #1060),
+        // fusionnee dans la rc pendant que ce lot etait en PR.
+        assert_eq!(pg_latest_version(), 68, "latest PG migration must be 68");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

@@ -528,14 +528,16 @@ struct ImportAutoEqBody {
 ///
 /// AutoEq préfixe ses profils d'un `Preamp` négatif pour que ses gains positifs
 /// n'écrêtent pas. Tune réserve déjà cette marge, et davantage : le pré-gain
-/// automatique de l'égaliseur vaut le plus grand de la somme de tous les gains
-/// positifs de la cascade et de sa norme L1
-/// (`EqProfile::automatic_headroom_db`, d423c16b puis #4073). Appliquer en plus le
-/// `Preamp` du fichier atténuerait deux fois.
+/// automatique de l'égaliseur vaut la **norme L1** de la cascade, la borne
+/// vraie de sa réponse en temps (`EqProfile::automatic_headroom_db` ; la somme
+/// des gains positifs depuis d423c16b, le plus grand des deux depuis #4073, la
+/// L1 seule depuis #4594). Appliquer en plus le `Preamp` du fichier atténuerait
+/// deux fois.
 ///
 /// La conséquence s'entend et doit être affichée : sur l'Etymotic ER4SR, le
-/// fichier demande −6,4 dB et Tune en réserve −22,2. Le préréglage joue donc
-/// nettement plus bas que le même profil dans un lecteur qui suit le `Preamp`.
+/// fichier demande −6,4 dB et Tune en réserve −12,4 (c'était −22,2 avant
+/// #4594). Le préréglage joue donc plus bas que le même profil dans un lecteur
+/// qui suit le `Preamp`.
 /// Ce n'est pas un défaut — rien n'écrête, et le timbre est celui d'AutoEq —
 /// mais l'utilisateur doit pouvoir rattraper au volume en sachant pourquoi.
 /// D'où `preamp_db`, `reserved_headroom_db` et `preamp_applied` dans la
@@ -551,10 +553,12 @@ struct ImportAutoEqBody {
 ///
 /// La couverture n'est pas supposée, elle est **vérifiée à chaque import** :
 /// `preamp_covered_by_headroom` compare la marge réellement réservée au
-/// `Preamp` demandé. Elle est vraie sur tout profil publié par AutoEq (le
-/// maximum d'une réponse combinée ne dépasse jamais la somme de ses gains
-/// positifs) ; un fichier bricolé pourrait la mettre en défaut, et la réponse
-/// porte alors un `warning` plutôt que de se taire.
+/// `Preamp` demandé. Elle est vraie sur tout profil publié par AutoEq — la
+/// norme L1 majore toujours le maximum de la réponse combinée, que le `Preamp`
+/// compense — et `tune-core/tests/autoeq_profils_reels.rs` le vérifie sur
+/// trois casques plutôt que de le supposer, y compris après le passage à la
+/// borne vraie (#4594). Un fichier bricolé pourrait la mettre en défaut, et la
+/// réponse porte alors un `warning` plutôt que de se taire.
 async fn import_autoeq(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,

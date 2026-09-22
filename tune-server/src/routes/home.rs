@@ -421,7 +421,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
         .filter_map(|cols| {
             let nature = cols.first().and_then(|v| v.as_string())?;
             let id = cols.get(1).and_then(|v| v.as_string())?;
-            // L'ESPACE DE NOMS de `id`, ecrit depuis la migration 104. Deux
+            // L'ESPACE DE NOMS de `id`, ecrit depuis la migration 105. Deux
             // objets sans rapport peuvent porter le meme nombre chez deux
             // services : sans lui, ils ne font qu'une vignette. `None` sur
             // une ligne plus ancienne — inconnu, pas « local ».
@@ -457,7 +457,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
             let pochette_contexte = cols.get(12).and_then(|v| v.as_string());
             // CHEZ QUI cette vignette s'ouvre. L'espace de noms de l'objet
             // demande quand il est ecrit ; a defaut — lignes d'avant la
-            // migration 104 — la source de la piste, qui est ce que cette
+            // migration 105 — la source de la piste, qui est ce que cette
             // section publiait deja. On ne reconstitue pas le passe, on
             // arrete de le deviner pour l'avenir.
             let service = espace.clone().unwrap_or_else(|| source.clone());
@@ -548,7 +548,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                         .filter(|_| bibliotheque)
                         .cloned()
                         // Le nom releve chez le service au clic (migration
-                        // 104). C'est ce que l'auditeur a REELLEMENT lance :
+                        // 105). C'est ce que l'auditeur a REELLEMENT lance :
                         // il prime sur tout repli, et il est la seule chose
                         // qui nomme une playlist de service.
                         .or_else(|| titre_contexte.clone());
@@ -598,7 +598,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     // libelle d'album vaut toujours mieux qu'une vignette
                     // MUETTE, et il reste le repli des lignes qui n'ont pas
                     // de nom de contexte. Ce qui change, c'est qu'il n'est
-                    // plus le SEUL recours : depuis la migration 104 le nom de
+                    // plus le SEUL recours : depuis la migration 105 le nom de
                     // la playlist de service est ecrit au moment du clic, et
                     // `nom` ci-dessus le rend. Le repli redevient ce qu'il
                     // aurait toujours du etre — un filet pour l'historique
@@ -645,7 +645,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
 /// `Some("local")` : oui. `Some(<service>)` : non — `66898771` est une
 /// playlist Qobuz, et la chercher dans `playlists` ou `albums` produit une
 /// vignette etrangere a ce qui a ete ecoute. `None` : ligne d'avant la
-/// migration 104, dont l'espace de noms n'a jamais ete ecrit — on garde alors
+/// migration 105, dont l'espace de noms n'a jamais ete ecrit — on garde alors
 /// le comportement d'avant plutot que de vider retroactivement la section.
 fn est_de_la_bibliotheque(espace: Option<&str>) -> bool {
     espace.is_none_or(|e| e == "local")
@@ -2979,7 +2979,7 @@ mod tests_2441_progression {
 ///    se confondaient en une seule vignette.
 ///
 /// Les lignes SANS `context_source` (tout l'historique d'avant la migration
-/// 104) gardent exactement le comportement d'avant : c'est `mod
+/// 105) gardent exactement le comportement d'avant : c'est `mod
 /// tests_contextes` ci-dessus, dont aucune ecoute n'ecrit cette colonne, qui
 /// en fait foi.
 #[cfg(test)]
@@ -2987,7 +2987,7 @@ mod tests_contexte_de_service {
     use super::*;
 
     /// Une ecoute qui dit AUSSI d'ou vient l'objet demande, et comment il
-    /// s'appelle — ce que la migration 104 a rendu possible.
+    /// s'appelle — ce que la migration 105 a rendu possible.
     #[allow(clippy::too_many_arguments)]
     fn ecoute_de_service(
         state: &AppState,
@@ -3069,7 +3069,7 @@ mod tests_contexte_de_service {
     }
 
     /// #3425 tient toujours pour ce qu'il visait : sans nom de contexte — une
-    /// ligne d'avant la migration 104 — le libelle d'album reste, parce qu'une
+    /// ligne d'avant la migration 105 — le libelle d'album reste, parce qu'une
     /// vignette MUETTE est pire.
     #[test]
     fn sans_nom_de_contexte_le_libelle_d_album_reste_le_repli() {

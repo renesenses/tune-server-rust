@@ -14,16 +14,18 @@
 //! que la porte `POST /system/import/roon`, pour qu'aucune des deux ne dérive.
 //! Tune ne remplace JAMAIS une image ni un crédit qu'il a déjà.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::body::Body;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -31,7 +33,8 @@ use tune_core::db::backend::DbBackend;
 use tune_core::event_bus::TuneEvent;
 use tune_core::library::pont_roon::ExportRoon;
 use tune_core::library::pont_roon_import::{
-    ARCHIVE_MAX_OCTETS, ImagesRoon, appliquer, est_un_export_du_pont, lire_archive,
+    ARCHIVE_MAX_OCTETS, ENTREE_MAX_OCTETS, ImagesRoon, appliquer, est_un_export_du_pont,
+    ouvrir_archive,
 };
 use tune_core::license::{Feature, LicenseManager};
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
@@ -98,10 +101,9 @@ struct Etat {
 fn router(etat: Etat) -> Router<()> {
     Router::new()
         .route("/", get(etat_du_pont))
-        .route(
-            "/import",
-            post(importer).layer(DefaultBodyLimit::max(ARCHIVE_MAX_OCTETS as usize)),
-        )
+        // Pas de `DefaultBodyLimit` : le corps n'est pas lu par un extracteur
+        // mais écrit sur disque par `recevoir`, qui porte son propre plafond.
+        .route("/import", post(importer))
         .with_state(etat)
 }
 
@@ -134,6 +136,8 @@ async fn etat_du_pont(State(etat): State<Etat>) -> Json<Value> {
     Json(json!({
         "premium": etat.license.check_feature(Feature::PontRoon).await,
         "dernier_rapport": dernier_rapport(&etat.backend),
+        // Le client refuse un fichier plus gros AVANT de l'envoyer.
+        "archive_max_octets": ARCHIVE_MAX_OCTETS,
     }))
 }
 
@@ -143,23 +147,97 @@ struct ImportQuery {
     apercu: bool,
 }
 
+/// Le fichier où l'archive est reçue, effacé quoi qu'il arrive.
+struct Envoi(PathBuf);
+
+impl Drop for Envoi {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Écrit le corps sur disque au fil de l'envoi, sans jamais le tenir en
+/// mémoire. Avant, axum le mettait tout entier en RAM jusqu'à 600 Mio, puis
+/// coupait la connexion en plein envoi : le navigateur n'affichait qu'une
+/// « NetworkError », et le serveur ne journalisait rien (archive de Fabien,
+/// 21/09). Au-delà de `plafond`, un 413 lisible, et une trace au journal.
+async fn recevoir(
+    corps: Body,
+    dossier: &Path,
+    plafond: u64,
+) -> Result<(Envoi, u64), (StatusCode, String)> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let interne = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    tokio::fs::create_dir_all(dossier).await.map_err(interne)?;
+    let envoi = Envoi(dossier.join(format!(
+        ".pont-roon-envoi-{}-{}.part",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    )));
+    let mut fichier = tokio::fs::File::create(&envoi.0).await.map_err(interne)?;
+    let mut recus: u64 = 0;
+    let mut flux = corps.into_data_stream();
+    while let Some(morceau) = flux.next().await {
+        let morceau = morceau.map_err(|e| {
+            tracing::warn!(recus, erreur = %e, "pont_roon_envoi_interrompu");
+            (StatusCode::BAD_REQUEST, format!("envoi interrompu : {e}"))
+        })?;
+        recus += morceau.len() as u64;
+        if recus > plafond {
+            tracing::warn!(recus, plafond, "pont_roon_archive_trop_volumineuse");
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("archive de plus de {} Mio", plafond / (1024 * 1024)),
+            ));
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut fichier, &morceau)
+            .await
+            .map_err(interne)?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut fichier)
+        .await
+        .map_err(interne)?;
+    Ok((envoi, recus))
+}
+
 /// `POST /import` — l'archive du moissonneur, ou l'`export.json` seul.
-async fn importer(
-    State(etat): State<Etat>,
-    Query(q): Query<ImportQuery>,
-    corps: Bytes,
-) -> Response {
+async fn importer(State(etat): State<Etat>, Query(q): Query<ImportQuery>, corps: Body) -> Response {
     if !etat.license.check_feature(Feature::PontRoon).await {
         tracing::info!("pont_roon_refuse_sans_premium");
         return refus_premium();
     }
     let apercu = q.apercu;
+    let (envoi, recus) = match recevoir(corps, &etat.dossier_cache, ARCHIVE_MAX_OCTETS).await {
+        Ok(r) => r,
+        Err((statut, e)) => {
+            return (
+                statut,
+                Json(json!({"error": "export_pont_roon_illisible", "detail": e})),
+            )
+                .into_response();
+        }
+    };
+    tracing::info!(apercu, octets = recus, "pont_roon_archive_recue");
     let backend = etat.backend.clone();
     let dossier = etat.dossier_cache.clone();
     let travail = tokio::task::spawn_blocking(move || -> Result<Value, (StatusCode, String)> {
-        let (export, images) = if corps.starts_with(b"PK\x03\x04") {
-            lire_archive(&corps).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?
+        use std::io::{Read, Seek};
+        let illisible = |e: std::io::Error| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string());
+        let mut fichier = std::fs::File::open(&envoi.0).map_err(illisible)?;
+        let mut signature = [0u8; 4];
+        let lu = fichier.read(&mut signature).map_err(illisible)?;
+        fichier.rewind().map_err(illisible)?;
+        let aucune: std::collections::HashMap<String, Vec<u8>> = Default::default();
+        let (export, archive) = if signature[..lu] == *b"PK\x03\x04" {
+            let (export, a) = ouvrir_archive(std::io::BufReader::new(fichier))
+                .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
+            (export, Some(a).filter(|a| !a.est_vide()))
         } else {
+            let mut corps = Vec::new();
+            fichier
+                .take(ENTREE_MAX_OCTETS + 1)
+                .read_to_end(&mut corps)
+                .map_err(illisible)?;
             let texte = std::str::from_utf8(&corps).map_err(|_| {
                 (
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -174,10 +252,14 @@ async fn importer(
             }
             let export =
                 ExportRoon::lire(texte).map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e))?;
-            (export, Default::default())
+            (export, None)
         };
+        let avec_images = archive.is_some();
         let porte = ImagesRoon {
-            octets: &images,
+            octets: match &archive {
+                Some(a) => a,
+                None => &aucune,
+            },
             dossier_cache: dossier.as_path(),
         };
         let rapport = appliquer(&backend, &export, apercu, Some(&porte));
@@ -186,7 +268,7 @@ async fn importer(
         v["core"] = json!(export.core);
         v["releve"] = json!(export.releve);
         v["absent_de_l_api"] = json!(export.absent_de_l_api);
-        v["archive"] = json!(!images.is_empty());
+        v["archive"] = json!(avec_images);
         if !apercu {
             if let Err(e) =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
@@ -369,5 +451,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rep.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// L'archive s'écrit sur disque ; au-delà du plafond, un refus lisible et
+    /// rien ne reste derrière — jamais la coupure muette du 21/09.
+    #[tokio::test]
+    async fn l_envoi_va_sur_disque_et_le_plafond_refuse_lisiblement() {
+        let scratch = tune_core::test_scratch::scratch_dir("pont_roon_envoi");
+        let dossier = scratch.path().to_path_buf();
+        let (envoi, n) = recevoir(Body::from(vec![7u8; 100]), &dossier, 100)
+            .await
+            .unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(std::fs::read(&envoi.0).unwrap(), vec![7u8; 100]);
+        let chemin = envoi.0.clone();
+        drop(envoi);
+        assert!(!chemin.exists(), "le fichier d'envoi est effacé");
+
+        let (statut, detail) = recevoir(Body::from(vec![7u8; 101]), &dossier, 100)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(statut, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(detail.contains("Mio"), "{detail}");
+        let restes = std::fs::read_dir(&dossier).unwrap().count();
+        assert_eq!(restes, 0, "aucun fichier partiel laissé");
     }
 }

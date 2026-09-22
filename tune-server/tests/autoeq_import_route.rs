@@ -148,16 +148,19 @@ async fn la_reponse_dit_le_preamp_lu_la_marge_reservee_et_quelle_le_couvre() {
 
     assert_eq!(corps["preamp_db"], -6.1);
     assert_eq!(corps["preamp_applied"], false);
-    assert_eq!(corps["reserved_headroom_db"], -13.8);
+    // #4594 : la réserve est la norme L1 de la cascade — la borne vraie —
+    // et non plus la somme des gains positifs, qui valait ici −13,8 dB.
+    // 3,5 dB de niveau rendus, et le `Preamp` du fichier reste couvert.
+    assert_eq!(corps["reserved_headroom_db"], -10.274_060_182_678_957);
     assert_eq!(corps["preamp_covered_by_headroom"], true);
     // Rien à signaler : la marge de Tune est la plus protectrice des deux.
     assert!(corps.get("warning").is_none(), "corps : {corps}");
 }
 
-/// Un `Preamp` que la somme des gains ne justifie pas ne passe PAS en silence.
+/// Un `Preamp` que la marge réservée ne justifie pas ne passe PAS en silence.
 ///
-/// Le cas ne se produit pas sur un export AutoEq — le maximum d'une réponse
-/// combinée ne dépasse jamais la somme de ses gains positifs — mais un fichier
+/// Le cas ne se produit pas sur un export AutoEq — la norme L1 de la cascade
+/// majore toujours le maximum de sa réponse combinée — mais un fichier
 /// écrit à la main peut le fabriquer. La marge de Tune est alors moins
 /// protectrice que celle du fichier, et la réponse le DIT.
 #[tokio::test]

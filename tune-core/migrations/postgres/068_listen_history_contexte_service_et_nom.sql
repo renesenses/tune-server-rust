@@ -1,6 +1,6 @@
 -- Rendre a l'objet demande son ESPACE DE NOMS et son NOM.
 --
--- Jumelle de la migration SQLite 104. Les deux listes sont SEPAREES —
+-- Jumelle de la migration SQLite 105. Les deux listes sont SEPAREES —
 -- `run_migrations` ne prend qu'un `SqliteDb` — donc une colonne posee d'un
 -- seul cote ne repare que la moitie du parc (#1612, #2111).
 --
@@ -34,7 +34,7 @@ ALTER TABLE listen_history
 ALTER TABLE listen_history
     ADD COLUMN IF NOT EXISTS context_cover TEXT;
 
-INSERT INTO schema_version (version, name) VALUES (67, 'listen_history_contexte_service_et_nom')
+INSERT INTO schema_version (version, name) VALUES (68, 'listen_history_contexte_service_et_nom')
     ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

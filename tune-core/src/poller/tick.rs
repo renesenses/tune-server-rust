@@ -475,6 +475,9 @@ impl PositionPoller {
                 ps.gapless_arm_logged = None;
                 ps.gapless_dsd_skip_pos = None;
                 ps.gapless_armed = None;
+                // #3967 — ce que l'appareil disait de la suivante PRÉCÉDENTE
+                // ne dit rien de celle-ci : la prochaine pose la relèvera.
+                ps.suivante_preparee = SuivantePreparee::Inconnue;
                 // Une piste lancée par `play()` n'a rien adopté (#4173).
                 ps.adoption_horloge = None;
                 ps.transition(fsm::Transition::NouvellePiste);
@@ -651,7 +654,7 @@ impl PositionPoller {
                 }
             }
 
-            let (status, famine_anneau) = {
+            let (status, famine_anneau, progression_octets) = {
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
                     match outputs.get(&device_id) {
@@ -724,7 +727,7 @@ impl PositionPoller {
                                 bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
                             }
                         }
-                        (s, famine)
+                        (s, famine, progress)
                     }
                     Err(e) => {
                         ps.consecutive_errors = ps.consecutive_errors.saturating_add(1);
@@ -1332,7 +1335,7 @@ impl PositionPoller {
                         status.current_uri.as_deref(),
                         &adoption.flux,
                         age_secs,
-                        ADOPTION_HORLOGE_DELAI_SECS,
+                        adoption.delai_secs,
                     ) {
                         decisions::SuiteAdoption::EnAttente => {}
                         decisions::SuiteAdoption::Confirmee => {
@@ -1575,6 +1578,11 @@ impl PositionPoller {
             let mut motif_fin_de_piste: &'static str = "";
             let mut force_stop = false;
             let mut force_stop_demarrage_mort = false;
+            // #4645 — la mesure du décrochage, capturée au site de décision
+            // pour être relue au site de coupure : (position atteinte, durée
+            // de la piste, octets servis, octets attendus). `ZonePollState`
+            // est retiré avant l'action, ces valeurs ne survivraient pas.
+            let mut mesure_renderer_cale: Option<(u64, u64, u64, Option<u64>)> = None;
 
             // Guard: if Tune's own playback state for this zone is Stopped
             // (or has no now_playing), ignore device state changes entirely.
@@ -1903,8 +1911,27 @@ impl PositionPoller {
                                         None => (0, None),
                                     };
                                     let seeked = zone_state.last_seek_at.is_some();
-                                    if decisions::renderer_could_have_finished(sent, total, seeked)
-                                    {
+                                    // Une sortie qui tire elle-même son flux
+                                    // n'a pas de session de streaming : les
+                                    // octets servis ci-dessus valent (0, None)
+                                    // et le garde-fou la laisserait passer sans
+                                    // rien vérifier. Son `Stopped` ne dit pas
+                                    // « fini », il dit « pas encore parti »
+                                    // (#4623).
+                                    let jamais_demarree =
+                                        decisions::sortie_non_temps_reel_jamais_demarree(
+                                            status.realtime,
+                                            ps.peak_position_ms,
+                                            progression_octets,
+                                        );
+                                    if decisions::accepter_fin_apres_stopped(
+                                        status.realtime,
+                                        ps.peak_position_ms,
+                                        progression_octets,
+                                        sent,
+                                        total,
+                                        seeked,
+                                    ) {
                                         fsm_actual = Some(fsm::StoppedOutcome::NaturalEndAdvance);
                                         ps.gapless_sent = false;
                                         ps.gapless_armed = None;
@@ -1924,6 +1951,13 @@ impl PositionPoller {
                                                 track_dur = track_duration_ms,
                                                 bytes_sent = sent,
                                                 bytes_total = total.unwrap_or(0),
+                                                // Sans ce témoin, une sortie
+                                                // qui ne démarre pas se lit
+                                                // comme un renderer qui cale :
+                                                // deux pannes distinctes,
+                                                // même ligne (#4623).
+                                                jamais_demarree,
+                                                progress_bytes = progression_octets.unwrap_or(0),
                                                 "renderer_stopped_on_incomplete_stream_waiting"
                                             );
                                         }
@@ -1944,6 +1978,20 @@ impl PositionPoller {
                                         ps.transition(fsm::Transition::PanneDeLecture {
                                             cause: CauseDeCoupure::RendererCale,
                                         });
+                                        // #4645 — le renderer s'est tu sur un
+                                        // flux incomplet. Couper la zone ici
+                                        // terminait la file : c'est l'« arrêt
+                                        // soudain » du testeur. On garde de
+                                        // quoi décider une reprise À LA
+                                        // POSITION ATTEINTE plus bas ; la
+                                        // coupure reste le défaut si elle est
+                                        // refusée.
+                                        mesure_renderer_cale = Some((
+                                            ps.peak_position_ms,
+                                            track_duration_ms,
+                                            sent,
+                                            total,
+                                        ));
                                     }
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
@@ -2390,13 +2438,17 @@ impl PositionPoller {
                                 // piste explicitement en fin de morceau.
                             } else {
                                 match self.prepare_gapless(zone_id, zone_state, &device_id).await {
-                                    GaplessPrep::Armed(arme) => {
+                                    GaplessPrep::Armed(arme, tenue) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
                                         // Ce que le renderer a ACCEPTE. Pose
                                         // apres `set_next_media` seulement :
                                         // un envoi refuse n'arme rien (#3026).
                                         ps.gapless_armed = arme;
+                                        // #3967 — et ce qu'il en a DIT : la
+                                        // seule chose qui autorisera, en fin
+                                        // de piste, un `Next` au lieu du repli.
+                                        ps.suivante_preparee = tenue;
                                         ps.transition(fsm::armement_accepte(arme));
                                     }
                                     GaplessPrep::DsdNextSkipped => {
@@ -2586,6 +2638,32 @@ impl PositionPoller {
                             } else {
                                 (decisions::EnchainementArme::Aucun, None, None)
                             };
+                        // #3967 — le renderer n'a pas enchaîné TOUT SEUL.
+                        // Mais s'il avait prouvé à l'armement qu'il TIENT
+                        // notre suivante (`GetMediaInfo` → `NextURI`) et
+                        // qu'il DÉCLARE l'action `Next`
+                        // (`GetCurrentTransportActions`), il reste un geste
+                        // avant de tout jeter : le lui demander. Son tampon
+                        // est déjà rempli — le DMP-A6 de Villerio avait tiré
+                        // 143 s d'avance au moment où Tune coupait son flux —
+                        // donc rien à retélécharger, rien à renégocier.
+                        //
+                        // L'appareil qui n'annonce rien, qui ne retient rien,
+                        // ou qui refuse le `Next` garde le repli d'aujourd'hui
+                        // sans qu'une seule ligne change pour lui.
+                        let enchainement = if ps.past_end_ticks >= seuil_ticks
+                            && decisions::bascule_sur_la_suivante_autorisee(
+                                is_dlna,
+                                ps.suivante_preparee,
+                                flux_arme.as_deref(),
+                                enchainement,
+                            )
+                            && self.demander_la_bascule(zone_id, &device_id).await
+                        {
+                            decisions::EnchainementArme::Bascule
+                        } else {
+                            enchainement
+                        };
                         // Gardé pour le journal du repli : le `filter`
                         // ci-dessous consomme `flux_arme`, et c'est justement
                         // sa présence ou son absence qui nomme la branche.
@@ -2824,6 +2902,26 @@ impl PositionPoller {
                     }
                     autorisee
                 };
+                // #4645 — reprise après décrochage EN COURS de lecture. La
+                // fenêtre est relue ici, comme celle de la relance ci-dessus,
+                // pour la même raison : elle vit hors de l'état de sondage.
+                let reprise_cale = match mesure_renderer_cale {
+                    Some((position_ms, duree_ms, servis, total)) if !relance => {
+                        let mut reprises = self.reprises_renderer_cale.lock().await;
+                        let autorisee = decisions::reprise_apres_renderer_cale_autorisee(
+                            reprises.get(&zone_id).map(|t| t.elapsed().as_secs()),
+                            position_ms,
+                            duree_ms,
+                            servis,
+                            total,
+                        );
+                        if autorisee {
+                            reprises.insert(zone_id, Instant::now());
+                        }
+                        autorisee.then_some(position_ms)
+                    }
+                    _ => None,
+                };
                 if relance {
                     // Pause→Stop d'abord : le pipeline Eversolo coincé ACQUITTE
                     // les Stop sans les exécuter, seul Pause→Stop le libère
@@ -2846,6 +2944,48 @@ impl PositionPoller {
                         }
                         Err(e) => {
                             warn!(zone_id, position, error = %e, "demarrage_mort_relance_echouee");
+                            self.orchestrator
+                                .stop(zone_id, device_id_ref.as_deref())
+                                .await;
+                        }
+                    }
+                } else if let Some(position_ms) = reprise_cale {
+                    // On repart de la file à la même position, puis on saute
+                    // là où le renderer s'est tu. Si le saut échoue — sortie
+                    // sans capacité Seek, renderer qui refuse — la piste
+                    // rejouerait depuis le début après un quart d'heure de
+                    // musique : inacceptable, on coupe comme avant.
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                    let position = zone_state.queue_position;
+                    match self.orchestrator.play_from_queue(zone_id, position).await {
+                        Ok(_) => match self
+                            .orchestrator
+                            .seek(zone_id, position_ms, device_id_ref.as_deref())
+                            .await
+                        {
+                            Ok(()) => {
+                                warn!(
+                                    zone_id,
+                                    position, position_ms, "renderer_cale_reprise_automatique"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    zone_id,
+                                    position,
+                                    position_ms,
+                                    error = %e,
+                                    "renderer_cale_reprise_saut_echoue"
+                                );
+                                self.orchestrator
+                                    .stop(zone_id, device_id_ref.as_deref())
+                                    .await;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(zone_id, position, error = %e, "renderer_cale_reprise_echouee");
                             self.orchestrator
                                 .stop(zone_id, device_id_ref.as_deref())
                                 .await;

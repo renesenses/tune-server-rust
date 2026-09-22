@@ -24,6 +24,23 @@ pub struct StreamingFavorite {
     pub album: Option<String>,
     pub cover_url: Option<String>,
     pub created_at: Option<String>,
+    /// La date à laquelle TUNE a vu ce favori pour la première fois, ISO 8601
+    /// UTC — **jamais réécrite** (renesenses/tune-web-client#1060).
+    ///
+    /// `created_at` porte la date du SERVICE. Elle lui appartient, et il la
+    /// refait : mesure du 19/09/2026 sur le serveur de Bertrand, vingt et un
+    /// favoris Qobuz portant vingt et une dates distinctes réparties sur SEIZE
+    /// SECONDES — l'instant où une recopie les a recréés chez Qobuz, pas celui
+    /// où il a aimé les morceaux. Trier là-dessus rend l'ordre d'une boucle.
+    ///
+    /// Ce champ-ci est posé une fois, à l'insertion, et aucune
+    /// resynchronisation n'y touche : c'est ce qui le rend utile au tri
+    /// « Ajout récent ». Il s'AJOUTE à `created_at`, il ne le remplace pas —
+    /// un client qui ne le connaît pas lit exactement ce qu'il lisait avant.
+    ///
+    /// `None` sur une base dont la migration 104 / PG 067 n'a rien trouvé à
+    /// reprendre ; le client retombe alors sur `created_at`.
+    pub first_seen_at: Option<String>,
 }
 
 /// Engine-agnostic SQL builders.
@@ -38,8 +55,8 @@ pub mod sql {
         // `ORDER BY created_at DESC` in list() was non-deterministic on PG.
         format!(
             "INSERT INTO streaming_favorites \
-             (profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             (profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (profile_id, item_type, service, service_id) DO NOTHING",
             d.placeholder(1),
             d.placeholder(2),
@@ -50,16 +67,22 @@ pub mod sql {
             d.placeholder(7),
             d.placeholder(8),
             d.now_iso8601(),
+            d.now_iso8601(),
         )
     }
 
     /// Même insertion, la date de mise en favori DONNÉE par le service (#3489,
     /// reprise des favoris) au lieu du « maintenant » du moteur.
+    ///
+    /// `first_seen_at` reste le « maintenant » du moteur, et c'est voulu :
+    /// c'est l'instant où TUNE découvre ce favori, pas celui que le service
+    /// raconte. Les deux dates répondent à deux questions différentes et la
+    /// table les garde toutes les deux.
     pub fn add_date<D: SqlDialect>(d: &D) -> String {
         format!(
             "INSERT INTO streaming_favorites \
-             (profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             (profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (profile_id, item_type, service, service_id) DO NOTHING",
             d.placeholder(1),
             d.placeholder(2),
@@ -70,11 +93,18 @@ pub mod sql {
             d.placeholder(7),
             d.placeholder(8),
             d.placeholder(9),
+            d.now_iso8601(),
         )
     }
 
     /// Redate une ligne EXISTANTE avec la date du service — pour les favoris
     /// repris avant que la reprise ne sache dater (tous au même instant).
+    ///
+    /// 🔴 Elle ne NOMME pas `first_seen_at`, et ce n'est pas un oubli : c'est
+    /// la seule chose qui rende la date locale digne du tri
+    /// (renesenses/tune-web-client#1060). Une resynchronisation repasse ici à
+    /// chaque fois qu'un service redate ses favoris ; si elle emportait aussi
+    /// la date locale, le défaut serait reconduit à l'identique.
     pub fn dater<D: SqlDialect>(d: &D) -> String {
         // La date est liée DEUX fois (1 et 6) : SQLite n'a que des `?`
         // positionnels, un `?1` répété n'y est pas un placeholder numéroté.
@@ -88,6 +118,27 @@ pub mod sql {
             d.placeholder(4),
             d.placeholder(5),
             d.placeholder(6),
+        )
+    }
+
+    /// Pose la date locale sur une ligne qui n'en a pas — et SEULEMENT là.
+    ///
+    /// `AND first_seen_at IS NULL` est la garde entière : la requête est sans
+    /// effet sur une ligne déjà datée, donc la repasser à chaque
+    /// resynchronisation ne peut pas réécrire ce qui est posé. C'est ce qui
+    /// rattrape les lignes que la migration n'a pas pu remplir (aucun
+    /// `created_at` à reprendre) et celles d'une base PostgreSQL montée par
+    /// `ensure_schema` avant la migration 067.
+    pub fn premiere_vue_si_absente<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE streaming_favorites SET first_seen_at = {} \
+             WHERE profile_id = {} AND item_type = {} AND service = {} AND service_id = {} \
+               AND first_seen_at IS NULL",
+            d.now_iso8601(),
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
         )
     }
 
@@ -113,7 +164,10 @@ pub mod sql {
         )
     }
 
-    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at \
+    // `first_seen_at` vient APRÈS `created_at` et AVANT `position` dans la
+    // requête au rang : les deux listes sont lues par INDICE de colonne, et
+    // l'insérer ailleurs décalerait silencieusement le rang manuel.
+    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at \
          FROM streaming_favorites";
 
     pub fn list_all<D: SqlDialect>(d: &D) -> String {
@@ -136,7 +190,7 @@ pub mod sql {
     /// Requête séparée, et non `position` ajouté à `SELECT_COLS` : la colonne
     /// n'est lue que par le tri manuel et n'entre JAMAIS dans
     /// `StreamingFavorite`, donc la forme du JSON rendu au client ne bouge pas.
-    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, position \
+    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, position \
          FROM streaming_favorites";
 
     pub fn list_all_pour_rang<D: SqlDialect>(d: &D) -> String {
@@ -309,6 +363,24 @@ impl StreamingFavoritesRepo {
         Ok(self.db.execute(&sql, &params)? > 0)
     }
 
+    /// Pose la date locale sur un favori qui n'en a pas encore. Rend `true`
+    /// si une ligne a changé — donc `false` dès la deuxième fois, ce qui EST
+    /// la garantie attendue : la date de première vue ne se repose pas.
+    pub fn premiere_vue_si_absente(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+    ) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::premiere_vue_si_absente, sql::premiere_vue_si_absente);
+        let pid = profile_id;
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let params: [&dyn ToSqlValue; 4] = [&pid, &item_type, &service, &service_id];
+        Ok(self.db.execute(&sql, &params)? > 0)
+    }
+
     pub fn remove(
         &self,
         profile_id: i64,
@@ -391,7 +463,9 @@ impl StreamingFavoritesRepo {
                 self.db.query_many(&sql, &params)?
             };
             favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
-                r.get(10).and_then(|v| v.as_i64())
+                // 11 et non 10 : `first_seen_at` s'est glissé entre
+                // `created_at` et `position` dans SELECT_COLS_POUR_RANG.
+                r.get(11).and_then(|v| v.as_i64())
             });
             return Ok(rows.iter().map(row_to_streaming_favorite).collect());
         }
@@ -471,6 +545,7 @@ fn row_to_streaming_favorite(cols: &Vec<SqlValue>) -> StreamingFavorite {
         album: cols.get(7).and_then(|v| v.as_string()),
         cover_url: cols.get(8).and_then(|v| v.as_string()),
         created_at: cols.get(9).and_then(|v| v.as_string()),
+        first_seen_at: cols.get(10).and_then(|v| v.as_string()),
     }
 }
 
@@ -703,7 +778,10 @@ mod tests {
         ));
         // Le rang doit etre LU, et seulement par la requete dediee : la
         // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
-        assert!(sql::list_by_type_pour_rang(&SqliteDialect).contains("created_at, position"));
+        assert!(
+            sql::list_by_type_pour_rang(&SqliteDialect)
+                .contains("created_at, first_seen_at, position")
+        );
         assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }
 
@@ -720,5 +798,111 @@ mod tests {
             .unwrap();
         assert_eq!(repo.list(1, None).unwrap().len(), 1);
         assert_eq!(repo.list(2, None).unwrap().len(), 1);
+    }
+
+    // --- Date locale de première vue (renesenses/tune-web-client#1060) ------
+
+    fn premiere_vue(repo: &StreamingFavoritesRepo, service_id: &str) -> Option<String> {
+        repo.list(1, None)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.service_id == service_id)
+            .and_then(|f| f.first_seen_at)
+    }
+
+    /// Le champ s'AJOUTE : `created_at` est toujours là, toujours la date du
+    /// service, et la charge garde toutes ses clés d'avant.
+    #[test]
+    fn la_date_locale_s_ajoute_sans_rien_deplacer() {
+        let repo = repo_a_trier();
+        let f = &repo.list(1, Some("track")).unwrap()[0];
+        let charge = serde_json::to_value(f).unwrap();
+        let cles: Vec<&String> = charge.as_object().unwrap().keys().collect();
+        for attendue in [
+            "id",
+            "profile_id",
+            "item_type",
+            "service",
+            "service_id",
+            "title",
+            "artist",
+            "album",
+            "cover_url",
+            "created_at",
+        ] {
+            assert!(
+                cles.iter().any(|c| c.as_str() == attendue),
+                "la charge a perdu `{attendue}` : {cles:?}"
+            );
+        }
+        assert!(
+            cles.iter().any(|c| c.as_str() == "first_seen_at"),
+            "la charge doit porter la date locale : {cles:?}"
+        );
+        // `repo_a_trier` force `created_at` à la main : la date du service est
+        // bien celle-là, et la date locale est une AUTRE valeur, posée par
+        // l'insertion.
+        assert_eq!(f.created_at.as_deref(), Some("2026-04-01T00:00:00Z"));
+        assert!(f.first_seen_at.as_deref().is_some_and(|d| !d.is_empty()));
+    }
+
+    /// 🔴 La garde entière : `dater` ne touche pas la date locale, et
+    /// `premiere_vue_si_absente` ne la repose pas.
+    #[test]
+    fn redater_un_favori_ne_reecrit_pas_sa_date_locale() {
+        let repo = fresh_repo();
+        repo.add(1, "track", "qobuz", "s1", Some("Titre"), None, None, None)
+            .unwrap();
+        let vue = premiere_vue(&repo, "s1").expect("date locale posée à l'ajout");
+
+        assert!(
+            repo.dater(1, "track", "qobuz", "s1", "2026-09-16T08:11:50Z")
+                .unwrap()
+        );
+        assert_eq!(
+            repo.list(1, None).unwrap()[0].created_at.as_deref(),
+            Some("2026-09-16T08:11:50Z")
+        );
+        assert_eq!(premiere_vue(&repo, "s1").as_deref(), Some(vue.as_str()));
+
+        // Et une seconde redate, comme une resynchronisation de plus.
+        repo.dater(1, "track", "qobuz", "s1", "2026-09-20T09:00:00Z")
+            .unwrap();
+        assert_eq!(premiere_vue(&repo, "s1").as_deref(), Some(vue.as_str()));
+
+        // `premiere_vue_si_absente` n'a rien à faire sur une ligne datée.
+        assert!(
+            !repo
+                .premiere_vue_si_absente(1, "track", "qobuz", "s1")
+                .unwrap()
+        );
+        assert_eq!(premiere_vue(&repo, "s1").as_deref(), Some(vue.as_str()));
+    }
+
+    /// Une ligne SANS date locale en reçoit une, une fois.
+    #[test]
+    fn la_date_locale_absente_se_pose_une_seule_fois() {
+        let repo = fresh_repo();
+        repo.add(1, "track", "qobuz", "s1", Some("Titre"), None, None, None)
+            .unwrap();
+        repo.db
+            .execute(
+                "UPDATE streaming_favorites SET first_seen_at = NULL WHERE service_id = 's1'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(premiere_vue(&repo, "s1"), None);
+
+        assert!(
+            repo.premiere_vue_si_absente(1, "track", "qobuz", "s1")
+                .unwrap()
+        );
+        let posee = premiere_vue(&repo, "s1").expect("posée");
+        assert!(
+            !repo
+                .premiere_vue_si_absente(1, "track", "qobuz", "s1")
+                .unwrap()
+        );
+        assert_eq!(premiere_vue(&repo, "s1").as_deref(), Some(posee.as_str()));
     }
 }

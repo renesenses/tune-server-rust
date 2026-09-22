@@ -78,13 +78,20 @@ impl Coffret {
     }
 }
 
+/// Les mots qui désignent un disque. UNE seule liste, partagée par la
+/// détection automatique ([`marqueur_final`]) et par la composition à la main
+/// ([`titre_commun`]) : deux copies divergeraient à la première addition.
+///
+/// ⚠️ `vol` n'en fait pas partie, et c'est tout le sujet du piège n° 1.
+pub const MOTS_DE_DISQUE: [&str; 4] = ["cd", "disc", "disque", "disk"];
+
 /// Le marqueur de disque EN FIN de nom, et le socle qui le précède.
 ///
 /// ⚠️ `vol` en est exclu, et c'est tout le sujet du piège n° 1.
 pub fn marqueur_final(nom: &str) -> Option<(String, u32)> {
     let n = nom.trim_end();
     let bas = n.to_lowercase();
-    for mot in ["cd", "disc", "disque", "disk"] {
+    for mot in MOTS_DE_DISQUE {
         let mut i = bas.len();
         // On remonte les chiffres de fin.
         let chiffres: String = bas
@@ -117,6 +124,94 @@ pub fn marqueur_final(nom: &str) -> Option<(String, u32)> {
         return Some((n[..socle.len()].trim_end().to_string(), numero));
     }
     None
+}
+
+/// LE TITRE D'UN COFFRET COMPOSÉ À LA MAIN — le plus long préfixe COMMUN.
+///
+/// Bertrand, 20/09/2026 : « je voudrais créer un coffret pour 101 de Depeche
+/// Mode », dont la bibliothèque porte deux albums *101 - Disc A* (9 pistes) et
+/// *101 - Disc B* (11 pistes).
+///
+/// 🔴 POURQUOI PAS [`marqueur_final`]. Elle ne lit que des CHIFFRES
+/// (`is_ascii_digit`, une ou deux positions) : *Disc A* et *Disc B* lui sont
+/// invisibles, et c'est précisément le cas de Bertrand. Le regroupement
+/// automatique ne pouvait donc pas le voir — celui-ci est composé à la main,
+/// et il ne doit dépendre d'AUCUN vocabulaire de marqueur. Le préfixe commun
+/// n'en connaît aucun : il marche sur *Disc A/B*, sur *CD1/CD2*, sur
+/// *Première partie / Deuxième partie*, et sur ce qui n'a pas encore été
+/// inventé.
+///
+/// ⚠️ LA COUPE NE TOMBE JAMAIS AU MILIEU D'UN MOT. *Abbey Road* et *Abbey
+/// Roadshow* ont « Abbey Road » en préfixe commun, mais le second continue sur
+/// une lettre : nommer le coffret « Abbey Road » inventerait un titre. On
+/// recule alors jusqu'à la dernière séparation.
+///
+/// Rend `None` quand il ne reste rien d'utilisable : l'appelant garde alors le
+/// titre de l'album cible plutôt que d'en inventer un.
+pub fn titre_commun(titres: &[String]) -> Option<String> {
+    if titres.len() < 2 {
+        return None;
+    }
+    // Le préfixe commun, CARACTÈRE par caractère : un `&str[..n]` sur des
+    // octets couperait un accent en deux et paniquerait.
+    let premier: Vec<char> = titres[0].chars().collect();
+    let mut n = premier.len();
+    for t in &titres[1..] {
+        let autre: Vec<char> = t.chars().collect();
+        let mut i = 0;
+        while i < n && i < autre.len() && premier[i] == autre[i] {
+            i += 1;
+        }
+        n = i;
+        if n == 0 {
+            return None;
+        }
+    }
+    // La coupe tombe-t-elle au MILIEU d'un mot ? Elle le fait dès qu'un des
+    // titres continue sur une lettre ou un chiffre — « Reiner RCA, CD01 » et
+    // « …CD02 » divergent à l'intérieur de « CD01 ». On recule alors jusqu'à
+    // la dernière séparation ; sans séparation, il n'y a pas de titre honnête.
+    if titres
+        .iter()
+        .any(|t| t.chars().nth(n).is_some_and(|c| c.is_alphanumeric()))
+    {
+        n = premier[..n].iter().rposition(|c| !c.is_alphanumeric())? + 1;
+    }
+    let socle = rogner_separateurs(&premier[..n].iter().collect::<String>());
+    // 🔴 LE DERNIER MOT DU SOCLE PEUT ÊTRE LE MARQUEUR LUI-MÊME.
+    //
+    // « 101 - Disc A » et « 101 - Disc B » ne divergent qu'à la lettre finale :
+    // le préfixe commun vaut « 101 - Disc », et s'arrêter là nommerait le
+    // coffret « 101 - Disc ». Le mot de trop est celui que
+    // [`marqueur_final`] connaît déjà — on réemploie SA liste plutôt que d'en
+    // écrire une seconde, qui divergerait à la première addition.
+    //
+    // ⚠️ Et seulement celle-là : « Le Ring — Première partie » / « …Deuxième
+    // partie » s'arrête à « Le Ring », parce que « Ring » n'en fait pas
+    // partie. Sans cette réserve, on retirerait un mot du titre.
+    let socle = match socle.rsplit_once(|c: char| c.is_whitespace()) {
+        Some((avant, dernier))
+            // ⚠️ Rogné des DEUX côtés : « Pulse (disque 1) » laisse
+            // « (disque » en dernier mot, parenthèse ouvrante comprise.
+            if MOTS_DE_DISQUE.contains(&dernier.trim_matches(SEPARATEURS).to_lowercase().as_str()) =>
+        {
+            rogner_separateurs(avant)
+        }
+        _ => socle,
+    };
+    if socle.is_empty() { None } else { Some(socle) }
+}
+
+/// Les séparateurs qu'un titre traîne autour de son socle — tirets longs
+/// compris (« Le Ring — Première partie »).
+const SEPARATEURS: [char; 14] = [
+    ' ', '.', '_', '-', ',', ':', ';', '(', ')', '[', ']', '/', '\u{2013}', '\u{2014}',
+];
+
+/// Le socle, débarrassé de ce qu'il traîne À DROITE. La gauche est gardée :
+/// c'est le début du titre.
+fn rogner_separateurs(s: &str) -> String {
+    s.trim().trim_end_matches(SEPARATEURS).trim().to_string()
 }
 
 /// Le parent d'un dossier, et son nom de feuille.
@@ -329,5 +424,93 @@ mod tests {
         assert_eq!(c[0].disques, vec![(1, 2), (2, 1), (10, 3)]);
         assert_eq!(c[0].cible(), Some(2));
         assert_eq!(c[0].absorbes(), vec![1, 3]);
+    }
+
+    // ------------------------------------------------------------------
+    // `titre_commun` — le coffret composé À LA MAIN
+    // ------------------------------------------------------------------
+
+    fn t(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn le_cas_de_bertrand_101_disc_a_et_disc_b() {
+        // 🔴 Exactement ce que montre sa capture du 20/09/2026 : deux albums
+        // Depeche Mode, 9 et 11 pistes. `marqueur_final` n'y voit RIEN — la
+        // lettre n'est pas un chiffre — et c'est pour cela que cette
+        // fonction-ci existe.
+        assert_eq!(marqueur_final("101 - Disc A"), None);
+        assert_eq!(
+            titre_commun(&t(&["101 - Disc A", "101 - Disc B"])),
+            Some("101".to_string())
+        );
+    }
+
+    #[test]
+    fn il_ne_connait_aucun_vocabulaire_de_marqueur() {
+        // Ni « disc », ni « cd » : le préfixe commun se moque du mot employé.
+        assert_eq!(
+            titre_commun(&t(&[
+                "Le Ring — Première partie",
+                "Le Ring — Deuxième partie"
+            ])),
+            Some("Le Ring".to_string())
+        );
+        assert_eq!(
+            titre_commun(&t(&[
+                "Reiner RCA, CD01",
+                "Reiner RCA, CD02",
+                "Reiner RCA, CD03"
+            ])),
+            Some("Reiner RCA".to_string())
+        );
+    }
+
+    #[test]
+    fn deux_titres_identiques_rendent_ce_titre() {
+        assert_eq!(
+            titre_commun(&t(&["The Wall", "The Wall"])),
+            Some("The Wall".to_string())
+        );
+    }
+
+    #[test]
+    fn la_coupe_ne_tombe_jamais_au_milieu_d_un_mot() {
+        // « Abbey Road » est bien le préfixe commun — mais le second titre
+        // continue sur une lettre. Nommer le coffret « Abbey Road »
+        // inventerait un titre que personne n'a écrit : on recule.
+        assert_eq!(
+            titre_commun(&t(&["Abbey Road", "Abbey Roadshow"])),
+            Some("Abbey".to_string())
+        );
+        // Et quand il n'y a aucune séparation où reculer, on ne rend rien.
+        assert_eq!(titre_commun(&t(&["Kind", "Kinder"])), None);
+    }
+
+    #[test]
+    fn sans_rien_de_commun_il_ne_rend_rien() {
+        assert_eq!(titre_commun(&t(&["Blue Train", "Giant Steps"])), None);
+        // Un seul album n'est pas un coffret.
+        assert_eq!(titre_commun(&t(&["101 - Disc A"])), None);
+        assert_eq!(titre_commun(&[]), None);
+    }
+
+    #[test]
+    fn il_ne_coupe_pas_un_accent_en_deux() {
+        // Le préfixe se calcule en CARACTÈRES : un découpage par octets
+        // paniquerait au milieu du « é ».
+        assert_eq!(
+            titre_commun(&t(&["Été 1970 / disque un", "Été 1970 / disque deux"])),
+            Some("Été 1970".to_string())
+        );
+    }
+
+    #[test]
+    fn la_ponctuation_de_fin_est_retiree() {
+        assert_eq!(
+            titre_commun(&t(&["Pulse (disque 1)", "Pulse (disque 2)"])),
+            Some("Pulse".to_string())
+        );
     }
 }

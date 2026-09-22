@@ -171,6 +171,12 @@ path = "tests/server_contracts.rs"
 name = "album_lecture_en_double"
 path = "tests/album_lecture_en_double.rs"
 
+# #4521 — le DR de chaque album de `GET /library/albums`, par la règle de la
+# fiche, et son coût sur une base synthétique (épreuve `#[ignore]`).
+[[test]]
+name = "dr_liste_albums_4521"
+path = "tests/dr_liste_albums_4521.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
@@ -186,6 +192,28 @@ path = "tests/albums_upnp_visibles_4146.rs"
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
+
+# Fuites de français — les seize collections intelligentes livrées portent une
+# clé stable à côté de leur nom. `autotests = false` en tête de ce manifeste :
+# sans cette cible, ni le témoin ni sa contre-épreuve (« une collection
+# renommée ne reçoit aucune clé ») ne seraient JAMAIS compilés.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "collections_cle_stable"
+path = "tests/collections_cle_stable.rs"
+
+# Fuites de français — le genre et le pays d'une station voyagent en clé et en
+# code, et le libellé du genre suit la langue de la requête. `autotests =
+# false` en tête de ce manifeste : sans cette cible, ni le témoin ni sa
+# contre-épreuve de traduction ne seraient JAMAIS compilés.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "radios_libelles_localises"
+path = "tests/radios_libelles_localises.rs"
 
 # #4577 — un favori Bandcamp posé une fois se retrouve la fois suivante.
 # `autotests = false` en tête de ce manifeste : sans cette cible le fichier ne

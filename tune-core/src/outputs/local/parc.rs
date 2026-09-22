@@ -14,15 +14,51 @@ impl AsioScanGate {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn run<T>(&self, backend: &str, cached: impl FnOnce() -> T, probe: impl FnOnce() -> T) -> T {
+    /// Les deux listes rendent un `Vec` : le type de retour est resserré pour
+    /// que la porte puisse dire COMBIEN d'appareils elle a servi (#4556) sans
+    /// toucher à la forme des deux sites d'appel.
+    fn run<T>(
+        &self,
+        backend: &str,
+        cached: impl FnOnce() -> Vec<T>,
+        probe: impl FnOnce() -> Vec<T>,
+    ) -> Vec<T> {
         if backend.eq_ignore_ascii_case("asio")
             && self.blocked.load(std::sync::atomic::Ordering::Acquire)
         {
-            debug!("asio_device_enumeration_blocked_after_boot_decision");
-            return cached();
+            // #4556 — ce chemin-ci mène tout droit à un refus de lecture chez
+            // l'utilisateur : il se dit au niveau WARN, avec le nombre
+            // d'appareils servis. Un journal de mise au point n'existe pas
+            // dans un export de terrain, qui ne porte que l'INFO et au-dessus.
+            let du_cache = cached();
+            journaliser_enumeration_asio_bloquee(backend, du_cache.len());
+            return du_cache;
         }
         probe()
     }
+}
+
+/// #4556 — rendre visible l'étape qui fabrique le refus.
+///
+/// Marco Polo (fil 1852, SMSL SU-1) : `requested=asio, active=WASAPI`, ASIO en
+/// `blocked_after_crash`. Côté serveur, la seule trace de la bascule était un
+/// `debug!` — donc rien, dans son rapport. Ce `warn!` nomme le motif, le
+/// témoin à supprimer, et le nombre d'appareils que la liste a vraiment rendus
+/// (zéro sur un processus neuf, puisque le cache est vide au démarrage).
+fn journaliser_enumeration_asio_bloquee(backend: &str, appareils: usize) {
+    let blocage = crate::outputs::asio_blocage_4556::blocage();
+    warn!(
+        backend = %backend,
+        motif = blocage.as_ref().map(|b| b.motif.code()).unwrap_or("unknown"),
+        temoin = blocage
+            .as_ref()
+            .and_then(|b| b.temoin.as_deref())
+            .unwrap_or("-"),
+        appareils,
+        "asio_device_enumeration_blocked_serving_cache — le balayage ASIO est suspendu pour ce \
+         processus : la liste rendue vient du cache, elle ne prouve RIEN sur les appareils ASIO \
+         branchés. Réarmez le balayage puis redémarrez Tune."
+    );
 }
 
 static ASIO_SCAN_GATE: AsioScanGate = AsioScanGate {
@@ -31,7 +67,15 @@ static ASIO_SCAN_GATE: AsioScanGate = AsioScanGate {
 
 /// Interdit l'énumération ASIO jusqu'au prochain démarrage, y compris depuis
 /// les réglages et les diagnostics. Les autres backends restent disponibles.
-pub fn block_asio_device_enumeration() {
+///
+/// #4556 — le MOTIF et le TÉMOIN voyagent avec le blocage. Un seul site
+/// d'appel ferme les deux verrous (la porte de ce module et l'état global lu
+/// par le refus de lecture) : ils ne peuvent pas diverger.
+pub fn block_asio_device_enumeration(
+    motif: crate::outputs::asio_blocage_4556::MotifDeBlocage,
+    temoin: Option<&str>,
+) {
+    crate::outputs::asio_blocage_4556::bloquer(motif, temoin);
     ASIO_SCAN_GATE.block();
 }
 
@@ -1133,6 +1177,51 @@ mod asio_scan_gate_4168_tests {
                 body.find(call)
                     .expect("une liste contourne le coupe-circuit ASIO (#4168)")
                     < body.find(hardware).expect("sonde matérielle introuvable")
+            );
+        }
+    }
+
+    /// #4556 — l'étape qui FABRIQUE le refus doit se voir dans un journal de
+    /// terrain.
+    ///
+    /// Un export de journal ne porte que l'INFO et au-dessus : le `debug!` qui
+    /// était ici n'existait pas pour le support, et le rapport de Marco Polo
+    /// (fil 1852) ne contenait donc aucune trace de la bascule qui a produit
+    /// son « zone_output_unavailable ».
+    #[test]
+    fn le_coupe_circuit_dit_au_niveau_warn_combien_d_appareils_il_a_servi() {
+        let source = include_str!("parc.rs");
+        let porte = source
+            .split_once("    fn run<T>(")
+            .expect("la porte a changé de forme")
+            .1
+            .split_once("\n    }\n")
+            .expect("fin de la porte introuvable")
+            .0;
+        assert!(
+            porte.contains("journaliser_enumeration_asio_bloquee(backend, du_cache.len())"),
+            "la porte ne dit plus combien d'appareils elle a servi (#4556) : {porte}"
+        );
+        assert!(
+            !porte.contains("debug!"),
+            "le chemin qui mène à un refus utilisateur est redescendu en debug! (#4556)"
+        );
+
+        let journal = source
+            .split_once("fn journaliser_enumeration_asio_bloquee(")
+            .expect("le journal du blocage a disparu")
+            .1
+            .split_once("\n}\n")
+            .expect("fin du journal introuvable")
+            .0;
+        assert!(
+            journal.contains("warn!"),
+            "le blocage ASIO doit être dit au niveau WARN (#4556)"
+        );
+        for champ in ["temoin", "appareils", "motif"] {
+            assert!(
+                journal.contains(champ),
+                "le champ « {champ} » a disparu du journal du blocage ASIO (#4556)"
             );
         }
     }
