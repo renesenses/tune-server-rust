@@ -815,7 +815,7 @@ async fn bc_artist(Path(id): Path<String>) -> Json<Value> {
 /// Fonction pure sur le HTML, donc testable sans réseau. Rend une liste vide
 /// quand la grille est absente — Bandcamp peut changer sa page sans préavis, et
 /// une liste vide franche vaut mieux qu'une structure devinée.
-fn extraire_discographie(page: &str, racine: &str) -> Vec<Value> {
+pub(crate) fn extraire_discographie(page: &str, racine: &str) -> Vec<Value> {
     let Some(debut) = page.find("id=\"music-grid\"") else {
         return Vec::new();
     };
@@ -875,20 +875,38 @@ struct ArtistQuery {
 /// Comme `/album`, l'adresse passe par `?url=` : une URL Bandcamp contient des
 /// `/` et ne tient pas dans un segment de chemin.
 async fn bc_artiste_par_url(Query(q): Query<ArtistQuery>) -> impl IntoResponse {
-    if !q.url.starts_with("https://") || !q.url.contains("bandcamp.com") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "url must be an https bandcamp.com address" })),
-        )
-            .into_response();
+    match discographie_depuis_url(&q.url).await {
+        Ok((racine, albums)) => Json(json!({
+            "type": "artist",
+            "url": racine,
+            "albums": albums,
+            "count": albums.len(),
+        }))
+        .into_response(),
+        Err(EchecAlbum::UrlInvalide(m)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": m }))).into_response()
+        }
+        Err(EchecAlbum::Passerelle(m)) => passerelle_en_echec(m),
+    }
+}
+
+/// La racine d'une page d'artiste et sa discographie publique.
+///
+/// Extrait de `bc_artiste_par_url` sans en changer la logique : la route en
+/// reste l'appelant, et l'adaptateur `StreamingService` en devient le second
+/// (`get_artist_albums`, #4579) — un seul lecteur de la page `/music`.
+pub(crate) async fn discographie_depuis_url(url: &str) -> Result<(String, Vec<Value>), EchecAlbum> {
+    if !url.starts_with("https://") || !url.contains("bandcamp.com") {
+        return Err(EchecAlbum::UrlInvalide(
+            "url must be an https bandcamp.com address".into(),
+        ));
     }
     // La discographie vit sur `/music`, pas sur la racine — une racine seule
     // affiche l'album mis en avant, ce qui donnerait un seul résultat.
-    let racine = q
-        .url
+    let racine = url
         .split("/music")
         .next()
-        .unwrap_or(&q.url)
+        .unwrap_or(url)
         .trim_end_matches('/')
         .to_string();
     let cible = format!("{racine}/music");
@@ -897,18 +915,11 @@ async fn bc_artiste_par_url(Query(q): Query<ArtistQuery>) -> impl IntoResponse {
     let reponse = client.get(&cible).send().await;
     let page = match reponse {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-        Ok(r) => return passerelle_en_echec(format!("HTTP {}", r.status())),
-        Err(e) => return passerelle_en_echec(e.to_string()),
+        Ok(r) => return Err(EchecAlbum::Passerelle(format!("HTTP {}", r.status()))),
+        Err(e) => return Err(EchecAlbum::Passerelle(e.to_string())),
     };
-
     let albums = extraire_discographie(&page, &racine);
-    Json(json!({
-        "type": "artist",
-        "url": racine,
-        "albums": albums,
-        "count": albums.len(),
-    }))
-    .into_response()
+    Ok((racine, albums))
 }
 
 // ---------------------------------------------------------------------------

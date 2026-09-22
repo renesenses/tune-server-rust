@@ -410,6 +410,30 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // 🔴 #4598 — le registre lu ci-dessus date de la dernière énumération
+        // PÉRIODIQUE (120 s sous macOS/Windows, 600 s sous Linux). Un DAC
+        // allumé ou rebranché depuis y manque encore : Cyrille (fil 1861) est
+        // refusé à 13:37:27, son iFi apparaît 12 s plus tard. Avant de conclure
+        // à l'absence, une énumération à la demande, bornée dans le temps, et
+        // seulement ici — au plus une fois par clic. L'appareil revenu passe
+        // comme un parc vide (#3737) : `recreate_local_and_play` l'ouvre.
+        if self
+            .appareil_local_revenu(
+                zone_id,
+                dev_id,
+                super::reenumeration_avant_refus::DELAI_REENUMERATION_AVANT_REFUS,
+            )
+            .await
+        {
+            info!(
+                zone_id,
+                zone_name = %zone.name,
+                device = dev_id,
+                "play_allowed_local_device_found_on_reenumeration"
+            );
+            return Ok(None);
+        }
+
         // The stored device really is gone. Before rejecting, look for a live
         // output carrying the same name (#1287).
         if let Some((new_id, new_type)) = self.find_rebind_target(&zone.name).await {
@@ -1493,7 +1517,13 @@ impl PlaybackOrchestrator {
             // position reellement atteinte, avance automatique comprise. En
             // aleatoire il reste vide — on re-tirera (#2441).
             let rang = rang_a_retenir(etat.shuffle, etat.queue_position);
-            let context = (etat.session_context_type, etat.session_context_id);
+            let context = (
+                etat.session_context_type,
+                etat.session_context_id,
+                etat.session_context_source,
+                etat.session_context_title,
+                etat.session_context_cover,
+            );
             self.record_listen(
                 &resolved.title,
                 resolved.artist.as_deref(),
@@ -1515,6 +1545,9 @@ impl PlaybackOrchestrator {
                     nature: context.0.as_deref(),
                     id: context.1.as_deref(),
                     rang,
+                    service: context.2.as_deref(),
+                    titre: context.3.as_deref(),
+                    pochette: context.4.as_deref(),
                 },
             );
         }
@@ -2533,10 +2566,25 @@ impl PlaybackOrchestrator {
                     (RepriseDeSession::RetablirALaPosition, Some(did)) => {
                         info!(zone_id, position_ms, "resume_stream_session_restore");
                         let req = requete_de_retablissement(zone_id, did, np, position_ms);
+                        // #4666 — encadrer la relecture par deux `seek`, comme
+                        // `replay_zone_at_position` et la recréation de flux du
+                        // seek. Sans eux, `play()` remet la position de zone à
+                        // zéro et efface `last_seek_at` : le sondeur, dont
+                        // l'état a été jeté pendant la pause, repart d'une
+                        // horloge à ZÉRO face à une sortie qui rend 2:19 — la
+                        // garde `stale_start_position` saute alors chaque tour
+                        // jusqu'à la fin de la piste, qui n'enchaîne jamais
+                        // (fil 1882), et l'écran reste à 0:00. Le `seek` d'après
+                        // pose l'instant que le repli « Fold a NEW seek » du
+                        // sondeur convertit en ancrage d'horloge.
+                        self.playback.seek(zone_id, position_ms as i64).await;
                         // Même piste, même écoute : pas de seconde ligne
                         // d'historique, exactement comme le re-play radio.
                         match self.play_without_history(req).await {
-                            Ok(_) => return Ok(()),
+                            Ok(_) => {
+                                self.playback.seek(zone_id, position_ms as i64).await;
+                                return Ok(());
+                            }
                             // Pas de repli silencieux : la sortie n'a plus rien à
                             // jouer, la reprendre ne ferait que rejouer le défaut.
                             Err(e) => {

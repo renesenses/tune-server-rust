@@ -370,6 +370,17 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_3182_moteur_annonce_dans_le_rapport -- --nocapture --test-threads=1
 
+      # #4602 -- le VRAI scan (`POST /system/scan`) d'une bibliotheque de FLAC
+      # avec pochettes : toute piste doit avoir un album, et les comptes ne
+      # doivent pas bouger d'une passe a l'autre. `GROUP_CONCAT` en dur dans
+      # `scattered_candidates` laissait 20 pistes sur 24 SANS album sur
+      # PostgreSQL ; la contre-epreuve SQLite du meme fichier tourne dans
+      # `ci.yml`. `--test-threads=1` : le test vide ses tables.
+      - name: Scan complet sur PostgreSQL, pistes sans album (#4602)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_scan_converge_4602 -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
@@ -426,6 +437,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test server_contracts pg_3857 -- --nocapture --test-threads=1
+      # #4625 -- la meme vue par dossiers, pour les pistes decoupees par une
+      # feuille CUE (`file_path` NULL, fichier dans `cue_media_path`) : un
+      # dossier CUE etait compte 0 et s'ouvrait vide.
+      - name: Dossiers CUE dans la vue par dossiers sur PostgreSQL (#4625)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dossier_cue_4625 pg_4625 -- --nocapture --test-threads=1
       - name: Versions par piste sur PostgreSQL (#2372)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

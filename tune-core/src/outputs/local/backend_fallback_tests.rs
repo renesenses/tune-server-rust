@@ -536,3 +536,89 @@ fn chaque_sortie_de_select_host_enregistre_le_backend_ouvert() {
         );
     }
 }
+
+// ── #4667 — un sondage forcé n'écrit pas le backend « actif » ──────────────
+
+/// Le rescan périodique force WASAPI quand ASIO est configuré ; sous
+/// [`super::sans_noter_le_backend_observe`], l'énumération qu'il mène ne doit
+/// pas remplacer « ASIO » par « WASAPI » dans ce que publient la fiche système
+/// et le rapport de bogue (ticket support 154 : `requested=asio,
+/// active=WASAPI` pendant que `bras_asio` jouait).
+///
+/// Rouge attendu sans correctif : l'emplacement vaut « WASAPI ».
+#[test]
+fn un_sondage_force_n_ecrase_pas_le_backend_actif_4667() {
+    let emplacement = std::sync::RwLock::new(None);
+    // L'énumération de démarrage, sur une configuration ASIO : elle note ASIO.
+    super::noter_dans(&emplacement, "ASIO", None);
+    // Le rescan : `select_host("wasapi")` note « WASAPI » — sous sondage.
+    super::sans_noter_le_backend_observe(|| {
+        super::noter_dans(&emplacement, "WASAPI", None);
+    });
+    assert_eq!(
+        *emplacement.read().unwrap(),
+        observed("ASIO", None),
+        "le rescan forcé en WASAPI a écrasé le backend actif : la fiche système \
+         annoncerait active=WASAPI sur un serveur qui joue en ASIO (#4667)"
+    );
+}
+
+/// CONTRE-ÉPREUVE : hors sondage, l'écriture reste celle d'avant — un vrai
+/// changement de réglage (ASIO → WASAPI) doit bien être vu.
+#[test]
+fn hors_sondage_l_observation_s_ecrit_toujours_4667() {
+    let emplacement = std::sync::RwLock::new(None);
+    super::noter_dans(&emplacement, "ASIO", None);
+    super::noter_dans(
+        &emplacement,
+        "WASAPI",
+        Some(LocalBackendFallback::AsioNoDevices),
+    );
+    assert_eq!(
+        *emplacement.read().unwrap(),
+        observed("WASAPI", Some(LocalBackendFallback::AsioNoDevices))
+    );
+}
+
+/// Le drapeau est local au fil, rétabli à la sortie — y compris imbriqué et
+/// après une panique.
+#[test]
+fn le_drapeau_de_sondage_est_borne_a_sa_portee_4667() {
+    assert!(!super::sondage_sans_observation_en_cours());
+    super::sans_noter_le_backend_observe(|| {
+        assert!(super::sondage_sans_observation_en_cours());
+        super::sans_noter_le_backend_observe(|| {
+            assert!(super::sondage_sans_observation_en_cours());
+        });
+        assert!(super::sondage_sans_observation_en_cours());
+    });
+    assert!(!super::sondage_sans_observation_en_cours());
+    let _ = std::panic::catch_unwind(|| {
+        super::sans_noter_le_backend_observe(|| panic!("énumération qui panique"))
+    });
+    assert!(!super::sondage_sans_observation_en_cours());
+    // Un autre fil n'est pas concerné.
+    super::sans_noter_le_backend_observe(|| {
+        let ailleurs = std::thread::spawn(super::sondage_sans_observation_en_cours)
+            .join()
+            .unwrap();
+        assert!(
+            !ailleurs,
+            "une ouverture réelle sur un autre fil doit noter"
+        );
+    });
+}
+
+/// Le chemin de production passe par la règle éprouvée ci-dessus.
+#[test]
+fn note_observed_backend_passe_par_la_regle_du_sondage_4667() {
+    let src =
+        std::fs::read_to_string(std::path::Path::new("src/outputs/local/etat_backend.rs")).unwrap();
+    let debut = src.find("pub(super) fn note_observed_backend(").unwrap();
+    let corps = &src[debut..];
+    let corps = &corps[..corps.find("\n}\n").expect("fin de note_observed_backend")];
+    assert!(
+        corps.contains("noter_dans(&OBSERVED_BACKEND,"),
+        "note_observed_backend doit écrire par noter_dans"
+    );
+}

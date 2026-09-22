@@ -203,7 +203,7 @@ where
 ///
 /// Aucun écran n'a besoin de distinguer « 5 000 » de « 12 000 » : il a besoin
 /// de savoir que 50 n'est pas le compte.
-const PLAFOND_DE_COMPTAGE: i64 = 5_000;
+pub(crate) const PLAFOND_DE_COMPTAGE: i64 = 5_000;
 
 /// Lignes rendues quand l'appelant ne dit rien. Nommé parce qu'il sert deux
 /// fois : ici, et en repli quand `?limit=` porte une valeur qu'un nombre

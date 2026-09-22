@@ -374,6 +374,19 @@ pub struct ZoneState {
     /// vide. `#[serde(default)]` comme ses deux voisins.
     #[serde(default)]
     pub session_context_source: Option<String>,
+    /// Le NOM de l'objet demandé, quand aucune table de cette base ne peut le
+    /// rendre : une playlist de service (#3425). `None` pour un objet local,
+    /// dont le nom se relit dans sa table — et `None` tant que le service
+    /// n'a pas répondu, ce qui n'empêche rien de jouer.
+    ///
+    /// Relevé pour l'HISTORIQUE, pas pour l'écran : c'est la seule trace qui
+    /// permettra ensuite de titrer la vignette « Reprendre l'écoute » avec ce
+    /// qui a réellement été écouté, au lieu de l'album de la dernière piste.
+    #[serde(default)]
+    pub session_context_title: Option<String>,
+    /// La pochette de ce même objet, même règle que `session_context_title`.
+    #[serde(default)]
+    pub session_context_cover: Option<String>,
     /// Instant de la dernière mise en pause (`None` hors pause). Pour une
     /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
     /// un flux live continue de se périmer pendant la pause (connexion
@@ -554,6 +567,8 @@ impl Default for ZoneState {
             session_context_type: None,
             session_context_id: None,
             session_context_source: None,
+            session_context_title: None,
+            session_context_cover: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,
@@ -1617,6 +1632,8 @@ impl PlaybackManager {
         context_type: Option<String>,
         context_id: Option<String>,
         context_source: Option<String>,
+        context_title: Option<String>,
+        context_cover: Option<String>,
     ) {
         let mut zones = self.zones.lock().await;
         let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -1626,6 +1643,11 @@ impl PlaybackManager {
         z.session_context_type = context_type;
         z.session_context_id = context_id;
         z.session_context_source = context_source;
+        // Toujours écrasés avec le reste, `None` compris : ce geste remplace
+        // le précédent. Les garder ferait porter à une playlist le nom de
+        // celle d'avant — exactement la vignette étrangère qu'on répare.
+        z.session_context_title = context_title;
+        z.session_context_cover = context_cover;
     }
 
     /// Observe actual work independently of the displayed media position.
@@ -1933,6 +1955,8 @@ mod tests {
             session_context_type: None,
             session_context_id: None,
             session_context_source: None,
+            session_context_title: None,
+            session_context_cover: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,

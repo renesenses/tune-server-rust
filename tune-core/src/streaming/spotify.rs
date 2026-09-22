@@ -282,6 +282,7 @@ impl SpotifyService {
                 .map(Into::into),
             track_count: item["tracks"]["total"].as_u64().unwrap_or(0) as u32,
             owner: item["owner"]["display_name"].as_str().map(Into::into),
+            covers: Vec::new(),
         }
     }
 
@@ -515,6 +516,7 @@ impl StreamingService for SpotifyService {
                 .map(Into::into),
             track_count: d["tracks"]["total"].as_u64().unwrap_or(0) as u32,
             owner: d["owner"]["display_name"].as_str().map(Into::into),
+            covers: Vec::new(),
         })
     }
     async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, TuneError> {
