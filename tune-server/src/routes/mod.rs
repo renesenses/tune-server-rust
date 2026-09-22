@@ -62,6 +62,7 @@ pub mod plugins;
 pub mod podcasts;
 pub mod profiles;
 pub mod radios;
+pub mod radios_libelles;
 pub mod room_calibration;
 pub mod room_correction;
 pub mod roon_bridge;
