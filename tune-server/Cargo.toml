@@ -796,3 +796,13 @@ path = "tests/index_recherche_denominateur_4565.rs"
 [[test]]
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
+
+# #4716 — l'interface hôte WASM ouverte aux playlists, au streaming et à un
+# stockage clé/valeur. `autotests = false` en tête de ce manifeste : sans cette
+# cible, ni le cloisonnement du stockage par greffon ni l'écriture chez un
+# service ne seraient jamais compilés. `required-features` parce que
+# `plugins_host` n'existe que sous `plugins-wasm`.
+[[test]]
+name = "hote_wasm_playlists_4716"
+path = "tests/hote_wasm_playlists_4716.rs"
+required-features = ["plugins-wasm"]
