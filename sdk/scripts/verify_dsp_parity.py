@@ -89,7 +89,11 @@ def main():
         runner=RUNNER
         if mode=='native':
             import os
-            for name in ['native','sdk']:
+            # `audio-support` en plus : le `mod.rs` écrit juste en dessous
+            # réexporte `tune_plugin_audio_support::ecretage`. Sans la
+            # dépendance, le projet d'essai ne compile pas (E0433) — c'est ce
+            # qui a mis « SDK source contracts » au rouge sur les trois OS.
+            for name in ['native','sdk','audio-support']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
             for name in ['eq','crossfeed']:
                 source=(ROOT/f'tune-core/src/audio/{name}.rs').read_text(encoding="utf-8")
