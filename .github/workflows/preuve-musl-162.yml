@@ -1,0 +1,50 @@
+name: Preuve musl 0.9.162
+
+# Branche JETABLE. La CI des PR, `ci:full` compris, ne compile JAMAIS
+# `aarch64-unknown-linux-musl` : seul `release.yml`, au tag, la construit via
+# `cross`. La v0.9.157 est morte comme ça (E0063 sur `libc::sched_param`, dont
+# la forme musl porte des champs de plus). Ce workflow rejoue la ligne EXACTE
+# de release.yml, sur le contenu de `rc/v0.9.162` + son bump, avant le tag.
+on:
+  push:
+    branches:
+      - 'test/preuve-musl-162-*'
+
+permissions:
+  contents: read
+
+jobs:
+  musl:
+    name: Build aarch64-unknown-linux-musl (ligne exacte de release.yml)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: taiki-e/install-action@cross
+      - name: Set TUNE_VERSION
+        run: echo "TUNE_VERSION=0.9.162" >> "$GITHUB_ENV"
+      # Copie conforme de l'etape « Build (cross) » de release.yml pour la
+      # ligne matrix `aarch64-unknown-linux-musl` (features relevees le 22/09).
+      - name: Build (cross)
+        run: cross build --release --package tune-server --target aarch64-unknown-linux-musl --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+      - name: Verify local-audio is compiled into the musl binary
+        shell: bash
+        run: |
+          BIN="target/aarch64-unknown-linux-musl/release/tune-server"
+          if ! readelf -sW "$BIN" | grep -q ' snd_pcm_open$'; then
+            echo "::error::Le binaire musl ne porte pas snd_pcm_open (#3621)."
+            exit 1
+          fi
+          echo "snd_pcm_open present dans l'ELF."
+      - name: Verify musl binary is statically linked
+        shell: bash
+        run: |
+          BIN="target/aarch64-unknown-linux-musl/release/tune-server"
+          if readelf -dW "$BIN" | grep -q 'NEEDED'; then
+            echo "::error::Le binaire musl arm64 n'est pas statique."
+            exit 1
+          fi
+          echo "OK — binaire musl arm64 statique."
