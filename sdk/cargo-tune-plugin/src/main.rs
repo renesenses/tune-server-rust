@@ -152,7 +152,17 @@ fn scaffold(args: &[String]) -> Result<(), String> {
         quoted_path(&sdk.join("tune-plugin-testkit"))?
     );
     if concrete {
-        let support = if template == "equalizer" {
+        // L'égaliseur ET le crossfeed appellent tous deux
+        // `tune_plugin_audio_support::niveau_moyen` depuis #4685 : le projet
+        // engendré doit déclarer la caisse, sinon il ne compile pas (E0433) —
+        // c'est ce qui a mis « SDK source contracts » au rouge sur les trois
+        // OS. La liste se lit dans le SOURCE recopié, pas dans une énumération
+        // de noms : un troisième greffon qui s'y mettrait serait couvert sans
+        // qu'on y pense.
+        let support = if fs::read_to_string(reference.join("src/engine.rs"))
+            .map(|src| src.contains("tune_plugin_audio_support"))
+            .unwrap_or(template == "equalizer")
+        {
             format!(
                 "tune-plugin-audio-support = {{ path = {} }}\n",
                 quoted_path(&sdk.join("tune-plugin-audio-support"))?

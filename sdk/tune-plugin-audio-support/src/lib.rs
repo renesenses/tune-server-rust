@@ -2,3 +2,4 @@
 #![forbid(unsafe_code)]
 pub mod dither;
 pub mod ecretage;
+pub mod niveau_moyen;
