@@ -561,7 +561,9 @@ mod tests {
         let mut cf = CrossfeedProcessor::new(sample_rate, amount, delay_ms);
         cf.process_interleaved(&mut sortie);
         let gauche = |v: &[f32]| -> Vec<f64> {
-            v.chunks_exact(2)
+            v.as_chunks::<2>()
+                .0
+                .iter()
                 .skip(frames / 4)
                 .map(|p| f64::from(p[0]))
                 .collect()

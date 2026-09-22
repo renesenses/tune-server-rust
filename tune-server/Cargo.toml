@@ -796,3 +796,10 @@ path = "tests/index_recherche_denominateur_4565.rs"
 [[test]]
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
+
+# #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
+# routeur réel. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "compensation_de_niveau_4685"
+path = "tests/compensation_de_niveau_4685.rs"
