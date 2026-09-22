@@ -17,6 +17,17 @@ use crate::hote::Hote;
 /// greffon est refusé au chargement, ce qui est le comportement voulu.
 const ABI: u32 = 1;
 
+// 🔴 `wasm_import_module = "tune"` n'est PAS décoratif.
+//
+// Sans cet attribut, `extern "C"` place les imports dans le module `env` —
+// le défaut de Rust — et l'instanciation échoue net :
+// `unknown import: env::host_playlist_tracks has not been defined`. L'hôte
+// n'installe ses fonctions que sous `"tune"` (RFC §3.4). Mesuré : les sept
+// essais de `greffon_convertisseur_4717` ont rougi ainsi avant l'ajout.
+//
+// C'est aussi pourquoi cet essai existe : aucun essai natif ne peut voir ce
+// défaut, puisque `abi.rs` n'est même pas compilé hors `wasm32`.
+#[link(wasm_import_module = "tune")]
 unsafe extern "C" {
     /// `{"level": "...", "msg": "..."}` — comme toutes les autres, en JSON.
     /// Elle est la seule à ne rien rendre.
