@@ -1117,6 +1117,12 @@ mod temoins_de_transitions_ref9;
 #[cfg(test)]
 mod position_de_la_piste_precedente_954;
 
+/// #4666 — une reprise après pause (sur place ou par rétablissement de
+/// session) est vue par le sondeur : l'état neuf ne part plus d'une horloge
+/// à zéro qui ferait prendre la position de reprise pour un fantôme.
+#[cfg(test)]
+mod reprise_apres_pause_4666;
+
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
 

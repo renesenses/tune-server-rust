@@ -484,6 +484,40 @@ pub fn stale_start_position(wall_elapsed_secs: u64, position_ms: u64) -> bool {
     position_ms > wall_elapsed_secs * 1000 + 15_000
 }
 
+/// #4666 — l'ancrage d'horloge d'un état de sondage NEUF, créé pour une zone
+/// qui joue déjà au milieu d'une piste.
+///
+/// Le sondeur jette l'état de sondage d'une zone dès qu'elle quitte `Playing`
+/// (`poll_states.retain` en tête de `tick`) : une PAUSE le supprime. À la
+/// reprise, il en recrée un neuf — même génération, donc pas de remise à zéro
+/// par changement de piste — avec `track_started_at = None`, c'est-à-dire une
+/// horloge murale à ZÉRO. La sortie rend alors la position de reprise (2:19
+/// chez Jean Valjean) : `stale_start_position(0, 139_666)` est vrai, le tour
+/// est sauté par `continue`, et les seuls sites qui reposent
+/// `track_started_at` sont APRÈS ce `continue`. L'état se nourrit lui-même
+/// jusqu'à la fin de la piste : position jamais publiée, fin de piste jamais
+/// vue, aucun enchaînement (fil 1882 : 31 × `stale_start_position_ignored
+/// wall_s=0`, zone figée 9 min 25 s).
+///
+/// La position que l'état de zone porte AU MOMENT de la reprise est celle que
+/// le sondeur a lui-même publiée avant la pause, ou la cible qu'une commande
+/// (`seek`) vient d'y écrire : ce n'est pas un échantillon de sortie, la garde
+/// anti-fantôme n'a pas à s'en méfier. On date donc le début de piste comme le
+/// fait déjà le repli de seek (« Fold a NEW seek ») : `maintenant − position`.
+///
+/// Une position nulle — tout `play()` d'une piste neuve la remet à zéro — rend
+/// `None` : le démarrage frais garde exactement son comportement d'avant, et
+/// la protection contre la position de la session précédente (DMP-A6/A8) avec.
+pub fn ancrage_d_un_etat_neuf(
+    maintenant: std::time::Instant,
+    position_zone_ms: i64,
+) -> Option<std::time::Instant> {
+    if position_zone_ms <= 0 {
+        return None;
+    }
+    maintenant.checked_sub(std::time::Duration::from_millis(position_zone_ms as u64))
+}
+
 /// The peak position reached (near) the track's full duration, so the track
 /// has demonstrably finished — independent of the wall clock.
 ///
