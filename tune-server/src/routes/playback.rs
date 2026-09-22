@@ -4363,7 +4363,8 @@ async fn set_eq(
     // (#1725). On regle un egaliseur musique en cours, a l'oreille — et trois
     // utilisateurs ont rapporte « l'egaliseur ne fonctionne pas » avant ca.
     // Sans effet quand rien ne joue, hors zone locale, ou en mode PURE.
-    let applique_a_chaud = state.orchestrator.apply_eq_change(zone_id).await;
+    let portee = state.orchestrator.apply_eq_change_portee(zone_id).await;
+    let applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
 
     let bands = eq_bands_json(&profile);
     Json(json!({
@@ -4378,6 +4379,12 @@ async fn set_eq(
         // a un egaliseur muet — c'est ce silence qui a produit #1372, #1555
         // et #1688.
         "applied_live": applique_a_chaud,
+        // #4680 — QUAND le réglage s'entend : `immediate`, `restart` (zone
+        // réseau, flux relancé à la position courante dans l'instant),
+        // `next_track` ou `not_playing`. Seul `next_track` justifie
+        // « prendra effet à la piste suivante » ; `applied_live` reste pour
+        // les clients qui ne lisent pas encore ce champ.
+        "portee": portee.code(),
     }))
     .into_response()
 }

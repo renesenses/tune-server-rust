@@ -446,7 +446,8 @@ async fn activate_preset(
 
             // Persister ne suffit pas : sans ceci le preset n'atteindrait le son
             // qu'à la piste suivante sur une zone locale (#1725).
-            let applique_a_chaud = state.orchestrator.apply_eq_change(zone_id).await;
+            let portee = state.orchestrator.apply_eq_change_portee(zone_id).await;
+            let applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
 
             Json(json!({
                 "active_preset_id": id,
@@ -458,6 +459,8 @@ async fn activate_preset(
                 // Faux ne signale pas un échec : rien ne joue, zone non locale,
                 // ou mode PURE.
                 "applied_live": applique_a_chaud,
+                // #4680 — quand il s'entend ; voir `POST /zones/{id}/eq`.
+                "portee": portee.code(),
             }))
             .into_response()
         }

@@ -280,10 +280,11 @@ async fn apply_profile_handler(
     // `applied: true` (#1725). Une correction de piece se juge a l'oreille,
     // musique en cours — c'est le geste meme qu'on attend de l'utilisateur.
     // `zone_id` est textuel sur cette route ; l'orchestrateur indexe par i64.
-    let applique_a_chaud = match zone_id.parse::<i64>() {
-        Ok(id) => state.orchestrator.apply_eq_change(id).await,
-        Err(_) => false,
+    let portee = match zone_id.parse::<i64>() {
+        Ok(id) => Some(state.orchestrator.apply_eq_change_portee(id).await),
+        Err(_) => None,
     };
+    let applique_a_chaud = portee == Some(tune_core::orchestrator::PorteeDuReglage::Immediate);
 
     Ok(Json(json!({
         "applied": true,
@@ -293,6 +294,8 @@ async fn apply_profile_handler(
         // `applied` dit « persiste » ; celui-ci dit « entendu maintenant ».
         // Faux ne signale pas un echec : rien ne joue, zone non locale, PURE.
         "applied_live": applique_a_chaud,
+        // #4680 — quand il s'entend ; voir `POST /zones/{id}/eq`.
+        "portee": portee.map(|p| p.code()),
     }))
     .into_response())
 }
