@@ -54,7 +54,7 @@ pub mod sql {
 
     pub fn record<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO listen_history (track_id, title, artist_name, album_title, source, source_id, album_id, duration_ms, zone_id, cover_url, profile_id, context_type, context_id, context_position, context_source, context_title, context_cover) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -68,7 +68,10 @@ pub mod sql {
             d.placeholder(11),
             d.placeholder(12),
             d.placeholder(13),
-            d.placeholder(14)
+            d.placeholder(14),
+            d.placeholder(15),
+            d.placeholder(16),
+            d.placeholder(17)
         )
     }
 
@@ -268,6 +271,28 @@ pub struct ListenRecord {
     /// ALEATOIRE. Dans ce second cas le rang est laisse vide a dessein — on
     /// RE-TIRE au lieu de rejouer le meme tirage.
     pub context_position: Option<i64>,
+    /// L'ESPACE DE NOMS de `context_id` — `local`, `qobuz`, `tidal`…
+    ///
+    /// `source`, juste au-dessus, est celui de la PISTE : il ne dit rien de
+    /// l'objet demandé. Une playlist Qobuz qui contient un morceau de la
+    /// bibliotheque ecrit des lignes `source = 'local'` sans cesser d'etre
+    /// une playlist Qobuz (mesure du 20/09/2026 sur le .18 : 3 lignes
+    /// `local` sur les 21 de la playlist `66898771`). Prendre `source` pour
+    /// l'espace de noms du contexte, c'est resoudre un identifiant Qobuz
+    /// dans les tables locales.
+    ///
+    /// `None` sur toute ligne anterieure a la migration 105 : l'historique
+    /// d'avant ne l'a jamais su, et rien ici ne pretend le reconstituer.
+    pub context_source: Option<String>,
+    /// Le NOM de l'objet demande, tel que sa source le donnait au clic.
+    ///
+    /// Ecrit pour ce que la base ne sait PAS retrouver : le nom d'une
+    /// playlist de service n'existe dans aucune table (#3425). Reste `None`
+    /// pour un objet local, dont le nom se relit dans sa table — une copie
+    /// perimee vaut moins que la ligne vivante.
+    pub context_title: Option<String>,
+    /// La POCHETTE de l'objet demande, meme regle que `context_title`.
+    pub context_cover: Option<String>,
 }
 
 pub struct HistoryRepo {
@@ -296,7 +321,7 @@ impl HistoryRepo {
 
     pub fn record(&self, rec: &ListenRecord) -> Result<i64, String> {
         let sql = self.dialect_sql(sql::record, sql::record);
-        let params: [&dyn ToSqlValue; 14] = [
+        let params: [&dyn ToSqlValue; 17] = [
             &rec.track_id,
             &rec.title,
             &rec.artist_name,
@@ -311,6 +336,9 @@ impl HistoryRepo {
             &rec.context_type,
             &rec.context_id,
             &rec.context_position,
+            &rec.context_source,
+            &rec.context_title,
+            &rec.context_cover,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -1581,6 +1609,9 @@ fn row_to_listen(cols: &Vec<SqlValue>) -> ListenRecord {
         context_type: cols.get(11).and_then(|v| v.as_string()),
         context_id: cols.get(12).and_then(|v| v.as_string()),
         context_position: cols.get(13).and_then(|v| v.as_i64()),
+        context_source: None,
+        context_title: None,
+        context_cover: None,
     }
 }
 
@@ -1669,6 +1700,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         }
     }
 
@@ -1786,6 +1820,9 @@ mod tests {
             context_type: Some("playlist".into()),
             context_id: Some("42".into()),
             context_position: Some(6),
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         };
         repo.record(&depuis_une_playlist).unwrap();
 
@@ -1834,6 +1871,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
             ..depuis_une_playlist.clone()
         };
         repo.record(&sans_contexte).unwrap();
@@ -1865,6 +1905,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         };
 
         repo.record(&rec).unwrap();
@@ -1903,6 +1946,9 @@ mod tests {
                 context_type: None,
                 context_id: None,
                 context_position: None,
+                context_source: None,
+                context_title: None,
+                context_cover: None,
             })
             .unwrap();
         }
@@ -1924,6 +1970,9 @@ mod tests {
                 context_type: None,
                 context_id: None,
                 context_position: None,
+                context_source: None,
+                context_title: None,
+                context_cover: None,
             })
             .unwrap();
         }
@@ -1957,6 +2006,9 @@ mod tests {
                 context_type: None,
                 context_id: None,
                 context_position: None,
+                context_source: None,
+                context_title: None,
+                context_cover: None,
             })
             .unwrap();
         }
@@ -1989,6 +2041,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -2014,6 +2069,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         })
         .unwrap();
         repo.record(&ListenRecord {
@@ -2033,6 +2091,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         })
         .unwrap();
 
@@ -2063,6 +2124,9 @@ mod tests {
                 context_type: None,
                 context_id: None,
                 context_position: None,
+                context_source: None,
+                context_title: None,
+                context_cover: None,
             })
             .unwrap();
         }
@@ -2076,14 +2140,16 @@ mod tests {
     fn sql_builders_dialect_placeholders() {
         let s = SqliteDialect;
         let p = PostgresDialect;
-        // 14 colonnes depuis #2441 : `context_type` et `context_id`
-        // (migration 84) puis `context_position` (migration 94) se sont
-        // ajoutees aux onze precedentes.
-        assert!(sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
+        // 17 colonnes : aux onze d'origine se sont ajoutees `context_type` et
+        // `context_id` (migration 84, #2441), `context_position`
+        // (migration 94), puis `context_source`, `context_title` et
+        // `context_cover` (migration 105).
         assert!(
-            sql::record(&p)
-                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)")
+            sql::record(&s).contains("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
         );
+        assert!(sql::record(&p).contains(
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)"
+        ));
         assert!(sql::recent_paginated(&p).contains("LIMIT $1 OFFSET $2"));
         assert!(sql::listening_history(&p, 7).contains("interval '7 days'"));
         assert!(sql::listening_history(&s, 7).contains("'-7 days'"));
@@ -2115,6 +2181,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         })
         .unwrap();
 
@@ -2149,6 +2218,9 @@ mod tests {
             context_type: None,
             context_id: None,
             context_position: None,
+            context_source: None,
+            context_title: None,
+            context_cover: None,
         })
         .unwrap();
         assert_eq!(repo.count().unwrap(), 1);
@@ -2207,6 +2279,9 @@ mod tests {
                 context_type: None,
                 context_id: None,
                 context_position: None,
+                context_source: None,
+                context_title: None,
+                context_cover: None,
             })
             .expect("ecoute enregistree");
         // `record` laisse la base dater la ligne ; on la repositionne pour que

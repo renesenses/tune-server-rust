@@ -530,6 +530,12 @@ impl PlaybackOrchestrator {
             context_type: contexte.nature.map(Into::into),
             context_id: contexte.id.map(Into::into),
             context_position: contexte.rang,
+            // L'espace de noms de `context_id`, et le libelle que la base ne
+            // sait pas retrouver toute seule. `source` ci-dessus est celui de
+            // la PISTE : il ne repond pas « chez qui ouvrir cet objet ».
+            context_source: contexte.service.map(Into::into),
+            context_title: contexte.titre.map(Into::into),
+            context_cover: contexte.pochette.map(Into::into),
         })
         .ok();
 
@@ -642,6 +648,9 @@ impl PlaybackOrchestrator {
                     nature: etat.session_context_type.as_deref(),
                     id: etat.session_context_id.as_deref(),
                     rang: rang_a_retenir(etat.shuffle, etat.queue_position),
+                    service: etat.session_context_source.as_deref(),
+                    titre: etat.session_context_title.as_deref(),
+                    pochette: etat.session_context_cover.as_deref(),
                 },
             );
         }
