@@ -19,6 +19,7 @@ tune-plugin-abi = {path = "../tune-plugin-abi", optional = true}
 serde.workspace = true
 serde_json.workspace = true
 tune-plugin-sdk.workspace = true
+tune-plugin-audio-support = { path = "../tune-plugin-audio-support" }
 
 [dev-dependencies]
 tune-plugin-testkit.workspace = true

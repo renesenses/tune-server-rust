@@ -3845,3 +3845,112 @@ async fn un_preampli_positif_est_rabote_a_volume_plein_mais_pas_a_mi_course() {
         "à mi-course, le même +6 dB est appliqué (0,5 × 1,995)"
     );
 }
+
+// -----------------------------------------------------------------------
+// #4685 — la compensation de niveau, rendue par le volume
+// -----------------------------------------------------------------------
+
+/// Le préréglage « Rock » de la grille ISO à 10 bandes (Q = 1).
+fn egaliseur_rock(canaux: u16) -> crate::audio::eq::EqProcessor {
+    const GRILLE: [f64; 10] = [
+        31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    ];
+    const ROCK: [f64; 10] = [5.0, 3.0, 0.0, -2.0, -1.0, 2.0, 4.0, 5.0, 5.0, 4.0];
+    let profil = crate::audio::eq::EqProfile {
+        enabled: true,
+        bands: GRILLE
+            .iter()
+            .zip(ROCK)
+            .map(|(&freq, gain)| crate::audio::eq::EqBandSpec {
+                freq,
+                gain,
+                q: 1.0,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    crate::audio::eq::EqProcessor::new(&profil, 44_100, canaux)
+}
+
+fn millemes(db: f64) -> i64 {
+    (10.0_f64.powf(db / 20.0) * 1000.0).round() as i64
+}
+
+/// Égaliseur « Rock » + crossfeed « Standard » sur une sortie locale, curseur
+/// à −20 dB : le volume effectif doit rendre exactement ce que le DSP retire
+/// en moyenne, le crête-mètre doit retomber sur le seul curseur, et
+/// l'interrupteur, le mode PURE et le volume plein doivent chacun faire ce
+/// qu'ils disent.
+#[tokio::test]
+async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
+    use crate::outputs::traits::OutputTarget;
+
+    let sortie = LocalOutput::new("DAC test".to_string());
+    let gain = sortie.gain_de_rendu();
+    let dsp = sortie.gain_moyen_du_dsp();
+    let mesure = crate::playback::PlaybackManager::new();
+    mesure.brancher_le_gain_de_sortie(7, sortie.gain_de_rendu());
+    mesure.brancher_le_gain_moyen_du_dsp(7, sortie.gain_moyen_du_dsp());
+
+    sortie.set_volume(0.1).await.expect("set_volume");
+    assert_eq!(gain.load(Ordering::SeqCst), 100, "−20 dB, sans DSP");
+    assert_eq!(dsp.load(Ordering::SeqCst), 1000, "sans DSP, rien à compenser");
+
+    let eq = egaliseur_rock(2);
+    let cf = crate::audio::crossfeed::CrossfeedProcessor::new(44_100, 0.30, 0.5);
+    let (eq_db, cf_db) = (eq.gain_moyen_db(), cf.gain_moyen_db());
+    eprintln!("rock {eq_db:+.2} dB, crossfeed standard {cf_db:+.2} dB");
+    assert!(eq_db < -3.0, "la réserve de « Rock » retire du niveau : {eq_db}");
+    assert!(cf_db < 0.0, "le crossfeed retire du Side : {cf_db}");
+    sortie.set_eq(Some(eq));
+    sortie.set_crossfeed(Some(cf));
+
+    let perte = eq_db + cf_db;
+    let rendu = gain.load(Ordering::SeqCst) as i64;
+    assert!(
+        (rendu - millemes(-20.0 - perte)).abs() <= 1,
+        "volume effectif {rendu} ‰, attendu {} ‰ (−20 dB + {:.2} dB rendus)",
+        millemes(-20.0 - perte),
+        -perte
+    );
+    assert!((i64::from(dsp.load(Ordering::SeqCst)) - millemes(perte)).abs() <= 1);
+    // L'aiguille : volume × compensation × gain moyen du DSP = le curseur.
+    let aiguille = i64::from(mesure.gain_de_sortie_units(7));
+    assert!(
+        (aiguille - 100).abs() <= 1,
+        "compensée, l'aiguille retombe sur le seul curseur : {aiguille} ‰"
+    );
+
+    // Interrupteur ouvert → le volume redevient le curseur, et l'aiguille
+    // montre la perte du DSP.
+    sortie.set_compensation_de_niveau(false);
+    assert_eq!(gain.load(Ordering::SeqCst), 100);
+    let aiguille = i64::from(mesure.gain_de_sortie_units(7));
+    assert!((aiguille - millemes(-20.0 + perte)).abs() <= 1, "{aiguille} ‰");
+
+    // Volume plein : la compensation est rabotée à l'unité, jamais au-delà.
+    sortie.set_compensation_de_niveau(true);
+    sortie.set_volume(1.0).await.expect("set_volume");
+    assert_eq!(gain.load(Ordering::SeqCst), 1000, "raboté à l'unité");
+
+    // PURE : DSP contourné, rien à compenser ni à retrancher de la mesure.
+    sortie.set_volume(0.1).await.expect("set_volume");
+    sortie.set_pure_bypass(true);
+    assert_eq!(gain.load(Ordering::SeqCst), 100);
+    assert_eq!(dsp.load(Ordering::SeqCst), 1000);
+    sortie.set_pure_bypass(false);
+
+    // Retirer l'égaliseur en cours de lecture recompose sans lui.
+    sortie.replace_eq_live(None);
+    let rendu = gain.load(Ordering::SeqCst) as i64;
+    assert!((rendu - millemes(-20.0 - cf_db)).abs() <= 1, "{rendu} ‰");
+
+    // Et le ReplayGain se compose toujours, compensation comprise.
+    sortie.set_replaygain_factor(0.5);
+    let rendu = gain.load(Ordering::SeqCst) as i64;
+    assert!(
+        (rendu - millemes(-20.0 - cf_db + 20.0 * 0.5_f64.log10())).abs() <= 1,
+        "{rendu} ‰"
+    );
+}

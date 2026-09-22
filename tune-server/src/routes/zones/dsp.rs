@@ -21,6 +21,8 @@ pub(super) async fn get_zone_dsp(
     // champ voit le même écran qu'avant.
     let crossfeed_status =
         crossfeed_status_de_zone(&state, id, crossfeed["enabled"].as_bool().unwrap_or(false)).await;
+    // #4685 — additif : un client qui l'ignore voit le même écran qu'avant.
+    let level_compensation = compensation_de_niveau_de_zone(&state, id);
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -30,6 +32,7 @@ pub(super) async fn get_zone_dsp(
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
             "crossfeed_status": crossfeed_status,
+            "level_compensation": level_compensation,
         }))
         .into_response(),
         Err(_) => Json(json!({
@@ -37,9 +40,45 @@ pub(super) async fn get_zone_dsp(
             "eq_profile": eq_profile.unwrap_or_default(),
             "crossfeed": crossfeed,
             "crossfeed_status": crossfeed_status,
+            "level_compensation": level_compensation,
         }))
         .into_response(),
     }
+}
+
+/// #4685 — l'interrupteur de compensation de niveau et ce qu'il vaut sur
+/// cette zone, pour l'écran.
+///
+/// ```json
+/// { "enabled": true, "eq_db": -10.62, "crossfeed_db": -1.05,
+///   "compensation_db": 11.67, "local_output_only": true }
+/// ```
+///
+/// `eq_db` / `crossfeed_db` : ce que chaque étage fait au niveau MOYEN
+/// (négatif = il en retire), calculé depuis le filtre par les mêmes
+/// chargeurs que la lecture — 0 quand l'étage n'est pas actif sur la zone.
+/// `compensation_db` : ce qui est rendu par le volume quand l'interrupteur
+/// est ouvert, 0 sinon. C'est une DEMANDE : à volume plein, le rabot à
+/// l'unité la mange (la ligne `local_gain_rabote_a_l_unite` le dit au
+/// journal). `local_output_only` : la compensation passe par le volume de la
+/// sortie LOCALE ; une zone réseau ne la reçoit pas.
+pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
+    let enabled = state.orchestrator.zone_compensation_de_niveau(zone_id);
+    let (eq_db, crossfeed_db) = state.orchestrator.gain_moyen_du_dsp_de_zone(zone_id);
+    // `+ 0.0` : pas de « -0 » dans le JSON quand rien n'est à rendre.
+    let arrondi = |db: f64| (db * 100.0).round() / 100.0 + 0.0;
+    let compensation_db = if enabled {
+        arrondi(-(eq_db + crossfeed_db))
+    } else {
+        0.0
+    };
+    json!({
+        "enabled": enabled,
+        "eq_db": arrondi(eq_db),
+        "crossfeed_db": arrondi(crossfeed_db),
+        "compensation_db": compensation_db,
+        "local_output_only": true,
+    })
 }
 
 /// Cache of computed convolver responses, keyed by zone id. The value pairs
@@ -362,6 +401,23 @@ pub(super) async fn set_zone_dsp(
         crossfeed_status = Some(statut);
     }
 
+    // #4685 — l'interrupteur de compensation de niveau. Pas de garde Premium :
+    // il ne crée aucun traitement, il rend par le volume ce que l'égaliseur
+    // (gratuit) ou le crossfeed (Premium, déjà gardé) retirent.
+    let mut compensation_appliquee_a_chaud = false;
+    if let Some(enabled) = body
+        .get("level_compensation")
+        .and_then(|v| v.get("enabled"))
+        .and_then(|v| v.as_bool())
+    {
+        let cle = tune_core::orchestrator::PlaybackOrchestrator::cle_compensation_de_niveau(id);
+        let _ = settings.set(&cle, if enabled { "true" } else { "false" });
+        compensation_appliquee_a_chaud = state.orchestrator.refresh_zone_compensation(id).await;
+    }
+    // Rendu à CHAQUE écriture : changer l'égaliseur ou le crossfeed change
+    // aussi ce que la compensation rend.
+    let level_compensation = compensation_de_niveau_de_zone(&state, id);
+
     let preset_id = body["dsp_preset_id"].as_i64();
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
     let repo = ZoneRepo::with_backend(state.backend.clone());
@@ -386,6 +442,9 @@ pub(super) async fn set_zone_dsp(
         "eq_applied_live": eq_applique_a_chaud,
         // Idem pour le crossfeed (#1786).
         "crossfeed_applied_live": cf_applique_a_chaud,
+        // #4685 — l'interrupteur et ce qu'il rend, après cette écriture.
+        "level_compensation": level_compensation,
+        "level_compensation_applied_live": compensation_appliquee_a_chaud,
     }))
     .into_response()
 }

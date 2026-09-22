@@ -10,6 +10,9 @@ pub use tune_plugin_equalizer::{
 use tune_plugin_native::stage::Stage;
 pub struct EqProcessor {
     engine: Engine,
+    /// #4685 — niveau moyen du filtre, réserve comprise, calculé UNE fois à
+    /// la construction (voir [`Self::gain_moyen_db`]).
+    gain_moyen_db: f64,
     clipping: CompteurDEcretage,
     closed: AtomicBool,
 }
@@ -42,11 +45,29 @@ impl EqProcessor {
                 channels,
             ))
         };
+        // Calculé depuis le PROFIL, pour les deux moteurs : le greffon natif
+        // signé exécute la même arithmétique que le moteur embarqué (même
+        // crate), et ne publie pas d'autre porte. Un moteur indisponible ne
+        // filtre rien — il n'a donc rien à compenser.
+        let gain_moyen_db = if matches!(engine, Engine::Unavailable) {
+            0.0
+        } else {
+            profile.gain_moyen_db_at(channels, f64::from(sample_rate))
+        };
         Self {
             engine,
+            gain_moyen_db,
             clipping: Default::default(),
             closed: AtomicBool::new(false),
         }
+    }
+
+    /// #4685 — ce que cet égaliseur, réserve automatique comprise, fait
+    /// gagner ou perdre au niveau MOYEN, en dB, sur un bruit rose. Négatif
+    /// dès qu'une bande pousse : la réserve anti-écrêtage retire plus que la
+    /// courbe ne rend en moyenne. Voir `EqProfile::gain_moyen_db_at`.
+    pub fn gain_moyen_db(&self) -> f64 {
+        self.gain_moyen_db
     }
     pub fn process_pcm(&mut self, pcm: &mut [u8], depth: u16) -> EqProcessStats {
         match &mut self.engine {

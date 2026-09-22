@@ -398,6 +398,94 @@ impl EqProfile {
     /// elle, vient entièrement de la borne vraie. Une somme et une cascade,
     /// c'étaient deux réponses à la même question, et celle qui gagnait le
     /// `max()` n'était pas celle qui mesure.
+    /// La cascade RÉELLE de chaque canal, `[canal][étage]` — exactement celle
+    /// qu'exécute [`EqProcessor::new`], qui la tient d'ici.
+    ///
+    /// Expert-mode bands take over the whole cascade when present; the
+    /// 3-tilt profiler cascade is the fallback (unchanged behaviour). La
+    /// cascade du profileur historique (3 filtres de tilt) ne connait pas les
+    /// canaux : elle s'applique partout, a l'identique. Seules les bandes du
+    /// mode expert peuvent viser un canal.
+    ///
+    /// Sortie de `new` pour [`Self::gain_moyen_db_at`] (#4685) : le niveau
+    /// moyen doit se calculer sur le filtre qui joue, pas sur une copie.
+    fn cascades(&self, sr: f64, channels: u16) -> Vec<Vec<BiquadCoeffs>> {
+        let commune: Vec<BiquadCoeffs> = if self.bands.is_empty() {
+            let (bass_db, mid_db, treble_db) = self.effective_gains();
+            if bass_db.abs() > 0.01 || mid_db.abs() > 0.01 || treble_db.abs() > 0.01 {
+                vec![
+                    low_shelf(80.0, bass_db, sr),
+                    peaking_eq(2000.0, mid_db, 1.0, sr),
+                    high_shelf(10000.0, treble_db, sr),
+                ]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        (0..channels.max(1))
+            .map(|ch| {
+                if self.bands.is_empty() {
+                    commune.clone()
+                } else {
+                    self.bands
+                        .iter()
+                        .filter(|b| !b.is_neutral() && b.vise_le_canal(ch))
+                        .map(|b| b.coeffs(sr))
+                        .collect()
+                }
+            })
+            .collect()
+    }
+
+    /// #4685 — ce que l'égaliseur, réserve automatique COMPRISE, fait gagner
+    /// ou perdre au niveau MOYEN, en dB, sur un bruit rose (voir
+    /// `tune_plugin_audio_support::niveau_moyen`).
+    ///
+    /// La réserve ([`Self::automatic_headroom_db_at`]) est le pré-gain que
+    /// #4685 demandait — « −(plus forte amplification) pour éviter
+    /// l'écrêtage » — et elle existe déjà, en plus sûr : la norme L1, qui
+    /// majore toujours le maximum fréquentiel. Elle n'est pas touchée. Mais
+    /// elle fait perdre du niveau : « Rock » réserve 13,64 dB pour une courbe
+    /// qui n'en rend que quelques-uns en moyenne. C'est CETTE perte nette qui
+    /// se lit ici, et que l'hôte peut rendre par le volume, là où aucun
+    /// écrêtage n'est possible.
+    ///
+    /// Moyenne de puissance sur les canaux : une courbe gauche/droite
+    /// dissymétrique compte pour moitié chacune. 0,0 pour un profil éteint ou
+    /// qui ne filtre rien — c'est-à-dire exactement quand [`EqProcessor`]
+    /// ne serait pas actif.
+    pub fn gain_moyen_db_at(&self, channels: u16, sample_rate: f64) -> f64 {
+        if !self.enabled || !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return 0.0;
+        }
+        let cascades = self.cascades(sample_rate, channels);
+        if cascades.iter().all(|c| c.is_empty()) {
+            return 0.0;
+        }
+        let reserves: Vec<f64> = (0..cascades.len() as u16)
+            .map(|ch| 10.0_f64.powf(self.automatic_headroom_db_at(ch, sample_rate) / 10.0))
+            .collect();
+        let n = cascades.len() as f64;
+        tune_plugin_audio_support::niveau_moyen::gain_moyen_rose_db(sample_rate, |f| {
+            let w = 2.0 * PI * f / sample_rate;
+            cascades
+                .iter()
+                .zip(reserves.iter())
+                .map(|(cascade, reserve)| {
+                    reserve
+                        * cascade
+                            .iter()
+                            .map(|c| c.module_a(w).powi(2))
+                            .product::<f64>()
+                })
+                .sum::<f64>()
+                / n
+        })
+    }
+
     fn cascade_a_gain(&self, channel: u16, sample_rate: f64) -> (bool, Vec<BiquadCoeffs>) {
         if self.bands.is_empty() {
             let (bass, mid, treble) = self.effective_gains();
@@ -496,6 +584,20 @@ struct BiquadCoeffs {
     b2: f64,
     a1: f64,
     a2: f64,
+}
+
+impl BiquadCoeffs {
+    /// |H(e^jw)| — le module de ce biquad à la pulsation normalisée `w`
+    /// (radians par échantillon). Une seule écriture, partagée par la courbe
+    /// publiée ([`EqProcessor::response`]) et le niveau moyen
+    /// ([`EqProfile::gain_moyen_db_at`]).
+    fn module_a(&self, w: f64) -> f64 {
+        let re = self.b0 + self.b1 * w.cos() + self.b2 * (2.0 * w).cos();
+        let im = -self.b1 * w.sin() - self.b2 * (2.0 * w).sin();
+        let dre = 1.0 + self.a1 * w.cos() + self.a2 * (2.0 * w).cos();
+        let dim = -self.a1 * w.sin() - self.a2 * (2.0 * w).sin();
+        re.hypot(im) / dre.hypot(dim)
+    }
 }
 
 /// Biquad filter state (per channel).
@@ -726,41 +828,7 @@ impl EqProcessor {
     /// Create a new EQ processor from a profile and sample rate.
     pub fn new(profile: &EqProfile, sample_rate: u32, channels: u16) -> Self {
         let sr = sample_rate as f64;
-
-        // Expert-mode bands take over the whole cascade when present; the
-        // 3-tilt profiler cascade is the fallback (unchanged behaviour).
-        // La cascade du profileur historique (3 filtres de tilt) ne connait pas
-        // les canaux : elle s'applique partout, a l'identique. Seules les
-        // bandes du mode expert peuvent viser un canal.
-        let commune: Vec<BiquadCoeffs> = if profile.bands.is_empty() {
-            let (bass_db, mid_db, treble_db) = profile.effective_gains();
-            if bass_db.abs() > 0.01 || mid_db.abs() > 0.01 || treble_db.abs() > 0.01 {
-                vec![
-                    low_shelf(80.0, bass_db, sr),
-                    peaking_eq(2000.0, mid_db, 1.0, sr),
-                    high_shelf(10000.0, treble_db, sr),
-                ]
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-
-        let filters: Vec<Vec<BiquadCoeffs>> = (0..channels.max(1))
-            .map(|ch| {
-                if profile.bands.is_empty() {
-                    commune.clone()
-                } else {
-                    profile
-                        .bands
-                        .iter()
-                        .filter(|b| !b.is_neutral() && b.vise_le_canal(ch))
-                        .map(|b| b.coeffs(sr))
-                        .collect()
-                }
-            })
-            .collect();
+        let filters = profile.cascades(sr, channels);
 
         let states = filters
             .iter()
@@ -999,11 +1067,7 @@ impl EqProcessor {
                         let w = 2.0 * PI * frequency / f64::from(sample_rate);
                         let mut magnitude = self.preamp_gains[channel];
                         for c in cascade {
-                            let re = c.b0 + c.b1 * w.cos() + c.b2 * (2.0 * w).cos();
-                            let im = -c.b1 * w.sin() - c.b2 * (2.0 * w).sin();
-                            let dre = 1.0 + c.a1 * w.cos() + c.a2 * (2.0 * w).cos();
-                            let dim = -c.a1 * w.sin() - c.a2 * (2.0 * w).sin();
-                            magnitude *= (re.hypot(im) / dre.hypot(dim)).max(1e-15);
+                            magnitude *= c.module_a(w).max(1e-15);
                         }
                         20.0 * magnitude.max(1e-15).log10()
                     })
@@ -1915,5 +1979,84 @@ mod tests {
             ..Default::default()
         };
         assert!(!EqProcessor::new(&profil, 44100, 2).enabled);
+    }
+
+    // -------------------------------------------------------------------
+    // #4685 — le niveau moyen, calculé puis MESURÉ
+    // -------------------------------------------------------------------
+
+    /// Un préréglage de la grille ISO à 10 bandes, Q = 1 — les mêmes valeurs
+    /// que `tune-core/src/audio/eq_presets.rs` et que le client web.
+    fn preregle(gains: [f64; 10]) -> EqProfile {
+        const GRILLE: [f64; 10] = [
+            31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+        ];
+        EqProfile {
+            enabled: true,
+            bands: GRILLE
+                .iter()
+                .zip(gains)
+                .map(|(&freq, gain)| EqBandSpec {
+                    freq,
+                    gain,
+                    q: 1.0,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Le témoin chiffré : un multi-sinus rose (même répartition d'énergie
+    /// que la référence) passe dans le VRAI processeur, réserve automatique
+    /// comprise ; l'écart de RMS mesuré doit retrouver `gain_moyen_db_at` à
+    /// 0,25 dB près, et la compensation qu'on en tire rendre le niveau
+    /// d'entrée.
+    #[test]
+    fn le_gain_moyen_calcule_retrouve_le_rms_mesure_4685() {
+        use tune_plugin_audio_support::niveau_moyen::{multisinus_rose, rms_db};
+        let cas: [(&str, [f64; 10]); 4] = [
+            ("rock", [5.0, 3.0, 0.0, -2.0, -1.0, 2.0, 4.0, 5.0, 5.0, 4.0]),
+            ("bass_boost", [8.0, 6.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            ("classical", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -2.0, -3.0, -2.0, -1.0]),
+            ("loudness", [6.0, 4.0, 0.0, -2.0, -1.0, 0.0, 2.0, 4.0, 5.0, 6.0]),
+        ];
+        for sr in [44_100_u32, 96_000] {
+            let frames = sr as usize * 2;
+            let signal = multisinus_rose(sr, frames, 0x4685);
+            for (nom, gains) in cas {
+                let profil = preregle(gains);
+                let calcule = profil.gain_moyen_db_at(1, f64::from(sr));
+                let mut eq = EqProcessor::new(&profil, sr, 1);
+                let mut sortie: Vec<f32> = signal.iter().map(|&s| s as f32).collect();
+                eq.process_interleaved(&mut sortie);
+                let avant = rms_db(signal.iter().skip(frames / 4).copied());
+                let apres = rms_db(sortie.iter().skip(frames / 4).map(|&s| f64::from(s)));
+                let mesure = apres - avant;
+                eprintln!(
+                    "égaliseur {nom} {sr} Hz : réserve {:+.2} dB, niveau moyen calculé \
+                     {calcule:+.3} dB, mesuré {mesure:+.3} dB",
+                    profil.automatic_headroom_db_at(0, f64::from(sr))
+                );
+                assert!(
+                    (calcule - mesure).abs() < 0.25,
+                    "{nom} {sr} Hz : calculé {calcule:.3} dB ≠ mesuré {mesure:.3} dB"
+                );
+                assert!(
+                    ((apres - calcule) - avant).abs() < 0.25,
+                    "la compensation doit rendre le niveau d'entrée"
+                );
+            }
+        }
+    }
+
+    /// Un profil éteint, ou qui ne filtre rien, n'a rien à compenser — la
+    /// même condition que celle qui laisse `EqProcessor` inactif.
+    #[test]
+    fn un_egaliseur_inactif_n_a_rien_a_compenser() {
+        let mut eteint = preregle([5.0, 3.0, 0.0, -2.0, -1.0, 2.0, 4.0, 5.0, 5.0, 4.0]);
+        eteint.enabled = false;
+        assert_eq!(eteint.gain_moyen_db_at(2, 44_100.0), 0.0);
+        assert_eq!(preregle([0.0; 10]).gain_moyen_db_at(2, 44_100.0), 0.0);
     }
 }
