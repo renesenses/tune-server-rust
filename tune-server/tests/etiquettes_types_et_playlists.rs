@@ -340,13 +340,9 @@ async fn la_suppression_atteint_encore_une_ligne_de_type_hors_liste() {
 /// compteur de l'étiquette reste à zéro.
 #[tokio::test]
 async fn un_identifiant_nul_ou_negatif_est_refuse_et_rien_n_est_ecrit() {
-    let (app, _state) = app_avec_etat();
-    let (statut, cree) = post(&app, "/api/v1/tags/", json!({ "name": "Garde id nul" })).await;
-    assert!(
-        statut.is_success(),
-        "création de l'étiquette : {statut} {cree}"
-    );
-    let id = cree["id"].as_i64().expect("id de l'étiquette");
+    let (app, state) = app_avec_etat();
+    let tags = TagRepo::with_backend(state.backend.clone());
+    let id = tags.create("Garde id nul", None).unwrap();
 
     for faux in [0, -3] {
         let (s, _) = post(
@@ -371,14 +367,11 @@ async fn un_identifiant_nul_ou_negatif_est_refuse_et_rien_n_est_ecrit() {
         "un lot contenant 0 a été accepté"
     );
 
-    let (_, liste) = get(&app, "/api/v1/tags/").await;
-    let compte = liste
-        .as_array()
-        .and_then(|l| l.iter().find(|t| t["id"].as_i64() == Some(id)))
-        .and_then(|t| t["count"].as_i64())
-        .unwrap_or(-1);
+    // Même lecture que le test voisin : la route générique voit tout.
+    let (_, items) = get(&app, &format!("/api/v1/tags/{id}/items")).await;
     assert_eq!(
-        compte, 0,
-        "une écriture refusée a quand même laissé des lignes"
+        items["items"],
+        json!([]),
+        "une écriture refusée a quand même laissé des lignes : {items}"
     );
 }
