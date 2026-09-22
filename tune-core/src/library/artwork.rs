@@ -680,7 +680,7 @@ pub async fn batch_enrich_artwork_scoped(
     for (album_id, title, artist_name, mbid) in &albums {
         // Même traitement, même carte à l'écran que les images d'artistes :
         // « Pochettes d'artistes » couvre les deux passes de `library::artwork`.
-        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::ImagesArtistes)
+        crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
             .await;
         let artist = artist_name.as_deref().unwrap_or("Unknown Artist");
 
@@ -1706,7 +1706,7 @@ async fn batch_enrich_artist_artwork_inner(
         // mémoire ; en sortir terminerait la tâche au lieu de la suspendre.
         // L'artiste précédent a son image écrite et son avancement publié —
         // la frontière est propre, et la reprise repart au même `i`.
-        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::ImagesArtistes)
+        crate::taches_de_fond::attendre_son_tour(crate::taches_de_fond::Tache::ImagesArtistes)
             .await;
         // Rate limit: short delay between community lookups (no rate limit),
         // longer delay only when hitting external APIs (MusicBrainz etc.)
