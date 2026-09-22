@@ -125,13 +125,24 @@ pub mod sql {
     /// Albums homonymes déjà rattachés à un AUTRE dossier, avec leur dossier
     /// et les numéros de piste qu'ils occupent : de quoi décider si le dossier
     /// courant est l'éclat d'une même compilation (#1440).
+    ///
+    /// 🔴 #4602 — l'agrégat passe par [`SqlDialect::group_concat`]. Écrit
+    /// `GROUP_CONCAT(t.track_number)` en dur, il n'existait que sur SQLite :
+    /// PostgreSQL refusait la requête ENTIÈRE, l'erreur remontait par `?`
+    /// jusqu'à `get_or_create_for_folder_with_track`, et la piste entrait en
+    /// base SANS album (`BUG_album_create_failed`). Comme la requête ne part
+    /// que pour un dossier qui porte une pochette et des numéros de piste —
+    /// presque toute la bibliothèque —, un scan sur PostgreSQL laissait la
+    /// majorité des albums sans ligne. `STRING_AGG` exige du texte, d'où le
+    /// `CAST` : il est aussi valide sur SQLite, qui rend la même liste.
     pub fn scattered_candidates<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT a.id, a.folder_path, \
-             (SELECT GROUP_CONCAT(t.track_number) FROM tracks t WHERE t.album_id = a.id) \
+             (SELECT {} FROM tracks t WHERE t.album_id = a.id) \
              FROM albums a \
              WHERE LOWER(a.title) = LOWER({}) AND a.folder_path IS NOT NULL \
              AND a.folder_path <> {} LIMIT 50",
+            d.group_concat("CAST(t.track_number AS TEXT)", ","),
             d.placeholder(1),
             d.placeholder(2)
         )

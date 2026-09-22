@@ -309,6 +309,13 @@ name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
 required-features = ["postgres"]
 
+# #4625 — la vue par dossiers compte et liste les pistes découpées par une
+# feuille CUE (`file_path` NULL). `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "dossier_cue_4625"
+path = "tests/dossier_cue_4625.rs"
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
@@ -818,6 +825,13 @@ path = "tests/index_recherche_denominateur_4565.rs"
 [[test]]
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
+
+# #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
+# et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "pg_scan_converge_4602"
+path = "tests/pg_scan_converge_4602.rs"
 
 # « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
 # faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
