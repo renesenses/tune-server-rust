@@ -291,6 +291,7 @@ pub(super) async fn set_zone_dsp(
     }
     // Handle eq_profile if present
     let mut eq_applique_a_chaud = false;
+    let mut eq_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
     if let Some(eq_val) = body.get("eq_profile") {
         if let Ok(profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
@@ -301,7 +302,9 @@ pub(super) async fn set_zone_dsp(
             // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
             // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
             // ne le faisait pas.
-            eq_applique_a_chaud = state.orchestrator.apply_eq_change(id).await;
+            let portee = state.orchestrator.apply_eq_change_portee(id).await;
+            eq_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+            eq_portee = Some(portee);
         }
     }
 
@@ -384,6 +387,9 @@ pub(super) async fn set_zone_dsp(
         // client de dire « prendra effet a la piste suivante » au lieu de
         // laisser croire a un egaliseur muet.
         "eq_applied_live": eq_applique_a_chaud,
+        // #4680 — quand l'égaliseur s'entend (`immediate`, `restart`,
+        // `next_track`, `not_playing`) ; `null` sans `eq_profile` dans le corps.
+        "eq_portee": eq_portee.map(|p| p.code()),
         // Idem pour le crossfeed (#1786).
         "crossfeed_applied_live": cf_applique_a_chaud,
     }))
