@@ -1,6 +1,6 @@
 {
   "version": "0.9.162",
-  "ready": false,
+  "ready": true,
   "components": {
     "server": {
       "repository": "renesenses/tune-server-rust",
@@ -9,7 +9,7 @@
     },
     "web": {
       "repository": "renesenses/tune-web-client",
-      "sha": "737ab0afb89e7d5f53994a0a7ca32d06c6ffc32f",
+      "sha": "44ec7a562dbe9271bf3265bcf40fb6d88601a337",
       "tag": "v0.9.162"
     },
     "os": {
