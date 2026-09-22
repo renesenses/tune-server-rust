@@ -49,8 +49,8 @@ impl CrossfeedProcessor {
         }
     }
 
-    /// #4685 — ce que ce crossfeed fait perdre au niveau MOYEN d'un canal, en
-    /// dB (négatif), sur un bruit rose stéréo de corrélation
+    /// #4685 — ce que ce crossfeed fait gagner ou perdre au niveau MOYEN d'un
+    /// canal, en dB, sur un bruit rose stéréo de corrélation
     /// `tune_plugin_crossfeed::CORRELATION_DE_REFERENCE`. Calculé depuis le
     /// filtre, pas depuis la musique : c'est un gain FIXE.
     pub fn gain_moyen_db(&self) -> f64 {

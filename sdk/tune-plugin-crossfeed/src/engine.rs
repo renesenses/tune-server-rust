@@ -306,9 +306,14 @@ pub const CORRELATION_DE_REFERENCE: f64 = 0.5;
 ///      = (1+ρ)/2 + (1−ρ)/2 · (1 − 4a·cos(2πfD/fs) + 4a²)
 /// ```
 ///
-/// Sans retard (`D = 0`) le Side est simplement multiplié par `1 − 2a` ;
-/// avec retard, c'est un peigne : il creuse le grave (`cos ≈ 1`) et pousse
-/// par endroits l'aigu — d'où « surtout dans le grave ».
+/// Sans retard (`D = 0`) le Side est simplement multiplié par `1 − 2a` : le
+/// niveau baisse partout (−0,90 dB à 25 %, −1,19 dB à 40 %). Avec retard,
+/// c'est un peigne : il creuse le grave (`cos ≈ 1`) — d'où « surtout dans le
+/// grave » — mais POUSSE le Side par endroits dans l'aigu, et en moyenne rose
+/// les deux se compensent presque : les trois réglages du client restent à
+/// quelques dixièmes de dB, dans un sens ou dans l'autre (témoin
+/// `avec_retard_le_peigne_rend_dans_l_aigu_ce_qu_il_prend_au_grave`). La
+/// compensation qui en découle peut donc être une ATTÉNUATION.
 ///
 /// Hors calcul : l'écrêtage du module (clamp à ±1), non linéaire, et un flux
 /// non stéréo, que le module laisse intact (0 dB serait alors juste ; ce
@@ -566,9 +571,9 @@ mod tests {
 
     /// Le témoin chiffré : sur les trois réglages tout faits du client
     /// (Léger 0,25/0,3 ms, Standard 0,30/0,5 ms, Fort 0,40/0,7 ms) et sans
-    /// retard, la perte MESURÉE au RMS doit retrouver [`gain_moyen_db`] à
-    /// 0,25 dB près — et la compensation qu'on en tire doit rendre le niveau
-    /// d'entrée.
+    /// retard, l'écart de niveau MESURÉ au RMS doit retrouver
+    /// [`gain_moyen_db`] à 0,25 dB près — et la compensation qu'on en tire
+    /// doit rendre le niveau d'entrée.
     #[test]
     fn le_gain_moyen_calcule_retrouve_le_rms_mesure_4685() {
         for (sr, amount, delay) in [
@@ -576,6 +581,7 @@ mod tests {
             (44_100, 0.30, 0.5),
             (48_000, 0.40, 0.7),
             (96_000, 0.30, 0.0),
+            (44_100, 0.50, 0.0),
         ] {
             let calcule = gain_moyen_db(sr, amount, delay);
             let (avant, apres) = rms_avant_apres(sr, amount, delay);
@@ -585,10 +591,6 @@ mod tests {
                  mesuré {mesure:+.3} dB (entrée {avant:.2} dB RMS, sortie {apres:.2}, \
                  compensée {:.2})",
                 apres - calcule
-            );
-            assert!(
-                calcule < 0.0,
-                "le crossfeed fait PERDRE du niveau : {calcule}"
             );
             assert!(
                 (calcule - mesure).abs() < 0.25,
@@ -608,15 +610,36 @@ mod tests {
         assert_eq!(gain_moyen_db(44_100, f32::NAN, 0.3), 0.0);
     }
 
-    /// Plus fort ⇒ plus de Side retiré ⇒ plus de niveau perdu.
+    /// SANS retard, le Side est simplement multiplié par `1 − 2a` : plus fort
+    /// ⇒ plus de Side retiré ⇒ plus de niveau perdu, à toutes les fréquences.
     #[test]
-    fn un_crossfeed_plus_fort_perd_plus() {
-        let leger = gain_moyen_db(44_100, 0.25, 0.3);
-        let standard = gain_moyen_db(44_100, 0.30, 0.5);
-        let fort = gain_moyen_db(44_100, 0.40, 0.7);
+    fn sans_retard_un_crossfeed_plus_fort_perd_plus() {
+        let faible = gain_moyen_db(44_100, 0.10, 0.0);
+        let moyen = gain_moyen_db(44_100, 0.25, 0.0);
+        let fort = gain_moyen_db(44_100, 0.40, 0.0);
         assert!(
-            leger > standard && standard > fort,
-            "{leger} {standard} {fort}"
+            0.0 > faible && faible > moyen && moyen > fort,
+            "{faible} {moyen} {fort}"
         );
+        // ρ = 0,5, a = 0,25 : Side × 0,5, soit 0,75 + 0,25 × 0,25 = 0,8125.
+        assert!((moyen - 10.0 * 0.8125_f64.log10()).abs() < 1e-9, "{moyen}");
+    }
+
+    /// AVEC retard, le terme croisé devient un peigne : il creuse le Side
+    /// dans le grave (sous `1/(4·retard)`) et le POUSSE par endroits dans
+    /// l'aigu. En moyenne rose les deux se compensent presque : les trois
+    /// réglages du client restent à quelques dixièmes de dB, dans un sens ou
+    /// dans l'autre. La compensation qui en découle est donc petite — et elle
+    /// peut ATTÉNUER. C'est le filtre qui le dit, pas une préférence.
+    #[test]
+    fn avec_retard_le_peigne_rend_dans_l_aigu_ce_qu_il_prend_au_grave() {
+        for (amount, delay) in [(0.25_f32, 0.3_f32), (0.30, 0.5), (0.40, 0.7)] {
+            let g = gain_moyen_db(44_100, amount, delay);
+            assert!(g.abs() < 0.5, "a={amount} d={delay} : {g:+.3} dB");
+            assert!(
+                g > gain_moyen_db(44_100, amount, 0.0),
+                "le retard doit rendre du niveau par rapport au même dosage instantané"
+            );
+        }
     }
 }

@@ -805,8 +805,10 @@ impl LocalOutput {
         };
         let dsp_db = if dsp_db.is_finite() { dsp_db } else { 0.0 };
         let en_millemes = |db: f64| (10.0_f64.powf(db / 20.0) * 1000.0).round();
-        self.gain_moyen_dsp
-            .store(en_millemes(dsp_db).clamp(0.0, 1000.0) as u32, Ordering::SeqCst);
+        self.gain_moyen_dsp.store(
+            en_millemes(dsp_db).clamp(0.0, 64_000.0) as u32,
+            Ordering::SeqCst,
+        );
         let compensation = if self.compensation_de_niveau.load(Ordering::Relaxed) {
             -dsp_db
         } else {

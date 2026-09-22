@@ -3877,7 +3877,7 @@ fn millemes(db: f64) -> i64 {
     (10.0_f64.powf(db / 20.0) * 1000.0).round() as i64
 }
 
-/// Égaliseur « Rock » + crossfeed « Standard » sur une sortie locale, curseur
+/// Égaliseur « Rock » + crossfeed 30 % sans retard sur une sortie locale, curseur
 /// à −20 dB : le volume effectif doit rendre exactement ce que le DSP retire
 /// en moyenne, le crête-mètre doit retomber sur le seul curseur, et
 /// l'interrupteur, le mode PURE et le volume plein doivent chacun faire ce
@@ -3895,13 +3895,20 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
 
     sortie.set_volume(0.1).await.expect("set_volume");
     assert_eq!(gain.load(Ordering::SeqCst), 100, "−20 dB, sans DSP");
-    assert_eq!(dsp.load(Ordering::SeqCst), 1000, "sans DSP, rien à compenser");
+    assert_eq!(
+        dsp.load(Ordering::SeqCst),
+        1000,
+        "sans DSP, rien à compenser"
+    );
 
     let eq = egaliseur_rock(2);
-    let cf = crate::audio::crossfeed::CrossfeedProcessor::new(44_100, 0.30, 0.5);
+    let cf = crate::audio::crossfeed::CrossfeedProcessor::new(44_100, 0.30, 0.0);
     let (eq_db, cf_db) = (eq.gain_moyen_db(), cf.gain_moyen_db());
-    eprintln!("rock {eq_db:+.2} dB, crossfeed standard {cf_db:+.2} dB");
-    assert!(eq_db < -3.0, "la réserve de « Rock » retire du niveau : {eq_db}");
+    eprintln!("rock {eq_db:+.2} dB, crossfeed 30 %/0 ms {cf_db:+.2} dB");
+    assert!(
+        eq_db < -3.0,
+        "la réserve de « Rock » retire du niveau : {eq_db}"
+    );
     assert!(cf_db < 0.0, "le crossfeed retire du Side : {cf_db}");
     sortie.set_eq(Some(eq));
     sortie.set_crossfeed(Some(cf));
@@ -3927,7 +3934,10 @@ async fn la_compensation_rend_par_le_volume_ce_que_le_dsp_retire_4685() {
     sortie.set_compensation_de_niveau(false);
     assert_eq!(gain.load(Ordering::SeqCst), 100);
     let aiguille = i64::from(mesure.gain_de_sortie_units(7));
-    assert!((aiguille - millemes(-20.0 + perte)).abs() <= 1, "{aiguille} ‰");
+    assert!(
+        (aiguille - millemes(-20.0 + perte)).abs() <= 1,
+        "{aiguille} ‰"
+    );
 
     // Volume plein : la compensation est rabotée à l'unité, jamais au-delà.
     sortie.set_compensation_de_niveau(true);
