@@ -287,6 +287,13 @@ name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
 required-features = ["postgres"]
 
+# #4625 — la vue par dossiers compte et liste les pistes découpées par une
+# feuille CUE (`file_path` NULL). `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "dossier_cue_4625"
+path = "tests/dossier_cue_4625.rs"
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
