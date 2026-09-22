@@ -69,6 +69,15 @@ pub fn router() -> Router<AppState> {
             "/media-servers/{id}/indexer",
             post(crate::routes::indexation_upnp::indexer_une_source),
         )
+        // #4624 : le chemin de SORTIE. Indexer existait, retirer n'existait
+        // pas — et le seul retrait ecrit (`confirm`) exige un Browse complet,
+        // donc un serveur ALLUME. Ces deux routes ne sortent pas sur le
+        // reseau : elles fonctionnent serveur eteint, qui est le cas nominal.
+        .route(
+            "/media-servers/{id}/bibliotheque",
+            get(crate::routes::retrait_upnp::apercu_du_retrait)
+                .delete(crate::routes::retrait_upnp::retrait_de_la_bibliotheque),
+        )
         .route("/media-servers/{id}/search", get(search_media_server))
         .route(
             "/media-servers/{id}/item/{item_id}/stream-url",
