@@ -89,11 +89,11 @@ def main():
         runner=RUNNER
         if mode=='native':
             import os
-            # `audio-support` en plus : le `mod.rs` écrit juste en dessous
-            # réexporte `tune_plugin_audio_support::ecretage`. Sans la
-            # dépendance, le projet d'essai ne compile pas (E0433) — c'est ce
-            # qui a mis « SDK source contracts » au rouge sur les trois OS.
-            for name in ['native','sdk','audio-support']:
+            # PAS `audio-support` ici : la branche `else` au-dessus l'a déjà
+            # déclarée pour tout mode autre qu'« historical », `native`
+            # compris. L'ajouter une seconde fois écrit deux fois la même clé
+            # dans le Cargo.toml engendré — « error: duplicate key ».
+            for name in ['native','sdk']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
             for name in ['eq','crossfeed']:
                 source=(ROOT/f'tune-core/src/audio/{name}.rs').read_text(encoding="utf-8")
