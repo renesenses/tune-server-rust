@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "e6338bc1d8455f4d3d1868dd5f27e602117ea57f",
+    "web_sha": "737ab0afb89e7d5f53994a0a7ca32d06c6ffc32f",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -500,7 +500,9 @@
         "premium",
         "dernier_rapport"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "archive_max_octets"
+      ]
     },
     {
       "route": "/home",
@@ -1424,6 +1426,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1446,6 +1450,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1479,6 +1485,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1501,6 +1509,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -2369,6 +2379,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -2389,6 +2402,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -2409,6 +2425,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -2429,6 +2448,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
