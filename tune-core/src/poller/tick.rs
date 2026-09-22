@@ -411,9 +411,17 @@ impl PositionPoller {
                 }
             };
 
-            let ps = poll_states
-                .entry(zone_id)
-                .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
+            // #4666 — un état NEUF pour une zone qui joue déjà (une reprise
+            // après pause : `retain` l'avait jeté) part de la position que
+            // l'état de zone porte, et non d'une horloge à zéro qui ferait
+            // prendre la position de reprise pour un fantôme — tour sauté,
+            // indéfiniment. Voir `decisions::ancrage_d_un_etat_neuf`.
+            let ps = poll_states.entry(zone_id).or_insert_with(|| {
+                let mut neuf = ZonePollState::new(zone_state.track_generation);
+                neuf.track_started_at =
+                    decisions::ancrage_d_un_etat_neuf(Instant::now(), zone_state.position_ms);
+                neuf
+            });
 
             // Detect track change: if the generation changed, the orchestrator
             // started a new track (via play() / play_from_queue / next / previous).
@@ -1578,6 +1586,11 @@ impl PositionPoller {
             let mut motif_fin_de_piste: &'static str = "";
             let mut force_stop = false;
             let mut force_stop_demarrage_mort = false;
+            // #4645 — la mesure du décrochage, capturée au site de décision
+            // pour être relue au site de coupure : (position atteinte, durée
+            // de la piste, octets servis, octets attendus). `ZonePollState`
+            // est retiré avant l'action, ces valeurs ne survivraient pas.
+            let mut mesure_renderer_cale: Option<(u64, u64, u64, Option<u64>)> = None;
 
             // Guard: if Tune's own playback state for this zone is Stopped
             // (or has no now_playing), ignore device state changes entirely.
@@ -1973,6 +1986,20 @@ impl PositionPoller {
                                         ps.transition(fsm::Transition::PanneDeLecture {
                                             cause: CauseDeCoupure::RendererCale,
                                         });
+                                        // #4645 — le renderer s'est tu sur un
+                                        // flux incomplet. Couper la zone ici
+                                        // terminait la file : c'est l'« arrêt
+                                        // soudain » du testeur. On garde de
+                                        // quoi décider une reprise À LA
+                                        // POSITION ATTEINTE plus bas ; la
+                                        // coupure reste le défaut si elle est
+                                        // refusée.
+                                        mesure_renderer_cale = Some((
+                                            ps.peak_position_ms,
+                                            track_duration_ms,
+                                            sent,
+                                            total,
+                                        ));
                                     }
                                 }
                             } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
@@ -2883,6 +2910,26 @@ impl PositionPoller {
                     }
                     autorisee
                 };
+                // #4645 — reprise après décrochage EN COURS de lecture. La
+                // fenêtre est relue ici, comme celle de la relance ci-dessus,
+                // pour la même raison : elle vit hors de l'état de sondage.
+                let reprise_cale = match mesure_renderer_cale {
+                    Some((position_ms, duree_ms, servis, total)) if !relance => {
+                        let mut reprises = self.reprises_renderer_cale.lock().await;
+                        let autorisee = decisions::reprise_apres_renderer_cale_autorisee(
+                            reprises.get(&zone_id).map(|t| t.elapsed().as_secs()),
+                            position_ms,
+                            duree_ms,
+                            servis,
+                            total,
+                        );
+                        if autorisee {
+                            reprises.insert(zone_id, Instant::now());
+                        }
+                        autorisee.then_some(position_ms)
+                    }
+                    _ => None,
+                };
                 if relance {
                     // Pause→Stop d'abord : le pipeline Eversolo coincé ACQUITTE
                     // les Stop sans les exécuter, seul Pause→Stop le libère
@@ -2905,6 +2952,48 @@ impl PositionPoller {
                         }
                         Err(e) => {
                             warn!(zone_id, position, error = %e, "demarrage_mort_relance_echouee");
+                            self.orchestrator
+                                .stop(zone_id, device_id_ref.as_deref())
+                                .await;
+                        }
+                    }
+                } else if let Some(position_ms) = reprise_cale {
+                    // On repart de la file à la même position, puis on saute
+                    // là où le renderer s'est tu. Si le saut échoue — sortie
+                    // sans capacité Seek, renderer qui refuse — la piste
+                    // rejouerait depuis le début après un quart d'heure de
+                    // musique : inacceptable, on coupe comme avant.
+                    self.orchestrator
+                        .stop(zone_id, device_id_ref.as_deref())
+                        .await;
+                    let position = zone_state.queue_position;
+                    match self.orchestrator.play_from_queue(zone_id, position).await {
+                        Ok(_) => match self
+                            .orchestrator
+                            .seek(zone_id, position_ms, device_id_ref.as_deref())
+                            .await
+                        {
+                            Ok(()) => {
+                                warn!(
+                                    zone_id,
+                                    position, position_ms, "renderer_cale_reprise_automatique"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    zone_id,
+                                    position,
+                                    position_ms,
+                                    error = %e,
+                                    "renderer_cale_reprise_saut_echoue"
+                                );
+                                self.orchestrator
+                                    .stop(zone_id, device_id_ref.as_deref())
+                                    .await;
+                            }
+                        },
+                        Err(e) => {
+                            warn!(zone_id, position, error = %e, "renderer_cale_reprise_echouee");
                             self.orchestrator
                                 .stop(zone_id, device_id_ref.as_deref())
                                 .await;

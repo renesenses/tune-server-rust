@@ -882,6 +882,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
+    /// #4598 — l'énumération du parc local menée à la demande, sur le seul
+    /// chemin du refus d'une zone locale (`gate_or_rebind_offline_zone`).
+    /// Un champ et non un appel direct : les témoins y substituent un parc
+    /// connu, faute de périphérique réel sur la machine qui les exécute.
+    pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1182,6 +1187,7 @@ impl PlaybackOrchestrator {
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
         }
     }
 
@@ -1243,6 +1249,8 @@ impl PlaybackOrchestrator {
 
 mod commun;
 
+/// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
+mod reenumeration_avant_refus;
 mod transport;
 // #2269 — le repli silencieux de la sortie locale, rendu audible.
 #[cfg(feature = "local-audio")]

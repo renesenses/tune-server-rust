@@ -5519,6 +5519,7 @@ version = "0.9.161"
 dependencies = [
  "async-trait",
  "axum",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",
