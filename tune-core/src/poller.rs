@@ -217,6 +217,20 @@ const RADIO_POLL_INTERVAL_SECS: u64 = 15;
 /// systemic — expired credentials, no network — where retrying once per queued
 /// item would just hammer the service.
 const MAX_CONSECUTIVE_SKIPS: u32 = 25;
+/// Combien de pistes que le SERVICE LUI-MÊME déclare injouables on enjambe
+/// avant de renoncer.
+///
+/// Séparé de [`MAX_CONSECUTIVE_SKIPS`] et volontairement large : ce n'est pas
+/// le même risque. Là-bas on se protège d'un jeton expiré ou d'un réseau mort,
+/// qu'il ne faut pas marteler une fois par piste de la file ; ici le service a
+/// répondu et a dit non pour CETTE piste — l'enjamber ne coûte rien et ne
+/// prouve rien sur les suivantes.
+///
+/// Mesuré : la playlist d'Alex Campbell porte 186 pistes injouables sur 1454,
+/// et l'indisponibilité Qobuz est GROUPÉE (un label, un album retiré d'un
+/// coup). 500 couvre largement ce cas sans jamais devenir une boucle infinie
+/// en répétition intégrale — la seule raison pour laquelle ce plafond existe.
+const PLAFOND_PISTES_INJOUABLES: u32 = 500;
 /// Grace period after SetNextAVTransportURI during which we treat Stopped
 /// state and position resets as gapless transitions instead of track-end.
 const GAPLESS_GUARD_SECS: u64 = 15;
@@ -793,6 +807,7 @@ impl PositionPoller {
 mod radio;
 
 mod fin_de_piste;
+mod refus_de_piste;
 
 mod tick;
 
