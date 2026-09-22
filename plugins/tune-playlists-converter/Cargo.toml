@@ -1,0 +1,24 @@
+[package]
+name = "tune-playlists-converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Greffon WASM « Playlists converter » : transfert de playlists d'un service à l'autre, simple et par lot (#4717)"
+
+# `rlib` ET `cdylib`, à dessein.
+#
+# `cdylib` + `--target wasm32-unknown-unknown` produit le `main.wasm` que
+# l'hôte charge. `rlib` garde la caisse constructible et TESTABLE sur la machine
+# de l'intégration continue : tout le moteur (aperçu, exécution, reprise) est
+# du Rust ordinaire, écrit contre le trait [`Hote`], et ses essais tournent
+# nativement. Seule la fine couche d'ABI est gardée derrière
+# `#[cfg(target_arch = "wasm32")]` — c'est la seule partie qu'on ne peut pas
+# exécuter ici, et elle ne contient aucune décision.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

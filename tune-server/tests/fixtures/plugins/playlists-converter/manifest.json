@@ -1,0 +1,19 @@
+{
+  "id": "playlists-converter",
+  "name": "Playlists converter",
+  "version": "0.1.0",
+  "description": "Transférer une ou plusieurs playlists d'un service à l'autre, à l'identique, avec aperçu obligatoire et reprise d'un lot interrompu",
+  "author": "MozAIk Labs",
+  "entry_point": "main.wasm",
+  "permissions": ["playlists", "streaming", "kv"],
+  "premium": true,
+  "default_enabled": false,
+  "min_server_version": "0.9.161",
+  "routes": [
+    { "method": "GET", "path": "/sources" },
+    { "method": "POST", "path": "/apercu" },
+    { "method": "POST", "path": "/executer" },
+    { "method": "GET", "path": "/transferts" },
+    { "method": "GET", "path": "/transfert" }
+  ]
+}

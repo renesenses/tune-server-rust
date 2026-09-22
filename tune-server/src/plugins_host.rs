@@ -923,12 +923,11 @@ pub async fn load_wasm_plugins(state: &AppState) {
     for info in infos {
         let id = info.manifest.id.clone();
 
-        let enabled = settings
-            .get(&format!("plugin_{id}_enabled"))
-            .ok()
-            .flatten()
-            .map(|v| v != "false")
-            .unwrap_or(true);
+        // Le réglage en base prime ; à défaut, c'est le manifeste qui décide
+        // (`default_enabled`, #4717). Un greffon facultatif — le convertisseur
+        // de playlists — reste donc dormant tant que personne ne l'a installé.
+        let reglage = settings.get(&format!("plugin_{id}_enabled")).ok().flatten();
+        let enabled = tune_core::plugins::est_actif(reglage.as_deref(), &info.manifest);
         if !enabled {
             debug!(id = %id, "wasm_plugin_skipped_disabled");
             continue;

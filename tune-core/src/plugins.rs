@@ -20,6 +20,19 @@ pub struct PluginManifest {
     /// (RFC §3.5). Defaults to `false` so existing manifests parse unchanged.
     #[serde(default)]
     pub premium: bool,
+    /// Ce greffon doit-il être actif quand rien n'a été décidé en base ?
+    ///
+    /// `true` par défaut, pour que tous les manifestes existants gardent leur
+    /// sens : un greffon posé sur le disque se chargeait au démarrage suivant.
+    /// `false` en fait un greffon **facultatif** — il reste dormant jusqu'à ce
+    /// que l'utilisateur l'installe depuis le gestionnaire de greffons, qui
+    /// écrit alors `plugin_{id}_enabled`. C'est le pendant wasm de
+    /// `Plugin::default_enabled()` côté SDK natif (DJ, Karaoke, Bandcamp), et
+    /// le greffon « Playlists converter » (#4717) en dépend : payant et
+    /// facultatif, il n'a rien à faire dans le processus de qui ne l'a pas
+    /// demandé.
+    #[serde(default = "actif_par_defaut")]
+    pub default_enabled: bool,
     /// Glob patterns for the `event_bus` events this plugin wants forwarded to
     /// its optional `plugin_on_event` export (RFC §3.6). Each pattern is an
     /// exact event name, a `"prefix.*"` wildcard, or the bare `"*"` (all
@@ -242,6 +255,27 @@ impl PluginManager {
     }
 }
 
+/// Le défaut de `default_enabled` : un manifeste muet reste actif, comme avant.
+fn actif_par_defaut() -> bool {
+    true
+}
+
+/// Un greffon est-il actif ?
+///
+/// Une seule définition, pour les TROIS endroits qui posaient la question :
+/// le chargement wasm (`plugins_host::load_wasm_plugins`) et les deux fiches
+/// du gestionnaire (`routes/plugins.rs`). Chacun répondait « absent ⇒ actif »,
+/// ce qui rendait `default_enabled = false` inopérant là où on l'oubliait.
+///
+/// `reglage` est la valeur de `plugin_{id}_enabled` en base : ce que
+/// l'utilisateur a DÉCIDÉ prime toujours sur ce que le manifeste propose.
+pub fn est_actif(reglage: Option<&str>, manifest: &PluginManifest) -> bool {
+    match reglage {
+        Some(valeur) => valeur != "false",
+        None => manifest.default_enabled,
+    }
+}
+
 fn load_manifest(path: &Path) -> Result<PluginManifest, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("read manifest: {e}"))?;
     serde_json::from_str(&content).map_err(|e| format!("parse manifest: {e}"))
@@ -263,8 +297,58 @@ mod tests {
             permissions: vec![],
             min_server_version: min.map(str::to_string),
             premium: false,
+            default_enabled: true,
             event_subscriptions: vec![],
         }
+    }
+
+    /// #4717 — un manifeste qui ne dit rien reste ACTIF par défaut.
+    ///
+    /// C'est la compatibilité descendante du champ : tous les manifestes
+    /// écrits avant lui (dont `party`) se chargeaient au démarrage suivant,
+    /// et doivent continuer.
+    #[test]
+    fn un_manifeste_sans_default_enabled_reste_actif() {
+        let manifeste: PluginManifest = serde_json::from_str(
+            r#"{"id":"party","name":"Party","version":"0.1.0","description":"",
+                "author":"","entry_point":"main.wasm","permissions":[],
+                "min_server_version":null}"#,
+        )
+        .expect("un manifeste d'avant #4717 doit encore se lire");
+        assert!(manifeste.default_enabled);
+        assert!(est_actif(None, &manifeste));
+    }
+
+    /// #4717 — `default_enabled: false` fait un greffon FACULTATIF.
+    ///
+    /// Sans réglage en base, il dort. C'est ce que le gestionnaire de greffons
+    /// présente comme « à installer », et c'est le cas du convertisseur de
+    /// playlists : payant, il n'a rien à faire dans le processus de qui ne l'a
+    /// pas demandé.
+    #[test]
+    fn default_enabled_false_laisse_le_greffon_dormant() {
+        let manifeste: PluginManifest = serde_json::from_str(
+            r#"{"id":"playlists-converter","name":"Playlists converter","version":"0.1.0",
+                "description":"","author":"","entry_point":"main.wasm","permissions":[],
+                "min_server_version":null,"premium":true,"default_enabled":false}"#,
+        )
+        .unwrap();
+        assert!(manifeste.premium);
+        assert!(!manifeste.default_enabled);
+        assert!(
+            !est_actif(None, &manifeste),
+            "rien en base : le manifeste décide, et il dit non"
+        );
+        // Ce que l'utilisateur décide prime, dans les deux sens.
+        assert!(est_actif(Some("true"), &manifeste));
+        assert!(!est_actif(Some("false"), &manifeste));
+        let ordinaire = manifeste_muet();
+        assert!(!est_actif(Some("false"), &ordinaire));
+        assert!(est_actif(Some("true"), &ordinaire));
+    }
+
+    fn manifeste_muet() -> PluginManifest {
+        manifeste(None)
     }
 
     /// Le sens de la règle : une absence vaut « compatible ».
@@ -412,6 +496,7 @@ mod tests {
                     permissions: vec![],
                     min_server_version: None,
                     premium: false,
+                    default_enabled: true,
                     event_subscriptions: vec![],
                 },
                 state: PluginState::Active,
@@ -432,6 +517,7 @@ mod tests {
                     permissions: vec![],
                     min_server_version: None,
                     premium: false,
+                    default_enabled: true,
                     event_subscriptions: vec![],
                 },
                 state: PluginState::Disabled,

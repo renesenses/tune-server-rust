@@ -348,12 +348,12 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
         if let Ok(infos) = manager.scan().await {
             for info in infos {
                 let id = info.manifest.id.clone();
-                let enabled = settings
-                    .get(&format!("plugin_{id}_enabled"))
-                    .ok()
-                    .flatten()
-                    .map(|v| v != "false")
-                    .unwrap_or(true);
+                // Même règle qu'au chargement (`load_wasm_plugins`) : le
+                // réglage prime, sinon le manifeste (#4717). Sans cette
+                // définition partagée, la fiche annonçait « activé » un
+                // greffon facultatif que le démarrage n'avait pas chargé.
+                let reglage = settings.get(&format!("plugin_{id}_enabled")).ok().flatten();
+                let enabled = tune_core::plugins::est_actif(reglage.as_deref(), &info.manifest);
                 #[cfg(feature = "plugins-wasm")]
                 let loaded = state
                     .wasm_plugins
@@ -385,6 +385,11 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     "type": "wasm",
                     "installed": true,
                     "enabled": enabled,
+                    // Le manifeste le DIT, et l'écran en a besoin pour poser
+                    // son cadenas : sans ce champ, un greffon payant se
+                    // présentait comme gratuit et son refus 402 n'arrivait
+                    // qu'au premier clic (#4717).
+                    "premium": info.manifest.premium,
                     "loaded": loaded,
                     "restart_required": enabled && !loaded,
                     "url": format!("/api/v1/plugins/{id}/"),
