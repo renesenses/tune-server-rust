@@ -591,12 +591,83 @@ pub(super) fn note_observed_backend(
     name: &'static str,
     fallback_reason: Option<LocalBackendFallback>,
 ) {
-    if let Ok(mut slot) = OBSERVED_BACKEND.write() {
-        *slot = Some(ObservedBackend {
-            name,
-            fallback_reason,
-        });
+    noter_dans(&OBSERVED_BACKEND, name, fallback_reason);
+}
+
+/// Le corps de [`note_observed_backend`], sur un emplacement fourni : les
+/// témoins de #4667 l'exercent sur un verrou À EUX, sans course avec les
+/// autres tests qui passent par `select_host`.
+pub(super) fn noter_dans(
+    emplacement: &std::sync::RwLock<Option<ObservedBackend>>,
+    name: &'static str,
+    fallback_reason: Option<LocalBackendFallback>,
+) {
+    let sondage = sondage_sans_observation_en_cours();
+    if sondage {
+        debug!(
+            backend = name,
+            "local_audio_backend_observation_skipped_probe"
+        );
     }
+    if let Ok(mut slot) = emplacement.write() {
+        enregistrer_l_observation(
+            &mut slot,
+            ObservedBackend {
+                name,
+                fallback_reason,
+            },
+            sondage,
+        );
+    }
+}
+
+/// #4667 — la règle d'écriture d'`OBSERVED_BACKEND`, isolée du verrou global
+/// pour être testable sans course avec les autres tests.
+///
+/// Un SONDAGE ne décrit pas ce qui joue : il n'écrit rien.
+pub(super) fn enregistrer_l_observation(
+    slot: &mut Option<ObservedBackend>,
+    observation: ObservedBackend,
+    sondage: bool,
+) {
+    if !sondage {
+        *slot = Some(observation);
+    }
+}
+
+thread_local! {
+    /// Vrai pendant une énumération menée par [`sans_noter_le_backend_observe`].
+    static SONDAGE_SANS_OBSERVATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn sondage_sans_observation_en_cours() -> bool {
+    SONDAGE_SANS_OBSERVATION.with(|c| c.get())
+}
+
+/// #4667 — mener une énumération SANS toucher au backend « actif » publié.
+///
+/// Le rescan périodique (`tune-server/src/background.rs`) FORCE WASAPI quand
+/// ASIO est configuré — re-sonder un pilote ASIO en lecture peut le tuer
+/// (#1267), ce choix n'est pas en cause. Mais l'énumération passe par
+/// `select_host("wasapi")`, qui notait « WASAPI » dans [`OBSERVED_BACKEND`] :
+/// toutes les 120 s, la fiche système et le rapport de bogue d'un serveur réglé
+/// sur ASIO annonçaient `active=WASAPI`, y compris pendant que `bras_asio`
+/// jouait (ticket support 154, 0.9.161). Un sondage n'est pas une lecture.
+///
+/// Le drapeau est local au FIL : l'énumération s'exécute en ligne dans `f`
+/// (`ASIO_SCAN_GATE.run` n'en change pas), et une ouverture réelle menée en
+/// même temps par un autre fil continue de noter ce qu'elle ouvre. Il est
+/// rétabli même si `f` panique.
+pub fn sans_noter_le_backend_observe<T>(f: impl FnOnce() -> T) -> T {
+    struct Retablir(bool);
+    impl Drop for Retablir {
+        fn drop(&mut self) {
+            SONDAGE_SANS_OBSERVATION.with(|c| c.set(self.0));
+        }
+    }
+    let _retablir = Retablir(SONDAGE_SANS_OBSERVATION.with(|c| c.replace(true)));
+    f()
 }
 
 /// Issue d'une demande `asio` sur une cible qui embarque ASIO.

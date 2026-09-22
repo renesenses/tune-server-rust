@@ -411,9 +411,17 @@ impl PositionPoller {
                 }
             };
 
-            let ps = poll_states
-                .entry(zone_id)
-                .or_insert_with(|| ZonePollState::new(zone_state.track_generation));
+            // #4666 — un état NEUF pour une zone qui joue déjà (une reprise
+            // après pause : `retain` l'avait jeté) part de la position que
+            // l'état de zone porte, et non d'une horloge à zéro qui ferait
+            // prendre la position de reprise pour un fantôme — tour sauté,
+            // indéfiniment. Voir `decisions::ancrage_d_un_etat_neuf`.
+            let ps = poll_states.entry(zone_id).or_insert_with(|| {
+                let mut neuf = ZonePollState::new(zone_state.track_generation);
+                neuf.track_started_at =
+                    decisions::ancrage_d_un_etat_neuf(Instant::now(), zone_state.position_ms);
+                neuf
+            });
 
             // Detect track change: if the generation changed, the orchestrator
             // started a new track (via play() / play_from_queue / next / previous).
