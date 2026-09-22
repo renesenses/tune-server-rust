@@ -642,6 +642,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                // La pochette PROPRE d'une piste se pose à part : `update_batch`
+                // n'écrit pas `cover_path`, faute de quoi une piste relue
+                // recopierait dans sa ligne la pochette de son ALBUM (la lecture
+                // est un `COALESCE`). Sans cet appel, l'image du single « Angry »
+                // n'atteint jamais la base d'une bibliothèque déjà scannée
+                // (#4650). Rien à écrire pour une piste sans pochette propre.
+                if let Err(e) = track_repo.appliquer_pochettes_de_piste(&to_update) {
+                    tracing::warn!(error = %e, "auto_scan_pochettes_de_piste_echec");
+                }
                 // Reprise des lignes d'importation relues sur le disque — sœur
                 // exacte du scan manuel (#2939).
                 match track_repo.adopter_en_local(&a_adopter) {
