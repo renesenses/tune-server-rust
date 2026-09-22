@@ -5459,6 +5459,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tune-plugin-audio-support",
  "tune-plugin-sdk",
 ]
 
