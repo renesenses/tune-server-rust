@@ -1272,6 +1272,11 @@ mod history;
 mod bandcamp;
 pub use bandcamp::*;
 
+/// Ce qu'on ANNONCE au renderer pour une piste de serveur média : le MIME ne
+/// se devine plus dans la seule URL, qui pour un `<res>` de Tune ne porte
+/// aucune extension — et un `DLNA.ORG_PN=MP3` faux fait jouer du silence.
+mod mime_upnp;
+
 /// Arm a one-shot diagnostic for a stream URL handed to a local output.
 ///
 /// Creating a stream session is not enough to infer a fault: gapless prepares
