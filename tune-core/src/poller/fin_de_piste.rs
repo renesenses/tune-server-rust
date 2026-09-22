@@ -385,7 +385,19 @@ impl PositionPoller {
             .enjamber_les_serveurs_absents(zone_id, next_pos)
             .await
             .map_or(next_pos, |(position, _)| position);
+        // 🔴 DEUX compteurs, et c'est tout le correctif (Bertrand, 21/09/2026 :
+        // « la lecture d'une playlist s'arrête sur un morceau non trouvé »).
+        //
+        // `skipped` garde son rôle : les pannes SYSTÉMIQUES — jeton expiré,
+        // réseau mort — qu'il ne faut pas marteler une fois par piste de la
+        // file. C'est ce que dit le commentaire de `MAX_CONSECUTIVE_SKIPS`.
+        //
+        // `injouables` compte les refus que le service prononce PISTE PAR
+        // PISTE. Les mêler était le défaut : sur une playlist dont
+        // l'indisponibilité est groupée, vingt-six titres morts d'affilée
+        // épuisaient un budget prévu pour une panne, et la lecture s'arrêtait.
         let mut skipped = 0u32;
+        let mut injouables = 0u32;
         loop {
             match self
                 .orchestrator
@@ -415,13 +427,26 @@ impl PositionPoller {
                             }),
                         );
                     }
-                    skipped += 1;
-                    // A run this long is not "one bad track" any more — an
-                    // expired token or a dead network would otherwise have us
-                    // hammer the service once per queued item.
-                    if skipped >= MAX_CONSECUTIVE_SKIPS {
-                        warn!(zone_id, skipped, "auto_next_skip_limit_reached");
-                        break;
+                    if super::refus_de_piste::refus_propre_a_la_piste(&e.to_string()) {
+                        injouables += 1;
+                        if injouables >= PLAFOND_PISTES_INJOUABLES {
+                            warn!(
+                                zone_id,
+                                injouables,
+                                "auto_next_unplayable_limit_reached — le service a refusé \
+                                 autant de pistes d'affilée : on s'arrête pour ne pas boucler"
+                            );
+                            break;
+                        }
+                    } else {
+                        skipped += 1;
+                        // A run this long is not "one bad track" any more — an
+                        // expired token or a dead network would otherwise have us
+                        // hammer the service once per queued item.
+                        if skipped >= MAX_CONSECUTIVE_SKIPS {
+                            warn!(zone_id, skipped, "auto_next_skip_limit_reached");
+                            break;
+                        }
                     }
                     match Self::next_position_after(zone_state, attempt_pos) {
                         // Same slot again means repeat-one on a dead track:
