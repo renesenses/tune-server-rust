@@ -824,3 +824,9 @@ path = "tests/etiquettes_types_et_playlists.rs"
 [[test]]
 name = "crossfeed_presets_4684"
 path = "tests/crossfeed_presets_4684.rs"
+# #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
+# routeur réel. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "compensation_de_niveau_4685"
+path = "tests/compensation_de_niveau_4685.rs"
