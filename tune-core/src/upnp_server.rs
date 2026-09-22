@@ -19,6 +19,9 @@ use crate::db::backend::DbBackend;
 use crate::db::track_repo::TrackRepo;
 use crate::discovery::ssdp;
 
+/// Parcours par dossiers (#4318) — le rayon « Folders ».
+mod dossiers;
+
 // ---------------------------------------------------------------------------
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------
@@ -1141,6 +1144,10 @@ fn search_tracks_in_container(
             ))
         }
         "radios" => Some(empty_didl()),
+        // #4318 : le rayon « Folders » ne publie que des pistes de la
+        // bibliothèque, mais chercher DANS un dossier n'est pas restreint ici —
+        // une liste vide, jamais une faute 710 sur un conteneur publié.
+        id if dossiers::est_a_nous(id) => Some(empty_didl()),
         id if id.starts_with("album/") => {
             let album_id = id.strip_prefix("album/")?.parse().ok()?;
             let tracks = TrackRepo::with_backend(state.backend.clone())
@@ -1301,6 +1308,8 @@ fn conteneur_publie(id: &str) -> bool {
         || ["artist/", "album/", "genre/", "year/", "playlist/"]
             .iter()
             .any(|prefixe| id.starts_with(prefixe))
+        // #4318 : le rayon « Folders » et ses dossiers.
+        || dossiers::est_a_nous(id)
 }
 
 /// Applique les predicats `dc:title` au nom visible d'objets non-pistes.
@@ -1701,8 +1710,10 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
             "-1",
             "Tune",
             "object.container.storageFolder",
-            Some(ROOT_CONTAINERS.len() as u64),
+            Some(nb_rayons_publies(state)),
         )),
+        // #4318 : le rayon « Folders » et ses dossiers se décrivent eux-mêmes.
+        id if dossiers::est_a_nous(id) => dossiers::decrire(state, id),
         // Les sept rubriques racine se décrivent depuis `ROOT_CONTAINERS`,
         // seule source de vérité de leur identifiant, de leur titre et de leur
         // classe — sept branches recopiées à la main finissaient toujours par
@@ -1898,6 +1909,9 @@ fn browse_direct_children(
         "tracks" => browse_all_tracks(state, start, count, &base_url),
         "radios" => browse_radios(state, start, count),
         "playlists" => browse_playlists(state, start, count),
+        // #4318 : parcours par dossiers, pour les points de contrôle qui
+        // naviguent par répertoires (JPlay).
+        id if dossiers::est_a_nous(id) => dossiers::parcourir(state, id, start, count),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
                 .strip_prefix("artist/")
@@ -2200,6 +2214,14 @@ fn compter_enfants_racine(state: &UpnpState, object_id: &str) -> Option<u64> {
     u64::try_from(n).ok()
 }
 
+/// Le nombre de rayons que `browse_root` publie : les sept de
+/// [`ROOT_CONTAINERS`], plus « Folders » quand une racine musicale contient
+/// des pistes (#4318). `BrowseMetadata("0")` doit annoncer ce que la racine
+/// ouvre.
+fn nb_rayons_publies(state: &UpnpState) -> u64 {
+    ROOT_CONTAINERS.len() as u64 + u64::from(dossiers::publie(state))
+}
+
 fn browse_root(state: &UpnpState) -> DidlResult {
     let containers = ROOT_CONTAINERS;
 
@@ -2213,11 +2235,28 @@ fn browse_root(state: &UpnpState) -> DidlResult {
             compter_enfants_racine(state, id),
         ));
     }
+    let mut total = containers.len() as u64;
+    // #4318 : « Folders » n'est PAS dans `ROOT_CONTAINERS`, parce qu'il n'est
+    // publié que s'il a quelque chose à ouvrir — la règle de cette liste,
+    // appliquée à un rayon dont le contenu dépend des réglages (`music_dirs`)
+    // et non de la seule base. Il vient en dernier : les sept rayons gardent
+    // leur position chez les points de contrôle qui les ont mémorisés.
+    let nb_racines = dossiers::nb_racines(state);
+    if nb_racines > 0 {
+        inner.push_str(&didl_container(
+            dossiers::ID_RAYON,
+            "0",
+            dossiers::TITRE_RAYON,
+            dossiers::CLASSE_RAYON,
+            Some(nb_racines),
+        ));
+        total += 1;
+    }
 
     DidlResult {
         xml: didl_wrap(&inner),
-        total: containers.len() as u64,
-        returned: containers.len() as u64,
+        total,
+        returned: total,
     }
 }
 
