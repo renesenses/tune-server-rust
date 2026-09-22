@@ -1480,6 +1480,7 @@ impl YouTubeService {
                 .or_else(|| item["trackCount"].as_u64())
                 .unwrap_or(0) as u32,
             owner: item["author"].as_str().map(Into::into),
+            covers: Vec::new(),
         }
     }
 
@@ -1842,6 +1843,7 @@ impl YouTubeService {
                             cover_path: cover,
                             track_count: 0,
                             owner: None,
+                            covers: Vec::new(),
                         });
                     }
                 }
@@ -3067,6 +3069,7 @@ impl StreamingService for YouTubeService {
                 cover_path: cover,
                 track_count: tracks.len() as u32,
                 owner: None,
+                covers: Vec::new(),
             });
         }
 
@@ -3092,6 +3095,7 @@ impl StreamingService for YouTubeService {
                         cover_path: Self::best_thumbnail(&snippet["thumbnails"]),
                         track_count: content["itemCount"].as_u64().unwrap_or(0) as u32,
                         owner: snippet["channelTitle"].as_str().map(Into::into),
+                        covers: Vec::new(),
                     });
                 }
             }

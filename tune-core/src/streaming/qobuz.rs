@@ -1595,6 +1595,45 @@ impl QobuzService {
     /// L'ordre préserve le rendu actuel des playlists éditoriales :
     /// `image_rectangle` reste en tête, les autres ne font que rattraper les
     /// cas où il est absent.
+    /// Les pochettes de la MOSAÏQUE d'une playlist Qobuz — au plus quatre,
+    /// distinctes, dans l'ordre que Qobuz donne.
+    ///
+    /// Qobuz rend `images300` / `images150` / `images` en TABLEAUX : les
+    /// pochettes des albums qu'elle contient, celles avec lesquelles ses
+    /// propres applications composent leur mosaïque. `pochette_playlist` n'en
+    /// garde que la première, pour le champ unique `cover_path`.
+    ///
+    /// Une playlist ÉDITORIALE porte une illustration dessinée
+    /// (`image_rectangle`) : elle doit rester entière, pas être remplacée par
+    /// un assemblage. On ne rend alors rien, et l'écran garde `cover_path`.
+    fn pochettes_mosaique(item: &serde_json::Value) -> Vec<String> {
+        if item["image_rectangle"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v.as_str().is_some_and(|s| !s.is_empty())))
+        {
+            return Vec::new();
+        }
+        for champ in ["images300", "images150", "images"] {
+            let Some(tableau) = item[champ].as_array() else {
+                continue;
+            };
+            let mut vues: Vec<String> = Vec::new();
+            for url in tableau.iter().filter_map(|v| v.as_str()) {
+                if url.is_empty() || vues.iter().any(|u| u == url) {
+                    continue;
+                }
+                vues.push(url.to_string());
+                if vues.len() == 4 {
+                    break;
+                }
+            }
+            if !vues.is_empty() {
+                return vues;
+            }
+        }
+        Vec::new()
+    }
+
     fn pochette_playlist(item: &serde_json::Value) -> Option<String> {
         const CHAMPS_TABLEAU: [&str; 5] = [
             "image_rectangle",
@@ -1637,6 +1676,7 @@ impl QobuzService {
             cover_path: Self::pochette_playlist(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: item["owner"]["name"].as_str().map(Into::into),
+            covers: Self::pochettes_mosaique(item),
         }
     }
 
@@ -2268,6 +2308,7 @@ impl StreamingService for QobuzService {
             cover_path: Self::pochette_playlist(&data),
             track_count: data["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: data["owner"]["name"].as_str().map(Into::into),
+            covers: Self::pochettes_mosaique(&data),
         })
     }
 
@@ -2780,6 +2821,7 @@ impl StreamingService for QobuzService {
                         cover_path: Self::pochette_playlist(item),
                         track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
                         owner: None,
+                        covers: Self::pochettes_mosaique(item),
                     })
                     .collect()
             })
@@ -2984,6 +3026,10 @@ impl StreamingService for QobuzService {
     }
 
     fn supports_write(&self) -> bool {
+        self.user_auth_token.is_some()
+    }
+
+    fn supports_playlist_delete(&self) -> bool {
         self.user_auth_token.is_some()
     }
 
@@ -4348,6 +4394,59 @@ mod tests {
     /// dur, alors que `/playlist/getUserPlaylists` porte les mêmes champs image
     /// que l'éditorial — Qobuz y compose une mosaïque des pochettes d'albums.
     /// La donnée était là ; on ne la lisait pas (#1970).
+    #[test]
+    fn quatre_pochettes_distinctes_pour_la_mosaique() {
+        // Bertrand, 21/09 : « Est-il possible d'associer 4 covers distinctes
+        // à toutes les playlists Qobuz ? ». Qobuz les donnait déjà ; on n'en
+        // gardait qu'une.
+        let item = json!({
+            "images300": [
+                "https://static.qobuz.com/a.jpg",
+                "https://static.qobuz.com/b.jpg",
+                "https://static.qobuz.com/a.jpg",
+                "https://static.qobuz.com/c.jpg",
+                "https://static.qobuz.com/d.jpg",
+                "https://static.qobuz.com/e.jpg"
+            ]
+        });
+        assert_eq!(
+            QobuzService::pochettes_mosaique(&item),
+            vec![
+                "https://static.qobuz.com/a.jpg",
+                "https://static.qobuz.com/b.jpg",
+                "https://static.qobuz.com/c.jpg",
+                "https://static.qobuz.com/d.jpg",
+            ],
+            "quatre, DISTINCTES, dans l'ordre de Qobuz"
+        );
+        // Et `cover_path` n'a pas bougé : c'est toujours la première.
+        assert_eq!(
+            QobuzService::pochette_playlist(&item).as_deref(),
+            Some("https://static.qobuz.com/a.jpg")
+        );
+    }
+
+    #[test]
+    fn une_illustration_editoriale_reste_entiere() {
+        // Une playlist éditoriale a une image DESSINÉE : l'assembler en
+        // mosaïque la détruirait. On ne rend rien, l'écran garde `cover_path`.
+        let item = json!({
+            "image_rectangle": ["https://static.qobuz.com/editorial.jpg"],
+            "images300": ["https://static.qobuz.com/a.jpg", "https://static.qobuz.com/b.jpg"]
+        });
+        assert!(QobuzService::pochettes_mosaique(&item).is_empty());
+    }
+
+    #[test]
+    fn sans_tableau_pas_de_mosaique() {
+        assert!(QobuzService::pochettes_mosaique(&json!({})).is_empty());
+        assert!(QobuzService::pochettes_mosaique(&json!({ "images300": [] })).is_empty());
+        assert!(
+            QobuzService::pochettes_mosaique(&json!({ "images300": [""] })).is_empty(),
+            "une URL vide n'est pas une pochette"
+        );
+    }
+
     #[test]
     fn une_playlist_utilisateur_recupere_sa_pochette() {
         let item = serde_json::json!({
