@@ -60,6 +60,16 @@ pub(super) struct ZonePollState {
     /// v0.9.0-rc4). On each NEW seek we rewind `track_started_at` by the seek
     /// target so `wall_elapsed` matches "played at 1x from the start" again.
     pub(super) last_seek_seen: Option<Instant>,
+    /// La cible du dernier déplacement replié dans `track_started_at`
+    /// (#4682). C'est d'elle que part la piste après le déplacement : la fin
+    /// de la grâce s'en sert pour dire si une chute de position vue PENDANT
+    /// la grâce était la fin réelle de la piste.
+    pub(super) cible_du_deplacement_ms: u64,
+    /// Une chute de position (`position_reset`) a été écartée parce qu'elle
+    /// tombait dans la grâce de déplacement (#2170). Elle est réexaminée au
+    /// premier sondage hors grâce, faute de quoi un enchaînement réel du
+    /// renderer pendant la grâce était perdu pour de bon (#4682).
+    pub(super) chute_en_grace: bool,
     /// Tracks the `ZoneState::track_generation` we last observed.
     /// When the generation changes (new track started via `play()`),
     /// we reset all per-track state so stale values from the previous
@@ -242,6 +252,8 @@ impl ZonePollState {
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
+            cible_du_deplacement_ms: 0,
+            chute_en_grace: false,
             track_generation: track_generation,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
