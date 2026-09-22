@@ -327,6 +327,16 @@ pub struct LabelInfo {
 pub struct PlaylistTag {
     pub id: String,
     pub name: String,
+    /// Le libellé de la catégorie dans TOUTES les langues que le service a
+    /// servies, indexées par étiquette de langue (`fr`, `en`, …).
+    ///
+    /// Qobuz rend ses libellés sous forme d'objet multilingue ; n'en garder
+    /// qu'un, et toujours le même, c'est ce qui faisait arriver « Histoires de
+    /// labels » et « Nouveautés » dans une interface roumaine alors que le
+    /// libellé anglais était dans la même réponse. Le faisceau entier voyage
+    /// désormais, et le choix se fait au plus près de l'affichage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_i18n: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Une catégorie de playlists éditoriales avec sa rangée de playlists — la
@@ -335,7 +345,37 @@ pub struct PlaylistTag {
 pub struct PlaylistTagGroup {
     pub id: String,
     pub name: String,
+    /// Voir [`PlaylistTag::name_i18n`] : la rangée porte le même faisceau que
+    /// la catégorie dont elle vient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_i18n: Option<std::collections::BTreeMap<String, String>>,
     pub playlists: Vec<StreamPlaylist>,
+}
+
+/// Le libellé à afficher, choisi dans un faisceau multilingue d'après les
+/// langues demandées.
+///
+/// L'ordre est : la première langue demandée qui existe dans le faisceau,
+/// puis l'anglais — langue de recours du catalogue, et non le français, qui
+/// n'est que la langue du studio —, puis ce que le service a bien voulu
+/// donner. Sans faisceau, le libellé déjà présent est gardé tel quel.
+pub fn etiquette_localisee(
+    faisceau: Option<&std::collections::BTreeMap<String, String>>,
+    langues: &[String],
+    defaut: &str,
+) -> String {
+    let Some(faisceau) = faisceau else {
+        return defaut.to_string();
+    };
+    for langue in langues {
+        if let Some(valeur) = faisceau.get(langue) {
+            return valeur.clone();
+        }
+    }
+    faisceau
+        .get("en")
+        .cloned()
+        .unwrap_or_else(|| defaut.to_string())
 }
 
 /// Discovery context of an album/track: its genre and record label. Lets a

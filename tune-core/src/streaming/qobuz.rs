@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -2514,28 +2514,56 @@ impl StreamingService for QobuzService {
                         // 13 catégories ne trouvait son nom et toutes
                         // retombaient sur leur slug : les rangées s'appelaient
                         // « artist », « mood », « label ».
-                        let localized = |v: &serde_json::Value| -> Option<String> {
+                        //
+                        // 🔴 Fuites de français : l'objet localisé porte le
+                        // libellé dans PLUSIEURS langues — `{"fr": …, "en": …}`
+                        // — et cette fonction n'en gardait qu'une, le français,
+                        // pour tout le monde. Un testeur roumain sur un compte
+                        // « Qobuz UK » lisait « Histoires de labels » et
+                        // « Nouveautés » alors que l'anglais était dans la même
+                        // réponse. Le faisceau entier est désormais retenu, et
+                        // le choix se fait au plus près de l'affichage, d'après
+                        // la langue de la requête.
+                        let faisceau = |v: &serde_json::Value| -> Option<BTreeMap<String, String>> {
                             let obj = v.as_object()?;
-                            obj.get("fr")
-                                .or_else(|| obj.get("en"))
-                                .or_else(|| obj.values().next())
-                                .and_then(|s| s.as_str())
-                                .map(String::from)
+                            let table: BTreeMap<String, String> = obj
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.to_lowercase(), s.to_string()))
+                                })
+                                .collect();
+                            (!table.is_empty()).then_some(table)
                         };
-                        let name = item["name"]
-                            .as_str()
-                            .map(String::from)
-                            .or_else(|| localized(&item["name"]))
+                        let name_i18n = faisceau(&item["name"])
                             .or_else(|| {
                                 item["name_json"]
                                     .as_str()
                                     .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                                     .as_ref()
-                                    .and_then(localized)
+                                    .and_then(faisceau)
                             })
-                            .or_else(|| localized(&item["name_json"]))
+                            .or_else(|| faisceau(&item["name_json"]));
+                        // `name` garde la valeur d'avant — le français quand
+                        // Qobuz le sert. C'est le champ que cite le contrat
+                        // web ; un client qui ignore `name_i18n` ne voit aucune
+                        // différence.
+                        let name = item["name"]
+                            .as_str()
+                            .map(String::from)
+                            .or_else(|| {
+                                name_i18n.as_ref().and_then(|t| {
+                                    t.get("fr")
+                                        .or_else(|| t.get("en"))
+                                        .or_else(|| t.values().next())
+                                        .cloned()
+                                })
+                            })
                             .unwrap_or_else(|| id.clone());
-                        Some(PlaylistTag { id, name })
+                        Some(PlaylistTag {
+                            id,
+                            name,
+                            name_i18n,
+                        })
                     })
                     .collect()
             })
@@ -2672,6 +2700,7 @@ impl StreamingService for QobuzService {
                 Some(PlaylistTagGroup {
                     id: tag.id,
                     name: tag.name,
+                    name_i18n: tag.name_i18n,
                     playlists,
                 })
             })
@@ -6279,6 +6308,56 @@ mod tests_repli_editorial {
             .get_mut(&cle)
             .expect("l'appel réussi a rempli le cache");
         entree.cree = Instant::now() - age;
+    }
+
+    /// 🔴 Fuites de français — le faisceau multilingue survit à l'extraction.
+    ///
+    /// Le libellé arrive de Qobuz en `name_json`, sous forme d'objet
+    /// `{"fr": …, "en": …}`. La lecture n'en gardait qu'une langue, toujours
+    /// le français : l'anglais était dans la même réponse, et jeté. Un testeur
+    /// roumain lisait « Humeurs » et « Nouveautés » sur un compte Qobuz UK.
+    ///
+    /// Deux propriétés, dont la seconde est la contre-épreuve :
+    ///
+    /// 1. les DEUX langues parviennent à l'appelant, dans `name_i18n` ;
+    /// 2. `name` garde exactement sa valeur d'avant — c'est le champ que cite
+    ///    le contrat web, et un client qui ignore `name_i18n` ne doit voir
+    ///    aucune différence.
+    #[tokio::test]
+    async fn le_faisceau_multilingue_parvient_a_l_appelant() {
+        let (base, _en_panne, _appels) = qobuz_tags_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+
+        let tags = svc.get_playlist_tags().await.expect("Qobuz répond");
+        let humeurs = tags
+            .iter()
+            .find(|t| t.id == "mood")
+            .expect("la catégorie « mood » est servie");
+
+        let faisceau = humeurs
+            .name_i18n
+            .as_ref()
+            .expect("le libellé multilingue doit voyager, pas seulement le français");
+        assert_eq!(faisceau.get("fr").map(String::as_str), Some("Humeurs"));
+        assert_eq!(
+            faisceau.get("en").map(String::as_str),
+            Some("mood"),
+            "l'anglais était dans la réponse de Qobuz : il ne doit plus être jeté"
+        );
+
+        // Contre-épreuve de rétro-compatibilité : rien n'a bougé sur `name`.
+        assert_eq!(humeurs.name, "Humeurs");
+
+        // Et TOUTES les catégories portent leur faisceau, pas seulement une.
+        let sans_faisceau: Vec<&str> = tags
+            .iter()
+            .filter(|t| t.name_i18n.is_none())
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(
+            sans_faisceau.is_empty(),
+            "catégories sans libellé multilingue : {sans_faisceau:?}"
+        );
     }
 
     /// LE défaut du signalement. Qobuz a déjà rendu la liste une fois ; il
