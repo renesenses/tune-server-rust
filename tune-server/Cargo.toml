@@ -818,3 +818,9 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 [[test]]
 name = "etiquettes_types_et_playlists"
 path = "tests/etiquettes_types_et_playlists.rs"
+# #4684 — les préréglages nommés du crossfeed (`/crossfeed/presets`) et les
+# bornes publiées par `GET /zones/{id}/dsp` (#4683). `autotests = false` en tête
+# de ce manifeste : sans cette cible, ce fichier ne serait JAMAIS compilé.
+[[test]]
+name = "crossfeed_presets_4684"
+path = "tests/crossfeed_presets_4684.rs"
