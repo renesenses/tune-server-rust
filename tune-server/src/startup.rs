@@ -274,6 +274,13 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     #[cfg(feature = "local-audio")]
     spawn_asio_warm_scan();
 
+    // #4677 — une ligne qui dit ce que le pare-feu Windows sait de cet
+    // exécutable (règle Block, règle sur un autre chemin, aucune règle). Le
+    // trafic entrant filtré ne laisse aucune trace côté serveur : sans ce
+    // relevé, le journal d'un testeur privé d'accès distant est muet.
+    // Lecture seule, en tâche de fond, sans effet hors Windows.
+    crate::pare_feu_windows::lancer_le_releve();
+
     reset_zones_offline(state);
     marquer_enrichissements_interrompus(state);
     ouvrir_le_registre_des_executions(state);
