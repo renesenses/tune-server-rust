@@ -39,14 +39,37 @@ pub const SOURCE_IMAGE_ROON: &str = "roon";
 /// Le rôle donné aux noms que Roon ajoute à l'interprète — voir `pont_roon`.
 const ROLE: &str = "composer";
 
-/// Plafond d'une archive lue en mémoire : ~1 800 images à ~80 Ko font
-/// ~150 Mo ; au-delà, ce n'est pas un export du moissonneur.
-pub const ARCHIVE_MAX_OCTETS: u64 = 600 * 1024 * 1024;
+/// Plafond d'une archive reçue. Elle n'est plus lue en mémoire : le serveur
+/// l'écrit sur disque au fil de l'envoi et n'en extrait les images qu'une à
+/// une. Le plafond ne garde donc plus la RAM, seulement le disque. L'archive
+/// réelle de Fabien dépassait les 600 Mio de l'ancien plafond (#4251) : il
+/// avait été calculé sur « ~1 800 images à ~80 Ko ».
+pub const ARCHIVE_MAX_OCTETS: u64 = 8 * 1024 * 1024 * 1024;
+/// Une entrée de l'archive ne se décompresse jamais au-delà : garde contre une
+/// bombe de décompression, entrée par entrée.
+pub const ENTREE_MAX_OCTETS: u64 = 256 * 1024 * 1024;
+
+/// D'où viennent les octets des images nommées par l'export.
+pub trait SourceImages {
+    /// L'archive porte-t-elle cette image ? Ne lit rien.
+    fn contient(&self, cle: &str) -> bool;
+    /// Les octets de l'image, lus à la demande.
+    fn lire(&self, cle: &str) -> Option<Vec<u8>>;
+}
+
+impl SourceImages for HashMap<String, Vec<u8>> {
+    fn contient(&self, cle: &str) -> bool {
+        self.contains_key(cle)
+    }
+    fn lire(&self, cle: &str) -> Option<Vec<u8>> {
+        self.get(cle).cloned()
+    }
+}
 
 /// Les octets d'image portés par une archive, et où les ranger.
 pub struct ImagesRoon<'a> {
     /// Clé d'image Roon → octets.
-    pub octets: &'a HashMap<String, Vec<u8>>,
+    pub octets: &'a dyn SourceImages,
     /// Le cache d'illustrations du serveur (`artwork_cache_dir`).
     pub dossier_cache: &'a Path,
 }
@@ -58,29 +81,62 @@ pub fn est_un_export_du_pont(texte: &str) -> bool {
         && texte.contains("\"artistes\"")
 }
 
-/// Une archive du moissonneur (`--archive`) : `export.json` + `images/<clé>.jpg`.
-pub fn lire_archive(octets: &[u8]) -> Result<(ExportRoon, HashMap<String, Vec<u8>>), String> {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(octets))
-        .map_err(|e| format!("archive illisible : {e}"))?;
+/// Une archive du moissonneur (`--archive`) ouverte : les images restent dans
+/// l'archive, seul leur index est gardé.
+pub struct ArchiveRoon<R> {
+    zip: std::sync::Mutex<zip::ZipArchive<R>>,
+    index: HashMap<String, usize>,
+}
+
+impl<R: Read + std::io::Seek> ArchiveRoon<R> {
+    /// Les clés d'image que l'archive porte.
+    pub fn cles(&self) -> impl Iterator<Item = &str> {
+        self.index.keys().map(String::as_str)
+    }
+    pub fn est_vide(&self) -> bool {
+        self.index.is_empty()
+    }
+}
+
+impl<R: Read + std::io::Seek> SourceImages for ArchiveRoon<R> {
+    fn contient(&self, cle: &str) -> bool {
+        self.index.contains_key(cle)
+    }
+    fn lire(&self, cle: &str) -> Option<Vec<u8>> {
+        let i = *self.index.get(cle)?;
+        let mut z = self.zip.lock().ok()?;
+        let f = z.by_index(i).ok()?;
+        lire_entree(f).ok()
+    }
+}
+
+fn lire_entree(f: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut contenu = Vec::new();
+    f.take(ENTREE_MAX_OCTETS + 1).read_to_end(&mut contenu)?;
+    if contenu.len() as u64 > ENTREE_MAX_OCTETS {
+        return Err(std::io::Error::other("entrée trop volumineuse"));
+    }
+    Ok(contenu)
+}
+
+/// Ouvre une archive du moissonneur : `export.json` + `images/<clé>.jpg`.
+/// Lit l'export, indexe les images sans les décompresser.
+pub fn ouvrir_archive<R: Read + std::io::Seek>(
+    lecteur: R,
+) -> Result<(ExportRoon, ArchiveRoon<R>), String> {
+    let mut z = zip::ZipArchive::new(lecteur).map_err(|e| format!("archive illisible : {e}"))?;
     let mut export: Option<ExportRoon> = None;
-    let mut images = HashMap::new();
-    let mut total: u64 = 0;
+    let mut index = HashMap::new();
     for i in 0..z.len() {
-        let mut f = z
+        let f = z
             .by_index(i)
             .map_err(|e| format!("archive illisible : {e}"))?;
         if f.is_dir() {
             continue;
         }
-        total = total.saturating_add(f.size());
-        if total > ARCHIVE_MAX_OCTETS {
-            return Err("archive trop volumineuse pour un export du moissonneur".into());
-        }
         let nom = f.name().to_string();
-        let mut contenu = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut contenu)
-            .map_err(|e| format!("archive illisible ({nom}) : {e}"))?;
         if nom == "export.json" {
+            let contenu = lire_entree(f).map_err(|e| format!("archive illisible ({nom}) : {e}"))?;
             let texte = String::from_utf8(contenu)
                 .map_err(|_| "export.json n'est pas de l'UTF-8".to_string())?;
             export = Some(ExportRoon::lire(&texte)?);
@@ -93,11 +149,17 @@ pub fn lire_archive(octets: &[u8]) -> Result<(ExportRoon, HashMap<String, Vec<u8
                         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
             })
         {
-            images.insert(cle.to_string(), contenu);
+            index.insert(cle.to_string(), i);
         }
     }
     let export = export.ok_or("archive sans export.json")?;
-    Ok((export, images))
+    Ok((
+        export,
+        ArchiveRoon {
+            zip: std::sync::Mutex::new(z),
+            index,
+        },
+    ))
 }
 
 /// Applique (ou aperçoit) un export contre la bibliothèque. `apercu` compte
@@ -120,10 +182,13 @@ pub fn appliquer(
         .map(|(id, nom, _)| (id, nom))
         .collect();
     let par_nom: HashMap<String, usize> = index_par_titre(&locaux, |(_, n)| n.as_str());
-    let octets_de = |cle: &Option<String>| -> Option<&Vec<u8>> {
-        let cle = cle.as_deref()?;
-        images?.octets.get(cle)
+    // Compter ne lit rien ; les octets ne sont extraits qu'au moment de poser.
+    let porte = |cle: &Option<String>| -> bool {
+        cle.as_deref()
+            .is_some_and(|c| images.is_some_and(|i| i.octets.contient(c)))
     };
+    let octets_de =
+        |cle: &Option<String>| -> Option<Vec<u8>> { images?.octets.lire(cle.as_deref()?) };
 
     let mut r = Rapport {
         artistes_total: export.artistes.len(),
@@ -134,13 +199,13 @@ pub fn appliquer(
         r.pistes_total += ar.albums.iter().map(|a| a.pistes.len()).sum::<usize>();
         if ar.image.is_some() {
             r.images_nommees += 1;
-            r.images_portees += usize::from(octets_de(&ar.image).is_some());
+            r.images_portees += usize::from(porte(&ar.image));
         }
         let Some(&i) = par_nom.get(&plier(&ar.nom)) else {
             r.artistes_inconnus.push(ar.nom.clone());
             for al in &ar.albums {
                 r.images_nommees += usize::from(al.image.is_some());
-                r.images_portees += usize::from(octets_de(&al.image).is_some());
+                r.images_portees += usize::from(porte(&al.image));
             }
             continue;
         };
@@ -148,7 +213,7 @@ pub fn appliquer(
         let (artiste_id, artiste_nom) = &locaux[i];
 
         // Image d'artiste : seulement s'il n'en a pas.
-        if let Some(data) = octets_de(&ar.image) {
+        if porte(&ar.image) {
             let sans_image = artistes
                 .get(*artiste_id)
                 .ok()
@@ -158,7 +223,7 @@ pub fn appliquer(
             if sans_image {
                 r.images_artistes_a_poser += 1;
                 if !apercu {
-                    if let Some(hash) = ranger(data, images) {
+                    if let Some(hash) = octets_de(&ar.image).and_then(|d| ranger(&d, images)) {
                         if artistes
                             .update_image(*artiste_id, &hash, SOURCE_IMAGE_ROON)
                             .is_ok()
@@ -174,7 +239,7 @@ pub fn appliquer(
         let par_titre = index_par_titre(&siens, |a| a.title.as_str());
         for al in &ar.albums {
             r.images_nommees += usize::from(al.image.is_some());
-            r.images_portees += usize::from(octets_de(&al.image).is_some());
+            r.images_portees += usize::from(porte(&al.image));
             let Some(&j) = par_titre.get(&plier(&al.titre)) else {
                 r.albums_inconnus.push(format!("{} — {}", ar.nom, al.titre));
                 continue;
@@ -185,12 +250,12 @@ pub fn appliquer(
             };
 
             // Pochette : seulement s'il n'en a pas.
-            if let Some(data) = octets_de(&al.image) {
+            if porte(&al.image) {
                 let pochette = siens[j].cover_path.as_deref();
                 if pochette.is_none_or(str::is_empty) {
                     r.images_albums_a_poser += 1;
                     if !apercu {
-                        if let Some(hash) = ranger(data, images) {
+                        if let Some(hash) = octets_de(&al.image).and_then(|d| ranger(&d, images)) {
                             // `force` : une chaîne vide n'est pas remplacée par
                             // COALESCE ; on vient de vérifier qu'il n'y a rien.
                             if albums.force_update_cover_path(album_id, &hash).is_ok() {
@@ -521,9 +586,12 @@ mod tests {
             z.write_all(b"x").unwrap();
             z.finish().unwrap();
         }
-        let (export, images) = lire_archive(tampon.get_ref()).unwrap();
+        let (export, images) = ouvrir_archive(tampon).unwrap();
         assert_eq!(export.source, "roon");
-        assert_eq!(images.keys().collect::<Vec<_>>(), vec!["abc123"]);
+        assert_eq!(images.cles().collect::<Vec<_>>(), vec!["abc123"]);
+        // Indexée à l'ouverture, extraite seulement à la demande.
+        assert_eq!(images.lire("abc123"), Some(jpeg(9)));
+        assert_eq!(images.lire("evil"), None);
 
         let mut sans = std::io::Cursor::new(Vec::new());
         {
@@ -533,12 +601,8 @@ mod tests {
             z.write_all(&jpeg(1)).unwrap();
             z.finish().unwrap();
         }
-        assert!(
-            lire_archive(sans.get_ref())
-                .unwrap_err()
-                .contains("export.json")
-        );
-        assert!(lire_archive(b"pas un zip").is_err());
+        assert!(ouvrir_archive(sans).err().unwrap().contains("export.json"));
+        assert!(ouvrir_archive(std::io::Cursor::new(b"pas un zip")).is_err());
     }
 
     #[test]
