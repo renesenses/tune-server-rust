@@ -1603,14 +1603,16 @@ impl PlaybackOrchestrator {
         {
             return None;
         }
-        let amount = cfg.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
-        let amount = amount.clamp(0.0, 0.5);
+        // Mêmes bornes que la route et les préréglages : une seule définition
+        // (`audio::crossfeed::borner`, #4683).
+        let (amount, delay_ms) = crate::audio::crossfeed::borner(
+            cfg.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.30),
+            cfg.get("delay_ms").and_then(|v| v.as_f64()).unwrap_or(0.30),
+        );
         if amount == 0.0 {
             return None;
         }
-        let delay_ms = cfg.get("delay_ms").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
-        let delay_ms = delay_ms.clamp(0.0, 5.0);
-        Some((amount, delay_ms))
+        Some((amount as f32, delay_ms as f32))
     }
 
     /// #4685 — la compensation de niveau est ACTIVE par défaut.

@@ -33,6 +33,7 @@ pub(super) async fn get_zone_dsp(
             "crossfeed": crossfeed,
             "crossfeed_status": crossfeed_status,
             "level_compensation": level_compensation,
+            "crossfeed_limits": crossfeed_limits(),
         }))
         .into_response(),
         Err(_) => Json(json!({
@@ -41,6 +42,7 @@ pub(super) async fn get_zone_dsp(
             "crossfeed": crossfeed,
             "crossfeed_status": crossfeed_status,
             "level_compensation": level_compensation,
+            "crossfeed_limits": crossfeed_limits(),
         }))
         .into_response(),
     }
@@ -200,6 +202,16 @@ pub(super) async fn convolver_response(
     }
 }
 
+/// Les bornes du crossfeed, publiées pour que le bout des curseurs d'un client
+/// soit EXACTEMENT celui que le serveur applique (#4683). `amount_max` est le
+/// point mono (Side entièrement replié) : c'est lui que « 100 % » désigne.
+pub(crate) fn crossfeed_limits() -> Value {
+    json!({
+        "amount_max": tune_core::audio::crossfeed::MAX_AMOUNT,
+        "delay_ms_max": tune_core::audio::crossfeed::MAX_DELAY_MS,
+    })
+}
+
 /// Read the `zone_{id}_crossfeed` settings row into a normalised JSON object,
 /// falling back to defaults (disabled, amount 0.30, delay 0.30 ms) for any
 /// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`.
@@ -345,8 +357,9 @@ pub(super) async fn set_zone_dsp(
     }
 
     // Handle crossfeed sub-object if present (local-output headphone effect).
-    // Separate Premium crossfeed gate above. Ranges clamped:
-    // amount 0..0.5, delay_ms 0..5. Persisted to `zone_{id}_crossfeed`.
+    // Separate Premium crossfeed gate above. Ranges clamped by
+    // `tune_core::audio::crossfeed::borner` (amount 0..0.5, delay_ms 0..5 — la
+    // même borne que les préréglages, #4684). Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;
     // #2742 — publié dès que le corps porte un `crossfeed`, pour que la réponse
@@ -357,16 +370,16 @@ pub(super) async fn set_zone_dsp(
             .get("enabled")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let amount = cf_val
-            .get("amount")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.30)
-            .clamp(0.0, 0.5);
-        let delay_ms = cf_val
-            .get("delay_ms")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.30)
-            .clamp(0.0, 5.0);
+        let (amount, delay_ms) = tune_core::audio::crossfeed::borner(
+            cf_val
+                .get("amount")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.30),
+            cf_val
+                .get("delay_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.30),
+        );
         let normalised = json!({
             "enabled": enabled,
             "amount": amount,

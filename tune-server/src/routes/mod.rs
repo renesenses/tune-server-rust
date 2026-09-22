@@ -13,6 +13,7 @@ pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
 pub(crate) mod corps_json_optionnel;
+pub mod crossfeed;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
@@ -48,6 +49,8 @@ pub mod network;
 pub mod offline;
 pub mod onboarding;
 mod pochettes_upnp;
+// Retrait d'une bibliotheque UPnP par serveur media (#4624).
+pub mod retrait_upnp;
 pub mod synchronisation_upnp;
 // `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
 // extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
@@ -378,6 +381,8 @@ pub fn router_with_plugins(
         .nest("/outputs", airplay_pairing::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
+        // #4684 — préréglages nommés du crossfeed, sur le modèle de `/eq/presets`.
+        .nest("/crossfeed", crossfeed::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
         .nest("/stats/listening", listening_stats::router())
