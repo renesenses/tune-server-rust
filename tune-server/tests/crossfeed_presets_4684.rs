@@ -73,7 +73,11 @@ async fn enregistrer_lister_supprimer() {
     let app = tune_server::routes::router(etat(true).await);
     assert!(lister(&app).await.is_empty(), "liste vide au départ");
 
-    let (status, cree) = post(&app, json!({"name": " Salon ", "amount": 0.35, "delay_ms": 0.6})).await;
+    let (status, cree) = post(
+        &app,
+        json!({"name": " Salon ", "amount": 0.35, "delay_ms": 0.6}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED, "{cree}");
     assert_eq!(cree["name"], "Salon", "nom rogné de ses espaces");
     assert_eq!(cree["amount"], 0.35);
@@ -85,7 +89,11 @@ async fn enregistrer_lister_supprimer() {
     assert_eq!(liste.len(), 1);
     assert_eq!(liste[0]["id"], id.as_str());
 
-    let (status, _) = post(&app, json!({"name": "Casque", "amount": 0.2, "delay_ms": 0.3})).await;
+    let (status, _) = post(
+        &app,
+        json!({"name": "Casque", "amount": 0.2, "delay_ms": 0.3}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(lister(&app).await.len(), 2);
 
@@ -104,8 +112,16 @@ async fn enregistrer_lister_supprimer() {
 #[tokio::test]
 async fn meme_nom_met_a_jour_sans_doublon() {
     let app = tune_server::routes::router(etat(true).await);
-    let (_, premier) = post(&app, json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5})).await;
-    let (status, second) = post(&app, json!({"name": "salon", "amount": 0.45, "delay_ms": 0.7})).await;
+    let (_, premier) = post(
+        &app,
+        json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5}),
+    )
+    .await;
+    let (status, second) = post(
+        &app,
+        json!({"name": "salon", "amount": 0.45, "delay_ms": 0.7}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["id"], premier["id"], "même préréglage");
     let liste = lister(&app).await;
@@ -119,7 +135,11 @@ async fn meme_nom_met_a_jour_sans_doublon() {
 #[tokio::test]
 async fn valeurs_bornees_et_nom_requis() {
     let app = tune_server::routes::router(etat(true).await);
-    let (status, p) = post(&app, json!({"name": "Trop", "amount": 0.9, "delay_ms": 12.0})).await;
+    let (status, p) = post(
+        &app,
+        json!({"name": "Trop", "amount": 0.9, "delay_ms": 12.0}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     assert_eq!(p["amount"], tune_core::audio::crossfeed::MAX_AMOUNT);
     assert_eq!(p["delay_ms"], tune_core::audio::crossfeed::MAX_DELAY_MS);
@@ -137,7 +157,11 @@ async fn valeurs_bornees_et_nom_requis() {
 #[tokio::test]
 async fn ecrire_demande_le_premium() {
     let app = tune_server::routes::router(etat(false).await);
-    let (status, _) = post(&app, json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5})).await;
+    let (status, _) = post(
+        &app,
+        json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5}),
+    )
+    .await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     assert!(lister(&app).await.is_empty());
 }
@@ -150,7 +174,11 @@ async fn ecrire_demande_le_greffon() {
         .set("plugin_crossfeed_installed", "false")
         .unwrap();
     let app = tune_server::routes::router(state);
-    let (status, body) = post(&app, json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5})).await;
+    let (status, body) = post(
+        &app,
+        json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5}),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"], "plugin_unavailable");
 }

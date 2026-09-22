@@ -405,7 +405,10 @@ mod tests {
         let (l, r) = traite(0.75, 0.8, -0.2);
         assert!(l < r, "Side inversé attendu : L={l} R={r}");
         let (l, r) = traite(1.0, 0.8, -0.2);
-        assert!((l + 0.2).abs() < 1e-6 && (r - 0.8).abs() < 1e-6, "L={l} R={r}");
+        assert!(
+            (l + 0.2).abs() < 1e-6 && (r - 0.8).abs() < 1e-6,
+            "L={l} R={r}"
+        );
     }
 
     #[test]
