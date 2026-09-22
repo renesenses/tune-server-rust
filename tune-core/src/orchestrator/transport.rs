@@ -410,6 +410,30 @@ impl PlaybackOrchestrator {
             }
         }
 
+        // 🔴 #4598 — le registre lu ci-dessus date de la dernière énumération
+        // PÉRIODIQUE (120 s sous macOS/Windows, 600 s sous Linux). Un DAC
+        // allumé ou rebranché depuis y manque encore : Cyrille (fil 1861) est
+        // refusé à 13:37:27, son iFi apparaît 12 s plus tard. Avant de conclure
+        // à l'absence, une énumération à la demande, bornée dans le temps, et
+        // seulement ici — au plus une fois par clic. L'appareil revenu passe
+        // comme un parc vide (#3737) : `recreate_local_and_play` l'ouvre.
+        if self
+            .appareil_local_revenu(
+                zone_id,
+                dev_id,
+                super::reenumeration_avant_refus::DELAI_REENUMERATION_AVANT_REFUS,
+            )
+            .await
+        {
+            info!(
+                zone_id,
+                zone_name = %zone.name,
+                device = dev_id,
+                "play_allowed_local_device_found_on_reenumeration"
+            );
+            return Ok(None);
+        }
+
         // The stored device really is gone. Before rejecting, look for a live
         // output carrying the same name (#1287).
         if let Some((new_id, new_type)) = self.find_rebind_target(&zone.name).await {
