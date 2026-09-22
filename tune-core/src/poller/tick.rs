@@ -454,7 +454,6 @@ impl PositionPoller {
                     ps.stall_declines = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
-                    ps.chute_en_grace = false;
                 }
                 ps.gapless_sent = false;
                 ps.gapless_sent_at = None;
@@ -493,6 +492,10 @@ impl PositionPoller {
                 // `e1_nouvelle_piste_ramene_a_neuve` borne à 34 lignes la
                 // distance entre le marqueur de journal et cet appel-là.
                 ps.reprendre_le_contrat_a_zero();
+                // Une chute écartée pendant la grâce appartenait à la piste
+                // d'avant, ou au flux que le déplacement vient de recréer :
+                // rien à réexaminer (#4682).
+                ps.chute_en_grace = false;
             }
 
             // Scrobble the current track once it has genuinely been listened past
