@@ -60,6 +60,27 @@ fn verifier_item_type(item_type: &str) -> Result<(), String> {
     }
 }
 
+/// Un identifiant d'objet local est STRICTEMENT positif.
+///
+/// 🔴 Mesuré sur le .18 le 22/09/2026 : deux lignes `item_tags` portaient
+/// `item_id = 0` — une sous « Bô enregistrements », une sous « J'adore ».
+/// Aucun album n'a l'identifiant 0 : ces lignes ne désignaient rien, mais
+/// gonflaient le compteur de l'étiquette (5 affichés pour 4 albums réels).
+/// `item_id` est un `i64` que serde accepte à 0 ; rien ne l'arrêtait.
+pub fn item_id_valide(item_id: i64) -> bool {
+    item_id > 0
+}
+
+fn verifier_item_id(item_id: i64) -> Result<(), String> {
+    if item_id_valide(item_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "item_id must be a positive local id, got {item_id}"
+        ))
+    }
+}
+
 /// Engine-agnostic SQL builders for tag_repo.
 pub mod sql {
     use super::SqlDialect;
@@ -422,6 +443,7 @@ impl TagRepo {
     /// suivant qu'on ajoutera l'oubliera.
     pub fn tag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
         verifier_item_type(item_type)?;
+        verifier_item_id(item_id)?;
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
@@ -508,6 +530,11 @@ impl TagRepo {
         // fois pour toutes) — sans cette ligne, le lot serait le trou par
         // lequel un type inconnu entrerait quand même, par centaines.
         verifier_item_type(item_type)?;
+        // Même raison que le type : tout le lot est vérifié AVANT d'écrire
+        // quoi que ce soit, un lot refusé ne laisse rien derrière lui.
+        for &item_id in item_ids {
+            verifier_item_id(item_id)?;
+        }
         let mut count = 0;
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         for &item_id in item_ids {

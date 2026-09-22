@@ -796,3 +796,10 @@ path = "tests/index_recherche_denominateur_4565.rs"
 [[test]]
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
+
+# Les étiquettes — types admis, playlists, et depuis le 22/09/2026 le refus
+# d'un `item_id` nul. Le fichier existait, mais `autotests = false` plus haut le
+# laissait hors compilation : ses gardes n'étaient exécutées par personne.
+[[test]]
+name = "etiquettes_types_et_playlists"
+path = "tests/etiquettes_types_et_playlists.rs"
