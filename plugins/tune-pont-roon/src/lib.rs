@@ -457,7 +457,8 @@ mod tests {
     /// rien ne reste derrière — jamais la coupure muette du 21/09.
     #[tokio::test]
     async fn l_envoi_va_sur_disque_et_le_plafond_refuse_lisiblement() {
-        let dossier = std::env::temp_dir().join(format!("pont_roon_envoi_{}", std::process::id()));
+        let scratch = tune_core::test_scratch::scratch_dir("pont_roon_envoi");
+        let dossier = scratch.path().to_path_buf();
         let (envoi, n) = recevoir(Body::from(vec![7u8; 100]), &dossier, 100)
             .await
             .unwrap();
@@ -475,6 +476,5 @@ mod tests {
         assert!(detail.contains("Mio"), "{detail}");
         let restes = std::fs::read_dir(&dossier).unwrap().count();
         assert_eq!(restes, 0, "aucun fichier partiel laissé");
-        let _ = std::fs::remove_dir_all(&dossier);
     }
 }
