@@ -33,6 +33,10 @@ pub fn router() -> Router<AppState> {
         .route("/merge", post(merge_playlists))
         .route("/export", post(export_playlists))
         .route("/import", post(import_playlists))
+        .route(
+            "/playlists/{service}/{playlist_id}",
+            axum::routing::delete(delete_service_playlist),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -115,25 +119,88 @@ async fn list_services(State(state): State<AppState>) -> Json<Value> {
             .get("authenticated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let write = if let Some(svc) = registry.get(name) {
-            svc.read().await.supports_write()
+        let (write, delete) = if let Some(svc) = registry.get(name) {
+            let svc = svc.read().await;
+            (svc.supports_write(), svc.supports_playlist_delete())
         } else {
-            false
+            (false, false)
         };
         services.insert(
             name.to_string(),
             json!({
                 "authenticated": authenticated,
                 "supports_write": write,
+                "supports_delete": delete,
             }),
         );
     }
     drop(registry);
     services.insert(
         "local".to_string(),
-        json!({ "authenticated": true, "supports_write": true }),
+        json!({ "authenticated": true, "supports_write": true, "supports_delete": true }),
     );
     Json(json!(services))
+}
+
+/// DELETE /playlist-manager/playlists/{service}/{playlist_id}
+///
+/// Supprime une playlist CHEZ le service de streaming. Les playlists locales
+/// passent par `DELETE /playlists/{id}` ; ici on ne parle qu'aux services.
+///
+/// Le geste est définitif chez le service : on refuse tout de suite (501) si
+/// le service ne sait pas le faire, plutôt que de laisser l'appel partir et
+/// rendre une erreur opaque.
+async fn delete_service_playlist(
+    State(state): State<AppState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if service == "local" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "use DELETE /playlists/{id} for local playlists" })),
+        )
+            .into_response();
+    }
+
+    let registry = state.services.lock().await;
+    let Some(svc_arc) = registry.get(&service) else {
+        drop(registry);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown service: {service}") })),
+        )
+            .into_response();
+    };
+    drop(registry);
+
+    let svc = svc_arc.read().await;
+    if !svc.supports_playlist_delete() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": format!("{service} does not support playlist deletion") })),
+        )
+            .into_response();
+    }
+
+    match svc.delete_playlist(&playlist_id).await {
+        Ok(()) => {
+            // 🔴 La liste des playlists du service est MÉMORISÉE 2 minutes.
+            // Sans cet oubli, la carte supprimée resterait affichée, et un
+            // rechargement de l'écran la ferait « revenir ».
+            crate::routes::streaming::purge_contenu_utilisateur(&service);
+            tracing::info!(%service, %playlist_id, "service_playlist_deleted");
+            Json(json!({ "deleted": true, "service": service, "playlist_id": playlist_id }))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(%service, %playlist_id, error = %e, "service_playlist_delete_failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1113,6 +1180,14 @@ struct MergeRequest {
     target_name: String,
     #[serde(default = "default_true")]
     deduplicate: bool,
+    /// Où atterrit la fusion. `None` ou `"local"` : la bibliothèque.
+    ///
+    /// 🔴 Ce champ N'EXISTAIT PAS. Le client l'envoyait déjà — serde jette en
+    /// silence un champ non déclaré, et la fusion de huit playlists Qobuz
+    /// créait une playlist LOCALE. Vide, de surcroît : la boucle des sources
+    /// « sautait pour le moment » toute source de service. Bertrand :
+    /// « Cela merge en local : erreur !! »
+    target_service: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1126,28 +1201,158 @@ async fn merge_playlists(
     profile: ActiveProfile,
     Json(body): Json<MergeRequest>,
 ) -> impl IntoResponse {
+    let cible = body
+        .target_service
+        .as_deref()
+        .unwrap_or("local")
+        .to_string();
+
+    // Les sources, lues chacune chez elle. Une seule erreur de lecture arrête
+    // tout : fusionner la moitié d'une playlist sans le dire serait pire.
+    let pistes = match rassembler_les_sources(&state, &profile, &body).await {
+        Ok(p) => p,
+        Err(reponse) => return reponse,
+    };
+
+    if cible == "local" {
+        fusion_vers_le_local(&state, &profile, &body, pistes).await
+    } else {
+        fusion_vers_le_service(&state, &body, &cible, pistes).await
+    }
+}
+
+/// Une piste vue depuis sa source, réduite à ce qui sert à l'apparier.
+///
+/// `id_source` n'est utilisable QUE chez `service` : un identifiant Qobuz ne
+/// veut rien dire chez Tidal. C'est toute la raison de l'appariement.
+struct PisteSource {
+    titre: String,
+    artiste: String,
+    isrc: String,
+    duree_ms: u64,
+    id_source: String,
+    service: String,
+}
+
+/// Lit les pistes de chaque playlist source, chacune chez son service.
+async fn rassembler_les_sources(
+    state: &AppState,
+    profile: &ActiveProfile,
+    body: &MergeRequest,
+) -> Result<Vec<PisteSource>, axum::response::Response> {
     let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
-    let mut all_track_ids: Vec<i64> = Vec::new();
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let mut pistes: Vec<PisteSource> = Vec::new();
 
     for source in &body.playlists {
         let service = source.service.as_deref().unwrap_or("local");
         if service == "local" {
             // Seule la CRÉATION était cloisonnée : les sources partaient d'un
-            // `WHERE id = ?` nu, et la fusion recopiait donc chez l'appelant le
-            // contenu de n'importe quelle playlist du foyer.
+            // `WHERE id = ?` nu, et la fusion recopiait donc chez l'appelant
+            // le contenu de n'importe quelle playlist du foyer.
             let playlist_id: i64 = source.playlist_id.parse().unwrap_or(0);
             if let Err(r) = owned_or_404_response(&playlist_repo, playlist_id, profile.id()) {
-                return r;
+                return Err(r);
             }
             let ids = playlist_repo.get_track_ids(playlist_id).unwrap_or_default();
-            all_track_ids.extend(ids);
+            for t in track_repo.get_multiple(&ids).unwrap_or_default() {
+                pistes.push(PisteSource {
+                    titre: t.title.clone(),
+                    artiste: t.artist_name.clone().unwrap_or_default(),
+                    isrc: String::new(),
+                    duree_ms: t.duration_ms.max(0) as u64,
+                    id_source: t.id.map(|i| i.to_string()).unwrap_or_default(),
+                    service: "local".into(),
+                });
+            }
+            continue;
         }
-        // Streaming service merge would require fetching + matching; skip for now
+
+        let registry = state.services.lock().await;
+        let Some(svc_arc) = registry.get(service) else {
+            drop(registry);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("unknown service: {service}") })),
+            )
+                .into_response());
+        };
+        drop(registry);
+        let svc = svc_arc.read().await;
+        match svc.get_playlist_tracks(&source.playlist_id).await {
+            Ok(lot) => {
+                for t in lot {
+                    pistes.push(PisteSource {
+                        titre: t.title,
+                        artiste: t.artist,
+                        isrc: t.isrc.unwrap_or_default(),
+                        duree_ms: t.duration_ms,
+                        id_source: t.id,
+                        service: service.to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": e.to_string(), "service": service })),
+                )
+                    .into_response());
+            }
+        }
+    }
+    Ok(pistes)
+}
+
+/// Ce qu'une piste introuvable laisse dire à l'écran.
+fn introuvable(p: &PisteSource) -> Value {
+    json!({ "title": p.titre, "artist": p.artiste, "service": p.service })
+}
+
+async fn fusion_vers_le_local(
+    state: &AppState,
+    profile: &ActiveProfile,
+    body: &MergeRequest,
+    pistes: Vec<PisteSource>,
+) -> axum::response::Response {
+    let playlist_repo = PlaylistRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut absentes: Vec<Value> = Vec::new();
+    for p in &pistes {
+        if p.service == "local" {
+            if let Ok(id) = p.id_source.parse::<i64>() {
+                ids.push(id);
+                continue;
+            }
+            absentes.push(introuvable(p));
+            continue;
+        }
+        // Une piste de service n'a pas d'identifiant local : on la CHERCHE
+        // dans la bibliothèque. C'est le même rapprochement que le transfert.
+        let requete = if p.artiste.is_empty() {
+            p.titre.clone()
+        } else {
+            format!("{} {}", p.titre, p.artiste)
+        };
+        match track_repo.search(&requete, 5).unwrap_or_default().first() {
+            Some(t) if t.id.is_some() => ids.push(t.id.unwrap()),
+            _ => absentes.push(introuvable(p)),
+        }
     }
 
     if body.deduplicate {
-        let mut seen = std::collections::HashSet::new();
-        all_track_ids.retain(|id| seen.insert(*id));
+        let mut vues = std::collections::HashSet::new();
+        ids.retain(|id| vues.insert(*id));
+    }
+
+    if ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no tracks to merge", "unmatched": absentes })),
+        )
+            .into_response();
     }
 
     let new_id =
@@ -1161,16 +1366,170 @@ async fn merge_playlists(
                     .into_response();
             }
         };
-
-    playlist_repo.add_tracks(new_id, &all_track_ids, None).ok();
+    playlist_repo.add_tracks(new_id, &ids, None).ok();
 
     Json(json!({
         "playlist_id": new_id,
+        "service": "local",
         "name": body.target_name,
-        "total_tracks": all_track_ids.len(),
+        "total_tracks": ids.len(),
         "deduplicated": body.deduplicate,
+        "not_found": absentes.len(),
+        "unmatched": absentes,
     }))
     .into_response()
+}
+
+/// Fusion CHEZ un service — « au même endroit », et depuis le 21/09 aussi
+/// depuis AILLEURS.
+///
+/// Les sources déjà sur la cible donnent leur identifiant tel quel. Les
+/// autres passent par une recherche dans le catalogue de la cible, appariée
+/// par ISRC quand la source en porte un, puis titre / artiste / durée. C'est
+/// le rapprochement du transfert, et il coûte un aller-retour réseau PAR
+/// TITRE à apparier : une fusion croisée n'est pas instantanée.
+async fn fusion_vers_le_service(
+    state: &AppState,
+    body: &MergeRequest,
+    cible: &str,
+    pistes: Vec<PisteSource>,
+) -> axum::response::Response {
+    let registry = state.services.lock().await;
+    let Some(svc_arc) = registry.get(cible) else {
+        drop(registry);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown service: {cible}") })),
+        )
+            .into_response();
+    };
+    drop(registry);
+    let svc = svc_arc.read().await;
+
+    if !svc.supports_write() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": format!("{cible} cannot create playlists") })),
+        )
+            .into_response();
+    }
+
+    let mut ids: Vec<String> = Vec::new();
+    let mut absentes: Vec<Value> = Vec::new();
+    for p in &pistes {
+        if p.service == cible {
+            if p.id_source.is_empty() {
+                absentes.push(introuvable(p));
+            } else {
+                ids.push(p.id_source.clone());
+            }
+            continue;
+        }
+        let requete = if p.artiste.is_empty() {
+            p.titre.clone()
+        } else {
+            format!("{} {}", p.titre, p.artiste)
+        };
+        match svc.search(&requete, 10).await {
+            Ok(res) => {
+                // L'ISRC et la durée sont passés quand la source les porte :
+                // le transfert, lui, envoie `""` et `0`, ce qui prive
+                // l'appariement de son critère le plus sûr.
+                match tune_core::streaming::matching::best_stream_match(
+                    &p.titre,
+                    &p.artiste,
+                    &p.isrc,
+                    p.duree_ms,
+                    &res.tracks,
+                ) {
+                    Some(t) => ids.push(t.id.clone()),
+                    None => absentes.push(introuvable(p)),
+                }
+            }
+            Err(_) => absentes.push(introuvable(p)),
+        }
+    }
+
+    if body.deduplicate {
+        let mut vues = std::collections::HashSet::new();
+        ids.retain(|id| vues.insert(id.clone()));
+    }
+
+    // 🔴 Ne JAMAIS créer une playlist vide : c'est exactement ce que la route
+    // rendait avant, en annonçant un succès.
+    if ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no tracks to merge", "unmatched": absentes })),
+        )
+            .into_response();
+    }
+
+    let nouvelle = match svc
+        .create_playlist(&body.target_name, Some("Merged by Tune"))
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    match svc.add_tracks_to_playlist(&nouvelle, &ids).await {
+        Ok(ajoutees) => {
+            // La liste des playlists du service est MÉMORISÉE 2 minutes.
+            // Sans cet oubli, la playlist créée n'apparaîtrait pas.
+            tune_streaming_http::purge_contenu_utilisateur(cible);
+            tracing::info!(service = %cible, playlist = %nouvelle, ajoutees, absentes = absentes.len(), "playlists_merged_on_service");
+            Json(json!({
+                "playlist_id": nouvelle,
+                "service": cible,
+                "name": body.target_name,
+                "total_tracks": ajoutees,
+                "deduplicated": body.deduplicate,
+                "not_found": absentes.len(),
+                "unmatched": absentes,
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            // 🔴 La playlist a été CRÉÉE avant que l'ajout échoue. Laissée
+            // telle quelle, elle encombre le compte — Bertrand en a récolté
+            // trois au fil des essais Tidal.
+            //
+            // On ne la retire QUE si elle est vraiment vide : un ajout peut
+            // échouer au deuxième lot de 100, et la supprimer alors perdrait
+            // les cent premiers titres.
+            let vide = match svc.get_playlist_tracks(&nouvelle).await {
+                Ok(p) => p.is_empty(),
+                Err(_) => false,
+            };
+            let retiree = if vide {
+                svc.delete_playlist(&nouvelle).await.is_ok()
+            } else {
+                false
+            };
+            if retiree {
+                tune_streaming_http::purge_contenu_utilisateur(cible);
+            }
+            tracing::warn!(service = %cible, playlist = %nouvelle, %retiree, error = %e, "merge_add_tracks_failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": e.to_string(),
+                    "playlist_id": nouvelle,
+                    "service": cible,
+                    "rolled_back": retiree,
+                    "partial": !retiree,
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

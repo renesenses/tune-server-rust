@@ -329,7 +329,13 @@ fn memoriser_contenu_utilisateur(service: &str, ressource: &str, donnees: Value)
 /// Sans condition sur le succès : une mutation en échec côté HTTP peut avoir
 /// abouti côté service (délai dépassé), et le prix d'une purge de trop est un
 /// seul rechargement.
-fn purge_contenu_utilisateur(service: &str) {
+///
+/// 🔴 `pub` depuis le 21/09/2026. La fusion et la suppression de playlists
+/// vivent dans `tune-server` (`playlist_manager.rs`) et appellent le service
+/// SANS passer par les routes d'ici : elles ne purgeaient donc rien, et la
+/// liste rendue restait la mémorisée — jusqu'à 2 minutes. Bertrand : « Je ne
+/// vois pas la playlist résultant du merge ! ». Elle existait chez Qobuz.
+pub fn purge_contenu_utilisateur(service: &str) {
     let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
         return;
     };

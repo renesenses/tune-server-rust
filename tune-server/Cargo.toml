@@ -818,3 +818,19 @@ path = "tests/index_recherche_denominateur_4565.rs"
 [[test]]
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
+
+# « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
+# faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
+# plus haut : sans cette cible, la garde du refus préalable (501 avant tout
+# appel réseau) ne serait compilée par personne.
+[[test]]
+name = "suppression_playlist_de_service"
+path = "tests/suppression_playlist_de_service.rs"
+
+# Le cloisonnement par profil du gestionnaire de playlists — dont la FUSION.
+# Le fichier existait depuis #3073, mais `autotests = false` plus haut le
+# laissait hors compilation : la garde qui interdit de fusionner la playlist
+# d'un autre profil n'était exécutée par personne.
+[[test]]
+name = "playlist_manager_cloisonnement_par_profil"
+path = "tests/playlist_manager_cloisonnement_par_profil.rs"
