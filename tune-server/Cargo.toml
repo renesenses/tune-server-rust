@@ -193,6 +193,17 @@ path = "tests/albums_upnp_visibles_4146.rs"
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
 
+# Fuites de français — les seize collections intelligentes livrées portent une
+# clé stable à côté de leur nom. `autotests = false` en tête de ce manifeste :
+# sans cette cible, ni le témoin ni sa contre-épreuve (« une collection
+# renommée ne reçoit aucune clé ») ne seraient JAMAIS compilés.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "collections_cle_stable"
+path = "tests/collections_cle_stable.rs"
+
 # #4577 — un favori Bandcamp posé une fois se retrouve la fois suivante.
 # `autotests = false` en tête de ce manifeste : sans cette cible le fichier ne
 # serait JAMAIS compilé, et la garde ne serait exécutée par personne.
