@@ -366,6 +366,32 @@ pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
     output_type == "dlna" && bytes_sent == 0
 }
 
+/// Le renderer peut-il encore être en train de jouer un fichier qu'il a
+/// reçu EN ENTIER ? (#4661)
+///
+/// Vrai tant que l'horloge murale de la piste n'a pas dépassé sa durée de
+/// [`END_MARGIN_MS`]. Un renderer ne joue pas plus vite que 1x : avant cette
+/// borne, un fichier entièrement servi peut encore sortir de son tampon, et
+/// un `Stopped` rapporté ne prouve pas l'arrêt — c'est exactement le « LHC qui
+/// joue sans rapporter son état » que la garde de consommation voulait
+/// protéger, et que la fin du transfert désarmait.
+///
+/// Au-delà, il a eu de quoi finir ET le temps de le jouer : la piste est
+/// finie, qu'il l'ait annoncé ou non.
+///
+/// Mesure qui motive la règle : Sevy Tabroc, 0.9.161, darTZeel LHC-208,
+/// piste de 281 160 ms servie en entier à 89 s ; zone coupée à
+/// `wall_secs=132`, soit ~150 s de musique encore dans le tampon.
+///
+/// Durée inconnue (`0`) ⇒ `false` : l'horloge ne peut rien trancher.
+pub fn tampon_du_renderer_peut_encore_jouer(
+    wall_elapsed_secs: u64,
+    track_duration_ms: u64,
+) -> bool {
+    track_duration_ms > 0
+        && wall_elapsed_secs.saturating_mul(1000) < track_duration_ms.saturating_add(END_MARGIN_MS)
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must

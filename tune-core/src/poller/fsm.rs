@@ -43,6 +43,19 @@ pub enum ConsommationFlux {
     /// Personne ne sait : pas de `stream_id`, ou session inconnue du
     /// gestionnaire de flux. On n'a mesuré RIEN — pas « rien servi ».
     Inconnue,
+    /// Le compteur est connu, n'avance plus — mais parce que le fichier a
+    /// été servi EN ENTIER (octets servis ≥ taille connue du flux), pas
+    /// parce que le renderer a cessé de tirer (#4661).
+    ///
+    /// Sur le chemin « fichier entier » (`dsp_progressif_reseau: false`)
+    /// combiné au pré-armement gapless, le transfert finit structurellement
+    /// AVANT la musique : darTZeel LHC-208, 0.9.161, fichier entièrement
+    /// servi 89 s après le début d'une piste de 281 s. Le renderer tient
+    /// alors dans son tampon de quoi jouer encore trois minutes ; le compteur
+    /// arrêté ne prouve plus rien sur la lecture. Seule l'horloge le peut —
+    /// voir [`classify_stopped`] et
+    /// [`decisions::tampon_du_renderer_peut_encore_jouer`].
+    ServiEnEntier,
 }
 
 impl ConsommationFlux {
@@ -54,6 +67,7 @@ impl ConsommationFlux {
             ConsommationFlux::Consomme => "consomme",
             ConsommationFlux::ASec => "a_sec",
             ConsommationFlux::Inconnue => "inconnue",
+            ConsommationFlux::ServiEnEntier => "servi_en_entier",
         }
     }
 
@@ -81,6 +95,33 @@ pub fn consommation_flux(octets_servis: Option<u64>, octets_precedents: u64) -> 
         None => ConsommationFlux::Inconnue,
         Some(octets) if octets > 0 && octets > octets_precedents => ConsommationFlux::Consomme,
         Some(_) => ConsommationFlux::ASec,
+    }
+}
+
+/// [`consommation_flux`], affinée par la taille connue du flux (#4661).
+///
+/// Un compteur arrêté ne veut dire « à sec » que s'il reste quelque chose à
+/// servir. Quand les octets servis atteignent la taille du flux, il s'est
+/// arrêté parce qu'il n'y a PLUS RIEN à servir : le verdict devient
+/// [`ConsommationFlux::ServiEnEntier`], jamais `ASec`.
+///
+/// `octets_total` à `None` (radio, flux décodé à la volée, ou horloge de
+/// piste inconnue — l'appelant le passe alors à `None`) ⇒ on ne juge pas, et
+/// le verdict reste celui de [`consommation_flux`].
+pub fn consommation_flux_au_total(
+    octets_servis: Option<u64>,
+    octets_precedents: u64,
+    octets_total: Option<u64>,
+) -> ConsommationFlux {
+    match consommation_flux(octets_servis, octets_precedents) {
+        ConsommationFlux::ASec
+            if octets_total.is_some_and(|total| {
+                total > 0 && octets_servis.is_some_and(|servis| servis >= total)
+            }) =>
+        {
+            ConsommationFlux::ServiEnEntier
+        }
+        verdict => verdict,
     }
 }
 
@@ -120,6 +161,15 @@ pub enum StoppedOutcome {
     /// on attend (#2394). Couper une zone parce qu'on ne sait pas la
     /// mesurer est pire que le défaut qu'on croit prévenir.
     FailureWaitingUnknown,
+    /// Seuil d'échec atteint, fichier servi EN ENTIER, et l'horloge dit que
+    /// le renderer peut encore être en train de jouer son tampon — on attend
+    /// (#4661). Couper ici arrêtait la file avec trois minutes de musique
+    /// encore à jouer.
+    FailureWaitingServedBuffer,
+    /// Seuil d'échec atteint, fichier servi EN ENTIER, et l'horloge a passé
+    /// la fin de la piste : le renderer a reçu de quoi finir et le temps de
+    /// le jouer — fin de piste, on enchaîne au lieu de couper (#4661).
+    ServedWholeEndAdvance,
     /// Failure threshold reached, stream idle — stop the zone.
     FailureStop,
     /// Below threshold, or above threshold without a natural end — accumulate.
@@ -135,6 +185,7 @@ impl StoppedOutcome {
                 | StoppedOutcome::LocalEndedNaturally
                 | StoppedOutcome::DsdDlnaReachedEnd
                 | StoppedOutcome::NaturalEndAdvance
+                | StoppedOutcome::ServedWholeEndAdvance
         )
     }
 
@@ -245,6 +296,19 @@ pub fn classify_stopped(i: &StoppedInput) -> StoppedOutcome {
                 ConsommationFlux::Consomme => FailureWaitingConsuming,
                 ConsommationFlux::Inconnue => FailureWaitingUnknown,
                 ConsommationFlux::ASec => FailureStop,
+                // Durée inconnue : l'horloge ne peut rien trancher, on garde
+                // le verdict d'avant (#4661).
+                ConsommationFlux::ServiEnEntier if i.track_duration_ms == 0 => FailureStop,
+                ConsommationFlux::ServiEnEntier => {
+                    if decisions::tampon_du_renderer_peut_encore_jouer(
+                        i.wall_elapsed,
+                        i.track_duration_ms,
+                    ) {
+                        FailureWaitingServedBuffer
+                    } else {
+                        ServedWholeEndAdvance
+                    }
+                }
             };
         }
         return Waiting;

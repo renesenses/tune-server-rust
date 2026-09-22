@@ -1802,8 +1802,12 @@ impl PositionPoller {
                     } else {
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
+                        // Compteur saturant : l'attente d'un tampon servi en
+                        // entier (#4661) peut durer plus de 255 tours sur une
+                        // piste longue — un `u8` qui déborde paniquerait en
+                        // debug et repartirait de zéro en release.
                         fsm_actual = Some(fsm::StoppedOutcome::Waiting);
-                        ps.stopped_ticks += 1;
+                        ps.stopped_ticks = ps.stopped_ticks.saturating_add(1);
                         ps.transition(fsm::Transition::RendererArrete);
                         if ps.stopped_ticks >= STOPPED_TICKS_THRESHOLD {
                             // When repeat mode is active (One or All) on DLNA,
@@ -1994,8 +1998,22 @@ impl PositionPoller {
                                     Some(sid) => self.orchestrator.streamer_bytes_sent(sid).await,
                                     None => None,
                                 };
-                                let consommation =
-                                    fsm::consommation_flux(octets_servis, ps.last_bytes_sent);
+                                // #4661 — la taille du flux, pour distinguer
+                                // « le renderer ne tire plus » de « il n'y a
+                                // plus rien à tirer ». Sans horloge de piste,
+                                // rien ne bornerait l'attente : on ne la
+                                // demande pas.
+                                let octets_total: Option<u64> = match stream_id.as_deref() {
+                                    Some(sid) if ps.track_started_at.is_some() => {
+                                        self.orchestrator.streamer_total_bytes(sid).await
+                                    }
+                                    _ => None,
+                                };
+                                let consommation = fsm::consommation_flux_au_total(
+                                    octets_servis,
+                                    ps.last_bytes_sent,
+                                    octets_total,
+                                );
                                 // Un compteur inconnu n'écrase pas le dernier
                                 // compte MESURÉ : sinon la reprise du
                                 // `stream_id` ferait repartir la comparaison
@@ -2037,6 +2055,56 @@ impl PositionPoller {
                                             has_stream_id = stream_id.is_some(),
                                             "octets_servis_inconnus_zone_non_coupee"
                                         );
+                                    }
+                                } else if consommation == fsm::ConsommationFlux::ServiEnEntier
+                                    && track_duration_ms > 0
+                                {
+                                    // #4661 — fichier servi EN ENTIER : le
+                                    // compteur s'est arrêté faute de matière,
+                                    // pas faute de lecteur. C'est l'horloge
+                                    // qui tranche, pas lui.
+                                    let reste_ms = track_duration_ms
+                                        .saturating_sub(wall_elapsed.saturating_mul(1000));
+                                    if decisions::tampon_du_renderer_peut_encore_jouer(
+                                        wall_elapsed,
+                                        track_duration_ms,
+                                    ) {
+                                        fsm_actual =
+                                            Some(fsm::StoppedOutcome::FailureWaitingServedBuffer);
+                                        ps.transition(fsm::Transition::AttenteProlongee);
+                                        if ps.stopped_ticks == STOPPED_FAILURE_THRESHOLD + 1
+                                            || ps.stopped_ticks % 30 == 0
+                                        {
+                                            info!(
+                                                zone_id,
+                                                peak_pos = ps.peak_position_ms,
+                                                track_dur = track_duration_ms,
+                                                wall_secs = wall_elapsed,
+                                                reste_ms,
+                                                bytes_sent = octets_servis.unwrap_or(0),
+                                                bytes_total = octets_total.unwrap_or(0),
+                                                consommation = consommation.etiquette(),
+                                                "flux_servi_en_entier_zone_non_coupee"
+                                            );
+                                        }
+                                    } else {
+                                        fsm_actual =
+                                            Some(fsm::StoppedOutcome::ServedWholeEndAdvance);
+                                        info!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            wall_secs = wall_elapsed,
+                                            bytes_sent = octets_servis.unwrap_or(0),
+                                            bytes_total = octets_total.unwrap_or(0),
+                                            "flux_servi_en_entier_fin_a_l_horloge"
+                                        );
+                                        ps.gapless_sent = false;
+                                        ps.gapless_armed = None;
+                                        track_ended = true;
+                                        motif_fin_de_piste =
+                                            decisions::motif_fin::FIN_NATURELLE_APRES_STOPPED;
+                                        ps.transition(fsm::Transition::FinNaturelleApresArret);
                                     }
                                 } else {
                                     let current_bytes = octets_servis.unwrap_or(0);

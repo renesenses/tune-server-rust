@@ -1120,6 +1120,11 @@ mod position_de_la_piste_precedente_954;
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
 
+/// #4661 — un fichier servi EN ENTIER n'est pas un flux « à sec » : la garde
+/// de consommation laisse l'horloge trancher au lieu de couper la zone.
+#[cfg(test)]
+mod flux_servi_en_entier_4661;
+
 /// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
 /// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position
 /// gelée à la durée) au lieu de jeter le flux qu'il tient et de repartir en

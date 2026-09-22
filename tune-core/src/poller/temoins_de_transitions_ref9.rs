@@ -151,14 +151,17 @@ fn appliquer_stopped(ps: &mut ZonePollState, issue: StoppedOutcome) -> (bool, bo
             return (true, false);
         }
         Waiting => ps.stopped_ticks += 1, // :1595
-        NaturalEndAdvance => {
-            // tick.rs:1595, :1697-1699
+        NaturalEndAdvance | ServedWholeEndAdvance => {
+            // tick.rs:1595, :1697-1699 (et la fin à l'horloge d'un flux
+            // servi en entier, #4661 : mêmes écritures)
             ps.stopped_ticks += 1;
             ps.gapless_sent = false;
             ps.gapless_armed = None;
             return (true, false);
         }
-        FailureWaitingConsuming | FailureWaitingUnknown => ps.stopped_ticks += 1, // :1595
+        FailureWaitingConsuming | FailureWaitingUnknown | FailureWaitingServedBuffer => {
+            ps.stopped_ticks += 1 // :1595
+        }
         FailureStop => {
             // tick.rs:1595, :1806-1807
             ps.stopped_ticks += 1;
