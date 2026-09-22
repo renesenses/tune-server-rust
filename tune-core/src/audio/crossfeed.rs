@@ -3,6 +3,9 @@ pub struct CrossfeedProcessor {
     engine: CrossfeedEngine,
     amount: f32,
     delay_samples: usize,
+    /// #4685 — niveau moyen du filtre, calculé UNE fois à la construction
+    /// (voir [`Self::gain_moyen_db`]).
+    gain_moyen_db: f64,
 }
 enum CrossfeedEngine {
     Bundled(tune_plugin_crossfeed::CrossfeedProcessor),
@@ -32,11 +35,26 @@ impl CrossfeedProcessor {
         } else {
             CrossfeedEngine::Bundled(reference)
         };
+        // Un moteur indisponible ne mélange rien : rien à compenser.
+        let gain_moyen_db = if matches!(engine, CrossfeedEngine::Unavailable) {
+            0.0
+        } else {
+            tune_plugin_crossfeed::gain_moyen_db(sample_rate, amount, delay_ms)
+        };
         Self {
             engine,
             amount,
             delay_samples,
+            gain_moyen_db,
         }
+    }
+
+    /// #4685 — ce que ce crossfeed fait gagner ou perdre au niveau MOYEN d'un
+    /// canal, en dB, sur un bruit rose stéréo de corrélation
+    /// `tune_plugin_crossfeed::CORRELATION_DE_REFERENCE`. Calculé depuis le
+    /// filtre, pas depuis la musique : c'est un gain FIXE.
+    pub fn gain_moyen_db(&self) -> f64 {
+        self.gain_moyen_db
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
         match &mut self.engine {

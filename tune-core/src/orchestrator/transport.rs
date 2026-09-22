@@ -1636,6 +1636,9 @@ impl PlaybackOrchestrator {
                 {
                     self.playback
                         .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
+                    // #4685 — et le gain MOYEN du DSP qu'elle compense.
+                    self.playback
+                        .brancher_le_gain_moyen_du_dsp(zone_id, local_output.gain_moyen_du_dsp());
                     return;
                 }
             }
@@ -1850,6 +1853,10 @@ impl PlaybackOrchestrator {
                         }
                         _ => 1.0,
                     };
+                    // #4685 — posé AVANT le facteur et les processeurs : chacun
+                    // recompose le gain de rendu à son installation.
+                    local_output
+                        .set_compensation_de_niveau(self.zone_compensation_de_niveau(zone_id));
                     local_output.set_replaygain_factor(rg);
                     // Headphone crossfeed (local DAC only). Returns None when the
                     // zone has crossfeed disabled OR is in PURE mode, so a PURE

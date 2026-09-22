@@ -89,6 +89,10 @@ def main():
         runner=RUNNER
         if mode=='native':
             import os
+            # PAS `audio-support` ici : la branche `else` au-dessus l'a déjà
+            # déclarée pour tout mode autre qu'« historical », `native`
+            # compris. L'ajouter une seconde fois écrit deux fois la même clé
+            # dans le Cargo.toml engendré — « error: duplicate key ».
             for name in ['native','sdk']:
                 deps+=f'tune-plugin-{name} = {{path={json.dumps(str(ROOT/"sdk"/f"tune-plugin-{name}"))}}}\n'
             for name in ['eq','crossfeed']:

@@ -1281,6 +1281,7 @@ impl PlaybackOrchestrator {
                 (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
                 _ => 1.0,
             };
+            local_output.set_compensation_de_niveau(self.zone_compensation_de_niveau(zone_id));
             local_output.set_replaygain_factor(rg);
             // #4384 — une bascule PURE en cours d'écoute change le facteur
             // ReplayGain sans passer par `send_to_output` : c'est ici que le
@@ -1288,6 +1289,8 @@ impl PlaybackOrchestrator {
             // sortie. Idempotent — on repousse le même `Arc`.
             self.playback
                 .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
+            self.playback
+                .brancher_le_gain_moyen_du_dsp(zone_id, local_output.gain_moyen_du_dsp());
             // `replace_*_live` et non `set_*` : la piste est en cours, donc
             // l'historique des biquads et les lignes à retard doivent survivre
             // au remplacement — sinon la bascule claque.
@@ -1608,6 +1611,120 @@ impl PlaybackOrchestrator {
         let delay_ms = cfg.get("delay_ms").and_then(|v| v.as_f64()).unwrap_or(0.30) as f32;
         let delay_ms = delay_ms.clamp(0.0, 5.0);
         Some((amount, delay_ms))
+    }
+
+    /// #4685 — la compensation de niveau est ACTIVE par défaut.
+    ///
+    /// Pourquoi « oui » :
+    ///
+    /// 1. c'est l'objet même de #4685 — à volume égal, on juge le réglage,
+    ///    pas le fait que plus fort sonne mieux ; une comparaison honnête
+    ///    qu'il faudrait d'abord aller chercher dans un réglage ne sert pas ;
+    /// 2. elle répond à la plainte la plus fréquente sur l'égaliseur — « pas
+    ///    de son quand j'active l'égaliseur » (#1640), « il baisse le volume
+    ///    au minimum » (#4407) : la réserve anti-écrêtage, indispensable,
+    ///    faisait perdre jusqu'à 10 dB de niveau moyen ;
+    /// 3. elle ne peut ni écrêter ni dépasser : elle passe par le volume
+    ///    effectif, raboté à l'unité APRÈS le DSP, donc jamais plus fort que
+    ///    la même zone sans égaliseur ni crossfeed au même curseur.
+    ///
+    /// Le prix, assumé : un auditeur qui avait remonté son curseur à la main
+    /// pour rattraper la réserve entendra, à la mise à jour, un niveau plus
+    /// élevé qu'hier — jamais plus que sans égaliseur. L'interrupteur existe
+    /// pour lui.
+    pub const COMPENSATION_DE_NIVEAU_PAR_DEFAUT: bool = true;
+
+    /// La clé de réglage de l'interrupteur, une seule écriture pour
+    /// l'orchestrateur et la route.
+    pub fn cle_compensation_de_niveau(zone_id: i64) -> String {
+        format!("zone_{zone_id}_level_compensation")
+    }
+
+    /// #4685 — la zone demande-t-elle la compensation de niveau de son
+    /// égaliseur et de son crossfeed ?
+    ///
+    /// Clé [`Self::cle_compensation_de_niveau`], **vraie par défaut** :
+    /// absente, vide ou illisible, elle compense. Seul `"false"` l'éteint.
+    /// Le choix du défaut est dit dans
+    /// [`Self::COMPENSATION_DE_NIVEAU_PAR_DEFAUT`].
+    pub fn zone_compensation_de_niveau(&self, zone_id: i64) -> bool {
+        Self::zone_compensation_de_niveau_with(&self.db, zone_id)
+    }
+
+    /// Même règle, lisible sans orchestrateur — c'est par là que la route
+    /// `GET /zones/{id}/dsp` publie l'interrupteur.
+    pub fn zone_compensation_de_niveau_with(
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+    ) -> bool {
+        match crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .get(&Self::cle_compensation_de_niveau(zone_id))
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("false") => false,
+            Some("true") => true,
+            _ => Self::COMPENSATION_DE_NIVEAU_PAR_DEFAUT,
+        }
+    }
+
+    /// #4685 — ce que l'égaliseur et le crossfeed de la zone font au niveau
+    /// MOYEN, en dB, `(égaliseur, crossfeed)` — tels que la sortie locale les
+    /// installerait, gardes comprises (PURE, droits, greffon, case décochée) :
+    /// ce sont les MÊMES chargeurs que la lecture. Sondés à 44,1 kHz stéréo,
+    /// le débit de référence du reste de l'écran ; le débit réel ne déplace
+    /// ces nombres que de quelques centièmes de dB.
+    pub fn gain_moyen_du_dsp_de_zone(&self, zone_id: i64) -> (f64, f64) {
+        let eq = self
+            .load_eq_processor(zone_id, 44_100, 2)
+            .map(|p| p.gain_moyen_db())
+            .unwrap_or(0.0);
+        let cf = self
+            .load_crossfeed_processor(zone_id, 44_100)
+            .map(|p| p.gain_moyen_db())
+            .unwrap_or(0.0);
+        (eq, cf)
+    }
+
+    /// #4685 — repousser l'interrupteur de compensation à la sortie locale
+    /// qui joue, sans attendre la piste suivante. Jumeau de
+    /// [`Self::refresh_zone_mono_downmix`] : rend `true` quand une sortie
+    /// locale vivante l'a reçu.
+    pub async fn refresh_zone_compensation(&self, zone_id: i64) -> bool {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            false
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id)
+            else {
+                return false;
+            };
+            if !device_id.starts_with("local:") {
+                return false;
+            }
+            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
+                return false;
+            };
+            let output = output_arc.lock().await;
+            let Some(local_output) = output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            let active = self.zone_compensation_de_niveau(zone_id);
+            local_output.set_compensation_de_niveau(active);
+            info!(zone_id, device_id = %device_id, active, "zone_compensation_refreshed_live");
+            true
+        }
     }
 
     /// La zone demande-t-elle le repli mono sur sa sortie LOCALE ? (#2362)
