@@ -48,6 +48,8 @@ pub mod network;
 pub mod offline;
 pub mod onboarding;
 mod pochettes_upnp;
+// Retrait d'une bibliotheque UPnP par serveur media (#4624).
+pub mod retrait_upnp;
 pub mod synchronisation_upnp;
 // `panne_sql` a demenage dans `tune-http-types` : les caisses de routes
 // extraites (`tune-smart-http`…) l'empruntent aussi, et une caisse extraite ne
