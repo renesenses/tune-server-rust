@@ -456,6 +456,34 @@ pub fn position_reset_fires(
     raw_position_reset && can_internal_gapless && !in_seek_grace
 }
 
+/// Une chute de position écartée PENDANT la grâce de déplacement était-elle
+/// la fin réelle de la piste ? (#4682)
+///
+/// La grâce écarte la chute parce qu'un flux recréé par le déplacement a la
+/// même forme qu'un enchaînement (#2170). Mais un déplacement près de la fin
+/// laisse la piste finir DANS la grâce : le renderer enchaîne sur la suivante,
+/// la chute est écartée, `last_position_ms` prend la position de la suivante,
+/// et plus aucune chute n'est jamais vue — l'écran reste sur la piste finie
+/// pendant que la suivante joue (position de l'une sur la durée de l'autre).
+///
+/// Au premier sondage hors grâce, on tranche sur l'arithmétique : partie de
+/// `cible_ms` il y a `depuis_ms`, la piste courante aurait atteint
+/// `cible_ms + depuis_ms`. Si c'est au-delà de sa durée, elle est finie ; et
+/// si la position rapportée est plus petite que le temps écoulé depuis le
+/// déplacement, elle est repartie de zéro APRÈS lui : c'est la suivante. Un
+/// déplacement vers l'arrière ou vers le début n'atteint jamais la durée, et
+/// ne passe donc jamais pour une fin. Durée inconnue : on ne tranche pas.
+pub fn chute_en_grace_etait_une_fin(
+    cible_ms: u64,
+    depuis_ms: u64,
+    position_ms: u64,
+    track_duration_ms: u64,
+) -> bool {
+    track_duration_ms > 0
+        && cible_ms.saturating_add(depuis_ms) >= track_duration_ms
+        && position_ms < depuis_ms
+}
+
 /// A renderer can report the PREVIOUS session's position for the first
 /// seconds after a fresh Play (Villerio's DMP-A6: ~374s — yesterday's end
 /// position — reported 6s into a new start). That stale sample poisons the

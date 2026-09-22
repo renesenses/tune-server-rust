@@ -1718,6 +1718,35 @@ impl PlaybackManager {
         }
     }
 
+    /// Le déplacement de la piste PRÉCÉDENTE ne vaut plus rien pour celle-ci
+    /// (#4682).
+    ///
+    /// `play()` efface `last_seek_at` au changement de piste ; l'avance
+    /// gapless, qui ne passe pas par lui, le laissait en place. La grâce de
+    /// déplacement du sondeur continuait alors de courir sur la piste
+    /// suivante : positions non publiées, chute de position écartée — un
+    /// déplacement sur une piste débordait sur l'autre.
+    pub async fn oublier_le_deplacement(&self, zone_id: i64) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            state.last_seek_at = None;
+        }
+    }
+
+    /// Recule d'autant l'instant du dernier déplacement : un banc qui rejoue
+    /// la fin d'une grâce de déplacement ne doit pas avoir à dormir (#4682).
+    #[cfg(test)]
+    pub(crate) async fn dater_le_deplacement(
+        &self,
+        zone_id: i64,
+        depuis: std::time::Duration,
+    ) -> Option<Instant> {
+        let mut zones = self.zones.lock().await;
+        let state = zones.get_mut(&zone_id)?;
+        state.last_seek_at = state.last_seek_at.and_then(|t| t.checked_sub(depuis));
+        state.last_seek_at
+    }
+
     /// Longueur et position de la file pour cette zone.
     ///
     /// `entry` et non `get_mut` : la zone n'est PAS forcément déjà en mémoire

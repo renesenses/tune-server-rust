@@ -454,6 +454,7 @@ impl PositionPoller {
                     ps.stall_declines = 0;
                     ps.past_end_ticks = 0;
                     ps.track_started_at = Some(Instant::now());
+                    ps.chute_en_grace = false;
                 }
                 ps.gapless_sent = false;
                 ps.gapless_sent_at = None;
@@ -1173,6 +1174,14 @@ impl PositionPoller {
                     let target = Duration::from_millis(zone_state.position_ms.max(0) as u64);
                     ps.track_started_at =
                         Instant::now().checked_sub(target).or(ps.track_started_at);
+                    // Le pic aussi repart de la cible (#4682). Gardé d'avant
+                    // le déplacement, il laissait `played_enough` vrai après
+                    // un recul : un renderer qui rapporte une position
+                    // transitoire proche de 0 et une autre durée (DMP-A6/A8,
+                    // `SetNext` armé) faisait avancer la file sur la suivante
+                    // alors que la piste courante jouait encore.
+                    ps.peak_position_ms = target.as_millis() as u64;
+                    ps.cible_du_deplacement_ms = target.as_millis() as u64;
                 }
             }
 
@@ -1447,8 +1456,36 @@ impl PositionPoller {
             // `ps.last_position_ms` after the overwrite, so `prev_pos` was
             // always mis-logged equal to `new_pos`).
             let prev_position_ms = ps.last_position_ms;
+            // Fin de la grâce de déplacement : une chute écartée pendant la
+            // grâce est réexaminée ici, une seule fois (#4682). Sans cela, la
+            // ligne `ps.last_position_ms = …` plus bas l'a déjà effacée et le
+            // renderer qui a enchaîné pendant la grâce n'est plus jamais vu.
+            let mut chute_retenue = false;
+            if ps.chute_en_grace && !in_seek_grace {
+                ps.chute_en_grace = false;
+                if let Some(seek_at) = zone_state.last_seek_at {
+                    let depuis_ms = seek_at.elapsed().as_millis() as u64;
+                    chute_retenue = ps.gapless_sent
+                        && decisions::chute_en_grace_etait_une_fin(
+                            ps.cible_du_deplacement_ms,
+                            depuis_ms,
+                            status.position_ms,
+                            track_duration_ms,
+                        );
+                    info!(
+                        zone_id,
+                        cible_ms = ps.cible_du_deplacement_ms,
+                        depuis_ms,
+                        position_ms = status.position_ms,
+                        track_dur = track_duration_ms,
+                        retenue = chute_retenue,
+                        "gapless_chute_pendant_la_grace_reexaminee"
+                    );
+                }
+            }
             let mut position_reset =
-                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent)
+                    || chute_retenue;
             // Suppress this metadata-only advance fallback for outputs that don't
             // do internal gapless (Chromecast, slimproto, exclusive local): for
             // them a position drop to 0 means the track ENDED (device IDLE /
@@ -1473,6 +1510,9 @@ impl PositionPoller {
                 if !position_reset {
                     if in_seek_grace {
                         info!(zone_id, "gapless_advance_suppressed_after_seek");
+                        // Écartée, pas oubliée : réexaminée à la fin de la
+                        // grâce (#4682).
+                        ps.chute_en_grace = can_internal_gapless;
                     } else {
                         info!(zone_id, "position_reset_deferred_to_natural_end");
                     }
