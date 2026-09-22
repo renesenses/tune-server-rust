@@ -309,6 +309,10 @@ impl StreamingService for ServiceDeBanc {
                 // Accents et suffixe de remasterisation : seul l'appariement
                 // partagé sait retrouver « La Boheme » là-dedans.
                 piste("banc-1", "La Bohème (Remastered 2014)", "Charles Aznavour"),
+                // Une AUTRE prise du même titre, bien plus courte : c'est elle
+                // que le greffon retiendra quand sa tolérance de durée
+                // écartera le verdict.
+                piste_duree("banc-2", "La Bohème", "Charles Aznavour", 150_500),
             ],
             albums: Vec::new(),
             artists: Vec::new(),
@@ -387,13 +391,17 @@ impl StreamingService for ServiceDeBanc {
 }
 
 fn piste(id: &str, titre: &str, artiste: &str) -> StreamTrack {
+    piste_duree(id, titre, artiste, 210_000)
+}
+
+fn piste_duree(id: &str, titre: &str, artiste: &str, duree_ms: u64) -> StreamTrack {
     StreamTrack {
         id: id.into(),
         title: titre.into(),
         artist: artiste.into(),
         album: None,
         album_id: None,
-        duration_ms: 210_000,
+        duration_ms: duree_ms,
         cover_path: None,
         track_number: Some(1),
         disc_number: Some(1),
@@ -516,6 +524,51 @@ async fn streaming_apparie_avec_l_appariement_partage() {
     .unwrap();
     assert_eq!(rendu["matched"]["source_id"], "banc-1");
     assert_eq!(rendu["approximate"], false);
+    // La forme d'avant est intacte, et le verdict est la TÊTE du classement.
+    assert_eq!(rendu["candidates"][0]["track"]["source_id"], "banc-1");
+}
+
+/// 🔴 Le manque que cette tranche répare, chez un service : le verdict rate la
+/// tolérance de durée que le greffon applique ensuite (±3 s), et un autre
+/// résultat de la MÊME recherche l'aurait tenue. Avec un seul candidat rendu,
+/// le titre ressortait « introuvable ».
+#[tokio::test]
+async fn streaming_match_track_rend_un_second_candidat_quand_le_premier_rate_la_duree() {
+    const TOLERANCE_MS: u64 = 3_000;
+    let source_ms: u64 = 150_000;
+    let (state, _, _) = banc().await;
+    let host = AppStateHost::from_state(&state);
+    let rendu = hors_du_worker(move || {
+        host.streaming_match_track(SERVICE, "La Boheme", "Charles Aznavour", "", source_ms)
+    })
+    .await
+    .unwrap();
+
+    // Le verdict est inchangé — et il rate la tolérance.
+    assert_eq!(rendu["matched"]["source_id"], "banc-1", "{rendu}");
+    let ecart = rendu["matched"]["duration_ms"]
+        .as_u64()
+        .unwrap()
+        .abs_diff(source_ms);
+    assert!(
+        ecart > TOLERANCE_MS,
+        "le verdict doit bien rater la tolérance, sinon l'essai ne prouve rien"
+    );
+
+    // Le greffon a maintenant un recours, borné et classé.
+    let candidats = rendu["candidates"].as_array().expect("une liste");
+    assert_eq!(candidats.len(), 2, "{rendu}");
+    let retenu = candidats
+        .iter()
+        .find(|c| {
+            c["track"]["duration_ms"]
+                .as_u64()
+                .unwrap_or(0)
+                .abs_diff(source_ms)
+                <= TOLERANCE_MS
+        })
+        .expect("un candidat doit tenir la tolérance de durée");
+    assert_eq!(retenu["track"]["source_id"], "banc-2");
 }
 
 #[tokio::test]

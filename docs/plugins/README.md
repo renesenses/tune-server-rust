@@ -423,9 +423,10 @@ peut lire, pas un trap — et **n'atteint jamais l'hôte**.
 | `events` | `host_emit` (l'abonnement se déclare dans le manifeste) |
 | `playlists` | `host_playlists_list`, `host_playlist_tracks`, `host_playlist_create`, `host_playlist_add_tracks` |
 | `streaming` | `host_streaming_services`, `host_streaming_playlists`, `host_streaming_playlist_tracks`, `host_streaming_playlist_create`, `host_streaming_playlist_add_tracks`, `host_streaming_match_track` |
+| `library` | `host_library_search`, `host_library_match_track` |
 | `kv` | `host_kv_get`, `host_kv_set`, `host_kv_list` |
 
-Les trois derniers scopes sont arrivés avec #4716 (tranche 1 de l'épique
+Les quatre derniers scopes sont arrivés avec #4716 (tranche 1 de l'épique
 #4715, greffon « Playlists converter »). Ce qu'un auteur de greffon doit en
 savoir :
 
@@ -436,15 +437,30 @@ savoir :
   `demandees` ce qui avait été demandé : les deux peuvent différer.
 * **`streaming`** — les services de streaming. `host_streaming_services` ne
   liste que les services **authentifiés**, avec leur `supports_write`.
-  `host_streaming_match_track` rend `{matched, score, approximate}` : `matched`
-  est `null` quand rien ne correspond, et `approximate: true` quand le score
-  est sous le seuil d'acceptation — à présenter à l'utilisateur, jamais à
-  écrire en silence chez un service.
+  `host_streaming_match_track` rend `{matched, score, approximate, count,
+  candidates}` : `matched` est `null` quand rien ne correspond, et
+  `approximate: true` quand le score est sous le seuil d'acceptation — à
+  présenter à l'utilisateur, jamais à écrire en silence chez un service.
+* **`library`** — la bibliothèque LOCALE, en lecture. `host_library_search`
+  cherche (`{query, limit}` → des pistes dans la même forme que
+  `host_playlist_tracks`) et `host_library_match_track` apparie un titre connu
+  (`{title, artist, isrc, duration_ms}`) dans la MÊME forme que son homologue
+  streaming. Sans ces deux-là, un convertisseur ne sait aller que de la
+  bibliothèque vers un service, jamais l'inverse.
+
 * **`kv`** — un espace clé/valeur **propre au greffon** (état des transferts,
   snapshots, liens de synchro). La clé est préfixée par l'identifiant de
   manifeste du greffon côté hôte : deux greffons peuvent utiliser la même clé
   sans se voir, et aucun ne peut lire l'état d'un autre. Une valeur est du JSON
   quelconque, bornée à 256 Kio.
+
+**Les deux appariements rendent PLUSIEURS candidats**, classés, le verdict en
+tête : `candidates[0]` est exactement `matched`, et les suivants sont les
+autres résultats de la même recherche, triés par score et plafonnés à cinq.
+C'est ce qu'il faut quand le greffon applique sa propre règle par-dessus — une
+tolérance de durée, par exemple : si le verdict la rate, redescendez d'un cran
+au lieu de conclure « introuvable ». Chaque candidat porte
+`{track, score, approximate}`.
 
 **Aucune de ces capacités ne SUPPRIME quoi que ce soit** : ni playlist, ni
 piste, ni favori, ni chez un service. C'est délibéré et gardé par un test —
