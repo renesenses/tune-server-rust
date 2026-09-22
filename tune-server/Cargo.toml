@@ -796,3 +796,10 @@ path = "tests/index_recherche_denominateur_4565.rs"
 [[test]]
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
+
+# #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
+# et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "pg_scan_converge_4602"
+path = "tests/pg_scan_converge_4602.rs"
