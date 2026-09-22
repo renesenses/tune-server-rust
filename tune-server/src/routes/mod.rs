@@ -13,6 +13,7 @@ pub mod connect;
 pub(crate) mod convert_destination;
 pub mod converter;
 pub(crate) mod corps_json_optionnel;
+pub mod crossfeed;
 pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
@@ -377,6 +378,8 @@ pub fn router_with_plugins(
         .nest("/outputs", airplay_pairing::router())
         .nest("/graphql", graphql::router())
         .nest("/eq", eq_pro::router())
+        // #4684 — préréglages nommés du crossfeed, sur le modèle de `/eq/presets`.
+        .nest("/crossfeed", crossfeed::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
         .nest("/stats/listening", listening_stats::router())
