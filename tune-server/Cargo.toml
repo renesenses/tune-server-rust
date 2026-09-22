@@ -826,6 +826,13 @@ path = "tests/index_recherche_denominateur_4565.rs"
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
 
+# #4684 — les préréglages nommés du crossfeed (`/crossfeed/presets`) et les
+# bornes publiées par `GET /zones/{id}/dsp` (#4683). `autotests = false` en tête
+# de ce manifeste : sans cette cible, ce fichier ne serait JAMAIS compilé.
+[[test]]
+name = "crossfeed_presets_4684"
+path = "tests/crossfeed_presets_4684.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.
