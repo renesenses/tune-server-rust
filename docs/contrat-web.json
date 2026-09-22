@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "d70fbb91c2bf0b1947e6b1c4fb7f5a4d39368db7",
+    "web_sha": "737ab0afb89e7d5f53994a0a7ca32d06c6ffc32f",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -500,7 +500,9 @@
         "premium",
         "dernier_rapport"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "archive_max_octets"
+      ]
     },
     {
       "route": "/home",
@@ -1424,6 +1426,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1446,6 +1450,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1479,6 +1485,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1501,6 +1509,8 @@
         "created_at"
       ],
       "champs_optionnels": [
+        "name_key",
+        "description_key",
         "album_count"
       ]
     },
@@ -1970,6 +1980,18 @@
       "champs_optionnels": []
     },
     {
+      "route": "/playlist-manager/playlists/{}/{}",
+      "methode": "DELETE",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "deleted",
+        "service",
+        "playlist_id"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/playlists",
       "methode": "GET",
       "type": "Playlist",
@@ -2357,6 +2379,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -2377,6 +2402,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -2397,6 +2425,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -2417,6 +2448,9 @@
         "tags",
         "codec",
         "country",
+        "country_code",
+        "genre_key",
+        "genre_label",
         "homepage_url"
       ]
     },
@@ -3055,7 +3089,8 @@
       ],
       "champs_optionnels": [
         "description",
-        "cover_path"
+        "cover_path",
+        "covers"
       ]
     },
     {
@@ -3214,7 +3249,8 @@
       ],
       "champs_optionnels": [
         "description",
-        "cover_path"
+        "cover_path",
+        "covers"
       ]
     },
     {
@@ -5314,7 +5350,7 @@
     },
     {
       "route": "/playlist-manager/services",
-      "type": "Record<string, { authenticated: boolean; supports_write: boolean }>",
+      "type": "Record<string, { authenticated: boolean; supports_write: boolean; supports_delete?: boolean }>",
       "raison": "type non structurel"
     },
     {
@@ -5759,7 +5795,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 289,
+    "routes_cartographiees": 290,
     "appels_non_resolus": 149
   }
 }

@@ -60,36 +60,96 @@ fn dedup_ranked_tracks(
         .collect()
 }
 
+/// `GET /library/search` — la recherche de l'écran Recherche de la nouvelle
+/// interface.
+///
+/// # #4663 — « Résultat : 40 » pour 119 correspondances
+///
+/// jfpaquet (fil 1878, 0.9.161 Windows/PostgreSQL, 79 614 pistes) cherche
+/// « autumn leaves » : l'écran affiche `Tracks 40`. Le 40 est la limite que
+/// l'écran demande, pas un compte. #3189 avait réparé exactement ce défaut —
+/// sur `GET /search`, pour l'ancien écran, supprimé le 19/09. Cette route-ci
+/// n'avait jamais rendu ni total, ni `has_more`, ni `offset` : le client ne
+/// pouvait pas dire que la liste était coupée, même s'il le voulait.
+///
+/// Elle rend désormais, À CÔTÉ des tableaux inchangés, le même contrat que
+/// `/search` sous `local` : `totals` (un `COUNT` sur le même prédicat, borné à
+/// [`PLAFOND_DE_COMPTAGE`]), `totals_capped`, `has_more`, `limit`, `offset`.
+/// `?offset=` pagine les artistes, les albums et les pistes ; les labels et
+/// les pistes trouvées par leurs seules métadonnées restent sur la première
+/// page (voir `routes/search.rs`, « Extended metadata search »). Un client
+/// qui ne lit que les tableaux voit exactement ce qu'il voyait.
 pub(super) async fn search(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Json<Value> {
     let limit = q.limit.unwrap_or(20);
-    let artists = ArtistRepo::with_backend(state.backend.clone())
-        .search(&q.q, limit)
+    let offset = q.offset.unwrap_or(0).max(0);
+    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
+    let track_repo = TrackRepo::with_backend(state.backend.clone());
+    let artists = artist_repo
+        .search_page(&q.q, limit, offset)
         .unwrap_or_default();
-    let albums = AlbumRepo::with_backend(state.backend.clone())
-        .search(&q.q, limit)
+    let albums = album_repo
+        .search_page(&q.q, limit, offset)
         .unwrap_or_default();
+    let n_albums = albums.len();
     let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
     // Point 8 (17/09/2026) : restreindre la recherche aux LABELS suppose de
     // les rendre. Champ nouveau, les clients antérieurs l'ignorent.
-    let labels: Vec<Value> = AlbumRepo::with_backend(state.backend.clone())
-        .search_labels(&q.q, limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(name, album_count)| json!({ "name": name, "album_count": album_count }))
-        .collect();
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .search(&q.q, limit)
+    let labels: Vec<Value> = if offset > 0 {
+        Vec::new()
+    } else {
+        album_repo
+            .search_labels(&q.q, limit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, album_count)| json!({ "name": name, "album_count": album_count }))
+            .collect()
+    };
+    let tracks = track_repo
+        .search_page(&q.q, limit, offset)
         .unwrap_or_default();
+
+    // #4663 — les totaux, sur le MÊME prédicat que les pages. Un `COUNT` qui
+    // échoue ne doit pas annoncer 0 sous une liste non vide : le repli est
+    // « au moins ce qu'on rend ».
+    let plafond = crate::routes::search::PLAFOND_DE_COMPTAGE;
+    let plancher = |rendus: usize| offset.saturating_add(rendus as i64);
+    let total_artists = artist_repo
+        .search_count(&q.q, plafond)
+        .unwrap_or_else(|_| plancher(artists.len()));
+    let total_albums = album_repo
+        .search_count(&q.q, plafond)
+        .unwrap_or_else(|_| plancher(n_albums));
+    let total_tracks = track_repo
+        .search_count(&q.q, plafond)
+        .unwrap_or_else(|_| plancher(tracks.len()));
+    let n_artists = artists.len();
+    let n_tracks = tracks.len();
+    // Même règle que `/search` : sous le plafond le total tranche ; au
+    // plafond, c'est la forme de la page (pleine ou non) qui parle.
+    let a_la_suite = |rendus: usize, total: i64| {
+        if total >= plafond {
+            limit > 0 && rendus as i64 >= limit
+        } else {
+            plancher(rendus) < total
+        }
+    };
 
     // --- Extended metadata search (Approach B) ---
     // Search track_metadata for matches in searchable fields (composer,
     // conductor, lyricist, performer, remixer, producer, label, comment,
     // lyrics, isrc, catalog_number). Merge with FTS results.
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
-    let meta_matches = meta_repo.search_by_value(&q.q, limit).unwrap_or_default();
+    // Première page seulement : cet apport n'a pas d'ordre qui pagine, le
+    // servir à chaque page rendrait les mêmes pistes page après page.
+    let meta_matches = if offset > 0 {
+        Vec::new()
+    } else {
+        meta_repo.search_by_value(&q.q, limit).unwrap_or_default()
+    };
 
     // Collect track IDs already returned by FTS
     let fts_track_ids: std::collections::HashSet<i64> =
@@ -138,6 +198,7 @@ pub(super) async fn search(
     // UN SEUL appel pour toute la page — les deux moitiés (FTS et
     // métadonnées) sont concaténées d'abord —, donc DEUX requêtes indexées
     // par page, et zéro sur une page vide. Pas une par piste.
+    let n_extra = extra_tracks.len();
     let toutes: Vec<tune_core::db::models::Track> =
         tracks.into_iter().chain(extra_tracks).collect();
     let mut track_results = super::tracks::joindre_dr_par_piste(&state, toutes);
@@ -162,6 +223,25 @@ pub(super) async fn search(
         "albums": albums,
         "labels": labels,
         "tracks": track_results,
+        // #4663 — ce que la liste ne disait pas (contrat de `/search`, #3189).
+        "totals": {
+            "artists": total_artists,
+            "albums": total_albums,
+            "tracks": total_tracks,
+            "tracks_via_metadata": n_extra,
+        },
+        "totals_capped": {
+            "artists": total_artists >= plafond,
+            "albums": total_albums >= plafond,
+            "tracks": total_tracks >= plafond,
+        },
+        "has_more": {
+            "artists": a_la_suite(n_artists, total_artists),
+            "albums": a_la_suite(n_albums, total_albums),
+            "tracks": a_la_suite(n_tracks, total_tracks),
+        },
+        "limit": limit,
+        "offset": offset,
     }))
 }
 
@@ -566,5 +646,72 @@ mod acoustic_reports_4187 {
         assert_eq!(body["eligible_tracks"], 2);
         assert_eq!(body["pending_tracks"], 1);
         assert_eq!(body["waiting_reason"], Value::Null);
+    }
+}
+
+#[cfg(test)]
+mod totaux_4663 {
+    use super::*;
+    use tune_core::db::models::Track;
+
+    /// 45 pistes « Autumn Leaves », et l'écran en demande 40 (`SearchV2`).
+    fn etat_45_pistes() -> AppState {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let repo = TrackRepo::with_backend(state.backend.clone());
+        for i in 0..45 {
+            repo.create(&Track::new(format!("Autumn Leaves {i}")))
+                .unwrap();
+        }
+        repo.create(&Track::new("Blue in Green".into())).unwrap();
+        state
+    }
+
+    async fn appeler(state: &AppState, requete: &str) -> Value {
+        let uri: axum::http::Uri = format!("/library/search?{requete}").parse().unwrap();
+        let q = Query::<SearchQuery>::try_from_uri(&uri).unwrap();
+        let Json(corps) = search(State(state.clone()), q).await;
+        corps
+    }
+
+    /// 🔴 #4663 — jfpaquet, fil 1878 : « Résultat : 40 » pour 119. La route
+    /// rendait 40 lignes et RIEN d'autre ; le client ne pouvait pas dire que
+    /// la liste était coupée.
+    #[tokio::test]
+    async fn la_route_dit_combien_il_y_en_a_et_qu_il_en_reste() {
+        let state = etat_45_pistes();
+        let corps = appeler(&state, "q=autumn%20leaves&limit=40").await;
+        assert_eq!(corps["tracks"].as_array().unwrap().len(), 40);
+        assert_eq!(
+            corps["totals"]["tracks"], 45,
+            "la route ne dit pas le nombre de correspondances (#4663) : {}",
+            corps["totals"]
+        );
+        assert_eq!(corps["has_more"]["tracks"], true);
+        assert_eq!(corps["totals_capped"]["tracks"], false);
+        assert_eq!(corps["offset"], 0);
+    }
+
+    /// La suite se demande par `?offset=` et ne redonne rien de la page 1.
+    #[tokio::test]
+    async fn la_suite_se_demande_par_offset_sans_doublon() {
+        let state = etat_45_pistes();
+        let p1 = appeler(&state, "q=autumn%20leaves&limit=40").await;
+        let p2 = appeler(&state, "q=autumn%20leaves&limit=40&offset=40").await;
+        let ids = |v: &Value| -> Vec<i64> {
+            v["tracks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["id"].as_i64())
+                .collect()
+        };
+        let (a, b) = (ids(&p1), ids(&p2));
+        assert_eq!(b.len(), 5);
+        assert!(
+            b.iter().all(|id| !a.contains(id)),
+            "la page 2 redonne la page 1"
+        );
+        assert_eq!(p2["has_more"]["tracks"], false);
+        assert_eq!(p2["offset"], 40);
     }
 }

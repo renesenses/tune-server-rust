@@ -83,7 +83,7 @@ use tune_core::streaming::traits::{
 
 use crate::{
     BC_SEARCH_API, EchecLiaison, album_depuis_url, chercher_une_categorie, compte_lie,
-    delier_compte, lier_compte, page_de_collection, pochette,
+    delier_compte, discographie_depuis_url, lier_compte, page_de_collection, pochette,
 };
 
 /// Le jeton de première page de la collection — même convention que le greffon.
@@ -261,6 +261,37 @@ pub(crate) fn albums_de_recherche(resultats: &[Value]) -> Vec<StreamAlbum> {
                 artist: r["artiste"].as_str().unwrap_or_default().to_string(),
                 artist_id: None,
                 cover_path: r["pochette"].as_str().map(str::to_string),
+                year: None,
+                track_count: 0,
+                released_at: None,
+                quality: Some(qualite_bandcamp()),
+            })
+        })
+        .collect()
+}
+
+/// La discographie publique d'un artiste, telle que le registre l'attend — #4579.
+///
+/// Prend la sortie de [`crate::extraire_discographie`], le MÊME lecteur que
+/// `GET /ext/bandcamp/artist?url=…`. Chaque album porte pour `id` son adresse
+/// complète (album ou piste isolée) : [`BandcampService::get_album_tracks`]
+/// sait la rouvrir, la vignette est donc JOUABLE.
+///
+/// `artist_id` = la racine de la page : c'est l'identifiant que la recherche
+/// rend pour cet artiste (`artistes_de_recherche`), celui que la fiche artiste
+/// du client compare pour ranger un album dans la discographie (#4651). Le nom
+/// n'est pas sur la grille `/music` : il reste vide plutôt qu'inventé.
+pub(crate) fn albums_de_discographie(racine: &str, entrees: &[Value]) -> Vec<StreamAlbum> {
+    entrees
+        .iter()
+        .filter_map(|e| {
+            let url = e["url"].as_str()?;
+            Some(StreamAlbum {
+                id: url.to_string(),
+                title: e["titre"].as_str().unwrap_or_default().to_string(),
+                artist: String::new(),
+                artist_id: Some(racine.to_string()),
+                cover_path: e["pochette"].as_str().map(str::to_string),
                 year: None,
                 track_count: 0,
                 released_at: None,
@@ -465,6 +496,24 @@ impl StreamingService for BandcampService {
             image_path: None,
             bio: None,
         })
+    }
+
+    /// 🔴 #4579 — la discographie d'un artiste Bandcamp.
+    ///
+    /// FabienM, fil 1862 : « Dans la page artiste, il manque les albums issus
+    /// de Bandcamp » — Soda Blonde, 21 albums, aucun de Bandcamp. Sans cette
+    /// méthode, le repli du trait rendait `Ok(vec![])` : mesuré sur le .18 le
+    /// 22/09/2026, `/streaming/bandcamp/artists/https%3A%2F%2Fagnesobel.bandcamp.com/albums`
+    /// → `200 []`, quand `/ext/bandcamp/artist?url=` rend trois albums pour
+    /// la même adresse. La page artiste du client interroge la première route.
+    ///
+    /// Un échec d'amont remonte en erreur : « le service a répondu et n'a
+    /// rien » et « le service n'a pas répondu » ne se disent pas pareil.
+    async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
+        let (racine, entrees) = discographie_depuis_url(artist_id)
+            .await
+            .map_err(echec_album)?;
+        Ok(albums_de_discographie(&racine, &entrees))
     }
 
     async fn get_playlist(&self, _playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
@@ -885,6 +934,50 @@ mod tests {
         assert!(
             matches!(erreur, TuneError::Unsupported(_)),
             "un refus delibere n'est pas une panne d'amont : {erreur:?}"
+        );
+    }
+
+    /// 🔴 #4579 — la méthode n'est plus le repli muet du trait : une adresse
+    /// qui n'est pas une page Bandcamp est REFUSÉE, sans réseau, au lieu de
+    /// rendre une discographie vide. Avec le repli, ce test est rouge
+    /// (`Ok([])`).
+    #[tokio::test]
+    async fn la_discographie_d_un_artiste_n_est_plus_le_repli_vide_du_trait() {
+        let svc = service_de_test();
+        let r = svc.get_artist_albums("pas-une-adresse").await;
+        assert!(
+            r.is_err(),
+            "get_artist_albums rend encore le repli vide du trait : {r:?}"
+        );
+    }
+
+    /// #4579 — la grille `/music` donne des albums jouables, rattachés à
+    /// l'identifiant d'artiste que rend la recherche.
+    #[test]
+    fn la_grille_music_donne_des_albums_jouables_rattaches_a_l_artiste() {
+        let page = r#"<ol id="music-grid" class="music-grid">
+          <li data-item-id="album-1" class="music-grid-item"><a href="/album/small-talk">
+            <div class="art"><img src="https://f4.bcbits.com/img/a1_2.jpg" alt=""></div>
+            <p class="title">Small Talk</p></a></li>
+          <li data-item-id="track-2" class="music-grid-item"><a href="/track/my-violence">
+            <div class="art"><img src="https://f4.bcbits.com/img/a2_2.jpg" alt=""></div>
+            <p class="title">My Violence</p></a></li>
+        </ol>"#;
+        let racine = "https://sodablonde.bandcamp.com";
+        let albums = albums_de_discographie(racine, &crate::extraire_discographie(page, racine));
+        let ids: Vec<&str> = albums.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "https://sodablonde.bandcamp.com/album/small-talk",
+                "https://sodablonde.bandcamp.com/track/my-violence",
+            ]
+        );
+        assert_eq!(albums[0].title, "Small Talk");
+        assert_eq!(albums[0].artist_id.as_deref(), Some(racine));
+        assert_eq!(
+            albums[1].cover_path.as_deref(),
+            Some("https://f4.bcbits.com/img/a2_2.jpg")
         );
     }
 

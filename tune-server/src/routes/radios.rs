@@ -16,7 +16,17 @@ use tune_core::http::streamer::AudioStreamer;
 
 use crate::error::AppError;
 use crate::routes::active_profile::DEFAULT_PROFILE_ID;
+use crate::routes::radios_libelles;
 use crate::state::AppState;
+
+/// Une station sérialisée, enrichie de ses repères stables dans la langue de
+/// la requête. Toutes les routes qui rendent UNE station passent par ici : un
+/// point de sortie oublié est exactement le défaut corrigé ici.
+fn station_localisee(station: &RadioStation, headers: &HeaderMap) -> Value {
+    let mut corps = json!(station);
+    radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(headers));
+    corps
+}
 
 // ---------------------------------------------------------------------------
 // Validation de l'adresse d'un flux, À LA SAISIE
@@ -593,6 +603,9 @@ pub(crate) fn corps_recherche(issue: &IssueRecherche, items: &[RadioStation], la
         "items": items,
         "message": issue.message(lang),
     });
+    // Les stations rendues par la recherche portent les mêmes repères stables
+    // que celles de `GET /radios` : `country_code`, `genre_key`, `genre_label`.
+    radios_libelles::enrichir(&mut corps["items"], lang);
     if let IssueRecherche::Echec(detail) = issue {
         // La cause technique, pour le journal et le rapport de bogue — jamais
         // pour l'écran : le message traduit est là pour ça.
@@ -946,6 +959,7 @@ struct ListRadiosQuery {
 }
 
 async fn list_radios(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Query(q): Query<ListRadiosQuery>,
 ) -> Json<Value> {
@@ -957,13 +971,19 @@ async fn list_radios(
     } else {
         repo.list().unwrap_or_default()
     };
-    Json(json!(items))
+    let mut corps = json!(items);
+    radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(&headers));
+    Json(corps)
 }
 
-async fn get_radio(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+async fn get_radio(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
     let repo = RadioRepo::with_backend(state.backend.clone());
     match repo.get(id) {
-        Ok(Some(r)) => Json(json!(r)).into_response(),
+        Ok(Some(r)) => Json(station_localisee(&r, &headers)).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1037,7 +1057,11 @@ async fn create_radio(
                 id: Some(id),
                 ..station
             });
-            (StatusCode::CREATED, Json(json!(created))).into_response()
+            (
+                StatusCode::CREATED,
+                Json(station_localisee(&created, &headers)),
+            )
+                .into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1156,7 +1180,7 @@ async fn update_radio(
                 "library.radios_changed",
                 json!({"action": "updated", "id": id}),
             );
-            Json(json!(station)).into_response()
+            Json(station_localisee(&station, &headers)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -1259,10 +1283,12 @@ async fn search_radios(
         .into_response()
 }
 
-async fn list_favorites(State(state): State<AppState>) -> Json<Value> {
+async fn list_favorites(headers: HeaderMap, State(state): State<AppState>) -> Json<Value> {
     let repo = RadioRepo::with_backend(state.backend.clone());
     let items = repo.favorites().unwrap_or_default();
-    Json(json!(items))
+    let mut corps = json!(items);
+    radios_libelles::enrichir(&mut corps, &crate::i18n::lang_from_header(&headers));
+    Json(corps)
 }
 
 #[derive(Deserialize)]
@@ -1453,6 +1479,7 @@ async fn toggle_favorite(
 // ---------------------------------------------------------------------------
 
 async fn set_radio_artwork(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(id): Path<i64>,
     mut multipart: axum::extract::Multipart,
@@ -1506,7 +1533,7 @@ async fn set_radio_artwork(
 
     radio.logo_url = Some(hash.clone());
     repo.update(&radio).ok();
-    Json(json!(radio)).into_response()
+    Json(station_localisee(&radio, &headers)).into_response()
 }
 
 async fn export_radios_m3u(State(state): State<AppState>) -> impl IntoResponse {

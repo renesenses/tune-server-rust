@@ -49,6 +49,8 @@ async fn le_geste_album_qobuz_donne_la_fiche_qobuz() {
             Some("album".into()),
             Some("0060254735822".into()),
             Some("qobuz".into()),
+            None,
+            None,
         )
         .await;
 
@@ -77,6 +79,8 @@ async fn l_alias_anglais_repond_la_meme_chose() {
             Some("album".into()),
             Some("0060254735822".into()),
             Some("qobuz".into()),
+            None,
+            None,
         )
         .await;
 
@@ -98,6 +102,8 @@ async fn un_album_local_sort_avec_le_chemin_de_bibliotheque() {
             Some("album".into()),
             Some("42".into()),
             Some("local".into()),
+            None,
+            None,
         )
         .await;
 
@@ -162,6 +168,8 @@ async fn un_geste_de_piste_n_est_pas_un_album() {
             Some("track".into()),
             Some("143276534".into()),
             Some("qobuz".into()),
+            None,
+            None,
         )
         .await;
 

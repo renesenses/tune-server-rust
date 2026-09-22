@@ -32,14 +32,40 @@ on:
         description: "Diagnostic seul — n'ouvre aucune issue"
         type: boolean
         default: false
+  pull_request:
+    paths:
+      - ".github/scripts/notes-de-version-watch.sh"
+      - "scripts/test-notes-de-version-watch.sh"
+      - ".github/workflows/notes-de-version-watch.yml"
 
 permissions:
   contents: read
   issues: write
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # La contre-épreuve (#4461). Le périmètre de la sonde — les versions de Tune,
+  # pas les releases du moissonneur Roon — est une règle qu'on ne voit pas
+  # tenir : elle se démontre en regardant la sonde se taire sur un tag
+  # `moissonneur-*` ET rougir, dans le même décor, sur un `v0.9.x` sans fil.
+  # Sans cette seconde moitié, un filtre trop large passerait pour un succès.
+  # ───────────────────────────────────────────────────────────────────────────
+  contre-epreuve:
+    name: Contre-épreuve du périmètre
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rejouer le décor du 20/09/2026
+        run: bash scripts/test-notes-de-version-watch.sh
+
   veille:
     name: Versions publiees sans note de version
+    # Sur une PR, seule la contre-épreuve a un sens : le forum réel n'a pas
+    # changé, et une lacune préexistante ferait échouer une PR qui n'y est pour
+    # rien. La veille garde ses déclencheurs d'origine.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

@@ -100,7 +100,7 @@ fn preference_de_qualite(
         .unwrap_or_default()
 }
 
-/// Ce que l'auditeur avait demandé, et où il en était — les trois champs que
+/// Ce que l'auditeur avait demandé, et où il en était — les champs que
 /// « Continuer l'écoute » a besoin de retrouver pour ROUVRIR cet objet à la
 /// bonne place (#2441, FabienM fil 1557).
 ///
@@ -123,6 +123,26 @@ pub struct ContexteEcoute<'a> {
     /// Le rang de la piste dans cet objet. `None` en lecture ALÉATOIRE : voir
     /// `rang_a_retenir`.
     pub rang: Option<i64>,
+    /// L'ESPACE DE NOMS de `id` : `local`, `qobuz`, `tidal`… Sans lui, `id`
+    /// est un nombre nu que rien ne rattache à un référentiel, et deux objets
+    /// sans rapport portant le même nombre se confondent.
+    ///
+    /// À ne PAS confondre avec le `source` de la ligne d'historique, qui est
+    /// celui de la PISTE qui a joué : une playlist Qobuz peut contenir un
+    /// morceau de la bibliothèque, et ses lignes portent alors `local` sans
+    /// que la playlist ait changé d'espace de noms. Mesuré sur le .18 le
+    /// 20/09/2026 : la playlist Qobuz `66898771` a 18 lignes `qobuz` et
+    /// 3 lignes `local`.
+    pub service: Option<&'a str>,
+    /// Le NOM de cet objet, tel que le service l'a donné au moment du clic.
+    ///
+    /// Le nom d'une playlist de service n'est écrit NULLE PART dans cette
+    /// base : sans cette trace, aucun client ne peut la nommer sans
+    /// ré-interroger le service vignette par vignette (#3425). Il est donc
+    /// relevé une fois, à la lecture, là où le serveur tient déjà la playlist.
+    pub titre: Option<&'a str>,
+    /// La POCHETTE de cet objet, pour la même raison que `titre`.
+    pub pochette: Option<&'a str>,
 }
 
 mod regles;
@@ -882,6 +902,11 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
+    /// #4598 — l'énumération du parc local menée à la demande, sur le seul
+    /// chemin du refus d'une zone locale (`gate_or_rebind_offline_zone`).
+    /// Un champ et non un appel direct : les témoins y substituent un parc
+    /// connu, faute de périphérique réel sur la machine qui les exécute.
+    pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1182,6 +1207,7 @@ impl PlaybackOrchestrator {
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
         }
     }
 
@@ -1243,6 +1269,8 @@ impl PlaybackOrchestrator {
 
 mod commun;
 
+/// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
+mod reenumeration_avant_refus;
 mod transport;
 // #2269 — le repli silencieux de la sortie locale, rendu audible.
 #[cfg(feature = "local-audio")]
@@ -1271,6 +1299,11 @@ mod history;
 
 mod bandcamp;
 pub use bandcamp::*;
+
+/// Ce qu'on ANNONCE au renderer pour une piste de serveur média : le MIME ne
+/// se devine plus dans la seule URL, qui pour un `<res>` de Tune ne porte
+/// aucune extension — et un `DLNA.ORG_PN=MP3` faux fait jouer du silence.
+mod mime_upnp;
 
 /// Arm a one-shot diagnostic for a stream URL handed to a local output.
 ///

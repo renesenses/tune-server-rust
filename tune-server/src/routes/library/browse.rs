@@ -349,14 +349,20 @@ pub(super) async fn browse_directory(
     let sep_txt = std::path::MAIN_SEPARATOR.to_string();
     let depart_enfant =
         repertoire_nfc.trim_end_matches(['/', '\\']).chars().count() + sep_txt.chars().count() + 1;
+    // #4625 — les pistes découpées par une feuille CUE (`file_path` NULL, le
+    // fichier dans `cue_media_path`) sont des enfants du dossier comme les
+    // autres : sans le `COALESCE`, un album CUE s'ouvrait sur une liste vide.
+    // La colonne 16 porte ce chemin pour `est_enfant_direct` ; `file_path`
+    // reste publié tel qu'en base (NULL pour une tranche CUE).
     let sql = format!(
         "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
                t.disc_number, t.track_number, t.duration_ms, t.file_path, \
-               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path \
+               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path, \
+               COALESCE(t.file_path, t.cue_media_path) \
                FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
                LEFT JOIN artists ar ON t.artist_id = ar.id \
-               WHERE t.file_path LIKE {ph}{esc} \
-               AND {pos}(substr(t.file_path, {depart_enfant}), {ph2}) = 0 \
+               WHERE COALESCE(t.file_path, t.cue_media_path) LIKE {ph}{esc} \
+               AND {pos}(substr(COALESCE(t.file_path, t.cue_media_path), {depart_enfant}), {ph2}) = 0 \
                ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
         esc = tune_core::db::track_repo::like_escape_clause()
     );
@@ -374,9 +380,10 @@ pub(super) async fn browse_directory(
         .iter()
         .filter_map(|cols| {
             let file_path = cols.get(9).and_then(|v| v.as_string());
-            let is_direct = file_path
-                .as_ref()
-                .map(|fp| est_enfant_direct(fp, &repertoire_nfc))
+            let is_direct = cols
+                .get(16)
+                .and_then(|v| v.as_string())
+                .map(|chemin| est_enfant_direct(&chemin, &repertoire_nfc))
                 .unwrap_or(false);
             if !is_direct {
                 return None;

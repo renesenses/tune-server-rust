@@ -421,8 +421,18 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
         .filter_map(|cols| {
             let nature = cols.first().and_then(|v| v.as_string())?;
             let id = cols.get(1).and_then(|v| v.as_string())?;
-            vues.insert((nature.clone(), id.clone()))
-                .then_some((nature, id, cols))
+            // L'ESPACE DE NOMS de `id`, ecrit depuis la migration 105. Deux
+            // objets sans rapport peuvent porter le meme nombre chez deux
+            // services : sans lui, ils ne font qu'une vignette. `None` sur
+            // une ligne plus ancienne — inconnu, pas « local ».
+            //
+            // Ce n'est PAS la colonne `source` (indice 9) : celle-la est
+            // celle de la PISTE qui a joue. Mesure du 20/09/2026 sur le .18 :
+            // la playlist Qobuz `66898771` porte 3 lignes `source = 'local'`
+            // sur 21, pour trois titres de la bibliotheque qu'elle contient.
+            let espace = cols.get(10).and_then(|v| v.as_string());
+            vues.insert((nature.clone(), id.clone(), espace.clone()))
+                .then_some((nature, id, espace, cols))
         })
         .collect();
 
@@ -431,7 +441,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
     let artistes = resoudre_par_id(state, &brut, "artist", "artists");
 
     brut.into_iter()
-        .filter_map(|(nature, id, cols)| {
+        .filter_map(|(nature, id, espace, cols)| {
             let dernier = cols.get(2).and_then(|v| v.as_string()).unwrap_or_default();
             let rang = cols.get(3).and_then(|v| v.as_i64());
             let titre_piste = cols.get(4).and_then(|v| v.as_string()).unwrap_or_default();
@@ -443,6 +453,20 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                 .get(9)
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "local".into());
+            let titre_contexte = cols.get(11).and_then(|v| v.as_string());
+            let pochette_contexte = cols.get(12).and_then(|v| v.as_string());
+            // CHEZ QUI cette vignette s'ouvre. L'espace de noms de l'objet
+            // demande quand il est ecrit ; a defaut — lignes d'avant la
+            // migration 105 — la source de la piste, qui est ce que cette
+            // section publiait deja. On ne reconstitue pas le passe, on
+            // arrete de le deviner pour l'avenir.
+            let service = espace.clone().unwrap_or_else(|| source.clone());
+            // Un identifiant ne se resout dans les tables de CETTE base que
+            // s'il en vient. `66898771` est une playlist Qobuz : le chercher
+            // dans `playlists` ou `albums` est ce qui produit une vignette
+            // etrangere a ce qui a ete ecoute. `None` (ligne ancienne) garde
+            // l'ancien comportement : son espace est inconnu, pas distant.
+            let bibliotheque = est_de_la_bibliotheque(espace.as_deref());
 
             // Socle commun : ce que TOUTES les natures portent. Les champs
             // d'album restent presents et nuls hors album — les clients
@@ -452,7 +476,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                 "context_type": nature,
                 "context_id": id,
                 "position": rang,
-                "source": source,
+                "source": service,
                 "id": album_id.unwrap_or(0),
                 "album_id": album_id,
                 "artist_name": artiste,
@@ -476,7 +500,7 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     // viennent de la bibliotheque. C'est la SEULE nature ou le
                     // filtre « pas encore fini » s'applique — un disque termine
                     // n'a plus rien a « continuer ».
-                    if let Some(a) = albums.get(&id) {
+                    if let Some(a) = albums.get(&id).filter(|_| bibliotheque) {
                         if let (Some(lus), Some(total)) = (a.listened_tracks, a.track_count) {
                             if total > 0 && lus >= total {
                                 return None;
@@ -519,9 +543,23 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     // `context_id` et sa `source`, a charge du client de la
                     // nommer. Mieux qu'un titre de piste presente pour un nom
                     // de playlist.
-                    let nom = playlists.get(&id);
+                    let nom = playlists
+                        .get(&id)
+                        .filter(|_| bibliotheque)
+                        .cloned()
+                        // Le nom releve chez le service au clic (migration
+                        // 105). C'est ce que l'auditeur a REELLEMENT lance :
+                        // il prime sur tout repli, et il est la seule chose
+                        // qui nomme une playlist de service.
+                        .or_else(|| titre_contexte.clone());
                     o.insert("title".into(), json!(nom));
                     o.insert("album_id".into(), Value::Null);
+                    // La pochette de la playlist elle-meme, quand le service
+                    // l'a donnee : sinon la vignette garde celle de la
+                    // derniere piste, qui est une pochette d'ALBUM.
+                    if let Some(p) = pochette_contexte.clone() {
+                        o.insert("cover_path".into(), json!(p));
+                    }
                     // 🔴 #3425 — la vignette muette.
                     //
                     // Le raisonnement ci-dessus tient : un titre de piste
@@ -552,11 +590,31 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     if nom.is_some() {
                         o.insert("album_title".into(), Value::Null);
                     }
+                    // 🔴 20/09/2026, Alex Campbell — « the playlist does not
+                    // represent the first song or any song played with any
+                    // audio ».
+                    //
+                    // Le raisonnement de #3425 n'est pas renverse : un
+                    // libelle d'album vaut toujours mieux qu'une vignette
+                    // MUETTE, et il reste le repli des lignes qui n'ont pas
+                    // de nom de contexte. Ce qui change, c'est qu'il n'est
+                    // plus le SEUL recours : depuis la migration 105 le nom de
+                    // la playlist de service est ecrit au moment du clic, et
+                    // `nom` ci-dessus le rend. Le repli redevient ce qu'il
+                    // aurait toujours du etre — un filet pour l'historique
+                    // d'avant, pas le libelle ordinaire.
+                    //
+                    // Mesure du 20/09/2026 sur le .18 : 16 vignettes de
+                    // playlist sur 16 tombaient dans ce repli.
                 }
                 "artist" => {
                     // L'artiste demande, pas celui de la derniere piste jouee :
                     // sur une compilation ils different.
-                    let nom = artistes.get(&id).cloned().or(artiste);
+                    let nom = artistes
+                        .get(&id)
+                        .filter(|_| bibliotheque)
+                        .cloned()
+                        .or(artiste);
                     o.insert("title".into(), json!(nom.clone()));
                     o.insert("artist_name".into(), json!(nom));
                     o.insert("album_id".into(), Value::Null);
@@ -582,6 +640,17 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
         .collect()
 }
 
+/// Cet identifiant vient-il des tables de CETTE base ?
+///
+/// `Some("local")` : oui. `Some(<service>)` : non — `66898771` est une
+/// playlist Qobuz, et la chercher dans `playlists` ou `albums` produit une
+/// vignette etrangere a ce qui a ete ecoute. `None` : ligne d'avant la
+/// migration 105, dont l'espace de noms n'a jamais ete ecrit — on garde alors
+/// le comportement d'avant plutot que de vider retroactivement la section.
+fn est_de_la_bibliotheque(espace: Option<&str>) -> bool {
+    espace.is_none_or(|e| e == "local")
+}
+
 /// Ce qu'un album de la bibliotheque apporte a une entree, une fois resolu.
 struct AlbumResolu {
     id: i64,
@@ -603,12 +672,18 @@ struct AlbumResolu {
 /// filtre de zone juste au-dessus.
 fn resoudre_albums(
     state: &AppState,
-    brut: &[(String, String, &Vec<tune_core::db::backend::SqlValue>)],
+    brut: &[(
+        String,
+        String,
+        Option<String>,
+        &Vec<tune_core::db::backend::SqlValue>,
+    )],
 ) -> std::collections::HashMap<String, AlbumResolu> {
     let ids: Vec<i64> = brut
         .iter()
-        .filter(|(nature, _, _)| nature == "album")
-        .filter_map(|(_, id, _)| id.parse::<i64>().ok())
+        .filter(|(nature, _, _, _)| nature == "album")
+        .filter(|(_, _, espace, _)| est_de_la_bibliotheque(espace.as_deref()))
+        .filter_map(|(_, id, _, _)| id.parse::<i64>().ok())
         .collect();
     if ids.is_empty() {
         return std::collections::HashMap::new();
@@ -651,14 +726,20 @@ fn resoudre_albums(
 /// requete : il n'a rien a y trouver.
 fn resoudre_par_id(
     state: &AppState,
-    brut: &[(String, String, &Vec<tune_core::db::backend::SqlValue>)],
+    brut: &[(
+        String,
+        String,
+        Option<String>,
+        &Vec<tune_core::db::backend::SqlValue>,
+    )],
     nature: &str,
     table: &str,
 ) -> std::collections::HashMap<String, String> {
     let ids: Vec<i64> = brut
         .iter()
-        .filter(|(n, _, _)| n == nature)
-        .filter_map(|(_, id, _)| id.parse::<i64>().ok())
+        .filter(|(n, _, _, _)| n == nature)
+        .filter(|(_, _, espace, _)| est_de_la_bibliotheque(espace.as_deref()))
+        .filter_map(|(_, id, _, _)| id.parse::<i64>().ok())
         .collect();
     if ids.is_empty() {
         return std::collections::HashMap::new();
@@ -2876,5 +2957,287 @@ mod tests_2441_progression {
         let attendu = vec![format!("album:{album}"), format!("playlist:{playlist}")];
         assert_eq!(lire(), attendu, "l'ordre doit etre celui du departage");
         assert_eq!(lire(), attendu, "et il doit etre le meme a chaque appel");
+    }
+}
+
+/// « Reprendre l'ecoute » designait un objet qu'on n'avait pas ecoute.
+///
+/// # Le defaut photographie (Alex Campbell, 20/09/2026)
+///
+/// Apres avoir lance une playlist Qobuz, la rangee montrait une carte « sans
+/// rapport » — une pochette et un titre d'album qui ne sont « ni la premiere
+/// piste de la playlist, ni aucune piste ayant joue ». Trois causes
+/// distinctes, toutes mesurees le 20/09/2026 sur le .18 :
+///
+/// 1. le NOM de la playlist n'existait dans aucune table, donc `title` restait
+///    nul et le client repliait sur `album_title`, celui de la derniere piste
+///    jouee. `GET /home/continue-listening?limit=200` : **16 vignettes de
+///    playlist sur 16** dans ce cas ;
+/// 2. `context_id` etait resolu dans les tables LOCALES sans regarder d'ou il
+///    venait — un identifiant de service peut y designer un autre objet ;
+/// 3. deux contextes d'espaces de noms differents portant le meme identifiant
+///    se confondaient en une seule vignette.
+///
+/// Les lignes SANS `context_source` (tout l'historique d'avant la migration
+/// 105) gardent exactement le comportement d'avant : c'est `mod
+/// tests_contextes` ci-dessus, dont aucune ecoute n'ecrit cette colonne, qui
+/// en fait foi.
+#[cfg(test)]
+mod tests_contexte_de_service {
+    use super::*;
+
+    /// Une ecoute qui dit AUSSI d'ou vient l'objet demande, et comment il
+    /// s'appelle — ce que la migration 105 a rendu possible.
+    #[allow(clippy::too_many_arguments)]
+    fn ecoute_de_service(
+        state: &AppState,
+        titre: &str,
+        album: &str,
+        source_piste: &str,
+        nature: &str,
+        contexte_id: &str,
+        espace: &str,
+        titre_contexte: Option<&str>,
+        pochette_contexte: Option<&str>,
+        quand: &str,
+    ) {
+        state
+            .backend
+            .execute(
+                "INSERT INTO listen_history \
+                 (title, artist_name, album_title, cover_url, source, \
+                  context_type, context_id, context_source, context_title, \
+                  context_cover, context_position, listened_at) \
+                 VALUES (?1, 'Earth, Wind & Fire', ?2, 'pochette-album', ?3, \
+                         ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+                &[
+                    &titre as &dyn ToSqlValue,
+                    &album as &dyn ToSqlValue,
+                    &source_piste as &dyn ToSqlValue,
+                    &nature as &dyn ToSqlValue,
+                    &contexte_id as &dyn ToSqlValue,
+                    &espace as &dyn ToSqlValue,
+                    &titre_contexte as &dyn ToSqlValue,
+                    &pochette_contexte as &dyn ToSqlValue,
+                    &quand as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// Le defaut d'Alex Campbell, en une assertion : la carte doit porter le
+    /// nom de la PLAYLIST, pas celui de l'album de la derniere piste.
+    ///
+    /// TEMOIN ROUGE avant le correctif : `title` = `null` et `album_title` =
+    /// « The Best Of Earth, Wind & Fire Vol. 1 ».
+    #[test]
+    fn la_carte_d_une_playlist_de_service_porte_le_nom_de_la_playlist() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_de_service(
+            &state,
+            "September",
+            "The Best Of Earth, Wind & Fire Vol. 1",
+            "qobuz",
+            "playlist",
+            "66898771",
+            "qobuz",
+            Some("Les indispensables"),
+            Some("pochette-playlist"),
+            "2026-09-19T14:04:57Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "vignettes rendues : {items:?}");
+        assert_eq!(
+            items[0]["title"].as_str(),
+            Some("Les indispensables"),
+            "la carte doit nommer la playlist ecoutee, pas un album : {items:?}"
+        );
+        assert!(
+            items[0]["album_title"].is_null(),
+            "un second libelle concurrent — celui d'un album qu'on n'a pas \
+             demande — ne doit plus accompagner le nom : {items:?}"
+        );
+        assert_eq!(
+            items[0]["cover_path"].as_str(),
+            Some("pochette-playlist"),
+            "la pochette doit etre celle de la playlist : {items:?}"
+        );
+    }
+
+    /// #3425 tient toujours pour ce qu'il visait : sans nom de contexte — une
+    /// ligne d'avant la migration 105 — le libelle d'album reste, parce qu'une
+    /// vignette MUETTE est pire.
+    #[test]
+    fn sans_nom_de_contexte_le_libelle_d_album_reste_le_repli() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_de_service(
+            &state,
+            "September",
+            "The Best Of Earth, Wind & Fire Vol. 1",
+            "qobuz",
+            "playlist",
+            "66898771",
+            "qobuz",
+            None,
+            None,
+            "2026-09-19T14:04:57Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "vignettes rendues : {items:?}");
+        assert!(items[0]["title"].is_null());
+        assert_eq!(
+            items[0]["album_title"].as_str(),
+            Some("The Best Of Earth, Wind & Fire Vol. 1"),
+            "le repli de #3425 doit survivre : {items:?}"
+        );
+    }
+
+    /// Un identifiant de service resolu dans les tables de CETTE base : la
+    /// carte etrangere, par la seconde porte.
+    ///
+    /// TEMOIN ROUGE avant le correctif : la carte s'appelait « Route de
+    /// nuit », le nom de la playlist LOCALE qui porte le meme nombre.
+    #[test]
+    fn un_identifiant_de_service_ne_se_resout_pas_dans_les_tables_locales() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .backend
+            .execute("INSERT INTO playlists (name) VALUES ('Route de nuit')", &[])
+            .unwrap();
+        let locale = state.backend.last_insert_rowid();
+
+        ecoute_de_service(
+            &state,
+            "September",
+            "The Best Of Earth, Wind & Fire Vol. 1",
+            "qobuz",
+            "playlist",
+            &locale.to_string(),
+            "qobuz",
+            None,
+            None,
+            "2026-09-19T14:04:57Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(items.len(), 1, "vignettes rendues : {items:?}");
+        assert_ne!(
+            items[0]["title"].as_str(),
+            Some("Route de nuit"),
+            "un identifiant Qobuz ne designe pas la playlist locale qui porte \
+             le meme nombre : {items:?}"
+        );
+        assert_eq!(items[0]["source"].as_str(), Some("qobuz"));
+    }
+
+    /// Le meme nombre chez deux services : DEUX objets, donc deux vignettes.
+    ///
+    /// TEMOIN ROUGE avant le correctif : une seule, le regroupement ignorant
+    /// l'espace de noms.
+    #[test]
+    fn deux_espaces_de_noms_ne_font_pas_une_seule_vignette() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_de_service(
+            &state,
+            "September",
+            "Album Qobuz",
+            "qobuz",
+            "playlist",
+            "12345",
+            "qobuz",
+            Some("Playlist Qobuz"),
+            None,
+            "2026-09-19T14:04:57Z",
+        );
+        ecoute_de_service(
+            &state,
+            "Fantasy",
+            "Album Tidal",
+            "tidal",
+            "playlist",
+            "12345",
+            "tidal",
+            Some("Playlist Tidal"),
+            None,
+            "2026-09-19T15:04:57Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(
+            items.len(),
+            2,
+            "deux objets differents, deux vignettes : {items:?}"
+        );
+        let mut noms: Vec<&str> = items.iter().filter_map(|i| i["title"].as_str()).collect();
+        noms.sort_unstable();
+        assert_eq!(noms, vec!["Playlist Qobuz", "Playlist Tidal"]);
+    }
+
+    /// La mesure du .18, telle quelle : la playlist Qobuz `66898771` porte
+    /// 18 lignes `source = 'qobuz'` et 3 lignes `source = 'local'` — trois
+    /// titres de la bibliotheque glisses dans une playlist de service.
+    ///
+    /// Elle reste UNE playlist, et elle s'ouvre chez Qobuz.
+    ///
+    /// TEMOIN ROUGE avant le correctif : `source` valait `local` des que la
+    /// derniere piste ecoutee venait de la bibliotheque — la carte renvoyait
+    /// alors vers une playlist locale `66898771` qui n'existe pas.
+    #[test]
+    fn une_piste_locale_dans_une_playlist_de_service_ne_change_pas_son_espace() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        ecoute_de_service(
+            &state,
+            "September",
+            "The Best Of Earth, Wind & Fire Vol. 1",
+            "qobuz",
+            "playlist",
+            "66898771",
+            "qobuz",
+            Some("Les indispensables"),
+            None,
+            "2026-09-19T12:33:01Z",
+        );
+        ecoute_de_service(
+            &state,
+            "Adele - Easy on Me",
+            "Adele - 30",
+            "local",
+            "playlist",
+            "66898771",
+            "qobuz",
+            Some("Les indispensables"),
+            None,
+            "2026-09-19T14:02:16Z",
+        );
+
+        let Ok(items) = fetch_continue_listening(&state, 10, None) else {
+            panic!("la requete doit repondre")
+        };
+
+        assert_eq!(
+            items.len(),
+            1,
+            "une playlist qui contient un titre local reste UNE playlist : {items:?}"
+        );
+        assert_eq!(
+            items[0]["source"].as_str(),
+            Some("qobuz"),
+            "la vignette s'ouvre chez Qobuz, pas dans la bibliotheque : {items:?}"
+        );
+        assert_eq!(items[0]["title"].as_str(), Some("Les indispensables"));
     }
 }
