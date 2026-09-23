@@ -4473,7 +4473,25 @@ mod conflit_de_protocole_au_demarrage_tests {
 
         // Et le lot poursuit jusqu'à la remise en ligne : l'utilisateur
         // retrouve une zone utilisable.
-        match repo.get_or_create_si_autorise("DMP-A8", Some("dlna"), UUID_DMP_A8, "ssdp_startup") {
+        //
+        // ⚠️ L'étiquette d'origine n'est PAS celle du lot de démarrage, et ce
+        // n'est pas un oubli. `tests/zones_auto_create_recension.rs` recense
+        // les chemins qui créent des zones en COMPTANT le littéral dans la
+        // source — comparaison de texte brut, commentaires compris — et exige
+        // exactement UNE occurrence de l'étiquette du lot dans ce fichier.
+        // C'est ainsi qu'un sixième site ne peut pas s'y glisser sans être vu
+        // (#3529). Cet appel-ci est un essai, pas un chemin de découverte :
+        // lui donner l'étiquette du lot ajouterait une seconde occurrence et
+        // rendrait la recension fausse. Ne pas « corriger » en remettant
+        // l'étiquette du lot, ni en la rangeant dans une constante partagée :
+        // une constante ramènerait le compte à un tout en AVEUGLANT le grep,
+        // ce qui est pire que le rouge.
+        match repo.get_or_create_si_autorise(
+            "DMP-A8",
+            Some("dlna"),
+            UUID_DMP_A8,
+            "essai_rattachement_apres_conflit",
+        ) {
             Ok(CreationDeZone::Existante(id)) => assert_eq!(id, dlna),
             autre => panic!("rattachement attendu, obtenu {autre:?}"),
         }
