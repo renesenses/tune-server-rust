@@ -460,9 +460,20 @@ pub(super) async fn artist_metadata(
     }
 }
 
+/// Paramètres de `GET /library/artists/{id}/albums`.
+#[derive(Deserialize)]
+pub(super) struct ArtistAlbumsQuery {
+    /// `sections=1` : rendre l'objet à sections de #4767 au lieu du tableau
+    /// nu. La valeur par défaut garde le tableau : la route est lue par le
+    /// client web, les clients natifs et le serveur média, et changer la
+    /// forme pour tout le monde casserait ce qui marche.
+    sections: Option<String>,
+}
+
 pub(super) async fn artist_albums(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(q): Query<ArtistAlbumsQuery>,
 ) -> Json<Value> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let mut items = repo.list_by_artist(id).unwrap_or_default();
@@ -470,7 +481,41 @@ pub(super) async fn artist_albums(
     // 16/09/2026) ; `select_album()` ne porte pas la colonne.
     repo.attacher_added_at(&mut items);
     let items: Vec<Value> = items.iter().map(|a| a.to_json()).collect();
-    Json(json!(items))
+
+    // Même lecture du drapeau que `proposals.rs` et `reports.rs`.
+    if !q
+        .sections
+        .as_deref()
+        .is_some_and(|v| v == "true" || v == "1")
+    {
+        return Json(json!(items));
+    }
+
+    // #4767 — deux sections de plus, à partir de l'artiste de CHAQUE piste.
+    // Une section vide est ABSENTE de la réponse : le client ne doit jamais
+    // avoir à décider s'il affiche un titre au-dessus de rien.
+    let mut reponse = json!({ "albums": items });
+    let obj = reponse.as_object_mut().expect("objet");
+    for (cle, albums) in [
+        (
+            "compilations",
+            repo.list_compilations_with_artist_track(id)
+                .unwrap_or_default(),
+        ),
+        (
+            "appearances",
+            repo.list_appearances_of_artist(id).unwrap_or_default(),
+        ),
+    ] {
+        if albums.is_empty() {
+            continue;
+        }
+        let mut albums = albums;
+        repo.attacher_added_at(&mut albums);
+        let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
+        obj.insert(cle.to_string(), json!(albums));
+    }
+    Json(reponse)
 }
 
 pub(super) async fn artist_tracks(
