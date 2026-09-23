@@ -352,6 +352,10 @@ impl PasseDr {
                 continue;
             }
             if any_zone_playing(&backend) {
+                // #4681 — au relevé de `/system/background-tasks`.
+                crate::taches_de_fond::priorite::noter_cedee(
+                    crate::taches_de_fond::Tache::PlageDynamique.id(),
+                );
                 self.attendre(Attente::Lecture, &mut sur_avancement);
                 tokio::time::sleep(cadence.report_lecture).await;
                 continue;

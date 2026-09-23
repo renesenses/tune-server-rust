@@ -183,6 +183,13 @@ path = "tests/integration_contracts.rs"
 name = "pause_taches_de_fond"
 path = "tests/pause_taches_de_fond.rs"
 
+# Meme raison : `autotests = false`. Binaire a lui seul : le temoin de lecture
+# des taches de fond est un etat de PROCESSUS ; un voisin qui mettrait une zone
+# en lecture dans le meme binaire rendrait ces temoins intermittents (#4681).
+[[test]]
+name = "priorite_lecture_taches_de_fond"
+path = "tests/priorite_lecture_taches_de_fond.rs"
+
 # `autotests = false` ci-dessus : un fichier posé dans tests/ ne se compile pas
 # tout seul, il faut le déclarer. Cible volontairement minuscule — elle ne tire
 # que tune_core, déjà construit (#2213).

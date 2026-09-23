@@ -103,6 +103,9 @@ fn inscrite(state: &AppState, ids: &[&str]) -> bool {
 /// tâche ajoutée, et l'écran lirait un état sur le `GET` et un autre après son
 /// propre clic.
 pub(crate) fn instantane(state: &AppState) -> Value {
+    // #4681 — la priorité à la lecture : lue UNE fois, pour que chaque carte
+    // et le bloc d'ensemble disent la même chose.
+    let priorite = tune_core::taches_de_fond::priorite::releve();
     let traitements: Vec<Value> = Tache::TOUTES
         .into_iter()
         .map(|tache| {
@@ -110,6 +113,10 @@ pub(crate) fn instantane(state: &AppState) -> Value {
                 "id": tache.id(),
                 "state": etat_de(state, tache).code(),
                 "paused": est_en_pause(tache),
+                // A cédé à la lecture dans la fenêtre récente : ralentie, ou
+                // arrêtée jusqu'à l'arrêt de la lecture pour les passes qui
+                // décodent.
+                "throttled_for_playback": priorite.throttled.contains(&tache.id()),
             })
         })
         .collect();
@@ -120,6 +127,14 @@ pub(crate) fn instantane(state: &AppState) -> Value {
         // Le scan n'est pas suspendable, et l'écran ne doit pas avoir à le
         // deviner : il porte « Arrêter », pas « Pause ».
         "scan_pausable": false,
+        // Le scan cède pourtant à la lecture comme les autres (#4681).
+        "scan": {
+            "running": tune_core::scanner::activite::scan_bibliotheque_en_cours(),
+            "throttled_for_playback": priorite
+                .throttled
+                .contains(&tune_core::taches_de_fond::priorite::ID_SCAN),
+        },
+        "playback_priority": priorite,
     })
 }
 

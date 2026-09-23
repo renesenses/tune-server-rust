@@ -1276,6 +1276,10 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     info!("audio_embed_reprise_utilisateur");
                 }
                 if crate::audio::replaygain::any_zone_playing(&backend) {
+                    // #4681 — au relevé de `/system/background-tasks`.
+                    crate::taches_de_fond::priorite::noter_cedee(
+                        crate::taches_de_fond::Tache::Acoustique.id(),
+                    );
                     if !playback_hold {
                         playback_hold = true;
                         info!(
