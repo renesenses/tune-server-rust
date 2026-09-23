@@ -128,6 +128,19 @@ pub const CHEMIN_DE_LA_PISTE: &str = "COALESCE(file_path, cue_media_path)";
 #[derive(Debug, Default, Clone)]
 pub struct ComptesParSousDossier {
     comptes: HashMap<String, i64>,
+    /// #4318 — l'orthographe RÉELLE du segment, telle que la base la porte.
+    ///
+    /// Sur SQLite, [`Self::comptes`] est indexé par une clé repliée en
+    /// minuscules ASCII, pour additionner `CD1` et `cd1` dans le même seau
+    /// (voir la section « La casse » de [`compter_pistes_par_sous_dossier`]).
+    /// Cette clé convient pour INTERROGER, jamais pour AFFICHER : le serveur
+    /// média publierait « beethoven » là où le disque porte « Beethoven ».
+    ///
+    /// On garde donc, à côté du compte, la première orthographe rencontrée.
+    /// « Première » et non « la bonne » : quand deux graphies coexistent en
+    /// base, une seule peut être affichée, et aucune n'est plus vraie que
+    /// l'autre. L'appelant qui ne fait qu'interroger n'en voit rien.
+    libelles: HashMap<String, String>,
     replier_la_casse: bool,
 }
 
@@ -155,6 +168,65 @@ impl ComptesParSousDossier {
     pub fn nb_dossiers_peuples(&self) -> usize {
         self.comptes.len()
     }
+
+    /// #4318 — les sous-dossiers PEUPLÉS, nommés et comptés, triés par nom.
+    ///
+    /// [`Self::get`] répond à « combien sous ce nom ? » : elle suppose que
+    /// l'appelant connaît déjà les noms, parce qu'il vient de les lire sur le
+    /// disque (`read_dir`). Le serveur média UPnP, lui, n'a pas cette liste et
+    /// ne doit pas l'avoir : `upnp_server.rs` vit dans `tune-core` et publie
+    /// des bibliothèques dont le support peut être démonté. Il lui faut donc
+    /// l'ÉNUMÉRATION, et elle vient de la même requête, sans second parcours.
+    ///
+    /// Le nom rendu est celui de la base (voir [`Self::libelles`]), jamais la
+    /// clé repliée. Le tri est stable — une `HashMap` rend un ordre arbitraire,
+    /// et un point de contrôle UPnP pagine : deux `Browse` successifs qui
+    /// n'ordonnent pas pareil sautent ou répètent des entrées.
+    pub fn sous_dossiers(&self) -> Vec<(String, i64)> {
+        let mut liste: Vec<(String, i64)> = self
+            .comptes
+            .iter()
+            .map(|(clef, n)| {
+                let nom = self
+                    .libelles
+                    .get(clef)
+                    .cloned()
+                    .unwrap_or_else(|| clef.clone());
+                (nom, *n)
+            })
+            .collect();
+        liste.sort_by(|a, b| a.0.cmp(&b.0));
+        liste
+    }
+}
+
+/// #4318 — le nombre de pistes sous `prefixe`, RÉCURSIVEMENT.
+///
+/// Sert à ne publier, dans la vue par dossiers du serveur média, que les
+/// racines qui portent réellement quelque chose : `upnp_server.rs` pose en
+/// toutes lettres qu'« un conteneur annoncé doit être navigable — un dossier
+/// visible et vide se lit comme une bibliothèque cassée ». Une racine musicale
+/// configurée mais jamais scannée est exactement ce cas.
+///
+/// Même motif `LIKE` et même `COALESCE` CUE (#4625) que
+/// [`compter_pistes_par_sous_dossier`], pour que le compte annoncé et le
+/// contenu ouvert ne puissent pas diverger.
+pub fn compter_pistes_sous(backend: &dyn DbBackend, prefixe: &str) -> Result<i64, String> {
+    let motif = folder_like_pattern(prefixe);
+    let ph = if backend.engine() == Engine::Postgres {
+        "$1"
+    } else {
+        "?1"
+    };
+    let sql = format!(
+        "SELECT COUNT(*) FROM tracks WHERE {CHEMIN_DE_LA_PISTE} LIKE {ph}{esc}",
+        esc = like_escape_clause()
+    );
+    let params: [&dyn ToSqlValue; 1] = [&motif];
+    Ok(backend
+        .query_one(&sql, &params)?
+        .and_then(|c| c.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0))
 }
 
 /// Le nombre de pistes sous **chaque sous-dossier direct** de `parent`, en
@@ -230,6 +302,8 @@ pub fn compter_pistes_par_sous_dossier(
     let params: [&dyn ToSqlValue; 2] = [&motif, &sep];
     let rows = backend.query_many(&sql, &params)?;
     let mut comptes: HashMap<String, i64> = HashMap::with_capacity(rows.len());
+    // #4318 — l'orthographe de la base, gardée à côté de la clé repliée.
+    let mut libelles: HashMap<String, String> = HashMap::with_capacity(rows.len());
     for row in &rows {
         let Some(segment) = row.first().and_then(|v| v.as_string()) else {
             continue;
@@ -239,14 +313,16 @@ pub fn compter_pistes_par_sous_dossier(
         }
         let n = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
         let clef = if postgres {
-            segment
+            segment.clone()
         } else {
             segment.to_ascii_lowercase()
         };
+        libelles.entry(clef.clone()).or_insert(segment);
         *comptes.entry(clef).or_insert(0) += n;
     }
     Ok(ComptesParSousDossier {
         comptes,
+        libelles,
         replier_la_casse: !postgres,
     })
 }
@@ -798,6 +874,39 @@ pub mod sql {
             "{} WHERE t.file_path = {}",
             select_track(),
             d.placeholder(1)
+        )
+    }
+
+    /// #4318 — les pistes posées DIRECTEMENT dans un dossier, sans descendre
+    /// dans ses sous-dossiers.
+    ///
+    /// Le `LIKE` seul est récursif : il ramènerait toute la bibliothèque pour
+    /// n'en garder que les quelques fichiers du niveau. La seconde clause dit
+    /// « aucun séparateur après le préfixe », ce qui écarte les descendants
+    /// **dans le SQL** — mesuré sur 155 829 pistes en #3857 : 0 ligne en 103 ms
+    /// contre 155 829 lignes en 343 ms.
+    ///
+    /// `COALESCE(t.file_path, t.cue_media_path)` et non `file_path` seul : une
+    /// piste découpée par une feuille CUE a `file_path = NULL` par construction
+    /// (#4625). Sans lui, un album rangé en CUE s'ouvre sur une liste vide.
+    ///
+    /// `depart` est l'indice, **en caractères et 1-indexé**, du premier
+    /// caractère après « `<dossier><séparateur>` » — jamais un nombre d'octets,
+    /// sans quoi un seul dossier accentué décalerait la coupe.
+    pub fn pistes_directement_dans<D: SqlDialect>(d: &D, depart: usize) -> String {
+        let pos = match d.engine() {
+            super::Engine::Postgres => "strpos",
+            super::Engine::Sqlite => "instr",
+        };
+        format!(
+            "{select} WHERE {chemin} LIKE {p1}{esc} \
+             AND {pos}(substr({chemin}, {depart}), {p2}) = 0 \
+             ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+            select = select_track(),
+            chemin = CHEMIN_OUVRABLE,
+            p1 = d.placeholder(1),
+            p2 = d.placeholder(2),
+            esc = super::like_escape_clause(),
         )
     }
 
@@ -2114,6 +2223,33 @@ impl TrackRepo {
     pub fn list_by_album(&self, album_id: i64) -> Result<Vec<Track>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_album, sql::list_by_album);
         let params: [&dyn ToSqlValue; 1] = [&album_id];
+        let rows = self.db.query_many_strong(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// #4318 — les pistes posées DIRECTEMENT dans `dossier`, sans descendre.
+    ///
+    /// Pendant de [`compter_pistes_par_sous_dossier`], qui rend les
+    /// sous-dossiers : à eux deux ils décrivent un niveau d'arborescence
+    /// **sans toucher au disque**. C'est la condition pour que le serveur média
+    /// UPnP publie une vue par dossiers : il vit dans `tune-core` et sert des
+    /// bibliothèques dont le support peut être démonté — un `read_dir` y
+    /// rendrait un dossier vide au lieu de la bibliothèque connue.
+    ///
+    /// Le calcul de `depart` reprend mot pour mot celui de
+    /// [`compter_pistes_par_sous_dossier`] : NFC, séparateurs de fin ôtés,
+    /// comptage en **caractères**, 1-indexé.
+    pub fn pistes_directement_dans(&self, dossier: &str) -> Result<Vec<Track>, TuneError> {
+        use unicode_normalization::UnicodeNormalization as _;
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
+        let depart = base.chars().count() + sep.chars().count() + 1;
+        let sql = self.dialect_sql(
+            |d| sql::pistes_directement_dans(d, depart),
+            |d| sql::pistes_directement_dans(d, depart),
+        );
+        let motif = folder_like_pattern(dossier);
+        let params: [&dyn ToSqlValue; 2] = [&motif, &sep];
         let rows = self.db.query_many_strong(&sql, &params)?;
         Ok(rows.iter().map(row_to_track).collect())
     }

@@ -1298,7 +1298,7 @@ fn search_containers_in_container(
 fn conteneur_publie(id: &str) -> bool {
     id == "0"
         || ROOT_CONTAINERS.iter().any(|(racine, _, _)| *racine == id)
-        || ["artist/", "album/", "genre/", "year/", "playlist/"]
+        || ["artist/", "album/", "genre/", "year/", "playlist/", "dir/"]
             .iter()
             .any(|prefixe| id.starts_with(prefixe))
 }
@@ -1818,6 +1818,34 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                     Some(liste.track_count as u64),
                 )
             }),
+        // #4318 — un dossier se décrit comme un genre ou une année : le point
+        // de contrôle le valide par `BrowseMetadata` avant de l'ouvrir, et
+        // c'est le mode d'échec type d'un indexeur (#2183, JPLAY iOS). Le
+        // `parentID` est le dossier au-dessus tant qu'on reste sous une racine
+        // publiée, et « folders » pour une racine elle-même.
+        //
+        // Le `childCount` annoncé est celui que `browse_folder_children`
+        // ouvrira — demandé à la même fonction, jamais recalculé à côté.
+        id if id.starts_with("dir/") => decode_dir_id(state, id).map(|chemin| {
+            let racine = racines_de_dossiers(state)
+                .iter()
+                .any(|r| std::path::Path::new(r) == std::path::Path::new(&chemin));
+            let parent = if racine {
+                "folders".to_string()
+            } else {
+                std::path::Path::new(&chemin)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .map_or_else(|| "folders".to_string(), id_de_dossier)
+            };
+            didl_container(
+                id,
+                &parent,
+                &nom_de_dossier(&chemin),
+                "object.container.storageFolder",
+                compter_enfants_du_dossier(state, &chemin),
+            )
+        }),
         // Un `<item>` publie doit savoir se decrire, exactement comme un
         // conteneur. ContentDirectory:1 ne fait aucune difference : « If
         // BrowseFlag is BrowseMetadata, ObjectID identifies the object to
@@ -1898,6 +1926,9 @@ fn browse_direct_children(
         "tracks" => browse_all_tracks(state, start, count, &base_url),
         "radios" => browse_radios(state, start, count),
         "playlists" => browse_playlists(state, start, count),
+        // #4318 — la vue par dossiers. `folders` ouvre sur les racines
+        // musicales peuplées, `dir/<chemin>` sur un niveau de l'arborescence.
+        "folders" => browse_folders(state, start, count),
         id if id.starts_with("artist/") => {
             let artist_id: i64 = id
                 .strip_prefix("artist/")
@@ -1927,6 +1958,14 @@ fn browse_direct_children(
             Some(annee) => browse_year_albums(state, annee, &base_url),
             None => empty_didl(),
         },
+        // #4318 — la même leçon, pour les dossiers : un conteneur publié par
+        // `browse_folders` doit savoir s'ouvrir ici. Un chemin hors des racines
+        // publiées rend `None`, donc un DIDL vide — jamais une erreur SOAP, et
+        // jamais un parcours hors de ce que l'utilisateur a publié.
+        id if id.starts_with("dir/") => match decode_dir_id(state, id) {
+            Some(chemin) => browse_folder_children(state, &chemin, start, count, &base_url),
+            None => empty_didl(),
+        },
         // La même leçon, pour les listes de lecture (#1802) : c'est ici que
         // « Playlists » manquait avant 0.9.79, et le conteneur se lisait comme
         // un dossier vide.
@@ -1945,7 +1984,7 @@ fn browse_direct_children(
 /// annoncé ici doit être navigable dans `browse_direct_children` — un dossier
 /// visible et vide se lit comme une bibliothèque cassée, pas comme une
 /// fonction manquante.
-const ROOT_CONTAINERS: [(&str, &str, &str); 7] = [
+const ROOT_CONTAINERS: [(&str, &str, &str); 8] = [
     ("artists", "Artists", "object.container"),
     ("albums", "Albums", "object.container"),
     ("genres", "Genres", "object.container"),
@@ -1964,6 +2003,18 @@ const ROOT_CONTAINERS: [(&str, &str, &str); 7] = [
     // `browse_playlists` et `browse_playlist_tracks` écrits et testés : la
     // règle n'était pas « pas de playlists », c'était « pas de dossier vide ».
     ("playlists", "Playlists", "object.container"),
+    // Parcours par DOSSIERS (#4318, Tades fil forum 1818 « Toujours pas de vue
+    // par répertoire » depuis JPlay ; même demande dans la recette de la
+    // v0.9.161 par Bertrand). Les sept rubriques ci-dessus décrivent la
+    // bibliothèque telle que les ÉTIQUETTES la rangent ; celle-ci la décrit
+    // telle que le DISQUE la range — c'est ce que Tune montre déjà dans son
+    // propre écran « Répertoires », et que le ContentDirectory ne publiait pas.
+    //
+    // `object.container.storageFolder` et non `object.container` : c'est la
+    // classe que ContentDirectory réserve à une arborescence de fichiers, et
+    // celle que les points de contrôle reconnaissent pour proposer un parcours
+    // par dossiers. La racine « Tune » (`browse_metadata("0")`) la porte déjà.
+    ("folders", "Folders", "object.container.storageFolder"),
 ];
 
 fn empty_didl() -> DidlResult {
@@ -2195,6 +2246,9 @@ fn compter_enfants_racine(state: &UpnpState, object_id: &str) -> Option<u64> {
             .ok()?
             .len() as i64,
         "playlists" => lire_listes_publiables(state).len() as i64,
+        // #4318 — autant d'entrées que de racines musicales PEUPLÉES : c'est
+        // exactement ce que `browse_folders` ouvrira.
+        "folders" => racines_de_dossiers(state).len() as i64,
         _ => return None,
     };
     u64::try_from(n).ok()
@@ -2419,6 +2473,237 @@ fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlRe
     let albums = repo.list_by_genre(genre).unwrap_or_default();
     let parent_id = format!("genre/{}", urlencoding::encode(genre));
     didl_albums_under(&albums, &parent_id, base_url)
+}
+
+// ─────────────────────────── #4318 — parcours par DOSSIERS ───────────────────
+//
+// Tades (fil forum 1818, 16/09/2026) : « Toujours pas de vue par répertoire »
+// depuis JPlay. Et Bertrand, recette de la v0.9.161 : « Serveur UPnP de Tune →
+// ajout répertoires ou dossiers pour être accessibles dans JPlay ». Deux
+// demandes indépendantes du même manque : Tune montre déjà une vue Répertoires
+// dans son propre écran (`GET /library/browse/dir`), le ContentDirectory ne la
+// publiait pas.
+//
+// 🔴 Ce parcours se lit DANS LA BASE, jamais sur le disque.
+//
+// `browse_directory`, côté serveur HTTP, énumère les sous-dossiers par
+// `std::fs::read_dir`. Ici ce serait une faute : `upnp_server.rs` vit dans
+// `tune-core`, et un point de contrôle interroge le ContentDirectory d'un Tune
+// dont le support peut être démonté, un partage SMB tombé, un NAS endormi. Un
+// `read_dir` y rendrait « dossier vide » pour une bibliothèque parfaitement
+// connue — c'est le défaut #1190, déjà payé une fois côté HTTP. Les deux
+// requêtes utilisées ne lisent que `tracks.file_path` :
+// `compter_pistes_par_sous_dossier` (les sous-dossiers) et
+// `TrackRepo::pistes_directement_dans` (les pistes du niveau).
+//
+// L'identifiant d'un dossier est `dir/<chemin encodé>`, comme un genre est
+// `genre/<nom encodé>` : `urlencoding::encode` échappe aussi la barre oblique,
+// donc le chemin entier tient dans un seul segment et se décode sans ambiguïté.
+
+/// Les racines musicales qui portent RÉELLEMENT des pistes.
+///
+/// Trois règles, dans cet ordre :
+///
+/// 1. la liste vient du réglage `music_dirs`, la même que lisent
+///    `GET /library/browse` et la facette par dossiers — pas une seconde
+///    source qui dériverait ;
+/// 2. une racine sans aucune piste en base n'est PAS publiée. C'est la règle
+///    de [`ROOT_CONTAINERS`] appliquée d'un cran plus bas : « un dossier
+///    visible et vide se lit comme une bibliothèque cassée ». Une racine
+///    configurée mais jamais scannée est exactement ce cas ;
+/// 3. si rien ne reste — réglage absent, ou chemins qui ne correspondent à
+///    aucune piste, ce qui arrive après un déménagement de bibliothèque —, on
+///    retombe sur [`derive_common_root`], le préfixe commun des chemins
+///    réellement en base. Même repli que `folder_facet`, pour la même raison :
+///    mieux vaut la racine que la base connaît qu'un conteneur vide.
+///
+/// ⚠️ `TuneConfig::music_dirs` (le défaut applicatif `~/Music`) n'est pas lu
+/// ici : `UpnpState` ne porte que le backend, et lui ajouter une configuration
+/// pour un défaut que la base contredit déjà ne servirait qu'à publier un
+/// dossier vide de plus.
+fn racines_de_dossiers(state: &UpnpState) -> Vec<String> {
+    let configurees: Vec<String> =
+        crate::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get("music_dirs")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default();
+    let mut peuplees: Vec<String> = configurees
+        .into_iter()
+        .map(|d| crate::scanner::walker::normalize_path(&d))
+        .filter(|d| {
+            !d.is_empty()
+                && crate::db::track_repo::compter_pistes_sous(state.backend.as_ref(), d)
+                    .unwrap_or(0)
+                    > 0
+        })
+        .collect();
+    peuplees.sort();
+    peuplees.dedup();
+    if peuplees.is_empty() {
+        if let Some(racine) = crate::db::track_repo::derive_common_root(state.backend.as_ref()) {
+            return vec![racine];
+        }
+    }
+    peuplees
+}
+
+/// Le nom AFFICHÉ d'un dossier : son dernier segment, jamais son chemin entier.
+///
+/// Une racine peut n'avoir aucun segment utile (`/`, ou `D:\`) : on rend alors
+/// le chemre tel quel plutôt qu'une chaîne vide, qu'aucun point de contrôle ne
+/// saurait afficher.
+fn nom_de_dossier(chemin: &str) -> String {
+    let coupe = chemin.trim_end_matches(['/', '\\']);
+    coupe
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .map_or_else(|| chemin.to_string(), str::to_string)
+}
+
+/// L'identifiant DIDL d'un dossier.
+fn id_de_dossier(chemin: &str) -> String {
+    format!("dir/{}", urlencoding::encode(chemin))
+}
+
+/// Décode `dir/<chemin>` — et REFUSE tout chemin hors des racines publiées.
+///
+/// Le refus n'est pas décoratif. L'identifiant vient du réseau : sans cette
+/// borne, n'importe quel point de contrôle pourrait demander `dir/` d'un
+/// chemin arbitraire et faire énumérer au serveur les chemins que la base
+/// porte ailleurs. Le parcours ne lit que la base, donc rien du disque ne
+/// fuirait — mais l'arborescence de la bibliothèque d'un utilisateur n'a pas à
+/// se laisser sonder hors de ce qu'il a publié.
+///
+/// Une racine est acceptée telle quelle ; un descendant l'est s'il commence
+/// par « `<racine><séparateur>` ». La comparaison passe par `std::path::Path`,
+/// qui connaît les deux séparateurs, plutôt que par un `starts_with` de
+/// chaînes, qui accepterait `/musique-perso` sous `/musique`.
+fn decode_dir_id(state: &UpnpState, object_id: &str) -> Option<String> {
+    let brut = object_id.strip_prefix("dir/")?;
+    let chemin = urlencoding::decode(brut).ok()?.into_owned();
+    if chemin.trim().is_empty() {
+        return None;
+    }
+    let chemin = crate::scanner::walker::normalize_path(&chemin);
+    let demande = std::path::Path::new(&chemin);
+    racines_de_dossiers(state)
+        .iter()
+        .any(|racine| demande.starts_with(std::path::Path::new(racine)))
+        .then_some(chemin)
+}
+
+/// Ce qu'un dossier OUVRE : ses sous-dossiers peuplés, puis ses pistes.
+///
+/// Rendu en une seule liste parce que c'est ce que le `childCount` annonce et
+/// ce que `Browse` pagine : deux listes séparées obligeraient à annoncer un
+/// nombre et à en ouvrir un autre — exactement la divergence que garde le
+/// test générique des rubriques racine.
+///
+/// L'ordre est stable : les sous-dossiers par nom (le tri de
+/// `ComptesParSousDossier::sous_dossiers`), puis les pistes par disque et
+/// numéro. Un point de contrôle qui pagine sur un ordre instable saute ou
+/// répète des entrées.
+fn contenu_du_dossier(state: &UpnpState, chemin: &str) -> (Vec<(String, i64)>, Vec<Track>) {
+    let sous_dossiers =
+        crate::db::track_repo::compter_pistes_par_sous_dossier(state.backend.as_ref(), chemin)
+            .map(|c| c.sous_dossiers())
+            .unwrap_or_default();
+    let pistes = TrackRepo::with_backend(state.backend.clone())
+        .pistes_directement_dans(chemin)
+        .unwrap_or_default();
+    (sous_dossiers, pistes)
+}
+
+/// Combien d'entrées un dossier ouvre — la valeur du `childCount` annoncé.
+fn compter_enfants_du_dossier(state: &UpnpState, chemin: &str) -> Option<u64> {
+    let (sous_dossiers, pistes) = contenu_du_dossier(state, chemin);
+    u64::try_from(sous_dossiers.len() + pistes.len()).ok()
+}
+
+/// La rubrique racine « Folders » : une entrée par racine musicale peuplée.
+fn browse_folders(state: &UpnpState, start: u64, count: u64) -> DidlResult {
+    let (page, total) = paginer(racines_de_dossiers(state), start, count);
+    let mut inner = String::new();
+    for racine in &page {
+        inner.push_str(&didl_container(
+            &id_de_dossier(racine),
+            "folders",
+            &nom_de_dossier(racine),
+            "object.container.storageFolder",
+            compter_enfants_du_dossier(state, racine),
+        ));
+    }
+    let returned = page.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned,
+    }
+}
+
+/// Un dossier : ses sous-dossiers en `<container>`, ses pistes en `<item>`.
+fn browse_folder_children(
+    state: &UpnpState,
+    chemin: &str,
+    start: u64,
+    count: u64,
+    base_url: &str,
+) -> DidlResult {
+    let (sous_dossiers, pistes) = contenu_du_dossier(state, chemin);
+    let parent_id = id_de_dossier(chemin);
+    let separateur = std::path::MAIN_SEPARATOR;
+    // Une seule liste d'entrées, paginée d'un bloc : le `childCount` annoncé
+    // par le conteneur parent compte les deux espèces, la pagination doit donc
+    // les parcourir dans le même ordre.
+    enum Entree {
+        Dossier(String, i64),
+        Piste(Box<Track>),
+    }
+    let mut entrees: Vec<Entree> = Vec::with_capacity(sous_dossiers.len() + pistes.len());
+    for (nom, nb) in sous_dossiers {
+        entrees.push(Entree::Dossier(nom, nb));
+    }
+    for piste in pistes {
+        entrees.push(Entree::Piste(Box::new(piste)));
+    }
+    let (page, total) = paginer(entrees, start, count);
+    let mut inner = String::new();
+    for entree in &page {
+        match entree {
+            Entree::Dossier(nom, nb) => {
+                let enfant = format!("{}{separateur}{nom}", chemin.trim_end_matches(['/', '\\']));
+                inner.push_str(&didl_container(
+                    &id_de_dossier(&enfant),
+                    &parent_id,
+                    nom,
+                    "object.container.storageFolder",
+                    // Le compte du sous-dossier est RÉCURSIF (toutes les pistes
+                    // sous lui), alors que son Browse ouvrira ses enfants
+                    // DIRECTS. Les deux ne coïncident que pour un dossier
+                    // feuille. On n'annonce donc pas ce nombre-là : on demande
+                    // au dossier ce qu'il ouvrira vraiment, comme
+                    // `browse_metadata` le fera. `nb` sert seulement à écarter
+                    // un dossier vide, que la requête ne rend de toute façon
+                    // pas.
+                    {
+                        let _ = nb;
+                        compter_enfants_du_dossier(state, &enfant)
+                    },
+                ));
+            }
+            Entree::Piste(piste) => {
+                inner.push_str(&didl_track_item(piste, &parent_id, base_url));
+            }
+        }
+    }
+    let returned = page.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned,
+    }
 }
 
 /// Les années DISTINCT des albums, la plus récente d'abord.
@@ -3302,6 +3587,22 @@ mod tests {
         assert!(xml.contains("childCount=\"42\""));
     }
 
+    /// #4318 — le séparateur de la plateforme, écrit une fois.
+    const SEP: char = std::path::MAIN_SEPARATOR;
+
+    /// Une racine musicale valable sur les deux familles de plateformes.
+    ///
+    /// `/music` sous Unix ; `C:\music` sous Windows, car `\music` seul est un
+    /// chemin relatif au lecteur courant et `Path::starts_with` ne s'y
+    /// comporte pas comme sur une racine.
+    fn racine_de_test() -> String {
+        if SEP == '\\' {
+            "C:\\music".to_string()
+        } else {
+            "/music".to_string()
+        }
+    }
+
     fn test_state() -> UpnpState {
         use crate::db::sqlite::SqliteDb;
         let db = SqliteDb::open_in_memory().unwrap();
@@ -3661,7 +3962,18 @@ mod tests {
         so_what.album_title = Some("Kind of Blue".into());
         so_what.artist_id = Some(artist_id);
         so_what.artist_name = Some("Miles Davis".into());
-        so_what.file_path = Some("/music/so-what.flac".into());
+        // #4318 — les chemins de cette fixture portent désormais le séparateur
+        // de la PLATEFORME, et la racine musicale est déclarée. Le rayon
+        // « Folders » se lit dans `tracks.file_path` : avec des `/` en dur, il
+        // se serait ouvert vide sous Windows, où `folder_like_pattern` coupe
+        // sur `\` — et les deux tests génériques qui bouclent sur
+        // `ROOT_CONTAINERS` auraient rougi sur cette seule plateforme.
+        //
+        // Un sous-dossier (`Kind of Blue`) en plus d'une piste posée au niveau
+        // de la racine : c'est la seule forme qui prouve que le parcours
+        // descend ET qu'il publie les deux espèces d'enfants.
+        let racine = racine_de_test();
+        so_what.file_path = Some(format!("{racine}{SEP}so-what.flac"));
         let so_what_id = track_repo.create(&so_what).unwrap();
 
         let mut blue = Track::new("Blue in Green".into());
@@ -3669,8 +3981,12 @@ mod tests {
         blue.album_title = Some("Kind of Blue".into());
         blue.artist_id = Some(artist_id);
         blue.artist_name = Some("Miles Davis".into());
-        blue.file_path = Some("/music/blue-in-green.flac".into());
+        blue.file_path = Some(format!("{racine}{SEP}Kind of Blue{SEP}blue-in-green.flac"));
         let blue_id = track_repo.create(&blue).unwrap();
+
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set("music_dirs", &format!("[\"{racine}\"]"))
+            .unwrap();
 
         RadioRepo::with_backend(backend.clone())
             .create(&RadioStation {
@@ -3719,6 +4035,153 @@ mod tests {
     /// `BrowseMetadata`, et ce nombre est EXACTEMENT celui que le conteneur
     /// ouvre : promettre 3 214 albums et en montrer 2 900 se lit comme une
     /// bibliothèque abîmée, pas comme un compteur approximatif.
+    #[test]
+    // ───────────────── #4318 — le parcours par DOSSIERS ─────────────────
+    //
+    // Tades, fil forum 1818 : « Toujours pas de vue par répertoire » depuis
+    // JPlay ; et Bertrand, recette de la v0.9.161 : « Serveur UPnP de Tune →
+    // ajout répertoires ou dossiers pour être accessibles dans JPlay ».
+    //
+    // Les deux tests génériques qui bouclent sur `ROOT_CONTAINERS`
+    // (`chaque_rayon_racine_annonce_la_taille_qu_il_ouvre` et
+    // `chaque_rayon_de_la_racine_s_ouvre_par_soap`) couvrent déjà le nouveau
+    // rayon sans être modifiés : ils exigent qu'il s'ouvre non vide, que son
+    // compteur corresponde, et que chacun de ses enfants sache se décrire par
+    // `BrowseMetadata`. Ce que les tests ci-dessous ajoutent, c'est ce qui leur
+    // est propre : la descente, les deux espèces d'enfants, et la borne.
+
+    /// Le rayon « Folders » ouvre sur les racines musicales, et une racine
+    /// ouvre sur ses sous-dossiers ET ses pistes.
+    #[test]
+    fn le_rayon_dossiers_descend_et_publie_les_deux_especes_4318() {
+        let (state, _, _, _, _) = state_complet();
+        let racine = racine_de_test();
+
+        let rayon = browse_direct_children(&state, "folders", 0, 100);
+        assert_eq!(rayon.total, 1, "une seule racine musicale : {}", rayon.xml);
+        let id_racine = id_de_dossier(&racine);
+        assert!(
+            rayon.xml.contains(&format!("id=\"{id_racine}\"")),
+            "le rayon doit publier la racine musicale : {}",
+            rayon.xml
+        );
+        assert!(
+            rayon.xml.contains("object.container.storageFolder"),
+            "un dossier se publie en storageFolder : {}",
+            rayon.xml
+        );
+
+        // La racine porte un sous-dossier ET une piste posée à son niveau.
+        let niveau = browse_direct_children(&state, &id_racine, 0, 100);
+        assert_eq!(
+            niveau.total, 2,
+            "un sous-dossier + une piste directe : {}",
+            niveau.xml
+        );
+        let id_sous = id_de_dossier(&format!("{racine}{SEP}Kind of Blue"));
+        assert!(
+            niveau.xml.contains(&format!("id=\"{id_sous}\"")),
+            "le sous-dossier doit être un <container> ouvrable : {}",
+            niveau.xml
+        );
+        assert!(
+            niveau.xml.contains("So What"),
+            "la piste posée à la racine doit être un <item> : {}",
+            niveau.xml
+        );
+
+        // Et le sous-dossier s'ouvre sur sa piste — la descente, qu'aucune
+        // autre rubrique n'exerce : genre, année et artiste n'ont que deux
+        // niveaux, un dossier en a autant qu'il en faut.
+        let sous = browse_direct_children(&state, &id_sous, 0, 100);
+        assert_eq!(sous.total, 1, "{}", sous.xml);
+        assert!(
+            sous.xml.contains("Blue in Green"),
+            "le sous-dossier doit ouvrir sur sa piste : {}",
+            sous.xml
+        );
+    }
+
+    /// Chaque dossier publié annonce la taille qu'il ouvre — le pendant, pour
+    /// les dossiers, de `chaque_genre_publie_ouvre_ce_qu_il_annonce`. Un
+    /// compteur qui diverge de ce qui s'ouvre est pire que pas de compteur.
+    #[test]
+    fn chaque_dossier_publie_ouvre_ce_qu_il_annonce_4318() {
+        let (state, _, _, _, _) = state_complet();
+        let racine = racine_de_test();
+
+        for chemin in [racine.clone(), format!("{racine}{SEP}Kind of Blue")] {
+            let id = id_de_dossier(&chemin);
+            let ouvert = browse_direct_children(&state, &id, 0, 0).total;
+            assert!(ouvert > 0, "le dossier {chemin} s'ouvre vide");
+            assert_eq!(
+                compter_enfants_du_dossier(&state, &chemin),
+                Some(ouvert),
+                "le compteur du dossier {chemin} diverge de ce qu'il ouvre"
+            );
+            let meta = browse_metadata(&state, &id);
+            assert!(
+                meta.xml.contains(&format!("childCount=\"{ouvert}\"")),
+                "BrowseMetadata({id}) n'annonce pas sa taille : {}",
+                meta.xml
+            );
+        }
+    }
+
+    /// ⭐ La borne : un `dir/` hors des racines publiées ne s'ouvre pas, et ne
+    /// se décrit pas. Sans elle, l'identifiant venant du réseau ferait
+    /// énumérer au serveur des chemins que l'utilisateur n'a pas publiés.
+    #[test]
+    fn un_dossier_hors_des_racines_publiees_est_refuse_4318() {
+        let (state, _, _, _, _) = state_complet();
+
+        for hors_piste in [
+            format!("{SEP}etc"),
+            // Le piège du préfixe de CHAÎNE : « /music-perso » commence bien
+            // par « /music », et ne doit pourtant pas passer.
+            format!("{}-perso", racine_de_test()),
+            format!("{SEP}"),
+        ] {
+            let id = id_de_dossier(&hors_piste);
+            assert!(
+                decode_dir_id(&state, &id).is_none(),
+                "{hors_piste} n'est pas sous une racine publiée"
+            );
+            let ouvert = browse_direct_children(&state, &id, 0, 100);
+            assert_eq!(
+                ouvert.total, 0,
+                "{hors_piste} ne doit rien ouvrir : {}",
+                ouvert.xml
+            );
+        }
+
+        // Mais l'identifiant reste RECONNU comme conteneur : `Search` doit
+        // rendre un DIDL vide, pas une erreur 710 « objet inconnu ».
+        assert!(conteneur_publie("dir/%2Fetc"));
+    }
+
+    /// Une racine configurée mais jamais scannée n'est PAS publiée : la règle
+    /// de `ROOT_CONTAINERS` — « un dossier visible et vide se lit comme une
+    /// bibliothèque cassée » — descend d'un cran.
+    #[test]
+    fn une_racine_sans_pistes_n_est_pas_publiee_4318() {
+        let (state, _, _, _, _) = state_complet();
+        let racine = racine_de_test();
+        crate::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "music_dirs",
+                &format!("[\"{racine}\",\"{SEP}vide-jamais-scanne\"]"),
+            )
+            .unwrap();
+
+        let racines = racines_de_dossiers(&state);
+        assert_eq!(
+            racines,
+            vec![racine],
+            "seule la racine PEUPLÉE se publie : {racines:?}"
+        );
+    }
+
     #[test]
     fn chaque_rayon_racine_annonce_la_taille_qu_il_ouvre() {
         let (state, _, _, _, _) = state_complet();
@@ -5706,14 +6169,23 @@ mod ssdp_msearch_tests {
                 "years",
                 "tracks",
                 "radios",
-                "playlists"
+                "playlists",
+                // #4318 — le parcours par dossiers, ajoute EN DERNIER comme
+                // « playlists » avant lui : l'ordre des rayons deja publies ne
+                // bouge pas, un point de controle qui memorise une position ne
+                // se retrouve pas devant un autre rayon.
+                "folders"
             ],
             "les rayons de la racine ont change d'ordre ou d'identifiant : {racine}"
         );
+        // #4318 — lu depuis `ROOT_CONTAINERS` et non ecrit en dur : ce temoin
+        // garde l'ORDRE et les identifiants (au-dessus), pas le nombre de
+        // rayons, qui a le droit de grandir. Un `7` en dur faisait rougir ce
+        // test pour un rayon AJOUTE, ce qui n'est pas une regression.
         assert_eq!(
             compteur(&racine, "NumberReturned"),
-            7,
-            "la racine n'annonce plus sept rayons : {racine}"
+            ROOT_CONTAINERS.len() as u64,
+            "la racine n'annonce pas tous ses rayons : {racine}"
         );
 
         // --- TEMOIN 2 : les cinq rayons qui paginaient deja.
