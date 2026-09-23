@@ -490,11 +490,11 @@ pub fn build_album_query(
     let mut conditions = Vec::new();
     for rule in &rules {
         let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
-        let raw_op = rule
-            .get("operator")
-            .or_else(|| rule.get("op"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("contains");
+        // 🔴 #4467 — les deux clés, lues UNE seule fois pour les quatre
+        // analyseurs. L'ordre y est `op` puis `operator` : la précédence ne
+        // change que pour une règle qui porterait les DEUX, ce qu'aucun
+        // éditeur n'écrit.
+        let raw_op = crate::regles_sql::lire_op(rule);
         let op = match raw_op {
             "=" | "eq" | "equals" => "=",
             "!=" | "ne" | "not_equals" => "!=",
