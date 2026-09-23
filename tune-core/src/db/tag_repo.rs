@@ -36,7 +36,19 @@ use super::sqlite::SqliteDb;
 /// c'est précisément la panne silencieuse que cette liste ferme. Étiqueter un
 /// label demande une décision de modèle — l'aligner sur `favorite_facets`, ou
 /// donner enfin une identité aux labels — qui n'appartient pas à ce correctif.
-pub const TAGGABLE_ITEM_TYPES: [&str; 4] = ["album", "artist", "playlist", "track"];
+///
+/// # `smart_playlist` est un type À PART, jamais déduit de `playlist` (#4798)
+///
+/// Une playlist intelligente a bien un identifiant entier — `smart_playlists.id`
+/// — mais cet espace **se recouvre** avec celui de `playlists` : l'id 1 existe
+/// dans les deux tables. Un client qui poserait `item_type = "playlist"` avec
+/// l'id d'une playlist intelligente étiquetterait une AUTRE playlist, sans
+/// que rien ne le dise. D'où un type distinct, écrit tel quel, et une route de
+/// lecture à lui (`/tags/{id}/smart-playlists`) qui ne résout que dans
+/// `smart_playlists`. C'est la même leçon que les collections : `collection`
+/// et `smart_collection` partagent l'id 1 sur le serveur de Bertrand.
+pub const TAGGABLE_ITEM_TYPES: [&str; 5] =
+    ["album", "artist", "playlist", "smart_playlist", "track"];
 
 /// Vrai si `item_type` est un type d'objet étiquetable connu.
 pub fn is_taggable_item_type(item_type: &str) -> bool {
@@ -57,6 +69,27 @@ fn verifier_item_type(item_type: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(item_type_rejette(item_type))
+    }
+}
+
+/// Un identifiant d'objet local est STRICTEMENT positif.
+///
+/// 🔴 Mesuré sur le .18 le 22/09/2026 : deux lignes `item_tags` portaient
+/// `item_id = 0` — une sous « Bô enregistrements », une sous « J'adore ».
+/// Aucun album n'a l'identifiant 0 : ces lignes ne désignaient rien, mais
+/// gonflaient le compteur de l'étiquette (5 affichés pour 4 albums réels).
+/// `item_id` est un `i64` que serde accepte à 0 ; rien ne l'arrêtait.
+pub fn item_id_valide(item_id: i64) -> bool {
+    item_id > 0
+}
+
+fn verifier_item_id(item_id: i64) -> Result<(), String> {
+    if item_id_valide(item_id) {
+        Ok(())
+    } else {
+        Err(format!(
+            "item_id must be a positive local id, got {item_id}"
+        ))
     }
 }
 
@@ -422,6 +455,7 @@ impl TagRepo {
     /// suivant qu'on ajoutera l'oubliera.
     pub fn tag_item(&self, tag_id: i64, item_type: &str, item_id: i64) -> Result<(), String> {
         verifier_item_type(item_type)?;
+        verifier_item_id(item_id)?;
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
@@ -508,6 +542,11 @@ impl TagRepo {
         // fois pour toutes) — sans cette ligne, le lot serait le trou par
         // lequel un type inconnu entrerait quand même, par centaines.
         verifier_item_type(item_type)?;
+        // Même raison que le type : tout le lot est vérifié AVANT d'écrire
+        // quoi que ce soit, un lot refusé ne laisse rien derrière lui.
+        for &item_id in item_ids {
+            verifier_item_id(item_id)?;
+        }
         let mut count = 0;
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         for &item_id in item_ids {
@@ -881,11 +920,11 @@ mod tests {
         );
     }
 
-    /// Les cinq types du modèle, moins `label` : quatre acceptés, `label`
-    /// refusé **tant qu'il n'a pas d'identité numérique** (voir la note de
-    /// [`TAGGABLE_ITEM_TYPES`]).
+    /// Les six types du modèle, moins `label` : cinq acceptés — dont
+    /// `smart_playlist` depuis #4798 —, `label` refusé **tant qu'il n'a pas
+    /// d'identité numérique** (voir la note de [`TAGGABLE_ITEM_TYPES`]).
     #[test]
-    fn les_quatre_types_a_identifiant_passent_et_label_est_refuse() {
+    fn les_cinq_types_a_identifiant_passent_et_label_est_refuse() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
@@ -893,16 +932,56 @@ mod tests {
         let repo = TagRepo::new(db);
         let tag_id = repo.create("Test", None).unwrap();
 
-        for (n, t) in ["album", "artist", "playlist", "track"].iter().enumerate() {
+        for (n, t) in ["album", "artist", "playlist", "smart_playlist", "track"]
+            .iter()
+            .enumerate()
+        {
             repo.tag_item(tag_id, t, n as i64 + 1)
                 .unwrap_or_else(|e| panic!("{t} doit être accepté : {e}"));
         }
-        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 4);
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 5);
 
         assert!(
             repo.tag_item(tag_id, "label", 1).is_err(),
             "`label` n'a pas d'identifiant numérique : item_id INTEGER ne peut pas le porter"
         );
+    }
+
+    /// #4798 — le test qui compte : `playlists.id` et `smart_playlists.id` se
+    /// recouvrent. Une playlist et une playlist intelligente de MÊME
+    /// identifiant doivent faire deux lignes, se lire chacune sous son type,
+    /// et se retirer l'une sans l'autre.
+    #[test]
+    fn une_playlist_et_une_playlist_intelligente_de_meme_id_ne_se_confondent_pas() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Dimanche", None).unwrap();
+
+        // Le même entier, sous les deux types : deux lignes, pas une.
+        repo.tag_item(tag_id, "playlist", 1).unwrap();
+        repo.tag_item(tag_id, "smart_playlist", 1).unwrap();
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 2);
+        assert_eq!(repo.items_by_tag(tag_id, "playlist").unwrap(), vec![1]);
+        assert_eq!(
+            repo.items_by_tag(tag_id, "smart_playlist").unwrap(),
+            vec![1]
+        );
+
+        // Retirer l'étiquette de la playlist ne touche pas l'intelligente.
+        repo.untag_item(tag_id, "playlist", 1).unwrap();
+        assert!(repo.items_by_tag(tag_id, "playlist").unwrap().is_empty());
+        assert_eq!(
+            repo.items_by_tag(tag_id, "smart_playlist").unwrap(),
+            vec![1],
+            "désétiqueter la playlist 1 a emporté la playlist intelligente 1"
+        );
+
+        // Et la garde #4678 vaut pour le nouveau type comme pour les autres.
+        assert!(repo.tag_item(tag_id, "smart_playlist", 0).is_err());
+        assert!(repo.tag_item(tag_id, "smart_playlist", -3).is_err());
     }
 
     /// `batch_tag` ne passe pas par `tag_item`. Sans vérification propre, il

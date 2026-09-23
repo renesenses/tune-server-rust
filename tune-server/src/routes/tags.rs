@@ -116,6 +116,9 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/tracks", get(list_tag_tracks))
         .route("/{id}/artists", get(list_tag_artists))
         .route("/{id}/playlists", get(list_tag_playlists))
+        // #4798 — route a part : les identifiants de `playlists` et de
+        // `smart_playlists` se recouvrent, on ne les melange jamais.
+        .route("/{id}/smart-playlists", get(list_tag_smart_playlists))
         .route("/for/{item_type}/{item_id}", get(tags_for_item))
         // La jumelle de `/for/…` pour l'espace du streaming. En parametres de
         // requete et non en segments, meme raison que ci-dessus.
@@ -281,6 +284,15 @@ async fn add_tag_item(
     if !is_taggable_item_type(&body.item_type) {
         return (StatusCode::BAD_REQUEST, item_type_rejette(&body.item_type)).into_response();
     }
+    // 🔴 400, pas 500 : c'est la REQUÊTE qui est fausse. Avant ce garde,
+    // `item_id = 0` était écrit tel quel — deux lignes fantômes sur le .18.
+    if !tune_core::db::tag_repo::item_id_valide(body.item_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("item_id must be a positive local id, got {}", body.item_id),
+        )
+            .into_response();
+    }
     let repo = TagRepo::with_backend(state.backend.clone());
     match repo.tag_item(id, &body.item_type, body.item_id) {
         Ok(_) => StatusCode::CREATED.into_response(),
@@ -295,6 +307,17 @@ async fn batch_tag_items(
 ) -> impl IntoResponse {
     if !is_taggable_item_type(&body.item_type) {
         return (StatusCode::BAD_REQUEST, item_type_rejette(&body.item_type)).into_response();
+    }
+    if let Some(faux) = body
+        .item_ids
+        .iter()
+        .find(|i| !tune_core::db::tag_repo::item_id_valide(**i))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("item_id must be a positive local id, got {faux}"),
+        )
+            .into_response();
     }
     let repo = TagRepo::with_backend(state.backend.clone());
     match repo.batch_tag(id, &body.item_type, &body.item_ids) {
@@ -491,6 +514,74 @@ async fn list_tag_playlists(
         }));
     }
     Json(json!({"tag_id": id, "playlists": playlists, "count": playlists.len()}))
+}
+
+/// Les playlists INTELLIGENTES d'une etiquette (#4798).
+///
+/// Route a part, et non une moitie de `/playlists` : `playlists.id` et
+/// `smart_playlists.id` se recouvrent (l'id 1 existe dans les deux tables).
+/// Resoudre un `item_id` de type `smart_playlist` dans `playlists` rendrait
+/// une AUTRE playlist, du bon nom ou non, sans que rien ne le dise. Ici on ne
+/// lit que `smart_playlists`, et la forme rendue est celle de
+/// `GET /library/smart-playlists` — l'ecran qui ouvre une playlist
+/// intelligente n'a donc rien a apprendre de nouveau.
+///
+/// Pas de moitie streaming : une playlist intelligente est locale par nature.
+/// Une playlist supprimee est omise, comme partout ailleurs ; aucun profil ne
+/// la cloisonne, la table n'en porte pas.
+///
+/// La table se lit en entier puis se filtre : elle compte quelques lignes (six
+/// sur le .18), et c'est ce qui evite d'ecrire la requete deux fois, une par
+/// dialecte de parametre.
+async fn list_tag_smart_playlists(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    let tag_repo = TagRepo::with_backend(state.backend.clone());
+    let etiquetees = tag_repo
+        .items_by_tag(id, "smart_playlist")
+        .unwrap_or_default();
+    let rows = if etiquetees.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .backend
+            .query_many(
+                "SELECT id, name, rules, match_mode, sort_by, sort_order, max_tracks \
+                 FROM smart_playlists ORDER BY name",
+                &[],
+            )
+            .unwrap_or_default()
+    };
+    let smart_playlists: Vec<Value> = rows
+        .iter()
+        .filter(|cols| {
+            cols.first()
+                .and_then(|v| v.as_i64())
+                .is_some_and(|sid| etiquetees.contains(&sid))
+        })
+        .map(|cols| {
+            let rules_str = cols
+                .get(2)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "[]".into());
+            let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
+            json!({
+                "id": cols.first().and_then(|v| v.as_i64()),
+                "name": cols.get(1).and_then(|v| v.as_string()),
+                "rules": rules,
+                "match_mode": cols.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
+                "sort_by": cols.get(4).and_then(|v| v.as_string()),
+                "sort_order": cols.get(5).and_then(|v| v.as_string()),
+                "max_tracks": cols.get(6).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
+    Json(json!({
+        "tag_id": id,
+        "smart_playlists": smart_playlists,
+        "count": smart_playlists.len(),
+    }))
 }
 
 async fn tags_for_item(
