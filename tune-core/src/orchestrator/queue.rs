@@ -757,6 +757,9 @@ impl PlaybackOrchestrator {
         // pour un renderer qui se contredit et le curseur serait resté collé à
         // la fin de la piste précédente pendant tout un album enchaîné (#3229).
         self.playback.reset_position(zone_id, 0).await;
+        // Le déplacement éventuel appartenait à la piste d'avant : sa grâce ne
+        // court pas sur celle-ci (#4682).
+        self.playback.oublier_le_deplacement(zone_id).await;
         self.playback.emit_position(zone_id, 0);
 
         // Une avance gapless est une nouvelle écoute confirmée par le sondeur

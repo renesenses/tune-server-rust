@@ -673,3 +673,9 @@ mod eversolo_epingle_4382;
 /// qu'il TIENT la suivante, et on la lui demande au lieu de tout relancer.
 #[cfg(test)]
 mod bascule_sur_la_suivante_3967;
+
+/// #4682 — un déplacement de la barre de progression ne fausse plus
+/// l'enchaînement : ce même banc, la fin de piste rejouée après un
+/// déplacement près de la fin, et un recul après l'armement.
+#[cfg(test)]
+mod deplacement_et_enchainement_4682;
