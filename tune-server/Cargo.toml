@@ -887,3 +887,9 @@ required-features = ["plugins-wasm"]
 name = "hote_wasm_appariement_local_4716"
 path = "tests/hote_wasm_appariement_local_4716.rs"
 required-features = ["plugins-wasm"]
+
+# #4767 — les deux sections de la page artiste (« Compilations »,
+# « Apparitions ») et l'absence d'une section vide.
+[[test]]
+name = "page_artiste_sections_4767"
+path = "tests/page_artiste_sections_4767.rs"
