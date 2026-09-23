@@ -14,7 +14,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::metadata_report_repo::{MetadataReportRepo, REPORT_ENTITIES};
 use tune_core::db::settings_repo::SettingsRepo;
 
@@ -66,8 +65,42 @@ pub(super) async fn create_report(
         .unwrap_or("unspecified")
         .to_string();
 
-    let repo = MetadataReportRepo::with_backend(state.backend.clone());
     let created_at = now_iso_utc();
+
+    // Image d'artiste rejetée (#4837) : le signalement garde l'EMPREINTE de
+    // l'image affichée et le MBID, puis l'efface. Les passes d'enrichissement
+    // lisent ces empreintes et ne reposent plus cette image — avant, le
+    // drapeau l'effaçait et la passe suivante ramenait la même, servie en
+    // priorité par le dépôt communautaire (Edge Of Thorns, fils 1901/1902).
+    if entity == "artist_image"
+        && let Some(id) = body.entity_id
+    {
+        let image_cleared = match tune_core::library::artwork::signaler_image_artiste(
+            &state.backend,
+            &super::artwork_cache_dir(),
+            id,
+            body.mbid.as_deref(),
+            &reason,
+            body.comment.as_deref(),
+            &created_at,
+        ) {
+            Ok(effacee) => effacee,
+            Err(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e})))
+                    .into_response();
+            }
+        };
+        let pushed = push_report_to_community(&state, &entity, &body, &reason).await;
+        return Json(json!({
+            "reported": true,
+            "entity": entity,
+            "image_cleared": image_cleared,
+            "pushed": pushed,
+        }))
+        .into_response();
+    }
+
+    let repo = MetadataReportRepo::with_backend(state.backend.clone());
     if let Err(e) = repo.insert(
         &entity,
         body.entity_id,
@@ -81,16 +114,9 @@ pub(super) async fn create_report(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
     }
 
-    // Local effect: a wrong artist image is dropped straight away so the UI
-    // falls back to a placeholder and the next enrichment re-fetches one.
-    let mut image_cleared = false;
-    if entity == "artist_image" {
-        if let Some(id) = body.entity_id {
-            image_cleared = ArtistRepo::with_backend(state.backend.clone())
-                .clear_image(id)
-                .is_ok();
-        }
-    }
+    // Un `artist_image` sans artiste local (signalement par MBID seul) n'a
+    // pas d'image locale à effacer.
+    let image_cleared = false;
 
     let pushed = push_report_to_community(&state, &entity, &body, &reason).await;
 
