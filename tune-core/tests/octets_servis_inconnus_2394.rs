@@ -192,8 +192,10 @@ fn un_flux_qui_delivre_ne_change_pas() {
 
 /// Le bras du seuil d'échec, découpé dans le source du sondeur.
 fn branche_du_seuil_d_echec() -> &'static str {
+    // Sans l'accolade : la condition du bras est multiligne depuis #4480 (le
+    // seuil en ticks s'y double d'un plancher en secondes).
     let debut = SOURCE_POLLER
-        .find("} else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {")
+        .find("} else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD")
         .expect("le bras du seuil d'échec a disparu de poller.rs et poller/tick.rs");
     let fin = SOURCE_POLLER[debut..]
         .find("\"stopped_early_waiting\"")
@@ -280,5 +282,103 @@ fn seule_la_branche_mesuree_coupe_la_zone() {
             .find("decisions::demarrage_mort(")
             .is_some_and(|d| d > coupe),
         "demarrage_mort doit rester dans la branche qui coupe"
+    );
+}
+
+// ─────────── 5. #4480 — trente TOURS ne font pas trente SECONDES ───────────
+//
+// Le même bras, une autre confusion : le seuil qui l'arme compte des tours de
+// sondeur, et tout le code les commente « ~1 s ». Ils ne le sont pas.
+//
+// `poller.rs::spawn` attend
+// `tokio::select! { ticker.tick(), TRACK_END_NOTIFY.notified() }` : chaque
+// notification fait un tour hors cadence. Et `tokio::time::interval` rattrape
+// par défaut les tours manqués EN RAFALE (`MissedTickBehavior::Burst`) : après
+// un tour lent, plusieurs tombent coup sur coup.
+//
+// Le terrain le chiffre (Eversolo DMP-A8 du .18, 19/09/2026, journal cité dans
+// l'issue) : `poller_track_generation_changed_resetting_state` à 09:04:05.921,
+// `playback_failure_stopping_zone` à 09:04:24.853. Les trente tours tiennent
+// donc dans **18,9 s au plus** — 0,63 s par tour. La ligne de coupure portait
+// `wall_secs=18` et personne ne l'avait lue ainsi.
+//
+// ⛔ Ce que ces épreuves n'établissent PAS : que l'Eversolo se serait rétabli
+// si on l'avait attendu jusqu'à trente secondes. Elles établissent que la
+// patience annoncée par le seuil — « accommodate slow DLNA renderers […] that
+// report Stopped/position=0 while buffering » — n'avait jamais lieu en entier.
+
+#[test]
+fn le_releve_du_terrain_ne_doit_plus_couper_4480() {
+    use std::time::Duration;
+    // 09:04:24.853 − 09:04:05.921 = 18,932 s pour trente tours.
+    assert!(
+        !tune_core::poller::fsm::arret_assez_long_pour_couper(
+            Some(Duration::from_millis(18_932)),
+            30,
+        ),
+        "dix-neuf secondes d'arrêt coupaient la zone alors que le seuil promet \
+         une patience de trente (#4480)"
+    );
+}
+
+#[test]
+fn le_plancher_n_empeche_pas_une_vraie_coupure_4480() {
+    use std::time::Duration;
+    assert!(tune_core::poller::fsm::arret_assez_long_pour_couper(
+        Some(Duration::from_secs(30)),
+        30,
+    ));
+    assert!(tune_core::poller::fsm::arret_assez_long_pour_couper(
+        Some(Duration::from_secs(120)),
+        30,
+    ));
+    // Horloge jamais armée : on ne change rien au comportement d'avant plutôt
+    // que de risquer une zone qui ne se couperait JAMAIS.
+    assert!(tune_core::poller::fsm::arret_assez_long_pour_couper(
+        None, 30
+    ));
+}
+
+/// 🔴 La règle ci-dessus ne vaut que si le bras de production l'APPELLE.
+///
+/// « Écrit mais pas branché » : une décision juste que personne ne consulte
+/// laisse le défaut entier. C'est la garde que le témoin d'origine (#2394)
+/// posait déjà sur ce même bras, pour la même raison.
+#[test]
+fn le_bras_de_production_applique_le_plancher_de_temps_4480() {
+    let branche = branche_du_seuil_d_echec();
+    let entete = &branche[..branche
+        .find("// Check if the stream is still being consumed")
+        .unwrap_or(branche.len().min(600))];
+
+    assert!(
+        entete.contains("fsm::arret_assez_long_pour_couper("),
+        "le seuil en ticks coupe de nouveau sans plancher de temps : trente \
+         tours de sondeur peuvent tomber en dix-neuf secondes (#4480)"
+    );
+    assert!(
+        entete.contains("STOPPED_FAILURE_MIN_SECS"),
+        "le plancher doit être la constante, pas un littéral posé sur place"
+    );
+    assert!(
+        entete.contains("ps.premier_arret_a"),
+        "le plancher doit se mesurer depuis le DÉBUT de la série d'arrêts, \
+         pas depuis le début de la piste (`wall_secs` inclut la lecture)"
+    );
+}
+
+/// L'horloge de la série d'arrêts s'arme au passage de 0 à 1 tour, et nulle
+/// part ailleurs : c'est ce qui permet à tout site qui repose
+/// `stopped_ticks = 0` de la ré-armer sans le savoir.
+#[test]
+fn l_horloge_de_la_serie_s_arme_a_l_entree_4480() {
+    let pose = SOURCE_POLLER
+        .find("ps.premier_arret_a = Some(Instant::now());")
+        .expect("l'horloge de la série d'arrêts n'est plus armée dans le sondeur");
+    let avant = &SOURCE_POLLER[pose.saturating_sub(200)..pose];
+    assert!(
+        avant.contains("if ps.stopped_ticks == 0 {"),
+        "l'horloge doit être posée à l'ENTRÉE de la série ; réarmée à chaque \
+         tour, elle ne mesurerait jamais que le dernier"
     );
 }

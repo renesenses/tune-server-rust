@@ -1813,6 +1813,18 @@ impl PositionPoller {
                             motif: MotifFin::DsdDlnaPicAtteint,
                         });
                     } else {
+                        // #4480 — on entre dans une série d'arrêts : l'horloge
+                        // part ici, et nulle part ailleurs. Tout site qui
+                        // repose `stopped_ticks = 0` la ré-arme donc de
+                        // lui-même au tour suivant.
+                        //
+                        // ⚠️ POSÉE AVANT le marqueur qui suit, et pas entre lui
+                        // et sa transition : le témoin REF-9 E7 exige
+                        // `RendererArrete` dans les trois lignes qui suivent
+                        // `fsm_actual = Some(StoppedOutcome::Waiting)`.
+                        if ps.stopped_ticks == 0 {
+                            ps.premier_arret_a = Some(Instant::now());
+                        }
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
                         fsm_actual = Some(fsm::StoppedOutcome::Waiting);
@@ -2002,7 +2014,12 @@ impl PositionPoller {
                                         ));
                                     }
                                 }
-                            } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
+                            } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD
+                                && fsm::arret_assez_long_pour_couper(
+                                    ps.premier_arret_a.map(|t| t.elapsed()),
+                                    STOPPED_FAILURE_MIN_SECS,
+                                )
+                            {
                                 // Check if the stream is still being consumed
                                 // (renderer actively fetching audio data). If so,
                                 // don't kill — the renderer is playing but not
@@ -2075,6 +2092,17 @@ impl PositionPoller {
                                         wall_secs = wall_elapsed,
                                         bytes_sent = current_bytes,
                                         consommation = consommation.etiquette(),
+                                        // #4480 — les deux grandeurs qui
+                                        // manquaient pour relire une coupure :
+                                        // combien de tours, et combien de
+                                        // SECONDES ils ont réellement pris.
+                                        // Sans elles, « 30 ticks » se lisait
+                                        // « 30 secondes », ce qui est faux.
+                                        arret_ticks = ps.stopped_ticks,
+                                        arret_secs = ps
+                                            .premier_arret_a
+                                            .map(|t| t.elapsed().as_secs())
+                                            .unwrap_or(0),
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;
