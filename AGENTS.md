@@ -26,7 +26,8 @@ changer la cible d'un lot déjà engagé à l'occasion de cet alignement.
 2. consulter les issues, commentaires, PR ouvertes et fichiers concernés ;
    vérifier par contenu si le correctif existe déjà et éviter les chevauchements ;
 3. lister les labels globaux `verrou:issue-*`, puis acquérir le verrou avec
-   `gh label create verrou:issue-N`, **sans `--force`** ;
+   `gh label create verrou:issue-N`, **sans `--force`** ; un verrou **détaché**
+   se reprend aux conditions de « Verrou détaché » ci-dessous ;
 4. ajouter `en-cours` et le verrou à l'issue ; publier l'identité complète
    (personne / fournisseur / run unique), le périmètre, les fichiers prévus,
    la branche, le SHA de base et le worktree Shrek.
@@ -40,12 +41,55 @@ gh label create "verrou:issue-N" --repo renesenses/tune-server-rust --color 5319
 gh issue edit N --repo renesenses/tune-server-rust --add-label "verrou:issue-N" --add-label en-cours
 ```
 
-Un label existant réserve l'issue même s'il n'y est pas attaché. Si sa création
-échoue, vérifier son existence exacte : présent ou incertain, ne pas commencer
-cette issue et passer à une tâche indépendante. Ne jamais reprendre un verrou
-d'une autre session sans transfert explicite, même s'il est ancien. Conserver
-les verrous pendant la revue ; leur libération suit les règles du dépôt.
-La réservation n'est acquise qu'après une création réussie.
+Ne jamais utiliser `--force`. Si la création échoue, vérifier l'existence exacte
+du label avant toute autre conclusion. Un verrou **posé sur son issue** est
+intouchable, quel que soit son âge : ne pas le reprendre sans transfert
+explicite. Conserver les verrous pendant la revue ; leur libération suit les
+règles du dépôt. La réservation n'est acquise qu'après une création réussie.
+
+### Verrou détaché : conditions de reprise (décision du 23/09/2026)
+
+Un label `verrou:issue-N` **détaché** — existant dans le dépôt mais posé sur
+aucune issue — ne réserve plus rien indéfiniment. Il se reprend si, et
+seulement si, les **trois** conditions sont réunies :
+
+- **(a)** le label n'est pas posé sur son issue `N` ;
+- **(b)** aucune PR ouverte ne cite l'issue `N` ;
+- **(c)** plus de **24 h** se sont écoulées depuis la dernière activité **du
+  verrou lui-même** — création du label, pose ou retrait du label sur l'issue,
+  commentaire de réservation ou de transfert. Un commentaire de tri ou de
+  livraison sans rapport avec la réservation ne rajeunit pas un verrou.
+
+```sh
+# (a) le label est-il posé sur son issue ?
+gh issue view N --repo renesenses/tune-server-rust --json labels \
+  --jq '[.labels[].name] | index("verrou:issue-N")'
+# (b) une PR ouverte cite-t-elle l'issue ?
+gh pr list --repo renesenses/tune-server-rust --state open --limit 500 \
+  --json number,title,body,headRefName --jq '.[] | select((.title + .body + .headRefName) | test("(^|[^0-9])N([^0-9]|$)")) | .number'
+# (c) dernière activité du verrou : créations et évènements de label
+gh api 'repos/renesenses/tune-server-rust/labels/verrou:issue-N' --jq .created_at
+gh api 'repos/renesenses/tune-server-rust/issues/N/timeline?per_page=100' --paginate \
+  --jq '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "verrou:issue-N") | {created_at, event}'
+```
+
+La reprise se **dit** : commentaire de réservation sur l'issue portant la
+personne, la session (personne / fournisseur / run unique) et le périmètre,
+en indiquant que le verrou détaché est repris au titre de cette règle. Sans ce
+commentaire, la reprise n'a pas eu lieu.
+
+Ménage : un verrou détaché remplissant (a), (b) et (c) **dont l'issue est
+fermée** ne protège plus rien et peut être supprimé
+(`gh label delete verrou:issue-N`). Un verrou détaché dont l'issue est
+**ouverte** n'est pas supprimé à la volée : il est repris selon la règle
+ci-dessus, ou purgé sur arbitrage humain.
+
+**Pourquoi cette règle.** La rédaction antérieure — « un label existant réserve
+l'issue même s'il n'y est pas attaché », sans limite de temps — condamnait à ne
+plus jamais être traitées les issues dont le verrou avait survécu à sa session.
+Le constat à l'origine de la décision : **207 verrous détachés sur 248**, et
+plusieurs sessions arrêtées le 23/09 devant ce texte, à juste titre. Un verrou
+protège un travail en cours, pas la mémoire d'un travail fini.
 
 Règles non négociables :
 
