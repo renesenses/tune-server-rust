@@ -346,6 +346,42 @@ pub fn classify_playing(i: &PlayingInput) -> PlayingDecision {
     }
 }
 
+/// 🔴 #4480 — le seuil d'échec compte des TOURS DE SONDEUR, pas des secondes.
+///
+/// `STOPPED_FAILURE_THRESHOLD` vaut 30, et sa documentation dit pourquoi :
+/// « accommodate slow DLNA renderers (Shanling SCD1.3, MPlayer-based) that
+/// report Stopped/position=0 while buffering ». L'intention est une PATIENCE,
+/// et une patience se mesure en secondes.
+///
+/// Elle n'en était pas une. La boucle de `poller.rs` attend
+/// `tokio::select! { ticker.tick(), TRACK_END_NOTIFY.notified() }` : toute
+/// notification fait un tour de plus hors cadence, et `tokio::time::interval`
+/// rattrape par défaut les tours manqués **en rafale**
+/// (`MissedTickBehavior::Burst`). Trente tours ne font donc pas trente
+/// secondes.
+///
+/// Le terrain le chiffre (#4480, Eversolo DMP-A8 du .18, 19/09/2026) : la
+/// génération de piste est remise à zéro à 09:04:05.921, la zone est coupée à
+/// 09:04:24.853 — **trente tours en 18,9 s au plus**. La ligne de coupure
+/// portait `wall_secs=18` et personne ne l'avait lue comme ça.
+///
+/// Ce plancher ne retire aucune coupure : il exige seulement que la patience
+/// promise ait réellement eu lieu. Les deux conditions restent cumulatives.
+///
+/// `None` — l'horloge n'a jamais été armée — rend `true` : on ne change rien
+/// au comportement d'avant plutôt que de risquer une zone qui ne se couperait
+/// jamais. En exploitation le cas n'existe pas, l'horloge étant posée au
+/// passage de 0 à 1 tour, qui précède toujours le trentième.
+pub fn arret_assez_long_pour_couper(
+    arret_depuis: Option<std::time::Duration>,
+    plancher_secs: u64,
+) -> bool {
+    match arret_depuis {
+        Some(d) => d.as_secs() >= plancher_secs,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

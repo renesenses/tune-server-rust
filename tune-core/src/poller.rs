@@ -215,6 +215,13 @@ const SEEK_STREAMING_GRACE_SECS: u64 = 10;
 /// Increased from 6 to 15 to accommodate slow DLNA renderers (Shanling SCD1.3,
 /// MPlayer-based) that report Stopped/position=0 while buffering.
 const STOPPED_FAILURE_THRESHOLD: u8 = 30;
+/// 🔴 #4480 — le plancher en SECONDES du seuil ci-dessus.
+///
+/// Trente tours de sondeur ne font pas trente secondes : la boucle se réveille
+/// aussi sur `TRACK_END_NOTIFY`, et `tokio::time::interval` rattrape les tours
+/// manqués en rafale. Mesuré sur le .18 le 19/09/2026 : trente tours en 18,9 s.
+/// Voir [`fsm::arret_assez_long_pour_couper`].
+const STOPPED_FAILURE_MIN_SECS: u64 = 30;
 /// Grace period (seconds) after a new track is loaded (track_generation
 /// changes).  During this window the poller suppresses stopped_ticks to
 /// let the renderer buffer — especially important for streaming sources
