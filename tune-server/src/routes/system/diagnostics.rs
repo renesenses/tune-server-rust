@@ -1903,6 +1903,98 @@ fn couverture_de_l_index(state: &AppState) -> Vec<(&'static str, Option<i64>, Op
         .collect()
 }
 
+/// Ce que la grille Bibliothèque › Artistes peut afficher comme PORTRAITS
+/// (#4845, fil 1903 — « toutes les vignettes en initiales »).
+///
+/// La grille rend un portrait SEULEMENT si `artists.image_path` est posé ET
+/// que `/library/artwork/{condensat}` trouve le fichier en cache ; sinon les
+/// initiales (`ArtistesV2.svelte` → `AlbumArt`). Aucun repli sur une
+/// pochette d'album, aucune condition de licence. Trois causes donnent donc
+/// le même écran et ne se distinguaient pas dans un rapport :
+///
+/// * `sans_image` — jamais enrichi (enrichissement coupé, `enrich_on_scan`
+///   faux) ou ligne recréée à vide (bibliothèque vidée, artiste orphelin
+///   purgé puis recréé) ;
+/// * `cache_perdu` — la base annonce une image que le cache n'a plus
+///   (cache effacé, `%LOCALAPPDATA%` d'un autre compte) ;
+/// * `distantes` — une URL servie par le mandataire, qui peut échouer.
+///
+/// Le périmètre est celui de la grille : les artistes porteurs d'un album.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct PortraitsDArtistes {
+    pub total: i64,
+    pub affichables: i64,
+    pub sans_image: i64,
+    pub cache_perdu: i64,
+    pub distantes: i64,
+    /// `image_source` des images posées (`community`, `auto`, `upload`…).
+    pub sources: std::collections::BTreeMap<String, i64>,
+}
+
+pub(crate) fn releve_portraits_d_artistes(
+    backend: &dyn tune_core::db::backend::DbBackend,
+    cache_dir: &std::path::Path,
+) -> Option<PortraitsDArtistes> {
+    let lignes = backend
+        .query_many(
+            "SELECT image_path, image_source FROM artists \
+             WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)",
+            &[],
+        )
+        .ok()?;
+    let mut r = PortraitsDArtistes::default();
+    for cols in lignes {
+        r.total += 1;
+        let chemin = cols
+            .first()
+            .and_then(|v| v.as_string())
+            .filter(|p| !p.trim().is_empty());
+        let Some(chemin) = chemin else {
+            r.sans_image += 1;
+            continue;
+        };
+        let source = cols
+            .get(1)
+            .and_then(|v| v.as_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "?".into());
+        *r.sources.entry(source).or_insert(0) += 1;
+        if chemin.starts_with("http") {
+            r.distantes += 1;
+            continue;
+        }
+        // Même résolution que `artist_image` et que la grille : un condensat
+        // hexadécimal tel quel, un chemin par son `artwork_hash`.
+        let hex = (chemin.len() == 32 || chemin.len() == 64)
+            && chemin.chars().all(|c| c.is_ascii_hexdigit());
+        let adresse = if hex {
+            chemin
+        } else {
+            tune_core::library::artwork::artwork_hash(&chemin)
+        };
+        if tune_core::library::artwork::find_cached(cache_dir, &adresse).is_some() {
+            r.affichables += 1;
+        } else {
+            r.cache_perdu += 1;
+        }
+    }
+    Some(r)
+}
+
+/// La ligne du rapport de bogue — celle que le testeur colle sur le forum.
+pub(crate) fn ligne_portraits_d_artistes(p: &PortraitsDArtistes) -> String {
+    let sources = if p.sources.is_empty() {
+        String::new()
+    } else {
+        let s: Vec<String> = p.sources.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        format!(" ; sources : {}", s.join(", "))
+    };
+    format!(
+        "- Portraits d'artistes (grille Artistes) : {}/{} affichables — sans image {}, cache perdu {}, URL distante {}{}\n",
+        p.affichables, p.total, p.sans_image, p.cache_perdu, p.distantes, sources
+    )
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -2074,6 +2166,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     md.push_str(&format!("- Tracks: {tracks}\n"));
     md.push_str(&format!("- Albums: {albums}\n"));
     md.push_str(&format!("- Artists: {artists}\n"));
+    // #4845 — ce que la grille Artistes peut afficher, et pourquoi pas.
+    let portraits = releve_portraits_d_artistes(
+        state.backend.as_ref(),
+        &crate::routes::library::artwork_cache_dir(),
+    );
+    if let Some(p) = &portraits {
+        md.push_str(&ligne_portraits_d_artistes(p));
+    }
     md.push_str(&format!("- Music dirs: {}\n", music_dirs.join(", ")));
     md.push_str(&format!("- Scan status: {scan_status}\n"));
     // #4319 — « je le vois dans Répertoires, la recherche ne le trouve pas ».
@@ -2421,6 +2521,15 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
             "tracks": tracks,
             "albums": albums,
             "artists": artists,
+            // #4845 — portraits que la grille Artistes peut afficher.
+            "artist_portraits": portraits.as_ref().map(|p| json!({
+                "total": p.total,
+                "displayable": p.affichables,
+                "without_image": p.sans_image,
+                "cache_missing": p.cache_perdu,
+                "remote_url": p.distantes,
+                "sources": p.sources,
+            })),
             "music_dirs": music_dirs,
             "scan_status": scan_status,
             // #4319 — ce que la RECHERCHE voit, à côté de ce que la
@@ -4460,6 +4569,82 @@ mod tests_doublons_de_zones {
             g["fusion_refusee_motif"],
             serde_json::Value::Null,
             "rien à refuser, donc aucun motif : {g:#?}"
+        );
+    }
+}
+
+/// #4845 (JPierre, fil 1903) — toutes les vignettes de la grille Artistes en
+/// initiales. La cause n'est pas établie : le rapport de bogue ne disait rien
+/// des portraits. Il dit désormais, pour les artistes de la grille, combien
+/// sont affichables et, sinon, POURQUOI — les trois causes du même écran.
+#[cfg(test)]
+mod portraits_d_artistes_4845 {
+    use super::{PortraitsDArtistes, ligne_portraits_d_artistes, releve_portraits_d_artistes};
+    use tune_core::db::artist_repo::ArtistRepo;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::models::Artist;
+
+    #[test]
+    fn le_rapport_distingue_sans_image_cache_perdu_et_affichable_4845() {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let db: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        let cache = tempfile::tempdir().unwrap();
+        let artistes = ArtistRepo::with_backend(db.clone());
+        let mut ids = Vec::new();
+        for nom in [
+            "Annie Lennox",
+            "Deep Purple",
+            "Diana Krall",
+            "Dire Straits",
+            "Sans album",
+        ] {
+            ids.push(artistes.create(&Artist::new(nom.into())).unwrap());
+        }
+        // Les quatre premiers portent un album (ils sont dans la grille).
+        for id in &ids[..4] {
+            db.execute_batch(&format!(
+                "INSERT INTO albums (title, artist_id) VALUES ('Album {id}', {id});"
+            ))
+            .unwrap();
+        }
+        // Annie Lennox : portrait en cache — affichable.
+        let octets: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let condensat =
+            tune_core::library::artwork::cache_fetched_image(&octets, cache.path(), "jpg").unwrap();
+        artistes
+            .update_image(ids[0], &condensat, "community")
+            .unwrap();
+        // Deep Purple : la base annonce une image que le cache n'a plus.
+        artistes
+            .update_image(ids[1], &"ab".repeat(32), "auto")
+            .unwrap();
+        // Diana Krall : jamais enrichie. Dire Straits : URL distante.
+        artistes
+            .update_image(ids[3], "https://exemple.invalid/p.jpg", "auto")
+            .unwrap();
+
+        let releve =
+            releve_portraits_d_artistes(db.as_ref(), cache.path()).expect("le relevé se lit");
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert("auto".to_string(), 2);
+        sources.insert("community".to_string(), 1);
+        assert_eq!(
+            releve,
+            PortraitsDArtistes {
+                total: 4,
+                affichables: 1,
+                sans_image: 1,
+                cache_perdu: 1,
+                distantes: 1,
+                sources,
+            },
+            "#4845 — le rapport doit séparer les trois causes des initiales"
+        );
+        assert_eq!(
+            ligne_portraits_d_artistes(&releve),
+            "- Portraits d'artistes (grille Artistes) : 1/4 affichables — sans image 1, \
+             cache perdu 1, URL distante 1 ; sources : auto 2, community 1\n"
         );
     }
 }
