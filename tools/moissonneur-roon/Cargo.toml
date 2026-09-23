@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 roon-api = "0.5.3"
+# La découverte SOOD, en direct : `RoonClient::start_discovery` se connecte et
+# s'apparie au PREMIER Core qui répond. Ici on veut d'abord VOIR qui répond.
+roon-sood = "0.5.3"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

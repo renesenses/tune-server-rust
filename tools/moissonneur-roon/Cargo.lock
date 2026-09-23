@@ -1342,6 +1342,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "roon-api",
+ "roon-sood",
  "serde",
  "serde_json",
  "tokio",
