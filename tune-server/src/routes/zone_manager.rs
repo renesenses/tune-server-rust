@@ -116,8 +116,21 @@ pub(crate) fn generic_group_view(mut group: Value) -> Value {
 }
 
 /// Ajoute le contrat de synchronisation à la vue d'un groupe OAAT.
+///
+/// Sans la feature `oaat`, le contrat OAAT n'existe pas dans `tune-core` : la
+/// vue porte alors le contrat générique, qui dit « non synchronisé ». Un binaire
+/// construit avec `--no-default-features --features local-audio` (profil
+/// « appareil ») ne compilait pas à cause de cette seule ligne (E0433,
+/// mesuré le 21/09/2026 sur la cible armv7).
 pub(crate) fn oaat_group_view(mut group: Value) -> Value {
-    group["synchronization"] = tune_core::outputs::oaat::oaat_synchronization_contract();
+    #[cfg(feature = "oaat")]
+    {
+        group["synchronization"] = tune_core::outputs::oaat::oaat_synchronization_contract();
+    }
+    #[cfg(not(feature = "oaat"))]
+    {
+        group["synchronization"] = generic_group_synchronization_contract();
+    }
     group
 }
 
@@ -1406,6 +1419,7 @@ mod tests {
     }
 
     /// #2215 : OAAT a un mécanisme, mais aucune précision mesurée.
+    #[cfg(feature = "oaat")]
     #[test]
     fn un_groupe_oaat_annonce_le_mecanisme_sans_inventer_sa_precision() {
         let view = oaat_group_view(json!({"id": "salon"}));
@@ -1418,6 +1432,22 @@ mod tests {
         );
         assert_eq!(view["synchronization"]["render_latency_calibrated"], false);
         assert!(view["synchronization"]["accuracy_claim_ms"].is_null());
+    }
+
+    /// Sans la feature `oaat`, la vue d'un groupe OAAT ne peut rien promettre :
+    /// elle porte le contrat générique. Un binaire « appareil »
+    /// (`--no-default-features --features local-audio`) doit compiler et le dire.
+    #[cfg(not(feature = "oaat"))]
+    #[test]
+    fn sans_la_feature_oaat_la_vue_dun_groupe_porte_le_contrat_generique() {
+        let view = oaat_group_view(json!({"id": "salon"}));
+
+        assert_eq!(view["synchronization"]["supported"], false);
+        assert_eq!(
+            view["synchronization"]["transport"],
+            "independent_renderers"
+        );
+        assert_eq!(view["synchronization"]["alternative"], "oaat");
     }
 
     /// #2215 : la seconde famille de routes de groupes (REF-4, #2219) sert le
