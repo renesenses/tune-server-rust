@@ -869,3 +869,21 @@ path = "tests/suppression_playlist_de_service.rs"
 [[test]]
 name = "playlist_manager_cloisonnement_par_profil"
 path = "tests/playlist_manager_cloisonnement_par_profil.rs"
+# #4716 — l'interface hôte WASM ouverte aux playlists, au streaming et à un
+# stockage clé/valeur. `autotests = false` en tête de ce manifeste : sans cette
+# cible, ni le cloisonnement du stockage par greffon ni l'écriture chez un
+# service ne seraient jamais compilés. `required-features` parce que
+# `plugins_host` n'existe que sous `plugins-wasm`.
+[[test]]
+name = "hote_wasm_playlists_4716"
+path = "tests/hote_wasm_playlists_4716.rs"
+required-features = ["plugins-wasm"]
+
+# #4716 — la permission `library` (appariement LOCAL) et l'appariement à
+# plusieurs candidats. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le sens service → bibliothèque ne serait jamais compilé.
+# `required-features` parce que `plugins_host` n'existe que sous `plugins-wasm`.
+[[test]]
+name = "hote_wasm_appariement_local_4716"
+path = "tests/hote_wasm_appariement_local_4716.rs"
+required-features = ["plugins-wasm"]

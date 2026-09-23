@@ -81,10 +81,81 @@ Unlisted permission ⇒ the import traps (deny by default).
 | *(always)* | `host_log(level,msg)` |
 | `queue` | `host_queue_get(zone)`, `host_queue_add(zone,tracks)`, `host_queue_set(zone,tracks,pos)`, `host_queue_remove/move` |
 | `playback` | `host_now_playing(zone)`, `host_play(zone,req)`, `host_pause/stop/next/prev(zone)`, `host_seek(zone,ms)`, `host_set_volume(zone,v)` |
-| `library` | `host_search(q)`, `host_track_get(id)` |
+| `library` | `host_library_search(query,limit)`, `host_library_match_track(title,artist,isrc,duration_ms)` — **livré #4716** ; `host_track_get(id)` reste à faire |
 | `events` | `host_emit(event,payload)` (subscription is declared in the manifest) |
-| `kv` | `host_kv_get/set(key)` — per-plugin settings namespace |
+| `playlists` | `host_playlists_list(limit,offset)`, `host_playlist_tracks(playlist_id)`, `host_playlist_create(name,description?)`, `host_playlist_add_tracks(playlist_id,track_ids[])` — **livré #4716** |
+| `streaming` | `host_streaming_services()`, `host_streaming_playlists(service)`, `host_streaming_playlist_tracks(service,playlist_id)`, `host_streaming_playlist_create(service,name,description?)`, `host_streaming_playlist_add_tracks(service,playlist_id,track_ids[])`, `host_streaming_match_track(service,title,artist,isrc,duration_ms)` — **livré #4716** |
+| `kv` | `host_kv_get(key)`, `host_kv_set(key,value)`, `host_kv_list(prefix)` — per-plugin settings namespace, **livré #4716** |
 | `net` | `host_fetch(req)` — gated outbound HTTP, host-executed (no raw sockets) |
+
+### 3.4.1 Garde-fous des capacités `playlists` / `streaming` / `library` / `kv` (#4716)
+
+Trois règles, non négociables, qui sont la raison d'être de la tranche :
+
+1. **Aucune suppression.** Il n'existe pas — et il ne doit pas exister — de
+   `host_playlist_delete`, `host_playlist_remove_tracks`,
+   `host_streaming_playlist_delete` ni de retrait de favori. Un greffon ne doit
+   pas pouvoir effacer chez un service : c'est irréversible et l'utilisateur
+   n'a rien demandé. Une capacité ABSENTE est la seule garde qu'on ne contourne
+   pas ; un test énumère les imports installés sur le `Linker` et refuse tout
+   nom contenant `delete`, `remove` ou `unfollow`.
+2. **Toute écriture chez un service purge son cache de contenu utilisateur.**
+   `host_streaming_playlist_create` et `host_streaming_playlist_add_tracks`
+   appellent `tune_streaming_http::purge_contenu_utilisateur(<service>)` juste
+   après l'écriture, **sans condition sur le succès** : sinon l'écran sert la
+   liste mémorisée pendant 120 s et la playlist qui vient d'être créée
+   « n'existe pas ».
+3. **`kv` est cloisonné par greffon.** La clé réellement écrite est
+   `plugin_kv:{plugin_id}:{clé}`, où `plugin_id` est l'identifiant de
+   **manifeste** rangé dans le `Store` par l'hôte au chargement — jamais une
+   valeur que le greffon fournit dans son JSON d'entrée. Le séparateur est `:`
+   parce qu'un identifiant de greffon ne peut contenir que `[A-Za-z0-9_-]` :
+   avec `_`, le greffon `a_b` + clé `x` et le greffon `a` + clé `b_x` auraient
+   écrit dans la même ligne. Valeur sérialisée bornée à 256 Kio.
+
+`host_streaming_match_track` **réutilise** l'appariement déjà écrit pour la
+fusion de playlists : `tune_core::streaming::matching` (recherche +
+`best_stream_match_scored`), que la route `POST /playlist-manager/transfer`
+appelle désormais elle aussi. Un seul verdict pour l'écran et pour le greffon.
+La réponse porte `score` et `approximate` (sous `MATCH_ACCEPT_SCORE`), à charge
+du greffon de ne pas écrire en silence un appariement douteux chez un service.
+
+### 3.4.2 Appariement à PLUSIEURS candidats (#4716)
+
+`host_streaming_match_track` et `host_library_match_track` rendent un
+**classement**, pas un verdict seul :
+
+```json
+{
+  "matched": { … }, "score": 0.95, "approximate": false,
+  "count": 2,
+  "candidates": [
+    { "track": { … }, "score": 0.95, "approximate": false },
+    { "track": { … }, "score": 0.95, "approximate": false }
+  ]
+}
+```
+
+La forme d'avant est **conservée** : `matched`/`score`/`approximate` désignent
+toujours le verdict, et `matched` vaut `null` quand rien ne correspond
+(`count: 0`, `candidates: []`). `candidates[0]` EST ce verdict ; les suivants
+sont les autres résultats de la même recherche, triés par score décroissant et
+plafonnés par `MAX_CANDIDATS_APPARIEMENT` (5).
+
+Pourquoi : le greffon applique sa propre règle par-dessus — « Playlists
+converter » refuse un appariement dont la durée s'écarte de plus de 3 s de la
+piste d'origine. Quand le verdict rate cette tolérance, un seul candidat rendu
+faisait ressortir le titre « introuvable » alors qu'un autre résultat aurait
+convenu. Rien n'est rescoré pour autant :
+`track_matcher::classer_candidats` appelle le MÊME `find_best_match`, et la
+tête du classement est le verdict que la route de transfert rendrait.
+
+`host_library_search` / `host_library_match_track` (permission `library`) sont
+le sens SERVICE → BIBLIOTHÈQUE, qui manquait : sans eux un convertisseur ne
+savait aller que de la bibliothèque VERS un service. La recherche est celle du
+serveur (`TrackRepo::search`, l'index plein texte) et l'appariement celui de
+`track_matcher` — aucun des deux n'est réécrit, et ni l'un ni l'autre n'écrit
+quoi que ce soit.
 
 Host functions run **async on the host side**; the wasm call is suspended via a
 host-provided await shim (or the call returns a future-id the plugin polls —
@@ -137,6 +208,9 @@ decks); only the audio-touching calls need the host. Decide once the ABI exists.
   gating.
 - **P2** — route mounting under `/api/v1/plugins/{id}` + license gating.
 - **P3** — event forwarding (`plugin_on_event`).
+- **P3.5** — #4716 : permissions `playlists`, `streaming`, `library`, `kv`
+  (tranche 1 de l'épique #4715, greffon « Playlists converter »), avec les
+  garde-fous du §3.4.1 et l'appariement à plusieurs candidats du §3.4.2.
 - **P4** — **Party mode end-to-end** on the ABI (validates the whole thing).
 - **P5** — decide DJ mode (native vs host-audio functions) and implement.
 

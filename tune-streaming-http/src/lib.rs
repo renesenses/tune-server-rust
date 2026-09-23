@@ -335,6 +335,12 @@ fn memoriser_contenu_utilisateur(service: &str, ressource: &str, donnees: Value)
 /// SANS passer par les routes d'ici : elles ne purgeaient donc rien, et la
 /// liste rendue restait la mémorisée — jusqu'à 2 minutes. Bertrand : « Je ne
 /// vois pas la playlist résultant du merge ! ». Elle existait chez Qobuz.
+/// **Publique depuis #4716** : les routes HTTP ne sont plus les seules à écrire
+/// chez un service. L'interface hôte WASM (`tune-server/src/plugins_host.rs`)
+/// crée des playlists et y ajoute des pistes pour le compte d'un greffon, HORS
+/// de ces routes ; sans appeler cette purge, l'écran continuerait de servir la
+/// liste mémorisée pendant 120 s et la playlist qui vient d'être créée
+/// « n'existerait pas ».
 pub fn purge_contenu_utilisateur(service: &str) {
     let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
         return;

@@ -20,6 +20,27 @@
 //! (and therefore any host-function it triggers) inside
 //! [`tokio::task::spawn_blocking`]. The queue/log/emit capabilities are pure
 //! sync (rusqlite / tracing / the event bus) and need no bridge.
+//!
+//! # #4716 — playlists, streaming, bibliothèque, stockage clé/valeur
+//!
+//! La tranche 1 de l'épique #4715 (« Playlists converter ») ajoute quatre
+//! familles de capacités — la quatrième, `library`, comble le sens
+//! SERVICE → BIBLIOTHÈQUE : sans recherche ni appariement local, le greffon
+//! refusait « transférer vers la bibliothèque ». Trois règles les tiennent :
+//!
+//! * **Aucune suppression.** Rien ici n'efface une playlist, une piste ou un
+//!   favori. Une capacité absente est la seule garde qu'on ne contourne pas.
+//! * **Toute écriture chez un service purge son cache de contenu utilisateur**
+//!   ([`tune_streaming_http::purge_contenu_utilisateur`]) — sans quoi l'écran
+//!   sert la liste mémorisée 120 s et la playlist qui vient d'être créée
+//!   « n'existe pas ».
+//! * **Le stockage clé/valeur est cloisonné par greffon** : la clé écrite en
+//!   base est préfixée par l'identifiant de manifeste, que l'hôte range dans
+//!   le `Store` au chargement. Il vit dans la table `settings`, par
+//!   [`SettingsRepo`] : ce que cette table fait déjà, sans table de plus.
+//!
+//! Les capacités `streaming` passent par le MÊME pont `block_on` que
+//! `now_playing`/`play` — pas de second mécanisme.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,13 +50,23 @@ use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 use tune_core::db::backend::DbBackend;
+use tune_core::db::models::Track;
 use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
+use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::event_bus::EventBus;
+use tune_core::library::appariement_bibliotheque::apparier_en_bibliotheque;
 use tune_core::orchestrator::{PlayRequest, PlaybackOrchestrator};
 use tune_core::playback::PlaybackManager;
 use tune_core::plugins::{PluginManager, PluginManifest};
+use tune_core::streaming::ServiceRegistry;
+use tune_core::streaming::matching::{
+    MATCH_ACCEPT_SCORE, MAX_CANDIDATS_APPARIEMENT, apparier_chez_le_service_classe,
+};
+use tune_core::streaming::traits::StreamingService;
+use tune_http_types::DEFAULT_PROFILE_ID;
 use tune_plugin_runtime_wasm::{HostContext, Limits, WasmPlugin};
 
 use crate::state::AppState;
@@ -58,6 +89,89 @@ pub struct AppStateHost {
     playback: Arc<PlaybackManager>,
     orchestrator: Arc<PlaybackOrchestrator>,
     event_bus: Arc<EventBus>,
+    /// Le parc des services de streaming (#4716) : la permission `streaming`
+    /// lit et écrit à travers lui, exactement comme les routes.
+    services: Arc<tokio::sync::Mutex<ServiceRegistry>>,
+}
+
+/// Préfixe des clés du stockage cloisonné des greffons (#4716).
+///
+/// Le stockage vit dans la table `settings`, par [`SettingsRepo`] — pas de
+/// table de plus : une clé/valeur par greffon, c'est exactement ce que cette
+/// table fait déjà pour le serveur, avec son `upsert` et son `all()`.
+///
+/// Le séparateur est `:` et non `_` **à dessein** : un identifiant de greffon
+/// ne peut contenir que `[A-Za-z0-9_-]` (voir `persist_plugin_archive_in`), si
+/// bien que `:` ne peut apparaître ni dans l'identifiant ni entre lui et la
+/// clé. Avec `_`, le greffon `a_b` et la clé `x` auraient écrit dans la même
+/// ligne que le greffon `a` et la clé `b_x` — deux états distincts sur une
+/// seule clé, c'est-à-dire une collision silencieuse.
+const PREFIXE_KV_GREFFON: &str = "plugin_kv:";
+
+/// Taille maximale d'une valeur du stockage clé/valeur, une fois sérialisée.
+///
+/// Le stockage sert à l'état des transferts, aux snapshots et aux liens de
+/// synchro : quelques kilo-octets. La borne empêche un greffon de remplir la
+/// table `settings` — qui est relue en entier par `all()`.
+const TAILLE_MAX_VALEUR_KV: usize = 256 * 1024;
+
+/// Ce qu'un convertisseur a besoin de lire d'une piste LOCALE pour apparier :
+/// titre, artiste, album, durée, ISRC — et de quoi la remettre en playlist.
+///
+/// Le reste de la fiche ne l'intéresse pas et gonflerait la mémoire linéaire
+/// du bac à sable. Une seule forme pour `playlist_tracks`, `library_search` et
+/// `library_match_track` : le greffon n'a pas à apprendre trois dialectes.
+fn fiche_piste(t: &Track) -> Value {
+    json!({
+        "track_id": t.id,
+        "title": t.title,
+        "artist_name": t.artist_name,
+        "album_title": t.album_title,
+        "duration_ms": t.duration_ms,
+        "isrc": t.isrc,
+        "source": t.source,
+        "source_id": t.source_id,
+    })
+}
+
+/// La réponse d'un appariement à PLUSIEURS candidats (#4716).
+///
+/// Forme COMPATIBLE avec celle d'avant : `matched`, `score` et `approximate`
+/// désignent toujours le verdict — exactement celui que rendait la version à
+/// un seul candidat. S'y ajoutent `candidates` (le classement complet, verdict
+/// en tête, plafonné par [`MAX_CANDIDATS_APPARIEMENT`]) et son `count`.
+///
+/// C'est ce que le greffon attendait : quand le verdict rate SA règle (un
+/// écart de durée de plus de 3 s), il redescend d'un cran au lieu de déclarer
+/// le titre introuvable.
+fn reponse_appariement(candidats: &[(Value, f64)]) -> Value {
+    let liste: Vec<Value> = candidats
+        .iter()
+        .map(|(piste, score)| {
+            json!({
+                "track": piste,
+                "score": score,
+                "approximate": *score < MATCH_ACCEPT_SCORE,
+            })
+        })
+        .collect();
+    match candidats.first() {
+        Some((piste, score)) => json!({
+            "matched": piste,
+            "score": score,
+            // Sous le seuil d'acceptation, le fuzzy a bien trouvé quelque
+            // chose mais ce n'est pas une certitude : le greffon doit pouvoir
+            // le présenter comme approximatif au lieu de l'écrire en silence.
+            "approximate": *score < MATCH_ACCEPT_SCORE,
+            "count": liste.len(),
+            "candidates": liste,
+        }),
+        None => json!({
+            "matched": Value::Null,
+            "count": 0,
+            "candidates": Vec::<Value>::new(),
+        }),
+    }
 }
 
 impl AppStateHost {
@@ -68,7 +182,69 @@ impl AppStateHost {
             playback: state.playback.clone(),
             orchestrator: state.orchestrator.clone(),
             event_bus: state.event_bus.clone(),
+            services: state.services.clone(),
         }
+    }
+
+    /// Le profil au nom duquel un greffon agit.
+    ///
+    /// Un greffon n'a pas d'en-tête `X-Profile-Id` : il n'est dans aucune
+    /// requête HTTP. On retient donc le MÊME repli que l'extracteur
+    /// [`crate::routes::active_profile::ActiveProfile`] — le réglage global
+    /// `active_profile_id`, puis le profil par défaut — pour qu'une playlist
+    /// créée par un greffon atterrisse là où l'utilisateur la cherchera.
+    fn profil_actif(&self) -> i64 {
+        SettingsRepo::with_backend(self.backend.clone())
+            .get("active_profile_id")
+            .ok()
+            .flatten()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .unwrap_or(DEFAULT_PROFILE_ID)
+    }
+
+    /// Le service nommé, ou une erreur lisible par le greffon.
+    fn service(
+        &self,
+        service: &str,
+    ) -> Result<Arc<tokio::sync::RwLock<Box<dyn StreamingService>>>, String> {
+        if service.is_empty() {
+            return Err("service manquant".to_string());
+        }
+        let registry = block_on(self.services.lock());
+        registry
+            .get(service)
+            .ok_or_else(|| format!("service inconnu : {service}"))
+    }
+
+    /// La clé réellement écrite en base pour `(greffon, cle)`.
+    ///
+    /// Refuse tout ce qui n'est pas cloisonnable : sans identifiant de greffon,
+    /// deux greffons partageraient le même espace de noms.
+    fn cle_kv(plugin_id: &str, cle: &str) -> Result<String, String> {
+        if plugin_id.is_empty() {
+            return Err("kv: greffon non identifié".to_string());
+        }
+        if !plugin_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "kv: identifiant de greffon invalide : {plugin_id:?}"
+            ));
+        }
+        if cle.is_empty() {
+            return Err("kv: clé vide".to_string());
+        }
+        Ok(format!("{PREFIXE_KV_GREFFON}{plugin_id}:{cle}"))
+    }
+
+    /// Le préfixe de toutes les clés d'un greffon.
+    fn espace_kv(plugin_id: &str) -> Result<String, String> {
+        // `cle_kv` porte toutes les validations ; on lui passe une clé factice
+        // et on ne garde que l'espace de noms.
+        let complet = Self::cle_kv(plugin_id, "x")?;
+        Ok(complet[..complet.len() - 1].to_string())
     }
 
     /// The zone's assigned output device id, if any — network capabilities
@@ -248,6 +424,346 @@ impl HostContext for AppStateHost {
 
     fn emit(&self, event: &str, payload: Value) {
         self.event_bus.emit(event, payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — `playlists`
+    //
+    // Lecture et ajout, jamais de suppression : il n'existe aucune capacité
+    // pour effacer une playlist ou en retirer une piste.
+    // -----------------------------------------------------------------------
+
+    fn playlists_list(&self, limit: i64, offset: i64) -> Result<Value, String> {
+        // Bornes défensives : un greffon qui demande `limit: 0` (champ absent
+        // mal rempli) ou un million de lignes ne doit pas décider de la charge.
+        let limit = limit.clamp(1, 1000);
+        let offset = offset.max(0);
+        let profil = self.profil_actif();
+        let playlists =
+            PlaylistRepo::with_backend(self.backend.clone()).list(profil, limit, offset)?;
+        Ok(json!({
+            "profile_id": profil,
+            "count": playlists.len(),
+            "playlists": playlists,
+        }))
+    }
+
+    fn playlist_tracks(&self, playlist_id: i64) -> Result<Value, String> {
+        let profil = self.profil_actif();
+        let repo = PlaylistRepo::with_backend(self.backend.clone());
+        // `get_for_profile` et non `get` : les ids de playlists sont de petits
+        // entiers séquentiels, un `WHERE id = ?` nu laisserait un greffon lire
+        // la playlist d'un autre profil du foyer (#2794).
+        let playlist = repo
+            .get_for_profile(playlist_id, profil)?
+            .ok_or_else(|| format!("playlist introuvable : {playlist_id}"))?;
+        let ids = repo.get_track_ids(playlist_id)?;
+        let pistes = TrackRepo::with_backend(self.backend.clone())
+            .get_multiple(&ids)
+            .map_err(|e| e.to_string())?;
+        // Ce que le convertisseur a besoin de lire pour apparier : titre,
+        // artiste, durée, ISRC — la fiche commune à toutes les capacités qui
+        // rendent des pistes locales.
+        let pistes: Vec<Value> = pistes.iter().map(fiche_piste).collect();
+        Ok(json!({
+            "playlist_id": playlist_id,
+            "name": playlist.name,
+            "count": pistes.len(),
+            "tracks": pistes,
+        }))
+    }
+
+    fn playlist_create(&self, name: &str, description: Option<&str>) -> Result<Value, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("playlist_create: nom vide".to_string());
+        }
+        let profil = self.profil_actif();
+        let id =
+            PlaylistRepo::with_backend(self.backend.clone()).create(name, description, profil)?;
+        info!(target: "plugin", playlist_id = id, profile_id = profil, "plugin_playlist_creee");
+        Ok(json!({ "playlist_id": id, "name": name, "profile_id": profil }))
+    }
+
+    fn playlist_add_tracks(&self, playlist_id: i64, track_ids: Vec<i64>) -> Result<Value, String> {
+        if track_ids.is_empty() {
+            return Err("playlist_add_tracks: aucune piste".to_string());
+        }
+        let profil = self.profil_actif();
+        let repo = PlaylistRepo::with_backend(self.backend.clone());
+        if repo.get_for_profile(playlist_id, profil)?.is_none() {
+            return Err(format!("playlist introuvable : {playlist_id}"));
+        }
+        let inserees = repo.add_tracks(playlist_id, &track_ids, None)?;
+        // Le compte ANNONCÉ est celui des lignes écrites, pas des ids demandés
+        // (#3663) : un compteur qui ment est pire qu'un compteur absent.
+        Ok(json!({
+            "ok": true,
+            "added": inserees.len(),
+            "demandees": track_ids.len(),
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — `streaming`
+    //
+    // Pont synchrone → async par `block_on`, comme `now_playing`/`play` : le
+    // gestionnaire de route conduit l'appel wasm dans `spawn_blocking`, donc
+    // aucun de ces appels ne tourne sur un worker tokio.
+    // -----------------------------------------------------------------------
+
+    fn streaming_services(&self) -> Result<Value, String> {
+        block_on(async {
+            let registry = self.services.lock().await;
+            let statuts = registry.status_all().await;
+            let mut services: Vec<Value> = Vec::new();
+            for statut in &statuts {
+                let nom = statut.get("name").and_then(Value::as_str).unwrap_or("");
+                let authentifie = statut
+                    .get("authenticated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                // « les services AUTHENTIFIÉS » : un service déconnecté n'a ni
+                // playlists ni droit d'écriture, l'annoncer n'aiderait personne.
+                if !authentifie || nom.is_empty() {
+                    continue;
+                }
+                let ecrivable = match registry.get(nom) {
+                    Some(arc) => arc.read().await.supports_write(),
+                    None => false,
+                };
+                services.push(json!({
+                    "name": nom,
+                    "authenticated": true,
+                    "supports_write": ecrivable,
+                }));
+            }
+            Ok(json!({ "count": services.len(), "services": services }))
+        })
+    }
+
+    fn streaming_playlists(&self, service: &str) -> Result<Value, String> {
+        let arc = self.service(service)?;
+        let playlists = block_on(async { arc.read().await.get_user_playlists().await })
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "service": service,
+            "count": playlists.len(),
+            "playlists": playlists,
+        }))
+    }
+
+    fn streaming_playlist_tracks(&self, service: &str, playlist_id: &str) -> Result<Value, String> {
+        if playlist_id.is_empty() {
+            return Err("playlist_id manquant".to_string());
+        }
+        let arc = self.service(service)?;
+        let pistes = block_on(async { arc.read().await.get_playlist_tracks(playlist_id).await })
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "service": service,
+            "playlist_id": playlist_id,
+            "count": pistes.len(),
+            "tracks": pistes,
+        }))
+    }
+
+    fn streaming_playlist_create(
+        &self,
+        service: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<Value, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("streaming_playlist_create: nom vide".to_string());
+        }
+        let arc = self.service(service)?;
+        let resultat =
+            block_on(async { arc.read().await.create_playlist(name, description).await });
+        // 🔴 La purge est INCONDITIONNELLE et suit immédiatement l'écriture :
+        // un échec HTTP peut avoir abouti côté service (délai dépassé), et
+        // sans elle l'écran servirait la liste mémorisée 2 min — la playlist
+        // qui vient d'être créée « n'existerait pas ».
+        tune_streaming_http::purge_contenu_utilisateur(service);
+        let playlist_id = resultat.map_err(|e| e.to_string())?;
+        info!(
+            target: "plugin",
+            service = %service,
+            playlist_id = %playlist_id,
+            "plugin_playlist_creee_chez_le_service"
+        );
+        Ok(json!({ "service": service, "playlist_id": playlist_id, "name": name }))
+    }
+
+    fn streaming_playlist_add_tracks(
+        &self,
+        service: &str,
+        playlist_id: &str,
+        track_ids: Vec<String>,
+    ) -> Result<Value, String> {
+        if playlist_id.is_empty() {
+            return Err("playlist_id manquant".to_string());
+        }
+        if track_ids.is_empty() {
+            return Err("streaming_playlist_add_tracks: aucune piste".to_string());
+        }
+        let arc = self.service(service)?;
+        let resultat = block_on(async {
+            arc.read()
+                .await
+                .add_tracks_to_playlist(playlist_id, &track_ids)
+                .await
+        });
+        // Même règle que ci-dessus : on purge après TOUTE écriture.
+        tune_streaming_http::purge_contenu_utilisateur(service);
+        let ajoutees = resultat.map_err(|e| e.to_string())?;
+        Ok(json!({
+            "ok": true,
+            "added": ajoutees,
+            "demandees": track_ids.len(),
+        }))
+    }
+
+    fn streaming_match_track(
+        &self,
+        service: &str,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<Value, String> {
+        if title.is_empty() {
+            return Err("streaming_match_track: titre vide".to_string());
+        }
+        let arc = self.service(service)?;
+        // L'appariement N'EST PAS réécrit ici : `apparier_chez_le_service_classe`
+        // dépouille la MÊME recherche que `transfer_playlist`, avec le même
+        // scoring, et sa tête est le verdict de la route. Un seul verdict pour
+        // l'écran et pour le greffon — avec, en plus, les candidats suivants.
+        let apparies = block_on(async {
+            let svc = arc.read().await;
+            apparier_chez_le_service_classe(
+                &**svc,
+                title,
+                artist,
+                isrc,
+                duration_ms,
+                MAX_CANDIDATS_APPARIEMENT,
+            )
+            .await
+        })?;
+        let candidats: Vec<(Value, f64)> = apparies
+            .into_iter()
+            .filter_map(|(piste, score)| serde_json::to_value(piste).ok().map(|v| (v, score)))
+            .collect();
+        let mut rendu = reponse_appariement(&candidats);
+        rendu["service"] = json!(service);
+        Ok(rendu)
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — `library`
+    //
+    // Le sens SERVICE → BIBLIOTHÈQUE. Lecture seule : chercher et apparier,
+    // rien d'autre. La recherche est celle du serveur (`TrackRepo::search`,
+    // l'index plein texte) et l'appariement celui de `track_matcher` — aucun
+    // des deux n'est réécrit ici.
+    // -----------------------------------------------------------------------
+
+    fn library_search(&self, query: &str, limit: i64) -> Result<Value, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("library_search: requête vide".to_string());
+        }
+        // Bornes défensives, comme `playlists_list` : ce n'est pas au greffon
+        // de décider de la charge.
+        let limit = limit.clamp(1, 200);
+        let pistes = TrackRepo::with_backend(self.backend.clone())
+            .search(query, limit)
+            .map_err(|e| e.to_string())?;
+        let pistes: Vec<Value> = pistes.iter().map(fiche_piste).collect();
+        Ok(json!({
+            "query": query,
+            "count": pistes.len(),
+            "tracks": pistes,
+        }))
+    }
+
+    fn library_match_track(
+        &self,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<Value, String> {
+        if title.is_empty() {
+            return Err("library_match_track: titre vide".to_string());
+        }
+        let repo = TrackRepo::with_backend(self.backend.clone());
+        let apparies = apparier_en_bibliotheque(
+            &repo,
+            title,
+            artist,
+            isrc,
+            duration_ms as i64,
+            MAX_CANDIDATS_APPARIEMENT,
+        )?;
+        // Même forme que l'appariement chez un service : le greffon applique
+        // sa tolérance de durée sur `candidates` des deux côtés, sans écrire
+        // deux fois la même logique.
+        let candidats: Vec<(Value, f64)> = apparies
+            .iter()
+            .map(|(piste, score)| (fiche_piste(piste), *score))
+            .collect();
+        Ok(reponse_appariement(&candidats))
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — `kv` : stockage cloisonné par greffon, dans `settings`
+    // -----------------------------------------------------------------------
+
+    fn kv_get(&self, plugin_id: &str, key: &str) -> Result<Value, String> {
+        let cle = Self::cle_kv(plugin_id, key)?;
+        let brut = SettingsRepo::with_backend(self.backend.clone()).get(&cle)?;
+        Ok(match brut {
+            // Ce qui a été écrit est du JSON ; une valeur illisible (écriture
+            // d'une autre version) revient en texte plutôt qu'en erreur.
+            Some(s) => json!({
+                "key": key,
+                "found": true,
+                "value": serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
+            }),
+            None => json!({ "key": key, "found": false, "value": Value::Null }),
+        })
+    }
+
+    fn kv_set(&self, plugin_id: &str, key: &str, value: Value) -> Result<Value, String> {
+        let cle = Self::cle_kv(plugin_id, key)?;
+        let serialisee =
+            serde_json::to_string(&value).map_err(|e| format!("kv_set: valeur illisible : {e}"))?;
+        if serialisee.len() > TAILLE_MAX_VALEUR_KV {
+            return Err(format!(
+                "kv_set: valeur trop grande ({} octets, maximum {TAILLE_MAX_VALEUR_KV})",
+                serialisee.len()
+            ));
+        }
+        SettingsRepo::with_backend(self.backend.clone()).set(&cle, &serialisee)?;
+        Ok(json!({ "ok": true, "key": key, "bytes": serialisee.len() }))
+    }
+
+    fn kv_list(&self, plugin_id: &str, prefix: &str) -> Result<Value, String> {
+        let espace = Self::espace_kv(plugin_id)?;
+        let toutes = SettingsRepo::with_backend(self.backend.clone()).all()?;
+        let mut cles: Vec<String> = toutes
+            .into_iter()
+            .filter_map(|(k, _)| k.strip_prefix(&espace).map(str::to_string))
+            // Le filtre du greffon s'applique à SA clé, jamais au préfixe de
+            // cloisonnement — qu'il n'a aucune raison de connaître.
+            .filter(|k| k.starts_with(prefix))
+            .collect();
+        cles.sort();
+        Ok(json!({ "count": cles.len(), "keys": cles }))
     }
 }
 
@@ -549,7 +1065,12 @@ pub async fn load_wasm_plugins(state: &AppState) {
         }
 
         let permissions: HashSet<String> = info.manifest.permissions.iter().cloned().collect();
-        match WasmPlugin::load_with_host(&entry, Limits::default(), host.clone(), permissions) {
+        // L'identifiant de manifeste part avec le greffon : c'est lui qui
+        // cloisonne son stockage clé/valeur (#4716), et il vient d'ici — du
+        // manifeste lu par l'hôte —, jamais du greffon lui-même.
+        let charge =
+            WasmPlugin::load_with_host(&entry, Limits::default(), host.clone(), permissions, &id);
+        match charge {
             Ok(plugin) => {
                 info!(
                     id = %id,
