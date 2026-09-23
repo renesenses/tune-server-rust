@@ -582,10 +582,54 @@ pub(super) fn cible_encodable(
 /// le bras que ni #1168 (navigateur), ni #1653 (sorties PULL), ni #2950 (bras
 /// progressif de `play_inner`) n'atteignaient — aucun ne passe par ici.
 ///
+/// Une TROISIÈME raison depuis le silence à 96 kHz de Silviu : le plafond de
+/// fréquence de la zone. Le proxy verbatim relaie les octets du CDN tels
+/// quels ; un 192 kHz y atteignait donc un renderer dont le DAC plafonne à
+/// 96 kHz, qui ne verrouille pas et joue du SILENCE — pendant que le panneau
+/// annonçait « 192 → 96 kHz ». Rééchantillonner demande de décoder, donc de
+/// pré-transcoder : c'est ce bras-ci, celui qui décode déjà.
+///
 /// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
 /// `use_file_transcode_for`.
-pub(super) fn streaming_needs_pretranscode(renderer_supports_mime: bool, dsp_active: bool) -> bool {
-    !renderer_supports_mime || dsp_active
+pub(super) fn streaming_needs_pretranscode(
+    renderer_supports_mime: bool,
+    dsp_active: bool,
+    plafond_de_zone: bool,
+) -> bool {
+    !renderer_supports_mime || dsp_active || plafond_de_zone
+}
+
+/// Le plafond de fréquence de la zone appliqué à un flux de SERVICE (Qobuz,
+/// Tidal, YouTube…), et la règle « bit-perfect strict » avec lui.
+///
+/// 🔴 **Ce plafond n'existait QUE pour la bibliothèque locale.**
+/// `resolve_local.rs` le pose depuis toujours (plafond combiné zone+catalogue,
+/// puis refus ou rééchantillonnage) ; le bras des services, lui, servait la
+/// cadence du service sans jamais la lire. Une zone réglée sur 96 kHz recevait
+/// donc du 192 kHz sur le fil — silence sur un DAC qui plafonne à 96 kHz, et
+/// « Bit-perfect strict » ne refusait rien, puisque aucun de ses quatre sites
+/// n'est sur ce chemin.
+///
+/// Rend la cadence à SERVIR : `None` quand il n'y a rien à faire (pas de
+/// plafond, ou la source tient dessous), `Some(hz)` quand il faut
+/// rééchantillonner, `Err` quand « bit-perfect strict » refuse plutôt que de
+/// convertir — la MÊME sentinelle que les autres sites, pour que la route HTTP
+/// et le client composent la phrase dans leur langue.
+pub(super) fn plafond_de_flux_de_service(
+    source_hz: u32,
+    plafond_de_zone: Option<u32>,
+    strict: bool,
+) -> Result<Option<u32>, crate::audio::bitperfect_strict::RefusBitPerfect> {
+    let Some(max) = plafond_de_zone else {
+        return Ok(None);
+    };
+    if max == 0 || source_hz <= max {
+        return Ok(None);
+    }
+    match crate::audio::bitperfect_strict::decision_bitperfect(source_hz, max, strict).refus() {
+        Some(refus) => Err(refus),
+        None => Ok(Some(max)),
+    }
 }
 
 /// Format d'encodage du pré-transcodage streaming.
