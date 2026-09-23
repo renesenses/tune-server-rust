@@ -37,17 +37,28 @@ use tokio::sync::Mutex;
 const ID: i64 = 62_301;
 const RENDERER: &str = "dlna:renderer-1";
 
-/// Un DSF minuscule mais VALIDE (en-tête `DSD `, `fmt `, `data`), stéréo
-/// DSD64, un bloc par canal. Le motif 0x55 (±1 alterné) décode en quasi
+/// Nombre de super-blocs (un bloc par canal) du DSF de test.
+const SUPER_BLOCS: usize = 16;
+/// Ce que le serveur média envoie AVANT de marquer une pause : l'en-tête et
+/// la première moitié des blocs — de quoi décoder plusieurs blocs PCM.
+const MOITIE: usize = 92 + SUPER_BLOCS / 2 * 2 * 4096;
+/// La pause du serveur entre les deux moitiés : un serveur qui cadence sa
+/// route au débit nominal du flux, en accéléré.
+const PAUSE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Un DSF petit mais VALIDE (en-tête `DSD `, `fmt `, `data`), stéréo DSD64,
+/// seize blocs par canal. Le motif 0x55 (±1 alterné) décode en quasi
 /// silence — ce n'est pas le son qu'on teste, c'est le CHEMIN.
 fn dsf_minuscule() -> Vec<u8> {
     let channels: u32 = 2;
     let block_size: u32 = 4096;
     let sample_rate: u32 = 2_822_400;
-    let total_samples: u64 = block_size as u64 * 8;
+    let total_samples: u64 = block_size as u64 * 8 * SUPER_BLOCS as u64;
     let mut data = Vec::new();
-    for _ in 0..channels {
-        data.extend(std::iter::repeat_n(0x55u8, block_size as usize));
+    for _ in 0..SUPER_BLOCS {
+        for _ in 0..channels {
+            data.extend(std::iter::repeat_n(0x55u8, block_size as usize));
+        }
     }
     let mut buf = Vec::new();
     buf.extend_from_slice(b"DSD ");
@@ -73,10 +84,13 @@ fn dsf_minuscule() -> Vec<u8> {
 
 /// Le « serveur média » : un serveur HTTP qui publie le DSF sous une URL SANS
 /// extension, en `application/x-dsd` — exactement ce que le serveur média de
-/// Tune publie dans son `<res>`. Compte les GET reçus.
+/// Tune publie dans son `<res>`. Compte les GET reçus, et dit quand il a
+/// FINI d'envoyer un corps : il marque une pause au milieu, comme le .15 qui
+/// cadence sa route audio au débit nominal du flux (5 minutes pour un DSD64).
 struct ServeurMedia {
     url: String,
     requetes: Arc<AtomicUsize>,
+    corps_termines: Arc<AtomicUsize>,
     _tache: tokio::task::JoinHandle<()>,
 }
 
@@ -93,7 +107,9 @@ async fn serveur_media() -> ServeurMedia {
         listener.local_addr().unwrap()
     );
     let requetes = Arc::new(AtomicUsize::new(0));
+    let corps_termines = Arc::new(AtomicUsize::new(0));
     let compteur = requetes.clone();
+    let termines = corps_termines.clone();
     let corps = dsf_minuscule();
     let tache = tokio::spawn(async move {
         loop {
@@ -117,13 +133,18 @@ async fn serveur_media() -> ServeurMedia {
                 corps.len()
             );
             let _ = socket.write_all(entete.as_bytes()).await;
-            let _ = socket.write_all(&corps).await;
+            let _ = socket.write_all(&corps[..MOITIE]).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(PAUSE).await;
+            let _ = socket.write_all(&corps[MOITIE..]).await;
             let _ = socket.shutdown().await;
+            termines.fetch_add(1, Ordering::SeqCst);
         }
     });
     ServeurMedia {
         url,
         requetes,
+        corps_termines,
         _tache: tache,
     }
 }
@@ -193,15 +214,28 @@ fn demande(zone_id: i64, sample_rate: u32, bit_depth: u16) -> PlayRequest {
 /// répond rien : chemin sûr) : la sortie ne reçoit PAS l'URL distante brute
 /// mais un flux WAV de Tune, décimé côté serveur — ce que le chemin local
 /// fait d'un `.dsf` sur cette même zone.
+///
+/// Et AU FIL DE L'EAU : la résolution rend la main avant la fin du
+/// téléchargement, et le premier octet WAV — en-tête puis PCM décodé — part
+/// pendant que le serveur média marque encore sa pause. Mesuré sur le .18
+/// (23/09, zone en `pcm`) : 5 minutes de téléchargement entier avant le
+/// premier décodage, `/play` muet 30 s, rien au bout de 10 minutes.
 #[tokio::test]
 async fn en_pcm_le_dsd_distant_part_decime_par_tune_pas_en_url_brute() {
     for dsd_mode in ["pcm", "auto"] {
         let serveur = serveur_media().await;
         let (orch, zone_id) = orchestrateur(dsd_mode, "dsd", &serveur.url);
+        let depart = std::time::Instant::now();
         let resolu = orch
             .resolve_stream(&demande(zone_id, 2_822_400, 1))
             .await
             .unwrap();
+        assert!(
+            depart.elapsed() < PAUSE,
+            "[{dsd_mode}] la résolution ne doit pas attendre la fin du téléchargement \
+             ({:?})",
+            depart.elapsed()
+        );
 
         assert_ne!(
             resolu.url, serveur.url,
@@ -230,10 +264,46 @@ async fn en_pcm_le_dsd_distant_part_decime_par_tune_pas_en_url_brute() {
             "[{dsd_mode}] l'origine reste connue"
         );
         assert_eq!(resolu.source, "upnp", "[{dsd_mode}]");
+
+        // Le premier son part AVANT que le serveur ait fini d'envoyer.
+        let sid = resolu.stream_id.as_deref().unwrap();
+        let session = orch
+            .streamer
+            .sessions_state()
+            .lock()
+            .await
+            .get(sid)
+            .cloned()
+            .expect("la session existe");
+        let mut recu = Vec::new();
+        while recu.len() <= 44 {
+            let bloc = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                session.recv_chunk(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("[{dsd_mode}] du WAV doit arriver sans attendre la fin du téléchargement")
+            })
+            .expect("le canal est ouvert");
+            recu.extend_from_slice(&bloc);
+        }
+        assert_eq!(
+            &recu[..4],
+            b"RIFF",
+            "[{dsd_mode}] l'en-tête WAV part en premier"
+        );
+        assert!(recu.len() > 44, "[{dsd_mode}] du PCM décodé suit l'en-tête");
+        assert_eq!(
+            serveur.corps_termines.load(Ordering::SeqCst),
+            0,
+            "[{dsd_mode}] le PCM est parti pendant que le serveur média envoyait encore : \
+             décodage au fil de l'eau, pas de téléchargement préalable"
+        );
         assert_eq!(
             serveur.requetes.load(Ordering::SeqCst),
             1,
-            "[{dsd_mode}] Tune a téléchargé le fichier pour le décoder"
+            "[{dsd_mode}] Tune tire le fichier UNE fois, pour le décoder"
         );
     }
 }

@@ -1253,23 +1253,30 @@ impl PlaybackOrchestrator {
                     headers: Vec::new(),
                 };
                 let cadence = self.cadence_servie_pour_un_service(req, &stream_data)?;
-                let (url, session_id, mime, _taille) = self
-                    .pretranscoder_en_flac(
-                        req,
-                        "upnp",
-                        &stream_data,
-                        conteneur.to_string(),
-                        cadence,
-                    )
-                    .await?;
-                (
-                    url,
-                    session_id,
-                    mime,
-                    Some(cadence.unwrap_or(stream_data.quality.sample_rate)),
-                    Some(24u32),
-                    Some(2u32),
-                )
+                let sr = cadence.unwrap_or(stream_data.quality.sample_rate);
+                let (url, session_id, mime) = if conteneur == "dsf" {
+                    // Au fil de l'eau : mesuré sur le .18 (23/09, 17:xx UTC),
+                    // le téléchargement ENTIER du DSF prenait 5 minutes — le
+                    // .15 cadence sa route audio au débit nominal du flux —
+                    // puis le décodage complet 5 de plus, sans un son ni
+                    // même une réponse de `/play` en 30 s.
+                    self.decoder_le_dsf_distant_en_wav(req, audio_url, sr).await
+                } else {
+                    // DFF : le lecteur de blocs n'a pas (encore) de source
+                    // HTTP ; c'est le chemin des services, téléchargement
+                    // compris.
+                    let (url, session_id, mime, _taille) = self
+                        .pretranscoder_en_flac(
+                            req,
+                            "upnp",
+                            &stream_data,
+                            conteneur.to_string(),
+                            cadence,
+                        )
+                        .await?;
+                    (url, session_id, mime)
+                };
+                (url, session_id, mime, Some(sr), Some(24u32), Some(2u32))
             }
         };
         Ok(ResolvedStream {
@@ -1289,6 +1296,109 @@ impl PlaybackOrchestrator {
             origin_url: Some(audio_url.to_string()),
             bitrate_kbps: None,
         })
+    }
+
+    /// Le bras PCM d'un DSF de serveur média, AU FIL DE L'EAU : le corps HTTP
+    /// est décodé bloc par bloc vers un canal WAV (`decode_dsf_http_to_pcm_streaming`),
+    /// comme une radio (`decoder_la_radio_en_wav`) — la session est rendue
+    /// tout de suite, le premier son part dès les premiers blocs, aucun
+    /// fichier temporaire. Chaîne DSP et niveaux comme `pretranscoder_en_flac`.
+    async fn decoder_le_dsf_distant_en_wav(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        sr: u32,
+    ) -> (String, Option<String>, String) {
+        let bd: u16 = 24;
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: sr,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: req.duration_ms.map(|d| d as u64),
+            ..Default::default()
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let tx = if dsp.is_active() {
+            info!(
+                zone_id = req.zone_id,
+                "dsd_upnp_wav_channel_dsp_relay_inserted"
+            );
+            spawn_streaming_dsp_relay(dsp, bd, true, tx)
+        } else {
+            tx
+        };
+        // L'en-tête WAV part DANS le canal (voir `anticiper_le_dop`) : sans ce
+        // drapeau, `handle_stream` en préfixerait un second.
+        {
+            let sessions = self.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .wav_header_included
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        info!(
+            zone_id = req.zone_id,
+            url = %audio_url,
+            sample_rate = sr,
+            bit_depth = bd,
+            "dsd_upnp_decodage_progressif_en_wav"
+        );
+
+        let ev_bus = self.event_bus.clone();
+        let playback = self.playback.clone();
+        let zone_id = req.zone_id;
+        let attach_levels = self.levels_attach_allowed(zone_id);
+        let url = audio_url.to_string();
+        tokio::spawn(async move {
+            let err_bus = ev_bus.clone();
+            let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                Some(bus) => {
+                    let play_seq = playback.current_play_seq(zone_id).await;
+                    spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0)
+                }
+                None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
+            };
+            let url_decode = url.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::audio::decode::decode_dsf_http_to_pcm_streaming(
+                    &url_decode,
+                    Some(sr),
+                    Some(2),
+                    bd,
+                    tx,
+                    32768,
+                    data_ready,
+                    levels_tx,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => debug!(url = %url, "dsd_upnp_wav_channel_complete"),
+                Ok(Err(e)) => {
+                    warn!(url = %url, error = %e, "dsd_upnp_wav_channel_decode_failed");
+                    if let Some(ref bus) = err_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": format!("Impossible de décoder la piste DSD : {e}"),
+                            }),
+                        );
+                    }
+                }
+                Err(e) => warn!(url = %url, error = %e, "dsd_upnp_wav_channel_task_panic"),
+            }
+        });
+
+        let server_ip = self.server_ip();
+        let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+        (stream_url, Some(session_id), "audio/wav".to_string())
     }
 
     /// Le bras DoP d'une piste DSD de serveur média : téléchargement, puis
