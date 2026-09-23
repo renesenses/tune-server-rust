@@ -162,6 +162,7 @@ impl StreamingService for Doublure {
     /// et ses essais seraient verts contre rien.
     async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
         Ok(vec![StreamAlbum {
+            release_type: None,
             id: format!("{}-nouveaute-1", self.0),
             title: format!("Inedits chez {}", self.0),
             artist: ARTISTE.into(),
