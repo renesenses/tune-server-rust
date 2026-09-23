@@ -36,7 +36,39 @@ use super::sqlite::SqliteDb;
 /// c'est précisément la panne silencieuse que cette liste ferme. Étiqueter un
 /// label demande une décision de modèle — l'aligner sur `favorite_facets`, ou
 /// donner enfin une identité aux labels — qui n'appartient pas à ce correctif.
-pub const TAGGABLE_ITEM_TYPES: [&str; 4] = ["album", "artist", "playlist", "track"];
+///
+/// # `smart_playlist` est un type À PART, jamais déduit de `playlist` (#4798)
+///
+/// Une playlist intelligente a bien un identifiant entier — `smart_playlists.id`
+/// — mais cet espace **se recouvre** avec celui de `playlists` : l'id 1 existe
+/// dans les deux tables. Un client qui poserait `item_type = "playlist"` avec
+/// l'id d'une playlist intelligente étiquetterait une AUTRE playlist, sans
+/// que rien ne le dise. D'où un type distinct, écrit tel quel, et une route de
+/// lecture à lui (`/tags/{id}/smart-playlists`) qui ne résout que dans
+/// `smart_playlists`. C'est la même leçon que les collections : `collection`
+/// et `smart_collection` partagent l'id 1 sur le serveur de Bertrand.
+///
+/// # `collection` et `smart_collection`, deux types À PART eux aussi (#4798)
+///
+/// Relevé pendant #4798 : l'écran Collections posait déjà le bouton Étiquette
+/// sur chaque pochette, avec `item_type = "collection"` ou
+/// `"smart_collection"` — et le serveur répondait 400, faute de connaître ces
+/// deux types. Un dossier vit dans le réglage JSON `collections` (identifiant
+/// = max + 1), une collection intelligente dans la table `smart_collections`
+/// (autoincrément) : deux espaces d'identifiants qui **se recouvrent** — l'id
+/// 1 est à la fois « favorites » et « Audiophile » sur le serveur de Bertrand.
+/// Le type reste donc écrit tel quel, jamais déduit, et chacun a sa route de
+/// lecture (`/tags/{id}/collections`, `/tags/{id}/smart-collections`) qui ne
+/// résout que dans SON espace.
+pub const TAGGABLE_ITEM_TYPES: [&str; 7] = [
+    "album",
+    "artist",
+    "collection",
+    "playlist",
+    "smart_collection",
+    "smart_playlist",
+    "track",
+];
 
 /// Vrai si `item_type` est un type d'objet étiquetable connu.
 pub fn is_taggable_item_type(item_type: &str) -> bool {
@@ -908,11 +940,12 @@ mod tests {
         );
     }
 
-    /// Les cinq types du modèle, moins `label` : quatre acceptés, `label`
-    /// refusé **tant qu'il n'a pas d'identité numérique** (voir la note de
-    /// [`TAGGABLE_ITEM_TYPES`]).
+    /// Les huit types du modèle, moins `label` : sept acceptés — dont
+    /// `smart_playlist`, `collection` et `smart_collection` depuis #4798 —,
+    /// `label` refusé **tant qu'il n'a pas d'identité numérique** (voir la
+    /// note de [`TAGGABLE_ITEM_TYPES`]).
     #[test]
-    fn les_quatre_types_a_identifiant_passent_et_label_est_refuse() {
+    fn les_sept_types_a_identifiant_passent_et_label_est_refuse() {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
@@ -920,16 +953,95 @@ mod tests {
         let repo = TagRepo::new(db);
         let tag_id = repo.create("Test", None).unwrap();
 
-        for (n, t) in ["album", "artist", "playlist", "track"].iter().enumerate() {
+        for (n, t) in TAGGABLE_ITEM_TYPES.iter().enumerate() {
             repo.tag_item(tag_id, t, n as i64 + 1)
                 .unwrap_or_else(|e| panic!("{t} doit être accepté : {e}"));
         }
-        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 4);
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 7);
 
         assert!(
             repo.tag_item(tag_id, "label", 1).is_err(),
             "`label` n'a pas d'identifiant numérique : item_id INTEGER ne peut pas le porter"
         );
+    }
+
+    /// #4798 — le test qui compte : `playlists.id` et `smart_playlists.id` se
+    /// recouvrent. Une playlist et une playlist intelligente de MÊME
+    /// identifiant doivent faire deux lignes, se lire chacune sous son type,
+    /// et se retirer l'une sans l'autre.
+    #[test]
+    fn une_playlist_et_une_playlist_intelligente_de_meme_id_ne_se_confondent_pas() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Dimanche", None).unwrap();
+
+        // Le même entier, sous les deux types : deux lignes, pas une.
+        repo.tag_item(tag_id, "playlist", 1).unwrap();
+        repo.tag_item(tag_id, "smart_playlist", 1).unwrap();
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 2);
+        assert_eq!(repo.items_by_tag(tag_id, "playlist").unwrap(), vec![1]);
+        assert_eq!(
+            repo.items_by_tag(tag_id, "smart_playlist").unwrap(),
+            vec![1]
+        );
+
+        // Retirer l'étiquette de la playlist ne touche pas l'intelligente.
+        repo.untag_item(tag_id, "playlist", 1).unwrap();
+        assert!(repo.items_by_tag(tag_id, "playlist").unwrap().is_empty());
+        assert_eq!(
+            repo.items_by_tag(tag_id, "smart_playlist").unwrap(),
+            vec![1],
+            "désétiqueter la playlist 1 a emporté la playlist intelligente 1"
+        );
+
+        // Et la garde #4678 vaut pour le nouveau type comme pour les autres.
+        assert!(repo.tag_item(tag_id, "smart_playlist", 0).is_err());
+        assert!(repo.tag_item(tag_id, "smart_playlist", -3).is_err());
+    }
+
+    /// #4798, second volet — la MÊME preuve pour les collections : un dossier
+    /// (réglage JSON `collections`) et une collection intelligente (table
+    /// `smart_collections`) portent l'id 1 tous les deux sur le serveur de
+    /// Bertrand. Deux lignes, deux lectures, deux retraits indépendants.
+    #[test]
+    fn une_collection_et_une_collection_intelligente_de_meme_id_ne_se_confondent_pas() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+
+        let repo = TagRepo::new(db);
+        let tag_id = repo.create("Vinyles", None).unwrap();
+
+        repo.tag_item(tag_id, "collection", 1).unwrap();
+        repo.tag_item(tag_id, "smart_collection", 1).unwrap();
+        assert_eq!(repo.all_items_by_tag(tag_id).unwrap().len(), 2);
+        assert_eq!(repo.items_by_tag(tag_id, "collection").unwrap(), vec![1]);
+        assert_eq!(
+            repo.items_by_tag(tag_id, "smart_collection").unwrap(),
+            vec![1]
+        );
+
+        // Retirer l'étiquette de l'intelligente ne touche pas le dossier.
+        repo.untag_item(tag_id, "smart_collection", 1).unwrap();
+        assert!(
+            repo.items_by_tag(tag_id, "smart_collection")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repo.items_by_tag(tag_id, "collection").unwrap(),
+            vec![1],
+            "désétiqueter la collection intelligente 1 a emporté le dossier 1"
+        );
+
+        // Et la garde #4678 vaut pour ces deux types comme pour les autres.
+        for t in ["collection", "smart_collection"] {
+            assert!(repo.tag_item(tag_id, t, 0).is_err(), "{t} : id 0 accepté");
+            assert!(repo.tag_item(tag_id, t, -3).is_err(), "{t} : id -3 accepté");
+        }
     }
 
     /// `batch_tag` ne passe pas par `tag_item`. Sans vérification propre, il
