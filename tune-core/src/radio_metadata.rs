@@ -126,6 +126,25 @@ async fn fetch_radio_metadata_depuis(
         return Some(meta);
     }
 
+    // Icecast générique — sixième famille (#2486). Ce n'est pas un diffuseur
+    // mais un LOGICIEL : `status-json.xsl` est la page d'état que tout serveur
+    // Icecast publie, sans clef ni compte, sur le même hôte que le flux.
+    //
+    // Elle règle un manque précis, mesuré le 23/09/2026 : les montages
+    // **Ogg/FLAC** n'annoncent AUCUN `icy-metaint` — Icecast ne transporte pas
+    // de bloc ICY hors MP3/AAC — et `fetch_icy_metadata` s'arrête donc sur son
+    // `?`. Neuf stations du catalogue passent par ici, dont cinq sur lesquelles
+    // l'écran ne montre RIEN aujourd'hui.
+    //
+    // Muette ou absente, la page laisse la main au repli ICY, exactement comme
+    // avant : aucune absence n'est fabriquée ici.
+    if let Some(status) = icecast_status_url(stream_url)
+        && let Some(montage) = montage_icecast(stream_url)
+        && let Some(meta) = fetch_icecast_status_metadata(&status, station_name, montage).await
+    {
+        return Some(meta);
+    }
+
     // Fallback: raw ICY metadata
     fetch_icy_metadata(stream_url).await
 }
@@ -1102,6 +1121,214 @@ async fn fetch_azuracast_metadata(api_url: &str, station_name: &str) -> Option<I
 
     let body: serde_json::Value = resp.json().await.ok()?;
     lire_now_playing_azuracast(&body, station_name)
+}
+
+// ---------------------------------------------------------------------------
+// Icecast générique (#2486)
+// ---------------------------------------------------------------------------
+
+/// La page d'état d'un serveur Icecast, à l'adresse que le logiciel impose.
+///
+/// `https://<hôte>/status-json.xsl` — même schéma, même hôte, même port que le
+/// flux. Aucune clef, aucun compte : c'est la page que l'administrateur
+/// d'Icecast publie par défaut depuis la 2.4.
+fn icecast_status_url(stream_url: &str) -> Option<String> {
+    let (schema, reste) = stream_url.split_once("://")?;
+    if schema != "http" && schema != "https" {
+        return None;
+    }
+    let (hote, _) = reste.split_once('/')?;
+    if hote.is_empty() {
+        return None;
+    }
+    Some(format!("{schema}://{hote}/status-json.xsl"))
+}
+
+/// Le **montage** d'une URL de flux : son chemin, sans la barre de tête.
+///
+/// C'est la seule partie de `listenurl` sur laquelle on peut s'appuyer pour
+/// retrouver son flux dans la page d'état. Mesuré le 23/09/2026 sur deux
+/// stations du catalogue, l'hôte et le port du `listenurl` ne sont PAS ceux par
+/// lesquels on écoute :
+///
+/// - Radio Calico : catalogue `https://stream.radio-calico.com/calico`,
+///   `listenurl` `http://stream.radio-calico.com:8080/calico` (autre schéma,
+///   autre port) ;
+/// - Linn Jazz : catalogue `http://radio.linn.co.uk:8003/autodj`,
+///   `listenurl` `http://radio.linnrecords.com:8003/autodj` (autre nom d'hôte).
+///
+/// Comparer les URL entières ne trouverait donc NI l'une NI l'autre.
+fn montage_icecast(url: &str) -> Option<&str> {
+    let (_, reste) = url.split_once("://")?;
+    let (_, chemin) = reste.split_once('/')?;
+    let chemin = chemin.split(['?', '#']).next()?.trim_end_matches('/');
+    (!chemin.is_empty()).then_some(chemin)
+}
+
+/// Les montages déclarés par la page d'état.
+///
+/// `icestats.source` est **polymorphe** : Icecast écrit un tableau quand le
+/// serveur porte plusieurs montages, et un objet nu quand il n'en porte qu'un.
+/// Ne lire que le tableau raterait tout serveur mono-montage.
+fn sources_icecast(body: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match body.get("icestats").and_then(|v| v.get("source")) {
+        Some(serde_json::Value::Array(v)) => v.iter().collect(),
+        Some(v @ serde_json::Value::Object(_)) => vec![v],
+        _ => Vec::new(),
+    }
+}
+
+/// Le nom du **programme** derrière un `server_name` de montage.
+///
+/// Un même programme est diffusé en plusieurs formats, et Icecast nomme chaque
+/// montage en accolant sa qualité au nom de la station. Relevé le 23/09/2026 :
+/// « Radio Calico - lossless » et « Radio Calico - 192kpbs », « Pure Classix
+/// Radio » et « Pure Classix Radio MP3 ». On retire donc le qualificatif
+/// introduit par « - », et l'on compare en minuscules.
+fn nom_de_programme(server_name: &str) -> String {
+    let base = server_name
+        .split_once(" - ")
+        .map_or(server_name, |(gauche, _)| gauche);
+    base.trim().to_lowercase()
+}
+
+/// Deux montages diffusent-ils le même programme ?
+///
+/// Oui si l'un des noms normalisés est préfixe de l'autre **à la frontière d'un
+/// mot** — « pure classix radio » couvre « pure classix radio mp3 », mais pas
+/// « pure lounge radio » (programme différent sur le même serveur, mesuré sur
+/// `mscp4.live-streams.nl:8140`) ni « jb radio2 » (autre programme de
+/// `mediacp.jb-radio.net:8001`, que le seul préfixe littéral aurait admis).
+fn meme_programme(a: &str, b: &str) -> bool {
+    fn couvre(court: &str, long: &str) -> bool {
+        !court.is_empty()
+            && long.starts_with(court)
+            && long[court.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| c == ' ' || c == '-')
+    }
+    couvre(a, b) || couvre(b, a)
+}
+
+/// Le morceau en cours d'un montage : titre, et artiste quand il est donné à
+/// part.
+///
+/// Trois formes coexistent dans les relevés du 23/09/2026 :
+/// - `artist` et `title` séparés (Radio Calico, montage MP3) ;
+/// - `title` seul portant « Artiste - Titre » (BluesWave, Linn, Morow) ;
+/// - `yp_currently_playing` seul, même forme (repli).
+///
+/// Sans titre — ou avec un titre vide une fois l'artiste retiré — on ne rend
+/// rien : le montage `live` de JB Radio2 annonce `yp_currently_playing =
+/// "JB RADIO2 - "`, qui est le nom de la station et non un morceau.
+fn morceau_icecast(source: &serde_json::Value) -> Option<(String, Option<String>)> {
+    let texte = |cle: &str| {
+        source
+            .get(cle)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+
+    if let (Some(titre), Some(artiste)) = (texte("title"), texte("artist")) {
+        return Some((titre.to_string(), Some(artiste.to_string())));
+    }
+
+    let brut = texte("title").or_else(|| texte("yp_currently_playing"))?;
+    match brut.split_once(" - ") {
+        Some((artiste, titre)) => {
+            let (artiste, titre) = (artiste.trim(), titre.trim());
+            if titre.is_empty() {
+                return None;
+            }
+            Some((
+                titre.to_string(),
+                (!artiste.is_empty()).then(|| artiste.to_string()),
+            ))
+        }
+        None => Some((brut.to_string(), None)),
+    }
+}
+
+/// Lire le morceau en cours du montage écouté dans une page d'état Icecast.
+///
+/// Deux passes, et la seconde est le cœur du correctif : le montage **sans
+/// perte** ne porte jamais de titre, parce qu'Icecast ne suit le titre en cours
+/// que pour les montages MP3/AAC. Son jumeau compressé, lui, le porte. On
+/// n'accepte ce jumeau que s'il diffuse le **même programme**
+/// ([`meme_programme`]), et on le journalise — jamais en silence.
+///
+/// Aucune pochette : une page d'état Icecast n'en publie pas. `cover_url` reste
+/// `None`, donc le logo de la station — juste — reste à l'écran.
+fn lire_status_icecast(
+    body: &serde_json::Value,
+    station_name: &str,
+    montage: &str,
+) -> Option<IcyMetadata> {
+    let sources = sources_icecast(body);
+    let mien = sources.iter().find(|s| {
+        s.get("listenurl")
+            .and_then(|v| v.as_str())
+            .and_then(montage_icecast)
+            == Some(montage)
+    })?;
+
+    let rendre = |(title, artist): (String, Option<String>)| IcyMetadata {
+        title,
+        artist,
+        station: Some(station_name.to_string()),
+        cover_url: None,
+    };
+
+    if let Some(morceau) = morceau_icecast(mien) {
+        return Some(rendre(morceau));
+    }
+
+    let mon_programme = nom_de_programme(mien.get("server_name")?.as_str()?);
+    for voisin in &sources {
+        if std::ptr::eq(*voisin, *mien) {
+            continue;
+        }
+        let Some(nom) = voisin.get("server_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !meme_programme(&mon_programme, &nom_de_programme(nom)) {
+            continue;
+        }
+        if let Some(morceau) = morceau_icecast(voisin) {
+            debug!(
+                station = %station_name,
+                montage = %montage,
+                voisin = %nom,
+                "icecast_titre_pris_sur_un_montage_jumeau"
+            );
+            return Some(rendre(morceau));
+        }
+    }
+    None
+}
+
+/// `status_url` sort de [`icecast_status_url`] : la contre-épreuve dresse un
+/// faux hôte et passe une URL de flux qui pointe dessus.
+async fn fetch_icecast_status_metadata(
+    status_url: &str,
+    station_name: &str,
+    montage: &str,
+) -> Option<IcyMetadata> {
+    let client = crate::http::client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+
+    let resp = client.get(status_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        debug!(station = %station_name, status = %resp.status(), "icecast_status_absent");
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    lire_status_icecast(&body, station_name, montage)
 }
 
 // ---------------------------------------------------------------------------
@@ -2995,5 +3222,279 @@ mod tests {
         let mut corps = charge_azuracast(POCHETTE_AZURACAST);
         corps["now_playing"]["song"]["title"] = json!("");
         assert!(lire_now_playing_azuracast(&corps, "Reggae Classic Mix").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // La sixième famille : Icecast générique (#2486)
+    // -----------------------------------------------------------------------
+    //
+    // ## Le fait de base, mesuré le 23/09/2026
+    //
+    // Neuf stations du catalogue livré (`GET https://mozaiklabs.fr/api/v1/radios`,
+    // 59 stations) sont servies par un Icecast que Tune ne reconnaissait pas.
+    // Une réclamation `Icy-MetaData: 1` sur leur flux donne ceci :
+    //
+    // | station (montage du catalogue)         | type          | `icy-metaint` |
+    // |----------------------------------------|---------------|---------------|
+    // | naim JAZZ `:8340/jazz-high.aac`        | audio/aac     | 16000         |
+    // | Linn Jazz `:8003/autodj`               | audio/mpeg    | 16000         |
+    // | Linn Classical `:8004/autodj`          | audio/mpeg    | 16000         |
+    // | Morow `:8080/morow_hi.aacp`            | audio/aacp    | 16000         |
+    // | BluesWave `:8050/FlacBlues`            | audio/ogg     | **absent**    |
+    // | PureClassic `:8140/flac.ogg`           | audio/ogg     | **absent**    |
+    // | Radio Calico `/calico`                 | application/ogg | **absent**  |
+    // | JB Radio2 `:8001/flac`                 | application/ogg | **absent**  |
+    // | Naim Classical `:8252/class-flac.flac` | (302)         | **absent**    |
+    //
+    // Icecast ne transporte de bloc ICY que sur les montages MP3/AAC.
+    // `fetch_icy_metadata` s'arrête donc sur son `?` pour les CINQ montages sans
+    // perte — l'écran ne montre RIEN. Et ce sont précisément ceux que le public
+    // de Tune écoute.
+    //
+    // `status-json.xsl`, la page d'état du même serveur, porte le morceau — sur
+    // le montage compressé jumeau. D'où les deux passes de `lire_status_icecast`.
+    //
+    // Aucun test ci-dessous n'appelle une vraie radio.
+
+    /// La page d'état relevée le 23/09/2026 à 11:57 UTC sur
+    /// `https://stream.radio-calico.com/status-json.xsl`, réduite aux champs
+    /// que Tune lit. Deux montages : le sans-perte écouté, sans titre, et son
+    /// jumeau MP3 qui le porte.
+    ///
+    /// Noter le `listenurl` : `http://…:8080/calico` quand le catalogue écoute
+    /// `https://…/calico`. Autre schéma, autre port.
+    fn charge_calico() -> Value {
+        json!({ "icestats": { "source": [
+            {
+                "listenurl": "http://stream.radio-calico.com:8080/calico",
+                "server_name": "Radio Calico - lossless",
+                "server_type": "application/ogg",
+            },
+            {
+                "listenurl": "http://stream.radio-calico.com:8080/calico.mp3",
+                "server_name": "Radio Calico - 192kpbs",
+                "server_type": "audio/mpeg",
+                "artist": "Glass Animals",
+                "title": "Heat Waves",
+                "yp_currently_playing": "Glass Animals - Heat Waves",
+            },
+        ]}})
+    }
+
+    /// Un faux Icecast : la page d'état, et un flux SANS `icy-metaint` partout
+    /// ailleurs — ce que rend un montage Ogg/FLAC réel.
+    async fn faux_icecast(corps: Value) -> String {
+        let app = routeur_faux_flux(false).route(
+            "/status-json.xsl",
+            axum::routing::get(move || {
+                let c = corps.clone();
+                async move { axum::Json(c) }
+            }),
+        );
+        faux_distant(app).await
+    }
+
+    /// **Le témoin, par la porte publique.** Radio Calico, écoutée sur son
+    /// montage sans perte, rend le morceau en cours.
+    ///
+    /// Rouge avant ce correctif : le montage `application/ogg` n'annonce aucun
+    /// `icy-metaint`, `fetch_icy_metadata` rend `None`, et
+    /// `fetch_radio_metadata` aussi — l'écran ne montre rien.
+    #[tokio::test]
+    async fn un_montage_sans_perte_rend_le_morceau_du_montage_jumeau() {
+        let base = faux_icecast(charge_calico()).await;
+        let meta = fetch_radio_metadata("Radio Calico", &format!("{base}/calico"))
+            .await
+            .expect("le morceau en cours doit sortir de la page d'etat Icecast");
+
+        assert_eq!(meta.title, "Heat Waves");
+        assert_eq!(meta.artist.as_deref(), Some("Glass Animals"));
+        assert_eq!(meta.station.as_deref(), Some("Radio Calico"));
+        // Une page d'etat Icecast ne publie aucune pochette : le logo de la
+        // station reste a l'ecran.
+        assert!(meta.cover_url.is_none());
+    }
+
+    /// **Le jumeau n'est pas n'importe quel voisin.** Sur
+    /// `mscp4.live-streams.nl:8140`, le serveur porte DEUX programmes : Pure
+    /// Classix (écouté en FLAC) et Pure Lounge. Prendre le titre du second
+    /// afficherait un morceau qui ne passe pas à l'antenne.
+    #[tokio::test]
+    async fn un_autre_programme_du_meme_serveur_n_est_pas_un_jumeau() {
+        // Relevé du 23/09/2026 : `flac.ogg` sans titre, `live.mp3` du même
+        // programme, `lounge.mp3` d'un autre.
+        let corps = json!({ "icestats": { "source": [
+            { "listenurl": "http://mscp4.live-streams.nl:8140/flac.ogg",
+              "server_name": "Pure Classix Radio" },
+            { "listenurl": "http://mscp4.live-streams.nl:8140/lounge.mp3",
+              "server_name": "Pure Lounge Radio",
+              "title": "Monkey Safari - Gravity" },
+            { "listenurl": "http://mscp4.live-streams.nl:8140/live.mp3",
+              "server_name": "Pure Classix Radio MP3",
+              "title": "Peter Gabriel - In Your Eyes" },
+        ]}});
+        let meta = lire_status_icecast(&corps, "PureClassic Radio", "flac.ogg")
+            .expect("le jumeau du bon programme donne le titre");
+        assert_eq!(meta.title, "In Your Eyes");
+        assert_eq!(meta.artist.as_deref(), Some("Peter Gabriel"));
+
+        // Sans le jumeau du bon programme, rien — surtout pas Pure Lounge.
+        let sans_jumeau = json!({ "icestats": { "source": [
+            { "listenurl": "http://mscp4.live-streams.nl:8140/flac.ogg",
+              "server_name": "Pure Classix Radio" },
+            { "listenurl": "http://mscp4.live-streams.nl:8140/lounge.mp3",
+              "server_name": "Pure Lounge Radio",
+              "title": "Monkey Safari - Gravity" },
+        ]}});
+        assert!(lire_status_icecast(&sans_jumeau, "PureClassic Radio", "flac.ogg").is_none());
+    }
+
+    /// `JB Radio2` : le montage `live` annonce `yp_currently_playing =
+    /// "JB RADIO2 - "`. C'est le nom de la station, pas un morceau — et le
+    /// montage `aac` du MÊME programme porte le vrai titre.
+    #[test]
+    fn un_nom_de_station_deguise_en_morceau_n_est_pas_un_titre() {
+        let corps = json!({ "icestats": { "source": [
+            { "listenurl": "http://mediacp.jb-radio.net:8001/flac",
+              "server_name": "JB Radio" },
+            { "listenurl": "http://mediacp.jb-radio.net:8001/live",
+              "server_name": "JB RADIO2",
+              "artist": "JB RADIO2",
+              "yp_currently_playing": "JB RADIO2 - " },
+            { "listenurl": "http://mediacp.jb-radio.net:8001/aac",
+              "server_name": "JB RADIO",
+              "title": "Zero 7 - In The Waiting Line" },
+        ]}});
+        let meta = lire_status_icecast(&corps, "JB Radio2", "flac").expect("le montage aac sert");
+        assert_eq!(meta.title, "In The Waiting Line");
+        assert_eq!(meta.artist.as_deref(), Some("Zero 7"));
+
+        // `JB RADIO2` n'est pas le programme `JB RADIO` : le seul préfixe
+        // littéral l'aurait admis, la frontière de mot l'écarte.
+        assert!(!meme_programme("jb radio", "jb radio2"));
+        assert!(meme_programme(
+            "pure classix radio",
+            "pure classix radio mp3"
+        ));
+        assert!(!meme_programme("pure classix radio", "pure lounge radio"));
+    }
+
+    /// Le montage écouté porte son propre titre : on ne va pas chercher de
+    /// voisin, et « Artiste - Titre » se découpe.
+    #[test]
+    fn un_montage_qui_porte_son_titre_se_lit_seul() {
+        // Linn Jazz, relevé du 23/09/2026 — `listenurl` sur
+        // `radio.linnrecords.com`, quand le catalogue écoute `radio.linn.co.uk`.
+        let corps = json!({ "icestats": { "source": [
+            { "listenurl": "http://radio.linnrecords.com:8003/autodj",
+              "server_name": "Linn Radio",
+              "title": "Barb Jungr - Like A Rolling Stone" },
+            { "listenurl": "http://radio.linnrecords.com:8003/live" },
+        ]}});
+        let meta = lire_status_icecast(&corps, "Linn Jazz", "autodj").expect("le titre est la");
+        assert_eq!(meta.title, "Like A Rolling Stone");
+        assert_eq!(meta.artist.as_deref(), Some("Barb Jungr"));
+    }
+
+    /// `icestats.source` est un OBJET NU quand le serveur ne porte qu'un
+    /// montage. Ne lire que le tableau raterait tout serveur mono-montage.
+    #[test]
+    fn une_page_d_etat_a_un_seul_montage_se_lit_aussi() {
+        let corps = json!({ "icestats": { "source":
+            { "listenurl": "http://exemple.invalid:8000/flux",
+              "server_name": "Solo",
+              "title": "A - B" }
+        }});
+        let meta = lire_status_icecast(&corps, "Solo", "flux").expect("l'objet nu se lit");
+        assert_eq!(meta.title, "B");
+        assert_eq!(meta.artist.as_deref(), Some("A"));
+        assert_eq!(sources_icecast(&corps).len(), 1);
+    }
+
+    /// **La source muette ne fabrique aucune absence.** Un hôte sans page
+    /// d'état laisse la main au repli ICY, exactement comme avant.
+    #[tokio::test]
+    async fn un_hote_sans_page_d_etat_laisse_la_main_au_repli_icy() {
+        let base = faux_distant(routeur_faux_flux(true)).await; // pas de status-json.xsl
+        let meta = fetch_radio_metadata("Faux Flux", &format!("{base}/flux.mp3"))
+            .await
+            .expect("le repli ICY sert toujours");
+        assert_eq!(meta.title, "B");
+        assert_eq!(meta.artist.as_deref(), Some("A"));
+    }
+
+    /// Un montage absent de la page d'état ne prend le titre de personne.
+    #[test]
+    fn un_montage_absent_de_la_page_ne_prend_le_titre_de_personne() {
+        assert!(lire_status_icecast(&charge_calico(), "Radio Calico", "autre").is_none());
+        assert!(lire_status_icecast(&json!({}), "Radio Calico", "calico").is_none());
+    }
+
+    /// L'adresse de la page d'état et le montage se déduisent de l'URL du flux
+    /// — les neuf stations du catalogue (23/09/2026) — et de rien d'autre.
+    #[test]
+    fn l_url_de_flux_icecast_donne_la_page_d_etat_et_le_montage() {
+        for (flux, status, montage) in [
+            (
+                "https://stream.radio-calico.com/calico",
+                "https://stream.radio-calico.com/status-json.xsl",
+                "calico",
+            ),
+            (
+                "http://radio.linn.co.uk:8003/autodj",
+                "http://radio.linn.co.uk:8003/status-json.xsl",
+                "autodj",
+            ),
+            (
+                "http://radio.linn.co.uk:8004/autodj",
+                "http://radio.linn.co.uk:8004/status-json.xsl",
+                "autodj",
+            ),
+            (
+                "http://blueswave.radio:8050/FlacBlues",
+                "http://blueswave.radio:8050/status-json.xsl",
+                "FlacBlues",
+            ),
+            (
+                "https://mediacp.jb-radio.net:8001/flac",
+                "https://mediacp.jb-radio.net:8001/status-json.xsl",
+                "flac",
+            ),
+            (
+                "http://mscp4.live-streams.nl:8140/flac.ogg",
+                "http://mscp4.live-streams.nl:8140/status-json.xsl",
+                "flac.ogg",
+            ),
+            (
+                "https://mscp3.live-streams.nl:8252/class-flac.flac",
+                "https://mscp3.live-streams.nl:8252/status-json.xsl",
+                "class-flac.flac",
+            ),
+            (
+                "http://mscp3.live-streams.nl:8340/jazz-high.aac",
+                "http://mscp3.live-streams.nl:8340/status-json.xsl",
+                "jazz-high.aac",
+            ),
+            (
+                "http://stream.fr.morow.com:8080/morow_hi.aacp?x=1",
+                "http://stream.fr.morow.com:8080/status-json.xsl",
+                "morow_hi.aacp",
+            ),
+        ] {
+            assert_eq!(icecast_status_url(flux).as_deref(), Some(status), "{flux}");
+            assert_eq!(montage_icecast(flux), Some(montage), "{flux}");
+        }
+
+        for flux in [
+            "rtsp://exemple.invalid/flux",
+            "http:///flux",
+            "http://exemple.invalid",
+            "exemple.invalid/flux",
+        ] {
+            assert!(
+                icecast_status_url(flux).is_none() || montage_icecast(flux).is_none(),
+                "{flux}"
+            );
+        }
     }
 }
