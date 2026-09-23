@@ -222,6 +222,17 @@ path = "tests/journal_insertion_par_lot.rs"
 name = "niveaux_sortie_pull_3807"
 path = "tests/niveaux_sortie_pull_3807.rs"
 
+# #4702 — barregraphe et crete-metre morts sur un ALAC servi SANS conversion
+# (Daniel LEVY, fil 1888). Le banc joue un vrai ALAC de la caisse sur une zone
+# `dlna` qui a coche « ALAC natif », et compte les `playback.audio_levels`
+# reellement publies. `autotests = false` en tete de ce manifeste : sans cette
+# cible, le fichier ne serait JAMAIS compile et la porte rendrait un vert
+# contre rien. Declaree ici, au MILIEU du manifeste, et non en queue ou tous
+# les lots ajoutent la leur.
+[[test]]
+name = "niveaux_alac_passthrough_4702"
+path = "tests/niveaux_alac_passthrough_4702.rs"
+
 # #3682 — spectre au plancher sur une zone LOCALE bit-perfect (capture de
 # Gilles OLIVE). Aucun temoin ne couvrait la premiere lecture explicite d'une
 # piste locale : ce banc cloue que `transcoder_en_session` nourrit bien

@@ -3066,11 +3066,17 @@ impl PlaybackOrchestrator {
             // Parallel decode-for-levels: decode the audio in the background
             // purely to emit VU-meter events for the web client. This does not
             // affect the actual audio stream served to the output device.
-            // Skip DSD (1-bit at MHz rates, can't decode inline for levels)
-            // and exotic formats that need heavy conversion.
-            let skip_passthrough_levels = source_format
-                .as_ref()
-                .is_some_and(|f| f.needs_transcode_for_dlna());
+            // Skip DSD (1-bit at MHz rates, can't decode inline for levels).
+            //
+            // Le prédicat vit dans `regles.rs` depuis #4702. Il appelait
+            // `needs_transcode_for_dlna()`, qui répond à « ce renderer
+            // saura-t-il lire ce format ? » — une question SANS RAPPORT avec
+            // « puis-je décoder ce fichier pour en tirer des niveaux ? ».
+            // `AudioFormat::Alac` y figure pour une raison de renderer, si
+            // bien que cocher « ALAC natif » sur une zone réseau servait le
+            // fichier brut ET éteignait barregraphe et crête-mètre ensemble
+            // (Daniel LEVY, fil 1888). Idem pour l'AAC natif (#1424).
+            let skip_passthrough_levels = niveaux_en_passthrough_a_sauter(source_format);
             // Ce decodage parallele n'a de sens que si PERSONNE d'autre ne
             // decode le fichier cote serveur : sortie reseau ou navigateur, qui
             // recoivent une URL et lisent eux-memes. Une sortie locale (comme

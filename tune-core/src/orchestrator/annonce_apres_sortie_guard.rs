@@ -170,6 +170,46 @@ fn le_passthrough_est_bride_sans_changer_ce_qu_il_decode() {
     );
 }
 
+/// #4702 : le décodage-pour-niveaux du passthrough ne se décide PLUS sur
+/// « ce renderer saura-t-il lire ce format ? ».
+///
+/// `needs_transcode_for_dlna()` répond à une question de RENDERER — sa propre
+/// docstring dit « most DLNA renderers cannot play AAC » — et `Alac` y figure
+/// pour cette raison-là. L'employer pour décider si un fichier est DÉCODABLE
+/// éteignait barregraphe et crête-mètre sur exactement les deux formats qui
+/// arrivent en passthrough par un opt-in de zone : l'ALAC natif (Daniel LEVY,
+/// fil 1888) et l'AAC natif (#1424).
+///
+/// Le test unitaire jumeau (`regles::lecture_locale_tests::
+/// seul_le_dsd_saute_le_decodage_pour_niveaux_du_passthrough`) tient la
+/// FONCTION ; celui-ci tient le BRANCHEMENT — une fonction juste qu'un site
+/// d'appel n'appelle pas ne garde rien.
+#[test]
+fn le_passthrough_ne_decide_plus_ses_niveaux_sur_un_predicat_de_renderer() {
+    let debut = position("let skip_passthrough_levels");
+    let fin = position("\"passthrough_levels_decode_failed\"");
+    assert!(
+        debut < fin,
+        "la découpe ne délimite plus le décodage-pour-niveaux du \
+         passthrough : ce garde-fou ne garde plus rien."
+    );
+    let tranche = &code_de_production()[debut..fin];
+    assert!(
+        tranche.contains("niveaux_en_passthrough_a_sauter("),
+        "le décodage-pour-niveaux du passthrough ne passe plus par le \
+         prédicat partagé de `regles.rs` : la décision est de nouveau prise \
+         sur place, et c'est ainsi qu'elle avait dérivé (#4702)."
+    );
+    assert!(
+        !tranche.contains("needs_transcode_for_dlna"),
+        "le passthrough redécide ses niveaux avec `needs_transcode_for_dlna`, \
+         un prédicat de RENDERER où `Alac` figure parce qu'un renderer ne sait \
+         pas le lire — pas parce que le serveur ne saurait pas le décoder. \
+         Cocher « ALAC natif » éteint alors barregraphe et crête-mètre \
+         ensemble (#4702)."
+    );
+}
+
 /// L'historique local souffrait du même défaut. C'était la question laissée
 /// ouverte par le ticket ; la réponse est oui, et elle est corrigée ici.
 #[test]
