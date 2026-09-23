@@ -19,7 +19,9 @@
 //!  (e) débannir rend tout ;
 //!  (f) un titre local et une ligne de service de même identifiant numérique
 //!      ne se confondent pas ;
-//!  (g) par profil : banni chez l'un, pas chez l'autre.
+//!  (g) par profil : banni chez l'un, pas chez l'autre ;
+//!  (h) le générateur de playlists (`/smart-ai/*`), la radio (`/radio/auto`)
+//!      et les recommandations (`/ai/recommendations`) ne le rendent jamais.
 //!
 //! Périmètre : bibliothèque LOCALE. Aucune forme `(source, source_id)` n'est
 //! branchée — voir `hidden_repo::ITEM_TYPE_TRACK`.
@@ -601,11 +603,16 @@ async fn bannir_le_titre_en_cours_passe_au_suivant() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(
-        v["zones_passees_au_suivant"],
-        json!([{"zone_id": zone, "queue_position": 3}]),
-        "{v}"
-    );
+    let passees = v["zones_passees_au_suivant"]
+        .as_array()
+        .expect("zones passées");
+    assert_eq!(passees.len(), 1, "{v}");
+    assert_eq!(passees[0]["zone_id"], json!(zone), "{v}");
+    assert_eq!(passees[0]["queue_position"], json!(3), "{v}");
+    // Le démarrage est attendu EN LIGNE et rendu tel quel ; sur ce banc les
+    // fichiers n'existent pas, la LECTURE peut échouer (et l'échec est
+    // annoncé) — c'est le PASSAGE qui est prouvé, pas le décodage.
+    assert!(passees[0]["started"].is_boolean(), "{v}");
 
     // Bannir un titre que personne ne joue ne passe aucune zone. (Une piste
     // HORS de la file : le passage au suivant lancé ci-dessus peut avoir
@@ -782,4 +789,136 @@ async fn banni_chez_l_un_pas_chez_l_autre() {
     .await;
     let (_, l2) = appel(&app, "GET", "/api/v1/library/tracks/banned", "2", None).await;
     assert_eq!(l2["total"], json!(1));
+}
+
+/// (h) Les autres sélections automatiques exposées par les routes : les six
+/// variantes du générateur de playlists, la radio et les recommandations.
+/// Cinquante passes chacune sur douze pistes ; témoin avant, retour après.
+#[tokio::test]
+async fn les_generateurs_la_radio_et_les_recommandations_ignorent_un_titre_banni() {
+    let (app, state) = app_et_etat();
+    let (_, ids) = bibliotheque(&state, "Chic", "C'est Chic", "Disco", 12);
+    let bannie = ids[7];
+    // Un tempo pour que « tempo-match » ait quelque chose à apparier.
+    state
+        .backend
+        .execute("UPDATE tracks SET bpm = 120", &[])
+        .unwrap();
+
+    let radio = format!("/api/v1/radio/auto?seed_track={}&count=50", ids[0]);
+    let appels: Vec<(&str, &str, Option<Value>)> = vec![
+        ("GET", &radio, None),
+        (
+            "POST",
+            "/api/v1/smart-ai/generate",
+            Some(json!({"prompt": "disco", "limit": 50})),
+        ),
+        (
+            "POST",
+            "/api/v1/smart-ai/mood",
+            Some(json!({"mood": "party", "limit": 50})),
+        ),
+        (
+            "POST",
+            "/api/v1/smart-ai/similar-to",
+            Some(json!({"track_id": ids[0], "limit": 50})),
+        ),
+        (
+            "POST",
+            "/api/v1/smart-ai/history-based",
+            Some(json!({"limit": 50})),
+        ),
+        (
+            "POST",
+            "/api/v1/smart-ai/tempo-match",
+            Some(json!({"target_bpm": 120, "limit": 50})),
+        ),
+        (
+            "POST",
+            "/api/v1/smart-ai/discovery",
+            Some(json!({"limit": 50})),
+        ),
+        ("GET", "/api/v1/ai/recommendations?limit=50", None),
+    ];
+
+    fn ids_rendus(v: &Value) -> Vec<i64> {
+        v["tracks"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|t| t.get("id").or(t.get("track_id")).and_then(Value::as_i64))
+            .collect()
+    }
+
+    for (methode, chemin, corps) in &appels {
+        let mut vue = false;
+        for _ in 0..50 {
+            let (st, v) = appel(&app, methode, chemin, "1", corps.clone()).await;
+            assert_eq!(st, StatusCode::OK, "{chemin} : {v}");
+            vue |= ids_rendus(&v).contains(&bannie);
+        }
+        assert!(
+            vue,
+            "témoin {chemin} : la piste doit sortir avant le bannissement"
+        );
+    }
+
+    let (st, _) = poster(
+        &app,
+        &format!("/api/v1/library/tracks/{bannie}/ban"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    for (methode, chemin, corps) in &appels {
+        for _ in 0..50 {
+            let (_, v) = appel(&app, methode, chemin, "1", corps.clone()).await;
+            let rendus = ids_rendus(&v);
+            assert!(!rendus.is_empty(), "{chemin} : rien ne sort ? {v}");
+            assert!(
+                !rendus.contains(&bannie),
+                "{chemin} : bannie et pourtant rendue : {rendus:?}"
+            );
+        }
+    }
+
+    // (g) Chez un autre profil, rien n'est banni : le générateur la rend.
+    ProfileRepo::with_backend(state.backend.clone())
+        .create("voisin", Some("Le voisin"), None)
+        .expect("profil 2");
+    let vue = {
+        let mut vue = false;
+        for _ in 0..50 {
+            let (_, v) = appel(
+                &app,
+                "POST",
+                "/api/v1/smart-ai/generate",
+                "2",
+                Some(json!({"prompt": "disco", "limit": 50})),
+            )
+            .await;
+            vue |= ids_rendus(&v).contains(&bannie);
+        }
+        vue
+    };
+    assert!(vue, "le profil 2 n'a rien banni");
+
+    // (e) Débannir rend tout.
+    appel(
+        &app,
+        "DELETE",
+        &format!("/api/v1/library/tracks/{bannie}/ban"),
+        "1",
+        None,
+    )
+    .await;
+    for (methode, chemin, corps) in &appels {
+        let mut revue = false;
+        for _ in 0..50 {
+            let (_, v) = appel(&app, methode, chemin, "1", corps.clone()).await;
+            revue |= ids_rendus(&v).contains(&bannie);
+        }
+        assert!(revue, "{chemin} : débannie, la piste doit ressortir");
+    }
 }

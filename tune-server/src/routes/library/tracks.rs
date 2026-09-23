@@ -318,6 +318,7 @@ pub(super) struct SimilarParams {
 /// this build never computed vectors — so the client can fall back gracefully.
 pub(super) async fn track_similar(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
     Query(p): Query<SimilarParams>,
 ) -> Json<Value> {
@@ -334,7 +335,7 @@ pub(super) async fn track_similar(
     let by_id: std::collections::HashMap<i64, &tune_core::db::models::Track> =
         tracks.iter().filter_map(|t| t.id.map(|i| (i, t))).collect();
     // Re-emit in acoustic-rank order (list_by_ids is unordered) with the score.
-    let items: Vec<Value> = neighbors
+    let mut items: Vec<Value> = neighbors
         .iter()
         .filter_map(|(tid, score)| {
             let t = by_id.get(tid)?;
@@ -348,6 +349,9 @@ pub(super) async fn track_similar(
             Some(v)
         })
         .collect();
+    // #4806 — « Plus comme ça » est une liste d'affichage : le titre banni y
+    // reste, `banned: true`, c'est l'écran qui le grise.
+    super::albums::attacher_banni(&state, profile.id(), &mut items);
     Json(json!({ "seed_track_id": id, "count": items.len(), "items": items }))
 }
 

@@ -357,6 +357,10 @@ pub fn smart_radio(
 ) -> Vec<RecommendedTrack> {
     let mut results = Vec::new();
     let count_i64 = count as i64;
+    // #4806 — la radio est une sélection automatique : aucune de ses cinq
+    // sources (voisins acoustiques, genre, co-occurrence, artiste, repli) ne
+    // rend un titre banni par le profil actif.
+    let sans_bannis = sans_titres_bannis(backend);
 
     // Resolve seed metadata
     let (genre, artist) = if let Some(tid) = seed_track_id {
@@ -416,7 +420,7 @@ pub fn smart_radio(
                  FROM tracks t \
                  LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
                  LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
-                 WHERE t.id IN ({placeholders})"
+                 WHERE t.id IN ({placeholders}) AND {sans_bannis}"
             );
             let params: Vec<&dyn ToSqlValue> = ids.iter().map(|id| id as &dyn ToSqlValue).collect();
             if let Ok(rows) = backend.query_many(&sql, &params) {
@@ -443,6 +447,7 @@ pub fn smart_radio(
              LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
              LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
              WHERE t.genre = ? AND t.id != ? \
+             AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
         );
 
@@ -499,6 +504,7 @@ pub fn smart_radio(
                      LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
                      WHERE COALESCE(a.name, t.album_artist) IN ({in_clause}) \
                      AND t.id NOT IN ({exclude_ids}) \
+                     AND {sans_bannis} \
                      ORDER BY RANDOM() LIMIT ?"
                 );
 
@@ -543,6 +549,7 @@ pub fn smart_radio(
                  WHERE COALESCE(a.name, t.album_artist) = ? \
                  AND t.id != ? \
                  AND t.id NOT IN ({exclude_ids}) \
+                 AND {sans_bannis} \
                  ORDER BY RANDOM() LIMIT ?"
             );
 
@@ -576,6 +583,7 @@ pub fn smart_radio(
              LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
              LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
              WHERE t.id NOT IN ({exclude_ids}) \
+             AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
         );
 

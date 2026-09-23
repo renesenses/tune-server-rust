@@ -101,6 +101,9 @@ pub struct BannedTrack {
     pub artist: Option<String>,
     pub album_id: Option<i64>,
     pub album_title: Option<String>,
+    /// `albums.cover_path` de l'album vivant, pour la vignette de l'écran
+    /// « Titres bannis » (l'image se sert par `/library/albums/{id}/cover`).
+    pub cover_path: Option<String>,
     pub banned_at: Option<String>,
     /// `false` = marqueur orphelin : l'id ne désigne plus de piste vivante.
     /// Pas de réconciliation par identité pour une piste (titre + interprète
@@ -215,7 +218,7 @@ pub mod sql {
     pub fn list_tracks<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT hi.item_id, hi.item_name, hi.item_artist, hi.created_at, \
-                    t.id, t.title, ar.name, t.album_id, al.title \
+                    t.id, t.title, ar.name, t.album_id, al.title, al.cover_path \
              FROM hidden_items hi \
              LEFT JOIN tracks t ON t.id = hi.item_id \
              LEFT JOIN artists ar ON ar.id = t.artist_id \
@@ -441,6 +444,7 @@ impl HiddenRepo {
                     }),
                     album_id: r.get(7).and_then(|v| v.as_i64()),
                     album_title: r.get(8).and_then(|v| v.as_string()),
+                    cover_path: r.get(9).and_then(|v| v.as_string()),
                     banned_at,
                     resolved,
                 })

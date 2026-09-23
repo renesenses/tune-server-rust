@@ -3305,7 +3305,8 @@ async fn set_repeat(
 
 /// #4806 — la piste vient d'être BANNIE alors qu'elle joue : chaque zone qui
 /// la joue passe au suivant, avec les mêmes enjambées que « Suivant ». Rend
-/// les zones passées, avec la position reprise (ou `null` : file finie).
+/// les zones passées, avec la position reprise (ou `null` : file finie) et
+/// `started` : le suivant a démarré (`false` = file finie, ou échec annoncé).
 ///
 /// Une ligne de service dont le `source_id` vaut l'id local banni n'est pas
 /// concernée : `now_playing.track_id` est `None` pour elle.
@@ -3355,23 +3356,32 @@ pub(crate) async fn passer_les_zones_qui_jouent_la_piste(
             suivante = ?suivante,
             "piste_bannie_en_cours_passage_au_suivant"
         );
-        let s = state.clone();
-        match suivante {
-            Some(p) => {
-                tokio::spawn(async move {
-                    if let Err(e) = s.orchestrator.play_from_queue(zone_id, p).await {
-                        tracing::warn!(zone_id, error = %e, "piste_bannie_suivante_non_demarree");
-                        s.orchestrator
-                            .dire_piste_non_demarree(zone_id, "suivante", &e);
-                    }
-                });
-            }
+        // Attendu EN LIGNE, pas détaché : la réponse du bannissement peut
+        // dire si le suivant a démarré, et l'échec est annoncé (#3270). Les
+        // seuls démarrages détachés de ce fichier restent ceux de `next` et
+        // de `previous`, dont la réponse est déjà partie.
+        let demarree = match suivante {
+            Some(p) => match state.orchestrator.play_from_queue(zone_id, p).await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(zone_id, error = %e, "piste_bannie_suivante_non_demarree");
+                    state
+                        .orchestrator
+                        .dire_piste_non_demarree(zone_id, "suivante", &e);
+                    false
+                }
+            },
             None => {
                 let device_id = get_zone_device_id(state, zone_id);
                 state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                false
             }
-        }
-        passees.push(json!({ "zone_id": zone_id, "queue_position": suivante }));
+        };
+        passees.push(json!({
+            "zone_id": zone_id,
+            "queue_position": suivante,
+            "started": demarree,
+        }));
     }
     passees
 }
