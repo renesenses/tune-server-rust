@@ -22,6 +22,8 @@ use super::local::{
 use super::negociation_format_exclusif_3837::{
     CandidatFormat, ResultatSonde, message_peripherique_occupe, negocier_format_exclusif,
 };
+#[cfg(target_os = "windows")]
+use super::reveil_rendu_4357::{ATTENTE_RENDU_MS, ReveilRendu, reveil_rendu};
 
 #[cfg(target_os = "windows")]
 fn resolve_wasapi_endpoint(requested: &str) -> Result<WasapiEndpoint, String> {
@@ -178,6 +180,8 @@ mod ffi {
             lpName: *const u16,
         ) -> HANDLE;
         pub fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: DWORD) -> DWORD;
+        /// #4357 — signale l'événement d'arrêt de la boucle de rendu.
+        pub fn SetEvent(hEvent: HANDLE) -> i32;
         pub fn CloseHandle(hObject: HANDLE) -> i32;
     }
 
@@ -431,6 +435,12 @@ pub struct WasapiExclusiveOutput {
     render_client: *mut std::ffi::c_void,
     #[cfg(target_os = "windows")]
     event_handle: ffi::HANDLE,
+    /// #4357 — événement à **réinitialisation manuelle** que `stop()` signale
+    /// pour réveiller la boucle de rendu. Sans lui, un arrêt demandé pendant
+    /// l'attente de l'événement du pilote coûtait 2 000 ms : le pilote ne
+    /// signale plus rien une fois `IAudioClient::Stop` passé.
+    #[cfg(target_os = "windows")]
+    stop_event: ffi::HANDLE,
     #[cfg(target_os = "windows")]
     buffer_frame_count: u32,
     running: Arc<AtomicBool>,
@@ -687,10 +697,21 @@ impl WasapiExclusiveOutput {
                 }
             }
 
+            // 8 bis. #4357 — l'événement d'arrêt de la boucle de rendu.
+            // Réinitialisation MANUELLE : une fois signalé il le reste, donc le
+            // fil le voit qu'il soit en attente ou en plein rendu.
+            let stop_event = CreateEventW(ptr::null(), 1, 0, ptr::null());
+            if stop_event.is_null() {
+                CloseHandle(event);
+                release(audio_client);
+                return Err("CreateEvent(arrêt du rendu) failed".into());
+            }
+
             // 9. Get buffer size
             let buffer_frame_count = match audio_client_buffer_size(audio_client) {
                 Ok(frames) => frames,
                 Err(error) => {
+                    CloseHandle(stop_event);
                     CloseHandle(event);
                     release(audio_client);
                     return Err(error);
@@ -709,6 +730,7 @@ impl WasapiExclusiveOutput {
                 let get_service: GetServiceFn = std::mem::transmute(*vtable.add(14));
                 let hr = get_service(audio_client, &IID_IAUDIO_RENDER_CLIENT, &mut render_client);
                 if hr != S_OK {
+                    CloseHandle(stop_event);
                     CloseHandle(event);
                     release(audio_client);
                     return Err(format!("GetService(IAudioRenderClient) failed: 0x{hr:08X}"));
@@ -744,6 +766,7 @@ impl WasapiExclusiveOutput {
                 audio_client,
                 render_client,
                 event_handle: event,
+                stop_event,
                 buffer_frame_count,
                 running: Arc::new(AtomicBool::new(false)),
                 underruns: Arc::new(AtomicU64::new(0)),
@@ -816,6 +839,8 @@ impl WasapiExclusiveOutput {
         let running = self.running.clone();
         let render_client = self.render_client as usize; // Send as usize (pointer)
         let event_handle = self.event_handle as usize;
+        // #4357 — la seconde poignée attendue par la boucle de rendu.
+        let stop_event = self.stop_event as usize;
         let buffer_frame_count = self.buffer_frame_count;
         let channels = self.channels;
         let bytes_per_sample = self.bit_depth / 8;
@@ -827,24 +852,37 @@ impl WasapiExclusiveOutput {
 
         let handle = std::thread::spawn(move || {
             const S_OK_LOCAL: i32 = 0;
-            const WAIT_OBJECT_0_LOCAL: u32 = 0;
 
             unsafe extern "system" {
-                fn WaitForSingleObject(h: *mut std::ffi::c_void, ms: u32) -> u32;
+                fn WaitForMultipleObjects(
+                    count: u32,
+                    handles: *const *mut std::ffi::c_void,
+                    wait_all: i32,
+                    ms: u32,
+                ) -> u32;
             }
 
             let render_client = render_client as *mut std::ffi::c_void;
-            let event_handle = event_handle as *mut std::ffi::c_void;
+            // #4357 — l'événement du pilote EN PREMIER : `WaitForMultipleObjects`
+            // rend l'indice le plus BAS parmi les poignées signalées, et un
+            // rendu dû doit primer sur un arrêt déjà obtenu.
+            let poignees: [*mut std::ffi::c_void; 2] = [
+                event_handle as *mut std::ffi::c_void,
+                stop_event as *mut std::ffi::c_void,
+            ];
 
             info!("wasapi_exclusive_render_thread_started");
 
             while running.load(Ordering::SeqCst) {
-                let wait_result = unsafe { WaitForSingleObject(event_handle, 2000) };
-                if wait_result != WAIT_OBJECT_0_LOCAL {
-                    if running.load(Ordering::SeqCst) {
+                let wait_result =
+                    unsafe { WaitForMultipleObjects(2, poignees.as_ptr(), 0, ATTENTE_RENDU_MS) };
+                match reveil_rendu(wait_result, running.load(Ordering::SeqCst)) {
+                    ReveilRendu::Arreter => break,
+                    ReveilRendu::EcheanceManquee => {
                         deadline_misses.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    continue;
+                    ReveilRendu::Rendre => {}
                 }
 
                 if paused.load(Ordering::SeqCst) {
@@ -934,6 +972,15 @@ impl WasapiExclusiveOutput {
         }
         let was_running = self.running.swap(false, Ordering::SeqCst);
 
+        // #4357 — réveiller la boucle de rendu AVANT d'arrêter le client. Une
+        // fois `IAudioClient::Stop` passé, le pilote ne signale plus jamais son
+        // événement : l'attente irait alors au bout de ses 2 000 ms, `join()`
+        // avec elle, et `local.rs` détacherait le fil de lecture précédent —
+        // le trou de 2,2 s mesuré sur chaque changement de piste en 0.9.161.
+        if unsafe { ffi::SetEvent(self.stop_event) } == 0 {
+            warn!("wasapi_exclusive_set_stop_event_failed");
+        }
+
         // Stop the audio client
         if was_running {
             let stop_hr = unsafe {
@@ -957,7 +1004,9 @@ impl WasapiExclusiveOutput {
         let close_ok = unsafe {
             ffi::release(self.render_client);
             ffi::release(self.audio_client);
-            ffi::CloseHandle(self.event_handle)
+            let arret_ferme = ffi::CloseHandle(self.stop_event);
+            let pilote_ferme = ffi::CloseHandle(self.event_handle);
+            arret_ferme & pilote_ferme
         };
         if close_ok == 0 {
             warn!("wasapi_exclusive_close_event_failed");
