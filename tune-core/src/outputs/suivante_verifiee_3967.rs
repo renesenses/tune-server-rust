@@ -42,6 +42,9 @@ struct Conduite {
     /// Ce que rend `GetCurrentTransportActions` : `None` = il ne connaît pas
     /// l'action et répond une faute 401.
     actions: Option<&'static str>,
+    /// #4382 — il ACQUITTE `GetCurrentTransportActions` mais sans la balise
+    /// `Actions` : une réponse 200 dont on ne peut rien tirer.
+    publie_balise_actions: bool,
     /// `Next` est-il accepté, ou refusé par une faute ?
     next_accepte: bool,
 }
@@ -54,6 +57,7 @@ impl Default for Conduite {
             retient_a_la_place: None,
             publie_nexturi: true,
             actions: Some("Play,Stop,Pause,Seek,Next,Previous"),
+            publie_balise_actions: true,
             next_accepte: true,
         }
     }
@@ -143,6 +147,12 @@ async fn renderer(conduite: Conduite) -> Renderer {
                         (axum::http::StatusCode::OK, enveloppe(&corps))
                     }
                     "GetCurrentTransportActions" => match conduite.actions {
+                        Some(_) if !conduite.publie_balise_actions => (
+                            axum::http::StatusCode::OK,
+                            enveloppe(
+                                "<u:GetCurrentTransportActionsResponse/>",
+                            ),
+                        ),
                         Some(a) => (
                             axum::http::StatusCode::OK,
                             enveloppe(&format!(
@@ -366,4 +376,126 @@ fn deux_url_sont_la_meme_ou_ne_le_sont_pas() {
     assert!(!meme_url("   ", URL));
     assert!(!meme_url("http://192.168.1.196:8888/stream/", URL));
     assert!(!meme_url(URL, "http://192.168.1.196:8888/stream/"));
+}
+
+// ── #4382 — le verdict doit se DIRE, sinon le journal du testeur ne tranche pas ──
+//
+// Le chemin `Next` de #3967 ne s'arme que si l'appareil NOMME notre suivante
+// ET DÉCLARE l'action. Jamais mesuré sur le micrologiciel 1.6.01 du DMP-A6 de
+// Villerio (#4382) — et impossible à mesurer sur son rapport, parce que trois
+// des cinq branches `Inconnue` n'écrivaient qu'en `debug!` et la quatrième
+// n'écrivait rien du tout. Un export de journal de terrain ne porte que
+// l'INFO et au-dessus : l'absence de `dlna_suivante_tenue` y était
+// indiscernable d'un armement qui n'a pas eu lieu.
+//
+// Ces témoins capturent au niveau INFO, exactement ce qu'un testeur nous
+// envoie, et exigent que chaque branche se nomme.
+
+/// Capture d'un abonné `tracing` local au fil courant — même montage que
+/// `dlna_command_tests_4258`.
+#[derive(Clone, Default)]
+struct Journal(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Journal {
+    fn write(&mut self, octets: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(octets);
+        Ok(octets.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+    type Writer = Journal;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Journal {
+    fn texte(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+    /// ⚠️ INFO, pas TRACE : c'est le niveau des exports de terrain.
+    fn abonner(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+    }
+}
+
+/// Le verdict relevé par `suivante_preparee`, et ce que le journal en dit au
+/// niveau INFO.
+async fn verdict_et_journal(conduite: Conduite) -> (SuivantePreparee, String) {
+    let r = renderer(conduite).await;
+    r.output.set_next_media(&media()).await.unwrap();
+    let journal = Journal::default();
+    let verdict = {
+        let _garde = journal.abonner();
+        r.output.suivante_preparee(URL).await
+    };
+    (verdict, journal.texte())
+}
+
+/// Sa pile ne publie pas `NextURI` : verdict `Inconnue`. Le journal doit le
+/// DIRE — c'est la branche la plus probable sur un renderer minimaliste.
+#[tokio::test]
+async fn le_champ_nexturi_non_publie_se_nomme_au_niveau_info() {
+    let (verdict, journal) = verdict_et_journal(Conduite {
+        publie_nexturi: false,
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(verdict, SuivantePreparee::Inconnue);
+    assert!(
+        journal.contains("dlna_suivante_nexturi_non_publie"),
+        "un export de terrain ne porte que l'INFO : cette branche doit s'y lire.\n{journal}"
+    );
+}
+
+/// Il retient bien notre suivante, mais ne connaît pas
+/// `GetCurrentTransportActions` et répond une **faute SOAP 401**.
+///
+/// 🔴 Mesuré sur Shrek le 23/09/2026, et ce n'est pas ce qu'on attendait :
+/// `av_action` rend `Ok(corps_de_la_faute)`, pas `Err`. Le refus le plus
+/// probable d'un renderer minimaliste ne passe donc PAS par
+/// `dlna_suivante_actions_muettes` (réservé à un échec de transport) mais par
+/// la branche « pas de balise `Actions` » — celle qui, avant #4382,
+/// n'écrivait **rien du tout, à aucun niveau**.
+#[tokio::test]
+async fn la_faute_soap_sur_les_actions_se_nomme_au_niveau_info() {
+    let (verdict, journal) = verdict_et_journal(Conduite {
+        actions: None,
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(verdict, SuivantePreparee::Inconnue);
+    assert!(
+        journal.contains("dlna_suivante_actions_non_publiees"),
+        "l'appareil qui refuse `GetCurrentTransportActions` doit se lire au journal.\n{journal}"
+    );
+}
+
+/// Il répond à `GetCurrentTransportActions`, mais SANS la balise `Actions`.
+/// Cette branche-là n'écrivait strictement rien, à aucun niveau.
+#[tokio::test]
+async fn une_reponse_sans_balise_actions_se_nomme_au_niveau_info() {
+    let (verdict, journal) = verdict_et_journal(Conduite {
+        publie_balise_actions: false,
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(verdict, SuivantePreparee::Inconnue);
+    assert!(
+        journal.contains("dlna_suivante_actions_non_publiees"),
+        "une réponse 200 sans balise `Actions` doit nommer sa branche.\n{journal}"
+    );
 }

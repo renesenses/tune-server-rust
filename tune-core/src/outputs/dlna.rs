@@ -2488,12 +2488,16 @@ impl OutputTarget for DlnaOutput {
             .av_action("GetMediaInfo", "<InstanceID>0</InstanceID>")
             .await
         else {
-            debug!(device = %self.name, "dlna_suivante_get_media_info_muet");
+            // #4382 — `info!`, PAS `debug!` : un export de journal de terrain
+            // ne porte que l'INFO et au-dessus. Muet ici, le verdict
+            // `Inconnue` ne laissait aucune trace, et le rapport du testeur
+            // ne permettait pas de dire si ce chemin s'était armé.
+            info!(device = %self.name, url, "dlna_suivante_get_media_info_muet");
             return SuivantePreparee::Inconnue;
         };
         let Some(retenue) = extract_tag(&xml, "NextURI") else {
             // Le champ n'est pas publié du tout : on ne conclut rien.
-            debug!(device = %self.name, "dlna_suivante_nexturi_non_publie");
+            info!(device = %self.name, url, "dlna_suivante_nexturi_non_publie");
             return SuivantePreparee::Inconnue;
         };
         if !meme_url(&retenue, url) {
@@ -2513,10 +2517,15 @@ impl OutputTarget for DlnaOutput {
             .av_action("GetCurrentTransportActions", "<InstanceID>0</InstanceID>")
             .await
         else {
-            debug!(device = %self.name, "dlna_suivante_actions_muettes");
+            info!(device = %self.name, url, "dlna_suivante_actions_muettes");
             return SuivantePreparee::Inconnue;
         };
         let Some(actions) = extract_tag(&xml, "Actions") else {
+            // #4382 — cette branche-ci ne disait RIEN, pas même en `debug!` :
+            // l'appareil répond à `GetCurrentTransportActions` mais sans la
+            // balise `Actions`. Indiscernable, au journal, d'un armement qui
+            // n'aurait jamais eu lieu.
+            info!(device = %self.name, url, "dlna_suivante_actions_non_publiees");
             return SuivantePreparee::Inconnue;
         };
         if actions
