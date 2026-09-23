@@ -3697,6 +3697,33 @@ struct NotesServies {
     fallback: bool,
 }
 
+/// Ce tag est-il une version de **Tune** ? `v0.9.161` oui ; `moissonneur-v0.9.161`
+/// non.
+///
+/// Depuis le 17/09/2026 (3e0af030) le dépôt publie une SECONDE famille de
+/// releases : le moissonneur Roon, un outil en ligne de commande, taguée
+/// `moissonneur-vX.Y.Z` — un tag par tag de Tune. Sur les vingt releases que
+/// la route télécharge, **huit** étaient des moissonneurs le 23/09/2026 : huit
+/// entrées de panneau pour un outil que le testeur n'a pas installé, mêlées
+/// aux versions de son serveur, chacune réduite à « Release 0.9.x » puisque
+/// ces releases n'ont pas de notes — et n'en auront pas (leur code n'a pas
+/// bougé entre `moissonneur-v0.9.155` et `moissonneur-v0.9.159`).
+///
+/// Le filtre est **positif** : on nomme ce qu'on sert. Une troisième famille
+/// de tags apparaîtra un jour ; elle sera écartée sans qu'on ait à y penser.
+/// C'est le même choix, et la même forme, que `notes-de-version-watch.sh`.
+fn est_une_version_de_tune(tag: &str) -> bool {
+    let Some(reste) = tag.strip_prefix('v') else {
+        return false;
+    };
+    let mut morceaux = reste.split('.');
+    let trois = [morceaux.next(), morceaux.next(), morceaux.next()];
+    morceaux.next().is_none()
+        && trois
+            .iter()
+            .all(|m| m.is_some_and(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit())))
+}
+
 /// Dérive les entrées du panneau depuis les releases brutes, pour `lang`.
 /// Sans réseau : c'est la partie testable de la route.
 fn entrees_pour_langue(releases: &[Value], lang: &str) -> NotesServies {
@@ -3706,6 +3733,9 @@ fn entrees_pour_langue(releases: &[Value], lang: &str) -> NotesServies {
         .iter()
         .filter_map(|r| {
             let tag = r["tag_name"].as_str()?;
+            if !est_une_version_de_tune(tag) {
+                return None;
+            }
             let version = tag.strip_prefix('v').unwrap_or(tag);
             let date = r["published_at"]
                 .as_str()
@@ -3945,9 +3975,16 @@ fn parse_release_body(body: &str) -> ParsedBody {
     out
 }
 
-/// Les releases GitHub BRUTES (JSON de l'API, 20 dernières), via le proxy
+/// Les releases GitHub BRUTES (JSON de l'API, 30 dernières), via le proxy
 /// `mozaiklabs.fr` puis GitHub. La dérivation en entrées du panneau, par
 /// langue, est faite par [`entrees_pour_langue`] — hors réseau, donc testable.
+///
+/// **Trente et non vingt** depuis le 23/09/2026. La liste mêle deux familles
+/// de tags (cf. [`est_une_version_de_tune`]) : sur les vingt dernières, huit
+/// étaient des releases du moissonneur Roon. Les écarter sans élargir la
+/// demande aurait fait passer le panneau de vingt entrées à douze — corriger
+/// un défaut en en créant un autre. Mesuré le 23/09 sur le proxy, qui honore
+/// `per_page` : 30 rendues, 8 moissonneurs, 22 versions de Tune.
 async fn fetch_github_releases() -> Result<Vec<Value>, String> {
     let client = tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -3958,7 +3995,7 @@ async fn fetch_github_releases() -> Result<Vec<Value>, String> {
     // Try mozaiklabs.fr proxy first, fallback to GitHub
     let releases: Vec<Value> = match async {
         let resp = client
-            .get("https://mozaiklabs.fr/api/tune/releases?per_page=20")
+            .get("https://mozaiklabs.fr/api/tune/releases?per_page=30")
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -3972,7 +4009,7 @@ async fn fetch_github_releases() -> Result<Vec<Value>, String> {
         Ok(r) => r,
         Err(_) => {
             let mut req = client.get(
-                "https://api.github.com/repos/renesenses/tune-server-rust/releases?per_page=20",
+                "https://api.github.com/repos/renesenses/tune-server-rust/releases?per_page=30",
             );
             if let Ok(token) = std::env::var("GITHUB_TOKEN") {
                 req = req.header("Authorization", format!("Bearer {token}"));
@@ -5452,6 +5489,118 @@ mod changelog_lang_tests {
             "le secours n'existe qu'en français"
         );
         assert_eq!(en["fallback"], json!(true));
+    }
+}
+
+/// #4190 — ce que le panneau « Quoi de neuf » affiche VRAIMENT.
+///
+/// Le 23/09/2026, ses vingt entrées étaient réduites à « Release 0.9.x » et
+/// huit d'entre elles annonçaient le moissonneur Roon. Deux causes distinctes,
+/// deux familles de témoins ici.
+#[cfg(test)]
+mod changelog_forme_tests {
+    use super::{ParsedBody, entrees_pour_langue, est_une_version_de_tune, parse_release_body};
+    use serde_json::{Value, json};
+
+    fn release(tag: &str, body: &str) -> Value {
+        json!({ "tag_name": tag, "published_at": "2026-09-23T09:00:00Z", "body": body })
+    }
+
+    // ── 1. Le moissonneur n'est pas une version de Tune ──────────────────────
+
+    #[test]
+    fn le_tag_du_moissonneur_nest_pas_une_version_de_tune() {
+        assert!(est_une_version_de_tune("v0.9.161"));
+        assert!(est_une_version_de_tune("v1.0.0"));
+        assert!(!est_une_version_de_tune("moissonneur-v0.9.161"));
+        // Ni un tag d'une famille qu'on ne connaît pas encore, ni un tag
+        // partiel : le filtre est positif, il ne liste pas ce qu'il écarte.
+        assert!(!est_une_version_de_tune("os-v0.9.161"));
+        assert!(!est_une_version_de_tune("v0.9"));
+        assert!(!est_une_version_de_tune("v0.9.161-rc1"));
+        assert!(!est_une_version_de_tune("0.9.161"));
+    }
+
+    /// Le décor du 23/09/2026 : huit releases du moissonneur mêlées aux
+    /// versions de Tune. Le panneau ne doit en montrer AUCUNE.
+    #[test]
+    fn le_panneau_ne_montre_que_les_versions_de_tune() {
+        let corps = "## Corrections\n- Le son ne baisse plus sans raison\n";
+        let releases: Vec<Value> = ["v0.9.162", "moissonneur-v0.9.162", "v0.9.161"]
+            .iter()
+            .map(|t| release(t, corps))
+            .collect();
+
+        let n = entrees_pour_langue(&releases, "fr");
+
+        let versions: Vec<&str> = n
+            .entries
+            .iter()
+            .map(|e| e["version"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["0.9.162", "0.9.161"],
+            "une entrée du moissonneur reste dans le panneau"
+        );
+    }
+
+    // ── 2. La forme de la note ───────────────────────────────────────────────
+
+    /// Les deux exemples que `scripts/test-forme-des-notes.sh` fait lire au
+    /// lecteur `awk` de la garde CI. Ce test les fait lire au VRAI parseur.
+    ///
+    /// C'est le seul lien qui rend la copie supportable : le banc affirme
+    /// 0/0/0 et 3/2/3 de son côté, ce test les affirme ici. Une divergence
+    /// entre les deux implémentations rougit d'un côté ou de l'autre.
+    const EXEMPLE_PROSE: &str =
+        include_str!("../../../../.github/scripts/exemples/notes-en-prose.md");
+    const EXEMPLE_PUCES: &str =
+        include_str!("../../../../.github/scripts/exemples/notes-en-puces.md");
+
+    #[test]
+    fn une_note_en_prose_ne_donne_aucun_item() {
+        let ParsedBody {
+            features,
+            fixes,
+            improvements,
+        } = parse_release_body(EXEMPLE_PROSE);
+        assert_eq!(
+            (features.len(), improvements.len(), fixes.len()),
+            (0, 0, 0),
+            "la prose sous des titres thématiques ne produit rien — et la \
+             section « Telechargements » ne doit pas la sauver"
+        );
+    }
+
+    #[test]
+    fn une_note_en_puces_donne_ses_items() {
+        let ParsedBody {
+            features,
+            fixes,
+            improvements,
+        } = parse_release_body(EXEMPLE_PUCES);
+        assert_eq!(
+            (features.len(), improvements.len(), fixes.len()),
+            (3, 2, 3),
+            "mêmes chiffres que scripts/test-forme-des-notes.sh"
+        );
+    }
+
+    /// Le défaut tel que le testeur le voit : une note sans un seul item
+    /// devient l'entrée « Release 0.9.163 », qui n'apprend rien.
+    #[test]
+    fn une_note_en_prose_devient_release_x_y_z_dans_le_panneau() {
+        let n = entrees_pour_langue(&[release("v0.9.163", EXEMPLE_PROSE)], "fr");
+        assert_eq!(n.entries[0]["features"], json!(["Release 0.9.163"]));
+        assert_eq!(n.entries[0]["fixes"], json!([]));
+
+        let n = entrees_pour_langue(&[release("v0.9.163", EXEMPLE_PUCES)], "fr");
+        assert_eq!(
+            n.entries[0]["features"].as_array().map(Vec::len),
+            Some(3),
+            "la même version, en forme A, montre ses nouveautés"
+        );
     }
 }
 
