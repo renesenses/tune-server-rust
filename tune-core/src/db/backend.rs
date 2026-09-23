@@ -453,6 +453,71 @@ fn rusqlite_value_to_sqlvalue(v: rusqlite::types::ValueRef<'_>) -> SqlValue {
     }
 }
 
+/// Au-delà de cette durée, une lecture SQLite passée par `query_one` /
+/// `query_many` — le chemin de TOUS les dépôts — est dite au journal (#4800).
+///
+/// `query_timed` avait sa trace `slow_query` depuis toujours, mais aucun
+/// dépôt ne passe par lui : `count_visible` a duré 28 s sur le .18 pendant
+/// 48 h sans une ligne au journal. La même trace vit désormais ici, avec en
+/// plus le temps passé à ATTENDRE une connexion du pool — c'est lui qui
+/// distingue « la requête est lente » de « une autre requête lente la
+/// retient ».
+const SEUIL_LECTURE_LENTE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Trace `slow_query` si la lecture, ou l'attente d'une connexion, dépasse
+/// [`SEUIL_LECTURE_LENTE`]. Le SQL est replié sur une ligne et tronqué : il
+/// sert à reconnaître la requête, pas à la rejouer.
+fn signaler_lecture_lente(sql: &str, attente: std::time::Duration, duree: std::time::Duration) {
+    if duree < SEUIL_LECTURE_LENTE && attente < SEUIL_LECTURE_LENTE {
+        return;
+    }
+    let extrait: String = sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect();
+    tracing::warn!(
+        ms = duree.as_millis() as u64,
+        attente_ms = attente.as_millis() as u64,
+        sql = %extrait,
+        "slow_query"
+    );
+}
+
+/// Le corps commun de `query_one` / `query_many` SQLite : prépare, lie, lit
+/// au plus `au_plus` lignes (toutes si `None`). Sorti des deux méthodes pour
+/// que la mesure de [`signaler_lecture_lente`] les enveloppe sans les
+/// recopier.
+fn sqlite_lire_lignes(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    refs: &[&dyn rusqlite::types::ToSql],
+    au_plus: Option<usize>,
+) -> Result<Vec<Vec<SqlValue>>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
+    let col_count = stmt.column_count();
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(refs.iter()))
+        .map_err(|e| format!("query: {e}"))?;
+    let mut out: Vec<Vec<SqlValue>> = Vec::new();
+    while au_plus.is_none_or(|n| out.len() < n) {
+        let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? else {
+            break;
+        };
+        let cols = (0..col_count)
+            .map(|i| {
+                row.get_ref(i)
+                    .map(rusqlite_value_to_sqlvalue)
+                    .map_err(|e| format!("col {i}: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        out.push(cols);
+    }
+    Ok(out)
+}
+
 impl DbBackend for crate::db::sqlite::SqliteDb {
     fn engine(&self) -> Engine {
         Engine::Sqlite
@@ -506,24 +571,11 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
-        let conn = self.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
-        let col_count = stmt.column_count();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(refs.iter()))
-            .map_err(|e| format!("query: {e}"))?;
-        if let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? {
-            let cols = (0..col_count)
-                .map(|i| {
-                    row.get_ref(i)
-                        .map(rusqlite_value_to_sqlvalue)
-                        .map_err(|e| format!("col {i}: {e}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Some(cols))
-        } else {
-            Ok(None)
-        }
+        let conn = self.read_connection();
+        let debut = std::time::Instant::now();
+        let resultat = sqlite_lire_lignes(&conn, sql, &refs, Some(1)).map(|mut l| l.pop());
+        signaler_lecture_lente(sql, conn.attente(), debut.elapsed());
+        resultat
     }
 
     fn query_many(
@@ -536,24 +588,11 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
-        let conn = self.read_connection().lock().unwrap();
-        let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
-        let col_count = stmt.column_count();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(refs.iter()))
-            .map_err(|e| format!("query: {e}"))?;
-        let mut out: Vec<Vec<SqlValue>> = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("row: {e}"))? {
-            let cols = (0..col_count)
-                .map(|i| {
-                    row.get_ref(i)
-                        .map(rusqlite_value_to_sqlvalue)
-                        .map_err(|e| format!("col {i}: {e}"))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            out.push(cols);
-        }
-        Ok(out)
+        let conn = self.read_connection();
+        let debut = std::time::Instant::now();
+        let resultat = sqlite_lire_lignes(&conn, sql, &refs, None);
+        signaler_lecture_lente(sql, conn.attente(), debut.elapsed());
+        resultat
     }
 
     fn write_tx(

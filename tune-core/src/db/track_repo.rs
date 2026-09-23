@@ -582,7 +582,7 @@ mod like_escape_tests {
 /// fragments behind TODO comments; phase 4 swaps them for PG
 /// equivalents via dialect helpers.
 pub mod sql {
-    use super::SqlDialect;
+    use super::{Engine, SqlDialect};
 
     /// Le chemin **ouvrable** d'une piste, en SQL — pour une table aliasée `t`.
     ///
@@ -808,11 +808,11 @@ pub mod sql {
     /// la liste qu'il pagine (#1391), celles d'un album distant doublé par
     /// un local (#4146), et les copies de moindre qualité que la liste replie
     /// (#4101). `count()` reste le compte COMPLET.
-    pub fn count_visible() -> String {
+    pub fn count_visible(engine: Engine) -> String {
         format!(
             "SELECT COUNT(*) FROM tracks t WHERE {} AND {} AND {}",
             crate::db::facet_filter::hidden_tracks_excluded(),
-            crate::db::facet_filter::pistes_album_distant_double_exclu(),
+            crate::db::facet_filter::pistes_album_distant_double_exclu(engine),
             crate::db::facet_filter::copie_de_moindre_qualite_exclue()
         )
     }
@@ -1867,7 +1867,7 @@ impl TrackRepo {
             "{} WHERE {} AND {} AND {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
             sql::select_track(),
             hidden_tracks_excluded(),
-            crate::db::facet_filter::pistes_album_distant_double_exclu(),
+            crate::db::facet_filter::pistes_album_distant_double_exclu(self.db.engine()),
             crate::db::facet_filter::copie_de_moindre_qualite_exclue(),
             match self.db.engine() {
                 Engine::Sqlite => SqliteDialect.placeholder(1),
@@ -1885,7 +1885,10 @@ impl TrackRepo {
 
     /// Compteur de la vue pistes : exclut comme [`Self::list_visible`].
     pub fn count_visible(&self) -> Result<i64, TuneError> {
-        match self.db.query_one(&sql::count_visible(), &[])? {
+        match self
+            .db
+            .query_one(&sql::count_visible(self.db.engine()), &[])?
+        {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
@@ -2184,7 +2187,9 @@ impl TrackRepo {
         // Doublon distant (#4146) : les pistes d'un album `upnp` dont
         // l'équivalent LOCAL existe sortent de la vue, comme leur album sort
         // de la grille. Même statut que ci-dessus — socle, pas facette.
-        conditions.push(crate::db::facet_filter::pistes_album_distant_double_exclu());
+        conditions.push(crate::db::facet_filter::pistes_album_distant_double_exclu(
+            engine,
+        ));
         // Copie de moindre qualité (#4101) : le repli que la fiche d'album,
         // la file et `albums.track_count` appliquent depuis #1362 manquait à
         // cette route — la SEULE que la vue Oxygen appelle. Socle, pas

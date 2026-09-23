@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -14,7 +16,7 @@ use crate::state::AppState;
 use tune_core::db::album_distinct_repo::{AlbumDistinctRepo, DistinctPairSet};
 use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::backend::ToSqlValue;
+use tune_core::db::backend::{DbBackend, ToSqlValue};
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::models::Album;
@@ -90,42 +92,75 @@ pub(super) async fn list_albums(
     State(state): State<AppState>,
     Query(p): Query<AlbumFilters>,
 ) -> Json<Value> {
-    let repo = AlbumRepo::with_backend(state.backend.clone());
+    // #4800 — TOUTES les lectures de cette route sont synchrones (rusqlite),
+    // et la page d'albums est la plus longue du serveur : 35 à 42 s sur le
+    // .18 avant le correctif de la clause de doublon. Posées sur un fil de
+    // l'exécuteur, elles gelaient ce fil pour toutes les autres requêtes en
+    // vol. `spawn_blocking` les met sur le pool de fils bloquants de Tokio,
+    // où une lecture longue ne retient qu'elle-même.
+    let backend = state.backend.clone();
+    let (limit, offset) = (p.limit.unwrap_or(50), p.offset.unwrap_or(0));
+    match tokio::task::spawn_blocking(move || lire_la_page_d_albums(backend, p)).await {
+        Ok(corps) => Json(corps),
+        Err(e) => {
+            // Le fil a paniqué ou a été annulé : une grille vide plutôt qu'un
+            // 500 muet, et le journal dit pourquoi.
+            tracing::error!(error = %e, "list_albums_tache_bloquante_perdue");
+            Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+        }
+    }
+}
+
+/// Le corps de `GET /library/albums`, exécuté HORS de l'exécuteur async.
+fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value {
+    let repo = AlbumRepo::with_backend(backend);
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let sort = p.sort.as_deref().unwrap_or("added_at");
     let order = p.order.as_deref().unwrap_or("asc");
     let include_hidden = p.include_hidden.unwrap_or(false);
     let dr = DrRange::new(p.dr_min, p.dr_max);
-    // Le total suit la même exclusion que la liste, sinon la grille pagine
-    // faux (#1391) — et la même TRANCHE de DR, sinon elle pagine encore plus
-    // faux (#2144) : le tag DR n'existe que sur une poignée d'albums, un
-    // `total` de 45 000 sur une liste de douze donnerait des centaines de
-    // pages vides.
-    let total = match dr {
-        Some(range) => repo.count_in_dr_range(range, include_hidden).unwrap_or(0),
-        None if include_hidden => repo.count().unwrap_or(0),
-        None => repo.count_visible().unwrap_or(0),
-    };
     // #3074 — `sort=random` : la graine EST le contrat. Le serveur en tire une
     // quand le client n'en donne pas, et la lui rend toujours, pour que les
     // pages suivantes retombent sur le meme tirage. Hors tri aleatoire elle
     // reste `None` et la reponse ne bouge pas d'un octet pour les clients deja
     // livres (iOS, macOS, Android, client web, UPnP).
     let seed = (sort == "random").then(|| p.seed.unwrap_or_else(AlbumRepo::graine_aleatoire));
-    let items = match repo.list_filtered_seeded(
-        limit,
-        offset,
-        sort,
-        order,
-        p.format.as_deref(),
-        p.quality.as_deref(),
-        p.compilation,
-        include_hidden,
-        dr,
-        seed,
-    ) {
-        Ok(albums) => albums,
+    // #4800 — la page et son total en UNE requête : le prédicat de doublon
+    // #4146 ne s'évalue plus deux fois. Le total n'est demandé que là où il
+    // sera repris (voir plus bas) ; ailleurs le SQL reste celui d'avant.
+    let sans_facette = p.format.is_none() && p.quality.is_none() && p.compilation.is_none();
+    let veut_le_total = dr.is_none() && !include_hidden && sans_facette;
+    let page = if veut_le_total {
+        repo.list_filtered_seeded_avec_total(
+            limit,
+            offset,
+            sort,
+            order,
+            p.format.as_deref(),
+            p.quality.as_deref(),
+            p.compilation,
+            include_hidden,
+            dr,
+            seed,
+        )
+    } else {
+        repo.list_filtered_seeded(
+            limit,
+            offset,
+            sort,
+            order,
+            p.format.as_deref(),
+            p.quality.as_deref(),
+            p.compilation,
+            include_hidden,
+            dr,
+            seed,
+        )
+        .map(|albums| (albums, None))
+    };
+    let (items, total_de_la_page) = match page {
+        Ok(page) => page,
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -133,11 +168,31 @@ pub(super) async fn list_albums(
                 order,
                 limit,
                 offset,
-                total,
-                "list_albums_query_failed — stats show {total} albums but query returned error"
+                "list_albums_query_failed"
             );
-            Vec::new()
+            (Vec::new(), None)
         }
+    };
+    // Le total suit la même exclusion que la liste, sinon la grille pagine
+    // faux (#1391) — et la même TRANCHE de DR, sinon elle pagine encore plus
+    // faux (#2144) : le tag DR n'existe que sur une poignée d'albums, un
+    // `total` de 45 000 sur une liste de douze donnerait des centaines de
+    // pages vides.
+    //
+    // Le total de la page n'est repris QUE là où il vaut, au caractère près,
+    // ce que `count_visible` compterait : sans tranche de DR, sans albums
+    // masqués, et sans facette de format/qualité/compilation — car ce total-
+    // là a toujours été celui de la bibliothèque VISIBLE entière, pas de la
+    // facette, et les clients paginent dessus. Ce contrat ne bouge pas ici.
+    // Page vide (décalage au-delà de la fin) : pas de total porté, on
+    // recompte — le seul cas où le doublon s'évalue deux fois.
+    let total = match dr {
+        Some(range) => repo.count_in_dr_range(range, include_hidden).unwrap_or(0),
+        None if include_hidden => repo.count().unwrap_or(0),
+        None => match total_de_la_page {
+            Some(total) => total,
+            None => repo.count_visible().unwrap_or(0),
+        },
     };
     // #4521 — le DR de chaque album de la page, par la règle de la fiche, en
     // UNE requête groupée sur les identifiants déjà bornés. Même type que la
@@ -170,7 +225,7 @@ pub(super) async fn list_albums(
         // exactement la reponse d'avant.
         corps["seed"] = json!(graine);
     }
-    Json(corps)
+    corps
 }
 
 pub(super) async fn album_count(State(state): State<AppState>) -> Json<Value> {

@@ -9,7 +9,7 @@ use crate::TuneError;
 
 /// Engine-agnostic SQL builders for album_repo.
 pub mod sql {
-    use super::SqlDialect;
+    use super::{Engine, SqlDialect};
 
     /// ⚠️ L'ordre des colonnes EST le contrat de [`super::row_to_album`], qui
     /// lit par index. `is_compilation` est en 24, `release_type` en 25 ;
@@ -396,11 +396,11 @@ pub mod sql {
     /// `list_filtered`, sinon le `total` de la pagination ment et la grille
     /// saute ou duplique des pages (#1391). Même exclusion, aussi, des albums
     /// distants doublés par un local (#4146) — et pour la même raison.
-    pub fn count_visible() -> String {
+    pub fn count_visible(engine: Engine) -> String {
         format!(
             "SELECT COUNT(*) FROM albums a WHERE {} AND {}",
             crate::db::facet_filter::hidden_albums_excluded(),
-            crate::db::facet_filter::album_distant_double_exclu("a")
+            crate::db::facet_filter::album_distant_double_exclu(engine, "a")
         )
     }
 
@@ -409,7 +409,7 @@ pub mod sql {
             "{} WHERE {} AND {} ORDER BY a.id DESC LIMIT {}",
             select_album(),
             crate::db::facet_filter::hidden_albums_excluded(),
-            crate::db::facet_filter::album_distant_double_exclu("a"),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
             d.placeholder(1)
         )
     }
@@ -1074,7 +1074,7 @@ impl AlbumRepo {
     /// sont pas rapprochés, et deux éditions (« Remastered », coffret) non
     /// plus, puisque le titre diffère.
     pub fn aussi_sur(&self, id: i64) -> Result<Vec<AussiSur>, TuneError> {
-        let cond = crate::db::facet_filter::condition_de_doublon("d");
+        let cond = crate::db::facet_filter::condition_de_doublon(self.db.engine(), "d");
         let p = self.marque(1);
         // Les deux sens, en une requête chacun ; un album n'est que l'un des deux.
         let distants = format!(
@@ -2091,7 +2091,10 @@ impl AlbumRepo {
     /// comme la liste qu'il pagine (#1391). `count()` reste le compte COMPLET
     /// (stats, maintenance).
     pub fn count_visible(&self) -> Result<i64, TuneError> {
-        match self.db.query_one(&sql::count_visible(), &[])? {
+        match self
+            .db
+            .query_one(&sql::count_visible(self.db.engine()), &[])?
+        {
             None => Ok(0),
             Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0)),
         }
@@ -2478,7 +2481,9 @@ impl AlbumRepo {
         // #4146 : le doublon distant sort de la tranche comme il sort de la
         // grille. `include_hidden` ne le rouvre PAS — c'est le drapeau des
         // albums masqués à la main (#1391), pas celui des doublons.
-        wheres.push(crate::db::facet_filter::album_distant_double_exclu("a"));
+        wheres.push(crate::db::facet_filter::album_distant_double_exclu(
+            engine, "a",
+        ));
         let sql = format!(
             "SELECT COUNT(*) FROM albums a {} WHERE {}",
             Self::dr_album_join(engine),
@@ -2681,6 +2686,76 @@ impl AlbumRepo {
         order: &str,
         format: Option<&str>,
         quality: Option<&str>,
+        compilation: Option<bool>,
+        include_hidden: bool,
+        dr: Option<DrRange>,
+        seed: Option<i64>,
+    ) -> Result<Vec<Album>, TuneError> {
+        self.lister_filtre(
+            limit,
+            offset,
+            sort,
+            order,
+            format,
+            quality,
+            compilation,
+            include_hidden,
+            dr,
+            seed,
+            false,
+        )
+        .map(|(albums, _)| albums)
+    }
+
+    /// [`Self::list_filtered_seeded`], plus l'EFFECTIF de l'ensemble filtré,
+    /// compté dans la MÊME requête que la page (#4800).
+    ///
+    /// La route `GET /library/albums` comptait (`count_visible`) puis listait :
+    /// le prédicat de doublon #4146 — le plus cher du `WHERE` — s'évaluait
+    /// deux fois par page. Ici `COUNT(*) OVER ()` le rend une seule fois, sur
+    /// les mêmes lignes que le tri : total et page ne peuvent pas diverger.
+    ///
+    /// `None` quand la page est VIDE (décalage au-delà de la fin) : une
+    /// fenêtre sans ligne ne porte pas de total, et l'appelant retombe alors
+    /// sur son compteur. C'est le seul cas où il compte deux fois.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_filtered_seeded_avec_total(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
+        compilation: Option<bool>,
+        include_hidden: bool,
+        dr: Option<DrRange>,
+        seed: Option<i64>,
+    ) -> Result<(Vec<Album>, Option<i64>), TuneError> {
+        self.lister_filtre(
+            limit,
+            offset,
+            sort,
+            order,
+            format,
+            quality,
+            compilation,
+            include_hidden,
+            dr,
+            seed,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lister_filtre(
+        &self,
+        limit: i64,
+        offset: i64,
+        sort: &str,
+        order: &str,
+        format: Option<&str>,
+        quality: Option<&str>,
         // `Some(true)` = seulement les compilations, `Some(false)` = tout sauf
         // elles, `None` = pas de filtre (#1957).
         compilation: Option<bool>,
@@ -2697,7 +2772,11 @@ impl AlbumRepo {
         // doublons en pagination. C'est la route HTTP qui en tire une quand le
         // client n'en donne pas, et qui la lui renvoie.
         seed: Option<i64>,
-    ) -> Result<Vec<Album>, TuneError> {
+        // `true` = compter l'ensemble filtré dans la même requête (#4800) ;
+        // `false` = le SQL d'avant, au caractère près, pour les appelants qui
+        // n'ont que faire du total (Browse UPnP, maintenance).
+        avec_total: bool,
+    ) -> Result<(Vec<Album>, Option<i64>), TuneError> {
         let dir = if order.eq_ignore_ascii_case("desc") {
             "DESC"
         } else {
@@ -2817,7 +2896,10 @@ impl AlbumRepo {
         // base, et y revient dès que le local disparaît. Le prédicat passe par
         // `wheres`, comme celui des masqués, et le compteur `count_visible`
         // porte le MÊME, sinon la pagination ment.
-        wheres.push(crate::db::facet_filter::album_distant_double_exclu("a"));
+        wheres.push(crate::db::facet_filter::album_distant_double_exclu(
+            self.db.engine(),
+            "a",
+        ));
         // Tranche de DR (#2144) : les marqueurs se prennent ICI, avant ceux de
         // LIMIT/OFFSET, sinon PostgreSQL décale toutes les valeurs liées (le
         // `?` de SQLite, lui, ignore l'indice et masquerait le défaut — piège
@@ -2882,13 +2964,23 @@ impl AlbumRepo {
         // en tri par date d'ajout : `aa.added_at` reste lisible par `ORDER BY`
         // depuis la jointure sans figurer dans la liste de colonnes. La date
         // n'a plus qu'UNE source de lecture, la même pour tous les tris.
+        // #4800 — l'effectif de l'ensemble filtré, en DERNIÈRE colonne, calculé
+        // par le moteur sur les lignes qu'il vient de retenir : le `WHERE` —
+        // doublon #4146 compris — n'est évalué qu'une fois pour la page ET
+        // son total. Fenêtre vide (`OVER ()`) : la même valeur sur chaque
+        // ligne, avant LIMIT/OFFSET.
+        let colonne_total = if avec_total {
+            ", COUNT(*) OVER () AS total"
+        } else {
+            ""
+        };
         let id_select = if let Some(rnd) = rnd_expr.as_deref() {
             // La colonne calculee reste dans le 1er temps de #1269 : on trie
             // des lignes ETROITES (id + valeur de melange), jamais les vingt-
             // cinq colonnes de l'album.
-            format!("SELECT a.id, {rnd} AS rnd FROM albums a {joins}")
+            format!("SELECT a.id, {rnd} AS rnd{colonne_total} FROM albums a {joins}")
         } else {
-            format!("SELECT a.id FROM albums a {joins}")
+            format!("SELECT a.id{colonne_total} FROM albums a {joins}")
         };
         let sql = format!(
             "{id_select}{where_clause} ORDER BY {order_clause} LIMIT {limit_ph} OFFSET {offset_ph}"
@@ -2904,8 +2996,14 @@ impl AlbumRepo {
             .filter_map(|r| r.first().and_then(|v| v.as_i64()))
             .collect();
         if ordered_ids.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
+        // Le total est le même sur toutes les lignes : la première suffit.
+        let total = if avec_total {
+            rows.first().and_then(|r| r.last()).and_then(|v| v.as_i64())
+        } else {
+            None
+        };
 
         // #3397 — la date d'ajout se lit ICI, sur la page déjà bornée, pour
         // TOUS les tris. Avant, elle n'était extraite que du 1er temps du tri
@@ -2947,14 +3045,15 @@ impl AlbumRepo {
                 }
             }
         }
-        Ok(ordered_ids
+        let albums = ordered_ids
             .iter()
             .filter_map(|id| {
                 let mut album = by_id.remove(id)?;
                 album.added_at = added_at_by_id.get(id).copied();
                 Some(album)
             })
-            .collect())
+            .collect();
+        Ok((albums, total))
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
@@ -3650,7 +3749,7 @@ mod tests {
             .query_many(
                 &format!(
                     "SELECT a.id FROM albums a WHERE {} ORDER BY a.id",
-                    crate::db::facet_filter::album_distant_double_exclu("a")
+                    crate::db::facet_filter::album_distant_double_exclu(Engine::Sqlite, "a")
                 ),
                 &[],
             )
