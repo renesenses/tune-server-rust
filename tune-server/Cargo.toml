@@ -819,6 +819,14 @@ path = "tests/playpause_un_appel_4566.rs"
 name = "index_recherche_denominateur_4565"
 path = "tests/index_recherche_denominateur_4565.rs"
 
+# #4319 — la ligne « Albums masqués » du rapport de diagnostic : le filtre qui
+# s'applique APRÈS l'index, et qui explique à lui seul « visible dans
+# Répertoires, introuvable à la recherche ». `autotests = false` en tête de ce
+# manifeste : sans cette cible, le témoin ne serait JAMAIS compilé.
+[[test]]
+name = "albums_masques_dans_le_rapport_4319"
+path = "tests/albums_masques_dans_le_rapport_4319.rs"
+
 # #4564 — les captures du signalement forum. `autotests = false` en tête de ce
 # manifeste : sans cette cible, ni la garde du nom `images[]` ni les refus
 # bornés ne seraient jamais compilés.
