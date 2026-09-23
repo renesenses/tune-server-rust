@@ -544,7 +544,22 @@ impl TidalService {
         self.user_id = token
             .user_id
             .or_else(|| Self::extract_uid_from_jwt(&access_token_clone));
-        self.country_code = "FR".into();
+        // 🔴 Le pays est celui du COMPTE, jamais un défaut écrit ici.
+        //
+        // Cette ligne posait `"FR"` sans condition, à chaque connexion. Le
+        // pays Tidal n'est pas une langue d'interface : il décide du
+        // CATALOGUE joignable et des droits de diffusion. Un abonné
+        // britannique ou roumain se voyait donc attribuer le catalogue
+        // français le temps que `/users/me` réponde — et DÉFINITIVEMENT si
+        // cet appel échouait, puisque plus rien ne repassait derrière.
+        //
+        // Ce que le compte fournit, dans l'ordre : la revendication du jeton
+        // (immédiate, hors réseau), puis `/users/me` juste en dessous, qui
+        // fait autorité. Si ni l'un ni l'autre ne dit rien, on garde la
+        // valeur en place plutôt que d'en inventer une.
+        if let Some(pays) = Self::pays_depuis_jwt(&access_token_clone) {
+            self.adopter_pays(&pays);
+        }
 
         info!(user_id = ?self.user_id, "tidal_pkce_authenticated");
 
@@ -1056,8 +1071,11 @@ impl TidalService {
     async fn refresh_user_info(&mut self) {
         if let Ok(me) = self.api_get("/users/me").await {
             self.username = me["username"].as_str().map(Into::into);
+            // `/users/me` FAIT AUTORITÉ sur le pays : c'est le compte qui
+            // parle. `adopter_pays` vide au passage le cache « À la une », qui
+            // ne porte pas le pays dans sa clé.
             if let Some(cc) = me["countryCode"].as_str() {
-                self.country_code = cc.into();
+                self.adopter_pays(cc);
             }
             info!(username = ?self.username, country = %self.country_code, "tidal_user_refreshed");
         }
@@ -1091,6 +1109,53 @@ impl TidalService {
         let decoded = base64_decode_url(payload).ok()?;
         let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
         claims["uid"].as_u64()
+    }
+
+    /// Le pays du COMPTE, lu dans le jeton d'accès.
+    ///
+    /// Le jeton Tidal est un JWT ; sa charge utile porte le pays de
+    /// l'abonnement, sous `cc` (la forme courte de Tidal) ou `countryCode`.
+    /// C'est une lecture de MEILLEUR EFFORT : si la revendication manque, la
+    /// fonction ne rend rien, et l'appelant garde ce qu'il avait. Elle ne
+    /// FABRIQUE jamais un pays.
+    ///
+    /// Le format est vérifié — exactement deux lettres ASCII, mises en
+    /// majuscules — parce qu'un pays faux ne se voit pas : il change
+    /// silencieusement le catalogue joignable, pas le message d'erreur.
+    fn pays_depuis_jwt(token: &str) -> Option<String> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() < 2 {
+            return None;
+        }
+        let decoded = base64_decode_url(parts[1]).ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        claims["cc"]
+            .as_str()
+            .or_else(|| claims["countryCode"].as_str())
+            .and_then(pays_iso2)
+    }
+
+    /// Adopter un pays que le COMPTE vient de nommer.
+    ///
+    /// Un pays refusé (forme invalide) ne remplace rien. Un pays qui CHANGE
+    /// vide le cache « À la une » : ses rangées ont été demandées avec
+    /// `countryCode=<ancien>`, et [`FeaturedCache`] ne porte pas le pays dans
+    /// sa clé. Sans cette purge, cinq minutes de rangées d'un autre catalogue
+    /// survivraient à la correction — exactement le défaut qu'on corrige, mais
+    /// servi par le cache.
+    fn adopter_pays(&mut self, nouveau: &str) {
+        let Some(nouveau) = pays_iso2(nouveau) else {
+            warn!(pays = %nouveau, "tidal_pays_refuse");
+            return;
+        };
+        if nouveau == self.country_code {
+            return;
+        }
+        info!(avant = %self.country_code, apres = %nouveau, "tidal_pays_du_compte_adopte");
+        self.country_code = nouveau;
+        if let Ok(mut cache) = self.featured_cache.lock() {
+            *cache = None;
+        }
     }
 
     async fn api_post_form(
@@ -1458,7 +1523,12 @@ impl StreamingService for TidalService {
                     .or_else(|| Self::extract_uid_from_jwt(&access_token_clone));
                 self.pending_device_auth = None;
                 self.device_auth_started = None;
-                self.country_code = "FR".into();
+                // Même correction qu'au bout du flux PKCE : le pays vient du
+                // compte (revendication du jeton, puis `/users/me` qui fait
+                // autorité), et non d'un `"FR"` écrit en dur ici.
+                if let Some(pays) = Self::pays_depuis_jwt(&access_token_clone) {
+                    self.adopter_pays(&pays);
+                }
 
                 info!(user_id = ?self.user_id, "tidal_authenticated");
 
@@ -2342,7 +2412,20 @@ impl StreamingService for TidalService {
                 // on-demand if a 401 comes back before then
             }
             self.username = tokens["username"].as_str().map(Into::into);
-            self.country_code = tokens["country_code"].as_str().unwrap_or("FR").into();
+            // 🔴 Le repli n'est pas `"FR"`. Une ligne de jetons écrite avant
+            // que `country_code` soit persisté — ou par une version plus
+            // ancienne — retombait sur la France à CHAQUE démarrage, et
+            // `refresh_user_info` n'est appelé qu'à la connexion : rien ne
+            // corrigeait ensuite. Ce qui est persisté vient du compte ; à
+            // défaut, la revendication du jeton ; à défaut, on garde la valeur
+            // en place.
+            if let Some(pays) = tokens["country_code"]
+                .as_str()
+                .and_then(pays_iso2)
+                .or_else(|| Self::pays_depuis_jwt(at))
+            {
+                self.country_code = pays;
+            }
             self.user_id = tokens["user_id"].as_u64().or_else(|| {
                 refresh_token
                     .as_deref()
@@ -2424,6 +2507,18 @@ fn base64url_encode(data: &[u8]) -> String {
         output.push(table[(buf & 0x3F) as usize] as char);
     }
     output
+}
+
+/// Un code pays ISO 3166-1 alpha-2, ou rien.
+///
+/// Tidal attend `countryCode=GB`, pas `countryCode=en-GB` ni
+/// `countryCode=GBR`. Cette garde est là pour que rien d'approchant ne passe :
+/// un pays faux ne provoque pas d'erreur, il change le catalogue joignable et
+/// rend des titres INJOUABLES sans un mot dans le journal.
+fn pays_iso2(brut: &str) -> Option<String> {
+    let taille = brut.trim();
+    (taille.len() == 2 && taille.chars().all(|c| c.is_ascii_alphabetic()))
+        .then(|| taille.to_ascii_uppercase())
 }
 
 fn base64_decode_url(input: &str) -> Result<Vec<u8>, String> {
@@ -3678,6 +3773,151 @@ mod tests {
         assert_eq!(svc.name(), "tidal");
         assert!(svc.enabled());
         assert_eq!(svc.country_code, "US");
+    }
+
+    /// Fabrique un jeton en forme de JWT dont la charge utile porte `claims`.
+    fn jeton_jwt(claims: serde_json::Value) -> String {
+        use base64::Engine;
+        let charge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("entete.{charge}.signature")
+    }
+
+    /// 🔴 Le pays Tidal vient du COMPTE, jamais d'un défaut écrit en dur.
+    ///
+    /// C'est un pays de CATALOGUE, pas une langue d'interface : il décide de
+    /// ce qui est joignable et diffusable. Le jeton d'accès le porte, et
+    /// c'est cette lecture-là qui remplace le `"FR"` que les deux fins
+    /// d'authentification posaient sans condition.
+    #[test]
+    fn le_pays_se_lit_dans_le_jeton_et_rien_ne_se_fabrique() {
+        assert_eq!(
+            TidalService::pays_depuis_jwt(&jeton_jwt(json!({"uid": 1, "cc": "GB"}))).as_deref(),
+            Some("GB"),
+            "la revendication du compte doit être lue"
+        );
+        assert_eq!(
+            TidalService::pays_depuis_jwt(&jeton_jwt(json!({"countryCode": "ro"}))).as_deref(),
+            Some("RO"),
+            "la forme longue vaut la courte, et le pays se met en majuscules"
+        );
+        // Aucun de ces jetons ne nomme un pays : la fonction ne doit rien
+        // rendre — surtout pas la France, qui était la valeur d'avant.
+        for muet in [
+            jeton_jwt(json!({"uid": 1})),
+            jeton_jwt(json!({"cc": "FRA"})),
+            jeton_jwt(json!({"cc": "f"})),
+            jeton_jwt(json!({"cc": "12"})),
+            "pas-un-jwt".to_string(),
+        ] {
+            assert_eq!(
+                TidalService::pays_depuis_jwt(&muet),
+                None,
+                "rien ne doit être fabriqué à partir de « {muet} »"
+            );
+        }
+    }
+
+    /// Un pays qui CHANGE vide le cache « À la une ».
+    ///
+    /// `FeaturedCache` ne porte pas le pays dans sa clé et vit 300 s. Sans
+    /// cette purge, la correction du pays arriverait… et cinq minutes de
+    /// rangées de l'ANCIEN catalogue continueraient d'être servies. Un pays
+    /// identique, lui, ne doit rien jeter.
+    #[test]
+    fn adopter_un_pays_different_vide_le_cache_a_la_une() {
+        let mut svc = TidalService::new();
+        assert_eq!(svc.country_code, "US");
+
+        let remplir = |svc: &TidalService| {
+            *svc.featured_cache.lock().unwrap() = Some(FeaturedCache {
+                sections: Vec::new(),
+                fetched_at: Instant::now(),
+            });
+        };
+
+        remplir(&svc);
+        svc.adopter_pays("us");
+        assert!(
+            svc.featured_cache.lock().unwrap().is_some(),
+            "le même pays ne doit rien jeter"
+        );
+
+        svc.adopter_pays("GB");
+        assert_eq!(svc.country_code, "GB");
+        assert!(
+            svc.featured_cache.lock().unwrap().is_none(),
+            "le cache « À la une » du catalogue précédent doit être jeté"
+        );
+
+        remplir(&svc);
+        svc.adopter_pays("FRA");
+        assert_eq!(
+            svc.country_code, "GB",
+            "une forme invalide ne remplace rien"
+        );
+        assert!(svc.featured_cache.lock().unwrap().is_some());
+    }
+
+    /// 🔴 Une ligne de jetons SANS pays ne retombe plus sur la France.
+    ///
+    /// `restore_tokens` faisait `unwrap_or("FR")` : à chaque démarrage, une
+    /// ligne écrite avant que `country_code` soit persisté rendait le serveur
+    /// français, et `refresh_user_info` n'étant appelé qu'à la connexion,
+    /// rien ne corrigeait ensuite. Le pays du compte est dans le jeton.
+    #[test]
+    fn une_ligne_de_jetons_sans_pays_ne_retombe_pas_sur_la_france() {
+        let mut svc = TidalService::new();
+        let jeton = jeton_jwt(json!({"uid": 12345, "cc": "GB"}));
+        assert!(svc.restore_tokens(&json!({
+            "access_token": jeton,
+            "refresh_token": "r",
+            "username": "testeur",
+        })));
+        assert_eq!(
+            svc.country_code, "GB",
+            "le pays doit venir du jeton, pas d'un défaut français"
+        );
+
+        // Et si vraiment PERSONNE ne nomme de pays, la valeur en place tient.
+        let mut muet = TidalService::new();
+        assert!(muet.restore_tokens(&json!({
+            "access_token": jeton_jwt(json!({"uid": 7})),
+            "username": "muet",
+        })));
+        assert_eq!(
+            muet.country_code, "US",
+            "sans pays nommé nulle part, on garde ce qu'on avait — pas la France"
+        );
+
+        // Le pays PERSISTÉ fait foi sur la revendication du jeton : c'est la
+        // dernière chose que `/users/me` ait dite.
+        let mut persiste = TidalService::new();
+        assert!(persiste.restore_tokens(&json!({
+            "access_token": jeton_jwt(json!({"uid": 1, "cc": "GB"})),
+            "country_code": "RO",
+        })));
+        assert_eq!(persiste.country_code, "RO");
+    }
+
+    /// Garde de non-régression : plus AUCUNE affectation de pays en dur.
+    ///
+    /// Les deux fins d'authentification (PKCE et code d'appareil) ne sont pas
+    /// joignables sans réseau ; cette garde est ce qui rougit si l'une d'elles
+    /// se remet à écrire un pays constant. L'aiguille est assemblée à
+    /// l'exécution pour que la garde ne se trouve pas ELLE-MÊME dans le
+    /// fichier qu'elle lit.
+    #[test]
+    fn aucun_pays_ecrit_en_dur_ne_subsiste() {
+        let source = include_str!("tidal.rs");
+        let guillemet = '"';
+        for pays in ["FR", "US", "GB", "DE"] {
+            let interdit = format!("country_code = {guillemet}{pays}{guillemet}");
+            assert_eq!(
+                source.matches(&interdit).count(),
+                0,
+                "« {interdit} » : le pays est un CATALOGUE, il vient du compte"
+            );
+        }
     }
 
     #[test]

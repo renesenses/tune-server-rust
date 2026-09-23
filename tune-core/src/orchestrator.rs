@@ -1281,6 +1281,7 @@ mod resolve_stream;
 mod resolve_local;
 
 mod dsp;
+pub use dsp::PorteeDuReglage;
 
 mod resolve_direct;
 

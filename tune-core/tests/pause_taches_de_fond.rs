@@ -472,3 +472,150 @@ async fn suspendre_la_plage_dynamique_laisse_le_replaygain_travailler() {
         "🔴 la plage dynamique est suspendue et a pourtant décodé"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 4. Les biographies — la passe `bios` est comptée dans « Enrichissement »
+// ---------------------------------------------------------------------------
+//
+// L'écran « État du serveur » range `bios` sous la carte « Enrichissement »
+// (`tune-server/src/routes/system/taches_de_fond.rs`, `etat_de` :
+// `inscrite(state, &["enrich_all", "bios", "credits_enrich_auto"])`). La carte
+// annonçait donc « en pause » pendant que `batch_enrich_artist_bios` continuait
+// d'appeler MusicBrainz, Wikipédia et Last.fm : la pause disait le contraire de
+// ce qui se passait.
+
+/// Le schéma minimal de la passe des biographies d'artistes.
+const SCHEMA_BIOS: &str = "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                            updated_at TEXT NOT NULL DEFAULT '');
+     CREATE TABLE artists (id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                           musicbrainz_id TEXT, bio TEXT, bio_source TEXT,
+                           bio_source_url TEXT, bio_license TEXT, bio_lang TEXT);";
+
+/// Un seul artiste, **sans MBID**.
+///
+/// Sans MBID, aucune source ne part du MBID (Wikidata, Wikipédia, TheAudioDB) :
+/// la boucle ne peut atteindre que la recherche par nom de Last.fm. Le témoin
+/// ne dépend donc d'aucun réseau pour son assertion centrale — et s'il tourne
+/// sur une machine qui PORTE une clé Last.fm en environnement, le tour coûte
+/// au pire deux secondes de temporisation plus une requête, bien en deçà de la
+/// fenêtre d'observation.
+fn bibliotheque_bios() -> Arc<dyn DbBackend> {
+    let db = SqliteDb::open_in_memory().expect("base mémoire");
+    db.execute_batch(SCHEMA_BIOS).expect("schéma");
+    db.execute(
+        "INSERT INTO artists (id, name, musicbrainz_id, bio) VALUES (1, 'Glass Hammer', '', '')",
+        &[],
+    )
+    .expect("un artiste sans bio ni MBID");
+    Arc::new(db)
+}
+
+/// `artist_bio_enrich_result` n'est écrit qu'à la TOUTE FIN de la passe : sa
+/// présence est donc le témoin, sans ambiguïté, que la passe est allée au bout.
+fn passe_bios_terminee(backend: &Arc<dyn DbBackend>) -> bool {
+    SettingsRepo::with_backend(backend.clone())
+        .get("artist_bio_enrich_result")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// La pause « Enrichissement » arrête la passe des biographies, et « Reprendre »
+/// la fait repartir.
+///
+/// 🔴 Retirer l'`attendre_la_reprise` en tête de la boucle de
+/// `batch_enrich_artist_bios_scoped` fait rougir la première assertion : la
+/// passe va au bout en moins d'une seconde alors que la pause est posée.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_pause_de_l_enrichissement_arrete_la_passe_des_biographies() {
+    let _serialise = VERROU.lock().await;
+    a_neuf();
+    let _scratch = tune_core::test_scratch::scratch_dir("pause-bios");
+    let backend = bibliotheque_bios();
+
+    mettre_en_pause(&backend, Tache::Enrichissement).expect("poser la pause");
+
+    let pour_la_passe = backend.clone();
+    let passe = tokio::spawn(async move {
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios(pour_la_passe, "fr").await;
+    });
+
+    // — garée —
+    //
+    // Six secondes : sans la garde, la passe termine son unique artiste en
+    // bien moins que ça (aucune source sans MBID, et au pire une seule requête
+    // Last.fm précédée de deux secondes de temporisation).
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    assert!(
+        !passe.is_finished() && !passe_bios_terminee(&backend),
+        "🔴 LA PAUSE N'ARRÊTE PAS LA PASSE DES BIOGRAPHIES. « Enrichissement » \
+         est suspendu et `batch_enrich_artist_bios` est pourtant allée au bout : \
+         l'écran « État du serveur » affiche « en pause » pendant que la passe \
+         interroge MusicBrainz, Wikipédia et Last.fm."
+    );
+
+    // — et elle repart —
+    reprendre(&backend, Tache::Enrichissement).expect("lever la pause");
+    tokio::time::timeout(std::time::Duration::from_secs(90), passe)
+        .await
+        .expect("la passe doit repartir après « Reprendre »")
+        .expect("la passe ne doit pas paniquer");
+    assert!(
+        passe_bios_terminee(&backend),
+        "🔴 « Reprendre » ne relance pas la passe des biographies"
+    );
+}
+
+/// Contre-épreuve : sans pause, la même passe va au bout dans la même fenêtre.
+///
+/// Sans elle, le témoin ci-dessus serait satisfait par une passe qui ne démarre
+/// jamais, pour n'importe quelle autre raison que la pause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn contre_epreuve_sans_pause_la_passe_des_biographies_va_au_bout() {
+    let _serialise = VERROU.lock().await;
+    a_neuf();
+    let _scratch = tune_core::test_scratch::scratch_dir("pause-bios-contre");
+    let backend = bibliotheque_bios();
+
+    let pour_la_passe = backend.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        tune_core::metadata::bio_batch::batch_enrich_artist_bios(pour_la_passe, "fr"),
+    )
+    .await
+    .expect("sans pause, la passe doit aller au bout");
+
+    assert!(
+        passe_bios_terminee(&backend),
+        "🔴 la contre-épreuve ne garde rien : la passe ne termine pas même sans pause"
+    );
+}
+
+/// La passe des ALBUMS porte la même garde, au même endroit.
+///
+/// Elle n'est pas jouée ici — un tour d'album part sur Wikipédia avant toute
+/// autre chose, et un témoin qui en dépendrait serait un témoin de réseau. Ce
+/// que cette garde tient est donc le CÂBLAGE : la garde est bien DANS le corps
+/// de `batch_enrich_album_bios_scoped`, pas ailleurs dans le fichier.
+#[test]
+fn la_passe_des_biographies_d_albums_porte_la_meme_garde() {
+    let source = include_str!("../src/metadata/bio_batch.rs");
+    let debut = source
+        .find("pub async fn batch_enrich_album_bios_scoped(")
+        .expect("la passe des albums a changé de nom");
+    // Couper au PREMIER item qui suit, quel qu'il soit : laisser la tranche
+    // courir jusqu'au bout du fichier la ferait passer sur la garde d'une
+    // autre fonction — ou sur un module d'essais ajouté plus tard.
+    let corps = &source[debut..];
+    let fin = ["\nfn ", "\npub fn ", "\npub async fn ", "\n#[cfg(test)]"]
+        .iter()
+        .filter_map(|marqueur| corps.find(marqueur))
+        .min()
+        .expect("la passe des albums n'est pas le dernier item du fichier");
+    let corps = &corps[..fin];
+    assert!(
+        corps.contains("attendre_la_reprise(") && corps.contains("Tache::Enrichissement"),
+        "🔴 la passe des biographies d'albums ne consulte pas la pause \
+         « Enrichissement », alors que l'écran la compte dedans"
+    );
+}

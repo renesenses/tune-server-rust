@@ -125,6 +125,60 @@ impl StreamInfo {
             ),
         )
     }
+
+    /// Le conteneur servi sur le fil est-il du PCM non compressé ?
+    ///
+    /// C'est la seule famille où le débit se déduit EXACTEMENT du format
+    /// (`fréquence × canaux × octets par échantillon`). Pour tout le reste —
+    /// FLAC, AAC, MP3 — la même formule donnerait le débit du PCM décodé,
+    /// bien supérieur à ce qui passe sur le fil, et surestimerait l'audio
+    /// livrée.
+    fn conteneur_pcm(&self) -> bool {
+        let format = self.format.to_ascii_lowercase();
+        if matches!(format.as_str(), "wav" | "pcm" | "lpcm" | "l16" | "l24") {
+            return true;
+        }
+        let mime = self.mime_type.to_ascii_lowercase();
+        mime.starts_with("audio/l")
+            || matches!(
+                mime.as_str(),
+                "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave"
+            )
+    }
+
+    /// 🔴 #4480 — le **débit nominal** de la session, en octets par seconde.
+    ///
+    /// C'est le facteur qui manquait pour lire un compteur d'octets : sans
+    /// lui, « 34 406 444 octets servis » ne se compare à rien. Avec lui, ce
+    /// sont **195 secondes d'audio**, à opposer à la position annoncée par le
+    /// renderer.
+    ///
+    /// Deux sources, dans cet ordre :
+    ///
+    /// 1. **Conteneur PCM** — `fréquence × canaux × (profondeur / 8)`. Exact,
+    ///    et disponible même quand la taille totale ne l'est pas : la
+    ///    session-canal de l'incident porte `file_size: None`.
+    /// 2. **Sinon, `octets_total / durée`** — la définition du nominal retenue
+    ///    par le projet pour lire un débit de service (#4645). Une moyenne
+    ///    pour un format compressé, mais la bonne moyenne.
+    ///
+    /// `None` quand ni l'une ni l'autre n'est calculable : on ne devine pas un
+    /// débit, et l'appelant doit alors s'abstenir de conclure.
+    pub fn debit_nominal_octets_par_seconde(&self) -> Option<u64> {
+        if self.conteneur_pcm() {
+            let octets_par_trame = self.channels as u64 * (self.bit_depth as u64 / 8);
+            let nominal = self.sample_rate as u64 * octets_par_trame;
+            if nominal > 0 {
+                return Some(nominal);
+            }
+        }
+        match (self.file_size, self.duration_ms) {
+            (Some(taille), Some(duree)) if taille > 0 && duree > 0 => {
+                Some((taille.saturating_mul(1_000) / duree).max(1))
+            }
+            _ => None,
+        }
+    }
 }
 
 pub struct StreamSession {
@@ -1302,6 +1356,42 @@ impl AudioStreamer {
         sessions
             .get(stream_id)
             .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 🔴 #4480 — combien de MILLISECONDES D'AUDIO ont été servies à ce
+    /// renderer, décalage de recherche compris.
+    ///
+    /// Le compteur d'octets seul ne se compare à rien ; converti au débit
+    /// nominal de la session ([`StreamInfo::debit_nominal_octets_par_seconde`])
+    /// il devient une grandeur de MÊME NATURE que la position annoncée par le
+    /// renderer, et les deux se soustraient. C'est ce que le sondeur n'avait
+    /// pas : il voyait « le compteur n'a pas bougé » là où le flux avait déjà
+    /// livré 195 s d'audio pour une position de 23 s.
+    ///
+    /// `None` pour une session dont on ne peut rien conclure :
+    ///
+    /// - session inconnue — la même ignorance que [`Self::stream_bytes_sent`] ;
+    /// - **radio**, infinie par nature : sa position ne mesure aucune avance ;
+    /// - débit nominal incalculable (ni conteneur PCM, ni taille + durée).
+    ///
+    /// ⚠️ Deux imprécisions connues, toutes deux assumées par l'appelant :
+    /// l'en-tête RIFF de 44 octets est compté comme de l'audio (0,25 ms en
+    /// 44,1/16), et `bytes_sent` est **monotone toutes connexions confondues**
+    /// — une reprise `Range` recompte ce qu'elle retélécharge, ce qui
+    /// SURESTIME l'audio livrée. C'est pour cette raison que la décision qui
+    /// s'en sert porte une borne haute (voir
+    /// [`crate::poller::fsm::famine_etablie_malgre_l_avance`]).
+    pub async fn stream_audio_servi_ms(&self, stream_id: &str) -> Option<u64> {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() }?;
+        if session.is_radio {
+            return None;
+        }
+        let info = session.effective_output_info();
+        let nominal = info.debit_nominal_octets_par_seconde()?;
+        let octets = session
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Some(info.seek_ms.unwrap_or(0) + octets.saturating_mul(1_000) / nominal)
     }
 
     /// Reprendre les sessions mortes — sur leur SILENCE, pas sur leur âge.

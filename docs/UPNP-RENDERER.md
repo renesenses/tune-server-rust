@@ -36,15 +36,23 @@ retire donc pas les sorties, et inversement.
 
 ### Depuis l'interface web (recommandé)
 
-1. **Réglages** → onglet **« Appareils »** ;
+1. **Réglages** → onglet **« Appareils »** → section **« Réglages par zone »** ;
 2. repérer la carte de la zone à rendre pilotable ;
-3. cocher **« Renderer UPnP »**.
+3. cocher **« Publier cette zone sur le réseau »**.
 
-L'infobulle de la case résume la fonction :
+La case a porté le nom de son protocole — « Renderer UPnP » — de #1750 au
+22/09/2026, sans une ligne d'aide. Personne ne la trouvait : le testeur du fil
+forum 1867 a redemandé la fonction comme une nouveauté (#4626). Elle dit
+désormais ce qu'elle fait, et l'écran l'explique :
 
-> La zone s'annonce sur le réseau comme sortie UPnP : JPlay, BubbleUPnP ou
-> mconnect peuvent y envoyer la lecture. Le flux traverse toute la chaîne Tune
-> (EQ, convolveur, trim).
+> Un autre Tune — ou tout point de lecture UPnP du réseau (JPlay, BubbleUPnP,
+> mconnect) — voit alors cette zone et peut y envoyer sa lecture.
+
+Cochée, l'écran ajoute ce que décocher fera vraiment — voir la limite « pas de
+`ssdp:byebye` » au §4 :
+
+> Décocher arrête l'annonce tout de suite, mais un lecteur qui a déjà vu la
+> zone peut la garder en mémoire jusqu'à 30 minutes.
 
 La case est **par zone** : cocher pour la zone « Salon » n'expose pas la zone
 « Cuisine ». C'est voulu — on ne publie pas sur le réseau des sorties que
@@ -57,15 +65,21 @@ réveille l'annonceur. La zone doit apparaître dans JPlay en quelques secondes.
 
 ```bash
 # Activer
-curl -X PATCH http://<tune>:8888/zones/<id> \
+curl -X PATCH http://<tune>:8888/api/v1/zones/<id> \
      -H 'Content-Type: application/json' \
      -d '{"upnp_renderer": true}'
 
 # Désactiver
-curl -X PATCH http://<tune>:8888/zones/<id> -d '{"upnp_renderer": false}'
+curl -X PATCH http://<tune>:8888/api/v1/zones/<id> -d '{"upnp_renderer": false}'
 ```
 
-L'état est relu dans `GET /zones` (champ `upnp_renderer`).
+⚠️ Le préfixe **`/api/v1`** n'est pas facultatif : `/zones` est monté DANS l'arbre
+`/api/v1` (`tune-server/src/routes/mod.rs:314` et `:494`), et il n'existe aucun
+alias sans préfixe. Ces deux commandes se sont écrites sans lui jusqu'au
+22/09/2026 — elles rendaient 404.
+
+L'état est relu dans `GET /api/v1/zones` (champ `upnp_renderer`, toujours
+présent, `false` quand la clé est absente).
 
 En base, le réglage vit dans la clé `zone_{id}_upnp_renderer`. La clé est
 **supprimée** à la désactivation, jamais mise à `"false"` : l'absence de clé et

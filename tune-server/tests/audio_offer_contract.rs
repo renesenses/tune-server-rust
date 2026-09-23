@@ -190,8 +190,13 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
                 } else {
                     "tune-declick"
                 };
+                // La racine est PROPRE À L'UTILISATEUR depuis #4770 : la
+                // composer à la main ici referait le défaut corrigé, et le
+                // ménage porterait sur un dossier qui n'existe pas. On
+                // demande donc son chemin au même code que la route.
                 // tmp-autorise: dossier créé par la route réelle, repris et nettoyé par Drop, même sur panique.
-                let _cleanup = JobOutputCleanup(std::path::Path::new("/tmp").join(output).join(id));
+                let racine = tune_core::chemins_de_travail::racine_de_travail(output);
+                let _cleanup = JobOutputCleanup(racine.join(id));
                 let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                     loop {
                         let (_, result) = request(

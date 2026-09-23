@@ -7,7 +7,10 @@
 //! télécharger une archive puis de la décompresser à la main.
 //!
 //! #2943 a fait DIRE au serveur ce qu'il fait — sortie dans
-//! `/tmp/tune-convert/{job_id}`, archive ZIP, sources en lecture seule. Ce
+//! `{racine de travail}/{job_id}`, archive ZIP, sources en lecture seule. La
+//! racine était le littéral `/tmp/tune-convert` ; elle est depuis #4770 propre
+//! à l'utilisateur qui exécute (`tune_core::chemins_de_travail`), et c'est le
+//! serveur qui l'annonce dans `output_root` — ce module n'en dépend pas. Ce
 //! module-ci CHANGE cette vérité pour le mode facultatif où l'appelant désigne
 //! un dossier : c'est donc la première fois qu'un client de ce serveur choisit
 //! un chemin d'ÉCRITURE. La classe de défaut correspondante est la plus grave

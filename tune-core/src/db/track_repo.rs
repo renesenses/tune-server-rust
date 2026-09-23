@@ -251,6 +251,32 @@ pub fn compter_pistes_par_sous_dossier(
     })
 }
 
+/// Un dossier tel que le lisent les requêtes « exactes » du parcours par
+/// dossiers du serveur média (#4318) : le motif `LIKE` (pré-filtre, échappé),
+/// le préfixe littéral `<dossier><séparateur>` en NFC, et sa longueur en
+/// CARACTÈRES — `substr` compte en caractères sur les deux moteurs.
+struct DossierExact {
+    motif: String,
+    prefixe: String,
+    separateur: String,
+    longueur: usize,
+}
+
+impl DossierExact {
+    fn new(dossier: &str) -> Self {
+        use unicode_normalization::UnicodeNormalization as _;
+        let separateur = std::path::MAIN_SEPARATOR.to_string();
+        let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
+        let prefixe = format!("{base}{separateur}");
+        Self {
+            motif: folder_like_pattern(dossier),
+            longueur: prefixe.chars().count(),
+            prefixe,
+            separateur,
+        }
+    }
+}
+
 /// #3857 — le témoin de l'équivalence entre la requête groupée et la boucle
 /// qu'elle remplace.
 ///
@@ -705,6 +731,33 @@ pub mod sql {
             d.placeholder(23),
             d.placeholder(24),
             d.placeholder(25),
+        )
+    }
+
+    /// Pose `tracks.cover_path` sur UNE piste, et seulement s'il change.
+    ///
+    /// 🔴 [`update`] ci-dessus ne liste PAS `cover_path` parmi ses colonnes, et
+    /// c'est délibéré : la lecture des pistes rend
+    /// `COALESCE(t.cover_path, al.cover_path)`, donc toute écriture qui
+    /// recopierait la valeur relue figerait la pochette de l'ALBUM dans la
+    /// ligne piste — le repli serait perdu pour toujours. Une route qui relit
+    /// une piste, en change le titre et la réécrit ferait exactement ça.
+    ///
+    /// Conséquence, mesurée le 22/09/2026 : la pochette par piste n'atteignait
+    /// la base que par l'INSERT. Sur une bibliothèque déjà scannée — où le
+    /// scan MET À JOUR — elle n'avait aucun chemin vers l'écran, pas même par
+    /// « Scan complet » (#4650, et déjà le cas de #1284 avant lui).
+    ///
+    /// D'où cette écriture ÉTROITE : une seule colonne, un seul sens, et la
+    /// garde `cover_path <> {3}` qui n'écrit rien quand la valeur est déjà la
+    /// bonne. Un album de trente pistes à jaquette unique ne produit aucune
+    /// ligne modifiée.
+    pub fn poser_pochette_de_piste<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE tracks SET cover_path = {} WHERE id = {} AND (cover_path IS NULL OR cover_path <> {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3)
         )
     }
 
@@ -1459,6 +1512,111 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&file_path];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+    }
+
+    /// Le dossier `dossier` contient-il au moins une piste, à n'importe quelle
+    /// profondeur ? Le `LIMIT 1` arrête la lecture à la première ligne : c'est
+    /// ce que la racine du serveur média interroge à chaque `Browse("0")`,
+    /// pour ne pas annoncer un rayon « Folders » vide (#4318).
+    pub fn dossier_peuple(&self, dossier: &str) -> Result<bool, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!(
+            "SELECT 1 FROM tracks WHERE file_path LIKE {p1}{esc} \
+             AND substr(file_path, 1, {n}) = {p2} LIMIT 1",
+            esc = like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
+        Ok(self.db.query_one(&sql, &params)?.is_some())
+    }
+
+    /// Les sous-dossiers **directs** de `dossier` qui contiennent au moins une
+    /// piste, chacun avec le nombre de ses enfants directs (sous-dossiers
+    /// peuplés + pistes posées dedans) — le `childCount` que le serveur média
+    /// annonce avant qu'on ouvre le dossier (#4318).
+    ///
+    /// Même découpage que [`compter_pistes_par_sous_dossier`], un cran plus
+    /// profond : le premier segment après le préfixe nomme le sous-dossier, le
+    /// deuxième nomme son enfant. Compter les deuxièmes segments DISTINCTS
+    /// donne exactement ce que [`Self::sous_dossiers_peuples`] puis
+    /// [`Self::pistes_du_dossier`] rendront à l'ouverture de ce sous-dossier.
+    ///
+    /// Le préfixe est comparé octet pour octet (`substr(...) = ...`) en plus du
+    /// `LIKE` : sur SQLite `LIKE` ignore la casse ASCII, et `Rock/` ramènerait
+    /// aussi `rock/`. Un compteur qui additionne deux dossiers voisins ne
+    /// correspondrait plus à ce que le dossier ouvre.
+    pub fn sous_dossiers_peuples(&self, dossier: &str) -> Result<Vec<(String, u64)>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2, p3) = self.marqueurs3();
+        let pos = self.fonction_position();
+        let sql = format!(
+            "SELECT seg1, COUNT(DISTINCT CASE WHEN {pos}(reste2, {p2}) > 0 \
+                 THEN substr(reste2, 1, {pos}(reste2, {p2}) - 1) ELSE reste2 END) \
+             FROM (SELECT substr(reste, 1, {pos}(reste, {p2}) - 1) AS seg1, \
+                          substr(reste, {pos}(reste, {p2}) + 1) AS reste2 \
+                   FROM (SELECT substr(file_path, {depart}) AS reste FROM tracks \
+                         WHERE file_path LIKE {p1}{esc} \
+                         AND substr(file_path, 1, {n}) = {p3}) AS a \
+                   WHERE {pos}(reste, {p2}) > 0) AS b \
+             WHERE seg1 <> '' AND reste2 <> '' GROUP BY seg1",
+            esc = like_escape_clause(),
+            n = d.longueur,
+            depart = d.longueur + 1,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&d.motif, &d.separateur, &d.prefixe];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let nom = r.first().and_then(|v| v.as_string())?;
+                let nb = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+                Some((nom, u64::try_from(nb).unwrap_or(0)))
+            })
+            .collect())
+    }
+
+    /// Les pistes posées **directement** dans `dossier` — pas celles de ses
+    /// sous-dossiers. Même filtre que `GET /library/browse/dir`, avec la
+    /// comparaison exacte du préfixe de [`Self::sous_dossiers_peuples`].
+    pub fn pistes_du_dossier(&self, dossier: &str) -> Result<Vec<Track>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2, p3) = self.marqueurs3();
+        let pos = self.fonction_position();
+        let sql = format!(
+            "{select} WHERE t.file_path LIKE {p1}{esc} \
+             AND substr(t.file_path, 1, {n}) = {p3} \
+             AND {pos}(substr(t.file_path, {depart}), {p2}) = 0",
+            select = sql::select_track(),
+            esc = like_escape_clause(),
+            n = d.longueur,
+            depart = d.longueur + 1,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&d.motif, &d.separateur, &d.prefixe];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    fn marqueurs2(&self) -> (&'static str, &'static str) {
+        match self.db.engine() {
+            Engine::Postgres => ("$1", "$2"),
+            Engine::Sqlite => ("?1", "?2"),
+        }
+    }
+
+    fn marqueurs3(&self) -> (&'static str, &'static str, &'static str) {
+        match self.db.engine() {
+            Engine::Postgres => ("$1", "$2", "$3"),
+            Engine::Sqlite => ("?1", "?2", "?3"),
+        }
+    }
+
+    /// `instr` (SQLite) et `strpos` (Postgres) : le même appel sous deux noms.
+    fn fonction_position(&self) -> &'static str {
+        match self.db.engine() {
+            Engine::Postgres => "strpos",
+            Engine::Sqlite => "instr",
+        }
     }
 
     /// La piste virtuelle d'une feuille CUE, retrouvée par sa TRANCHE.
@@ -2765,6 +2923,50 @@ impl TrackRepo {
                 pistes = tracks.len(),
                 "track_update_failures_truncated"
             );
+        }
+        Ok(count)
+    }
+
+    /// Écrit la pochette PROPRE des pistes qui en portent une, et seulement
+    /// celles-là (#4650). Rend le nombre de lignes réellement modifiées.
+    ///
+    /// Complément de [`update_batch`], qui n'écrit pas `cover_path` — voir
+    /// [`sql::poser_pochette_de_piste`] pour la raison, qui est une garde et
+    /// non un oubli. Le scan appelle les deux : l'un pose les balises, l'autre
+    /// la pochette de piste.
+    ///
+    /// Une piste sans pochette propre (`cover_path = None`) n'est pas touchée :
+    /// c'est le cas ORDINAIRE — toutes les pistes d'un album partagent la
+    /// jaquette de leur album — et il ne doit coûter aucune écriture.
+    pub fn appliquer_pochettes_de_piste(&self, tracks: &[Track]) -> Result<usize, TuneError> {
+        let sql = self.dialect_sql(sql::poser_pochette_de_piste, sql::poser_pochette_de_piste);
+        let mut row_params: Vec<Vec<SqlValue>> = Vec::new();
+        for track in tracks {
+            let Some(id) = track.id else { continue };
+            let Some(pochette) = track.cover_path.clone() else {
+                continue;
+            };
+            row_params.push(vec![
+                pochette.to_sql_value(),
+                id.to_sql_value(),
+                pochette.to_sql_value(),
+            ]);
+        }
+        if row_params.is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        let mut echecs = 0usize;
+        for res in self.db.execute_many(&sql, &row_params) {
+            match res {
+                Ok(n) => count += n,
+                Err(e) => {
+                    echecs += 1;
+                    if echecs <= ECHECS_DETAILLES {
+                        tracing::warn!(error = %e, "track_cover_path_update_failed");
+                    }
+                }
+            }
         }
         Ok(count)
     }
@@ -4453,5 +4655,133 @@ mod tests {
         }
         let pg = sql_figer_toutes_les_premieres_vues(Engine::Postgres);
         assert!(pg.contains("ON CONFLICT (file_path) DO NOTHING"), "{pg}");
+    }
+
+    // ------------------------------------------------------------------
+    // #4650 — la pochette PROPRE d'une piste doit atteindre la base même
+    // quand le scan MET À JOUR une ligne existante.
+    // ------------------------------------------------------------------
+
+    /// Lit la colonne BRUTE, sans le `COALESCE(t.cover_path, al.cover_path)`
+    /// des lectures ordinaires : c'est le seul moyen de voir ce qui est
+    /// réellement écrit dans la ligne PISTE.
+    fn pochette_brute(repo: &TrackRepo, id: i64) -> Option<String> {
+        let p: [&dyn ToSqlValue; 1] = [&id];
+        repo.backend()
+            .query_one("SELECT cover_path FROM tracks WHERE id = ?", &p)
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_string()))
+    }
+
+    /// LE FAIT : sur une bibliothèque DÉJÀ scannée, le scan met à jour les
+    /// lignes au lieu de les insérer — et `update_batch` n'écrit pas
+    /// `cover_path`. Sans écriture dédiée, l'image du single n'atteint jamais
+    /// la base, pas même par « Scan complet ».
+    ///
+    /// Rouge contre le code d'avant le correctif : la colonne reste NULL après
+    /// le passage du scan.
+    #[test]
+    fn la_pochette_de_piste_atteint_la_base_sur_une_mise_a_jour_4650() {
+        let db = test_db();
+        let albums = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db.clone());
+        let album = albums
+            .create(&Album::new("Hackney Diamonds".into()))
+            .unwrap();
+        albums.update_cover_path(album, "condensat-album").unwrap();
+
+        // La piste telle qu'un scan d'avant le correctif l'a posée : aucune
+        // pochette propre.
+        let mut angry = Track::new("Angry".into());
+        angry.album_id = Some(album);
+        angry.file_path = Some("/music/hackney/01.flac".into());
+        angry.file_mtime = Some(1_000.0);
+        assert_eq!(repo.create_batch(&[angry]).unwrap(), 1);
+        let id = repo.list_by_album(album).unwrap().remove(0).id.unwrap();
+        assert_eq!(pochette_brute(&repo, id), None, "témoin : rien au départ");
+
+        // Le scan relit le fichier : l'importateur a reconnu une image propre.
+        let mut relue = Track::new("Angry".into());
+        relue.id = Some(id);
+        relue.album_id = Some(album);
+        relue.file_path = Some("/music/hackney/01.flac".into());
+        relue.file_mtime = Some(2_000.0);
+        relue.cover_path = Some("condensat-single-angry".into());
+
+        // `update_batch` ne touche PAS `cover_path`, et c'est une garde
+        // délibérée : la lecture est un COALESCE, donc réécrire ce qu'on relit
+        // figerait la pochette de l'ALBUM dans la ligne piste.
+        assert_eq!(repo.update_batch(&[relue.clone()]).unwrap(), 1);
+        assert_eq!(
+            pochette_brute(&repo, id),
+            None,
+            "garde : la mise à jour générale ne doit pas écrire cover_path"
+        );
+
+        // L'écriture dédiée, elle, la pose.
+        assert_eq!(
+            repo.appliquer_pochettes_de_piste(&[relue.clone()]).unwrap(),
+            1,
+            "#4650 : la pochette propre de « Angry » n'atteint pas la base — \
+             sur une bibliothèque déjà scannée, le scan MET À JOUR, et la \
+             colonne reste vide : le single garde la pochette de l'album"
+        );
+        assert_eq!(
+            pochette_brute(&repo, id),
+            Some("condensat-single-angry".into())
+        );
+
+        // Et la lecture ordinaire sert bien l'image de la piste, pas celle de
+        // l'album.
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().cover_path.as_deref(),
+            Some("condensat-single-angry")
+        );
+    }
+
+    /// LE TÉMOIN DU COÛT : rejouer le scan sur un album dont rien n'a changé
+    /// ne modifie AUCUNE ligne, et une piste sans pochette propre n'est jamais
+    /// touchée.
+    ///
+    /// C'est la garde demandée par Bertrand : « un album de 30 pistes ne doit
+    /// pas provoquer 30 écritures inutiles ».
+    #[test]
+    fn rejouer_le_scan_n_ecrit_aucune_pochette_inutile_4650() {
+        let db = test_db();
+        let albums = AlbumRepo::new(db.clone());
+        let repo = TrackRepo::new(db.clone());
+        let album = albums
+            .create(&Album::new("Hackney Diamonds".into()))
+            .unwrap();
+
+        let mut lot = Vec::new();
+        for n in 1..=30 {
+            let mut t = Track::new(format!("titre {n}"));
+            t.album_id = Some(album);
+            t.file_path = Some(format!("/music/hackney/{n:02}.flac"));
+            lot.push(t);
+        }
+        assert_eq!(repo.create_batch(&lot).unwrap(), 30);
+
+        // Vingt-neuf pistes partagent la jaquette de l'album (aucune pochette
+        // propre), une seule en a une.
+        let mut relues: Vec<Track> = repo.list_by_album(album).unwrap();
+        for t in relues.iter_mut() {
+            t.cover_path = None;
+        }
+        relues[0].cover_path = Some("condensat-single-angry".into());
+
+        assert_eq!(
+            repo.appliquer_pochettes_de_piste(&relues).unwrap(),
+            1,
+            "une seule piste porte une pochette propre : une seule ligne écrite"
+        );
+        // Deuxième passe, à l'identique : plus rien à écrire.
+        assert_eq!(
+            repo.appliquer_pochettes_de_piste(&relues).unwrap(),
+            0,
+            "la valeur est déjà la bonne : la garde `cover_path <> ?` doit \
+             empêcher toute réécriture à chaque scan"
+        );
     }
 }

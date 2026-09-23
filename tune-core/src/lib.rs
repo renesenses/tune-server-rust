@@ -10,6 +10,7 @@ pub mod audio;
 pub mod bandcamp_veille;
 pub mod bug_report;
 pub mod cadence;
+pub mod chemins_de_travail;
 pub mod cloud;
 pub mod collaborative;
 pub mod config;

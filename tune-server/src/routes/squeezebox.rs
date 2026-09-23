@@ -83,6 +83,60 @@ fn diagnostic_sans_platine(hote: &str) -> Value {
     })
 }
 
+/// La marque que le pont de commande LMS **de Tune** pose dans sa propre
+/// réponse `serverstatus` (`slimproto::cli_server::handle_serverstatus`). Un
+/// vrai LMS y met un GUID hexadécimal ; celui-ci est une constante littérale.
+const UUID_DE_TUNE: &str = "uuid:tune-server";
+
+/// L'adresse configurée désigne-t-elle le pont Squeezebox **de Tune** plutôt
+/// qu'un vrai serveur Lyrion / LMS ?
+///
+/// La question se tranche sur le PROTOCOLE, pas sur l'adresse : c'est le seul
+/// critère qui survit à `localhost`, à un nom d'hôte, à l'IP de la machine vue
+/// depuis une autre interface ou à un conteneur. La réponse `serverstatus` de
+/// Tune porte `uuid:tune-server`, littéralement.
+fn reponse_identifie_tune_lui_meme(reponse_serverstatus: &str) -> bool {
+    reponse_serverstatus
+        .split_whitespace()
+        .any(|jeton| jeton == UUID_DE_TUNE)
+}
+
+/// Le diagnostic d'un recensement VIDE, sachant ce que `serverstatus` a
+/// répondu.
+///
+/// 🔴 #4703 — Le recensement était structurellement vide chez Yacine, et le
+/// message le plus utile n'était pas celui qu'on affichait.
+///
+/// `parse_lms_host` retombe sur `"localhost"` quand aucun `lms_host` n'est
+/// enregistré, et le pont de commande LMS **de Tune** écoute, lui, sur
+/// `0.0.0.0:9090` — le port CLI par défaut. Tune s'interroge alors LUI-MÊME :
+/// `serverstatus` réussit (donc pas de 502, et le volet « impossible de
+/// connecter » disparaît, exactement ce que le testeur rapporte le 22/09),
+/// puis `player count ?` rend `player count 0` puisque le registre slimproto
+/// de Tune est vide. L'écran affichait « LMS répond mais n'annonce aucune
+/// platine » et envoyait chercher le défaut chez Lyrion, où il n'est pas.
+///
+/// Mesuré en lecture seule sur le .18 le 22/09/2026,
+/// `GET /api/v1/squeezebox/status` : `lms_host: "localhost"`,
+/// `lms_cli.port: 9090`, `players: []`, et la réponse rendue telle quelle —
+/// `serverstatus 0 100 lastscan:0 version:0.9.161 uuid:tune-server …`. Le
+/// `uuid:tune-server` est la signature du pont de Tune.
+///
+/// Ce que cette fonction ne fait PAS : changer le repli `"localhost"`. Un LMS
+/// qui tourne sur la même machine prend 9090 en premier, et le pont de Tune se
+/// replie alors sur 9091 (#4361) ; l'adresse `localhost` est donc légitime
+/// dans ce cas et sa réponse ne porte aucun `uuid:tune-server`. Le critère de
+/// protocole distingue les deux, une comparaison d'adresses non.
+fn diagnostic_recensement_vide(hote: &str, reponse_serverstatus: &str) -> Value {
+    if reponse_identifie_tune_lui_meme(reponse_serverstatus) {
+        return json!({
+            "code": "lms_est_tune_lui_meme",
+            "message": format!("L'adresse configurée ({hote}) désigne le pont de commande Squeezebox de Tune, pas un serveur Lyrion/LMS : Tune s'interroge lui-même, et le recensement des platines restera vide quoi que fasse Lyrion. Saisir l'adresse de votre serveur Lyrion dans Réglages → Squeezebox (port CLI 9090 par défaut)."),
+        });
+    }
+    diagnostic_sans_platine(hote)
+}
+
 /// Lit un réglage booléen stocké en texte (`"true"` / `"1"`).
 fn drapeau(settings: &SettingsRepo, cle: &str) -> bool {
     settings
@@ -259,9 +313,13 @@ async fn squeezebox_status(State(state): State<AppState>) -> impl IntoResponse {
             // et c'est une ligne de journal, pas un 502.
             let (players, diagnostic) = match list_players_cli(&host, port) {
                 Ok(p) => {
+                    // #4703 : `resp` est la réponse `serverstatus` qu'on vient
+                    // de recevoir. Elle dit à QUI on parle — et quand c'est au
+                    // pont de Tune lui-même, « aucune platine » envoie chercher
+                    // le défaut chez Lyrion, où il n'est pas.
                     let diagnostic = p
                         .is_empty()
-                        .then(|| diagnostic_sans_platine(&lms_host_display));
+                        .then(|| diagnostic_recensement_vide(&lms_host_display, &resp));
                     (p, diagnostic)
                 }
                 Err(e) => {
@@ -413,7 +471,13 @@ async fn discover_players(State(state): State<AppState>) -> impl IntoResponse {
             // Un rafraîchissement ne peut enregistrer aucune sortie : le client
             // affiche déjà le champ error des réponses HTTP non réussies.
             // GET /status conserve, lui, le succès d'un LMS joignable.
-            let diagnostic = diagnostic_sans_platine(&lms_host_display);
+            //
+            // #4703 : le bouton « Rafraîchir » est la deuxième porte que le
+            // testeur pousse, et elle rendait le même message trompeur que le
+            // panneau. La sonde `serverstatus` n'a lieu QUE sur ce chemin
+            // d'échec, où une poignée de main de plus ne coûte rien.
+            let reponse = lms_cli_command(&host, port, "serverstatus 0 1").unwrap_or_default();
+            let diagnostic = diagnostic_recensement_vide(&lms_host_display, &reponse);
             let mut body = statut_json(enabled, &lms_host_display, lms_discovered, registered);
             body["discovered"] = json!(0);
             body["error"] = diagnostic["message"].clone();
@@ -631,10 +695,86 @@ pub async fn discover_and_register(state: &AppState) -> Result<Vec<Value>, Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        LMS_CLI_PORT, adresse_auto_detectee, list_players_cli, split_lms_host, statut_json,
+        LMS_CLI_PORT, adresse_auto_detectee, diagnostic_recensement_vide, list_players_cli,
+        reponse_identifie_tune_lui_meme, split_lms_host, statut_json,
     };
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+
+    /// La réponse RÉELLE du .18, relevée en lecture seule le 22/09/2026 par
+    /// `GET /api/v1/squeezebox/status` — champ `response`, recopié tel quel.
+    /// `lms_host` y valait `"localhost"` et `lms_cli.port` `9090` : Tune
+    /// s'interrogeait lui-même, et le panneau affichait pourtant « LMS répond
+    /// mais n'annonce aucune platine » (#4703).
+    const SERVERSTATUS_DU_18: &str = "serverstatus 0 100 lastscan:0 version:0.9.161 \
+         uuid:tune-server info total albums:0 info total artists:0 info total songs:0 \
+         player count:1 other player count:0";
+
+    /// Un VRAI LMS : `uuid` est un GUID hexadécimal, jamais un littéral.
+    /// Forme reprise de la documentation du CLI Lyrion.
+    const SERVERSTATUS_DUN_VRAI_LMS: &str = "serverstatus 0 100 lastscan:1758470000 \
+         version:8.5.2 uuid:2e6f6a1c-9b3d-4f05-8f5a-7d2c1e4b9a30 \
+         info total albums:1204 info total artists:517 info total songs:14892 \
+         player count:0 other player count:0";
+
+    /// 🔴 #4703 — le recensement rend zéro parce que Tune parle à Tune.
+    ///
+    /// Le testeur écrit « toujours pas de platine, aucun lecteur trouvé alors
+    /// que Lyrion s'ouvre en affichant ma bibliothèque ». Les deux faits sont
+    /// vrais en même temps : son Lyrion va bien, et Tune ne l'interroge pas.
+    #[test]
+    fn une_reponse_serverstatus_de_tune_se_reconnait() {
+        assert!(
+            reponse_identifie_tune_lui_meme(SERVERSTATUS_DU_18),
+            "la réponse mesurée sur le .18 porte `uuid:tune-server` : c'est le \
+             pont de commande de Tune qui a répondu, pas Lyrion"
+        );
+        assert!(
+            !reponse_identifie_tune_lui_meme(SERVERSTATUS_DUN_VRAI_LMS),
+            "un vrai LMS porte un GUID : le confondre avec Tune ferait dire à \
+             l'écran d'aller corriger une adresse pourtant juste"
+        );
+        assert!(
+            !reponse_identifie_tune_lui_meme(""),
+            "une sonde muette (LMS injoignable sur ce chemin) ne prouve rien : \
+             le message générique reste le bon"
+        );
+        assert!(
+            !reponse_identifie_tune_lui_meme("serverstatus 0 100 uuid:tune-server-de-jp"),
+            "le jeton se compare ENTIER : un uuid qui COMMENCE par la marque \
+             de Tune n'est pas Tune"
+        );
+    }
+
+    /// Le diagnostic choisi pour un recensement vide : c'est lui que l'écran
+    /// affiche, et c'est lui qui décide où le testeur va chercher.
+    #[test]
+    fn un_recensement_vide_contre_tune_lui_meme_ne_blame_plus_lyrion() {
+        let d = diagnostic_recensement_vide("localhost", SERVERSTATUS_DU_18);
+        assert_eq!(
+            d["code"], "lms_est_tune_lui_meme",
+            "tant que ce code vaut `lms_sans_platine`, l'écran envoie vérifier \
+             les lecteurs d'un LMS que Tune n'a jamais interrogé (#4703)"
+        );
+        let message = d["message"].as_str().expect("un message");
+        assert!(
+            message.contains("localhost"),
+            "le message doit citer l'adresse fautive : {message}"
+        );
+        assert!(
+            message.contains("Lyrion"),
+            "le message doit dire quoi saisir à la place : {message}"
+        );
+
+        // Le TÉMOIN : un vrai LMS sans platine garde le message d'avant.
+        let temoin = diagnostic_recensement_vide("192.168.0.34", SERVERSTATUS_DUN_VRAI_LMS);
+        assert_eq!(
+            temoin["code"], "lms_sans_platine",
+            "un vrai LMS réellement sans platine doit garder son diagnostic : \
+             un correctif qui rendrait le nouveau code PARTOUT serait vert \
+             au-dessus sans rien prouver"
+        );
+    }
 
     /// Un LMS bouchonné : il accepte une connexion par commande, lit la ligne
     /// et rend la réponse prévue. Aucun trafic ne sort de la boucle locale.

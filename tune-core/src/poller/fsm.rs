@@ -120,6 +120,12 @@ pub enum StoppedOutcome {
     /// on attend (#2394). Couper une zone parce qu'on ne sait pas la
     /// mesurer est pire que le défaut qu'on croit prévenir.
     FailureWaitingUnknown,
+    /// Seuil d'échec atteint, compteur d'octets MESURÉ et à sec — mais
+    /// l'audio déjà livrée devance la position annoncée d'assez pour que le
+    /// renderer ait encore de quoi jouer : on attend (#4480). Une socket à
+    /// sec n'est pas un renderer à sec ; voir
+    /// [`famine_etablie_malgre_l_avance`].
+    FailureWaitingAvance,
     /// Failure threshold reached, stream idle — stop the zone.
     FailureStop,
     /// Below threshold, or above threshold without a natural end — accumulate.
@@ -178,6 +184,12 @@ pub struct StoppedInput {
     /// Ce que le sondeur SAIT du flux — trois états, pas un compteur
     /// (#2394). `Inconnue` ne coupe pas.
     pub consommation: ConsommationFlux,
+    /// #4480 — l'audio DÉJÀ LIVRÉE devance-t-elle encore la position d'assez
+    /// pour que le renderer ait de quoi jouer ? Calculé par le bras du seuil
+    /// d'échec, qui seul interroge le gestionnaire de flux ; `false` par
+    /// défaut, comme `consommation` part à `Inconnue`. Ne pèse que sur
+    /// [`ConsommationFlux::ASec`] : c'est la seule issue qui coupe.
+    pub avance_audio_couvre_l_arret: bool,
     /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
     /// DSD track on a DLNA renderer whose peak position reached the end.
     /// Gapless is intentionally off for a DSD next on DLNA, and DLNA never
@@ -244,6 +256,10 @@ pub fn classify_stopped(i: &StoppedInput) -> StoppedOutcome {
             return match i.consommation {
                 ConsommationFlux::Consomme => FailureWaitingConsuming,
                 ConsommationFlux::Inconnue => FailureWaitingUnknown,
+                // #4480 — une socket à sec n'est pas un renderer à sec : tant
+                // que l'audio livrée devance la position, il reste de quoi
+                // jouer et la famine n'est pas établie.
+                ConsommationFlux::ASec if i.avance_audio_couvre_l_arret => FailureWaitingAvance,
                 ConsommationFlux::ASec => FailureStop,
             };
         }
@@ -346,6 +362,116 @@ pub fn classify_playing(i: &PlayingInput) -> PlayingDecision {
     }
 }
 
+/// 🔴 #4480 — le seuil d'échec compte des TOURS DE SONDEUR, pas des secondes.
+///
+/// `STOPPED_FAILURE_THRESHOLD` vaut 30, et sa documentation dit pourquoi :
+/// « accommodate slow DLNA renderers (Shanling SCD1.3, MPlayer-based) that
+/// report Stopped/position=0 while buffering ». L'intention est une PATIENCE,
+/// et une patience se mesure en secondes.
+///
+/// Elle n'en était pas une. La boucle de `poller.rs` attend
+/// `tokio::select! { ticker.tick(), TRACK_END_NOTIFY.notified() }` : toute
+/// notification fait un tour de plus hors cadence, et `tokio::time::interval`
+/// rattrape par défaut les tours manqués **en rafale**
+/// (`MissedTickBehavior::Burst`). Trente tours ne font donc pas trente
+/// secondes.
+///
+/// Le terrain le chiffre (#4480, Eversolo DMP-A8 du .18, 19/09/2026) : la
+/// génération de piste est remise à zéro à 09:04:05.921, la zone est coupée à
+/// 09:04:24.853 — **trente tours en 18,9 s au plus**. La ligne de coupure
+/// portait `wall_secs=18` et personne ne l'avait lue comme ça.
+///
+/// Ce plancher ne retire aucune coupure : il exige seulement que la patience
+/// promise ait réellement eu lieu. Les deux conditions restent cumulatives.
+///
+/// `None` — l'horloge n'a jamais été armée — rend `true` : on ne change rien
+/// au comportement d'avant plutôt que de risquer une zone qui ne se couperait
+/// jamais. En exploitation le cas n'existe pas, l'horloge étant posée au
+/// passage de 0 à 1 tour, qui précède toujours le trentième.
+pub fn arret_assez_long_pour_couper(
+    arret_depuis: Option<std::time::Duration>,
+    plancher_secs: u64,
+) -> bool {
+    match arret_depuis {
+        Some(d) => d.as_secs() >= plancher_secs,
+        None => true,
+    }
+}
+
+/// 🔴 #4480 — de combien l'audio DÉJÀ LIVRÉE devance la position annoncée.
+///
+/// `audio_servi_ms` vient du gestionnaire de flux : les octets servis à ce
+/// renderer, convertis en millisecondes d'audio au **débit nominal** de la
+/// session (`StreamInfo::debit_nominal_octets_par_seconde`), décalage de
+/// recherche compris. `None` = personne ne sait — pas « zéro ».
+///
+/// La position est le PIC atteint (`ps.peak_position_ms`), jamais la dernière
+/// valeur lue : le pic est la plus GRANDE des deux, donc l'avance la plus
+/// PETITE. Un renderer qui remet sa position à zéro en calant ne se fabrique
+/// pas ainsi une avance imaginaire.
+///
+/// Rend `None` si l'audio servie ne dépasse pas la position : il n'y a alors
+/// aucune avance à opposer à la famine.
+pub fn avance_audio_ms(audio_servi_ms: Option<u64>, position_ms: u64) -> Option<u64> {
+    match audio_servi_ms {
+        Some(servi) if servi > position_ms => Some(servi - position_ms),
+        _ => None,
+    }
+}
+
+/// 🔴 #4480 — la famine est-elle ÉTABLIE, ou le renderer a-t-il encore de
+/// l'audio devant lui ?
+///
+/// `consommation == ASec` ne dit qu'une chose : **le compteur d'octets de la
+/// socket n'a pas bougé depuis le tour précédent**. Sur une livraison HTTP à
+/// contre-pression, c'est l'état NORMAL d'un renderer qui a tamponné loin
+/// devant : il ne tire plus parce qu'il n'a plus de place, pas parce qu'il
+/// manque de son. Une socket à sec n'est pas un renderer à sec.
+///
+/// Le cas mesuré (#4480, Eversolo DMP-A8 du .18, 19/09/2026) : **34 406 444
+/// octets** de WAV 44,1 kHz / 16 bits / stéréo servis — 176 400 o/s, soit
+/// **195 s d'audio** — pour une position annoncée de **23 s**. Le renderer
+/// avait 172 s de musique dans le ventre, et Tune coupait la zone au bout de
+/// dix-neuf secondes d'arrêt.
+///
+/// ## La borne haute, et pourquoi il en faut une
+///
+/// ⚠️ C'est une décision de SÛRETÉ : une zone réellement morte ne doit pas
+/// rester ouverte indéfiniment. L'avance seule ne suffit donc pas comme
+/// patience — un renderer qui aurait tamponné une heure garderait sa zone une
+/// heure. La patience retenue est :
+///
+/// ```text
+/// patience = min(avance_audio, borne_haute)
+/// ```
+///
+/// et la coupure n'est retenue que lorsque l'arrêt dure au moins aussi
+/// longtemps. Le raisonnement du premier terme : un renderer qui a `N`
+/// secondes d'audio devant lui ne peut pas être affamé avant `N` secondes ;
+/// passé ce délai, son tampon est vide quoi qu'il arrive et la famine devient
+/// réelle. Le second terme borne le pathologique — métadonnées fausses,
+/// renderer qui jette ce qu'on lui sert, tampon démesuré.
+///
+/// Aucune patience n'est retirée : les conditions restent **cumulatives** avec
+/// le seuil en tours et le plancher en secondes de
+/// [`arret_assez_long_pour_couper`].
+///
+/// `avance_ms` à `None` (rien de mesuré, ou audio servie derrière la position)
+/// rend `true` : on ne change rien au comportement d'avant plutôt que de
+/// risquer une zone qui ne se couperait jamais — même règle que le `None` du
+/// plancher. `arret_depuis` à `None` rend `true` pour la même raison.
+pub fn famine_etablie_malgre_l_avance(
+    avance_ms: Option<u64>,
+    arret_depuis: Option<std::time::Duration>,
+    borne_haute_secs: u64,
+) -> bool {
+    let (Some(avance_ms), Some(arret)) = (avance_ms, arret_depuis) else {
+        return true;
+    };
+    let patience_secs = (avance_ms / 1_000).min(borne_haute_secs);
+    arret.as_secs() >= patience_secs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +497,8 @@ mod tests {
             can_internal_gapless: true,
             // Base : compteur MESURÉ et à sec — c'est ce qui doit couper.
             consommation: ConsommationFlux::ASec,
+            // Base : aucune avance d'audio à opposer — c'est ce qui coupe.
+            avance_audio_couvre_l_arret: false,
             dlna_dsd_reached_end: false,
         }
     }

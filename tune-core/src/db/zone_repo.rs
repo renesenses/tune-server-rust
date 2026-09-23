@@ -2411,6 +2411,9 @@ impl ZoneRepo {
         let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        // Une zone supprimée ne joue plus : sans cela, la supprimer en pleine
+        // lecture laisserait les passes de fond freinées (#4681).
+        crate::taches_de_fond::priorite::oublier_la_zone(id);
         Ok(())
     }
 
@@ -2523,6 +2526,10 @@ impl ZoneRepo {
     /// Persist the play state ("playing", "paused", "stopped") for a zone.
     /// Silently ignores missing column (pre-v39 database).
     pub fn save_play_state(&self, id: i64, state: &str) -> Result<(), String> {
+        // Le témoin EN MÉMOIRE que relisent les passes de fond pour céder à la
+        // lecture (#4681). Noté avant l'écriture, et quoi qu'elle rende :
+        // l'état de la zone est un fait du processus, pas de la base.
+        crate::taches_de_fond::priorite::noter_etat_de_lecture(id, state);
         let sql = self.update_field_sql("last_play_state");
         let params: [&dyn ToSqlValue; 2] = [&state, &id];
         match self.db.execute(&sql, &params) {

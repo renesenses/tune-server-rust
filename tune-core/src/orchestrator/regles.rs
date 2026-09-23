@@ -162,6 +162,45 @@ pub fn alac_passthrough_applies(
         && zone_opt_in()
 }
 
+/// Le décodage-pour-niveaux du PASSTHROUGH doit-il être sauté pour cette
+/// source ?
+///
+/// En passthrough, le fichier part BRUT : personne ne le décode côté serveur,
+/// donc rien n'alimenterait les VU-mètres, le barregraphe et le crête-mètre —
+/// tous trois nourris par le MÊME événement `playback.audio_levels` (#3807).
+/// Une seconde passe est montée exprès pour ce cas, et cette fonction dit
+/// quand elle n'a pas lieu d'être.
+///
+/// **Un seul format le justifie : le DSD.** Un train 1 bit à des MHz ne se
+/// décode pas au fil de l'eau pour de simples aiguilles ; c'est la raison que
+/// le commentaire d'origine du bloc donnait déjà, mot pour mot.
+///
+/// ## Pourquoi cette fonction existe plutôt que le prédicat d'avant
+///
+/// Le bloc appelait [`AudioFormat::needs_transcode_for_dlna`], qui répond à
+/// une question SANS RAPPORT : « ce renderer saura-t-il lire ce format ? ».
+/// Sa propre docstring le dit (« most DLNA renderers cannot play AAC »). Or
+/// `AudioFormat::Alac` y figure — pour une raison de renderer, pas de
+/// décodage. Résultat : sur une zone qui a coché « ALAC natif », l'ALAC part
+/// brut ET le décodage-pour-niveaux est sauté. **Cocher l'option éteignait
+/// les instruments**, sans que rien ne le signale (#4702, Daniel LEVY, fil
+/// 1888). Le même angle mort valait mot pour mot pour l'AAC natif (#1424).
+///
+/// L'ALAC se décode parfaitement côté serveur : c'est exactement ce que fait
+/// la branche transcodée du même fichier, et ce que
+/// `tests/niveaux_alac_passthrough_4702.rs` mesure sur une vraie fixture.
+/// Seul le DSD reste hors de portée — et les quatre autres branches du
+/// décodeur en flux (Opus, Monkey's Audio, WavPack, AIFF) le sont, elles,
+/// bel et bien capables, cf. `audio::decode::decode_to_pcm_streaming_inner`.
+///
+/// Les formats qui ne peuvent PAS atteindre le passthrough n'ont pas à être
+/// nommés ici : sur une zone réseau,
+/// [`needs_transcode_for_output_applies`] les envoie tous au transcodage, et
+/// sur une zone navigateur [`navigateur_exige_le_wav`] fait de même.
+pub fn niveaux_en_passthrough_a_sauter(source_format: Option<AudioFormat>) -> bool {
+    source_format == Some(AudioFormat::Dsd)
+}
+
 /// La source doit-elle etre transcodee POUR LA SORTIE ?
 ///
 /// Quatrieme condition partagee entre la decision
@@ -543,10 +582,54 @@ pub(super) fn cible_encodable(
 /// le bras que ni #1168 (navigateur), ni #1653 (sorties PULL), ni #2950 (bras
 /// progressif de `play_inner`) n'atteignaient — aucun ne passe par ici.
 ///
+/// Une TROISIÈME raison depuis le silence à 96 kHz de Silviu : le plafond de
+/// fréquence de la zone. Le proxy verbatim relaie les octets du CDN tels
+/// quels ; un 192 kHz y atteignait donc un renderer dont le DAC plafonne à
+/// 96 kHz, qui ne verrouille pas et joue du SILENCE — pendant que le panneau
+/// annonçait « 192 → 96 kHz ». Rééchantillonner demande de décoder, donc de
+/// pré-transcoder : c'est ce bras-ci, celui qui décode déjà.
+///
 /// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
 /// `use_file_transcode_for`.
-pub(super) fn streaming_needs_pretranscode(renderer_supports_mime: bool, dsp_active: bool) -> bool {
-    !renderer_supports_mime || dsp_active
+pub(super) fn streaming_needs_pretranscode(
+    renderer_supports_mime: bool,
+    dsp_active: bool,
+    plafond_de_zone: bool,
+) -> bool {
+    !renderer_supports_mime || dsp_active || plafond_de_zone
+}
+
+/// Le plafond de fréquence de la zone appliqué à un flux de SERVICE (Qobuz,
+/// Tidal, YouTube…), et la règle « bit-perfect strict » avec lui.
+///
+/// 🔴 **Ce plafond n'existait QUE pour la bibliothèque locale.**
+/// `resolve_local.rs` le pose depuis toujours (plafond combiné zone+catalogue,
+/// puis refus ou rééchantillonnage) ; le bras des services, lui, servait la
+/// cadence du service sans jamais la lire. Une zone réglée sur 96 kHz recevait
+/// donc du 192 kHz sur le fil — silence sur un DAC qui plafonne à 96 kHz, et
+/// « Bit-perfect strict » ne refusait rien, puisque aucun de ses quatre sites
+/// n'est sur ce chemin.
+///
+/// Rend la cadence à SERVIR : `None` quand il n'y a rien à faire (pas de
+/// plafond, ou la source tient dessous), `Some(hz)` quand il faut
+/// rééchantillonner, `Err` quand « bit-perfect strict » refuse plutôt que de
+/// convertir — la MÊME sentinelle que les autres sites, pour que la route HTTP
+/// et le client composent la phrase dans leur langue.
+pub(super) fn plafond_de_flux_de_service(
+    source_hz: u32,
+    plafond_de_zone: Option<u32>,
+    strict: bool,
+) -> Result<Option<u32>, crate::audio::bitperfect_strict::RefusBitPerfect> {
+    let Some(max) = plafond_de_zone else {
+        return Ok(None);
+    };
+    if max == 0 || source_hz <= max {
+        return Ok(None);
+    }
+    match crate::audio::bitperfect_strict::decision_bitperfect(source_hz, max, strict).refus() {
+        Some(refus) => Err(refus),
+        None => Ok(Some(max)),
+    }
 }
 
 /// Format d'encodage du pré-transcodage streaming.
@@ -1082,6 +1165,41 @@ pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
 #[cfg(test)]
 mod lecture_locale_tests {
     use super::*;
+
+    /// #4702 — seul le DSD fait sauter le décodage-pour-niveaux du
+    /// passthrough. Le prédicat d'avant, `needs_transcode_for_dlna()`,
+    /// nommait aussi l'ALAC et l'AAC — les deux SEULS autres formats qui
+    /// atteignent cette branche, par leur opt-in de zone : la garde couvrait
+    /// donc exactement les cas qu'elle n'aurait jamais dû couvrir.
+    #[test]
+    fn seul_le_dsd_saute_le_decodage_pour_niveaux_du_passthrough() {
+        assert!(
+            niveaux_en_passthrough_a_sauter(Some(AudioFormat::Dsd)),
+            "le DSD reste hors de portée : 1 bit à des MHz ne se décode pas \
+             au fil de l'eau pour animer des aiguilles"
+        );
+        for f in [
+            AudioFormat::Alac,
+            AudioFormat::Aac,
+            AudioFormat::M4a,
+            AudioFormat::Flac,
+            AudioFormat::Wav,
+            AudioFormat::Mp3,
+            AudioFormat::Aiff,
+        ] {
+            assert!(
+                !niveaux_en_passthrough_a_sauter(Some(f)),
+                "{f:?} se décode côté serveur : sauter sa seconde passe éteint \
+                 barregraphe ET crête-mètre ensemble (#4702). `Alac` et `Aac` \
+                 sont les deux formats qui arrivent ici par un opt-in de zone."
+            );
+        }
+        assert!(
+            !niveaux_en_passthrough_a_sauter(None),
+            "une source de format inconnu retombe sur le comportement \
+             nominal : on tente le décodage, un échec se journalise"
+        );
+    }
 
     #[test]
     fn la_sortie_oaat_se_lit_dans_le_prefixe_de_l_identifiant() {

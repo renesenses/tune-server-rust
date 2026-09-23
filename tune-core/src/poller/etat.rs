@@ -3,6 +3,24 @@ use super::*;
 pub(super) struct ZonePollState {
     pub(super) gapless_sent: bool,
     pub(super) stopped_ticks: u8,
+    /// 🔴 #4480 — QUAND la série de `Stopped` en cours a commencé.
+    ///
+    /// `stopped_ticks` compte des TOURS DE SONDEUR, que tout le code commente
+    /// « ~1 s » ; la boucle de `poller.rs` les fait tomber bien plus vite. Elle
+    /// se réveille sur `ticker.tick()` **ou** sur `TRACK_END_NOTIFY`
+    /// (`tokio::select!`), et `tokio::time::interval` rattrape par défaut les
+    /// tours manqués en rafale (`MissedTickBehavior::Burst`). Un tour de plus
+    /// n'attend donc pas forcément une seconde.
+    ///
+    /// Mesuré sur le terrain (#4480, Eversolo DMP-A8 du .18, 19/09) : la
+    /// génération de piste est remise à zéro à 09:04:05.921 et la zone est
+    /// coupée à 09:04:24.853 — **30 tours en 18,9 s au plus**, soit 0,63 s par
+    /// tour. Le `wall_secs=18` de la ligne de coupure le dit lui-même.
+    ///
+    /// Armé à l'entrée dans la série (au passage de 0 à 1) et jamais remis à
+    /// zéro ailleurs : chaque site qui repose `stopped_ticks = 0` le ré-arme
+    /// donc de lui-même au tour suivant.
+    pub(super) premier_arret_a: Option<Instant>,
     /// Ticks consecutifs ou le renderer rapporte une URI qui n'est pas la
     /// notre. Trois d'affilee avant de parler : une transition de piste peut
     /// montrer un instant l'URI precedente.
@@ -60,6 +78,16 @@ pub(super) struct ZonePollState {
     /// v0.9.0-rc4). On each NEW seek we rewind `track_started_at` by the seek
     /// target so `wall_elapsed` matches "played at 1x from the start" again.
     pub(super) last_seek_seen: Option<Instant>,
+    /// La cible du dernier déplacement replié dans `track_started_at`
+    /// (#4682). C'est d'elle que part la piste après le déplacement : la fin
+    /// de la grâce s'en sert pour dire si une chute de position vue PENDANT
+    /// la grâce était la fin réelle de la piste.
+    pub(super) cible_du_deplacement_ms: u64,
+    /// Une chute de position (`position_reset`) a été écartée parce qu'elle
+    /// tombait dans la grâce de déplacement (#2170). Elle est réexaminée au
+    /// premier sondage hors grâce, faute de quoi un enchaînement réel du
+    /// renderer pendant la grâce était perdu pour de bon (#4682).
+    pub(super) chute_en_grace: bool,
     /// Tracks the `ZoneState::track_generation` we last observed.
     /// When the generation changes (new track started via `play()`),
     /// we reset all per-track state so stale values from the previous
@@ -224,6 +252,7 @@ impl ZonePollState {
         Self {
             gapless_sent: false,
             stopped_ticks: 0,
+            premier_arret_a: None,
             tenue_etrangere_ticks: 0,
             tenue_signalee: false,
             gapless_cooldown: 0,
@@ -242,6 +271,8 @@ impl ZonePollState {
             ticks_since_db_save: 0,
             track_started_at: None,
             last_seek_seen: None,
+            cible_du_deplacement_ms: 0,
+            chute_en_grace: false,
             track_generation: track_generation,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,

@@ -96,6 +96,44 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
     })
 }
 
+/// L'opérateur BRUT d'une règle, quelle que soit la clé qui le porte.
+///
+/// 🔴 #4467 — **deux clés désignent la même chose et coexistent en base** :
+/// l'éditeur de collections écrit `op`, celui des playlists `operator`, et le
+/// type canonique du client (`SmartRule`) déclare `op`. Sur le .18, les
+/// collections 32, 33, 34, 36, 37 portent `op`, les 5 et 10 `operator`.
+///
+/// Trois analyseurs sur quatre lisaient déjà les deux (`catalogue`,
+/// `smart_collections`, `source_streaming`). Le quatrième —
+/// `smart_playlists::build_smart_query` — ne lisait que `op` : une règle
+/// écrite `{"operator": "!="}` y retombait sur le défaut `contains` et rendait
+/// le **contraire** de ce qu'elle demandait, sans une ligne de journal.
+///
+/// Mesuré sur le .18 en v0.9.162 le 23/09/2026,
+/// `POST /api/v1/library/smart-playlists/preview`, `artist` = « Miles Davis »
+/// sur 42 844 pistes :
+///
+/// | règle | `total` |
+/// |---|---|
+/// | `{"op":"="}` | 337 |
+/// | `{"operator":"="}` | 338 — lu `contains` |
+/// | `{"op":"!="}` | 42 507 |
+/// | `{"operator":"!="}` | **338** — l'exact contraire |
+/// | `{"op":"is_empty"}` | 0 |
+/// | `{"operator":"is_empty"}` | **42 844** — toute la bibliothèque |
+///
+/// Une seule définition, ici, pour que le prochain analyseur n'ait plus à
+/// choisir. `op` d'abord : c'est la clé du type canonique du client.
+pub(crate) fn lire_op(rule: &serde_json::Value) -> &str {
+    // La première clé qui porte une CHAÎNE gagne : une clé présente mais d'un
+    // autre type (un nombre recopié par un éditeur) ne doit pas masquer
+    // l'autre, sans quoi l'opérateur écrit disparaît une seconde fois.
+    rule.get("op")
+        .and_then(|v| v.as_str())
+        .or_else(|| rule.get("operator").and_then(|v| v.as_str()))
+        .unwrap_or("contains")
+}
+
 /// Le nom canonique d'un opérateur.
 ///
 /// Reprise de `build_album_query`, qui l'avait déjà : l'éditeur écrit
@@ -210,6 +248,20 @@ mod tests {
     fn un_champ_inconnu_ne_rend_pas_de_colonne() {
         assert!(colonne_piste("zzz_inexistant").is_none());
         assert!(colonne_piste("").is_none());
+    }
+
+    /// 🔴 #4467 — une seule lecture des deux clés, pour les quatre analyseurs.
+    #[test]
+    fn l_operateur_se_lit_sous_ses_deux_cles() {
+        use serde_json::json;
+        assert_eq!(lire_op(&json!({"field": "artist", "op": "!="})), "!=");
+        assert_eq!(lire_op(&json!({"field": "artist", "operator": "!="})), "!=");
+        // Sans opérateur du tout : le repli historique, `contains`.
+        assert_eq!(lire_op(&json!({"field": "artist"})), "contains");
+        // `op` l'emporte s'il est là : c'est la clé du type canonique du client.
+        assert_eq!(lire_op(&json!({"op": "=", "operator": "!="})), "=");
+        // Une clé présente mais non textuelle ne doit pas masquer l'autre.
+        assert_eq!(lire_op(&json!({"op": 3, "operator": "!="})), "!=");
     }
 
     #[test]

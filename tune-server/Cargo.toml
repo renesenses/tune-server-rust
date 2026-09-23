@@ -849,6 +849,7 @@ path = "tests/smart_playlist_favori_etiquette_4798.rs"
 name = "collections_etiquette_4798"
 path = "tests/collections_etiquette_4798.rs"
 
+
 # #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
 # routeur réel. `autotests = false` en tête de ce manifeste : sans cette
 # cible, le fichier ne serait jamais compilé.

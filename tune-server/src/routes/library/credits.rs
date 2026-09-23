@@ -663,6 +663,21 @@ async fn passe_automatique_credits(state: AppState) {
             tokio::time::sleep(CADENCE_CREDITS_AUTO).await;
             continue;
         }
+        // « Suspendre les traitements » : l'écran « État du serveur » compte
+        // `credits_enrich_auto` dans la carte « Enrichissement » (`etat_de`,
+        // `routes/system/taches_de_fond.rs`), et cette boucle ne lisait pas
+        // le drapeau. La carte pouvait donc dire « en pause » pendant que la
+        // passe continuait d'interroger MusicBrainz.
+        //
+        // On relit à la cadence de la pause, pas à celle de la passe : sans
+        // quoi un clic sur « Reprendre » attendrait jusqu'à un tour entier.
+        // Et la garde est AVANT l'ouverture du tour, donc aucune tâche n'est
+        // inscrite au registre tant que la pause tient.
+        if tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement)
+        {
+            tokio::time::sleep(tune_core::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+            continue;
+        }
         let reglages =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
         if passe_auto_coupee(reglages.get(REGLAGE_CREDITS_AUTO).ok().flatten()) {
@@ -722,7 +737,21 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
         "enrichment",
     );
     let total = candidats.len() as u64;
+    // Le tour s'est-il arrêté sur une pause avant d'épuiser ses candidats ?
+    // Ce n'est PAS une fin de parcours : remettre le curseur à zéro ici
+    // referait la bibliothèque depuis le début à chaque reprise.
+    let mut suspendu = false;
     for (i, c) in candidats.iter().enumerate() {
+        // Une pause posée PENDANT le tour l'arrête à la frontière suivante.
+        // Sortir, et non se garer : le curseur est écrit en base après CHAQUE
+        // piste (plus bas), donc le tour suivant reprendra exactement ici —
+        // là où se garer garderait la tâche inscrite au registre et le
+        // verrou de la passe manuelle pris pour rien.
+        if tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement)
+        {
+            suspendu = true;
+            break;
+        }
         state
             .background_tasks
             .update_progress(TACHE_CREDITS_AUTO, i as u64, total, "Crédits");
@@ -773,7 +802,7 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
             .set(REGLAGE_CURSEUR_CREDITS_AUTO, &c.id.to_string())
             .ok();
     }
-    bilan.fin_de_parcours = candidats.len() < BORNE_PAR_TOUR;
+    bilan.fin_de_parcours = !suspendu && candidats.len() < BORNE_PAR_TOUR;
     if bilan.fin_de_parcours {
         reglages.set(REGLAGE_CURSEUR_CREDITS_AUTO, "0").ok();
     }
@@ -835,9 +864,79 @@ mod tests {
             "Feature::AutoEnrichment",
             "passe_auto_coupee(",
             "t.id == TACHE_CREDITS",
+            // L'écran « État du serveur » compte `credits_enrich_auto` dans la
+            // carte « Enrichissement » : la boucle doit lire le drapeau, sinon
+            // la carte dit « en pause » pendant que la passe travaille.
+            "taches_de_fond::est_en_pause(",
         ] {
             assert!(corps.contains(garde), "{garde} doit garder la passe");
         }
+        // Et elle doit relire à la cadence de la PAUSE, pas à celle de la
+        // passe : sans quoi « Reprendre » attendrait jusqu'à un tour entier.
+        assert!(
+            corps.contains("CADENCE_RELECTURE_PAUSE"),
+            "une reprise doit se voir en quelques secondes, pas au tour suivant"
+        );
+    }
+
+    /// Un tour ouvert alors que « Enrichissement » est suspendu ne traite
+    /// AUCUNE piste, ne touche pas au réseau, et surtout **ne se déclare pas
+    /// fin de parcours** : un curseur remis à zéro ici referait toute la
+    /// bibliothèque à chaque reprise.
+    ///
+    /// 🔴 Retirer le `break` en tête de la boucle de `un_tour_de_credits` fait
+    /// rougir `traitees == 0` : le tour part chercher le MBID sur MusicBrainz.
+    #[tokio::test]
+    async fn un_tour_suspendu_ne_traite_rien_et_garde_son_curseur() {
+        use tune_core::db::backend::ToSqlValue;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let b = &state.backend;
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(b.clone());
+        reglages.set(REGLAGE_CURSEUR_CREDITS_AUTO, "0").unwrap();
+        b.execute(
+            "INSERT INTO tracks (title, file_path) VALUES (?1, ?2)",
+            &[
+                &"Sans crédit" as &dyn ToSqlValue,
+                &"/m/sans-credit.flac" as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+
+        tune_core::taches_de_fond::oublier_pour_les_essais();
+        tune_core::taches_de_fond::mettre_en_pause(
+            b,
+            tune_core::taches_de_fond::Tache::Enrichissement,
+        )
+        .unwrap();
+        let bilan = un_tour_de_credits(&state).await;
+        tune_core::taches_de_fond::oublier_pour_les_essais();
+
+        assert_eq!(
+            bilan.traitees, 0,
+            "🔴 LA PAUSE N'ARRÊTE PAS LA PASSE AUTOMATIQUE DES CRÉDITS : \
+             {bilan:?}"
+        );
+        assert!(
+            !bilan.fin_de_parcours,
+            "un tour arrêté par la pause n'est pas une fin de parcours — \
+             remettre le curseur à zéro referait tout à chaque reprise"
+        );
+        assert_eq!(
+            reglages
+                .get(REGLAGE_CURSEUR_CREDITS_AUTO)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "le curseur ne doit pas avoir bougé"
+        );
+        assert!(
+            state
+                .background_tasks
+                .snapshot()
+                .iter()
+                .all(|t| t.id != TACHE_CREDITS_AUTO),
+            "aucune tâche ne reste inscrite"
+        );
     }
 
     /// Sur une bibliothèque sans piste candidate, un tour ne fait AUCUN appel

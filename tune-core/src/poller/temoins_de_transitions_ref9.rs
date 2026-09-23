@@ -48,6 +48,10 @@ struct Observation {
     realtime: bool,
     can_internal_gapless: bool,
     consommation: ConsommationFlux,
+    /// #4480 — l'audio déjà livrée devance-t-elle la position d'assez pour
+    /// que le renderer ait de quoi jouer ? Seule `ConsommationFlux::ASec`
+    /// la consulte : c'est la seule issue qui coupe.
+    avance_audio_couvre_l_arret: bool,
     dlna_dsd_reached_end: bool,
     repeat_active: bool,
 }
@@ -61,6 +65,7 @@ fn observation(track_duration_ms: u64, wall_elapsed: u64) -> Observation {
         realtime: true,
         can_internal_gapless: true,
         consommation: ConsommationFlux::Inconnue,
+        avance_audio_couvre_l_arret: false,
         dlna_dsd_reached_end: false,
         repeat_active: false,
     }
@@ -101,6 +106,7 @@ fn entree_stopped(ps: &ZonePollState, o: &Observation) -> StoppedInput {
         realtime: o.realtime,
         can_internal_gapless: o.can_internal_gapless,
         consommation: o.consommation,
+        avance_audio_couvre_l_arret: o.avance_audio_couvre_l_arret,
         dlna_dsd_reached_end: o.dlna_dsd_reached_end,
     }
 }
@@ -158,7 +164,11 @@ fn appliquer_stopped(ps: &mut ZonePollState, issue: StoppedOutcome) -> (bool, bo
             ps.gapless_armed = None;
             return (true, false);
         }
-        FailureWaitingConsuming | FailureWaitingUnknown => ps.stopped_ticks += 1, // :1595
+        // `FailureWaitingAvance` (#4480) écrit comme ses deux sœurs : on
+        // accumule un tour d'arrêt de plus, on ne coupe pas.
+        FailureWaitingConsuming | FailureWaitingUnknown | FailureWaitingAvance => {
+            ps.stopped_ticks += 1 // :1595
+        }
         FailureStop => {
             // tick.rs:1595, :1806-1807
             ps.stopped_ticks += 1;
@@ -1745,10 +1755,31 @@ fn e12_attente_prolongee_reste_arretee() {
         );
         ps.coherent().unwrap();
     }
+    // #4480 — troisième façon de ne PAS couper au seuil : le compteur est
+    // mesuré et à sec, mais l'audio déjà livrée devance la position (195 s
+    // servies pour une position de 23 s, journal du .18 du 19/09). La socket
+    // est à sec, le renderer ne l'est pas.
+    let mut o = observation(300_000, 40);
+    o.consommation = ConsommationFlux::ASec;
+    o.avance_audio_couvre_l_arret = true;
+    let issue = classify_stopped(&entree_stopped(&ps, &o));
+    assert_eq!(issue, StoppedOutcome::FailureWaitingAvance);
+    assert!(!issue.is_force_stop());
+    appliquer_stopped(&mut ps, issue);
+    ps.transition(Transition::AttenteProlongee);
+    assert_eq!(
+        ps.etat,
+        EtatDeLecture::Arretee {
+            depuis: Depuis::Lecture
+        }
+    );
+    ps.coherent().unwrap();
+
     let sans = suivant(&EtatDeLecture::Lecture, Transition::AttenteProlongee).unwrap_err();
     for marqueur in [
         "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);",
         "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingUnknown);",
+        "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingAvance);",
     ] {
         appel_suit_le_marqueur(
             marqueur,

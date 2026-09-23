@@ -212,12 +212,7 @@ const CHAMPS_ARTISTE: &[&str] = &["artist", "artist_name"];
 
 fn est_egalite(r: &Value) -> bool {
     matches!(
-        crate::regles_sql::normaliser_op(
-            r.get("op")
-                .or_else(|| r.get("operator"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("contains"),
-        ),
+        crate::regles_sql::normaliser_op(crate::regles_sql::lire_op(r)),
         "="
     )
 }
@@ -248,11 +243,7 @@ pub fn regles_hors_service(rules_json: &str, objet: Objet) -> Vec<String> {
             !(honorables.contains(&c.as_str()) && est_egalite(r))
         })
         .map(|r| {
-            let op = r
-                .get("op")
-                .or_else(|| r.get("operator"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("contains");
+            let op = crate::regles_sql::lire_op(r);
             format!("{} {op}", champ(r))
         })
         .collect()
