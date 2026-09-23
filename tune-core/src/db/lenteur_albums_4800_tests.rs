@@ -415,23 +415,35 @@ fn une_lecture_lente_ne_retient_plus_les_autres() {
     }
 }
 
-/// Preuve (b) — le banc sur une base RÉELLE (`TUNE_BANC_DB`, copie de
-/// `tune_v2.db` du .18 : 9 427 albums dont 5 489 distants). Ignoré par
-/// défaut ; chiffres dans la PR #4800.
+/// Preuve (b) — le banc de MESURE, ancienne clause contre dépôt actuel.
+///
+/// Sur une base RÉELLE si `TUNE_BANC_DB` la désigne (copie de `tune_v2.db`
+/// du .18 : 9 427 albums dont 5 489 distants — chiffres dans la PR #4800),
+/// sinon sur le banc de synthèse de ce fichier : il mesure TOUJOURS, il ne
+/// saute jamais (garde `derive_des_garde_fous_2816`). Ignoré par défaut
+/// parce que c'est une mesure, pas un verdict — l'ancienne clause y coûte
+/// des dizaines de secondes.
 ///
 /// ```text
 /// TUNE_BANC_DB=/chemin/tune_v2.db cargo test -p tune-core --lib \
 ///     banc_reel_4800 -- --ignored --nocapture
 /// ```
 #[test]
-#[ignore = "mesure sur une base réelle, chemin dans TUNE_BANC_DB"]
+#[ignore = "mesure, pas un verdict : lancer à la main, TUNE_BANC_DB pour une base réelle"]
 fn banc_reel_4800() {
-    let Ok(chemin) = std::env::var("TUNE_BANC_DB") else {
-        eprintln!("TUNE_BANC_DB absent : rien à mesurer");
-        return;
+    let base_reelle = std::env::var("TUNE_BANC_DB").ok();
+    let db = match base_reelle.as_deref() {
+        Some(chemin) => {
+            eprintln!("base réelle : {chemin}");
+            let db = SqliteDb::open(chemin).unwrap();
+            super::migrations::run_migrations(&db).unwrap();
+            db
+        }
+        None => {
+            eprintln!("TUNE_BANC_DB absent : banc de synthèse (2 500 albums)");
+            banc_d_albums_homonymes()
+        }
     };
-    let db = SqliteDb::open(&chemin).unwrap();
-    super::migrations::run_migrations(&db).unwrap();
     let repo = AlbumRepo::new(db.clone());
     let par_source = db
         .query_many(
