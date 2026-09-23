@@ -417,6 +417,13 @@ pub fn router() -> Router<AppState> {
             "/artwork/enrich-artists/status",
             get(artwork::batch_enrich_artist_artwork_status),
         )
+        // 🔴 #4692 — la liste NOMINATIVE derrière « N artistes encore sans
+        // portrait ». Elle sort de la même fonction que le nombre, donc les
+        // deux ne peuvent pas diverger.
+        .route(
+            "/artwork/artists-without-image",
+            get(artwork::artists_without_image),
+        )
         .route("/duplicates", get(duplicates::list_duplicates))
         .route(
             "/tracks/{id}/better-quality",
