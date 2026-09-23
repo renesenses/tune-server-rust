@@ -1246,21 +1246,21 @@ fn alac_16_playing() -> ZoneState {
 
 #[test]
 fn wav_wire_native_wav_is_bit_perfect_any_depth() {
-    assert!(wav_wire_bit_perfect(true, true, false, 24)); // native WAV 24-bit, flag off
-    assert!(wav_wire_bit_perfect(true, true, false, 16));
+    assert!(wav_wire_bit_perfect(true, true, false, 24, false)); // native WAV 24-bit, flag off
+    assert!(wav_wire_bit_perfect(true, true, false, 16, false));
 }
 
 #[test]
 fn wav_wire_flac_fallback_capped_at_16_bit() {
     // FLAC/ALAC → WAV fallback (source not WAV): 24-bit needs the override.
-    assert!(!wav_wire_bit_perfect(true, false, false, 24));
-    assert!(wav_wire_bit_perfect(true, false, false, 16)); // fits plain 16-bit LPCM
-    assert!(wav_wire_bit_perfect(true, false, true, 24)); // dlna_wav24 preserves 24-bit
+    assert!(!wav_wire_bit_perfect(true, false, false, 24, false));
+    assert!(wav_wire_bit_perfect(true, false, false, 16, false)); // fits plain 16-bit LPCM
+    assert!(wav_wire_bit_perfect(true, false, true, 24, false)); // dlna_wav24 preserves 24-bit
 }
 
 #[test]
 fn wav_wire_lossy_source_never_bit_perfect() {
-    assert!(!wav_wire_bit_perfect(false, true, true, 16));
+    assert!(!wav_wire_bit_perfect(false, true, true, 16, false));
 }
 
 // ------------------------------------------------------------------
@@ -3125,6 +3125,167 @@ fn pure_sans_conversion_n_est_pas_degrade_3973() {
     assert_eq!(sp["pure"], serde_json::json!(true));
     assert_eq!(sp["pure_degraded"], serde_json::json!(false), "{sp}");
     assert!(sp["rate_conversion"].is_null(), "{sp}");
+}
+
+// ── #4354 (défaut n° 3) — le bandeau PURE pendant une DÉCIMATION DSD → PCM ──
+//
+// Le .42, 17/09/2026 : zone 10 en `dsd_mode = pcm` vers un Eversolo DMP-A8 en
+// DLNA. Le journal dit `streaming_decode_wav_header_sent_dsd source_rate=352800
+// output_bd=24` — le 1 bit est décimé en PCM multibit — et l'interface affiche
+// PURE. PURE promet l'absence de traitement ; ici le signal est reconstruit.
+//
+// Deux trous indépendants, fermés ensemble :
+//
+//  1. `pure_degraded` ne regardait que `rate_conversion`, renseigné par la
+//     seule étape « Resampler ». La décimation DSD passe par « Transcoder », et
+//     le calcul du plafond exclut explicitement le DSD (`!is_dsd`). PURE
+//     restait donc intact.
+//  2. `wav_wire_bit_perfect` rendait `true` : pour du DSD, `bit_depth` vaut 1
+//     (la profondeur de la SOURCE, forcée par `decrire_la_source`), donc
+//     `bit_depth <= 16` était trivialement vrai, et le DSD est « lossless ».
+//     La branche `"oaat"` portait déjà la bonne règle — « DSD → WAV is a
+//     domain conversion […] so it is NOT bit-perfect » —, la branche
+//     `"dlna" | "openhome"` ne l'avait pas.
+//
+// La distinction qui compte, et que ces tests clouent : le DoP n'est PAS une
+// décimation. Il emballe les mêmes bits dans des trames PCM et doit rester
+// bit-perfect, PURE non dégradé.
+
+/// La fonction NUE : c'est `bit_depth = 1` du DSD qui rendait la clause
+/// `bit_depth <= 16` toujours vraie. Le dernier argument est le seul qui
+/// change le verdict, et son absence était le défaut.
+#[test]
+fn wav_wire_un_dsd_decime_n_est_jamais_bit_perfect_4354() {
+    // Ce que la fonction rendait AVANT, sur exactement ces entrées (source DSD
+    // sans perte, fil WAV, profondeur source de 1 bit) : `true`.
+    assert!(
+        wav_wire_bit_perfect(true, false, true, 1, false),
+        "sans le drapeau, le verdict historique est conservé — c'est le DoP"
+    );
+    // Et ce qu'elle doit rendre quand le DSD est DÉCIMÉ.
+    assert!(
+        !wav_wire_bit_perfect(true, false, true, 1, true),
+        "une décimation 1 bit -> PCM multibit n'est pas bit-perfect"
+    );
+}
+
+/// ⭐ Le cas du signalement : zone réseau, `dsd_mode = pcm`, fil WAV
+/// 352,8 kHz / 24 bits, PURE armé. Le badge doit dire DÉGRADÉ, et le transport
+/// ne doit plus se dire bit-perfect.
+#[test]
+fn pure_sur_un_dsd_decime_en_pcm_est_declare_degrade_4354() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone_id, "pcm")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 352_800, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp["pure"], serde_json::json!(true), "{sp}");
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(true),
+        "PURE + décimation DSD -> PCM = PURE dégradé : {sp}"
+    );
+    let transport = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Transport")
+        .expect("l'étape Transport")
+        .clone();
+    assert_eq!(
+        transport["bit_perfect"],
+        serde_json::json!(false),
+        "le transport DLNA d'un DSD décimé n'est pas bit-perfect : {transport}"
+    );
+}
+
+/// ⭐ La contre-épreuve du correctif lui-même : le DoP n'est pas une
+/// décimation. Même source, même fil, même zone — seul `dsd_mode` change — et
+/// le verdict doit rester celui d'avant. Sans ce test, un correctif qui
+/// écrirait simplement « DSD => pas bit-perfect » passerait, en cassant le DoP.
+#[test]
+fn le_dop_reste_bit_perfect_et_pure_non_degrade_4354() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone_id, "dop")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("DMP-A8"),
+        "none",
+        Some(&wire_mime("wav", "audio/wav", 352_800, 24)),
+    )
+    .unwrap();
+
+    assert_eq!(sp["pure"], serde_json::json!(true), "{sp}");
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(false),
+        "le DoP emballe les mêmes bits : PURE n'est pas dégradé : {sp}"
+    );
+    let transport = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "Transport")
+        .expect("l'étape Transport")
+        .clone();
+    assert_eq!(
+        transport["bit_perfect"],
+        serde_json::json!(true),
+        "le DoP reste bit-perfect : {transport}"
+    );
+}
+
+/// Et le DSD servi BRUT (mode natif accepté par le renderer) n'est pas touché
+/// non plus : rien n'est converti, le fil porte du `audio/dsf`.
+#[test]
+fn le_dsd_servi_brut_reste_bit_perfect_4354() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone_id, "native")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&format!("zone_{zone_id}_audiophile"), r#"{"enabled":true}"#)
+        .unwrap();
+
+    let sp = build_signal_path(
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        Some("Yamaha R-N2000A"),
+        "none",
+        Some(&wire_mime("dsf", "audio/dsf", 5_644_800, 1)),
+    )
+    .unwrap();
+
+    assert_eq!(
+        sp["pure_degraded"],
+        serde_json::json!(false),
+        "le .dsf part brut : rien n'est converti, PURE tient : {sp}"
+    );
 }
 
 // #4350 — un FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5 part ré-encodé
