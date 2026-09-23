@@ -127,20 +127,39 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
     // livres (iOS, macOS, Android, client web, UPnP).
     let seed = (sort == "random").then(|| p.seed.unwrap_or_else(AlbumRepo::graine_aleatoire));
     // #4800 — la page et son total en UNE requête : le prédicat de doublon
-    // #4146 ne s'évalue plus deux fois. `total_de_la_page` est `None` quand la
-    // page est vide, et alors seulement on recompte.
-    let (items, total_de_la_page) = match repo.list_filtered_seeded_avec_total(
-        limit,
-        offset,
-        sort,
-        order,
-        p.format.as_deref(),
-        p.quality.as_deref(),
-        p.compilation,
-        include_hidden,
-        dr,
-        seed,
-    ) {
+    // #4146 ne s'évalue plus deux fois. Le total n'est demandé que là où il
+    // sera repris (voir plus bas) ; ailleurs le SQL reste celui d'avant.
+    let sans_facette = p.format.is_none() && p.quality.is_none() && p.compilation.is_none();
+    let veut_le_total = dr.is_none() && !include_hidden && sans_facette;
+    let page = if veut_le_total {
+        repo.list_filtered_seeded_avec_total(
+            limit,
+            offset,
+            sort,
+            order,
+            p.format.as_deref(),
+            p.quality.as_deref(),
+            p.compilation,
+            include_hidden,
+            dr,
+            seed,
+        )
+    } else {
+        repo.list_filtered_seeded(
+            limit,
+            offset,
+            sort,
+            order,
+            p.format.as_deref(),
+            p.quality.as_deref(),
+            p.compilation,
+            include_hidden,
+            dr,
+            seed,
+        )
+        .map(|albums| (albums, None))
+    };
+    let (items, total_de_la_page) = match page {
         Ok(page) => page,
         Err(e) => {
             tracing::error!(
@@ -165,13 +184,14 @@ fn lire_la_page_d_albums(backend: Arc<dyn DbBackend>, p: AlbumFilters) -> Value 
     // masqués, et sans facette de format/qualité/compilation — car ce total-
     // là a toujours été celui de la bibliothèque VISIBLE entière, pas de la
     // facette, et les clients paginent dessus. Ce contrat ne bouge pas ici.
-    let sans_facette = p.format.is_none() && p.quality.is_none() && p.compilation.is_none();
+    // Page vide (décalage au-delà de la fin) : pas de total porté, on
+    // recompte — le seul cas où le doublon s'évalue deux fois.
     let total = match dr {
         Some(range) => repo.count_in_dr_range(range, include_hidden).unwrap_or(0),
         None if include_hidden => repo.count().unwrap_or(0),
         None => match total_de_la_page {
-            Some(total) if sans_facette => total,
-            _ => repo.count_visible().unwrap_or(0),
+            Some(total) => total,
+            None => repo.count_visible().unwrap_or(0),
         },
     };
     // #4521 — le DR de chaque album de la page, par la règle de la fiche, en
