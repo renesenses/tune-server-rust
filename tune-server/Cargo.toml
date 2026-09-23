@@ -806,3 +806,12 @@ path = "tests/bug_report_captures_4564.rs"
 name = "hote_wasm_playlists_4716"
 path = "tests/hote_wasm_playlists_4716.rs"
 required-features = ["plugins-wasm"]
+
+# #4716 — la permission `library` (appariement LOCAL) et l'appariement à
+# plusieurs candidats. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le sens service → bibliothèque ne serait jamais compilé.
+# `required-features` parce que `plugins_host` n'existe que sous `plugins-wasm`.
+[[test]]
+name = "hote_wasm_appariement_local_4716"
+path = "tests/hote_wasm_appariement_local_4716.rs"
+required-features = ["plugins-wasm"]

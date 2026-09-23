@@ -21,10 +21,12 @@
 //! [`tokio::task::spawn_blocking`]. The queue/log/emit capabilities are pure
 //! sync (rusqlite / tracing / the event bus) and need no bridge.
 //!
-//! # #4716 — playlists, streaming, stockage clé/valeur
+//! # #4716 — playlists, streaming, bibliothèque, stockage clé/valeur
 //!
-//! La tranche 1 de l'épique #4715 (« Playlists converter ») ajoute trois
-//! familles de capacités, et trois règles avec elles :
+//! La tranche 1 de l'épique #4715 (« Playlists converter ») ajoute quatre
+//! familles de capacités — la quatrième, `library`, comble le sens
+//! SERVICE → BIBLIOTHÈQUE : sans recherche ni appariement local, le greffon
+//! refusait « transférer vers la bibliothèque ». Trois règles les tiennent :
 //!
 //! * **Aucune suppression.** Rien ici n'efface une playlist, une piste ou un
 //!   favori. Une capacité absente est la seule garde qu'on ne contourne pas.
@@ -48,17 +50,21 @@ use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
 use tune_core::db::backend::DbBackend;
+use tune_core::db::models::Track;
 use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
 use tune_core::db::playlist_repo::PlaylistRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::event_bus::EventBus;
+use tune_core::library::appariement_bibliotheque::apparier_en_bibliotheque;
 use tune_core::orchestrator::{PlayRequest, PlaybackOrchestrator};
 use tune_core::playback::PlaybackManager;
 use tune_core::plugins::{PluginManager, PluginManifest};
 use tune_core::streaming::ServiceRegistry;
-use tune_core::streaming::matching::{MATCH_ACCEPT_SCORE, apparier_chez_le_service};
+use tune_core::streaming::matching::{
+    MATCH_ACCEPT_SCORE, MAX_CANDIDATS_APPARIEMENT, apparier_chez_le_service_classe,
+};
 use tune_core::streaming::traits::StreamingService;
 use tune_http_types::DEFAULT_PROFILE_ID;
 use tune_plugin_runtime_wasm::{HostContext, Limits, WasmPlugin};
@@ -108,6 +114,65 @@ const PREFIXE_KV_GREFFON: &str = "plugin_kv:";
 /// synchro : quelques kilo-octets. La borne empêche un greffon de remplir la
 /// table `settings` — qui est relue en entier par `all()`.
 const TAILLE_MAX_VALEUR_KV: usize = 256 * 1024;
+
+/// Ce qu'un convertisseur a besoin de lire d'une piste LOCALE pour apparier :
+/// titre, artiste, album, durée, ISRC — et de quoi la remettre en playlist.
+///
+/// Le reste de la fiche ne l'intéresse pas et gonflerait la mémoire linéaire
+/// du bac à sable. Une seule forme pour `playlist_tracks`, `library_search` et
+/// `library_match_track` : le greffon n'a pas à apprendre trois dialectes.
+fn fiche_piste(t: &Track) -> Value {
+    json!({
+        "track_id": t.id,
+        "title": t.title,
+        "artist_name": t.artist_name,
+        "album_title": t.album_title,
+        "duration_ms": t.duration_ms,
+        "isrc": t.isrc,
+        "source": t.source,
+        "source_id": t.source_id,
+    })
+}
+
+/// La réponse d'un appariement à PLUSIEURS candidats (#4716).
+///
+/// Forme COMPATIBLE avec celle d'avant : `matched`, `score` et `approximate`
+/// désignent toujours le verdict — exactement celui que rendait la version à
+/// un seul candidat. S'y ajoutent `candidates` (le classement complet, verdict
+/// en tête, plafonné par [`MAX_CANDIDATS_APPARIEMENT`]) et son `count`.
+///
+/// C'est ce que le greffon attendait : quand le verdict rate SA règle (un
+/// écart de durée de plus de 3 s), il redescend d'un cran au lieu de déclarer
+/// le titre introuvable.
+fn reponse_appariement(candidats: &[(Value, f64)]) -> Value {
+    let liste: Vec<Value> = candidats
+        .iter()
+        .map(|(piste, score)| {
+            json!({
+                "track": piste,
+                "score": score,
+                "approximate": *score < MATCH_ACCEPT_SCORE,
+            })
+        })
+        .collect();
+    match candidats.first() {
+        Some((piste, score)) => json!({
+            "matched": piste,
+            "score": score,
+            // Sous le seuil d'acceptation, le fuzzy a bien trouvé quelque
+            // chose mais ce n'est pas une certitude : le greffon doit pouvoir
+            // le présenter comme approximatif au lieu de l'écrire en silence.
+            "approximate": *score < MATCH_ACCEPT_SCORE,
+            "count": liste.len(),
+            "candidates": liste,
+        }),
+        None => json!({
+            "matched": Value::Null,
+            "count": 0,
+            "candidates": Vec::<Value>::new(),
+        }),
+    }
+}
 
 impl AppStateHost {
     /// Build a host from the server state, cloning the `Arc`s it forwards to.
@@ -397,23 +462,9 @@ impl HostContext for AppStateHost {
             .get_multiple(&ids)
             .map_err(|e| e.to_string())?;
         // Ce que le convertisseur a besoin de lire pour apparier : titre,
-        // artiste, durée, ISRC. Le reste de la fiche ne l'intéresse pas et
-        // gonflerait la mémoire linéaire du bac à sable.
-        let pistes: Vec<Value> = pistes
-            .iter()
-            .map(|t| {
-                json!({
-                    "track_id": t.id,
-                    "title": t.title,
-                    "artist_name": t.artist_name,
-                    "album_title": t.album_title,
-                    "duration_ms": t.duration_ms,
-                    "isrc": t.isrc,
-                    "source": t.source,
-                    "source_id": t.source_id,
-                })
-            })
-            .collect();
+        // artiste, durée, ISRC — la fiche commune à toutes les capacités qui
+        // rendent des pistes locales.
+        let pistes: Vec<Value> = pistes.iter().map(fiche_piste).collect();
         Ok(json!({
             "playlist_id": playlist_id,
             "name": playlist.name,
@@ -586,27 +637,86 @@ impl HostContext for AppStateHost {
             return Err("streaming_match_track: titre vide".to_string());
         }
         let arc = self.service(service)?;
-        // L'appariement N'EST PAS réécrit ici : `apparier_chez_le_service` est
-        // l'extraction de ce que faisait déjà `transfer_playlist`, et la route
-        // l'appelle désormais elle aussi. Un seul verdict pour l'écran et pour
-        // le greffon.
-        let apparie = block_on(async {
+        // L'appariement N'EST PAS réécrit ici : `apparier_chez_le_service_classe`
+        // dépouille la MÊME recherche que `transfer_playlist`, avec le même
+        // scoring, et sa tête est le verdict de la route. Un seul verdict pour
+        // l'écran et pour le greffon — avec, en plus, les candidats suivants.
+        let apparies = block_on(async {
             let svc = arc.read().await;
-            apparier_chez_le_service(&**svc, title, artist, isrc, duration_ms).await
+            apparier_chez_le_service_classe(
+                &**svc,
+                title,
+                artist,
+                isrc,
+                duration_ms,
+                MAX_CANDIDATS_APPARIEMENT,
+            )
+            .await
         })?;
-        Ok(match apparie {
-            Some((piste, score)) => json!({
-                "service": service,
-                "matched": piste,
-                "score": score,
-                // Sous le seuil d'acceptation, le fuzzy a bien trouvé quelque
-                // chose mais ce n'est pas une certitude : le greffon doit
-                // pouvoir le présenter comme approximatif au lieu de l'écrire
-                // en silence chez le service.
-                "approximate": score < MATCH_ACCEPT_SCORE,
-            }),
-            None => json!({ "service": service, "matched": Value::Null }),
-        })
+        let candidats: Vec<(Value, f64)> = apparies
+            .into_iter()
+            .filter_map(|(piste, score)| serde_json::to_value(piste).ok().map(|v| (v, score)))
+            .collect();
+        let mut rendu = reponse_appariement(&candidats);
+        rendu["service"] = json!(service);
+        Ok(rendu)
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — `library`
+    //
+    // Le sens SERVICE → BIBLIOTHÈQUE. Lecture seule : chercher et apparier,
+    // rien d'autre. La recherche est celle du serveur (`TrackRepo::search`,
+    // l'index plein texte) et l'appariement celui de `track_matcher` — aucun
+    // des deux n'est réécrit ici.
+    // -----------------------------------------------------------------------
+
+    fn library_search(&self, query: &str, limit: i64) -> Result<Value, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("library_search: requête vide".to_string());
+        }
+        // Bornes défensives, comme `playlists_list` : ce n'est pas au greffon
+        // de décider de la charge.
+        let limit = limit.clamp(1, 200);
+        let pistes = TrackRepo::with_backend(self.backend.clone())
+            .search(query, limit)
+            .map_err(|e| e.to_string())?;
+        let pistes: Vec<Value> = pistes.iter().map(fiche_piste).collect();
+        Ok(json!({
+            "query": query,
+            "count": pistes.len(),
+            "tracks": pistes,
+        }))
+    }
+
+    fn library_match_track(
+        &self,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<Value, String> {
+        if title.is_empty() {
+            return Err("library_match_track: titre vide".to_string());
+        }
+        let repo = TrackRepo::with_backend(self.backend.clone());
+        let apparies = apparier_en_bibliotheque(
+            &repo,
+            title,
+            artist,
+            isrc,
+            duration_ms as i64,
+            MAX_CANDIDATS_APPARIEMENT,
+        )?;
+        // Même forme que l'appariement chez un service : le greffon applique
+        // sa tolérance de durée sur `candidates` des deux côtés, sans écrire
+        // deux fois la même logique.
+        let candidats: Vec<(Value, f64)> = apparies
+            .iter()
+            .map(|(piste, score)| (fiche_piste(piste), *score))
+            .collect();
+        Ok(reponse_appariement(&candidats))
     }
 
     // -----------------------------------------------------------------------
