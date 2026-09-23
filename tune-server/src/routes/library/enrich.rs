@@ -330,7 +330,10 @@ pub(super) async fn enrich_all_library(
             //
             // La frontière est propre : la piste précédente est enrichie et
             // écrite, aucune requête MusicBrainz n'est en vol.
-            tune_core::taches_de_fond::attendre_la_reprise(
+            //
+            // Même frontière pour la lecture (#4681) : tant qu'une zone joue,
+            // la passe marque une pause entre deux pistes au lieu d'enchaîner.
+            tune_core::taches_de_fond::attendre_son_tour(
                 tune_core::taches_de_fond::Tache::Enrichissement,
             )
             .await;
@@ -469,31 +472,54 @@ pub(super) async fn enrich_all_library(
             // `albums.year` que les cartes de l'ecran Metadonnees comptent.
             // Elle est sortie d'ici pour etre testable — la boucle qui l'entoure
             // fait des allers-retours reseau, la partie base non (#2259).
-            let result = tune_core::metadata::enrichment::write_track_enrichment(
-                &backend2,
-                track_id,
-                row.get(10).and_then(|v| v.as_i64()),
-                &mb_id,
-                composer_val,
-                &details,
-            );
-
-            // Backfill the artist's MusicBrainz ID (unlocks Wikipedia/Wikidata
-            // bios). COALESCE so an existing value is never overwritten.
-            if artist_needs_mbid {
-                if let (Some(aid), Some(artist_mbid)) =
-                    (artist_id, details.musicbrainz_artist_id.as_ref())
-                {
-                    let ambid_val: Option<String> = Some(artist_mbid.clone());
-                    backend2
-                        .execute(
-                            "UPDATE artists SET musicbrainz_id = COALESCE(musicbrainz_id, ?) \
-                             WHERE id = ?",
-                            &[&ambid_val as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
-                        )
-                        .ok();
-                    artists_mbid_done.insert(aid);
-                }
+            //
+            // #4681 — et elle part HORS des fils de l'exécuteur, avec le report
+            // du MBID d'artiste : ces fils servent aussi la lecture, et une
+            // écriture SQLite qui y attend le verrou les tient.
+            let ecriture = {
+                let backend_ecriture = backend2.clone();
+                let album_id = row.get(10).and_then(|v| v.as_i64());
+                let mb_id = mb_id.clone();
+                tune_core::taches_de_fond::priorite::hors_du_fil_async(
+                    tune_core::taches_de_fond::Tache::Enrichissement.id(),
+                    move || {
+                        let result = tune_core::metadata::enrichment::write_track_enrichment(
+                            &backend_ecriture,
+                            track_id,
+                            album_id,
+                            &mb_id,
+                            composer_val,
+                            &details,
+                        );
+                        // Backfill the artist's MusicBrainz ID (unlocks
+                        // Wikipedia/Wikidata bios). COALESCE so an existing
+                        // value is never overwritten.
+                        let mut mbid_artiste_pose = None;
+                        if artist_needs_mbid
+                            && let (Some(aid), Some(artist_mbid)) =
+                                (artist_id, details.musicbrainz_artist_id.as_ref())
+                        {
+                            let ambid_val: Option<String> = Some(artist_mbid.clone());
+                            backend_ecriture
+                                .execute(
+                                    "UPDATE artists SET musicbrainz_id = \
+                                     COALESCE(musicbrainz_id, ?) WHERE id = ?",
+                                    &[&ambid_val as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
+                                )
+                                .ok();
+                            mbid_artiste_pose = Some(aid);
+                        }
+                        (result, details, mbid_artiste_pose)
+                    },
+                )
+                .await
+            };
+            let Some((result, details, mbid_artiste_pose)) = ecriture else {
+                errors += 1;
+                continue;
+            };
+            if let Some(aid) = mbid_artiste_pose {
+                artists_mbid_done.insert(aid);
             }
 
             match result {
