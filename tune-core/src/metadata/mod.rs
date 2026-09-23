@@ -16,6 +16,8 @@ pub mod lyrics;
 pub mod matcher;
 pub mod musicbrainz_release;
 pub mod reidentify;
+// Le type de sortie d'un disque — album, EP, single (#4767).
+pub mod release_type;
 pub mod suggestions;
 pub mod tag_writer;
 

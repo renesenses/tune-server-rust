@@ -70,6 +70,26 @@ pub struct Album {
     /// enfin conservée.
     #[serde(default)]
     pub is_compilation: bool,
+    /// Le TYPE DE SORTIE du disque : `album`, `ep`, `single`, `broadcast`,
+    /// `other` (#4767).
+    ///
+    /// C'est le `primary-type` du GROUPE DE SORTIE MusicBrainz, mis en bas de
+    /// casse, quand `musicbrainz_release_group_id` a pu être résolu — ou le
+    /// type que le service annonce pour un album de streaming. Voir
+    /// [`crate::metadata::release_type`], qui est le seul décodeur.
+    ///
+    /// 🔴 `None` veut dire INCONNU, et l'inconnu est l'état NORMAL : la
+    /// couverture MBID mesurée est de 0,9 % sur le .18 et 88,4 % sur le .15.
+    /// Rien ne le devine — ni le nombre de titres, ni la durée. Un client qui
+    /// lit `null` doit le dire ou s'abstenir, jamais classer d'office : un tri
+    /// faux est pire qu'une section absente (#4767).
+    ///
+    /// Les `secondary-types` (Live, Compilation, Soundtrack, Remix…) ne
+    /// changent JAMAIS cette valeur — un album live reste un `album`. Pour
+    /// « compilation », la colonne qui fait foi reste [`Self::is_compilation`],
+    /// écrite par le scan.
+    #[serde(default)]
+    pub release_type: Option<String>,
 }
 
 impl Album {
@@ -126,6 +146,7 @@ impl Album {
             original_date: None,
             added_at: None,
             is_compilation: false,
+            release_type: None,
         }
     }
 }
@@ -377,6 +398,7 @@ mod tests {
     #[test]
     fn album_serialization() {
         let album = Album {
+            release_type: None,
             id: Some(1),
             title: "Kind of Blue".into(),
             artist_id: Some(42),

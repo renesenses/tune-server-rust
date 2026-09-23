@@ -400,7 +400,14 @@ CREATE TABLE IF NOT EXISTS albums (
     -- le scan, avec exactement la decision qui a produit le regroupement — donc
     -- la pastille explique toujours ce que l'utilisateur voit.
     -- PG : SMALLINT 0/1 (migration 028), meme convention que muted/is_hidden.
-    is_compilation INTEGER DEFAULT 0
+    is_compilation INTEGER DEFAULT 0,
+    -- Type de sortie MusicBrainz du disque : `album`, `ep`, `single`,
+    -- `broadcast`, `other` (migration 106, #4767). NUL = INCONNU, et c'est
+    -- l'etat normal : la couverture MBID mesuree est de 0,9 % sur le .18 et
+    -- 88,4 % sur le .15. Aucune heuristique ne remplit cette colonne — ni le
+    -- nombre de titres, ni la duree : un tri faux est pire qu'une section
+    -- absente. TEXT sur les deux moteurs, sans defaut.
+    release_type TEXT
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,

@@ -1270,6 +1270,7 @@ impl YouTubeService {
         let content = &item["contentDetails"];
 
         StreamAlbum {
+            release_type: None,
             id: item["id"].as_str().unwrap_or("").into(),
             title: snippet["title"].as_str().unwrap_or("").into(),
             artist: snippet["channelTitle"].as_str().unwrap_or("").into(),
@@ -1446,6 +1447,7 @@ impl YouTubeService {
             .unwrap_or(0) as u32;
 
         StreamAlbum {
+            release_type: None,
             id: browse_id,
             title,
             artist,
@@ -1565,6 +1567,7 @@ impl YouTubeService {
                     });
                 } else if page_type.contains("ALBUM") || subtitle.to_lowercase().contains("album") {
                     albums.push(StreamAlbum {
+                        release_type: None,
                         id: browse_id.to_string(),
                         title: title_text.to_string(),
                         artist: subtitle.clone(),
@@ -1764,6 +1767,7 @@ impl YouTubeService {
                                 .map(String::from);
 
                         albums.push(StreamAlbum {
+                            release_type: None,
                             id: browse_id.into(),
                             title: title.into(),
                             artist: artist_name.into(),
@@ -2112,6 +2116,7 @@ impl YouTubeService {
             .map(String::from);
 
         Some(StreamAlbum {
+            release_type: None,
             id: String::new(), // Caller sets this
             title: title.into(),
             artist: artist.into(),
@@ -2219,6 +2224,7 @@ impl YouTubeService {
                             .map(String::from);
 
                         albums.push(StreamAlbum {
+                            release_type: None,
                             id: browse_id.into(),
                             title: title.into(),
                             artist: String::new(), // Set by caller
@@ -2443,6 +2449,7 @@ impl YouTubeService {
                             .map(String::from);
 
                         albums.push(StreamAlbum {
+                            release_type: None,
                             id: item_id.into(),
                             title: item_title.into(),
                             artist: artist_name.into(),
@@ -2660,6 +2667,7 @@ impl StreamingService for YouTubeService {
                     }
                     "youtube#playlist" => {
                         albums.push(StreamAlbum {
+                            release_type: None,
                             id: item["id"]["playlistId"].as_str().unwrap_or("").into(),
                             title: title.into(),
                             artist: snippet["channelTitle"].as_str().unwrap_or("").into(),
