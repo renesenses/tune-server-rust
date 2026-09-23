@@ -55,4 +55,6 @@ pub mod zone_repo;
 
 #[cfg(test)]
 mod album_dr_provenance_tests;
+#[cfg(test)]
+mod lenteur_albums_4800_tests;
 pub mod upnp_revision;
