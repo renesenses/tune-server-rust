@@ -293,12 +293,16 @@ async fn une_playlist_et_une_playlist_intelligente_de_meme_id_ne_se_confondent_p
     let (app, state) = app_avec_etat();
     let sid = creer_smart_playlist(&app, "Intelligente").await;
     let playlists = PlaylistRepo::with_backend(state.backend.clone());
-    let mut pid = playlists.create("Manuelle", None, 1).unwrap();
+    // `smart_playlists` est semée par les migrations : l'intelligente ne
+    // porte pas l'id 1. On crée des playlists jusqu'à ce que l'une d'elles
+    // reçoive le MÊME entier — c'est elle, la jumelle, et c'est son nom que la
+    // route des playlists doit rendre.
+    let mut nom_jumelle = String::from("Manuelle");
+    let mut pid = playlists.create(&nom_jumelle, None, 1).unwrap();
     let mut essais = 0;
     while pid < sid && essais < 64 {
-        pid = playlists
-            .create(&format!("Remplissage {essais}"), None, 1)
-            .unwrap();
+        nom_jumelle = format!("Manuelle {essais}");
+        pid = playlists.create(&nom_jumelle, None, 1).unwrap();
         essais += 1;
     }
     assert_eq!(
@@ -358,7 +362,7 @@ async fn une_playlist_et_une_playlist_intelligente_de_meme_id_ne_se_confondent_p
 
     let (_, pl) = get(&app, &format!("/api/v1/tags/{tag}/playlists")).await;
     assert_eq!(pl["count"], json!(1), "{pl}");
-    assert_eq!(pl["playlists"][0]["name"], json!("Manuelle"));
+    assert_eq!(pl["playlists"][0]["name"], json!(nom_jumelle));
     let (_, sp) = get(&app, &format!("/api/v1/tags/{tag}/smart-playlists")).await;
     assert_eq!(sp["count"], json!(1), "{sp}");
     assert_eq!(sp["smart_playlists"][0]["name"], json!("Intelligente"));
