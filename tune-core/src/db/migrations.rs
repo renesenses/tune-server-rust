@@ -5585,12 +5585,24 @@ mod tests {
             );
         }
 
-        // 3. Le SELECT commun des albums doit se PREPARER sur les DEUX :
-        //    SQLite refuse a la preparation une colonne qui n'existe pas.
-        for (nom, db) in [("neuve", &neuve), ("ancienne", &ancienne)] {
-            let conn = db.connection().lock().unwrap();
+        // 3. Le SELECT commun des albums doit se PREPARER : SQLite refuse a
+        //    la preparation une colonne qui n'existe pas. C'est la garde qui
+        //    compte — `select_album()` NOMME desormais `a.release_type`, et
+        //    sans la colonne, TOUTES les requetes d'albums echoueraient.
+        //
+        //    Juge sur la base NEUVE : la table bricolee du cas 2 n'a jamais
+        //    eu `original_year` ni les autres colonnes des migrations
+        //    anterieures, que cette migration-ci n'a pas a rattraper. Pour
+        //    elle, c'est `release_type` seule qui se lit.
+        {
+            let conn = neuve.connection().lock().unwrap();
             conn.prepare(crate::db::album_repo::sql::select_album())
-                .unwrap_or_else(|e| panic!("base {nom} : `select_album` echoue — {e}"));
+                .expect("base neuve : `select_album` doit se preparer");
+        }
+        {
+            let conn = ancienne.connection().lock().unwrap();
+            conn.prepare("SELECT release_type FROM albums")
+                .expect("base ancienne : `release_type` doit se lire");
         }
 
         // 4. Jumelle PostgreSQL. Ce test lit les SOURCES, donc il vaut sans la
