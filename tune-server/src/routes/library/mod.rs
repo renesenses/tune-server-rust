@@ -6,7 +6,10 @@ mod artists;
 mod artwork;
 mod better_quality;
 mod browse;
-mod collections;
+// `pub(crate)` : `/tags/{id}/collections` (routes/tags.rs) rend les dossiers d'une
+// étiquette dans la forme SERVIE de `/library/collections` — même fonction,
+// mêmes `album_count` et `orphan_album_ids` (#4798).
+pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;

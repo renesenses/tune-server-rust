@@ -119,6 +119,11 @@ pub fn router() -> Router<AppState> {
         // #4798 — route a part : les identifiants de `playlists` et de
         // `smart_playlists` se recouvrent, on ne les melange jamais.
         .route("/{id}/smart-playlists", get(list_tag_smart_playlists))
+        // #4798, second volet — meme regle pour les collections : un dossier
+        // (reglage JSON `collections`) et une collection intelligente (table
+        // `smart_collections`) partagent leurs identifiants, deux routes.
+        .route("/{id}/collections", get(list_tag_collections))
+        .route("/{id}/smart-collections", get(list_tag_smart_collections))
         .route("/for/{item_type}/{item_id}", get(tags_for_item))
         // La jumelle de `/for/…` pour l'espace du streaming. En parametres de
         // requete et non en segments, meme raison que ci-dessus.
@@ -581,6 +586,83 @@ async fn list_tag_smart_playlists(
         "tag_id": id,
         "smart_playlists": smart_playlists,
         "count": smart_playlists.len(),
+    }))
+}
+
+/// Les DOSSIERS (collections manuelles) d'une etiquette (#4798, second volet).
+///
+/// L'ecran Collections posait deja le bouton Etiquette sur chaque pochette,
+/// avec `item_type = "collection"` — et le serveur repondait 400. Un dossier
+/// n'a pas de table : c'est une entree de la liste JSON du reglage
+/// `collections`, servie ici dans la forme exacte de `GET /library/collections`
+/// (`album_count`, `orphan_album_ids`), par la meme fonction.
+///
+/// Route a part de `/smart-collections` : les identifiants des deux espaces
+/// se recouvrent — l'id 1 est a la fois « favorites » et « Audiophile » sur le
+/// serveur de Bertrand. Ici on ne lit que le reglage `collections`. Un
+/// dossier supprime est omis ; une erreur de base remonte en 500, comme sur
+/// la route d'origine.
+async fn list_tag_collections(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, crate::error::AppError> {
+    let tag_repo = TagRepo::with_backend(state.backend.clone());
+    let etiquetes = tag_repo.items_by_tag(id, "collection").unwrap_or_default();
+    let collections =
+        crate::routes::library::collections::dossiers_servis_parmi(&state, &etiquetes)?;
+    Ok(Json(json!({
+        "tag_id": id,
+        "collections": collections,
+        "count": collections.len(),
+    })))
+}
+
+/// Les collections INTELLIGENTES d'une etiquette (#4798, second volet).
+///
+/// Ne lit que `smart_collections`, jamais le reglage `collections` — meme
+/// raison que ci-dessus. La forme rendue est celle de
+/// `GET /library/smart-collections`, par le decodeur de cette route
+/// (`name_key` et `description_key` compris, pour que le client traduise les
+/// seize collections du semis) — sans `album_count`, qui demanderait de
+/// resoudre chaque regle : l'ecran qui l'ouvre le fait deja.
+///
+/// La table se lit en entier puis se filtre, comme les playlists
+/// intelligentes : quelques dizaines de lignes, et une seule requete valable
+/// dans les deux dialectes.
+async fn list_tag_smart_collections(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Json<Value> {
+    let tag_repo = TagRepo::with_backend(state.backend.clone());
+    let etiquetees = tag_repo
+        .items_by_tag(id, "smart_collection")
+        .unwrap_or_default();
+    let rows = if etiquetees.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .backend
+            .query_many(
+                "SELECT id, name, rules, match_mode, sort_by, sort_order, max_limit, \
+                 description, icon, color, created_at \
+                 FROM smart_collections ORDER BY name",
+                &[],
+            )
+            .unwrap_or_default()
+    };
+    let smart_collections: Vec<Value> = rows
+        .iter()
+        .filter(|cols| {
+            cols.first()
+                .and_then(|v| v.as_i64())
+                .is_some_and(|sid| etiquetees.contains(&sid))
+        })
+        .map(|cols| tune_smart_http::smart_collections::decode_collection_row(cols))
+        .collect();
+    Json(json!({
+        "tag_id": id,
+        "smart_collections": smart_collections,
+        "count": smart_collections.len(),
     }))
 }
 
