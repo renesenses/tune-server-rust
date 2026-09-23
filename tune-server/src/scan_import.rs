@@ -836,8 +836,23 @@ impl TrackImporter {
             // coffret de #3855 ses deux lignes album, et à « Woodstock »
             // l'artiste de sa première piste. Deux artistes ou plus ⇒ la
             // convention, et elle seule.
+            //
+            // 🔴 Ticket support 156 / fil 1881 (jfpaquet, 0.9.161) — un artiste
+            // d'album tagué qui EST la convention n'est pas un artiste. Ses
+            // fichiers portent `ALBUMARTIST = Various` ; `folder_tagged_artist`
+            // n'y voyait qu'une valeur unique et C2 la prenait au mot : la
+            // ligne album naissait sous un artiste nommé « Various », et
+            // l'écran Bibliothèque montrait une entrée de plus à la lettre V,
+            // à côté de « Various Artists ». Les graphies libres (« VA »,
+            // « Compilations ») en fabriquaient autant. `is_various_artists`
+            // les connaît toutes — c'est LUI qui a fait de cet album une
+            // compilation quelques lignes plus haut (`forme`) — et la passe de
+            // réparation les écarte déjà (`reparer_compilations.rs`,
+            // `Temoignage::ajouter`). Le scan les écarte donc pareillement :
+            // la convention reprend la main, sous sa graphie canonique.
             self.folder_tagged_artist
                 .get(&album_dir)
+                .filter(|a| !is_various_artists(a.as_str()))
                 .cloned()
                 .unwrap_or_else(|| "Various Artists".to_string())
         } else if let Some(aa) = meta.album_artist.as_deref() {
@@ -2382,6 +2397,121 @@ mod tests {
                 (artiste.as_str(), *compilation),
                 ("Various Artists", true),
                 "témoin : une vraie compilation le reste, fichier illisible compris ({chemin})"
+            );
+        }
+    }
+
+    /// Un `ALBUMARTIST` qui EST la convention ne devient pas un artiste.
+    ///
+    /// jfpaquet (0.9.161, Windows, 6 599 albums, ticket support 156) :
+    /// « ils apparaissent dans Library à la lettre V MAIS artist est indiqué
+    /// "Various" alors que chaque morceau est bien taggé avec le nom de
+    /// l'artiste ». Ses compilations portent `ALBUMARTIST = Various` — une
+    /// graphie que [`is_various_artists`] reconnaît, et c'est elle qui, par
+    /// `forme`, en fait des compilations. C2 rendait ensuite « l'artiste
+    /// d'album tagué du dossier », c'est-à-dire « Various » TEL QUEL :
+    /// `folder_tagged_artist` n'y voyait qu'une valeur unique. Une ligne
+    /// `artists` naissait par graphie — « Various », « VA »,
+    /// « Compilations » — toutes rangées à la lettre V à côté de la vraie,
+    /// « Various Artists ». La passe de réparation, elle, les écarte déjà
+    /// (`reparer_compilations.rs`, `Temoignage::ajouter`) : le scan et elle
+    /// se contredisaient.
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant : retirer le
+    /// `.filter(|a| !is_various_artists(a.as_str()))` de `import` rend « Various » et
+    /// « VA » là où il attend « Various Artists ».
+    #[test]
+    fn un_album_artist_conventionnel_ne_devient_pas_un_artiste() {
+        let scratch = tune_core::test_scratch::scratch_dir("scan_import_va_conventionnel");
+        let racine = scratch.path();
+
+        /// Une piste dont l'artiste et l'ARTISTE D'ALBUM diffèrent — ce que
+        /// `fichier_etiquete` ne sait pas faire, et c'est tout le sujet.
+        fn piste(
+            chemin: &str,
+            artiste: &str,
+            album_artiste: &str,
+            album: &str,
+            n: u32,
+            tag: Option<bool>,
+        ) -> ScannedFile {
+            let mut f = sf(chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("{album} {n}")),
+                artist: Some(artiste.to_string()),
+                album: Some(album.to_string()),
+                album_artist: Some(album_artiste.to_string()),
+                track_number: Some(n),
+                compilation: tag,
+                ..Default::default()
+            });
+            f
+        }
+
+        // Les deux graphies du tester, chacune dans son dossier. Les pistes
+        // portent bien leur propre artiste : c'est ce qu'il dit du sien.
+        for (dossier, graphie, album) in [
+            ("Nuits Jazz", "Various", "Nuits Jazz"),
+            ("Soul Legends", "VA", "Soul Legends"),
+        ] {
+            let d = racine.join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let c = |n: &str| d.join(n).to_string_lossy().into_owned();
+            let fichiers = vec![
+                piste(&c("01.flac"), "Miles Davis", graphie, album, 1, None),
+                piste(&c("02.flac"), "John Coltrane", graphie, album, 2, None),
+                piste(&c("03.flac"), "Bill Evans", graphie, album, 3, None),
+            ];
+            let rendu = importer_par_lots(&fichiers, 8, &racine.join(format!("cache-{dossier}")));
+            assert_eq!(rendu.len(), 3, "les trois pistes doivent être importées");
+            for (chemin, (artiste, compilation, _)) in &rendu {
+                assert_eq!(
+                    (artiste.as_str(), *compilation),
+                    ("Various Artists", true),
+                    "ALBUMARTIST = « {graphie} » est la CONVENTION, pas un artiste : \
+                     l'album doit porter « Various Artists » et non « {artiste} » ({chemin})"
+                );
+            }
+            let albums: std::collections::BTreeSet<i64> =
+                rendu.values().map(|(_, _, id)| *id).collect();
+            assert_eq!(albums.len(), 1, "et les trois pistes tiennent en un album");
+        }
+
+        // TÉMOIN C2 — sur la MÊME branche, un VRAI artiste d'album tagué garde
+        // la main. Le tag `compilation = vrai` fait entrer ce coffret par C2,
+        // là même où la correction agit : sans ce témoin, écarter la graphie
+        // conventionnelle passerait pour une correction alors qu'elle pourrait
+        // tout aussi bien renvoyer tout coffret sous « Various Artists » —
+        // exactement le défaut que C2 a corrigé le 14/09.
+        let d = racine.join("Coffret Reiner");
+        std::fs::create_dir_all(&d).unwrap();
+        let c = |n: &str| d.join(n).to_string_lossy().into_owned();
+        let fichiers = vec![
+            piste(
+                &c("01.flac"),
+                "Chicago Symphony Orchestra",
+                "Fritz Reiner",
+                "Ein Heldenleben",
+                1,
+                Some(true),
+            ),
+            piste(
+                &c("02.flac"),
+                "Fritz Reiner",
+                "Fritz Reiner",
+                "Ein Heldenleben",
+                2,
+                Some(true),
+            ),
+        ];
+        let rendu = importer_par_lots(&fichiers, 8, &racine.join("cache-reiner"));
+        assert_eq!(rendu.len(), 2, "les deux pistes doivent être importées");
+        for (chemin, (artiste, compilation, _)) in &rendu {
+            assert_eq!(
+                (artiste.as_str(), *compilation),
+                ("Fritz Reiner", true),
+                "témoin C2 : sur une compilation aussi, un artiste d'album tagué \
+                 qui n'est PAS la convention reste l'artiste de l'album ({chemin})"
             );
         }
     }
