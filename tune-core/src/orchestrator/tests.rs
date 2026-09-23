@@ -8575,6 +8575,37 @@ async fn sans_flux_connu_le_changement_d_egaliseur_relance_comme_avant_4407() {
     assert_eq!(relances_programmees_4407(&orch, zone_id), 1);
 }
 
+/// #4680 — sur une zone RÉSEAU, un égaliseur qui change le signal fait
+/// relancer le flux à la position courante : l'effet s'entend dans l'instant.
+/// La réponse le disait `applied_live: false`, que les écrans traduisaient
+/// « prendra effet à la piste suivante » — faux, a constaté la recette de la
+/// v0.9.161 sur un Eversolo DMP-A8.
+#[tokio::test]
+async fn la_portee_distingue_la_relance_de_la_piste_suivante_4680() {
+    use crate::orchestrator::PorteeDuReglage;
+    let device_id = "dlna:uuid-4680-portee";
+    let (orch, zone_id, _dir) = zone_dlna_servie_4407(device_id).await;
+
+    ecrire_profil_4407(&orch, zone_id, &profil_audible_4407(6.0));
+    let portee = orch.apply_eq_change_portee(zone_id).await;
+    assert_eq!(portee, PorteeDuReglage::Relance);
+    assert_eq!(portee.code(), "restart", "et surtout pas `next_track`");
+    assert_eq!(relances_programmees_4407(&orch, zone_id), 1);
+
+    // Contre-épreuve : le flux porte déjà ce profil, rien à relancer.
+    laisser_passer_l_anti_rebond().await;
+    assert_eq!(
+        orch.apply_eq_change_portee(zone_id).await,
+        PorteeDuReglage::Immediate
+    );
+
+    // Une zone où rien ne joue : la prochaine lecture partira réglée.
+    assert_eq!(
+        orch.apply_eq_change_portee(zone_id + 4_680).await,
+        PorteeDuReglage::RienNeJoue
+    );
+}
+
 // ── #3973 — « bit-perfect strict » : les sites de la résolution ──────────────
 
 /// Une piste FLAC 192 kHz / 24 bits (le fichier n'est pas ouvert : la décision

@@ -10,6 +10,48 @@ struct Etiquettes {
     duration_ms: u64,
 }
 
+/// Quand un réglage d'égaliseur atteint le son (#4680).
+///
+/// Le client en tire sa phrase : seul [`Self::PisteSuivante`] justifie
+/// « prendra effet à la piste suivante ». [`Self::Relance`] s'entend dans
+/// l'instant — le flux est relancé à la position courante après
+/// l'anti-rebond (`EQ_REPLAY_DEBOUNCE_MS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PorteeDuReglage {
+    /// Le son est déjà conforme : sortie locale modifiée à chaud, ou flux
+    /// réseau qui porte déjà ce traitement.
+    Immediate,
+    /// Zone réseau : le flux va être relancé à la position courante.
+    Relance,
+    /// Rien ne peut agir avant la piste suivante (position inconnue, #2595).
+    PisteSuivante,
+    /// Rien ne joue : la prochaine lecture partira avec ce réglage.
+    RienNeJoue,
+}
+
+impl PorteeDuReglage {
+    /// Le mot publié dans les réponses (`portee`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Relance => "restart",
+            Self::PisteSuivante => "next_track",
+            Self::RienNeJoue => "not_playing",
+        }
+    }
+
+    /// Le `chemin` de `eq_change_journal` dit déjà ce qui s'est passé : la
+    /// portée s'en déduit, pour qu'elle ne puisse pas diverger du journal.
+    fn du_chemin(chemin: &str) -> Self {
+        match chemin {
+            "local_a_chaud" | "flux_conserve_signal_identique" => Self::Immediate,
+            "replay_programme" => Self::Relance,
+            "rien_ne_joue" => Self::RienNeJoue,
+            _ => Self::PisteSuivante,
+        }
+    }
+}
+
 /// Pourquoi l'égaliseur n'a pas pu être remplacé À CHAUD sur une sortie locale.
 ///
 /// #3479 — « l'activation de l'égaliseur coupe le son » (Reivax66, 0.9.138,
@@ -793,6 +835,20 @@ impl PlaybackOrchestrator {
     /// et reconstruisent ainsi `signal_path` depuis le profil EQ qui vient
     /// d'être persisté, au lieu de conserver l'instantané de la lecture (#1985).
     pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        self.apply_eq_change_portee(zone_id).await == PorteeDuReglage::Immediate
+    }
+
+    /// [`Self::apply_eq_change`], mais qui dit QUAND le réglage atteindra le
+    /// son, au lieu d'un booléen à plusieurs sens (#4680).
+    ///
+    /// `false` confondait « relance du flux programmée dans une demi-seconde »
+    /// (DLNA, navigateur) avec « piste suivante » : l'interface annonçait donc
+    /// « prendra effet à la piste suivante » sur une zone réseau où l'effet
+    /// s'entend presque aussitôt — recette v0.9.161, Eversolo DMP-A8.
+    pub async fn apply_eq_change_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
         let debut = std::time::Instant::now();
         let rapport = self.refresh_zone_eq_detaille(zone_id).await;
         let applique_a_chaud = rapport.applique();
@@ -839,10 +895,7 @@ impl PlaybackOrchestrator {
         if let Some(ref bus) = self.event_bus {
             bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
         }
-        // Un flux conservé parce qu'il porte déjà ce traitement : le son EST
-        // conforme au réglage, immédiatement — comme la bascule PURE sans
-        // effet (#4004).
-        applique_a_chaud || chemin == "flux_conserve_signal_identique"
+        PorteeDuReglage::du_chemin(chemin)
     }
 
     /// Combien de flux résolus une zone garde en mémoire (#4407) : celui qui
