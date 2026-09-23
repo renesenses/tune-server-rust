@@ -459,7 +459,7 @@ fn banc_reel_4800() {
     );
     eprintln!(
         "--- plan, ANCIENNE clause (COUNT) :\n  {}",
-        plan(&ancien_count)
+        plan(&db, &ancien_count)
     );
     chrono("COUNT ancienne clause", &|| un_entier(&db, &ancien_count));
     chrono("repo.count_visible()", &|| repo.count_visible().unwrap());
