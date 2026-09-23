@@ -3022,6 +3022,15 @@ impl PositionPoller {
                     stopped_ticks = etat.map(|p| p.stopped_ticks).unwrap_or(0),
                     past_end_ticks = etat.map(|p| p.past_end_ticks).unwrap_or(0),
                     gapless_sent = etat.map(|p| p.gapless_sent).unwrap_or(false),
+                    // #4382 — `gapless_sent` ne dit que « le SetNext est
+                    // parti ». Ce qui décide du geste de #3967, c'est ce que
+                    // l'appareil en a DIT à l'armement, et cette ligne — la
+                    // seule que les rapports de terrain portent — ne le
+                    // nommait pas. Sans elle, un journal d'Eversolo ne permet
+                    // pas de dire si la branche `Next` s'est armée ou non.
+                    suivante_preparee = ?etat
+                        .map(|p| p.suivante_preparee)
+                        .unwrap_or(SuivantePreparee::Inconnue),
                     peak_pos = etat.map(|p| p.peak_position_ms).unwrap_or(0),
                     track_dur = track_duration_ms,
                     wall_secs = wall_elapsed,

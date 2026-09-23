@@ -281,3 +281,86 @@ fn la_porte_de_la_bascule() {
     assert!(!porte(true, SuivantePreparee::Tenue, flux, E::Certain));
     assert!(!porte(true, SuivantePreparee::Tenue, flux, E::Probable));
 }
+
+// ── #4382 — `track_end_gap` doit NOMMER le verdict d'armement ──────────────
+//
+// C'est la seule ligne que les rapports de terrain portent (le `diagnostic.md`
+// de Villerio du 18/09 n'en contient pas d'autre sur cette transition). Elle
+// disait `gapless_sent=true`, c'est-à-dire « le `SetNext` est parti » — et
+// rien de plus. Or ce qui décide du geste de #3967, c'est ce que l'appareil a
+// RÉPONDU à l'armement. Sans ce champ, le journal du DMP-A6 ne permet pas de
+// dire si la branche `Next` s'est armée, et la question ne peut pas être
+// tranchée sans avoir l'appareil sous la main.
+
+#[derive(Clone, Default)]
+struct JournalDuRepli(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for JournalDuRepli {
+    fn write(&mut self, octets: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(octets);
+        Ok(octets.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JournalDuRepli {
+    type Writer = JournalDuRepli;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl JournalDuRepli {
+    fn texte(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+    /// INFO : le niveau d'un export de terrain, pas TRACE.
+    fn abonner(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+    }
+}
+
+/// La signature exacte du rapport de Villerio : l'appareil n'a rien annoncé
+/// de la suivante (`Inconnue`, le défaut), il a tiré le flux armé, et il
+/// nomme encore la piste finie. Le repli part — et la ligne qui le dit doit
+/// porter le verdict d'armement.
+#[tokio::test]
+async fn track_end_gap_nomme_le_verdict_d_armement() {
+    let mut banc = Banc::monter().await;
+    let (flux, _) = banc.armer().await;
+    assert_eq!(
+        banc.poll_states
+            .get(&banc.zone_id)
+            .unwrap()
+            .suivante_preparee,
+        SuivantePreparee::Inconnue,
+        "le banc doit partir du verdict par défaut, celui du DMP-A6 non mesuré"
+    );
+    banc.la_signature_du_dmp_a6(&flux).await;
+
+    let journal = JournalDuRepli::default();
+    {
+        let _garde = journal.abonner();
+        banc.la_fin_a_l_horloge().await;
+    }
+
+    let texte = journal.texte();
+    assert!(
+        texte.contains("track_end_gap"),
+        "la ligne d'entonnoir doit être écrite au niveau INFO.\n{texte}"
+    );
+    assert!(
+        texte.contains("suivante_preparee=Inconnue"),
+        "`track_end_gap` doit nommer ce que l'appareil a répondu à l'armement : \
+         sans ce champ, aucun journal de terrain ne dit si la branche `Next` \
+         de #3967 s'est armée.\n{texte}"
+    );
+}
