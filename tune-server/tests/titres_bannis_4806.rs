@@ -297,6 +297,7 @@ async fn un_titre_banni_ne_sort_jamais_de_la_lecture_aleatoire() {
     let (app, state) = app_et_etat();
     let (album_id, ids) = bibliotheque(&state, "Chic", "Risqué", "Disco", 12);
     let bannie = ids[5];
+    let zone = zone_avec_sortie(&state, "salle").await;
     let artiste_id = ArtistRepo::with_backend(state.backend.clone())
         .get_or_create("Chic", None, None)
         .unwrap()
@@ -304,7 +305,7 @@ async fn un_titre_banni_ne_sort_jamais_de_la_lecture_aleatoire() {
         .unwrap();
 
     let file = |app: axum::Router| async move {
-        let (_, f) = lire(&app, "/api/v1/zones/1/queue").await;
+        let (_, f) = lire(&app, &format!("/api/v1/zones/{zone}/queue")).await;
         f["tracks"]
             .as_array()
             .unwrap_or(&Vec::new())
@@ -316,7 +317,12 @@ async fn un_titre_banni_ne_sort_jamais_de_la_lecture_aleatoire() {
     // Témoin : avant le bannissement, la piste part.
     let mut vue = false;
     for _ in 0..20 {
-        poster(&app, "/api/v1/playback/shuffle-all?zone_id=1", json!({})).await;
+        poster(
+            &app,
+            &format!("/api/v1/playback/shuffle-all?zone_id={zone}"),
+            json!({}),
+        )
+        .await;
         let f = file(app.clone()).await;
         assert_eq!(f.len(), 12, "témoin : 12 pistes en file, {f:?}");
         vue |= f.contains(&bannie);
@@ -332,11 +338,11 @@ async fn un_titre_banni_ne_sort_jamais_de_la_lecture_aleatoire() {
     assert_eq!(st, StatusCode::OK);
 
     let portees = [
-        "/api/v1/playback/shuffle-all?zone_id=1".to_string(),
-        format!("/api/v1/playback/shuffle-all?zone_id=1&album_id={album_id}"),
-        format!("/api/v1/playback/shuffle-all?zone_id=1&artist_id={artiste_id}"),
-        "/api/v1/playback/shuffle-all?zone_id=1&search_query=Risqu".to_string(),
-        "/api/v1/playback/shuffle-all?zone_id=1&genre=Disco".to_string(),
+        format!("/api/v1/playback/shuffle-all?zone_id={zone}"),
+        format!("/api/v1/playback/shuffle-all?zone_id={zone}&album_id={album_id}"),
+        format!("/api/v1/playback/shuffle-all?zone_id={zone}&artist_id={artiste_id}"),
+        format!("/api/v1/playback/shuffle-all?zone_id={zone}&search_query=Risqu"),
+        format!("/api/v1/playback/shuffle-all?zone_id={zone}&genre=Disco"),
     ];
     for portee in &portees {
         for _ in 0..20 {
@@ -363,7 +369,12 @@ async fn un_titre_banni_ne_sort_jamais_de_la_lecture_aleatoire() {
     .await;
     let mut revue = false;
     for _ in 0..20 {
-        poster(&app, "/api/v1/playback/shuffle-all?zone_id=1", json!({})).await;
+        poster(
+            &app,
+            &format!("/api/v1/playback/shuffle-all?zone_id={zone}"),
+            json!({}),
+        )
+        .await;
         let f = file(app.clone()).await;
         assert_eq!(f.len(), 12);
         revue |= f.contains(&bannie);
@@ -684,6 +695,7 @@ async fn banni_chez_l_un_pas_chez_l_autre() {
     assert_eq!(voisin, 2);
     let (album_id, ids) = bibliotheque(&state, "Air", "Moon Safari", "Downtempo", 5);
     let bannie = ids[3];
+    let zone = zone_avec_sortie(&state, "salle").await;
 
     let (st, v) = appel(
         &app,
@@ -722,7 +734,7 @@ async fn banni_chez_l_un_pas_chez_l_autre() {
 
     // L'aléatoire du profil 1 la tire ; celui du profil 2 jamais.
     let file = |app: axum::Router| async move {
-        let (_, f) = lire(&app, "/api/v1/zones/1/queue").await;
+        let (_, f) = lire(&app, &format!("/api/v1/zones/{zone}/queue")).await;
         f["tracks"]
             .as_array()
             .unwrap_or(&Vec::new())
@@ -734,7 +746,7 @@ async fn banni_chez_l_un_pas_chez_l_autre() {
         appel(
             &app,
             "POST",
-            "/api/v1/playback/shuffle-all?zone_id=1",
+            &format!("/api/v1/playback/shuffle-all?zone_id={zone}"),
             "2",
             Some(json!({})),
         )
@@ -748,7 +760,7 @@ async fn banni_chez_l_un_pas_chez_l_autre() {
         appel(
             &app,
             "POST",
-            "/api/v1/playback/shuffle-all?zone_id=1",
+            &format!("/api/v1/playback/shuffle-all?zone_id={zone}"),
             "1",
             Some(json!({})),
         )
