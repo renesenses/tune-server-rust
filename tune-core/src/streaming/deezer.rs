@@ -71,6 +71,81 @@ pub struct DeezerService {
     /// Nombre de réponses `USER_ID: 0` CONSÉCUTIVES depuis la dernière
     /// authentification réussie. Remis à zéro par tout succès.
     arl_zero_user_streak: u8,
+    /// La langue du COMPTE Deezer, telle que la passerelle l'a nommée.
+    ///
+    /// 🔴 Fuites de français. [`DeezerService::gw_api_call`] portait
+    /// `Accept-Language: fr-FR,fr;q=0.9,en;q=0.8` écrit en dur : chaque appel
+    /// à la passerelle se présentait comme un navigateur français, pour tout
+    /// le monde et sans condition.
+    ///
+    /// Ce n'est PAS une langue d'interface transmise à chaque requête : la
+    /// passerelle est appelée hors requête HTTP — sonde de démarrage,
+    /// rafraîchissement de jetons toutes les 300 s, résolution d'une URL de
+    /// lecture — et il n'y a là aucun `Accept-Language` de lecteur à suivre.
+    /// La seule langue qui ait un sens à cette profondeur est celle que le
+    /// compte lui-même déclare, et c'est la passerelle qui la dit, dans la
+    /// réponse de `deezer.getUserData`.
+    ///
+    /// Tant qu'elle est inconnue — premier appel, compte muet sur le sujet —
+    /// l'en-tête demande l'ANGLAIS, langue de recours d'un catalogue
+    /// international (voir [`entete_accept_language`]). Jamais le français par
+    /// défaut.
+    langue_du_compte: Option<String>,
+}
+
+/// La valeur de l'en-tête `Accept-Language` d'un appel à la passerelle.
+///
+/// Avec une langue connue : elle d'abord, l'anglais en second — un serveur
+/// qui ne sait pas la servir retombe sur une langue internationale, pas sur
+/// celle du studio. Sans langue connue : l'anglais seul.
+///
+/// Le français n'apparaît que si le compte est français. C'est tout le
+/// correctif : la valeur est construite, plus écrite en dur.
+fn entete_accept_language(langue: Option<&str>) -> String {
+    match langue.and_then(etiquette_de_langue) {
+        Some(langue) if langue.eq_ignore_ascii_case("en") => "en,en-US;q=0.9".to_string(),
+        Some(langue) => format!("{langue},{langue};q=0.9,en;q=0.8"),
+        None => "en,en-US;q=0.9".to_string(),
+    }
+}
+
+/// Une étiquette de langue utilisable, ou rien.
+///
+/// Deux ou trois lettres ASCII, éventuellement suivies d'une région
+/// (`fr`, `pt-BR`, `zh-Hant`). Tout le reste est refusé : une valeur
+/// fantaisiste recopiée telle quelle dans un en-tête en ferait un en-tête
+/// invalide, et [`reqwest`] rejetterait l'appel entier — une langue
+/// inattendue ne doit pas coûter la lecture.
+fn etiquette_de_langue(brut: &str) -> Option<String> {
+    let brut = brut.trim();
+    let mut morceaux = brut.split('-');
+    let base = morceaux.next()?;
+    if !(2..=3).contains(&base.len()) || !base.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !morceaux.all(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_alphanumeric())) {
+        return None;
+    }
+    Some(brut.to_ascii_lowercase())
+}
+
+/// La langue que la réponse de `deezer.getUserData` déclare pour le compte.
+///
+/// Lecture de MEILLEUR EFFORT : la passerelle Deezer n'est pas un contrat
+/// public, et les chemins ci-dessous sont ceux qu'elle sert aujourd'hui. Si
+/// aucun ne répond, la fonction ne rend rien et l'en-tête reste à l'anglais —
+/// le repli EST déjà la correction ; lire la langue du compte n'est qu'un
+/// mieux. Elle ne FABRIQUE jamais de langue.
+fn langue_du_compte_deezer(resultat: &serde_json::Value) -> Option<String> {
+    let user = &resultat["USER"];
+    [
+        &user["SETTING"]["global"]["language"],
+        &user["SETTING"]["site"]["language"],
+        &user["LANG"],
+        &resultat["COUNTRY_LANGUAGE"],
+    ]
+    .into_iter()
+    .find_map(|v| v.as_str().and_then(etiquette_de_langue))
 }
 
 /// Combien de sessions anonymes consécutives on tolère avant de jeter un ARL
@@ -132,6 +207,7 @@ impl DeezerService {
             arl_rejected: false,
             arl_authenticated_once: false,
             arl_zero_user_streak: 0,
+            langue_du_compte: None,
         }
     }
 
@@ -173,7 +249,15 @@ impl DeezerService {
             .post(&url)
             .header("Cookie", cookie)
             .header("Accept", "application/json, text/plain, */*")
-            .header("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")
+            // 🔴 Fuites de français : cet en-tête valait
+            // `fr-FR,fr;q=0.9,en;q=0.8`, écrit en dur, pour tous les comptes.
+            // Il se construit désormais à partir de la langue que le COMPTE
+            // déclare, et retombe sur l'anglais tant qu'elle est inconnue —
+            // jamais sur le français (voir `langue_du_compte`).
+            .header(
+                "Accept-Language",
+                entete_accept_language(self.langue_du_compte.as_deref()),
+            )
             .json(&params.unwrap_or(serde_json::json!({})))
             .send()
             .await
@@ -286,9 +370,17 @@ impl DeezerService {
         if let Some(cf) = result.get("checkForm").and_then(|v| v.as_str()) {
             self.api_token = Some(cf.into());
         }
+        // La passerelle vient de dire qui est ce compte : elle dit aussi dans
+        // quelle langue il vit. Les appels suivants la demanderont, au lieu de
+        // réclamer du français à tout le monde. Un compte muet sur le sujet
+        // laisse le champ vide, et l'en-tête reste à l'anglais.
+        if let Some(langue) = langue_du_compte_deezer(&result) {
+            self.langue_du_compte = Some(langue);
+        }
         info!(
             user_id = ?self.user_id,
             has_license = self.license_token.is_some(),
+            langue = ?self.langue_du_compte,
             "deezer_arl_authenticated"
         );
         Ok(true)
@@ -1517,13 +1609,16 @@ mod tests {
     /// reponse coupee en cours (RST) rendrait ce temoin intermittent ; c'est
     /// la premiere chose a verifier s'il se met a vaciller.
     ///
-    /// Rend, dans l'ordre, la valeur de l'en-tete `Cookie` de chaque requete.
+    /// Rend, dans l'ordre, la TETE de requete complete de chaque appel —
+    /// ligne de requete et en-tetes. Le temoin du `sid` y lit son `Cookie`,
+    /// celui de la langue son `Accept-Language` : un seul faux serveur, et
+    /// chaque temoin lit la ligne qui le regarde.
     async fn fausse_passerelle(
         listener: tokio::net::TcpListener,
         reponses: Vec<String>,
     ) -> Vec<String> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut cookies = Vec::new();
+        let mut requetes = Vec::new();
         for corps in reponses {
             let (mut sock, _) = listener.accept().await.expect("accept");
             let mut recu: Vec<u8> = Vec::new();
@@ -1549,12 +1644,12 @@ mod tests {
                 }
             }
             let texte = String::from_utf8_lossy(&recu).to_string();
-            cookies.push(
+            requetes.push(
                 texte
-                    .lines()
-                    .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
-                    .map(|l| l[7..].trim().to_string())
-                    .unwrap_or_default(),
+                    .split("\r\n\r\n")
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
             );
             let tete = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
@@ -1572,7 +1667,18 @@ mod tests {
             sock.flush().await.expect("flush");
             let _ = sock.shutdown().await;
         }
-        cookies
+        requetes
+    }
+
+    /// La valeur d'un en-tete dans une tete de requete capturee, vide s'il
+    /// n'y est pas. Insensible a la casse du NOM, comme HTTP.
+    fn entete(requete: &str, nom: &str) -> String {
+        let prefixe = format!("{}:", nom.to_ascii_lowercase());
+        requete
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with(&prefixe))
+            .map(|l| l[prefixe.len()..].trim().to_string())
+            .unwrap_or_default()
     }
 
     /// Temoin de CABLAGE (#3866) — le seul qui rougisse si le `sid` est
@@ -1611,8 +1717,9 @@ mod tests {
             .await
             .expect("second appel passerelle");
 
-        let cookies = serveur.await.expect("faux serveur");
-        assert_eq!(cookies.len(), 2, "deux appels attendus");
+        let requetes = serveur.await.expect("faux serveur");
+        assert_eq!(requetes.len(), 2, "deux appels attendus");
+        let cookies: Vec<String> = requetes.iter().map(|r| entete(r, "Cookie")).collect();
         assert!(
             !cookies[0].contains("sid="),
             "aucune session n'est encore ouverte au premier appel"
@@ -1628,6 +1735,179 @@ mod tests {
         assert!(
             cookies[1].contains("arl="),
             "l'ARL doit rester a cote du sid, pas etre remplace par lui"
+        );
+    }
+
+    /// 🔴 Fuites de français — l'appel passerelle ne réclame plus du français.
+    ///
+    /// La ligne fautive : `deezer.rs:176`,
+    /// `.header("Accept-Language", "fr-FR,fr;q=0.9,en;q=0.8")`, écrite en dur,
+    /// sur TOUS les appels et pour TOUS les comptes.
+    ///
+    /// Les deux propriétés que ce témoin tient, sur le fil :
+    ///
+    /// 1. le PREMIER appel — `deezer.getUserData`, avant que quoi que ce soit
+    ///    soit connu du compte — demande l'ANGLAIS. C'est le cas de repli, et
+    ///    c'est lui qui portait le défaut : il n'y a jamais eu de raison d'y
+    ///    réclamer du français ;
+    /// 2. le SECOND appel suit la langue que le compte a déclarée dans la
+    ///    réponse du premier — ici le roumain.
+    ///
+    /// Le français n'apparaît nulle part : c'est l'assertion qui rougit si la
+    /// valeur codée en dur revient.
+    #[tokio::test]
+    async fn l_appel_passerelle_suit_la_langue_du_compte_et_replie_sur_l_anglais() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![
+                // 1. deezer.getUserData : le compte est roumain.
+                r#"{"results":{"USER":{"USER_ID":42,"BLOG_NAME":"testeur","SETTING":{"global":{"language":"ro"}},"OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string(),
+                // 2. song.getData : ce qui compte est l'en-tete ENVOYE.
+                r#"{"results":{"TRACK_TOKEN":"TT"}}"#.to_string(),
+            ],
+        ));
+
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        assert!(svc.authenticate_arl(&"a".repeat(192)).await.unwrap());
+        assert_eq!(svc.langue_du_compte.as_deref(), Some("ro"));
+
+        svc.gw_api_call("song.getData", None)
+            .await
+            .expect("second appel passerelle");
+
+        let requetes = serveur.await.expect("faux serveur");
+        assert_eq!(requetes.len(), 2, "deux appels attendus");
+        let langues: Vec<String> = requetes
+            .iter()
+            .map(|r| entete(r, "Accept-Language"))
+            .collect();
+
+        assert_eq!(
+            langues[0], "en,en-US;q=0.9",
+            "rien n'est encore connu du compte : l'appel demande l'anglais, pas le français"
+        );
+        assert_eq!(
+            langues[1], "ro,ro;q=0.9,en;q=0.8",
+            "la langue du compte doit partir dans l'appel suivant"
+        );
+        for langue in &langues {
+            assert!(
+                !langue.to_ascii_lowercase().contains("fr"),
+                "aucun appel ne doit réclamer du français : {langue}"
+            );
+        }
+    }
+
+    /// Contre-épreuve : un compte FRANÇAIS garde son français.
+    ///
+    /// Le correctif ne chasse pas le français, il cesse de l'imposer. Un
+    /// compte qui se déclare francophone doit voir repartir exactement la
+    /// langue qu'il a nommée — sinon le correctif aurait simplement remplacé
+    /// une langue codée en dur par une autre.
+    #[tokio::test]
+    async fn un_compte_francais_garde_le_francais() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![
+                r#"{"results":{"USER":{"USER_ID":7,"SETTING":{"global":{"language":"fr"}},"OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string(),
+                r#"{"results":{"TRACK_TOKEN":"TT"}}"#.to_string(),
+            ],
+        ));
+
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        assert!(svc.authenticate_arl(&"a".repeat(192)).await.unwrap());
+        svc.gw_api_call("song.getData", None).await.expect("2e");
+
+        let requetes = serveur.await.expect("faux serveur");
+        assert_eq!(
+            entete(&requetes[1], "Accept-Language"),
+            "fr,fr;q=0.9,en;q=0.8"
+        );
+    }
+
+    /// Un compte MUET sur sa langue reste à l'anglais.
+    ///
+    /// La lecture de la langue est de meilleur effort : la passerelle Deezer
+    /// n'est pas un contrat public. Si elle ne dit rien, le repli doit tenir —
+    /// c'est LUI la correction, pas la lecture.
+    #[tokio::test]
+    async fn un_compte_muet_reste_a_l_anglais() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind boucle locale");
+        let port = listener.local_addr().unwrap().port();
+        let serveur = tokio::spawn(fausse_passerelle(
+            listener,
+            vec![
+                r#"{"results":{"USER":{"USER_ID":7,"OPTIONS":{"license_token":"LIC"}},"checkForm":"CF"}}"#.to_string(),
+                r#"{"results":{"TRACK_TOKEN":"TT"}}"#.to_string(),
+            ],
+        ));
+
+        let mut svc = DeezerService::new();
+        svc.set_gw_url(format!("http://127.0.0.1:{port}/ajax/gw-light.php"));
+        assert!(svc.authenticate_arl(&"a".repeat(192)).await.unwrap());
+        assert_eq!(svc.langue_du_compte, None, "rien ne doit être fabriqué");
+        svc.gw_api_call("song.getData", None).await.expect("2e");
+
+        let requetes = serveur.await.expect("faux serveur");
+        assert_eq!(entete(&requetes[1], "Accept-Language"), "en,en-US;q=0.9");
+    }
+
+    #[test]
+    fn l_entete_de_langue_se_construit_et_refuse_les_valeurs_fantaisistes() {
+        assert_eq!(entete_accept_language(None), "en,en-US;q=0.9");
+        assert_eq!(entete_accept_language(Some("RO")), "ro,ro;q=0.9,en;q=0.8");
+        assert_eq!(
+            entete_accept_language(Some("pt-BR")),
+            "pt-br,pt-br;q=0.9,en;q=0.8"
+        );
+        assert_eq!(
+            entete_accept_language(Some("en")),
+            "en,en-US;q=0.9",
+            "l'anglais ne se demande pas deux fois"
+        );
+        // Une valeur inattendue ne doit pas fabriquer d'en-tete invalide —
+        // reqwest rejetterait l'appel entier, et une langue bizarre couterait
+        // la lecture.
+        for fantaisie in ["", " ", "français", "fr_FR", "fr-", "12", "x"] {
+            assert_eq!(
+                entete_accept_language(Some(fantaisie)),
+                "en,en-US;q=0.9",
+                "« {fantaisie} » doit retomber sur l'anglais"
+            );
+        }
+    }
+
+    #[test]
+    fn la_langue_du_compte_se_lit_ou_ne_se_lit_pas() {
+        use serde_json::json;
+        assert_eq!(
+            langue_du_compte_deezer(&json!({"USER":{"SETTING":{"global":{"language":"de"}}}})),
+            Some("de".to_string())
+        );
+        assert_eq!(
+            langue_du_compte_deezer(&json!({"USER":{"SETTING":{"site":{"language":"it"}}}})),
+            Some("it".to_string())
+        );
+        assert_eq!(
+            langue_du_compte_deezer(&json!({"USER":{"USER_ID":42}})),
+            None,
+            "aucune langue nommee : ne rien fabriquer"
+        );
+        assert_eq!(
+            langue_du_compte_deezer(&json!({"USER":{"SETTING":{"global":{"language":""}}}})),
+            None
         );
     }
 
