@@ -3338,6 +3338,7 @@ mod tests {
             original_date: None,
             added_at: None,
             is_compilation: false,
+            release_type: None,
         }
     }
 

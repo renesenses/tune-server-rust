@@ -483,6 +483,33 @@ pub async fn lookup_release_detail(release_id: &str) -> Option<MBReleaseDetail> 
     parse_release_detail(&data)
 }
 
+/// Le TYPE DE SORTIE d'un groupe de sortie MusicBrainz (#4767).
+///
+/// Une seule requête, sur l'identifiant que la base porte déjà
+/// (`albums.musicbrainz_release_group_id`) : pas de recherche par
+/// titre+artiste, qui ramènerait un groupe voisin et donc un type FAUX.
+///
+/// `None` couvre les trois cas qui se valent pour l'appelant — identifiant
+/// vide, MusicBrainz muet ou en erreur, groupe de sortie sans type — et veut
+/// dire INCONNU. L'appelant laisse alors la colonne nulle : c'est l'état
+/// normal, la couverture MBID mesurée étant de 0,9 % sur le .18.
+///
+/// Le décodage lui-même vit dans [`super::release_type`], pour être testable
+/// sans réseau.
+pub async fn lookup_release_group_type(
+    release_group_id: &str,
+) -> Option<super::release_type::TypeDeSortie> {
+    if release_group_id.trim().is_empty() {
+        return None;
+    }
+    let data = mb_get(
+        &format!("release-group/{release_group_id}"),
+        &[("fmt", "json".to_string())],
+    )
+    .await?;
+    super::release_type::depuis_groupe_musicbrainz(&data)
+}
+
 pub async fn rate_limit_delay() {
     tokio::time::sleep(std::time::Duration::from_millis(MB_RATE_LIMIT_MS)).await;
 }

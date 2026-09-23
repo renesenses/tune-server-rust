@@ -1951,6 +1951,34 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
         // base qui les a deja.
         up: "",
     },
+
+    // #4767 — le TYPE DE SORTIE du disque : album, EP ou single.
+    //
+    // Sans lui, la frontiere entre « Albums principaux » et « EP & singles »
+    // demandee par FabienM n'existe pas : aucune table, aucun scan, aucun
+    // enrichissement ne portait cette information. La page de Neil Young
+    // restait donc une seule liste de 192 lignes.
+    //
+    // SOURCE : `primary-type` du GROUPE DE SORTIE MusicBrainz, dont
+    // `albums.musicbrainz_release_group_id` porte deja l'identifiant. Les
+    // `secondary-types` (Live, Compilation, Soundtrack, Remix…) ne changent
+    // JAMAIS ce type : un album live reste un album.
+    //
+    // 🔴 NUL = INCONNU, et l'inconnu est l'etat NORMAL. La couverture MBID
+    // mesuree est de 0,9 % sur le .18 et 88,4 % sur le .15 : sur la plupart
+    // des disques, MusicBrainz ne repondra pas. Aucune heuristique ne remplit
+    // cette colonne — ni le nombre de titres, ni la duree totale. C'est ecrit
+    // dans l'issue : un tri faux est pire qu'une section absente. Un client
+    // qui lit `null` doit le dire ou s'abstenir, jamais deviner.
+    //
+    // Colonne posee par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'aux migrations 79, 84, 94, 95,
+    // 96, 99, 100 et 104.
+    Migration {
+        version: 106,
+        name: "albums_type_de_sortie",
+        up: "",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -2772,6 +2800,14 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 warn!(erreur = %e, "migration_104_reprise_first_seen_at");
             }
         }
+        if migration.version == 106 {
+            // Type de sortie MusicBrainz (#4767). Sans defaut : la colonne
+            // naît NULLE partout, et NULL veut dire « inconnu ». Aucune
+            // reprise de donnees n'est possible — rien dans cette base ne
+            // porte le type d'un disque, et le deviner est justement ce que
+            // l'issue interdit.
+            add_column_if_missing(db, "albums", "release_type", "TEXT");
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -3103,6 +3139,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // `a.is_compilation`. Une base qui arriverait ici sans la colonne ferait
     // echouer TOUTES les requetes d'albums — bibliotheque vide, partout.
     add_column_if_missing(db, "albums", "is_compilation", "INTEGER DEFAULT 0");
+
+    // Type de sortie du disque (migration v106, #4767). MEME raison que la
+    // ligne ci-dessus, et c'est tout l'interet de cette passe : `select_album`
+    // NOMME desormais `a.release_type`. Une base qui arriverait ici sans la
+    // colonne ferait echouer TOUTES les requetes d'albums.
+    add_column_if_missing(db, "albums", "release_type", "TEXT");
 
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
@@ -3819,6 +3861,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         68,
         "listen_history_contexte_service_et_nom",
         include_str!("../../migrations/postgres/068_listen_history_contexte_service_et_nom.sql"),
+    ),
+    // Jumelle de la SQLite 106 (#4767). Numero libre remesure DANS LE CODE,
+    // entree par entree de cette liste — un `ls migrations/postgres` ment ici
+    // depuis la 54, qui est une entree `concat!` sans fichier.
+    (
+        69,
+        "albums_type_de_sortie",
+        include_str!("../../migrations/postgres/069_albums_type_de_sortie.sql"),
     ),
 ];
 
@@ -5467,6 +5517,88 @@ mod tests {
         );
     }
 
+    /// #4767 — la migration 106 pose `albums.release_type`, sur une base
+    /// NEUVE comme sur une base ANCIENNE.
+    ///
+    /// Les deux cas comptent et ne passent pas par le meme chemin : une base
+    /// neuve recoit la colonne du `CORE_SCHEMA`, une base ancienne du bloc de
+    /// version 106 (`add_column_if_missing`) puis de la passe de surete.
+    /// Sans l'un des deux, `album_repo::sql::select_album` — qui NOMME
+    /// desormais `a.release_type` — ferait echouer TOUTES les requetes
+    /// d'albums : bibliotheque vide, partout.
+    #[test]
+    fn la_migration_106_pose_le_type_de_sortie_sur_base_neuve_et_ancienne() {
+        let colonnes = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(albums)").unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        // 1. Base NEUVE : schema complet puis migrations.
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        let c = colonnes(&neuve);
+        assert!(
+            c.iter().any(|x| x == "release_type"),
+            "base neuve : `albums.release_type` manque ({c:?})"
+        );
+
+        // 2. Base ANCIENNE : une table `albums` d'avant la 106, sans la
+        //    colonne. C'est le parc des testeurs.
+        let ancienne = SqliteDb::open_in_memory().unwrap();
+        ancienne
+            .execute_batch("CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            .unwrap();
+        run_migrations(&ancienne).unwrap();
+        let c = colonnes(&ancienne);
+        assert!(
+            c.iter().any(|x| x == "release_type"),
+            "base ancienne : `albums.release_type` manque ({c:?})"
+        );
+
+        // 3. Le SELECT commun des albums doit se PREPARER sur les DEUX :
+        //    SQLite refuse a la preparation une colonne qui n'existe pas.
+        for (nom, db) in [("neuve", &neuve), ("ancienne", &ancienne)] {
+            let conn = db.connection().lock().unwrap();
+            conn.prepare(crate::db::album_repo::sql::select_album())
+                .unwrap_or_else(|e| panic!("base {nom} : `select_album` echoue — {e}"));
+        }
+
+        // 4. Jumelle PostgreSQL. Ce test lit les SOURCES, donc il vaut sans la
+        //    feature `postgres`.
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "069_albums_type_de_sortie.sql";
+        assert!(
+            racine.join("migrations/postgres").join(fichier).exists(),
+            "la jumelle PG {fichier} n'existe pas"
+        );
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains(fichier),
+            "{fichier} n'est pas enregistree dans PG_MIGRATIONS"
+        );
+        assert!(
+            ce_fichier.contains("(\n        69,"),
+            "le rang PG attendu a bouge"
+        );
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        // Le numero ecrit DANS le script doit etre celui de son entree : c'est
+        // lui qui marque `schema_version` cote PostgreSQL. La 052 l'avait
+        // oublie et la base se croyait une version en arriere pour toujours
+        // (#3699).
+        assert!(
+            sql_pg.contains("VALUES (69, 'albums_type_de_sortie')"),
+            "le script PG marque un autre numero dans schema_version"
+        );
+        assert!(
+            sql_pg.contains("ADD COLUMN IF NOT EXISTS release_type TEXT"),
+            "la jumelle PG ne pose pas la colonne"
+        );
+    }
+
     #[test]
     fn migration_count_matches() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -5923,7 +6055,11 @@ mod tests {
         // Renumerotee 67 -> 68 a la promotion vers rc/v0.9.162 (PR #4735) :
         // la 67 etait prise par `favoris_premiere_vue_locale` (web #1060),
         // fusionnee dans la rc pendant que ce lot etait en PR.
-        assert_eq!(pg_latest_version(), 68, "latest PG migration must be 68");
+        // 69 : `albums_type_de_sortie` (#4767), jumelle de la SQLite 106.
+        // Pose `albums.release_type` — sans elle, aucune base PostgreSQL ne
+        // recevrait la colonne que `album_repo::sql::select_album` NOMME
+        // desormais, et TOUTES les requetes d'albums tomberaient sur ce parc.
+        assert_eq!(pg_latest_version(), 69, "latest PG migration must be 69");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

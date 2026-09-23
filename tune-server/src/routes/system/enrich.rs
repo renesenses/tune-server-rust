@@ -355,6 +355,61 @@ pub(super) async fn enrich_bios(
 }
 
 // ---------------------------------------------------------------------------
+// POST /system/enrich-release-types — type de sortie des albums (#4767)
+// ---------------------------------------------------------------------------
+
+/// Remplit `albums.release_type` depuis MusicBrainz, pour les albums dont le
+/// groupe de sortie est déjà connu.
+///
+/// 🔴 Sans ce champ, la frontière entre « Albums principaux » et
+/// « EP & singles » demandée par FabienM n'existe pas.
+///
+/// Ce que la réponse annonce est MESURÉ avant de lancer la passe :
+/// `candidats` est le nombre d'albums qui ont un
+/// `musicbrainz_release_group_id` et pas encore de type. Les autres — la
+/// grande majorité sur une bibliothèque locale, la couverture MBID mesurée
+/// étant de 0,9 % sur le .18 — ne sont pas candidats et resteront de type
+/// INCONNU : rien dans cette base ne dit leur type, et le deviner est
+/// exactement ce que l'issue interdit.
+///
+/// Tâche de fond, enregistrée dans le registre RAII existant
+/// (`background_tasks.begin`) comme les passes de biographies et d'images :
+/// pas un second mécanisme. Elle respecte la limite d'UNE requête par seconde
+/// de MusicBrainz via `musicbrainz_release::rate_limit_delay`, le même délai
+/// que les autres passes MusicBrainz du dépôt.
+pub(super) async fn enrich_release_types(State(state): State<AppState>) -> impl IntoResponse {
+    let is_premium = match gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    // Le compte est pris AVANT que la passe soit lancée : il décrit la
+    // bibliothèque telle que l'utilisateur vient de la soumettre.
+    let candidats = repo.albums_sans_type_de_sortie().unwrap_or_default().len();
+
+    let db = state.backend.clone();
+    let guard = state.background_tasks.begin(
+        "types_de_sortie",
+        "Type de sortie des albums…",
+        "enrichment",
+    );
+    tokio::spawn(async move {
+        let _guard = guard;
+        tune_core::metadata::release_type::remplir_types_depuis_musicbrainz(db).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "release_type_enrichment_started",
+            "candidats": candidats,
+            "premium": is_premium,
+        })),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // POST /system/enrich-metadata — extended file metadata extraction
 // ---------------------------------------------------------------------------
 

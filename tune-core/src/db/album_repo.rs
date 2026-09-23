@@ -12,12 +12,13 @@ pub mod sql {
     use super::SqlDialect;
 
     /// ⚠️ L'ordre des colonnes EST le contrat de [`super::row_to_album`], qui
-    /// lit par index. `is_compilation` est en 24 ; une éventuelle colonne 25
-    /// (`added_at`) reste tolérée par `row_to_album` : toute colonne ajoutée
-    /// ici doit l'être AVANT `FROM`, et `row_to_album` mis à jour dans le
-    /// même mouvement.
+    /// lit par index. `is_compilation` est en 24, `release_type` en 25 ;
+    /// `added_at` n'est JAMAIS dans cette liste — elle est attachée après
+    /// coup par [`super::AlbumRepo::added_at_by_ids`] (#3397). Toute colonne
+    /// ajoutée ici doit l'être AVANT `FROM`, et `row_to_album` mis à jour
+    /// dans le même mouvement.
     pub fn select_album() -> &'static str {
-        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres, a.is_compilation FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
+        "SELECT a.id, a.title, a.artist_id, ar.name, a.year, a.original_year, a.genre, a.disc_count, a.track_count, a.cover_path, a.source, a.source_id, a.label, a.catalog_number, a.barcode, a.format, a.sample_rate, a.bit_depth, a.bio, a.musicbrainz_release_id, a.musicbrainz_release_group_id, a.release_date, a.original_date, a.genres, a.is_compilation, a.release_type FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id"
     }
 
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
@@ -69,7 +70,7 @@ pub mod sql {
 
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date, is_compilation) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO albums (title, artist_id, year, original_year, genre, genres, disc_count, track_count, cover_path, source, source_id, label, catalog_number, barcode, format, sample_rate, bit_depth, bio, musicbrainz_release_id, musicbrainz_release_group_id, release_date, original_date, is_compilation, release_type) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -93,6 +94,7 @@ pub mod sql {
             d.placeholder(21),
             d.placeholder(22),
             d.placeholder(23),
+            d.placeholder(24),
         )
     }
 
@@ -470,6 +472,35 @@ pub mod sql {
 
     pub fn list_without_bio_without_mbid() -> &'static str {
         "SELECT a.id, a.title, ar.name FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id WHERE (a.bio IS NULL OR a.bio = '') AND (a.musicbrainz_release_group_id IS NULL OR a.musicbrainz_release_group_id = '') AND a.source = 'local' ORDER BY a.id"
+    }
+
+    /// Les albums dont le GROUPE DE SORTIE MusicBrainz est connu mais dont le
+    /// type de sortie ne l'est pas (#4767).
+    ///
+    /// C'est exactement la liste des disques sur lesquels MusicBrainz a
+    /// quelque chose à dire : un album sans `musicbrainz_release_group_id`
+    /// n'est PAS candidat, et restera de type inconnu — la couverture MBID
+    /// mesurée est de 0,9 % sur le .18 et 88,4 % sur le .15. Aucune recherche
+    /// par titre+artiste ici : elle ramènerait un groupe de sortie voisin, et
+    /// donc un type faux, ce que l'issue interdit expressément.
+    ///
+    /// Chaque entrée est `(album_id, musicbrainz_release_group_id)`, même
+    /// forme que [`list_without_bio_with_mbid`].
+    pub fn list_sans_type_de_sortie() -> &'static str {
+        "SELECT a.id, a.musicbrainz_release_group_id FROM albums a WHERE (a.release_type IS NULL OR a.release_type = '') AND a.musicbrainz_release_group_id IS NOT NULL AND a.musicbrainz_release_group_id != '' ORDER BY a.id"
+    }
+
+    /// Écrit le type de sortie d'un album (#4767).
+    ///
+    /// Paramètre lié et non littéral, contrairement à [`set_compilation`] : la
+    /// colonne est `TEXT` sur LES DEUX moteurs, donc une chaîne liée passe
+    /// sans conversion — c'est le booléen 0/1 qui posait ce problème-là.
+    pub fn set_release_type<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE albums SET release_type = {} WHERE id = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
     }
 
     /// Le PRÉDICAT de la recherche d'albums, sans projection ni bornes.
@@ -1140,7 +1171,7 @@ impl AlbumRepo {
         // type booléen et la colonne PG est un SMALLINT 0/1 (convention du
         // schéma, cf. l'en-tête de 001_initial_schema.sql).
         let is_compilation: i64 = i64::from(album.is_compilation);
-        let params: [&dyn ToSqlValue; 23] = [
+        let params: [&dyn ToSqlValue; 24] = [
             &album.title,
             &album.artist_id,
             &album.year,
@@ -1164,6 +1195,10 @@ impl AlbumRepo {
             &album.release_date,
             &album.original_date,
             &is_compilation,
+            // Type de sortie (#4767) : `None` traverse en NULL, c'est-à-dire
+            // « inconnu ». Un album créé par le scan n'en a jamais : rien dans
+            // un fichier ne le dit.
+            &album.release_type,
         ];
         Ok(self.db.execute_returning_id(&sql, &params)?)
     }
@@ -2095,6 +2130,43 @@ impl AlbumRepo {
                 )
             })
             .collect())
+    }
+
+    /// Les albums qui ont un groupe de sortie MusicBrainz mais pas encore de
+    /// type de sortie (#4767). Chaque entrée est
+    /// `(album_id, musicbrainz_release_group_id)`.
+    pub fn albums_sans_type_de_sortie(&self) -> Result<Vec<(i64, String)>, TuneError> {
+        let rows = self.db.query_many(sql::list_sans_type_de_sortie(), &[])?;
+        Ok(rows
+            .into_iter()
+            .map(|cols| {
+                (
+                    cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                    cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Pose le type de sortie d'un album (#4767).
+    ///
+    /// 🔴 N'écrit JAMAIS « inconnu » : la méthode prend un type, pas une
+    /// option. Une source qui n'a rien à dire n'appelle pas — la colonne
+    /// reste NULLE, et NULL veut dire inconnu. Sans cette règle, une passe
+    /// muette effacerait ce qu'une autre source avait su.
+    ///
+    /// Écriture ciblée, et non un `update` complet : la ligne porte des
+    /// colonnes (pochette, dates) qu'un `UPDATE` de tout depuis une copie en
+    /// cache effacerait — même raison que `reclasser_en_compilation`.
+    pub fn definir_type_de_sortie(
+        &self,
+        album_id: i64,
+        type_de_sortie: &str,
+    ) -> Result<(), TuneError> {
+        let sql = self.dialect_sql(sql::set_release_type, sql::set_release_type);
+        let params: [&dyn ToSqlValue; 2] = [&type_de_sortie, &album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
     }
 
     pub fn list_recent(&self, limit: i64) -> Result<Vec<Album>, TuneError> {
@@ -3381,12 +3453,16 @@ fn row_to_album(cols: &Vec<SqlValue>) -> Album {
         // Index 24: a.is_compilation (#1957). Voir [`drapeau_compilation`] :
         // même décodeur que les routes qui bâtissent leur JSON à la main.
         is_compilation: drapeau_compilation(cols.get(24)),
-        // Index 25: added_at — `select_album()` s'arrête à `is_compilation`,
-        // donc la colonne est absente ici (None). Le listage de la
-        // Bibliothèque la renseigne après coup, pour TOUS les tris, depuis
-        // `added_at_by_ids` (#3397 ; auparavant depuis la seule première
-        // passe du tri par date, #1269).
-        added_at: cols.get(25).and_then(|v| v.as_f64()),
+        // Index 25: a.release_type (#4767). Le mot que MusicBrainz ou le
+        // service a donné, tel quel ; NULL ⇒ `None`, c'est-à-dire INCONNU.
+        // Contrairement à `is_compilation`, pas de repli sur une valeur par
+        // défaut : il n'y en a pas d'honnête, et l'issue interdit de deviner.
+        release_type: cols.get(25).and_then(|v| v.as_string()),
+        // `added_at` n'est dans AUCUNE colonne de `select_album()` : le
+        // listage de la Bibliothèque la renseigne après coup, pour TOUS les
+        // tris, depuis `added_at_by_ids` (#3397 ; auparavant depuis la seule
+        // première passe du tri par date, #1269). Laissée à None ici.
+        added_at: None,
         disc_count: cols.get(7).and_then(|v| v.as_i64()).map(|n| n as i32),
         track_count: cols.get(8).and_then(|v| v.as_i64()).map(|n| n as i32),
         cover_path: cols.get(9).and_then(|v| v.as_string()),
@@ -5028,6 +5104,91 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(tout.len(), 2, "sans filtre, les deux albums : {tout:?}");
+    }
+
+    /// #4767 — le type de sortie s'ECRIT et se RELIT, et un album sans MBID
+    /// reste INCONNU.
+    ///
+    /// Les deux moitiés comptent : sans la première, la colonne ne sert à
+    /// rien ; sans la seconde, la section « EP & singles » se remplirait de
+    /// disques que personne n'a classés.
+    #[test]
+    fn le_type_de_sortie_s_ecrit_se_relit_et_reste_inconnu_sans_mbid() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+
+        // 1. Un album dont MusicBrainz a parlé.
+        let connu = repo
+            .create(&Album::new("Tonight's the Night".into()))
+            .unwrap();
+        assert!(
+            repo.get(connu).unwrap().unwrap().release_type.is_none(),
+            "un album fraîchement créé n'a pas de type : rien ne le dit"
+        );
+        repo.definir_type_de_sortie(connu, "album").unwrap();
+        assert_eq!(
+            repo.get(connu).unwrap().unwrap().release_type.as_deref(),
+            Some("album"),
+            "le type écrit doit se relire tel quel"
+        );
+
+        // 2. Un album sans MBID : personne ne l'a classé, il reste inconnu.
+        let inconnu = repo.create(&Album::new("Bande du grenier".into())).unwrap();
+        assert!(
+            repo.get(inconnu).unwrap().unwrap().release_type.is_none(),
+            "sans groupe de sortie MusicBrainz, le type doit rester NUL —              jamais replié sur `album` en silence (#4767)"
+        );
+
+        // 3. Le type voyage jusqu'au JSON des routes, sous son nom.
+        let j = repo.get(connu).unwrap().unwrap().to_json();
+        assert_eq!(
+            j["release_type"].as_str(),
+            Some("album"),
+            "les routes d'albums doivent publier le type : {j}"
+        );
+        let j = repo.get(inconnu).unwrap().unwrap().to_json();
+        assert!(
+            j["release_type"].is_null(),
+            "un type inconnu se publie EXPLICITEMENT à null,              pour que le client puisse le dire au lieu de deviner : {j}"
+        );
+    }
+
+    /// #4767 — la liste des candidats au remplissage ne retient QUE les
+    /// albums qui ont un groupe de sortie MusicBrainz et pas encore de type.
+    ///
+    /// Contre-épreuve : retirer la condition sur
+    /// `musicbrainz_release_group_id` ferait entrer l'album sans MBID, que la
+    /// passe ne pourrait de toute façon pas résoudre — et qu'une recherche
+    /// par titre classerait faux.
+    #[test]
+    fn seuls_les_albums_a_groupe_de_sortie_sont_candidats() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+
+        let mut avec = Album::new("On the Beach".into());
+        avec.musicbrainz_release_group_id = Some("rg-plage".into());
+        let id_avec = repo.create(&avec).unwrap();
+
+        let mut deja = Album::new("Harvest".into());
+        deja.musicbrainz_release_group_id = Some("rg-moisson".into());
+        let id_deja = repo.create(&deja).unwrap();
+        repo.definir_type_de_sortie(id_deja, "album").unwrap();
+
+        let sans = repo
+            .create(&Album::new("Cassette sans étiquette".into()))
+            .unwrap();
+
+        let candidats = repo.albums_sans_type_de_sortie().unwrap();
+        let ids: Vec<i64> = candidats.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![id_avec],
+            "un seul candidat attendu : {candidats:?}              (déjà typé = {id_deja}, sans MBID = {sans})"
+        );
+        assert_eq!(
+            candidats[0].1, "rg-plage",
+            "le groupe de sortie doit accompagner l'identifiant"
+        );
     }
 
     /// `added_at` est injecté JUSTE AVANT `FROM albums a`, donc l'ajout de
