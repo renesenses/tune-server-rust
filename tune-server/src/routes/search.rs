@@ -786,6 +786,7 @@ mod tests_pistes_de_service_i4441 {
             .register(Box::new(QobuzDeFabien));
         let reponse = federated_search(
             State(state),
+            crate::routes::active_profile::ActiveProfile(1),
             Query(SearchParams {
                 q: q.to_string(),
                 limit: None,

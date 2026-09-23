@@ -672,7 +672,12 @@ mod totaux_4663 {
     async fn appeler(state: &AppState, requete: &str) -> Value {
         let uri: axum::http::Uri = format!("/library/search?{requete}").parse().unwrap();
         let q = Query::<SearchQuery>::try_from_uri(&uri).unwrap();
-        let Json(corps) = search(State(state.clone()), q).await;
+        let Json(corps) = search(
+            State(state.clone()),
+            crate::routes::active_profile::ActiveProfile(1),
+            q,
+        )
+        .await;
         corps
     }
 
