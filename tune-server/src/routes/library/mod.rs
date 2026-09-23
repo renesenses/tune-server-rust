@@ -52,6 +52,9 @@ pub(super) struct Pagination {
 pub(super) struct SearchQuery {
     pub q: String,
     pub limit: Option<i64>,
+    /// Rang de la première ligne rendue, par famille — #4663. Absent = 0, la
+    /// réponse d'avant.
+    pub offset: Option<i64>,
 }
 
 pub(super) const API_CACHE_TTL_SECS: i64 = 86400; // 24 hours

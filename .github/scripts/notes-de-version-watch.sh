@@ -23,6 +23,10 @@
 # nait `moderation_status = 'pending'`, donc invisible, pendant que le POST
 # repond 200 — un job vert pour un fil que personne ne voit).
 #
+# Perimetre : les versions de TUNE, `vX.Y.Z` (#4461). Les releases du
+# moissonneur Roon, `moissonneur-vX.Y.Z`, sont ecartees — le motif et le
+# pourquoi sont dans le rapprochement, section 3.
+#
 # Variables d'environnement :
 #   FORUM_TOKEN             jeton bearer de l'API forum (obligatoire)
 #   GITHUB_REPOSITORY       owner/repo (obligatoire)
@@ -55,9 +59,13 @@ CORPS="$TRAVAIL/corps.md"
 
 # --- 1. Les versions publiees -------------------------------------------------
 #
-# `--limit 40` couvre tres largement la fenetre de 72 h : la cadence la plus
-# dense observee est de quatre versions par jour.
-if ! gh release list --repo "$GITHUB_REPOSITORY" --limit 40 \
+# La cadence la plus dense observee est de quatre versions de Tune par jour,
+# soit douze sur la fenetre de 72 h. Mais depuis le 17/09/2026 le depot publie
+# une SECONDE famille de releases — `moissonneur-v0.9.x`, une par tag de Tune —
+# qui occupe la liste sans etre examinee (voir le filtre plus bas). `--limit 60`
+# garde la meme marge qu'avant pour les versions de Tune une fois l'autre
+# famille deduite.
+if ! gh release list --repo "$GITHUB_REPOSITORY" --limit 60 \
        --json tagName,isDraft,isPrerelease,publishedAt > "$RELEASES"; then
   echo "::error::impossible de lister les releases GitHub"
   exit 1
@@ -111,6 +119,19 @@ with open(os.environ["MANQ_FILS"], encoding="utf-8") as f:
 tous = fils.get("threads", [])
 titres = [t.get("title") or "" for t in tous if t.get("type") == "release"]
 
+# Symetrique du filtre pose sur les tags (#4461) : un fil du MOISSONNEUR
+# n'annonce pas une version de Tune, et doit etre retire d'ici avant tout
+# rapprochement.
+#
+# Sans ce retrait, le fil groupe « Moissonneur Roon v0.9.155 a v0.9.159 — Notes
+# de version » vaudrait annonce pour les versions v0.9.155 ET v0.9.159 DU
+# SERVEUR : il contient « 0.9.155 » et « 0.9.159 », precedes d'un « v » qui
+# n'est ni un chiffre ni un point, donc avec les bornes que `annoncee()`
+# exige. La sonde se tairait sur deux versions de Tune reellement non
+# annoncees — un vert qui ne garde rien, et le pire des deux erreurs
+# possibles ici.
+titres = [t for t in titres if not re.search(r"moissonneur", t, re.IGNORECASE)]
+
 # Jusqu'ou cette page voit-elle ?
 #
 # L'API rend une page, pas l'histoire. Au-dela de son fil non epingle le plus
@@ -130,6 +151,36 @@ if plancher is not None and plancher > reference - fenetre:
     )
 
 
+# Quelles releases cette sonde surveille-t-elle ? (#4461)
+#
+# Le depot publie DEUX familles de releases sous le meme toit :
+#
+#   `v0.9.x`             Tune, le serveur. C'est lui qui se met a jour tout
+#                        seul chez le testeur, et c'est pour lui que les notes
+#                        de version existent : savoir ce qu'on installe.
+#
+#   `moissonneur-v0.9.x` le moissonneur Roon, un outil en ligne de commande que
+#                        le testeur telecharge a la main. Publie a part depuis
+#                        le 17/09/2026 (3e0af030) PARCE QUE ses archives, posees
+#                        sur la release de Tune, etaient prises pour l'archive
+#                        du serveur par la mise a jour automatique.
+#
+# Seule la premiere famille a des notes de version, et ce n'est pas un oubli.
+# Le moissonneur n'a pas de journal des changements : son propre numero est
+# 0.1.0, le numero du tag est emprunte au tag de Tune qui a declenche sa
+# construction, et son code n'a pas bouge entre `moissonneur-v0.9.155` et
+# `moissonneur-v0.9.159` (`git diff v0.9.155 v0.9.159 -- tools/` : vide).
+# Exiger un fil par tag reviendrait a demander cinq annonces pour zero
+# changement — et a faire figurer le moissonneur dans la liste des « versions
+# de Tune », la confusion meme que la separation des releases a supprimee.
+#
+# Le filtre est POSITIF : on nomme ce qu'on surveille, on ne liste pas ce qu'on
+# ecarte. Une troisieme famille de tags apparaitra un jour ; elle sera ignoree,
+# mais pas en silence — les tags ecartes sont dits sur la sortie d'erreur, pour
+# qu'un nouveau venu se remarque au lieu de disparaitre.
+TAG_DE_TUNE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
+
+
 def annoncee(tag):
     """Un fil parle-t-il de CETTE version, et pas d'une voisine ?
 
@@ -144,8 +195,13 @@ def annoncee(tag):
 
 
 manquantes = []
+ecartees = []
 for r in releases:
     if r.get("isDraft") or r.get("isPrerelease"):
+        continue
+    tag = r.get("tagName") or ""
+    if not TAG_DE_TUNE.match(tag):
+        ecartees.append(tag)
         continue
     publiee_le = r.get("publishedAt") or ""
     if not publiee_le or publiee_le.startswith("0001-"):
@@ -163,9 +219,16 @@ for r in releases:
     # plainte du testeur portait sur plus de huit heures.
     if age < grace:
         continue
-    if not annoncee(r["tagName"]):
+    if not annoncee(tag):
         heures = age.total_seconds() / 3600.0
-        manquantes.append((r["tagName"], publiee_le, heures))
+        manquantes.append((tag, publiee_le, heures))
+
+if ecartees:
+    sys.stderr.write(
+        "Releases ecartees — pas des versions de Tune, pas de notes attendues : "
+        + ", ".join(sorted(ecartees))
+        + "\n"
+    )
 
 for tag, publiee_le, heures in manquantes:
     print(f"{tag}\t{publiee_le}\t{heures:.1f}")

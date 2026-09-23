@@ -2524,7 +2524,16 @@ pub async fn rescan_local_audio_devices(state: &AppState) {
 
     let backend_clone = scan_backend.clone();
     let devices = match tokio::task::spawn_blocking(move || {
-        tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
+        // #4667 — un rescan FORCÉ en WASAPI sur une configuration ASIO est un
+        // sondage, pas une lecture : il ne doit pas réécrire le backend
+        // « actif » que publient la fiche système et le rapport de bogue.
+        if is_asio_configured {
+            tune_core::outputs::local::sans_noter_le_backend_observe(|| {
+                tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
+            })
+        } else {
+            tune_core::outputs::local::list_audio_devices_with_backend(&backend_clone)
+        }
     })
     .await
     {
@@ -4239,6 +4248,47 @@ mod tests_battement_profil_throttle {
             )
             .is_none(),
             "un 401 ne doit RIEN retenir : le prochain cycle doit repartir"
+        );
+    }
+}
+
+/// #4667 — le rescan périodique forcé en WASAPI sur une configuration ASIO
+/// énumère SOUS `sans_noter_le_backend_observe` : sans quoi il réécrit toutes
+/// les 120 s le backend « actif » publié par la fiche système et le rapport de
+/// bogue (`requested=asio, active=WASAPI` pendant que `bras_asio` joue). La
+/// règle elle-même est éprouvée dans `tune-core` (`backend_fallback_tests`) ;
+/// ici on tient son BRANCHEMENT, faute de pouvoir exécuter un rescan ASIO
+/// ailleurs que sous Windows.
+#[cfg(test)]
+mod rescan_force_ne_note_pas_le_backend_4667 {
+    #[test]
+    fn le_rescan_force_enumere_sans_noter_le_backend_observe() {
+        let source = include_str!("background.rs");
+        let production = source
+            .split(&format!("#[cfg({})]", "test"))
+            .next()
+            .expect("source vide");
+        let debut = production
+            .find("pub async fn rescan_local_audio_devices(")
+            .expect("rescan_local_audio_devices introuvable");
+        let corps = &production[debut..];
+        let fin = corps
+            .find("let zone_repo")
+            .expect("la suite du rescan après l'énumération");
+        let enumeration = &corps[..fin];
+        let garde = enumeration
+            .find("if is_asio_configured {")
+            .expect("l'énumération doit distinguer le rescan forcé");
+        let apres_garde = &enumeration[garde..];
+        let sondage = apres_garde
+            .find("sans_noter_le_backend_observe(")
+            .expect("le rescan forcé doit énumérer sous sans_noter_le_backend_observe (#4667)");
+        let liste = apres_garde
+            .find("list_audio_devices_with_backend(")
+            .expect("l'énumération");
+        assert!(
+            sondage < liste,
+            "l'énumération forcée doit être DANS sans_noter_le_backend_observe"
         );
     }
 }

@@ -193,6 +193,28 @@ path = "tests/albums_upnp_visibles_4146.rs"
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"
 
+# Fuites de français — les seize collections intelligentes livrées portent une
+# clé stable à côté de leur nom. `autotests = false` en tête de ce manifeste :
+# sans cette cible, ni le témoin ni sa contre-épreuve (« une collection
+# renommée ne reçoit aucune clé ») ne seraient JAMAIS compilés.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "collections_cle_stable"
+path = "tests/collections_cle_stable.rs"
+
+# Fuites de français — le genre et le pays d'une station voyagent en clé et en
+# code, et le libellé du genre suit la langue de la requête. `autotests =
+# false` en tête de ce manifeste : sans cette cible, ni le témoin ni sa
+# contre-épreuve de traduction ne seraient JAMAIS compilés.
+#
+# Rangée au MILIEU du manifeste, pas en queue : deux lots qui ajoutent chacun
+# leur cible à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "radios_libelles_localises"
+path = "tests/radios_libelles_localises.rs"
+
 # #4577 — un favori Bandcamp posé une fois se retrouve la fois suivante.
 # `autotests = false` en tête de ce manifeste : sans cette cible le fichier ne
 # serait JAMAIS compilé, et la garde ne serait exécutée par personne.
@@ -286,6 +308,13 @@ required-features = ["postgres"]
 name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
 required-features = ["postgres"]
+
+# #4625 — la vue par dossiers compte et liste les pistes découpées par une
+# feuille CUE (`file_path` NULL). `autotests = false` plus haut : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "dossier_cue_4625"
+path = "tests/dossier_cue_4625.rs"
 
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
@@ -803,3 +832,40 @@ path = "tests/bug_report_captures_4564.rs"
 [[test]]
 name = "etiquettes_types_et_playlists"
 path = "tests/etiquettes_types_et_playlists.rs"
+
+# #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
+# routeur réel. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "compensation_de_niveau_4685"
+path = "tests/compensation_de_niveau_4685.rs"
+
+# #4684 — les préréglages nommés du crossfeed (`/crossfeed/presets`) et les
+# bornes publiées par `GET /zones/{id}/dsp` (#4683). `autotests = false` en tête
+# de ce manifeste : sans cette cible, ce fichier ne serait JAMAIS compilé.
+[[test]]
+name = "crossfeed_presets_4684"
+path = "tests/crossfeed_presets_4684.rs"
+
+# #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
+# et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
+# cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "pg_scan_converge_4602"
+path = "tests/pg_scan_converge_4602.rs"
+
+# « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
+# faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
+# plus haut : sans cette cible, la garde du refus préalable (501 avant tout
+# appel réseau) ne serait compilée par personne.
+[[test]]
+name = "suppression_playlist_de_service"
+path = "tests/suppression_playlist_de_service.rs"
+
+# Le cloisonnement par profil du gestionnaire de playlists — dont la FUSION.
+# Le fichier existait depuis #3073, mais `autotests = false` plus haut le
+# laissait hors compilation : la garde qui interdit de fusionner la playlist
+# d'un autre profil n'était exécutée par personne.
+[[test]]
+name = "playlist_manager_cloisonnement_par_profil"
+path = "tests/playlist_manager_cloisonnement_par_profil.rs"

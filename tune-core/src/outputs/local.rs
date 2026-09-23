@@ -411,8 +411,25 @@ pub struct LocalOutput {
     /// what mute restores. Kept apart from `volume` so a ReplayGain
     /// attenuation never looks like the slider moved on its own.
     user_volume: Arc<AtomicU32>,
-    /// ReplayGain factor for the current track, in milli-units (1000 = 1.0).
+    /// ReplayGain factor for the current track, in milli-units (1000 = 1.0),
+    /// déjà multiplié par la compensation de niveau (#4685) — c'est ce que
+    /// lisent les boucles de rendu. Le ReplayGain SEUL est dans
+    /// `replaygain_seul`.
     rg_factor: Arc<AtomicU32>,
+    /// #4685 — le facteur ReplayGain tel que l'orchestrateur l'a posé, avant
+    /// compensation, en millièmes. Gardé à part pour que la compensation se
+    /// recompose quand l'égaliseur ou le crossfeed changent en cours de piste,
+    /// sans relire la piste.
+    replaygain_seul: AtomicU32,
+    /// #4685 — la zone qui joue demande-t-elle la compensation de niveau ?
+    /// Posé par l'orchestrateur à chaque lecture (`zone_{id}_level_compensation`,
+    /// vrai par défaut).
+    compensation_de_niveau: AtomicBool,
+    /// #4685 — le gain MOYEN de l'égaliseur et du crossfeed installés, en
+    /// millièmes : ce que le DSP fait au niveau moyen entre le point de mesure
+    /// du crête-mètre et le volume. Partagé avec le `PlaybackManager` comme
+    /// `volume` (voir [`Self::gain_moyen_du_dsp`]).
+    gain_moyen_dsp: Arc<AtomicU32>,
     /// Volume stored before mute, so unmute can restore it
     pre_mute_volume: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
@@ -667,6 +684,10 @@ fn effective_volume_units(user_units: u32, rg_units: u32, dop: bool) -> u32 {
 /// +6 dB agit pourtant dès que le curseur descend un peu, ce qui rend le
 /// réglage inexplicable depuis l'écran.
 ///
+/// Depuis #4685, `rg_units` porte aussi la compensation de niveau de
+/// l'égaliseur et du crossfeed : c'est elle, surtout, que le rabot mange à
+/// volume plein.
+///
 /// Une ligne par recalcul, et seulement quand le rabot mord : le recalcul
 /// n'arrive qu'au changement de volume, de piste ou de bascule DoP, jamais par
 /// bloc audio — ce n'est pas un `warn!` dans un rappel temps réel.
@@ -731,8 +752,91 @@ impl LocalOutput {
     /// downcast `LocalOutput` without importing `OutputTarget`.
     pub fn set_replaygain_factor(&self, factor: f64) {
         let f = (factor.clamp(0.0, 4.0) * 1000.0).round() as u32;
-        self.rg_factor.store(f, Ordering::SeqCst);
-        self.recompute_effective_volume();
+        self.replaygain_seul.store(f, Ordering::SeqCst);
+        self.recalculer_la_compensation();
+    }
+
+    /// #4685 — armer ou désarmer la compensation de niveau pour la zone qui
+    /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture et
+    /// quand l'interrupteur change, comme `set_pure_bypass`.
+    pub fn set_compensation_de_niveau(&self, active: bool) {
+        self.compensation_de_niveau.store(active, Ordering::Relaxed);
+        self.recalculer_la_compensation();
+    }
+
+    /// #4685 — recomposer le gain de rendu depuis le DSP installé.
+    ///
+    /// L'égaliseur et le crossfeed changent le niveau MOYEN (réserve
+    /// anti-écrêtage de l'un, Side retiré par l'autre). Leur gain moyen est
+    /// un nombre fixe, calculé par chaque processeur depuis son filtre ; la
+    /// compensation est son inverse, et elle est rendue ICI, dans le facteur
+    /// que les rappels multiplient APRÈS le DSP — donc avec le même rabot à
+    /// l'unité que le ReplayGain ([`effective_volume_units`]). C'est ce qui la
+    /// rend incapable d'écrêter : le DSP sort sous la pleine échelle, et le
+    /// volume effectif ne dépasse jamais 1. Le prix est connu et dit au
+    /// journal (`local_gain_rabote_a_l_unite`) : à volume plein, une
+    /// compensation positive ne peut rien rendre.
+    ///
+    /// Appelée à chaque installation d'un processeur, d'un facteur ReplayGain
+    /// ou d'un changement d'interrupteur — jamais par bloc audio.
+    ///
+    /// Ce que le calcul suppose : un flux STÉRÉO pour le crossfeed (le seul
+    /// cas où `apply_local_dsp` l'applique) ; un flux mono avec un crossfeed
+    /// installé serait compensé à tort. Sous PURE (et en DoP, où
+    /// `effective_volume_units` rend l'unité de toute façon) le DSP est
+    /// contourné : rien à compenser.
+    fn recalculer_la_compensation(&self) {
+        let dsp_db = if self.pure_bypass.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            let eq_db = self
+                .eq
+                .lock()
+                .ok()
+                .and_then(|e| e.as_ref().map(|p| p.gain_moyen_db()))
+                .unwrap_or(0.0);
+            let cf_db = self
+                .crossfeed
+                .lock()
+                .ok()
+                .and_then(|c| c.as_ref().map(|p| p.gain_moyen_db()))
+                .unwrap_or(0.0);
+            eq_db + cf_db
+        };
+        let dsp_db = if dsp_db.is_finite() { dsp_db } else { 0.0 };
+        let en_millemes = |db: f64| (10.0_f64.powf(db / 20.0) * 1000.0).round();
+        self.gain_moyen_dsp.store(
+            en_millemes(dsp_db).clamp(0.0, 64_000.0) as u32,
+            Ordering::SeqCst,
+        );
+        let compensation = if self.compensation_de_niveau.load(Ordering::Relaxed) {
+            -dsp_db
+        } else {
+            0.0
+        };
+        let rg = self.replaygain_seul.load(Ordering::SeqCst) as f64;
+        // Borné à ×64 : le produit est de toute façon raboté à l'unité par
+        // `effective_volume_units`, la borne ne protège que l'`u32`.
+        let compose = (rg * 10.0_f64.powf(compensation / 20.0)).clamp(0.0, 64_000.0);
+        let compose = compose.round() as u32;
+        // Une lecture installe ReplayGain, crossfeed et égaliseur l'un après
+        // l'autre : ne recalculer (et ne journaliser un rabot) que si le
+        // facteur a réellement bougé. Rien d'autre ne peut avoir rendu
+        // `volume` périmé : ses seuls écrivains (`set_volume`, `set_mute`, la
+        // bascule DoP) le recalculent eux-mêmes depuis `rg_factor`.
+        if self.rg_factor.swap(compose, Ordering::SeqCst) != compose {
+            self.recompute_effective_volume();
+        }
+    }
+
+    /// #4685 — le gain MOYEN du DSP installé, en millièmes, partagé comme
+    /// [`Self::gain_de_rendu`]. Le crête-mètre mesure AVANT l'égaliseur et le
+    /// crossfeed : sans ce facteur, la compensation rendue par le volume
+    /// apparaîtrait sur l'aiguille alors que la réserve qu'elle compense n'y
+    /// apparaît pas — +10 dB fantômes sur « Rock ». Voir
+    /// `PlaybackManager::brancher_le_gain_moyen_du_dsp`.
+    pub fn gain_moyen_du_dsp(&self) -> Arc<AtomicU32> {
+        self.gain_moyen_dsp.clone()
     }
 
     fn recompute_effective_volume(&self) {
@@ -832,6 +936,12 @@ impl LocalOutput {
             volume: Arc::new(AtomicU32::new(1000)),
             user_volume: Arc::new(AtomicU32::new(1000)),
             rg_factor: Arc::new(AtomicU32::new(1000)),
+            replaygain_seul: AtomicU32::new(1000),
+            // Même défaut que le réglage de zone : une sortie construite hors
+            // chemin de lecture compense aussi, mais sans DSP installé le
+            // facteur vaut 1 et rien ne change.
+            compensation_de_niveau: AtomicBool::new(true),
+            gain_moyen_dsp: Arc::new(AtomicU32::new(1000)),
             pre_mute_volume: Arc::new(AtomicU32::new(1000)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
@@ -886,6 +996,7 @@ impl LocalOutput {
     /// two tracks takes effect on the next one.
     pub fn set_eq(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
         *self.eq.lock().unwrap() = eq;
+        self.recalculer_la_compensation();
     }
 
     /// Remplacer l'égaliseur **pendant** la lecture, en emportant l'historique
@@ -902,14 +1013,18 @@ impl LocalOutput {
     /// pas d'historique à conserver, et celui de la piste précédente serait
     /// faux.
     pub fn replace_eq_live(&self, eq: Option<super::super::audio::eq::EqProcessor>) {
-        let mut emplacement = self.eq.lock().unwrap();
-        match (eq, emplacement.as_ref()) {
-            (Some(mut neuf), Some(precedent)) => {
-                neuf.inherit_state_from(precedent);
-                *emplacement = Some(neuf);
+        {
+            let mut emplacement = self.eq.lock().unwrap();
+            match (eq, emplacement.as_ref()) {
+                (Some(mut neuf), Some(precedent)) => {
+                    neuf.inherit_state_from(precedent);
+                    *emplacement = Some(neuf);
+                }
+                (suivant, _) => *emplacement = suivant,
             }
-            (suivant, _) => *emplacement = suivant,
         }
+        // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
+        self.recalculer_la_compensation();
     }
 
     pub fn has_eq(&self) -> bool {
@@ -981,7 +1096,7 @@ impl LocalOutput {
     /// callbacks de rendu, hors de `apply_local_dsp`.
     #[cfg(test)]
     pub(crate) fn replaygain_units_for_test(&self) -> u32 {
-        self.rg_factor.load(Ordering::SeqCst)
+        self.replaygain_seul.load(Ordering::SeqCst)
     }
 
     /// Empaquette `(taux, canaux)` pour [`Self::current_format`]. Un taux
@@ -1037,6 +1152,9 @@ impl LocalOutput {
     /// zones on the same output keep it.
     pub fn set_pure_bypass(&self, bypass: bool) {
         self.pure_bypass.store(bypass, Ordering::Relaxed);
+        // #4685 — un DSP contourné ne change aucun niveau : sa compensation
+        // doit tomber avec lui.
+        self.recalculer_la_compensation();
     }
 
     /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
@@ -1114,6 +1232,7 @@ impl LocalOutput {
     /// after the convolver, only for stereo streams.
     pub fn set_crossfeed(&self, cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>) {
         *self.crossfeed.lock().unwrap() = cf;
+        self.recalculer_la_compensation();
     }
 
     /// Remplacer le crossfeed **pendant** la lecture, en emportant les lignes à
@@ -1132,14 +1251,18 @@ impl LocalOutput {
         &self,
         cf: Option<super::super::audio::crossfeed::CrossfeedProcessor>,
     ) {
-        let mut emplacement = self.crossfeed.lock().unwrap();
-        match (cf, emplacement.as_ref()) {
-            (Some(mut neuf), Some(precedent)) => {
-                neuf.inherit_state_from(precedent);
-                *emplacement = Some(neuf);
+        {
+            let mut emplacement = self.crossfeed.lock().unwrap();
+            match (cf, emplacement.as_ref()) {
+                (Some(mut neuf), Some(precedent)) => {
+                    neuf.inherit_state_from(precedent);
+                    *emplacement = Some(neuf);
+                }
+                (suivant, _) => *emplacement = suivant,
             }
-            (suivant, _) => *emplacement = suivant,
         }
+        // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
+        self.recalculer_la_compensation();
     }
 
     pub fn has_crossfeed(&self) -> bool {

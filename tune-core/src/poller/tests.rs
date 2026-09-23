@@ -2083,3 +2083,104 @@ fn une_sortie_non_temps_reel_jamais_demarree_ne_voit_pas_sa_fin_acceptee() {
         "chemin renderer classique : inchangé"
     );
 }
+
+/// #4645 — reprise après décrochage du renderer EN COURS de lecture.
+///
+/// Le cas nominal est la mesure de Sevy Tabroc (0.9.159, macOS, darTZeel
+/// LHC-51, zone 10) : WAV de 272 651 970 octets pour une piste de 1 030 431 ms,
+/// connexion fermée après 239 140 864 octets servis, renderer arrêté à
+/// 900 000 ms. Avant ce correctif, Tune coupait la zone et la file s'arrêtait.
+#[test]
+fn reprise_apres_renderer_cale_la_mesure_de_sevy_autorise_la_reprise() {
+    assert!(
+        decisions::reprise_apres_renderer_cale_autorisee(
+            None,
+            900_000,
+            1_030_431,
+            239_140_864,
+            Some(272_651_970),
+        ),
+        "le décrochage mesuré le 21/09 doit donner lieu à une reprise, pas à une coupure"
+    );
+}
+
+#[test]
+fn reprise_apres_renderer_cale_refusee_quand_la_piste_na_jamais_joue() {
+    // Position nulle : c'est un démarrage mort (#2394), qui se rejoue depuis
+    // le début par l'AUTRE branche. Reprendre à 0 ici doublerait la relance.
+    assert!(
+        !decisions::reprise_apres_renderer_cale_autorisee(None, 0, 1_030_431, 0, Some(272_651_970),),
+        "une piste qui n'a jamais joué relève du démarrage mort, pas de la reprise"
+    );
+}
+
+#[test]
+fn reprise_apres_renderer_cale_refusee_sur_un_total_inconnu() {
+    // `None` = le gestionnaire de flux ne sait pas. Une ignorance ne prouve
+    // pas que le flux est incomplet : on ne reprend pas dessus (#2394).
+    assert!(
+        !decisions::reprise_apres_renderer_cale_autorisee(
+            None,
+            900_000,
+            1_030_431,
+            239_140_864,
+            None
+        ),
+        "un total d'octets inconnu ne doit pas déclencher de reprise"
+    );
+}
+
+#[test]
+fn reprise_apres_renderer_cale_refusee_quand_le_flux_est_complet() {
+    assert!(
+        !decisions::reprise_apres_renderer_cale_autorisee(
+            None,
+            900_000,
+            1_030_431,
+            272_651_970,
+            Some(272_651_970),
+        ),
+        "un flux entièrement servi n'est pas un décrochage de livraison"
+    );
+}
+
+#[test]
+fn reprise_apres_renderer_cale_refusee_a_quelques_secondes_de_la_fin() {
+    // 1 030 431 - 1 020 000 = 10 431 ms restants, sous RENDERER_CALE_RESTE_MIN_MS.
+    assert!(
+        !decisions::reprise_apres_renderer_cale_autorisee(
+            None,
+            1_020_000,
+            1_030_431,
+            239_140_864,
+            Some(272_651_970),
+        ),
+        "trop près de la fin : on coupe au lieu de renvoyer un ordre de lecture"
+    );
+}
+
+#[test]
+fn reprise_apres_renderer_cale_une_seule_par_fenetre() {
+    // Même décrochage, mais une reprise a eu lieu il y a 30 s : on ne
+    // martèle pas un appareil ou un réseau qui ne suit pas.
+    assert!(
+        !decisions::reprise_apres_renderer_cale_autorisee(
+            Some(30),
+            900_000,
+            1_030_431,
+            239_140_864,
+            Some(272_651_970),
+        ),
+        "deux décrochages dans la même fenêtre : la zone est coupée comme avant"
+    );
+    assert!(
+        decisions::reprise_apres_renderer_cale_autorisee(
+            Some(600),
+            900_000,
+            1_030_431,
+            239_140_864,
+            Some(272_651_970),
+        ),
+        "hors fenêtre, la reprise redevient permise"
+    );
+}

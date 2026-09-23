@@ -1476,6 +1476,36 @@ mod tests {
         autoplay_backup_roundtrip(backend_sqlite());
     }
 
+    /// #4684 — les préréglages de crossfeed (`crossfeed_presets`, écrits par
+    /// `/crossfeed/presets`) voyagent avec la sauvegarde : exportés d'une
+    /// installation, restaurés sur une installation vierge, à l'identique.
+    #[test]
+    fn crossfeed_presets_4684_sauvegardes_et_restaures() {
+        let liste = r#"[{"id":"p1","name":"Salon","amount":0.3,"delay_ms":0.5,"created_at":1}]"#;
+        let source = backend_sqlite();
+        SettingsRepo::with_backend(source.clone())
+            .set("crossfeed_presets", liste)
+            .unwrap();
+        let snapshot = export_config(&source).unwrap();
+        assert!(
+            snapshot
+                .settings
+                .iter()
+                .any(|(k, v)| k == "crossfeed_presets" && v == liste),
+            "absents de la sauvegarde"
+        );
+
+        let cible = backend_sqlite();
+        import_config(&cible, snapshot).unwrap();
+        assert_eq!(
+            SettingsRepo::with_backend(cible)
+                .get("crossfeed_presets")
+                .unwrap()
+                .as_deref(),
+            Some(liste)
+        );
+    }
+
     // Executed by the existing pg_config_backup CI step, after real migrations.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]

@@ -342,6 +342,31 @@ impl PlaybackOrchestrator {
             .filter(|u| est_une_url_http(u))
     }
 
+    /// Le FORMAT que l'indexation a rangé sur la ligne — `flac`, `alac`,
+    /// `mp3`… —, déduit du `res@protocolInfo` publié par le serveur média
+    /// (`routes/indexation_upnp.rs::PisteDistante::format`, écrit en phase 2).
+    ///
+    /// Même forme et même coût que [`Self::url_de_lecture_indexee`] : une
+    /// colonne, une ligne, la clé primaire. C'est d'ailleurs la MÊME ligne —
+    /// la lecture en relisait déjà l'URL et ignorait le format, alors que les
+    /// deux viennent du même DIDL.
+    ///
+    /// `None` quand la piste n'est pas indexée, quand le serveur n'a rien dit
+    /// du format, ou quand la base est illisible : trois cas où l'appelant ne
+    /// doit rien affirmer, pas trois cas où il faut deviner.
+    pub(super) fn format_indexe(&self, track_id: i64) -> Option<String> {
+        use crate::db::backend::ToSqlValue;
+        self.db
+            .query_one(
+                "SELECT format FROM tracks WHERE id = ?",
+                &[&track_id as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))
+            .filter(|f| !f.trim().is_empty())
+    }
+
     /// **#4323 — une URI qui désigne une piste de NOTRE bibliothèque doit
     /// retrouver son `track_id`, et donc son vrai titre.**
     ///
@@ -610,11 +635,24 @@ impl PlaybackOrchestrator {
         // n'ont pas d'extension : `guess_mime_from_url` retomberait sur son
         // défaut, qui se trouve être le bon. On l'affirme plutôt que d'en
         // dépendre — si ce défaut changeait, la zone recevrait un MIME faux.
+        // Le `<res>` d'un serveur média n'a, lui, PAS d'extension du tout — et
+        // le défaut `audio/mpeg` y devient `DLNA.ORG_PN=MP3`, donc du SILENCE
+        // sur le renderer. On relit ce que Tune sait déjà du format plutôt que
+        // de laisser l'URL parler seule : voir `mime_upnp`.
+        let format_indexe = (source == "upnp")
+            .then(|| req.track_id.and_then(|id| self.format_indexe(id)))
+            .flatten();
         let mime_type = if source == "bandcamp" {
             bc_quality
                 .as_ref()
                 .map(|q| q.mime_type)
                 .unwrap_or("audio/mpeg")
+        } else if source == "upnp" {
+            super::mime_upnp::mime_d_une_piste_upnp(
+                audio_url,
+                req.media_format.as_deref(),
+                format_indexe.as_deref(),
+            )
         } else {
             guess_mime_from_url(audio_url)
         };

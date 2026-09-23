@@ -88,19 +88,38 @@ fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
         .and_then(|v| v.as_string())
         .unwrap_or_else(|| "[]".into());
     let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
-    json!({
+    let nom = r.get(1).and_then(|v| v.as_string());
+    let description = r.get(7).and_then(|v| v.as_string());
+    let mut objet = json!({
         "id": r.get(0).and_then(|v| v.as_i64()),
-        "name": r.get(1).and_then(|v| v.as_string()),
+        "name": nom,
         "rules": rules,
         "match_mode": r.get(3).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
         "sort_by": r.get(4).and_then(|v| v.as_string()),
         "sort_order": normalize_sort_order(r.get(5).and_then(|v| v.as_string())),
         "max_limit": r.get(6).and_then(|v| v.as_i64()),
-        "description": r.get(7).and_then(|v| v.as_string()),
+        "description": description,
         "icon": r.get(8).and_then(|v| v.as_string()),
         "color": r.get(9).and_then(|v| v.as_string()),
         "created_at": r.get(10).and_then(|v| v.as_string()),
-    })
+    });
+    // Les seize collections du semis sont nommées en français en base
+    // (`tune-core/src/db/migrations.rs:546` et `:614`). Leur clé stable part
+    // À CÔTÉ du nom, jamais à sa place : le client la traduit et retombe sur
+    // `name` quand elle manque. Une collection renommée par l'utilisateur ne
+    // ressemble plus au semis et n'en reçoit aucune — c'est ainsi que
+    // « ne rien renommer » est tenu, sans écrire une ligne en base.
+    let (cle_nom, cle_description) = crate::collections_par_defaut::cles(
+        nom.as_deref().unwrap_or_default(),
+        description.as_deref(),
+    );
+    if let Some(cle) = cle_nom {
+        objet["name_key"] = json!(cle);
+    }
+    if let Some(cle) = cle_description {
+        objet["description_key"] = json!(cle);
+    }
+    objet
 }
 
 /// Le nombre d'albums d'une collection : ceux de la bibliothèque, **plus** les

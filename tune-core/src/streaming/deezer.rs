@@ -534,6 +534,7 @@ impl DeezerService {
                 .map(Into::into),
             track_count: item["nb_tracks"].as_u64().unwrap_or(0) as u32,
             owner: item["creator"]["name"].as_str().map(Into::into),
+            covers: Vec::new(),
         }
     }
 

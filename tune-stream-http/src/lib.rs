@@ -1204,6 +1204,12 @@ async fn serve_file(
             start,
             length,
             session.clone(),
+            debit_nominal_octets_par_seconde(
+                &info.format,
+                info.sample_rate,
+                info.bit_depth,
+                info.channels,
+            ),
         );
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
@@ -1226,7 +1232,19 @@ async fn serve_file(
         HeaderValue::from_static("DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000"),
     );
 
-    let body = build_file_body(faststart, path.to_string(), 0, file_size, session.clone());
+    let body = build_file_body(
+        faststart,
+        path.to_string(),
+        0,
+        file_size,
+        session.clone(),
+        debit_nominal_octets_par_seconde(
+            &info.format,
+            info.sample_rate,
+            info.bit_depth,
+            info.channels,
+        ),
+    );
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -1237,6 +1255,63 @@ const EN_TETE_WAV: u64 = 44;
 /// Reprises signalées au niveau WARN par session ; au-delà, DEBUG. Un
 /// renderer qui boucle en produirait des centaines par minute.
 const RANGES_HORS_TRAME_AU_JOURNAL: u32 = 3;
+
+/// #4645 — de combien l'avance de livraison doit reculer avant qu'on le dise,
+/// et combien de fois on le dit au niveau WARN.
+///
+/// Sevy Tabroc (fil 1871, darTZeel LHC-208 en DLNA, 0.9.159) : « parfois, il y
+/// a de micro coupure durant la lecture d'un morceau ». Son journal n'en porte
+/// AUCUNE trace — ni WARN, ni ERROR, pendant les quinze minutes jouées. La
+/// famine de l'anneau ne couvre que la sortie LOCALE (0 évènement sur 0 servi :
+/// elle n'a pas joué), et sur le chemin fichier entier la source n'est pas lue
+/// pendant la lecture. Rien, nulle part, ne datait une micro-coupure.
+const PAS_DE_PERTE_MS: i64 = 1_000;
+/// Pertes signalées au niveau WARN par session ; au-delà, DEBUG. Même motif
+/// que `RANGES_HORS_TRAME_AU_JOURNAL` : un renderer qui hoquette en continu
+/// en produirait des centaines.
+const PERTES_AU_JOURNAL: u32 = 3;
+
+/// Débit nominal d'un flux PCM servi en WAV, en octets par seconde.
+///
+/// `None` hors WAV, et c'est délibéré : sur un format compressé la
+/// correspondance octets ↔ temps n'est pas linéaire, et une avance calculée
+/// dessus mentirait. Mieux vaut ne rien dire que dire un chiffre faux — même
+/// contrat que le `debit_kio_s` sous la milliseconde.
+fn debit_nominal_octets_par_seconde(
+    format: &str,
+    sample_rate: u32,
+    bit_depth: u16,
+    channels: u16,
+) -> Option<u32> {
+    if format != "wav" {
+        return None;
+    }
+    let octets_par_trame = u32::from(channels) * u32::from(bit_depth / 8);
+    let debit = sample_rate.checked_mul(octets_par_trame)?;
+    (debit > 0).then_some(debit)
+}
+
+/// De combien de millisecondes d'audio la livraison est-elle EN AVANCE sur
+/// l'horloge ? Négatif : elle a pris du retard.
+///
+/// C'est la quantité que le renderer a devant lui. Tant qu'elle reste stable,
+/// il joue sans manquer de rien ; quand elle recule, il a cessé de jouer
+/// pendant tout ce qu'elle a perdu.
+fn avance_de_livraison_ms(octets_servis: u64, octets_par_seconde: u32, elapsed_ms: u64) -> i64 {
+    let audio_ms = (u128::from(octets_servis) * 1000 / u128::from(octets_par_seconde)) as i64;
+    audio_ms - elapsed_ms as i64
+}
+
+/// Terrain perdu depuis le sommet de l'avance.
+///
+/// C'est LA mesure qui manquait. Une avance absolue ne dit rien d'un renderer
+/// qui tire au rythme exact de la lecture sans jamais prendre d'avance — le
+/// profil du darTZeel, justement : l'instrument serait resté muet sur le cas
+/// qui l'a motivé. Le recul depuis le sommet, lui, vaut le temps pendant
+/// lequel le renderer n'a rien eu à jouer, qu'il ait tampon ou non.
+fn terrain_perdu_ms(avance_max_ms: i64, avance_ms: i64) -> i64 {
+    (avance_max_ms - avance_ms).max(0)
+}
 
 /// #4455 — de combien d'octets une reprise `Range: bytes=N-` d'un WAV tombe
 /// À CÔTÉ de la grille des trames PCM. `0` : alignée, ou dans l'en-tête, ou
@@ -1362,16 +1437,32 @@ struct ChronoServiceFichier {
     servis: u64,
     debut: std::time::Instant,
     premier_octet_ms: Option<u64>,
+    /// #4645 — débit nominal du flux, quand il est connu (WAV seulement).
+    /// `None` : aucune avance n'est calculée et aucun champ n'est publié.
+    octets_par_seconde: Option<u32>,
+    /// Sommet de l'avance de livraison, et son creux.
+    avance_max_ms: i64,
+    avance_min_ms: i64,
+    /// Dernier recul déjà porté au journal, pour n'annoncer que les pas
+    /// suivants et non chaque octet.
+    perte_signalee_ms: i64,
+    /// Nombre de reculs franchis.
+    pertes: u32,
 }
 
 impl ChronoServiceFichier {
-    fn new(stream_id: String, demande: u64) -> Self {
+    fn new(stream_id: String, demande: u64, octets_par_seconde: Option<u32>) -> Self {
         Self {
             stream_id,
             demande,
             servis: 0,
             debut: std::time::Instant::now(),
             premier_octet_ms: None,
+            octets_par_seconde,
+            avance_max_ms: 0,
+            avance_min_ms: 0,
+            perte_signalee_ms: 0,
+            pertes: 0,
         }
     }
 
@@ -1380,6 +1471,54 @@ impl ChronoServiceFichier {
             self.premier_octet_ms = Some(self.debut.elapsed().as_millis() as u64);
         }
         self.servis += n;
+        self.mesurer_le_terrain();
+    }
+
+    /// Suit l'avance de livraison et porte au journal chaque pas de terrain
+    /// perdu (#4645).
+    ///
+    /// Une PAUSE du renderer produit la même forme : il cesse de tirer,
+    /// l'avance recule. La ligne ne dit donc pas « micro-coupure », elle dit
+    /// « la livraison a perdu du terrain » — c'est l'état de la zone, côté
+    /// sondeur, qui tranche entre les deux. Nommer plus fort que ce qu'on
+    /// mesure ferait de cette ligne un faux témoin.
+    fn mesurer_le_terrain(&mut self) {
+        let Some(octets_par_seconde) = self.octets_par_seconde else {
+            return;
+        };
+        let elapsed_ms = self.debut.elapsed().as_millis() as u64;
+        let avance = avance_de_livraison_ms(self.servis, octets_par_seconde, elapsed_ms);
+        self.avance_max_ms = self.avance_max_ms.max(avance);
+        self.avance_min_ms = self.avance_min_ms.min(avance);
+        let perte = terrain_perdu_ms(self.avance_max_ms, avance);
+        if perte < self.perte_signalee_ms + PAS_DE_PERTE_MS {
+            return;
+        }
+        self.perte_signalee_ms = perte;
+        self.pertes += 1;
+        if self.pertes <= PERTES_AU_JOURNAL {
+            warn!(
+                stream_id = %self.stream_id,
+                perte_ms = perte,
+                avance_ms = avance,
+                avance_max_ms = self.avance_max_ms,
+                octets = self.servis,
+                elapsed_ms,
+                occurrence = self.pertes,
+                "service_fichier_perd_du_terrain — le renderer a cessé de tirer \
+                 pendant tout ce que l'avance a perdu (pause comprise) ; \
+                 l'état de la zone tranche (#4645)"
+            );
+        } else {
+            debug!(
+                stream_id = %self.stream_id,
+                perte_ms = perte,
+                avance_ms = avance,
+                elapsed_ms,
+                occurrence = self.pertes,
+                "service_fichier_perd_du_terrain"
+            );
+        }
     }
 }
 
@@ -1408,6 +1547,15 @@ impl Drop for ChronoServiceFichier {
             elapsed_ms,
             debit_kio_s,
             complet = self.servis >= self.demande,
+            // #4645 — le bilan du terrain. `None` hors WAV : un `None`
+            // n'imprime PAS le champ, la ligne dit « je ne sais pas »
+            // plutôt que « zéro », comme `debit_kio_s` sous la ms.
+            avance_max_ms = self.octets_par_seconde.map(|_| self.avance_max_ms),
+            avance_min_ms = self.octets_par_seconde.map(|_| self.avance_min_ms),
+            perte_ms = self
+                .octets_par_seconde
+                .map(|_| terrain_perdu_ms(self.avance_max_ms, self.avance_min_ms)),
+            pertes = self.octets_par_seconde.map(|_| self.pertes),
             "service_fichier_termine"
         );
     }
@@ -1419,9 +1567,10 @@ fn build_file_body(
     start: u64,
     length: u64,
     byte_counter: std::sync::Arc<StreamSession>,
+    octets_par_seconde: Option<u32>,
 ) -> Body {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length);
+    let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length, octets_par_seconde);
     Body::from_stream(async_stream::stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut remaining = length;
@@ -4008,3 +4157,84 @@ mod stream_url_distant_tests {
 
 #[cfg(test)]
 mod long_wav_4016;
+
+/// #4645 — la mesure du terrain perdu pendant le service d'un fichier.
+///
+/// Les chiffres de référence sont ceux du journal de Sevy Tabroc du
+/// 21/09/2026 (Tune 0.9.159, darTZeel LHC-51 en DLNA, zone 10) : WAV
+/// 44,1 kHz / 24 bits stéréo, 272 651 970 octets demandés pour une piste de
+/// 1 030 431 ms, connexion fermée après 239 140 864 octets et 929 402 ms.
+#[cfg(test)]
+mod terrain_perdu_4645 {
+    use super::{avance_de_livraison_ms, debit_nominal_octets_par_seconde, terrain_perdu_ms};
+
+    /// Le nominal du WAV de Sevy : 44 100 × 2 × 3 = 264 600 octets/s.
+    /// C'est ce chiffre qui a permis de lire son journal — comparé à lui, le
+    /// débit servi (251,3 Kio/s, soit 257 331 o/s) est SOUS le temps réel,
+    /// alors qu'il paraît sain comparé aux autres pistes de la matinée.
+    #[test]
+    fn le_nominal_du_wav_de_sevy_vaut_264600_octets_par_seconde() {
+        assert_eq!(
+            debit_nominal_octets_par_seconde("wav", 44_100, 24, 2),
+            Some(264_600)
+        );
+        // Les pistes 16 bits de la même matinée, à 176 400 o/s : deuxième
+        // nuage de débits du journal (173,9 à 176,5 Kio/s).
+        assert_eq!(
+            debit_nominal_octets_par_seconde("wav", 44_100, 16, 2),
+            Some(176_400)
+        );
+    }
+
+    /// Hors WAV, on ne rend RIEN plutôt qu'un chiffre faux : sur un format
+    /// compressé la correspondance octets ↔ temps n'est pas linéaire.
+    #[test]
+    fn hors_wav_aucun_nominal_nest_rendu() {
+        for format in ["flac", "mp3", "aac", "dsf", ""] {
+            assert_eq!(
+                debit_nominal_octets_par_seconde(format, 44_100, 24, 2),
+                None,
+                "{format} : un nominal calculé sur un format compressé mentirait"
+            );
+        }
+    }
+
+    /// Un flux servi exactement au temps réel n'a ni avance ni retard.
+    #[test]
+    fn une_livraison_au_temps_reel_na_aucune_avance() {
+        assert_eq!(avance_de_livraison_ms(264_600, 264_600, 1_000), 0);
+        assert_eq!(avance_de_livraison_ms(2_646_000, 264_600, 10_000), 0);
+    }
+
+    /// La mesure qui manquait au journal de Sevy : à la fermeture, la
+    /// livraison accusait 25,6 s de retard sur l'horloge.
+    #[test]
+    fn a_la_fermeture_la_livraison_de_sevy_accusait_25_secondes_de_retard() {
+        let avance = avance_de_livraison_ms(239_140_864, 264_600, 929_402);
+        assert_eq!(avance, -25_620);
+        assert!(
+            avance < 0,
+            "la livraison est passée SOUS le temps réel : c'est ce que le journal ne disait pas"
+        );
+    }
+
+    /// Le terrain perdu se compte depuis le sommet, pas depuis zéro — sans
+    /// quoi un renderer qui ne prend jamais d'avance (le profil du darTZeel)
+    /// ne produirait aucune mesure.
+    #[test]
+    fn le_terrain_se_compte_depuis_le_sommet_pas_depuis_zero() {
+        // Renderer sans tampon : sommet à 0, retard de 25,6 s ⇒ 25,6 s perdues.
+        assert_eq!(terrain_perdu_ms(0, -25_620), 25_620);
+        // Renderer avec 4 s de tampon, retombé à 0 : il a perdu ses 4 s,
+        // alors qu'une lecture en absolu aurait dit « avance nulle, rien à
+        // signaler ».
+        assert_eq!(terrain_perdu_ms(4_000, 0), 4_000);
+    }
+
+    /// Gagner de l'avance n'est pas perdre du terrain.
+    #[test]
+    fn regagner_de_lavance_ne_compte_aucune_perte() {
+        assert_eq!(terrain_perdu_ms(3_000, 3_000), 0);
+        assert_eq!(terrain_perdu_ms(3_000, 9_000), 0);
+    }
+}

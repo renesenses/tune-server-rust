@@ -125,13 +125,24 @@ pub mod sql {
     /// Albums homonymes déjà rattachés à un AUTRE dossier, avec leur dossier
     /// et les numéros de piste qu'ils occupent : de quoi décider si le dossier
     /// courant est l'éclat d'une même compilation (#1440).
+    ///
+    /// 🔴 #4602 — l'agrégat passe par [`SqlDialect::group_concat`]. Écrit
+    /// `GROUP_CONCAT(t.track_number)` en dur, il n'existait que sur SQLite :
+    /// PostgreSQL refusait la requête ENTIÈRE, l'erreur remontait par `?`
+    /// jusqu'à `get_or_create_for_folder_with_track`, et la piste entrait en
+    /// base SANS album (`BUG_album_create_failed`). Comme la requête ne part
+    /// que pour un dossier qui porte une pochette et des numéros de piste —
+    /// presque toute la bibliothèque —, un scan sur PostgreSQL laissait la
+    /// majorité des albums sans ligne. `STRING_AGG` exige du texte, d'où le
+    /// `CAST` : il est aussi valide sur SQLite, qui rend la même liste.
     pub fn scattered_candidates<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT a.id, a.folder_path, \
-             (SELECT GROUP_CONCAT(t.track_number) FROM tracks t WHERE t.album_id = a.id) \
+             (SELECT {} FROM tracks t WHERE t.album_id = a.id) \
              FROM albums a \
              WHERE LOWER(a.title) = LOWER({}) AND a.folder_path IS NOT NULL \
              AND a.folder_path <> {} LIMIT 50",
+            d.group_concat("CAST(t.track_number AS TEXT)", ","),
             d.placeholder(1),
             d.placeholder(2)
         )
@@ -485,16 +496,39 @@ pub mod sql {
         )
     }
 
-    /// Recherche d'albums, PAGINÉE. `ORDER BY a.id` est un ordre total —
-    /// sans lui une page peut redonner ce que la précédente avait déjà rendu.
-    /// Emplacements 7 et 8 : `LIMIT` et `OFFSET`.
+    /// Recherche d'albums, PAGINÉE, la plus PERTINENTE d'abord.
+    ///
+    /// L'ordre reste TOTAL (#3189) — `a.id` départage en dernier, sans quoi une
+    /// page pourrait redonner ce que la précédente avait déjà rendu.
+    ///
+    /// 🔴 #4665 — il n'était QUE `a.id` : l'ordre d'insertion au scan. Le
+    /// prédicat retient un album dès que le titre d'UNE de ses pistes contient
+    /// la saisie ; sur 79 614 pistes, « VA » attrape Vaughan, Evans, Savage…
+    /// et les 40 albums que l'écran demande étaient les 40 plus anciens de ce
+    /// lot, sans raison d'être ceux cherchés (jfpaquet, fil 1880). Le rang :
+    ///
+    ///   0. le TITRE de l'album commence par la saisie (« VA - Ladies Jazz ») ;
+    ///   1. le titre la contient ;
+    ///   2. le nom de l'artiste de l'album la contient ;
+    ///   3. le reste : FTS, genre, MBID, titre d'une piste.
+    ///
+    /// Emplacements 7 (motif de préfixe), 8 et 9 (motif `%…%`), puis 10 et 11 :
+    /// `LIMIT` et `OFFSET`. SQLite lit des `?` positionnels : un motif utilisé
+    /// deux fois se passe deux fois.
     pub fn search<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE {} ORDER BY a.id LIMIT {} OFFSET {}",
+            "{} WHERE {} ORDER BY CASE \
+             WHEN LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) THEN 0 \
+             WHEN LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) THEN 1 \
+             WHEN LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) THEN 2 \
+             ELSE 3 END, a.id LIMIT {} OFFSET {}",
             select_album(),
             search_where(d),
             d.placeholder(7),
-            d.placeholder(8)
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11)
         )
     }
 
@@ -3222,11 +3256,14 @@ impl AlbumRepo {
     ) -> Result<Vec<Album>, TuneError> {
         let fts_query = crate::db::engine::format_fts_query(self.db.engine(), query);
         let like = crate::db::engine::motif_like(query);
+        // #4665 — le motif du rang 0 : le titre COMMENCE par la saisie.
+        let prefixe = format!("{}%", query.replace('"', "").trim());
         let trimmed = query.trim();
         let offset = offset.max(0);
         let sql = self.dialect_sql(sql::search, sql::search);
-        let params: [&dyn ToSqlValue; 8] = [
-            &fts_query, &like, &like, &like, &trimmed, &like, &limit, &offset,
+        let params: [&dyn ToSqlValue; 11] = [
+            &fts_query, &like, &like, &like, &trimmed, &like, &prefixe, &like, &like, &limit,
+            &offset,
         ];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
@@ -5086,7 +5123,8 @@ mod tests {
         // plan rend de toute façon les lignes dans l'ordre des rowid, donc
         // aucun garde de comportement local ne verrait l'`ORDER BY` partir.
         for sql in [&s_sql, &p_sql] {
-            assert!(sql.contains("ORDER BY a.id"), "{sql}");
+            // #4665 : le rang de pertinence d'abord, `a.id` départage.
+            assert!(sql.contains("END, a.id LIMIT"), "{sql}");
             assert!(sql.contains("OFFSET"), "{sql}");
         }
         // Le compte porte LITTÉRALEMENT le prédicat de la liste.
@@ -5128,6 +5166,59 @@ mod tests {
             }
         }
         assert_eq!(vus.len(), 23);
+    }
+
+    /// 🔴 #4665 — jfpaquet, fil 1880 : chercher « VA » ne fait pas remonter
+    /// les albums « VA - … ». Ici, 45 albums plus ANCIENS (plus petit `id`)
+    /// correspondent par le titre d'une de leurs pistes (« Vaughan », « Evans »)
+    /// ; les albums dont le TITRE commence par « VA » sont insérés après. Coupé
+    /// à 40 dans l'ordre `a.id`, aucun n'était rendu.
+    #[test]
+    fn la_recherche_d_albums_rend_d_abord_ceux_dont_le_titre_correspond() {
+        let db = test_db();
+        let repo = AlbumRepo::new(db.clone());
+        let tracks = crate::db::track_repo::TrackRepo::new(db);
+        for i in 0..45 {
+            let id = repo
+                .create(&Album::new(format!("Blue Note {i:03}")))
+                .unwrap();
+            let mut t = crate::db::models::Track::new(format!("Sarah Vaughan {i}"));
+            t.album_id = Some(id);
+            tracks.create(&t).unwrap();
+        }
+        let artiste = repo
+            .create(&Album::new("Ladies (Valerie June)".into()))
+            .unwrap();
+        let contient = repo
+            .create(&Album::new("Jazz Vocal VA Box".into()))
+            .unwrap();
+        let prefixe = repo.create(&Album::new("VA - Ladies Jazz".into())).unwrap();
+
+        let rendus: Vec<i64> = repo
+            .search_page("VA", 40, 0)
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.id)
+            .collect();
+        assert_eq!(
+            rendus.first(),
+            Some(&prefixe),
+            "le titre qui COMMENCE par la saisie doit venir en tête (#4665) : {rendus:?}"
+        );
+        assert!(
+            rendus.contains(&contient),
+            "le titre qui contient la saisie est coupé"
+        );
+        assert!(rendus.contains(&artiste));
+        // L'ordre reste total : la suite ne redonne rien et le total tombe juste.
+        let suite: Vec<i64> = repo
+            .search_page("VA", 40, 40)
+            .unwrap()
+            .iter()
+            .filter_map(|a| a.id)
+            .collect();
+        assert!(suite.iter().all(|id| !rendus.contains(id)));
+        assert_eq!(rendus.len() + suite.len(), 48);
     }
 
     #[test]

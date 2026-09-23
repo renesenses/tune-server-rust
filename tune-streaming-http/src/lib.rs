@@ -18,6 +18,7 @@ use tune_core::streaming::ServiceRegistry;
 use tune_core::streaming::traits::StreamingService;
 
 pub mod deezer_proxy_handler;
+pub mod etiquettes_langue;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -206,6 +207,35 @@ const CACHE_EDITORIAL: &str = "private, max-age=1800";
 ///
 /// Une erreur n'est pas mise en cache : un 502 passager deviendrait une panne
 /// de trente minutes.
+/// Comme [`svc_response_editorial`], mais le corps est d'abord relu dans la
+/// langue de la requête : tout `name` accompagné d'un `name_i18n` prend le
+/// libellé de cette langue (voir `etiquettes_langue`).
+///
+/// `Vary: Accept-Language` est posé EN MÊME TEMPS que `Cache-Control`. Sans
+/// lui, le cache navigateur de trente minutes resservirait à un lecteur
+/// roumain la copie française mise en cache par la visite précédente — le
+/// défaut corrigé ici réapparaîtrait par le cache.
+fn svc_response_editorial_localise<R: serde::Serialize>(
+    result: Result<R, tune_core::TuneError>,
+    langues: &[String],
+) -> Response {
+    let result = result.and_then(|valeur| {
+        let mut corps =
+            serde_json::to_value(valeur).map_err(|e| tune_core::TuneError::Other(e.to_string()))?;
+        etiquettes_langue::localiser(&mut corps, langues);
+        Ok(corps)
+    });
+    let est_ok = result.is_ok();
+    let mut response = svc_response_editorial(result);
+    if est_ok {
+        response.headers_mut().insert(
+            axum::http::header::VARY,
+            axum::http::HeaderValue::from_static("Accept-Language"),
+        );
+    }
+    response
+}
+
 fn svc_response_editorial<R: serde::Serialize>(
     result: Result<R, tune_core::TuneError>,
 ) -> Response {
@@ -299,7 +329,13 @@ fn memoriser_contenu_utilisateur(service: &str, ressource: &str, donnees: Value)
 /// Sans condition sur le succès : une mutation en échec côté HTTP peut avoir
 /// abouti côté service (délai dépassé), et le prix d'une purge de trop est un
 /// seul rechargement.
-fn purge_contenu_utilisateur(service: &str) {
+///
+/// 🔴 `pub` depuis le 21/09/2026. La fusion et la suppression de playlists
+/// vivent dans `tune-server` (`playlist_manager.rs`) et appellent le service
+/// SANS passer par les routes d'ici : elles ne purgeaient donc rien, et la
+/// liste rendue restait la mémorisée — jusqu'à 2 minutes. Bertrand : « Je ne
+/// vois pas la playlist résultant du merge ! ». Elle existait chez Qobuz.
+pub fn purge_contenu_utilisateur(service: &str) {
     let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
         return;
     };
@@ -851,8 +887,15 @@ async fn service_album_label(
 async fn service_playlist_tags(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    with_svc_editorial!(&state, &service, |svc| svc.get_playlist_tags().await)
+    let langues = etiquettes_langue::langues_demandees(&headers);
+    let arc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    svc_response_editorial_localise(svc.get_playlist_tags().await, &langues)
 }
 
 #[derive(Deserialize)]
@@ -883,10 +926,18 @@ async fn service_featured_playlists_by_tag(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
     Query(q): Query<ByTagQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    with_svc_editorial!(&state, &service, |svc| svc
-        .get_featured_playlists_by_tag(q.genre.as_deref())
-        .await)
+    let langues = etiquettes_langue::langues_demandees(&headers);
+    let arc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    svc_response_editorial_localise(
+        svc.get_featured_playlists_by_tag(q.genre.as_deref()).await,
+        &langues,
+    )
 }
 
 async fn service_album_context(
@@ -2922,5 +2973,112 @@ mod tests_route_rubrique_par_genre {
     async fn sans_rubrique_la_route_rend_les_nouveautes() {
         let vus = titres("essai-genre-defaut", None, None).await;
         assert_eq!(vus, vec![String::from("nouveautes|80")]);
+    }
+}
+
+/// 🔴 Fuites de français — la réponse éditoriale sort dans la langue demandée.
+///
+/// Qobuz sert ses libellés de rubriques en objet multilingue ; le connecteur
+/// n'en gardait qu'un, le français, pour tout le monde
+/// (`tune-core/src/streaming/qobuz.rs:2519`). Le faisceau voyage désormais
+/// jusqu'ici, et c'est ici — au plus près de l'affichage, là où
+/// `Accept-Language` est lisible — que la langue est choisie.
+///
+/// Trois propriétés :
+///
+/// 1. un lecteur roumain reçoit le libellé anglais, pas le français ;
+/// 2. **la contre-épreuve** : un lecteur francophone garde le sien, sinon le
+///    correctif aurait seulement déplacé la fuite ;
+/// 3. `Vary: Accept-Language` accompagne le `Cache-Control` de trente
+///    minutes — sans lui, le cache navigateur resservirait la copie française.
+#[cfg(test)]
+mod temoin_rubriques_dans_la_langue_demandee {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tune_core::streaming::traits::PlaylistTagGroup;
+
+    fn faisceau(fr: &str, en: &str) -> Option<BTreeMap<String, String>> {
+        Some(BTreeMap::from([
+            ("fr".to_string(), fr.to_string()),
+            ("en".to_string(), en.to_string()),
+        ]))
+    }
+
+    /// Les rubriques telles que Qobuz les sert : le libellé français d'origine
+    /// dans `name`, le faisceau complet à côté.
+    fn rangees() -> Vec<PlaylistTagGroup> {
+        vec![
+            PlaylistTagGroup {
+                id: "label".into(),
+                name: "Histoires de labels".into(),
+                name_i18n: faisceau("Histoires de labels", "Label Stories"),
+                playlists: Vec::new(),
+            },
+            PlaylistTagGroup {
+                id: "new".into(),
+                name: "Nouveautés".into(),
+                name_i18n: faisceau("Nouveautés", "New Releases"),
+                playlists: Vec::new(),
+            },
+        ]
+    }
+
+    async fn libelles(accept_language: &str) -> (Vec<String>, Option<String>) {
+        let mut entetes = axum::http::HeaderMap::new();
+        entetes.insert("accept-language", accept_language.parse().unwrap());
+        let langues = etiquettes_langue::langues_demandees(&entetes);
+
+        let reponse =
+            svc_response_editorial_localise(Ok::<_, tune_core::TuneError>(rangees()), &langues);
+        let vary = reponse
+            .headers()
+            .get(axum::http::header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps lisible");
+        let v: Value = serde_json::from_slice(&corps).expect("JSON");
+        let noms = v
+            .as_array()
+            .expect("un tableau de rangées")
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        (noms, vary)
+    }
+
+    #[tokio::test]
+    async fn un_lecteur_roumain_ne_recoit_plus_le_francais() {
+        let (noms, _) = libelles("ro-RO,ro;q=0.9").await;
+        assert_eq!(
+            noms,
+            vec![String::from("Label Stories"), String::from("New Releases")],
+            "le roumain n'existe pas chez Qobuz : recours à l'anglais, pas au français"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_lecteur_francophone_garde_son_libelle() {
+        // LA contre-épreuve : préférer l'anglais pour tout le monde aurait
+        // seulement déplacé la fuite d'une langue à l'autre.
+        let (noms, _) = libelles("fr-FR,fr;q=0.9").await;
+        assert_eq!(
+            noms,
+            vec![
+                String::from("Histoires de labels"),
+                String::from("Nouveautés")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn la_reponse_varie_selon_la_langue_demandee() {
+        let (_, vary) = libelles("ro").await;
+        assert_eq!(
+            vary.as_deref(),
+            Some("Accept-Language"),
+            "sans `Vary`, le cache navigateur de 30 min resservirait la copie française"
+        );
     }
 }

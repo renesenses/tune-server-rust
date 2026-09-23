@@ -90,7 +90,8 @@ pub fn descriptor(id: &str) -> Value {
         ),
         "crossfeed" => (
             "crossfeed",
-            vec!["/api/v1/zones/{zone}/dsp"],
+            // `/crossfeed` : les préréglages nommés (#4684).
+            vec!["/api/v1/zones/{zone}/dsp", "/api/v1/crossfeed"],
             "crossfeed",
             "dsp",
         ),
