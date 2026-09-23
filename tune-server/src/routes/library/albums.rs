@@ -271,6 +271,9 @@ pub(super) async fn create_album(
         // Un album créé à la main n'est pas une compilation : c'est le scan
         // qui lève ce drapeau, d'après les tags (#1957).
         is_compilation: false,
+        // Ni son type de sortie : personne ne l'a demandé, et il ne se devine
+        // pas. NULL = inconnu (#4767).
+        release_type: None,
     };
     let id = repo
         .create(&album)

@@ -56,6 +56,7 @@ fn piste(id: &str, titre: &str, artiste: &str, album: &str) -> StreamTrack {
 
 fn album(id: &str, titre: &str, artiste: &str) -> StreamAlbum {
     StreamAlbum {
+        release_type: None,
         id: id.into(),
         title: titre.into(),
         artist: artiste.into(),

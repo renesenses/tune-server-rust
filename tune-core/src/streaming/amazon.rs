@@ -217,6 +217,7 @@ impl AmazonMusicService {
             .unwrap_or("Unknown")
             .to_string();
         StreamAlbum {
+            release_type: None,
             id: data["id"]
                 .as_str()
                 .or_else(|| data["albumId"].as_str())
