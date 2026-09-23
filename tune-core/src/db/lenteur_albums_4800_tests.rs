@@ -11,16 +11,19 @@
 //!   tournant, occupée ou non. Preuve : trois lectures dont une lente, les
 //!   deux autres ne l'attendent plus.
 //!
-//! Ces tests ne dépendent que d'API STABLES du dépôt (`count_visible`,
-//! `list_filtered_seeded`, `query_one`) : ils compilent AVANT le correctif —
-//! c'est ce qui permet la contre-épreuve (rouge avant, vert après) et la
-//! mesure avant/après sur la même base.
+//! Les trois premiers témoins ne dépendent que d'API STABLES du dépôt
+//! (`count_visible`, `list_filtered_seeded`, `query_one`) : ils compilent
+//! AVANT le correctif — c'est ce qui permet la contre-épreuve (rouge avant,
+//! vert après) et la mesure avant/après sur la même base. Les suivants
+//! tiennent au correctif lui-même : le plan d'exécution, le total compté
+//! dans la même requête que la page.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::album_repo::AlbumRepo;
 use super::backend::{DbBackend, ToSqlValue};
+use super::engine::Engine;
 use super::facet_filter::{
     copie_de_moindre_qualite_exclue, hidden_albums_excluded, hidden_tracks_excluded,
 };
@@ -83,23 +86,27 @@ fn un_entier(db: &dyn DbBackend, sql: &str) -> i64 {
 /// Le banc : des MILLIERS d'albums locaux et distants, dans toutes les
 /// situations que la règle #4146 distingue.
 ///
-/// * 3 000 locaux, 300 artistes, titres `Album n` ;
-/// * 2 000 distants qui doublent un local — même artiste, titre en
+/// * 1 000 locaux, 100 artistes, titres `Album n` ;
+/// * 700 distants qui doublent un local — même artiste, titre en
 ///   MAJUSCULES pour que la casse compte (masqués) ;
-/// * 500 distants homonymes d'un AUTRE artiste (visibles) ;
-/// * 400 distants SANS artiste sur un titre local non ambigu (masqués) ;
-/// * 100 paires locales de même titre `Live n` chez deux artistes, et un
+/// * 200 distants homonymes d'un AUTRE artiste (visibles) ;
+/// * 150 distants SANS artiste sur un titre local non ambigu (masqués) ;
+/// * 50 paires locales de même titre `Live n` chez deux artistes, et un
 ///   distant sans artiste sur chacune (ambigu : visibles) ;
-/// * 1 000 distants sans aucune contrepartie (visibles) ;
-/// * 60 albums masqués à la main (`hidden_items`), pris parmi les locaux ;
+/// * 300 distants sans aucune contrepartie (visibles) ;
+/// * 40 albums masqués à la main (`hidden_items`), pris parmi les locaux ;
 /// * une piste sur un album sur deux, pour que le tri par date d'ajout et le
 ///   compteur de pistes aient matière.
+///
+/// 2 500 albums : l'ANCIENNE clause y coûte déjà des secondes (elle est en
+/// n²), c'est le prix de la comparaison — pas plus, pour que la CI reste
+/// courte.
 fn banc_d_albums_homonymes() -> SqliteDb {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     super::migrations::run_migrations(&db).unwrap();
     let mut sql = String::from("BEGIN;\n");
-    for a in 0..300 {
+    for a in 0..100 {
         sql.push_str(&format!(
             "INSERT INTO artists (id, name) VALUES ({}, 'Artiste {a}');\n",
             a + 1
@@ -115,25 +122,25 @@ fn banc_d_albums_homonymes() -> SqliteDb {
         ));
         id
     };
-    for i in 0..3_000 {
-        album(&mut sql, &format!("Album {i}"), Some(i % 300 + 1), "local");
+    for i in 0..1_000 {
+        album(&mut sql, &format!("Album {i}"), Some(i % 100 + 1), "local");
     }
-    for i in 0..2_000 {
-        album(&mut sql, &format!("ALBUM {i}"), Some(i % 300 + 1), "upnp");
+    for i in 0..700 {
+        album(&mut sql, &format!("ALBUM {i}"), Some(i % 100 + 1), "upnp");
     }
-    for i in 0..500 {
+    for i in 0..200 {
         album(&mut sql, &format!("Album {i}"), Some(9001), "upnp");
     }
-    for i in 2_500..2_900 {
+    for i in 800..950 {
         album(&mut sql, &format!("album {i}"), None, "upnp");
     }
-    for j in 0..100 {
+    for j in 0..50 {
         album(&mut sql, &format!("Live {j}"), Some(9001), "local");
         album(&mut sql, &format!("Live {j}"), Some(9002), "local");
         album(&mut sql, &format!("live {j}"), None, "upnp");
     }
-    for i in 0..1_000 {
-        album(&mut sql, &format!("Distant {i}"), Some(i % 300 + 1), "upnp");
+    for i in 0..300 {
+        album(&mut sql, &format!("Distant {i}"), Some(i % 100 + 1), "upnp");
     }
     let dernier = id;
     for (n, id) in (1_001..=dernier).enumerate() {
@@ -144,9 +151,9 @@ fn banc_d_albums_homonymes() -> SqliteDb {
             ));
         }
     }
-    // Les masqués à la main sont pris parmi les 3 000 locaux — tous visibles
+    // Les masqués à la main sont pris parmi les 1 000 locaux — tous visibles
     // par ailleurs — pour que leur retrait se compte simplement.
-    for id in (1_001..=4_000).step_by(50).take(60) {
+    for id in (1_001..=2_000).step_by(20).take(40) {
         sql.push_str(&format!(
             "INSERT INTO hidden_items (item_type, item_id) VALUES ('album', {id});\n"
         ));
@@ -175,11 +182,11 @@ fn la_liste_et_le_total_sont_ceux_de_l_ancienne_clause() {
     let total_apres = repo.count_visible().unwrap();
     // Le banc a de la matière : des masqués ET des visibles de chaque sorte.
     let tous = un_entier(&db, "SELECT COUNT(*) FROM albums");
-    assert_eq!(tous, 7_200, "taille du banc");
+    assert_eq!(tous, 2_500, "taille du banc");
     assert_eq!(
         total_avant,
-        3_000 + 200 + 500 + 100 + 1_000 - 60,
-        "l'ancienne clause masque 2 000 + 400 doublons et 60 masqués à la main ; \
+        1_000 + 100 + 200 + 50 + 300 - 40,
+        "l'ancienne clause masque 700 + 150 doublons et 40 masqués à la main ; \
          si ce nombre bouge, c'est le BANC qui a changé, pas la règle"
     );
     assert_eq!(total_apres, total_avant, "count_visible ≠ ancienne clause");
@@ -217,14 +224,14 @@ fn la_liste_et_le_total_sont_ceux_de_l_ancienne_clause() {
         "liste entière ≠ ancienne clause"
     );
     assert_eq!(
-        liste_apres(100, 1_500),
-        liste_avant(100, 1_500),
+        liste_apres(100, 800),
+        liste_avant(100, 800),
         "page du milieu ≠ ancienne clause"
     );
     assert_eq!(
-        liste_apres(100, 4_500),
-        liste_avant(100, 4_500),
-        "dernière page ≠ ancienne clause"
+        liste_apres(100, 1_550),
+        liste_avant(100, 1_550),
+        "dernière page, incomplète ≠ ancienne clause"
     );
 
     // Les pistes suivent leur album : même règle, même résultat.
@@ -239,13 +246,112 @@ fn la_liste_et_le_total_sont_ceux_de_l_ancienne_clause() {
     );
     let pistes_apres = TrackRepo::new(db.clone()).count_visible().unwrap();
     assert!(
-        pistes_avant > 1_000 && pistes_avant < 3_600,
+        pistes_avant > 500 && pistes_avant < 1_250,
         "matière : {pistes_avant}"
     );
     assert_eq!(
         pistes_apres, pistes_avant,
         "pistes visibles ≠ ancienne clause"
     );
+}
+
+/// Le plan d'exécution SQLite, une ligne par étape.
+fn plan(db: &dyn DbBackend, sql: &str) -> String {
+    db.query_many(&format!("EXPLAIN QUERY PLAN {sql}"), &[])
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|v| {
+                    v.as_string()
+                        .unwrap_or_else(|| v.as_i64().map_or(String::new(), |n| n.to_string()))
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// La cause 1, lue dans le PLAN : l'ancienne clause parcourait `albums loc`
+/// en entier pour chaque ligne ; la nouvelle la cherche par
+/// `idx_albums_title`. Ce n'est pas une garde de texte sur le SQL — c'est
+/// le moteur qui dit ce qu'il fera.
+#[test]
+fn la_sous_requete_de_doublon_cherche_par_l_index_des_titres() {
+    let db = banc_d_albums_homonymes();
+    let ancien = plan(
+        &db,
+        &format!(
+            "SELECT COUNT(*) FROM albums a WHERE {} AND {}",
+            hidden_albums_excluded(),
+            ancienne_exclusion_albums()
+        ),
+    );
+    let nouveau = plan(&db, &super::album_repo::sql::count_visible(Engine::Sqlite));
+    assert!(
+        ancien.contains("SCAN loc"),
+        "l'ancienne clause doit parcourir `loc` (sinon le banc ne reproduit pas le .18) :\n{ancien}"
+    );
+    assert!(
+        nouveau.contains("SEARCH loc USING") && nouveau.contains("idx_albums_title"),
+        "la nouvelle clause doit chercher `loc` par idx_albums_title :\n{nouveau}"
+    );
+    assert!(
+        !nouveau.contains("SCAN loc"),
+        "plus aucun parcours complet de `loc` :\n{nouveau}"
+    );
+    // Le texte PostgreSQL, lui, garde `LOWER` : pas de `COLLATE NOCASE` là-bas.
+    let pg = super::album_repo::sql::count_visible(Engine::Postgres);
+    assert!(pg.contains("LOWER(loc.title) = LOWER(a.title)") && !pg.contains("NOCASE"));
+}
+
+/// #4800 — le total compté dans la MÊME requête que la page vaut
+/// `count_visible`, page pleine ou incomplète, tri aléatoire compris ; la
+/// page elle-même ne change pas ; au-delà de la fin, pas de total.
+#[test]
+fn le_total_de_la_page_est_celui_du_compteur() {
+    let db = banc_d_albums_homonymes();
+    let repo = AlbumRepo::new(db.clone());
+    let attendu = repo.count_visible().unwrap();
+    let ids_de = |albums: &[super::models::Album]| -> Vec<i64> {
+        albums.iter().filter_map(|a| a.id).collect()
+    };
+    for (limit, offset, sort, seed) in [
+        (100, 0, "added_at", None),
+        (100, 800, "title", None),
+        (100, 1_550, "title", None),
+        (2_000, 0, "added_at", None),
+        (50, 0, "random", Some(42)),
+    ] {
+        let (page, total) = repo
+            .list_filtered_seeded_avec_total(
+                limit, offset, sort, "asc", None, None, None, false, None, seed,
+            )
+            .unwrap();
+        assert_eq!(
+            total,
+            Some(attendu),
+            "limit {limit} offset {offset} sort {sort}"
+        );
+        let sans_total = repo
+            .list_filtered_seeded(
+                limit, offset, sort, "asc", None, None, None, false, None, seed,
+            )
+            .unwrap();
+        assert_eq!(
+            ids_de(&page),
+            ids_de(&sans_total),
+            "la page ne bouge pas avec le total"
+        );
+    }
+    let (page, total) = repo
+        .list_filtered_seeded_avec_total(
+            100, 10_000, "title", "asc", None, None, None, false, None, None,
+        )
+        .unwrap();
+    assert!(page.is_empty());
+    assert_eq!(total, None, "une page vide ne porte pas de total");
 }
 
 /// Preuve (c) : trois lectures dont une LENTE — les deux autres ne doivent
@@ -335,22 +441,6 @@ fn banc_reel_4800() {
         .unwrap();
     eprintln!("albums par source : {par_source:?}");
 
-    let plan = |sql: &str| -> String {
-        db.query_many(&format!("EXPLAIN QUERY PLAN {sql}"), &[])
-            .unwrap()
-            .iter()
-            .map(|r| {
-                r.iter()
-                    .map(|v| {
-                        v.as_string()
-                            .unwrap_or_else(|| v.as_i64().map_or(String::new(), |n| n.to_string()))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            })
-            .collect::<Vec<_>>()
-            .join("\n  ")
-    };
     let chrono = |nom: &str, f: &dyn Fn() -> i64| {
         for _ in 0..3 {
             let debut = Instant::now();
