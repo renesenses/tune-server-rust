@@ -461,6 +461,21 @@ pub trait StreamingService: Send + Sync {
     /// ou un refus de l'API (#2160). C'est le seul endroit où cette traduction
     /// peut vivre une fois pour toutes : chaque service la referait sinon, et
     /// aucun ne la faisait.
+    /// Combien d'éléments PAR CATÉGORIE [`Self::search_page`] rend réellement
+    /// pour une `limit` demandée (#4803).
+    ///
+    /// La recherche fédérée pagine chaque service avec un curseur : la page
+    /// suivante commence à `offset + ce nombre`. Avancer du nombre DEMANDÉ
+    /// quand le service en a servi moins ferait un TROU — Qobuz ramène un
+    /// `limit=1000` à 500 : avancer de 1000 sauterait les rangs 500 à 999.
+    ///
+    /// Défaut : la borne de [`Self::search_page`] par défaut,
+    /// [`limite_sans_pagination`]. Un service qui redéfinit `search_page`
+    /// avec un autre plafond doit redéfinir aussi cette méthode.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        limite_sans_pagination(limit)
+    }
+
     async fn search_page(
         &self,
         query: &str,
