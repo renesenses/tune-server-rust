@@ -176,11 +176,21 @@ pub enum CrossfeedConstraint {
     /// est sans effet et l'écran doit le dire.
     PureMode,
     /// Zone RÉSEAU dont le flux progressif n'est pas armé. Depuis LAT-F1, le
-    /// crossfeed d'une zone réseau est appliqué par le relais du bras
-    /// progressif ; ce bras n'est emprunté que si l'opt-in global
-    /// `dsp_progressif_reseau` (Réglages → Lecture) est coché. À froid, la
-    /// zone part encore par le fichier pré-transcodé, qui ne porte aucun
-    /// crossfeed — et c'est un garde-fou du dépôt, pas un oubli.
+    /// crossfeed d'une piste de la BIBLIOTHÈQUE est appliqué par le relais du
+    /// bras progressif ; ce bras n'est emprunté que si l'opt-in global
+    /// `dsp_progressif_reseau` (Réglages → Lecture) est coché. À froid, une
+    /// piste de la bibliothèque part encore par le fichier pré-transcodé, qui
+    /// ne porte aucun crossfeed — et c'est un garde-fou du dépôt, pas un oubli.
+    ///
+    /// ⚠️ Motif PARTIEL, et c'est le seul (#2742, 23/09) : il ne VERROUILLE pas
+    /// le contrôle ([`Self::verrouille`]). Les bras STREAMING (Qobuz, Tidal,
+    /// YouTube) chargent la chaîne de la zone par `load_streaming_dsp`, dont le
+    /// dernier étage est le crossfeed, et la pré-transcodent dès qu'un étage
+    /// est actif — SANS consulter cet opt-in. Sur ces flux le crossfeed
+    /// s'entend donc, opt-in désarmé. Le déclarer indisponible verrouillait
+    /// l'intensité et le retard d'un effet que l'auditeur Qobuz entendait
+    /// — « même plus la possibilité de régler intensité et retard » (Tades,
+    /// 0.9.151, zone DLNA, source Qobuz).
     NetworkProgressiveOff,
     /// Zone RÉSEAU dont le renderer n'a pas annoncé le LPCM à la profondeur
     /// servie (sonde `GetProtocolInfo`, réponse inconcluante comprise). Le
@@ -225,10 +235,12 @@ impl CrossfeedConstraint {
                  reprendra effet dès que le mode PURE sera désactivé."
             }
             Self::NetworkProgressiveOff => {
-                "Sur une zone réseau, le crossfeed passe par le flux progressif. \
-                 Activez « DSP progressif réseau » dans Réglages → Lecture pour \
-                 l'entendre ; sans cette option la zone reçoit un fichier \
-                 pré-transcodé, qui ne porte pas le crossfeed."
+                "Sur cette zone réseau, le crossfeed s'applique aux flux Qobuz, \
+                 Tidal et YouTube, traités avant l'envoi. Les pistes de votre \
+                 bibliothèque partent en revanche sans lui tant que le flux \
+                 progressif n'est pas activé : réglez « Égaliseur et \
+                 traitements → réseau » sur « Au fil de l'eau » dans les \
+                 Réglages pour l'entendre aussi sur elles."
             }
             Self::NetworkRendererNoLpcm => {
                 "Ce lecteur réseau n'annonce pas savoir lire le PCM non compressé \
@@ -237,6 +249,18 @@ impl CrossfeedConstraint {
                  Le réglage est conservé et vaudra pour une autre sortie."
             }
         }
+    }
+
+    /// Ce motif doit-il VERROUILLER le contrôle ?
+    ///
+    /// Vrai pour tous, sauf [`Self::NetworkProgressiveOff`] : c'est le seul
+    /// motif sous lequel une partie du son de la zone porte quand même le
+    /// crossfeed (les flux des services, voir la variante). Verrouiller
+    /// l'intensité et le retard d'un effet qui s'entend est le défaut de
+    /// #2742 pris à l'envers — l'écran dit « sans effet » pendant que le
+    /// renderer le reçoit, et l'auditeur ne peut plus le régler.
+    pub fn verrouille(self) -> bool {
+        !matches!(self, Self::NetworkProgressiveOff)
     }
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
@@ -261,14 +285,19 @@ impl CrossfeedConstraint {
 pub struct CrossfeedStatus {
     /// Ce que l'utilisateur a demandé (la case `enabled` du réglage persisté).
     pub requested: bool,
-    /// Ce qui sera réellement appliqué au son de cette zone.
+    /// Ce qui sera réellement appliqué au son de cette zone — au moins à une
+    /// partie de ce qu'elle joue quand `reason` porte un motif partiel
+    /// (`NetworkProgressiveOff` : les flux des services, pas les fichiers).
     pub effective: bool,
-    /// `true` dès que la contrainte s'applique — **y compris quand la case
+    /// `true` dès qu'une contrainte VERROUILLANTE s'applique
+    /// ([`CrossfeedConstraint::verrouille`]) — **y compris quand la case
     /// était déjà décochée**. C'est ce champ qui doit VERROUILLER le contrôle :
     /// la question n'est pas « le réglage a-t-il été changé ? » mais « ce
     /// réglage a-t-il encore un sens sur cette zone ? ».
     pub unavailable: bool,
-    /// Pourquoi. `None` = le réglage est honoré tel quel.
+    /// Pourquoi. `None` = le réglage est honoré tel quel. Un motif avec
+    /// `unavailable == false` est une RÉSERVE : le réglage s'entend, mais pas
+    /// sur tout ce que la zone joue.
     pub reason: Option<CrossfeedConstraint>,
     /// La même chose en clair, pour un écran qui n'a pas de table de traduction.
     pub detail: Option<&'static str>,
@@ -339,7 +368,11 @@ pub fn crossfeed_status(
         // sans preuve est exactement le défaut de #2742 pris à l'envers.
         Some(CrossfeedConstraint::NonLocalOutput)
     };
-    let unavailable = reason.is_some();
+    // Un motif n'est pas forcément un verrou (#2742, 23/09) : sous
+    // `NetworkProgressiveOff`, les flux des services portent le crossfeed.
+    // Le motif reste publié — il dit ce qui manque aux pistes de la
+    // bibliothèque — mais le contrôle reste réglable.
+    let unavailable = reason.is_some_and(CrossfeedConstraint::verrouille);
     CrossfeedStatus {
         requested,
         effective: requested && !unavailable,
@@ -563,52 +596,71 @@ mod tests {
         assert_eq!(eteint.reason, None);
     }
 
-    /// 1. Zone réseau + case COCHÉE + flux progressif DÉSARMÉ : le réglage est
-    ///    sans effet, **et la raison est donnée**. C'est tout le ticket : avant,
-    ///    le premier point était vrai et le second manquait.
+    /// 1. Zone réseau + case COCHÉE + flux progressif DÉSARMÉ : le réglage
+    ///    RESTE réglable, et la réserve est donnée (#2742, 23/09).
     ///
-    ///    Le motif a changé avec LAT-F1 : ce n'est plus « pas de sortie locale »
-    ///    (une zone réseau PEUT désormais entendre le crossfeed) mais « le flux
-    ///    progressif n'est pas armé ». La nuance compte pour l'utilisateur :
-    ///    l'ancien message le renvoyait à changer de zone, le nouveau à cocher
-    ///    une case.
+    ///    Jusqu'à la v0.9.163, ce cas rendait `unavailable: true` — donc un
+    ///    client qui verrouille l'intensité et le retard — au motif que « la
+    ///    zone reçoit un fichier pré-transcodé, qui ne porte pas le
+    ///    crossfeed ». Vrai pour une piste de la BIBLIOTHÈQUE, faux pour un flux
+    ///    Qobuz, Tidal ou YouTube : leurs bras chargent `load_streaming_dsp`,
+    ///    dont le dernier étage est le crossfeed, sans lire l'opt-in. La
+    ///    diaphonie produite par cette chaîne est MESURÉE dans
+    ///    `orchestrator/tests.rs`
+    ///    (`une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742`).
+    ///    Tades, 0.9.151, zone DLNA, source Qobuz : « même plus la possibilité
+    ///    de régler intensité et retard ».
     #[test]
-    fn une_sortie_reseau_sans_flux_progressif_dit_que_le_crossfeed_n_agit_pas() {
+    fn une_sortie_reseau_sans_flux_progressif_reste_reglable_avec_sa_reserve() {
         let s = crossfeed_status(true, false, true, false, false, false);
         assert!(
-            !s.effective,
-            "sans le bras progressif, une zone réseau n'a aucun chemin"
+            !s.unavailable,
+            "les flux des services portent le crossfeed sans l'opt-in : \
+             verrouiller le contrôle interdirait de régler un effet qui s'entend"
         );
         assert!(
-            s.unavailable,
-            "et le contrôle doit être annoncé comme INDISPONIBLE, pas honoré"
+            s.effective,
+            "case cochée, et une partie du son de la zone porte le crossfeed"
         );
-        assert_eq!(s.reason, Some(CrossfeedConstraint::NetworkProgressiveOff));
+        assert_eq!(
+            s.reason,
+            Some(CrossfeedConstraint::NetworkProgressiveOff),
+            "la réserve sur les pistes de la bibliothèque reste NOMMÉE"
+        );
         let detail = s
             .detail
-            .expect("une contrainte sans explication, c'est le défaut de #2742");
+            .expect("une réserve sans explication n'aide personne");
         assert!(
-            detail.contains("progressif"),
-            "l'explication doit dire à l'utilisateur ce qu'il PEUT faire \
-             (armer le flux progressif), pas seulement ce qu'il subit : {detail}"
+            detail.contains("Qobuz") && detail.contains("Au fil de l'eau"),
+            "l'explication doit dire OÙ l'effet s'entend et quoi faire pour les \
+             pistes de la bibliothèque : {detail}"
         );
-        assert!(
-            s.requested,
-            "`requested` doit rester ce que l'utilisateur a demandé, sinon \
-             l'écran ne peut pas dire que son choix est resté lettre morte"
-        );
+        assert!(s.requested);
     }
 
-    /// 2. Zone réseau + case DÉCOCHÉE : `unavailable` se lève quand même. La
-    ///    question n'est pas « le réglage a-t-il été changé ? » mais « ce
-    ///    réglage a-t-il encore un sens ici ? » — sinon le client ne verrouille
-    ///    le contrôle qu'APRÈS que l'utilisateur a cliqué pour rien.
+    /// 2. Zone réseau + case DÉCOCHÉE : ni verrou ni effet — le contrôle doit
+    ///    pouvoir être coché, c'est lui qui ouvre l'effet sur les flux.
     #[test]
-    fn une_sortie_reseau_verrouille_meme_case_decochee() {
+    fn une_sortie_reseau_case_decochee_reste_activable() {
         let s = crossfeed_status(false, false, true, false, false, false);
         assert!(!s.effective);
-        assert!(s.unavailable);
+        assert!(!s.unavailable, "le contrôle doit rester activable : {s:?}");
         assert_eq!(s.reason, Some(CrossfeedConstraint::NetworkProgressiveOff));
+    }
+
+    /// Contre-épreuve de [`CrossfeedConstraint::verrouille`] : SEUL
+    /// `NetworkProgressiveOff` est partiel. Une variante qui deviendrait
+    /// partielle sans preuve rouvrirait le défaut de #2742 à l'endroit : un
+    /// contrôle offert là où rien ne peut s'entendre.
+    #[test]
+    fn seul_le_motif_de_l_opt_in_reseau_laisse_le_controle_reglable() {
+        for c in CrossfeedConstraint::ALL {
+            assert_eq!(
+                c.verrouille(),
+                c != CrossfeedConstraint::NetworkProgressiveOff,
+                "{c:?}"
+            );
+        }
     }
 
     /// 3. Le mode PURE désarme le crossfeed sur une sortie locale, et le dit.

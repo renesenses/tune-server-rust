@@ -892,3 +892,10 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 [[test]]
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
+
+# #2742 (23/09) — une zone réseau sans flux progressif garde le crossfeed
+# RÉGLABLE : les flux des services le portent. `autotests = false` plus haut :
+# sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "crossfeed_reglable_zone_reseau_2742"
+path = "tests/crossfeed_reglable_zone_reseau_2742.rs"

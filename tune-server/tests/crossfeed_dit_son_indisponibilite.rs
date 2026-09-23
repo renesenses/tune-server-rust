@@ -146,20 +146,18 @@ async fn le_temoin_une_zone_locale_applique_le_crossfeed_sans_rien_annoncer() {
 // 2. LE DÉFAUT — une zone réseau le DIT, au lieu de se taire.
 // ---------------------------------------------------------------------------
 
-/// Le cœur de #2742 : sur une zone DLNA, activer le crossfeed rend un statut
-/// qui dit `unavailable`, avec un motif STABLE et une phrase en clair.
+/// Sur une zone DLNA sans flux progressif, activer le crossfeed rend un statut
+/// qui garde le contrôle RÉGLABLE et nomme la réserve — #2742, 23/09.
 ///
-/// Le motif a changé avec LAT-F1 : `network_progressive_off` et non plus
-/// `non_local_output`. Une zone réseau PEUT désormais entendre le crossfeed —
-/// via le relais du bras progressif — mais seulement si l'opt-in
-/// `dsp_progressif_reseau` est armé, et il ne l'est pas ici. L'ancien message
-/// renvoyait l'utilisateur changer de zone ; le nouveau, cocher une case.
-///
-/// Avant, cette réponse ne portait que `crossfeed` (la valeur enregistrée) et
-/// `crossfeed_applied_live: false` — dont le commentaire dit lui-même qu'il ne
-/// signale pas un échec. L'utilisateur ne pouvait rien en déduire.
+/// Jusqu'à la v0.9.163 ce cas rendait `unavailable: true` : le client
+/// verrouillait l'intensité et le retard. Or les bras streaming (Qobuz, Tidal,
+/// YouTube) appliquent le crossfeed de la zone sans lire l'opt-in
+/// `dsp_progressif_reseau` — diaphonie mesurée dans
+/// `tune-core/src/orchestrator/tests.rs`. Seules les pistes de la
+/// bibliothèque en sont privées, et c'est ce que dit le motif, conservé.
+/// Le témoin compilé à part est `crossfeed_reglable_zone_reseau_2742.rs`.
 #[tokio::test]
-async fn une_zone_reseau_annonce_que_le_crossfeed_n_agira_pas() {
+async fn une_zone_reseau_garde_le_crossfeed_reglable_et_nomme_sa_reserve() {
     let (app, _, reseau) = app_avec_zones().await;
 
     let (status, corps) = ecrire_crossfeed(&app, reseau, true).await;
@@ -170,44 +168,28 @@ async fn une_zone_reseau_annonce_que_le_crossfeed_n_agira_pas() {
         "la réponse au clic doit porter le statut : {corps}"
     );
     assert_eq!(
-        st["effective"].as_bool(),
-        Some(false),
-        "aucun des trois sites d'installation n'est atteignable ici — {corps}"
-    );
-    assert_eq!(
         st["unavailable"].as_bool(),
-        Some(true),
-        "le contrôle doit être annoncé INDISPONIBLE, pas simplement inactif"
+        Some(false),
+        "les flux des services portent le crossfeed : pas de verrou — {corps}"
     );
+    assert_eq!(st["effective"].as_bool(), Some(true), "{corps}");
     assert_eq!(
         st["reason"].as_str(),
         Some("network_progressive_off"),
-        "le client lit ce code pour choisir sa traduction : {st}"
+        "la réserve sur les pistes de la bibliothèque reste nommée : {st}"
     );
     let detail = st["detail"].as_str().unwrap_or_default();
     assert!(
-        !detail.is_empty(),
-        "une contrainte sans explication, c'est le défaut de #2742"
-    );
-    assert!(
-        detail.contains("progressif"),
+        detail.contains("Au fil de l'eau"),
         "l'explication doit dire ce que l'utilisateur PEUT faire : {detail}"
     );
-    assert_eq!(
-        st["requested"].as_bool(),
-        Some(true),
-        "`requested` garde ce que l'utilisateur a demandé, sinon l'écran ne \
-         peut pas dire que son choix est resté lettre morte"
-    );
+    assert_eq!(st["requested"].as_bool(), Some(true));
 }
 
-/// `GET` le dit aussi — et **même quand la case est décochée**.
-///
-/// La question n'est pas « le réglage a-t-il été changé ? » mais « ce réglage
-/// a-t-il encore un sens sur cette zone ? ». Sans cela le client ne verrouille
-/// le contrôle qu'APRÈS que l'utilisateur a cliqué pour rien.
+/// `GET`, case décochée : le contrôle reste ACTIVABLE — c'est lui qui ouvre
+/// l'effet sur les flux des services.
 #[tokio::test]
-async fn la_relecture_verrouille_le_controle_meme_case_decochee() {
+async fn la_relecture_laisse_le_controle_activable_case_decochee() {
     let (app, _, reseau) = app_avec_zones().await;
 
     // Aucune écriture : le réglage n'a jamais été touché sur cette zone.
@@ -222,8 +204,8 @@ async fn la_relecture_verrouille_le_controle_meme_case_decochee() {
     assert_eq!(st["requested"].as_bool(), Some(false));
     assert_eq!(
         st["unavailable"].as_bool(),
-        Some(true),
-        "le contrôle doit être verrouillé AVANT le premier clic : {corps}"
+        Some(false),
+        "le contrôle doit rester activable : {corps}"
     );
     assert_eq!(st["reason"].as_str(), Some("network_progressive_off"));
 }
