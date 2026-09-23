@@ -881,6 +881,13 @@ impl TidalService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            // #4767 — Tidal porte le type dans `type` : `ALBUM`, `EP`,
+            // `SINGLE`. Même décodeur que Qobuz, donc même vocabulaire de
+            // sortie ; la casse est absorbée par `depuis_service`.
+            release_type: item["type"]
+                .as_str()
+                .and_then(crate::metadata::release_type::depuis_service)
+                .map(|t| t.as_str().to_string()),
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: item["title"].as_str().unwrap_or("").into(),
             artist: item["artist"]["name"]
@@ -2773,6 +2780,7 @@ mod tests {
                 name: format!("Rangée {id}"),
             },
             vec![StreamAlbum {
+                release_type: None,
                 title: titre_album.into(),
                 ..Default::default()
             }],

@@ -91,6 +91,20 @@ pub struct StreamAlbum {
     /// `released_at` ne touche pas à cette condition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub released_at: Option<i64>,
+    /// Le TYPE DE SORTIE que le service annonce : `album`, `ep`, `single`
+    /// (#4767).
+    ///
+    /// Tidal l'écrit dans `type`, Qobuz dans `release_type` ; les autres
+    /// services laissent `None` — une absence ne s'invente pas, et le client
+    /// lit `None` comme « inconnu ». Toujours passé par
+    /// [`crate::metadata::release_type::depuis_service`], qui est le SEUL
+    /// décodeur : un mot hors vocabulaire reste inconnu plutôt que replié de
+    /// force sur `album`.
+    ///
+    /// Même vocabulaire que `albums.release_type` côté bibliothèque, pour que
+    /// le client n'ait qu'une liste de mots à connaître.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +834,7 @@ mod tests {
     #[test]
     fn stream_album_serialization() {
         let album = StreamAlbum {
+            release_type: None,
             id: "789".into(),
             title: "Kind of Blue".into(),
             artist: "Miles Davis".into(),
