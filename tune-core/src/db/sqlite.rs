@@ -1,5 +1,7 @@
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 use tracing::info;
@@ -12,10 +14,66 @@ use crate::db::engine::{Engine, SqliteDialect};
 /// Number of read connections in the pool.
 const READ_POOL_SIZE: usize = 3;
 
+/// Filet de sécurité de l'attente d'une connexion de lecture (#4800) : un
+/// lecteur qui n'a trouvé aucune connexion libre se réveille au plus tard
+/// après ce délai pour réessayer, même si aucune libération ne l'a prévenu.
+/// C'est le cas de la base EN MÉMOIRE, où les trois « lecteurs » et
+/// l'écrivain sont UNE SEULE connexion : l'écrivain la rend sans passer par
+/// [`LectureEmpruntee`], donc sans signal.
+const REVEIL_ATTENTE_LECTURE: Duration = Duration::from_millis(10);
+
+/// Signal « une connexion de lecture vient d'être rendue ».
+type Liberation = (Mutex<()>, Condvar);
+
 pub struct SqliteDb {
     conn: Arc<Mutex<Connection>>,
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
+    liberation: Arc<Liberation>,
+}
+
+/// Une connexion de lecture EMPRUNTÉE au pool (#4800).
+///
+/// Se déréférence en [`Connection`] ; rendue au `drop`, elle réveille alors
+/// un lecteur qui attendait. [`Self::attente`] dit combien de temps l'emprunt
+/// a patienté avant d'obtenir une connexion — c'est la mesure de la
+/// saturation du pool, celle que le journal ne montrait pas.
+pub struct LectureEmpruntee<'a> {
+    // `Option` pour pouvoir RENDRE la connexion avant de prévenir : prévenir
+    // d'abord réveillerait un lecteur qui la trouverait encore prise.
+    garde: Option<MutexGuard<'a, Connection>>,
+    liberation: &'a Liberation,
+    attente: Duration,
+}
+
+impl LectureEmpruntee<'_> {
+    /// Temps passé à attendre qu'une connexion se libère. Zéro dans le cas
+    /// nominal : une connexion était libre du premier coup.
+    pub fn attente(&self) -> Duration {
+        self.attente
+    }
+}
+
+impl Deref for LectureEmpruntee<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        // L'`Option` n'est vidé que dans `drop`, jamais avant.
+        self.garde
+            .as_deref()
+            .expect("connexion de lecture déjà rendue")
+    }
+}
+
+impl Drop for LectureEmpruntee<'_> {
+    fn drop(&mut self) {
+        // 1. rendre la connexion, 2. prévenir — sous le verrou du signal, pour
+        // qu'un lecteur entre son dernier essai et sa mise en attente ne rate
+        // pas ce réveil.
+        self.garde.take();
+        let _verrou = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
+        self.liberation.1.notify_one();
+    }
 }
 
 /// Filesystem types that don't provide reliable POSIX file locking or WAL
@@ -212,6 +270,7 @@ impl SqliteDb {
             conn: Arc::new(Mutex::new(conn)),
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
+            liberation: Arc::new((Mutex::new(()), Condvar::new())),
         })
     }
 
@@ -230,6 +289,7 @@ impl SqliteDb {
             conn,
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
+            liberation: Arc::new((Mutex::new(()), Condvar::new())),
         })
     }
 
@@ -237,10 +297,56 @@ impl SqliteDb {
         &self.conn
     }
 
-    /// Returns the next read connection from the round-robin pool.
-    pub fn read_connection(&self) -> &Arc<Mutex<Connection>> {
-        let idx = self.read_counter.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
-        &self.read_pool[idx]
+    /// Emprunte la PREMIÈRE connexion de lecture LIBRE du pool (#4800).
+    ///
+    /// Avant, la connexion était attribuée par compteur tournant
+    /// (`read_counter % 3`) et l'appelant se mettait en file derrière elle,
+    /// occupée ou non. Une seule lecture lente suffisait donc à retenir un
+    /// tiers de TOUTES les autres : pendant une page de `GET /library/albums`
+    /// de 40 s sur le .18, `/profiles` passait de 4 ms à 20 s et `/devices` de
+    /// 385 ms à 60 s — et les widgets de l'accueil, gardés à 8 s, rendaient
+    /// « délai dépassé ». Le compteur ne sert plus qu'à répartir le point de
+    /// départ de la recherche, pour ne pas user toujours la même connexion.
+    ///
+    /// Aucune libre : on attend la première RENDUE (signal de
+    /// [`LectureEmpruntee`]), avec [`REVEIL_ATTENTE_LECTURE`] en filet.
+    pub fn read_connection(&self) -> LectureEmpruntee<'_> {
+        let depart = self.read_counter.fetch_add(1, Ordering::Relaxed);
+        let n = self.read_pool.len();
+        let premiere_libre = || {
+            (0..n).find_map(|k| match self.read_pool[(depart + k) % n].try_lock() {
+                Ok(garde) => Some(garde),
+                // Un fil a paniqué en tenant la connexion ; elle reste
+                // utilisable, comme avec l'ancien `lock().unwrap()`… en
+                // mieux : on ne propage pas la panique.
+                Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            })
+        };
+        let emprunt = |garde, attente| LectureEmpruntee {
+            garde: Some(garde),
+            liberation: self.liberation.as_ref(),
+            attente,
+        };
+        // Chemin rapide, sans toucher au signal.
+        if let Some(garde) = premiere_libre() {
+            return emprunt(garde, Duration::ZERO);
+        }
+        let debut = Instant::now();
+        let mut signal = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // Sous le verrou du signal : une libération survenue entre cet
+            // essai et le `wait` ne peut pas passer inaperçue.
+            if let Some(garde) = premiere_libre() {
+                return emprunt(garde, debut.elapsed());
+            }
+            signal = self
+                .liberation
+                .1
+                .wait_timeout(signal, REVEIL_ATTENTE_LECTURE)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 
     pub fn execute(
@@ -297,7 +403,7 @@ impl SqliteDb {
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
     ) -> Result<T, String> {
-        let conn = self.read_connection().lock().unwrap();
+        let conn = self.read_connection();
         f(&conn).map_err(|e| format!("db read: {e}"))
     }
 
@@ -311,7 +417,7 @@ impl SqliteDb {
     }
 
     pub fn query_timed<T>(&self, label: &str, f: impl FnOnce(&Connection) -> T) -> T {
-        let conn = self.read_connection().lock().unwrap();
+        let conn = self.read_connection();
         let start = std::time::Instant::now();
         let result = f(&conn);
         let elapsed = start.elapsed();
@@ -340,6 +446,7 @@ impl Clone for SqliteDb {
             conn: self.conn.clone(),
             read_pool: self.read_pool.clone(),
             read_counter: self.read_counter.clone(),
+            liberation: self.liberation.clone(),
         }
     }
 }

@@ -1176,7 +1176,7 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
     let sql = format!("SELECT {col_list} FROM {table}");
 
     let rows: Vec<Vec<SqlValue>> = {
-        let conn = sqlite_db.read_connection().lock().unwrap();
+        let conn = sqlite_db.read_connection();
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("prepare SELECT from {table}: {e}"))?;
@@ -1336,7 +1336,7 @@ fn bind_migration_value<'q>(
 
 /// Get column names for a SQLite table via PRAGMA table_info.
 fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String> {
-    let conn = db.read_connection().lock().unwrap();
+    let conn = db.read_connection();
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(|e| format!("pragma table_info({table}): {e}"))?;
