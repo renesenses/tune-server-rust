@@ -425,11 +425,37 @@ fn source_est(alias: &str, operateur: &str) -> String {
 ///   artiste serait masqué par le « Live » de n'importe qui.
 ///
 /// Un album LOCAL n'est jamais masqué : le premier terme le sort d'emblée.
-fn double_par_un_local(alias: &str) -> String {
+fn double_par_un_local(engine: Engine, alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM albums loc WHERE {})",
-        condition_de_doublon(alias)
+        condition_de_doublon(engine, alias)
     )
+}
+
+/// « Ces deux TITRES d'album sont égaux à la casse près » — écrit pour que
+/// l'index serve (#4800).
+///
+/// `LOWER(loc.title) = LOWER(a.title)` rendait `idx_albums_title` inutile :
+/// aucun index ne sert une expression, et SQLite parcourait `albums` en
+/// entier pour CHAQUE ligne de la requête englobante — 9 427 × 9 427 sur la
+/// base du .18, 28 s par `COUNT`, exécuté deux fois par page de la grille.
+/// C'est le piège déjà mesuré par [`super::home_queries::HISTORIQUE_VERS_ALBUM`]
+/// (19 ms contre 83 s), retombé ici une seconde fois.
+///
+/// * SQLite : `idx_albums_title ON albums(title COLLATE NOCASE)` existe
+///   depuis la migration 16. Une égalité `COLLATE NOCASE` la prend, et sa
+///   sémantique est EXACTEMENT celle de `LOWER()` : les deux ne replient que
+///   les 26 lettres ASCII (le `lower()` de SQLite sans ICU ne fait pas plus).
+///   Même ensemble masqué, donc, au caractère près.
+/// * PostgreSQL n'a pas de `COLLATE NOCASE` ; son `LOWER()`, lui, replie tout
+///   l'Unicode — et c'est le texte d'origine qui reste, inchangé. Là-bas le
+///   planificateur transforme le `NOT EXISTS` corrélé en anti-jointure par
+///   hachage sur cette égalité : il ne rejoue pas la sous-requête par ligne.
+fn titres_egaux_sans_casse(engine: Engine, gauche: &str, droit: &str) -> String {
+    match engine {
+        Engine::Sqlite => format!("{gauche} = {droit} COLLATE NOCASE"),
+        Engine::Postgres => format!("LOWER({gauche}) = LOWER({droit})"),
+    }
 }
 
 /// Le CORPS du rapprochement #4146 : l'album distant `{alias}` et l'album
@@ -438,19 +464,24 @@ fn double_par_un_local(alias: &str) -> String {
 /// [`super::album_repo::AlbumRepo::aussi_sur`]) rapproche EXACTEMENT ce que la
 /// grille masque — deux copies de la règle divergeraient au premier
 /// correctif, et un album serait masqué sans être signalé, ou l'inverse.
-pub(crate) fn condition_de_doublon(alias: &str) -> String {
+///
+/// `engine` ne change que l'écriture de l'égalité des titres
+/// ([`titres_egaux_sans_casse`]), jamais la règle.
+pub(crate) fn condition_de_doublon(engine: Engine, alias: &str) -> String {
     let nom_distant = nom_d_artiste(alias, "ar_dist");
     let nom_local = nom_d_artiste("loc", "ar_loc");
     let distant = source_est(alias, "<>");
     let local = source_est("loc", "=");
     let ambigu = source_est("amb", "=");
+    let titre_local = titres_egaux_sans_casse(engine, "loc.title", &format!("{alias}.title"));
+    let titre_ambigu = titres_egaux_sans_casse(engine, "amb.title", &format!("{alias}.title"));
     format!(
         "{distant} AND {local} \
-         AND LOWER(loc.title) = LOWER({alias}.title) \
+         AND {titre_local} \
          AND (LOWER({nom_local}) = LOWER({nom_distant}) \
               OR ({nom_distant} = '' \
                   AND (SELECT COUNT(*) FROM albums amb \
-                       WHERE LOWER(amb.title) = LOWER({alias}.title) AND {ambigu}) = 1))"
+                       WHERE {titre_ambigu} AND {ambigu}) = 1))"
     )
 }
 
@@ -465,8 +496,8 @@ pub(crate) fn condition_de_doublon(alias: &str) -> String {
 /// Vit ici pour la même raison que [`hidden_albums_excluded`] : la liste, son
 /// compteur de pagination et le compteur de tranche DR doivent exclure
 /// EXACTEMENT le même ensemble, sinon la grille saute des pages.
-pub fn album_distant_double_exclu(alias: &str) -> String {
-    format!("NOT {}", double_par_un_local(alias))
+pub fn album_distant_double_exclu(engine: Engine, alias: &str) -> String {
+    format!("NOT {}", double_par_un_local(engine, alias))
 }
 
 /// Prédicat jumeau pour les requêtes de PISTES (#4146) — alias `t`, celui de
@@ -476,11 +507,11 @@ pub fn album_distant_double_exclu(alias: &str) -> String {
 /// pistes le sont aussi. Une piste SANS album reste visible — le `NOT EXISTS`
 /// est vrai quand la sous-requête ne trouve rien, NULL compris, exactement
 /// comme [`hidden_tracks_excluded`].
-pub fn pistes_album_distant_double_exclu() -> String {
+pub fn pistes_album_distant_double_exclu(engine: Engine) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM albums dist \
          WHERE dist.id = t.album_id AND {})",
-        double_par_un_local("dist")
+        double_par_un_local(engine, "dist")
     )
 }
 
