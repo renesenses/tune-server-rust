@@ -1688,10 +1688,68 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Télécharge une URL amont ENTIÈRE dans un fichier temporaire nommé
+    /// `tune-stream-<uuid>.<codec>`, et rend son chemin.
+    ///
+    /// L'extension est ce que le décodeur lit pour choisir son chemin
+    /// (`decode_to_pcm_streaming_inner` aiguille `.dsf`/`.dff` vers le
+    /// convertisseur DSD natif) : elle DOIT nommer le codec réel.
+    ///
+    /// Les octets vont directement sur le disque, sans passer par une
+    /// mémoire tampon de la taille du fichier : un DSD64 fait 300 Mio, un
+    /// DSD256 dépasse le gigaoctet, et ce chemin les sert désormais
+    /// (`resolve_direct::servir_le_dsd_upnp_au_reseau`). Pour un AAC de
+    /// quelques mégaoctets, rien ne change.
+    ///
+    /// Le fichier appartient à l'appelant : c'est lui qui le supprime.
+    pub(super) async fn telecharger_dans_un_fichier_temporaire(
+        upstream_url: String,
+        upstream_headers: Vec<(String, String)>,
+        codec: &str,
+    ) -> Result<String, String> {
+        let tmp_dl = std::env::temp_dir()
+            .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
+            .to_string_lossy()
+            .to_string();
+        let tmp_dl_clone = tmp_dl.clone();
+        let dl = tokio::task::spawn_blocking(move || {
+            let mut resp = crate::http::client::blocking_builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .and_then(|c| rejouer_les_entetes(c.get(&upstream_url), &upstream_headers).send())
+                .map_err(|e| format!("upstream fetch: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("upstream HTTP {}", resp.status()));
+            }
+            let mut fichier =
+                std::fs::File::create(&tmp_dl_clone).map_err(|e| format!("write dl: {e}"))?;
+            resp.copy_to(&mut fichier)
+                .map_err(|e| format!("download: {e}"))?;
+            Ok::<(), String>(())
+        })
+        .await;
+        match dl {
+            Ok(Ok(())) => Ok(tmp_dl),
+            Ok(Err(e)) => {
+                let _ = std::fs::remove_file(&tmp_dl);
+                Err(e)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_dl);
+                Err(format!("download task panic: {e}"))
+            }
+        }
+    }
+
     /// Premier temps, codecs que les renderers DLNA anciens refusent (AAC,
     /// MP4, Opus) : téléchargement puis pré-transcodage en FLAC, servi par
     /// une session de fichier avec Content-Length.
-    async fn pretranscoder_en_flac(
+    ///
+    /// `pub(super)` : c'est aussi le bras PCM d'une piste DSD de serveur
+    /// média vers un renderer (`resolve_direct::servir_le_dsd_upnp_au_reseau`)
+    /// — le même canal WAV que « le chemin des DSD et des radios » ci-dessous,
+    /// nourri par le convertisseur DSD natif via l'extension `.dsf`/`.dff`.
+    pub(super) async fn pretranscoder_en_flac(
         &self,
         req: &PlayRequest,
         service_name: &str,
@@ -1734,43 +1792,19 @@ impl PlaybackOrchestrator {
             // du format, `googlevideo` refuse en 403 : mesuré chez FabienM,
             // URL rendue en 2 s, GET nu refusé en 36 ms. La liste est vide pour
             // tout service qui n'en fournit pas — rien ne change ailleurs.
-            let upstream_url = stream_data.url.clone();
-            let upstream_headers = stream_data.headers.clone();
-            let codec = codec_lower.clone();
-            let tmp_dl = std::env::temp_dir()
-                .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
-                .to_string_lossy()
-                .to_string();
-            let tmp_dl_clone = tmp_dl.clone();
-            let dl = tokio::task::spawn_blocking(move || {
-                let resp = crate::http::client::blocking_builder()
-                    .timeout(std::time::Duration::from_secs(120))
-                    .build()
-                    .and_then(|c| {
-                        rejouer_les_entetes(c.get(&upstream_url), &upstream_headers).send()
-                    })
-                    .map_err(|e| format!("upstream fetch: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("upstream HTTP {}", resp.status()));
-                }
-                let bytes = resp.bytes().map_err(|e| format!("download: {e}"))?;
-                std::fs::write(&tmp_dl_clone, &bytes).map_err(|e| format!("write dl: {e}"))?;
-                Ok::<(), String>(())
-            })
-            .await;
-            match dl {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+            let tmp_dl = match Self::telecharger_dans_un_fichier_temporaire(
+                stream_data.url.clone(),
+                stream_data.headers.clone(),
+                &codec_lower,
+            )
+            .await
+            {
+                Ok(chemin) => chemin,
+                Err(e) => {
                     warn!(error = %e, "streaming_aac_download_failed");
-                    let _ = std::fs::remove_file(&tmp_dl);
                     return Err(format!("AAC download failed: {e}"));
                 }
-                Err(e) => {
-                    warn!(error = %e, "streaming_aac_download_task_panic");
-                    let _ = std::fs::remove_file(&tmp_dl);
-                    return Err(format!("AAC download task panic: {e}"));
-                }
-            }
+            };
 
             let info = StreamInfo {
                 format: "wav".into(),

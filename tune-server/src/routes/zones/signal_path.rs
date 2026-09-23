@@ -726,8 +726,10 @@ fn assembler_les_etapes(
             && !wav_output
             && !dlna_cap_16bit
             && !needs_transcode_for_output;
+        // `!is_dsd` sur le bras WAV aussi : un DSD porte `bit_depth == 1`, et
+        // `1 <= 16` faisait passer sa décimation pour un WAV sans perte.
         let transcode_lossless = ((is_oaat && is_lossless && !is_dsd)
-            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16))
+            || (wav_output && is_lossless && !is_dsd && (dlna_wav24 || bit_depth <= 16))
             || conteneur_seul_reecrit)
             && ps
                 .now_playing
@@ -1254,12 +1256,18 @@ fn decrire_le_transport<'a>(
                 // transcodes for DLNA), so it is bit-perfect at any depth
                 // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
                 // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
-                let wav_bit_perfect = wav_wire_bit_perfect(
-                    is_lossless,
-                    matches!(source_format, Some(AudioFormat::Wav)),
-                    dlna_wav24,
-                    bit_depth,
-                );
+                // Un DSD décimé en WAV est un changement de DOMAINE (1 bit
+                // sigma-delta → PCM multibit), jamais bit-perfect — le bras
+                // OAAT le dit déjà. Ici, `bit_depth` vaut 1 pour un DSD, et
+                // `1 <= 16` faisait passer la décimation pour du LPCM intact
+                // (Abacab, DMP-A8, .18 du 23/09/2026).
+                let wav_bit_perfect = !is_dsd
+                    && wav_wire_bit_perfect(
+                        is_lossless,
+                        matches!(source_format, Some(AudioFormat::Wav)),
+                        dlna_wav24,
+                        bit_depth,
+                    );
                 (wav_bit_perfect, "DLNA/UPnP", "WAV")
             } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
