@@ -1343,3 +1343,88 @@ mod enchainement_upnp_3967_tests {
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_4324.rs"]
 mod session_4324_tests;
+
+#[cfg(test)]
+mod publication_de_zone_4626_tests {
+    use super::*;
+
+    /// 🔴 renesenses/tune-server-rust#4626 — « Publier cette zone sur le
+    /// réseau ».
+    ///
+    /// L'écriture (`zones/ecriture.rs`, famille 6) est déjà gardée : cocher
+    /// écrit `"true"`, décocher SUPPRIME la clé. Ce témoin-là s'arrête à la
+    /// table des réglages, et une clé absente ne dit RIEN de ce que le réseau
+    /// voit encore. Personne ne gardait la surface UPnP elle-même : ni le 404
+    /// de la façade sans opt-in, ni sa disparition au décochage.
+    ///
+    /// Trou mesuré le 22/09/2026 sur `origin/main` (cf28b013), en établissant
+    /// pour le testeur du fil 1867 comment cette publication s'active et se
+    /// coupe. Il compte, parce que c'est exactement la promesse faite à
+    /// l'écran : décocher retire la zone du réseau.
+    ///
+    /// Ce que ce témoin NE dit pas, et qui reste vrai (docs/UPNP-RENDERER.md
+    /// §4) : aucun `ssdp:byebye` n'est émis. Tune cesse d'annoncer et de
+    /// répondre, mais un point de contrôle garde son entrée en cache jusqu'à
+    /// l'expiration du `max-age` (1800 s). Le client web le dit désormais à
+    /// l'endroit où l'on décoche.
+    #[tokio::test]
+    async fn la_facade_du_renderer_suit_l_opt_in_de_la_zone() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zone_id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon", None, None)
+            .unwrap();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        let cle = format!("zone_{zone_id}_upnp_renderer");
+
+        // 1. Case jamais cochée — le défaut. Rien à voir sur le réseau.
+        let reponse = description(State(state.clone()), Path(zone_id)).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::NOT_FOUND,
+            "sans opt-in, la façade MediaRenderer d'une zone ne doit pas exister"
+        );
+
+        // 2. Case cochée : la façade est servie, et c'est bien un MediaRenderer.
+        reglages.set(&cle, "true").unwrap();
+        let reponse = description(State(state.clone()), Path(zone_id)).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::OK,
+            "zone publiée : la façade MediaRenderer doit être servie"
+        );
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let xml = String::from_utf8_lossy(&octets).to_string();
+        assert!(
+            xml.contains("urn:schemas-upnp-org:device:MediaRenderer:1"),
+            "la description servie doit annoncer un MediaRenderer:1 — \
+             sinon aucun point de contrôle ne proposera la zone.\nservi : {xml}"
+        );
+        assert!(
+            xml.contains("Salon (Tune)"),
+            "la façade doit porter le nom de la zone, suffixé une seule fois \
+             (#3616).\nservi : {xml}"
+        );
+
+        // 3. Décochée : c'est la SUPPRESSION de la clé que fait la route
+        //    d'écriture, pas un « false ». La façade disparaît.
+        reglages.delete(&cle).unwrap();
+        let reponse = description(State(state.clone()), Path(zone_id)).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::NOT_FOUND,
+            "décocher la case doit retirer la façade MediaRenderer de la zone"
+        );
+
+        // 4. Et la valeur littérale « false », qu'un client tiers pourrait
+        //    écrire, ne publie pas non plus.
+        reglages.set(&cle, "false").unwrap();
+        let reponse = description(State(state.clone()), Path(zone_id)).await;
+        assert_eq!(
+            reponse.status(),
+            StatusCode::NOT_FOUND,
+            "seule la chaîne « true » publie une zone (`zone_renderer_enabled`)"
+        );
+    }
+}
