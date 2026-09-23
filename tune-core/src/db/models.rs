@@ -398,6 +398,7 @@ mod tests {
     #[test]
     fn album_serialization() {
         let album = Album {
+            release_type: None,
             id: Some(1),
             title: "Kind of Blue".into(),
             artist_id: Some(42),
