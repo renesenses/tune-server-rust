@@ -5545,18 +5545,45 @@ mod tests {
             "base neuve : `albums.release_type` manque ({c:?})"
         );
 
-        // 2. Base ANCIENNE : une table `albums` d'avant la 106, sans la
-        //    colonne. C'est le parc des testeurs.
+        // 2. Base ANCIENNE : la table `albums` d'avant la 106, posee AVANT
+        //    `init_schema` — `CREATE TABLE IF NOT EXISTS` la laisse alors
+        //    telle quelle, comme sur le parc des testeurs. Meme montage que
+        //    `une_base_ancienne_gagne_le_drapeau_compilation`.
         let ancienne = SqliteDb::open_in_memory().unwrap();
         ancienne
-            .execute_batch("CREATE TABLE albums (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            .execute_batch(
+                "CREATE TABLE albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    artist_id INTEGER,
+                    year INTEGER,
+                    folder_path TEXT
+                );
+                INSERT INTO albums (title) VALUES ('Tonight''s the Night');",
+            )
             .unwrap();
+        ancienne.init_schema().unwrap();
         run_migrations(&ancienne).unwrap();
         let c = colonnes(&ancienne);
         assert!(
             c.iter().any(|x| x == "release_type"),
             "base ancienne : `albums.release_type` manque ({c:?})"
         );
+        {
+            let conn = ancienne.connection().lock().unwrap();
+            // La ligne existante survit, et son type nait INCONNU : rien dans
+            // cette base ne l'a jamais su, et la migration n'invente pas.
+            let (n, t): (i64, Option<String>) = conn
+                .query_row("SELECT COUNT(*), MAX(release_type) FROM albums", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(n, 1, "l'album enregistre a disparu a la migration");
+            assert!(
+                t.is_none(),
+                "un album d'avant la 106 doit rester de type INCONNU, pas                  recevoir une valeur par defaut : {t:?}"
+            );
+        }
 
         // 3. Le SELECT commun des albums doit se PREPARER sur les DEUX :
         //    SQLite refuse a la preparation une colonne qui n'existe pas.
