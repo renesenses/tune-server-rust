@@ -1135,6 +1135,145 @@ pub async fn handle_stream(
 
 // ─── File serving with Range ────────────────────────────────────
 
+/// Ce qu'un en-tête `Range` demande VRAIMENT d'un fichier de taille connue.
+///
+/// Séparé de [`serve_file`] parce que c'est la seule façon d'en éprouver les
+/// bords : les cas fautifs ci-dessous sont des en-têtes, pas des fichiers.
+#[derive(Debug, PartialEq, Eq)]
+enum DemandeDeRange {
+    /// Bornes INCLUSES, toutes deux garanties dans le fichier (`debut <= fin`
+    /// et `fin < taille`) : le `Content-Length` en découle sans soustraction
+    /// risquée.
+    Tranche { debut: u64, fin: u64 },
+    /// L'en-tête est bien formé mais ne désigne aucun octet existant :
+    /// la réponse due est un **416** avec `Content-Range: bytes */taille`.
+    Insatisfiable,
+    /// En-tête absent, d'une autre unité, ou syntaxiquement invalide. La RFC
+    /// 9110 §14.2 impose alors de l'IGNORER : on sert le fichier entier en
+    /// 200, comme s'il n'y avait pas eu de `Range`.
+    Totalite,
+}
+
+/// Lit un en-tête `Range` pour un fichier de `taille` octets.
+///
+/// # Les deux défauts que cette fonction ferme
+///
+/// L'ancien code tenait en trois lignes, et chacune portait un défaut :
+///
+/// ```ignore
+/// let start = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+/// let end   = parts.get(1)….unwrap_or(file_size - 1);
+/// let length = end - start + 1;
+/// ```
+///
+/// 1. **`bytes=N-` avec `N >= taille`.** `end` vaut `taille - 1`, donc
+///    `end < start`, et `end - start + 1` DÉBORDE par le bas. `overflow-checks`
+///    étant éteint en `release` (voir `[profile.release]` à la racine), rien ne
+///    panique : le serveur annonce un `Content-Length` de l'ordre de 2^64 et un
+///    `Content-Range: bytes 9999-42/43` qui ne veut rien dire. Le renderer
+///    attend alors des octets qui ne viendront jamais. La réponse due est un
+///    416, et c'est ce que rend désormais [`DemandeDeRange::Insatisfiable`].
+/// 2. **`bytes=-N` (suffixe).** `split('-')` rend `["", "N"]` : `""` ne se
+///    parse pas, `start` retombait sur `0` et le serveur servait les N
+///    PREMIERS octets là où le client demandait les N DERNIERS. Un client
+///    poli n'en envoie pas — mais celui qui en envoie recevait le début d'un
+///    fichier en croyant en lire la fin.
+///
+/// `taille == 0` referme au passage le `file_size - 1` de la ligne 2, qui
+/// débordait lui aussi sur un fichier vide : plus aucun octet n'est
+/// satisfaisable, donc 416.
+///
+/// ⚠️ Hors sujet ici, et délibérément : rien n'aligne `debut` sur la grille
+/// des trames PCM. C'est l'hypothèse 1 de l'enquête #4455 (« souffle
+/// soudain »), que la sonde `stream_range_hors_trame` de la v0.9.157 doit
+/// trancher sur PIÈCES. Cette fonction sert l'octet demandé, comme avant.
+fn interpreter_range(entete: &str, taille: u64) -> DemandeDeRange {
+    // L'unité est insensible à la casse (RFC 9110 §14.1) ; une autre unité
+    // que `bytes` doit être ignorée, pas rejetée.
+    let Some(specs) = entete
+        .split_once('=')
+        .filter(|(unite, _)| unite.trim().eq_ignore_ascii_case("bytes"))
+        .map(|(_, reste)| reste)
+    else {
+        return DemandeDeRange::Totalite;
+    };
+    // Une demande multi-tranches est légale ; y répondre par une seule
+    // tranche l'est aussi (§14.2 : « MAY … send only the first »), et le
+    // corps `multipart/byteranges` n'aurait aucun usage ici. On lit donc la
+    // première, au lieu de l'ancien `split('-')` qui digérait « 99,200 » en
+    // silence.
+    let spec = specs.split(',').next().unwrap_or("").trim();
+    let Some((avant, apres)) = spec.split_once('-') else {
+        return DemandeDeRange::Totalite;
+    };
+    let (avant, apres) = (avant.trim(), apres.trim());
+
+    // Fichier vide : aucun octet n'existe, donc aucune tranche n'est
+    // satisfaisable — y compris le `bytes=0-` d'une sonde.
+    if taille == 0 {
+        return DemandeDeRange::Insatisfiable;
+    }
+    let dernier = taille - 1;
+
+    if avant.is_empty() {
+        // Suffixe `bytes=-N` : les N DERNIERS octets. `bytes=-0` ne désigne
+        // rien (§14.1.2) → 416.
+        let Ok(n) = apres.parse::<u64>() else {
+            return DemandeDeRange::Totalite;
+        };
+        if n == 0 {
+            return DemandeDeRange::Insatisfiable;
+        }
+        return DemandeDeRange::Tranche {
+            debut: taille.saturating_sub(n),
+            fin: dernier,
+        };
+    }
+
+    let Ok(debut) = avant.parse::<u64>() else {
+        return DemandeDeRange::Totalite;
+    };
+    if apres.is_empty() {
+        // `bytes=N-` : jusqu'à la fin. Au-delà du dernier octet, 416.
+        return if debut > dernier {
+            DemandeDeRange::Insatisfiable
+        } else {
+            DemandeDeRange::Tranche {
+                debut,
+                fin: dernier,
+            }
+        };
+    }
+    let Ok(fin_demandee) = apres.parse::<u64>() else {
+        return DemandeDeRange::Totalite;
+    };
+    // `first-pos > last-pos` rend la spec INVALIDE, pas insatisfaisable :
+    // l'en-tête entier doit être ignoré (§14.1.2).
+    if fin_demandee < debut {
+        return DemandeDeRange::Totalite;
+    }
+    if debut > dernier {
+        return DemandeDeRange::Insatisfiable;
+    }
+    DemandeDeRange::Tranche {
+        debut,
+        fin: fin_demandee.min(dernier),
+    }
+}
+
+/// La réponse due à une demande insatisfaisable : 416 + `Content-Range:
+/// bytes */taille`, qui DIT au renderer la taille réelle pour qu'il refasse
+/// sa demande au bon endroit (RFC 9110 §15.5.17).
+fn reponse_416(taille: u64) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Content-Range",
+        HeaderValue::from_str(&format!("bytes */{taille}")).unwrap(),
+    );
+    headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response()
+}
+
 async fn serve_file(
     path: &str,
     info: &StreamInfo,
@@ -1161,14 +1300,27 @@ async fn serve_file(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    if let Some(range) = range_header {
-        let range_str = range.replace("bytes=", "");
-        let parts: Vec<&str> = range_str.split('-').collect();
-        let start: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let end: u64 = parts
-            .get(1)
-            .and_then(|s| if s.is_empty() { None } else { s.parse().ok() })
-            .unwrap_or(file_size - 1);
+    let demande = range_header
+        .as_deref()
+        .map(|r| interpreter_range(r, file_size))
+        .unwrap_or(DemandeDeRange::Totalite);
+
+    if let DemandeDeRange::Insatisfiable = demande {
+        warn!(
+            stream_id = %session.id,
+            range = range_header.as_deref().unwrap_or("-"),
+            file_size,
+            "stream_range_insatisfiable — 416 ; l'ancien code annonçait ici un \
+             Content-Length aberrant né d'une soustraction u64 qui débordait"
+        );
+        return reponse_416(file_size);
+    }
+
+    if let DemandeDeRange::Tranche {
+        debut: start,
+        fin: end,
+    } = demande
+    {
         let length = end - start + 1;
         noter_range_hors_trame(&session, info, start);
 
@@ -4236,5 +4388,265 @@ mod terrain_perdu_4645 {
     fn regagner_de_lavance_ne_compte_aucune_perte() {
         assert_eq!(terrain_perdu_ms(3_000, 3_000), 0);
         assert_eq!(terrain_perdu_ms(3_000, 9_000), 0);
+    }
+}
+
+/// Deux défauts du chemin FICHIER de `serve_file`, tenus par leurs bords.
+///
+/// Ils vivaient tous deux dans les trois lignes qui lisaient l'en-tête
+/// `Range` — voir [`interpreter_range`] pour le détail de ce qu'elles
+/// faisaient.
+#[cfg(test)]
+mod range_du_chemin_fichier {
+    use super::{DemandeDeRange, interpreter_range};
+
+    /// DÉFAUT 1 — `bytes=N-` au-delà de la fin du fichier.
+    ///
+    /// L'ancien calcul faisait `end - start + 1` avec `end = taille - 1 <
+    /// start` : une soustraction `u64` qui passe par le bas. `overflow-checks`
+    /// est éteint en `release`, donc aucune panique — un `Content-Length`
+    /// proche de 2^64 et un `Content-Range` à l'envers partaient au renderer.
+    #[test]
+    fn un_range_qui_commence_apres_la_fin_est_insatisfiable() {
+        // Le cas exact du débordement : dernier octet = 42, demande à 9 999.
+        assert_eq!(
+            interpreter_range("bytes=9999-", 43),
+            DemandeDeRange::Insatisfiable
+        );
+        // Juste au-delà du dernier octet : la frontière elle-même.
+        assert_eq!(
+            interpreter_range("bytes=43-", 43),
+            DemandeDeRange::Insatisfiable
+        );
+        // Et sa jumelle bornée, qui débordait de la même façon.
+        assert_eq!(
+            interpreter_range("bytes=9999-19999", 43),
+            DemandeDeRange::Insatisfiable
+        );
+        // TÉMOIN : le dernier octet, lui, reste servi.
+        assert_eq!(
+            interpreter_range("bytes=42-", 43),
+            DemandeDeRange::Tranche { debut: 42, fin: 42 }
+        );
+        // Fichier vide : `taille - 1` débordait AUSSI, y compris sur la sonde
+        // `bytes=0-` que tout renderer DLNA envoie.
+        assert_eq!(
+            interpreter_range("bytes=0-", 0),
+            DemandeDeRange::Insatisfiable
+        );
+    }
+
+    /// DÉFAUT 2 — `bytes=-N` demande les N DERNIERS octets.
+    ///
+    /// `split('-')` rendait `["", "N"]` : `""` ne se parse pas, `start`
+    /// retombait sur `0`, et le serveur renvoyait les N PREMIERS octets sous
+    /// un `Content-Range` qui les annonçait comme tels. Le client, lui, avait
+    /// demandé la fin.
+    #[test]
+    fn un_range_suffixe_rend_la_fin_du_fichier_pas_son_debut() {
+        assert_eq!(
+            interpreter_range("bytes=-500", 2_000),
+            DemandeDeRange::Tranche {
+                debut: 1_500,
+                fin: 1_999
+            }
+        );
+        // Un suffixe plus grand que le fichier vaut le fichier entier
+        // (RFC 9110 §14.1.2), pas une soustraction qui déborde.
+        assert_eq!(
+            interpreter_range("bytes=-5000", 2_000),
+            DemandeDeRange::Tranche {
+                debut: 0,
+                fin: 1_999
+            }
+        );
+        // `bytes=-0` ne désigne aucun octet.
+        assert_eq!(
+            interpreter_range("bytes=-0", 2_000),
+            DemandeDeRange::Insatisfiable
+        );
+    }
+
+    /// Les cas ordinaires, pour que les deux corrections ci-dessus ne
+    /// puissent pas être obtenues en cassant le chemin qui marche : la sonde
+    /// `bytes=0-` du Marantz, la reprise par tranches de l'Eversolo, et la
+    /// borne haute rognée à la taille réelle.
+    #[test]
+    fn les_reprises_ordinaires_des_renderers_restent_servies_a_l_identique() {
+        assert_eq!(
+            interpreter_range("bytes=0-", 1_000),
+            DemandeDeRange::Tranche { debut: 0, fin: 999 }
+        );
+        assert_eq!(
+            interpreter_range("bytes=1310720-", 5_000_000),
+            DemandeDeRange::Tranche {
+                debut: 1_310_720,
+                fin: 4_999_999
+            }
+        );
+        assert_eq!(
+            interpreter_range("bytes=44-99", 1_000),
+            DemandeDeRange::Tranche { debut: 44, fin: 99 }
+        );
+        // Borne haute au-delà du fichier : rognée, pas refusée.
+        assert_eq!(
+            interpreter_range("bytes=44-99999", 1_000),
+            DemandeDeRange::Tranche {
+                debut: 44,
+                fin: 999
+            }
+        );
+    }
+
+    /// Un en-tête qu'on ne sait pas lire doit être IGNORÉ (RFC 9110 §14.2),
+    /// donc servir le fichier entier en 200 — jamais un 416, qui ferait
+    /// renoncer un renderer sur une syntaxe qu'on n'a pas comprise.
+    #[test]
+    fn un_entete_illisible_est_ignore_et_non_refuse() {
+        assert_eq!(
+            interpreter_range("bytes=abc-", 1_000),
+            DemandeDeRange::Totalite
+        );
+        assert_eq!(
+            interpreter_range("chunks=0-", 1_000),
+            DemandeDeRange::Totalite
+        );
+        assert_eq!(interpreter_range("bytes=", 1_000), DemandeDeRange::Totalite);
+        // `first-pos > last-pos` : spec invalide, pas insatisfaisable.
+        assert_eq!(
+            interpreter_range("bytes=99-44", 1_000),
+            DemandeDeRange::Totalite
+        );
+    }
+}
+
+/// Les mêmes deux défauts, cette fois par la fonction de PRODUCTION : la
+/// réponse HTTP que `handle_stream` construit pour une session fichier.
+///
+/// Sans ce banc, `interpreter_range` pourrait être parfaite et `serve_file`
+/// continuer à ignorer ce qu'elle rend.
+#[cfg(test)]
+mod range_du_chemin_fichier_de_bout_en_bout {
+    use super::{StreamInfo, StreamSession, handle_stream};
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tune_core::http::streamer::SharedSessions;
+
+    /// Une session FICHIER posée sur un fichier réel de `octets` octets, dont
+    /// l'octet d'indice `i` vaut `i % 251` — un motif qui rend toute
+    /// confusion début/fin VISIBLE.
+    async fn session_fichier(
+        id: &str,
+        octets: usize,
+    ) -> (tune_core::test_scratch::ScratchFile, SharedSessions) {
+        // `scratch_file` et non un chemin composé à la main : le garde
+        // `aucune_fuite_de_temporaires` (#3030) refuse le second.
+        let fichier = tune_core::test_scratch::scratch_file(id, ".wav");
+        let contenu: Vec<u8> = (0..octets).map(|i| (i % 251) as u8).collect();
+        std::fs::write(fichier.path(), &contenu).expect("fichier de test");
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..StreamInfo::default()
+        };
+        let session = Arc::new(StreamSession::new(id.into(), info, false, 8));
+        *session.file_path.lock().await = Some(fichier.path().to_string_lossy().into_owned());
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(id.to_string(), session)].into_iter().collect(),
+        ));
+        (fichier, sessions)
+    }
+
+    async fn demander(
+        sessions: SharedSessions,
+        id: &str,
+        range: &str,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut entetes = HeaderMap::new();
+        entetes.insert("Range", HeaderValue::from_str(range).unwrap());
+        let reponse = handle_stream(Path(format!("{id}.flac")), State(sessions), entetes).await;
+        let statut = reponse.status();
+        let entetes_rendus = reponse.headers().clone();
+        let mut corps = reponse.into_body().into_data_stream();
+        let mut recu = Vec::new();
+        while let Some(m) = corps.next().await {
+            recu.extend_from_slice(&m.expect("erreur de flux"));
+        }
+        (statut, entetes_rendus, recu)
+    }
+
+    fn entete(entetes: &HeaderMap, nom: &str) -> String {
+        entetes
+            .get(nom)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<absent>")
+            .to_string()
+    }
+
+    /// DÉFAUT 1, de bout en bout. Avant le correctif, cette demande partait
+    /// avec `Content-Length: 18446744073709542420` et
+    /// `Content-Range: bytes 9999-9999/10000`… puis un corps vide.
+    #[tokio::test]
+    async fn un_range_au_dela_de_la_fin_repond_416_et_dit_la_taille() {
+        let (_f, sessions) = session_fichier("range-416-bd71", 10_000).await;
+        let (statut, entetes, corps) = demander(sessions, "range-416-bd71", "bytes=20000-").await;
+
+        assert_eq!(
+            statut,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "un range qui commence après la fin doit valoir 416, pas un \
+             Content-Length né d'une soustraction u64 qui déborde"
+        );
+        assert_eq!(
+            entete(&entetes, "Content-Range"),
+            "bytes */10000",
+            "le 416 doit DIRE la taille réelle, sans quoi le renderer ne sait \
+             pas où refaire sa demande"
+        );
+        assert!(
+            corps.is_empty(),
+            "un 416 ne porte pas d'octets audio : {} reçus",
+            corps.len()
+        );
+    }
+
+    /// DÉFAUT 2, de bout en bout : les 500 derniers octets, pas les
+    /// 500 premiers.
+    #[tokio::test]
+    async fn un_range_suffixe_sert_la_fin_du_fichier() {
+        const TAILLE: usize = 10_000;
+        let (_f, sessions) = session_fichier("range-suffixe-bd71", TAILLE).await;
+        let (statut, entetes, corps) = demander(sessions, "range-suffixe-bd71", "bytes=-500").await;
+
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            entete(&entetes, "Content-Range"),
+            "bytes 9500-9999/10000",
+            "le Content-Range doit annoncer la FIN du fichier"
+        );
+        assert_eq!(corps.len(), 500, "500 octets demandés, 500 servis");
+        let attendu: Vec<u8> = (TAILLE - 500..TAILLE).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            corps, attendu,
+            "un suffixe `bytes=-500` doit rendre les 500 DERNIERS octets ; \
+             servir les 500 premiers est la réponse à une autre question"
+        );
+    }
+
+    /// TÉMOIN. La reprise par tranches de l'Eversolo — le cas COURANT — doit
+    /// traverser ces corrections sans bouger d'un octet.
+    #[tokio::test]
+    async fn la_reprise_ordinaire_dun_renderer_est_servie_a_l_identique() {
+        const TAILLE: usize = 10_000;
+        let (_f, sessions) = session_fichier("range-temoin-bd71", TAILLE).await;
+        let (statut, entetes, corps) = demander(sessions, "range-temoin-bd71", "bytes=4096-").await;
+
+        assert_eq!(statut, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(entete(&entetes, "Content-Range"), "bytes 4096-9999/10000");
+        assert_eq!(entete(&entetes, "Content-Length"), "5904");
+        let attendu: Vec<u8> = (4096..TAILLE).map(|i| (i % 251) as u8).collect();
+        assert_eq!(corps, attendu);
     }
 }
