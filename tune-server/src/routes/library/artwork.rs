@@ -569,22 +569,96 @@ pub(super) async fn batch_enrich_artwork_status(State(state): State<AppState>) -
     }))
 }
 
-/// Décompte des artistes que la passe d'enrichissement va **réellement**
-/// traiter, ventilé par population.
+/// La NATURE d'un portrait manquant — quatre, et le geste de réparation n'est
+/// pas le même pour chacune.
 ///
-/// Les quatre champs reprennent, une pour une, les quatre listes que
+/// 🔴 #4692, Bilou (fil forum 1887) : « 12 portraits d'artistes seraient
+/// manquants (sur 1288 artistes) — comment les retrouver pour les corriger ? »
+/// Le nombre additionnait ces quatre populations sans jamais les distinguer,
+/// dont deux où la base annonce une photo qui n'existe plus sur le disque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NatureSansImage {
+    /// MBID connu, aucune image en base : un fournisseur peut la trouver.
+    SansImageAvecMbid,
+    /// MBID connu, `image_path` posé mais le fichier de cache a disparu.
+    CachePerduAvecMbid,
+    /// Aucun MBID, aucune image : la passe par NOM (Discogs / Last.fm).
+    SansImageSansMbid,
+    /// Aucun MBID, `image_path` posé mais le fichier de cache a disparu.
+    CachePerduSansMbid,
+}
+
+impl NatureSansImage {
+    /// La clé stable que l'API rend — le client la traduit.
+    pub fn cle(self) -> &'static str {
+        match self {
+            Self::SansImageAvecMbid => "sans_image_avec_mbid",
+            Self::CachePerduAvecMbid => "cache_perdu_avec_mbid",
+            Self::SansImageSansMbid => "sans_image_sans_mbid",
+            Self::CachePerduSansMbid => "cache_perdu_sans_mbid",
+        }
+    }
+
+    /// Image « fantôme » : la base annonce une photo, le fichier a disparu.
+    pub fn est_cache_perdu(self) -> bool {
+        matches!(self, Self::CachePerduAvecMbid | Self::CachePerduSansMbid)
+    }
+}
+
+/// Un artiste sans portrait visible, nommé.
+#[derive(Clone, Debug)]
+pub(super) struct ArtisteSansImage {
+    pub id: i64,
+    pub nom: String,
+    /// L'identifiant MusicBrainz, vide pour les deux populations « sans MBID ».
+    pub musicbrainz_id: String,
+    /// Le chemin que la base annonce alors que le fichier n'est plus là.
+    pub image_path_perdu: Option<String>,
+    pub nature: NatureSansImage,
+}
+
+impl ArtisteSansImage {
+    pub fn json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "name": self.nom,
+            "musicbrainz_id": (!self.musicbrainz_id.is_empty())
+                .then(|| self.musicbrainz_id.clone()),
+            "image_path": self.image_path_perdu,
+            "nature": self.nature.cle(),
+        })
+    }
+}
+
+/// Les artistes que la passe d'enrichissement va **réellement** traiter,
+/// ventilés par population — **et nommés**.
+///
+/// Les quatre listes reprennent, une pour une, celles que
 /// `batch_enrich_artist_artwork_inner` empile avant de boucler
 /// (`tune-core/src/library/artwork.rs`) : c'est la seule façon d'annoncer un
 /// total qui corresponde au travail lancé.
+///
+/// 🔴 #4692 — elles étaient construites à chaque appel puis **réduites à leur
+/// longueur sur place**. Les noms que Bilou demande existaient donc au moment
+/// même du comptage, et étaient jetés. Les garder ne coûte aucune requête de
+/// plus : les quatre `SELECT` tournaient déjà.
+///
+/// ⚠️ Et c'est la seule façon de rendre une liste qui corresponde au nombre
+/// affiché : ces quatre requêtes portent sur TOUTE la table `artists`, alors
+/// que la grille Bibliothèque › Artistes ne montre que les artistes d'album
+/// (`stats.rs`, `total_artists`). Mesuré sur le .18 en v0.9.162 le
+/// 23/09/2026 : `artists_without_image` = 2 339 quand `/library/stats` annonce
+/// 1 341 artistes. Un filtre « sans portrait » posé côté client listerait donc
+/// un ensemble DIFFÉRENT du nombre affiché — la liste doit venir d'ici.
 pub(super) struct ArtistesSansImage {
     /// MBID connu, aucune image en base (`list_without_image`).
-    pub avec_mbid: usize,
+    pub avec_mbid: Vec<ArtisteSansImage>,
     /// MBID connu, `image_path` posé mais le fichier de cache a disparu.
-    pub cache_perdu_avec_mbid: usize,
+    pub cache_perdu_avec_mbid: Vec<ArtisteSansImage>,
     /// Aucun MBID, aucune image (`list_without_image_no_mbid`).
-    pub sans_mbid: usize,
+    pub sans_mbid: Vec<ArtisteSansImage>,
     /// Aucun MBID, `image_path` posé mais le fichier de cache a disparu.
-    pub cache_perdu_sans_mbid: usize,
+    pub cache_perdu_sans_mbid: Vec<ArtisteSansImage>,
 }
 
 impl ArtistesSansImage {
@@ -595,16 +669,51 @@ impl ArtistesSansImage {
     /// `musicbrainz_id != ''`. Sur une bibliothèque non étiquetée le total
     /// tombait donc à zéro alors que la passe traite tout le monde (#2184).
     pub fn total(&self) -> usize {
-        self.avec_mbid + self.cache_perdu_avec_mbid + self.sans_mbid + self.cache_perdu_sans_mbid
+        self.avec_mbid.len()
+            + self.cache_perdu_avec_mbid.len()
+            + self.sans_mbid.len()
+            + self.cache_perdu_sans_mbid.len()
     }
 
     /// Les images « fantômes » : la base annonce une photo, le fichier a disparu.
     pub fn cache_perdu(&self) -> usize {
-        self.cache_perdu_avec_mbid + self.cache_perdu_sans_mbid
+        self.cache_perdu_avec_mbid.len() + self.cache_perdu_sans_mbid.len()
+    }
+
+    /// Les quatre populations bout à bout, triées par nom : la liste que
+    /// `total()` compte, dans le même appel, sans aucune requête de plus.
+    pub fn tous(&self) -> Vec<&ArtisteSansImage> {
+        let mut v: Vec<&ArtisteSansImage> = self
+            .avec_mbid
+            .iter()
+            .chain(self.cache_perdu_avec_mbid.iter())
+            .chain(self.sans_mbid.iter())
+            .chain(self.cache_perdu_sans_mbid.iter())
+            .collect();
+        // Tri stable et reproductible : l'ordre doit survivre à la pagination.
+        v.sort_by(|a, b| {
+            a.nom
+                .to_lowercase()
+                .cmp(&b.nom.to_lowercase())
+                .then(a.id.cmp(&b.id))
+        });
+        v
+    }
+
+    /// La ventilation, telle que l'API la rend.
+    pub fn ventilation(&self) -> Value {
+        json!({
+            "sans_image_avec_mbid": self.avec_mbid.len(),
+            "cache_perdu_avec_mbid": self.cache_perdu_avec_mbid.len(),
+            "sans_image_sans_mbid": self.sans_mbid.len(),
+            "cache_perdu_sans_mbid": self.cache_perdu_sans_mbid.len(),
+            "cache_perdu": self.cache_perdu(),
+            "total": self.total(),
+        })
     }
 }
 
-/// Compte les artistes sans image visible, MBID ou pas.
+/// Liste les artistes sans image visible, MBID ou pas, par population.
 pub(super) fn compter_artistes_sans_image(
     artist_repo: &tune_core::db::artist_repo::ArtistRepo,
     cache_dir: &std::path::Path,
@@ -613,23 +722,56 @@ pub(super) fn compter_artistes_sans_image(
         !tune_core::library::artwork::cached_artwork_exists(cache_dir, image_path)
     };
     ArtistesSansImage {
-        avec_mbid: artist_repo.list_without_image().unwrap_or_default().len(),
+        avec_mbid: artist_repo
+            .list_without_image()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, nom, mbid)| ArtisteSansImage {
+                id,
+                nom,
+                musicbrainz_id: mbid,
+                image_path_perdu: None,
+                nature: NatureSansImage::SansImageAvecMbid,
+            })
+            .collect(),
         cache_perdu_avec_mbid: artist_repo
             .list_with_image_and_mbid()
             .unwrap_or_default()
             .into_iter()
             .filter(|(_, _, _, image_path)| perdu(image_path))
-            .count(),
+            .map(|(id, nom, mbid, image_path)| ArtisteSansImage {
+                id,
+                nom,
+                musicbrainz_id: mbid,
+                image_path_perdu: Some(image_path),
+                nature: NatureSansImage::CachePerduAvecMbid,
+            })
+            .collect(),
         sans_mbid: artist_repo
             .list_without_image_no_mbid()
             .unwrap_or_default()
-            .len(),
+            .into_iter()
+            .map(|(id, nom)| ArtisteSansImage {
+                id,
+                nom,
+                musicbrainz_id: String::new(),
+                image_path_perdu: None,
+                nature: NatureSansImage::SansImageSansMbid,
+            })
+            .collect(),
         cache_perdu_sans_mbid: artist_repo
             .list_with_image_no_mbid()
             .unwrap_or_default()
             .into_iter()
             .filter(|(_, _, image_path)| perdu(image_path))
-            .count(),
+            .map(|(id, nom, image_path)| ArtisteSansImage {
+                id,
+                nom,
+                musicbrainz_id: String::new(),
+                image_path_perdu: Some(image_path),
+                nature: NatureSansImage::CachePerduSansMbid,
+            })
+            .collect(),
     }
 }
 
@@ -1752,11 +1894,85 @@ pub(super) async fn batch_enrich_artist_artwork_status(
     // condition d'arrêt (`artistImgRemaining === 0` ⇒ « terminé »). Le limiter
     // aux artistes porteurs d'un MBID faisait conclure « terminé » au premier
     // sondage sur toute bibliothèque non taguée.
-    let still_missing = compter_artistes_sans_image(&artist_repo, &artwork_cache_dir()).total();
+    let sans_image = compter_artistes_sans_image(&artist_repo, &artwork_cache_dir());
 
     Json(json!({
         "result": result,
-        "artists_without_image": still_missing,
+        "artists_without_image": sans_image.total(),
+        // 🔴 #4692 — le même nombre, VENTILÉ. « 12 artistes encore sans
+        // portrait » additionnait quatre natures dont deux images fantômes
+        // (chemin en base, fichier de cache disparu) : le geste de réparation
+        // n'est pas le même, et l'écran ne pouvait pas le dire. La ventilation
+        // ne coûte aucune requête de plus, les quatre `SELECT` tournaient déjà.
+        "artists_without_image_detail": sans_image.ventilation(),
+    }))
+}
+
+/// Les artistes sans portrait, NOMMÉS — `GET /library/artwork/artists-without-image`.
+///
+/// 🔴 #4692, Bilou (fil forum 1887, 22/09/2026) : « L'écran d'état du serveur
+/// m'indique que 12 portraits d'artistes seraient manquants (sur 1288
+/// artistes) — comment les retrouver pour les corriger ? » Réponse d'alors :
+/// aucun écran ne les liste, et le repli était de faire défiler la grille
+/// Artistes à l'œil.
+///
+/// La liste sort de la MÊME fonction que le nombre
+/// ([`compter_artistes_sans_image`]) : son `total` est, par construction,
+/// celui de `enrich-artists/status`. C'est le point qui interdisait de régler
+/// la demande côté client — un filtre « sans portrait » posé sur la grille
+/// Bibliothèque › Artistes listerait les seuls artistes d'ALBUM, donc un
+/// ensemble différent du nombre affiché (mesuré sur le .18 en v0.9.162 :
+/// 2 339 sans portrait, 1 341 artistes annoncés par `/library/stats`).
+///
+/// Paramètres : `limit` (200 par défaut, 1000 au plus), `offset`, et `nature`
+/// pour n'en garder qu'une des quatre.
+pub(super) async fn artists_without_image(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let artist_repo = tune_core::db::artist_repo::ArtistRepo::with_backend(state.backend.clone());
+    let sans_image = compter_artistes_sans_image(&artist_repo, &artwork_cache_dir());
+
+    let nature = params.get("nature").map(|s| s.as_str());
+    let tous = sans_image.tous();
+    let filtres: Vec<&ArtisteSansImage> = match nature {
+        // `cache_perdu` regroupe les deux natures fantômes : c'est la question
+        // qui tranche pour un testeur (la base annonce une photo qui n'est
+        // plus là), et elle se pose sans savoir si l'artiste a un MBID.
+        Some("cache_perdu") => tous
+            .into_iter()
+            .filter(|a| a.nature.est_cache_perdu())
+            .collect(),
+        Some(n) => tous.into_iter().filter(|a| a.nature.cle() == n).collect(),
+        None => tous,
+    };
+
+    let offset: usize = params
+        .get("offset")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200)
+        .clamp(1, 1000);
+
+    let page: Vec<Value> = filtres
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|a| a.json())
+        .collect();
+
+    Json(json!({
+        "artists": page,
+        // Le nombre de la SÉLECTION (après `nature`), pour paginer.
+        "total": filtres.len(),
+        // Et celui de l'écran d'état, toujours, pour que les deux se comparent.
+        "artists_without_image": sans_image.total(),
+        "detail": sans_image.ventilation(),
+        "limit": limit,
+        "offset": offset,
     }))
 }
 
@@ -1970,9 +2186,10 @@ mod tests_decompte_artistes {
 
         let compte = compter_artistes_sans_image(&repo, cache.path());
 
-        assert_eq!(compte.avec_mbid, 0, "aucun artiste n'a de MBID");
+        assert_eq!(compte.avec_mbid.len(), 0, "aucun artiste n'a de MBID");
         assert_eq!(
-            compte.sans_mbid, 3,
+            compte.sans_mbid.len(),
+            3,
             "les trois sont sans MBID et sans image"
         );
         assert_eq!(
@@ -2001,7 +2218,7 @@ mod tests_decompte_artistes {
 
         let compte = compter_artistes_sans_image(&repo, cache.path());
 
-        assert_eq!(compte.cache_perdu_sans_mbid, 1);
+        assert_eq!(compte.cache_perdu_sans_mbid.len(), 1);
         assert_eq!(compte.total(), 1);
     }
 
@@ -2057,12 +2274,106 @@ mod tests_decompte_artistes {
 
         let compte = compter_artistes_sans_image(&repo, cache.path());
 
-        assert_eq!(compte.avec_mbid, 1);
-        assert_eq!(compte.cache_perdu_avec_mbid, 1);
-        assert_eq!(compte.sans_mbid, 1);
-        assert_eq!(compte.cache_perdu_sans_mbid, 1);
+        assert_eq!(compte.avec_mbid.len(), 1);
+        assert_eq!(compte.cache_perdu_avec_mbid.len(), 1);
+        assert_eq!(compte.sans_mbid.len(), 1);
+        assert_eq!(compte.cache_perdu_sans_mbid.len(), 1);
         assert_eq!(compte.total(), 4, "quatre artistes sans photo visible");
         assert_eq!(compte.cache_perdu(), 2);
+    }
+
+    /// 🔴 #4692 — les noms que le comptage construisait, puis jetait.
+    ///
+    /// Bilou demande « comment les retrouver pour les corriger ». Jusqu'ici la
+    /// seule réponse exacte était « aucun écran ne les liste » : les quatre
+    /// listes nominatives étaient réduites à leur longueur sur place.
+    #[test]
+    fn la_liste_nominative_survit_au_comptage() {
+        let backend = base_memoire();
+        let repo = ArtistRepo::with_backend(backend);
+        let cache = tempfile::tempdir().unwrap();
+        let present = "99998888777766665555444433332222";
+        std::fs::write(cache.path().join(format!("{present}.jpg")), b"jpeg").unwrap();
+
+        artiste(&repo, "Zao", Some("mbid-a"), None);
+        artiste(
+            &repo,
+            "Ange",
+            Some("mbid-b"),
+            Some("00000000000000000000000000000000"),
+        );
+        artiste(&repo, "Magma", None, None);
+        artiste(&repo, "servi", Some("mbid-c"), Some(present));
+
+        let compte = compter_artistes_sans_image(&repo, cache.path());
+        let tous = compte.tous();
+
+        // ⭐ L'invariant qui vaut le correctif : la liste et le nombre sortent
+        // du MÊME calcul. Un filtre posé ailleurs listerait un autre ensemble.
+        assert_eq!(
+            tous.len(),
+            compte.total(),
+            "la liste doit avoir exactement la longueur du nombre affiché"
+        );
+
+        let noms: Vec<&str> = tous.iter().map(|a| a.nom.as_str()).collect();
+        assert_eq!(
+            noms,
+            vec!["Ange", "Magma", "Zao"],
+            "les trois artistes sans photo, nommés et triés — « servi » exclu"
+        );
+
+        // Et chacun porte la NATURE de son manque : le geste de réparation
+        // n'est pas le même pour une image fantôme que pour une image absente.
+        let nature = |nom: &str| {
+            tous.iter()
+                .find(|a| a.nom == nom)
+                .expect("artiste listé")
+                .nature
+        };
+        assert_eq!(nature("Zao").cle(), "sans_image_avec_mbid");
+        assert_eq!(nature("Ange").cle(), "cache_perdu_avec_mbid");
+        assert!(
+            nature("Ange").est_cache_perdu(),
+            "la base annonce une photo qui n'est plus sur le disque"
+        );
+        assert_eq!(nature("Magma").cle(), "sans_image_sans_mbid");
+        assert!(!nature("Magma").est_cache_perdu());
+
+        // Le chemin fantôme est rendu : c'est ce qui permet de dire POURQUOI.
+        assert!(
+            tous.iter()
+                .find(|a| a.nom == "Ange")
+                .and_then(|a| a.image_path_perdu.as_deref())
+                .is_some(),
+            "l'entrée « cache perdu » doit nommer le chemin que la base annonce"
+        );
+        assert!(
+            tous.iter()
+                .find(|a| a.nom == "Zao")
+                .expect("Zao")
+                .image_path_perdu
+                .is_none(),
+            "une image jamais posée n'a pas de chemin perdu"
+        );
+
+        // La ventilation rendue par l'API somme au total, sans terme oublié.
+        let v = compte.ventilation();
+        assert_eq!(v["total"].as_u64(), Some(3));
+        assert_eq!(v["cache_perdu"].as_u64(), Some(1));
+        let somme: u64 = [
+            "sans_image_avec_mbid",
+            "cache_perdu_avec_mbid",
+            "sans_image_sans_mbid",
+            "cache_perdu_sans_mbid",
+        ]
+        .iter()
+        .map(|k| v[*k].as_u64().unwrap_or(0))
+        .sum();
+        assert_eq!(
+            somme, 3,
+            "les quatre natures doivent recouvrir le total, sans trou : {v}"
+        );
     }
 }
 
@@ -2648,5 +2959,133 @@ mod tests {
         );
         // Une passe inconnue garde le repli historique.
         assert_eq!(libelle_phase(None), "MusicBrainz");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #4692 — la liste nominative derrière « N artistes encore sans portrait ».
+//
+// La garde ci-dessus éprouve le CALCUL ; celle-ci éprouve qu'une route le
+// sert. Sans elle, une liste parfaitement construite resterait invisible du
+// client — exactement l'état que le ticket décrit (« construite à chaque
+// appel puis jetée, aucune route ne la rend »).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod liste_des_artistes_sans_portrait_4692 {
+    use crate::state::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use tune_core::db::artist_repo::ArtistRepo;
+
+    async fn get(etat: &AppState, chemin: &str) -> (StatusCode, Value) {
+        let reponse = super::super::router()
+            .with_state(etat.clone())
+            .oneshot(Request::get(chemin).body(Body::empty()).expect("requête"))
+            .await
+            .expect("réponse");
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .expect("corps");
+        (
+            statut,
+            serde_json::from_slice(&octets).unwrap_or(Value::Null),
+        )
+    }
+
+    fn etat_avec_trois_artistes_sans_portrait() -> AppState {
+        let etat = AppState::new(":memory:", 0, Default::default()).expect("état en mémoire");
+        let repo = ArtistRepo::with_backend(etat.backend.clone());
+        for nom in ["Zao", "Ange", "Magma"] {
+            repo.get_or_create(nom, None, None).expect("artiste");
+        }
+        etat
+    }
+
+    /// La route existe, elle NOMME, et son total est celui de l'écran d'état.
+    #[tokio::test]
+    async fn la_route_nomme_les_artistes_et_s_accorde_au_compteur() {
+        let etat = etat_avec_trois_artistes_sans_portrait();
+
+        let (statut, corps) = get(&etat, "/artwork/artists-without-image").await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "aucune route ne rendait cette liste : {corps}"
+        );
+
+        let noms: Vec<&str> = corps["artists"]
+            .as_array()
+            .expect("un tableau d'artistes")
+            .iter()
+            .filter_map(|a| a["name"].as_str())
+            .collect();
+        assert_eq!(
+            noms,
+            vec!["Ange", "Magma", "Zao"],
+            "les artistes sans portrait doivent être nommés : {corps}"
+        );
+
+        // ⭐ L'accord avec l'écran d'état : même calcul, donc même nombre.
+        let (_, statut_ecran) = get(&etat, "/artwork/enrich-artists/status").await;
+        assert_eq!(
+            corps["artists_without_image"], statut_ecran["artists_without_image"],
+            "la liste et le nombre affiché doivent sortir du même calcul — \
+             sinon un filtre listerait un ensemble différent du compteur : \
+             liste={corps}, écran={statut_ecran}"
+        );
+        assert_eq!(
+            corps["artists"].as_array().map(|a| a.len()),
+            statut_ecran["artists_without_image"]
+                .as_u64()
+                .map(|n| n as usize),
+            "{corps}"
+        );
+
+        // Chaque entrée porte sa nature, et l'écran d'état la ventile aussi.
+        assert_eq!(corps["artists"][0]["nature"], "sans_image_sans_mbid");
+        assert_eq!(
+            statut_ecran["artists_without_image_detail"]["sans_image_sans_mbid"].as_u64(),
+            Some(3),
+            "l'écran d'état doit ventiler les quatre natures : {statut_ecran}"
+        );
+        assert_eq!(
+            statut_ecran["artists_without_image_detail"]["cache_perdu"].as_u64(),
+            Some(0),
+            "aucune image fantôme ici : {statut_ecran}"
+        );
+    }
+
+    /// La pagination et le filtre par nature, sans quoi 2 339 entrées
+    /// (mesurées sur le .18 en v0.9.162) partiraient en une seule réponse.
+    #[tokio::test]
+    async fn la_liste_se_pagine_et_se_filtre_par_nature() {
+        let etat = etat_avec_trois_artistes_sans_portrait();
+
+        let (_, page) = get(&etat, "/artwork/artists-without-image?limit=2").await;
+        assert_eq!(
+            page["artists"].as_array().map(|a| a.len()),
+            Some(2),
+            "{page}"
+        );
+        assert_eq!(
+            page["total"].as_u64(),
+            Some(3),
+            "le total reste celui de la sélection entière, pas de la page : {page}"
+        );
+
+        let (_, suite) = get(&etat, "/artwork/artists-without-image?limit=2&offset=2").await;
+        assert_eq!(suite["artists"][0]["name"], "Zao", "{suite}");
+
+        // Une nature qui n'a personne rend une liste vide, pas la liste entière.
+        let (_, fantomes) = get(&etat, "/artwork/artists-without-image?nature=cache_perdu").await;
+        assert_eq!(fantomes["total"].as_u64(), Some(0), "{fantomes}");
+        assert_eq!(
+            fantomes["artists_without_image"].as_u64(),
+            Some(3),
+            "le compteur d'ensemble reste rendu à côté de la sélection : {fantomes}"
+        );
     }
 }

@@ -141,6 +141,38 @@ pub(crate) fn compte_albums(
     match_mode: &str,
     profile_id: i64,
 ) -> i64 {
+    let (en_base, en_service) = compte_albums_ventile(
+        backend,
+        sql_bibliotheque,
+        rules_json,
+        match_mode,
+        profile_id,
+    );
+    en_base + en_service
+}
+
+/// Le même compte, mais SÉPARÉ : ce que la bibliothèque apporte, et ce que les
+/// favoris de service ajoutent.
+///
+/// 🔴 #4466 — la seconde moitié du ticket. `album_count` sait additionner les
+/// deux depuis #4470 ; `track_count` ne le peut pas, et c'est structurel :
+/// `streaming_favorites` (`tune-core/src/db/migrations.rs:739`) ne porte que
+/// service, identifiant, titre, artiste, album et pochette. **Un album favori
+/// d'un service n'a pas de nombre de pistes à ajouter** — d'où le
+/// `"track_count": 0` de `source_streaming::album_json`.
+///
+/// Savoir si le service contribue est donc ce qui décide si le compte de
+/// pistes de la bibliothèque est le compte COMPLET, ou seulement une moitié.
+/// Le corps de l'issue tranchait déjà : « qu'ils passent par le même chemin
+/// complet que la vue — ou, à défaut, qu'ils ne soient pas rendus plutôt que
+/// rendus faux ». Il n'y a rien à additionner : reste à ne pas rendre.
+pub(crate) fn compte_albums_ventile(
+    backend: &dyn tune_core::db::backend::DbBackend,
+    sql_bibliotheque: &str,
+    rules_json: &str,
+    match_mode: &str,
+    profile_id: i64,
+) -> (i64, i64) {
     let un = |sql: &str| {
         backend
             .query_many(sql, &[])
@@ -153,7 +185,7 @@ pub(crate) fn compte_albums(
         source_streaming::requete_compte(rules_json, match_mode, Objet::Album, profile_id)
             .map(|sql| un(&sql))
             .unwrap_or(0);
-    en_base + en_service
+    (en_base, en_service)
 }
 
 async fn list_collections(
@@ -199,25 +231,46 @@ async fn list_collections(
                  LEFT JOIN artists ar ON al.artist_id = ar.id \
                  LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
             );
-            col["album_count"] = json!(compte_albums(
+            let (albums_en_base, albums_de_service) = compte_albums_ventile(
                 &*state.backend,
                 &album_count_sql,
                 &rules_str,
                 match_mode,
                 profile.id(),
-            ));
-            let track_count_sql = format!(
-                "SELECT COUNT(DISTINCT t.id) FROM albums al \
-                 LEFT JOIN artists ar ON al.artist_id = ar.id \
-                 LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
             );
-            if let Ok(rs) = state.backend.query_many(&track_count_sql, &[]) {
-                col["track_count"] = json!(
-                    rs.first()
-                        .and_then(|r| r.first())
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0)
+            col["album_count"] = json!(albums_en_base + albums_de_service);
+            // 🔴 #4466 — `track_count` ne compte QUE la base. Tant que les
+            // favoris de service n'entrent pas dans la collection, c'est le
+            // compte complet et il se rend. Dès qu'ils y entrent, il ne
+            // couvre plus qu'une part du contenu — et une collection faite de
+            // 3 albums favoris Qobuz affichait « 3 albums · 0 piste ».
+            //
+            // Il n'y a rien à additionner : `streaming_favorites` ne porte
+            // aucun nombre de pistes. On ne rend donc PAS le champ, ce que le
+            // corps de l'issue demandait explicitement à défaut du compte
+            // complet — « un 0 sur une collection pleine est pire qu'une
+            // absence de compte ». Le client teste déjà `track_count != null`
+            // (`SmartCollectionsView.svelte`) : la mention de pistes
+            // disparaît, le nombre d'albums reste.
+            let compte_complet = albums_de_service == 0;
+            if compte_complet {
+                let track_count_sql = format!(
+                    "SELECT COUNT(DISTINCT t.id) FROM albums al \
+                     LEFT JOIN artists ar ON al.artist_id = ar.id \
+                     LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
                 );
+                if let Ok(rs) = state.backend.query_many(&track_count_sql, &[]) {
+                    col["track_count"] = json!(
+                        rs.first()
+                            .and_then(|r| r.first())
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0)
+                    );
+                }
+            } else {
+                // Et on DIT pourquoi, plutôt que de laisser un champ
+                // manquant s'expliquer tout seul.
+                col["track_count_partiel"] = json!(true);
             }
             // #4473, arbitrage 2 : le catalogue n'est PAS compté (un appel
             // réseau par collection et par affichage), mais la liste le dit,
@@ -490,11 +543,11 @@ pub fn build_album_query(
     let mut conditions = Vec::new();
     for rule in &rules {
         let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
-        let raw_op = rule
-            .get("operator")
-            .or_else(|| rule.get("op"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("contains");
+        // 🔴 #4467 — les deux clés, lues UNE seule fois pour les quatre
+        // analyseurs. L'ordre y est `op` puis `operator` : la précédence ne
+        // change que pour une règle qui porterait les DEUX, ce qu'aucun
+        // éditeur n'écrit.
+        let raw_op = crate::regles_sql::lire_op(rule);
         let op = match raw_op {
             "=" | "eq" | "equals" => "=",
             "!=" | "ne" | "not_equals" => "!=",
@@ -1590,6 +1643,103 @@ mod tests {
             reponse.0[1]["catalogue_service"], "qobuz",
             "{}",
             reponse.0[1]
+        );
+    }
+
+    /// 🔴 #4466 — « 3 albums · 0 piste » : le compteur de PISTES d'une
+    /// collection faite de favoris de service.
+    ///
+    /// `album_count` sait les additionner depuis #4470. `track_count`, lui,
+    /// reste le seul `COUNT(DISTINCT t.id)` de la base — et
+    /// `streaming_favorites` ne porte aucun nombre de pistes à y ajouter. Le
+    /// champ n'est donc plus RENDU quand des favoris de service entrent dans
+    /// la collection, au lieu d'annoncer un 0 démenti par la vue.
+    ///
+    /// L'épreuve passe par le HANDLER : une garde sur la seule fonction de
+    /// comptage laisserait passer un débranchement de la condition.
+    #[tokio::test]
+    async fn le_compte_de_pistes_ne_se_rend_pas_quand_il_serait_partiel() {
+        use crate::SmartHttpState;
+        use std::sync::Arc;
+        use tune_core::db::backend::ToSqlValue;
+        use tune_core::db::sqlite::SqliteDb;
+        use tune_http_types::ActiveProfile;
+
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS smart_collections (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, rules TEXT,
+                     match_mode TEXT, sort_by TEXT, sort_order TEXT, max_limit INTEGER,
+                     description TEXT, icon TEXT, color TEXT, created_at TEXT);
+                 CREATE TABLE IF NOT EXISTS streaming_favorites (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id INTEGER,
+                     item_type TEXT, service TEXT, service_id TEXT, title TEXT,
+                     artist TEXT, album TEXT, cover_url TEXT, created_at TEXT);",
+            )
+            .expect("tables");
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        // « A » d'abord : la liste est triée par nom.
+        backend
+            .execute(
+                "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order) \
+                 VALUES ('A Qobuz', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"source","op":"=","value":"qobuz"}]"# as &dyn ToSqlValue],
+            )
+            .expect("collection de service");
+        backend
+            .execute(
+                "INSERT INTO smart_collections (name, rules, match_mode, sort_by, sort_order) \
+                 VALUES ('B Jazz local', ?1, 'all', 'title', 'asc')",
+                &[&r#"[{"field":"genre","op":"contains","value":"jazz"}]"# as &dyn ToSqlValue],
+            )
+            .expect("collection de bibliothèque");
+        for t in ["album", "album", "album"] {
+            backend
+                .execute(
+                    "INSERT INTO streaming_favorites (profile_id, item_type, service, service_id, title) \
+                     VALUES (1, ?1, 'qobuz', 'x', 'y')",
+                    &[&t as &dyn ToSqlValue],
+                )
+                .expect("favori");
+        }
+
+        let etat = SmartHttpState::new(backend);
+        let Ok(reponse) =
+            super::list_collections(axum::extract::State(etat), ActiveProfile(1)).await
+        else {
+            panic!("la liste doit répondre");
+        };
+
+        let service = &reponse.0[0];
+        assert_eq!(
+            service["album_count"].as_i64(),
+            Some(3),
+            "les 3 favoris ALBUM Qobuz sont bien là : {service}"
+        );
+        assert!(
+            service["track_count"].is_null(),
+            "un compte de pistes qui ne couvre pas les favoris de service ne doit PAS être rendu — obtenu : {service}"
+        );
+        assert_eq!(
+            service["track_count_partiel"], true,
+            "et l'absence doit se dire : {service}"
+        );
+
+        // Contre-partie indispensable : sans favori de service, le compte est
+        // complet et il se rend. Sans cette moitié, supprimer purement le
+        // champ passerait au vert.
+        let locale = &reponse.0[1];
+        assert!(
+            !locale["track_count"].is_null(),
+            "une collection de bibliothèque garde son compte de pistes : {locale}"
+        );
+        assert!(
+            locale["track_count_partiel"].is_null(),
+            "et ne s'annonce pas partielle : {locale}"
         );
     }
 
