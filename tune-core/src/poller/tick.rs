@@ -1680,6 +1680,10 @@ impl PositionPoller {
                         // seuil d'échec, seule à interroger le gestionnaire de
                         // flux, la remplace par un verdict mesuré.
                         consommation: fsm::ConsommationFlux::Inconnue,
+                        // #4480 — même règle que `consommation` : le bras du
+                        // seuil d'échec est le seul à savoir, et il le
+                        // remplace par un verdict mesuré.
+                        avance_audio_couvre_l_arret: false,
                         dlna_dsd_reached_end,
                     };
                     let mut fsm_actual: Option<fsm::StoppedOutcome>;
@@ -2049,6 +2053,42 @@ impl PositionPoller {
                                 }
                                 fsm_in.consommation = consommation;
 
+                                // 🔴 #4480 — le compteur d'octets ne dit RIEN
+                                // tant qu'on ne le convertit pas en secondes
+                                // d'audio. `ASec` ne signifie que « la socket
+                                // n'a pas bougé depuis le tour d'avant » : sur
+                                // une livraison à contre-pression, c'est
+                                // exactement ce que fait un renderer qui a
+                                // tamponné loin devant et n'a plus de place.
+                                //
+                                // Le terrain : 34 406 444 octets de WAV
+                                // 44,1/16 servis — 195 s d'audio — pour une
+                                // position annoncée de 23 s. Tune coupait.
+                                //
+                                // On ne pose la question qu'ici, dans le seul
+                                // bras qui coupe, et seulement quand le
+                                // compteur est mesuré et à sec : un tour
+                                // ordinaire ne paie pas ce verrou.
+                                let audio_servi_ms: Option<u64> =
+                                    if consommation == fsm::ConsommationFlux::ASec {
+                                        match stream_id.as_deref() {
+                                            Some(sid) => {
+                                                self.orchestrator.streamer_audio_servi_ms(sid).await
+                                            }
+                                            None => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let avance_audio_ms =
+                                    fsm::avance_audio_ms(audio_servi_ms, ps.peak_position_ms);
+                                let famine_etablie = fsm::famine_etablie_malgre_l_avance(
+                                    avance_audio_ms,
+                                    ps.premier_arret_a.map(|t| t.elapsed()),
+                                    AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                );
+                                fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
+
                                 if consommation == fsm::ConsommationFlux::Consomme {
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
                                     ps.transition(fsm::Transition::AttenteProlongee);
@@ -2082,6 +2122,33 @@ impl PositionPoller {
                                             "octets_servis_inconnus_zone_non_coupee"
                                         );
                                     }
+                                } else if !famine_etablie {
+                                    // #4480 — la socket est à sec, le renderer
+                                    // ne l'est pas : il lui reste de l'audio
+                                    // devant la position qu'il annonce. On
+                                    // attend, dans la borne haute, et on le
+                                    // DIT — sans cette ligne l'épargne serait
+                                    // aussi muette que la coupure l'était.
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingAvance);
+                                    ps.transition(fsm::Transition::AttenteProlongee);
+                                    if ps.stopped_ticks % 30 == 0 {
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            wall_secs = wall_elapsed,
+                                            bytes_sent = octets_servis.unwrap_or(0),
+                                            consommation = consommation.etiquette(),
+                                            audio_servi_ms = audio_servi_ms.unwrap_or(0),
+                                            avance_ms = avance_audio_ms.unwrap_or(0),
+                                            arret_secs = ps
+                                                .premier_arret_a
+                                                .map(|t| t.elapsed().as_secs())
+                                                .unwrap_or(0),
+                                            borne_haute_secs = AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                            "audio_livree_devant_la_position_zone_non_coupee"
+                                        );
+                                    }
                                 } else {
                                     let current_bytes = octets_servis.unwrap_or(0);
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureStop);
@@ -2103,6 +2170,15 @@ impl PositionPoller {
                                             .premier_arret_a
                                             .map(|t| t.elapsed().as_secs())
                                             .unwrap_or(0),
+                                        // #4480 — et de quoi juger la famine
+                                        // elle-même : l'audio livrée, et ce
+                                        // qu'il en restait devant la position.
+                                        // `0` sur l'avance = le renderer était
+                                        // bien au bout de ce qu'on lui a
+                                        // servi ; un débit nominal inconnu se
+                                        // lit sur `audio_servi_ms = 0`.
+                                        audio_servi_ms = audio_servi_ms.unwrap_or(0),
+                                        avance_ms = avance_audio_ms.unwrap_or(0),
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;
