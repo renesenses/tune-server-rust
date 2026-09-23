@@ -88,15 +88,53 @@
 //!   `Official DR value: DRn`, et les mesures au format
 //!   `DR%-2.0f %10.2f dB %8.2f dB` (`DEFAULT_DR_FORMAT`,
 //!   `dr_plugin/src/dr_meter_plugin.c`).
-//! - **MAAT DROffline MkII** → **nom NON ÉTABLI, et rien n'a été ajouté pour
-//!   lui.** Son manuel (`DROfflineMkII_UM.pdf`, sections « Settings » et
-//!   « Global Tab ») décrit une case *Create Log File*, un dossier de sortie
-//!   au choix (dossier source, *Analysis Folder* ou *Alternate Folder*) et un
-//!   format « plain ASCII text, where commas are used to create structure » ou
-//!   TSV — mais **ne donne ni le nom du fichier, ni un exemple de mise en
-//!   page**. Une sortie à virgules ou tabulée n'est PAS la mise en page du TT
-//!   DR ; l'analyseur ne la lirait probablement pas. Tant qu'un rapport réel
-//!   n'est pas en main, on n'invente ni son nom ni son format.
+//! - **MAAT DROffline MkII** → **aucun nom fixe non plus**, et surtout **une
+//!   AUTRE mise en page** : voir la section suivante. Son manuel
+//!   (`DROfflineMkII_UM.pdf`, sections « Settings » et « Global Tab ») décrit
+//!   une case *Create Log File*, un dossier de sortie au choix (dossier
+//!   source, *Analysis Folder* ou *Alternate Folder*) et un format « plain
+//!   ASCII text, where commas are used to create structure » ou TSV. **Les
+//!   deux rapports réels démentent cette description** : ni virgule ni
+//!   tabulation, un tableau à barres verticales.
+//!
+//! # DROffline MkII (#4352) : là, c'est l'ANALYSEUR qui refusait
+//!
+//! Pour DeaDBeeF, le blocage était la découverte, et l'élargissement des noms
+//! l'a levé. Pour DROffline MkII, il est ailleurs. Mesuré le 20/09/2026 sur
+//! les deux pièces jointes de Patatorz (fil 1781, réponse 6568), passées au
+//! module livré en v0.9.158 : `lignes=0`, `dr_album=None`, `entete=false` —
+//! **et la même chose après les avoir renommées `foo_dr.txt`**. Le nom n'y
+//! était pour rien.
+//!
+//! Le plus court des deux, intégral :
+//!
+//! ```text
+//! Folder Path:   /Volumes/music-1/00_music/studio_masters/GoGo Penguin/Live At Abbey Road EP
+//!
+//!                   File Name | Format |  SR | Word Length | Max. TPL |  LUFSi | DR (PMF) |
+//!
+//!  01 - Branches Break (Live) |  .flac | 48k |          24 |    -0.37 | -12.01 |        7 |
+//!       02 - GBFISYSIH (Live) |  .flac | 48k |          24 |    -0.37 | -16.21 |       11 |
+//!        03 - Initiate (Live) |  .flac | 48k |          24 |    -0.39 | -10.25 |        7 |
+//! 04 - Ocean In A Drop (Live) |  .flac | 48k |          24 |    -0.32 | -11.49 |        7 |
+//!
+//! Number of EP/Album Files: 4
+//! Official EP/Album DR: 8
+//! ```
+//!
+//! Rien de ce que le lecteur TT DR cherche n'y est : la valeur DR est en
+//! **dernière** colonne et en **entier nu**, pas en tête et pas préfixée
+//! `DR` ; il n'y a ni `Peak` ni `RMS` mais un true peak (`Max. TPL`) et une
+//! loudness intégrée (`LUFSi`) ; et le total s'écrit `Official EP/Album DR:`.
+//! D'où un **second analyseur** ([`analyser_droffline`]), et non un nom de
+//! plus dans la liste : [`analyser`] aiguille sur la présence de l'en-tête à
+//! barres verticales, qu'un rapport TT DR ne peut pas porter.
+//!
+//! Le nom réel des deux fichiers est `<dernier segment du Folder Path>_log.txt`
+//! (`Live At Abbey Road EP_log.txt`). Ce n'est **pas** ajouté aux noms
+//! établis : deux exemplaires font une régularité, pas une règle, et la porte
+//! des candidats suffit — l'en-tête DROffline signe le rapport
+//! ([`RapportDr::est_signe`]).
 //!
 //! # Comment on élargit sans lire n'importe quoi
 //!
@@ -157,10 +195,11 @@ pub struct RapportDr {
     /// `Official DR value: DR9`. Lu, pas écrit : voir le module.
     pub dr_album: Option<u8>,
     pub lignes: Vec<LigneDr>,
-    /// Vrai quand le texte portait la ligne d'en-tête de colonnes
-    /// `DR … Peak … RMS`. C'est, avec `dr_album`, ce qui distingue un
-    /// RAPPORT d'un texte où des lignes ressemblent à des mesures — voir
-    /// [`RapportDr::est_signe`].
+    /// Vrai quand le texte portait une ligne d'en-tête de colonnes — celle du
+    /// TT DR (`DR … Peak … RMS`) ou celle de DROffline MkII
+    /// (`File Name | … | DR (PMF) |`). C'est, avec `dr_album`, ce qui
+    /// distingue un RAPPORT d'un texte où des lignes ressemblent à des
+    /// mesures — voir [`RapportDr::est_signe`].
     pub entete: bool,
     /// Le dossier que le mesureur dit avoir analysé, quand il l'écrit —
     /// `Folder Path:` chez DROffline MkII (#4352). Le TT DR ne l'écrit pas,
@@ -240,7 +279,23 @@ fn decoder_windows_1252(octets: &[u8]) -> String {
 /// Analyse le texte d'un rapport. Ne rend jamais d'erreur : une ligne qui
 /// n'est pas une mesure est ignorée, et un rapport sans aucune mesure rend
 /// un [`RapportDr`] vide.
+///
+/// Deux mises en page, deux analyseurs (#4352) : celle du TT DR — colonnes à
+/// largeur fixe, sans délimiteur, DR en TÊTE de ligne — et celle de MAAT
+/// DROffline MkII — colonnes séparées par des barres verticales, DR en
+/// DERNIÈRE position et en entier nu. Le choix se fait sur la présence d'un
+/// en-tête DROffline, qui ne peut pas apparaître dans un rapport TT DR (le
+/// second ne contient aucune barre verticale).
 pub fn analyser(texte: &str) -> RapportDr {
+    match colonnes_droffline(texte) {
+        Some(colonnes) => analyser_droffline(texte, &colonnes),
+        None => analyser_tt_dr(texte),
+    }
+}
+
+/// La mise en page du TT DR Offline Meter, celle que reprennent le DR Meter
+/// de foobar2000, `dr14_t.meter` et le `dr_meter` de DeaDBeeF.
+fn analyser_tt_dr(texte: &str) -> RapportDr {
     let mut rapport = RapportDr::default();
     // Le mesureur n'ajoute les colonnes par canal que quand il en a. Ce
     // n'est qu'à cette condition que des `dB` en queue de ligne sont des
@@ -268,12 +323,20 @@ pub fn analyser(texte: &str) -> RapportDr {
             brutes.push(l);
         }
     }
+    rapport.lignes = assembler(brutes);
+    rapport
+}
+
+/// Découpe la colonne « piste » de chaque ligne brute en numéro de disque,
+/// numéro de piste et titre. Commun aux deux analyseurs : ce découpage dépend
+/// de l'ENSEMBLE des lignes (coffrets), il ne peut pas se faire ligne à ligne.
+fn assembler(brutes: Vec<LigneBrute>) -> Vec<LigneDr> {
     // Coffrets : `1-01 Titre`. La forme disque-piste n'est retenue que si
     // TOUTES les lignes la portent — sur une seule, `01-12 Bars Blues` serait
     // lu « disque 1, piste 12 » et apparié à la mauvaise piste.
     let en_disque_piste =
         !brutes.is_empty() && brutes.iter().all(|l| DISQUE_ET_NUMERO.is_match(&l.piste));
-    rapport.lignes = brutes
+    brutes
         .into_iter()
         .map(|l| {
             let (disque, numero, titre) = match (en_disque_piste, NUMERO_EN_TETE.captures(&l.piste))
@@ -300,7 +363,147 @@ pub fn analyser(texte: &str) -> RapportDr {
                 multicanal: l.multicanal,
             }
         })
+        .collect()
+}
+
+/// Le nom des colonnes de l'en-tête DROffline MkII, s'il y en a un dans le
+/// texte. C'est le seul aiguillage entre les deux analyseurs.
+///
+/// Mesuré sur les deux pièces jointes de Patatorz (fil 1781, réponse 6568) :
+///
+/// ```text
+///                   File Name | Format |  SR | Word Length | Max. TPL |  LUFSi | DR (PMF) |
+/// ```
+///
+/// Reconnu par sa STRUCTURE, pas par la liste exacte des colonnes : une
+/// colonne `File Name` et une colonne dont le nom commence par `DR`. Le
+/// manuel MAAT annonce trois formats d'export (virgules, TSV, et celui-ci) et
+/// ne documente aucune de ces colonnes ; on ne fige donc que ce qui a été
+/// mesuré, et un réglage qui ajoute ou retire une colonne du milieu ne casse
+/// rien — c'est l'en-tête qui donne les positions.
+fn colonnes_droffline(texte: &str) -> Option<Vec<String>> {
+    texte.lines().find_map(|ligne| {
+        if !ligne.contains('|') {
+            return None;
+        }
+        let colonnes = decouper_aux_barres(ligne);
+        let a_le_nom = colonnes.iter().any(|c| c.eq_ignore_ascii_case("File Name"));
+        let a_le_dr = colonnes.iter().any(|c| est_colonne_dr(c));
+        (a_le_nom && a_le_dr).then_some(colonnes)
+    })
+}
+
+/// Découpe une ligne aux barres verticales. La ligne finit par `| ` : le
+/// champ vide de queue n'est pas une colonne.
+fn decouper_aux_barres(ligne: &str) -> Vec<String> {
+    let mut champs: Vec<String> = ligne
+        .trim_end_matches('\r')
+        .split('|')
+        .map(|c| c.trim().to_string())
         .collect();
+    while champs.last().is_some_and(String::is_empty) {
+        champs.pop();
+    }
+    champs
+}
+
+/// `DR (PMF)`, `DR`, `DR(PMF)` — la colonne qui porte la plage dynamique.
+/// `Word Length` ou `LUFSi` ne commencent pas par `DR`, et la colonne
+/// `Duration` d'un éventuel autre réglage non plus.
+fn est_colonne_dr(nom: &str) -> bool {
+    let n = nom.trim();
+    if !n.get(..2).is_some_and(|d| d.eq_ignore_ascii_case("dr")) {
+        return false;
+    }
+    matches!(n.as_bytes().get(2).copied(), None | Some(b' ') | Some(b'('))
+}
+
+/// La mise en page de MAAT DROffline MkII (#4352), telle que les deux
+/// rapports réels de Patatorz l'écrivent.
+///
+/// Quatre différences avec le TT DR, et chacune est une raison pour laquelle
+/// l'analyseur ci-dessus rendait ZÉRO ligne sur ces fichiers, même renommés
+/// `foo_dr.txt` (mesuré le 20/09/2026) :
+///
+/// 1. les colonnes sont séparées par des **barres verticales**, pas par des
+///    largeurs fixes ;
+/// 2. la valeur DR est en **dernière** position et en **entier nu** (`7`),
+///    quand `analyser_ligne` exige un premier jeton `DR<n>` ;
+/// 3. il n'y a ni `Peak` ni `RMS` : DROffline donne un true peak
+///    (`Max. TPL`) et une loudness intégrée (`LUFSi`) ;
+/// 4. le total s'écrit `Official EP/Album DR:` et non `Official DR value:`.
+///
+/// ⚠️ **L'échelle de `DR (PMF)` n'est pas établie** comme identique à celle du
+/// TT DR : `PMF` n'est explicité nulle part dans le fichier, et aucune mesure
+/// croisée n'existe (JeromeQ en a une entre foobar2000 et DeaDBeeF, « ±1 dB »,
+/// pas pour DROffline). Le seul recoupement possible ici est interne : sur les
+/// deux rapports, `Official EP/Album DR` vaut la **moyenne tronquée** des DR
+/// de piste — 8 pour `(7+11+7+7)/4 = 8,0` et 8 pour `144/17 = 8,47` — soit la
+/// même convention d'agrégation que le TT DR. C'est une cohérence interne, pas
+/// une équivalence d'échelle.
+fn analyser_droffline(texte: &str, colonnes: &[String]) -> RapportDr {
+    let mut rapport = RapportDr {
+        entete: true,
+        ..RapportDr::default()
+    };
+    let (Some(i_nom), Some(i_dr)) = (
+        colonnes
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("File Name")),
+        colonnes.iter().position(|c| est_colonne_dr(c)),
+    ) else {
+        return rapport;
+    };
+    let mut brutes: Vec<LigneBrute> = Vec::new();
+    for ligne in texte.lines() {
+        let propre = ligne.trim_end_matches('\r').trim();
+        if propre.is_empty() {
+            continue;
+        }
+        if let Some(reste) = propre.strip_prefix("Folder Path:") {
+            let chemin = reste.trim();
+            if !chemin.is_empty() {
+                rapport.dossier_source = Some(chemin.to_string());
+            }
+            continue;
+        }
+        // `Official EP/Album DR: 8` chez DROffline, `Official DR value: DR9`
+        // chez le TT DR — les deux sont acceptés, le second ne coûte rien.
+        if let Some(reste) = propre
+            .strip_prefix("Official EP/Album DR:")
+            .or_else(|| propre.strip_prefix("Official DR value:"))
+        {
+            rapport.dr_album = valeur_dr(reste.trim());
+            continue;
+        }
+        if !propre.contains('|') {
+            continue;
+        }
+        let champs = decouper_aux_barres(ligne);
+        // Le nombre de colonnes est celui de l'en-tête : une ligne plus
+        // courte ou plus longue n'est pas une mesure de ce tableau.
+        if champs.len() != colonnes.len() {
+            continue;
+        }
+        // L'en-tête lui-même repasse ici : sa colonne DR vaut `DR (PMF)`,
+        // que `valeur_dr` refuse. Rien à filtrer de plus.
+        let Some(dr) = valeur_dr(&champs[i_dr]) else {
+            continue;
+        };
+        let piste = champs[i_nom].trim().to_string();
+        if piste.is_empty() {
+            continue;
+        }
+        brutes.push(LigneBrute {
+            dr,
+            piste,
+            // DROffline écrit le titre en entier et n'a pas de colonnes par
+            // canal : ni troncature à reconnaître, ni couche à départager.
+            tronque: false,
+            multicanal: false,
+        });
+    }
+    rapport.lignes = assembler(brutes);
     rapport
 }
 
