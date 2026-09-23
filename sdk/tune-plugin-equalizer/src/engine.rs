@@ -600,6 +600,113 @@ impl BiquadCoeffs {
     }
 }
 
+/// #4755 — sous ce module, la sortie d'un étage est rangée à zéro exact.
+///
+/// # Ce que le plancher empêche
+///
+/// Le biquad est en forme directe I : `y1`/`y2` sont un chemin de RETOUR. En
+/// silence numérique exact, l'entrée ne les rafraîchit plus et ils décroissent
+/// géométriquement, de ~1 après excitation jusqu'à la plage DÉNORMALE de
+/// `f64` (< 2,225e−308). Ils n'en sortent pas : à cette échelle le pas de
+/// l'arithmétique est absolu (4,9e−324), la récursion se comporte comme du
+/// virgule fixe et s'installe dans un cycle limite granulaire — le zéro exact
+/// n'est jamais atteint.
+///
+/// Mesuré sur Shrek (Xeon E5-2630 v4), 44,1 kHz stéréo, banc
+/// `banc_denormal_4755` partie 1. Ce relevé est ARITHMÉTIQUE — il compte des
+/// mots d'état, pas des nanosecondes — donc la charge de la machine n'y entre
+/// pas. Colonne de droite : l'état est-il ENCORE dénormal au bout de 600 s ?
+///
+/// | profil | 1er état dénormal | encore dénormal à 600 s |
+/// |---|---|---|
+/// | tilt 3 filtres (+6/+4 dB) | 2,35 s de silence | oui |
+/// | graphique 10 bandes Q = 1,41 | 11,94 s | oui |
+/// | graphique 31 bandes Q = 4,3 | 56,52 s | oui |
+/// | 1 bande 20 Hz Q = 30 | 470,62 s | oui |
+///
+/// Il n'en sort jamais de lui-même : la fenêtre dénormale court jusqu'à la
+/// fin du relevé dans les quatre cas. Avec le plancher, la même partie 1
+/// rend « — » partout : **zéro mot dénormal sur 600 s**, sur les quatre
+/// profils.
+///
+/// Et le coût, même banc partie 3, 120 s de silence, silence APRÈS excitation
+/// contre silence sur un processeur neuf (Shrek à 4,02 de charge, 40 cœurs,
+/// cœur 12 épinglé par `taskset`, meilleur de 5 passes) :
+///
+/// | profil | silence frais | silence après excitation | écart |
+/// |---|---|---|---|
+/// | tilt 3 filtres | 27,35 ns/trame | 634,28 | **×23,2** |
+/// | graphique 10 bandes | 76,71 | 2 213,06 | **×28,9** |
+/// | graphique 31 bandes | 272,84 | 4 278,53 | **×15,7** |
+/// | 1 bande 20 Hz Q = 30 | 17,06 | 17,07 | ×1,00 |
+///
+/// Soit, pour le 31 bandes, **18,9 % d'un cœur au lieu de 1,2 %** : à
+/// 44,1 kHz, 1 ns par trame vaut 0,0044 % d'un cœur. Un x86 traite le
+/// dénormal par assistance microcodée ; le prix n'est pas payé sur la
+/// musique, il est payé sur le SILENCE, et le fil qui le paie est celui qui
+/// doit remplir le tampon audio à l'heure.
+///
+/// La dernière ligne est le contrôle interne : un seul biquad très sélectif
+/// met 470 s à descendre si bas, donc sur 120 s il n'y arrive pas et ne paie
+/// rien. Le défaut se paie à proportion du nombre d'étages — c'est-à-dire
+/// exactement sur les profils que les utilisateurs chargent.
+///
+/// # Pourquoi une fois par BLOC et non par échantillon
+///
+/// Les deux formes ferment le défaut. Elles n'ont pas le même prix, et le
+/// banc les a départagées dos à dos : trois binaires PRÉ-COMPILÉS (aucune
+/// compilation pendant la mesure), joués en tours alternés, cœur 12 épinglé
+/// par `taskset`. Les deux premiers tours ont été relevés **machine au
+/// repos** — charge 1,52 puis 2,3 sur 40 cœurs ; le troisième tour, pollué
+/// par une compilation tierce arrivée entre-temps (charge montée à 7,1), est
+/// écarté et non repris ici. Colonne « musique » du banc, en nanosecondes par
+/// trame stéréo à 44,1 kHz, meilleur des deux tours retenus :
+///
+/// | profil | sans garde | garde par ÉCHANTILLON | garde par BLOC |
+/// |---|---|---|---|
+/// | tilt 3 filtres | 26,53 | 35,70 (**+35 %**) | 26,18 (−1 %) |
+/// | graphique 10 bandes | 75,82 | 111,01 (**+46 %**) | 75,20 (−1 %) |
+/// | graphique 31 bandes | 272,65 | 369,83 (**+36 %**) | 279,69 (+3 %) |
+/// | 1 bande 20 Hz Q = 30 | 16,88 | 19,03 (**+13 %**) | 15,91 (−6 %) |
+///
+/// La garde par échantillon paie une comparaison et une sélection sur le
+/// chemin le plus chaud du serveur, **pour la musique comme pour le silence**
+/// — de 13 à 46 % du coût du DSP, sur un produit qui tourne aussi sur
+/// Raspberry Pi. La garde par bloc reste dans le bruit de la mesure (−6 % à
+/// +3 %, l'écart change de signe d'un profil à l'autre) : elle coûte
+/// `4 × étages × canaux` comparaisons pour 1 024 trames, de l'ordre du
+/// millième, et le banc ne sait pas la distinguer de l'absence de garde.
+///
+/// Et elle protège autant, parce que le défaut est LENT. Un pôle capable de
+/// séjourner dans la plage dénormale est par construction un pôle proche du
+/// cercle unité : sur 1 024 trames il ne perd qu'un facteur ~0,13, donc il ne
+/// peut pas traverser les 108 décades de marge à l'intérieur d'un bloc — il
+/// est assaini bien avant d'y entrer. À l'inverse, un pôle assez rapide pour
+/// franchir ces 108 décades en un bloc traverse toute la plage dénormale en
+/// quelques dizaines d'échantillons et retombe à zéro tout seul : il ne s'y
+/// installe pas. Le cas coûteux est exactement celui que la cadence par bloc
+/// attrape.
+///
+/// # Pourquoi 1e−200, et pourquoi ce n'est pas un changement de réponse
+///
+/// Le seuil doit tenir deux bouts :
+///
+/// * **assez HAUT** pour qu'aucun produit de la cascade ne retombe dans la
+///   plage dénormale — un étage très atténuant (un `low_pass` à 20 Hz a
+///   `b0 ≈ 4e−6`) divise encore ce qu'il reçoit, et une cascade de 31 étages
+///   le fait 31 fois ; 108 décades de marge sous 1e−200 absorbent le cas ;
+/// * **assez BAS** pour n'avoir aucun sens musical. La sortie de l'égaliseur
+///   est rendue en `f32` (plus petit dénormal : 1,4e−45) et le bit de poids
+///   faible d'un mot de 32 bits vaut 2,3e−10. 1e−200 est 155 décades sous le
+///   premier et 190 sous le second : ce qui est mis à zéro ici était déjà zéro
+///   partout ailleurs.
+///
+/// Ce n'est donc pas du bruit ajouté ni un mode d'arrondi changé (Tune ne
+/// touche pas à FTZ/DAZ sur son fil audio, et ce crate porte
+/// `forbid(unsafe_code)`) : c'est un zéro rendu exact quelques centaines de
+/// décades sous l'audible.
+const PLANCHER_ANTI_DENORMAL: f64 = 1e-200;
+
 /// Biquad filter state (per channel).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct BiquadState {
@@ -617,6 +724,22 @@ impl BiquadState {
         self.y2 = self.y1;
         self.y1 = y;
         y
+    }
+
+    /// #4755 — remet à zéro EXACT les mots d'état devenus négligeables.
+    ///
+    /// Appelée une fois par BLOC, jamais par échantillon : voir
+    /// [`PLANCHER_ANTI_DENORMAL`] pour le pourquoi de cette cadence et le prix
+    /// mesuré de l'autre.
+    ///
+    /// `abs() < seuil` est faux pour NaN et pour l'infini : ils traversent
+    /// inchangés et restent comptés par `non_finite_samples`.
+    fn assainir(&mut self) {
+        for v in [&mut self.x1, &mut self.x2, &mut self.y1, &mut self.y2] {
+            if v.abs() < PLANCHER_ANTI_DENORMAL {
+                *v = 0.0;
+            }
+        }
     }
 }
 
@@ -898,6 +1021,12 @@ impl EqProcessor {
     /// le premier écrêtage de la piste UNE fois. Jamais dans la boucle
     /// d'échantillons.
     fn apres_le_bloc(&mut self, avant: &tune_plugin_audio_support::ecretage::CompteurDEcretage) {
+        // #4755 — l'état du biquad est assaini UNE FOIS par bloc, pas par
+        // échantillon. Voir [`PLANCHER_ANTI_DENORMAL`] : la cadence est le
+        // cœur du correctif, pas un détail d'implémentation.
+        for etat in self.states.iter_mut().flatten() {
+            etat.assainir();
+        }
         tune_plugin_audio_support::ecretage::REGISTRE
             .egaliseur
             .absorber(avant, &self.ecretage);
@@ -2069,3 +2198,10 @@ mod tests {
         assert_eq!(preregle([0.0; 10]).gain_moyen_db_at(2, 44_100.0), 0.0);
     }
 }
+
+/// #4755 — le banc qui mesure l'état dénormalisé des biquads pendant le
+/// silence. Module ENFANT d'`engine` : il voit l'état privé, ce qu'un banc
+/// posé dans `tests/` ne pourrait pas faire. Tous ses témoins sont `#[ignore]`.
+#[cfg(test)]
+#[path = "banc_denormal_4755.rs"]
+mod banc_denormal_4755;
