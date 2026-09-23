@@ -251,6 +251,32 @@ pub fn compter_pistes_par_sous_dossier(
     })
 }
 
+/// Un dossier tel que le lisent les requêtes « exactes » du parcours par
+/// dossiers du serveur média (#4318) : le motif `LIKE` (pré-filtre, échappé),
+/// le préfixe littéral `<dossier><séparateur>` en NFC, et sa longueur en
+/// CARACTÈRES — `substr` compte en caractères sur les deux moteurs.
+struct DossierExact {
+    motif: String,
+    prefixe: String,
+    separateur: String,
+    longueur: usize,
+}
+
+impl DossierExact {
+    fn new(dossier: &str) -> Self {
+        use unicode_normalization::UnicodeNormalization as _;
+        let separateur = std::path::MAIN_SEPARATOR.to_string();
+        let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
+        let prefixe = format!("{base}{separateur}");
+        Self {
+            motif: folder_like_pattern(dossier),
+            longueur: prefixe.chars().count(),
+            prefixe,
+            separateur,
+        }
+    }
+}
+
 /// #3857 — le témoin de l'équivalence entre la requête groupée et la boucle
 /// qu'elle remplace.
 ///
@@ -1486,6 +1512,111 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::get_by_path, sql::get_by_path);
         let params: [&dyn ToSqlValue; 1] = [&file_path];
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
+    }
+
+    /// Le dossier `dossier` contient-il au moins une piste, à n'importe quelle
+    /// profondeur ? Le `LIMIT 1` arrête la lecture à la première ligne : c'est
+    /// ce que la racine du serveur média interroge à chaque `Browse("0")`,
+    /// pour ne pas annoncer un rayon « Folders » vide (#4318).
+    pub fn dossier_peuple(&self, dossier: &str) -> Result<bool, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!(
+            "SELECT 1 FROM tracks WHERE file_path LIKE {p1}{esc} \
+             AND substr(file_path, 1, {n}) = {p2} LIMIT 1",
+            esc = like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
+        Ok(self.db.query_one(&sql, &params)?.is_some())
+    }
+
+    /// Les sous-dossiers **directs** de `dossier` qui contiennent au moins une
+    /// piste, chacun avec le nombre de ses enfants directs (sous-dossiers
+    /// peuplés + pistes posées dedans) — le `childCount` que le serveur média
+    /// annonce avant qu'on ouvre le dossier (#4318).
+    ///
+    /// Même découpage que [`compter_pistes_par_sous_dossier`], un cran plus
+    /// profond : le premier segment après le préfixe nomme le sous-dossier, le
+    /// deuxième nomme son enfant. Compter les deuxièmes segments DISTINCTS
+    /// donne exactement ce que [`Self::sous_dossiers_peuples`] puis
+    /// [`Self::pistes_du_dossier`] rendront à l'ouverture de ce sous-dossier.
+    ///
+    /// Le préfixe est comparé octet pour octet (`substr(...) = ...`) en plus du
+    /// `LIKE` : sur SQLite `LIKE` ignore la casse ASCII, et `Rock/` ramènerait
+    /// aussi `rock/`. Un compteur qui additionne deux dossiers voisins ne
+    /// correspondrait plus à ce que le dossier ouvre.
+    pub fn sous_dossiers_peuples(&self, dossier: &str) -> Result<Vec<(String, u64)>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2, p3) = self.marqueurs3();
+        let pos = self.fonction_position();
+        let sql = format!(
+            "SELECT seg1, COUNT(DISTINCT CASE WHEN {pos}(reste2, {p2}) > 0 \
+                 THEN substr(reste2, 1, {pos}(reste2, {p2}) - 1) ELSE reste2 END) \
+             FROM (SELECT substr(reste, 1, {pos}(reste, {p2}) - 1) AS seg1, \
+                          substr(reste, {pos}(reste, {p2}) + 1) AS reste2 \
+                   FROM (SELECT substr(file_path, {depart}) AS reste FROM tracks \
+                         WHERE file_path LIKE {p1}{esc} \
+                         AND substr(file_path, 1, {n}) = {p3}) AS a \
+                   WHERE {pos}(reste, {p2}) > 0) AS b \
+             WHERE seg1 <> '' AND reste2 <> '' GROUP BY seg1",
+            esc = like_escape_clause(),
+            n = d.longueur,
+            depart = d.longueur + 1,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&d.motif, &d.separateur, &d.prefixe];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let nom = r.first().and_then(|v| v.as_string())?;
+                let nb = r.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+                Some((nom, u64::try_from(nb).unwrap_or(0)))
+            })
+            .collect())
+    }
+
+    /// Les pistes posées **directement** dans `dossier` — pas celles de ses
+    /// sous-dossiers. Même filtre que `GET /library/browse/dir`, avec la
+    /// comparaison exacte du préfixe de [`Self::sous_dossiers_peuples`].
+    pub fn pistes_du_dossier(&self, dossier: &str) -> Result<Vec<Track>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2, p3) = self.marqueurs3();
+        let pos = self.fonction_position();
+        let sql = format!(
+            "{select} WHERE t.file_path LIKE {p1}{esc} \
+             AND substr(t.file_path, 1, {n}) = {p3} \
+             AND {pos}(substr(t.file_path, {depart}), {p2}) = 0",
+            select = sql::select_track(),
+            esc = like_escape_clause(),
+            n = d.longueur,
+            depart = d.longueur + 1,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&d.motif, &d.separateur, &d.prefixe];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    fn marqueurs2(&self) -> (&'static str, &'static str) {
+        match self.db.engine() {
+            Engine::Postgres => ("$1", "$2"),
+            Engine::Sqlite => ("?1", "?2"),
+        }
+    }
+
+    fn marqueurs3(&self) -> (&'static str, &'static str, &'static str) {
+        match self.db.engine() {
+            Engine::Postgres => ("$1", "$2", "$3"),
+            Engine::Sqlite => ("?1", "?2", "?3"),
+        }
+    }
+
+    /// `instr` (SQLite) et `strpos` (Postgres) : le même appel sous deux noms.
+    fn fonction_position(&self) -> &'static str {
+        match self.db.engine() {
+            Engine::Postgres => "strpos",
+            Engine::Sqlite => "instr",
+        }
     }
 
     /// La piste virtuelle d'une feuille CUE, retrouvée par sa TRANCHE.
