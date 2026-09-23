@@ -334,6 +334,7 @@ pub fn router() -> Router<AppState> {
 
 async fn federated_search(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<SearchParams>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(LIMITE_PAR_DEFAUT);
@@ -468,6 +469,9 @@ async fn federated_search(
         }
         track_results.push(v);
     }
+    // #4806 — `banned` sur la recherche fédérée aussi : un titre banni se
+    // trouve, grisé.
+    crate::routes::library::attacher_banni(&state, profile.id(), &mut track_results);
 
     // La moitié streaming ne change pas d'un octet : la liste blanche est la
     // même, lue plus haut, et la règle qu'elle applique ici est celle d'avant.

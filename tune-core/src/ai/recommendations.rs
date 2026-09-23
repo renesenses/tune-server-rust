@@ -11,6 +11,13 @@ use tracing::{debug, info};
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
 
+/// #4806 — le prédicat « pas banni pour le profil actif », alias `t`.
+fn sans_titres_bannis(backend: &Arc<dyn DbBackend>) -> String {
+    crate::db::facet_filter::banned_tracks_excluded(
+        crate::db::hidden_repo::profil_de_selection_automatique(backend),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -79,6 +86,9 @@ pub fn get_recommendations(
     limit: i64,
 ) -> Vec<RecommendedTrack> {
     let mut results = Vec::new();
+    // #4806 — une recommandation est une sélection automatique : jamais un
+    // titre banni par le profil actif.
+    let sans_bannis = sans_titres_bannis(backend);
 
     // --- Top genres from history (join tracks to get genre) ---
     let top_genres = backend
@@ -134,6 +144,7 @@ pub fn get_recommendations(
                  SELECT CAST(track_id AS INTEGER) FROM listen_history \
                  WHERE listened_at > datetime('now', '-7 days') \
              ) \
+             AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
         );
 
@@ -170,6 +181,7 @@ pub fn get_recommendations(
                      WHERE listened_at > datetime('now', '-7 days') \
                  ) \
                  AND t.id NOT IN ({}) \
+                 AND {sans_bannis} \
                  ORDER BY RANDOM() LIMIT ?",
                 if results.is_empty() {
                     "0".to_string()
@@ -205,6 +217,7 @@ pub fn get_recommendations(
              FROM tracks t \
              LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
              LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
+             WHERE {sans_bannis} \
              ORDER BY RANDOM() LIMIT ?"
         );
         let lim = limit;
@@ -228,6 +241,8 @@ pub fn get_recommendations(
 /// so the UI can poll it without re-computing.
 pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
     let mut mixes = Vec::new();
+    // #4806 — même règle que `get_recommendations`.
+    let sans_bannis = sans_titres_bannis(backend);
 
     // Get top genres
     let top_genres = backend
@@ -254,6 +269,7 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
              LEFT JOIN artists a ON t.artist_id = CAST(a.id AS TEXT) \
              LEFT JOIN albums al ON t.album_id = CAST(al.id AS TEXT) \
              WHERE t.genre = ? \
+             AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT 15"
         );
 
@@ -292,6 +308,7 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
                  SELECT CAST(track_id AS INTEGER) FROM listen_history \
                  WHERE listened_at > datetime('now', '-7 days') \
              ) \
+             AND {sans_bannis} \
              ORDER BY RANDOM() LIMIT 15"
         );
 

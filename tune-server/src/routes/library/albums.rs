@@ -404,6 +404,7 @@ pub(super) async fn get_album(
 
 pub(super) async fn album_tracks(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Path(id): Path<i64>,
     Query(f): Query<AlbumFilters>,
 ) -> Json<Value> {
@@ -463,7 +464,46 @@ pub(super) async fn album_tracks(
     // ligne la route rend les mêmes 31 champs qu'avant et les colonnes restent
     // `indisponible` côté client.
     attacher_ecoutes(&state, &mut items);
+    // #4806 — le titre banni RESTE dans la liste de l'album, grisé par
+    // l'écran : c'est ce drapeau qui le dit, jamais un filtre.
+    attacher_banni(&state, profile.id(), &mut items);
     Json(json!(items))
+}
+
+/// #4806 — le drapeau `banned` d'une liste de pistes, pour le profil qui
+/// regarde : TOUJOURS présent (`false` par défaut), comme `play_count`, et
+/// jamais un filtre — un titre banni est visible, grisé, jouable d'un clic
+/// délibéré. Une seule requête indexée par page, aucune sur une page vide.
+///
+/// Le profil vient de l'extracteur `ActiveProfile` (en-tête `X-Profile-Id`,
+/// sinon le profil actif du serveur) : ce n'est pas une portée de vue au sens
+/// d'`active_profile.rs` — la liste ne change pas, seule l'annotation « pour
+/// vous » varie — et le bannissement n'a de sens que pour quelqu'un.
+pub(crate) fn attacher_banni(state: &AppState, profile_id: i64, items: &mut [Value]) {
+    let ids: Vec<i64> = items
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_i64))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let bannis = match tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .banned_track_ids(profile_id, &ids)
+    {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::error!(error = %e, profile_id, "titres_bannis_illisibles");
+            return;
+        }
+    };
+    for item in items.iter_mut() {
+        let Some(id) = item.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("banned".into(), json!(bannis.contains(&id)));
+        }
+    }
 }
 
 /// La PROVENANCE du Dynamic Range par piste, appariée à sa valeur (#3924).

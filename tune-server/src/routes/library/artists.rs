@@ -475,10 +475,15 @@ pub(super) async fn artist_albums(
 
 pub(super) async fn artist_tracks(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
 ) -> Json<Value> {
     let repo = TrackRepo::with_backend(state.backend.clone());
     let items = dedup_display_tracks(repo.list_by_artist(id).unwrap_or_default());
+    // #4806 — `banned` ici aussi : la liste ne change pas, elle s'annote.
+    // Passer par `Vec<Value>` lui donne au passage `channel_badge` (additif).
+    let mut items: Vec<Value> = items.iter().map(|t| t.to_json()).collect();
+    super::albums::attacher_banni(&state, profile.id(), &mut items);
     Json(json!(items))
 }
 

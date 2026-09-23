@@ -459,13 +459,33 @@ pub(crate) fn build_smart_query(
     (where_clause, order, limit_clause)
 }
 
+/// #4806 — le socle de TOUTE résolution de smart playlist : un titre banni
+/// par ce profil en est exclu d'office, sans règle à configurer (décision
+/// Bertrand, 23/09/2026). Posé ICI, à l'exécution, et non dans
+/// `build_smart_query` : la clause des règles est parenthésée en bloc, donc
+/// un `match_mode = any` (`a OR b`) ne peut pas contourner le socle par
+/// précédence — `WHERE (a OR b) AND socle`. Sans règle : `WHERE socle`.
+///
+/// `build_smart_query` sert aussi aux références imbriquées (`smart_refs`,
+/// sous-requête `t.id IN (…)`) : le socle de la requête ENGLOBANTE suffit,
+/// un titre banni n'y passe pas davantage.
+fn avec_le_socle_des_bannis(where_clause: &str, profile_id: i64) -> String {
+    let socle = tune_core::db::facet_filter::banned_tracks_excluded(profile_id);
+    match where_clause.trim().strip_prefix("WHERE ") {
+        Some(regles) => format!("WHERE ({regles}) AND {socle}"),
+        None => format!("WHERE {socle}"),
+    }
+}
+
 /// Execute a smart query and return track rows as JSON values.
 fn execute_smart_track_query(
     state: &SmartHttpState,
+    profile_id: i64,
     where_clause: &str,
     order: &str,
     limit_clause: &str,
 ) -> Result<Vec<Value>, AppError> {
+    let where_clause = avec_le_socle_des_bannis(where_clause, profile_id);
     let needs_play_count = order.contains("play_count");
     let play_count_join = if needs_play_count {
         "LEFT JOIN (SELECT track_id, COUNT(*) AS play_count FROM listen_history WHERE track_id IS NOT NULL GROUP BY track_id) lh ON t.id = lh.track_id"
@@ -707,7 +727,8 @@ async fn resolve_tracks(
             max_tracks,
             &ctx,
         );
-        let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+        let items =
+            execute_smart_track_query(&state, profile.id(), &where_clause, &order, &limit_clause)?;
         avec_favoris_de_service(
             &state,
             items,
@@ -750,7 +771,7 @@ async fn smart_collection_albums(
             max_tracks,
             &ctx,
         );
-        execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?
+        execute_smart_track_query(&state, profile.id(), &where_clause, &order, &limit_clause)?
     };
     // 🔴 #4473 — cette vue regroupe les pistes de la playlist : elle doit voir
     // le catalogue et surtout porter les MÊMES refus. Sans cet appel, une
@@ -823,7 +844,8 @@ async fn preview_smart_collection(
             body.max_tracks,
             &ctx,
         );
-        let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
+        let items =
+            execute_smart_track_query(&state, profile.id(), &where_clause, &order, &limit_clause)?;
         avec_favoris_de_service(
             &state,
             items,
@@ -1089,6 +1111,41 @@ mod tests {
             w.contains("t.id NOT IN (SELECT track_id FROM playlist_tracks"),
             "{w}"
         );
+    }
+
+    /// #4806 — le socle « pas banni » enveloppe la clause des règles : avec
+    /// `match_mode = any`, `a OR b` est parenthésé, sinon le socle ne
+    /// s'appliquerait qu'à `b`. Sans règle, le socle seul.
+    #[test]
+    fn le_socle_des_bannis_enveloppe_les_regles() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(7));
+        let (w, _, _) = build_smart_query(
+            r#"[{"field":"genre","op":"contains","value":"Rock"},
+                {"field":"genre","op":"contains","value":"Jazz"}]"#,
+            "any",
+            "title",
+            "asc",
+            None,
+            &ctx,
+        );
+        assert!(w.contains(" OR "), "témoin : {w}");
+        let socle = super::avec_le_socle_des_bannis(&w, 7);
+        assert!(socle.starts_with("WHERE ("), "{socle}");
+        assert!(
+            socle.contains(
+                ") AND NOT EXISTS (SELECT 1 FROM hidden_items hb WHERE hb.profile_id = 7"
+            ),
+            "{socle}"
+        );
+        assert!(
+            socle.contains("hb.item_type = 'track' AND hb.item_id = t.id)"),
+            "{socle}"
+        );
+
+        // Sans règle : `WHERE socle`, pas `WHERE () AND …`.
+        let vide = super::avec_le_socle_des_bannis("", 7);
+        assert!(vide.starts_with("WHERE NOT EXISTS"), "{vide}");
+        assert!(!vide.contains("()"), "{vide}");
     }
 }
 

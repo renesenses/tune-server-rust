@@ -32,12 +32,17 @@ pub fn generate_random_queue(
         AutoplayMode::RandomTracks => "ORDER BY RANDOM() LIMIT 10",
         AutoplayMode::Off | AutoplayMode::Similar => return Ok(Vec::new()),
     };
+    // #4806 — les titres bannis par le profil actif ne sont pas éligibles :
+    // un seul prédicat dans le CTE couvre les quatre modes.
+    let profil = crate::db::hidden_repo::profil_de_selection_automatique(db);
+    let sans_bannis = crate::db::facet_filter::banned_tracks_excluded(profil);
     let sql = format!(
         "WITH eligible AS (SELECT t.*, COALESCE(NULLIF(t.year, 0), al.year) AS autoplay_year \
          FROM tracks t LEFT JOIN albums al ON al.id = t.album_id \
          WHERE COALESCE(NULLIF(t.source, ''), 'local') = 'local' \
          AND (NULLIF(TRIM(t.file_path), '') IS NOT NULL \
-              OR NULLIF(TRIM(t.cue_media_path), '') IS NOT NULL)) \
+              OR NULLIF(TRIM(t.cue_media_path), '') IS NOT NULL) \
+         AND {sans_bannis}) \
          SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.autoplay_year, t.bpm \
          FROM eligible t LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id {selection}"
