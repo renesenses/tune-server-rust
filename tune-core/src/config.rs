@@ -449,13 +449,57 @@ impl ExclusiveModeConstraint {
 
     /// Phrase courte, dans la langue du chemin du signal — le serveur y écrit
     /// déjà ses `detail` en français.
+    ///
+    /// C'est le libellé de la contrainte SEULE, c'est-à-dire le cas où la case
+    /// « mode exclusif » est décochée. Le conseil qu'il porte n'est juste que
+    /// dans ce cas : voir [`Self::detail_selon_demande`].
     pub fn detail(self) -> &'static str {
-        match self {
-            Self::AsioAlwaysExclusive => {
+        self.detail_selon_demande(false)
+    }
+
+    /// Le même libellé, mais sachant si l'utilisateur a **aussi** coché la
+    /// case « mode exclusif ».
+    ///
+    /// # Pourquoi ce paramètre (#3245, jfpaquet, fil 1879 / ticket support 154)
+    ///
+    /// [`exclusive_mode_status`] rend `effective = requested || forced`. Quand
+    /// la case est cochée, `effective` reste donc **vrai** après un passage à
+    /// WASAPI — et le conseil « pour le partager, choisissez un autre backend
+    /// (WASAPI) » envoie l'utilisateur dans un mur : il fait le geste, le son
+    /// des autres applications ne revient pas, et rien ne lui dit pourquoi.
+    ///
+    /// Le diagnostic du 21/09/2026 montre exactement ce couple :
+    ///
+    /// ```text
+    /// - Audio backend: requested=asio, active=WASAPI
+    /// - Exclusive mode: requested=true, effective=true, forced=true — … Pour
+    ///   le partager, choisissez un autre backend (WASAPI).
+    /// ```
+    ///
+    /// `requested=true` : il faut **deux** gestes, et le texte n'en nommait
+    /// qu'un. #3192 avait rendu la contrainte honnête ; il restait à rendre le
+    /// conseil praticable.
+    ///
+    /// Ce que ceci ne fait **pas** : aucun mode exclusif par zone n'est créé,
+    /// et le mode exclusif reste un choix audiophile délibéré. Seul le texte
+    /// change.
+    pub fn detail_selon_demande(self, demande: bool) -> &'static str {
+        match (self, demande) {
+            (Self::AsioAlwaysExclusive, false) => {
                 "ASIO prend le périphérique en exclusivité : son pilote n'a pas \
                  de mode partagé. Les autres applications n'auront plus de son \
                  sur ce périphérique. Pour le partager, choisissez un autre \
                  backend (WASAPI)."
+            }
+            (Self::AsioAlwaysExclusive, true) => {
+                "ASIO prend le périphérique en exclusivité : son pilote n'a pas \
+                 de mode partagé. Les autres applications n'auront plus de son \
+                 sur ce périphérique. Ici le mode exclusif est EN PLUS demandé \
+                 dans vos réglages : pour partager le périphérique il faut les \
+                 DEUX gestes — décochez « mode exclusif », ET choisissez un \
+                 autre backend (WASAPI). L'un sans l'autre ne rend rien : sous \
+                 ASIO la case décochée reste sans effet, et sous WASAPI la case \
+                 cochée garde le périphérique."
             }
         }
     }
@@ -514,7 +558,9 @@ pub fn exclusive_mode_status(
         effective: requested || forced,
         forced,
         reason,
-        detail: reason.map(ExclusiveModeConstraint::detail),
+        // Le conseil dépend de `requested` : avec la case cochée, changer de
+        // backend ne suffit pas (`effective = requested || forced`). #3245.
+        detail: reason.map(|r| r.detail_selon_demande(requested)),
     }
 }
 
@@ -1081,6 +1127,100 @@ mod tests {
             codes.push(c.code());
         }
         assert_eq!(codes.len(), ExclusiveModeConstraint::ALL.len());
+    }
+
+    /// Le fait qui rend le conseil nécessaire, isolé : changer de backend
+    /// n'éteint PAS l'exclusif quand la case est cochée.
+    ///
+    /// Si cet essai devenait faux, les deux suivants n'auraient plus de raison
+    /// d'être — c'est lui qui établit le défaut, pas le texte.
+    #[test]
+    fn passer_en_wasapi_ne_rend_pas_le_peripherique_si_la_case_est_cochee() {
+        let apres_bascule = exclusive_mode_status("wasapi", true, true);
+        assert!(
+            apres_bascule.effective,
+            "avec la case cochée, WASAPI reste exclusif : `effective = requested || forced`. \
+             C'est ce qui rend « choisissez un autre backend » insuffisant à lui seul (#3245)"
+        );
+        assert!(
+            !apres_bascule.forced,
+            "sous WASAPI la contrainte de plateforme ne s'applique plus : ce qui reste \
+             est la case, et elle seule"
+        );
+    }
+
+    /// #3245 — jfpaquet, fil 1879 / ticket support 154.
+    ///
+    /// Avec `requested = true`, le conseil doit nommer les DEUX gestes.
+    /// Ne nommer que le backend envoie le testeur dans un mur : il bascule sur
+    /// WASAPI, `effective` reste vrai, et le son des autres applications ne
+    /// revient pas.
+    #[test]
+    fn le_conseil_nomme_les_deux_gestes_quand_la_case_est_cochee() {
+        let statut = exclusive_mode_status("asio", true, true);
+        assert!(statut.requested && statut.forced && statut.effective);
+        let conseil = statut
+            .detail
+            .expect("une contrainte ASIO doit porter une explication");
+
+        assert!(
+            conseil.contains("décochez"),
+            "le conseil doit nommer le geste « décocher le mode exclusif » ; \
+             sans lui, basculer sur WASAPI ne rend rien. Lu : {conseil}"
+        );
+        assert!(
+            conseil.contains("WASAPI"),
+            "le conseil doit nommer l'autre geste, le changement de backend. Lu : {conseil}"
+        );
+        assert!(
+            conseil.contains("DEUX"),
+            "le conseil doit dire que les deux gestes sont nécessaires ENSEMBLE, \
+             pas en proposer un au choix. Lu : {conseil}"
+        );
+    }
+
+    /// CONTRE-ÉPREUVE permanente du précédent : le conseil doit réellement
+    /// DÉPENDRE de `requested`.
+    ///
+    /// Sans cet essai, un libellé unique qui nommerait les deux gestes en
+    /// toutes circonstances passerait l'essai ci-dessus — alors qu'il dirait à
+    /// un utilisateur qui n'a rien coché de décocher une case déjà décochée.
+    #[test]
+    fn le_conseil_depend_de_la_case_et_reste_court_quand_elle_est_decochee() {
+        let coche = exclusive_mode_status("asio", true, true).detail.unwrap();
+        let decoche = exclusive_mode_status("asio", false, true).detail.unwrap();
+
+        assert_ne!(
+            coche, decoche,
+            "le conseil doit dépendre de la case : un texte constant redeviendrait \
+             le conseil sans issue de #3245"
+        );
+        assert!(
+            !decoche.contains("décochez"),
+            "case décochée : il n'y a rien à décocher, le seul geste utile est le \
+             changement de backend. Lu : {decoche}"
+        );
+        assert!(
+            decoche.contains("WASAPI"),
+            "case décochée : le conseil « choisissez un autre backend » reste juste. \
+             Lu : {decoche}"
+        );
+    }
+
+    /// Le libellé publié est bien celui que le diagnostic COLLE dans le ticket
+    /// (`/system/config` → `local_exclusive_mode_status.detail`), pas une
+    /// chaîne recopiée à côté.
+    #[test]
+    fn le_detail_serialise_suit_la_case() {
+        for demande in [false, true] {
+            let statut = exclusive_mode_status("asio", demande, true);
+            let v = serde_json::to_value(&statut).expect("le statut doit être sérialisable");
+            assert_eq!(
+                v["detail"].as_str(),
+                Some(ExclusiveModeConstraint::AsioAlwaysExclusive.detail_selon_demande(demande)),
+                "le JSON doit porter le libellé de la case {demande}"
+            );
+        }
     }
 
     /// Le code stable doit être celui que porte le JSON — pas une chaîne
