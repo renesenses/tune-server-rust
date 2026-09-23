@@ -82,7 +82,7 @@ fn normalize_sort_order(raw: Option<String>) -> String {
 /// Decode a row from `smart_collections` into a JSON object.
 /// Column order: id(0), name(1), rules(2), match_mode(3), sort_by(4),
 /// sort_order(5), max_limit(6), description(7), icon(8), color(9), created_at(10).
-fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
+pub fn decode_collection_row(r: &[tune_core::db::backend::SqlValue]) -> Value {
     let rules_str = r
         .get(2)
         .and_then(|v| v.as_string())

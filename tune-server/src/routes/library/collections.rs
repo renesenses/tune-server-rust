@@ -135,16 +135,50 @@ fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError
     Ok(servi)
 }
 
-pub(super) async fn list_collections(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, AppError> {
+/// Les dossiers STOCKÉS, tels quels — la liste JSON du réglage `collections`.
+fn dossiers_stockes(state: &AppState) -> Vec<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let data: Vec<Value> = settings
+    settings
         .get("collections")
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<Vec<Value>>(&s).ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Les dossiers dont l'identifiant est dans `ids`, dans la forme SERVIE de
+/// `GET /library/collections` — `album_count` compté sur les albums encore
+/// là, `orphan_album_ids` dit à voix haute.
+///
+/// Point d'entrée de `/tags/{id}/collections` (#4798) : la lecture par
+/// étiquette rend exactement ce que l'écran Collections sait déjà afficher,
+/// sans seconde forme. Un dossier étiqueté puis supprimé n'est plus dans la
+/// liste : il est omis, comme partout ailleurs.
+///
+/// ⚠️ `ids` désigne des DOSSIERS, jamais des collections intelligentes : les
+/// deux espaces se recouvrent (l'id 1 est à la fois « favorites » et
+/// « Audiophile » sur le serveur de Bertrand), et cette fonction ne lit que
+/// le réglage `collections`.
+pub(crate) fn dossiers_servis_parmi(state: &AppState, ids: &[i64]) -> Result<Vec<Value>, AppError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let album_repo = AlbumRepo::with_backend(state.backend.clone());
+    dossiers_stockes(state)
+        .iter()
+        .filter(|c| {
+            c.get("id")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|id| ids.contains(&id))
+        })
+        .map(|c| dossier_servi(&album_repo, c))
+        .collect()
+}
+
+pub(super) async fn list_collections(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let data = dossiers_stockes(&state);
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let servis = data
         .iter()

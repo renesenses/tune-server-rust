@@ -833,6 +833,23 @@ path = "tests/bug_report_captures_4564.rs"
 name = "etiquettes_types_et_playlists"
 path = "tests/etiquettes_types_et_playlists.rs"
 
+# #4798 — favori et étiquettes d'une playlist INTELLIGENTE, et surtout la
+# preuve qu'une playlist et une playlist intelligente de même identifiant ne
+# se confondent pas. `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "smart_playlist_favori_etiquette_4798"
+path = "tests/smart_playlist_favori_etiquette_4798.rs"
+
+# #4798, second volet — étiquettes d'un DOSSIER et d'une collection
+# INTELLIGENTE, et la preuve qu'un dossier et une collection intelligente de
+# même identifiant ne se confondent pas. `autotests = false` en tête de ce
+# manifeste : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "collections_etiquette_4798"
+path = "tests/collections_etiquette_4798.rs"
+
+
 # #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
 # routeur réel. `autotests = false` en tête de ce manifeste : sans cette
 # cible, le fichier ne serait jamais compilé.
