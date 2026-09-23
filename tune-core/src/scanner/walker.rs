@@ -1975,6 +1975,17 @@ pub fn scan_files_batched(
         .into_iter()
         .enumerate()
     {
+        // La lecture d'abord (#4681) : tant qu'une zone joue, une pause entre
+        // deux lots. Le lot suivant — 500 fichiers lus en parallèle, puis leur
+        // transaction d'écriture — n'enchaîne pas sur le précédent. Pas avant
+        // le PREMIER lot : un scan demandé commence tout de suite. Cette
+        // fonction tourne sur un fil bloquant (ses deux appelants passent par
+        // `spawn_blocking`), la pause bloquante y est donc à sa place.
+        if batch_idx > 0 {
+            crate::taches_de_fond::priorite::ceder_a_la_lecture_bloquant(
+                crate::taches_de_fond::priorite::ID_SCAN,
+            );
+        }
         // Parse metadata in parallel within this chunk
         let failed_files: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
         let batch_timeout_counter = AtomicUsize::new(0);

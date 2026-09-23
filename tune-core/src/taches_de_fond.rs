@@ -68,6 +68,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
+/// La lecture d'abord : freiner les passes pendant qu'une zone joue, et le
+/// relever (#4681).
+pub mod priorite;
+
 /// Un traitement de fond que l'utilisateur peut suspendre.
 ///
 /// ⚠️ **Le scan n'en est pas**, et ce n'est pas un oubli : voir
@@ -324,6 +328,17 @@ pub async fn attendre_la_reprise(tache: Tache) {
         tokio::time::sleep(CADENCE_RELECTURE_PAUSE).await;
     }
     tracing::info!(tache = tache.id(), "tache_de_fond_repartie");
+}
+
+/// La frontière d'une passe qui tient sa liste en mémoire : d'abord la pause
+/// de l'utilisateur ([`attendre_la_reprise`]), puis la lecture
+/// ([`priorite::ceder_a_la_lecture`], #4681).
+///
+/// Un seul appel aux frontières de l'enrichissement et des images d'artistes,
+/// pour qu'aucune des deux ne puisse honorer l'une sans l'autre.
+pub async fn attendre_son_tour(tache: Tache) {
+    attendre_la_reprise(tache).await;
+    priorite::ceder_a_la_lecture(tache.id()).await;
 }
 
 /// Vider le miroir en mémoire, SANS toucher à la base.

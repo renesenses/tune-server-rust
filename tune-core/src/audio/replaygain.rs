@@ -73,6 +73,73 @@ fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
     !existant.is_some_and(|v| !v.trim().is_empty())
 }
 
+/// Poser une plage dynamique MESURÉE, seulement dans le vide.
+///
+/// 🔴 LE TAG DU FICHIER FAIT FOI, TOUJOURS. `dr_track` peut déjà porter la
+/// valeur lue dans `DYNAMIC RANGE` au scan (`metadata/mod.rs`) : c'est celle
+/// que le producteur du disque a mesurée, et l'écraser par la nôtre
+/// remplacerait une donnée d'origine par une estimation. On relit donc juste
+/// avant d'écrire — un scan a pu en poser un PENDANT le décodage.
+///
+/// `dr_source` dit d'où vient ce qui est en base : sans lui, une valeur
+/// calculée s'afficherait comme une valeur du disque, ce qui serait un
+/// affichage inventé.
+///
+/// Synchrone, et appelée HORS du fil async (#4681) : la passe de piste comme
+/// le rattrapage la font partir sur le pool bloquant.
+fn ecrire_le_dr_mesure(repo: &TrackMetadataRepo, track_id: i64, dr: u32) {
+    // `get_all` : le dépôt n'expose pas de lecture d'UNE clé.
+    let existant = repo
+        .get_all(track_id)
+        .ok()
+        .and_then(|m| m.get("dr_track").cloned());
+    if peut_ecrire_le_dr(existant.as_deref()) {
+        let _ = repo.set(track_id, "dr_track", &dr.to_string());
+        let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
+    }
+}
+
+/// Écrire la mesure d'une piste : gains, pics, provenance, et la plage
+/// dynamique qui voyage avec ce décodage-ci.
+///
+/// Synchrone, et appelée HORS du fil async (#4681) : cinq à sept écritures
+/// SQLite qui prennent le verrou d'écriture unique de la base.
+fn ecrire_la_mesure_de_piste(
+    backend: &Arc<dyn DbBackend>,
+    track_id: i64,
+    lufs: f64,
+    peak: f64,
+    true_peak: f64,
+    plage: Option<u32>,
+) {
+    let repo = TrackMetadataRepo::with_backend(backend.clone());
+    let gain = track_gain_db(lufs);
+    let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
+    let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
+    // True peak inter-échantillons 4× (#1694). Clé à part : `rg_track_peak`
+    // garde sa sémantique sample-peak (compat tags, #1382) ;
+    // `prevent_clipping` PRÉFÈRE celle-ci quand elle existe. Peut dépasser
+    // 1.0 — c'est l'information.
+    let _ = repo.set(track_id, "rg_track_true_peak", &format_peak(true_peak));
+    // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en base un
+    // gain MESURÉ ici d'un gain lu dans les tags du fichier : les deux
+    // s'écrivent sous `rg_track_gain`, et c'est voulu (interchangeables à la
+    // lecture). Mais le chemin du signal doit pouvoir dire d'où vient le gain
+    // qu'il applique, et « tags du fichier » affiché sur une mesure Tune
+    // serait un affichage inventé.
+    let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
+
+    // ── PLAGE DYNAMIQUE ──────────────────────────────────────────────────
+    //
+    // Elle voyage avec ce décodage-ci : `mesurer_intensite_et_plage` la
+    // calcule sur les mêmes échantillons, donc elle ne coûte que son
+    // arithmétique. Un balayage séparé relirait chaque fichier une seconde
+    // fois — 46 877 pistes sur le .18, mesuré le 09/09/2026.
+    if let Some(dr) = plage {
+        ecrire_le_dr_mesure(&repo, track_id, dr);
+    }
+}
+
 /// Pause between per-file analyses (each one fully decodes a track). Keeps the
 /// pass "nice": it must never compete with playback or make the machine hot.
 const PER_FILE_PAUSE_MS: u64 = 400;
@@ -576,8 +643,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     continue;
                 }
                 // Yield the decode-heavy track pass to playback (#1310). The
-                // album pass is pure DB math (no file decode), so it keeps
-                // making progress even while a zone plays.
+                // album pass yields too since #4681 — see `passe_d_album`.
                 let playing = any_zone_playing(&backend);
                 let mut suspendue: Option<crate::taches_de_fond::Tache> = None;
                 let did = if playing {
@@ -598,40 +664,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 // la boucle inscrirait au registre un « rien à faire » faux et
                 // dormirait 15 minutes au lieu des 30 s de report lecture.
                 let playing = playing || any_zone_playing(&backend);
-                // Le lot d'ALBUMS est du ReplayGain — le même traitement, la
-                // même carte à l'écran. Il ne décode rien, mais le suspendre
-                // avec sa passe est la seule lecture honnête du bouton : sinon
-                // « ReplayGain en pause » continuerait d'écrire des gains
-                // d'album, et la jauge avancerait sous un badge « En pause ».
-                //
-                // #4567 — et quand il tourne, il tourne sur un fil BLOQUANT :
-                // cette passe n'est pas « du calcul pur », elle ÉCRIT quatre
-                // clés par piste (jusqu'à ~60 écritures SQLite d'affilée pour
-                // un album de 15 titres), jusqu'ici sur le fil de l'exécuteur.
-                // Trois micro-coupures de la .18 les 19 et 20/09/2026 tombent
-                // à la seconde sur une ligne `replaygain_album`. Sa durée est
-                // journalisée au-delà de 50 ms.
-                let albums = if crate::taches_de_fond::est_en_pause(
-                    crate::taches_de_fond::Tache::ReplayGain,
-                ) {
-                    0
-                } else {
-                    let debut_album = std::time::Instant::now();
-                    let backend_album = backend.clone();
-                    let albums =
-                        tokio::task::spawn_blocking(move || analyze_album_batch(&backend_album))
-                            .await
-                            .unwrap_or(0);
-                    let duree_album = debut_album.elapsed();
-                    if albums > 0 && duree_album >= std::time::Duration::from_millis(50) {
-                        info!(
-                            duree_ms = duree_album.as_millis() as u64,
-                            en_lecture = playing,
-                            "replaygain_album_passe_longue"
-                        );
-                    }
-                    albums
-                };
+                let albums = passe_d_album(&backend, playing).await;
 
                 if did > 0 || albums > 0 {
                     // Du travail : ouvrir la campagne si elle ne l'est pas déjà.
@@ -645,6 +678,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 }
 
                 if playing {
+                    // #4681 — céder, oui, mais le dire : le relevé de
+                    // `/system/background-tasks` doit pouvoir nommer la passe
+                    // qui s'est effacée devant la lecture.
+                    crate::taches_de_fond::priorite::noter_cedee(
+                        crate::taches_de_fond::Tache::ReplayGain.id(),
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(PLAYBACK_BACKOFF_SECS)).await;
                 } else if let Some(tache) = suspendue {
                     // ⚠️ NE PAS clore la campagne, et NE PAS inscrire « rien à
@@ -692,6 +731,52 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
             }
         }
     });
+}
+
+/// Un tour de la passe d'ALBUMS, ou rien.
+///
+/// Le lot d'albums est du ReplayGain — le même traitement, la même carte à
+/// l'écran. Il ne décode rien, mais le suspendre avec sa passe est la seule
+/// lecture honnête du bouton : sinon « ReplayGain en pause » continuerait
+/// d'écrire des gains d'album, et la jauge avancerait sous un badge « En
+/// pause ».
+///
+/// # 🔴 PAS PENDANT LA LECTURE (#4681)
+///
+/// Cette passe était annoncée « pure arithmetic » et tournait donc en pleine
+/// écoute. Elle ÉCRIT pourtant quatre clés par piste — jusqu'à ~60 écritures
+/// SQLite d'affilée pour un album de 15 titres, précédées d'une sélection à
+/// trois `NOT EXISTS` imbriqués sur toute la bibliothèque. Trois
+/// micro-coupures de la .18 les 19 et 20/09/2026 tombent à la seconde sur une
+/// ligne `replaygain_album` (#4567). #4572 l'a sortie du fil de l'exécuteur ;
+/// elle prenait encore le verrou d'écriture UNIQUE de la base, que le chemin
+/// de lecture attend aussi.
+///
+/// Elle attend donc l'arrêt, comme les passes qui décodent. Le retard est
+/// sans conséquence : un album par tour, quelques millisecondes chacun, tout
+/// est rattrapé dans la minute qui suit l'arrêt.
+///
+/// `en_lecture` est le témoin en base que la boucle vient de lire ; le témoin
+/// en mémoire ([`crate::taches_de_fond::priorite::lecture_en_cours`]) compte
+/// aussi — l'un ou l'autre suffit à céder.
+///
+/// Gardé par `tune-core/tests/priorite_lecture_taches_de_fond.rs`.
+pub async fn passe_d_album(backend: &Arc<dyn DbBackend>, en_lecture: bool) -> usize {
+    use crate::taches_de_fond::{Tache, est_en_pause, priorite};
+
+    if est_en_pause(Tache::ReplayGain) {
+        return 0;
+    }
+    if en_lecture || priorite::lecture_en_cours() {
+        priorite::noter_cedee(Tache::ReplayGain.id());
+        return 0;
+    }
+    let backend_album = backend.clone();
+    priorite::hors_du_fil_async(Tache::ReplayGain.id(), move || {
+        analyze_album_batch(&backend_album)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Fermer la campagne ReplayGain en cours, ou inscrire un « rien à faire ».
@@ -992,54 +1077,24 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         };
         match measured {
             Ok(Some((lufs, peak, true_peak, plage))) => {
-                let gain = track_gain_db(lufs);
-                let _ = repo.set(track_id, "rg_track_gain", &format_gain(gain));
-                let _ = repo.set(track_id, "rg_track_peak", &format_peak(peak));
-                // True peak inter-échantillons 4× (#1694). Clé à part :
-                // `rg_track_peak` garde sa sémantique sample-peak (compat
-                // tags, #1382) ; `prevent_clipping` PRÉFÈRE celle-ci quand
-                // elle existe. Peut dépasser 1.0 — c'est l'information.
-                let _ = repo.set(track_id, "rg_track_true_peak", &format_peak(true_peak));
-                // Témoin de PROVENANCE (#1627). Sans lui, rien ne distingue en
-                // base un gain MESURÉ ici d'un gain lu dans les tags du
-                // fichier : les deux s'écrivent sous `rg_track_gain`, et c'est
-                // voulu (interchangeables à la lecture). Mais le chemin du
-                // signal doit pouvoir dire d'où vient le gain qu'il applique,
-                // et « tags du fichier » affiché sur une mesure Tune serait un
-                // affichage inventé.
-                let _ = repo.set(track_id, TRACK_SOURCE_KEY, SOURCE_ANALYSIS);
-
-                // ── PLAGE DYNAMIQUE ──────────────────────────────────────
-                //
-                // Elle voyage avec ce décodage-ci : `mesurer_intensite_et_plage`
-                // la calcule sur les mêmes échantillons, donc elle ne coûte que
-                // son arithmétique. Un balayage séparé relirait chaque fichier
-                // une seconde fois — 46 877 pistes sur le .18, mesuré le
-                // 09/09/2026.
-                //
-                // 🔴 LE TAG DU FICHIER FAIT FOI, TOUJOURS. `dr_track` peut déjà
-                // porter la valeur lue dans `DYNAMIC RANGE` au scan
-                // (`metadata/mod.rs`) : c'est celle que le producteur du disque
-                // a mesurée, et l'écraser par la nôtre remplacerait une donnée
-                // d'origine par une estimation. On n'écrit QUE dans le vide.
-                //
-                // `dr_source` dit d'où vient ce qui est en base — même
-                // raisonnement que `TRACK_SOURCE_KEY` juste au-dessus : sans
-                // lui, une valeur calculée s'afficherait comme une valeur du
-                // disque, ce qui serait un affichage inventé.
-                if let Some(dr) = plage {
-                    // `get_all` : le dépôt n'expose pas de lecture d'UNE clé,
-                    // et la ligne est de toute façon déjà en cache après
-                    // l'écriture des gains juste au-dessus.
-                    let existant = repo
-                        .get_all(track_id)
-                        .ok()
-                        .and_then(|m| m.get("dr_track").cloned());
-                    if peut_ecrire_le_dr(existant.as_deref()) {
-                        let _ = repo.set(track_id, "dr_track", &dr.to_string());
-                        let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
-                    }
-                }
+                // #4681 — les cinq à sept écritures de la mesure partent HORS
+                // des fils de l'exécuteur : la lecture a pu démarrer pendant
+                // le décodage, et ces fils la servent.
+                let backend_ecriture = backend.clone();
+                crate::taches_de_fond::priorite::hors_du_fil_async(
+                    crate::taches_de_fond::Tache::ReplayGain.id(),
+                    move || {
+                        ecrire_la_mesure_de_piste(
+                            &backend_ecriture,
+                            track_id,
+                            lufs,
+                            peak,
+                            true_peak,
+                            plage,
+                        )
+                    },
+                )
+                .await;
             }
             // Le fichier a disparu ENTRE la résolution et le décodage — un
             // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -1085,8 +1140,17 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
         // pesent rien, et la piste ne repassera pas par ici.
         empreinter_la_piste(backend, track_id, &sur_disque).await;
         // Sentinel = unix seconds, so an album pass can tell a track has been
-        // handled even when it produced no gain.
-        let _ = repo.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
+        // handled even when it produced no gain. Hors du fil async (#4681).
+        {
+            let repo_temoin = TrackMetadataRepo::with_backend(backend.clone());
+            crate::taches_de_fond::priorite::hors_du_fil_async(
+                crate::taches_de_fond::Tache::ReplayGain.id(),
+                move || {
+                    let _ = repo_temoin.set(track_id, "rg_analyzed", &now_epoch_secs().to_string());
+                },
+            )
+            .await;
+        }
         done += 1;
         // #4144 — LE point d'avancement nominal. Il est ici, par piste, et non
         // au retour du lot : un lot de 25 fichiers peut tenir plus d'une heure
@@ -1140,14 +1204,21 @@ async fn empreinter_la_piste(backend: &Arc<dyn DbBackend>, track_id: i64, chemin
             return false;
         }
     };
-    match crate::db::track_repo::TrackRepo::with_backend(backend.clone())
-        .set_audio_fingerprint(track_id, &valeur)
-    {
-        Ok(()) => true,
-        Err(e) => {
+    // Hors du fil async (#4681) : c'est une écriture SQLite.
+    let depot = crate::db::track_repo::TrackRepo::with_backend(backend.clone());
+    let ecriture = crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::Empreintes.id(),
+        move || depot.set_audio_fingerprint(track_id, &valeur),
+    )
+    .await;
+    match ecriture {
+        Some(Ok(())) => true,
+        Some(Err(e)) => {
             warn!(track_id, error = %e, "empreinte_ecriture_echouee");
             false
         }
+        // Le travail a paniqué : `hors_du_fil_async` l'a déjà journalisé.
+        None => false,
     }
 }
 
@@ -1468,15 +1539,14 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
                 mesuree = true;
                 // 🔴 LE TAG DU FICHIER FAIT FOI. La requête a bien écarté les
                 // pistes qui en portaient un, mais un scan a pu en poser un
-                // PENDANT le décodage — jusqu'à 180 s de fenêtre. On relit.
-                let existant = repo
-                    .get_all(track_id)
-                    .ok()
-                    .and_then(|m| m.get("dr_track").cloned());
-                if peut_ecrire_le_dr(existant.as_deref()) {
-                    let _ = repo.set(track_id, "dr_track", &dr.to_string());
-                    let _ = repo.set(track_id, "dr_source", DR_SOURCE_ANALYSIS);
-                }
+                // PENDANT le décodage — jusqu'à 180 s de fenêtre. On relit,
+                // hors du fil async (#4681).
+                let repo_dr = TrackMetadataRepo::with_backend(backend.clone());
+                crate::taches_de_fond::priorite::hors_du_fil_async(
+                    crate::taches_de_fond::Tache::PlageDynamique.id(),
+                    move || ecrire_le_dr_mesure(&repo_dr, track_id, dr),
+                )
+                .await;
             }
             // Le fichier a disparu ENTRE la résolution et le décodage : un
             // partage qui tombe pendant la passe. On reporte, on ne condamne pas.
