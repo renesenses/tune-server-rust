@@ -88,25 +88,45 @@ pub fn bandcamp_quality(enc: &str) -> Option<BandcampQuality> {
     }
 }
 
-pub(super) fn guess_mime_from_url(url: &str) -> &'static str {
+/// Le MIME de DERNIER RECOURS, quand rien — ni l'URL, ni la ligne, ni
+/// l'appelant — ne nomme le format.
+///
+/// Il n'affirme rien : c'est le choix le moins coûteux pour une URL de podcast
+/// ou de radio, qui est très majoritairement du MP3. Sur un serveur média, ce
+/// même défaut MENT (voir [`super::mime_upnp`]), d'où la séparation ci-dessous
+/// entre « l'extension nomme un format » et « on retombe ».
+pub(super) const MIME_PAR_DEFAUT: &str = "audio/mpeg";
+
+/// Le MIME que l'EXTENSION de l'URL nomme — `None` quand elle n'en nomme
+/// aucun.
+///
+/// Cette fonction ne retombe sur rien : c'est précisément la distinction qui
+/// manquait. [`guess_mime_from_url`] confondait « l'URL dit MP3 » et « l'URL
+/// ne dit rien », les deux rendant `"audio/mpeg"` ; un appelant qui sait autre
+/// chose sur la piste ne pouvait donc pas savoir s'il avait le droit de parler.
+pub(super) fn mime_depuis_l_extension(url: &str) -> Option<&'static str> {
     let lower = url.to_lowercase();
     let path = lower.split('?').next().unwrap_or(&lower);
     if path.ends_with(".mp3") {
-        "audio/mpeg"
+        Some("audio/mpeg")
     } else if path.ends_with(".m4a") || path.ends_with(".aac") || path.ends_with(".mp4") {
-        "audio/mp4"
+        Some("audio/mp4")
     } else if path.ends_with(".ogg") || path.ends_with(".opus") {
-        "audio/ogg"
+        Some("audio/ogg")
     } else if path.ends_with(".flac") || path.ends_with(".flc") {
         // ".flc" is the extension Lyrion/LMS uses for FLAC in its stream URLs
         // (…/music/<id>/download.flc); it fell through to the "audio/mpeg"
         // default, so the DLNA renderer got FLAC bytes labelled as MP3.
-        "audio/flac"
+        Some("audio/flac")
     } else if path.ends_with(".wav") {
-        "audio/wav"
+        Some("audio/wav")
     } else if path.ends_with(".aif") || path.ends_with(".aiff") {
-        "audio/aiff"
+        Some("audio/aiff")
     } else {
-        "audio/mpeg"
+        None
     }
+}
+
+pub(super) fn guess_mime_from_url(url: &str) -> &'static str {
+    mime_depuis_l_extension(url).unwrap_or(MIME_PAR_DEFAUT)
 }

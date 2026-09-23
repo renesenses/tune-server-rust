@@ -711,6 +711,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tune-plugin-abi",
+ "tune-plugin-audio-support",
  "tune-plugin-sdk",
  "tune-plugin-testkit",
 ]

@@ -113,6 +113,12 @@ pub fn like_escape_clause() -> &'static str {
     " ESCAPE '\\'"
 }
 
+/// Le chemin sur disque d'une piste, qu'elle soit un fichier entier
+/// (`file_path`) ou une tranche d'image découpée par une feuille CUE
+/// (`file_path` NULL, `cue_media_path` renseigné). Sert à la vue par dossiers
+/// (#4625), qui ne voyait que la première forme.
+pub const CHEMIN_DE_LA_PISTE: &str = "COALESCE(file_path, cue_media_path)";
+
 /// Les comptes rendus par [`compter_pistes_par_sous_dossier`], indexés par nom
 /// de sous-dossier.
 ///
@@ -207,10 +213,17 @@ pub fn compter_pistes_par_sous_dossier(
     } else {
         ("?1", "?2", "instr")
     };
+    // 🔴 #4625 — `COALESCE(file_path, cue_media_path)` et non `file_path`
+    // seul : une piste découpée par une feuille CUE a `file_path = NULL` par
+    // construction (elle vit dans `cue_media_path`, voir
+    // `scanner::cue_bibliotheque`), et le scan RETIRE de la bibliothèque les
+    // fichiers que la feuille découpe. Un dossier rangé en CUE — y compris une
+    // feuille « un FILE par piste » posée à côté de FLAC ordinaires — tombait
+    // donc à 0 dans la vue par dossiers, alors que ses pistes sont en base.
     let sql = format!(
         "SELECT substr(reste, 1, {pos}(reste, {p2}) - 1) AS segment, COUNT(*) \
-         FROM (SELECT substr(file_path, {depart}) AS reste FROM tracks \
-         WHERE file_path LIKE {p1}{esc}) AS sous \
+         FROM (SELECT substr({CHEMIN_DE_LA_PISTE}, {depart}) AS reste FROM tracks \
+         WHERE {CHEMIN_DE_LA_PISTE} LIKE {p1}{esc}) AS sous \
          WHERE {pos}(reste, {p2}) > 0 GROUP BY segment",
         esc = like_escape_clause()
     );

@@ -374,6 +374,19 @@ pub struct ZoneState {
     /// vide. `#[serde(default)]` comme ses deux voisins.
     #[serde(default)]
     pub session_context_source: Option<String>,
+    /// Le NOM de l'objet demandé, quand aucune table de cette base ne peut le
+    /// rendre : une playlist de service (#3425). `None` pour un objet local,
+    /// dont le nom se relit dans sa table — et `None` tant que le service
+    /// n'a pas répondu, ce qui n'empêche rien de jouer.
+    ///
+    /// Relevé pour l'HISTORIQUE, pas pour l'écran : c'est la seule trace qui
+    /// permettra ensuite de titrer la vignette « Reprendre l'écoute » avec ce
+    /// qui a réellement été écouté, au lieu de l'album de la dernière piste.
+    #[serde(default)]
+    pub session_context_title: Option<String>,
+    /// La pochette de ce même objet, même règle que `session_context_title`.
+    #[serde(default)]
+    pub session_context_cover: Option<String>,
     /// Instant de la dernière mise en pause (`None` hors pause). Pour une
     /// RADIO, l'orchestrateur compare cet instant à un seuil à la reprise :
     /// un flux live continue de se périmer pendant la pause (connexion
@@ -554,6 +567,8 @@ impl Default for ZoneState {
             session_context_type: None,
             session_context_id: None,
             session_context_source: None,
+            session_context_title: None,
+            session_context_cover: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,
@@ -805,6 +820,12 @@ pub struct PlaybackManager {
     /// Absent = aucun gain connu en aval : le forwarder mesure alors tel quel,
     /// ce qui est le comportement de tous les chemins non locaux.
     gains_de_sortie: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU32>>>,
+    /// #4685 — le gain MOYEN de l'égaliseur et du crossfeed de la sortie
+    /// locale, en millièmes (`LocalOutput::gain_moyen_du_dsp`). Le point de
+    /// mesure est AVANT eux : sans ce facteur, la compensation de niveau que
+    /// porte le gain de rendu apparaîtrait sur l'aiguille sans la réserve
+    /// qu'elle compense. Absent = 1,0.
+    gains_moyens_du_dsp: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU32>>>,
 }
 
 impl Default for PlaybackManager {
@@ -823,6 +844,7 @@ impl PlaybackManager {
             zone_taps: std::sync::Mutex::new(HashMap::new()),
             levels_gens: std::sync::Mutex::new(HashMap::new()),
             gains_de_sortie: std::sync::Mutex::new(HashMap::new()),
+            gains_moyens_du_dsp: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -848,17 +870,50 @@ impl PlaybackManager {
             .lock()
             .expect("gains_de_sortie lock")
             .remove(&zone_id);
+        // Le gain moyen du DSP appartient à la MÊME sortie : il part avec elle.
+        self.gains_moyens_du_dsp
+            .lock()
+            .expect("gains_moyens_du_dsp lock")
+            .remove(&zone_id);
+    }
+
+    /// #4685 — partage le gain MOYEN du DSP de la sortie locale qui va jouer
+    /// cette zone. Voir [`Self::gain_de_sortie_units`].
+    pub fn brancher_le_gain_moyen_du_dsp(
+        &self,
+        zone_id: i64,
+        gain: Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.gains_moyens_du_dsp
+            .lock()
+            .expect("gains_moyens_du_dsp lock")
+            .insert(zone_id, gain);
     }
 
     /// Le gain en aval du point de mesure, en millièmes. `1000` quand rien
     /// n'est branché — c'est-à-dire « mesure telle quelle ».
+    ///
+    /// #4685 — produit du gain de rendu (volume × ReplayGain × compensation)
+    /// et du gain MOYEN du DSP. Compensation active et non rabotée, les deux
+    /// derniers s'annulent : l'aiguille retrouve le niveau du fichier au
+    /// volume près, ce qui est exactement ce que la compensation promet. La
+    /// crête, elle, reste celle d'avant le DSP — l'égaliseur et le crossfeed
+    /// ne sont toujours pas mesurés échantillon par échantillon (#4384).
     pub fn gain_de_sortie_units(&self, zone_id: i64) -> u32 {
-        self.gains_de_sortie
-            .lock()
-            .expect("gains_de_sortie lock")
-            .get(&zone_id)
-            .map(|g| g.load(std::sync::atomic::Ordering::SeqCst))
-            .unwrap_or(1000)
+        let lire = |carte: &std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU32>>>| {
+            carte
+                .lock()
+                .expect("gains lock")
+                .get(&zone_id)
+                .map(|g| g.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        let rendu = lire(&self.gains_de_sortie).unwrap_or(1000);
+        match lire(&self.gains_moyens_du_dsp) {
+            Some(dsp) if dsp != 1000 => {
+                ((u64::from(rendu) * u64::from(dsp) + 500) / 1000).min(u64::from(u32::MAX)) as u32
+            }
+            _ => rendu,
+        }
     }
 
     /// La génération de niveaux d'une zone (créée au premier accès).
@@ -1577,6 +1632,8 @@ impl PlaybackManager {
         context_type: Option<String>,
         context_id: Option<String>,
         context_source: Option<String>,
+        context_title: Option<String>,
+        context_cover: Option<String>,
     ) {
         let mut zones = self.zones.lock().await;
         let z = zones.entry(zone_id).or_insert_with(|| ZoneState {
@@ -1586,6 +1643,11 @@ impl PlaybackManager {
         z.session_context_type = context_type;
         z.session_context_id = context_id;
         z.session_context_source = context_source;
+        // Toujours écrasés avec le reste, `None` compris : ce geste remplace
+        // le précédent. Les garder ferait porter à une playlist le nom de
+        // celle d'avant — exactement la vignette étrangère qu'on répare.
+        z.session_context_title = context_title;
+        z.session_context_cover = context_cover;
     }
 
     /// Observe actual work independently of the displayed media position.
@@ -1893,6 +1955,8 @@ mod tests {
             session_context_type: None,
             session_context_id: None,
             session_context_source: None,
+            session_context_title: None,
+            session_context_cover: None,
             metadata_changed_at_ms: None,
             browser_unattended_at: None,
             derniere_avance_de_position: None,

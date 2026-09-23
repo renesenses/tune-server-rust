@@ -96,8 +96,8 @@ use super::{
     DEAD_START_RETRY_COOLDOWN_SECS, GAPLESS_STAGE_MAX_AGE_SECS, GAPLESS_STUCK_THRESHOLD,
     GAPLESS_WINDOW_MS, MIN_PEAK_UNKNOWN_DURATION_MS, MIN_PLAYED_FRACTION, MIN_TRACK_WALL_SECS,
     MIN_WALL_FRACTION_FOR_NATURAL_END, POLL_FAIL_END_MIN_ERRORS, POLL_INTERVAL_MS,
-    POSITION_PAST_END_TICKS, STOPPED_TICKS_THRESHOLD, SuivantePreparee,
-    TICKS_GELE_DLNA_AVEC_SETNEXT,
+    POSITION_PAST_END_TICKS, RENDERER_CALE_REPRISE_COOLDOWN_SECS, RENDERER_CALE_RESTE_MIN_MS,
+    STOPPED_TICKS_THRESHOLD, SuivantePreparee, TICKS_GELE_DLNA_AVEC_SETNEXT,
 };
 
 /// Margin (ms) added to the track duration before position-based
@@ -422,6 +422,42 @@ pub fn relance_demarrage_mort_autorisee(derniere_il_y_a_secs: Option<u64>) -> bo
     derniere_il_y_a_secs.is_none_or(|s| s > DEAD_START_RETRY_COOLDOWN_SECS)
 }
 
+/// Une reprise automatique après décrochage du renderer EN COURS de lecture
+/// est-elle permise ? (#4645)
+///
+/// À ne pas confondre avec `relance_demarrage_mort_autorisee` : là-bas la
+/// piste n'a JAMAIS démarré et on la rejoue depuis le début. Ici elle a joué
+/// `position_ms`, et c'est de cette position qu'on repart. Le refus de
+/// « rejouer » un décrochage en cours de lecture (#2394) portait sur le retour
+/// au début — pas sur la reprise là où le renderer s'est tu.
+///
+/// Mesure qui motive la règle (#4645, Sevy Tabroc, 0.9.159) : sur un WAV de
+/// 272 Mo servi à un darTZeel LHC, la connexion s'est fermée à 87,7 % du
+/// fichier ; le renderer a joué les 15:00 reçues d'une piste de 17:10, puis
+/// s'est tu. Tune coupait alors la zone, et la file s'arrêtait là.
+///
+/// Quatre conditions, toutes nécessaires :
+///
+/// * la piste a réellement joué (`position_ms > 0`) — sinon c'est un démarrage
+///   mort, qui relève de l'autre branche et se rejoue depuis zéro ;
+/// * le flux est MESURÉ incomplet (`octets_total` connu, et non atteint) : un
+///   total inconnu ne prouve rien, et on ne reprend pas sur une ignorance ;
+/// * il reste au moins `RENDERER_CALE_RESTE_MIN_MS` de musique à jouer ;
+/// * aucune reprise sur cette zone depuis `RENDERER_CALE_REPRISE_COOLDOWN_SECS`.
+pub fn reprise_apres_renderer_cale_autorisee(
+    derniere_il_y_a_secs: Option<u64>,
+    position_ms: u64,
+    track_duration_ms: u64,
+    octets_servis: u64,
+    octets_total: Option<u64>,
+) -> bool {
+    let a_joue = position_ms > 0;
+    let flux_incomplet = octets_total.is_some_and(|total| total > 0 && octets_servis < total);
+    let reste_assez = track_duration_ms.saturating_sub(position_ms) >= RENDERER_CALE_RESTE_MIN_MS;
+    let hors_fenetre = derniere_il_y_a_secs.is_none_or(|s| s > RENDERER_CALE_REPRISE_COOLDOWN_SECS);
+    a_joue && flux_incomplet && reste_assez && hors_fenetre
+}
+
 /// Le verrou « suivant DSD sur DLNA » (#2394) tient-il encore ? Il ne
 /// tient que pour LA position de file constatée : si la file bouge (ajout,
 /// saut, avance), la position suivante change et on re-résout — au pire on
@@ -482,6 +518,40 @@ pub fn position_reset_fires(
 /// the poisoned-peak advance and the near-end gapless mis-staging.
 pub fn stale_start_position(wall_elapsed_secs: u64, position_ms: u64) -> bool {
     position_ms > wall_elapsed_secs * 1000 + 15_000
+}
+
+/// #4666 — l'ancrage d'horloge d'un état de sondage NEUF, créé pour une zone
+/// qui joue déjà au milieu d'une piste.
+///
+/// Le sondeur jette l'état de sondage d'une zone dès qu'elle quitte `Playing`
+/// (`poll_states.retain` en tête de `tick`) : une PAUSE le supprime. À la
+/// reprise, il en recrée un neuf — même génération, donc pas de remise à zéro
+/// par changement de piste — avec `track_started_at = None`, c'est-à-dire une
+/// horloge murale à ZÉRO. La sortie rend alors la position de reprise (2:19
+/// chez Jean Valjean) : `stale_start_position(0, 139_666)` est vrai, le tour
+/// est sauté par `continue`, et les seuls sites qui reposent
+/// `track_started_at` sont APRÈS ce `continue`. L'état se nourrit lui-même
+/// jusqu'à la fin de la piste : position jamais publiée, fin de piste jamais
+/// vue, aucun enchaînement (fil 1882 : 31 × `stale_start_position_ignored
+/// wall_s=0`, zone figée 9 min 25 s).
+///
+/// La position que l'état de zone porte AU MOMENT de la reprise est celle que
+/// le sondeur a lui-même publiée avant la pause, ou la cible qu'une commande
+/// (`seek`) vient d'y écrire : ce n'est pas un échantillon de sortie, la garde
+/// anti-fantôme n'a pas à s'en méfier. On date donc le début de piste comme le
+/// fait déjà le repli de seek (« Fold a NEW seek ») : `maintenant − position`.
+///
+/// Une position nulle — tout `play()` d'une piste neuve la remet à zéro — rend
+/// `None` : le démarrage frais garde exactement son comportement d'avant, et
+/// la protection contre la position de la session précédente (DMP-A6/A8) avec.
+pub fn ancrage_d_un_etat_neuf(
+    maintenant: std::time::Instant,
+    position_zone_ms: i64,
+) -> Option<std::time::Instant> {
+    if position_zone_ms <= 0 {
+        return None;
+    }
+    maintenant.checked_sub(std::time::Duration::from_millis(position_zone_ms as u64))
 }
 
 /// The peak position reached (near) the track's full duration, so the track

@@ -1,8 +1,41 @@
 //! Crossfeed plugin compatibility and host applicability status.
+
+/// Borne haute du NIVEAU (`amount`) — la même pour la route
+/// `PUT /zones/{id}/dsp`, les préréglages et l'orchestrateur.
+///
+/// Ce n'est pas un plafond de prudence, c'est le bout physique de l'échelle
+/// (#4683). Le moteur fait `L' = L + a·(Rd − Ld)`, `R' = R + a·(Ld − Rd)` :
+/// le Mid est intact et le Side devient `S·(1 − 2a)` (retard nul). À 0,5, le
+/// Side est entièrement replié — l'image est mono ; c'est donc « 100 % » du
+/// curseur. Au-delà, le Side change de signe (image en opposition de phase) et
+/// à 1,0 la gauche et la droite sont simplement échangées : rien qui imite une
+/// tête. Relever cette borne n'aurait aucun sens acoustique.
+pub const MAX_AMOUNT: f64 = 0.5;
+
+/// Borne haute du RETARD, en millisecondes — celle que le moteur du greffon
+/// applique lui-même (`MAX_DELAY_MS` de `tune-plugin-crossfeed`, 5 ms). Le
+/// retard interaural naturel plafonne vers 0,6–0,7 ms ; les réglages tout faits
+/// des clients restent en deçà.
+pub const MAX_DELAY_MS: f64 = 5.0;
+
+/// Le réglage `{ amount, delay_ms }` ramené dans les bornes ci-dessus. Un NaN
+/// retombe sur la valeur par défaut (0,30 / 0,30 ms) plutôt que sur une borne.
+pub fn borner(amount: f64, delay_ms: f64) -> (f64, f64) {
+    let amount = if amount.is_finite() { amount } else { 0.30 };
+    let delay_ms = if delay_ms.is_finite() { delay_ms } else { 0.30 };
+    (
+        amount.clamp(0.0, MAX_AMOUNT),
+        delay_ms.clamp(0.0, MAX_DELAY_MS),
+    )
+}
+
 pub struct CrossfeedProcessor {
     engine: CrossfeedEngine,
     amount: f32,
     delay_samples: usize,
+    /// #4685 — niveau moyen du filtre, calculé UNE fois à la construction
+    /// (voir [`Self::gain_moyen_db`]).
+    gain_moyen_db: f64,
 }
 enum CrossfeedEngine {
     Bundled(tune_plugin_crossfeed::CrossfeedProcessor),
@@ -32,11 +65,26 @@ impl CrossfeedProcessor {
         } else {
             CrossfeedEngine::Bundled(reference)
         };
+        // Un moteur indisponible ne mélange rien : rien à compenser.
+        let gain_moyen_db = if matches!(engine, CrossfeedEngine::Unavailable) {
+            0.0
+        } else {
+            tune_plugin_crossfeed::gain_moyen_db(sample_rate, amount, delay_ms)
+        };
         Self {
             engine,
             amount,
             delay_samples,
+            gain_moyen_db,
         }
+    }
+
+    /// #4685 — ce que ce crossfeed fait gagner ou perdre au niveau MOYEN d'un
+    /// canal, en dB, sur un bruit rose stéréo de corrélation
+    /// `tune_plugin_crossfeed::CORRELATION_DE_REFERENCE`. Calculé depuis le
+    /// filtre, pas depuis la musique : c'est un gain FIXE.
+    pub fn gain_moyen_db(&self) -> f64 {
+        self.gain_moyen_db
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
         match &mut self.engine {
@@ -347,6 +395,47 @@ pub fn avec_les_droits(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // #4683 — 0,5 est le bout de l'échelle du niveau, pas un plafond arbitraire.
+    // -----------------------------------------------------------------
+
+    fn traite(amount: f32, l: f32, r: f32) -> (f32, f32) {
+        let mut p = tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, amount, 0.0);
+        let mut s = [l, r];
+        p.process_interleaved(&mut s);
+        (s[0], s[1])
+    }
+
+    /// À `MAX_AMOUNT`, retard nul, le Side est entièrement replié : les deux
+    /// oreilles reçoivent la même chose. C'est le « 100 % » du curseur.
+    #[test]
+    fn au_niveau_maximal_l_image_est_mono_4683() {
+        let (l, r) = traite(MAX_AMOUNT as f32, 0.8, -0.2);
+        assert!((l - r).abs() < 1e-6, "L={l} R={r}");
+        assert!((l + r - 0.6).abs() < 1e-6, "le Mid doit rester intact");
+    }
+
+    /// Contre-épreuve : au-delà, le Side change de signe, et à 1,0 la gauche
+    /// et la droite sont échangées — ce que relever la borne produirait.
+    #[test]
+    fn au_dela_du_maximum_le_side_s_inverse_4683() {
+        let (l, r) = traite(0.75, 0.8, -0.2);
+        assert!(l < r, "Side inversé attendu : L={l} R={r}");
+        let (l, r) = traite(1.0, 0.8, -0.2);
+        assert!(
+            (l + 0.2).abs() < 1e-6 && (r - 0.8).abs() < 1e-6,
+            "L={l} R={r}"
+        );
+    }
+
+    #[test]
+    fn borner_ramene_dans_l_echelle_4683() {
+        assert_eq!(borner(0.9, 12.0), (MAX_AMOUNT, MAX_DELAY_MS));
+        assert_eq!(borner(-1.0, -1.0), (0.0, 0.0));
+        assert_eq!(borner(f64::NAN, f64::INFINITY), (0.30, 0.30));
+        assert_eq!(borner(0.3, 0.5), (0.3, 0.5));
+    }
 
     // -----------------------------------------------------------------
     // #4511 — les droits ne passent plus devant la sortie.

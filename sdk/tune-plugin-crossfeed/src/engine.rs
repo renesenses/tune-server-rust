@@ -72,8 +72,7 @@ impl CrossfeedProcessor {
     /// `delay_samples = round(delay_ms / 1000 * sample_rate)`, clamped so a
     /// pathological config can never allocate an unbounded buffer.
     pub fn new(sample_rate: u32, amount: f32, delay_ms: f32) -> Self {
-        let clamped_ms = delay_ms.clamp(0.0, MAX_DELAY_MS);
-        let delay_samples = ((clamped_ms / 1000.0) * sample_rate as f32).round() as usize;
+        let delay_samples = retard_en_echantillons(sample_rate, delay_ms);
         Self {
             amount,
             delay_samples,
@@ -265,6 +264,73 @@ impl CrossfeedProcessor {
     pub fn delay_samples(&self) -> usize {
         self.delay_samples
     }
+}
+
+/// Le retard RÉEL du terme croisé, en échantillons : `delay_ms` borné à
+/// [`MAX_DELAY_MS`] puis arrondi au débit. Une seule formule pour le
+/// processeur et pour [`gain_moyen_db`] : la compensation doit parler du
+/// filtre construit, pas du réglage demandé.
+fn retard_en_echantillons(sample_rate: u32, delay_ms: f32) -> usize {
+    let clamped_ms = delay_ms.clamp(0.0, MAX_DELAY_MS);
+    ((clamped_ms / 1000.0) * sample_rate as f32).round() as usize
+}
+
+/// Corrélation gauche/droite du signal de référence de [`gain_moyen_db`].
+///
+/// Le crossfeed conserve le Mid au bit près et ne touche qu'au Side : ce
+/// qu'il fait perdre en niveau dépend donc de la part de Side dans la
+/// musique, que le filtre seul ne connaît pas. Il faut une référence, et
+/// elle est posée ICI, une fois : 0 serait deux canaux sans rapport (le pire
+/// cas, qu'aucun mixage ne produit), 1 une source mono (le crossfeed ne
+/// change alors rien). 0,5 — Side 4,8 dB sous le Mid — est une CONVENTION
+/// de mixage stéréo ordinaire, pas une mesure : à reprendre à l'oreille si
+/// la compensation se révèle trop forte ou trop faible.
+pub const CORRELATION_DE_REFERENCE: f64 = 0.5;
+
+/// #4685 — ce que ce crossfeed fait gagner (> 0) ou perdre (< 0) au niveau
+/// MOYEN d'un canal, en dB, sur un bruit rose stéréo de corrélation
+/// [`CORRELATION_DE_REFERENCE`].
+///
+/// Calculé depuis le filtre lui-même, donc identique pour toute la musique :
+/// la compensation qu'on en tire est un gain FIXE, pas un automatisme.
+///
+/// Le calcul suit l'algorithme ligne à ligne. Avec `M = (L+R)/2` et
+/// `S = (L−R)/2`, le module rend `M` intact et
+/// `S_out = S · (1 − 2a·z^−D)` — la différence des deux termes croisés.
+/// Pour L et R de même puissance et de corrélation ρ, `M` et `S` sont
+/// décorrélés, de puissances `(1+ρ)/2` et `(1−ρ)/2`, et un canal de sortie
+/// vaut donc, à la fréquence `f` :
+///
+/// ```text
+/// P(f) = (1+ρ)/2 + (1−ρ)/2 · |1 − 2a·e^(−j2πfD/fs)|²
+///      = (1+ρ)/2 + (1−ρ)/2 · (1 − 4a·cos(2πfD/fs) + 4a²)
+/// ```
+///
+/// Sans retard (`D = 0`) le Side est simplement multiplié par `1 − 2a` : le
+/// niveau baisse partout (−0,90 dB à 25 %, −1,19 dB à 40 %). Avec retard,
+/// c'est un peigne : il creuse le grave (`cos ≈ 1`) — d'où « surtout dans le
+/// grave » — mais POUSSE le Side par endroits dans l'aigu, et en moyenne rose
+/// les deux se compensent presque : les trois réglages du client restent à
+/// quelques dixièmes de dB, dans un sens ou dans l'autre (témoin
+/// `avec_retard_le_peigne_rend_dans_l_aigu_ce_qu_il_prend_au_grave`). La
+/// compensation qui en découle peut donc être une ATTÉNUATION.
+///
+/// Hors calcul : l'écrêtage du module (clamp à ±1), non linéaire, et un flux
+/// non stéréo, que le module laisse intact (0 dB serait alors juste ; ce
+/// calcul ne connaît pas les canaux et suppose la stéréo).
+pub fn gain_moyen_db(sample_rate: u32, amount: f32, delay_ms: f32) -> f64 {
+    if amount == 0.0 || !amount.is_finite() || sample_rate == 0 {
+        return 0.0;
+    }
+    let a = f64::from(amount);
+    let retard = retard_en_echantillons(sample_rate, delay_ms) as f64;
+    let fs = f64::from(sample_rate);
+    let rho = CORRELATION_DE_REFERENCE;
+    let (p_mid, p_side) = ((1.0 + rho) / 2.0, (1.0 - rho) / 2.0);
+    tune_plugin_audio_support::niveau_moyen::gain_moyen_rose_db(fs, |f| {
+        let cos = (2.0 * std::f64::consts::PI * f * retard / fs).cos();
+        p_mid + p_side * (1.0 - 4.0 * a * cos + 4.0 * a * a)
+    })
 }
 
 #[cfg(test)]
@@ -470,5 +536,112 @@ mod tests {
         let mut neuf2 = CrossfeedProcessor::new(48000, 0.3, 0.0);
         neuf2.inherit_state_from(&prec2);
         assert!(neuf2.ring_l.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // #4685 — le niveau moyen, calculé puis MESURÉ
+    // -------------------------------------------------------------------
+
+    /// Passe un Mid et un Side multi-sinus (corrélation L/R = 0,5, celle de
+    /// la référence) dans le VRAI processeur et rend (entrée, sortie) en dB
+    /// RMS sur le canal gauche, ligne à retard amorcée.
+    fn rms_avant_apres(sample_rate: u32, amount: f32, delay_ms: f32) -> (f64, f64) {
+        use tune_plugin_audio_support::niveau_moyen::{multisinus_rose, rms_db};
+        let frames = sample_rate as usize * 2;
+        let mid = multisinus_rose(sample_rate, frames, 0x4685);
+        let side = multisinus_rose(sample_rate, frames, 0x1234_5678);
+        // Puissance du Side = 1/3 de celle du Mid ⇔ ρ = (1−1/3)/(1+1/3) = 0,5.
+        let k = (1.0_f64 / 3.0).sqrt();
+        let entree: Vec<f32> = mid
+            .iter()
+            .zip(side.iter())
+            .flat_map(|(m, s)| [(m + k * s) as f32, (m - k * s) as f32])
+            .collect();
+        let mut sortie = entree.clone();
+        let mut cf = CrossfeedProcessor::new(sample_rate, amount, delay_ms);
+        cf.process_interleaved(&mut sortie);
+        let gauche = |v: &[f32]| -> Vec<f64> {
+            v.as_chunks::<2>()
+                .0
+                .iter()
+                .skip(frames / 4)
+                .map(|p| f64::from(p[0]))
+                .collect()
+        };
+        (rms_db(gauche(&entree)), rms_db(gauche(&sortie)))
+    }
+
+    /// Le témoin chiffré : sur les trois réglages tout faits du client
+    /// (Léger 0,25/0,3 ms, Standard 0,30/0,5 ms, Fort 0,40/0,7 ms) et sans
+    /// retard, l'écart de niveau MESURÉ au RMS doit retrouver
+    /// [`gain_moyen_db`] à 0,25 dB près — et la compensation qu'on en tire
+    /// doit rendre le niveau d'entrée.
+    #[test]
+    fn le_gain_moyen_calcule_retrouve_le_rms_mesure_4685() {
+        for (sr, amount, delay) in [
+            (44_100, 0.25_f32, 0.3_f32),
+            (44_100, 0.30, 0.5),
+            (48_000, 0.40, 0.7),
+            (96_000, 0.30, 0.0),
+            (44_100, 0.50, 0.0),
+        ] {
+            let calcule = gain_moyen_db(sr, amount, delay);
+            let (avant, apres) = rms_avant_apres(sr, amount, delay);
+            let mesure = apres - avant;
+            eprintln!(
+                "crossfeed {sr} Hz a={amount} d={delay} ms : calculé {calcule:+.3} dB, \
+                 mesuré {mesure:+.3} dB (entrée {avant:.2} dB RMS, sortie {apres:.2}, \
+                 compensée {:.2})",
+                apres - calcule
+            );
+            assert!(
+                (calcule - mesure).abs() < 0.25,
+                "calculé {calcule:.3} dB ≠ mesuré {mesure:.3} dB ({sr} Hz, a={amount}, d={delay})"
+            );
+            assert!(
+                ((apres - calcule) - avant).abs() < 0.25,
+                "la compensation doit rendre le niveau d'entrée"
+            );
+        }
+    }
+
+    #[test]
+    fn sans_crossfeed_il_n_y_a_rien_a_compenser() {
+        assert_eq!(gain_moyen_db(44_100, 0.0, 0.3), 0.0);
+        assert_eq!(gain_moyen_db(0, 0.3, 0.3), 0.0);
+        assert_eq!(gain_moyen_db(44_100, f32::NAN, 0.3), 0.0);
+    }
+
+    /// SANS retard, le Side est simplement multiplié par `1 − 2a` : plus fort
+    /// ⇒ plus de Side retiré ⇒ plus de niveau perdu, à toutes les fréquences.
+    #[test]
+    fn sans_retard_un_crossfeed_plus_fort_perd_plus() {
+        let faible = gain_moyen_db(44_100, 0.10, 0.0);
+        let moyen = gain_moyen_db(44_100, 0.25, 0.0);
+        let fort = gain_moyen_db(44_100, 0.40, 0.0);
+        assert!(
+            0.0 > faible && faible > moyen && moyen > fort,
+            "{faible} {moyen} {fort}"
+        );
+        // ρ = 0,5, a = 0,25 : Side × 0,5, soit 0,75 + 0,25 × 0,25 = 0,8125.
+        assert!((moyen - 10.0 * 0.8125_f64.log10()).abs() < 1e-9, "{moyen}");
+    }
+
+    /// AVEC retard, le terme croisé devient un peigne : il creuse le Side
+    /// dans le grave (sous `1/(4·retard)`) et le POUSSE par endroits dans
+    /// l'aigu. En moyenne rose les deux se compensent presque : les trois
+    /// réglages du client restent à quelques dixièmes de dB, dans un sens ou
+    /// dans l'autre. La compensation qui en découle est donc petite — et elle
+    /// peut ATTÉNUER. C'est le filtre qui le dit, pas une préférence.
+    #[test]
+    fn avec_retard_le_peigne_rend_dans_l_aigu_ce_qu_il_prend_au_grave() {
+        for (amount, delay) in [(0.25_f32, 0.3_f32), (0.30, 0.5), (0.40, 0.7)] {
+            let g = gain_moyen_db(44_100, amount, delay);
+            assert!(g.abs() < 0.5, "a={amount} d={delay} : {g:+.3} dB");
+            assert!(
+                g > gain_moyen_db(44_100, amount, 0.0),
+                "le retard doit rendre du niveau par rapport au même dosage instantané"
+            );
+        }
     }
 }

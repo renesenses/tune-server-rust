@@ -21,6 +21,9 @@ pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;
 pub mod lien_de_partage;
+/// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
+/// `tune-server.exe` (lecture seule, une ligne de journal).
+pub mod pare_feu_windows;
 pub mod plugins;
 /// P2 of the plugin ABI: AppState-backed [`HostContext`] plus the registry of
 /// loaded wasm plugins. Gated behind `plugins-wasm`; absent from default builds.

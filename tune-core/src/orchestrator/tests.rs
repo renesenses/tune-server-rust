@@ -2728,6 +2728,8 @@ async fn avance_gapless_ecrit_la_piste_atteinte_dans_l_historique() {
             Some("playlist".into()),
             Some("42".into()),
             Some("local".into()),
+            None,
+            None,
         )
         .await;
     orch.playback
@@ -6376,6 +6378,9 @@ async fn test_record_listen() {
             nature: Some("playlist"),
             id: Some("12"),
             rang: Some(4),
+            service: Some("qobuz"),
+            titre: Some("Les indispensables"),
+            pochette: None,
         },
     );
 

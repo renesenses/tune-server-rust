@@ -1098,30 +1098,81 @@ impl TidalService {
         path: &str,
         form: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
+        self.api_post_form_etiquette(path, form, None).await
+    }
+
+    /// L'ÉTIQUETTE d'une playlist Tidal (`ETag`).
+    ///
+    /// 🔴 Tidal refuse toute modification du CONTENU d'une playlist sans
+    /// `If-None-Match` :
+    ///
+    /// ```text
+    /// 412 {"subStatus":7002,"userMessage":"You must send the correct Etag
+    ///      value in the If-None-Match header to modify a playlist"}
+    /// ```
+    ///
+    /// Elle change à chaque modification : on la relit avant CHAQUE lot, sans
+    /// quoi le deuxième lot d'une playlist de plus de 100 titres échouerait.
+    async fn etiquette_playlist(&self, playlist_id: &str) -> Result<String, String> {
         let token = self.get_access_token().await?;
-        let url = format!("{API_BASE}{path}");
+        let url = format!("{API_BASE}/playlists/{playlist_id}");
         let resp = self
             .client
-            .post(&url)
+            .get(&url)
             .header("Authorization", format!("Bearer {token}"))
             .query(&[("countryCode", &self.country_code)])
-            .form(form)
             .send()
             .await
-            .map_err(|e| format!("tidal post: {e}"))?;
+            .map_err(|e| format!("tidal etag: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "tidal etag {playlist_id}: {}",
+                resp.status().as_u16()
+            ));
+        }
+        resp.headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("tidal etag {playlist_id}: en-tête absent"))
+    }
+
+    async fn api_post_form_etiquette(
+        &self,
+        path: &str,
+        form: &[(&str, &str)],
+        etiquette: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let token = self.get_access_token().await?;
+        let url = format!("{API_BASE}{path}");
+        let poser = |req: reqwest::RequestBuilder| match etiquette {
+            Some(e) => req.header(reqwest::header::IF_NONE_MATCH, e),
+            None => req,
+        };
+        let resp = poser(
+            self.client
+                .post(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .query(&[("countryCode", &self.country_code)])
+                .form(form),
+        )
+        .send()
+        .await
+        .map_err(|e| format!("tidal post: {e}"))?;
 
         if resp.status() == 401 {
             if let Ok(true) = self.do_refresh_token().await {
                 let new_token = self.get_access_token().await?;
-                let retry_resp = self
-                    .client
-                    .post(&url)
-                    .header("Authorization", format!("Bearer {new_token}"))
-                    .query(&[("countryCode", &self.country_code)])
-                    .form(form)
-                    .send()
-                    .await
-                    .map_err(|e| format!("tidal post retry: {e}"))?;
+                let retry_resp = poser(
+                    self.client
+                        .post(&url)
+                        .header("Authorization", format!("Bearer {new_token}"))
+                        .query(&[("countryCode", &self.country_code)])
+                        .form(form),
+                )
+                .send()
+                .await
+                .map_err(|e| format!("tidal post retry: {e}"))?;
                 if !retry_resp.status().is_success() {
                     let status = retry_resp.status().as_u16();
                     let body = retry_resp.text().await.unwrap_or_default();
@@ -1202,6 +1253,7 @@ impl TidalService {
                 }),
             track_count: item["numberOfTracks"].as_u64().unwrap_or(0) as u32,
             owner: item["creator"]["name"].as_str().map(Into::into),
+            covers: Vec::new(),
         }
     }
 
@@ -1940,15 +1992,33 @@ impl StreamingService for TidalService {
         Ok(Self::map_playlist(&data))
     }
 
+    /// 🔴 Paginé. La version d'avant demandait `?limit=100` et s'arrêtait là :
+    /// une playlist de 1 454 titres en rendait 100, sans rien dire. Invisible
+    /// à la lecture — on écoute rarement au-delà — mais la FUSION, elle, en
+    /// perdait les neuf dixièmes.
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        let data = self
-            .api_get(&format!("/playlists/{playlist_id}/tracks?limit=100"))
-            .await?;
-        let tracks = data["items"]
-            .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
-            .unwrap_or_default();
-        Ok(tracks)
+        let mut toutes: Vec<StreamTrack> = Vec::new();
+        let mut offset = 0u32;
+        let page = 100u32;
+        loop {
+            let data = self
+                .api_get(&format!(
+                    "/playlists/{playlist_id}/tracks?limit={page}&offset={offset}"
+                ))
+                .await?;
+            let lot: Vec<StreamTrack> = data["items"]
+                .as_array()
+                .map(|items| items.iter().map(Self::map_track).collect())
+                .unwrap_or_default();
+            let recues = lot.len();
+            toutes.extend(lot);
+            let total = data["totalNumberOfItems"].as_u64().unwrap_or(0) as usize;
+            offset += page;
+            if recues == 0 || toutes.len() >= total {
+                break;
+            }
+        }
+        Ok(toutes)
     }
 
     async fn get_genres(&self, _parent_id: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
@@ -2116,18 +2186,60 @@ impl StreamingService for TidalService {
     ) -> Result<usize, TuneError> {
         let mut added = 0;
         for chunk in track_ids.chunks(100) {
+            // Relue à chaque tour : l'ajout précédent l'a changée.
+            let etiquette = self.etiquette_playlist(playlist_id).await?;
             let ids_csv = chunk.join(",");
-            self.api_post_form(
-                &format!("/playlists/{playlist_id}/items"),
-                &[("trackIds", &ids_csv)],
-            )
-            .await?;
-            added += chunk.len();
+            // 🔴 `onArtifactNotFound` vaut `FAIL` par défaut : UNE piste
+            // introuvable dans le pays du compte — retirée du catalogue, ou
+            // jamais distribuée là — et Tidal refuse le LOT ENTIER :
+            //
+            //   404 {"subStatus":2001,"userMessage":"Track not found"}
+            //
+            // Les vieilles playlists en contiennent toujours. `SKIP` ajoute
+            // ce qui existe et laisse le reste, ce qui vaut mieux que de ne
+            // rien ajouter du tout. `onDupes=SKIP` par symétrie : les
+            // doublons sont déjà écartés en amont, et une playlist n'a pas à
+            // grossir d'un titre en double si elle passe deux fois ici.
+            let reponse = self
+                .api_post_form_etiquette(
+                    &format!("/playlists/{playlist_id}/items"),
+                    &[
+                        ("trackIds", &ids_csv),
+                        ("onArtifactNotFound", "SKIP"),
+                        ("onDupes", "SKIP"),
+                    ],
+                    Some(&etiquette),
+                )
+                .await?;
+            // Compter ce que Tidal a VRAIMENT ajouté : avec `SKIP`, annoncer
+            // la taille du lot mentirait dès qu'une piste manque.
+            added += reponse["addedItemIds"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(chunk.len());
         }
         Ok(added)
     }
 
+    /// DELETE /playlists/{uuid} — supprime la playlist chez Tidal.
+    ///
+    /// L'identifiant Tidal d'une playlist est un uuid, pas l'entier des
+    /// pistes ; c'est celui que `map_playlist` remonte et que l'interface
+    /// renvoie.
+    async fn delete_playlist(&self, playlist_id: &str) -> Result<(), TuneError> {
+        if self.user_id.is_none() {
+            return Err("tidal: not authenticated (no user_id)".into());
+        }
+        self.api_delete(&format!("/playlists/{playlist_id}"))
+            .await?;
+        Ok(())
+    }
+
     fn supports_write(&self) -> bool {
+        self.user_id.is_some()
+    }
+
+    fn supports_playlist_delete(&self) -> bool {
         self.user_id.is_some()
     }
 
@@ -2665,6 +2777,139 @@ mod tests {
                 ..Default::default()
             }],
         )
+    }
+
+    /*
+    | La suppression d'une playlist Tidal.
+    |
+    | `delete_playlist` avait l'implémentation par défaut du trait : elle
+    | rendait `Unsupported` sans jamais rien appeler. Le gestionnaire de
+    | playlists n'offrait donc aucun bouton « supprimer » sur une carte Tidal,
+    | alors que l'écran en pose un sur chaque playlist locale.
+    |
+    | Ces deux témoins portent sur la CAPACITÉ annoncée, pas sur le réseau :
+    | c'est elle qui décide si l'interface pose le bouton, et un bouton posé
+    | sans compte rendrait 501 au clic.
+    */
+
+    #[test]
+    fn sans_compte_tidal_la_suppression_nest_pas_annoncee() {
+        let svc = TidalService::new();
+        assert!(svc.user_id.is_none());
+        assert!(!svc.supports_playlist_delete());
+    }
+
+    #[tokio::test]
+    async fn sans_compte_la_suppression_echoue_sans_toucher_au_reseau() {
+        let svc = TidalService::new();
+        let err = svc.delete_playlist("uuid-quelconque").await.unwrap_err();
+        assert!(
+            err.to_string().contains("not authenticated"),
+            "motif inattendu : {err}"
+        );
+    }
+
+    #[test]
+    fn avec_un_compte_la_suppression_est_annoncee() {
+        let mut svc = TidalService::new();
+        svc.user_id = Some(4242);
+        assert!(svc.supports_playlist_delete());
+    }
+
+    /*
+    | L'ÉTIQUETTE (`ETag`) exigée par Tidal pour modifier une playlist.
+    |
+    | 🔴 Bertrand, 21/09, en fusionnant deux playlists Tidal :
+    |
+    |   Merge error: tidal /playlists/c7366b98-…/items: 412
+    |   {"subStatus":7002,"userMessage":"You must send the correct Etag value
+    |    in the If-None-Match header to modify a playlist"}
+    |
+    | La playlist était créée, et restait VIDE. `add_tracks_to_playlist`
+    | postait sans `If-None-Match`.
+    |
+    | L'étiquette se relit avant CHAQUE lot de 100 : l'ajout précédent l'a
+    | changée, donc une playlist de plus de 100 titres échouerait au deuxième
+    | tour si on la relisait une seule fois.
+    */
+
+    #[tokio::test]
+    async fn sans_compte_l_etiquette_ne_peut_pas_etre_lue() {
+        let svc = TidalService::new();
+        let err = svc
+            .etiquette_playlist("c7366b98-bff1-4ed4-9aa7-849185b3d702")
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty(), "un échec doit porter un motif");
+    }
+
+    #[test]
+    fn l_ajout_de_pistes_relit_l_etiquette_a_chaque_lot() {
+        // Garde de source : la relecture est DANS la boucle. Écrite parce que
+        // la poser au-dessus paraît plus économique et casse au 101ᵉ titre,
+        // ce qu'aucun essai sans compte ne montrerait.
+        let source = include_str!("tidal.rs");
+        let debut = source
+            .find("async fn add_tracks_to_playlist")
+            .expect("add_tracks_to_playlist introuvable");
+        let corps = &source[debut..debut + 900];
+        let boucle = corps.find("for chunk in").expect("plus de lots");
+        let relecture = corps
+            .find("self.etiquette_playlist(playlist_id)")
+            .expect("l'étiquette n'est plus lue");
+        assert!(
+            relecture > boucle,
+            "l'étiquette est lue HORS de la boucle : le deuxième lot échouera"
+        );
+    }
+
+    /*
+    | 🔴 « Merge error: tidal /playlists/…/items: 404 {"subStatus":2001,
+    | "userMessage":"Track not found"} » — Bertrand, 21/09, après le correctif
+    | de l'étiquette.
+    |
+    | Les identifiants envoyés étaient BONS (mesurés sur le .18 : 175461939,
+    | 20055000, 29280241…). C'est `onArtifactNotFound` qui vaut `FAIL` par
+    | défaut : une seule piste introuvable dans le pays du compte, et Tidal
+    | refuse le lot entier. Les vieilles playlists en contiennent toujours.
+    |
+    | Deux gardes de source : le drapeau est envoyé, et le compte rendu vient
+    | de Tidal. Sans la seconde, on annoncerait « 7 ajoutées » alors que SKIP
+    | en aurait laissé trois de côté.
+    */
+
+    #[test]
+    fn l_ajout_de_pistes_ne_capitule_pas_sur_une_piste_introuvable() {
+        let source = include_str!("tidal.rs");
+        let debut = source
+            .find("async fn add_tracks_to_playlist")
+            .expect("add_tracks_to_playlist introuvable");
+        let corps = &source[debut..debut + 2200];
+        assert!(
+            corps.contains("(\"onArtifactNotFound\", \"SKIP\")"),
+            "sans SKIP, une piste retirée du catalogue fait échouer tout le lot"
+        );
+        assert!(
+            corps.contains("addedItemIds"),
+            "le compte doit venir de Tidal, pas de la taille du lot"
+        );
+    }
+
+    #[test]
+    fn les_pistes_d_une_playlist_sont_paginees() {
+        let source = include_str!("tidal.rs");
+        let debut = source
+            .find("async fn get_playlist_tracks")
+            .expect("get_playlist_tracks introuvable");
+        let corps = &source[debut..debut + 1200];
+        assert!(
+            corps.contains("offset={offset}"),
+            "sans offset, une playlist de plus de 100 titres est tronquée en silence"
+        );
+        assert!(
+            corps.contains("totalNumberOfItems"),
+            "il faut une borne, sinon la boucle ne s'arrête jamais"
+        );
     }
 
     #[test]
