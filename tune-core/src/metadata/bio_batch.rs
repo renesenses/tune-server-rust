@@ -650,6 +650,15 @@ pub async fn batch_enrich_artist_bios_scoped(
     let mut failed = 0u32;
 
     for (artist_id, name, mbid) in &artists {
+        // « Suspendre les traitements » compte cette passe dans
+        // « Enrichissement » (`routes/system/taches_de_fond.rs`, `etat_de` :
+        // l'identifiant `bios` y figure), mais elle ne le consultait nulle
+        // part : la carte annonçait « en pause » pendant que la passe
+        // continuait d'appeler MusicBrainz, Wikipédia et Last.fm. La liste
+        // des candidats est tenue EN MÉMOIRE — on gare donc à la frontière
+        // plutôt que de sortir, pour repartir au même index.
+        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::Enrichissement)
+            .await;
         if mbid.is_empty() {
             // No MusicBrainz ID — can't fetch via Wikidata, try Last.fm only.
             //
@@ -783,6 +792,12 @@ pub async fn batch_enrich_album_bios_scoped(
     let album_repo = crate::db::album_repo::AlbumRepo::with_backend(db.clone());
 
     for (album_id, title, artist_name) in albums.iter() {
+        // Même garde que la passe des artistes : `bios` est compté dans
+        // « Enrichissement » par l'écran « État du serveur », il doit donc
+        // s'y arrêter. Avant la temporisation, pour qu'une pause ne coûte pas
+        // encore deux secondes de réseau.
+        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::Enrichissement)
+            .await;
         // Gentle rate limit: 2s between each album to avoid Wikipedia/Last.fm bans
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
 
