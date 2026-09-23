@@ -1404,6 +1404,78 @@ mod tests {
         assert!(w.contains("playlist_tracks"), "{w}");
     }
 
+    /// Bertrand, 21/09 : « impossible de choisir un tag comme règle de smart
+    /// collection ». Les étiquettes existaient (`tags`, `item_tags`), aucune
+    /// règle ne les lisait.
+    ///
+    /// Joué de bout en bout sur une base migrée : règle → `build_album_query`
+    /// → SQL exécuté. Trois cas qui comptent :
+    /// - l'album étiqueté lui-même ;
+    /// - l'album dont l'ARTISTE est étiqueté — c'est ce que dit l'étiquette ;
+    /// - la négation, qui doit garder l'album SANS artiste (colonne NULLable).
+    #[test]
+    fn une_etiquette_est_une_regle_de_smart_collection() {
+        use tune_core::db::backend::DbBackend;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (1,'Miles Davis'),(2,'Autre'); \
+             INSERT INTO albums (id, title, artist_id) VALUES \
+               (1,'Kind of Blue',1),(2,'Bitches Brew',1),(3,'Étiqueté seul',2), \
+               (4,'Rien',2),(5,'Sans artiste',NULL); \
+             INSERT INTO tracks (album_id, title, file_path) VALUES \
+               (1,'a','/m/1.flac'),(2,'b','/m/2.flac'),(3,'c','/m/3.flac'), \
+               (4,'d','/m/4.flac'),(5,'e','/m/5.flac'); \
+             INSERT INTO tags (id, name) VALUES (7,'J''adore'),(8,'Autre étiquette'); \
+             INSERT INTO item_tags (tag_id, item_type, item_id) VALUES \
+               (7,'artist',1),(7,'album',3),(8,'album',4);",
+        )
+        .unwrap();
+
+        let titres = |regles: &str| -> Vec<String> {
+            let ctx = RefCtx::root(&EmptyResolver, Some(1));
+            let (where_clause, order, _) =
+                build_album_query(regles, "all", "title", "asc", None, &ctx);
+            let sql = format!(
+                "SELECT al.title FROM albums al \
+                 LEFT JOIN artists ar ON al.artist_id = ar.id \
+                 LEFT JOIN tracks t ON t.album_id = al.id \
+                 {where_clause} GROUP BY al.id, al.title {order}"
+            );
+            db.query_many(&sql, &[])
+                .unwrap_or_else(|e| panic!("{e}\n{sql}"))
+                .iter()
+                .map(|r| r[0].as_string().unwrap_or_default())
+                .collect()
+        };
+
+        let a = titres(r#"[{"field":"tag","op":"is","value":"7"}]"#);
+        assert_eq!(
+            a,
+            vec!["Bitches Brew", "Kind of Blue", "Étiqueté seul"],
+            "l'album étiqueté ET les albums de l'artiste étiqueté"
+        );
+
+        let sans = titres(r#"[{"field":"tag","op":"is_not","value":"7"}]"#);
+        assert_eq!(
+            sans,
+            vec!["Rien", "Sans artiste"],
+            "la négation garde l'album SANS artiste"
+        );
+
+        // Une valeur illisible dégénère comme une référence introuvable : rien
+        // en positif, tout en négatif — et surtout pas une erreur SQL.
+        assert!(titres(r#"[{"field":"tag","op":"is","value":"x"}]"#).is_empty());
+        assert_eq!(
+            titres(r#"[{"field":"tag","op":"is_not","value":"x"}]"#).len(),
+            5
+        );
+    }
+
     /// #1426 (Jean Valjean, forum « F5 obligatoire ») : « Dans la Smart
     /// Collection "World Music" [il] n'a pas les bons albums, c'est un peu
     /// mélangé (Folk, Folk Métal, Folk Rock) ».

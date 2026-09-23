@@ -281,6 +281,15 @@ async fn add_tag_item(
     if !is_taggable_item_type(&body.item_type) {
         return (StatusCode::BAD_REQUEST, item_type_rejette(&body.item_type)).into_response();
     }
+    // 🔴 400, pas 500 : c'est la REQUÊTE qui est fausse. Avant ce garde,
+    // `item_id = 0` était écrit tel quel — deux lignes fantômes sur le .18.
+    if !tune_core::db::tag_repo::item_id_valide(body.item_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("item_id must be a positive local id, got {}", body.item_id),
+        )
+            .into_response();
+    }
     let repo = TagRepo::with_backend(state.backend.clone());
     match repo.tag_item(id, &body.item_type, body.item_id) {
         Ok(_) => StatusCode::CREATED.into_response(),
@@ -295,6 +304,17 @@ async fn batch_tag_items(
 ) -> impl IntoResponse {
     if !is_taggable_item_type(&body.item_type) {
         return (StatusCode::BAD_REQUEST, item_type_rejette(&body.item_type)).into_response();
+    }
+    if let Some(faux) = body
+        .item_ids
+        .iter()
+        .find(|i| !tune_core::db::tag_repo::item_id_valide(**i))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("item_id must be a positive local id, got {faux}"),
+        )
+            .into_response();
     }
     let repo = TagRepo::with_backend(state.backend.clone());
     match repo.batch_tag(id, &body.item_type, &body.item_ids) {

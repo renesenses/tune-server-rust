@@ -10,7 +10,16 @@
 //! {"field": "in_playlist",   "op": "in",     "value": "smart:7"}
 //! {"field": "favorite",      "op": "is",     "value": "track"}
 //! {"field": "favorite",      "op": "is_not", "value": "artist"}
+//! {"field": "tag",           "op": "is",     "value": "3"}
+//! {"field": "tag",           "op": "is_not", "value": "3"}
 //! ```
+//!
+//! - `tag` : `value` est l'identifiant d'une ÉTIQUETTE (`tags.id`). Au niveau
+//!   album, l'album porte l'étiquette OU son artiste la porte ; au niveau
+//!   piste, la piste, son album ou son artiste. Étiqueter un artiste
+//!   « J'adore » et bâtir une collection « J'adore » doit ramener ses albums :
+//!   c'est ce que l'étiquette dit. Les étiquettes sont globales, pas par
+//!   profil — la table `item_tags` n'a pas de colonne de profil.
 //!
 //! - `value` d'une référence : `classic:<id>` (collection/playlist classique),
 //!   `smart:<id>` (smart collection/playlist) ; un entier nu est toléré et
@@ -39,7 +48,24 @@ pub const MAX_REF_DEPTH: u32 = 10;
 
 /// Champs de règle traités par ce module.
 pub fn is_ref_field(field: &str) -> bool {
-    matches!(field, "in_collection" | "in_playlist" | "favorite")
+    matches!(field, "in_collection" | "in_playlist" | "favorite" | "tag")
+}
+
+/// Les éléments d'un type portant l'étiquette `tag_id`.
+///
+/// `tag_id` est un ENTIER déjà analysé : il est formaté dans la requête, et
+/// ne peut donc rien y injecter.
+fn portant_l_etiquette(tag_id: i64, item_type: &str) -> String {
+    format!(
+        "SELECT it9.item_id FROM item_tags it9 \
+         WHERE it9.tag_id = {tag_id} AND it9.item_type = '{item_type}'"
+    )
+}
+
+/// L'identifiant d'étiquette d'une règle `tag`. Une valeur illisible rend
+/// `None`, et la règle dégénère comme une référence introuvable.
+fn etiquette_de(value: &str) -> Option<i64> {
+    value.trim().parse::<i64>().ok().filter(|id| *id > 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -360,6 +386,31 @@ pub(crate) fn album_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
                 membership("al.id", &sub, neg, false)
             }
         }
+        // Bertrand, 21/09 : « impossible de choisir un tag comme règle de
+        // smart collection ». Les étiquettes existaient — tables `tags` et
+        // `item_tags` —, aucune règle ne les lisait.
+        "tag" => {
+            let Some(id) = etiquette_de(value) else {
+                return degenerate(neg);
+            };
+            let albums = portant_l_etiquette(id, "album");
+            let artistes = portant_l_etiquette(id, "artist");
+            if neg {
+                // `ar.id` est NULLable (LEFT JOIN) : un album sans artiste
+                // ne porte PAS l'étiquette par son artiste.
+                format!(
+                    "({} AND {})",
+                    membership("al.id", &albums, true, false),
+                    membership("ar.id", &artistes, true, true)
+                )
+            } else {
+                format!(
+                    "({} OR {})",
+                    membership("al.id", &albums, false, false),
+                    membership("ar.id", &artistes, false, true)
+                )
+            }
+        }
         _ => degenerate(neg),
     }
 }
@@ -418,6 +469,29 @@ pub(crate) fn track_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
             } else {
                 let sub = format!("SELECT track_id FROM playlist_tracks WHERE playlist_id = {id}");
                 membership("t.id", &sub, neg, false)
+            }
+        }
+        "tag" => {
+            let Some(id) = etiquette_de(value) else {
+                return degenerate(neg);
+            };
+            let pistes = portant_l_etiquette(id, "track");
+            let albums = portant_l_etiquette(id, "album");
+            let artistes = portant_l_etiquette(id, "artist");
+            if neg {
+                format!(
+                    "({} AND {} AND {})",
+                    membership("t.id", &pistes, true, false),
+                    membership("t.album_id", &albums, true, true),
+                    membership("t.artist_id", &artistes, true, true)
+                )
+            } else {
+                format!(
+                    "({} OR {} OR {})",
+                    membership("t.id", &pistes, false, false),
+                    membership("t.album_id", &albums, false, true),
+                    membership("t.artist_id", &artistes, false, true)
+                )
             }
         }
         _ => degenerate(neg),

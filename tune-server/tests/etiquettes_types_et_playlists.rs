@@ -329,3 +329,49 @@ async fn la_suppression_atteint_encore_une_ligne_de_type_hors_liste() {
         "une ligne héritée doit rester supprimable : {items}"
     );
 }
+
+/// 🔴 Deux lignes `item_tags` à `item_id = 0` sur le .18 (22/09/2026) — une
+/// sous « Bô enregistrements », une sous « J'adore ». Aucun album n'a
+/// l'identifiant 0 : elles ne désignaient rien, mais faisaient afficher 5 à
+/// une étiquette qui ne porte que 4 albums. `item_id` est un `i64` que serde
+/// accepte à 0 ; rien ne l'arrêtait.
+///
+/// Refus en 400 — c'est la requête qui est fausse —, et RIEN d'écrit : le
+/// compteur de l'étiquette reste à zéro.
+#[tokio::test]
+async fn un_identifiant_nul_ou_negatif_est_refuse_et_rien_n_est_ecrit() {
+    let (app, state) = app_avec_etat();
+    let tags = TagRepo::with_backend(state.backend.clone());
+    let id = tags.create("Garde id nul", None).unwrap();
+
+    for faux in [0, -3] {
+        let (s, _) = post(
+            &app,
+            &format!("/api/v1/tags/{id}/items"),
+            json!({ "item_type": "album", "item_id": faux }),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "item_id = {faux} a été accepté");
+    }
+
+    // Le lot : un seul identifiant faux refuse TOUT le lot, sans rien écrire.
+    let (s, _) = post(
+        &app,
+        &format!("/api/v1/tags/{id}/items/batch"),
+        json!({ "item_type": "album", "item_ids": [12, 0, 14] }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "un lot contenant 0 a été accepté"
+    );
+
+    // Même lecture que le test voisin : la route générique voit tout.
+    let (_, items) = get(&app, &format!("/api/v1/tags/{id}/items")).await;
+    assert_eq!(
+        items["items"],
+        json!([]),
+        "une écriture refusée a quand même laissé des lignes : {items}"
+    );
+}
