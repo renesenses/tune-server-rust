@@ -13,6 +13,16 @@
 //! with a mock; wiring it to the real server (`AppState`) is P2 and is
 //! intentionally absent here.
 //!
+//! **#4716** (tranche 1 de l'épique #4715, « Playlists converter ») élargit
+//! cette surface à trois permissions de plus — `playlists`, `streaming` et
+//! `kv` — sur le modèle exact des précédentes. Trois règles s'y lisent :
+//! aucune capacité ne SUPPRIME quoi que ce soit (ni playlist, ni piste, ni
+//! favori : un greffon ne doit pas pouvoir effacer chez un service) ; toute
+//! écriture chez un service purge le cache de contenu utilisateur côté hôte ;
+//! et le stockage clé/valeur est cloisonné par l'identifiant du greffon, que
+//! l'hôte range dans le [`Store`] au chargement et qu'aucun JSON d'entrée ne
+//! peut usurper.
+//!
 //! # Marshalling convention
 //!
 //! WASM can only pass integers, so structured data crosses as **UTF-8 JSON in
@@ -105,6 +115,91 @@ pub trait HostContext: Send + Sync {
     fn pause(&self, zone: i64) -> Result<serde_json::Value, String>;
     /// `events` — emit an event onto the host event bus (fire-and-forget).
     fn emit(&self, event: &str, payload: serde_json::Value);
+
+    // -----------------------------------------------------------------------
+    // #4716 — playlists, streaming, stockage clé/valeur (épique #4715)
+    //
+    // Trois règles tiennent toute cette tranche :
+    //
+    // 1. **Aucune suppression.** Ni playlist, ni piste, ni favori : la liste
+    //    ci-dessous ne porte QUE de la lecture et de l'ajout. Un greffon ne
+    //    doit pas pouvoir effacer chez un service — c'est irréversible et
+    //    l'utilisateur n'a rien demandé. Tout ajout ici doit se lire comme tel.
+    // 2. **Toute écriture chez un service purge son cache de contenu
+    //    utilisateur** côté implémentation, sinon l'écran sert la liste
+    //    mémorisée 2 minutes et la playlist créée « n'existe pas ».
+    // 3. **Le stockage clé/valeur est cloisonné par greffon** : l'identifiant
+    //    du greffon appelant est passé par l'hôte (il vient du `Store`, jamais
+    //    du JSON que le greffon fournit), et préfixe la clé.
+    // -----------------------------------------------------------------------
+
+    /// `playlists` — lister les playlists locales du profil actif.
+    fn playlists_list(&self, limit: i64, offset: i64) -> Result<serde_json::Value, String>;
+    /// `playlists` — lire les pistes d'une playlist locale.
+    fn playlist_tracks(&self, playlist_id: i64) -> Result<serde_json::Value, String>;
+    /// `playlists` — créer une playlist locale (jamais en effacer une).
+    fn playlist_create(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<serde_json::Value, String>;
+    /// `playlists` — AJOUTER des pistes à une playlist locale.
+    fn playlist_add_tracks(
+        &self,
+        playlist_id: i64,
+        track_ids: Vec<i64>,
+    ) -> Result<serde_json::Value, String>;
+
+    /// `streaming` — les services de streaming AUTHENTIFIÉS, et s'ils savent
+    /// écrire.
+    fn streaming_services(&self) -> Result<serde_json::Value, String>;
+    /// `streaming` — les playlists de l'utilisateur chez un service.
+    fn streaming_playlists(&self, service: &str) -> Result<serde_json::Value, String>;
+    /// `streaming` — les pistes d'une playlist d'un service.
+    fn streaming_playlist_tracks(
+        &self,
+        service: &str,
+        playlist_id: &str,
+    ) -> Result<serde_json::Value, String>;
+    /// `streaming` — créer une playlist CHEZ un service (jamais en effacer
+    /// une). L'implémentation purge le cache de contenu utilisateur ensuite.
+    fn streaming_playlist_create(
+        &self,
+        service: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<serde_json::Value, String>;
+    /// `streaming` — AJOUTER des pistes à une playlist d'un service.
+    /// L'implémentation purge le cache de contenu utilisateur ensuite.
+    fn streaming_playlist_add_tracks(
+        &self,
+        service: &str,
+        playlist_id: &str,
+        track_ids: Vec<String>,
+    ) -> Result<serde_json::Value, String>;
+    /// `streaming` — apparier un titre connu chez un service, avec
+    /// l'appariement déjà écrit pour la fusion de playlists (jamais un second).
+    fn streaming_match_track(
+        &self,
+        service: &str,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<serde_json::Value, String>;
+
+    /// `kv` — lire une valeur du stockage CLOISONNÉ de `plugin_id`.
+    fn kv_get(&self, plugin_id: &str, key: &str) -> Result<serde_json::Value, String>;
+    /// `kv` — écrire une valeur dans le stockage cloisonné de `plugin_id`.
+    fn kv_set(
+        &self,
+        plugin_id: &str,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
+    /// `kv` — lister les clés du greffon commençant par `prefix` (sans le
+    /// préfixe de cloisonnement, qu'un greffon n'a jamais à connaître).
+    fn kv_list(&self, plugin_id: &str, prefix: &str) -> Result<serde_json::Value, String>;
 }
 
 /// A [`HostContext`] that grants nothing useful: `log`/`emit` are no-ops and
@@ -135,6 +230,80 @@ impl HostContext for NoHost {
         Err("no host context wired".to_string())
     }
     fn emit(&self, _event: &str, _payload: serde_json::Value) {}
+
+    fn playlists_list(&self, _limit: i64, _offset: i64) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn playlist_tracks(&self, _playlist_id: i64) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn playlist_create(
+        &self,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn playlist_add_tracks(
+        &self,
+        _playlist_id: i64,
+        _track_ids: Vec<i64>,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn streaming_services(&self) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn streaming_playlists(&self, _service: &str) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn streaming_playlist_tracks(
+        &self,
+        _service: &str,
+        _playlist_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn streaming_playlist_create(
+        &self,
+        _service: &str,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn streaming_playlist_add_tracks(
+        &self,
+        _service: &str,
+        _playlist_id: &str,
+        _track_ids: Vec<String>,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn streaming_match_track(
+        &self,
+        _service: &str,
+        _title: &str,
+        _artist: &str,
+        _isrc: &str,
+        _duration_ms: u64,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn kv_get(&self, _plugin_id: &str, _key: &str) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn kv_set(
+        &self,
+        _plugin_id: &str,
+        _key: &str,
+        _value: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn kv_list(&self, _plugin_id: &str, _prefix: &str) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
 }
 
 /// Resource limits applied to a loaded plugin (RFC §3.1).
@@ -177,6 +346,13 @@ struct StoreData {
     /// Permissions granted to this plugin (from its manifest). A host-function
     /// whose required permission is absent fails the call (RFC §3.4).
     permissions: HashSet<String>,
+    /// Identifiant de manifeste du greffon qui possède ce `Store` (#4716).
+    ///
+    /// Il vient de l'HÔTE au chargement, jamais du JSON qu'un greffon envoie :
+    /// c'est ce qui cloisonne le stockage clé/valeur. Vide quand aucun hôte
+    /// n'est câblé ([`WasmPlugin::load`]) — les capacités `kv` refusent alors,
+    /// faute de savoir à qui appartiendrait la clé.
+    plugin_id: String,
     /// The plugin's linear memory, set after instantiation. `None` only during
     /// instantiation, before any host-function can possibly run.
     memory: Option<Memory>,
@@ -268,6 +444,28 @@ fn host_json_call<F>(
 where
     F: FnOnce(&Arc<dyn HostContext>, serde_json::Value) -> Result<serde_json::Value, String>,
 {
+    host_json_call_du_greffon(caller, ptr, len, required_perm, |ctx, _greffon, v| {
+        f(ctx, v)
+    })
+}
+
+/// Comme [`host_json_call`], mais le corps reçoit aussi l'IDENTIFIANT du
+/// greffon appelant, lu dans le [`Store`] (#4716).
+///
+/// Le cloisonnement du stockage clé/valeur en dépend : la clé écrite en base
+/// est préfixée par cet identifiant, et comme il vient du chargement et non du
+/// JSON d'entrée, un greffon ne peut pas se faire passer pour un autre ni lire
+/// son état.
+fn host_json_call_du_greffon<F>(
+    caller: &mut Caller<'_, StoreData>,
+    ptr: i32,
+    len: i32,
+    required_perm: &str,
+    f: F,
+) -> Result<i64, wasmtime::Error>
+where
+    F: FnOnce(&Arc<dyn HostContext>, &str, serde_json::Value) -> Result<serde_json::Value, String>,
+{
     if !caller.data().permissions.contains(required_perm) {
         let denied = serde_json::json!({
             "error": "permission_denied",
@@ -279,11 +477,53 @@ where
     let value: serde_json::Value = serde_json::from_slice(&input)
         .map_err(|e| wasmtime::Error::msg(format!("host call: invalid input JSON: {e}")))?;
     let ctx = caller.data().ctx.clone();
-    let result = match f(&ctx, value) {
+    let plugin_id = caller.data().plugin_id.clone();
+    let result = match f(&ctx, &plugin_id, value) {
         Ok(v) => v,
         Err(e) => serde_json::json!({ "error": e }),
     };
     guest_write_json(caller, &result)
+}
+
+/// Lire un champ texte d'un objet d'entrée, vide à défaut.
+fn texte(value: &serde_json::Value, cle: &str) -> String {
+    value
+        .get(cle)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Lire un champ texte FACULTATIF : `None` si absent, `null` ou vide.
+fn texte_facultatif(value: &serde_json::Value, cle: &str) -> Option<String> {
+    value
+        .get(cle)
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Lire une liste d'identifiants de pistes LOCALES (des entiers).
+fn ids_entiers(value: &serde_json::Value, cle: &str) -> Vec<i64> {
+    value
+        .get(cle)
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
+        .unwrap_or_default()
+}
+
+/// Lire une liste d'identifiants de pistes de SERVICE (des chaînes).
+fn ids_textes(value: &serde_json::Value, cle: &str) -> Vec<String> {
+    value
+        .get(cle)
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Extract the `zone` field (defaulting to 0) from a host-call input object.
@@ -427,6 +667,260 @@ fn register_host_imports(linker: &mut Linker<StoreData>) -> Result<(), String> {
         )
         .map_err(|e| format!("register host_emit: {e}"))?;
 
+    // -----------------------------------------------------------------------
+    // #4716 — `playlists`
+    //
+    // Lecture et AJOUT seulement : il n'existe volontairement aucun
+    // `host_playlist_delete` ni `host_playlist_remove_tracks`. Un greffon ne
+    // doit pas pouvoir effacer le travail de l'utilisateur, et une capacité
+    // absente est la seule garde qu'on ne puisse pas contourner.
+    // -----------------------------------------------------------------------
+    linker
+        .func_wrap(
+            "tune",
+            "host_playlists_list",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "playlists", |ctx, v| {
+                    let limit = v
+                        .get("limit")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(200);
+                    let offset = v
+                        .get("offset")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    ctx.playlists_list(limit, offset)
+                })
+            },
+        )
+        .map_err(|e| format!("register host_playlists_list: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_playlist_tracks",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "playlists", |ctx, v| {
+                    let id = v
+                        .get("playlist_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    ctx.playlist_tracks(id)
+                })
+            },
+        )
+        .map_err(|e| format!("register host_playlist_tracks: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_playlist_create",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "playlists", |ctx, v| {
+                    let name = texte(&v, "name");
+                    let description = texte_facultatif(&v, "description");
+                    ctx.playlist_create(&name, description.as_deref())
+                })
+            },
+        )
+        .map_err(|e| format!("register host_playlist_create: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_playlist_add_tracks",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "playlists", |ctx, v| {
+                    let id = v
+                        .get("playlist_id")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    ctx.playlist_add_tracks(id, ids_entiers(&v, "track_ids"))
+                })
+            },
+        )
+        .map_err(|e| format!("register host_playlist_add_tracks: {e}"))?;
+
+    // -----------------------------------------------------------------------
+    // #4716 — `streaming`
+    //
+    // Même règle : aucune capacité de suppression chez un service. Les deux
+    // capacités d'écriture (`create`, `add_tracks`) purgent le cache de
+    // contenu utilisateur du service côté implémentation.
+    // -----------------------------------------------------------------------
+    linker
+        .func_wrap(
+            "tune",
+            "host_streaming_services",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "streaming", |ctx, _v| {
+                    ctx.streaming_services()
+                })
+            },
+        )
+        .map_err(|e| format!("register host_streaming_services: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_streaming_playlists",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "streaming", |ctx, v| {
+                    ctx.streaming_playlists(&texte(&v, "service"))
+                })
+            },
+        )
+        .map_err(|e| format!("register host_streaming_playlists: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_streaming_playlist_tracks",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "streaming", |ctx, v| {
+                    ctx.streaming_playlist_tracks(&texte(&v, "service"), &texte(&v, "playlist_id"))
+                })
+            },
+        )
+        .map_err(|e| format!("register host_streaming_playlist_tracks: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_streaming_playlist_create",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "streaming", |ctx, v| {
+                    let description = texte_facultatif(&v, "description");
+                    ctx.streaming_playlist_create(
+                        &texte(&v, "service"),
+                        &texte(&v, "name"),
+                        description.as_deref(),
+                    )
+                })
+            },
+        )
+        .map_err(|e| format!("register host_streaming_playlist_create: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_streaming_playlist_add_tracks",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "streaming", |ctx, v| {
+                    ctx.streaming_playlist_add_tracks(
+                        &texte(&v, "service"),
+                        &texte(&v, "playlist_id"),
+                        ids_textes(&v, "track_ids"),
+                    )
+                })
+            },
+        )
+        .map_err(|e| format!("register host_streaming_playlist_add_tracks: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_streaming_match_track",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "streaming", |ctx, v| {
+                    let duration_ms = v
+                        .get("duration_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    ctx.streaming_match_track(
+                        &texte(&v, "service"),
+                        &texte(&v, "title"),
+                        &texte(&v, "artist"),
+                        &texte(&v, "isrc"),
+                        duration_ms,
+                    )
+                })
+            },
+        )
+        .map_err(|e| format!("register host_streaming_match_track: {e}"))?;
+
+    // -----------------------------------------------------------------------
+    // #4716 — `kv` : stockage cloisonné PAR GREFFON
+    //
+    // L'identifiant du greffon vient du `Store`, jamais du JSON d'entrée : un
+    // greffon ne peut donc ni lire ni écraser l'état d'un autre.
+    // -----------------------------------------------------------------------
+    linker
+        .func_wrap(
+            "tune",
+            "host_kv_get",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call_du_greffon(&mut caller, ptr, len, "kv", |ctx, greffon, v| {
+                    ctx.kv_get(greffon, &texte(&v, "key"))
+                })
+            },
+        )
+        .map_err(|e| format!("register host_kv_get: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_kv_set",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call_du_greffon(&mut caller, ptr, len, "kv", |ctx, greffon, v| {
+                    let value = v.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                    ctx.kv_set(greffon, &texte(&v, "key"), value)
+                })
+            },
+        )
+        .map_err(|e| format!("register host_kv_set: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_kv_list",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call_du_greffon(&mut caller, ptr, len, "kv", |ctx, greffon, v| {
+                    ctx.kv_list(greffon, &texte(&v, "prefix"))
+                })
+            },
+        )
+        .map_err(|e| format!("register host_kv_list: {e}"))?;
+
     Ok(())
 }
 
@@ -459,30 +953,35 @@ impl WasmPlugin {
     /// `plugin_dispatch`/`dispatch_c`), instantiation trap, or an
     /// `abi_version()` that differs from [`HOST_ABI_VERSION`].
     pub fn load(path: &Path, limits: Limits) -> Result<WasmPlugin, String> {
-        Self::load_with_host(path, limits, Arc::new(NoHost), HashSet::new())
+        Self::load_with_host(path, limits, Arc::new(NoHost), HashSet::new(), "")
     }
 
     /// Like [`load`](WasmPlugin::load) but wires a [`HostContext`] and the set
     /// of `permissions` granted to the plugin (from its manifest). Host imports
     /// under the `"tune"` module forward to `ctx`, gated by `permissions`
     /// (deny-by-default, RFC §3.4).
+    ///
+    /// `plugin_id` est l'identifiant de MANIFESTE du greffon (#4716) : il ne
+    /// sert pas au chargement mais cloisonne le stockage clé/valeur, et c'est
+    /// l'hôte qui le fournit — jamais le greffon.
     pub fn load_with_host(
         path: &Path,
         limits: Limits,
         ctx: Arc<dyn HostContext>,
         permissions: HashSet<String>,
+        plugin_id: &str,
     ) -> Result<WasmPlugin, String> {
         let engine = engine();
         let module =
             Module::from_file(engine, path).map_err(|e| format!("load wasm module: {e}"))?;
-        Self::from_module(engine, &module, limits, ctx, permissions)
+        Self::from_module(engine, &module, limits, ctx, permissions, plugin_id)
     }
 
     /// Instantiate from already-compiled wat/wasm text or bytes, no host wired.
     /// Primarily for tests (avoids needing the `wasm32` toolchain).
     #[cfg(test)]
     pub fn from_bytes(bytes: impl AsRef<[u8]>, limits: Limits) -> Result<WasmPlugin, String> {
-        Self::from_bytes_with_host(bytes, limits, Arc::new(NoHost), HashSet::new())
+        Self::from_bytes_with_host(bytes, limits, Arc::new(NoHost), HashSet::new(), "")
     }
 
     /// Like [`from_bytes`](WasmPlugin::from_bytes) with a [`HostContext`] and
@@ -494,10 +993,11 @@ impl WasmPlugin {
         limits: Limits,
         ctx: Arc<dyn HostContext>,
         permissions: HashSet<String>,
+        plugin_id: &str,
     ) -> Result<WasmPlugin, String> {
         let engine = engine();
         let module = Module::new(engine, bytes).map_err(|e| format!("compile wasm module: {e}"))?;
-        Self::from_module(engine, &module, limits, ctx, permissions)
+        Self::from_module(engine, &module, limits, ctx, permissions, plugin_id)
     }
 
     fn from_module(
@@ -506,6 +1006,7 @@ impl WasmPlugin {
         limits: Limits,
         ctx: Arc<dyn HostContext>,
         permissions: HashSet<String>,
+        plugin_id: &str,
     ) -> Result<WasmPlugin, String> {
         let state = StoreData {
             limits: StoreLimitsBuilder::new()
@@ -513,6 +1014,7 @@ impl WasmPlugin {
                 .build(),
             ctx,
             permissions,
+            plugin_id: plugin_id.to_string(),
             memory: None,
             alloc: None,
         };
@@ -856,6 +1358,29 @@ mod tests {
         logs: Mutex<Vec<(String, String)>>,
         queue_add_calls: Mutex<Vec<(i64, serde_json::Value)>>,
         emits: Mutex<Vec<(String, serde_json::Value)>>,
+        /// #4716 — journal des capacités playlists/streaming/kv : `(nom de la
+        /// méthode, arguments reçus)`. Une capacité refusée doit laisser ce
+        /// journal VIDE — c'est ce que prouvent les tests de refus.
+        appels_4716: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl MockHostContext {
+        /// Noter un appel et rendre une réponse reconnaissable, pour que le
+        /// test prouve aussi l'aller-retour hôte → greffon.
+        fn noter(&self, nom: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
+            self.appels_4716
+                .lock()
+                .unwrap()
+                .push((nom.to_string(), args));
+            Ok(serde_json::json!({ "ok": true, "appel": nom }))
+        }
+
+        /// Le seul appel noté, ou un échec explicite.
+        fn seul_appel(&self) -> (String, serde_json::Value) {
+            let appels = self.appels_4716.lock().unwrap();
+            assert_eq!(appels.len(), 1, "une capacité, un appel — vu {appels:?}");
+            appels[0].clone()
+        }
     }
 
     /// Canned response `queue_add` returns, so the test can assert the round-trip.
@@ -895,6 +1420,124 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((event.to_string(), payload));
+        }
+
+        // --- #4716 ---------------------------------------------------------
+        fn playlists_list(&self, limit: i64, offset: i64) -> Result<serde_json::Value, String> {
+            self.noter(
+                "playlists_list",
+                serde_json::json!({ "limit": limit, "offset": offset }),
+            )
+        }
+        fn playlist_tracks(&self, playlist_id: i64) -> Result<serde_json::Value, String> {
+            self.noter(
+                "playlist_tracks",
+                serde_json::json!({ "playlist_id": playlist_id }),
+            )
+        }
+        fn playlist_create(
+            &self,
+            name: &str,
+            description: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "playlist_create",
+                serde_json::json!({ "name": name, "description": description }),
+            )
+        }
+        fn playlist_add_tracks(
+            &self,
+            playlist_id: i64,
+            track_ids: Vec<i64>,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "playlist_add_tracks",
+                serde_json::json!({ "playlist_id": playlist_id, "track_ids": track_ids }),
+            )
+        }
+        fn streaming_services(&self) -> Result<serde_json::Value, String> {
+            self.noter("streaming_services", serde_json::json!({}))
+        }
+        fn streaming_playlists(&self, service: &str) -> Result<serde_json::Value, String> {
+            self.noter(
+                "streaming_playlists",
+                serde_json::json!({ "service": service }),
+            )
+        }
+        fn streaming_playlist_tracks(
+            &self,
+            service: &str,
+            playlist_id: &str,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "streaming_playlist_tracks",
+                serde_json::json!({ "service": service, "playlist_id": playlist_id }),
+            )
+        }
+        fn streaming_playlist_create(
+            &self,
+            service: &str,
+            name: &str,
+            description: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "streaming_playlist_create",
+                serde_json::json!({
+                    "service": service, "name": name, "description": description,
+                }),
+            )
+        }
+        fn streaming_playlist_add_tracks(
+            &self,
+            service: &str,
+            playlist_id: &str,
+            track_ids: Vec<String>,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "streaming_playlist_add_tracks",
+                serde_json::json!({
+                    "service": service, "playlist_id": playlist_id, "track_ids": track_ids,
+                }),
+            )
+        }
+        fn streaming_match_track(
+            &self,
+            service: &str,
+            title: &str,
+            artist: &str,
+            isrc: &str,
+            duration_ms: u64,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "streaming_match_track",
+                serde_json::json!({
+                    "service": service, "title": title, "artist": artist,
+                    "isrc": isrc, "duration_ms": duration_ms,
+                }),
+            )
+        }
+        fn kv_get(&self, plugin_id: &str, key: &str) -> Result<serde_json::Value, String> {
+            self.noter(
+                "kv_get",
+                serde_json::json!({ "plugin_id": plugin_id, "key": key }),
+            )
+        }
+        fn kv_set(
+            &self,
+            plugin_id: &str,
+            key: &str,
+            value: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "kv_set",
+                serde_json::json!({ "plugin_id": plugin_id, "key": key, "value": value }),
+            )
+        }
+        fn kv_list(&self, plugin_id: &str, prefix: &str) -> Result<serde_json::Value, String> {
+            self.noter(
+                "kv_list",
+                serde_json::json!({ "plugin_id": plugin_id, "prefix": prefix }),
+            )
         }
     }
 
@@ -966,6 +1609,7 @@ mod tests {
             Limits::default(),
             mock.clone() as Arc<dyn HostContext>,
             perms(&["queue", "events"]),
+            "essai",
         )
         .expect("load host-calling plugin");
 
@@ -1071,6 +1715,7 @@ mod tests {
             Limits::default(),
             mock.clone() as Arc<dyn HostContext>,
             perms(&["playback"]),
+            "essai",
         )
         .expect("load host-calling plugin");
 
@@ -1096,6 +1741,472 @@ mod tests {
             mock.logs.lock().unwrap().len(),
             1,
             "host_log is always allowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — playlists, streaming, stockage clé/valeur
+    //
+    // Chaque capacité a DEUX gardes : sans sa permission elle rend
+    // `{"error":"permission_denied"}` et n'atteint PAS l'hôte (modèle :
+    // `host_queue_add_denied_without_queue_permission`) ; avec sa permission
+    // elle atteint l'hôte avec les bons arguments et lui rapporte sa réponse.
+    // -----------------------------------------------------------------------
+
+    /// Un greffon qui importe UNE seule fonction hôte, l'appelle avec un objet
+    /// JSON fixe, et rend telle quelle la réponse packée que l'hôte lui a
+    /// écrite en mémoire. Le WAT est engendré pour que décalages et longueurs
+    /// restent toujours cohérents avec la charge utile.
+    fn appel_hote_wat(import: &str, payload: &str) -> String {
+        let offset = 16usize;
+        let litteral = payload.replace('"', "\\\"");
+        format!(
+            r#"(module
+  (import "tune" "{import}" (func $cible (param i32 i32) (result i64)))
+  (memory (export "memory") 4)
+  (global $bump (mut i32) (i32.const 1024))
+  (data (i32.const {offset}) "{litteral}")
+
+  (func (export "abi_version") (result i32) (i32.const {abi}))
+
+  (func $alloc (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $bump))
+    (global.set $bump
+      (i32.and
+        (i32.add (i32.add (global.get $bump) (local.get $len)) (i32.const 7))
+        (i32.const -8)))
+    (local.get $ptr))
+
+  (func (export "dealloc") (param $ptr i32) (param $len i32))
+
+  (func (export "plugin_dispatch") (param $ptr i32) (param $len i32) (result i64)
+    (call $cible (i32.const {offset}) (i32.const {taille}))))
+"#,
+            abi = HOST_ABI_VERSION,
+            taille = payload.len(),
+        )
+    }
+
+    /// Identifiant de greffon utilisé par les tests de cloisonnement `kv`.
+    const GREFFON_ESSAI: &str = "playlists-converter";
+
+    /// Jouer `import` avec `payload` et les permissions `accordees`.
+    fn jouer(
+        import: &str,
+        payload: &str,
+        accordees: &[&str],
+    ) -> (serde_json::Value, Arc<MockHostContext>) {
+        let mock = Arc::new(MockHostContext::default());
+        let mut plugin = WasmPlugin::from_bytes_with_host(
+            appel_hote_wat(import, payload),
+            Limits::default(),
+            mock.clone() as Arc<dyn HostContext>,
+            perms(accordees),
+            GREFFON_ESSAI,
+        )
+        .expect("charger le greffon d'essai");
+        let sortie = plugin
+            .dispatch(r#"{"declencheur":true}"#)
+            .expect("dispatch");
+        let rendu: serde_json::Value =
+            serde_json::from_str(&sortie).expect("la sortie du greffon est du JSON");
+        (rendu, mock)
+    }
+
+    /// Sans sa permission : erreur structurée ET hôte jamais atteint.
+    ///
+    /// La permission accordée est délibérément une AUTRE (`queue`) : le greffon
+    /// charge donc normalement, seule la capacité visée est refusée — sans quoi
+    /// un « rien ne s'est passé » pourrait venir d'un chargement raté.
+    fn refuse_sans_permission(import: &str, payload: &str, permission: &str) {
+        let (rendu, mock) = jouer(import, payload, &["queue"]);
+        assert_eq!(
+            rendu,
+            serde_json::json!({ "error": "permission_denied", "permission": permission }),
+            "{import} sans `{permission}` doit rendre l'erreur structurée, pas un trap"
+        );
+        assert!(
+            mock.appels_4716.lock().unwrap().is_empty(),
+            "{import} ne doit PAS atteindre l'hôte quand `{permission}` est refusée"
+        );
+    }
+
+    /// Avec sa permission : l'hôte est atteint avec `arguments`, et sa réponse
+    /// revient au greffon.
+    fn atteint_l_hote(
+        import: &str,
+        payload: &str,
+        permission: &str,
+        methode: &str,
+        arguments: serde_json::Value,
+    ) {
+        let (rendu, mock) = jouer(import, payload, &[permission]);
+        let (nom, args) = mock.seul_appel();
+        assert_eq!(nom, methode, "{import} doit appeler `{methode}`");
+        assert_eq!(args, arguments, "{import} doit transmettre ses arguments");
+        assert_eq!(
+            rendu,
+            serde_json::json!({ "ok": true, "appel": methode }),
+            "{import} doit rapporter au greffon la réponse de l'hôte"
+        );
+    }
+
+    // --- `playlists` -------------------------------------------------------
+
+    #[test]
+    fn host_playlists_list_refuse_sans_permission_playlists() {
+        refuse_sans_permission(
+            "host_playlists_list",
+            r#"{"limit":50,"offset":10}"#,
+            "playlists",
+        );
+    }
+
+    #[test]
+    fn host_playlists_list_atteint_l_hote_avec_playlists() {
+        atteint_l_hote(
+            "host_playlists_list",
+            r#"{"limit":50,"offset":10}"#,
+            "playlists",
+            "playlists_list",
+            serde_json::json!({ "limit": 50, "offset": 10 }),
+        );
+    }
+
+    #[test]
+    fn host_playlist_tracks_refuse_sans_permission_playlists() {
+        refuse_sans_permission("host_playlist_tracks", r#"{"playlist_id":7}"#, "playlists");
+    }
+
+    #[test]
+    fn host_playlist_tracks_atteint_l_hote_avec_playlists() {
+        atteint_l_hote(
+            "host_playlist_tracks",
+            r#"{"playlist_id":7}"#,
+            "playlists",
+            "playlist_tracks",
+            serde_json::json!({ "playlist_id": 7 }),
+        );
+    }
+
+    #[test]
+    fn host_playlist_create_refuse_sans_permission_playlists() {
+        refuse_sans_permission(
+            "host_playlist_create",
+            r#"{"name":"Transfert","description":"depuis Qobuz"}"#,
+            "playlists",
+        );
+    }
+
+    #[test]
+    fn host_playlist_create_atteint_l_hote_avec_playlists() {
+        atteint_l_hote(
+            "host_playlist_create",
+            r#"{"name":"Transfert","description":"depuis Qobuz"}"#,
+            "playlists",
+            "playlist_create",
+            serde_json::json!({ "name": "Transfert", "description": "depuis Qobuz" }),
+        );
+    }
+
+    #[test]
+    fn host_playlist_add_tracks_refuse_sans_permission_playlists() {
+        refuse_sans_permission(
+            "host_playlist_add_tracks",
+            r#"{"playlist_id":7,"track_ids":[1,2,3]}"#,
+            "playlists",
+        );
+    }
+
+    #[test]
+    fn host_playlist_add_tracks_atteint_l_hote_avec_playlists() {
+        atteint_l_hote(
+            "host_playlist_add_tracks",
+            r#"{"playlist_id":7,"track_ids":[1,2,3]}"#,
+            "playlists",
+            "playlist_add_tracks",
+            serde_json::json!({ "playlist_id": 7, "track_ids": [1, 2, 3] }),
+        );
+    }
+
+    // --- `streaming` -------------------------------------------------------
+
+    #[test]
+    fn host_streaming_services_refuse_sans_permission_streaming() {
+        refuse_sans_permission("host_streaming_services", r#"{}"#, "streaming");
+    }
+
+    #[test]
+    fn host_streaming_services_atteint_l_hote_avec_streaming() {
+        atteint_l_hote(
+            "host_streaming_services",
+            r#"{}"#,
+            "streaming",
+            "streaming_services",
+            serde_json::json!({}),
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlists_refuse_sans_permission_streaming() {
+        refuse_sans_permission(
+            "host_streaming_playlists",
+            r#"{"service":"qobuz"}"#,
+            "streaming",
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlists_atteint_l_hote_avec_streaming() {
+        atteint_l_hote(
+            "host_streaming_playlists",
+            r#"{"service":"qobuz"}"#,
+            "streaming",
+            "streaming_playlists",
+            serde_json::json!({ "service": "qobuz" }),
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlist_tracks_refuse_sans_permission_streaming() {
+        refuse_sans_permission(
+            "host_streaming_playlist_tracks",
+            r#"{"service":"qobuz","playlist_id":"pl-1"}"#,
+            "streaming",
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlist_tracks_atteint_l_hote_avec_streaming() {
+        atteint_l_hote(
+            "host_streaming_playlist_tracks",
+            r#"{"service":"qobuz","playlist_id":"pl-1"}"#,
+            "streaming",
+            "streaming_playlist_tracks",
+            serde_json::json!({ "service": "qobuz", "playlist_id": "pl-1" }),
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlist_create_refuse_sans_permission_streaming() {
+        refuse_sans_permission(
+            "host_streaming_playlist_create",
+            r#"{"service":"tidal","name":"Copie"}"#,
+            "streaming",
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlist_create_atteint_l_hote_avec_streaming() {
+        atteint_l_hote(
+            "host_streaming_playlist_create",
+            r#"{"service":"tidal","name":"Copie"}"#,
+            "streaming",
+            "streaming_playlist_create",
+            // `description` absente : l'hôte reçoit `None`, pas la chaîne vide.
+            serde_json::json!({ "service": "tidal", "name": "Copie", "description": null }),
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlist_add_tracks_refuse_sans_permission_streaming() {
+        refuse_sans_permission(
+            "host_streaming_playlist_add_tracks",
+            r#"{"service":"tidal","playlist_id":"pl-9","track_ids":["a","b"]}"#,
+            "streaming",
+        );
+    }
+
+    #[test]
+    fn host_streaming_playlist_add_tracks_atteint_l_hote_avec_streaming() {
+        atteint_l_hote(
+            "host_streaming_playlist_add_tracks",
+            r#"{"service":"tidal","playlist_id":"pl-9","track_ids":["a","b"]}"#,
+            "streaming",
+            "streaming_playlist_add_tracks",
+            serde_json::json!({
+                "service": "tidal", "playlist_id": "pl-9", "track_ids": ["a", "b"],
+            }),
+        );
+    }
+
+    #[test]
+    fn host_streaming_match_track_refuse_sans_permission_streaming() {
+        refuse_sans_permission(
+            "host_streaming_match_track",
+            r#"{"service":"qobuz","title":"La Boheme","artist":"Aznavour","isrc":"FR123","duration_ms":210000}"#,
+            "streaming",
+        );
+    }
+
+    #[test]
+    fn host_streaming_match_track_atteint_l_hote_avec_streaming() {
+        atteint_l_hote(
+            "host_streaming_match_track",
+            r#"{"service":"qobuz","title":"La Boheme","artist":"Aznavour","isrc":"FR123","duration_ms":210000}"#,
+            "streaming",
+            "streaming_match_track",
+            serde_json::json!({
+                "service": "qobuz", "title": "La Boheme", "artist": "Aznavour",
+                "isrc": "FR123", "duration_ms": 210_000,
+            }),
+        );
+    }
+
+    // --- `kv` --------------------------------------------------------------
+
+    #[test]
+    fn host_kv_get_refuse_sans_permission_kv() {
+        refuse_sans_permission("host_kv_get", r#"{"key":"transfert/42"}"#, "kv");
+    }
+
+    #[test]
+    fn host_kv_get_atteint_l_hote_avec_kv() {
+        atteint_l_hote(
+            "host_kv_get",
+            r#"{"key":"transfert/42"}"#,
+            "kv",
+            "kv_get",
+            // L'identifiant du greffon vient du `Store`, pas du JSON d'entrée.
+            serde_json::json!({ "plugin_id": GREFFON_ESSAI, "key": "transfert/42" }),
+        );
+    }
+
+    #[test]
+    fn host_kv_set_refuse_sans_permission_kv() {
+        refuse_sans_permission("host_kv_set", r#"{"key":"etat","value":{"pas":3}}"#, "kv");
+    }
+
+    #[test]
+    fn host_kv_set_atteint_l_hote_avec_kv() {
+        atteint_l_hote(
+            "host_kv_set",
+            r#"{"key":"etat","value":{"pas":3}}"#,
+            "kv",
+            "kv_set",
+            serde_json::json!({
+                "plugin_id": GREFFON_ESSAI, "key": "etat", "value": { "pas": 3 },
+            }),
+        );
+    }
+
+    #[test]
+    fn host_kv_list_refuse_sans_permission_kv() {
+        refuse_sans_permission("host_kv_list", r#"{"prefix":"transfert/"}"#, "kv");
+    }
+
+    #[test]
+    fn host_kv_list_atteint_l_hote_avec_kv() {
+        atteint_l_hote(
+            "host_kv_list",
+            r#"{"prefix":"transfert/"}"#,
+            "kv",
+            "kv_list",
+            serde_json::json!({ "plugin_id": GREFFON_ESSAI, "prefix": "transfert/" }),
+        );
+    }
+
+    /// Un greffon ne peut pas se faire passer pour un autre : un `plugin_id`
+    /// glissé dans le JSON d'entrée est ignoré, l'hôte reçoit celui du `Store`.
+    #[test]
+    fn kv_l_identifiant_du_greffon_ne_vient_jamais_du_json_4716() {
+        atteint_l_hote(
+            "host_kv_get",
+            r#"{"key":"etat","plugin_id":"un-autre-greffon"}"#,
+            "kv",
+            "kv_get",
+            serde_json::json!({ "plugin_id": GREFFON_ESSAI, "key": "etat" }),
+        );
+    }
+
+    /// Un `kv` sans hôte câblé n'a pas d'identifiant : les clés seraient
+    /// partagées par tout le monde. La capacité doit refuser, pas ranger.
+    #[test]
+    fn kv_sans_identifiant_de_greffon_refuse_4716() {
+        // `NoHost` + permission accordée : seule la voie du `Store` manque.
+        let mut plugin = WasmPlugin::from_bytes_with_host(
+            appel_hote_wat("host_kv_set", r#"{"key":"etat","value":1}"#),
+            Limits::default(),
+            Arc::new(NoHost) as Arc<dyn HostContext>,
+            perms(&["kv"]),
+            "",
+        )
+        .expect("charger");
+        let rendu: serde_json::Value =
+            serde_json::from_str(&plugin.dispatch("{}").expect("dispatch")).expect("JSON");
+        assert!(
+            rendu.get("error").is_some(),
+            "sans identifiant de greffon, `kv` doit refuser — vu {rendu}"
+        );
+    }
+
+    /// 🔴 Garde de STRUCTURE du garde-fou « aucune suppression » (#4716).
+    ///
+    /// Elle n'inspecte pas le texte du fichier mais le `Linker` réellement
+    /// construit : la liste des imports `"tune"` est la surface qu'un greffon
+    /// peut atteindre. Aucun nom n'y contient `delete`, `remove` ni `unfollow`,
+    /// et la liste attendue est écrite en toutes lettres — ajouter une capacité
+    /// destructrice sans le vouloir fait tomber ce test.
+    #[test]
+    fn aucune_capacite_hote_ne_supprime_4716() {
+        let engine = engine();
+        let mut store = Store::new(
+            engine,
+            StoreData {
+                limits: StoreLimitsBuilder::new().memory_size(1 << 20).build(),
+                ctx: Arc::new(NoHost),
+                permissions: HashSet::new(),
+                plugin_id: String::new(),
+                memory: None,
+                alloc: None,
+            },
+        );
+        let mut linker: Linker<StoreData> = Linker::new(engine);
+        register_host_imports(&mut linker).expect("installer les imports hôte");
+
+        let mut noms: Vec<String> = linker
+            .iter(&mut store)
+            .map(|(module, nom, _)| format!("{module}::{nom}"))
+            .collect();
+        noms.sort();
+
+        for nom in &noms {
+            assert!(
+                !nom.contains("delete") && !nom.contains("remove") && !nom.contains("unfollow"),
+                "aucune capacité hôte ne doit pouvoir EFFACER — vu `{nom}`"
+            );
+        }
+
+        let mut attendus: Vec<String> = [
+            "host_log",
+            "host_queue_get",
+            "host_queue_add",
+            "host_now_playing",
+            "host_play",
+            "host_pause",
+            "host_emit",
+            "host_playlists_list",
+            "host_playlist_tracks",
+            "host_playlist_create",
+            "host_playlist_add_tracks",
+            "host_streaming_services",
+            "host_streaming_playlists",
+            "host_streaming_playlist_tracks",
+            "host_streaming_playlist_create",
+            "host_streaming_playlist_add_tracks",
+            "host_streaming_match_track",
+            "host_kv_get",
+            "host_kv_set",
+            "host_kv_list",
+        ]
+        .iter()
+        .map(|n| format!("tune::{n}"))
+        .collect();
+        attendus.sort();
+        assert_eq!(
+            noms, attendus,
+            "la surface hôte doit être exactement celle-ci"
         );
     }
 }

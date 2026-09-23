@@ -299,7 +299,14 @@ fn memoriser_contenu_utilisateur(service: &str, ressource: &str, donnees: Value)
 /// Sans condition sur le succès : une mutation en échec côté HTTP peut avoir
 /// abouti côté service (délai dépassé), et le prix d'une purge de trop est un
 /// seul rechargement.
-fn purge_contenu_utilisateur(service: &str) {
+///
+/// **Publique depuis #4716** : les routes HTTP ne sont plus les seules à écrire
+/// chez un service. L'interface hôte WASM (`tune-server/src/plugins_host.rs`)
+/// crée des playlists et y ajoute des pistes pour le compte d'un greffon, HORS
+/// de ces routes ; sans appeler cette purge, l'écran continuerait de servir la
+/// liste mémorisée pendant 120 s et la playlist qui vient d'être créée
+/// « n'existerait pas ».
+pub fn purge_contenu_utilisateur(service: &str) {
     let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
         return;
     };

@@ -10,7 +10,7 @@
 //! match becomes "not found" rather than a silent mismatch.
 
 use crate::library::track_matcher::{MatchCandidate, find_best_match};
-use crate::streaming::traits::StreamTrack;
+use crate::streaming::traits::{StreamTrack, StreamingService};
 
 /// Minimum score required to accept a match when resolving a known track onto a
 /// streaming service. An exact normalized title+artist scores 0.95 and an ISRC
@@ -88,6 +88,50 @@ pub fn best_stream_match_scored<'a>(
     }
     let idx: usize = best.source_id.parse().ok()?;
     tracks.get(idx).map(|t| (t, best.score))
+}
+
+/// Nombre de résultats demandés au service avant l'appariement.
+///
+/// C'est la valeur que la route de transfert (`routes/playlist_manager.rs`)
+/// utilisait déjà en dur : l'extraction ci-dessous la NOMME au lieu de la
+/// recopier chez le deuxième appelant.
+pub const LIMITE_RECHERCHE_APPARIEMENT: usize = 10;
+
+/// Chercher un titre connu chez un service, puis l'apparier — les DEUX gestes
+/// que tout transfert de playlist enchaîne.
+///
+/// Extrait de `transfer_playlist` (`tune-server/src/routes/playlist_manager.rs`)
+/// pour l'ouverture de l'interface hôte WASM (#4716, épique #4715) : la capacité
+/// `host_streaming_match_track` doit apparier EXACTEMENT comme la route, sans
+/// quoi le greffon « Playlists converter » et l'écran de fusion donneraient deux
+/// verdicts différents sur le même titre. Rien n'est réécrit ici : la requête
+/// est la même (`"{titre} {artiste}"`, l'artiste seul étant facultatif), et le
+/// verdict reste celui de [`best_stream_match_scored`].
+///
+/// Rend le score avec la piste : l'appelant décide s'il exige
+/// [`MATCH_ACCEPT_SCORE`] (comme le transfert) ou s'il sait présenter la bande
+/// approximative ([`MATCH_APPROX_SCORE`]) à l'utilisateur. `isrc` et
+/// `duration_ms` peuvent être vides/`0` quand la source ne les porte pas.
+pub async fn apparier_chez_le_service(
+    svc: &dyn StreamingService,
+    title: &str,
+    artist: &str,
+    isrc: &str,
+    duration_ms: u64,
+) -> Result<Option<(StreamTrack, f64)>, String> {
+    let query = if artist.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title} {artist}")
+    };
+    let results = svc
+        .search(&query, LIMITE_RECHERCHE_APPARIEMENT)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(
+        best_stream_match_scored(title, artist, isrc, duration_ms, &results.tracks)
+            .map(|(t, score)| (t.clone(), score)),
+    )
 }
 
 #[cfg(test)]

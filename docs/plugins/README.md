@@ -401,11 +401,57 @@ Declared in `manifest.json` under `permissions`:
 - `settings` -- read/write server settings
 - `network` -- discover and interact with network devices
 
-**Not enforced.**  The loader never reads the manifest, so these are
-documentation of intent, not a sandbox — a plugin runs in-process with the
-server's own database handle.  Use the four scopes above rather than inventing
-finer-grained names, so declarations stay comparable when enforcement lands
-(`docs/ARCHITECTURE-CIBLE-v0.9.md` puts sandboxing after v1).
+**Not enforced — pour les greffons NATIFS (SDK).**  Le chargeur natif ne lit
+pas le manifeste : pour lui ces quatre scopes sont une déclaration d'intention,
+pas un bac à sable (le greffon tourne en processus, avec la base du serveur).
+Utilisez les quatre ci-dessus plutôt que d'inventer plus fin
+(`docs/ARCHITECTURE-CIBLE-v0.9.md` place le bac à sable après la v1).
+
+### Greffons WASM : les permissions sont RÉELLEMENT appliquées
+
+Pour un greffon **WASM** (`tune-plugin-runtime-wasm`), c'est l'inverse : le
+`permissions` du manifeste est lu au chargement et chaque fonction hôte est
+fermée par défaut. Une capacité appelée sans sa permission rend
+`{"error":"permission_denied","permission":"<scope>"}` — un JSON que le greffon
+peut lire, pas un trap — et **n'atteint jamais l'hôte**.
+
+| Scope | Ce qu'il ouvre |
+|---|---|
+| *(toujours)* | `host_log` |
+| `queue` | `host_queue_get`, `host_queue_add` |
+| `playback` | `host_now_playing`, `host_play`, `host_pause` |
+| `events` | `host_emit` (l'abonnement se déclare dans le manifeste) |
+| `playlists` | `host_playlists_list`, `host_playlist_tracks`, `host_playlist_create`, `host_playlist_add_tracks` |
+| `streaming` | `host_streaming_services`, `host_streaming_playlists`, `host_streaming_playlist_tracks`, `host_streaming_playlist_create`, `host_streaming_playlist_add_tracks`, `host_streaming_match_track` |
+| `kv` | `host_kv_get`, `host_kv_set`, `host_kv_list` |
+
+Les trois derniers scopes sont arrivés avec #4716 (tranche 1 de l'épique
+#4715, greffon « Playlists converter »). Ce qu'un auteur de greffon doit en
+savoir :
+
+* **`playlists`** — les playlists LOCALES du profil actif. Lecture et ajout
+  seulement. `host_playlist_tracks` rend, pour chaque piste, de quoi apparier :
+  `track_id`, `title`, `artist_name`, `album_title`, `duration_ms`, `isrc`.
+  `host_playlist_add_tracks` annonce dans `added` ce qui est **entré**, et dans
+  `demandees` ce qui avait été demandé : les deux peuvent différer.
+* **`streaming`** — les services de streaming. `host_streaming_services` ne
+  liste que les services **authentifiés**, avec leur `supports_write`.
+  `host_streaming_match_track` rend `{matched, score, approximate}` : `matched`
+  est `null` quand rien ne correspond, et `approximate: true` quand le score
+  est sous le seuil d'acceptation — à présenter à l'utilisateur, jamais à
+  écrire en silence chez un service.
+* **`kv`** — un espace clé/valeur **propre au greffon** (état des transferts,
+  snapshots, liens de synchro). La clé est préfixée par l'identifiant de
+  manifeste du greffon côté hôte : deux greffons peuvent utiliser la même clé
+  sans se voir, et aucun ne peut lire l'état d'un autre. Une valeur est du JSON
+  quelconque, bornée à 256 Kio.
+
+**Aucune de ces capacités ne SUPPRIME quoi que ce soit** : ni playlist, ni
+piste, ni favori, ni chez un service. C'est délibéré et gardé par un test —
+un greffon ne doit pas pouvoir effacer ce que l'utilisateur n'a pas demandé
+d'effacer. Toute écriture chez un service purge en revanche le cache de
+contenu utilisateur du serveur, pour que l'écran voie la playlist tout de
+suite au lieu de resservir sa liste d'avant pendant deux minutes.
 
 ## Installation
 
