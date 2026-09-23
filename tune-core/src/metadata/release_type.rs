@@ -160,6 +160,13 @@ pub async fn remplir_types_depuis_musicbrainz(
 
     let mut remplis = 0usize;
     for (album_id, groupe) in &candidats {
+        // La passe se GARE quand l'utilisateur suspend l'enrichissement, et
+        // repart au meme index (#4574). C'est le mecanisme existant, celui que
+        // la passe d'images d'artistes et l'enrichissement des metadonnees
+        // utilisent deja : rien ici n'en ouvre un second. La liste etant tenue
+        // en memoire, sortir de la boucle perdrait le curseur.
+        crate::taches_de_fond::attendre_la_reprise(crate::taches_de_fond::Tache::Enrichissement)
+            .await;
         super::musicbrainz_release::rate_limit_delay().await;
         match super::musicbrainz_release::lookup_release_group_type(groupe).await {
             Some(t) => {
