@@ -42,6 +42,11 @@ pub(crate) mod periode_exclusive_4357;
 /// feature pour `tune-core`, et cette décision-ci doit pouvoir y être jugée.
 pub mod pseudo_peripherique_alsa;
 pub mod registry;
+/// #4357 — le réveil de la boucle de rendu WASAPI exclusive. Même raison que
+/// `negociation_format_exclusif_3837` d'être hors FFI : aucun job de CI
+/// n'exécute WASAPI, cette table de décision-ci est jugée par `cargo test`.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod reveil_rendu_4357;
 pub mod slimproto;
 pub mod squeezebox;
 /// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,

@@ -332,6 +332,29 @@ impl PlaybackOrchestrator {
         // which LocalOutput cannot decode — it would interpret compressed
         // bytes as raw PCM samples, producing white noise.
         // Fix: download → decode → WAV transcode, same as local files.
+        // #4759 — le plafond de fréquence de la zone, sur le bras des SERVICES.
+        //
+        // Il n'existait QUE pour la bibliothèque locale (`resolve_local.rs`,
+        // « zone_max_sample_rate_cap_applied ») et pour le bras local/OAAT de
+        // ce fichier (`decider_le_wav_de_sortie`). Le bras HTTPS — Qobuz, et
+        // tout service qui publie un FLAC directement — relayait les octets du
+        // CDN verbatim : un 192 kHz atteignait un renderer réglé sur 96 kHz,
+        // son DAC ne verrouillait pas, et la zone jouait du SILENCE pendant
+        // que le chemin du signal annonçait « 192 → 96 kHz ».
+        //
+        // Le plafond COMBINÉ (réglage de zone et catalogue en `min`), comme
+        // `resolve_local.rs` : un plafond catalogue ne peut que resserrer.
+        //
+        // Décidé ICI, avant la répartition, parce que c'est la même valeur qui
+        // doit partir sur le fil ET être annoncée dans `ResolvedStream` : les
+        // séparer, c'est fabriquer la contradiction que ce correctif ferme.
+        let cadence_plafonnee = if is_https && !is_dash_file && !is_local_stream && !is_oaat_stream
+        {
+            self.cadence_servie_pour_un_service(req, &stream_data)?
+        } else {
+            None
+        };
+
         let (stream_url, sid, out_mime, stream_file_size) = if is_local_stream || is_oaat_stream {
             self.resoudre_flux_local_ou_oaat(req, service_name, &stream_data, is_local_stream)
                 .await?
@@ -344,8 +367,16 @@ impl PlaybackOrchestrator {
                 FluxOuFini::Flux(flux) => flux,
             }
         } else if is_https {
-            self.resoudre_flux_https(req, source_id, service_name, &stream_data, info, is_https)
-                .await?
+            self.resoudre_flux_https(
+                req,
+                source_id,
+                service_name,
+                &stream_data,
+                info,
+                is_https,
+                cadence_plafonnee,
+            )
+            .await?
         } else {
             (
                 stream_data.url.clone(),
@@ -428,12 +459,75 @@ impl PlaybackOrchestrator {
             cover_url: cover_path,
             stream_id: sid,
             file_size: stream_file_size,
-            sample_rate: Some(stream_data.quality.sample_rate),
+            // La cadence ANNONCÉE est celle qui part sur le fil : quand le
+            // plafond de zone a rééchantillonné, annoncer les 192 kHz de la
+            // source poserait dans le `<res sampleFrequency>` du DIDL un
+            // chiffre que le flux ne porte pas (#4759).
+            sample_rate: Some(cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate)),
             bit_depth: Some(stream_data.quality.bit_depth as u32),
             channels: Some(2),
             origin_url,
             bitrate_kbps: None,
         })
+    }
+
+    /// #4759 — la cadence RÉELLEMENT servie par le bras des SERVICES, plafond
+    /// de fréquence de la zone compris.
+    ///
+    /// 🔴 **Ce plafond n'existait QUE pour la bibliothèque locale.**
+    /// `resolve_local.rs` le pose depuis toujours
+    /// (« zone_max_sample_rate_cap_applied »), et le bras local/OAAT de ce
+    /// fichier le pose aussi (`decider_le_wav_de_sortie`). Le bras HTTPS —
+    /// Qobuz, et tout service qui publie un FLAC directement — relayait les
+    /// octets du CDN VERBATIM : un 192 kHz atteignait un renderer réglé sur
+    /// 96 kHz, son DAC ne verrouillait pas, et la zone jouait du SILENCE
+    /// pendant que le chemin du signal annonçait « 192 → 96 kHz ». « Bit-perfect
+    /// strict » ne refusait rien non plus : aucun de ses sites n'est ici.
+    ///
+    /// Le plafond COMBINÉ (réglage de zone et catalogue en `min`), comme
+    /// `resolve_local.rs` : un plafond catalogue ne peut que resserrer.
+    ///
+    /// Rend `None` quand rien ne change — c'est le chemin de l'immense
+    /// majorité des écoutes, et il ne bouge pas d'un octet.
+    pub(super) fn cadence_servie_pour_un_service(
+        &self,
+        req: &PlayRequest,
+        stream_data: &crate::streaming::StreamUrl,
+    ) -> Result<Option<u32>, String> {
+        let plafond = crate::device_catalog::combine_max_sample_rate(
+            ZoneRepo::with_backend(self.db.clone())
+                .get(req.zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.max_sample_rate),
+            crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
+        );
+        match plafond_de_flux_de_service(
+            stream_data.quality.sample_rate,
+            plafond,
+            crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+        ) {
+            Ok(cadence) => {
+                if let Some(hz) = cadence {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = stream_data.quality.sample_rate,
+                        max_rate = hz,
+                        "streaming_https_zone_max_sample_rate_cap_applied"
+                    );
+                }
+                Ok(cadence)
+            }
+            Err(refus) => {
+                warn!(
+                    zone_id = req.zone_id,
+                    source_rate = stream_data.quality.sample_rate,
+                    max_rate = refus.sortie_hz,
+                    "streaming_https_zone_max_sample_rate_bitperfect_strict_refused"
+                );
+                Err(refus.sentinelle())
+            }
+        }
     }
 
     /// Branche locale et OAAT de `resolve_streaming_url`, sortie telle quelle
@@ -1553,6 +1647,9 @@ impl PlaybackOrchestrator {
         stream_data: &crate::streaming::StreamUrl,
         info: StreamInfo,
         is_https: bool,
+        // La cadence à SERVIR quand le plafond de zone s'applique (#4759).
+        // `None` : la cadence du service part telle quelle, comme avant.
+        cadence_plafonnee: Option<u32>,
     ) -> Result<FluxHttps, String> {
         let codec_lower = stream_data.quality.codec.to_lowercase();
         // Codecs that legacy DLNA renderers can't decode must be
@@ -1568,8 +1665,14 @@ impl PlaybackOrchestrator {
                 .is_some_and(|f| f.needs_transcode_for_dlna());
 
         if needs_flac_transcode {
-            self.pretranscoder_en_flac(req, service_name, stream_data, codec_lower)
-                .await
+            self.pretranscoder_en_flac(
+                req,
+                service_name,
+                stream_data,
+                codec_lower,
+                cadence_plafonnee,
+            )
+            .await
         } else {
             self.relayer_le_flux(
                 req,
@@ -1579,6 +1682,7 @@ impl PlaybackOrchestrator {
                 info,
                 is_https,
                 codec_lower,
+                cadence_plafonnee,
             )
             .await
         }
@@ -1593,13 +1697,20 @@ impl PlaybackOrchestrator {
         service_name: &str,
         stream_data: &crate::streaming::StreamUrl,
         codec_lower: String,
+        cadence_plafonnee: Option<u32>,
     ) -> Result<FluxHttps, String> {
         let flux = {
             // AAC/MP4 streams need transcoding for DLNA — most renderers
             // (DMP-A8, etc.) don't support AAC via DLNA.  Pre-transcode to
             // FLAC temp file so we serve with Content-Length (chunked WAV
             // causes noise on many renderers).
-            let sr = stream_data.quality.sample_rate;
+            //
+            // #4759 — la cadence SERVIE, plafond de zone compris : ce bras
+            // décode déjà, `decode_to_pcm(.., Some(sr), ..)` rééchantillonne
+            // donc sans une ligne de plus. Sans lui, un Opus/AAC 48 kHz —
+            // ou un flux de service plus haut — sortait à sa cadence d'origine
+            // vers une zone qui avait demandé moins.
+            let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
             let bd = stream_data.quality.bit_depth.max(16).min(24) as u16;
 
             info!(
@@ -1772,6 +1883,7 @@ impl PlaybackOrchestrator {
         info: StreamInfo,
         is_https: bool,
         codec_lower: String,
+        cadence_plafonnee: Option<u32>,
     ) -> Result<FluxHttps, String> {
         let flux = {
             // Non-AAC codecs (FLAC, etc.) — check if the DLNA renderer
@@ -1808,11 +1920,23 @@ impl PlaybackOrchestrator {
             // étaient donc calculés puis jetés, sans une ligne de journal —
             // « je règle mon égaliseur, j'écoute du Qobuz sur ma zone
             // réseau, et je n'entends aucune différence ».
-            let sr = stream_data.quality.sample_rate;
+            //
+            // #4759 — et le PLAFOND DE FRÉQUENCE de la zone, troisième raison
+            // de ne pas relayer verbatim. Un 192 kHz relayé tel quel vers un
+            // renderer dont le DAC plafonne à 96 kHz ne verrouille pas : du
+            // SILENCE, sans une ligne de journal, pendant que le panneau
+            // annonce « 192 → 96 kHz ». Le DSP est chargé à la cadence
+            // SERVIE, pas à celle du service : ses coefficients sont calculés
+            // pour le fil.
+            let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
             let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
             let https_dsp_active = https_dsp.is_active();
 
-            if streaming_needs_pretranscode(renderer_supports_mime, https_dsp_active) {
+            if streaming_needs_pretranscode(
+                renderer_supports_mime,
+                https_dsp_active,
+                cadence_plafonnee.is_some(),
+            ) {
                 // Deux raisons d'arriver ici : le renderer ne sait pas lire
                 // le FLAC (→ WAV/LPCM), ou un traitement doit entrer dans le
                 // signal (→ FLAC pleine profondeur, le renderer sait le

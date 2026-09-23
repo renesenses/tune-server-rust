@@ -1708,6 +1708,16 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                // La pochette PROPRE d'une piste se pose à part : `update_batch`
+                // n'écrit pas `cover_path`, faute de quoi une piste relue
+                // recopierait dans sa ligne la pochette de son ALBUM (la lecture
+                // est un `COALESCE`). Sans cet appel, l'image du single « Angry »
+                // n'atteint jamais la base d'une bibliothèque déjà scannée, pas
+                // même par « Scan complet », qui MET À JOUR (#4650). Rien à
+                // écrire pour une piste sans pochette propre.
+                if let Err(e) = track_repo.appliquer_pochettes_de_piste(&to_update) {
+                    tracing::warn!(error = %e, "scan_pochettes_de_piste_echec");
+                }
                 // Les lignes reprises à un importateur deviennent locales : sans
                 // cela elles resteraient hors de portée de la tenue de compte du
                 // scan (dont la purge) et le désaccord se rejouerait à chaque

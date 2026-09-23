@@ -264,7 +264,11 @@ CREATE TABLE IF NOT EXISTS albums (
     -- Drapeau « compilation » (#1957). TEXT ici comme tout le reste de ce
     -- schéma de copie (voir l'en-tête) ; la migration PG 028 le ramène à
     -- SMALLINT après la copie.
-    is_compilation TEXT
+    is_compilation TEXT,
+    -- Type de sortie MusicBrainz (#4767) : `album`, `ep`, `single`,
+    -- `broadcast`, `other`. TEXT des DEUX côtés — c'est un mot, pas un
+    -- booléen — donc rien à reconvertir après la copie. NUL = inconnu.
+    release_type TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -954,6 +958,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS bio_fetched_at TEXT;
 -- les autres booléens copiés ; la migration PG 028 le ramène à SMALLINT après.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS is_compilation TEXT DEFAULT 0;
 
+-- albums: type de sortie MusicBrainz (SQLite migration v106, #4767). Sans
+-- défaut : NUL veut dire « inconnu », et c'est l'état normal — la couverture
+-- MBID mesurée est de 0,9 % sur le .18. `select_album` NOMME cette colonne.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
+
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
 
@@ -1176,7 +1185,7 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
     let sql = format!("SELECT {col_list} FROM {table}");
 
     let rows: Vec<Vec<SqlValue>> = {
-        let conn = sqlite_db.read_connection().lock().unwrap();
+        let conn = sqlite_db.read_connection();
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("prepare SELECT from {table}: {e}"))?;
@@ -1336,7 +1345,7 @@ fn bind_migration_value<'q>(
 
 /// Get column names for a SQLite table via PRAGMA table_info.
 fn get_sqlite_columns(db: &SqliteDb, table: &str) -> Result<Vec<String>, String> {
-    let conn = db.read_connection().lock().unwrap();
+    let conn = db.read_connection();
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(|e| format!("pragma table_info({table}): {e}"))?;

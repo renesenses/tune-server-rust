@@ -224,10 +224,11 @@ async fn apply_profile_handler(
     // Meme raison qu'en room_correction : persister ne suffit pas, sans ceci la
     // calibration n'atteint le son qu'a la piste SUIVANTE sur une zone locale
     // alors que la reponse annonce `applied: true` (#1725).
-    let applique_a_chaud = match zone_id.parse::<i64>() {
-        Ok(id) => state.orchestrator.apply_eq_change(id).await,
-        Err(_) => false,
+    let portee = match zone_id.parse::<i64>() {
+        Ok(id) => Some(state.orchestrator.apply_eq_change_portee(id).await),
+        Err(_) => None,
     };
+    let applique_a_chaud = portee == Some(tune_core::orchestrator::PorteeDuReglage::Immediate);
 
     Ok((
         StatusCode::CREATED,
@@ -238,6 +239,8 @@ async fn apply_profile_handler(
             "filter_count": body.profile.corrections.len(),
             // « persiste » d'un cote, « entendu maintenant » de l'autre.
             "applied_live": applique_a_chaud,
+            // #4680 — quand il s'entend ; voir `POST /zones/{id}/eq`.
+            "portee": portee.map(|p| p.code()),
         })),
     )
         .into_response())

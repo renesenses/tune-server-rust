@@ -6,7 +6,10 @@ mod artists;
 mod artwork;
 mod better_quality;
 mod browse;
-mod collections;
+// `pub(crate)` : `/tags/{id}/collections` (routes/tags.rs) rend les dossiers d'une
+// étiquette dans la forme SERVIE de `/library/collections` — même fonction,
+// mêmes `album_count` et `orphan_album_ids` (#4798).
+pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
@@ -416,6 +419,13 @@ pub fn router() -> Router<AppState> {
         .route(
             "/artwork/enrich-artists/status",
             get(artwork::batch_enrich_artist_artwork_status),
+        )
+        // 🔴 #4692 — la liste NOMINATIVE derrière « N artistes encore sans
+        // portrait ». Elle sort de la même fonction que le nombre, donc les
+        // deux ne peuvent pas diverger.
+        .route(
+            "/artwork/artists-without-image",
+            get(artwork::artists_without_image),
         )
         .route("/duplicates", get(duplicates::list_duplicates))
         .route(

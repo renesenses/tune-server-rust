@@ -500,6 +500,10 @@ impl PositionPoller {
                 // `e1_nouvelle_piste_ramene_a_neuve` borne à 34 lignes la
                 // distance entre le marqueur de journal et cet appel-là.
                 ps.reprendre_le_contrat_a_zero();
+                // Une chute écartée pendant la grâce appartenait à la piste
+                // d'avant, ou au flux que le déplacement vient de recréer :
+                // rien à réexaminer (#4682).
+                ps.chute_en_grace = false;
             }
 
             // Scrobble the current track once it has genuinely been listened past
@@ -1181,6 +1185,14 @@ impl PositionPoller {
                     let target = Duration::from_millis(zone_state.position_ms.max(0) as u64);
                     ps.track_started_at =
                         Instant::now().checked_sub(target).or(ps.track_started_at);
+                    // Le pic aussi repart de la cible (#4682). Gardé d'avant
+                    // le déplacement, il laissait `played_enough` vrai après
+                    // un recul : un renderer qui rapporte une position
+                    // transitoire proche de 0 et une autre durée (DMP-A6/A8,
+                    // `SetNext` armé) faisait avancer la file sur la suivante
+                    // alors que la piste courante jouait encore.
+                    ps.peak_position_ms = target.as_millis() as u64;
+                    ps.cible_du_deplacement_ms = target.as_millis() as u64;
                 }
             }
 
@@ -1455,8 +1467,36 @@ impl PositionPoller {
             // `ps.last_position_ms` after the overwrite, so `prev_pos` was
             // always mis-logged equal to `new_pos`).
             let prev_position_ms = ps.last_position_ms;
+            // Fin de la grâce de déplacement : une chute écartée pendant la
+            // grâce est réexaminée ici, une seule fois (#4682). Sans cela, la
+            // ligne `ps.last_position_ms = …` plus bas l'a déjà effacée et le
+            // renderer qui a enchaîné pendant la grâce n'est plus jamais vu.
+            let mut chute_retenue = false;
+            if ps.chute_en_grace && !in_seek_grace {
+                ps.chute_en_grace = false;
+                if let Some(seek_at) = zone_state.last_seek_at {
+                    let depuis_ms = seek_at.elapsed().as_millis() as u64;
+                    chute_retenue = ps.gapless_sent
+                        && decisions::chute_en_grace_etait_une_fin(
+                            ps.cible_du_deplacement_ms,
+                            depuis_ms,
+                            status.position_ms,
+                            track_duration_ms,
+                        );
+                    info!(
+                        zone_id,
+                        cible_ms = ps.cible_du_deplacement_ms,
+                        depuis_ms,
+                        position_ms = status.position_ms,
+                        track_dur = track_duration_ms,
+                        retenue = chute_retenue,
+                        "gapless_chute_pendant_la_grace_reexaminee"
+                    );
+                }
+            }
             let mut position_reset =
-                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent)
+                    || chute_retenue;
             // Suppress this metadata-only advance fallback for outputs that don't
             // do internal gapless (Chromecast, slimproto, exclusive local): for
             // them a position drop to 0 means the track ENDED (device IDLE /
@@ -1481,6 +1521,9 @@ impl PositionPoller {
                 if !position_reset {
                     if in_seek_grace {
                         info!(zone_id, "gapless_advance_suppressed_after_seek");
+                        // Écartée, pas oubliée : réexaminée à la fin de la
+                        // grâce (#4682).
+                        ps.chute_en_grace = can_internal_gapless;
                     } else {
                         info!(zone_id, "position_reset_deferred_to_natural_end");
                     }
@@ -1680,6 +1723,10 @@ impl PositionPoller {
                         // seuil d'échec, seule à interroger le gestionnaire de
                         // flux, la remplace par un verdict mesuré.
                         consommation: fsm::ConsommationFlux::Inconnue,
+                        // #4480 — même règle que `consommation` : le bras du
+                        // seuil d'échec est le seul à savoir, et il le
+                        // remplace par un verdict mesuré.
+                        avance_audio_couvre_l_arret: false,
                         dlna_dsd_reached_end,
                     };
                     let mut fsm_actual: Option<fsm::StoppedOutcome>;
@@ -1813,6 +1860,18 @@ impl PositionPoller {
                             motif: MotifFin::DsdDlnaPicAtteint,
                         });
                     } else {
+                        // #4480 — on entre dans une série d'arrêts : l'horloge
+                        // part ici, et nulle part ailleurs. Tout site qui
+                        // repose `stopped_ticks = 0` la ré-arme donc de
+                        // lui-même au tour suivant.
+                        //
+                        // ⚠️ POSÉE AVANT le marqueur qui suit, et pas entre lui
+                        // et sa transition : le témoin REF-9 E7 exige
+                        // `RendererArrete` dans les trois lignes qui suivent
+                        // `fsm_actual = Some(StoppedOutcome::Waiting)`.
+                        if ps.stopped_ticks == 0 {
+                            ps.premier_arret_a = Some(Instant::now());
+                        }
                         // Default for this block; overridden by the natural-end
                         // and failure sub-branches below.
                         fsm_actual = Some(fsm::StoppedOutcome::Waiting);
@@ -2002,7 +2061,12 @@ impl PositionPoller {
                                         ));
                                     }
                                 }
-                            } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD {
+                            } else if ps.stopped_ticks >= STOPPED_FAILURE_THRESHOLD
+                                && fsm::arret_assez_long_pour_couper(
+                                    ps.premier_arret_a.map(|t| t.elapsed()),
+                                    STOPPED_FAILURE_MIN_SECS,
+                                )
+                            {
                                 // Check if the stream is still being consumed
                                 // (renderer actively fetching audio data). If so,
                                 // don't kill — the renderer is playing but not
@@ -2031,6 +2095,42 @@ impl PositionPoller {
                                     ps.last_bytes_sent = octets;
                                 }
                                 fsm_in.consommation = consommation;
+
+                                // 🔴 #4480 — le compteur d'octets ne dit RIEN
+                                // tant qu'on ne le convertit pas en secondes
+                                // d'audio. `ASec` ne signifie que « la socket
+                                // n'a pas bougé depuis le tour d'avant » : sur
+                                // une livraison à contre-pression, c'est
+                                // exactement ce que fait un renderer qui a
+                                // tamponné loin devant et n'a plus de place.
+                                //
+                                // Le terrain : 34 406 444 octets de WAV
+                                // 44,1/16 servis — 195 s d'audio — pour une
+                                // position annoncée de 23 s. Tune coupait.
+                                //
+                                // On ne pose la question qu'ici, dans le seul
+                                // bras qui coupe, et seulement quand le
+                                // compteur est mesuré et à sec : un tour
+                                // ordinaire ne paie pas ce verrou.
+                                let audio_servi_ms: Option<u64> =
+                                    if consommation == fsm::ConsommationFlux::ASec {
+                                        match stream_id.as_deref() {
+                                            Some(sid) => {
+                                                self.orchestrator.streamer_audio_servi_ms(sid).await
+                                            }
+                                            None => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let avance_audio_ms =
+                                    fsm::avance_audio_ms(audio_servi_ms, ps.peak_position_ms);
+                                let famine_etablie = fsm::famine_etablie_malgre_l_avance(
+                                    avance_audio_ms,
+                                    ps.premier_arret_a.map(|t| t.elapsed()),
+                                    AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                );
+                                fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
 
                                 if consommation == fsm::ConsommationFlux::Consomme {
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
@@ -2065,6 +2165,33 @@ impl PositionPoller {
                                             "octets_servis_inconnus_zone_non_coupee"
                                         );
                                     }
+                                } else if !famine_etablie {
+                                    // #4480 — la socket est à sec, le renderer
+                                    // ne l'est pas : il lui reste de l'audio
+                                    // devant la position qu'il annonce. On
+                                    // attend, dans la borne haute, et on le
+                                    // DIT — sans cette ligne l'épargne serait
+                                    // aussi muette que la coupure l'était.
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingAvance);
+                                    ps.transition(fsm::Transition::AttenteProlongee);
+                                    if ps.stopped_ticks % 30 == 0 {
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            wall_secs = wall_elapsed,
+                                            bytes_sent = octets_servis.unwrap_or(0),
+                                            consommation = consommation.etiquette(),
+                                            audio_servi_ms = audio_servi_ms.unwrap_or(0),
+                                            avance_ms = avance_audio_ms.unwrap_or(0),
+                                            arret_secs = ps
+                                                .premier_arret_a
+                                                .map(|t| t.elapsed().as_secs())
+                                                .unwrap_or(0),
+                                            borne_haute_secs = AVANCE_AUDIO_BORNE_HAUTE_SECS,
+                                            "audio_livree_devant_la_position_zone_non_coupee"
+                                        );
+                                    }
                                 } else {
                                     let current_bytes = octets_servis.unwrap_or(0);
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureStop);
@@ -2075,6 +2202,26 @@ impl PositionPoller {
                                         wall_secs = wall_elapsed,
                                         bytes_sent = current_bytes,
                                         consommation = consommation.etiquette(),
+                                        // #4480 — les deux grandeurs qui
+                                        // manquaient pour relire une coupure :
+                                        // combien de tours, et combien de
+                                        // SECONDES ils ont réellement pris.
+                                        // Sans elles, « 30 ticks » se lisait
+                                        // « 30 secondes », ce qui est faux.
+                                        arret_ticks = ps.stopped_ticks,
+                                        arret_secs = ps
+                                            .premier_arret_a
+                                            .map(|t| t.elapsed().as_secs())
+                                            .unwrap_or(0),
+                                        // #4480 — et de quoi juger la famine
+                                        // elle-même : l'audio livrée, et ce
+                                        // qu'il en restait devant la position.
+                                        // `0` sur l'avance = le renderer était
+                                        // bien au bout de ce qu'on lui a
+                                        // servi ; un débit nominal inconnu se
+                                        // lit sur `audio_servi_ms = 0`.
+                                        audio_servi_ms = audio_servi_ms.unwrap_or(0),
+                                        avance_ms = avance_audio_ms.unwrap_or(0),
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;
@@ -3022,6 +3169,15 @@ impl PositionPoller {
                     stopped_ticks = etat.map(|p| p.stopped_ticks).unwrap_or(0),
                     past_end_ticks = etat.map(|p| p.past_end_ticks).unwrap_or(0),
                     gapless_sent = etat.map(|p| p.gapless_sent).unwrap_or(false),
+                    // #4382 — `gapless_sent` ne dit que « le SetNext est
+                    // parti ». Ce qui décide du geste de #3967, c'est ce que
+                    // l'appareil en a DIT à l'armement, et cette ligne — la
+                    // seule que les rapports de terrain portent — ne le
+                    // nommait pas. Sans elle, un journal d'Eversolo ne permet
+                    // pas de dire si la branche `Next` s'est armée ou non.
+                    suivante_preparee = ?etat
+                        .map(|p| p.suivante_preparee)
+                        .unwrap_or(SuivantePreparee::Inconnue),
                     peak_pos = etat.map(|p| p.peak_position_ms).unwrap_or(0),
                     track_dur = track_duration_ms,
                     wall_secs = wall_elapsed,

@@ -394,6 +394,27 @@ pub struct TrackImporter {
     // never share a cache entry even though title+artist+year match.
     album_cache: HashMap<(String, String, i64, Option<i32>, Option<String>), Arc<Album>>,
     albums_with_cover: HashSet<i64>,
+    /// Par album : le condensat de CONTENU de la jaquette qui FAIT RÉFÉRENCE
+    /// — celle dont la pochette d'album a été tirée (#4650).
+    ///
+    /// C'est le point de comparaison qui permet de repérer une piste dont
+    /// l'image intégrée DIFFÈRE de celle de son album : le single « Angry »
+    /// rangé dans *Hackney Diamonds* porte sa propre jaquette, et Tune la
+    /// jetait (Fuccaro, forum 1317).
+    ///
+    /// 🔴 La référence est le condensat des OCTETS
+    /// (`artwork::content_hash`), jamais le `cover_path` de la ligne album :
+    /// ce dernier peut être une adresse HÉRITÉE dérivée du CHEMIN de la piste
+    /// (`artwork_hash`), qui ne dit rien du contenu et ne se compare donc à
+    /// rien. Les octets, eux, sont déjà en mémoire — lus avec les balises —
+    /// donc la comparaison ne rouvre aucun fichier.
+    ///
+    /// ⚠️ C'est bien la pochette RÉELLEMENT retenue pour l'album qui sert de
+    /// référence, et non l'image majoritaire du dossier. Une piste qui ne
+    /// porte pas de pochette propre retombe par `COALESCE` sur celle de son
+    /// album : une référence qui ne serait pas celle de l'album ferait donc
+    /// afficher la mauvaise image à toutes les pistes du repli.
+    album_ref_cover: HashMap<i64, String>,
     /// First track-artist seen per folder, used to pin the album artist when a
     /// track has no `album_artist` tag (classical soloists / features).
     dir_album_artist: HashMap<String, String>,
@@ -472,6 +493,7 @@ impl TrackImporter {
             artist_cache: HashMap::new(),
             album_cache: HashMap::new(),
             albums_with_cover: HashSet::new(),
+            album_ref_cover: HashMap::new(),
             dir_album_artist: HashMap::new(),
             preuves,
             albums_reclasses: HashSet::new(),
@@ -836,8 +858,23 @@ impl TrackImporter {
             // coffret de #3855 ses deux lignes album, et à « Woodstock »
             // l'artiste de sa première piste. Deux artistes ou plus ⇒ la
             // convention, et elle seule.
+            //
+            // 🔴 Ticket support 156 / fil 1881 (jfpaquet, 0.9.161) — un artiste
+            // d'album tagué qui EST la convention n'est pas un artiste. Ses
+            // fichiers portent `ALBUMARTIST = Various` ; `folder_tagged_artist`
+            // n'y voyait qu'une valeur unique et C2 la prenait au mot : la
+            // ligne album naissait sous un artiste nommé « Various », et
+            // l'écran Bibliothèque montrait une entrée de plus à la lettre V,
+            // à côté de « Various Artists ». Les graphies libres (« VA »,
+            // « Compilations ») en fabriquaient autant. `is_various_artists`
+            // les connaît toutes — c'est LUI qui a fait de cet album une
+            // compilation quelques lignes plus haut (`forme`) — et la passe de
+            // réparation les écarte déjà (`reparer_compilations.rs`,
+            // `Temoignage::ajouter`). Le scan les écarte donc pareillement :
+            // la convention reprend la main, sous sa graphie canonique.
             self.folder_tagged_artist
                 .get(&album_dir)
+                .filter(|a| !is_various_artists(a.as_str()))
                 .cloned()
                 .unwrap_or_else(|| "Various Artists".to_string())
         } else if let Some(aa) = meta.album_artist.as_deref() {
@@ -1165,6 +1202,21 @@ impl TrackImporter {
                     &self.cache_dir,
                 ),
             };
+            // #4650 — cette jaquette-ci FAIT RÉFÉRENCE pour l'album : c'est
+            // d'elle que sort la pochette d'album ci-dessous. Toute piste dont
+            // l'image intégrée s'en écarte portera une pochette à elle.
+            //
+            // Seule la branche « octets en main » amorce la référence : quand
+            // `cover_art` est vide, la pochette vient du DOSSIER et l'on n'a
+            // pas ses octets. La référence est alors posée par la première
+            // piste du lot qui porte une image (voir plus bas), ce qui laisse
+            // l'album illustré par son `cover.jpg` et n'écrit aucune pochette
+            // de piste tant que toutes portent la même.
+            if let Some(cover) = meta.cover_art.as_ref() {
+                self.album_ref_cover
+                    .entry(aid)
+                    .or_insert_with(|| tune_core::library::artwork::content_hash(&cover.0));
+            }
             if let Some(hash) = cover_hash {
                 // `update_cover_path` est un `COALESCE` : il ne remplace jamais
                 // une valeur déjà posée. C'est ce qu'il faut entre deux scans
@@ -1257,6 +1309,62 @@ impl TrackImporter {
                     cover,
                 )
             };
+        } else if let Some(cover) = meta.cover_art.as_ref()
+            && let Some(aid) = album_id
+        {
+            // #4650 — UN ALBUM ORDINAIRE, une piste qui porte sa propre image.
+            //
+            // Les quatre singles de *Hackney Diamonds* (dont « Angry ») sont
+            // rangés dans le dossier de l'album et portent chacun une jaquette
+            // différente de la sienne. Jusqu'ici Tune les jetait : la pochette
+            // par piste n'était retenue que dans le cas `use_folder_title`
+            // ci-dessus, c'est-à-dire un dossier fourre-tout (#1284). Décision
+            // de Bertrand du 22/09/2026 : le scan GARDE l'image intégrée à la
+            // piste quand elle diffère de celle de l'album.
+            //
+            // Le coût, lu sur le code plutôt que supposé :
+            // - **aucune lecture de fichier** — `cover.0` est en mémoire, lu
+            //   avec les balises ;
+            // - **aucune écriture de cache** quand l'image est la même : la
+            //   comparaison échoue avant d'y toucher, et le cache est de
+            //   toute façon adressé par le CONTENU ;
+            // - **aucune écriture de base supplémentaire** : `cover_path` est
+            //   une colonne de la ligne piste, que le scan écrit de toute
+            //   façon (et `appliquer_pochettes_de_piste` ne touche que les
+            //   pistes qui en portent une). Un album de 30 pistes à jaquette
+            //   unique ne produit donc que 30 condensats SHA-256 sur des
+            //   octets déjà en RAM, et rien d'autre.
+            //
+            // La comparaison porte sur le condensat de CONTENU et jamais sur
+            // ce que rend `save_embedded_cover` : celui-ci sonde d'abord une
+            // entrée HÉRITÉE adressée par le CHEMIN de la piste, qui ne peut
+            // par construction jamais égaler la référence — toutes les pistes
+            // auraient alors été déclarées « différentes ».
+            let condensat = tune_core::library::artwork::content_hash(&cover.0);
+            match self.album_ref_cover.get(&aid) {
+                // La référence existe et cette piste s'en écarte : elle garde
+                // son image. `cache_embedded_cover` saute la sonde héritée,
+                // donc il rend exactement le condensat comparé — sans quoi la
+                // ligne piste annoncerait une image et la comparaison une
+                // autre. Il n'écrit rien si ces octets sont déjà en cache.
+                Some(reference) if *reference != condensat => {
+                    track.cover_path = tune_core::library::artwork::cache_embedded_cover(
+                        std::path::Path::new(&sf.path),
+                        &self.cache_dir,
+                        cover,
+                    );
+                }
+                // Même image que l'album : rien à faire, la lecture retombe
+                // sur la pochette d'album par `COALESCE`.
+                Some(_) => {}
+                // Album sans référence connue (sa pochette vient du dossier) :
+                // la première image rencontrée devient la référence. Sans
+                // cela, un album illustré par un `cover.jpg` verrait TOUTES
+                // ses pistes déclarées « différentes ».
+                None => {
+                    self.album_ref_cover.insert(aid, condensat);
+                }
+            }
         }
 
         Some((track, album_id))
@@ -2386,6 +2494,121 @@ mod tests {
         }
     }
 
+    /// Un `ALBUMARTIST` qui EST la convention ne devient pas un artiste.
+    ///
+    /// jfpaquet (0.9.161, Windows, 6 599 albums, ticket support 156) :
+    /// « ils apparaissent dans Library à la lettre V MAIS artist est indiqué
+    /// "Various" alors que chaque morceau est bien taggé avec le nom de
+    /// l'artiste ». Ses compilations portent `ALBUMARTIST = Various` — une
+    /// graphie que [`is_various_artists`] reconnaît, et c'est elle qui, par
+    /// `forme`, en fait des compilations. C2 rendait ensuite « l'artiste
+    /// d'album tagué du dossier », c'est-à-dire « Various » TEL QUEL :
+    /// `folder_tagged_artist` n'y voyait qu'une valeur unique. Une ligne
+    /// `artists` naissait par graphie — « Various », « VA »,
+    /// « Compilations » — toutes rangées à la lettre V à côté de la vraie,
+    /// « Various Artists ». La passe de réparation, elle, les écarte déjà
+    /// (`reparer_compilations.rs`, `Temoignage::ajouter`) : le scan et elle
+    /// se contredisaient.
+    ///
+    /// Ce test ÉCHOUE contre le code d'avant : retirer le
+    /// `.filter(|a| !is_various_artists(a.as_str()))` de `import` rend « Various » et
+    /// « VA » là où il attend « Various Artists ».
+    #[test]
+    fn un_album_artist_conventionnel_ne_devient_pas_un_artiste() {
+        let scratch = tune_core::test_scratch::scratch_dir("scan_import_va_conventionnel");
+        let racine = scratch.path();
+
+        /// Une piste dont l'artiste et l'ARTISTE D'ALBUM diffèrent — ce que
+        /// `fichier_etiquete` ne sait pas faire, et c'est tout le sujet.
+        fn piste(
+            chemin: &str,
+            artiste: &str,
+            album_artiste: &str,
+            album: &str,
+            n: u32,
+            tag: Option<bool>,
+        ) -> ScannedFile {
+            let mut f = sf(chemin);
+            f.metadata = Some(TrackMetadata {
+                title: Some(format!("{album} {n}")),
+                artist: Some(artiste.to_string()),
+                album: Some(album.to_string()),
+                album_artist: Some(album_artiste.to_string()),
+                track_number: Some(n),
+                compilation: tag,
+                ..Default::default()
+            });
+            f
+        }
+
+        // Les deux graphies du tester, chacune dans son dossier. Les pistes
+        // portent bien leur propre artiste : c'est ce qu'il dit du sien.
+        for (dossier, graphie, album) in [
+            ("Nuits Jazz", "Various", "Nuits Jazz"),
+            ("Soul Legends", "VA", "Soul Legends"),
+        ] {
+            let d = racine.join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let c = |n: &str| d.join(n).to_string_lossy().into_owned();
+            let fichiers = vec![
+                piste(&c("01.flac"), "Miles Davis", graphie, album, 1, None),
+                piste(&c("02.flac"), "John Coltrane", graphie, album, 2, None),
+                piste(&c("03.flac"), "Bill Evans", graphie, album, 3, None),
+            ];
+            let rendu = importer_par_lots(&fichiers, 8, &racine.join(format!("cache-{dossier}")));
+            assert_eq!(rendu.len(), 3, "les trois pistes doivent être importées");
+            for (chemin, (artiste, compilation, _)) in &rendu {
+                assert_eq!(
+                    (artiste.as_str(), *compilation),
+                    ("Various Artists", true),
+                    "ALBUMARTIST = « {graphie} » est la CONVENTION, pas un artiste : \
+                     l'album doit porter « Various Artists » et non « {artiste} » ({chemin})"
+                );
+            }
+            let albums: std::collections::BTreeSet<i64> =
+                rendu.values().map(|(_, _, id)| *id).collect();
+            assert_eq!(albums.len(), 1, "et les trois pistes tiennent en un album");
+        }
+
+        // TÉMOIN C2 — sur la MÊME branche, un VRAI artiste d'album tagué garde
+        // la main. Le tag `compilation = vrai` fait entrer ce coffret par C2,
+        // là même où la correction agit : sans ce témoin, écarter la graphie
+        // conventionnelle passerait pour une correction alors qu'elle pourrait
+        // tout aussi bien renvoyer tout coffret sous « Various Artists » —
+        // exactement le défaut que C2 a corrigé le 14/09.
+        let d = racine.join("Coffret Reiner");
+        std::fs::create_dir_all(&d).unwrap();
+        let c = |n: &str| d.join(n).to_string_lossy().into_owned();
+        let fichiers = vec![
+            piste(
+                &c("01.flac"),
+                "Chicago Symphony Orchestra",
+                "Fritz Reiner",
+                "Ein Heldenleben",
+                1,
+                Some(true),
+            ),
+            piste(
+                &c("02.flac"),
+                "Fritz Reiner",
+                "Fritz Reiner",
+                "Ein Heldenleben",
+                2,
+                Some(true),
+            ),
+        ];
+        let rendu = importer_par_lots(&fichiers, 8, &racine.join("cache-reiner"));
+        assert_eq!(rendu.len(), 2, "les deux pistes doivent être importées");
+        for (chemin, (artiste, compilation, _)) in &rendu {
+            assert_eq!(
+                (artiste.as_str(), *compilation),
+                ("Fritz Reiner", true),
+                "témoin C2 : sur une compilation aussi, un artiste d'album tagué \
+                 qui n'est PAS la convention reste l'artiste de l'album ({chemin})"
+            );
+        }
+    }
+
     /// #3855 — LE COFFRET DE PIERRE M, à la forme exacte de ses captures.
     ///
     /// « The Complete RCA Album Collection » (Reiner / Chicago SO, 63 CD). Le
@@ -2487,5 +2710,202 @@ mod tests {
             // Et le coffret ne perd aucune piste au passage.
             assert_eq!(rendu.len(), 12, "quality_split={quality_split}");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // #4650 — LA POCHETTE DU SINGLE, dans un album ordinaire.
+    //
+    // Fuccaro (forum 1317, 21/09/2026) : les quatre singles de *Hackney
+    // Diamonds* — dont « Angry » — portent chacun une jaquette différente de
+    // celle de l'album, et sont rangés dans le même dossier que lui. Tune
+    // affichait la pochette de l'album pour tout le monde : la pochette par
+    // piste n'était retenue que dans un dossier FOURRE-TOUT (#1284), jamais
+    // dans un album normal.
+    //
+    // Décision de Bertrand du 22/09/2026 : le scan garde l'image intégrée à la
+    // piste quand elle DIFFÈRE de celle de l'album.
+    // ------------------------------------------------------------------
+
+    const JAQUETTE_ALBUM: &[u8] = b"IMAGE-ALBUM-HACKNEY-DIAMONDS";
+    const JAQUETTE_SINGLE: &[u8] = b"IMAGE-SINGLE-ANGRY";
+
+    /// Un fichier d'album ORDINAIRE (un seul artiste, une seule étiquette
+    /// d'album : rien qui déclenche `use_folder_title`), avec l'image
+    /// intégrée donnée.
+    fn piste_avec_jaquette(
+        dossier: &std::path::Path,
+        fichier: &str,
+        titre: &str,
+        numero: u32,
+        jaquette: &[u8],
+    ) -> ScannedFile {
+        let chemin = dossier.join(fichier).to_string_lossy().into_owned();
+        let mut f = sf(&chemin);
+        f.metadata = Some(TrackMetadata {
+            title: Some(titre.to_string()),
+            artist: Some("The Rolling Stones".into()),
+            album: Some("Hackney Diamonds".into()),
+            album_artist: Some("The Rolling Stones".into()),
+            track_number: Some(numero),
+            cover_art: Some((jaquette.to_vec(), "image/jpeg".into())),
+            ..Default::default()
+        });
+        f
+    }
+
+    /// Importe un lot dans un importateur neuf et rend `titre -> cover_path`,
+    /// plus le répertoire de cache pour le compte des entrées.
+    fn pochettes_de_piste(
+        lot: &[ScannedFile],
+        cache: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, Option<String>> {
+        use std::sync::Arc;
+        use tune_core::db::sqlite::SqliteDb;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let backend: Arc<dyn tune_core::db::backend::DbBackend> = Arc::new(db);
+        let mut imp = TrackImporter::new(backend, true, cache.to_path_buf(), PorteeDuScan::TOUT);
+        imp.begin_batch(lot);
+        let mut rendu = std::collections::BTreeMap::new();
+        for f in lot {
+            let (piste, album_id) = imp.import(f).expect("import");
+            assert!(album_id.is_some(), "un album pour « {} »", piste.title);
+            rendu.insert(piste.title.clone(), piste.cover_path.clone());
+        }
+        rendu
+    }
+
+    /// LE FAIT de #4650 : dans un album ordinaire, la piste dont l'image
+    /// intégrée diffère de celle de l'album garde SON image ; les autres
+    /// n'écrivent rien et retombent sur la pochette d'album.
+    ///
+    /// Rouge contre le code d'avant : `cover_path` valait `None` pour les
+    /// quatre pistes, la branche par piste étant gardée par
+    /// `use_folder_title`. Le message nomme alors la pochette jetée.
+    #[test]
+    fn le_single_garde_sa_pochette_dans_un_album_ordinaire_4650() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("artwork_cache");
+        let dossier = tmp.path().join("The Rolling Stones - Hackney Diamonds");
+        std::fs::create_dir_all(&dossier).unwrap();
+
+        // La première piste vue donne sa pochette à l'album — c'est le
+        // comportement en place. Ici c'est « Get Close », une piste ordinaire.
+        let lot = vec![
+            piste_avec_jaquette(&dossier, "02.flac", "Get Close", 2, JAQUETTE_ALBUM),
+            piste_avec_jaquette(&dossier, "01.flac", "Angry", 1, JAQUETTE_SINGLE),
+            piste_avec_jaquette(&dossier, "03.flac", "Depending On You", 3, JAQUETTE_ALBUM),
+            piste_avec_jaquette(&dossier, "04.flac", "Bite My Head Off", 4, JAQUETTE_ALBUM),
+        ];
+        let pochettes = pochettes_de_piste(&lot, &cache);
+        let condensat_single = tune_core::library::artwork::content_hash(JAQUETTE_SINGLE);
+
+        assert_eq!(
+            pochettes.get("Angry").cloned().flatten().as_deref(),
+            Some(condensat_single.as_str()),
+            "#4650 : « Angry » porte une image intégrée DIFFÉRENTE de celle de \
+             son album, et le scan la jette — la piste affiche la pochette de \
+             l'album. Pochettes vues : {pochettes:?}"
+        );
+
+        for titre in ["Get Close", "Depending On You", "Bite My Head Off"] {
+            assert_eq!(
+                pochettes.get(titre).cloned().flatten(),
+                None,
+                "« {titre} » porte la MÊME image que son album : elle ne doit \
+                 rien écrire et retomber sur la pochette d'album par COALESCE. \
+                 Pochettes vues : {pochettes:?}"
+            );
+        }
+
+        // L'image retenue est bien en cache : sans quoi la base annoncerait un
+        // condensat que la route rend en 404 (#2567).
+        assert!(
+            tune_core::library::artwork::find_cached(&cache, &condensat_single).is_some(),
+            "la pochette du single doit exister dans le cache"
+        );
+    }
+
+    /// ⚠️ LE REVERS, mesuré et assumé : quand c'est le SINGLE qui est vu en
+    /// premier, c'est lui qui donne sa pochette à l'album — comportement en
+    /// place, hors périmètre de #4650 — et ce sont les autres pistes qui
+    /// portent alors une pochette propre.
+    ///
+    /// L'affichage reste JUSTE dans les deux cas : chaque piste montre son
+    /// image réelle. Seule la vignette de l'ALBUM dépend de l'ordre de lecture,
+    /// et c'est un défaut antérieur (la pochette d'album est celle du premier
+    /// fichier vu). Ce témoin existe pour que ce revers soit écrit quelque
+    /// part plutôt que découvert par un testeur.
+    #[test]
+    fn single_vu_en_premier_la_pochette_propre_change_de_camp_4650() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("artwork_cache");
+        let dossier = tmp.path().join("The Rolling Stones - Hackney Diamonds");
+        std::fs::create_dir_all(&dossier).unwrap();
+
+        let lot = vec![
+            piste_avec_jaquette(&dossier, "01.flac", "Angry", 1, JAQUETTE_SINGLE),
+            piste_avec_jaquette(&dossier, "02.flac", "Get Close", 2, JAQUETTE_ALBUM),
+        ];
+        let pochettes = pochettes_de_piste(&lot, &cache);
+        let condensat_album = tune_core::library::artwork::content_hash(JAQUETTE_ALBUM);
+
+        assert_eq!(
+            pochettes.get("Angry").cloned().flatten(),
+            None,
+            "la piste vue en PREMIÈRE donne sa pochette à l'album : elle n'a \
+             rien à écrire. Pochettes vues : {pochettes:?}"
+        );
+        assert_eq!(
+            pochettes.get("Get Close").cloned().flatten().as_deref(),
+            Some(condensat_album.as_str()),
+            "et c'est la piste ordinaire qui porte alors une pochette propre — \
+             son image RÉELLE, donc un affichage juste. Pochettes vues : \
+             {pochettes:?}"
+        );
+    }
+
+    /// LE TÉMOIN DU COÛT : un album de trente pistes à jaquette UNIQUE
+    /// n'écrit AUCUNE pochette de piste et ne pose qu'UNE entrée de cache.
+    ///
+    /// C'est la garde demandée par Bertrand — « un album de 30 pistes ne doit
+    /// pas provoquer 30 écritures inutiles ». Vert des deux côtés du
+    /// correctif : c'est ce qui prouve que le test précédent mesure la
+    /// DIFFÉRENCE d'image, et non le simple fait qu'une image existe.
+    #[test]
+    fn trente_pistes_a_jaquette_unique_n_ecrivent_aucune_pochette_4650() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("artwork_cache");
+        let dossier = tmp.path().join("The Rolling Stones - Hackney Diamonds");
+        std::fs::create_dir_all(&dossier).unwrap();
+
+        let lot: Vec<ScannedFile> = (1..=30u32)
+            .map(|n| {
+                piste_avec_jaquette(
+                    &dossier,
+                    &format!("{n:02}.flac"),
+                    &format!("titre {n}"),
+                    n,
+                    JAQUETTE_ALBUM,
+                )
+            })
+            .collect();
+        let pochettes = pochettes_de_piste(&lot, &cache);
+
+        let avec_pochette = pochettes.values().filter(|p| p.is_some()).count();
+        assert_eq!(
+            avec_pochette, 0,
+            "trente pistes portant la MÊME jaquette que leur album ne doivent \
+             produire aucune pochette de piste : {avec_pochette} en ont une"
+        );
+        let entrees = std::fs::read_dir(&cache)
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            entrees, 1,
+            "le cache est adressé par le CONTENU : une seule image, une seule \
+             entrée — {entrees} trouvées"
+        );
     }
 }

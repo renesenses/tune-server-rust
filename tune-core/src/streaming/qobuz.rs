@@ -1345,6 +1345,16 @@ impl QobuzService {
 
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
+            // #4767 — le type que QOBUZ annonce pour SON album. C'est lui
+            // l'autorité sur son catalogue, et aucune requête de plus n'est
+            // nécessaire : le champ est déjà dans la réponse. Un mot hors
+            // vocabulaire (`compilation`, `epMini`…) reste inconnu plutôt que
+            // replié sur `album` — un tri faux est pire qu'une section
+            // absente.
+            release_type: item["release_type"]
+                .as_str()
+                .and_then(crate::metadata::release_type::depuis_service)
+                .map(|t| t.as_str().to_string()),
             id: item["id"]
                 .as_str()
                 .map(Into::into)

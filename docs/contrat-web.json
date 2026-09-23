@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "737ab0afb89e7d5f53994a0a7ca32d06c6ffc32f",
+    "web_sha": "89bf3e488bd9e4acef2501168c24c09630ee102e",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -125,6 +125,31 @@
       "champs_optionnels": [
         "download_size",
         "error"
+      ]
+    },
+    {
+      "route": "/crossfeed/presets",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "presets"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/crossfeed/presets",
+      "methode": "POST",
+      "type": "CrossfeedPresetServeur",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "amount",
+        "delay_ms"
+      ],
+      "champs_optionnels": [
+        "created_at"
       ]
     },
     {
@@ -1788,6 +1813,34 @@
       "champs_optionnels": []
     },
     {
+      "route": "/network/media-servers/{}/bibliotheque",
+      "methode": "DELETE",
+      "type": "RetraitUpnpApercu",
+      "liste": false,
+      "champs_obligatoires": [
+        "pistes",
+        "albums",
+        "favoris",
+        "playlists",
+        "sources"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/network/media-servers/{}/bibliotheque",
+      "methode": "GET",
+      "type": "RetraitUpnpApercu",
+      "liste": false,
+      "champs_obligatoires": [
+        "pistes",
+        "albums",
+        "favoris",
+        "playlists",
+        "sources"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/network/media-servers/{}/browse",
       "methode": "GET",
       "type": "MediaServerBrowseResult",
@@ -2635,7 +2688,9 @@
         "lms_discovered",
         "players"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "diagnostic"
+      ]
     },
     {
       "route": "/squeezebox/players/{}/create-zone",
@@ -2713,7 +2768,9 @@
         "lms_discovered",
         "players"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "diagnostic"
+      ]
     },
     {
       "route": "/streaming/youtube/auth/device-code",
@@ -4051,6 +4108,17 @@
       "champs_optionnels": []
     },
     {
+      "route": "/tags/{}/collections",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "collections",
+        "count"
+      ],
+      "champs_optionnels": []
+    },
+    {
       "route": "/tags/{}/items/batch",
       "methode": "POST",
       "type": "(en ligne)",
@@ -4067,6 +4135,28 @@
       "liste": false,
       "champs_obligatoires": [
         "playlists",
+        "count"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/tags/{}/smart-collections",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "smart_collections",
+        "count"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/tags/{}/smart-playlists",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "smart_playlists",
         "count"
       ],
       "champs_optionnels": []
@@ -4471,7 +4561,9 @@
       "champs_optionnels": [
         "eq_profile",
         "crossfeed",
-        "crossfeed_status"
+        "crossfeed_status",
+        "crossfeed_limits",
+        "level_compensation"
       ]
     },
     {
@@ -4483,7 +4575,9 @@
       "champs_optionnels": [
         "eq_profile",
         "crossfeed",
-        "crossfeed_status"
+        "crossfeed_status",
+        "crossfeed_limits",
+        "level_compensation"
       ]
     },
     {
@@ -5179,6 +5273,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/artists/{}/albums",
+      "type": "unknown",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/library/tracks",
       "type": "any",
       "raison": "type non structurel"
@@ -5795,7 +5894,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 290,
-    "appels_non_resolus": 149
+    "routes_cartographiees": 297,
+    "appels_non_resolus": 150
   }
 }

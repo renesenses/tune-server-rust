@@ -703,6 +703,14 @@ impl PlaybackOrchestrator {
         self.streamer.stream_bytes_sent(stream_id).await
     }
 
+    /// Audio servie à ce renderer, en millisecondes (voir
+    /// [`AudioStreamer::stream_audio_servi_ms`]). #4480 : c'est le compteur
+    /// d'octets converti au débit nominal du flux — la seule forme sous
+    /// laquelle il se compare à une position de lecture.
+    pub async fn streamer_audio_servi_ms(&self, stream_id: &str) -> Option<u64> {
+        self.streamer.stream_audio_servi_ms(stream_id).await
+    }
+
     /// Consigne le constat « aucun onglet ne reçoit le son de cette zone »
     /// (voir [`crate::playback::PlaybackManager::note_browser_unattended`]).
     pub async fn note_browser_unattended(&self, zone_id: i64, unattended: bool) {
