@@ -830,7 +830,7 @@ mod tests {
             "--port=9331",
             "--archive=a.zip",
             "--sortie=s.json",
-            "--jeton=/tmp/j.json",
+            "--jeton=/media/cle/j.json",
             "--decouverte=12",
             "--sans-pistes",
         ]));
@@ -838,7 +838,7 @@ mod tests {
         assert_eq!(a.port, Some(9331));
         assert_eq!(a.archive, Some(PathBuf::from("a.zip")));
         assert_eq!(a.sortie, PathBuf::from("s.json"));
-        assert_eq!(a.jeton, Some(PathBuf::from("/tmp/j.json")));
+        assert_eq!(a.jeton, Some(PathBuf::from("/media/cle/j.json")));
         assert_eq!(a.decouverte, Duration::from_secs(12));
         assert!(a.sans_pistes);
     }
@@ -1025,9 +1025,8 @@ mod tests {
     fn le_fichier_de_jeton_n_est_lisible_que_par_son_proprietaire() {
         use std::os::unix::fs::PermissionsExt;
 
-        let base = std::env::temp_dir().join(format!("moissonneur-jeton-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let chemin = base.join("sous").join(FICHIER_JETON);
+        let base = tempfile::tempdir().unwrap();
+        let chemin = base.path().join("sous").join(FICHIER_JETON);
 
         securiser_le_jeton(&chemin).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -1045,8 +1044,6 @@ mod tests {
         assert_eq!(mode(&chemin), 0o600);
         // …sans écraser ce qu'il contenait.
         assert_eq!(std::fs::read(&chemin).unwrap(), b"{}");
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
