@@ -862,3 +862,9 @@ path = "tests/suppression_playlist_de_service.rs"
 [[test]]
 name = "playlist_manager_cloisonnement_par_profil"
 path = "tests/playlist_manager_cloisonnement_par_profil.rs"
+
+# #4767 — les deux sections de la page artiste (« Compilations »,
+# « Apparitions ») et l'absence d'une section vide.
+[[test]]
+name = "page_artiste_sections_4767"
+path = "tests/page_artiste_sections_4767.rs"

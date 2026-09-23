@@ -436,6 +436,71 @@ pub mod sql {
         )
     }
 
+    /// Le prédicat « cet album porte au moins une piste de cet artiste »
+    /// (#4767).
+    ///
+    /// Sur `tracks.artist_id`, PAS sur `track_credits` : cette table-là est
+    /// VIDE en pratique (mesure du 23/09/2026 sur le .18 : 0 crédit pour Neil
+    /// Young), elle n'est peuplée que par un enrichissement à la demande. Le
+    /// seul artiste connu de chaque piste sans réseau est celui de `tracks`.
+    ///
+    /// `IN (SELECT …)` et non `EXISTS` corrélé : la sous-requête se lit une
+    /// fois sur `idx_tracks_artist_id` (présent en SQLite comme en PG) au
+    /// lieu d'être rejouée album par album.
+    fn albums_portant_une_piste_de(placeholder: &str) -> String {
+        format!(
+            "a.id IN (SELECT t.album_id FROM tracks t \
+             WHERE t.artist_id = {placeholder} AND t.album_id IS NOT NULL)"
+        )
+    }
+
+    /// Le prédicat commun aux deux sections de la page artiste (#4767) :
+    /// l'album n'est PAS attribué à l'artiste de la page, mais il porte au
+    /// moins une de ses pistes.
+    ///
+    /// L'album de l'artiste lui-même en est exclu : il est déjà dans la
+    /// discographie que rend [`list_by_artist`], et #4651 vient justement de
+    /// la débarrasser des albums d'autres artistes — ces sections ne doivent
+    /// pas les y ramener par la bande, ni afficher deux fois le même album.
+    fn hors_discographie_mais_present<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "(a.artist_id IS NULL OR a.artist_id <> {}) AND {} AND {}",
+            d.placeholder(1),
+            albums_portant_une_piste_de(&d.placeholder(2)),
+            crate::db::facet_filter::hidden_albums_excluded()
+        )
+    }
+
+    /// Section « Compilations » de la page artiste (#4767) : les albums
+    /// marqués compilation qui portent au moins une piste de cet artiste.
+    ///
+    /// C'est le cas « Hits from the 60s » de la capture de FabienM : un
+    /// « Artistes divers » où l'artiste signe un titre.
+    pub fn list_compilations_with_artist_track<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE COALESCE(a.is_compilation, 0) <> 0 AND {} \
+             ORDER BY a.year ASC, LOWER(a.title) ASC",
+            select_album(),
+            hors_discographie_mais_present(d)
+        )
+    }
+
+    /// Section « Apparitions » de la page artiste (#4767) : les albums NON
+    /// compilation d'un AUTRE artiste qui portent au moins une piste de
+    /// celui-ci.
+    ///
+    /// « Apparitions » et non « Collaborations » : faute de crédits en base,
+    /// seul l'invité crédité EN TÊTE d'un titre ressort — le musicien de
+    /// séance n'y sera pas, et le libellé ne doit pas promettre l'inverse.
+    pub fn list_appearances_of_artist<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "{} WHERE COALESCE(a.is_compilation, 0) = 0 AND {} \
+             ORDER BY a.year ASC, LOWER(a.title) ASC",
+            select_album(),
+            hors_discographie_mais_present(d)
+        )
+    }
+
     pub fn list_by_year<D: SqlDialect>(d: &D) -> String {
         format!(
             "{} WHERE a.year = {} ORDER BY LOWER(a.title) ASC",
@@ -2823,6 +2888,37 @@ impl AlbumRepo {
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
         let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
+    }
+
+    /// Section « Compilations » de la page artiste (#4767).
+    ///
+    /// Voir [`sql::list_compilations_with_artist_track`] pour le prédicat.
+    /// L'identifiant est passé DEUX fois : SQLite numérote ses `?` par
+    /// position, il lui en faut donc un par occurrence.
+    pub fn list_compilations_with_artist_track(
+        &self,
+        artist_id: i64,
+    ) -> Result<Vec<Album>, TuneError> {
+        let sql = self.dialect_sql(
+            sql::list_compilations_with_artist_track,
+            sql::list_compilations_with_artist_track,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_album).collect())
+    }
+
+    /// Section « Apparitions » de la page artiste (#4767).
+    ///
+    /// Voir [`sql::list_appearances_of_artist`] pour le prédicat.
+    pub fn list_appearances_of_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
+        let sql = self.dialect_sql(
+            sql::list_appearances_of_artist,
+            sql::list_appearances_of_artist,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }
