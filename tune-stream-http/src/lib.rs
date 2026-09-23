@@ -1431,6 +1431,49 @@ where
 /// Le `Drop` est deliberé : il couvre la connexion abandonnee en cours de
 /// route aussi bien que le service mene a son terme. Une piste que le renderer
 /// abandonne au bout de 30 s ne laissait, elle non plus, aucune trace.
+/// 🔴 #4645 — COMMENT le service du corps s'est terminé.
+///
+/// `service_fichier_termine … complet=false` ne disait pas qui avait lâché.
+/// Le générateur du corps a quatre sorties et trois d'entre elles sont les
+/// siennes ; la quatrième — de loin la plus probable — est qu'il n'a jamais
+/// rendu la main : hyper a détruit le corps parce que la connexion est
+/// partie. Les deux cas s'impriment aujourd'hui exactement pareil, et c'est
+/// ce qui bloque l'instruction de ce ticket : « la connexion HTTP du WAV se
+/// ferme à 87,7 % », sans que rien ne dise si c'est le renderer, le réseau,
+/// un ordre de Tune, ou le serveur à court de fichier.
+///
+/// ⛔ Ce champ ne NOMME pas le coupable d'une fin `ConsommateurParti` : il
+/// sépare « le serveur a arrêté d'émettre » de « on a cessé de l'écouter ».
+/// C'est la moitié qui manquait ; l'autre se lit dans le journal DLNA autour
+/// du même horodatage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinDuService {
+    /// Tout le corps annoncé est parti. C'est la seule fin normale.
+    Complet,
+    /// Le fichier s'est terminé AVANT la longueur annoncée (`read` → `Ok(0)`).
+    /// Le serveur a promis plus qu'il n'avait : `Content-Length` ment.
+    FichierPlusCourt,
+    /// Ouverture, positionnement ou lecture en échec — la ligne `file_*_error`
+    /// qui précède en donne la cause.
+    Erreur,
+    /// 🔴 Le générateur n'a JAMAIS rendu la main : il a été détruit au milieu
+    /// d'un `yield`. Le corps n'est pas parti de lui-même, on a cessé de le
+    /// lire — renderer qui referme, lien qui tombe, ou Tune qui pousse une
+    /// nouvelle URI sur le même renderer (`dlna_set_uri_ok`, `dlna_stop`).
+    ConsommateurParti,
+}
+
+impl FinDuService {
+    fn etiquette(self) -> &'static str {
+        match self {
+            Self::Complet => "complet",
+            Self::FichierPlusCourt => "fichier_plus_court",
+            Self::Erreur => "erreur",
+            Self::ConsommateurParti => "consommateur_parti",
+        }
+    }
+}
+
 struct ChronoServiceFichier {
     stream_id: String,
     demande: u64,
@@ -1448,6 +1491,10 @@ struct ChronoServiceFichier {
     perte_signalee_ms: i64,
     /// Nombre de reculs franchis.
     pertes: u32,
+    /// #4645 — comment le service s'est terminé. Posé à `ConsommateurParti`
+    /// d'emblée : c'est la seule fin que le générateur ne peut pas écrire
+    /// lui-même, puisqu'il ne reprend jamais la main pour le faire.
+    fin: FinDuService,
 }
 
 impl ChronoServiceFichier {
@@ -1463,7 +1510,18 @@ impl ChronoServiceFichier {
             avance_min_ms: 0,
             perte_signalee_ms: 0,
             pertes: 0,
+            fin: FinDuService::ConsommateurParti,
         }
+    }
+
+    /// #4645 — noter COMMENT le service s'est terminé.
+    ///
+    /// Une méthode et non une affectation nue : la dernière, posée à la fin du
+    /// générateur, est signalée `unused_assignments` par rustc — il ne voit pas
+    /// que le champ est lu par `Drop`, la transformation du générateur lui
+    /// cachant la portée réelle de `chrono`.
+    fn noter_fin(&mut self, fin: FinDuService) {
+        self.fin = fin;
     }
 
     fn compter(&mut self, n: u64) {
@@ -1556,6 +1614,9 @@ impl Drop for ChronoServiceFichier {
                 .octets_par_seconde
                 .map(|_| terrain_perdu_ms(self.avance_max_ms, self.avance_min_ms)),
             pertes = self.octets_par_seconde.map(|_| self.pertes),
+            // #4645 — LE discriminant : le corps s'est-il arrêté de
+            // lui-même, ou a-t-on cessé de le lire ?
+            fin = self.fin.etiquette(),
             "service_fichier_termine"
         );
     }
@@ -1595,24 +1656,25 @@ fn build_file_body(
                         let file_off = map.body_src_start + (vpos - header_len);
                         if let Err(e) = file.seek(std::io::SeekFrom::Start(file_off)).await {
                             warn!(error = %e, "file_seek_error");
+                            chrono.noter_fin(FinDuService::Erreur);
                             return;
                         }
                         let mut buf = vec![0u8; 65536];
                         while remaining > 0 {
                             let to_read = (remaining as usize).min(buf.len());
                             match file.read(&mut buf[..to_read]).await {
-                                Ok(0) => break,
+                                Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                                 Ok(n) => {
                                     remaining -= n as u64;
                                     byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
                                     chrono.compter(n as u64);
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                                 }
-                                Err(e) => { warn!(error = %e, "file_read_error"); break; }
+                                Err(e) => { warn!(error = %e, "file_read_error"); chrono.noter_fin(FinDuService::Erreur); break; }
                             }
                         }
                     }
-                    Err(e) => warn!(error = %e, "file_open_error"),
+                    Err(e) => { warn!(error = %e, "file_open_error"); chrono.noter_fin(FinDuService::Erreur); }
                 }
             }
         } else {
@@ -1620,25 +1682,34 @@ fn build_file_body(
                 Ok(mut file) => {
                     if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
                         warn!(error = %e, "file_seek_error");
+                        chrono.noter_fin(FinDuService::Erreur);
                         return;
                     }
                     let mut buf = vec![0u8; 65536];
                     while remaining > 0 {
                         let to_read = (remaining as usize).min(buf.len());
                         match file.read(&mut buf[..to_read]).await {
-                            Ok(0) => break,
+                            Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                             Ok(n) => {
                                 remaining -= n as u64;
                                 byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
                                 chrono.compter(n as u64);
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
                             }
-                            Err(e) => { warn!(error = %e, "file_read_error"); break; }
+                            Err(e) => { warn!(error = %e, "file_read_error"); chrono.noter_fin(FinDuService::Erreur); break; }
                         }
                     }
                 }
-                Err(e) => warn!(error = %e, "file_open_error"),
+                Err(e) => { warn!(error = %e, "file_open_error"); chrono.noter_fin(FinDuService::Erreur); }
             }
+        }
+        // #4645 — le générateur rend la main de lui-même : tout ce qui était
+        // annoncé est parti. Cette ligne ne s'exécute que si aucune sortie
+        // anticipée ne l'a précédée — et surtout, elle NE S'EXÉCUTE PAS quand
+        // hyper détruit le corps au milieu d'un `yield`, ce qui est
+        // exactement la distinction cherchée.
+        if remaining == 0 {
+            chrono.noter_fin(FinDuService::Complet);
         }
     })
 }

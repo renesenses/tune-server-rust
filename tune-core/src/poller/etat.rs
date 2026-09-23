@@ -3,6 +3,24 @@ use super::*;
 pub(super) struct ZonePollState {
     pub(super) gapless_sent: bool,
     pub(super) stopped_ticks: u8,
+    /// 🔴 #4480 — QUAND la série de `Stopped` en cours a commencé.
+    ///
+    /// `stopped_ticks` compte des TOURS DE SONDEUR, que tout le code commente
+    /// « ~1 s » ; la boucle de `poller.rs` les fait tomber bien plus vite. Elle
+    /// se réveille sur `ticker.tick()` **ou** sur `TRACK_END_NOTIFY`
+    /// (`tokio::select!`), et `tokio::time::interval` rattrape par défaut les
+    /// tours manqués en rafale (`MissedTickBehavior::Burst`). Un tour de plus
+    /// n'attend donc pas forcément une seconde.
+    ///
+    /// Mesuré sur le terrain (#4480, Eversolo DMP-A8 du .18, 19/09) : la
+    /// génération de piste est remise à zéro à 09:04:05.921 et la zone est
+    /// coupée à 09:04:24.853 — **30 tours en 18,9 s au plus**, soit 0,63 s par
+    /// tour. Le `wall_secs=18` de la ligne de coupure le dit lui-même.
+    ///
+    /// Armé à l'entrée dans la série (au passage de 0 à 1) et jamais remis à
+    /// zéro ailleurs : chaque site qui repose `stopped_ticks = 0` le ré-arme
+    /// donc de lui-même au tour suivant.
+    pub(super) premier_arret_a: Option<Instant>,
     /// Ticks consecutifs ou le renderer rapporte une URI qui n'est pas la
     /// notre. Trois d'affilee avant de parler : une transition de piste peut
     /// montrer un instant l'URI precedente.
@@ -224,6 +242,7 @@ impl ZonePollState {
         Self {
             gapless_sent: false,
             stopped_ticks: 0,
+            premier_arret_a: None,
             tenue_etrangere_ticks: 0,
             tenue_signalee: false,
             gapless_cooldown: 0,

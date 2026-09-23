@@ -215,6 +215,36 @@ const SEEK_STREAMING_GRACE_SECS: u64 = 10;
 /// Increased from 6 to 15 to accommodate slow DLNA renderers (Shanling SCD1.3,
 /// MPlayer-based) that report Stopped/position=0 while buffering.
 const STOPPED_FAILURE_THRESHOLD: u8 = 30;
+/// 🔴 #4480 — le plancher en SECONDES du seuil ci-dessus.
+///
+/// Trente tours de sondeur ne font pas trente secondes : la boucle se réveille
+/// aussi sur `TRACK_END_NOTIFY`, et `tokio::time::interval` rattrape les tours
+/// manqués en rafale. Mesuré sur le .18 le 19/09/2026 : trente tours en 18,9 s.
+/// Voir [`fsm::arret_assez_long_pour_couper`].
+const STOPPED_FAILURE_MIN_SECS: u64 = 30;
+/// 🔴 #4480 — la BORNE HAUTE de la patience accordée à un renderer qui a
+/// encore de l'audio devant lui.
+///
+/// La patience vaut `min(avance_audio, cette borne)` : un renderer à qui l'on
+/// a livré 195 s d'audio pour une position de 23 s n'est pas affamé, mais une
+/// zone réellement morte ne doit pas rester ouverte indéfiniment. Deux
+/// minutes, parce que la valeur doit :
+///
+/// - **dépasser** ce que Tune tolère déjà sans rien couper —
+///   [`TRACK_LOAD_GRACE_SECS`] vaut 45 s, et [`STOPPED_FAILURE_MIN_SECS`]
+///   30 s — sinon elle n'ajoute aucune patience ;
+/// - **rester loin sous** la vie d'une session de flux
+///   (`SESSION_IDLE_TIMEOUT` = 1800 s) : au-delà, le gestionnaire de flux
+///   retire la session, `/stream/{id}` répond 404 et la zone est perdue de
+///   toute façon — attendre plus longtemps n'a aucun sens ;
+/// - **borner ce qu'une mesure imparfaite peut coûter** : `bytes_sent` est
+///   monotone toutes connexions confondues, donc une reprise `Range`
+///   surestime l'audio livrée. Le pire cas reste deux minutes d'une zone
+///   morte affichée en lecture, contre ~30 s avant — au lieu d'une heure si
+///   l'avance seule faisait la patience.
+///
+/// Voir [`fsm::famine_etablie_malgre_l_avance`].
+const AVANCE_AUDIO_BORNE_HAUTE_SECS: u64 = 120;
 /// Grace period (seconds) after a new track is loaded (track_generation
 /// changes).  During this window the poller suppresses stopped_ticks to
 /// let the renderer buffer — especially important for streaming sources

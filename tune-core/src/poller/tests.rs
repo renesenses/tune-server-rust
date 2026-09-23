@@ -391,6 +391,7 @@ fn gapless_cooldown_suppresses_stopped() {
     let mut ps = ZonePollState {
         gapless_sent: false,
         stopped_ticks: 0,
+        premier_arret_a: None,
         tenue_etrangere_ticks: 0,
         tenue_signalee: false,
         gapless_cooldown: 4,
@@ -458,6 +459,7 @@ fn playing_state_resets_cooldown() {
     let mut ps = ZonePollState {
         gapless_sent: true,
         stopped_ticks: 0,
+        premier_arret_a: None,
         tenue_etrangere_ticks: 0,
         tenue_signalee: false,
         gapless_cooldown: 3,
@@ -770,6 +772,7 @@ fn backoff_exponential() {
     let mut ps = ZonePollState {
         gapless_sent: false,
         stopped_ticks: 0,
+        premier_arret_a: None,
         tenue_etrangere_ticks: 0,
         tenue_signalee: false,
         gapless_cooldown: 0,
@@ -1620,6 +1623,7 @@ fn gapless_stuck_forces_track_end() {
     let mut ps = ZonePollState {
         gapless_sent: false,
         stopped_ticks: 0,
+        premier_arret_a: None,
         tenue_etrangere_ticks: 0,
         tenue_signalee: false,
         gapless_cooldown: 0,
@@ -1954,6 +1958,7 @@ fn gapless_stuck_cleared_on_playing() {
     let mut ps = ZonePollState {
         gapless_sent: false,
         stopped_ticks: 0,
+        premier_arret_a: None,
         tenue_etrangere_ticks: 0,
         tenue_signalee: false,
         gapless_cooldown: 0,
