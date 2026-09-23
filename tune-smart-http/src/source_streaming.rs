@@ -74,11 +74,9 @@ fn texte(v: Option<&Value>) -> String {
 }
 
 fn operateur(rule: &Value) -> String {
-    let brut = rule
-        .get("operator")
-        .or_else(|| rule.get("op"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("contains");
+    // 🔴 #4467 — la même lecture des deux clés que les trois autres
+    // analyseurs, au même endroit.
+    let brut = crate::regles_sql::lire_op(rule);
     match brut {
         "=" | "eq" | "equals" | "is" => "=",
         "!=" | "ne" | "neq" | "not_equals" | "is_not" => "!=",

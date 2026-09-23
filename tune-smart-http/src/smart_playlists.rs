@@ -357,16 +357,43 @@ pub(crate) fn build_smart_query(
     max_tracks: Option<i64>,
     ctx: &RefCtx,
 ) -> (String, String, String) {
+    let (w, o, l, _) =
+        build_smart_query_rapport(rules_json, match_mode, sort_by, sort_order, max_tracks, ctx);
+    (w, o, l)
+}
+
+/// La même construction, plus la liste des règles REFUSÉES.
+///
+/// 🔴 #4467 — depuis #4469 une règle intraduisible rend FAUX au lieu de la
+/// bibliothèque entière ; c'était la moitié du défaut. L'autre moitié tient
+/// dans le corps de l'issue : « rien ne le dit à l'utilisateur, la playlist
+/// rend simplement moins de titres ». Le seul témoin était un `warn` dans le
+/// journal du serveur, que personne ne lit depuis l'écran d'édition.
+///
+/// Chaque entrée est lisible telle quelle : `champ opérateur`, la même forme
+/// que [`catalogue::regles_hors_service`], pour que l'aperçu puisse la
+/// montrer. Une liste vide veut dire « toutes les règles ont été appliquées ».
+pub(crate) fn build_smart_query_rapport(
+    rules_json: &str,
+    match_mode: &str,
+    sort_by: &str,
+    sort_order: &str,
+    max_tracks: Option<i64>,
+    ctx: &RefCtx,
+) -> (String, String, String, Vec<String>) {
+    let mut refusees: Vec<String> = Vec::new();
     let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
     let joiner = if match_mode == "any" { " OR " } else { " AND " };
 
     let mut conditions = Vec::new();
     for rule in &rules {
         let field = rule.get("field").and_then(|v| v.as_str()).unwrap_or("");
-        let raw_op = rule
-            .get("op")
-            .and_then(|v| v.as_str())
-            .unwrap_or("contains");
+        // 🔴 #4467 — les DEUX clés, comme les collections, le catalogue et les
+        // favoris de service. Ce `.get("op")` seul était le dernier analyseur à
+        // n'en lire qu'une : une règle en `operator` y retombait sur le défaut
+        // `contains` et rendait le contraire de ce qu'elle demandait
+        // (`{"operator":"!="}` → 338 pistes au lieu de 42 507 sur le .18).
+        let raw_op = regles_sql::lire_op(rule);
         // 🔴 #1231 — la normalisation du module partagé, qui connaît AUSSI
         // `=`, `!=`, `<`, `>` et `is_empty`. Celle d'avant n'en reconnaissait
         // que quatre formes : une règle écrite `{"op": "="}` tombait donc sur
@@ -423,6 +450,10 @@ pub(crate) fn build_smart_query(
                         operateur = %op,
                         "regle_intraduisible_playlist_faux"
                     );
+                    // #4467 — et on le DIT : l'appelant remonte cette liste à
+                    // l'aperçu, au lieu de laisser l'utilisateur deviner
+                    // pourquoi sa playlist s'est vidée.
+                    refusees.push(format!("{field} {op}"));
                     regles_sql::FAUX.to_string()
                 }
             }
@@ -456,7 +487,7 @@ pub(crate) fn build_smart_query(
 
     let limit_clause = max_tracks.map(|n| format!("LIMIT {n}")).unwrap_or_default();
 
-    (where_clause, order, limit_clause)
+    (where_clause, order, limit_clause, refusees)
 }
 
 /// Execute a smart query and return track rows as JSON values.
@@ -812,10 +843,10 @@ async fn preview_smart_collection(
 
     // Les références à l'état meurent avant le `.await` du catalogue (voir
     // `resolve_tracks`).
-    let items = {
+    let (items, refusees) = {
         let resolver = DbRefResolver::new(&state.backend);
         let ctx = RefCtx::root(&resolver, Some(profile.id()));
-        let (where_clause, order, limit_clause) = build_smart_query(
+        let (where_clause, order, limit_clause, refusees) = build_smart_query_rapport(
             &rules_json,
             match_mode,
             sort_by,
@@ -824,22 +855,32 @@ async fn preview_smart_collection(
             &ctx,
         );
         let items = execute_smart_track_query(&state, &where_clause, &order, &limit_clause)?;
-        avec_favoris_de_service(
-            &state,
-            items,
-            &rules_json,
-            match_mode,
-            profile.id(),
-            sort_by,
-            sort_order,
-            body.max_tracks,
-        )?
+        (
+            avec_favoris_de_service(
+                &state,
+                items,
+                &rules_json,
+                match_mode,
+                profile.id(),
+                sort_by,
+                sort_order,
+                body.max_tracks,
+            )?,
+            refusees,
+        )
     };
     // 🔴 #4473 — l'aperçu est ce que la playlist rendra : sans cet appel, une
     // règle « catalogue » s'y montrerait vide et sans refus.
     let items = avec_pistes_de_catalogue(&state, items, &rules_json, body.max_tracks).await?;
 
-    Ok(Json(json!({"tracks": items, "total": items.len()})))
+    // 🔴 #4467 — l'aperçu DIT ce qu'il n'a pas su appliquer. Une règle
+    // intraduisible rend FAUX depuis #4469 : la playlist se vide sans rien
+    // annoncer, et l'utilisateur n'a que le journal du serveur pour le savoir.
+    // Champ toujours présent, vide quand tout a été appliqué : un client qui
+    // teste sa longueur n'a pas à distinguer « absent » de « aucune ».
+    Ok(Json(
+        json!({"tracks": items, "total": items.len(), "regles_refusees": refusees}),
+    ))
 }
 
 pub(crate) fn strip_accents(s: &str) -> String {
@@ -925,13 +966,100 @@ pub(crate) fn strip_accents(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_smart_query;
+    use super::{build_smart_query, build_smart_query_rapport};
     use crate::smart_refs::{EmptyResolver, RefCtx};
 
     fn where_of(rules: &str) -> String {
         let ctx = RefCtx::root(&EmptyResolver, Some(1));
         let (w, _order, _limit) = build_smart_query(rules, "all", "title", "asc", None, &ctx);
         w
+    }
+
+    fn refusees_de(rules: &str) -> Vec<String> {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        let (_w, _o, _l, refusees) =
+            build_smart_query_rapport(rules, "all", "title", "asc", None, &ctx);
+        refusees
+    }
+
+    /// 🔴 #4467 — la clé `operator` était ignorée côté PLAYLISTS.
+    ///
+    /// Mesuré sur le .18 en v0.9.162 le 23/09/2026 sur 42 844 pistes,
+    /// `artist` = « Miles Davis » : `{"op":"!="}` rendait 42 507 pistes,
+    /// `{"operator":"!="}` en rendait **338** — l'exact contraire, sans une
+    /// ligne de journal, parce que le défaut `contains` prenait la place de
+    /// l'opérateur écrit.
+    #[test]
+    fn les_deux_cles_d_operateur_donnent_la_meme_clause() {
+        for (op_, operator) in [
+            (
+                r#"[{"field":"artist","op":"!=","value":"Miles Davis"}]"#,
+                r#"[{"field":"artist","operator":"!=","value":"Miles Davis"}]"#,
+            ),
+            (
+                r#"[{"field":"artist","op":"is_empty","value":""}]"#,
+                r#"[{"field":"artist","operator":"is_empty","value":""}]"#,
+            ),
+            (
+                r#"[{"field":"year","op":"greater_than","value":"2000"}]"#,
+                r#"[{"field":"year","operator":"greater_than","value":"2000"}]"#,
+            ),
+        ] {
+            assert_eq!(
+                where_of(op_),
+                where_of(operator),
+                "la clé `operator` doit produire la MÊME clause que `op` : {operator}"
+            );
+        }
+    }
+
+    /// Et la clause obtenue est bien celle de l'opérateur écrit, pas celle du
+    /// repli `contains` : sans cette assertion, deux clauses également fausses
+    /// passeraient la comparaison ci-dessus.
+    #[test]
+    fn operator_seul_applique_l_operateur_ecrit_pas_le_repli_contains() {
+        let w = where_of(r#"[{"field":"artist","operator":"!=","value":"Miles Davis"}]"#);
+        assert!(
+            w.contains("!="),
+            "`operator: !=` doit nier, pas retomber sur `contains` : {w}"
+        );
+        assert!(
+            !w.contains("LIKE"),
+            "le repli `contains` produit un LIKE — il ne doit plus être pris : {w}"
+        );
+
+        // `is_empty` lu comme `contains ''` donnait `LIKE '%%'`, vrai pour
+        // toute la bibliothèque : 42 844 pistes mesurées sur le .18.
+        let vide = where_of(r#"[{"field":"artist","operator":"is_empty","value":""}]"#);
+        assert!(
+            vide.contains("IS NULL"),
+            "`operator: is_empty` doit tester la nullité : {vide}"
+        );
+    }
+
+    /// 🔴 #4467, seconde moitié — une règle refusée doit se DIRE.
+    ///
+    /// Depuis #4469 elle rend FAUX (zéro piste) au lieu de la bibliothèque
+    /// entière ; mais rien ne l'annonçait hors du journal du serveur, et
+    /// l'utilisateur voyait seulement sa playlist se vider.
+    #[test]
+    fn une_regle_refusee_est_nommee_dans_le_rapport() {
+        let r = refusees_de(r#"[{"field":"zzz_inexistant","op":"equals","value":"x"}]"#);
+        assert_eq!(r.len(), 1, "une règle refusée, un signalement : {r:?}");
+        assert!(
+            r[0].contains("zzz_inexistant"),
+            "le signalement doit nommer le champ : {r:?}"
+        );
+        // Une règle qui s'applique ne se signale pas.
+        assert!(
+            refusees_de(r#"[{"field":"composer","op":"equals","value":"Mozart"}]"#).is_empty(),
+            "une règle traduite ne doit rien signaler"
+        );
+        // Et la règle refusée reste FAUSSE : le rapport s'ajoute au garde-fou
+        // de #4469, il ne le remplace pas.
+        assert!(
+            where_of(r#"[{"field":"zzz_inexistant","op":"equals","value":"x"}]"#).contains("1 = 0")
+        );
     }
     /// 🔴 #1231 — une règle que le moteur ne sait pas traduire rendait
     /// « pas de condition », c'est-à-dire VRAI pour tout.
