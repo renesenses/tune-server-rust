@@ -1775,12 +1775,12 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
 fn un_traitement_actif_impose_le_pretranscodage_streaming() {
     // Renderer FLAC-capable, aucun traitement : proxy verbatim, bit-perfect.
     // C'est ce que les testeurs écoutent aujourd'hui — inchangé.
-    assert!(!streaming_needs_pretranscode(true, false));
+    assert!(!streaming_needs_pretranscode(true, false, false));
     // Renderer FLAC-capable, traitement armé : LE défaut #2863.
-    assert!(streaming_needs_pretranscode(true, true));
+    assert!(streaming_needs_pretranscode(true, true, false));
     // Renderer qui refuse le MIME amont : pré-transcodage, comme avant.
-    assert!(streaming_needs_pretranscode(false, false));
-    assert!(streaming_needs_pretranscode(false, true));
+    assert!(streaming_needs_pretranscode(false, false, false));
+    assert!(streaming_needs_pretranscode(false, true, false));
 }
 
 /// Le plafond 16 bits ne doit PAS suivre le traitement.
@@ -8736,6 +8736,149 @@ async fn plafond_de_zone_des_services_3973_strict_refuse() {
             .map(|(sr, _, _)| sr),
         Err("bitperfect_strict_refused:192000:96000".to_string()),
         "bit-perfect strict : le flux 192 kHz ne doit pas être plafonné en silence"
+    );
+}
+
+// ─── #4759 — le plafond de fréquence était MUET sur le bras des services ───
+
+/// Le flux d'un service, tel que Qobuz le publie : FLAC 192 kHz / 24 bits,
+/// URL HTTPS directe. C'est CE flux que le bras HTTPS relayait verbatim.
+fn flux_de_service_4759(sample_rate: u32) -> crate::streaming::StreamUrl {
+    crate::streaming::StreamUrl {
+        url: "https://exemple.invalid/piste.flac".into(),
+        mime_type: "audio/flac".into(),
+        quality: crate::streaming::StreamQuality {
+            codec: "flac".into(),
+            sample_rate,
+            bit_depth: 24,
+            bitrate: None,
+            channels: 2,
+        },
+        expires_at: None,
+        headers: Vec::new(),
+    }
+}
+
+/// La règle pure, sur ses quatre issues.
+///
+/// Sabotage qui rend ce témoin ROUGE : rendre `Ok(None)` au lieu de
+/// `Ok(Some(max))` quand la source dépasse le plafond — c'est exactement
+/// l'état d'avant le correctif, « le plafond n'existe pas ici ».
+#[test]
+fn le_plafond_dun_flux_de_service_convertit_ou_refuse_4759() {
+    use super::regles::plafond_de_flux_de_service;
+    // Aucun plafond réglé : rien à faire, le chemin ne bouge pas d'un octet.
+    assert_eq!(plafond_de_flux_de_service(192_000, None, false), Ok(None));
+    // La source tient sous le plafond : rien à faire non plus. C'est le
+    // 44,1 kHz qui s'entendait chez Silviu pendant que le 192 était muet.
+    assert_eq!(
+        plafond_de_flux_de_service(44_100, Some(96_000), false),
+        Ok(None)
+    );
+    // Au-dessus du plafond : rééchantillonner VERS le plafond.
+    assert_eq!(
+        plafond_de_flux_de_service(192_000, Some(96_000), false),
+        Ok(Some(96_000))
+    );
+    // Bit-perfect strict : refuser, et nommer les deux fréquences — la MÊME
+    // sentinelle que les autres sites, celle que la route HTTP traduit.
+    assert_eq!(
+        plafond_de_flux_de_service(192_000, Some(96_000), true).map_err(|r| r.sentinelle()),
+        Err("bitperfect_strict_refused:192000:96000".to_string())
+    );
+}
+
+/// Le plafond seul DOIT imposer le pré-transcodage : sans lui, la décision
+/// reste « proxy verbatim » et pas un octet ne change.
+///
+/// Sabotage qui rend ce témoin ROUGE : retirer `|| plafond_de_zone` de
+/// `streaming_needs_pretranscode`.
+#[test]
+fn le_plafond_seul_impose_le_pretranscodage_4759() {
+    // Renderer FLAC-capable, aucun traitement, plafond ARMÉ : il faut décoder
+    // pour rééchantillonner, donc pré-transcoder.
+    assert!(streaming_needs_pretranscode(true, false, true));
+    // Et sans plafond, rien ne change : le proxy verbatim reste le chemin de
+    // l'immense majorité des écoutes.
+    assert!(!streaming_needs_pretranscode(true, false, false));
+}
+
+/// Site « plafond de zone », bras HTTPS des services (Qobuz vers un renderer
+/// DLNA) : 192 kHz sur une zone plafonnée à 96 kHz.
+///
+/// 🔴 C'est le trou qui rendait Silviu muet : le bras local/OAAT plafonnait
+/// (`decider_le_wav_de_sortie`), la bibliothèque locale plafonnait
+/// (`decider_le_format_de_sortie`), et le bras HTTPS — le seul que prend un
+/// renderer réseau nourri par un service — ne lisait JAMAIS le réglage.
+///
+/// Sabotage qui rend ce témoin ROUGE : rendre `Ok(None)` sans condition dans
+/// `cadence_servie_pour_un_service`.
+#[tokio::test]
+async fn plafond_de_zone_du_bras_https_4759_convertit_puis_strict_refuse() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones
+        .create("NanoPlayer 96k", Some("dlna"), Some("uuid:nano-4759"))
+        .unwrap();
+    zones.update_max_sample_rate(zone_id, Some(96_000)).unwrap();
+    let req = requete_locale_3234(zone_id, 1);
+
+    // 44,1 kHz : sous le plafond, rien à faire — la piste qui s'entendait.
+    assert_eq!(
+        orch.cadence_servie_pour_un_service(&req, &flux_de_service_4759(44_100)),
+        Ok(None),
+        "un 44,1 kHz ne doit rien déclencher"
+    );
+
+    // 192 kHz : la cadence servie devient 96 kHz. Avant le correctif, les
+    // 192 kHz du CDN partaient tels quels et le DAC restait muet.
+    assert_eq!(
+        orch.cadence_servie_pour_un_service(&req, &flux_de_service_4759(192_000)),
+        Ok(Some(96_000)),
+        "le plafond de la zone doit s'appliquer au flux d'un service"
+    );
+
+    // Bit-perfect strict : refus nommé, pas une conversion silencieuse.
+    crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+        .set(
+            &crate::audio::bitperfect_strict::cle_de_zone(zone_id),
+            "true",
+        )
+        .unwrap();
+    assert_eq!(
+        orch.cadence_servie_pour_un_service(&req, &flux_de_service_4759(192_000)),
+        Err("bitperfect_strict_refused:192000:96000".to_string()),
+        "bit-perfect strict doit tenir sa promesse sur le bras des services aussi"
+    );
+}
+
+/// Le site d'appel : une cadence plafonnée qui ne serait pas ANNONCÉE
+/// fabriquerait la panne d'à côté — un `<res sampleFrequency>` à 192 000 sur
+/// un flux à 96 kHz, la famille #1137 / #1458.
+///
+/// Garde de TEXTE, sur le fichier du SITE (`resolve_stream.rs`), qui ne
+/// définit ni la règle ni la fonction : la définition ne peut donc pas la
+/// satisfaire toute seule.
+///
+/// Sabotage qui rend ce témoin ROUGE : rétablir
+/// `sample_rate: Some(stream_data.quality.sample_rate)` dans `ResolvedStream`.
+#[test]
+fn la_cadence_servie_est_aussi_la_cadence_annoncee_4759() {
+    let site = include_str!("resolve_stream.rs");
+    assert!(
+        site.contains("self.cadence_servie_pour_un_service(req, &stream_data)?"),
+        "le bras des services doit CONSULTER le plafond de la zone"
+    );
+    assert!(
+        site.contains(
+            "sample_rate: Some(cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate)),"
+        ),
+        "la cadence annoncée doit sortir de la MÊME valeur que la cadence servie"
+    );
+    assert!(
+        site.contains("cadence_plafonnee.is_some(),"),
+        "le plafond doit être passé à `streaming_needs_pretranscode` : sans cela, \
+         les octets du CDN partent verbatim et rien n'est rééchantillonné"
     );
 }
 
