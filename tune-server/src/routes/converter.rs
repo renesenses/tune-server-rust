@@ -125,16 +125,32 @@ struct ConvertJob {
 
 type JobStore = Arc<Mutex<HashMap<String, Arc<Mutex<ConvertJob>>>>>;
 
+/// L'étiquette du chantier dans le nom de la racine de travail. C'est elle
+/// qui dit, devant un résidu retrouvé un mois plus tard, à quoi il servait.
+const ETIQUETTE_TRAVAIL: &str = "tune-convert";
+
 /// Root of the per-job scratch directories the converter writes into.
 ///
 /// Single source of truth: the directory `start_job` creates and the one
 /// `/capabilities` announces must never drift apart (#2943).
-const CONVERT_OUTPUT_ROOT: &str = "/tmp/tune-convert";
+///
+/// ⚠️ C'était un littéral — `"/tmp/tune-convert"` — et c'est le défaut corrigé
+/// ici : un chemin FIXE est partagé par tous les comptes de la machine. Le
+/// premier venu le crée, les autres n'y écrivent plus jamais. Mesuré sur la
+/// machine de compilation, où il appartient à `jp` en 775 depuis le
+/// 18/09/2026 : `cargo test -p tune-server` y rougit pour tout autre
+/// utilisateur, sur `audio_offer_contract`, en « failed to create output dir:
+/// Permission denied ». Voir [`tune_core::chemins_de_travail`] pour le
+/// raisonnement complet, y compris pourquoi la production n'en voit rien
+/// (`PrivateTmp=yes`) et pourquoi `TMPDIR` est désormais respecté.
+fn convert_output_root() -> PathBuf {
+    tune_core::chemins_de_travail::racine_de_travail(ETIQUETTE_TRAVAIL)
+}
 
 /// Where one job's converted files land. Nothing is ever written outside of
 /// this directory — not into the library, not next to the source files.
 fn job_output_dir(job_id: &str) -> PathBuf {
-    PathBuf::from(CONVERT_OUTPUT_ROOT).join(job_id)
+    convert_output_root().join(job_id)
 }
 
 /// What the converter does with the result, and what it promises not to touch.
@@ -166,7 +182,10 @@ fn delivery_descriptor(racines: &[String]) -> Value {
         // The result leaves the server as a single downloadable archive.
         "mode": "zip_download",
         // Server-side scratch root; per job, a `{output_root}/{job_id}` dir.
-        "output_root": CONVERT_OUTPUT_ROOT,
+        // Propre à l'utilisateur qui fait tourner le serveur : l'écran lit
+        // donc le chemin RÉEL, et non un littéral qui serait faux dès que
+        // deux comptes se partagent la machine.
+        "output_root": convert_output_root().to_string_lossy(),
         // The two questions the screen must be able to answer up front.
         "writes_to_library": false,
         "modifies_sources": false,
@@ -1869,7 +1888,10 @@ mod tests {
             d["mode"], "zip_download",
             "le résultat sort en archive téléchargeable, l'écran doit pouvoir le dire"
         );
-        assert_eq!(d["output_root"], CONVERT_OUTPUT_ROOT);
+        assert_eq!(
+            d["output_root"],
+            convert_output_root().to_string_lossy().as_ref()
+        );
         assert_eq!(
             d["writes_to_library"], false,
             "la bibliothèque n'est ni modifiée ni dupliquée"
@@ -1931,12 +1953,15 @@ mod tests {
         let job_id = "11111111-2222-3333-4444-555555555555";
         assert_eq!(
             job_output_dir(job_id),
-            PathBuf::from(CONVERT_OUTPUT_ROOT).join(job_id),
+            convert_output_root().join(job_id),
             "la sortie par défaut a bougé"
         );
         let d = delivery_descriptor(&[]);
         assert_eq!(d["mode"], "zip_download");
-        assert_eq!(d["output_root"], CONVERT_OUTPUT_ROOT);
+        assert_eq!(
+            d["output_root"],
+            convert_output_root().to_string_lossy().as_ref()
+        );
         assert_eq!(d["writes_to_library"], false);
         assert_eq!(d["modifies_sources"], false);
     }
@@ -1969,7 +1994,10 @@ mod tests {
         assert_eq!(d["destination"]["roots"], json!(["/mnt/musique"]));
         // Et le mode par défaut n'a pas bougé pour autant.
         assert_eq!(d["mode"], "zip_download");
-        assert_eq!(d["output_root"], CONVERT_OUTPUT_ROOT);
+        assert_eq!(
+            d["output_root"],
+            convert_output_root().to_string_lossy().as_ref()
+        );
     }
 
     /// La carte web commitée, la même que lit `tests/web_response_contracts.rs`.
@@ -2010,7 +2038,7 @@ mod tests {
             completed,
             current_file: "02 - Chelsea Girl.flac".into(),
             errors: Vec::new(),
-            output_dir: PathBuf::from("/tmp/tune-convert/temoin"),
+            output_dir: convert_output_root().join("temoin"),
             output_bytes: 128_400_000,
             destination_serveur: false,
         }

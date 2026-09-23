@@ -30,6 +30,22 @@ use tune_core::db::track_repo::TrackRepo;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// L'étiquette du chantier dans le nom de la racine de travail.
+const ETIQUETTE_TRAVAIL: &str = "tune-declick";
+
+/// Racine des dossiers de travail du dé-ploc, **propre à l'utilisateur**.
+///
+/// C'était `format!("/tmp/tune-declick/{job_id}")` : le même défaut que le
+/// convertisseur, écrit par recopie. Un chemin fixe appartient au premier
+/// compte qui le crée et devient inaccessible à tous les autres sur la même
+/// machine. Les deux routes se corrigent ensemble parce que le geste est le
+/// même — et parce que le même test les traverse toutes les deux
+/// (`tune-server/tests/audio_offer_contract.rs`).
+/// Voir [`tune_core::chemins_de_travail`].
+fn declick_output_root() -> PathBuf {
+    tune_core::chemins_de_travail::racine_de_travail(ETIQUETTE_TRAVAIL)
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -219,7 +235,7 @@ async fn start_job(
 
     let total = file_paths.len();
     let job_id = uuid::Uuid::new_v4().to_string();
-    let output_dir = PathBuf::from(format!("/tmp/tune-declick/{}", job_id));
+    let output_dir = declick_output_root().join(&job_id);
     tokio::fs::create_dir_all(&output_dir)
         .await
         .map_err(|e| AppError::internal(format!("failed to create output dir: {e}")))?;
