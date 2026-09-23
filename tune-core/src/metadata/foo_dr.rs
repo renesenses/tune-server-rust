@@ -162,6 +162,17 @@ pub struct RapportDr {
     /// RAPPORT d'un texte où des lignes ressemblent à des mesures — voir
     /// [`RapportDr::est_signe`].
     pub entete: bool,
+    /// Le dossier que le mesureur dit avoir analysé, quand il l'écrit —
+    /// `Folder Path:` chez DROffline MkII (#4352). Le TT DR ne l'écrit pas,
+    /// et le rapport est alors `None`.
+    ///
+    /// Lu et conservé mais PAS encore exploité : [`rapport_voisin`] ne
+    /// cherche que dans le dossier de la piste, donc le chemin y est toujours
+    /// le bon. Il devient la clé d'appariement le jour où l'on indexera les
+    /// rapports d'un *Analysis Folder* commun à plusieurs albums — ce que le
+    /// manuel MAAT autorise et que Tune ne sait pas faire. Le jeter
+    /// maintenant obligerait à réécrire l'analyseur à ce moment-là.
+    pub dossier_source: Option<String>,
 }
 
 /// `01-Titre`, `01. Titre`, `01 - Titre`, `01 Titre`, `01_Titre`.
@@ -1163,5 +1174,168 @@ DR14      -0.20 dBFS  -16.53 dBFS    4:12 03 - Silverside.flac\n",
              DeaDBeeF (Miles Davis, DR13). Relevé : {r:?}"
         );
         assert_eq!(r.lignes[0].titre, "Foil");
+    }
+
+    const DROFFLINE_ABBEY: &str = r#"
+Folder Path:   /Volumes/music-1/00_music/studio_masters/GoGo Penguin/Live At Abbey Road EP
+
+                  File Name | Format |  SR | Word Length | Max. TPL |  LUFSi | DR (PMF) | 
+
+ 01 - Branches Break (Live) |  .flac | 48k |          24 |    -0.37 | -12.01 |        7 | 
+      02 - GBFISYSIH (Live) |  .flac | 48k |          24 |    -0.37 | -16.21 |       11 | 
+       03 - Initiate (Live) |  .flac | 48k |          24 |    -0.39 | -10.25 |        7 | 
+04 - Ocean In A Drop (Live) |  .flac | 48k |          24 |    -0.32 | -11.49 |        7 | 
+
+Number of EP/Album Files: 4
+Official EP/Album DR: 8"#;
+
+    const DROFFLINE_HOPE: &str = r#"
+Folder Path:   /Users/ludovicaudoin/Downloads/Qobuz Download/Ezra Collective/Here Because of Hope
+
+             File Name | Format |  SR | Word Length | Max. TPL |  LUFSi | DR (PMF) | 
+
+           01 - Part 1 |   .aif | 48k |          24 |    -4.01 | -18.66 |       15 | 
+02 - Blow Your Trumpet |   .aif | 48k |          24 |    -0.11 | -10.68 |        6 | 
+       03 - Sweet Echo |   .aif | 48k |          24 |    -0.11 |  -9.68 |        7 | 
+      04 - Don't Worry |   .aif | 48k |          24 |    -0.11 |  -9.44 |        7 | 
+        05 - Only Love |   .aif | 48k |          24 |    -0.11 |  -9.87 |        6 | 
+          06 - Someday |   .aif | 48k |          24 |    -0.11 |  -9.68 |        7 | 
+           07 - Part 2 |   .aif | 48k |          24 |    -4.02 | -18.29 |       13 | 
+     08 - Birdie Sings |   .aif | 48k |          24 |    -0.11 |  -9.76 |        8 | 
+   09 - The Last Stand |   .aif | 48k |          24 |    -0.11 |  -8.89 |        7 | 
+   10 - Well Organised |   .aif | 48k |          24 |    -0.11 | -10.32 |        7 | 
+       11 - El Corazón |   .aif | 48k |          24 |    -0.11 |  -9.63 |        8 | 
+12 - Bunny on the Rise |   .aif | 48k |          24 |    -0.11 |  -8.95 |        7 | 
+           13 - Part 3 |   .aif | 48k |          24 |    -4.01 | -18.55 |       15 | 
+       14 - All I Need |   .aif | 48k |          24 |    -0.11 | -11.94 |        9 | 
+  15 - Jubilee Feeling |   .aif | 48k |          24 |    -0.11 | -10.41 |        7 | 
+       16 - Black Flag |   .aif | 48k |          24 |    -0.11 | -10.00 |        7 | 
+        17 - Most High |   .aif | 48k |          24 |    -0.11 | -11.15 |        8 | 
+
+Number of EP/Album Files: 17
+Official EP/Album DR: 8"#;
+
+    /// Un tableau à barres verticales qui n'est PAS un rapport DR : même
+    /// forme, aucune colonne DR. Il ne doit devenir ni un rapport, ni un
+    /// candidat retenu par la découverte.
+    const TABLEAU_SANS_DR: &str = "\
+                  File Name | Format |  SR | Word Length |\n\
+ 01 - Branches Break (Live) |  .flac | 48k |          24 |\n\
+      02 - GBFISYSIH (Live) |  .flac | 48k |          24 |\n";
+
+    /// Le rapport DROffline MkII de Patatorz, **mot pour mot** (réponse 6568
+    /// du fil 1781, `Live At Abbey Road EP_log.txt`, 601 octets, LF, aucune
+    /// tabulation et aucune virgule). Mesuré le 20/09 sur le module livré :
+    /// `lignes=0 dr_album=None entete=false` — même renommé `foo_dr.txt`.
+    #[test]
+    fn lit_le_rapport_droffline_mkii_de_patatorz_4352() {
+        let r = analyser(DROFFLINE_ABBEY);
+        assert_eq!(
+            r.lignes.len(),
+            4,
+            "les quatre pistes de l'EP. Relevé : {r:#?}"
+        );
+        assert_eq!(r.dr_album, Some(8), "`Official EP/Album DR: 8`");
+        assert!(
+            r.entete,
+            "l'en-tête `File Name | … | DR (PMF) |` signe le rapport"
+        );
+        assert!(r.est_signe(), "sans signature, un nom inconnu reste fermé");
+        assert_eq!(
+            r.dossier_source.as_deref(),
+            Some("/Volumes/music-1/00_music/studio_masters/GoGo Penguin/Live At Abbey Road EP"),
+            "`Folder Path:` est la clé d'appariement d'un rapport posé ailleurs"
+        );
+        let numeros: Vec<Option<u32>> = r.lignes.iter().map(|l| l.numero).collect();
+        assert_eq!(
+            numeros,
+            vec![Some(1), Some(2), Some(3), Some(4)],
+            "la colonne `File Name` porte `NN - Titre`"
+        );
+        let drs: Vec<u8> = r.lignes.iter().map(|l| l.dr).collect();
+        assert_eq!(
+            drs,
+            vec![7, 11, 7, 7],
+            "la valeur DR est en DERNIÈRE colonne, en entier nu, sans préfixe `DR`"
+        );
+        assert_eq!(r.lignes[0].titre, "Branches Break (Live)");
+        assert_eq!(r.lignes[3].titre, "Ocean In A Drop (Live)");
+        assert!(
+            r.lignes.iter().all(|l| !l.tronque && !l.multicanal),
+            "DROffline ne tronque pas les titres et n'écrit pas de colonnes par canal"
+        );
+    }
+
+    /// Le second rapport de la même réponse : 17 pistes `.aif`, un titre
+    /// accentué (`El Corazón`) qui prouve le décodage UTF-8, et une colonne
+    /// `File Name` dont le rembourrage est DIFFÉRENT du premier fichier
+    /// (13 espaces contre 18) — la largeur dépend du plus long titre et ne
+    /// peut donc pas être codée en dur.
+    #[test]
+    fn lit_le_second_rapport_droffline_et_ses_dix_sept_pistes_4352() {
+        let r = analyser(DROFFLINE_HOPE);
+        assert_eq!(r.lignes.len(), 17, "Relevé : {r:#?}");
+        assert_eq!(r.dr_album, Some(8));
+        assert_eq!(r.lignes[0].titre, "Part 1");
+        assert_eq!(r.lignes[0].dr, 15);
+        assert_eq!(r.lignes[10].numero, Some(11));
+        assert_eq!(r.lignes[10].titre, "El Corazón");
+        assert_eq!(r.lignes[10].dr, 8);
+        assert_eq!(r.lignes[16].numero, Some(17));
+        assert_eq!(r.lignes[16].dr, 8);
+        assert_eq!(
+            r.dossier_source.as_deref(),
+            Some(
+                "/Users/ludovicaudoin/Downloads/Qobuz Download/Ezra Collective/Here Because of Hope"
+            )
+        );
+    }
+
+    /// L'appariement d'une piste, une fois le rapport lu : par numéro, et par
+    /// titre quand le fichier n'a pas de numéro de piste.
+    #[test]
+    fn apparie_une_piste_du_rapport_droffline_4352() {
+        let r = analyser(DROFFLINE_ABBEY);
+        assert_eq!(r.dr_pour_la_piste(Some(2), None, None, Some(2)), Some(11));
+        assert_eq!(
+            r.dr_pour_la_piste(None, None, Some("Ocean In A Drop (Live)"), Some(2)),
+            Some(7)
+        );
+        assert_eq!(
+            r.dr_pour_la_piste(Some(9), None, Some("Pas dans le rapport"), Some(2)),
+            None,
+            "une piste absente du rapport ne prend pas le DR d'une autre"
+        );
+    }
+
+    /// La découverte : le fichier porte le nom que DROffline lui a donné —
+    /// `<nom du dossier d'album>_log.txt` — qui n'est PAS un nom établi. Il
+    /// passe par la porte des candidats, et c'est sa SIGNATURE qui l'ouvre.
+    #[test]
+    fn trouve_le_rapport_droffline_sous_son_vrai_nom_4352() {
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-droffline");
+        std::fs::write(
+            dossier.join("Live At Abbey Road EP_log.txt"),
+            DROFFLINE_ABBEY,
+        )
+        .unwrap();
+        let r = rapport_voisin(&audio)
+            .expect("#4352 — un rapport DROffline MkII signé est retenu sous n'importe quel nom");
+        assert_eq!(r.lignes.len(), 4);
+        assert_eq!(r.dr_album, Some(8));
+    }
+
+    /// Le garde-fou : un tableau à barres verticales SANS colonne DR n'est ni
+    /// lu ni retenu. Sans lui, n'importe quel tableau texte d'un dossier
+    /// d'album deviendrait une source de plage dynamique.
+    #[test]
+    fn un_tableau_a_barres_sans_colonne_dr_n_est_pas_un_rapport_4352() {
+        let r = analyser(TABLEAU_SANS_DR);
+        assert!(r.lignes.is_empty(), "Relevé : {r:#?}");
+        assert!(!r.est_signe());
+
+        let (dossier, audio) = dossier_avec_audio("foo-dr-4352-tableau");
+        std::fs::write(dossier.join("liste des pistes.txt"), TABLEAU_SANS_DR).unwrap();
+        assert!(rapport_voisin(&audio).is_none());
     }
 }
