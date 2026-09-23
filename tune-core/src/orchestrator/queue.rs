@@ -6,6 +6,8 @@ impl PlaybackOrchestrator {
     /// previously prepared session doesn't leak.
     pub(super) async fn cleanup_gapless_session(&self, zone_id: i64) {
         let old_sid = self.gapless_sessions.lock().await.remove(&zone_id);
+        // #3365 — la qualité rangée avec ce flux part avec lui.
+        self.ranger_la_qualite_pre_armee(zone_id, None).await;
         if let Some(ref sid) = old_sid {
             self.streamer.remove_session(sid).await;
             debug!(zone_id, stream_id = %sid, "gapless_session_cleaned_up");
@@ -698,6 +700,18 @@ impl PlaybackOrchestrator {
             } else {
                 source
             };
+            // #3365 — la qualité que `resolve_stream` a rendue à l'armement de
+            // CE flux, par les mêmes règles que le démarrage
+            // (`composer_le_now_playing`). Sans elle, `..Default::default()`
+            // posait `None` et l'album Qobuz de Serge passait de 192/24 à
+            // « 44,1 / 16 » (repli du chemin du signal) dès la piste 2.
+            // Rien d'armé, ou armé pour un autre flux : `None`, pas un chiffre.
+            let qualite = self
+                .reprendre_la_qualite_pre_armee(zone_id, flux_adopte.as_deref())
+                .await;
+            let (format, sample_rate, bit_depth, bitrate_kbps) = qualite
+                .map(|q| (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps))
+                .unwrap_or_default();
             crate::playback::NowPlaying {
                 track_id: None,
                 title: entry.title.clone().unwrap_or_default(),
@@ -710,6 +724,10 @@ impl PlaybackOrchestrator {
                 source_id: entry.source_id.clone(),
                 // #3442 — le `None` en dur qui perdait le flux pre-arme.
                 stream_id: flux_adopte.clone(),
+                format,
+                sample_rate,
+                bit_depth,
+                bitrate_kbps,
                 ..Default::default()
             }
         };
@@ -1036,6 +1054,18 @@ impl PlaybackOrchestrator {
                 .await
                 .insert(zone_id, sid.clone());
         }
+        // #3365 — la qualité que la première piste aurait annoncée pour ce
+        // flux, gardée jusqu'à ce que `advance_queue_metadata` l'adopte. Sans
+        // elle, la piste suivante d'un album Qobuz perdait 192/24.
+        self.ranger_la_qualite_pre_armee(
+            zone_id,
+            QualitePreArmee::d_un_flux_de_service(
+                req.source.as_deref().unwrap_or_default(),
+                req.source_id.as_deref(),
+                &resolved,
+            ),
+        )
+        .await;
         let raw_cover = cover.or(resolved.cover_url);
         Ok(ResolvedQueueItem {
             url: resolved.url,
