@@ -185,18 +185,18 @@ impl CrossfeedProcessor {
             let s = sample.clamp(-1.0, 1.0);
             match bit_depth {
                 16 => {
-                    let v = (s * 32767.0).round() as i16;
+                    let v = (s * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
                     pcm[o..o + 2].copy_from_slice(&v.to_le_bytes());
                 }
                 24 => {
-                    let v = (s * 8_388_607.0).round() as i32;
+                    let v = (s * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32;
                     let b = v.to_le_bytes();
                     pcm[o] = b[0];
                     pcm[o + 1] = b[1];
                     pcm[o + 2] = b[2];
                 }
                 32 => {
-                    let v = (s * 2_147_483_647.0).round() as i32;
+                    let v = (s * 2_147_483_648.0).round().clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
                     pcm[o..o + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 _ => {}

@@ -108,7 +108,7 @@ impl Processor for Instance {
                 }
                 self.engine.process_interleaved(scratch);
                 for (x, v) in s.iter_mut().zip(scratch.iter()) {
-                    *x = (v * 32767.0).round() as i16;
+                    *x = (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
                 }
             }
             SamplesMut::S24Le(s) => {
@@ -117,7 +117,7 @@ impl Processor for Instance {
                 }
                 self.engine.process_interleaved(scratch);
                 for (b, v) in s.as_chunks_mut::<3>().0.iter_mut().zip(scratch.iter()) {
-                    b.copy_from_slice(&((v * 8_388_607.0).round() as i32).to_le_bytes()[..3]);
+                    b.copy_from_slice(&((v * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32).to_le_bytes()[..3]);
                 }
             }
             SamplesMut::S32(s) => {
@@ -126,7 +126,7 @@ impl Processor for Instance {
                 }
                 self.engine.process_interleaved(scratch);
                 for (x, v) in s.iter_mut().zip(scratch.iter()) {
-                    *x = (v * 2_147_483_647.0).round() as i32;
+                    *x = (v * 2_147_483_648.0).round().clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
                 }
             }
             SamplesMut::F64(_) => return Err(Error::UnsupportedFormat),
