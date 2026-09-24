@@ -477,6 +477,10 @@ where
         )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
+        .route(
+            "/{service}/tracks/{track_id}/similar",
+            get(service_track_similar),
+        )
         .route("/{service}/featured", get(service_featured))
         .route(
             "/{service}/featured/sections",
@@ -1182,6 +1186,104 @@ async fn service_logout(
     // Le compte change : ses listes ne doivent pas survivre à la session.
     purge_contenu_utilisateur(&service);
     Json(json!({ "service": service, "status": "logged_out" })).into_response()
+}
+
+/// Nombre de titres rendus par défaut par « Plus comme ça » sur un titre de
+/// service : un titre par artiste voisin, comme la radio.
+const PLUS_COMME_CA_PAR_DEFAUT: usize = 20;
+/// Plafond de `?limit=`. Chaque titre coûte un appel au service (les titres
+/// phares d'un voisin), faits l'un après l'autre : au-delà, le clic attend.
+const PLUS_COMME_CA_PLAFOND: usize = 50;
+
+#[derive(Deserialize)]
+struct SimilairesQuery {
+    limit: Option<usize>,
+}
+
+/// Le nombre de titres réellement demandé : absent → le défaut, `0` → au
+/// moins un, trop grand → le plafond.
+fn borne_plus_comme_ca(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(PLUS_COMME_CA_PAR_DEFAUT)
+        .clamp(1, PLUS_COMME_CA_PLAFOND)
+}
+
+/// `GET /{service}/tracks/{track_id}/similar` — « Plus comme ça » sur un titre
+/// de service. Fil 1906 (FabienM), point 3.
+///
+/// Même algorithme que la reprise automatique de fin de file (voir
+/// `tune_core::playback::auto_dj::pistes_similaires_du_service`) : l'artiste
+/// du titre, ses voisins, un titre phare par voisin, le titre source exclu.
+/// La réponse est une liste de pistes au format des autres routes streaming
+/// (`StreamTrack`), que le client lit ou enfile comme d'habitude.
+///
+/// Réponses :
+///  - 404 : service inconnu (comme toutes les routes `/{service}/…`) ;
+///  - 501 : le service ne connaît pas ses artistes similaires — aujourd'hui,
+///    tous sauf Qobuz. Un refus DIT, pas une liste vide qui laisserait croire
+///    à un artiste sans voisin ;
+///  - 502 : le titre source n'a pas pu être lu chez le service ;
+///  - 200 `[]` : aucun voisin trouvé — une réponse, pas une panne.
+///
+/// Titres bannis : la radio n'en exclut aucun sur cette base (la fonction
+/// `banned` de #4818 n'y est pas) ; la route suit la radio.
+async fn service_track_similar(
+    State(state): State<StreamingHttpState>,
+    Path((service, track_id)): Path<(String, String)>,
+    Query(q): Query<SimilairesQuery>,
+) -> Response {
+    let arc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // Le verrou de lecture est RELÂCHÉ avant la recherche des voisins, qui
+    // reprend le sien à chaque appel : le garder ici laisserait un écrivain en
+    // attente (rafraîchissement de jeton) bloquer toute la requête.
+    let source = {
+        let svc = arc.read().await;
+        if !svc.propose_des_artistes_similaires() {
+            return svc_response::<Vec<tune_core::streaming::traits::StreamTrack>>(Err(
+                tune_core::TuneError::Unsupported(format!(
+                    "{service} ne fournit pas d'artistes similaires : « Plus comme ça » \
+                     n'est pas disponible pour ce service"
+                )),
+            ));
+        }
+        match svc.get_track(&track_id).await {
+            Ok(piste) => piste,
+            Err(e) => {
+                return svc_response::<Vec<tune_core::streaming::traits::StreamTrack>>(Err(e));
+            }
+        }
+    };
+    let borne = borne_plus_comme_ca(q.limit);
+    let noms =
+        tune_core::playback::auto_dj::similar_artist_names(&state.backend, &source.artist, borne)
+            .await;
+    let mut exclure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    exclure.insert(track_id.clone());
+    if !source.id.is_empty() {
+        exclure.insert(source.id.clone());
+    }
+    let similaires = tune_core::playback::auto_dj::pistes_similaires_du_service(
+        &arc,
+        &source.artist,
+        source.artist_id.as_deref(),
+        noms,
+        borne,
+        borne,
+        &exclure,
+    )
+    .await;
+    tracing::info!(
+        service = %service,
+        track_id = %track_id,
+        candidats = similaires.candidats,
+        depuis_enrichissement = similaires.depuis_enrichissement,
+        pistes = similaires.pistes.len(),
+        "plus_comme_ca_service"
+    );
+    svc_response(Ok(similaires.pistes))
 }
 
 async fn service_track_url(

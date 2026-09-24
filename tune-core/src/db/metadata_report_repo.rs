@@ -33,8 +33,26 @@ pub const REPORT_ENTITIES: &[&str] = &[
 ];
 
 /// Engine-agnostic SQL builders for metadata_report_repo.
+/// Le champ sous lequel un signalement `artist_image` garde l'EMPREINTE
+/// (SHA-256 des octets, [`crate::library::artwork::content_hash`]) de l'image
+/// rejetée (#4837). Local seulement : l'envoi au dépôt communautaire reprend
+/// le corps de la requête, pas cette ligne.
+pub const CHAMP_EMPREINTE_IMAGE: &str = "image_sha256";
+
 pub mod sql {
     use super::SqlDialect;
+
+    /// Empreintes des images d'artiste rejetées, par artiste local OU par MBID.
+    pub fn empreintes_rejetees<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT DISTINCT value FROM metadata_reports \
+             WHERE entity = 'artist_image' AND field = '{}' AND value IS NOT NULL \
+             AND (entity_id = {} OR (mbid IS NOT NULL AND mbid <> '' AND mbid = {}))",
+            super::CHAMP_EMPREINTE_IMAGE,
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -177,6 +195,27 @@ impl MetadataReportRepo {
         let params: [&dyn ToSqlValue; 2] = [&pushed_at, &id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Les empreintes des images que l'utilisateur a rejetées pour cet artiste
+    /// (#4837) — par son id local ou par son MBID, pour qu'un rejet survive à
+    /// la recréation de la ligne `artists` (scan, fusion). Une passe
+    /// d'enrichissement ne repose JAMAIS une image dont l'empreinte est ici.
+    pub fn empreintes_d_image_rejetees(
+        &self,
+        artist_id: Option<i64>,
+        mbid: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let sql = self.dialect_sql(sql::empreintes_rejetees, sql::empreintes_rejetees);
+        let id = artist_id.unwrap_or(-1);
+        let mbid = mbid.unwrap_or("");
+        let params: [&dyn ToSqlValue; 2] = [&id, &mbid];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .into_iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
+            .collect())
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {

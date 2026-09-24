@@ -267,7 +267,10 @@ async fn get_tracks(
     let tracks = TrackRepo::with_backend(state.backend.clone())
         .get_multiple(&track_ids)
         .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(json!(tracks)))
+    // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
+    let mut items: Vec<Value> = tracks.iter().map(|t| t.to_json()).collect();
+    crate::routes::library::attacher_banni(&state, profile.id(), &mut items);
+    Ok(Json(json!(items)))
 }
 
 async fn add_tracks(

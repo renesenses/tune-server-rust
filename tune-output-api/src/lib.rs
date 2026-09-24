@@ -515,6 +515,18 @@ pub struct RingStarvation {
     /// Échantillons entrelacés par seconde (taux × canaux). Posé hors du
     /// rappel par [`begin_stream`](Self::begin_stream).
     samples_per_second: AtomicU32,
+    /// Fil 1908 (Didier) — échantillons entrelacés ÉCRITS dans l'anneau et pas
+    /// encore tirés par le pilote, relevés à chaque écriture et à chaque
+    /// lecture. C'est l'avance de la position rapportée sur le son : la
+    /// sortie locale compte ce qu'elle a POUSSÉ, et l'anneau en garde jusqu'à
+    /// deux secondes. Voir [`position_audible_ms`](Self::position_audible_ms).
+    en_attente: AtomicU64,
+    /// Le producteur a fini d'écrire et attend que l'anneau se vide : pendant
+    /// ce vidage, la sortie rapporte DÉJÀ la position jouée (alimenté − anneau),
+    /// il ne faut pas retrancher l'anneau une seconde fois. Levé par
+    /// [`marquer_le_vidage`](Self::marquer_le_vidage), retombé à la première
+    /// écriture.
+    en_vidage: AtomicBool,
 }
 
 impl RingStarvation {
@@ -534,6 +546,64 @@ impl RingStarvation {
             sample_rate.saturating_mul(u32::from(channels)),
             Ordering::Relaxed,
         );
+        self.en_attente.store(0, Ordering::Relaxed);
+        self.en_vidage.store(false, Ordering::Relaxed);
+    }
+
+    /// Fil 1908 — relever ce que l'anneau contient APRÈS une écriture.
+    /// Appelé par le producteur ; il écrit, donc il ne vide plus.
+    #[inline]
+    pub fn noter_alimentation(&self, en_attente: usize) {
+        self.en_attente.store(en_attente as u64, Ordering::Relaxed);
+        self.en_vidage.store(false, Ordering::Relaxed);
+    }
+
+    /// Fil 1908 — relever ce que l'anneau contient APRÈS une lecture.
+    ///
+    /// Chemin temps réel (appelé depuis le rappel du pilote) : un seul
+    /// atomique `Relaxed`, comme [`record`](Self::record). Producteur et
+    /// rappel écrivent chacun la valeur qu'ils ont vue ; la dernière écriture
+    /// gagne, et l'écart est borné par une période ou un bloc — quelques
+    /// millisecondes contre les deux secondes que cette mesure corrige.
+    #[inline]
+    pub fn noter_en_attente(&self, en_attente: usize) {
+        self.en_attente.store(en_attente as u64, Ordering::Relaxed);
+    }
+
+    /// Fil 1908 — le producteur entre dans le vidage de fin de piste, où la
+    /// sortie rapporte déjà la position JOUÉE. Hors chemin temps réel.
+    pub fn marquer_le_vidage(&self) {
+        self.en_vidage.store(true, Ordering::Relaxed);
+    }
+
+    /// Durée d'audio écrite dans l'anneau et pas encore partie au pilote, en
+    /// millisecondes. `None` tant qu'aucun flux n'est armé (cadence inconnue).
+    ///
+    /// Ce n'est PAS toute la latence jusqu'au DAC : le tampon propre du
+    /// pilote (période WASAPI, CoreAudio, ALSA — de l'ordre de 10 à 50 ms)
+    /// n'est pas vu d'ici. C'est la part qui se compte en secondes.
+    pub fn latence_anneau_ms(&self) -> Option<u64> {
+        let cadence = u64::from(self.samples_per_second.load(Ordering::Relaxed));
+        if cadence == 0 {
+            return None;
+        }
+        Some(self.en_attente.load(Ordering::Relaxed).saturating_mul(1000) / cadence)
+    }
+
+    /// La position que l'on ENTEND, à partir de celle que la sortie rapporte.
+    ///
+    /// Fil 1908 (Didier, SMSL SU-8 en USB, Windows) : « l'analyseur est une à
+    /// deux secondes en avance sur la sortie audio ». La sortie locale
+    /// rapporte la position ALIMENTÉE — ce qu'elle a poussé dans un anneau de
+    /// deux secondes (`taux × canaux × 2`) — et les niveaux se calaient
+    /// dessus. Retrancher ce qui attend encore dans l'anneau rend la position
+    /// du son, sauf pendant le vidage de fin de piste, où la sortie a déjà
+    /// fait ce calcul elle-même.
+    pub fn position_audible_ms(&self, position_rapportee_ms: u64) -> u64 {
+        if self.en_vidage.load(Ordering::Relaxed) {
+            return position_rapportee_ms;
+        }
+        position_rapportee_ms.saturating_sub(self.latence_anneau_ms().unwrap_or(0))
     }
 
     /// Comptabiliser UN rappel : `demande` = ce que le pilote a réclamé,
@@ -634,6 +704,60 @@ impl RingStarvation {
                 served.saturating_mul(1000) / cadence
             },
         }
+    }
+}
+
+/// Fil 1908 (Didier) — la position que l'on entend n'est pas celle qu'on a
+/// poussée. Exécuté à chaque PR, comme `famine_pilote_3205` ci-dessous.
+#[cfg(test)]
+mod position_audible_1908 {
+    use super::*;
+
+    /// L'anneau d'une sortie locale tient deux secondes (`taux × canaux × 2`).
+    /// Plein, il retarde le son de deux secondes sur la position alimentée.
+    #[test]
+    fn un_anneau_plein_retarde_le_son_de_sa_contenance() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(96_000, 2);
+        compteur.noter_alimentation(96_000 * 2 * 2);
+        assert_eq!(compteur.latence_anneau_ms(), Some(2_000));
+        assert_eq!(
+            compteur.position_audible_ms(62_000),
+            60_000,
+            "la position alimentée (62 s) passait pour la position jouée : \
+             tout ce qui s'y cale — l'analyseur de spectre du fil 1908 — \
+             devance le son de la contenance de l'anneau"
+        );
+        // Le rappel tire une demi-seconde : le son rattrape d'autant.
+        compteur.noter_en_attente(96_000 * 2 * 3 / 2);
+        assert_eq!(compteur.position_audible_ms(62_000), 60_500);
+    }
+
+    /// Pendant le vidage, la sortie rapporte DÉJÀ alimenté − anneau.
+    /// Retrancher encore l'anneau mettrait le son deux secondes trop tôt.
+    #[test]
+    fn le_vidage_ne_retranche_pas_l_anneau_deux_fois() {
+        let compteur = RingStarvation::new();
+        compteur.begin_stream(44_100, 2);
+        compteur.noter_alimentation(44_100 * 2);
+        compteur.marquer_le_vidage();
+        assert_eq!(compteur.position_audible_ms(10_000), 10_000);
+        // Une écriture = la piste suivante s'alimente : on retranche de nouveau.
+        compteur.noter_alimentation(44_100 * 2);
+        assert_eq!(compteur.position_audible_ms(10_000), 9_000);
+    }
+
+    /// Sans flux armé, la cadence est inconnue : on ne corrige rien plutôt
+    /// que d'inventer une latence.
+    #[test]
+    fn sans_flux_arme_aucune_latence_n_est_inventee() {
+        let compteur = RingStarvation::new();
+        compteur.noter_en_attente(1_000_000);
+        assert_eq!(compteur.latence_anneau_ms(), None);
+        assert_eq!(compteur.position_audible_ms(5_000), 5_000);
+        // Un nouveau flux repart d'un anneau vide.
+        compteur.begin_stream(48_000, 2);
+        assert_eq!(compteur.latence_anneau_ms(), Some(0));
     }
 }
 

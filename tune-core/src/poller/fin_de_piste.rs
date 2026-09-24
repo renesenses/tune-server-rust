@@ -380,11 +380,23 @@ impl PositionPoller {
         // enjambées d'un coup, et dites en nommant le serveur, plutôt qu'une
         // à une par la boucle d'échecs ci-dessous (qui ne dit que le motif
         // brut, et s'arrête au 25e).
-        let mut attempt_pos = self
+        let attempt_pos = self
             .orchestrator
             .enjamber_les_serveurs_absents(zone_id, next_pos)
             .await
             .map_or(next_pos, |(position, _)| position);
+        // #4806 — les titres BANNIS sont sautés AVANT toute tentative : ce ne
+        // sont pas des échecs, ils ne consomment aucun des deux budgets
+        // ci-dessous. Si tout ce qui restait était banni, la file est finie.
+        let mut attempt_pos = match self
+            .orchestrator
+            .enjamber_les_pistes_bannies(zone_id, attempt_pos)
+            .await
+        {
+            crate::orchestrator::Enjambee::Rien => attempt_pos,
+            crate::orchestrator::Enjambee::Reprise(p) => p,
+            crate::orchestrator::Enjambee::FileEpuisee => return false,
+        };
         // 🔴 DEUX compteurs, et c'est tout le correctif (Bertrand, 21/09/2026 :
         // « la lecture d'une playlist s'arrête sur un morceau non trouvé »).
         //

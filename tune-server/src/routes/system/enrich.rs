@@ -410,6 +410,143 @@ pub(super) async fn enrich_release_types(State(state): State<AppState>) -> impl 
 }
 
 // ---------------------------------------------------------------------------
+// POST|GET /system/enrich-credits — crédits MusicBrainz par disque (#4767)
+// ---------------------------------------------------------------------------
+
+/// Corps optionnel de `POST /system/enrich-credits`.
+#[derive(serde::Deserialize, Default)]
+pub(super) struct CorpsEnrichCreditsReleases {
+    /// `true` : oublier les curseurs et réinterroger TOUS les disques qui ont
+    /// un `musicbrainz_release_id`. Par défaut, seuls ceux jamais interrogés.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Remplit `track_credits` depuis MusicBrainz, UNE requête par disque.
+///
+/// Sans ces crédits, « Collaborations » et « Reprises » de la page artiste
+/// n'ont rien à lire : `track_credits` est VIDE en pratique (mesure du
+/// 23/09/2026 sur le .18).
+///
+/// Même modèle que `enrich-release-types` : barrière d'enrichissement
+/// (premium / quota), tâche de fond au registre RAII (`background_tasks`),
+/// pause de l'enrichissement respectée. En plus : l'avancement est persisté et
+/// relu par `GET`, la passe est REPRENABLE (curseur `albums.credits_mb_at`
+/// posé disque par disque) et une seconde demande pendant qu'elle tourne est
+/// refusée (409) plutôt que de lancer un second flux vers MusicBrainz.
+///
+/// Coût annoncé AVANT de lancer : `candidats` = disques à interroger = nombre
+/// de requêtes, à une par seconde (limiteur MusicBrainz partagé).
+pub(super) async fn enrich_credits_releases(
+    State(state): State<AppState>,
+    corps: Option<Json<CorpsEnrichCreditsReleases>>,
+) -> axum::response::Response {
+    use tune_core::metadata::credits_release as cr;
+
+    let force = corps.map(|Json(c)| c.force).unwrap_or(false);
+    if state
+        .background_tasks
+        .snapshot()
+        .iter()
+        .any(|t| t.id == cr::TACHE_CREDITS_RELEASES)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "status": "already_running" })),
+        )
+            .into_response();
+    }
+    let is_premium = match gate_enrichment(&state).await {
+        Ok(p) => p,
+        Err(resp) => return resp.into_response(),
+    };
+
+    if force {
+        cr::oublier_les_curseurs(&state.backend);
+    }
+    let candidats = cr::albums_candidats(&state.backend).len();
+    let avec_mbid = cr::albums_avec_mbid(&state.backend);
+    let task_id = uuid::Uuid::new_v4().to_string();
+
+    // Écrit AVANT le spawn : un client qui sonde juste après son 202 doit lire
+    // `running`, pas l'état de la passe précédente.
+    cr::publier(
+        &state.backend,
+        &cr::Avancement {
+            total: candidats,
+            ..Default::default()
+        },
+        "running",
+        &task_id,
+    );
+
+    let db = state.backend.clone();
+    let guard = state.background_tasks.begin(
+        cr::TACHE_CREDITS_RELEASES,
+        "Crédits MusicBrainz des albums…",
+        "enrichment",
+    );
+    let taches = state.background_tasks.clone();
+    let id_tache = task_id.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let sur_avancement = move |av: &cr::Avancement| {
+            taches.update_progress(
+                cr::TACHE_CREDITS_RELEASES,
+                av.processed as u64,
+                av.total as u64,
+                "Crédits",
+            );
+        };
+        cr::remplir_credits_depuis_musicbrainz(db, &id_tache, &sur_avancement).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "credits_enrichment_started",
+            "task_id": task_id,
+            "candidats": candidats,
+            "albums_avec_mbid": avec_mbid,
+            "force": force,
+            "premium": is_premium,
+        })),
+    )
+        .into_response()
+}
+
+/// `GET /system/enrich-credits` — état de la passe.
+///
+/// Toujours la même forme, repos compris : `status` (`idle`, `running`,
+/// `done`, `interrupted` après un redémarrage en cours de passe), les
+/// compteurs de la DERNIÈRE passe (`total`, `processed`, `enriched`,
+/// `tracks_credited`, `unmatched`, `unknown`, `errors`), et deux mesures
+/// prises à l'instant : `candidats` (disques encore à interroger) et
+/// `albums_avec_mbid` (le plafond de ce que la passe peut couvrir).
+pub(super) async fn enrich_credits_releases_status(State(state): State<AppState>) -> Json<Value> {
+    use tune_core::metadata::credits_release as cr;
+
+    let mut etat = SettingsRepo::with_backend(state.backend.clone())
+        .get(cr::REGLAGE_AVANCEMENT_CREDITS_RELEASES)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| cr::Avancement::default().en_json("idle", ""));
+    if let Some(o) = etat.as_object_mut() {
+        o.insert(
+            "candidats".into(),
+            json!(cr::albums_candidats(&state.backend).len()),
+        );
+        o.insert(
+            "albums_avec_mbid".into(),
+            json!(cr::albums_avec_mbid(&state.backend)),
+        );
+    }
+    Json(etat)
+}
+
+// ---------------------------------------------------------------------------
 // POST /system/enrich-metadata — extended file metadata extraction
 // ---------------------------------------------------------------------------
 
