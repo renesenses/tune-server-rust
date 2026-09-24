@@ -64,6 +64,11 @@ pub struct BilanCue {
     pub pistes_mises_a_jour: usize,
     /// Pistes virtuelles supprimées parce que leur fichier image a disparu.
     pub pistes_elaguees: usize,
+    /// Doublons résorbés : un même fichier portait DEUX lignes — une posée par
+    /// le scan ordinaire (avec `file_path`), une posée par la feuille (sans).
+    /// La seconde est retirée au profit de la première. C'est l'état mesuré le
+    /// 24/09/2026 sur le serveur .18, où 58 titres existaient deux fois.
+    pub doublons_resorbes: usize,
     /// Albums dont le titre a été réconcilié depuis le `TITLE` de la feuille.
     ///
     /// Compté à part des créations : un album CUE d'avant la 0.9.144 est titré
@@ -122,16 +127,55 @@ fn sonder_image(image: &Path) -> SondeImage {
     }
 }
 
+/// Cette piste occupe-t-elle un fichier ENTIER, à elle seule ?
+///
+/// Vrai quand elle est la seule tranche de son fichier, qu'elle démarre à zéro
+/// et qu'aucune fin ne la borne : il ne reste alors plus rien du fichier
+/// autour d'elle. C'est le cas de toute feuille « gapless » (un `FILE` par
+/// piste), et c'est ce qui autorise à lui poser un `file_path` — voir
+/// [`piste_en_ligne`].
+fn occupe_le_fichier_entier(piste: &PisteCue, tranches_du_fichier: usize) -> bool {
+    tranches_du_fichier == 1 && piste.debut_ms == 0 && piste.fin_ms.is_none()
+}
+
+/// Combien de tranches chaque fichier image porte, dans cet album.
+fn tranches_par_fichier(album: &AlbumCue) -> std::collections::HashMap<&Path, usize> {
+    let mut par_fichier = std::collections::HashMap::new();
+    for piste in &album.pistes {
+        *par_fichier.entry(piste.media.as_path()).or_insert(0) += 1;
+    }
+    par_fichier
+}
+
 /// La ligne `tracks` d'une piste virtuelle.
 ///
-/// `file_path` reste `NULL` : c'est ce qui autorise N pistes sur le même
-/// fichier sous la contrainte `UNIQUE` de `tracks.file_path`.
+/// `file_path` reste `NULL` **quand la piste est une tranche** : c'est ce qui
+/// autorise N pistes sur le même fichier sous la contrainte `UNIQUE` de
+/// `tracks.file_path`.
+///
+/// 🔴 **Mais une piste qui occupe un fichier ENTIER n'est pas une tranche.**
+/// Une feuille « gapless » décrit un fichier par piste : chaque ligne a
+/// `cue_start_ms = 0`, aucune fin, et un fichier pour elle seule. Lui refuser
+/// son `file_path` la rendait introuvable PAR CHEMIN — et c'est de là que
+/// viennent les deux symptômes opposés mesurés sur les serveurs de Bertrand :
+///
+/// - la ligne CUE est invisible au pré-filtre incrémental du scan (qui
+///   s'indexe sur `file_path`), donc le fichier peut être réindexé à part et
+///   le même titre existe DEUX fois ;
+/// - toutes les passes qui filtrent `file_path IS NOT NULL` (ReplayGain,
+///   paroles, écriture de balises) l'ignorent, alors que le fichier entier est
+///   exactement ce qu'elles savent traiter.
+///
+/// `file_mtime` et `file_size` l'accompagnent : sans eux, `file_needs_scan`
+/// conclurait « modifié » et le scan ordinaire relirait les balises du fichier
+/// par-dessus le titre de la feuille, à chaque passage.
 fn piste_en_ligne(
     piste: &PisteCue,
     album: &AlbumCue,
     album_id: Option<i64>,
     artist_id: Option<i64>,
     sonde: SondeImage,
+    fichier_entier: bool,
 ) -> Track {
     let titre = piste
         .titre
@@ -148,7 +192,15 @@ fn piste_en_ligne(
         .or_else(|| album.interprete.clone());
     t.album_artist = album.interprete.clone();
     t.track_number = piste.numero as i32;
-    t.file_path = None;
+    t.file_path = fichier_entier.then(|| piste.media.to_string_lossy().into_owned());
+    if fichier_entier && let Ok(meta) = std::fs::metadata(&piste.media) {
+        t.file_size = Some(meta.len() as i64);
+        t.file_mtime = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64());
+    }
     t.format = piste
         .media
         .extension()
@@ -182,6 +234,54 @@ fn duree_de_la_tranche(piste: &PisteCue, sonde: SondeImage) -> i64 {
         (None, None) => return 0,
     };
     (fin - debut).max(0)
+}
+
+/// Reprend, sur la ligne déjà en base, ce qu'une feuille CUE ne sait pas dire.
+///
+/// Une feuille porte des titres, des interprètes, un genre, une année. Elle ne
+/// porte NI empreinte audio, NI identifiant MusicBrainz, NI ISRC, NI tempo, NI
+/// pochette : tout cela vient de l'analyse du fichier et des passes
+/// d'enrichissement. Écraser la ligne avec une piste neuve les effacerait à
+/// chaque scan — et c'est exactement ce qui guette maintenant qu'une piste
+/// CUE peut ADOPTER une ligne posée par le scan ordinaire, laquelle est
+/// souvent enrichie depuis des mois.
+///
+/// On ne reprend jamais un champ que la feuille a rempli : le `TITLE` de la
+/// feuille reste le titre, c'est toute la raison d'être du module.
+fn reprendre_l_acquis(neuve: &mut Track, existante: &Track) {
+    if neuve.audio_hash.is_none() {
+        neuve.audio_hash = existante.audio_hash.clone();
+    }
+    if neuve.musicbrainz_recording_id.is_none() {
+        neuve.musicbrainz_recording_id = existante.musicbrainz_recording_id.clone();
+    }
+    if neuve.isrc.is_none() {
+        neuve.isrc = existante.isrc.clone();
+    }
+    if neuve.composer.is_none() {
+        neuve.composer = existante.composer.clone();
+    }
+    if neuve.bpm.is_none() {
+        neuve.bpm = existante.bpm;
+    }
+    if neuve.label.is_none() {
+        neuve.label = existante.label.clone();
+    }
+    if neuve.comments.is_none() {
+        neuve.comments = existante.comments.clone();
+    }
+    if neuve.cover_path.is_none() {
+        neuve.cover_path = existante.cover_path.clone();
+    }
+    if neuve.file_mtime.is_none() {
+        neuve.file_mtime = existante.file_mtime;
+    }
+    if neuve.file_size.is_none() {
+        neuve.file_size = existante.file_size;
+    }
+    if neuve.duration_ms <= 0 {
+        neuve.duration_ms = existante.duration_ms;
+    }
 }
 
 /// `REM DATE` porte parfois une date complète (`1981-03-12`) ou du bruit.
@@ -294,18 +394,81 @@ fn ecrire_album(
     let mut sondes: std::collections::HashMap<PathBuf, SondeImage> =
         std::collections::HashMap::new();
     let mut ecrites = 0usize;
+    let tranches = tranches_par_fichier(album);
+    // Les fichiers réellement DÉCOUPÉS — eux seuls doivent sortir du scan
+    // ordinaire. Un fichier occupé en entier par une seule piste garde son
+    // `file_path` : il reste vu par le scan, qui le reconnaîtra inchangé et
+    // passera son chemin. L'en retirer le ferait au contraire sortir de
+    // `discovered_paths`, et la purge effacerait la ligne qu'on vient d'écrire.
+    let mut images_decoupees: HashSet<PathBuf> = HashSet::new();
 
     for piste in &album.pistes {
         let sonde = *sondes
             .entry(piste.media.clone())
             .or_insert_with(|| sonder_image(&piste.media));
-        let mut ligne = piste_en_ligne(piste, album, ligne_album, artist_id, sonde);
+        let fichier_entier = occupe_le_fichier_entier(
+            piste,
+            tranches.get(piste.media.as_path()).copied().unwrap_or(1),
+        );
+        if !fichier_entier {
+            images_decoupees.insert(piste.media.clone());
+        }
+        let mut ligne = piste_en_ligne(piste, album, ligne_album, artist_id, sonde, fichier_entier);
         let media = ligne.cue_media_path.clone().unwrap_or_default();
         let debut = ligne.cue_start_ms.unwrap_or(0);
 
-        match track_repo.get_by_cue_identity(&media, debut) {
-            Ok(Some(existante)) => {
+        // DEUX identités peuvent désigner cette piste, et elles peuvent
+        // désigner DEUX lignes distinctes.
+        //
+        // - `(cue_media_path, cue_start_ms)` retrouve ce qu'un scan précédent
+        //   a posé depuis la feuille ;
+        // - `file_path` retrouve la ligne que le scan ordinaire avait créée
+        //   pour ce même fichier, avant que la feuille ne soit lue.
+        //
+        // Quand les deux répondent et qu'il s'agit de deux lignes, c'est
+        // exactement le doublon mesuré sur le serveur .18 : le même titre en
+        // double, une fois par chemin et une fois par feuille, invisibles l'un
+        // à l'autre. On garde CELLE QUI PORTE LE CHEMIN — c'est elle que
+        // protège `file_path UNIQUE`, elle que le pré-filtre incrémental voit,
+        // et elle qui porte l'enrichissement accumulé — et on retire l'autre.
+        // Sans ce choix, poser `file_path` sur la ligne CUE se ferait refuser
+        // par la contrainte et la piste serait perdue en silence.
+        let par_cue = match track_repo.get_by_cue_identity(&media, debut) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(media = %media, debut, error = %e, "cue_identite_illisible");
+                bilan.echecs += 1;
+                continue;
+            }
+        };
+        let par_chemin = if fichier_entier {
+            track_repo.get_by_path(&media).unwrap_or(None)
+        } else {
+            None
+        };
+        let deja_la = match (par_chemin, par_cue) {
+            (Some(chemin), Some(cue)) if chemin.id != cue.id => {
+                if let Some(id) = cue.id
+                    && track_repo.delete(id).is_ok()
+                {
+                    bilan.doublons_resorbes += 1;
+                    info!(
+                        media = %media,
+                        supprimee = id,
+                        gardee = ?chemin.id,
+                        "cue_doublon_resorbe — la ligne sans chemin est retirée au profit de celle qui en porte un"
+                    );
+                }
+                Some(chemin)
+            }
+            (Some(chemin), _) => Some(chemin),
+            (None, cue) => cue,
+        };
+
+        match deja_la {
+            Some(existante) => {
                 ligne.id = existante.id;
+                reprendre_l_acquis(&mut ligne, &existante);
                 match track_repo.update(&ligne) {
                     Ok(()) => {
                         bilan.pistes_mises_a_jour += 1;
@@ -317,7 +480,7 @@ fn ecrire_album(
                     }
                 }
             }
-            Ok(None) => match track_repo.create(&ligne) {
+            None => match track_repo.create(&ligne) {
                 Ok(_) => {
                     bilan.pistes_creees += 1;
                     ecrites += 1;
@@ -327,10 +490,6 @@ fn ecrire_album(
                     bilan.echecs += 1;
                 }
             },
-            Err(e) => {
-                warn!(media = %media, debut, error = %e, "cue_identite_illisible");
-                bilan.echecs += 1;
-            }
         }
     }
 
@@ -340,7 +499,7 @@ fn ecrire_album(
         // tranches : le scan ordinaire ne doit plus les indexer comme des
         // pistes à part entière, sinon le même disque existe deux fois — une
         // piste « image entière » de 74 minutes à côté de ses 15 tranches.
-        images_couvertes.extend(sondes.keys().cloned());
+        images_couvertes.extend(images_decoupees);
         if let Some(id) = ligne_album {
             let _ = album_repo.update_track_count(id);
         }
@@ -387,6 +546,7 @@ pub fn inventorier_et_ecrire(
             pistes_creees = bilan.pistes_creees,
             pistes_mises_a_jour = bilan.pistes_mises_a_jour,
             pistes_elaguees = bilan.pistes_elaguees,
+            doublons_resorbes = bilan.doublons_resorbes,
             echecs = bilan.echecs,
             images_couvertes = images_couvertes.len(),
             "scan_cue_tracks_written"

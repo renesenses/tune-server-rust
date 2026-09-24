@@ -21,12 +21,21 @@ pub struct CueTrack {
     pub title: Option<String>,
     /// Interprète de la piste, ou celui de l'album à défaut.
     pub performer: Option<String>,
-    /// Le `FILE` sous lequel cette piste est déclarée, tel qu'écrit dans la
+    /// Le `FILE` qui porte l'`INDEX 01` de cette piste, tel qu'écrit dans la
     /// feuille. Une feuille peut en enchaîner plusieurs — un `.cue` par face de
     /// vinyle est le cas courant, mais le format autorise aussi plusieurs
     /// `FILE` dans une seule feuille (rip piste-à-piste). Les temps sont alors
     /// relatifs à CE fichier, jamais à l'album : sans ce champ, les pistes du
     /// second fichier se superposeraient à celles du premier.
+    ///
+    /// 🔴 **C'est l'`INDEX 01` qui décide, pas la ligne `TRACK`.** Dans une
+    /// feuille « gapless » écrite par EAC — un `FILE` par piste — le pré-gap
+    /// `INDEX 00` d'une piste vit à la FIN du fichier précédent, si bien que la
+    /// piste est DÉCLARÉE sous le fichier d'avant et ne commence réellement que
+    /// dans le `FILE` annoncé juste après. Se fier au `FILE` courant au moment
+    /// du `TRACK` décalait alors tout l'album d'un fichier, et faisait
+    /// disparaître la piste 1 — elle entrait en collision avec la piste 2, même
+    /// fichier et même `start_ms = 0`.
     pub audio_file: Option<String>,
     /// Début dans le fichier, en millisecondes.
     pub start_ms: u64,
@@ -133,8 +142,14 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
     // `TITLE` et `PERFORMER` valent pour l'album AVANT le premier `TRACK`, et
     // pour la piste après : c'est la position qui décide, pas le mot-clé.
     let mut in_track = false;
-    // Le `FILE` courant : toute piste déclarée ensuite lui appartient.
+    // Le `FILE` courant. Il sert de rattachement PROVISOIRE à la piste qui
+    // suit ; l'`INDEX 01` de cette piste tranchera (voir `CueTrack::audio_file`
+    // et le bras `INDEX` plus bas).
     let mut fichier_courant: Option<String> = None;
+    // L'`INDEX 01` de la piste en cours a-t-il déjà fixé son fichier ? Un
+    // `INDEX 02`, `03`… reste à l'intérieur de la même piste et ne doit pas
+    // rejouer ce rattachement.
+    let mut fichier_ancre = false;
 
     for raw in content.lines() {
         let Some((kw, rest)) = split_keyword(raw) else {
@@ -192,6 +207,7 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     end_ms: None,
                 });
                 in_track = true;
+                fichier_ancre = false;
             }
             "TITLE" => {
                 if in_track {
@@ -224,6 +240,22 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                 }
                 if let (Some(track), Some(ms)) = (sheet.tracks.last_mut(), parse_cue_time(time)) {
                     track.start_ms = ms;
+                    // 🔴 Le fichier d'une piste est celui qui porte son
+                    // `INDEX 01`, pas celui qui était courant à sa
+                    // DÉCLARATION. Dans une feuille EAC « gapless » (un `FILE`
+                    // par piste) le `TRACK` est annoncé sous le fichier
+                    // précédent, parce que son pré-gap `INDEX 00` y vit
+                    // encore ; le vrai début est dans le `FILE` qui suit.
+                    // Sans ce rattachement, tout l'album glissait d'un
+                    // fichier et la piste 1 disparaissait.
+                    //
+                    // Le cas ordinaire — un seul `FILE`, des `INDEX` à de
+                    // vrais décalages — n'est pas touché : `fichier_courant`
+                    // y vaut la même chose aux deux instants.
+                    if !fichier_ancre {
+                        track.audio_file = fichier_courant.clone();
+                        fichier_ancre = true;
+                    }
                 }
             }
             _ => {}
@@ -362,6 +394,133 @@ FILE "gould.ape" WAVE
                 Some("face-b.flac")
             ]
         );
+    }
+
+    /// LE CAS ORDINAIRE, INCHANGÉ — une image, des pré-gaps, de vrais
+    /// décalages.
+    ///
+    /// C'est le cas pour lequel le format a été inventé, et la très grande
+    /// majorité des feuilles. Le nouveau rattachement par `INDEX 01` ne doit
+    /// rien y changer : le `FILE` courant y vaut la même chose au `TRACK` et à
+    /// l'`INDEX`.
+    #[test]
+    fn une_image_unique_avec_pregaps_reste_rattachee_comme_avant() {
+        let s = parse_cue_sheet(
+            "TITLE \"Dark Side\"\nFILE \"image.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:00:33\n  TRACK 02 AUDIO\n    INDEX 00 01:10:00\n    INDEX 01 01:12:00\n  TRACK 03 AUDIO\n    INDEX 00 03:58:00\n    INDEX 01 04:00:00\n",
+        );
+        assert_eq!(s.audio_files, vec!["image.flac"]);
+        assert!(
+            s.tracks
+                .iter()
+                .all(|t| t.audio_file.as_deref() == Some("image.flac"))
+        );
+        let debuts: Vec<u64> = s.tracks.iter().map(|t| t.start_ms).collect();
+        assert_eq!(debuts, vec![440, 72_000, 240_000], "les INDEX 00 ont gagné");
+        // Et le chaînage des fins reste celui d'une image : chaque piste finit
+        // où la suivante commence.
+        assert_eq!(s.tracks[0].end_ms, Some(72_000));
+        assert_eq!(s.tracks[1].end_ms, Some(240_000));
+        assert_eq!(s.tracks[2].end_ms, None);
+    }
+
+    /// La feuille « gapless » d'EAC : UN `FILE` par piste, et le pré-gap
+    /// `INDEX 00` d'une piste écrit à la FIN du fichier précédent.
+    ///
+    /// Forme relevée le 24/09/2026 sur le `.cue` de *Shaking the Tree* de
+    /// Peter Gabriel (serveur .15) : la piste est DÉCLARÉE sous le fichier
+    /// d'avant, et son vrai début — `INDEX 01 00:00:00` — tombe sous le `FILE`
+    /// annoncé juste après.
+    const GAPLESS: &str = r#"PERFORMER "Peter Gabriel"
+TITLE "Shaking the Tree"
+FILE "01. Solsbury Hill.wav" WAVE
+  TRACK 01 AUDIO
+    TITLE "Solsbury Hill"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "I Don't Remember"
+    INDEX 00 04:20:49
+FILE "02. I Don't Remember.wav" WAVE
+    INDEX 01 00:00:00
+  TRACK 03 AUDIO
+    TITLE "Sledgehammer"
+    INDEX 00 03:48:27
+FILE "03. Sledgehammer.wav" WAVE
+    INDEX 01 00:00:00
+"#;
+
+    /// 🔴 LE DÉFAUT — chaque piste tombait sur le fichier PRÉCÉDENT.
+    ///
+    /// Mesuré sur le serveur .15 avant correction : « I Don't Remember »
+    /// pointait sur `01. Solsbury Hill.flac`, « Sledgehammer » sur
+    /// `02. I Don't Remember.flac`. L'auditeur voyait un titre et en entendait
+    /// un autre, sur tout l'album.
+    #[test]
+    fn une_piste_appartient_au_fichier_qui_porte_son_index_01() {
+        let s = parse_cue_sheet(GAPLESS);
+        let fichiers: Vec<Option<&str>> =
+            s.tracks.iter().map(|t| t.audio_file.as_deref()).collect();
+        assert_eq!(
+            fichiers,
+            vec![
+                Some("01. Solsbury Hill.wav"),
+                Some("02. I Don't Remember.wav"),
+                Some("03. Sledgehammer.wav"),
+            ],
+            "chaque piste doit suivre son INDEX 01, pas le FILE de sa déclaration"
+        );
+    }
+
+    /// AUCUNE PISTE PERDUE — et aucune collision d'identité.
+    ///
+    /// Les pistes 1 et 2 se retrouvaient sur le MÊME fichier avec le MÊME
+    /// `start_ms = 0` : l'identité `(cue_media_path, cue_start_ms)` les
+    /// confondait, la seconde écrasait la première, et la piste 1 disparaissait
+    /// de l'album.
+    #[test]
+    fn aucune_piste_gapless_ne_partage_l_identite_d_une_autre() {
+        let s = parse_cue_sheet(GAPLESS);
+        assert_eq!(s.tracks.len(), 3);
+        let mut identites: Vec<(Option<&str>, u64)> = s
+            .tracks
+            .iter()
+            .map(|t| (t.audio_file.as_deref(), t.start_ms))
+            .collect();
+        let avant = identites.len();
+        identites.sort();
+        identites.dedup();
+        assert_eq!(
+            identites.len(),
+            avant,
+            "deux pistes partagent (fichier, début) : l'une écrasera l'autre en base"
+        );
+    }
+
+    /// LE DERNIER `FILE` N'EST PLUS ORPHELIN.
+    ///
+    /// Avec l'ancien rattachement, le dernier fichier de la feuille n'était
+    /// cité par aucune piste : le scan ordinaire l'indexait à part, avec ses
+    /// propres balises. L'album montrait quinze titres faux et un juste.
+    #[test]
+    fn aucun_fichier_de_la_feuille_ne_reste_sans_piste() {
+        let s = parse_cue_sheet(GAPLESS);
+        for fichier in &s.audio_files {
+            assert!(
+                s.tracks
+                    .iter()
+                    .any(|t| t.audio_file.as_deref() == Some(fichier.as_str())),
+                "{fichier} n'est réclamé par aucune piste : il sera indexé à part"
+            );
+        }
+    }
+
+    /// Une piste gapless couvre son fichier ENTIER : début à zéro, pas de fin.
+    #[test]
+    fn une_piste_gapless_couvre_tout_son_fichier() {
+        let s = parse_cue_sheet(GAPLESS);
+        for t in &s.tracks {
+            assert_eq!(t.start_ms, 0, "piste {} : {:?}", t.number, t.audio_file);
+            assert_eq!(t.end_ms, None, "piste {} : {:?}", t.number, t.audio_file);
+        }
     }
 
     /// Au passage d'un `FILE` à l'autre les temps repartent de zéro : chaîner
