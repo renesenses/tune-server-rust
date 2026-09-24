@@ -516,6 +516,21 @@ impl PositionPoller {
         self
     }
 
+    /// Vrai si ce sondeur émet sur CE bus-là — celui que le WebSocket relaie.
+    ///
+    /// Existe pour le témoin de câblage de `tune-server` (fils 1890/1857,
+    /// Jean Valjean) : toutes les annonces du sondeur — contrat de signal
+    /// (#4559), bascule des niveaux (#2280), `zone.playback_error`, pistes
+    /// sautées — sont gardées par `if let Some(ref bus) = self.event_bus`. Le
+    /// sondeur de PRODUCTION était construit sans bus : chacune de ces
+    /// annonces, verte dans ses bancs qui appellent `with_event_bus`, était
+    /// muette chez l'auditeur.
+    pub fn annonce_sur(&self, bus: &Arc<crate::event_bus::EventBus>) -> bool {
+        self.event_bus
+            .as_ref()
+            .is_some_and(|le_mien| Arc::ptr_eq(le_mien, bus))
+    }
+
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("position_poller_started");

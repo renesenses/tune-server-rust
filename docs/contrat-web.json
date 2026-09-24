@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "89bf3e488bd9e4acef2501168c24c09630ee102e",
+    "web_sha": "61b2dcbf1e3aa81df69b68d1f7fb18edfdcd97b6",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -699,6 +699,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -734,6 +736,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -769,6 +773,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -867,6 +873,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -902,6 +910,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -933,7 +942,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -1028,6 +1038,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -1109,6 +1121,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -1140,7 +1153,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -1598,6 +1612,19 @@
       ]
     },
     {
+      "route": "/library/tracks/banned",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "total",
+        "items"
+      ],
+      "champs_optionnels": [
+        "profile_id"
+      ]
+    },
+    {
       "route": "/library/tracks/{}",
       "methode": "GET",
       "type": "Track",
@@ -1608,6 +1635,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -1639,7 +1667,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -2179,6 +2208,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -2210,7 +2240,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -2830,6 +2861,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -2861,7 +2893,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -2899,6 +2932,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -2934,6 +2969,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -2965,7 +3001,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -2999,6 +3036,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -3034,6 +3073,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -3065,7 +3105,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -3184,6 +3225,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -3219,6 +3262,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -3268,6 +3313,8 @@
       ],
       "champs_optionnels": [
         "added_at",
+        "focus_track_ids",
+        "credit_roles",
         "artist_id",
         "artist_name",
         "year",
@@ -3343,6 +3390,7 @@
       ],
       "champs_optionnels": [
         "album_id",
+        "album_id_service",
         "album_title",
         "artist_id",
         "artist_name",
@@ -3374,7 +3422,8 @@
         "musicbrainz_recording_id",
         "dynamic_range",
         "play_count",
-        "last_played_at"
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -3416,7 +3465,102 @@
       ],
       "champs_optionnels": [
         "username",
-        "subscription"
+        "subscription",
+        "favoris_ecrivables"
+      ]
+    },
+    {
+      "route": "/streaming/{}/tracks/{}",
+      "methode": "GET",
+      "type": "Track",
+      "liste": false,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_id_service",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "grouping",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id",
+        "dynamic_range",
+        "play_count",
+        "last_played_at",
+        "banned"
+      ]
+    },
+    {
+      "route": "/streaming/{}/tracks/{}/similar",
+      "methode": "GET",
+      "type": "Track",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "title"
+      ],
+      "champs_optionnels": [
+        "album_id",
+        "album_id_service",
+        "album_title",
+        "artist_id",
+        "artist_name",
+        "album_artist",
+        "disc_number",
+        "disc_subtitle",
+        "grouping",
+        "track_number",
+        "duration_ms",
+        "file_path",
+        "cue_media_path",
+        "cue_start_ms",
+        "cue_end_ms",
+        "format",
+        "sample_rate",
+        "bit_depth",
+        "channels",
+        "cover_path",
+        "source",
+        "source_id",
+        "gapless_next",
+        "genre",
+        "year",
+        "label",
+        "composer",
+        "isrc",
+        "bpm",
+        "comments",
+        "musicbrainz_recording_id",
+        "dynamic_range",
+        "play_count",
+        "last_played_at",
+        "banned"
       ]
     },
     {
@@ -3721,6 +3865,56 @@
         "status"
       ],
       "champs_optionnels": []
+    },
+    {
+      "route": "/system/enrich-credits",
+      "methode": "GET",
+      "type": "EtatEnrichCredits",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "task_id",
+        "total",
+        "processed",
+        "enriched",
+        "tracks_credited",
+        "unmatched",
+        "unknown",
+        "errors",
+        "candidats",
+        "albums_avec_mbid"
+      ]
+    },
+    {
+      "route": "/system/enrich-credits",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "task_id",
+        "candidats",
+        "albums_avec_mbid",
+        "force",
+        "premium"
+      ]
+    },
+    {
+      "route": "/system/enrich-release-types",
+      "methode": "POST",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "status"
+      ],
+      "champs_optionnels": [
+        "candidats",
+        "premium"
+      ]
     },
     {
       "route": "/system/health",
@@ -5258,6 +5452,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/albums",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/library/albums/filters",
       "type": "any",
       "raison": "type non structurel"
@@ -5894,7 +6093,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 297,
-    "appels_non_resolus": 150
+    "routes_cartographiees": 303,
+    "appels_non_resolus": 151
   }
 }
