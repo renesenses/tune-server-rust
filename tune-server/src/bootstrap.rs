@@ -193,62 +193,7 @@ pub async fn run_with(opts: RunOptions) {
 
     let config = TuneConfig::load();
 
-    // Use local time for log timestamps (fixes UTC display on Windows/CEST systems).
-    // Must capture offset before spawning threads (security restriction on some OS).
-    let time_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-    let time_fmt = time::macros::format_description!(
-        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
-    );
-    let timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
-    let env_filter = filtre_du_journal(&config.log_level);
-
-    // Write logs to a file on every platform (Linux included) so the
-    // Diagnostics "Export logs" button and /system/logs work even when not
-    // launched from a terminal — systemd/journald, Docker, or a double-clicked
-    // .app. The path is shared with the reader via config::default_log_file_path()
-    // so both always agree. Previously Linux wrote no file, so any launch where
-    // journalctl didn't apply exported an empty log.
-    // Plafond du journal : 10 Mio pour le fichier courant, plus une sauvegarde
-    // `.1` — soit ~2× sur le disque.
-    //
-    // Il est tenu à DEUX moments, et il faut les deux. `rotate_log_file` range
-    // au démarrage ce que la session précédente a laissé ; `JournalBorne` tient
-    // le plafond *pendant* que le serveur tourne. Jusqu'ici seul le premier
-    // existait, et #539 l'assumait — mais un serveur qui tourne longtemps est
-    // justement le seul qui puisse dépasser 10 Mio (voir tune-server/journal.rs
-    // et #2156).
-    const PLAFOND_JOURNAL: u64 = 10 * 1024 * 1024;
-    let log_file = {
-        let path = config::default_log_file_path();
-        config::rotate_log_file(&path, PLAFOND_JOURNAL);
-        crate::journal::JournalBorne::ouvrir(path.clone(), PLAFOND_JOURNAL)
-            .ok()
-            .map(|j| {
-                eprintln!("Logging to {}", path.display());
-                j
-            })
-    };
-
-    if let Some(file) = log_file {
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        let file_timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
-        let file_layer = tracing_subscriber::fmt::layer()
-            .with_timer(file_timer)
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file));
-        let stderr_layer = tracing_subscriber::fmt::layer().with_timer(timer);
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(stderr_layer)
-            .with(file_layer)
-            .init();
-    } else {
-        tracing_subscriber::fmt()
-            .with_timer(timer)
-            .with_env_filter(env_filter)
-            .init();
-    }
+    installer_le_journal(&config.log_level);
 
     // Image builders alone cannot protect appliances already in the field:
     // self-update replaces this binary, not /etc.  On Tune OS/Linux, migrate
@@ -817,6 +762,121 @@ fn same_executable(a: &str, b: &str) -> bool {
 /// sortir un serveur au démarrage.
 fn version_requested<I: IntoIterator<Item = String>>(args: I) -> bool {
     args.into_iter().any(|a| a == "--version" || a == "-V")
+}
+
+/// Installe l'abonné `tracing` du serveur, et rend le chemin du fichier de
+/// journal quand il a pu être ouvert.
+///
+/// Sorti de [`run_with`] pour être témoignable : c'est la seule façon de
+/// prouver la propriété qui nous intéresse — *une ligne émise arrive une fois
+/// et une seule dans le fichier* — dans un processus dont la console a été
+/// branchée sur ce fichier, exactement comme le fait le lanceur macOS.
+///
+/// Deux destinations, et il faut les deux :
+///
+/// * le **fichier**, toujours, sur toutes les plateformes. C'est lui que
+///   « Exporter le journal » et le rapport de bogue intégré relisent, et il
+///   doit exister même quand personne ne regarde un terminal (systemd, Docker,
+///   un `.app` double-cliqué) ;
+/// * la **console**, pour qui lance `./tune-server` à la main et veut voir
+///   passer les lignes.
+///
+/// Sauf que la console et le fichier peuvent être **le même fichier**. Le
+/// lanceur du `.app` macOS démarre le serveur avec
+/// `>> ~/Library/Logs/tune-server.log 2>&1` — le chemin même que
+/// [`config::default_log_file_path`] rend sur macOS. Les deux couches écrivent
+/// alors dans le même inode par deux descripteurs, et chaque ligne y figure
+/// deux fois. Voir [`crate::journal::la_console_ecrit_deja_dans`] pour la
+/// mesure, pour le descripteur qu'il faut interroger, et pour ce que le
+/// doublement coûte au rapport de bogue.
+///
+/// La console est donc posée **sauf** quand sa sortie désigne déjà le fichier.
+/// Le terminal, lui, ne change pas d'un iota.
+pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> {
+    // Use local time for log timestamps (fixes UTC display on Windows/CEST systems).
+    // Must capture offset before spawning threads (security restriction on some OS).
+    let time_offset = time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
+    let time_fmt = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory]:[offset_minute]"
+    );
+    let timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
+    let env_filter = filtre_du_journal(niveau_journal);
+
+    // Write logs to a file on every platform (Linux included) so the
+    // Diagnostics "Export logs" button and /system/logs work even when not
+    // launched from a terminal — systemd/journald, Docker, or a double-clicked
+    // .app. The path is shared with the reader via config::default_log_file_path()
+    // so both always agree. Previously Linux wrote no file, so any launch where
+    // journalctl didn't apply exported an empty log.
+    // Plafond du journal : 10 Mio pour le fichier courant, plus une sauvegarde
+    // `.1` — soit ~2× sur le disque.
+    //
+    // Il est tenu à DEUX moments, et il faut les deux. `rotate_log_file` range
+    // au démarrage ce que la session précédente a laissé ; `JournalBorne` tient
+    // le plafond *pendant* que le serveur tourne. Jusqu'ici seul le premier
+    // existait, et #539 l'assumait — mais un serveur qui tourne longtemps est
+    // justement le seul qui puisse dépasser 10 Mio (voir tune-server/journal.rs
+    // et #2156).
+    const PLAFOND_JOURNAL: u64 = 10 * 1024 * 1024;
+    let log_file = {
+        let path = config::default_log_file_path();
+        config::rotate_log_file(&path, PLAFOND_JOURNAL);
+        crate::journal::JournalBorne::ouvrir(path.clone(), PLAFOND_JOURNAL)
+            .ok()
+            .map(|j| {
+                eprintln!("Logging to {}", path.display());
+                (j, path)
+            })
+    };
+
+    if let Some((file, chemin)) = log_file {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let file_timer = tracing_subscriber::fmt::time::OffsetTime::new(time_offset, time_fmt);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_timer(file_timer)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file));
+
+        // La sortie de la console pointe-t-elle déjà sur CE fichier ? Alors la
+        // couche console n'ajouterait rien qu'un doublon : on ne la pose pas.
+        // `Option<L>` est une couche à part entière pour `tracing-subscriber`,
+        // et `None` ne s'abonne à rien.
+        //
+        // La console écrit sur la SORTIE STANDARD, pas sur le flux d'erreur :
+        // c'est l'écrivain par défaut de `fmt::layer()`
+        // (`tracing-subscriber-0.3.23`, `fmt/fmt_layer.rs:749` : `io::stdout`).
+        // L'ancien nom `stderr_layer` disait le contraire et n'a jamais été
+        // vrai.
+        let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
+        let console_layer =
+            (!console_ferait_doublon).then(|| tracing_subscriber::fmt::layer().with_timer(timer));
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .with(file_layer)
+            .init();
+
+        if console_ferait_doublon {
+            // `eprintln!` ne traverse pas `tracing` : cette ligne-là n'est
+            // jamais dédoublée. Elle va sur le flux d'erreur, que le lanceur
+            // macOS amène dans le même fichier (`2>&1`) — donc elle se relit,
+            // et elle explique pourquoi la console s'est tue.
+            eprintln!(
+                "tune-server: la sortie console pointe déjà sur {} — couche console désactivée \
+                 pour ne pas écrire chaque ligne deux fois",
+                chemin.display()
+            );
+        }
+        return Some(chemin);
+    }
+
+    tracing_subscriber::fmt()
+        .with_timer(timer)
+        .with_env_filter(env_filter)
+        .init();
+    None
 }
 
 /// Le filtre du journal : le niveau demandé pour tout ce qui vient du dépôt,
