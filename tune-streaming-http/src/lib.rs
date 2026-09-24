@@ -141,9 +141,25 @@ impl TypeFavori {
 /// Tout le reste — réseau injoignable, JSON illisible, erreur rendue par le
 /// service, cas inconnu — reste une panne d'amont. `None` ici, et l'appelant
 /// garde son 502. Remplacer un mensonge par un autre n'aurait rien réparé.
+///
+/// # L'objet introuvable (renesenses/tune-web-client#992)
+///
+/// [`TuneError::NotFound`] dit « le service a répondu, et cet objet n'existe
+/// pas chez lui » — un artiste inconnu de Qobuz ou de YouTube. Ce n'est pas
+/// une passerelle en panne non plus : c'est un `404`. Mesuré sur la .18 le
+/// 24/09/2026 (0.9.164) :
+///
+/// ```text
+/// GET /api/v1/streaming/youtube/artists/UCxxxx992 → 502
+///     Not found: youtube artist UCxxxx992 not found
+/// ```
+///
+/// et le client affichait ce 502 en bandeau « Server error », depuis la
+/// Lecture en cours (FabienM, fil 1774, point 14).
 fn statut_porte_par_l_erreur(e: &tune_core::TuneError) -> Option<StatusCode> {
     match e {
         tune_core::TuneError::Unsupported(_) => Some(StatusCode::NOT_IMPLEMENTED),
+        tune_core::TuneError::NotFound(_) => Some(StatusCode::NOT_FOUND),
         _ => None,
     }
 }
@@ -2984,6 +3000,16 @@ mod temoin_statut_du_refus_i859 {
         }
     }
 
+    /// #992 — la ROUTE, pas seulement la table : un artiste introuvable sort
+    /// en 404, avec la phrase du service, et plus en 502.
+    #[test]
+    fn un_objet_introuvable_sort_en_404_et_non_en_502() {
+        let r = svc_response::<Value>(Err(TuneError::NotFound(
+            "youtube artist UCxxxx992 not found".into(),
+        )));
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
     /// Une réponse ÉDITORIALE refusée passe par `svc_response_editorial`, qui
     /// délègue à `svc_response`. Sans cet essai, la moitié éditoriale des
     /// routes pourrait garder le 502 sans que rien ne rougisse.
@@ -2998,19 +3024,24 @@ mod temoin_statut_du_refus_i859 {
     }
 
     /// Le 502 reste le DÉFAUT. Aucune autre variante ne doit être promue en
-    /// douce : cet essai fige la frontière, variante par variante.
+    /// douce : cet essai fige la frontière, variante par variante. Deux
+    /// seulement portent un statut — le refus (501, #859) et l'introuvable
+    /// (404, renesenses/tune-web-client#992).
     #[test]
-    fn seule_la_variante_du_refus_porte_un_statut() {
+    fn seuls_le_refus_et_l_introuvable_portent_un_statut() {
         assert_eq!(
             statut_porte_par_l_erreur(&TuneError::Unsupported("x".into())),
             Some(StatusCode::NOT_IMPLEMENTED)
+        );
+        assert_eq!(
+            statut_porte_par_l_erreur(&TuneError::NotFound("x".into())),
+            Some(StatusCode::NOT_FOUND)
         );
         for panne in [
             TuneError::Streaming("x".into()),
             TuneError::Json(serde_json::from_str::<Value>("{").unwrap_err()),
             TuneError::Db("x".into()),
             TuneError::Config("x".into()),
-            TuneError::NotFound("x".into()),
             TuneError::Other("x".into()),
         ] {
             assert_eq!(
