@@ -1400,6 +1400,8 @@ mod dsp;
 pub use dsp::PorteeDuReglage;
 
 mod resolve_direct;
+// #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
+mod capacite_lpcm_par_sortie;
 
 /// #4362 — le chemin de lecture consulte le registre des serveurs multimédia
 /// avant d'envoyer l'URL d'une piste indexée à une sortie.
