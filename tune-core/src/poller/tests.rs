@@ -2119,6 +2119,49 @@ fn reprise_apres_renderer_cale_la_mesure_de_sevy_autorise_la_reprise() {
     );
 }
 
+/// #4645 — le même décrochage, passé par `playback_failure_stopping_zone`
+/// (flux à sec) au lieu du bras du renderer calé. Mesure de Sevy Tabroc du
+/// 24/09 (0.9.163, darTZeel LHC-208, zone 10) : piste de 310 867 ms, WAV de
+/// 54 836 880 octets, 39 387 136 servis, renderer figé à 213 000 ms. En 0.9.163
+/// ce bras coupait la zone sans jamais proposer la reprise.
+#[test]
+fn reprise_apres_flux_a_sec_la_mesure_du_24_09_autorise_la_reprise() {
+    let mesure = decisions::mesure_de_reprise_apres_flux_a_sec(
+        213_000,
+        310_867,
+        39_387_136,
+        Some(54_836_880),
+    );
+    assert_eq!(
+        mesure,
+        Some((213_000, 310_867, 39_387_136, Some(54_836_880))),
+        "un décrochage en cours de lecture doit armer la reprise dans ce bras aussi"
+    );
+    let (position_ms, duree_ms, servis, total) = mesure.unwrap();
+    assert!(
+        decisions::reprise_apres_renderer_cale_autorisee(
+            None,
+            position_ms,
+            duree_ms,
+            servis,
+            total
+        ),
+        "le flux à sec du 24/09 doit donner lieu à une reprise, pas à une coupure"
+    );
+}
+
+#[test]
+fn reprise_apres_flux_a_sec_laisse_le_demarrage_mort_a_sa_relance() {
+    // Zéro octet servi : démarrage mort (#2394), rejoué depuis le début par
+    // Pause→Stop→Play. Armer aussi la reprise doublerait l'ordre de lecture.
+    assert_eq!(
+        decisions::mesure_de_reprise_apres_flux_a_sec(0, 310_867, 0, Some(54_836_880)),
+        None,
+        "zéro octet servi relève de la relance du démarrage mort"
+    );
+    assert!(decisions::demarrage_mort("dlna", 0));
+}
+
 #[test]
 fn reprise_apres_renderer_cale_refusee_quand_la_piste_na_jamais_joue() {
     // Position nulle : c'est un démarrage mort (#2394), qui se rejoue depuis
