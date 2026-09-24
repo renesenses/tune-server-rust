@@ -1550,3 +1550,8 @@ mod adoption_du_flux_pre_arme_3442;
 /// CI — celui des PR vers `batch/*` — et pas seulement sous `local-audio`.
 #[cfg(test)]
 mod refus_asio_bloque_4556;
+
+/// #4366 — le 403 amont de YouTube doit dire combien d'en-tetes de yt-dlp
+/// ont ete rejoues sur la requete qui l'a pris.
+#[cfg(test)]
+mod refus_amont_4366;
