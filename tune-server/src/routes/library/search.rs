@@ -81,6 +81,7 @@ fn dedup_ranked_tracks(
 /// qui ne lit que les tableaux voit exactement ce qu'il voyait.
 pub(super) async fn search(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(q): Query<SearchQuery>,
 ) -> Json<Value> {
     let limit = q.limit.unwrap_or(20);
@@ -201,7 +202,7 @@ pub(super) async fn search(
     let n_extra = extra_tracks.len();
     let toutes: Vec<tune_core::db::models::Track> =
         tracks.into_iter().chain(extra_tracks).collect();
-    let mut track_results = super::tracks::joindre_dr_par_piste(&state, toutes);
+    let mut track_results = super::tracks::joindre_dr_par_piste(&state, profile.id(), toutes);
 
     // L'annotation propre à cette route se pose APRÈS, sur le JSON déjà
     // enrichi : les pistes trouvées par leurs métadonnées disent laquelle a
@@ -256,6 +257,7 @@ pub(super) async fn search(
 #[cfg(feature = "audio-embedding")]
 pub(super) async fn acoustic_search(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     axum::Json(body): axum::Json<AcousticQuery>,
 ) -> Result<Json<Value>, crate::error::AppError> {
     use tune_core::audio::{embedding_store, text_embedding};
@@ -353,7 +355,7 @@ pub(super) async fn acoustic_search(
     // requêtes indexées ne portent que sur la page rendue, pas sur le
     // sur-échantillonnage à 2× qu'exige le dédoublonnage.
     let tracks: Vec<tune_core::db::models::Track> = tracks.into_iter().take(limit).collect();
-    let mut items = super::tracks::joindre_dr_par_piste(&state, tracks);
+    let mut items = super::tracks::joindre_dr_par_piste(&state, profile.id(), tracks);
     for v in items.iter_mut() {
         let Some(id) = v.get("id").and_then(Value::as_i64) else {
             continue;
@@ -379,6 +381,7 @@ pub(super) async fn acoustic_search(
 #[cfg(not(feature = "audio-embedding"))]
 pub(super) async fn acoustic_search(
     State(_state): State<AppState>,
+    _profile: crate::routes::active_profile::ActiveProfile,
     axum::Json(_body): axum::Json<AcousticQuery>,
 ) -> Result<Json<Value>, crate::error::AppError> {
     Err(crate::error::AppError::service_unavailable(
@@ -669,7 +672,12 @@ mod totaux_4663 {
     async fn appeler(state: &AppState, requete: &str) -> Value {
         let uri: axum::http::Uri = format!("/library/search?{requete}").parse().unwrap();
         let q = Query::<SearchQuery>::try_from_uri(&uri).unwrap();
-        let Json(corps) = search(State(state.clone()), q).await;
+        let Json(corps) = search(
+            State(state.clone()),
+            crate::routes::active_profile::ActiveProfile(1),
+            q,
+        )
+        .await;
         corps
     }
 

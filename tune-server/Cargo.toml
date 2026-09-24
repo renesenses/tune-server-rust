@@ -177,6 +177,14 @@ path = "tests/album_lecture_en_double.rs"
 name = "dr_liste_albums_4521"
 path = "tests/dr_liste_albums_4521.rs"
 
+# #4806 — bannir un titre : jamais joué automatiquement, visible mais grisé.
+# Les sept points (aléatoire, smart playlists, file, titre en cours,
+# débannir, local ≠ service, par profil) par les routes montées. `autotests =
+# false` en tête de ce manifeste : sans cette cible, rien ne serait compilé.
+[[test]]
+name = "titres_bannis_4806"
+path = "tests/titres_bannis_4806.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois

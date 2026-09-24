@@ -1294,6 +1294,7 @@ mod serveur_source_absent_4362;
 pub mod verdict_upnp;
 
 mod queue;
+pub use queue::Enjambee;
 
 mod history;
 

@@ -387,6 +387,22 @@ pub fn hidden_tracks_excluded() -> &'static str {
      WHERE h.item_type = 'album' AND h.item_id = t.album_id)"
 }
 
+/// Prédicat « la piste n'est PAS bannie pour ce profil » (#4806), pour les
+/// requêtes de SÉLECTION AUTOMATIQUE — alias `t`, comme ci-dessus.
+///
+/// À poser sur l'aléatoire, les smart playlists, l'enchaînement de fin de
+/// file, la radio d'artiste, les recommandations — et NULLE PART sur une
+/// liste d'affichage (album, playlist, recherche) : un titre banni reste
+/// visible, grisé ; c'est le drapeau `banned` des routes qui le dit, pas un
+/// filtre. Le profil est un `i64` de confiance inscrit en clair, comme les
+/// ids de `TrackMetadataRepo::sql::get_key_for_tracks`.
+pub fn banned_tracks_excluded(profile_id: i64) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM hidden_items hb \
+         WHERE hb.profile_id = {profile_id} AND hb.item_type = 'track' AND hb.item_id = t.id)"
+    )
+}
+
 /// Le nom de l'artiste d'un album, en sous-requête corrélée.
 ///
 /// Volontairement PAS une jointure : le prédicat de doublon ci-dessous doit

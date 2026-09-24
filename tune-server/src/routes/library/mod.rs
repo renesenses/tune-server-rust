@@ -1,5 +1,8 @@
 mod album_order;
 mod albums;
+/// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
+/// playlists et la recherche fédérée qui vivent hors de ce module.
+pub(crate) use albums::attacher_banni;
 mod albums_detailed;
 mod ambiances;
 mod artists;
@@ -281,6 +284,13 @@ pub fn router() -> Router<AppState> {
         )
         .route("/tracks", get(tracks::list_tracks))
         .route("/tracks/count", get(tracks::track_count))
+        // Titres bannis (#4806). `/tracks/banned` AVANT `/tracks/{id}`, même
+        // hygiène que `/albums/hidden`.
+        .route("/tracks/banned", get(tracks::list_banned_tracks))
+        .route(
+            "/tracks/{id}/ban",
+            post(tracks::ban_track).delete(tracks::unban_track),
+        )
         // PUT mirrors POST /metadata/tracks/{id}/edit so track editing lives on
         // the same REST family as albums/artists (PUT /library/…/{id}).
         .route(
