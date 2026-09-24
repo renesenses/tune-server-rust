@@ -595,3 +595,9 @@ path = "tests/canaux_reseau_repli_4573.rs"
 [[test]]
 name = "canaux_reseau_branchement_4573"
 path = "tests/canaux_reseau_branchement_4573.rs"
+
+# #4894 — `autotests = false` : sans cette cible, les témoins de la capacité
+# LPCM hors DLNA ne seraient jamais compilés.
+[[test]]
+name = "sonde_lpcm_hors_dlna_4894"
+path = "tests/sonde_lpcm_hors_dlna_4894.rs"
