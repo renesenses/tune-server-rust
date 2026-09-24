@@ -173,14 +173,13 @@ fn l_extraction_reconnait_les_formes_du_code() {
 #[test]
 fn le_plist_rendu_est_valide_pour_macos() {
     let plist = info_plist_du_workflow().replace("${VERSION}", "0.0.0");
-    let chemin = std::env::temp_dir().join(format!("tune-info-4949-{}.plist", std::process::id()));
-    fs::write(&chemin, plist).expect("écriture du plist rendu");
+    let fichier = tune_core::test_scratch::scratch_file("info-plist-4949", ".plist");
+    fs::write(fichier.path(), plist).expect("écriture du plist rendu");
     let sortie = std::process::Command::new("plutil")
         .arg("-lint")
-        .arg(&chemin)
+        .arg(fichier.path())
         .output()
         .expect("plutil présent sur macOS");
-    let _ = fs::remove_file(&chemin);
     assert!(
         sortie.status.success(),
         "plutil -lint refuse l'Info.plist de Tune Server.app : {}",
