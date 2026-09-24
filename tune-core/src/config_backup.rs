@@ -416,11 +416,17 @@ fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> 
         let name = row.get(1).and_then(|v| v.as_string()).unwrap_or_default();
         let desc = row.get(2).and_then(|v| v.as_string());
 
+        // #4927 — l'artiste et l'album viennent de leurs tables : `tracks` ne
+        // porte que `artist_id` et `album_id`. Jointures a GAUCHE, pour qu'une
+        // piste sans artiste ni album reste dans la sauvegarde (champ vide).
+        // Les cles exportees ne changent pas : c'est ce que lit la restauration.
         let track_rows = backend.query_many(
-            "SELECT pt.position, t.title, t.artist_name, t.album_title, \
+            "SELECT pt.position, t.title, ar.name, al.title, \
              t.source, t.source_id, t.isrc, t.duration_ms \
              FROM playlist_tracks pt \
              JOIN tracks t ON t.id = pt.track_id \
+             LEFT JOIN artists ar ON ar.id = t.artist_id \
+             LEFT JOIN albums al ON al.id = t.album_id \
              WHERE pt.playlist_id = ? ORDER BY pt.position",
             &[&id as &dyn ToSqlValue],
         )?;
@@ -834,6 +840,7 @@ fn import_playlists(
             for t in tracks {
                 let title = t["title"].as_str().unwrap_or_default();
                 let artist = t["artist_name"].as_str().unwrap_or_default();
+                let album = t["album_title"].as_str().unwrap_or_default();
                 let source = t["source"].as_str().unwrap_or("local");
                 let source_id = t["source_id"].as_str().unwrap_or_default();
                 let position = t["position"].as_i64().unwrap_or(0);
@@ -847,11 +854,22 @@ fn import_playlists(
                         ],
                     )?
                 } else {
+                    // #4927 — `tracks` n'a ni `artist_name` ni `album_title` :
+                    // l'artiste et l'album sont des cles etrangeres. Une piste
+                    // locale se retrouve par titre + nom d'artiste, et l'album
+                    // departage deux homonymes (une sauvegarde sans
+                    // `album_title` prend la premiere, comme avant).
                     backend.query_one(
-                        "SELECT id FROM tracks WHERE title = ? AND artist_name = ? LIMIT 1",
+                        "SELECT t.id FROM tracks t \
+                         LEFT JOIN artists ar ON ar.id = t.artist_id \
+                         LEFT JOIN albums al ON al.id = t.album_id \
+                         WHERE t.title = ? AND COALESCE(ar.name, '') = ? \
+                         ORDER BY CASE WHEN COALESCE(al.title, '') = ? THEN 0 ELSE 1 END, t.id \
+                         LIMIT 1",
                         &[
                             &title.to_string() as &dyn ToSqlValue,
                             &artist.to_string() as &dyn ToSqlValue,
+                            &album.to_string() as &dyn ToSqlValue,
                         ],
                     )?
                 };
@@ -1551,6 +1569,16 @@ mod tests {
     fn temoin_le_reste_du_bloc_ne_change_pas() {
         scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&backend_sqlite());
     }
+
+    #[test]
+    fn playlist_sauvegarde_puis_restauree() {
+        scenarios_playlists::une_playlist_de_trois_pistes_fait_l_aller_retour(&backend_sqlite());
+    }
+
+    #[test]
+    fn playlist_d_une_sauvegarde_existante_restauree() {
+        scenarios_playlists::une_sauvegarde_existante_se_restaure(&backend_sqlite());
+    }
 }
 
 /// Contre-epreuves de `import_zones`, ecrites contre un `DbBackend` quelconque.
@@ -1778,5 +1806,267 @@ pub(crate) mod scenarios_zones {
         }
 
         effacer(backend, NOM);
+    }
+}
+
+/// Aller-retour d'une playlist par la sauvegarde de configuration (#4927),
+/// ecrit contre un `DbBackend` quelconque : joue sur SQLite par le `mod tests`
+/// ci-dessous et sur une VRAIE base PostgreSQL par
+/// `db::postgres_e2e::pg_config_backup_zones_volume_fixe`.
+///
+/// `tracks` ne porte ni `artist_name` ni `album_title` : l'artiste et l'album y
+/// sont des cles etrangeres (`artist_id`, `album_id`). L'export les lisait
+/// pourtant sur `tracks`, si bien que le moindre playlist faisait echouer
+/// l'export ENTIER ; la restauration cherchait une piste locale par
+/// `tracks.artist_name`, si bien que la moindre piste sans `source_id` faisait
+/// echouer la restauration ENTIERE.
+#[cfg(test)]
+pub(crate) mod scenarios_playlists {
+    use super::*;
+
+    const PLAYLIST: &str = "Temoin sauvegarde playlist 4927";
+    const ARTISTE: &str = "Artiste temoin 4927";
+    const ALBUM: &str = "Album temoin 4927";
+    const LEURRE: &str = "Album leurre 4927";
+
+    fn id(backend: &Arc<dyn DbBackend>, sql: &str, params: &[&dyn ToSqlValue]) -> i64 {
+        backend.execute_returning_id(sql, params).unwrap()
+    }
+
+    fn piste(
+        backend: &Arc<dyn DbBackend>,
+        titre: &str,
+        album: i64,
+        artiste: i64,
+        chemin: &str,
+        source: &str,
+        source_id: Option<&str>,
+    ) -> i64 {
+        id(
+            backend,
+            "INSERT INTO tracks (title, album_id, artist_id, file_path, source, source_id, duration_ms) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            &[
+                &titre.to_string() as &dyn ToSqlValue,
+                &album as &dyn ToSqlValue,
+                &artiste as &dyn ToSqlValue,
+                &chemin.to_string() as &dyn ToSqlValue,
+                &source.to_string() as &dyn ToSqlValue,
+                &source_id.map(str::to_string) as &dyn ToSqlValue,
+                &200_000i64 as &dyn ToSqlValue,
+            ],
+        )
+    }
+
+    fn effacer_la_playlist(backend: &Arc<dyn DbBackend>) {
+        let nom = PLAYLIST.to_string();
+        backend
+            .execute(
+                "DELETE FROM playlist_tracks WHERE playlist_id IN \
+                 (SELECT id FROM playlists WHERE name = ?)",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .unwrap();
+        backend
+            .execute(
+                "DELETE FROM playlists WHERE name = ?",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    fn effacer(backend: &Arc<dyn DbBackend>) {
+        effacer_la_playlist(backend);
+        backend
+            .execute(
+                "DELETE FROM tracks WHERE file_path LIKE '/temoin-4927/%'",
+                &[],
+            )
+            .unwrap();
+        for album in [ALBUM, LEURRE] {
+            backend
+                .execute(
+                    "DELETE FROM albums WHERE title = ?",
+                    &[&album.to_string() as &dyn ToSqlValue],
+                )
+                .unwrap();
+        }
+        backend
+            .execute(
+                "DELETE FROM artists WHERE name = ?",
+                &[&ARTISTE.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    /// Les pistes de la playlist restauree, dans l'ordre des positions.
+    fn pistes_restaurees(backend: &Arc<dyn DbBackend>) -> Vec<i64> {
+        backend
+            .query_many(
+                "SELECT pt.track_id FROM playlist_tracks pt \
+                 JOIN playlists p ON p.id = pt.playlist_id \
+                 WHERE p.name = ? ORDER BY pt.position",
+                &[&PLAYLIST.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .into_iter()
+            .map(|r| r.first().and_then(|v| v.as_i64()).unwrap_or(0))
+            .collect()
+    }
+
+    /// Une bibliotheque de trois pistes et un leurre : meme titre, meme
+    /// artiste que la 1re piste locale, sur un AUTRE album, insere AVANT elle
+    /// (plus petit id). Rend les trois pistes dans l'ordre de la playlist.
+    fn semer(backend: &Arc<dyn DbBackend>) -> [i64; 3] {
+        effacer(backend);
+        let artiste = id(
+            backend,
+            "INSERT INTO artists (name) VALUES (?)",
+            &[&ARTISTE.to_string() as &dyn ToSqlValue],
+        );
+        let leurre = id(
+            backend,
+            "INSERT INTO albums (title, artist_id) VALUES (?, ?)",
+            &[
+                &LEURRE.to_string() as &dyn ToSqlValue,
+                &artiste as &dyn ToSqlValue,
+            ],
+        );
+        let album = id(
+            backend,
+            "INSERT INTO albums (title, artist_id) VALUES (?, ?)",
+            &[
+                &ALBUM.to_string() as &dyn ToSqlValue,
+                &artiste as &dyn ToSqlValue,
+            ],
+        );
+        piste(
+            backend,
+            "Intro",
+            leurre,
+            artiste,
+            "/temoin-4927/leurre/01.flac",
+            "local",
+            None,
+        );
+        let intro = piste(
+            backend,
+            "Intro",
+            album,
+            artiste,
+            "/temoin-4927/album/01.flac",
+            "local",
+            None,
+        );
+        let deux = piste(
+            backend,
+            "Deuxieme",
+            album,
+            artiste,
+            "/temoin-4927/album/02.flac",
+            "local",
+            None,
+        );
+        let service = piste(
+            backend,
+            "Troisieme",
+            album,
+            artiste,
+            "/temoin-4927/album/03.flac",
+            "qobuz",
+            Some("q-4927-3"),
+        );
+
+        let pl = id(
+            backend,
+            "INSERT INTO playlists (name, description) VALUES (?, ?)",
+            &[
+                &PLAYLIST.to_string() as &dyn ToSqlValue,
+                &"trois pistes".to_string() as &dyn ToSqlValue,
+            ],
+        );
+        // Ordre volontairement different de celui des ids.
+        let ordre = [deux, service, intro];
+        for (position, track) in ordre.iter().enumerate() {
+            backend
+                .execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)",
+                    &[
+                        &pl as &dyn ToSqlValue,
+                        track as &dyn ToSqlValue,
+                        &(position as i64) as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap();
+        }
+        ordre
+    }
+
+    /// Sauvegarde, perte de la playlist, restauration : la playlist revient
+    /// avec ses trois pistes, dans son ordre, et la piste locale homonyme
+    /// retrouve SON album, pas le leurre.
+    pub(crate) fn une_playlist_de_trois_pistes_fait_l_aller_retour(backend: &Arc<dyn DbBackend>) {
+        let ordre = semer(backend);
+
+        let snapshot = export_config(backend).expect("l'export de la configuration echoue");
+        let exportee = snapshot
+            .playlists
+            .iter()
+            .find(|p| p["name"] == PLAYLIST)
+            .expect("playlist absente de l'export");
+        let pistes = exportee["tracks"].as_array().unwrap();
+        assert_eq!(pistes.len(), 3, "{exportee}");
+        let titres: Vec<&str> = pistes
+            .iter()
+            .map(|t| t["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(titres, ["Deuxieme", "Troisieme", "Intro"]);
+        for t in pistes {
+            assert_eq!(t["artist_name"], ARTISTE, "{t}");
+            assert_eq!(t["album_title"], ALBUM, "{t}");
+        }
+
+        effacer_la_playlist(backend);
+        assert!(pistes_restaurees(backend).is_empty());
+
+        let report = import_config(backend, snapshot).expect("la restauration echoue");
+        assert!(report.playlists_restored >= 1, "{report:?}");
+        assert_eq!(pistes_restaurees(backend), ordre.to_vec());
+
+        effacer(backend);
+    }
+
+    /// Une sauvegarde deja produite, a la forme d'aujourd'hui (`artist_name`,
+    /// `album_title`, `source_id` vide pour une piste locale), se restaure.
+    pub(crate) fn une_sauvegarde_existante_se_restaure(backend: &Arc<dyn DbBackend>) {
+        let ordre = semer(backend);
+        effacer_la_playlist(backend);
+
+        let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "0.9.163",
+            "created_at": "2026-09-23T00:00:00Z",
+            "zones": [], "settings": [], "favorites": [], "radio_stations": [],
+            "alarms": [], "eq_presets": [], "room_profiles": [],
+            "playlists": [{
+                "id": 7, "name": PLAYLIST, "description": null,
+                "tracks": [
+                    {"position": 0, "title": "Deuxieme", "artist_name": ARTISTE,
+                     "album_title": ALBUM, "source": "local", "source_id": "",
+                     "isrc": null, "duration_ms": 200000},
+                    {"position": 1, "title": "Troisieme", "artist_name": ARTISTE,
+                     "album_title": ALBUM, "source": "qobuz", "source_id": "q-4927-3",
+                     "isrc": null, "duration_ms": 200000},
+                    {"position": 2, "title": "Intro", "artist_name": ARTISTE,
+                     "album_title": ALBUM, "source": "local", "source_id": "",
+                     "isrc": null, "duration_ms": 200000}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        import_config(backend, snapshot).expect("la restauration echoue");
+        assert_eq!(pistes_restaurees(backend), ordre.to_vec());
+
+        effacer(backend);
     }
 }
