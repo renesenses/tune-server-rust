@@ -1979,6 +1979,52 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
         name: "albums_type_de_sortie",
         up: "",
     },
+
+    // #4907 — la meme musique dans plusieurs repertoires : les EXEMPLAIRES
+    // d'une piste, et le repertoire prefere d'un album.
+    //
+    // Numerotee 110, PAS 107 : les 107 (credits MusicBrainz, #4862), 108
+    // (rayons de collections, #4888) et 109 (Playlists converter, #4718 /
+    // #4719) sont reservees par des PR ouvertes en meme temps que celle-ci.
+    // Un numero deja applique sur une base ne se reprend jamais : la
+    // coordination des lots a donc fixe celui-ci d'avance. Tant que 107-109
+    // ne sont pas fusionnees, la garde de contiguite de cette liste le signale.
+    //
+    // `track_copies` : un fichier octet pour octet identique a celui d'une
+    // piste, range dans le meme album. Le scan l'ecartait
+    // (`skip_duplicate_audio_hash`) ; il le rattache desormais a la piste.
+    // AUCUNE ligne `tracks` n'est creee, modifiee ni renumerotee : les
+    // identifiants que visent playlists, favoris, historique, notes et files
+    // d'attente ne bougent pas. La table part VIDE ; le prochain scan la
+    // remplit. `ON DELETE CASCADE` : une piste retiree emporte ses copies.
+    //
+    // `album_preferred_roots` : le dossier de musique depuis lequel
+    // l'utilisateur veut lire un album. Absente = regle par defaut (meilleure
+    // qualite, puis ordre des repertoires).
+    Migration {
+        version: 110,
+        name: "exemplaires_par_repertoire",
+        up: "
+CREATE TABLE IF NOT EXISTS track_copies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL UNIQUE,
+    format TEXT,
+    sample_rate INTEGER,
+    bit_depth INTEGER,
+    file_size INTEGER,
+    file_mtime REAL,
+    audio_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_track_copies_track ON track_copies(track_id);
+CREATE TABLE IF NOT EXISTS album_preferred_roots (
+    album_id INTEGER PRIMARY KEY REFERENCES albums(id) ON DELETE CASCADE,
+    root TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -3869,6 +3915,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         69,
         "albums_type_de_sortie",
         include_str!("../../migrations/postgres/069_albums_type_de_sortie.sql"),
+    ),
+    // #4907 — exemplaires d'une piste et repertoire prefere d'un album.
+    // Jumelle de la migration SQLite 110. Numerotee 73 : 70, 71 et 72 sont
+    // reservees par des PR ouvertes en meme temps (#4862, #4888, #4718/#4719).
+    (
+        73,
+        "exemplaires_par_repertoire",
+        include_str!("../../migrations/postgres/073_exemplaires_par_repertoire.sql"),
     ),
 ];
 

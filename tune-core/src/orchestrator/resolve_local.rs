@@ -509,6 +509,10 @@ impl PlaybackOrchestrator {
             .get(track_id)
             .map_err(|e| e.to_string())?
             .ok_or("track not found")?;
+        // #4907 — le fichier À LIRE est choisi parmi les exemplaires de la
+        // piste, avant toute décision de format : préférence de l'album,
+        // qualité, ordre des répertoires, puis repli sur le suivant joignable.
+        crate::library::exemplaires::appliquer_a_la_lecture(&*self.db, &mut track);
 
         // #3631 — une piste de feuille CUE n'a PAS de `file_path` : `tracks.
         // file_path` est `UNIQUE` et une feuille découpe N pistes dans le même

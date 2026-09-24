@@ -569,6 +569,19 @@ pub(super) fn build_signal_path(
             "to_hz": vers,
         })),
     }))
+    .map(|mut v| {
+        // #4907 — l'EXEMPLAIRE réellement ouvert, quand la piste en a
+        // plusieurs (même musique dans plusieurs répertoires) : son chemin, sa
+        // racine, et s'il s'agit d'un repli. Clé ABSENTE sinon : le contrat
+        // des pistes à un seul fichier ne bouge pas.
+        if let Some(e) = np
+            .track_id
+            .and_then(tune_core::library::exemplaires::exemplaire_lu)
+        {
+            v["exemplaire"] = json!(e);
+        }
+        v
+    })
 }
 
 /// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de

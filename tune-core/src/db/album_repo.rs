@@ -1405,6 +1405,16 @@ impl AlbumRepo {
             return self.get_or_create_with_mbid(title, artist_id, year, mbid);
         }
 
+        // #4907 — le MÊME dossier recopié sous une autre racine de musique
+        // (NAS, disque local, sauvegarde) est la même parution, pas une
+        // édition de plus : sans ce rattrapage, chaque copie d'une racine à
+        // l'autre dédoublait l'album dans toutes les vues.
+        if self.find_id_by_folder(folder)?.is_none() {
+            if let Some(album) = self.album_du_dossier_miroir(folder, title)? {
+                return Ok(album);
+            }
+        }
+
         // Le disque a-t-il déjà une entrée, posée par un dossier frère ? Le
         // rangement Qobuz d'une compilation met chaque piste dans le dossier
         // de SON artiste ; sans ce rattrapage, une anthologie de 41 titres
@@ -1503,6 +1513,41 @@ impl AlbumRepo {
                 Ok(candidate)
             }
         }
+    }
+
+    /// L'album déjà rangé sous le dossier MIROIR de `folder` — le même chemin
+    /// relatif sous une autre racine de musique
+    /// ([`crate::library::exemplaires::dossiers_miroirs`]) — quand il porte le
+    /// même titre (#4907). Le titre est exigé en plus du chemin : un dossier
+    /// homonyme qui contiendrait une autre parution reste un autre album.
+    fn album_du_dossier_miroir(
+        &self,
+        folder: &str,
+        title: &str,
+    ) -> Result<Option<Album>, TuneError> {
+        let racines = crate::library::exemplaires::dossiers_de_musique(&*self.db);
+        let titre = title.trim().to_lowercase();
+        for miroir in crate::library::exemplaires::dossiers_miroirs(folder, &racines) {
+            let Some(id) = self.find_id_by_folder(&miroir)? else {
+                continue;
+            };
+            let sql = self.dialect_sql(sql::get_by_id, sql::get_by_id);
+            let params: [&dyn ToSqlValue; 1] = [&id];
+            let Some(row) = self.db.query_one_strong(&sql, &params)? else {
+                continue;
+            };
+            let album = row_to_album(&row);
+            if album.title.trim().to_lowercase() == titre {
+                tracing::info!(
+                    album_id = id,
+                    dossier = folder,
+                    miroir = %miroir,
+                    "album_miroir_rattache — même dossier sous une autre racine : même album"
+                );
+                return Ok(Some(album));
+            }
+        }
+        Ok(None)
     }
 
     /// Rend à l'album son vrai artiste quand il est resté sur « Unknown Artist ».

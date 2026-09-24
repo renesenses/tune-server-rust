@@ -381,6 +381,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_scan_converge_4602 -- --nocapture --test-threads=1
 
+      # #4907 -- la meme musique dans plusieurs repertoires, par le VRAI scan :
+      # la copie identique devient un exemplaire (`track_copies`, migration
+      # 073), les vues gardent les memes compteurs, un fichier supprime ne
+      # retire que son exemplaire, et les identifiants de pistes ne bougent
+      # pas. La contre-epreuve SQLite du meme fichier tourne dans `ci.yml`.
+      - name: Exemplaires par repertoire sur PostgreSQL (#4907)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test exemplaires_par_repertoire_4907 -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.

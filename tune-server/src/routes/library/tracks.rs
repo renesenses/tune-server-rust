@@ -403,10 +403,12 @@ pub(super) async fn stream_track_audio(
     req_headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let track = match repo.get(id) {
+    let mut track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    // #4907 — même choix d'exemplaire que la lecture en zone.
+    tune_core::library::exemplaires::appliquer_a_la_lecture(&*state.backend, &mut track);
 
     let Some(ref file_path) = track.file_path else {
         return StatusCode::NOT_FOUND.into_response();

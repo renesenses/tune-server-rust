@@ -406,6 +406,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let mut known_hashes = track_repo
             .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
+        // #4907 — les exemplaires déjà rattachés, sœur exacte du scan manuel.
+        tune_core::library::exemplaires::nettoyer_les_orphelins(&*db);
+        let existing_copies: crate::routes::system::scan::CarteDesChemins =
+            tune_core::library::exemplaires::carte_des_exemplaires(&*db).unwrap_or_default();
 
         // Keep only files that are new or whose mtime/size changed since the
         // last scan. This stat()s every discovered file; on a network mount
@@ -419,6 +423,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // interminable" bug: NFD-named files missing the map and re-read over SMB).
         let is_changed = |path: &std::path::Path| {
             crate::routes::system::scan::file_needs_scan(path, &existing_tracks)
+                && crate::routes::system::scan::file_needs_scan(path, &existing_copies)
         };
         // `scan_io_concurrency()` et non 32 en dur : ce pool ignorait
         // `TUNE_SCAN_IO_CONCURRENCY`, donc régler la variable ne calmait que la
@@ -518,6 +523,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 let mut to_update: Vec<Track> = Vec::with_capacity(batch.len() / 4);
                 // Lignes posées par un importateur que ce lot reprend (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
+                let mut exemplaires_du_lot =
+                    crate::routes::system::scan::ExemplairesDuLot::default();
 
                 // Manual transaction for batch performance (SQLite only;
                 // PG handles transactions at the pool level).
@@ -565,6 +572,19 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     // zéro piste) naît pour un fichier qu'on va écarter.
                     // `force` est faux ici : le scan automatique ne re-résout
                     // jamais les album_id d'un fichier inchangé.
+                    // Un exemplaire déjà rattaché et inchangé ne se relit pas (#4907).
+                    if crate::routes::system::scan::verdict_ecriture(
+                        &sf.path,
+                        sf.mtime,
+                        sf.file_size,
+                        false,
+                        &existing_copies,
+                    ) == crate::routes::system::scan::VerdictEcriture::Inchange
+                    {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
+                    }
                     let verdict = crate::routes::system::scan::verdict_ecriture(
                         &sf.path,
                         sf.mtime,
@@ -595,43 +615,23 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         continue;
                     }
 
-                    // `audio_hash` only selects cheap candidates. Never hide a
-                    // track until an existing path is byte-for-byte identical.
-                    if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
-                        let key = (hash.clone(), aid);
-                        let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
-                        if let Some(existing_path) =
-                            tune_core::scanner::hasher::find_byte_identical_path(
-                                std::path::Path::new(&sf.path),
-                                &candidates,
-                            )
-                        {
-                            tracing::debug!(
-                                audio_hash = %hash,
-                                album_id = aid,
-                                path = %sf.path,
-                                existing_path = %existing_path,
-                                "skip_duplicate_audio_hash"
-                            );
-                            skipped += 1;
-                            skipped_duplicate += 1;
-                            // Journalise en `debug!` seulement : invisible au
-                            // niveau livré, donc introuvable (#2050).
-                            tune_core::scanner::walker::pousser_chemin_ecarte(
-                                &mut skipped_duplicate_paths,
-                                format!("{} (identique à {})", sf.path, existing_path),
-                            );
-                            continue;
-                        }
-                        if !candidates.is_empty() {
-                            tracing::warn!(
-                                audio_hash = %hash,
-                                album_id = aid,
-                                path = %sf.path,
-                                candidates = candidates.len(),
-                                "audio_hash_candidate_not_byte_identical"
-                            );
-                        }
+                    // #4907 — une copie octet pour octet d'une piste du même album
+                    // devient un EXEMPLAIRE de cette piste (règle partagée).
+                    if let Some(existing_path) =
+                        exemplaires_du_lot.exemplaire_identique(&track, &known_hashes)
+                    {
+                        tracing::debug!(
+                            path = %sf.path,
+                            existing_path = %existing_path,
+                            "auto_scan_exemplaire_identique"
+                        );
+                        skipped += 1;
+                        skipped_duplicate += 1;
+                        tune_core::scanner::walker::pousser_chemin_ecarte(
+                            &mut skipped_duplicate_paths,
+                            format!("{} (exemplaire de {})", sf.path, existing_path),
+                        );
+                        continue;
                     }
 
                     to_insert.push(track);
@@ -642,6 +642,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as u64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as u64;
+                exemplaires_du_lot.ecrire(&*db, &existing_copies, &to_insert);
                 // La pochette PROPRE d'une piste se pose à part : `update_batch`
                 // n'écrit pas `cover_path`, faute de quoi une piste relue
                 // recopierait dans sa ligne la pochette de son ALBUM (la lecture
@@ -824,7 +825,16 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 .filter(|(_, info)| info.est_locale())
                 .map(|(chemin, info)| (chemin.as_str(), info.id))
                 .collect();
-            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
+            // #4907 — les exemplaires tels qu'ils sont MAINTENANT (ce scan
+            // vient peut-être d'en rattacher) ; ils comptent pour les racines
+            // vidées comme pour sauver une piste.
+            let copies_du_scan: crate::routes::system::scan::CarteDesChemins =
+                tune_core::library::exemplaires::carte_des_exemplaires(&*db).unwrap_or_default();
+            let existing_refs: Vec<&str> = pistes_locales
+                .keys()
+                .copied()
+                .chain(copies_du_scan.keys().map(String::as_str))
+                .collect();
             racines_videes = crate::routes::system::scan::roots_gone_empty(
                 &music_dirs,
                 &existing_refs,
@@ -878,6 +888,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     }
                 }
             }
+            let a_promouvoir = crate::routes::system::scan::separer_les_promotions(
+                &mut a_supprimer,
+                &copies_du_scan,
+                &discovered_paths,
+            );
             if purge_trop_massive(a_supprimer.len(), examinees) {
                 tracing::error!(
                     candidats = a_supprimer.len(),
@@ -904,8 +919,30 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 a_supprimer,
                 "auto",
             );
-            let pruned = bilan.removed;
-            db_delete_failed = bilan.db_delete_failed;
+            let bilan_promotions = crate::routes::system::scan::promouvoir_les_exemplaires(
+                &*db,
+                &track_repo,
+                a_promouvoir,
+                "auto",
+            );
+            crate::routes::system::scan::purger_les_exemplaires_disparus(
+                &*db,
+                &copies_du_scan,
+                &discovered_paths,
+                None,
+                |chemin| {
+                    verdict_purge(
+                        chemin,
+                        &music_dirs,
+                        &missing_dirs,
+                        &error_dirs,
+                        emptied_roots,
+                        &sous_arbres,
+                    )
+                },
+            );
+            let pruned = bilan.removed + bilan_promotions.removed;
+            db_delete_failed = bilan.db_delete_failed + bilan_promotions.db_delete_failed;
             if hors_perimetre > 0 {
                 tracing::warn!(
                     hors_perimetre,
@@ -1874,12 +1911,21 @@ pub fn spawn_file_watcher(
                                             &candidates,
                                         )
                                     {
+                                        // #4907 — la copie devient un EXEMPLAIRE
+                                        // de la piste identique, pas un fichier
+                                        // ignoré.
+                                        if let Some(n) = tune_core::library::exemplaires::NouvelExemplaire::depuis_la_piste(
+                                            &existing_path,
+                                            &track,
+                                        ) {
+                                            tune_core::library::exemplaires::rattacher(&*db, &[n]);
+                                        }
                                         tracing::debug!(
                                             audio_hash = %hash,
                                             album_id = aid,
                                             path = %sf.path,
                                             existing_path = %existing_path,
-                                            "watcher_skip_duplicate_audio_hash"
+                                            "watcher_exemplaire_identique"
                                         );
                                         continue;
                                     }
@@ -1946,6 +1992,20 @@ pub fn spawn_file_watcher(
                                     continue;
                                 }
                                 VerdictPurge::Supprimer => {}
+                            }
+                            // #4907 — un exemplaire disparu ne retire que
+                            // lui-même ; le fichier d'une piste qui a une
+                            // copie joignable cède sa place à la copie, et la
+                            // piste garde son identifiant.
+                            match tune_core::library::exemplaires::retirer_le_fichier(
+                                &*db,
+                                &change.path,
+                            ) {
+                                tune_core::library::exemplaires::RetraitDuFichier::Aucun => {}
+                                autre => {
+                                    info!(path = %change.path, retrait = ?autre, "watcher_exemplaire_retire");
+                                    continue;
+                                }
                             }
                             let track_repo = TrackRepo::with_backend(db.clone());
                             if track_repo.delete_by_path(&change.path).is_ok() {

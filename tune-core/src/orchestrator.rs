@@ -1444,6 +1444,9 @@ mod wav_override_tests;
 /// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
 #[cfg(test)]
 mod alac_passthrough_tests;
+/// #4907 — l'exemplaire préféré injoignable : la lecture part depuis le suivant.
+#[cfg(test)]
+mod exemplaires_lecture_tests;
 #[cfg(test)]
 mod plafond_16_bits_tests;
 /// #4016 — le plafond de 4 GiB de l en-tete RIFF, mesure puis route.

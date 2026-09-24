@@ -4,6 +4,8 @@ pub mod artwork_proxy;
 pub mod audit;
 pub mod cover_fetcher;
 pub mod duplicate_detector;
+/// Les exemplaires d'une piste dans plusieurs répertoires (#4907).
+pub mod exemplaires;
 pub mod export;
 pub mod folder_playlists;
 pub mod full_text_search;
