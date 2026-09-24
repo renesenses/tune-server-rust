@@ -8,6 +8,7 @@
 use serde_json::{Value, json};
 
 use crate::hote::Hote;
+use crate::liens::{DemandeLien, EVENEMENT_MINUTEUR, Liens, declencheur};
 use crate::modele::Demande;
 use crate::moteur::Convertisseur;
 use crate::snapshots::{RETENTION_PAR_PLAYLIST, Snapshots, mode};
@@ -188,10 +189,130 @@ pub fn repondre<H: Hote + ?Sized>(hote: &H, requete: &Value) -> Value {
             }
         }
 
+        // -- #4719 — liens auto-sync --------------------------------------------
+        ("POST", "/liens") => match serde_json::from_value::<DemandeLien>(corps) {
+            Ok(d) => match Liens::new(hote).creer(&d) {
+                Ok(lien) => reponse(200, json!({ "lien": lien })),
+                Err(e) => erreur(&e),
+            },
+            Err(e) => reponse(400, json!({ "error": format!("demande illisible : {e}") })),
+        },
+
+        ("GET", "/liens") => match Liens::new(hote).lister() {
+            Ok(l) => reponse(200, json!({ "count": l.len(), "liens": l })),
+            Err(e) => erreur(&e),
+        },
+
+        ("GET", "/lien") => {
+            let id = parametre(requete_query, "id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "paramètre ?id= manquant" }));
+            }
+            match Liens::new(hote).lire(&id) {
+                Ok(l) => reponse(200, json!({ "lien": l })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("GET", "/lien/journal") => {
+            let id = parametre(requete_query, "id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "paramètre ?id= manquant" }));
+            }
+            match Liens::new(hote).journal(&id) {
+                Ok(j) => reponse(200, json!({ "count": j.len(), "entrees": j })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/lien/apercu") => {
+            let id = texte(&corps, "lien_id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "lien_id manquant" }));
+            }
+            match Liens::new(hote).apercu(&id) {
+                Ok(plan) => reponse(200, json!({ "plan": plan })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/lien/synchroniser") => {
+            let id = texte(&corps, "lien_id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "lien_id manquant" }));
+            }
+            let accord = corps
+                .get("accord")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match Liens::new(hote).synchroniser(&id, accord, declencheur::DEMANDE) {
+                Ok((lien, entree)) => reponse(200, json!({ "lien": lien, "entree": entree })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/lien/pause") => {
+            let id = texte(&corps, "lien_id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "lien_id manquant" }));
+            }
+            let pause = corps.get("pause").and_then(Value::as_bool).unwrap_or(true);
+            match Liens::new(hote).mettre_en_pause(&id, pause) {
+                Ok(l) => reponse(200, json!({ "lien": l })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/lien/reglages") => {
+            let id = texte(&corps, "lien_id");
+            let Some(cadence) = corps.get("cadence_minutes").and_then(Value::as_u64) else {
+                return reponse(400, json!({ "error": "cadence_minutes manquant" }));
+            };
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "lien_id manquant" }));
+            }
+            match Liens::new(hote).regler(&id, cadence) {
+                Ok(l) => reponse(200, json!({ "lien": l })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/lien/supprimer") => {
+            let id = texte(&corps, "lien_id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "lien_id manquant" }));
+            }
+            match Liens::new(hote).supprimer(&id) {
+                Ok(v) => reponse(200, v),
+                Err(e) => erreur(&e),
+            }
+        }
+
         _ => reponse(
             404,
             json!({ "error": "route inconnue", "method": methode, "path": chemin }),
         ),
+    }
+}
+
+/// Un événement de l'hôte (`plugin_on_event`). Seul le `minuteur` (#4719)
+/// est attendu : il synchronise au plus UN lien dû. Tout le reste est ignoré.
+/// Ne rend rien et ne trappe jamais : une erreur finit dans le journal de
+/// l'hôte.
+pub fn sur_evenement<H: Hote + ?Sized>(hote: &H, evenement: &Value) {
+    if evenement.get("name").and_then(Value::as_str) != Some(EVENEMENT_MINUTEUR) {
+        return;
+    }
+    match Liens::new(hote).tic() {
+        Ok(Some((lien, entree))) => hote.journal(
+            "info",
+            &format!(
+                "minuteur : lien {} synchronisé ({}, {} ajout(s))",
+                lien.lien_id, entree.statut, entree.ajoutees
+            ),
+        ),
+        Ok(None) => {}
+        Err(e) => hote.journal("warn", &format!("minuteur : {e}")),
     }
 }
 
@@ -201,6 +322,7 @@ fn erreur(message: &str) -> Value {
     let code = if message.starts_with("accord_requis") {
         409
     } else if message.starts_with("lot_inconnu")
+        || message.starts_with("lien_inconnu")
         || message.starts_with("snapshot_inconnu")
         || message.starts_with("snapshot_expire")
         || message.starts_with("plan_inconnu")
@@ -208,6 +330,8 @@ fn erreur(message: &str) -> Value {
         404
     } else if message.starts_with("lot_deja_engage")
         || message.starts_with("plan_deja_engage")
+        || message.starts_with("lien_en_pause")
+        || message.starts_with("apercu_requis")
         || message.starts_with("cible_locale_non_supportee")
     {
         409

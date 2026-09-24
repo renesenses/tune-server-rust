@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn host_streaming_playlist_create(ptr: u32, len: u32) -> u64;
     fn host_streaming_playlist_add_tracks(ptr: u32, len: u32) -> u64;
     fn host_streaming_match_track(ptr: u32, len: u32) -> u64;
+    fn host_library_match_track(ptr: u32, len: u32) -> u64;
     fn host_kv_get(ptr: u32, len: u32) -> u64;
     fn host_kv_set(ptr: u32, len: u32) -> u64;
     fn host_kv_list(ptr: u32, len: u32) -> u64;
@@ -85,6 +86,16 @@ pub extern "C" fn plugin_dispatch(ptr: u32, len: u32) -> u64 {
     let requete: Value = serde_json::from_slice(&entree).unwrap_or(Value::Null);
     let reponse = crate::dispatch::repondre(&HoteWasm, &requete);
     ecrire(&serde_json::to_vec(&reponse).unwrap_or_else(|_| b"{}".to_vec()))
+}
+
+/// Le point d'entrée des événements (RFC §3.6) — ici, le seul qui compte :
+/// le `minuteur` que l'hôte envoie toutes les minutes au greffon abonné
+/// (#4719). Rien n'est rendu : un événement est « tiré et oublié ».
+#[unsafe(no_mangle)]
+pub extern "C" fn plugin_on_event(ptr: u32, len: u32) {
+    let entree = unsafe { lire(ptr, len) };
+    let evenement: Value = serde_json::from_slice(&entree).unwrap_or(Value::Null);
+    crate::dispatch::sur_evenement(&HoteWasm, &evenement);
 }
 
 unsafe fn lire(ptr: u32, len: u32) -> Vec<u8> {
@@ -228,6 +239,24 @@ impl Hote for HoteWasm {
             host_streaming_match_track,
             &serde_json::json!({
                 "service": service,
+                "title": title,
+                "artist": artist,
+                "isrc": isrc,
+                "duration_ms": duration_ms,
+            }),
+        )
+    }
+
+    fn library_match_track(
+        &self,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<Value, String> {
+        appel(
+            host_library_match_track,
+            &serde_json::json!({
                 "title": title,
                 "artist": artist,
                 "isrc": isrc,

@@ -281,9 +281,11 @@ fn demande() -> Value {
 // ---------------------------------------------------------------------------
 
 /// Le manifeste dit ce que le ticket demande : greffon PREMIUM, et aucune
-/// permission de plus que les trois de la tranche 1.
+/// permission de plus que celles de la tranche 1. `library` s'y ajoute avec
+/// les liens auto-sync (#4719) : un lien peut avoir la bibliothèque locale
+/// pour extrémité, et y apparier demande `host_library_match_track`.
 #[test]
-fn le_manifeste_est_premium_et_ne_demande_que_trois_permissions() {
+fn le_manifeste_est_premium_et_ne_demande_que_les_permissions_voulues() {
     let brut = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/plugins/playlists-converter/manifest.json"),
@@ -295,9 +297,10 @@ fn le_manifeste_est_premium_et_ne_demande_que_trois_permissions() {
     assert_eq!(m["entry_point"], "main.wasm");
     let mut perms = permissions_du_manifeste().into_iter().collect::<Vec<_>>();
     perms.sort();
-    assert_eq!(perms, vec!["kv", "playlists", "streaming"]);
-    // Aucun abonnement au bus : ce greffon ne réagit à rien, il répond.
-    assert!(m.get("event_subscriptions").is_none());
+    assert_eq!(perms, vec!["kv", "library", "playlists", "streaming"]);
+    // Un seul abonnement, et pas au bus : le minuteur de l'hôte (#4719), qui
+    // réveille les liens auto-sync. Rien d'autre.
+    assert_eq!(m["event_subscriptions"], json!(["minuteur"]));
 }
 
 /// L'ABI répond : le module se charge, donc `abi_version()` vaut celle de
