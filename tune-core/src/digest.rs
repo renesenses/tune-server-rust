@@ -211,19 +211,25 @@ fn generate_recommendations(
         .filter_map(|cols| cols.first().and_then(|v| v.as_string()))
         .collect();
 
+    // #4806 — une suggestion du résumé hebdomadaire est une sélection
+    // automatique : jamais un titre banni par le profil actif.
+    let sans_bannis = crate::db::facet_filter::banned_tracks_excluded(
+        crate::db::hidden_repo::profil_de_selection_automatique(backend),
+    );
     if top_genres.is_empty() {
         // Fallback: random tracks from library not recently played
+        let sql = format!(
+            "SELECT t.title, a.name FROM tracks t \
+             LEFT JOIN artists a ON a.id = t.artist_id \
+             WHERE t.id NOT IN ( \
+                 SELECT DISTINCT track_id FROM listen_history \
+                 WHERE track_id IS NOT NULL AND listened_at >= ? \
+             ) \
+             AND {sans_bannis} \
+             ORDER BY RANDOM() LIMIT 5"
+        );
         return backend
-            .query_many(
-                "SELECT t.title, a.name FROM tracks t \
-                 LEFT JOIN artists a ON a.id = t.artist_id \
-                 WHERE t.id NOT IN ( \
-                     SELECT DISTINCT track_id FROM listen_history \
-                     WHERE track_id IS NOT NULL AND listened_at >= ? \
-                 ) \
-                 ORDER BY RANDOM() LIMIT 5",
-                &[&week_start.to_string() as &dyn ToSqlValue],
-            )
+            .query_many(&sql, &[&week_start.to_string() as &dyn ToSqlValue])
             .unwrap_or_default()
             .iter()
             .map(|cols| TrackPlay {
@@ -249,6 +255,7 @@ fn generate_recommendations(
              SELECT DISTINCT track_id FROM listen_history \
              WHERE track_id IS NOT NULL AND listened_at >= ? \
          ) \
+         AND {sans_bannis} \
          ORDER BY RANDOM() LIMIT 5"
     );
 
@@ -262,4 +269,53 @@ fn generate_recommendations(
             plays: 0,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests_titres_bannis_4806 {
+    use super::*;
+    use crate::db::sqlite::SqliteDb;
+
+    /// #4806 — les suggestions du résumé hebdomadaire sont une sélection
+    /// automatique : un titre banni n'y figure jamais, avec ou sans
+    /// historique de genre. Témoin avant, retour après débannissement.
+    #[test]
+    fn les_suggestions_du_resume_ignorent_un_titre_banni() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+        for i in 1..=6i64 {
+            let params: [&dyn ToSqlValue; 3] = [&i, &format!("Piste {i}"), &format!("/m/{i}.flac")];
+            db.execute(
+                "INSERT INTO tracks (id, title, file_path, genre) VALUES (?, ?, ?, 'Jazz')",
+                &params,
+            )
+            .unwrap();
+        }
+        let suggestions = || -> Vec<String> {
+            generate_recommendations(&db, "2026-09-14", "2026-09-21")
+                .into_iter()
+                .map(|t| t.title)
+                .collect()
+        };
+        assert!(
+            (0..50).any(|_| suggestions().contains(&"Piste 3".to_string())),
+            "témoin : la piste sort avant le bannissement"
+        );
+
+        let bans = crate::db::hidden_repo::HiddenRepo::with_backend(db.clone());
+        assert!(bans.ban_track(1, 3).unwrap());
+        for _ in 0..50 {
+            let s = suggestions();
+            assert_eq!(s.len(), 5, "cinq suggestions jouables : {s:?}");
+            assert!(
+                !s.contains(&"Piste 3".to_string()),
+                "bannie et suggérée : {s:?}"
+            );
+        }
+
+        assert!(bans.unban_track(1, 3).unwrap());
+        assert!((0..50).any(|_| suggestions().contains(&"Piste 3".to_string())));
+    }
 }

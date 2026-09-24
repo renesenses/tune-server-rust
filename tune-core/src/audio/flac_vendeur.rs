@@ -153,6 +153,103 @@ pub fn flac_ecrit_par_ffmpeg(chemin: &Path) -> bool {
         .is_some_and(|e| entete_a_eviter_en_passthrough(&e))
 }
 
+/// Longueur de l'en-tête neuf : `fLaC` (4) + en-tête de bloc (4) + STREAMINFO
+/// (34) + en-tête de bloc (4) + VORBIS_COMMENT vide (8).
+pub const ENTETE_NEUF_OCTETS: usize = 4 + 4 + 34 + 4 + 8;
+
+/// #4800 — le conteneur NEUF sous lequel servir ce FLAC tel quel, sans le
+/// décoder : `fLaC`, son STREAMINFO recopié à l'octet près, un VORBIS_COMMENT
+/// vide — puis ses trames, copiées depuis le fichier à partir de
+/// `body_src_start`.
+///
+/// C'est, à l'octet près, la forme que [`crate::audio::decode::remux_flac_dash_stream`]
+/// donne aux trames Tidal (DASH) pour les renderers DLNA, l'Eversolo DMP-A8
+/// compris — et les fichiers de l'enregistreur portent ces mêmes trames,
+/// recopiées par `ffmpeg -c copy` sous un en-tête `Lavf`. Réécrire l'en-tête
+/// sans toucher aux trames tient donc la promesse de #4350 (conteneur neuf,
+/// échantillons intacts) sans le décodage-ré-encodage complet qui retardait
+/// le premier son de 2 à 4,6 s sur le .18 (mesure du 23/09, cause 5 de #4800).
+///
+/// `None` dans le doute — pas un FLAC, STREAMINFO illisible ou sans cadence,
+/// aucune trame après les métadonnées, ou premier octet qui n'est pas un code
+/// de synchronisation de trame : la décision garde alors le transcodage.
+pub fn conteneur_neuf<R: Read + Seek>(
+    lecteur: &mut R,
+    taille_fichier: u64,
+) -> Option<crate::audio::faststart::FaststartMap> {
+    let mut marqueur = [0u8; 4];
+    lecteur.read_exact(&mut marqueur).ok()?;
+    if &marqueur != b"fLaC" {
+        return None;
+    }
+    let mut entete = [0u8; 4];
+    lecteur.read_exact(&mut entete).ok()?;
+    let longueur = u32::from_be_bytes([0, entete[1], entete[2], entete[3]]);
+    if entete[0] & 0x7f != 0 || longueur != 34 {
+        return None;
+    }
+    let mut streaminfo = [0u8; 34];
+    lecteur.read_exact(&mut streaminfo).ok()?;
+    // Cadence sur 20 bits en tête du quatrième mot : nulle, le STREAMINFO est
+    // un gabarit jamais rempli, pas un en-tête.
+    let cadence = u32::from_be_bytes([
+        streaminfo[10],
+        streaminfo[11],
+        streaminfo[12],
+        streaminfo[13],
+    ]) >> 12;
+    if cadence == 0 {
+        return None;
+    }
+    let mut dernier = entete[0] & 0x80 != 0;
+    let mut blocs = 0usize;
+    while !dernier {
+        blocs += 1;
+        if blocs > BLOCS_MAX {
+            return None;
+        }
+        let mut e = [0u8; 4];
+        lecteur.read_exact(&mut e).ok()?;
+        dernier = e[0] & 0x80 != 0;
+        let l = u32::from_be_bytes([0, e[1], e[2], e[3]]);
+        lecteur.seek(SeekFrom::Current(i64::from(l))).ok()?;
+    }
+    let debut_des_trames = lecteur.stream_position().ok()?;
+    if debut_des_trames >= taille_fichier {
+        return None;
+    }
+    // Code de synchronisation d'une trame FLAC : 0xFFF8 (taille de bloc
+    // fixe) ou 0xFFF9 (variable), les deux bits réservés à zéro.
+    let mut sync = [0u8; 2];
+    lecteur.read_exact(&mut sync).ok()?;
+    if sync[0] != 0xFF || sync[1] & 0xFC != 0xF8 {
+        return None;
+    }
+    let mut header = Vec::with_capacity(ENTETE_NEUF_OCTETS);
+    header.extend_from_slice(b"fLaC");
+    header.extend_from_slice(&[0x00, 0x00, 0x00, 0x22]);
+    header.extend_from_slice(&streaminfo);
+    header.extend_from_slice(&[0x84, 0x00, 0x00, 0x08]);
+    header.extend_from_slice(&[0u8; 8]);
+    let body_len = taille_fichier - debut_des_trames;
+    Some(crate::audio::faststart::FaststartMap {
+        total: header.len() as u64 + body_len,
+        header,
+        body_src_start: debut_des_trames,
+        body_len,
+    })
+}
+
+/// [`conteneur_neuf`] sur un fichier du disque. Seules les métadonnées sont
+/// lues (une pochette est sautée, jamais chargée) ; `None` dans le doute.
+pub fn conteneur_neuf_pour_passthrough(
+    chemin: &Path,
+) -> Option<crate::audio::faststart::FaststartMap> {
+    let f = std::fs::File::open(chemin).ok()?;
+    let taille = f.metadata().ok()?.len();
+    conteneur_neuf(&mut std::io::BufReader::new(f), taille)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +386,114 @@ mod tests {
         assert!(vendeur_est_ffmpeg(" Lavf58.76.100"));
         assert!(!vendeur_est_ffmpeg("libFLAC"));
         assert!(!vendeur_est_ffmpeg(""));
+    }
+
+    // ── #4800 — le conteneur neuf ─────────────────────────────────────────
+
+    /// Un STREAMINFO rempli comme celui mesuré sur le .18 le 23/09
+    /// (`10 - Stickle Bricks.flac`, Qobuz, enregistreur) : blocs 4608,
+    /// trames 857..20 596, 96 kHz, 2 canaux, 24 bits, 10 369 280
+    /// échantillons, MD5 nul.
+    fn streaminfo_du_18() -> [u8; 34] {
+        let mut s = [0u8; 34];
+        s[0..4].copy_from_slice(&[0x12, 0x00, 0x12, 0x00]);
+        s[4..10].copy_from_slice(&[0x00, 0x03, 0x59, 0x00, 0x50, 0x74]);
+        s[10..14].copy_from_slice(&[0x17, 0x70, 0x03, 0x70]);
+        s[14..18].copy_from_slice(&[0x00, 0x9e, 0x39, 0x00]);
+        s
+    }
+
+    /// La forme exacte du fichier du .18 : STREAMINFO, PADDING (42 509),
+    /// VORBIS_COMMENT `Lavf60.16.100` avec ses tags, PICTURE (154 508) en
+    /// dernier, puis les trames. Rend le fichier et l'offset des trames.
+    fn fichier_du_18(trames: &[u8]) -> (Vec<u8>, u64) {
+        let mut f = b"fLaC".to_vec();
+        f.extend(bloc(false, 0, &streaminfo_du_18()));
+        f.extend(bloc(false, 1, &vec![0u8; 42_509]));
+        let mut tags = vorbis("Lavf60.16.100");
+        // Le compteur de commentaires est le dernier mot de `vorbis` : on le
+        // remplace par deux tags, comme sur le fichier mesuré.
+        tags.truncate(tags.len() - 4);
+        tags.extend_from_slice(&2u32.to_le_bytes());
+        for t in ["TITLE=Stickle Bricks", "ARTIST=Guess What"] {
+            tags.extend_from_slice(&(t.len() as u32).to_le_bytes());
+            tags.extend_from_slice(t.as_bytes());
+        }
+        f.extend(bloc(false, 4, &tags));
+        f.extend(bloc(true, 6, &vec![0xAB; 154_508]));
+        let debut = f.len() as u64;
+        f.extend_from_slice(trames);
+        (f, debut)
+    }
+
+    #[test]
+    fn le_conteneur_neuf_recopie_streaminfo_et_pointe_sur_les_trames_4800() {
+        let trames = [0xFF, 0xF8, 0x5B, 0x1C, 0x00, 0xE9, 0x48, 0xFF, 0xFF, 0xFF];
+        let (f, debut) = fichier_du_18(&trames);
+        let taille = f.len() as u64;
+        let m = conteneur_neuf(&mut Cursor::new(f), taille).expect("conteneur neuf");
+        assert_eq!(m.header.len(), ENTETE_NEUF_OCTETS);
+        assert_eq!(&m.header[..8], b"fLaC\x00\x00\x00\x22");
+        assert_eq!(
+            &m.header[8..42],
+            &streaminfo_du_18(),
+            "STREAMINFO à l'octet près"
+        );
+        assert_eq!(
+            &m.header[42..],
+            &[0x84, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0],
+            "VORBIS_COMMENT vide, dernier bloc — celui de `remux_flac_dash_stream`"
+        );
+        assert_eq!(
+            m.body_src_start, debut,
+            "les trames commencent après la pochette"
+        );
+        assert_eq!(m.body_len, trames.len() as u64);
+        assert_eq!(m.total, ENTETE_NEUF_OCTETS as u64 + trames.len() as u64);
+        // Ce qui est SERVI, reconstitué : en-tête neuf puis trames intactes.
+        let (f, _) = fichier_du_18(&trames);
+        let servi = [&m.header[..], &f[m.body_src_start as usize..]].concat();
+        assert_eq!(servi.len() as u64, m.total);
+        assert_eq!(&servi[ENTETE_NEUF_OCTETS..], &trames);
+    }
+
+    /// Le fichier de référence du dépôt (Lavf, MD5 réel) se remuxe aussi :
+    /// la fonction ne juge pas le vendeur, c'est la règle qui décide quand
+    /// l'appeler.
+    #[test]
+    fn le_flac_de_reference_du_depot_a_un_conteneur_neuf() {
+        let chemin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+        let taille = std::fs::metadata(&chemin).unwrap().len();
+        let m = conteneur_neuf_pour_passthrough(&chemin).expect("conteneur neuf");
+        let d = std::fs::read(&chemin).unwrap();
+        assert_eq!(&m.header[8..42], &d[8..42]);
+        assert_eq!(
+            m.total - ENTETE_NEUF_OCTETS as u64,
+            taille - m.body_src_start
+        );
+        assert_eq!(d[m.body_src_start as usize], 0xFF);
+        assert_eq!(d[m.body_src_start as usize + 1] & 0xFC, 0xF8);
+    }
+
+    /// Dans le doute, `None` : la décision garde alors le transcodage.
+    #[test]
+    fn sans_trame_ou_sans_cadence_pas_de_conteneur_neuf() {
+        // Aucune trame après les métadonnées.
+        let (f, _) = fichier_du_18(&[]);
+        let taille = f.len() as u64;
+        assert!(conteneur_neuf(&mut Cursor::new(f), taille).is_none());
+        // Un premier octet qui n'est pas un code de synchronisation.
+        let (f, _) = fichier_du_18(&[0x00, 0x00, 0x00, 0x00]);
+        let taille = f.len() as u64;
+        assert!(conteneur_neuf(&mut Cursor::new(f), taille).is_none());
+        // STREAMINFO gabarit (cadence nulle), comme les témoins du panneau.
+        let mut f = b"fLaC".to_vec();
+        f.extend(bloc(true, 0, &streaminfo(true)));
+        f.extend_from_slice(&[0xFF, 0xF8, 0x69, 0x18]);
+        let taille = f.len() as u64;
+        assert!(conteneur_neuf(&mut Cursor::new(f), taille).is_none());
+        // Pas un FLAC ; chemin inexistant.
+        assert!(conteneur_neuf(&mut Cursor::new(b"RIFF....WAVE".to_vec()), 12).is_none());
+        assert!(conteneur_neuf_pour_passthrough(Path::new("/nexiste/pas.flac")).is_none());
     }
 }

@@ -198,6 +198,10 @@ impl PlaybackOrchestrator {
             {
                 return self.resolve_direct_url(req).await;
             }
+            // #4863 — une source PCM inscrite par un greffon (lecture d'un CD).
+            if let Some(fournisseur) = self.sources_pcm.fournisseur(source) {
+                return self.resolve_source_pcm(source, fournisseur, req).await;
+            }
             return self.resolve_streaming_url(source, req).await;
         }
 

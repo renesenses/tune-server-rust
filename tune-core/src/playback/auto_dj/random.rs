@@ -32,12 +32,17 @@ pub fn generate_random_queue(
         AutoplayMode::RandomTracks => "ORDER BY RANDOM() LIMIT 10",
         AutoplayMode::Off | AutoplayMode::Similar => return Ok(Vec::new()),
     };
+    // #4806 — les titres bannis par le profil actif ne sont pas éligibles :
+    // un seul prédicat dans le CTE couvre les quatre modes.
+    let profil = crate::db::hidden_repo::profil_de_selection_automatique(db);
+    let sans_bannis = crate::db::facet_filter::banned_tracks_excluded(profil);
     let sql = format!(
         "WITH eligible AS (SELECT t.*, COALESCE(NULLIF(t.year, 0), al.year) AS autoplay_year \
          FROM tracks t LEFT JOIN albums al ON al.id = t.album_id \
          WHERE COALESCE(NULLIF(t.source, ''), 'local') = 'local' \
          AND (NULLIF(TRIM(t.file_path), '') IS NOT NULL \
-              OR NULLIF(TRIM(t.cue_media_path), '') IS NOT NULL)) \
+              OR NULLIF(TRIM(t.cue_media_path), '') IS NOT NULL) \
+         AND {sans_bannis}) \
          SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.autoplay_year, t.bpm \
          FROM eligible t LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id {selection}"
@@ -269,5 +274,116 @@ mod tests {
             library(&db);
             check_groups(&db);
         }
+    }
+
+    /// #4806 — un titre banni ne sort d'AUCUN générateur de sélection
+    /// automatique de tune-core : les quatre modes d'autoplay, l'enchaînement
+    /// (`generate_queue`), l'ambiance, la radio d'artiste, la radio
+    /// intelligente et les recommandations. Cent passes chacun sur une base
+    /// de 24 pistes. Témoin : avant le bannissement, la piste sort ; après
+    /// débannissement, elle ressort. Le profil est celui du serveur (1 par
+    /// défaut), comme en production sans requête HTTP.
+    #[test]
+    fn un_titre_banni_ne_sort_d_aucun_generateur() {
+        use crate::ai::recommendations::{get_recommendations, smart_radio};
+        use crate::playback::auto_dj::{
+            Mood, generate_mood_queue, generate_queue, tracks_for_artist_names,
+        };
+
+        let db = db();
+        library(&db);
+        let bannie = 105i64;
+        let noms = vec!["Artist 1".to_string()];
+
+        let generateurs: Vec<(&str, Box<dyn Fn() -> Vec<i64>>)> = vec![
+            (
+                "autoplay:tracks",
+                Box::new(|| {
+                    ids_de(&generate_random_queue(&db, AutoplayMode::RandomTracks).unwrap())
+                }),
+            ),
+            (
+                "autoplay:album",
+                Box::new(|| {
+                    ids_de(&generate_random_queue(&db, AutoplayMode::RandomAlbum).unwrap())
+                }),
+            ),
+            (
+                "autoplay:artist",
+                Box::new(|| {
+                    ids_de(&generate_random_queue(&db, AutoplayMode::RandomArtist).unwrap())
+                }),
+            ),
+            (
+                "autoplay:year",
+                Box::new(|| ids_de(&generate_random_queue(&db, AutoplayMode::RandomYear).unwrap())),
+            ),
+            (
+                "enchainement",
+                Box::new(|| ids_de(&generate_queue(&db, 101, 20))),
+            ),
+            (
+                "ambiance",
+                Box::new(|| ids_de(&generate_mood_queue(&db, Mood::Party, 20))),
+            ),
+            (
+                "radio_artiste",
+                Box::new(|| ids_de(&tracks_for_artist_names(&db, &noms, 12, 12))),
+            ),
+            (
+                "radio_intelligente",
+                Box::new(|| {
+                    smart_radio(&db, Some(101), None, None, 20)
+                        .iter()
+                        .map(|t| t.track_id)
+                        .collect()
+                }),
+            ),
+            (
+                "recommandations",
+                Box::new(|| {
+                    get_recommendations(&db, None, 20)
+                        .iter()
+                        .map(|t| t.track_id)
+                        .collect()
+                }),
+            ),
+        ];
+
+        // Témoin : chaque générateur ramène la piste au moins une fois en
+        // cent passes (24 pistes, tirages de 10 à 20).
+        for (nom, g) in &generateurs {
+            let vue = (0..100).any(|_| g().contains(&bannie));
+            assert!(
+                vue,
+                "témoin {nom} : la piste doit sortir avant le bannissement"
+            );
+        }
+
+        let bans = crate::db::hidden_repo::HiddenRepo::with_backend(db.clone());
+        assert!(bans.ban_track(1, bannie).unwrap());
+        for (nom, g) in &generateurs {
+            for _ in 0..100 {
+                let tirage = g();
+                assert!(
+                    !tirage.contains(&bannie),
+                    "{nom} : bannie et pourtant sélectionnée : {tirage:?}"
+                );
+            }
+        }
+
+        // Débannir rend tout.
+        assert!(bans.unban_track(1, bannie).unwrap());
+        for (nom, g) in &generateurs {
+            let revue = (0..100).any(|_| g().contains(&bannie));
+            assert!(revue, "{nom} : débannie, la piste doit ressortir");
+        }
+    }
+
+    fn ids_de(tracks: &[Value]) -> Vec<i64> {
+        tracks
+            .iter()
+            .filter_map(|t| t["track_id"].as_i64())
+            .collect()
     }
 }

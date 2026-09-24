@@ -286,6 +286,12 @@ pub fn router() -> Router<AppState> {
         // #4767 — le type de sortie des albums (album / EP / single), sans
         // lequel la page d'un artiste ne peut pas se découper en sections.
         .route("/enrich-release-types", post(enrich::enrich_release_types))
+        // #4767 — les crédits MusicBrainz par disque, sans lesquels la page
+        // d'un artiste n'a ni « Collaborations » ni « Reprises ».
+        .route(
+            "/enrich-credits",
+            get(enrich::enrich_credits_releases_status).post(enrich::enrich_credits_releases),
+        )
         .route("/enrichment/status", get(enrich::enrichment_status))
         .route("/enrichment/run", post(enrich::enrichment_run))
         // La limite globale (50 Mo) coupait l'import bien avant le handler :

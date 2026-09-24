@@ -2229,6 +2229,25 @@ impl PositionPoller {
                                     ps.transition(fsm::Transition::PanneDeLecture {
                                         cause: CauseDeCoupure::FluxASec,
                                     });
+                                    // #4645 — un décrochage en cours de
+                                    // lecture finit AUSSI ici, quand le
+                                    // renderer se tait sans annoncer
+                                    // `Stopped`. Même reprise à la position
+                                    // atteinte que dans le bras du renderer
+                                    // calé ; la coupure reste le défaut.
+                                    let total = match stream_id.as_deref() {
+                                        Some(sid) => {
+                                            self.orchestrator.streamer_total_bytes(sid).await
+                                        }
+                                        None => None,
+                                    };
+                                    mesure_renderer_cale =
+                                        decisions::mesure_de_reprise_apres_flux_a_sec(
+                                            ps.peak_position_ms,
+                                            track_duration_ms,
+                                            current_bytes,
+                                            total,
+                                        );
                                     // « Démarrage mort » (#2394) : la piste n'a
                                     // JAMAIS été tirée (0 octet servi) sur un
                                     // renderer DLNA — le profil du pipeline

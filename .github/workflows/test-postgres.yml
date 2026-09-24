@@ -210,6 +210,13 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i4521_dr_liste_postgres -- --nocapture
 
+      # #4853 — les rayons de collections sur une VRAIE base, native ET issue de
+      # la bascule SQLite→PG (types BIGINT posés par la migration 070).
+      - name: Rayons de collections sur PostgreSQL (#4853)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4853 -- --nocapture
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

@@ -102,6 +102,12 @@ impl ScanGate {
         }
     }
 
+    /// Un scan détient-il le droit en ce moment ? C'est CE bit, et non le
+    /// réglage `scan_status`, qui décide si un nouveau départ sera refusé.
+    fn is_active(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & SCAN_ACTIVE != 0
+    }
+
     fn cancel_requested(&self) -> bool {
         self.state.load(Ordering::SeqCst) & (SCAN_ACTIVE | SCAN_CANCELLED)
             == (SCAN_ACTIVE | SCAN_CANCELLED)
@@ -157,6 +163,53 @@ pub(crate) fn scan_cancel_requested() -> bool {
 #[cfg(test)]
 mod scan_gate_tests {
     use super::ScanGate;
+
+    /// Le bit que `trigger_scan` consulte se lit, et retombe avec le jeton.
+    #[test]
+    fn le_verrou_dit_s_il_est_tenu() {
+        let _serialise = serialiser();
+        let gate = ScanGate::new();
+        assert!(!gate.is_active());
+        let jeton = gate.try_acquire().expect("premier depart");
+        assert!(gate.is_active(), "tenu : un nouveau depart serait refuse");
+        drop(jeton);
+        assert!(!gate.is_active(), "rendu : un nouveau depart passera");
+    }
+
+    #[test]
+    fn le_statut_publie_suit_le_droit_et_non_le_reglage() {
+        use super::statut_publie;
+        assert_eq!(statut_publie("idle".into(), true), "scanning");
+        assert_eq!(statut_publie("idle".into(), false), "idle");
+        assert_eq!(statut_publie("scanning".into(), false), "scanning");
+    }
+
+    /// LE DÉFAUT, par la vraie route et le vrai verrou global : la tâche de
+    /// scan a écrit `idle` mais tient encore son droit. `scan/status` doit
+    /// dire « scanning » — sinon le client relance et reçoit 409
+    /// `already_scanning` (pg_scan_converge_4602, 24/09/2026).
+    #[tokio::test]
+    async fn scan_status_ne_dit_pas_idle_tant_que_le_droit_est_tenu() {
+        let _serialise = serialiser();
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set("scan_status", "idle")
+            .unwrap();
+        let Some(jeton) = super::try_begin_scan() else {
+            // Un autre test de ce binaire tient le droit global : le cas est
+            // alors déjà celui qu'on veut éprouver.
+            let r = super::scan_status(axum::extract::State(state)).await;
+            assert_eq!(r.0["status"], "scanning");
+            return;
+        };
+        let r = super::scan_status(axum::extract::State(state.clone())).await;
+        assert_eq!(
+            r.0["status"], "scanning",
+            "réglage `idle` mais droit tenu : un clic « Scanner » recevrait 409"
+        );
+        assert_eq!(r.0["scanning"], true);
+        drop(jeton);
+    }
 
     /// Chaque `ScanGate` de test est local, mais le drapeau que son jeton lève
     /// pour le balayage acoustique est un COMPTEUR DE PROCESSUS (#2469,
@@ -2108,13 +2161,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
             }
             if let Err(e) = db.execute(
-                "UPDATE albums SET \
+                &format!("UPDATE albums SET \
                  format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
                  sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
                  bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
                  genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)), \
                  genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)), \
-                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id))",
+                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)), \
+                 {}",
+                    // #4836 : le label des pistes remonte sur l'album, que lit
+                    // l'onglet Labels — même fragment que la remontée par album.
+                    tune_core::db::album_repo::sql_label_repris_des_pistes()
+                ),
                 &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_album_quality_update_failed");
@@ -2575,6 +2633,17 @@ pub(crate) fn cloturer_scan_interrompu(
     );
 }
 
+/// Le statut que `GET /system/scan/status` publie : celui du réglage, sauf
+/// quand le droit de scanner est encore tenu — alors « scanning », parce qu'un
+/// nouveau départ serait refusé.
+fn statut_publie(stocke: String, droit_tenu: bool) -> String {
+    if droit_tenu {
+        "scanning".into()
+    } else {
+        stocke
+    }
+}
+
 pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let status = settings
@@ -2582,6 +2651,13 @@ pub(super) async fn scan_status(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .unwrap_or_else(|| "idle".into());
+    // La tâche de scan écrit `idle` AVANT d'avoir fini (journal, événements,
+    // suites du scan), et ne rend son droit qu'à sa terminaison réelle. Dans
+    // cet intervalle, dire « idle » invite à relancer un scan que
+    // `trigger_scan` refuse aussitôt en 409 `already_scanning` — vu trois fois
+    // le 24/09/2026 dans `pg_scan_converge_4602`, et atteignable par un
+    // utilisateur. Tant que le droit est tenu, le statut est donc « scanning ».
+    let status = statut_publie(status, SCAN_GATE.is_active());
     let scanning = status == "scanning";
     let result = settings
         .get("scan_result")
