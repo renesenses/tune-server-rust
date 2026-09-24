@@ -49,6 +49,12 @@ async fn app_avec_zones() -> (axum::Router, i64, i64) {
     let reseau = repo
         .create("Salon", Some("dlna"), Some("dlna:uuid-marantz"))
         .unwrap();
+    // #2742 (24/09) — un renderer SANS LPCM annoncé : sortie factice, sans
+    // Sink `GetProtocolInfo`. Absent du registre, il serait présumé capable et
+    // recevrait le crossfeed en WAV progressif — plus de réserve à nommer.
+    state.orchestrator.outputs.lock().await.register(Box::new(
+        tune_core::outputs::mock::MockOutput::new("dlna:uuid-marantz", "Salon").with_type("dlna"),
+    ));
     (tune_server::routes::router(state), locale, reseau)
 }
 
@@ -180,8 +186,9 @@ async fn une_zone_reseau_garde_le_crossfeed_reglable_et_nomme_sa_reserve() {
     );
     let detail = st["detail"].as_str().unwrap_or_default();
     assert!(
-        detail.contains("Au fil de l'eau"),
-        "l'explication doit dire ce que l'utilisateur PEUT faire : {detail}"
+        detail.contains("PCM non compressé"),
+        "l'explication doit dire pourquoi les pistes de la bibliothèque en \
+         sont privées : {detail}"
     );
     assert_eq!(st["requested"].as_bool(), Some(true));
 }
