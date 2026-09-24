@@ -606,11 +606,27 @@ CREATE TABLE IF NOT EXISTS playlists (
     profile_id INTEGER NOT NULL DEFAULT 1
 );
 
+-- #4889 — une ligne de playlist est SOIT une piste de la bibliotheque
+-- (`track_id`), SOIT un titre de service (`source` + `source_id`), jamais les
+-- deux ni aucun. Les colonnes d'affichage d'une ligne de service (titre,
+-- artiste, album, duree, pochette, album chez le service) sont copiees a
+-- l'ajout : lister la playlist n'appelle pas le service. Meme forme que
+-- `queue_items`. Jumelle de la migration SQLite 109 et de la PG 072.
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL DEFAULT 0
+    track_id INTEGER REFERENCES tracks(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    duration_ms INTEGER,
+    cover_url TEXT,
+    CHECK ((track_id IS NOT NULL AND source IS NULL AND source_id IS NULL)
+        OR (track_id IS NULL AND source IS NOT NULL AND source_id IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS zones (

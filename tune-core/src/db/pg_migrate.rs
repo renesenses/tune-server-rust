@@ -366,11 +366,22 @@ CREATE TABLE IF NOT EXISTS playlists (
     profile_id TEXT NOT NULL DEFAULT '1'
 );
 
+-- #4889 : `track_id` nul pour un titre de service, porte par `source` /
+-- `source_id` et ses colonnes d'affichage (migration PG 072, SQLite 109).
+-- Tout en TEXT comme le reste de ce schema : la 072 convertit `duration_ms`.
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id TEXT PRIMARY KEY,
     playlist_id TEXT NOT NULL,
-    track_id TEXT NOT NULL,
-    position TEXT NOT NULL DEFAULT 0
+    track_id TEXT,
+    position TEXT NOT NULL DEFAULT 0,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    duration_ms TEXT,
+    cover_url TEXT
 );
 
 CREATE SEQUENCE IF NOT EXISTS zones_id_seq;

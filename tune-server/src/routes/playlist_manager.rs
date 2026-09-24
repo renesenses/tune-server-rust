@@ -1099,11 +1099,12 @@ async fn restore_backup(
 
     let playlist_id = if let Some(ex) = existing {
         let pid = ex.id.unwrap_or(0);
-        // Clear existing tracks
-        let track_ids = playlist_repo.get_track_ids(pid).unwrap_or_default();
-        for (pos, _) in track_ids.iter().enumerate() {
-            playlist_repo.remove_track(pid, pos as i64).ok();
-        }
+        // Clear existing tracks — TOUTES les lignes. L'ancienne boucle
+        // retirait les positions 0..n-1, n compté sur les seules pistes
+        // LOCALES : depuis #4889 une playlist peut porter des titres de
+        // service, qui décalent les positions, et « remplacer » aurait
+        // laissé des lignes de l'ancienne version derrière la nouvelle.
+        playlist_repo.set_tracks(pid, &[]).ok();
         pid
     } else {
         match playlist_repo.create(
