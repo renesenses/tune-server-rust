@@ -1980,6 +1980,19 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
         up: "",
     },
 
+    // #4767 — les CREDITS MusicBrainz par disque : `track_credits.artist_mbid`
+    // (l'artiste credite, par son identifiant) et `albums.credits_mb_at` (le
+    // curseur de reprise de la passe `POST /system/enrich-credits`). Sans eux,
+    // les sections « Collaborations » et « Reprises » de la page artiste n'ont
+    // rien a lire : `track_credits` est VIDE en pratique.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'a la 106. Jumelle PG : 070.
+    Migration {
+        version: 107,
+        name: "credits_musicbrainz",
+        up: "",
+    },
     // #4853 — DOSSIERS DE COLLECTIONS (Gros Bidon, fil 1907 ; decision de
     // Bertrand du 24/09/2026 : arbre, profondeur maximale 3).
     //
@@ -2857,6 +2870,19 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // l'issue interdit.
             add_column_if_missing(db, "albums", "release_type", "TEXT");
         }
+        if migration.version == 107 {
+            // Credits MusicBrainz par disque (#4767). Sans defaut : NUL veut
+            // dire « inconnu » pour l'artiste, « jamais interroge » pour le
+            // disque. L'index vient APRES la colonne qu'il nomme.
+            add_column_if_missing(db, "track_credits", "artist_mbid", "TEXT");
+            add_column_if_missing(db, "albums", "credits_mb_at", "TEXT");
+            if let Err(e) = db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_track_credits_artist_mbid \
+                 ON track_credits(artist_mbid)",
+            ) {
+                warn!(erreur = %e, "migration_107_index_artist_mbid");
+            }
+        }
         if migration.version == 12 {
             upgrade_fts5_tables(db);
         }
@@ -3194,6 +3220,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // NOMME desormais `a.release_type`. Une base qui arriverait ici sans la
     // colonne ferait echouer TOUTES les requetes d'albums.
     add_column_if_missing(db, "albums", "release_type", "TEXT");
+
+    // Credits MusicBrainz par disque (migration v107, #4767). La page artiste
+    // et la passe des credits NOMMENT ces deux colonnes : une base qui
+    // arriverait ici sans elles ferait echouer ces deux lectures.
+    add_column_if_missing(db, "track_credits", "artist_mbid", "TEXT");
+    add_column_if_missing(db, "albums", "credits_mb_at", "TEXT");
 
     // Podcast subscriptions matched by streaming source id (migration v59). Safety
     // pass so DBs from any prior version get the column (Fabien: "S'abonner" stays).
@@ -3918,6 +3950,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         69,
         "albums_type_de_sortie",
         include_str!("../../migrations/postgres/069_albums_type_de_sortie.sql"),
+    ),
+    // Jumelle de la SQLite 107 (#4767) : credits MusicBrainz par disque.
+    // Numero remesure le 24/09/2026 sur origin/main ET sur toutes les
+    // branches `batch/*`, `rc/*` et les PR ouvertes : aucune 070 ailleurs.
+    (
+        70,
+        "credits_musicbrainz",
+        include_str!("../../migrations/postgres/070_credits_musicbrainz.sql"),
     ),
     // Jumelle de la SQLite 108 (#4853). Renumerotee le 24/09/2026 (070 → 071,
     // SQLite 107 → 108) a l'integration de la v0.9.164 : les credits MusicBrainz
@@ -5695,6 +5735,104 @@ mod tests {
         );
     }
 
+    /// #4767 — la migration 107 pose `track_credits.artist_mbid` et
+    /// `albums.credits_mb_at`, sur une base NEUVE comme sur une base ANCIENNE
+    /// dont `track_credits` date de la migration 9 ; et sa jumelle PG 070
+    /// existe, est enregistree et marque le bon numero.
+    #[test]
+    fn la_migration_107_pose_les_colonnes_des_credits_sur_base_neuve_et_ancienne() {
+        let colonnes = |db: &SqliteDb, table: &str| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+
+        // Base ANCIENNE : `track_credits` telle que la migration 9 la creait,
+        // avec une ligne deja ecrite, et un album sans les colonnes recentes.
+        let ancienne = SqliteDb::open_in_memory().unwrap();
+        ancienne
+            .execute_batch(
+                "CREATE TABLE albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    artist_id INTEGER,
+                    year INTEGER,
+                    folder_path TEXT
+                );
+                CREATE TABLE track_credits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    track_id INTEGER NOT NULL,
+                    artist_id INTEGER,
+                    artist_name TEXT NOT NULL,
+                    role TEXT DEFAULT 'performer',
+                    instrument TEXT,
+                    position INTEGER DEFAULT 0
+                );
+                INSERT INTO track_credits (track_id, artist_name, role) VALUES (1, 'Neil Young', 'composer');",
+            )
+            .unwrap();
+        ancienne.init_schema().unwrap();
+        run_migrations(&ancienne).unwrap();
+
+        for (nom, db) in [("neuve", &neuve), ("ancienne", &ancienne)] {
+            let c = colonnes(db, "track_credits");
+            assert!(
+                c.iter().any(|x| x == "artist_mbid"),
+                "base {nom} : `track_credits.artist_mbid` manque ({c:?})"
+            );
+            let c = colonnes(db, "albums");
+            assert!(
+                c.iter().any(|x| x == "credits_mb_at"),
+                "base {nom} : `albums.credits_mb_at` manque ({c:?})"
+            );
+        }
+        {
+            let conn = ancienne.connection().lock().unwrap();
+            let (n, mbid): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(artist_mbid) FROM track_credits",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "le credit existant a disparu a la migration");
+            assert!(
+                mbid.is_none(),
+                "la migration n'invente pas de MBID : {mbid:?}"
+            );
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "070_credits_musicbrainz.sql";
+        let sql_pg = std::fs::read_to_string(racine.join("migrations/postgres").join(fichier))
+            .unwrap_or_else(|e| panic!("la jumelle PG {fichier} n'existe pas : {e}"));
+        let ce_fichier = include_str!("migrations.rs");
+        assert!(
+            ce_fichier.contains(fichier) && ce_fichier.contains("(\n        70,"),
+            "{fichier} n'est pas enregistree au rang 70 dans PG_MIGRATIONS"
+        );
+        assert!(
+            sql_pg.contains("VALUES (70, 'credits_musicbrainz')"),
+            "le script PG marque un autre numero dans schema_version"
+        );
+        for colonne in [
+            "ADD COLUMN IF NOT EXISTS artist_mbid TEXT",
+            "ADD COLUMN IF NOT EXISTS credits_mb_at TEXT",
+        ] {
+            assert!(
+                sql_pg.contains(colonne),
+                "la jumelle PG ne pose pas `{colonne}`"
+            );
+        }
+    }
+
     #[test]
     fn migration_count_matches() {
         let db = SqliteDb::open_in_memory().unwrap();
@@ -6155,6 +6293,9 @@ mod tests {
         // Pose `albums.release_type` — sans elle, aucune base PostgreSQL ne
         // recevrait la colonne que `album_repo::sql::select_album` NOMME
         // desormais, et TOUTES les requetes d'albums tomberaient sur ce parc.
+        // 70 : `credits_musicbrainz` (#4767), jumelle de la SQLite 107. Pose
+        // `track_credits.artist_mbid` et `albums.credits_mb_at`, que la passe
+        // des credits et la page artiste NOMMENT.
         // 71 : `collection_folders` (#4853), jumelle de la SQLite 108.
         assert_eq!(pg_latest_version(), 71, "latest PG migration must be 71");
         for wanted in [10, 11, 13, 36] {

@@ -19,7 +19,6 @@ use tracing::debug;
 
 const MB_API: &str = "https://musicbrainz.org/ws/2";
 const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
-const MB_RATE_LIMIT_MS: u64 = 1100;
 
 /// Below this score a search hit is noise rather than a match.
 const MIN_CONFIDENT_SCORE: i32 = 80;
@@ -510,8 +509,78 @@ pub async fn lookup_release_group_type(
     super::release_type::depuis_groupe_musicbrainz(&data)
 }
 
+/// Clé du créneau MusicBrainz dans le limiteur partagé
+/// [`crate::http::fetch::MUSICBRAINZ`]. C'est la MÊME que celle des pochettes
+/// et images d'artistes (`library::artwork`) : une clé par SERVICE, pas par
+/// passe — MusicBrainz plafonne à une requête par seconde PAR IP, et deux clés
+/// distinctes laisseraient deux flux parallèles doubler ce débit (503).
+pub const CLE_LIMITEUR_MUSICBRAINZ: &str = "mb";
+
+/// Attend le prochain créneau MusicBrainz.
+///
+/// 🔴 Ce n'est plus un `sleep` local (#4767). Un `sleep` n'espace que les
+/// requêtes d'UNE boucle : la passe des types de sortie, la ré-identification
+/// et la passe des crédits tournant en même temps que celle des pochettes
+/// frappaient MusicBrainz plusieurs fois dans la même seconde. Toutes passent
+/// désormais par le limiteur PARTAGÉ du dépôt, sous la même clé que les
+/// pochettes : les créneaux sont réservés un par un, une seconde d'écart,
+/// quel que soit le nombre de passes.
 pub async fn rate_limit_delay() {
-    tokio::time::sleep(std::time::Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+    crate::http::fetch::MUSICBRAINZ
+        .acquire(CLE_LIMITEUR_MUSICBRAINZ)
+        .await;
+}
+
+/// Issue d'une lecture de release pour la passe des crédits (#4767).
+///
+/// Trois cas, parce que l'appelant ne fait pas la même chose : une réponse
+/// se lit ; un identifiant INCONNU de MusicBrainz (404, 400) ne reviendra pas
+/// à la prochaine passe et se marque traité ; une panne (503, réseau) se
+/// retente plus tard.
+#[derive(Debug)]
+pub enum LectureRelease {
+    Lue(Value),
+    Inconnue,
+    Panne(String),
+}
+
+/// Les relations d'une release demandées en UNE requête : pistes,
+/// artistes crédités, relations d'enregistrement (musiciens, chant,
+/// production), relations d'œuvre (compositeur, parolier) et relations
+/// d'artistes au niveau de la release.
+pub const INC_CREDITS_RELEASE: &str =
+    "recordings+artist-credits+recording-level-rels+work-rels+work-level-rels+artist-rels";
+
+/// Lit une release avec toutes ses relations de crédits (#4767). N'attend PAS
+/// le créneau : l'appelant appelle [`rate_limit_delay`] juste avant.
+pub async fn lookup_release_credits(release_id: &str) -> LectureRelease {
+    let id = release_id.trim();
+    if id.is_empty() {
+        return LectureRelease::Inconnue;
+    }
+    let client = crate::http::client::shared();
+    let resp = match client
+        .get(format!("{MB_API}/release/{id}"))
+        .query(&[("inc", INC_CREDITS_RELEASE), ("fmt", "json")])
+        .header("User-Agent", MB_UA)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return LectureRelease::Panne(e.to_string()),
+    };
+    let statut = resp.status();
+    if statut == reqwest::StatusCode::NOT_FOUND || statut == reqwest::StatusCode::BAD_REQUEST {
+        return LectureRelease::Inconnue;
+    }
+    if !statut.is_success() {
+        return LectureRelease::Panne(format!("HTTP {statut}"));
+    }
+    match resp.json::<Value>().await {
+        Ok(v) => LectureRelease::Lue(v),
+        Err(e) => LectureRelease::Panne(e.to_string()),
+    }
 }
 
 #[cfg(test)]

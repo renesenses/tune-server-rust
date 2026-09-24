@@ -898,3 +898,10 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 [[test]]
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
+
+# #4767 — crédits MusicBrainz par disque (fixture réelle de *Déjà vu*) :
+# idempotence, sections « Collaborations » / « Reprises » de la page artiste,
+# focus par pistes créditées, route `/system/enrich-credits`.
+[[test]]
+name = "credits_musicbrainz_4767"
+path = "tests/credits_musicbrainz_4767.rs"

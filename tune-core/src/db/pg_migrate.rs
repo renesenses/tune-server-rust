@@ -273,7 +273,10 @@ CREATE TABLE IF NOT EXISTS albums (
     -- Type de sortie MusicBrainz (#4767) : `album`, `ep`, `single`,
     -- `broadcast`, `other`. TEXT des DEUX côtés — c'est un mot, pas un
     -- booléen — donc rien à reconvertir après la copie. NUL = inconnu.
-    release_type TEXT
+    release_type TEXT,
+    -- Curseur de la passe des crédits MusicBrainz (#4767). NUL = jamais
+    -- interrogé.
+    credits_mb_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -325,7 +328,8 @@ CREATE TABLE IF NOT EXISTS track_credits (
     artist_name TEXT NOT NULL,
     role TEXT DEFAULT 'performer',
     instrument TEXT,
-    position TEXT DEFAULT 0
+    position TEXT DEFAULT 0,
+    artist_mbid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
@@ -986,6 +990,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS is_compilation TEXT DEFAULT 0;
 -- défaut : NUL veut dire « inconnu », et c'est l'état normal — la couverture
 -- MBID mesurée est de 0,9 % sur le .18. `select_album` NOMME cette colonne.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
+
+-- Crédits MusicBrainz par disque (SQLite migration v107, #4767) : l'artiste
+-- crédité par son MBID, et le curseur de reprise de la passe.
+ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
 
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
