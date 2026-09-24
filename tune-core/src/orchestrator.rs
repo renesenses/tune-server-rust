@@ -1443,6 +1443,10 @@ mod wav_override_tests;
 /// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
 #[cfg(test)]
 mod alac_passthrough_tests;
+/// #4800 (cause 5) — un FLAC de l'enregistreur (`Lavf` sans MD5, #4350) part
+/// tel quel sous un en-tête neuf vers une zone réseau, sans être ré-encodé.
+#[cfg(test)]
+mod flac_conteneur_neuf_4800;
 #[cfg(test)]
 mod plafond_16_bits_tests;
 /// #4016 — le plafond de 4 GiB de l en-tete RIFF, mesure puis route.
