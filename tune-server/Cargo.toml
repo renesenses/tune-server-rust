@@ -321,6 +321,19 @@ path = "tests/dossier_cue_4625.rs"
 name = "ajouts_recents_fenetre"
 path = "tests/ajouts_recents_fenetre.rs"
 
+# #2901 (suite) — le plafond de la file d'attente est un reglage, et ses bornes
+# se ferment a l'ECRITURE : `PATCH /system/config` refuse une valeur hors
+# bornes au lieu de l'accepter puis de la ramener en silence a la lecture. La
+# cible mesure la file ECRITE apres `POST /playback/shuffle-all`, pas un
+# compteur de la reponse. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait JAMAIS compile, donc vert contre rien.
+#
+# Posee ICI, au milieu du fichier, et non a la fin : deux lots qui ajoutent
+# chacun leur cible en queue de `Cargo.toml` se conflictent a chaque fois.
+[[test]]
+name = "plafond_file_aleatoire_borne_2901"
+path = "tests/plafond_file_aleatoire_borne_2901.rs"
+
 # #3867 : l adresse ANNONCEE gouverne les URL que les taches de fond remettent a
 # un tiers. Trois sites de `background.rs` appelaient `get_local_ip()` brut, a
 # deux fonctions d un annonceur SSDP qui, lui, respecte `advertised_ip`. Le
