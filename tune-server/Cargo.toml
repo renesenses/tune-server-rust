@@ -906,3 +906,11 @@ path = "tests/credits_musicbrainz_4767.rs"
 [[test]]
 name = "crossfeed_reglable_zone_reseau_2742"
 path = "tests/crossfeed_reglable_zone_reseau_2742.rs"
+
+# La LISTE des albums manquants d'un dossier « Collections » (#901, Lulu) —
+# `orphan_album_ids` publiait la longueur de la liste, pas la liste. Cible
+# propre plutôt qu'un `mod` de `server_contracts` : ces gardes doivent pouvoir
+# tourner seules, sans traîner tout le contrat de routes derrière elles.
+[[test]]
+name = "collections_albums_manquants_901"
+path = "tests/collections_albums_manquants_901.rs"
