@@ -1158,18 +1158,34 @@ async fn browse_media_server(
         .ok_or_else(|| EchecParcours::ServeurInconnu(id.clone()).en_erreur_http("?"))?;
     drop(servers);
 
-    let (containers, items, total_matches) =
+    let (containers, items, total_matches, incomplet) =
         parcourir_les_enfants(&ms.content_directory_url, &ms.name, object_id)
             .await
             .map_err(|e| e.en_erreur_http(&ms.name))?;
     let fetched = containers.len() + items.len();
     let total = (total_matches as usize).max(fetched);
+    // #4895 : un parcours arrêté en route (page vide au milieu, DIDL illisible
+    // sur une page suivante, catalogue qui change…) servait ce qu'il avait lu
+    // en 200, sans un mot — l'écran le prenait pour la liste entière. Ce qui a
+    // été lu reste servi, mais la réponse le DIT, et le journal aussi.
+    if let Some(raison) = &incomplet {
+        warn!(
+            serveur = %ms.name,
+            object_id,
+            lus = fetched,
+            annonces = total,
+            error = %raison,
+            "browse_media_server_incomplete"
+        );
+    }
     Ok(Json(json!({
         "object_id": object_id,
         "containers": containers,
         "items": items,
         "total_matches": total,
         "number_returned": fetched,
+        "complet": incomplet.is_none(),
+        "incomplet": incomplet,
     })))
 }
 
@@ -1192,6 +1208,17 @@ pub(crate) enum EchecParcours {
     /// 2xx sans élément `<Result>` — un SOAP Fault, ou autre chose qu'un
     /// ContentDirectory.
     SansResultat,
+    /// #4895 — la réponse n'a pas de `NumberReturned` lisible : on ne sait pas
+    /// ce que la page était censée contenir.
+    SansCompteur,
+    /// #4895 — la page n'annonce pas de `TotalMatches` lisible.
+    SansTotal,
+    /// #4895 — Tune n'a su lire que `lus` des `annonces` éléments que la page
+    /// déclare (`NumberReturned`) : un DIDL que l'analyseur ne comprend pas.
+    DidlIllisible { lus: u32, annonces: u32 },
+    /// #4895 — une page vide alors que `total` éléments sont annoncés et que
+    /// seuls `lus` ont été lus : « 0/12 » sur la première page.
+    PaginationInterrompue { lus: u32, total: u32 },
 }
 
 impl EchecParcours {
@@ -1223,6 +1250,34 @@ impl EchecParcours {
                      (SOAP Fault ?)"
                 ),
             ),
+            EchecParcours::SansCompteur => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a répondu au Browse sans compteur \
+                     NumberReturned lisible"
+                ),
+            ),
+            EchecParcours::SansTotal => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a répondu au Browse sans compteur \
+                     TotalMatches lisible"
+                ),
+            ),
+            EchecParcours::DidlIllisible { lus, annonces } => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a rendu au Browse un DIDL que Tune ne sait \
+                     pas lire : {lus} des {annonces} éléments annoncés lus"
+                ),
+            ),
+            EchecParcours::PaginationInterrompue { lus, total } => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a rendu une page vide au Browse après \
+                     {lus} des {total} éléments annoncés"
+                ),
+            ),
         };
         warn!(serveur = nom_du_serveur, error = %message, "browse_media_server_failed");
         AppError {
@@ -1240,8 +1295,10 @@ impl EchecParcours {
 /// `unifier-serveurs-upnp-et-bibliotheque` a besoin du MEME parcours, page par
 /// page, et le recopier aurait fait diverger deux lecteurs du même protocole.
 ///
-/// Rend `(conteneurs, items, total_matches)`. Un `total_matches` de 0 avec des
-/// items rendus signifie seulement que le serveur ne l'annonce pas.
+/// Rend `(conteneurs, items, total_matches, incomplet)`. Un `total_matches` de
+/// 0 avec des items rendus signifie seulement que le serveur ne l'annonce pas.
+/// `incomplet` porte la raison d'un parcours arrêté APRÈS avoir lu quelque
+/// chose (#4895) : ce qui a été lu est servi, mais ce n'est pas tout.
 // UPnP Browse returns results in PAGES. The old code issued a single
 // Browse with RequestedCount=200 and returned only that page, so a server
 // with thousands of albums showed just its first page (~100 on MinimServer /
@@ -1254,7 +1311,7 @@ pub(crate) async fn parcourir_les_enfants(
     content_directory_url: &str,
     nom_du_serveur: &str,
     object_id: &str,
-) -> Result<(Vec<Value>, Vec<Value>, u32), EchecParcours> {
+) -> Result<(Vec<Value>, Vec<Value>, u32, Option<String>), EchecParcours> {
     let p = parcourir_les_enfants_verifie(content_directory_url, nom_du_serveur, object_id).await;
     // #4134 : l'échec de la PREMIÈRE page est celui du dossier — rien n'a été
     // lu, la route doit le dire au lieu de rendre un dossier vide muet. Un
@@ -1264,7 +1321,7 @@ pub(crate) async fn parcourir_les_enfants(
             return Err(cause);
         }
     }
-    Ok((p.conteneurs, p.items, p.total))
+    Ok((p.conteneurs, p.items, p.total, p.erreur))
 }
 
 pub(crate) struct ParcoursEnfants {
@@ -1273,9 +1330,12 @@ pub(crate) struct ParcoursEnfants {
     pub total: u32,
     pub erreur: Option<String>,
     /// La même défaillance, typée, pour la route `browse` (#4134) : elle en
-    /// tire 404 / 502 / 504 au lieu d'un dossier vide muet. Renseignée aux
-    /// seuls échecs qui peuvent frapper la PREMIÈRE page ; les incidents de
-    /// pagination, par construction, surviennent après avoir lu quelque chose.
+    /// tire 404 / 502 / 504 au lieu d'un dossier vide muet. Renseignée à TOUS
+    /// les échecs qui peuvent frapper la PREMIÈRE page — #4895 : un compteur
+    /// absent, un DIDL illisible ou une page vide sur N annoncés le peuvent
+    /// aussi, et sans cause ils rendaient un 200 vide. Les incidents qui ne
+    /// surviennent qu'après une page lue (catalogue changé, plafond…) n'en
+    /// ont pas besoin : la route les signale par `incomplet`.
     pub cause: Option<EchecParcours>,
 }
 
@@ -1409,15 +1469,26 @@ pub(crate) async fn parcourir_les_enfants_verifie(
         // Missing counters, malformed XML/HTML and SOAP faults are not empty libraries.
         let Some(returned) = returned else {
             p.erreur = Some(format!("{nom} : réponse Browse sans compteur valide"));
+            p.cause = Some(EchecParcours::SansCompteur);
             break;
         };
-        if returned != parsed || total.is_none() {
+        if returned != parsed {
             p.erreur = Some(format!(
                 "{nom} : réponse Browse incomplète ({parsed}/{returned})"
             ));
+            p.cause = Some(EchecParcours::DidlIllisible {
+                lus: parsed,
+                annonces: returned,
+            });
             break;
         }
-        let total = total.unwrap();
+        let Some(total) = total else {
+            p.erreur = Some(format!(
+                "{nom} : réponse Browse incomplète ({parsed}/{returned}, sans TotalMatches)"
+            ));
+            p.cause = Some(EchecParcours::SansTotal);
+            break;
+        };
         if total_annonce.is_some_and(|t| t != total) || (start > 0 && update != update_id) {
             p.erreur = Some(format!("{nom} : le catalogue a changé pendant le parcours"));
             break;
@@ -1430,6 +1501,9 @@ pub(crate) async fn parcourir_les_enfants_verifie(
         if returned == 0 {
             if total != 0 && start < total {
                 p.erreur = Some(format!("{nom} : pagination interrompue ({start}/{total})"));
+                // #4895 : sur la PREMIÈRE page (« 0/12 »), c'est l'échec du
+                // dossier entier ; plus loin, `incomplet` le dit à la route.
+                p.cause = Some(EchecParcours::PaginationInterrompue { lus: start, total });
             } else {
                 termine = true;
             }
@@ -2458,11 +2532,12 @@ mod tests_browse_dit_son_echec_4134 {
     #[tokio::test]
     async fn un_dossier_reellement_vide_reste_un_succes() {
         let url = faux_serveur("200 OK", BROWSE_VIDE).await;
-        let (c, i, total) = parcourir_les_enfants(&url, "faux", "0")
+        let (c, i, total, incomplet) = parcourir_les_enfants(&url, "faux", "0")
             .await
             .expect("vide ≠ échec");
         assert!(c.is_empty() && i.is_empty());
         assert_eq!(total, 0);
+        assert_eq!(incomplet, None, "un dossier vide est complet");
     }
 
     #[tokio::test]
