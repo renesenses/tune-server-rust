@@ -2768,9 +2768,12 @@ fn record_feed_stall_failure(
 
 /// Le flux de la piste s'est COUPÉ loin de sa fin (fil 1915, Reivax66).
 ///
-/// Même famille `record_*` que les autres : `failure_slot` est drainé par
-/// `take_output_failure()` à chaque tick du sondeur, qui émet
-/// `zone.playback_error` (`fatal: true`) et arrête la zone. Sans ce constat,
+/// Même canal que les autres `record_*` (`take_output_failure()`, drainé à
+/// chaque tick du sondeur), mais le constat porte le préfixe
+/// [`PREFIXE_PISTE_TRONQUEE`](crate::poller::decisions::PREFIXE_PISTE_TRONQUEE) :
+/// le sondeur n'arrête PAS la zone, il émet `zone.playback_error`
+/// (`fatal: false`) et `playback.track_skipped`, puis passe à la piste
+/// suivante — ou termine la file si c'était la dernière. Sans ce constat,
 /// l'erreur de lecture était prise pour une fin naturelle : la file enchaînait
 /// — ou se fermait — sur une piste amputée, sans un mot à l'écran.
 ///
@@ -2798,7 +2801,8 @@ fn record_truncated_track_failure(
     );
     if let Ok(mut slot) = failure_slot.lock() {
         *slot = Some(format!(
-            "Sortie « {device} » : le flux de la piste s'est interrompu à {} sur {} ; la lecture a été arrêtée. Relancez la lecture.",
+            "{}Sortie « {device} » : le flux de la piste s'est interrompu à {} sur {} ; la piste a été abandonnée.",
+            crate::poller::decisions::PREFIXE_PISTE_TRONQUEE,
             minutes_secondes(position_ms),
             minutes_secondes(duree_ms),
         ));
@@ -3922,9 +3926,10 @@ impl BoucleProducteur<'_> {
                     // Fil 1915 : une erreur LOIN de la fin est une coupure du
                     // flux, pas une fin de piste. La prendre pour une fin
                     // enchaînait (ou fermait la file) en silence, la piste
-                    // amputée. On le dit, et on n'enchaîne rien — la même
-                    // sortie que le puits mort (#3108) : constat posé,
-                    // `Interrompue`.
+                    // amputée. On le dit, et ce fil n'enchaîne rien : constat
+                    // posé (préfixé « piste tronquée »), `Interrompue`. C'est
+                    // le sondeur qui passe à la piste suivante, en le
+                    // signalant, comme pour un saut de piste.
                     let position_atteinte_ms = compteurs.position_ms(etage.cadence_source());
                     let duree_ms = self.duree_de_la_piste_ms.load(Ordering::SeqCst);
                     if crate::poller::decisions::position_loin_de_la_fin(

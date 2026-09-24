@@ -11,7 +11,7 @@
 //!
 //! Ce que ces témoins gardent :
 //! - une erreur à 66 % de la piste rend `Interrompue` et POSE un constat
-//!   (canal `take_output_failure` → `zone.playback_error`), pour les deux
+//!   préfixé « piste tronquée » (le sondeur passe à la suivante), pour les deux
 //!   rôles de la boucle ;
 //! - une erreur de fin de corps à 99,9 % reste une fin de flux — la
 //!   non-régression de #1254 (PR #1076 : MP3 dont la fin de corps lève une
@@ -150,6 +150,12 @@ fn f1915_une_coupure_a_66_pour_cent_n_est_pas_une_fin_naturelle() {
                 nom(role)
             )
         });
+        assert!(
+            crate::poller::decisions::constat_de_piste_tronquee(&constat).is_some(),
+            "{} : sans son préfixe, le sondeur prendrait la coupure pour une panne de \
+             sortie et arrêterait la zone au lieu de passer à la suivante : {constat}",
+            nom(role)
+        );
         assert!(
             constat.contains("Smart DX1") && constat.contains("7:50") && constat.contains("11:51"),
             "{} : le constat doit nommer la sortie, la position et la durée : {constat}",

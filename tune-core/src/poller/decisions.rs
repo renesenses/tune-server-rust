@@ -626,6 +626,22 @@ pub fn position_loin_de_la_fin(position_ms: u64, duree_ms: u64) -> bool {
         && duree_ms.saturating_sub(position_ms) > ECART_TOLERE_AVANT_LA_FIN_MS
 }
 
+/// Préfixe du constat « piste tronquée » (fil 1915) sur le canal
+/// `take_output_failure`.
+///
+/// Ce canal arrête la zone sur une panne de SORTIE (`fatal: true`). Une piste
+/// dont le flux s'est coupé n'en est pas une : la sortie va bien, la piste
+/// suivante peut jouer (décision de Bertrand, 24/09/2026). Le préfixe dit au
+/// sondeur de passer à la suivante — saut signalé, message non fatal — au lieu
+/// d'arrêter.
+pub const PREFIXE_PISTE_TRONQUEE: &str = "piste_tronquee:";
+
+/// Le message lisible d'un constat de piste tronquée, `None` pour tout autre
+/// constat de sortie.
+pub fn constat_de_piste_tronquee(constat: &str) -> Option<&str> {
+    constat.strip_prefix(PREFIXE_PISTE_TRONQUEE)
+}
+
 /// A DSD track on a DLNA renderer that has demonstrably reached its end.
 ///
 /// Gapless (`SetNextAVTransportURI`) is intentionally NOT armed when the next

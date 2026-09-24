@@ -625,6 +625,43 @@ impl PositionPoller {
                     };
                     output.take_output_failure()
                 };
+                // Fil 1915 — une piste dont le flux s'est COUPÉ loin de sa
+                // fin n'est pas une panne de sortie : on passe à la suivante
+                // (ou on termine la file), en le disant — message non fatal
+                // et saut signalé —, au lieu d'arrêter la zone.
+                if let Some(message) = failure
+                    .as_deref()
+                    .and_then(decisions::constat_de_piste_tronquee)
+                {
+                    warn!(
+                        zone_id,
+                        device = %device_id,
+                        error = %message,
+                        queue_pos = zone_state.queue_position,
+                        "piste_tronquee_passage_a_la_suivante"
+                    );
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": message,
+                                "fatal": false,
+                            }),
+                        );
+                        bus.emit(
+                            "playback.track_skipped",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "position": zone_state.queue_position,
+                                "reason": message,
+                            }),
+                        );
+                    }
+                    poll_states.remove(&zone_id);
+                    self.handle_track_end(zone_id, zone_state).await;
+                    continue;
+                }
                 if let Some(msg) = failure {
                     warn!(
                         zone_id,
