@@ -247,7 +247,7 @@ fn conserver_etiquettes(
 }
 
 /// Les dossiers STOCKÉS, tels quels — la liste JSON du réglage `collections`.
-fn dossiers_stockes(state: &AppState) -> Vec<Value> {
+pub(super) fn dossiers_stockes(state: &AppState) -> Vec<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("collections")
@@ -426,6 +426,9 @@ pub(super) async fn delete_collection(
     settings
         .set("collections", &serde_json::to_string(&collections)?)
         .ok();
+    // #4853 — l'id d'un dossier est `max + 1`, donc réutilisé : sans ceci, la
+    // collection créée ensuite hériterait du rangement de celle-ci.
+    super::collection_folders::oublier_collection_simple(&state, id);
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -885,6 +885,12 @@ path = "tests/smart_playlist_favori_etiquette_4798.rs"
 name = "collections_etiquette_4798"
 path = "tests/collections_etiquette_4798.rs"
 
+# #4853 — dossiers de collections (arbre, profondeur 3). `autotests = false` :
+# sans cette entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "dossiers_de_collections_4853"
+path = "tests/dossiers_de_collections_4853.rs"
+
 
 # #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
 # routeur réel. `autotests = false` en tête de ce manifeste : sans cette

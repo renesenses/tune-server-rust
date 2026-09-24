@@ -1993,6 +1993,54 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
         name: "credits_musicbrainz",
         up: "",
     },
+    // #4853 — DOSSIERS DE COLLECTIONS (Gros Bidon, fil 1907 ; decision de
+    // Bertrand du 24/09/2026 : arbre, profondeur maximale 3).
+    //
+    // Un dossier range des collections des DEUX sortes et des sous-dossiers.
+    // Les collections elles-memes ne changent pas : les simples restent dans
+    // le reglage JSON `collections`, les intelligentes dans
+    // `smart_collections`. Ces deux espaces d'identifiants SE RECOUVRENT
+    // (l'id 1 est a la fois « favorites » et « Audiophile » sur le .18) : une
+    // ligne de rangement porte donc TOUJOURS la paire `(kind, collection_id)`,
+    // jamais un entier nu — `kind` vaut `collection` ou `smart`.
+    //
+    // * `collection_folders.parent_id` NULL = racine. Pas d'AUTOINCREMENT :
+    //   l'identifiant est attribue par le depot (max + 1, dans la meme
+    //   transaction), pour eviter la divergence AUTOINCREMENT / BIGSERIAL de
+    //   la bascule SQLite -> PostgreSQL (#1706).
+    // * `collection_folder_items` : clef primaire `(kind, collection_id)` —
+    //   c'est ELLE qui garantit qu'une collection est rangee dans UN SEUL
+    //   dossier (arbre, pas graphe). `folder_id` NULL = rangee a la racine,
+    //   a une position choisie ; une collection sans ligne est a la racine,
+    //   apres les rangees.
+    // * Aucune clef etrangere : le schema PostgreSQL de bascule n'en porte
+    //   aucune, et les collections simples ne sont pas une table. Le cycle,
+    //   la profondeur et le devenir du contenu d'un dossier supprime sont
+    //   verifies par `collection_folder_repo`, seul chemin d'ecriture.
+    //
+    // Jumelle PostgreSQL : 071_collection_folders.sql.
+    Migration {
+        version: 108,
+        name: "collection_folders",
+        up: "
+CREATE TABLE IF NOT EXISTS collection_folders (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    parent_id INTEGER,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_collection_folders_parent ON collection_folders(parent_id);
+CREATE TABLE IF NOT EXISTS collection_folder_items (
+    kind TEXT NOT NULL,
+    collection_id INTEGER NOT NULL,
+    folder_id INTEGER,
+    position INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, collection_id)
+);
+CREATE INDEX IF NOT EXISTS idx_collection_folder_items_folder ON collection_folder_items(folder_id);
+",
+    },
 ];
 
 /// v0.9 rc.2 — one-time copy of the split `play_queue` / `streaming_queue`
@@ -3910,6 +3958,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         70,
         "credits_musicbrainz",
         include_str!("../../migrations/postgres/070_credits_musicbrainz.sql"),
+    ),
+    // Jumelle de la SQLite 108 (#4853). Renumerotee le 24/09/2026 (070 → 071,
+    // SQLite 107 → 108) a l'integration de la v0.9.164 : les credits MusicBrainz
+    // (#4767) avaient pris 107 / 070 le meme jour.
+    (
+        71,
+        "collection_folders",
+        include_str!("../../migrations/postgres/071_collection_folders.sql"),
     ),
 ];
 
@@ -6240,7 +6296,8 @@ mod tests {
         // 70 : `credits_musicbrainz` (#4767), jumelle de la SQLite 107. Pose
         // `track_credits.artist_mbid` et `albums.credits_mb_at`, que la passe
         // des credits et la page artiste NOMMENT.
-        assert_eq!(pg_latest_version(), 70, "latest PG migration must be 70");
+        // 71 : `collection_folders` (#4853), jumelle de la SQLite 108.
+        assert_eq!(pg_latest_version(), 71, "latest PG migration must be 71");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
