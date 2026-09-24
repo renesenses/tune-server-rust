@@ -1644,6 +1644,16 @@ impl PlaybackOrchestrator {
                     // #4685 — et le gain MOYEN du DSP qu'elle compense.
                     self.playback
                         .brancher_le_gain_moyen_du_dsp(zone_id, local_output.gain_moyen_du_dsp());
+                    // Fil 1908 — et son horloge : les niveaux sortent quand
+                    // le son sort, pas quand il entre dans l'anneau.
+                    let (position_alimentee_ms, anneau) = local_output.horloge_de_sortie();
+                    self.playback.brancher_l_horloge_de_sortie(
+                        zone_id,
+                        crate::playback::HorlogeDeSortie {
+                            position_alimentee_ms,
+                            anneau,
+                        },
+                    );
                     return;
                 }
             }
