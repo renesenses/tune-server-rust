@@ -1995,6 +1995,62 @@ pub(crate) fn ligne_portraits_d_artistes(p: &PortraitsDArtistes) -> String {
     )
 }
 
+/// Combien d'albums la bibliothèque MASQUE — la seule cause de #4319 qu'un
+/// rapport tranche SANS retour du testeur.
+///
+/// #4319 — Tades voit deux albums Mahler/Mehta dans **Répertoires**, la
+/// recherche n'en rend qu'un. L'instruction du ticket a réduit le champ à
+/// quatre mécanismes, tous côté données. L'un d'eux, l'album **masqué**,
+/// produit exactement cette signature :
+///
+/// - [`hidden_albums_excluded`] retire l'album de la bibliothèque **et** de la
+///   recherche — c'est un `NOT EXISTS` sur `hidden_items`, appliqué dans
+///   `AlbumRepo` à la liste comme à `search_page` ;
+/// - `browse_directory` (`routes/library/browse.rs`) liste les sous-dossiers
+///   depuis le **disque** (`std::fs::read_dir`) et n'applique aucun de ces
+///   filtres : le dossier reste visible dans Répertoires.
+///
+/// « Je le vois dans Répertoires, la recherche ne le trouve pas » est donc la
+/// description littérale d'un album masqué — et rien, dans le rapport que le
+/// testeur colle sur le forum, ne le disait. La ligne posée par #4428 mesure
+/// l'index ; elle ne voit pas ce filtre, qui s'applique **après** lui.
+///
+/// Contrairement à [`couverture_de_l_index`], cette mesure vaut sur les **deux**
+/// moteurs : `hidden_items` est créée en SQLite (`init_schema`, migration 89)
+/// comme en PostgreSQL (`pg_migrate`). Il n'y a donc pas de garde par moteur.
+///
+/// `None` quand le compte n'a pas pu être lu — une base trop ancienne pour
+/// porter la table ne doit pas afficher un `0` qui affirmerait, à tort, que
+/// rien n'est masqué. Même règle que pour la couverture de l'index : on ne
+/// remplace jamais une absence de mesure par un zéro mesuré.
+fn albums_masques(state: &AppState) -> Option<i64> {
+    state
+        .backend
+        .query_one(
+            "SELECT COUNT(*) FROM hidden_items WHERE item_type = 'album'",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|c| c.first().and_then(|v| v.as_i64()))
+}
+
+/// La ligne du rapport, telle qu'elle se LIT — fonction NUE, éprouvable sans
+/// base ni `AppState` (même parti que [`valeur_lisible`]).
+///
+/// Le libellé nomme la conséquence, pas seulement le nombre : un testeur qui
+/// colle son rapport doit pouvoir faire le rapprochement avec ce qu'il voit à
+/// l'écran, sans connaître le schéma.
+fn ligne_albums_masques(compte: Option<i64>) -> String {
+    match compte {
+        Some(n) => format!(
+            "- Albums masqués : {n} (exclus de la bibliothèque ET de la recherche, \
+             toujours visibles dans Répertoires)\n"
+        ),
+        None => "- Albums masqués : illisible\n".to_string(),
+    }
+}
+
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
@@ -2210,6 +2266,13 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         md.push_str(" (indexées/en base)");
         md.push('\n');
     }
+    // #4319 — le filtre qui s'applique APRÈS l'index. Un album masqué sort de
+    // la bibliothèque et de la recherche, mais reste visible dans Répertoires,
+    // qui lit les sous-dossiers depuis le disque. La ligne d'index ci-dessus ne
+    // peut pas le voir : elle compte des lignes indexées, pas des lignes
+    // filtrées. Voir `albums_masques`.
+    let masques = albums_masques(&state);
+    md.push_str(&ligne_albums_masques(masques));
     md.push('\n');
 
     md.push_str(&format!("## Zones ({zone_count})\n"));
@@ -2548,6 +2611,9 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
                 .iter()
                 .map(|(t, _, en_base)| ((*t).to_string(), json!(en_base)))
                 .collect::<serde_json::Map<_, _>>(),
+            // #4319 — le filtre d'APRÈS l'index. `null` quand la table n'a pas
+            // pu être lue : une base trop ancienne ne doit pas dire « 0 ».
+            "hidden_albums": masques,
         },
         "zones": {
             "count": zone_count,
