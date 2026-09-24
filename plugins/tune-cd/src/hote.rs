@@ -3,7 +3,7 @@
 //!
 //! Un trait, pour que les routes et la surveillance de l'éjection se prouvent
 //! sans orchestrateur. L'implémentation de production (`HoteOrchestrateur`)
-//! fait exactement ce que fait la route `/playback/play` pour un album de
+//! fait exactement ce que fait la route `POST /zones/{id}/play` (`routes/playback.rs`) pour un album de
 //! service : `set_streaming_queue`, `update_queue_info`, puis
 //! `orchestrator.play` sur la première ligne.
 
@@ -78,7 +78,7 @@ impl HoteLecture for HoteOrchestrateur {
                 )
             })
             .collect();
-        // La file AVANT la lecture, comme `/playback/play` : le client qui la
+        // La file AVANT la lecture, comme `POST /zones/{id}/play` : le client qui la
         // relit à l'annonce de la lecture doit la trouver.
         PlayQueueRepo::with_backend(self.backend.clone()).set_streaming_queue(zone_id, &lignes)?;
         let longueur = elements.len() as i64;
@@ -112,7 +112,7 @@ impl HoteLecture for HoteOrchestrateur {
                 disc_number: Some(1),
             })
             .await?;
-        // Réaffirmée APRÈS play(), pour la même raison que `/playback/play` :
+        // Réaffirmée APRÈS play(), pour la même raison que `POST /zones/{id}/play` :
         // sur une zone neuve, play() crée l'état avec une file de longueur 0.
         self.playback
             .update_queue_info(zone_id, depart as i64, longueur)
