@@ -269,6 +269,18 @@ path = "tests/cles_developpeur_hors_journal.rs"
 name = "journal_sondage_hqplayer"
 path = "tests/journal_sondage_hqplayer.rs"
 
+# Journal écrit en double sur macOS : le lanceur du `.app` branche le flux
+# d'erreur sur le fichier que la couche fichier ouvre déjà, et chaque ligne y
+# arrive deux fois (1 002 lignes pour 585 uniques, journal de Cyrille Moutia
+# en 0.9.163). La cible est indispensable : `autotests = false` en tête de ce
+# manifeste laisserait le fichier HORS COMPILATION, donc éternellement vert.
+#
+# Rangée au MILIEU, jamais en queue : deux lots qui ajoutent chacun leur cible
+# à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "journal_ecrit_en_double_20260923"
+path = "tests/journal_ecrit_en_double_20260923.rs"
+
 # #4051 — troisième de la même famille : abonné `tracing` GLOBAL, donc un
 # binaire à lui seul et UN essai dedans. Il garde le réglage LRCLIB publié par
 # `GET /system/config`, l'aller-retour du PATCH, et les deux lignes de journal
