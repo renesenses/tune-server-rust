@@ -213,9 +213,13 @@ async fn banc() -> Banc {
 async fn chercher(state: &crate::state::AppState, chaine: &str) -> Value {
     let uri: axum::http::Uri = format!("/?{chaine}").parse().expect("URI valide");
     let Query(params) = Query::try_from_uri(&uri).expect("paramètres lisibles");
-    federated_search(State(state.clone()), Query(params))
-        .await
-        .0
+    federated_search(
+        State(state.clone()),
+        crate::routes::active_profile::ActiveProfile(1),
+        Query(params),
+    )
+    .await
+    .0
 }
 
 fn ids(bloc: &Value) -> Vec<String> {
