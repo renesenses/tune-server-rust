@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
@@ -57,6 +57,10 @@ concerts = ["dep:tune-concerts"]
 # images). Dans `default` comme Bandcamp : le greffon est opt-in à l'exécution
 # (`default_enabled = false`) et refuse sans licence.
 pont-roon = ["dep:tune-pont-roon"]
+# Lecture directe d'un CD audio (#4863), sans extraction. Dans `default` comme
+# Bandcamp : le greffon est opt-in à l'exécution (`default_enabled = false`) et
+# hors catalogue tant qu'aucun écran ne le consomme. Choix à valider.
+cd = ["dep:tune-cd"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -78,6 +82,7 @@ tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = tr
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
+tune-cd = { path = "../plugins/tune-cd", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tokio = { workspace = true }
