@@ -171,3 +171,34 @@ async fn la_route_patch_ecrit_le_vide_force_et_sait_le_retirer() {
         "« je me suis trompé » doit rendre la détection"
     );
 }
+/// 🔴 Fils 1914/1913 — Reivax66, Denon AVR-X1600H en DLNA : « la case canaux
+/// suivre l'appareil reste grisée ». Ce que `GET /zones` publie pour une zone
+/// réseau que Tune décode : plus `unavailable`, et la portée du choix.
+/// Rouge sans le lot : `sortie_non_locale`, donc sélecteur verrouillé.
+#[test]
+fn une_zone_dlna_publie_des_canaux_choisissables() {
+    let (_, state) = serveur();
+    let zone_id = ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", Some("dlna"), Some("dlna:uuid-denon"))
+        .unwrap();
+    let statut = |output_type: &str, device: &str| {
+        let mut obj = serde_json::Map::new();
+        obj.insert("output_type".into(), json!(output_type));
+        crate::routes::zones::inject_device_identity(
+            &mut obj,
+            &state.backend,
+            zone_id,
+            Some(device),
+            None,
+        );
+        obj["channel_layout_status"].clone()
+    };
+    let dlna = statut("dlna", "dlna:uuid-denon");
+    assert_eq!(dlna["unavailable"], false, "{dlna}");
+    assert_eq!(dlna["portee"], "plafond_reseau", "{dlna}");
+    // Contre-témoin : AirPlay n'a toujours aucun chemin — verrouillé.
+    let airplay = statut("airplay", "airplay:AppleTV");
+    assert_eq!(airplay["unavailable"], true, "{airplay}");
+    assert_eq!(airplay["reason"], "sortie_non_locale", "{airplay}");
+    assert!(airplay.get("portee").is_none(), "{airplay}");
+}
