@@ -265,7 +265,7 @@ jobs:
       # `-p tune-server`. L'inserer au milieu de ce bloc fait rougir cette
       # garde-la — mesure sur Shrek avant de la deplacer ici.
       # plugin-catalog: {"features":"fast","base":["oaat","cloud-relay"],"packages":"workspace"}
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon --no-default-features --features oaat,cloud-relay,bandcamp
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-playlists-converter --no-default-features --features oaat,cloud-relay,bandcamp
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -771,7 +771,7 @@ jobs:
       # (Apache-2.0 déclarée contre en-tête ISO/Philips). Garde :
       # tune-core/tests/dst_desarmee_4378.rs.
       # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,dj,karaoke,bandcamp,concerts,pont-roon -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-playlists-converter --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,dj,karaoke,bandcamp,concerts,pont-roon -- -D clippy::correctness
 
   audit:
     name: Security Audit
