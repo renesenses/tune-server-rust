@@ -862,3 +862,11 @@ path = "tests/suppression_playlist_de_service.rs"
 [[test]]
 name = "playlist_manager_cloisonnement_par_profil"
 path = "tests/playlist_manager_cloisonnement_par_profil.rs"
+
+# La LISTE des albums manquants d'un dossier « Collections » (#901, Lulu) —
+# `orphan_album_ids` publiait la longueur de la liste, pas la liste. Cible
+# propre plutôt qu'un `mod` de `server_contracts` : ces gardes doivent pouvoir
+# tourner seules, sans traîner tout le contrat de routes derrière elles.
+[[test]]
+name = "collections_albums_manquants_901"
+path = "tests/collections_albums_manquants_901.rs"
