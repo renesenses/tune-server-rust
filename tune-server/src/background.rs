@@ -1058,14 +1058,37 @@ fn spawn_session_gc(state: &AppState) {
 }
 
 fn spawn_position_poller(state: &AppState) {
-    let poller = tune_core::poller::PositionPoller::new(
+    construire_le_sondeur(state).spawn();
+}
+
+/// Le sondeur de position tel que la production le lance.
+///
+/// Fils 1890/1857 (Jean Valjean), v0.9.158 → v0.9.163, sortie locale WASAPI
+/// exclusive : le panneau annonce « WASAPI (shared — Windows mixer) » et
+/// « Transcodé » alors que son journal dit `wasapi_exclusive_playing` puis
+/// `windows_exclusive_signal_contract bit_perfect=true reasons=[]`. #4568 a
+/// fait annoncer ce contrat par le sondeur (`zone.updated`), mais l'annonce
+/// est gardée par `if let Some(ref bus) = self.event_bus` — et ce sondeur-ci
+/// était construit SANS `with_event_bus`. Aucune ligne
+/// `contrat_de_signal_publie_annonce` dans son journal de la 0.9.163 : le
+/// correctif était vert dans son banc, muet chez lui. Avec PURE, le volume est
+/// épinglé à 100 % : le seul geste qui faisait relire la zone (un
+/// aller-retour du volume) n'existe plus, d'où « transcodé » à chaque piste.
+///
+/// Le bus est celui que relaie le WebSocket (`routes/ws.rs`). Il allume du
+/// même coup les autres annonces du sondeur, toutes écrites pour le client et
+/// toutes muettes jusqu'ici : bascule des niveaux (#2280),
+/// `zone.playback_error` d'une sortie qui échoue sur son propre fil,
+/// `playback.track_skipped`, `playback.autoplay_tracks_added`.
+fn construire_le_sondeur(state: &AppState) -> tune_core::poller::PositionPoller {
+    tune_core::poller::PositionPoller::new(
         state.orchestrator.clone(),
         state.playback.clone(),
         state.outputs.clone(),
         state.backend.clone(),
         state.poller_metrics.clone(),
-    );
-    poller.spawn();
+    )
+    .with_event_bus(state.event_bus.clone())
 }
 
 /// #3589, volet A — le catalogue « Tune tested », au démarrage puis toutes les
@@ -4551,6 +4574,31 @@ mod conflit_de_protocole_au_demarrage_tests {
         assert_eq!(
             suite_du_lot_de_demarrage(false, "", "dlna"),
             SuiteDuLotDeDemarrage::Poursuivre
+        );
+    }
+}
+
+/// Fils 1890/1857 (Jean Valjean) — WASAPI exclusif + PURE affiché
+/// « Transcodé » : le sondeur de production doit émettre sur le bus que le
+/// WebSocket relaie. La mécanique d'annonce elle-même est éprouvée dans
+/// `tune-core` (`poller/annonce_du_contrat_de_signal_4559.rs`) — avec un banc
+/// qui, lui, appelait `with_event_bus`. Ici on tient le BRANCHEMENT : c'est
+/// lui qui manquait, et aucun banc ne le voyait.
+#[cfg(test)]
+mod sondeur_branche_sur_le_bus_du_websocket {
+    use super::*;
+
+    #[tokio::test]
+    async fn le_sondeur_de_production_annonce_sur_le_bus_du_websocket() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let sondeur = construire_le_sondeur(&state);
+        assert!(
+            sondeur.annonce_sur(&state.event_bus),
+            "le sondeur de production n'émet pas sur `state.event_bus` : le \
+             contrat de signal publié à l'ouverture du périphérique n'est \
+             jamais annoncé, et le panneau reste « WASAPI (shared — Windows \
+             mixer) » / « Transcodé » tant que l'auditeur ne touche pas au \
+             volume — ce que PURE lui interdit (fils 1890/1857, #4559)."
         );
     }
 }
