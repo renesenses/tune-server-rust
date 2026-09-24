@@ -3139,6 +3139,9 @@ fn pure_sans_conversion_n_est_pas_degrade_3973() {
 fn fichier_flac(dir: &std::path::Path, nom: &str, vendeur: &str, md5_nul: bool) -> String {
     let mut f = b"fLaC".to_vec();
     let mut streaminfo = [0u8; 34];
+    // Cadence 44 100 Hz, 2 canaux, 16 bits — un STREAMINFO renseigné, comme
+    // ceux de l'enregistreur (#4800 lit la cadence pour bâtir l'en-tête neuf).
+    streaminfo[10..14].copy_from_slice(&[0x0A, 0xC4, 0x42, 0xF0]);
     if !md5_nul {
         streaminfo[18..34].copy_from_slice(&[0x5a; 16]);
     }
@@ -3204,6 +3207,14 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
         transcoder["bit_perfect"],
         serde_json::json!(true),
         "ré-encodé sans perte : mêmes échantillons, {transcoder}"
+    );
+    // #4800 — l'en-tête de ce fichier se lit, et une trame le suit : le
+    // conteneur est réécrit sans décodage, et l'écran le dit.
+    assert!(
+        transcoder["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("trames copiées telles quelles")),
+        "{transcoder}"
     );
     assert!(
         sp["summary"].as_str().unwrap().contains("transcode"),

@@ -53,6 +53,12 @@ struct DecisionLocale {
     fmt: String,
     zone: Option<crate::db::zone_repo::Zone>,
     needs_transcode: bool,
+    /// #4800 — l'en-tête NEUF sous lequel servir ce FLAC tel quel, quand la
+    /// règle de #4350 s'applique (`Lavf` sans MD5 vers le réseau) et que
+    /// rien d'autre n'impose un transcodage : `fLaC`, STREAMINFO recopié,
+    /// VORBIS_COMMENT vide, puis les trames du fichier copiées sans décodage
+    /// (`audio::flac_vendeur::conteneur_neuf`). `None` partout ailleurs.
+    conteneur_flac_neuf: Option<crate::audio::faststart::FaststartMap>,
     /// #3631 — la TRANCHE à jouer dans `file_path`, quand la piste vient d'une
     /// feuille CUE : début et durée, en millisecondes.
     ///
@@ -240,6 +246,7 @@ fn assembler_la_decision(
     transcodage: TranscodagePourLaSortie,
     traitement: Traitement,
     flac_ffmpeg_vers_le_reseau: bool,
+    conteneur_flac_neuf: Option<crate::audio::faststart::FaststartMap>,
 ) -> DecisionLocale {
     let SourceEtZone {
         sample_rate,
@@ -311,15 +318,23 @@ fn assembler_la_decision(
         // sous le nom d'une de ses pistes. Seul le décodage sait couper.
         est_une_tranche_cue: tranche_cue.is_some(),
         flac_ffmpeg_vers_le_reseau,
+        // #4800 — l'en-tête neuf prêt, la réécriture du conteneur se fait
+        // sans décoder : le motif de #4350 seul ne force plus le transcodage.
+        conteneur_flac_neuf_pret: conteneur_flac_neuf.is_some(),
         // #4573 — sans ce motif, le repli serait décidé puis jamais emprunté :
         // le passthrough enverrait le FLAC 5.1 intact et `channels` mentirait
         // dans le DIDL. Seul le décodage sait replier.
         reduction_de_canaux: canaux_reduits.is_some(),
     });
-    if flac_ffmpeg_vers_le_reseau {
+    if flac_ffmpeg_vers_le_reseau && needs_transcode {
+        // Le conteneur neuf n'a pas pu être préparé, ou un autre motif
+        // transcode de toute façon : la voie de #4350, décodage puis
+        // ré-encodage. Le nom de la ligne est un vestige — Tune n'appelle
+        // pas ffmpeg, c'est l'enregistreur qui a écrit le fichier avec lui.
         info!(
             zone_id = req.zone_id,
             file = %file_path,
+            conteneur_neuf_pret = conteneur_flac_neuf.is_some(),
             "flac_ffmpeg_transcode_au_lieu_du_passthrough"
         );
     }
@@ -358,6 +373,9 @@ fn assembler_la_decision(
         fmt,
         zone,
         needs_transcode,
+        // Sans objet dès qu'un transcodage a lieu : le bras fichier décode
+        // et ré-encode, l'en-tête neuf ne sert qu'au passthrough.
+        conteneur_flac_neuf: conteneur_flac_neuf.filter(|_| !needs_transcode),
         tranche_cue,
     }
 }
@@ -788,6 +806,18 @@ impl PlaybackOrchestrator {
             tranche_cue.is_some(),
             || Some(file_path.clone()),
         );
+        // #4800 — quand la règle s'applique, préparer l'en-tête neuf : une
+        // seconde lecture des seuls blocs de métadonnées (la pochette est
+        // sautée). Prêt, il épargne le décodage-ré-encodage complet qui
+        // retardait le premier son de 2 à 4,6 s sur le .18 ; `None`, la
+        // décision transcode comme avant.
+        let conteneur_flac_neuf = if flac_ffmpeg_vers_le_reseau {
+            crate::audio::flac_vendeur::conteneur_neuf_pour_passthrough(std::path::Path::new(
+                &file_path,
+            ))
+        } else {
+            None
+        };
         Ok(DecisionOuResolu::Decision(assembler_la_decision(
             req,
             track,
@@ -801,6 +831,7 @@ impl PlaybackOrchestrator {
             transcodage,
             traitement,
             flac_ffmpeg_vers_le_reseau,
+            conteneur_flac_neuf,
         )))
     }
 
@@ -2960,6 +2991,7 @@ impl PlaybackOrchestrator {
             ref file_path,
             ref fmt,
             ref zone,
+            ref conteneur_flac_neuf,
             ..
         } = *decision;
         let flux = {
@@ -3010,8 +3042,15 @@ impl PlaybackOrchestrator {
             } else {
                 None
             };
-            let passthrough_file_size =
-                passthrough_disk_size.or_else(|| track_file_size.map(|s| s as u64));
+            // #4800 — sous un en-tête neuf, ce qui part sur le fil est
+            // l'en-tête puis les trames, pas le fichier : `res@size` et
+            // Content-Length doivent dire ces octets-là (même raison que
+            // #1132 juste au-dessus).
+            let passthrough_file_size = conteneur_flac_neuf
+                .as_ref()
+                .map(|m| m.total)
+                .or(passthrough_disk_size)
+                .or_else(|| track_file_size.map(|s| s as u64));
 
             let info = StreamInfo {
                 format: fmt.clone(),
@@ -3028,6 +3067,24 @@ impl PlaybackOrchestrator {
                 .streamer
                 .create_file_session(info, file_path.clone(), false)
                 .await;
+
+            // #4800 — FLAC de l'enregistreur (`Lavf` sans MD5, #4350) vers le
+            // réseau : servi tel quel sous son en-tête neuf. La carte est la
+            // même mécanique que le faststart M4A ci-dessous — en-tête depuis
+            // la mémoire, corps copié depuis le fichier à partir de l'offset
+            // des trames — et le premier octet part aussitôt, là où le
+            // décodage-ré-encodage complet retardait le premier son de 2 à
+            // 4,6 s (mesure du 23/09 sur le .18).
+            if let Some(map) = conteneur_flac_neuf.clone() {
+                info!(
+                    zone_id = req.zone_id,
+                    file = %file_path,
+                    octets = map.total,
+                    debut_des_trames = map.body_src_start,
+                    "flac_conteneur_neuf_en_passthrough"
+                );
+                self.streamer.set_faststart(&session_id, map).await;
+            }
 
             // For M4A/ALAC passthrough, attach an on-the-fly faststart map so the
             // file is served as `ftyp + patched-moov + mdat` (moov relocated to
