@@ -1132,6 +1132,22 @@ fn search_tracks_in_container(
     titres: &[PredicatTitre],
 ) -> Option<DidlResult> {
     match container_id {
+        // Fil 1916 : chercher DANS un ensemble de pistes reste dans cet
+        // ensemble, et dans son ordre — mélangé compris.
+        id if ensemble_de_pistes(id).is_some() => {
+            if titres.is_empty() {
+                return Some(browse_ensemble_de_pistes(state, id, start, count, base_url));
+            }
+            let ids = ids_de_l_ensemble(state, id).unwrap_or_default();
+            let tracks = pistes_dans_l_ordre(state, &ids);
+            Some(paginate_track_results(
+                filtrer_par_titre(tracks, titres),
+                id,
+                start,
+                count,
+                base_url,
+            ))
+        }
         "0" | "tracks" | "artists" | "albums" | "genres" | "years" | "playlists" => {
             if titres.is_empty() {
                 // Sans predicat de titre, c'est le parcours d'indexation :
@@ -1308,6 +1324,8 @@ fn conteneur_publie(id: &str) -> bool {
         || ["artist/", "album/", "genre/", "year/", "playlist/"]
             .iter()
             .any(|prefixe| id.starts_with(prefixe))
+        // Fil 1916 : les ensembles de pistes d'un genre.
+        || ensemble_de_pistes(id).is_some()
         // #4318 : le rayon « Folders » et ses dossiers.
         || dossiers::est_a_nous(id)
 }
@@ -1803,6 +1821,9 @@ fn browse_metadata(state: &UpnpState, object_id: &str) -> DidlResult {
                 nb,
             )
         }),
+        // Fil 1916 : les deux ensembles de pistes d'un genre se décrivent
+        // comme le genre qui les publie — même nombre, même parent.
+        id if ensemble_de_pistes(id).is_some() => decrire_ensemble_du_genre(state, id),
         // Même règle que `genre/` : une année est un conteneur comme un autre,
         // et un point de contrôle strict le décrit avant de l'ouvrir.
         id if id.starts_with("year/") => decode_year_id(id)
@@ -1907,6 +1928,11 @@ fn browse_direct_children(
         "genres" => browse_genres(state, start, count),
         "years" => browse_years(state, start, count),
         "tracks" => browse_all_tracks(state, start, count, &base_url),
+        // Fil 1916 : « All Tracks (Shuffle) », à la racine et dans chaque
+        // genre, et « All Tracks » d'un genre.
+        id if ensemble_de_pistes(id).is_some() => {
+            browse_ensemble_de_pistes(state, id, start, count, &base_url)
+        }
         "radios" => browse_radios(state, start, count),
         "playlists" => browse_playlists(state, start, count),
         // #4318 : parcours par dossiers, pour les points de contrôle qui
@@ -1959,7 +1985,7 @@ fn browse_direct_children(
 /// annoncé ici doit être navigable dans `browse_direct_children` — un dossier
 /// visible et vide se lit comme une bibliothèque cassée, pas comme une
 /// fonction manquante.
-const ROOT_CONTAINERS: [(&str, &str, &str); 7] = [
+const ROOT_CONTAINERS: [(&str, &str, &str); 8] = [
     ("artists", "Artists", "object.container"),
     ("albums", "Albums", "object.container"),
     ("genres", "Genres", "object.container"),
@@ -1978,6 +2004,18 @@ const ROOT_CONTAINERS: [(&str, &str, &str); 7] = [
     // `browse_playlists` et `browse_playlist_tracks` écrits et testés : la
     // règle n'était pas « pas de playlists », c'était « pas de dossier vide ».
     ("playlists", "Playlists", "object.container"),
+    // Fil 1916 (Sevy Tabroc) : « jouer toutes les pistes en mode aléatoire ».
+    // Un serveur de médias ne joue rien — c'est le point de contrôle qui lit
+    // un conteneur dans l'ordre reçu. Le mélange se publie donc comme un
+    // conteneur frère de « All Tracks », qui rend les MÊMES pistes dans un
+    // ordre mélangé et stable d'une page à l'autre (voir
+    // [`graine_du_melange`]). Il vient APRÈS les sept rayons historiques : ils
+    // gardent leur position chez les points de contrôle qui les ont mémorisés.
+    (
+        ID_TOUT_ALEATOIRE,
+        "All Tracks (Shuffle)",
+        "object.container",
+    ),
 ];
 
 fn empty_didl() -> DidlResult {
@@ -1996,7 +2034,12 @@ fn empty_didl() -> DidlResult {
 /// l'encodage : sans cela, un genre composé serait tronqué et ne retrouverait
 /// jamais ses albums.
 fn decode_genre_id(object_id: &str) -> Option<String> {
-    let raw = object_id.strip_prefix("genre/")?;
+    decoder_nom_de_genre(object_id.strip_prefix("genre/")?)
+}
+
+/// Le nom d'un genre tel que `urlencoding::encode` l'a mis dans un
+/// identifiant — celui du genre comme ceux de ses ensembles de pistes.
+fn decoder_nom_de_genre(raw: &str) -> Option<String> {
     let decoded = urlencoding::decode(raw).ok()?.into_owned();
     if decoded.trim().is_empty() {
         return None;
@@ -2201,7 +2244,8 @@ fn compter_enfants_racine(state: &UpnpState, object_id: &str) -> Option<u64> {
             .ok()?,
         "genres" => lire_genres(state).len() as i64,
         "years" => lire_annees(state).len() as i64,
-        "tracks" => TrackRepo::with_backend(state.backend.clone())
+        // Le mélange ouvre exactement les pistes de « All Tracks ».
+        "tracks" | ID_TOUT_ALEATOIRE => TrackRepo::with_backend(state.backend.clone())
             .count()
             .ok()?,
         "radios" => RadioRepo::with_backend(state.backend.clone())
@@ -2438,12 +2482,21 @@ fn didl_genres(genres: &[(String, u64)]) -> DidlResult {
 /// sort pas : la règle de [`ROOT_CONTAINERS`] — aucun conteneur annoncé qui
 /// s'ouvre vide — descend ainsi d'un niveau, comme elle le fait déjà pour les
 /// listes de lecture.
+///
+/// Le nombre rendu est celui des ENFANTS que le dossier ouvre : ses albums,
+/// plus les [`NB_ENSEMBLES_DU_GENRE`] ensembles de pistes que
+/// [`browse_genre_albums`] publie en tête (fil 1916). Le compter ici, à la
+/// source, garde la liste, `BrowseMetadata` et `Search` d'accord entre eux.
 fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
     AlbumRepo::with_backend(state.backend.clone())
         .genre_counts()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(genre, nb)| u64::try_from(nb).ok().map(|nb| (genre, nb)))
+        .filter_map(|(genre, nb)| {
+            u64::try_from(nb)
+                .ok()
+                .map(|nb| (genre, nb + NB_ENSEMBLES_DU_GENRE))
+        })
         .collect()
 }
 
@@ -2453,11 +2506,36 @@ fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
 /// « Rock/Pop ») et la colonne JSON `genres` — la même correspondance que
 /// l'interface web, pour que les deux vues d'un même genre donnent la même
 /// liste.
+///
+/// Fil 1916 : un genre publié ouvre d'abord « All Tracks » puis « All Tracks
+/// (Shuffle) » — toutes les pistes du genre, dans l'ordre des albums puis
+/// mélangées —, ensuite ses albums. Un genre inconnu reste vide : les deux
+/// ensembles n'existent que là où il y a des albums.
 fn browse_genre_albums(state: &UpnpState, genre: &str, base_url: &str) -> DidlResult {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let albums = repo.list_by_genre(genre).unwrap_or_default();
     let parent_id = format!("genre/{}", urlencoding::encode(genre));
-    didl_albums_under(&albums, &parent_id, base_url)
+    if albums.is_empty() {
+        return didl_albums_under(&albums, &parent_id, base_url);
+    }
+    let nb_pistes = ids_des_pistes_des_albums(state, &albums).len() as u64;
+    let mut inner = String::new();
+    for aleatoire in [false, true] {
+        inner.push_str(&didl_container(
+            &id_ensemble_du_genre(genre, aleatoire),
+            &parent_id,
+            titre_ensemble_du_genre(aleatoire),
+            "object.container",
+            Some(nb_pistes),
+        ));
+    }
+    inner.push_str(&albums_en_conteneurs(&albums, &parent_id, base_url));
+    let total = albums.len() as u64 + NB_ENSEMBLES_DU_GENRE;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
+    }
 }
 
 /// Les années DISTINCT des albums, la plus récente d'abord.
@@ -2533,6 +2611,22 @@ fn didl_albums_under(
     parent_id: &str,
     base_url: &str,
 ) -> DidlResult {
+    let inner = albums_en_conteneurs(albums, parent_id, base_url);
+    let total = albums.len() as u64;
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total,
+        returned: total,
+    }
+}
+
+/// Les `<container>` d'une liste d'albums, sans l'enveloppe DIDL — pour qu'un
+/// genre puisse les faire précéder de ses ensembles de pistes.
+fn albums_en_conteneurs(
+    albums: &[crate::db::models::Album],
+    parent_id: &str,
+    base_url: &str,
+) -> String {
     let mut inner = String::new();
     for album in albums {
         let id = format!("album/{}", album.id.unwrap_or(0));
@@ -2559,13 +2653,7 @@ fn didl_albums_under(
             &extra,
         ));
     }
-
-    let total = albums.len() as u64;
-    DidlResult {
-        xml: didl_wrap(&inner),
-        total,
-        returned: total,
-    }
+    inner
 }
 
 /// Le dossier Radio, PAGINÉ comme tous les autres conteneurs peuplés.
@@ -2800,6 +2888,268 @@ fn browse_album_tracks(state: &UpnpState, album_id: i64, base_url: &str) -> Didl
         total,
         returned: total,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Toutes les pistes, en ordre et en aléatoire (fil 1916, Sevy Tabroc)
+// ---------------------------------------------------------------------------
+//
+// « Je choisis un genre, je choisis toutes les pistes, je souhaite pouvoir les
+// jouer en mode aléatoire. » Un serveur de médias UPnP ne joue rien : le point
+// de contrôle (appli d'un lecteur réseau, BubbleUPnP, mconnect…) lit les
+// pistes d'un conteneur DANS L'ORDRE où le serveur les rend. « Tout en
+// aléatoire » se publie donc comme un conteneur : il rend les mêmes pistes que
+// son frère « All Tracks », dans un ordre mélangé.
+//
+// Les titres restent en anglais, comme ceux de tous les rayons du serveur
+// (« Artists », « All Tracks », « Folders ») : une requête UPnP ne porte ni
+// session ni langue.
+
+/// Rayon racine : toute la bibliothèque, mélangée.
+const ID_TOUT_ALEATOIRE: &str = "tracks-shuffle";
+/// « All Tracks » d'un genre : ses pistes, album après album.
+const PREFIXE_PISTES_DU_GENRE: &str = "genre-tracks/";
+/// « All Tracks (Shuffle) » d'un genre : les mêmes, mélangées.
+const PREFIXE_ALEATOIRE_DU_GENRE: &str = "genre-shuffle/";
+/// Les conteneurs qu'un genre publie avant ses albums.
+const NB_ENSEMBLES_DU_GENRE: u64 = 2;
+
+/// Combien de temps un ordre mélangé survit sans être relu.
+///
+/// Un point de contrôle lit un grand conteneur page par page
+/// (`StartingIndex` / `RequestedCount`). Si chaque requête tirait un nouvel
+/// ordre, la page 2 serait découpée dans un AUTRE mélange que la page 1 : des
+/// pistes en double, d'autres jamais lues, et un `TotalMatches` juste qui ne
+/// le laisse pas voir. L'ordre est donc mémorisé par conteneur, et chaque
+/// lecture repousse son échéance : il tient tant que quelqu'un le parcourt, et
+/// se renouvelle dix minutes après la dernière page — la prochaine ouverture
+/// joue dans un autre ordre.
+const DUREE_DU_MELANGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Même borne que `browse_all_tracks` : `RequestedCount = 0` veut dire
+/// « tout », et tout, sur des dizaines de milliers de pistes, est un DIDL de
+/// plusieurs mégaoctets. `TotalMatches` dit la taille réelle.
+const MAX_PAGE_ENSEMBLE: u64 = 500;
+
+/// Un ensemble de pistes publié comme conteneur.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnsembleDePistes {
+    /// `tracks-shuffle` : toute la bibliothèque, mélangée.
+    ToutAleatoire,
+    /// `genre-tracks/<nom>` (ordre des albums) ou `genre-shuffle/<nom>`.
+    Genre { genre: String, aleatoire: bool },
+}
+
+/// L'ensemble que désigne un identifiant, ou `None` s'il n'en désigne aucun.
+fn ensemble_de_pistes(id: &str) -> Option<EnsembleDePistes> {
+    if id == ID_TOUT_ALEATOIRE {
+        return Some(EnsembleDePistes::ToutAleatoire);
+    }
+    if let Some(raw) = id.strip_prefix(PREFIXE_PISTES_DU_GENRE) {
+        return decoder_nom_de_genre(raw).map(|genre| EnsembleDePistes::Genre {
+            genre,
+            aleatoire: false,
+        });
+    }
+    let raw = id.strip_prefix(PREFIXE_ALEATOIRE_DU_GENRE)?;
+    decoder_nom_de_genre(raw).map(|genre| EnsembleDePistes::Genre {
+        genre,
+        aleatoire: true,
+    })
+}
+
+/// L'identifiant d'un ensemble de genre — encodé comme `genre/<nom>`, pour
+/// qu'un « Rock/Pop » ne soit pas coupé à la barre oblique.
+fn id_ensemble_du_genre(genre: &str, aleatoire: bool) -> String {
+    let prefixe = if aleatoire {
+        PREFIXE_ALEATOIRE_DU_GENRE
+    } else {
+        PREFIXE_PISTES_DU_GENRE
+    };
+    format!("{prefixe}{}", urlencoding::encode(genre))
+}
+
+fn titre_ensemble_du_genre(aleatoire: bool) -> &'static str {
+    if aleatoire {
+        "All Tracks (Shuffle)"
+    } else {
+        "All Tracks"
+    }
+}
+
+/// Les pistes des albums donnés, album après album, chacun dans son ordre
+/// (disque, numéro, titre). UNE requête pour tout le genre.
+fn ids_des_pistes_des_albums(state: &UpnpState, albums: &[crate::db::models::Album]) -> Vec<i64> {
+    let album_ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
+    let lignes = TrackRepo::with_backend(state.backend.clone())
+        .ids_by_album_ids(&album_ids)
+        .unwrap_or_default();
+    let mut par_album: std::collections::HashMap<i64, Vec<i64>> = std::collections::HashMap::new();
+    for (piste, album) in lignes {
+        par_album.entry(album).or_default().push(piste);
+    }
+    album_ids
+        .iter()
+        .flat_map(|album| par_album.remove(album).unwrap_or_default())
+        .collect()
+}
+
+/// Les pistes d'un genre, ou `None` si le genre n'ouvre aucun album — il
+/// n'est alors pas publié, ses ensembles non plus.
+fn ids_du_genre(state: &UpnpState, genre: &str) -> Option<Vec<i64>> {
+    let albums = AlbumRepo::with_backend(state.backend.clone())
+        .list_by_genre(genre)
+        .unwrap_or_default();
+    if albums.is_empty() {
+        return None;
+    }
+    Some(ids_des_pistes_des_albums(state, &albums))
+}
+
+/// Les pistes d'un ensemble, dans l'ordre PUBLIÉ — mélangé pour les
+/// conteneurs aléatoires, avec la graine mémorisée de ce conteneur.
+fn ids_de_l_ensemble(state: &UpnpState, id: &str) -> Option<Vec<i64>> {
+    let (mut ids, aleatoire) = match ensemble_de_pistes(id)? {
+        // La table entière, comme « All Tracks » (`TrackRepo::list` et
+        // `count` ne filtrent rien) : les deux frères ouvrent le même ensemble.
+        EnsembleDePistes::ToutAleatoire => (
+            TrackRepo::with_backend(state.backend.clone())
+                .all_ids()
+                .unwrap_or_default(),
+            true,
+        ),
+        EnsembleDePistes::Genre { genre, aleatoire } => (ids_du_genre(state, &genre)?, aleatoire),
+    };
+    if aleatoire {
+        melanger(&mut ids, graine_du_melange(id));
+    }
+    Some(ids)
+}
+
+/// Une page d'un ensemble de pistes. `TotalMatches` est la taille EXACTE de
+/// l'ensemble ; la page est découpée dans l'ordre publié, donc deux pages
+/// successives ne se recouvrent pas et n'omettent rien.
+fn browse_ensemble_de_pistes(
+    state: &UpnpState,
+    id: &str,
+    start: u64,
+    count: u64,
+    base_url: &str,
+) -> DidlResult {
+    let Some(ids) = ids_de_l_ensemble(state, id) else {
+        return empty_didl();
+    };
+    let total = ids.len();
+    let debut = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+    let demande = usize::try_from(count.min(MAX_PAGE_ENSEMBLE)).unwrap_or(usize::MAX);
+    let fin = debut.saturating_add(demande).min(total);
+    let tracks = pistes_dans_l_ordre(state, &ids[debut..fin]);
+
+    let mut inner = String::new();
+    for track in &tracks {
+        inner.push_str(&didl_track_item(track, id, base_url));
+    }
+    DidlResult {
+        xml: didl_wrap(&inner),
+        total: total as u64,
+        returned: tracks.len() as u64,
+    }
+}
+
+/// `BrowseMetadata` d'un ensemble de genre : son parent est le genre, son
+/// nombre d'enfants celui qu'il ouvre. Le rayon racine se décrit, lui, depuis
+/// [`ROOT_CONTAINERS`].
+fn decrire_ensemble_du_genre(state: &UpnpState, id: &str) -> Option<String> {
+    let EnsembleDePistes::Genre { genre, aleatoire } = ensemble_de_pistes(id)? else {
+        return None;
+    };
+    let nb = ids_du_genre(state, &genre)?.len() as u64;
+    Some(didl_container(
+        id,
+        &format!("genre/{}", urlencoding::encode(&genre)),
+        titre_ensemble_du_genre(aleatoire),
+        "object.container",
+        Some(nb),
+    ))
+}
+
+/// La graine du mélange d'un conteneur, mémorisée — voir [`DUREE_DU_MELANGE`].
+///
+/// Partagée par tous les points de contrôle : deux appareils qui ouvrent le
+/// même conteneur dans la même fenêtre lisent le même ordre, et aucun ne voit
+/// l'ordre changer au milieu de sa pagination parce qu'un autre a lu la page 1.
+fn graine_du_melange(conteneur: &str) -> u64 {
+    type Memo = std::collections::HashMap<String, (u64, std::time::Instant)>;
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Memo>> = std::sync::OnceLock::new();
+    let mut memo = MEMO
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|empoisonne| empoisonne.into_inner());
+    graine_memorisee(
+        &mut memo,
+        conteneur,
+        std::time::Instant::now(),
+        DUREE_DU_MELANGE,
+        graine_neuve,
+    )
+}
+
+/// Le cœur de [`graine_du_melange`], l'horloge et le tirage passés en
+/// paramètres pour être éprouvés sans attendre dix minutes.
+///
+/// Les entrées échues sont purgées à chaque appel : la table ne grossit pas
+/// au-delà des conteneurs lus dans la fenêtre.
+fn graine_memorisee(
+    memo: &mut std::collections::HashMap<String, (u64, std::time::Instant)>,
+    conteneur: &str,
+    maintenant: std::time::Instant,
+    duree: std::time::Duration,
+    neuve: impl FnOnce(&str) -> u64,
+) -> u64 {
+    memo.retain(|_, (_, vu)| maintenant.saturating_duration_since(*vu) < duree);
+    let entree = memo
+        .entry(conteneur.to_owned())
+        .or_insert_with(|| (neuve(conteneur), maintenant));
+    entree.1 = maintenant;
+    entree.0
+}
+
+/// Une graine imprévisible, sans dépendance : `RandomState` est semé par le
+/// système à chaque construction.
+fn graine_neuve(conteneur: &str) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    conteneur.hash(&mut h);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        .hash(&mut h);
+    h.finish()
+}
+
+/// Mélange de Fisher-Yates, déterministe pour une graine donnée.
+///
+/// Les identifiants sont d'abord TRIÉS : l'ordre obtenu ne dépend que de
+/// l'ensemble et de la graine, pas de l'ordre dans lequel la base les a rendus
+/// — deux requêtes de la même fenêtre découpent donc bien le même ordre.
+fn melanger(ids: &mut [i64], graine: u64) {
+    ids.sort_unstable();
+    let mut etat = graine;
+    for i in (1..ids.len()).rev() {
+        let j = (splitmix64(&mut etat) % (i as u64 + 1)) as usize;
+        ids.swap(i, j);
+    }
+}
+
+/// SplitMix64 : un générateur de 64 bits sans état caché, assez bon pour
+/// mélanger une liste de lecture.
+fn splitmix64(etat: &mut u64) -> u64 {
+    *etat = etat.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *etat;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 // ---------------------------------------------------------------------------
@@ -3404,10 +3754,14 @@ mod tests {
     fn browser_un_genre_renvoie_ses_albums() {
         let state = state_with_albums();
         let res = browse_direct_children(&state, "genre/Jazz", 0, 100);
+        // Deux albums, précédés des deux ensembles de pistes du genre
+        // (« All Tracks », « All Tracks (Shuffle) », fil 1916).
         assert_eq!(
-            res.total, 2,
+            res.total,
+            2 + NB_ENSEMBLES_DU_GENRE,
             "Jazz doit rendre ses deux albums, dont celui au genre composé"
         );
+        assert_eq!(res.xml.matches("id=\"album/").count(), 2, "{}", res.xml);
         assert!(res.xml.contains("Kind of Blue"));
         assert!(res.xml.contains("Bitches Brew"));
         assert!(
@@ -3519,11 +3873,13 @@ mod tests {
             "aucune valeur composée ne doit être publiée telle quelle : {noms:?}"
         );
         // « Jazz » ouvre les DEUX albums qui le portent, le composé compris.
+        let jazz = browse_direct_children(&state, "genre/Jazz", 0, 0);
         assert_eq!(
-            browse_direct_children(&state, "genre/Jazz", 0, 0).total,
+            jazz.xml.matches("id=\"album/").count(),
             2,
             "Jazz doit ouvrir l'album simple ET l'album composé"
         );
+        assert_eq!(jazz.total, 2 + NB_ENSEMBLES_DU_GENRE);
         // Un genre porté par le seul tableau JSON existe aussi : le
         // `SELECT DISTINCT genre` l'ignorait.
         assert!(
@@ -5746,14 +6102,16 @@ mod ssdp_msearch_tests {
                 "years",
                 "tracks",
                 "radios",
-                "playlists"
+                "playlists",
+                // Fil 1916 : ajouté EN DERNIER, les sept premiers ne bougent pas.
+                "tracks-shuffle"
             ],
             "les rayons de la racine ont change d'ordre ou d'identifiant : {racine}"
         );
         assert_eq!(
             compteur(&racine, "NumberReturned"),
-            7,
-            "la racine n'annonce plus sept rayons : {racine}"
+            8,
+            "la racine n'annonce plus ses huit rayons : {racine}"
         );
 
         // --- TEMOIN 2 : les cinq rayons qui paginaient deja.
@@ -6729,5 +7087,290 @@ mod ssdp_msearch_tests {
 <SortCriteria></SortCriteria>
 </u:Browse></s:Body></s:Envelope>"#
         )
+    }
+}
+
+/// Fil 1916 (Sevy Tabroc, macOS, v0.9.163) : « À partir du media server Tune
+/// Server il faudrait ajouter la possibilité de jouer tous les morceaux en mode
+/// aléatoire : je choisis un genre, je choisis toutes les pistes, je souhaite
+/// pouvoir avoir l'option "Jouer toutes les pistes" en mode aléatoire. »
+///
+/// Tout passe par la réponse SOAP, là où le point de contrôle la lit.
+#[cfg(test)]
+mod aleatoire_1916_tests {
+    use super::*;
+    use crate::db::models::{Album, Artist};
+    use crate::db::sqlite::SqliteDb;
+    use std::time::{Duration, Instant};
+
+    /// Trois albums de six pistes : deux Jazz, un Rock — dix-huit pistes, dont
+    /// douze de Jazz.
+    fn banc() -> UpnpState {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let artiste = ArtistRepo::with_backend(backend.clone())
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let albums = AlbumRepo::with_backend(backend.clone());
+        let pistes = TrackRepo::with_backend(backend.clone());
+        for (titre, genre) in [
+            ("Kind of Blue", "Jazz"),
+            ("Bitches Brew", "Jazz"),
+            ("The Wall", "Rock"),
+        ] {
+            let mut album = Album::new(titre.into());
+            album.genre = Some(genre.into());
+            album.artist_id = Some(artiste);
+            album.artist_name = Some("Miles Davis".into());
+            let album_id = albums.create(&album).unwrap();
+            for n in 1..=6 {
+                let mut piste = Track::new(format!("{titre} {n:02}"));
+                piste.album_id = Some(album_id);
+                piste.album_title = Some(titre.into());
+                piste.artist_id = Some(artiste);
+                piste.artist_name = Some("Miles Davis".into());
+                piste.file_path = Some(format!("/music/{titre}/{n:02}.flac"));
+                pistes.create(&piste).unwrap();
+            }
+        }
+        UpnpState::new(backend, 8888, None)
+    }
+
+    fn corps(id: &str, drapeau: &str, debut: u64, nombre: u64) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+  <s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+    <ObjectID>{id}</ObjectID><BrowseFlag>{drapeau}</BrowseFlag><Filter>*</Filter>
+    <StartingIndex>{debut}</StartingIndex><RequestedCount>{nombre}</RequestedCount>
+    <SortCriteria></SortCriteria>
+  </u:Browse></s:Body>
+</s:Envelope>"#
+        )
+    }
+
+    fn parcourir(state: &UpnpState, id: &str, debut: u64, nombre: u64) -> String {
+        let soap = build_browse_response(state, &corps(id, "BrowseDirectChildren", debut, nombre));
+        assert!(!is_soap_fault(&soap), "Browse({id}) rend un fault : {soap}");
+        soap
+    }
+
+    fn champ(soap: &str, balise: &str) -> String {
+        let ouvrant = format!("<{balise}>");
+        let debut = soap.find(&ouvrant).expect(balise) + ouvrant.len();
+        let fin = soap[debut..].find(&format!("</{balise}>")).expect(balise) + debut;
+        soap[debut..fin].to_string()
+    }
+
+    fn nombre(soap: &str, balise: &str) -> u64 {
+        champ(soap, balise).parse().unwrap()
+    }
+
+    fn didl(soap: &str) -> String {
+        unescape(&champ(soap, "Result")).unwrap().into_owned()
+    }
+
+    /// Les `id` des objets du DIDL qui commencent par `prefixe`, dans l'ordre.
+    fn ids(didl: &str, prefixe: &str) -> Vec<String> {
+        let aiguille = format!("id=\"{prefixe}");
+        didl.match_indices(&aiguille)
+            .map(|(i, _)| {
+                let debut = i + "id=\"".len();
+                let fin = didl[debut..].find('"').unwrap() + debut;
+                didl[debut..fin].to_string()
+            })
+            .collect()
+    }
+
+    fn pistes(soap: &str) -> Vec<String> {
+        ids(&didl(soap), "track/")
+    }
+
+    fn trie(mut v: Vec<String>) -> Vec<String> {
+        v.sort();
+        v
+    }
+
+    /// Le conteneur aléatoire APPARAÎT dans le Browse de son parent : à la
+    /// racine, et dans chaque genre juste à côté de « All Tracks ».
+    #[test]
+    fn le_conteneur_aleatoire_apparait_a_cote_de_toutes_les_pistes() {
+        let state = banc();
+
+        let racine = didl(&parcourir(&state, "0", 0, 0));
+        assert!(
+            racine.contains(
+                "id=\"tracks-shuffle\" parentID=\"0\" restricted=\"1\" childCount=\"18\""
+            ),
+            "la racine ne publie pas « All Tracks (Shuffle) » : {racine}"
+        );
+        assert!(racine.contains("<dc:title>All Tracks (Shuffle)</dc:title>"));
+
+        let jazz = parcourir(&state, "genre/Jazz", 0, 0);
+        let enfants = ids(&didl(&jazz), "");
+        assert_eq!(
+            &enfants[..2],
+            ["genre-tracks/Jazz", "genre-shuffle/Jazz"],
+            "le genre doit ouvrir sur « All Tracks » puis son frère aléatoire : {jazz}"
+        );
+        assert_eq!(
+            enfants.iter().filter(|i| i.starts_with("album/")).count(),
+            2
+        );
+        assert_eq!(nombre(&jazz, "TotalMatches"), 4, "{jazz}");
+        assert_eq!(nombre(&jazz, "NumberReturned"), 4, "{jazz}");
+        let didl_jazz = didl(&jazz);
+        for (id, titre) in [
+            ("genre-tracks/Jazz", "All Tracks"),
+            ("genre-shuffle/Jazz", "All Tracks (Shuffle)"),
+        ] {
+            assert!(
+                didl_jazz.contains(&format!(
+                    "id=\"{id}\" parentID=\"genre/Jazz\" restricted=\"1\" childCount=\"12\"><dc:title>{titre}</dc:title>"
+                )),
+                "{id} mal annoncé : {didl_jazz}"
+            );
+            // BrowseMetadata dit la même chose que la liste.
+            let meta = build_browse_response(&state, &corps(id, "BrowseMetadata", 0, 0));
+            assert_eq!(nombre(&meta, "NumberReturned"), 1, "{meta}");
+            assert!(
+                didl(&meta).contains("parentID=\"genre/Jazz\" restricted=\"1\" childCount=\"12\""),
+                "BrowseMetadata({id}) : {meta}"
+            );
+        }
+
+        // Le genre annonce les enfants qu'il ouvre : 2 albums + 2 ensembles.
+        let genres = didl(&parcourir(&state, "genres", 0, 0));
+        assert!(
+            genres.contains(
+                "id=\"genre/Jazz\" parentID=\"genres\" restricted=\"1\" childCount=\"4\""
+            ),
+            "{genres}"
+        );
+    }
+
+    /// Même ensemble que « All Tracks », ordre différent — à la racine et
+    /// dans un genre, et sans une piste d'un autre genre.
+    #[test]
+    fn l_aleatoire_rend_les_memes_pistes_dans_un_autre_ordre() {
+        let state = banc();
+        for (ordonne, melange, attendu) in [
+            ("tracks", "tracks-shuffle", 18),
+            ("genre-tracks/Jazz", "genre-shuffle/Jazz", 12),
+        ] {
+            let a = pistes(&parcourir(&state, ordonne, 0, 0));
+            let b = pistes(&parcourir(&state, melange, 0, 0));
+            assert_eq!(a.len(), attendu, "{ordonne}");
+            assert_eq!(b.len(), attendu, "{melange}");
+            assert_eq!(
+                trie(a.clone()),
+                trie(b.clone()),
+                "{melange} ne rend pas les pistes de {ordonne}"
+            );
+            // Une permutation de 12 ou 18 éléments qui retombe sur l'ordre
+            // de départ : une chance sur 479 millions au pire.
+            assert_ne!(
+                a, b,
+                "{melange} rend l'ordre de {ordonne} : rien n'est mélangé"
+            );
+        }
+
+        let jazz = didl(&parcourir(&state, "genre-shuffle/Jazz", 0, 0));
+        assert!(
+            !jazz.contains("The Wall"),
+            "une piste Rock dans le Jazz : {jazz}"
+        );
+
+        // « All Tracks » du genre : album après album, chacun dans son ordre.
+        let en_ordre = didl(&parcourir(&state, "genre-tracks/Jazz", 0, 0));
+        let pos = |t: &str| en_ordre.find(t).unwrap_or_else(|| panic!("{t} absent"));
+        assert!(pos("Bitches Brew 01") < pos("Bitches Brew 06"));
+        assert!(pos("Bitches Brew 06") < pos("Kind of Blue 01"));
+        assert!(pos("Kind of Blue 01") < pos("Kind of Blue 06"));
+    }
+
+    /// Le point crucial : un point de contrôle qui lit en TROIS pages reçoit
+    /// l'ensemble exact, sans doublon ni omission, et dans l'ordre d'une
+    /// lecture d'un seul tenant.
+    #[test]
+    fn trois_pages_du_melange_rendent_l_ensemble_sans_doublon() {
+        let state = banc();
+        for (id, total) in [("tracks-shuffle", 18u64), ("genre-shuffle/Jazz", 12)] {
+            let entier = pistes(&parcourir(&state, id, 0, 0));
+            let taille = total / 3;
+            let mut lu = Vec::new();
+            for page in 0..3 {
+                let soap = parcourir(&state, id, page * taille, taille);
+                assert_eq!(nombre(&soap, "TotalMatches"), total, "{id} : {soap}");
+                assert_eq!(nombre(&soap, "NumberReturned"), taille, "{id} : {soap}");
+                lu.extend(pistes(&soap));
+            }
+            assert_eq!(
+                lu, entier,
+                "{id} : les pages ne découpent pas le même ordre"
+            );
+            let uniques: std::collections::HashSet<_> = lu.iter().collect();
+            assert_eq!(uniques.len() as u64, total, "{id} : doublons {lu:?}");
+            let au_dela = parcourir(&state, id, total, taille);
+            assert_eq!(nombre(&au_dela, "NumberReturned"), 0, "{au_dela}");
+        }
+    }
+
+    /// La graine tient tant que le conteneur est relu (fenêtre glissante), et
+    /// se renouvelle une fois la fenêtre passée sans lecture.
+    #[test]
+    fn la_graine_tient_pendant_la_lecture_et_se_renouvelle_apres() {
+        let mut memo = std::collections::HashMap::new();
+        let duree = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut tirages = 0u64;
+        let mut graine =
+            |memo: &mut std::collections::HashMap<String, (u64, Instant)>, id: &str, t: Instant| {
+                graine_memorisee(memo, id, t, duree, |_| {
+                    tirages += 1;
+                    tirages
+                })
+            };
+        assert_eq!(graine(&mut memo, "tracks-shuffle", t0), 1);
+        let t1 = t0 + Duration::from_secs(540);
+        assert_eq!(graine(&mut memo, "tracks-shuffle", t1), 1, "relu à 9 min");
+        let t2 = t1 + Duration::from_secs(540);
+        assert_eq!(
+            graine(&mut memo, "tracks-shuffle", t2),
+            1,
+            "18 min après l'ouverture, 9 après la dernière page : même ordre"
+        );
+        let t3 = t2 + duree + Duration::from_secs(1);
+        assert_eq!(
+            graine(&mut memo, "tracks-shuffle", t3),
+            2,
+            "dix minutes sans lecture : nouvel ordre"
+        );
+        assert_eq!(
+            graine(&mut memo, "genre-shuffle/Jazz", t3),
+            3,
+            "chaque conteneur a sa graine"
+        );
+    }
+
+    /// L'ordre ne dépend que de l'ensemble et de la graine — pas de l'ordre
+    /// dans lequel la base a rendu les identifiants.
+    #[test]
+    fn le_melange_ne_depend_que_de_l_ensemble_et_de_la_graine() {
+        let croissant: Vec<i64> = (1..=50).collect();
+        let mut a = croissant.clone();
+        let mut b: Vec<i64> = croissant.iter().rev().copied().collect();
+        melanger(&mut a, 42);
+        melanger(&mut b, 42);
+        assert_eq!(a, b);
+        assert_ne!(a, croissant);
+        let mut c = croissant.clone();
+        melanger(&mut c, 43);
+        assert_ne!(a, c, "deux graines, un seul ordre");
+        let mut trie = a.clone();
+        trie.sort_unstable();
+        assert_eq!(trie, croissant, "le mélange a perdu ou dupliqué une piste");
     }
 }
