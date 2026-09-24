@@ -838,5 +838,21 @@ mod tests {
         );
         assert_eq!(r.create_folder("Suivant", None).unwrap().id, 8);
         pool.close().await;
+
+        // Nettoyage OBLIGATOIRE : la CI partage UNE base entre ses étapes. Un
+        // schéma laissé derrière porte `PG_FULL_SCHEMA` tout-TEXT, dont
+        // `favorite_facets.profile_id` : la garde de la 038, qui lit
+        // `information_schema.columns` sans filtrer le schéma, l'y trouvait en
+        // TEXT et convertissait celui du schéma courant, déjà BIGINT —
+        // `btrim(bigint) does not exist` dans l'E2E #2468 (intégration v0.9.164).
+        let maintenance = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::raw_sql(
+            "DROP SCHEMA IF EXISTS rayons_4853_natif CASCADE; \
+             DROP SCHEMA IF EXISTS rayons_4853_bascule CASCADE;",
+        )
+        .execute(&maintenance)
+        .await
+        .unwrap();
+        maintenance.close().await;
     }
 }
