@@ -515,7 +515,101 @@ pub(super) async fn artist_albums(
         let albums: Vec<Value> = albums.iter().map(|a| a.to_json()).collect();
         obj.insert(cle.to_string(), json!(albums));
     }
+    inserer_sections_de_credits(&repo, &state, id, obj);
     Json(reponse)
+}
+
+/// #4767 — « Collaborations » et « Reprises », lues dans `track_credits`
+/// (rempli par `POST /system/enrich-credits`).
+///
+/// Ne regarde que les disques d'AUTRUI où l'artiste n'est l'artiste d'aucune
+/// piste : ceux-là sont déjà dans la discographie, « Compilations » ou
+/// « Apparitions », et un album ne s'affiche jamais deux fois.
+///
+/// Forme, pour chaque album : l'objet album habituel, plus
+/// - `focus_track_ids` : les pistes où l'artiste est crédité au titre de la
+///   section (musicien pour « Collaborations », auteur pour « Reprises ») —
+///   c'est le FOCUS : `tracks.artist_id` n'y désigne pas l'artiste, le client
+///   filtre donc sur ces identifiants ;
+/// - `credit_roles` : ce qu'il y fait (instruments, `vocals`, `composer`,
+///   `writer`…), sans doublon.
+///
+/// `collaborations` est groupée par ARTISTE PRINCIPAL de l'album :
+/// `[{artist_id, artist_name, albums: [...]}]`, groupes par nom, albums par
+/// année. `covers` est une liste d'albums par année. Chaque clé est ABSENTE
+/// quand sa section est vide, comme `compilations` et `appearances`.
+fn inserer_sections_de_credits(
+    repo: &AlbumRepo,
+    state: &AppState,
+    artist_id: i64,
+    obj: &mut serde_json::Map<String, Value>,
+) {
+    use tune_core::metadata::credits_release::{AlbumCredite, classer, credits_hors_discographie};
+
+    let (credits, disques) = credits_hors_discographie(&state.backend, artist_id);
+    if credits.is_empty() {
+        return;
+    }
+    let classement = classer(&credits, &disques);
+
+    // Les albums d'une section, triés par année puis titre, avec leur focus.
+    let charger = |entrees: &[AlbumCredite]| -> Vec<(tune_core::db::models::Album, Value)> {
+        let (mut seuls, trouvees): (Vec<tune_core::db::models::Album>, Vec<&AlbumCredite>) =
+            entrees
+                .iter()
+                .filter_map(|e| repo.get(e.album_id).ok().flatten().map(|a| (a, e)))
+                .unzip();
+        repo.attacher_added_at(&mut seuls);
+        let mut albums: Vec<(tune_core::db::models::Album, &AlbumCredite)> =
+            seuls.into_iter().zip(trouvees).collect();
+        albums.sort_by(|(a, _), (b, _)| {
+            a.year
+                .unwrap_or(i32::MAX)
+                .cmp(&b.year.unwrap_or(i32::MAX))
+                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        });
+        albums
+            .into_iter()
+            .map(|(a, e)| {
+                let mut v = a.to_json();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("focus_track_ids".into(), json!(e.track_ids));
+                    o.insert("credit_roles".into(), json!(e.roles));
+                }
+                (a, v)
+            })
+            .collect()
+    };
+
+    let collaborations = charger(&classement.collaborations);
+    if !collaborations.is_empty() {
+        // Groupes dans l'ordre des noms ; albums déjà triés par année.
+        let mut groupes: Vec<(Option<i64>, String, Vec<Value>)> = Vec::new();
+        for (album, v) in collaborations {
+            let nom = album.artist_name.clone().unwrap_or_default();
+            match groupes
+                .iter_mut()
+                .find(|(id, n, _)| *id == album.artist_id && *n == nom)
+            {
+                Some((_, _, albums)) => albums.push(v),
+                None => groupes.push((album.artist_id, nom, vec![v])),
+            }
+        }
+        groupes.sort_by_key(|g| g.1.to_lowercase());
+        let groupes: Vec<Value> = groupes
+            .into_iter()
+            .map(|(id, nom, albums)| json!({ "artist_id": id, "artist_name": nom, "albums": albums }))
+            .collect();
+        obj.insert("collaborations".into(), json!(groupes));
+    }
+
+    let reprises: Vec<Value> = charger(&classement.reprises)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect();
+    if !reprises.is_empty() {
+        obj.insert("covers".into(), json!(reprises));
+    }
 }
 
 pub(super) async fn artist_tracks(

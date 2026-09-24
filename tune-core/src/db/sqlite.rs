@@ -514,7 +514,11 @@ CREATE TABLE IF NOT EXISTS albums (
     -- 88,4 % sur le .15. Aucune heuristique ne remplit cette colonne — ni le
     -- nombre de titres, ni la duree : un tri faux est pire qu'une section
     -- absente. TEXT sur les deux moteurs, sans defaut.
-    release_type TEXT
+    release_type TEXT,
+    -- Dernier passage de la passe des credits MusicBrainz sur ce disque
+    -- (migration 107, #4767). NUL = jamais interroge : c'est le curseur de
+    -- reprise de `POST /system/enrich-credits`.
+    credits_mb_at TEXT
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,
@@ -575,7 +579,9 @@ CREATE TABLE IF NOT EXISTS track_credits (
     artist_name TEXT NOT NULL,
     role TEXT DEFAULT 'performer',
     instrument TEXT,
-    position INTEGER DEFAULT 0
+    position INTEGER DEFAULT 0,
+    -- Identifiant MusicBrainz de l'artiste credite (migration 107, #4767).
+    artist_mbid TEXT
 );
 
 -- Persistent per-file first-seen-in-library timestamp, keyed by path.

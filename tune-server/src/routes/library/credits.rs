@@ -59,49 +59,11 @@ fn ecrire_credits(
     track_id: i64,
     lignes: &[LigneCredit],
 ) -> usize {
-    use tune_core::db::backend::ToSqlValue;
-    let id_str = track_id.to_string();
-    backend
-        .execute(
-            "DELETE FROM track_credits WHERE track_id = ?",
-            &[&id_str as &dyn ToSqlValue],
-        )
-        .ok();
-    // CRD-4 : la fiche artiste existante est LIÉE (jamais créée ici — un
-    // musicien de session n'est pas un artiste de la bibliothèque tant
-    // qu'aucun album ne le porte). Sans ce lien, `/artists/{id}/credits`
-    // retombait sur une comparaison de noms, et l'onglet Instrument à venir
-    // (CRD-6) n'aurait aucune clé. Lié en CHAÎNE, comme `track_id`, pour le
-    // miroir PostgreSQL où la colonne est du `TEXT`.
-    let artistes = tune_core::db::artist_repo::ArtistRepo::with_backend(backend.clone());
-    let mut ecrites = 0usize;
-    for (pos, ligne) in lignes.iter().enumerate() {
-        let pos = pos as i32;
-        let artist_id: Option<String> = artistes
-            .get_by_name(&ligne.artist_name)
-            .ok()
-            .flatten()
-            .and_then(|a| a.id)
-            .map(|id| id.to_string());
-        let ok = backend
-            .execute(
-                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                &[
-                    &id_str as &dyn ToSqlValue,
-                    &artist_id as &dyn ToSqlValue,
-                    &ligne.artist_name as &dyn ToSqlValue,
-                    &ligne.role as &dyn ToSqlValue,
-                    &ligne.instrument as &dyn ToSqlValue,
-                    &pos as &dyn ToSqlValue,
-                ],
-            )
-            .is_ok();
-        if ok {
-            ecrites += 1;
-        }
-    }
-    ecrites
+    // #4767 — l'écriture vit désormais dans tune-core, pour que la passe des
+    // crédits PAR DISQUE (`POST /system/enrich-credits`) écrive exactement
+    // comme ces routes : même purge, mêmes positions, même liaison de fiche
+    // (par MBID d'abord, puis par nom), jamais de fiche créée.
+    tune_core::metadata::credits_release::ecrire_credits_piste(backend, track_id, lignes)
 }
 
 pub(super) async fn track_credits(
@@ -232,6 +194,8 @@ pub(super) async fn enrich_track_credits(
         "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
     );
 
+    // Créneau du limiteur MusicBrainz PARTAGÉ (#4767) — pas de cadence locale.
+    tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
     let resp =
         match state.http_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
@@ -288,6 +252,7 @@ pub(super) async fn enrich_album_credits(
             "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
         );
 
+        tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
         let resp = match state.http_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
@@ -305,9 +270,6 @@ pub(super) async fn enrich_album_credits(
         ecrire_credits(&state.backend, track_id, &lignes_credits(&resp));
 
         enriched += 1;
-
-        // MusicBrainz rate limit: 1 request/sec
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     }
 
     Json(json!({
@@ -455,6 +417,7 @@ pub(super) async fn enrich_all_credits(
                 "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
             );
 
+            tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
             match state.http_client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                     Ok(data) => {
@@ -498,9 +461,6 @@ pub(super) async fn enrich_all_credits(
                     "Crédits",
                 );
             }
-
-            // MusicBrainz rate limit: 1 request/sec
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
 
         reglages
@@ -568,9 +528,11 @@ pub(crate) const CADENCE_CREDITS_AUTO: std::time::Duration =
     std::time::Duration::from_secs(6 * 3600);
 /// Attente avant le premier tour : le démarrage a mieux à faire.
 const PREMIER_TOUR_APRES: std::time::Duration = std::time::Duration::from_secs(90);
-/// Pause entre deux appels MusicBrainz (politique du service : une requête
-/// par seconde).
-const PAUSE_MUSICBRAINZ: std::time::Duration = std::time::Duration::from_millis(1100);
+// La cadence MusicBrainz (une requête par seconde) n'est plus tenue ici par
+// un `sleep` : chaque appel attend son créneau dans le limiteur PARTAGÉ du
+// dépôt (`musicbrainz_release::rate_limit_delay`, #4767), que la passe des
+// crédits par disque, les types de sortie et les pochettes empruntent aussi.
+
 /// Quand la passe manuelle tourne, on repasse plus tard sans compter un tour.
 const REESSAI_SI_PASSE_MANUELLE: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -688,7 +650,12 @@ async fn passe_automatique_credits(state: AppState) {
             .background_tasks
             .snapshot()
             .iter()
-            .any(|t| t.id == TACHE_CREDITS)
+            // La passe PAR DISQUE (#4767) écrit la même table : on s'efface
+            // aussi devant elle.
+            .any(|t| {
+                t.id == TACHE_CREDITS
+                    || t.id == tune_core::metadata::credits_release::TACHE_CREDITS_RELEASES
+            })
         {
             tokio::time::sleep(REESSAI_SI_PASSE_MANUELLE).await;
             continue;
@@ -766,7 +733,6 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                     Some(c.duree_ms),
                 )
                 .await;
-                tokio::time::sleep(PAUSE_MUSICBRAINZ).await;
                 if let Some(t) = &trouve {
                     retenir_le_mbid(state, c.id, &t.mbid);
                 }
@@ -778,6 +744,7 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                 let url = format!(
                     "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
                 );
+                tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
                 match state.http_client.get(&url).send().await {
                     Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                         Ok(data) => {
@@ -793,7 +760,6 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                     },
                     _ => bilan.erreurs += 1,
                 }
-                tokio::time::sleep(PAUSE_MUSICBRAINZ).await;
             }
             None => bilan.sans_credit += 1,
         }
@@ -1013,11 +979,13 @@ mod tests {
                 artist_name: "anouar brahem".into(),
                 role: "performer".into(),
                 instrument: Some("oud".into()),
+                artist_mbid: None,
             },
             LigneCredit {
                 artist_name: "Musicien De Session".into(),
                 role: "performer".into(),
                 instrument: Some("piano".into()),
+                artist_mbid: None,
             },
         ];
         assert_eq!(ecrire_credits(b, piste, &lignes), 2);
