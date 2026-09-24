@@ -104,6 +104,16 @@ impl StreamInfo {
     /// pas dans le flux décodé, la durée réelle diffère de toute façon de la
     /// durée en bibliothèque.
     pub fn wav_content_length(&self) -> Option<u64> {
+        // #4863 — un producteur qui CONNAÎT sa longueur exacte (source PCM
+        // d'un greffon : `44 + secteurs × 2 352` pour un CD) la pose dans
+        // `file_size`, et elle prime sur la déduction par la durée. La réponse
+        // HEAD lisait déjà `file_size` en premier ; le GET en déduisait une
+        // longueur arrondie qui tronquait la fin de piste. Aucune session de
+        // canal WAV ne posait `file_size` jusqu'ici : les sessions de FICHIER
+        // qui le posent y mettent la taille réelle du fichier, identique.
+        if let Some(taille) = self.file_size.filter(|_| self.format == "wav") {
+            return Some(taille);
+        }
         let dur = self.duration_ms?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
@@ -2261,6 +2271,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.wav_content_length(), Some(180 * 44100 * 2 * 2 + 44));
+    }
+
+    /// #4863 — une piste de CD de 3 001 secteurs : 3 001 × 2 352 octets. Aucune
+    /// durée entière en millisecondes ne donne cette longueur (3 001 n'est pas
+    /// un multiple de 3) ; la longueur exacte posée par le producteur prime.
+    #[test]
+    fn wav_content_length_prend_la_longueur_exacte_du_producteur() {
+        let exacte = 44 + 3_001 * 2_352;
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: Some(exacte),
+            duration_ms: Some(3_001 * 40 / 3),
+            ..Default::default()
+        };
+        assert_eq!(info.wav_content_length(), Some(exacte));
     }
 
     // ─── Péremption des sessions : activité, pas âge (#2536) ────────

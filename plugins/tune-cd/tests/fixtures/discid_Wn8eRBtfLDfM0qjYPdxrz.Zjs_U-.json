@@ -1,0 +1,155 @@
+{
+  "releases": [
+    {
+      "id": "a060c352-c9d6-4717-aab8-95a2965fa8d7",
+      "title": "Fiction",
+      "artist-credit": [
+        {
+          "name": "Dark Tranquillity",
+          "joinphrase": ""
+        }
+      ],
+      "cover-art-archive": {
+        "front": true
+      },
+      "media": [
+        {
+          "position": 1,
+          "discs": [
+            {
+              "id": "Hs8ZseFVsWMtuKhz.v8BD1GdRTU-"
+            },
+            {
+              "id": "Wn8eRBtfLDfM0qjYPdxrz.Zjs_U-"
+            },
+            {
+              "id": "YDyLBqZ5bqcWHVPjuSn.cnHtCGM-"
+            }
+          ],
+          "tracks": [
+            {
+              "position": 1,
+              "number": "1",
+              "title": "Nothing to No One",
+              "length": 250000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 2,
+              "number": "2",
+              "title": "The Lesser Faith",
+              "length": 277000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 3,
+              "number": "3",
+              "title": "Terminus (Where Death Is Most Alive)",
+              "length": 264000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 4,
+              "number": "4",
+              "title": "Blind at Heart",
+              "length": 261000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 5,
+              "number": "5",
+              "title": "Icipher",
+              "length": 279000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 6,
+              "number": "6",
+              "title": "Inside the Particle Storm",
+              "length": 329000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 7,
+              "number": "7",
+              "title": "Empty Me",
+              "length": 299000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 8,
+              "number": "8",
+              "title": "Misery’s Crown",
+              "length": 254000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 9,
+              "number": "9",
+              "title": "Focus Shift",
+              "length": 216000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            },
+            {
+              "position": 10,
+              "number": "10",
+              "title": "The Mundane and the Magic",
+              "length": 317000,
+              "artist-credit": [
+                {
+                  "name": "Dark Tranquillity",
+                  "joinphrase": ""
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
