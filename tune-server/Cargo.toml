@@ -807,6 +807,17 @@ name = "hote_wasm_playlists_4716"
 path = "tests/hote_wasm_playlists_4716.rs"
 required-features = ["plugins-wasm"]
 
+# #4717 — le greffon « Playlists converter » CHARGÉ dans le bac à sable. Le
+# moteur se joue en natif dans `plugins/tune-playlists-converter` ; cette cible
+# est la seule qui exerce l'ABI (alloc/dealloc, empaquetage `(ptr<<32)|len`,
+# imports `"tune"`) et la seule qui prouve qu'un aperçu n'écrit rien EN
+# TRAVERSANT le bac à sable. `autotests = false` en tête de ce manifeste :
+# sans ce bloc, le fichier ne serait jamais compilé.
+[[test]]
+name = "greffon_convertisseur_4717"
+path = "tests/greffon_convertisseur_4717.rs"
+required-features = ["plugins-wasm"]
+
 # #4716 — la permission `library` (appariement LOCAL) et l'appariement à
 # plusieurs candidats. `autotests = false` en tête de ce manifeste : sans cette
 # cible, le sens service → bibliothèque ne serait jamais compilé.

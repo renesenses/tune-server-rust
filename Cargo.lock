@@ -5428,6 +5428,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-playlists-converter"
+version = "0.9.161"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tune-plugin-abi"
 version = "0.1.0"
 dependencies = [
