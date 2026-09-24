@@ -9,6 +9,8 @@ mod browse;
 // `pub(crate)` : `/tags/{id}/collections` (routes/tags.rs) rend les dossiers d'une
 // étiquette dans la forme SERVIE de `/library/collections` — même fonction,
 // mêmes `album_count` et `orphan_album_ids` (#4798).
+// Dossiers de collections (#4853) : un arbre au-dessus des deux listes plates.
+mod collection_folders;
 pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
@@ -39,7 +41,7 @@ mod tracks;
 pub(crate) mod write_tags;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -511,6 +513,24 @@ pub fn router() -> Router<AppState> {
             "/collections/{id}/albums/{album_id}",
             post(collections::add_album_to_collection)
                 .delete(collections::remove_album_from_collection),
+        )
+        // Dossiers de collections (#4853) — ADDITIF : les deux listes plates
+        // ci-dessus et `/library/smart-collections` gardent leur forme.
+        .route(
+            "/collection-folders",
+            get(collection_folders::tree).post(collection_folders::create_folder),
+        )
+        .route(
+            "/collection-folders/{id}",
+            patch(collection_folders::rename_folder).delete(collection_folders::delete_folder),
+        )
+        .route(
+            "/collection-folders/{id}/move",
+            post(collection_folders::move_folder),
+        )
+        .route(
+            "/collection-folders/items/{kind}/{id}",
+            post(collection_folders::place_item).delete(collection_folders::remove_item),
         )
 }
 

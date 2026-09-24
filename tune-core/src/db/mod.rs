@@ -6,6 +6,7 @@ pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
+pub mod collection_folder_repo;
 pub mod engine;
 pub mod facet_filter;
 pub mod favorite_facets_repo;

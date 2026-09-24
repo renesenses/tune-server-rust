@@ -171,6 +171,11 @@ const MIGRATION_TABLES: &[&str] = &[
     // l'utilisateur a fait taire réapparaîtraient à la bascule
     // SQLite → PostgreSQL.
     "ignored_devices",
+    // Dossiers de collections (#4853). Sans ces deux lignes, tout le
+    // rangement de l'utilisateur serait perdu a la bascule SQLite ->
+    // PostgreSQL — les collections, elles, passent (reglage + table).
+    "collection_folders",
+    "collection_folder_items",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -593,6 +598,25 @@ CREATE TABLE IF NOT EXISTS ignored_devices (
     name TEXT NOT NULL DEFAULT '',
     device_type TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+
+-- Dossiers de collections (#4853). Tout en TEXT, comme le reste de ce
+-- schéma : la copie lie chaque valeur SQLite en texte. La migration 070
+-- convertit ensuite les colonnes entières en BIGINT (conversion gardée sur le
+-- type courant, patron 038).
+CREATE TABLE IF NOT EXISTS collection_folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    parent_id TEXT,
+    position TEXT NOT NULL DEFAULT '0',
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+CREATE TABLE IF NOT EXISTS collection_folder_items (
+    kind TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    folder_id TEXT,
+    position TEXT NOT NULL DEFAULT '0',
+    PRIMARY KEY (kind, collection_id)
 );
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
@@ -1241,6 +1265,8 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         "upnp_library_sources" => "ON CONFLICT (source_key) DO NOTHING",
         "upnp_library_members" => "ON CONFLICT (source_key, track_id) DO NOTHING",
         "media_servers" => "ON CONFLICT (udn) DO NOTHING",
+        // Pas de colonne `id` : la clef primaire est la paire (#4853).
+        "collection_folder_items" => "ON CONFLICT (kind, collection_id) DO NOTHING",
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",
         "track_source_links" => "ON CONFLICT (track_id, service) DO NOTHING",
