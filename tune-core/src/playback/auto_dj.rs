@@ -5,6 +5,16 @@ use serde_json::{Value, json};
 
 use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 
+/// #4806 — le prédicat « pas banni pour le profil actif », alias `t`, que
+/// chaque générateur de ce module pose dans son `WHERE`. L'auto-DJ tourne
+/// sans requête HTTP : le profil est celui du serveur, voir
+/// `hidden_repo::profil_de_selection_automatique`.
+fn sans_titres_bannis(db: &std::sync::Arc<dyn DbBackend>) -> String {
+    crate::db::facet_filter::banned_tracks_excluded(
+        crate::db::hidden_repo::profil_de_selection_automatique(db),
+    )
+}
+
 fn rows_to_json(rows: &[Vec<SqlValue>]) -> Vec<Value> {
     rows.iter()
         .map(|r| {
@@ -32,6 +42,17 @@ pub fn tracks_for_artist_names(
     count: usize,
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
+    // #4806 — la radio d'artiste est une sélection automatique : jamais un
+    // titre banni par le profil actif.
+    let sans_bannis = sans_titres_bannis(db);
+    let sql = format!(
+        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
+         FROM tracks t \
+         JOIN artists ar ON t.artist_id = ar.id \
+         LEFT JOIN albums al ON t.album_id = al.id \
+         WHERE LOWER(ar.name) = ?1 AND {sans_bannis} \
+         ORDER BY RANDOM() LIMIT ?2"
+    );
     for name in names {
         if out.len() >= count {
             break;
@@ -39,15 +60,7 @@ pub fn tracks_for_artist_names(
         let lname = name.to_lowercase();
         let limit = per_artist.min(count - out.len()) as i64;
         let rows = db
-            .query_many(
-                "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
-                 FROM tracks t \
-                 JOIN artists ar ON t.artist_id = ar.id \
-                 LEFT JOIN albums al ON t.album_id = al.id \
-                 WHERE LOWER(ar.name) = ?1 \
-                 ORDER BY RANDOM() LIMIT ?2",
-                &[&lname, &limit],
-            )
+            .query_many(&sql, &[&lname, &limit])
             .map(|r| rows_to_json(&r))
             .unwrap_or_default();
         out.extend(rows);
@@ -256,7 +269,9 @@ pub fn generate_queue(
     // Build dynamic query based on available seed metadata.
     // We use positional params (?1, ?2, ...) and collect owned
     // SqlValue params so we can pass &dyn ToSqlValue slices.
-    let mut conditions = vec!["t.id != ?1".to_string()];
+    // #4806 — l'enchaînement de fin de file ne choisit jamais un titre banni.
+    let sans_bannis = sans_titres_bannis(db);
+    let mut conditions = vec!["t.id != ?1".to_string(), sans_bannis.clone()];
     let mut owned_params: Vec<crate::db::backend::SqlValue> = vec![seed_track_id.to_sql_value()];
     let mut param_idx = 2;
 
@@ -306,16 +321,16 @@ pub fn generate_queue(
     // Fallback to random if no matches
     if results.is_empty() && (genre.is_some() || year.is_some() || bpm.is_some()) {
         let cnt = count as i64;
-        results = db
-            .query_many(
-                "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
+        let repli = format!(
+            "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
              FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              LEFT JOIN albums al ON t.album_id = al.id \
-             WHERE t.id != ? \
-             ORDER BY RANDOM() LIMIT ?",
-                &[&seed_track_id, &cnt],
-            )
+             WHERE t.id != ? AND {sans_bannis} \
+             ORDER BY RANDOM() LIMIT ?"
+        );
+        results = db
+            .query_many(&repli, &[&seed_track_id, &cnt])
             .map(|r| rows_to_json(&r))
             .unwrap_or_default();
     }
@@ -1161,6 +1176,8 @@ pub fn generate_mood_queue(
         format!("({})", genre_conditions.join(" OR "))
     };
 
+    // #4806 — une ambiance est une sélection automatique : sans titre banni.
+    let sans_bannis = sans_titres_bannis(db);
     let sql = format!(
         "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
          FROM tracks t \
@@ -1168,6 +1185,7 @@ pub fn generate_mood_queue(
          LEFT JOIN albums al ON t.album_id = al.id \
          WHERE ({genre_clause}) \
          AND (t.bpm IS NULL OR t.bpm BETWEEN ? AND ?) \
+         AND {sans_bannis} \
          ORDER BY RANDOM() LIMIT ?",
     );
 
@@ -1179,15 +1197,16 @@ pub fn generate_mood_queue(
 
     // Fallback to random if mood filter too restrictive
     if results.is_empty() {
-        results = db
-            .query_many(
-                "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
+        let repli = format!(
+            "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.genre, t.year, t.bpm \
              FROM tracks t \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              LEFT JOIN albums al ON t.album_id = al.id \
-             ORDER BY RANDOM() LIMIT ?",
-                &[&cnt],
-            )
+             WHERE {sans_bannis} \
+             ORDER BY RANDOM() LIMIT ?"
+        );
+        results = db
+            .query_many(&repli, &[&cnt])
             .map(|r| rows_to_json(&r))
             .unwrap_or_default();
     }
