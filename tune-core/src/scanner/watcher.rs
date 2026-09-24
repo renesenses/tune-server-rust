@@ -377,6 +377,61 @@ mod tests {
         assert!(!is_audio_file(Path::new("cover.jpg")));
     }
 
+    /// Rejoue des événements `notify` bruts dans le gestionnaire de
+    /// production, puis les fusionne comme `poll_debounced` : le dernier
+    /// événement d'un chemin l'emporte.
+    fn rejouer(evenements: Vec<Event>) -> HashMap<String, ChangeType> {
+        let (tx, rx) = mpsc::channel();
+        let gestionnaire = make_event_handler(tx);
+        for e in evenements {
+            gestionnaire(Ok(e));
+        }
+        let mut fusion = HashMap::new();
+        while let Ok(c) = rx.try_recv() {
+            fusion.insert(c.path, c.change_type);
+        }
+        fusion
+    }
+
+    fn ev(kind: EventKind, chemin: &str) -> Event {
+        Event::new(kind).add_path(PathBuf::from(chemin))
+    }
+
+    /// #4896 (Didier, fil 1904) — les séquences que le moteur Windows de
+    /// `notify` 7.0.0 fabrique (`src/windows.rs`, `handle_event`) :
+    /// `FILE_ACTION_MODIFIED` → `Modify(Any)`, `ADDED` → `Create(Any)`,
+    /// `REMOVED` → `Remove(Any)`, `RENAMED_OLD_NAME`/`NEW_NAME` →
+    /// `Modify(Name(From/To))`. Aucune n'est perdue pour le fichier audio :
+    /// la retouche Mp3tag parvient bien jusqu'à `auto_scan`. Le dernier cas
+    /// arrive en `Added` sur un chemin DÉJÀ indexé, que `auto_scan` doit
+    /// traiter comme un remplacement (`reimporter_fichier_surveillant`).
+    #[test]
+    fn les_sequences_windows_d_une_retouche_atteignent_le_fichier_audio_4896() {
+        use notify::event::{CreateKind, RemoveKind, RenameMode};
+        let x = r"D:\Musique\Pink Floyd\Multichannel 7.1\01 - Speak To Me.flac";
+        let tmp = r"D:\Musique\Pink Floyd\Multichannel 7.1\01 - Speak To Me.tmp";
+        // Écriture en place (FLAC au remplissage suffisant).
+        let en_place = rejouer(vec![ev(EventKind::Modify(ModifyKind::Any), x)]);
+        assert_eq!(en_place.get(x), Some(&ChangeType::Modified));
+        // Fichier temporaire du même dossier, puis renommage par-dessus.
+        let par_renommage = rejouer(vec![
+            ev(EventKind::Create(CreateKind::Any), tmp),
+            ev(EventKind::Modify(ModifyKind::Any), tmp),
+            ev(EventKind::Remove(RemoveKind::Any), x),
+            ev(EventKind::Modify(ModifyKind::Name(RenameMode::From)), tmp),
+            ev(EventKind::Modify(ModifyKind::Name(RenameMode::To)), x),
+        ]);
+        assert_eq!(par_renommage.get(x), Some(&ChangeType::Modified));
+        assert!(!par_renommage.contains_key(tmp), "le temporaire est filtré");
+        // Remplacement par déplacement depuis un autre dossier : REMOVED puis
+        // ADDED, sans MODIFIED.
+        let par_deplacement = rejouer(vec![
+            ev(EventKind::Remove(RemoveKind::Any), x),
+            ev(EventKind::Create(CreateKind::Any), x),
+        ]);
+        assert_eq!(par_deplacement.get(x), Some(&ChangeType::Added));
+    }
+
     #[test]
     fn watcher_lifecycle() {
         let dir = tempfile::TempDir::new().unwrap();
