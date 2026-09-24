@@ -292,9 +292,13 @@ pub(super) async fn crossfeed_status_de_zone(
         .flatten()
         .as_deref()
         == Some("true");
-    // La sonde ne sert que si les deux conditions d'avant sont réunies : ne
-    // pas réveiller le réseau pour une zone locale, ni pour un opt-in fermé.
-    let renderer_accepte_lpcm = match (&device, est_reseau && progressif_arme) {
+    // La sonde ne sert que pour une zone RÉSEAU : ne pas réveiller le réseau
+    // pour une zone locale. Depuis #2742 (24/09), elle compte aussi opt-in
+    // fermé : un renderer qui annonce le LPCM reçoit le crossfeed des pistes
+    // de la bibliothèque en WAV progressif, et le statut doit le dire. C'est la
+    // MÊME sonde que la résolution (`dlna_accepte_lpcm`, mémorisée par
+    // renderer) : l'écran et le son se répondent sur une seule règle.
+    let renderer_accepte_lpcm = match (&device, est_reseau) {
         (Some(did), true) if !did.is_empty() => {
             state.orchestrator.dlna_accepte_lpcm(did, false).await
         }

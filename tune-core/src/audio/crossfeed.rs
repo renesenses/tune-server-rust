@@ -175,22 +175,30 @@ pub enum CrossfeedConstraint {
     /// C'est un choix assumé, pas une panne — mais tant qu'il dure, le réglage
     /// est sans effet et l'écran doit le dire.
     PureMode,
-    /// Zone RÉSEAU dont le flux progressif n'est pas armé. Depuis LAT-F1, le
-    /// crossfeed d'une piste de la BIBLIOTHÈQUE est appliqué par le relais du
-    /// bras progressif ; ce bras n'est emprunté que si l'opt-in global
-    /// `dsp_progressif_reseau` (Réglages → Lecture) est coché. À froid, une
-    /// piste de la bibliothèque part encore par le fichier pré-transcodé, qui
-    /// ne porte aucun crossfeed — et c'est un garde-fou du dépôt, pas un oubli.
+    /// Zone RÉSEAU dont le flux progressif n'est pas armé ET dont le renderer
+    /// n'a pas annoncé le LPCM (sonde `GetProtocolInfo`, réponse inconcluante
+    /// comprise).
+    ///
+    /// Depuis le 24/09 (#2742, décision de Bertrand : « crossfeed toujours,
+    /// SANS délai »), une piste de la BIBLIOTHÈQUE sur une zone réseau porte le
+    /// crossfeed sans l'opt-in dans deux cas (`orchestrator::
+    /// crossfeed_bibliotheque_reseau`) : quand un autre traitement la
+    /// ré-encode déjà (le crossfeed rejoint ce ré-encodage), et quand le
+    /// renderer lit le LPCM (WAV progressif). Il reste un cas : crossfeed seul
+    /// vers un renderer SANS LPCM. La piste y part telle quelle — la
+    /// ré-encoder par le fichier entier retarderait le premier son de
+    /// plusieurs secondes à plusieurs dizaines (#3357). C'est ce que dit ce
+    /// motif, et lui seul.
     ///
     /// ⚠️ Motif PARTIEL, et c'est le seul (#2742, 23/09) : il ne VERROUILLE pas
     /// le contrôle ([`Self::verrouille`]). Les bras STREAMING (Qobuz, Tidal,
     /// YouTube) chargent la chaîne de la zone par `load_streaming_dsp`, dont le
     /// dernier étage est le crossfeed, et la pré-transcodent dès qu'un étage
     /// est actif — SANS consulter cet opt-in. Sur ces flux le crossfeed
-    /// s'entend donc, opt-in désarmé. Le déclarer indisponible verrouillait
-    /// l'intensité et le retard d'un effet que l'auditeur Qobuz entendait
-    /// — « même plus la possibilité de régler intensité et retard » (Tades,
-    /// 0.9.151, zone DLNA, source Qobuz).
+    /// s'entend donc. Le déclarer indisponible verrouillait l'intensité et le
+    /// retard d'un effet que l'auditeur Qobuz entendait — « même plus la
+    /// possibilité de régler intensité et retard » (Tades, 0.9.151, zone DLNA,
+    /// source Qobuz).
     NetworkProgressiveOff,
     /// Zone RÉSEAU dont le renderer n'a pas annoncé le LPCM à la profondeur
     /// servie (sonde `GetProtocolInfo`, réponse inconcluante comprise). Le
@@ -236,11 +244,12 @@ impl CrossfeedConstraint {
             }
             Self::NetworkProgressiveOff => {
                 "Sur cette zone réseau, le crossfeed s'applique aux flux Qobuz, \
-                 Tidal et YouTube, traités avant l'envoi. Les pistes de votre \
-                 bibliothèque partent en revanche sans lui tant que le flux \
-                 progressif n'est pas activé : réglez « Égaliseur et \
-                 traitements → réseau » sur « Au fil de l'eau » dans les \
-                 Réglages pour l'entendre aussi sur elles."
+                 Tidal et YouTube, et aux pistes de votre bibliothèque que Tune \
+                 retraite déjà (égaliseur, correction de pièce, ReplayGain, \
+                 conversion). Les autres pistes partent telles quelles : ce \
+                 lecteur n'annonce pas le PCM non compressé, seul format par \
+                 lequel Tune peut leur appliquer le crossfeed sans retarder le \
+                 début de la lecture."
             }
             Self::NetworkRendererNoLpcm => {
                 "Ce lecteur réseau n'annonce pas savoir lire le PCM non compressé \
@@ -287,7 +296,8 @@ pub struct CrossfeedStatus {
     pub requested: bool,
     /// Ce qui sera réellement appliqué au son de cette zone — au moins à une
     /// partie de ce qu'elle joue quand `reason` porte un motif partiel
-    /// (`NetworkProgressiveOff` : les flux des services, pas les fichiers).
+    /// (`NetworkProgressiveOff` : les flux des services et les pistes déjà
+    /// retraitées, pas celles qui partent telles quelles).
     pub effective: bool,
     /// `true` dès qu'une contrainte VERROUILLANTE s'applique
     /// ([`CrossfeedConstraint::verrouille`]) — **y compris quand la case
@@ -354,7 +364,15 @@ pub fn crossfeed_status(
         // l'utilisateur peut agir dessus : l'opt-in est une case qu'il coche,
         // le LPCM du renderer ne se négocie pas.
         if !progressif_arme {
-            Some(CrossfeedConstraint::NetworkProgressiveOff)
+            // #2742 (24/09) — sans l'opt-in, un renderer qui annonce le LPCM
+            // reçoit le crossfeed des pistes de la bibliothèque en WAV
+            // progressif (`crossfeed_bibliotheque_reseau`, cas 2). La réserve
+            // ne vaut plus que pour celui qui ne l'annonce pas (cas 3).
+            if renderer_accepte_lpcm {
+                None
+            } else {
+                Some(CrossfeedConstraint::NetworkProgressiveOff)
+            }
         } else if !renderer_accepte_lpcm {
             Some(CrossfeedConstraint::NetworkRendererNoLpcm)
         } else {
@@ -631,11 +649,32 @@ mod tests {
             .detail
             .expect("une réserve sans explication n'aide personne");
         assert!(
-            detail.contains("Qobuz") && detail.contains("Au fil de l'eau"),
-            "l'explication doit dire OÙ l'effet s'entend et quoi faire pour les \
-             pistes de la bibliothèque : {detail}"
+            detail.contains("Qobuz") && detail.contains("PCM non compressé"),
+            "l'explication doit dire OÙ l'effet s'entend et pourquoi les autres \
+             pistes de la bibliothèque en sont privées : {detail}"
+        );
+        assert!(
+            !detail.contains("Au fil de l'eau"),
+            "l'opt-in n'y changerait rien — ce renderer n'annonce pas le LPCM, \
+             le motif serait `network_renderer_no_lpcm` : {detail}"
         );
         assert!(s.requested);
+    }
+
+    /// #2742 (24/09) — sans l'opt-in, un renderer qui ANNONCE le LPCM reçoit
+    /// le crossfeed des pistes de la bibliothèque en WAV progressif
+    /// (`orchestrator::crossfeed_bibliotheque_reseau`, cas 2, mesuré de bout
+    /// en bout par `cas_2_crossfeed_seul_part_en_wav_progressif_si_le_renderer_lit_le_lpcm_2742`).
+    /// Plus aucune réserve : le statut dit vrai selon le renderer.
+    #[test]
+    fn une_sortie_reseau_qui_lit_le_lpcm_n_a_plus_de_reserve_sans_opt_in() {
+        let s = crossfeed_status(true, false, true, false, false, true);
+        assert_eq!(s.reason, None, "{s:?}");
+        assert!(s.effective && !s.unavailable, "{s:?}");
+        // PURE coupe toujours tout.
+        let pure = crossfeed_status(true, false, true, true, false, true);
+        assert_eq!(pure.reason, Some(CrossfeedConstraint::PureMode));
+        assert!(!pure.effective);
     }
 
     /// 2. Zone réseau + case DÉCOCHÉE : ni verrou ni effet — le contrôle doit
@@ -934,14 +973,19 @@ mod tests {
              garde plus le chemin qu'il prétend garder"
         );
 
-        // La prémisse INVERSE, et c'est la plus importante : le chemin réseau
-        // ne doit pas se mettre à appliquer un crossfeed dans notre dos.
-        // `transcode_source_to_file` est la seule porte du chemin transcodé
-        // (DLNA, OpenHome, Chromecast, BluOS…) ; sa signature ne porte que
-        // l'égaliseur, le convolveur et le ReplayGain. Le jour où l'on y ajoute
-        // le crossfeed, `crossfeed_status` mentira dans l'AUTRE sens — un écran
-        // qui annonce « sans effet » pendant que le DAC reçoit un signal
-        // traité — et ce test doit l'exiger AVANT que ça n'arrive.
+        // La prémisse INVERSE, et c'est la plus importante : le chemin
+        // transcodé ne doit pas appliquer un crossfeed dans notre dos.
+        //
+        // Jusqu'au 24/09, `transcode_source_to_file` était la SEULE porte du
+        // chemin transcodé et sa signature ne portait que l'égaliseur, le
+        // convolveur et le ReplayGain. Depuis #2742 (décision de Bertrand :
+        // « crossfeed toujours, SANS délai »), une piste de la bibliothèque
+        // déjà ré-encodée pour une zone RÉSEAU emporte aussi le crossfeed, et
+        // `crossfeed_status` le sait (seul le renderer sans LPCM garde la
+        // réserve `network_progressive_off`). D'où trois gardes au lieu d'une :
+        //
+        // a. la porte d'origine reste SANS crossfeed — le pré-chauffage de
+        //    `queue.rs` et tout nouvel appelant passent par elle ;
         let (_, apres) = ORCHESTRATEUR
             .split_once("async fn transcode_source_to_file(")
             .expect("la porte du chemin transcodé doit exister");
@@ -950,9 +994,36 @@ mod tests {
             .expect("signature de transcode_source_to_file illisible");
         assert!(
             !signature.contains("crossfeed"),
-            "le chemin transcodé accepte désormais un crossfeed : \
-             `CrossfeedConstraint::NonLocalOutput` n'est plus vrai et doit \
-             être revu ici AVANT d'être publié à l'écran.\nsignature : {signature}"
+            "la porte d'origine du chemin transcodé accepte un crossfeed : le \
+             pré-chauffage et tout appelant hors #2742 le recevraient sans que \
+             `crossfeed_status` le sache.\nsignature : {signature}"
+        );
+        // b. la porte qui le porte n'a qu'UN appelant de production, la
+        //    lecture d'une piste de la bibliothèque (`resolve_local.rs`) ;
+        const RESOLVE_LOCAL: &str = include_str!("../orchestrator/resolve_local.rs");
+        let compter = |src: &str| {
+            src.matches("transcode_source_to_file_avec_crossfeed(")
+                .count()
+        };
+        assert_eq!(
+            (compter(ORCHESTRATEUR), compter(RESOLVE_LOCAL)),
+            (2, 1),
+            "`transcode_source_to_file_avec_crossfeed` doit avoir exactement sa \
+             définition, l'appel de la porte d'origine (avec `None`) et celui de \
+             `resolve_local.rs` : un appelant de plus appliquerait le crossfeed \
+             hors de la règle de `crossfeed_bibliotheque_reseau`"
+        );
+        // c. et ce qu'elle reçoit sort de `crossfeed_du_fichier`, fermé à une
+        //    sortie `local:` — qui l'applique déjà elle-même : le cumul de
+        //    v0.9.139 ne doit pas revenir par ce bras.
+        const MODULE: &str = include_str!("../orchestrator/crossfeed_bibliotheque_reseau.rs");
+        assert!(
+            RESOLVE_LOCAL.contains("self.crossfeed_du_fichier(")
+                && MODULE.contains(
+                    "sortie_est_reseau && traitement_cuit_dans_le_fichier(sortie_est_locale)"
+                ),
+            "le crossfeed du fichier ré-encodé doit rester réservé aux zones \
+             RÉSEAU, jamais à une sortie `local:`"
         );
 
         // 3. Et le RELAIS progressif, lui, doit en porter un.

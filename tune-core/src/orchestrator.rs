@@ -1280,6 +1280,9 @@ mod resolve_stream;
 
 mod resolve_local;
 
+// #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
+mod crossfeed_bibliotheque_reseau;
+
 mod dsp;
 pub use dsp::PorteeDuReglage;
 
