@@ -23,7 +23,23 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use tune_core::db::zone_repo::ZoneRepo;
 
+/// Le renderer de la zone réseau annonce-t-il le LPCM ?
+///
+/// Absent du registre, il est présumé capable — la règle de
+/// `dlna_accepte_lpcm`, la même à la résolution qu'à l'écran. Enregistré sous
+/// une sortie factice sans Sink `GetProtocolInfo`, il n'annonce rien : c'est
+/// le renderer sans LPCM, le seul cas qui garde la réserve depuis le 24/09.
+#[derive(Clone, Copy)]
+enum Renderer {
+    AnnonceLeLpcm,
+    SansLpcm,
+}
+
 async fn app(premium: bool) -> (axum::Router, i64, i64) {
+    app_avec(premium, Renderer::SansLpcm).await
+}
+
+async fn app_avec(premium: bool, renderer: Renderer) -> (axum::Router, i64, i64) {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
     state.license.set_account_premium(premium, None).await;
     let repo = ZoneRepo::with_backend(state.backend.clone());
@@ -33,6 +49,12 @@ async fn app(premium: bool) -> (axum::Router, i64, i64) {
     let reseau = repo
         .create("C19", Some("dlna"), Some("uuid:diretta-renderer-2742"))
         .unwrap();
+    if let Renderer::SansLpcm = renderer {
+        state.orchestrator.outputs.lock().await.register(Box::new(
+            tune_core::outputs::mock::MockOutput::new("uuid:diretta-renderer-2742", "C19")
+                .with_type("dlna"),
+        ));
+    }
     (tune_server::routes::router(state), locale, reseau)
 }
 
@@ -96,8 +118,8 @@ async fn une_zone_reseau_sans_opt_in_laisse_regler_intensite_et_retard() {
          retard est le symptôme de Tades — {st}"
     );
     assert_eq!(st["effective"].as_bool(), Some(true), "{st}");
-    // La réserve reste dite : les pistes de la bibliothèque, elles, attendent
-    // le flux progressif.
+    // La réserve reste dite : ce renderer n'annonce pas le LPCM, les pistes
+    // de la bibliothèque que rien ne retraite partent telles quelles.
     assert_eq!(
         st["reason"].as_str(),
         Some("network_progressive_off"),
@@ -106,7 +128,7 @@ async fn une_zone_reseau_sans_opt_in_laisse_regler_intensite_et_retard() {
     assert!(
         st["detail"]
             .as_str()
-            .is_some_and(|d| d.contains("Qobuz") && d.contains("Au fil de l'eau")),
+            .is_some_and(|d| d.contains("Qobuz") && d.contains("PCM non compressé")),
         "{st}"
     );
     // Et le réglage envoyé est celui qui est relu.
@@ -136,6 +158,20 @@ async fn sans_premium_la_meme_zone_reste_verrouillee_par_les_droits() {
 async fn la_sortie_locale_reste_nominale() {
     let (app, locale, _) = app(true).await;
     let (status, ecrit) = ecrire(&app, locale).await;
+    assert_eq!(status, StatusCode::OK, "{ecrit}");
+    let st = &ecrit["crossfeed_status"];
+    assert_eq!(st["unavailable"].as_bool(), Some(false), "{st}");
+    assert_eq!(st["effective"].as_bool(), Some(true), "{st}");
+    assert!(st["reason"].is_null(), "{st}");
+}
+
+/// #2742 (24/09) — le même écran devant un renderer qui ANNONCE le LPCM : les
+/// pistes de la bibliothèque portent le crossfeed en WAV progressif, sans
+/// l'opt-in (décision de Bertrand). Plus aucune réserve.
+#[tokio::test]
+async fn un_renderer_qui_lit_le_lpcm_n_a_plus_de_reserve() {
+    let (app, _, reseau) = app_avec(true, Renderer::AnnonceLeLpcm).await;
+    let (status, ecrit) = ecrire(&app, reseau).await;
     assert_eq!(status, StatusCode::OK, "{ecrit}");
     let st = &ecrit["crossfeed_status"];
     assert_eq!(st["unavailable"].as_bool(), Some(false), "{st}");

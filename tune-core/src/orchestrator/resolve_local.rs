@@ -1402,8 +1402,15 @@ impl PlaybackOrchestrator {
             // `is_network_output &&` d'abord : sans lui, une zone LOCALE
             // paierait une lecture de réglages par piste pour un drapeau que
             // `cible_wav_pour_traitement` va de toute façon annuler.
-            let traitement = eq_forces_transcode
-                || (is_network_output && self.zone_has_active_crossfeed(req.zone_id));
+            let crossfeed_reseau = is_network_output && self.zone_has_active_crossfeed(req.zone_id);
+            let traitement = eq_forces_transcode || crossfeed_reseau;
+            // #2742 (24/09) — un crossfeed SEUL vaut consentement au WAV
+            // progressif : `crossfeed_bibliotheque_reseau`, cas 2.
+            let opt_in = super::crossfeed_bibliotheque_reseau::wav_progressif_consenti(
+                opt_in,
+                crossfeed_reseau,
+                eq_forces_transcode,
+            );
             let candidat =
                 cible_wav_pour_traitement(traitement, is_network_output, src_est_dsd, opt_in, true);
 
@@ -2199,6 +2206,7 @@ impl PlaybackOrchestrator {
             bit_depth,
             channels,
             is_local_output,
+            is_network_output,
             sample_rate,
             track_duration_ms,
             tranche_cue,
@@ -2241,6 +2249,10 @@ impl PlaybackOrchestrator {
             let convolver = cuire
                 .then(|| self.load_convolver(req.zone_id, out_sr, channels))
                 .flatten();
+            // #2742 — le crossfeed, cuit côté RÉSEAU seulement, et sa clé de
+            // cache : `crossfeed_bibliotheque_reseau`, cas 1.
+            let crossfeed =
+                self.crossfeed_du_fichier(req.zone_id, out_sr, is_network_output, is_local_output);
             // ReplayGain scales the samples, so like the EQ and the FIR it
             // changes the encoded bytes without being part of the cache key.
             // A cached transcode made at a different gain would be served
@@ -2289,6 +2301,10 @@ impl PlaybackOrchestrator {
             let empreinte_dsp = crate::transcode_cache::empreinte_avec_tranche(
                 empreinte_dsp,
                 tranche_cue.map(|t| (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d))),
+            );
+            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_crossfeed(
+                empreinte_dsp,
+                crossfeed.as_ref().map(|(_, reglage)| *reglage),
             );
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
@@ -2515,7 +2531,7 @@ impl PlaybackOrchestrator {
                     seq: my_seq,
                 };
                 let transcode_result = transcoder_sous_budget(
-                    transcode_source_to_file(
+                    transcode_source_to_file_avec_crossfeed(
                         fp.clone(),
                         out_sr,
                         channels,
@@ -2533,6 +2549,7 @@ impl PlaybackOrchestrator {
                             debut_s: t.debut_ms as f64 / 1000.0,
                             duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
                         }),
+                        crossfeed.map(|(processeur, _)| processeur),
                     ),
                     progres,
                     politique,

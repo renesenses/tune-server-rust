@@ -1724,11 +1724,20 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
     );
     let req = requete_locale_3234(zone_id, 1);
 
-    // Opt-in DÉSARMÉ : rien ne bouge. FLAC ré-encodé par le fichier, comme
-    // avant le correctif — pas une seconde d'attente ajoutée.
+    // Opt-in DÉSARMÉ, renderer qui annonce le LPCM (absent du registre :
+    // présumé capable). Depuis le 24/09 (#2742, décision de Bertrand), le
+    // crossfeed seul vaut consentement au WAV progressif — jamais au fichier
+    // entier : pas une seconde d'attente ajoutée. Le cas sans LPCM, qui part
+    // tel quel, est mesuré dans `crossfeed_bibliotheque_reseau`.
     let avant = orch.format_de_sortie_pour_test(&req).await.unwrap();
-    assert_eq!(avant.out_mime, "audio/flac", "à froid, rien ne change");
-    assert!(avant.use_file_transcode);
+    assert_eq!(
+        avant.out_mime, "audio/wav",
+        "crossfeed seul : WAV progressif"
+    );
+    assert!(
+        !avant.use_file_transcode,
+        "jamais le fichier entier pour un crossfeed seul"
+    );
 
     // Opt-in ARMÉ : WAV progressif, et le relais portera le crossfeed.
     settings.set("dsp_progressif_reseau", "true").unwrap();
