@@ -839,6 +839,16 @@ impl LocalOutput {
         self.gain_moyen_dsp.clone()
     }
 
+    /// Fil 1908 (Didier) — de quoi dire QUAND un échantillon sort : la
+    /// position ALIMENTÉE (celle que la sortie rapporte, les mêmes `Arc` que
+    /// le fil de lecture) et le compteur de l'anneau, qui sait combien de
+    /// millisecondes attendent encore le pilote. Partagés, pas copiés : le
+    /// forwarder de niveaux les relit à chaque fenêtre. Voir
+    /// `PlaybackManager::brancher_l_horloge_de_sortie`.
+    pub fn horloge_de_sortie(&self) -> (Arc<AtomicU64>, Arc<RingStarvation>) {
+        (self.position_ms.clone(), self.starvation.clone())
+    }
+
     fn recompute_effective_volume(&self) {
         let user = self.user_volume.load(Ordering::SeqCst);
         let rg = self.rg_factor.load(Ordering::SeqCst);
@@ -1435,6 +1445,9 @@ impl NativePcmRing {
             unsafe { *self.buf[idx].get() = *sample };
         }
         self.write.store(w + n as u64, Ordering::Release);
+        // Fil 1908 — ce qui attend le pilote, pour la position audible.
+        self.starvation
+            .noter_alimentation(w.wrapping_sub(r) as usize + n);
         n
     }
 
@@ -1458,6 +1471,9 @@ impl NativePcmRing {
         }
         self.read.store(r + n as u64, Ordering::Release);
         self.starvation.record(out.len(), n);
+        // Fil 1908 — un atomique `Relaxed` de plus, même contrat temps réel.
+        self.starvation
+            .noter_en_attente(w.wrapping_sub(r) as usize - n);
         n
     }
 
@@ -1486,6 +1502,8 @@ impl NativePcmRing {
         // Compté en ÉCHANTILLONS comme partout ailleurs, pas en octets : le
         // chiffre doit se comparer d'un backend à l'autre (#3205).
         self.starvation.record(out.len() / bytes_per_sample, count);
+        // Fil 1908 — ce qui reste pour le pilote, en échantillons.
+        self.starvation.noter_en_attente(available - count);
         count * bytes_per_sample
     }
 }
@@ -1671,6 +1689,9 @@ impl RingBuf {
             unsafe { *self.buf[idx].get() = samples[i] };
         }
         self.write.store(w + n as u64, Ordering::Release);
+        // Fil 1908 — ce qui attend le pilote, pour la position audible.
+        self.starvation
+            .noter_alimentation(w.wrapping_sub(r) as usize + n);
         n
     }
 
@@ -1699,6 +1720,9 @@ impl RingBuf {
         // que les rappels comblent avec des zéros. Trois atomiques `Relaxed`,
         // rien d'autre — voir le contrat sur `RingStarvation`.
         self.starvation.record(out.len(), n);
+        // Fil 1908 — ce qui reste pour le pilote : la position audible
+        // retranche cette durée de la position alimentée. Même contrat.
+        self.starvation.noter_en_attente(avail - n);
         n
     }
 }
@@ -5957,6 +5981,10 @@ impl OutputTarget for LocalOutput {
                 output_sr as u64,
                 output_ch as u64,
             );
+            // Fil 1908 — le vidage rapporte déjà la position JOUÉE
+            // (alimenté − anneau) : la position audible ne doit pas
+            // retrancher l'anneau une seconde fois.
+            starvation.marquer_le_vidage();
             let vidage = backend.drainer(drain_deadline);
 
             if http_eof && vidage.vide {
