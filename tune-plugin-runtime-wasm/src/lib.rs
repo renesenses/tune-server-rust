@@ -14,8 +14,11 @@
 //! intentionally absent here.
 //!
 //! **#4716** (tranche 1 de l'épique #4715, « Playlists converter ») élargit
-//! cette surface à trois permissions de plus — `playlists`, `streaming` et
-//! `kv` — sur le modèle exact des précédentes. Trois règles s'y lisent :
+//! cette surface à quatre permissions de plus — `playlists`, `streaming`,
+//! `library` et `kv` — sur le modèle exact des précédentes. `library` est
+//! arrivée après coup : sans recherche ni appariement LOCAL, le greffon ne
+//! savait aller que de la bibliothèque VERS un service et refusait le sens
+//! inverse. Trois règles s'y lisent :
 //! aucune capacité ne SUPPRIME quoi que ce soit (ni playlist, ni piste, ni
 //! favori : un greffon ne doit pas pouvoir effacer chez un service) ; toute
 //! écriture chez un service purge le cache de contenu utilisateur côté hôte ;
@@ -179,9 +182,28 @@ pub trait HostContext: Send + Sync {
     ) -> Result<serde_json::Value, String>;
     /// `streaming` — apparier un titre connu chez un service, avec
     /// l'appariement déjà écrit pour la fusion de playlists (jamais un second).
+    ///
+    /// Rend PLUSIEURS candidats classés, le verdict en tête : l'appelant qui
+    /// applique ensuite sa propre règle (le greffon refuse un écart de durée de
+    /// plus de 3 s) doit pouvoir redescendre d'un cran au lieu de conclure
+    /// « introuvable ».
     fn streaming_match_track(
         &self,
         service: &str,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<serde_json::Value, String>;
+
+    /// `library` — chercher dans la bibliothèque LOCALE (recherche plein
+    /// texte du serveur, jamais une seconde).
+    fn library_search(&self, query: &str, limit: i64) -> Result<serde_json::Value, String>;
+    /// `library` — apparier un titre connu SUR la bibliothèque locale, dans la
+    /// même forme que [`HostContext::streaming_match_track`] : sans elle, un
+    /// convertisseur ne sait aller que de la bibliothèque VERS un service.
+    fn library_match_track(
+        &self,
         title: &str,
         artist: &str,
         isrc: &str,
@@ -283,6 +305,18 @@ impl HostContext for NoHost {
     fn streaming_match_track(
         &self,
         _service: &str,
+        _title: &str,
+        _artist: &str,
+        _isrc: &str,
+        _duration_ms: u64,
+    ) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn library_search(&self, _query: &str, _limit: i64) -> Result<serde_json::Value, String> {
+        Err("no host context wired".to_string())
+    }
+    fn library_match_track(
+        &self,
         _title: &str,
         _artist: &str,
         _isrc: &str,
@@ -868,6 +902,57 @@ fn register_host_imports(linker: &mut Linker<StoreData>) -> Result<(), String> {
             },
         )
         .map_err(|e| format!("register host_streaming_match_track: {e}"))?;
+
+    // -----------------------------------------------------------------------
+    // #4716 — `library`
+    //
+    // Le sens SERVICE → BIBLIOTHÈQUE, qui manquait : sans recherche locale ni
+    // appariement local, un convertisseur de playlists ne savait qu'aller de
+    // la bibliothèque VERS un service. Lecture seule : on ne fait que chercher
+    // et apparier — aucune de ces deux capacités n'écrit, et aucune n'efface.
+    // -----------------------------------------------------------------------
+    linker
+        .func_wrap(
+            "tune",
+            "host_library_search",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "library", |ctx, v| {
+                    let limit = v
+                        .get("limit")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(20);
+                    ctx.library_search(&texte(&v, "query"), limit)
+                })
+            },
+        )
+        .map_err(|e| format!("register host_library_search: {e}"))?;
+
+    linker
+        .func_wrap(
+            "tune",
+            "host_library_match_track",
+            |mut caller: Caller<'_, StoreData>,
+             ptr: i32,
+             len: i32|
+             -> Result<i64, wasmtime::Error> {
+                host_json_call(&mut caller, ptr, len, "library", |ctx, v| {
+                    let duration_ms = v
+                        .get("duration_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    ctx.library_match_track(
+                        &texte(&v, "title"),
+                        &texte(&v, "artist"),
+                        &texte(&v, "isrc"),
+                        duration_ms,
+                    )
+                })
+            },
+        )
+        .map_err(|e| format!("register host_library_match_track: {e}"))?;
 
     // -----------------------------------------------------------------------
     // #4716 — `kv` : stockage cloisonné PAR GREFFON
@@ -1516,6 +1601,27 @@ mod tests {
                 }),
             )
         }
+        fn library_search(&self, query: &str, limit: i64) -> Result<serde_json::Value, String> {
+            self.noter(
+                "library_search",
+                serde_json::json!({ "query": query, "limit": limit }),
+            )
+        }
+        fn library_match_track(
+            &self,
+            title: &str,
+            artist: &str,
+            isrc: &str,
+            duration_ms: u64,
+        ) -> Result<serde_json::Value, String> {
+            self.noter(
+                "library_match_track",
+                serde_json::json!({
+                    "title": title, "artist": artist,
+                    "isrc": isrc, "duration_ms": duration_ms,
+                }),
+            )
+        }
         fn kv_get(&self, plugin_id: &str, key: &str) -> Result<serde_json::Value, String> {
             self.noter(
                 "kv_get",
@@ -2054,6 +2160,75 @@ mod tests {
         );
     }
 
+    // --- `library` ---------------------------------------------------------
+
+    #[test]
+    fn host_library_search_refuse_sans_permission_library() {
+        refuse_sans_permission(
+            "host_library_search",
+            r#"{"query":"La Boheme Aznavour","limit":25}"#,
+            "library",
+        );
+    }
+
+    #[test]
+    fn host_library_search_atteint_l_hote_avec_library() {
+        atteint_l_hote(
+            "host_library_search",
+            r#"{"query":"La Boheme Aznavour","limit":25}"#,
+            "library",
+            "library_search",
+            serde_json::json!({ "query": "La Boheme Aznavour", "limit": 25 }),
+        );
+    }
+
+    #[test]
+    fn host_library_match_track_refuse_sans_permission_library() {
+        refuse_sans_permission(
+            "host_library_match_track",
+            r#"{"title":"La Boheme","artist":"Aznavour","isrc":"FR123","duration_ms":210000}"#,
+            "library",
+        );
+    }
+
+    #[test]
+    fn host_library_match_track_atteint_l_hote_avec_library() {
+        atteint_l_hote(
+            "host_library_match_track",
+            r#"{"title":"La Boheme","artist":"Aznavour","isrc":"FR123","duration_ms":210000}"#,
+            "library",
+            "library_match_track",
+            serde_json::json!({
+                "title": "La Boheme", "artist": "Aznavour",
+                "isrc": "FR123", "duration_ms": 210_000,
+            }),
+        );
+    }
+
+    /// La permission `library` n'ouvre QUE la bibliothèque : une capacité
+    /// `streaming` reste refusée, et réciproquement. Sans cette contre-épreuve,
+    /// un gating recopié sur la mauvaise chaîne passerait inaperçu.
+    #[test]
+    fn la_permission_library_n_ouvre_pas_les_autres_familles_4716() {
+        let (rendu, mock) = jouer(
+            "host_streaming_services",
+            r#"{}"#,
+            &["library", "playlists", "kv"],
+        );
+        assert_eq!(
+            rendu,
+            serde_json::json!({ "error": "permission_denied", "permission": "streaming" })
+        );
+        assert!(mock.appels_4716.lock().unwrap().is_empty());
+
+        let (rendu, mock) = jouer("host_library_search", r#"{"query":"x"}"#, &["streaming"]);
+        assert_eq!(
+            rendu,
+            serde_json::json!({ "error": "permission_denied", "permission": "library" })
+        );
+        assert!(mock.appels_4716.lock().unwrap().is_empty());
+    }
+
     // --- `kv` --------------------------------------------------------------
 
     #[test]
@@ -2196,6 +2371,8 @@ mod tests {
             "host_streaming_playlist_create",
             "host_streaming_playlist_add_tracks",
             "host_streaming_match_track",
+            "host_library_search",
+            "host_library_match_track",
             "host_kv_get",
             "host_kv_set",
             "host_kv_list",
