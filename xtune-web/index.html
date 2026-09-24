@@ -4,10 +4,64 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>xTune</title>
+  <meta name="theme-color" content="#121212" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.json" />
   <script type="module" crossorigin src="/assets/index-C90zaFjh.js"></script>
   <link rel="stylesheet" crossorigin href="/assets/index-BFOhTS8j.css">
 </head>
 <body>
   <div id="app"></div>
+  <script>
+    // Integration API Media Session pour ecrans de verrouillage et notifications Android/iOS
+    if ('mediaSession' in navigator) {
+      window.updateMediaSession = function(metadata) {
+        if (!metadata) return;
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: metadata.title || 'Tune Server',
+          artist: metadata.artist || 'High-Resolution Audio',
+          album: metadata.album || 'Bit-Perfect Playback',
+          artwork: metadata.artworkUrl ? [
+            { src: metadata.artworkUrl, sizes: '512x512', type: 'image/jpeg' }
+          ] : []
+        });
+        if (metadata.playbackState) {
+          navigator.mediaSession.playbackState = metadata.playbackState;
+        }
+        if (metadata.duration && metadata.position !== undefined) {
+          try {
+            navigator.mediaSession.setPositionState({
+              duration: metadata.duration,
+              playbackRate: 1.0,
+              position: metadata.position
+            });
+          } catch (e) {}
+        }
+      };
+
+      navigator.mediaSession.setActionHandler('play', () => {
+        fetch('/api/v1/zones/current/play', { method: 'POST' }).catch(() => {});
+      });
+      navigator.mediaSession.setActionHandler('pause', () => {
+        fetch('/api/v1/zones/current/pause', { method: 'POST' }).catch(() => {});
+      });
+      navigator.mediaSession.setActionHandler('previoustrack', () => {
+        fetch('/api/v1/zones/current/previous', { method: 'POST' }).catch(() => {});
+      });
+      navigator.mediaSession.setActionHandler('nexttrack', () => {
+        fetch('/api/v1/zones/current/next', { method: 'POST' }).catch(() => {});
+      });
+      navigator.mediaSession.setActionHandler('seekto', (details) => {
+        if (details.seekTime !== undefined) {
+          fetch('/api/v1/zones/current/seek', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ position_ms: Math.round(details.seekTime * 1000) })
+          }).catch(() => {});
+        }
+      });
+    }
+  </script>
 </body>
 </html>
