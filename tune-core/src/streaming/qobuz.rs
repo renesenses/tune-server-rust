@@ -2979,6 +2979,12 @@ impl StreamingService for QobuzService {
         Ok(artists)
     }
 
+    /// `artist/getSimilarArtists` ci-dessus : Qobuz est le seul service qui
+    /// sait répondre « et après ? » depuis son propre catalogue (fil 1906).
+    fn propose_des_artistes_similaires(&self) -> bool {
+        true
+    }
+
     async fn create_playlist(
         &self,
         name: &str,

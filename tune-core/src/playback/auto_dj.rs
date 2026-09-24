@@ -242,6 +242,175 @@ where
     out
 }
 
+/// Ce que rend [`pistes_similaires_du_service`] : les pistes, et de quoi
+/// journaliser d'où elles viennent.
+#[derive(Debug, Default)]
+pub struct PistesSimilairesDuService {
+    pub pistes: Vec<crate::streaming::traits::StreamTrack>,
+    /// Nombre d'artistes voisins retenus comme candidats (0 = aucune source
+    /// n'a répondu).
+    pub candidats: usize,
+    /// `true` quand les voisins viennent de l'API d'enrichissement, `false`
+    /// quand c'est le service qui les a donnés.
+    pub depuis_enrichissement: bool,
+}
+
+/// « Qui ressemble à ce titre ? », sur le catalogue d'un service de streaming.
+///
+/// C'est l'algorithme de la reprise automatique de fin de file
+/// (`poller/radio.rs`, `autoplay_streaming_radio`), sorti de là pour servir
+/// AUSSI « Plus comme ça » sur un titre Qobuz — fil 1906 (FabienM), point 3.
+/// Une seule définition de « ressemble » : la radio et le menu du titre ne
+/// peuvent plus diverger.
+///
+/// Les étapes, inchangées :
+///  1. les voisins selon l'API d'enrichissement (`noms_enrichissement`, que
+///     l'appelant obtient par [`similar_artist_names`] — hors d'ici pour que
+///     cette fonction se prouve sans réseau) ;
+///  2. à défaut, les voisins selon le service ([`service_similar_artists`]) ;
+///  3. un titre par voisin ([`streaming_tracks_for_artist_names`]) : ses
+///     titres phares quand on a son identifiant, une recherche par nom sinon.
+///
+/// `artiste_graine_id` : l'identifiant SUR LE SERVICE de l'artiste graine,
+/// quand l'appelant le connaît (une piste Qobuz le porte). Il épargne la
+/// recherche par nom — et son risque de « tribute band ». `None` = la radio,
+/// qui ne part que d'un nom.
+///
+/// `exclure` : identifiants de pistes à ne jamais proposer (la graine, la
+/// file déjà posée).
+pub async fn pistes_similaires_du_service(
+    service: &std::sync::Arc<
+        tokio::sync::RwLock<Box<dyn crate::streaming::traits::StreamingService>>,
+    >,
+    artiste_graine: &str,
+    artiste_graine_id: Option<&str>,
+    noms_enrichissement: Vec<String>,
+    max_artistes: usize,
+    max_pistes: usize,
+    exclure: &std::collections::HashSet<String>,
+) -> PistesSimilairesDuService {
+    let names = noms_enrichissement;
+    let from_enrichment = !names.is_empty();
+    // Source 2 : le service lui-meme. Deux appels reseau, pas un de plus.
+    // On garde les IDENTIFIANTS de catalogue, pas seulement les noms : ils
+    // permettent ensuite de demander « des titres DE cet artiste » plutot
+    // que « des titres qui contiennent son nom ».
+    let mut service_artists: Vec<crate::streaming::traits::StreamArtist> = Vec::new();
+    if names.is_empty() {
+        tracing::info!(
+            seed_artist = artiste_graine,
+            "autoplay_streaming_enrichment_empty_trying_service"
+        );
+        let graine_connue = artiste_graine_id
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| crate::streaming::traits::StreamArtist {
+                id: id.to_string(),
+                name: artiste_graine.trim().to_string(),
+                image_path: None,
+                bio: None,
+            });
+        service_artists = service_similar_artists(
+            artiste_graine,
+            max_artistes,
+            |query| {
+                let service = service.clone();
+                async move {
+                    // Graine déjà identifiée : on la rend telle quelle,
+                    // `pick_seed_artist_id` la reconnaît à son nom exact.
+                    if let Some(graine) = graine_connue {
+                        return vec![graine];
+                    }
+                    let svc = service.read().await;
+                    match svc.search(&query, 10).await {
+                        Ok(res) => res.artists,
+                        Err(e) => {
+                            tracing::warn!(artist = %query, error = %e, "autoplay_streaming_artist_search_failed");
+                            Vec::new()
+                        }
+                    }
+                }
+            },
+            |artist_id| {
+                let service = service.clone();
+                async move {
+                    let svc = service.read().await;
+                    match svc.get_similar_artists(&artist_id, max_artistes).await {
+                        Ok(artists) => artists,
+                        Err(e) => {
+                            tracing::warn!(artist_id = %artist_id, error = %e, "autoplay_streaming_similar_failed");
+                            Vec::new()
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    }
+
+    if names.is_empty() && service_artists.is_empty() {
+        return PistesSimilairesDuService::default();
+    }
+    let candidats = if from_enrichment {
+        names.len()
+    } else {
+        service_artists.len()
+    };
+
+    // Deux facons de transformer un voisin en piste jouable :
+    //  - via l'API d'enrichissement on n'a qu'un NOM, donc une recherche ;
+    //  - via le service on a son identifiant de catalogue, donc ses titres
+    //    a lui. La recherche par nom reste le repli quand l'artiste n'a pas
+    //    de titres exposes.
+    let names_by_id: std::collections::HashMap<String, String> = service_artists
+        .iter()
+        .map(|a| (a.id.clone(), a.name.clone()))
+        .collect();
+    let keys: Vec<String> = if from_enrichment {
+        names.clone()
+    } else {
+        service_artists.iter().map(|a| a.id.clone()).collect()
+    };
+
+    let pistes = streaming_tracks_for_artist_names(&keys, max_pistes, exclure, |key| {
+        let service = service.clone();
+        let artist_name = names_by_id.get(&key).cloned();
+        async move {
+            let svc = service.read().await;
+            // Chemin identifiant : les titres DE l'artiste, sans
+            // ambiguite de titre homonyme.
+            if let Some(ref name) = artist_name {
+                match svc.get_artist_top_tracks(&key).await {
+                    Ok(tracks) if !tracks.is_empty() => return tracks,
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(artist_id = %key, error = %e, "autoplay_streaming_top_tracks_failed");
+                    }
+                }
+                return match svc.search(name, 5).await {
+                    Ok(res) => res.tracks,
+                    Err(e) => {
+                        tracing::warn!(artist = %name, error = %e, "autoplay_streaming_search_failed");
+                        Vec::new()
+                    }
+                };
+            }
+            match svc.search(&key, 5).await {
+                Ok(res) => res.tracks,
+                Err(e) => {
+                    tracing::warn!(artist = %key, error = %e, "autoplay_streaming_search_failed");
+                    Vec::new()
+                }
+            }
+        }
+    })
+    .await;
+    PistesSimilairesDuService {
+        pistes,
+        candidats,
+        depuis_enrichissement: from_enrichment,
+    }
+}
+
 pub fn generate_queue(
     db: &std::sync::Arc<dyn DbBackend>,
     seed_track_id: i64,
@@ -1240,5 +1409,293 @@ mod mood_tests {
         assert_eq!(json, "\"party\"");
         let parsed: Mood = serde_json::from_str("\"chill\"").unwrap();
         assert!(matches!(parsed, Mood::Chill));
+    }
+}
+
+/// Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz passe
+/// par [`pistes_similaires_du_service`], la logique de la radio de fin de
+/// file. Ces essais la prouvent sans réseau, avec un service simulé.
+#[cfg(test)]
+mod tests_plus_comme_ca {
+    use super::*;
+    use crate::error::TuneError;
+    use crate::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
+        StreamUrl, StreamingService,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+
+    fn piste(id: &str, artiste: &str) -> StreamTrack {
+        StreamTrack {
+            id: id.into(),
+            title: format!("Titre {id}"),
+            artist: artiste.into(),
+            album: None,
+            album_id: None,
+            duration_ms: 200_000,
+            cover_path: None,
+            track_number: None,
+            disc_number: None,
+            explicit: false,
+            disponible: None,
+            quality: None,
+            isrc: None,
+            composer: None,
+            artist_id: None,
+        }
+    }
+
+    fn artiste(id: &str, nom: &str) -> StreamArtist {
+        StreamArtist {
+            id: id.into(),
+            name: nom.into(),
+            image_path: None,
+            bio: None,
+        }
+    }
+
+    /// Un catalogue minuscule : la graine « Graine » (id g), ses voisins, et
+    /// les titres phares de chacun. Note tout ce qu'on lui demande.
+    struct ServiceVoisins {
+        voisins: Vec<StreamArtist>,
+        titres_phares: HashMap<String, Vec<StreamTrack>>,
+        recherches: Arc<Mutex<Vec<String>>>,
+        voisins_demandes: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceVoisins {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "voisins"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _enabled: bool) {}
+        async fn authenticate(&mut self, _c: &serde_json::Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        async fn search(&self, query: &str, _limit: usize) -> Result<SearchResults, TuneError> {
+            self.recherches.lock().unwrap().push(query.to_string());
+            Ok(SearchResults {
+                tracks: vec![piste(&format!("recherche-{query}"), query)],
+                albums: Vec::new(),
+                artists: vec![artiste("g", "Graine"), artiste("t", "Graine Tribute")],
+                playlists: Vec::new(),
+            })
+        }
+        async fn get_track(&self, _id: &str) -> Result<StreamTrack, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_track_url(&self, _id: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album(&self, _id: &str) -> Result<StreamAlbum, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_album_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist(&self, _id: &str) -> Result<StreamArtist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_artist_top_tracks(
+            &self,
+            artist_id: &str,
+        ) -> Result<Vec<StreamTrack>, TuneError> {
+            Ok(self
+                .titres_phares
+                .get(artist_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn get_similar_artists(
+            &self,
+            artist_id: &str,
+            _limit: usize,
+        ) -> Result<Vec<StreamArtist>, TuneError> {
+            self.voisins_demandes
+                .lock()
+                .unwrap()
+                .push(artist_id.to_string());
+            if artist_id == "g" {
+                Ok(self.voisins.clone())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn get_playlist(&self, _id: &str) -> Result<StreamPlaylist, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err("hors sujet".into())
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(Vec::new())
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(Vec::new())
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Ok(Vec::new())
+        }
+    }
+
+    type Temoins = (Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>);
+
+    /// Voisins A, B, C. B n'a pour titre phare que la graine elle-même ET le
+    /// titre de A : l'exclusion et la déduplication doivent le faire passer à
+    /// son titre suivant.
+    fn service() -> (Arc<tokio::sync::RwLock<Box<dyn StreamingService>>>, Temoins) {
+        let recherches = Arc::new(Mutex::new(Vec::new()));
+        let voisins_demandes = Arc::new(Mutex::new(Vec::new()));
+        let mut titres_phares = HashMap::new();
+        titres_phares.insert("a".to_string(), vec![piste("a1", "A"), piste("a2", "A")]);
+        titres_phares.insert(
+            "b".to_string(),
+            vec![piste("source", "B"), piste("a1", "A"), piste("b2", "B")],
+        );
+        titres_phares.insert("c".to_string(), vec![piste("c1", "C")]);
+        let svc: Box<dyn StreamingService> = Box::new(ServiceVoisins {
+            voisins: vec![
+                artiste("a", "A"),
+                // Un doublon de nom : un seul appel, un seul titre.
+                artiste("a-bis", "a"),
+                // La graine parmi ses propres voisins : écartée.
+                artiste("g", "Graine"),
+                artiste("b", "B"),
+                artiste("c", "C"),
+            ],
+            titres_phares,
+            recherches: recherches.clone(),
+            voisins_demandes: voisins_demandes.clone(),
+        });
+        (
+            Arc::new(tokio::sync::RwLock::new(svc)),
+            (recherches, voisins_demandes),
+        )
+    }
+
+    fn exclure_la_source() -> HashSet<String> {
+        HashSet::from(["source".to_string()])
+    }
+
+    #[tokio::test]
+    async fn un_titre_par_voisin_sans_la_source_ni_doublon() {
+        let (svc, (recherches, voisins_demandes)) = service();
+        let r = pistes_similaires_du_service(
+            &svc,
+            "Graine",
+            Some("g"),
+            Vec::new(),
+            20,
+            20,
+            &exclure_la_source(),
+        )
+        .await;
+        let ids: Vec<&str> = r.pistes.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a1", "b2", "c1"],
+            "un titre par voisin, dans l'ordre du service ; la source et le \
+             titre déjà pris sautés"
+        );
+        assert_eq!(r.candidats, 3, "A, B, C — ni le doublon « a » ni la graine");
+        assert!(!r.depuis_enrichissement);
+        assert!(
+            recherches.lock().unwrap().is_empty(),
+            "graine identifiée : aucune recherche par nom"
+        );
+        assert_eq!(*voisins_demandes.lock().unwrap(), vec!["g".to_string()]);
+    }
+
+    /// La radio ne part que d'un NOM : la graine est retrouvée par recherche,
+    /// sur son nom exact — pas sur « Graine Tribute ».
+    #[tokio::test]
+    async fn sans_identifiant_la_graine_est_retrouvee_par_son_nom_exact() {
+        let (svc, (recherches, voisins_demandes)) = service();
+        let r = pistes_similaires_du_service(
+            &svc,
+            "Graine",
+            None,
+            Vec::new(),
+            20,
+            20,
+            &exclure_la_source(),
+        )
+        .await;
+        assert_eq!(r.pistes.len(), 3);
+        assert_eq!(*recherches.lock().unwrap(), vec!["Graine".to_string()]);
+        assert_eq!(*voisins_demandes.lock().unwrap(), vec!["g".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn la_borne_de_pistes_est_tenue() {
+        let (svc, _) = service();
+        let r = pistes_similaires_du_service(
+            &svc,
+            "Graine",
+            Some("g"),
+            Vec::new(),
+            20,
+            2,
+            &exclure_la_source(),
+        )
+        .await;
+        assert_eq!(r.pistes.len(), 2);
+    }
+
+    /// Des voisins venus de l'API d'enrichissement passent AVANT le service,
+    /// comme dans la radio : on ne demande pas les voisins au service.
+    #[tokio::test]
+    async fn les_voisins_de_l_enrichissement_passent_d_abord() {
+        let (svc, (recherches, voisins_demandes)) = service();
+        let r = pistes_similaires_du_service(
+            &svc,
+            "Graine",
+            Some("g"),
+            vec!["Nom Enrichi".to_string()],
+            20,
+            20,
+            &exclure_la_source(),
+        )
+        .await;
+        assert!(r.depuis_enrichissement);
+        assert_eq!(r.candidats, 1);
+        assert_eq!(r.pistes[0].id, "recherche-Nom Enrichi");
+        assert_eq!(*recherches.lock().unwrap(), vec!["Nom Enrichi".to_string()]);
+        assert!(voisins_demandes.lock().unwrap().is_empty());
+    }
+
+    /// Un artiste sans voisin : zéro candidat, zéro piste — l'appelant
+    /// décide (la radio se tait, la route rend `[]`).
+    #[tokio::test]
+    async fn un_artiste_sans_voisin_ne_rend_rien() {
+        let (svc, _) = service();
+        let r = pistes_similaires_du_service(
+            &svc,
+            "Isolé",
+            Some("isole"),
+            Vec::new(),
+            20,
+            20,
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(r.candidats, 0);
+        assert!(r.pistes.is_empty());
     }
 }

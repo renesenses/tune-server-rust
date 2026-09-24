@@ -549,6 +549,17 @@ pub trait StreamingService: Send + Sync {
         let _ = (artist_id, limit);
         Ok(vec![])
     }
+    /// Le service connaît-il SES artistes similaires ?
+    ///
+    /// Fil 1906 (FabienM), point 3 : « Plus comme ça » sur un titre de
+    /// service. Le défaut vide de [`Self::get_similar_artists`] suffit à la
+    /// radio d'autoplay, qui se tait en silence ; il ne suffit pas à une route
+    /// qu'on interroge : un service sans similarité y rendrait une liste vide,
+    /// indiscernable d'un artiste isolé. La capacité se DIT donc ici, et la
+    /// route répond 501 à qui ne l'a pas. Seul Qobuz la déclare aujourd'hui.
+    fn propose_des_artistes_similaires(&self) -> bool {
+        false
+    }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
 

@@ -676,6 +676,14 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 [[test]]
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
+
+# Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
+# `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
+# des services simulés. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "plus_comme_ca_qobuz_fil1906"
+path = "tests/plus_comme_ca_qobuz_fil1906.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
