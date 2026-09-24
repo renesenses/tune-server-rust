@@ -598,6 +598,34 @@ pub fn peak_reached_end(track_duration_ms: u64, peak_position_ms: u64) -> bool {
         && peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
 }
 
+/// En deçà de cette fraction de la durée, une fin de flux n'est plus « la
+/// fin de la piste » (fil 1915).
+pub const FRACTION_D_UNE_VRAIE_FIN: f64 = 0.95;
+/// …à condition qu'il manque aussi plus que cet écart : une durée en base
+/// fausse de quelques secondes (étiquette arrondie, remplissage d'encodeur)
+/// n'est pas une coupure.
+pub const ECART_TOLERE_AVANT_LA_FIN_MS: u64 = 5_000;
+
+/// La position atteinte est-elle LOIN de la fin de la piste ?
+///
+/// Fil 1915 (Reivax66, sortie locale WASAPI) : le corps HTTP d'une piste de
+/// 11:52 a rendu `error decoding response body` à 7:51, et la sortie a pris
+/// l'erreur pour une fin — piste coupée d'un tiers, file close, aucun signal.
+///
+/// Une erreur de fin de corps AU BOUT de la piste reste, elle, une fin : MP3
+/// dont le décodage déborde la durée annoncée (#1254, PR #1076). D'où les
+/// deux conditions, qui doivent tenir ENSEMBLE pour parler de coupure : moins
+/// de [`FRACTION_D_UNE_VRAIE_FIN`] de la durée ET plus de
+/// [`ECART_TOLERE_AVANT_LA_FIN_MS`] manquants.
+///
+/// Durée inconnue (`0` : radio, flux sans durée) ⇒ jamais « loin » : on ne
+/// sait pas où est la fin, le comportement historique est gardé.
+pub fn position_loin_de_la_fin(position_ms: u64, duree_ms: u64) -> bool {
+    duree_ms > 0
+        && (position_ms as f64) < duree_ms as f64 * FRACTION_D_UNE_VRAIE_FIN
+        && duree_ms.saturating_sub(position_ms) > ECART_TOLERE_AVANT_LA_FIN_MS
+}
+
 /// A DSD track on a DLNA renderer that has demonstrably reached its end.
 ///
 /// Gapless (`SetNextAVTransportURI`) is intentionally NOT armed when the next

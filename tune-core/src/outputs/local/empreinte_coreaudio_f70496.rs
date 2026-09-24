@@ -129,6 +129,7 @@ fn route_du_bras(
         position_ms: &position_ms,
         open_failure: &open_failure,
         debut_du_flux: std::time::Instant::now(),
+        duree_de_la_piste_ms: &super::DUREE_DE_PISTE_INCONNUE,
     };
     let mut compteurs = CompteursDePiste {
         total_bytes_read: 0,

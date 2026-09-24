@@ -1031,6 +1031,9 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
             position_ms: &*position_ms,
             open_failure: &*open_failure,
             debut_du_flux: std::time::Instant::now(),
+            // Chemin exclusif mono-piste : durée non transmise, erreur de
+            // lecture = fin de flux comme avant (fil 1915 hors périmètre).
+            duree_de_la_piste_ms: &super::DUREE_DE_PISTE_INCONNUE,
         };
         let mut compteurs = CompteursDePiste {
             total_bytes_read: 0,

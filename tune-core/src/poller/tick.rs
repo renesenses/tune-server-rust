@@ -1838,6 +1838,26 @@ impl PositionPoller {
                         ps.transition(fsm::Transition::FinConstateeAvantLeSeuil {
                             motif: MotifFin::FinNaturelleLocale,
                         });
+                        // Fil 1915 : `wall_elapsed` à 50 % suffit à accepter
+                        // la fin — une piste de 11:52 arrêtée à 7:51 passait
+                        // pour finie, sans un mot. Le comportement ne change
+                        // pas ici (la sortie locale refuse désormais elle-même
+                        // une erreur de lecture loin de la fin) ; ce qui reste
+                        // se DIT au lieu de passer pour une fin normale.
+                        if decisions::position_loin_de_la_fin(
+                            ps.peak_position_ms,
+                            track_duration_ms,
+                        ) {
+                            warn!(
+                                zone_id,
+                                peak_pos = ps.peak_position_ms,
+                                track_dur = track_duration_ms,
+                                wall_elapsed,
+                                "piste_probablement_tronquee — fin naturelle annoncée loin \
+                                 de la durée de la piste : flux coupé en amont, ou durée en \
+                                 base fausse"
+                            );
+                        }
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
