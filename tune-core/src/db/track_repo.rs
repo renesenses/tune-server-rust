@@ -705,34 +705,152 @@ pub mod sql {
         )
     }
 
+    /// Les colonnes de CONNAISSANCE d'une piste : ce que l'enrichissement
+    /// MusicBrainz dépose et qu'un fichier ne porte, chez la plupart des
+    /// auditeurs, jamais.
+    ///
+    /// Elles sont listées ici, et ici seulement, pour que
+    /// [`update_du_scan`] et le commentaire qui l'explique ne puissent pas
+    /// diverger.
+    ///
+    /// `isrc` n'y figure pas : [`update`] ne l'écrit pas du tout — le scan ne
+    /// peut donc pas l'effacer, et l'ajouter ici laisserait croire l'inverse.
+    pub const COLONNES_DE_CONNAISSANCE: [&str; 6] = [
+        "genre",
+        "genres",
+        "composer",
+        "year",
+        "label",
+        "musicbrainz_recording_id",
+    ];
+
+    /// `UPDATE tracks …` qui ÉCRASE tout, y compris ce que le scan ignore.
+    ///
+    /// Réservé aux écritures qui connaissent vraiment la valeur qu'elles
+    /// posent — la retouche manuelle d'une fiche (`PUT /metadata/track/:id`),
+    /// où vider un champ est une volonté et doit passer. Le scan, lui, prend
+    /// [`update_du_scan`].
     pub fn update<D: SqlDialect>(d: &D) -> String {
+        update_avec(d, false)
+    }
+
+    /// `UPDATE tracks …` du SCAN : il n'efface jamais ce qu'il ne sait pas.
+    ///
+    /// # Le défaut, mesuré le 24/09/2026
+    ///
+    /// [`update`] pose les 24 colonnes sans condition. Le scan la fait tourner
+    /// par [`super::TrackRepo::update_batch`] sur chaque fichier dont
+    /// `verdict_ecriture` rend `MettreAJour` — c'est-à-dire sur TOUS, dès que
+    /// `force`/`full` est armé, donc à chaque clic sur « Scan complet ». Or la
+    /// ligne que le scan écrit est construite à partir du FICHIER SEUL
+    /// (`scan_import::build_track_row`) : elle ne relit pas la base. Les six
+    /// colonnes de [`COLONNES_DE_CONNAISSANCE`] retombaient donc sur ce que
+    /// disent les balises — c'est-à-dire sur rien, pour 98 % d'une
+    /// bibliothèque ordinaire.
+    ///
+    /// Sur le serveur du mainteneur : `settings.enrich_all_status` garde la
+    /// trace d'une passe qui avait apparié **22 450 pistes sur 46 898**, et il
+    /// n'en reste **1 147** qui portent un `musicbrainz_recording_id`
+    /// (relevé du 24/09/2026 sur `tune_v2.db`, en lecture seule). Les
+    /// identifiants de `tracks` y courent de 114 852 à 211 370 **sans un seul
+    /// trou** : la table a été vidée et réinsérée d'un bloc.
+    ///
+    /// Contre-épreuve du mécanisme : le scan ne récrit PAS les albums — il
+    /// n'appelle que `update_cover_path`, `update_track_count`,
+    /// `update_quality_from_tracks` — et les biographies d'album, elles, sont
+    /// intactes. Seules les colonnes de PISTE étaient effacées.
+    ///
+    /// # La règle
+    ///
+    /// * une balise présente GAGNE — retaguer dans Picard puis rescanner met
+    ///   bien la base à jour, c'est tout l'objet d'un scan ;
+    /// * un fichier qui ne dit RIEN laisse la valeur stockée en place.
+    ///
+    /// D'où `COALESCE(NULLIF(?, ''), colonne)`, et **dans cet ordre** :
+    /// `COALESCE(colonne, ?)` — la forme de `write_track_enrichment`, juste
+    /// pour lui, qui comble un trou — figerait ici l'ancienne valeur pour
+    /// toujours et rendrait tout rescan inutile.
+    ///
+    /// # Chaîne vide ou NULL
+    ///
+    /// Les deux valent « je ne sais pas », et le `NULLIF` le dit. Le lecteur
+    /// d'étiquettes rend `Some("")` pour une trame PRÉSENTE mais vide —
+    /// `get(ItemKey::MusicBrainzRecordingId)` ne filtre rien, et `genre`
+    /// retombe sur `raw_genres.first()` quand le découpage ne rend aucun
+    /// genre — ce qui est indiscernable d'une trame absente : un éditeur
+    /// d'étiquettes qui « efface » un champ laisse le plus souvent la trame
+    /// vide derrière lui. Sans le `NULLIF`, ces `""` rouvriraient le trou
+    /// qu'on vient de boucher, en écrasant l'enrichissement par du vide.
+    ///
+    /// Ce que cela coûte, et qu'on assume : on ne peut plus effacer un de ces
+    /// six champs en vidant la balise puis en rescannant. La fiche de piste
+    /// reste le chemin pour cela — elle passe par [`update`], qui écrase.
+    ///
+    /// `year` est un entier : il n'a pas de chaîne vide, et `NULLIF($n, '')`
+    /// sur un paramètre lié en `int8` ne passerait pas sur PostgreSQL. Simple
+    /// `COALESCE`.
+    pub fn update_du_scan<D: SqlDialect>(d: &D) -> String {
+        update_avec(d, true)
+    }
+
+    /// Le corps commun aux deux formes ci-dessus.
+    ///
+    /// ⚠️ UNE seule définition de l'ordre des colonnes, donc de l'ordre des
+    /// paramètres liés : `update` et `update_du_scan` partagent le même
+    /// tableau de 25 valeurs chez leurs appelants. Deux `format!` recopiés
+    /// auraient fini par diverger d'un cran, et un décalage de paramètres
+    /// écrit des valeurs justes dans les mauvaises colonnes sans lever la
+    /// moindre erreur.
+    fn update_avec<D: SqlDialect>(d: &D, conserver: bool) -> String {
+        // `COALESCE(NULLIF(?, ''), col)` : la balise gagne quand elle parle.
+        let texte = |n: usize, col: &str| {
+            let p = d.placeholder(n);
+            if conserver {
+                format!("{col} = COALESCE(NULLIF({p}, ''), {col})")
+            } else {
+                format!("{col} = {p}")
+            }
+        };
+        // Un entier n'a pas de chaîne vide à neutraliser.
+        let entier = |n: usize, col: &str| {
+            let p = d.placeholder(n);
+            if conserver {
+                format!("{col} = COALESCE({p}, {col})")
+            } else {
+                format!("{col} = {p}")
+            }
+        };
+        let brut = |n: usize, col: &str| format!("{col} = {}", d.placeholder(n));
+        let colonnes = [
+            brut(1, "title"),
+            brut(2, "album_id"),
+            brut(3, "artist_id"),
+            brut(4, "album_artist"),
+            brut(5, "disc_number"),
+            brut(6, "disc_subtitle"),
+            brut(7, "track_number"),
+            brut(8, "duration_ms"),
+            brut(9, "file_path"),
+            brut(10, "format"),
+            brut(11, "sample_rate"),
+            brut(12, "bit_depth"),
+            brut(13, "channels"),
+            brut(14, "file_mtime"),
+            brut(15, "file_size"),
+            brut(16, "audio_hash"),
+            texte(17, "genre"),
+            texte(18, "genres"),
+            texte(19, "composer"),
+            entier(20, "year"),
+            brut(21, "bpm"),
+            texte(22, "label"),
+            texte(23, "musicbrainz_recording_id"),
+            brut(24, "comments"),
+        ];
         format!(
-            "UPDATE tracks SET title = {}, album_id = {}, artist_id = {}, album_artist = {}, disc_number = {}, disc_subtitle = {}, track_number = {}, duration_ms = {}, file_path = {}, format = {}, sample_rate = {}, bit_depth = {}, channels = {}, file_mtime = {}, file_size = {}, audio_hash = {}, genre = {}, genres = {}, composer = {}, year = {}, bpm = {}, label = {}, musicbrainz_recording_id = {}, comments = {} WHERE id = {}",
-            d.placeholder(1),
-            d.placeholder(2),
-            d.placeholder(3),
-            d.placeholder(4),
-            d.placeholder(5),
-            d.placeholder(6),
-            d.placeholder(7),
-            d.placeholder(8),
-            d.placeholder(9),
-            d.placeholder(10),
-            d.placeholder(11),
-            d.placeholder(12),
-            d.placeholder(13),
-            d.placeholder(14),
-            d.placeholder(15),
-            d.placeholder(16),
-            d.placeholder(17),
-            d.placeholder(18),
-            d.placeholder(19),
-            d.placeholder(20),
-            d.placeholder(21),
-            d.placeholder(22),
-            d.placeholder(23),
-            d.placeholder(24),
-            d.placeholder(25),
+            "UPDATE tracks SET {} WHERE id = {}",
+            colonnes.join(", "),
+            d.placeholder(25)
         )
     }
 
@@ -2868,8 +2986,14 @@ impl TrackRepo {
     /// The caller is responsible for wrapping the call in a transaction
     /// (e.g. `BEGIN IMMEDIATE` / `COMMIT`) if atomicity is needed.
     /// See `create_batch` for rationale.
+    /// La mise à jour par LOT — le chemin du scan, et rien d'autre.
+    ///
+    /// Elle prend [`sql::update_du_scan`], pas [`sql::update`] : les six
+    /// colonnes de connaissance ne sont écrasées que par une balise qui parle.
+    /// Voir la fiche de [`sql::update_du_scan`] pour le défaut mesuré et la
+    /// règle.
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
-        let update_sql = self.dialect_sql(sql::update, sql::update);
+        let update_sql = self.dialect_sql(sql::update_du_scan, sql::update_du_scan);
         let mut count = 0usize;
         // Rows without an id are skipped, so collect the params first and
         // batch them through one execute_many call (see create_batch).
@@ -4864,5 +4988,317 @@ mod tests {
         let apres = repo.random_ids(1, 500).unwrap();
         assert_eq!(apres.len(), 40);
         assert!(apres.contains(&bannie));
+    }
+
+    // ── Le scan n'efface plus l'enrichissement ────────────────────────────
+    //
+    // Le défaut, mesuré le 24/09/2026 sur la bibliothèque du mainteneur :
+    // `settings.enrich_all_status` garde la trace d'une passe qui avait
+    // apparié 22 450 pistes sur 46 898, et plus une seule ne survit en base.
+    // `sql::update` posait les six colonnes de connaissance sans condition, et
+    // `update_batch` la faisait tourner sur CHAQUE fichier dès que
+    // `force`/`full` est armé — donc à chaque clic sur « Scan complet ».
+    // Voir la fiche de [`sql::update_du_scan`].
+
+    /// Une piste telle que la base la porte APRÈS un enrichissement
+    /// MusicBrainz : les six colonnes de connaissance sont pleines.
+    fn piste_enrichie(repo: &TrackRepo) -> i64 {
+        let mut t = Track::new("Blue In Green".into());
+        t.file_path = Some("/music/kind-of-blue/03.flac".into());
+        t.file_mtime = Some(1_000.0);
+        t.file_size = Some(42);
+        t.genre = Some("Jazz".into());
+        t.genres = Some(r#"["Jazz","Modal"]"#.into());
+        t.composer = Some("Bill Evans".into());
+        t.year = Some(1959);
+        t.label = Some("Columbia".into());
+        t.musicbrainz_recording_id = Some("c0ffee00-dead-beef-cafe-000000000001".into());
+        repo.create(&t).unwrap()
+    }
+
+    /// La ligne que le SCAN écrit : elle sort de `build_track_row`, qui ne lit
+    /// que le FICHIER — jamais la base. Le mtime avance, c'est une relecture.
+    fn ligne_du_scan(id: i64, connaissance: Option<&str>) -> Track {
+        let mut t = Track::new("Blue In Green".into());
+        t.id = Some(id);
+        t.file_path = Some("/music/kind-of-blue/03.flac".into());
+        t.file_mtime = Some(2_000.0);
+        t.file_size = Some(43);
+        t.genre = connaissance.map(str::to_string);
+        t.genres = connaissance.map(|_| r#"["Rock"]"#.to_string());
+        t.composer = connaissance.map(str::to_string);
+        t.year = None;
+        t.label = connaissance.map(str::to_string);
+        t.musicbrainz_recording_id = connaissance.map(str::to_string);
+        t
+    }
+
+    /// Les six colonnes de connaissance, relues en base.
+    fn connaissance(repo: &TrackRepo, id: i64) -> Vec<String> {
+        let t = repo.get(id).unwrap().unwrap();
+        vec![
+            format!("genre={:?}", t.genre),
+            format!("genres={:?}", t.genres),
+            format!("composer={:?}", t.composer),
+            format!("year={:?}", t.year),
+            format!("label={:?}", t.label),
+            format!("mbid={:?}", t.musicbrainz_recording_id),
+        ]
+    }
+
+    /// (1) Un fichier qui ne dit RIEN laisse l'enrichissement en place.
+    ///
+    /// Rouge avant le correctif : les six valeurs reviennent à `None` — c'est
+    /// exactement la perte des 22 450 pistes.
+    #[test]
+    fn le_scan_complet_n_efface_plus_l_enrichissement() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        // « Scan complet » : `verdict_ecriture` rend `MettreAJour` pour tout
+        // fichier connu, et le lot passe par `update_batch`.
+        assert_eq!(repo.update_batch(&[ligne_du_scan(id, None)]).unwrap(), 1);
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Jazz")"#.to_string(),
+                r#"genres=Some("[\"Jazz\",\"Modal\"]")"#.to_string(),
+                r#"composer=Some("Bill Evans")"#.to_string(),
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Columbia")"#.to_string(),
+                r#"mbid=Some("c0ffee00-dead-beef-cafe-000000000001")"#.to_string(),
+            ],
+            "un scan complet a effacé l'enrichissement d'une piste dont le \
+             fichier ne porte aucune de ces balises"
+        );
+
+        // Le scan a bien fait son travail par ailleurs : la preuve que la
+        // garde ne fige pas TOUTE la ligne.
+        let relue = repo.get(id).unwrap().unwrap();
+        assert_eq!(relue.file_mtime, Some(2_000.0), "le mtime doit avancer");
+        assert_eq!(relue.file_size, Some(43), "la taille doit avancer");
+    }
+
+    /// (2) Une balise PRÉSENTE gagne : retaguer dans Picard puis rescanner met
+    /// bien la base à jour, c'est tout l'objet d'un scan.
+    ///
+    /// Rouge si l'on écrit `COALESCE(colonne, ?)` — la forme de
+    /// `write_track_enrichment`, qui comble un trou — au lieu de
+    /// `COALESCE(NULLIF(?, ''), colonne)` : la valeur stockée resterait figée
+    /// pour toujours et aucun rescan ne pourrait plus rien corriger.
+    #[test]
+    fn une_balise_presente_gagne_sur_la_valeur_stockee() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        assert_eq!(
+            repo.update_batch(&[ligne_du_scan(id, Some("Retagué"))])
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Retagué")"#.to_string(),
+                r#"genres=Some("[\"Rock\"]")"#.to_string(),
+                r#"composer=Some("Retagué")"#.to_string(),
+                // `year` n'est pas dans le fichier retagué : elle SURVIT.
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Retagué")"#.to_string(),
+                r#"mbid=Some("Retagué")"#.to_string(),
+            ],
+            "la balise du fichier doit gagner — sans quoi un rescan ne \
+             corrigerait plus jamais rien"
+        );
+    }
+
+    /// (3) Une balise VIDE ne vaut pas effacement.
+    ///
+    /// Le lecteur rend `Some("")` pour une trame présente mais vide —
+    /// `get(ItemKey::MusicBrainzRecordingId)` ne filtre rien, et `genre`
+    /// retombe sur `raw_genres.first()` quand le découpage ne rend aucun
+    /// genre. C'est indiscernable d'une trame absente. Sans le `NULLIF`, ces
+    /// `""` rouvriraient le trou en écrasant l'enrichissement par du vide.
+    #[test]
+    fn une_balise_vide_ne_vaut_pas_effacement() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        let mut ligne = ligne_du_scan(id, Some(""));
+        ligne.genres = Some(String::new());
+        assert_eq!(repo.update_batch(&[ligne]).unwrap(), 1);
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Jazz")"#.to_string(),
+                r#"genres=Some("[\"Jazz\",\"Modal\"]")"#.to_string(),
+                r#"composer=Some("Bill Evans")"#.to_string(),
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Columbia")"#.to_string(),
+                r#"mbid=Some("c0ffee00-dead-beef-cafe-000000000001")"#.to_string(),
+            ],
+            "une trame d'étiquette vide a effacé l'enrichissement : c'est le \
+             même trou, par l'autre bout"
+        );
+    }
+
+    /// (4) Une piste NEUVE reçoit ses balises comme avant : la garde ne peut
+    /// pas empêcher une colonne vide de se remplir.
+    #[test]
+    fn une_piste_neuve_recoit_bien_ses_balises() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let mut nue = Track::new("Blue In Green".into());
+        nue.file_path = Some("/music/kind-of-blue/03.flac".into());
+        let id = repo.create(&nue).unwrap();
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                "genre=None".to_string(),
+                "genres=None".to_string(),
+                "composer=None".to_string(),
+                "year=None".to_string(),
+                "label=None".to_string(),
+                "mbid=None".to_string(),
+            ],
+            "la piste doit bien partir nue"
+        );
+
+        let mut ligne = ligne_du_scan(id, Some("Jazz"));
+        ligne.year = Some(1959);
+        assert_eq!(repo.update_batch(&[ligne]).unwrap(), 1);
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Jazz")"#.to_string(),
+                r#"genres=Some("[\"Rock\"]")"#.to_string(),
+                r#"composer=Some("Jazz")"#.to_string(),
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Jazz")"#.to_string(),
+                r#"mbid=Some("Jazz")"#.to_string(),
+            ],
+            "une piste neuve doit recevoir les balises de son fichier"
+        );
+    }
+
+    /// (5) La RETOUCHE MANUELLE, elle, doit toujours pouvoir vider un champ.
+    ///
+    /// `PUT /metadata/track/:id` lit la fiche, y pose ce que l'utilisateur a
+    /// tapé — chaîne vide comprise — et appelle `TrackRepo::update`. Ce
+    /// chemin garde `sql::update`, qui écrase : sans quoi le correctif rendrait
+    /// les six champs ineffaçables pour de bon.
+    #[test]
+    fn la_fiche_de_piste_peut_toujours_vider_un_champ() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        let mut fiche = repo.get(id).unwrap().unwrap();
+        fiche.genre = Some(String::new());
+        fiche.label = None;
+        repo.update(&fiche).unwrap();
+
+        let relue = repo.get(id).unwrap().unwrap();
+        assert_eq!(
+            relue.genre.as_deref(),
+            Some(""),
+            "la fiche de piste doit pouvoir vider le genre"
+        );
+        assert_eq!(
+            relue.label, None,
+            "la fiche de piste doit pouvoir retirer le label"
+        );
+    }
+
+    /// La garde porte sur les SIX colonnes nommées, et sur elles seules.
+    ///
+    /// Un `COALESCE` posé par erreur sur `file_mtime`, `audio_hash` ou
+    /// `album_id` figerait la ligne que le scan a justement pour rôle de
+    /// tenir à jour — et le rouge, lui, n'arriverait qu'au prochain
+    /// déménagement de fichier.
+    #[test]
+    fn la_garde_ne_couvre_que_les_colonnes_de_connaissance() {
+        let sql = sql::update_du_scan(&SqliteDialect);
+        for col in sql::COLONNES_DE_CONNAISSANCE {
+            assert!(
+                sql.contains(&format!("{col} = COALESCE(")),
+                "`{col}` doit être gardée : {sql}"
+            );
+        }
+        for col in [
+            "title",
+            "album_id",
+            "artist_id",
+            "album_artist",
+            "file_path",
+            "file_mtime",
+            "file_size",
+            "audio_hash",
+            "format",
+            "comments",
+            "bpm",
+        ] {
+            assert!(
+                sql.contains(&format!("{col} = ?")),
+                "`{col}` doit rester écrite telle quelle : {sql}"
+            );
+        }
+        // `year` est un entier : pas de `NULLIF`, qui ne passerait pas sur
+        // PostgreSQL (`int8` comparé à `''`).
+        assert!(
+            sql.contains("year = COALESCE(?, year)"),
+            "`year` se garde sans NULLIF : {sql}"
+        );
+        // L'ORDRE des arguments décide de tout : `COALESCE(?, colonne)` garde
+        // la nouveauté, `COALESCE(colonne, ?)` figerait l'ancien pour toujours.
+        assert!(
+            !sql.contains("COALESCE(genre,"),
+            "ordre inversé : la valeur stockée serait figée pour toujours"
+        );
+        // Les 25 paramètres restent à leur rang, dans les deux formes.
+        for forme in [sql::update(&SqliteDialect), sql] {
+            assert_eq!(
+                forme.matches('?').count(),
+                25,
+                "25 paramètres liés, ni plus ni moins : {forme}"
+            );
+        }
+    }
+
+    /// La forme PostgreSQL est la même règle, avec ses `$n` dans l'ordre.
+    #[test]
+    fn la_garde_du_scan_tient_aussi_en_postgresql() {
+        let sql = sql::update_du_scan(&PostgresDialect);
+        assert!(
+            sql.contains("genre = COALESCE(NULLIF($17, ''), genre)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("genres = COALESCE(NULLIF($18, ''), genres)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("composer = COALESCE(NULLIF($19, ''), composer)"),
+            "{sql}"
+        );
+        assert!(sql.contains("year = COALESCE($20, year)"), "{sql}");
+        assert!(
+            sql.contains("label = COALESCE(NULLIF($22, ''), label)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "musicbrainz_recording_id = COALESCE(NULLIF($23, ''), musicbrainz_recording_id)"
+            ),
+            "{sql}"
+        );
+        assert!(sql.ends_with("WHERE id = $25"), "{sql}");
     }
 }
