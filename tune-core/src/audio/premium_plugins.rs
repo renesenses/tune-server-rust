@@ -10,9 +10,27 @@
 //! Installer (la route `POST /plugins/equalizer/install` pose
 //! `plugin_equalizer_installed=true`) rend les réglages actifs tels quels.
 //! Crossfeed, convertisseur et Dé-ploc gardent la migration d'origine.
+//!
+//! #4861 : quand le compte n'est pas reconnu Premium au moment de la
+//! migration, les drapeaux des greffons payants sont écrits `false` (un compte
+//! Free n'a jamais de greffon payant actif) ET une clé de retenue
+//! (`premium_audio_plugins_withheld_{id}`) note quelles clés la migration a
+//! écrites faute de licence. Au retour du Premium — démarrage suivant
+//! ([`migrate_for_account`]) ou revalidation de la licence
+//! ([`restore_withheld`], appelé par `LicenseManager`) — ces clés-là, et
+//! seulement elles, repassent à `true`. Un choix explicite de l'utilisateur
+//! (désinstallation, désactivation) efface la retenue ([`forget_withheld`]) :
+//! il n'est jamais annulé.
 use crate::db::settings_repo::SettingsRepo;
 pub const IDS: [&str; 4] = ["equalizer", "crossfeed", "converter", "declick"];
 pub const MIGRATION: &str = "premium_audio_plugins_migration_v1";
+/// Préfixe de la clé de retenue d'un greffon payant (#4861). Sa valeur liste
+/// les suffixes (`installed`, `enabled`) que la migration a écrits `false`
+/// faute de licence Premium.
+const WITHHELD_PREFIX: &str = "premium_audio_plugins_withheld_";
+fn withheld_key(id: &str) -> String {
+    format!("{WITHHELD_PREFIX}{id}")
+}
 pub fn contains(id: &str) -> bool {
     IDS.contains(&id)
 }
@@ -90,8 +108,13 @@ pub fn migrate(settings: &SettingsRepo) -> Result<(), String> {
 /// uninstall/disable choices. L'égaliseur n'est jamais installé ici : une
 /// configuration existante ne vaut qu'une proposition, et un choix explicite
 /// antérieur (`plugin_equalizer_installed` présent, vrai ou faux) la tait.
+///
+/// Compte non Premium (#4861) : les drapeaux payants sont écrits `false`, et la
+/// clé de retenue note lesquels. Compte Premium : les greffons retenus lors
+/// d'une migration antérieure sont rétablis, même si le marqueur est posé.
 pub fn migrate_for_account(settings: &SettingsRepo, premium: bool) -> Result<(), String> {
     if settings.get(MIGRATION)?.as_deref() == Some("complete") {
+        restore_withheld(settings, premium)?;
         return Ok(());
     }
     for id in IDS {
@@ -99,21 +122,67 @@ pub fn migrate_for_account(settings: &SettingsRepo, premium: bool) -> Result<(),
             propose_install_if_configured(settings, id)?;
             continue;
         }
+        let withhold = !premium && requires_premium(id);
+        let mut withheld = Vec::new();
         for suffix in ["installed", "enabled"] {
             let key = format!("plugin_{id}_{suffix}");
             if settings.get(&key)?.is_none() {
-                settings.set(
-                    &key,
-                    if premium || !requires_premium(id) {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )?;
+                settings.set(&key, if withhold { "false" } else { "true" })?;
+                if withhold {
+                    withheld.push(suffix);
+                }
             }
+        }
+        if !withheld.is_empty() {
+            settings.set(&withheld_key(id), &withheld.join(","))?;
         }
     }
     settings.set(MIGRATION, "complete")
+}
+/// Rétablit les greffons payants que la migration a retenus faute de licence
+/// (#4861). Sans effet si `premium` est faux. Seules les clés notées dans la
+/// retenue, et encore à `false`, repassent à `true` ; la retenue est ensuite
+/// effacée. Rend les identifiants rétablis.
+pub fn restore_withheld(
+    settings: &SettingsRepo,
+    premium: bool,
+) -> Result<Vec<&'static str>, String> {
+    let mut restored = Vec::new();
+    if !premium {
+        return Ok(restored);
+    }
+    for id in IDS {
+        if !requires_premium(id) {
+            continue;
+        }
+        let Some(suffixes) = settings.get(&withheld_key(id))? else {
+            continue;
+        };
+        let mut touched = false;
+        for suffix in suffixes
+            .split(',')
+            .filter(|s| matches!(*s, "installed" | "enabled"))
+        {
+            let key = format!("plugin_{id}_{suffix}");
+            if settings.get(&key)?.as_deref() == Some("false") {
+                settings.set(&key, "true")?;
+                touched = true;
+            }
+        }
+        settings.delete(&withheld_key(id))?;
+        if touched {
+            restored.push(id);
+        }
+    }
+    Ok(restored)
+}
+/// Un choix explicite de l'utilisateur (désinstallation, désactivation) sur un
+/// greffon payant efface sa retenue : le retour du Premium ne l'annulera pas.
+pub fn forget_withheld(settings: &SettingsRepo, id: &str) -> Result<(), String> {
+    if requires_premium(id) {
+        settings.delete(&withheld_key(id))?;
+    }
+    Ok(())
 }
 fn propose_install_if_configured(settings: &SettingsRepo, id: &str) -> Result<(), String> {
     if settings.get(&format!("plugin_{id}_installed"))?.is_some() {
@@ -143,6 +212,115 @@ mod tests {
     fn installer_par_la_route(s: &SettingsRepo, id: &str) {
         s.set(&format!("plugin_{id}_installed"), "true").unwrap();
         s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
+    }
+    const PAYANTS: [&str; 3] = ["crossfeed", "converter", "declick"];
+    /// #4861 : un premier démarrage vu comme Free (licence pas encore
+    /// revalidée), puis un démarrage Premium, rend les trois greffons payants
+    /// installés et actifs.
+    #[test]
+    fn temoin_4861_free_puis_premium_rend_les_trois_greffons() {
+        let s = settings();
+        migrate_for_account(&s, false).unwrap();
+        for id in PAYANTS {
+            assert!(!enabled(&s, id), "{id} actif pour un compte Free");
+        }
+        migrate_for_account(&s, true).unwrap();
+        for id in PAYANTS {
+            assert!(
+                installed(&s, id),
+                "{id} non réinstallé au retour du Premium"
+            );
+            assert!(enabled(&s, id), "{id} inactif au retour du Premium");
+        }
+        // Rejouer ne change plus rien.
+        let apres = etat(&s);
+        migrate_for_account(&s, true).unwrap();
+        assert_eq!(etat(&s), apres);
+    }
+    /// #4861 : même chose quand le Premium revient EN COURS de route, par la
+    /// revalidation de la licence (clé ou compte), sans attendre un redémarrage.
+    #[tokio::test]
+    async fn temoin_4861_retour_du_premium_par_la_licence() {
+        for par_le_compte in [false, true] {
+            let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            let backend: std::sync::Arc<dyn crate::db::backend::DbBackend> =
+                std::sync::Arc::new(db);
+            let s = SettingsRepo::with_backend(backend.clone());
+            let licence = crate::license::LicenseManager::new(backend);
+            migrate_for_account(&s, licence.is_premium().await).unwrap();
+            for id in PAYANTS {
+                assert!(!enabled(&s, id), "{id} actif pour un compte Free");
+            }
+            // Une réponse Free ne rend rien.
+            licence
+                .update_from_server(crate::license::Tier::Free, None)
+                .await;
+            for id in PAYANTS {
+                assert!(!enabled(&s, id), "{id} rendu à un compte Free");
+            }
+            if par_le_compte {
+                licence.set_account_premium(true, None).await;
+            } else {
+                licence
+                    .update_from_server(crate::license::Tier::Premium, None)
+                    .await;
+            }
+            for id in PAYANTS {
+                assert!(
+                    enabled(&s, id),
+                    "{id} inactif au retour du Premium (compte={par_le_compte})"
+                );
+            }
+        }
+    }
+    /// #4861 : un choix de l'utilisateur antérieur à la migration (greffon
+    /// désactivé) survit au retour du Premium ; un compte Free n'a jamais de
+    /// greffon payant actif, quel que soit le nombre de démarrages.
+    #[test]
+    fn temoin_4861_choix_anterieur_garde_et_free_jamais_actif() {
+        let s = settings();
+        s.set("plugin_declick_enabled", "false").unwrap();
+        for _ in 0..3 {
+            migrate_for_account(&s, false).unwrap();
+            for id in PAYANTS {
+                assert!(!enabled(&s, id), "{id} actif pour un compte Free");
+            }
+        }
+        migrate_for_account(&s, true).unwrap();
+        assert!(enabled(&s, "crossfeed"));
+        assert!(enabled(&s, "converter"));
+        assert!(installed(&s, "declick"), "declick non réinstallé");
+        assert!(!enabled(&s, "declick"), "désactivation antérieure écrasée");
+    }
+    /// #4861 : un compte Premium dès le premier démarrage garde le
+    /// comportement d'origine, sans aucune clé de retenue ; l'égaliseur,
+    /// gratuit et seulement proposé, n'est jamais installé par le retour du
+    /// Premium.
+    #[test]
+    fn temoin_4861_premium_d_emblee_et_egaliseur_inchanges() {
+        let s = settings();
+        s.set("zone_1_eq_profile", "profil").unwrap();
+        migrate_for_account(&s, true).unwrap();
+        let premium_d_emblee = etat(&s);
+        for id in PAYANTS {
+            assert!(enabled(&s, id));
+        }
+        assert!(
+            !premium_d_emblee
+                .iter()
+                .any(|(k, _)| k.starts_with("premium_audio_plugins_withheld")),
+            "clé de retenue posée pour un compte Premium"
+        );
+        let s = settings();
+        s.set("zone_1_eq_profile", "profil").unwrap();
+        migrate_for_account(&s, false).unwrap();
+        migrate_for_account(&s, true).unwrap();
+        assert!(!installed(&s, "equalizer"), "égaliseur installé d'office");
+        assert!(!enabled(&s, "equalizer"));
+        assert!(install_proposed(&s, "equalizer"));
+        assert!(s.get("plugin_equalizer_installed").unwrap().is_none());
     }
     #[test]
     fn egaliseur_base_neuve_ni_installe_ni_propose_ni_actif() {
