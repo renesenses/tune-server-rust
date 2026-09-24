@@ -741,24 +741,19 @@ pub(super) async fn artist_image_report(
     // Recorded in metadata_reports like every other report. It used to be
     // stashed as a settings key (reported_artist_image_{id}), which no code
     // could list or aggregate and which never reached the community backend.
-    tune_core::db::metadata_report_repo::MetadataReportRepo::with_backend(state.backend.clone())
-        .insert(
-            "artist_image",
-            Some(id),
-            None,
-            None,
-            None,
-            reason.as_deref().unwrap_or("incorrect_image"),
-            None,
-            &now_iso_utc(),
-        )
-        .ok();
-    // Also remove the wrong image locally so the artist shows a placeholder and
-    // a fresh image is re-fetched on the next enrichment (Jean Valjean #1096:
-    // "supprimer les images incorrectes en appuyant sur le drapeau").
-    let cleared = ArtistRepo::with_backend(state.backend.clone())
-        .clear_image(id)
-        .is_ok();
+    // Le signalement garde l'empreinte de l'image et l'efface (Jean Valjean
+    // #1096) ; l'enrichissement suivant ne la repose plus (#4837) — même
+    // chemin que `POST /library/reports`.
+    let cleared = tune_core::library::artwork::signaler_image_artiste(
+        &state.backend,
+        &artwork_cache_dir(),
+        id,
+        None,
+        reason.as_deref().unwrap_or("incorrect_image"),
+        None,
+        &now_iso_utc(),
+    )
+    .unwrap_or(false);
     Json(json!({"reported": true, "artist_id": id, "image_cleared": cleared}))
 }
 

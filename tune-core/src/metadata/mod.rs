@@ -2234,6 +2234,19 @@ pub(crate) fn disque_arbitre(tag: Option<u32>, chemin: Option<u32>) -> Option<u3
     }
 }
 
+/// Le label d'un tag lofty : `ItemKey::Label`, et à défaut `ItemKey::Publisher`.
+///
+/// lofty range la trame ID3v2 `TPUB` sous `Publisher` — sa table déclare
+/// `"TPUB" => Publisher | Label` et la LECTURE retient la première variante —
+/// comme le commentaire Vorbis `PUBLISHER`. Ne demander que `Label` perdait
+/// donc le label de tout MP3/AIFF étiqueté par Mp3tag (#4836, fil 1899). Un
+/// `LABEL`/`ORGANIZATION` explicite reste prioritaire.
+fn label_du_tag(get: &dyn Fn(lofty::tag::ItemKey) -> Option<String>) -> Option<String> {
+    let non_vide = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    non_vide(get(lofty::tag::ItemKey::Label))
+        .or_else(|| non_vide(get(lofty::tag::ItemKey::Publisher)))
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
@@ -3298,6 +3311,9 @@ mod ogg_fallback_tests_4412;
 #[cfg(test)]
 mod coffret_multicanal_tests_4846;
 
+#[cfg(test)]
+mod label_tests_4836;
+
 fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -3618,7 +3634,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             .map(|m| m.len()),
         bpm,
         compilation,
-        label: get(ItemKey::Label),
+        label: label_du_tag(&get),
         catalog_number: get(ItemKey::CatalogNumber),
         musicbrainz_recording_id: get(ItemKey::MusicBrainzRecordingId),
         musicbrainz_release_id: get(ItemKey::MusicBrainzReleaseId),
@@ -3724,7 +3740,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::Remixer) {
         meta.insert("remixer".into(), v);
     }
-    if let Some(v) = get(ItemKey::Label) {
+    if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
     }
     if let Some(v) = get(ItemKey::Producer) {
