@@ -60,39 +60,64 @@ use crate::state::AppState;
 /// travailler.
 const CANDIDATS: usize = 5;
 
-pub(super) async fn reidentify_album(
-    State(state): State<AppState>,
-    Path(album_id): Path<i64>,
-) -> impl IntoResponse {
+/// Ce qu'une identification d'album a donné, indépendamment du transport.
+///
+/// 🔴 Sortie de la route POUR ÊTRE APPELÉE DEUX FOIS (#4805). Le pilote de lot
+/// de `identification_lot.rs` doit faire *exactement* ce que fait le bouton
+/// « Ré-identifier » d'un album — même recherche, même appariement, mêmes
+/// écritures, mêmes garde-fous. Recopier la chaîne aurait fabriqué deux
+/// identifications qui divergent au premier correctif ; la route est
+/// désormais une mise en forme JSON, et rien d'autre.
+pub(super) struct Identification {
+    pub verdict: &'static str,
+    pub tracks_total: usize,
+    pub was_identified_before: bool,
+    pub previous_release_id: Option<String>,
+    pub searched_title: String,
+    pub searched_artist: String,
+    /// Le pressage retenu. `None` sur `not_found` / `no_tracks`.
+    pub meilleur: Option<musicbrainz_release::MBReleaseMatch>,
+    /// Ce qui a été écrit. `None` sur `not_found` / `no_tracks`.
+    pub applied: Option<tune_core::metadata::reidentify::AppliedIdentification>,
+}
+
+/// Pourquoi une identification n'a même pas pu être tentée. À distinguer d'un
+/// `not_found`, qui est un résultat : ici, rien n'a été interrogé.
+pub(super) enum EchecIdentification {
+    AlbumIntrouvable,
+    Base(String),
+}
+
+/// La chaîne complète pour UN album : recherche, détail, appariement, écriture.
+///
+/// Deux requêtes MusicBrainz, séparées par [`musicbrainz_release::rate_limit_delay`].
+/// L'appelant qui enchaîne des albums doit ajouter SON propre délai entre deux
+/// appels — celui d'ici ne couvre que l'intervalle interne.
+pub(super) async fn identifier_album(
+    state: &AppState,
+    album_id: i64,
+) -> Result<Identification, EchecIdentification> {
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let album = match album_repo.get(album_id) {
         Ok(Some(a)) => a,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "album introuvable"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
+        Ok(None) => return Err(EchecIdentification::AlbumIntrouvable),
+        Err(e) => return Err(EchecIdentification::Base(e.to_string())),
     };
 
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let tracks = track_repo.list_by_album(album_id).unwrap_or_default();
     if tracks.is_empty() {
         // Rien à ré-identifier, et surtout : ne rien effacer pour autant.
-        return Json(json!({
-            "album_id": album_id,
-            "verdict": "no_tracks",
-            "tracks_total": 0,
-        }))
-        .into_response();
+        return Ok(Identification {
+            verdict: "no_tracks",
+            tracks_total: 0,
+            was_identified_before: false,
+            previous_release_id: None,
+            searched_title: album.title.clone(),
+            searched_artist: String::new(),
+            meilleur: None,
+            applied: None,
+        });
     }
 
     // L'artiste à interroger : celui de l'album quand il est connu, sinon
@@ -109,7 +134,7 @@ pub(super) async fn reidentify_album(
         Ok(c) => c,
         Err(e) => {
             warn!(album_id, error = %e, "reidentify_clear_failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+            return Err(EchecIdentification::Base(e));
         }
     };
 
@@ -130,15 +155,16 @@ pub(super) async fn reidentify_album(
             warn!(album_id, error = %e, "reidentify_restore_failed");
         }
         info!(album_id, title = %album.title, "reidentify_not_found");
-        return Json(json!({
-            "album_id": album_id,
-            "verdict": "not_found",
-            "tracks_total": tracks.len(),
-            "previous_identification_restored": cleared.was_identified(),
-            "searched_title": album.title,
-            "searched_artist": artist,
-        }))
-        .into_response();
+        return Ok(Identification {
+            verdict: "not_found",
+            tracks_total: tracks.len(),
+            was_identified_before: cleared.was_identified(),
+            previous_release_id: cleared.release_id.clone(),
+            searched_title: album.title.clone(),
+            searched_artist: artist,
+            meilleur: None,
+            applied: None,
+        });
     };
 
     musicbrainz_release::rate_limit_delay().await;
@@ -178,7 +204,7 @@ pub(super) async fn reidentify_album(
             if let Err(e2) = restore_album_identification(&state.backend, album_id, &cleared) {
                 warn!(album_id, error = %e2, "reidentify_restore_failed");
             }
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+            return Err(EchecIdentification::Base(e));
         }
     };
 
@@ -199,25 +225,79 @@ pub(super) async fn reidentify_album(
         "reidentify_done"
     );
 
-    Json(json!({
-        "album_id": album_id,
-        "verdict": verdict,
-        "was_identified_before": cleared.was_identified(),
-        "previous_release_id": cleared.release_id,
-        "release_id": meilleur.release_id,
-        "release_group_id": meilleur.release_group_id,
-        "release_title": meilleur.title,
-        "release_artist": meilleur.artist,
-        "release_date": meilleur.date,
-        "release_country": meilleur.country,
-        "release_disambiguation": meilleur.disambiguation,
-        "match_score": meilleur.score,
-        "tracks_total": locales.len(),
-        "tracks_matched": applied.tracks_matched,
-        "tracks_unmatched": applied.tracks_unmatched,
-        // Ce que Tune a refusé d'écraser, nommément. Sans cette liste,
-        // l'utilisateur croirait la ré-identification incomplète.
-        "fields_left_as_is": applied.fields_left_as_is,
-    }))
-    .into_response()
+    Ok(Identification {
+        verdict,
+        tracks_total: locales.len(),
+        was_identified_before: cleared.was_identified(),
+        previous_release_id: cleared.release_id.clone(),
+        searched_title: album.title.clone(),
+        searched_artist: artist,
+        meilleur: Some(meilleur),
+        applied: Some(applied),
+    })
+}
+
+pub(super) async fn reidentify_album(
+    State(state): State<AppState>,
+    Path(album_id): Path<i64>,
+) -> impl IntoResponse {
+    let issue = match identifier_album(&state, album_id).await {
+        Ok(i) => i,
+        Err(EchecIdentification::AlbumIntrouvable) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "album introuvable"})),
+            )
+                .into_response();
+        }
+        Err(EchecIdentification::Base(e)) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
+    };
+
+    match (issue.verdict, &issue.meilleur, &issue.applied) {
+        ("no_tracks", _, _) => Json(json!({
+            "album_id": album_id,
+            "verdict": "no_tracks",
+            "tracks_total": 0,
+        }))
+        .into_response(),
+        ("not_found", _, _) => Json(json!({
+            "album_id": album_id,
+            "verdict": "not_found",
+            "tracks_total": issue.tracks_total,
+            "previous_identification_restored": issue.was_identified_before,
+            "searched_title": issue.searched_title,
+            "searched_artist": issue.searched_artist,
+        }))
+        .into_response(),
+        (verdict, Some(meilleur), Some(applied)) => Json(json!({
+            "album_id": album_id,
+            "verdict": verdict,
+            "was_identified_before": issue.was_identified_before,
+            "previous_release_id": issue.previous_release_id,
+            "release_id": meilleur.release_id,
+            "release_group_id": meilleur.release_group_id,
+            "release_title": meilleur.title,
+            "release_artist": meilleur.artist,
+            "release_date": meilleur.date,
+            "release_country": meilleur.country,
+            "release_disambiguation": meilleur.disambiguation,
+            "match_score": meilleur.score,
+            "tracks_total": issue.tracks_total,
+            "tracks_matched": applied.tracks_matched,
+            "tracks_unmatched": applied.tracks_unmatched,
+            // Ce que Tune a refusé d'écraser, nommément. Sans cette liste,
+            // l'utilisateur croirait la ré-identification incomplète.
+            "fields_left_as_is": applied.fields_left_as_is,
+        }))
+        .into_response(),
+        // Inatteignable : un verdict posé sans pressage. On le dit au lieu de
+        // rendre un corps muet.
+        (verdict, _, _) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "verdict sans pressage", "verdict": verdict})),
+        )
+            .into_response(),
+    }
 }
