@@ -792,6 +792,11 @@ pub struct PlaybackOrchestrator {
     /// left None in tests → no gating). Enforced at zone activation in `play`.
     pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    /// #3365 — la qualité annoncée de la piste pré-armée, rangée à côté de
+    /// `gapless_sessions` et reprise par `advance_queue_metadata` quand la
+    /// zone adopte ce flux. Carte annexe plutôt qu'un changement de forme de
+    /// `gapless_sessions`, dont vit l'épreuve de #3442.
+    qualites_pre_armees: Mutex<HashMap<i64, QualitePreArmee>>,
     pub prefetch: Arc<PrefetchEngine>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
@@ -1193,6 +1198,7 @@ impl PlaybackOrchestrator {
             event_bus: None,
             license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
@@ -1300,6 +1306,9 @@ mod history;
 
 mod bandcamp;
 pub use bandcamp::*;
+
+mod qualite_pre_armee;
+pub(crate) use qualite_pre_armee::{QualitePreArmee, format_du_mime, format_nomme_par_la_source};
 
 /// Ce qu'on ANNONCE au renderer pour une piste de serveur média : le MIME ne
 /// se devine plus dans la seule URL, qui pour un `<res>` de Tune ne porte
@@ -1546,6 +1555,9 @@ mod recreation_locale_guard;
 
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
+
+#[cfg(test)]
+mod qualite_piste_de_service_3365;
 
 /// #4556 — le refus de lecture quand le coupe-circuit ASIO a vidé le parc.
 ///
