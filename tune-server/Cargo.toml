@@ -780,6 +780,11 @@ path = "tests/indexation_upnp_2219.rs"
 [[test]]
 name = "refus_oaat_upnp_2219"
 path = "tests/refus_oaat_upnp_2219.rs"
+
+# #4895 : un Browse qui ne peut pas être servi le DIT (plus de 200 vide muet).
+[[test]]
+name = "browse_serveur_muet_4895"
+path = "tests/browse_serveur_muet_4895.rs"
 # #4125 — la fraîcheur du registre des serveurs multimédia, mesurée sur la
 # ROUTE montée. `autotests = false` en tête de ce manifeste : sans cette cible,
 # le fichier ne serait JAMAIS compilé et la garde serait verte contre rien.
