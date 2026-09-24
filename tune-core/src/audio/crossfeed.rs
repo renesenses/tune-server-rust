@@ -190,7 +190,8 @@ pub enum CrossfeedConstraint {
     /// plusieurs secondes à plusieurs dizaines (#3357). C'est ce que dit ce
     /// motif, et lui seul.
     ///
-    /// ⚠️ Motif PARTIEL, et c'est le seul (#2742, 23/09) : il ne VERROUILLE pas
+    /// ⚠️ Motif PARTIEL (#2742, 23/09), comme [`Self::NetworkRendererNoLpcm`]
+    /// depuis le 24/09 : il ne VERROUILLE pas
     /// le contrôle ([`Self::verrouille`]). Les bras STREAMING (Qobuz, Tidal,
     /// YouTube) chargent la chaîne de la zone par `load_streaming_dsp`, dont le
     /// dernier étage est le crossfeed, et la pré-transcodent dès qu'un étage
@@ -202,8 +203,11 @@ pub enum CrossfeedConstraint {
     NetworkProgressiveOff,
     /// Zone RÉSEAU dont le renderer n'a pas annoncé le LPCM à la profondeur
     /// servie (sonde `GetProtocolInfo`, réponse inconcluante comprise). Le
-    /// bras progressif sert du WAV : une piste de la BIBLIOTHÈQUE est donc
-    /// renvoyée au fichier, qui ne porte pas le crossfeed.
+    /// bras progressif sert du WAV : une piste de la BIBLIOTHÈQUE qu'aucun
+    /// autre traitement ne ré-encode part donc telle quelle, sans crossfeed.
+    /// Celle qu'un égaliseur, un convolveur ou un ReplayGain ré-encode déjà
+    /// le porte depuis le 24/09 (`orchestrator::crossfeed_bibliotheque_reseau`,
+    /// cas 1).
     ///
     /// ⚠️ Motif PARTIEL depuis la mesure du 24/09 (#2742) : il ne VERROUILLE
     /// pas le contrôle ([`Self::verrouille`]). Les bras STREAMING ne lisent
@@ -262,7 +266,9 @@ impl CrossfeedConstraint {
             }
             Self::NetworkRendererNoLpcm => {
                 "Sur cette zone réseau, le crossfeed s'applique aux flux Qobuz, \
-                 Tidal et YouTube, traités avant l'envoi. Les pistes de votre \
+                 Tidal et YouTube, traités avant l'envoi, et aux pistes de votre \
+                 bibliothèque que Tune retraite déjà (égaliseur, correction de \
+                 pièce, ReplayGain, conversion). Les autres pistes de la \
                  bibliothèque partent en revanche sans lui : ce lecteur \
                  n'annonce pas savoir lire le PCM non compressé, et le flux \
                  progressif qui les traiterait ne peut pas lui être servi."
