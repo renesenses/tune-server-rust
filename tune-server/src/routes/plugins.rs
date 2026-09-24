@@ -14,6 +14,15 @@ pub fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/", get(list_plugins))
         .route("/docs", get(plugin_docs))
+        // Bandeau « Réinstaller » des greffons payants (#4861).
+        .route(
+            "/premium-audio/reinstall-suggestion",
+            get(crate::premium_audio_plugins::reinstall_suggestion),
+        )
+        .route(
+            "/premium-audio/reinstall-suggestion/dismiss",
+            post(crate::premium_audio_plugins::dismiss_reinstall_suggestion),
+        )
         .route("/{name}", get(get_plugin))
         .route("/{name}", axum::routing::delete(delete_plugin))
         .route("/{name}/enable", post(enable_plugin))
