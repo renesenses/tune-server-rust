@@ -366,6 +366,38 @@ pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
     output_type == "dlna" && bytes_sent == 0
 }
 
+/// 🔴 #4661 — le renderer peut-il encore être en train de jouer un fichier
+/// qu'il a reçu EN ENTIER ?
+///
+/// Vrai tant que l'horloge murale de la piste n'a pas dépassé sa durée de
+/// [`END_MARGIN_MS`]. Un renderer temps réel ne joue pas plus vite que 1× :
+/// avant cette borne, un fichier entièrement servi peut encore sortir de son
+/// tampon, et un `Stopped` annoncé ne prouve pas l'arrêt.
+///
+/// Au-delà, il a eu de quoi finir ET le temps de le jouer : la musique est
+/// finie, qu'il l'ait annoncé ou non.
+///
+/// ⚠️ Cette fonction ne juge PAS si le fichier a été servi en entier — c'est
+/// [`super::fsm::flux_servi_en_entier`] qui l'établit, aux octets contre la
+/// taille du flux. Appelée seule, elle dirait « peut encore jouer » de
+/// n'importe quel renderer avant la fin nominale de sa piste, y compris d'un
+/// mort à qui l'on n'a servi que 70 % du morceau.
+///
+/// Mesure qui motive la règle : Sevy Tabroc, 0.9.161, darTZeel LHC-208,
+/// piste de 281 160 ms servie en entier à 89 s de piste. La patience plate de
+/// #4480 (`min(avance, 120 s)`, depuis un arrêt commencé vers 102 s) place la
+/// coupure vers 222 s : **59 s de musique perdues**. L'horloge, elle, sait
+/// que la musique court jusqu'à 281 s.
+///
+/// Durée inconnue (`0`) ⇒ `false` : l'horloge ne peut rien trancher.
+pub fn tampon_du_renderer_peut_encore_jouer(
+    wall_elapsed_secs: u64,
+    track_duration_ms: u64,
+) -> bool {
+    track_duration_ms > 0
+        && wall_elapsed_secs.saturating_mul(1000) < track_duration_ms.saturating_add(END_MARGIN_MS)
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must

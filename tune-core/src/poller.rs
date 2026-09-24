@@ -245,6 +245,40 @@ const STOPPED_FAILURE_MIN_SECS: u64 = 30;
 ///
 /// Voir [`fsm::famine_etablie_malgre_l_avance`].
 const AVANCE_AUDIO_BORNE_HAUTE_SECS: u64 = 120;
+/// 🔴 #4661 — le PLAFOND de la patience que l'HORLOGE DE PISTE peut accorder
+/// en plus, quand le flux a été servi EN ENTIER.
+///
+/// [`AVANCE_AUDIO_BORNE_HAUTE_SECS`] est PLATE : deux minutes, que la piste
+/// dure trois minutes ou vingt. Sur le cas mesuré (#4661, darTZeel LHC-208,
+/// WAV de 281 160 ms servi EN ENTIER à 89 s de piste, renderer muet à partir
+/// de ~102 s), elle place la coupure vers 222 s de piste — **59 secondes de
+/// musique encore dans le tampon du renderer**.
+///
+/// Or quand la durée est connue ET que le fichier a été servi en entier,
+/// l'horloge n'a plus besoin d'une constante : elle sait DIRE quand la
+/// musique s'arrête — `durée + END_MARGIN_MS`. La patience devient exacte au
+/// lieu d'être forfaitaire.
+///
+/// Ce plafond-ci ne borne donc pas la règle, il borne son PATHOLOGIQUE :
+///
+/// - `bytes_sent` est **monotone toutes connexions confondues** (voir
+///   [`crate::http::streamer::AudioStreamer::stream_audio_servi_ms`]) : une
+///   reprise `Range` peut le faire dépasser la taille du fichier sans que le
+///   renderer ait jamais reçu le morceau entier. « Servi en entier » peut
+///   donc être conclu à tort ;
+/// - et sur une piste très longue (un set d'une heure, une face de disque
+///   enregistrée d'un bloc), attendre `durée` laisserait une zone morte
+///   affichée en lecture pendant tout ce temps.
+///
+/// Dix minutes, parce que la valeur doit **dépasser largement**
+/// [`AVANCE_AUDIO_BORNE_HAUTE_SECS`] (sinon elle n'ajoute aucune patience et
+/// le cas mesuré, 182 s d'arrêt, retomberait dans la coupure) et **rester
+/// loin sous** la vie d'une session de flux
+/// (`crate::http::streamer::SESSION_IDLE_TIMEOUT` = 1800 s), au-delà de
+/// laquelle `/stream/{id}` répond 404 et la zone est perdue de toute façon.
+///
+/// Voir [`fsm::horloge_de_piste_couvre_l_arret`].
+const HORLOGE_DE_PISTE_BORNE_HAUTE_SECS: u64 = 600;
 /// Grace period (seconds) after a new track is loaded (track_generation
 /// changes).  During this window the poller suppresses stopped_ticks to
 /// let the renderer buffer — especially important for streaming sources
@@ -1203,6 +1237,11 @@ mod reprise_apres_pause_4666;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+
+/// #4661 — un fichier servi EN ENTIER se finit à l'HORLOGE DE PISTE, pas au
+/// bout d'un forfait de deux minutes.
+#[cfg(test)]
+mod fin_de_piste_a_l_horloge_4661;
 
 /// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
 /// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position
