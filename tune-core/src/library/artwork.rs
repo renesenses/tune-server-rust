@@ -477,6 +477,112 @@ pub fn cache_fetched_image(data: &[u8], cache_dir: &Path, ext: &str) -> Option<S
     save_to_cache(data, cache_dir, &hash, ext).map(|_| hash)
 }
 
+/// L'empreinte (SHA-256 des octets) de l'image qu'un `image_path` d'artiste
+/// désigne dans le cache. Couvre les deux formes stockées : le condensat de
+/// contenu (depuis #1444) comme l'ancienne adresse `artwork_hash(...)` d'une
+/// image nommée — c'est pour cela qu'on relit les OCTETS au lieu de recopier
+/// `image_path`. Une URL distante n'a pas d'empreinte locale.
+pub fn empreinte_image_en_cache(cache_dir: &Path, image_path: &str) -> Option<String> {
+    if image_path.starts_with("http") {
+        return None;
+    }
+    let hex = (image_path.len() == 32 || image_path.len() == 64)
+        && image_path.chars().all(|c| c.is_ascii_hexdigit());
+    let adresse = if hex {
+        image_path.to_string()
+    } else {
+        artwork_hash(image_path)
+    };
+    let (chemin, _) = find_cached(cache_dir, &adresse)?;
+    std::fs::read(chemin)
+        .ok()
+        .map(|octets| content_hash(&octets))
+}
+
+/// Écarte une image d'artiste que l'utilisateur a déjà rejetée (#4837).
+///
+/// Rend les octets s'ils sont acceptables, `None` si leur empreinte figure
+/// parmi `refusees`. Appliquée à CHAQUE source de la cascade et à la passe
+/// communautaire : sans elle, le drapeau « image incorrecte » effaçait
+/// l'image, et l'enrichissement suivant reposait la même, servie en priorité
+/// par le dépôt communautaire sous le bon MBID (Edge Of Thorns, fils
+/// 1901/1902).
+pub fn image_retenue(octets: Vec<u8>, refusees: &[String]) -> Option<Vec<u8>> {
+    if refusees.is_empty() {
+        return Some(octets);
+    }
+    let empreinte = content_hash(&octets);
+    if refusees.iter().any(|r| r.eq_ignore_ascii_case(&empreinte)) {
+        info!(empreinte = %empreinte, "artist_image_rejetee_localement_ecartee");
+        return None;
+    }
+    Some(octets)
+}
+
+/// Enregistre le signalement « image d'artiste incorrecte » ET son effet local
+/// durable (#4837) : la ligne `metadata_reports` porte l'empreinte de l'image
+/// affichée ([`CHAMP_EMPREINTE_IMAGE`](crate::db::metadata_report_repo::CHAMP_EMPREINTE_IMAGE))
+/// et le MBID de l'artiste, puis l'image est effacée. Les passes
+/// d'enrichissement consultent ces empreintes et ne reposent plus cette image.
+///
+/// Rend `true` quand l'image a été effacée.
+#[allow(clippy::too_many_arguments)]
+pub fn signaler_image_artiste(
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    cache_dir: &Path,
+    artist_id: i64,
+    mbid: Option<&str>,
+    reason: &str,
+    comment: Option<&str>,
+    created_at: &str,
+) -> Result<bool, String> {
+    let artistes = crate::db::artist_repo::ArtistRepo::with_backend(db.clone());
+    let artiste = artistes.get(artist_id).ok().flatten();
+    let empreinte = artiste
+        .as_ref()
+        .and_then(|a| a.image_path.as_deref())
+        .and_then(|ip| empreinte_image_en_cache(cache_dir, ip));
+    let mbid = mbid
+        .filter(|m| !m.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            artiste
+                .as_ref()
+                .and_then(|a| a.musicbrainz_id.clone())
+                .filter(|m| !m.trim().is_empty())
+        });
+    crate::db::metadata_report_repo::MetadataReportRepo::with_backend(db.clone()).insert(
+        "artist_image",
+        Some(artist_id),
+        mbid.as_deref(),
+        empreinte
+            .as_ref()
+            .map(|_| crate::db::metadata_report_repo::CHAMP_EMPREINTE_IMAGE),
+        empreinte.as_deref(),
+        reason,
+        comment,
+        created_at,
+    )?;
+    info!(
+        artist_id,
+        empreinte = ?empreinte,
+        "artist_image_signalee_empreinte_gardee"
+    );
+    Ok(artistes.clear_image(artist_id).is_ok())
+}
+
+/// Les empreintes rejetées d'un artiste ; vide en cas d'erreur de lecture (on
+/// n'empêche pas un enrichissement parce que la table ne se lit pas).
+fn empreintes_rejetees(
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    artist_id: i64,
+    mbid: &str,
+) -> Vec<String> {
+    crate::db::metadata_report_repo::MetadataReportRepo::with_backend(db.clone())
+        .empreintes_d_image_rejetees(Some(artist_id), Some(mbid))
+        .unwrap_or_default()
+}
+
 /// Fetch front cover art from the Cover Art Archive using a MusicBrainz release ID.
 pub async fn fetch_cover_art(mbid: &str) -> Option<Vec<u8>> {
     let client = crate::http::client::builder()
@@ -803,6 +909,7 @@ pub async fn fetch_artist_image(
     artist_name: &str,
     discogs_token: Option<&str>,
     lastfm_key: &str,
+    refusees: &[String],
 ) -> Option<Vec<u8>> {
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
@@ -812,7 +919,10 @@ pub async fn fetch_artist_image(
 
     // 1. Mozaiklabs community by MBID (fastest, no rate limit) — highest priority
     if !mbid.is_empty() {
-        if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid).await {
+        if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
     }
@@ -821,7 +931,10 @@ pub async fn fetch_artist_image(
     // for artists without an MBID (which never reach the by-MBID lookup above),
     // BEFORE falling back to any external source.
     if !artist_name.is_empty() {
-        if let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name).await {
+        if let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
     }
@@ -831,18 +944,27 @@ pub async fn fetch_artist_image(
     if !mbid.is_empty() {
         // 2. Fanart.tv
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Some(bytes) = fetch_artist_image_fanart(&client, mbid).await {
+        if let Some(bytes) = fetch_artist_image_fanart(&client, mbid)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
 
         // 3. TheAudioDB (free API, good coverage)
-        if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid).await {
+        if let Some(bytes) = fetch_artist_image_theaudiodb(&client, mbid)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
 
         // 4+5. MusicBrainz: try direct image relation, then Wikidata→Wikimedia
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid).await {
+        if let Some(bytes) = fetch_artist_image_musicbrainz_full(&client, mbid)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
     }
@@ -850,7 +972,10 @@ pub async fn fetch_artist_image(
     // 6. Discogs (if token configured, search by artist name)
     if !artist_name.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name, discogs_token).await {
+        if let Some(bytes) = fetch_artist_image_discogs(&client, artist_name, discogs_token)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
     }
@@ -858,7 +983,10 @@ pub async fn fetch_artist_image(
     // 7. Last.fm (artist.getinfo → image array, "extralarge" or "mega")
     if !artist_name.is_empty() && !lastfm_key.is_empty() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name, lastfm_key).await {
+        if let Some(bytes) = fetch_artist_image_lastfm(&client, artist_name, lastfm_key)
+            .await
+            .and_then(|b| image_retenue(b, refusees))
+        {
             return Some(bytes);
         }
     }
@@ -1505,8 +1633,14 @@ async fn batch_enrich_artist_artwork_inner(
                     .user_agent(MB_USER_AGENT)
                     .timeout(std::time::Duration::from_secs(15))
                     .build();
+                // #4837 : l'image communautaire que l'utilisateur a rejetée
+                // pour cet artiste n'est plus reposée à chaque passe.
+                let refusees = empreintes_rejetees(&db, artist_id, &img.mbid);
                 if let Ok(client) = client {
-                    if let Some(data) = download_image(&client, &img.image_url).await {
+                    if let Some(data) = download_image(&client, &img.image_url)
+                        .await
+                        .and_then(|d| image_retenue(d, &refusees))
+                    {
                         // Adressage par le CONTENU (#1444) : sous
                         // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
                         // — dont c'est tout l'objet — réécrivait sous l'adresse
@@ -1728,7 +1862,18 @@ async fn batch_enrich_artist_artwork_inner(
             }
         }
 
-        match fetch_artist_image(&mbid, name, discogs_token.as_deref(), &lastfm_key).await {
+        // #4837 : une image rejetée par l'utilisateur ne revient pas, de
+        // quelque source qu'elle vienne.
+        let refusees = empreintes_rejetees(&db, *artist_id, &mbid);
+        match fetch_artist_image(
+            &mbid,
+            name,
+            discogs_token.as_deref(),
+            &lastfm_key,
+            &refusees,
+        )
+        .await
+        {
             Some(data) => {
                 // Adressage par le CONTENU (#1444), plus par l'identité de
                 // l'artiste. L'ancienne clé était `artist-mbid-{mbid}`, sinon
@@ -1856,13 +2001,17 @@ async fn batch_enrich_artist_artwork_inner(
                 let artist_repo = &artist_repo;
                 let discogs_token = discogs_token.as_deref();
                 let lastfm_key = lastfm_key.as_str();
+                // #4837 : ni Discogs ni Last.fm ne reposent une image rejetée.
+                let refusees = empreintes_rejetees(&db, artist_id, "");
                 async move {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                     // Try Discogs first
                     if discogs_available {
                         if let Some(data) =
-                            fetch_artist_image_discogs(client, &name, discogs_token).await
+                            fetch_artist_image_discogs(client, &name, discogs_token)
+                                .await
+                                .and_then(|d| image_retenue(d, &refusees))
                         {
                             // Adressage par le CONTENU (#1444) : deux artistes
                             // homonymes ne partagent plus une seule adresse.
@@ -1879,7 +2028,9 @@ async fn batch_enrich_artist_artwork_inner(
                     if lastfm_available {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         if let Some(data) =
-                            fetch_artist_image_lastfm(client, &name, lastfm_key).await
+                            fetch_artist_image_lastfm(client, &name, lastfm_key)
+                                .await
+                                .and_then(|d| image_retenue(d, &refusees))
                         {
                             // Adressage par le CONTENU (#1444), même raison
                             // qu'au passage Discogs juste au-dessus.
@@ -2275,6 +2426,10 @@ pub fn backfill_embedded_covers(
     }
     filled
 }
+
+#[cfg(test)]
+#[path = "image_rejetee_tests_4837.rs"]
+mod image_rejetee_tests_4837;
 
 #[cfg(test)]
 mod tests {
