@@ -184,6 +184,47 @@ pub fn forget_withheld(settings: &SettingsRepo, id: &str) -> Result<(), String> 
     }
     Ok(())
 }
+/// Clé du refus du bandeau « Réinstaller » (#4861). Sa valeur liste, séparés
+/// par des virgules, les greffons payants que l'utilisateur a choisi
+/// d'ignorer. Aucune route ne l'efface : une réinstallation puis une
+/// désinstallation ultérieures ne rouvrent pas le bandeau.
+pub const REINSTALL_DISMISSED: &str = "premium_audio_plugins_reinstall_dismissed";
+fn reinstall_dismissed(settings: &SettingsRepo) -> Result<Vec<&'static str>, String> {
+    let raw = settings.get(REINSTALL_DISMISSED)?.unwrap_or_default();
+    Ok(IDS
+        .into_iter()
+        .filter(|id| raw.split(',').any(|d| d.trim() == *id))
+        .collect())
+}
+/// Bandeau « Réinstaller » (#4861) : les greffons payants non installés que
+/// l'utilisateur n'a pas refusés. Le droit Premium n'est PAS jugé ici :
+/// l'appelant filtre par licence, comme la route d'installation.
+///
+/// Une installation touchée par l'ancienne migration ne se distingue pas d'une
+/// désinstallation native (mêmes drapeaux `false`) : on ne répare rien
+/// d'office, on propose, et l'utilisateur tranche.
+pub fn reinstall_candidates(settings: &SettingsRepo) -> Result<Vec<&'static str>, String> {
+    let dismissed = reinstall_dismissed(settings)?;
+    Ok(IDS
+        .into_iter()
+        .filter(|id| requires_premium(id) && !installed(settings, id) && !dismissed.contains(id))
+        .collect())
+}
+/// « Ignorer » : mémorise le refus pour ces greffons payants. Les identifiants
+/// inconnus ou gratuits sont écartés. Rend la liste complète des refus.
+pub fn dismiss_reinstall(
+    settings: &SettingsRepo,
+    ids: &[String],
+) -> Result<Vec<&'static str>, String> {
+    let mut dismissed = reinstall_dismissed(settings)?;
+    for id in IDS {
+        if requires_premium(id) && ids.iter().any(|i| i == id) && !dismissed.contains(&id) {
+            dismissed.push(id);
+        }
+    }
+    settings.set(REINSTALL_DISMISSED, &dismissed.join(","))?;
+    Ok(dismissed)
+}
 fn propose_install_if_configured(settings: &SettingsRepo, id: &str) -> Result<(), String> {
     if settings.get(&format!("plugin_{id}_installed"))?.is_some() {
         return Ok(());
