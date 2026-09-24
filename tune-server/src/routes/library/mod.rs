@@ -20,6 +20,7 @@ mod genres;
 // LA définition du genre, partagée avec `/dashboard/stats` (#4527) : une seule
 // fonction, pour que « Genres » et « Genres écoutés » se comparent.
 pub(crate) use genres::genres_de_l_album;
+mod identification_lot;
 mod ingest;
 mod lyrics_pass;
 mod proposals;
@@ -474,6 +475,18 @@ pub fn router() -> Router<AppState> {
         .route("/ratings/import", post(ratings::import_ratings))
         .route("/enrich-all", post(enrich::enrich_all_library))
         .route("/enrich-all/status", get(enrich::enrich_all_status))
+        // #4805 — le pilote de lot de l'identification. Le travail par album
+        // existait depuis #2128 (`/albums/{id}/reidentify`), sans personne pour
+        // l'enchaîner. Deux routes seulement : lancer, et regarder. L'arrêt
+        // passe par le registre des tâches de fond, sous `identification`.
+        .route(
+            "/identify-all",
+            post(identification_lot::identification_lot_start),
+        )
+        .route(
+            "/identify-all/status",
+            get(identification_lot::identification_lot_status),
+        )
         .route("/write-tags", post(write_tags::write_tags_to_files))
         .route("/write-tags/status", get(write_tags::write_tags_status))
         // Graver le Dynamic Range calculé par Tune dans les fichiers (16/09/2026).

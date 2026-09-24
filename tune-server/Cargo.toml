@@ -934,3 +934,20 @@ path = "tests/crossfeed_reglable_zone_reseau_2742.rs"
 [[test]]
 name = "collections_albums_manquants_901"
 path = "tests/collections_albums_manquants_901.rs"
+
+# #4805 — le pilote de lot de l'identification. `autotests = false` en tête de
+# ce manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et le
+# témoin du refus Premium ne serait exécuté par personne — ni en local, ni en CI.
+[[test]]
+name = "identification_lot_4805"
+path = "tests/identification_lot_4805.rs"
+
+# 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
+# été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
+# le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne
+# que le pilote de lot appelle désormais album par album — était donc gardé par
+# un banc que personne n'exécutait, ni en local ni en CI. Il l'est maintenant,
+# et il sert de garde de non-régression au découpage de `identifier_album`.
+[[test]]
+name = "reidentification_album"
+path = "tests/reidentification_album.rs"
