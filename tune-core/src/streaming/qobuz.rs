@@ -2138,6 +2138,13 @@ impl StreamingService for QobuzService {
     /// Le plafond se compte à partir du curseur — `offset=500&limit=200` rend
     /// les 200 suivants, il ne rend pas zéro sous prétexte que 500 est déjà le
     /// plafond d'une requête.
+    /// Le plafond de Qobuz est celui de [`plafond_recherche`] — 500 par
+    /// catégorie, `0` valant « Tous » —, pas celui des services sans
+    /// pagination (#4803).
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        plafond_recherche(limit)
+    }
+
     async fn search_page(
         &self,
         query: &str,
