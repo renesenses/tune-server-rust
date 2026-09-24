@@ -5,6 +5,7 @@ pub mod batch;
 pub mod bio_batch;
 pub mod coffrets;
 pub mod credits_mb;
+pub mod credits_release;
 pub mod disques_abimes;
 pub mod enrich_scope;
 pub mod enrichment;
