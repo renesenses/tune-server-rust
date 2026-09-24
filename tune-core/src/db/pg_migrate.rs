@@ -601,7 +601,7 @@ CREATE TABLE IF NOT EXISTS ignored_devices (
 );
 
 -- Dossiers de collections (#4853). Tout en TEXT, comme le reste de ce
--- schéma : la copie lie chaque valeur SQLite en texte. La migration 070
+-- schéma : la copie lie chaque valeur SQLite en texte. La migration 071
 -- convertit ensuite les colonnes entières en BIGINT (conversion gardée sur le
 -- type courant, patron 038).
 CREATE TABLE IF NOT EXISTS collection_folders (

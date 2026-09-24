@@ -717,8 +717,8 @@ mod tests {
     }
 
     /// Le même dépôt sur un VRAI PostgreSQL, par les DEUX naissances d'une
-    /// base : installation native (la 070 sur une base nue) et bascule depuis
-    /// SQLite (`PG_FULL_SCHEMA` tout-TEXT, puis la 070 qui convertit). SQLite
+    /// base : installation native (la 071 sur une base nue) et bascule depuis
+    /// SQLite (`PG_FULL_SCHEMA` tout-TEXT, puis la 071 qui convertit). SQLite
     /// tolère ce que PostgreSQL refuse : `text = bigint` n'existe pas.
     #[cfg(feature = "postgres")]
     #[tokio::test(flavor = "multi_thread")]
@@ -728,7 +728,7 @@ mod tests {
             return;
         };
         const MIGRATION: &str =
-            include_str!("../../migrations/postgres/070_collection_folders.sql");
+            include_str!("../../migrations/postgres/071_collection_folders.sql");
         const SCHEMA_VERSION: &str = "CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY, name TEXT, applied_at TIMESTAMPTZ DEFAULT now())";
 
@@ -804,7 +804,7 @@ mod tests {
         )));
         pool.close().await;
 
-        // 2. Bascule SQLite -> PostgreSQL : tout-TEXT, une ligne copiée, puis 070.
+        // 2. Bascule SQLite -> PostgreSQL : tout-TEXT, une ligne copiée, puis 071.
         let pool = base(&url, "rayons_4853_bascule").await;
         sqlx::raw_sql(crate::db::pg_migrate::PG_FULL_SCHEMA)
             .execute(&pool)

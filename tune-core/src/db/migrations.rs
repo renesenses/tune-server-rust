@@ -2005,9 +2005,9 @@ CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_see
     //   la profondeur et le devenir du contenu d'un dossier supprime sont
     //   verifies par `collection_folder_repo`, seul chemin d'ecriture.
     //
-    // Jumelle PostgreSQL : 070_collection_folders.sql.
+    // Jumelle PostgreSQL : 071_collection_folders.sql.
     Migration {
-        version: 107,
+        version: 108,
         name: "collection_folders",
         up: "
 CREATE TABLE IF NOT EXISTS collection_folders (
@@ -3919,12 +3919,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "albums_type_de_sortie",
         include_str!("../../migrations/postgres/069_albums_type_de_sortie.sql"),
     ),
-    // Jumelle de la SQLite 107 (#4853). Numero libre verifie le 24/09/2026
-    // sur main ET sur chaque `batch/*` / `rc/*` ouvert : aucun ne porte de 70.
+    // Jumelle de la SQLite 108 (#4853). Renumerotee le 24/09/2026 (070 → 071,
+    // SQLite 107 → 108) a l'integration de la v0.9.164 : les credits MusicBrainz
+    // (#4767) avaient pris 107 / 070 le meme jour.
     (
-        70,
+        71,
         "collection_folders",
-        include_str!("../../migrations/postgres/070_collection_folders.sql"),
+        include_str!("../../migrations/postgres/071_collection_folders.sql"),
     ),
 ];
 
@@ -6154,8 +6155,8 @@ mod tests {
         // Pose `albums.release_type` — sans elle, aucune base PostgreSQL ne
         // recevrait la colonne que `album_repo::sql::select_album` NOMME
         // desormais, et TOUTES les requetes d'albums tomberaient sur ce parc.
-        // 70 : `collection_folders` (#4853), jumelle de la SQLite 107.
-        assert_eq!(pg_latest_version(), 70, "latest PG migration must be 70");
+        // 71 : `collection_folders` (#4853), jumelle de la SQLite 108.
+        assert_eq!(pg_latest_version(), 71, "latest PG migration must be 71");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

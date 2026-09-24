@@ -814,7 +814,7 @@ CREATE TABLE IF NOT EXISTS ignored_devices (
 CREATE INDEX IF NOT EXISTS idx_ignored_devices_mac ON ignored_devices(mac);
 CREATE INDEX IF NOT EXISTS idx_ignored_devices_host ON ignored_devices(host);
 
--- Dossiers de collections (#4853) — miroir de la migration SQLite 107. Voir
+-- Dossiers de collections (#4853) — miroir de la migration SQLite 108. Voir
 -- la migration pour la doctrine : `(kind, collection_id)` en clef primaire,
 -- une collection dans UN SEUL dossier, `NULL` = racine.
 CREATE TABLE IF NOT EXISTS collection_folders (

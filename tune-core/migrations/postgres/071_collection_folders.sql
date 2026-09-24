@@ -2,7 +2,7 @@
 -- DEUX sortes) dans un arbre de dossiers — #4853, Gros Bidon fil 1907.
 -- Décision de Bertrand du 24/09/2026 : arbre, profondeur maximale 3.
 --
--- Jumelle PostgreSQL de la migration SQLite 107. Voir celle-ci pour la
+-- Jumelle PostgreSQL de la migration SQLite 108. Voir celle-ci pour la
 -- doctrine complète ; l'essentiel :
 --
 -- * une ligne de rangement porte TOUJOURS la paire `(kind, collection_id)` :
