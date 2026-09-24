@@ -188,6 +188,22 @@ impl HostContext for HoteDeBanc {
         }
     }
 
+    // La permission `library` (#4716, appariement LOCAL) est arrivée dans le
+    // lot après ce greffon. Sa fiche ne la demande pas : le bac à sable refuse
+    // l'appel avant d'atteindre l'hôte, et ce banc ne doit donc jamais la voir.
+    fn library_search(&self, _query: &str, _limit: i64) -> Result<Value, String> {
+        Err("library : permission non demandée par ce greffon".to_string())
+    }
+    fn library_match_track(
+        &self,
+        _title: &str,
+        _artist: &str,
+        _isrc: &str,
+        _duration_ms: u64,
+    ) -> Result<Value, String> {
+        Err("library : permission non demandée par ce greffon".to_string())
+    }
+
     fn kv_get(&self, _plugin_id: &str, key: &str) -> Result<Value, String> {
         Ok(match self.kv.lock().unwrap().get(key) {
             Some(v) => json!({ "key": key, "found": true, "value": v }),
