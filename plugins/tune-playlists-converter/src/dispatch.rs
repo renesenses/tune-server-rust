@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::hote::Hote;
 use crate::modele::Demande;
 use crate::moteur::Convertisseur;
+use crate::snapshots::{RETENTION_PAR_PLAYLIST, Snapshots, mode};
 
 /// Router une requête. Ne rend jamais d'`Err` : une erreur est une réponse
 /// HTTP, pas un trap — un greffon qui trappe est marqué en erreur par l'hôte
@@ -83,6 +84,110 @@ pub fn repondre<H: Hote + ?Sized>(hote: &H, requete: &Value) -> Value {
             }
         }
 
+        // -- #4718 — snapshots ------------------------------------------------
+        ("POST", "/snapshot") => {
+            let service = texte(&corps, "service");
+            let playlist_id = texte(&corps, "playlist_id");
+            if service.is_empty() || playlist_id.is_empty() {
+                return reponse(
+                    400,
+                    json!({ "error": "service et playlist_id sont obligatoires" }),
+                );
+            }
+            let nom = corps.get("nom").and_then(Value::as_str);
+            match Snapshots::new(hote).prendre(&service, &playlist_id, nom, "manuel") {
+                Ok(e) => reponse(200, json!({ "snapshot": e })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("GET", "/snapshots") => {
+            let snapshots = Snapshots::new(hote);
+            let service = parametre(requete_query, "service");
+            let playlist_id = parametre(requete_query, "playlist_id");
+            if service.is_empty() && playlist_id.is_empty() {
+                return match snapshots.playlists() {
+                    Ok(p) => reponse(
+                        200,
+                        json!({
+                            "count": p.len(),
+                            "playlists": p,
+                            "retention_par_playlist": RETENTION_PAR_PLAYLIST,
+                        }),
+                    ),
+                    Err(e) => erreur(&e),
+                };
+            }
+            if service.is_empty() || playlist_id.is_empty() {
+                return reponse(
+                    400,
+                    json!({ "error": "?service= et ?playlist_id= vont ensemble" }),
+                );
+            }
+            match snapshots.lister(&service, &playlist_id) {
+                Ok(l) => reponse(
+                    200,
+                    json!({
+                        "count": l.len(),
+                        "snapshots": l,
+                        "retention_par_playlist": RETENTION_PAR_PLAYLIST,
+                    }),
+                ),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("GET", "/snapshot") => {
+            let id = parametre(requete_query, "id");
+            if id.is_empty() {
+                return reponse(400, json!({ "error": "paramètre ?id= manquant" }));
+            }
+            match Snapshots::new(hote).lire(&id) {
+                Ok(s) => reponse(200, json!({ "snapshot": s })),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/snapshot/restauration/apercu") => {
+            let snapshot_id = texte(&corps, "snapshot_id");
+            if snapshot_id.is_empty() {
+                return reponse(400, json!({ "error": "snapshot_id manquant" }));
+            }
+            let mode = corps
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or(mode::COMPLETER);
+            match Snapshots::new(hote).apercu_restauration(&snapshot_id, mode) {
+                Ok((plan, a_rajouter, a_retirer)) => reponse(
+                    200,
+                    json!({
+                        "plan": plan,
+                        "a_rajouter": a_rajouter,
+                        "a_retirer_par_vous": a_retirer,
+                    }),
+                ),
+                Err(e) => erreur(&e),
+            }
+        }
+
+        ("POST", "/snapshot/restauration") => {
+            let plan_id = texte(&corps, "plan_id");
+            if plan_id.is_empty() {
+                return reponse(400, json!({ "error": "plan_id manquant" }));
+            }
+            let accord = corps
+                .get("accord")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match Snapshots::new(hote).restaurer(&plan_id, accord) {
+                Ok((plan, a_retirer)) => reponse(
+                    200,
+                    json!({ "plan": plan, "a_retirer_par_vous": a_retirer }),
+                ),
+                Err(e) => erreur(&e),
+            }
+        }
+
         _ => reponse(
             404,
             json!({ "error": "route inconnue", "method": methode, "path": chemin }),
@@ -95,12 +200,19 @@ pub fn repondre<H: Hote + ?Sized>(hote: &H, requete: &Value) -> Value {
 fn erreur(message: &str) -> Value {
     let code = if message.starts_with("accord_requis") {
         409
-    } else if message.starts_with("lot_inconnu") {
+    } else if message.starts_with("lot_inconnu")
+        || message.starts_with("snapshot_inconnu")
+        || message.starts_with("snapshot_expire")
+        || message.starts_with("plan_inconnu")
+    {
         404
     } else if message.starts_with("lot_deja_engage")
+        || message.starts_with("plan_deja_engage")
         || message.starts_with("cible_locale_non_supportee")
     {
         409
+    } else if message.starts_with("demande_invalide") {
+        400
     } else {
         502
     };
@@ -118,14 +230,41 @@ fn texte(v: &Value, cle: &str) -> String {
         .to_string()
 }
 
-/// Lire un paramètre de la chaîne de requête. Pas de décodage d'échappement :
-/// les identifiants de lot sont `lot-<n>`, et un identifiant qui aurait besoin
-/// d'être échappé n'est pas un identifiant de lot.
+/// Lire un paramètre de la chaîne de requête, décodé (`%XX` et `+`).
+///
+/// Les identifiants de lot (`lot-<n>`) n'en ont pas besoin, mais un
+/// identifiant de playlist de service (#4718) peut porter n'importe quoi : il
+/// arrive encodé par `encodeURIComponent` côté client.
 fn parametre(query: &str, nom: &str) -> String {
     query
         .split('&')
         .filter_map(|p| p.split_once('='))
         .find(|(k, _)| *k == nom)
-        .map(|(_, v)| v.to_string())
+        .map(|(_, v)| decoder(v))
         .unwrap_or_default()
+}
+
+fn decoder(v: &str) -> String {
+    let octets = v.as_bytes();
+    let mut sortie = Vec::with_capacity(octets.len());
+    let mut i = 0;
+    while i < octets.len() {
+        match octets[i] {
+            b'+' => sortie.push(b' '),
+            b'%' if i + 2 < octets.len() => match (hexa(octets[i + 1]), hexa(octets[i + 2])) {
+                (Some(h), Some(l)) => {
+                    sortie.push(h * 16 + l);
+                    i += 2;
+                }
+                _ => sortie.push(b'%'),
+            },
+            b => sortie.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&sortie).into_owned()
+}
+
+fn hexa(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
 }

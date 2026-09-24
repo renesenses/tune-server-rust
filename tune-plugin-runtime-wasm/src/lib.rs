@@ -222,6 +222,21 @@ pub trait HostContext: Send + Sync {
     /// `kv` — lister les clés du greffon commençant par `prefix` (sans le
     /// préfixe de cloisonnement, qu'un greffon n'a jamais à connaître).
     fn kv_list(&self, plugin_id: &str, prefix: &str) -> Result<serde_json::Value, String>;
+
+    /// L'heure de l'hôte, en millisecondes depuis l'époque Unix (#4718).
+    ///
+    /// Un greffon `wasm32-unknown-unknown` n'a pas d'horloge : sans elle, un
+    /// snapshot ne peut pas être « daté » et un lien de synchronisation ne sait
+    /// pas quand il est dû. Toujours autorisée, comme `log` : lire l'heure ne
+    /// lit ni n'écrit rien de l'utilisateur. Méthode par défaut pour que les
+    /// hôtes existants n'aient rien à changer ; un banc d'essai la remplace
+    /// pour piloter le temps.
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
 }
 
 /// A [`HostContext`] that grants nothing useful: `log`/`emit` are no-ops and
@@ -594,6 +609,24 @@ fn register_host_imports(linker: &mut Linker<StoreData>) -> Result<(), String> {
             },
         )
         .map_err(|e| format!("register host_log: {e}"))?;
+
+    // Toujours autorisée : l'heure de l'hôte (#4718). Un greffon wasm n'a pas
+    // d'horloge ; lire l'heure ne touche à rien de l'utilisateur. L'entrée est
+    // ignorée — la signature reste `(i32, i32) -> i64` comme toutes les autres
+    // pour que le greffon n'ait qu'une seule façon d'appeler l'hôte.
+    linker
+        .func_wrap(
+            "tune",
+            "host_now",
+            |mut caller: Caller<'_, StoreData>,
+             _ptr: i32,
+             _len: i32|
+             -> Result<i64, wasmtime::Error> {
+                let now_ms = caller.data().ctx.now_ms();
+                guest_write_json(&mut caller, &serde_json::json!({ "now_ms": now_ms }))
+            },
+        )
+        .map_err(|e| format!("register host_now: {e}"))?;
 
     // `queue`
     linker
@@ -2355,6 +2388,7 @@ mod tests {
 
         let mut attendus: Vec<String> = [
             "host_log",
+            "host_now",
             "host_queue_get",
             "host_queue_add",
             "host_now_playing",
@@ -2384,6 +2418,145 @@ mod tests {
         assert_eq!(
             noms, attendus,
             "la surface hôte doit être exactement celle-ci"
+        );
+    }
+
+    /// #4718 — `host_now` rend l'heure de l'hôte SANS permission : un greffon
+    /// qui n'a rien reçu peut quand même dater un snapshot. Le banc fixe
+    /// l'heure pour prouver que c'est bien celle de l'hôte, pas une constante.
+    #[test]
+    fn host_now_rend_l_heure_de_l_hote_sans_permission_4718() {
+        struct Horloge;
+        impl HostContext for Horloge {
+            fn log(&self, _level: &str, _msg: &str) {}
+            fn queue_get(&self, _zone: i64) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn queue_add(
+                &self,
+                _zone: i64,
+                _tracks: serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn now_playing(&self, _zone: i64) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn play(
+                &self,
+                _zone: i64,
+                _req: serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn pause(&self, _zone: i64) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn emit(&self, _event: &str, _payload: serde_json::Value) {}
+            fn playlists_list(&self, _l: i64, _o: i64) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn playlist_tracks(&self, _id: i64) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn playlist_create(
+                &self,
+                _name: &str,
+                _d: Option<&str>,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn playlist_add_tracks(
+                &self,
+                _id: i64,
+                _ids: Vec<i64>,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn streaming_services(&self) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn streaming_playlists(&self, _s: &str) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn streaming_playlist_tracks(
+                &self,
+                _s: &str,
+                _p: &str,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn streaming_playlist_create(
+                &self,
+                _s: &str,
+                _n: &str,
+                _d: Option<&str>,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn streaming_playlist_add_tracks(
+                &self,
+                _s: &str,
+                _p: &str,
+                _ids: Vec<String>,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn streaming_match_track(
+                &self,
+                _s: &str,
+                _t: &str,
+                _a: &str,
+                _i: &str,
+                _d: u64,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn library_search(&self, _q: &str, _l: i64) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn library_match_track(
+                &self,
+                _t: &str,
+                _a: &str,
+                _i: &str,
+                _d: u64,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn kv_get(&self, _g: &str, _k: &str) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn kv_set(
+                &self,
+                _g: &str,
+                _k: &str,
+                _v: serde_json::Value,
+            ) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn kv_list(&self, _g: &str, _p: &str) -> Result<serde_json::Value, String> {
+                Err(String::new())
+            }
+            fn now_ms(&self) -> u64 {
+                1_758_700_000_000
+            }
+        }
+
+        let mut plugin = WasmPlugin::from_bytes_with_host(
+            appel_hote_wat("host_now", "{}"),
+            Limits::default(),
+            Arc::new(Horloge) as Arc<dyn HostContext>,
+            HashSet::new(),
+            GREFFON_ESSAI,
+        )
+        .expect("charger");
+        let rendu: serde_json::Value =
+            serde_json::from_str(&plugin.dispatch("{}").expect("dispatch")).expect("JSON");
+        assert_eq!(
+            rendu,
+            serde_json::json!({ "now_ms": 1_758_700_000_000u64 }),
+            "host_now doit rendre l'heure de l'hôte, sans aucune permission"
         );
     }
 }

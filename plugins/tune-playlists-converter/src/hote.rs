@@ -23,8 +23,19 @@ pub trait Hote {
     /// Journal de diagnostic. Toujours autorisé, aucune permission.
     fn journal(&self, niveau: &str, message: &str);
 
+    /// L'heure de l'hôte, en millisecondes Unix (`host_now`, #4718). Toujours
+    /// autorisée : un greffon wasm n'a pas d'horloge, et un snapshot doit être
+    /// daté. `0` si l'hôte ne répond pas — un snapshot daté de 1970 se voit,
+    /// un greffon qui s'arrête faute d'heure ne se voit pas.
+    fn maintenant_ms(&self) -> u64;
+
     // -- permission `playlists` : la bibliothèque locale -------------------
     fn playlist_tracks(&self, playlist_id: i64) -> Result<Value, String>;
+    /// Créer une playlist LOCALE (#4718 : restaurer un snapshot local). Jamais
+    /// en effacer une : la capacité n'existe pas.
+    fn playlist_create(&self, name: &str, description: Option<&str>) -> Result<Value, String>;
+    /// AJOUTER des pistes à une playlist locale.
+    fn playlist_add_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<Value, String>;
 
     // -- permission `streaming` : les services ------------------------------
     fn streaming_playlists(&self, service: &str) -> Result<Value, String>;

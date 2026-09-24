@@ -32,7 +32,10 @@ unsafe extern "C" {
     /// `{"level": "...", "msg": "..."}` — comme toutes les autres, en JSON.
     /// Elle est la seule à ne rien rendre.
     fn host_log(ptr: u32, len: u32);
+    fn host_now(ptr: u32, len: u32) -> u64;
     fn host_playlist_tracks(ptr: u32, len: u32) -> u64;
+    fn host_playlist_create(ptr: u32, len: u32) -> u64;
+    fn host_playlist_add_tracks(ptr: u32, len: u32) -> u64;
     fn host_streaming_playlists(ptr: u32, len: u32) -> u64;
     fn host_streaming_playlist_tracks(ptr: u32, len: u32) -> u64;
     fn host_streaming_playlist_create(ptr: u32, len: u32) -> u64;
@@ -139,10 +142,31 @@ impl Hote for HoteWasm {
         }
     }
 
+    fn maintenant_ms(&self) -> u64 {
+        appel(host_now, &serde_json::json!({}))
+            .ok()
+            .and_then(|v| v.get("now_ms").and_then(Value::as_u64))
+            .unwrap_or(0)
+    }
+
     fn playlist_tracks(&self, playlist_id: i64) -> Result<Value, String> {
         appel(
             host_playlist_tracks,
             &serde_json::json!({ "playlist_id": playlist_id }),
+        )
+    }
+
+    fn playlist_create(&self, name: &str, description: Option<&str>) -> Result<Value, String> {
+        appel(
+            host_playlist_create,
+            &serde_json::json!({ "name": name, "description": description }),
+        )
+    }
+
+    fn playlist_add_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<Value, String> {
+        appel(
+            host_playlist_add_tracks,
+            &serde_json::json!({ "playlist_id": playlist_id, "track_ids": track_ids }),
         )
     }
 

@@ -77,6 +77,10 @@ pub struct PlaylistDuLot {
     /// existe déjà**, une reprise ne doit pas en créer une seconde.
     #[serde(default)]
     pub cible_playlist_id: Option<String>,
+    /// Le snapshot de la playlist visée pris AVANT le premier titre versé
+    /// (#4718). Présent ⇒ la copie existe, une reprise n'en reprend pas.
+    #[serde(default)]
+    pub snapshot_avant: Option<String>,
     /// Les identifiants CIBLE déjà versés. Une reprise ne repasse pas dessus.
     #[serde(default)]
     pub versees: Vec<String>,

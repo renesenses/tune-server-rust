@@ -11,6 +11,7 @@
 //! | Aperçu obligatoire, rien d'écrit sans accord explicite | [`moteur::Convertisseur::apercu`] / [`moteur::Convertisseur::transferer`] |
 //! | Rapport : transférés, introuvables, raison | [`modele::PlaylistDuLot`], [`appariement::Raison`] |
 //! | Reprise sans recréer | [`modele::PlaylistDuLot::restant_a_verser`] |
+//! | Snapshot daté avant tout transfert, retour en arrière SANS suppression (#4718) | [`snapshots`] |
 //!
 //! # L'appariement (Bertrand, 22/09/2026)
 //!
@@ -35,6 +36,7 @@ pub mod dispatch;
 pub mod hote;
 pub mod modele;
 pub mod moteur;
+pub mod snapshots;
 
 #[cfg(target_arch = "wasm32")]
 mod abi;
@@ -43,3 +45,5 @@ mod abi;
 mod banc;
 #[cfg(test)]
 mod essais;
+#[cfg(test)]
+mod essais_snapshots;
