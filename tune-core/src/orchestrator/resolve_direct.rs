@@ -36,7 +36,8 @@ impl PlaybackOrchestrator {
     /// Mêmes conventions que `dlna_supports_mime` : une sortie absente du
     /// registre est présumée capable (elle n'est pas là pour dire le
     /// contraire), une sortie qui n'est pas un `DlnaOutput` n'a pas de Sink à
-    /// lire donc répond NON, et une sonde inconcluante répond NON sans être
+    /// lire : sa réponse vient de son TYPE (#4894), et une sonde
+    /// inconcluante répond NON sans être
     /// mise en cache — la lecture suivante re-sonde. Les réponses concluantes
     /// sont mémorisées par renderer : une sonde SOAP par session, pas par
     /// morceau.
@@ -51,8 +52,9 @@ impl PlaybackOrchestrator {
             return *connu;
         }
         let arc = { self.outputs.lock().await.get(device_id) };
+        // #4894 — les deux replis sans sonde passent par la réponse par type.
         let Some(output) = arc else {
-            return true;
+            return super::capacite_lpcm_par_sortie::repli_sans_sonde(None, hi_res);
         };
         let caps = {
             let locked = output.lock().await;
@@ -60,7 +62,8 @@ impl PlaybackOrchestrator {
                 .as_any()
                 .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
             else {
-                return false;
+                let t = locked.output_type();
+                return super::capacite_lpcm_par_sortie::repli_sans_sonde(Some(t), hi_res);
             };
             dlna.probe_capabilities().await
         };
