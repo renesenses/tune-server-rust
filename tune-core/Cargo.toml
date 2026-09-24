@@ -595,3 +595,11 @@ path = "tests/canaux_reseau_repli_4573.rs"
 [[test]]
 name = "canaux_reseau_branchement_4573"
 path = "tests/canaux_reseau_branchement_4573.rs"
+
+# #2742 — le motif `network_renderer_no_lpcm` MESURÉ dans les octets servis :
+# vrai serveur SOAP sans LPCM, vraie zone, vraie file, diaphonie du fichier
+# servi. `autotests = false` en tête de ce manifeste : sans cette cible, le
+# fichier ne serait JAMAIS compilé et la porte rendrait un vert contre rien.
+[[test]]
+name = "crossfeed_renderer_sans_lpcm_2742"
+path = "tests/crossfeed_renderer_sans_lpcm_2742.rs"
