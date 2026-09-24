@@ -132,13 +132,88 @@ Les actifs sont préparés avant de déplacer un canal public. Une reprise utili
 le même tag et le même numéro ; un incident d'infrastructure ne consomme pas
 une nouvelle version.
 
-## 5. Notes de version multilingues
+## 5. Notes de version
 
 Arbitrage de #3089 : les notes de version sont **traduites à la publication**,
 et `GET /system/changelog` sert la langue demandée (`?lang=xx`, sinon
 `Accept-Language`, sinon `fr`). Ni français assumé, ni traduction à la volée.
 
-### Format : un bloc par langue dans le corps de la release GitHub
+### 5.1 Forme A : les puces d'abord, le détail après
+
+**Décision de Bertrand, 23/09/2026.** Toute note de version **ouvre** par les
+trois rubriques que le panneau sait lire, chacune avec **5 à 8 puces d'une
+ligne**, **sans numéro d'issue** — le dépôt est privé, ces renvois ne mènent
+nulle part pour un testeur. La prose vient après, sous `## Le détail`, aussi
+longue qu'on veut.
+
+```markdown
+# Tune v0.9.163
+
+## Nouveautés
+- Une zone réseau se répare seule quand son appareil revient
+- …
+
+## Améliorations
+- Le tableau de bord s'affiche en moins d'une seconde
+- …
+
+## Corrections
+- Le son ne descend plus de 28 dB sans raison
+- …
+
+## Le détail
+
+Le chapeau, les tableaux de mesures, les explications — tout ce qui se lit
+sur le forum et que le panneau ne montrera pas.
+```
+
+**Pourquoi.** Le 23/09/2026, le panneau de mise à jour rendait **vingt entrées
+sur vingt réduites à « Release 0.9.x »**, sans un seul item, alors que chaque
+version avait son fil et que `notes-de-version-watch` était verte. La cause
+n'est pas un défaut de code : `parse_release_body` ne retient que les **puces**
+sous un titre reconnu, et nos notes étaient de la prose sous des titres
+thématiques (« L'égaliseur », « Le tableau de bord »). La règle était déjà
+écrite plus bas dans cette section ; il n'y avait **aucune garde** pour la
+tenir (#4190).
+
+⛔ **Les notes déjà publiées ne sont pas réécrites.** La forme vaut pour les
+prochaines.
+
+### 5.2 Vérifier — avant, puis après
+
+**Avant de publier**, hors réseau, sur le fichier de notes :
+
+```sh
+.github/scripts/notes-de-version-watch.sh --forme notes-v0.9.163.md
+```
+
+Il rejoue le découpage exact du serveur
+(`.github/scripts/forme-des-notes.awk`, copie gardée de `parse_release_body`)
+et compte les items que le panneau affichera. Moins de `ITEMS_MINIMUM` (5),
+il refuse et rappelle la forme. Il dit aussi quelles langues la note couvre.
+
+**Après publication**, la seule preuve qui vaille est la réponse de la route :
+
+```sh
+curl -s 'http://192.168.1.18:8888/api/v1/system/changelog?lang=fr' \
+  | jq '.entries[0] | {version, features, improvements, fixes}'
+```
+
+L'entrée de tête doit porter des **items réels**. `"features": ["Release
+0.9.163"]` et deux listes vides est le symptôme exact de #4190 : la note est
+publiée, le testeur ne voit rien. Le corps se corrige **sans retaguer** —
+`gh release edit v0.9.163 --notes-file notes.md` — et le panneau suit au plus
+tard une heure après (cache de la route).
+
+Contrôler aussi une langue traduite : `?lang=en` doit rendre `"lang": "en"` et
+`"fallback": false`. `"fallback": true` signifie que la note ne porte pas de
+bloc pour cette langue et que le français a été servi à sa place.
+
+La sonde horaire `notes-de-version-watch` reprend ce contrôle sur les cinq
+dernières versions publiées **à partir du 23/09/2026** (`FORME_DEPUIS`) et
+ouvre l'issue de veille si l'une d'elles ne rend rien.
+
+### 5.3 Format : un bloc par langue dans le corps de la release GitHub
 
 Le corps de la release reste un seul texte Markdown. Le **français vient en
 premier, sans marqueur**, exactement comme il a toujours été écrit. Chaque
@@ -169,7 +244,14 @@ d'actifs, sur un dépôt privé qui exige un jeton). Le commentaire HTML est
 invisible sur la page GitHub, traverse le proxy comme du texte, et se produit
 avec le même `gh release edit vX.Y.Z --notes-file notes.md` que le français.
 
-### Règles de lecture côté serveur (`tune-server/src/routes/system/update.rs`)
+⚠️ **État mesuré au 23/09/2026 : aucune note publiée ne porte de marqueur.**
+Le format ci-dessus est en service côté serveur et testé, mais l'étape de
+traduction décrite en 5.5 n'est pas branchée : `?lang=en` — et les huit autres
+langues — rend du français avec `fallback: true`. Ce n'est pas une panne, c'est
+le comportement prévu en l'absence de bloc ; c'est simplement le chantier qui
+reste. Le contrôle `--forme` le rappelle à chaque note.
+
+### 5.4 Règles de lecture côté serveur (`tune-server/src/routes/system/update.rs`)
 
 - Marqueur : `<!-- lang:xx -->`, espaces et casse tolérés, région ignorée
   (`<!--lang:EN-GB-->` vaut `en`). Tout autre commentaire HTML est du texte.
@@ -183,7 +265,7 @@ avec le même `gh release edit vX.Y.Z --notes-file notes.md` que le français.
 - Un bloc vide (marqueur laissé sans texte) ne couvre pas sa langue : elle
   replie sur le français.
 
-### Titres de rubriques reconnus
+### 5.5 Titres de rubriques reconnus
 
 Le panneau ne connaît que trois rubriques ; les puces d'une section dont le
 titre n'est pas reconnu sont **ignorées** (c'est voulu : « Mise à jour »,
@@ -209,7 +291,7 @@ titres n'en sont jamais. Une note faite de paragraphes sous des titres
 thématiques (« Lecture », « Bibliothèque ») donne un panneau réduit à
 « Release x.y.z » — dans toutes les langues.
 
-### Ce que le train doit produire
+### 5.6 Ce que le train doit produire
 
 Une étape **outillée** de traduction, entre la rédaction française et la
 publication du corps de la release, qui assemble `fr` + blocs `<!-- lang:xx -->`

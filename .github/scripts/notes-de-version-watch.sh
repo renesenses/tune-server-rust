@@ -36,11 +36,132 @@
 #   FENETRE_HEURES          profondeur d'examen en arriere (72)
 #   MAINTENANT_ISO          instant de reference UTC — pour les tests uniquement
 #   SANS_ISSUE              a 1, n'ouvre aucune issue : diagnostic seul
+#   ITEMS_MINIMUM           items attendus d'une note, forme A (5)
+#   FORME_DEPUIS            date a partir de laquelle la forme A est exigee
+#                           (2026-09-23 — decision de Bertrand ; les notes
+#                           publiees avant ne sont PAS reecrites)
+#   FORME_COMBIEN           nombre de notes recentes examinees au plus (5)
 #
 # Sortie : 0 si tout est annonce (ou si le forum est injoignable), 1 si au moins
-# une version publiee n'a pas de fil.
+# une version publiee n'a pas de fil, ou rend une note illisible par le panneau.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Le second controle : la FORME de la note (#4190)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Un fil existe ne veut pas dire que le testeur voit quelque chose. Le
+# 23/09/2026, le panneau de mise a jour de Tune rendait VINGT entrees sur vingt
+# reduites a « Release 0.9.x », sans un seul item — alors que chaque version
+# avait son fil, et que cette sonde etait verte.
+#
+# La cause n'est pas un defaut de code : `parse_release_body` ne retient que
+# les PUCES placees sous un titre reconnu (Nouveautes / Ameliorations /
+# Corrections), et nos notes sont de la prose sous des titres thematiques
+# (« L'egaliseur », « Le tableau de bord »). La regle etait deja ecrite dans
+# `docs/RELEASE-WORKFLOW.md` §5 — elle n'etait tenue par rien.
+#
+# Ce controle la tient. Il ne juge ni le style ni la longueur : il rejoue le
+# decoupage du serveur (`.github/scripts/forme-des-notes.awk`, copie conforme
+# gardee de `parse_release_body`) et compte ce que le panneau AFFICHERA.
+#
+# Deux bornes volontaires :
+#
+#   - il ne regarde que les versions publiees a partir de `FORME_DEPUIS`. Les
+#     notes deja publiees ne sont pas reecrites : la forme s'applique aux
+#     prochaines, et un controle retroactif ne ferait que crier sur ce qu'on
+#     s'est interdit de changer ;
+#   - le decompte porte sur le bloc FRANCAIS. Les puces d'un bloc traduit ne
+#     doivent pas masquer un francais reste en prose.
+#
+# Il s'utilise aussi AVANT publication, hors reseau, sur le fichier de notes :
+#
+#   .github/scripts/notes-de-version-watch.sh --forme notes-v0.9.163.md
+#
+# C'est la le vrai usage : constater apres coup vaut mieux que rien, refuser
+# avant de publier vaut mieux que constater.
 
 set -u
+
+ICI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LECTEUR_DE_FORME="$ICI/forme-des-notes.awk"
+ITEMS_MINIMUM="${ITEMS_MINIMUM:-5}"
+FORME_DEPUIS="${FORME_DEPUIS:-2026-09-23}"
+
+# `verifier_la_forme <etiquette> <fichier>` — 0 si la note rend assez d'items,
+# 1 sinon. Ecrit son verdict sur la sortie standard, dans les deux cas : un
+# controle qui ne dit rien quand il passe n'apprend a personne ce qu'il mesure.
+verifier_la_forme() {
+  local etiquette="$1" fichier="$2"
+  local sortie f a c total langues
+  if ! sortie=$(awk -f "$LECTEUR_DE_FORME" < "$fichier" 2>&1); then
+    printf '%s : lecture impossible — %s\n' "$etiquette" "$sortie"
+    return 1
+  fi
+  f=$(printf '%s\n' "$sortie" | awk -F'\t' '$1=="features"{print $2}')
+  a=$(printf '%s\n' "$sortie" | awk -F'\t' '$1=="improvements"{print $2}')
+  c=$(printf '%s\n' "$sortie" | awk -F'\t' '$1=="fixes"{print $2}')
+  langues=$(printf '%s\n' "$sortie" | awk -F'\t' '$1=="langues"{print $2}')
+  total=$(( f + a + c ))
+
+  # Le marqueur de langue n'est PAS une condition de succes : une note
+  # francaise seule est servie a tout le monde, en le disant (`fallback:true`).
+  # Mais l'absence se dit, sinon personne ne se souvient que neuf langues
+  # replient.
+  if [ "$langues" = "fr" ]; then
+    printf '%s : aucun marqueur <!-- lang:xx --> — les neuf autres langues recevront le francais, avec fallback:true (docs/RELEASE-WORKFLOW.md §5).\n' \
+      "$etiquette"
+  fi
+
+  if [ "$total" -lt "$ITEMS_MINIMUM" ]; then
+    printf '%s : %d item(s) pour le panneau (%d nouveautes, %d ameliorations, %d corrections)' \
+      "$etiquette" "$total" "$f" "$a" "$c"
+    printf ' — il en faut au moins %d.\n' "$ITEMS_MINIMUM"
+    return 1
+  fi
+  printf '%s : %d items (%d nouveautes, %d ameliorations, %d corrections) — langues : %s\n' \
+    "$etiquette" "$total" "$f" "$a" "$c" "$langues"
+  return 0
+}
+
+# Mode hors ligne : `--forme FICHIER…`. Aucun reseau, aucun jeton, aucune
+# issue — c'est le contrat qui le rend utilisable dans un pre-commit ou a la
+# main juste avant `gh release edit --notes-file`.
+if [ "${1:-}" = "--forme" ]; then
+  shift
+  if [ "$#" -eq 0 ]; then
+    echo "usage : $0 --forme FICHIER..." >&2
+    exit 2
+  fi
+  etat_forme=0
+  for fichier in "$@"; do
+    if [ ! -r "$fichier" ]; then
+      echo "fichier illisible : $fichier" >&2
+      etat_forme=1
+      continue
+    fi
+    verifier_la_forme "$fichier" "$fichier" || etat_forme=1
+  done
+  if [ "$etat_forme" -ne 0 ]; then
+    cat <<'AIDE'
+
+Forme attendue (docs/RELEASE-WORKFLOW.md §5, arbitrage du 23/09/2026) : la note
+OUVRE par les trois rubriques, 5 a 8 puces d'une ligne chacune, sans numero
+d'issue — le depot est prive, ces renvois ne menent nulle part pour un testeur.
+La prose suit sous « ## Le detail », et n'est jamais lue par le panneau.
+
+    ## Nouveautes
+    - …
+    ## Ameliorations
+    - …
+    ## Corrections
+    - …
+
+    ## Le detail
+    …
+AIDE
+  fi
+  exit "$etat_forme"
+fi
 
 # `per_page=100` n'est pas un detail de confort. Sans lui, l'API rend 50 fils —
 # dont sept epingles qui remontent a mai — et la page ne redescend qu'a trois
@@ -244,23 +365,74 @@ if [ "$ETAT_PYTHON" -ne 0 ]; then
   exit 1
 fi
 
-if [ -z "$MANQUANTES" ]; then
+# --- 3 bis. La forme des notes (#4190) ----------------------------------------
+#
+# Un fil existe ne prouve pas qu'on y lit quelque chose. On rejoue ici, sur le
+# corps de chaque release RECENTE de Tune, le decoupage exact du serveur, et on
+# compte les items que le panneau affichera.
+#
+# `FORME_DEPUIS` borne le controle aux notes ecrites sous la regle : les notes
+# anterieures ne sont pas reecrites (decision du 23/09/2026), donc crier
+# dessus n'apprendrait rien et rendrait la sonde rouge a perpetuite.
+FORME_KO=""
+CANDIDATES=$(jq -r --arg depuis "$FORME_DEPUIS" '
+  .[]
+  | select((.isDraft | not) and (.isPrerelease | not))
+  | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+  | select((.publishedAt // "") >= $depuis)
+  | .tagName
+' "$RELEASES" 2>/dev/null | head -n "${FORME_COMBIEN:-5}")
+
+if [ -n "$CANDIDATES" ]; then
+  echo "Forme des notes (items que le panneau affichera) :"
+  while IFS= read -r tag; do
+    [ -n "$tag" ] || continue
+    if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body -q .body \
+           > "$TRAVAIL/corps-$tag.md" 2>/dev/null; then
+      echo "  $tag : corps illisible — non juge."
+      continue
+    fi
+    if ! verifier_la_forme "  $tag" "$TRAVAIL/corps-$tag.md"; then
+      FORME_KO="${FORME_KO}${tag}"$'\n'
+    fi
+  done <<< "$CANDIDATES"
+fi
+FORME_KO=$(printf '%s' "$FORME_KO" | sed '/^$/d')
+
+if [ -z "$MANQUANTES" ] && [ -z "$FORME_KO" ]; then
   echo "OK — aucune version publiee sans note de version."
   exit 0
 fi
 
-echo "Versions publiees sans fil de notes :"
-echo "$MANQUANTES"
+[ -n "$MANQUANTES" ] && { echo "Versions publiees sans fil de notes :"; echo "$MANQUANTES"; }
+[ -n "$FORME_KO" ] && { echo "Notes illisibles par le panneau :"; echo "$FORME_KO"; }
 
 # --- 4. Le cri ----------------------------------------------------------------
 {
   printf 'Detecte par `notes-de-version-watch` le %s.\n\n' \
     "$(date -u '+%Y-%m-%d a %H:%M UTC')"
-  printf 'Ces versions sont **publiees sur GitHub** et **sans fil de notes sur le forum** :\n\n'
-  printf '| Version | Publiee le | Depuis |\n|---|---|---|\n'
-  printf '%s\n' "$MANQUANTES" | while IFS=$'\t' read -r tag quand heures; do
-    printf '| `%s` | %s | %s h |\n' "$tag" "$quand" "$heures"
-  done
+  if [ -n "$MANQUANTES" ]; then
+    printf 'Ces versions sont **publiees sur GitHub** et **sans fil de notes sur le forum** :\n\n'
+    printf '| Version | Publiee le | Depuis |\n|---|---|---|\n'
+    printf '%s\n' "$MANQUANTES" | while IFS=$'\t' read -r tag quand heures; do
+      printf '| `%s` | %s | %s h |\n' "$tag" "$quand" "$heures"
+    done
+    printf '\n'
+  fi
+  if [ -n "$FORME_KO" ]; then
+    printf 'Ces notes existent mais le **panneau de mise a jour n en tire rien** :\n'
+    printf 'moins de %s items apres le decoupage de `parse_release_body`, donc\n' "$ITEMS_MINIMUM"
+    printf 'une entree reduite a « Release x.y.z » chez le testeur (#4190).\n\n'
+    printf '%s\n' "$FORME_KO" | while IFS= read -r tag; do
+      [ -n "$tag" ] && printf -- '- `%s`\n' "$tag"
+    done
+    printf '\nLa note doit OUVRIR par `## Nouveautes`, `## Ameliorations` et\n'
+    printf '`## Corrections`, 5 a 8 puces d une ligne chacune, sans numero d issue.\n'
+    printf 'La prose suit sous `## Le detail` — voir `docs/RELEASE-WORKFLOW.md` §5.\n'
+    printf 'Le corps se corrige sans retaguer : `gh release edit <tag> --notes-file`.\n\n'
+    printf 'Se verifier avant publication, hors reseau :\n'
+    printf '`.github/scripts/notes-de-version-watch.sh --forme notes.md`\n\n'
+  fi
   printf '\n## Quoi faire\n\n'
   printf 'Ecrire le fil, a la main, comme d habitude : `type=release`, titre\n'
   printf '`Tune <version> — Notes de version`, `user_id=18` (Bertrand — le compte 1\n'
