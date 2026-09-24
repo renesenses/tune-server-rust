@@ -346,4 +346,62 @@ mod tests {
             "le réglage doit rester intact"
         );
     }
+
+    /// #4861, témoin de bout en bout : premier démarrage vu comme Free, puis
+    /// l'utilisateur retire deux greffons payants par les routes réelles
+    /// (désinstallation native, désinstallation du catalogue) et en désactive
+    /// un troisième ; au retour du Premium puis au démarrage suivant, ses
+    /// choix tiennent. Un greffon qu'il n'a pas touché revient installé et
+    /// actif.
+    #[tokio::test]
+    async fn temoin_4861_desinstallation_explicite_respectee_au_retour_du_premium() {
+        dossier_de_donnees_jetable();
+        for desactive in [false, true] {
+            let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+            assert!(!state.license.is_premium().await);
+            for id in ["crossfeed", "converter", "declick"] {
+                assert!(
+                    !premium_plugins::enabled(&settings, id),
+                    "{id} actif en Free"
+                );
+            }
+            let app = crate::routes::router_with_plugins(state.clone(), routers);
+            let (status, reponse) =
+                appel(&app, "POST", "/api/v1/audio-plugins/crossfeed/uninstall").await;
+            assert_eq!(status, StatusCode::OK, "{reponse}");
+            let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/converter").await;
+            assert_eq!(status, StatusCode::OK, "{reponse}");
+            if desactive {
+                let (status, reponse) =
+                    appel(&app, "POST", "/api/v1/plugins/declick/disable").await;
+                assert_eq!(status, StatusCode::OK, "{reponse}");
+            }
+
+            // Retour du Premium par la licence, puis démarrage suivant.
+            state
+                .license
+                .update_from_server(tune_core::license::Tier::Premium, None)
+                .await;
+            premium_plugins::migrate_for_account(&settings, state.license.is_premium().await)
+                .unwrap();
+
+            assert!(
+                !premium_plugins::installed(&settings, "crossfeed"),
+                "désinstallation native annulée"
+            );
+            assert!(!premium_plugins::enabled(&settings, "crossfeed"));
+            assert!(
+                !premium_plugins::installed(&settings, "converter"),
+                "désinstallation du catalogue annulée"
+            );
+            assert!(!premium_plugins::enabled(&settings, "converter"));
+            assert_eq!(
+                premium_plugins::enabled(&settings, "declick"),
+                !desactive,
+                "declick (désactivé={desactive})"
+            );
+        }
+    }
 }
