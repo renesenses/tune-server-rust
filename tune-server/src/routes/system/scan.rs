@@ -2108,13 +2108,18 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 tracing::warn!(error = %e, "post_scan_track_count_update_failed");
             }
             if let Err(e) = db.execute(
-                "UPDATE albums SET \
+                &format!("UPDATE albums SET \
                  format = COALESCE(albums.format, (SELECT t.format FROM tracks t WHERE t.album_id = albums.id AND t.format IS NOT NULL LIMIT 1)), \
                  sample_rate = COALESCE(albums.sample_rate, (SELECT MAX(t.sample_rate) FROM tracks t WHERE t.album_id = albums.id)), \
                  bit_depth = COALESCE(albums.bit_depth, (SELECT MAX(t.bit_depth) FROM tracks t WHERE t.album_id = albums.id)), \
                  genre = COALESCE(NULLIF(albums.genre, ''), (SELECT t.genre FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' LIMIT 1)), \
                  genres = COALESCE(NULLIF(albums.genres, ''), (SELECT t.genres FROM tracks t WHERE t.album_id = albums.id AND t.genres IS NOT NULL AND t.genres != '' LIMIT 1)), \
-                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id))",
+                 disc_count = COALESCE(albums.disc_count, (SELECT MAX(t.disc_number) FROM tracks t WHERE t.album_id = albums.id)), \
+                 {}",
+                    // #4836 : le label des pistes remonte sur l'album, que lit
+                    // l'onglet Labels — même fragment que la remontée par album.
+                    tune_core::db::album_repo::sql_label_repris_des_pistes()
+                ),
                 &[],
             ) {
                 tracing::warn!(error = %e, "post_scan_album_quality_update_failed");
