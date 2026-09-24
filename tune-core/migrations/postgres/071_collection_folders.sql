@@ -77,6 +77,6 @@ BEGIN
     END LOOP;
 END $$;
 
-INSERT INTO schema_version (version, name) VALUES (70, 'collection_folders') ON CONFLICT (version) DO NOTHING;
+INSERT INTO schema_version (version, name) VALUES (71, 'collection_folders') ON CONFLICT (version) DO NOTHING;
 
 COMMIT;
