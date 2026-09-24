@@ -121,8 +121,11 @@ fn chaque_piste_atterrit_sur_le_fichier_de_son_index_01() {
     let (dossier, fichiers) = album_gapless(scratch.path());
     let db = base();
 
-    let (inv, bilan, images) =
-        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(scratch.path()));
+    let (inv, bilan, images) = inventorier_et_ecrire(
+        db.clone(),
+        std::slice::from_ref(&dossier),
+        &racines(scratch.path()),
+    );
 
     assert_eq!(inv.albums, 1, "inventaire : {inv:?}");
     assert_eq!(inv.pistes, 3, "inventaire : {inv:?}");
