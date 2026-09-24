@@ -18,7 +18,9 @@ use serde_json::Value;
 use tracing::debug;
 
 const MB_API: &str = "https://musicbrainz.org/ws/2";
-const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
+/// Public depuis #4863 : le greffon de lecture de CD consulte `/ws/2/discid`
+/// sous la même identité. Son DÉBIT, lui, passe par [`rate_limit_delay`] (#4767).
+pub const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
 
 /// Below this score a search hit is noise rather than a match.
 const MIN_CONFIDENT_SCORE: i32 = 80;

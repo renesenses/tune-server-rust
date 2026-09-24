@@ -1022,6 +1022,9 @@ pub struct PlaybackOrchestrator {
     /// Un champ et non un appel direct : les témoins y substituent un parc
     /// connu, faute de périphérique réel sur la machine qui les exécute.
     pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
+    /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
+    /// par nom de `source`. Voir `crate::source_pcm`.
+    pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1324,6 +1327,7 @@ impl PlaybackOrchestrator {
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
+            sources_pcm: crate::source_pcm::SourcesPcm::default(),
         }
     }
 
@@ -1405,6 +1409,8 @@ pub use dsp::PorteeDuReglage;
 mod resolve_direct;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
 mod capacite_lpcm_par_sortie;
+// #4863 — une source PCM fournie par un greffon (lecture d'un CD).
+mod source_pcm;
 
 /// #4362 — le chemin de lecture consulte le registre des serveurs multimédia
 /// avant d'envoyer l'URL d'une piste indexée à une sortie.
