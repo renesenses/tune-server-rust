@@ -2198,8 +2198,13 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // came from two independent subqueries, which is how an album
                 // tagged "Alternatif & Indé" surfaced a stale "singer; Songwriter"
                 // genres value from an unrelated track — #1160).
+                //
+                // Un genre corrigé À LA MAIN (C3 ; écran « Modifier » de la
+                // fiche, 25/09/2026) n'est pas un genre « périmé » : le scan
+                // complet ne le réécrit pas.
                 if let Err(e) = db.execute(
-                    "UPDATE albums SET \
+                    &format!(
+                        "UPDATE albums SET \
                      genre = (SELECT t.genre FROM tracks t \
                               WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' \
                               GROUP BY t.genre ORDER BY COUNT(*) DESC, t.genre ASC LIMIT 1), \
@@ -2208,7 +2213,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                                   WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '' \
                                   GROUP BY t.genre ORDER BY COUNT(*) DESC, t.genre ASC LIMIT 1), \
                                  '\"', '\\\"') || '\"]' \
-                     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '')",
+                     WHERE EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id AND t.genre IS NOT NULL AND t.genre != '') \
+                     AND NOT {}",
+                        tune_core::db::album_repo::sql_champ_tenu_a_la_main("genre")
+                    ),
                     &[],
                 ) {
                     tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");

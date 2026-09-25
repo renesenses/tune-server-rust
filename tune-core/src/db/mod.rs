@@ -8,6 +8,7 @@ pub mod artist_repo;
 pub mod backend;
 pub mod coffrets_auto;
 pub mod collection_folder_repo;
+pub mod edition_album;
 pub mod engine;
 pub mod facet_filter;
 pub mod favorite_facets_repo;

@@ -433,6 +433,12 @@ pub struct TrackImporter {
     /// n'avait AUCUN chemin pour atteindre l'écran, pas même le bouton « Scan
     /// complet » (#3028).
     force_artwork: bool,
+    /// Ce que l'utilisateur a tenu à la main depuis l'écran « Modifier » de
+    /// la fiche album (GO du 25/09/2026) : album, disque, numéro, nom du
+    /// disque, titre et artiste de piste. Chargé UNE fois par scan, posé sur
+    /// chaque ligne AVANT qu'elle soit écrite — les balises relues ne
+    /// l'écrasent plus. Voir [`tune_core::db::edition_album::Tenues`].
+    tenues: tune_core::db::edition_album::Tenues,
 }
 
 impl TrackImporter {
@@ -452,6 +458,7 @@ impl TrackImporter {
         portee: PorteeDuScan<'_>,
     ) -> Self {
         let preuves = Self::amorcer_depuis_la_base(&db, portee);
+        let tenues = tune_core::db::edition_album::Tenues::charger(&db);
         Self {
             artist_repo: ArtistRepo::with_backend(db.clone()),
             album_repo: AlbumRepo::with_backend(db),
@@ -471,6 +478,7 @@ impl TrackImporter {
             graphie_d_album: HashMap::new(),
             artwork_extracted: 0,
             force_artwork: false,
+            tenues,
         }
     }
 
@@ -1373,6 +1381,13 @@ impl TrackImporter {
             }
         }
 
+        // L'édition manuelle prime sur les balises (écran « Modifier », GO du
+        // 25/09/2026) : un scan qui relit ce fichier n'écrase ni sa place
+        // dans le coffret, ni son titre, ni son artiste.
+        if self.tenues.appliquer(&mut track) {
+            let tenu = track.album_id;
+            return Some((track, tenu));
+        }
         Some((track, album_id))
     }
 }
@@ -2902,6 +2917,134 @@ mod tests {
             entrees, 1,
             "le cache est adressé par le CONTENU : une seule image, une seule \
              entrée — {entrees} trouvées"
+        );
+    }
+}
+
+/// L'édition manuelle (mode « Modifier » de la fiche album, GO du 25/09/2026)
+/// face au VRAI importateur du scan : c'est `TrackImporter::import`, le site
+/// d'appel partagé par le scan manuel et le scan automatique, qui pose les
+/// tenues — pas une fonction à côté.
+#[cfg(test)]
+mod tests_edition_manuelle {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tune_core::db::album_repo::AlbumRepo;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::edition_album::{self, Modification};
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::db::track_repo::TrackRepo;
+    use tune_core::metadata::TrackMetadata;
+    use tune_core::scanner::walker::ScannedFile;
+
+    use super::{PorteeDuScan, TrackImporter};
+
+    /// Deux albums de deux dossiers, tels que leurs BALISES les décrivent :
+    /// l'utilisateur en fera un coffret.
+    fn fichiers(racine: &std::path::Path) -> Vec<ScannedFile> {
+        let mut v = Vec::new();
+        for (dossier, disque, n) in [
+            ("Koln Concert", 1, 1),
+            ("Koln Concert", 1, 2),
+            ("Koln Concert", 1, 3),
+            ("Koln Bonus", 1, 1),
+            ("Koln Bonus", 1, 2),
+        ] {
+            let d = racine.join(dossier);
+            std::fs::create_dir_all(&d).unwrap();
+            let chemin = d
+                .join(format!("{n:02}.flac"))
+                .to_string_lossy()
+                .into_owned();
+            std::fs::write(&chemin, b"pas-du-vrai-audio").unwrap();
+            v.push(ScannedFile {
+                path: chemin,
+                metadata: Some(TrackMetadata {
+                    title: Some(format!("piste {disque}-{n}")),
+                    artist: Some("Keith Jarrett".into()),
+                    album: Some(dossier.into()),
+                    album_artist: Some("Keith Jarrett".into()),
+                    track_number: Some(n),
+                    disc_number: Some(disque),
+                    ..Default::default()
+                }),
+                unsupported: None,
+                audio_hash: Some(format!("hash-{dossier}-{disque}-{n}")),
+                file_size: 4096,
+                mtime: 1_700_000_000,
+            });
+        }
+        v
+    }
+
+    /// Une passe de scan telle que `scan.rs` la joue : `begin_batch`, `import`
+    /// de chaque fichier, insertion ou mise à jour selon le chemin, purge des
+    /// albums orphelins.
+    fn scanner(db: &Arc<dyn DbBackend>, racine: &std::path::Path, lot: &[ScannedFile]) {
+        let pistes = TrackRepo::with_backend(db.clone());
+        let mut imp =
+            TrackImporter::new(db.clone(), true, racine.join("cache"), PorteeDuScan::TOUT)
+                .with_force_artwork(true);
+        imp.begin_batch(lot);
+        let (mut a_inserer, mut a_mettre_a_jour) = (Vec::new(), Vec::new());
+        for sf in lot {
+            let (mut t, _) = imp.import(sf).expect("import");
+            match pistes.get_by_path(&sf.path).unwrap().and_then(|x| x.id) {
+                Some(id) => {
+                    t.id = Some(id);
+                    a_mettre_a_jour.push(t);
+                }
+                None => a_inserer.push(t),
+            }
+        }
+        pistes.create_batch(&a_inserer).unwrap();
+        pistes.update_batch(&a_mettre_a_jour).unwrap();
+        AlbumRepo::with_backend(db.clone())
+            .delete_orphans()
+            .unwrap();
+    }
+
+    #[test]
+    fn un_scan_qui_relit_tout_ne_defait_pas_l_edition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sqlite = SqliteDb::open_in_memory().unwrap();
+        sqlite.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&sqlite).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(sqlite);
+        let lot = fichiers(tmp.path());
+
+        // 1. Premier scan : un album par DOSSIER.
+        scanner(&db, tmp.path(), &lot);
+        let pistes = TrackRepo::with_backend(db.clone());
+        let id_de = |i: usize| pistes.get_by_path(&lot[i].path).unwrap().unwrap();
+        let (cd1, cd2) = (id_de(0).album_id.unwrap(), id_de(3).album_id.unwrap());
+        assert_ne!(cd1, cd2, "deux dossiers, deux albums");
+
+        // 2. L'utilisateur attache le disque 2, puis dispose et renomme.
+        edition_album::attacher(&db, cd1, cd2).unwrap();
+        let ids: Vec<i64> = (0..5).map(|i| id_de(i).id.unwrap()).collect();
+        let m: Modification = serde_json::from_value(json!({
+            "discs": [
+                { "number": 2, "title": "Live", "track_ids": [ids[4], ids[3], ids[2]] },
+                { "number": 1, "title": "Studio", "track_ids": [ids[0], ids[1]] }
+            ],
+            "tracks": [ { "id": ids[0], "title": "Intro", "artist_name": "Invité" } ]
+        }))
+        .unwrap();
+        edition_album::appliquer(&db, cd1, &m).unwrap();
+        let attendu = edition_album::lire_vue(&db, cd1).unwrap().unwrap();
+
+        // 3. « Scan complet » : chaque fichier relu, chaque ligne réécrite
+        //    depuis ses balises. Le dossier cd2 n'a plus d'album à lui : la
+        //    résolution par dossier lui en recrée un, que rien ne doit garder.
+        scanner(&db, tmp.path(), &lot);
+        let apres = edition_album::lire_vue(&db, cd1).unwrap().unwrap();
+        assert_eq!(apres, attendu, "le scan a défait l'édition");
+        assert_eq!(
+            AlbumRepo::with_backend(db.clone()).count().unwrap(),
+            1,
+            "l'album recréé pour cd2 est resté vide, donc purgé"
         );
     }
 }

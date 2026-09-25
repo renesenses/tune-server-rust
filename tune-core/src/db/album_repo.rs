@@ -830,6 +830,16 @@ pub fn sql_label_repris_des_pistes() -> &'static str {
       GROUP BY t.label ORDER BY COUNT(*) DESC, t.label ASC LIMIT 1))"
 }
 
+/// Le prédicat « ce champ de l'album est tenu par une édition manuelle » (C3),
+/// corrélé sur `albums.id`, pour les passes SQL du scan qui réécrivent un
+/// champ d'album sans passer par le dépôt. SQL commun aux deux moteurs.
+pub fn sql_champ_tenu_a_la_main(champ: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM album_metadata am WHERE am.album_id = albums.id \
+         AND am.key = 'edition_manuelle' AND am.value LIKE '%\"{champ}\"%')"
+    )
+}
+
 /// Bilan de [`AlbumRepo::recalculer_les_compilations`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BilanRecalculCompilations {

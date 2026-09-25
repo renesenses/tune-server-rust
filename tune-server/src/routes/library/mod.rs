@@ -18,6 +18,8 @@ pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
+// Le mode « Modifier » de la fiche album (GO du 25/09/2026).
+mod edition;
 mod enrich;
 mod facets;
 mod folder_facet;
@@ -285,6 +287,18 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),
+        )
+        // Le mode « Modifier » de la fiche album (GO du 25/09/2026) : champs,
+        // mode de compilation, disques (ordre, noms, pistes), et les deux
+        // gestes sur les disques d'un coffret.
+        .route(
+            "/albums/{id}/edition",
+            get(edition::lire).put(edition::modifier),
+        )
+        .route("/albums/{id}/discs/attach", post(edition::attacher))
+        .route(
+            "/albums/{id}/discs/{number}/detach",
+            post(edition::detacher),
         )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
         .route("/albums/{id}/aussi-sur", get(albums::album_aussi_sur))

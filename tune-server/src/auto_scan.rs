@@ -1853,17 +1853,29 @@ pub fn spawn_file_watcher(
                                         Some((Some(indices.juger().compilation), unique))
                                     })
                                     .unwrap_or((None, None));
-                                let Some((track, album_id)) = build_track_from_metadata_opts(
-                                    sf,
-                                    &artist_repo,
-                                    &album_repo,
-                                    watcher_quality_split,
-                                    comp_override,
-                                    folder_tagged_artist.as_deref(),
-                                ) else {
+                                let Some((mut track, mut album_id)) =
+                                    build_track_from_metadata_opts(
+                                        sf,
+                                        &artist_repo,
+                                        &album_repo,
+                                        watcher_quality_split,
+                                        comp_override,
+                                        folder_tagged_artist.as_deref(),
+                                    )
+                                else {
                                     tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
                                     continue;
                                 };
+
+                                // L'édition manuelle prime sur les balises
+                                // (écran « Modifier », GO du 25/09/2026) : le
+                                // fichier réenregistré garde sa place, son
+                                // titre et son artiste tenus à la main.
+                                if tune_core::db::edition_album::Tenues::charger(&db)
+                                    .appliquer(&mut track)
+                                {
+                                    album_id = track.album_id;
+                                }
 
                                 // The hash is only a candidate selector. The
                                 // watcher is allowed to skip solely after a

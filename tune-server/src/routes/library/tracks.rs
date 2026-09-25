@@ -688,6 +688,8 @@ pub(super) async fn rescan_track(
     match meta {
         Some(m) => {
             apply_metadata_to_track(&mut track, &m);
+            // L'édition manuelle (GO du 25/09/2026) prime sur les étiquettes.
+            tune_core::db::edition_album::Tenues::charger(&state.backend).appliquer(&mut track);
 
             if let Err(e) = repo.update(&track) {
                 tracing::warn!(track_id = id, error = %e, "rescan_track_update_failed");
@@ -1190,6 +1192,9 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                 }
             };
 
+            // Ce que l'utilisateur a tenu à la main (écran « Modifier », GO du
+            // 25/09/2026) : relire les étiquettes ne l'écrase pas.
+            let tenues = tune_core::db::edition_album::Tenues::charger(&backend_inner);
             let total = tracks.len();
             let mut updated = 0usize;
             let mut skipped = 0usize;
@@ -1255,6 +1260,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
 
                 let mut t = track.clone();
                 apply_metadata_to_track(&mut t, &meta);
+                tenues.appliquer(&mut t);
 
                 match track_repo.update(&t) {
                     Ok(_) => updated += 1,

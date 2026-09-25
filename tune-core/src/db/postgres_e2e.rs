@@ -189,6 +189,35 @@ async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
     crate::db::coffrets_auto::tests::scenario_complet(&db);
 }
 
+/// Édition d'album — mode « Modifier » de la fiche (GO du 25/09/2026) : LES
+/// MÊMES scénarios que SQLite (`edition_album_tests.rs`), sur le VRAI moteur.
+/// La transaction unique de `appliquer`, le JSON dans `album_metadata`, les
+/// numéros de disque provisoires négatifs d'`attacher` et le refus dans
+/// `settings` y passent.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_edition_album_scenarios() {
+    use crate::db::edition_album::tests as e;
+    let db = pg_or_skip!();
+    let scenarios: [(&str, fn(&Arc<dyn DbBackend>)); 7] = [
+        ("aller_retour", e::scenario_aller_retour),
+        ("disque_vide", e::scenario_disque_vide),
+        ("refus", e::scenario_refus),
+        ("compilation", e::scenario_compilation),
+        (
+            "tenues_face_aux_analyses",
+            e::scenario_tenues_face_aux_analyses,
+        ),
+        ("passe_des_coffrets", e::scenario_passe_des_coffrets),
+        ("attacher_detacher", e::scenario_attacher_detacher),
+    ];
+    for (nom, scenario) in scenarios {
+        eprintln!("pg_edition_album : {nom}");
+        reset_schema(&db);
+        scenario(&db);
+    }
+    reset_schema(&db);
+}
+
 /// LA règle « compilation » du 25/09/2026 rejouée sur une base PostgreSQL :
 /// `recalculer_les_compilations` lit le drapeau (`SMALLINT` depuis PG 028)
 /// par `COALESCE(…, 0) <> 0`, puis le BAISSE par `set_compilation` et rend à
