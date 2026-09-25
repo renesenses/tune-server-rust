@@ -2212,47 +2212,66 @@ mod tests {
     /// pose, n'est probablement PAS la cause du dossier de #3687.
     #[tokio::test]
     async fn l_etat_d_ecoute_dit_le_refus_puis_la_reprise() {
-        // L'occupant : aucune option de partage, exactement le cas ou le
-        // noyau refuse.
-        let occupant = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("port ephemere");
-        let port = occupant.local_addr().unwrap().port();
+        const TENTATIVES: usize = 8;
+        let mut derniere_erreur = String::new();
+        for _ in 0..TENTATIVES {
+            // L'occupant : aucune option de partage, exactement le cas ou le
+            // noyau refuse.
+            let occupant = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("port ephemere");
+            let port = occupant.local_addr().unwrap().port();
 
-        // ── MOITIE ROUGE : le port est pris, on doit le DIRE ──────────────
-        let refus = lier_ecouteur_ssdp(port);
-        assert!(
-            refus.is_err(),
-            "un occupant sans SO_REUSEADDR doit faire refuser la liaison"
-        );
-        let etat = etat_ecoute_ssdp().expect("aucun etat retenu apres un bind refuse");
-        assert_eq!(etat.port, port);
-        assert!(
-            !etat.ecoute,
-            "l'etat doit dire que le repondeur ne tourne pas"
-        );
-        assert!(
-            etat.erreur_systeme.is_some(),
-            "l'erreur systeme est la moitie exploitable du diagnostic"
-        );
-        assert!(etat.echecs >= 1, "l'echec doit etre compte");
-        let message = etat
-            .message
-            .expect("une phrase lisible, pas seulement un code");
-        assert!(
-            message.contains("M-SEARCH"),
-            "la phrase doit nommer la consequence, pas seulement la cause : {message}"
-        );
+            // ── MOITIE ROUGE : le port est pris, on doit le DIRE ──────────────
+            let refus = lier_ecouteur_ssdp(port);
+            assert!(
+                refus.is_err(),
+                "un occupant sans SO_REUSEADDR doit faire refuser la liaison"
+            );
+            let etat = etat_ecoute_ssdp().expect("aucun etat retenu apres un bind refuse");
+            assert_eq!(etat.port, port);
+            assert!(
+                !etat.ecoute,
+                "l'etat doit dire que le repondeur ne tourne pas"
+            );
+            assert!(
+                etat.erreur_systeme.is_some(),
+                "l'erreur systeme est la moitie exploitable du diagnostic"
+            );
+            assert!(etat.echecs >= 1, "l'echec doit etre compte");
+            let message = etat
+                .message
+                .expect("une phrase lisible, pas seulement un code");
+            assert!(
+                message.contains("M-SEARCH"),
+                "la phrase doit nommer la consequence, pas seulement la cause : {message}"
+            );
 
-        // ── MOITIE VERTE : le port se libere, on doit le dire AUSSI ───────
-        // Sans elle, un `lier_ecouteur_ssdp` qui echouerait toujours serait
-        // vert au premier assert et rendrait Tune muet en le proclamant.
-        drop(occupant);
-        let socket = lier_ecouteur_ssdp(port).expect("le port libere doit se lier");
-        let etat = etat_ecoute_ssdp().expect("etat retenu apres un bind reussi");
-        assert_eq!(etat.port, port);
-        assert!(etat.ecoute, "l'etat doit dire que le repondeur tourne");
-        assert!(etat.erreur_systeme.is_none());
-        assert!(etat.message.is_none());
-        drop(socket);
+            // ── MOITIE VERTE : le port se libere, on doit le dire AUSSI ───────
+            // Sans elle, un `lier_ecouteur_ssdp` qui echouerait toujours serait
+            // vert au premier assert et rendrait Tune muet en le proclamant.
+            //
+            // Entre `drop(occupant)` et la re-liaison, un autre test du meme
+            // binaire qui lie le port 0 peut recevoir CE port ephemere (CI #4709,
+            // 22/09 : `os error 98` sur un port libere). On rejoue alors tout le
+            // scenario sur un port neuf ; apres TENTATIVES echecs le test rougit
+            // avec la derniere erreur, donc une liaison qui echouerait toujours
+            // reste rouge.
+            drop(occupant);
+            let socket = match lier_ecouteur_ssdp(port) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    derniere_erreur = e;
+                    continue;
+                }
+            };
+            let etat = etat_ecoute_ssdp().expect("etat retenu apres un bind reussi");
+            assert_eq!(etat.port, port);
+            assert!(etat.ecoute, "l'etat doit dire que le repondeur tourne");
+            assert!(etat.erreur_systeme.is_none());
+            assert!(etat.message.is_none());
+            drop(socket);
+            return;
+        }
+        panic!("le port libere doit se lier ({TENTATIVES} tentatives) : {derniere_erreur:?}");
     }
 
     /// 🔴 #3687 — LA GARDE du repondeur M-SEARCH.
