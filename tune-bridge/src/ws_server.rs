@@ -144,12 +144,11 @@ pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
                 }
             }
             _ = heartbeat_interval.tick() => {
-                if let Some(conn) = state.servers.get(&server_id) {
-                    if conn.last_heartbeat.elapsed() > heartbeat_timeout {
+                if let Some(conn) = state.servers.get(&server_id)
+                    && conn.last_heartbeat.elapsed() > heartbeat_timeout {
                         warn!(server_id = %server_id, "heartbeat timeout");
                         break;
                     }
-                }
             }
         }
     }
@@ -333,7 +332,7 @@ async fn resolve_pending(state: &RelayState, server_id: &str, resp: protocol::Re
 /// s'entendrait a la place de se voir.
 fn decoder_base64(texte: &str) -> Option<Vec<u8>> {
     let octets = texte.as_bytes();
-    if octets.len() % 4 != 0 {
+    if !octets.len().is_multiple_of(4) {
         return None;
     }
     let dernier = octets.len() / 4;
