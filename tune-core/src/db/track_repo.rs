@@ -678,6 +678,14 @@ pub mod sql {
         )
     }
 
+    /// #5073 — les tranches d'un fichier image : `(id, cue_start_ms)`.
+    pub fn tranches_cue_du_media<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, cue_start_ms FROM tracks WHERE cue_media_path = {}",
+            d.placeholder(1)
+        )
+    }
+
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
         format!("{} WHERE t.id = {}", select_track(), d.placeholder(1))
     }
@@ -1877,6 +1885,26 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::delete_by_cue_media, sql::delete_by_cue_media);
         let params: [&dyn ToSqlValue; 1] = [&cue_media_path];
         Ok(self.db.execute(&sql, &params)? as u64)
+    }
+
+    /// #5073 — les tranches que la base porte pour ce fichier image, en
+    /// `(id, cue_start_ms)` : ce qu'une feuille relue confronte à ce qu'elle
+    /// décrit désormais (`cue_bibliotheque::relire_le_dossier`).
+    pub fn tranches_cue_du_media(
+        &self,
+        cue_media_path: &str,
+    ) -> Result<Vec<(i64, i64)>, TuneError> {
+        let sql = self.dialect_sql(sql::tranches_cue_du_media, sql::tranches_cue_du_media);
+        let params: [&dyn ToSqlValue; 1] = [&cue_media_path];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .iter()
+            .filter_map(|ligne| {
+                let id = ligne.first()?.as_i64()?;
+                Some((id, ligne.get(1).and_then(|v| v.as_i64()).unwrap_or(0)))
+            })
+            .collect())
     }
 
     fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {

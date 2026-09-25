@@ -82,7 +82,11 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
 
             if let Some(ct) = change_type {
                 for path in &event.paths {
-                    if is_audio_file(path) && !super::is_tune_temp_file(path) {
+                    // #5073 — la feuille CUE aussi : c'est elle qui découpe
+                    // son FLAC, et `auto_scan` relit alors son dossier.
+                    if (is_audio_file(path) || est_une_feuille_cue(path))
+                        && !super::is_tune_temp_file(path)
+                    {
                         let _ = event_tx.send(FileChange {
                             change_type: ct.clone(),
                             path: path.to_string_lossy().to_string(),
@@ -99,7 +103,10 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                 return;
             }
             for path in &event.paths {
-                if is_audio_file(path) || super::is_tune_temp_file(path) {
+                if is_audio_file(path)
+                    || est_une_feuille_cue(path)
+                    || super::is_tune_temp_file(path)
+                {
                     continue;
                 }
                 if let Some(genre) = evenement_de_dossier(&event.kind, path) {
@@ -472,6 +479,15 @@ fn is_network_path(path: &Path) -> bool {
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn is_network_path(_path: &Path) -> bool {
     false
+}
+
+/// #5073 — une feuille CUE (`.cue`, toute casse). Le surveillant la relaie
+/// comme un fichier : sans elle, un album « image + feuille » déposé Tune
+/// lancé était importé en UNE piste, le découpage n'ayant lieu qu'au scan.
+pub fn est_une_feuille_cue(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cue"))
 }
 
 fn is_audio_file(path: &Path) -> bool {

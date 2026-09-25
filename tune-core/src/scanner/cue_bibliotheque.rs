@@ -518,6 +518,33 @@ pub fn inventorier_et_ecrire(
     dossiers: &[PathBuf],
     racines: &[String],
 ) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
+    let (inventaire, mut bilan, images_couvertes) = ecrire_les_dossiers(&db, dossiers, |_, _| {});
+
+    let track_repo = TrackRepo::with_backend(db.clone());
+    bilan.pistes_elaguees = elaguer_les_pistes_cue(&track_repo, racines);
+
+    if bilan != BilanCue::default() {
+        info!(
+            albums = bilan.albums,
+            pistes_creees = bilan.pistes_creees,
+            pistes_mises_a_jour = bilan.pistes_mises_a_jour,
+            pistes_elaguees = bilan.pistes_elaguees,
+            doublons_resorbes = bilan.doublons_resorbes,
+            echecs = bilan.echecs,
+            images_couvertes = images_couvertes.len(),
+            "scan_cue_tracks_written"
+        );
+    }
+    (inventaire, bilan, images_couvertes)
+}
+
+/// Le cœur commun du scan et du surveillant : planifier chaque dossier et
+/// écrire ses albums par [`ecrire_album`]. `observer` voit chaque plan écrit.
+fn ecrire_les_dossiers(
+    db: &Arc<dyn DbBackend>,
+    dossiers: &[PathBuf],
+    mut observer: impl FnMut(&Path, &PlanCue),
+) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
     let artist_repo = ArtistRepo::with_backend(db.clone());
     let album_repo = AlbumRepo::with_backend(db.clone());
     let track_repo = TrackRepo::with_backend(db.clone());
@@ -536,23 +563,162 @@ pub fn inventorier_et_ecrire(
                 &mut images_couvertes,
             );
         }
+        observer(dossier, plan);
     });
+    (inventaire, bilan, images_couvertes)
+}
 
-    bilan.pistes_elaguees = elaguer_les_pistes_cue(&track_repo, racines);
+/// Ce que [`relire_le_dossier`] a changé dans la bibliothèque (#5073).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RelectureDuDossier {
+    /// Les fichiers image que les feuilles du dossier DÉCOUPENT : leurs
+    /// tranches les représentent, le surveillant ne doit plus les importer en
+    /// piste entière. C'est l'`images_cue` du scan.
+    pub images_decoupees: HashSet<PathBuf>,
+    /// Les fichiers image qu'aucune feuille ne décrit plus (feuille supprimée,
+    /// ou qui désigne un autre fichier) : leurs tranches sont retirées, ils
+    /// redeviennent des pistes ordinaires, à réimporter.
+    pub images_liberees: Vec<PathBuf>,
+    /// Ce que l'écriture des albums a changé, comme au scan.
+    pub bilan: BilanCue,
+    /// Tranches que la feuille ne décrit plus, retirées.
+    pub tranches_retirees: usize,
+    /// Pistes « image entière » retirées : le fichier est désormais découpé.
+    pub pistes_entieres_retirees: usize,
+}
 
-    if bilan != BilanCue::default() {
+/// Le dossier ne porte, à cet instant, aucune feuille `.cue` — et il se lit.
+fn dossier_lisible_sans_feuille(dossier: &Path) -> bool {
+    let Ok(entrees) = std::fs::read_dir(dossier) else {
+        return false;
+    };
+    !entrees.flatten().any(|e| {
+        e.path()
+            .extension()
+            .and_then(|x| x.to_str())
+            .is_some_and(|x| x.eq_ignore_ascii_case("cue"))
+    })
+}
+
+/// #5073 (Gros Bidon, fil 1904) — le surveillant relit UN dossier dont une
+/// feuille CUE ou un fichier audio vient de changer, par le MÊME découpage que
+/// le scan ([`planifier_dossier`](super::cue_album::planifier_dossier) puis
+/// `ecrire_album`).
+///
+/// Le surveillant importait chaque FLAC seul : un album « image + feuille »
+/// déposé Tune lancé devenait UNE piste de 40 minutes, et le `.cue` n'était
+/// jamais lu hors d'une analyse complète.
+///
+/// En plus de ce que fait le scan, cette relecture confronte la base à la
+/// feuille relue, pour ce seul dossier :
+///
+/// - la ligne « image entière » d'un fichier désormais découpé est retirée —
+///   le scan la retire par sa purge de fin, qui n'existe pas ici (feuille
+///   arrivée APRÈS le FLAC) ;
+/// - une tranche que la feuille ne décrit plus (feuille retouchée) est retirée ;
+/// - un fichier qu'aucune feuille ne décrit plus (feuille supprimée) perd ses
+///   tranches et revient dans [`RelectureDuDossier::images_liberees`], pour
+///   être réimporté comme une piste ordinaire.
+///
+/// ⚠️ Rien n'est retiré sur un doute : dossier illisible (support absent, cf.
+/// #1943), ou feuille présente mais illisible à cet instant (en cours
+/// d'écriture, droits). L'élagage de toute la bibliothèque
+/// ([`elaguer_les_pistes_cue`]) reste l'affaire du scan : il sonderait chaque
+/// image de chaque album CUE à chaque événement.
+pub fn relire_le_dossier(db: &Arc<dyn DbBackend>, dossier: &Path) -> RelectureDuDossier {
+    use super::cue_album::MotifEcart;
+    let mut relecture = RelectureDuDossier::default();
+    if std::fs::read_dir(dossier).is_err() {
+        return relecture;
+    }
+    let track_repo = TrackRepo::with_backend(db.clone());
+    // Les images de CE dossier que la base découpe déjà, avant relecture.
+    let images_avant: Vec<String> = match track_repo.cue_media_paths() {
+        Ok(v) => v
+            .into_iter()
+            .filter(|m| Path::new(m).parent() == Some(dossier))
+            .collect(),
+        Err(e) => {
+            warn!(dossier = %dossier.display(), error = %e, "cue_relecture_base_illisible");
+            return relecture;
+        }
+    };
+
+    let mut decrites: HashSet<(String, i64)> = HashSet::new();
+    let mut feuille_vue = false;
+    let mut feuille_illisible = false;
+    let (_, bilan, images_decoupees) =
+        ecrire_les_dossiers(db, &[dossier.to_path_buf()], |_, plan| {
+            feuille_vue = true;
+            for album in &plan.albums {
+                for piste in &album.pistes {
+                    decrites.insert((
+                        piste.media.to_string_lossy().into_owned(),
+                        piste.debut_ms as i64,
+                    ));
+                }
+            }
+            feuille_illisible |= plan
+                .ecartees
+                .iter()
+                .any(|(_, motif)| matches!(motif, MotifEcart::Illisible(_)));
+        });
+    relecture.bilan = bilan;
+
+    // Le fichier découpé perd sa ligne « image entière » : sans quoi l'album
+    // existerait deux fois, 40 minutes d'un bloc à côté de ses tranches.
+    for image in &images_decoupees {
+        let chemin = image.to_string_lossy();
+        if let Ok(Some(entiere)) = track_repo.get_by_path(&chemin)
+            && entiere.cue_media_path.is_none()
+            && let Some(id) = entiere.id
+            && track_repo.delete(id).is_ok()
+        {
+            relecture.pistes_entieres_retirees += 1;
+            info!(image = %chemin, piste = id, "cue_piste_entiere_remplacee_par_ses_tranches");
+        }
+    }
+    relecture.images_decoupees = images_decoupees;
+
+    if feuille_illisible {
+        warn!(dossier = %dossier.display(), "cue_relecture_feuille_illisible — aucune tranche retirée");
+        return relecture;
+    }
+    // Aucune feuille vue : seulement si le dossier se lit ET n'en porte
+    // vraiment plus — `planifier_dossier` rend aussi un plan vide sur un
+    // dossier devenu illisible entre-temps.
+    if !feuille_vue && !dossier_lisible_sans_feuille(dossier) {
+        return relecture;
+    }
+    for media in images_avant {
+        let tranches = match track_repo.tranches_cue_du_media(&media) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(media = %media, error = %e, "cue_relecture_tranches_illisibles");
+                continue;
+            }
+        };
+        let mut gardees = 0usize;
+        for (id, debut) in tranches {
+            if decrites.contains(&(media.clone(), debut)) {
+                gardees += 1;
+            } else if track_repo.delete(id).is_ok() {
+                relecture.tranches_retirees += 1;
+            }
+        }
+        if gardees == 0 && Path::new(&media).is_file() {
+            info!(image = %media, "cue_image_liberee — plus aucune feuille ne la découpe");
+            relecture.images_liberees.push(PathBuf::from(media));
+        }
+    }
+    if relecture.tranches_retirees > 0 {
         info!(
-            albums = bilan.albums,
-            pistes_creees = bilan.pistes_creees,
-            pistes_mises_a_jour = bilan.pistes_mises_a_jour,
-            pistes_elaguees = bilan.pistes_elaguees,
-            doublons_resorbes = bilan.doublons_resorbes,
-            echecs = bilan.echecs,
-            images_couvertes = images_couvertes.len(),
-            "scan_cue_tracks_written"
+            dossier = %dossier.display(),
+            tranches = relecture.tranches_retirees,
+            "cue_tranches_retirees — la feuille ne les décrit plus"
         );
     }
-    (inventaire, bilan, images_couvertes)
+    relecture
 }
 
 /// Retire les pistes virtuelles dont le fichier image a disparu.
