@@ -717,6 +717,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-crossfeed-pro"
+version = "0.1.0"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "tune-plugin-abi",
+ "tune-plugin-audio-support",
+ "tune-plugin-sdk",
+ "tune-plugin-testkit",
+]
+
+[[package]]
 name = "tune-plugin-declick"
 version = "0.1.0"
 dependencies = [

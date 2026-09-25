@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-plugin-sdk", "tune-plugin-testkit", "cargo-tune-plugin", "tune-plugin-audio-support", "tune-plugin-equalizer", "tune-plugin-crossfeed", "tune-plugin-converter", "tune-plugin-declick", "tune-plugin-abi", "tune-plugin-native"]
+members = ["tune-plugin-sdk", "tune-plugin-testkit", "cargo-tune-plugin", "tune-plugin-audio-support", "tune-plugin-equalizer", "tune-plugin-crossfeed", "tune-plugin-crossfeed-pro", "tune-plugin-converter", "tune-plugin-declick", "tune-plugin-abi", "tune-plugin-native"]
 resolver = "2"
 
 [workspace.package]

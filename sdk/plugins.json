@@ -11,6 +11,7 @@
   "native": [
     {"id": "equalizer", "crate": "tune-plugin-equalizer", "bundled_in": "tune-core"},
     {"id": "crossfeed", "crate": "tune-plugin-crossfeed", "bundled_in": "tune-core"},
+    {"id": "crossfeed-pro", "crate": "tune-plugin-crossfeed-pro"},
     {"id": "converter", "crate": "tune-plugin-converter", "bundled_in": "tune-server"},
     {"id": "declick", "crate": "tune-plugin-declick", "bundled_in": "tune-server"}
   ]

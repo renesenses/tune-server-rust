@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CrossfeedProSettings",
+  "description": "Réglages de Crossfeed Pro, tels que la zone les enregistre.\n\nDéfauts : éteint ; dosage 0,30 ; retard 0,3 ms ; ombre de la tête\nDÉSACTIVÉE (700 Hz si on l'allume) ; coupe-bas désactivé ; garde de phase\nACTIVE (30 ms) — elle ne fait rien sur un signal dont la corrélation L/R\nreste positive.",
+  "type": "object",
+  "properties": {
+    "amount": {
+      "description": "Dosage k de la voie croisée, de 0,20 à 0,60.",
+      "type": "number",
+      "format": "float",
+      "default": 0.30000001192092896,
+      "maximum": 0.6,
+      "minimum": 0.2
+    },
+    "delay_ms": {
+      "description": "Retard de la voie croisée, de 0 à 1 ms.",
+      "type": "number",
+      "format": "float",
+      "default": 0.30000001192092896,
+      "maximum": 1.0,
+      "minimum": 0.0
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "head_shadow": {
+      "description": "Passe-bas « ombre de la tête » (1er ordre, 6 dB/octave) sur la voie\ncroisée.",
+      "type": "boolean",
+      "default": false
+    },
+    "head_shadow_hz": {
+      "description": "Sa fréquence de coupure, de 100 Hz à 10 kHz.",
+      "type": "number",
+      "format": "float",
+      "default": 700.0,
+      "maximum": 10000.0,
+      "minimum": 100.0
+    },
+    "low_cut": {
+      "description": "Coupe-bas du 1er ordre à 150 Hz sur la voie croisée.",
+      "type": "boolean",
+      "default": false
+    },
+    "phase_guard": {
+      "description": "Garde de phase : baisse le dosage quand la corrélation L/R devient\nnégative.",
+      "type": "boolean",
+      "default": true
+    },
+    "phase_guard_ms": {
+      "description": "Constante de temps de la corrélation lissée, de 20 à 50 ms.",
+      "type": "number",
+      "format": "float",
+      "default": 30.0,
+      "maximum": 50.0,
+      "minimum": 20.0
+    }
+  }
+}

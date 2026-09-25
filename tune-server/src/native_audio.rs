@@ -143,9 +143,14 @@ async fn install(
         Err(e) => refusal(e.to_string()),
     }
 }
+/// Le droit de licence d'un greffon audio. `crossfeed-pro` (#5039) est
+/// accordé par la licence Premium EXACTEMENT comme `crossfeed` : même droit.
+/// Sans cette ligne il tomberait dans le bras par défaut, celui de
+/// l'égaliseur, qui est GRATUIT. La politique commerciale propre à Crossfeed
+/// Pro reste à décider ; elle passera par une variante de `Feature`.
 pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
     match id {
-        "crossfeed" => tune_core::license::Feature::Crossfeed,
+        "crossfeed" | "crossfeed-pro" => tune_core::license::Feature::Crossfeed,
         "converter" => tune_core::license::Feature::BatchConverter,
         "declick" => tune_core::license::Feature::Declick,
         _ => tune_core::license::Feature::DspEq,
@@ -237,5 +242,28 @@ async fn asset(
     match tokio::task::spawn_blocking(move||tune_plugin_native::package::read_asset(&root(),&id,&name,&keys)).await {
         Ok(Ok(bytes)) => ([("content-type",content_type),("x-content-type-options","nosniff"),("cache-control","no-store"),("content-security-policy","sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'"),("access-control-allow-origin","*")],bytes).into_response(),
         Ok(Err(e))=>refusal(e),Err(e)=>refusal(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::feature;
+    use tune_core::license::Feature;
+
+    /// #5039 : le manifeste de Crossfeed Pro réclame `crossfeed-pro`, et ce
+    /// droit est celui de `crossfeed`, réservé au Premium — pas le bras par
+    /// défaut (l'égaliseur, gratuit).
+    #[test]
+    fn crossfeed_pro_est_premium_comme_crossfeed_5039() {
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../sdk/tune-plugin-crossfeed-pro/manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(manifest["entitlement"], "crossfeed-pro");
+        assert_eq!(manifest["id"], "crossfeed-pro");
+        let droit = feature("crossfeed-pro");
+        assert_eq!(droit, feature("crossfeed"));
+        assert_ne!(droit, Feature::DspEq, "tombé dans le bras gratuit");
+        assert!(Feature::all_premium().contains(&droit));
     }
 }
