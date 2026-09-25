@@ -170,6 +170,11 @@ declarer_evenements! {
     /// RESERVE : les erreurs partent en journal et en reponse HTTP, jamais sur
     /// le bus sous ce nom.
     Error => "error", Reserve;
+
+    // ── Sources physiques (#5065) ────────────────────────────────────────
+    /// La liste COMPLETE des sources physiques (CD, entrees…), a chaque
+    /// changement reel. Emis par `sources_physiques.rs`.
+    SourcesChanged => "sources.changed", Emis;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,7 +367,7 @@ mod tests {
     fn toutes_couvre_l_enumeration_entiere() {
         assert_eq!(
             EventType::TOUTES.len(),
-            38,
+            39,
             "une variante a ete ajoutee ou retiree : mettre ce compte a jour APRES \
              avoir verifie son statut d'emission"
         );
@@ -379,6 +384,8 @@ mod tests {
         // These strings are consumed by existing clients — they must not drift.
         assert_eq!(EventType::ZoneDeleted.as_str(), "zone.deleted");
         assert_eq!(EventType::ScanComplete.as_str(), "library.scan.completed");
+        // #5065 — la rubrique « Sources » du client web ecoute cette chaine.
+        assert_eq!(EventType::SourcesChanged.as_str(), "sources.changed");
         // Contrat ENTRE DEUX DEPOTS, dans l'autre sens : c'est le CLIENT qui
         // ecoutait cette chaine depuis la v0.8 (`MetadataView.svelte`,
         // `SettingsView.svelte`) et le serveur qui ne la produisait nulle part.

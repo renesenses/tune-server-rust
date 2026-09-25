@@ -1025,6 +1025,9 @@ pub struct PlaybackOrchestrator {
     /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
     /// par nom de `source`. Voir `crate::source_pcm`.
     pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
+    /// #5065 — le registre commun des sources physiques (CD, entrées…).
+    /// Voir `crate::sources_physiques`.
+    pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1328,6 +1331,7 @@ impl PlaybackOrchestrator {
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
+            sources_physiques: Arc::default(),
         }
     }
 
