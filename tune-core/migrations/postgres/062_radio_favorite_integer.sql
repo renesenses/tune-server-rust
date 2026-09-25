@@ -10,15 +10,15 @@ DECLARE
   def TEXT;
 BEGIN
   SELECT data_type, column_default INTO typ, def FROM information_schema.columns
-   WHERE table_schema = 'public' AND table_name = 'radio_stations'
+   WHERE table_schema = current_schema() AND table_name = 'radio_stations'
      AND column_name = 'is_favorite';
   IF typ IN ('smallint', 'integer', 'text', 'character varying', 'boolean') THEN
-    ALTER TABLE public.radio_stations ALTER COLUMN is_favorite DROP DEFAULT;
-    ALTER TABLE public.radio_stations ALTER COLUMN is_favorite TYPE BIGINT USING
+    ALTER TABLE radio_stations ALTER COLUMN is_favorite DROP DEFAULT;
+    ALTER TABLE radio_stations ALTER COLUMN is_favorite TYPE BIGINT USING
       (CASE lower(btrim(is_favorite::text)) WHEN 'true' THEN '1'
         WHEN 'false' THEN '0' ELSE is_favorite::text END)::bigint;
     IF def IS NOT NULL THEN
-      EXECUTE format('ALTER TABLE public.radio_stations ALTER COLUMN is_favorite SET DEFAULT (CASE lower(btrim((%s)::text)) WHEN ''true'' THEN ''1'' WHEN ''false'' THEN ''0'' ELSE (%s)::text END)::bigint', def, def);
+      EXECUTE format('ALTER TABLE radio_stations ALTER COLUMN is_favorite SET DEFAULT (CASE lower(btrim((%s)::text)) WHEN ''true'' THEN ''1'' WHEN ''false'' THEN ''0'' ELSE (%s)::text END)::bigint', def, def);
     END IF;
   END IF;
 END

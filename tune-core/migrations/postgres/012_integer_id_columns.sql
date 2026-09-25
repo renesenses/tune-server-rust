@@ -102,7 +102,9 @@ BEGIN
     SELECT cl.relname AS tbl, t.tgname AS name, pg_get_triggerdef(t.oid) AS def
       FROM pg_trigger t
       JOIN pg_class cl ON cl.oid = t.tgrelid
+      JOIN pg_namespace ns ON ns.oid = cl.relnamespace
      WHERE NOT t.tgisinternal
+       AND ns.nspname = current_schema()
        AND cl.relname = ANY(target_tables)
   LOOP
     trg_defs := array_append(trg_defs, trg.def);
@@ -113,7 +115,7 @@ BEGIN
   FOREACH c SLICE 1 IN ARRAY fk_cols LOOP
     SELECT data_type, column_default INTO cur_type, col_def
       FROM information_schema.columns
-     WHERE table_name = c[1] AND column_name = c[2];
+     WHERE table_schema = current_schema() AND table_name = c[1] AND column_name = c[2];
     IF cur_type IN ('text', 'character varying') THEN
       EXECUTE format(
         'SELECT count(*) FROM %I WHERE %I IS NOT NULL AND %I !~ %L',
@@ -144,7 +146,7 @@ BEGIN
   FOREACH t IN ARRAY pk_tables LOOP
     SELECT data_type INTO cur_type
       FROM information_schema.columns
-     WHERE table_name = t AND column_name = 'id';
+     WHERE table_schema = current_schema() AND table_name = t AND column_name = 'id';
     IF cur_type IN ('text', 'character varying') THEN
       EXECUTE format(
         'SELECT count(*) FROM %I WHERE id IS NOT NULL AND id !~ %L', t, int_re)

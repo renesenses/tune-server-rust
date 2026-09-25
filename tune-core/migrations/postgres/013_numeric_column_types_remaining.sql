@@ -84,7 +84,7 @@ BEGIN
   FOREACH c SLICE 1 IN ARRAY cols LOOP
     SELECT data_type INTO cur_type
       FROM information_schema.columns
-     WHERE table_name = c[1] AND column_name = c[2];
+     WHERE table_schema = current_schema() AND table_name = c[1] AND column_name = c[2];
 
     -- Only touch columns that exist AND are still text/varchar.
     IF cur_type IN ('text', 'character varying') THEN

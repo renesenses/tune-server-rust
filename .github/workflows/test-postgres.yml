@@ -222,6 +222,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
 
+      # #5003 — les gardes de migration lisent le schéma COURANT : un schéma
+      # voisin portant les mêmes tables (tout-TEXT, ou déjà BIGINT) ne doit
+      # rien changer au schéma que Tune reçoit. Le test monte SES bases
+      # (`tune_gardes_5003_*`) et les supprime, même en échec : rien ne reste
+      # dans `tune_test`.
+      - name: Gardes de migration et schéma voisin sur PostgreSQL (#5003)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5003 -- --nocapture
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
