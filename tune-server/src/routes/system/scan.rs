@@ -2409,6 +2409,11 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 }
             }
         }
+        // Coffrets automatiques (GO du 25/09/2026) : les disques d'un coffret
+        // rangé un dossier par disque (« Titre, Disc 2 ») sont réunis. APRÈS
+        // la réconciliation des paires distinctes, qu'elle consulte, et hors de
+        // la garde `full_scan_ok` : elle ne supprime rien qui ne soit absorbé.
+        tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan");
 
         // Backfill embedded cover art for local albums still missing a cover.
         // The incremental scan only extracts covers from files it re-processed;

@@ -1028,6 +1028,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     tracing::warn!(error = %e, "auto_scan_album_distinct_pairs_reconcile_failed")
                 }
             }
+            // Coffrets automatiques (GO du 25/09/2026) — même passe qu'après
+            // `POST /system/scan`.
+            tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto");
         }
 
         info!(

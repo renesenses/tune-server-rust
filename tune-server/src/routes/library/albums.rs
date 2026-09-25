@@ -6,7 +6,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::metadata::coffrets::{AlbumAGrouper, Coffret, coffrets, titre_commun};
+use tune_core::db::coffrets_auto;
+use tune_core::metadata::coffrets::{Coffret, coffrets, titre_commun};
 use tune_core::metadata::disques_abimes::{Correction, PisteAExaminer, corrections};
 use tune_http_types::panne_sql::OuDefautJournalise;
 
@@ -3594,34 +3595,11 @@ pub(super) async fn reparer_disques(
 // Coffrets ÉCLATÉS en un album par disque — chantier « coffrets »
 // ---------------------------------------------------------------------------
 
-/// Un album et le dossier d'une de ses pistes.
-///
-/// 🔴 `MIN(file_path)` : les disques d'un coffret n'ont qu'un dossier chacun,
-/// et prendre le plus petit chemin rend un résultat STABLE d'un appel à
-/// l'autre. Sans agrégat, l'ordre des lignes dépendrait du plan de requête et
-/// deux aperçus successifs pourraient ne pas se ressembler.
-const SQL_ALBUMS_ET_DOSSIER: &str = "\
-    SELECT t.album_id, al.title, MIN(t.file_path) \
-    FROM tracks t JOIN albums al ON al.id = t.album_id \
-    WHERE t.file_path IS NOT NULL AND t.file_path <> '' \
-    GROUP BY t.album_id, al.title";
-
-fn albums_a_grouper(state: &AppState) -> Vec<AlbumAGrouper> {
-    state
-        .backend
-        .query_many(SQL_ALBUMS_ET_DOSSIER, &[])
-        .ou_defaut_journalise()
-        .into_iter()
-        .filter_map(|r| {
-            let chemin = r.get(2).and_then(|v| v.as_string())?;
-            let dossier = chemin.rsplit_once('/').map(|(d, _)| d.to_string())?;
-            Some(AlbumAGrouper {
-                id: r.first().and_then(|v| v.as_i64())?,
-                titre: r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                dossier,
-            })
-        })
-        .collect()
+/// L'inventaire des albums à regrouper — UNE lecture, partagée avec la passe
+/// automatique ([`coffrets_auto::inventaire`]) : l'écran et la passe ne
+/// peuvent pas voir deux bibliothèques différentes.
+fn inventaire(state: &AppState) -> Result<coffrets_auto::Inventaire, AppError> {
+    coffrets_auto::inventaire(&state.backend).map_err(AppError::internal)
 }
 
 fn rapport_coffret(c: &Coffret) -> Value {
@@ -3637,7 +3615,7 @@ fn rapport_coffret(c: &Coffret) -> Value {
 pub(super) async fn coffrets_eclates(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    let trouves = coffrets(&albums_a_grouper(&state));
+    let trouves = coffrets(&inventaire(&state)?.albums);
     Ok(Json(json!({
         "count": trouves.len(),
         "albums": trouves.iter().map(|c| c.disques.len()).sum::<usize>(),
@@ -3768,6 +3746,18 @@ pub(super) async fn composer_coffret(
             tracing::warn!(album = cible, erreur = %e, "coffret_manuel_titre_non_renomme");
         }
     }
+    // Le marqueur `manuel` : la passe automatique ne touchera JAMAIS à ce
+    // coffret — ni pour y ajouter un disque frère, ni pour l'absorber ailleurs.
+    // Sans lui, un coffret manuel ne se distingue d'un coffret réparti sur
+    // plusieurs dossiers que par cette absence ; la passe l'épargne aussi,
+    // mais par prudence et non par décision.
+    let marqueur = serde_json::to_string(&coffrets_auto::Marqueur::manuel()).unwrap_or_default();
+    if let Err(e) =
+        tune_core::db::album_metadata_repo::AlbumMetadataRepo::with_backend(state.backend.clone())
+            .set(cible, coffrets_auto::CLE_COFFRET, &marqueur)
+    {
+        tracing::warn!(album = cible, erreur = %e, "coffret_manuel_non_marque");
+    }
     state.event_bus.emit(
         tune_core::event_types::EventType::LibraryUpdated.as_str(),
         json!({ "source": "coffret_manuel", "cible": cible }),
@@ -3802,43 +3792,34 @@ pub(super) async fn regrouper_coffret(
     State(state): State<AppState>,
     Path(cible): Path<i64>,
 ) -> axum::response::Response {
-    let trouves = coffrets(&albums_a_grouper(&state));
-    let Some(c) = trouves.into_iter().find(|c| c.cible() == Some(cible)) else {
+    let inv = match inventaire(&state) {
+        Ok(inv) => inv,
+        Err(e) => return e.into_response(),
+    };
+    let Some(c) = coffrets(&inv.albums)
+        .into_iter()
+        .find(|c| c.cible() == Some(cible))
+    else {
         return refus(
             StatusCode::NOT_FOUND,
             "coffret_inconnu",
             format!("l'album {cible} n'est pas le premier disque d'un coffret éclaté"),
         );
     };
-    let repo = AlbumRepo::with_backend(state.backend.clone());
-    let mut absorbes = 0usize;
-    for id in c.absorbes() {
-        if let Err(e) = repo.absorber(cible, id) {
-            return AppError::internal(format!("regroupement du disque {id} : {e}"))
+    // La MÊME réunion que la passe automatique : numéros de disque d'après le
+    // marqueur, absorption, titre sans marqueur, marqueur `auto` (qui permet
+    // de la défaire).
+    let absorbes = match coffrets_auto::reunir(&state.backend, &c, &inv) {
+        Ok(n) => n,
+        Err(e) => {
+            return AppError::internal(format!("regroupement du coffret {cible} : {e}"))
                 .into_response();
         }
-        absorbes += 1;
-    }
-    // Le titre du coffret, marqueur retiré : l'album survivant s'appelait
-    // « … , Disc 1 » et porte désormais tout le coffret.
-    //
-    // ⚠️ Un titre non renommé n'annule PAS le regroupement : les pistes sont
-    // déjà réunies, et refuser ici laisserait la bibliothèque à mi-chemin.
-    // On le journalise, l'utilisateur peut renommer à la main.
-    {
-        let (p1, p2) = match state.backend.engine() {
-            Engine::Postgres => (
-                PostgresDialect.placeholder(1),
-                PostgresDialect.placeholder(2),
-            ),
-            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
-        };
-        if let Err(e) = state.backend.execute(
-            &format!("UPDATE albums SET title = {p1} WHERE id = {p2}"),
-            &[&c.titre as &dyn ToSqlValue, &cible],
-        ) {
-            tracing::warn!(album = cible, erreur = %e, "coffret_titre_non_renomme");
-        }
+    };
+    // Réunir à la main un coffret qu'on avait défait, c'est revenir sur le
+    // refus : la passe ne doit plus le tenir pour refusé.
+    if let Err(e) = coffrets_auto::oublier_refus(&state.backend, &c.cle) {
+        tracing::warn!(cible, erreur = %e, "coffret_refus_non_oublie");
     }
     state.event_bus.emit(
         tune_core::event_types::EventType::LibraryUpdated.as_str(),
@@ -3850,4 +3831,75 @@ pub(super) async fn regrouper_coffret(
         Json(json!({ "cible": cible, "absorbes": absorbes, "titre": c.titre })),
     )
         .into_response()
+}
+
+/// `GET /library/coffrets` — les COFFRETS de la bibliothèque, pour l'onglet
+/// « Coffrets » (GO de Bertrand du 25/09/2026).
+///
+/// Coffrets automatiques, coffrets composés à la main, et tout album rangé
+/// disque par disque dans des dossiers distincts (voir
+/// [`coffrets_auto::lister`]). Chaque entrée est l'album tel que le rend
+/// `GET /library/albums/{id}`, plus :
+///
+/// - `disc_count` : le nombre RÉEL de disques, compté sur les pistes — la
+///   colonne `albums.disc_count` n'est pas tenue à jour par une réunion ;
+/// - `coffret` : `auto`, `manuel`, ou `null` (coffret sans marqueur).
+///
+/// Trié par titre, sans casse.
+pub(super) async fn lister_coffrets(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    let liste = coffrets_auto::lister(&state.backend).map_err(AppError::internal)?;
+    let repo = AlbumRepo::with_backend(state.backend.clone());
+    let mut items = Vec::with_capacity(liste.len());
+    for c in liste {
+        let Some(album) = repo.get(c.album_id).map_err(AppError::internal)? else {
+            continue;
+        };
+        let mut j = album.to_json();
+        if let Some(obj) = j.as_object_mut() {
+            obj.insert("disc_count".into(), json!(c.disques));
+            obj.insert("coffret".into(), json!(c.origine));
+        }
+        items.push(j);
+    }
+    items.sort_by_cached_key(|j| j["title"].as_str().unwrap_or_default().to_lowercase());
+    Ok(Json(json!({ "count": items.len(), "items": items })))
+}
+
+/// `POST /library/coffrets/{id}/defaire` — DÉFAIT un coffret automatique.
+///
+/// Chaque disque redevient un album, sous son titre d'origine, et le coffret
+/// est retenu comme refusé : la passe automatique ne le reforme plus, même
+/// après un rescan complet. Le réunir de nouveau reste possible, à la main,
+/// depuis l'écran des coffrets éclatés — ce qui lève le refus.
+///
+/// Un coffret composé À LA MAIN n'est pas concerné (409) : il n'a pas été
+/// deviné, il n'y a rien à désavouer.
+pub(super) async fn defaire_coffret(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    match coffrets_auto::defaire(&state.backend, id) {
+        Ok(recrees) => {
+            state.event_bus.emit(
+                tune_core::event_types::EventType::LibraryUpdated.as_str(),
+                json!({ "source": "coffret_defait", "cible": id }),
+            );
+            tracing::info!(cible = id, disques = recrees.len(), "coffret_defait");
+            (
+                StatusCode::OK,
+                Json(json!({ "cible": id, "albums_recrees": recrees })),
+            )
+                .into_response()
+        }
+        Err(coffrets_auto::RefusDefaire::PasUnCoffretAuto) => refus(
+            StatusCode::CONFLICT,
+            "pas_un_coffret_auto",
+            format!("l'album {id} n'est pas un coffret réuni automatiquement"),
+        ),
+        Err(coffrets_auto::RefusDefaire::Base(e)) => {
+            AppError::internal(format!("défaire le coffret {id} : {e}")).into_response()
+        }
+    }
 }

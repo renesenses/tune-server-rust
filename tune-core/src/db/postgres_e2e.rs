@@ -178,6 +178,17 @@ async fn pg_albums_round_trip() {
     assert_eq!(again.id, Some(id));
 }
 
+/// Coffrets automatiques (GO du 25/09/2026) : LE MÊME scénario que le témoin
+/// SQLite `scenario_complet_sur_sqlite` — réunir, laisser le manuel, défaire,
+/// ne pas reformer — sur le VRAI moteur. `COUNT(DISTINCT …)`, `MIN(file_path)`,
+/// le marqueur JSON dans `album_metadata` et le refus dans `settings` y passent.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_complet(&db);
+}
+
 /// Preuve réelle sur le second dialecte pour #2458 : le MBID vide ne sert plus
 /// d'identité et la réparation fail-closed exécute sa sélection + son UPDATE
 /// dans une transaction PostgreSQL, pas seulement dans le fixture SQLite.
