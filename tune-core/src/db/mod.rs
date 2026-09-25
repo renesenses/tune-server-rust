@@ -52,6 +52,8 @@ pub mod task_run_repo;
 pub mod track_metadata_repo;
 pub mod track_repo;
 pub mod tx_holder;
+/// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
+pub mod verrou_ecriture;
 pub mod zone_repo;
 
 #[cfg(test)]

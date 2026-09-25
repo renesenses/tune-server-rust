@@ -193,7 +193,18 @@ pub async fn run_with(opts: RunOptions) {
 
     let config = TuneConfig::load();
 
-    installer_le_journal(&config.log_level);
+    let chemin_du_journal = installer_le_journal(&config.log_level);
+
+    // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
+    // ptrace ni sudo. Les relevés vont à côté du journal.
+    {
+        let dossier = chemin_du_journal
+            .as_deref()
+            .and_then(|c| c.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        std::mem::forget(crate::gel_executeur::demarrer_en_production(dossier));
+    }
 
     // Image builders alone cannot protect appliances already in the field:
     // self-update replaces this binary, not /etc.  On Tune OS/Linux, migrate
