@@ -127,7 +127,8 @@ async fn etiqueter_un_dossier_est_accepte_et_se_lit_dans_la_forme_servie() {
     );
 
     // Lisible par son NOM, dans la forme SERVIE de `/library/collections` :
-    // `album_count` compté, `orphan_album_ids` présent.
+    // `album_count` compté, et les manquants dans la forme de #901 (#4808) —
+    // le NOMBRE dans `orphan_album_count`, la LISTE dans `orphan_album_ids`.
     let (status, body) = get(&app, &format!("/api/v1/tags/{tag}/collections")).await;
     assert_eq!(status, StatusCode::OK, "404 = route absente");
     assert_eq!(body["tag_id"], json!(tag));
@@ -135,8 +136,13 @@ async fn etiqueter_un_dossier_est_accepte_et_se_lit_dans_la_forme_servie() {
     assert_eq!(body["collections"][0]["id"], json!(cid));
     assert_eq!(body["collections"][0]["name"], json!("Vinyles à réécouter"));
     assert_eq!(body["collections"][0]["album_count"], json!(0), "{body}");
+    assert_eq!(
+        body["collections"][0]["orphan_album_count"],
+        json!(0),
+        "{body}"
+    );
     assert!(
-        body["collections"][0]["orphan_album_ids"].is_number(),
+        body["collections"][0]["orphan_album_ids"].is_array(),
         "{body}"
     );
 

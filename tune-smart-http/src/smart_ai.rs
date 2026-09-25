@@ -33,12 +33,21 @@ use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
 use crate::SmartHttpState;
-use tune_http_types::AppError;
+use tune_http_types::{ActiveProfile, AppError};
+
+/// #4806 — le socle de chaque générateur : un titre banni par le profil qui
+/// demande n'entre dans aucune playlist générée, quelle que soit la variante.
+/// Alias `t`, comme toutes les requêtes de ce module.
+fn sans_titres_bannis(profile: &ActiveProfile) -> String {
+    tune_core::db::facet_filter::banned_tracks_excluded(profile.id())
+}
 
 pub fn router<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
     SmartHttpState: axum::extract::FromRef<S>,
+    ActiveProfile: axum::extract::FromRequestParts<S>,
+    <ActiveProfile as axum::extract::FromRequestParts<S>>::Rejection: axum::response::IntoResponse,
 {
     Router::new()
         .route("/generate", post(generate_smart_playlist))
@@ -90,8 +99,10 @@ struct GenerateRequest {
 
 async fn generate_smart_playlist(
     State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
     Json(body): Json<GenerateRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let sans_bannis = sans_titres_bannis(&profile);
     let limit = body.limit.unwrap_or(30);
     let prompt = body.prompt.to_lowercase();
     let engine = state.backend.engine();
@@ -207,6 +218,8 @@ async fn generate_smart_playlist(
         .collect();
     let artist_filter = pick_artist_from_prompt(&prompt, &artist_names);
 
+    // #4806 — le socle s'ajoute aux conditions, toujours présent.
+    conditions.push(sans_bannis.clone());
     // Placeholders: the artist (if matched) binds as $1 and LIMIT follows.
     let (where_clause, limit_ph) = if artist_filter.is_some() {
         conditions.push(format!("LOWER(ar.name) = LOWER({})", ph(engine, 1)));
@@ -281,8 +294,10 @@ struct MoodRequest {
 
 async fn mood_playlist(
     State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
     Json(body): Json<MoodRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let sans_bannis = sans_titres_bannis(&profile);
     let limit = body.limit.unwrap_or(20);
     let engine = state.backend.engine();
 
@@ -354,6 +369,7 @@ async fn mood_playlist(
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          WHERE ({genre_where}) AND ({bpm_cast} IS NULL OR {bpm_cast} BETWEEN {p1} AND {p2}) \
+         AND {sans_bannis} \
          ORDER BY RANDOM() \
          LIMIT {p3}",
     );
@@ -398,6 +414,7 @@ async fn mood_playlist(
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              WHERE ({bpm_cast} IS NULL OR {bpm_cast} BETWEEN {p1} AND {p2}) \
+             AND {sans_bannis} \
              ORDER BY RANDOM() \
              LIMIT {p3}",
         );
@@ -442,8 +459,10 @@ struct SimilarToRequest {
 
 async fn similar_to_playlist(
     State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
     Json(body): Json<SimilarToRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let sans_bannis = sans_titres_bannis(&profile);
     let limit = body.limit.unwrap_or(20);
     let engine = state.backend.engine();
 
@@ -545,6 +564,8 @@ async fn similar_to_playlist(
     } else {
         format!("{} AND {}", conditions.join(" AND "), exclude)
     };
+    // #4806 — jamais un titre banni, quelle que soit la ressemblance.
+    let where_clause = format!("({where_clause}) AND {sans_bannis}");
 
     let p1 = ph(engine, 1);
     let sql = format!(
@@ -607,8 +628,10 @@ struct HistoryBasedRequest {
 
 async fn history_based_playlist(
     State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
     Json(body): Json<HistoryBasedRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let sans_bannis = sans_titres_bannis(&profile);
     let limit = body.limit.unwrap_or(30);
     let days = body.days.unwrap_or(30);
     let engine = state.backend.engine();
@@ -671,6 +694,7 @@ async fn history_based_playlist(
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              WHERE t.artist_id IN ({in_clause}) \
+             AND {sans_bannis} \
              ORDER BY RANDOM() \
              LIMIT {p1}",
         );
@@ -714,6 +738,7 @@ async fn history_based_playlist(
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              WHERE ({genre_where}) \
                AND t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+               AND {sans_bannis} \
              ORDER BY RANDOM() \
              LIMIT {p1}",
         );
@@ -749,6 +774,7 @@ async fn history_based_playlist(
              FROM tracks t \
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
+             WHERE {sans_bannis} \
              ORDER BY RANDOM() \
              LIMIT {p1}",
         );
@@ -797,8 +823,10 @@ struct TempoMatchRequest {
 
 async fn tempo_match_playlist(
     State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
     Json(body): Json<TempoMatchRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let sans_bannis = sans_titres_bannis(&profile);
     let tolerance = body.tolerance.unwrap_or(10.0);
     let limit = body.limit.unwrap_or(20);
     let bpm_min = body.target_bpm - tolerance;
@@ -822,6 +850,7 @@ async fn tempo_match_playlist(
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          WHERE t.bpm IS NOT NULL AND {bpm_cast} BETWEEN {p1} AND {p2} \
+         AND {sans_bannis} \
          ORDER BY ABS({bpm_cast} - {p3}) ASC \
          LIMIT {p4}",
     );
@@ -876,8 +905,10 @@ struct DiscoveryRequest {
 
 async fn discovery_playlist(
     State(state): State<SmartHttpState>,
+    profile: ActiveProfile,
     Json(body): Json<DiscoveryRequest>,
 ) -> Result<Json<Value>, AppError> {
+    let sans_bannis = sans_titres_bannis(&profile);
     let limit = body.limit.unwrap_or(30);
     let engine = state.backend.engine();
 
@@ -909,6 +940,7 @@ async fn discovery_playlist(
              LEFT JOIN albums al ON t.album_id = al.id \
              LEFT JOIN artists ar ON t.artist_id = ar.id \
              WHERE t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+             AND {sans_bannis} \
              ORDER BY RANDOM() \
              LIMIT {p1}",
         );
@@ -957,6 +989,7 @@ async fn discovery_playlist(
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          WHERE ({genre_where}) \
            AND t.id NOT IN (SELECT DISTINCT track_id FROM listen_history WHERE track_id IS NOT NULL) \
+           AND {sans_bannis} \
          ORDER BY RANDOM() \
          LIMIT {p1}",
     );

@@ -3056,6 +3056,21 @@ async fn next(State(state): State<AppState>, Path(zone_id): Path<i64>) -> impl I
         .enjamber_les_serveurs_absents(zone_id, next_pos)
         .await
         .map_or(next_pos, |(position, _)| position);
+    // #4806 — « Suivant » saute aussi les titres bannis ; si tout ce qui
+    // restait l'était, la file est finie.
+    let next_pos = match state
+        .orchestrator
+        .enjamber_les_pistes_bannies(zone_id, next_pos)
+        .await
+    {
+        tune_core::orchestrator::Enjambee::Rien => next_pos,
+        tune_core::orchestrator::Enjambee::Reprise(p) => p,
+        tune_core::orchestrator::Enjambee::FileEpuisee => {
+            let device_id = get_zone_device_id(&state, zone_id);
+            state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+            return Json(json!({ "status": "stopped", "reason": "end_of_queue" })).into_response();
+        }
+    };
     let s = state.clone();
     tokio::spawn(async move {
         if let Err(e) = s.orchestrator.play_from_queue(zone_id, next_pos).await {
@@ -3288,7 +3303,94 @@ async fn set_repeat(
     Json(json!({ "repeat": mode }))
 }
 
-async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json<Value> {
+/// #4806 — la piste vient d'être BANNIE alors qu'elle joue : chaque zone qui
+/// la joue passe au suivant, avec les mêmes enjambées que « Suivant ». Rend
+/// les zones passées, avec la position reprise (ou `null` : file finie) et
+/// `started` : le suivant a démarré (`false` = file finie, ou échec annoncé).
+///
+/// Une ligne de service dont le `source_id` vaut l'id local banni n'est pas
+/// concernée : `now_playing.track_id` est `None` pour elle.
+pub(crate) async fn passer_les_zones_qui_jouent_la_piste(
+    state: &AppState,
+    track_id: i64,
+) -> Vec<Value> {
+    let mut passees = Vec::new();
+    for zs in state.playback.all_states().await {
+        if zs.state == tune_core::playback::PlayState::Stopped {
+            continue;
+        }
+        if zs.now_playing.as_ref().and_then(|np| np.track_id) != Some(track_id) {
+            continue;
+        }
+        let zone_id = zs.zone_id;
+        let titre = zs
+            .now_playing
+            .as_ref()
+            .map(|np| np.title.clone())
+            .unwrap_or_default();
+        let suivante = tune_core::poller::PositionPoller::next_position_manual(&zs);
+        let suivante = match suivante {
+            None => None,
+            Some(p) => {
+                let p = state
+                    .orchestrator
+                    .enjamber_les_serveurs_absents(zone_id, p)
+                    .await
+                    .map_or(p, |(position, _)| position);
+                match state
+                    .orchestrator
+                    .enjamber_les_pistes_bannies(zone_id, p)
+                    .await
+                {
+                    tune_core::orchestrator::Enjambee::Rien => Some(p),
+                    tune_core::orchestrator::Enjambee::Reprise(p) => Some(p),
+                    tune_core::orchestrator::Enjambee::FileEpuisee => None,
+                }
+            }
+        };
+        info!(
+            zone_id,
+            track_id,
+            title = %titre,
+            queue_position = zs.queue_position,
+            suivante = ?suivante,
+            "piste_bannie_en_cours_passage_au_suivant"
+        );
+        // Attendu EN LIGNE, pas détaché : la réponse du bannissement peut
+        // dire si le suivant a démarré, et l'échec est annoncé (#3270). Les
+        // seuls démarrages détachés de ce fichier restent ceux de `next` et
+        // de `previous`, dont la réponse est déjà partie.
+        let demarree = match suivante {
+            Some(p) => match state.orchestrator.play_from_queue(zone_id, p).await {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(zone_id, error = %e, "piste_bannie_suivante_non_demarree");
+                    state
+                        .orchestrator
+                        .dire_piste_non_demarree(zone_id, "suivante", &e);
+                    false
+                }
+            },
+            None => {
+                let device_id = get_zone_device_id(state, zone_id);
+                state.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                false
+            }
+        };
+        passees.push(json!({
+            "zone_id": zone_id,
+            "queue_position": suivante,
+            "started": demarree,
+        }));
+    }
+    passees
+}
+
+async fn get_queue(
+    State(state): State<AppState>,
+    profile: ActiveProfile,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
     let ps = state.playback.get_state(zone_id).await;
 
@@ -3338,11 +3440,22 @@ async fn get_queue(State(state): State<AppState>, Path(zone_id): Path<i64>) -> J
     // pas sur la longueur que l'état de zone traînait.
     let mut zs = ps.clone();
     zs.queue_length = length as i64;
+    // #4806 — `banned` par ligne, pour le profil qui regarde : la file n'est
+    // pas purgée, la ligne reste et l'écran la grise. Une ligne de service
+    // (`track_id` absent) n'est jamais bannie, quel que soit son `source_id`.
+    let ids_locaux: Vec<i64> = entries.iter().filter_map(|e| e.track_id).collect();
+    let bannis = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .banned_track_ids(profile.id(), &ids_locaux)
+        .ou_defaut_journalise();
     let tracks: Vec<Value> = entries
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                let bannie = e.track_id.is_some_and(|id| bannis.contains(&id));
+                obj.insert("banned".into(), Value::Bool(bannie));
+            }
             let suivant = entries.get(idx + 1);
             let promesse = tune_core::playback::gapless::enchainement_sans_blanc(
                 &tune_core::playback::gapless::EnchainementAffiche {
@@ -5528,12 +5641,38 @@ fn reponse_shuffle(
 
 pub async fn shuffle_all(
     State(state): State<AppState>,
+    profile: ActiveProfile,
     Query(q): Query<ShuffleAllQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = crate::i18n::lang_from_header(&headers);
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
+    // #4806 — l'aléatoire est une sélection automatique : un titre banni par
+    // le profil qui agit n'en sort jamais. Les tirages SQL (bibliothèque
+    // entière, répertoire) filtrent dans la requête ; les branches qui
+    // réutilisent une liste d'affichage (album, artiste, recherche, genre)
+    // — qui, elles, ne filtrent pas, par contrat — sont épurées ici.
+    let profil = profile.id();
+    let sans_bannis = |ids: Vec<i64>| -> Vec<i64> {
+        let bannis = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+            .banned_track_ids(profil, &ids)
+            .ou_defaut_journalise();
+        if bannis.is_empty() {
+            return ids;
+        }
+        ids.into_iter().filter(|id| !bannis.contains(id)).collect()
+    };
+    let sans_pistes_bannies = |pistes: Vec<tune_core::db::models::Track>| {
+        let ids: Vec<i64> = pistes.iter().filter_map(|t| t.id).collect();
+        let bannis = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+            .banned_track_ids(profil, &ids)
+            .ou_defaut_journalise();
+        pistes
+            .into_iter()
+            .filter(|t| !t.id.is_some_and(|id| bannis.contains(&id)))
+            .collect::<Vec<_>>()
+    };
     // Lu UNE fois par requête, puis passé à toutes les branches. Les cinq
     // chemins (album, artiste, recherche, genre, bibliothèque entière) et la
     // troncature finale doivent voir le MÊME plafond : c'est aussi la valeur
@@ -5549,17 +5688,21 @@ pub async fn shuffle_all(
     // ce cas on ne l'invente pas : c'est la même règle que #2250 sur la
     // résolution annoncée, la valeur qu'on a ou rien.
     let (mut all_ids, disponibles): (Vec<i64>, Option<i64>) = if let Some(aid) = q.album_id {
-        let ids: Vec<i64> = track_repo
-            .list_by_album(aid)
-            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default();
+        let ids: Vec<i64> = sans_bannis(
+            track_repo
+                .list_by_album(aid)
+                .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+                .unwrap_or_default(),
+        );
         let n = ids.len() as i64;
         (ids, Some(n))
     } else if let Some(arid) = q.artist_id {
-        let ids: Vec<i64> = track_repo
-            .list_by_artist(arid)
-            .map(|v| v.into_iter().filter_map(|t| t.id).collect())
-            .unwrap_or_default();
+        let ids: Vec<i64> = sans_bannis(
+            track_repo
+                .list_by_artist(arid)
+                .map(|v| v.into_iter().filter_map(|t| t.id).collect())
+                .unwrap_or_default(),
+        );
         let n = ids.len() as i64;
         (ids, Some(n))
     } else if let Some(fld) = q.folder.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -5580,7 +5723,7 @@ pub async fn shuffle_all(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        match track_repo.random_ids_in_folder(fld, terme, plafond) {
+        match track_repo.random_ids_in_folder(profil, fld, terme, plafond) {
             Ok((ids, total)) => (ids, Some(total)),
             Err(e) => {
                 // Ne PAS retomber sur la bibliothèque entière : c'est
@@ -5596,9 +5739,15 @@ pub async fn shuffle_all(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        selection_bornee(track_repo.search(sq, plafond).ok(), plafond)
+        selection_bornee(
+            track_repo.search(sq, plafond).ok().map(sans_pistes_bannies),
+            plafond,
+        )
     } else if let Some(g) = q.genre.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        selection_bornee(track_repo.search(g, plafond).ok(), plafond)
+        selection_bornee(
+            track_repo.search(g, plafond).ok().map(sans_pistes_bannies),
+            plafond,
+        )
     } else {
         // Whole-library shuffle: take a random `plafond`-sized sample straight
         // from the DB rather than every row. Enqueuing an entire 50k-track library
@@ -5610,7 +5759,7 @@ pub async fn shuffle_all(
         // C'est la seule branche où le total est connu sans coût : la
         // bibliothèque entière se compte.
         (
-            track_repo.random_ids(plafond).unwrap_or_default(),
+            track_repo.random_ids(profil, plafond).unwrap_or_default(),
             track_repo.count().ok(),
         )
     };

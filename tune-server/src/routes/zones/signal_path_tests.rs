@@ -3139,6 +3139,9 @@ fn pure_sans_conversion_n_est_pas_degrade_3973() {
 fn fichier_flac(dir: &std::path::Path, nom: &str, vendeur: &str, md5_nul: bool) -> String {
     let mut f = b"fLaC".to_vec();
     let mut streaminfo = [0u8; 34];
+    // Cadence 44 100 Hz, 2 canaux, 16 bits — un STREAMINFO renseigné, comme
+    // ceux de l'enregistreur (#4800 lit la cadence pour bâtir l'en-tête neuf).
+    streaminfo[10..14].copy_from_slice(&[0x0A, 0xC4, 0x42, 0xF0]);
     if !md5_nul {
         streaminfo[18..34].copy_from_slice(&[0x5a; 16]);
     }
@@ -3204,6 +3207,14 @@ fn un_flac_ffmpeg_vers_le_reseau_annonce_son_conteneur_reecrit_4350() {
         transcoder["bit_perfect"],
         serde_json::json!(true),
         "ré-encodé sans perte : mêmes échantillons, {transcoder}"
+    );
+    // #4800 — l'en-tête de ce fichier se lit, et une trame le suit : le
+    // conteneur est réécrit sans décodage, et l'écran le dit.
+    assert!(
+        transcoder["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("trames copiées telles quelles")),
+        "{transcoder}"
     );
     assert!(
         sp["summary"].as_str().unwrap().contains("transcode"),
@@ -3428,4 +3439,73 @@ async fn sans_declaration_du_renderer_un_51_garde_ses_six_voies() {
         Some(6),
         "aucun renderer n'a déclaré ses canaux : la piste part intacte"
     );
+}
+
+/// Une piste DSD de serveur média que la zone laisse partir BRUTE — servie
+/// par une session mandataire de Tune (`/stream/<id>.dsf`), donc avec un fil
+/// lisible. Le panneau ne doit annoncer AUCUN transcodage : c'est exactement
+/// le libellé impossible « DSD64 → FLAC 2822kHz/1bit » que #1315 a déjà
+/// coûté, et que l'absence de fil (URL distante remise telle quelle, avant
+/// correctif) faisait renaître avec son avertissement
+/// `signal_path_libelle_impossible_ecarte` en rafale (.18, 23/09/2026).
+#[test]
+fn un_dsd_de_serveur_media_servi_brut_par_tune_n_annonce_aucun_transcodage() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Abacab".into(),
+            source: "upnp".into(),
+            format: Some("dsd".into()),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            stream_id: Some("sid-dsf".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let fil = wire("dsf", 2_822_400, 1);
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DMP-A8"), "", Some(&fil)).unwrap();
+
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("DSD64 2.8 MHz"));
+    assert!(
+        step_desc(&sp, "Transcoder").is_none(),
+        "le fil porte le .dsf brut : aucune étape de transcodage ne doit être inventée ({sp})"
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+}
+
+/// La même piste quand la zone demande du PCM : Tune la décime en WAV
+/// 176,4 kHz / 24 bits et c'est CE fil-là que le panneau décrit — pas une
+/// cible FLAC devinée, pas une résolution DSD sous un conteneur PCM.
+#[test]
+fn un_dsd_de_serveur_media_decime_par_tune_annonce_le_wav_reellement_servi() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Abacab".into(),
+            source: "upnp".into(),
+            format: Some("dsd".into()),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            stream_id: Some("sid-wav".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let fil = wire("wav", 176_400, 24);
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DMP-A8"), "", Some(&fil)).unwrap();
+
+    assert_eq!(
+        step_desc(&sp, "Transcoder").as_deref(),
+        Some("DSD64 2.8 MHz \u{2192} WAV 176kHz/24bit"),
+        "le panneau doit dire ce qui part réellement ({sp})"
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    assert_eq!(sp.get("lossless").and_then(Value::as_bool), Some(true));
 }

@@ -461,6 +461,21 @@ pub trait StreamingService: Send + Sync {
     /// ou un refus de l'API (#2160). C'est le seul endroit où cette traduction
     /// peut vivre une fois pour toutes : chaque service la referait sinon, et
     /// aucun ne la faisait.
+    /// Combien d'éléments PAR CATÉGORIE [`Self::search_page`] rend réellement
+    /// pour une `limit` demandée (#4803).
+    ///
+    /// La recherche fédérée pagine chaque service avec un curseur : la page
+    /// suivante commence à `offset + ce nombre`. Avancer du nombre DEMANDÉ
+    /// quand le service en a servi moins ferait un TROU — Qobuz ramène un
+    /// `limit=1000` à 500 : avancer de 1000 sauterait les rangs 500 à 999.
+    ///
+    /// Défaut : la borne de [`Self::search_page`] par défaut,
+    /// [`limite_sans_pagination`]. Un service qui redéfinit `search_page`
+    /// avec un autre plafond doit redéfinir aussi cette méthode.
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        limite_sans_pagination(limit)
+    }
+
     async fn search_page(
         &self,
         query: &str,
@@ -533,6 +548,17 @@ pub trait StreamingService: Send + Sync {
     ) -> Result<Vec<StreamArtist>, TuneError> {
         let _ = (artist_id, limit);
         Ok(vec![])
+    }
+    /// Le service connaît-il SES artistes similaires ?
+    ///
+    /// Fil 1906 (FabienM), point 3 : « Plus comme ça » sur un titre de
+    /// service. Le défaut vide de [`Self::get_similar_artists`] suffit à la
+    /// radio d'autoplay, qui se tait en silence ; il ne suffit pas à une route
+    /// qu'on interroge : un service sans similarité y rendrait une liste vide,
+    /// indiscernable d'un artiste isolé. La capacité se DIT donc ici, et la
+    /// route répond 501 à qui ne l'a pas. Seul Qobuz la déclare aujourd'hui.
+    fn propose_des_artistes_similaires(&self) -> bool {
+        false
     }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;

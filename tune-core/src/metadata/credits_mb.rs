@@ -30,6 +30,11 @@ pub struct LigneCredit {
     /// Instrument CANONISÉ (§4 de l'issue), ou `None` pour les rôles qui n'en
     /// portent pas (producteur, ingénieur…).
     pub instrument: Option<String>,
+    /// Identifiant MusicBrainz de l'artiste crédité (`artist.id` de la
+    /// relation ou de l'`artist-credit`), quand la réponse le porte. La page
+    /// artiste le compare à `artists.musicbrainz_id` (#4767) : le nom seul se
+    /// trompe d'homonyme.
+    pub artist_mbid: Option<String>,
 }
 
 /// Types de relation MusicBrainz retenus, et le rôle canonique écrit en base.
@@ -117,6 +122,16 @@ fn instruments_de_la_relation(rel: &Value) -> Vec<String> {
     out
 }
 
+/// Le MBID d'un objet `artist` MusicBrainz, s'il est présent et non vide.
+fn mbid_artiste(artiste: Option<&Value>) -> Option<String> {
+    artiste
+        .and_then(|a| a.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Lignes issues de `artist-credit` (les interprètes principaux du morceau).
 ///
 /// Contrat inchangé : rôle `artist`, un par entrée, dans l'ordre.
@@ -135,6 +150,7 @@ pub fn lignes_artist_credit(data: &Value) -> Vec<LigneCredit> {
                 .to_string(),
             role: "artist".to_string(),
             instrument: None,
+            artist_mbid: mbid_artiste(credit.get("artist")),
         })
         .collect()
 }
@@ -164,6 +180,7 @@ pub fn lignes_relations(data: &Value) -> Vec<LigneCredit> {
             continue;
         };
 
+        let artist_mbid = mbid_artiste(rel.get("artist"));
         let instruments = instruments_de_la_relation(rel);
         if instruments.is_empty() {
             // Un chant sans attribut reste un chant : sans ce repli, une
@@ -174,6 +191,7 @@ pub fn lignes_relations(data: &Value) -> Vec<LigneCredit> {
                 artist_name: name.to_string(),
                 role: role.to_string(),
                 instrument,
+                artist_mbid: artist_mbid.clone(),
             });
             continue;
         }
@@ -182,6 +200,7 @@ pub fn lignes_relations(data: &Value) -> Vec<LigneCredit> {
                 artist_name: name.to_string(),
                 role: role.to_string(),
                 instrument: Some(instrument),
+                artist_mbid: artist_mbid.clone(),
             });
         }
     }
@@ -326,6 +345,9 @@ pub async fn rechercher_l_enregistrement(
             echappe(artiste.trim())
         )
     };
+    // Créneau du limiteur MusicBrainz PARTAGÉ (#4767) : la recherche compte
+    // dans la même seconde que toutes les autres passes.
+    super::musicbrainz_release::rate_limit_delay().await;
     let resp = client
         .get("https://musicbrainz.org/ws/2/recording")
         .query(&[("query", query.as_str()), ("limit", "5"), ("fmt", "json")])

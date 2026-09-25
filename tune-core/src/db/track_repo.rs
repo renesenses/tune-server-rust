@@ -4,7 +4,9 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{Placeholders, any_of, favorite_condition, hidden_tracks_excluded};
+use super::facet_filter::{
+    Placeholders, any_of, banned_tracks_excluded, favorite_condition, hidden_tracks_excluded,
+};
 use super::home_queries::{DATE_D_AJOUT, JOINTURE_PREMIERE_VUE};
 use super::models::Track;
 use super::sqlite::SqliteDb;
@@ -2483,7 +2485,10 @@ impl TrackRepo {
         Ok(n > 0)
     }
 
-    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, TuneError> {
+    /// Tirage aléatoire sur la bibliothèque ENTIÈRE, pour ce profil : les
+    /// titres bannis (#4806) n'en sortent jamais — le filtre est dans la
+    /// requête, pas après, pour que le plafond soit tenu en pistes jouables.
+    pub fn random_ids(&self, profile_id: i64, limit: i64) -> Result<Vec<i64>, TuneError> {
         // Both engines accept `ORDER BY RANDOM()` (SQLite) /
         // `ORDER BY random()` (PG). The lowercase form works on both.
         let make_ph = |i: usize| match self.db.engine() {
@@ -2491,7 +2496,8 @@ impl TrackRepo {
             Engine::Postgres => PostgresDialect.placeholder(i),
         };
         let sql = format!(
-            "SELECT id FROM tracks ORDER BY random() LIMIT {}",
+            "SELECT t.id FROM tracks t WHERE {} ORDER BY random() LIMIT {}",
+            banned_tracks_excluded(profile_id),
             make_ph(1)
         );
         let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -2545,6 +2551,7 @@ impl TrackRepo {
     /// le sous-arbre affiché ; `None` ou vide = tout le sous-arbre.
     pub fn random_ids_in_folder(
         &self,
+        profile_id: i64,
         folder: &str,
         terme: Option<&str>,
         limit: i64,
@@ -2578,6 +2585,9 @@ impl TrackRepo {
 
         // Jumeau du socle de la vue filtrée : les albums masqués n'en sont pas.
         conditions.push(hidden_tracks_excluded().to_string());
+        // Et les titres bannis par ce profil non plus (#4806) — un tirage est
+        // une sélection automatique, pas une liste d'affichage.
+        conditions.push(banned_tracks_excluded(profile_id));
 
         // La jointure `artists` est inconditionnelle — comme dans
         // `list_filtered` — pour que le compte et le tirage lisent la MÊME
@@ -4328,7 +4338,7 @@ mod tests {
 
         let s = std::path::MAIN_SEPARATOR;
         let vise = format!("{s}music{s}Disco Pack");
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 500).unwrap();
 
         let attendus: std::collections::HashSet<i64> = cree
             .iter()
@@ -4368,7 +4378,7 @@ mod tests {
 
         let s = std::path::MAIN_SEPARATOR;
         let vise = format!("{s}music{s}Disco Pack");
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 2).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 2).unwrap();
         assert_eq!(ids.len(), 2, "la file est bornée par le plafond");
         assert_eq!(total, 3, "le total reste celui du répertoire entier");
     }
@@ -4388,7 +4398,7 @@ mod tests {
         let s = std::path::MAIN_SEPARATOR;
         let vise = format!("{s}music{s}Disco Pack");
         let (ids, total) = repo
-            .random_ids_in_folder(&vise, Some("funkytown"), 500)
+            .random_ids_in_folder(1, &vise, Some("funkytown"), 500)
             .unwrap();
         assert_eq!(ids.len(), 1, "une seule « Funkytown » sous ce répertoire");
         assert_eq!(total, 1);
@@ -4433,7 +4443,7 @@ mod tests {
         repo.create(&masquee).unwrap();
 
         // Témoin : avant le masquage, les deux pistes partent.
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 500).unwrap();
         assert_eq!(ids.len(), 2, "témoin : les deux pistes sont éligibles");
         assert_eq!(total, 2);
 
@@ -4441,7 +4451,7 @@ mod tests {
             .hide_album(album_id)
             .unwrap();
 
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 500).unwrap();
         assert_eq!(
             ids,
             vec![visible_id],
@@ -4470,7 +4480,7 @@ mod tests {
         let vise = format!("{s}music{s}Disco Pack");
 
         for terme in [None, Some("funkytown")] {
-            let (ids, total) = repo.random_ids_in_folder(&vise, terme, 500).unwrap();
+            let (ids, total) = repo.random_ids_in_folder(1, &vise, terme, 500).unwrap();
             let filtre = TrackFilter {
                 folder: Some(vise.clone()),
                 q: terme.map(str::to_string),
@@ -4788,5 +4798,71 @@ mod tests {
             "la valeur est déjà la bonne : la garde `cover_path <> ?` doit \
              empêcher toute réécriture à chaque scan"
         );
+    }
+
+    /// #4806 (a) — un titre banni ne sort JAMAIS d'un aléatoire de 500, sur
+    /// une base de banc de 40 pistes : 500 tirages de la bibliothèque entière
+    /// et 500 tirages par répertoire, aucun ne le contient ; et le plafond
+    /// est tenu en pistes JOUABLES (39, pas 40 moins une). Contre-épreuves :
+    /// avant le bannissement il sort, pour un AUTRE profil (g) il sort, et
+    /// après débannissement (e) il ressort.
+    #[test]
+    fn un_titre_banni_ne_sort_jamais_de_l_aleatoire() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Chic".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Banc");
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            let mut t = Track::new(format!("Piste {i:02}"));
+            t.artist_id = Some(artist_id);
+            t.file_path = Some(format!("{vise}{s}piste-{i:02}.flac"));
+            ids.push(repo.create(&t).unwrap());
+        }
+        let bannie = ids[17];
+        let bans = crate::db::hidden_repo::HiddenRepo::new(db.clone());
+
+        // Témoin : avant le bannissement, 500 tirages de 5 le ramènent.
+        let sort_avant = (0..500).any(|_| repo.random_ids(1, 5).unwrap().contains(&bannie));
+        assert!(
+            sort_avant,
+            "témoin : la piste doit sortir avant d'être bannie"
+        );
+
+        assert!(bans.ban_track(1, bannie).unwrap());
+
+        for _ in 0..500 {
+            let tirage = repo.random_ids(1, 5).unwrap();
+            assert!(
+                !tirage.contains(&bannie),
+                "bannie et pourtant tirée : {tirage:?}"
+            );
+        }
+        let tout = repo.random_ids(1, 500).unwrap();
+        assert_eq!(tout.len(), 39, "le plafond se tient en pistes jouables");
+        assert!(!tout.contains(&bannie));
+
+        for _ in 0..500 {
+            let (tirage, total) = repo.random_ids_in_folder(1, &vise, None, 5).unwrap();
+            assert!(
+                !tirage.contains(&bannie),
+                "bannie et pourtant tirée : {tirage:?}"
+            );
+            assert_eq!(total, 39, "le total du répertoire ne compte pas la bannie");
+        }
+
+        // (g) Par profil : bannie chez 1, pas chez 2.
+        let chez_2 = repo.random_ids(2, 500).unwrap();
+        assert_eq!(chez_2.len(), 40);
+        assert!(chez_2.contains(&bannie), "le profil 2 n'a rien banni");
+
+        // (e) Débannir rend tout.
+        assert!(bans.unban_track(1, bannie).unwrap());
+        let apres = repo.random_ids(1, 500).unwrap();
+        assert_eq!(apres.len(), 40);
+        assert!(apres.contains(&bannie));
     }
 }

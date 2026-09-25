@@ -5,6 +5,7 @@ pub mod batch;
 pub mod bio_batch;
 pub mod coffrets;
 pub mod credits_mb;
+pub mod credits_release;
 pub mod disques_abimes;
 pub mod enrich_scope;
 pub mod enrichment;
@@ -2116,6 +2117,65 @@ pub fn numero_de_disque(nom: &str) -> Option<u32> {
     None
 }
 
+/// Vrai quand un nom de dossier n'est QU'UNE variante de mixage d'une
+/// édition : `Multichannel 7.1`, `5.1`, `Stereo`, `Dolby Atmos`,
+/// `Surround 5.1`, `Quad`… (#4846, coffrets Blu-ray/SACD).
+///
+/// Même esprit que [`numero_de_disque`] : volontairement étroit. Chaque mot du
+/// nom doit être un mot de mixage (`multichannel`, `stereo`, `surround`,
+/// `atmos`, `quad`, `mch`, `dts`…), une disposition de canaux (`5.1`, `7.1.4`)
+/// ou un mot d'appoint (`mix`, `channel`, `dolby`…) — et au moins un mot de
+/// mixage ou une disposition. `Stereolab`, `Quadrophenia`, `Stereo Total`,
+/// `Mix` ou `Dolby` seuls ne sont donc pas des variantes.
+pub fn variante_de_mixage(nom: &str) -> bool {
+    let mut n = nom.trim().to_lowercase();
+    for (de, vers) in [
+        ("multi-channel", "multichannel"),
+        ("multi_channel", "multichannel"),
+        ("multi channel", "multichannel"),
+    ] {
+        n = n.replace(de, vers);
+    }
+    let disposition = |m: &str| {
+        let parts: Vec<&str> = m.split('.').collect();
+        (2..=3).contains(&parts.len())
+            && parts
+                .iter()
+                .all(|p| (1..=2).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    const MIXAGE: &[&str] = &[
+        "multichannel",
+        "multicanal",
+        "multicanaux",
+        "surround",
+        "stereo",
+        "stéréo",
+        "quad",
+        "quadraphonic",
+        "quadraphonique",
+        "atmos",
+        "mch",
+        "dts",
+    ];
+    const APPOINT: &[&str] = &[
+        "channel", "channels", "canaux", "ch", "mix", "dolby", "hd", "audio", "version",
+    ];
+    let mut signe = false;
+    let mut vide = true;
+    for mot in n
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | '_' | '-' | ','))
+        .filter(|m| !m.is_empty())
+    {
+        vide = false;
+        if MIXAGE.contains(&mot) || disposition(mot) {
+            signe = true;
+        } else if !APPOINT.contains(&mot) {
+            return false;
+        }
+    }
+    !vide && signe
+}
+
 /// Déduit `(album, artiste, disque)` de l'arborescence, convention
 /// `.../Artiste/Album/piste.ext`.
 ///
@@ -2175,6 +2235,19 @@ pub(crate) fn disque_arbitre(tag: Option<u32>, chemin: Option<u32>) -> Option<u3
     }
 }
 
+/// Le label d'un tag lofty : `ItemKey::Label`, et à défaut `ItemKey::Publisher`.
+///
+/// lofty range la trame ID3v2 `TPUB` sous `Publisher` — sa table déclare
+/// `"TPUB" => Publisher | Label` et la LECTURE retient la première variante —
+/// comme le commentaire Vorbis `PUBLISHER`. Ne demander que `Label` perdait
+/// donc le label de tout MP3/AIFF étiqueté par Mp3tag (#4836, fil 1899). Un
+/// `LABEL`/`ORGANIZATION` explicite reste prioritaire.
+fn label_du_tag(get: &dyn Fn(lofty::tag::ItemKey) -> Option<String>) -> Option<String> {
+    let non_vide = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    non_vide(get(lofty::tag::ItemKey::Label))
+        .or_else(|| non_vide(get(lofty::tag::ItemKey::Publisher)))
+}
+
 pub(crate) fn album_artiste_du_chemin(
     path: &Path,
 ) -> (Option<String>, Option<String>, Option<u32>) {
@@ -2184,7 +2257,25 @@ pub(crate) fn album_artiste_du_chemin(
             .map(|s| s.to_string())
     };
     let parent = path.parent();
-    let disque = nom(parent).as_deref().and_then(numero_de_disque);
+    let nom_du_parent = nom(parent);
+    let disque = nom_du_parent.as_deref().and_then(numero_de_disque);
+    // Un sous-dossier de MIXAGE (`Multichannel 7.1`, `Stereo`, `5.1`…) n'est
+    // pas l'album non plus : c'est une variante de l'édition au-dessus
+    // (#4846, fil 1904 — l'album s'appelait « Multichannel 7.1 »). L'album
+    // prend le nom de l'édition, la variante en qualificatif : la version
+    // stéréo et la version 5.1 d'un même coffret restent deux albums, sans
+    // numéros de piste qui se marchent dessus.
+    let edition = parent.and_then(|p| p.parent());
+    if disque.is_none()
+        && let Some(variante) = nom_du_parent.as_deref().filter(|n| variante_de_mixage(n))
+        && let Some(titre) = nom(edition)
+    {
+        return (
+            Some(format!("{titre} ({})", variante.trim())),
+            nom(edition.and_then(|p| p.parent())),
+            None,
+        );
+    }
     let dossier_album = match disque {
         Some(_) => parent.and_then(|p| p.parent()),
         None => parent,
@@ -3218,6 +3309,12 @@ fn has_valid_ogg_bos_page(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod ogg_fallback_tests_4412;
 
+#[cfg(test)]
+mod coffret_multicanal_tests_4846;
+
+#[cfg(test)]
+mod label_tests_4836;
+
 fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
     use lofty::config::{ParseOptions, ParsingMode};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -3538,7 +3635,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             .map(|m| m.len()),
         bpm,
         compilation,
-        label: get(ItemKey::Label),
+        label: label_du_tag(&get),
         catalog_number: get(ItemKey::CatalogNumber),
         musicbrainz_recording_id: get(ItemKey::MusicBrainzRecordingId),
         musicbrainz_release_id: get(ItemKey::MusicBrainzReleaseId),
@@ -3644,7 +3741,7 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::Remixer) {
         meta.insert("remixer".into(), v);
     }
-    if let Some(v) = get(ItemKey::Label) {
+    if let Some(v) = label_du_tag(&get) {
         meta.insert("label".into(), v);
     }
     if let Some(v) = get(ItemKey::Producer) {

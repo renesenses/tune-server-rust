@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd"]
 local-audio = ["tune-core/local-audio"]
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. DÉSARMÉE — hors `default` et hors
@@ -57,6 +57,10 @@ concerts = ["dep:tune-concerts"]
 # images). Dans `default` comme Bandcamp : le greffon est opt-in à l'exécution
 # (`default_enabled = false`) et refuse sans licence.
 pont-roon = ["dep:tune-pont-roon"]
+# Lecture directe d'un CD audio (#4863), sans extraction. Dans `default` comme
+# Bandcamp : le greffon est opt-in à l'exécution (`default_enabled = false`) et
+# hors catalogue tant qu'aucun écran ne le consomme. Choix à valider.
+cd = ["dep:tune-cd"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -78,6 +82,7 @@ tune-plugin-runtime-wasm = { path = "../tune-plugin-runtime-wasm", optional = tr
 tune-dj = { path = "../plugins/tune-dj", optional = true }
 tune-karaoke = { path = "../plugins/tune-karaoke", optional = true }
 tune-bandcamp = { path = "../plugins/tune-bandcamp", optional = true }
+tune-cd = { path = "../plugins/tune-cd", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
 tokio = { workspace = true }
@@ -177,6 +182,14 @@ path = "tests/album_lecture_en_double.rs"
 name = "dr_liste_albums_4521"
 path = "tests/dr_liste_albums_4521.rs"
 
+# #4806 — bannir un titre : jamais joué automatiquement, visible mais grisé.
+# Les sept points (aléatoire, smart playlists, file, titre en cours,
+# débannir, local ≠ service, par profil) par les routes montées. `autotests =
+# false` en tête de ce manifeste : sans cette cible, rien ne serait compilé.
+[[test]]
+name = "titres_bannis_4806"
+path = "tests/titres_bannis_4806.rs"
+
 # #4146 — les albums d'une source UPnP indexée sont visibles, sauf doublon
 # local, mesuré sur les ROUTES montées. `autotests = false` en tête de ce
 # manifeste : sans cette cible le fichier ne serait JAMAIS compilé et les trois
@@ -268,6 +281,18 @@ path = "tests/cles_developpeur_hors_journal.rs"
 [[test]]
 name = "journal_sondage_hqplayer"
 path = "tests/journal_sondage_hqplayer.rs"
+
+# Journal écrit en double sur macOS : le lanceur du `.app` branche le flux
+# d'erreur sur le fichier que la couche fichier ouvre déjà, et chaque ligne y
+# arrive deux fois (1 002 lignes pour 585 uniques, journal de Cyrille Moutia
+# en 0.9.163). La cible est indispensable : `autotests = false` en tête de ce
+# manifeste laisserait le fichier HORS COMPILATION, donc éternellement vert.
+#
+# Rangée au MILIEU, jamais en queue : deux lots qui ajoutent chacun leur cible
+# à la fin du même fichier se conflictent à tous les coups.
+[[test]]
+name = "journal_ecrit_en_double_20260923"
+path = "tests/journal_ecrit_en_double_20260923.rs"
 
 # #4051 — troisième de la même famille : abonné `tracing` GLOBAL, donc un
 # binaire à lui seul et UN essai dedans. Il garde le réglage LRCLIB publié par
@@ -656,6 +681,14 @@ path = "tests/recherche_pistes_enrichies_3789.rs"
 [[test]]
 name = "album_en_cours_1361"
 path = "tests/album_en_cours_1361.rs"
+
+# Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
+# `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
+# des services simulés. `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "plus_comme_ca_qobuz_fil1906"
+path = "tests/plus_comme_ca_qobuz_fil1906.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
@@ -819,6 +852,14 @@ path = "tests/playpause_un_appel_4566.rs"
 name = "index_recherche_denominateur_4565"
 path = "tests/index_recherche_denominateur_4565.rs"
 
+# #4319 — la ligne « Albums masqués » du rapport de diagnostic : le filtre qui
+# s'applique APRÈS l'index, et qui explique à lui seul « visible dans
+# Répertoires, introuvable à la recherche ». `autotests = false` en tête de ce
+# manifeste : sans cette cible, le témoin ne serait JAMAIS compilé.
+[[test]]
+name = "albums_masques_dans_le_rapport_4319"
+path = "tests/albums_masques_dans_le_rapport_4319.rs"
+
 # #4564 — les captures du signalement forum. `autotests = false` en tête de ce
 # manifeste : sans cette cible, ni la garde du nom `images[]` ni les refus
 # bornés ne seraient jamais compilés.
@@ -848,6 +889,12 @@ path = "tests/smart_playlist_favori_etiquette_4798.rs"
 [[test]]
 name = "collections_etiquette_4798"
 path = "tests/collections_etiquette_4798.rs"
+
+# #4853 — dossiers de collections (arbre, profondeur 3). `autotests = false` :
+# sans cette entrée, le fichier ne serait jamais compilé.
+[[test]]
+name = "dossiers_de_collections_4853"
+path = "tests/dossiers_de_collections_4853.rs"
 
 
 # #4685 — la compensation de niveau de l'égaliseur et du crossfeed, par le
@@ -892,3 +939,42 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 [[test]]
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
+
+# #4767 — crédits MusicBrainz par disque (fixture réelle de *Déjà vu*) :
+# idempotence, sections « Collaborations » / « Reprises » de la page artiste,
+# focus par pistes créditées, route `/system/enrich-credits`.
+[[test]]
+name = "credits_musicbrainz_4767"
+path = "tests/credits_musicbrainz_4767.rs"
+
+# #2742 (23/09) — une zone réseau sans flux progressif garde le crossfeed
+# RÉGLABLE : les flux des services le portent. `autotests = false` plus haut :
+# sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "crossfeed_reglable_zone_reseau_2742"
+path = "tests/crossfeed_reglable_zone_reseau_2742.rs"
+
+# La LISTE des albums manquants d'un dossier « Collections » (#901, Lulu) —
+# `orphan_album_ids` publiait la longueur de la liste, pas la liste. Cible
+# propre plutôt qu'un `mod` de `server_contracts` : ces gardes doivent pouvoir
+# tourner seules, sans traîner tout le contrat de routes derrière elles.
+[[test]]
+name = "collections_albums_manquants_901"
+path = "tests/collections_albums_manquants_901.rs"
+
+# #4805 — le pilote de lot de l'identification. `autotests = false` en tête de
+# ce manifeste : sans cette cible, le fichier ne serait JAMAIS compilé et le
+# témoin du refus Premium ne serait exécuté par personne — ni en local, ni en CI.
+[[test]]
+name = "identification_lot_4805"
+path = "tests/identification_lot_4805.rs"
+
+# 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
+# été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
+# le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne
+# que le pilote de lot appelle désormais album par album — était donc gardé par
+# un banc que personne n'exécutait, ni en local ni en CI. Il l'est maintenant,
+# et il sert de garde de non-régression au découpage de `identifier_album`.
+[[test]]
+name = "reidentification_album"
+path = "tests/reidentification_album.rs"

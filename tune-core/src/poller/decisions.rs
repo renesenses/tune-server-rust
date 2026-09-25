@@ -458,6 +458,32 @@ pub fn reprise_apres_renderer_cale_autorisee(
     a_joue && flux_incomplet && reste_assez && hors_fenetre
 }
 
+/// #4645 — la coupure `playback_failure_stopping_zone` (flux à sec) ouvre-t-elle
+/// droit à la reprise à la position atteinte ?
+///
+/// #4660 n'armait la reprise que dans l'autre bras qui coupe,
+/// `renderer_stalled_not_advancing_stopping_zone`. Or le même décrochage passe
+/// aussi par ici quand le renderer se tait SANS annoncer `Stopped` : la socket
+/// reste à sec pendant trente tours et c'est ce bras qui tranche. Mesure du
+/// 24/09 (Sevy Tabroc, 0.9.163, darTZeel LHC-208, zone 10) : WAV de
+/// 54 836 880 octets pour une piste de 310 867 ms, livraison tombée sous le
+/// nominal (145,6 Kio/s contre 172,3), renderer figé à 213 000 ms après
+/// 39 387 136 octets servis — zone coupée, file arrêtée, aucune reprise tentée.
+///
+/// Seul le décrochage EN COURS de lecture est concerné : zéro octet servi,
+/// c'est le démarrage mort (#2394), qui a sa propre relance. Le reste des
+/// conditions — piste qui a joué, flux mesuré incomplet, musique restante,
+/// fenêtre — est jugé ensuite par [`reprise_apres_renderer_cale_autorisee`],
+/// commun aux deux bras.
+pub fn mesure_de_reprise_apres_flux_a_sec(
+    position_ms: u64,
+    track_duration_ms: u64,
+    octets_servis: u64,
+    octets_total: Option<u64>,
+) -> Option<(u64, u64, u64, Option<u64>)> {
+    (octets_servis > 0).then_some((position_ms, track_duration_ms, octets_servis, octets_total))
+}
+
 /// Le verrou « suivant DSD sur DLNA » (#2394) tient-il encore ? Il ne
 /// tient que pour LA position de file constatée : si la file bouge (ajout,
 /// saut, avance), la position suivante change et on re-résout — au pire on
