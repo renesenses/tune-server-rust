@@ -99,21 +99,3 @@ async fn installe_il_repond_desinstalle_ses_routes_rendent_404() {
         assert_eq!(statut, StatusCode::NOT_FOUND, "{m} {chemin}");
     }
 }
-
-#[tokio::test]
-async fn le_greffon_reste_hors_catalogue_tant_qu_aucun_ecran_ne_l_appelle() {
-    let (_state, app) = demarrer(":memory:").await;
-    let (statut, corps) = appel(&app, "GET", "/api/v1/plugins", "").await;
-    assert_eq!(statut, StatusCode::OK);
-    let texte = corps.to_string();
-    // Témoin de la liste elle-même : un greffon dormant ET catalogué y figure,
-    // sinon l'absence de `circle` ne prouverait rien.
-    assert!(
-        texte.contains("\"bandcamp\""),
-        "la liste doit proposer bandcamp : {texte}"
-    );
-    assert!(
-        !texte.contains("\"circle\""),
-        "circle ne doit pas être PROPOSÉ au gestionnaire de greffons : {texte}"
-    );
-}

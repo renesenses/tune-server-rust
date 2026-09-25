@@ -62,18 +62,19 @@ impl TunePlugin for CirclePlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Tune Circle : inviter des proches, accepter, révoquer (compte mozaiklabs)"
+        "Tune Circle — partage entre proches invités. Gratuit ; l'écoute à distance sera Premium."
     }
     /// Opt-in, comme `cd` : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
         false
     }
-    /// Hors catalogue, comme `cd`, tant qu'aucun écran du client ne consomme
-    /// ses routes (doctrine #2090) : l'écran web vient dans une PR séparée.
-    /// Installable nommément : `POST /api/v1/plugins/circle/install`.
-    /// Gratuit ou Premium : décision laissée à Bertrand (#5018).
+    /// Au catalogue (#5018, décision de Bertrand du 25/09), comme `cd`
+    /// (#4863) : le gestionnaire propose « Installer », puis
+    /// `POST /api/v1/plugins/circle/install` et un redémarrage.
+    /// Gratuit : absent de `premium_plugins`, aucun contrôle de droit. Seule
+    /// l'écoute à distance (étape T4, à venir) sera Premium.
     fn catalogued(&self) -> bool {
-        false
+        true
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
