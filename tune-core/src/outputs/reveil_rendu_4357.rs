@@ -33,6 +33,8 @@
 //! être testée sur toutes les plateformes de CI.
 
 /// Délai maximal de l'attente de rendu, en millisecondes.
+/// Seul `wasapi_exclusive` l'attend ; les épreuves lisent la table de décision.
+#[cfg(all(target_os = "windows", feature = "local-audio"))]
 pub(crate) const ATTENTE_RENDU_MS: u32 = 2_000;
 
 /// `WAIT_OBJECT_0` — poignée 0 du tableau : l'événement du pilote.

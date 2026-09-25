@@ -1235,7 +1235,9 @@ fn le_transcodage_fichier_epargne_la_sortie_locale() {
 /// Niveau efficace d'un PCM stéréo 16 bits, en dBFS.
 fn rms_dbfs_16(pcm: &[u8], depuis: usize) -> f64 {
     let ech: Vec<f64> = pcm
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .skip(depuis * 2)
         .map(|o| i16::from_le_bytes([o[0], o[1]]) as f64 / 32768.0)
         .collect();
@@ -1984,8 +1986,10 @@ fn la_chaine_streaming_applique_replaygain_puis_egaliseur() {
     rg.process(&mut pcm, 16);
     assert_ne!(pcm, source);
     for (i, (a, b)) in source
-        .chunks_exact(2)
-        .zip(pcm.chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(pcm.as_chunks::<2>().0.iter())
         .enumerate()
         .take(64)
     {
@@ -2859,7 +2863,7 @@ fn ecrire_dsf_carre(path: &std::path::Path, blocs_par_canal: usize) {
     // Disposition DSF : bloc du canal 0, bloc du canal 1, bloc suivant du
     // canal 0… Les deux canaux portent le même carré.
     for indice_bloc in 0..blocs_par_canal * CANAUX {
-        let octet: u8 = if (indice_bloc / CANAUX) % 2 == 0 {
+        let octet: u8 = if (indice_bloc / CANAUX).is_multiple_of(2) {
             0xFF
         } else {
             0x00
@@ -3132,7 +3136,7 @@ fn ecrire_wav_carre(path: &std::path::Path, duree_ms: u64) {
     ));
     let demi_periode = (SR / 86).max(1) as usize;
     for t in 0..trames {
-        let v: i16 = if (t / demi_periode) % 2 == 0 {
+        let v: i16 = if (t / demi_periode).is_multiple_of(2) {
             24_000
         } else {
             -24_000
@@ -9157,7 +9161,9 @@ async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
     chaine.process(&mut pcm, 16);
     let voie = |c: usize| -> f64 {
         let e: f64 = pcm
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|f| {
                 let v = i16::from_le_bytes([f[2 * c], f[2 * c + 1]]) as f64 / 32768.0;
                 v * v

@@ -276,11 +276,11 @@ impl PlaybackOrchestrator {
         let info = StreamInfo {
             format: ext.clone(),
             mime_type: mime.clone(),
-            sample_rate: sample_rate.unwrap_or(44100) as u32,
+            sample_rate: sample_rate.unwrap_or(44100),
             bit_depth: bit_depth.unwrap_or(16),
-            channels: channels as u16,
+            channels,
             file_size,
-            duration_ms: Some(duration_ms as u64),
+            duration_ms: Some(duration_ms),
             ..Default::default()
         };
 
@@ -312,7 +312,7 @@ impl PlaybackOrchestrator {
             duration_ms: Some(duration_ms as i64),
             source: "upload".into(),
             mime_type: mime,
-            sample_rate: sample_rate.map(|s| s as u32),
+            sample_rate,
             bit_depth: bit_depth.map(|b| b as u32),
             channels: Some(channels as u32),
             origin_url: None,

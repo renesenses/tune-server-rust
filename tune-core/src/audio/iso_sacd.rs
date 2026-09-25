@@ -161,10 +161,10 @@ fn usable_probe_output(output: &std::process::Output) -> bool {
 
 fn find_sacd_extract() -> Option<PathBuf> {
     for name in &SACD_EXTRACT_CANDIDATES {
-        if let Ok(output) = Command::new(name).arg("--help").output() {
-            if usable_probe_output(&output) {
-                return Some(PathBuf::from(name));
-            }
+        if let Ok(output) = Command::new(name).arg("--help").output()
+            && usable_probe_output(&output)
+        {
+            return Some(PathBuf::from(name));
         }
     }
     None
@@ -202,8 +202,8 @@ mod tests {
     fn find_sacd_extract_if_available() {
         // This test only passes if sacd_extract is installed
         let result = find_sacd_extract();
-        if result.is_some() {
-            println!("sacd_extract found at: {:?}", result.unwrap());
+        if let Some(chemin) = result {
+            println!("sacd_extract found at: {:?}", chemin);
         } else {
             println!("sacd_extract not installed (test skipped)");
         }

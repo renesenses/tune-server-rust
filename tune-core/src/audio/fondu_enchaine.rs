@@ -736,7 +736,7 @@ mod tests {
         let mut puits = PuitsMemoire::nouveau();
         let mut moteur = FonduEnchaine::nouveau(stereo(48_000), 64, CourbeDeFondu::Lineaire)
             .expect("recouvrement non nul");
-        moteur.pousser_sortante(&mut puits, &vec![1.0; 10 * 2]);
+        moteur.pousser_sortante(&mut puits, &[1.0; 10 * 2]);
         moteur.pousser_entrante(&mut puits, &vec![2.0; 40 * 2]);
         moteur.fin_de_la_sortante(&mut puits);
         moteur.vider(&mut puits);
@@ -754,7 +754,7 @@ mod tests {
         assert!(!moteur.traitement_actif());
         moteur.fin_de_la_sortante(&mut puits);
         assert!(moteur.traitement_actif());
-        moteur.pousser_entrante(&mut puits, &vec![2.0; 8 * 2]);
+        moteur.pousser_entrante(&mut puits, &[2.0; 8 * 2]);
         assert!(!moteur.traitement_actif());
     }
 
@@ -765,7 +765,7 @@ mod tests {
         let mut moteur = FonduEnchaine::nouveau(stereo(48_000), 2, CourbeDeFondu::Lineaire)
             .expect("recouvrement non nul");
         assert_eq!(
-            moteur.pousser_sortante(&mut puits, &vec![1.0; 10 * 2]),
+            moteur.pousser_sortante(&mut puits, &[1.0; 10 * 2]),
             EtatDuFondu::PuitsMort
         );
     }

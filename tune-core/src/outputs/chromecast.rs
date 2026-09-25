@@ -242,7 +242,7 @@ impl SansSession {
     fn depuis(apps: Option<&[rust_cast::channels::receiver::Application]>) -> Self {
         match apps {
             None => Self::StatutIllisible,
-            Some(apps) if apps.is_empty() => Self::AppareilAuRepos,
+            Some([]) => Self::AppareilAuRepos,
             Some(_) => Self::ApplicationTierce,
         }
     }

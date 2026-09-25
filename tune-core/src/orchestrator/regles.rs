@@ -948,6 +948,10 @@ pub fn transport_dsd(is_local: bool, is_network: bool, dsd_mode: &str) -> Transp
 /// Écrite ainsi plutôt qu'en double pour qu'il ne puisse pas exister deux
 /// réponses à la même question — la dérive qu'a coûtée chaque copie de
 /// `is_network_output_type` (#2189).
+///
+/// La production lit `transport_dsd` directement ; ce booléen ne sert plus
+/// qu'à la table de vérité de `dop_routing_tests`.
+#[cfg(test)]
 pub(crate) fn dop_requested(is_local: bool, is_network: bool, dsd_mode: &str) -> bool {
     transport_dsd(is_local, is_network, dsd_mode) != TransportDsd::Pcm
 }

@@ -589,14 +589,12 @@ impl OutputTarget for OpenHomeOutput {
         // track 1, so inserting the next track "after" it corrupts the order
         // (playlist becomes [t1, t3, t2]) and the track 2→3 transition stalls
         // (Pierre M). Query Playlist/Id and re-anchor to the id actually playing.
-        if let Some(url) = self.svc_url("playlist") {
-            if let Ok(resp) = self.soap_call(url, SVC_PLAYLIST, "Id", &[]).await {
-                if let Some(id) = extract_tag(&resp, "Value").and_then(|v| v.parse::<u32>().ok()) {
-                    if id != 0 {
-                        *self.current_oh_id.lock().await = Some(id);
-                    }
-                }
-            }
+        if let Some(url) = self.svc_url("playlist")
+            && let Ok(resp) = self.soap_call(url, SVC_PLAYLIST, "Id", &[]).await
+            && let Some(id) = extract_tag(&resp, "Value").and_then(|v| v.parse::<u32>().ok())
+            && id != 0
+        {
+            *self.current_oh_id.lock().await = Some(id);
         }
         let after_id = self.current_oh_id.lock().await.unwrap_or(0);
         let new_id = self.playlist_insert(after_id, media.url, &metadata).await?;

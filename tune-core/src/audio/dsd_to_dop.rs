@@ -1,18 +1,18 @@
-/// DSD over PCM (DoP) encoder.
-///
-/// Packs raw DSD bitstream data into 24-bit PCM frames with DoP marker
-/// bytes in the top 8 bits. This allows DSD playback through PCM-only
-/// audio interfaces (WASAPI, ASIO, CoreAudio).
-///
-/// DoP frame layout (24-bit LE per channel):
-///   byte 0: DSD bits `[7:0]`  (low byte of 16 DSD bits)
-///   byte 1: DSD bits `[15:8]` (high byte of 16 DSD bits)
-///   byte 2: marker (0x05 or 0xFA, alternating per frame)
-///
-/// Sample rates:
-///   DSD64  (2.8224 MHz) → 176.4 kHz DoP
-///   DSD128 (5.6448 MHz) → 352.8 kHz DoP
-///   DSD256 (11.2896 MHz) → 705.6 kHz DoP
+//! DSD over PCM (DoP) encoder.
+//!
+//! Packs raw DSD bitstream data into 24-bit PCM frames with DoP marker
+//! bytes in the top 8 bits. This allows DSD playback through PCM-only
+//! audio interfaces (WASAPI, ASIO, CoreAudio).
+//!
+//! DoP frame layout (24-bit LE per channel):
+//!   byte 0: DSD bits `[7:0]`  (low byte of 16 DSD bits)
+//!   byte 1: DSD bits `[15:8]` (high byte of 16 DSD bits)
+//!   byte 2: marker (0x05 or 0xFA, alternating per frame)
+//!
+//! Sample rates:
+//!   DSD64  (2.8224 MHz) → 176.4 kHz DoP
+//!   DSD128 (5.6448 MHz) → 352.8 kHz DoP
+//!   DSD256 (11.2896 MHz) → 705.6 kHz DoP
 
 pub struct DsdToDoP {
     channels: usize,
@@ -74,7 +74,7 @@ impl DsdToDoP {
         let mut out = Vec::with_capacity(num_frames * 3 * self.channels);
 
         for frame_idx in 0..num_frames {
-            let marker = if self.frame_count % 2 == 0 {
+            let marker = if self.frame_count.is_multiple_of(2) {
                 0x05u8
             } else {
                 0xFAu8

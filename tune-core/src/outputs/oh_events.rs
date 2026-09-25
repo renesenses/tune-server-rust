@@ -302,13 +302,16 @@ pub fn parse_last_change(xml: &str) -> HashMap<String, String> {
     result
 }
 
+/// Les états d'abonnement GENA, par SID.
+type Gestionnaires = Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<EventState>>>>>;
+
 /// Récepteur GENA partagé : un seul port HTTP local pour tous les abonnements,
 /// quel que soit le dialecte (OpenHome ou UPnP AV / DLNA).
 pub struct UpnpEventListener {
     port: u16,
     server_ip: String,
     client: Client,
-    handlers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<EventState>>>>>,
+    handlers: Gestionnaires,
     subscriptions: Arc<RwLock<HashMap<String, String>>>,
 }
 
@@ -329,8 +332,7 @@ impl UpnpEventListener {
             .map_err(|e| format!("local addr: {e}"))?
             .port();
 
-        let handlers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<EventState>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let handlers: Gestionnaires = Arc::new(RwLock::new(HashMap::new()));
         let subscriptions: Arc<RwLock<HashMap<String, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
@@ -498,10 +500,7 @@ impl UpnpEventListener {
     }
 }
 
-async fn handle_notify(
-    stream: tokio::net::TcpStream,
-    handlers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<EventState>>>>>,
-) {
+async fn handle_notify(stream: tokio::net::TcpStream, handlers: Gestionnaires) {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader);
 
@@ -557,7 +556,7 @@ async fn handle_notify(
 async fn renew_all(
     client: &Client,
     subscriptions: &Arc<RwLock<HashMap<String, String>>>,
-    handlers: &Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<EventState>>>>>,
+    handlers: &Gestionnaires,
     server_ip: &str,
     port: u16,
 ) {
@@ -902,9 +901,11 @@ mod tests {
     /// actions par seconde en pure perte.
     #[test]
     fn un_abonnement_silencieux_reste_vivant_meme_quand_il_n_est_plus_frais() {
-        let mut st = EventState::default();
-        st.alive = true;
-        st.last_update = Some(Instant::now() - std::time::Duration::from_secs(120));
+        let mut st = EventState {
+            alive: true,
+            last_update: Some(Instant::now() - std::time::Duration::from_secs(120)),
+            ..Default::default()
+        };
         assert!(!st.is_fresh(), "deux minutes sans évènement : plus frais");
         assert!(st.is_live(), "…mais toujours abonné, donc digne de foi");
 
@@ -920,8 +921,10 @@ mod tests {
     /// vaut rien : on ne sert pas un état vide comme une vérité.
     #[test]
     fn un_abonnement_sans_le_moindre_evenement_ne_vaut_pas_vivant() {
-        let mut st = EventState::default();
-        st.alive = true;
+        let st = EventState {
+            alive: true,
+            ..Default::default()
+        };
         assert!(!st.is_live());
     }
 }
