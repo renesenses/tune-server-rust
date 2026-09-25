@@ -6561,7 +6561,9 @@ mod tests {
         // 72 : `playlist_tracks_titres_de_service` (#4889), jumelle de la
         // SQLite 109. Relache `track_id`, pose `source` / `source_id` et les
         // colonnes d'affichage, et le CHECK « l'un ou l'autre ».
-        assert_eq!(pg_latest_version(), 72, "latest PG migration must be 72");
+        // 73 : `exemplaires_par_repertoire` (#4907), jumelle de la SQLite 110.
+        // Pose `track_copies` et `album_preferred_roots`.
+        assert_eq!(pg_latest_version(), 73, "latest PG migration must be 73");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

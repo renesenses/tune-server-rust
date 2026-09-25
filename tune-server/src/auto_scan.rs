@@ -2263,9 +2263,14 @@ fn traiter_les_dossiers_du_lot(
         if std::fs::symlink_metadata(&chemin).is_ok() {
             continue;
         }
-        let fichiers = track_repo
+        let mut fichiers = track_repo
             .fichiers_sous_dossier(&chemin)
             .unwrap_or_default();
+        // #4907 — les exemplaires rangés sous ce dossier le suivent aussi : un
+        // dossier qui ne porte QUE des copies est un dossier à apparier.
+        fichiers.extend(tune_core::library::exemplaires::exemplaires_sous_dossier(
+            &**db, &chemin,
+        ));
         // Un fichier qui n'était pas audio (pochette, temporaire d'un éditeur
         // de balises), ou un dossier sans piste indexée : rien à faire.
         if fichiers.is_empty() {
@@ -2292,9 +2297,13 @@ fn traiter_les_dossiers_du_lot(
             deplacer_le_dossier(db, &ancien.chemin, &apparu.path, &deplacements);
             // Ce qui n'a pas suivi (fichier retiré pendant le déplacement) est
             // bien parti : même traitement qu'un dossier disparu qui a attendu.
-            let restants = track_repo
+            let mut restants = track_repo
                 .fichiers_sous_dossier(&ancien.chemin)
                 .unwrap_or_default();
+            restants.extend(tune_core::library::exemplaires::exemplaires_sous_dossier(
+                &**db,
+                &ancien.chemin,
+            ));
             if !restants.is_empty() {
                 disparus.push(DossierDisparu {
                     chemin: ancien.chemin,
@@ -2304,7 +2313,9 @@ fn traiter_les_dossiers_du_lot(
             }
         }
         for fichier in tune_core::scanner::watcher::fichiers_audio_sous(nouveau) {
-            if matches!(track_repo.get_by_path(&fichier), Ok(None)) {
+            if matches!(track_repo.get_by_path(&fichier), Ok(None))
+                && !tune_core::library::exemplaires::est_un_exemplaire(&**db, &fichier)
+            {
                 a_relire.push(FileChange {
                     change_type: ChangeType::Added,
                     path: fichier,
@@ -2371,6 +2382,10 @@ fn deplacer_le_dossier(
     deplacements: &[(String, String)],
 ) {
     let pistes = TrackRepo::with_backend(db.clone()).deplacer_fichiers(deplacements);
+    // #4907 — les exemplaires du dossier suivent, rattachés à leur piste. Un
+    // couple qui n'est pas une copie ne touche rien, et inversement.
+    let exemplaires =
+        tune_core::library::exemplaires::deplacer_les_exemplaires(&**db, deplacements);
     let albums = AlbumRepo::with_backend(db.clone()).deplacer_dossier(ancien, nouveau);
     match (pistes, albums) {
         (Ok(pistes), Ok(albums)) => info!(
@@ -2378,6 +2393,7 @@ fn deplacer_le_dossier(
             nouveau = %nouveau,
             pistes,
             albums,
+            exemplaires,
             "watcher_dossier_deplace — pistes et albums gardent leur ligne (#4896)"
         ),
         (pistes, albums) => tracing::warn!(

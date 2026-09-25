@@ -696,6 +696,63 @@ pub fn carte_des_exemplaires(db: &dyn DbBackend) -> Result<HashMap<String, InfoF
         .collect())
 }
 
+/// #4896 × #4907 — les copies rangées sous `dossier` (découpage exact :
+/// `…/Album` n'emporte pas `…/Album 2`), avec leur taille. Même forme que
+/// `TrackRepo::fichiers_sous_dossier` : le surveillant les apparie ensemble
+/// quand un dossier est renommé ou déplacé. Lecture forte.
+pub fn exemplaires_sous_dossier(db: &dyn DbBackend, dossier: &str) -> Vec<(String, Option<i64>)> {
+    let d = crate::db::track_repo::DossierExact::new(dossier);
+    let sql = format!(
+        "SELECT file_path, file_size FROM track_copies WHERE substr(file_path, 1, {}) = {}",
+        d.longueur,
+        ph(db, 1)
+    );
+    let params: [&dyn ToSqlValue; 1] = [&d.prefixe];
+    db.query_many_strong(&sql, &params)
+        .unwrap_or_else(|e| {
+            warn!(dossier, error = %e, "exemplaires_sous_dossier_illisibles");
+            Vec::new()
+        })
+        .iter()
+        .filter_map(|r| Some((r.first()?.as_string()?, r.get(1).and_then(|v| v.as_i64()))))
+        .collect()
+}
+
+/// Ce chemin est-il celui d'un exemplaire ? Lecture forte.
+pub fn est_un_exemplaire(db: &dyn DbBackend, chemin: &str) -> bool {
+    let sql = format!("SELECT 1 FROM track_copies WHERE file_path = {}", ph(db, 1));
+    let params: [&dyn ToSqlValue; 1] = [&chemin];
+    matches!(db.query_one_strong(&sql, &params), Ok(Some(_)))
+}
+
+/// #4896 × #4907 — un dossier renommé ou déplacé : chaque copie `(ancien,
+/// nouveau)` change de chemin et reste rattachée à SA piste. Sans ceci, la
+/// ligne gardait le chemin mort jusqu'au scan suivant, et le fichier sous son
+/// nouveau nom était relu comme inconnu. Un couple qui n'est pas une copie
+/// ne touche rien ; un nouveau chemin déjà rattaché n'est pas écrasé
+/// (`file_path` est unique). Rend le nombre de copies déplacées.
+pub fn deplacer_les_exemplaires(db: &dyn DbBackend, deplacements: &[(String, String)]) -> usize {
+    // Marqueurs NUMÉROTÉS : `p1` sert deux fois.
+    let (p1, p2) = match db.engine() {
+        Engine::Postgres => ("$1", "$2"),
+        Engine::Sqlite => ("?1", "?2"),
+    };
+    let sql = format!(
+        "UPDATE track_copies SET file_path = {p1} WHERE file_path = {p2} \
+         AND NOT EXISTS (SELECT 1 FROM track_copies deja WHERE deja.file_path = {p1})"
+    );
+    deplacements
+        .iter()
+        .map(|(ancien, nouveau)| {
+            let params: [&dyn ToSqlValue; 2] = [nouveau, ancien];
+            db.execute(&sql, &params).unwrap_or_else(|e| {
+                warn!(ancien = %ancien, nouveau = %nouveau, error = %e, "exemplaire_deplacement_echec");
+                0
+            })
+        })
+        .sum()
+}
+
 /// Retire des exemplaires. Rend le nombre de lignes retirées.
 pub fn retirer_des_exemplaires(db: &dyn DbBackend, chemins: &[String]) -> usize {
     let sql = format!("DELETE FROM track_copies WHERE file_path = {}", ph(db, 1));
