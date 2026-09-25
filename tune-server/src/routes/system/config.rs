@@ -1027,6 +1027,51 @@ fn normaliser_plafonds_indexation(
     Ok(())
 }
 
+/// Normalise et VALIDE le plafond de la lecture aléatoire d'un
+/// `PATCH /config` (#2901, suite).
+///
+/// | reçu | écrit | sens |
+/// |---|---|---|
+/// | `1200` ou `"1200"` | `"1200"` | un plafond, dans les bornes |
+/// | `0`, `-1`, `100000` | **400** | hors bornes, refusé |
+/// | `"beaucoup"`, `500.5`, `null` | **400** | illisible, refusé |
+/// | clé absente | — | rien, le réglage ne bouge pas |
+///
+/// 🔴 Pourquoi refuser plutôt que borner. #2901 a posé la validation à la
+/// LECTURE (`resolve_shuffle_max_tracks`), et c'est juste : une ligne écrite à
+/// la main ou héritée ne doit jamais empêcher de jouer. Mais la même
+/// indulgence à l'ÉCRITURE rendait `{"ok": true}` pour `100000` avant de
+/// retenir 5 000 : l'utilisateur lançait sa lecture aléatoire sur 30 000
+/// pistes, en recevait 5 000, et cherchait la panne ailleurs. C'est le défaut
+/// muet que #4154 a refermé un cran plus loin, sur les plafonds d'indexation,
+/// et le refus est écrit ici sur le même patron.
+///
+/// Rien n'est réécrit en base : une valeur hors bornes déjà persistée reste, et
+/// `GET /config` continue de publier ce qui s'appliquera vraiment.
+///
+/// Le contrôle du client web borne déjà la saisie avant d'envoyer
+/// (`bornerFileAleatoire`) : ce refus ne change rien pour lui, il garde les
+/// appels directs à l'API — un script, `curl`, un client tiers.
+fn normaliser_plafond_aleatoire(
+    values: &mut serde_json::Map<String, Value>,
+) -> Result<(), AppError> {
+    let cle = tune_core::playback::queue::SHUFFLE_MAX_TRACKS_KEY;
+    let Some(brut) = values.get(cle) else {
+        return Ok(());
+    };
+    let texte = match brut {
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        autre => autre.to_string(),
+    };
+    let borne = tune_core::playback::queue::valider_shuffle_max_tracks(&texte)
+        .map_err(AppError::bad_request)?;
+    // Une seule forme en base : l'entier nu. La lecture accepte encore les
+    // autres (`"\"800\""`), pour les lignes déjà écrites.
+    values.insert(cle.to_string(), Value::String(borne.to_string()));
+    Ok(())
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     profile: ActiveProfile,
@@ -1069,6 +1114,10 @@ pub(super) async fn update_config(
     // devient `0`, la valeur que la route d'indexation lit ; une valeur
     // illisible est REFUSÉE, jamais réinterprétée.
     normaliser_plafonds_indexation(&mut values)?;
+    // #2901 (suite) — le plafond de la lecture aléatoire. Même discipline : une
+    // valeur hors bornes ou illisible est REFUSÉE en nommant les bornes, au
+    // lieu d'être acceptée puis ramenée en silence à la lecture.
+    normaliser_plafond_aleatoire(&mut values)?;
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
     let volume_lock_was_enabled =
         tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend);
