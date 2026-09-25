@@ -1764,6 +1764,10 @@ impl PositionPoller {
                         // seuil d'échec est le seul à savoir, et il le
                         // remplace par un verdict mesuré.
                         avance_audio_couvre_l_arret: false,
+                        // #4661 — même règle encore : seul le bras du seuil
+                        // d'échec connaît la taille du flux, et lui seul
+                        // remplace ce défaut par une mesure.
+                        horloge_de_piste_couvre_l_arret: false,
                         dlna_dsd_reached_end,
                     };
                     let mut fsm_actual: Option<fsm::StoppedOutcome>;
@@ -2189,6 +2193,49 @@ impl PositionPoller {
                                 );
                                 fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
 
+                                // 🔴 #4661 — la borne de #4480 est PLATE :
+                                // deux minutes, quelle que soit la piste. Sur
+                                // un fichier servi EN ENTIER, l'horloge sait
+                                // mieux — elle dit à la seconde près quand la
+                                // musique s'arrête (durée + marge de fin).
+                                //
+                                // Le terrain : WAV de 281 160 ms servi en
+                                // entier à 89 s de piste, renderer muet à
+                                // partir de ~102 s. La borne plate coupe vers
+                                // 222 s — 59 s de musique encore dans le
+                                // tampon du LHC-208.
+                                //
+                                // « Servi en entier » se lit aux OCTETS
+                                // contre la TAILLE DU FLUX, jamais de la
+                                // branche où l'on se trouve : la même branche
+                                // s'arme aussi sur un flux tronqué (70,5 %
+                                // servis, journal du 24/09). Comme pour
+                                // l'audio servie, on ne paie la taille que
+                                // dans ce bras, et seulement à sec.
+                                let octets_total: Option<u64> =
+                                    if consommation == fsm::ConsommationFlux::ASec {
+                                        match stream_id.as_deref() {
+                                            Some(sid) => {
+                                                self.orchestrator.streamer_total_bytes(sid).await
+                                            }
+                                            None => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let flux_servi_en_entier =
+                                    fsm::flux_servi_en_entier(octets_servis, octets_total);
+                                let horloge_couvre_l_arret = fsm::horloge_de_piste_couvre_l_arret(
+                                    flux_servi_en_entier,
+                                    decisions::tampon_du_renderer_peut_encore_jouer(
+                                        wall_elapsed,
+                                        track_duration_ms,
+                                    ),
+                                    ps.premier_arret_a.map(|t| t.elapsed()),
+                                    HORLOGE_DE_PISTE_BORNE_HAUTE_SECS,
+                                );
+                                fsm_in.horloge_de_piste_couvre_l_arret = horloge_couvre_l_arret;
+
                                 if consommation == fsm::ConsommationFlux::Consomme {
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
                                     ps.transition(fsm::Transition::AttenteProlongee);
@@ -2220,6 +2267,35 @@ impl PositionPoller {
                                             consommation = consommation.etiquette(),
                                             has_stream_id = stream_id.is_some(),
                                             "octets_servis_inconnus_zone_non_coupee"
+                                        );
+                                    }
+                                } else if horloge_couvre_l_arret {
+                                    // #4661 — le fichier est chez le renderer
+                                    // EN ENTIER, et l'horloge de la piste
+                                    // n'est pas arrivée à sa fin : il reste
+                                    // de la musique, on sait combien. On
+                                    // attend ce reste-là, pas un forfait —
+                                    // et on le DIT, avec le chiffre qui
+                                    // justifie l'attente.
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingHorloge);
+                                    ps.transition(fsm::Transition::AttenteProlongee);
+                                    if ps.stopped_ticks % 30 == 0 {
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            wall_secs = wall_elapsed,
+                                            reste_ms = track_duration_ms
+                                                .saturating_sub(wall_elapsed.saturating_mul(1000)),
+                                            bytes_sent = octets_servis.unwrap_or(0),
+                                            bytes_total = octets_total.unwrap_or(0),
+                                            consommation = consommation.etiquette(),
+                                            arret_secs = ps
+                                                .premier_arret_a
+                                                .map(|t| t.elapsed().as_secs())
+                                                .unwrap_or(0),
+                                            plafond_secs = HORLOGE_DE_PISTE_BORNE_HAUTE_SECS,
+                                            "flux_servi_en_entier_zone_non_coupee"
                                         );
                                     }
                                 } else if !famine_etablie {
@@ -2279,6 +2355,14 @@ impl PositionPoller {
                                         // lit sur `audio_servi_ms = 0`.
                                         audio_servi_ms = audio_servi_ms.unwrap_or(0),
                                         avance_ms = avance_audio_ms.unwrap_or(0),
+                                        // #4661 — et de quoi relire la
+                                        // coupure contre l'horloge : la
+                                        // taille du flux (0 = inconnue) dit
+                                        // si le fichier était chez le
+                                        // renderer EN ENTIER. Sans elle,
+                                        // `bytes_sent` seul ne permet pas de
+                                        // distinguer 70 % servis de 101 %.
+                                        bytes_total = octets_total.unwrap_or(0),
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;
