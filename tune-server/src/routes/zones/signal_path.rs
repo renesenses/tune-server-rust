@@ -538,11 +538,16 @@ pub(super) fn build_signal_path(
         )
         .map(|d| d.channel_count()),
     };
-    let bit_perfect = analyse.verdicts.bit_perfect;
+    // #5051 — une entrée audio EN DIRECT : ce que la compensation de dérive
+    // fait au signal. Une reprise ou un rééchantillonnage retire le
+    // bit-perfect, et l'étape « Capture » le dit.
+    let capture = etape_de_capture_en_direct(np);
+    let bit_perfect =
+        analyse.verdicts.bit_perfect && capture.as_ref().is_none_or(|(_, intacte)| *intacte);
     let is_lossless = analyse.source.is_lossless;
     let zone_id_courant = zone.id.unwrap_or(0);
     let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id_courant);
-    let etapes = assembler_les_etapes(
+    let mut etapes = assembler_les_etapes(
         ps,
         zone,
         renderer_label,
@@ -550,6 +555,10 @@ pub(super) fn build_signal_path(
         runtime_signal_path,
         analyse,
     );
+    if let Some((etape, _)) = capture {
+        let apres_la_source = etapes.steps.len().min(1);
+        etapes.steps.insert(apres_la_source, etape);
+    }
     Some(json!({
         "bit_perfect": bit_perfect,
         // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
@@ -574,6 +583,51 @@ pub(super) fn build_signal_path(
             "to_hz": vers,
         })),
     }))
+}
+
+/// #5051 — l'étape « Capture » d'une entrée audio en direct, et si le signal
+/// servi est encore, à l'octet près, celui capté. `None` hors entrée audio.
+pub(super) fn etape_de_capture_en_direct(
+    np: &tune_core::playback::NowPlaying,
+) -> Option<(Value, bool)> {
+    if np.source != "entree-audio" {
+        return None;
+    }
+    let compensation = np
+        .stream_id
+        .as_deref()
+        .and_then(tune_core::source_pcm::compensation_du_direct);
+    let Some(c) = compensation else {
+        return Some((
+            json!({
+                "name": "Capture",
+                "description": "Entrée audio en direct",
+                "bit_perfect": true,
+            }),
+            true,
+        ));
+    };
+    let derive = c
+        .derive_ppm
+        .map(|p| format!(", dérive {p:+.1} ppm"))
+        .unwrap_or_default();
+    let description = if c.reechantillonne {
+        format!("Entrée audio en direct — dérive compensée par rééchantillonnage adaptatif{derive}")
+    } else {
+        format!(
+            "Entrée audio en direct — tampon avec reprise, sans rééchantillonnage ; {} reprise(s){derive}",
+            c.reprises
+        )
+    };
+    let intacte = c.bit_perfect();
+    Some((
+        json!({
+            "name": "Capture",
+            "description": description,
+            "bit_perfect": intacte,
+        }),
+        intacte,
+    ))
 }
 
 /// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
