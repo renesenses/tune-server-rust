@@ -1,0 +1,51 @@
+[package]
+name = "tune-entree-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# In-tree native plugin (#5051) : capter une ENTRÉE audio (platine par préampli
+# phono USB, S/PDIF sur une interface USB, sortie optique d'une TV…) et la
+# diffuser EN DIRECT vers une zone Tune.
+#
+# NATIF, pas WASM, pour la même raison que `tune-cd` : il ouvre un
+# périphérique (cpal, en entrée), ce que le bac à sable WASM n'offre pas.
+#
+# La lecture vers une zone passe par l'hôte : le greffon inscrit un
+# `tune_core::source_pcm::FournisseurPcm` EN DIRECT sous la source
+# `entree-audio`, et l'orchestrateur le sert comme une radio (flux sans fin).
+#
+# `capture` (cpal) est une feature, activée par la feature `local-audio` de
+# `tune-server` : sans elle, le greffon compile, répond, et dit que la
+# capture n'est pas compilée — les builds sans pile audio (Docker) n'ont pas
+# à tirer ALSA.
+
+[features]
+default = []
+capture = ["dep:cpal", "dep:coreaudio-rs", "dep:objc2-core-audio", "dep:objc2-core-audio-types"]
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+cpal = { path = "../../vendor/cpal", version = "0.17.3", optional = true }
+
+# Mêmes versions et mêmes features que tune-core (sortie locale) : aucune
+# caisse nouvelle dans le graphe. Elles lisent ce que cpal ne dit pas — le
+# format PHYSIQUE de l'entrée et sa fréquence nominale courante.
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = { version = "0.14", default-features = false, features = ["audio_toolbox", "core_audio"], optional = true }
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "objc2-core-audio-types", "AudioHardware", "AudioHardwareDeprecated"], optional = true }
+objc2-core-audio-types = { version = "0.3", default-features = false, features = ["std", "CoreAudioBaseTypes"], optional = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+# Banc de la comparaison octet pour octet à travers Loopback Audio (#5051).
+[[example]]
+name = "banc_loopback"
+required-features = ["capture"]

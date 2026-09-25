@@ -157,6 +157,20 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         })))
         .await;
 
+    // Entrée audio en direct (#5051). Comme `cd` : l'orchestrateur pour y
+    // inscrire la source PCM EN DIRECT `entree-audio` et lancer la zone, le
+    // gestionnaire de lecture pour la file et l'état des zones.
+    #[cfg(feature = "entree-audio")]
+    loader
+        .register(Box::new(tune_entree_audio::EntreeAudioPlugin::new(
+            tune_entree_audio::HostServices {
+                backend: state.backend.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
+        .await;
+
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
     // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
     // images de l'archive sous le même condensat que tout le reste.
