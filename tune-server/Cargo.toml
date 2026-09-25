@@ -321,6 +321,14 @@ name = "pg_3181_sections_accueil"
 path = "tests/pg_3181_sections_accueil.rs"
 required-features = ["postgres"]
 
+# Premier demarrage d une base PostgreSQL NEUVE (chasse PG du 25/09/2026) :
+# `ensure_schema` tournait avant les scripts numerotes, sur des tables encore
+# absentes, et quatorze colonnes manquaient jusqu au redemarrage suivant.
+[[test]]
+name = "pg_premier_demarrage_base_neuve"
+path = "tests/pg_premier_demarrage_base_neuve.rs"
+required-features = ["postgres"]
+
 # #2372 : la route par piste `GET /library/tracks/{id}/versions`. Ce n'est PAS
 # la route de `pg_3181_sections_accueil` — sa SQL est distincte et n'a jamais
 # porté de `DISTINCT`. Depuis ce lot, le TRI des versions descend de la requête

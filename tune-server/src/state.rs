@@ -592,6 +592,11 @@ impl AppState {
                         tokio::runtime::Handle::current().block_on(async {
                             let pg = tune_core::db::postgres::PostgresDb::connect(pg_url).await?;
                             tune_core::db::migrations::run_pg_migrations(pg.pool()).await?;
+                            // Second passage du DDL auto-réparateur : sur une
+                            // base NEUVE, celui de `connect()` a tourné avant
+                            // que les scripts ne créent les tables (chasse PG
+                            // du 25/09/2026, voir `ensure_schema`).
+                            pg.ensure_schema().await;
                             let backend =
                                 tune_core::db::backend::PostgresBackend::new(pg.pool().clone());
                             Ok::<_, String>(Arc::new(backend) as Arc<dyn DbBackend>)
