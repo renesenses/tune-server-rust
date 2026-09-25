@@ -966,10 +966,7 @@ mod eq_refresh_guard {
         };
         let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
         lignes.iter().enumerate().any(|(i, l)| {
-            *l == format!("mod {nom};")
-                && lignes[i.saturating_sub(3)..i]
-                    .iter()
-                    .any(|a| *a == "#[cfg(test)]")
+            *l == format!("mod {nom};") && lignes[i.saturating_sub(3)..i].contains(&"#[cfg(test)]")
         })
     }
 
@@ -986,10 +983,7 @@ mod eq_refresh_guard {
         let parent = fs::read_to_string(&fichier_parent).ok()?;
         let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
         let declare = lignes.iter().enumerate().any(|(i, l)| {
-            *l == format!("mod {nom};")
-                && !lignes[i.saturating_sub(3)..i]
-                    .iter()
-                    .any(|a| *a == "#[cfg(test)]")
+            *l == format!("mod {nom};") && !lignes[i.saturating_sub(3)..i].contains(&"#[cfg(test)]")
         });
         if !declare {
             return None;

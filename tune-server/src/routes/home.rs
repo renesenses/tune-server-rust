@@ -501,10 +501,11 @@ fn contextes_recents(state: &AppState, limit: i64, zone_filter: &str) -> Vec<(St
                     // filtre « pas encore fini » s'applique — un disque termine
                     // n'a plus rien a « continuer ».
                     if let Some(a) = albums.get(&id).filter(|_| bibliotheque) {
-                        if let (Some(lus), Some(total)) = (a.listened_tracks, a.track_count) {
-                            if total > 0 && lus >= total {
-                                return None;
-                            }
+                        if let (Some(lus), Some(total)) = (a.listened_tracks, a.track_count)
+                            && total > 0
+                            && lus >= total
+                        {
+                            return None;
                         }
                         o.insert("id".into(), json!(a.id));
                         o.insert("album_id".into(), json!(a.id));
@@ -1124,6 +1125,9 @@ mod tests_contextes {
 
     /// Une ecoute qui DIT d'ou venait le geste. `rang` a `None` = tirage
     /// aleatoire ou ligne d'avant la migration 94.
+    // Fabrique d'épreuve : un argument par colonne de la ligne insérée, lue
+    // d'un coup d'œil à chaque appel (clippy 1.98, `too_many_arguments`).
+    #[allow(clippy::too_many_arguments)]
     fn ecoute_avec_contexte(
         state: &AppState,
         titre: &str,
@@ -1795,7 +1799,7 @@ fn fetch_recently_added(state: &AppState, limit: i64, depuis: f64) -> Result<Vec
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "year": cols.get(3).and_then(|v| v.as_i64()),
@@ -1974,7 +1978,7 @@ async fn top_mixes(
                 .iter()
                 .map(|cols| {
                     json!({
-                        "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                        "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                         "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                         "artist_name": cols.get(2).and_then(|v| v.as_string()),
                         "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -2035,7 +2039,7 @@ async fn new_in_library(
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 "title": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_id": cols.get(2).and_then(|v| v.as_i64()),
                 "artist_name": cols.get(3).and_then(|v| v.as_string()),
@@ -2509,7 +2513,7 @@ fn fetch_radio_picks(state: &AppState) -> Result<Vec<Value>, AppError> {
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                "id": cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 "name": cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "url": cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
                 "logo_url": cols.get(3).and_then(|v| v.as_string()),

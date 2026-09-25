@@ -273,19 +273,17 @@ async fn lastfm_recommendations(
                     &[("artist", artist), ("limit", limit)],
                 )
                 .await
-                {
-                    if let Some(artists) = similar
+                    && let Some(artists) = similar
                         .pointer("/similarartists/artist")
                         .and_then(|a| a.as_array())
-                    {
-                        for a in artists {
-                            recommendations.push(json!({
-                                "name": a["name"],
-                                "match": a["match"],
-                                "url": a["url"],
-                                "based_on": artist,
-                            }));
-                        }
+                {
+                    for a in artists {
+                        recommendations.push(json!({
+                            "name": a["name"],
+                            "match": a["match"],
+                            "url": a["url"],
+                            "based_on": artist,
+                        }));
                     }
                 }
             }

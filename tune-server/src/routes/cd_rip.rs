@@ -139,23 +139,21 @@ async fn list_drives() -> Json<Value> {
     }
 
     // macOS: list optical drives via diskutil
-    if cfg!(target_os = "macos") {
-        if let Ok(output) = tokio::process::Command::new("diskutil")
+    if cfg!(target_os = "macos")
+        && let Ok(output) = tokio::process::Command::new("diskutil")
             .args(["list", "external"])
             .output()
             .await
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("/dev/disk") {
-                        drives.push(json!({
-                            "device": trimmed.split_whitespace().next().unwrap_or(trimmed),
-                            "name": trimmed,
-                        }));
-                    }
-                }
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("/dev/disk") {
+                drives.push(json!({
+                    "device": trimmed.split_whitespace().next().unwrap_or(trimmed),
+                    "name": trimmed,
+                }));
             }
         }
     }
@@ -401,20 +399,20 @@ async fn rip_status(State(state): State<AppState>) -> Json<Value> {
 /// Cancel a running rip task.
 async fn cancel_rip(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Some(current) = settings.get("cd_rip_current").ok().flatten() {
-        if let Ok(mut rip) = serde_json::from_str::<Value>(&current) {
-            rip["status"] = json!("cancelled");
-            settings
-                .set("cd_rip_current", &serde_json::to_string(&rip)?)
-                .ok();
-            return Ok(Json(json!({
-                "status": "cancelled",
-                // #2466 : ce serveur ne lance aucun processus d'extraction, il
-                // n'en interrompt donc aucun. Il efface l'état enregistré, et
-                // c'est tout ce que cette phrase a le droit d'annoncer.
-                "message": "Recorded rip state cleared. No extraction process was running to stop.",
-            })));
-        }
+    if let Some(current) = settings.get("cd_rip_current").ok().flatten()
+        && let Ok(mut rip) = serde_json::from_str::<Value>(&current)
+    {
+        rip["status"] = json!("cancelled");
+        settings
+            .set("cd_rip_current", &serde_json::to_string(&rip)?)
+            .ok();
+        return Ok(Json(json!({
+            "status": "cancelled",
+            // #2466 : ce serveur ne lance aucun processus d'extraction, il
+            // n'en interrompt donc aucun. Il efface l'état enregistré, et
+            // c'est tout ce que cette phrase a le droit d'annoncer.
+            "message": "Recorded rip state cleared. No extraction process was running to stop.",
+        })));
     }
     Ok(Json(json!({
         "status": "idle",

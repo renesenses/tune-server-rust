@@ -166,7 +166,7 @@ fn execute_tracks(state: &AppState, limit: i64, offset: i64) -> Value {
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "album_title": r.get(3).and_then(|v| v.as_string()),
@@ -216,7 +216,7 @@ fn execute_albums(state: &AppState, limit: i64, offset: i64) -> Value {
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "year": r.get(3).and_then(|v| v.as_i64()),
@@ -263,7 +263,7 @@ fn execute_artists(state: &AppState, limit: i64, offset: i64) -> Value {
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "name": r.get(1).and_then(|v| v.as_string()),
                 "album_count": r.get(2).and_then(|v| v.as_i64()),
                 "track_count": r.get(3).and_then(|v| v.as_i64()),
@@ -310,7 +310,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "album_title": r.get(3).and_then(|v| v.as_string()),
@@ -333,7 +333,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "year": r.get(3).and_then(|v| v.as_i64()),
@@ -352,7 +352,7 @@ fn execute_search(state: &AppState, q: &str, limit: i64) -> Value {
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "name": r.get(1).and_then(|v| v.as_string()),
             })
         })

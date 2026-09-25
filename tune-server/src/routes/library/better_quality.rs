@@ -59,7 +59,7 @@ pub(super) async fn track_better_quality(
         if score > score_courant && meilleur.as_ref().is_none_or(|(_, s)| score > *s) {
             meilleur = Some((
                 json!({
-                    "track_id": r.get(0).and_then(|v| v.as_i64()),
+                    "track_id": r.first().and_then(|v| v.as_i64()),
                     "title": r.get(1).and_then(|v| v.as_string()),
                     "format": r.get(2).and_then(|v| v.as_string()),
                     "sample_rate": r.get(3).and_then(|v| v.as_i64()),
@@ -114,7 +114,7 @@ pub(super) async fn album_better_quality(
         if score > score_courant && meilleur.as_ref().is_none_or(|(_, s)| score > *s) {
             meilleur = Some((
                 json!({
-                    "album_id": r.get(0).and_then(|v| v.as_i64()),
+                    "album_id": r.first().and_then(|v| v.as_i64()),
                     "album_title": r.get(1).and_then(|v| v.as_string()),
                     "format": r.get(2).and_then(|v| v.as_string()),
                     "sample_rate": r.get(3).and_then(|v| v.as_i64()),

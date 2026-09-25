@@ -382,10 +382,10 @@ fn boot_disk_name() -> String {
     // /dev/sdb2 → sdb ; /dev/nvme0n1p2 → nvme0n1 ; LVM/dm laissé tel quel
     // (l'image Tune OS n'utilise pas LVM).
     let name = root_dev.trim_start_matches("/dev/");
-    if let Some(idx) = name.find(|c: char| c == 'p') {
-        if name.starts_with("nvme") {
-            return name[..idx].to_string();
-        }
+    if let Some(idx) = name.find('p')
+        && name.starts_with("nvme")
+    {
+        return name[..idx].to_string();
     }
     name.trim_end_matches(|c: char| c.is_ascii_digit())
         .to_string()
@@ -829,6 +829,32 @@ async fn relocate(
     Ok(Json(json!({ "started": true })))
 }
 
+/// Boot guard (docs/DATA-RELOCATION.md) : si la config pointe sous le volume
+/// de données et que celui-ci est absent, on attend — jamais de démarrage
+/// silencieux sur une base vide. Tente un `systemctl start` de l'unité à
+/// chaque itération (disque branché après coup).
+pub async fn wait_for_data_volume(db_path: &str) {
+    let mount_point = data_mount_point();
+    if !super::appliance::is_appliance() || !db_path.starts_with(mount_point.as_str()) {
+        return;
+    }
+    let unit = mount_unit_name(&mount_point);
+    let mut attempt = 0u32;
+    while !Path::new(db_path).exists() {
+        attempt += 1;
+        tracing::warn!(
+            attempt,
+            mount_point = %mount_point,
+            "volume de données absent — en attente (branchez le disque Tune)"
+        );
+        let _ = run_tool("TUNE_SYSTEMCTL_BIN", "systemctl", &["start", &unit]).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    if attempt > 0 {
+        tracing::info!("volume de données présent — démarrage");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,31 +936,5 @@ tmpfs /run tmpfs rw 0 0
         assert!(u.contains("What=/dev/disk/by-uuid/A1B2-C3D4"));
         assert!(u.contains("Where=/srv/tune-data"));
         assert!(u.contains("Options=nofail"));
-    }
-}
-
-/// Boot guard (docs/DATA-RELOCATION.md) : si la config pointe sous le volume
-/// de données et que celui-ci est absent, on attend — jamais de démarrage
-/// silencieux sur une base vide. Tente un `systemctl start` de l'unité à
-/// chaque itération (disque branché après coup).
-pub async fn wait_for_data_volume(db_path: &str) {
-    let mount_point = data_mount_point();
-    if !super::appliance::is_appliance() || !db_path.starts_with(mount_point.as_str()) {
-        return;
-    }
-    let unit = mount_unit_name(&mount_point);
-    let mut attempt = 0u32;
-    while !Path::new(db_path).exists() {
-        attempt += 1;
-        tracing::warn!(
-            attempt,
-            mount_point = %mount_point,
-            "volume de données absent — en attente (branchez le disque Tune)"
-        );
-        let _ = run_tool("TUNE_SYSTEMCTL_BIN", "systemctl", &["start", &unit]).await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
-    if attempt > 0 {
-        tracing::info!("volume de données présent — démarrage");
     }
 }

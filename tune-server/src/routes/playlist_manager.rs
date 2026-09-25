@@ -342,19 +342,19 @@ async fn transfer_playlist(
                 format!("{title} {artist}")
             };
             let results = track_repo.search(&query, 5).unwrap_or_default();
-            if let Some(best) = results.first() {
-                if let Some(id) = best.id {
-                    matched_track_ids.push(id);
-                    matched += 1;
-                    track_details.push(json!({
-                        "source_title": title,
-                        "source_artist": artist,
-                        "matched_title": best.title,
-                        "matched_artist": best.artist_name,
-                        "status": "matched",
-                    }));
-                    continue;
-                }
+            if let Some(best) = results.first()
+                && let Some(id) = best.id
+            {
+                matched_track_ids.push(id);
+                matched += 1;
+                track_details.push(json!({
+                    "source_title": title,
+                    "source_artist": artist,
+                    "matched_title": best.title,
+                    "matched_artist": best.artist_name,
+                    "status": "matched",
+                }));
+                continue;
             }
             not_found += 1;
             track_details.push(json!({
@@ -803,17 +803,15 @@ async fn sync_link(
             } else {
                 format!("{title} {artist}")
             };
-            if let Ok(results) = track_repo.search(&query, 1) {
-                if let Some(track) = results.first() {
-                    if let Some(tid) = track.id {
-                        if !local_track_ids.contains(&tid) {
-                            playlist_repo
-                                .add_tracks(local_playlist_id, &[tid], None)
-                                .ok();
-                            added_to_local += 1;
-                        }
-                    }
-                }
+            if let Ok(results) = track_repo.search(&query, 1)
+                && let Some(track) = results.first()
+                && let Some(tid) = track.id
+                && !local_track_ids.contains(&tid)
+            {
+                playlist_repo
+                    .add_tracks(local_playlist_id, &[tid], None)
+                    .ok();
+                added_to_local += 1;
             }
         }
     }
@@ -935,21 +933,21 @@ async fn backup_playlists(
                 let source_id = &pl.id;
 
                 let mut tracks_data: Vec<Value> = Vec::new();
-                if body.include_tracks {
-                    if let Ok(tracks) = svc.get_playlist_tracks(source_id).await {
-                        tracks_data = tracks
-                            .iter()
-                            .map(|t| {
-                                json!({
-                                    "title": t.title,
-                                    "artist_name": t.artist,
-                                    "album_title": t.album.as_deref().unwrap_or(""),
-                                    "duration_ms": t.duration_ms,
-                                    "source_id": t.id,
-                                })
+                if body.include_tracks
+                    && let Ok(tracks) = svc.get_playlist_tracks(source_id).await
+                {
+                    tracks_data = tracks
+                        .iter()
+                        .map(|t| {
+                            json!({
+                                "title": t.title,
+                                "artist_name": t.artist,
+                                "album_title": t.album.as_deref().unwrap_or(""),
+                                "duration_ms": t.duration_ms,
+                                "source_id": t.id,
                             })
-                            .collect();
-                    }
+                        })
+                        .collect();
                 }
                 let snap_id = next_id(&snapshots);
                 snapshots.push(json!({
@@ -1142,14 +1140,13 @@ async fn restore_backup(
         } else {
             format!("{title} {artist}")
         };
-        if let Ok(results) = track_repo.search(&query, 1) {
-            if let Some(track) = results.first() {
-                if let Some(tid) = track.id {
-                    matched_ids.push(tid);
-                    matched += 1;
-                    continue;
-                }
-            }
+        if let Ok(results) = track_repo.search(&query, 1)
+            && let Some(track) = results.first()
+            && let Some(tid) = track.id
+        {
+            matched_ids.push(tid);
+            matched += 1;
+            continue;
         }
         not_found += 1;
     }
@@ -1251,9 +1248,7 @@ async fn rassembler_les_sources(
             // `WHERE id = ?` nu, et la fusion recopiait donc chez l'appelant
             // le contenu de n'importe quelle playlist du foyer.
             let playlist_id: i64 = source.playlist_id.parse().unwrap_or(0);
-            if let Err(r) = owned_or_404_response(&playlist_repo, playlist_id, profile.id()) {
-                return Err(r);
-            }
+            owned_or_404_response(&playlist_repo, playlist_id, profile.id())?;
             let ids = playlist_repo.get_track_ids(playlist_id).unwrap_or_default();
             for t in track_repo.get_multiple(&ids).unwrap_or_default() {
                 pistes.push(PisteSource {
@@ -1741,14 +1736,13 @@ async fn import_playlists(
         } else {
             format!("{} {}", t.title, artist)
         };
-        if let Ok(results) = track_repo.search(&query, 1) {
-            if let Some(track) = results.first() {
-                if let Some(tid) = track.id {
-                    matched_ids.push(tid);
-                    matched += 1;
-                    continue;
-                }
-            }
+        if let Ok(results) = track_repo.search(&query, 1)
+            && let Some(track) = results.first()
+            && let Some(tid) = track.id
+        {
+            matched_ids.push(tid);
+            matched += 1;
+            continue;
         }
         not_found += 1;
     }

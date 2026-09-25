@@ -345,6 +345,260 @@ fn ext_allowed(ext: &str) -> bool {
     ALLOWED_EXT.contains(&ext)
 }
 
+async fn detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let auth = match auth(&state) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let base = base_url(&state);
+    finish(
+        support::get_ticket(&state.http_client, &auth, id, base.as_deref()).await,
+        &headers,
+    )
+}
+
+/// Répond à un ticket. Deux formats, comme à l'ouverture : `application/json`
+/// (chemin historique, corps seul) ou `multipart/form-data` (avec
+/// `attachments[]`).
+///
+/// Le multipart manquait. mozaiklabs accepte pourtant les pièces jointes sur ce
+/// chemin depuis toujours (`ReplySupportTicketRequest`, `AddSupportMessage`) :
+/// c'est ici que la chaîne s'arrêtait, et c'est pourquoi le PREMIER message
+/// d'un testeur pouvait porter son journal quand le DEUXIÈME ne pouvait rien
+/// porter — pas même jusqu'au ticket que le SAV lit (#3871).
+///
+/// ⚠️ Ce qui reste hors de ce dépôt : que ce deuxième message apparaisse sur le
+/// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
+/// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
+async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request) -> Response {
+    let auth = match auth(&state) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    let is_multipart = est_multipart(&req);
+    // Copiés avant l'extraction du corps, qui consomme la requête (#2178).
+    let headers = req.headers().clone();
+
+    if is_multipart {
+        reply_multipart(state, auth, id, req, headers).await
+    } else {
+        reply_json(state, auth, id, req, headers).await
+    }
+}
+
+/// Chemin JSON historique — réponse sans pièce jointe. C'est le seul que les
+/// clients déployés connaissent : il ne bouge pas.
+async fn reply_json(
+    state: AppState,
+    auth: support::SupportAuth,
+    id: i64,
+    req: Request,
+    headers: HeaderMap,
+) -> Response {
+    let payload = match req.extract::<Json<ReplyBody>, _>().await {
+        Ok(Json(p)) => p,
+        Err(rej) => return rej.into_response(),
+    };
+    let base = base_url(&state);
+    finish(
+        support::reply(
+            &state.http_client,
+            &auth,
+            id,
+            &payload.body,
+            base.as_deref(),
+        )
+        .await,
+        &headers,
+    )
+}
+
+/// Chemin multipart — réponse AVEC pièces jointes. Mêmes bornes qu'à
+/// l'ouverture (5 fichiers, 50 Mo, même liste blanche d'extensions), parce que
+/// c'est la même règle Laravel de l'autre côté.
+async fn reply_multipart(
+    state: AppState,
+    auth: support::SupportAuth,
+    id: i64,
+    req: Request,
+    headers: HeaderMap,
+) -> Response {
+    let multipart = match req.extract::<Multipart, _>().await {
+        Ok(m) => m,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let relais = match lire_multipart(multipart, CHAMPS_REPONSE).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // Refusé ici plutôt qu'en 422 amont : la règle est connue, et un
+    // aller-retour réseau pour l'apprendre ne sert personne.
+    if !relais.porte("body") {
+        return client_error("missing_fields", "La réponse ne peut pas être vide.");
+    }
+
+    let base = base_url(&state);
+    finish(
+        support::reply_multipart(
+            &state.http_client,
+            &auth,
+            id,
+            relais.fields,
+            relais.files,
+            base.as_deref(),
+        )
+        .await,
+        &headers,
+    )
+}
+
+/// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
+/// jamais d'une clé de licence fournie par la page.
+async fn mark_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let auth = match auth(&state) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+    let base = base_url(&state);
+    finish(
+        support::mark_read(&state.http_client, &auth, id, base.as_deref()).await,
+        &headers,
+    )
+}
+
+/// Racine du nuage à interroger, `None` pour la production.
+///
+/// Même réglage que le SSO, le marché de greffons, les couvertures
+/// communautaires et la validation de licence : `mozaik_base_url`. Sans lui, le
+/// chemin qui porte le diagnostic des tickets ne pouvait être éprouvé de bout
+/// en bout qu'en appelant mozaiklabs.fr pour de vrai — c'est-à-dire jamais
+/// (#2916).
+fn base_url(state: &AppState) -> Option<String> {
+    SettingsRepo::with_backend(state.backend.clone())
+        .get("mozaik_base_url")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
+/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
+/// 412 seulement si NI l'un NI l'autre n'est disponible.
+fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    // Chemin 1 : token OAuth premium (login SSO dans Tune).
+    if let Some(token) = settings.get("mozaik_access_token").ok().flatten()
+        && !token.is_empty()
+    {
+        return Ok(support::SupportAuth::Bearer(token));
+    }
+
+    // Chemin 2 : clé de licence. mozaiklabs vérifie la licence premium et
+    // rattache le ticket au compte de l'e-mail de la licence.
+    if let Some(key) = settings.get("license_key").ok().flatten()
+        && !key.is_empty()
+    {
+        let fingerprint = settings
+            .get("hardware_fingerprint")
+            .ok()
+            .flatten()
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(tune_core::license::LicenseManager::hardware_fingerprint);
+        return Ok(support::SupportAuth::License { key, fingerprint });
+    }
+
+    Err((
+        StatusCode::PRECONDITION_FAILED,
+        Json(json!({
+            "error": "not_connected",
+            "message": "Connecte-toi à ton compte Tune ou active ta licence premium pour utiliser le support.",
+        })),
+    )
+        .into_response())
+}
+
+/// Remplace le texte d'un 429 par un message localisé et exploitable.
+///
+/// Le limiteur de Laravel ne sait dire qu'une chose, en anglais et sans
+/// contexte : `{"message":"Too Many Attempts."}`. Un client qui affiche
+/// `message` montrait donc ce texte-là, et celui qui ne le lit pas retombait
+/// sur son message générique — « Une erreur est survenue (429) », qui ne dit ni
+/// ce qui s'est passé ni quand réessayer (#2178).
+///
+/// On écrit ici, dans la langue de l'interface (`Accept-Language`, comme la
+/// porte des clés Radio France), ce que le serveur sait réellement : la limite
+/// vient du service distant, et — quand mozaiklabs l'annonce — le délai avant
+/// nouvelle tentative. **Aucun délai n'est inventé** : sans en-tête
+/// exploitable, le message le tait au lieu de le supposer.
+///
+/// Le texte amont n'est pas perdu : il est déplacé sous `upstream_message`,
+/// pour le SAV et pour le diagnostic. Le code machine `error` (posé par
+/// `tune_core::cloud::support`) n'est pas touché : les clients qui programment
+/// contre `rate_limited` gardent leur contrat.
+fn localiser_limite(value: &mut Value, headers: &HeaderMap, retry_after: Option<u64>) {
+    // Même fabrique que le reste du nuage (`routes::cloud_error`), avec les
+    // clés propres au support : une seule règle d'arrondi, un seul endroit où
+    // la langue est résolue.
+    let message = crate::routes::cloud_error::message_limite(
+        headers,
+        retry_after,
+        "support.tropDeRequetes",
+        "support.tropDeRequetesDelai",
+    );
+
+    // `build_result` garantit un objet sur un 429, mais on ne parie pas dessus.
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(amont) = obj.insert("message".to_string(), json!(message)) {
+        obj.entry("upstream_message").or_insert(amont);
+    }
+}
+
+/// Traduit le `SupportResult` en réponse HTTP, en préservant le status renvoyé
+/// par mozaiklabs (401/403/422…).
+///
+/// Sur un 429, `tune_core::cloud::support` a déjà déposé `retry_after` dans le
+/// corps ; on le réémet aussi en en-tête `Retry-After`, forme standard que
+/// lisent les clients non web, et on remplace le texte anglais du limiteur par
+/// un message localisé (voir [`localiser_limite`]). Le **statut reste 429** :
+/// il est juste, et les clients déployés le reçoivent déjà — seul le corps
+/// change (#2178).
+fn finish(result: support::SupportResult, headers: &HeaderMap) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err((status, mut value)) => {
+            let retry_after = value.get("retry_after").and_then(Value::as_u64);
+            if status == 429 {
+                localiser_limite(&mut value, headers, retry_after);
+            }
+            let mut resp = (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(value),
+            )
+                .into_response();
+            if let Some(secs) = retry_after
+                && let Ok(v) = header::HeaderValue::from_str(&secs.to_string())
+            {
+                resp.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            resp
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,9 +640,9 @@ mod tests {
         assert_eq!(MAX_FILE_BYTES, 50 * 1024 * 1024);
         // Le plafond du corps doit dépasser 5 fichiers pleins pour ne pas
         // tronquer un envoi légitime.
-        assert!(MAX_TOTAL_BYTES > MAX_FILES * MAX_FILE_BYTES);
+        const { assert!(MAX_TOTAL_BYTES > MAX_FILES * MAX_FILE_BYTES) };
         // …et rester au-dessus du DefaultBodyLimit global (50 Mo).
-        assert!(MAX_TOTAL_BYTES > 50 * 1024 * 1024);
+        const { assert!(MAX_TOTAL_BYTES > 50 * 1024 * 1024) };
     }
 
     /// Le corps que le client web envoie réellement quand il n'y a AUCUNE pièce
@@ -577,259 +831,5 @@ mod tests {
 
         assert_eq!(code, StatusCode::FORBIDDEN);
         assert_eq!(body, amont, "corps modifié hors 429 : {body}");
-    }
-}
-
-async fn detail(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let base = base_url(&state);
-    finish(
-        support::get_ticket(&state.http_client, &auth, id, base.as_deref()).await,
-        &headers,
-    )
-}
-
-/// Répond à un ticket. Deux formats, comme à l'ouverture : `application/json`
-/// (chemin historique, corps seul) ou `multipart/form-data` (avec
-/// `attachments[]`).
-///
-/// Le multipart manquait. mozaiklabs accepte pourtant les pièces jointes sur ce
-/// chemin depuis toujours (`ReplySupportTicketRequest`, `AddSupportMessage`) :
-/// c'est ici que la chaîne s'arrêtait, et c'est pourquoi le PREMIER message
-/// d'un testeur pouvait porter son journal quand le DEUXIÈME ne pouvait rien
-/// porter — pas même jusqu'au ticket que le SAV lit (#3871).
-///
-/// ⚠️ Ce qui reste hors de ce dépôt : que ce deuxième message apparaisse sur le
-/// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
-/// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
-async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-
-    let is_multipart = est_multipart(&req);
-    // Copiés avant l'extraction du corps, qui consomme la requête (#2178).
-    let headers = req.headers().clone();
-
-    if is_multipart {
-        reply_multipart(state, auth, id, req, headers).await
-    } else {
-        reply_json(state, auth, id, req, headers).await
-    }
-}
-
-/// Chemin JSON historique — réponse sans pièce jointe. C'est le seul que les
-/// clients déployés connaissent : il ne bouge pas.
-async fn reply_json(
-    state: AppState,
-    auth: support::SupportAuth,
-    id: i64,
-    req: Request,
-    headers: HeaderMap,
-) -> Response {
-    let payload = match req.extract::<Json<ReplyBody>, _>().await {
-        Ok(Json(p)) => p,
-        Err(rej) => return rej.into_response(),
-    };
-    let base = base_url(&state);
-    finish(
-        support::reply(
-            &state.http_client,
-            &auth,
-            id,
-            &payload.body,
-            base.as_deref(),
-        )
-        .await,
-        &headers,
-    )
-}
-
-/// Chemin multipart — réponse AVEC pièces jointes. Mêmes bornes qu'à
-/// l'ouverture (5 fichiers, 50 Mo, même liste blanche d'extensions), parce que
-/// c'est la même règle Laravel de l'autre côté.
-async fn reply_multipart(
-    state: AppState,
-    auth: support::SupportAuth,
-    id: i64,
-    req: Request,
-    headers: HeaderMap,
-) -> Response {
-    let multipart = match req.extract::<Multipart, _>().await {
-        Ok(m) => m,
-        Err(rej) => return rej.into_response(),
-    };
-
-    let relais = match lire_multipart(multipart, CHAMPS_REPONSE).await {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-
-    // Refusé ici plutôt qu'en 422 amont : la règle est connue, et un
-    // aller-retour réseau pour l'apprendre ne sert personne.
-    if !relais.porte("body") {
-        return client_error("missing_fields", "La réponse ne peut pas être vide.");
-    }
-
-    let base = base_url(&state);
-    finish(
-        support::reply_multipart(
-            &state.http_client,
-            &auth,
-            id,
-            relais.fields,
-            relais.files,
-            base.as_deref(),
-        )
-        .await,
-        &headers,
-    )
-}
-
-/// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
-/// jamais d'une clé de licence fournie par la page.
-async fn mark_read(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-) -> Response {
-    let auth = match auth(&state) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-    let base = base_url(&state);
-    finish(
-        support::mark_read(&state.http_client, &auth, id, base.as_deref()).await,
-        &headers,
-    )
-}
-
-/// Racine du nuage à interroger, `None` pour la production.
-///
-/// Même réglage que le SSO, le marché de greffons, les couvertures
-/// communautaires et la validation de licence : `mozaik_base_url`. Sans lui, le
-/// chemin qui porte le diagnostic des tickets ne pouvait être éprouvé de bout
-/// en bout qu'en appelant mozaiklabs.fr pour de vrai — c'est-à-dire jamais
-/// (#2916).
-fn base_url(state: &AppState) -> Option<String> {
-    SettingsRepo::with_backend(state.backend.clone())
-        .get("mozaik_base_url")
-        .ok()
-        .flatten()
-        .filter(|s| !s.trim().is_empty())
-}
-
-/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
-/// la clé de licence (premium par clé, sans SSO — la majorité des testeurs).
-/// 412 seulement si NI l'un NI l'autre n'est disponible.
-fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    // Chemin 1 : token OAuth premium (login SSO dans Tune).
-    if let Some(token) = settings.get("mozaik_access_token").ok().flatten() {
-        if !token.is_empty() {
-            return Ok(support::SupportAuth::Bearer(token));
-        }
-    }
-
-    // Chemin 2 : clé de licence. mozaiklabs vérifie la licence premium et
-    // rattache le ticket au compte de l'e-mail de la licence.
-    if let Some(key) = settings.get("license_key").ok().flatten() {
-        if !key.is_empty() {
-            let fingerprint = settings
-                .get("hardware_fingerprint")
-                .ok()
-                .flatten()
-                .filter(|f| !f.is_empty())
-                .unwrap_or_else(tune_core::license::LicenseManager::hardware_fingerprint);
-            return Ok(support::SupportAuth::License { key, fingerprint });
-        }
-    }
-
-    Err((
-        StatusCode::PRECONDITION_FAILED,
-        Json(json!({
-            "error": "not_connected",
-            "message": "Connecte-toi à ton compte Tune ou active ta licence premium pour utiliser le support.",
-        })),
-    )
-        .into_response())
-}
-
-/// Remplace le texte d'un 429 par un message localisé et exploitable.
-///
-/// Le limiteur de Laravel ne sait dire qu'une chose, en anglais et sans
-/// contexte : `{"message":"Too Many Attempts."}`. Un client qui affiche
-/// `message` montrait donc ce texte-là, et celui qui ne le lit pas retombait
-/// sur son message générique — « Une erreur est survenue (429) », qui ne dit ni
-/// ce qui s'est passé ni quand réessayer (#2178).
-///
-/// On écrit ici, dans la langue de l'interface (`Accept-Language`, comme la
-/// porte des clés Radio France), ce que le serveur sait réellement : la limite
-/// vient du service distant, et — quand mozaiklabs l'annonce — le délai avant
-/// nouvelle tentative. **Aucun délai n'est inventé** : sans en-tête
-/// exploitable, le message le tait au lieu de le supposer.
-///
-/// Le texte amont n'est pas perdu : il est déplacé sous `upstream_message`,
-/// pour le SAV et pour le diagnostic. Le code machine `error` (posé par
-/// `tune_core::cloud::support`) n'est pas touché : les clients qui programment
-/// contre `rate_limited` gardent leur contrat.
-fn localiser_limite(value: &mut Value, headers: &HeaderMap, retry_after: Option<u64>) {
-    // Même fabrique que le reste du nuage (`routes::cloud_error`), avec les
-    // clés propres au support : une seule règle d'arrondi, un seul endroit où
-    // la langue est résolue.
-    let message = crate::routes::cloud_error::message_limite(
-        headers,
-        retry_after,
-        "support.tropDeRequetes",
-        "support.tropDeRequetesDelai",
-    );
-
-    // `build_result` garantit un objet sur un 429, mais on ne parie pas dessus.
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-    if let Some(amont) = obj.insert("message".to_string(), json!(message)) {
-        obj.entry("upstream_message").or_insert(amont);
-    }
-}
-
-/// Traduit le `SupportResult` en réponse HTTP, en préservant le status renvoyé
-/// par mozaiklabs (401/403/422…).
-///
-/// Sur un 429, `tune_core::cloud::support` a déjà déposé `retry_after` dans le
-/// corps ; on le réémet aussi en en-tête `Retry-After`, forme standard que
-/// lisent les clients non web, et on remplace le texte anglais du limiteur par
-/// un message localisé (voir [`localiser_limite`]). Le **statut reste 429** :
-/// il est juste, et les clients déployés le reçoivent déjà — seul le corps
-/// change (#2178).
-fn finish(result: support::SupportResult, headers: &HeaderMap) -> Response {
-    match result {
-        Ok(value) => Json(value).into_response(),
-        Err((status, mut value)) => {
-            let retry_after = value.get("retry_after").and_then(Value::as_u64);
-            if status == 429 {
-                localiser_limite(&mut value, headers, retry_after);
-            }
-            let mut resp = (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                Json(value),
-            )
-                .into_response();
-            if let Some(secs) = retry_after {
-                if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
-                    resp.headers_mut().insert(header::RETRY_AFTER, v);
-                }
-            }
-            resp
-        }
     }
 }

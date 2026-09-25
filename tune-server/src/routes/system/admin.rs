@@ -203,10 +203,10 @@ pub(super) async fn admin_zones(State(state): State<AppState>) -> Json<Value> {
                 tune_core::playback::PlayState::Paused => "paused",
                 tune_core::playback::PlayState::Stopped => "stopped",
             },
-            "volume": if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 },
+            "volume": if ps.volume > 0.0 { ps.volume } else { z.volume / 100.0 },
             // #1274 — lecture en dB du volume ci-dessus, `null` = silence.
             "volume_db": tune_core::audio::volume_scale::linear_to_db(
-                if ps.volume > 0.0 { ps.volume } else { z.volume as f64 / 100.0 },
+                if ps.volume > 0.0 { ps.volume } else { z.volume / 100.0 },
             ),
             "muted": z.muted,
             "current_track": ps.now_playing,
@@ -253,11 +253,10 @@ fn load_peers(state: &AppState) -> Vec<PeerAddr> {
 }
 
 fn save_peers(state: &AppState, peers: &[PeerAddr]) {
-    if let Ok(json) = serde_json::to_string(peers) {
-        if let Err(e) = SettingsRepo::with_backend(state.backend.clone()).set(TUNE_PEERS_KEY, &json)
-        {
-            warn!(error = %e, "tune_peers_persist_failed");
-        }
+    if let Ok(json) = serde_json::to_string(peers)
+        && let Err(e) = SettingsRepo::with_backend(state.backend.clone()).set(TUNE_PEERS_KEY, &json)
+    {
+        warn!(error = %e, "tune_peers_persist_failed");
     }
 }
 

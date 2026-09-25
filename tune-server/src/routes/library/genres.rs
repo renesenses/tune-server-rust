@@ -36,16 +36,16 @@ pub(super) async fn genre_tree(State(state): State<AppState>) -> Result<Json<Val
     let mut genre_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (genre_col, genres_col) in &raw_genres {
         // Prefer the structured genres JSON array if present
-        if let Some(json_str) = genres_col {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
-                for g in arr {
-                    let trimmed = g.trim().to_string();
-                    if !trimmed.is_empty() {
-                        genre_set.insert(trimmed);
-                    }
+        if let Some(json_str) = genres_col
+            && let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str)
+        {
+            for g in arr {
+                let trimmed = g.trim().to_string();
+                if !trimmed.is_empty() {
+                    genre_set.insert(trimmed);
                 }
-                continue;
             }
+            continue;
         }
         // Fall back to splitting the legacy genre column
         if let Some(raw) = genre_col {
@@ -280,10 +280,8 @@ pub(super) async fn rename_genre(
                 (new_k, new_children)
             })
             .collect();
-        if tree_changed {
-            if let Ok(s) = serde_json::to_string(&renamed) {
-                settings.set("genre_tree", &s).ok();
-            }
+        if tree_changed && let Ok(s) = serde_json::to_string(&renamed) {
+            settings.set("genre_tree", &s).ok();
         }
     }
     tracing::info!(from = %from, to = %to, albums = n_albums, tracks = n_tracks, "genre_renamed");
@@ -379,8 +377,8 @@ pub(super) async fn list_genres(
     let filter = params.query.map(|q| q.to_lowercase());
 
     let items: Vec<Value> = groups
-        .iter()
-        .filter_map(|(_key, variants)| {
+        .values()
+        .filter_map(|variants| {
             let count: i64 = variants.values().sum();
             // Display label = the most common spelling; ties broken by the
             // lexicographically smallest for a stable, deterministic label.

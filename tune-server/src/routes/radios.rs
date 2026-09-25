@@ -1849,12 +1849,12 @@ async fn list_radio_favorites(
             "SELECT id, title, artist, station_name, cover_url, stream_url, saved_at FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?",
             &[&limit as &dyn ToSqlValue, &offset as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "title": r.get(1).and_then(|v| v.as_string()),
                 "artist": r.get(2).and_then(|v| v.as_string()),
                 "station_name": r.get(3).and_then(|v| v.as_string()),
@@ -1871,8 +1871,8 @@ async fn radio_favorites_count(State(state): State<AppState>) -> Result<Json<Val
     let count: i64 = state
         .backend
         .query_one("SELECT COUNT(*) FROM radio_favorites", &[])
-        .map_err(|e| AppError::internal(e))?
-        .and_then(|r| r.get(0).and_then(|v| v.as_i64()))
+        .map_err(AppError::internal)?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0);
     Ok(Json(json!({ "count": count })))
 }
@@ -1895,8 +1895,8 @@ async fn is_radio_favorite(
             "SELECT EXISTS(SELECT 1 FROM radio_favorites WHERE title = ? AND artist = ?)",
             &[&q.title as &dyn ToSqlValue, &artist as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?
-        .and_then(|r| r.get(0).and_then(|v| v.as_i64()))
+        .map_err(AppError::internal)?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .map(|v| v != 0)
         .unwrap_or(false);
     Ok(Json(json!({ "is_favorite": exists })))
@@ -2073,7 +2073,7 @@ async fn create_playlist_from_favorites(
         .into_iter()
         .map(|r| {
             (
-                r.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                r.first().and_then(|v| v.as_string()).unwrap_or_default(),
                 r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
             )
         })
@@ -2113,12 +2113,12 @@ async fn create_playlist_from_favorites(
     let favorites: Vec<(String, String)> = favorites
         .into_iter()
         .map(|(title, artist)| {
-            if artist.trim().is_empty() {
-                if let Some((a, t)) = title.split_once(" - ") {
-                    let (a, t) = (a.trim(), t.trim());
-                    if !a.is_empty() && !t.is_empty() {
-                        return (t.to_string(), a.to_string());
-                    }
+            if artist.trim().is_empty()
+                && let Some((a, t)) = title.split_once(" - ")
+            {
+                let (a, t) = (a.trim(), t.trim());
+                if !a.is_empty() && !t.is_empty() {
+                    return (t.to_string(), a.to_string());
                 }
             }
             (title, artist)
@@ -2503,12 +2503,12 @@ async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppEr
     let rows = state.backend.query_many(
         "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids FROM alarms ORDER BY time",
         &[],
-    ).map_err(|e| AppError::internal(e))?;
+    ).map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "name": r.get(1).and_then(|v| v.as_string()).unwrap_or_else(|| "Alarm".into()),
                 "time": r.get(2).and_then(|v| v.as_string()),
                 "days": r.get(3).and_then(|v| v.as_string()),
@@ -2567,7 +2567,7 @@ async fn create_alarm_global(
             .query_one("SELECT COUNT(*) FROM alarms", &[])
             .ok()
             .flatten()
-            .and_then(|r| r.get(0).and_then(|v| v.as_i64()))
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
             .unwrap_or(0);
         if count >= 1 {
             return (

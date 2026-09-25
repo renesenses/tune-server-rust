@@ -155,7 +155,7 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
             "SELECT genre, genres FROM tracks WHERE (genre IS NOT NULL AND genre != '') OR (genres IS NOT NULL AND genres != '')",
             &[],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     for cols in &rows {
@@ -163,19 +163,19 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
         let genres_col = cols.get(1).and_then(|v| v.as_string());
 
         let mut genres_for_track: Vec<String> = Vec::new();
-        if let Some(json_str) = &genres_col {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str) {
-                genres_for_track = arr
-                    .into_iter()
-                    .map(|g| g.trim().to_string())
-                    .filter(|g| !g.is_empty())
-                    .collect();
-            }
+        if let Some(json_str) = &genres_col
+            && let Ok(arr) = serde_json::from_str::<Vec<String>>(json_str)
+        {
+            genres_for_track = arr
+                .into_iter()
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect();
         }
-        if genres_for_track.is_empty() {
-            if let Some(raw_genre) = &genre_col {
-                genres_for_track = tune_core::metadata::split_genre_tag(raw_genre);
-            }
+        if genres_for_track.is_empty()
+            && let Some(raw_genre) = &genre_col
+        {
+            genres_for_track = tune_core::metadata::split_genre_tag(raw_genre);
         }
         for g in genres_for_track {
             *counts.entry(g).or_insert(0) += 1;
@@ -183,7 +183,7 @@ async fn genre_breakdown(State(state): State<AppState>) -> Result<Json<Value>, A
     }
 
     let mut sorted: Vec<(String, i64)> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
     sorted.truncate(30);
 
     let items: Vec<Value> = sorted
@@ -235,7 +235,7 @@ async fn wrapped(
             "SELECT COUNT(*), COALESCE(SUM(duration_ms), 0) FROM listen_history WHERE listened_at >= ? AND listened_at < ?",
             &[&year_start as &dyn tune_core::db::backend::ToSqlValue, &year_end],
         )
-        .map_err(|e| AppError::internal(e))?
+        .map_err(AppError::internal)?
         .unwrap_or_default();
     let total_listens = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
     let total_ms = row.get(1).and_then(|v| v.as_i64()).unwrap_or(0);

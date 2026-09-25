@@ -39,7 +39,7 @@ async fn preview(State(state): State<AppState>) -> Result<Json<Value>, AppError>
     let report = tokio::task::spawn_blocking(move || digest::generate_digest(&backend))
         .await
         .map_err(|e| AppError::internal(format!("digest task: {e}")))?
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     Ok(Json(json!(report)))
 }
@@ -94,7 +94,7 @@ async fn send(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let report = tokio::task::spawn_blocking(move || digest::generate_digest(&backend))
         .await
         .map_err(|e| AppError::internal(format!("digest task: {e}")))?
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     // Push to mozaiklabs.fr API
     let body = json!({
@@ -195,17 +195,17 @@ async fn save_settings(
     if let Some(enabled) = body.enabled {
         settings
             .set("digest_enabled", if enabled { "true" } else { "false" })
-            .map_err(|e| AppError::internal(e))?;
+            .map_err(AppError::internal)?;
     }
     if let Some(ref day) = body.day_of_week {
         settings
             .set("digest_day_of_week", day)
-            .map_err(|e| AppError::internal(e))?;
+            .map_err(AppError::internal)?;
     }
     if let Some(ref email) = body.email {
         settings
             .set("digest_email", email)
-            .map_err(|e| AppError::internal(e))?;
+            .map_err(AppError::internal)?;
     }
 
     info!(

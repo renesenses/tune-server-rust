@@ -54,7 +54,7 @@ pub(super) async fn export_ratings(
         .into_iter()
         .map(|r| {
             json!({
-                "album_id": r.get(0).and_then(|v| v.as_i64()),
+                "album_id": r.first().and_then(|v| v.as_i64()),
                 "album_title": r.get(1).and_then(|v| v.as_string()),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "rating": r.get(3).and_then(|v| v.as_i64()),
