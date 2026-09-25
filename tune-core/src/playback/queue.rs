@@ -81,6 +81,44 @@ pub fn resolve_shuffle_max_tracks(brut: Option<&str>) -> i64 {
         .clamp(SHUFFLE_MAX_TRACKS_FLOOR, SHUFFLE_MAX_TRACKS_CEILING)
 }
 
+/// Valide une valeur ARRIVANTE, celle d'un `PATCH /system/config`.
+///
+/// Jumelle de `resolve_shuffle_max_tracks`, et délibérément plus sévère
+/// qu'elle. Les deux ne regardent pas la même scène :
+///
+/// * à la LECTURE, il n'y a personne devant l'écran. Une ligne illisible ou
+///   hors bornes peut venir d'une base écrite à la main, d'un réglage posé
+///   avant cette garde, ou d'une restauration. La ramener dans les bornes est
+///   la seule conduite acceptable : un réglage ne doit jamais empêcher de
+///   jouer, et c'est ce que `resolve_shuffle_max_tracks` continue de faire.
+/// * à l'ÉCRITURE, quelqu'un vient de taper un chiffre et regarde la réponse.
+///   Accepter `100000` puis appliquer `5000` lui ferait croire à un plafond
+///   qu'il n'a pas : il lancerait une lecture aléatoire sur ses 30 000 pistes,
+///   en recevrait 5 000, et chercherait le bug ailleurs. Exactement le défaut
+///   muet que #4154 a refermé sur les plafonds d'indexation — refusé, en
+///   nommant les bornes, plutôt que deviné.
+///
+/// Rend la valeur canonique à persister (l'entier, sans espaces ni
+/// guillemets) pour que la base ne porte qu'une seule forme.
+pub fn valider_shuffle_max_tracks(brut: &str) -> Result<i64, String> {
+    let nettoye = brut.trim().trim_matches('"').trim();
+    let Ok(n) = nettoye.parse::<i64>() else {
+        return Err(format!(
+            "{SHUFFLE_MAX_TRACKS_KEY} : un entier entre {SHUFFLE_MAX_TRACKS_FLOOR} et \
+             {SHUFFLE_MAX_TRACKS_CEILING} — reçu « {brut} »"
+        ));
+    };
+    if !(SHUFFLE_MAX_TRACKS_FLOOR..=SHUFFLE_MAX_TRACKS_CEILING).contains(&n) {
+        return Err(format!(
+            "{SHUFFLE_MAX_TRACKS_KEY} = {n} : hors bornes. Le plancher est \
+             {SHUFFLE_MAX_TRACKS_FLOOR} (zéro éteindrait le bouton « lecture aléatoire ») et le \
+             plafond {SHUFFLE_MAX_TRACKS_CEILING} (au-delà, la file relue dépasse deux mégaoctets \
+             et c'est le client qui gèle, pas le serveur)"
+        ));
+    }
+    Ok(n)
+}
+
 /// Lit le plafond effectif depuis les réglages.
 pub fn shuffle_max_tracks(backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>) -> i64 {
     let settings = crate::db::settings_repo::SettingsRepo::with_backend(backend.clone());
@@ -621,7 +659,7 @@ mod tests {
 mod plafond_aleatoire_reglage_tests {
     use super::{
         SHUFFLE_MAX_TRACKS_CEILING, SHUFFLE_MAX_TRACKS_DEFAULT, SHUFFLE_MAX_TRACKS_FLOOR,
-        resolve_shuffle_max_tracks,
+        resolve_shuffle_max_tracks, valider_shuffle_max_tracks,
     };
 
     /// LA garantie donnée à Jean Valjean : personne ne configure rien, le
@@ -709,6 +747,76 @@ mod plafond_aleatoire_reglage_tests {
         assert_eq!(resolve_shuffle_max_tracks(Some("beaucoup")), 500);
         assert_eq!(resolve_shuffle_max_tracks(Some("500.5")), 500);
         assert_eq!(resolve_shuffle_max_tracks(Some("tout")), 500);
+    }
+
+    /// Ce que le PATCH accepte : les bornes INCLUSES, et rien au-delà.
+    ///
+    /// Les deux extrémités sont éprouvées parce que ce sont elles qu'un
+    /// `<` posé à la place d'un `<=` rendrait injoignables — 5 000 est
+    /// précisément la valeur que l'écran propose comme maximum.
+    #[test]
+    fn le_patch_accepte_les_bornes_incluses() {
+        assert_eq!(
+            valider_shuffle_max_tracks("1"),
+            Ok(SHUFFLE_MAX_TRACKS_FLOOR)
+        );
+        assert_eq!(
+            valider_shuffle_max_tracks("5000"),
+            Ok(SHUFFLE_MAX_TRACKS_CEILING)
+        );
+        assert_eq!(valider_shuffle_max_tracks("500"), Ok(500));
+        assert_eq!(
+            valider_shuffle_max_tracks("  2400  "),
+            Ok(2400),
+            "les espaces d'un champ de saisie ne sont pas une valeur illisible"
+        );
+        assert_eq!(
+            valider_shuffle_max_tracks("\"2400\""),
+            Ok(2400),
+            "nombre ou chaîne JSON : les deux formes arrivent par PATCH /config"
+        );
+    }
+
+    /// Hors bornes à l'ÉCRITURE : refusé, et le refus NOMME les deux bornes.
+    ///
+    /// C'est toute la différence avec `resolve_shuffle_max_tracks`, qui ramène
+    /// la même valeur dans les bornes sans un mot. Là-bas c'est la seule
+    /// conduite possible — personne ne regarde. Ici quelqu'un attend une
+    /// réponse : lui rendre `{"ok": true}` après avoir retenu 5 000 pour un
+    /// 100 000 demandé, c'est lui faire chercher le bug ailleurs.
+    #[test]
+    fn hors_bornes_le_patch_refuse_en_nommant_les_bornes() {
+        for valeur in ["0", "-1", "5001", "30000", "100000"] {
+            let erreur = match valider_shuffle_max_tracks(valeur) {
+                Ok(v) => panic!(
+                    "« {valeur} » est hors bornes : il doit être REFUSÉ, il a été ramené à {v}"
+                ),
+                Err(e) => e,
+            };
+            assert!(
+                erreur.contains(&SHUFFLE_MAX_TRACKS_FLOOR.to_string())
+                    && erreur.contains(&SHUFFLE_MAX_TRACKS_CEILING.to_string()),
+                "le refus de « {valeur} » doit nommer les deux bornes, sinon il \
+                 laisse l'utilisateur deviner quoi écrire : {erreur}"
+            );
+        }
+    }
+
+    /// Illisible à l'écriture : refusé aussi. La lecture, elle, retombe sur le
+    /// défaut — une base ne doit jamais empêcher de jouer, un utilisateur si.
+    #[test]
+    fn une_saisie_illisible_est_refusee_la_ou_la_lecture_replie() {
+        for valeur in ["beaucoup", "500.5", "", "   ", "1e3"] {
+            assert!(
+                valider_shuffle_max_tracks(valeur).is_err(),
+                "« {valeur} » n'est pas un entier : le PATCH doit le dire"
+            );
+        }
+        assert_eq!(
+            resolve_shuffle_max_tracks(Some("beaucoup")),
+            SHUFFLE_MAX_TRACKS_DEFAULT,
+            "la LECTURE, elle, ne refuse rien : elle replie"
+        );
     }
 
     /// Contre-épreuve des bornes elles-mêmes : un défaut hors bornes serait

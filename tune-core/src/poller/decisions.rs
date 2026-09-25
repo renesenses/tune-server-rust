@@ -366,6 +366,38 @@ pub fn demarrage_mort(output_type: &str, bytes_sent: u64) -> bool {
     output_type == "dlna" && bytes_sent == 0
 }
 
+/// 🔴 #4661 — le renderer peut-il encore être en train de jouer un fichier
+/// qu'il a reçu EN ENTIER ?
+///
+/// Vrai tant que l'horloge murale de la piste n'a pas dépassé sa durée de
+/// [`END_MARGIN_MS`]. Un renderer temps réel ne joue pas plus vite que 1× :
+/// avant cette borne, un fichier entièrement servi peut encore sortir de son
+/// tampon, et un `Stopped` annoncé ne prouve pas l'arrêt.
+///
+/// Au-delà, il a eu de quoi finir ET le temps de le jouer : la musique est
+/// finie, qu'il l'ait annoncé ou non.
+///
+/// ⚠️ Cette fonction ne juge PAS si le fichier a été servi en entier — c'est
+/// [`super::fsm::flux_servi_en_entier`] qui l'établit, aux octets contre la
+/// taille du flux. Appelée seule, elle dirait « peut encore jouer » de
+/// n'importe quel renderer avant la fin nominale de sa piste, y compris d'un
+/// mort à qui l'on n'a servi que 70 % du morceau.
+///
+/// Mesure qui motive la règle : Sevy Tabroc, 0.9.161, darTZeel LHC-208,
+/// piste de 281 160 ms servie en entier à 89 s de piste. La patience plate de
+/// #4480 (`min(avance, 120 s)`, depuis un arrêt commencé vers 102 s) place la
+/// coupure vers 222 s : **59 s de musique perdues**. L'horloge, elle, sait
+/// que la musique court jusqu'à 281 s.
+///
+/// Durée inconnue (`0`) ⇒ `false` : l'horloge ne peut rien trancher.
+pub fn tampon_du_renderer_peut_encore_jouer(
+    wall_elapsed_secs: u64,
+    track_duration_ms: u64,
+) -> bool {
+    track_duration_ms > 0
+        && wall_elapsed_secs.saturating_mul(1000) < track_duration_ms.saturating_add(END_MARGIN_MS)
+}
+
 /// Is a `Playing`-but-dead watchdog meaningful for this sample?
 ///
 /// Every gate removes a known false positive: this is DLNA-only, Tune must
@@ -622,6 +654,50 @@ pub fn ancrage_d_un_etat_neuf(
 pub fn peak_reached_end(track_duration_ms: u64, peak_position_ms: u64) -> bool {
     track_duration_ms > 0
         && peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
+}
+
+/// En deçà de cette fraction de la durée, une fin de flux n'est plus « la
+/// fin de la piste » (fil 1915).
+pub const FRACTION_D_UNE_VRAIE_FIN: f64 = 0.95;
+/// …à condition qu'il manque aussi plus que cet écart : une durée en base
+/// fausse de quelques secondes (étiquette arrondie, remplissage d'encodeur)
+/// n'est pas une coupure.
+pub const ECART_TOLERE_AVANT_LA_FIN_MS: u64 = 5_000;
+
+/// La position atteinte est-elle LOIN de la fin de la piste ?
+///
+/// Fil 1915 (Reivax66, sortie locale WASAPI) : le corps HTTP d'une piste de
+/// 11:52 a rendu `error decoding response body` à 7:51, et la sortie a pris
+/// l'erreur pour une fin — piste coupée d'un tiers, file close, aucun signal.
+///
+/// Une erreur de fin de corps AU BOUT de la piste reste, elle, une fin : MP3
+/// dont le décodage déborde la durée annoncée (#1254, PR #1076). D'où les
+/// deux conditions, qui doivent tenir ENSEMBLE pour parler de coupure : moins
+/// de [`FRACTION_D_UNE_VRAIE_FIN`] de la durée ET plus de
+/// [`ECART_TOLERE_AVANT_LA_FIN_MS`] manquants.
+///
+/// Durée inconnue (`0` : radio, flux sans durée) ⇒ jamais « loin » : on ne
+/// sait pas où est la fin, le comportement historique est gardé.
+pub fn position_loin_de_la_fin(position_ms: u64, duree_ms: u64) -> bool {
+    duree_ms > 0
+        && (position_ms as f64) < duree_ms as f64 * FRACTION_D_UNE_VRAIE_FIN
+        && duree_ms.saturating_sub(position_ms) > ECART_TOLERE_AVANT_LA_FIN_MS
+}
+
+/// Préfixe du constat « piste tronquée » (fil 1915) sur le canal
+/// `take_output_failure`.
+///
+/// Ce canal arrête la zone sur une panne de SORTIE (`fatal: true`). Une piste
+/// dont le flux s'est coupé n'en est pas une : la sortie va bien, la piste
+/// suivante peut jouer (décision de Bertrand, 24/09/2026). Le préfixe dit au
+/// sondeur de passer à la suivante — saut signalé, message non fatal — au lieu
+/// d'arrêter.
+pub const PREFIXE_PISTE_TRONQUEE: &str = "piste_tronquee:";
+
+/// Le message lisible d'un constat de piste tronquée, `None` pour tout autre
+/// constat de sortie.
+pub fn constat_de_piste_tronquee(constat: &str) -> Option<&str> {
+    constat.strip_prefix(PREFIXE_PISTE_TRONQUEE)
 }
 
 /// A DSD track on a DLNA renderer that has demonstrably reached its end.
@@ -1353,6 +1429,14 @@ const MOUVEMENT_MINIMAL_MS: u64 = 1000;
 /// suffit). Les octets tirés ne valent PAS confirmation : un renderer qui
 /// télécharge n'est pas un renderer qui joue.
 ///
+/// 🔴 Fils 1926/1931 (Stéphane Villerio, DMP-A6, 0.9.163-0.9.164) : un
+/// renderer ARRÊTÉ n'est jamais un signe de vie (`renderer_arrete`). Un
+/// appareil qui acquitte le `Next` de #3967 puis se tait rapporte `STOPPED`
+/// et une position remise à 0 : l'écart avec la position gelée (237 s → 0)
+/// passait pour « la position repart » et confirmait la bascule. Plus aucun
+/// repli ne partait, la zone restait sur une piste 2 muette. Arrêté, on
+/// attend le délai, puis le repli relance la piste adoptée.
+///
 /// Sans signe de vie pendant `delai_secs`, l'adoption est infirmée : le
 /// repli reprend, sur la piste adoptée et non sur la suivante — sans cette
 /// surveillance, une position gelée à l'ancienne durée finirait par passer
@@ -1362,6 +1446,7 @@ pub fn suite_de_l_adoption(
     position_figee_ms: u64,
     current_uri: Option<&str>,
     flux_adopte: &str,
+    renderer_arrete: bool,
     age_secs: u64,
     delai_secs: u64,
 ) -> SuiteAdoption {
@@ -1369,7 +1454,9 @@ pub fn suite_de_l_adoption(
         && current_uri
             .map(str::trim)
             .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
-    if uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS {
+    let signe_de_vie =
+        uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS;
+    if signe_de_vie && !renderer_arrete {
         SuiteAdoption::Confirmee
     } else if age_secs >= delai_secs {
         SuiteAdoption::Infirmee

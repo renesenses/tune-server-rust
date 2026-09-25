@@ -71,16 +71,16 @@ pub(super) async fn track_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
-    // On Postgres the mirror schema stores integer-semantic columns as TEXT, so
-    // binding an i64 here made the comparison `text = bigint`, which Postgres
-    // rejects ("operator does not exist: text = bigint") → 500. Bind the id as a
-    // string: `text = text` on PG, and SQLite numeric affinity handles it too.
-    let id_str = id.to_string();
+    // #4984 — `track_credits.track_id` est un entier sur PostgreSQL : BIGINT dès
+    // `001_initial_schema.sql`, et `012_integer_id_columns.sql` a converti les
+    // bases migrées depuis SQLite. Lier l'id en TEXTE faisait `bigint = text`,
+    // que PostgreSQL refuse (« operator does not exist ») → 500 sur toute base
+    // PG. On lie l'entier, comme partout ailleurs.
     let rows = state
         .backend
         .query_many(
             "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
-            &[&id_str as &dyn ToSqlValue],
+            &[&id as &dyn ToSqlValue],
         )
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
@@ -105,17 +105,24 @@ pub(super) async fn artist_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
-    // Bind as string — see track_credits above (Postgres TEXT columns vs bigint).
+    // #4984 — `artists.id` est BIGINT sur PostgreSQL : l'entier s'y lie tel
+    // quel. `track_credits.artist_id` peut, lui, être resté TEXT sur une base
+    // migrée depuis SQLite (conversion gardée de la migration 012) : on le
+    // compare en texte sur PostgreSQL, comme `credits_release::artiste`.
     let id_str = id.to_string();
+    let cle_fiche = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => "CAST(tc.artist_id AS TEXT) = ?",
+        tune_core::db::engine::Engine::Sqlite => "tc.artist_id = ?",
+    };
+    let sql = format!(
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
+         FROM track_credits tc \
+         WHERE {cle_fiche} OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
+         ORDER BY tc.track_id, tc.position"
+    );
     let rows = state
         .backend
-        .query_many(
-            "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
-             FROM track_credits tc \
-             WHERE tc.artist_id = ? OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
-             ORDER BY tc.track_id, tc.position",
-            &[&id_str as &dyn ToSqlValue, &id_str as &dyn ToSqlValue],
-        )
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue, &id as &dyn ToSqlValue])
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
         .into_iter()
@@ -128,6 +135,66 @@ pub(super) async fn artist_credits(
                 "role": r.get(4).and_then(|v| v.as_string()),
                 "instrument": r.get(5).and_then(|v| v.as_string()),
                 "position": r.get(6).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+/// Crédits d'un ALBUM (#1572, fil forum 1921, FabienM) : les lignes de
+/// `track_credits` de toutes ses pistes, avec la piste concernée.
+///
+/// La réponse est la liste PLATE de `GET /library/tracks/{id}/credits`, plus
+/// `track_title`, `track_number` et `disc_number` : le client regroupe par
+/// rôle puis par artiste et cite, pour chaque nom, les pistes où il figure.
+/// Un seul aller-retour au lieu d'un appel par piste.
+///
+/// Ordre : disque, numéro de piste, puis `position` du crédit.
+///
+/// PostgreSQL : sur une base migrée depuis SQLite, `track_credits.track_id` et
+/// `tracks.album_id` peuvent être du TEXT, du BIGINT ailleurs — même remède
+/// que la lecture de la page artiste (`credits_release`) : la comparaison en
+/// texte vaut pour les deux. Sur SQLite, les colonnes gardent leur index.
+pub(super) async fn album_credits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::engine::Engine;
+    let (jointure, cle_album) = match state.backend.engine() {
+        Engine::Postgres => (
+            "CAST(tc.track_id AS TEXT) = CAST(t.id AS TEXT)",
+            "CAST(t.album_id AS TEXT) = ?",
+        ),
+        Engine::Sqlite => ("tc.track_id = t.id", "t.album_id = ?"),
+    };
+    let sql = format!(
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position, \
+                t.title, t.track_number, t.disc_number \
+         FROM track_credits tc \
+         JOIN tracks t ON {jointure} \
+         WHERE {cle_album} \
+         ORDER BY t.disc_number, t.track_number, t.id, tc.position"
+    );
+    let id_str = id.to_string();
+    let rows = state
+        .backend
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "track_id": r.get(1).and_then(|v| v.as_i64()),
+                "artist_id": r.get(2).and_then(|v| v.as_i64()),
+                "artist_name": r.get(3).and_then(|v| v.as_string()),
+                "role": r.get(4).and_then(|v| v.as_string()),
+                "instrument": r.get(5).and_then(|v| v.as_string()),
+                "position": r.get(6).and_then(|v| v.as_i64()),
+                "track_title": r.get(7).and_then(|v| v.as_string()),
+                "track_number": r.get(8).and_then(|v| v.as_i64()),
+                "disc_number": r.get(9).and_then(|v| v.as_i64()),
             })
         })
         .collect();

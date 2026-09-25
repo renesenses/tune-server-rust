@@ -330,6 +330,99 @@ pub(crate) fn output_command_error_response(error: OutputCommandError) -> axum::
     }
 }
 
+/// Les lignes d'une playlist Tune en entrées de la file UNIFIÉE (#4889) :
+/// une piste locale par son `tracks.id`, un titre de service comme une ligne
+/// de streaming — la forme exacte qu'y écrit la lecture d'une playlist de
+/// service, pour que la résolution (et l'enchaînement) soit la même.
+pub(crate) fn entrees_de_file(
+    entries: &[tune_core::db::playlist_repo::PlaylistEntry],
+) -> Vec<QueueInput> {
+    use tune_core::db::playlist_repo::EntryContent;
+    entries
+        .iter()
+        .map(|e| match &e.content {
+            EntryContent::Local(track_id) => QueueInput::Local {
+                track_id: *track_id,
+            },
+            EntryContent::Service(s) => QueueInput::Streaming {
+                source: s.source.clone(),
+                source_id: s.source_id.clone(),
+                title: s.title.clone(),
+                artist: s.artist.clone().unwrap_or_default(),
+                album: s.album.clone(),
+                cover_url: s.cover_url.clone(),
+                duration_ms: s.duration_ms.unwrap_or(0),
+                track_number: None,
+                disc_number: None,
+            },
+        })
+        .collect()
+}
+
+/// `POST /zones/{id}/play` avec `playlist_id` d'une playlist MIXTE (#4889).
+///
+/// La file est remplacée par les lignes de la playlist, dans l'ordre ; la
+/// lecture part de `start_index` (borné à la file réellement écrite) par
+/// `play_from_queue`, qui sait jouer une ligne locale comme une ligne de
+/// service. Une piste locale disparue de `tracks` n'entre pas dans la file
+/// (`insert_at` l'écarte) — `GET /playlists/{id}/tracks` l'omet aussi, donc
+/// l'indice du client désigne toujours la même ligne.
+///
+/// Un titre banni (#4806) est une piste LOCALE : l'avance de la file le
+/// saute déjà, comme dans toute file.
+async fn jouer_playlist_mixte(
+    state: &AppState,
+    zone_id: i64,
+    queue_repo: &PlayQueueRepo,
+    entries: &[tune_core::db::playlist_repo::PlaylistEntry],
+    start_index: Option<i64>,
+    lang: &str,
+) -> axum::response::Response {
+    let items = entrees_de_file(entries);
+    if let Err(e) = queue_repo.clear(zone_id) {
+        return lecture_base_echouee("play_playlist_mixte_vider_file", zone_id, e);
+    }
+    if let Err(e) = queue_repo.append(zone_id, &items) {
+        // Même règle que `set_queue_failed_clearing` : jamais de lecture sur
+        // une file à moitié écrite.
+        warn!(zone_id, error = %e, "play_playlist_mixte_file_non_ecrite");
+        let _ = queue_repo.clear(zone_id);
+        return lecture_base_echouee("play_playlist_mixte_ecrire_file", zone_id, e);
+    }
+    let longueur = match queue_repo.count_all(zone_id) {
+        Ok(n) => n,
+        Err(e) => return lecture_base_echouee("play_playlist_mixte_longueur_file", zone_id, e),
+    };
+    if longueur == 0 {
+        return (StatusCode::BAD_REQUEST, "no tracks to play").into_response();
+    }
+    let depart = start_index.unwrap_or(0).clamp(0, longueur - 1);
+    info!(
+        zone_id,
+        lignes = items.len(),
+        en_file = longueur,
+        depart,
+        "play_playlist_mixte"
+    );
+    state
+        .playback
+        .update_queue_info(zone_id, depart, longueur)
+        .await;
+    match state.orchestrator.play_from_queue(zone_id, depart).await {
+        Ok(result) => {
+            persist_queue_async(state, zone_id);
+            Json(build_zone_json_with_result(state, zone_id, &result).await).into_response()
+        }
+        Err(e) => {
+            // La file reste écrite : l'auditeur voit sa playlist, et peut
+            // choisir une autre ligne si celle-ci ne se joue pas.
+            persist_queue_async(state, zone_id);
+            warn!(zone_id, depart, error = %e, "play_playlist_mixte_echec");
+            play_error_response(e, lang)
+        }
+    }
+}
+
 /// Persist the queue state for a zone to disk (non-blocking).
 fn persist_queue_async(state: &AppState, zone_id: i64) {
     let db = state.backend.clone();
@@ -2349,8 +2442,27 @@ async fn play(
             // #4261 — `.unwrap_or_default()` faisait d'une playlist ILLISIBLE
             // une playlist vide, donc un 400 « no tracks to play » : la panne
             // se lisait comme un choix de l'auditeur.
-            Ok(_) => match repo.get_track_ids(playlist_id) {
-                Ok(ids) => ids,
+            //
+            // #4889 — une playlist qui porte des TITRES DE SERVICE prend un
+            // chemin à elle (`jouer_playlist_mixte`) : la file unifiée reçoit
+            // chaque ligne dans l'ordre, les titres de service y passent par
+            // la résolution de streaming existante. Une playlist toute locale
+            // garde le chemin ci-dessous, inchangé. L'ordre est celui de
+            // `GET /playlists/{id}/tracks` (`get_entries`) : `start_index`
+            // désigne la ligne que le client a montrée.
+            Ok(_) => match repo.get_entries(playlist_id) {
+                Ok(entries) if entries.iter().any(|e| e.service().is_some()) => {
+                    return jouer_playlist_mixte(
+                        &state,
+                        zone_id,
+                        &queue_repo,
+                        &entries,
+                        body.start_index,
+                        &lang,
+                    )
+                    .await;
+                }
+                Ok(entries) => entries.iter().filter_map(|e| e.track_id()).collect(),
                 Err(e) => return lecture_base_echouee("play_pistes_de_playlist", zone_id, e),
             },
             Err(r) => return r,

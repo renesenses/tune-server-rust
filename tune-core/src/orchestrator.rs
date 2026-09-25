@@ -1558,6 +1558,11 @@ mod preemption_du_transcodage_tests;
 #[cfg(test)]
 mod dsd_passthrough_tests;
 
+/// Une piste DSD de serveur média vers un renderer suit la politique DSD de
+/// la zone (brut / DoP / PCM), comme un `.dsf` local — par la porte publique.
+#[cfg(test)]
+mod dsd_upnp_politique_de_zone_tests;
+
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]

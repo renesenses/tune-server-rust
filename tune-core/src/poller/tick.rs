@@ -16,9 +16,36 @@ impl PositionPoller {
         });
 
         // Also poll stopped zones to detect externally-started playback and sync volume
-        let all_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .list()
-            .unwrap_or_default();
+        let depot_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone());
+        let mut all_zones = depot_zones.list().unwrap_or_default();
+
+        // 🔴 #4970 — `list()` ne rend que les zones VISIBLES. Une zone masquée
+        // (appareil ignoré, zone « supprimée ») reste pourtant jouable : si
+        // elle joue, le sondeur la suit sans la trouver ici, lit son type de
+        // sortie comme `""`, et tous les filets de fin propres au DLNA
+        // (gardés par `is_dlna`) restent muets — l'album s'arrête après
+        // chaque piste (DMP-A6, Villerio, 0.9.164). Une zone qui JOUE est
+        // relue par son identifiant, masquée ou non.
+        let masquees_en_lecture =
+            zones_masquees_en_lecture(&all_zones, &states, |id| depot_zones.get(id).ok().flatten());
+        {
+            let mut signalees = self
+                .zones_masquees_signalees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            signalees.retain(|id| masquees_en_lecture.iter().any(|z| z.id == Some(*id)));
+            for z in &masquees_en_lecture {
+                let id = z.id.unwrap_or(0);
+                if signalees.insert(id) {
+                    warn!(
+                        zone_id = id,
+                        output_type = z.output_type.as_deref().unwrap_or(""),
+                        "zone_masquee_en_lecture — le sondeur la suit par son identifiant"
+                    );
+                }
+            }
+        }
+        all_zones.extend(masquees_en_lecture);
 
         // Ne pas laisser l'état de recul survivre à une zone supprimée.
         idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
@@ -625,6 +652,43 @@ impl PositionPoller {
                     };
                     output.take_output_failure()
                 };
+                // Fil 1915 — une piste dont le flux s'est COUPÉ loin de sa
+                // fin n'est pas une panne de sortie : on passe à la suivante
+                // (ou on termine la file), en le disant — message non fatal
+                // et saut signalé —, au lieu d'arrêter la zone.
+                if let Some(message) = failure
+                    .as_deref()
+                    .and_then(decisions::constat_de_piste_tronquee)
+                {
+                    warn!(
+                        zone_id,
+                        device = %device_id,
+                        error = %message,
+                        queue_pos = zone_state.queue_position,
+                        "piste_tronquee_passage_a_la_suivante"
+                    );
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": message,
+                                "fatal": false,
+                            }),
+                        );
+                        bus.emit(
+                            "playback.track_skipped",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "position": zone_state.queue_position,
+                                "reason": message,
+                            }),
+                        );
+                    }
+                    poll_states.remove(&zone_id);
+                    self.handle_track_end(zone_id, zone_state).await;
+                    continue;
+                }
                 if let Some(msg) = failure {
                     warn!(
                         zone_id,
@@ -1354,6 +1418,8 @@ impl PositionPoller {
                         adoption.position_figee_ms,
                         status.current_uri.as_deref(),
                         &adoption.flux,
+                        // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
+                        status.state == TransportState::Stopped,
                         age_secs,
                         adoption.delai_secs,
                     ) {
@@ -1727,6 +1793,10 @@ impl PositionPoller {
                         // seuil d'échec est le seul à savoir, et il le
                         // remplace par un verdict mesuré.
                         avance_audio_couvre_l_arret: false,
+                        // #4661 — même règle encore : seul le bras du seuil
+                        // d'échec connaît la taille du flux, et lui seul
+                        // remplace ce défaut par une mesure.
+                        horloge_de_piste_couvre_l_arret: false,
                         dlna_dsd_reached_end,
                     };
                     let mut fsm_actual: Option<fsm::StoppedOutcome>;
@@ -1838,6 +1908,26 @@ impl PositionPoller {
                         ps.transition(fsm::Transition::FinConstateeAvantLeSeuil {
                             motif: MotifFin::FinNaturelleLocale,
                         });
+                        // Fil 1915 : `wall_elapsed` à 50 % suffit à accepter
+                        // la fin — une piste de 11:52 arrêtée à 7:51 passait
+                        // pour finie, sans un mot. Le comportement ne change
+                        // pas ici (la sortie locale refuse désormais elle-même
+                        // une erreur de lecture loin de la fin) ; ce qui reste
+                        // se DIT au lieu de passer pour une fin normale.
+                        if decisions::position_loin_de_la_fin(
+                            ps.peak_position_ms,
+                            track_duration_ms,
+                        ) {
+                            warn!(
+                                zone_id,
+                                peak_pos = ps.peak_position_ms,
+                                track_dur = track_duration_ms,
+                                wall_elapsed,
+                                "piste_probablement_tronquee — fin naturelle annoncée loin \
+                                 de la durée de la piste : flux coupé en amont, ou durée en \
+                                 base fausse"
+                            );
+                        }
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally
@@ -2132,6 +2222,49 @@ impl PositionPoller {
                                 );
                                 fsm_in.avance_audio_couvre_l_arret = !famine_etablie;
 
+                                // 🔴 #4661 — la borne de #4480 est PLATE :
+                                // deux minutes, quelle que soit la piste. Sur
+                                // un fichier servi EN ENTIER, l'horloge sait
+                                // mieux — elle dit à la seconde près quand la
+                                // musique s'arrête (durée + marge de fin).
+                                //
+                                // Le terrain : WAV de 281 160 ms servi en
+                                // entier à 89 s de piste, renderer muet à
+                                // partir de ~102 s. La borne plate coupe vers
+                                // 222 s — 59 s de musique encore dans le
+                                // tampon du LHC-208.
+                                //
+                                // « Servi en entier » se lit aux OCTETS
+                                // contre la TAILLE DU FLUX, jamais de la
+                                // branche où l'on se trouve : la même branche
+                                // s'arme aussi sur un flux tronqué (70,5 %
+                                // servis, journal du 24/09). Comme pour
+                                // l'audio servie, on ne paie la taille que
+                                // dans ce bras, et seulement à sec.
+                                let octets_total: Option<u64> =
+                                    if consommation == fsm::ConsommationFlux::ASec {
+                                        match stream_id.as_deref() {
+                                            Some(sid) => {
+                                                self.orchestrator.streamer_total_bytes(sid).await
+                                            }
+                                            None => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+                                let flux_servi_en_entier =
+                                    fsm::flux_servi_en_entier(octets_servis, octets_total);
+                                let horloge_couvre_l_arret = fsm::horloge_de_piste_couvre_l_arret(
+                                    flux_servi_en_entier,
+                                    decisions::tampon_du_renderer_peut_encore_jouer(
+                                        wall_elapsed,
+                                        track_duration_ms,
+                                    ),
+                                    ps.premier_arret_a.map(|t| t.elapsed()),
+                                    HORLOGE_DE_PISTE_BORNE_HAUTE_SECS,
+                                );
+                                fsm_in.horloge_de_piste_couvre_l_arret = horloge_couvre_l_arret;
+
                                 if consommation == fsm::ConsommationFlux::Consomme {
                                     fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);
                                     ps.transition(fsm::Transition::AttenteProlongee);
@@ -2163,6 +2296,35 @@ impl PositionPoller {
                                             consommation = consommation.etiquette(),
                                             has_stream_id = stream_id.is_some(),
                                             "octets_servis_inconnus_zone_non_coupee"
+                                        );
+                                    }
+                                } else if horloge_couvre_l_arret {
+                                    // #4661 — le fichier est chez le renderer
+                                    // EN ENTIER, et l'horloge de la piste
+                                    // n'est pas arrivée à sa fin : il reste
+                                    // de la musique, on sait combien. On
+                                    // attend ce reste-là, pas un forfait —
+                                    // et on le DIT, avec le chiffre qui
+                                    // justifie l'attente.
+                                    fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingHorloge);
+                                    ps.transition(fsm::Transition::AttenteProlongee);
+                                    if ps.stopped_ticks % 30 == 0 {
+                                        warn!(
+                                            zone_id,
+                                            peak_pos = ps.peak_position_ms,
+                                            track_dur = track_duration_ms,
+                                            wall_secs = wall_elapsed,
+                                            reste_ms = track_duration_ms
+                                                .saturating_sub(wall_elapsed.saturating_mul(1000)),
+                                            bytes_sent = octets_servis.unwrap_or(0),
+                                            bytes_total = octets_total.unwrap_or(0),
+                                            consommation = consommation.etiquette(),
+                                            arret_secs = ps
+                                                .premier_arret_a
+                                                .map(|t| t.elapsed().as_secs())
+                                                .unwrap_or(0),
+                                            plafond_secs = HORLOGE_DE_PISTE_BORNE_HAUTE_SECS,
+                                            "flux_servi_en_entier_zone_non_coupee"
                                         );
                                     }
                                 } else if !famine_etablie {
@@ -2222,6 +2384,14 @@ impl PositionPoller {
                                         // lit sur `audio_servi_ms = 0`.
                                         audio_servi_ms = audio_servi_ms.unwrap_or(0),
                                         avance_ms = avance_audio_ms.unwrap_or(0),
+                                        // #4661 — et de quoi relire la
+                                        // coupure contre l'horloge : la
+                                        // taille du flux (0 = inconnue) dit
+                                        // si le fichier était chez le
+                                        // renderer EN ENTIER. Sans elle,
+                                        // `bytes_sent` seul ne permet pas de
+                                        // distinguer 70 % servis de 101 %.
+                                        bytes_total = octets_total.unwrap_or(0),
                                         "playback_failure_stopping_zone"
                                     );
                                     track_ended = false;
@@ -3224,4 +3394,21 @@ impl PositionPoller {
             );
         }
     }
+}
+
+/// #4970 — les zones qui JOUENT mais que `ZoneRepo::list()` ne rend pas
+/// (masquées : `is_hidden = 1`), relues par leur identifiant via `lire`.
+/// Le sondeur les ajoute à sa liste : sans cela, il tourne sur une zone
+/// dont il ignore le type de sortie.
+pub(super) fn zones_masquees_en_lecture(
+    visibles: &[crate::db::zone_repo::Zone],
+    etats: &[crate::playback::ZoneState],
+    lire: impl Fn(i64) -> Option<crate::db::zone_repo::Zone>,
+) -> Vec<crate::db::zone_repo::Zone> {
+    etats
+        .iter()
+        .filter(|s| s.state == PlayState::Playing)
+        .filter(|s| !visibles.iter().any(|z| z.id == Some(s.zone_id)))
+        .filter_map(|s| lire(s.zone_id))
+        .collect()
 }

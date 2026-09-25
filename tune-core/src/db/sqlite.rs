@@ -10,6 +10,7 @@ use tracing::info;
 mod open_diagnostic;
 
 use crate::db::engine::{Engine, SqliteDialect};
+use crate::db::verrou_ecriture::{VerrouEcriture, attendre_hors_executeur};
 
 /// Number of read connections in the pool.
 const READ_POOL_SIZE: usize = 3;
@@ -26,7 +27,9 @@ const REVEIL_ATTENTE_LECTURE: Duration = Duration::from_millis(10);
 type Liberation = (Mutex<()>, Condvar);
 
 pub struct SqliteDb {
-    conn: Arc<Mutex<Connection>>,
+    /// La connexion d'écriture, derrière un verrou SURVEILLÉ (#4924) : voir
+    /// [`crate::db::verrou_ecriture`].
+    conn: VerrouEcriture,
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
     liberation: Arc<Liberation>,
@@ -267,7 +270,7 @@ impl SqliteDb {
         );
 
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            conn: VerrouEcriture::new(Arc::new(Mutex::new(conn))),
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
@@ -286,14 +289,17 @@ impl SqliteDb {
         let conn = Arc::new(Mutex::new(conn));
         let read_pool = vec![conn.clone(); READ_POOL_SIZE];
         Ok(Self {
-            conn,
+            conn: VerrouEcriture::new(conn),
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
         })
     }
 
-    pub fn connection(&self) -> &Arc<Mutex<Connection>> {
+    /// La connexion d'écriture. `connection().lock()` rend une garde qui se
+    /// déréférence en [`Connection`] ; l'attente, quand elle est prise, se
+    /// fait hors de l'exécuteur tokio et la détention est surveillée (#4924).
+    pub fn connection(&self) -> &VerrouEcriture {
         &self.conn
     }
 
@@ -333,20 +339,24 @@ impl SqliteDb {
             return emprunt(garde, Duration::ZERO);
         }
         let debut = Instant::now();
-        let mut signal = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            // Sous le verrou du signal : une libération survenue entre cet
-            // essai et le `wait` ne peut pas passer inaperçue.
-            if let Some(garde) = premiere_libre() {
-                return emprunt(garde, debut.elapsed());
+        // L'attente d'un lecteur libre ne doit pas plus garder un cœur de
+        // l'exécuteur que celle de l'écrivain (#4924).
+        attendre_hors_executeur(|| {
+            let mut signal = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                // Sous le verrou du signal : une libération survenue entre cet
+                // essai et le `wait` ne peut pas passer inaperçue.
+                if let Some(garde) = premiere_libre() {
+                    return emprunt(garde, debut.elapsed());
+                }
+                signal = self
+                    .liberation
+                    .1
+                    .wait_timeout(signal, REVEIL_ATTENTE_LECTURE)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
             }
-            signal = self
-                .liberation
-                .1
-                .wait_timeout(signal, REVEIL_ATTENTE_LECTURE)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
+        })
     }
 
     pub fn execute(
@@ -606,11 +616,27 @@ CREATE TABLE IF NOT EXISTS playlists (
     profile_id INTEGER NOT NULL DEFAULT 1
 );
 
+-- #4889 — une ligne de playlist est SOIT une piste de la bibliotheque
+-- (`track_id`), SOIT un titre de service (`source` + `source_id`), jamais les
+-- deux ni aucun. Les colonnes d'affichage d'une ligne de service (titre,
+-- artiste, album, duree, pochette, album chez le service) sont copiees a
+-- l'ajout : lister la playlist n'appelle pas le service. Meme forme que
+-- `queue_items`. Jumelle de la migration SQLite 109 et de la PG 072.
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     playlist_id INTEGER NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-    position INTEGER NOT NULL DEFAULT 0
+    track_id INTEGER REFERENCES tracks(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    duration_ms INTEGER,
+    cover_url TEXT,
+    CHECK ((track_id IS NOT NULL AND source IS NULL AND source_id IS NULL)
+        OR (track_id IS NULL AND source IS NOT NULL AND source_id IS NOT NULL))
 );
 
 CREATE TABLE IF NOT EXISTS zones (

@@ -189,6 +189,10 @@ async fn uninstall(
         return refusal("unknown plugin".into());
     }
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    // Choix explicite : le retour du Premium ne doit pas l'annuler (#4861).
+    if let Err(e) = tune_core::audio::premium_plugins::forget_withheld(&settings, &id) {
+        return refusal(e);
+    }
     for suffix in ["installed", "enabled"] {
         if let Err(e) = settings.set(&format!("plugin_{id}_{suffix}"), "false") {
             return refusal(e);

@@ -62,6 +62,9 @@ pub struct MockOutput {
     /// #3967 — le `Next` fait-il VRAIMENT avancer l'appareil ? Un renderer qui
     /// acquitte `Next` sans bouger est le cas que le repli doit rattraper.
     bascule_honoree: Arc<AtomicBool>,
+    /// Fil 1915 — le constat que la sortie remet au sondeur par
+    /// `take_output_failure` (une seule fois, comme les vraies sorties).
+    echec: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl MockOutput {
@@ -88,6 +91,7 @@ impl MockOutput {
             suivante_preparee: Arc::new(std::sync::Mutex::new(SuivantePreparee::Inconnue)),
             bascule_calls: Arc::new(AtomicU64::new(0)),
             bascule_honoree: Arc::new(AtomicBool::new(true)),
+            echec: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -249,6 +253,11 @@ impl MockOutput {
         self.bascule_honoree.store(honoree, Ordering::Relaxed);
     }
 
+    /// Fil 1915 — poser un constat sur le canal `take_output_failure`.
+    pub fn poser_echec(&self, constat: &str) {
+        *self.echec.lock().unwrap() = Some(constat.to_string());
+    }
+
     /// #3967 — nombre de `Next` reçus.
     pub fn bascule_call_count(&self) -> u64 {
         self.bascule_calls.load(Ordering::Relaxed)
@@ -286,6 +295,10 @@ impl OutputTarget for MockOutput {
 
     fn host(&self) -> Option<&str> {
         self.host.as_deref()
+    }
+
+    fn take_output_failure(&self) -> Option<String> {
+        self.echec.lock().unwrap().take()
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {

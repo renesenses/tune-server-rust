@@ -723,14 +723,62 @@ impl PlaybackOrchestrator {
         // lire son type en base plutôt que déduire « aucune sortie » de
         // l'absence de périphérique (#2076, #2158). Cette propriété vaut pour
         // Bandcamp comme pour la radio dont l'EQ force désormais le proxy WAV.
-        let is_browser_output = req.output_device_id.is_none()
-            && ZoneRepo::with_backend(self.db.clone())
-                .get(req.zone_id)
-                .ok()
-                .flatten()
-                .and_then(|zone| zone.output_type)
-                .as_deref()
-                == Some("browser");
+        let zone = ZoneRepo::with_backend(self.db.clone())
+            .get(req.zone_id)
+            .ok()
+            .flatten();
+        let zone_output_type = zone.as_ref().and_then(|z| z.output_type.as_deref());
+        let is_browser_output =
+            req.output_device_id.is_none() && zone_output_type == Some("browser");
+
+        // ------------------------------------------------------------------
+        // Une piste DSD de serveur média vers un renderer RÉSEAU suit la
+        // politique DSD de la ZONE — la même que pour un `.dsf` local.
+        //
+        // Jusqu'ici ce chemin remettait l'URL distante TELLE QUELLE au
+        // renderer, sans lire ni `dsd_mode` ni la réponse du renderer, là où
+        // `resolve_local` décide DoP / brut / PCM avant d'envoyer quoi que ce
+        // soit. Mesuré sur le .18 le 23/09/2026 : « Abacab » (DSD64) indexé
+        // depuis le .15, zone « Eversolo DMP-A8 » — `dlna_set_uri_ok
+        // url="http://192.168.1.15:8888/api/v1/library/tracks/581978/audio"
+        // advertised_mime=application/x-dsd`, puis du BRUIT ; les FLAC
+        // suivants sur la même zone étaient bons. Le même fichier en local
+        // partait par `/stream/<id>.dsf` (17-18/09) et se jouait.
+        //
+        // La décision vient de `politique_dsd_reseau`, qui compose les deux
+        // fonctions du chemin local (`transport_dsd`, `should_dsd_passthrough`)
+        // au lieu de les recopier. La détection DSD s'appuie sur le MIME déjà
+        // calculé, lui-même issu du format indexé ou du DIDL (`mime_upnp`).
+        if source == "upnp" && est_dsd_brut(mime_type) && is_network_output_type(zone_output_type) {
+            let did = identifiant_du_renderer(
+                req.output_device_id.as_deref(),
+                zone.as_ref().and_then(|z| z.output_device_id.as_deref()),
+            );
+            let politique = self.politique_dsd_reseau(req.zone_id, did).await;
+            info!(
+                zone_id = req.zone_id,
+                track_id = ?req.track_id,
+                url = %audio_url,
+                mime = mime_type,
+                politique = politique.as_str(),
+                "dsd_upnp_politique_de_zone"
+            );
+            let zone_max_sample_rate = crate::device_catalog::combine_max_sample_rate(
+                zone.as_ref().and_then(|z| z.max_sample_rate),
+                crate::device_catalog::resolve_zone_quirks(&self.db, req.zone_id).max_sample_rate,
+            );
+            return self
+                .servir_le_dsd_upnp_au_reseau(
+                    req,
+                    audio_url,
+                    mime_type,
+                    &title,
+                    politique,
+                    zone_max_sample_rate,
+                )
+                .await;
+        }
+        // ------------------------------------------------------------------
 
         // La sortie locale applique déjà l'EQ dans son callback : le refaire
         // ici colorerait le signal deux fois. OAAT, DLNA et navigateur
@@ -1121,6 +1169,301 @@ impl PlaybackOrchestrator {
     /// resolution que l'appelant a portee depuis les attributs `res@` du DIDL
     /// est conservee telle quelle : c'est ce qui empeche un ALAC 24 bits d'un
     /// NAS d'etre affiche en 44,1 kHz / 16 bits.
+    /// Une piste DSD de serveur média vers un renderer réseau, selon la
+    /// politique de la zone ([`super::resolve_local::PolitiqueDsdReseau`]).
+    ///
+    /// Trois bras, et chacun réemploie le chemin qui existe déjà pour un
+    /// fichier local ou un flux de service — rien n'est décodé ici :
+    ///
+    /// - **brut** : les octets passent VERBATIM, mais par une session
+    ///   mandataire de Tune, à une adresse `/stream/<id>.dsf`. C'est le fil
+    ///   EXACT du `.dsf` local en passthrough (même MIME, même extension,
+    ///   Range servi), et c'est la seule différence mesurable entre le DSF
+    ///   local qui se jouait et l'URL distante qui bruitait (.18, 23/09) ;
+    ///   la session donne aussi au chemin du signal un fil à lire (#1315) ;
+    /// - **DoP** : le fichier est téléchargé puis emballé par
+    ///   `anticiper_le_dop`, le même que pour une piste locale ; sans ligne
+    ///   en base, ou au-delà du plafond de la zone, on retombe sur le PCM ;
+    /// - **PCM** : le canal WAV des services (`pretranscoder_en_flac`), dont
+    ///   le décodeur aiguille `.dsf`/`.dff` vers le convertisseur DSD natif.
+    async fn servir_le_dsd_upnp_au_reseau(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        mime_type: &str,
+        title: &str,
+        politique: super::resolve_local::PolitiqueDsdReseau,
+        zone_max_sample_rate: Option<u32>,
+    ) -> Result<ResolvedStream, String> {
+        use super::resolve_local::PolitiqueDsdReseau;
+        let conteneur = conteneur_dsd(audio_url, mime_type);
+        let dsd_rate = req.sample_rate.unwrap_or(0);
+        let server_ip = self.server_ip();
+
+        let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = match politique {
+            PolitiqueDsdReseau::Brut => {
+                let info = StreamInfo {
+                    format: conteneur.to_string(),
+                    mime_type: mime_type.to_string(),
+                    sample_rate: dsd_rate,
+                    bit_depth: 1,
+                    channels: 2,
+                    file_size: None,
+                    duration_ms: req.duration_ms.map(|d| d as u64),
+                    ..Default::default()
+                };
+                let session_id = self
+                    .streamer
+                    .create_proxy_session(info, audio_url.to_string(), false)
+                    .await;
+                let url = self
+                    .streamer
+                    .get_stream_url(&session_id, &server_ip, conteneur);
+                info!(
+                    zone_id = req.zone_id,
+                    url = %audio_url,
+                    conteneur,
+                    "dsd_upnp_brut_relaye_par_tune"
+                );
+                (
+                    url,
+                    Some(session_id),
+                    mime_type.to_string(),
+                    req.sample_rate,
+                    req.bit_depth.map(u32::from),
+                    None,
+                )
+            }
+            PolitiqueDsdReseau::Dop | PolitiqueDsdReseau::Pcm => {
+                if politique == PolitiqueDsdReseau::Dop
+                    && let Some(resolu) = self
+                        .dop_pour_une_piste_upnp(req, audio_url, conteneur, zone_max_sample_rate)
+                        .await?
+                {
+                    return Ok(resolu);
+                }
+                let stream_data = StreamUrl {
+                    url: audio_url.to_string(),
+                    mime_type: mime_type.to_string(),
+                    quality: crate::streaming::StreamQuality {
+                        codec: conteneur.to_string(),
+                        sample_rate: AudioFormat::Dsd.dsd_output_sample_rate(dsd_rate),
+                        bit_depth: 24,
+                        bitrate: None,
+                        channels: 2,
+                    },
+                    expires_at: None,
+                    headers: Vec::new(),
+                };
+                let cadence = self.cadence_servie_pour_un_service(req, &stream_data)?;
+                let sr = cadence.unwrap_or(stream_data.quality.sample_rate);
+                let (url, session_id, mime) = if conteneur == "dsf" {
+                    // Au fil de l'eau : mesuré sur le .18 (23/09, 17:xx UTC),
+                    // le téléchargement ENTIER du DSF prenait 5 minutes — le
+                    // .15 cadence sa route audio au débit nominal du flux —
+                    // puis le décodage complet 5 de plus, sans un son ni
+                    // même une réponse de `/play` en 30 s.
+                    self.decoder_le_dsf_distant_en_wav(req, audio_url, sr).await
+                } else {
+                    // DFF : le lecteur de blocs n'a pas (encore) de source
+                    // HTTP ; c'est le chemin des services, téléchargement
+                    // compris.
+                    let (url, session_id, mime, _taille) = self
+                        .pretranscoder_en_flac(
+                            req,
+                            "upnp",
+                            &stream_data,
+                            conteneur.to_string(),
+                            cadence,
+                        )
+                        .await?;
+                    (url, session_id, mime)
+                };
+                (url, session_id, mime, Some(sr), Some(24u32), Some(2u32))
+            }
+        };
+        Ok(ResolvedStream {
+            url,
+            mime_type: out_mime,
+            title: title.to_string(),
+            artist: req.artist_name.clone(),
+            album: req.album_title.clone(),
+            duration_ms: req.duration_ms,
+            source: "upnp".into(),
+            cover_url: req.cover_url.clone(),
+            stream_id,
+            file_size: None,
+            sample_rate: out_sr,
+            bit_depth: out_bd,
+            channels: out_ch,
+            origin_url: Some(audio_url.to_string()),
+            bitrate_kbps: None,
+        })
+    }
+
+    /// Le bras PCM d'un DSF de serveur média, AU FIL DE L'EAU : le corps HTTP
+    /// est décodé bloc par bloc vers un canal WAV (`decode_dsf_http_to_pcm_streaming`),
+    /// comme une radio (`decoder_la_radio_en_wav`) — la session est rendue
+    /// tout de suite, le premier son part dès les premiers blocs, aucun
+    /// fichier temporaire. Chaîne DSP et niveaux comme `pretranscoder_en_flac`.
+    async fn decoder_le_dsf_distant_en_wav(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        sr: u32,
+    ) -> (String, Option<String>, String) {
+        let bd: u16 = 24;
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: sr,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: req.duration_ms.map(|d| d as u64),
+            ..Default::default()
+        };
+        let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
+        let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let tx = if dsp.is_active() {
+            info!(
+                zone_id = req.zone_id,
+                "dsd_upnp_wav_channel_dsp_relay_inserted"
+            );
+            spawn_streaming_dsp_relay(dsp, bd, true, tx)
+        } else {
+            tx
+        };
+        // L'en-tête WAV part DANS le canal (voir `anticiper_le_dop`) : sans ce
+        // drapeau, `handle_stream` en préfixerait un second.
+        {
+            let sessions = self.streamer.sessions_state();
+            let sessions = sessions.lock().await;
+            if let Some(session) = sessions.get(&session_id) {
+                session
+                    .wav_header_included
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        info!(
+            zone_id = req.zone_id,
+            url = %audio_url,
+            sample_rate = sr,
+            bit_depth = bd,
+            "dsd_upnp_decodage_progressif_en_wav"
+        );
+
+        let ev_bus = self.event_bus.clone();
+        let playback = self.playback.clone();
+        let zone_id = req.zone_id;
+        let attach_levels = self.levels_attach_allowed(zone_id);
+        let url = audio_url.to_string();
+        tokio::spawn(async move {
+            let err_bus = ev_bus.clone();
+            let levels_tx = match ev_bus.filter(|_| attach_levels) {
+                Some(bus) => {
+                    let play_seq = playback.current_play_seq(zone_id).await;
+                    spawn_paced_levels_forwarder(bus, playback, zone_id, play_seq, 0)
+                }
+                None => tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>().0,
+            };
+            let url_decode = url.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::audio::decode::decode_dsf_http_to_pcm_streaming(
+                    &url_decode,
+                    Some(sr),
+                    Some(2),
+                    bd,
+                    tx,
+                    32768,
+                    data_ready,
+                    levels_tx,
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => debug!(url = %url, "dsd_upnp_wav_channel_complete"),
+                Ok(Err(e)) => {
+                    warn!(url = %url, error = %e, "dsd_upnp_wav_channel_decode_failed");
+                    if let Some(ref bus) = err_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": format!("Impossible de décoder la piste DSD : {e}"),
+                            }),
+                        );
+                    }
+                }
+                Err(e) => warn!(url = %url, error = %e, "dsd_upnp_wav_channel_task_panic"),
+            }
+        });
+
+        let server_ip = self.server_ip();
+        let stream_url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+        (stream_url, Some(session_id), "audio/wav".to_string())
+    }
+
+    /// Le bras DoP d'une piste DSD de serveur média : téléchargement, puis
+    /// `anticiper_le_dop` sur le fichier, comme pour une piste locale. `None`
+    /// quand ce bras ne peut pas répondre — pas de ligne en base pour porter
+    /// la piste, ou cadence DoP au-delà du plafond de la zone — et l'appelant
+    /// continue en PCM, exactement comme `decider_le_dop` retombe sur le
+    /// chemin ordinaire. Un refus bit-perfect strict, lui, REMONTE.
+    async fn dop_pour_une_piste_upnp(
+        &self,
+        req: &PlayRequest,
+        audio_url: &str,
+        conteneur: &str,
+        zone_max_sample_rate: Option<u32>,
+    ) -> Result<Option<ResolvedStream>, String> {
+        let Some(track) = req.track_id.and_then(|id| {
+            TrackRepo::with_backend(self.db.clone())
+                .get(id)
+                .ok()
+                .flatten()
+        }) else {
+            warn!(
+                zone_id = req.zone_id,
+                url = %audio_url,
+                "dsd_upnp_dop_sans_ligne_en_base_repli_pcm"
+            );
+            return Ok(None);
+        };
+        let fichier = Self::telecharger_dans_un_fichier_temporaire(
+            audio_url.to_string(),
+            Vec::new(),
+            conteneur,
+        )
+        .await
+        .map_err(|e| format!("Téléchargement du DSD impossible : {e}"))?;
+        let strict = crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id);
+        let resultat = self
+            .anticiper_le_dop(&track, fichier.clone(), zone_max_sample_rate, false, strict)
+            .await;
+        match resultat {
+            Ok(Some(mut resolu)) => {
+                if let Some(sid) = resolu.stream_id.as_deref() {
+                    supprimer_a_la_fin_de_la_session(
+                        self.streamer.clone(),
+                        sid.to_string(),
+                        fichier,
+                    );
+                } else {
+                    let _ = std::fs::remove_file(&fichier);
+                }
+                resolu.source = "upnp".into();
+                resolu.origin_url = Some(audio_url.to_string());
+                info!(zone_id = req.zone_id, url = %audio_url, "dsd_upnp_dop");
+                Ok(Some(resolu))
+            }
+            autre => {
+                let _ = std::fs::remove_file(&fichier);
+                autre
+            }
+        }
+    }
+
     async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
         let Directe {
             audio_url,
@@ -1543,6 +1886,39 @@ fn conteneur_depuis_url(url: &str, mime: &str) -> &'static str {
         "audio/opus" => "opus",
         _ => "mp3",
     }
+}
+
+/// Le conteneur d'une piste DSD relayée ou téléchargée : `dff` si l'URL ou
+/// le MIME le nomment, `dsf` sinon — le cas de loin le plus répandu, et
+/// celui que le serveur média de Tune publie sous `application/x-dsd`.
+/// L'extension nomme l'adresse rendue ET le chemin du décodeur natif.
+pub(crate) fn conteneur_dsd(url: &str, mime: &str) -> &'static str {
+    let chemin = url.split(['?', '#']).next().unwrap_or(url).to_lowercase();
+    if chemin.ends_with(".dff") || mime.to_ascii_lowercase().contains("dff") {
+        "dff"
+    } else {
+        "dsf"
+    }
+}
+
+/// Supprime un fichier temporaire quand la session qui le lit n'existe plus.
+///
+/// `anticiper_le_dop` décode dans une tâche bloquante qui ne rend rien à
+/// l'appelant ; la fin de la SESSION (arrêt, piste suivante, fin de flux) est
+/// le seul signal fiable que plus personne ne lira le fichier. Même sonde que
+/// `telecharger_pour_session` (#4234).
+fn supprimer_a_la_fin_de_la_session(
+    streamer: Arc<AudioStreamer>,
+    session_id: String,
+    chemin: String,
+) {
+    tokio::spawn(async move {
+        while streamer.session_alive(&session_id).await {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let _ = std::fs::remove_file(&chemin);
+        debug!(stream_id = %session_id, chemin = %chemin, "dsd_upnp_fichier_temporaire_supprime");
+    });
 }
 
 /// Ce flux est-il déjà du PCM en conteneur WAV ?

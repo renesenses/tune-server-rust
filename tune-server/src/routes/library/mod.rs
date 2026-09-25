@@ -325,6 +325,8 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/rating", get(albums::get_album_rating))
         .route("/tracks/{id}/credits", get(credits::track_credits))
         .route("/artists/{id}/credits", get(credits::artist_credits))
+        // #1572 — crédits d’un album : un aller-retour pour toute la fiche.
+        .route("/albums/{id}/credits", get(credits::album_credits))
         .route(
             "/tracks/{id}/credits/enrich",
             post(credits::enrich_track_credits),

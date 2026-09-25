@@ -254,11 +254,13 @@ pub fn ecrire_credits_piste(
     track_id: i64,
     lignes: &[LigneCredit],
 ) -> usize {
-    let id_str = track_id.to_string();
+    // #4984 — l'entier, pas sa chaîne : sur PostgreSQL `track_id` est BIGINT,
+    // et `bigint = text` y est refusé. L'erreur étant avalée par `.ok()`, la
+    // purge n'avait jamais lieu : chaque réécriture AJOUTAIT ses crédits.
     backend
         .execute(
             "DELETE FROM track_credits WHERE track_id = ?",
-            &[&id_str as &dyn ToSqlValue],
+            &[&track_id as &dyn ToSqlValue],
         )
         .ok();
     let artistes = crate::db::artist_repo::ArtistRepo::with_backend(backend.clone());
@@ -270,13 +272,17 @@ pub fn ecrire_credits_piste(
             .as_deref()
             .and_then(|m| artistes.get_by_musicbrainz_id(m).ok().flatten())
             .or_else(|| artistes.get_by_name(&ligne.artist_name).ok().flatten());
-        let artist_id: Option<String> = fiche.and_then(|a| a.id).map(|id| id.to_string());
+        // #4984 — des entiers, pas leurs chaînes : sur PostgreSQL `track_id`
+        // est BIGINT et « column "track_id" is of type bigint but expression
+        // is of type text » refusait TOUTE écriture de crédits. Un entier lié
+        // passe aussi dans une colonne restée TEXT (conversion d'affectation).
+        let artist_id: Option<i64> = fiche.and_then(|a| a.id);
         let ok = backend
             .execute(
                 "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position, artist_mbid) \
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
                 &[
-                    &id_str as &dyn ToSqlValue,
+                    &track_id as &dyn ToSqlValue,
                     &artist_id as &dyn ToSqlValue,
                     &ligne.artist_name as &dyn ToSqlValue,
                     &ligne.role as &dyn ToSqlValue,

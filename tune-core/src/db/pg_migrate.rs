@@ -366,11 +366,22 @@ CREATE TABLE IF NOT EXISTS playlists (
     profile_id TEXT NOT NULL DEFAULT '1'
 );
 
+-- #4889 : `track_id` nul pour un titre de service, porte par `source` /
+-- `source_id` et ses colonnes d'affichage (migration PG 072, SQLite 109).
+-- Tout en TEXT comme le reste de ce schema : la 072 convertit `duration_ms`.
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id TEXT PRIMARY KEY,
     playlist_id TEXT NOT NULL,
-    track_id TEXT NOT NULL,
-    position TEXT NOT NULL DEFAULT 0
+    track_id TEXT,
+    position TEXT NOT NULL DEFAULT 0,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    duration_ms TEXT,
+    cover_url TEXT
 );
 
 CREATE SEQUENCE IF NOT EXISTS zones_id_seq;
@@ -904,6 +915,7 @@ CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_audio_hash ON tracks(audio_hash);
+CREATE INDEX IF NOT EXISTS idx_tracks_source_source_id ON tracks(source, source_id);
 CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_id);

@@ -14,6 +14,15 @@ pub fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/", get(list_plugins))
         .route("/docs", get(plugin_docs))
+        // Bandeau « Réinstaller » des greffons payants (#4861).
+        .route(
+            "/premium-audio/reinstall-suggestion",
+            get(crate::premium_audio_plugins::reinstall_suggestion),
+        )
+        .route(
+            "/premium-audio/reinstall-suggestion/dismiss",
+            post(crate::premium_audio_plugins::dismiss_reinstall_suggestion),
+        )
         .route("/{name}", get(get_plugin))
         .route("/{name}", axum::routing::delete(delete_plugin))
         .route("/{name}/enable", post(enable_plugin))
@@ -577,6 +586,8 @@ async fn enable_plugin(
 /// actif. Le dire est la même dette que ci-dessus.
 async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // Choix explicite : le retour du Premium ne doit pas l'annuler (#4861).
+    tune_core::audio::premium_plugins::forget_withheld(&settings, &name).ok();
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "false").ok();
     let restart_required = greffon_charge(&state, &name);
@@ -731,6 +742,8 @@ async fn delete_plugin(
     // installed it is loaded and running now — the startup gate only drops it
     // next boot, so a restart is still required.
     let was_installed = settings.get(&key).ok().flatten().as_deref() == Some("true");
+    // Choix explicite : le retour du Premium ne doit pas l'annuler (#4861).
+    tune_core::audio::premium_plugins::forget_withheld(&settings, &name).ok();
     settings.delete(&key).ok();
     let enabled_key = format!("plugin_{name}_enabled");
     settings.delete(&enabled_key).ok();

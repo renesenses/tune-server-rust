@@ -532,6 +532,11 @@ pub(super) fn build_signal_path(
         transport: (transport_bit_perfect, transport_desc, output_format_name),
         verdicts,
         transformations_reelles,
+        canaux_declares: tune_core::audio::canaux_declares::disposition_declaree(
+            backend,
+            zone.id.unwrap_or(0),
+        )
+        .map(|d| d.channel_count()),
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
@@ -589,6 +594,9 @@ struct Analyse<'a> {
     verdicts: Verdicts,
     /// Ce que la sortie a réellement fait (REF-6b) ; `None` = non publié.
     transformations_reelles: Option<&'a TransformationsReelles>,
+    /// Fils 1914/1913 — les canaux de la disposition déclarée pour la zone,
+    /// pour dire la CAUSE d'une réduction réseau.
+    canaux_declares: Option<u16>,
 }
 
 /// Les étapes affichées, le résumé et les métriques DSP.
@@ -614,6 +622,7 @@ fn assembler_les_etapes(
     analyse: Analyse<'_>,
 ) -> Etapes {
     let (transport_bit_perfect, transport_desc, output_format_name) = analyse.transport;
+    let canaux_declares = analyse.canaux_declares;
     let Source {
         wire_sample_rate,
         wire_bit_depth,
@@ -727,8 +736,10 @@ fn assembler_les_etapes(
             && !wav_output
             && !dlna_cap_16bit
             && !needs_transcode_for_output;
+        // `!is_dsd` sur le bras WAV aussi : un DSD porte `bit_depth == 1`, et
+        // `1 <= 16` faisait passer sa décimation pour un WAV sans perte.
         let transcode_lossless = ((is_oaat && is_lossless && !is_dsd)
-            || (wav_output && is_lossless && (dlna_wav24 || bit_depth <= 16))
+            || (wav_output && is_lossless && !is_dsd && (dlna_wav24 || bit_depth <= 16))
             || conteneur_seul_reecrit)
             && ps
                 .now_playing
@@ -997,8 +1008,11 @@ fn assembler_les_etapes(
     if reel.is_none()
         && tune_core::orchestrator::is_network_output_type(Some(output_type))
         && let (Some(entree), Some(sortie)) = (canaux_source, canaux_du_fil)
-        && let Some(etiquette) =
-            tune_core::audio::canaux_reseau_4573::etiquette_de_reduction(entree, Some(sortie))
+        && let Some(etiquette) = tune_core::audio::canaux_reseau_4573::etiquette_de_reduction_reseau(
+            entree,
+            sortie,
+            canaux_declares,
+        )
     {
         steps.push(json!({
             "name": "Canaux",
@@ -1261,12 +1275,18 @@ fn decrire_le_transport<'a>(
                 // transcodes for DLNA), so it is bit-perfect at any depth
                 // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
                 // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
-                let wav_bit_perfect = wav_wire_bit_perfect(
-                    is_lossless,
-                    matches!(source_format, Some(AudioFormat::Wav)),
-                    dlna_wav24,
-                    bit_depth,
-                );
+                // Un DSD décimé en WAV est un changement de DOMAINE (1 bit
+                // sigma-delta → PCM multibit), jamais bit-perfect — le bras
+                // OAAT le dit déjà. Ici, `bit_depth` vaut 1 pour un DSD, et
+                // `1 <= 16` faisait passer la décimation pour du LPCM intact
+                // (Abacab, DMP-A8, .18 du 23/09/2026).
+                let wav_bit_perfect = !is_dsd
+                    && wav_wire_bit_perfect(
+                        is_lossless,
+                        matches!(source_format, Some(AudioFormat::Wav)),
+                        dlna_wav24,
+                        bit_depth,
+                    );
                 (wav_bit_perfect, "DLNA/UPnP", "WAV")
             } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
