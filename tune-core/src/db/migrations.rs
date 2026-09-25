@@ -2731,6 +2731,12 @@ fn upgrade_fts5_tables(db: &SqliteDb) {
     }
 }
 
+/// Index de recherche d'une piste par son identifiant de source (#4924),
+/// assure a chaque demarrage sur les DEUX moteurs, hors migrations numerotees.
+/// Meme texte pour SQLite et PostgreSQL : il n'emploie que du SQL commun.
+pub(crate) const TRACKS_SOURCE_ID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_source_source_id ON tracks(source, source_id)";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -3368,6 +3374,19 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_media_servers_last_seen ON media_servers(last_seen_at);",
     )
     .ok();
+
+    // Recherche d'une piste par son identifiant de source (#4924). Sans index,
+    // `WHERE source = ? AND source_id = ?` ne pouvait s'appuyer que sur
+    // `idx_tracks_source_path (source, file_path)` : il balayait toutes les
+    // pistes UPnP (49 440 sur le .18) pour CHAQUE piste synchronisee, et la
+    // synchronisation horaire gelait le serveur. Pose ICI, dans la passe rejouee
+    // a chaque demarrage, et NON dans une migration numerotee : le lanceur ne
+    // joue que `version > MAX`, et deux migrations voisines (109, 110) attendent
+    // encore leur fusion — un numero pris avant elles les ferait sauter en
+    // silence sur toute base deja montee. PG : `run_pg_migrations`, meme passe.
+    if let Err(e) = db.execute_batch(TRACKS_SOURCE_ID_INDEX) {
+        warn!(error = %e, "sqlite_tracks_source_id_index_failed");
+    }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
     db.execute_batch(include_str!("../../migrations/upnp_catalog_revision.sql"))?;
@@ -4124,6 +4143,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     .await
     .map_err(|e| format!("pg upnp revision: {e}"))?;
 
+    // Meme index que la passe finale SQLite (#4924), meme raison de ne pas le
+    // numeroter. Place APRES les scripts : sur une base neuve, `tracks` n'existe
+    // pas encore quand `ensure_schema` tourne a la connexion.
+    if let Err(e) = sqlx::raw_sql(TRACKS_SOURCE_ID_INDEX).execute(pool).await {
+        warn!(error = %e, "pg_tracks_source_id_index_failed");
+    }
+
     // Run ANALYZE on key tables for the query planner.
     sqlx::raw_sql("ANALYZE artists; ANALYZE albums; ANALYZE tracks;")
         .execute(pool)
@@ -4149,6 +4175,77 @@ pub fn pg_latest_version() -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// #4924 — le temoin du gel horaire du .18. Une base DEJA montee par une
+    /// version anterieure (ici : migree puis privee de l'index) doit le recevoir
+    /// au simple redemarrage, sans que `MAX(version)` bouge — c'est tout
+    /// l'interet de ne pas le numeroter. Et la requete de la synchronisation
+    /// UPnP doit alors s'appuyer sur lui, pas sur `idx_tracks_source_path`.
+    #[test]
+    fn i4924_index_source_id_pose_au_redemarrage_d_une_base_existante() {
+        const INDEX: &str = "idx_tracks_source_source_id";
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        let mut sql = String::from("BEGIN;");
+        for i in 0..500 {
+            let source = if i % 2 == 0 { "upnp" } else { "local" };
+            sql.push_str(&format!(
+                "INSERT INTO tracks (title, source, source_id, file_path) \
+                 VALUES ('t{i}', '{source}', 'obj-{i}', '/m/{i}.flac');"
+            ));
+        }
+        sql.push_str("COMMIT;");
+        db.execute_batch(&sql).unwrap();
+        db.execute_batch(&format!("DROP INDEX IF EXISTS {INDEX};"))
+            .unwrap();
+
+        let max_version = |db: &SqliteDb| -> i32 {
+            db.connection()
+                .lock()
+                .unwrap()
+                .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
+                .unwrap()
+        };
+        let plan = |db: &SqliteDb| -> String {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT id FROM tracks \
+                     WHERE source = 'upnp' AND source_id = ?1",
+                )
+                .unwrap();
+            stmt.query_map(["obj-42"], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let avant = plan(&db);
+        eprintln!("plan AVANT redemarrage : {avant}");
+        assert!(
+            !avant.contains(INDEX),
+            "la base existante simulee porte deja l'index : {avant}"
+        );
+        let version_avant = max_version(&db);
+
+        // Redemarrage : `state.rs` rejoue init_schema puis run_migrations.
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let apres = plan(&db);
+        eprintln!("plan APRES redemarrage : {apres}");
+        assert!(
+            apres.contains(&format!("INDEX {INDEX} (source=? AND source_id=?)")),
+            "la recherche par source_id n'emploie pas {INDEX} : {apres}"
+        );
+        assert_eq!(
+            max_version(&db),
+            version_avant,
+            "l'index ne doit consommer aucun numero de migration"
+        );
+    }
     use super::*;
     use std::fs;
     use std::path::Path;
