@@ -301,6 +301,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_ensure_schema_parity -- --nocapture --test-threads=1
 
+      # Chasse PG du 25/09/2026 -- deux ecritures propres a SQLite, avalees par
+      # leur appelant : `strftime` dans la fraicheur du cache d API (le cache des
+      # biographies n etait jamais relu) et `STRING_AGG($1)` dans la fusion
+      # manuelle des doublons (le bouton ne fusionnait rien). Jumeau SQLite
+      # dans ci.yml.
+      - name: Fonctions propres a SQLite dans les routes, sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_fonctions_sqlite_seules -- --nocapture --test-threads=1
+
       # #3726 — les ECRITURES, et non plus seulement les schemas.
       #
       # Les trois portes ci-dessus comparent des SCHEMAS entre eux. Aucune ne
