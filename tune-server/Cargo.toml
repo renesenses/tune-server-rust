@@ -826,3 +826,12 @@ required-features = ["plugins-wasm"]
 name = "hote_wasm_appariement_local_4716"
 path = "tests/hote_wasm_appariement_local_4716.rs"
 required-features = ["plugins-wasm"]
+
+# #4718 — les snapshots du greffon « Playlists converter » DANS le bac à sable :
+# copie datée avant le premier titre versé, retour en arrière qui rajoute sans
+# jamais supprimer, date lue par `host_now`. `autotests = false` en tête de ce
+# manifeste : sans ce bloc, le fichier ne serait jamais compilé.
+[[test]]
+name = "greffon_snapshots_4718"
+path = "tests/greffon_snapshots_4718.rs"
+required-features = ["plugins-wasm"]

@@ -44,6 +44,7 @@ use serde_json::{Value, json};
 use crate::appariement::{self, Raison};
 use crate::hote::Hote;
 use crate::modele::{Appariee, Demande, EnTeteLot, Introuvable, Lot, PlaylistDuLot, etat};
+use crate::snapshots::Snapshots;
 
 /// Taille d'un paquet de titres versé chez la cible.
 ///
@@ -133,6 +134,7 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
                 appariees,
                 introuvables,
                 cible_playlist_id: None,
+                snapshot_avant: None,
                 versees: Vec::new(),
                 etat: etat::APERCU.to_string(),
                 erreur: None,
@@ -259,6 +261,7 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
         lot_id: &str,
         pl: &mut PlaylistDuLot,
     ) -> Result<(), String> {
+        let mut vient_d_etre_creee = false;
         if pl.cible_playlist_id.is_none() {
             let reponse = self.hote.streaming_playlist_create(
                 cible,
@@ -276,11 +279,29 @@ impl<'h, H: Hote + ?Sized> Convertisseur<'h, H> {
             // reprise recréerait — un doublon qu'aucune capacité ne sait
             // effacer.
             self.ecrire_la_playlist(lot_id, pl)?;
+            vient_d_etre_creee = true;
         }
         let cible_playlist_id = pl
             .cible_playlist_id
             .clone()
             .expect("identifiant posé juste au-dessus");
+
+        // #4718 — une copie datée de la playlist visée AVANT le premier titre
+        // versé. Sans elle, pas d'écriture : c'est ce qui rend le retour en
+        // arrière possible. Une playlist que le transfert vient de créer est
+        // vide, et on le sait sans la relire (un service peut mettre quelques
+        // secondes à la lister) ; une playlist qui existait déjà est lue.
+        if pl.snapshot_avant.is_none() {
+            let snapshots = Snapshots::new(self.hote);
+            let motif = format!("avant_transfert:{lot_id}");
+            let entete = if vient_d_etre_creee {
+                snapshots.prendre_depuis(cible, &cible_playlist_id, &pl.cible_nom, &[], &motif)?
+            } else {
+                snapshots.prendre(cible, &cible_playlist_id, Some(&pl.cible_nom), &motif)?
+            };
+            pl.snapshot_avant = Some(entete.snapshot_id);
+            self.ecrire_la_playlist(lot_id, pl)?;
+        }
 
         let restant = pl.restant_a_verser();
         for paquet in restant.chunks(TAILLE_PAQUET) {

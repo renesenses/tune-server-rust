@@ -417,7 +417,7 @@ peut lire, pas un trap — et **n'atteint jamais l'hôte**.
 
 | Scope | Ce qu'il ouvre |
 |---|---|
-| *(toujours)* | `host_log` |
+| *(toujours)* | `host_log`, `host_now` (l'heure de l'hôte en ms Unix, #4718) |
 | `queue` | `host_queue_get`, `host_queue_add` |
 | `playback` | `host_now_playing`, `host_play`, `host_pause` |
 | `events` | `host_emit` (l'abonnement se déclare dans le manifeste) |

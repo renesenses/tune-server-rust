@@ -78,7 +78,7 @@ Unlisted permission ⇒ the import traps (deny by default).
 
 | Permission | Host functions |
 |---|---|
-| *(always)* | `host_log(level,msg)` |
+| *(always)* | `host_log(level,msg)`, `host_now()` → `{now_ms}` — l'heure de l'hôte, **livré #4718** (un greffon `wasm32-unknown-unknown` n'a pas d'horloge ; lire l'heure ne touche rien de l'utilisateur) |
 | `queue` | `host_queue_get(zone)`, `host_queue_add(zone,tracks)`, `host_queue_set(zone,tracks,pos)`, `host_queue_remove/move` |
 | `playback` | `host_now_playing(zone)`, `host_play(zone,req)`, `host_pause/stop/next/prev(zone)`, `host_seek(zone,ms)`, `host_set_volume(zone,v)` |
 | `library` | `host_library_search(query,limit)`, `host_library_match_track(title,artist,isrc,duration_ms)` — **livré #4716** ; `host_track_get(id)` reste à faire |

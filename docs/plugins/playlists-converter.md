@@ -1,8 +1,10 @@
 # Greffon « Playlists converter »
 
-Tranche 2 de l'épique [#4715](https://github.com/renesenses/tune-server-rust/issues/4715)
-([#4717](https://github.com/renesenses/tune-server-rust/issues/4717)). Transfère
-une playlist d'un service vers un autre, **à l'identique** et **par lot**.
+Tranches 2 et 3 de l'épique [#4715](https://github.com/renesenses/tune-server-rust/issues/4715)
+([#4717](https://github.com/renesenses/tune-server-rust/issues/4717),
+[#4718](https://github.com/renesenses/tune-server-rust/issues/4718)). Transfère
+une playlist d'un service vers un autre, **à l'identique** et **par lot**, et
+garde une **copie datée** (snapshot) de toute playlist avant d'y écrire.
 
 Greffon **WASM**, **premium** (`manifest.premium = true`) et **facultatif** :
 il n'est pas embarqué dans les paquets publiés, il s'installe depuis le
@@ -55,10 +57,61 @@ aucune licence.
 | `POST /reprise` | `{lot_id}` | `{resume, lot}` ; `409` si le lot n'a jamais été accepté |
 | `GET /lots` | — | `{count, lots: [en-tête…]}` |
 | `GET /lot?id=lot-N` | — | `{resume, lot}` |
+| `POST /snapshot` | `{service, playlist_id, nom?}` | `{snapshot: en-tête}` — lecture seule chez le service |
+| `GET /snapshots` | — | `{count, playlists: [{service, playlist_id, nom, snapshots, dernier_le_ms}], retention_par_playlist}` |
+| `GET /snapshots?service=S&playlist_id=P` | — | `{count, snapshots: [en-tête…], retention_par_playlist}`, du plus récent au plus ancien |
+| `GET /snapshot?id=snap-K-N` | — | `{snapshot: {…en-tête, pistes: [{id, titre, artiste, duree_ms, isrc}]}}` ; `404` inconnu ou expiré |
+| `POST /snapshot/restauration/apercu` | `{snapshot_id, mode: "completer"\|"recreer"}` | `{plan, a_rajouter: [piste…], a_retirer_par_vous: [piste…]}` — **rien n'est écrit** |
+| `POST /snapshot/restauration` | `{plan_id, accord: true}` | `{plan, a_retirer_par_vous}` ; `409` sans accord ou plan déjà exécuté |
+
+Un en-tête de snapshot : `{snapshot_id, service, playlist_id, nom, pris_le_ms,
+motif, total, pages, empreinte}`. `motif` vaut `manuel`,
+`avant_transfert:lot-N` ou `avant_restauration:plan-N`.
 
 `source_service` vaut `"local"` pour la bibliothèque (les `playlists` sont
 alors des identifiants entiers en texte). Sans `suffixe_nom`, le nom de la
 playlist créée est **repris à l'identique**.
+
+## Snapshots (#4718)
+
+Avant **tout** transfert, le greffon garde une copie datée de la playlist
+visée : son nom, ses pistes et leurs identifiants de service, avec l'heure de
+l'hôte (`host_now`). Le transfert n'écrit **aucun** titre tant que cette copie
+n'est pas écrite ; son identifiant est rangé dans le lot
+(`lot.playlists[i].snapshot_avant`). Une playlist que le transfert vient de
+créer est gardée vide — c'est son état d'avant.
+
+On peut aussi prendre un snapshot à la main de n'importe quelle playlist
+(service ou bibliothèque locale), les lister et en lire le contenu.
+
+### Le retour en arrière ne supprime RIEN
+
+L'interface hôte n'a **aucune** capacité de suppression, et ce n'est pas un
+manque à combler : c'est la règle. Un retour en arrière est donc **non
+destructif**, et se fait toujours en deux temps — **aperçu**, puis **accord** :
+
+| Mode | Ce qui est fait | Ce qui ne l'est pas |
+|---|---|---|
+| `completer` (défaut) | les pistes du snapshot qui ont disparu de la playlist y sont **rajoutées** (en fin de playlist) | les pistes ajoutées depuis le snapshot **restent** : elles sont listées dans `a_retirer_par_vous`, et c'est à **l'utilisateur** de les retirer lui-même, depuis l'application du service, s'il le souhaite. L'ordre d'origine n'est pas rétabli. |
+| `recreer` | une **nouvelle** playlist est créée avec le nom et les pistes du snapshot | l'ancienne playlist n'est ni modifiée ni supprimée |
+
+Le retour en arrière n'écrit jamais **plus** que l'aperçu accepté (une piste
+disparue après l'aperçu attendra un nouvel aperçu), et en mode `completer` il
+prend lui-même un snapshot de l'état courant avant d'écrire : il se défait
+comme le reste.
+
+### Rétention
+
+Le stockage clé/valeur ne sait pas non plus supprimer une clé : la rétention
+est un **anneau**.
+
+* **10 snapshots par playlist.** Le onzième réécrit le plus ancien ; le
+  demander ensuite rend `404 snapshot_expire`.
+* Un snapshot **identique** au précédent (même nom, mêmes pistes, même ordre)
+  n'occupe pas d'emplacement : le précédent est rendu.
+* Les pistes sont rangées par pages de 400, pour tenir sous la borne de
+  256 Kio par valeur.
+* **20 plans de retour en arrière** gardés, tous confondus.
 
 ## Ce que le greffon ne peut pas faire
 
@@ -86,7 +139,12 @@ Dans le stockage clé/valeur cloisonné du greffon (#4716), donc sous
 |---|---|
 | `compteur_lots` | le dernier numéro attribué |
 | `lot:<id>` | l'en-tête : services, état, rangs des playlists |
-| `lot:<id>:pl:<rang>` | une playlist : appariées, introuvables, identifiant cible, versées |
+| `lot:<id>:pl:<rang>` | une playlist : appariées, introuvables, identifiant cible, versées, snapshot d'avant |
+| `compteur_playlists_snap` | le dernier numéro de playlist ayant un snapshot |
+| `snap_pl:<service>/<playlist_id>` | le registre d'une playlist : son numéro `K`, son nom, le nombre de snapshots pris |
+| `snap:<K>:<emplacement>` | l'en-tête d'un snapshot (anneau de 10) |
+| `snap:<K>:<emplacement>:p:<n>` | une page de 400 pistes |
+| `compteur_restaurations`, `restauration:<emplacement>` | les plans de retour en arrière (anneau de 20) |
 
 Une playlist par clé **à dessein** : l'hôte borne une valeur à 256 Kio, et un
 lot de trente playlists de trois cents titres n'y tiendrait pas d'un bloc.
@@ -108,8 +166,9 @@ porte `rlib` **en plus** de `cdylib` pour que `cargo test` puisse la lier.
 
 | Porte | Ce qu'elle couvre |
 |---|---|
-| `cargo test -p tune-playlists-converter` | le moteur en natif, contre un hôte de banc : règle des ±3 s, aperçu sans écriture, rapport, reprise, mode par lot |
+| `cargo test -p tune-playlists-converter` | le moteur en natif, contre un hôte de banc : règle des ±3 s, aperçu sans écriture, rapport, reprise, mode par lot, snapshots, rétention, retour en arrière |
 | `cargo test -p tune-server --features plugins-wasm --test greffon_convertisseur_4717` | le **vrai `main.wasm`** dans le vrai bac à sable : l'ABI, les permissions, et les mêmes garanties bout en bout |
+| `cargo test -p tune-server --features plugins-wasm --test greffon_snapshots_4718` | le vrai `main.wasm` : snapshot écrit AVANT le premier titre versé, retour en arrière qui rajoute sans rien supprimer, date lue par `host_now` |
 
 Le second est le seul à exercer `src/abi.rs` (allocation, empaquetage
 `(ptr << 32) | len`, imports `"tune"`).
