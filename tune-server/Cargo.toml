@@ -991,3 +991,10 @@ path = "tests/identification_lot_4805.rs"
 [[test]]
 name = "reidentification_album"
 path = "tests/reidentification_album.rs"
+
+# #4949 — l'Info.plist de Tune Server.app (heredoc de release.yml) doit
+# déclarer le réseau local et chaque type Bonjour du serveur, sans quoi macOS
+# 15+ refuse tout le LAN en os error 65.
+[[test]]
+name = "reseau_local_macos_4949"
+path = "tests/reseau_local_macos_4949.rs"

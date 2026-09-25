@@ -923,6 +923,11 @@ jobs:
           mv "$APP/Contents/MacOS/Tune Server.app/Contents/MacOS/applet" "$APP/Contents/MacOS/Tune Server"
           mv "$APP/Contents/MacOS/Tune Server.app/Contents/Resources/Scripts" "$APP/Contents/Resources/Scripts"
           rm -rf "$APP/Contents/MacOS/Tune Server.app"
+          # #4949 — sans NSLocalNetworkUsageDescription ni NSBonjourServices,
+          # macOS 15+ n'inscrit pas l'app dans « Réseau local » : la permission
+          # ne peut pas être accordée, et tout le LAN tombe en os error 65
+          # (Cyrille, #4580). Chaque type Bonjour du serveur doit y figurer :
+          # tune-server/tests/reseau_local_macos_4949.rs les compare au code.
           cat > "$APP/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -938,6 +943,22 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>LSUIElement</key><true/>
             <key>NSAppleScriptEnabled</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>Tune trouve et pilote vos appareils audio (DLNA, AirPlay, Chromecast) sur le réseau local. Tune finds and controls your audio devices on the local network.</string>
+            <key>NSBonjourServices</key>
+            <array>
+              <string>_airplay._tcp</string>
+              <string>_raop._tcp</string>
+              <string>_googlecast._tcp</string>
+              <string>_sendspin._tcp</string>
+              <string>_sendspin-server._tcp</string>
+              <string>_oaat._tcp</string>
+              <string>_tune-server._tcp</string>
+              <string>_smb._tcp</string>
+              <string>_slimcli._tcp</string>
+              <string>_musc._tcp</string>
+              <string>_musp._tcp</string>
+              <string>_musz._tcp</string>
+            </array>
           </dict>
           </plist>
           PLIST
