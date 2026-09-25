@@ -487,3 +487,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1
+
+      # #5026 — la règle « Étiquette » élargie : sous-requête sur `tracks`,
+      # GROUP BY sur la paire source + source_id, COUNT sur une table dérivée.
+      # SQLite en accepte plus que PostgreSQL ; sans cette étape, l'épreuve
+      # prendrait son « saut annoncé ».
+      - name: Règle Étiquette des collections sur PostgreSQL (#5026)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
