@@ -28,9 +28,10 @@
 //! 1. relit le tag `compilation` et l'artiste d'album DANS LES FICHIERS
 //!    (`read_metadata`, le lecteur du scan) — pas dans la base, qui ne les a
 //!    pas ;
-//! 2. décide selon C1 : un tag qui parle tranche dans les deux sens ; sinon la
-//!    forme (un « Various Artists », ou deux artistes d'album distincts dans
-//!    un même dossier) ;
+//! 2. décide selon LA règle (`tune_core::library::regle_compilation`,
+//!    25/09/2026) : un « Various Artists », ou deux artistes principaux
+//!    distincts ; la balise `COMPILATION=1` seule ne suffit plus,
+//!    `COMPILATION=0` fait foi (C1) ;
 //! 3. décide l'artiste selon C2 : compilation ⇒ l'unique artiste d'album
 //!    tagué, sinon « Various Artists » ; pas compilation ⇒ l'unique artiste
 //!    d'album tagué s'il y en a exactement un, sinon on ne touche pas ;
@@ -51,6 +52,7 @@ use tracing::{debug, info, warn};
 use tune_core::db::album_metadata_repo::AlbumMetadataRepo;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
+use tune_core::library::regle_compilation::IndicesCompilation;
 use tune_http_types::panne_sql::OuDefautJournalise;
 
 use crate::scan_import::is_various_artists;
@@ -72,12 +74,8 @@ const SQL_PISTES: &str = "SELECT al.id, al.title, al.artist_id, COALESCE(ar.name
 /// Ce que les FICHIERS d'un album disent, réduit à ce que C1 et C2 lisent.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct Temoignage {
-    /// Un fichier au moins porte le tag à VRAI.
-    pub tag_vrai: bool,
-    /// Un fichier au moins porte le tag à FAUX.
-    pub tag_faux: bool,
-    /// Un artiste d'album « Various Artists » quelque part.
-    pub va: bool,
+    /// Ce que LA règle consomme : artistes d'album, artistes de piste, balise.
+    pub indices: IndicesCompilation,
     /// Les artistes d'album tagués, par dossier, repliés en minuscules ; la
     /// graphie d'origine est gardée pour pouvoir l'écrire.
     pub artistes_par_dossier: HashMap<String, BTreeSet<String>>,
@@ -90,10 +88,10 @@ pub(crate) struct Temoignage {
 impl Temoignage {
     fn ajouter(&mut self, dossier: &str, meta: &tune_core::metadata::TrackMetadata) {
         self.lus += 1;
-        match meta.compilation {
-            Some(true) => self.tag_vrai = true,
-            Some(false) => self.tag_faux = true,
-            None => {}
+        self.indices.balise(meta.compilation);
+        if !meta.artist_from_path {
+            self.indices
+                .ajouter_piste(meta.album_artist.as_deref(), meta.artist.as_deref());
         }
         if let Some(aa) = meta
             .album_artist
@@ -101,9 +99,7 @@ impl Temoignage {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            if is_various_artists(aa) {
-                self.va = true;
-            } else {
+            if !is_various_artists(aa) {
                 let cle = aa.to_lowercase();
                 self.artistes_par_dossier
                     .entry(dossier.to_string())
@@ -132,18 +128,13 @@ pub(crate) struct Verdict {
     pub artiste: Option<String>,
 }
 
-/// C1 puis C2, sur ce que les fichiers témoignent. Fonction PURE : c'est elle
-/// que les témoins éprouvent.
+/// LA règle puis C2, sur ce que les fichiers témoignent. Fonction PURE : c'est
+/// elle que les témoins éprouvent.
 pub(crate) fn decider(t: &Temoignage) -> Verdict {
-    // C1 — le tag parle, dans les deux sens ; un VRAI l'emporte sur un FAUX
-    // (même règle que `decide_compilation_albums`).
-    let forme = t.va || t.artistes_par_dossier.values().any(|s| s.len() >= 2);
-    let (compilation, motif) = match (t.tag_vrai, t.tag_faux) {
-        (true, _) => (true, "tag"),
-        (false, true) => (false, "tag"),
-        (false, false) if forme => (true, "forme_des_dossiers"),
-        (false, false) => (false, "aucun"),
-    };
+    // LA règle (`tune_core::library::regle_compilation`) — la même que le
+    // scan et le surveillant.
+    let jugement = t.indices.juger();
+    let (compilation, motif) = (jugement.compilation, jugement.motif.as_str());
     let artistes = t.artistes();
     let unique = (artistes.len() == 1)
         .then(|| {
@@ -426,7 +417,7 @@ mod tests {
         ]);
         let v = decider(&t);
         assert!(!v.compilation);
-        assert_eq!(v.motif, "tag");
+        assert_eq!(v.motif, "balise_non");
         assert_eq!(v.artiste, None, "deux graphies : on n'invente pas");
 
         // Anthologie taguée : compilation, Various Artists.
@@ -436,11 +427,14 @@ mod tests {
         ]);
         let v = decider(&t);
         assert!(v.compilation);
-        assert_eq!(v.motif, "tag");
+        assert_eq!(v.motif, "plusieurs_artistes_principaux");
         assert_eq!(v.artiste.as_deref(), Some("Various Artists"));
 
-        // Un FAUX et un VRAI : le vrai l'emporte.
-        let t = temoignage(&[("/x", None, Some(false)), ("/x", None, Some(true))]);
+        // Un FAUX et un VRAI : le vrai l'emporte — le refus C1 ne joue pas.
+        let t = temoignage(&[
+            ("/x", Some("A"), Some(false)),
+            ("/x", Some("B"), Some(true)),
+        ]);
         assert!(decider(&t).compilation);
     }
 
@@ -451,23 +445,25 @@ mod tests {
         let t = temoignage(&[("/d", Some("A"), None), ("/d", Some("B"), None)]);
         let v = decider(&t);
         assert!(v.compilation);
-        assert_eq!(v.motif, "forme_des_dossiers");
+        assert_eq!(v.motif, "plusieurs_artistes_principaux");
         assert_eq!(v.artiste.as_deref(), Some("Various Artists"));
 
-        // Compilation par tag mais UN seul artiste d'album tagué : C2 le garde.
+        // 25/09/2026 — la balise SEULE sur un seul artiste ne suffit plus :
+        // pas une compilation, et l'album garde son artiste.
         let t = temoignage(&[
             ("/d", Some("Fritz Reiner"), Some(true)),
             ("/d", Some("fritz reiner"), Some(true)),
         ]);
         let v = decider(&t);
-        assert!(v.compilation);
+        assert!(!v.compilation);
+        assert_eq!(v.motif, "un_seul_artiste");
         assert_eq!(v.artiste.as_deref(), Some("Fritz Reiner"));
 
         // Rien du tout : pas une compilation, rien à poser.
         let t = temoignage(&[("/d", Some("Solo"), None)]);
         let v = decider(&t);
         assert!(!v.compilation);
-        assert_eq!(v.motif, "aucun");
+        assert_eq!(v.motif, "un_seul_artiste");
         assert_eq!(v.artiste.as_deref(), Some("Solo"));
     }
 
@@ -574,6 +570,22 @@ mod tests {
         // Seconde passe : plus rien à faire.
         let bilan = reparer(&s, &|_, _| {});
         assert_eq!((bilan.reparees, bilan.inchangees), (0, 1));
+    }
+
+    /// « Here & Gone » (David Sanborn) : un seul artiste, `COMPILATION=1` dans
+    /// les fichiers, drapeau levé en base. La passe le BAISSE, et l'album
+    /// garde son artiste.
+    #[test]
+    fn la_passe_baisse_le_drapeau_d_un_album_d_un_seul_artiste_balise() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = fichier(dir.path(), "01.flac", "David Sanborn", Some(true));
+        let b = fichier(dir.path(), "02.flac", "David Sanborn", Some(true));
+        let s = etat();
+        album(&s, 1, "David Sanborn", true, &[&a, &b]);
+
+        let bilan = reparer(&s, &|_, _| {});
+        assert_eq!(bilan.reparees, 1, "{bilan:?}");
+        assert_eq!(ligne(&s, 1), (false, "David Sanborn".to_string()));
     }
 
     /// C3 — un album dont l'artiste est tenu par une édition manuelle n'est

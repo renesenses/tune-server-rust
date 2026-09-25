@@ -18,25 +18,29 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::models::{Album, Artist, Track};
+use tune_core::library::regle_compilation::{IndicesCompilation, Jugement, MotifCompilation};
 use tune_core::metadata::TrackMetadata;
 use tune_core::scanner::walker::ScannedFile;
 
 /// True when an `album_artist` value denotes a various-artists compilation.
+/// Le vocabulaire est celui de LA règle
+/// ([`tune_core::library::regle_compilation::est_artistes_divers`]).
 pub(crate) fn is_various_artists(s: &str) -> bool {
-    let l = s.trim().to_lowercase();
-    l == "various artists" || l == "various" || l == "va" || l == "compilations"
+    tune_core::library::regle_compilation::est_artistes_divers(s)
 }
 
 /// Decide, per `(folder, album title)`, whether that album is a various-artists
 /// compilation, from the metadata of a set of scanned tracks.
 ///
-/// A genuine single-artist album has one consistent `album_artist`. An album is
-/// treated as a compilation when any of its tracks carries the compilation flag
-/// or a "Various Artists" album_artist, OR when the `album_artist` value varies
-/// across the tracks of the same `(folder, album)` — the tell-tale of a
-/// compilation whose tracks were each tagged with their own artist as the
-/// album_artist, which otherwise splits into one album (and cover) per artist.
+/// 🔴 25/09/2026 — la décision est celle de LA règle
+/// ([`tune_core::library::regle_compilation`]) : artiste d'album « Various
+/// Artists », OU deux artistes principaux distincts, OU MusicBrainz. La
+/// balise `COMPILATION=1` seule, sur un album d'un seul artiste, ne suffit
+/// plus (« Here & Gone », David Sanborn) ; `COMPILATION=0` fait toujours foi
+/// (C1). Ce qui reste propre au scan, c'est le RASSEMBLEMENT des indices par
+/// `(dossier, album)`, pas la règle.
 ///
+/// Items: `(folder, album, album_artist, compilation tag, track artist)`.
 /// Keys are `(folder, album_title.to_lowercase())`.
 ///
 /// ⚠️ N'ALIMENTER qu'avec des valeurs venues des BALISES. Un fichier dont les
@@ -45,82 +49,38 @@ pub(crate) fn is_various_artists(s: &str) -> bool {
 /// bascule l'album entier en compilation (#3232). Le filtrage se fait chez
 /// l'appelant, [`TrackImporter::begin_batch`].
 pub(crate) fn decide_compilation_albums<'a>(
-    items: impl Iterator<Item = (String, &'a str, Option<&'a str>, Option<bool>)>,
+    items: impl Iterator<
+        Item = (
+            String,
+            &'a str,
+            Option<&'a str>,
+            Option<bool>,
+            Option<&'a str>,
+        ),
+    >,
 ) -> HashMap<(String, String), VerdictAlbum> {
-    // Par album : (un tag dit VRAI, un tag dit FAUX, un artiste « Various
-    // Artists », les graphies d'artiste d'album rencontrées).
-    let mut acc: HashMap<(String, String), (bool, bool, bool, HashSet<String>)> = HashMap::new();
-    for (dir, album, album_artist, tag) in items {
+    let mut acc: HashMap<(String, String), IndicesCompilation> = HashMap::new();
+    for (dir, album, album_artist, tag, artist) in items {
         let e = acc.entry((dir, album.to_lowercase())).or_default();
-        match tag {
-            Some(true) => e.0 = true,
-            Some(false) => e.1 = true,
-            None => {}
-        }
-        let aa = album_artist.map(|s| s.trim()).filter(|s| !s.is_empty());
-        if aa.map(is_various_artists).unwrap_or(false) {
-            e.2 = true;
-        }
-        if let Some(aa) = aa {
-            e.3.insert(aa.to_lowercase());
-        }
+        e.ajouter_piste(album_artist, artist);
+        e.balise(tag);
     }
     acc.into_iter()
-        .map(|(k, (vrai, faux, va, artistes))| {
-            // Un dossier où deux fichiers se contredisent : le VRAI l'emporte.
-            // Le drapeau ne se baisse jamais (voir `mark_compilation`), et un
-            // album à demi étiqueté reste une compilation.
-            let tag = match (vrai, faux) {
-                (true, _) => Some(true),
-                (false, true) => Some(false),
-                (false, false) => None,
-            };
+        .map(|(k, indices)| {
             (
                 k,
                 VerdictAlbum {
-                    tag,
-                    forme: va || artistes.len() >= 2,
+                    jugement: indices.juger(),
                 },
             )
         })
         .collect()
 }
 
-/// Ce que l'on sait d'un `(dossier, album)` quant à la compilation — les deux
-/// sources séparées, et non déjà fondues en un `bool`.
-///
-/// 🔴 Les fondre était le défaut : le tag et la forme entraient tous deux dans
-/// un même « ou », d'où le tag ne pouvait plus qu'ALLUMER le drapeau. C1
-/// demande l'inverse — que le tag puisse aussi l'ÉTEINDRE.
-#[derive(Debug, Default, Clone)]
+/// Ce que LA règle rend pour un `(dossier, album)`.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct VerdictAlbum {
-    /// Ce que les FICHIERS déclarent, en trois états. Fait foi (C1).
-    pub tag: Option<bool>,
-    /// Ce que la forme donne à DÉDUIRE : un artiste d'album « Various
-    /// Artists », ou deux artistes d'album distincts sous un même titre.
-    /// N'intervient que si `tag` est `None`.
-    pub forme: bool,
-}
-
-/// Qui a tranché, du tag ou de la forme des dossiers — ce que le journal nomme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MotifCompilation {
-    /// Les pistes portent le tag (`TCMP`, `COMPILATION` ou `cpil`). Il fait foi.
-    Tag,
-    /// Aucun tag : les dossiers sont éclatés, ou l'album porte deux artistes.
-    FormeDesDossiers,
-    /// Ni tag ni forme — ce n'est pas une compilation.
-    Aucun,
-}
-
-impl MotifCompilation {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Tag => "tag",
-            Self::FormeDesDossiers => "forme_des_dossiers",
-            Self::Aucun => "aucun",
-        }
-    }
+    pub jugement: Jugement,
 }
 
 /// Per-FOLDER compilation decision, complementing [`decide_compilation_albums`]
@@ -129,40 +89,41 @@ impl MotifCompilation {
 /// single track, so the "≥2 artists" tell-tale never fires; JP Borderies).
 ///
 /// Returns `folder → (various_artists, use_folder_title)`:
-/// - `various_artists`: the folder holds ≥2 distinct artists → album artist is
-///   "Various Artists". A single-artist multi-disc folder (1 artist) is untouched.
+/// - `various_artists`: LA règle, appliquée au dossier entier (sans balise),
+///   dit « compilation » — deux artistes principaux distincts. Un dossier
+///   d'un seul artiste (plusieurs disques, des invités) n'est pas touché.
 /// - `use_folder_title`: additionally ≥2 distinct album tags → the per-track
 ///   album tags are unrelated, so the folder name is the real album title. A
 ///   genuine various-artists album with ONE album tag (e.g. "Woodstock") keeps
 ///   its title (only `decide_compilation_albums` flags it): here it stays false.
 ///
-/// `items` yields `(folder, artist, album)`; `artist` = the album_artist tag if
-/// present, else the track artist.
+/// `items` yields `(folder, album_artist, artist, album)`.
 ///
 /// ⚠️ Même règle que [`decide_compilation_albums`] : rien qui ne vienne des
 /// BALISES. Un fichier en repli « tout depuis le chemin » doit entrer avec
-/// `(dossier, None, None)` — c'est LUI qui fabriquait le second artiste et
-/// faisait sortir le tag « compilation » au hasard (#3232).
+/// `(dossier, None, None, None)` — c'est LUI qui fabriquait le second artiste
+/// et faisait sortir le tag « compilation » au hasard (#3232).
 pub(crate) fn decide_compilation_folders<'a>(
-    items: impl Iterator<Item = (String, Option<&'a str>, Option<&'a str>)>,
+    items: impl Iterator<Item = (String, Option<&'a str>, Option<&'a str>, Option<&'a str>)>,
 ) -> HashMap<String, (bool, bool)> {
-    let mut acc: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
-    for (dir, artist, album) in items {
+    let mut acc: HashMap<String, (IndicesCompilation, HashSet<String>)> = HashMap::new();
+    for (dir, album_artist, artist, album) in items {
         let e = acc.entry(dir).or_default();
-        if let Some(a) = artist.map(str::trim).filter(|s| !s.is_empty()) {
-            e.0.insert(a.to_lowercase());
-        }
+        e.0.ajouter_piste(album_artist, artist);
         if let Some(al) = album.map(str::trim).filter(|s| !s.is_empty()) {
             e.1.insert(al.to_lowercase());
         }
     }
     acc.into_iter()
-        .map(|(dir, (artists, albums))| {
-            let va = artists.len() >= 2;
+        .map(|(dir, (indices, albums))| {
+            let va = indices.juger().compilation;
             (dir, (va, va && albums.len() >= 2))
         })
         .collect()
 }
+
+/// `(titre d'album, artiste d'album, balise « compilation », artiste de la piste)`.
+type PreuveDAlbum = (String, Option<String>, Option<bool>, Option<String>);
 
 /// Les seules balises dont dépendent les deux décisions ci-dessus, gardées
 /// pour un dossier pendant TOUTE la durée du scan.
@@ -183,14 +144,14 @@ pub(crate) fn decide_compilation_folders<'a>(
 /// avec les pochettes d'un seul lot.
 #[derive(Default)]
 pub(crate) struct PreuvesDuDossier {
-    /// `(titre d'album, artiste d'album, TAG compilation en trois états)` —
-    /// ce que [`decide_compilation_albums`] consomme. `None` = le fichier ne
-    /// dit rien, et c'est alors, et alors seulement, que la forme tranche.
-    par_album: HashSet<(String, Option<String>, Option<bool>)>,
-    /// `(artiste, titre d'album)` — ce que [`decide_compilation_folders`]
-    /// consomme. Un fichier sans balises entre en `(None, None)` : il fait
-    /// savoir que le dossier existe sans y apporter d'artiste.
-    par_dossier: HashSet<(Option<String>, Option<String>)>,
+    /// `(titre d'album, artiste d'album, TAG compilation en trois états,
+    /// artiste de la piste)` — ce que [`decide_compilation_albums`] consomme.
+    par_album: HashSet<PreuveDAlbum>,
+    /// `(artiste d'album, artiste de la piste, titre d'album)` — ce que
+    /// [`decide_compilation_folders`] consomme. Un fichier sans balises entre
+    /// en `(None, None, None)` : il fait savoir que le dossier existe sans y
+    /// apporter d'artiste.
+    par_dossier: HashSet<(Option<String>, Option<String>, Option<String>)>,
 }
 
 /// Ce que ce scan PRÉSENTE et ce qu'il ÉCARTE.
@@ -452,6 +413,12 @@ pub struct TrackImporter {
     /// donc sur le nom du dossier si c'était lui le premier — et partait dans
     /// un album à part (#3232).
     folder_tagged_artist: HashMap<String, String>,
+    /// `(dossier, album)` -> la graphie d'artiste d'album qui vaut pour tout
+    /// l'album quand ses pistes en portent plusieurs d'un MEME artiste (#3855,
+    /// `tune_core::library::regle_compilation::graphie_de_reference`). Avant
+    /// le 25/09/2026, c'est le basculement en compilation qui gardait ce
+    /// disque en une seule ligne ; il n'est plus une compilation.
+    graphie_d_album: HashMap<(String, String), String>,
     artwork_extracted: u64,
     /// « Scan complet » : relire la pochette depuis les fichiers et **écraser**
     /// celle de la base.
@@ -501,6 +468,7 @@ impl TrackImporter {
             comp_decision: HashMap::new(),
             folder_comp: HashMap::new(),
             folder_tagged_artist: HashMap::new(),
+            graphie_d_album: HashMap::new(),
             artwork_extracted: 0,
             force_artwork: false,
         }
@@ -591,7 +559,7 @@ impl TrackImporter {
                 // Aucune ligne album : le scan précédent n'a trouvé chez ce
                 // fichier ni balise `album` ni dossier-compilation. Il fait
                 // savoir que le dossier existe, rien de plus.
-                p.par_dossier.insert((None, None));
+                p.par_dossier.insert((None, None, None));
                 continue;
             };
             p.par_album.insert((
@@ -599,13 +567,15 @@ impl TrackImporter {
                 preuve.album_artist.clone(),
                 // `albums.is_compilation` est le VERDICT déjà rendu, pas le tag
                 // du fichier : la base ne garde pas ce que le fichier disait.
-                // Un drapeau levé entre donc comme `Some(true)` — le drapeau ne
-                // se baisse jamais (`mark_compilation`), et C3 interdit de
-                // réparer l'existant. Un drapeau baissé n'apprend rien : `None`.
+                // Un drapeau levé entre donc comme `Some(true)` — ce qui, depuis
+                // le 25/09/2026, ne suffit plus SEUL : un album d'un seul
+                // artiste marqué sous l'ancienne règle n'est plus jugé
+                // compilation. Un drapeau baissé n'apprend rien : `None`.
                 if preuve.compilation { Some(true) } else { None },
+                preuve.artiste.clone(),
             ));
-            let artiste = preuve.album_artist.or(preuve.artiste);
-            p.par_dossier.insert((artiste, Some(album)));
+            p.par_dossier
+                .insert((preuve.album_artist, preuve.artiste, Some(album)));
         }
         if pistes > 0 {
             tracing::info!(
@@ -690,7 +660,7 @@ impl TrackImporter {
             if !etiquete(sf) {
                 // Le dossier reste connu (il faut savoir qu'il existe), mais un
                 // fichier sans balises n'y apporte ni artiste ni titre d'album.
-                p.par_dossier.insert((None, None));
+                p.par_dossier.insert((None, None, None));
                 continue;
             }
             if let Some(album) = meta.album.as_deref() {
@@ -698,26 +668,59 @@ impl TrackImporter {
                     album.to_string(),
                     meta.album_artist.clone(),
                     meta.compilation,
+                    meta.artist.clone(),
                 ));
             }
-            let artist = meta.album_artist.as_deref().or(meta.artist.as_deref());
-            p.par_dossier
-                .insert((artist.map(str::to_string), meta.album.clone()));
+            p.par_dossier.insert((
+                meta.album_artist.clone(),
+                meta.artist.clone(),
+                meta.album.clone(),
+            ));
         }
 
         // 2. Recalculer les deux décisions sur le TOTAL accumulé. Ce sont les
         //    mêmes fonctions qu'avant, avec la seule population qui vaille :
         //    le dossier entier, tel que le scan l'a vu jusqu'ici.
         self.comp_decision = decide_compilation_albums(self.preuves.iter().flat_map(|(dir, p)| {
-            p.par_album
-                .iter()
-                .map(move |(album, aa, comp)| (dir.clone(), album.as_str(), aa.as_deref(), *comp))
+            p.par_album.iter().map(move |(album, aa, comp, artist)| {
+                (
+                    dir.clone(),
+                    album.as_str(),
+                    aa.as_deref(),
+                    *comp,
+                    artist.as_deref(),
+                )
+            })
         }));
         self.folder_comp = decide_compilation_folders(self.preuves.iter().flat_map(|(dir, p)| {
-            p.par_dossier
-                .iter()
-                .map(move |(artist, album)| (dir.clone(), artist.as_deref(), album.as_deref()))
+            p.par_dossier.iter().map(move |(aa, artist, album)| {
+                (
+                    dir.clone(),
+                    aa.as_deref(),
+                    artist.as_deref(),
+                    album.as_deref(),
+                )
+            })
         }));
+
+        // 2 bis. La graphie de reference des albums ecrits de plusieurs facons.
+        let mut graphies: HashMap<(String, String), Vec<&str>> = HashMap::new();
+        for (dir, p) in &self.preuves {
+            for (album, aa, _, _) in &p.par_album {
+                if let Some(aa) = aa.as_deref() {
+                    graphies
+                        .entry((dir.clone(), album.to_lowercase()))
+                        .or_default()
+                        .push(aa);
+                }
+            }
+        }
+        self.graphie_d_album = graphies
+            .into_iter()
+            .filter_map(|(k, v)| {
+                tune_core::library::regle_compilation::graphie_de_reference(v).map(|g| (k, g))
+            })
+            .collect();
 
         // 3. L'unique artiste d'album ÉTIQUETÉ de chaque dossier, quand il n'y
         //    en a qu'un : c'est lui qu'adoptera un fichier sans balises, au
@@ -731,7 +734,9 @@ impl TrackImporter {
                 let mut vus: Vec<&str> = p
                     .par_dossier
                     .iter()
-                    .filter_map(|(artist, _)| artist.as_deref().map(str::trim))
+                    .filter_map(|(aa, artist, _)| {
+                        aa.as_deref().or(artist.as_deref()).map(str::trim)
+                    })
                     .filter(|s| !s.is_empty())
                     .collect();
                 vus.sort_unstable();
@@ -772,45 +777,39 @@ impl TrackImporter {
             .get(&album_dir)
             .copied()
             .unwrap_or((false, false));
-        // 🔴 C1 (Bertrand, 14/09/2026) — LE TAG FAIT FOI, la forme des dossiers
-        // n'est qu'un REPLI. La règle tient ici, et nulle part ailleurs.
-        //
-        // Ce que ce code faisait AVANT, et qui en était l'inverse : `folder_va`
-        // ouvrait une chaîne de `||`, et le tag n'était consulté que dans le
-        // `unwrap_or_else` — donc jamais quand l'album figurait déjà dans la
-        // décision, ce qui est le cas ordinaire. Pire, la décision elle-même
-        // fondait le tag et la forme dans un même « ou » : le tag ne pouvait
-        // ainsi qu'ALLUMER le drapeau, jamais l'éteindre. Un coffret dont les
-        // fichiers portent `COMPILATION=0` était renversé en « compilation »
-        // par deux graphies du nom de son chef d'orchestre, sans que rien ne
-        // s'y oppose ni ne le dise.
+        // 🔴 LA règle (Bertrand, 25/09/2026 —
+        // `tune_core::library::regle_compilation`) : artiste d'album « Various
+        // Artists », OU deux artistes principaux distincts, OU MusicBrainz. La
+        // balise `COMPILATION=1` seule, sur un album d'un seul artiste, ne
+        // suffit plus (« Here & Gone ») ; `COMPILATION=0` fait toujours foi
+        // (C1, 14/09/2026) — et ce refus vaut aussi contre le signal du
+        // DOSSIER, comme avant.
         let verdict = meta.album.as_ref().and_then(|a| {
             self.comp_decision
                 .get(&(album_dir.clone(), a.to_lowercase()))
         });
-        // Le tag de CE fichier ne sert qu'en dernier recours : quand l'album
-        // n'est connu ni du scan ni de la base, il n'y a que lui.
-        let tag = verdict.and_then(|v| v.tag).or(meta.compilation);
-        let forme = verdict.map(|v| v.forme).unwrap_or(false)
-            || folder_va
-            || meta
-                .album_artist
-                .as_deref()
-                .map(is_various_artists)
-                .unwrap_or(false);
-        let (is_compilation, motif) = match tag {
-            // Le tag parle : il tranche, et dans les DEUX sens.
-            Some(oui) => (oui, MotifCompilation::Tag),
-            // Le tag se tait : la forme reprend la main. C'est le repli de C1.
-            None if forme => (true, MotifCompilation::FormeDesDossiers),
-            None => (false, MotifCompilation::Aucun),
+        // Le fichier SEUL ne sert qu'en dernier recours : quand l'album n'est
+        // connu ni du scan ni de la base, il n'y a que lui.
+        let jugement = verdict.map(|v| v.jugement).unwrap_or_else(|| {
+            let mut seul = IndicesCompilation::new();
+            if !meta.artist_from_path {
+                seul.ajouter_piste(meta.album_artist.as_deref(), meta.artist.as_deref());
+            }
+            seul.balise(meta.compilation);
+            seul.juger()
+        });
+        let par_le_dossier =
+            !jugement.compilation && folder_va && jugement.motif != MotifCompilation::BaliseNon;
+        let is_compilation = jugement.compilation || par_le_dossier;
+        let motif = if par_le_dossier {
+            "dossier_d_artistes_varies"
+        } else {
+            jugement.motif.as_str()
         };
 
-        // Le journal dit POURQUOI cet album est une compilation. Rien ne le
-        // disait : une bibliothèque entière rangée sous « Various Artists » ne
-        // laissait aucune trace de la règle qui l'y avait mise, et les trois
-        // signalements du chantier ont dû être reconstitués à la main. Une
-        // ligne par album et par scan — pas par piste.
+        // Le journal dit POURQUOI cet album est une compilation — ou pourquoi
+        // une balise `COMPILATION=1` a été écartée. Une ligne par album et par
+        // scan — pas par piste.
         if self
             .decisions_journalisees
             .insert((album_dir.clone(), meta.album.clone().unwrap_or_default()))
@@ -819,9 +818,8 @@ impl TrackImporter {
                 dossier = %album_dir,
                 album = %meta.album.as_deref().unwrap_or("<sans titre>"),
                 compilation = is_compilation,
-                motif = motif.as_str(),
-                tag = ?tag,
-                forme,
+                motif,
+                balise_ecartee = jugement.balise_ecartee,
                 "compilation_decidee"
             );
         }
@@ -878,7 +876,15 @@ impl TrackImporter {
                 .cloned()
                 .unwrap_or_else(|| "Various Artists".to_string())
         } else if let Some(aa) = meta.album_artist.as_deref() {
-            aa.to_string()
+            // #3855 : une graphie pour tout l'album, s'il en porte plusieurs.
+            meta.album
+                .as_ref()
+                .and_then(|a| {
+                    self.graphie_d_album
+                        .get(&(album_dir.clone(), a.to_lowercase()))
+                })
+                .cloned()
+                .unwrap_or_else(|| aa.to_string())
         } else if meta.artist_from_path {
             // Les balises de ce fichier n'ont pas pu être lues : son « artiste »
             // est le nom d'un dossier. Il prend l'artiste d'album étiqueté du
@@ -1636,73 +1642,63 @@ mod tests {
 
     #[test]
     fn decide_compilation_folders_flags_mixed_folders_only() {
+        // Items : (dossier, artiste d'album, artiste de piste, titre d'album).
+        let dossier = |d: &str, pistes: &[(&'static str, &'static str)]| {
+            decide_compilation_folders(
+                pistes
+                    .iter()
+                    .map(|(artiste, album)| (d.to_string(), None, Some(*artiste), Some(*album)))
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            )
+            .get(d)
+            .copied()
+        };
         // JP Borderies: a hand-made compilation — several artists AND several
         // album tags in one folder → Various Artists + folder-name title.
-        let mixed = decide_compilation_folders(
-            [
-                (
-                    "/comp".to_string(),
-                    Some("Angela Brown"),
-                    Some("Just Fabulous - Live"),
-                ),
-                (
-                    "/comp".to_string(),
-                    Some("Aretha Franklin"),
-                    Some("Amazing Grace"),
-                ),
-                (
-                    "/comp".to_string(),
-                    Some("Nina Simone"),
-                    Some("Pastel Blues"),
-                ),
-            ]
-            .into_iter(),
+        let mixed = dossier(
+            "/comp",
+            &[
+                ("Angela Brown", "Just Fabulous - Live"),
+                ("Aretha Franklin", "Amazing Grace"),
+                ("Nina Simone", "Pastel Blues"),
+            ],
         );
-        assert_eq!(mixed.get("/comp"), Some(&(true, true)));
+        assert_eq!(mixed, Some((true, true)));
 
         // Genuine various-artists album: many artists, ONE album tag ("Woodstock")
         // → VA artist, but KEEP the album title (use_folder_title = false).
-        let va_one_tag = decide_compilation_folders(
-            [
-                (
-                    "/woodstock".to_string(),
-                    Some("Jimi Hendrix"),
-                    Some("Woodstock"),
-                ),
-                ("/woodstock".to_string(), Some("Santana"), Some("Woodstock")),
-            ]
-            .into_iter(),
+        let va_one_tag = dossier(
+            "/woodstock",
+            &[("Jimi Hendrix", "Woodstock"), ("Santana", "Woodstock")],
         );
-        assert_eq!(va_one_tag.get("/woodstock"), Some(&(true, false)));
+        assert_eq!(va_one_tag, Some((true, false)));
 
         // Single-artist multi-disc: one artist, two album tags → untouched.
-        let multidisc = decide_compilation_folders(
-            [
-                (
-                    "/album".to_string(),
-                    Some("Pink Floyd"),
-                    Some("The Wall (Disc 1)"),
-                ),
-                (
-                    "/album".to_string(),
-                    Some("Pink Floyd"),
-                    Some("The Wall (Disc 2)"),
-                ),
-            ]
-            .into_iter(),
+        let multidisc = dossier(
+            "/album",
+            &[
+                ("Pink Floyd", "The Wall (Disc 1)"),
+                ("Pink Floyd", "The Wall (Disc 2)"),
+            ],
         );
-        assert_eq!(multidisc.get("/album"), Some(&(false, false)));
+        assert_eq!(multidisc, Some((false, false)));
 
         // Plain single-artist single-album folder → untouched.
-        let plain = decide_compilation_folders(
-            [(
-                "/kob".to_string(),
-                Some("Miles Davis"),
-                Some("Kind of Blue"),
-            )]
-            .into_iter(),
+        let plain = dossier("/kob", &[("Miles Davis", "Kind of Blue")]);
+        assert_eq!(plain, Some((false, false)));
+
+        // 25/09/2026 — un artiste et ses invités : UN seul artiste principal,
+        // le dossier n'est plus basculé en « Various Artists ».
+        let invites = dossier(
+            "/santana",
+            &[
+                ("Santana", "Supernatural"),
+                ("Santana feat. Rob Thomas", "Supernatural"),
+                ("Santana & Everlast", "Supernatural"),
+            ],
         );
-        assert_eq!(plain.get("/kob"), Some(&(false, false)));
+        assert_eq!(invites, Some((false, false)));
     }
 
     #[test]

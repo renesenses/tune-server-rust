@@ -2309,6 +2309,22 @@ pub(crate) async fn spawn_library_scan_confirmee(
             tracing::info!(orphan_albums, "post_scan_orphan_albums_cleaned");
         }
 
+        // LA règle « compilation » (25/09/2026) sur ce que la base garde : le
+        // scan ne sait que LEVER le drapeau, cette passe baisse celui des
+        // albums d'un seul artiste marqués sous l'ancienne règle. Lecture de
+        // la base seule, idempotente, éditions manuelles respectées.
+        if !scan_cancel_requested() {
+            match tune_core::db::album_repo::AlbumRepo::with_backend(db.clone())
+                .recalculer_les_compilations()
+            {
+                Ok(bilan) if bilan.baisses > 0 => {
+                    tracing::info!(?bilan, "post_scan_compilations_recalculees")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "post_scan_compilations_recalcul_echoue"),
+            }
+        }
+
         // Une réparation d'attribution ne se fonde que sur une vue complète et
         // saine de la bibliothèque. Un scan ciblé, annulé ou privé d'une racine
         // n'a pas assez d'information pour conclure sans risque (#2458).
@@ -3742,17 +3758,18 @@ mod tests {
             // Ces temoins parlent en « drapeau leve / pas de drapeau », ce qui
             // est exactement `Some(true)` / `None` depuis que le tag porte
             // trois etats (C1).
+            // Pas d'artiste de piste : l'artiste d'album en tient lieu.
             (
                 dir.to_string(),
                 *album,
                 *aa,
                 if *flag { Some(true) } else { None },
+                None,
             )
         }))
         .into_iter()
-        // La regle C1 ramenee au `bool` que ces temoins interrogent : le tag
-        // tranche s'il existe, la forme des dossiers seulement sinon.
-        .map(|(k, v)| (k, v.tag.unwrap_or(v.forme)))
+        // LA regle (25/09/2026) ramenee au `bool` que ces temoins interrogent.
+        .map(|(k, v)| (k, v.jugement.compilation))
         .collect()
     }
 
@@ -3811,13 +3828,22 @@ mod tests {
         assert!(is_comp(&m, "/m/comp/hits", "Now 100"));
     }
 
+    /// Bertrand, 25/09/2026 : la balise `COMPILATION=1` SEULE, sur un album
+    /// d'un seul artiste, ne suffit plus (« Here & Gone », David Sanborn).
+    /// Ce témoin disait l'inverse (« le drapeau l'emporte ») ; il est retourné.
     #[test]
-    fn compilation_flag_wins_even_with_consistent_artist() {
+    fn la_balise_seule_ne_suffit_plus_sur_un_seul_artiste() {
         let m = decide(&[
             ("/m/comp/ost", "OST", Some("Hans Zimmer"), true),
             ("/m/comp/ost", "OST", Some("Hans Zimmer"), false),
         ]);
-        assert!(is_comp(&m, "/m/comp/ost", "OST"));
+        assert!(!is_comp(&m, "/m/comp/ost", "OST"));
+        // Avec des artistes variés, la balise ne gêne rien : compilation.
+        let m = decide(&[
+            ("/m/comp/mix", "Mix", Some("Hans Zimmer"), true),
+            ("/m/comp/mix", "Mix", Some("John Williams"), true),
+        ]);
+        assert!(is_comp(&m, "/m/comp/mix", "Mix"));
     }
 
     #[test]
