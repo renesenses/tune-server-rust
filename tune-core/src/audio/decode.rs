@@ -27,7 +27,18 @@ use super::dsd_to_pcm::choose_output_rate;
 /// drifted once: the log messages announced `_10s` long after it became 300,
 /// which cost a wrong diagnosis on #1323. A name cannot go stale; a number in
 /// a message can.
-const SEND_TIMEOUT_SECS: u64 = 300;
+///
+/// 🔴 #4917 — jamais MOINS que la vie d'une session inactive. Une sortie
+/// locale en pause (mode partagé) garde sa connexion et cesse de lire : à
+/// 300 s, le décodeur rendait la main comme à la fin du fichier, la session
+/// fermait son canal, et à la reprise la piste s'arrêtait après le reliquat du
+/// canal (~23 s) — « R and R » coupé à 7:51 sur 11:52 après 22 min de pause
+/// (fil 1915). La session, elle, survit [`SESSION_IDLE_TIMEOUT`] sans un octet
+/// servi ; c'est le ramasse-miettes qui libère une session orpheline (son
+/// récepteur tombe, `send` échoue et le décodeur sort aussitôt), pas ce délai.
+///
+/// [`SESSION_IDLE_TIMEOUT`]: crate::http::streamer::SESSION_IDLE_TIMEOUT
+const SEND_TIMEOUT_SECS: u64 = crate::http::streamer::SESSION_IDLE_TIMEOUT.as_secs();
 
 /// Round a preferred PCM batch size down to a whole number of interleaved frames.
 ///
@@ -4110,6 +4121,10 @@ fn send_dop_chunk(
 #[cfg(test)]
 #[path = "dop_terminal_tests_2369.rs"]
 mod dop_terminal_tests_2369;
+
+#[cfg(test)]
+#[path = "pause_longue_4917_tests.rs"]
+mod pause_longue_4917_tests;
 
 /// Decode a DSD file (DSF or DFF) to PCM using streaming converter.
 ///

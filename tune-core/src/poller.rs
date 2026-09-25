@@ -162,6 +162,9 @@ const GAPLESS_WINDOW_MS: u64 = 30_000;
 ///
 /// Confortablement sous les 300 s : repreparer coute un transcodage, se
 /// tromper coute un blanc et une zone arretee.
+///
+/// #4917 : ce delai d'abandon suit desormais `SESSION_IDLE_TIMEOUT` (30 min),
+/// les 300 s ci-dessus sont historiques. 200 s reste en deca : prudent, inchange.
 const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
 
 /// Fenêtre minimale entre deux relances automatiques « démarrage mort »
