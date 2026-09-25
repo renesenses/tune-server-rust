@@ -9,9 +9,9 @@
 //! Ce banc éprouve le contrat corrigé :
 //! - un remplacement par une piste LOCALE est ÉCRIT dans `playlist_tracks`, à
 //!   la même position, et `applied` le dit ;
-//! - une piste de service est REFUSÉE nommément (`rejected` + motif), parce
-//!   que `playlist_tracks.track_id` est `NOT NULL REFERENCES tracks(id)` —
-//!   doctrine #1848 ;
+//! - une piste de service est REFUSÉE nommément (`rejected` + motif) : la
+//!   récupération ne remplace que par une piste de la bibliothèque (depuis
+//!   #4889, un titre de service entre par « Ajouter à une playlist ») ;
 //! - `still_missing` est recompté APRÈS les écritures, sur la base ;
 //! - un corps absent ou vide est un 400 explicite, pas un recomptage ;
 //! - quand rien n'a pu être appliqué, la réponse est un 422 qui porte le même
@@ -211,8 +211,11 @@ async fn apres_remplacement_la_verification_ne_liste_plus_la_piste_manquante() {
     assert_eq!(apres["available"], 2, "{apres}");
 }
 
-/// Une piste de service ne peut pas entrer dans `playlist_tracks` (#1848) :
-/// le refus est nommé, par piste, et RIEN n'est écrit.
+/// La récupération ne remplace une piste manquante que par une piste de la
+/// bibliothèque. Depuis #4889 une playlist PEUT porter un titre de service —
+/// par le geste « Ajouter à une playlist », pas par ce remplacement, qui n'a
+/// ni le titre ni l'artiste à écrire : le refus reste nommé, par piste, et
+/// RIEN n'est écrit.
 #[tokio::test]
 async fn une_piste_de_service_est_refusee_nommement_et_rien_n_est_ecrit() {
     let b = banc().await;

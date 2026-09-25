@@ -217,6 +217,11 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4853 -- --nocapture
 
+      - name: Titres de service dans les playlists sur PostgreSQL (#4889)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

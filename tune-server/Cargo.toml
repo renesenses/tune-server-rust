@@ -1090,3 +1090,12 @@ required-features = ["plugins-wasm"]
 name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
+
+# 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
+# JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
+# cible ne le déclarait. Il garde maintenant le contrat des titres de service
+# dans une playlist Tune (ajout, liste, réordonnancement, lecture, copie,
+# export) — il fallait qu'il tourne.
+[[test]]
+name = "playlists_pistes_de_service"
+path = "tests/playlists_pistes_de_service.rs"
