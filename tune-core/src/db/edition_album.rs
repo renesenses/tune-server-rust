@@ -44,8 +44,19 @@
 //!
 //! ⚠️ Un « réinitialiser la bibliothèque » (`DELETE FROM albums`) emporte
 //! `album_metadata`, donc ces éditions, comme il emporte déjà toutes les
-//! autres éditions manuelles. Rien n'est écrit dans les FICHIERS dans cette
-//! tranche.
+//! autres éditions manuelles.
+//!
+//! # Écrire dans les fichiers (tranche 4)
+//!
+//! [`balises_effectives`] rend, piste par piste, les valeurs que la base tient
+//! — c'est ce que `POST /library/albums/{id}/edition/write-tags` écrit dans les
+//! balises (`metadata::tag_writer::ecrire_balises_edition`). Les marqueurs
+//! (`edition_manuelle`, `edition_pistes`) sont GARDÉS après l'écriture : les
+//! fichiers portent désormais les mêmes valeurs, mais le marqueur protège
+//! aussi de ce que les balises ne disent pas (année, label, genre, type de
+//! sortie, mode de compilation forcé), des enrichissements distants, de la
+//! passe des coffrets et du DOSSIER, qui tranche le numéro de disque au scan
+//! (#4471). Un marqueur qui dit la même chose que le fichier ne coûte rien.
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -60,6 +71,7 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::Track;
 use crate::TuneError;
 use crate::library::regle_compilation::IndicesCompilation;
+use crate::metadata::tag_writer::{BalisesEdition, DrapeauAEcrire};
 
 /// Clé, dans `album_metadata`, de la disposition et des renommages de pistes
 /// tenus à la main. Valeur : un [`EditionPistes`] en JSON.
@@ -454,6 +466,11 @@ pub struct VueEdition {
     pub album: VueAlbum,
     pub discs: Vec<VueDisque>,
     pub tracks: Vec<VuePiste>,
+    /// Ce serveur sait reporter l'édition dans les balises des fichiers
+    /// (`POST …/edition/write-tags`, tranche 4). Toujours `true` ici : c'est
+    /// la SONDE du bouton « Écrire dans les fichiers » — un serveur qui n'a
+    /// que les tranches 1 à 3 ne l'envoie pas, et le bouton n'apparaît pas.
+    pub ecriture_balises: bool,
 }
 
 /// Les noms de `edition_manuelle` rendus sous ceux du contrat de l'écran.
@@ -561,6 +578,7 @@ pub fn lire_vue(db: &Arc<dyn DbBackend>, album_id: i64) -> Result<Option<VueEdit
         },
         discs,
         tracks,
+        ecriture_balises: true,
     }))
 }
 
@@ -1193,6 +1211,135 @@ pub fn detacher(db: &Arc<dyn DbBackend>, album_id: i64, numero: i32) -> Result<i
         "disque_detache"
     );
     Ok(nouveau)
+}
+
+// ---------------------------------------------------------------------------
+// Écrire dans les fichiers — tranche 4 (GO de Bertrand du 25/09/2026)
+// ---------------------------------------------------------------------------
+
+/// Une piste de l'album et les balises qu'elle devrait porter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PisteABaliser {
+    pub id: i64,
+    /// `tracks.file_path` — `None` pour une piste de feuille CUE.
+    pub chemin: Option<String>,
+    /// Piste découpée dans une image (feuille CUE) : jamais écrite, les
+    /// balises de l'image sont celles de TOUTES ses pistes.
+    pub cue: bool,
+    /// `tracks.source` : seules les pistes `local` ont un fichier à nous.
+    pub source: String,
+    pub balises: BalisesEdition,
+}
+
+/// Les valeurs EFFECTIVES de chaque piste d'un album, telles que la base les
+/// tient après le mode « Modifier » — `None` si l'album n'existe pas.
+///
+/// - `ALBUM` / `ALBUMARTIST` : `albums.title` et le nom de son artiste ;
+/// - `DISCNUMBER` / `TRACKNUMBER` / `DISCSUBTITLE` / `TITLE` / `ARTIST` : la
+///   ligne piste ;
+/// - `DISCTOTAL` : le nombre de disques DISTINCTS de l'album ; `TRACKTOTAL` :
+///   le nombre de pistes du disque de la piste ;
+/// - `COMPILATION` : `1` si l'album est une compilation effective ET compte au
+///   moins deux artistes de piste ; s'il n'en est pas une, `0` quand il compte
+///   plusieurs artistes (sans quoi le scan suivant le redécouvrirait d'après
+///   eux), retrait sinon ; compilation effective d'un SEUL artiste : balise
+///   laissée telle quelle — on ne pose pas `COMPILATION=1` sur l'album d'un
+///   seul artiste.
+pub fn balises_effectives(
+    db: &Arc<dyn DbBackend>,
+    album_id: i64,
+) -> Result<Option<Vec<PisteABaliser>>, TuneError> {
+    let Some(album) = AlbumRepo::with_backend(db.clone()).get(album_id)? else {
+        return Ok(None);
+    };
+    let p1 = marque(db.engine(), 1);
+    let rows = db.query_many_strong(
+        &format!(
+            "SELECT t.id, t.file_path, t.cue_media_path, t.cue_start_ms, t.source, t.title, \
+             ar.name, t.disc_number, t.track_number, t.disc_subtitle \
+             FROM tracks t LEFT JOIN artists ar ON ar.id = t.artist_id \
+             WHERE t.album_id = {p1} \
+             ORDER BY COALESCE(t.disc_number, 1), COALESCE(t.track_number, 0), t.id"
+        ),
+        &[&album_id as &dyn ToSqlValue],
+    )?;
+    struct Brut {
+        id: i64,
+        chemin: Option<String>,
+        cue: bool,
+        source: String,
+        titre: String,
+        artiste: Option<String>,
+        disque: u32,
+        numero: u32,
+        nom_disque: Option<String>,
+    }
+    let texte = |v: Option<&SqlValue>| {
+        v.and_then(|v| v.as_string())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let brutes: Vec<Brut> = rows
+        .iter()
+        .filter_map(|r| {
+            Some(Brut {
+                id: r.first()?.as_i64()?,
+                chemin: texte(r.get(1)),
+                cue: texte(r.get(2)).is_some() || r.get(3).and_then(|v| v.as_i64()).is_some(),
+                source: texte(r.get(4)).unwrap_or_else(|| "local".into()),
+                titre: texte(r.get(5)).unwrap_or_default(),
+                artiste: texte(r.get(6)),
+                disque: r.get(7).and_then(|v| v.as_i64()).unwrap_or(1).max(1) as u32,
+                numero: r.get(8).and_then(|v| v.as_i64()).unwrap_or(0).max(0) as u32,
+                nom_disque: texte(r.get(9)),
+            })
+        })
+        .collect();
+    let disques: BTreeSet<u32> = brutes.iter().map(|b| b.disque).collect();
+    let mut par_disque: HashMap<u32, u32> = HashMap::new();
+    for b in &brutes {
+        *par_disque.entry(b.disque).or_default() += 1;
+    }
+    let artistes: HashSet<String> = brutes
+        .iter()
+        .filter_map(|b| b.artiste.as_deref().map(str::to_lowercase))
+        .collect();
+    let plusieurs = artistes.len() >= 2;
+    let compilation = match (album.is_compilation, plusieurs) {
+        (true, true) => Some(DrapeauAEcrire::Vrai),
+        (true, false) => None,
+        (false, true) => Some(DrapeauAEcrire::Faux),
+        (false, false) => Some(DrapeauAEcrire::Retrait),
+    };
+    let artiste_album = album
+        .artist_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(Some(
+        brutes
+            .into_iter()
+            .map(|b| PisteABaliser {
+                id: b.id,
+                chemin: b.chemin,
+                cue: b.cue,
+                source: b.source,
+                balises: BalisesEdition {
+                    album: album.title.clone(),
+                    artiste_album: artiste_album.clone(),
+                    disque: b.disque,
+                    disques: disques.len() as u32,
+                    nom_disque: b.nom_disque,
+                    piste: b.numero,
+                    pistes: par_disque.get(&b.disque).copied().unwrap_or(0),
+                    titre: b.titre,
+                    artiste: b.artiste,
+                    compilation,
+                },
+            })
+            .collect(),
+    ))
 }
 
 #[cfg(test)]

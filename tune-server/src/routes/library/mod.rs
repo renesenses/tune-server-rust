@@ -20,6 +20,7 @@ pub(crate) mod credits_mb;
 mod duplicates;
 // Le mode « Modifier » de la fiche album (GO du 25/09/2026).
 mod edition;
+mod edition_balises;
 mod enrich;
 mod facets;
 mod folder_facet;
@@ -294,6 +295,12 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/{id}/edition",
             get(edition::lire).put(edition::modifier),
+        )
+        // Tranche 4 : reporter l'édition dans les BALISES des fichiers
+        // (`{ dry_run }` rend le plan sans rien écrire).
+        .route(
+            "/albums/{id}/edition/write-tags",
+            post(edition_balises::ecrire_balises),
         )
         .route("/albums/{id}/discs/attach", post(edition::attacher))
         .route(

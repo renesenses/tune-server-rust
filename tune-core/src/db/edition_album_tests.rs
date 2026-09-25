@@ -762,3 +762,85 @@ fn null_explicite_et_champ_absent_se_distinguent() {
     assert_eq!(d.title, Some(None));
     assert_eq!(d.number, None);
 }
+
+/// Tranche 4 — les valeurs que « Écrire dans les fichiers » écrira : celles de
+/// la BASE après l'édition, disque par disque, et la règle du drapeau
+/// COMPILATION (1 / 0 / retrait / laissé tel quel).
+pub(crate) fn scenario_balises_effectives(db: &Arc<dyn DbBackend>) {
+    use crate::metadata::tag_writer::DrapeauAEcrire;
+    nettoyer(db);
+    let k = poser_koln(db);
+    // b[1] est une piste de feuille CUE : pas de fichier à elle.
+    db.execute(
+        &format!(
+            "UPDATE tracks SET file_path = NULL, cue_media_path = {}, cue_start_ms = 0 \
+             WHERE id = {}",
+            marque(db.engine(), 1),
+            marque(db.engine(), 2)
+        ),
+        &[&"/e/box/cd2/image.flac" as &dyn ToSqlValue, &k.b[1]],
+    )
+    .unwrap();
+    modifier(
+        db,
+        k.album,
+        json!({
+            "title": "Köln 1975",
+            "compilation_mode": "non",
+            "tracks": [ { "id": k.a[1], "artist_name": "Gary Peacock" } ]
+        }),
+    )
+    .unwrap();
+
+    assert!(balises_effectives(db, 999_999).unwrap().is_none());
+    let p = balises_effectives(db, k.album).unwrap().unwrap();
+    assert_eq!(p.len(), 5);
+    let de = |id: i64| p.iter().find(|x| x.id == id).expect("piste").clone();
+    let a1 = de(k.a[1]);
+    assert_eq!(a1.balises.album, "Köln 1975");
+    assert_eq!(a1.balises.artiste_album.as_deref(), Some("Keith Jarrett"));
+    assert_eq!(a1.balises.artiste.as_deref(), Some("Gary Peacock"));
+    assert_eq!(a1.balises.titre, "piste 2");
+    assert_eq!((a1.balises.disque, a1.balises.disques), (1, 2));
+    assert_eq!((a1.balises.piste, a1.balises.pistes), (2, 3));
+    assert_eq!(a1.balises.nom_disque.as_deref(), Some("Première partie"));
+    assert_eq!(a1.chemin.as_deref(), Some("/e/box/cd1/02.flac"));
+    assert!(!a1.cue);
+    assert_eq!(a1.source, "local");
+    // « non » et deux artistes : 0, pour que le scan ne le redécouvre pas.
+    assert_eq!(a1.balises.compilation, Some(DrapeauAEcrire::Faux));
+    let b0 = de(k.b[0]);
+    assert_eq!((b0.balises.disque, b0.balises.pistes), (2, 2));
+    assert_eq!(b0.balises.nom_disque, None);
+    let b1 = de(k.b[1]);
+    assert!(b1.cue, "la piste CUE doit être signalée");
+    assert_eq!(b1.chemin, None);
+
+    modifier(db, k.album, json!({ "compilation_mode": "oui" })).unwrap();
+    let p = balises_effectives(db, k.album).unwrap().unwrap();
+    assert!(
+        p.iter()
+            .all(|x| x.balises.compilation == Some(DrapeauAEcrire::Vrai))
+    );
+
+    // Un seul artiste : jamais COMPILATION=1, balise laissée telle quelle.
+    modifier(
+        db,
+        k.album,
+        json!({ "tracks": [ { "id": k.a[1], "artist_name": "Keith Jarrett" } ] }),
+    )
+    .unwrap();
+    let p = balises_effectives(db, k.album).unwrap().unwrap();
+    assert!(p.iter().all(|x| x.balises.compilation.is_none()));
+    modifier(db, k.album, json!({ "compilation_mode": "non" })).unwrap();
+    let p = balises_effectives(db, k.album).unwrap().unwrap();
+    assert!(
+        p.iter()
+            .all(|x| x.balises.compilation == Some(DrapeauAEcrire::Retrait))
+    );
+}
+
+#[test]
+fn balises_effectives_sur_sqlite() {
+    scenario_balises_effectives(&sqlite());
+}

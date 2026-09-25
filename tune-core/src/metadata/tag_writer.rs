@@ -173,6 +173,25 @@ fn ecrire_par_tag_generique(
     file_path: &str,
     appliquer: impl FnOnce(&mut lofty::tag::Tag) -> usize,
 ) -> Result<usize, String> {
+    ecrire_par_tag(file_path, false, appliquer)
+}
+
+/// [`ecrire_par_tag_generique`], avec une option : `promouvoir`.
+///
+/// Un WAV ou un AIFF qui ne porte QUE des balises secondaires (RIFF INFO,
+/// blocs texte AIFF) n'a ni ALBUMARTIST, ni DISCNUMBER, ni DISCSUBTITLE, ni
+/// COMPILATION : lofty y refuse ces clés sans le dire. Avec `promouvoir`,
+/// l'étiquette PRIMAIRE du conteneur (ID3v2) est créée à partir de la
+/// secondaire — tous ses champs et ses images recopiés — et c'est elle qui est
+/// éditée ; la secondaire reste telle quelle. Le lecteur du scan lit la
+/// primaire d'abord : il retrouve les anciens champs ET les nouveaux.
+/// Réservé à « Écrire dans les fichiers » (tranche 4), qui VÉRIFIE ensuite
+/// la copie ; les autres écrivains gardent leur comportement.
+fn ecrire_par_tag(
+    file_path: &str,
+    promouvoir: bool,
+    appliquer: impl FnOnce(&mut lofty::tag::Tag) -> usize,
+) -> Result<usize, String> {
     use std::io::Seek;
 
     use lofty::config::ParseOptions;
@@ -254,8 +273,24 @@ fn ecrire_par_tag_generique(
             let mut tagged =
                 lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
             let tag_type = tagged.primary_tag_type();
-            if tagged.primary_tag().is_none() && tagged.first_tag().is_none() {
-                tagged.insert_tag(lofty::tag::Tag::new(tag_type));
+            if tagged.primary_tag().is_none() {
+                let nouvelle = match tagged.first_tag() {
+                    Some(secondaire) if promouvoir => {
+                        let mut primaire = lofty::tag::Tag::new(tag_type);
+                        for item in secondaire.items() {
+                            primaire.insert(item.clone());
+                        }
+                        for image in secondaire.pictures() {
+                            primaire.push_picture(image.clone());
+                        }
+                        Some(primaire)
+                    }
+                    Some(_) => None,
+                    None => Some(lofty::tag::Tag::new(tag_type)),
+                };
+                if let Some(t) = nouvelle {
+                    tagged.insert_tag(t);
+                }
             }
             let has_primary = tagged.primary_tag().is_some();
             let tag = if has_primary {
@@ -663,6 +698,413 @@ pub(crate) fn write_metadata_to_file_sync(
         file_path: file_path.into(),
         fields_written: count,
     })
+}
+
+// ---------------------------------------------------------------------------
+// « Écrire dans les fichiers » — tranche 4 du chantier « édition des albums,
+// compilations et coffrets » (GO de Bertrand du 25/09/2026).
+//
+// Reporte dans les BALISES ce que le mode « Modifier » de la fiche album a
+// posé EN BASE. Même écrivain que tout le reste du module
+// (`ecrire_par_tag_generique` : Vorbis par `split_tag`/`merge_tag`, pochettes
+// et champs maison conservés ; ID3v2 / MP4 / APE par le `Tag` générique),
+// mais JAMAIS en place : sur une copie, dans le même dossier, qui ne remplace
+// l'original qu'après avoir prouvé que son audio est identique octet pour
+// octet ([`super::empreinte_audio`]).
+// ---------------------------------------------------------------------------
+
+/// Préfixe des copies de travail : le scanner et le surveillant les écartent
+/// (`scanner::is_tune_temp_file`), elles ne deviennent jamais des pistes.
+pub const PREFIXE_COPIE_DE_TRAVAIL: &str = "tune-balises-";
+
+/// Les valeurs EFFECTIVES d'une piste, telles que la base les tient.
+///
+/// `None` sur un champ facultatif : « ne pas toucher » — sauf
+/// [`Self::nom_disque`], où `None` RETIRE la balise (un disque sans nom en
+/// base ne doit pas garder, dans le fichier, un nom que l'utilisateur a
+/// effacé).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BalisesEdition {
+    pub album: String,
+    pub artiste_album: Option<String>,
+    pub disque: u32,
+    pub disques: u32,
+    pub nom_disque: Option<String>,
+    pub piste: u32,
+    pub pistes: u32,
+    pub titre: String,
+    pub artiste: Option<String>,
+    /// `Some(true)` : `COMPILATION=1` ; `Some(false)` : pas une compilation
+    /// (voir [`DrapeauAEcrire`]) ; `None` : ne pas toucher.
+    pub compilation: Option<DrapeauAEcrire>,
+}
+
+/// Ce que devient la balise COMPILATION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrapeauAEcrire {
+    /// `1` (`TCMP=1`, `cpil=true`, `COMPILATION=1`).
+    Vrai,
+    /// `0` : l'album a plusieurs artistes mais l'utilisateur dit « pas une
+    /// compilation » — le `0` porte cette intention jusqu'au scan suivant, qui
+    /// sinon la redécouvrirait d'après les artistes.
+    Faux,
+    /// Retrait : un album ordinaire n'a pas besoin de drapeau.
+    Retrait,
+}
+
+/// Un champ qui change : nom stable (celui de la balise Vorbis), avant, après.
+/// `apres: None` = balise retirée.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Changement {
+    pub champ: &'static str,
+    pub avant: Option<String>,
+    pub apres: Option<String>,
+}
+
+/// Les extensions que « Écrire dans les fichiers » sait écrire ET garder :
+/// celles que lofty écrit et dont [`super::empreinte_audio`] sait isoler
+/// l'audio. DSF et DFF n'y sont pas : lofty 0.24 ne connaît pas le DSF (la
+/// lecture passe par un lecteur ID3 maison, voir `metadata::mod`), et aucun
+/// écrivain du dépôt n'y écrit.
+pub fn format_balises_edition(file_path: &str) -> bool {
+    let p = Path::new(file_path);
+    super::empreinte_audio::format_empreinte_gere(p) && !is_unsupported_format(file_path)
+}
+
+fn texte(v: Option<&str>) -> Option<String> {
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Ce qui changerait sur ce `Tag` pour qu'il porte `b`.
+fn changements(tag: &lofty::tag::Tag, b: &BalisesEdition) -> Vec<Changement> {
+    let mut v = Vec::new();
+    let mut texte_requis = |champ: &'static str, avant: Option<String>, apres: Option<&str>| {
+        let apres = texte(apres);
+        if apres.is_some() && avant != apres {
+            v.push(Changement {
+                champ,
+                avant,
+                apres,
+            });
+        }
+    };
+    texte_requis("ALBUM", texte(tag.album().as_deref()), Some(&b.album));
+    texte_requis(
+        "ALBUMARTIST",
+        texte(tag.get_string(ItemKey::AlbumArtist)),
+        b.artiste_album.as_deref(),
+    );
+    texte_requis("TITLE", texte(tag.title().as_deref()), Some(&b.titre));
+    texte_requis(
+        "ARTIST",
+        texte(tag.artist().as_deref()),
+        b.artiste.as_deref(),
+    );
+    let mut nombre = |champ: &'static str, avant: Option<u32>, apres: u32| {
+        if apres > 0 && avant != Some(apres) {
+            v.push(Changement {
+                champ,
+                avant: avant.map(|n| n.to_string()),
+                apres: Some(apres.to_string()),
+            });
+        }
+    };
+    nombre("DISCNUMBER", tag.disk(), b.disque);
+    nombre("DISCTOTAL", tag.disk_total(), b.disques);
+    nombre("TRACKNUMBER", tag.track(), b.piste);
+    nombre("TRACKTOTAL", tag.track_total(), b.pistes);
+    let nom_avant = texte(tag.get_string(ItemKey::SetSubtitle));
+    let nom_apres = texte(b.nom_disque.as_deref());
+    if nom_avant != nom_apres {
+        v.push(Changement {
+            champ: "DISCSUBTITLE",
+            avant: nom_avant,
+            apres: nom_apres,
+        });
+    }
+    let brut = texte(tag.get_string(ItemKey::FlagCompilation));
+    let lu = super::lire_drapeau_compilation(brut.as_deref()).tri_etat();
+    let voulu = match b.compilation {
+        Some(DrapeauAEcrire::Vrai) if lu != Some(true) => Some(Some("1".to_string())),
+        Some(DrapeauAEcrire::Faux) if lu != Some(false) => Some(Some("0".to_string())),
+        Some(DrapeauAEcrire::Retrait) if brut.is_some() => Some(None),
+        _ => None,
+    };
+    if let Some(apres) = voulu {
+        v.push(Changement {
+            champ: "COMPILATION",
+            avant: brut,
+            apres,
+        });
+    }
+    v
+}
+
+/// Pose `changements` sur le `Tag`. Rend combien de champs ont été posés.
+fn poser(tag: &mut lofty::tag::Tag, changements: &[Changement]) -> usize {
+    for c in changements {
+        let nombre = || c.apres.as_deref().and_then(|s| s.parse::<u32>().ok());
+        match (c.champ, c.apres.as_deref()) {
+            ("ALBUM", Some(s)) => tag.set_album(s.to_string()),
+            ("ALBUMARTIST", Some(s)) => {
+                tag.insert_text(ItemKey::AlbumArtist, s.to_string());
+            }
+            ("TITLE", Some(s)) => tag.set_title(s.to_string()),
+            ("ARTIST", Some(s)) => tag.set_artist(s.to_string()),
+            ("DISCNUMBER", _) => {
+                if let Some(n) = nombre() {
+                    tag.set_disk(n)
+                }
+            }
+            ("DISCTOTAL", _) => {
+                if let Some(n) = nombre() {
+                    tag.set_disk_total(n)
+                }
+            }
+            ("TRACKNUMBER", _) => {
+                if let Some(n) = nombre() {
+                    tag.set_track(n)
+                }
+            }
+            ("TRACKTOTAL", _) => {
+                if let Some(n) = nombre() {
+                    tag.set_track_total(n)
+                }
+            }
+            ("DISCSUBTITLE", Some(s)) => {
+                tag.insert_text(ItemKey::SetSubtitle, s.to_string());
+            }
+            ("DISCSUBTITLE", None) => tag.remove_key(ItemKey::SetSubtitle),
+            ("COMPILATION", Some(s)) => {
+                tag.insert_text(ItemKey::FlagCompilation, s.to_string());
+            }
+            ("COMPILATION", None) => tag.remove_key(ItemKey::FlagCompilation),
+            _ => {}
+        }
+    }
+    changements.len()
+}
+
+/// Le `Tag` que l'écrivain éditerait, lu sans rien écrire : même choix que
+/// `ecrire_par_tag_generique` (Vorbis pour FLAC/Ogg/Opus, sinon l'étiquette
+/// primaire, sinon la première).
+fn tag_lu(file_path: &str) -> Result<lofty::tag::Tag, String> {
+    let tagged = lofty::read_from_path(file_path).map_err(|e| format!("lofty read: {e}"))?;
+    Ok(tagged
+        .primary_tag()
+        .or_else(|| tagged.first_tag())
+        .cloned()
+        .unwrap_or_else(|| lofty::tag::Tag::new(tagged.primary_tag_type())))
+}
+
+/// Le plan d'une piste : ce que l'écriture changerait, sans rien écrire.
+///
+/// `file_path` : la graphie de la base ; la graphie du disque est retrouvée
+/// ici (#1865).
+pub fn plan_balises_edition(
+    file_path: &str,
+    b: &BalisesEdition,
+) -> Result<Vec<Changement>, String> {
+    if !format_balises_edition(file_path) {
+        return Err("unsupported tag format".into());
+    }
+    let path = graphie_sur_disque(file_path)?;
+    Ok(changements(&tag_lu(&path)?, &b.sanitized()))
+}
+
+impl BalisesEdition {
+    /// Même assainissement que [`TagUpdate`] : aucun caractère de contrôle
+    /// n'atteint un fichier.
+    fn sanitized(&self) -> Self {
+        let mut b = self.clone();
+        for (champ, v) in [("album_title", &mut b.album), ("title", &mut b.titre)] {
+            let (propre, _) = super::sanitize_untrusted_single_line_text(v, champ);
+            *v = propre;
+        }
+        for (champ, v) in [
+            ("album_artist", &mut b.artiste_album),
+            ("artist_name", &mut b.artiste),
+            ("disc_subtitle", &mut b.nom_disque),
+        ] {
+            if let Some(brut) = v.as_deref() {
+                let (propre, _) = super::sanitize_untrusted_single_line_text(brut, champ);
+                *v = (!propre.is_empty()).then_some(propre);
+            }
+        }
+        b
+    }
+}
+
+/// Écrit `b` dans le fichier, ATOMIQUEMENT. Rend les changements écrits
+/// (vide : le fichier portait déjà tout, il n'a pas été touché).
+///
+/// 1. l'empreinte audio de l'original est prise ;
+/// 2. l'original est COPIÉ dans son propre dossier, sous un nom
+///    [`PREFIXE_COPIE_DE_TRAVAIL`] que le scan ignore (droits recopiés,
+///    propriétaire recopié quand le système le permet) ;
+/// 3. l'écrivain du module écrit dans la COPIE ;
+/// 4. la copie est relue : empreinte audio identique, sinon abandon ;
+///    l'original n'a pas bougé depuis l'étape 1 (taille, date), sinon abandon ;
+/// 5. la copie est synchronisée sur le disque puis RENOMMÉE sur l'original —
+///    un renommage dans un même dossier est atomique : un lecteur voit
+///    l'ancien fichier entier ou le nouveau entier, jamais un mélange.
+///
+/// Tout abandon retire la copie et laisse l'original tel quel.
+///
+/// Synchrone : à appeler dans `spawn_blocking`.
+pub fn ecrire_balises_edition(
+    file_path: &str,
+    b: &BalisesEdition,
+) -> Result<Vec<Changement>, String> {
+    if !format_balises_edition(file_path) {
+        return Err("unsupported tag format".into());
+    }
+    let path = graphie_sur_disque(file_path)?;
+    let b = b.sanitized();
+    let prevus = changements(&tag_lu(&path)?, &b);
+    if prevus.is_empty() {
+        return Ok(prevus);
+    }
+    let mut ecrits: Vec<Changement> = Vec::new();
+    ecrire_atomiquement(
+        Path::new(&path),
+        |tag| {
+            // Recalculé sur le `Tag` que l'écrivain édite vraiment.
+            ecrits = changements(tag, &b);
+            poser(tag, &ecrits)
+        },
+        // La copie RELUE doit porter chaque valeur : un conteneur qui en
+        // refuse une (un WAV qui n'a que des balises RIFF INFO, sans
+        // ALBUMARTIST ni DISCSUBTITLE) ne remplace pas l'original.
+        |copie| {
+            let restants = changements(&tag_lu(copie)?, &b);
+            if restants.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "champs non retenus par le conteneur : {}",
+                    restants
+                        .iter()
+                        .map(|c| c.champ)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            }
+        },
+    )?;
+    info!(
+        file = %path,
+        champs = ecrits.len(),
+        "balises_edition_ecrites"
+    );
+    Ok(ecrits)
+}
+
+/// La copie de travail : `<dossier>/tune-balises-<pid>-<n>.<ext>`.
+fn chemin_de_copie(original: &Path) -> Result<std::path::PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COMPTEUR: AtomicU64 = AtomicU64::new(0);
+    let dossier = original
+        .parent()
+        .ok_or_else(|| "dossier parent introuvable".to_string())?;
+    let ext = original
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("tmp");
+    let n = COMPTEUR.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Ok(dossier.join(format!(
+        "{PREFIXE_COPIE_DE_TRAVAIL}{}-{n}-{nanos}.{ext}",
+        std::process::id()
+    )))
+}
+
+/// Retire la copie de travail quoi qu'il arrive, sauf si elle a été renommée.
+struct Copie {
+    chemin: std::path::PathBuf,
+    renommee: bool,
+}
+
+impl Drop for Copie {
+    fn drop(&mut self) {
+        if !self.renommee {
+            let _ = std::fs::remove_file(&self.chemin);
+        }
+    }
+}
+
+/// L'étape commune : copier, écrire la copie, prouver l'audio, renommer.
+/// Rend le nombre de champs posés (0 : rien écrit, la copie est jetée).
+pub(crate) fn ecrire_atomiquement(
+    original: &Path,
+    appliquer: impl FnOnce(&mut lofty::tag::Tag) -> usize,
+    verifier: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<usize, String> {
+    use super::empreinte_audio::empreinte_audio;
+
+    let avant = empreinte_audio(original)?
+        .ok_or_else(|| "format sans empreinte audio : écriture refusée".to_string())?;
+    let meta_avant = std::fs::metadata(original).map_err(|e| format!("stat: {e}"))?;
+    let mut copie = Copie {
+        chemin: chemin_de_copie(original)?,
+        renommee: false,
+    };
+    if copie.chemin.exists() {
+        return Err("copie de travail déjà présente".into());
+    }
+    std::fs::copy(original, &copie.chemin).map_err(|e| format!("copie: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Au mieux : un service qui n'est pas propriétaire du fichier garde
+        // au moins son groupe ; un refus n'empêche pas l'écriture.
+        let _ = std::os::unix::fs::chown(
+            &copie.chemin,
+            Some(meta_avant.uid()),
+            Some(meta_avant.gid()),
+        );
+    }
+    let copie_str = copie
+        .chemin
+        .to_str()
+        .ok_or_else(|| "chemin de copie non UTF-8".to_string())?
+        .to_string();
+    let n = ecrire_par_tag(&copie_str, true, appliquer)?;
+    if n == 0 {
+        return Ok(0);
+    }
+    // Les champs d'abord, l'audio ENSUITE : la preuve de l'audio est la
+    // dernière chose vue avant le renommage.
+    verifier(&copie_str)?;
+    let apres = empreinte_audio(&copie.chemin)?
+        .ok_or_else(|| "empreinte audio de la copie illisible".to_string())?;
+    if apres != avant {
+        tracing::error!(
+            file = %original.display(),
+            "balises_edition_audio_modifie_abandon"
+        );
+        return Err("l'écriture aurait modifié l'audio : abandon, original intact".into());
+    }
+    let meta_now = std::fs::metadata(original).map_err(|e| format!("stat: {e}"))?;
+    if meta_now.len() != meta_avant.len() || meta_now.modified().ok() != meta_avant.modified().ok()
+    {
+        return Err("le fichier a changé pendant l'écriture : abandon".into());
+    }
+    std::fs::File::open(&copie.chemin)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| format!("sync: {e}"))?;
+    std::fs::rename(&copie.chemin, original).map_err(|e| format!("rename: {e}"))?;
+    copie.renommee = true;
+    #[cfg(unix)]
+    if let Some(dossier) = original.parent() {
+        let _ = std::fs::File::open(dossier).and_then(|d| d.sync_all());
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1170,5 +1612,100 @@ mod tests {
             .unwrap();
         assert_eq!(r.fields_written, 0);
         assert_eq!(std::fs::read(&cible).unwrap(), avant);
+    }
+
+    // ------------------------------------------------------------------
+    // « Écrire dans les fichiers » (édition d'album, tranche 4) : l'écriture
+    // atomique et ses deux gardes. Contre-épreuves : une copie dont l'audio a
+    // bougé, une copie qui ne porte pas les champs — l'original ne bouge pas,
+    // et aucune copie de travail ne traîne.
+    // ------------------------------------------------------------------
+
+    fn copies_de_travail(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(PREFIXE_COPIE_DE_TRAVAIL))
+            .collect()
+    }
+
+    #[test]
+    fn ecriture_atomique_temoin_ecrit_et_ne_laisse_rien() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("t.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        let n = ecrire_atomiquement(
+            &cible,
+            |tag| {
+                tag.set_title("Temoin".into());
+                1
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        let t = crate::metadata::read_metadata(&cible).unwrap();
+        assert_eq!(t.title.as_deref(), Some("Temoin"));
+        assert!(copies_de_travail(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn ecriture_atomique_refuse_une_copie_dont_l_audio_a_bouge() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("t.flac");
+        std::fs::copy(fixture("test.flac"), &cible).unwrap();
+        let avant = std::fs::read(&cible).unwrap();
+        let r = ecrire_atomiquement(
+            &cible,
+            |tag| {
+                tag.set_title("Abime".into());
+                1
+            },
+            // Simule un écrivain qui toucherait au son : un octet des trames
+            // FLAC (le milieu du fichier) change dans la COPIE.
+            |copie| {
+                let mut o = std::fs::read(copie).unwrap();
+                let m = o.len() / 2;
+                o[m] ^= 0x01;
+                std::fs::write(copie, o).unwrap();
+                Ok(())
+            },
+        );
+        let e = r.unwrap_err();
+        assert!(e.contains("audio"), "{e}");
+        assert_eq!(std::fs::read(&cible).unwrap(), avant, "l'original a bougé");
+        assert!(copies_de_travail(dir.path()).is_empty(), "copie laissée");
+    }
+
+    #[test]
+    fn ecriture_atomique_verification_refusee_laisse_l_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let cible = dir.path().join("t.mp3");
+        std::fs::copy(fixture("test.mp3"), &cible).unwrap();
+        let avant = std::fs::read(&cible).unwrap();
+        let r = ecrire_atomiquement(
+            &cible,
+            |tag| {
+                tag.set_title("Refuse".into());
+                1
+            },
+            |_| Err("champs non retenus par le conteneur : TITLE".into()),
+        );
+        assert!(r.is_err());
+        assert_eq!(std::fs::read(&cible).unwrap(), avant);
+        assert!(copies_de_travail(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn dsf_et_dff_ne_sont_pas_des_formats_d_edition() {
+        assert!(!format_balises_edition("/m/a.dsf"));
+        assert!(!format_balises_edition("/m/a.dff"));
+        assert!(!format_balises_edition("/m/a.wma"));
+        for ok in [
+            "a.flac", "a.MP3", "a.m4a", "a.ogg", "a.opus", "a.wav", "a.aiff",
+        ] {
+            assert!(format_balises_edition(ok), "{ok}");
+        }
     }
 }

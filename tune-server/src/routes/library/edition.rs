@@ -10,7 +10,9 @@
 //!
 //! La logique, et ce qui la rend durable face aux analyses, vit dans
 //! [`tune_core::db::edition_album`] ; ces routes ne font que traduire.
-//! Rien n'est écrit dans les FICHIERS dans cette tranche.
+//! Rien n'est écrit dans les FICHIERS par ces routes : c'est
+//! `POST /library/albums/{id}/edition/write-tags` (tranche 4,
+//! [`super::edition_balises`]) qui reporte l'édition dans les balises.
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
