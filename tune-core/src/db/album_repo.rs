@@ -1738,6 +1738,47 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// #4896 — un dossier renommé ou déplacé : les albums identifiés par ce
+    /// dossier, ou par un dossier qu'il contient, le suivent. Sans cela,
+    /// `get_or_create_for_folder` ne reconnaîtrait plus l'album à son dossier
+    /// et la prochaine relecture d'une piste en ouvrirait un second. Découpage
+    /// exact (`…/Album` ne déplace pas `…/Album 2`). Rend le nombre de lignes.
+    pub fn deplacer_dossier(&self, ancien: &str, nouveau: &str) -> Result<usize, TuneError> {
+        use unicode_normalization::UnicodeNormalization as _;
+        let d = super::track_repo::DossierExact::new(ancien);
+        let base_ancienne = d
+            .prefixe
+            .trim_end_matches(d.separateur.as_str())
+            .to_string();
+        let base_nouvelle: String = nouveau.trim_end_matches(['/', '\\']).nfc().collect();
+        let (p1, p2, p3) = match self.db.engine() {
+            Engine::Postgres => ("$1", "$2", "$3"),
+            Engine::Sqlite => ("?1", "?2", "?3"),
+        };
+        let sql = format!(
+            "SELECT id, folder_path FROM albums WHERE folder_path = {p1} \
+             OR (folder_path LIKE {p2}{esc} AND substr(folder_path, 1, {n}) = {p3})",
+            esc = super::track_repo::like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&base_ancienne, &d.motif, &d.prefixe];
+        let mut deplaces = 0usize;
+        for ligne in self.db.query_many_strong(&sql, &params)? {
+            let (Some(id), Some(dossier)) = (
+                ligne.first().and_then(|v| v.as_i64()),
+                ligne.get(1).and_then(|v| v.as_string()),
+            ) else {
+                continue;
+            };
+            let Some(reste) = dossier.strip_prefix(&base_ancienne) else {
+                continue;
+            };
+            self.set_folder_path(id, &format!("{base_nouvelle}{reste}"))?;
+            deplaces += 1;
+        }
+        Ok(deplaces)
+    }
+
     /// Marque l'album comme compilation (#1957). **Ne baisse jamais le
     /// drapeau**, et c'est délibéré :
     ///
