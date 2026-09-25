@@ -197,6 +197,29 @@ pub mod sql {
         )
     }
 
+    /// Les pistes des albums LOCAUX marqués compilation, avec ce que la base
+    /// garde de leurs artistes — la matière de
+    /// [`super::AlbumRepo::recalculer_les_compilations`].
+    ///
+    /// Colonnes : id d'album, nom de l'artiste de l'album, balise
+    /// `album_artist` BRUTE de la piste, id et nom de l'artiste de la piste.
+    /// Sur un album marqué compilation, `tracks.artist_id` est l'artiste
+    /// PROPRE de chaque piste (le scan ne le rabat sur l'artiste d'album que
+    /// hors compilation) : c'est exactement ce que la règle lit.
+    ///
+    /// Aucun paramètre, aucune syntaxe propre à un moteur : `COALESCE(…, 0)`
+    /// lit le `INTEGER` de SQLite comme le `SMALLINT` de PostgreSQL (PG 028).
+    pub fn compilations_a_recalculer() -> &'static str {
+        "SELECT a.id, ar.name, t.album_artist, t.artist_id, tar.name \
+         FROM albums a \
+         JOIN tracks t ON t.album_id = a.id \
+         LEFT JOIN artists ar ON ar.id = a.artist_id \
+         LEFT JOIN artists tar ON tar.id = t.artist_id \
+         WHERE COALESCE(a.is_compilation, 0) <> 0 \
+           AND COALESCE(a.source, 'local') = 'local' \
+         ORDER BY a.id, t.id"
+    }
+
     /// Les numéros de disque distincts déjà rangés sous un album (C4).
     pub fn disc_numbers_of<D: SqlDialect>(d: &D) -> String {
         format!(
@@ -805,6 +828,32 @@ pub fn sql_label_repris_des_pistes() -> &'static str {
      (SELECT t.label FROM tracks t \
       WHERE t.album_id = albums.id AND t.label IS NOT NULL AND t.label != '' \
       GROUP BY t.label ORDER BY COUNT(*) DESC, t.label ASC LIMIT 1))"
+}
+
+/// Le prédicat « ce champ de l'album est tenu par une édition manuelle » (C3),
+/// corrélé sur `albums.id`, pour les passes SQL du scan qui réécrivent un
+/// champ d'album sans passer par le dépôt. SQL commun aux deux moteurs.
+pub fn sql_champ_tenu_a_la_main(champ: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM album_metadata am WHERE am.album_id = albums.id \
+         AND am.key = 'edition_manuelle' AND am.value LIKE '%\"{champ}\"%')"
+    )
+}
+
+/// Bilan de [`AlbumRepo::recalculer_les_compilations`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BilanRecalculCompilations {
+    /// Albums marqués compilation examinés.
+    pub examines: usize,
+    /// Drapeaux baissés.
+    pub baisses: usize,
+    /// Dont albums rendus à leur artiste (sortis de « Various Artists »).
+    pub reattribues: usize,
+    /// Laissés tels quels : drapeau ou artiste tenu à la main (C3).
+    pub manuels: usize,
+    /// Laissés tels quels : sous « Various Artists » sans artiste à rendre.
+    pub indecis: usize,
+    pub erreurs: usize,
 }
 
 pub struct AlbumRepo {
@@ -1861,6 +1910,153 @@ impl AlbumRepo {
             self.db.execute(&sql, &params)?;
         }
         Ok(())
+    }
+
+    /// Recalcule, SANS relire un seul fichier, le drapeau « compilation » des
+    /// albums déjà marqués, selon LA règle du 25/09/2026
+    /// ([`crate::library::regle_compilation`]).
+    ///
+    /// # Pourquoi
+    ///
+    /// Le scan ne fait que LEVER le drapeau (`mark_compilation`) : un album
+    /// d'un seul artiste marqué sous l'ancienne règle — « Here & Gone », dont
+    /// les fichiers portent `COMPILATION=1` — le resterait jusqu'au « Scan
+    /// complet », qui efface aussi tout ce que l'utilisateur a corrigé. La
+    /// base a déjà ce que la règle lit : la balise `album_artist` de chaque
+    /// piste et l'artiste propre de chaque piste.
+    ///
+    /// # Ce qu'elle fait — et ce qu'elle ne fait pas
+    ///
+    /// - elle ne fait que BAISSER : un album que la règle juge encore
+    ///   compilation n'est pas touché, et un album non marqué n'est pas lu.
+    ///   La balise `COMPILATION=0`, que la base ne garde pas, ne peut que
+    ///   baisser elle aussi : l'ignorer ici ne fait jamais monter à tort ;
+    /// - un album dont le drapeau OU l'artiste est tenu par une édition
+    ///   manuelle (C3, `album_metadata.edition_manuelle`) est laissé tel quel ;
+    /// - un album rangé sous « Various Artists » par l'ancienne règle est
+    ///   rendu à son artiste — celui de toutes ses pistes, ou son unique
+    ///   artiste d'album balisé — pour revenir dans SA discographie
+    ///   (`list_by_artist` ne lit que `albums.artist_id`). Sans artiste à
+    ///   lui rendre, il n'est pas touché (`indecis`) ;
+    /// - idempotente : une seconde passe ne trouve plus rien à faire. Elle est
+    ///   donc jouée à chaque démarrage et après chaque scan, sans marqueur.
+    pub fn recalculer_les_compilations(&self) -> Result<BilanRecalculCompilations, TuneError> {
+        use crate::library::regle_compilation::{IndicesCompilation, est_artistes_divers};
+
+        struct Ligne {
+            id: i64,
+            artiste: Option<String>,
+            indices: IndicesCompilation,
+            artistes_de_piste: std::collections::BTreeSet<(i64, String)>,
+            pistes_sans_artiste: bool,
+            balises_d_album: std::collections::BTreeMap<String, String>,
+        }
+
+        let rows = self
+            .db
+            .query_many_strong(sql::compilations_a_recalculer(), &[])?;
+        let mut albums: Vec<Ligne> = Vec::new();
+        for r in &rows {
+            let Some(id) = r.first().and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if albums.last().is_none_or(|a| a.id != id) {
+                albums.push(Ligne {
+                    id,
+                    artiste: r.get(1).and_then(|v| v.as_string()),
+                    indices: IndicesCompilation::new(),
+                    artistes_de_piste: Default::default(),
+                    pistes_sans_artiste: false,
+                    balises_d_album: Default::default(),
+                });
+            }
+            let Some(a) = albums.last_mut() else { continue };
+            let balise = r.get(2).and_then(|v| v.as_string());
+            let artiste = r.get(4).and_then(|v| v.as_string());
+            a.indices
+                .ajouter_piste(balise.as_deref(), artiste.as_deref());
+            match (r.get(3).and_then(|v| v.as_i64()), artiste) {
+                (Some(aid), Some(nom)) => {
+                    a.artistes_de_piste.insert((aid, nom));
+                }
+                _ => a.pistes_sans_artiste = true,
+            }
+            if let Some(b) = balise
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+            {
+                a.balises_d_album.entry(b.to_lowercase()).or_insert(b);
+            }
+        }
+
+        let meta = crate::db::album_metadata_repo::AlbumMetadataRepo::with_backend(self.db.clone());
+        let artistes = crate::db::artist_repo::ArtistRepo::with_backend(self.db.clone());
+        let mut bilan = BilanRecalculCompilations {
+            examines: albums.len(),
+            ..Default::default()
+        };
+        for a in &albums {
+            let jugement = a.indices.juger();
+            if jugement.compilation {
+                continue;
+            }
+            // C3 — la main de l'utilisateur, dans les deux sens.
+            let tenus = meta.champs_edites_a_la_main(a.id).unwrap_or_default();
+            if tenus.iter().any(|c| c == "is_compilation" || c == "artist") {
+                bilan.manuels += 1;
+                continue;
+            }
+            // L'album est-il rangé sous la CONVENTION ? Il faut alors lui
+            // rendre son artiste, sans quoi il resterait hors de sa
+            // discographie.
+            let sous_la_convention = a.artiste.as_deref().is_none_or(est_artistes_divers);
+            let nouvel_artiste = if !sous_la_convention {
+                None
+            } else if let (false, [(aid, nom)]) = (
+                a.pistes_sans_artiste,
+                a.artistes_de_piste.iter().collect::<Vec<_>>().as_slice(),
+            ) && !est_artistes_divers(nom)
+            {
+                Some(*aid)
+            } else if let [(_, nom)] = a.balises_d_album.iter().collect::<Vec<_>>().as_slice()
+                && !est_artistes_divers(nom)
+            {
+                artistes
+                    .get_or_create(nom, None, None)
+                    .ok()
+                    .and_then(|x| x.id)
+            } else {
+                bilan.indecis += 1;
+                continue;
+            };
+            if sous_la_convention && nouvel_artiste.is_none() {
+                bilan.indecis += 1;
+                continue;
+            }
+            match self.reparer_compilation(a.id, false, nouvel_artiste) {
+                Ok(()) => {
+                    bilan.baisses += 1;
+                    if nouvel_artiste.is_some() {
+                        bilan.reattribues += 1;
+                    }
+                    tracing::info!(
+                        album_id = a.id,
+                        motif = jugement.motif.as_str(),
+                        ancien_artiste = ?a.artiste,
+                        nouvel_artiste_id = ?nouvel_artiste,
+                        "compilation_recalculee"
+                    );
+                }
+                Err(e) => {
+                    bilan.erreurs += 1;
+                    tracing::warn!(album_id = a.id, error = %e, "compilation_recalcul_echoue");
+                }
+            }
+        }
+        if bilan.baisses > 0 || bilan.erreurs > 0 {
+            tracing::info!(?bilan, "compilations_recalculees");
+        }
+        Ok(bilan)
     }
 
     /// Les numéros de disque distincts déjà rangés sous un album, triés (C4).
@@ -3733,6 +3929,177 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db
+    }
+
+    /// LA règle du 25/09/2026, rejouée sur une base EXISTANTE sans relire un
+    /// fichier (`recalculer_les_compilations`) — les cas mesurés sur le .18.
+    ///
+    /// - « Here & Gone » : un seul artiste, drapeau levé (balise
+    ///   `COMPILATION=1`), artiste d'album David Sanborn ⇒ baissé, reste dans
+    ///   SA discographie et quitte la section « Compilations » de sa page ;
+    /// - « A Love Supreme, Disc 1 » rangé sous « Various Artists » par
+    ///   l'ancienne règle ⇒ baissé ET rendu à John Coltrane, dont il rejoint
+    ///   la discographie, comme son Disc 2 ;
+    /// - « Jazz in Paris » (artiste d'album Various Artists) et une
+    ///   compilation faite main (artistes variés) ⇒ intouchées ;
+    /// - un drapeau tenu à la main (C3) ⇒ intouché ;
+    /// - seconde passe ⇒ plus rien à faire.
+    #[test]
+    fn le_recalcul_baisse_le_drapeau_des_albums_d_un_seul_artiste() {
+        use crate::db::album_metadata_repo::AlbumMetadataRepo;
+
+        let db = test_db();
+        db.connection()
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS album_metadata (
+                     album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                     key TEXT NOT NULL,
+                     value TEXT NOT NULL,
+                     PRIMARY KEY (album_id, key)
+                 );",
+            )
+            .unwrap();
+        let artistes = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+        let nouvel = |nom: &str| artistes.create(&Artist::new(nom.into())).unwrap();
+        let va = nouvel("Various Artists");
+        let sanborn = nouvel("David Sanborn");
+        let coltrane = nouvel("John Coltrane");
+        let django = nouvel("Django Reinhardt");
+        let grappelli = nouvel("Stéphane Grappelli");
+        let ellington = nouvel("Duke Ellington");
+        let album = |titre: &str, artiste: i64, drapeau: bool| {
+            let mut a = Album::new(titre.into());
+            a.artist_id = Some(artiste);
+            a.is_compilation = drapeau;
+            repo.create(&a).unwrap()
+        };
+
+        let here_and_gone = album("Here & Gone", sanborn, true);
+        seed_track_with_album_artist(
+            &db,
+            here_and_gone,
+            sanborn,
+            1,
+            "/m/hg/01.flac",
+            Some("David Sanborn"),
+        );
+        seed_track_with_album_artist(
+            &db,
+            here_and_gone,
+            sanborn,
+            2,
+            "/m/hg/02.flac",
+            Some("David Sanborn"),
+        );
+
+        let disc1 = album("A Love Supreme, Disc 1", va, true);
+        seed_track(&db, disc1, coltrane, 1, "/m/als1/01.flac");
+        seed_track(&db, disc1, coltrane, 2, "/m/als1/02.flac");
+        let disc2 = album("A Love Supreme, Disc 2", coltrane, false);
+        seed_track(&db, disc2, coltrane, 1, "/m/als2/01.flac");
+
+        let jazz_in_paris = album("Jazz in Paris", va, true);
+        seed_track_with_album_artist(
+            &db,
+            jazz_in_paris,
+            django,
+            1,
+            "/m/jip/01.flac",
+            Some("Various Artists"),
+        );
+        seed_track_with_album_artist(
+            &db,
+            jazz_in_paris,
+            django,
+            2,
+            "/m/jip/02.flac",
+            Some("Various Artists"),
+        );
+
+        let faite_main = album("Swing", va, true);
+        seed_track(&db, faite_main, django, 1, "/m/swing/01.flac");
+        seed_track(&db, faite_main, grappelli, 2, "/m/swing/02.flac");
+
+        let tenu = album("Tenu à la main", ellington, true);
+        seed_track(&db, tenu, ellington, 1, "/m/tenu/01.flac");
+        AlbumMetadataRepo::new(db.clone())
+            .marquer_edition_manuelle(tenu, &["is_compilation"])
+            .unwrap();
+
+        // Avant : « Here & Gone » figure dans la section Compilations de la
+        // page de David Sanborn ? Non — il est DANS sa discographie (son
+        // artist_id), et le filtre « Compilations » le montre.
+        let drapeau = |id: i64| repo.get(id).unwrap().unwrap().is_compilation;
+        let artiste = |id: i64| repo.get(id).unwrap().unwrap().artist_id;
+        let titres = |v: Vec<Album>| v.into_iter().map(|a| a.title).collect::<Vec<_>>();
+        assert!(
+            titres(repo.list_compilations_with_artist_track(coltrane).unwrap())
+                .contains(&"A Love Supreme, Disc 1".to_string())
+        );
+
+        let bilan = repo.recalculer_les_compilations().unwrap();
+        assert_eq!(
+            (
+                bilan.examines,
+                bilan.baisses,
+                bilan.reattribues,
+                bilan.manuels,
+                bilan.indecis,
+                bilan.erreurs
+            ),
+            (5, 2, 1, 1, 0, 0),
+            "{bilan:?}"
+        );
+
+        assert!(
+            !drapeau(here_and_gone),
+            "Here & Gone : la balise seule ne suffit plus"
+        );
+        assert_eq!(artiste(here_and_gone), Some(sanborn));
+        assert!(!drapeau(disc1));
+        assert_eq!(
+            artiste(disc1),
+            Some(coltrane),
+            "le Disc 1 est rendu à John Coltrane"
+        );
+        assert!(
+            drapeau(jazz_in_paris),
+            "(a) artiste d'album Various Artists"
+        );
+        assert!(drapeau(faite_main), "(b) deux artistes principaux");
+        assert!(
+            drapeau(tenu),
+            "C3 : un drapeau tenu à la main n'est pas touché"
+        );
+
+        // Effet sur la page artiste (#4767) : les deux disques d'A Love
+        // Supreme sont dans la discographie de John Coltrane, et plus dans
+        // sa section « Compilations ».
+        let disco = titres(repo.list_by_artist(coltrane).unwrap());
+        assert!(
+            disco.contains(&"A Love Supreme, Disc 1".to_string()),
+            "{disco:?}"
+        );
+        assert!(
+            disco.contains(&"A Love Supreme, Disc 2".to_string()),
+            "{disco:?}"
+        );
+        assert!(titres(repo.list_compilations_with_artist_track(coltrane).unwrap()).is_empty());
+        assert!(titres(repo.list_by_artist(sanborn).unwrap()).contains(&"Here & Gone".to_string()));
+        // Django reste dans la section Compilations (Jazz in Paris, Swing).
+        assert_eq!(
+            repo.list_compilations_with_artist_track(django)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Idempotente.
+        let bilan = repo.recalculer_les_compilations().unwrap();
+        assert_eq!(bilan.baisses, 0, "{bilan:?}");
     }
 
     /// Phase 5 UPnP : la mention réciproque, et ses deux contre-épreuves

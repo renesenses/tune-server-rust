@@ -33,7 +33,9 @@
 //!    coffret manuel antérieur au marqueur, coffret `CD01/CD02` du scan (C4) :
 //!    on ne sait pas qui l'a fait, donc on n'y ajoute rien ;
 //! 3. un coffret que l'utilisateur a défait ([`defaire`]) ;
-//! 4. deux disques que l'utilisateur a déclarés distincts (#1276).
+//! 4. deux disques que l'utilisateur a déclarés distincts (#1276) ;
+//! 5. un album dont l'utilisateur a disposé les disques à la main (écran
+//!    « Modifier » de la fiche, [`super::edition_album`]).
 //!
 //! Idempotente : un coffret réuni n'est plus qu'un album, sans frère à
 //! absorber ; la passe suivante ne trouve rien.
@@ -106,6 +108,9 @@ pub struct Inventaire {
     /// Albums dont les pistes vivent dans PLUS D'UN dossier.
     pub plusieurs_dossiers: HashSet<i64>,
     pub marqueurs: HashMap<i64, Marqueur>,
+    /// Albums dont l'utilisateur a DISPOSÉ les disques à la main (écran
+    /// « Modifier » de la fiche, GO du 25/09/2026) : la passe n'y touche pas.
+    pub disposes: HashSet<i64>,
 }
 
 /// Même liste que `is_various_artists` du scan (`tune-server`), qui n'est pas
@@ -189,6 +194,9 @@ pub fn inventaire(db: &Arc<dyn DbBackend>) -> Result<Inventaire, TuneError> {
         albums,
         plusieurs_dossiers,
         marqueurs: marqueurs(db)?,
+        disposes: super::edition_album::Tenues::charger(db)
+            .albums_disposes()
+            .clone(),
     })
 }
 
@@ -208,6 +216,16 @@ pub fn refus(db: &Arc<dyn DbBackend>) -> BTreeSet<String> {
 fn ecrire_refus(db: &Arc<dyn DbBackend>, r: &BTreeSet<String>) -> Result<(), TuneError> {
     let json = serde_json::to_string(r).map_err(|e| e.to_string())?;
     SettingsRepo::with_backend(db.clone()).set(CLE_REFUS, &json)?;
+    Ok(())
+}
+
+/// Retient un coffret comme REFUSÉ — ce que fait [`defaire`], et le geste
+/// « détacher un disque » d'un coffret automatique.
+pub fn retenir_refus(db: &Arc<dyn DbBackend>, cle: &str) -> Result<(), TuneError> {
+    let mut r = refus(db);
+    if r.insert(cle.to_string()) {
+        ecrire_refus(db, &r)?;
+    }
     Ok(())
 }
 
@@ -329,6 +347,9 @@ fn une_paire_distincte(c: &Coffret, d: &DistinctPairSet) -> bool {
 /// Un membre que la passe ne doit pas toucher : un coffret composé à la main,
 /// ou un album réparti sur plusieurs dossiers dont on ne sait pas qui l'a fait.
 fn tenu_a_la_main(id: i64, inv: &Inventaire) -> bool {
+    if inv.disposes.contains(&id) {
+        return true;
+    }
     match inv.marqueurs.get(&id) {
         Some(m) => !m.est_auto(),
         None => inv.plusieurs_dossiers.contains(&id),
