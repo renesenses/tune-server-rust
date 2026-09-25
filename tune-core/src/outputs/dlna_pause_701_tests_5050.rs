@@ -14,6 +14,10 @@
 //! `acquitter_commande_soap("Pause", response)` fait tomber
 //! `une_pause_refusee_pendant_la_transition_aboutit_quand_le_renderer_en_sort`
 //! et `un_renderer_deja_en_pause_n_est_pas_un_echec`.
+//!
+//! Le même factice sert à l'orchestrateur (#5050, Seek de reprise
+//! conditionnel) : il répond à `GetPositionInfo` avec le `RelTime` posé dans
+//! [`Etat::rel_time`] — ou sans `RelTime` du tout, une position illisible.
 use super::*;
 use axum::{Router, http::StatusCode, routing::post};
 use std::sync::Mutex;
@@ -23,21 +27,24 @@ const FAUTE_701: &str = "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/e
 
 /// Ce que le renderer factice déclare, et quand.
 #[derive(Clone, Copy)]
-enum Scenario {
+pub(crate) enum Scenario {
     /// `TRANSITIONING` pendant cette durée, puis `PLAYING`.
     TransitionPuisLecture(Duration),
     /// Toujours cet état ; la pause y est toujours refusée en 701.
     Fige(&'static str),
 }
 
-struct Etat {
+pub(crate) struct Etat {
     debut: Instant,
     scenario: Scenario,
-    en_pause: bool,
+    pub(crate) en_pause: bool,
+    /// Ce que `GetPositionInfo` rend dans `RelTime` ; `None` : la réponse
+    /// n'en porte pas (position illisible).
+    pub(crate) rel_time: Option<&'static str>,
 }
 
 impl Etat {
-    fn courant(&self) -> &'static str {
+    pub(crate) fn courant(&self) -> &'static str {
         if self.en_pause {
             return "PAUSED_PLAYBACK";
         }
@@ -49,36 +56,47 @@ impl Etat {
     }
 }
 
-struct Renderer {
-    output: DlnaOutput,
-    recues: Arc<Mutex<Vec<String>>>,
-    etat: Arc<Mutex<Etat>>,
-    task: tokio::task::JoinHandle<()>,
+/// Le serveur factice s'arrête avec ce gardien, pas avec le `Renderer` :
+/// on peut ainsi céder la sortie à un registre (`Renderer` se déstructure)
+/// sans couper le serveur.
+pub(crate) struct Serveur(tokio::task::JoinHandle<()>);
+
+impl Drop for Serveur {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+pub(crate) struct Renderer {
+    pub(crate) output: DlnaOutput,
+    pub(crate) recues: Arc<Mutex<Vec<String>>>,
+    pub(crate) etat: Arc<Mutex<Etat>>,
+    pub(crate) task: Serveur,
+}
+
+/// Combien de fois `action` a été reçue.
+pub(crate) fn compte_dans(recues: &Mutex<Vec<String>>, action: &str) -> usize {
+    recues
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|a| a.ends_with(&format!("#{action}\"")))
+        .count()
 }
 
 impl Renderer {
     fn compte(&self, action: &str) -> usize {
-        self.recues
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|a| a.ends_with(&format!("#{action}\"")))
-            .count()
+        compte_dans(&self.recues, action)
     }
 }
 
-async fn renderer(scenario: Scenario) -> Renderer {
+pub(crate) async fn renderer(scenario: Scenario) -> Renderer {
     let recues = Arc::new(Mutex::new(Vec::new()));
     let etat = Arc::new(Mutex::new(Etat {
         debut: Instant::now(),
         scenario,
         en_pause: false,
+        rel_time: None,
     }));
     let (r, e) = (recues.clone(), etat.clone());
     let app = Router::new().route(
@@ -98,6 +116,15 @@ async fn renderer(scenario: Scenario) -> Renderer {
                     let corps = format!(
                         "<s:Envelope><s:Body><u:GetTransportInfoResponse><CurrentTransportState>{}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse></s:Body></s:Envelope>",
                         etat.courant()
+                    );
+                    (StatusCode::OK, corps)
+                } else if action.ends_with("#GetPositionInfo\"") {
+                    let rel = etat
+                        .rel_time
+                        .map(|t| format!("<RelTime>{t}</RelTime>"))
+                        .unwrap_or_default();
+                    let corps = format!(
+                        "<s:Envelope><s:Body><u:GetPositionInfoResponse><Track>1</Track><TrackDuration>0:05:00</TrackDuration>{rel}</u:GetPositionInfoResponse></s:Body></s:Envelope>"
                     );
                     (StatusCode::OK, corps)
                 } else if action.ends_with("#Pause\"") {
@@ -128,7 +155,7 @@ async fn renderer(scenario: Scenario) -> Renderer {
         output,
         recues,
         etat,
-        task,
+        task: Serveur(task),
     }
 }
 
@@ -213,4 +240,23 @@ async fn un_renderer_arrete_rend_le_refus_sans_attendre() {
     assert!(debut.elapsed() < Duration::from_secs(2));
     assert_eq!(r.compte("Pause"), 1);
     assert_eq!(r.compte("GetTransportInfo"), 1);
+}
+
+/// #5050 — la position mesurée pour le Seek de reprise n'est prise que d'un
+/// `RelTime` lisible : ni un `RelTime` absent, ni `NOT_IMPLEMENTED` ne
+/// deviennent un « 0:00 » qui ressemblerait à une mesure.
+#[tokio::test]
+async fn la_position_mesuree_ne_prend_qu_un_rel_time_lisible() {
+    let r = renderer(Scenario::Fige("PLAYING")).await;
+    assert_eq!(r.output.position_mesuree_ms().await, None, "sans RelTime");
+    r.etat.lock().unwrap().rel_time = Some("NOT_IMPLEMENTED");
+    assert_eq!(
+        r.output.position_mesuree_ms().await,
+        None,
+        "NOT_IMPLEMENTED"
+    );
+    r.etat.lock().unwrap().rel_time = Some("0:01:20");
+    assert_eq!(r.output.position_mesuree_ms().await, Some(80_000));
+    r.etat.lock().unwrap().rel_time = Some("0:00:00");
+    assert_eq!(r.output.position_mesuree_ms().await, Some(0));
 }

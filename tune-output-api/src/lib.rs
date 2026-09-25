@@ -2175,6 +2175,25 @@ pub trait OutputTarget: Send + Sync {
         false
     }
 
+    /// #5050 — la position que l'appareil DÉCLARE jouer, lue chez lui à
+    /// l'instant de l'appel.
+    ///
+    /// Sert au rattrapage qui suit une reprise sur un renderer réseau : l'hôte
+    /// n'envoie plus le `Seek` à la position de la pause que si l'appareil
+    /// n'y est pas déjà (le Beosound Stage répond à ce Seek superflu par une
+    /// transition pendant laquelle il refuse la Pause en 701).
+    ///
+    /// Ce n'est PAS `get_status().position_ms` : ce champ vaut 0 quand la
+    /// réponse est illisible, et peut être une extrapolation (mode silence
+    /// UPnP) — ni l'un ni l'autre ne dit où l'appareil en est vraiment.
+    ///
+    /// `None` = pas de mesure. L'hôte garde alors la conduite d'avant : il
+    /// envoie le `Seek`. C'est le défaut, donc une sortie qui ne sait pas
+    /// répondre ne change pas de comportement.
+    async fn position_mesuree_ms(&self) -> Option<u64> {
+        None
+    }
+
     fn host(&self) -> Option<&str> {
         None
     }
