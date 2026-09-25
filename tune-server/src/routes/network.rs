@@ -1158,18 +1158,34 @@ async fn browse_media_server(
         .ok_or_else(|| EchecParcours::ServeurInconnu(id.clone()).en_erreur_http("?"))?;
     drop(servers);
 
-    let (containers, items, total_matches) =
+    let (containers, items, total_matches, incomplet) =
         parcourir_les_enfants(&ms.content_directory_url, &ms.name, object_id)
             .await
             .map_err(|e| e.en_erreur_http(&ms.name))?;
     let fetched = containers.len() + items.len();
     let total = (total_matches as usize).max(fetched);
+    // #4895 : un parcours arrêté en route (page vide au milieu, DIDL illisible
+    // sur une page suivante, catalogue qui change…) servait ce qu'il avait lu
+    // en 200, sans un mot — l'écran le prenait pour la liste entière. Ce qui a
+    // été lu reste servi, mais la réponse le DIT, et le journal aussi.
+    if let Some(raison) = &incomplet {
+        warn!(
+            serveur = %ms.name,
+            object_id,
+            lus = fetched,
+            annonces = total,
+            error = %raison,
+            "browse_media_server_incomplete"
+        );
+    }
     Ok(Json(json!({
         "object_id": object_id,
         "containers": containers,
         "items": items,
         "total_matches": total,
         "number_returned": fetched,
+        "complet": incomplet.is_none(),
+        "incomplet": incomplet,
     })))
 }
 
@@ -1192,6 +1208,17 @@ pub(crate) enum EchecParcours {
     /// 2xx sans élément `<Result>` — un SOAP Fault, ou autre chose qu'un
     /// ContentDirectory.
     SansResultat,
+    /// #4895 — la réponse n'a pas de `NumberReturned` lisible : on ne sait pas
+    /// ce que la page était censée contenir.
+    SansCompteur,
+    /// #4895 — la page n'annonce pas de `TotalMatches` lisible.
+    SansTotal,
+    /// #4895 — Tune n'a su lire que `lus` des `annonces` éléments que la page
+    /// déclare (`NumberReturned`) : un DIDL que l'analyseur ne comprend pas.
+    DidlIllisible { lus: u32, annonces: u32 },
+    /// #4895 — une page vide alors que `total` éléments sont annoncés et que
+    /// seuls `lus` ont été lus : « 0/12 » sur la première page.
+    PaginationInterrompue { lus: u32, total: u32 },
 }
 
 impl EchecParcours {
@@ -1200,7 +1227,31 @@ impl EchecParcours {
     /// Le message nomme le serveur et la cause ; le code reste stable pour
     /// les clients qui voudront le lire.
     fn en_erreur_http(&self, nom_du_serveur: &str) -> AppError {
-        let (status, message) = match self {
+        self.en_erreur_http_de(nom_du_serveur, "Browse")
+    }
+
+    /// La même réponse pour une autre action ContentDirectory — `Search`
+    /// (#4895) : même statut, même message à l'action près, mais son propre
+    /// code stable et sa propre ligne de journal, pour qu'on ne confonde pas
+    /// une recherche en échec avec un dossier qui ne s'ouvre pas.
+    fn en_erreur_http_de(&self, nom_du_serveur: &str, action: &str) -> AppError {
+        let (status, message) = self.statut_et_message(nom_du_serveur, action);
+        let code = if action == "Search" {
+            warn!(serveur = nom_du_serveur, error = %message, "search_media_server_failed");
+            "media_server_search_failed"
+        } else {
+            warn!(serveur = nom_du_serveur, error = %message, "browse_media_server_failed");
+            "media_server_browse_failed"
+        };
+        AppError {
+            status,
+            message,
+            code: Some(code.into()),
+        }
+    }
+
+    fn statut_et_message(&self, nom_du_serveur: &str, action: &str) -> (StatusCode, String) {
+        match self {
             EchecParcours::ServeurInconnu(id) => (
                 StatusCode::NOT_FOUND,
                 format!(
@@ -1210,25 +1261,47 @@ impl EchecParcours {
             ),
             EchecParcours::Transport(e) => (
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("{nom_du_serveur} n'a pas répondu au Browse : {e}"),
+                format!("{nom_du_serveur} n'a pas répondu au {action} : {e}"),
             ),
             EchecParcours::Statut(code) => (
                 StatusCode::BAD_GATEWAY,
-                format!("{nom_du_serveur} a répondu HTTP {code} au Browse"),
+                format!("{nom_du_serveur} a répondu HTTP {code} au {action}"),
             ),
             EchecParcours::SansResultat => (
                 StatusCode::BAD_GATEWAY,
                 format!(
-                    "{nom_du_serveur} a répondu sans élément <Result> au Browse \
+                    "{nom_du_serveur} a répondu sans élément <Result> au {action} \
                      (SOAP Fault ?)"
                 ),
             ),
-        };
-        warn!(serveur = nom_du_serveur, error = %message, "browse_media_server_failed");
-        AppError {
-            status,
-            message,
-            code: Some("media_server_browse_failed".into()),
+            EchecParcours::SansCompteur => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a répondu au {action} sans compteur \
+                     NumberReturned lisible"
+                ),
+            ),
+            EchecParcours::SansTotal => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a répondu au {action} sans compteur \
+                     TotalMatches lisible"
+                ),
+            ),
+            EchecParcours::DidlIllisible { lus, annonces } => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a rendu au {action} un DIDL que Tune ne sait \
+                     pas lire : {lus} des {annonces} éléments annoncés lus"
+                ),
+            ),
+            EchecParcours::PaginationInterrompue { lus, total } => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "{nom_du_serveur} a rendu une page vide au {action} après \
+                     {lus} des {total} éléments annoncés"
+                ),
+            ),
         }
     }
 }
@@ -1240,8 +1313,10 @@ impl EchecParcours {
 /// `unifier-serveurs-upnp-et-bibliotheque` a besoin du MEME parcours, page par
 /// page, et le recopier aurait fait diverger deux lecteurs du même protocole.
 ///
-/// Rend `(conteneurs, items, total_matches)`. Un `total_matches` de 0 avec des
-/// items rendus signifie seulement que le serveur ne l'annonce pas.
+/// Rend `(conteneurs, items, total_matches, incomplet)`. Un `total_matches` de
+/// 0 avec des items rendus signifie seulement que le serveur ne l'annonce pas.
+/// `incomplet` porte la raison d'un parcours arrêté APRÈS avoir lu quelque
+/// chose (#4895) : ce qui a été lu est servi, mais ce n'est pas tout.
 // UPnP Browse returns results in PAGES. The old code issued a single
 // Browse with RequestedCount=200 and returned only that page, so a server
 // with thousands of albums showed just its first page (~100 on MinimServer /
@@ -1254,7 +1329,7 @@ pub(crate) async fn parcourir_les_enfants(
     content_directory_url: &str,
     nom_du_serveur: &str,
     object_id: &str,
-) -> Result<(Vec<Value>, Vec<Value>, u32), EchecParcours> {
+) -> Result<(Vec<Value>, Vec<Value>, u32, Option<String>), EchecParcours> {
     let p = parcourir_les_enfants_verifie(content_directory_url, nom_du_serveur, object_id).await;
     // #4134 : l'échec de la PREMIÈRE page est celui du dossier — rien n'a été
     // lu, la route doit le dire au lieu de rendre un dossier vide muet. Un
@@ -1264,7 +1339,7 @@ pub(crate) async fn parcourir_les_enfants(
             return Err(cause);
         }
     }
-    Ok((p.conteneurs, p.items, p.total))
+    Ok((p.conteneurs, p.items, p.total, p.erreur))
 }
 
 pub(crate) struct ParcoursEnfants {
@@ -1273,9 +1348,12 @@ pub(crate) struct ParcoursEnfants {
     pub total: u32,
     pub erreur: Option<String>,
     /// La même défaillance, typée, pour la route `browse` (#4134) : elle en
-    /// tire 404 / 502 / 504 au lieu d'un dossier vide muet. Renseignée aux
-    /// seuls échecs qui peuvent frapper la PREMIÈRE page ; les incidents de
-    /// pagination, par construction, surviennent après avoir lu quelque chose.
+    /// tire 404 / 502 / 504 au lieu d'un dossier vide muet. Renseignée à TOUS
+    /// les échecs qui peuvent frapper la PREMIÈRE page — #4895 : un compteur
+    /// absent, un DIDL illisible ou une page vide sur N annoncés le peuvent
+    /// aussi, et sans cause ils rendaient un 200 vide. Les incidents qui ne
+    /// surviennent qu'après une page lue (catalogue changé, plafond…) n'en
+    /// ont pas besoin : la route les signale par `incomplet`.
     pub cause: Option<EchecParcours>,
 }
 
@@ -1409,15 +1487,26 @@ pub(crate) async fn parcourir_les_enfants_verifie(
         // Missing counters, malformed XML/HTML and SOAP faults are not empty libraries.
         let Some(returned) = returned else {
             p.erreur = Some(format!("{nom} : réponse Browse sans compteur valide"));
+            p.cause = Some(EchecParcours::SansCompteur);
             break;
         };
-        if returned != parsed || total.is_none() {
+        if returned != parsed {
             p.erreur = Some(format!(
                 "{nom} : réponse Browse incomplète ({parsed}/{returned})"
             ));
+            p.cause = Some(EchecParcours::DidlIllisible {
+                lus: parsed,
+                annonces: returned,
+            });
             break;
         }
-        let total = total.unwrap();
+        let Some(total) = total else {
+            p.erreur = Some(format!(
+                "{nom} : réponse Browse incomplète ({parsed}/{returned}, sans TotalMatches)"
+            ));
+            p.cause = Some(EchecParcours::SansTotal);
+            break;
+        };
         if total_annonce.is_some_and(|t| t != total) || (start > 0 && update != update_id) {
             p.erreur = Some(format!("{nom} : le catalogue a changé pendant le parcours"));
             break;
@@ -1430,6 +1519,9 @@ pub(crate) async fn parcourir_les_enfants_verifie(
         if returned == 0 {
             if total != 0 && start < total {
                 p.erreur = Some(format!("{nom} : pagination interrompue ({start}/{total})"));
+                // #4895 : sur la PREMIÈRE page (« 0/12 »), c'est l'échec du
+                // dossier entier ; plus loin, `incomplet` le dit à la route.
+                p.cause = Some(EchecParcours::PaginationInterrompue { lus: start, total });
             } else {
                 termine = true;
             }
@@ -1484,7 +1576,7 @@ async fn search_media_server(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<SearchQuery>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     let container = q.container.as_deref().unwrap_or("0");
     let vide = |supported: bool, raison: &str| {
         Json(json!({
@@ -1502,18 +1594,23 @@ async fn search_media_server(
     let servers = state.media_servers.lock().await;
     let ms = match servers.get(&id) {
         Some(ms) => ms.clone(),
-        None => return vide(false, "serveur inconnu"),
+        None => return Ok(vide(false, "serveur inconnu")),
     };
     drop(servers);
 
     if q.q.trim().is_empty() {
-        return vide(true, "");
+        return Ok(vide(true, ""));
     }
 
     let caps = capacites_de_recherche(&ms.content_directory_url).await;
     let criteria = match critere_de_recherche(&caps, &q.q) {
         Some(c) => c,
-        None => return vide(false, "ce serveur n'annonce pas la recherche par titre"),
+        None => {
+            return Ok(vide(
+                false,
+                "ce serveur n'annonce pas la recherche par titre",
+            ));
+        }
     };
 
     const PAGE_SIZE: u32 = 200;
@@ -1523,6 +1620,8 @@ async fn search_media_server(
     let mut items: Vec<Value> = Vec::new();
     let mut starting_index: u32 = 0;
     let mut total_matches: u32 = 0;
+    let mut cause: Option<EchecParcours> = None;
+    let mut termine = false;
 
     for _page in 0..MAX_PAGES {
         let soap_body = format!(
@@ -1560,10 +1659,12 @@ async fn search_media_server(
                     "search_media_server soap_error server={} start={starting_index} err={e}",
                     ms.name
                 );
+                cause = Some(EchecParcours::Transport(e.to_string()));
                 break;
             }
         };
 
+        let statut = resp.status();
         let body = resp.text().await.unwrap_or_default();
         // Un 708 (« critère non supporté ») n'est pas une panne : c'est un
         // serveur qui annonce plus qu'il n'évalue. On le dit, plutôt que de
@@ -1574,7 +1675,11 @@ async fn search_media_server(
                 "search_media_server refus server={} code={code} criteria={criteria}",
                 ms.name
             );
-            return vide(false, "ce serveur a refusé le critère de recherche");
+            return Ok(vide(false, "ce serveur a refusé le critère de recherche"));
+        }
+        if !statut.is_success() {
+            cause = Some(EchecParcours::Statut(statut.as_u16()));
+            break;
         }
 
         let (mut page_containers, mut page_items) = parse_didl_browse_response(&body);
@@ -1590,17 +1695,64 @@ async fn search_media_server(
         containers.append(&mut page_containers);
         items.append(&mut page_items);
 
-        if number_returned == 0 || parsed == 0 {
+        // #4895 — la boucle s'arrêtait EN SILENCE sur toute page vide : une
+        // page vide AU MILIEU (« 8/13 ») servait 8 résultats comme s'ils
+        // étaient tous, et une première page vide sur 12 annoncés se lisait
+        // « aucun résultat ». Même règle que le Browse : on dit pourquoi.
+        if parsed < number_returned {
+            cause = Some(EchecParcours::DidlIllisible {
+                lus: parsed,
+                annonces: number_returned,
+            });
+            break;
+        }
+        if number_returned == 0 {
+            if total_matches > starting_index {
+                cause = Some(EchecParcours::PaginationInterrompue {
+                    lus: starting_index,
+                    total: total_matches,
+                });
+            } else {
+                termine = true;
+            }
             break;
         }
         starting_index += number_returned.max(parsed);
         if total_matches != 0 && starting_index >= total_matches {
+            termine = true;
             break;
         }
     }
 
     let fetched = containers.len() + items.len();
-    Json(json!({
+    // Rien lu : l'échec est celui de la recherche entière — 502/504 typé, et
+    // la ligne `search_media_server_failed`, plutôt qu'un « aucun résultat ».
+    if fetched == 0
+        && let Some(cause) = &cause
+    {
+        return Err(cause.en_erreur_http_de(&ms.name, "Search"));
+    }
+    let incomplet = match &cause {
+        Some(cause) => Some(cause.statut_et_message(&ms.name, "Search").1),
+        // `total_matches == 0` : le serveur n'annonce pas de total ; la
+        // borne de pages atteinte n'y prouve rien de manquant.
+        None if !termine && total_matches > starting_index => Some(format!(
+            "{} : plafond de {MAX_PAGES} pages atteint au Search ({starting_index}/{total_matches})",
+            ms.name
+        )),
+        None => None,
+    };
+    if let Some(raison) = &incomplet {
+        warn!(
+            serveur = %ms.name,
+            container,
+            lus = fetched,
+            annonces = total_matches,
+            error = %raison,
+            "search_media_server_incomplete"
+        );
+    }
+    Ok(Json(json!({
         "container": container,
         "query": q.q,
         "supported": true,
@@ -1609,7 +1761,9 @@ async fn search_media_server(
         "items": items,
         "total_matches": (total_matches as usize).max(fetched),
         "number_returned": fetched,
-    }))
+        "complet": incomplet.is_none(),
+        "incomplet": incomplet,
+    })))
 }
 
 /// Ce que le serveur distant DIT savoir chercher.
@@ -1710,8 +1864,35 @@ fn xml_escape(v: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Position de la prochaine balise ouvrante `<nom>` ou `<nom …>` dans `doc`,
+/// à partir de l'octet `depuis`.
+///
+/// #4895 — l'analyseur cherchait `<item ` et `<container ` avec l'ESPACE : un
+/// serveur qui écrit `<item\n id="…">` ou `<container\tid="…">` — du XML
+/// parfaitement valide, le blanc après le nom de balise peut être n'importe
+/// quel blanc XML — voyait tout son DIDL lu comme vide. Ici, après le nom,
+/// seul compte un blanc XML (espace, tabulation, CR, LF) — ou `>` quand
+/// `nue_admise` : `<Result>`, `<res>`. `<itemfoo>` ou `<item:x>` ne sont PAS des
+/// `<item>` ; un `<item>` ou `<container>` NU non plus : DIDL-Lite leur impose
+/// `id`, `parentID` et `restricted`, et #4914 garde qu'un tel DIDL est dit
+/// illisible plutôt que lu avec des identifiants vides.
+fn balise_ouvrante(doc: &str, depuis: usize, nom: &str, nue_admise: bool) -> Option<usize> {
+    let motif = format!("<{nom}");
+    let mut pos = depuis;
+    while let Some(rel) = doc.get(pos..)?.find(&motif) {
+        let debut = pos + rel;
+        let suite = debut + motif.len();
+        match doc.as_bytes().get(suite) {
+            Some(b' ' | b'\t' | b'\n' | b'\r') => return Some(debut),
+            Some(b'>') if nue_admise => return Some(debut),
+            _ => pos = suite,
+        }
+    }
+    None
+}
+
 fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
-    let result_start = xml.find("<Result>").or_else(|| xml.find("<Result "));
+    let result_start = balise_ouvrante(xml, 0, "Result", true);
     let result_end = xml.find("</Result>");
     let didl = match (result_start, result_end) {
         (Some(s), Some(e)) => {
@@ -1732,11 +1913,10 @@ fn parse_didl_browse_response(xml: &str) -> (Vec<Value>, Vec<Value>) {
     let mut items = Vec::new();
 
     for tag in ["container", "item"] {
-        let open = format!("<{tag} ");
         let close = format!("</{tag}>");
         let mut pos = 0;
-        while let Some(start) = decoded[pos..].find(&open) {
-            let abs_start = pos + start;
+        // #4895 : tout blanc XML après le nom de balise, pas la seule espace.
+        while let Some(abs_start) = balise_ouvrante(&decoded, pos, tag, false) {
             if let Some(end) = decoded[abs_start..].find(&close) {
                 let element = &decoded[abs_start..abs_start + end + close.len()];
                 let id = extract_attr(element, "id").unwrap_or_default();
@@ -1836,14 +2016,9 @@ struct DidlRes {
 fn parse_res_elements(element: &str) -> Vec<DidlRes> {
     let mut out = Vec::new();
     let mut pos = 0;
-    while let Some(start) = element[pos..].find("<res") {
-        let abs = pos + start;
-        // Only match the actual <res> tag ("<res " / "<res>"), not e.g. <resType>.
-        let after = &element[abs + 4..];
-        if !(after.starts_with(' ') || after.starts_with('>')) {
-            pos = abs + 4;
-            continue;
-        }
+    // Only match the actual <res> tag, not e.g. <resType> — and, #4895, with
+    // ANY XML whitespace after the name (`<res\n protocolInfo=…>`).
+    while let Some(abs) = balise_ouvrante(element, pos, "res", true) {
         let Some(tag_end_rel) = element[abs..].find('>') else {
             break;
         };
@@ -2011,11 +2186,12 @@ fn texte_didl(brut: &str) -> String {
 
 fn extract_xml_tag(element: &str, tag: &str) -> Option<String> {
     let open_full = format!("<{tag}>");
-    let open_attr = format!("<{tag} ");
     let close = format!("</{tag}>");
+    // #4895 : `<dc:title\n xml:lang=…>` est une balise avec attributs, au même
+    // titre que `<dc:title xml:lang=…>`.
     let content_start = if let Some(s) = element.find(&open_full) {
         s + open_full.len()
-    } else if let Some(s) = element.find(&open_attr) {
+    } else if let Some(s) = balise_ouvrante(element, 0, tag, true) {
         let after = &element[s..];
         after.find('>')? + s + 1
     } else {
@@ -2458,11 +2634,12 @@ mod tests_browse_dit_son_echec_4134 {
     #[tokio::test]
     async fn un_dossier_reellement_vide_reste_un_succes() {
         let url = faux_serveur("200 OK", BROWSE_VIDE).await;
-        let (c, i, total) = parcourir_les_enfants(&url, "faux", "0")
+        let (c, i, total, incomplet) = parcourir_les_enfants(&url, "faux", "0")
             .await
             .expect("vide ≠ échec");
         assert!(c.is_empty() && i.is_empty());
         assert_eq!(total, 0);
+        assert_eq!(incomplet, None, "un dossier vide est complet");
     }
 
     #[tokio::test]
