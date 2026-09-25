@@ -908,6 +908,11 @@ path = "tests/albums_masques_dans_le_rapport_4319.rs"
 name = "bug_report_captures_4564"
 path = "tests/bug_report_captures_4564.rs"
 
+# #5068 — la limite d'envoi du site (429) rendue en code stable `rate_limited`.
+[[test]]
+name = "bug_report_limite_5068"
+path = "tests/bug_report_limite_5068.rs"
+
 # Les étiquettes — types admis, playlists, et depuis le 22/09/2026 le refus
 # d'un `item_id` nul. Le fichier existait, mais `autotests = false` plus haut le
 # laissait hors compilation : ses gardes n'étaient exécutées par personne.
