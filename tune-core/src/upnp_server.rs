@@ -16,7 +16,7 @@ use crate::db::radio_repo::RadioRepo;
 use std::sync::Arc;
 
 use crate::db::backend::DbBackend;
-use crate::db::track_repo::TrackRepo;
+use crate::db::track_repo::{ColonneTextePiste, TrackRepo};
 use crate::discovery::ssdp;
 
 /// Parcours par dossiers (#4318) — le rayon « Folders ».
@@ -634,7 +634,14 @@ pub fn build_browse_response(state: &UpnpState, soap_body: &str) -> String {
 /// l'evaluer le faisait tomber dans le bras « autre champ » d'`evaluer_criteres`
 /// — donc un SOAP 708, donc un dossier vide chez Foobar2000 et WiiM la ou
 /// Emby et Serviio remplissaient (Roro62, fil forum, #1390).
-const SEARCH_CAPS: &str = "upnp:class,dc:title,@refID";
+///
+/// `upnp:artist`, `dc:creator`, `upnp:album` et `upnp:genre` s'y ajoutent pour
+/// #4955 (Jean Valjean, Marantz ND8006, trois releves du 30/08 au 24/09) : la
+/// recherche d'un lecteur reseau est une recherche d'ARTISTE, d'ALBUM ou de
+/// titre, et un point de controle qui ne lit que `upnp:class,dc:title` dans nos
+/// capacites n'a pas de quoi formuler la premiere. Ils sont evalues — sur le
+/// nom visible de l'objet, voir [`ChampTexte`] —, pas seulement annonces.
+const SEARCH_CAPS: &str = "upnp:class,dc:title,upnp:artist,dc:creator,upnp:album,upnp:genre,@refID";
 
 /// L'action `Search` de ContentDirectory.
 ///
@@ -661,13 +668,25 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
     };
 
     let (container_id, criteria, start, count, sort_criteria) = parse_search_request(soap_body);
-    if !sort_criteria.trim().is_empty() {
-        return soap_fault(709, "Unsupported or invalid sort criteria");
-    }
+    debug!(
+        container = %container_id,
+        criteria = %criteria,
+        sort = %sort_criteria,
+        start,
+        "upnp_search"
+    );
+    // #4955 : un `SortCriteria` non vide recevait un SOAP 709, et la
+    // recherche entiere avec lui. `Browse` l'a toujours ignore — et c'est ce
+    // verbe-la que les lecteurs reseau utilisent sans encombre sur le meme
+    // serveur. Un point de controle qui demande `+dc:title` alors que
+    // `SortCaps` est vide veut des RESULTATS avant de vouloir un ordre : il les
+    // recoit, dans l'ordre du serveur, comme pour `Browse`.
     let criteres = match evaluer_criteres(&criteria) {
         Ok(c) => c,
         Err(()) => {
-            debug!(criteria = %criteria, "upnp_search_criteria_non_supporte");
+            // `warn`, pas `debug` : c'est la seule trace qu'un point de
+            // controle a cherche et n'a rien recu (#4955 n'avait rien a lire).
+            warn!(criteria = %criteria, "upnp_search_criteria_non_supporte");
             return soap_fault(708, "Unsupported or invalid search criteria");
         }
     };
@@ -680,7 +699,7 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
             start,
             count,
             &base_url,
-            &criteres.titres,
+            &criteres.filtre,
         ) {
             Some(result) => result,
             None => return soap_fault(710, "No such container"),
@@ -692,7 +711,7 @@ fn search_action_response(state: &UpnpState, soap_body: &str) -> String {
                 &container_id,
                 start,
                 count,
-                &criteres.titres,
+                &criteres.filtre,
             ) {
                 Some(result) => result,
                 None => return soap_fault(710, "No such container"),
@@ -826,42 +845,6 @@ fn predicat_de_classe(op: &str, valeur: &str, classe: &str, ancetres: &[&str]) -
     }
 }
 
-/// Évalue le sous-ensemble de SearchCriteria réellement annoncé, et rend les
-/// rubriques que le prédicat laisse passer.
-///
-/// Tune annonce `upnp:class` et `dc:title`. Toute expression qui mentionne un
-/// autre champ reçoit le SOAP 708 prévu par ContentDirectory, au lieu de
-/// rendre mensongèrement toute la bibliothèque.
-///
-/// `*` reste le raccourci d'indexation historique — il laisse passer tout ce
-/// qu'on publie, et [`cible_unique`] le ramène aux pistes.
-fn cibles_du_predicat(criteria: &str) -> Result<Vec<CibleRecherche>, ()> {
-    let c = criteria.trim();
-    if c == "*" {
-        return Ok(CLASSES_PUBLIEES
-            .iter()
-            .map(|(cible, _, _)| *cible)
-            .collect());
-    }
-    let parts: Vec<&str> = c.split_whitespace().collect();
-    if parts.len() != 3 || !parts[0].eq_ignore_ascii_case("upnp:class") {
-        return Err(());
-    }
-    let valeur = parts[2]
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .ok_or(())?
-        .to_ascii_lowercase();
-    let op = parts[1].to_ascii_lowercase();
-    let mut retenues = Vec::new();
-    for (cible, classe, ancetres) in CLASSES_PUBLIEES {
-        if predicat_de_classe(&op, &valeur, classe, ancetres)? {
-            retenues.push(cible);
-        }
-    }
-    Ok(retenues)
-}
-
 /// Une expression de classe peut laisser passer PLUSIEURS rubriques :
 /// `derivedfrom "object.item.audioItem"` vise à la fois les pistes et les
 /// radios. La règle est choisie pour ne rien changer à ce qui marchait — les
@@ -886,13 +869,14 @@ fn cible_unique(cibles: &[CibleRecherche]) -> Option<CibleRecherche> {
 /// Forme historique conservée : c'est elle qui porte l'invariant de #2312 —
 /// n'annoncer que ce qu'on évalue — et les tests qui le tiennent.
 ///
-/// La recherche de production passe désormais par [`evaluer_criteres`], qui
-/// intersecte TOUTES les rubriques publiées puis conclut par [`cible_unique`] ;
-/// ce raccourci « est-ce des pistes ? » n'y a plus d'appelant. Portée `test`
-/// pour le dire, plutôt que de laisser croire à une seconde porte d'entrée.
+/// La recherche de production passe par [`evaluer_criteres`], qui résout le
+/// critère pour TOUTES les rubriques publiées puis conclut par
+/// [`cible_unique`] ; ce raccourci « est-ce des pistes ? » n'y a pas
+/// d'appelant. Portée `test` pour le dire, plutôt que de laisser croire à une
+/// seconde porte d'entrée.
 #[cfg(test)]
 fn evaluate_supported_class_criteria(criteria: &str) -> Result<bool, ()> {
-    Ok(cibles_du_predicat(criteria)?.contains(&CibleRecherche::Pistes))
+    Ok(evaluer_criteres(criteria)?.cible == Some(CibleRecherche::Pistes))
 }
 
 /// Un predicat sur `dc:title`.
@@ -964,61 +948,174 @@ fn sans_accents_minuscule(s: &str) -> String {
         .collect()
 }
 
+/// Un champ TEXTE qu'un `SearchCriteria` peut interroger, et que
+/// `SEARCH_CAPS` annonce.
+///
+/// Chaque objet publié le lit sur son nom visible — celui que le DIDL met dans
+/// `<dc:title>`, ou l'attribut du même nom quand l'objet le porte : l'artiste
+/// d'une piste ou d'un album, le titre de l'album d'une piste, son genre. Un
+/// objet qui n'a pas le champ ne satisfait aucun prédicat sur lui : un genre
+/// n'a pas d'album, une liste de lecture pas d'artiste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChampTexte {
+    Titre,
+    Artiste,
+    Album,
+    Genre,
+}
+
+impl ChampTexte {
+    fn depuis(nom: &str) -> Option<Self> {
+        match nom.to_ascii_lowercase().as_str() {
+            "dc:title" => Some(ChampTexte::Titre),
+            // `dc:creator` est la forme Dublin Core de l'artiste : les deux
+            // circulent, selon que le point de controle vient du monde
+            // DLNA ou du monde UPnP AV.
+            "upnp:artist" | "dc:creator" => Some(ChampTexte::Artiste),
+            "upnp:album" => Some(ChampTexte::Album),
+            "upnp:genre" => Some(ChampTexte::Genre),
+            _ => None,
+        }
+    }
+
+    /// La colonne de la base qui porte ce champ pour une piste — le
+    /// pre-filtre SQL de [`candidats_par_filtre`]. C'est aussi ce que lit
+    /// [`champ_de_piste`] : les deux doivent dire la meme chose.
+    fn colonne_de_piste(self) -> ColonneTextePiste {
+        match self {
+            ChampTexte::Titre => ColonneTextePiste::Titre,
+            ChampTexte::Artiste => ColonneTextePiste::Artiste,
+            ChampTexte::Album => ColonneTextePiste::Album,
+            ChampTexte::Genre => ColonneTextePiste::Genre,
+        }
+    }
+}
+
+/// Ce qu'il reste d'un `SearchCriteria` une fois la RUBRIQUE fixee : les
+/// predicats de classe et `@refID` sont devenus des constantes, seuls restent
+/// les predicats de texte, a appliquer objet par objet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Filtre {
+    Vrai,
+    Faux,
+    Texte(ChampTexte, PredicatTitre),
+    Et(Vec<Filtre>),
+    Ou(Vec<Filtre>),
+}
+
+impl Filtre {
+    /// Conjonction simplifiee : `Vrai` s'efface, `Faux` absorbe.
+    fn et(parties: Vec<Filtre>) -> Filtre {
+        let mut gardees = Vec::new();
+        for p in parties {
+            match p {
+                Filtre::Vrai => {}
+                Filtre::Faux => return Filtre::Faux,
+                autre => gardees.push(autre),
+            }
+        }
+        match gardees.len() {
+            0 => Filtre::Vrai,
+            1 => gardees.remove(0),
+            _ => Filtre::Et(gardees),
+        }
+    }
+
+    /// Disjonction simplifiee : `Faux` s'efface, `Vrai` absorbe.
+    fn ou(parties: Vec<Filtre>) -> Filtre {
+        let mut gardees = Vec::new();
+        for p in parties {
+            match p {
+                Filtre::Faux => {}
+                Filtre::Vrai => return Filtre::Vrai,
+                autre => gardees.push(autre),
+            }
+        }
+        match gardees.len() {
+            0 => Filtre::Faux,
+            1 => gardees.remove(0),
+            _ => Filtre::Ou(gardees),
+        }
+    }
+
+    /// L'objet dont `champ` lit les attributs satisfait-il le filtre ?
+    fn satisfait<'a>(&self, champ: &impl Fn(ChampTexte) -> Option<&'a str>) -> bool {
+        match self {
+            Filtre::Vrai => true,
+            Filtre::Faux => false,
+            Filtre::Texte(c, p) => champ(*c).is_some_and(|v| p.satisfait(v)),
+            Filtre::Et(parties) => parties.iter().all(|p| p.satisfait(champ)),
+            Filtre::Ou(parties) => parties.iter().any(|p| p.satisfait(champ)),
+        }
+    }
+
+    /// Des predicats POSITIFS dont l'un au moins est vrai pour tout objet qui
+    /// satisfait le filtre — donc de quoi interroger la base sans la lire
+    /// entiere. `None` quand il n'en existe pas (un filtre purement negatif,
+    /// par exemple) : l'appelant se replie alors sur une lecture bornee.
+    fn predicats_couvrants(&self) -> Option<Vec<(ChampTexte, &str)>> {
+        match self {
+            Filtre::Vrai => None,
+            Filtre::Faux => Some(Vec::new()),
+            Filtre::Texte(c, p) => p.valeur_prefiltrante().map(|v| vec![(*c, v)]),
+            // Une conjonction est couverte par N'IMPORTE LAQUELLE de ses
+            // parties couvertes : on prend la plus etroite.
+            Filtre::Et(parties) => parties
+                .iter()
+                .filter_map(Filtre::predicats_couvrants)
+                .min_by_key(Vec::len),
+            // Une disjonction ne l'est que si TOUTES ses branches le sont.
+            Filtre::Ou(parties) => {
+                let mut tous = Vec::new();
+                for p in parties {
+                    tous.extend(p.predicats_couvrants()?);
+                }
+                Some(tous)
+            }
+        }
+    }
+}
+
 /// Ce qu'un `SearchCriteria` demande, une fois reduit a ce qu'on sait faire.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CriteresRecherche {
     /// La rubrique visee, ou `None` si aucune classe publiee ne convient —
     /// une recherche de photos, par exemple, rend une liste vide.
     pub(crate) cible: Option<CibleRecherche>,
-    pub(crate) titres: Vec<PredicatTitre>,
+    /// Les predicats de texte a appliquer aux objets de cette rubrique.
+    pub(crate) filtre: Filtre,
 }
 
-/// Analyse le `SearchCriteria` et le reduit aux champs ANNONCES.
-///
-/// Portee, volontairement etroite et alignee sur `SEARCH_CAPS` :
-/// - `*`, le raccourci d'indexation historique ;
-/// - des predicats sur `upnp:class` et `dc:title` ;
-/// - `@refID exists true|false`, la clause d'existence des exemples de la
-///   specification (#1390) ;
-/// - leur conjonction par `and`.
-///
-/// Tout le reste — `or`, parentheses, autre champ — rend `Err`, donc un SOAP
-/// 708. C'est la lecon de #2312 : mieux vaut refuser explicitement que rendre
-/// la bibliotheque entiere en faisant croire qu'on a cherche.
-pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> {
-    let c = criteria.trim();
-    if c == "*" {
-        return Ok(CriteresRecherche {
-            cible: Some(CibleRecherche::Pistes),
-            titres: Vec::new(),
-        });
-    }
-    if c.contains('(') || c.contains(')') {
-        return Err(());
-    }
+/// Le critere tel qu'il est ecrit, avant d'etre resolu pour une rubrique.
+#[derive(Debug, Clone, PartialEq)]
+enum Expression {
+    /// `upnp:class <op> "<valeur>"`, op et valeur en minuscules.
+    Classe {
+        op: String,
+        valeur: String,
+    },
+    /// `@refID exists <bool>`.
+    RefId {
+        existe: bool,
+    },
+    Texte(ChampTexte, PredicatTitre),
+    Et(Vec<Expression>),
+    Ou(Vec<Expression>),
+}
 
-    // On part de TOUT ce qu'on publie, et chaque predicat de classe restreint.
-    // La conjonction se lit donc comme une intersection, ce qu'elle est.
-    let mut cibles: Vec<CibleRecherche> = CLASSES_PUBLIEES
-        .iter()
-        .map(|(cible, _, _)| *cible)
-        .collect();
-    let mut titres = Vec::new();
-    for predicat in decouper_conjonction(c)? {
-        let (champ, op, valeur) = decouper_predicat(&predicat)?;
-        if champ.eq_ignore_ascii_case("upnp:class") {
-            let retenues = cibles_du_predicat(&format!("{champ} {op} \"{valeur}\""))?;
-            cibles.retain(|cible| retenues.contains(cible));
-        } else if champ.eq_ignore_ascii_case("dc:title") {
-            let op = match op.to_ascii_lowercase().as_str() {
-                "contains" => OpTitre::Contient,
-                "doesnotcontain" => OpTitre::NeContientPas,
-                "=" => OpTitre::Egal,
-                "!=" => OpTitre::Different,
-                _ => return Err(()),
-            };
-            titres.push(PredicatTitre { op, valeur });
-        } else if champ.eq_ignore_ascii_case("@refID") {
+impl Expression {
+    /// Le filtre qui reste pour UNE classe publiee.
+    fn pour_la_classe(&self, classe: &str, ancetres: &[&str]) -> Filtre {
+        match self {
+            // L'operateur a ete verifie a la lecture : l'erreur ne peut plus
+            // venir d'ici.
+            Expression::Classe { op, valeur } => {
+                if predicat_de_classe(op, valeur, classe, ancetres).unwrap_or(false) {
+                    Filtre::Vrai
+                } else {
+                    Filtre::Faux
+                }
+            }
             // `@refID exists false` = « pas les objets de reference ». Tune
             // n'en publie AUCUN — aucun `<item>` ni `<container>` sorti d'ici
             // ne porte de `refID` —, donc tout ce que nous publions satisfait
@@ -1027,94 +1124,246 @@ pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> 
             // Sa forme inverse, `@refID exists true`, ne peut rendre que la
             // liste vide, pour la meme raison. Vide, pas en faute : c'est la
             // regle deja tenue par `une_classe_inconnue_ou_ambigue_rend_une_liste_vide`.
-            if !op.eq_ignore_ascii_case("exists") {
-                return Err(());
+            Expression::RefId { existe } => {
+                if *existe {
+                    Filtre::Faux
+                } else {
+                    Filtre::Vrai
+                }
             }
-            match valeur.to_ascii_lowercase().as_str() {
-                "false" => {}
-                "true" => cibles.clear(),
-                _ => return Err(()),
-            }
-        } else {
-            return Err(());
+            Expression::Texte(c, p) => Filtre::Texte(*c, p.clone()),
+            Expression::Et(parties) => Filtre::et(
+                parties
+                    .iter()
+                    .map(|p| p.pour_la_classe(classe, ancetres))
+                    .collect(),
+            ),
+            Expression::Ou(parties) => Filtre::ou(
+                parties
+                    .iter()
+                    .map(|p| p.pour_la_classe(classe, ancetres))
+                    .collect(),
+            ),
         }
     }
-    Ok(CriteresRecherche {
-        cible: cible_unique(&cibles),
-        titres,
+}
+
+/// Analyse le `SearchCriteria` et le reduit aux champs ANNONCES.
+///
+/// Portee alignee sur `SEARCH_CAPS` :
+/// - `*`, le raccourci d'indexation historique ;
+/// - des predicats sur `upnp:class`, `dc:title`, `upnp:artist`, `dc:creator`,
+///   `upnp:album` et `upnp:genre` ;
+/// - `@refID exists true|false`, la clause d'existence des exemples de la
+///   specification (#1390) ;
+/// - leur combinaison par `and`, `or` et parentheses — la grammaire de
+///   ContentDirectory:1, `and` liant plus fort que `or`.
+///
+/// Les parentheses et `or` sont entres avec #4955 : un lecteur reseau enrobe
+/// volontiers son critere — `(upnp:class derivedfrom "…" and dc:title contains
+/// "…")` — ou cherche un nom dans plusieurs champs a la fois. Les refuser
+/// rendait un SOAP 708 a une recherche parfaitement evaluable.
+///
+/// Tout le reste — autre champ, autre operateur, guillemet ou parenthese non
+/// ferme — rend `Err`, donc un SOAP 708. C'est la lecon de #2312 : mieux vaut
+/// refuser explicitement que rendre la bibliotheque entiere en faisant croire
+/// qu'on a cherche.
+pub(crate) fn evaluer_criteres(criteria: &str) -> Result<CriteresRecherche, ()> {
+    let c = criteria.trim();
+    if c == "*" {
+        return Ok(CriteresRecherche {
+            cible: Some(CibleRecherche::Pistes),
+            filtre: Filtre::Vrai,
+        });
+    }
+    let jetons = decouper_jetons(c)?;
+    let mut position = 0;
+    let expression = lire_disjonction(&jetons, &mut position)?;
+    if position != jetons.len() {
+        return Err(());
+    }
+
+    // Chaque classe publiee recoit son filtre ; celles pour lesquelles il est
+    // `Faux` sont hors du critere.
+    let mut retenues: Vec<(CibleRecherche, Filtre)> = Vec::new();
+    for (cible, classe, ancetres) in CLASSES_PUBLIEES {
+        let filtre = expression.pour_la_classe(classe, ancetres);
+        if filtre != Filtre::Faux {
+            retenues.push((cible, filtre));
+        }
+    }
+    let cibles: Vec<CibleRecherche> = retenues.iter().map(|(c, _)| *c).collect();
+    Ok(match cible_unique(&cibles) {
+        Some(cible) => CriteresRecherche {
+            cible: Some(cible),
+            filtre: retenues
+                .into_iter()
+                .find(|(c, _)| *c == cible)
+                .map(|(_, f)| f)
+                .unwrap_or(Filtre::Faux),
+        },
+        None => CriteresRecherche {
+            cible: None,
+            filtre: Filtre::Faux,
+        },
     })
 }
 
-/// Coupe sur les `and` de premier niveau, en respectant les guillemets — un
-/// titre peut contenir « and », et le couper la ferait chercher n'importe quoi.
-fn decouper_conjonction(c: &str) -> Result<Vec<String>, ()> {
-    let mut parties = Vec::new();
-    let mut courant = String::new();
-    let mut dans_guillemets = false;
-    let mut mots = Vec::new();
-    for ch in c.chars() {
-        if ch == '"' {
-            dans_guillemets = !dans_guillemets;
-            courant.push(ch);
-        } else if ch.is_whitespace() && !dans_guillemets {
-            if !courant.is_empty() {
-                mots.push(std::mem::take(&mut courant));
-            }
-        } else {
-            courant.push(ch);
-        }
-    }
-    if dans_guillemets {
-        return Err(());
-    }
-    if !courant.is_empty() {
-        mots.push(courant);
-    }
-
-    let mut bloc: Vec<String> = Vec::new();
-    for mot in mots {
-        if mot.eq_ignore_ascii_case("or") {
-            return Err(());
-        }
-        if mot.eq_ignore_ascii_case("and") {
-            if bloc.is_empty() {
-                return Err(());
-            }
-            parties.push(bloc.join(" "));
-            bloc = Vec::new();
-        } else {
-            bloc.push(mot);
-        }
-    }
-    if bloc.is_empty() {
-        return Err(());
-    }
-    parties.push(bloc.join(" "));
-    Ok(parties)
+/// Un jeton de `SearchCriteria`.
+#[derive(Debug, Clone, PartialEq)]
+enum Jeton {
+    Ouvrante,
+    Fermante,
+    /// Une chaine entre guillemets, sequences `\"` et `\\` resolues.
+    Chaine(String),
+    /// Un nom de champ, un operateur, `and`/`or`, ou le booleen d'`exists`.
+    Mot(String),
 }
 
-/// `champ op "valeur"` — la valeur garde ses espaces.
-fn decouper_predicat(p: &str) -> Result<(String, String, String), ()> {
-    let mut it = p.splitn(3, ' ');
-    let champ = it.next().ok_or(())?.to_string();
-    let op = it.next().ok_or(())?.to_string();
-    let brut = it.next().ok_or(())?.trim().to_string();
-    let valeur = match brut.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        Some(v) => v.to_string(),
-        // `exists` prend un booleen NU — `@refID exists false`, sans
-        // guillemets, comme dans les exemples de la specification. Exiger des
-        // guillemets partout faisait echouer le decoupage AVANT meme qu'on
-        // regarde le champ, et le critere entier partait en 708 (#1390).
-        // La tolerance s'arrete la : elle n'est ouverte que pour `exists`, et
-        // seulement pour `true`/`false`.
-        None if op.eq_ignore_ascii_case("exists")
-            && (brut.eq_ignore_ascii_case("true") || brut.eq_ignore_ascii_case("false")) =>
-        {
-            brut
+/// Decoupe le critere en jetons, en respectant les guillemets — un titre peut
+/// contenir « and », une parenthese ou un espace.
+fn decouper_jetons(c: &str) -> Result<Vec<Jeton>, ()> {
+    let mut jetons = Vec::new();
+    let mut chars = c.chars().peekable();
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+        } else if ch == '(' {
+            chars.next();
+            jetons.push(Jeton::Ouvrante);
+        } else if ch == ')' {
+            chars.next();
+            jetons.push(Jeton::Fermante);
+        } else if ch == '"' {
+            chars.next();
+            let mut valeur = String::new();
+            let mut fermee = false;
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => valeur.push(chars.next().ok_or(())?),
+                    '"' => {
+                        fermee = true;
+                        break;
+                    }
+                    autre => valeur.push(autre),
+                }
+            }
+            if !fermee {
+                return Err(());
+            }
+            jetons.push(Jeton::Chaine(valeur));
+        } else {
+            let mut mot = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() || ch == '(' || ch == ')' || ch == '"' {
+                    break;
+                }
+                mot.push(ch);
+                chars.next();
+            }
+            jetons.push(Jeton::Mot(mot));
         }
-        None => return Err(()),
+    }
+    Ok(jetons)
+}
+
+fn est_le_mot(jeton: Option<&Jeton>, attendu: &str) -> bool {
+    matches!(jeton, Some(Jeton::Mot(m)) if m.eq_ignore_ascii_case(attendu))
+}
+
+/// `disjonction := conjonction ("or" conjonction)*`
+fn lire_disjonction(jetons: &[Jeton], position: &mut usize) -> Result<Expression, ()> {
+    let mut parties = vec![lire_conjonction(jetons, position)?];
+    while est_le_mot(jetons.get(*position), "or") {
+        *position += 1;
+        parties.push(lire_conjonction(jetons, position)?);
+    }
+    Ok(if parties.len() == 1 {
+        parties.remove(0)
+    } else {
+        Expression::Ou(parties)
+    })
+}
+
+/// `conjonction := facteur ("and" facteur)*`
+fn lire_conjonction(jetons: &[Jeton], position: &mut usize) -> Result<Expression, ()> {
+    let mut parties = vec![lire_facteur(jetons, position)?];
+    while est_le_mot(jetons.get(*position), "and") {
+        *position += 1;
+        parties.push(lire_facteur(jetons, position)?);
+    }
+    Ok(if parties.len() == 1 {
+        parties.remove(0)
+    } else {
+        Expression::Et(parties)
+    })
+}
+
+/// `facteur := "(" disjonction ")" | champ operateur valeur`
+fn lire_facteur(jetons: &[Jeton], position: &mut usize) -> Result<Expression, ()> {
+    if jetons.get(*position) == Some(&Jeton::Ouvrante) {
+        *position += 1;
+        let interieur = lire_disjonction(jetons, position)?;
+        if jetons.get(*position) != Some(&Jeton::Fermante) {
+            return Err(());
+        }
+        *position += 1;
+        return Ok(interieur);
+    }
+    let Some(Jeton::Mot(champ)) = jetons.get(*position) else {
+        return Err(());
     };
-    Ok((champ, op, valeur))
+    let Some(Jeton::Mot(op)) = jetons.get(*position + 1) else {
+        return Err(());
+    };
+    let valeur = jetons.get(*position + 2).ok_or(())?;
+    *position += 3;
+    let op = op.to_ascii_lowercase();
+
+    if champ.eq_ignore_ascii_case("upnp:class") {
+        let Jeton::Chaine(valeur) = valeur else {
+            return Err(());
+        };
+        let valeur = valeur.to_ascii_lowercase();
+        // Verifie l'operateur une fois pour toutes : `pour_la_classe` n'a
+        // plus a le faire.
+        predicat_de_classe(&op, &valeur, "", &[])?;
+        return Ok(Expression::Classe { op, valeur });
+    }
+    if champ.eq_ignore_ascii_case("@refID") {
+        // `exists` prend un booleen NU — `@refID exists false`, sans
+        // guillemets, comme dans les exemples de la specification (#1390).
+        if op != "exists" {
+            return Err(());
+        }
+        let brut = match valeur {
+            Jeton::Mot(m) | Jeton::Chaine(m) => m.to_ascii_lowercase(),
+            _ => return Err(()),
+        };
+        return match brut.as_str() {
+            "true" => Ok(Expression::RefId { existe: true }),
+            "false" => Ok(Expression::RefId { existe: false }),
+            _ => Err(()),
+        };
+    }
+    let champ = ChampTexte::depuis(champ).ok_or(())?;
+    let Jeton::Chaine(valeur) = valeur else {
+        return Err(());
+    };
+    let op = match op.as_str() {
+        "contains" => OpTitre::Contient,
+        "doesnotcontain" => OpTitre::NeContientPas,
+        "=" => OpTitre::Egal,
+        "!=" => OpTitre::Different,
+        _ => return Err(()),
+    };
+    Ok(Expression::Texte(
+        champ,
+        PredicatTitre {
+            op,
+            valeur: valeur.clone(),
+        },
+    ))
 }
 
 /// Pistes situées sous le conteneur demandé, avec pagination et total filtré.
@@ -1129,19 +1378,19 @@ fn search_tracks_in_container(
     start: u64,
     count: u64,
     base_url: &str,
-    titres: &[PredicatTitre],
+    filtre: &Filtre,
 ) -> Option<DidlResult> {
     match container_id {
         // Fil 1916 : chercher DANS un ensemble de pistes reste dans cet
         // ensemble, et dans son ordre — mélangé compris.
         id if ensemble_de_pistes(id).is_some() => {
-            if titres.is_empty() {
+            if *filtre == Filtre::Vrai {
                 return Some(browse_ensemble_de_pistes(state, id, start, count, base_url));
             }
             let ids = ids_de_l_ensemble(state, id).unwrap_or_default();
             let tracks = pistes_dans_l_ordre(state, &ids);
             Some(paginate_track_results(
-                filtrer_par_titre(tracks, titres),
+                filtrer_pistes(tracks, filtre),
                 id,
                 start,
                 count,
@@ -1149,12 +1398,12 @@ fn search_tracks_in_container(
             ))
         }
         "0" | "tracks" | "artists" | "albums" | "genres" | "years" | "playlists" => {
-            if titres.is_empty() {
-                // Sans predicat de titre, c'est le parcours d'indexation :
+            if *filtre == Filtre::Vrai {
+                // Sans predicat de texte, c'est le parcours d'indexation :
                 // la pagination reste celle de la base, pas de la memoire.
                 return Some(browse_all_tracks(state, start, count, base_url));
             }
-            let tracks = candidats_par_titre(state, titres)?;
+            let tracks = candidats_par_filtre(state, filtre)?;
             Some(paginate_track_results(
                 tracks, "tracks", start, count, base_url,
             ))
@@ -1170,7 +1419,7 @@ fn search_tracks_in_container(
                 .list_by_album(album_id)
                 .ok()?;
             Some(paginate_track_results(
-                filtrer_par_titre(tracks, titres),
+                filtrer_pistes(tracks, filtre),
                 id,
                 start,
                 count,
@@ -1183,7 +1432,7 @@ fn search_tracks_in_container(
                 .list_by_artist(artist_id)
                 .ok()?;
             Some(paginate_track_results(
-                filtrer_par_titre(tracks, titres),
+                filtrer_pistes(tracks, filtre),
                 id,
                 start,
                 count,
@@ -1199,7 +1448,7 @@ fn search_tracks_in_container(
                 .ok()?;
             let tracks = pistes_dans_l_ordre(state, &ids);
             Some(paginate_track_results(
-                filtrer_par_titre(tracks, titres),
+                filtrer_pistes(tracks, filtre),
                 id,
                 start,
                 count,
@@ -1239,7 +1488,7 @@ fn search_containers_in_container(
     container_id: &str,
     start: u64,
     count: u64,
-    titres: &[PredicatTitre],
+    filtre: &Filtre,
 ) -> Option<DidlResult> {
     // Chercher des artistes DANS un album n'a pas de sens : la liste est vide,
     // elle n'est pas fautive. Seul un identifiant qu'on ne publie nulle part
@@ -1260,7 +1509,7 @@ fn search_containers_in_container(
             let artistes = ArtistRepo::with_backend(state.backend.clone())
                 .list(MAX_CANDIDATS_CONTENEURS, 0)
                 .unwrap_or_default();
-            let retenus = retenir_par_titre(artistes, titres, |a| a.name.as_str());
+            let retenus = retenir(artistes, filtre, champ_d_artiste);
             let (page, total) = paginer(retenus, start, count);
             Some(didl_artistes(state, &page, "artists", total))
         }
@@ -1268,7 +1517,7 @@ fn search_containers_in_container(
             let albums = AlbumRepo::with_backend(state.backend.clone())
                 .list(MAX_CANDIDATS_CONTENEURS, 0)
                 .unwrap_or_default();
-            let retenus = retenir_par_titre(albums, titres, |a| a.title.as_str());
+            let retenus = retenir(albums, filtre, champ_d_album);
             let (page, total) = paginer(retenus, start, count);
             let mut didl = didl_albums_under(&page, "albums", &base_url);
             didl.total = total;
@@ -1276,7 +1525,7 @@ fn search_containers_in_container(
         }
         CibleRecherche::Genres => {
             let genres = lire_genres(state);
-            let retenus = retenir_par_titre(genres, titres, |g| g.0.as_str());
+            let retenus = retenir(genres, filtre, champ_de_genre);
             let (page, total) = paginer(retenus, start, count);
             let mut didl = didl_genres(&page);
             didl.total = total;
@@ -1287,7 +1536,9 @@ fn search_containers_in_container(
         // un verbe, vide par l'autre. Même source, même émetteur DIDL.
         CibleRecherche::Listes => {
             let listes = lire_listes_publiables(state);
-            let retenues = retenir_par_titre(listes, titres, |l| l.name.as_str());
+            let retenues = retenir(listes, filtre, |l, champ| {
+                (champ == ChampTexte::Titre).then_some(l.name.as_str())
+            });
             let (page, total) = paginer(retenues, start, count);
             let mut didl = didl_listes(&page);
             didl.total = total;
@@ -1297,7 +1548,9 @@ fn search_containers_in_container(
             let stations = RadioRepo::with_backend(state.backend.clone())
                 .list()
                 .unwrap_or_default();
-            let retenues = retenir_par_titre(stations, titres, |s| s.name.as_str());
+            let retenues = retenir(stations, filtre, |s, champ| {
+                (champ == ChampTexte::Titre).then_some(s.name.as_str())
+            });
             let (page, total) = paginer(retenues, start, count);
             // Le verbe CHERCHE : on repond dans la classe qui a servi de
             // critere, pas dans celle du parcours. Voir
@@ -1330,23 +1583,62 @@ fn conteneur_publie(id: &str) -> bool {
         || dossiers::est_a_nous(id)
 }
 
-/// Applique les predicats `dc:title` au nom visible d'objets non-pistes.
+/// Applique le filtre de texte a des objets non-pistes.
 ///
-/// Le nom visible est celui que le DIDL met dans `<dc:title>` : le nom de
-/// l'artiste, le titre de l'album, le nom du genre ou de la station. Chercher
-/// sur autre chose rendrait deux resultats differents selon la rubrique.
-fn retenir_par_titre<T>(
+/// `champ` lit, pour un objet, la valeur de chaque champ interrogeable — ou
+/// `None` s'il ne le porte pas. Le titre est le nom visible, celui que le DIDL
+/// met dans `<dc:title>` : le nom de l'artiste, le titre de l'album, le nom du
+/// genre, de la liste ou de la station.
+fn retenir<T>(
     items: Vec<T>,
-    titres: &[PredicatTitre],
-    nom: impl Fn(&T) -> &str,
+    filtre: &Filtre,
+    champ: impl Fn(&T, ChampTexte) -> Option<&str>,
 ) -> Vec<T> {
-    if titres.is_empty() {
+    if *filtre == Filtre::Vrai {
         return items;
     }
     items
         .into_iter()
-        .filter(|item| titres.iter().all(|p| p.satisfait(nom(item))))
+        .filter(|item| filtre.satisfait(&|c| champ(item, c)))
         .collect()
+}
+
+/// Un artiste est son propre nom, en titre comme en artiste.
+fn champ_d_artiste(a: &crate::db::models::Artist, champ: ChampTexte) -> Option<&str> {
+    match champ {
+        ChampTexte::Titre | ChampTexte::Artiste => Some(a.name.as_str()),
+        ChampTexte::Album | ChampTexte::Genre => None,
+    }
+}
+
+/// Un album est son propre titre, en titre comme en album ; il porte aussi
+/// son artiste et son genre.
+fn champ_d_album(a: &crate::db::models::Album, champ: ChampTexte) -> Option<&str> {
+    match champ {
+        ChampTexte::Titre | ChampTexte::Album => Some(a.title.as_str()),
+        ChampTexte::Artiste => a.artist_name.as_deref(),
+        ChampTexte::Genre => a.genre.as_deref(),
+    }
+}
+
+/// Un genre est son propre nom, en titre comme en genre.
+fn champ_de_genre(g: &(String, u64), champ: ChampTexte) -> Option<&str> {
+    match champ {
+        ChampTexte::Titre | ChampTexte::Genre => Some(g.0.as_str()),
+        ChampTexte::Artiste | ChampTexte::Album => None,
+    }
+}
+
+/// Les champs d'une piste — exactement les colonnes que
+/// [`ColonneTextePiste`] interroge en base, pour que le pre-filtre SQL et le
+/// filtre exact disent la meme chose.
+fn champ_de_piste(t: &Track, champ: ChampTexte) -> Option<&str> {
+    match champ {
+        ChampTexte::Titre => Some(t.title.as_str()),
+        ChampTexte::Artiste => t.artist_name.as_deref(),
+        ChampTexte::Album => t.album_title.as_deref(),
+        ChampTexte::Genre => t.genre.as_deref(),
+    }
 }
 
 /// La page demandee et le total retenu. Meme borne de page que les pistes :
@@ -1363,28 +1655,47 @@ fn paginer<T>(items: Vec<T>, start: u64, count: u64) -> (Vec<T>, u64) {
 }
 
 /// Toute la bibliotheque ne passe pas en memoire : on demande d'abord a la
-/// base les titres qui PEUVENT convenir, puis on applique les predicats
-/// exacts. Un critere qui n'a aucun predicat positif ne reduit rien — il
-/// faudrait lire la table entiere pour le satisfaire, ce qu'on refuse (708).
-fn candidats_par_titre(state: &UpnpState, titres: &[PredicatTitre]) -> Option<Vec<Track>> {
+/// base les pistes qui PEUVENT convenir — une requete par predicat couvrant,
+/// voir [`Filtre::predicats_couvrants`] —, puis on applique le filtre exact.
+///
+/// Un filtre sans predicat couvrant (purement negatif) ne reduit rien : la
+/// lecture est alors bornee a `MAX_CANDIDATS`, comme toute autre.
+fn candidats_par_filtre(state: &UpnpState, filtre: &Filtre) -> Option<Vec<Track>> {
     /// Assez large pour une bibliotheque reelle, assez borne pour qu'un
     /// critere d'un seul caractere ne batisse pas un DIDL de plusieurs
     /// megaoctets. `TotalMatches` reflete ce qui a ete retenu.
     const MAX_CANDIDATS: i64 = 10_000;
-    let prefiltre = titres.iter().find_map(|p| p.valeur_prefiltrante())?;
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .search_by_title(prefiltre, MAX_CANDIDATS)
-        .ok()?;
-    Some(filtrer_par_titre(tracks, titres))
+    let repo = TrackRepo::with_backend(state.backend.clone());
+    let candidats = match filtre.predicats_couvrants() {
+        Some(predicats) => {
+            let mut vus = std::collections::HashSet::new();
+            let mut candidats = Vec::new();
+            for (champ, valeur) in predicats {
+                for piste in repo
+                    .search_by_text_column(champ.colonne_de_piste(), valeur, MAX_CANDIDATS)
+                    .ok()?
+                {
+                    // Une piste peut repondre a deux predicats d'un `or` :
+                    // elle ne doit paraitre qu'une fois.
+                    if piste.id.is_none_or(|id| vus.insert(id)) {
+                        candidats.push(piste);
+                    }
+                }
+            }
+            candidats
+        }
+        None => repo.list(MAX_CANDIDATS, 0).ok()?,
+    };
+    Some(filtrer_pistes(candidats, filtre))
 }
 
-fn filtrer_par_titre(tracks: Vec<Track>, titres: &[PredicatTitre]) -> Vec<Track> {
-    if titres.is_empty() {
+fn filtrer_pistes(tracks: Vec<Track>, filtre: &Filtre) -> Vec<Track> {
+    if *filtre == Filtre::Vrai {
         return tracks;
     }
     tracks
         .into_iter()
-        .filter(|t| titres.iter().all(|p| p.satisfait(&t.title)))
+        .filter(|t| filtre.satisfait(&|c| champ_de_piste(t, c)))
         .collect()
 }
 
@@ -2758,7 +3069,7 @@ fn didl_radios(
 ///
 /// * [`CLASSES_PUBLIEES`] est une table de **CRITERE**. Ses chaines sont en
 ///   minuscules et ne sont lues que par [`predicat_de_classe`] /
-///   [`cibles_du_predicat`] pour traduire un `SearchCriteria` en
+///   [`evaluer_criteres`] pour traduire un `SearchCriteria` en
 ///   [`CibleRecherche`]. Aucune d'elles n'atteint jamais le XML.
 /// * La constante ci-dessous est une valeur **EMISE**, en casse DIDL, et
 ///   c'est la seule qui entre dans un `<upnp:class>`.
@@ -4082,8 +4393,15 @@ mod tests {
     fn la_recherche_accepte_le_conteneur_years() {
         let state = state_with_years();
         assert!(
-            search_tracks_in_container(&state, "years", 0, 100, "http://127.0.0.1:8888", &[])
-                .is_some(),
+            search_tracks_in_container(
+                &state,
+                "years",
+                0,
+                100,
+                "http://127.0.0.1:8888",
+                &Filtre::Vrai
+            )
+            .is_some(),
             "years est un conteneur racine annoncé : Search doit l'accepter"
         );
     }
@@ -4426,13 +4744,19 @@ mod tests {
         let base = "http://127.0.0.1:8888";
 
         assert!(
-            search_tracks_in_container(&state, "playlists", 0, 100, base, &[]).is_some(),
+            search_tracks_in_container(&state, "playlists", 0, 100, base, &Filtre::Vrai).is_some(),
             "playlists est un conteneur racine annoncé : Search doit l'accepter"
         );
 
-        let dans_la_liste =
-            search_tracks_in_container(&state, &format!("playlist/{soiree}"), 0, 100, base, &[])
-                .unwrap();
+        let dans_la_liste = search_tracks_in_container(
+            &state,
+            &format!("playlist/{soiree}"),
+            0,
+            100,
+            base,
+            &Filtre::Vrai,
+        )
+        .unwrap();
         assert_eq!(dans_la_liste.total, 3);
         assert!(
             dans_la_liste.xml.contains("So What"),
@@ -4440,10 +4764,13 @@ mod tests {
             dans_la_liste.xml
         );
 
-        let filtre = [PredicatTitre {
-            op: OpTitre::Contient,
-            valeur: "so what".into(),
-        }];
+        let filtre = Filtre::Texte(
+            ChampTexte::Titre,
+            PredicatTitre {
+                op: OpTitre::Contient,
+                valeur: "so what".into(),
+            },
+        );
         let restreint = search_tracks_in_container(
             &state,
             &format!("playlist/{soiree}"),
@@ -5702,13 +6029,14 @@ mod ssdp_msearch_tests {
 
     #[test]
     fn un_predicat_non_annonce_est_refuse_au_lieu_de_tout_rendre() {
-        // `dc:title` est desormais annonce ET evalue : ce n'est plus lui
-        // l'exemple du champ inconnu. L'intention du test — refuser plutot
-        // que rendre toute la bibliotheque — est reportee sur `upnp:artist`,
-        // qui reste hors de SEARCH_CAPS.
+        // `dc:title`, puis `upnp:artist` (#4955) sont desormais annonces ET
+        // evalues : ce ne sont plus eux l'exemple du champ inconnu.
+        // L'intention du test — refuser plutot que rendre toute la
+        // bibliotheque — est reportee sur `dc:date`, qui reste hors de
+        // SEARCH_CAPS.
         for c in [
-            "upnp:artist contains \"Introuvable\"",
-            "upnp:class derivedfrom \"object.item.audioItem\" and upnp:artist contains \"Introuvable\"",
+            "dc:date contains \"1959\"",
+            "upnp:class derivedfrom \"object.item.audioItem\" and dc:date contains \"1959\"",
             "",
         ] {
             assert_eq!(evaluer_criteres(c).err(), Some(()), "{c}");
@@ -5719,7 +6047,7 @@ mod ssdp_msearch_tests {
             &state,
             &soap_search(
                 "0",
-                "upnp:class derivedfrom &quot;object.item.audioItem&quot; and upnp:artist contains &quot;Introuvable&quot;",
+                "upnp:class derivedfrom &quot;object.item.audioItem&quot; and dc:date contains &quot;1959&quot;",
                 0,
                 100,
             ),
@@ -5731,8 +6059,11 @@ mod ssdp_msearch_tests {
         assert!(!response.contains("<u:SearchResponse"), "{response}");
     }
 
+    /// #4955 — un `SortCriteria` non vide faisait refuser la recherche ENTIERE
+    /// (SOAP 709), alors que `Browse` l'a toujours ignore. La recherche est
+    /// servie, dans l'ordre du serveur.
     #[test]
-    fn un_tri_non_annonce_est_refuse() {
+    fn un_tri_demande_n_empeche_plus_la_recherche_4955() {
         let state = search_test_state();
         let soap = soap_search(
             "0",
@@ -5745,10 +6076,8 @@ mod ssdp_msearch_tests {
             "<SortCriteria>+dc:title</SortCriteria></u:Search>",
         );
         let response = search_action_response(&state, &soap);
-        assert!(
-            response.contains("<errorCode>709</errorCode>"),
-            "{response}"
-        );
+        assert!(!response.contains("<errorCode>"), "{response}");
+        assert!(response.contains("<u:SearchResponse"), "{response}");
     }
 
     #[test]
@@ -5802,7 +6131,7 @@ mod ssdp_msearch_tests {
             0,
             100,
             "http://127.0.0.1:8888",
-            &[],
+            &Filtre::Vrai,
         )
         .unwrap();
         assert_eq!(result.total, 1);
@@ -5869,7 +6198,12 @@ mod ssdp_msearch_tests {
                 "{champ} est annonce dans SEARCH_CAPS mais l'evaluateur le refuse"
             );
         }
-        for champ in ["upnp:artist", "upnp:album", "dc:creator", "upnp:genre"] {
+        for champ in [
+            "dc:date",
+            "upnp:author",
+            "upnp:originalTrackNumber",
+            "dc:description",
+        ] {
             assert!(
                 !SEARCH_CAPS.contains(champ),
                 "{champ} est annonce sans etre evalue"
@@ -5881,17 +6215,21 @@ mod ssdp_msearch_tests {
         }
     }
 
+    fn filtre_de_titre(op: OpTitre, valeur: &str) -> Filtre {
+        Filtre::Texte(
+            ChampTexte::Titre,
+            PredicatTitre {
+                op,
+                valeur: valeur.into(),
+            },
+        )
+    }
+
     #[test]
     fn un_predicat_de_titre_est_reconnu() {
         let c = evaluer_criteres("dc:title contains \"Kind of Blue\"").unwrap();
         assert_eq!(c.cible, Some(CibleRecherche::Pistes));
-        assert_eq!(
-            c.titres,
-            vec![PredicatTitre {
-                op: OpTitre::Contient,
-                valeur: "Kind of Blue".into()
-            }]
-        );
+        assert_eq!(c.filtre, filtre_de_titre(OpTitre::Contient, "Kind of Blue"));
     }
 
     #[test]
@@ -5901,8 +6239,7 @@ mod ssdp_msearch_tests {
         )
         .unwrap();
         assert_eq!(c.cible, Some(CibleRecherche::Pistes));
-        assert_eq!(c.titres.len(), 1);
-        assert_eq!(c.titres[0].valeur, "So What");
+        assert_eq!(c.filtre, filtre_de_titre(OpTitre::Contient, "So What"));
     }
 
     /// Un titre peut contenir « and ». Couper dessus ferait chercher un
@@ -5910,8 +6247,10 @@ mod ssdp_msearch_tests {
     #[test]
     fn le_and_a_l_interieur_des_guillemets_n_est_pas_un_separateur() {
         let c = evaluer_criteres("dc:title contains \"Peaches and Cream\"").unwrap();
-        assert_eq!(c.titres.len(), 1);
-        assert_eq!(c.titres[0].valeur, "Peaches and Cream");
+        assert_eq!(
+            c.filtre,
+            filtre_de_titre(OpTitre::Contient, "Peaches and Cream")
+        );
     }
 
     // --- Le menu d'un lecteur reseau passe par Search (#1777, fil 1439) ---
@@ -6811,21 +7150,121 @@ mod ssdp_msearch_tests {
 
     /// Ce qu'on ne sait pas evaluer doit etre REFUSE, pas approxime : c'est
     /// tout l'objet de #2312.
+    ///
+    /// `or`, les parentheses et `upnp:artist` en sont sortis avec #4955 : ils
+    /// sont desormais evalues, voir `les_formes_d_un_lecteur_reseau_sont_evaluees_4955`.
     #[test]
     fn ce_qui_n_est_pas_evalue_est_refuse() {
         for critere in [
-            "dc:title contains \"a\" or dc:title contains \"b\"",
-            "(dc:title contains \"a\")",
-            "upnp:artist = \"Miles Davis\"",
+            "dc:date = \"1959\"",
             "dc:title exists true",
+            "dc:title derivedfrom \"a\"",
+            "upnp:class exists true",
+            "upnp:class = object.item.audioItem",
             "dc:title contains \"pas de guillemet fermant",
             "and dc:title contains \"a\"",
+            "dc:title contains \"a\" or",
+            "(dc:title contains \"a\"",
+            "dc:title contains \"a\")",
+            "()",
+            "dc:title contains \"a\" dc:title contains \"b\"",
         ] {
             assert!(
                 evaluer_criteres(critere).is_err(),
                 "ce critere devait etre refuse : {critere}"
             );
         }
+    }
+
+    /// #4955 — les formes qu'un lecteur reseau (Denon/Marantz HEOS, et
+    /// d'autres) donne a sa recherche : critere enrobe de parentheses,
+    /// recherche d'un nom dans plusieurs champs a la fois, recherche par
+    /// artiste ou par album. Toutes rendaient un SOAP 708.
+    #[test]
+    fn les_formes_d_un_lecteur_reseau_sont_evaluees_4955() {
+        let artiste = |valeur: &str| {
+            Filtre::Texte(
+                ChampTexte::Artiste,
+                PredicatTitre {
+                    op: OpTitre::Contient,
+                    valeur: valeur.into(),
+                },
+            )
+        };
+        for (critere, cible, filtre) in [
+            (
+                "(upnp:class derivedfrom \"object.container.person.musicArtist\" and dc:title contains \"miles\")",
+                Some(CibleRecherche::Artistes),
+                filtre_de_titre(OpTitre::Contient, "miles"),
+            ),
+            (
+                "upnp:class = \"object.container.album.musicAlbum\" and upnp:artist contains \"miles\"",
+                Some(CibleRecherche::Albums),
+                artiste("miles"),
+            ),
+            (
+                "upnp:artist contains \"miles\"",
+                Some(CibleRecherche::Pistes),
+                artiste("miles"),
+            ),
+            (
+                "dc:creator contains \"miles\" and @refID exists false",
+                Some(CibleRecherche::Pistes),
+                artiste("miles"),
+            ),
+            (
+                "upnp:class derivedfrom \"object.item.audioItem\" and (dc:title contains \"so\" or upnp:artist contains \"so\")",
+                Some(CibleRecherche::Pistes),
+                Filtre::Ou(vec![
+                    filtre_de_titre(OpTitre::Contient, "so"),
+                    artiste("so"),
+                ]),
+            ),
+            // `and` lie plus fort que `or` : la classe ne porte que sur la
+            // premiere branche, la seconde vise toutes les rubriques — les
+            // pistes l'emportent (`cible_unique`).
+            (
+                "upnp:class = \"object.container.album.musicAlbum\" and dc:title contains \"x\" or dc:title contains \"y\"",
+                Some(CibleRecherche::Pistes),
+                filtre_de_titre(OpTitre::Contient, "y"),
+            ),
+            // Un titre peut porter une parenthese, un guillemet echappe.
+            (
+                "dc:title contains \"So What (Live)\"",
+                Some(CibleRecherche::Pistes),
+                filtre_de_titre(OpTitre::Contient, "So What (Live)"),
+            ),
+            (
+                "dc:title = \"Dit \\\"bonjour\\\"\"",
+                Some(CibleRecherche::Pistes),
+                filtre_de_titre(OpTitre::Egal, "Dit \"bonjour\""),
+            ),
+        ] {
+            let c = evaluer_criteres(critere)
+                .unwrap_or_else(|()| panic!("critere refuse (708) : {critere}"));
+            assert_eq!(c.cible, cible, "{critere}");
+            assert_eq!(c.filtre, filtre, "{critere}");
+        }
+    }
+
+    /// Le pre-filtre SQL doit couvrir TOUT ce que le filtre exact laisse
+    /// passer : une branche d'un `or` oubliee ferait disparaitre ses resultats
+    /// sans faute ni trace.
+    #[test]
+    fn les_predicats_couvrants_couvrent_chaque_branche_d_un_or() {
+        let c = evaluer_criteres(
+            "dc:title contains \"a\" or (upnp:album contains \"b\" and dc:title doesNotContain \"c\")",
+        )
+        .unwrap();
+        assert_eq!(
+            c.filtre.predicats_couvrants(),
+            Some(vec![(ChampTexte::Titre, "a"), (ChampTexte::Album, "b")])
+        );
+        let negatif = evaluer_criteres("dc:title doesNotContain \"live\"").unwrap();
+        assert_eq!(negatif.filtre.predicats_couvrants(), None);
+        let mixte =
+            evaluer_criteres("dc:title contains \"a\" or dc:title doesNotContain \"b\"").unwrap();
+        assert_eq!(mixte.filtre.predicats_couvrants(), None);
     }
 
     #[test]
@@ -6900,7 +7339,7 @@ mod ssdp_msearch_tests {
             0,
             100,
             "http://127.0.0.1:8888",
-            &criteres.titres,
+            &criteres.filtre,
         )
         .unwrap();
 
@@ -7029,7 +7468,7 @@ mod ssdp_msearch_tests {
     /// C'est la raison pour laquelle la classe emise n'avait jamais ete
     /// changee. Elle tient parce que les deux usages sont SEPARES :
     /// `CLASSES_PUBLIEES` est un critere (chaines en minuscules, lues par
-    /// `cibles_du_predicat`, jamais emises), `RADIO_CLASSE_*` sont des valeurs
+    /// `evaluer_criteres`, jamais emises), `RADIO_CLASSE_*` sont des valeurs
     /// emises. Ce temoin mesure la separation sur le SOAP reellement rendu :
     /// si quelqu'un unifie les deux classes plus tard, il rougit.
     #[test]
