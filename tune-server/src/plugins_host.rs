@@ -1159,6 +1159,14 @@ pub fn spawn_wasm_event_forwarder(state: &AppState) {
                 Err(RecvError::Closed) => break,
             };
 
+            // #4719 — le `minuteur` n'est JAMAIS relayé depuis le bus : seul
+            // l'hôte le produit ([`spawn_wasm_minuteur`]). Sans ce filtre, un
+            // greffon doté de `events` pourrait faire synchroniser les liens
+            // d'un autre en émettant « minuteur » sur le bus.
+            if !transmis_par_le_bus(&event.event_type) {
+                continue;
+            }
+
             // The registry is published once at startup; if it is not set yet
             // (or empty) there is nothing to forward to.
             let Some(registry) = wasm_plugins.get() else {
@@ -1224,10 +1232,128 @@ pub fn spawn_wasm_event_forwarder(state: &AppState) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// #4719 — le minuteur des greffons
+// ---------------------------------------------------------------------------
+
+/// Le nom de l'événement que l'hôte envoie aux greffons abonnés, toutes les
+/// [`PERIODE_MINUTEUR`]. C'est ainsi qu'un greffon WASM — qui ne s'exécute
+/// que lorsqu'on l'appelle — tient une cadence (liens auto-sync du
+/// convertisseur de playlists).
+pub const EVENEMENT_MINUTEUR: &str = "minuteur";
+
+/// Un réveil par minute : la cadence la plus fine d'un lien est de quinze
+/// minutes, le greffon décide lui-même de ce qui est dû.
+const PERIODE_MINUTEUR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Au-delà, on cesse d'attendre le réveil (il est journalisé) ; l'appel, lui,
+/// reste borné en carburant comme tout appel de greffon.
+const BUDGET_MINUTEUR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Un greffon ne reçoit le minuteur que s'il le demande EXPRESSÉMENT : une
+/// entrée exacte `"minuteur"` dans `event_subscriptions`. Un abonnement `"*"`
+/// ne suffit pas — un greffon qui écoute tout le bus n'a pas demandé à être
+/// réveillé chaque minute.
+pub(crate) fn abonne_au_minuteur(subscriptions: &[String]) -> bool {
+    subscriptions.iter().any(|s| s == EVENEMENT_MINUTEUR)
+}
+
+/// L'enveloppe `{name, payload}` passée à `plugin_on_event`.
+pub(crate) fn evenement_minuteur(now_ms: u64) -> String {
+    json!({ "name": EVENEMENT_MINUTEUR, "payload": { "now_ms": now_ms } }).to_string()
+}
+
+/// Un événement du bus peut-il être relayé aux greffons ? Tout, sauf le
+/// minuteur, que seul l'hôte produit.
+pub(crate) fn transmis_par_le_bus(nom: &str) -> bool {
+    nom != EVENEMENT_MINUTEUR
+}
+
+fn maintenant_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// #4719 — réveiller, chaque minute, les greffons WASM abonnés au
+/// `minuteur`, par leur export `plugin_on_event`.
+///
+/// Le minimum, et cloisonné : il ne passe pas par le bus (les clients ne le
+/// voient pas, un greffon ne peut pas le forger), chaque greffon est appelé
+/// SEUL sous son propre verrou, dans `spawn_blocking` (ses capacités
+/// `streaming` font `block_on`), et un réveil encore en cours n'est pas
+/// doublé : le suivant est simplement sauté. Aucune capacité n'est ajoutée —
+/// le greffon réveillé n'a que les permissions de son manifeste, et aucune ne
+/// supprime quoi que ce soit.
+///
+/// Appelé une fois, juste après [`spawn_wasm_event_forwarder`].
+pub fn spawn_wasm_minuteur(state: &AppState) {
+    let wasm_plugins = state.wasm_plugins.clone();
+    tokio::spawn(async move {
+        let mut tic = tokio::time::interval(PERIODE_MINUTEUR);
+        tic.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Le premier tic d'un `interval` est immédiat : on laisse le
+        // démarrage finir avant de réveiller qui que ce soit.
+        tic.tick().await;
+        let mut en_cours: HashMap<String, tokio::task::JoinHandle<Result<(), String>>> =
+            HashMap::new();
+        loop {
+            tic.tick().await;
+            let Some(registry) = wasm_plugins.get() else {
+                continue;
+            };
+            let abonnes: Vec<String> = registry
+                .plugins
+                .iter()
+                .filter(|(_, loaded)| abonne_au_minuteur(&loaded.manifest.event_subscriptions))
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in abonnes {
+                if en_cours.get(&id).is_some_and(|h| !h.is_finished()) {
+                    debug!(id = %id, "wasm_plugin_minuteur_saute_reveil_precedent_en_cours");
+                    continue;
+                }
+                let wasm_plugins = wasm_plugins.clone();
+                let plugin_id = id.clone();
+                let evenement = evenement_minuteur(maintenant_ms());
+                let mut appel = tokio::task::spawn_blocking(move || {
+                    let Some(registry) = wasm_plugins.get() else {
+                        return Ok(());
+                    };
+                    let Some(loaded) = registry.get(&plugin_id) else {
+                        return Ok(());
+                    };
+                    let mut plugin = loaded.plugin.blocking_lock();
+                    plugin.on_event(&evenement)
+                });
+                match tokio::time::timeout(BUDGET_MINUTEUR, &mut appel).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(e))) => {
+                        warn!(id = %id, error = %e, "wasm_plugin_minuteur_erreur");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(id = %id, error = %e, "wasm_plugin_minuteur_tache_echouee");
+                    }
+                    Err(_) => {
+                        warn!(
+                            id = %id,
+                            budget_s = BUDGET_MINUTEUR.as_secs(),
+                            "wasm_plugin_minuteur_long — réveil toujours en cours, le suivant sera sauté"
+                        );
+                        en_cours.insert(id, appel);
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        any_subscription_matches, event_matches, persist_plugin_archive_in, resolve_plugins_dir,
+        abonne_au_minuteur, any_subscription_matches, evenement_minuteur, event_matches,
+        persist_plugin_archive_in, resolve_plugins_dir, transmis_par_le_bus,
     };
     use std::io::Write;
     use std::path::PathBuf;
@@ -1356,6 +1482,35 @@ mod tests {
     fn glob_exact_matches_only_the_name() {
         assert!(event_matches("zone.created", "zone.created"));
         assert!(!event_matches("zone.created", "zone.updated"));
+    }
+
+    /// #4719 — le minuteur se demande EXPRESSÉMENT : `"*"` ou un préfixe ne
+    /// suffisent pas à être réveillé chaque minute.
+    #[test]
+    fn seul_un_abonnement_exact_recoit_le_minuteur_4719() {
+        assert!(abonne_au_minuteur(&["minuteur".to_string()]));
+        assert!(abonne_au_minuteur(&[
+            "playback.*".to_string(),
+            "minuteur".to_string()
+        ]));
+        assert!(!abonne_au_minuteur(&["*".to_string()]));
+        assert!(!abonne_au_minuteur(&["minuteur.*".to_string()]));
+        assert!(!abonne_au_minuteur(&[]));
+    }
+
+    /// #4719 — le minuteur ne se relaie pas depuis le bus : seul l'hôte le
+    /// produit, un greffon ne peut pas le forger pour en réveiller un autre.
+    #[test]
+    fn le_minuteur_ne_passe_pas_par_le_bus_4719() {
+        assert!(!transmis_par_le_bus("minuteur"));
+        assert!(transmis_par_le_bus("playback.state_changed"));
+    }
+
+    #[test]
+    fn l_evenement_minuteur_a_la_forme_de_plugin_on_event_4719() {
+        let v: serde_json::Value = serde_json::from_str(&evenement_minuteur(42)).unwrap();
+        assert_eq!(v["name"], "minuteur");
+        assert_eq!(v["payload"]["now_ms"], 42);
     }
 
     #[test]

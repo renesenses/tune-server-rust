@@ -426,6 +426,13 @@ peut lire, pas un trap — et **n'atteint jamais l'hôte**.
 | `library` | `host_library_search`, `host_library_match_track` |
 | `kv` | `host_kv_get`, `host_kv_set`, `host_kv_list` |
 
+**Le minuteur (#4719).** Un greffon WASM ne s'exécute que lorsqu'on l'appelle.
+Pour tenir une cadence, il déclare `"event_subscriptions": ["minuteur"]` (une
+entrée EXACTE : `"*"` ne suffit pas) et exporte `plugin_on_event` ; l'hôte
+l'appelle alors toutes les 60 s avec `{"name":"minuteur","payload":{"now_ms":…}}`.
+Ce réveil ne passe pas par le bus d'événements et ne donne aucune permission
+de plus.
+
 Les quatre derniers scopes sont arrivés avec #4716 (tranche 1 de l'épique
 #4715, greffon « Playlists converter »). Ce qu'un auteur de greffon doit en
 savoir :

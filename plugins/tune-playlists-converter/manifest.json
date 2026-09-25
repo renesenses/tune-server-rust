@@ -1,11 +1,12 @@
 {
   "id": "playlists-converter",
   "name": "Playlists converter",
-  "version": "0.2.0",
-  "description": "Transférer une playlist d'un service à un autre, à l'identique et par lot, avec aperçu obligatoire avant toute écriture ; copie datée avant chaque transfert et retour en arrière sans suppression",
+  "version": "0.3.0",
+  "description": "Transférer une playlist d'un service à un autre, à l'identique et par lot, avec aperçu obligatoire avant toute écriture ; copie datée avant chaque transfert et retour en arrière sans suppression ; liens de synchronisation qui n'écrivent que des ajouts",
   "author": "MozAIk Labs",
   "entry_point": "main.wasm",
-  "permissions": ["playlists", "streaming", "kv"],
+  "permissions": ["playlists", "streaming", "library", "kv"],
+  "event_subscriptions": ["minuteur"],
   "min_server_version": "0.9.162",
   "premium": true,
   "routes": [
@@ -18,6 +19,15 @@
     { "method": "GET", "path": "/snapshots" },
     { "method": "GET", "path": "/snapshot" },
     { "method": "POST", "path": "/snapshot/restauration/apercu" },
-    { "method": "POST", "path": "/snapshot/restauration" }
+    { "method": "POST", "path": "/snapshot/restauration" },
+    { "method": "POST", "path": "/liens" },
+    { "method": "GET", "path": "/liens" },
+    { "method": "GET", "path": "/lien" },
+    { "method": "GET", "path": "/lien/journal" },
+    { "method": "POST", "path": "/lien/apercu" },
+    { "method": "POST", "path": "/lien/synchroniser" },
+    { "method": "POST", "path": "/lien/pause" },
+    { "method": "POST", "path": "/lien/reglages" },
+    { "method": "POST", "path": "/lien/supprimer" }
   ]
 }

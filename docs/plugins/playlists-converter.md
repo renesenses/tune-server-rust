@@ -1,10 +1,12 @@
 # Greffon « Playlists converter »
 
-Tranches 2 et 3 de l'épique [#4715](https://github.com/renesenses/tune-server-rust/issues/4715)
+Tranches 2 à 4 de l'épique [#4715](https://github.com/renesenses/tune-server-rust/issues/4715)
 ([#4717](https://github.com/renesenses/tune-server-rust/issues/4717),
-[#4718](https://github.com/renesenses/tune-server-rust/issues/4718)). Transfère
-une playlist d'un service vers un autre, **à l'identique** et **par lot**, et
-garde une **copie datée** (snapshot) de toute playlist avant d'y écrire.
+[#4718](https://github.com/renesenses/tune-server-rust/issues/4718),
+[#4719](https://github.com/renesenses/tune-server-rust/issues/4719)). Transfère
+une playlist d'un service vers un autre, **à l'identique** et **par lot**,
+garde une **copie datée** (snapshot) de toute playlist avant d'y écrire, et
+tient deux playlists à jour par des **liens** qui n'écrivent que des ajouts.
 
 Greffon **WASM**, **premium** (`manifest.premium = true`) et **facultatif** :
 il n'est pas embarqué dans les paquets publiés, il s'installe depuis le
@@ -64,9 +66,24 @@ aucune licence.
 | `POST /snapshot/restauration/apercu` | `{snapshot_id, mode: "completer"\|"recreer"}` | `{plan, a_rajouter: [piste…], a_retirer_par_vous: [piste…]}` — **rien n'est écrit** |
 | `POST /snapshot/restauration` | `{plan_id, accord: true}` | `{plan, a_retirer_par_vous}` ; `409` sans accord ou plan déjà exécuté |
 
+| `POST /liens` | `{a: {service, playlist_id}, b: {service, playlist_id}, sens?: "a_vers_b"\|"deux_sens", cadence_minutes?}` | `{lien}` — état `attente_premier_apercu` ; `400` si même service, cadence hors bornes ou playlist illisible |
+| `GET /liens` | — | `{count, liens: [lien…]}` (supprimés exclus) |
+| `GET /lien?id=lien-N` | — | `{lien}` ; `404` inconnu ou supprimé |
+| `GET /lien/journal?id=lien-N` | — | `{count, entrees: [entrée…]}`, du plus récent au plus ancien |
+| `POST /lien/apercu` | `{lien_id}` | `{plan: {ajouts, introuvables, disparues, deja_presentes, introuvables_connues, calcule_le_ms}}` — **rien n'est écrit** |
+| `POST /lien/synchroniser` | `{lien_id, accord?}` | `{lien, entree}` ; `409 apercu_requis` / `409 accord_requis` pour la première, `409 lien_en_pause` |
+| `POST /lien/pause` | `{lien_id, pause: bool}` | `{lien}` |
+| `POST /lien/reglages` | `{lien_id, cadence_minutes}` | `{lien}` ; `400` hors bornes |
+| `POST /lien/supprimer` | `{lien_id}` | `{lien_id, supprime: true, playlists_touchees: false}` |
+
 Un en-tête de snapshot : `{snapshot_id, service, playlist_id, nom, pris_le_ms,
 motif, total, pages, empreinte}`. `motif` vaut `manuel`,
-`avant_transfert:lot-N` ou `avant_restauration:plan-N`.
+`avant_transfert:lot-N`, `avant_restauration:plan-N` ou `avant_synchro:lien-N`.
+
+Un lien : `{lien_id, a: {service, playlist_id, nom}, b: {…}, sens,
+cadence_minutes, etat: "attente_premier_apercu"|"actif"|"en_pause",
+premiere_synchro_faite, cree_le_ms, derniere_synchro_ms, prochaine_synchro_ms,
+derniere_erreur, journal_compteur}`.
 
 `source_service` vaut `"local"` pour la bibliothèque (les `playlists` sont
 alors des identifiants entiers en texte). Sans `suffixe_nom`, le nom de la
@@ -113,6 +130,39 @@ est un **anneau**.
   256 Kio par valeur.
 * **20 plans de retour en arrière** gardés, tous confondus.
 
+## Liens auto-sync (#4719)
+
+Un **lien** relie deux playlists : deux services **différents**, ou un
+service et la bibliothèque locale (`"local"`, identifiants entiers). Sens
+unique (`a_vers_b`) ou double (`deux_sens`). C'est la tranche la plus
+risquée — elle écrit chez un service sans geste de l'utilisateur —, d'où ses
+règles :
+
+| Règle | Comment elle tient |
+|---|---|
+| **Jamais de suppression** | l'hôte n'a aucune capacité de suppression. Une piste disparue d'un côté est **signalée** au journal (`disparues_signalees`, une seule fois), elle n'est ni retirée de l'autre côté, ni **remise** du côté d'où l'utilisateur l'a ôtée. |
+| **Des ajouts seulement** | qu'elle vienne du minuteur ou d'une demande, une synchronisation n'appelle que `…_add_tracks`. Elle ne crée pas de playlist. |
+| **Première synchro sur aperçu accepté** | un lien créé est à l'état `attente_premier_apercu` : le minuteur l'ignore. `POST /lien/apercu` calcule (sans rien écrire) ; `POST /lien/synchroniser` avec `accord: true` exécute — et **jamais plus** que l'aperçu : ce qui est apparu depuis attend la synchro suivante. |
+| **Snapshot avant chaque synchro** | les deux côtés sont gardés (#4718, motif `avant_synchro:lien-N`) avant d'écrire ; un côté dont la copie échoue ne reçoit rien. Une copie identique à la précédente n'occupe pas d'emplacement. |
+| **Journal** | chaque synchro écrit une entrée : `quand_ms`, `declencheur` (`premiere`, `demande`, `minuteur`), `statut` (`ok`, `rien_a_faire`, `partiel`, `echec`), `ajoutees` + `ajouts` (quoi, vers quel côté), `introuvables` + détail avec la raison, `disparues_signalees`, `echecs`, `snapshots`. 50 entrées gardées par lien, détail plafonné à 200 par liste (les comptes restent exacts). |
+| **Pause, suppression** | `POST /lien/pause` (`pause: true/false`) ; `POST /lien/supprimer` marque le lien supprimé (le stockage ne sait pas effacer une clé) : il disparaît des listes et du minuteur. **Aucune des deux playlists n'est touchée.** |
+
+L'appariement est celui de la tranche 2 (titre + artiste + durée à ±3 s,
+verdict de l'hôte), côté service par `host_streaming_match_track`, côté
+bibliothèque par `host_library_match_track` — d'où la permission `library`.
+Les correspondances trouvées sont mémorisées par lien : une piste déjà
+appariée n'est pas redemandée, et une piste introuvable n'est redemandée
+qu'à une synchronisation **à la demande**, pas à chaque réveil.
+
+### Cadence et minuteur
+
+`cadence_minutes` : `0` = à la demande seulement ; sinon de **15** à
+**10 080** (une semaine). Une valeur hors bornes est **refusée** (`400`), pas
+ramenée en silence. L'hôte réveille le greffon toutes les minutes
+(`event_subscriptions: ["minuteur"]`, voir le README des greffons) ; à chaque
+réveil, **un seul** lien dû est synchronisé — le plus en retard. Après une
+pause, la cadence repart pleine : pas de rattrapage en rafale.
+
 ## Ce que le greffon ne peut pas faire
 
 * **Supprimer quoi que ce soit.** Aucune capacité de suppression n'existe dans
@@ -123,12 +173,12 @@ est un **anneau**.
   connecteur, derrière `add_tracks_to_playlist` / `get_playlist_tracks`. Le
   greffon verse par paquets de 100 — la taille d'un lot TIDAL, et le grain de
   la reprise.
-* **Écrire DANS la bibliothèque locale.** Il faudrait apparier un titre dans la
-  bibliothèque, et la tranche 1 n'expose aucune capacité de recherche locale
-  (`host_search` / un `host_library_match_track`, permission `library`). La
-  demande est **refusée explicitement** (`cible_locale_non_supportee`) plutôt
-  que silencieusement approximée. Le sens inverse — bibliothèque → service —
-  fonctionne.
+* **Transférer (tranche 2) VERS la bibliothèque locale.** Le transfert refuse
+  toujours cette cible (`cible_locale_non_supportee`) : il a été écrit avant
+  que `host_library_match_track` n'arrive. Un **lien** (#4719), lui, sait
+  écrire dans une playlist locale existante — il apparie par
+  `host_library_match_track` et ajoute par `host_playlist_add_tracks`.
+  Lever le refus du transfert est hors de cette tranche.
 
 ## Stockage
 
@@ -145,6 +195,11 @@ Dans le stockage clé/valeur cloisonné du greffon (#4716), donc sous
 | `snap:<K>:<emplacement>` | l'en-tête d'un snapshot (anneau de 10) |
 | `snap:<K>:<emplacement>:p:<n>` | une page de 400 pistes |
 | `compteur_restaurations`, `restauration:<emplacement>` | les plans de retour en arrière (anneau de 20) |
+| `compteur_liens`, `lien:<id>` | les liens (un lien supprimé reste, marqué `supprime`) |
+| `lien_corr:<id>` | les correspondances piste A → piste B |
+| `lien_vus:<id>` | les pistes déjà vues de chaque côté (ne font que croître), les introuvables, les disparitions déjà signalées |
+| `lien_apercu:<id>` | les ajouts acceptés avant la première synchronisation |
+| `lien_journal:<id>:<emplacement>` | une entrée de journal (anneau de 50) |
 
 Une playlist par clé **à dessein** : l'hôte borne une valeur à 256 Kio, et un
 lot de trente playlists de trois cents titres n'y tiendrait pas d'un bloc.
@@ -166,8 +221,9 @@ porte `rlib` **en plus** de `cdylib` pour que `cargo test` puisse la lier.
 
 | Porte | Ce qu'elle couvre |
 |---|---|
-| `cargo test -p tune-playlists-converter` | le moteur en natif, contre un hôte de banc : règle des ±3 s, aperçu sans écriture, rapport, reprise, mode par lot, snapshots, rétention, retour en arrière |
+| `cargo test -p tune-playlists-converter` | le moteur en natif, contre un hôte de banc : règle des ±3 s, aperçu sans écriture, rapport, reprise, mode par lot, snapshots, rétention, retour en arrière, liens (double sens, bibliothèque locale, pause, journal) |
 | `cargo test -p tune-server --features plugins-wasm --test greffon_convertisseur_4717` | le **vrai `main.wasm`** dans le vrai bac à sable : l'ABI, les permissions, et les mêmes garanties bout en bout |
+| `cargo test -p tune-server --features plugins-wasm --test greffon_liens_sync_4719` | le vrai `main.wasm` réveillé par l'enveloppe exacte du minuteur : première synchro sur aperçu accepté, ajouts seulement, disparition signalée, journal, pause, suppression du lien |
 | `cargo test -p tune-server --features plugins-wasm --test greffon_snapshots_4718` | le vrai `main.wasm` : snapshot écrit AVANT le premier titre versé, retour en arrière qui rajoute sans rien supprimer, date lue par `host_now` |
 
 Le second est le seul à exercer `src/abi.rs` (allocation, empaquetage

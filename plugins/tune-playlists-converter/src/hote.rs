@@ -61,6 +61,18 @@ pub trait Hote {
         duration_ms: u64,
     ) -> Result<Value, String>;
 
+    // -- permission `library` : apparier DANS la bibliothèque locale ---------
+    /// Même forme de réponse que [`Hote::streaming_match_track`] ; la piste
+    /// porte son identifiant entier sous `track_id` (#4719 : un lien dont une
+    /// extrémité est la bibliothèque locale).
+    fn library_match_track(
+        &self,
+        title: &str,
+        artist: &str,
+        isrc: &str,
+        duration_ms: u64,
+    ) -> Result<Value, String>;
+
     // -- permission `kv` : l'état des lots, cloisonné par l'hôte ------------
     fn kv_get(&self, key: &str) -> Result<Value, String>;
     fn kv_set(&self, key: &str, value: &Value) -> Result<Value, String>;

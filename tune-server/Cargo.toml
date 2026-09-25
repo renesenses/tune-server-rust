@@ -835,3 +835,13 @@ required-features = ["plugins-wasm"]
 name = "greffon_snapshots_4718"
 path = "tests/greffon_snapshots_4718.rs"
 required-features = ["plugins-wasm"]
+
+# #4719 — les liens auto-sync du greffon « Playlists converter » DANS le bac à
+# sable, réveillés par l'enveloppe exacte du minuteur de l'hôte : première
+# synchro sur aperçu accepté, ajouts seulement, disparition signalée, journal,
+# pause, suppression du lien sans toucher aux playlists. `autotests = false`
+# en tête de ce manifeste : sans ce bloc, le fichier ne serait jamais compilé.
+[[test]]
+name = "greffon_liens_sync_4719"
+path = "tests/greffon_liens_sync_4719.rs"
+required-features = ["plugins-wasm"]

@@ -99,6 +99,11 @@ pub struct HoteDeBanc {
     pub source: HashMap<String, (String, Vec<Piste>)>,
     /// Verdict de la cible, par titre source.
     pub cible: HashMap<String, Verdict>,
+    /// Verdict PAR SERVICE, par titre (#4719) : dans un lien à double sens,
+    /// « Imagine » ne rend pas le même identifiant chez TIDAL et chez Qobuz.
+    /// Prime sur `cible`. Le service `local` sert l'appariement en
+    /// bibliothèque.
+    pub cible_chez: HashMap<(String, String), Verdict>,
     /// Le contenu COURANT des playlists qui ont bougé depuis le départ
     /// (créées, versées, retouchées). Prime sur `source`.
     modifs: RefCell<HashMap<String, (String, Vec<Piste>)>>,
@@ -120,6 +125,7 @@ impl HoteDeBanc {
         Self {
             source: HashMap::new(),
             cible: HashMap::new(),
+            cible_chez: HashMap::new(),
             modifs: RefCell::new(HashMap::new()),
             kv: RefCell::new(HashMap::new()),
             journaux: RefCell::new(Journaux::default()),
@@ -138,6 +144,53 @@ impl HoteDeBanc {
     pub fn avec_verdict(mut self, titre_source: &str, v: Verdict) -> Self {
         self.cible.insert(titre_source.into(), v);
         self
+    }
+
+    pub fn avec_verdict_chez(mut self, service: &str, titre_source: &str, v: Verdict) -> Self {
+        self.cible_chez
+            .insert((service.into(), titre_source.into()), v);
+        self
+    }
+
+    fn verdict(&self, service: &str, titre: &str) -> Option<&Verdict> {
+        self.cible_chez
+            .get(&(service.to_string(), titre.to_string()))
+            .or_else(|| {
+                if service == "local" {
+                    None
+                } else {
+                    self.cible.get(titre)
+                }
+            })
+    }
+
+    fn reponse_appariement(&self, service: &str, titre: &str) -> Result<Value, String> {
+        match self.verdict(service, titre) {
+            None | Some(Verdict::Rien) => Ok(json!({ "service": service, "matched": Value::Null })),
+            Some(Verdict::Erreur(e)) => Err(e.clone()),
+            Some(Verdict::Candidat {
+                piste,
+                score,
+                approximatif,
+            }) => {
+                let mut matched = piste.json();
+                if service == "local"
+                    && let Ok(n) = piste.id.parse::<i64>()
+                {
+                    matched["track_id"] = json!(n);
+                    // Comme l'hôte réel : une piste locale venue d'un service
+                    // garde son `source_id` d'ORIGINE, qui n'est pas son
+                    // identifiant en bibliothèque.
+                    matched["source_id"] = json!(format!("origine-{n}"));
+                }
+                Ok(json!({
+                    "service": service,
+                    "matched": matched,
+                    "score": score,
+                    "approximate": approximatif,
+                }))
+            }
+        }
     }
 
     pub fn ecriture_interdite(mut self) -> Self {
@@ -193,7 +246,7 @@ impl HoteDeBanc {
     /// Retrouver la fiche d'une piste par son identifiant, où qu'elle soit
     /// connue du banc — pour qu'un ajout fasse apparaître une vraie piste.
     fn piste_par_id(&self, id: &str) -> Piste {
-        for v in self.cible.values() {
+        for v in self.cible.values().chain(self.cible_chez.values()) {
             if let Verdict::Candidat { piste, .. } = v
                 && piste.id == id
             {
@@ -380,20 +433,17 @@ impl Hote for HoteDeBanc {
         _isrc: &str,
         _duration_ms: u64,
     ) -> Result<Value, String> {
-        match self.cible.get(title) {
-            None | Some(Verdict::Rien) => Ok(json!({ "service": service, "matched": Value::Null })),
-            Some(Verdict::Erreur(e)) => Err(e.clone()),
-            Some(Verdict::Candidat {
-                piste,
-                score,
-                approximatif,
-            }) => Ok(json!({
-                "service": service,
-                "matched": piste.json(),
-                "score": score,
-                "approximate": approximatif,
-            })),
-        }
+        self.reponse_appariement(service, title)
+    }
+
+    fn library_match_track(
+        &self,
+        title: &str,
+        _artist: &str,
+        _isrc: &str,
+        _duration_ms: u64,
+    ) -> Result<Value, String> {
+        self.reponse_appariement("local", title)
     }
 
     fn kv_get(&self, key: &str) -> Result<Value, String> {

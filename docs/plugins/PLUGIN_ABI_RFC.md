@@ -174,6 +174,13 @@ blocking thread).
 - Manifest `event_subscriptions: ["playback.*","zone.*"]`.
 - Host forwards matching `event_bus` events to `plugin_on_event` (fire-and-forget,
   timeout-bounded).
+- **Minuteur (#4719).** Un greffon qui déclare EXACTEMENT `"minuteur"` dans
+  `event_subscriptions` reçoit, toutes les 60 s, `{"name":"minuteur",
+  "payload":{"now_ms":…}}` sur `plugin_on_event`. Il ne passe pas par le bus :
+  les clients ne le voient pas, un greffon ne peut pas le forger (le relais du
+  bus l'écarte), et `"*"` ne suffit pas à le recevoir. Un réveil encore en
+  cours n'est pas doublé. Aucune capacité n'est ajoutée : le greffon réveillé
+  n'a que les permissions de son manifeste.
 
 ### 3.7 Lifecycle & errors
 - `enable` → instantiate, check `abi_version`, call `plugin_init`; on trap/limit

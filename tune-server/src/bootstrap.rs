@@ -430,6 +430,10 @@ pub async fn run_with(opts: RunOptions) {
     // never break the bus). Must run after the registry is published above.
     #[cfg(feature = "plugins-wasm")]
     crate::plugins_host::spawn_wasm_event_forwarder(&state);
+    // #4719 — le minuteur : un réveil par minute des greffons wasm qui s'y
+    // abonnent EXPRESSÉMENT (`event_subscriptions: ["minuteur"]`), hors bus.
+    #[cfg(feature = "plugins-wasm")]
+    crate::plugins_host::spawn_wasm_minuteur(&state);
 
     // NOTE: local-zone auto-resume is deferred until AFTER the HTTP listener is
     // bound (see below). Running it here fetched the local output's own
