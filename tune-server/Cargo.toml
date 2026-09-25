@@ -940,6 +940,11 @@ path = "tests/playlist_manager_cloisonnement_par_profil.rs"
 name = "page_artiste_sections_4767"
 path = "tests/page_artiste_sections_4767.rs"
 
+# #1572 — crédits d’un album (GET /library/albums/{id}/credits), fil 1921.
+[[test]]
+name = "credits_album_1572"
+path = "tests/credits_album_1572.rs"
+
 # #4767 — crédits MusicBrainz par disque (fixture réelle de *Déjà vu*) :
 # idempotence, sections « Collaborations » / « Reprises » de la page artiste,
 # focus par pistes créditées, route `/system/enrich-credits`.
