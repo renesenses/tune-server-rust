@@ -989,3 +989,9 @@ path = "tests/identification_lot_4805.rs"
 [[test]]
 name = "reidentification_album"
 path = "tests/reidentification_album.rs"
+
+# `library/stats` dit si l'import UPnP est complet (plafond, paginations
+# interrompues) — champ additif `upnp_import`.
+[[test]]
+name = "stats_import_upnp_incomplet"
+path = "tests/stats_import_upnp_incomplet.rs"
