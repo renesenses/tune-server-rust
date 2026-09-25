@@ -8,6 +8,8 @@
 //!
 //! ```text
 //! LecteurDisque (trait)  ── linux.rs  : ioctl /dev/sr*
+//!        │                ├─ cddafs.rs : volume cddafs (AIFF + .TOC.plist),
+//!        │                │              découvert par macos.rs
 //!        │                └─ simule.rs : TOC et secteurs en mémoire (témoins)
 //!        ▼
 //! toc.rs / discid.rs / musicbrainz.rs   (purs : TOC, identifiant, métadonnées)
@@ -26,10 +28,11 @@
 //!
 //! ## Hors de ce greffon
 //!
-//! L'extraction vers la bibliothèque (#2466), macOS (volume AIFF sous
-//! `/Volumes`) et Windows (`IOCTL_CDROM_RAW_READ`) : l'abstraction
-//! [`lecteur::LecteurDisque`] est prête à les recevoir.
+//! L'extraction vers la bibliothèque (#2466) et Windows
+//! (`IOCTL_CDROM_RAW_READ`) : l'abstraction [`lecteur::LecteurDisque`] est
+//! prête à les recevoir.
 
+pub mod cddafs;
 pub mod discid;
 pub mod ejection;
 pub mod flux;
@@ -38,6 +41,8 @@ pub mod hote;
 pub mod lecteur;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod musicbrainz;
 pub mod routes;
 pub mod simule;
@@ -89,7 +94,7 @@ impl TunePlugin for CdPlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Lecture directe d'un CD audio vers une zone, sans extraction (lecteur pris en charge sous Linux)"
+        "Lecture directe d'un CD audio vers une zone, sans extraction (lecteur pris en charge sous Linux et macOS)"
     }
     /// Opt-in : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
@@ -98,7 +103,7 @@ impl TunePlugin for CdPlugin {
     /// Au catalogue (#4863) : l'écran « Lecture CD » du client web consomme
     /// ses trois routes, donc la doctrine #2090 est remplie — le gestionnaire
     /// peut proposer « Installer ». Gratuit, comme `bandcamp` (absent de
-    /// `premium_plugins`). Sous macOS et Windows, l'installation réussit et
+    /// `premium_plugins`). Sous Windows, l'installation réussit et
     /// `/etat` répond `plateforme_prise_en_charge: false` : un état, pas une
     /// erreur.
     fn catalogued(&self) -> bool {
