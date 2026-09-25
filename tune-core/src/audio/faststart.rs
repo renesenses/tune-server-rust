@@ -707,7 +707,7 @@ mod tests {
         // Already-faststart file with no cover art → nothing to do.
         let ftyp = atom(b"ftyp", b"M4A isom");
         let moov = moov_with_stco_and_meta(&[(ftyp.len() + 200 + 8) as u32], None);
-        let mdat = atom(b"mdat", &vec![0u8; 100]);
+        let mdat = atom(b"mdat", &[0u8; 100]);
         let mut original = ftyp;
         original.extend_from_slice(&moov);
         original.extend_from_slice(&mdat);
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn relocates_moov_and_patches_stco() {
         let ftyp = atom(b"ftyp", b"M4A isom");
-        let mdat = atom(b"mdat", &vec![0xAAu8; 100]);
+        let mdat = atom(b"mdat", &[0xAAu8; 100]);
         let moov = moov_with_stco(&[/* chunk in mdat at */ ftyp.len() as u32 + 8]);
         let moov_size = moov.len() as u32;
 
@@ -763,7 +763,7 @@ mod tests {
     fn already_faststart_returns_none() {
         let ftyp = atom(b"ftyp", b"M4A isom");
         let moov = moov_with_stco(&[999]);
-        let mdat = atom(b"mdat", &vec![0u8; 10]);
+        let mdat = atom(b"mdat", &[0u8; 10]);
         // ftyp | moov | mdat  (already faststart)
         let mut data = ftyp;
         data.extend_from_slice(&moov);
@@ -785,7 +785,7 @@ mod tests {
         let moov = atom(b"moov", &trak);
         let moov_size = moov.len() as u64;
         let ftyp = atom(b"ftyp", b"isom");
-        let mdat = atom(b"mdat", &vec![0u8; 60]);
+        let mdat = atom(b"mdat", &[0u8; 60]);
         let mut original = ftyp.clone();
         original.extend_from_slice(&mdat);
         original.extend_from_slice(&moov);
@@ -805,7 +805,7 @@ mod tests {
     #[test]
     fn prepare_map_reads_only_header_and_maps_body() {
         let ftyp = atom(b"ftyp", b"M4A isom");
-        let mdat = atom(b"mdat", &vec![0x42u8; 200]);
+        let mdat = atom(b"mdat", &[0x42u8; 200]);
         let moov = moov_with_stco(&[ftyp.len() as u32 + 8]);
         let mut original = ftyp.clone();
         original.extend_from_slice(&mdat);

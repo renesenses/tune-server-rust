@@ -1,3 +1,9 @@
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::needless_range_loop)]
+
 use tracing::{debug, warn};
 
 /// Audio encoder that handles WAV (native) and FLAC (native pure-Rust).
@@ -272,7 +278,7 @@ fn flac_start(sample_rate: u32, bit_depth: u32, channels: u32) -> FlacStreamStat
 
     // 2. STREAMINFO metadata block header
     //    1 bit is_last=0, 7 bits type=0, 24 bits length=34
-    let block_header: u32 = (0 << 31) | 34; // is_last=0: VORBIS_COMMENT follows
+    let block_header: u32 = 34; // is_last=0: VORBIS_COMMENT follows
     output.extend_from_slice(&block_header.to_be_bytes());
 
     let streaminfo_offset = output.len();
@@ -287,10 +293,7 @@ fn flac_start(sample_rate: u32, bit_depth: u32, channels: u32) -> FlacStreamStat
 
     // sample rate (20 bits) | channels-1 (3 bits) | bps-1 (5 bits) | total samples high 4 bits
     // Total samples = 0 placeholder (patched in finish)
-    let sr_ch_bps: u32 = ((sample_rate) << 12)
-        | (((channels - 1) as u32) << 9)
-        | (((bit_depth - 1) as u32) << 4)
-        | 0; // total_samples_hi = 0 placeholder
+    let sr_ch_bps: u32 = ((sample_rate) << 12) | ((channels - 1) << 9) | ((bit_depth - 1) << 4); // total_samples_hi = 0 placeholder
     output.extend_from_slice(&sr_ch_bps.to_be_bytes());
 
     // total samples low 32 bits — placeholder 0
@@ -325,7 +328,7 @@ fn flac_write(
     bit_depth: u32,
     channels: u32,
 ) -> Result<(), String> {
-    let bytes_per_sample = ((bit_depth + 7) / 8) as usize;
+    let bytes_per_sample = bit_depth.div_ceil(8) as usize;
     let bytes_per_frame = bytes_per_sample * channels as usize; // one inter-channel sample
     let combined: Vec<u8>;
     let working_data: &[u8] = if state.pcm_leftover.is_empty() {
@@ -434,7 +437,7 @@ fn flac_finish(
 ) -> Result<Vec<u8>, String> {
     // Handle any leftover PCM bytes (shouldn't happen with well-aligned writes, but be safe)
     if !state.pcm_leftover.is_empty() {
-        let bytes_per_sample = ((bit_depth + 7) / 8) as usize;
+        let bytes_per_sample = bit_depth.div_ceil(8) as usize;
         let bytes_per_frame = bytes_per_sample * channels as usize;
         let usable = (state.pcm_leftover.len() / bytes_per_frame) * bytes_per_frame;
         if usable > 0 {
@@ -523,9 +526,9 @@ fn encode_flac_batch(
     bit_depth: u32,
     channels: u32,
 ) -> Result<Vec<u8>, String> {
-    let bytes_per_sample = ((bit_depth + 7) / 8) as usize;
+    let bytes_per_sample = bit_depth.div_ceil(8) as usize;
     let frame_size_bytes = bytes_per_sample * channels as usize;
-    if pcm.len() % frame_size_bytes != 0 {
+    if !pcm.len().is_multiple_of(frame_size_bytes) {
         return Err(format!(
             "PCM data length {} is not a multiple of frame size {}",
             pcm.len(),
@@ -550,7 +553,7 @@ fn encode_flac_batch(
     output.extend_from_slice(b"fLaC");
 
     // 2. STREAMINFO metadata block (is_last=0: VORBIS_COMMENT follows)
-    let block_header: u32 = (0 << 31) | 34;
+    let block_header: u32 = 34;
     output.extend_from_slice(&block_header.to_be_bytes());
 
     let block_size = FLAC_BLOCK_SIZE.min(total_samples);
@@ -814,10 +817,10 @@ fn encode_flac_frame_slices(
         44100 => 9,
         48000 => 10,
         96000 => 11,
-        _ if sample_rate % 1000 == 0 && sample_rate / 1000 <= 255 => 12, // 8-bit kHz
-        _ if sample_rate <= 65535 => 13,                                 // 16-bit Hz
-        _ if sample_rate % 10 == 0 && sample_rate / 10 <= 65535 => 14,   // 16-bit tens of Hz
-        _ => 0,                                                          // use STREAMINFO
+        _ if sample_rate.is_multiple_of(1000) && sample_rate / 1000 <= 255 => 12, // 8-bit kHz
+        _ if sample_rate <= 65535 => 13,                                          // 16-bit Hz
+        _ if sample_rate.is_multiple_of(10) && sample_rate / 10 <= 65535 => 14, // 16-bit tens of Hz
+        _ => 0,                                                                 // use STREAMINFO
     };
     bw.write_bits(sample_rate_code as u32, 4);
 

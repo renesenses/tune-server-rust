@@ -26,7 +26,7 @@ impl PlaybackOrchestrator {
     /// Le test d'origine n'exercait que `tidal` et `qobuz` — des sources qui
     /// portent TOUJOURS un `source_id`. Il ne pouvait pas voir le cas local.
     pub(super) fn record_or_detect_duplicate_net_play(
-        map: &mut HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>,
+        map: &mut HashMap<i64, super::DerniereLectureReseau>,
         zone_id: i64,
         source: &str,
         source_id: &Option<String>,
@@ -492,6 +492,8 @@ impl PlaybackOrchestrator {
         }
     }
 
+    // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn record_listen(
         &self,
         title: &str,

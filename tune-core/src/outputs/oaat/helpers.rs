@@ -113,7 +113,7 @@ fn parse_wav(buf: &mut Vec<u8>) -> Option<StreamInfo> {
 }
 
 /// Parse FLAC STREAMINFO metadata block.
-fn parse_flac(buf: &mut Vec<u8>) -> Option<StreamInfo> {
+fn parse_flac(buf: &mut [u8]) -> Option<StreamInfo> {
     if buf.len() < 42 {
         return None;
     }
@@ -1358,14 +1358,14 @@ mod tests_trames_flac {
         // Trame 0 puis un corps compressé quelconque, PLUS GROS que la trame :
         // au prorata des octets, la position exploserait.
         let mut flux = entete_de_trame(0);
-        flux.extend(std::iter::repeat(0xA5).take(9000));
+        flux.extend(std::iter::repeat_n(0xA5, 9000));
         c.avaler(&flux);
         assert!(c.est_synchronise());
         assert_eq!(c.position_samples(), 0, "trame 0 = position 0");
 
         // Trame 3 (on saute la 1 et la 2 : peu importe, la position est ABSOLUE).
         let mut flux2 = entete_de_trame(3);
-        flux2.extend(std::iter::repeat(0x5A).take(500));
+        flux2.extend(std::iter::repeat_n(0x5A, 500));
         c.avaler(&flux2);
         assert_eq!(
             c.position_samples(),

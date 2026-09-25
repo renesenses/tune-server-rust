@@ -62,7 +62,7 @@ fn short_first_and_final_block_is_delivered_and_announced_for_dsf_and_dff() {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
         ));
-        for (index, frame) in payload.chunks_exact(6).enumerate() {
+        for (index, frame) in payload.as_chunks::<6>().0.iter().enumerate() {
             let marker = if index % 2 == 0 { 0x05 } else { 0xfa };
             assert_eq!(
                 [frame[2], frame[5]],

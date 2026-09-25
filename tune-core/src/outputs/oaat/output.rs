@@ -229,10 +229,10 @@ fn signaler_refus_negociation(
     depot: &Arc<std::sync::Mutex<Option<String>>>,
     refus: &RefusNegociation,
 ) {
-    if let Ok(mut place) = depot.lock() {
-        if place.is_none() {
-            *place = Some(refus.raison.clone());
-        }
+    if let Ok(mut place) = depot.lock()
+        && place.is_none()
+    {
+        *place = Some(refus.raison.clone());
     }
 }
 
@@ -742,11 +742,11 @@ impl OutputTarget for OaatOutput {
         // parallèle sur un endpoint mono-client se volent la connexion, et la
         // piste reboucle sur ses premières secondes (#1475). On annule donc
         // l'ancienne AVANT d'en lancer une nouvelle.
-        if let Some(previous) = self.play_task.lock().await.take() {
-            if !previous.is_finished() {
-                debug!(device = %self.name, "oaat: annulation de la lecture precedente");
-                previous.abort();
-            }
+        if let Some(previous) = self.play_task.lock().await.take()
+            && !previous.is_finished()
+        {
+            debug!(device = %self.name, "oaat: annulation de la lecture precedente");
+            previous.abort();
         }
 
         let task = tokio::spawn(async move {
@@ -914,14 +914,13 @@ impl OutputTarget for OaatOutput {
                         let dsd_mult = dsd_rate_from_sample_rate(dsf_info.sample_rate);
                         if let (Some(m), Some(max)) =
                             (dsd_mult, endpoint.info.capabilities.dsd_max_rate)
+                            && m > max
                         {
-                            if m > max {
-                                debug!(
-                                    dsd = m,
-                                    max, "DSD rate exceeds endpoint max, falling back to PCM"
-                                );
-                                break 'direct false;
-                            }
+                            debug!(
+                                dsd = m,
+                                max, "DSD rate exceeds endpoint max, falling back to PCM"
+                            );
+                            break 'direct false;
                         }
                         let mut reader =
                             match crate::audio::dsf::DsfStreamReader::open(fp, dsf_info.clone()) {
@@ -1199,30 +1198,30 @@ impl OutputTarget for OaatOutput {
                                             // Otherwise leave next_dsd None so the
                                             // track ends cleanly and the poller
                                             // advances (small gap across the boundary).
-                                            if next_dsd.is_none() {
-                                                if let Some(fp) = file_path {
-                                                    next_dsd = tokio::task::block_in_place(|| {
-                                                        open_next_dsd(
-                                                            &fp,
-                                                            cur_sample_rate,
-                                                            ch,
-                                                            title,
-                                                            artist,
-                                                            album,
-                                                            cover_url,
-                                                            duration_ms,
-                                                        )
-                                                    });
-                                                    match next_dsd {
-                                                        Some(_) => info!(
-                                                            device = %device_name,
-                                                            "oaat: native DSD next track prepared (gapless ready)"
-                                                        ),
-                                                        None => info!(
-                                                            device = %device_name,
-                                                            "oaat: native DSD next not gapless-compatible, will advance at end"
-                                                        ),
-                                                    }
+                                            if next_dsd.is_none()
+                                                && let Some(fp) = file_path
+                                            {
+                                                next_dsd = tokio::task::block_in_place(|| {
+                                                    open_next_dsd(
+                                                        &fp,
+                                                        cur_sample_rate,
+                                                        ch,
+                                                        title,
+                                                        artist,
+                                                        album,
+                                                        cover_url,
+                                                        duration_ms,
+                                                    )
+                                                });
+                                                match next_dsd {
+                                                    Some(_) => info!(
+                                                        device = %device_name,
+                                                        "oaat: native DSD next track prepared (gapless ready)"
+                                                    ),
+                                                    None => info!(
+                                                        device = %device_name,
+                                                        "oaat: native DSD next not gapless-compatible, will advance at end"
+                                                    ),
                                                 }
                                             }
                                         }
@@ -1396,58 +1395,59 @@ impl OutputTarget for OaatOutput {
                             // same mechanism the PCM/HTTP path relies on. No compatible
                             // next → fall through to a clean stop and let the poller's
                             // natural-end fallback advance.
-                            if !stopped && playing.load(Ordering::Relaxed) && eof {
-                                if let Some(next) = next_dsd.take() {
-                                    endpoint
-                                        .send_audio(
-                                            stream_num,
-                                            cur_format,
-                                            0,
-                                            sample_offset,
-                                            &[],
-                                            PacketFlags::LAST_PACKET,
-                                        )
-                                        .await
-                                        .ok();
+                            if !stopped
+                                && playing.load(Ordering::Relaxed)
+                                && eof
+                                && let Some(next) = next_dsd.take()
+                            {
+                                endpoint
+                                    .send_audio(
+                                        stream_num,
+                                        cur_format,
+                                        0,
+                                        sample_offset,
+                                        &[],
+                                        PacketFlags::LAST_PACKET,
+                                    )
+                                    .await
+                                    .ok();
 
-                                    info!(
-                                        device = %device_name,
-                                        title = %next.title,
-                                        "oaat: gapless transition (native DSD)"
-                                    );
+                                info!(
+                                    device = %device_name,
+                                    title = %next.title,
+                                    "oaat: gapless transition (native DSD)"
+                                );
 
-                                    reader = next.reader;
-                                    sample_offset = 0;
-                                    pts_bits_base = 0;
-                                    pending.clear();
-                                    first = true;
-                                    eof = false;
-                                    pause_offset = std::time::Duration::ZERO;
-                                    stream_start_ns = super::helpers::now_ns() + 500_000_000;
-                                    start = std::time::Instant::now();
-                                    position_ms.store(0, Ordering::SeqCst);
-                                    duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
+                                reader = next.reader;
+                                sample_offset = 0;
+                                pts_bits_base = 0;
+                                pending.clear();
+                                first = true;
+                                eof = false;
+                                pause_offset = std::time::Duration::ZERO;
+                                stream_start_ns = super::helpers::now_ns() + 500_000_000;
+                                start = std::time::Instant::now();
+                                position_ms.store(0, Ordering::SeqCst);
+                                duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
 
-                                    *current_title.lock().await = Some(next.title.clone());
-                                    *current_artist.lock().await = Some(next.artist.clone());
-                                    *current_uri.lock().await = Some(String::new());
+                                *current_title.lock().await = Some(next.title.clone());
+                                *current_artist.lock().await = Some(next.artist.clone());
+                                *current_uri.lock().await = Some(String::new());
 
-                                    let fmt_str =
-                                        format_rate_display(cur_sample_rate, 1, cur_format);
-                                    endpoint
-                                        .send_metadata(oaat_core::message::TrackMetadata {
-                                            title: next.title,
-                                            artist: next.artist,
-                                            album: next.album,
-                                            duration_ms: next.duration_ms,
-                                            artwork_url: next.cover_url,
-                                            format: Some(fmt_str),
-                                        })
-                                        .await
-                                        .ok();
+                                let fmt_str = format_rate_display(cur_sample_rate, 1, cur_format);
+                                endpoint
+                                    .send_metadata(oaat_core::message::TrackMetadata {
+                                        title: next.title,
+                                        artist: next.artist,
+                                        album: next.album,
+                                        duration_ms: next.duration_ms,
+                                        artwork_url: next.cover_url,
+                                        format: Some(fmt_str),
+                                    })
+                                    .await
+                                    .ok();
 
-                                    continue 'track;
-                                }
+                                continue 'track;
                             }
                             break 'track;
                         } // end 'track loop
@@ -1919,14 +1919,13 @@ impl OutputTarget for OaatOutput {
                                     duration_ms,
                                     file_path: Some(next_path),
                                     ..
-                                } => {
-                                    if staged_rx.is_none() && staged_next.is_none() {
-                                        let (tx, rx) = tokio::sync::oneshot::channel();
-                                        staged_rx = Some(rx);
-                                        let dev = device_name.clone();
-                                        let cible = contrat_negocie.clone();
-                                        tokio::task::spawn_blocking(move || {
-                                            let staged = super::helpers::stage_direct_track(
+                                } if staged_rx.is_none() && staged_next.is_none() => {
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    staged_rx = Some(rx);
+                                    let dev = device_name.clone();
+                                    let cible = contrat_negocie.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let staged = super::helpers::stage_direct_track(
                                                 &next_path,
                                                 title,
                                                 artist,
@@ -1943,12 +1942,11 @@ impl OutputTarget for OaatOutput {
                                                     }
                                                 }
                                             });
-                                            if staged.is_none() {
-                                                debug!(device = %dev, path = %next_path, "oaat: direct next track not stageable");
-                                            }
-                                            let _ = tx.send(staged);
-                                        });
-                                    }
+                                        if staged.is_none() {
+                                            debug!(device = %dev, path = %next_path, "oaat: direct next track not stageable");
+                                        }
+                                        let _ = tx.send(staged);
+                                    });
                                 }
                                 // A next track without a local path is not
                                 // handled on the direct path.
@@ -3189,10 +3187,10 @@ impl OutputTarget for OaatOutput {
         // pauses. Un `stop` était donc journalisé pendant que la boucle
         // continuait à réclamer l'endpoint jusqu'à quarante secondes — et
         // volait la connexion à la lecture suivante (#1475).
-        if let Some(task) = self.play_task.lock().await.take() {
-            if !task.is_finished() {
-                task.abort();
-            }
+        if let Some(task) = self.play_task.lock().await.take()
+            && !task.is_finished()
+        {
+            task.abort();
         }
         #[cfg(feature = "oaat")]
         {
@@ -3348,6 +3346,8 @@ impl OutputTarget for OaatOutput {
 /// gap across the format boundary, never a stall). Blocking file I/O: call from
 /// within `tokio::task::block_in_place`.
 #[cfg(feature = "oaat")]
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 fn open_next_dsd(
     file_path: &str,
     expect_sample_rate: u32,
@@ -3984,6 +3984,8 @@ pub(crate) async fn attendre_accord_format_sur(
     }
 }
 
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn settle_prefetch(
     endpoint: &mut oaat_controller::ConnectedEndpoint,
     mut prefetch: NextTrackPrefetch,
@@ -4029,6 +4031,8 @@ async fn settle_prefetch(
     Some(prefetch)
 }
 
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn prefetch_next_track(
     client: &reqwest::Client,
     device_name: &str,

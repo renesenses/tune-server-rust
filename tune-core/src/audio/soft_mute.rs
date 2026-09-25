@@ -285,7 +285,7 @@ impl SoftMuteRamp {
             let mut map = |sample: f32| -> T {
                 let g = base_gain * gain;
                 index += 1;
-                if index % ch == 0 {
+                if index.is_multiple_of(ch) {
                     gain = advance_gain(gain, target, step);
                 }
                 convert(sample * g)
@@ -443,7 +443,7 @@ mod tests {
         // retirée : ici le signal alterne ±1, donc on compare les modules.
         let mut worst = 0.0f32;
         let mut prev: Option<f32> = None;
-        for s in buf.chunks_exact(2) {
+        for s in buf.as_chunks::<2>().0.iter() {
             if let Some(p) = prev {
                 worst = worst.max((s[0].abs() - p).abs());
             }
@@ -539,7 +539,7 @@ mod tests {
         ramp.begin(true);
         let mut buf = vec![1.0f32; 256];
         ramp.apply(&mut buf, 1.0);
-        for frame in buf.chunks_exact(2) {
+        for frame in buf.as_chunks::<2>().0.iter() {
             assert_eq!(frame[0].to_bits(), frame[1].to_bits());
         }
     }

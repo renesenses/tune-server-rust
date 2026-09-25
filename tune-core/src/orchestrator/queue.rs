@@ -214,7 +214,7 @@ impl PlaybackOrchestrator {
             }
 
             let sr = stream_data.quality.sample_rate;
-            let bd = stream_data.quality.bit_depth.max(16).min(24);
+            let bd = stream_data.quality.bit_depth.clamp(16, 24);
             let key_bd = if out_fmt == "wav" { 16 } else { bd };
             let cp = crate::transcode_cache::cache_path_streaming(
                 &source, &source_id, out_fmt, sr, key_bd, 2,

@@ -2,6 +2,11 @@
 //!
 //! Parses the IFF container (FORM + COMM + SSND chunks) and extracts
 //! interleaved PCM samples as i16.
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::while_let_loop)]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -201,7 +206,7 @@ pub fn decode_aiff_to_pcm(
         }
     }
 
-    let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
+    let bytes_per_sample = (info.bits_per_sample as u32).div_ceil(8);
     let frame_size = bytes_per_sample * info.channels as u32;
 
     // Compute seek offset in frames
@@ -212,11 +217,7 @@ pub fn decode_aiff_to_pcm(
     };
 
     // Compute max frames to read
-    let available_frames = if seek_frames < info.num_frames as u64 {
-        info.num_frames as u64 - seek_frames
-    } else {
-        0
-    };
+    let available_frames = (info.num_frames as u64).saturating_sub(seek_frames);
     let max_frames = if max_duration_s > 0.0 {
         let limit = (max_duration_s * info.sample_rate).round() as u64;
         available_frames.min(limit)
@@ -447,7 +448,7 @@ mod tests {
         ssnd.extend_from_slice(&0u32.to_be_bytes());
         ssnd.extend_from_slice(&0u32.to_be_bytes());
         ssnd.extend_from_slice(pcm);
-        if pcm.len() % 2 != 0 {
+        if !pcm.len().is_multiple_of(2) {
             ssnd.push(0);
         }
 
@@ -508,7 +509,7 @@ mod tests {
     #[test]
     fn pcm_16bit_be_conversion() {
         // 16-bit big-endian: 0x7FFF = i16::MAX, 0x8001 = -32767
-        let raw = vec![0x7F, 0xFF, 0x80, 0x01, 0x00, 0x00];
+        let raw = [0x7F, 0xFF, 0x80, 0x01, 0x00, 0x00];
         let mut samples = Vec::new();
         for chunk in raw.chunks_exact(2) {
             samples.push(i16::from_be_bytes([chunk[0], chunk[1]]));
@@ -519,7 +520,7 @@ mod tests {
     #[test]
     fn pcm_24bit_be_to_i16() {
         // 24-bit big-endian: 0x7FFFFF -> should map to ~i16::MAX
-        let raw = vec![0x7F, 0xFF, 0xFF];
+        let raw = [0x7F, 0xFF, 0xFF];
         let val = i32::from_be_bytes([raw[0], raw[1], raw[2], 0]);
         let sample = (val >> 16) as i16;
         assert_eq!(sample, i16::MAX);
@@ -802,7 +803,7 @@ mod tests {
         ssnd.extend_from_slice(&0u32.to_be_bytes());
         ssnd.extend_from_slice(&0u32.to_be_bytes());
         ssnd.extend_from_slice(pcm);
-        if pcm.len() % 2 != 0 {
+        if !pcm.len().is_multiple_of(2) {
             ssnd.push(0);
         }
         let mut form = Vec::new();

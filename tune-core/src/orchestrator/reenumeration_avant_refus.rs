@@ -95,10 +95,10 @@ impl PlaybackOrchestrator {
         };
         for sortie in sorties {
             let sortie = sortie.lock().await;
-            if let Ok(statut) = sortie.get_status().await {
-                if statut.state == crate::outputs::traits::TransportState::Playing {
-                    return true;
-                }
+            if let Ok(statut) = sortie.get_status().await
+                && statut.state == crate::outputs::traits::TransportState::Playing
+            {
+                return true;
             }
         }
         false

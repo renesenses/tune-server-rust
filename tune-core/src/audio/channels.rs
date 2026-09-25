@@ -2,6 +2,11 @@
 //!
 //! Ported from Python `tune_server/audio/formats.py` (feat/multichannel branch).
 //! Supports up to 32 channels (Trinnov Altitude).
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 use serde::{Deserialize, Serialize};
 
@@ -458,7 +463,7 @@ fn validate_channel_adaptation(
     if source_ch == 0 || target_ch == 0 {
         return Err("channel count must be greater than zero".into());
     }
-    if sample_count % source_ch as usize != 0 {
+    if !sample_count.is_multiple_of(source_ch as usize) {
         return Err(format!(
             "PCM sample count {sample_count} is not aligned to {source_ch} source channels"
         ));

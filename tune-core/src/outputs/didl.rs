@@ -584,7 +584,7 @@ impl DidlBuilder {
     /// (Denon, Marantz) have buggy XML parsers that fail to unescape `&quot;`
     /// in text content, causing them to reject the metadata entirely.
     pub fn build_escaped(&self) -> String {
-        partial_escape(&self.build()).to_string()
+        partial_escape(self.build()).to_string()
     }
 }
 

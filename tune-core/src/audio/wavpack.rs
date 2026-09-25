@@ -380,6 +380,9 @@ impl<'a> BitstreamReader<'a> {
         self.read_bit().unwrap_or(0)
     }
 
+    // Le décodeur lit bit à bit (`read_bit`) ; la lecture groupée ne sert
+    // plus qu'aux épreuves du lecteur de flux.
+    #[cfg(test)]
     fn read_bits(&mut self, n: u32) -> Option<u32> {
         let mut value = 0u32;
         for i in 0..n {
@@ -1101,11 +1104,11 @@ fn decode_block(header: &BlockHeader, block_data: &[u8]) -> Result<DecodedBlock,
             id if id == SUB_BITSTREAM => {
                 bitstream_data = &sub.data;
             }
-            id if id == SUB_WVX_BITSTREAM => {
+            id if id == SUB_WVX_BITSTREAM
                 // Les 4 premiers octets portent le CRC des bits supplémentaires.
-                if sub.data.len() > 4 {
-                    wvx_data = Some(&sub.data[4..]);
-                }
+                && sub.data.len() > 4 =>
+            {
+                wvx_data = Some(&sub.data[4..]);
             }
             _ => {}
         }
@@ -1652,7 +1655,9 @@ mod tests {
         );
         assert_eq!(pcm.len(), 4410 * 2);
         let samples: Vec<i32> = pcm
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
             .collect();
         assert_eq!(
@@ -2055,9 +2060,9 @@ mod tests {
     #[test]
     fn restore_weight_values() {
         assert_eq!(restore_weight(0), 0);
-        assert_eq!(restore_weight(1), 8 + 0); // (1<<3) + ((1+7)>>4) = 8 + 0 = 8
+        assert_eq!(restore_weight(1), 8); // (1<<3) + ((1+7)>>4) = 8 + 0 = 8
         assert_eq!(restore_weight(10), 80 + 1); // (10<<3) + ((10+7)>>4) = 80 + 1 = 81
-        assert_eq!(restore_weight(-1), -8 + 0); // (-1<<3) - ((1+7)>>4) = -8 - 0 = -8
+        assert_eq!(restore_weight(-1), -8); // (-1<<3) - ((1+7)>>4) = -8 - 0 = -8
     }
 
     #[test]
