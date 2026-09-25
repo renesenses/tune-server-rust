@@ -1,6 +1,13 @@
 //! Un faux mozaiklabs, local, qui implémente le contrat `/api/v1/circle` de
 //! #5018 — l'API réelle est codée en parallèle et n'est pas encore déployée.
 //!
+//! Formes alignées sur le côté cloud tel qu'écrit (renesenses/site-mozaiklabs
+//! #223) : `id` et `user_id` entiers ; invitation créée = 201 et l'invitation ;
+//! `accept` = 200 et le membre ; `decline` et les deux `DELETE` = 200
+//! `{ "ok": true }` ; 404 `{ "error": "not_found" }` ; 409 `already_member`,
+//! `already_invited`, `invitation_received` ; 422 `self_invitation` ou adresse
+//! invalide ; 429 au-delà du débit ; toujours du JSON.
+//!
 //! Il tient le cercle d'UN compte (le détenteur du jeton), compte les appels
 //! reçus, et sait jouer la panne (500) et le débit dépassé (429). Il sert
 //! aussi `POST /oauth/token` pour le rafraîchissement.
@@ -26,6 +33,14 @@ pub const RAFRAICHISSEMENT: &str = "jeton-rafraichissement-SECRET-5018";
 pub const JETON_NEUF: &str = "jeton-neuf-SECRET-5018";
 pub const RAFRAICHISSEMENT_NEUF: &str = "jeton-rafraichissement-neuf-SECRET-5018";
 pub const COURRIEL_INVITE: &str = "claire.invitee@exemple.fr";
+/// L'adresse du détenteur du jeton : s'inviter soi-même = 422.
+pub const COURRIEL_DU_COMPTE: &str = "moi.proprietaire@exemple.fr";
+/// L'adresse d'Alice, déjà membre : 409 `already_member`.
+pub const COURRIEL_MEMBRE: &str = "alice.membre@exemple.fr";
+/// L'adresse de Denis, qui nous a déjà invités : 409 `invitation_received`.
+pub const COURRIEL_QUI_NOUS_INVITE: &str = "denis.invitant@exemple.fr";
+/// L'adresse d'une invitation déjà envoyée et en attente : 409 `already_invited`.
+pub const COURRIEL_DEJA_INVITE: &str = "bob.envoye@exemple.fr";
 
 pub struct Faux {
     pub jeton_valide: String,
@@ -40,6 +55,7 @@ pub struct Faux {
     pub invitations_permises: u32,
     /// Le dernier corps reçu par `POST /invitations`.
     pub dernier_corps: Option<Value>,
+    pub prochain_id: i64,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -51,13 +67,13 @@ pub fn cercle_initial() -> Value {
             { "user_id": 9, "name": "Bruno", "since": "2026-09-02T11:00:00Z" }
         ],
         "sent": [
-            { "id": "inv-s1", "name_or_email": "bob.envoye@exemple.fr",
+            { "id": 11, "name_or_email": "bob.envoye@exemple.fr",
               "created_at": "2026-09-20T08:00:00Z", "expires_at": "2026-10-20T08:00:00Z" }
         ],
         "received": [
-            { "id": "inv-r1", "name_or_email": "Denis",
+            { "id": 21, "name_or_email": "Denis",
               "created_at": "2026-09-21T08:00:00Z", "expires_at": "2026-10-21T08:00:00Z" },
-            { "id": "inv-r2", "name_or_email": "Emma",
+            { "id": 22, "name_or_email": "Emma",
               "created_at": "2026-09-22T08:00:00Z", "expires_at": "2026-10-22T08:00:00Z" }
         ]
     })
@@ -76,6 +92,7 @@ impl Faux {
             panne: false,
             invitations_permises: 10,
             dernier_corps: None,
+            prochain_id: 12,
         }
     }
 
@@ -98,11 +115,7 @@ fn non_authentifie() -> Response {
 }
 
 fn introuvable() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "message": "Not Found." })),
-    )
-        .into_response()
+    (StatusCode::NOT_FOUND, Json(json!({ "error": "not_found" }))).into_response()
 }
 
 /// Compte l'appel, puis rend la réponse de panne ou d'auth s'il y a lieu.
@@ -136,11 +149,16 @@ async fn lister(State(e): State<Partage>, h: HeaderMap) -> Response {
     Json(e.lock().unwrap().cercle()).into_response()
 }
 
+fn refus(statut: StatusCode, motif: &str) -> Response {
+    (statut, Json(json!({ "error": motif }))).into_response()
+}
+
 async fn inviter(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Response {
     if let Some(r) = garde(&e, &h) {
         return r;
     }
     let mut f = e.lock().unwrap();
+    // Le limiteur passe avant la validation, comme `throttle` chez Laravel.
     if f.invitations_permises == 0 {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -152,17 +170,26 @@ async fn inviter(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Respon
     f.invitations_permises -= 1;
     let v: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
     f.dernier_corps = Some(v.clone());
-    let id = format!("inv-s{}", f.sent.len() + 1);
-    f.sent.push(json!({
-        "id": id, "name_or_email": v["email"],
+    let Some(email) = v["email"].as_str().filter(|m| m.contains('@')) else {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "invalid_email");
+    };
+    match email {
+        COURRIEL_DU_COMPTE => return refus(StatusCode::UNPROCESSABLE_ENTITY, "self_invitation"),
+        COURRIEL_MEMBRE => return refus(StatusCode::CONFLICT, "already_member"),
+        COURRIEL_QUI_NOUS_INVITE => return refus(StatusCode::CONFLICT, "invitation_received"),
+        _ => {}
+    }
+    if f.sent.iter().any(|i| i["name_or_email"] == email) {
+        return refus(StatusCode::CONFLICT, "already_invited");
+    }
+    let invitation = json!({
+        "id": f.prochain_id, "name_or_email": email,
         "created_at": "2026-09-25T08:00:00Z", "expires_at": "2026-10-25T08:00:00Z"
-    }));
+    });
+    f.prochain_id += 1;
+    f.sent.push(invitation.clone());
     // Même réponse que l'adresse soit connue ou non (aucune énumération).
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({ "status": "invitation_sent" })),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(invitation)).into_response()
 }
 
 fn position(v: &[Value], cle: &str, id: &str) -> Option<usize> {
@@ -187,7 +214,7 @@ async fn accepter(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>
         "since": "2026-09-25T09:00:00Z"
     });
     f.members.push(membre.clone());
-    Json(json!({ "member": membre })).into_response()
+    Json(membre).into_response()
 }
 
 async fn refuser(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>) -> Response {
@@ -199,7 +226,7 @@ async fn refuser(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>)
         return introuvable();
     };
     f.received.remove(i);
-    Json(json!({ "status": "declined" })).into_response()
+    Json(json!({ "ok": true })).into_response()
 }
 
 async fn retirer(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>) -> Response {
@@ -211,7 +238,7 @@ async fn retirer(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>)
         return introuvable();
     };
     f.sent.remove(i);
-    StatusCode::NO_CONTENT.into_response()
+    Json(json!({ "ok": true })).into_response()
 }
 
 async fn revoquer(State(e): State<Partage>, h: HeaderMap, Path(uid): Path<String>) -> Response {
@@ -223,7 +250,7 @@ async fn revoquer(State(e): State<Partage>, h: HeaderMap, Path(uid): Path<String
         return introuvable();
     };
     f.members.remove(i);
-    StatusCode::NO_CONTENT.into_response()
+    Json(json!({ "ok": true })).into_response()
 }
 
 /// `POST /oauth/token`, `grant_type=refresh_token` : fait tourner la paire.

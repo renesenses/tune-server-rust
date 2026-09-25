@@ -63,7 +63,15 @@ async fn ni_jeton_ni_courriel_au_journal() {
         Some(json!({ "email": COURRIEL_INVITE })),
     )
     .await; // 429
-    appel(&app, "POST", "/invitations/inv-r1/accept", None).await;
+    appel(&app, "POST", "/invitations/21/accept", None).await;
+    faux.etat.lock().unwrap().invitations_permises = 5;
+    appel(
+        &app,
+        "POST",
+        "/invitations",
+        Some(json!({ "email": COURRIEL_MEMBRE })),
+    )
+    .await; // 409
     appel(&app, "DELETE", "/members/9", None).await;
     appel(&app, "GET", "/", None).await; // liste avec `sent` porteur d'adresses
     faux.etat.lock().unwrap().panne = true;
@@ -92,7 +100,8 @@ async fn ni_jeton_ni_courriel_au_journal() {
         RAFRAICHISSEMENT_NEUF,
         "SECRET-5018",
         COURRIEL_INVITE,
-        "bob.envoye@exemple.fr",
+        COURRIEL_DEJA_INVITE,
+        COURRIEL_MEMBRE,
         "@exemple.fr",
     ] {
         assert!(

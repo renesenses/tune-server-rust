@@ -27,9 +27,9 @@ async fn sans_session_sso_l_etat_est_clair_et_rien_ne_part() {
                 "/invitations",
                 Some(json!({ "email": COURRIEL_INVITE })),
             ),
-            ("POST", "/invitations/inv-r1/accept", None),
-            ("POST", "/invitations/inv-r1/decline", None),
-            ("DELETE", "/invitations/inv-s1", None),
+            ("POST", "/invitations/21/accept", None),
+            ("POST", "/invitations/21/decline", None),
+            ("DELETE", "/invitations/11", None),
             ("DELETE", "/members/7", None),
         ] {
             let r = appel(&app, m, chemin, corps).await;
@@ -64,10 +64,10 @@ async fn la_liste_est_relayee_a_l_identique() {
     assert_eq!(r.entetes.get("content-type").unwrap(), "application/json");
 }
 
-// 3. Invitation : 202 relayé, 429 relayé ----------------------------------
+// 3. Invitation : 201 relayé, 429 relayé ; 409 et 422 du cloud relayés ---
 
 #[tokio::test]
-async fn l_invitation_relaie_202_puis_429_avec_son_delai() {
+async fn l_invitation_relaie_201_puis_429_avec_son_delai() {
     let faux = demarrer().await;
     faux.etat.lock().unwrap().invitations_permises = 1;
     let app = app(base(&faux.base, Some(JETON)));
@@ -80,8 +80,12 @@ async fn l_invitation_relaie_202_puis_429_avec_son_delai() {
         Some(json!({ "email": COURRIEL_INVITE, "admin": true })),
     )
     .await;
-    assert_eq!(r.statut, StatusCode::ACCEPTED);
-    assert_eq!(r.json(), json!({ "status": "invitation_sent" }));
+    assert_eq!(r.statut, StatusCode::CREATED);
+    assert_eq!(
+        r.json(),
+        json!({ "id": 12, "name_or_email": COURRIEL_INVITE,
+                "created_at": "2026-09-25T08:00:00Z", "expires_at": "2026-10-25T08:00:00Z" })
+    );
     assert_eq!(
         faux.etat.lock().unwrap().dernier_corps,
         Some(json!({ "email": COURRIEL_INVITE }))
@@ -99,16 +103,51 @@ async fn l_invitation_relaie_202_puis_429_avec_son_delai() {
     assert_eq!(r.entetes.get("retry-after").unwrap(), "42");
 }
 
+/// Le cloud seul juge l'adresse : ses 409 et 422 arrivent avec leur motif,
+/// sans qu'un second juge local ne les remplace.
 #[tokio::test]
-async fn une_invitation_sans_courriel_est_refusee_sans_appel() {
+async fn les_refus_409_et_422_du_cloud_sont_relayes_avec_leur_motif() {
     let faux = demarrer().await;
     let app = app(base(&faux.base, Some(JETON)));
-    for corps in [json!({}), json!({ "email": "  " }), json!({ "email": 3 })] {
-        let r = appel(&app, "POST", "/invitations", Some(corps)).await;
-        assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(r.json(), json!({ "code": "circle.email_required" }));
+    for (corps, statut, motif) in [
+        (
+            json!({ "email": COURRIEL_DU_COMPTE }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "self_invitation",
+        ),
+        (
+            json!({ "email": "pas-une-adresse" }),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_email",
+        ),
+        (json!({}), StatusCode::UNPROCESSABLE_ENTITY, "invalid_email"),
+        (
+            json!({ "email": COURRIEL_MEMBRE }),
+            StatusCode::CONFLICT,
+            "already_member",
+        ),
+        (
+            json!({ "email": COURRIEL_DEJA_INVITE }),
+            StatusCode::CONFLICT,
+            "already_invited",
+        ),
+        (
+            json!({ "email": COURRIEL_QUI_NOUS_INVITE }),
+            StatusCode::CONFLICT,
+            "invitation_received",
+        ),
+    ] {
+        let r = appel(&app, "POST", "/invitations", Some(corps.clone())).await;
+        assert_eq!(r.statut, statut, "{corps}");
+        assert_eq!(r.json(), json!({ "error": motif }), "{corps}");
+        if corps == json!({}) {
+            assert_eq!(
+                faux.etat.lock().unwrap().dernier_corps,
+                Some(json!({ "email": null })),
+                "un corps sans `email` part avec `email: null` : le cloud juge"
+            );
+        }
     }
-    assert_eq!(faux.etat.lock().unwrap().appels, 0);
 }
 
 // 4. Accepter, refuser, retirer -------------------------------------------
@@ -118,17 +157,21 @@ async fn accepter_refuser_retirer_passent_au_cloud() {
     let faux = demarrer().await;
     let app = app(base(&faux.base, Some(JETON)));
 
-    let r = appel(&app, "POST", "/invitations/inv-r1/accept", None).await;
+    // `accept` rend le membre créé, tel quel.
+    let r = appel(&app, "POST", "/invitations/21/accept", None).await;
     assert_eq!(r.statut, StatusCode::OK);
-    assert_eq!(r.json()["member"]["name"], "Denis");
+    assert_eq!(
+        r.json(),
+        json!({ "user_id": 102, "name": "Denis", "since": "2026-09-25T09:00:00Z" })
+    );
 
-    let r = appel(&app, "POST", "/invitations/inv-r2/decline", None).await;
+    let r = appel(&app, "POST", "/invitations/22/decline", None).await;
     assert_eq!(r.statut, StatusCode::OK);
-    assert_eq!(r.json(), json!({ "status": "declined" }));
+    assert_eq!(r.json(), json!({ "ok": true }));
 
-    let r = appel(&app, "DELETE", "/invitations/inv-s1", None).await;
-    assert_eq!(r.statut, StatusCode::NO_CONTENT);
-    assert!(r.octets.is_empty());
+    let r = appel(&app, "DELETE", "/invitations/11", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "ok": true }));
 
     let cercle = appel(&app, "GET", "/", None).await.json();
     assert_eq!(cercle["received"], json!([]));
@@ -163,7 +206,8 @@ async fn la_revocation_par_tune_se_voit_a_la_lecture_suivante() {
         [7, 9]
     );
     let r = appel(&app, "DELETE", "/members/9", None).await;
-    assert_eq!(r.statut, StatusCode::NO_CONTENT);
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "ok": true }));
     assert_eq!(
         ids_des_membres(&appel(&app, "GET", "/", None).await.json()),
         [7]
@@ -210,9 +254,11 @@ async fn ce_qui_n_est_pas_a_l_appelant_rend_le_404_du_cloud() {
     let app = app(base(&faux.base, Some(JETON)));
 
     for (m, chemin) in [
-        ("POST", "/invitations/inv-inconnue/accept"),
-        ("POST", "/invitations/inv-inconnue/decline"),
-        ("DELETE", "/invitations/inv-inconnue"),
+        ("POST", "/invitations/999/accept"),
+        ("POST", "/invitations/999/decline"),
+        ("DELETE", "/invitations/999"),
+        // L'auteur ne peut pas accepter sa propre invitation : 404, pas 403.
+        ("POST", "/invitations/11/accept"),
         ("DELETE", "/members/12345"),
         // Un identifiant qui tente de sortir de son segment reste UN segment :
         // le cloud reçoit `invitations/x%2F..%2F..%2Fmembers%2F7`, pas une
@@ -221,7 +267,7 @@ async fn ce_qui_n_est_pas_a_l_appelant_rend_le_404_du_cloud() {
     ] {
         let r = appel(&app, m, chemin, None).await;
         assert_eq!(r.statut, StatusCode::NOT_FOUND, "{m} {chemin}");
-        assert_eq!(r.json(), json!({ "message": "Not Found." }), "{m} {chemin}");
+        assert_eq!(r.json(), json!({ "error": "not_found" }), "{m} {chemin}");
     }
     assert_eq!(ids_des_membres(&faux.etat.lock().unwrap().cercle()), [7, 9]);
 }

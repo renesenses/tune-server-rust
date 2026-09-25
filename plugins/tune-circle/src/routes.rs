@@ -20,8 +20,10 @@
 //!   "circle.not_connected" }`. Aucun appel ne part.
 //! * **Cloud indisponible** (injoignable, délai, 5xx) : `503 { "connected":
 //!   true, "code": "circle.cloud_unavailable", "upstream_status": 500|null }`.
-//! * Refus locaux, sans appel : `422 circle.email_required` (corps sans
-//!   `email`), `404 circle.not_found` (identifiant vide, `.` ou `..`).
+//! * Refus local, sans appel : `404 circle.not_found` (identifiant vide, `.`
+//!   ou `..`). La validité de l'adresse, elle, est jugée par le cloud seul
+//!   (`422 self_invitation`, adresse invalide ; `409 already_member`,
+//!   `already_invited`, `invitation_received`) et relayée avec son corps.
 
 use std::sync::Arc;
 
@@ -38,7 +40,6 @@ use crate::relais::{Issue, Relais};
 
 pub const CODE_NON_CONNECTE: &str = "circle.not_connected";
 pub const CODE_CLOUD_INDISPONIBLE: &str = "circle.cloud_unavailable";
-pub const CODE_COURRIEL_REQUIS: &str = "circle.email_required";
 pub const CODE_INTROUVABLE: &str = "circle.not_found";
 pub const CODE_REPONSE_ILLISIBLE: &str = "circle.unreadable_response";
 
@@ -121,23 +122,13 @@ async fn cercle(State(relais): State<Arc<Relais>>) -> Response {
 }
 
 async fn inviter(State(relais): State<Arc<Relais>>, corps: Bytes) -> Response {
+    // Seul `email` part, tel que le client l'a donné : le contrat n'en demande
+    // pas plus, et c'est le cloud qui juge l'adresse (422, 409). Un second
+    // juge ici, plus lâche ou plus strict, ferait diverger les deux motifs.
     let email = serde_json::from_slice::<Value>(&corps)
         .ok()
-        .and_then(|v| {
-            v.get("email")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .map(String::from)
-        })
-        .filter(|e| !e.is_empty());
-    let Some(email) = email else {
-        return refus(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            json!({ "code": CODE_COURRIEL_REQUIS }),
-        );
-    };
-    // Seul `email` part : le contrat n'en demande pas plus, et rien d'autre
-    // du client ne transite vers le cloud.
+        .and_then(|v| v.get("email").cloned())
+        .unwrap_or(Value::Null);
     let envoi = json!({ "email": email });
     en_reponse(
         relais
