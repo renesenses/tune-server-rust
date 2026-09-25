@@ -2394,6 +2394,101 @@ async fn pg_3715_alarm_source_migration_preserves_ids_and_accepts_opaque_strings
     }
 }
 
+/// #4836 (suite) — même témoin que
+/// `labels_albums_4836_tests::i4836_le_demarrage_remonte_le_label_des_pistes_jusqu_a_l_onglet_labels`
+/// (serveur, SQLite), contre PostgreSQL : le label des pistes remonte sur
+/// l'album au passage du runner de démarrage, en comblement seul, et un second
+/// passage ne touche aucune ligne.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_4836_labels_d_album_combles_au_demarrage() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("runner sur la base de test");
+    let id_de = |sql: &str| -> i64 {
+        db.query_many(sql, &[])
+            .unwrap()
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap()
+    };
+    let artiste = id_de("INSERT INTO artists (name) VALUES ('Artiste pg_4836') RETURNING id");
+    let album = |titre: &str, label: &str| -> i64 {
+        let label = if label == "NULL" {
+            "NULL".to_string()
+        } else {
+            format!("'{label}'")
+        };
+        id_de(&format!(
+            "INSERT INTO albums (title, artist_id, track_count, label) \
+             VALUES ('{titre}', {artiste}, 2, {label}) RETURNING id"
+        ))
+    };
+    let vide = album("pg_4836 vide", "NULL");
+    let pose = album("pg_4836 posé", "Label Maison");
+    for (a, l) in [
+        (vide, "ECM"),
+        (vide, "ECM"),
+        (vide, "Columbia"),
+        (pose, "ECM"),
+    ] {
+        db.execute(
+            &format!(
+                "INSERT INTO tracks (title, album_id, artist_id, label) \
+                 VALUES ('pg_4836', {a}, {artiste}, '{l}')"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+    let label_de = |id: i64| -> Option<String> {
+        db.query_many(&format!("SELECT label FROM albums WHERE id = {id}"), &[])
+            .unwrap()
+            .first()
+            .and_then(|r| r.first().and_then(|v| v.as_string()))
+    };
+    assert_eq!(
+        label_de(vide),
+        None,
+        "la base d'avant n'a pas de label d'album"
+    );
+
+    // Redémarrage.
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("runner au redémarrage");
+    assert_eq!(
+        label_de(vide).as_deref(),
+        Some("ECM"),
+        "#4836 — le runner de démarrage PG doit remonter le label majoritaire \
+         des pistes sur l'album"
+    );
+    assert_eq!(
+        label_de(pose).as_deref(),
+        Some("Label Maison"),
+        "un label d'album posé n'est jamais écrasé"
+    );
+
+    // Idempotence : rejouée, la passe ne touche plus ces albums.
+    let rejouee = sqlx::query(sqlx::AssertSqlSafe(
+        crate::db::album_repo::sql_combler_les_labels_d_album(),
+    ))
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(
+        rejouee, 0,
+        "la passe rejouée a encore écrit {rejouee} lignes"
+    );
+    pool.close().await;
+}
+
 /// #4201 — le compteur UPnP suit les radios SANS figer le type de
 /// `radio_stations.is_favorite`. Un WHEN qui nommait la colonne en faisait une
 /// dépendance : 062 rejouée (pg_2468) et le banc pg_3181 échouaient sur

@@ -691,6 +691,12 @@ pub(super) async fn rescan_track(
 
             if let Err(e) = repo.update(&track) {
                 tracing::warn!(track_id = id, error = %e, "rescan_track_update_failed");
+            } else if let Some(album_id) = track.album_id {
+                // #4836 : le label relu (TPUB, LABEL…) remonte sur l'album, que
+                // lit l'onglet Labels. Comblement seul, comme au scan.
+                tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+                    .update_label_from_tracks(album_id)
+                    .ok();
             }
 
             Json(json!({
@@ -1283,6 +1289,16 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                  WHERE source = 'local' OR source IS NULL",
             )
             .ok();
+            // #4836 : cette passe relit les étiquettes de toute la bibliothèque,
+            // TPUB compris ; le label relu remonte sur l'album, en comblement
+            // seul — même règle que le scan et le démarrage.
+            if let Err(e) = tune_core::db::album_repo::AlbumRepo::with_backend(
+                backend_inner.clone(),
+            )
+            .combler_les_labels_depuis_les_pistes()
+            {
+                tracing::warn!(error = %e, "rescan_metadata_album_labels_failed");
+            }
 
             // errors compte toujours les pistes et sert à l'avancement.
             // Un lot étendu peut être partiellement écrit : ne pas additionner
