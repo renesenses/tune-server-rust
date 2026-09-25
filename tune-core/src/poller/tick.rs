@@ -1354,6 +1354,8 @@ impl PositionPoller {
                         adoption.position_figee_ms,
                         status.current_uri.as_deref(),
                         &adoption.flux,
+                        // Fils 1926/1931 : arrêté à 0 n'est pas « reparti ».
+                        status.state == TransportState::Stopped,
                         age_secs,
                         adoption.delai_secs,
                     ) {
