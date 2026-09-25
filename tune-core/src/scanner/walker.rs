@@ -352,7 +352,7 @@ pub(crate) fn disque_rotatif() -> Option<bool> {
     {
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata(racine_scannee()).ok()?.dev();
-        let (majeur, mineur) = (unsafe { libc::major(dev) }, unsafe { libc::minor(dev) });
+        let (majeur, mineur) = (libc::major(dev), libc::minor(dev));
         let base = format!("/sys/dev/block/{majeur}:{mineur}");
         for chemin in [
             format!("{base}/queue/rotational"),
@@ -1422,10 +1422,10 @@ pub fn list_audio_files_avec_progression(
                             // un autre : c'est la description d'un album. Le
                             // dossier est retenu ici et relu après le parcours
                             // (#1763) — voir `dossiers_avec_feuille_cue`.
-                            if unsupported.report_key == "cue" {
-                                if let Some(parent) = path.parent() {
-                                    dossiers_cue.insert(parent.to_path_buf());
-                                }
+                            if unsupported.report_key == "cue"
+                                && let Some(parent) = path.parent()
+                            {
+                                dossiers_cue.insert(parent.to_path_buf());
                             }
                             skipped_reasons
                                 .entry(unsupported.report_key)
@@ -1705,10 +1705,10 @@ pub fn scan_files_parallel(
                     // DSD track isn't left at 0 in the library (a 0 breaks
                     // gapless/advance/prefetch). Bounded; non-DSD relies on the
                     // play-time backfill.
-                    if meta.duration_ms.is_none_or(|d| d == 0) {
-                        if let Some(d) = probe_dsd_header_duration_bounded(path) {
-                            meta.duration_ms = Some(d);
-                        }
+                    if meta.duration_ms.is_none_or(|d| d == 0)
+                        && let Some(d) = probe_dsd_header_duration_bounded(path)
+                    {
+                        meta.duration_ms = Some(d);
                     }
                     (Some(meta), None, None)
                 }
@@ -1958,8 +1958,10 @@ pub fn scan_files_batched(
     } else {
         batch_size
     };
-    let mut aggregate = ScanStats::default();
-    aggregate.total_files = total;
+    let mut aggregate = ScanStats {
+        total_files: total,
+        ..Default::default()
+    };
 
     // Dedicated high-concurrency pool for the I/O-bound tag reads (see
     // SCAN_IO_CONCURRENCY). Built once per process and reused by every scan
@@ -3387,7 +3389,7 @@ mod tests {
         std::fs::write(base.join("Incoming/b.flac"), b"x").unwrap();
 
         let root = base.to_string_lossy().to_string();
-        let all = list_audio_files(&[root.clone()]);
+        let all = list_audio_files(std::slice::from_ref(&root));
         assert_eq!(all.files.len(), 2);
 
         // Case-insensitive substring match prunes the whole subtree.

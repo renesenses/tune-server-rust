@@ -37,6 +37,6 @@ fn staged_without_a_timestamp_is_left_alone() {
 /// elle, on rearmerait juste apres que le flux est mort, ou jamais.
 #[test]
 fn the_threshold_stays_below_the_decoder_timeout() {
-    assert!(super::GAPLESS_STAGE_MAX_AGE_SECS < 300);
-    assert!(super::GAPLESS_STAGE_MAX_AGE_SECS > 60);
+    const { assert!(super::GAPLESS_STAGE_MAX_AGE_SECS < 300) };
+    const { assert!(super::GAPLESS_STAGE_MAX_AGE_SECS > 60) };
 }

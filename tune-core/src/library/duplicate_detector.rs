@@ -109,7 +109,8 @@ pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanRe
 
     // Le 5e champ est `file_path` BRUT : vide ou absent ⇒ la piste est une
     // tranche de feuille CUE, et le chemin du 2e champ est celui de l'image.
-    let rows: Vec<(i64, String, String, Option<String>, Option<i64>)> = raw_rows
+    type Ligne = (i64, String, String, Option<String>, Option<i64>);
+    let rows: Vec<Ligne> = raw_rows
         .iter()
         .map(|r| {
             let a_un_fichier_a_soi = r
@@ -147,13 +148,13 @@ pub fn scan_duplicates(db: &Arc<dyn DbBackend>, limit: usize) -> DuplicateScanRe
             // quinze pistes du disque porteraient la même, et tout ce qui lit
             // `tracks.audio_hash` (dédoublonnage du scanner, appariement par
             // album) hériterait de la confusion qu'on vient d'éviter ici.
-            if let (Some(h), None) = (&computed, tranche) {
-                if let Err(error) = db.execute(
+            if let (Some(h), None) = (&computed, tranche)
+                && let Err(error) = db.execute(
                     "UPDATE tracks SET audio_hash = ? WHERE id = ?",
                     &[&h.as_str(), id],
-                ) {
-                    warn!(%error, track_id = id, path = file_path, "audio_hash_update_failed");
-                }
+                )
+            {
+                warn!(%error, track_id = id, path = file_path, "audio_hash_update_failed");
             }
             computed
         };
@@ -268,7 +269,7 @@ mod tests {
     fn hash_tiny_nonempty_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.bin");
-        std::fs::write(&path, &[0u8; 100]).unwrap();
+        std::fs::write(&path, [0u8; 100]).unwrap();
         let result = compute_audio_hash_str(path.to_str().unwrap());
         assert!(result.is_some());
     }

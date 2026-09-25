@@ -71,7 +71,7 @@ pub async fn scan_new_releases(
         .unwrap_or_else(|_| http_client.clone());
 
     for row in &rows {
-        let mb_id = match row.get(0).and_then(|v| v.as_string()) {
+        let mb_id = match row.first().and_then(|v| v.as_string()) {
             Some(id) => id,
             None => continue,
         };
@@ -89,25 +89,23 @@ pub async fn scan_new_releases(
             .send()
             .await;
 
-        if let Ok(r) = resp {
-            if r.status().is_success() {
-                if let Ok(data) = r.json::<serde_json::Value>().await {
-                    if let Some(groups) = data["release-groups"].as_array() {
-                        for rg in groups {
-                            let title = rg["title"].as_str().unwrap_or("").to_string();
-                            let date = rg["first-release-date"].as_str().unwrap_or("").to_string();
-                            let rg_id = rg["id"].as_str().map(String::from);
-                            if date.len() >= 4 {
-                                releases.push(serde_json::json!({
-                                    "musicbrainz_artist_id": mb_id,
-                                    "artist_name": artist_name,
-                                    "album_title": title,
-                                    "release_date": if date.len() >= 10 { &date[..10] } else { &date },
-                                    "musicbrainz_release_id": rg_id,
-                                }));
-                            }
-                        }
-                    }
+        if let Ok(r) = resp
+            && r.status().is_success()
+            && let Ok(data) = r.json::<serde_json::Value>().await
+            && let Some(groups) = data["release-groups"].as_array()
+        {
+            for rg in groups {
+                let title = rg["title"].as_str().unwrap_or("").to_string();
+                let date = rg["first-release-date"].as_str().unwrap_or("").to_string();
+                let rg_id = rg["id"].as_str().map(String::from);
+                if date.len() >= 4 {
+                    releases.push(serde_json::json!({
+                        "musicbrainz_artist_id": mb_id,
+                        "artist_name": artist_name,
+                        "album_title": title,
+                        "release_date": if date.len() >= 10 { &date[..10] } else { &date },
+                        "musicbrainz_release_id": rg_id,
+                    }));
                 }
             }
         }

@@ -182,7 +182,7 @@ pub async fn push_changes(
         // Collect changelog entries
         let mut entries: Vec<(i64, String, i64, String)> = Vec::new();
         for row in &rows {
-            let id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+            let id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
             let etype = row.get(1).and_then(|v| v.as_string()).unwrap_or_default();
             let eid = row.get(2).and_then(|v| v.as_i64()).unwrap_or(0);
             let action = row.get(3).and_then(|v| v.as_string()).unwrap_or_default();
@@ -231,7 +231,7 @@ pub async fn push_changes(
                 track_ids.iter().map(|id| id as &dyn ToSqlValue).collect();
             if let Ok(trows) = backend.query_many(&sql, &params) {
                 for r in &trows {
-                    let tid = r.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let tid = r.first().and_then(|v| v.as_i64()).unwrap_or(0);
                     let action = entries
                         .iter()
                         .find(|(_, et, eid, _)| et == "track" && *eid == tid)
@@ -299,7 +299,7 @@ pub async fn push_changes(
                 album_ids.iter().map(|id| id as &dyn ToSqlValue).collect();
             if let Ok(arows) = backend.query_many(&sql, &params) {
                 for r in &arows {
-                    let aid = r.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let aid = r.first().and_then(|v| v.as_i64()).unwrap_or(0);
                     let action = entries
                         .iter()
                         .find(|(_, et, eid, _)| et == "album" && *eid == aid)
@@ -347,7 +347,7 @@ pub async fn push_changes(
                 artist_ids.iter().map(|id| id as &dyn ToSqlValue).collect();
             if let Ok(rrows) = backend.query_many(&sql, &params) {
                 for r in &rrows {
-                    let rid = r.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let rid = r.first().and_then(|v| v.as_i64()).unwrap_or(0);
                     let action = entries
                         .iter()
                         .find(|(_, et, eid, _)| et == "artist" && *eid == rid)

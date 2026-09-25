@@ -20,26 +20,25 @@ pub async fn fetch_artist_bio(
     lang: &str,
 ) -> Option<BioResult> {
     // 1. Wikipedia in the preferred language via MusicBrainz → Wikidata → sitelinks
-    if let Some(bio) = fetch_bio_via_wikidata(client, mbid, lang).await {
-        if bio.text.len() > 50 {
-            return Some(bio);
-        }
+    if let Some(bio) = fetch_bio_via_wikidata(client, mbid, lang).await
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     // 2. Last.fm fallback
-    if !lastfm_key.is_empty() {
-        if let Some(bio) = fetch_bio_lastfm(client, artist_name, lastfm_key, lang).await {
-            if bio.text.len() > 50 {
-                return Some(bio);
-            }
-        }
+    if !lastfm_key.is_empty()
+        && let Some(bio) = fetch_bio_lastfm(client, artist_name, lastfm_key, lang).await
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     // 3. TheAudioDB fallback (niche artists Wikipedia/Last.fm miss)
-    if let Some(bio) = fetch_artist_bio_theaudiodb(client, mbid, lang).await {
-        if bio.text.len() > 50 {
-            return Some(bio);
-        }
+    if let Some(bio) = fetch_artist_bio_theaudiodb(client, mbid, lang).await
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     None
@@ -96,13 +95,11 @@ async fn fetch_bio_via_wikidata(
         .and_then(|v| v.as_str())
     {
         (lang.to_string(), t.to_string())
-    } else if let Some(t) = wd_data
-        .pointer(&format!("/entities/{qid}/sitelinks/enwiki/title"))
-        .and_then(|v| v.as_str())
-    {
-        ("en".to_string(), t.to_string())
     } else {
-        return None;
+        let t = wd_data
+            .pointer(&format!("/entities/{qid}/sitelinks/enwiki/title"))
+            .and_then(|v| v.as_str())?;
+        ("en".to_string(), t.to_string())
     };
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -215,37 +212,34 @@ pub async fn fetch_album_bio(
     lang: &str,
 ) -> Option<BioResult> {
     // 1. Wikipedia in the preferred language
-    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, lang).await {
-        if bio.text.len() > 50 {
-            return Some(bio);
-        }
+    if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, lang).await
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     // 2. Wikipedia EN fallback
-    if lang != "en" {
-        if let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "en").await {
-            if bio.text.len() > 50 {
-                return Some(bio);
-            }
-        }
+    if lang != "en"
+        && let Some(bio) = fetch_album_bio_wikipedia(client, album_title, artist_name, "en").await
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     // 3. Last.fm fallback
-    if !lastfm_key.is_empty() {
-        if let Some(bio) =
+    if !lastfm_key.is_empty()
+        && let Some(bio) =
             fetch_album_bio_lastfm(client, artist_name, album_title, lastfm_key, lang).await
-        {
-            if bio.text.len() > 50 {
-                return Some(bio);
-            }
-        }
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     // 4. TheAudioDB fallback (niche albums Wikipedia/Last.fm miss)
-    if let Some(bio) = fetch_album_bio_theaudiodb(client, artist_name, album_title, lang).await {
-        if bio.text.len() > 50 {
-            return Some(bio);
-        }
+    if let Some(bio) = fetch_album_bio_theaudiodb(client, artist_name, album_title, lang).await
+        && bio.text.len() > 50
+    {
+        return Some(bio);
     }
 
     None

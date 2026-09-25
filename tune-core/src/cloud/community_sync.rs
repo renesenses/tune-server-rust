@@ -109,7 +109,7 @@ pub async fn sync_enriched_tracks(
         .iter()
         .map(|r| {
             serde_json::json!({
-                "musicbrainz_recording_id": r.get(0).and_then(|v| v.as_string()),
+                "musicbrainz_recording_id": r.first().and_then(|v| v.as_string()),
                 "title": r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": r.get(2).and_then(|v| v.as_string()),
                 "album_title": r.get(3).and_then(|v| v.as_string()),
@@ -269,7 +269,7 @@ pub async fn resolve_missing_mbids(
     // which we map to the corresponding track id.
     let ids: Vec<i64> = rows
         .iter()
-        .filter_map(|r| r.get(0).and_then(|v| v.as_i64()))
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
         .collect();
     let items: Vec<serde_json::Value> = rows
         .iter()
@@ -393,7 +393,7 @@ pub async fn pull_community_extra(
     let candidates: Vec<(i64, String)> = rows
         .iter()
         .filter_map(|r| {
-            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let id = r.first().and_then(|v| v.as_i64())?;
             let mbid = r.get(1).and_then(|v| v.as_string())?;
             Some((id, mbid))
         })
@@ -518,7 +518,7 @@ pub async fn push_local_extra(
     let candidates: Vec<(i64, String)> = rows
         .iter()
         .filter_map(|r| {
-            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let id = r.first().and_then(|v| v.as_i64())?;
             let mbid = r.get(1).and_then(|v| v.as_string())?;
             Some((id, mbid))
         })

@@ -55,9 +55,7 @@ impl SystemSleepInhibitor {
     /// le verrou des zones du `PlaybackManager`, donc l'ordre du canal est
     /// exactement celui des transitions de lecture.
     pub(crate) fn set_active(&self, active: bool) {
-        if self.requested.swap(active, Ordering::SeqCst) == active {
-            return;
-        }
+        if self.requested.swap(active, Ordering::SeqCst) == active {}
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {

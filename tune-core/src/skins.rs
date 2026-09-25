@@ -103,34 +103,34 @@ impl SkinManager {
         }
 
         // Scan skins/ directory
-        if self.skins_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&self.skins_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let manifest_path = path.join("skin.json");
-                    if !manifest_path.exists() {
-                        continue;
-                    }
-                    match std::fs::read_to_string(&manifest_path) {
-                        Ok(content) => match serde_json::from_str::<SkinManifest>(&content) {
-                            Ok(manifest) => {
-                                info!(skin_id = %manifest.id, skin_name = %manifest.name, "skin_discovered");
-                                skins.push(InstalledSkin {
-                                    manifest,
-                                    path: path.clone(),
-                                    size_bytes: dir_size(&path),
-                                });
-                            }
-                            Err(e) => {
-                                warn!(path = %manifest_path.display(), error = %e, "skin_manifest_parse_error");
-                            }
-                        },
-                        Err(e) => {
-                            warn!(path = %manifest_path.display(), error = %e, "skin_manifest_read_error");
+        if self.skins_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&self.skins_dir)
+        {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let manifest_path = path.join("skin.json");
+                if !manifest_path.exists() {
+                    continue;
+                }
+                match std::fs::read_to_string(&manifest_path) {
+                    Ok(content) => match serde_json::from_str::<SkinManifest>(&content) {
+                        Ok(manifest) => {
+                            info!(skin_id = %manifest.id, skin_name = %manifest.name, "skin_discovered");
+                            skins.push(InstalledSkin {
+                                manifest,
+                                path: path.clone(),
+                                size_bytes: dir_size(&path),
+                            });
                         }
+                        Err(e) => {
+                            warn!(path = %manifest_path.display(), error = %e, "skin_manifest_parse_error");
+                        }
+                    },
+                    Err(e) => {
+                        warn!(path = %manifest_path.display(), error = %e, "skin_manifest_read_error");
                     }
                 }
             }

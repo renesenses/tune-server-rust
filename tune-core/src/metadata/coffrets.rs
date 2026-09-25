@@ -227,7 +227,8 @@ fn parent_et_feuille(dossier: &str) -> (String, String) {
 /// Un socle qui ne rassemble qu'un seul disque n'est pas un coffret : c'est un
 /// disque isolé, et on n'y touche pas.
 pub fn coffrets(albums: &[AlbumAGrouper]) -> Vec<Coffret> {
-    let mut par_socle: BTreeMap<(String, String), Vec<(u32, i64, String)>> = BTreeMap::new();
+    type Disque = (u32, i64, String);
+    let mut par_socle: BTreeMap<(String, String), Vec<Disque>> = BTreeMap::new();
     for a in albums {
         let (parent, feuille) = parent_et_feuille(&a.dossier);
         let Some((socle, numero)) = marqueur_final(&feuille) else {

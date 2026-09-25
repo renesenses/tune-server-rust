@@ -511,10 +511,10 @@ pub fn load_all_snapshots(db_path: &str) -> Vec<QueueSnapshot> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(snapshot) = serde_json::from_str::<QueueSnapshot>(&content) {
-                snapshots.push(snapshot);
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(snapshot) = serde_json::from_str::<QueueSnapshot>(&content)
+        {
+            snapshots.push(snapshot);
         }
     }
     snapshots

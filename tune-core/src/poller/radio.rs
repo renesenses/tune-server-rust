@@ -16,128 +16,123 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
     ) {
         // Radio metadata polling (title/artist from ICY or external)
-        if let Some(ref np) = zone_state.now_playing {
-            if np.source == "radio" {
-                if let Some(ref source_id) = np.source_id {
-                    // source_id is either a numeric radio DB id or the stream URL itself
-                    // Le logo de la station sert de REPLI quand le titre en
-                    // cours n'a pas de pochette. Il faut le relire ici et non
-                    // reprendre `np.cover_path` : dès qu'un titre a posé sa
-                    // pochette, `cover_path` la porte, et le titre suivant —
-                    // une chronique, un jingle — hériterait de la pochette du
-                    // précédent au lieu de revenir au logo.
-                    let radio_repo =
-                        crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
-                    let mut logo_station: Option<String> = None;
-                    let (station_name, stream_url) =
-                        if let Some(station) = station_du_now_playing(&radio_repo, source_id) {
-                            logo_station = station.logo_url.clone();
-                            (station.name.clone(), station.url.clone())
-                        } else {
-                            // Station introuvable en base : on retombe sur
-                            // `album_title`, qui porte le nom de la station et
-                            // survit aux mises a jour (`np.title`, lui, prend
-                            // le titre du morceau des le premier
-                            // rafraichissement).
-                            let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
-                            (name, source_id.clone())
-                        };
+        if let Some(ref np) = zone_state.now_playing
+            && np.source == "radio"
+            && let Some(ref source_id) = np.source_id
+        {
+            // source_id is either a numeric radio DB id or the stream URL itself
+            // Le logo de la station sert de REPLI quand le titre en
+            // cours n'a pas de pochette. Il faut le relire ici et non
+            // reprendre `np.cover_path` : dès qu'un titre a posé sa
+            // pochette, `cover_path` la porte, et le titre suivant —
+            // une chronique, un jingle — hériterait de la pochette du
+            // précédent au lieu de revenir au logo.
+            let radio_repo = crate::db::radio_repo::RadioRepo::with_backend(self.db.clone());
+            let mut logo_station: Option<String> = None;
+            let (station_name, stream_url) =
+                if let Some(station) = station_du_now_playing(&radio_repo, source_id) {
+                    logo_station = station.logo_url.clone();
+                    (station.name.clone(), station.url.clone())
+                } else {
+                    // Station introuvable en base : on retombe sur
+                    // `album_title`, qui porte le nom de la station et
+                    // survit aux mises a jour (`np.title`, lui, prend
+                    // le titre du morceau des le premier
+                    // rafraichissement).
+                    let name = np.album_title.clone().unwrap_or_else(|| np.title.clone());
+                    (name, source_id.clone())
+                };
 
-                    if let Some(meta) =
-                        crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url)
-                            .await
-                    {
-                        // La pochette du titre quand la station la donne, le
-                        // logo sinon. Bertrand : « mettre la pochette de
-                        // l'album et non le logo de la radio ».
-                        let pochette = vignette_du_pas_radio(
-                            meta.cover_url.as_deref(),
-                            logo_station.as_deref(),
+            if let Some(meta) =
+                crate::radio_metadata::fetch_radio_metadata(&station_name, &stream_url).await
+            {
+                // La pochette du titre quand la station la donne, le
+                // logo sinon. Bertrand : « mettre la pochette de
+                // l'album et non le logo de la radio ».
+                let pochette =
+                    vignette_du_pas_radio(meta.cover_url.as_deref(), logo_station.as_deref());
+                let title_changed = np.title != meta.title
+                    || np.artist_name != meta.artist
+                    || np.cover_path != pochette;
+                if title_changed {
+                    let new_np = crate::playback::NowPlaying {
+                        track_id: None,
+                        title: meta.title,
+                        artist_name: meta.artist,
+                        album_title: Some(station_name.clone()),
+                        cover_path: pochette,
+                        duration_ms: 0,
+                        source: "radio".into(),
+                        source_id: np.source_id.clone(),
+                        stream_id: np.stream_id.clone(),
+                        ..Default::default()
+                    };
+                    // Le renderer, lui, ne lit pas le now-playing : il
+                    // reçoit des blocs ICY dans le flux. On publie donc
+                    // titre ET pochette là où le gestionnaire de flux
+                    // saura les relire, sinon l'appareil reste figé sur
+                    // le morceau qui passait à sa connexion (#2161).
+                    //
+                    // On lit ces trois valeurs SUR `new_np`, et non sur
+                    // des copies prises plus haut : ce sont exactement
+                    // celles que l'interface Tune va recevoir. Trois
+                    // variables `*_for_icy` parallèles pouvaient diverger
+                    // du now-playing sans qu'aucune épreuve ne le voie —
+                    // et c'est cette classe d'écart silencieux entre le
+                    // producteur et le consommateur qui a produit ce
+                    // ticket. Ici, l'écart n'est plus représentable.
+                    //
+                    // ── Et ce que cette garde TAISAIT (#2991) ──
+                    //
+                    // Sans `stream_id`, le `if let` ci-dessous ne
+                    // publiait rien — en silence. L'interface Tune, elle,
+                    // était mise à jour deux lignes plus bas par
+                    // `update_now_playing`, qui ne dépend pas du
+                    // `stream_id`. « Dans Tune ça fonctionne, sur le
+                    // RS250A non » est le symptôme EXACT de cet écart, et
+                    // rien au journal ne permettait de le distinguer d'un
+                    // renderer qui n'aurait pas demandé l'ICY. Deux causes
+                    // opposées, une seule absence de trace.
+                    //
+                    // On lit donc le canal AVANT de publier, et on
+                    // journalise dans TOUS les cas — y compris celui qui
+                    // marche, sans quoi « pas de ligne » resterait
+                    // ambigu.
+                    let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());
+                    if let Some(sid) = np.stream_id.as_deref() {
+                        crate::http::streamer::publish_radio_now(
+                            sid,
+                            new_np.artist_name.clone(),
+                            new_np.title.clone(),
+                            new_np.cover_path.clone(),
                         );
-                        let title_changed = np.title != meta.title
-                            || np.artist_name != meta.artist
-                            || np.cover_path != pochette;
-                        if title_changed {
-                            let new_np = crate::playback::NowPlaying {
-                                track_id: None,
-                                title: meta.title,
-                                artist_name: meta.artist,
-                                album_title: Some(station_name.clone()),
-                                cover_path: pochette,
-                                duration_ms: 0,
-                                source: "radio".into(),
-                                source_id: np.source_id.clone(),
-                                stream_id: np.stream_id.clone(),
-                                ..Default::default()
-                            };
-                            // Le renderer, lui, ne lit pas le now-playing : il
-                            // reçoit des blocs ICY dans le flux. On publie donc
-                            // titre ET pochette là où le gestionnaire de flux
-                            // saura les relire, sinon l'appareil reste figé sur
-                            // le morceau qui passait à sa connexion (#2161).
-                            //
-                            // On lit ces trois valeurs SUR `new_np`, et non sur
-                            // des copies prises plus haut : ce sont exactement
-                            // celles que l'interface Tune va recevoir. Trois
-                            // variables `*_for_icy` parallèles pouvaient diverger
-                            // du now-playing sans qu'aucune épreuve ne le voie —
-                            // et c'est cette classe d'écart silencieux entre le
-                            // producteur et le consommateur qui a produit ce
-                            // ticket. Ici, l'écart n'est plus représentable.
-                            //
-                            // ── Et ce que cette garde TAISAIT (#2991) ──
-                            //
-                            // Sans `stream_id`, le `if let` ci-dessous ne
-                            // publiait rien — en silence. L'interface Tune, elle,
-                            // était mise à jour deux lignes plus bas par
-                            // `update_now_playing`, qui ne dépend pas du
-                            // `stream_id`. « Dans Tune ça fonctionne, sur le
-                            // RS250A non » est le symptôme EXACT de cet écart, et
-                            // rien au journal ne permettait de le distinguer d'un
-                            // renderer qui n'aurait pas demandé l'ICY. Deux causes
-                            // opposées, une seule absence de trace.
-                            //
-                            // On lit donc le canal AVANT de publier, et on
-                            // journalise dans TOUS les cas — y compris celui qui
-                            // marche, sans quoi « pas de ligne » resterait
-                            // ambigu.
-                            let canal = crate::http::streamer::canal_radio(np.stream_id.as_deref());
-                            if let Some(sid) = np.stream_id.as_deref() {
-                                crate::http::streamer::publish_radio_now(
-                                    sid,
-                                    new_np.artist_name.clone(),
-                                    new_np.title.clone(),
-                                    new_np.cover_path.clone(),
-                                );
-                            }
-                            // UNE ligne doit suffire à savoir laquelle des
-                            // branches mord la prochaine fois qu'un testeur
-                            // signale un écran figé. Même nom d'évènement dans
-                            // les deux cas — seul le niveau change — pour qu'un
-                            // `grep radio_refresh_channel` les ramène ensemble.
-                            let sid_journal = np.stream_id.as_deref().unwrap_or("absent");
-                            if canal.atteint_le_renderer() {
-                                debug!(
-                                    zone_id,
-                                    station = %station_name,
-                                    stream_id = sid_journal,
-                                    canal = canal.libelle(),
-                                    "radio_refresh_channel"
-                                );
-                            } else {
-                                warn!(
-                                    zone_id,
-                                    station = %station_name,
-                                    stream_id = sid_journal,
-                                    canal = canal.libelle(),
-                                    "radio_refresh_channel — le morceau a changé mais l'écran du \
-                                     lecteur réseau ne l'apprendra pas"
-                                );
-                            }
-                            self.playback.update_now_playing(zone_id, new_np).await;
-                            debug!(zone_id, station = %station_name, "radio_metadata_updated");
-                        }
                     }
+                    // UNE ligne doit suffire à savoir laquelle des
+                    // branches mord la prochaine fois qu'un testeur
+                    // signale un écran figé. Même nom d'évènement dans
+                    // les deux cas — seul le niveau change — pour qu'un
+                    // `grep radio_refresh_channel` les ramène ensemble.
+                    let sid_journal = np.stream_id.as_deref().unwrap_or("absent");
+                    if canal.atteint_le_renderer() {
+                        debug!(
+                            zone_id,
+                            station = %station_name,
+                            stream_id = sid_journal,
+                            canal = canal.libelle(),
+                            "radio_refresh_channel"
+                        );
+                    } else {
+                        warn!(
+                            zone_id,
+                            station = %station_name,
+                            stream_id = sid_journal,
+                            canal = canal.libelle(),
+                            "radio_refresh_channel — le morceau a changé mais l'écran du \
+                             lecteur réseau ne l'apprendra pas"
+                        );
+                    }
+                    self.playback.update_now_playing(zone_id, new_np).await;
+                    debug!(zone_id, station = %station_name, "radio_metadata_updated");
                 }
             }
         }
