@@ -1283,6 +1283,17 @@ async fn pg_config_backup_zones_volume_fixe() {
     scenarios_zones::une_zone_armee_absente_prend_le_defaut_du_schema(&db);
     scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&db);
     scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&db);
+
+    // #4927 — joues ICI plutot que dans une epreuve a part : une autre
+    // epreuve `pg_config_backup_*` en parallele viderait `playlists` et
+    // `tracks` par son `reset_schema` au milieu de l'aller-retour.
+    use crate::config_backup::scenarios_playlists;
+    scenarios_playlists::une_playlist_de_trois_pistes_fait_l_aller_retour(&db);
+    scenarios_playlists::une_sauvegarde_existante_se_restaure(&db);
+
+    // #4983 — la restauration des favoris, meme raison d'etre jouee ici.
+    use crate::config_backup::scenarios_favoris;
+    scenarios_favoris::un_favori_se_restaure_et_un_doublon_est_ignore(&db);
 }
 
 /// #2441 — « Continuer l'ecoute » sur une VRAIE base PostgreSQL : les
