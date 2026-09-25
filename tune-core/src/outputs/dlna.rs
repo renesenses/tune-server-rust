@@ -25,6 +25,10 @@ static DLNA_COMMAND_ID: AtomicU64 = AtomicU64::new(1);
 #[path = "dlna_command_tests_4258.rs"]
 mod command_tests_4258;
 
+#[cfg(test)]
+#[path = "dlna_contact_tests_4971.rs"]
+mod contact_tests_4971;
+
 /// Une faute SOAP reste un corps HTTP lisible. Les chemins Play avec reprise
 /// doivent pouvoir l'inspecter ; pause/resume, eux, doivent la rendre en erreur.
 fn faute_commande_soap(response: &str) -> bool {
@@ -435,6 +439,9 @@ pub struct DlnaOutput {
     /// AU MOMENT de l'envoi ([`DlnaOutput::url_de`]) et rafraîchies par la
     /// redécouverte ciblée ([`DlnaOutput::redecouvrir_les_urls`]).
     urls: std::sync::RwLock<UrlsDeControle>,
+    /// #4971 — boîte noire du contact SOAP : derniers échanges, perte et
+    /// retour du renderer portés au journal INFO une fois par bascule.
+    contact: std::sync::Mutex<super::dlna_contact::JournalDeContact>,
     /// Bornes et mémoire de la redécouverte ciblée (#3829).
     redecouverte: Redecouverte,
     client: Client,
@@ -663,6 +670,7 @@ impl DlnaOutput {
             dernier_volume_pct: AtomicU64::new(u64::MAX),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
+            contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
         }
     }
 
@@ -1177,6 +1185,78 @@ impl DlnaOutput {
     /// c'est [`DlnaOutput::conclure`] qui le fait, pour que le rejeu d'après
     /// redécouverte soit interprété exactement comme le premier envoi.
     async fn envoyer_soap(
+        &self,
+        url: &str,
+        soap_action: &str,
+        soap: &str,
+        action: &str,
+    ) -> IssueSoap {
+        let debut = std::time::Instant::now();
+        let issue = self.envoyer_soap_brut(url, soap_action, soap, action).await;
+        self.noter_contact(action, &issue, debut.elapsed());
+        issue
+    }
+
+    /// #4971 — porte au journal INFO la perte et le retour du contact SOAP
+    /// avec ce renderer, UNE fois par changement d'état (voir
+    /// [`super::dlna_contact`]). Une erreur définitive (URL illisible) ne dit
+    /// rien du renderer : elle n'est pas comptée.
+    fn noter_contact(&self, action: &str, issue: &IssueSoap, duree: std::time::Duration) {
+        use super::dlna_contact::{Bascule, IssueContact};
+        let contact = match issue {
+            IssueSoap::Reponse { .. } => IssueContact::Reponse,
+            IssueSoap::Echec { refus: true, .. } => IssueContact::Refus,
+            IssueSoap::Echec { timeout: true, .. } => IssueContact::Expire,
+            IssueSoap::Echec {
+                apres_reessais: true,
+                ..
+            } => IssueContact::Coupure,
+            IssueSoap::Echec { .. } => return,
+        };
+        let bascule = match self.contact.lock() {
+            Ok(mut j) => j.noter(action, contact, duree, std::time::Instant::now()),
+            Err(_) => return,
+        };
+        match bascule {
+            Bascule::Aucune => {}
+            Bascule::Perdu {
+                dernier_ok,
+                historique,
+            } => {
+                let (dernier_ok_action, dernier_ok_il_y_a_ms) = match &dernier_ok {
+                    Some((a, ms)) => (a.as_str(), Some(*ms)),
+                    None => ("-", None),
+                };
+                warn!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    action,
+                    issue = ?contact.etiquette(),
+                    dernier_ok_action = ?dernier_ok_action,
+                    dernier_ok_il_y_a_ms = ?dernier_ok_il_y_a_ms,
+                    ctrl = %self.url_av_transport(),
+                    historique = %historique,
+                    "dlna_contact_perdu — le renderer ne répond plus ; l'historique \
+                     dit ce que Tune lui a envoyé juste avant (#4971)"
+                );
+            }
+            Bascule::Retrouve {
+                duree_perte_ms,
+                echecs,
+            } => {
+                info!(
+                    device = %self.name,
+                    device_id = %self.device_id,
+                    action,
+                    duree_perte_ms,
+                    echecs,
+                    "dlna_contact_retrouve"
+                );
+            }
+        }
+    }
+
+    async fn envoyer_soap_brut(
         &self,
         url: &str,
         soap_action: &str,
