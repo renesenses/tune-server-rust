@@ -57,6 +57,10 @@ const PLAFOND_POSE: usize = 2;
 /// valeur mal calée, et une profondeur dure descendue sous ce que le défaut
 /// demande déjà.
 #[test]
+// Les messages citent les valeurs (`{PISTES_DU_BANC}`…) : un `const { assert!() }`
+// ne sait pas formater, et la valeur lue dans le rouge est tout l'intérêt de
+// la garde (clippy 1.98, `assertions_on_constants`).
+#[allow(clippy::assertions_on_constants)]
 fn le_banc_et_les_defauts_tiennent_debout() {
     assert!(
         PISTES_DU_BANC > PLAFOND_POSE,

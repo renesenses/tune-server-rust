@@ -219,10 +219,10 @@ impl AppState {
     /// because the choice is stored in the database, never in the config file
     /// (forum, Windows).
     pub fn display_audio_backend(&self) -> String {
-        if let Ok(guard) = self.active_audio_backend.read() {
-            if let Some(b) = guard.as_ref() {
-                return b.clone();
-            }
+        if let Ok(guard) = self.active_audio_backend.read()
+            && let Some(b) = guard.as_ref()
+        {
+            return b.clone();
         }
         self.effective_audio_backend()
     }
@@ -583,7 +583,7 @@ impl AppState {
                         .database_url
                         .as_deref()
                         .ok_or("TUNE_DATABASE_URL is required for postgres engine")?;
-                    let safe_url = pg_url.split('@').last().unwrap_or(pg_url);
+                    let safe_url = pg_url.split('@').next_back().unwrap_or(pg_url);
                     info!(engine = "postgres", url = %safe_url, "database_engine_selected");
 
                     // Connect to PG and run migrations synchronously

@@ -123,10 +123,10 @@ pub fn cle_silence_upnp(zone_id: i64) -> String {
 /// L'option « silence UPnP » est-elle armée sur la zone qui porte cet appareil ?
 ///
 /// Strictement opt-in : sans zone, sans réglage, ou sur un réglage illisible,
-/// la réponse est `false` et la sortie garde le régime par défaut (évènements
-/// + position mesurée). Relu à CHAQUE construction de `DlnaOutput`, comme
-/// `resolve_play_delay`, pour que le choix survive à un redémarrage et à une
-/// redécouverte — pas seulement à un PATCH en direct.
+/// la réponse est `false` et la sortie garde le régime par défaut
+/// (évènements et position mesurée). Relu à CHAQUE construction de
+/// `DlnaOutput`, comme `resolve_play_delay`, pour que le choix survive à un
+/// redémarrage et à une redécouverte — pas seulement à un PATCH en direct.
 pub fn resolve_upnp_silence(
     db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     device_id: &str,
@@ -387,32 +387,29 @@ impl TuneConfig {
             config.database_url = Some(v);
         }
         // Also accept TUNE_DB_URL as a shorter alias.
-        if config.database_url.is_none() {
-            if let Ok(v) = std::env::var("TUNE_DB_URL")
-                && !v.is_empty()
-            {
-                config.database_url = Some(v);
-            }
+        if config.database_url.is_none()
+            && let Ok(v) = std::env::var("TUNE_DB_URL")
+            && !v.is_empty()
+        {
+            config.database_url = Some(v);
         }
         // TUNE_DB_ENGINE=postgres constructs the DSN from individual env vars.
-        if config.database_url.is_none() {
-            if let Ok(engine) = std::env::var("TUNE_DB_ENGINE") {
-                if engine.eq_ignore_ascii_case("postgres")
-                    || engine.eq_ignore_ascii_case("postgresql")
-                {
-                    let host = std::env::var("TUNE_DB_HOST").unwrap_or_else(|_| "localhost".into());
-                    let port = std::env::var("TUNE_DB_PORT").unwrap_or_else(|_| "5432".into());
-                    let name = std::env::var("TUNE_DB_NAME").unwrap_or_else(|_| "tune".into());
-                    let user = std::env::var("TUNE_DB_USER").unwrap_or_else(|_| "tune".into());
-                    let pass = std::env::var("TUNE_DB_PASS").unwrap_or_default();
-                    let url = if pass.is_empty() {
-                        format!("postgresql://{user}@{host}:{port}/{name}")
-                    } else {
-                        format!("postgresql://{user}:{pass}@{host}:{port}/{name}")
-                    };
-                    config.database_url = Some(url);
-                }
-            }
+        if config.database_url.is_none()
+            && let Ok(engine) = std::env::var("TUNE_DB_ENGINE")
+            && (engine.eq_ignore_ascii_case("postgres")
+                || engine.eq_ignore_ascii_case("postgresql"))
+        {
+            let host = std::env::var("TUNE_DB_HOST").unwrap_or_else(|_| "localhost".into());
+            let port = std::env::var("TUNE_DB_PORT").unwrap_or_else(|_| "5432".into());
+            let name = std::env::var("TUNE_DB_NAME").unwrap_or_else(|_| "tune".into());
+            let user = std::env::var("TUNE_DB_USER").unwrap_or_else(|_| "tune".into());
+            let pass = std::env::var("TUNE_DB_PASS").unwrap_or_default();
+            let url = if pass.is_empty() {
+                format!("postgresql://{user}@{host}:{port}/{name}")
+            } else {
+                format!("postgresql://{user}:{pass}@{host}:{port}/{name}")
+            };
+            config.database_url = Some(url);
         }
         // Un seul réglage, deux noms : la résolution vit dans `tune-core` pour
         // que les deux chemins de configuration ne puissent pas diverger
@@ -550,10 +547,10 @@ pub fn resolve_web_dir() -> std::path::PathBuf {
 pub fn default_log_file_path() -> std::path::PathBuf {
     use std::path::PathBuf;
 
-    if let Ok(custom) = std::env::var("TUNE_LOG_FILE") {
-        if !custom.is_empty() {
-            return PathBuf::from(custom);
-        }
+    if let Ok(custom) = std::env::var("TUNE_LOG_FILE")
+        && !custom.is_empty()
+    {
+        return PathBuf::from(custom);
     }
 
     let path = if cfg!(target_os = "windows") {

@@ -665,7 +665,7 @@ async fn zone_delete_updates_all_counts() {
     let resp = app
         .clone()
         .oneshot(
-            axum::http::Request::delete(&format!("/api/v1/zones/{zone_id}"))
+            axum::http::Request::delete(format!("/api/v1/zones/{zone_id}"))
                 .body(Body::empty())
                 .unwrap(),
         )
