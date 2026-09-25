@@ -141,6 +141,66 @@ pub(super) async fn artist_credits(
     Ok(Json(json!(items)))
 }
 
+/// Crédits d'un ALBUM (#1572, fil forum 1921, FabienM) : les lignes de
+/// `track_credits` de toutes ses pistes, avec la piste concernée.
+///
+/// La réponse est la liste PLATE de `GET /library/tracks/{id}/credits`, plus
+/// `track_title`, `track_number` et `disc_number` : le client regroupe par
+/// rôle puis par artiste et cite, pour chaque nom, les pistes où il figure.
+/// Un seul aller-retour au lieu d'un appel par piste.
+///
+/// Ordre : disque, numéro de piste, puis `position` du crédit.
+///
+/// PostgreSQL : sur une base migrée depuis SQLite, `track_credits.track_id` et
+/// `tracks.album_id` peuvent être du TEXT, du BIGINT ailleurs — même remède
+/// que la lecture de la page artiste (`credits_release`) : la comparaison en
+/// texte vaut pour les deux. Sur SQLite, les colonnes gardent leur index.
+pub(super) async fn album_credits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::engine::Engine;
+    let (jointure, cle_album) = match state.backend.engine() {
+        Engine::Postgres => (
+            "CAST(tc.track_id AS TEXT) = CAST(t.id AS TEXT)",
+            "CAST(t.album_id AS TEXT) = ?",
+        ),
+        Engine::Sqlite => ("tc.track_id = t.id", "t.album_id = ?"),
+    };
+    let sql = format!(
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position, \
+                t.title, t.track_number, t.disc_number \
+         FROM track_credits tc \
+         JOIN tracks t ON {jointure} \
+         WHERE {cle_album} \
+         ORDER BY t.disc_number, t.track_number, t.id, tc.position"
+    );
+    let id_str = id.to_string();
+    let rows = state
+        .backend
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "track_id": r.get(1).and_then(|v| v.as_i64()),
+                "artist_id": r.get(2).and_then(|v| v.as_i64()),
+                "artist_name": r.get(3).and_then(|v| v.as_string()),
+                "role": r.get(4).and_then(|v| v.as_string()),
+                "instrument": r.get(5).and_then(|v| v.as_string()),
+                "position": r.get(6).and_then(|v| v.as_i64()),
+                "track_title": r.get(7).and_then(|v| v.as_string()),
+                "track_number": r.get(8).and_then(|v| v.as_i64()),
+                "disc_number": r.get(9).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
 /// Écrit sur la piste l'enregistrement retenu par le score (CRD-3), pour que
 /// la passe globale et les crédits d'album le retrouvent sans rechercher.
 fn retenir_le_mbid(state: &AppState, track_id: i64, mbid: &str) {
