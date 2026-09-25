@@ -968,8 +968,9 @@ jobs:
             # pouvoir savoir laquelle gouverne le processus qui tourne (capture de
             # Cyrille, fil 1861). Mesuré sur les artefacts publiés de la v0.9.161 :
             # tarball = fr.mozaiklabs.tune-server, DMG = tune-server.
-            codesign --force --options runtime --entitlements "$DROITS" \
-              --identifier fr.mozaiklabs.tune-server --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
+            # Commande tenue sur UNE ligne : la garde #1641 (runtime.rs) relit
+            # release.yml ligne à ligne ; une continuation `\` la rendrait aveugle.
+            codesign --force --options runtime --entitlements "$DROITS" --identifier fr.mozaiklabs.tune-server --sign "$IDENTITY" "$APP/Contents/Resources/tune-server"
             # Sign the nested AirPlay 2 daemon BEFORE the outer .app (inside-out
             # signing) so the bundle stays valid and notarization does not reject
             # an unsigned executable.
