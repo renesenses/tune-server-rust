@@ -2803,6 +2803,95 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 
+    /// #4442 — reprendre, sur la zone CIBLE d'un transfert, la position que
+    /// la source avait atteinte.
+    ///
+    /// `do_transfer` appelait [`Self::seek`] dans la foulée de
+    /// `play_from_queue` : pour une piste de la bibliothèque sur une sortie
+    /// réseau, c'est un `Seek` SOAP nu, envoyé à l'instant où le renderer
+    /// vient de recevoir `SetAVTransportURI` + `Play`. Les deux autres
+    /// chemins qui font la MÊME manœuvre — relancer une piste puis la
+    /// repositionner — prennent trois précautions que celui-ci n'avait pas :
+    ///
+    /// 1. **la session sait-elle chercher ?** Un flux transcodé servi par un
+    ///    canal (sans Range) ne se repositionne pas par un `Seek` : le
+    ///    renderer rejoue depuis l'octet 0. On recrée alors le flux À la
+    ///    position ([`Self::replay_zone_at_position`]), comme la relecture
+    ///    d'égaliseur ;
+    /// 2. **laisser le `Play` prendre** (`REPLAY_OUTPUT_SEEK_SETTLE_MS`), comme
+    ///    `seek_output_after_replay` et la recréation de flux de `seek` ;
+    /// 3. **relire l'état après le `Seek`** : le Rygel du Devialet (fil 1780)
+    ///    reste en pause sur un `Seek` reçu avant que son `Play` ait pris.
+    ///
+    /// Hors sortie réseau (locale, OAAT), rien ne change : [`Self::seek`] y
+    /// recrée déjà le flux à la position.
+    ///
+    /// `en_lecture` à faux (source en pause) : pas de relance, `do_transfer`
+    /// repose la pause juste après.
+    pub async fn reprendre_la_position_transferee(
+        &self,
+        zone_id: i64,
+        did: &str,
+        position_ms: u64,
+        en_lecture: bool,
+    ) -> OutputCommandResult<()> {
+        let output_type = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_type);
+        if !is_network_output_type(output_type.as_deref()) {
+            return self.seek(zone_id, position_ms, Some(did)).await;
+        }
+        let stream_id = self
+            .playback
+            .get_state(zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id);
+        // Sans flux identifié, on ne sait rien de la session : on garde le
+        // `Seek` d'avant plutôt que de recréer un flux au hasard.
+        let cherchable = match stream_id {
+            Some(ref sid) => self.streamer.is_seekable_session(sid).await,
+            None => true,
+        };
+        if !cherchable {
+            info!(zone_id, position_ms, "transfert_position_par_relecture");
+            return self
+                .replay_zone_at_position(zone_id, position_ms, "transfert")
+                .await
+                .map_err(|e| OutputCommandError::failed(OutputCommand::Seek, e));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(
+            REPLAY_OUTPUT_SEEK_SETTLE_MS,
+        ))
+        .await;
+        self.seek(zone_id, position_ms, Some(did)).await?;
+        let Some(output) = ({ self.outputs.lock().await.get(did) }) else {
+            return Ok(());
+        };
+        let sortie = output.lock().await;
+        if en_lecture
+            && let Ok(statut) = sortie.get_status().await
+            && statut.state == crate::outputs::TransportState::Paused
+        {
+            match sortie.checked_resume().await {
+                Ok(()) => info!(
+                    zone_id,
+                    position_ms, "transfert_seek_relance_play_renderer_reste_en_pause"
+                ),
+                Err(e) => warn!(
+                    zone_id,
+                    position_ms,
+                    error = %e,
+                    "transfert_seek_relance_play_echouee"
+                ),
+            }
+        }
+        info!(zone_id, position_ms, "transfert_position_reprise");
+        Ok(())
+    }
+
     /// Le déplacement de la sortie elle-même : selon la source (flux ou
     /// fichier) et ce que la sortie sait faire, recherche native, recréation
     /// du flux à la position demandée, ou relecture depuis le début avec
