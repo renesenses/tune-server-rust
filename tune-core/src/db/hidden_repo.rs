@@ -52,13 +52,65 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::favorites_reconcile::{ReconcileStats, album_live_identity, find_album_by_identity};
 use super::sqlite::SqliteDb;
 
-/// Seul type d'item masquable aujourd'hui. La table en accepte d'autres
-/// (piste, artiste) sans changement de schéma.
+/// Album masqué (#1391). La table en accepte d'autres types sans changement
+/// de schéma — la piste bannie en est le second.
 pub const ITEM_TYPE_ALBUM: &str = "album";
+
+/// Titre BANNI (#4806) : jamais choisi par une sélection AUTOMATIQUE
+/// (aléatoire, smart playlist, enchaînement de fin de file, radio d'artiste,
+/// recommandations), sauté quand une file y arrive, mais VISIBLE — grisé —
+/// dans son album, ses playlists et la recherche ; un clic délibéré le joue.
+///
+/// Contrairement au masquage d'album, le bannissement est PAR PROFIL :
+/// `profile_id` est écrit ET lu. Le profil d'une sélection lancée par une
+/// route est celui de l'action (`ActiveProfile`) ; celui d'une sélection sans
+/// requête (fin de file, autoplay) est le profil actif du serveur — voir
+/// [`profil_de_selection_automatique`].
+///
+/// Périmètre : bibliothèque LOCALE seulement (`tracks.id`). `item_id` est un
+/// entier des deux côtés (SQLite INTEGER, PG BIGINT) : un titre de service
+/// `(source, source_id)` demanderait une table jumelle sur le modèle de
+/// `streaming_item_tags` — voie ouverte, pas livrée.
+pub const ITEM_TYPE_TRACK: &str = "track";
 
 /// Masquage GLOBAL : on écrit le profil pour préparer l'avenir, on ne le lit
 /// jamais — même valeur que les six sites `profile_id = 1` des facettes.
 const GLOBAL_PROFILE_ID: i64 = 1;
+
+/// Le profil d'une sélection automatique qui n'a PAS de requête HTTP pour
+/// dire qui agit (enchaînement de fin de file, autoplay, radio d'artiste) :
+/// le profil actif du serveur (`settings.active_profile_id`), sinon 1 — le
+/// même repli que l'extracteur `ActiveProfile` côté routes, sans son en-tête.
+pub fn profil_de_selection_automatique(db: &Arc<dyn DbBackend>) -> i64 {
+    super::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get("active_profile_id")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|id| *id > 0)
+        .unwrap_or(GLOBAL_PROFILE_ID)
+}
+
+/// Un titre banni, tel que la route de révision le rend.
+#[derive(Debug, Clone, Serialize)]
+pub struct BannedTrack {
+    pub track_id: i64,
+    /// Titre vivant si la piste existe encore, sinon l'instantané figé au
+    /// bannissement.
+    pub title: String,
+    pub artist: Option<String>,
+    pub album_id: Option<i64>,
+    pub album_title: Option<String>,
+    /// `albums.cover_path` de l'album vivant, pour la vignette de l'écran
+    /// « Titres bannis » (l'image se sert par `/library/albums/{id}/cover`).
+    pub cover_path: Option<String>,
+    pub banned_at: Option<String>,
+    /// `false` = marqueur orphelin : l'id ne désigne plus de piste vivante.
+    /// Pas de réconciliation par identité pour une piste (titre + interprète
+    /// rattacherait une autre VERSION, non visée) : le marqueur reste listé,
+    /// débannissable, et c'est tout.
+    pub resolved: bool,
+}
 
 /// Un album masqué, tel que la route de révision le rend.
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +177,56 @@ pub mod sql {
              WHERE hi.item_type = {} \
              ORDER BY hi.created_at DESC, hi.item_id ASC",
             d.placeholder(1),
+        )
+    }
+
+    // --- Titres bannis (#4806) : tout est PAR PROFIL, contrairement à l'album.
+
+    pub fn unban_track<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "DELETE FROM hidden_items WHERE profile_id = {} AND item_type = {} AND item_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+        )
+    }
+
+    pub fn count_one_for_profile<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COUNT(*) FROM hidden_items \
+             WHERE profile_id = {} AND item_type = {} AND item_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+        )
+    }
+
+    /// Les ids bannis PARMI une liste — une requête par page, jamais une par
+    /// piste. Les ids sont des `i64` de confiance inscrits en clair, même
+    /// raison que `TrackMetadataRepo::sql::get_key_for_tracks`.
+    pub fn banned_among<D: SqlDialect>(d: &D, id_list: &str) -> String {
+        format!(
+            "SELECT item_id FROM hidden_items \
+             WHERE profile_id = {} AND item_type = {} AND item_id IN ({id_list})",
+            d.placeholder(1),
+            d.placeholder(2),
+        )
+    }
+
+    /// LEFT JOIN : un marqueur orphelin (piste morte) reste listé avec son
+    /// instantané, donc débannissable.
+    pub fn list_tracks<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT hi.item_id, hi.item_name, hi.item_artist, hi.created_at, \
+                    t.id, t.title, ar.name, t.album_id, al.title, al.cover_path \
+             FROM hidden_items hi \
+             LEFT JOIN tracks t ON t.id = hi.item_id \
+             LEFT JOIN artists ar ON ar.id = t.artist_id \
+             LEFT JOIN albums al ON al.id = t.album_id \
+             WHERE hi.profile_id = {} AND hi.item_type = {} \
+             ORDER BY hi.created_at DESC, hi.item_id ASC",
+            d.placeholder(1),
+            d.placeholder(2),
         )
     }
 }
@@ -233,12 +335,132 @@ impl HiddenRepo {
     /// identité — le pendant de `FavoritesReconciler::run`, appelé aux mêmes
     /// endroits (démarrage, post-scan, purge de bibliothèque).
     ///
+    // --- Titres bannis (#4806) ------------------------------------------
+
+    /// Identité vivante (titre, interprète) de la piste, ou `None` si elle
+    /// n'existe pas — bannir un id fantôme est refusé plutôt qu'écrit.
+    fn track_identity(&self, track_id: i64) -> Result<Option<(String, String)>, String> {
+        let params: [&dyn ToSqlValue; 1] = [&track_id];
+        let row = self.db.query_one(
+            "SELECT t.title, COALESCE(ar.name, t.album_artist, '') \
+             FROM tracks t LEFT JOIN artists ar ON ar.id = t.artist_id \
+             WHERE t.id = ?",
+            &params,
+        )?;
+        Ok(row.map(|cols| {
+            (
+                cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+            )
+        }))
+    }
+
+    /// Bannit un titre LOCAL pour ce profil. `Ok(false)` = id inconnu (la
+    /// route rend 404). Idempotent : re-bannir réussit sans rien écrire.
+    pub fn ban_track(&self, profile_id: i64, track_id: i64) -> Result<bool, String> {
+        let Some((title, artist)) = self.track_identity(track_id)? else {
+            return Ok(false);
+        };
+        let sql = self.dialect_sql(sql::hide, sql::hide);
+        let params: [&dyn ToSqlValue; 5] =
+            [&profile_id, &ITEM_TYPE_TRACK, &track_id, &title, &artist];
+        self.db.execute(&sql, &params)?;
+        info!(profile_id, track_id, title = %title, "track_banned");
+        Ok(true)
+    }
+
+    /// Débannit. `Ok(false)` = rien n'était banni sous cet id pour ce profil.
+    pub fn unban_track(&self, profile_id: i64, track_id: i64) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::unban_track, sql::unban_track);
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &ITEM_TYPE_TRACK, &track_id];
+        let n = self.db.execute(&sql, &params)?;
+        if n > 0 {
+            info!(profile_id, track_id, "track_unbanned");
+        }
+        Ok(n > 0)
+    }
+
+    pub fn is_track_banned(&self, profile_id: i64, track_id: i64) -> Result<bool, String> {
+        let sql = self.dialect_sql(sql::count_one_for_profile, sql::count_one_for_profile);
+        let params: [&dyn ToSqlValue; 3] = [&profile_id, &ITEM_TYPE_TRACK, &track_id];
+        match self.db.query_one(&sql, &params)? {
+            None => Ok(false),
+            Some(cols) => Ok(cols.first().and_then(|v| v.as_i64()).unwrap_or(0) > 0),
+        }
+    }
+
+    /// Les ids bannis parmi `track_ids`, pour ce profil — une seule requête,
+    /// aucune sur une liste vide. C'est ce que les listes de pistes lisent
+    /// pour poser leur drapeau `banned` sans rien filtrer.
+    pub fn banned_track_ids(
+        &self,
+        profile_id: i64,
+        track_ids: &[i64],
+    ) -> Result<std::collections::HashSet<i64>, String> {
+        if track_ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let id_list = track_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = self.dialect_sql(
+            |d| sql::banned_among(d, &id_list),
+            |d| sql::banned_among(d, &id_list),
+        );
+        let params: [&dyn ToSqlValue; 2] = [&profile_id, &ITEM_TYPE_TRACK];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    /// Tous les titres bannis du profil, vivants comme orphelins.
+    pub fn list_banned_tracks(&self, profile_id: i64) -> Result<Vec<BannedTrack>, String> {
+        let sql = self.dialect_sql(sql::list_tracks, sql::list_tracks);
+        let params: [&dyn ToSqlValue; 2] = [&profile_id, &ITEM_TYPE_TRACK];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let track_id = r.first().and_then(|v| v.as_i64())?;
+                let snapshot_name = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+                let snapshot_artist = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+                let banned_at = r.get(3).and_then(|v| v.as_string());
+                let resolved = r.get(4).and_then(|v| v.as_i64()).is_some();
+                let live_title = r.get(5).and_then(|v| v.as_string());
+                let live_artist = r.get(6).and_then(|v| v.as_string());
+                Some(BannedTrack {
+                    track_id,
+                    title: live_title.unwrap_or(snapshot_name),
+                    artist: live_artist.or({
+                        if snapshot_artist.is_empty() {
+                            None
+                        } else {
+                            Some(snapshot_artist)
+                        }
+                    }),
+                    album_id: r.get(7).and_then(|v| v.as_i64()),
+                    album_title: r.get(8).and_then(|v| v.as_string()),
+                    cover_path: r.get(9).and_then(|v| v.as_string()),
+                    banned_at,
+                    resolved,
+                })
+            })
+            .collect())
+    }
+
     /// `delete_unresolved` ne doit être vrai qu'après un scan COMPLET et sain
     /// (même règle que les favoris, #1943) : c'est la seule situation où
     /// « introuvable » veut dire « n'existe vraiment plus ». Au démarrage ou
     /// sur un scan partiel, un marqueur orphelin est CONSERVÉ — un volume pas
     /// encore monté peut encore ramener l'album, et un album masqué qui
     /// réapparaît visible serait exactement le bug que cette table évite.
+    ///
+    /// Ne traite QUE les albums : un marqueur de piste bannie (#4806) n'est
+    /// ni rattaché ni purgé ici — voir `BannedTrack::resolved`.
     pub fn reconcile(&self, delete_unresolved: bool) -> Result<ReconcileStats, String> {
         let params: [&dyn ToSqlValue; 1] = [&ITEM_TYPE_ALBUM];
         let rows = self.db.query_many(
@@ -509,5 +731,83 @@ mod tests {
         let stats = repo.reconcile(false).unwrap();
         assert_eq!(stats.changed(), 0, "rien à réparer après un simple update");
         assert!(repo.is_album_hidden(al).unwrap());
+    }
+
+    fn insert_track(db: &Arc<dyn DbBackend>, title: &str, artist_id: i64, album_id: i64) -> i64 {
+        let params: [&dyn ToSqlValue; 4] = [&title, &artist_id, &album_id, &title];
+        db.execute(
+            "INSERT INTO tracks (title, artist_id, album_id, file_path) VALUES (?, ?, ?, '/m/' || ? || '.flac')",
+            &params,
+        )
+        .unwrap();
+        db.last_insert_rowid()
+    }
+
+    /// #4806 — bannir, lister, débannir : par PROFIL (g), idempotent, et
+    /// l'album masqué (type `album`) et le titre banni (type `track`) de
+    /// même id numérique ne se confondent pas dans la même table.
+    #[test]
+    fn bannir_lister_debannir_par_profil() {
+        let db = test_db();
+        let repo = HiddenRepo::with_backend(db.clone());
+        let ar = insert_artist(&db, "Portishead");
+        let al = insert_album(&db, "Dummy", ar);
+        let t1 = insert_track(&db, "Roads", ar, al);
+        let t2 = insert_track(&db, "Glory Box", ar, al);
+
+        assert!(!repo.is_track_banned(1, t1).unwrap());
+        assert!(repo.ban_track(1, t1).unwrap());
+        assert!(repo.ban_track(1, t1).unwrap(), "idempotent");
+        assert!(repo.is_track_banned(1, t1).unwrap());
+        assert!(
+            !repo.is_track_banned(2, t1).unwrap(),
+            "(g) pas banni chez le profil 2"
+        );
+        assert!(!repo.is_track_banned(1, t2).unwrap());
+
+        let parmi = repo.banned_track_ids(1, &[t1, t2, 999]).unwrap();
+        assert_eq!(parmi.len(), 1);
+        assert!(parmi.contains(&t1));
+        assert!(repo.banned_track_ids(2, &[t1, t2]).unwrap().is_empty());
+        assert!(repo.banned_track_ids(1, &[]).unwrap().is_empty());
+
+        let liste = repo.list_banned_tracks(1).unwrap();
+        assert_eq!(liste.len(), 1);
+        assert_eq!(liste[0].track_id, t1);
+        assert_eq!(liste[0].title, "Roads");
+        assert_eq!(liste[0].artist.as_deref(), Some("Portishead"));
+        assert_eq!(liste[0].album_id, Some(al));
+        assert_eq!(liste[0].album_title.as_deref(), Some("Dummy"));
+        assert!(liste[0].resolved);
+        assert!(repo.list_banned_tracks(2).unwrap().is_empty());
+
+        // Même table, deux types : masquer l'album d'id `t1` (s'il existait)
+        // ne bannit pas la piste, et bannir la piste ne masque aucun album.
+        assert!(!repo.is_album_hidden(t1).unwrap());
+        assert!(repo.list_hidden_albums().unwrap().is_empty());
+
+        assert!(repo.unban_track(1, t1).unwrap());
+        assert!(!repo.unban_track(1, t1).unwrap(), "plus rien à débannir");
+        assert!(!repo.is_track_banned(1, t1).unwrap());
+    }
+
+    #[test]
+    fn bannir_un_id_fantome_est_refuse() {
+        let db = test_db();
+        let repo = HiddenRepo::with_backend(db);
+        assert!(!repo.ban_track(1, 4242).unwrap());
+        assert!(repo.list_banned_tracks(1).unwrap().is_empty());
+    }
+
+    /// Le profil des sélections sans requête : le réglage `active_profile_id`,
+    /// sinon 1.
+    #[test]
+    fn profil_de_selection_automatique_lit_le_reglage() {
+        let db = test_db();
+        assert_eq!(profil_de_selection_automatique(&db), 1);
+        crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+            .set("active_profile_id", "3")
+            .unwrap();
+        assert_eq!(profil_de_selection_automatique(&db), 3);
     }
 }

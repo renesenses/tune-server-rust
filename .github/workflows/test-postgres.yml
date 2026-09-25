@@ -210,6 +210,18 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres,oaat i4521_dr_liste_postgres -- --nocapture
 
+      # #4853 — les rayons de collections sur une VRAIE base, native ET issue de
+      # la bascule SQLite→PG (types BIGINT posés par la migration 070).
+      - name: Rayons de collections sur PostgreSQL (#4853)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4853 -- --nocapture
+
+      - name: Titres de service dans les playlists sur PostgreSQL (#4889)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -381,6 +393,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_scan_converge_4602 -- --nocapture --test-threads=1
 
+      # #4907 -- la meme musique dans plusieurs repertoires, par le VRAI scan :
+      # la copie identique devient un exemplaire (`track_copies`, migration
+      # 073), les vues gardent les memes compteurs, un fichier supprime ne
+      # retire que son exemplaire, et les identifiants de pistes ne bougent
+      # pas. La contre-epreuve SQLite du meme fichier tourne dans `ci.yml`.
+      - name: Exemplaires par repertoire sur PostgreSQL (#4907)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test exemplaires_par_repertoire_4907 -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
@@ -466,3 +488,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_returning_id_hors_table_a_id_3256 -- --nocapture
+
+      # #4984 — les crédits de piste. `track_credits.track_id` est BIGINT sur
+      # PostgreSQL et le code le liait en texte : aucun crédit écrit, purge
+      # jamais faite, GET des crédits en 500. SQLite l'avale, il faut le
+      # moteur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Crédits de piste sur PostgreSQL (#4984)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1

@@ -188,6 +188,70 @@ pub async fn require_entitlement(
     }
 }
 
+/// Bandeau « Réinstaller » (#4861) : les greffons payants absents, pour un
+/// compte qui a le droit de les installer, que l'utilisateur n'a pas refusés.
+/// Le droit est jugé par la même porte que la route d'installation
+/// (`check_feature` du droit de chaque greffon) : un compte Free ne reçoit
+/// jamais rien. « Réinstaller » passe par `POST /plugins/{id}/install`.
+async fn reinstall_suggestion_ids(state: &AppState) -> Result<Vec<&'static str>, String> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let mut ids = Vec::new();
+    for id in premium_plugins::reinstall_candidates(&settings)? {
+        if state
+            .license
+            .check_feature(crate::native_audio::feature(id))
+            .await
+        {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn reinstall_suggestion_failed(error: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tracing::error!(%error, "premium_audio_reinstall_suggestion_failed");
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(json!({"error":"reinstall_suggestion_failed","detail":error})),
+    )
+        .into_response()
+}
+
+/// `GET /api/v1/plugins/premium-audio/reinstall-suggestion` → `{"ids": [...]}`.
+pub async fn reinstall_suggestion(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match reinstall_suggestion_ids(&state).await {
+        Ok(ids) => axum::Json(json!({ "ids": ids })).into_response(),
+        Err(e) => reinstall_suggestion_failed(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DismissRequest {
+    ids: Vec<String>,
+}
+
+/// `POST /api/v1/plugins/premium-audio/reinstall-suggestion/dismiss`
+/// `{"ids": [...]}` : « Ignorer ». Le refus est mémorisé pour ces greffons ;
+/// la réponse porte la suggestion relue (`{"ids": [...]}`).
+pub async fn dismiss_reinstall_suggestion(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(body): axum::Json<DismissRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(e) = premium_plugins::dismiss_reinstall(&settings, &body.ids) {
+        return reinstall_suggestion_failed(e);
+    }
+    match reinstall_suggestion_ids(&state).await {
+        Ok(ids) => axum::Json(json!({ "ids": ids })).into_response(),
+        Err(e) => reinstall_suggestion_failed(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +309,15 @@ mod tests {
     }
 
     async fn appel(app: &axum::Router, methode: &str, chemin: &str) -> (StatusCode, Value) {
+        appel_avec_corps(app, methode, chemin, json!({})).await
+    }
+
+    async fn appel_avec_corps(
+        app: &axum::Router,
+        methode: &str,
+        chemin: &str,
+        corps: Value,
+    ) -> (StatusCode, Value) {
         let response = app
             .clone()
             .oneshot(
@@ -252,7 +325,7 @@ mod tests {
                     .method(methode)
                     .uri(chemin)
                     .header("content-type", "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(corps.to_string()))
                     .unwrap(),
             )
             .await
@@ -345,5 +418,187 @@ mod tests {
             Some(r#"{"enabled":true,"bass_gain_db":4.0}"#),
             "le réglage doit rester intact"
         );
+    }
+
+    /// #4861, témoin de bout en bout : premier démarrage vu comme Free, puis
+    /// l'utilisateur retire deux greffons payants par les routes réelles
+    /// (désinstallation native, désinstallation du catalogue) et en désactive
+    /// un troisième ; au retour du Premium puis au démarrage suivant, ses
+    /// choix tiennent. Un greffon qu'il n'a pas touché revient installé et
+    /// actif.
+    #[tokio::test]
+    async fn temoin_4861_desinstallation_explicite_respectee_au_retour_du_premium() {
+        dossier_de_donnees_jetable();
+        for desactive in [false, true] {
+            let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+            assert!(!state.license.is_premium().await);
+            for id in ["crossfeed", "converter", "declick"] {
+                assert!(
+                    !premium_plugins::enabled(&settings, id),
+                    "{id} actif en Free"
+                );
+            }
+            let app = crate::routes::router_with_plugins(state.clone(), routers);
+            let (status, reponse) =
+                appel(&app, "POST", "/api/v1/audio-plugins/crossfeed/uninstall").await;
+            assert_eq!(status, StatusCode::OK, "{reponse}");
+            let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/converter").await;
+            assert_eq!(status, StatusCode::OK, "{reponse}");
+            if desactive {
+                let (status, reponse) =
+                    appel(&app, "POST", "/api/v1/plugins/declick/disable").await;
+                assert_eq!(status, StatusCode::OK, "{reponse}");
+            }
+
+            // Retour du Premium par la licence, puis démarrage suivant.
+            state
+                .license
+                .update_from_server(tune_core::license::Tier::Premium, None)
+                .await;
+            premium_plugins::migrate_for_account(&settings, state.license.is_premium().await)
+                .unwrap();
+
+            assert!(
+                !premium_plugins::installed(&settings, "crossfeed"),
+                "désinstallation native annulée"
+            );
+            assert!(!premium_plugins::enabled(&settings, "crossfeed"));
+            assert!(
+                !premium_plugins::installed(&settings, "converter"),
+                "désinstallation du catalogue annulée"
+            );
+            assert!(!premium_plugins::enabled(&settings, "converter"));
+            assert_eq!(
+                premium_plugins::enabled(&settings, "declick"),
+                !desactive,
+                "declick (désactivé={desactive})"
+            );
+        }
+    }
+
+    const SUGGESTION: &str = "/api/v1/plugins/premium-audio/reinstall-suggestion";
+    const IGNORER: &str = "/api/v1/plugins/premium-audio/reinstall-suggestion/dismiss";
+
+    /// Une installation touchée par l'ancienne migration (#4861) : les trois
+    /// greffons payants écrits `false`/`false`, sans retenue — l'état exact
+    /// qu'écrit aussi la désinstallation native. Le compte est Premium si
+    /// `premium`.
+    async fn installation_touchee(premium: bool) -> (AppState, SettingsRepo, axum::Router) {
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        if premium {
+            state
+                .license
+                .update_from_server(tune_core::license::Tier::Premium, None)
+                .await;
+        }
+        for id in ["crossfeed", "converter", "declick"] {
+            settings
+                .set(&format!("plugin_{id}_installed"), "false")
+                .unwrap();
+            settings
+                .set(&format!("plugin_{id}_enabled"), "false")
+                .unwrap();
+            settings
+                .delete(&format!("premium_audio_plugins_withheld_{id}"))
+                .unwrap();
+        }
+        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        (state, settings, app)
+    }
+
+    async fn proposes(app: &axum::Router) -> Value {
+        let (status, reponse) = appel(app, "GET", SUGGESTION).await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        reponse["ids"].clone()
+    }
+
+    /// Témoin 1 : Premium sans les trois greffons payants → les trois proposés,
+    /// jamais l'égaliseur (gratuit, seulement proposé par le catalogue).
+    #[tokio::test]
+    async fn temoin_4861_bandeau_premium_sans_les_trois_greffons() {
+        let (_state, _settings, app) = installation_touchee(true).await;
+        assert_eq!(
+            proposes(&app).await,
+            json!(["crossfeed", "converter", "declick"])
+        );
+    }
+
+    /// Témoin 2 : un compte Free ne reçoit jamais rien.
+    #[tokio::test]
+    async fn temoin_4861_bandeau_rien_pour_un_compte_free() {
+        let (state, _settings, app) = installation_touchee(false).await;
+        assert!(!state.license.is_premium().await);
+        assert_eq!(proposes(&app).await, json!([]));
+    }
+
+    /// Témoin 3 : « Ignorer » est mémorisé, greffon par greffon ; une
+    /// réinstallation puis une désinstallation ultérieures ne rouvrent pas le
+    /// bandeau.
+    #[tokio::test]
+    async fn temoin_4861_bandeau_ignorer_est_memorise() {
+        let (_state, settings, app) = installation_touchee(true).await;
+        let (status, reponse) =
+            appel_avec_corps(&app, "POST", IGNORER, json!({"ids": ["crossfeed"]})).await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert_eq!(reponse["ids"], json!(["converter", "declick"]));
+        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
+
+        let (status, reponse) = appel_avec_corps(
+            &app,
+            "POST",
+            IGNORER,
+            json!({"ids": ["converter", "declick", "equalizer", "bandcamp"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert_eq!(reponse["ids"], json!([]));
+        assert_eq!(proposes(&app).await, json!([]));
+
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/crossfeed/install").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/crossfeed").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert!(!premium_plugins::installed(&settings, "crossfeed"));
+        assert_eq!(
+            proposes(&app).await,
+            json!([]),
+            "le bandeau refusé est revenu"
+        );
+    }
+
+    /// Témoin 4 : un greffon installé n'est pas proposé.
+    #[tokio::test]
+    async fn temoin_4861_bandeau_greffon_installe_non_propose() {
+        let (_state, settings, app) = installation_touchee(true).await;
+        settings.set("plugin_converter_installed", "true").unwrap();
+        settings.set("plugin_converter_enabled", "true").unwrap();
+        assert_eq!(proposes(&app).await, json!(["crossfeed", "declick"]));
+    }
+
+    /// Témoin 5 : « Réinstaller » par la route d'installation EXISTANTE rend le
+    /// greffon installé ET actif, et il sort du bandeau.
+    #[tokio::test]
+    async fn temoin_4861_reinstaller_par_la_route_existante() {
+        let (_state, settings, app) = installation_touchee(true).await;
+        assert_eq!(
+            proposes(&app).await,
+            json!(["crossfeed", "converter", "declick"])
+        );
+        for id in ["crossfeed", "converter", "declick"] {
+            let (status, reponse) =
+                appel(&app, "POST", &format!("/api/v1/plugins/{id}/install")).await;
+            assert_eq!(status, StatusCode::OK, "{id}: {reponse}");
+            assert!(
+                premium_plugins::installed(&settings, id),
+                "{id} non installé"
+            );
+            assert!(premium_plugins::enabled(&settings, id), "{id} inactif");
+        }
+        assert_eq!(proposes(&app).await, json!([]));
     }
 }

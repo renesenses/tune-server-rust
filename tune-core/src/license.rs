@@ -569,8 +569,24 @@ impl LicenseManager {
         state.expires_at = expires_at;
         state.last_validated = Some(now.clone());
         state.key_premium_marker = tier == Tier::Premium;
+        let premium = effective_tier(&state) == Tier::Premium;
+        drop(state);
 
         info!(tier = %tier, validated = %now, "license_updated_from_server");
+        self.restore_withheld_plugins(premium);
+    }
+
+    /// #4861 : au retour du Premium, rétablir les greffons audio payants que la
+    /// migration avait retenus faute de licence. Sans effet hors Premium.
+    fn restore_withheld_plugins(&self, premium: bool) {
+        let settings = SettingsRepo::with_backend(self.db.clone());
+        match crate::audio::premium_plugins::restore_withheld(&settings, premium) {
+            Ok(restored) if !restored.is_empty() => {
+                info!(plugins = ?restored, "premium_audio_plugins_restored");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "premium_audio_plugins_restore_failed"),
+        }
     }
 
     /// Set the account premium (SSO) state. Called after an SSO login (and by the
@@ -594,8 +610,11 @@ impl LicenseManager {
         state.account_premium = premium;
         state.account_premium_expires = expires;
         state.account_premium_checked = Some(now);
+        let effective_premium = effective_tier(&state) == Tier::Premium;
+        drop(state);
 
         info!(account_premium = premium, "license_account_premium_updated");
+        self.restore_withheld_plugins(effective_premium);
     }
 
     /// Set the Qobuz endpoint order flag from the cloud license validation.

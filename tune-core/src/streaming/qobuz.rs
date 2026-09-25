@@ -131,6 +131,28 @@ fn endpoint_order(proxy_first: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// L'erreur d'une lecture de FICHE (un artiste, sa discographie), statut
+/// Qobuz compris — renesenses/tune-web-client#992.
+///
+/// Un **404** de Qobuz dit « cet objet n'existe pas chez moi » : c'est
+/// [`TuneError::NotFound`], que la route HTTP sort en 404. Mesuré sur la .18
+/// le 24/09/2026 (0.9.164), il sortait en **502** :
+///
+/// ```text
+/// GET /api/v1/streaming/qobuz/artists/999999999999 → 502
+///     qobuz /artist/get: 404 {"status":"error","code":404,
+///       "message":"No result matching given argument"}
+/// ```
+///
+/// Tout le reste garde la variante d'avant (`Other`, via `From<String>`) et
+/// donc son 502 : une vraie panne d'amont reste une panne d'amont.
+fn erreur_de_fiche((statut, message): (Option<u16>, String)) -> TuneError {
+    match statut {
+        Some(404) => TuneError::NotFound(message),
+        _ => TuneError::from(message),
+    }
+}
+
 /// Error from a single API attempt against one base URL.
 #[derive(Debug)]
 enum AttemptError {
@@ -585,6 +607,24 @@ impl QobuzService {
         path: &str,
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, String> {
+        self.api_get_avec_statut(path, params)
+            .await
+            .map_err(|(_, message)| message)
+    }
+
+    /// Comme [`Self::api_get`], mais rend AUSSI le code HTTP du refus — le
+    /// jumeau de [`Self::api_post_avec_statut`], pour la même raison : la
+    /// logique de repli n'est écrite qu'une fois, et le code est lu sur
+    /// [`AttemptError`], jamais reconstitué depuis le texte.
+    ///
+    /// renesenses/tune-web-client#992 : la fiche d'un artiste que Qobuz ne
+    /// connaît pas sortait en 502 (« passerelle en panne ») alors que Qobuz
+    /// avait répondu, net, 404. Voir [`erreur_de_fiche`].
+    async fn api_get_avec_statut(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> Result<serde_json::Value, (Option<u16>, String)> {
         let (primary, fallback) = self.bases_api();
         match self.api_get_at(primary, path, params).await {
             Ok(v) => Ok(v),
@@ -592,12 +632,12 @@ impl QobuzService {
                 log_fallback(self.proxy_first, path, &err);
                 self.api_get_at(fallback, path, params).await.map_err(|e| {
                     info!(path, error = %e, "qobuz_fallback_api_error");
-                    format!("qobuz {path}: {e}")
+                    (e.statut_http(), format!("qobuz {path}: {e}"))
                 })
             }
             Err(err) => {
                 info!(path, error = %err, "qobuz_api_error");
-                Err(format!("qobuz {path}: {err}"))
+                Err((err.statut_http(), format!("qobuz {path}: {err}")))
             }
         }
     }
@@ -2138,6 +2178,13 @@ impl StreamingService for QobuzService {
     /// Le plafond se compte à partir du curseur — `offset=500&limit=200` rend
     /// les 200 suivants, il ne rend pas zéro sous prétexte que 500 est déjà le
     /// plafond d'une requête.
+    /// Le plafond de Qobuz est celui de [`plafond_recherche`] — 500 par
+    /// catégorie, `0` valant « Tous » —, pas celui des services sans
+    /// pagination (#4803).
+    fn limite_de_page_recherche(&self, limit: usize) -> usize {
+        plafond_recherche(limit)
+    }
+
     async fn search_page(
         &self,
         query: &str,
@@ -2302,8 +2349,9 @@ impl StreamingService for QobuzService {
     /// donc JAMAIS tourné.
     async fn get_artist(&self, artist_id: &str) -> Result<StreamArtist, TuneError> {
         let data = self
-            .api_get("/artist/get", &[("artist_id", artist_id)])
-            .await?;
+            .api_get_avec_statut("/artist/get", &[("artist_id", artist_id)])
+            .await
+            .map_err(erreur_de_fiche)?;
         Ok(Self::map_artist(&data))
     }
 
@@ -2888,7 +2936,7 @@ impl StreamingService for QobuzService {
     ) -> Result<Vec<StreamAlbum>, TuneError> {
         let offset = offset.to_string();
         let data = self
-            .api_get(
+            .api_get_avec_statut(
                 "/artist/get",
                 &[
                     ("artist_id", artist_id),
@@ -2897,7 +2945,8 @@ impl StreamingService for QobuzService {
                     ("offset", &offset),
                 ],
             )
-            .await?;
+            .await
+            .map_err(erreur_de_fiche)?;
         let albums = data["albums"]["items"]
             .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
@@ -2970,6 +3019,12 @@ impl StreamingService for QobuzService {
             .map(|items| items.iter().map(Self::map_artist).collect())
             .unwrap_or_default();
         Ok(artists)
+    }
+
+    /// `artist/getSimilarArtists` ci-dessus : Qobuz est le seul service qui
+    /// sait répondre « et après ? » depuis son propre catalogue (fil 1906).
+    fn propose_des_artistes_similaires(&self) -> bool {
+        true
     }
 
     async fn create_playlist(
@@ -3832,6 +3887,60 @@ mod tests {
         assert_eq!(
             pistes[0].album.as_deref(),
             Some("Bach: Suites pour violoncelle")
+        );
+    }
+
+    /// renesenses/tune-web-client#992 — un artiste que Qobuz ne CONNAÎT PAS
+    /// n'est pas une panne d'amont. Qobuz répond 404 ; la fiche doit le dire
+    /// (`NotFound`, sorti en 404 par la route), pas le maquiller en 502.
+    /// Et le reste — ici un 400 — garde la variante d'avant, donc son 502.
+    #[tokio::test]
+    async fn fiche_artiste_inconnue_de_qobuz_est_un_not_found_992() {
+        use axum::Router;
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/artist/get",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("artist_id").map(String::as_str) {
+                    Some("inconnu") => (
+                        StatusCode::NOT_FOUND,
+                        r#"{"status":"error","code":404,"message":"No result matching given argument"}"#,
+                    ),
+                    _ => (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"status":"error","code":400,"message":"Invalid argument"}"#,
+                    ),
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+
+        let fiche = svc.get_artist("inconnu").await.unwrap_err();
+        assert!(
+            matches!(fiche, TuneError::NotFound(_)),
+            "la fiche d'un artiste inconnu : {fiche:?}"
+        );
+        let albums = svc.get_artist_albums_page("inconnu", 0).await.unwrap_err();
+        assert!(
+            matches!(albums, TuneError::NotFound(_)),
+            "sa discographie non plus : {albums:?}"
+        );
+
+        let refus = svc.get_artist("mal-forme").await.unwrap_err();
+        assert!(
+            !matches!(refus, TuneError::NotFound(_)),
+            "un 400 n'est pas « introuvable » : {refus:?}"
         );
     }
 

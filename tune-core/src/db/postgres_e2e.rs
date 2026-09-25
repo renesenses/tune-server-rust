@@ -1283,6 +1283,17 @@ async fn pg_config_backup_zones_volume_fixe() {
     scenarios_zones::une_zone_armee_absente_prend_le_defaut_du_schema(&db);
     scenarios_zones::temoin_une_sauvegarde_desarmee_repose_son_volume(&db);
     scenarios_zones::temoin_les_autres_champs_du_bloc_ne_bougent_pas(&db);
+
+    // #4927 — joues ICI plutot que dans une epreuve a part : une autre
+    // epreuve `pg_config_backup_*` en parallele viderait `playlists` et
+    // `tracks` par son `reset_schema` au milieu de l'aller-retour.
+    use crate::config_backup::scenarios_playlists;
+    scenarios_playlists::une_playlist_de_trois_pistes_fait_l_aller_retour(&db);
+    scenarios_playlists::une_sauvegarde_existante_se_restaure(&db);
+
+    // #4983 — la restauration des favoris, meme raison d'etre jouee ici.
+    use crate::config_backup::scenarios_favoris;
+    scenarios_favoris::un_favori_se_restaure_et_un_doublon_est_ignore(&db);
 }
 
 /// #2441 — « Continuer l'ecoute » sur une VRAIE base PostgreSQL : les
@@ -2472,5 +2483,86 @@ async fn pg_4201_revision_radio_sans_dependance_de_colonne() {
         .execute(&pool)
         .await
         .unwrap();
+    pool.close().await;
+}
+
+/// #4924 — meme temoin que `i4924_index_source_id_pose_au_redemarrage_d_une_base_existante`
+/// (SQLite), contre PostgreSQL : une base existante privee de l'index le recoit
+/// au prochain passage du runner, sans que `schema_version` bouge, et la
+/// recherche par `source_id` s'appuie sur lui.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_4924_index_source_id_pose_au_redemarrage() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    const INDEX: &str = "idx_tracks_source_source_id";
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("runner sur la base de test");
+    sqlx::raw_sql("DROP INDEX IF EXISTS idx_tracks_source_source_id")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let present = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM pg_indexes \
+              WHERE schemaname = current_schema() AND indexname = $1",
+        )
+        .bind(INDEX)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+            == 1
+    };
+    let plan = |pool: sqlx::PgPool| async move {
+        let mut conn = pool.acquire().await.unwrap();
+        // Table de test minuscule : sans ceci le planificateur prefere toujours
+        // le balayage sequentiel, index ou pas, et le temoin ne dirait rien.
+        // `jit = off` : le cout de desactivation declenche la compilation JIT,
+        // absente de certaines installations — le plan n'en depend pas.
+        sqlx::raw_sql("SET enable_seqscan = off; SET jit = off")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        let lignes: Vec<String> = sqlx::query_scalar(
+            "EXPLAIN SELECT id FROM tracks WHERE source = 'upnp' AND source_id = 'obj-42'",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql("RESET enable_seqscan; RESET jit")
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        lignes.join(" | ")
+    };
+    let version = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, i32>("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+
+    assert!(!present(pool.clone()).await, "DROP INDEX sans effet");
+    let avant = plan(pool.clone()).await;
+    eprintln!("plan PG AVANT redemarrage : {avant}");
+    assert!(!avant.contains(INDEX), "{avant}");
+    let version_avant = version(pool.clone()).await;
+
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("runner au redemarrage");
+
+    assert!(
+        present(pool.clone()).await,
+        "{INDEX} absent apres le redemarrage d'une base existante"
+    );
+    let apres = plan(pool.clone()).await;
+    eprintln!("plan PG APRES redemarrage : {apres}");
+    assert!(apres.contains(INDEX), "{apres}");
+    assert_eq!(version(pool.clone()).await, version_avant);
     pool.close().await;
 }

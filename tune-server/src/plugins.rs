@@ -145,6 +145,18 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         )))
         .await;
 
+    // Lecture directe d'un CD audio (#4863). L'orchestrateur est passé pour
+    // que le greffon y inscrive sa source PCM `cd` et lance la file du disque ;
+    // le gestionnaire de lecture, pour la longueur de file et l'état des zones.
+    #[cfg(feature = "cd")]
+    loader
+        .register(Box::new(tune_cd::CdPlugin::new(tune_cd::HostServices {
+            backend: state.backend.clone(),
+            orchestrator: state.orchestrator.clone(),
+            playback: state.playback.clone(),
+        })))
+        .await;
+
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
     // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
     // images de l'archive sous le même condensat que tout le reste.

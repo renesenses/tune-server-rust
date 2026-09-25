@@ -20,8 +20,10 @@ modifie aucun réglage de Roon.
 - Une machine qui **voit le Core Roon sur le réseau** pour lancer le
   moissonneur : le Mac, le PC ou la machine Linux du Core lui-même, ou une
   autre machine du même réseau. Il n'a pas besoin de tourner à côté de Tune.
-- L'**adresse IP** de la machine qui fait tourner le Core Roon. Le moissonneur
-  ne cherche pas le Core tout seul : il faut la lui donner.
+- **Aucune adresse IP à connaître** : le moissonneur cherche le Core tout seul
+  sur le réseau. Gardez-la quand même sous la main pour les cas où la diffusion
+  ne passe pas (Wi-Fi avec isolation des clients, VLAN, Docker) : elle se donne
+  alors avec `--hote=`.
 
 ## 1. Télécharger le moissonneur
 
@@ -60,22 +62,46 @@ xattr -d com.apple.quarantine ./moissonneur-roon
 ## 2. Lancer le moissonneur
 
 ```sh
-./moissonneur-roon --hote=192.168.1.20 --archive=export-roon.zip
+./moissonneur-roon --archive=export-roon.zip
 ```
 
-(sous Windows : `moissonneur-roon.exe --hote=192.168.1.20 --archive=export-roon.zip`)
+(sous Windows : `moissonneur-roon.exe --archive=export-roon.zip`)
 
-Remplacez `192.168.1.20` par l'adresse IP de votre Core Roon.
+**Aucune adresse à taper** : le moissonneur interroge le réseau et affiche le
+Core qu'il a trouvé.
+
+```
+recherche du Core Roon sur le réseau (5 s)…
+Core trouvé : « Salon » — 192.168.1.20:9330 (Roon 2.65)
+```
+
+Deux cas où il vous rend la main plutôt que de choisir :
+
+- **plusieurs Cores répondent** — il les liste tous et attend que vous disiez
+  lequel avec `--hote=` ;
+- **aucun ne répond** — la diffusion ne traverse pas toujours : Wi-Fi avec
+  « isolation des clients », VLAN séparé, conteneur Docker sans
+  `--network=host`. Donnez alors l'adresse à la main :
+
+  ```sh
+  ./moissonneur-roon --hote=192.168.1.20 --archive=export-roon.zip
+  ```
+
+  Sur un réseau lent, ou un Core qui vient de démarrer, essayez d'abord
+  `--decouverte=20`.
 
 Options :
 
 | option | rôle | défaut |
 |---|---|---|
-| `--hote=<ip>` | adresse du Core Roon — **obligatoire** | aucun |
-| `--port=<port>` | port du Core | `9330` |
+| `--hote=<ip>` | adresse du Core Roon — **facultative**, elle court-circuite la recherche | le Core trouvé sur le réseau |
+| `--port=<port>` | port du Core | celui qu'annonce le Core, sinon `9330` |
+| `--decouverte=<secondes>` | combien de temps écouter le réseau | `5` |
 | `--archive=<fichier.zip>` | écrit l'archive à importer (export + octets des images) | pas d'archive |
 | `--sortie=<fichier.json>` | fichier `export.json` écrit à côté | `export-roon.json` |
 | `--sans-pistes` | ne descend pas dans les albums : ni pistes, ni crédits | pistes récoltées |
+| `--jeton=<fichier>` | où garder l'autorisation Roon (voir §3) | dossier de configuration du compte |
+| `--aide` | rappelle tout ceci et s'arrête | — |
 
 Les options s'écrivent **avec `=`** (`--hote=192.168.1.20`, pas
 `--hote 192.168.1.20`).
@@ -86,18 +112,46 @@ ne pourrait poser aucune image.
 
 ## 3. Autoriser l'extension dans Roon
 
-Au lancement, le moissonneur affiche :
+**Une seule fois.** Au tout premier lancement, le moissonneur affiche :
 
 ```
 connexion à 192.168.1.20:9330 — autorisez « Tune — moissonneur » dans Roon (Réglages → Extensions)
+(une seule fois : l'autorisation est gardée dans …/tune-moissonneur-roon/jeton-roon.json)
 ```
 
 Dans Roon, ouvrez **Réglages → Extensions** et **activez « Tune —
 moissonneur »** (éditeur : Mozaik Labs). Le moissonneur attend cette
 autorisation, puis affiche `connecté.` et commence.
 
-Le moissonneur ne garde pas le jeton d'autorisation sur disque : si Roon vous
-la redemande à un lancement suivant, donnez-la de nouveau.
+Aux lancements suivants, il ne vous redemande plus rien :
+
+```
+connexion à 192.168.1.20:9330 — autorisation déjà donnée (jeton : …/jeton-roon.json)
+```
+
+Le jeton est rangé dans le dossier de configuration de **votre compte**, pas
+dans le dossier d'où vous lancez la commande :
+
+| système | fichier |
+|---|---|
+| macOS | `~/Library/Application Support/tune-moissonneur-roon/jeton-roon.json` |
+| Linux | `~/.config/tune-moissonneur-roon/jeton-roon.json` (ou `$XDG_CONFIG_HOME`) |
+| Windows | `%APPDATA%\tune-moissonneur-roon\jeton-roon.json` |
+
+`--jeton=<fichier>` le range ailleurs (clé USB, machine partagée).
+
+Ce fichier **autorise à lire votre Core Roon** : sur macOS et Linux il n'est
+lisible que par vous (`600`), dans un dossier `700`. Le moissonneur n'en
+affiche jamais le contenu, seulement le chemin. Traitez-le comme un mot de
+passe : ne le recopiez pas dans un ticket ni sur le forum.
+
+**Pour retirer l'autorisation**, au choix :
+
+- **supprimer le fichier** — le moissonneur redemandera l'autorisation au
+  lancement suivant ;
+- **dans Roon**, Réglages → Extensions → « Tune — moissonneur » → désactiver
+  ou oublier l'extension. C'est le seul des deux gestes qui coupe l'accès
+  côté Core ; faites-le si la machine du moissonneur vous échappe.
 
 ## 4. Où est l'archive
 
@@ -133,7 +187,9 @@ Dans Tune : **Extensions → Pont Roon**.
 Le rapport du dernier import (hors aperçu) est conservé et réaffiché sur
 l'écran de l'extension.
 
-L'archive ne doit pas dépasser 600 Mo. Un `export-roon.json` seul est accepté
+L'archive ne doit pas dépasser **8 Gio**. Tune l'écrit sur disque au fil de
+l'envoi : au-delà du plafond, il répond une erreur lisible (`413`) au lieu de
+couper la connexion en plein milieu. Un `export-roon.json` seul est accepté
 aussi, mais il n'apporte alors que les crédits, aucune image.
 
 ## Ce que fait l'import, et ce qu'il ne fait jamais

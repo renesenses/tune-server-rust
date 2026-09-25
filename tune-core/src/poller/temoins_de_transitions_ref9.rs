@@ -52,6 +52,10 @@ struct Observation {
     /// que le renderer ait de quoi jouer ? Seule `ConsommationFlux::ASec`
     /// la consulte : c'est la seule issue qui coupe.
     avance_audio_couvre_l_arret: bool,
+    /// #4661 — le fichier a-t-il été servi EN ENTIER, l'horloge de la piste
+    /// n'étant pas arrivée à sa fin ? Consultée avant l'avance, et par la
+    /// seule `ConsommationFlux::ASec`.
+    horloge_de_piste_couvre_l_arret: bool,
     dlna_dsd_reached_end: bool,
     repeat_active: bool,
 }
@@ -66,6 +70,7 @@ fn observation(track_duration_ms: u64, wall_elapsed: u64) -> Observation {
         can_internal_gapless: true,
         consommation: ConsommationFlux::Inconnue,
         avance_audio_couvre_l_arret: false,
+        horloge_de_piste_couvre_l_arret: false,
         dlna_dsd_reached_end: false,
         repeat_active: false,
     }
@@ -107,6 +112,7 @@ fn entree_stopped(ps: &ZonePollState, o: &Observation) -> StoppedInput {
         can_internal_gapless: o.can_internal_gapless,
         consommation: o.consommation,
         avance_audio_couvre_l_arret: o.avance_audio_couvre_l_arret,
+        horloge_de_piste_couvre_l_arret: o.horloge_de_piste_couvre_l_arret,
         dlna_dsd_reached_end: o.dlna_dsd_reached_end,
     }
 }
@@ -164,9 +170,13 @@ fn appliquer_stopped(ps: &mut ZonePollState, issue: StoppedOutcome) -> (bool, bo
             ps.gapless_armed = None;
             return (true, false);
         }
-        // `FailureWaitingAvance` (#4480) écrit comme ses deux sœurs : on
-        // accumule un tour d'arrêt de plus, on ne coupe pas.
-        FailureWaitingConsuming | FailureWaitingUnknown | FailureWaitingAvance => {
+        // `FailureWaitingAvance` (#4480) et `FailureWaitingHorloge` (#4661)
+        // écrivent comme leurs sœurs : on accumule un tour d'arrêt de plus,
+        // on ne coupe pas.
+        FailureWaitingConsuming
+        | FailureWaitingUnknown
+        | FailureWaitingAvance
+        | FailureWaitingHorloge => {
             ps.stopped_ticks += 1 // :1595
         }
         FailureStop => {
@@ -1775,11 +1785,32 @@ fn e12_attente_prolongee_reste_arretee() {
     );
     ps.coherent().unwrap();
 
+    // #4661 — quatrième façon de ne PAS couper : le fichier est chez le
+    // renderer EN ENTIER et l'horloge de la piste n'est pas arrivée à sa fin.
+    // Elle l'emporte sur l'avance, qui n'est qu'une borne plate.
+    let mut o = observation(300_000, 40);
+    o.consommation = ConsommationFlux::ASec;
+    o.avance_audio_couvre_l_arret = false;
+    o.horloge_de_piste_couvre_l_arret = true;
+    let issue = classify_stopped(&entree_stopped(&ps, &o));
+    assert_eq!(issue, StoppedOutcome::FailureWaitingHorloge);
+    assert!(!issue.is_force_stop() && !issue.is_track_end());
+    appliquer_stopped(&mut ps, issue);
+    ps.transition(Transition::AttenteProlongee);
+    assert_eq!(
+        ps.etat,
+        EtatDeLecture::Arretee {
+            depuis: Depuis::Lecture
+        }
+    );
+    ps.coherent().unwrap();
+
     let sans = suivant(&EtatDeLecture::Lecture, Transition::AttenteProlongee).unwrap_err();
     for marqueur in [
         "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingConsuming);",
         "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingUnknown);",
         "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingAvance);",
+        "fsm_actual = Some(fsm::StoppedOutcome::FailureWaitingHorloge);",
     ] {
         appel_suit_le_marqueur(
             marqueur,
@@ -2273,4 +2304,24 @@ async fn e23_le_tick_de_production_tient_l_invariant() {
     assert_eq!(ps.etat, EtatDeLecture::Lecture);
     assert_eq!(ps.stopped_ticks, 0);
     ps.coherent().unwrap();
+}
+
+/// #4645 — la coupure `playback_failure_stopping_zone` arme la reprise à la
+/// position atteinte, comme celle du renderer calé. Sans cet appel, le flux à
+/// sec du 24/09 (Sevy Tabroc, 0.9.163) coupait la zone et arrêtait la file :
+/// `mesure_renderer_cale` restait `None`, et plus bas le `force_stop` tombait
+/// dans le `stop` nu. Aucun drapeau d'état ne distingue les deux issues.
+#[test]
+fn flux_a_sec_arme_la_reprise_a_la_position_atteinte_4645() {
+    ecriture_suit_le_marqueur(
+        "\"playback_failure_stopping_zone\"",
+        "mesure_renderer_cale =",
+        26,
+    );
+    appel_suit_le_marqueur(
+        "\"playback_failure_stopping_zone\"",
+        "decisions::mesure_de_reprise_apres_flux_a_sec(",
+        26,
+        None,
+    );
 }

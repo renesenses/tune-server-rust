@@ -104,6 +104,16 @@ impl StreamInfo {
     /// pas dans le flux décodé, la durée réelle diffère de toute façon de la
     /// durée en bibliothèque.
     pub fn wav_content_length(&self) -> Option<u64> {
+        // #4863 — un producteur qui CONNAÎT sa longueur exacte (source PCM
+        // d'un greffon : `44 + secteurs × 2 352` pour un CD) la pose dans
+        // `file_size`, et elle prime sur la déduction par la durée. La réponse
+        // HEAD lisait déjà `file_size` en premier ; le GET en déduisait une
+        // longueur arrondie qui tronquait la fin de piste. Aucune session de
+        // canal WAV ne posait `file_size` jusqu'ici : les sessions de FICHIER
+        // qui le posent y mettent la taille réelle du fichier, identique.
+        if let Some(taille) = self.file_size.filter(|_| self.format == "wav") {
+            return Some(taille);
+        }
         let dur = self.duration_ms?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
@@ -849,6 +859,55 @@ pub fn forget_icy_channel(stream_id: &str) {
     }
 }
 
+// ─── MIME annoncé au renderer, relu par le serveur de flux (#4958) ──────────
+//
+// La reprise 714 de la sortie DLNA (#744) réécrit le MIME de la DIDL à
+// l'orthographe exacte du Sink (`audio/flac` → `audio/x-flac`). Mais le
+// Beosound Stage fait un `HEAD` sur l'URL avant de répondre, et le serveur de
+// flux lui rendait `Content-Type: audio/flac` — le MIME de la SESSION, que la
+// reprise ne touchait pas. Un renderer qui confronte ce `Content-Type` à son
+// Sink refusait donc les deux reprises, quel que soit le libellé de la DIDL.
+//
+// Ce registre porte l'orthographe que la sortie a ANNONCÉE pour un flux : le
+// serveur de flux la sert en `Content-Type` (HEAD et GET), à la place du MIME
+// de la session. Seule la reprise « orthographe exacte » y écrit, et
+// seulement un ALIAS du même format — jamais une étiquette d'un autre format.
+static MIME_ANNONCE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Noter l'orthographe du MIME annoncée au renderer pour ce flux.
+pub fn annoncer_mime_du_flux(stream_id: &str, mime: &str) {
+    if let Ok(mut map) = MIME_ANNONCE.lock() {
+        map.insert(stream_id.to_string(), mime.to_string());
+    }
+}
+
+/// Le `Content-Type` à servir pour ce flux : l'orthographe annoncée au
+/// renderer si la sortie en a posé une, sinon `defaut` (MIME de la session).
+pub fn content_type_du_flux(stream_id: &str, defaut: &str) -> String {
+    MIME_ANNONCE
+        .lock()
+        .ok()
+        .and_then(|m| m.get(stream_id).cloned())
+        .unwrap_or_else(|| defaut.to_string())
+}
+
+/// Oublier l'orthographe annoncée (même vie que [`forget_icy_channel`]).
+pub fn oublier_mime_du_flux(stream_id: &str) {
+    if let Ok(mut map) = MIME_ANNONCE.lock() {
+        map.remove(stream_id);
+    }
+}
+
+/// L'identifiant de flux d'une URL servie par ce serveur
+/// (`http://h:p/stream/<id>.flac` → `<id>`). `None` pour toute autre URL.
+pub fn stream_id_de_l_url(url: &str) -> Option<&str> {
+    let sans_requete = url.split(['?', '#']).next().unwrap_or(url);
+    let (_, apres) = sans_requete.rsplit_once("/stream/")?;
+    let id = extract_stream_id(apres);
+    (!id.is_empty() && !id.contains('/')).then_some(id)
+}
+
 /// Le verdict : par où — ou par où PAS — le changement de morceau atteint le
 /// renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1280,6 +1339,8 @@ impl AudioStreamer {
         forget_radio_now(stream_id);
         // Même vie pour le canal négocié (#2991) : une entrée par flux écouté.
         forget_icy_channel(stream_id);
+        // Et pour l'orthographe du MIME annoncée au renderer (#4958).
+        oublier_mime_du_flux(stream_id);
         // Clean up temp transcode files created by the pre-transcode pipeline.
         // Only delete files under the system temp dir with the tune-transcode prefix
         // to avoid accidentally removing actual music files.
@@ -2261,6 +2322,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.wav_content_length(), Some(180 * 44100 * 2 * 2 + 44));
+    }
+
+    /// #4863 — une piste de CD de 3 001 secteurs : 3 001 × 2 352 octets. Aucune
+    /// durée entière en millisecondes ne donne cette longueur (3 001 n'est pas
+    /// un multiple de 3) ; la longueur exacte posée par le producteur prime.
+    #[test]
+    fn wav_content_length_prend_la_longueur_exacte_du_producteur() {
+        let exacte = 44 + 3_001 * 2_352;
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            file_size: Some(exacte),
+            duration_ms: Some(3_001 * 40 / 3),
+            ..Default::default()
+        };
+        assert_eq!(info.wav_content_length(), Some(exacte));
     }
 
     // ─── Péremption des sessions : activité, pas âge (#2536) ────────

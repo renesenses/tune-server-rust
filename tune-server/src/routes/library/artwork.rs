@@ -344,6 +344,8 @@ pub(super) async fn proxy_artwork(
     // Pochette de serveur UPnP de la bibliothèque (réseau local) : refusée par
     // la garde générale, admise si — et seulement si — c'est l'adresse
     // ENREGISTRÉE d'un album. Voir `artwork_proxy::pochette_de_bibliotheque`.
+    // Idem pour la pochette d.un serveur Tune découvert (#4954), voir
+    // `pochette_d_un_serveur_tune_decouvert`.
     // Jamais par l'exemption DIDL, jamais pour une URL déjà signée.
     if let Err(Echec::Refus(ref refus)) = resultat
         && q.sig.is_none()
@@ -352,7 +354,8 @@ pub(super) async fn proxy_artwork(
             refus,
             artwork_proxy::Refus::AdresseInterdite { .. } | artwork_proxy::Refus::HoteRefuse(_)
         )
-        && artwork_proxy::pochette_de_bibliotheque(&state.backend, &q.url)
+        && (artwork_proxy::pochette_de_bibliotheque(&state.backend, &q.url)
+            || pochette_d_un_serveur_tune_decouvert(&state, &q.url).await)
     {
         // La signature n'est PAS publiée : elle dit seulement au relais que
         // l'URL a été jugée côté serveur, pour qu'il passe la liste d'hôtes.
@@ -405,6 +408,26 @@ pub(super) async fn proxy_artwork(
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
+}
+
+/// #4954 — l'URL est-elle la pochette d'un serveur Tune DÉCOUVERT ?
+///
+/// Chemin figé ([`tune_core::library::artwork_proxy::pochette_d_un_serveur_tune`])
+/// ET hôte:port présent au registre SSDP des serveurs multimédia — le nôtre y
+/// est aussi (#3786), d'où « le serveur Tune lui-même » de l'issue. Un appareil
+/// du réseau ne choisit donc ni la cible (il faudrait qu'elle s'annonce en
+/// SSDP) ni la ressource (une pochette, rien d'autre).
+async fn pochette_d_un_serveur_tune_decouvert(state: &AppState, url: &str) -> bool {
+    let Some((hote, port)) = tune_core::library::artwork_proxy::pochette_d_un_serveur_tune(url)
+    else {
+        return false;
+    };
+    state
+        .media_servers
+        .lock()
+        .await
+        .values()
+        .any(|s| s.port == port && s.host.eq_ignore_ascii_case(&hote))
 }
 
 pub(super) async fn enrich_album_artwork(
