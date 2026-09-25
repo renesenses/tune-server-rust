@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -17,16 +17,32 @@ pub fn is_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Le cache d'icônes de notification, sous `temp_dir()`.
+/// L'étiquette du cache d'icônes : c'est elle qui nomme le dossier, suivie de
+/// l'UID (cf [`crate::chemins_de_travail`]).
+const ETIQUETTE_ICONES: &str = "tune-notify-icons";
+
+/// Le cache d'icônes de notification, sous `temp_dir()`, **propre au compte**.
 ///
 /// En exploitation, le dossier doit survivre au processus : c'est un cache,
 /// et le vider à chaque démarrage retélécharge chaque pochette. Le geste est
-/// donc légitime ICI.
+/// donc légitime ICI — mais pas sous un nom fixe (#4770) : avant, le dossier
+/// était `temp_dir()/tune-notify-icons`, partagé par tous les comptes de la
+/// machine. Le premier qui le créait en devenait propriétaire, et chez les
+/// suivants `create_dir_all` réussissait (le dossier existe) mais chaque
+/// écriture d'icône échouait, en silence puisque le cache est best-effort :
+/// les notifications perdaient leur pochette pour toujours.
 fn icon_cache_dir() -> PathBuf {
-    icon_cache_dir_in(std::env::temp_dir())
+    creer_le_cache(chemin_du_cache_d_icones())
 }
 
-/// Le même, sous une racine imposée.
+/// Le chemin de production, **sans rien créer** : c'est ce que garde
+/// `le_cache_de_production_porte_l_uid_courant`. Séparé de [`icon_cache_dir`]
+/// pour que la garde porte sur le branchement réel et non sur une copie.
+fn chemin_du_cache_d_icones() -> PathBuf {
+    crate::chemins_de_travail::racine_de_travail(ETIQUETTE_ICONES)
+}
+
+/// Le même, sous une racine et un UID imposés — la forme testable.
 ///
 /// La racine est un paramètre **pour le test** : `icon_cache_dir_exists`
 /// appelait l'autre, donc créait pour de bon `/tmp/tune-notify-icons` et le
@@ -36,10 +52,22 @@ fn icon_cache_dir() -> PathBuf {
 /// ici, dans du code de production que le test appelle. Un garde de source
 /// lit les tests ; il ne suit pas les appels.
 ///
+/// L'UID est un paramètre pour la même raison que dans
+/// [`crate::chemins_de_travail::racine_de_travail_sous`] : deux comptes ne se
+/// simulent pas avec le seul UID du processus.
+///
 /// Le test passe désormais un `ScratchDir`, qui emporte le dossier en
 /// sortant de portée.
-fn icon_cache_dir_in(racine: impl AsRef<Path>) -> PathBuf {
-    let dir = racine.as_ref().join("tune-notify-icons");
+#[cfg(test)]
+fn icon_cache_dir_in(racine: impl AsRef<std::path::Path>, uid: u32) -> PathBuf {
+    creer_le_cache(crate::chemins_de_travail::racine_de_travail_sous(
+        racine,
+        ETIQUETTE_ICONES,
+        uid,
+    ))
+}
+
+fn creer_le_cache(dir: PathBuf) -> PathBuf {
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -219,10 +247,79 @@ mod tests {
     #[test]
     fn icon_cache_dir_exists() {
         let racine = crate::test_scratch::scratch_dir("tune-notify-cache");
-        let dir = icon_cache_dir_in(&racine);
+        let dir = icon_cache_dir_in(&racine, 4242);
         assert!(dir.is_dir(), "cache d'icônes non créé : {dir:?}");
         assert!(dir.starts_with(racine.path()), "cache hors de sa racine");
-        assert_eq!(dir.file_name().unwrap(), "tune-notify-icons");
+        assert_eq!(dir.file_name().unwrap(), "tune-notify-icons-4242");
+    }
+
+    /// Le témoin de #4770 pour le cache d'icônes : un compte arrivé second
+    /// peut encore écrire ses pochettes.
+    ///
+    /// Le dossier « de l'autre » est posé en `555` sous les DEUX noms qu'il
+    /// aurait pu prendre — l'ancien nom fixe, et le nom propre à son UID.
+    /// C'est ce que voit un second compte devant le `/tmp/tune-notify-icons`
+    /// d'un premier : le dossier existe, `create_dir_all` réussit, et
+    /// l'écriture de l'icône est refusée.
+    ///
+    /// Contre-épreuve : faire rendre à `icon_cache_dir_in` l'ancien
+    /// `racine.join("tune-notify-icons")` en ignorant l'UID — ce test rougit
+    /// en « écriture refusée … Permission denied ».
+    #[cfg(unix)]
+    #[test]
+    fn un_second_compte_ecrit_ses_icones_malgre_le_cache_du_premier() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::chemins_de_travail::uid_courant() == 0 {
+            eprintln!("témoin ignoré : exécuté en root, les modes ne mordent pas");
+            return;
+        }
+        let racine = crate::test_scratch::scratch_dir("tune-notify-deux-comptes");
+        let lui = 1001;
+        let moi = 1000;
+
+        let ancien = racine.path().join("tune-notify-icons");
+        let le_sien =
+            crate::chemins_de_travail::racine_de_travail_sous(&racine, "tune-notify-icons", lui);
+        for d in [&ancien, &le_sien] {
+            std::fs::create_dir_all(d).expect("cache « de l'autre compte »");
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).expect("mode 555");
+        }
+        // Le rouge d'avant, reproduit : sans lui le témoin ne prouve rien.
+        assert!(
+            std::fs::write(ancien.join("sonde.jpg"), b"x").is_err(),
+            "le cache au nom fixe aurait dû refuser l'écriture"
+        );
+
+        let le_mien = icon_cache_dir_in(&racine, moi);
+        let ecrit = std::fs::write(le_mien.join("pochette.jpg"), b"jpg");
+
+        for d in [&ancien, &le_sien] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        ecrit.unwrap_or_else(|e| panic!("écriture refusée dans {le_mien:?} : {e}"));
+        assert_ne!(le_mien, le_sien, "deux comptes partagent le cache d'icônes");
+        assert_ne!(le_mien, ancien, "le cache est retombé sur le nom fixe");
+    }
+
+    /// Le branchement de PRODUCTION porte l'UID courant, sous `temp_dir()`.
+    ///
+    /// Sans cette garde, `icon_cache_dir_in` pourrait être juste et
+    /// `icon_cache_dir` continuer d'appeler l'ancien chemin : le témoin
+    /// ci-dessus resterait vert. Rien n'est créé ici.
+    #[test]
+    fn le_cache_de_production_porte_l_uid_courant() {
+        let chemin = chemin_du_cache_d_icones();
+        // tmp-autorise: rien n'est créé ici, on LIT la base pour la comparer.
+        let base = std::env::temp_dir();
+        assert_eq!(chemin.parent(), Some(base.as_path()));
+        assert_eq!(
+            chemin.file_name().unwrap().to_string_lossy(),
+            format!(
+                "tune-notify-icons-{}",
+                crate::chemins_de_travail::uid_courant()
+            )
+        );
     }
 
     #[cfg(target_os = "macos")]
