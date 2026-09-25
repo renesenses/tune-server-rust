@@ -189,6 +189,80 @@ async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
     crate::db::coffrets_auto::tests::scenario_complet(&db);
 }
 
+/// LA règle « compilation » du 25/09/2026 rejouée sur une base PostgreSQL :
+/// `recalculer_les_compilations` lit le drapeau (`SMALLINT` depuis PG 028)
+/// par `COALESCE(…, 0) <> 0`, puis le BAISSE par `set_compilation` et rend à
+/// son artiste l'album rangé sous « Various Artists ». Une vraie compilation
+/// (artiste d'album « Various Artists ») reste marquée.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_recalcul_des_compilations_d_un_seul_artiste() {
+    use crate::db::album_repo::AlbumRepo;
+    use crate::db::artist_repo::ArtistRepo;
+    use crate::db::models::{Album, Artist, Track};
+    use crate::db::track_repo::TrackRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let artistes = ArtistRepo::with_backend(db.clone());
+    let repo = AlbumRepo::with_backend(db.clone());
+    let pistes = TrackRepo::with_backend(db.clone());
+    let va = artistes
+        .create(&Artist::new("Various Artists".into()))
+        .unwrap();
+    let coltrane = artistes
+        .create(&Artist::new("John Coltrane".into()))
+        .unwrap();
+    let django = artistes
+        .create(&Artist::new("Django Reinhardt".into()))
+        .unwrap();
+
+    let album = |titre: &str, artiste: i64| {
+        let mut a = Album::new(titre.into());
+        a.artist_id = Some(artiste);
+        a.is_compilation = true;
+        repo.create(&a).unwrap()
+    };
+    let piste = |album_id: i64, artiste: i64, n: i32, balise: Option<&str>, chemin: &str| {
+        let mut t = Track::new(format!("piste {n}"));
+        t.album_id = Some(album_id);
+        t.artist_id = Some(artiste);
+        t.track_number = n;
+        t.album_artist = balise.map(str::to_string);
+        t.file_path = Some(chemin.to_string());
+        pistes.create(&t).unwrap();
+    };
+    let disc1 = album("A Love Supreme, Disc 1", va);
+    piste(
+        disc1,
+        coltrane,
+        1,
+        Some("John Coltrane"),
+        "/pg/als1/01.flac",
+    );
+    piste(
+        disc1,
+        coltrane,
+        2,
+        Some("John Coltrane"),
+        "/pg/als1/02.flac",
+    );
+    let jip = album("Jazz in Paris", va);
+    piste(jip, django, 1, Some("Various Artists"), "/pg/jip/01.flac");
+
+    let bilan = repo.recalculer_les_compilations().unwrap();
+    assert_eq!(
+        (bilan.examines, bilan.baisses, bilan.reattribues),
+        (2, 1, 1),
+        "{bilan:?}"
+    );
+    let a = repo.get(disc1).unwrap().unwrap();
+    assert!(!a.is_compilation);
+    assert_eq!(a.artist_id, Some(coltrane));
+    assert!(repo.get(jip).unwrap().unwrap().is_compilation);
+    assert_eq!(repo.recalculer_les_compilations().unwrap().baisses, 0);
+    reset_schema(&db);
+}
+
 /// Preuve réelle sur le second dialecte pour #2458 : le MBID vide ne sert plus
 /// d'identité et la réparation fail-closed exécute sa sélection + son UPDATE
 /// dans une transaction PostgreSQL, pas seulement dans le fixture SQLite.

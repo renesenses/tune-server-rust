@@ -18,5 +18,7 @@ pub mod pont_roon;
 /// Appliquer un export du pont Roon (crédits, images) contre la base.
 pub mod pont_roon_import;
 pub mod quality;
+/// LA règle « compilation » (25/09/2026) — un seul endroit, voir le module.
+pub mod regle_compilation;
 pub mod smart_collections;
 pub mod track_matcher;
