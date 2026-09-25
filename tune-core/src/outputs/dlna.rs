@@ -1778,6 +1778,16 @@ impl OutputTarget for DlnaOutput {
                             sink = ?sink,
                             "dlna_set_uri_714_exact_spelling_retry"
                         );
+                        // #4958 — la DIDL seule ne suffit pas : le Beosound
+                        // Stage fait un `HEAD` sur l'URL avant de répondre, et
+                        // confronte son `Content-Type` au Sink. Le serveur de
+                        // flux doit servir la MÊME orthographe que la DIDL.
+                        // `exact` est un alias du même format (voir
+                        // `advertised_mime_for_sink`) : jamais un mensonge sur
+                        // les octets. La reprise PCM, elle, n'y touche pas.
+                        if let Some(sid) = crate::http::streamer::stream_id_de_l_url(media.url) {
+                            crate::http::streamer::annoncer_mime_du_flux(sid, &exact);
+                        }
                         attempt_mime = exact;
                         continue;
                     }
