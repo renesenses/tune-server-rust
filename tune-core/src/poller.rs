@@ -1101,6 +1101,10 @@ mod remontee_des_pannes_de_sortie_tests;
 #[cfg(test)]
 mod lecture_sans_destination_tests;
 
+/// Fil 1915 — piste coupée : passage à la suivante, pas arrêt de zone.
+#[cfg(test)]
+mod piste_tronquee_1915_tests;
+
 /// #2493 — garde-fou d'EMPLACEMENT : le constat de depassement DIT, il n'agit
 /// pas.
 ///
