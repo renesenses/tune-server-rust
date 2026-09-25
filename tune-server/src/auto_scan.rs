@@ -54,16 +54,16 @@ pub fn build_track_from_metadata_opts(
 ) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
-    // C1 — le tag fait foi, la forme sert de repli. Même règle que
-    // `scan_import::TrackImporter::import` ; cette voie-ci est celle du
-    // surveillant de fichiers.
+    // LA règle (`tune_core::library::regle_compilation`), sur ce seul
+    // fichier quand l'appelant n'a pas la vue du dossier : la balise
+    // `COMPILATION=1` seule ne suffit plus.
     let is_compilation = compilation_override.unwrap_or_else(|| {
-        meta.compilation.unwrap_or_else(|| {
-            meta.album_artist
-                .as_deref()
-                .map(crate::scan_import::is_various_artists)
-                .unwrap_or(false)
-        })
+        let mut seul = tune_core::library::regle_compilation::IndicesCompilation::new();
+        if !meta.artist_from_path {
+            seul.ajouter_piste(meta.album_artist.as_deref(), meta.artist.as_deref());
+        }
+        seul.balise(meta.compilation);
+        seul.juger().compilation
     });
 
     let album_artist_name = if is_compilation {
@@ -1803,7 +1803,10 @@ pub fn spawn_file_watcher(
                                         let dir = std::path::Path::new(&sf.path).parent()?;
                                         // Le TAG, en trois etats (C1).
                                         let tag = meta.compilation;
-                                        let mut va_tague = false;
+                                        // LA regle (25/09/2026), sur la vue du
+                                        // dossier que la base reconstruit.
+                                        let mut indices = tune_core::library::regle_compilation::IndicesCompilation::new();
+                                        indices.balise(tag);
                                         let mut artists: std::collections::HashSet<String> =
                                             std::collections::HashSet::new();
                                         // La casse d'origine du premier artiste
@@ -1814,9 +1817,6 @@ pub fn spawn_file_watcher(
                                             if let Some(a) =
                                                 aa.map(str::trim).filter(|s| !s.is_empty())
                                             {
-                                                if crate::scan_import::is_various_artists(a) {
-                                                    va_tague = true;
-                                                }
                                                 if artists.insert(a.to_lowercase())
                                                     && premier.is_none()
                                                 {
@@ -1828,25 +1828,26 @@ pub fn spawn_file_watcher(
                                         // une balise : il ne compte pas.
                                         if !meta.artist_from_path {
                                             note(meta.album_artist.as_deref());
+                                            indices.ajouter_piste(
+                                                meta.album_artist.as_deref(),
+                                                meta.artist.as_deref(),
+                                            );
                                         }
                                         let siblings = track_repo
                                             .siblings_album_artists(&dir.to_string_lossy())
                                             .ok()?;
-                                        for (fp, aa) in &siblings {
+                                        for (fp, aa, artiste) in &siblings {
                                             // Direct children only (exclude
                                             // sub-folders sharing the prefix).
                                             if std::path::Path::new(fp).parent() != Some(dir) {
                                                 continue;
                                             }
                                             note(aa.as_deref());
+                                            indices.ajouter_piste(aa.as_deref(), artiste.as_deref());
                                         }
                                         let unique =
                                             if artists.len() == 1 { premier } else { None };
-                                        // C1 : le tag tranche s'il existe ; sinon la forme.
-                                        Some((
-                                            Some(tag.unwrap_or(va_tague || artists.len() >= 2)),
-                                            unique,
-                                        ))
+                                        Some((Some(indices.juger().compilation), unique))
                                     })
                                     .unwrap_or((None, None));
                                 let Some((track, album_id)) = build_track_from_metadata_opts(

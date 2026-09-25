@@ -549,10 +549,10 @@ pub struct DisqueAClasser {
 }
 
 /// Vrai pour un nom d'artiste d'album qui désigne une compilation. Même
-/// vocabulaire que `scan_import::is_various_artists` côté serveur.
+/// vocabulaire que `scan_import::is_various_artists` côté serveur : celui de
+/// LA règle ([`crate::library::regle_compilation::est_artistes_divers`]).
 pub fn est_artistes_divers(nom: &str) -> bool {
-    let l = nom.trim().to_lowercase();
-    l == "various artists" || l == "various" || l == "va" || l == "compilations"
+    crate::library::regle_compilation::est_artistes_divers(nom)
 }
 
 /// Les deux sections, à partir des crédits de l'artiste sur les disques
