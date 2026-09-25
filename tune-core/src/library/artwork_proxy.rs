@@ -315,6 +315,46 @@ pub fn pochette_de_bibliotheque(backend: &Arc<dyn DbBackend>, url: &str) -> bool
         .is_some()
 }
 
+/// L'hôte et le port d'une URL qui est EXACTEMENT la route de pochette d'un
+/// serveur Tune — `http(s)://<hôte>:<port>/api/v1/library/artwork/<condensat>`,
+/// sans requête, sans fragment, sans identifiants — ou `None`.
+///
+/// ## #4954 — les pochettes d'un serveur Tune vu dans « Serveurs multimédia »
+///
+/// Le client web lit le catalogue d'un serveur Tune découvert par son API REST
+/// et bâtit, pour chaque album, cette adresse sur l'IP de réseau local du
+/// serveur (`tuneRemote.ts::pochetteDistante`). En 0.9.163, il l'envoyait à ce
+/// relais, qui refuse l'adresse privée : toutes les tuiles grises, le serveur
+/// Tune lui-même compris (Jean Valjean, 2 809 albums).
+///
+/// Le relais ne l'admet que si l'hôte:port est AUSSI un serveur multimédia
+/// découvert (registre SSDP, vérifié par l'appelant). Le chemin est figé, et le
+/// condensat a la forme de `albums.cover_path` (32 ou 64 hexadécimaux) : ni
+/// l'API du serveur visé, ni sa route de relais, ni une autre ressource.
+pub fn pochette_d_un_serveur_tune(url: &str) -> Option<(String, u16)> {
+    let u = reqwest::Url::parse(url).ok()?;
+    if !matches!(u.scheme(), "http" | "https")
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
+        return None;
+    }
+    let condensat = u.path().strip_prefix("/api/v1/library/artwork/")?;
+    let condensat_valide =
+        matches!(condensat.len(), 32 | 64) && condensat.bytes().all(|b| b.is_ascii_hexdigit());
+    if !condensat_valide {
+        return None;
+    }
+    let hote = u
+        .host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    Some((hote, u.port_or_known_default()?))
+}
+
 // ---------------------------------------------------------------------------
 // Résolution DNS gardée
 // ---------------------------------------------------------------------------
