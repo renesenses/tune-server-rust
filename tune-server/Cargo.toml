@@ -341,6 +341,13 @@ required-features = ["postgres"]
 name = "dossier_cue_4625"
 path = "tests/dossier_cue_4625.rs"
 
+# GROUP BY lache de l historique (chasse PG du 25/09/2026) : top-tracks et
+# « Ce jour-la » toujours vides sur PostgreSQL. Pas de `required-features` : la
+# contre-epreuve SQLite tourne dans la suite ordinaire.
+[[test]]
+name = "pg_group_by_strict_historique"
+path = "tests/pg_group_by_strict_historique.rs"
+
 # Depuis #3039, la fenetre des ajouts recents est un parametre borne.
 [[test]]
 name = "ajouts_recents_fenetre"
