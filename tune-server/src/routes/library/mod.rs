@@ -37,6 +37,7 @@ mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
+pub(crate) mod compositeur_depuis_credits;
 pub(crate) mod graver_compilation;
 pub(crate) mod graver_dr;
 pub(crate) mod reparer_compilations;
@@ -505,6 +506,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
+        )
+        // 25/09/2026 — le compositeur des CRÉDITS descend dans la colonne ET
+        // dans la balise du fichier. La balise est indispensable : `update_batch`
+        // reconstruit `tracks.composer` à partir du fichier seul dès qu'un scan
+        // complet est armé, et défairait sinon chaque correction.
+        .route(
+            "/composer-from-credits",
+            get(compositeur_depuis_credits::statut).post(compositeur_depuis_credits::lancer),
         )
         // Phase 4 du chantier « tag compilation » : réparer l'existant (C3).
         .route(
