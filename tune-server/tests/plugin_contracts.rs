@@ -72,6 +72,8 @@ fn use_scratch_plugin_data_dir() {
     });
 }
 
+#[path = "circle_plugin.rs"]
+mod circle_plugin;
 #[path = "concerts_plugin.rs"]
 mod concerts_plugin;
 #[path = "dj_plugin.rs"]
