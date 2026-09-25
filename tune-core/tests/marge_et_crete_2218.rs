@@ -1320,12 +1320,7 @@ fn reserve_publiee_separe_dix_bandes_qui_poussent_de_dix_qui_creusent() {
         31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
     ];
 
-    let poussent = profil(
-        freqs
-            .iter()
-            .map(|f| bande("peaking", *f, 6.0, 1.0))
-            .collect(),
-    );
+    let poussent = profil(freqs.iter().map(|f| bande("peak", *f, 6.0, 1.0)).collect());
     let reserve_poussent = poussent.automatic_headroom_db(0);
     assert!(
         reserve_poussent <= -20.0,
@@ -1340,12 +1335,7 @@ fn reserve_publiee_separe_dix_bandes_qui_poussent_de_dix_qui_creusent() {
     // 🔴 La contre-épreuve : un profil qui ne fait que creuser ne réserve RIEN.
     // Si le testeur renvoie `reserve_eq_db_g` proche de zéro, l'hypothèse du
     // préampli tombe et il faut chercher ailleurs.
-    let creusent = profil(
-        freqs
-            .iter()
-            .map(|f| bande("peaking", *f, -6.0, 1.0))
-            .collect(),
-    );
+    let creusent = profil(freqs.iter().map(|f| bande("peak", *f, -6.0, 1.0)).collect());
     let reserve_creusent = creusent.automatic_headroom_db(0);
     assert!(
         reserve_creusent.abs() < 1e-9,
