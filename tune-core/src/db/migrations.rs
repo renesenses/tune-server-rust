@@ -2731,6 +2731,34 @@ fn upgrade_fts5_tables(db: &SqliteDb) {
     }
 }
 
+/// #4836 (suite) — le label des pistes remonte sur leur album à CHAQUE
+/// démarrage, hors migration numérotée.
+///
+/// v0.9.164 ne jouait cette remontée qu'en fin de scan manuel : ni la mise à
+/// jour, ni le démarrage, ni le surveillant ne la déclenchaient, et une base
+/// déjà scannée gardait 0 album étiqueté alors que ses pistes l'étaient (le
+/// .18 : 2 641 pistes étiquetées, 257 albums à combler, 0 album avec un
+/// label). Comblement seul : un label d'album déjà posé n'est jamais écrasé ;
+/// un second passage ne touche aucune ligne.
+///
+/// Pas de numéro : le lanceur ne joue que `version > MAX` et le registre est
+/// réservé ailleurs ; une passe idempotente n'a de toute façon pas besoin
+/// d'être mémorisée. Un échec est journalisé, jamais bloquant.
+fn combler_les_labels_d_album_sqlite(db: &SqliteDb) {
+    let debut = std::time::Instant::now();
+    match db.execute(
+        &crate::db::album_repo::sql_combler_les_labels_d_album(),
+        &[],
+    ) {
+        Ok(albums) => info!(
+            albums,
+            ms = debut.elapsed().as_millis() as u64,
+            "albums_labels_repris_des_pistes"
+        ),
+        Err(e) => warn!(error = %e, "albums_labels_repris_des_pistes_failed"),
+    }
+}
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -3376,6 +3404,8 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
     // on DBs that skipped the numbered unified-queue migration.
     migrate_to_unified_queue(db);
+
+    combler_les_labels_d_album_sqlite(db);
 
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
@@ -4123,6 +4153,24 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     .execute(pool)
     .await
     .map_err(|e| format!("pg upnp revision: {e}"))?;
+
+    // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
+    // rejouée à chaque démarrage, sans numéro de migration.
+    let debut_labels = std::time::Instant::now();
+    match sqlx::query(sqlx::AssertSqlSafe(
+        // Fragments constants seulement : aucune donnée n'entre dans ce texte.
+        crate::db::album_repo::sql_combler_les_labels_d_album(),
+    ))
+    .execute(pool)
+    .await
+    {
+        Ok(r) => info!(
+            albums = r.rows_affected(),
+            ms = debut_labels.elapsed().as_millis() as u64,
+            "pg_albums_labels_repris_des_pistes"
+        ),
+        Err(e) => warn!(error = %e, "pg_albums_labels_repris_des_pistes_failed"),
+    }
 
     // Run ANALYZE on key tables for the query planner.
     sqlx::raw_sql("ANALYZE artists; ANALYZE albums; ANALYZE tracks;")

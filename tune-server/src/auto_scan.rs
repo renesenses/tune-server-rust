@@ -1582,6 +1582,29 @@ pub(crate) fn verdict_suppression_surveillant(
 
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
 /// a personne. Voir l'emission de `library.updated` en fin de lot.
+/// Le surveillant range UNE piste lue sur le disque, PUIS remonte sur son
+/// album ce qui s'en déduit (nombre de pistes, qualité, genre, label).
+///
+/// L'ordre est la correction (#4836, suite) : la remontée précédait
+/// l'insertion, si bien qu'elle ne voyait pas la piste qu'on venait de lire.
+/// Le premier fichier d'un album neuf n'y portait jamais son label, et un
+/// fichier modifié (supprimé puis réinséré) le retirait du vote. Le scan de
+/// démarrage et le scan manuel, eux, remontent APRÈS avoir écrit leurs
+/// pistes : les trois chemins suivent désormais le même ordre.
+pub(crate) fn ranger_la_piste_du_surveillant(
+    track_repo: &TrackRepo,
+    album_repo: &AlbumRepo,
+    track: &Track,
+    album_id: Option<i64>,
+) -> bool {
+    let rangee = track_repo.create(track).is_ok();
+    if let Some(aid) = album_id {
+        album_repo.update_track_count(aid).ok();
+        album_repo.update_quality_from_tracks(aid).ok();
+    }
+    rangee
+}
+
 pub fn spawn_file_watcher(
     db: Arc<dyn DbBackend>,
     wait_for_scan: Option<Arc<AtomicBool>>,
@@ -1902,11 +1925,14 @@ pub fn spawn_file_watcher(
                                     ) {
                                         album_repo.update_cover_path(aid, &hash).ok();
                                     }
-                                    album_repo.update_track_count(aid).ok();
-                                    album_repo.update_quality_from_tracks(aid).ok();
                                 }
 
-                                if track_repo.create(&track).is_ok() {
+                                if ranger_la_piste_du_surveillant(
+                                    &track_repo,
+                                    &album_repo,
+                                    &track,
+                                    album_id,
+                                ) {
                                     info!(path = %sf.path, "watcher_track_added");
                                 }
                             }
