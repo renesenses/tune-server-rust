@@ -16,7 +16,7 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'podcast_subscriptions'
+        WHERE table_schema = current_schema() AND table_name = 'podcast_subscriptions'
           AND column_name = 'id'
           AND column_default IS NULL
     ) THEN

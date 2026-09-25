@@ -61,7 +61,7 @@ BEGIN
     FOREACH col IN ARRAY ARRAY['track_number', 'disc_number'] LOOP
       SELECT data_type INTO cur_type
         FROM information_schema.columns
-       WHERE table_name = 'queue_items' AND column_name = col;
+       WHERE table_schema = current_schema() AND table_name = 'queue_items' AND column_name = col;
 
       BEGIN
         IF cur_type IS NULL THEN
@@ -101,7 +101,7 @@ BEGIN
   ELSE
     SELECT data_type, column_default INTO cur_type, col_def
       FROM information_schema.columns
-     WHERE table_name = 'streaming_favorites' AND column_name = 'id';
+     WHERE table_schema = current_schema() AND table_name = 'streaming_favorites' AND column_name = 'id';
 
     -- Colonne non textuelle (BIGINT depuis 012) dont le DEFAULT manque ou est
     -- resté en `::text` : on lui rend une séquence entière, calée après MAX(id).

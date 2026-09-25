@@ -32,7 +32,7 @@ DECLARE
 BEGIN
   SELECT data_type INTO cur_type
     FROM information_schema.columns
-   WHERE table_name = 'albums' AND column_name = 'is_compilation';
+   WHERE table_schema = current_schema() AND table_name = 'albums' AND column_name = 'is_compilation';
 
   -- On ne touche QUE la colonne encore en texte : no-op sur un schéma déjà
   -- conforme (installation neuve). Une valeur qui n'est pas un entier

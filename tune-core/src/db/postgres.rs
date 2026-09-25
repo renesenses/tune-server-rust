@@ -77,7 +77,7 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // forcing the `::text` flavour is both wrong and fatal (#1706).
     "DO $ensure$ BEGIN \
             IF EXISTS (SELECT 1 FROM information_schema.columns \
-                        WHERE table_name = 'streaming_favorites' AND column_name = 'id' \
+                        WHERE table_schema = current_schema() AND table_name = 'streaming_favorites' AND column_name = 'id' \
                           AND data_type IN ('text', 'character varying')) THEN \
                 ALTER TABLE streaming_favorites \
                     ALTER COLUMN id SET DEFAULT nextval('streaming_favorites_id_seq')::text; \
@@ -400,6 +400,10 @@ mod tests {
             .expect("streaming_favorites id DEFAULT statement missing");
         assert!(stmt.starts_with("DO $"), "unguarded ALTER: {stmt}");
         assert!(stmt.contains("information_schema.columns"), "{stmt}");
+        assert!(
+            stmt.contains("table_schema = current_schema()"),
+            "#5003 : {stmt}"
+        );
         assert!(stmt.contains("'text', 'character varying'"), "{stmt}");
     }
 }

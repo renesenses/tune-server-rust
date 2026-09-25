@@ -61,7 +61,7 @@ BEGIN
     LOOP
         IF EXISTS (
             SELECT 1 FROM information_schema.columns
-             WHERE table_name = t
+             WHERE table_schema = current_schema() AND table_name = t
                AND column_name = c
                AND data_type IN ('text', 'character varying')
         ) THEN

@@ -1084,14 +1084,14 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
 /// mirrors migration 013). No Rust write path can produce '' — the model
 /// field is `Option<f64>` and binds natively — so once converted the column
 /// stays clean.
-const PG_NORMALIZE_FILE_MTIME: &str = r#"
+pub(crate) const PG_NORMALIZE_FILE_MTIME: &str = r#"
 DO $$
 DECLARE
     cur_type TEXT;
 BEGIN
     SELECT data_type INTO cur_type
       FROM information_schema.columns
-     WHERE table_name = 'tracks' AND column_name = 'file_mtime';
+     WHERE table_schema = current_schema() AND table_name = 'tracks' AND column_name = 'file_mtime';
     IF cur_type IN ('text', 'character varying') THEN
         UPDATE tracks SET file_mtime = NULL WHERE file_mtime = '';
         ALTER TABLE tracks ALTER COLUMN file_mtime TYPE DOUBLE PRECISION

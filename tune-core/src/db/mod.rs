@@ -27,6 +27,8 @@ pub mod migrations;
 pub mod models;
 #[cfg(all(test, feature = "postgres"))]
 mod pg_ensure_schema_parity;
+#[cfg(all(test, feature = "postgres"))]
+mod pg_gardes_schema_5003;
 #[cfg(feature = "postgres")]
 pub mod pg_migrate;
 #[cfg(all(test, feature = "postgres"))]
