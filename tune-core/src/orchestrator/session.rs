@@ -225,6 +225,38 @@ pub(super) const REPLAY_OUTPUT_SEEK_SETTLE_MS: u64 = 500;
 /// la réponse, il court dans une tâche détachée).
 pub(super) const RESUME_OUTPUT_SEEK_SETTLE_MS: u64 = 700;
 
+/// #5050 — écart toléré, après une REPRISE sur renderer DLNA/OpenHome, entre
+/// la position que l'appareil déclare et celle de la pause, en deçà duquel le
+/// `Seek` de rattrapage n'est PAS envoyé.
+///
+/// Le Seek existe pour les renderers qui repartent de zéro au Play d'après
+/// Pause (Cyrus Stream X, d01986a8). Sur ceux qui reprennent en place, il est
+/// superflu, et le Beosound Stage y répond par une transition pendant laquelle
+/// il refuse la Pause en 701 (FabienM, fil 1943).
+///
+/// Pourquoi 2 s :
+/// - un renderer qui reprend en place déclare la position de la pause plus
+///   les `RESUME_OUTPUT_SEEK_SETTLE_MS` écoulés (0,7 s), ou moins d'une
+///   seconde de moins (`RelTime`, le `Seconds` d'OpenHome, sont tronqués à la
+///   seconde) : environ 1 s d'écart au pire ;
+/// - un renderer reparti de zéro déclare au plus ~1 s, et le Seek de reprise
+///   n'est tenté qu'au-delà de 3 s de lecture : son écart dépasse toujours
+///   2 s.
+pub(super) const ECART_TOLERE_APRES_REPRISE_MS: u64 = 2_000;
+
+/// #5050 — faut-il envoyer le `Seek` de rattrapage après une reprise ?
+///
+/// `mesuree_ms` est la position lue CHEZ l'appareil
+/// ([`crate::outputs::OutputTarget::position_mesuree_ms`]). Sans mesure, la
+/// conduite d'avant : on envoie le Seek. On ne saute que lorsque l'appareil
+/// dit être à la position de la pause, à la tolérance près.
+pub(super) fn seek_de_reprise_necessaire(position_pausee_ms: u64, mesuree_ms: Option<u64>) -> bool {
+    match mesuree_ms {
+        None => true,
+        Some(m) => m.abs_diff(position_pausee_ms) > ECART_TOLERE_APRES_REPRISE_MS,
+    }
+}
+
 /// Le seek détaché n'a de sens que pour la lecture qui l'a demandé : entre le
 /// départ de la tâche et la fin de son temps de pose, un stop, un next ou une
 /// nouvelle lecture peuvent être passés — il seekerait alors la piste

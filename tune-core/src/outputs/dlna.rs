@@ -29,6 +29,10 @@ mod command_tests_4258;
 #[path = "dlna_contact_tests_4971.rs"]
 mod contact_tests_4971;
 
+#[cfg(test)]
+#[path = "dlna_pause_701_tests_5050.rs"]
+pub(crate) mod pause_701_tests_5050;
+
 /// Une faute SOAP reste un corps HTTP lisible. Les chemins Play avec reprise
 /// doivent pouvoir l'inspecter ; pause/resume, eux, doivent la rendre en erreur.
 fn faute_commande_soap(response: &str) -> bool {
@@ -1073,6 +1077,108 @@ impl DlnaOutput {
             .unwrap_or(0.5))
     }
 
+    /// #5050 — un 701 sur `Pause` nomme un état, comme sur `Play` (#2581) :
+    /// on le LIT au lieu de rendre le refus tel quel.
+    ///
+    /// FabienM (Beosound Stage, 0.9.165, fil 1943) : six Pause refusées en 701
+    /// « Transition not available », de 3 à 51 s après un `Seek` ; 16 ms après
+    /// le Seek de reprise, `GetTransportInfo` rendait `TRANSITIONING`. Un
+    /// renderer qui se repositionne passe par cet état, et le contrat UPnP lui
+    /// permet d'y refuser la pause. `pause()` renvoyait le 701 à l'interface au
+    /// premier refus, sans rien relire ni réessayer.
+    ///
+    /// Conduite, bornée par `budget` :
+    /// - `PAUSED_PLAYBACK` : la pause est déjà là, c'est un succès ;
+    /// - `TRANSITIONING` : relire l'état tous les `pas` jusqu'à ce qu'il en
+    ///   sorte, sans rien lui envoyer d'autre ;
+    /// - `PLAYING` : renvoyer `Pause` ;
+    /// - arrêté, sans média, ou état illisible : rien à attendre, le refus
+    ///   remonte comme avant — un renderer muet garde l'ancienne conduite.
+    ///
+    /// Le budget épuisé, le refus remonte en nommant l'état lu : l'interface
+    /// et le journal disent POURQUOI la pause n'a pas pris.
+    async fn pause_apres_refus_701(
+        &self,
+        refus: String,
+        budget: std::time::Duration,
+        pas: std::time::Duration,
+    ) -> Result<(), String> {
+        let debut = std::time::Instant::now();
+        let mut refus = refus;
+        let mut pauses_renvoyees = 0u32;
+        let mut etat_journalise: Option<Option<String>> = None;
+        loop {
+            let etat = self
+                .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                .await
+                .ok()
+                .and_then(|xml| extract_tag(&xml, "CurrentTransportState"));
+            let conduite = conduite_apres_refus_pause(etat.as_deref());
+            let attente_ms = debut.elapsed().as_millis() as u64;
+            // Une ligne par état DIFFÉRENT : une transition de 5 s lue tous
+            // les 250 ms ne doit pas écrire vingt fois la même chose.
+            if etat_journalise.as_ref() != Some(&etat) {
+                info!(
+                    device = %self.name,
+                    etat = etat.as_deref().unwrap_or("-"),
+                    conduite = ?conduite,
+                    attente_ms,
+                    pauses_renvoyees,
+                    "dlna_pause_701_transport_lu"
+                );
+                etat_journalise = Some(etat.clone());
+            }
+            let budget_epuise = debut.elapsed() >= budget;
+            match conduite {
+                ConduiteApresRefusPause::DejaEnPause => return Ok(()),
+                ConduiteApresRefusPause::Abandonner => {}
+                _ if budget_epuise => {}
+                ConduiteApresRefusPause::Attendre => {
+                    tokio::time::sleep(pas).await;
+                    continue;
+                }
+                ConduiteApresRefusPause::RenvoyerPause => {
+                    tokio::time::sleep(pas).await;
+                    pauses_renvoyees += 1;
+                    let response = self
+                        .av_action("Pause", "<InstanceID>0</InstanceID>")
+                        .await?;
+                    if !faute_commande_soap(&response) {
+                        info!(
+                            device = %self.name,
+                            attente_ms = debut.elapsed().as_millis() as u64,
+                            pauses_renvoyees,
+                            "dlna_pause_701_reprise_reussie"
+                        );
+                        return Ok(());
+                    }
+                    if !est_701(&response) {
+                        return acquitter_commande_soap("Pause", response);
+                    }
+                    refus = response;
+                    continue;
+                }
+            }
+            warn!(
+                device = %self.name,
+                etat = etat.as_deref().unwrap_or("-"),
+                attente_ms = debut.elapsed().as_millis() as u64,
+                pauses_renvoyees,
+                "dlna_pause_701_abandon"
+            );
+            let raison = acquitter_commande_soap("Pause", refus)
+                .err()
+                .unwrap_or_else(|| "Pause rejected".to_string());
+            return Err(match etat {
+                Some(e) => format!(
+                    "{raison} — transport du renderer : {e} après {} ms",
+                    debut.elapsed().as_millis()
+                ),
+                None => raison,
+            });
+        }
+    }
+
     /// L'état poussé contredit-il la position mesurée ?
     ///
     /// Un renderer peut accepter un abonnement et cesser d'émettre : l'état
@@ -1684,6 +1790,22 @@ impl OutputTarget for DlnaOutput {
         Some(&self.host)
     }
 
+    /// #5050 — un `GetPositionInfo` envoyé exprès, jamais l'ancre ni
+    /// l'extrapolation du mode silence : après une reprise, on veut savoir où
+    /// l'appareil EST, pas où Tune croit qu'il est. Un transport en échec, une
+    /// faute SOAP, un `RelTime` absent ou non numérique (`NOT_IMPLEMENTED`)
+    /// ne sont pas des mesures : `None`.
+    async fn position_mesuree_ms(&self) -> Option<u64> {
+        let reponse = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .ok()?;
+        if faute_commande_soap(&reponse) {
+            return None;
+        }
+        crate::upnp_renderer::parse_upnp_time(&extract_tag(&reponse, "RelTime")?)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         // Les abonnements de la piste précédente d'abord : sans ce retrait,
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
@@ -2165,6 +2287,11 @@ impl OutputTarget for DlnaOutput {
         let response = self
             .av_action("Pause", "<InstanceID>0</InstanceID>")
             .await?;
+        if faute_commande_soap(&response) && est_701(&response) {
+            return self
+                .pause_apres_refus_701(response, PAUSE_701_BUDGET, PAUSE_701_PAS)
+                .await;
+        }
         acquitter_commande_soap("Pause", response)
     }
 
@@ -3334,6 +3461,39 @@ fn est_701(reponse_play: &str) -> bool {
         || reponse_play
             .to_ascii_lowercase()
             .contains("transition not available")
+}
+
+/// Combien de temps `pause()` laisse à un renderer qui a refusé la pause en
+/// 701 pour sortir de sa transition (#5050). Du même ordre que le barème de
+/// `Play` (#2581) : l'appelant tient la sortie pendant ce temps, et
+/// l'utilisateur attend la réponse de son geste.
+const PAUSE_701_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Intervalle entre deux lectures de l'état pendant cette attente.
+const PAUSE_701_PAS: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Que faire d'une `Pause` refusée en 701, selon l'état que le transport
+/// déclare (`CurrentTransportState`) — #5050.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum ConduiteApresRefusPause {
+    /// Le renderer est déjà en pause : le geste a abouti.
+    DejaEnPause,
+    /// Il change d'état (repositionnement, chargement) : attendre qu'il en
+    /// sorte, sans rien lui envoyer.
+    Attendre,
+    /// Il joue : la transition PLAYING→PAUSED existe, redemander `Pause`.
+    RenvoyerPause,
+    /// Arrêté, sans média, ou muet : rien qu'une attente change, le refus
+    /// remonte tel quel.
+    Abandonner,
+}
+
+fn conduite_apres_refus_pause(etat_transport: Option<&str>) -> ConduiteApresRefusPause {
+    match etat_transport.map(|e| e.trim().to_ascii_uppercase()) {
+        Some(e) if e.starts_with("PAUSED") => ConduiteApresRefusPause::DejaEnPause,
+        Some(e) if e == "TRANSITIONING" => ConduiteApresRefusPause::Attendre,
+        Some(e) if e == "PLAYING" => ConduiteApresRefusPause::RenvoyerPause,
+        _ => ConduiteApresRefusPause::Abandonner,
+    }
 }
 
 /// Ce qu'il faut envoyer — ou ne pas envoyer — avant de redemander `Play`

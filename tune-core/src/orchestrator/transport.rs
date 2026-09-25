@@ -2113,6 +2113,9 @@ impl PlaybackOrchestrator {
             position_ms,
             std::time::Duration::from_millis(REPLAY_OUTPUT_SEEK_SETTLE_MS),
             "relecture",
+            // Flux NEUF : la session repart de l'octet 0, le renderer aussi —
+            // rien à mesurer, le Seek reste inconditionnel (#2893).
+            false,
         )
         .await;
     }
@@ -2122,6 +2125,11 @@ impl PlaybackOrchestrator {
     /// de pose (LAT-P2). La tâche capture la génération de lecture au départ
     /// et abandonne si un stop, un next ou une nouvelle lecture est intervenu
     /// pendant la pose — sinon elle seekerait la piste suivante.
+    ///
+    /// `seulement_si_decale` (#5050) : la tâche lit d'abord où l'appareil en
+    /// est ([`crate::outputs::OutputTarget::position_mesuree_ms`]) et n'envoie
+    /// le Seek que s'il n'est pas à `position_ms`, à
+    /// [`ECART_TOLERE_APRES_REPRISE_MS`] près. Position illisible : Seek.
     async fn detacher_le_seek_apres_reprise(
         &self,
         zone_id: i64,
@@ -2129,6 +2137,7 @@ impl PlaybackOrchestrator {
         position_ms: u64,
         pose: std::time::Duration,
         motif: &'static str,
+        seulement_si_decale: bool,
     ) {
         let seq_au_depart = self.playback.current_play_seq(zone_id).await;
         let outputs = self.outputs.clone();
@@ -2157,6 +2166,29 @@ impl PlaybackOrchestrator {
                 return;
             };
             let sortie = output.lock().await;
+            if seulement_si_decale {
+                let mesuree_ms = sortie.position_mesuree_ms().await;
+                if !seek_de_reprise_necessaire(position_ms, mesuree_ms) {
+                    // Beosound Stage, FabienM (fil 1943, #5050) : le Seek
+                    // superflu le faisait transiter, et la Pause suivante
+                    // tombait en 701. L'appareil est déjà en place : rien.
+                    info!(
+                        zone_id,
+                        position_ms,
+                        mesuree_ms = ?mesuree_ms,
+                        motif,
+                        "seek_apres_reprise_inutile_renderer_deja_en_place"
+                    );
+                    return;
+                }
+                info!(
+                    zone_id,
+                    position_ms,
+                    mesuree_ms = ?mesuree_ms,
+                    motif,
+                    "seek_apres_reprise_renderer_decale"
+                );
+            }
             match sortie.checked_seek(position_ms).await {
                 Ok(()) => {
                     info!(zone_id, position_ms, motif, "seek_apres_reprise_envoye");
@@ -2620,6 +2652,11 @@ impl PlaybackOrchestrator {
         // position once the renderer has had a moment to (re)start, so playback
         // continues instead of replaying from the top. Locks are released during
         // the wait so other zones aren't blocked.
+        //
+        // #5050 — ce Seek n'est plus envoyé qu'à un renderer qui n'est PAS à
+        // la position de la pause : la tâche la lui demande d'abord. Un
+        // renderer qui a repris en place (Beosound Stage) ne le reçoit plus,
+        // et ne refuse plus la Pause suivante en 701.
         if matches!(output_type.as_deref(), Some("dlna" | "openhome")) && position_ms > 3000 {
             let did = device_id.expect("output type only exists with a device id");
             self.detacher_le_seek_apres_reprise(
@@ -2628,6 +2665,8 @@ impl PlaybackOrchestrator {
                 position_ms,
                 std::time::Duration::from_millis(RESUME_OUTPUT_SEEK_SETTLE_MS),
                 "reprise",
+                // #5050 — seulement si l'appareil n'a pas repris en place.
+                true,
             )
             .await;
         }

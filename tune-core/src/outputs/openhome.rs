@@ -347,6 +347,19 @@ impl OutputTarget for OpenHomeOutput {
         "openhome"
     }
 
+    /// #5050 — même rôle que pour DLNA : l'action `Time` du service Time lue
+    /// à l'instant, en secondes entières. Pas de service Time, un échec ou un
+    /// `Seconds` illisible : `None`, et l'hôte envoie le Seek comme avant.
+    async fn position_mesuree_ms(&self) -> Option<u64> {
+        let url = self.svc_url("time")?;
+        let reponse = self.soap_call(url, SVC_TIME, "Time", &[]).await.ok()?;
+        extract_tag(&reponse, "Seconds")?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|s| s * 1000)
+    }
+
     fn capabilities(&self) -> OutputCapabilities {
         let transport = self.svc_url("transport").is_some() || self.svc_url("playlist").is_some();
         let volume = self.svc_url("volume").is_some();

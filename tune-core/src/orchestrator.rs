@@ -1647,6 +1647,11 @@ mod curseur_intact_4283;
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
 
+/// #5050 — le Seek d'après reprise DLNA/OpenHome n'est plus envoyé qu'à un
+/// renderer qui n'est pas à la position de la pause.
+#[cfg(test)]
+mod seek_de_reprise_conditionnel_5050;
+
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
 ///
