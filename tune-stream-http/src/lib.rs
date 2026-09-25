@@ -2042,11 +2042,16 @@ async fn send_with_reresolve(
 /// Bytes are streamed verbatim — no decoding or transformation — so the audio
 /// stays byte-exact. `abs_offset` is the absolute file offset of the first
 /// byte of `initial` (0 for a full fetch, N for a `bytes=N-` resume).
+/// `sauter` : octets de l'amont à NE PAS livrer en tête — le corps amont
+/// commence à `abs_offset`, le renderer veut `abs_offset + sauter`. Sert la
+/// petite reprise `bytes=N-` d'un Lavf (sous le seuil de transfert au CDN)
+/// avec un vrai 206 depuis N, sans rien demander de plus à l'amont.
 fn resumable_proxy_body(
     client: &'static reqwest::Client,
     upstream_url: String,
     initial: reqwest::Response,
     abs_offset: u64,
+    sauter: u64,
     reresolve: Option<ReresolveFn>,
     compteur: std::sync::Arc<StreamSession>,
 ) -> Body {
@@ -2057,6 +2062,7 @@ fn resumable_proxy_body(
         let mut url = upstream_url;
         // Absolute file offset of the next byte we expect to yield.
         let mut pos = abs_offset;
+        let mut a_sauter = sauter;
         let mut resumes: u32 = 0;
         loop {
             let mut stream = resp.bytes_stream();
@@ -2065,6 +2071,17 @@ fn resumable_proxy_body(
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         pos += chunk.len() as u64;
+                        if a_sauter > 0 {
+                            let n = chunk.len() as u64;
+                            if n <= a_sauter {
+                                a_sauter -= n;
+                                continue;
+                            }
+                            let garde = chunk.slice(a_sauter as usize..);
+                            a_sauter = 0;
+                            yield Ok::<_, std::io::Error>(garde);
+                            continue;
+                        }
                         yield Ok::<_, std::io::Error>(chunk);
                     }
                     Some(Err(e)) => {
@@ -2273,6 +2290,49 @@ async fn proxy_stream(
             upstream_url.to_string(),
             upstream_resp,
             start,
+            0,
+            reresolve.clone(),
+            session.clone(),
+        );
+        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
+
+    // Une petite reprise `bytes=N-` (0 < N < seuil) d'un renderer Lavf n'est
+    // PAS transmise au CDN — le seuil existe pour ne pas marteler Akamai avec
+    // les micro-Range de l'analyse d'en-tête FLAC. Mais y répondre par un 200
+    // depuis l'octet 0, comme avant, donne au renderer des octets d'en-tête
+    // là où il attend l'octet N : sur un `.dsf` relayé depuis un autre Tune,
+    // l'Eversolo DMP-A8 enchaîne `bytes=0-`, `bytes=<fin-187>-` (chunk ID3
+    // final), `bytes=28-` — et, trahi par la dernière, recommence les trois
+    // en boucle sans jamais jouer (.18, 23/09/2026, position 0 pendant 45 s).
+    // Une session de FICHIER répond 206 depuis N (`serve_file`) ; le
+    // mandataire fait de même en tirant l'amont depuis 0 et en SAUTANT N
+    // octets, sans rien demander de plus au CDN.
+    let saut_local = range_value
+        .as_deref()
+        .and_then(parse_range_start)
+        .filter(|&n| n > 0 && n < resume_threshold)
+        .filter(|_| !is_radio && upstream_resp.status() == reqwest::StatusCode::OK);
+    if let (Some(n), Some(cl)) = (saut_local, content_length)
+        && n < cl
+    {
+        headers.insert("Content-Length", HeaderValue::from(cl - n));
+        headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes {n}-{}/{}", cl - 1, cl)).unwrap(),
+        );
+        info!(
+            url = upstream_url,
+            start = n,
+            total = cl,
+            "proxy_206_par_saut_local"
+        );
+        let body = resumable_proxy_body(
+            client,
+            upstream_url.to_string(),
+            upstream_resp,
+            0,
+            n,
             reresolve.clone(),
             session.clone(),
         );
@@ -2321,6 +2381,7 @@ async fn proxy_stream(
             upstream_url.to_string(),
             upstream_resp,
             0,
+            0,
             reresolve.clone(),
             session.clone(),
         );
@@ -2335,6 +2396,7 @@ async fn proxy_stream(
         client,
         upstream_url.to_string(),
         upstream_resp,
+        0,
         0,
         reresolve.clone(),
         session.clone(),
@@ -5007,5 +5069,205 @@ mod reprise_714_sink_strict_de_bout_en_bout {
             vec![("audio/flac".to_string(), "audio/flac".to_string())],
             "un seul essai, au MIME de la session"
         );
+    }
+
+/// Le mandataire doit répondre aux reprises `Range` d'un renderer Lavf comme
+/// une session de FICHIER : un vrai 206 depuis N, `Content-Range` exact,
+/// `Content-Length` du reste — y compris pour une PETITE reprise sous le
+/// seuil de transfert au CDN, qui recevait un 200 depuis l'octet 0.
+///
+/// Mesuré sur le .18 le 23/09/2026 (Abacab, DSD64 relayé depuis le .15,
+/// Eversolo DMP-A8) : `bytes=0-`, `bytes=294338652-` (les 187 derniers
+/// octets, le chunk ID3), `bytes=28-` — puis les trois à nouveau, trois fois
+/// de suite, position 0 pendant 45 s. Ce témoin rejoue exactement ces trois
+/// sondes, dans cet ordre, et compare octet pour octet ce qui revient.
+#[cfg(test)]
+mod temoins_du_mandataire_dsf {
+    use axum::extract::{Path, State};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tune_core::http::streamer::{SharedSessions, StreamInfo, StreamSession};
+
+    const LAVF: &str = "Lavf/58.45.100";
+
+    /// Un « .dsf » de 4 096 octets : 28 octets de « DSD  », le reste
+    /// numéroté, 187 octets de « métadonnées » en fin. Le contenu n'a pas à
+    /// se décoder — c'est le TRANSPORT qu'on éprouve, octet pour octet.
+    fn corps() -> Vec<u8> {
+        (0..4096u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Un serveur média qui honore `Range: bytes=N-` par un 206 exact, et
+    /// sert le tout en 200 sinon — ce que fait la route audio de Tune.
+    async fn serveur_media(corps: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/v1/library/tracks/581978/audio",
+            listener.local_addr().unwrap()
+        );
+        let tache = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let corps = corps.clone();
+                tokio::spawn(async move {
+                    let mut requete = Vec::new();
+                    let mut octet = [0u8; 1];
+                    while !requete.ends_with(b"\r\n\r\n") && requete.len() < 16_384 {
+                        if socket.read_exact(&mut octet).await.is_err() {
+                            return;
+                        }
+                        requete.push(octet[0]);
+                    }
+                    let texte = String::from_utf8_lossy(&requete).to_string();
+                    let debut = texte
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("Range: bytes=")
+                                .or(l.strip_prefix("range: bytes="))
+                        })
+                        .and_then(|r| r.split('-').next()?.parse::<usize>().ok());
+                    let total = corps.len();
+                    let (statut, entetes, tranche) = match debut {
+                        Some(n) if n < total => (
+                            "206 Partial Content",
+                            format!(
+                                "Content-Range: bytes {n}-{}/{total}\r\nContent-Length: {}\r\n",
+                                total - 1,
+                                total - n
+                            ),
+                            &corps[n..],
+                        ),
+                        _ => ("200 OK", format!("Content-Length: {total}\r\n"), &corps[..]),
+                    };
+                    let entete = format!(
+                        "HTTP/1.1 {statut}\r\nContent-Type: application/x-dsd\r\nAccept-Ranges: bytes\r\n{entetes}Connection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(entete.as_bytes()).await;
+                    let _ = socket.write_all(tranche).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (url, tache)
+    }
+
+    async fn lire_tout(reponse: axum::response::Response) -> Vec<u8> {
+        let mut flux = reponse.into_body().into_data_stream();
+        let mut tout = Vec::new();
+        while let Some(bloc) = tokio::time::timeout(std::time::Duration::from_secs(10), flux.next())
+            .await
+            .expect("le corps doit arriver")
+        {
+            tout.extend_from_slice(&bloc.expect("bloc lisible"));
+        }
+        tout
+    }
+
+    #[tokio::test]
+    async fn les_trois_sondes_du_dmp_a8_recoivent_chacune_un_206_exact() {
+        let corps = corps();
+        let total = corps.len() as u64;
+        let (upstream, _serveur) = serveur_media(corps.clone()).await;
+
+        let sid = "dsf-mandataire";
+        let info = StreamInfo {
+            format: "dsf".into(),
+            mime_type: "application/x-dsd".into(),
+            sample_rate: 2_822_400,
+            bit_depth: 1,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let session = StreamSession::new(sid.to_string(), info, false, 128);
+        *session.proxy_url.lock().await = Some(upstream);
+        let session = Arc::new(session);
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session)].into_iter().collect(),
+        ));
+        let requete = |range: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("User-Agent", LAVF.parse().unwrap());
+            h.insert("Range", range.parse().unwrap());
+            h
+        };
+
+        // Les trois sondes, dans l'ordre du journal.
+        let fin_id3 = total - 187;
+        for (range, debut) in [
+            ("bytes=0-".to_string(), 0u64),
+            (format!("bytes={fin_id3}-"), fin_id3),
+            ("bytes=28-".to_string(), 28u64),
+        ] {
+            let rep = super::handle_stream(
+                Path(format!("{sid}.dsf")),
+                State(sessions.clone()),
+                requete(&range),
+            )
+            .await;
+            assert_eq!(
+                rep.status(),
+                axum::http::StatusCode::PARTIAL_CONTENT,
+                "{range} : une reprise reçoit un 206, comme sur une session de fichier"
+            );
+            let entetes = rep.headers().clone();
+            assert_eq!(
+                entetes.get("Content-Range").and_then(|v| v.to_str().ok()),
+                Some(format!("bytes {debut}-{}/{total}", total - 1).as_str()),
+                "{range} : le Content-Range doit partir de l'octet demandé"
+            );
+            assert_eq!(
+                entetes.get("Content-Length").and_then(|v| v.to_str().ok()),
+                Some((total - debut).to_string().as_str()),
+                "{range} : la longueur est celle du reste"
+            );
+            assert_eq!(
+                entetes.get("Content-Type").and_then(|v| v.to_str().ok()),
+                Some("application/x-dsd")
+            );
+            assert!(entetes.get("Accept-Ranges").is_some(), "{range}");
+            let octets = lire_tout(rep).await;
+            assert_eq!(
+                octets,
+                corps[debut as usize..].to_vec(),
+                "{range} : les octets livrés sont ceux du fichier à partir de {debut}"
+            );
+        }
+    }
+
+    /// Sous le seuil de transfert au CDN (1 Mio pour un Lavf), la reprise est
+    /// servie par un SAUT local : même contrat pour le renderer, aucun Range
+    /// de plus vers l'amont.
+    #[tokio::test]
+    async fn une_petite_reprise_sous_le_seuil_recoit_aussi_un_206_exact() {
+        let corps = corps();
+        let total = corps.len() as u64;
+        let (upstream, _serveur) = serveur_media(corps.clone()).await;
+        let sid = "dsf-mandataire-petit";
+        let info = StreamInfo {
+            format: "dsf".into(),
+            mime_type: "application/x-dsd".into(),
+            ..StreamInfo::default()
+        };
+        let session = StreamSession::new(sid.to_string(), info, false, 128);
+        *session.proxy_url.lock().await = Some(upstream);
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), Arc::new(session))].into_iter().collect(),
+        ));
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("User-Agent", LAVF.parse().unwrap());
+        h.insert("Range", "bytes=4000-".parse().unwrap());
+        let rep = super::handle_stream(Path(format!("{sid}.dsf")), State(sessions), h).await;
+        assert_eq!(rep.status(), axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            rep.headers()
+                .get("Content-Range")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("bytes 4000-{}/{total}", total - 1).as_str())
+        );
+        assert_eq!(lire_tout(rep).await, corps[4000..].to_vec());
     }
 }

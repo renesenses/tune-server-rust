@@ -3508,3 +3508,72 @@ fn la_reduction_due_au_choix_est_dite_comme_telle() {
         Some("6 \u{2192} 2 canaux (disposition choisie)")
     );
 }
+
+/// Une piste DSD de serveur média que la zone laisse partir BRUTE — servie
+/// par une session mandataire de Tune (`/stream/<id>.dsf`), donc avec un fil
+/// lisible. Le panneau ne doit annoncer AUCUN transcodage : c'est exactement
+/// le libellé impossible « DSD64 → FLAC 2822kHz/1bit » que #1315 a déjà
+/// coûté, et que l'absence de fil (URL distante remise telle quelle, avant
+/// correctif) faisait renaître avec son avertissement
+/// `signal_path_libelle_impossible_ecarte` en rafale (.18, 23/09/2026).
+#[test]
+fn un_dsd_de_serveur_media_servi_brut_par_tune_n_annonce_aucun_transcodage() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Abacab".into(),
+            source: "upnp".into(),
+            format: Some("dsd".into()),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            stream_id: Some("sid-dsf".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let fil = wire("dsf", 2_822_400, 1);
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DMP-A8"), "", Some(&fil)).unwrap();
+
+    assert_eq!(step_desc(&sp, "Source").as_deref(), Some("DSD64 2.8 MHz"));
+    assert!(
+        step_desc(&sp, "Transcoder").is_none(),
+        "le fil porte le .dsf brut : aucune étape de transcodage ne doit être inventée ({sp})"
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+}
+
+/// La même piste quand la zone demande du PCM : Tune la décime en WAV
+/// 176,4 kHz / 24 bits et c'est CE fil-là que le panneau décrit — pas une
+/// cible FLAC devinée, pas une résolution DSD sous un conteneur PCM.
+#[test]
+fn un_dsd_de_serveur_media_decime_par_tune_annonce_le_wav_reellement_servi() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Abacab".into(),
+            source: "upnp".into(),
+            format: Some("dsd".into()),
+            sample_rate: Some(2_822_400),
+            bit_depth: Some(1),
+            stream_id: Some("sid-wav".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let fil = wire("wav", 176_400, 24);
+
+    let sp = build_signal_path(&ps, &zone, &backend, Some("DMP-A8"), "", Some(&fil)).unwrap();
+
+    assert_eq!(
+        step_desc(&sp, "Transcoder").as_deref(),
+        Some("DSD64 2.8 MHz \u{2192} WAV 176kHz/24bit"),
+        "le panneau doit dire ce qui part réellement ({sp})"
+    );
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
+    assert_eq!(sp.get("lossless").and_then(Value::as_bool), Some(true));
+}

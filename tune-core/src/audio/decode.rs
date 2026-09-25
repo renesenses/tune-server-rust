@@ -3798,17 +3798,194 @@ fn decode_dsd_streaming(
     rt: &tokio::runtime::Handle,
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
-    use super::dsd_to_pcm::DsdToPcmStreamer;
-
-    // Parse header once, then create streamer + reader from the same info.
-    let (dsd_rate, channels) = if ext == "dsf" {
-        let info = super::dsf::parse_dsf(file_path)?;
-        (info.sample_rate, info.channels as usize)
-    } else {
-        let info = super::dff::parse_dff(file_path)?;
-        (info.sample_rate, info.channels as usize)
-    };
     let lsb_first = ext == "dsf";
+    if ext == "dsf" {
+        let info = super::dsf::parse_dsf(file_path)?;
+        let (dsd_rate, channels) = (info.sample_rate, info.channels as usize);
+        let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
+        if seek_s > 0.0 {
+            // Block-aligned seek so DSD playback resumes at the requested
+            // position instead of restarting at 0 (Xavier). bytes-per-channel =
+            // seek_s × dsd_rate / 8.
+            let target_bpc = (seek_s * dsd_rate as f64 / 8.0) as usize;
+            let reached = reader.seek_to_bytes_per_channel(target_bpc)?;
+            tracing::info!(
+                seek_s,
+                dsd_rate,
+                target_bpc,
+                reached_bpc = reached,
+                "dsd_streaming_seek_block_aligned"
+            );
+        }
+        return decoder_le_dsd_par_blocs(
+            file_path,
+            ext,
+            dsd_rate,
+            channels,
+            lsb_first,
+            target_sample_rate,
+            target_channels,
+            output_bd,
+            tx,
+            chunk_size,
+            first_chunk_sent,
+            data_ready,
+            levels_tx,
+            rt,
+            || reader.next_chunk(),
+        );
+    }
+    let info = super::dff::parse_dff(file_path)?;
+    let (dsd_rate, channels) = (info.sample_rate, info.channels as usize);
+    // Read in chunks aligned to channel count.
+    // 32768 bytes is a good balance: small enough for low memory, large
+    // enough to amortize I/O overhead.
+    let read_chunk = 32768 / channels * channels;
+    let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
+    if seek_s > 0.0 {
+        let target = (seek_s * dsd_rate as f64 / 8.0) as usize * channels;
+        let reached = reader.seek_to_interleaved_byte(target, channels)?;
+        tracing::info!(
+            seek_s,
+            dsd_rate,
+            target,
+            reached,
+            "dsd_streaming_seek_block_aligned"
+        );
+    }
+    decoder_le_dsd_par_blocs(
+        file_path,
+        ext,
+        dsd_rate,
+        channels,
+        lsb_first,
+        target_sample_rate,
+        target_channels,
+        output_bd,
+        tx,
+        chunk_size,
+        first_chunk_sent,
+        data_ready,
+        levels_tx,
+        rt,
+        || reader.next_chunk(),
+    )
+}
+
+/// Décode un DSF au fil de l'eau depuis un corps HTTP, en PCM vers le canal.
+///
+/// Même convertisseur, même lecteur de blocs et même découpe que le fichier
+/// local (`decoder_le_dsd_par_blocs`, par `DsfStreamReader::depuis_lecteur`) :
+/// l'en-tête (92 octets) est lu au début du corps, puis chaque bloc `data`
+/// est décodé à mesure qu'il arrive. Aucun fichier temporaire, aucune attente
+/// de la fin du téléchargement — un serveur média qui cadence sa route au
+/// débit nominal du flux (le .15, 5 minutes pour un DSD64) donne son premier
+/// son en quelques secondes. Le chunk de métadonnées (ID3), en FIN de
+/// fichier, n'est jamais nécessaire.
+///
+/// L'en-tête WAV part EN PREMIER dans le canal, avant le premier bloc décodé
+/// (même contrat que la branche DSD de `decode_to_pcm_streaming_inner`) : la
+/// session doit donc porter `wav_header_included`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_dsf_http_to_pcm_streaming(
+    url: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    output_bd: u16,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+) -> Result<(u16, u32), String> {
+    use std::io::Read;
+    let rt = tokio::runtime::Handle::try_current()
+        .map_err(|_| "no tokio runtime for streaming decode")?;
+    // Pas de délai TOTAL : le corps arrive au rythme du serveur amont, qui
+    // peut le cadencer au débit nominal du flux (plusieurs minutes).
+    let mut reponse = crate::http::client::blocking_builder()
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("dsf http client: {e}"))?
+        .get(url)
+        .send()
+        .map_err(|e| format!("dsf http fetch: {e}"))?;
+    if !reponse.status().is_success() {
+        return Err(format!("dsf http HTTP {}", reponse.status()));
+    }
+    let mut entete = [0u8; 92];
+    reponse
+        .read_exact(&mut entete)
+        .map_err(|e| format!("dsf http read header: {e}"))?;
+    let info = super::dsf::parse_dsf_from_bytes(&entete)?;
+    // `parse_dsf_from_bytes` pose `data_offset = 92` : le corps est
+    // exactement sur le premier bloc de `data`.
+    let (dsd_rate, channels) = (info.sample_rate, info.channels as usize);
+    let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
+    let output_ch = checked_channels(
+        target_channels.unwrap_or(channels as u32),
+        "DSD http stream target",
+    )?;
+
+    let wav_hdr = super::wav::build_wav_header(output_ch, output_rate, output_bd);
+    if rt.block_on(tx.send(wav_hdr.to_vec())).is_err() {
+        return Ok((output_bd, output_rate));
+    }
+    data_ready.notify_one();
+    debug!(
+        url,
+        dsd_rate,
+        output_rate,
+        output_bd,
+        channels = output_ch,
+        "streaming_decode_wav_header_sent_dsd_http"
+    );
+
+    let mut first_chunk_sent = true;
+    let mut reader = super::dsf::DsfStreamReader::depuis_lecteur(reponse, info);
+    decoder_le_dsd_par_blocs(
+        url,
+        "dsf",
+        dsd_rate,
+        channels,
+        true,
+        Some(output_rate),
+        Some(u32::from(output_ch)),
+        output_bd,
+        tx,
+        chunk_size,
+        &mut first_chunk_sent,
+        &Some(data_ready),
+        &Some(levels_tx),
+        &rt,
+        || reader.next_chunk(),
+    )
+}
+
+/// Le cœur du décodage DSD progressif, indépendant de la SOURCE des blocs :
+/// `prochain_bloc` rend les blocs DSD entrelacés par octet (fichier local par
+/// `DsfStreamReader`/`DffStreamReader`, corps HTTP par
+/// `DsfStreamReader::depuis_lecteur`). Convertisseur, adaptateur de canaux,
+/// découpe et niveaux sont écrits UNE fois.
+#[allow(clippy::too_many_arguments)]
+fn decoder_le_dsd_par_blocs(
+    source_name: &str,
+    ext: &str,
+    dsd_rate: u32,
+    channels: usize,
+    lsb_first: bool,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    output_bd: u16,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    first_chunk_sent: &mut bool,
+    data_ready: &Option<std::sync::Arc<tokio::sync::Notify>>,
+    levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
+    rt: &tokio::runtime::Handle,
+    mut prochain_bloc: impl FnMut() -> Result<Option<Vec<u8>>, String>,
+) -> Result<(u16, u32), String> {
+    use super::dsd_to_pcm::DsdToPcmStreamer;
 
     let output_rate = target_sample_rate.unwrap_or_else(|| choose_output_rate(dsd_rate));
     let mut streamer = DsdToPcmStreamer::new(dsd_rate, output_rate, channels, lsb_first);
@@ -3882,51 +4059,10 @@ fn decode_dsd_streaming(
             Ok(false)
         };
 
-    // Read and process DSD data in chunks
-    if ext == "dsf" {
-        let info = super::dsf::parse_dsf(file_path)?;
-        let mut reader = super::dsf::DsfStreamReader::open(file_path, info)?;
-        if seek_s > 0.0 {
-            // Block-aligned seek so DSD playback resumes at the requested
-            // position instead of restarting at 0 (Xavier). bytes-per-channel =
-            // seek_s × dsd_rate / 8.
-            let target_bpc = (seek_s * dsd_rate as f64 / 8.0) as usize;
-            let reached = reader.seek_to_bytes_per_channel(target_bpc)?;
-            tracing::info!(
-                seek_s,
-                dsd_rate,
-                target_bpc,
-                reached_bpc = reached,
-                "dsd_streaming_seek_block_aligned"
-            );
-        }
-        while let Some(dsd_chunk) = reader.next_chunk()? {
-            if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
-                return Ok((output_bd, output_rate));
-            }
-        }
-    } else {
-        let info = super::dff::parse_dff(file_path)?;
-        // Read in chunks aligned to channel count.
-        // 32768 bytes is a good balance: small enough for low memory, large
-        // enough to amortize I/O overhead.
-        let read_chunk = 32768 / channels * channels;
-        let mut reader = super::dff::DffStreamReader::open(file_path, &info, read_chunk)?;
-        if seek_s > 0.0 {
-            let target = (seek_s * dsd_rate as f64 / 8.0) as usize * channels;
-            let reached = reader.seek_to_interleaved_byte(target, channels)?;
-            tracing::info!(
-                seek_s,
-                dsd_rate,
-                target,
-                reached,
-                "dsd_streaming_seek_block_aligned"
-            );
-        }
-        while let Some(dsd_chunk) = reader.next_chunk()? {
-            if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
-                return Ok((output_bd, output_rate));
-            }
+    // Read and process DSD data in chunks, whatever the source.
+    while let Some(dsd_chunk) = prochain_bloc()? {
+        if process_dsd_chunk(&mut streamer, &dsd_chunk)? {
+            return Ok((output_bd, output_rate));
         }
     }
 
@@ -3982,7 +4118,7 @@ fn decode_dsd_streaming(
     let duration_s = total_frames / output_rate as f64;
 
     debug!(
-        file = file_path,
+        file = source_name,
         ext,
         dsd_rate,
         output_rate,
