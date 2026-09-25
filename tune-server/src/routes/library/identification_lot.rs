@@ -72,26 +72,53 @@
 //!
 //! # 🔴 Le disjoncteur : pourquoi une passe de lot ne peut pas se taire
 //!
-//! `lookup_release_candidates` rend `Vec::new()` **aussi bien** quand
-//! MusicBrainz n'a rien que lorsqu'il a refusé la requête (503, coupure,
-//! délai dépassé) : le `None` de `mb_get` est avalé par un `else { return
-//! Vec::new() }`. Sur un album à la main, l'utilisateur relance et voit bien
-//! que ça ne marche pas. Sur **3 909 albums**, une panne MusicBrainz produirait
-//! une passe de 2 h 23 parfaitement verte qui conclurait « aucun pressage
-//! trouvé » pour la bibliothèque entière — un repli silencieux, et le
-//! testeur en tirerait que sa musique n'est pas identifiable.
+//! Sur **3 909 albums**, une panne MusicBrainz produirait une passe de trois
+//! heures parfaitement verte qui conclurait « aucun pressage trouvé » pour la
+//! bibliothèque entière — un repli silencieux, et le testeur en tirerait que
+//! sa musique n'est pas identifiable. Sur un album à la main, l'utilisateur
+//! relance et voit bien que ça ne marche pas ; sur un lot, personne ne regarde.
 //!
 //! D'où [`ECHECS_CONSECUTIFS_MAX`] : la passe **s'arrête et le dit**. Le seuil
 //! n'est pas choisi au doigt mouillé, il se calcule sur le taux mesuré au §4 de
-//! l'issue — 33 % d'échecs sur un service en bonne santé, donc `0,33¹²` ≈
-//! 2 · 10⁻⁶ pour douze de suite. Douze échecs consécutifs ne sont pas une
-//! bibliothèque exotique, c'est une panne.
+//! l'issue #4805 — 33 % d'échecs sur un service en bonne santé, donc `0,33¹²` ≈
+//! 2 · 10⁻⁶ pour douze de suite.
 //!
-//! La vraie correction — distinguer en amont « MusicBrainz a refusé » de
-//! « MusicBrainz n'a rien » — appartient à `musicbrainz_release.rs`, le fichier
-//! que modifie la PR #4812. Elle est laissée à une PR suivante pour ne pas
-//! faire collisionner deux lots sur le même fichier ; c'est écrit tel quel dans
-//! la PR.
+//! ## Ce que ce calcul supposait, et qui était faux (#4991)
+//!
+//! Il suppose les échecs **indépendants**. Ils ne le sont pas : la sélection
+//! est `ORDER BY al.id`, donc les albums arrivent groupés par dossier, par
+//! source et par genre. Mesuré le 25/09/2026 sur le .18, trois lancements de
+//! suite : 115 / 16 / **12 traités**, le troisième avec **zéro identifié**. La
+//! tête de file était devenue un amas de musique classique — le titre y est
+//! descriptif et l'« artiste » est l'interprète, le compositeur n'étant nulle
+//! part dans la requête — que la passe ne pouvait structurellement pas
+//! apparier. Douze absences d'affilée, un arrêt annoncé
+//! « MusicBrainz injoignable », et MusicBrainz qui répondait `200` en 0,15 s.
+//! Et comme un album introuvable ne reçoit pas de `musicbrainz_release_id`, il
+//! reste en tête de file : la reprise réattaquait **exactement** l'amas qui
+//! venait de faire sauter le disjoncteur. 3 823 albums sur 3 909 étaient
+//! derrière ces douze-là.
+//!
+//! ## Le critère, corrigé
+//!
+//! Le disjoncteur ne disparaît pas — sa raison d'être reste entière — et ni son
+//! seuil ni son message ne changent. C'est son **critère** qui change : il
+//! s'arme sur les **refus** (`503`, coupure, délai dépassé) et non sur les
+//! **absences**. Un album introuvable est un résultat, pas une panne.
+//!
+//! La distinction vient de `musicbrainz_release.rs`, qui rend désormais une
+//! `RechercheDePressages` portant son
+//! `tune_core::metadata::musicbrainz_release::RefusMusicBrainz` éventuel ; elle
+//! traverse [`super::reidentify::Identification::refus_musicbrainz`] et se lit
+//! ici dans [`effet_sur_le_disjoncteur`]. Le contrat de
+//! `POST /library/albums/{id}/reidentify` ne bouge pas : un refus y reste un
+//! `not_found`, comme avant.
+//!
+//! Reste ce que cette PR ne fait **pas** : même sans arrêt, un album introuvable
+//! le restera au lancement suivant et sera ré-interrogé. Éviter cette
+//! re-interrogation demande une marque « déjà tenté, rien trouvé », donc une
+//! migration — c'est une économie (~20 min par relance), pas un déblocage, et
+//! elle fait l'objet d'une PR distincte (#4991, point (b)).
 
 use axum::Json;
 use axum::extract::State;
@@ -114,9 +141,82 @@ use crate::state::AppState;
 /// en est.
 const CLE_ETAT: &str = "identification_lot_status";
 
-/// Combien d'albums d'affilée peuvent ne rien trouver avant que la passe
-/// conclue à une panne et s'arrête. Voir l'en-tête du module pour l'arithmétique.
+/// Combien de **refus** de MusicBrainz d'affilée avant que la passe conclue à
+/// une panne et s'arrête. Voir l'en-tête du module pour l'arithmétique — et
+/// pour la raison, mesurée, qui fait que seuls les refus comptent (#4991).
 const ECHECS_CONSECUTIFS_MAX: u32 = 12;
+
+/// Le motif écrit dans l'état quand le disjoncteur saute. Une constante, pour
+/// que le témoin et la route ne puissent pas dériver l'un de l'autre.
+const RAISON_MUSICBRAINZ_INJOIGNABLE: &str = "musicbrainz_injoignable";
+
+/// Ce qu'un album fait au compteur du disjoncteur (#4991).
+///
+/// Trois cas, et non deux : « MusicBrainz n'a pas été interrogé » n'est ni un
+/// refus ni une réponse. Le confondre avec l'un des deux ferait mentir le
+/// compteur dans un sens ou dans l'autre.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffetSurLeDisjoncteur {
+    /// MusicBrainz a répondu — qu'il ait ou non le pressage. Le compteur repart
+    /// de zéro : une panne se juge sur une suite **ininterrompue** de refus.
+    Remise,
+    /// MusicBrainz n'a pas répondu. Un refus de plus.
+    Refus,
+    /// MusicBrainz n'a pas été interrogé (album disparu entre la sélection et
+    /// son tour, panne SQL, album sans piste). Le compteur ne bouge ni dans un
+    /// sens ni dans l'autre : cet album n'apprend rien sur la santé du service.
+    Inchange,
+}
+
+/// 🔴 Le critère du disjoncteur, sorti de la boucle pour être **prouvable**.
+///
+/// C'est ici que se joue #4991, et c'est la seule expression que la boucle
+/// utilise pour décider : un témoin qui couvre cette fonction couvre la
+/// décision de la passe.
+pub(super) fn effet_sur_le_disjoncteur(
+    verdict: &str,
+    refus_musicbrainz: bool,
+) -> EffetSurLeDisjoncteur {
+    if refus_musicbrainz {
+        return EffetSurLeDisjoncteur::Refus;
+    }
+    match verdict {
+        // Un album sans piste ne part même pas vers MusicBrainz.
+        "no_tracks" => EffetSurLeDisjoncteur::Inchange,
+        // 🔴 `not_found` COMPRIS. MusicBrainz a répondu « je n'ai pas ce
+        //    pressage » : c'est un RÉSULTAT. Le compter comme une panne est
+        //    exactement le défaut mesuré le 25/09/2026 — douze albums de
+        //    musique classique contigus par identifiant arrêtaient la passe
+        //    pour de bon, et sa reprise repartait sur le même amas.
+        _ => EffetSurLeDisjoncteur::Remise,
+    }
+}
+
+/// Le disjoncteur : il ne compte **que** les refus consécutifs.
+#[derive(Debug, Default)]
+pub(super) struct Disjoncteur {
+    refus_consecutifs: u32,
+}
+
+impl Disjoncteur {
+    fn enregistrer(&mut self, effet: EffetSurLeDisjoncteur) {
+        match effet {
+            EffetSurLeDisjoncteur::Refus => self.refus_consecutifs += 1,
+            EffetSurLeDisjoncteur::Remise => self.refus_consecutifs = 0,
+            EffetSurLeDisjoncteur::Inchange => {}
+        }
+    }
+
+    /// `true` quand la suite de refus atteint le seuil : la passe s'arrête et
+    /// le dit.
+    fn a_saute(&self) -> bool {
+        self.refus_consecutifs >= ECHECS_CONSECUTIFS_MAX
+    }
+
+    fn refus_consecutifs(&self) -> u32 {
+        self.refus_consecutifs
+    }
+}
 
 /// Tous les combien on réécrit l'avancement en base. À ~2,8 s par album, dix
 /// albums font une écriture toutes les trente secondes — assez pour une barre
@@ -375,7 +475,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
     let mut identifies = 0usize;
     let mut sans_correspondance = 0usize;
     let mut pistes = 0usize;
-    let mut echecs_consecutifs = 0u32;
+    let mut disjoncteur = Disjoncteur::default();
 
     for (rang, album_id) in albums.into_iter().enumerate() {
         // La frontière de pause, en TÊTE de boucle. L'album précédent est
@@ -418,38 +518,45 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                 match issue.verdict {
                     "reidentified" | "unchanged" => {
                         identifies += 1;
-                        echecs_consecutifs = 0;
                         pistes += issue.applied.as_ref().map_or(0, |a| a.tracks_matched);
                     }
                     _ => {
                         // `not_found` comme `no_tracks` : rien n'a été posé.
                         sans_correspondance += 1;
-                        echecs_consecutifs += 1;
                     }
                 }
+                // 🔴 #4991 — une SEULE expression décide, et elle est couverte
+                //    par ses témoins. Le compteur du disjoncteur ne se touche
+                //    nulle part ailleurs dans cette boucle.
+                disjoncteur.enregistrer(effet_sur_le_disjoncteur(
+                    issue.verdict,
+                    issue.refus_musicbrainz,
+                ));
             }
             Err(EchecIdentification::AlbumIntrouvable) => {
                 // L'album a disparu entre la sélection et son tour — un scan a
                 // pu passer. Ce n'est pas un échec MusicBrainz : le compteur de
                 // disjoncteur ne bouge pas.
                 traites += 1;
+                disjoncteur.enregistrer(EffetSurLeDisjoncteur::Inchange);
             }
             Err(EchecIdentification::Base(e)) => {
                 warn!(task_id = %task_id, album_id, error = %e, "identification_lot_album_echoue");
                 traites += 1;
+                disjoncteur.enregistrer(EffetSurLeDisjoncteur::Inchange);
             }
         }
 
-        // 🔴 Le disjoncteur. Voir l'en-tête du module : sur un service en
-        //    bonne santé, douze échecs d'affilée ont une probabilité de
-        //    2 · 10⁻⁶. Ce n'est plus une bibliothèque difficile, c'est une
-        //    panne — et continuer 2 h 23 pour écrire « aucun pressage » partout
-        //    est pire que de s'arrêter en le disant.
-        if echecs_consecutifs >= ECHECS_CONSECUTIFS_MAX {
+        // 🔴 Le disjoncteur. Voir l'en-tête du module : douze REFUS d'affilée
+        //    ne sont pas une bibliothèque difficile, c'est une panne — et
+        //    continuer trois heures pour écrire « aucun pressage » partout est
+        //    pire que de s'arrêter en le disant. Douze ABSENCES, en revanche,
+        //    sont un amas de musique classique, et la passe doit le traverser.
+        if disjoncteur.a_saute() {
             warn!(
                 task_id = %task_id,
                 traites,
-                echecs_consecutifs,
+                refus_consecutifs = disjoncteur.refus_consecutifs(),
                 "identification_lot_arret_musicbrainz_injoignable"
             );
             ecrire_etat(
@@ -461,7 +568,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
                 identifies,
                 sans_correspondance,
                 pistes,
-                Some("musicbrainz_injoignable"),
+                Some(RAISON_MUSICBRAINZ_INJOIGNABLE),
             );
             return;
         }
@@ -607,6 +714,163 @@ mod tests {
             vec![5, 7],
             "l'album fraîchement identifié doit sortir du lot : c'est ce qui \
              fait qu'une reprise ne recommence pas la passe"
+        );
+    }
+
+    // -- 🔴 #4991 : le disjoncteur ne compte QUE les refus --
+    //
+    // Le banc joue la boucle au grain où elle décide : une suite de verdicts,
+    // et l'état du disjoncteur après chacun. Les deux côtés sont couverts —
+    // douze absences ne doivent PAS arrêter la passe, douze refus doivent
+    // l'arrêter — parce qu'un correctif qui ne garderait qu'un des deux
+    // remplacerait un défaut par l'autre : soit l'amas de classique bloque
+    // encore, soit une panne MusicBrainz repeint la bibliothèque entière en
+    // « aucun pressage trouvé ».
+
+    /// Fait tourner le disjoncteur sur une suite de `(verdict, refus)` et rend
+    /// l'état final. C'est *exactement* ce que la boucle fait de chaque album.
+    fn passer(albums: &[(&str, bool)]) -> Disjoncteur {
+        let mut disjoncteur = Disjoncteur::default();
+        for (verdict, refus) in albums {
+            disjoncteur.enregistrer(effet_sur_le_disjoncteur(verdict, *refus));
+        }
+        disjoncteur
+    }
+
+    /// 🔴 Le défaut, mesuré le 25/09/2026 : douze albums sans correspondance
+    /// d'affilée arrêtaient la passe. Ce sont les douze de la tête de file du
+    /// .18 — Goldberg-Variationen, Shostakovich 5, Beethoven 5 & 7… — tous
+    /// introuvables parce que le compositeur n'est pas dans la requête, tous
+    /// contigus par identifiant. La passe doit les traverser.
+    #[test]
+    fn douze_albums_sans_correspondance_daffilee_narretent_pas_la_passe() {
+        // Bien au-delà du seuil : la propriété n'est pas « ça tient jusqu'à
+        // douze », c'est « ça ne s'arme jamais là-dessus ».
+        let amas: Vec<(&str, bool)> =
+            vec![("not_found", false); ECHECS_CONSECUTIFS_MAX as usize + 8];
+        let disjoncteur = passer(&amas);
+
+        assert_eq!(
+            disjoncteur.refus_consecutifs(),
+            0,
+            "un album que MusicBrainz a répondu ne pas avoir n'est pas un refus : \
+             le compteur de refus doit rester à zéro"
+        );
+        assert!(
+            !disjoncteur.a_saute(),
+            "{} albums sans correspondance d'affilée ont fait sauter le \
+             disjoncteur — c'est le défaut #4991 : la passe s'arrête en annonçant \
+             « {RAISON_MUSICBRAINZ_INJOIGNABLE} » alors que MusicBrainz répond en 0,15 s, \
+             et sa reprise repart sur le même amas",
+            amas.len()
+        );
+    }
+
+    /// L'autre moitié, et elle compte autant : le disjoncteur ne disparaît pas.
+    /// Douze refus d'affilée arrêtent bien la passe, avec le message existant.
+    #[test]
+    fn douze_refus_musicbrainz_daffilee_arretent_la_passe() {
+        for avant_le_seuil in 1..ECHECS_CONSECUTIFS_MAX {
+            let disjoncteur = passer(&vec![("not_found", true); avant_le_seuil as usize]);
+            assert!(
+                !disjoncteur.a_saute(),
+                "le disjoncteur a sauté au {avant_le_seuil}e refus, avant le seuil \
+                 de {ECHECS_CONSECUTIFS_MAX}"
+            );
+        }
+
+        let disjoncteur = passer(&vec![("not_found", true); ECHECS_CONSECUTIFS_MAX as usize]);
+        assert_eq!(disjoncteur.refus_consecutifs(), ECHECS_CONSECUTIFS_MAX);
+        assert!(
+            disjoncteur.a_saute(),
+            "{ECHECS_CONSECUTIFS_MAX} refus de MusicBrainz d'affilée doivent arrêter \
+             la passe : sans cet arrêt, une panne produirait trois heures de \
+             « aucun pressage trouvé » sur toute la bibliothèque"
+        );
+        assert_eq!(
+            RAISON_MUSICBRAINZ_INJOIGNABLE, "musicbrainz_injoignable",
+            "le motif d'arrêt est un contrat servi par \
+             GET /library/identify-all/status : il ne change pas"
+        );
+    }
+
+    /// Une panne se juge sur une suite **ininterrompue**. Un seul album que
+    /// MusicBrainz a su traiter désarme le compteur.
+    #[test]
+    fn un_album_auquel_musicbrainz_a_repondu_desarme_le_disjoncteur() {
+        let mut suite: Vec<(&str, bool)> = vec![("not_found", true); 11];
+        suite.push(("reidentified", false));
+        suite.extend(vec![("not_found", true); 11]);
+
+        let disjoncteur = passer(&suite);
+        assert_eq!(disjoncteur.refus_consecutifs(), 11);
+        assert!(
+            !disjoncteur.a_saute(),
+            "22 refus coupés par un album identifié ne sont pas 22 refus d'affilée"
+        );
+    }
+
+    /// Un `not_found` VRAI — MusicBrainz a répondu — désarme aussi : c'est ce
+    /// qui fait qu'un amas de classique au milieu d'une panne ne masque rien,
+    /// et surtout qu'une panne au milieu d'un amas reste détectable.
+    #[test]
+    fn une_absence_reelle_desarme_le_compteur_de_refus() {
+        let mut suite: Vec<(&str, bool)> = vec![("not_found", true); 11];
+        suite.push(("not_found", false));
+        let disjoncteur = passer(&suite);
+
+        assert_eq!(
+            disjoncteur.refus_consecutifs(),
+            0,
+            "MusicBrainz a répondu au douzième album : la suite de refus est rompue"
+        );
+        assert!(!disjoncteur.a_saute());
+    }
+
+    /// Un album sans piste n'interroge pas MusicBrainz. Il ne doit donc ni
+    /// armer le disjoncteur, ni le désarmer — sinon un lot mal formé masquerait
+    /// une panne en cours.
+    #[test]
+    fn un_album_sans_piste_laisse_le_compteur_ou_il_est() {
+        let mut suite: Vec<(&str, bool)> = vec![("not_found", true); 11];
+        suite.push(("no_tracks", false));
+        suite.push(("not_found", true));
+
+        let disjoncteur = passer(&suite);
+        assert_eq!(
+            disjoncteur.refus_consecutifs(),
+            ECHECS_CONSECUTIFS_MAX,
+            "un album sans piste n'apprend rien sur MusicBrainz : il ne doit pas \
+             remettre le compteur de refus à zéro"
+        );
+        assert!(disjoncteur.a_saute());
+    }
+
+    /// Le critère, lu directement : trois entrées, trois effets distincts.
+    #[test]
+    fn le_critere_separe_le_refus_de_labsence() {
+        assert_eq!(
+            effet_sur_le_disjoncteur("not_found", false),
+            EffetSurLeDisjoncteur::Remise,
+            "« MusicBrainz n'a pas ce pressage » est un résultat"
+        );
+        assert_eq!(
+            effet_sur_le_disjoncteur("not_found", true),
+            EffetSurLeDisjoncteur::Refus,
+            "« MusicBrainz n'a pas répondu » est une panne"
+        );
+        assert_eq!(
+            effet_sur_le_disjoncteur("no_tracks", false),
+            EffetSurLeDisjoncteur::Inchange,
+            "MusicBrainz n'a pas été interrogé"
+        );
+        assert_eq!(
+            effet_sur_le_disjoncteur("reidentified", false),
+            EffetSurLeDisjoncteur::Remise
+        );
+        assert_eq!(
+            effet_sur_le_disjoncteur("unchanged", false),
+            EffetSurLeDisjoncteur::Remise
         );
     }
 
