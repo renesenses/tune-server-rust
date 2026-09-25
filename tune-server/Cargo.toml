@@ -985,3 +985,13 @@ path = "tests/identification_lot_4805.rs"
 [[test]]
 name = "reidentification_album"
 path = "tests/reidentification_album.rs"
+
+# Favoris LOCAUX sur PostgreSQL (chasse PG du 25/09/2026) : `ProfileRepo` liait
+# `favorites.profile_id`/`item_id` en chaine alors que ces colonnes sont BIGINT
+# sur les deux naissances d'une base PG. PAS de `required-features` : la
+# contre-epreuve SQLite tourne dans la suite ordinaire ; seule l'epreuve PG porte
+# `#[cfg(feature = "postgres")]`. `autotests = false` : sans cette cible, le
+# fichier ne serait jamais compile.
+[[test]]
+name = "pg_favoris_locaux_entiers"
+path = "tests/pg_favoris_locaux_entiers.rs"
