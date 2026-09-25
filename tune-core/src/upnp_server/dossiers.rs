@@ -381,7 +381,7 @@ pub(super) fn parcourir(state: &UpnpState, id: &str, start: u64, count: u64) -> 
 /// Tri naturel : les suites de chiffres se comparent par leur VALEUR, le
 /// reste sans casse ni accents. Égalité départagée par le texte brut, pour
 /// un ordre total et stable entre deux requêtes — la pagination en dépend.
-fn comparer_naturel(a: &str, b: &str) -> Ordering {
+pub(super) fn comparer_naturel(a: &str, b: &str) -> Ordering {
     let (ka, kb) = (cle_naturelle(a), cle_naturelle(b));
     ka.cmp(&kb).then_with(|| a.cmp(b))
 }

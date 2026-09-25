@@ -721,3 +721,149 @@ async fn l_exemption_didl_ne_profite_pas_de_l_exception() {
     assert_ne!(statut, StatusCode::OK);
     assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
 }
+
+// ---------------------------------------------------------------------------
+// #4954 — la pochette d'un SERVEUR TUNE découvert (onglet « Serveurs
+// multimédia »). Le client web lit le catalogue d'un serveur Tune par son API
+// REST et bâtit, pour chaque album, `http://<ip-lan>:8888/api/v1/library/
+// artwork/<condensat>` (`tuneRemote.ts::pochetteDistante`). En 0.9.163 il
+// l'envoie à CE relais, qui refusait l'adresse privée : 2 809 tuiles grises
+// chez Jean Valjean, le serveur Tune lui-même compris. L'exception tient à
+// deux conditions à la fois : l'hôte:port est un serveur multimédia DÉCOUVERT
+// (registre SSDP, le nôtre y compris, #3786), et le chemin est EXACTEMENT la
+// route de pochette de Tune suivie d'un condensat.
+// ---------------------------------------------------------------------------
+
+/// Un condensat SHA-256 (64 hexadécimaux), la forme de `albums.cover_path`.
+const CONDENSAT_4954: &str = "ce0a963bb7eb63c3b33b4e00b6ab3427ce0a963bb7eb63c3b33b4e00b6ab3427";
+
+/// Un serveur Tune du banc : sert sa pochette sur la route de Tune, et compte
+/// TOUT ce qu'il reçoit (le repli dit « secret » : il ne doit jamais sortir).
+async fn amont_tune() -> Amont {
+    let requetes = Arc::new(AtomicUsize::new(0));
+    let (c1, c2) = (requetes.clone(), requetes.clone());
+    let app = Router::new()
+        .route(
+            "/api/v1/library/artwork/{condensat}",
+            get(move || {
+                c1.fetch_add(1, Ordering::SeqCst);
+                async { ([(header::CONTENT_TYPE, "image/jpeg")], POCHETTE) }
+            }),
+        )
+        .fallback(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            async { "secret interne".into_response() }
+        });
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("port libre");
+    let port = ecoute.local_addr().expect("adresse locale").port();
+    tokio::spawn(async move {
+        axum::serve(ecoute, app).await.ok();
+    });
+    Amont { port, requetes }
+}
+
+/// Inscrit un serveur multimédia au registre SSDP, comme la découverte.
+async fn decouvrir_serveur(state: &AppState, hote: &str, port: u16) {
+    let info = tune_core::discovery::ssdp::MediaServerInfo {
+        id: format!("uuid:banc-4954-{port}"),
+        name: "Tune Server".into(),
+        manufacturer: "Mozaiklabs".into(),
+        model: "Tune".into(),
+        location: format!("http://{hote}:{port}/upnp/description.xml"),
+        content_directory_url: format!("http://{hote}:{port}/upnp/control/content_directory"),
+        host: hote.into(),
+        port,
+        last_seen: std::time::Instant::now(),
+        max_age: std::time::Duration::from_secs(1800),
+    };
+    state
+        .media_servers
+        .lock()
+        .await
+        .insert(info.id.clone(), info);
+}
+
+/// LE témoin de #4954 : l'URL que le client bâtit pour un album d'un serveur
+/// Tune découvert, adresse littérale, est relayée.
+#[tokio::test]
+async fn la_pochette_d_un_serveur_tune_decouvert_est_relayee_4954() {
+    let amont = amont_tune().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/library/artwork/{CONDENSAT_4954}",
+        amont.port
+    );
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::OK, "{}", texte(&corps));
+    assert_eq!(corps, POCHETTE);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 1);
+}
+
+/// Contre-garde : même URL, serveur ABSENT du registre ⇒ refus, rien ne part.
+#[tokio::test]
+async fn la_pochette_d_un_serveur_non_decouvert_reste_refusee_4954() {
+    let amont = amont_tune().await;
+    let state = etat_avec_relais_lan();
+    // Un serveur découvert sur le même hôte, mais un AUTRE port.
+    decouvrir_serveur(&state, "127.0.0.1", amont.port.wrapping_add(1)).await;
+    let app = app(&state, DISTANT);
+
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/library/artwork/{CONDENSAT_4954}",
+        amont.port
+    );
+    let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{}", texte(&corps));
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}
+
+/// Contre-garde : serveur découvert, mais un AUTRE chemin que la pochette —
+/// l'exception ne fait pas du relais une porte vers son API.
+#[tokio::test]
+async fn un_autre_chemin_d_un_serveur_decouvert_reste_refuse_4954() {
+    let amont = amont_tune().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    let app = app(&state, DISTANT);
+
+    for chemin_amont in [
+        "/api/v1/system/profile".to_string(),
+        "/api/v1/library/artwork/proxy?url=http://169.254.169.254/".to_string(),
+        "/api/v1/library/artwork/pas-un-condensat".to_string(),
+        format!("/api/v1/library/artwork/{CONDENSAT_4954}?x=1"),
+        format!("/api/v1/library/artwork/{CONDENSAT_4954}/../../system/profile"),
+    ] {
+        let url = format!("http://127.0.0.1:{}{chemin_amont}", amont.port);
+        let (statut, corps) = appel(&app, &chemin_relais(&url), None).await;
+        assert_eq!(
+            statut,
+            StatusCode::FORBIDDEN,
+            "{chemin_amont} : {}",
+            texte(&corps)
+        );
+    }
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}
+
+/// Contre-garde : par l'exemption DIDL (sans jeton), pas d'exception.
+#[tokio::test]
+async fn l_exemption_didl_ne_profite_pas_du_serveur_decouvert_4954() {
+    let amont = amont_tune().await;
+    let state = etat_avec_relais_lan();
+    decouvrir_serveur(&state, "127.0.0.1", amont.port).await;
+    enable_auth(&state);
+    let app = app(&state, RENDERER_LAN);
+
+    let url = format!(
+        "http://127.0.0.1:{}/api/v1/library/artwork/{CONDENSAT_4954}",
+        amont.port
+    );
+    let (statut, _corps) = appel(&app, &chemin_relais(&url), None).await;
+    assert_ne!(statut, StatusCode::OK);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}

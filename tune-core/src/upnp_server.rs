@@ -2487,8 +2487,16 @@ fn didl_genres(genres: &[(String, u64)]) -> DidlResult {
 /// plus les [`NB_ENSEMBLES_DU_GENRE`] ensembles de pistes que
 /// [`browse_genre_albums`] publie en tête (fil 1916). Le compter ici, à la
 /// source, garde la liste, `BrowseMetadata` et `Search` d'accord entre eux.
+///
+/// #4956 — l'ORDRE est celui des noms du serveur média
+/// ([`dossiers::comparer_naturel`] : sans casse ni accents, nombres par leur
+/// valeur, égalité départagée par le texte brut). `genre_counts` rend l'ordre
+/// des octets de la clé en minuscules : « Électronique » après « World »,
+/// « 10s » avant « 9s ». Un appareil qui affiche l'ordre reçu (Marantz ND8006)
+/// montrait une liste « sans ordre défini au début ». L'ordre est total, donc
+/// stable d'une page à l'autre.
 fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
-    AlbumRepo::with_backend(state.backend.clone())
+    let mut genres: Vec<(String, u64)> = AlbumRepo::with_backend(state.backend.clone())
         .genre_counts()
         .unwrap_or_default()
         .into_iter()
@@ -2497,7 +2505,9 @@ fn lire_genres(state: &UpnpState) -> Vec<(String, u64)> {
                 .ok()
                 .map(|nb| (genre, nb + NB_ENSEMBLES_DU_GENRE))
         })
-        .collect()
+        .collect();
+    genres.sort_by(|a, b| dossiers::comparer_naturel(&a.0, &b.0));
+    genres
 }
 
 /// Les albums d'un genre.
@@ -3892,6 +3902,67 @@ mod tests {
             !noms.iter().any(|g| g == "Zouk"),
             "un genre entièrement masqué ne doit plus être publié : {noms:?}"
         );
+    }
+
+    /// #4956 — la liste Genres sort dans l'ordre de la collation des noms du
+    /// serveur média (`dossiers::comparer_naturel` : sans casse ni accents,
+    /// nombres par leur valeur), et non dans l'ordre des OCTETS de la clé en
+    /// minuscules que rend `genre_counts`. Sur un Marantz ND8006 (Jean Valjean,
+    /// 0.9.163) : « tri sans ordre défini au début ». Par octets, « Électronique »
+    /// passait APRÈS « World » et « 10s » AVANT « 9s ». Le témoin lit le DIDL
+    /// que reçoit l'appareil, pas la liste interne.
+    #[test]
+    fn la_liste_des_genres_suit_la_collation_des_noms_4956() {
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = AlbumRepo::with_backend(backend.clone());
+        for (titre, genre) in [
+            ("a", "World"),
+            ("b", "Électronique"),
+            ("c", "jazz"),
+            ("d", "10s"),
+            ("e", "9s"),
+            ("f", "Ambient"),
+            ("g", "Easy Listening"),
+        ] {
+            repo.create(&album_with_genre(titre, genre)).unwrap();
+        }
+        let state = UpnpState::new(backend, 8888, None);
+
+        let didl = browse_genres(&state, 0, UNLIMITED_BROWSE_COUNT).xml;
+        let ordre: Vec<&str> = didl
+            .split("<dc:title>")
+            .skip(1)
+            .filter_map(|m| m.split("</dc:title>").next())
+            .collect();
+        assert_eq!(
+            ordre,
+            [
+                "9s",
+                "10s",
+                "Ambient",
+                "Easy Listening",
+                "Électronique",
+                "jazz",
+                "World"
+            ],
+            "ordre des genres dans le DIDL : {didl}"
+        );
+
+        // La pagination suit le même ordre : la 2e page commence où la 1re
+        // s'arrête (un appareil pagine par 50, ou moins).
+        let page = browse_genres(&state, 2, 2).xml;
+        assert!(
+            page.find("<dc:title>Ambient</dc:title>")
+                .is_some_and(|a| page
+                    .find("<dc:title>Easy Listening</dc:title>")
+                    .is_some_and(|e| a < e)),
+            "la page 2 doit porter Ambient puis Easy Listening : {page}"
+        );
+        assert_eq!(page.matches("<dc:title>").count(), 2, "{page}");
     }
 
     /// Contre-échec : sans la branche `genre/`, ce test rendait 0 — c'est
