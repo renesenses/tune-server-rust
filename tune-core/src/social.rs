@@ -10,7 +10,7 @@ use crate::playback::NowPlaying;
 // Sharing profile — user preferences for what to share publicly
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SharingProfile {
     pub display_name: String,
     pub public_url: Option<String>,
@@ -18,19 +18,6 @@ pub struct SharingProfile {
     pub share_now_playing: bool,
     pub share_history: bool,
     pub share_top_artists: bool,
-}
-
-impl Default for SharingProfile {
-    fn default() -> Self {
-        Self {
-            display_name: String::new(),
-            public_url: None,
-            enabled: false,
-            share_now_playing: false,
-            share_history: false,
-            share_top_artists: false,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

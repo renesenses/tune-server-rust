@@ -121,16 +121,16 @@ pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
 
     match lofty::read_from_path(&*extended_path(audio_path)) {
         Ok(tagged) => {
-            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-                if let Some(pic) = tag.pictures().first() {
-                    let mime = match pic.mime_type() {
-                        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
-                        Some(lofty::picture::MimeType::Png) => "image/png",
-                        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
-                        _ => "image/jpeg",
-                    };
-                    return Some((pic.data().to_vec(), mime.to_string()));
-                }
+            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag())
+                && let Some(pic) = tag.pictures().first()
+            {
+                let mime = match pic.mime_type() {
+                    Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
+                    Some(lofty::picture::MimeType::Png) => "image/png",
+                    Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                    _ => "image/jpeg",
+                };
+                return Some((pic.data().to_vec(), mime.to_string()));
             }
         }
         Err(e) => {
@@ -918,25 +918,23 @@ pub async fn fetch_artist_image(
         .ok()?;
 
     // 1. Mozaiklabs community by MBID (fastest, no rate limit) — highest priority
-    if !mbid.is_empty() {
-        if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid)
+    if !mbid.is_empty()
+        && let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid)
             .await
             .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some(bytes);
-        }
+    {
+        return Some(bytes);
     }
 
     // 1b. Mozaiklabs community by NAME — keeps mozaiklabs the top priority even
     // for artists without an MBID (which never reach the by-MBID lookup above),
     // BEFORE falling back to any external source.
-    if !artist_name.is_empty() {
-        if let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name)
+    if !artist_name.is_empty()
+        && let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name)
             .await
             .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some(bytes);
-        }
+    {
+        return Some(bytes);
     }
 
     // Sources 2–5 are keyed by MBID; skip them entirely for artists without one
@@ -1127,16 +1125,15 @@ async fn fetch_artist_image_musicbrainz_full(
         } else {
             None
         }
-    }) {
-        if let Some(filename) = commons_page.rsplit("File:").next() {
-            let direct_url = format!(
-                "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
-                filename.replace(' ', "_")
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Some(bytes) = download_image(client, &direct_url).await {
-                return Some(bytes);
-            }
+    }) && let Some(filename) = commons_page.rsplit("File:").next()
+    {
+        let direct_url = format!(
+            "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
+            filename.replace(' ', "_")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(bytes) = download_image(client, &direct_url).await {
+            return Some(bytes);
         }
     }
 
@@ -1418,7 +1415,7 @@ pub const PHASE_PAR_NOM: &str = "names";
 /// de la condition. Une seule définition désormais — et le `traites == total`
 /// n'est pas décoratif : sans lui, un lot de douze cesserait d'afficher à dix.
 pub(crate) fn doit_publier_avancement(traites: usize, total: usize) -> bool {
-    traites % 5 == 0 || traites == total
+    traites.is_multiple_of(5) || traites == total
 }
 
 /// Instantané d'avancement de la passe 3 — recherche d'image **par nom**
@@ -1636,27 +1633,26 @@ async fn batch_enrich_artist_artwork_inner(
                 // #4837 : l'image communautaire que l'utilisateur a rejetée
                 // pour cet artiste n'est plus reposée à chaque passe.
                 let refusees = empreintes_rejetees(&db, artist_id, &img.mbid);
-                if let Ok(client) = client {
-                    if let Some(data) = download_image(&client, &img.image_url)
+                if let Ok(client) = client
+                    && let Some(data) = download_image(&client, &img.image_url)
                         .await
                         .and_then(|d| image_retenue(d, &refusees))
-                    {
-                        // Adressage par le CONTENU (#1444) : sous
-                        // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
-                        // — dont c'est tout l'objet — réécrivait sous l'adresse
-                        // déjà distribuée, servie `immutable, max-age=31536000` :
-                        // l'ancienne photo restait affichée un an.
-                        std::fs::create_dir_all(&cache_dir).ok();
-                        if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
-                            artist_repo.update_image(artist_id, &hash, "community").ok();
-                            community_applied += 1;
-                            info!(
-                                artist_id,
-                                artist = %img.artist_name,
-                                hash = %hash,
-                                "batch_artist_artwork_community_applied"
-                            );
-                        }
+                {
+                    // Adressage par le CONTENU (#1444) : sous
+                    // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
+                    // — dont c'est tout l'objet — réécrivait sous l'adresse
+                    // déjà distribuée, servie `immutable, max-age=31536000` :
+                    // l'ancienne photo restait affichée un an.
+                    std::fs::create_dir_all(&cache_dir).ok();
+                    if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
+                        artist_repo.update_image(artist_id, &hash, "community").ok();
+                        community_applied += 1;
+                        info!(
+                            artist_id,
+                            artist = %img.artist_name,
+                            hash = %hash,
+                            "batch_artist_artwork_community_applied"
+                        );
                     }
                 }
             }
@@ -2007,8 +2003,8 @@ async fn batch_enrich_artist_artwork_inner(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                     // Try Discogs first
-                    if discogs_available {
-                        if let Some(data) =
+                    if discogs_available
+                        && let Some(data) =
                             fetch_artist_image_discogs(client, &name, discogs_token)
                                 .await
                                 .and_then(|d| image_retenue(d, &refusees))
@@ -2022,7 +2018,6 @@ async fn batch_enrich_artist_artwork_inner(
                                 return Some(SourceParNom::Discogs);
                             }
                         }
-                    }
 
                     // Fallback to Last.fm
                     if lastfm_available {
@@ -2639,9 +2634,9 @@ mod tests {
         assert_eq!(vus[0]["total"], 12);
 
         // Cadence : rien ne bouge avant la cinquième, puis la dixième.
-        for avant in 1..5 {
+        for (avant, vu) in vus.iter().enumerate().take(5).skip(1) {
             assert_eq!(
-                vus[avant]["processed"],
+                vu["processed"],
                 0,
                 "publication hors cadence avant la fiche {}",
                 avant + 1

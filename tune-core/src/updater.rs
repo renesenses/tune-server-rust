@@ -255,10 +255,10 @@ impl UpdateChecker {
 
     async fn fetch_releases_json(&self, url: &str) -> Result<Vec<serde_json::Value>, String> {
         let mut req = self.client.get(url);
-        if url.contains("github.com") {
-            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-                req = req.header("Authorization", format!("Bearer {token}"));
-            }
+        if url.contains("github.com")
+            && let Ok(token) = std::env::var("GITHUB_TOKEN")
+        {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         let resp = req.send().await.map_err(|e| format!("request: {e}"))?;
         if !resp.status().is_success() {

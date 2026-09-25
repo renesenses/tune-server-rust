@@ -230,7 +230,7 @@ async fn handle_command(line: &str, state: &Arc<CliState>) -> String {
     let full = line;
     match cmd {
         "login" => format!("{full} ******"),
-        "listen" => format!("{full}"),
+        "listen" => full.to_string(),
         "can" => handle_can(full),
         "player" => handle_player_query(full, state).await,
         "players" => handle_players(full, state).await,
@@ -239,10 +239,10 @@ async fn handle_command(line: &str, state: &Arc<CliState>) -> String {
         "pref" => handle_pref(full, state),
         "version" => format!("version {}", state.server_version),
         "connected" => "connected 1".to_string(),
-        "subscribe" => format!("{full}"),
+        "subscribe" => full.to_string(),
         _ => {
             debug!(cmd = full, "lms_cli_unknown_command");
-            format!("{full}")
+            full.to_string()
         }
     }
 }
@@ -282,7 +282,7 @@ async fn handle_player_query(line: &str, state: &Arc<CliState>) -> String {
         return format!("player name {idx} {}", cli_encode(&name));
     }
 
-    format!("{line}")
+    line.to_string()
 }
 
 /// Handle global "status - 1 subscribe:-" command.
@@ -364,10 +364,7 @@ fn handle_pref(line: &str, _state: &Arc<CliState>) -> String {
     if line.contains('?') {
         let key = line.split_whitespace().nth(1).unwrap_or("unknown");
         let value = match key {
-            "httpport" => {
-                let port = std::env::var("TUNE_PORT").unwrap_or_else(|_| "8888".into());
-                port
-            }
+            "httpport" => std::env::var("TUNE_PORT").unwrap_or_else(|_| "8888".into()),
             "language" => "en".to_string(),
             "skin" => "Default".to_string(),
             _ => String::new(),

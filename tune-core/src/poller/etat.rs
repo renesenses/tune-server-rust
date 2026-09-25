@@ -273,7 +273,7 @@ impl ZonePollState {
             last_seek_seen: None,
             cible_du_deplacement_ms: 0,
             chute_en_grace: false,
-            track_generation: track_generation,
+            track_generation,
             track_loaded_at: Instant::now(),
             past_end_ticks: 0,
             gapless_advance_pending: false,

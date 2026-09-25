@@ -295,7 +295,8 @@ mod tests {
         let bannie = 105i64;
         let noms = vec!["Artist 1".to_string()];
 
-        let generateurs: Vec<(&str, Box<dyn Fn() -> Vec<i64>>)> = vec![
+        type Generateur<'a> = (&'a str, Box<dyn Fn() -> Vec<i64> + 'a>);
+        let generateurs: Vec<Generateur> = vec![
             (
                 "autoplay:tracks",
                 Box::new(|| {

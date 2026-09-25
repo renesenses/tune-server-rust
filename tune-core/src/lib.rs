@@ -103,6 +103,9 @@ pub fn rustc_version() -> &'static str {
 }
 
 /// List of cargo features enabled at compile time.
+// Chaque `push` dépend d'un `cfg` : un `vec![]` littéral ne sait pas les
+// porter (clippy 1.98, `vec_init_then_push`).
+#[allow(clippy::vec_init_then_push)]
 pub fn enabled_features() -> Vec<&'static str> {
     let mut features = Vec::new();
     #[cfg(feature = "local-audio")]

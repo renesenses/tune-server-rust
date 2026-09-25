@@ -1104,6 +1104,7 @@ impl AudioStreamer {
     ///     the mpsc channel, so waiting would hang),
     ///   - file sessions (`serve_file`, already on disk, Range-seekable),
     ///   - unknown or already-closed sessions.
+    ///
     /// Only genuine transcode/radio channel sessions are actually awaited.
     ///
     /// Returns `false` when `timeout` elapses first — the hard cap so a slow or
@@ -1295,13 +1296,13 @@ impl AudioStreamer {
         // to avoid accidentally removing actual music files.
         if let Some(session) = removed {
             let fp = session.file_path.lock().await;
-            if let Some(ref path) = *fp {
-                if is_temp_transcode_file(path) {
-                    if let Err(e) = std::fs::remove_file(path) {
-                        info!(stream_id, path, error = %e, "temp_transcode_file_cleanup_failed");
-                    } else {
-                        info!(stream_id, path, "temp_transcode_file_cleaned_up");
-                    }
+            if let Some(ref path) = *fp
+                && is_temp_transcode_file(path)
+            {
+                if let Err(e) = std::fs::remove_file(path) {
+                    info!(stream_id, path, error = %e, "temp_transcode_file_cleanup_failed");
+                } else {
+                    info!(stream_id, path, "temp_transcode_file_cleaned_up");
                 }
             }
         }
@@ -1470,12 +1471,11 @@ impl AudioStreamer {
             };
             // Check for temp transcode file to clean up.
             // We can't .await inside retain, so use try_lock.
-            if let Ok(fp) = s.file_path.try_lock() {
-                if let Some(ref path) = *fp {
-                    if is_temp_transcode_file(path) {
-                        temp_files_to_remove.push(path.clone());
-                    }
-                }
+            if let Ok(fp) = s.file_path.try_lock()
+                && let Some(ref path) = *fp
+                && is_temp_transcode_file(path)
+            {
+                temp_files_to_remove.push(path.clone());
             }
             info!(
                 stream_id = %id,
@@ -1518,16 +1518,14 @@ pub fn cleanup_leftover_transcode_files() {
     };
     let mut count = 0;
     for entry in entries.flatten() {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with("tune-transcode-")
+        if let Some(name) = entry.file_name().to_str()
+            && (name.starts_with("tune-transcode-")
                 || name.starts_with("tune-aac-transcode-")
                 || name.starts_with("tune-dash-transcode-")
-                || name.starts_with("tune-faststart-")
-            {
-                if std::fs::remove_file(entry.path()).is_ok() {
-                    count += 1;
-                }
-            }
+                || name.starts_with("tune-faststart-"))
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            count += 1;
         }
     }
     if count > 0 {

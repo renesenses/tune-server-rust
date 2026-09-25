@@ -813,7 +813,7 @@ impl StreamingService for DeezerService {
                 quality: StreamQuality {
                     codec: if ext == "flac" { "FLAC" } else { "MP3" }.into(),
                     sample_rate: 44100,
-                    bit_depth: if ext == "flac" { 16 } else { 16 },
+                    bit_depth: 16, // FLAC comme MP3 : Deezer sert du 16 bits
                     bitrate: if ext == "flac" { None } else { Some(320) },
                     channels: 2,
                 },

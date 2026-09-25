@@ -96,10 +96,11 @@ fn parse_days(days_str: Option<&str>) -> Vec<u32> {
 /// Resolve active days for an alarm.  Prefers `days_of_week` (7-char
 /// bitmask) when present; falls back to legacy `days` (CSV/named).
 fn resolve_alarm_days(alarm: &serde_json::Value) -> Vec<u32> {
-    if let Some(dow) = alarm.get("days_of_week").and_then(|v| v.as_str()) {
-        if dow.len() == 7 && dow.chars().all(|c| c == '0' || c == '1') {
-            return parse_days_of_week(dow);
-        }
+    if let Some(dow) = alarm.get("days_of_week").and_then(|v| v.as_str())
+        && dow.len() == 7
+        && dow.chars().all(|c| c == '0' || c == '1')
+    {
+        return parse_days_of_week(dow);
     }
     parse_days(alarm.get("days").and_then(|v| v.as_str()))
 }
@@ -130,7 +131,7 @@ impl SnoozeState {
 
     fn snooze(&mut self, alarm_id: i64, minutes: u64) {
         self.snoozed.insert(alarm_id, Instant::now());
-        self.durations.insert(alarm_id, minutes.max(1).min(60) * 60);
+        self.durations.insert(alarm_id, minutes.clamp(1, 60) * 60);
     }
 
     fn pop_ready(&mut self) -> Vec<i64> {
@@ -219,7 +220,7 @@ impl AlarmScheduler {
     }
 
     pub async fn snooze(&self, alarm_id: i64, minutes: Option<i64>) -> Result<(), String> {
-        let mins = minutes.unwrap_or(SNOOZE_DEFAULT_MIN).max(1).min(60) as u64;
+        let mins = minutes.unwrap_or(SNOOZE_DEFAULT_MIN).clamp(1, 60) as u64;
         self.snooze.lock().await.snooze(alarm_id, mins);
         info!(alarm_id, minutes = mins, "alarm_snoozed");
         Ok(())
@@ -434,7 +435,7 @@ impl AlarmScheduler {
             .into_iter()
             .map(|r| {
                 serde_json::json!({
-                    "id": r.get(0).and_then(SqlValue::as_i64).unwrap_or(0),
+                    "id": r.first().and_then(SqlValue::as_i64).unwrap_or(0),
                     "name": r.get(1).and_then(SqlValue::as_str).unwrap_or(""),
                     "time": r.get(2).and_then(SqlValue::as_str).unwrap_or(""),
                     "days": r.get(3).and_then(SqlValue::as_str),
@@ -464,7 +465,7 @@ impl AlarmScheduler {
         )?;
         Ok(row.map(|r| {
             serde_json::json!({
-                "id": r.get(0).and_then(SqlValue::as_i64).unwrap_or(0),
+                "id": r.first().and_then(SqlValue::as_i64).unwrap_or(0),
                 "name": r.get(1).and_then(SqlValue::as_str).unwrap_or(""),
                 "time": r.get(2).and_then(SqlValue::as_str).unwrap_or(""),
                 "days": r.get(3).and_then(SqlValue::as_str),

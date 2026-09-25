@@ -237,12 +237,12 @@ impl PluginMarketplace {
         }
 
         // Reject early if the advertised length already exceeds the cap.
-        if let Some(len) = resp.content_length() {
-            if len > MAX_PLUGIN_BYTES as u64 {
-                return Err(CloudError::Message(format!(
-                    "plugin too large: {len} bytes (max {MAX_PLUGIN_BYTES})"
-                )));
-            }
+        if let Some(len) = resp.content_length()
+            && len > MAX_PLUGIN_BYTES as u64
+        {
+            return Err(CloudError::Message(format!(
+                "plugin too large: {len} bytes (max {MAX_PLUGIN_BYTES})"
+            )));
         }
 
         // Stream with a running cap so a missing/lying Content-Length can't

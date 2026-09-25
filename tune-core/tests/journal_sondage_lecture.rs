@@ -400,8 +400,7 @@ fn une_panne_de_sondage_en_lecture_se_dit_quelques_fois_puis_se_recapitule() {
     // ── Le total n'est jamais perdu ──────────────────────────────────────
     let dernier = texte
         .lines()
-        .filter(|l| l.contains("poll_still_failing"))
-        .next_back()
+        .rfind(|l| l.contains("poll_still_failing"))
         .expect("il doit rester au moins un récapitulatif");
     assert!(
         dernier.contains("echecs=64"),

@@ -28,12 +28,12 @@ fn cache() -> &'static Mutex<Option<PathBuf>> {
 /// on Windows, `~/Library/Application Support/Tune` on macOS, `~/.cache/tune`
 /// (or `$XDG_CACHE_HOME/tune`) on Linux. Overridable with `TUNE_TOOLS_DIR`.
 pub fn tools_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("TUNE_TOOLS_DIR") {
-        if !custom.is_empty() {
-            let p = PathBuf::from(custom);
-            std::fs::create_dir_all(&p).ok();
-            return p;
-        }
+    if let Ok(custom) = std::env::var("TUNE_TOOLS_DIR")
+        && !custom.is_empty()
+    {
+        let p = PathBuf::from(custom);
+        std::fs::create_dir_all(&p).ok();
+        return p;
     }
     let base: PathBuf = if cfg!(target_os = "windows") {
         std::env::var("LOCALAPPDATA")
@@ -98,13 +98,13 @@ pub fn binary() -> Option<PathBuf> {
 /// configured path (the `yt_dlp_path` setting), then the auto-download location,
 /// then a `yt-dlp` on `PATH`. Returns the resolved path (also cached).
 pub async fn resolve(configured_path: Option<&str>) -> Option<PathBuf> {
-    if let Some(p) = configured_path {
-        if !p.is_empty() {
-            let pb = PathBuf::from(p);
-            if pb.exists() {
-                set_binary(pb.clone());
-                return Some(pb);
-            }
+    if let Some(p) = configured_path
+        && !p.is_empty()
+    {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            set_binary(pb.clone());
+            return Some(pb);
         }
     }
     let local = local_binary_path();
@@ -150,10 +150,10 @@ pub async fn download() -> Result<(PathBuf, String), String> {
     let mut req = client
         .get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")
         .header("Accept", "application/vnd.github+json");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
+    if let Ok(token) = std::env::var("GITHUB_TOKEN")
+        && !token.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {token}"));
     }
     let release: serde_json::Value = req
         .send()

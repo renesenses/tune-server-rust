@@ -68,6 +68,8 @@ impl PlaybackHistory {
         )
     }
 
+    // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         track_id: Option<i64>,
@@ -86,7 +88,7 @@ impl PlaybackHistory {
             .as_secs() as i64;
 
         use crate::db::backend::ToSqlValue;
-        Ok(self.db.execute_returning_id(
+        self.db.execute_returning_id(
             "INSERT INTO playback_history \
              (track_id, title, artist_name, album_title, source, source_id, \
               zone_id, played_at, duration_ms, listened_ms) \
@@ -103,7 +105,7 @@ impl PlaybackHistory {
                 &duration_ms,
                 &listened_ms,
             ],
-        )?)
+        )
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {

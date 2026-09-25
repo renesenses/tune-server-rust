@@ -149,7 +149,7 @@ fn hex_encode(data: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex string".into());
     }
     (0..s.len())
@@ -300,10 +300,10 @@ impl Envelope {
         // Not the passphrase — try it as a recovery key, normalising the
         // grouping and Crockford aliases the user may have typed.
         let normalized = normalize_recovery_key(secret);
-        if !normalized.is_empty() {
-            if let Ok(dek) = unwrap_dek(&normalized, &self.recovery_slot) {
-                return Ok(dek);
-            }
+        if !normalized.is_empty()
+            && let Ok(dek) = unwrap_dek(&normalized, &self.recovery_slot)
+        {
+            return Ok(dek);
         }
         Err("wrong passphrase or recovery key".into())
     }

@@ -507,7 +507,7 @@ impl MetadataEnricher {
                 &track.title,
                 track.artist_name.as_deref(),
                 track.album_title.as_deref(),
-                Some(track.duration_ms as i64),
+                Some(track.duration_ms),
             )
             .await?;
 
@@ -548,7 +548,7 @@ impl MetadataEnricher {
             _ => None,
         };
 
-        let cover_url = if let Some(ref rg_id) = details
+        let cover_url = if let Some(rg_id) = details
             .release_group_id
             .as_ref()
             .or(recording.release_group_id.as_ref())
@@ -650,16 +650,16 @@ fn score_candidate(
     }
 
     // Duration match (0-10 points, penalty for large difference)
-    if let Some(q_dur) = query_duration_ms {
-        if let Some(mb_dur) = raw["length"].as_i64() {
-            let diff_ms = (q_dur - mb_dur).unsigned_abs();
-            if diff_ms < 2000 {
-                score += 10;
-            } else if diff_ms < 5000 {
-                score += 5;
-            } else if diff_ms > 30000 {
-                score -= 10;
-            }
+    if let Some(q_dur) = query_duration_ms
+        && let Some(mb_dur) = raw["length"].as_i64()
+    {
+        let diff_ms = (q_dur - mb_dur).unsigned_abs();
+        if diff_ms < 2000 {
+            score += 10;
+        } else if diff_ms < 5000 {
+            score += 5;
+        } else if diff_ms > 30000 {
+            score -= 10;
         }
     }
 

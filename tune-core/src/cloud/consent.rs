@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn le_defaut_d_une_installation_neuve_est_non() {
         let settings = SettingsRepo::with_backend(base_neuve());
-        assert!(!CONTRIBUTION_DEFAULT);
+        const { assert!(!CONTRIBUTION_DEFAULT) };
         assert!(
             !contribution_autorisee(&settings),
             "une base neuve ne porte aucun consentement : rien ne doit partir"
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn la_synchronisation_reste_un_opt_in() {
         let settings = SettingsRepo::with_backend(base_neuve());
-        assert!(!SYNC_DEFAULT);
+        const { assert!(!SYNC_DEFAULT) };
         assert!(!sync_communautaire_autorise(&settings));
     }
 

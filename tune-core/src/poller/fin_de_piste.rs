@@ -117,7 +117,7 @@ impl PositionPoller {
                         let new_pos = zone_state.queue_position + 1;
                         if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                             warn!(zone_id, error = %e, "autoplay_play_failed");
-                            self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                            self.orchestrator.stop(zone_id, device_id).await;
                         }
                         return;
                     }
@@ -174,7 +174,7 @@ impl PositionPoller {
                     );
                     if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
-                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        self.orchestrator.stop(zone_id, device_id).await;
                     }
                     return;
                 }
@@ -237,7 +237,7 @@ impl PositionPoller {
                     );
                     if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
-                        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                        self.orchestrator.stop(zone_id, device_id).await;
                     }
                     return;
                 }
@@ -255,7 +255,7 @@ impl PositionPoller {
                     crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
                 if let Err(e) = queue_repo.append_tracks(zone_id, &track_ids) {
                     warn!(zone_id, error = %e, "autoplay_append_queue_failed");
-                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                    self.orchestrator.stop(zone_id, device_id).await;
                     return;
                 }
 
@@ -278,7 +278,7 @@ impl PositionPoller {
                 info!(zone_id, new_pos, "autoplay_starting_generated_track");
                 if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
                     warn!(zone_id, error = %e, "autoplay_play_failed");
-                    self.orchestrator.stop(zone_id, device_id.as_deref()).await;
+                    self.orchestrator.stop(zone_id, device_id).await;
                 }
                 return;
             }
@@ -296,8 +296,7 @@ impl PositionPoller {
             repeat = ?zone_state.repeat,
             "queue_ended"
         );
-        self.orchestrator.stop(zone_id, device_id.as_deref()).await;
-        return;
+        self.orchestrator.stop(zone_id, device_id).await;
     }
 
     async fn continuer_aleatoirement(
@@ -733,7 +732,7 @@ impl PositionPoller {
                     .await;
                 let output_arc = {
                     let outputs = self.outputs.lock().await;
-                    outputs.get(device_id).map(|a| a.clone())
+                    outputs.get(device_id)
                 };
                 let Some(output_arc) = output_arc else {
                     return GaplessPrep::NotArmed;
@@ -780,11 +779,11 @@ impl PositionPoller {
             }
             Ok(_) => {
                 info!(zone_id, "gapless_local_file_skipped_no_local_next");
-                return GaplessPrep::NotArmed;
+                GaplessPrep::NotArmed
             }
             Err(e) => {
                 warn!(zone_id, error = %e, "gapless_local_file_resolve_failed");
-                return GaplessPrep::NotArmed;
+                GaplessPrep::NotArmed
             }
         }
     }
