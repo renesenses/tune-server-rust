@@ -1833,6 +1833,37 @@ impl AlbumRepo {
         self.mark_compilation(album_id)
     }
 
+    /// #4896 — reprend le titre et/ou l'artiste d'une ligne album d'après les
+    /// balises de ses pistes, que le surveillant de fichiers vient de relire
+    /// (voir `auto_scan::realigner_albums_sur_les_balises`, qui décide).
+    ///
+    /// Écriture ciblée, comme [`Self::reclasser_en_compilation`] : la pochette
+    /// et les dates restent. Chaque champ tenu par une édition manuelle
+    /// (C3) est laissé tel quel. Rend `true` si quelque chose a été écrit.
+    pub fn realigner_sur_les_balises(
+        &self,
+        album_id: i64,
+        titre: Option<&str>,
+        artist_id: Option<i64>,
+    ) -> Result<bool, TuneError> {
+        let mut ecrit = false;
+        if let Some(titre) = titre
+            && !self.tenu_a_la_main(album_id, "title")
+        {
+            self.force_update_title(album_id, titre)?;
+            ecrit = true;
+        }
+        if let Some(artist_id) = artist_id
+            && !self.tenu_a_la_main(album_id, "artist")
+        {
+            let sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+            let params: [&dyn ToSqlValue; 2] = [&artist_id, &album_id];
+            self.db.execute(&sql, &params)?;
+            ecrit = true;
+        }
+        Ok(ecrit)
+    }
+
     /// Répare le drapeau « compilation » et, s'il est donné, l'artiste d'un
     /// album déjà indexé — dans les DEUX sens, contrairement à
     /// [`Self::mark_compilation`].
