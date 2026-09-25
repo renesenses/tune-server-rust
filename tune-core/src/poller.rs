@@ -526,6 +526,9 @@ pub struct PositionPoller {
     /// `relances_demarrage_mort` : la reprise recrée l'état de sondage, un
     /// drapeau posé dedans repartirait à zéro et bouclerait.
     reprises_renderer_cale: Mutex<std::collections::HashMap<i64, Instant>>,
+    /// #4970 — zones masquées en lecture déjà signalées au journal
+    /// (`zone_masquee_en_lecture`), pour ne le dire qu'une fois par lecture.
+    zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 impl PositionPoller {
@@ -545,6 +548,7 @@ impl PositionPoller {
             event_bus: None,
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
+            zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1258,6 +1262,8 @@ mod fin_de_piste_a_l_horloge_4661;
 /// inchangé quand rien n'atteste l'enchaînement.
 #[cfg(test)]
 mod adoption_a_l_horloge_4173;
+#[cfg(test)]
+mod zone_masquee_en_lecture_4970;
 
 /// #4559 — Jean Valjean, fil 1857 : le panneau annonce « WASAPI (shared —
 /// Windows mixer) » pendant que le journal montre le bras exclusif ouvert et

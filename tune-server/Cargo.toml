@@ -998,3 +998,9 @@ path = "tests/reidentification_album.rs"
 [[test]]
 name = "reseau_local_macos_4949"
 path = "tests/reseau_local_macos_4949.rs"
+
+# #4957 — ignorer un appareil ne masque QUE ses propres zones : jamais une
+# zone d'un autre protocole à la même adresse IP.
+[[test]]
+name = "ignorer_un_appareil_ne_masque_que_ses_zones_4957"
+path = "tests/ignorer_un_appareil_ne_masque_que_ses_zones_4957.rs"

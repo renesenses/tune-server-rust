@@ -16,9 +16,36 @@ impl PositionPoller {
         });
 
         // Also poll stopped zones to detect externally-started playback and sync volume
-        let all_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .list()
-            .unwrap_or_default();
+        let depot_zones = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone());
+        let mut all_zones = depot_zones.list().unwrap_or_default();
+
+        // 🔴 #4970 — `list()` ne rend que les zones VISIBLES. Une zone masquée
+        // (appareil ignoré, zone « supprimée ») reste pourtant jouable : si
+        // elle joue, le sondeur la suit sans la trouver ici, lit son type de
+        // sortie comme `""`, et tous les filets de fin propres au DLNA
+        // (gardés par `is_dlna`) restent muets — l'album s'arrête après
+        // chaque piste (DMP-A6, Villerio, 0.9.164). Une zone qui JOUE est
+        // relue par son identifiant, masquée ou non.
+        let masquees_en_lecture =
+            zones_masquees_en_lecture(&all_zones, &states, |id| depot_zones.get(id).ok().flatten());
+        {
+            let mut signalees = self
+                .zones_masquees_signalees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            signalees.retain(|id| masquees_en_lecture.iter().any(|z| z.id == Some(*id)));
+            for z in &masquees_en_lecture {
+                let id = z.id.unwrap_or(0);
+                if signalees.insert(id) {
+                    warn!(
+                        zone_id = id,
+                        output_type = z.output_type.as_deref().unwrap_or(""),
+                        "zone_masquee_en_lecture — le sondeur la suit par son identifiant"
+                    );
+                }
+            }
+        }
+        all_zones.extend(masquees_en_lecture);
 
         // Ne pas laisser l'état de recul survivre à une zone supprimée.
         idle_backoff.retain(|zone_id, _| all_zones.iter().any(|z| z.id == Some(*zone_id)));
@@ -3365,4 +3392,21 @@ impl PositionPoller {
             );
         }
     }
+}
+
+/// #4970 — les zones qui JOUENT mais que `ZoneRepo::list()` ne rend pas
+/// (masquées : `is_hidden = 1`), relues par leur identifiant via `lire`.
+/// Le sondeur les ajoute à sa liste : sans cela, il tourne sur une zone
+/// dont il ignore le type de sortie.
+pub(super) fn zones_masquees_en_lecture(
+    visibles: &[crate::db::zone_repo::Zone],
+    etats: &[crate::playback::ZoneState],
+    lire: impl Fn(i64) -> Option<crate::db::zone_repo::Zone>,
+) -> Vec<crate::db::zone_repo::Zone> {
+    etats
+        .iter()
+        .filter(|s| s.state == PlayState::Playing)
+        .filter(|s| !visibles.iter().any(|z| z.id == Some(s.zone_id)))
+        .filter_map(|s| lire(s.zone_id))
+        .collect()
 }
