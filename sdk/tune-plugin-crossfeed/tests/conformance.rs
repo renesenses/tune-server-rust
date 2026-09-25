@@ -92,3 +92,75 @@ fn integer_sdk_matches_legacy_quantization() {
         expected
     );
 }
+
+/// #4973 — les rails et la demi-échelle, par PROFONDEUR : une source MONO
+/// (L = R) traverse le crossfeed actif sans perdre un bit, par l'instance du
+/// greffon comme par `process_pcm`. Avant, l'encodage à 2^(N−1) − 1 rendait
+/// −32 768 en −32 767, et 32 767 en 32 766.
+#[test]
+fn une_source_mono_traverse_le_greffon_au_bit_pres_4973() {
+    let reglage = json!({"enabled":true,"amount":0.3,"delay_ms":0.3});
+    let contexte = || BlockContext {
+        zone_id: 1,
+        generation: 1,
+        position_frames: 0,
+    };
+    let stereo = |mots: &[i32]| -> Vec<i32> { mots.iter().flat_map(|m| [*m, *m]).collect() };
+
+    // 16 bits.
+    let mots = stereo(&[
+        -32_768, -32_767, -16_385, -1, 0, 1, 16_384, 16_385, 32_766, 32_767,
+    ]);
+    let entree: Vec<i16> = mots.iter().map(|m| *m as i16).collect();
+    let f = AudioFormat::new(44_100, ChannelLayout::Stereo, SampleEncoding::S16).unwrap();
+    let mut p = Crossfeed.prepare(f, 64, &reglage).unwrap();
+    let mut sortie = entree.clone();
+    p.process(
+        &mut AudioBlock::new(f, SamplesMut::S16(&mut sortie), 64).unwrap(),
+        contexte(),
+    )
+    .unwrap();
+    assert_eq!(sortie, entree, "16 bits");
+
+    // 24 bits, petit-boutien compact.
+    let mots = stereo(&[
+        -8_388_608, -8_388_607, -4_194_305, -1, 0, 1, 4_194_304, 8_388_606, 8_388_607,
+    ]);
+    let entree: Vec<u8> = mots
+        .iter()
+        .flat_map(|m| {
+            let b = m.to_le_bytes();
+            [b[0], b[1], b[2]]
+        })
+        .collect();
+    let f = AudioFormat::new(96_000, ChannelLayout::Stereo, SampleEncoding::S24Le).unwrap();
+    let mut p = Crossfeed.prepare(f, 64, &reglage).unwrap();
+    let mut sortie = entree.clone();
+    p.process(
+        &mut AudioBlock::new(f, SamplesMut::S24Le(&mut sortie), 64).unwrap(),
+        contexte(),
+    )
+    .unwrap();
+    assert_eq!(sortie, entree, "24 bits");
+
+    // 32 bits : les rails, et un 24 bits aligné à gauche — ce qu'un `f32`
+    // porte exactement.
+    let entree = stereo(&[
+        i32::MIN,
+        -8_388_607 << 8,
+        -1,
+        0,
+        1,
+        8_388_607 << 8,
+        i32::MAX,
+    ]);
+    let f = AudioFormat::new(192_000, ChannelLayout::Stereo, SampleEncoding::S32).unwrap();
+    let mut p = Crossfeed.prepare(f, 64, &reglage).unwrap();
+    let mut sortie = entree.clone();
+    p.process(
+        &mut AudioBlock::new(f, SamplesMut::S32(&mut sortie), 64).unwrap(),
+        contexte(),
+    )
+    .unwrap();
+    assert_eq!(sortie, entree, "32 bits");
+}
