@@ -347,6 +347,32 @@ fn running_in_docker() -> bool {
     false
 }
 
+/// Consigne rendue à l'utilisateur qui lance la mise à jour depuis un
+/// conteneur. La version précédente tenait en une commande —
+/// `docker compose pull && docker compose up -d` — et supposait, sans le dire,
+/// un déploiement par fichier compose référençant une étiquette MOBILE.
+///
+/// Daniel LEVY (fil 1865 réponse 6606, puis fil 1874) est resté bloqué une
+/// journée sur cette supposition : son `docker-compose.yml`, recopié de la page
+/// Download, porte `image: renesenses/tune:v0.9.156`. Sur une étiquette figée,
+/// `docker compose pull` re-résout le MÊME digest, ne télécharge rien et rend
+/// un code de sortie NUL — l'échec est muet, et la consigne affichée ne laisse
+/// rien soupçonner. Le texte nomme donc désormais les trois choses qu'il
+/// passait sous silence : l'étiquette figée, le dossier d'où lancer la
+/// commande, et le cas sans fichier compose (Container Manager / Container
+/// Station, le cas des NAS Synology et QNAP).
+const DOCKER_UPDATE_HINT: &str = "You're running Tune in Docker, so the in-app update cannot replace the binary — pull the new image instead. 1. Open your docker-compose.yml and look at the image line: if it pins a version (for example `renesenses/tune:v0.9.156`), `docker compose pull` re-resolves that exact same image, downloads nothing and still reports success — change it to `renesenses/tune:latest` first. 2. From the folder that holds that docker-compose.yml, run: docker compose pull && docker compose up -d. If Tune was installed without a compose file — Synology Container Manager, QNAP Container Station, or a plain `docker run` — do it from that interface instead: download the `renesenses/tune:latest` image in the Registry, then stop the container and reset (or rebuild) it from the new image. Your data in the mounted volumes is preserved either way.";
+
+/// Corps rendu par la branche conteneur de `POST /system/update/install`.
+/// Il vit ici, et non dans le handler, pour qu'un test puisse le relire : la
+/// branche elle-même n'est atteignable que dans un conteneur Linux.
+fn docker_update_result() -> serde_json::Value {
+    json!({
+        "status": "docker",
+        "message": DOCKER_UPDATE_HINT,
+    })
+}
+
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade tune-server";
 const HOMEBREW_UPDATE_HINT: &str = "This Tune installation is managed by Homebrew. Update it with `brew update && brew upgrade tune-server`. If the renesenses tap stays stale, run `brew untap renesenses/tap && brew tap renesenses/tap` first.";
 
@@ -2261,14 +2287,7 @@ pub(super) async fn update_install(
     // can present as guidance rather than a failure.
     if running_in_docker() {
         info!("update_skipped_docker");
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "status": "docker",
-                "message": "You're running Tune in Docker. Update by pulling the new image: docker compose pull && docker compose up -d (your data in the mounted volumes is preserved)."
-            })),
-        )
-            .into_response();
+        return (StatusCode::OK, Json(docker_update_result())).into_response();
     }
 
     let current_exe = std::env::current_exe().ok();
@@ -6037,5 +6056,91 @@ mod homebrew_upgrade_tests {
         // qui pourrait porter autre chose.
         assert!(script.contains("\"$BREW\" upgrade tune-server"));
         assert!(script.contains("NONINTERACTIVE=1"));
+    }
+}
+
+/// #4646 — la consigne Docker doit nommer ce que l'ancienne taisait.
+///
+/// Elle tenait en une commande, `docker compose pull && docker compose up -d`,
+/// vraie seulement si le service référence une étiquette MOBILE. Daniel LEVY,
+/// dont le `docker-compose.yml` porte `renesenses/tune:v0.9.156`, a lancé cette
+/// commande, n'a eu aucun message d'erreur, et n'a rien mis à jour : sur une
+/// étiquette figée le `pull` re-résout le même digest et rend 0. Ce banc relit
+/// le texte rendu à l'utilisateur, pas la commande écrite dans le handler.
+#[cfg(test)]
+mod docker_update_hint_tests {
+    use super::{DOCKER_UPDATE_HINT, docker_update_result};
+
+    /// Compte les occurrences d'un motif, pour ne pas prendre une mention
+    /// unique pour une explication.
+    fn occurrences(motif: &str) -> usize {
+        DOCKER_UPDATE_HINT.matches(motif).count()
+    }
+
+    #[test]
+    fn la_consigne_avertit_qu_une_etiquette_figee_rend_le_pull_muet() {
+        // Le cas de Daniel : l'exemple cite une étiquette figée…
+        assert!(
+            occurrences("renesenses/tune:v0.9.156") >= 1,
+            "la consigne ne montre aucun exemple d'étiquette figée — l'utilisateur ne peut pas reconnaître son propre cas : {DOCKER_UPDATE_HINT}"
+        );
+        // …et dit que le pull réussit SANS rien télécharger, ce qui est le
+        // cœur du piège : l'échec est muet.
+        assert!(
+            DOCKER_UPDATE_HINT.contains("downloads nothing")
+                && DOCKER_UPDATE_HINT.contains("reports success"),
+            "la consigne ne dit pas qu'un pull sur étiquette figée réussit sans rien faire : {DOCKER_UPDATE_HINT}"
+        );
+        // …et nomme le remède.
+        assert!(
+            occurrences("renesenses/tune:latest") >= 1,
+            "la consigne ne nomme pas l'étiquette mobile à mettre à la place : {DOCKER_UPDATE_HINT}"
+        );
+    }
+
+    #[test]
+    fn la_consigne_situe_la_commande_et_garde_la_commande() {
+        assert!(
+            DOCKER_UPDATE_HINT.contains("docker compose pull && docker compose up -d"),
+            "la commande de mise à jour a disparu de la consigne : {DOCKER_UPDATE_HINT}"
+        );
+        assert!(
+            DOCKER_UPDATE_HINT.contains("From the folder that holds that docker-compose.yml"),
+            "la consigne ne dit pas d'où lancer la commande — lancée ailleurs elle rend `no configuration file provided` : {DOCKER_UPDATE_HINT}"
+        );
+    }
+
+    #[test]
+    fn la_consigne_couvre_l_installation_sans_fichier_compose() {
+        // Synology et QNAP installent couramment sans fichier compose : la
+        // commande n'a alors aucun projet sur lequel agir.
+        for repere in [
+            "Synology Container Manager",
+            "QNAP Container Station",
+            "docker run",
+            "Registry",
+        ] {
+            assert!(
+                DOCKER_UPDATE_HINT.contains(repere),
+                "la consigne ne couvre pas l'installation sans fichier compose : « {repere} » absent de : {DOCKER_UPDATE_HINT}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_consigne_rassure_toujours_sur_les_donnees() {
+        assert!(
+            DOCKER_UPDATE_HINT.contains("mounted volumes is preserved"),
+            "la consigne ne dit plus que les données des volumes montés survivent : {DOCKER_UPDATE_HINT}"
+        );
+    }
+
+    /// La branche conteneur du handler rend ce corps-ci. Le statut est lu par
+    /// les clients : il ne doit pas bouger.
+    #[test]
+    fn le_corps_rendu_porte_le_statut_docker_et_cette_consigne() {
+        let corps = docker_update_result();
+        assert_eq!(corps["status"], "docker");
+        assert_eq!(corps["message"], DOCKER_UPDATE_HINT);
     }
 }
