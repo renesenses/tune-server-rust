@@ -42,6 +42,7 @@ mod postgres_e2e;
 pub mod profile_repo;
 pub mod radio_repo;
 pub mod rating_repo;
+pub mod rattrapage_metadonnees_5043;
 pub mod settings_repo;
 pub mod source_link_repo;
 pub mod sqlite;

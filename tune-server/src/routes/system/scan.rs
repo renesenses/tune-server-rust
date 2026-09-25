@@ -1471,6 +1471,45 @@ pub(crate) async fn spawn_library_scan_confirmee(
             .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
 
+        // #5043 — le RATTRAPAGE des métadonnées étendues, et sa borne.
+        //
+        // Un scan complet (`?force=true` / `?full=true`, le bouton « Scan
+        // complet ») désactive le raccourci « inchangé » : TOUS les fichiers
+        // entrent dans son lot de travail, y compris ceux qui n'ont pas bougé.
+        // C'est ce qui permet au bloc de métadonnées étendues, plus bas, de
+        // rattraper une bibliothèque constituée avant son existence. Un scan
+        // incrémental, lui, ne voit jamais un fichier inchangé : il ne rouvre
+        // donc rien de plus, et n'a rien à lire ici.
+        //
+        // La contrepartie : sans borne, chaque scan complet rouvrirait une
+        // SECONDE fois (`read_extended_metadata` ouvre le fichier pour son
+        // compte, après la lecture des balises de base) les 32 333 pistes du
+        // .18 qui ont DÉJÀ leurs crédits. Le surcoût serait permanent au lieu
+        // d'être payé une fois. On lit donc en UNE requête l'ensemble des
+        // pistes qui ont DÉJÀ leurs métadonnées étendues, et aucun lot n'en
+        // rouvre une seule.
+        let deja_pourvues: std::collections::HashSet<i64> = if force {
+            match tune_core::db::rattrapage_metadonnees_5043::pistes_deja_pourvues(&db) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Un échec de lecture ne doit pas SAUTER le rattrapage :
+                    // l'ensemble vide fait relire tout le monde — le
+                    // comportement d'avant #5043, coûteux mais jamais faux.
+                    tracing::warn!(error = %e, "scan_rattrapage_metadonnees_lecture_echouee");
+                    std::collections::HashSet::new()
+                }
+            }
+        } else {
+            std::collections::HashSet::new()
+        };
+        if force {
+            tracing::info!(
+                deja_pourvues = deja_pourvues.len(),
+                "scan_rattrapage_metadonnees_etendues — un fichier inchangé n'est rouvert pour \
+                 ses métadonnées étendues que s'il n'en a AUCUNE (#5043)"
+            );
+        }
+
         // Quick stat pass: skip files whose mtime+size haven't changed.
         // Parallelised: each `path.metadata()` is a blocking stat that, over a
         // NAS/SMB mount, carries real round-trip latency; doing 58k of them
@@ -1752,12 +1791,43 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
                 }
 
-                // Collect extended metadata for tracks in this batch
+                // Collect extended metadata for tracks in this batch.
+                //
+                // #5043 — un fichier NEUF ou MODIFIÉ se relit toujours : ses
+                // balises viennent de changer, ses crédits avec. Un fichier
+                // INCHANGÉ n'est dans ce lot que parce qu'un scan COMPLET a
+                // désactivé le raccourci ; on ne le rouvre alors que s'il n'a
+                // encore AUCUNE métadonnée étendue. Sans cette borne, chaque
+                // scan complet repaierait le second passage sur toute la
+                // bibliothèque, pour n'y rien changer.
+                //
+                // Le critère ne compte PAS les lignes de `track_metadata` : les
+                // clés `rg_*` / `dr_*` / `upnp_*` ont leurs propres écrivains,
+                // qui n'ouvrent jamais le fichier pour ses crédits. Les compter
+                // sauterait à vie les 15 151 pistes du .18 qui n'ont qu'elles
+                // (voir `rattrapage_metadonnees_5043`).
                 let mut extended_meta_paths: Vec<String> = Vec::new();
                 for sf in &batch {
-                    if sf.metadata.is_some() {
-                        extended_meta_paths.push(sf.path.clone());
+                    if sf.metadata.is_none() {
+                        continue;
                     }
+                    // `false` et non `force` : la question est « ce fichier
+                    // a-t-il bougé ? », pas « le scan est-il complet ? ».
+                    let inchange = verdict_ecriture(
+                        &sf.path,
+                        sf.mtime,
+                        sf.file_size,
+                        false,
+                        &existing_tracks,
+                    ) == VerdictEcriture::Inchange;
+                    if inchange
+                        && existing_tracks
+                            .get(sf.path.as_str())
+                            .is_some_and(|info| deja_pourvues.contains(&info.id))
+                    {
+                        continue;
+                    }
+                    extended_meta_paths.push(sf.path.clone());
                 }
 
                 // Batch insert + update using prepared statements. Per-row
@@ -1824,16 +1894,33 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     let meta_repo = tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone());
                     let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> = Vec::new();
 
+                    // #5043 — les `tracks.id` du lot, par une lecture FORTE.
+                    //
+                    // Ce bloc tourne DANS la transaction du lot. `get_by_path`
+                    // passait par le pool de lecture — des connexions SÉPARÉES
+                    // sous SQLite, qui ne voient pas ce que cette transaction
+                    // vient d'écrire. Elle rendait `None`, le `if let
+                    // Ok(Some(..))` l'avalait, et aucune métadonnée étendue
+                    // n'entrait en base : sur le .18, un scan complet de
+                    // 46 965 fichiers n'a posé PAS UNE clé de crédit.
+                    //
+                    // Une requête par tranche, et non une par fichier.
+                    let ids = tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(
+                        &db,
+                        &extended_meta_paths,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "scan_ids_des_metadonnees_etendues_echec");
+                        std::collections::HashMap::new()
+                    });
                     for path_str in &extended_meta_paths {
                         let path = std::path::Path::new(path_str);
-                        // Look up the track_id by file_path
-                        if let Ok(Some(track)) = track_repo.get_by_path(path_str) {
-                            if let Some(track_id) = track.id {
-                                let ext_meta = tune_core::metadata::read_extended_metadata(path);
-                                if !ext_meta.is_empty() {
-                                    meta_entries.push((track_id, ext_meta));
-                                }
-                            }
+                        let Some(track_id) = ids.get(path_str).copied() else {
+                            continue;
+                        };
+                        let ext_meta = tune_core::metadata::read_extended_metadata(path);
+                        if !ext_meta.is_empty() {
+                            meta_entries.push((track_id, ext_meta));
                         }
                     }
 
