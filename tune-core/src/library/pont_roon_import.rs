@@ -258,7 +258,14 @@ pub fn appliquer(
                         if let Some(hash) = octets_de(&al.image).and_then(|d| ranger(&d, images)) {
                             // `force` : une chaîne vide n'est pas remplacée par
                             // COALESCE ; on vient de vérifier qu'il n'y a rien.
-                            if albums.force_update_cover_path(album_id, &hash).is_ok() {
+                            if albums
+                                .force_update_cover_path(
+                                    album_id,
+                                    &hash,
+                                    crate::db::models::SourcePochette::Importee,
+                                )
+                                .is_ok()
+                            {
                                 r.images_albums_posees += 1;
                             }
                         }

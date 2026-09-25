@@ -17,6 +17,8 @@ pub mod local_path;
 pub mod lyrics_pass;
 pub mod m3u_parser;
 pub mod playlist_scan;
+/// La pochette d'un album face au disque : retrait et suivi (#5034).
+pub mod pochette_disque;
 pub mod pont_roon;
 /// Appliquer un export du pont Roon (crédits, images) contre la base.
 pub mod pont_roon_import;

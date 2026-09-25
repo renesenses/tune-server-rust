@@ -378,6 +378,9 @@ fn sanitize_track_row_text(track: &mut Track) -> Vec<tune_core::metadata::TextCo
 /// (re)index. The caller keeps ownership of the unchanged-file skip, the
 /// insert-vs-update decision, dedup, and the transaction.
 pub struct TrackImporter {
+    /// La base, pour la pochette d'album (#5034) : `pochette_disque` relit
+    /// les pistes de l'album quand son fichier source a disparu.
+    db: Arc<dyn DbBackend>,
     artist_repo: ArtistRepo,
     album_repo: AlbumRepo,
     quality_split: bool,
@@ -457,8 +460,9 @@ pub struct TrackImporter {
     /// celle de la base.
     ///
     /// Faux par défaut — c'est le scan incrémental et le surveillant de
-    /// fichiers, qui gardent la sonde héritée (URL stables, #1444) et
-    /// l'écriture `COALESCE` (une pochette posée une fois ne bouge plus).
+    /// fichiers : une pochette posée ne bouge plus, SAUF quand le fichier
+    /// qui l'avait donnée a disparu (#5034, `library::pochette_disque`). Une
+    /// pochette téléversée n'est jamais touchée, même par un scan forcé.
     ///
     /// Vrai uniquement pour un scan forcé, exactement comme le genre d'album
     /// (`scan.rs`, « A forced full scan is an explicit "rebuild from the files"
@@ -486,6 +490,7 @@ impl TrackImporter {
     ) -> Self {
         let preuves = Self::amorcer_depuis_la_base(&db, portee);
         Self {
+            db: db.clone(),
             artist_repo: ArtistRepo::with_backend(db.clone()),
             album_repo: AlbumRepo::with_backend(db),
             quality_split,
@@ -1172,38 +1177,35 @@ impl TrackImporter {
         if let Some(aid) = album_id
             && !self.albums_with_cover.contains(&aid)
         {
+            // La pochette d'album face au DISQUE (#5034) : une règle, portée
+            // par `pochette_disque`, partagée avec le surveillant et le
+            // rattrapage de fin de scan. Elle pose la pochette d'un album qui
+            // n'en a pas (jaquette intégrée d'abord, puis image du dossier),
+            // et RETIRE celle dont le fichier source a disparu — ce que rien
+            // ne faisait, même « Analyse complète ». Une pochette téléversée
+            // n'est jamais touchée.
+            //
             // Prefer the embedded cover already read while parsing the tags —
             // re-opening the file to extract it failed (os error 3) for some
             // accented Windows paths even though the first read had succeeded.
+            // `suivre_la_piste` n'ouvre la piste que si ces octets manquent.
             //
-            // Sur un « Scan complet », les variantes `*_refresh` sautent la
-            // sonde héritée : celle-ci est adressée par le CHEMIN de la piste,
-            // qui ne bouge pas quand on remplace `cover.jpg`, et rendait donc
-            // l'ancienne image sans rouvrir le moindre fichier (#3028).
-            let cover_hash = match meta.cover_art.as_ref() {
-                Some(cover) if self.force_artwork => {
-                    tune_core::library::artwork::cache_embedded_cover(
-                        std::path::Path::new(&sf.path),
-                        &self.cache_dir,
-                        cover,
-                    )
-                }
-                Some(cover) => tune_core::library::artwork::save_embedded_cover(
-                    std::path::Path::new(&sf.path),
-                    &self.cache_dir,
-                    cover,
-                ),
-                None if self.force_artwork => tune_core::library::artwork::refresh_cover_hash(
-                    std::path::Path::new(&sf.path),
-                    &self.cache_dir,
-                ),
-                None => tune_core::library::artwork::get_or_extract(
-                    std::path::Path::new(&sf.path),
-                    &self.cache_dir,
-                ),
-            };
+            // Sur un « Scan complet », la lecture saute la sonde héritée :
+            // celle-ci est adressée par le CHEMIN de la piste, qui ne bouge pas
+            // quand on remplace `cover.jpg`, et rendait donc l'ancienne image
+            // sans rouvrir le moindre fichier (#3028). Les passes
+            // automatiques la sautent aussi désormais : la pochette est
+            // comparée par son CONTENU.
+            let suivi = tune_core::library::pochette_disque::suivre_la_piste(
+                &self.db,
+                aid,
+                std::path::Path::new(&sf.path),
+                meta.cover_art.as_ref(),
+                &self.cache_dir,
+                self.force_artwork,
+            );
             // #4650 — cette jaquette-ci FAIT RÉFÉRENCE pour l'album : c'est
-            // d'elle que sort la pochette d'album ci-dessous. Toute piste dont
+            // d'elle que sort la pochette d'album ci-dessus. Toute piste dont
             // l'image intégrée s'en écarte portera une pochette à elle.
             //
             // Seule la branche « octets en main » amorce la référence : quand
@@ -1217,22 +1219,10 @@ impl TrackImporter {
                     .entry(aid)
                     .or_insert_with(|| tune_core::library::artwork::content_hash(&cover.0));
             }
-            if let Some(hash) = cover_hash {
-                // `update_cover_path` est un `COALESCE` : il ne remplace jamais
-                // une valeur déjà posée. C'est ce qu'il faut entre deux scans
-                // complets, et c'est exactement ce qui retenait l'ancienne
-                // pochette en base quand l'utilisateur en avait posé une neuve
-                // sur son disque (#3028). Un scan forcé écrase, comme il écrase
-                // déjà le genre d'album.
-                let ecriture = if self.force_artwork {
-                    self.album_repo.force_update_cover_path(aid, &hash)
-                } else {
-                    self.album_repo.update_cover_path(aid, &hash)
-                };
-                if let Err(e) = ecriture {
-                    tracing::warn!(album_id = aid, error = %e, "cover_path_update_failed");
-                }
+            if suivi.tranche {
                 self.albums_with_cover.insert(aid);
+            }
+            if suivi.posee {
                 self.artwork_extracted += 1;
             }
         }

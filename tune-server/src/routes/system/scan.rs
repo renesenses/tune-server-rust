@@ -2304,6 +2304,19 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // retouché suit ses balises, par la même règle que le surveillant.
         balises_vues.realigner(&db);
 
+        // #5034 — APRÈS la purge : chaque pochette tirée d'un fichier du
+        // disque est confrontée à ce fichier, d'un `stat`. Le scan rapide ne
+        // relit que les pistes modifiées : un `cover.jpg` supprimé dans un
+        // album dont aucune piste n'a bougé n'était vu par personne.
+        // « Répertoires » ne regarde que son dossier.
+        let portee_pochettes: Vec<String> = targeted.iter().cloned().collect();
+        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+            &db,
+            &cache_dir,
+            &portee_pochettes,
+            force,
+        );
+
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —
         // can leave album rows behind that no track references. Without this
