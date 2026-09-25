@@ -113,7 +113,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 use crate::state::AppState;
 
@@ -231,13 +231,31 @@ async fn cache_control_middleware(
     if headers.contains_key(axum::http::header::CACHE_CONTROL) {
         return response;
     }
-    if path.starts_with("/assets/") {
+    // `immutable` ne se décide pas sur le seul chemin : une réponse d'erreur
+    // marquée immuable un an survit aux rechargements (#4847).
+    let succes = response.status().is_success();
+    let est_du_html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/html"));
+    let headers = response.headers_mut();
+    if path.starts_with("/assets/") && succes && !est_du_html {
         // Hashed assets (index-Bmb2F8zZ.js) — immutable, cache forever
         headers.insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
         );
-    } else if path == "/" || path.ends_with(".html") || !path.contains('.') {
+    } else if path.starts_with("/assets/") {
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+    } else if path == "/"
+        || path.ends_with(".html")
+        || !path.contains('.')
+        || (succes && est_du_html)
+    {
         // HTML pages and SPA routes — always revalidate
         headers.insert(
             axum::http::header::CACHE_CONTROL,
@@ -276,6 +294,86 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
+}
+
+/// Extensions des fichiers que le client web (ou une skin) demande au disque.
+/// Un chemin dont le DERNIER segment porte l'une d'elles est un fichier, pas une
+/// route de l'application : absent, il rend 404 (#4847). La liste est fermée
+/// exprès — `/artist/R.E.M.` ou `/album/1.5` ont un point sans être des fichiers.
+const EXTENSIONS_STATIQUES: &[&str] = &[
+    "js",
+    "mjs",
+    "cjs",
+    "css",
+    "map",
+    "json",
+    "wasm",
+    "html",
+    "htm",
+    "txt",
+    "xml",
+    "webmanifest",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "webp",
+    "avif",
+    "ico",
+    "bmp",
+    "woff",
+    "woff2",
+    "ttf",
+    "otf",
+    "eot",
+];
+
+/// Le chemin désigne-t-il un fichier statique plutôt qu'une route SPA ?
+///
+/// Tout ce qui est sous `/assets/` est un fichier (morceaux hachés de Vite).
+/// Ailleurs, seul le dernier segment compte : un point dans un segment
+/// intermédiaire (`/artist/Mr.%20Oizo/albums`) ne fait pas un fichier.
+fn designe_un_fichier_statique(path: &str) -> bool {
+    if path.starts_with("/assets/") {
+        return true;
+    }
+    let dernier = path.rsplit('/').next().unwrap_or("");
+    dernier.rsplit_once('.').is_some_and(|(_, ext)| {
+        EXTENSIONS_STATIQUES
+            .iter()
+            .any(|e| ext.eq_ignore_ascii_case(e))
+    })
+}
+
+/// Service statique d'un répertoire web (`web/` ou une skin) avec repli SPA.
+///
+/// Le repli de `ServeDir` ne sert `index.html` qu'aux routes de l'application ;
+/// un fichier absent rend 404 `no-store`. Avant #4847, le repli servait
+/// `index.html` en 200 à TOUT chemin absent, `/assets/*.js` compris.
+fn service_statique_spa(dir: &std::path::Path) -> ServeDir<axum::routing::MethodRouter> {
+    let index = std::sync::Arc::new(dir.join("index.html"));
+    let repli = axum::routing::any(move |uri: axum::http::Uri| {
+        let index = index.clone();
+        async move {
+            if designe_un_fichier_statique(uri.path()) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CACHE_CONTROL, "no-store")],
+                )
+                    .into_response();
+            }
+            match tokio::fs::read(index.as_path()).await {
+                Ok(html) => (
+                    [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    html,
+                )
+                    .into_response(),
+                Err(_) => StatusCode::NOT_FOUND.into_response(),
+            }
+        }
+    });
+    ServeDir::new(dir).fallback(repli)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -545,10 +643,7 @@ pub fn router_with_plugins(
         let index = format!("{}/index.html", skin_path.display());
         if std::path::Path::new(&index).exists() {
             tracing::info!(skin_id = %skin_id, path = %skin_path.display(), "skin_mounted");
-            app = app.nest_service(
-                &format!("/{skin_id}"),
-                ServeDir::new(&skin_path).fallback(ServeFile::new(&index)),
-            );
+            app = app.nest_service(&format!("/{skin_id}"), service_statique_spa(&skin_path));
         }
     }
 
@@ -574,9 +669,7 @@ pub fn router_with_plugins(
             }
         }),
     )
-    .fallback_service(
-        ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html"))),
-    )
+    .fallback_service(service_statique_spa(std::path::Path::new(&web_dir)))
     .layer(axum::middleware::from_fn(cache_control_middleware))
     .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new())
@@ -595,6 +688,151 @@ mod escape_tests {
         );
         assert_eq!(html_escape("O'Brien"), "O&#x27;Brien");
         assert_eq!(html_escape("plain radio"), "plain radio");
+    }
+}
+
+/// Repli SPA et cache des assets (#4847).
+///
+/// Mesuré sur le .18 après le passage 0.9.162 → 0.9.163 : un morceau haché de
+/// l'ANCIENNE version, absent du disque, rendait `index.html` en 200 marqué
+/// `immutable` pour un an. L'onglet resté ouvert recevait du HTML à la place du
+/// JavaScript, et le navigateur gardait cette mauvaise charge sous l'URL de
+/// l'asset.
+///
+/// Le routeur de test est bâti des MÊMES pièces que la production :
+/// `service_statique_spa` (repli de `web/` ET de chaque skin) sous
+/// `cache_control_middleware`.
+#[cfg(test)]
+mod repli_spa_tests {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    fn web_dir_temporaire() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!DOCTYPE html><html><body>spa</body></html>",
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("assets")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/present-abc.js"),
+            "export const x = 1;",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn app(dir: &std::path::Path) -> Router {
+        Router::new()
+            .nest_service("/skin-test", super::service_statique_spa(dir))
+            .fallback_service(super::service_statique_spa(dir))
+            .layer(axum::middleware::from_fn(super::cache_control_middleware))
+    }
+
+    async fn get(app: &Router, chemin: &str) -> (StatusCode, String, String, String) {
+        let r = app
+            .clone()
+            .oneshot(Request::get(chemin).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let en_tete = |n: header::HeaderName| {
+            r.headers()
+                .get(n)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (ct, cc) = (
+            en_tete(header::CONTENT_TYPE),
+            en_tete(header::CACHE_CONTROL),
+        );
+        let status = r.status();
+        let corps = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, ct, cc, String::from_utf8_lossy(&corps).into_owned())
+    }
+
+    #[tokio::test]
+    async fn un_asset_present_est_servi_immuable() {
+        let dir = web_dir_temporaire();
+        let app = app(dir.path());
+        let (status, ct, cc, corps) = get(&app, "/assets/present-abc.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(ct.contains("javascript"), "content-type = {ct}");
+        assert!(cc.contains("immutable"), "cache-control = {cc}");
+        assert!(corps.contains("export const x"));
+    }
+
+    #[tokio::test]
+    async fn un_asset_absent_rend_404_jamais_immuable() {
+        let dir = web_dir_temporaire();
+        let app = app(dir.path());
+        for chemin in [
+            "/assets/absent-xyz.js",
+            "/assets/index-9f5_wNpC.css",
+            "/assets/sans-extension",
+            "/favicon-absent.png",
+            "/police-absente.WOFF2",
+            "/skin-test/assets/absent-xyz.js",
+            "/skin-test/logo-absent.svg",
+        ] {
+            let (status, ct, cc, corps) = get(&app, chemin).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{chemin} : {ct} {cc}");
+            assert!(!cc.contains("immutable"), "{chemin} : cache-control = {cc}");
+            assert!(!corps.contains("<!DOCTYPE"), "{chemin} a rendu index.html");
+        }
+    }
+
+    /// Le middleware seul, sans le `no-store` que pose le repli : une réponse
+    /// d'erreur, ou du HTML, sous `/assets/` n'est jamais immuable — quelle que
+    /// soit la source qui l'a produite.
+    #[tokio::test]
+    async fn le_middleware_ne_rend_immuable_qu_un_vrai_fichier() {
+        let app = Router::new()
+            .route(
+                "/assets/erreur.js",
+                axum::routing::get(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/assets/html.js",
+                axum::routing::get(|| async { axum::response::Html("<!DOCTYPE html>") }),
+            )
+            .layer(axum::middleware::from_fn(super::cache_control_middleware));
+        for chemin in ["/assets/erreur.js", "/assets/html.js"] {
+            let (_, _, cc, _) = get(&app, chemin).await;
+            assert!(!cc.contains("immutable"), "{chemin} : cache-control = {cc}");
+        }
+    }
+
+    #[tokio::test]
+    async fn une_route_spa_rend_index_html_revalide() {
+        let dir = web_dir_temporaire();
+        let app = app(dir.path());
+        for chemin in [
+            "/library/albums",
+            "/artist/12",
+            "/skin-test/library/albums",
+            // Un point dans un segment INTERMÉDIAIRE : c'est le dernier qui compte.
+            "/artist/Mr.%20Oizo/albums",
+            // Un point dans le dernier segment qui n'est pas une extension de
+            // fichier statique : nom d'artiste, id.
+            "/artist/R.E.M.",
+            "/artist/Dr.%20Dre",
+            "/album/1.5",
+        ] {
+            let (status, ct, cc, corps) = get(&app, chemin).await;
+            assert_eq!(status, StatusCode::OK, "{chemin}");
+            assert!(
+                ct.starts_with("text/html"),
+                "{chemin} : content-type = {ct}"
+            );
+            assert!(corps.contains("<!DOCTYPE"), "{chemin}");
+            assert!(!cc.contains("immutable"), "{chemin} : cache-control = {cc}");
+            assert!(cc.contains("no-cache"), "{chemin} : cache-control = {cc}");
+        }
     }
 }
 

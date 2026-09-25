@@ -1136,6 +1136,13 @@ pub(super) struct MotifsDeTranscodage {
     /// DMP-A8 lit ses en-têtes puis cale, muet. Ré-encodé par Tune, sans perte,
     /// il joue. Voir `audio::flac_vendeur`.
     pub(super) flac_ffmpeg_vers_le_reseau: bool,
+    /// #4800 — le conteneur NEUF de ce FLAC est prêt : en-tête réécrit,
+    /// trames copiées telles quelles (`audio::flac_vendeur::conteneur_neuf`).
+    /// Il tient la promesse de #4350 sans décoder ni ré-encoder : seul, le
+    /// motif `flac_ffmpeg_vers_le_reseau` ne force alors plus le transcodage,
+    /// la piste part en passthrough sous son en-tête neuf. Faux quand
+    /// l'en-tête n'a pas pu être lu : le transcodage reste la voie sûre.
+    pub(super) conteneur_flac_neuf_pret: bool,
     /// #4573 — la source a PLUS de canaux que le renderer n'en annonce. Servir
     /// le fichier tel quel laisse l'ampli se débrouiller : le Denon
     /// AVR-X1600H de Xavier replie le 5.1 en stéréo avec son propre mélange,
@@ -1158,7 +1165,7 @@ pub(super) fn transcodage_requis(motifs: &MotifsDeTranscodage) -> bool {
         || motifs.dsp_progressif_wav
         || (motifs.dlna_cap_16bit && motifs.will_be_flac)
         || motifs.est_une_tranche_cue
-        || motifs.flac_ffmpeg_vers_le_reseau
+        || (motifs.flac_ffmpeg_vers_le_reseau && !motifs.conteneur_flac_neuf_pret)
         || motifs.reduction_de_canaux
 }
 
@@ -1358,6 +1365,7 @@ mod lecture_locale_tests {
             will_be_flac: false,
             est_une_tranche_cue: false,
             flac_ffmpeg_vers_le_reseau: false,
+            conteneur_flac_neuf_pret: false,
             reduction_de_canaux: false,
         }
     }
@@ -1515,5 +1523,102 @@ mod flac_ffmpeg_tests {
             false,
             || None
         ));
+    }
+
+    fn flac_ffmpeg_seul() -> MotifsDeTranscodage {
+        MotifsDeTranscodage {
+            needs_transcode_for_output: false,
+            oaat_needs_wav: false,
+            local_needs_wav: false,
+            browser_needs_wav: false,
+            needs_downsample: false,
+            dlna_needs_wav: false,
+            eq_forces_transcode: false,
+            dsp_progressif_wav: false,
+            dlna_cap_16bit: false,
+            will_be_flac: true,
+            est_une_tranche_cue: false,
+            flac_ffmpeg_vers_le_reseau: true,
+            conteneur_flac_neuf_pret: false,
+            reduction_de_canaux: false,
+        }
+    }
+
+    /// #4800 — le conteneur neuf prêt, le FLAC de l'enregistreur part en
+    /// passthrough : plus de décodage-ré-encodage avant le premier son.
+    #[test]
+    fn un_conteneur_neuf_pret_epargne_le_transcodage_4800() {
+        assert!(!transcodage_requis(&MotifsDeTranscodage {
+            conteneur_flac_neuf_pret: true,
+            ..flac_ffmpeg_seul()
+        }));
+    }
+
+    /// Témoin : sans conteneur neuf (en-tête illisible), la règle de #4350
+    /// tient mot pour mot — le fichier est ré-encodé, jamais servi tel quel.
+    #[test]
+    fn sans_conteneur_neuf_le_flac_ffmpeg_est_toujours_transcode_4350() {
+        assert!(transcodage_requis(&flac_ffmpeg_seul()));
+    }
+
+    /// Témoin : un conteneur neuf n'efface aucun AUTRE motif. Égaliseur,
+    /// plafond de fréquence, plafond 16 bits, canaux à replier, tranche CUE :
+    /// chacun transcode comme avant.
+    #[test]
+    fn le_conteneur_neuf_n_efface_aucun_autre_motif() {
+        let pret = MotifsDeTranscodage {
+            conteneur_flac_neuf_pret: true,
+            ..flac_ffmpeg_seul()
+        };
+        let autres = [
+            (
+                "eq_forces_transcode",
+                MotifsDeTranscodage {
+                    eq_forces_transcode: true,
+                    ..pret
+                },
+            ),
+            (
+                "needs_downsample",
+                MotifsDeTranscodage {
+                    needs_downsample: true,
+                    ..pret
+                },
+            ),
+            (
+                "dlna_cap_16bit",
+                MotifsDeTranscodage {
+                    dlna_cap_16bit: true,
+                    ..pret
+                },
+            ),
+            (
+                "dlna_needs_wav",
+                MotifsDeTranscodage {
+                    dlna_needs_wav: true,
+                    ..pret
+                },
+            ),
+            (
+                "reduction_de_canaux",
+                MotifsDeTranscodage {
+                    reduction_de_canaux: true,
+                    ..pret
+                },
+            ),
+            (
+                "est_une_tranche_cue",
+                MotifsDeTranscodage {
+                    est_une_tranche_cue: true,
+                    ..pret
+                },
+            ),
+        ];
+        for (nom, motif) in &autres {
+            assert!(
+                transcodage_requis(motif),
+                "{nom} doit transcoder, conteneur neuf ou pas"
+            );
+        }
     }
 }

@@ -424,7 +424,39 @@ pub(super) struct TrancheSource {
     pub(super) duree_s: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn transcode_source_to_file(
+    source: String,
+    out_sr: u32,
+    channels: u16,
+    target_bd: u16,
+    target_fmt: String,
+    eq: Option<crate::audio::eq::EqProcessor>,
+    convolver: Option<crate::audio::convolver::Convolver>,
+    replaygain: Option<f64>,
+    dest: String,
+    progres: Option<std::sync::Arc<crate::audio::decode_progress::DecodeProgress>>,
+    abandon: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    tranche: Option<TrancheSource>,
+) -> Result<(u64, Vec<u8>, u16), String> {
+    transcode_source_to_file_avec_crossfeed(
+        source, out_sr, channels, target_bd, target_fmt, eq, convolver, replaygain, dest, progres,
+        abandon, tranche, None,
+    )
+    .await
+}
+
+/// [`transcode_source_to_file`], plus le CROSSFEED en dernier étage (#2742,
+/// 24/09).
+///
+/// Seule la lecture d'une piste de la bibliothèque vers une zone RÉSEAU le
+/// passe, et seulement par
+/// [`super::crossfeed_bibliotheque_reseau`] : jamais pour une sortie
+/// `local:`, qui l'applique elle-même dans sa boucle de lecture. Le
+/// pré-chauffage (`queue.rs`) garde la porte d'origine, sans crossfeed : sa
+/// rendition n'a pas la même clé de cache.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn transcode_source_to_file_avec_crossfeed(
     source: String,
     out_sr: u32,
     channels: u16,
@@ -445,6 +477,9 @@ pub(super) async fn transcode_source_to_file(
     // piste virtuelle de feuille CUE. `None` pour un fichier ordinaire : le
     // décodage est alors STRICTEMENT celui d'avant (`0.0, 0.0`).
     tranche: Option<TrancheSource>,
+    // #2742 — le crossfeed, dernier étage. `None` : strictement la chaîne
+    // d'avant.
+    crossfeed: Option<crate::audio::crossfeed::CrossfeedProcessor>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -488,6 +523,7 @@ pub(super) async fn transcode_source_to_file(
         .map(|f| (20.0 * f.log10() * 100.0).round() / 100.0);
     let egaliseur = eq.is_some();
     let convolution = convolver.is_some();
+    let crossfeed_actif = crossfeed.is_some();
 
     // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
     //
@@ -534,6 +570,12 @@ pub(super) async fn transcode_source_to_file(
         conv.process_pcm(&mut pcm_bytes, actual_bd);
     }
 
+    // 1e. Le crossfeed EN DERNIER, comme `StreamingDsp::process` et la sortie
+    // locale : il élargit ou resserre l'image d'un signal déjà corrigé (#2742).
+    if let Some(mut cf) = crossfeed {
+        cf.process_pcm(&mut pcm_bytes, actual_bd, decoded.channels as u16);
+    }
+
     let traitement_ms = chrono.elapsed().as_millis() as u64 - decode_ms;
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
@@ -571,6 +613,7 @@ pub(super) async fn transcode_source_to_file(
         replaygain_db = ?replaygain_db,
         egaliseur,
         convolution,
+        crossfeed = crossfeed_actif,
         "transcode_to_temp_file_stages"
     );
 

@@ -1,0 +1,37 @@
+[package]
+name = "tune-cd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# In-tree native plugin (#4863) : lire un CD audio SANS l'extraire.
+#
+# NATIF, pas WASM : il parle au lecteur par ioctl (`/dev/sr*`), ce que le bac
+# à sable WASM n'offre pas — l'hôte WASM n'expose aucun périphérique. Pas non
+# plus un greffon du SDK audio `.tuneplugin` : celui-ci TRAITE un signal que
+# l'hôte lui passe, il ne PRODUIT pas de source.
+#
+# La lecture vers une zone passe par l'hôte : le greffon inscrit un
+# `tune_core::source_pcm::FournisseurPcm` sous la source `cd`, et la file, les
+# sorties et le WAV progressif sont ceux de l'orchestrateur.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+# Identifiant de disque MusicBrainz : SHA-1 puis base64 modifiée. `sha1` 0.10
+# est déjà dans le graphe (même famille RustCrypto que `sha2` 0.10), `base64`
+# 0.22 aussi (tune-core).
+sha1 = "0.10"
+base64 = "0.22"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

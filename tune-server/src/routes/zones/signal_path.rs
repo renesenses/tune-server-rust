@@ -623,6 +623,7 @@ fn assembler_les_etapes(
         format_name,
         is_lossless,
         flac_ffmpeg_vers_le_reseau,
+        conteneur_flac_copie,
         canaux_source,
         canaux_du_fil,
         ..
@@ -769,9 +770,15 @@ fn assembler_les_etapes(
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
             // même résolution ressemble à une erreur d'affichage.
             etape["code"] = json!("flac_container_rewritten");
-            etape["detail"] = json!(
+            // #4800 — deux façons de réécrire le conteneur, et l'écran doit
+            // dire laquelle : l'en-tête neuf sur des trames copiées (aucun
+            // décodage, premier son immédiat) ou, si l'en-tête n'a pas pu
+            // être lu, le décodage-ré-encodage de #4350.
+            etape["detail"] = json!(if conteneur_flac_copie {
+                "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, en-tête neuf, trames copiées telles quelles"
+            } else {
                 "Conteneur réécrit : FLAC écrit par ffmpeg (Lavf) sans MD5, ré-encodé sans perte"
-            );
+            });
         }
         steps.push(etape);
     }
@@ -1713,6 +1720,12 @@ struct Source<'w> {
     /// quel (le DMP-A8 cale sur ces en-têtes). Même fonction que la décision,
     /// `flac_ffmpeg_vers_le_reseau_applies`.
     flac_ffmpeg_vers_le_reseau: bool,
+    /// #4800 — et l'en-tête neuf est prêt : le conteneur est réécrit SANS
+    /// décoder, les trames partent copiées telles quelles
+    /// (`audio::flac_vendeur::conteneur_neuf`). Faux quand l'en-tête n'a pas
+    /// pu être lu : l'orchestrateur décode et ré-encode alors, comme en
+    /// v0.9.154. Même fonction que la décision, sur le même fichier.
+    conteneur_flac_copie: bool,
     /// #4573 — les canaux de la SOURCE, lus dans la ligne `tracks`. `None`
     /// pour une radio ou une piste absente de la base : on ne compare alors
     /// rien, et aucune étape « Canaux » n'apparaît.
@@ -1777,6 +1790,7 @@ fn decrire_la_source<'w>(
                 .map_or("Unknown", AudioFormat::display_name),
             is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
             flac_ffmpeg_vers_le_reseau: false,
+            conteneur_flac_copie: false,
             // Une radio n'a pas de ligne `tracks` : rien à comparer.
             canaux_source: None,
             canaux_du_fil: None,
@@ -1888,17 +1902,28 @@ fn decrire_la_source<'w>(
     // #4350 — la MÊME porte que `resolve_local_track`, sur le MÊME fichier
     // (chemin de la base, orthographe réelle sur disque) : le fichier n'est
     // ouvert que pour un FLAC entier vers une sortie réseau.
+    let chemin_local = || {
+        track
+            .as_ref()
+            .and_then(|t| t.file_path.as_deref())
+            .and_then(tune_core::library::local_path::resolve_existing_local_path)
+    };
     let flac_ffmpeg_vers_le_reseau = tune_core::orchestrator::flac_ffmpeg_vers_le_reseau_applies(
         tune_core::orchestrator::is_network_output_type(Some(output_type)),
         source_format,
         track.as_ref().is_some_and(|t| t.bornes_cue().is_some()),
-        || {
-            track
-                .as_ref()
-                .and_then(|t| t.file_path.as_deref())
-                .and_then(tune_core::library::local_path::resolve_existing_local_path)
-        },
+        chemin_local,
     );
+    // #4800 — la MÊME préparation que la décision : l'en-tête neuf se lit
+    // sur les seuls blocs de métadonnées, et seulement quand la règle
+    // s'applique.
+    let conteneur_flac_copie = flac_ffmpeg_vers_le_reseau
+        && chemin_local().is_some_and(|c| {
+            tune_core::audio::flac_vendeur::conteneur_neuf_pour_passthrough(std::path::Path::new(
+                &c,
+            ))
+            .is_some()
+        });
     Source {
         output_container,
         wire_sample_rate,
@@ -1910,6 +1935,7 @@ fn decrire_la_source<'w>(
         format_name,
         is_lossless,
         flac_ffmpeg_vers_le_reseau,
+        conteneur_flac_copie,
         // #4573 — un `0` en base veut dire « le scan ne l'a pas lu », pas
         // « zéro voie » : filtré ici plutôt que comparé plus loin.
         canaux_source: track

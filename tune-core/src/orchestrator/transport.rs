@@ -1061,45 +1061,17 @@ impl PlaybackOrchestrator {
                 // when the stream is transcoded to WAV for a local output, so
                 // the format chip shows FLAC and not the output container
                 // (Progman/Cyrille: Qobuz shown compressed / wrong format).
-                .or_else(|| match resolved.source.as_str() {
-                    "qobuz" => Some("flac".to_string()),
-                    // Bandcamp : le dire ici — et non depuis le client — pour
-                    // deux raisons : le repli sur le type MIME afficherait
-                    // « MPEG » au lieu de « MP3 », et surtout l'avance de file
-                    // re-résout la piste SANS qu'aucun client repasse un
-                    // format. Sans cette ligne, la piste 1 s'affichait
-                    // autrement que la piste 2 du même habillage.album.
-                    //
-                    // Le codec vient de l'URL, pas du nom du service : sans
-                    // achat Bandcamp ne sert que du `mp3-128`, mais un fichier
-                    // acheté descend en `flac`/`alac` par la même porte, et
-                    // l'annoncer « MP3 » serait faux (#2074). Repli sur `mp3`
-                    // quand l'URL ne nomme rien : c'est l'écoute libre.
-                    "bandcamp" => Some(
-                        req.source_id
-                            .as_deref()
-                            .and_then(bandcamp_encoding)
-                            .and_then(|enc| bandcamp_quality(&enc))
-                            .map(|q| q.codec.to_string())
-                            .unwrap_or_else(|| "mp3".to_string()),
-                    ),
-                    _ => None,
-                })
+                // La source nomme son format (Qobuz : FLAC ; Bandcamp : le
+                // codec de l'URL, #2074). Règle partagée avec l'armement
+                // gapless (#3365), pour que la piste 2 dise la même chose.
+                .or_else(|| format_nomme_par_la_source(&resolved.source, req.source_id.as_deref()))
                 // A media-server (UPnP/NAS) item has no local track row, so the
                 // codec the client read from the DIDL res@protocolInfo is the only
                 // authoritative source: audio/mp4 is ambiguous ALAC-vs-AAC, so
                 // surface "alac" here instead of falling back to the "mp4" MIME
                 // and mislabeling a lossless ALAC as lossy AAC (Yves, NAS).
                 .or_else(|| req.media_format.clone())
-                .or_else(|| {
-                    let mime = &resolved.mime_type;
-                    Some(
-                        mime.strip_prefix("audio/")
-                            .unwrap_or(mime)
-                            .replace("x-", "")
-                            .to_string(),
-                    )
-                }),
+                .or_else(|| Some(format_du_mime(&resolved.mime_type))),
             // Prefer the SOURCE resolution (library metadata) over the resolved
             // OUTPUT format. Local playback forces a 32-bit WAV to the DAC, but
             // the "now playing" label must show the file's real depth (16/24) —
@@ -1672,6 +1644,16 @@ impl PlaybackOrchestrator {
                     // #4685 — et le gain MOYEN du DSP qu'elle compense.
                     self.playback
                         .brancher_le_gain_moyen_du_dsp(zone_id, local_output.gain_moyen_du_dsp());
+                    // Fil 1908 — et son horloge : les niveaux sortent quand
+                    // le son sort, pas quand il entre dans l'anneau.
+                    let (position_alimentee_ms, anneau) = local_output.horloge_de_sortie();
+                    self.playback.brancher_l_horloge_de_sortie(
+                        zone_id,
+                        crate::playback::HorlogeDeSortie {
+                            position_alimentee_ms,
+                            anneau,
+                        },
+                    );
                     return;
                 }
             }

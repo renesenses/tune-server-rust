@@ -279,8 +279,10 @@ async fn temoin_la_reponse_ne_gagne_que_gapless_next() {
         "bit_depth",
         "track_number",
         "disc_number",
-        // …plus la seule nouveauté.
+        // …plus la nouveauté de ce fichier.
         "gapless_next",
+        // …et le drapeau « titre banni » (#4806), booléen, jamais absent.
+        "banned",
     ];
     attendues.sort_unstable();
 

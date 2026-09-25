@@ -1305,3 +1305,271 @@ fn i4079_le_gain_continu_de_tune_reste_unitaire_sur_les_sept_rapports() {
         );
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// #4754 — interpolation Linéaire contre Cubique : qualité ET coût processeur
+// ══════════════════════════════════════════════════════════════════════════
+//
+// `parametres_sinc` fixe `interpolation: SincInterpolationType::Linear`. Ce
+// banc ne change RIEN d'autre : même `sinc_len`, même `f_cutoff`, même
+// fenêtre, même sur-échantillonnage (256 phases), même taille de bloc, même
+// `FixedAsync::Input`, même fonction de production `rubato_resample_chunk`,
+// même recadrage par `alignement_de_piste`. Seul le mode d'interpolation
+// ENTRE les phases de la table diffère.
+//
+// La comparaison est faite contre la MÊME référence indépendante que le reste
+// du fichier (sinc polyphase exacte, Kaiser β = 14, f64) : les deux chiffres
+// se lisent donc sur la même échelle, et aucun des deux n'est comparé à
+// lui-même.
+//
+// Témoins `#[ignore]` : ce sont des mesures, pas des gardes. Elles changent
+// avec la machine.
+//
+// ```text
+// cargo test --release -p tune-core --test reechantillonnage_reference_2218 \
+//     -- --ignored --nocapture interpolation_4754
+// ```
+mod interpolation_4754 {
+    use super::*;
+    use rubato::{Async, FixedAsync, SincInterpolationType};
+    use std::time::Instant;
+
+    /// La taille de bloc de `new_streaming_resampler`.
+    const BLOC: usize = 1_024;
+
+    fn resampleur(interp: SincInterpolationType, de: u32, vers: u32, canaux: u16) -> Async<f32> {
+        let mut params = parametres_sinc(de, vers);
+        params.interpolation = interp;
+        Async::<f32>::new_sinc(
+            vers as f64 / de as f64,
+            1.1,
+            &params,
+            BLOC,
+            canaux as usize,
+            FixedAsync::Input,
+        )
+        .expect("paramètres valides")
+    }
+
+    /// Une piste passée par le chemin en FLUX de la production, recadrée comme
+    /// `rubato_resample_track` : la sortie est directement comparable à la
+    /// référence et à `tune_piste`.
+    fn piste_interp(interp: SincInterpolationType, x: &[f32], de: u32, vers: u32) -> Vec<f64> {
+        let (pre_roll, a_retirer, _) = alignement_de_piste(de, vers);
+        let attendu = Reference::new(de, vers, 0.0).trames_de_sortie(x.len());
+        let mut entree = vec![0.0f32; pre_roll];
+        entree.extend_from_slice(x);
+
+        let mut r = Some(resampleur(interp, de, vers, 1));
+        let mut reste = Vec::new();
+        let mut sortie: Vec<f32> = Vec::new();
+        for morceau in entree.chunks(BLOC) {
+            sortie.extend(rubato_resample_chunk(&mut r, morceau, 1, false, &mut reste));
+        }
+        sortie.extend(rubato_resample_chunk(&mut r, &[], 1, true, &mut reste));
+        en_f64(&sortie)
+            .into_iter()
+            .skip(a_retirer)
+            .take(attendu)
+            .collect()
+    }
+
+    /// La réponse en fréquence réelle de ce mode d'interpolation, par
+    /// impulsion — même recette que `reponse_de_tune`, mode choisi.
+    fn reponse(interp: SincInterpolationType, de: u32, vers: u32) -> impl Fn(f64) -> f64 {
+        let rapport = vers as f64 / de as f64;
+        let pos = de as usize / 10;
+        let xi = impulsion(de, 0.25, pos);
+        let h = piste_interp(interp, &xi, de, vers);
+        let centre = ((pos as f64 * rapport).round() as usize).min(h.len());
+        let fen = 4_096.min(centre);
+        let h = h[centre - fen..(centre + fen).min(h.len())].to_vec();
+        move |f: f64| module_a(&h, vers, f) / rapport
+    }
+
+    struct Releve {
+        err_sinus_db: f64,
+        thd_n_1k_db: f64,
+        err_balayage_db: f64,
+        rejection_db: f64,
+        bande_01db_hz: f64,
+        ondulation_db: f64,
+    }
+
+    fn relever(interp: SincInterpolationType, r: Rapport) -> Releve {
+        let Rapport { de, vers, .. } = r;
+        let nyq_utile = 0.5 * de.min(vers) as f64;
+
+        // sinus 1 kHz, aligné sur son propre délai de phase
+        let x = sinus(de, 1_000.0, DUREE_S);
+        let piste = piste_interp(interp, &x, de, vers);
+        let ref0 = Reference::new(de, vers, 0.0);
+        let y0 = ref0.appliquer(&en_f64(&x));
+        let n = piste.len().min(y0.len());
+        let (c0, c1) = (n / 10, n * 9 / 10);
+        let delai = delai_par_phase(&piste, &y0, vers, 1_000.0, c0, c1);
+        let refd = Reference::new(de, vers, delai);
+        let yd = refd.appliquer(&en_f64(&x));
+        let err_sinus_db = erreur_rms_db(&piste, &yd, c0, c1);
+        let (amp, _, residu) = ajuster_sinus(&piste, vers, 1_000.0, c0, c1);
+        let thd_n_1k_db = db(residu / (amp / 2f64.sqrt()));
+
+        // balayage 20 Hz → 20 kHz
+        let xb = balayage(de, DUREE_S);
+        let pisteb = piste_interp(interp, &xb, de, vers);
+        let yb = refd.appliquer(&en_f64(&xb));
+        let nb = pisteb.len().min(yb.len());
+        let err_balayage_db = erreur_rms_db(&pisteb, &yb, nb / 10, nb * 9 / 10);
+
+        // réponse en fréquence et réjection — même méthode que `mesurer`
+        let module = reponse(interp, de, vers);
+        let (bande_01db_hz, ondulation_db) = bande_et_ondulation(&module, nyq_utile);
+        let rejection_db = if vers > de {
+            let (nyq_in, nyq_out) = (0.5 * de as f64, 0.5 * vers as f64);
+            let mut pire: f64 = -400.0;
+            let mut f = nyq_in + 0.25 * (nyq_out - nyq_in);
+            while f <= nyq_out {
+                pire = pire.max(db(module(f)));
+                f += 50.0;
+            }
+            pire
+        } else {
+            let (nyq_in, nyq_out) = (0.5 * de as f64, 0.5 * vers as f64);
+            let f_ton = nyq_out + 0.25 * (nyq_in - nyq_out);
+            let pt = piste_interp(interp, &sinus(de, f_ton, DUREE_S), de, vers);
+            let nt = pt.len();
+            db(rms(&pt[nt / 10..nt * 9 / 10]) / (AMPLITUDE / 2f64.sqrt()))
+        };
+
+        Releve {
+            err_sinus_db,
+            thd_n_1k_db,
+            err_balayage_db,
+            rejection_db,
+            bande_01db_hz,
+            ondulation_db,
+        }
+    }
+
+    /// Contrôle de fidélité du banc : l'arme « Linéaire » de CE banc doit
+    /// rendre le même signal que la production. Sans ce témoin, les deux
+    /// colonnes pourraient parler d'un chemin que Tune n'emprunte pas.
+    #[test]
+    fn le_banc_4754_reproduit_bien_le_chemin_de_production() {
+        for r in RAPPORTS {
+            let x = sinus(r.de, 1_000.0, 0.2);
+            let mien = piste_interp(SincInterpolationType::Linear, &x, r.de, r.vers);
+            let prod = tune_piste(&x, r.de, r.vers);
+            let n = mien.len().min(prod.len());
+            assert!(n > 0, "{} : piste vide", r.nom);
+            let pire = (0..n)
+                .map(|i| (mien[i] - prod[i]).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                pire < 1e-6,
+                "{} : le banc #4754 diverge de la production ({pire:.3e})",
+                r.nom
+            );
+        }
+    }
+
+    /// QUALITÉ — Linéaire contre Cubique, sur les sept rapports.
+    #[test]
+    #[ignore = "mesure #4754, pas une garde"]
+    fn banc_4754_qualite_lineaire_contre_cubique() {
+        println!("\n=== #4754 — QUALITÉ : Linéaire (production) contre Cubique ===");
+        println!(
+            "{:<18} {:<9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>8}",
+            "rapport", "interp", "err.sin", "THD+N", "err.bal", "réject.", "bande-.1dB", "ondul."
+        );
+        for r in RAPPORTS {
+            let ligne = |nom: &str, interp: SincInterpolationType| {
+                let m = relever(interp, r);
+                println!(
+                    "{:<18} {nom:<9} {:>8.1}dB {:>8.1}dB {:>8.1}dB {:>8.1}dB {:>8.0}Hz {:>7.3}dB",
+                    r.nom,
+                    m.err_sinus_db,
+                    m.thd_n_1k_db,
+                    m.err_balayage_db,
+                    m.rejection_db,
+                    m.bande_01db_hz,
+                    m.ondulation_db
+                );
+                m
+            };
+            let l = ligne("Linéaire", SincInterpolationType::Linear);
+            let c = ligne("Cubique", SincInterpolationType::Cubic);
+            println!(
+                "{:<18} {:<9} {:>+8.1}dB {:>+8.1}dB {:>+8.1}dB {:>+8.1}dB",
+                "",
+                "Δ (C−L)",
+                c.err_sinus_db - l.err_sinus_db,
+                c.thd_n_1k_db - l.thd_n_1k_db,
+                c.err_balayage_db - l.err_balayage_db,
+                c.rejection_db - l.rejection_db
+            );
+        }
+        println!("\nPlus NÉGATIF = meilleur pour err.sin / THD+N / err.bal / réjection.");
+        println!(
+            "Repère : le plancher d'un mot de 24 bits est −144 dBFS ; d'un 16 bits, −96 dBFS."
+        );
+    }
+
+    /// COÛT — le temps processeur des deux modes, sur le chemin en flux.
+    #[test]
+    #[ignore = "mesure #4754, pas une garde"]
+    fn banc_4754_cout_processeur_lineaire_contre_cubique() {
+        const SECONDES: f64 = 10.0;
+        const PASSES: usize = 5;
+        const CANAUX: u16 = 2;
+
+        println!(
+            "\n=== #4754 — COÛT : {SECONDES} s de stéréo, blocs de {BLOC}, meilleur de {PASSES} ==="
+        );
+        println!(
+            "{:<18} {:>12} {:>12} {:>9} {:>12} {:>12}",
+            "rapport", "Linéaire ms", "Cubique ms", "rapport", "Lin. % cœur", "Cub. % cœur"
+        );
+
+        for r in RAPPORTS {
+            let trames = (r.de as f64 * SECONDES) as usize;
+            let x: Vec<f32> = (0..trames * CANAUX as usize)
+                .map(|i| (0.5 * (i as f64 * 0.017).sin()) as f32)
+                .collect();
+
+            let mesurer = |interp: SincInterpolationType| -> f64 {
+                let mut meilleur = f64::INFINITY;
+                for _ in 0..PASSES {
+                    let mut res = Some(resampleur(interp, r.de, r.vers, CANAUX));
+                    let mut reste = Vec::new();
+                    let t0 = Instant::now();
+                    for morceau in x.chunks(BLOC * CANAUX as usize) {
+                        std::hint::black_box(rubato_resample_chunk(
+                            &mut res, morceau, CANAUX, false, &mut reste,
+                        ));
+                    }
+                    std::hint::black_box(rubato_resample_chunk(
+                        &mut res,
+                        &[],
+                        CANAUX,
+                        true,
+                        &mut reste,
+                    ));
+                    meilleur = meilleur.min(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                meilleur
+            };
+
+            let lin = mesurer(SincInterpolationType::Linear);
+            let cub = mesurer(SincInterpolationType::Cubic);
+            println!(
+                "{:<18} {lin:>12.2} {cub:>12.2} {:>8.2}× {:>11.2}% {:>11.2}%",
+                r.nom,
+                cub / lin.max(1e-9),
+                lin / (SECONDES * 1e3) * 100.0,
+                cub / (SECONDES * 1e3) * 100.0
+            );
+        }
+        println!("\n« % cœur » = part d'UN cœur consommée pour tenir le temps réel stéréo.");
+    }
+}

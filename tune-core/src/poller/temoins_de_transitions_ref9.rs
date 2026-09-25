@@ -2274,3 +2274,23 @@ async fn e23_le_tick_de_production_tient_l_invariant() {
     assert_eq!(ps.stopped_ticks, 0);
     ps.coherent().unwrap();
 }
+
+/// #4645 — la coupure `playback_failure_stopping_zone` arme la reprise à la
+/// position atteinte, comme celle du renderer calé. Sans cet appel, le flux à
+/// sec du 24/09 (Sevy Tabroc, 0.9.163) coupait la zone et arrêtait la file :
+/// `mesure_renderer_cale` restait `None`, et plus bas le `force_stop` tombait
+/// dans le `stop` nu. Aucun drapeau d'état ne distingue les deux issues.
+#[test]
+fn flux_a_sec_arme_la_reprise_a_la_position_atteinte_4645() {
+    ecriture_suit_le_marqueur(
+        "\"playback_failure_stopping_zone\"",
+        "mesure_renderer_cale =",
+        26,
+    );
+    appel_suit_le_marqueur(
+        "\"playback_failure_stopping_zone\"",
+        "decisions::mesure_de_reprise_apres_flux_a_sec(",
+        26,
+        None,
+    );
+}

@@ -18,8 +18,9 @@ use serde_json::Value;
 use tracing::debug;
 
 const MB_API: &str = "https://musicbrainz.org/ws/2";
-const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
-const MB_RATE_LIMIT_MS: u64 = 1100;
+/// Public depuis #4863 : le greffon de lecture de CD consulte `/ws/2/discid`
+/// sous la même identité. Son DÉBIT, lui, passe par [`rate_limit_delay`] (#4767).
+pub const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
 
 /// Below this score a search hit is noise rather than a match.
 const MIN_CONFIDENT_SCORE: i32 = 80;
@@ -419,6 +420,121 @@ pub async fn lookup_release(
         .filter(|m| m.score >= MIN_CONFIDENT_SCORE)
 }
 
+/// Les marqueurs qui trahissent un suffixe de PRESSAGE, pas un morceau du titre.
+/// Comparés en minuscules, par inclusion : `192kHz/24bit` porte `khz`, et
+/// `Original 1976 Version` porte `version`.
+const MARQUEURS_DE_SUFFIXE: &[&str] = &[
+    "khz",
+    "bit",
+    "remaster",
+    "deluxe",
+    "edition",
+    "version",
+    "anniversary",
+    "expanded",
+    "bonus",
+    "live",
+    "mono",
+    "stereo",
+    "reissue",
+    "dsd",
+];
+
+/// Les mots qui introduisent un numéro de disque en fin de titre.
+const MOTS_DE_DISQUE: &[&str] = &["disc", "disque", "cd"];
+
+fn contient_un_marqueur(dedans: &str) -> bool {
+    let bas = dedans.to_lowercase();
+    MARQUEURS_DE_SUFFIXE.iter().any(|m| bas.contains(m))
+}
+
+/// Retire UN suffixe de fin. Rend `None` quand il n'y a rien à retirer, ce qui
+/// sert de condition d'arrêt à la boucle de [`titre_de_requete`].
+fn retire_un_suffixe(titre: &str) -> Option<String> {
+    let t = titre.trim_end();
+
+    // 1. Parenthèse ou crochet FINAL dont le contenu porte un marqueur de
+    //    pressage. `(Live at Montreux)` s'en va ; `(Part 2)` reste.
+    for (ouvre, ferme) in [('(', ')'), ('[', ']')] {
+        if !t.ends_with(ferme) {
+            continue;
+        }
+        let Some(pos) = t.rfind(ouvre) else { continue };
+        let contenu = &t[pos + ouvre.len_utf8()..t.len() - ferme.len_utf8()];
+        if !contient_un_marqueur(contenu) {
+            continue;
+        }
+        let reste = t[..pos].trim_end();
+        if !reste.is_empty() {
+            return Some(reste.to_string());
+        }
+    }
+
+    // 2. `, Disc 1` / ` - CD 2` / `, Disque 3` en fin de titre. Le découpage
+    //    par disque est une propriété de NOTRE arborescence, pas du pressage :
+    //    MusicBrainz décrit le coffret entier sous un seul titre.
+    let bas = t.to_lowercase();
+    for mot in MOTS_DE_DISQUE {
+        // Chercher la dernière occurrence du mot, puis vérifier que tout ce qui
+        // suit est un nombre, et que ce qui précède est un séparateur.
+        let Some(pos) = bas.rfind(mot) else { continue };
+        let apres = t[pos + mot.len()..].trim();
+        if apres.is_empty() || !apres.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let avant = t[..pos].trim_end();
+        let avant = avant.strip_suffix('-').or_else(|| avant.strip_suffix('–'));
+        let Some(avant) = avant.map(str::trim_end).or_else(|| {
+            // Sans tiret, il faut une virgule : `Singles and More, Disc 1`.
+            t[..pos].trim_end().strip_suffix(',')
+        }) else {
+            continue;
+        };
+        let avant = avant.trim_end().trim_end_matches(',').trim_end();
+        if !avant.is_empty() {
+            return Some(avant.to_string());
+        }
+    }
+
+    None
+}
+
+/// Le titre à envoyer à la RECHERCHE MusicBrainz, quand celui de la bibliothèque
+/// porte un suffixe qui la fait échouer.
+///
+/// Mesuré le 23/09/2026 sur 40 albums du .18 tirés au hasard (#4805) : la
+/// recherche telle quelle rend un pressage plausible pour **26 albums sur 39**
+/// (66,7 %). Les 13 échecs ont une cause unique et visible — le titre porte un
+/// suffixe technique (`(192kHz/24bit)`, `(Remastered)`, `(Deluxe)`,
+/// `(Original 1976 Version)`, `, Disc 1`) qui noie la recherche Lucene en amont.
+/// Rejouée avec le titre nettoyé, elle en retrouve **6 de plus : 32 sur 39
+/// (82,1 %)**, soit **+15,4 points** pour une requête supplémentaire sur le seul
+/// tiers d'albums en échec.
+///
+/// Ne touche QUE la requête : la donnée stockée n'est jamais réécrite, et le
+/// filtre [`plausible`] continue de juger contre le titre d'origine — ce qui est
+/// plus strict, l'inclusion étant mutuelle (`somethin else 192khz24bit` contient
+/// bien `somethin else`).
+///
+/// Rend `None` quand il n'y a rien à retirer : l'appelant sait alors qu'un
+/// second essai serait la même requête, et s'épargne 1,1 s.
+pub fn titre_de_requete(titre: &str) -> Option<String> {
+    let mut courant = titre.trim().to_string();
+    // Plusieurs suffixes peuvent s'empiler : `Album (Remastered) (Deluxe)`.
+    // Borné pour qu'aucune entrée tordue ne fasse boucler.
+    for _ in 0..4 {
+        match retire_un_suffixe(&courant) {
+            Some(plus_court) => courant = plus_court,
+            None => break,
+        }
+    }
+    let courant = courant.trim();
+    if courant.is_empty() || courant == titre.trim() {
+        return None;
+    }
+    Some(courant.to_string())
+}
+
 /// Every plausible release for an album, for the user to choose from.
 ///
 /// The query is deliberately loose — only title and artist. Constraining on the
@@ -436,28 +552,60 @@ pub async fn lookup_release_candidates(
         return Vec::new();
     }
 
-    let mut query_parts = vec![format!("release:\"{title}\"")];
-    if !artist.trim().is_empty() {
-        query_parts.push(format!("artist:\"{artist}\""));
-    }
-
     // Ask for more than we show: the plausibility filter drops some, and
     // MusicBrainz mixes in loosely-related releases.
     let fetch = (limit * 3).clamp(10, 100);
-    let Some(data) = mb_get(
-        "release",
-        &[
-            ("query", query_parts.join(" AND ")),
-            ("limit", fetch.to_string()),
-            ("fmt", "json".to_string()),
-        ],
-    )
-    .await
-    else {
-        return Vec::new();
-    };
 
-    let mut candidates = rank_candidates(parse_search_results(&data, title, artist), track_hint);
+    // Un essai de recherche. `interroge` porte le titre ENVOYÉ à MusicBrainz ;
+    // le tri de plausibilité, lui, juge toujours contre `title`, celui de la
+    // bibliothèque.
+    async fn un_essai(
+        interroge: &str,
+        title: &str,
+        artist: &str,
+        fetch: usize,
+        track_hint: Option<u32>,
+    ) -> Vec<MBReleaseMatch> {
+        let mut query_parts = vec![format!("release:\"{interroge}\"")];
+        if !artist.trim().is_empty() {
+            query_parts.push(format!("artist:\"{artist}\""));
+        }
+        let Some(data) = mb_get(
+            "release",
+            &[
+                ("query", query_parts.join(" AND ")),
+                ("limit", fetch.to_string()),
+                ("fmt", "json".to_string()),
+            ],
+        )
+        .await
+        else {
+            return Vec::new();
+        };
+        rank_candidates(parse_search_results(&data, title, artist), track_hint)
+    }
+
+    let mut candidates = un_essai(title, title, artist, fetch, track_hint).await;
+
+    // Second essai, et seulement sur échec : le titre débarrassé de son suffixe
+    // de pressage. Mesuré à +15,4 points sur le .18 (#4805). Le coût — une
+    // requête de 1,1 s — n'est payé que par le tiers d'albums qui a échoué, et
+    // pas du tout quand il n'y a rien à retirer.
+    let second_essai = if candidates.is_empty() {
+        titre_de_requete(title)
+    } else {
+        None
+    };
+    if let Some(nettoye) = second_essai {
+        debug!(
+            title = title,
+            retry = %nettoye,
+            "mb_release_candidates_retry_titre_nettoye"
+        );
+        rate_limit_delay().await;
+        candidates = un_essai(&nettoye, title, artist, fetch, track_hint).await;
+    }
+
     candidates.truncate(limit);
     debug!(
         count = candidates.len(),
@@ -510,8 +658,78 @@ pub async fn lookup_release_group_type(
     super::release_type::depuis_groupe_musicbrainz(&data)
 }
 
+/// Clé du créneau MusicBrainz dans le limiteur partagé
+/// [`crate::http::fetch::MUSICBRAINZ`]. C'est la MÊME que celle des pochettes
+/// et images d'artistes (`library::artwork`) : une clé par SERVICE, pas par
+/// passe — MusicBrainz plafonne à une requête par seconde PAR IP, et deux clés
+/// distinctes laisseraient deux flux parallèles doubler ce débit (503).
+pub const CLE_LIMITEUR_MUSICBRAINZ: &str = "mb";
+
+/// Attend le prochain créneau MusicBrainz.
+///
+/// 🔴 Ce n'est plus un `sleep` local (#4767). Un `sleep` n'espace que les
+/// requêtes d'UNE boucle : la passe des types de sortie, la ré-identification
+/// et la passe des crédits tournant en même temps que celle des pochettes
+/// frappaient MusicBrainz plusieurs fois dans la même seconde. Toutes passent
+/// désormais par le limiteur PARTAGÉ du dépôt, sous la même clé que les
+/// pochettes : les créneaux sont réservés un par un, une seconde d'écart,
+/// quel que soit le nombre de passes.
 pub async fn rate_limit_delay() {
-    tokio::time::sleep(std::time::Duration::from_millis(MB_RATE_LIMIT_MS)).await;
+    crate::http::fetch::MUSICBRAINZ
+        .acquire(CLE_LIMITEUR_MUSICBRAINZ)
+        .await;
+}
+
+/// Issue d'une lecture de release pour la passe des crédits (#4767).
+///
+/// Trois cas, parce que l'appelant ne fait pas la même chose : une réponse
+/// se lit ; un identifiant INCONNU de MusicBrainz (404, 400) ne reviendra pas
+/// à la prochaine passe et se marque traité ; une panne (503, réseau) se
+/// retente plus tard.
+#[derive(Debug)]
+pub enum LectureRelease {
+    Lue(Value),
+    Inconnue,
+    Panne(String),
+}
+
+/// Les relations d'une release demandées en UNE requête : pistes,
+/// artistes crédités, relations d'enregistrement (musiciens, chant,
+/// production), relations d'œuvre (compositeur, parolier) et relations
+/// d'artistes au niveau de la release.
+pub const INC_CREDITS_RELEASE: &str =
+    "recordings+artist-credits+recording-level-rels+work-rels+work-level-rels+artist-rels";
+
+/// Lit une release avec toutes ses relations de crédits (#4767). N'attend PAS
+/// le créneau : l'appelant appelle [`rate_limit_delay`] juste avant.
+pub async fn lookup_release_credits(release_id: &str) -> LectureRelease {
+    let id = release_id.trim();
+    if id.is_empty() {
+        return LectureRelease::Inconnue;
+    }
+    let client = crate::http::client::shared();
+    let resp = match client
+        .get(format!("{MB_API}/release/{id}"))
+        .query(&[("inc", INC_CREDITS_RELEASE), ("fmt", "json")])
+        .header("User-Agent", MB_UA)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return LectureRelease::Panne(e.to_string()),
+    };
+    let statut = resp.status();
+    if statut == reqwest::StatusCode::NOT_FOUND || statut == reqwest::StatusCode::BAD_REQUEST {
+        return LectureRelease::Inconnue;
+    }
+    if !statut.is_success() {
+        return LectureRelease::Panne(format!("HTTP {statut}"));
+    }
+    match resp.json::<Value>().await {
+        Ok(v) => LectureRelease::Lue(v),
+        Err(e) => LectureRelease::Panne(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -871,5 +1089,106 @@ mod tests {
         let d = parse_release_detail(&data).unwrap();
         assert_eq!(d.tracks.len(), 1);
         assert_eq!(d.tracks[0].title, "Real");
+    }
+
+    /// Les SIX titres qui, le 23/09/2026, ne rendaient rien tels quels sur le
+    /// .18 et ont rendu un pressage une fois nettoyés (#4805). Ce ne sont pas
+    /// des exemples inventés : c'est l'échantillon mesuré.
+    #[test]
+    fn titre_de_requete_retire_les_suffixes_qui_font_echouer_la_recherche() {
+        for (brut, attendu) in [
+            ("Somethin' Else (192kHz/24bit)", "Somethin' Else"),
+            ("My Favorite Things (96kHz/24bit)", "My Favorite Things"),
+            ("Bird And Diz (Remastered)", "Bird And Diz"),
+            (
+                "West Kirby County Primary (Deluxe)",
+                "West Kirby County Primary",
+            ),
+            (
+                "Tales Of Mystery And Imagination (Original 1976 Version)",
+                "Tales Of Mystery And Imagination",
+            ),
+            (
+                "Smash the System: Singles and More, Disc 1",
+                "Smash the System: Singles and More",
+            ),
+        ] {
+            assert_eq!(
+                titre_de_requete(brut).as_deref(),
+                Some(attendu),
+                "le suffixe de « {brut} » n'a pas ete retire"
+            );
+        }
+    }
+
+    /// `, Disc N` et ` - CD N` en fin de titre : le decoupage par disque est une
+    /// propriete de notre arborescence, MusicBrainz decrit le coffret entier.
+    #[test]
+    fn titre_de_requete_retire_le_numero_de_disque_final() {
+        assert_eq!(
+            titre_de_requete("Radio Nova - La boite Jaune - 1992, Disc 12").as_deref(),
+            Some("Radio Nova - La boite Jaune - 1992")
+        );
+        assert_eq!(
+            titre_de_requete("Anthology - CD 2").as_deref(),
+            Some("Anthology")
+        );
+    }
+
+    /// La contrepartie : ne rien retirer quand il n'y a rien a retirer. `None`
+    /// est ce qui epargne a l'appelant une seconde requete de 1,1 s identique.
+    #[test]
+    fn titre_de_requete_ne_touche_pas_un_titre_propre() {
+        for propre in [
+            "Cousin Zaka, Vol. 1",
+            "Tango macondo",
+            "The Best of Miles Davis & John Coltrane: 1955-1961",
+            "Back To Mine - Talvin Singh",
+            "Kind of Blue",
+        ] {
+            assert_eq!(
+                titre_de_requete(propre),
+                None,
+                "« {propre} » a ete ampute alors qu'il etait propre"
+            );
+        }
+    }
+
+    /// Un suffixe ne doit jamais devorer le titre entier : mieux vaut ne rien
+    /// retirer que d'interroger MusicBrainz avec une chaine vide.
+    #[test]
+    fn titre_de_requete_ne_vide_jamais_le_titre() {
+        assert_eq!(titre_de_requete("(Remastered)"), None);
+        assert_eq!(titre_de_requete("[Deluxe Edition]"), None);
+        assert_eq!(titre_de_requete(", Disc 1"), None);
+        assert_eq!(titre_de_requete(""), None);
+    }
+
+    /// Plusieurs suffixes s'empilent en pratique.
+    #[test]
+    fn titre_de_requete_depile_les_suffixes_empiles() {
+        assert_eq!(
+            titre_de_requete("Fireball (25th Anniversary Edition) (Remastered)").as_deref(),
+            Some("Fireball")
+        );
+    }
+
+    /// Le filtre `plausible` juge contre le titre D'ORIGINE, pas contre le titre
+    /// nettoye — c'est ce qui rend le second essai sur : le pressage court
+    /// revenu de MusicBrainz reste inclus dans le titre long de la bibliotheque.
+    #[test]
+    fn le_pressage_court_reste_plausible_face_au_titre_long() {
+        assert!(plausible(
+            "Somethin' Else",
+            "Cannonball Adderley",
+            "Somethin' Else (192kHz/24bit)",
+            "Cannonball Adderley"
+        ));
+        assert!(plausible(
+            "Smash the System: Singles and More",
+            "Saint Etienne",
+            "Smash the System: Singles and More, Disc 1",
+            "Saint Etienne"
+        ));
     }
 }

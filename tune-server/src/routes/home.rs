@@ -1083,7 +1083,12 @@ mod tests_homonymes {
             .unwrap();
         ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
 
-        let Ok(Json(mixes)) = top_mixes(State(state)).await else {
+        let Ok(Json(mixes)) = top_mixes(
+            State(state),
+            crate::routes::active_profile::ActiveProfile(1),
+        )
+        .await
+        else {
             panic!("la route doit repondre")
         };
         let mixes = mixes.as_array().expect("mixes");
@@ -1922,7 +1927,10 @@ fn album_recommande(cols: &[tune_core::db::backend::SqlValue], raison: &str) -> 
 
 /// Auto-generated "mixes" by genre from top genres in history.
 /// Each mix = playlist of 20 tracks from that genre.
-async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn top_mixes(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+) -> Result<Json<Value>, AppError> {
     let engine = state.backend.engine();
 
     // Get top 5 genres from history
@@ -1940,13 +1948,18 @@ async fn top_mixes(State(state): State<AppState>) -> Result<Json<Value>, AppErro
 
     let p1 = ph(engine, 1);
     let p2 = ph(engine, 2);
+    // #4806 — un mix est une sélection automatique : jamais un titre banni
+    // par le profil qui regarde. Les deux genres sont parenthésés pour que
+    // le socle s'applique aux deux branches du OR.
+    let sans_bannis = tune_core::db::facet_filter::banned_tracks_excluded(profile.id());
     let tracks_sql = format!(
         "SELECT t.id, t.title, ar.name, al.title, \
                 CAST(t.duration_ms AS BIGINT), al.cover_path \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
-         WHERE t.genre = {p1} OR al.genre = {p2} \
+         WHERE (t.genre = {p1} OR al.genre = {p2}) \
+         AND {sans_bannis} \
          ORDER BY RANDOM() LIMIT 20"
     );
 

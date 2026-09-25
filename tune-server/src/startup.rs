@@ -351,7 +351,10 @@ fn reset_zones_offline(state: &AppState) {
 /// Réglages d'avancement d'enrichissement dont l'état « en cours » est écrit en
 /// base. Chacun ne connaît que deux écritures : `running` au lancement et à
 /// chaque jalon, `done` à la fin NORMALE de la boucle.
-const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 4] = [
+const REGLAGES_AVANCEMENT_ENRICHISSEMENT: [&str; 5] = [
+    // Passe des crédits MusicBrainz PAR DISQUE (#4767) : même cycle de vie,
+    // même risque — des heures à une requête par seconde.
+    tune_core::metadata::credits_release::REGLAGE_AVANCEMENT_CREDITS_RELEASES,
     "enrich_all_status",
     "artist_artwork_enrich_result",
     // Passe « crédits MusicBrainz » (#2799). Elle dure des heures sur une

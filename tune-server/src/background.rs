@@ -528,6 +528,54 @@ async fn spawn_relay_client(state: &AppState) {
     }
 }
 
+/// Ce que le lot SSDP de démarrage fait d'un appareil dont une zone d'un
+/// AUTRE protocole revendique déjà l'adresse ou la MAC.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SuiteDuLotDeDemarrage {
+    /// Le garde de doublon inter-protocoles s'applique : ne rien créer.
+    IgnorerConflitDeProtocole,
+    /// Poursuivre — soit l'appareil possède déjà SA zone et il faut la
+    /// rattacher, soit l'occupante est du même protocole et le conflit n'en
+    /// est pas un.
+    Poursuivre,
+}
+
+/// Arbitrage du garde de doublon inter-protocoles, côté lot de démarrage.
+///
+/// La règle gardée (#1239, #1183) : un appareil physique ne doit pas se
+/// présenter deux fois, une fois par protocole. Un Bluesound Node vu en BluOS
+/// (mDNS), en DLNA et en OpenHome porte trois noms et trois UUID pour un seul
+/// appareil ; sans garde, l'utilisateur récolte trois zones dont deux ne
+/// jouent rien. Le garde reste donc entier.
+///
+/// Ce qu'il ne doit PAS faire, et qu'il faisait ici : barrer un appareil qui
+/// possède déjà SA propre zone. Ce n'est plus un doublon à créer, c'est un
+/// rattachement — et l'écarter laisse une zone existante hors ligne, sans
+/// recours pour l'utilisateur. La découverte vivante respecte déjà cet ordre
+/// (`get_by_device_id` avant `physical_zone_conflict`, `discovery_setup.rs`) ;
+/// le lot de démarrage ne le respectait pas.
+///
+/// Aucun classement de protocoles n'est introduit : il n'en existe pas dans ce
+/// dépôt, et en inventer un reviendrait à deviner, appareil par appareil, quel
+/// chemin joue le mieux.
+pub(crate) fn suite_du_lot_de_demarrage(
+    possede_deja_sa_zone: bool,
+    type_de_l_occupante: &str,
+    type_demande: &str,
+) -> SuiteDuLotDeDemarrage {
+    // Une occupante sans type, ou du même protocole, n'est pas un conflit :
+    // c'est la voie de reconnexion ordinaire.
+    if type_de_l_occupante.is_empty()
+        || type_de_l_occupante.eq_ignore_ascii_case(type_demande)
+        // L'appareil a déjà sa zone : rien à créer, donc aucun doublon
+        // possible. Le garde n'a pas lieu de s'armer.
+        || possede_deja_sa_zone
+    {
+        return SuiteDuLotDeDemarrage::Poursuivre;
+    }
+    SuiteDuLotDeDemarrage::IgnorerConflitDeProtocole
+}
+
 fn spawn_ssdp_startup_scan(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -556,15 +604,49 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                     info!(name = %d.name, device_id = %d.id, "ssdp_startup_appareil_ignore");
                     continue;
                 }
-                if let Ok(desc) =
-                    tune_core::discovery::xml_parser::fetch_device_description(location).await
-                {
-                    if desc.is_media_renderer() {
+                // Les SIX sorties de cette boucle étaient muettes : adresse de
+                // description vide, sortie déjà enregistrée, appareil tu,
+                // description injoignable, appareil qui n'est pas un renderer,
+                // services manquants. `ssdp_startup_scan_complete registered=0
+                // total=4` était donc indéchiffrable — c'est exactement ce que
+                // le journal du 23/09 a donné à lire. On nomme désormais les
+                // deux modes d'échec qui dépendent de l'appareil.
+                match tune_core::discovery::xml_parser::fetch_device_description(location).await {
+                    Err(e) => {
+                        info!(
+                            name = %d.name,
+                            device_id = %d.id,
+                            host = %d.host,
+                            location,
+                            error = %e,
+                            "ssdp_startup_description_injoignable"
+                        );
+                    }
+                    Ok(desc) if !desc.is_media_renderer() => {
+                        info!(
+                            name = %d.name,
+                            device_id = %d.id,
+                            host = %d.host,
+                            "ssdp_startup_pas_un_renderer"
+                        );
+                    }
+                    Ok(desc) => {
                         let service_urls = desc.service_urls();
-                        if let (Some(av), Some(rc)) = (
+                        let paire = (
                             service_urls.get("avtransport"),
                             service_urls.get("renderingcontrol"),
-                        ) {
+                        );
+                        if paire.0.is_none() || paire.1.is_none() {
+                            info!(
+                                name = %d.name,
+                                device_id = %d.id,
+                                host = %d.host,
+                                avtransport = paire.0.is_some(),
+                                renderingcontrol = paire.1.is_some(),
+                                "ssdp_startup_services_upnp_manquants"
+                            );
+                        }
+                        if let (Some(av), Some(rc)) = paire {
                             let cm_url = service_urls
                                 .get("connectionmanager")
                                 .or_else(|| service_urls.get("ConnectionManager"))
@@ -621,21 +703,53 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                 // under another protocol (BluOS via mDNS) gained a second
                 // "dlna" zone here on every fresh boot. Match on the persisted
                 // host/MAC identity of visible zones.
+                //
+                // 🔴 Le garde ne s'applique qu'à la CRÉATION. C'est ce que dit
+                // déjà sa propre documentation, côté découverte vivante
+                // (`physical_zone_conflict` : « same-type matches are the
+                // reconnect path, get_by_device_id / zone_id_by_host handle
+                // those ») — mais ICI il n'y avait aucun barreau de
+                // rattachement avant lui, et `get_or_create_si_autorise`, qui
+                // porte ce rattachement (`CreationDeZone::Existante`), est
+                // placé APRÈS. Un appareil qui possédait DÉJÀ sa propre zone
+                // était donc écarté par une zone d'un autre protocole, et
+                // n'était jamais remis en ligne.
+                //
+                // Mesuré le 23/09/2026 sur 192.168.1.18 (v0.9.162) : au
+                // redémarrage de 15:10:28, l'Eversolo DMP-A8
+                // (uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE, 192.168.1.17) —
+                // qui répondait parfaitement en UPnP — a été écarté au profit
+                // d'une zone AirPlay HORS LIGNE tenant la même adresse. Sa
+                // zone DLNA existait pourtant : la découverte vivante l'a
+                // rattachée telle quelle à 15:44 (`zone_device_reconnected`,
+                // même uuid), sans qu'aucun réglage n'ait changé entre-temps.
+                let possede_deja_sa_zone = matches!(zone_repo.get_by_device_id(&d.id), Ok(Some(_)));
                 if let Some((zid, zname, ztype)) =
                     zone_repo.find_visible_zone_by_identity(&d.host, d.mac_address.as_deref())
+                    && let SuiteDuLotDeDemarrage::IgnorerConflitDeProtocole =
+                        suite_du_lot_de_demarrage(possede_deja_sa_zone, &ztype, "dlna")
                 {
-                    if !ztype.is_empty() && !ztype.eq_ignore_ascii_case("dlna") {
-                        info!(
-                            name = %d.name,
-                            device_id = %d.id,
-                            host = %d.host,
-                            conflicting_zone = %zname,
-                            conflicting_zone_id = zid,
-                            conflicting_type = %ztype,
-                            "ssdp_startup_zone_skipped_conflicting_protocol"
-                        );
-                        continue;
-                    }
+                    // L'état de l'occupante n'était pas journalisé : l'INFO
+                    // nommait la zone qui gagnait l'arbitrage sans dire si
+                    // elle vivait. Le cas mesuré — l'occupante était morte —
+                    // était donc illisible dans le journal.
+                    let conflicting_online = zone_repo
+                        .get(zid)
+                        .ok()
+                        .flatten()
+                        .map(|z| z.online)
+                        .unwrap_or(false);
+                    info!(
+                        name = %d.name,
+                        device_id = %d.id,
+                        host = %d.host,
+                        conflicting_zone = %zname,
+                        conflicting_zone_id = zid,
+                        conflicting_type = %ztype,
+                        conflicting_online,
+                        "ssdp_startup_zone_skipped_conflicting_protocol"
+                    );
+                    continue;
                 }
 
                 // #3529 — ce lot tourne à CHAQUE démarrage et ne consultait pas
@@ -944,14 +1058,37 @@ fn spawn_session_gc(state: &AppState) {
 }
 
 fn spawn_position_poller(state: &AppState) {
-    let poller = tune_core::poller::PositionPoller::new(
+    construire_le_sondeur(state).spawn();
+}
+
+/// Le sondeur de position tel que la production le lance.
+///
+/// Fils 1890/1857 (Jean Valjean), v0.9.158 → v0.9.163, sortie locale WASAPI
+/// exclusive : le panneau annonce « WASAPI (shared — Windows mixer) » et
+/// « Transcodé » alors que son journal dit `wasapi_exclusive_playing` puis
+/// `windows_exclusive_signal_contract bit_perfect=true reasons=[]`. #4568 a
+/// fait annoncer ce contrat par le sondeur (`zone.updated`), mais l'annonce
+/// est gardée par `if let Some(ref bus) = self.event_bus` — et ce sondeur-ci
+/// était construit SANS `with_event_bus`. Aucune ligne
+/// `contrat_de_signal_publie_annonce` dans son journal de la 0.9.163 : le
+/// correctif était vert dans son banc, muet chez lui. Avec PURE, le volume est
+/// épinglé à 100 % : le seul geste qui faisait relire la zone (un
+/// aller-retour du volume) n'existe plus, d'où « transcodé » à chaque piste.
+///
+/// Le bus est celui que relaie le WebSocket (`routes/ws.rs`). Il allume du
+/// même coup les autres annonces du sondeur, toutes écrites pour le client et
+/// toutes muettes jusqu'ici : bascule des niveaux (#2280),
+/// `zone.playback_error` d'une sortie qui échoue sur son propre fil,
+/// `playback.track_skipped`, `playback.autoplay_tracks_added`.
+fn construire_le_sondeur(state: &AppState) -> tune_core::poller::PositionPoller {
+    tune_core::poller::PositionPoller::new(
         state.orchestrator.clone(),
         state.playback.clone(),
         state.outputs.clone(),
         state.backend.clone(),
         state.poller_metrics.clone(),
-    );
-    poller.spawn();
+    )
+    .with_event_bus(state.event_bus.clone())
 }
 
 /// #3589, volet A — le catalogue « Tune tested », au démarrage puis toutes les
@@ -4289,6 +4426,179 @@ mod rescan_force_ne_note_pas_le_backend_4667 {
         assert!(
             sondage < liste,
             "l'énumération forcée doit être DANS sans_noter_le_backend_observe"
+        );
+    }
+}
+
+#[cfg(test)]
+mod conflit_de_protocole_au_demarrage_tests {
+    use super::{SuiteDuLotDeDemarrage, suite_du_lot_de_demarrage};
+    use tune_core::db::zone_repo::{CreationDeZone, ZoneRepo};
+
+    fn base_de_test() -> std::sync::Arc<dyn tune_core::db::backend::DbBackend> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().expect("base en memoire");
+        db.init_schema().expect("schema");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        std::sync::Arc::new(db)
+    }
+
+    const HOTE: &str = "192.168.1.17";
+    const UUID_DMP_A8: &str = "uuid:9C41535E-DB73-11F0-A7C6-800A805D4DEE";
+
+    /// L'INCIDENT du 23/09/2026 sur 192.168.1.18, v0.9.162.
+    ///
+    /// Une zone AirPlay HORS LIGNE (« eversolo,1 », id 2) tient l'adresse du
+    /// DMP-A8. L'appareil possède DÉJÀ sa zone DLNA, et il répond : au
+    /// redémarrage il doit la retrouver EN LIGNE. Avant le correctif, le
+    /// garde de doublon inter-protocoles s'armait avant toute tentative de
+    /// rattachement et l'utilisateur se retrouvait sans aucune zone utilisable.
+    #[test]
+    fn une_zone_morte_d_un_autre_protocole_ne_debranche_plus_la_zone_de_l_appareil() {
+        let repo = ZoneRepo::with_backend(base_de_test());
+
+        // L'occupante AirPlay, créée la première (donc la plus petite id, et
+        // celle que `find_visible_zone_by_identity` rend), puis éteinte.
+        let airplay = repo
+            .create("eversolo,1", Some("airplay"), Some("airplay:eversolo"))
+            .expect("zone airplay");
+        repo.set_identity(airplay, HOTE, None).expect("identite");
+        repo.update_online(airplay, false).expect("hors ligne");
+
+        // La zone DLNA que l'appareil possède déjà — celle que la découverte
+        // vivante a rattachée à 15:44 sans que rien n'ait changé.
+        let dlna = repo
+            .create("DMP-A8", Some("dlna"), Some(UUID_DMP_A8))
+            .expect("zone dlna");
+        repo.set_identity(dlna, HOTE, None).expect("identite");
+        repo.update_online(dlna, false).expect("hors ligne au boot");
+
+        let (zid, _, ztype) = repo
+            .find_visible_zone_by_identity(HOTE, None)
+            .expect("une occupante tient l'adresse");
+        assert_eq!(
+            zid, airplay,
+            "l'occupante arbitrée est bien la zone AirPlay"
+        );
+        assert_eq!(ztype, "airplay");
+        assert!(
+            !repo.get(zid).unwrap().unwrap().online,
+            "et elle est morte — c'est tout l'objet de l'incident"
+        );
+
+        let possede_deja_sa_zone = matches!(repo.get_by_device_id(UUID_DMP_A8), Ok(Some(_)));
+        assert!(possede_deja_sa_zone);
+        assert_eq!(
+            suite_du_lot_de_demarrage(possede_deja_sa_zone, &ztype, "dlna"),
+            SuiteDuLotDeDemarrage::Poursuivre,
+            "un appareil qui possède déjà SA zone ne crée aucun doublon : le \
+             garde n'a pas à s'armer"
+        );
+
+        // Et le lot poursuit jusqu'à la remise en ligne : l'utilisateur
+        // retrouve une zone utilisable.
+        //
+        // ⚠️ L'étiquette d'origine n'est PAS celle du lot de démarrage, et ce
+        // n'est pas un oubli. `tests/zones_auto_create_recension.rs` recense
+        // les chemins qui créent des zones en COMPTANT le littéral dans la
+        // source — comparaison de texte brut, commentaires compris — et exige
+        // exactement UNE occurrence de l'étiquette du lot dans ce fichier.
+        // C'est ainsi qu'un sixième site ne peut pas s'y glisser sans être vu
+        // (#3529). Cet appel-ci est un essai, pas un chemin de découverte :
+        // lui donner l'étiquette du lot ajouterait une seconde occurrence et
+        // rendrait la recension fausse. Ne pas « corriger » en remettant
+        // l'étiquette du lot, ni en la rangeant dans une constante partagée :
+        // une constante ramènerait le compte à un tout en AVEUGLANT le grep,
+        // ce qui est pire que le rouge.
+        match repo.get_or_create_si_autorise(
+            "DMP-A8",
+            Some("dlna"),
+            UUID_DMP_A8,
+            "essai_rattachement_apres_conflit",
+        ) {
+            Ok(CreationDeZone::Existante(id)) => assert_eq!(id, dlna),
+            autre => panic!("rattachement attendu, obtenu {autre:?}"),
+        }
+        repo.set_online_by_device(UUID_DMP_A8, true)
+            .expect("remise en ligne");
+        assert!(
+            repo.get(dlna).unwrap().unwrap().online,
+            "après le balayage de démarrage, la zone du DMP-A8 doit être EN LIGNE"
+        );
+        assert_eq!(
+            repo.list().unwrap().len(),
+            2,
+            "aucune zone de plus n'a été fabriquée"
+        );
+    }
+
+    /// LE MIROIR — la règle tient. Occupante d'un autre protocole EN LIGNE, et
+    /// un appareil qui ne possède aucune zone : on n'en crée pas une seconde
+    /// pour le même appareil physique (#1239, le Node à trois zones).
+    #[test]
+    fn un_appareil_sans_zone_ne_double_pas_une_occupante_d_un_autre_protocole() {
+        let repo = ZoneRepo::with_backend(base_de_test());
+
+        let airplay = repo
+            .create("eversolo,1", Some("airplay"), Some("airplay:eversolo"))
+            .expect("zone airplay");
+        repo.set_identity(airplay, HOTE, None).expect("identite");
+        repo.update_online(airplay, true).expect("en ligne");
+
+        let (_, _, ztype) = repo
+            .find_visible_zone_by_identity(HOTE, None)
+            .expect("occupante");
+        let possede_deja_sa_zone = matches!(repo.get_by_device_id(UUID_DMP_A8), Ok(Some(_)));
+        assert!(!possede_deja_sa_zone, "l'appareil n'a aucune zone à lui");
+        assert_eq!(
+            suite_du_lot_de_demarrage(possede_deja_sa_zone, &ztype, "dlna"),
+            SuiteDuLotDeDemarrage::IgnorerConflitDeProtocole,
+            "sans zone à rattacher, créer reviendrait à doubler l'appareil"
+        );
+        assert_eq!(repo.list().unwrap().len(), 1, "une seule zone, comme avant");
+    }
+
+    /// Le correctif n'invente AUCUN classement de protocoles : une occupante
+    /// morte que l'appareil ne possède pas laisse le garde armé, exactement
+    /// comme avant. Seul le rattachement d'une zone existante est débloqué.
+    #[test]
+    fn aucun_classement_de_protocole_nest_introduit() {
+        assert_eq!(
+            suite_du_lot_de_demarrage(false, "airplay", "dlna"),
+            SuiteDuLotDeDemarrage::IgnorerConflitDeProtocole
+        );
+        // Même protocole, ou occupante sans type : voie de reconnexion.
+        assert_eq!(
+            suite_du_lot_de_demarrage(false, "DLNA", "dlna"),
+            SuiteDuLotDeDemarrage::Poursuivre
+        );
+        assert_eq!(
+            suite_du_lot_de_demarrage(false, "", "dlna"),
+            SuiteDuLotDeDemarrage::Poursuivre
+        );
+    }
+}
+
+/// Fils 1890/1857 (Jean Valjean) — WASAPI exclusif + PURE affiché
+/// « Transcodé » : le sondeur de production doit émettre sur le bus que le
+/// WebSocket relaie. La mécanique d'annonce elle-même est éprouvée dans
+/// `tune-core` (`poller/annonce_du_contrat_de_signal_4559.rs`) — avec un banc
+/// qui, lui, appelait `with_event_bus`. Ici on tient le BRANCHEMENT : c'est
+/// lui qui manquait, et aucun banc ne le voyait.
+#[cfg(test)]
+mod sondeur_branche_sur_le_bus_du_websocket {
+    use super::*;
+
+    #[tokio::test]
+    async fn le_sondeur_de_production_annonce_sur_le_bus_du_websocket() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let sondeur = construire_le_sondeur(&state);
+        assert!(
+            sondeur.annonce_sur(&state.event_bus),
+            "le sondeur de production n'émet pas sur `state.event_bus` : le \
+             contrat de signal publié à l'ouverture du périphérique n'est \
+             jamais annoncé, et le panneau reste « WASAPI (shared — Windows \
+             mixer) » / « Transcodé » tant que l'auditeur ne touche pas au \
+             volume — ce que PURE lui interdit (fils 1890/1857, #4559)."
         );
     }
 }

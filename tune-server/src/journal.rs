@@ -206,6 +206,103 @@ impl Write for JournalBorne {
     }
 }
 
+/// La sortie standard du processus désigne-t-elle **déjà** le fichier `chemin` ?
+///
+/// ## Pourquoi cette question se pose
+///
+/// L'abonné `tracing` du serveur porte deux couches : une couche fichier, qui
+/// écrit dans le journal, et une couche console. Les deux sont légitimes — qui
+/// lance `./tune-server` dans un terminal veut voir passer les lignes *et* les
+/// retrouver dans le fichier.
+///
+/// Mais le lanceur du `.app` macOS (l'applet AppleScript compilé par
+/// `.github/workflows/release.yml:908-921`) démarre le serveur ainsi :
+///
+/// ```text
+/// tune-server >> ~/Library/Logs/tune-server.log 2>&1 &
+/// ```
+///
+/// …c'est-à-dire en branchant sa sortie **sur le fichier que la couche fichier
+/// ouvre de son côté** — `~/Library/Logs/tune-server.log` est exactement ce que
+/// [`crate::config::default_log_file_path`] rend sur macOS. Chaque ligne y
+/// arrive alors deux fois, par deux descripteurs distincts. Journal de Cyrille
+/// Moutia, 0.9.163 : 1 002 lignes pour 585 uniques, un seul
+/// `tune-server starting`, une seule séquence de démarrage, et jusqu'aux lignes
+/// de migration de base dédoublées.
+///
+/// Ce n'est pas cosmétique : le rapport de bogue intégré n'embarque que les
+/// 200 dernières lignes (`BUG_REPORT_LOG_LINES`). Dédoublées, elles ne portent
+/// que 100 lignes d'information — chaque diagnostic nous arrive de moitié.
+///
+/// ## La SORTIE STANDARD, et non le flux d'erreur
+///
+/// Le piège est là, et il a coûté une lecture de plus. La couche console est
+/// une `tracing_subscriber::fmt::layer()`, dont l'écrivain par défaut est
+/// `io::stdout` (`tracing-subscriber-0.3.23`, `fmt/fmt_layer.rs:749`) — malgré
+/// le nom `stderr_layer` que portait la variable dans `bootstrap.rs`. Les
+/// lignes de `tracing` partent donc sur le descripteur **1**. Le descripteur 2
+/// ne porte que les `eprintln!` d'avant l'abonné (« Logging to … », les échecs
+/// de rotation, une panique) : eux ne sont jamais dédoublés, puisqu'aucune
+/// couche ne les réécrit.
+///
+/// C'est donc le descripteur 1 qu'on interroge. `2>&1` du lanceur amène de
+/// toute façon les deux sur le même fichier.
+///
+/// ## Comment on tranche
+///
+/// Sous Unix, deux descripteurs visent le même fichier si et seulement si ils
+/// portent le même couple (device, inode). Comparer les *chemins* ne suffirait
+/// pas : un descripteur redirigé n'en garde aucun, et le chemin ouvert pourrait
+/// passer par un lien symbolique.
+///
+/// Le descripteur est emprunté via `ManuallyDrop` : le laisser tomber le
+/// fermerait, et le processus perdrait sa sortie standard.
+///
+/// Un échec de `stat` — des deux côtés — rend `false` : dans le doute on garde
+/// la console, parce que perdre l'affichage est pire que doubler le fichier.
+///
+/// Mesuré sur ce Mac : sortie sur un tube → `dev=0`, jamais celui du fichier ;
+/// sortie sur un terminal → même `dev` que le fichier mais `ino` différent ;
+/// sortie redirigée sur le fichier → les deux égaux. Les trois cas sont tenus
+/// par `tests/journal_ecrit_en_double_20260923.rs`.
+///
+/// ## Windows
+///
+/// Rend toujours `false`. L'équivalent existe
+/// (`GetFileInformationByHandle` : numéro de série du volume + index de
+/// fichier), mais aucun chemin de lancement Windows ne redirige quoi que ce
+/// soit : `start-tune-server.bat`, écrit par l'installeur NSIS
+/// (`.github/workflows/release.yml:805-812`), lance `tune-server.exe` dans une
+/// console, sans `>`. Le défaut n'y existe pas, et on n'ajoute pas une
+/// dépendance `windows-sys` pour une garde sans terrain. Si un service Windows
+/// redirigeait un jour sa sortie vers ce même fichier, c'est ici qu'il faudrait
+/// revenir.
+#[cfg(unix)]
+pub fn la_console_ecrit_deja_dans(chemin: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(meta_fichier) = std::fs::metadata(chemin) else {
+        return false;
+    };
+
+    // Emprunt du descripteur 1 : `ManuallyDrop` empêche la fermeture que le
+    // `Drop` de `File` ferait — le serveur n'aurait plus de sortie standard.
+    let sortie = std::mem::ManuallyDrop::new(unsafe {
+        <File as std::os::unix::io::FromRawFd>::from_raw_fd(1)
+    });
+    let Ok(meta_sortie) = sortie.metadata() else {
+        return false;
+    };
+
+    meta_sortie.dev() == meta_fichier.dev() && meta_sortie.ino() == meta_fichier.ino()
+}
+
+/// Voir la version Unix : sans terrain Windows, la console est toujours gardée.
+#[cfg(not(unix))]
+pub fn la_console_ecrit_deja_dans(_chemin: &std::path::Path) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

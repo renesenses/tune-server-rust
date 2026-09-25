@@ -110,8 +110,65 @@ fn partager_ids(repo: &AlbumRepo, album_ids: &[i64]) -> Result<(Vec<i64>, Vec<i6
     Ok((encore_la, morts))
 }
 
+/// Champ STOCKÉ (jamais servi tel quel) : le titre et l'artiste de chaque
+/// album AU MOMENT DU RANGEMENT, indexés par identifiant.
+///
+/// 🔴 #901 (Lulu) — la liste des albums manquants ne sert à rien si elle est
+/// une suite de numéros. Or ces albums ne sont plus en base : leur titre n'est
+/// lisible NULLE PART au moment où on voudrait l'afficher. Le seul instant où
+/// il l'est encore, c'est quand l'album est rangé (ou quand le dossier est
+/// ouvert alors qu'il vit encore). On l'écrit donc là, et pas ailleurs.
+const ETIQUETTES: &str = "album_labels";
+
+/// Le nom d'un album, tel qu'il est au moment où on le regarde.
+fn etiquette_de(album: &tune_core::db::models::Album) -> Value {
+    json!({ "title": album.title, "artist": album.artist_name })
+}
+
+/// Les étiquettes conservées d'un dossier, indexées par identifiant d'album.
+fn etiquettes_stockees(collection: &Value) -> serde_json::Map<String, Value> {
+    collection
+        .get(ETIQUETTES)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// La liste des albums manquants — NOMMÉE quand on a su garder le nom.
+///
+/// `title`/`artist` valent `null` pour un album rangé avant que ce champ
+/// n'existe et mort sans que le dossier ait jamais été rouvert entre-temps :
+/// il ne reste alors que son identifiant, et on ne l'invente pas.
+fn albums_manquants(collection: &Value, morts: &[i64]) -> Vec<Value> {
+    let etiquettes = etiquettes_stockees(collection);
+    morts
+        .iter()
+        .map(|id| {
+            let e = etiquettes.get(&id.to_string());
+            let champ = |nom: &str| {
+                e.and_then(|e| e.get(nom))
+                    .filter(|v| !v.is_null())
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            };
+            json!({ "id": id, "title": champ("title"), "artist": champ("artist") })
+        })
+        .collect()
+}
+
 /// Rend un dossier tel qu'il est SERVI : `album_ids` réduit aux albums encore
-/// présents, et le nombre d'identifiants morts dit à voix haute.
+/// présents, et les identifiants morts dits à voix haute.
+///
+/// 🔴 #901 — `orphan_album_ids` portait, MALGRÉ SON NOM, un nombre. Il porte
+/// désormais ce que son nom annonce : la LISTE des identifiants. Le nombre
+/// reste publié, sous un nom qui le dit — `orphan_album_count` — et
+/// `orphan_albums` donne le détail nommé.
+///
+/// ⚠️ Compatibilité : un client d'avant #901 lit `orphan_album_ids` derrière
+/// un `typeof === 'number'` (CollectionsV2.svelte, v0.9.161). Une liste lui
+/// fait donc masquer la mention — il ne plante pas, n'affiche ni `NaN` ni un
+/// compte faux : il retombe exactement sur l'écran d'avant v0.9.161. C'est le
+/// prix assumé pour que la clé cesse de mentir sur son contenu.
 ///
 /// ⚠️ La liste STOCKÉE n'est pas touchée. Un `GET` ne purge rien : un album
 /// peut manquer parce qu'un disque n'est pas monté ou qu'un scan est en cours,
@@ -126,17 +183,71 @@ fn dossier_servi(repo: &AlbumRepo, collection: &Value) -> Result<Value, AppError
             morts.len()
         );
     }
+    let manquants = albums_manquants(collection, &morts);
     let mut servi = collection.clone();
     if let Some(obj) = servi.as_object_mut() {
         obj.insert("album_count".into(), json!(vivants.len()));
-        obj.insert("orphan_album_ids".into(), json!(morts.len()));
+        obj.insert("orphan_album_ids".into(), json!(morts));
+        obj.insert("orphan_album_count".into(), json!(morts.len()));
+        obj.insert("orphan_albums".into(), json!(manquants));
         obj.insert("album_ids".into(), json!(vivants));
+        // Les étiquettes sont une RÉSERVE, pas une donnée d'écran : un
+        // dossier de 2 000 albums doublerait la réponse pour rien.
+        obj.remove(ETIQUETTES);
     }
     Ok(servi)
 }
 
+/// Écrit les étiquettes d'un dossier SANS toucher au reste.
+///
+/// Relit le réglage juste avant d'écrire et ne modifie que `album_labels` du
+/// dossier visé : un rangement fait entre-temps par un autre appel est donc
+/// conservé. Rend `true` si quelque chose a été écrit.
+fn conserver_etiquettes(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    collection_id: i64,
+    nouvelles: &serde_json::Map<String, Value>,
+) -> bool {
+    if nouvelles.is_empty() {
+        return false;
+    }
+    let mut collections: Vec<Value> = settings
+        .get("collections")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let Some(collection) = collections
+        .iter_mut()
+        .find(|c| c.get("id").and_then(|v| v.as_i64()) == Some(collection_id))
+    else {
+        return false;
+    };
+    let mut etiquettes = etiquettes_stockees(collection);
+    let mut change = false;
+    for (id, valeur) in nouvelles {
+        if etiquettes.get(id) != Some(valeur) {
+            etiquettes.insert(id.clone(), valeur.clone());
+            change = true;
+        }
+    }
+    if !change {
+        return false;
+    }
+    if let Some(obj) = collection.as_object_mut() {
+        obj.insert(ETIQUETTES.into(), Value::Object(etiquettes));
+    }
+    match serde_json::to_string(&collections) {
+        Ok(s) => settings.set("collections", &s).is_ok(),
+        Err(e) => {
+            tracing::warn!("dossier {collection_id}: étiquettes non conservées: {e} (#901)");
+            false
+        }
+    }
+}
+
 /// Les dossiers STOCKÉS, tels quels — la liste JSON du réglage `collections`.
-fn dossiers_stockes(state: &AppState) -> Vec<Value> {
+pub(super) fn dossiers_stockes(state: &AppState) -> Vec<Value> {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings
         .get("collections")
@@ -315,6 +426,9 @@ pub(super) async fn delete_collection(
     settings
         .set("collections", &serde_json::to_string(&collections)?)
         .ok();
+    // #4853 — l'id d'un dossier est `max + 1`, donc réutilisé : sans ceci, la
+    // collection créée ensuite hériterait du rangement de celle-ci.
+    super::collection_folders::oublier_collection_simple(&state, id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -389,6 +503,23 @@ pub(super) async fn collection_albums(
             tracing::warn!("dossier {id}: added_at_by_ids a échoué — liste sans date d'ajout: {e}")
         }
     }
+    // #901 — RATTRAPAGE. Les albums vivants du dossier sont déjà chargés ici :
+    // relever leur nom ne coûte pas une requête de plus. C'est le seul moyen
+    // de nommer un jour les albums rangés AVANT que ce champ n'existe — quand
+    // ils mourront, leur étiquette sera déjà là. Rien n'est écrit si rien n'a
+    // changé, donc cette écriture ne se produit qu'une fois par dossier.
+    let mut releve = serde_json::Map::new();
+    for album in &albums {
+        if let Some(aid) = album.id {
+            releve.insert(aid.to_string(), etiquette_de(album));
+        }
+    }
+    if conserver_etiquettes(&settings, id, &releve) {
+        tracing::info!(
+            "dossier {id}: {} étiquette(s) d'album conservées pour la liste des manquants (#901)",
+            releve.len()
+        );
+    }
     sort_albums(
         &mut albums,
         CollectionSort::parse(query.sort.as_deref()),
@@ -431,6 +562,28 @@ pub(super) async fn add_album_to_collection(
             }
         }
     }
+    // #901 — le nom de l'album est lisible MAINTENANT, et seulement
+    // maintenant : on le range avec lui. Un album introuvable ou une base
+    // muette ne fait pas échouer le rangement, elle laisse l'étiquette vide.
+    let etiquette = match AlbumRepo::with_backend(state.backend.clone()).get(path.album_id) {
+        Ok(Some(album)) => Some(etiquette_de(&album)),
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(
+                "dossier {}: album {} illisible, rangé sans étiquette: {e} (#901)",
+                path.id,
+                path.album_id
+            );
+            None
+        }
+    };
+    if let Some(etiquette) = etiquette {
+        let mut etiquettes = etiquettes_stockees(collection);
+        etiquettes.insert(path.album_id.to_string(), etiquette);
+        if let Some(obj) = collection.as_object_mut() {
+            obj.insert(ETIQUETTES.into(), Value::Object(etiquettes));
+        }
+    }
     settings
         .set("collections", &serde_json::to_string(&collections)?)
         .ok();
@@ -461,6 +614,14 @@ pub(super) async fn remove_album_from_collection(
         .and_then(|v| v.as_array_mut())
     {
         arr.retain(|v| v.as_i64() != Some(path.album_id));
+    }
+    // #901 — un album sorti du dossier n'y « manque » plus : son étiquette
+    // n'a plus de raison d'être gardée, et la réserve ne doit pas enfler.
+    if let Some(etiquettes) = collection
+        .get_mut(ETIQUETTES)
+        .and_then(|v| v.as_object_mut())
+    {
+        etiquettes.remove(&path.album_id.to_string());
     }
     settings
         .set("collections", &serde_json::to_string(&collections)?)

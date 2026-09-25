@@ -215,6 +215,10 @@ fn spawn_paced_levels_forwarder(
         // perdue. Un état par forwarder = remise à zéro au changement de
         // piste, gratuite par construction.
         let mut peak_hold = crate::audio::levels::PeakHold::default();
+        // Fil 1908 — l'horloge de la sortie locale cadence tant qu'elle
+        // reste cohérente avec la piste de CE forwarder ; retombée une fois,
+        // on revient au cadencement mural pour le reste de la piste.
+        let mut horloge_de_sortie_fiable = true;
         while let Some(raw) = rx.recv().await {
             // La boucle RAPPORTE la position lue au moment où la zone est
             // effectivement en lecture : c'est cette valeur-là, et aucune autre,
@@ -259,26 +263,65 @@ fn spawn_paced_levels_forwarder(
             if next_emit < now {
                 next_emit = now;
             }
-            // Rattrapage borné sur la position du renderer : si le flux émis
-            // est en retard sur le son (démarrage tardif du décodage — mesuré
-            // ~5 s de staging sur un 24/192 en passthrough), on émet sans
-            // attendre jusqu'à recoller à ~1 s. Borné par construction : le
-            // retard vaut quelques secondes de fenêtres, pas la piste entière.
-            let lagging =
-                reported_advancing && (position.as_millis() as i64) < reported_position_ms - 1_000;
-            if lagging {
-                // Fenêtre du passé audible : personne n'en veut — ni le tap
-                // ni les clients. On la saute sans l'émettre (l'émettre en
-                // rafale inondait le bus : « broadcast lagged, skipped
-                // 2000 messages ») et on garde l'horloge au présent.
-                if (position.as_millis() as i64) + 2_000 < reported_position_ms {
+            // Fil 1908 (Didier, 24/09/2026, SMSL SU-8 en USB sous Windows) :
+            // « l'analyseur [est] une à deux secondes en avance sur la sortie
+            // audio ». Sur une sortie LOCALE, la position rapportée est celle
+            // ALIMENTÉE — l'anneau garde jusqu'à deux secondes entre elle et
+            // le pilote — et le rattrapage ci-dessous recollait les niveaux à
+            // une seconde d'elle : en avance sur le son. Quand la sortie dit
+            // ce que son anneau retient, c'est l'instant où la fenêtre SORT
+            // qui cadence, et non plus l'horloge murale.
+            let audible = if horloge_de_sortie_fiable {
+                playback.position_audible_ms(zone_id)
+            } else {
+                None
+            };
+            if let Some(audible) = audible {
+                let debut_fenetre_ms = position.as_millis() as i64;
+                if debut_fenetre_ms + 2_000 < audible {
+                    // Déjà entendue depuis longtemps : même règle que le
+                    // rattrapage ci-dessous, on ne l'émet pas.
                     position += raw.window;
                     next_emit = now;
                     continue;
                 }
-                next_emit = now;
+                match attendre_que_la_sortie_joue(
+                    &playback,
+                    zone_id,
+                    play_seq,
+                    &gen_arc,
+                    gen_at_spawn,
+                    debut_fenetre_ms,
+                )
+                .await
+                {
+                    AttenteDeSortie::Jouee => {}
+                    AttenteDeSortie::HorlogeIncoherente => horloge_de_sortie_fiable = false,
+                    AttenteDeSortie::LectureRemplacee => return,
+                }
+                next_emit = tokio::time::Instant::now();
             } else {
-                tokio::time::sleep_until(next_emit).await;
+                // Rattrapage borné sur la position du renderer : si le flux émis
+                // est en retard sur le son (démarrage tardif du décodage — mesuré
+                // ~5 s de staging sur un 24/192 en passthrough), on émet sans
+                // attendre jusqu'à recoller à ~1 s. Borné par construction : le
+                // retard vaut quelques secondes de fenêtres, pas la piste entière.
+                let lagging = reported_advancing
+                    && (position.as_millis() as i64) < reported_position_ms - 1_000;
+                if lagging {
+                    // Fenêtre du passé audible : personne n'en veut — ni le tap
+                    // ni les clients. On la saute sans l'émettre (l'émettre en
+                    // rafale inondait le bus : « broadcast lagged, skipped
+                    // 2000 messages ») et on garde l'horloge au présent.
+                    if (position.as_millis() as i64) + 2_000 < reported_position_ms {
+                        position += raw.window;
+                        next_emit = now;
+                        continue;
+                    }
+                    next_emit = now;
+                } else {
+                    tokio::time::sleep_until(next_emit).await;
+                }
             }
 
             let window = raw.window;
@@ -418,6 +461,73 @@ fn spawn_paced_levels_forwarder(
         }
     });
     tx
+}
+
+/// Fil 1908 — issue de l'attente d'une fenêtre sur l'horloge de la sortie.
+#[derive(Debug, PartialEq, Eq)]
+enum AttenteDeSortie {
+    /// Le son a atteint le début de la fenêtre : on la publie.
+    Jouee,
+    /// L'horloge ne décrit pas cette piste (bien trop loin derrière, ou figée
+    /// alors que la zone joue) : on la publie et on revient au cadencement
+    /// mural. Attendre encore coûterait la même attente à chaque fenêtre.
+    HorlogeIncoherente,
+    /// Piste remplacée ou lecture arrêtée pendant l'attente.
+    LectureRemplacee,
+}
+
+/// Écart au-delà duquel l'horloge de sortie ne décrit plus la piste du
+/// forwarder : l'anneau d'une sortie locale tient deux secondes, jamais cinq.
+const HORLOGE_DE_SORTIE_AVANCE_MAX_MS: i64 = 5_000;
+
+/// Durée sans progrès de l'horloge, zone en lecture, au-delà de laquelle on
+/// cesse de la croire (flux réseau figé, pilote muet).
+const HORLOGE_DE_SORTIE_FIGEE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Attendre que le son de la sortie locale atteigne `cible_ms` — fil 1908.
+///
+/// La pause ne compte pas comme une horloge figée : l'attente reprend avec la
+/// lecture, et la fenêtre sort avec le son.
+async fn attendre_que_la_sortie_joue(
+    playback: &PlaybackManager,
+    zone_id: i64,
+    play_seq: u64,
+    gen_arc: &std::sync::atomic::AtomicU64,
+    gen_at_spawn: u64,
+    cible_ms: i64,
+) -> AttenteDeSortie {
+    let mut dernier_audible = i64::MIN;
+    let mut depuis_le_dernier_progres = tokio::time::Instant::now();
+    loop {
+        if playback.current_play_seq(zone_id).await != play_seq
+            || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
+        {
+            return AttenteDeSortie::LectureRemplacee;
+        }
+        // Débranchée entre-temps (zone rebasculée sur un rendu réseau) :
+        // plus rien à attendre.
+        let Some(audible) = playback.position_audible_ms(zone_id) else {
+            return AttenteDeSortie::Jouee;
+        };
+        let avance = cible_ms - audible;
+        if avance <= 0 {
+            return AttenteDeSortie::Jouee;
+        }
+        if avance > HORLOGE_DE_SORTIE_AVANCE_MAX_MS {
+            return AttenteDeSortie::HorlogeIncoherente;
+        }
+        let maintenant = tokio::time::Instant::now();
+        if audible != dernier_audible
+            || playback.get_state(zone_id).await.state != PlayState::Playing
+        {
+            dernier_audible = audible;
+            depuis_le_dernier_progres = maintenant;
+        } else if maintenant.duration_since(depuis_le_dernier_progres) > HORLOGE_DE_SORTIE_FIGEE {
+            return AttenteDeSortie::HorlogeIncoherente;
+        }
+        let pas = avance.clamp(5, 50) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(pas)).await;
+    }
 }
 
 /// Le FREIN du décodage-pour-niveaux, isolé de ce QU'ON décode.
@@ -792,6 +902,11 @@ pub struct PlaybackOrchestrator {
     /// left None in tests → no gating). Enforced at zone activation in `play`.
     pub license: Option<Arc<crate::license::LicenseManager>>,
     gapless_sessions: Mutex<HashMap<i64, String>>,
+    /// #3365 — la qualité annoncée de la piste pré-armée, rangée à côté de
+    /// `gapless_sessions` et reprise par `advance_queue_metadata` quand la
+    /// zone adopte ce flux. Carte annexe plutôt qu'un changement de forme de
+    /// `gapless_sessions`, dont vit l'épreuve de #3442.
+    qualites_pre_armees: Mutex<HashMap<i64, QualitePreArmee>>,
     pub prefetch: Arc<PrefetchEngine>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
@@ -907,6 +1022,9 @@ pub struct PlaybackOrchestrator {
     /// Un champ et non un appel direct : les témoins y substituent un parc
     /// connu, faute de périphérique réel sur la machine qui les exécute.
     pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
+    /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
+    /// par nom de `source`. Voir `crate::source_pcm`.
+    pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1193,6 +1311,7 @@ impl PlaybackOrchestrator {
             event_bus: None,
             license: None,
             gapless_sessions: Mutex::new(HashMap::new()),
+            qualites_pre_armees: Mutex::new(HashMap::new()),
             prefetch: Arc::new(PrefetchEngine::new()),
             dsd_capabilities: Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
@@ -1208,6 +1327,7 @@ impl PlaybackOrchestrator {
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
+            sources_pcm: crate::source_pcm::SourcesPcm::default(),
         }
     }
 
@@ -1280,10 +1400,17 @@ mod resolve_stream;
 
 mod resolve_local;
 
+// #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
+mod crossfeed_bibliotheque_reseau;
+
 mod dsp;
 pub use dsp::PorteeDuReglage;
 
 mod resolve_direct;
+// #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
+mod capacite_lpcm_par_sortie;
+// #4863 — une source PCM fournie par un greffon (lecture d'un CD).
+mod source_pcm;
 
 /// #4362 — le chemin de lecture consulte le registre des serveurs multimédia
 /// avant d'envoyer l'URL d'une piste indexée à une sortie.
@@ -1295,11 +1422,15 @@ mod serveur_source_absent_4362;
 pub mod verdict_upnp;
 
 mod queue;
+pub use queue::Enjambee;
 
 mod history;
 
 mod bandcamp;
 pub use bandcamp::*;
+
+mod qualite_pre_armee;
+pub(crate) use qualite_pre_armee::{QualitePreArmee, format_du_mime, format_nomme_par_la_source};
 
 /// Ce qu'on ANNONCE au renderer pour une piste de serveur média : le MIME ne
 /// se devine plus dans la seule URL, qui pour un `<res>` de Tune ne porte
@@ -1432,6 +1563,10 @@ mod dsd_passthrough_tests;
 #[cfg(test)]
 mod dsd_upnp_politique_de_zone_tests;
 
+/// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
+/// l'alimentation de l'anneau.
+#[cfg(test)]
+mod niveaux_a_la_sortie_1908;
 #[cfg(test)]
 mod resolution_annoncee_tests;
 
@@ -1449,6 +1584,10 @@ mod wav_override_tests;
 /// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
 #[cfg(test)]
 mod alac_passthrough_tests;
+/// #4800 (cause 5) — un FLAC de l'enregistreur (`Lavf` sans MD5, #4350) part
+/// tel quel sous un en-tête neuf vers une zone réseau, sans être ré-encodé.
+#[cfg(test)]
+mod flac_conteneur_neuf_4800;
 #[cfg(test)]
 mod plafond_16_bits_tests;
 /// #4016 — le plafond de 4 GiB de l en-tete RIFF, mesure puis route.
@@ -1548,6 +1687,9 @@ mod recreation_locale_guard;
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
 
+#[cfg(test)]
+mod qualite_piste_de_service_3365;
+
 /// #4556 — le refus de lecture quand le coupe-circuit ASIO a vidé le parc.
 ///
 /// Hors de toute `feature` : `refus_de_zone_hors_ligne` est une fonction pure
@@ -1556,3 +1698,8 @@ mod adoption_du_flux_pre_arme_3442;
 /// CI — celui des PR vers `batch/*` — et pas seulement sous `local-audio`.
 #[cfg(test)]
 mod refus_asio_bloque_4556;
+
+/// #4366 — le 403 amont de YouTube doit dire combien d'en-tetes de yt-dlp
+/// ont ete rejoues sur la requete qui l'a pris.
+#[cfg(test)]
+mod refus_amont_4366;

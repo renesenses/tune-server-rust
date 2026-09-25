@@ -782,6 +782,31 @@ pub struct AussiSur {
     pub serveur: Option<String>,
 }
 
+/// Le fragment `SET` qui remonte le label des PISTES sur leur ALBUM (#4836).
+///
+/// Le scan range le label lu dans le fichier (`LABEL`/`ORGANIZATION` Vorbis,
+/// `TPUB` ID3v2…) sur `tracks.label` ; l'onglet Labels de la bibliothèque et
+/// la recherche des labels (`search_labels`) lisent `albums.label`. Aucun
+/// chemin de scan n'écrivait ce dernier : seuls l'enrichissement MusicBrainz,
+/// la ré-identification et l'édition manuelle le faisaient. Un label bien
+/// étiqueté ne s'affichait donc jamais (fil 1899).
+///
+/// Comblement seul : un label d'album déjà posé — par l'utilisateur ou par
+/// l'enrichissement — n'est jamais écrasé ; une chaîne vide compte comme un
+/// trou (même règle que `genre`). Parmi les pistes, le label le plus fréquent
+/// l'emporte, départagé par ordre alphabétique : un `LIMIT 1` nu rendrait une
+/// ligne quelconque, différente d'un scan à l'autre (#1160).
+///
+/// Corrélé sur `albums.id` : il sert tel quel à la remontée d'un album
+/// (`WHERE id = ?`) comme à la remontée globale du scan manuel. SQL commun à
+/// SQLite et PostgreSQL.
+pub fn sql_label_repris_des_pistes() -> &'static str {
+    "label = COALESCE(NULLIF(albums.label, ''), \
+     (SELECT t.label FROM tracks t \
+      WHERE t.album_id = albums.id AND t.label IS NOT NULL AND t.label != '' \
+      GROUP BY t.label ORDER BY COUNT(*) DESC, t.label ASC LIMIT 1))"
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -1998,6 +2023,21 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Remonte le label des pistes sur leur album — voir [`sql_label_repris_des_pistes`].
+    pub fn update_label_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
+        let sql = format!(
+            "UPDATE albums SET {} WHERE id = {}",
+            sql_label_repris_des_pistes(),
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(1),
+                Engine::Postgres => PostgresDialect.placeholder(1),
+            }
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
         // 7 references to the same album_id parameter. SQLite uses `?`
         // for each; PG would use $1..$7 — we build the placeholder list
@@ -2037,6 +2077,8 @@ impl AlbumRepo {
             &album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id,
         ];
         self.db.execute(&sql, &params)?;
+        // #4836 : le label des pistes remonte avec le reste.
+        self.update_label_from_tracks(album_id)?;
         Ok(())
     }
 
@@ -4139,6 +4181,81 @@ mod tests {
             repo.get(album_id).unwrap().unwrap().genre.as_deref(),
             Some("Jazz"),
             "an already-empty album genre must be re-filled from a real track genre"
+        );
+    }
+
+    /// #4836 (Dominique Pamingle, fil 1899) — « mes balises LABEL sont bien
+    /// remplies, mais ne s'affichent pas ». Le scan range le label du fichier
+    /// sur la PISTE (`tracks.label`) ; l'onglet Labels et la recherche des
+    /// labels lisent l'ALBUM (`albums.label`). La remontée de fin de scan doit
+    /// donc porter le label des pistes jusqu'à l'album — par vote majoritaire,
+    /// une piste vide ne comptant pas — sans jamais écraser un label d'album
+    /// déjà posé (édition manuelle, enrichissement MusicBrainz).
+    #[test]
+    fn le_label_des_pistes_remonte_sur_l_album_sans_ecraser_4836() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+        let artist_id = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let vide = repo
+            .get_or_create("Kind of Blue", artist_id, Some(1959))
+            .unwrap()
+            .id
+            .unwrap();
+        let pose = repo
+            .get_or_create("Bitches Brew", artist_id, Some(1970))
+            .unwrap()
+            .id
+            .unwrap();
+        let global = repo
+            .get_or_create("In a Silent Way", artist_id, Some(1969))
+            .unwrap()
+            .id
+            .unwrap();
+        db.execute_batch(&format!(
+            "UPDATE albums SET label = 'Sony Music' WHERE id = {pose};
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('So What', {vide}, {artist_id}, '');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Freddie', {vide}, {artist_id}, 'CBS');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Blue in Green', {vide}, {artist_id}, 'Columbia');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('All Blues', {vide}, {artist_id}, 'Columbia');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Pharaoh', {pose}, {artist_id}, 'Columbia');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Shhh', {global}, {artist_id}, 'Columbia');"
+        ))
+        .unwrap();
+
+        // Le chemin par album (scan automatique, veilleur, enrichissement).
+        repo.update_quality_from_tracks(vide).unwrap();
+        repo.update_quality_from_tracks(pose).unwrap();
+        assert_eq!(
+            repo.get(vide).unwrap().unwrap().label.as_deref(),
+            Some("Columbia"),
+            "#4836 — le label porté par les pistes doit remonter sur l'album \
+             (majorité, piste vide écartée) : c'est `albums.label` que lit \
+             l'onglet Labels"
+        );
+        assert_eq!(
+            repo.get(pose).unwrap().unwrap().label.as_deref(),
+            Some("Sony Music"),
+            "un label d'album déjà posé ne s'écrase pas"
+        );
+
+        // Le chemin global du scan manuel (`routes/system/scan.rs`), qui
+        // emploie le MÊME fragment SQL.
+        db.execute(
+            &format!("UPDATE albums SET {}", sql_label_repris_des_pistes()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            repo.get(global).unwrap().unwrap().label.as_deref(),
+            Some("Columbia"),
+            "#4836 — la remontée globale de fin de scan manuel porte aussi le label"
+        );
+        assert_eq!(
+            repo.get(pose).unwrap().unwrap().label.as_deref(),
+            Some("Sony Music")
         );
     }
 
