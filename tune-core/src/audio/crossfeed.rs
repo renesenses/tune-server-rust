@@ -74,7 +74,14 @@ impl CrossfeedProcessor {
             },
         };
         for (id, reglage) in tiers {
-            let Some(fournisseur) = super::natifs_tiers::fournisseur_dsp(id) else {
+            // Directement au registre natif, sans passer par
+            // `super::natifs_tiers` : ce fichier est aussi compilé SEUL par
+            // l'oracle de parité DSP (`sdk/scripts/verify_dsp_parity.py`). Les
+            // appelants ont déjà filtré les identifiants admissibles.
+            let Some(fournisseur) = tune_plugin_native::provider(id).filter(|library| {
+                library.manifest.kind == tune_plugin_sdk::manifest::PluginKind::Dsp
+                    && tune_plugin_native::failure(id).is_none()
+            }) else {
                 continue;
             };
             match tune_plugin_native::stage::Stage::prepare(fournisseur, sample_rate, 2, reglage) {

@@ -725,12 +725,6 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{reponse}");
         assert_eq!(reponse["detail"], "missing detached signature", "{reponse}");
-        let (status, reponse) = appel(&app, "POST", "/api/v1/audio-plugins/bandcamp/install").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{reponse}");
-        assert_eq!(
-            reponse["detail"], "plugin id already used by another plugin",
-            "{reponse}"
-        );
         // Premium mais greffon non chargé : pas de réglage de zone.
         let (status, reponse) = appel_avec_corps(
             &app,
@@ -750,5 +744,37 @@ mod tests {
                 .any(|p| p["id"] == tiers && p["third_party"] == true),
             "greffon tiers absent de l'état : {reponse}"
         );
+    }
+
+    /// Un greffon natif tiers ne peut pas prendre le nom d'un greffon compilé
+    /// dans ce serveur : ils partageraient les drapeaux `plugin_{id}_*`. Le jeu
+    /// registré est posé à la main, pour ne dépendre d'aucune feature.
+    #[tokio::test]
+    async fn greffon_natif_tiers_refuse_le_nom_d_un_greffon_compile() {
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state
+            .plugin_names
+            .set(vec!["greffon-compile-essai".to_string()])
+            .unwrap();
+        state
+            .license
+            .update_from_server(tune_core::license::Tier::Premium, None)
+            .await;
+        let app = crate::routes::router_with_plugins(state.clone(), vec![]);
+        let (status, reponse) = appel(
+            &app,
+            "POST",
+            "/api/v1/audio-plugins/greffon-compile-essai/install",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reponse}");
+        assert_eq!(
+            reponse["detail"], "plugin id already used by another plugin",
+            "{reponse}"
+        );
+        // Un nom libre n'est arrêté que par la signature.
+        let (_, reponse) = appel(&app, "POST", "/api/v1/audio-plugins/greffon-libre/install").await;
+        assert_eq!(reponse["detail"], "missing detached signature", "{reponse}");
     }
 }
