@@ -347,15 +347,12 @@ async fn un_401_sans_rafraichissement_possible_est_relaye() {
 // Le greffon lui-même -------------------------------------------------------
 
 #[test]
-fn le_greffon_s_appelle_circle_et_reste_opt_in_hors_catalogue() {
+fn le_greffon_s_appelle_circle_reste_opt_in_et_est_au_catalogue() {
     use tune_core::plugin_sdk::TunePlugin;
     let g = tune_circle::CirclePlugin::new(tune_circle::HostServices {
         backend: base("http://127.0.0.1:9", None),
     });
     assert_eq!(g.name(), "circle");
     assert!(!g.default_enabled(), "opt-in, comme cd");
-    assert!(
-        !g.catalogued(),
-        "hors catalogue, comme cd, tant qu'aucun écran"
-    );
+    assert!(g.catalogued(), "au catalogue, comme cd (#5018)");
 }

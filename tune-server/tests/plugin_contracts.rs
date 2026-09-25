@@ -74,6 +74,10 @@ fn use_scratch_plugin_data_dir() {
 
 #[path = "circle_plugin.rs"]
 mod circle_plugin;
+// #5018 — le greffon `circle` au catalogue (feature `circle`, dans `default`).
+#[cfg(feature = "circle")]
+#[path = "circle_catalogue_5018.rs"]
+mod circle_catalogue_5018;
 #[path = "concerts_plugin.rs"]
 mod concerts_plugin;
 #[path = "dj_plugin.rs"]
