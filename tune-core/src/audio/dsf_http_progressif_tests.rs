@@ -9,9 +9,10 @@
 //! canal, corrélation des deux flux — et mesure la vitesse de décodage face au
 //! temps réel, qui est la contrainte d'un flux servi au fil de l'eau.
 //!
-//! Deux sources : un DSF SYNTHÉTIQUE écrit ici (sinus 1 kHz modulé sigma-delta
-//! au second ordre, dont fréquence et niveau se vérifient après décodage), et,
-//! quand `TUNE_DSF_REEL` nomme un fichier, un vrai DSF du terrain.
+//! Trois sources : un DSF SYNTHÉTIQUE écrit ici (sinus 1 kHz modulé sigma-delta
+//! au second ordre, dont fréquence et niveau se vérifient après décodage), le
+//! DSF de référence du dépôt (écrit par un autre écrivain, toujours joué), et,
+//! quand `TUNE_DSF_REEL` nomme un fichier, un vrai DSF du terrain en plus.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -349,22 +350,37 @@ async fn le_chemin_http_produit_le_meme_pcm_que_le_fichier_sur_un_sinus() {
     );
 }
 
-/// Un vrai DSF du terrain, quand `TUNE_DSF_REEL` en nomme un (le fichier de
-/// 15 Mio du .18 ne peut pas entrer dans le dépôt). Ignoré sinon.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn le_chemin_http_produit_le_meme_pcm_que_le_fichier_sur_un_dsf_reel() {
-    let Ok(chemin) = std::env::var("TUNE_DSF_REEL") else {
-        eprintln!("TUNE_DSF_REEL absent : témoin sur DSF réel ignoré");
-        return;
-    };
-    let corps = std::fs::read(&chemin).expect("lire le DSF réel");
+/// Le DSF de référence du dépôt, écrit par un AUTRE écrivain que `dsf_sinus`
+/// (`tests/fixtures/dsd/generer_fixtures_dsd.py`, d'après la spécification
+/// Sony v1.01) : le conteneur ne vient pas du même code que le témoin.
+const DSF_DE_REFERENCE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/dsd/ref_dsd64_stereo.dsf"
+);
+
+async fn comparer_sur_un_dsf(nom: &str, chemin: &str) {
+    let corps = std::fs::read(chemin).expect("lire le DSF");
     let info = super::dsf::parse_dsf_from_bytes(&corps).expect("en-tête DSF");
     let duree = info.total_samples as f64 / info.sample_rate as f64;
     eprintln!(
-        "[réel] {chemin} : {} Hz, {} canaux, {} échantillons/canal, {duree:.3} s",
+        "[{nom}] {chemin} : {} Hz, {} canaux, {} échantillons/canal, {duree:.3} s",
         info.sample_rate, info.channels, info.total_samples
     );
-    let par_fichier = decoder_par_fichier(&chemin).await;
+    let par_fichier = decoder_par_fichier(chemin).await;
     let par_http = decoder_par_http(Arc::new(corps)).await;
-    comparer("réel", &par_fichier, &par_http, duree);
+    comparer(nom, &par_fichier, &par_http, duree);
+}
+
+/// Un DSF écrit hors de ce module — TOUJOURS joué, en CI comme ailleurs.
+///
+/// `TUNE_DSF_REEL` peut nommer EN PLUS un vrai DSF du terrain (le fichier de
+/// 15 Mio du .18 ne peut pas entrer dans le dépôt) : il est alors comparé à
+/// la suite. Sans elle, le témoin ne saute pas — il joue la référence du
+/// dépôt, et c'est elle que la CI garde.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_chemin_http_produit_le_meme_pcm_que_le_fichier_sur_un_dsf_reel() {
+    comparer_sur_un_dsf("référence", DSF_DE_REFERENCE).await;
+    if let Ok(chemin) = std::env::var("TUNE_DSF_REEL") {
+        comparer_sur_un_dsf("réel", &chemin).await;
+    }
 }
