@@ -111,11 +111,17 @@ pub mod sql {
             // title (t3) as a fallback. Without this the client can't play a top
             // track directly (it fell back to a fragile title search that failed),
             // so tapping a track on the home screen did nothing.
+            //
+            // Chaque colonne hors du `GROUP BY` passe par un agrégat : SQLite
+            // tolère une colonne nue, PostgreSQL refuse la requête ENTIÈRE
+            // (« column "t.id" must appear in the GROUP BY clause ») et la
+            // liste revenait vide sur toute base PG (chasse PG du 25/09/2026,
+            // `tune-server/tests/pg_group_by_strict_historique.rs`).
             "SELECT h.title, h.artist_name, COUNT(*) as plays, \
-             COALESCE(t.id, MAX(t3.id), h.track_id) as track_id, \
-             COALESCE(al.cover_path, al2.cover_path, MAX(h.cover_url)) as cover_path, \
-             COALESCE(al.title, h.album_title) as album_title, \
-             h.source \
+             COALESCE(MAX(t.id), MAX(t3.id), MAX(h.track_id)) as track_id, \
+             COALESCE(MAX(al.cover_path), MAX(al2.cover_path), MAX(h.cover_url)) as cover_path, \
+             COALESCE(MAX(al.title), MAX(h.album_title)) as album_title, \
+             MAX(h.source) \
              FROM listen_history h \
              LEFT JOIN tracks t ON h.track_id = t.id \
              LEFT JOIN tracks t3 ON t3.title = h.title \
@@ -1274,9 +1280,11 @@ impl HistoryRepo {
             Engine::Sqlite => "CAST(strftime('%Y', listened_at) AS INTEGER)",
             Engine::Postgres => "EXTRACT(YEAR FROM listened_at::timestamp)::int",
         };
+        // Agrégats hors du `GROUP BY` : même raison que `sql::top_tracks`
+        // (PostgreSQL refuse une colonne nue, « Ce jour-là » revenait vide).
         let otd_sql = format!(
-            "SELECT title, artist_name, album_title, NULL, listened_at,
-                    {yr_expr} as yr
+            "SELECT title, artist_name, MAX(album_title), NULL, MAX(listened_at),
+                    MAX({yr_expr}) as yr
              FROM listen_history
              WHERE listened_at LIKE {ph} AND {yr_expr} < {current_year}
              GROUP BY title, artist_name

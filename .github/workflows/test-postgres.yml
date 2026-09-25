@@ -180,6 +180,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test alarm_source_3715 i3715_alarm_postgres -- --nocapture
 
+      # Chasse PG du 25/09/2026 -- `GROUP BY` lache de l historique : une
+      # colonne nue hors du GROUP BY passe sur SQLite et fait tomber la requete
+      # entiere sur PostgreSQL. « Titres les plus ecoutes » et « Ce jour-la »
+      # rendaient `200 []` sur toute base PG. Jumeau SQLite dans ci.yml.
+      - name: GROUP BY strict de l historique sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
+
       # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
       # base. Ces requetes vivaient dans tune-server, que ce job ne compile
       # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
