@@ -524,6 +524,167 @@ const RETRAIT_PROUVE: &[Cas] = &[Cas {
     complet: None,
 }];
 
+/// Les gestes de CHANGEMENT (points 7 et 9 de Didier) et leurs contre-témoins.
+/// Décision de Bertrand du 25/09/2026 : les passes automatiques suivent une
+/// pochette du disque changée ; une pochette téléversée n'est jamais écrasée.
+pub(super) const CHANGEMENTS: &[Cas] = &[
+    Cas {
+        nom: "7 jaquette changee sans cover.jpg",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+    Cas {
+        nom: "7b jaquette changee, cover.jpg present",
+        avant: (Some(JAQUETTE), Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE_2), Some(COVER)),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+    Cas {
+        nom: "9 cover.jpg change sans jaquette",
+        avant: (None, Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (None, Some(COVER_2)),
+        attendu: Some(COVER_2),
+        complet: None,
+    },
+    Cas {
+        // La jaquette intégrée passe avant le cover.jpg (#5035) : changer ce
+        // dernier ne change rien à l'écran.
+        nom: "9b cover.jpg change, jaquette presente",
+        avant: (Some(JAQUETTE), Some(COVER)),
+        pochette: Avant::DuScan,
+        apres: (Some(JAQUETTE), Some(COVER_2)),
+        attendu: Some(JAQUETTE),
+        complet: None,
+    },
+    Cas {
+        nom: "televersee puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::Televersee,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(TELEVERSEE),
+        complet: None,
+    },
+    Cas {
+        nom: "televersee puis cover.jpg change",
+        avant: (None, Some(COVER)),
+        pochette: Avant::Televersee,
+        apres: (None, Some(COVER_2)),
+        attendu: Some(TELEVERSEE),
+        complet: None,
+    },
+    Cas {
+        nom: "fournisseur puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::Fournisseur,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(FOURNISSEUR),
+        // L'Analyse complète reconstruit depuis les fichiers — comme avant.
+        complet: Some(Some(JAQUETTE_2)),
+    },
+    Cas {
+        // Rien ne prouve que l'image en place venait du disque : une passe
+        // automatique la garde ; l'Analyse complète reconstruit, comme avant.
+        nom: "source inconnue (avant migration) puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::SourceInconnue,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE),
+        complet: Some(Some(JAQUETTE_2)),
+    },
+    Cas {
+        nom: "adresse heritee puis jaquette changee",
+        avant: (Some(JAQUETTE), None),
+        pochette: Avant::AdresseHeritee,
+        apres: (Some(JAQUETTE_2), None),
+        attendu: Some(JAQUETTE_2),
+        complet: None,
+    },
+];
+
+#[tokio::test]
+async fn changements_par_l_analyse_rapide_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Rapide).await;
+}
+
+#[tokio::test]
+async fn changements_par_repertoires_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Repertoires).await;
+}
+
+#[tokio::test]
+async fn changements_par_l_analyse_complete_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Complete).await;
+}
+
+#[tokio::test]
+async fn changements_par_le_scan_de_demarrage_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Demarrage).await;
+}
+
+#[tokio::test]
+async fn changements_par_le_surveillant_5034() {
+    jouer_le_tableau("changements", CHANGEMENTS, Passe::Surveillant).await;
+}
+
+/// #4650 — le single à la jaquette PROPRE, rangé dans l'album, ne devient
+/// pas la pochette de l'album quand on retouche SA jaquette, ni quand on
+/// retouche l'album entier et qu'il est relu le premier.
+#[tokio::test]
+async fn un_single_retouche_ne_prend_pas_la_pochette_de_l_album_5034() {
+    const SINGLE: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-DU-SINGLE-5034";
+    const SINGLE_2: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-DU-SINGLE-RETOUCHEE-5034";
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    for passe in [Passe::Rapide, Passe::Demarrage, Passe::Surveillant] {
+        let (racine, _dossier, pistes) =
+            album_sur_disque(&format!("single-{passe:?}"), Some(JAQUETTE), None);
+        poser_jaquette(&pistes[1], Some(SINGLE));
+        dater(&pistes[1], hier());
+        let etat = etat_sur(&racine);
+        let db = etat.backend.clone();
+        scan_manuel(&etat, false, None).await;
+        let aid = album_de(&db, &pistes[0]);
+        let pochette = || {
+            AlbumRepo::with_backend(db.clone())
+                .get(aid)
+                .unwrap()
+                .unwrap()
+                .cover_path
+        };
+        assert_eq!(
+            pochette(),
+            Some(content_hash(JAQUETTE)),
+            "{passe:?} : montage"
+        );
+        // Le single seul, puis l'album entier en commençant par le single.
+        for touchees in [vec![1usize], vec![1, 0]] {
+            for &i in &touchees {
+                let j = if i == 1 { SINGLE_2 } else { JAQUETTE };
+                poser_jaquette(&pistes[i], Some(j));
+            }
+            match passe {
+                Passe::Surveillant => {
+                    for &i in &touchees {
+                        lot_du_surveillant(&db, &racine, &[pistes[i].clone()], &[]);
+                    }
+                }
+                Passe::Demarrage => scan_de_demarrage(&db).await,
+                _ => scan_manuel(&etat, false, None).await,
+            }
+            assert_eq!(
+                pochette(),
+                Some(content_hash(JAQUETTE)),
+                "{passe:?} / pistes retouchées {touchees:?} : le single a pris la pochette de l'album"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn retraits_par_l_analyse_rapide_5034() {
     jouer_le_tableau("retraits", RETRAITS, Passe::Rapide).await;

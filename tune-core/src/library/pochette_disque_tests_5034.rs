@@ -130,6 +130,45 @@ fn la_regle_retire_seulement_ce_qui_vient_du_disque_5034() {
             true,
             Geste::Poser(a.clone()),
         ),
+        // Du disque, source là mais image CHANGÉE : suivie, même en passe
+        // automatique (décision du 25/09/2026, #5034 point 1).
+        (
+            Some("old"),
+            Some(Dossier),
+            Some(&a),
+            false,
+            true,
+            false,
+            Geste::Poser(a.clone()),
+        ),
+        (
+            Some("old"),
+            None,
+            Some(&a),
+            false,
+            true,
+            false,
+            Geste::Poser(a.clone()),
+        ),
+        // Inconnue, non prouvée, autre image : gardée hors scan complet.
+        (
+            Some("old"),
+            None,
+            Some(&a),
+            false,
+            false,
+            false,
+            Geste::Garder,
+        ),
+        (
+            Some("old"),
+            None,
+            Some(&a),
+            true,
+            false,
+            false,
+            Geste::Poser(a.clone()),
+        ),
         // Même image : confirmée.
         (
             Some("aaa"),
@@ -148,7 +187,7 @@ fn la_regle_retire_seulement_ce_qui_vient_du_disque_5034() {
     ];
     for (i, (cover, source, l, complet, dd, partie, attendu)) in cas.into_iter().enumerate() {
         assert_eq!(
-            arbitrer(&etat(cover, source), l, complet, dd, partie),
+            arbitrer(&etat(cover, source), l, complet, dd),
             attendu,
             "ligne {i} : {cover:?} {source:?} lue={:?} complet={complet} du_disque={dd} partie={partie}",
             l.map(|x| &x.condensat)

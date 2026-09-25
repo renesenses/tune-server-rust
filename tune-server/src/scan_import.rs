@@ -461,7 +461,8 @@ pub struct TrackImporter {
     ///
     /// Faux par défaut — c'est le scan incrémental et le surveillant de
     /// fichiers : une pochette posée ne bouge plus, SAUF quand le fichier
-    /// qui l'avait donnée a disparu (#5034, `library::pochette_disque`). Une
+    /// qui l'avait donnée a disparu ou changé (#5034,
+    /// `library::pochette_disque`). Une
     /// pochette téléversée n'est jamais touchée, même par un scan forcé.
     ///
     /// Vrai uniquement pour un scan forcé, exactement comme le genre d'album

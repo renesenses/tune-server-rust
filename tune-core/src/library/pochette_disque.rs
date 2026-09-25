@@ -198,24 +198,23 @@ fn vient_du_disque(etat: &EtatPochette, lue: Option<&PochetteLue>, pistes: &[Pat
 /// LA règle. `complet` : « Analyse complète » (scan forcé) ; sinon passe
 /// automatique — scan rapide, « Répertoires », scan de démarrage, surveillant.
 ///
-/// `source_partie` : le fichier qui avait donné la pochette en place n'existe
-/// plus, ou ne porte plus d'image. Ce que le disque offre alors la REMPLACE —
-/// c'est un retrait suivi d'une reprise, pas un changement.
-///
 /// | pochette en place | disque : rien | disque : même image | disque : autre image |
 /// |---|---|---|---|
 /// | aucune | — | — | posée |
 /// | téléversée | gardée | gardée | gardée |
 /// | fournisseur, import | gardée | gardée | posée si complet |
-/// | du disque (prouvée), source partie | **retirée** | confirmée | **posée** |
-/// | du disque (prouvée), source là | — | confirmée | posée si complet |
+/// | du disque (prouvée) | **retirée** | confirmée | **posée** |
 /// | inconnue, non prouvée | gardée | — | posée si complet |
+///
+/// Décision de Bertrand du 25/09/2026 (#5034, point 1) : les passes
+/// automatiques SUIVENT une pochette du disque CHANGÉE — jaquette retouchée
+/// dans Mp3tag, `cover.jpg` remplacé. Jusqu'ici seule l'Analyse complète le
+/// faisait, et pour la seule jaquette intégrée.
 pub fn arbitrer(
     etat: &EtatPochette,
     lue: Option<&PochetteLue>,
     complet: bool,
     du_disque: bool,
-    source_partie: bool,
 ) -> Geste {
     let Some(actuelle) = etat.cover_path.as_deref() else {
         return lue.map_or(Geste::Garder, |l| Geste::Poser(l.clone()));
@@ -236,7 +235,7 @@ pub fn arbitrer(
         // Même image : on la CONFIRME, pour que sa source et son fichier
         // soient à jour (une ligne inconnue devient ainsi classée).
         Some(l) if l.condensat == actuelle => Geste::Poser(l.clone()),
-        Some(l) if complet || (du_disque && source_partie) => Geste::Poser(l.clone()),
+        Some(l) if complet || du_disque => Geste::Poser(l.clone()),
         Some(_) => Geste::Garder,
     }
 }
@@ -312,9 +311,7 @@ pub fn reevaluer_l_album(
     let Ok(Some(etat)) = repo.etat_pochette(album_id) else {
         return Geste::Garder;
     };
-    reevaluer_avec(
-        db, &repo, album_id, &etat, cache_dir, complet, en_plus, false,
-    )
+    reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, en_plus)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,7 +323,6 @@ fn reevaluer_avec(
     cache_dir: &Path,
     complet: bool,
     en_plus: Option<&Path>,
-    perdue: bool,
 ) -> Geste {
     // Rien à relire pour une pochette que le disque ne peut pas toucher.
     if etat.cover_path.is_some() && matches!(etat.source, Some(SourcePochette::Televersee)) {
@@ -340,12 +336,7 @@ fn reevaluer_avec(
     }
     let lue = lire_depuis_l_album(&pistes, cache_dir);
     let du_disque = vient_du_disque(etat, lue.as_ref(), &pistes);
-    let source_partie = perdue
-        || etat
-            .fichier
-            .as_deref()
-            .is_some_and(|f| !extended_path(Path::new(f)).exists());
-    let geste = arbitrer(etat, lue.as_ref(), complet, du_disque, source_partie);
+    let geste = arbitrer(etat, lue.as_ref(), complet, du_disque);
     appliquer(repo, album_id, &geste);
     geste
 }
@@ -419,6 +410,12 @@ pub fn suivre_la_piste(
         .fichier
         .as_deref()
         .is_some_and(|f| !extended_path(Path::new(f)).exists());
+    // Disparu, ou réécrit depuis la lecture : l'empreinte (« mtime:taille »)
+    // ne correspond plus.
+    let source_changee = source_disparue
+        || etat.fichier.as_deref().is_some_and(|f| {
+            empreinte_du_fichier(Path::new(f)).as_deref() != etat.empreinte.as_deref()
+        });
 
     match etat.source {
         Some(SourcePochette::Televersee) => {
@@ -436,10 +433,21 @@ pub fn suivre_la_piste(
         // Pochette du disque tirée d'un autre fichier, toujours présent : la
         // relecture de cette piste ne la concerne pas (un single à la jaquette
         // propre, rangé dans l'album, ne la remplace pas — #4650).
-        Some(s) if s.vient_du_disque() && !complet && !piste_source && !source_disparue => {
+        Some(s) if s.vient_du_disque() && !complet && !piste_source && !source_changee => {
             return Suivi {
                 tranche: true,
                 posee: false,
+            };
+        }
+        // Tirée d'un AUTRE fichier, qui a changé : c'est LUI qu'il faut
+        // relire, pas cette piste — l'album entier tranche. Sans quoi un
+        // single à la jaquette propre, relu le premier après une retouche de
+        // tout l'album, imposerait sa pochette au disque (#4650).
+        Some(s) if s.vient_du_disque() && !complet && !piste_source => {
+            let geste = reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste));
+            return Suivi {
+                tranche: true,
+                posee: matches!(geste, Geste::Poser(_)),
             };
         }
         _ => {}
@@ -459,18 +467,9 @@ pub fn suivre_la_piste(
         }
     };
     let geste = if du_disque && (perdue || source_disparue) {
-        reevaluer_avec(
-            db,
-            &repo,
-            album_id,
-            &etat,
-            cache_dir,
-            complet,
-            Some(piste),
-            perdue,
-        )
+        reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste))
     } else {
-        let g = arbitrer(&etat, lue.as_ref(), complet, du_disque, false);
+        let g = arbitrer(&etat, lue.as_ref(), complet, du_disque);
         appliquer(&repo, album_id, &g);
         g
     };
@@ -481,10 +480,11 @@ pub fn suivre_la_piste(
 }
 
 /// Fin de scan : chaque album dont la pochette sort d'un fichier du disque
-/// est confronté à ce fichier, d'un `stat`. Disparu, l'album est relu en
-/// entier et la règle s'applique. C'est ce qui rattrape le `cover.jpg`
-/// supprimé d'un album dont aucune piste n'a changé — le scan rapide ne relit
-/// que les pistes modifiées.
+/// est confronté à ce fichier, d'un `stat`. Disparu ou réécrit (empreinte
+/// « mtime:taille » différente), l'album est relu en entier et la règle
+/// s'applique. C'est ce qui rattrape le `cover.jpg` supprimé ou remplacé
+/// d'un album dont aucune piste n'a changé — le scan rapide ne relit que les
+/// pistes modifiées.
 ///
 /// `portee` : les dossiers scannés (« Répertoires ») ; vide = tous.
 pub fn suivre_les_fichiers_sources(
@@ -502,11 +502,12 @@ pub fn suivre_les_fichiers_sources(
         }
     };
     let mut reprises = 0usize;
-    for (album_id, fichier, _empreinte) in sources {
+    for (album_id, fichier, empreinte) in sources {
         if !portee.is_empty() && !portee.iter().any(|d| sous_le_dossier(&fichier, d)) {
             continue;
         }
-        if empreinte_du_fichier(Path::new(&fichier)).is_some() {
+        let actuelle = empreinte_du_fichier(Path::new(&fichier));
+        if actuelle.is_some() && actuelle == empreinte {
             continue;
         }
         if reevaluer_l_album(db, album_id, cache_dir, complet, None) != Geste::Garder {
