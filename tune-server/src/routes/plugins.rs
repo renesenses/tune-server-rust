@@ -399,6 +399,9 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     "url": format!("/api/v1/plugins/{id}/"),
                     "compatible": compatible,
                     "min_server_version": info.manifest.min_server_version,
+                    // Le badge, comme sur les fiches compilées (#4715) : la
+                    // garde de `wasm_dispatch` lit ce même champ du manifeste.
+                    "premium": info.manifest.premium,
                 }));
             }
         }
@@ -448,6 +451,40 @@ async fn compatible_selon_le_disque(name: &str) -> bool {
         .find(|i| i.manifest.id == name)
         .map(|i| i.manifest.compatible_with(tune_core::version()))
         .unwrap_or(true)
+}
+
+/// Le manifeste wasm posé sur le disque demande-t-il Premium ?
+///
+/// Même source que la garde de [`wasm_dispatch`] (`manifest.premium`), lue au
+/// disque comme [`compatible_selon_le_disque`] : un greffon installé depuis le
+/// dernier démarrage répond déjà juste.
+async fn premium_selon_le_disque(name: &str) -> bool {
+    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
+        return false;
+    };
+    let manager = tune_core::plugins::PluginManager::new(dir);
+    let Ok(infos) = manager.scan().await else {
+        return false;
+    };
+    infos
+        .iter()
+        .any(|i| i.manifest.id == name && i.manifest.premium)
+}
+
+/// Le verrou des routes d'action (`install`, `enable`, `update`) : le droit
+/// des greffons audio payants, puis celui d'un greffon wasm dont le manifeste
+/// dit `premium` (#4715). Même `Feature` que la garde de [`wasm_dispatch`] :
+/// installer ou activer ce qu'on ne pourra pas appeler serait un « oui » vide.
+async fn exiger_le_droit(state: &AppState, name: &str) -> Result<(), axum::response::Response> {
+    crate::premium_audio_plugins::require_entitlement(state, name).await?;
+    if premium_selon_le_disque(name).await {
+        crate::premium_guard::require_premium(
+            &state.license,
+            tune_core::license::Feature::PluginMarketplace,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
@@ -530,6 +567,7 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
         "enabled": enabled,
         "status": if installed { "installed" } else { "not_installed" },
         "compatible": compatible,
+        "premium": premium_selon_le_disque(&name).await,
     });
     crate::premium_audio_plugins::annotate(&settings, &name, &mut card);
     Json(card)
@@ -570,7 +608,7 @@ async fn enable_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+    if let Err(response) = exiger_le_droit(&state, &name).await {
         return response;
     }
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -687,7 +725,7 @@ async fn install_plugin(
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
     }
-    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+    if let Err(response) = exiger_le_droit(&state, &name).await {
         return response;
     }
 
@@ -710,7 +748,7 @@ async fn update_plugin(
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
     }
-    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+    if let Err(response) = exiger_le_droit(&state, &name).await {
         return response;
     }
 

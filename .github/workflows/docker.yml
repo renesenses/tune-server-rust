@@ -133,11 +133,15 @@ jobs:
       # Party (WASM) plugin — arch-independent, staged once and COPYied into the
       # image next to /app/tune-server so the plugins-wasm runtime loads it.
       # Sourced from the committed fixture; the wasm is not rebuilt.
-      - name: Stage Party plugin (WASM)
+      - name: Stage WASM plugins (Party, Playlists converter)
         run: |
           mkdir -p dist/plugins/party
           cp tune-server/tests/fixtures/plugins/party/main.wasm dist/plugins/party/
           cp tune-server/tests/fixtures/plugins/party/manifest.json dist/plugins/party/
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          mkdir -p dist/plugins/playlists-converter
+          cp tune-server/tests/fixtures/plugins/playlists-converter/main.wasm dist/plugins/playlists-converter/
+          cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json dist/plugins/playlists-converter/
 
       - name: Build tune-server (arm64, cross)
         run: |
