@@ -598,6 +598,50 @@ pub fn peak_reached_end(track_duration_ms: u64, peak_position_ms: u64) -> bool {
         && peak_position_ms as f64 >= track_duration_ms as f64 * MIN_PLAYED_FRACTION
 }
 
+/// En deçà de cette fraction de la durée, une fin de flux n'est plus « la
+/// fin de la piste » (fil 1915).
+pub const FRACTION_D_UNE_VRAIE_FIN: f64 = 0.95;
+/// …à condition qu'il manque aussi plus que cet écart : une durée en base
+/// fausse de quelques secondes (étiquette arrondie, remplissage d'encodeur)
+/// n'est pas une coupure.
+pub const ECART_TOLERE_AVANT_LA_FIN_MS: u64 = 5_000;
+
+/// La position atteinte est-elle LOIN de la fin de la piste ?
+///
+/// Fil 1915 (Reivax66, sortie locale WASAPI) : le corps HTTP d'une piste de
+/// 11:52 a rendu `error decoding response body` à 7:51, et la sortie a pris
+/// l'erreur pour une fin — piste coupée d'un tiers, file close, aucun signal.
+///
+/// Une erreur de fin de corps AU BOUT de la piste reste, elle, une fin : MP3
+/// dont le décodage déborde la durée annoncée (#1254, PR #1076). D'où les
+/// deux conditions, qui doivent tenir ENSEMBLE pour parler de coupure : moins
+/// de [`FRACTION_D_UNE_VRAIE_FIN`] de la durée ET plus de
+/// [`ECART_TOLERE_AVANT_LA_FIN_MS`] manquants.
+///
+/// Durée inconnue (`0` : radio, flux sans durée) ⇒ jamais « loin » : on ne
+/// sait pas où est la fin, le comportement historique est gardé.
+pub fn position_loin_de_la_fin(position_ms: u64, duree_ms: u64) -> bool {
+    duree_ms > 0
+        && (position_ms as f64) < duree_ms as f64 * FRACTION_D_UNE_VRAIE_FIN
+        && duree_ms.saturating_sub(position_ms) > ECART_TOLERE_AVANT_LA_FIN_MS
+}
+
+/// Préfixe du constat « piste tronquée » (fil 1915) sur le canal
+/// `take_output_failure`.
+///
+/// Ce canal arrête la zone sur une panne de SORTIE (`fatal: true`). Une piste
+/// dont le flux s'est coupé n'en est pas une : la sortie va bien, la piste
+/// suivante peut jouer (décision de Bertrand, 24/09/2026). Le préfixe dit au
+/// sondeur de passer à la suivante — saut signalé, message non fatal — au lieu
+/// d'arrêter.
+pub const PREFIXE_PISTE_TRONQUEE: &str = "piste_tronquee:";
+
+/// Le message lisible d'un constat de piste tronquée, `None` pour tout autre
+/// constat de sortie.
+pub fn constat_de_piste_tronquee(constat: &str) -> Option<&str> {
+    constat.strip_prefix(PREFIXE_PISTE_TRONQUEE)
+}
+
 /// A DSD track on a DLNA renderer that has demonstrably reached its end.
 ///
 /// Gapless (`SetNextAVTransportURI`) is intentionally NOT armed when the next

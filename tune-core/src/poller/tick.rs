@@ -625,6 +625,43 @@ impl PositionPoller {
                     };
                     output.take_output_failure()
                 };
+                // Fil 1915 — une piste dont le flux s'est COUPÉ loin de sa
+                // fin n'est pas une panne de sortie : on passe à la suivante
+                // (ou on termine la file), en le disant — message non fatal
+                // et saut signalé —, au lieu d'arrêter la zone.
+                if let Some(message) = failure
+                    .as_deref()
+                    .and_then(decisions::constat_de_piste_tronquee)
+                {
+                    warn!(
+                        zone_id,
+                        device = %device_id,
+                        error = %message,
+                        queue_pos = zone_state.queue_position,
+                        "piste_tronquee_passage_a_la_suivante"
+                    );
+                    if let Some(ref bus) = self.event_bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": message,
+                                "fatal": false,
+                            }),
+                        );
+                        bus.emit(
+                            "playback.track_skipped",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "position": zone_state.queue_position,
+                                "reason": message,
+                            }),
+                        );
+                    }
+                    poll_states.remove(&zone_id);
+                    self.handle_track_end(zone_id, zone_state).await;
+                    continue;
+                }
                 if let Some(msg) = failure {
                     warn!(
                         zone_id,
@@ -1838,6 +1875,26 @@ impl PositionPoller {
                         ps.transition(fsm::Transition::FinConstateeAvantLeSeuil {
                             motif: MotifFin::FinNaturelleLocale,
                         });
+                        // Fil 1915 : `wall_elapsed` à 50 % suffit à accepter
+                        // la fin — une piste de 11:52 arrêtée à 7:51 passait
+                        // pour finie, sans un mot. Le comportement ne change
+                        // pas ici (la sortie locale refuse désormais elle-même
+                        // une erreur de lecture loin de la fin) ; ce qui reste
+                        // se DIT au lieu de passer pour une fin normale.
+                        if decisions::position_loin_de_la_fin(
+                            ps.peak_position_ms,
+                            track_duration_ms,
+                        ) {
+                            warn!(
+                                zone_id,
+                                peak_pos = ps.peak_position_ms,
+                                track_dur = track_duration_ms,
+                                wall_elapsed,
+                                "piste_probablement_tronquee — fin naturelle annoncée loin \
+                                 de la durée de la piste : flux coupé en amont, ou durée en \
+                                 base fausse"
+                            );
+                        }
                     } else if dlna_dsd_reached_end {
                         fsm_actual = Some(fsm::StoppedOutcome::DsdDlnaReachedEnd);
                         // A DSD track on a DLNA renderer: gapless is intentionally

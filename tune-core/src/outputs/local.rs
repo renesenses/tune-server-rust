@@ -2766,6 +2766,55 @@ fn record_feed_stall_failure(
     }
 }
 
+/// Le flux de la piste s'est COUPÉ loin de sa fin (fil 1915, Reivax66).
+///
+/// Même canal que les autres `record_*` (`take_output_failure()`, drainé à
+/// chaque tick du sondeur), mais le constat porte le préfixe
+/// [`PREFIXE_PISTE_TRONQUEE`](crate::poller::decisions::PREFIXE_PISTE_TRONQUEE) :
+/// le sondeur n'arrête PAS la zone, il émet `zone.playback_error`
+/// (`fatal: false`) et `playback.track_skipped`, puis passe à la piste
+/// suivante — ou termine la file si c'était la dernière. Sans ce constat,
+/// l'erreur de lecture était prise pour une fin naturelle : la file enchaînait
+/// — ou se fermait — sur une piste amputée, sans un mot à l'écran.
+///
+/// La cause amont de la coupure (producteur arrêté, durée en base fausse) n'est
+/// pas connue ici ; `stream_id` joint la ligne au `stream_delivery_stall` du
+/// flux interne (#3318).
+fn record_truncated_track_failure(
+    backend: &str,
+    device: &str,
+    stream_id: Option<&str>,
+    erreur: &str,
+    position_ms: u64,
+    duree_ms: u64,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        backend,
+        device,
+        stream_id = %stream_id.unwrap_or(FLUX_INCONNU),
+        error = %erreur,
+        position_ms,
+        duree_ms,
+        "piste_tronquee — le flux de la piste a rendu une erreur loin de sa fin ; \
+         ce n'est pas une fin naturelle, la file n'est pas enchaînée"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "{}Sortie « {device} » : le flux de la piste s'est interrompu à {} sur {} ; la piste a été abandonnée.",
+            crate::poller::decisions::PREFIXE_PISTE_TRONQUEE,
+            minutes_secondes(position_ms),
+            minutes_secondes(duree_ms),
+        ));
+    }
+}
+
+/// `m:ss`, pour un message lu par un humain.
+fn minutes_secondes(ms: u64) -> String {
+    let s = ms / 1000;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
 /// Le DÉCODAGE a échoué : la zone ne jouera pas, et c'est le seul endroit qui
 /// sait pourquoi (#3270).
 ///
@@ -3725,7 +3774,22 @@ struct BoucleProducteur<'a> {
     /// pré-remplissage déjà acquis, et les durées journalisées comptent à
     /// partir de là.
     debut_du_flux: std::time::Instant,
+    /// Durée de LA piste que lit cette boucle (fil 1915), `0` si inconnue —
+    /// relue au moment de l'erreur, pas à l'entrée de la boucle.
+    /// Sert à distinguer une erreur de fin de corps (#1254 : la piste est au
+    /// bout, c'est une fin) d'une coupure du flux en cours de piste.
+    duree_de_la_piste_ms: &'a AtomicU64,
 }
+
+/// Durée inconnue pour [`BoucleProducteur::duree_de_la_piste_ms`] : une erreur
+/// de lecture y reste une fin de flux, comme avant le fil 1915. Seuls les bras
+/// exclusifs mono-piste (ASIO, CoreAudio) et les bancs s'en servent.
+#[cfg(any(
+    test,
+    target_os = "macos",
+    all(target_os = "windows", feature = "asio")
+))]
+static DUREE_DE_PISTE_INCONNUE: AtomicU64 = AtomicU64::new(0);
 
 /// Les compteurs d'une piste, que la boucle fait avancer.
 struct CompteursDePiste {
@@ -3738,6 +3802,14 @@ struct CompteursDePiste {
     skipped_bytes: u64,
     /// Faux tant que l'arrivée des premières données n'a pas été journalisée.
     premiere_donnee_journalisee: bool,
+}
+
+impl CompteursDePiste {
+    /// La position alimentée, dans la piste, à la cadence source donnée —
+    /// celle que la boucle publie après chaque bloc.
+    fn position_ms(&self, cadence_source: u32) -> u64 {
+        (self.total_frames_fed as f64 / cadence_source as f64 * 1000.0) as u64 + self.seek_offset
+    }
 }
 
 impl BoucleProducteur<'_> {
@@ -3851,8 +3923,34 @@ impl BoucleProducteur<'_> {
                     } else {
                         warn!(error = %e, "local_audio_gapless_read_error");
                     }
-                    // Les deux boucles traitaient déjà une erreur de lecture
-                    // comme une fin de flux : la piste a joué ce qu'elle avait.
+                    // Fil 1915 : une erreur LOIN de la fin est une coupure du
+                    // flux, pas une fin de piste. La prendre pour une fin
+                    // enchaînait (ou fermait la file) en silence, la piste
+                    // amputée. On le dit, et ce fil n'enchaîne rien : constat
+                    // posé (préfixé « piste tronquée »), `Interrompue`. C'est
+                    // le sondeur qui passe à la piste suivante, en le
+                    // signalant, comme pour un saut de piste.
+                    let position_atteinte_ms = compteurs.position_ms(etage.cadence_source());
+                    let duree_ms = self.duree_de_la_piste_ms.load(Ordering::SeqCst);
+                    if crate::poller::decisions::position_loin_de_la_fin(
+                        position_atteinte_ms,
+                        duree_ms,
+                    ) {
+                        record_truncated_track_failure(
+                            self.backend,
+                            self.device_name,
+                            self.cle_de_flux,
+                            &e.to_string(),
+                            position_atteinte_ms,
+                            duree_ms,
+                            self.open_failure,
+                        );
+                        return FinDeBoucle::Interrompue;
+                    }
+                    // Au bout de la piste (ou durée inconnue), une erreur de
+                    // lecture reste une fin de flux : c'est la fin de corps
+                    // du MP3/ALAC qui déborde la durée annoncée (#1254, PR
+                    // #1076) — la piste a joué ce qu'elle avait.
                     return FinDeBoucle::FinDeFlux;
                 }
             };
@@ -3947,9 +4045,7 @@ impl BoucleProducteur<'_> {
                 return FinDeBoucle::Abandon;
             }
 
-            let position = (compteurs.total_frames_fed as f64 / etage.cadence_source() as f64
-                * 1000.0) as u64
-                + compteurs.seek_offset;
+            let position = compteurs.position_ms(etage.cadence_source());
             self.position_ms.store(position, Ordering::Relaxed);
         }
     }
@@ -5408,6 +5504,9 @@ impl OutputTarget for LocalOutput {
                 position_ms: position_ms.as_ref(),
                 open_failure: open_failure.as_ref(),
                 debut_du_flux: stream_start,
+                // Relue au moment de l'erreur : `play_media` ne la pose
+                // qu'APRÈS le retour de `play_url`, fil déjà lancé.
+                duree_de_la_piste_ms: duration_ms_arc.as_ref(),
             };
             let mut compteurs = CompteursDePiste {
                 total_bytes_read,
@@ -5819,6 +5918,7 @@ impl OutputTarget for LocalOutput {
                 // et il ne choisit que les noms d'événement. C'est tout
                 // l'intérêt — #3108 avait dû être corrigé DEUX fois parce que
                 // ces deux boucles étaient deux copies.
+                let duree_enchainee_ms = AtomicU64::new(next.duration_ms.unwrap_or(0));
                 let producteur_enchaine = BoucleProducteur {
                     backend: backend.nom(),
                     role: RoleDeLaBoucle::PisteEnchainee,
@@ -5830,6 +5930,9 @@ impl OutputTarget for LocalOutput {
                     position_ms: position_ms.as_ref(),
                     open_failure: open_failure.as_ref(),
                     debut_du_flux: std::time::Instant::now(),
+                    // La durée de CETTE piste, pas celle de la précédente que
+                    // `duration_ms_arc` garde quand la suivante n'en a pas.
+                    duree_de_la_piste_ms: &duree_enchainee_ms,
                 };
                 let mut gapless_read_buf = vec![0u8; 65536];
                 let mut compteurs_enchaines = CompteursDePiste {
@@ -6817,6 +6920,10 @@ mod pcm_materiel_a_la_resolution_i1655;
 
 #[cfg(test)]
 mod empreinte_du_puits_r1;
+
+/// Fil 1915 — une erreur de lecture loin de la fin n'est pas une fin de piste.
+#[cfg(test)]
+mod piste_tronquee_1915;
 
 /// REF-8 (#2219) — l'empreinte du bras CoreAudio sur le chemin décoder →
 /// étage → boucle commune → puits, relevée sur la route directe d'avant.
