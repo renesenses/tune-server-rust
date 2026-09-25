@@ -63,6 +63,125 @@ enum OpenFailure {
     Unknown,
 }
 
+/// #4953 — ce que la boucle gapless fait d'une piste enchaînée dont la cadence
+/// n'est pas celle du flux OUVERT.
+///
+/// Belkadi Yacine (fil 1922, v0.9.163, DENAFRIPS en `hw:`, PURE allumé) : le
+/// DAC s'ouvrait bien à la cadence de chaque piste lancée, mais une piste à
+/// 48 kHz ATTEINTE PAR ENCHAÎNEMENT après une piste à 44,1 kHz était convertie
+/// en 44,1 kHz (`local_audio_gapless_resampler_recreated`), en silence, et la
+/// lecture n'était plus bit-perfect. Seul « bit-perfect strict » (#3973)
+/// refusait cet enchaînement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CadenceEnchainee {
+    /// La piste enchaînée est à la cadence du flux ouvert : rien à décider.
+    MemeCadence,
+    /// Convertir vers la cadence du flux ouvert et garder l'enchaînement sans
+    /// blanc : seulement quand le périphérique ne suit PAS la cadence de la
+    /// source (il convertirait de toute façon) et qu'aucun réglage de la zone
+    /// n'exige le bit-perfect.
+    Convertir,
+    /// Ne pas enchaîner : la piste suivante repasse par l'ouverture, qui rouvre
+    /// le périphérique à SA cadence. Le passage perd son enchaînement sans
+    /// blanc, et le journal le dit.
+    Rouvrir(MotifDeReouverture),
+}
+
+/// Pourquoi l'enchaînement est abandonné pour rouvrir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MotifDeReouverture {
+    /// « Bit-perfect strict » de la zone (#3973).
+    BitPerfectStrict,
+    /// Mode PURE de la zone : on ne convertit pas en silence ce que la zone
+    /// demande de servir tel quel.
+    Pure,
+    /// Le périphérique a prouvé à l'ouverture qu'il suit la cadence de la
+    /// source (liste de cadences MESURÉE, flux ouvert à la cadence de la
+    /// source) : le rouvrir est ce qu'un double-clic sur la piste aurait fait.
+    PeripheriqueSuitLaSource,
+}
+
+impl MotifDeReouverture {
+    /// Code stable, pour le journal.
+    pub(super) fn code(self) -> &'static str {
+        match self {
+            Self::BitPerfectStrict => "bitperfect_strict",
+            Self::Pure => "pure",
+            Self::PeripheriqueSuitLaSource => "peripherique_suit_la_source",
+        }
+    }
+}
+
+/// Ce que la décision a le droit de lire : les réglages de la zone et ce que le
+/// périphérique a prouvé à l'ouverture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct ReglesDeCadence {
+    /// « Bit-perfect strict » de la zone (`zone_{id}_strict_bitperfect`).
+    pub(super) strict: bool,
+    /// Mode PURE de la zone (`pure_bypass`, rafraîchi en vol).
+    pub(super) pure: bool,
+    /// [`backend::BackendCpal::suit_la_cadence_source`].
+    pub(super) peripherique_suit_la_source: bool,
+}
+
+/// LA règle de la frontière gapless — fonction pure.
+///
+/// Le plafond de fréquence de la zone (#4796, `resolve_local`/`resolve_stream`)
+/// n'entre pas ici, et c'est voulu : il s'applique EN AMONT, au transcodage,
+/// si bien que l'en-tête WAV de la piste enchaînée porte déjà la cadence
+/// plafonnée. Rouvrir à cette cadence-là respecte le plafond.
+pub(super) fn decider_la_cadence_enchainee(
+    nouvelle_sr: u32,
+    sortie_sr: u32,
+    regles: ReglesDeCadence,
+) -> CadenceEnchainee {
+    if nouvelle_sr == sortie_sr {
+        return CadenceEnchainee::MemeCadence;
+    }
+    // #3973 — la même règle que les trois autres sites.
+    if crate::audio::bitperfect_strict::decision_bitperfect(nouvelle_sr, sortie_sr, regles.strict)
+        .refus()
+        .is_some()
+    {
+        return CadenceEnchainee::Rouvrir(MotifDeReouverture::BitPerfectStrict);
+    }
+    if regles.pure {
+        return CadenceEnchainee::Rouvrir(MotifDeReouverture::Pure);
+    }
+    if regles.peripherique_suit_la_source {
+        return CadenceEnchainee::Rouvrir(MotifDeReouverture::PeripheriqueSuitLaSource);
+    }
+    CadenceEnchainee::Convertir
+}
+
+/// La ligne qui dit qu'un passage gapless est sacrifié pour rouvrir.
+///
+/// Le strict garde sa ligne de #3973 (`local_audio_gapless_bitperfect_strict_reopen`),
+/// que des relevés de terrain cherchent déjà.
+fn journaliser_la_reouverture(
+    motif: MotifDeReouverture,
+    nouvelle_sr: u32,
+    sortie_sr: u32,
+    device_name: &str,
+) {
+    if motif == MotifDeReouverture::BitPerfectStrict {
+        info!(
+            device = %device_name,
+            requested_sr = nouvelle_sr,
+            stream_sr = sortie_sr,
+            "local_audio_gapless_bitperfect_strict_reopen"
+        );
+        return;
+    }
+    info!(
+        device = %device_name,
+        requested_sr = nouvelle_sr,
+        stream_sr = sortie_sr,
+        motif = motif.code(),
+        "local_audio_gapless_rate_change_reopen"
+    );
+}
+
 /// Classify a device-open error.
 ///
 /// The backend strings are written for driver authors, not for the person whose
@@ -77,36 +196,6 @@ enum OpenFailure {
 /// Matching is loose on purpose: cpal wraps the backend message and the wording
 /// varies by platform, so anything unrecognised falls through to `Unknown`
 /// rather than to a confident wrong answer.
-/// #3973 — le site « changement de cadence en cours de flux » de la règle
-/// bit-perfect ([`crate::audio::bitperfect_strict::decision_bitperfect`]).
-///
-/// `true` : la piste enchaînée ne doit PAS être convertie vers la cadence du
-/// flux ouvert — l'enchaînement gapless est abandonné, la piste courante se
-/// termine proprement, et la suivante repasse par l'ouverture, où la même
-/// règle juge contre ce que le périphérique sait réellement faire. Un refus
-/// posé ICI serait faux : le flux ouvert à 96 kHz ne dit rien de la capacité
-/// du DAC à ouvrir 192 kHz.
-fn enchainement_refuse_par_le_strict(
-    nouvelle_sr: u32,
-    sortie_sr: u32,
-    strict: bool,
-    device_name: &str,
-) -> bool {
-    let Some(refus) =
-        crate::audio::bitperfect_strict::decision_bitperfect(nouvelle_sr, sortie_sr, strict)
-            .refus()
-    else {
-        return false;
-    };
-    info!(
-        device = %device_name,
-        requested_sr = refus.demandee_hz,
-        stream_sr = refus.sortie_hz,
-        "local_audio_gapless_bitperfect_strict_reopen"
-    );
-    true
-}
-
 fn classify_open_failure(err: &str) -> OpenFailure {
     let e = err.to_ascii_lowercase();
     if e.contains("host is down")
@@ -2790,6 +2879,55 @@ fn record_feed_stall_failure(
     }
 }
 
+/// Le flux de la piste s'est COUPÉ loin de sa fin (fil 1915, Reivax66).
+///
+/// Même canal que les autres `record_*` (`take_output_failure()`, drainé à
+/// chaque tick du sondeur), mais le constat porte le préfixe
+/// [`PREFIXE_PISTE_TRONQUEE`](crate::poller::decisions::PREFIXE_PISTE_TRONQUEE) :
+/// le sondeur n'arrête PAS la zone, il émet `zone.playback_error`
+/// (`fatal: false`) et `playback.track_skipped`, puis passe à la piste
+/// suivante — ou termine la file si c'était la dernière. Sans ce constat,
+/// l'erreur de lecture était prise pour une fin naturelle : la file enchaînait
+/// — ou se fermait — sur une piste amputée, sans un mot à l'écran.
+///
+/// La cause amont de la coupure (producteur arrêté, durée en base fausse) n'est
+/// pas connue ici ; `stream_id` joint la ligne au `stream_delivery_stall` du
+/// flux interne (#3318).
+fn record_truncated_track_failure(
+    backend: &str,
+    device: &str,
+    stream_id: Option<&str>,
+    erreur: &str,
+    position_ms: u64,
+    duree_ms: u64,
+    failure_slot: &std::sync::Mutex<Option<String>>,
+) {
+    warn!(
+        backend,
+        device,
+        stream_id = %stream_id.unwrap_or(FLUX_INCONNU),
+        error = %erreur,
+        position_ms,
+        duree_ms,
+        "piste_tronquee — le flux de la piste a rendu une erreur loin de sa fin ; \
+         ce n'est pas une fin naturelle, la file n'est pas enchaînée"
+    );
+    if let Ok(mut slot) = failure_slot.lock() {
+        *slot = Some(format!(
+            "{}Sortie « {device} » : le flux de la piste s'est interrompu à {} sur {} ; la piste a été abandonnée.",
+            crate::poller::decisions::PREFIXE_PISTE_TRONQUEE,
+            minutes_secondes(position_ms),
+            minutes_secondes(duree_ms),
+        ));
+    }
+}
+
+/// `m:ss`, pour un message lu par un humain.
+fn minutes_secondes(ms: u64) -> String {
+    let s = ms / 1000;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
 /// Le DÉCODAGE a échoué : la zone ne jouera pas, et c'est le seul endroit qui
 /// sait pourquoi (#3270).
 ///
@@ -3426,6 +3564,98 @@ impl EtageDeConversion<'_> {
         self.sortie.canaux != self.spec.canaux()
     }
 
+    /// #4953 — **la frontière de cadence d'une piste enchaînée en gapless**,
+    /// sortie de la boucle de `play_url` pour être éprouvée sur un puits
+    /// factice : c'est ici, et nulle part ailleurs, que la piste suivante est
+    /// soit convertie vers la cadence du flux ouvert, soit refusée pour que le
+    /// périphérique soit rouvert à SA cadence.
+    ///
+    /// `Err(motif)` : ne pas enchaîner. Rien n'a été touché — ni l'étage, ni le
+    /// puits : la piste courante se termine exactement comme si l'en-tête
+    /// suivant avait été illisible, et la ligne de journal dit pourquoi.
+    ///
+    /// `Ok(format_change)` : l'étage porte le format de la piste enchaînée ;
+    /// `format_change` dit à l'appelant s'il doit reconstruire le convolveur.
+    fn enchainer_la_piste(
+        &mut self,
+        puits: &mut (dyn PuitsDEchantillons + '_),
+        nouvelle_spec: AudioSpec,
+        regles: ReglesDeCadence,
+        device_name: &str,
+    ) -> Result<bool, MotifDeReouverture> {
+        let new_sr = nouvelle_spec.cadence();
+        let new_ch = nouvelle_spec.canaux();
+        let output_sr = self.sortie.cadence;
+        let output_ch = self.sortie.canaux;
+        let decision = decider_la_cadence_enchainee(new_sr, output_sr, regles);
+        if let CadenceEnchainee::Rouvrir(motif) = decision {
+            journaliser_la_reouverture(motif, new_sr, output_sr, device_name);
+            return Err(motif);
+        }
+
+        let prev_sr = self.sample_rate();
+        let prev_ch = self.channels();
+        let prev_needs_resample = self.needs_resample;
+        let next_needs_resample = decision == CadenceEnchainee::Convertir;
+        let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
+
+        // Un moteur FFT est lié au format source. Avant de le remplacer,
+        // rendre sa queue dans l'ANCIEN format et lui faire suivre la même
+        // adaptation/rééchantillonnage que la piste qui se termine. À format
+        // identique on ne touche à rien : son état fait partie de la
+        // continuité gapless. `self` porte encore le format de la piste QUI SE
+        // TERMINE : il n'est mis à jour que plus bas.
+        if convolver_format_changed {
+            self.rendre_la_queue_du_dsp(puits);
+        }
+
+        // À cadence source identique, le resampler fait partie du flux
+        // continu : conserver son état et son leftover est nécessaire au vrai
+        // gapless. On ne le draine que si le prochain flux impose réellement
+        // une autre cadence (ou n'en a plus besoin). Le vidage a lieu APRÈS
+        // validation de l'en-tête : le faire dès qu'un `next_media` existe
+        // insérait du silence même quand la requête suivante échouait.
+        if prev_needs_resample && (new_sr != prev_sr || !next_needs_resample) {
+            self.vider(puits);
+        }
+
+        // R5 : les trois étiquettes du format source ne se posent
+        // qu'ensemble ; l'adaptation de canaux se déduit du format ouvert.
+        self.spec = nouvelle_spec;
+        self.needs_resample = next_needs_resample;
+        self.pcm_kind = LocalPcmKind::for_bit_depth(nouvelle_spec.profondeur().bits_declares());
+
+        // Recreate the resampler if the source sample rate changed.
+        if self.needs_resample && new_sr != prev_sr {
+            self.resample_leftover.clear();
+            // Même constructeur que l'amorçage de piste : la cadence qui
+            // change en cours de chaîne ne doit pas changer le filtre (#2218,
+            // D1).
+            self.resampler =
+                match crate::audio::resample::new_streaming_resampler(new_sr, output_sr, output_ch)
+                {
+                    Ok(r) => {
+                        info!(
+                            from_sr = new_sr,
+                            to_sr = output_sr,
+                            "local_audio_gapless_resampler_recreated"
+                        );
+                        Some(r)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "local_audio_gapless_resampler_failed");
+                        self.needs_resample = false;
+                        None
+                    }
+                };
+            self.resample_leftover.clear();
+        } else if !self.needs_resample && self.resampler.is_some() {
+            self.resampler = None;
+            self.resample_leftover.clear();
+        }
+        Ok(convolver_format_changed)
+    }
+
     /// Décode ce qui est aligné dans le tampon d'attente.
     ///
     /// `process_pcm_chunk` rend déjà `None` quand rien n'est aligné : la garde
@@ -3749,7 +3979,22 @@ struct BoucleProducteur<'a> {
     /// pré-remplissage déjà acquis, et les durées journalisées comptent à
     /// partir de là.
     debut_du_flux: std::time::Instant,
+    /// Durée de LA piste que lit cette boucle (fil 1915), `0` si inconnue —
+    /// relue au moment de l'erreur, pas à l'entrée de la boucle.
+    /// Sert à distinguer une erreur de fin de corps (#1254 : la piste est au
+    /// bout, c'est une fin) d'une coupure du flux en cours de piste.
+    duree_de_la_piste_ms: &'a AtomicU64,
 }
+
+/// Durée inconnue pour [`BoucleProducteur::duree_de_la_piste_ms`] : une erreur
+/// de lecture y reste une fin de flux, comme avant le fil 1915. Seuls les bras
+/// exclusifs mono-piste (ASIO, CoreAudio) et les bancs s'en servent.
+#[cfg(any(
+    test,
+    target_os = "macos",
+    all(target_os = "windows", feature = "asio")
+))]
+static DUREE_DE_PISTE_INCONNUE: AtomicU64 = AtomicU64::new(0);
 
 /// Les compteurs d'une piste, que la boucle fait avancer.
 struct CompteursDePiste {
@@ -3762,6 +4007,14 @@ struct CompteursDePiste {
     skipped_bytes: u64,
     /// Faux tant que l'arrivée des premières données n'a pas été journalisée.
     premiere_donnee_journalisee: bool,
+}
+
+impl CompteursDePiste {
+    /// La position alimentée, dans la piste, à la cadence source donnée —
+    /// celle que la boucle publie après chaque bloc.
+    fn position_ms(&self, cadence_source: u32) -> u64 {
+        (self.total_frames_fed as f64 / cadence_source as f64 * 1000.0) as u64 + self.seek_offset
+    }
 }
 
 impl BoucleProducteur<'_> {
@@ -3875,8 +4128,34 @@ impl BoucleProducteur<'_> {
                     } else {
                         warn!(error = %e, "local_audio_gapless_read_error");
                     }
-                    // Les deux boucles traitaient déjà une erreur de lecture
-                    // comme une fin de flux : la piste a joué ce qu'elle avait.
+                    // Fil 1915 : une erreur LOIN de la fin est une coupure du
+                    // flux, pas une fin de piste. La prendre pour une fin
+                    // enchaînait (ou fermait la file) en silence, la piste
+                    // amputée. On le dit, et ce fil n'enchaîne rien : constat
+                    // posé (préfixé « piste tronquée »), `Interrompue`. C'est
+                    // le sondeur qui passe à la piste suivante, en le
+                    // signalant, comme pour un saut de piste.
+                    let position_atteinte_ms = compteurs.position_ms(etage.cadence_source());
+                    let duree_ms = self.duree_de_la_piste_ms.load(Ordering::SeqCst);
+                    if crate::poller::decisions::position_loin_de_la_fin(
+                        position_atteinte_ms,
+                        duree_ms,
+                    ) {
+                        record_truncated_track_failure(
+                            self.backend,
+                            self.device_name,
+                            self.cle_de_flux,
+                            &e.to_string(),
+                            position_atteinte_ms,
+                            duree_ms,
+                            self.open_failure,
+                        );
+                        return FinDeBoucle::Interrompue;
+                    }
+                    // Au bout de la piste (ou durée inconnue), une erreur de
+                    // lecture reste une fin de flux : c'est la fin de corps
+                    // du MP3/ALAC qui déborde la durée annoncée (#1254, PR
+                    // #1076) — la piste a joué ce qu'elle avait.
                     return FinDeBoucle::FinDeFlux;
                 }
             };
@@ -3971,9 +4250,7 @@ impl BoucleProducteur<'_> {
                 return FinDeBoucle::Abandon;
             }
 
-            let position = (compteurs.total_frames_fed as f64 / etage.cadence_source() as f64
-                * 1000.0) as u64
-                + compteurs.seek_offset;
+            let position = compteurs.position_ms(etage.cadence_source());
             self.position_ms.store(position, Ordering::Relaxed);
         }
     }
@@ -5169,6 +5446,11 @@ impl OutputTarget for LocalOutput {
                 }
             };
             let sortie = backend.format_ouvert();
+            // #4953 — le périphérique vient-il de prouver qu'il suit la
+            // cadence de la source ? Lu UNE fois, à l'ouverture : c'est ce
+            // qui décide, à une frontière gapless qui change de cadence, s'il
+            // faut rouvrir plutôt que convertir.
+            let peripherique_suit_la_source = backend.suit_la_cadence_source();
 
             let output_sr = sortie.cadence;
             let output_ch = sortie.canaux;
@@ -5432,6 +5714,9 @@ impl OutputTarget for LocalOutput {
                 position_ms: position_ms.as_ref(),
                 open_failure: open_failure.as_ref(),
                 debut_du_flux: stream_start,
+                // Relue au moment de l'erreur : `play_media` ne la pose
+                // qu'APRÈS le retour de `play_url`, fil déjà lancé.
+                duree_de_la_piste_ms: duration_ms_arc.as_ref(),
             };
             let mut compteurs = CompteursDePiste {
                 total_bytes_read,
@@ -5662,64 +5947,25 @@ impl OutputTarget for LocalOutput {
                     "local_audio_gapless_next_track_format"
                 );
 
-                let prev_sr = etage.sample_rate();
-                let prev_ch = etage.channels();
-                let prev_needs_resample = etage.needs_resample;
-                // #3973 — le site « changement de cadence en cours de flux » :
-                // la piste enchaînée demande une cadence que le flux OUVERT ne
-                // tient pas. Strict ⇒ on ne la convertit pas : on n'enchaîne
-                // pas, exactement comme un flux non-WAV, et la fin de piste
-                // normale relance la suivante par `play_url` — dont
-                // l'ouverture (`refus_strict_a_l_ouverture`) juge alors contre
-                // la cadence RÉELLE du périphérique : il la joue telle quelle
-                // s'il la lit, il la refuse en le disant sinon.
-                if enchainement_refuse_par_le_strict(
-                    new_sr,
-                    output_sr,
-                    strict_bitperfect,
-                    &device_name,
-                ) {
+                // #4953 — la frontière de cadence de la piste enchaînée vit
+                // dans l'étage (`EtageDeConversion::enchainer_la_piste`) : la
+                // décision (convertir, ou ne pas enchaîner et rouvrir), la
+                // queue du DSP, le vidage et le rééchantillonneur. `Err` = on
+                // n'enchaîne PAS, exactement comme un flux non-WAV : la piste
+                // courante se termine proprement, la fin de piste normale
+                // relance la suivante par `play_url`, dont l'ouverture juge la
+                // nouvelle cadence contre le périphérique réel.
+                let regles = ReglesDeCadence {
+                    strict: strict_bitperfect,
+                    pure: pure_bypass.load(Ordering::Relaxed),
+                    peripherique_suit_la_source,
+                };
+                let Ok(convolver_format_changed) =
+                    etage.enchainer_la_piste(&mut *puits, nouvelle_spec, regles, &device_name)
+                else {
                     break;
-                }
-                let next_needs_resample = output_sr != new_sr;
-                let convolver_format_changed = new_sr != prev_sr || new_ch != prev_ch;
+                };
 
-                // Un moteur FFT est lié au format source. Avant de le remplacer,
-                // rendre sa queue dans l'ANCIEN format et lui faire suivre la
-                // même adaptation/rééchantillonnage que la piste qui se termine.
-                // À format identique on ne touche à rien : son état fait partie
-                // de la continuité gapless.
-                //
-                // `etage` porte encore le format de la piste QUI SE TERMINE —
-                // il n'est mis à jour que plus bas : `rendre_la_queue_du_dsp`
-                // tire la queue avec les canaux de cette piste-là et lui
-                // applique exactement son adaptation et son rééchantillonnage.
-                if convolver_format_changed {
-                    etage.rendre_la_queue_du_dsp(&mut *puits);
-                }
-
-                // À cadence source identique, le resampler fait partie du flux
-                // continu : conserver son état et son leftover est nécessaire
-                // au vrai gapless. On ne le draine que si le prochain flux
-                // impose réellement une autre cadence (ou n'en a plus besoin).
-                // Le vidage doit avoir lieu APRÈS validation de l'en-tête : le
-                // faire dès qu'un `next_media` existe insérait du silence même
-                // quand la requête suivante échouait.
-                if prev_needs_resample && (new_sr != prev_sr || !next_needs_resample) {
-                    etage.vider(&mut *puits);
-                }
-
-                // Update source format variables for the new track.
-                // Le format source vit dans `etage` : c'est lui, et lui seul,
-                // que la boucle producteur consulte pour décoder et convertir.
-                // R5 : UNE affectation là où il y en avait SIX. Les trois
-                // étiquettes ne se posent plus qu'ensemble, les octets par
-                // trame en découlent, et l'adaptation de canaux se déduit de la
-                // comparaison avec le format ouvert. Il n'y a plus de
-                // quatrième ligne à oublier.
-                etage.spec = nouvelle_spec;
-                etage.needs_resample = next_needs_resample;
-                etage.pcm_kind = LocalPcmKind::for_bit_depth(new_bd);
                 // REF-6b : la piste enchaînée a son propre format d'entrée.
                 publier_les_transformations(&transformations_reelles, &etage);
                 let sample_rate = etage.sample_rate();
@@ -5747,36 +5993,6 @@ impl OutputTarget for LocalOutput {
                             "local_convolver_gapless_format_rejected"
                         ),
                     }
-                }
-
-                // Recreate the resampler if the source sample rate changed
-                if etage.needs_resample && new_sr != prev_sr {
-                    // Sample rate changed — flush old resampler residuals
-                    etage.resample_leftover.clear();
-                    // Même constructeur que l'amorçage de piste : la cadence
-                    // qui change en cours de chaîne ne doit pas changer le
-                    // filtre (#2218, D1).
-                    etage.resampler = match crate::audio::resample::new_streaming_resampler(
-                        new_sr, output_sr, output_ch,
-                    ) {
-                        Ok(r) => {
-                            info!(
-                                from_sr = new_sr,
-                                to_sr = output_sr,
-                                "local_audio_gapless_resampler_recreated"
-                            );
-                            Some(r)
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "local_audio_gapless_resampler_failed");
-                            etage.needs_resample = false;
-                            None
-                        }
-                    };
-                    etage.resample_leftover.clear();
-                } else if !etage.needs_resample && etage.resampler.is_some() {
-                    etage.resampler = None;
-                    etage.resample_leftover.clear();
                 }
 
                 // L'enchaînement est acquis : le flux suivant répond et porte un
@@ -5843,6 +6059,7 @@ impl OutputTarget for LocalOutput {
                 // et il ne choisit que les noms d'événement. C'est tout
                 // l'intérêt — #3108 avait dû être corrigé DEUX fois parce que
                 // ces deux boucles étaient deux copies.
+                let duree_enchainee_ms = AtomicU64::new(next.duration_ms.unwrap_or(0));
                 let producteur_enchaine = BoucleProducteur {
                     backend: backend.nom(),
                     role: RoleDeLaBoucle::PisteEnchainee,
@@ -5854,6 +6071,9 @@ impl OutputTarget for LocalOutput {
                     position_ms: position_ms.as_ref(),
                     open_failure: open_failure.as_ref(),
                     debut_du_flux: std::time::Instant::now(),
+                    // La durée de CETTE piste, pas celle de la précédente que
+                    // `duration_ms_arc` garde quand la suivante n'en a pas.
+                    duree_de_la_piste_ms: &duree_enchainee_ms,
                 };
                 let mut gapless_read_buf = vec![0u8; 65536];
                 let mut compteurs_enchaines = CompteursDePiste {
@@ -6622,6 +6842,10 @@ mod ordonnancement_rt_i3206;
 #[cfg(test)]
 mod bitperfect_strict_3973;
 
+// #4953 — changement de cadence en gapless : rouvrir plutôt que convertir.
+#[cfg(test)]
+mod gapless_changement_de_cadence_4953;
+
 /// #3208 — la période demandée au pilote, telle que le backend l'emploie.
 /// La décision pure et la garde de branchement vivent dans
 /// `crate::audio::periode_alsa` : elles tournent dans la porte `test` de la CI,
@@ -6845,6 +7069,10 @@ mod pcm_materiel_a_la_resolution_i1655;
 
 #[cfg(test)]
 mod empreinte_du_puits_r1;
+
+/// Fil 1915 — une erreur de lecture loin de la fin n'est pas une fin de piste.
+#[cfg(test)]
+mod piste_tronquee_1915;
 
 /// REF-8 (#2219) — l'empreinte du bras CoreAudio sur le chemin décoder →
 /// étage → boucle commune → puits, relevée sur la route directe d'avant.

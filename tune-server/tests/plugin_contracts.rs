@@ -78,6 +78,10 @@ mod concerts_plugin;
 mod dj_plugin;
 #[path = "plugin_routes.rs"]
 mod plugin_routes;
+// #4863 — le greffon `cd` au catalogue (feature `cd`, dans `default`).
+#[cfg(feature = "cd")]
+#[path = "cd_catalogue_4863.rs"]
+mod cd_catalogue_4863;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une

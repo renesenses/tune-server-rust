@@ -55,8 +55,12 @@ use tune_server::state::AppState;
 const LECTURE_LONGUEUR_FILE: &str = "SELECT COUNT(*) FROM queue_items";
 /// Le fragment SQL de la zone par id (`ZoneRepo::get`).
 const LECTURE_ZONE: &str = "FROM zones WHERE id =";
-/// Le fragment SQL des pistes d'une playlist (`PlaylistRepo::get_track_ids`).
-const LECTURE_PISTES_PLAYLIST: &str = "SELECT track_id FROM playlist_tracks";
+/// Le fragment SQL des lignes d'une playlist : commun à
+/// `PlaylistRepo::get_track_ids` et à `PlaylistRepo::get_entries`, que la
+/// lecture d'une playlist lit depuis #4889 (elle doit voir aussi les titres de
+/// service). Il ne touche PAS la lecture cloisonnée de la playlist elle-même
+/// (`… FROM playlist_tracks pt WHERE …`), sinon la panne se lirait 404.
+const LECTURE_PISTES_PLAYLIST: &str = "FROM playlist_tracks WHERE playlist_id";
 
 const REFUS: &str = "echec injecte: lecture refusee (#4261)";
 
@@ -393,6 +397,7 @@ async fn contre_epreuve_l_injection_fait_bien_echouer_les_lectures() {
             .is_some()
     );
     assert_eq!(pl.get_track_ids(plid), Ok(vec![tid]));
+    assert_eq!(pl.get_entries(plid).map(|e| e.len()), Ok(1));
 
     // En panne : chacune échoue, et SEULEMENT elle.
     for (motif, file, zone, playlist) in [
@@ -417,11 +422,24 @@ async fn contre_epreuve_l_injection_fait_bien_echouer_les_lectures() {
             "motif {motif} : zone"
         );
         assert_eq!(
-            PlaylistRepo::with_backend(casse)
+            PlaylistRepo::with_backend(casse.clone())
                 .get_track_ids(plid)
                 .is_err(),
             playlist,
             "motif {motif} : pistes de playlist"
+        );
+        assert_eq!(
+            PlaylistRepo::with_backend(casse.clone())
+                .get_entries(plid)
+                .is_err(),
+            playlist,
+            "motif {motif} : lignes de playlist (#4889)"
+        );
+        assert!(
+            PlaylistRepo::with_backend(casse)
+                .get_for_profile(plid, 1)
+                .is_ok(),
+            "motif {motif} : la playlist elle-même reste lisible"
         );
     }
 

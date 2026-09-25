@@ -380,6 +380,31 @@ fn assembler_la_decision(
     }
 }
 
+/// Ce qui part sur le fil pour une piste DSD vers un renderer réseau, une
+/// fois le réglage de la zone et la réponse du renderer lus
+/// ([`PlaybackOrchestrator::politique_dsd_reseau`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolitiqueDsdReseau {
+    /// Le `.dsf`/`.dff` brut, servi par Tune.
+    Brut,
+    /// Le DSD emballé en trames PCM 24 bits (DoP), réglage explicite.
+    Dop,
+    /// Décimé en PCM côté serveur.
+    Pcm,
+}
+
+impl PolitiqueDsdReseau {
+    /// Libellé stable pour le journal.
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Brut => "brut",
+            Self::Dop => "dop",
+            Self::Pcm => "pcm",
+        }
+    }
+}
+
 impl PlaybackOrchestrator {
     /// Faut-il envoyer le DSD tel quel au renderer ?
     ///
@@ -438,6 +463,35 @@ impl PlaybackOrchestrator {
             .get(device_id)
             .map(|cap| cap.supports_dsf || cap.supports_dff);
         (mode, annonce)
+    }
+
+    /// Ce que la zone veut faire d'une piste DSD sur une sortie RÉSEAU —
+    /// UNE décision, lue par les deux chemins qui servent un renderer.
+    ///
+    /// Le chemin local la prenait en deux temps, dans cet ordre, et chaque
+    /// temps est réutilisé ici tel quel plutôt que recopié :
+    ///
+    /// 1. [`transport_dsd`] — la zone demande-t-elle le DoP ? (`decider_le_dop`) ;
+    /// 2. sinon [`Self::should_dsd_passthrough`] — le `.dsf` part-il brut ?
+    ///    (`decider_les_forcages_reseau`) ; sinon, c'est du PCM.
+    ///
+    /// Le chemin des serveurs média (`resolve_direct`) ne posait AUCUNE de
+    /// ces questions : l'URL distante d'un DSD partait telle quelle, quel que
+    /// soit le réglage de la zone (Abacab, DMP-A8, .18 du 23/09/2026 : bruit).
+    pub(super) async fn politique_dsd_reseau(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+    ) -> PolitiqueDsdReseau {
+        let dsd_mode = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id);
+        if transport_dsd(false, true, &dsd_mode) == TransportDsd::Dop {
+            return PolitiqueDsdReseau::Dop;
+        }
+        if self.should_dsd_passthrough(zone_id, device_id).await {
+            PolitiqueDsdReseau::Brut
+        } else {
+            PolitiqueDsdReseau::Pcm
+        }
     }
 
     pub(super) async fn should_dsd_passthrough(&self, zone_id: i64, device_id: &str) -> bool {
@@ -1286,11 +1340,21 @@ impl PlaybackOrchestrator {
         } else {
             None
         };
+        // Fils 1914/1913 — la disposition DÉCLARÉE pour la zone est un second
+        // plafond, lu sous les mêmes gardes que la sonde. Elle ne fait que
+        // réduire (plancher stéréo) ; le renderer garde le dernier mot quand
+        // il annonce moins. Voir `plafond_de_canaux`.
+        let canaux_declares = if is_network_output && !dsd_passthrough && canaux_source > 2 {
+            crate::audio::canaux_declares::disposition_declaree(&self.db, req.zone_id)
+                .map(|d| d.channel_count())
+        } else {
+            None
+        };
         let canaux_reduits = crate::audio::canaux_reseau_4573::canaux_a_servir(
             is_network_output,
             dsd_passthrough,
             canaux_source,
-            canaux_renderer,
+            crate::audio::canaux_reseau_4573::plafond_de_canaux(canaux_renderer, canaux_declares),
         );
         if let Some(cible) = canaux_reduits {
             info!(
@@ -1500,7 +1564,7 @@ impl PlaybackOrchestrator {
     /// ici même, cadence et canaux lus DANS LE FICHIER (l'en-tête WAV
     /// décrivait la ligne `tracks`). `None` quand la cadence DoP dépasse le
     /// plafond de la zone : la décision continue sur le chemin ordinaire.
-    async fn anticiper_le_dop(
+    pub(super) async fn anticiper_le_dop(
         &self,
         track: &crate::db::models::Track,
         file_path: String,

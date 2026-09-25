@@ -144,6 +144,8 @@ mod paroles_source_lrclib;
 mod partage_playlist_revoque_2373;
 #[path = "piste_artiste_par_id.rs"]
 mod piste_artiste_par_id;
+#[path = "piste_tronquee_dit_pourquoi_1915.rs"]
+mod piste_tronquee_dit_pourquoi_1915;
 #[path = "plafond_zones_gratuit.rs"]
 mod plafond_zones_gratuit;
 #[path = "playlist_manager_cloisonnement_par_profil.rs"]

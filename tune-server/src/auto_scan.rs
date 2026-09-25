@@ -502,6 +502,8 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         let scan_timer_start = std::time::Instant::now();
         let mut last_progress_emit = scan_timer_start;
 
+        // #4896 — les balises lues, par album : voir `BalisesVuesParAlbum`.
+        let mut balises_vues = BalisesVuesParAlbum::default();
         let stats = tune_core::scanner::walker::scan_files_batched(
             &files_to_scan,
             true,
@@ -591,6 +593,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         if adopter {
                             a_adopter.push(id);
                         }
+                        balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_update.push(track);
                         continue;
                     }
@@ -634,6 +637,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         }
                     }
 
+                    balises_vues.noter(track.album_id, sf.metadata.as_ref());
                     to_insert.push(track);
                 }
 
@@ -953,6 +957,10 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             }
         }
 
+        // #4896 — APRÈS la purge : la ligne album d'un dossier retouché suit
+        // ses balises, par la même règle que le surveillant.
+        balises_vues.realigner(&db);
+
         // Clean up orphan albums with 0 tracks (ghost entries from
         // artist_id changes or interrupted scans) — bug #593.
         let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
@@ -1228,7 +1236,13 @@ fn settle_partition(
         if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
             continue;
         }
-        if change.change_type == ChangeType::Deleted {
+        // Une suppression n'a rien à attendre ; un événement de DOSSIER non
+        // plus (#4896) — et la taille d'un dossier ne se stabilise pas, elle
+        // vaut 0 sous Windows : il resterait en attente pour toujours.
+        if matches!(
+            change.change_type,
+            ChangeType::Deleted | ChangeType::DossierApparu | ChangeType::DossierDisparu
+        ) {
             ready.push(change);
             continue;
         }
@@ -1579,6 +1593,796 @@ pub(crate) fn verdict_suppression_surveillant(
 ) -> crate::routes::system::scan::VerdictPurge {
     crate::routes::system::scan::verdict_purge(chemin, racines, racines_illisibles, &[], &[], &[])
 }
+/// Relit UN fichier que le surveillant signale ajouté ou modifié, et remplace
+/// sa ligne. Extrait tel quel de la boucle de `spawn_file_watcher` pour être
+/// joué par les tests (#4896) — la boucle n'appelle plus que ceci.
+///
+/// Rend l'album du fichier quand ses balises ne s'accordent plus avec la ligne
+/// album de son dossier (titre ou artiste d'album) : c'est la liste que
+/// [`realigner_albums_sur_les_balises`] reprend en fin de lot.
+pub(crate) fn reimporter_fichier_surveillant(
+    db: &Arc<dyn DbBackend>,
+    change: &tune_core::scanner::watcher::FileChange,
+    watcher_quality_split: bool,
+) -> Option<i64> {
+    let mut album_a_realigner = None;
+    // #4896 — un « ajout » sur un chemin DÉJÀ indexé est un REMPLACEMENT.
+    // Sous Windows, un fichier remplacé par déplacement depuis un autre
+    // dossier arrive en `FILE_ACTION_REMOVED` puis `FILE_ACTION_ADDED`, sans
+    // `FILE_ACTION_MODIFIED` : `notify` rend `Remove` puis `Create`, et la
+    // fusion du lot garde le dernier, `Added`. Cette branche ne supprimait
+    // l'ancienne ligne que pour `Modified` : l'empreinte audio retrouvait
+    // alors le fichier lui-même (« doublon ») et les balises neuves étaient
+    // perdues sans un mot.
+    let existante = TrackRepo::with_backend(db.clone())
+        .get_by_path(&change.path)
+        .ok()
+        .flatten();
+    let remplace = change.change_type == tune_core::scanner::watcher::ChangeType::Modified
+        || existante.is_some();
+    // Unchanged-file guard (Jean Marie: "le scan tourne
+    // en boucle", macOS Ventura). A Modified event whose
+    // on-disk mtime+size still match the stored row is a
+    // self-induced event: reading a file to import it
+    // makes macOS write an extended attribute, which
+    // fires another Modify event → re-read → infinite
+    // loop. Detect it with a cheap stat and skip —
+    // crucially WITHOUT reading the content (scan_files_
+    // parallel), since the read is what re-triggers it.
+    // Même garde pour un « ajout » sur un chemin connu (#4896).
+    if let Some(existing) = existante
+        && let Ok(fs_meta) = std::fs::metadata(&change.path)
+    {
+        let fs_size = fs_meta.len() as i64;
+        let fs_mtime = fs_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as f64);
+        let unchanged = existing.file_size == Some(fs_size)
+            && match (existing.file_mtime, fs_mtime) {
+                (Some(a), Some(b)) => (a - b).abs() <= 0.5,
+                _ => false,
+            };
+        if unchanged {
+            tracing::debug!(path = %change.path, "watcher_skip_unchanged");
+            return None;
+        }
+    }
+    let files: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&change.path)];
+    let (scanned, _) = tune_core::scanner::walker::scan_files_parallel(&files, true, None);
+    let track_repo = TrackRepo::with_backend(db.clone());
+    let artist_repo = ArtistRepo::with_backend(db.clone());
+    let album_repo = AlbumRepo::with_backend(db.clone());
+
+    for sf in &scanned {
+        if sf.metadata.is_none() {
+            continue;
+        }
+
+        if remplace {
+            track_repo.delete_by_path(&sf.path).ok();
+        }
+
+        // Decide compilation over the whole folder from
+        // the siblings already in the DB, so re-importing
+        // a single file (MP3tag save → Modified event)
+        // doesn't split a various-artists album tagged
+        // with per-track album_artist into one album per
+        // artist (JP Borderies). The manual/batch scan
+        // sees the whole album at once; the watcher sees
+        // one file, so it reconstructs the folder view
+        // from the DB. Any doubt → None → per-file
+        // self-decide (previous behaviour, no regression).
+        // Rendu : `(compilation ?, artiste d'album unique
+        // du dossier)`. Le second sert au seul fichier
+        // dont les balises n'ont pas pu être lues (#3232).
+        let (comp_override, folder_tagged_artist): (Option<bool>, Option<String>) = sf
+            .metadata
+            .as_ref()
+            .and_then(|meta| {
+                let dir = std::path::Path::new(&sf.path).parent()?;
+                // Le TAG, en trois etats (C1).
+                let tag = meta.compilation;
+                let mut va_tague = false;
+                let mut artists: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                // La casse d'origine du premier artiste
+                // vu : `artists` est en minuscules, or
+                // ce nom peut devenir celui de l'album.
+                let mut premier: Option<String> = None;
+                let mut note = |aa: Option<&str>| {
+                    if let Some(a) = aa.map(str::trim).filter(|s| !s.is_empty()) {
+                        if crate::scan_import::is_various_artists(a) {
+                            va_tague = true;
+                        }
+                        if artists.insert(a.to_lowercase()) && premier.is_none() {
+                            premier = Some(a.to_string());
+                        }
+                    }
+                };
+                // Un artiste déduit du CHEMIN n'est pas
+                // une balise : il ne compte pas.
+                if !meta.artist_from_path {
+                    note(meta.album_artist.as_deref());
+                }
+                let siblings = track_repo
+                    .siblings_album_artists(&dir.to_string_lossy())
+                    .ok()?;
+                for (fp, aa) in &siblings {
+                    // Direct children only (exclude
+                    // sub-folders sharing the prefix).
+                    if std::path::Path::new(fp).parent() != Some(dir) {
+                        continue;
+                    }
+                    note(aa.as_deref());
+                }
+                let unique = if artists.len() == 1 { premier } else { None };
+                // C1 : le tag tranche s'il existe ; sinon la forme.
+                Some((Some(tag.unwrap_or(va_tague || artists.len() >= 2)), unique))
+            })
+            .unwrap_or((None, None));
+        let Some((track, album_id)) = build_track_from_metadata_opts(
+            sf,
+            &artist_repo,
+            &album_repo,
+            watcher_quality_split,
+            comp_override,
+            folder_tagged_artist.as_deref(),
+        ) else {
+            tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
+            continue;
+        };
+
+        // The hash is only a candidate selector. The
+        // watcher is allowed to skip solely after a
+        // full byte-for-byte comparison.
+        if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
+            let candidates = track_repo
+                .paths_by_audio_hash_and_album(hash, aid)
+                .unwrap_or_default();
+            if let Some(existing_path) = tune_core::scanner::hasher::find_byte_identical_path(
+                std::path::Path::new(&sf.path),
+                &candidates,
+            ) {
+                tracing::debug!(
+                    audio_hash = %hash,
+                    album_id = aid,
+                    path = %sf.path,
+                    existing_path = %existing_path,
+                    "watcher_skip_duplicate_audio_hash"
+                );
+                continue;
+            }
+            if !candidates.is_empty() {
+                tracing::warn!(
+                    audio_hash = %hash,
+                    album_id = aid,
+                    path = %sf.path,
+                    candidates = candidates.len(),
+                    "watcher_audio_hash_candidate_not_byte_identical"
+                );
+            }
+        }
+
+        if let Some(aid) = album_id {
+            let cache_dir = crate::routes::library::artwork_cache_dir();
+            if let Some(hash) = tune_core::library::artwork::get_or_extract(
+                std::path::Path::new(&sf.path),
+                &cache_dir,
+            ) {
+                album_repo.update_cover_path(aid, &hash).ok();
+            }
+            album_repo.update_track_count(aid).ok();
+            album_repo.update_quality_from_tracks(aid).ok();
+        }
+
+        if track_repo.create(&track).is_ok() {
+            info!(path = %sf.path, "watcher_track_added");
+            // #4896 — les balises relues désavouent-elles la ligne album du
+            // dossier ? Un simple lookup ; la relecture du dossier entier
+            // n'a lieu qu'en fin de lot, et seulement dans ce cas.
+            if let (Some(aid), Some(meta)) = (album_id, sf.metadata.as_ref())
+                && let Ok(Some(album)) = album_repo.get(aid)
+            {
+                let (titre, artiste) = balises_d_album(meta);
+                if balises_desavouent_l_album(&album, titre, artiste) {
+                    album_a_realigner = Some(aid);
+                }
+            }
+        }
+    }
+    album_a_realigner
+}
+
+/// #4896 (Didier, fil 1904) — la ligne album d'un dossier suit les balises
+/// que l'on vient d'y retoucher.
+///
+/// L'album est identifié par son DOSSIER (`get_or_create_for_folder`) : relire
+/// une piste retouchée la rattache à la ligne existante du dossier, titre et
+/// artiste d'album compris. Chez Didier, le coffret indexé sans balise ALBUM
+/// gardait le nom tiré du chemin après que Mp3tag eut posé ALBUM et
+/// ALBUMARTIST sur chaque piste : les pistes étaient relues, l'album non.
+///
+/// Ne réécrit une ligne que si TOUTES ses pistes, relues sur le disque,
+/// portent le même ALBUM (et, pour l'artiste, le même artiste d'album) : un
+/// dossier retouché à moitié ne décide rien, la dernière piste enregistrée
+/// par l'éditeur déclenchera la reprise. Portée : les seuls albums que le lot
+/// a touchés, jamais la bibliothèque. Une compilation, une ligne non locale
+/// et un champ édité à la main dans Tune ne sont pas repris.
+pub(crate) fn realigner_albums_sur_les_balises(
+    db: &Arc<dyn DbBackend>,
+    albums: &std::collections::HashSet<i64>,
+) {
+    let album_repo = AlbumRepo::with_backend(db.clone());
+    let track_repo = TrackRepo::with_backend(db.clone());
+    let artist_repo = ArtistRepo::with_backend(db.clone());
+    for &aid in albums {
+        let Ok(Some(album)) = album_repo.get(aid) else {
+            continue;
+        };
+        if album.is_compilation || album.source != "local" {
+            continue;
+        }
+        let Ok(pistes) = track_repo.list_by_album(aid) else {
+            continue;
+        };
+        let Some((titre, artiste)) = balises_unanimes_du_dossier(&pistes) else {
+            continue;
+        };
+        let titre = (titre != album.title).then_some(titre);
+        let artist_id = artiste
+            .filter(|nom| {
+                !album
+                    .artist_name
+                    .as_deref()
+                    .is_some_and(|actuel| actuel.eq_ignore_ascii_case(nom))
+            })
+            .and_then(|nom| artist_repo.get_or_create(&nom, None, None).ok())
+            .and_then(|a| a.id);
+        if titre.is_none() && artist_id.is_none() {
+            continue;
+        }
+        match album_repo.realigner_sur_les_balises(aid, titre.as_deref(), artist_id) {
+            Ok(true) => info!(
+                album_id = aid,
+                ancien_titre = %album.title,
+                nouveau_titre = ?titre,
+                nouvel_artiste_id = ?artist_id,
+                "watcher_album_realigne_sur_les_balises"
+            ),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(album_id = aid, error = %e, "watcher_album_realignement_echoue")
+            }
+        }
+    }
+}
+
+/// (ALBUM, artiste d'album) communs à toutes les pistes, relus sur le disque.
+/// `None` au moindre désaccord ou fichier illisible. L'artiste vaut `None`
+/// quand les pistes ne s'accordent pas sur lui, ou qu'il n'est tiré que du
+/// chemin : le titre peut alors être repris seul.
+fn balises_unanimes_du_dossier(
+    pistes: &[tune_core::db::models::Track],
+) -> Option<(String, Option<String>)> {
+    let mut titre: Option<String> = None;
+    let mut artiste: Option<String> = None;
+    let mut artiste_unanime = true;
+    for piste in pistes {
+        let chemin = piste.file_path.as_deref()?;
+        let meta = tune_core::metadata::read_metadata(std::path::Path::new(chemin))?;
+        let (t, a) = balises_d_album(&meta);
+        let t = t?;
+        match &titre {
+            None => titre = Some(t.to_string()),
+            Some(deja) if deja == t => {}
+            Some(_) => return None,
+        }
+        match (a, &artiste) {
+            (None, _) => artiste_unanime = false,
+            (Some(a), None) => artiste = Some(a.to_string()),
+            (Some(a), Some(deja)) if deja.eq_ignore_ascii_case(a) => {}
+            (Some(_), Some(_)) => artiste_unanime = false,
+        }
+    }
+    Some((titre?, artiste.filter(|_| artiste_unanime)))
+}
+
+/// (ALBUM, artiste d'album) que les balises d'UNE piste proposent à la ligne
+/// album de son dossier : la lecture de [`balises_unanimes_du_dossier`], piste
+/// par piste. Un artiste tiré du chemin n'est pas une balise ; « Various
+/// Artists » ne nomme personne.
+fn balises_d_album(meta: &tune_core::metadata::TrackMetadata) -> (Option<&str>, Option<&str>) {
+    let titre = meta
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let artiste = if meta.artist_from_path {
+        None
+    } else {
+        meta.album_artist
+            .as_deref()
+            .or(meta.artist.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !crate::scan_import::is_various_artists(s))
+    };
+    (titre, artiste)
+}
+
+/// Les balises d'une piste désavouent-elles la ligne album où elle est rangée ?
+/// Un simple regard, sans lecture de disque : c'est ce qui décide si
+/// [`realigner_albums_sur_les_balises`] relira le dossier. Une compilation
+/// n'est jamais désavouée (son titre peut être celui du dossier).
+fn balises_desavouent_l_album(
+    album: &tune_core::db::models::Album,
+    titre: Option<&str>,
+    artiste: Option<&str>,
+) -> bool {
+    if album.is_compilation {
+        return false;
+    }
+    let titre_differe = titre.is_some_and(|t| t != album.title);
+    let artiste_differe = artiste.is_some_and(|a| {
+        !album
+            .artist_name
+            .as_deref()
+            .is_some_and(|actuel| actuel.eq_ignore_ascii_case(a))
+    });
+    titre_differe || artiste_differe
+}
+
+/// #4896 — les balises qu'un scan (manuel ou de démarrage) a lues, rangées par
+/// l'album où l'import a mis chaque piste. Le scan reconnaît lui aussi l'album
+/// à son DOSSIER (`get_or_create_for_folder`) : relire les pistes d'un dossier
+/// retouché ne renommait pas sa ligne album, pas plus qu'au surveillant.
+///
+/// Une paire (titre, artiste) distincte par album et non une par piste : un
+/// scan complet de cent mille pistes n'en garde que quelques milliers. Le
+/// verdict attend la fin du scan ([`Self::realigner`]), APRÈS la purge des
+/// fichiers disparus : un éditeur qui renomme les fichiers en retouchant les
+/// balises laisse sinon, dans l'album, des lignes dont le fichier n'existe
+/// plus, et le dossier ne serait jamais « unanime ».
+#[derive(Default)]
+pub(crate) struct BalisesVuesParAlbum(
+    std::collections::HashMap<i64, std::collections::HashSet<(Option<String>, Option<String>)>>,
+);
+
+impl BalisesVuesParAlbum {
+    /// Une piste que le scan vient d'écrire (insérée ou mise à jour).
+    pub(crate) fn noter(
+        &mut self,
+        album_id: Option<i64>,
+        meta: Option<&tune_core::metadata::TrackMetadata>,
+    ) {
+        let (Some(aid), Some(meta)) = (album_id, meta) else {
+            return;
+        };
+        let (titre, artiste) = balises_d_album(meta);
+        self.0
+            .entry(aid)
+            .or_default()
+            .insert((titre.map(str::to_string), artiste.map(str::to_string)));
+    }
+
+    /// Fin de scan : les albums que des balises lues désavouent sont repris
+    /// par la MÊME règle que le surveillant — toutes les pistes du dossier
+    /// doivent s'accorder, jamais une compilation, une ligne non locale ou un
+    /// champ édité à la main. Rend le nombre d'albums soumis à cette règle.
+    pub(crate) fn realigner(self, db: &Arc<dyn DbBackend>) -> usize {
+        let album_repo = AlbumRepo::with_backend(db.clone());
+        let desavoues: std::collections::HashSet<i64> = self
+            .0
+            .into_iter()
+            .filter(|(aid, vues)| {
+                album_repo.get(*aid).ok().flatten().is_some_and(|album| {
+                    vues.iter().any(|(titre, artiste)| {
+                        balises_desavouent_l_album(&album, titre.as_deref(), artiste.as_deref())
+                    })
+                })
+            })
+            .map(|(aid, _)| aid)
+            .collect();
+        if !desavoues.is_empty() {
+            info!(
+                albums = desavoues.len(),
+                "scan_albums_a_realigner_sur_les_balises"
+            );
+            realigner_albums_sur_les_balises(db, &desavoues);
+        }
+        desavoues.len()
+    }
+}
+
+/// Ce que la boucle du surveillant lit une fois, à son démarrage.
+pub(crate) struct ReglagesDuSurveillant<'a> {
+    /// Motifs d'exclusion des scans, en minuscules.
+    pub(crate) exclusions: &'a [String],
+    /// Racines de musique normalisées : l'arbitrage des suppressions (#1943).
+    pub(crate) racines: &'a [String],
+    pub(crate) quality_split: bool,
+}
+
+/// UN lot du surveillant, une fois écartés les fichiers encore en cours
+/// d'écriture (`settle_partition`). Extrait tel quel de la boucle de
+/// `spawn_file_watcher` (#4896) pour que les épreuves jouent la voie de
+/// production ; la boucle n'appelle plus que ceci, puis nettoie les albums
+/// vides et annonce le changement.
+///
+/// `dossiers_en_attente` porte d'un lot au suivant les dossiers disparus que
+/// rien n'a encore expliqués (voir [`traiter_les_dossiers_du_lot`]). Rend les
+/// fichiers à relire au cycle suivant : le contenu des dossiers apparus, qui
+/// passe par la même attente d'écriture stable que tout fichier signalé.
+pub(crate) fn traiter_le_lot_du_surveillant(
+    db: &Arc<dyn DbBackend>,
+    changes: Vec<tune_core::scanner::watcher::FileChange>,
+    reglages: &ReglagesDuSurveillant<'_>,
+    dossiers_en_attente: &mut Vec<String>,
+) -> Vec<tune_core::scanner::watcher::FileChange> {
+    use crate::routes::system::scan::VerdictPurge;
+    use tune_core::scanner::watcher::ChangeType;
+    let (dossiers, fichiers): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| {
+        matches!(
+            c.change_type,
+            ChangeType::DossierApparu | ChangeType::DossierDisparu
+        )
+    });
+    // Racines illisibles À CET INSTANT. Calculée une fois par
+    // lot, et seulement s'il porte une suppression : `read_dir`
+    // sur un partage réseau tombé peut bloquer plusieurs
+    // secondes, et un lot en porte des centaines.
+    let porte_une_suppression = !dossiers_en_attente.is_empty()
+        || dossiers
+            .iter()
+            .any(|c| c.change_type == ChangeType::DossierDisparu)
+        || fichiers
+            .iter()
+            .any(|c| c.change_type == ChangeType::Deleted);
+    let racines_illisibles: Vec<String> = if porte_une_suppression {
+        reglages
+            .racines
+            .iter()
+            .filter(|r| std::fs::read_dir(r).is_err())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // #4896 — les DOSSIERS d'abord : une piste emportée par son dossier doit
+    // avoir son nouveau chemin avant que les événements de fichier du même lot
+    // (ceux du PollWatcher, qui voit chaque fichier bouger) ne la cherchent.
+    let a_relire = traiter_les_dossiers_du_lot(
+        db,
+        &dossiers,
+        reglages,
+        &racines_illisibles,
+        dossiers_en_attente,
+    );
+    let mut albums_a_realigner = std::collections::HashSet::new();
+    for change in fichiers {
+        // Same exclusions as the scans (re-read per event batch
+        // so setting edits apply without a restart is overkill;
+        // the list was read once at watcher start).
+        if !reglages.exclusions.is_empty() {
+            let path_l = change.path.to_lowercase();
+            if reglages
+                .exclusions
+                .iter()
+                .any(|x| path_l.contains(x.as_str()))
+            {
+                continue;
+            }
+        }
+        // Tune's own streaming temp files (tune-stream-*/
+        // tune-prefetch-* in %TEMP%) fire watcher events on every
+        // transcode when the library root is a parent of the temp
+        // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
+        // degrading the first seconds of each streaming play.
+        if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
+            continue;
+        }
+        match change.change_type {
+            ChangeType::Added | ChangeType::Modified => {
+                if let Some(aid) =
+                    reimporter_fichier_surveillant(db, &change, reglages.quality_split)
+                {
+                    albums_a_realigner.insert(aid);
+                }
+            }
+            ChangeType::Deleted => {
+                // NEVER delete tracks because a mount dropped:
+                // when a NAS goes away, the whole subtree fires
+                // Remove events (and the poll watcher for
+                // network mounts sees every file "vanish").
+                // If the owning music root is unreadable, the
+                // files are unreachable — not deleted.
+                if std::path::Path::new(&change.path).exists() {
+                    tracing::debug!(path = %change.path, "watcher_delete_ignored_file_still_present");
+                    continue;
+                }
+                // Même arbitrage que la purge de fin de scan, et
+                // par la MÊME fonction : cette règle ne doit
+                // exister qu'à un endroit (#1943). Ce chemin-ci
+                // la contournait, et y perdait ses deux moitiés.
+                match verdict_suppression_surveillant(
+                    &change.path,
+                    reglages.racines,
+                    &racines_illisibles,
+                ) {
+                    VerdictPurge::ProtegeIllisible => {
+                        tracing::warn!(
+                            path = %change.path,
+                            "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
+                        );
+                        continue;
+                    }
+                    VerdictPurge::HorsPerimetre => {
+                        tracing::warn!(
+                            path = %change.path,
+                            "watcher_delete_skipped_out_of_scope — cette piste n'est sous AUCUNE racine configurée, elle n'est pas « disparue » (#1943)"
+                        );
+                        continue;
+                    }
+                    VerdictPurge::Supprimer => {}
+                }
+                let track_repo = TrackRepo::with_backend(db.clone());
+                if track_repo.delete_by_path(&change.path).is_ok() {
+                    info!(path = %change.path, "watcher_track_removed");
+                }
+            }
+            // Traités plus haut, par `traiter_les_dossiers_du_lot`.
+            ChangeType::DossierApparu | ChangeType::DossierDisparu => {}
+        }
+    }
+    // #4896 — la ligne album d'un dossier retouché suit ses balises.
+    realigner_albums_sur_les_balises(db, &albums_a_realigner);
+    a_relire
+}
+
+/// Un dossier disparu que ce lot examine : son chemin, les fichiers indexés
+/// sous lui (chemin, taille), et s'il a déjà attendu un lot.
+struct DossierDisparu {
+    chemin: String,
+    fichiers: Vec<(String, Option<i64>)>,
+    deja_attendu: bool,
+}
+
+/// `<dossier><séparateur>` en NFC : le préfixe sous lequel la base range les
+/// fichiers d'un dossier (même forme que `DossierExact` côté dépôt).
+fn prefixe_en_base(dossier: &str) -> String {
+    let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
+    format!("{base}{}", std::path::MAIN_SEPARATOR)
+}
+
+/// #4896 (Didier, fil 1904) — un dossier d'album renommé, déplacé, mis à la
+/// corbeille ou supprimé pendant que Tune tourne.
+///
+/// Le surveillant ne voyait que des fichiers audio : les trois moteurs natifs
+/// ne signalent que le DOSSIER, si bien que l'album gardait ses pistes sous un
+/// chemin mort jusqu'au scan suivant (voir `evenement_de_dossier` dans
+/// `tune-core/src/scanner/watcher.rs` pour les séquences de chaque moteur).
+///
+/// - **Renommé ou déplacé** : un dossier apparu dont on retrouve les fichiers
+///   d'un dossier disparu — même chemin relatif, même taille, pour plus de la
+///   moitié d'entre eux — est le MÊME dossier. Ses pistes changent de chemin
+///   en gardant leur ligne : identifiant, favoris, écoutes, étiquettes, date
+///   d'ajout. Rien n'est supprimé puis réimporté comme un album neuf. La paire
+///   se reconnaît sur le disque et non sur l'ordre des événements : Windows
+///   dit `From`/`To` ou `Remove`/`Create`, FSEvents deux `Name(Any)` sans lien,
+///   inotify une paire explicite, le PollWatcher une disparition et une
+///   création.
+/// - **Disparu sans successeur** : il attend UN lot (quelques secondes), au
+///   cas où son nouveau nom arriverait dans le suivant, puis ses pistes sont
+///   retirées sous le même arbitrage que toute suppression du surveillant —
+///   racine illisible ou hors périmètre, rien ne part (#1943) — et sous le
+///   même plafond que la purge du scan (`purge_trop_massive`) : au-delà, c'est
+///   au scan, qui sait demander confirmation, de trancher.
+/// - **Apparu** : ses fichiers audio que la base ne connaît pas à ce chemin
+///   sont rendus pour être relus au cycle suivant, après l'attente d'écriture
+///   stable (un dossier copié se remplit encore).
+///
+/// Portée : les seules pistes rangées sous le dossier concerné, découpage
+/// exact (`…/Album` n'emporte pas `…/Album 2`).
+fn traiter_les_dossiers_du_lot(
+    db: &Arc<dyn DbBackend>,
+    dossiers: &[tune_core::scanner::watcher::FileChange],
+    reglages: &ReglagesDuSurveillant<'_>,
+    racines_illisibles: &[String],
+    en_attente: &mut Vec<String>,
+) -> Vec<tune_core::scanner::watcher::FileChange> {
+    use tune_core::scanner::watcher::{ChangeType, FileChange};
+    let track_repo = TrackRepo::with_backend(db.clone());
+    let mut disparus: Vec<DossierDisparu> = Vec::new();
+    let du_lot = dossiers
+        .iter()
+        .filter(|c| c.change_type == ChangeType::DossierDisparu)
+        .map(|c| (c.path.clone(), false));
+    let du_lot_precedent = std::mem::take(en_attente).into_iter().map(|p| (p, true));
+    for (chemin, deja_attendu) in du_lot.chain(du_lot_precedent) {
+        if let Some(connu) = disparus.iter_mut().find(|d| d.chemin == chemin) {
+            connu.deja_attendu |= deja_attendu;
+            continue;
+        }
+        // Revenu entre-temps (renommé puis rendu à son nom) : rien n'a bougé.
+        if std::fs::symlink_metadata(&chemin).is_ok() {
+            continue;
+        }
+        let fichiers = track_repo
+            .fichiers_sous_dossier(&chemin)
+            .unwrap_or_default();
+        // Un fichier qui n'était pas audio (pochette, temporaire d'un éditeur
+        // de balises), ou un dossier sans piste indexée : rien à faire.
+        if fichiers.is_empty() {
+            continue;
+        }
+        disparus.push(DossierDisparu {
+            chemin,
+            fichiers,
+            deja_attendu,
+        });
+    }
+
+    let mut a_relire = Vec::new();
+    for apparu in dossiers
+        .iter()
+        .filter(|c| c.change_type == ChangeType::DossierApparu)
+    {
+        let nouveau = std::path::Path::new(&apparu.path);
+        if !nouveau.is_dir() {
+            continue;
+        }
+        if let Some((i, deplacements)) = ancien_nom_du_dossier(nouveau, &disparus) {
+            let ancien = disparus.remove(i);
+            deplacer_le_dossier(db, &ancien.chemin, &apparu.path, &deplacements);
+            // Ce qui n'a pas suivi (fichier retiré pendant le déplacement) est
+            // bien parti : même traitement qu'un dossier disparu qui a attendu.
+            let restants = track_repo
+                .fichiers_sous_dossier(&ancien.chemin)
+                .unwrap_or_default();
+            if !restants.is_empty() {
+                disparus.push(DossierDisparu {
+                    chemin: ancien.chemin,
+                    fichiers: restants,
+                    deja_attendu: true,
+                });
+            }
+        }
+        for fichier in tune_core::scanner::watcher::fichiers_audio_sous(nouveau) {
+            if matches!(track_repo.get_by_path(&fichier), Ok(None)) {
+                a_relire.push(FileChange {
+                    change_type: ChangeType::Added,
+                    path: fichier,
+                });
+            }
+        }
+    }
+
+    for disparu in disparus {
+        if disparu.deja_attendu {
+            retirer_les_pistes_du_dossier(db, &disparu, reglages.racines, racines_illisibles);
+        } else {
+            tracing::debug!(dossier = %disparu.chemin, pistes = disparu.fichiers.len(), "watcher_dossier_disparu_en_attente");
+            en_attente.push(disparu.chemin);
+        }
+    }
+    a_relire
+}
+
+/// Le dossier disparu dont `nouveau` porte les fichiers, et les déplacements
+/// `(ancien chemin en base, nouveau chemin en base)` de ceux qu'on y retrouve
+/// — même chemin relatif, même taille quand elle est connue. Il en faut PLUS
+/// DE LA MOITIÉ : deux albums distincts partagent volontiers un « 01.flac »,
+/// jamais la majorité de leurs fichiers à l'octet près. Le meilleur candidat
+/// l'emporte.
+fn ancien_nom_du_dossier(
+    nouveau: &std::path::Path,
+    disparus: &[DossierDisparu],
+) -> Option<(usize, Vec<(String, String)>)> {
+    let prefixe_nouveau = prefixe_en_base(&nouveau.to_string_lossy());
+    let mut meilleur: Option<(usize, Vec<(String, String)>)> = None;
+    for (i, disparu) in disparus.iter().enumerate() {
+        let prefixe_ancien = prefixe_en_base(&disparu.chemin);
+        let deplacements: Vec<(String, String)> = disparu
+            .fichiers
+            .iter()
+            .filter_map(|(chemin, taille)| {
+                let reste = chemin.strip_prefix(&prefixe_ancien)?;
+                let sur_disque = std::fs::metadata(nouveau.join(reste)).ok()?;
+                let meme_taille = taille.is_none_or(|t| t == sur_disque.len() as i64);
+                (sur_disque.is_file() && meme_taille)
+                    .then(|| (chemin.clone(), format!("{prefixe_nouveau}{reste}")))
+            })
+            .collect();
+        if deplacements.len() * 2 <= disparu.fichiers.len() {
+            continue;
+        }
+        if meilleur
+            .as_ref()
+            .is_none_or(|(_, deja)| deplacements.len() > deja.len())
+        {
+            meilleur = Some((i, deplacements));
+        }
+    }
+    meilleur
+}
+
+/// Déplace en base les pistes d'un dossier renommé, et les albums que ce
+/// dossier identifie.
+fn deplacer_le_dossier(
+    db: &Arc<dyn DbBackend>,
+    ancien: &str,
+    nouveau: &str,
+    deplacements: &[(String, String)],
+) {
+    let pistes = TrackRepo::with_backend(db.clone()).deplacer_fichiers(deplacements);
+    let albums = AlbumRepo::with_backend(db.clone()).deplacer_dossier(ancien, nouveau);
+    match (pistes, albums) {
+        (Ok(pistes), Ok(albums)) => info!(
+            ancien = %ancien,
+            nouveau = %nouveau,
+            pistes,
+            albums,
+            "watcher_dossier_deplace — pistes et albums gardent leur ligne (#4896)"
+        ),
+        (pistes, albums) => tracing::warn!(
+            ancien = %ancien,
+            nouveau = %nouveau,
+            pistes = ?pistes.err(),
+            albums = ?albums.err(),
+            "watcher_dossier_deplacement_echoue"
+        ),
+    }
+}
+
+/// Retire les pistes d'un dossier disparu pour de bon, sous l'arbitrage de
+/// toute suppression du surveillant (#1943) et le plafond de la purge du scan.
+fn retirer_les_pistes_du_dossier(
+    db: &Arc<dyn DbBackend>,
+    disparu: &DossierDisparu,
+    racines: &[String],
+    racines_illisibles: &[String],
+) {
+    use crate::routes::system::scan::VerdictPurge;
+    let track_repo = TrackRepo::with_backend(db.clone());
+    let a_retirer: Vec<&str> = disparu
+        .fichiers
+        .iter()
+        .map(|(chemin, _)| chemin.as_str())
+        .filter(|chemin| {
+            matches!(
+                verdict_suppression_surveillant(chemin, racines, racines_illisibles),
+                VerdictPurge::Supprimer
+            )
+        })
+        .collect();
+    if a_retirer.len() < disparu.fichiers.len() {
+        tracing::warn!(
+            dossier = %disparu.chemin,
+            gardees = disparu.fichiers.len() - a_retirer.len(),
+            "watcher_dossier_disparu_pistes_gardees — racine illisible ou hors périmètre (#1943)"
+        );
+    }
+    let total = track_repo.count().unwrap_or(0).max(0) as usize;
+    if crate::routes::system::scan::purge_trop_massive(a_retirer.len(), total) {
+        tracing::warn!(
+            dossier = %disparu.chemin,
+            pistes = a_retirer.len(),
+            total,
+            "watcher_dossier_disparu_trop_massif — rien n'est retiré, le prochain scan en décidera"
+        );
+        return;
+    }
+    let mut retirees = 0usize;
+    for chemin in a_retirer {
+        if track_repo.delete_by_path(chemin).is_ok() {
+            retirees += 1;
+        }
+        // Une image découpée par une feuille CUE porte ses tranches ici.
+        let _ = track_repo.delete_by_cue_media(chemin);
+    }
+    info!(dossier = %disparu.chemin, pistes = retirees, "watcher_dossier_retire");
+}
 
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait
 /// a personne. Voir l'emission de `library.updated` en fin de lot.
@@ -1599,9 +2403,9 @@ pub fn spawn_file_watcher(
         return;
     }
 
-    // Le surveillant supprime des lignes de `tracks` : il doit passer par le
-    // MÊME arbitrage que la purge de fin de scan (#1943).
-    use crate::routes::system::scan::VerdictPurge;
+    // Le surveillant supprime des lignes de `tracks` : il passe par le MÊME
+    // arbitrage que la purge de fin de scan (#1943), dans
+    // `traiter_le_lot_du_surveillant`.
 
     // Normalized roots for the delete guard below — same normalization the
     // watcher applies internally.
@@ -1666,6 +2470,8 @@ pub fn spawn_file_watcher(
             // progress, a download, a real-time producer): carried across cycles
             // until their size settles, so the final COMPLETE write is scanned.
             let mut pending_settle: Vec<tune_core::scanner::watcher::FileChange> = Vec::new();
+            // #4896 — dossiers disparus que le lot précédent n'a pas expliqués.
+            let mut dossiers_en_attente: Vec<String> = Vec::new();
             loop {
                 // Every ~2 min (each idle iteration blocks ~2s): re-watch
                 // roots that appeared or came back after an unmount, and
@@ -1686,274 +2492,22 @@ pub fn spawn_file_watcher(
                 changes.append(&mut pending_settle);
                 let (changes, still_writing) = settle_partition(changes, &watcher_excludes);
                 pending_settle = still_writing;
-                let had_changes = !changes.is_empty();
-                // Racines illisibles À CET INSTANT. Calculée une fois par
-                // lot, et seulement s'il porte une suppression : `read_dir`
-                // sur un partage réseau tombé peut bloquer plusieurs
-                // secondes, et un lot en porte des centaines.
-                let racines_illisibles: Vec<String> = if changes
-                    .iter()
-                    .any(|c| c.change_type == tune_core::scanner::watcher::ChangeType::Deleted)
-                {
-                    guard_roots
-                        .iter()
-                        .filter(|r| std::fs::read_dir(r).is_err())
-                        .cloned()
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                for change in changes {
-                    // Same exclusions as the scans (re-read per event batch
-                    // so setting edits apply without a restart is overkill;
-                    // the list was read once at watcher start).
-                    if !watcher_excludes.is_empty() {
-                        let path_l = change.path.to_lowercase();
-                        if watcher_excludes.iter().any(|x| path_l.contains(x.as_str())) {
-                            continue;
-                        }
-                    }
-                    // Tune's own streaming temp files (tune-stream-*/
-                    // tune-prefetch-* in %TEMP%) fire watcher events on every
-                    // transcode when the library root is a parent of the temp
-                    // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
-                    // degrading the first seconds of each streaming play.
-                    if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
-                        continue;
-                    }
-                    match change.change_type {
-                        tune_core::scanner::watcher::ChangeType::Added
-                        | tune_core::scanner::watcher::ChangeType::Modified => {
-                            // Unchanged-file guard (Jean Marie: "le scan tourne
-                            // en boucle", macOS Ventura). A Modified event whose
-                            // on-disk mtime+size still match the stored row is a
-                            // self-induced event: reading a file to import it
-                            // makes macOS write an extended attribute, which
-                            // fires another Modify event → re-read → infinite
-                            // loop. Detect it with a cheap stat and skip —
-                            // crucially WITHOUT reading the content (scan_files_
-                            // parallel), since the read is what re-triggers it.
-                            if change.change_type
-                                == tune_core::scanner::watcher::ChangeType::Modified
-                            {
-                                if let Ok(Some(existing)) =
-                                    TrackRepo::with_backend(db.clone()).get_by_path(&change.path)
-                                {
-                                    if let Ok(fs_meta) = std::fs::metadata(&change.path) {
-                                        let fs_size = fs_meta.len() as i64;
-                                        let fs_mtime = fs_meta
-                                            .modified()
-                                            .ok()
-                                            .and_then(|t| {
-                                                t.duration_since(std::time::UNIX_EPOCH).ok()
-                                            })
-                                            .map(|d| d.as_secs() as f64);
-                                        let unchanged =
-                                            existing.file_size.map_or(false, |s| s == fs_size)
-                                                && match (existing.file_mtime, fs_mtime) {
-                                                    (Some(a), Some(b)) => (a - b).abs() <= 0.5,
-                                                    _ => false,
-                                                };
-                                        if unchanged {
-                                            tracing::debug!(path = %change.path, "watcher_skip_unchanged");
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-                            let files: Vec<std::path::PathBuf> =
-                                vec![std::path::PathBuf::from(&change.path)];
-                            let (scanned, _) =
-                                tune_core::scanner::walker::scan_files_parallel(&files, true, None);
-                            let track_repo = TrackRepo::with_backend(db.clone());
-                            let artist_repo = ArtistRepo::with_backend(db.clone());
-                            let album_repo = AlbumRepo::with_backend(db.clone());
-
-                            for sf in &scanned {
-                                if sf.metadata.is_none() {
-                                    continue;
-                                }
-
-                                if change.change_type
-                                    == tune_core::scanner::watcher::ChangeType::Modified
-                                {
-                                    track_repo.delete_by_path(&sf.path).ok();
-                                }
-
-                                // Decide compilation over the whole folder from
-                                // the siblings already in the DB, so re-importing
-                                // a single file (MP3tag save → Modified event)
-                                // doesn't split a various-artists album tagged
-                                // with per-track album_artist into one album per
-                                // artist (JP Borderies). The manual/batch scan
-                                // sees the whole album at once; the watcher sees
-                                // one file, so it reconstructs the folder view
-                                // from the DB. Any doubt → None → per-file
-                                // self-decide (previous behaviour, no regression).
-                                // Rendu : `(compilation ?, artiste d'album unique
-                                // du dossier)`. Le second sert au seul fichier
-                                // dont les balises n'ont pas pu être lues (#3232).
-                                let (comp_override, folder_tagged_artist): (
-                                    Option<bool>,
-                                    Option<String>,
-                                ) = sf
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|meta| {
-                                        let dir = std::path::Path::new(&sf.path).parent()?;
-                                        // Le TAG, en trois etats (C1).
-                                        let tag = meta.compilation;
-                                        let mut va_tague = false;
-                                        let mut artists: std::collections::HashSet<String> =
-                                            std::collections::HashSet::new();
-                                        // La casse d'origine du premier artiste
-                                        // vu : `artists` est en minuscules, or
-                                        // ce nom peut devenir celui de l'album.
-                                        let mut premier: Option<String> = None;
-                                        let mut note = |aa: Option<&str>| {
-                                            if let Some(a) =
-                                                aa.map(str::trim).filter(|s| !s.is_empty())
-                                            {
-                                                if crate::scan_import::is_various_artists(a) {
-                                                    va_tague = true;
-                                                }
-                                                if artists.insert(a.to_lowercase())
-                                                    && premier.is_none()
-                                                {
-                                                    premier = Some(a.to_string());
-                                                }
-                                            }
-                                        };
-                                        // Un artiste déduit du CHEMIN n'est pas
-                                        // une balise : il ne compte pas.
-                                        if !meta.artist_from_path {
-                                            note(meta.album_artist.as_deref());
-                                        }
-                                        let siblings = track_repo
-                                            .siblings_album_artists(&dir.to_string_lossy())
-                                            .ok()?;
-                                        for (fp, aa) in &siblings {
-                                            // Direct children only (exclude
-                                            // sub-folders sharing the prefix).
-                                            if std::path::Path::new(fp).parent() != Some(dir) {
-                                                continue;
-                                            }
-                                            note(aa.as_deref());
-                                        }
-                                        let unique =
-                                            if artists.len() == 1 { premier } else { None };
-                                        // C1 : le tag tranche s'il existe ; sinon la forme.
-                                        Some((
-                                            Some(tag.unwrap_or(va_tague || artists.len() >= 2)),
-                                            unique,
-                                        ))
-                                    })
-                                    .unwrap_or((None, None));
-                                let Some((track, album_id)) = build_track_from_metadata_opts(
-                                    sf,
-                                    &artist_repo,
-                                    &album_repo,
-                                    watcher_quality_split,
-                                    comp_override,
-                                    folder_tagged_artist.as_deref(),
-                                ) else {
-                                    tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
-                                    continue;
-                                };
-
-                                // The hash is only a candidate selector. The
-                                // watcher is allowed to skip solely after a
-                                // full byte-for-byte comparison.
-                                if let (Some(hash), Some(aid)) = (&track.audio_hash, album_id) {
-                                    let candidates = track_repo
-                                        .paths_by_audio_hash_and_album(hash, aid)
-                                        .unwrap_or_default();
-                                    if let Some(existing_path) =
-                                        tune_core::scanner::hasher::find_byte_identical_path(
-                                            std::path::Path::new(&sf.path),
-                                            &candidates,
-                                        )
-                                    {
-                                        tracing::debug!(
-                                            audio_hash = %hash,
-                                            album_id = aid,
-                                            path = %sf.path,
-                                            existing_path = %existing_path,
-                                            "watcher_skip_duplicate_audio_hash"
-                                        );
-                                        continue;
-                                    }
-                                    if !candidates.is_empty() {
-                                        tracing::warn!(
-                                            audio_hash = %hash,
-                                            album_id = aid,
-                                            path = %sf.path,
-                                            candidates = candidates.len(),
-                                            "watcher_audio_hash_candidate_not_byte_identical"
-                                        );
-                                    }
-                                }
-
-                                if let Some(aid) = album_id {
-                                    let cache_dir = crate::routes::library::artwork_cache_dir();
-                                    if let Some(hash) = tune_core::library::artwork::get_or_extract(
-                                        std::path::Path::new(&sf.path),
-                                        &cache_dir,
-                                    ) {
-                                        album_repo.update_cover_path(aid, &hash).ok();
-                                    }
-                                    album_repo.update_track_count(aid).ok();
-                                    album_repo.update_quality_from_tracks(aid).ok();
-                                }
-
-                                if track_repo.create(&track).is_ok() {
-                                    info!(path = %sf.path, "watcher_track_added");
-                                }
-                            }
-                        }
-                        tune_core::scanner::watcher::ChangeType::Deleted => {
-                            // NEVER delete tracks because a mount dropped:
-                            // when a NAS goes away, the whole subtree fires
-                            // Remove events (and the poll watcher for
-                            // network mounts sees every file "vanish").
-                            // If the owning music root is unreadable, the
-                            // files are unreachable — not deleted.
-                            if std::path::Path::new(&change.path).exists() {
-                                tracing::debug!(path = %change.path, "watcher_delete_ignored_file_still_present");
-                                continue;
-                            }
-                            // Même arbitrage que la purge de fin de scan, et
-                            // par la MÊME fonction : cette règle ne doit
-                            // exister qu'à un endroit (#1943). Ce chemin-ci
-                            // la contournait, et y perdait ses deux moitiés.
-                            match verdict_suppression_surveillant(
-                                &change.path,
-                                &guard_roots,
-                                &racines_illisibles,
-                            ) {
-                                VerdictPurge::ProtegeIllisible => {
-                                    tracing::warn!(
-                                        path = %change.path,
-                                        "watcher_delete_skipped_root_unreachable — mount dropped, keeping tracks"
-                                    );
-                                    continue;
-                                }
-                                VerdictPurge::HorsPerimetre => {
-                                    tracing::warn!(
-                                        path = %change.path,
-                                        "watcher_delete_skipped_out_of_scope — cette piste n'est sous AUCUNE racine configurée, elle n'est pas « disparue » (#1943)"
-                                    );
-                                    continue;
-                                }
-                                VerdictPurge::Supprimer => {}
-                            }
-                            let track_repo = TrackRepo::with_backend(db.clone());
-                            if track_repo.delete_by_path(&change.path).is_ok() {
-                                info!(path = %change.path, "watcher_track_removed");
-                            }
-                        }
-                    }
-                }
+                // Un dossier disparu en attente se tranche au lot suivant, même
+                // sans nouvel événement : ce lot-là compte comme un changement.
+                let had_changes = !changes.is_empty() || !dossiers_en_attente.is_empty();
+                let a_relire = traiter_le_lot_du_surveillant(
+                    &db,
+                    changes,
+                    &ReglagesDuSurveillant {
+                        exclusions: &watcher_excludes,
+                        racines: &guard_roots,
+                        quality_split: watcher_quality_split,
+                    },
+                    &mut dossiers_en_attente,
+                );
+                // Le contenu d'un dossier apparu attend, comme tout fichier
+                // signalé, que son écriture soit stable (#4896).
+                pending_settle.extend(a_relire);
                 // After a batch, remove any album left with 0 tracks. An
                 // incremental re-import can re-point a track to a new album
                 // row (album_artist tag drift) and leave the old row as a
@@ -1990,3 +2544,15 @@ pub fn spawn_file_watcher(
         }
     });
 }
+
+#[cfg(test)]
+#[path = "surveillant_retouche_tests_4896.rs"]
+mod surveillant_retouche_tests_4896;
+
+#[cfg(test)]
+#[path = "surveillant_dossiers_tests_4896.rs"]
+mod surveillant_dossiers_tests_4896;
+
+#[cfg(test)]
+#[path = "scan_realigne_tests_4896.rs"]
+mod scan_realigne_tests_4896;

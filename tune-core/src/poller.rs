@@ -162,6 +162,9 @@ const GAPLESS_WINDOW_MS: u64 = 30_000;
 ///
 /// Confortablement sous les 300 s : repreparer coute un transcodage, se
 /// tromper coute un blanc et une zone arretee.
+///
+/// #4917 : ce delai d'abandon suit desormais `SESSION_IDLE_TIMEOUT` (30 min),
+/// les 300 s ci-dessus sont historiques. 200 s reste en deca : prudent, inchange.
 const GAPLESS_STAGE_MAX_AGE_SECS: u64 = 200;
 
 /// Fenêtre minimale entre deux relances automatiques « démarrage mort »
@@ -245,6 +248,40 @@ const STOPPED_FAILURE_MIN_SECS: u64 = 30;
 ///
 /// Voir [`fsm::famine_etablie_malgre_l_avance`].
 const AVANCE_AUDIO_BORNE_HAUTE_SECS: u64 = 120;
+/// 🔴 #4661 — le PLAFOND de la patience que l'HORLOGE DE PISTE peut accorder
+/// en plus, quand le flux a été servi EN ENTIER.
+///
+/// [`AVANCE_AUDIO_BORNE_HAUTE_SECS`] est PLATE : deux minutes, que la piste
+/// dure trois minutes ou vingt. Sur le cas mesuré (#4661, darTZeel LHC-208,
+/// WAV de 281 160 ms servi EN ENTIER à 89 s de piste, renderer muet à partir
+/// de ~102 s), elle place la coupure vers 222 s de piste — **59 secondes de
+/// musique encore dans le tampon du renderer**.
+///
+/// Or quand la durée est connue ET que le fichier a été servi en entier,
+/// l'horloge n'a plus besoin d'une constante : elle sait DIRE quand la
+/// musique s'arrête — `durée + END_MARGIN_MS`. La patience devient exacte au
+/// lieu d'être forfaitaire.
+///
+/// Ce plafond-ci ne borne donc pas la règle, il borne son PATHOLOGIQUE :
+///
+/// - `bytes_sent` est **monotone toutes connexions confondues** (voir
+///   [`crate::http::streamer::AudioStreamer::stream_audio_servi_ms`]) : une
+///   reprise `Range` peut le faire dépasser la taille du fichier sans que le
+///   renderer ait jamais reçu le morceau entier. « Servi en entier » peut
+///   donc être conclu à tort ;
+/// - et sur une piste très longue (un set d'une heure, une face de disque
+///   enregistrée d'un bloc), attendre `durée` laisserait une zone morte
+///   affichée en lecture pendant tout ce temps.
+///
+/// Dix minutes, parce que la valeur doit **dépasser largement**
+/// [`AVANCE_AUDIO_BORNE_HAUTE_SECS`] (sinon elle n'ajoute aucune patience et
+/// le cas mesuré, 182 s d'arrêt, retomberait dans la coupure) et **rester
+/// loin sous** la vie d'une session de flux
+/// (`crate::http::streamer::SESSION_IDLE_TIMEOUT` = 1800 s), au-delà de
+/// laquelle `/stream/{id}` répond 404 et la zone est perdue de toute façon.
+///
+/// Voir [`fsm::horloge_de_piste_couvre_l_arret`].
+const HORLOGE_DE_PISTE_BORNE_HAUTE_SECS: u64 = 600;
 /// Grace period (seconds) after a new track is loaded (track_generation
 /// changes).  During this window the poller suppresses stopped_ticks to
 /// let the renderer buffer — especially important for streaming sources
@@ -489,6 +526,9 @@ pub struct PositionPoller {
     /// `relances_demarrage_mort` : la reprise recrée l'état de sondage, un
     /// drapeau posé dedans repartirait à zéro et bouclerait.
     reprises_renderer_cale: Mutex<std::collections::HashMap<i64, Instant>>,
+    /// #4970 — zones masquées en lecture déjà signalées au journal
+    /// (`zone_masquee_en_lecture`), pour ne le dire qu'une fois par lecture.
+    zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 impl PositionPoller {
@@ -508,6 +548,7 @@ impl PositionPoller {
             event_bus: None,
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
+            zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1098,6 +1139,10 @@ mod remontee_des_pannes_de_sortie_tests;
 #[cfg(test)]
 mod lecture_sans_destination_tests;
 
+/// Fil 1915 — piste coupée : passage à la suivante, pas arrêt de zone.
+#[cfg(test)]
+mod piste_tronquee_1915_tests;
+
 /// #2493 — garde-fou d'EMPLACEMENT : le constat de depassement DIT, il n'agit
 /// pas.
 ///
@@ -1204,6 +1249,11 @@ mod reprise_apres_pause_4666;
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
 
+/// #4661 — un fichier servi EN ENTIER se finit à l'HORLOGE DE PISTE, pas au
+/// bout d'un forfait de deux minutes.
+#[cfg(test)]
+mod fin_de_piste_a_l_horloge_4661;
+
 /// #4173 — la fin de piste prononcée à l'horloge ADOPTE l'enchaînement du
 /// renderer (Eversolo DMP-A6 : `SetNext` acquitté, flux armé tiré, position
 /// gelée à la durée) au lieu de jeter le flux qu'il tient et de repartir en
@@ -1212,6 +1262,8 @@ mod fin_hors_temps_reel_tests;
 /// inchangé quand rien n'atteste l'enchaînement.
 #[cfg(test)]
 mod adoption_a_l_horloge_4173;
+#[cfg(test)]
+mod zone_masquee_en_lecture_4970;
 
 /// #4559 — Jean Valjean, fil 1857 : le panneau annonce « WASAPI (shared —
 /// Windows mixer) » pendant que le journal montre le bras exclusif ouvert et

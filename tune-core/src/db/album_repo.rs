@@ -578,10 +578,15 @@ pub mod sql {
     /// index `albums_fts` contiennent tout, les reconstruire à chaque
     /// masquage serait le mauvais échange (#1391).
     ///
+    /// Même ET pour l'album DISTANT doublé par un album local (#4146) :
+    /// seul le local est rendu, comme dans la grille de `/library/albums`.
+    /// Le prédicat est celui de la grille, pris à `facet_filter`, jamais
+    /// recopié — il vaut pour la page ET pour son total.
+    ///
     /// Emplacements 1..=6.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {}",
+            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {} AND {}",
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
@@ -589,6 +594,7 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
         )
     }
 
@@ -636,10 +642,11 @@ pub mod sql {
         format!(
             "SELECT a.label, COUNT(*) AS n FROM albums a \
              WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' \
-             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} \
+             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} AND {} \
              GROUP BY a.label ORDER BY n DESC, a.label LIMIT {}",
             d.placeholder(1),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
             d.placeholder(2)
         )
     }
@@ -1738,6 +1745,47 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// #4896 — un dossier renommé ou déplacé : les albums identifiés par ce
+    /// dossier, ou par un dossier qu'il contient, le suivent. Sans cela,
+    /// `get_or_create_for_folder` ne reconnaîtrait plus l'album à son dossier
+    /// et la prochaine relecture d'une piste en ouvrirait un second. Découpage
+    /// exact (`…/Album` ne déplace pas `…/Album 2`). Rend le nombre de lignes.
+    pub fn deplacer_dossier(&self, ancien: &str, nouveau: &str) -> Result<usize, TuneError> {
+        use unicode_normalization::UnicodeNormalization as _;
+        let d = super::track_repo::DossierExact::new(ancien);
+        let base_ancienne = d
+            .prefixe
+            .trim_end_matches(d.separateur.as_str())
+            .to_string();
+        let base_nouvelle: String = nouveau.trim_end_matches(['/', '\\']).nfc().collect();
+        let (p1, p2, p3) = match self.db.engine() {
+            Engine::Postgres => ("$1", "$2", "$3"),
+            Engine::Sqlite => ("?1", "?2", "?3"),
+        };
+        let sql = format!(
+            "SELECT id, folder_path FROM albums WHERE folder_path = {p1} \
+             OR (folder_path LIKE {p2}{esc} AND substr(folder_path, 1, {n}) = {p3})",
+            esc = super::track_repo::like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&base_ancienne, &d.motif, &d.prefixe];
+        let mut deplaces = 0usize;
+        for ligne in self.db.query_many_strong(&sql, &params)? {
+            let (Some(id), Some(dossier)) = (
+                ligne.first().and_then(|v| v.as_i64()),
+                ligne.get(1).and_then(|v| v.as_string()),
+            ) else {
+                continue;
+            };
+            let Some(reste) = dossier.strip_prefix(&base_ancienne) else {
+                continue;
+            };
+            self.set_folder_path(id, &format!("{base_nouvelle}{reste}"))?;
+            deplaces += 1;
+        }
+        Ok(deplaces)
+    }
+
     /// Marque l'album comme compilation (#1957). **Ne baisse jamais le
     /// drapeau**, et c'est délibéré :
     ///
@@ -1831,6 +1879,37 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
         self.db.execute(&sql, &params)?;
         self.mark_compilation(album_id)
+    }
+
+    /// #4896 — reprend le titre et/ou l'artiste d'une ligne album d'après les
+    /// balises de ses pistes, que le surveillant de fichiers vient de relire
+    /// (voir `auto_scan::realigner_albums_sur_les_balises`, qui décide).
+    ///
+    /// Écriture ciblée, comme [`Self::reclasser_en_compilation`] : la pochette
+    /// et les dates restent. Chaque champ tenu par une édition manuelle
+    /// (C3) est laissé tel quel. Rend `true` si quelque chose a été écrit.
+    pub fn realigner_sur_les_balises(
+        &self,
+        album_id: i64,
+        titre: Option<&str>,
+        artist_id: Option<i64>,
+    ) -> Result<bool, TuneError> {
+        let mut ecrit = false;
+        if let Some(titre) = titre
+            && !self.tenu_a_la_main(album_id, "title")
+        {
+            self.force_update_title(album_id, titre)?;
+            ecrit = true;
+        }
+        if let Some(artist_id) = artist_id
+            && !self.tenu_a_la_main(album_id, "artist")
+        {
+            let sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+            let params: [&dyn ToSqlValue; 2] = [&artist_id, &album_id];
+            self.db.execute(&sql, &params)?;
+            ecrit = true;
+        }
+        Ok(ecrit)
     }
 
     /// Répare le drapeau « compilation » et, s'il est donné, l'artiste d'un

@@ -358,6 +358,28 @@ async fn objets_persistes_respectent_leurs_contrats_web() {
     );
     assert_eq!(playlist["track_count"], 1);
 
+    // #4889 — un titre de service dans la même playlist : la liste rendue par
+    // `GET /playlists/{id}/tracks` doit TOUJOURS satisfaire le contrat `Track`
+    // du client (`id` présent — nul —, `title`), ligne par ligne.
+    let playlist = mutation_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/playlists/{playlist_id}/tracks"),
+        serde_json::json!({
+            "track_ids": [],
+            "streaming_tracks": [{
+                "source": "bandcamp", "source_id": "bc-contrat", "title": "Titre de service",
+            }]
+        }),
+        StatusCode::CREATED,
+    )
+    .await
+    .expect("ajout du titre de service temoin");
+    respecte_tous_les_contrats(&carte, "POST", "/playlists/{}/tracks", &playlist).unwrap_or_else(
+        |erreur| panic!("POST /playlists/{{id}}/tracks (service): {erreur}; payload={playlist}"),
+    );
+    assert_eq!(playlist["track_count"], 2);
+
     for (route_contrat, chemin_reel) in [
         ("/playlists", "/api/v1/playlists".to_string()),
         ("/playlists/{}", format!("/api/v1/playlists/{playlist_id}")),

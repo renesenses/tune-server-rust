@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "0ae859430478a6b8a04e498356964c85c166482b",
+    "web_sha": "ce01ee4a118c0f6e5dc50d404f778ec515956a86",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -1881,7 +1881,10 @@
         "total_matches",
         "number_returned"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "complet",
+        "incomplet"
+      ]
     },
     {
       "route": "/network/media-servers/{}/indexer",
@@ -2316,6 +2319,26 @@
       "champs_optionnels": [
         "url"
       ]
+    },
+    {
+      "route": "/plugins/premium-audio/reinstall-suggestion",
+      "methode": "GET",
+      "type": "SuggestionReinstallationGreffons",
+      "liste": false,
+      "champs_obligatoires": [
+        "ids"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/plugins/premium-audio/reinstall-suggestion/dismiss",
+      "methode": "POST",
+      "type": "SuggestionReinstallationGreffons",
+      "liste": false,
+      "champs_obligatoires": [
+        "ids"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/plugins/{}",
@@ -4118,7 +4141,9 @@
         "enabled",
         "time"
       ],
-      "champs_optionnels": []
+      "champs_optionnels": [
+        "last_run"
+      ]
     },
     {
       "route": "/system/scan/schedule",
@@ -5477,6 +5502,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/library/albums/{}/credits",
+      "type": "import('./library/credits').CreditAvecPiste[]",
+      "raison": "type introuvable dans les sources"
+    },
+    {
       "route": "/library/tracks",
       "type": "any",
       "raison": "type non structurel"
@@ -6093,7 +6123,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 303,
-    "appels_non_resolus": 151
+    "routes_cartographiees": 305,
+    "appels_non_resolus": 152
   }
 }

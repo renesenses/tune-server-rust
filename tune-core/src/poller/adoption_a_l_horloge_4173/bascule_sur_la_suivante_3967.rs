@@ -364,3 +364,105 @@ async fn track_end_gap_nomme_le_verdict_d_armement() {
          de #3967 s'est armée.\n{texte}"
     );
 }
+
+impl Banc {
+    /// L'appareil se TAIT : `STOPPED`, position remise à zéro. C'est ce que
+    /// rapporte un renderer qui a quitté la piste finie sans démarrer la
+    /// suivante — la position « bouge » (237 s → 0), mais rien ne joue.
+    async fn le_renderer_s_arrete_a_zero(&self) {
+        let reg = self.outputs.lock().await;
+        let arc = reg.get(APPAREIL).unwrap();
+        let sortie = arc.lock().await;
+        let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+        mock.set_state(crate::outputs::traits::TransportState::Stopped)
+            .await;
+        mock.set_position(0);
+    }
+}
+
+/// **Fils 1926/1931 (Stéphane Villerio, DMP-A6, 0.9.163-0.9.164) : « la piste
+/// 2 ne s'enchaîne pas ».** L'appareil acquitte le `Next`, puis s'ARRÊTE :
+/// `STOPPED`, position 0. La surveillance lisait « la position a quitté
+/// 237 000 ms » comme un signe de vie et CONFIRMAIT la bascule : plus aucun
+/// repli, la zone restait sur une piste 2 qui ne jouait pas, jusqu'à ce que
+/// la garde d'échec coupe la zone. Un renderer arrêté n'a pas enchaîné : il
+/// n'est pas un signe de vie, et le repli doit relancer la piste ADOPTÉE.
+#[tokio::test]
+async fn un_appareil_qui_s_arrete_apres_le_next_ne_confirme_pas_la_bascule() {
+    let mut banc = Banc::monter().await;
+    banc.l_appareil_dit_de_la_suivante(SuivantePreparee::Tenue)
+        .await;
+    banc.l_appareil_honore_le_next(false).await;
+    let (flux, _) = banc.armer().await;
+    banc.la_signature_du_dmp_a6(&flux).await;
+
+    banc.la_fin_a_l_horloge().await;
+    assert_eq!(banc.bascules().await, 1);
+
+    // Un sondage dans le délai : l'appareil s'est tu, position 0.
+    banc.le_renderer_s_arrete_a_zero().await;
+    banc.tic().await;
+    assert!(
+        banc.surveillance().is_some(),
+        "un renderer ARRÊTÉ à 0 n'est pas un signe de vie : la bascule ne doit \
+         pas être confirmée"
+    );
+    assert_eq!(banc.play_complets().await, Vec::<String>::new());
+
+    // Le délai est écoulé, l'appareil toujours arrêté : le repli relance.
+    banc.poll_states
+        .get_mut(&banc.zone_id)
+        .unwrap()
+        .adoption_horloge
+        .as_mut()
+        .unwrap()
+        .depuis = Instant::now() - Duration::from_secs(BASCULE_DELAI_SECS + 1);
+    banc.le_renderer_s_arrete_a_zero().await;
+    banc.tic().await;
+
+    assert_eq!(
+        banc.play_complets().await,
+        vec![ARMEE.to_string()],
+        "l'appareil arrêté après le `Next` : le repli relance la piste ADOPTÉE"
+    );
+    let (position, titre, _) = banc.ecran().await;
+    assert_eq!(
+        (position, titre.as_str()),
+        (1, ARMEE),
+        "aucune piste perdue : la file est sur la piste armée"
+    );
+}
+
+/// Le même arrêt, sans `Next` : l'adoption à l'horloge de #4173 (flux armé
+/// tiré, URI muette) ne se confirme pas non plus sur un renderer arrêté.
+#[tokio::test]
+async fn une_adoption_a_l_horloge_ne_se_confirme_pas_sur_un_renderer_arrete() {
+    let mut banc = Banc::monter().await;
+    let (flux, _) = banc.armer().await;
+    banc.le_renderer_tire(&flux, OCTETS_TIRES).await;
+    banc.le_renderer_rapporte(None).await;
+    banc.la_fin_a_l_horloge().await;
+    verifier_l_adoption(&banc, &flux, decisions::EnchainementArme::Probable).await;
+
+    banc.le_renderer_s_arrete_a_zero().await;
+    banc.tic().await;
+    assert!(
+        banc.surveillance().is_some(),
+        "un renderer ARRÊTÉ à 0 ne confirme pas l'adoption"
+    );
+
+    banc.poll_states
+        .get_mut(&banc.zone_id)
+        .unwrap()
+        .adoption_horloge
+        .as_mut()
+        .unwrap()
+        .depuis = Instant::now() - Duration::from_secs(ADOPTION_HORLOGE_DELAI_SECS + 1);
+    banc.le_renderer_s_arrete_a_zero().await;
+    banc.tic().await;
+    assert_eq!(
+        banc.play_complets().await,
+        vec![ARMEE.to_string()],
+        "sans signe de vie, le repli relance la piste ADOPTÉE"
+    );
+}

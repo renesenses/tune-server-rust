@@ -196,6 +196,15 @@ impl Drop for RadioConsumerGuard {
     }
 }
 
+/// `Content-Type` d'une session : l'orthographe du MIME que la sortie DLNA a
+/// ANNONCÉE au renderer si elle en a posé une (reprise 714, #4958), sinon le
+/// MIME de la session. Le `HEAD` et le `GET` doivent dire ce que dit la DIDL :
+/// le Beosound Stage confronte le `Content-Type` du `HEAD` à son Sink.
+fn content_type_servi(stream_id: &str, mime_session: &str) -> HeaderValue {
+    let mime = tune_core::http::streamer::content_type_du_flux(stream_id, mime_session);
+    HeaderValue::from_str(&mime).unwrap_or_else(|_| HeaderValue::from_str(mime_session).unwrap())
+}
+
 pub async fn handle_head(
     Path(raw_id): Path<String>,
     State(sessions): State<SharedSessions>,
@@ -251,7 +260,7 @@ pub async fn handle_head(
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
-        HeaderValue::from_str(&session.info.mime_type).unwrap(),
+        content_type_servi(&session.id, &session.info.mime_type),
     );
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
 
@@ -411,7 +420,7 @@ pub async fn handle_stream(
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
-        HeaderValue::from_str(&session.info.mime_type).unwrap(),
+        content_type_servi(&session.id, &session.info.mime_type),
     );
     headers.insert(
         "transferMode.dlna.org",
@@ -1327,7 +1336,7 @@ async fn serve_file(
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Type",
-            HeaderValue::from_str(&info.mime_type).unwrap(),
+            content_type_servi(&session.id, &info.mime_type),
         );
         headers.insert("Content-Length", HeaderValue::from(length));
         headers.insert(
@@ -1370,7 +1379,7 @@ async fn serve_file(
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type",
-        HeaderValue::from_str(&info.mime_type).unwrap(),
+        content_type_servi(&session.id, &info.mime_type),
     );
     headers.insert("Content-Length", HeaderValue::from(file_size));
     headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
@@ -2033,11 +2042,16 @@ async fn send_with_reresolve(
 /// Bytes are streamed verbatim — no decoding or transformation — so the audio
 /// stays byte-exact. `abs_offset` is the absolute file offset of the first
 /// byte of `initial` (0 for a full fetch, N for a `bytes=N-` resume).
+/// `sauter` : octets de l'amont à NE PAS livrer en tête — le corps amont
+/// commence à `abs_offset`, le renderer veut `abs_offset + sauter`. Sert la
+/// petite reprise `bytes=N-` d'un Lavf (sous le seuil de transfert au CDN)
+/// avec un vrai 206 depuis N, sans rien demander de plus à l'amont.
 fn resumable_proxy_body(
     client: &'static reqwest::Client,
     upstream_url: String,
     initial: reqwest::Response,
     abs_offset: u64,
+    sauter: u64,
     reresolve: Option<ReresolveFn>,
     compteur: std::sync::Arc<StreamSession>,
 ) -> Body {
@@ -2048,6 +2062,7 @@ fn resumable_proxy_body(
         let mut url = upstream_url;
         // Absolute file offset of the next byte we expect to yield.
         let mut pos = abs_offset;
+        let mut a_sauter = sauter;
         let mut resumes: u32 = 0;
         loop {
             let mut stream = resp.bytes_stream();
@@ -2056,6 +2071,17 @@ fn resumable_proxy_body(
                 match stream.next().await {
                     Some(Ok(chunk)) => {
                         pos += chunk.len() as u64;
+                        if a_sauter > 0 {
+                            let n = chunk.len() as u64;
+                            if n <= a_sauter {
+                                a_sauter -= n;
+                                continue;
+                            }
+                            let garde = chunk.slice(a_sauter as usize..);
+                            a_sauter = 0;
+                            yield Ok::<_, std::io::Error>(garde);
+                            continue;
+                        }
                         yield Ok::<_, std::io::Error>(chunk);
                     }
                     Some(Err(e)) => {
@@ -2221,6 +2247,10 @@ async fn proxy_stream(
         .map(|s| s.to_string());
 
     let mut headers = HeaderMap::new();
+    // #4958 — l'orthographe annoncée au renderer prime sur celle du CDN :
+    // c'est elle que la DIDL porte, et un Sink strict confronte les deux.
+    let upstream_content_type =
+        tune_core::http::streamer::content_type_du_flux(&session.id, &upstream_content_type);
     headers.insert(
         "Content-Type",
         HeaderValue::from_str(&upstream_content_type).unwrap(),
@@ -2260,6 +2290,49 @@ async fn proxy_stream(
             upstream_url.to_string(),
             upstream_resp,
             start,
+            0,
+            reresolve.clone(),
+            session.clone(),
+        );
+        return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
+    }
+
+    // Une petite reprise `bytes=N-` (0 < N < seuil) d'un renderer Lavf n'est
+    // PAS transmise au CDN — le seuil existe pour ne pas marteler Akamai avec
+    // les micro-Range de l'analyse d'en-tête FLAC. Mais y répondre par un 200
+    // depuis l'octet 0, comme avant, donne au renderer des octets d'en-tête
+    // là où il attend l'octet N : sur un `.dsf` relayé depuis un autre Tune,
+    // l'Eversolo DMP-A8 enchaîne `bytes=0-`, `bytes=<fin-187>-` (chunk ID3
+    // final), `bytes=28-` — et, trahi par la dernière, recommence les trois
+    // en boucle sans jamais jouer (.18, 23/09/2026, position 0 pendant 45 s).
+    // Une session de FICHIER répond 206 depuis N (`serve_file`) ; le
+    // mandataire fait de même en tirant l'amont depuis 0 et en SAUTANT N
+    // octets, sans rien demander de plus au CDN.
+    let saut_local = range_value
+        .as_deref()
+        .and_then(parse_range_start)
+        .filter(|&n| n > 0 && n < resume_threshold)
+        .filter(|_| !is_radio && upstream_resp.status() == reqwest::StatusCode::OK);
+    if let (Some(n), Some(cl)) = (saut_local, content_length)
+        && n < cl
+    {
+        headers.insert("Content-Length", HeaderValue::from(cl - n));
+        headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes {n}-{}/{}", cl - 1, cl)).unwrap(),
+        );
+        info!(
+            url = upstream_url,
+            start = n,
+            total = cl,
+            "proxy_206_par_saut_local"
+        );
+        let body = resumable_proxy_body(
+            client,
+            upstream_url.to_string(),
+            upstream_resp,
+            0,
+            n,
             reresolve.clone(),
             session.clone(),
         );
@@ -2308,6 +2381,7 @@ async fn proxy_stream(
             upstream_url.to_string(),
             upstream_resp,
             0,
+            0,
             reresolve.clone(),
             session.clone(),
         );
@@ -2322,6 +2396,7 @@ async fn proxy_stream(
         client,
         upstream_url.to_string(),
         upstream_resp,
+        0,
         0,
         reresolve.clone(),
         session.clone(),
@@ -4719,5 +4794,481 @@ mod range_du_chemin_fichier_de_bout_en_bout {
         assert_eq!(entete(&entetes, "Content-Length"), "5904");
         let attendu: Vec<u8> = (4096..TAILLE).map(|i| (i % 251) as u8).collect();
         assert_eq!(corps, attendu);
+    }
+}
+
+/// #4958 — Beosound Stage (B&O), `714 Illegal MIME-type` sur toute lecture,
+/// même après les deux reprises de #744.
+///
+/// Le banc rejoue le couple SOAP + HTTP de bout en bout : la VRAIE sortie
+/// DLNA (`DlnaOutput::play_media`) parle à un faux renderer strict, et ce
+/// renderer va chercher l'URL du flux sur le VRAI serveur de flux de ce
+/// module (`router`), comme le Beosound le fait (un `HEAD` avant chaque
+/// réponse, journal de FabienM du 24/09). Il refuse en 714 tout MIME absent
+/// de son Sink — celui de la DIDL comme le `Content-Type` du `HEAD`. Son Sink
+/// est l'extrait du journal : `audio/x-flac`, `audio/wav`… mais PAS
+/// `audio/flac`.
+#[cfg(test)]
+mod reprise_714_sink_strict_de_bout_en_bout {
+    use super::{StreamInfo, StreamSession, router};
+    use axum::Router;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tune_core::http::streamer::SharedSessions;
+    use tune_core::outputs::dlna::DlnaOutput;
+    use tune_core::outputs::traits::{OutputTarget, PlayMedia};
+
+    /// Sink du Beosound Stage, extrait du journal de #4958.
+    const SINK_BEOSOUND: &[&str] = &[
+        "http-get:*:audio/x-flac:*",
+        "http-get:*:audio/wav:*",
+        "http-get:*:audio/wave:*",
+        "http-get:*:audio/x-wav:*",
+        "http-get:*:audio/mpeg:*",
+        "http-get:*:audio/l16;rate=44100;channels=2:*",
+        "http-get:*:audio/l16;rate=44100;channels=2:DLNA.ORG_PN=LPCM",
+    ];
+
+    #[derive(Clone, Default)]
+    struct Renderer {
+        sink: Arc<Vec<String>>,
+        current_uri: Arc<Mutex<String>>,
+        /// Pour chaque SetAVTransportURI : (MIME de la DIDL, Content-Type du HEAD).
+        essais: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    fn base_du_sink(entree: &str) -> String {
+        let champ = entree.split(':').nth(2).unwrap_or("");
+        champ
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    }
+
+    impl Renderer {
+        fn accepte(&self, mime: &str) -> bool {
+            let m = mime
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            self.sink.iter().any(|e| base_du_sink(e) == m)
+        }
+    }
+
+    fn soap(action: &str, service: &str, inner: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:{action}Response xmlns:u="urn:schemas-upnp-org:service:{service}:1">{inner}</u:{action}Response></s:Body></s:Envelope>"#
+        )
+    }
+
+    fn faute_714() -> String {
+        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>714</errorCode><errorDescription>Illegal MIME-type</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_string()
+    }
+
+    fn action_de(corps: &str) -> String {
+        corps
+            .find("<u:")
+            .map(|i| &corps[i + 3..])
+            .and_then(|r| r.find([' ', '>']).map(|f| r[..f].to_string()))
+            .unwrap_or_default()
+    }
+
+    fn balise(xml: &str, nom: &str) -> String {
+        let (o, f) = (format!("<{nom}>"), format!("</{nom}>"));
+        xml.find(&o)
+            .and_then(|d| {
+                let d = d + o.len();
+                xml[d..].find(&f).map(|e| xml[d..d + e].to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Le MIME de la DIDL : 3ᵉ champ du `protocolInfo` de `<res>`.
+    fn mime_de_la_didl(corps: &str) -> String {
+        let didl = balise(corps, "CurrentURIMetaData")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&");
+        didl.find("protocolInfo=\"")
+            .map(|i| &didl[i + "protocolInfo=\"".len()..])
+            .and_then(|r| r.split(':').nth(2))
+            .unwrap_or("")
+            .to_string()
+    }
+
+    async fn av(State(r): State<Renderer>, corps: String) -> axum::response::Response {
+        let action = action_de(&corps);
+        match action.as_str() {
+            "SetAVTransportURI" => {
+                let uri = balise(&corps, "CurrentURI");
+                let didl = mime_de_la_didl(&corps);
+                // Comme le Beosound : un HEAD sur l'URL avant de répondre.
+                let ct = tune_core::http::client::shared()
+                    .head(&uri)
+                    .send()
+                    .await
+                    .ok()
+                    .and_then(|rep| {
+                        rep.headers()
+                            .get("Content-Type")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                r.essais.lock().await.push((didl.clone(), ct.clone()));
+                if !r.accepte(&didl) || !r.accepte(&ct) {
+                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, faute_714())
+                        .into_response();
+                }
+                *r.current_uri.lock().await = uri;
+                soap(&action, "AVTransport", "").into_response()
+            }
+            "GetTransportInfo" => soap(
+                &action,
+                "AVTransport",
+                "<CurrentTransportState>STOPPED</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed>",
+            )
+            .into_response(),
+            "GetMediaInfo" => {
+                let uri = r.current_uri.lock().await.clone();
+                soap(
+                    &action,
+                    "AVTransport",
+                    &format!("<NrTracks>1</NrTracks><CurrentURI>{uri}</CurrentURI>"),
+                )
+                .into_response()
+            }
+            "GetPositionInfo" => {
+                let uri = r.current_uri.lock().await.clone();
+                soap(
+                    &action,
+                    "AVTransport",
+                    &format!("<Track>1</Track><TrackURI>{uri}</TrackURI><RelTime>0:00:00</RelTime>"),
+                )
+                .into_response()
+            }
+            _ => soap(&action, "AVTransport", "").into_response(),
+        }
+    }
+
+    async fn cm(State(r): State<Renderer>) -> axum::response::Response {
+        soap(
+            "GetProtocolInfo",
+            "ConnectionManager",
+            &format!("<Source></Source><Sink>{}</Sink>", r.sink.join(",")),
+        )
+        .into_response()
+    }
+
+    async fn rc(corps: String) -> axum::response::Response {
+        soap(&action_de(&corps), "RenderingControl", "").into_response()
+    }
+
+    async fn ecouter(app: Router) -> (u16, tokio::task::JoinHandle<()>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = tokio::spawn(async move {
+            axum::serve(l, app).await.ok();
+        });
+        (port, h)
+    }
+
+    /// Joue un FLAC servi `audio/flac` vers un renderer au Sink donné, et rend
+    /// l'issue et les essais vus par le renderer.
+    async fn jouer_un_flac(id: &str, sink: &[&str]) -> (Result<(), String>, Vec<(String, String)>) {
+        let fichier = tune_core::test_scratch::scratch_file(id, ".flac");
+        std::fs::write(fichier.path(), vec![0u8; 4096]).expect("fichier de test");
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            ..StreamInfo::default()
+        };
+        let session = Arc::new(StreamSession::new(id.into(), info, false, 8));
+        *session.file_path.lock().await = Some(fichier.path().to_string_lossy().into_owned());
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(id.to_string(), session)].into_iter().collect(),
+        ));
+        let (port_flux, flux) = ecouter(router(sessions)).await;
+
+        let renderer = Renderer {
+            sink: Arc::new(sink.iter().map(|s| s.to_string()).collect()),
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route("/AVTransport/control", post(av))
+            .route("/ConnectionManager/control", post(cm))
+            .route("/RenderingControl/control", post(rc))
+            .with_state(renderer.clone());
+        let (port_r, vie) = ecouter(app).await;
+        let base = format!("http://127.0.0.1:{port_r}");
+        let sortie = DlnaOutput::new(
+            "Parents".into(),
+            "uuid:28630ca6-cd4f-4a15-80ae-f170dc890b20".into(),
+            "127.0.0.1".into(),
+            format!("{base}/AVTransport/control"),
+            format!("{base}/RenderingControl/control"),
+            Some(format!("{base}/ConnectionManager/control")),
+        );
+        let url = format!("http://127.0.0.1:{port_flux}/stream/{id}.flac");
+        let issue = sortie
+            .play_media(&PlayMedia {
+                url: &url,
+                mime_type: "audio/flac",
+                title: Some("Far from Any Road"),
+                sample_rate: Some(44_100),
+                bit_depth: Some(16),
+                channels: Some(2),
+                ..Default::default()
+            })
+            .await;
+        let essais = renderer.essais.lock().await.clone();
+        vie.abort();
+        flux.abort();
+        (issue, essais)
+    }
+
+    /// LE CAS DE #4958. Sink sans `audio/flac` : la reprise « orthographe
+    /// exacte » annonce `audio/x-flac` dans la DIDL — le `HEAD` doit dire la
+    /// même chose, sans quoi le renderer refuse toutes les reprises.
+    #[tokio::test]
+    async fn la_reprise_orthographe_exacte_aligne_le_content_type_du_head() {
+        let (issue, essais) = jouer_un_flac("beosound-4958-a1", SINK_BEOSOUND).await;
+        assert!(
+            issue.is_ok(),
+            "le Sink liste audio/x-flac : la lecture doit passer à la reprise \
+             « orthographe exacte ». Issue : {issue:?} ; essais (DIDL, HEAD) : {essais:?}"
+        );
+        let dernier = essais.last().expect("au moins un SetAVTransportURI");
+        assert_eq!(
+            dernier,
+            &("audio/x-flac".to_string(), "audio/x-flac".to_string()),
+            "DIDL et Content-Type du HEAD doivent porter la même orthographe : {essais:?}"
+        );
+    }
+
+    /// TÉMOIN des autres renderers : un Sink qui liste `audio/flac` passe du
+    /// premier coup, avec le `Content-Type` de la session, inchangé.
+    #[tokio::test]
+    async fn un_sink_qui_liste_audio_flac_ne_change_rien() {
+        let (issue, essais) = jouer_un_flac(
+            "sink-flac-4958-b2",
+            &["http-get:*:audio/flac:*", "http-get:*:audio/wav:*"],
+        )
+        .await;
+        assert!(issue.is_ok(), "{issue:?} ; {essais:?}");
+        assert_eq!(
+            essais,
+            vec![("audio/flac".to_string(), "audio/flac".to_string())],
+            "un seul essai, au MIME de la session"
+        );
+    }
+}
+
+/// Le mandataire doit répondre aux reprises `Range` d'un renderer Lavf comme
+/// une session de FICHIER : un vrai 206 depuis N, `Content-Range` exact,
+/// `Content-Length` du reste — y compris pour une PETITE reprise sous le
+/// seuil de transfert au CDN, qui recevait un 200 depuis l'octet 0.
+///
+/// Mesuré sur le .18 le 23/09/2026 (Abacab, DSD64 relayé depuis le .15,
+/// Eversolo DMP-A8) : `bytes=0-`, `bytes=294338652-` (les 187 derniers
+/// octets, le chunk ID3), `bytes=28-` — puis les trois à nouveau, trois fois
+/// de suite, position 0 pendant 45 s. Ce témoin rejoue exactement ces trois
+/// sondes, dans cet ordre, et compare octet pour octet ce qui revient.
+#[cfg(test)]
+mod temoins_du_mandataire_dsf {
+    use axum::extract::{Path, State};
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tune_core::http::streamer::{SharedSessions, StreamInfo, StreamSession};
+
+    const LAVF: &str = "Lavf/58.45.100";
+
+    /// Un « .dsf » de 4 096 octets : 28 octets de « DSD  », le reste
+    /// numéroté, 187 octets de « métadonnées » en fin. Le contenu n'a pas à
+    /// se décoder — c'est le TRANSPORT qu'on éprouve, octet pour octet.
+    fn corps() -> Vec<u8> {
+        (0..4096u32).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Un serveur média qui honore `Range: bytes=N-` par un 206 exact, et
+    /// sert le tout en 200 sinon — ce que fait la route audio de Tune.
+    async fn serveur_media(corps: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/v1/library/tracks/581978/audio",
+            listener.local_addr().unwrap()
+        );
+        let tache = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let corps = corps.clone();
+                tokio::spawn(async move {
+                    let mut requete = Vec::new();
+                    let mut octet = [0u8; 1];
+                    while !requete.ends_with(b"\r\n\r\n") && requete.len() < 16_384 {
+                        if socket.read_exact(&mut octet).await.is_err() {
+                            return;
+                        }
+                        requete.push(octet[0]);
+                    }
+                    let texte = String::from_utf8_lossy(&requete).to_string();
+                    let debut = texte
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("Range: bytes=")
+                                .or(l.strip_prefix("range: bytes="))
+                        })
+                        .and_then(|r| r.split('-').next()?.parse::<usize>().ok());
+                    let total = corps.len();
+                    let (statut, entetes, tranche) = match debut {
+                        Some(n) if n < total => (
+                            "206 Partial Content",
+                            format!(
+                                "Content-Range: bytes {n}-{}/{total}\r\nContent-Length: {}\r\n",
+                                total - 1,
+                                total - n
+                            ),
+                            &corps[n..],
+                        ),
+                        _ => ("200 OK", format!("Content-Length: {total}\r\n"), &corps[..]),
+                    };
+                    let entete = format!(
+                        "HTTP/1.1 {statut}\r\nContent-Type: application/x-dsd\r\nAccept-Ranges: bytes\r\n{entetes}Connection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(entete.as_bytes()).await;
+                    let _ = socket.write_all(tranche).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (url, tache)
+    }
+
+    async fn lire_tout(reponse: axum::response::Response) -> Vec<u8> {
+        let mut flux = reponse.into_body().into_data_stream();
+        let mut tout = Vec::new();
+        while let Some(bloc) = tokio::time::timeout(std::time::Duration::from_secs(10), flux.next())
+            .await
+            .expect("le corps doit arriver")
+        {
+            tout.extend_from_slice(&bloc.expect("bloc lisible"));
+        }
+        tout
+    }
+
+    #[tokio::test]
+    async fn les_trois_sondes_du_dmp_a8_recoivent_chacune_un_206_exact() {
+        let corps = corps();
+        let total = corps.len() as u64;
+        let (upstream, _serveur) = serveur_media(corps.clone()).await;
+
+        let sid = "dsf-mandataire";
+        let info = StreamInfo {
+            format: "dsf".into(),
+            mime_type: "application/x-dsd".into(),
+            sample_rate: 2_822_400,
+            bit_depth: 1,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let session = StreamSession::new(sid.to_string(), info, false, 128);
+        *session.proxy_url.lock().await = Some(upstream);
+        let session = Arc::new(session);
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session)].into_iter().collect(),
+        ));
+        let requete = |range: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("User-Agent", LAVF.parse().unwrap());
+            h.insert("Range", range.parse().unwrap());
+            h
+        };
+
+        // Les trois sondes, dans l'ordre du journal.
+        let fin_id3 = total - 187;
+        for (range, debut) in [
+            ("bytes=0-".to_string(), 0u64),
+            (format!("bytes={fin_id3}-"), fin_id3),
+            ("bytes=28-".to_string(), 28u64),
+        ] {
+            let rep = super::handle_stream(
+                Path(format!("{sid}.dsf")),
+                State(sessions.clone()),
+                requete(&range),
+            )
+            .await;
+            assert_eq!(
+                rep.status(),
+                axum::http::StatusCode::PARTIAL_CONTENT,
+                "{range} : une reprise reçoit un 206, comme sur une session de fichier"
+            );
+            let entetes = rep.headers().clone();
+            assert_eq!(
+                entetes.get("Content-Range").and_then(|v| v.to_str().ok()),
+                Some(format!("bytes {debut}-{}/{total}", total - 1).as_str()),
+                "{range} : le Content-Range doit partir de l'octet demandé"
+            );
+            assert_eq!(
+                entetes.get("Content-Length").and_then(|v| v.to_str().ok()),
+                Some((total - debut).to_string().as_str()),
+                "{range} : la longueur est celle du reste"
+            );
+            assert_eq!(
+                entetes.get("Content-Type").and_then(|v| v.to_str().ok()),
+                Some("application/x-dsd")
+            );
+            assert!(entetes.get("Accept-Ranges").is_some(), "{range}");
+            let octets = lire_tout(rep).await;
+            assert_eq!(
+                octets,
+                corps[debut as usize..].to_vec(),
+                "{range} : les octets livrés sont ceux du fichier à partir de {debut}"
+            );
+        }
+    }
+
+    /// Sous le seuil de transfert au CDN (1 Mio pour un Lavf), la reprise est
+    /// servie par un SAUT local : même contrat pour le renderer, aucun Range
+    /// de plus vers l'amont.
+    #[tokio::test]
+    async fn une_petite_reprise_sous_le_seuil_recoit_aussi_un_206_exact() {
+        let corps = corps();
+        let total = corps.len() as u64;
+        let (upstream, _serveur) = serveur_media(corps.clone()).await;
+        let sid = "dsf-mandataire-petit";
+        let info = StreamInfo {
+            format: "dsf".into(),
+            mime_type: "application/x-dsd".into(),
+            ..StreamInfo::default()
+        };
+        let session = StreamSession::new(sid.to_string(), info, false, 128);
+        *session.proxy_url.lock().await = Some(upstream);
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), Arc::new(session))].into_iter().collect(),
+        ));
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("User-Agent", LAVF.parse().unwrap());
+        h.insert("Range", "bytes=4000-".parse().unwrap());
+        let rep = super::handle_stream(Path(format!("{sid}.dsf")), State(sessions), h).await;
+        assert_eq!(rep.status(), axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            rep.headers()
+                .get("Content-Range")
+                .and_then(|v| v.to_str().ok()),
+            Some(format!("bytes 4000-{}/{total}", total - 1).as_str())
+        );
+        assert_eq!(lire_tout(rep).await, corps[4000..].to_vec());
     }
 }

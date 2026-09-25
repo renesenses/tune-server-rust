@@ -2194,6 +2194,43 @@ impl ZoneRepo {
         }
     }
 
+    /// #4957 — every VISIBLE zone persisted on this host, as
+    /// `(id, output_device_id, output_type)`. The caller decides which ones
+    /// belong to a given device: the host alone never does (a DLNA renderer
+    /// and an AirPlay entry of the same box share it).
+    pub fn visible_zones_on_host(&self, host: &str) -> Vec<(i64, String, String)> {
+        if host.is_empty() {
+            return Vec::new();
+        }
+        let p1 = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "SELECT id, COALESCE(output_device_id, ''), COALESCE(output_type, '') FROM zones \
+             WHERE COALESCE(is_hidden, 0) = 0 \
+             AND host IS NOT NULL AND host <> '' AND LOWER(host) = LOWER({p1}) \
+             ORDER BY id"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&host];
+        match self.db.query_many_strong(&sql, &params) {
+            Ok(rows) => rows
+                .iter()
+                .map(|cols| {
+                    (
+                        cols.first().and_then(|v| v.as_i64()).unwrap_or_default(),
+                        cols.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                        cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(error = %e, "zones_on_host_lookup_failed_ignoring");
+                Vec::new()
+            }
+        }
+    }
+
     /// The persisted physical identity of every visible zone's device:
     /// `(output_device_id, host, mac)`. Feeds the heartbeat telemetry so the
     /// admin can identify renderer brands from the MAC's OUI. Graceful on
