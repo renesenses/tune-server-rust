@@ -880,28 +880,10 @@ pub(crate) mod tests {
     use super::*;
     use crate::discid::disc_id;
     use crate::simule::contenu_des_secteurs;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// Un dossier temporaire propre au témoin, effacé à la fin.
-    pub(crate) struct Dossier(pub PathBuf);
-    impl Dossier {
-        pub(crate) fn nouveau(nom: &str) -> Dossier {
-            static N: AtomicU32 = AtomicU32::new(0);
-            let p = std::env::temp_dir().join(format!(
-                "tune-cd-{nom}-{}-{}",
-                std::process::id(),
-                N.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&p);
-            std::fs::create_dir_all(&p).unwrap();
-            Dossier(p)
-        }
-    }
-    impl Drop for Dossier {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// Un dossier temporaire propre au témoin, effacé à la fin même sur
+    /// panique (`test_scratch`, #3030).
+    pub(crate) type Dossier = tune_core::test_scratch::ScratchDir;
 
     /// 44 100 Hz en flottant étendu 80 bits.
     const F44100: [u8; 10] = [0x40, 0x0E, 0xAC, 0x44, 0, 0, 0, 0, 0, 0];
@@ -1032,15 +1014,15 @@ pub(crate) mod tests {
 
     /// Un faux volume `cddafs` : `.TOC.plist` et un AIFF par piste audio.
     pub(crate) fn faux_volume(nom: &str, toc: &Toc) -> Dossier {
-        let d = Dossier::nouveau(nom);
-        std::fs::write(d.0.join(FICHIER_TOC), plist_de(toc, true, true)).unwrap();
+        let d = tune_core::test_scratch::scratch_dir(&format!("cd-{nom}"));
+        std::fs::write(d.join(FICHIER_TOC), plist_de(toc, true, true)).unwrap();
         for p in toc.pistes_audio() {
             let fin = toc.fin_de_piste(p.numero).unwrap();
             // Pistes paires en AIFC `sowt`, impaires en AIFF : les deux ordres
             // d'octets passent par le même lecteur.
             let sowt = p.numero % 2 == 0;
             std::fs::write(
-                d.0.join(format!("{} Audio Track.aiff", p.numero)),
+                d.join(format!("{} Audio Track.aiff", p.numero)),
                 aiff(p.debut, fin, sowt, p.numero as u32 * 3),
             )
             .unwrap();
@@ -1234,7 +1216,7 @@ pub(crate) mod tests {
     fn le_lecteur_de_volume_rend_les_secteurs_bruts_a_travers_les_pistes() {
         let toc = petite_toc();
         let v = faux_volume("lecture", &toc);
-        let l = LecteurVolume::sur_dossier(v.0.clone());
+        let l = LecteurVolume::sur_dossier(v.to_path_buf());
         assert_eq!(l.presence(), Presence::Disque);
         assert_eq!(l.lire_toc().unwrap(), toc);
         for (lba, n) in [(32, 1), (32, 24), (130, 24), (320, 20), (400, 20)] {
@@ -1264,7 +1246,7 @@ pub(crate) mod tests {
         use tune_core::source_pcm::FournisseurPcm;
         let toc = petite_toc();
         let v = faux_volume("fournisseur", &toc);
-        let l: Arc<dyn LecteurDisque> = Arc::new(LecteurVolume::sur_dossier(v.0.clone()));
+        let l: Arc<dyn LecteurDisque> = Arc::new(LecteurVolume::sur_dossier(v.to_path_buf()));
         let f = FournisseurCd { lecteur: l };
         let mut flux = f.ouvrir(&source_id(&disc_id(&toc), 2), 0).unwrap();
         assert_eq!(flux.octets, 191 * OCTETS_PAR_SECTEUR as u64);
@@ -1278,8 +1260,8 @@ pub(crate) mod tests {
     fn sans_toc_plist_la_toc_se_deduit_des_fichiers() {
         let toc = petite_toc();
         let v = faux_volume("sans-plist", &toc);
-        std::fs::remove_file(v.0.join(FICHIER_TOC)).unwrap();
-        let vol = VolumeCdda::ouvrir(&v.0).unwrap();
+        std::fs::remove_file(v.join(FICHIER_TOC)).unwrap();
+        let vol = VolumeCdda::ouvrir(&v).unwrap();
         assert_eq!(
             vol.toc.pistes.iter().map(|p| p.debut).collect::<Vec<_>>(),
             vec![0, 108, 299]
@@ -1293,7 +1275,7 @@ pub(crate) mod tests {
     fn l_ejection_est_la_disparition_du_volume() {
         let toc = petite_toc();
         let v = faux_volume("ejection", &toc);
-        let racine = v.0.clone();
+        let racine = v.to_path_buf();
         let l = LecteurVolume::new(
             "lecteur optique",
             move || racine.join(FICHIER_TOC).exists().then(|| racine.clone()),
@@ -1301,7 +1283,7 @@ pub(crate) mod tests {
         );
         let mut s = vec![0; 24 * OCTETS_PAR_SECTEUR];
         l.lire_secteurs(32, 24, &mut s).unwrap();
-        std::fs::remove_dir_all(&v.0).unwrap();
+        std::fs::remove_dir_all(&*v).unwrap();
         assert_eq!(l.presence(), Presence::Vide);
         assert_eq!(l.chemin(), "lecteur optique");
         assert_eq!(l.lire_secteurs(56, 24, &mut s), Err(ErreurCd::AucunDisque));
@@ -1316,10 +1298,10 @@ pub(crate) mod tests {
     fn un_fichier_illisible_est_une_erreur_de_lecture_pas_une_ejection() {
         let toc = petite_toc();
         let v = faux_volume("rayure", &toc);
-        let l = LecteurVolume::sur_dossier(v.0.clone());
+        let l = LecteurVolume::sur_dossier(v.to_path_buf());
         l.lire_toc().unwrap();
         // Le fichier de la piste 3 est tronqué : ses derniers secteurs manquent.
-        let p3 = v.0.join("3 Audio Track.aiff");
+        let p3 = v.join("3 Audio Track.aiff");
         let o = std::fs::read(&p3).unwrap();
         std::fs::write(&p3, &o[..o.len() - 10 * OCTETS_PAR_SECTEUR]).unwrap();
         let mut s = vec![0; 2 * OCTETS_PAR_SECTEUR];
