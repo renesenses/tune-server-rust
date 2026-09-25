@@ -10,7 +10,6 @@ use tracing::info;
 mod open_diagnostic;
 
 use crate::db::engine::{Engine, SqliteDialect};
-use crate::db::verrou_ecriture::{VerrouEcriture, attendre_hors_executeur};
 
 /// Number of read connections in the pool.
 const READ_POOL_SIZE: usize = 3;
@@ -27,9 +26,7 @@ const REVEIL_ATTENTE_LECTURE: Duration = Duration::from_millis(10);
 type Liberation = (Mutex<()>, Condvar);
 
 pub struct SqliteDb {
-    /// La connexion d'écriture, derrière un verrou SURVEILLÉ (#4924) : voir
-    /// [`crate::db::verrou_ecriture`].
-    conn: VerrouEcriture,
+    conn: Arc<Mutex<Connection>>,
     read_pool: Vec<Arc<Mutex<Connection>>>,
     read_counter: Arc<AtomicUsize>,
     liberation: Arc<Liberation>,
@@ -270,7 +267,7 @@ impl SqliteDb {
         );
 
         Ok(Self {
-            conn: VerrouEcriture::new(Arc::new(Mutex::new(conn))),
+            conn: Arc::new(Mutex::new(conn)),
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
@@ -289,17 +286,14 @@ impl SqliteDb {
         let conn = Arc::new(Mutex::new(conn));
         let read_pool = vec![conn.clone(); READ_POOL_SIZE];
         Ok(Self {
-            conn: VerrouEcriture::new(conn),
+            conn,
             read_pool,
             read_counter: Arc::new(AtomicUsize::new(0)),
             liberation: Arc::new((Mutex::new(()), Condvar::new())),
         })
     }
 
-    /// La connexion d'écriture. `connection().lock()` rend une garde qui se
-    /// déréférence en [`Connection`] ; l'attente, quand elle est prise, se
-    /// fait hors de l'exécuteur tokio et la détention est surveillée (#4924).
-    pub fn connection(&self) -> &VerrouEcriture {
+    pub fn connection(&self) -> &Arc<Mutex<Connection>> {
         &self.conn
     }
 
@@ -339,24 +333,20 @@ impl SqliteDb {
             return emprunt(garde, Duration::ZERO);
         }
         let debut = Instant::now();
-        // L'attente d'un lecteur libre ne doit pas plus garder un cœur de
-        // l'exécuteur que celle de l'écrivain (#4924).
-        attendre_hors_executeur(|| {
-            let mut signal = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
-            loop {
-                // Sous le verrou du signal : une libération survenue entre cet
-                // essai et le `wait` ne peut pas passer inaperçue.
-                if let Some(garde) = premiere_libre() {
-                    return emprunt(garde, debut.elapsed());
-                }
-                signal = self
-                    .liberation
-                    .1
-                    .wait_timeout(signal, REVEIL_ATTENTE_LECTURE)
-                    .unwrap_or_else(|e| e.into_inner())
-                    .0;
+        let mut signal = self.liberation.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            // Sous le verrou du signal : une libération survenue entre cet
+            // essai et le `wait` ne peut pas passer inaperçue.
+            if let Some(garde) = premiere_libre() {
+                return emprunt(garde, debut.elapsed());
             }
-        })
+            signal = self
+                .liberation
+                .1
+                .wait_timeout(signal, REVEIL_ATTENTE_LECTURE)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
     }
 
     pub fn execute(
