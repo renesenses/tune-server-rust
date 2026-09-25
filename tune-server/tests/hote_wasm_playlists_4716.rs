@@ -355,6 +355,7 @@ impl StreamingService for ServiceDeBanc {
             name: "Mes classiques".into(),
             description: None,
             cover_path: None,
+            covers: Vec::new(),
             track_count: 1,
             owner: None,
         }])
