@@ -91,10 +91,17 @@ async fn cible_recue(state: &AppState) -> (u64, TransportState, u64) {
 /// Une zone source qui joue une piste WAV réelle à 80 s, et une zone cible
 /// DLNA dont le renderer se comporte comme le Rygel du Devialet.
 async fn source_a_80_s() -> (axum::Router, AppState, i64, i64, tempfile::TempDir) {
-    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // `do_transfer` persiste la file de la cible à côté de `config.db_path`
+    // (`queue_state/`) : on la pose dans le dossier jetable, sinon ce dossier
+    // atterrirait dans le répertoire de la caisse.
+    let dir = tempfile::tempdir().unwrap();
+    let config = tune_server::config::TuneConfig {
+        db_path: dir.path().join("tune.db").to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let state = AppState::new(":memory:", 0, config).unwrap();
     let app = tune_server::routes::router(state.clone());
 
-    let dir = tempfile::tempdir().unwrap();
     let chemin = dir.path().join("piste.wav");
     std::fs::write(&chemin, wav_de_silence(DUREE_PISTE_MS)).unwrap();
     state
