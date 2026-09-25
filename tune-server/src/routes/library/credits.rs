@@ -71,16 +71,16 @@ pub(super) async fn track_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
-    // On Postgres the mirror schema stores integer-semantic columns as TEXT, so
-    // binding an i64 here made the comparison `text = bigint`, which Postgres
-    // rejects ("operator does not exist: text = bigint") → 500. Bind the id as a
-    // string: `text = text` on PG, and SQLite numeric affinity handles it too.
-    let id_str = id.to_string();
+    // #4984 — `track_credits.track_id` est un entier sur PostgreSQL : BIGINT dès
+    // `001_initial_schema.sql`, et `012_integer_id_columns.sql` a converti les
+    // bases migrées depuis SQLite. Lier l'id en TEXTE faisait `bigint = text`,
+    // que PostgreSQL refuse (« operator does not exist ») → 500 sur toute base
+    // PG. On lie l'entier, comme partout ailleurs.
     let rows = state
         .backend
         .query_many(
             "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
-            &[&id_str as &dyn ToSqlValue],
+            &[&id as &dyn ToSqlValue],
         )
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
@@ -105,17 +105,24 @@ pub(super) async fn artist_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
-    // Bind as string — see track_credits above (Postgres TEXT columns vs bigint).
+    // #4984 — `artists.id` est BIGINT sur PostgreSQL : l'entier s'y lie tel
+    // quel. `track_credits.artist_id` peut, lui, être resté TEXT sur une base
+    // migrée depuis SQLite (conversion gardée de la migration 012) : on le
+    // compare en texte sur PostgreSQL, comme `credits_release::artiste`.
     let id_str = id.to_string();
+    let cle_fiche = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => "CAST(tc.artist_id AS TEXT) = ?",
+        tune_core::db::engine::Engine::Sqlite => "tc.artist_id = ?",
+    };
+    let sql = format!(
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
+         FROM track_credits tc \
+         WHERE {cle_fiche} OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
+         ORDER BY tc.track_id, tc.position"
+    );
     let rows = state
         .backend
-        .query_many(
-            "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
-             FROM track_credits tc \
-             WHERE tc.artist_id = ? OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
-             ORDER BY tc.track_id, tc.position",
-            &[&id_str as &dyn ToSqlValue, &id_str as &dyn ToSqlValue],
-        )
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue, &id as &dyn ToSqlValue])
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
         .into_iter()

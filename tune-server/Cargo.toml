@@ -978,3 +978,10 @@ path = "tests/identification_lot_4805.rs"
 [[test]]
 name = "reidentification_album"
 path = "tests/reidentification_album.rs"
+
+# #4984 — les crédits de piste sur PostgreSQL : écriture, purge et relecture
+# par le vrai routeur. `track_id` y est BIGINT ; il était lié en texte.
+[[test]]
+name = "pg_credits_4984"
+path = "tests/pg_credits_4984.rs"
+required-features = ["postgres"]
