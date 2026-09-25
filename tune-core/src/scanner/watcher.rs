@@ -727,9 +727,12 @@ mod tests {
             ),
             evp(EventKind::Create(CreateKind::Any), &pochette),
         ]));
-        assert!(
-            vus.is_empty(),
-            "une pochette présente ne dit rien : {vus:?}"
+        // #5034 — elle est désormais RELAYÉE, mais comme image de pochette :
+        // jamais comme un dossier.
+        assert_eq!(
+            vus.values().collect::<Vec<_>>(),
+            vec![&ChangeType::ImageDePochette],
+            "une pochette n'est jamais un dossier : {vus:?}"
         );
         // Le moteur a dit « fichier » : pas de dossier, même disparu.
         let vus = genres(&rejouer_evenements_notify(vec![evp(
