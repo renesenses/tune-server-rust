@@ -250,8 +250,25 @@ pub fn evict() {
 
 /// Eviction with an explicit byte cap (the testable core of [`evict`]).
 fn evict_with_cap(cap: u64) {
-    let dir = std::env::temp_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    evict_in(
+        &std::env::temp_dir(),
+        cap,
+        crate::chemins_de_travail::uid_courant(),
+    );
+}
+/// Le cœur de l'éviction, avec son dossier et son propriétaire **passés**.
+///
+/// Les rendus vivent à plat dans `temp_dir()`, que d'autres comptes de la même
+/// machine partagent (#4770). Seuls les fichiers qui appartiennent à `uid`
+/// comptent dans le total et peuvent être supprimés : sans ce filtre, le
+/// plafond comparait un total gonflé par le cache du voisin, et, sur un
+/// `TMPDIR` non sticky, la boucle effaçait les fichiers d'un autre serveur.
+///
+/// `uid` est un paramètre, pas un appel à `uid_courant()` ici même : c'est ce
+/// qui permet au témoin de jouer « un autre compte » sans avoir deux comptes.
+/// Sous Windows, `temp_dir()` est déjà propre au compte : pas de filtre.
+fn evict_in(dir: &std::path::Path, cap: u64, uid: u32) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -268,7 +285,7 @@ fn evict_with_cap(cap: u64) {
             continue;
         }
         if let Ok(m) = entry.metadata() {
-            if !m.is_file() {
+            if !m.is_file() || !appartient_a(&m, uid) {
                 continue;
             }
             total += m.len();
@@ -301,6 +318,16 @@ fn evict_with_cap(cap: u64) {
             "transcode_cache_evicted"
         );
     }
+}
+/// Vrai quand le fichier décrit par `m` appartient au compte `uid`.
+#[cfg(unix)]
+fn appartient_a(m: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    m.uid() == uid
+}
+#[cfg(not(unix))]
+fn appartient_a(_m: &std::fs::Metadata, _uid: u32) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -478,5 +505,42 @@ mod tests {
         // EVICT_MIN_AGE_SECS so it must still survive.
         evict_with_cap(0);
         assert!(p.exists(), "recent file must not be evicted");
+    }
+    /// Témoin de #4770 : l'éviction ne touche pas le cache d'un AUTRE compte.
+    ///
+    /// Un seul compte suffit : le fichier est à nous, et on évince « au nom »
+    /// d'un autre UID. Deux assertions, dans cet ordre :
+    /// 1. au nom d'un autre compte, un rendu vieux de deux heures sous un
+    ///    plafond nul SURVIT — sans le filtre, il est supprimé ;
+    /// 2. au nom de son propriétaire, le même fichier PART — sans cette
+    ///    contre-partie, le test passerait aussi si l'éviction ne supprimait
+    ///    plus rien du tout.
+    #[cfg(unix)]
+    #[test]
+    fn eviction_ne_touche_pas_le_cache_d_un_autre_compte() {
+        let dossier = crate::test_scratch::scratch_dir("tcache-eviction-4770");
+        let rendu = dossier.path().join(format!("{CACHE_PREFIX}voisin.flac"));
+        std::fs::write(&rendu, vec![0u8; 4096]).unwrap();
+        let vieux = SystemTime::now() - Duration::from_secs(2 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&rendu)
+            .unwrap()
+            .set_modified(vieux)
+            .unwrap();
+        let moi = crate::chemins_de_travail::uid_courant();
+        let autre = moi.wrapping_add(1);
+
+        evict_in(dossier.path(), 0, autre);
+        assert!(
+            rendu.exists(),
+            "l'éviction d'un autre compte a supprimé un rendu qui n'est pas à lui"
+        );
+
+        evict_in(dossier.path(), 0, moi);
+        assert!(
+            !rendu.exists(),
+            "le propriétaire doit pouvoir évincer son propre rendu (sinon le témoin ne prouve rien)"
+        );
     }
 }
