@@ -5070,6 +5070,7 @@ mod reprise_714_sink_strict_de_bout_en_bout {
             "un seul essai, au MIME de la session"
         );
     }
+}
 
 /// Le mandataire doit répondre aux reprises `Range` d'un renderer Lavf comme
 /// une session de FICHIER : un vrai 206 depuis N, `Content-Range` exact,
