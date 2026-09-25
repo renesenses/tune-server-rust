@@ -91,6 +91,21 @@
 //! artiste fantôme de plus — exactement le défaut que `artist_split` existe
 //! pour réparer.
 //!
+//! # 🔴 La GARDE : une correction ne doit pas appauvrir (Bertrand, 25/09/2026)
+//!
+//! **Une correction n'a lieu que si les crédits ne portent pas MOINS de noms
+//! que la colonne.** Sinon la piste n'est **pas touchée** — ni la colonne, ni
+//! le fichier — et le cas est consigné avec ses deux valeurs.
+//!
+//! C'est un **comptage**, pas une comparaison de noms, et la nuance décide de
+//! tout : une garde qui exigerait que chaque nom de la colonne se retrouve
+//! dans les crédits bloquerait **sept des neuf bonnes corrections**
+//! (`GORECKI` ne survit pas à `Henryk Mikołaj Górecki`). Voir
+//! [`correction_appauvrissante`], qui porte la règle, ses six cas mesurés, et
+//! surtout **pourquoi elle est un pis-aller assumé** : le comptage ne sait pas
+//! distinguer « plusieurs auteurs » de « un auteur écrit deux fois »
+//! (`Verdi Giuseppe (1813-1901)/Giuseppe Verdi`).
+//!
 //! # ⚠️ Ce que la décision coûte, mesuré et NON corrigé (25/09/2026)
 //!
 //! La sélection de ce module, rejouée en lecture seule contre le .18, rend
@@ -106,15 +121,16 @@
 //! J. Joplin & G. Mekler                    ==>  Gabriel Mekler         ← 2 noms → 1
 //! ```
 //!
-//! **Sur les 9, deux corrections font PERDRE des co-auteurs** : la colonne y
-//! est plus riche que les crédits, qui sont incomplets pour ces deux pistes.
-//! Ira Gershwin, DuBose Heyward et Janis Joplin disparaissent.
+//! **Sur les 9, deux corrections feraient PERDRE des co-auteurs** : la colonne
+//! y est plus riche que les crédits, incomplets pour ces deux pistes. Ira
+//! Gershwin, DuBose Heyward et Janis Joplin y disparaîtraient.
 //!
-//! La décision de Bertrand n'est pas relitigée : les crédits font foi, la
-//! correction a lieu. Elle a seulement lieu **en le disant** —
-//! [`correction_appauvrissante`] pose un `warn!` par piste et un compte à part
-//! (`corrige_moins_de_noms`) dans le `GET`. C'est un compteur, jamais une
-//! garde : rien n'est retenu, rien n'est sauté.
+//! Ces deux-là sont **retenues par la garde** : rien n'est écrit pour elles.
+//! Les sept autres sont corrigées. Les deux retenues sont consignées — `warn!`
+//! au journal **et** liste dans l'état persisté (`retenues`), avec
+//! l'identifiant, le titre, la valeur de la colonne et celle des crédits côte
+//! à côte. La liste se relit par le `GET` **sans relancer la passe** : c'est
+//! pour ça qu'elle vit dans `settings` et non seulement dans le journal.
 //!
 //! # 🔴 La mesure qui contredit la convention, et pourquoi elle ne l'emporte pas
 //!
@@ -201,6 +217,9 @@ const JALON_AVANCEMENT: usize = 25;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidat {
     pub(crate) id: i64,
+    /// Le titre de la piste. Porté jusqu'ici uniquement pour que la liste des
+    /// retenues soit lisible sans repasser par la base.
+    pub(crate) titre: String,
     pub(crate) chemin: String,
     /// `tracks.composer` tel qu'il est, déjà rogné. `None` = colonne vide.
     pub(crate) colonne: Option<String>,
@@ -226,6 +245,10 @@ pub(crate) struct Inventaire {
     pub(crate) a_remplir: usize,
     pub(crate) a_corriger: usize,
     pub(crate) inchange: usize,
+    /// Divergences que la garde [`correction_appauvrissante`] va RETENIR. Elles
+    /// ne sont pas dans `a_corriger` : rien ne sera écrit pour elles, et le
+    /// coût annoncé doit le dire avant de lancer, pas après.
+    pub(crate) retenues: usize,
 }
 
 impl Inventaire {
@@ -253,7 +276,7 @@ impl Inventaire {
 pub(crate) fn sql_candidats(engine: tune_core::db::engine::Engine) -> String {
     let m = |i: usize| crate::routes::versions::marqueur(engine, i);
     format!(
-        "SELECT t.id, t.file_path, t.composer, c.artist_name, c.position, c.id \
+        "SELECT t.id, t.file_path, t.composer, c.artist_name, c.position, c.id, t.title \
          FROM tracks t \
          JOIN track_credits c ON c.track_id = t.id \
          WHERE c.role = 'composer' \
@@ -302,26 +325,84 @@ fn noms_distincts(valeur: &str) -> usize {
         .max(1)
 }
 
-/// 🔴 Cette correction fait-elle PERDRE des co-auteurs ?
+/// 🔴 **LA GARDE** — cette correction ferait-elle PERDRE des co-auteurs ?
 ///
-/// Mesuré sur le .18 le 25/09/2026 : **2 des 9 divergences** sont dans ce cas,
-/// parce que les crédits, eux, sont incomplets pour ces pistes —
+/// Quand elle rend `true`, la piste n'est **pas** touchée : ni la colonne, ni
+/// le fichier. Le cas est consigné avec ses deux valeurs, pour être repris à
+/// la main.
+///
+/// # Un COMPTAGE, jamais une comparaison de noms
+///
+/// La règle de Bertrand (25/09/2026) : *une correction n'a lieu que si les
+/// crédits ne portent pas MOINS de noms que la colonne.* Le comptage est
+/// l'essentiel, et il n'est pas un détail d'implémentation : une garde qui
+/// exigerait que chaque nom de la colonne « survive » dans les crédits
+/// bloquerait **sept des neuf bonnes corrections** — `GORECKI` ne survit pas à
+/// `Henryk Mikołaj Górecki`, ni `R. Barrett` à `Richard Barrett`, ni
+/// `Billy Hills` à `Billy Hill`. Or ce sont exactement celles qu'on veut.
+///
+/// Sur les neuf divergences mesurées :
 ///
 /// ```text
-/// George Gershwin/Ira Gershwin/D. Heyward  ==>  George Gershwin
-/// J. Joplin & G. Mekler                    ==>  Gabriel Mekler
+/// GORECKI (×4)                             1 → 1   corrigé
+/// Sheffield Lab                            1 → 1   corrigé
+/// R. Barrett                               1 → 1   corrigé
+/// Billy Hills                              1 → 2   corrigé
+/// George Gershwin/Ira Gershwin/D. Heyward  3 → 1   RETENU
+/// J. Joplin & G. Mekler                    2 → 1   RETENU
 /// ```
 ///
-/// La décision de Bertrand est appliquée telle quelle : les crédits font foi,
-/// la correction a lieu. Mais elle a lieu **en le disant** — un `warn!` par
-/// piste et un compte à part dans le `GET`. Un appauvrissement silencieux sur
-/// 22 % des corrections serait indiscernable d'une amélioration, et personne
-/// ne reviendrait dessus.
+/// # ⚠️ Pourquoi c'est un pis-aller ASSUMÉ, et non une solution
 ///
-/// Ne change **rien** au comportement : c'est un compteur, pas une garde.
+/// Le comptage **ne distingue pas** « plusieurs auteurs » de « un auteur écrit
+/// plusieurs fois ». Mesuré sur le .18 : **66 pistes locales sur 9 112**
+/// (0,7 % — c'est toute l'exposition) ont une colonne à plusieurs noms, et
+/// parmi elles :
+///
+/// ```text
+/// Verdi Giuseppe (1813-1901)/Giuseppe Verdi
+/// Verdi, Guiseppe (1813-1901)/Giuseppe Verdi     ← avec la faute, en prime
+/// Primerose/ Mills
+/// ```
+///
+/// C'est **le même homme deux fois**. Des crédits qui rendraient
+/// `Giuseppe Verdi` seul **corrigeraient** au lieu d'appauvrir — et la garde
+/// les retiendra quand même. Bertrand le sait et l'accepte : ces doublons
+/// restent à traiter à la main.
+///
+/// 🔴 **Que personne ne prenne donc cette garde pour un jugement de qualité.**
+/// Elle ne dit pas « les crédits sont moins bons » ; elle dit « les crédits
+/// portent moins de noms, va voir ». La liste des retenues existe pour ça.
+///
+/// (Répartition par genre de ces 66 : Electro 16, Jazz 11, Classique 10,
+/// Pop-Rock 8, Rock 7, Pop 7. Aucun genre ne domine — il n'y a aucune règle à
+/// en tirer, et c'est pour éviter qu'on la cherche que le chiffre est ici.)
 pub(crate) fn correction_appauvrissante(colonne: &str, attendu: &str) -> bool {
     noms_distincts(colonne) > noms_distincts(attendu)
 }
+
+/// Une divergence que la garde a RETENUE, telle que le `GET` la rend et que le
+/// journal la nomme : les **deux valeurs côte à côte**, plus de quoi retrouver
+/// la piste. Sans les deux, la liste n'est pas exploitable à la main.
+fn retenue_en_json(candidat: &Candidat) -> Value {
+    json!({
+        "track_id": candidat.id,
+        "titre": candidat.titre,
+        "colonne": candidat.colonne.as_deref().unwrap_or(""),
+        "credits": candidat.attendu,
+        "noms_colonne": noms_distincts(candidat.colonne.as_deref().unwrap_or("")),
+        "noms_credits": noms_distincts(&candidat.attendu),
+    })
+}
+
+/// Plafond de la liste consignée dans l'état.
+///
+/// L'état vit dans une ligne de `settings` : une liste non bornée y ferait une
+/// valeur de plusieurs mégaoctets sur une bibliothèque abîmée, relue à chaque
+/// `GET`. Le **compte**, lui, n'est jamais tronqué — c'est la liste qui l'est,
+/// et l'état le dit (`retenues_tronquees`). 200 tient très large : l'exposition
+/// totale mesurée sur le .18 est de 66 pistes, et seules 2 sont retenues.
+const RETENUES_LISTEES_MAX: usize = 200;
 
 /// Le verdict d'une piste : remplir, corriger, ou ne rien faire.
 ///
@@ -353,6 +434,7 @@ type GroupeDeCredits = (String, Option<String>, Vec<(i64, i64, String)>);
 pub(crate) fn candidats_depuis_lignes(lignes: &[Vec<SqlValue>]) -> Vec<Candidat> {
     // (piste, chemin, colonne) → crédits [(position, id_credit, nom)]
     let mut ordre: Vec<i64> = Vec::new();
+    let mut titres: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     let mut par_piste: std::collections::HashMap<i64, GroupeDeCredits> =
         std::collections::HashMap::new();
 
@@ -365,6 +447,12 @@ pub(crate) fn candidats_depuis_lignes(lignes: &[Vec<SqlValue>]) -> Vec<Candidat>
             continue;
         };
         let colonne = ligne.get(2).and_then(SqlValue::as_string);
+        titres.entry(id).or_insert_with(|| {
+            ligne
+                .get(6)
+                .and_then(SqlValue::as_string)
+                .unwrap_or_default()
+        });
         let position = ligne.get(4).and_then(SqlValue::as_i64).unwrap_or(0);
         let id_credit = ligne.get(5).and_then(SqlValue::as_i64).unwrap_or(0);
         let entree = par_piste.entry(id).or_insert_with(|| {
@@ -387,6 +475,7 @@ pub(crate) fn candidats_depuis_lignes(lignes: &[Vec<SqlValue>]) -> Vec<Candidat>
         }
         sortie.push(Candidat {
             id,
+            titre: titres.remove(&id).unwrap_or_default(),
             chemin,
             colonne,
             attendu,
@@ -408,7 +497,13 @@ fn inventaire(state: &AppState, curseur: i64) -> (Inventaire, Vec<Candidat>) {
     for c in &candidats {
         match verdict(c.colonne.as_deref(), &c.attendu) {
             Verdict::Rempli => inv.a_remplir += 1,
-            Verdict::Corrige => inv.a_corriger += 1,
+            Verdict::Corrige => {
+                if correction_appauvrissante(c.colonne.as_deref().unwrap_or(""), &c.attendu) {
+                    inv.retenues += 1;
+                } else {
+                    inv.a_corriger += 1;
+                }
+            }
             Verdict::Inchange => inv.inchange += 1,
         }
     }
@@ -423,15 +518,20 @@ struct Comptes {
     inchange: usize,
     sans_fichier: usize,
     echec_ecriture: usize,
-    /// Sous-ensemble de `corrige` : les corrections qui font PERDRE des noms.
-    /// Informatif — voir [`correction_appauvrissante`].
-    corrige_moins_de_noms: usize,
+    /// Les divergences que la GARDE a retenues : rien n'a été écrit pour
+    /// elles, ni colonne ni fichier. Voir [`correction_appauvrissante`].
+    retenu_moins_de_noms: usize,
     derniere_piste: i64,
 }
 
 impl Comptes {
     fn traitees(&self) -> usize {
-        self.rempli + self.corrige + self.inchange + self.sans_fichier + self.echec_ecriture
+        self.rempli
+            + self.corrige
+            + self.inchange
+            + self.sans_fichier
+            + self.echec_ecriture
+            + self.retenu_moins_de_noms
     }
 }
 
@@ -451,7 +551,9 @@ fn etat_au_repos() -> Value {
         "inchange": 0,
         "sans_fichier": 0,
         "echec_ecriture": 0,
-        "corrige_moins_de_noms": 0,
+        "retenu_moins_de_noms": 0,
+        "retenues": [],
+        "retenues_tronquees": false,
         "derniere_piste": 0,
         "raison": Value::Null,
     })
@@ -464,6 +566,7 @@ fn etat_en_json(
     status: &str,
     total: usize,
     c: &Comptes,
+    retenues: &[Value],
     raison: Option<&str>,
 ) -> Value {
     json!({
@@ -476,7 +579,12 @@ fn etat_en_json(
         "inchange": c.inchange,
         "sans_fichier": c.sans_fichier,
         "echec_ecriture": c.echec_ecriture,
-        "corrige_moins_de_noms": c.corrige_moins_de_noms,
+        "retenu_moins_de_noms": c.retenu_moins_de_noms,
+        // 🔴 La LISTE, pas seulement le compte : l'exigence est qu'on puisse
+        //    retrouver les cas après coup SANS relancer la passe. Elle vit donc
+        //    dans l'état persisté, à côté des compteurs.
+        "retenues": retenues,
+        "retenues_tronquees": c.retenu_moins_de_noms > retenues.len(),
         "derniere_piste": c.derniere_piste,
         "raison": raison,
     })
@@ -548,6 +656,7 @@ pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
         o.insert("a_remplir".into(), json!(inv.a_remplir));
         o.insert("a_corriger".into(), json!(inv.a_corriger));
         o.insert("deja_conformes".into(), json!(inv.inchange));
+        o.insert("retenues_prevues".into(), json!(inv.retenues));
         o.insert("pistes_concernees".into(), json!(inv.pistes_concernees()));
         o.insert("curseur_de_reprise".into(), json!(curseur));
         o.insert(
@@ -615,7 +724,7 @@ pub(crate) async fn lancer(
     // `running`, pas l'état de la passe précédente.
     ecrire_etat(
         &state.backend,
-        &etat_en_json(&task_id, "running", total, &comptes, None),
+        &etat_en_json(&task_id, "running", total, &comptes, &[], None),
     );
 
     info!(
@@ -624,6 +733,7 @@ pub(crate) async fn lancer(
         curseur,
         a_remplir = inv.a_remplir,
         a_corriger = inv.a_corriger,
+        retenues_prevues = inv.retenues,
         "compositeur_depuis_credits_demarre"
     );
 
@@ -651,6 +761,8 @@ pub(crate) async fn lancer(
             "a_remplir": inv.a_remplir,
             "a_corriger": inv.a_corriger,
             "deja_conformes": inv.inchange,
+            // Ce que la GARDE va retenir : annoncé AVANT, pas découvert après.
+            "retenues_prevues": inv.retenues,
             "curseur": curseur,
             "statut": "GET /library/composer-from-credits",
             "arreter": "POST /system/taches-de-fond/enrichment/pause",
@@ -664,6 +776,10 @@ pub(crate) async fn lancer(
 async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mut c: Comptes) {
     let total = candidats.len();
     let taches = state.background_tasks.clone();
+    // Les cas que la garde retient, consignés au fil de l'eau : ils partent
+    // dans l'état à chaque publication, donc une passe interrompue laisse
+    // déjà lisible ce qu'elle a retenu jusque-là.
+    let mut retenues: Vec<Value> = Vec::new();
 
     for candidat in candidats {
         // La frontière de pause, en TÊTE de boucle : la piste précédente est
@@ -679,7 +795,14 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
             );
             ecrire_etat(
                 &state.backend,
-                &etat_en_json(&task_id, "paused", total, &c, Some("pause_utilisateur")),
+                &etat_en_json(
+                    &task_id,
+                    "paused",
+                    total,
+                    &c,
+                    &retenues,
+                    Some("pause_utilisateur"),
+                ),
             );
             return;
         }
@@ -688,8 +811,40 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
         if verdict == Verdict::Inchange {
             c.inchange += 1;
             c.derniere_piste = candidat.id;
-            publier(&taches, &state, &task_id, total, &c);
+            publier(&taches, &state, &task_id, total, &c, &retenues);
             continue;
+        }
+
+        // 🔴 LA GARDE, et elle est AVANT toute écriture.
+        //
+        //    Une correction n'a lieu que si les crédits ne portent pas MOINS de
+        //    noms que la colonne. Quand ils en portent moins, on ne touche à
+        //    RIEN — ni la colonne, ni le fichier — et le cas est consigné avec
+        //    ses deux valeurs pour être repris à la main.
+        //
+        //    Sa place ici n'est pas cosmétique : posée après `write_tags`, elle
+        //    aurait déjà gravé le fichier appauvri, et la « garde » n'aurait
+        //    plus gardé que la base.
+        if verdict == Verdict::Corrige {
+            let avant = candidat.colonne.as_deref().unwrap_or("");
+            if correction_appauvrissante(avant, &candidat.attendu) {
+                c.retenu_moins_de_noms += 1;
+                if retenues.len() < RETENUES_LISTEES_MAX {
+                    retenues.push(retenue_en_json(&candidat));
+                }
+                warn!(
+                    track_id = candidat.id,
+                    titre = %candidat.titre,
+                    colonne = avant,
+                    credits = %candidat.attendu,
+                    noms_colonne = noms_distincts(avant),
+                    noms_credits = noms_distincts(&candidat.attendu),
+                    "compositeur_retenu_les_credits_portent_moins_de_noms"
+                );
+                c.derniere_piste = candidat.id;
+                publier(&taches, &state, &task_id, total, &c, &retenues);
+                continue;
+            }
         }
 
         // 🔴 Le FICHIER d'abord, la colonne ensuite.
@@ -709,7 +864,7 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
                 c.sans_fichier += 1;
                 c.derniere_piste = candidat.id;
                 debug!(track_id = candidat.id, chemin = %candidat.chemin, "compositeur_fichier_introuvable");
-                publier(&taches, &state, &task_id, total, &c);
+                publier(&taches, &state, &task_id, total, &c, &retenues);
                 continue;
             }
             Err(e) => {
@@ -724,7 +879,7 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
                     error = %e,
                     "compositeur_gravure_echouee"
                 );
-                publier(&taches, &state, &task_id, total, &c);
+                publier(&taches, &state, &task_id, total, &c, &retenues);
                 continue;
             }
         }
@@ -741,29 +896,20 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
         match verdict {
             Verdict::Rempli => c.rempli += 1,
             Verdict::Corrige => {
+                // La garde est passée plus haut : arriver ici, c'est que les
+                // crédits ne portent pas moins de noms que la colonne.
                 c.corrige += 1;
-                let avant = candidat.colonne.as_deref().unwrap_or("");
-                if correction_appauvrissante(avant, &candidat.attendu) {
-                    c.corrige_moins_de_noms += 1;
-                    warn!(
-                        track_id = candidat.id,
-                        avant,
-                        apres = %candidat.attendu,
-                        "compositeur_corrige_en_perdant_des_noms"
-                    );
-                } else {
-                    info!(
-                        track_id = candidat.id,
-                        avant,
-                        apres = %candidat.attendu,
-                        "compositeur_corrige"
-                    );
-                }
+                info!(
+                    track_id = candidat.id,
+                    avant = candidat.colonne.as_deref().unwrap_or(""),
+                    apres = %candidat.attendu,
+                    "compositeur_corrige"
+                );
             }
             Verdict::Inchange => unreachable!("traité plus haut"),
         }
         c.derniere_piste = candidat.id;
-        publier(&taches, &state, &task_id, total, &c);
+        publier(&taches, &state, &task_id, total, &c, &retenues);
     }
 
     info!(
@@ -774,7 +920,7 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
         inchange = c.inchange,
         sans_fichier = c.sans_fichier,
         echec_ecriture = c.echec_ecriture,
-        corrige_moins_de_noms = c.corrige_moins_de_noms,
+        retenu_moins_de_noms = c.retenu_moins_de_noms,
         "compositeur_depuis_credits_termine"
     );
     taches.update_progress(TACHE, total as u64, total as u64, "Compositeur");
@@ -783,7 +929,7 @@ async fn executer(state: AppState, task_id: String, candidats: Vec<Candidat>, mu
     c.derniere_piste = 0;
     ecrire_etat(
         &state.backend,
-        &etat_en_json(&task_id, "done", total, &c, None),
+        &etat_en_json(&task_id, "done", total, &c, &retenues, None),
     );
 }
 
@@ -797,6 +943,7 @@ fn publier(
     task_id: &str,
     total: usize,
     c: &Comptes,
+    retenues: &[Value],
 ) {
     let traitees = c.traitees();
     if !traitees.is_multiple_of(JALON_AVANCEMENT) {
@@ -805,7 +952,7 @@ fn publier(
     taches.update_progress(TACHE, traitees as u64, total as u64, "Compositeur");
     ecrire_etat(
         &state.backend,
-        &etat_en_json(task_id, "running", total, c, None),
+        &etat_en_json(task_id, "running", total, c, retenues, None),
     );
 }
 
@@ -850,7 +997,18 @@ mod tests {
         composer: Option<&str>,
         source: Option<&str>,
     ) {
-        let titre = format!("piste {id}");
+        piste_titree(s, id, &format!("piste {id}"), chemin, composer, source);
+    }
+
+    fn piste_titree(
+        s: &AppState,
+        id: i64,
+        titre: &str,
+        chemin: Option<&str>,
+        composer: Option<&str>,
+        source: Option<&str>,
+    ) {
+        let titre = titre.to_string();
         let chemin = chemin.map(str::to_string);
         let composer = composer.map(str::to_string);
         let source = source.map(str::to_string);
@@ -985,11 +1143,16 @@ mod tests {
         );
     }
 
-    /// ⚠️ Les DEUX corrections du .18 qui font perdre des co-auteurs sont
-    /// reconnues ; les sept autres ne sont pas signalées à tort. Le témoin
-    /// porte les valeurs réelles, relevées en lecture seule le 25/09/2026.
+    /// 🔴 La règle de la garde est un COMPTAGE, et ce témoin le prouve sur les
+    /// neuf divergences réelles du .18 (relevées en lecture seule le
+    /// 25/09/2026) : deux retenues, sept laissées passer.
+    ///
+    /// La deuxième moitié est la plus importante : une garde écrite comme une
+    /// comparaison de NOMS — « chaque nom de la colonne doit se retrouver dans
+    /// les crédits » — bloquerait sept des neuf bonnes corrections. Le témoin
+    /// nomme donc chacune d'elles.
     #[test]
-    fn une_correction_qui_perd_des_co_auteurs_est_reconnue() {
+    fn la_garde_compte_les_noms_et_ne_compare_pas_les_noms() {
         // Les deux vraies : la colonne est plus riche que les crédits.
         assert!(correction_appauvrissante(
             "George Gershwin/Ira Gershwin/D. Heyward",
@@ -999,18 +1162,37 @@ mod tests {
             "J. Joplin & G. Mekler",
             "Gabriel Mekler"
         ));
-        // Les sept autres : aucune perte, aucun signalement.
+        // Les sept autres passent. AUCUN de ces quatre couples ne survivrait à
+        // une garde qui comparerait les noms au lieu de les compter : `GORECKI`
+        // n'est pas `Henryk Mikołaj Górecki`, `R. Barrett` n'est pas
+        // `Richard Barrett`, `Billy Hills` n'est pas `Billy Hill`. C'est
+        // exactement ce qu'on veut corriger.
         for (avant, apres) in [
-            ("Billy Hills", "Peter de Rose; Billy Hill"),
-            ("Sheffield Lab", "Robbie Buchanan"),
-            ("GORECKI", "Henryk Mikołaj Górecki"),
-            ("R. Barrett", "Richard Barrett"),
+            ("Billy Hills", "Peter de Rose; Billy Hill"), // 1 → 2
+            ("Sheffield Lab", "Robbie Buchanan"),         // 1 → 1
+            ("GORECKI", "Henryk Mikołaj Górecki"),        // 1 → 1
+            ("R. Barrett", "Richard Barrett"),            // 1 → 1
         ] {
             assert!(
                 !correction_appauvrissante(avant, apres),
-                "{avant} → {apres} signalé à tort comme appauvrissant"
+                "{avant} → {apres} retenu à tort : la garde compare les noms au \
+                 lieu de les compter, et bloque une bonne correction"
             );
         }
+
+        // ⚠️ Le pis-aller assumé, écrit noir sur blanc : le comptage ne sait
+        //    PAS qu'il s'agit du même homme deux fois. Ce témoin fige le fait
+        //    que la garde retient ce cas — pour que personne ne la prenne pour
+        //    un jugement de qualité, et pour que le jour où on saura replier
+        //    les doublons, l'assertion change AVEC la règle.
+        assert!(
+            correction_appauvrissante(
+                "Verdi Giuseppe (1813-1901)/Giuseppe Verdi",
+                "Giuseppe Verdi"
+            ),
+            "si ce cas cesse d'être retenu, la garde a gagné un repli sur les \
+             doublons : mettre la doc du module à jour avec"
+        );
         // 🔴 La virgule n'est PAS une marque de pluriel : « Grover Washington,
         // Jr. » est un seul nom, et le compter pour deux ferait un faux
         // signalement à chaque suffixe générationnel.
@@ -1106,7 +1288,8 @@ mod tests {
             Inventaire {
                 a_remplir: 1,
                 a_corriger: 1,
-                inchange: 1
+                inchange: 1,
+                retenues: 0
             }
         );
         assert_eq!(inv.pistes_concernees(), 2, "deux fichiers seront réécrits");
@@ -1198,7 +1381,7 @@ mod tests {
         assert_eq!(etat["inchange"], 1, "{etat}");
         assert_eq!(etat["sans_fichier"], 1, "{etat}");
         assert_eq!(etat["echec_ecriture"], 0, "{etat}");
-        assert_eq!(etat["corrige_moins_de_noms"], 0, "{etat}");
+        assert_eq!(etat["retenu_moins_de_noms"], 0, "{etat}");
 
         // 🔴 LA BALISE, relue sur le disque. C'est elle qui rend la correction
         //    durable : `update_batch` reconstruit la colonne à partir du
@@ -1249,6 +1432,123 @@ mod tests {
         let relu = compositeur_du_fichier(&cible).unwrap();
         assert_eq!(relu, NOM, "octet pour octet : {:?}", relu.as_bytes());
         assert_eq!(colonne(&s, 1).as_deref(), Some(NOM));
+    }
+
+    /// 🔴 LA GARDE, SUR DE VRAIS FICHIERS, DES DEUX CÔTÉS.
+    ///
+    /// Un banc, deux pistes, une seule différence entre elles : le NOMBRE de
+    /// noms. La réduction est retenue — **le fichier et la colonne sont
+    /// vérifiés intacts**, pas seulement le compteur — et elle est consignée
+    /// avec ses deux valeurs. La non-réduction, elle, passe et grave.
+    ///
+    /// Vérifier le fichier est le cœur du témoin : une garde posée après
+    /// `write_tags` laisserait le compteur juste et le disque déjà gravé.
+    #[tokio::test]
+    async fn la_garde_retient_la_reduction_la_consigne_et_laisse_passer_le_reste() {
+        let dir = scratch_dir("tune-compositeur-garde");
+        // 1 — 3 noms dans la colonne, 1 dans les crédits : RETENUE.
+        let appauvrie = dir.join("appauvrie.flac");
+        std::fs::copy(fixture("test.flac"), &appauvrie).unwrap();
+        // 2 — 1 nom dans la colonne, 1 dans les crédits, mais faux : CORRIGÉE.
+        let corrigeable = dir.join("corrigeable.flac");
+        std::fs::copy(fixture("test.flac"), &corrigeable).unwrap();
+        // 3 — 1 nom dans la colonne, 2 dans les crédits : CORRIGÉE aussi. La
+        //     garde ne bloque que la RÉDUCTION, pas l'enrichissement.
+        let enrichie = dir.join("enrichie.flac");
+        std::fs::copy(fixture("test.flac"), &enrichie).unwrap();
+
+        let s = etat();
+        piste_titree(
+            &s,
+            1,
+            "Summertime",
+            appauvrie.to_str(),
+            Some("George Gershwin/Ira Gershwin/D. Heyward"),
+            Some("local"),
+        );
+        credit(&s, 11, 1, "composer", "George Gershwin", 0);
+        piste_titree(
+            &s,
+            2,
+            "Symphonie N° 3",
+            corrigeable.to_str(),
+            Some("GORECKI"),
+            Some("local"),
+        );
+        credit(&s, 21, 2, "composer", "Henryk Mikołaj Górecki", 0);
+        piste_titree(
+            &s,
+            3,
+            "Wagon Wheels",
+            enrichie.to_str(),
+            Some("Billy Hills"),
+            Some("local"),
+        );
+        credit(&s, 31, 3, "composer", "Peter de Rose", 1);
+        credit(&s, 32, 3, "composer", "Billy Hill", 2);
+
+        // Le coût est annoncé AVANT : une retenue, deux corrections.
+        let (inv, _) = inventaire(&s, 0);
+        assert_eq!(inv.retenues, 1, "{inv:?}");
+        assert_eq!(inv.a_corriger, 2, "{inv:?}");
+        assert_eq!(
+            inv.pistes_concernees(),
+            2,
+            "la piste retenue ne doit pas être comptée dans le coût : aucun \
+             fichier ne sera ouvert pour elle"
+        );
+
+        let r = lancer(State(s.clone()), None).await.into_response();
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        attendre_la_fin(&s).await;
+
+        let etat = lire_etat(&s);
+        assert_eq!(etat["status"], "done", "{etat}");
+
+        // 🔴 LE DISQUE D'ABORD. C'est l'assertion qui doit rougir quand la
+        //    garde saute : un compteur juste sur un fichier déjà gravé serait
+        //    le pire des verts. Le reste de l'état suit, en dessous.
+        assert_eq!(
+            compositeur_du_fichier(&appauvrie),
+            None,
+            "la garde a laissé GRAVER le fichier appauvri — état : {etat}"
+        );
+        assert_eq!(
+            colonne(&s, 1).as_deref(),
+            Some("George Gershwin/Ira Gershwin/D. Heyward"),
+            "la garde a laissé écraser la colonne plus riche — état : {etat}"
+        );
+        assert_eq!(etat["retenu_moins_de_noms"], 1, "{etat}");
+        assert_eq!(etat["corrige"], 2, "{etat}");
+
+        // … et elle est CONSIGNÉE, avec les deux valeurs côte à côte, relisible
+        // par le GET sans relancer la passe.
+        let retenues = etat["retenues"].as_array().expect("liste absente");
+        assert_eq!(retenues.len(), 1, "{etat}");
+        let r0 = &retenues[0];
+        assert_eq!(r0["track_id"], 1);
+        assert_eq!(r0["titre"], "Summertime");
+        assert_eq!(r0["colonne"], "George Gershwin/Ira Gershwin/D. Heyward");
+        assert_eq!(r0["credits"], "George Gershwin");
+        assert_eq!(r0["noms_colonne"], 3);
+        assert_eq!(r0["noms_credits"], 1);
+        assert_eq!(etat["retenues_tronquees"], false, "{etat}");
+
+        // Les deux autres sont bien passées, disque compris.
+        assert_eq!(
+            compositeur_du_fichier(&corrigeable).as_deref(),
+            Some("Henryk Mikołaj Górecki")
+        );
+        assert_eq!(
+            compositeur_du_fichier(&enrichie).as_deref(),
+            Some("Peter de Rose; Billy Hill"),
+            "la garde bloque la RÉDUCTION, pas l'enrichissement"
+        );
+
+        // Et le GET sert la liste telle quelle, sans relancer quoi que ce soit.
+        let Json(vu) = statut(State(s.clone())).await;
+        assert_eq!(vu["retenues"].as_array().map(|a| a.len()), Some(1), "{vu}");
+        assert_eq!(vu["retenues"][0]["titre"], "Summertime");
     }
 
     /// 🔴 LE TÉMOIN DU PIÈGE #4238 (commit `c252b7b4`).
@@ -1398,7 +1698,7 @@ mod tests {
             "inchange",
             "sans_fichier",
             "echec_ecriture",
-            "corrige_moins_de_noms",
+            "retenu_moins_de_noms",
         ] {
             assert_eq!(v[cle], 0, "{cle} absent ou non nul au repos : {v}");
         }
