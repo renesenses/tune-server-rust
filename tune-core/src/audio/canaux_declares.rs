@@ -45,7 +45,10 @@
 //! d'`ExclusiveModeStatus` et de `CrossfeedStatus`.
 
 use super::channels::ChannelLayout;
+use crate::db::backend::DbBackend;
+use crate::db::settings_repo::SettingsRepo;
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Pourquoi la disposition déclarée n'aura pas d'effet.
 ///
@@ -53,11 +56,14 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CanauxContrainte {
-    /// La zone ne sort pas par une carte son locale. Un renderer DLNA,
-    /// AirPlay, Chromecast, BluOS, OpenHome ou Squeezebox négocie son propre
-    /// format : ce qu'on déclare ici ne l'atteint pas. Même prédicat que le
-    /// repli mono — `device_id.starts_with("local:")` — pour qu'écran et son
-    /// ne puissent pas diverger.
+    /// La zone ne sort ni par une carte son locale, ni par un renderer RÉSEAU
+    /// dont Tune décode le flux ([`PorteeDeSortie`]) : AirPlay, OAAT, zone
+    /// sans appareil. Ce qu'on déclare ici ne l'atteint pas.
+    ///
+    /// Fils 1914/1913 : ce motif couvrait aussi DLNA, OpenHome, Chromecast,
+    /// BluOS et Squeezebox — alors que ce chemin sait replier une piste
+    /// multicanale (#4573). Ils portent désormais la déclaration comme
+    /// PLAFOND. Le code reste `sortie_non_locale` : c'est un contrat client.
     SortieNonLocale,
     /// L'appareil annonce moins de canaux que la disposition déclarée. On ne
     /// bloque pas la saisie — un pilote ment parfois, et l'utilisateur en sait
@@ -100,6 +106,68 @@ pub struct CanauxStatus {
     pub unavailable: bool,
     pub reason: Option<CanauxContrainte>,
     pub detail: Option<&'static str>,
+    /// Fils 1914/1913 — comment la déclaration agit sur cette sortie, quand
+    /// elle n'y agit pas comme sur une carte locale. `plafond_reseau` : Tune
+    /// réduit une piste multicanale au nombre choisi quand il décode le flux
+    /// (jamais d'ajout de canal, un DSD servi tel quel n'est pas touché).
+    /// Absent partout ailleurs. Code STABLE ; le client le traduit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portee: Option<&'static str>,
+}
+/// Où la disposition déclarée a un chemin — fils 1914/1913.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PorteeDeSortie {
+    /// Carte son locale : [`canaux_portes_par_la_sortie`].
+    Locale,
+    /// Renderer réseau dont Tune décode le flux
+    /// ([`crate::orchestrator::is_network_output_type`]) : la déclaration y
+    /// plafonne les canaux servis ([`super::canaux_reseau_4573`]).
+    ReseauPlafond,
+    /// Aucun chemin : AirPlay, OAAT, zone sans appareil.
+    Aucune,
+}
+/// La portée de la déclaration sur la sortie d'une zone.
+pub fn portee_de_la_sortie(
+    output_device_id: Option<&str>,
+    output_type: Option<&str>,
+) -> PorteeDeSortie {
+    if canaux_portes_par_la_sortie(output_device_id) {
+        PorteeDeSortie::Locale
+    } else if output_device_id.is_some() && crate::orchestrator::is_network_output_type(output_type)
+    {
+        PorteeDeSortie::ReseauPlafond
+    } else {
+        PorteeDeSortie::Aucune
+    }
+}
+/// La clé de réglage de la disposition déclarée d'une zone.
+pub fn cle_de_zone(zone_id: i64) -> String {
+    format!("zone_{zone_id}_channel_layout")
+}
+/// La disposition déclarée pour une zone, ou `None` (« suivre l'appareil »,
+/// ou valeur inconnue en base — jamais devinée).
+pub fn disposition_declaree(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<ChannelLayout> {
+    let v = SettingsRepo::with_backend(db.clone())
+        .get(&cle_de_zone(zone_id))
+        .ok()
+        .flatten()?;
+    ChannelLayout::TOUTES
+        .iter()
+        .copied()
+        .find(|d| d.as_str() == v)
+}
+/// [`canaux_status`] selon la portée de la sortie : une zone réseau que Tune
+/// décode n'est plus « indisponible », elle dit comment la déclaration agit.
+pub fn canaux_status_pour(
+    requested: Option<ChannelLayout>,
+    portee: PorteeDeSortie,
+    max_channels: Option<u16>,
+) -> CanauxStatus {
+    let mut s = canaux_status(requested, portee != PorteeDeSortie::Aucune, max_channels);
+    if portee == PorteeDeSortie::ReseauPlafond {
+        s.portee = Some("plafond_reseau");
+    }
+    s
 }
 
 /// La disposition déclarée a-t-elle un chemin sur CETTE sortie ?
@@ -141,6 +209,7 @@ pub fn canaux_status(
         unavailable,
         reason,
         detail: reason.map(CanauxContrainte::detail),
+        portee: None,
     }
 }
 
@@ -271,5 +340,44 @@ mod tests {
         // qu'elle a elle-même démenti.
         let deux = dispositions_a_proposer(Some(2));
         assert_eq!(deux, vec![ChannelLayout::Mono, ChannelLayout::Stereo]);
+    }
+    /// 🔴 Fils 1914/1913 — un renderer DLNA n'est plus verrouillé : la
+    /// déclaration y a un chemin, le plafond de #4573.
+    #[test]
+    fn une_zone_dlna_porte_la_declaration_comme_plafond() {
+        let p = portee_de_la_sortie(Some("dlna:uuid-denon"), Some("dlna"));
+        assert_eq!(p, PorteeDeSortie::ReseauPlafond);
+        let s = canaux_status_pour(Some(ChannelLayout::Stereo), p, None);
+        assert!(!s.unavailable);
+        assert_eq!(s.reason, None);
+        assert_eq!(s.effective, Some(ChannelLayout::Stereo));
+        assert_eq!(s.portee, Some("plafond_reseau"));
+        // Rien de choisi : libre aussi — « Suivre l'appareil ».
+        assert!(!canaux_status_pour(None, p, None).unavailable);
+    }
+    /// Ce qui n'a toujours aucun chemin reste verrouillé, et le dit.
+    #[test]
+    fn airplay_oaat_et_zone_sans_appareil_restent_verrouilles() {
+        for (id, t) in [
+            (Some("airplay:AppleTV"), Some("airplay")),
+            (Some("oaat:x"), Some("oaat")),
+            (None, Some("dlna")),
+        ] {
+            let p = portee_de_la_sortie(id, t);
+            assert_eq!(p, PorteeDeSortie::Aucune, "{id:?} {t:?}");
+            let s = canaux_status_pour(None, p, None);
+            assert!(s.unavailable);
+            assert_eq!(s.reason, Some(CanauxContrainte::SortieNonLocale));
+            assert_eq!(s.portee, None);
+        }
+    }
+    #[test]
+    fn une_sortie_locale_ne_change_pas() {
+        let p = portee_de_la_sortie(Some("local:DAC"), Some("local"));
+        assert_eq!(p, PorteeDeSortie::Locale);
+        assert_eq!(
+            canaux_status_pour(Some(ChannelLayout::Surround51), p, Some(6)),
+            canaux_status(Some(ChannelLayout::Surround51), true, Some(6))
+        );
     }
 }

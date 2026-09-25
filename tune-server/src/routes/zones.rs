@@ -397,11 +397,22 @@ fn inject_device_identity(
     // …et ce que cette déclaration VAUT ici. Même forme que le statut du repli
     // mono juste en dessous, et pour la même raison (#3254) : un renderer
     // réseau négocie son propre format, lui déclarer 5.1 ne l'atteint pas.
+    // Fils 1914/1913 — la PORTÉE de la sortie, et non plus « locale ou
+    // rien » : un renderer réseau que Tune décode porte la déclaration comme
+    // plafond (#4573). AirPlay, OAAT et la zone sans appareil restent
+    // verrouillés.
+    let output_type = obj
+        .get("output_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     obj.insert(
         "channel_layout_status".into(),
-        json!(tune_core::audio::canaux_declares::canaux_status(
+        json!(tune_core::audio::canaux_declares::canaux_status_pour(
             channel_layout,
-            tune_core::audio::canaux_declares::canaux_portes_par_la_sortie(output_device_id),
+            tune_core::audio::canaux_declares::portee_de_la_sortie(
+                output_device_id,
+                output_type.as_deref(),
+            ),
             obj.get("output_capabilities")
                 .and_then(|c| c.get("max_channels"))
                 .and_then(|v| v.as_u64())

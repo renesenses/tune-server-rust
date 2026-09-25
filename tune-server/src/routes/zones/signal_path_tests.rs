@@ -3429,3 +3429,69 @@ async fn sans_declaration_du_renderer_un_51_garde_ses_six_voies() {
         "aucun renderer n'a déclaré ses canaux : la piste part intacte"
     );
 }
+// ---------------------------------------------------------------------------
+// Fils 1914/1913 — Reivax66, Denon AVR-X1600H : « la case canaux suivre
+// l'appareil reste grisée ». La disposition DÉCLARÉE devient un plafond du
+// chemin réseau de #4573 : elle a un effet, donc le sélecteur s'ouvre.
+// ---------------------------------------------------------------------------
+/// 🔴 Le branchement, par la porte publique : la même zone DLNA muette que
+/// ci-dessus, mais l'utilisateur a choisi « Stéréo ». Le 5.1 part en deux
+/// voies. Rouge sans le plafond déclaré : six voies, le choix n'agissait pas.
+#[tokio::test]
+async fn une_zone_reseau_declaree_stereo_replie_un_51() {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::canaux_declares::cle_de_zone(zone_id),
+            "stereo",
+        )
+        .unwrap();
+    let chemin = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tune-core/tests/fixtures/test.flac"
+    );
+    let mut t = tune_core::db::models::Track::new("Piste 5.1".into());
+    t.duration_ms = 1_000;
+    t.file_path = Some(chemin.into());
+    t.format = Some("flac".into());
+    t.sample_rate = Some(48_000);
+    t.bit_depth = Some(24);
+    t.channels = 6;
+    t.file_size = std::fs::metadata(chemin).ok().map(|m| m.len() as i64);
+    t.source = "local".into();
+    let track_id = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone())
+        .create(&t)
+        .unwrap();
+    let r = decision(&backend, zone_id, track_id).await;
+    assert_eq!(
+        r.channels,
+        Some(2),
+        "la disposition choisie plafonne ce qui part au renderer"
+    );
+}
+/// Et l'écran dit la CAUSE : c'est le choix, pas l'annonce du lecteur.
+#[test]
+fn la_reduction_due_au_choix_est_dite_comme_telle() {
+    let (backend, zone) = dlna_zone_migrated();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::canaux_declares::cle_de_zone(zone.id.unwrap()),
+            "stereo",
+        )
+        .unwrap();
+    let (_tid, ps) = piste_multicanale(&backend, 6);
+    let v = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        "CoreAudio",
+        Some(&fil_de_canaux("wav", 2)),
+    )
+    .unwrap();
+    assert_eq!(
+        step_desc(&v, "Canaux").as_deref(),
+        Some("6 \u{2192} 2 canaux (disposition choisie)")
+    );
+}
