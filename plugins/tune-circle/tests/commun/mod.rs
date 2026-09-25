@@ -12,16 +12,20 @@
 //! reçus, et sait jouer la panne (500) et le débit dépassé (429). Il sert
 //! aussi `POST /oauth/token` pour le rafraîchissement.
 //!
-//! Avenant « plusieurs cercles » (#5018, 25/09) : `GET /` porte aussi
-//! `circles` (les cercles DU détenteur, `{ id, name, member_ids }`) ;
+//! Avenant « plusieurs cercles » (#5018, 25/09), tel que mozaiklabs l'a écrit
+//! (site-mozaiklabs#224) : `GET /` porte aussi `circles` (les cercles DU
+//! détenteur, `{ id, name, member_ids }`) mais SEULEMENT s'il en a au moins
+//! un — sinon la forme exacte `{members, sent, received}` de T1 ;
 //! `POST /circles` = 201 et le cercle ; `PATCH /circles/{id}` et
 //! `PUT /circles/{id}/members/{user_id}` (idempotent) = 200 et le cercle ;
-//! les deux `DELETE` = 200 `{ "ok": true }`. Nom de 1 à 60 caractères
-//! (422 `invalid_name`), unique sans casse (409 `circle_name_taken`), au plus
-//! [`CERCLES_MAX`] (422 `too_many_circles`) ; cercle d'un autre ou non-contact
-//! = 404. Révoquer un contact le retire de tous les cercles ; supprimer un
-//! cercle ne révoque personne. `circle_id` d'une invitation est gardé pour
-//! [`Faux::acceptee_par_l_invite`].
+//! les deux `DELETE` = 200 `{ "ok": true }`. Nom de 1 à 60 caractères (422
+//! de validation Laravel), unique sans casse (409 `circle_name_taken`), au
+//! plus [`CERCLES_MAX`] (422 `too_many_circles`) ; cercle d'un autre,
+//! non-contact, ou contact non rangé dans le cercle retiré = 404. Révoquer un
+//! contact le retire de tous les cercles ; supprimer un cercle ne révoque
+//! personne. Sur `POST /invitations`, un `circle_id` non entier = 422 de
+//! validation, celui d'un autre = 404 sans invitation ; sinon il est gardé
+//! pour [`Faux::acceptee_par_l_invite`].
 
 #![allow(dead_code)]
 
@@ -124,10 +128,14 @@ impl Faux {
     }
 
     pub fn cercle(&self) -> Value {
-        json!({
-            "members": self.members, "sent": self.sent, "received": self.received,
-            "circles": self.circles
-        })
+        let mut c = json!({
+            "members": self.members, "sent": self.sent, "received": self.received
+        });
+        // Comme site-mozaiklabs#224 : la clé n'existe que s'il y a un cercle.
+        if !self.circles.is_empty() {
+            c["circles"] = json!(self.circles);
+        }
+        c
     }
 
     /// Ce que fait le cloud quand l'invité accepte, de SON côté, une
@@ -222,6 +230,22 @@ fn refus(statut: StatusCode, motif: &str) -> Response {
     (statut, Json(json!({ "error": motif }))).into_response()
 }
 
+/// Un 422 de validation, à la forme de Laravel.
+pub fn corps_de_validation(champ: &str, message: &str) -> Value {
+    json!({ "message": message, "errors": { champ: [message] } })
+}
+
+fn validation(champ: &str, message: &str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(corps_de_validation(champ, message)),
+    )
+        .into_response()
+}
+
+pub const MESSAGE_CIRCLE_ID: &str = "The circle id field must be an integer.";
+pub const MESSAGE_NOM: &str = "The name field must be between 1 and 60 characters.";
+
 async fn inviter(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Response {
     if let Some(r) = garde(&e, &h) {
         return r;
@@ -251,9 +275,19 @@ async fn inviter(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Respon
     if f.sent.iter().any(|i| i["name_or_email"] == email) {
         return refus(StatusCode::CONFLICT, "already_invited");
     }
-    if let Some(c) = v.get("circle_id") {
+    let circle_id = v.get("circle_id").filter(|c| !c.is_null()).cloned();
+    if let Some(c) = &circle_id {
+        if !c.is_i64() {
+            return validation("circle_id", MESSAGE_CIRCLE_ID);
+        }
+        // Le cercle d'un autre : 404, ni invitation ni courriel.
+        if !f.circles.iter().any(|x| x["id"] == *c) {
+            return introuvable();
+        }
+    }
+    if let Some(c) = circle_id {
         let id = f.prochain_id;
-        f.rangement_des_invitations.push((id, c.clone()));
+        f.rangement_des_invitations.push((id, c));
     }
     let invitation = json!({
         "id": f.prochain_id, "name_or_email": email,
@@ -351,7 +385,7 @@ fn nom_valide(corps: &Bytes) -> Option<String> {
 }
 
 fn nom_invalide() -> Response {
-    refus(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")
+    validation("name", MESSAGE_NOM)
 }
 
 /// Un autre cercle du propriétaire porte-t-il déjà ce nom, casse ignorée ?
@@ -458,13 +492,12 @@ async fn deranger(
     let Some(k) = position(&f.circles, "id", &id) else {
         return introuvable();
     };
-    if position(&f.members, "user_id", &uid).is_none() {
+    // Non-contact, ou contact qui n'est pas rangé dans CE cercle : 404.
+    let ids = f.circles[k]["member_ids"].as_array_mut().unwrap();
+    let Some(i) = ids.iter().position(|m| meme_id(m, &uid)) else {
         return introuvable();
-    }
-    f.circles[k]["member_ids"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|m| !meme_id(m, &uid));
+    };
+    ids.remove(i);
     Json(json!({ "ok": true })).into_response()
 }
 

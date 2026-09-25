@@ -30,11 +30,13 @@
 //!
 //! ## Les états
 //!
-//! * **Réponse du cloud** (2xx, 4xx — dont 401, 404, 429) : statut et corps
-//!   relayés à l'octet près, `Retry-After` compris.
-//! * **Non connecté** (aucune session SSO) : `GET /` rend `200 { "connected":
-//!   false }` ; toute autre route rend `412 { "connected": false, "code":
-//!   "circle.not_connected" }`. Aucun appel ne part.
+//! * **Réponse du cloud** (2xx, 4xx — dont 404, 409, 422, 429) : statut et
+//!   corps relayés à l'octet près, `Retry-After` compris.
+//! * **Non connecté** (aucune session SSO, ou session que le cloud refuse
+//!   encore en 401 après UN rafraîchissement) : `GET /` rend `200 {
+//!   "connected": false }` ; toute autre route rend `412 { "connected": false,
+//!   "code": "circle.not_connected" }`. Le greffon ne rend JAMAIS 401 : pour
+//!   le client web, un 401 est la fin de la session Tune elle-même.
 //! * **Cloud indisponible** (injoignable, délai, 5xx) : `503 { "connected":
 //!   true, "code": "circle.cloud_unavailable", "upstream_status": 500|null }`.
 //! * Refus local, sans appel : `404 circle.not_found` (identifiant vide, `.`

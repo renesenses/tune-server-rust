@@ -78,7 +78,11 @@ async fn creer_un_cercle_relaie_201_409_et_422() {
     ] {
         let r = appel(&app, "POST", "/circles", Some(corps.clone())).await;
         assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
-        assert_eq!(r.json(), json!({ "error": "invalid_name" }), "{corps}");
+        assert_eq!(
+            r.json(),
+            corps_de_validation("name", MESSAGE_NOM),
+            "{corps}"
+        );
     }
     assert_eq!(faux.etat.lock().unwrap().circles.len(), 3);
 }
@@ -184,6 +188,11 @@ async fn retirer_d_un_cercle_ne_touche_que_ce_cercle() {
     assert_eq!(r.statut, StatusCode::OK);
     assert_eq!(r.json(), json!({ "ok": true }));
 
+    // Alice est un contact, mais elle n'est pas rangée dans Jazz : 404 relayé.
+    let r = appel(&app, "DELETE", "/circles/2/members/7", None).await;
+    assert_eq!(r.statut, StatusCode::NOT_FOUND);
+    assert_eq!(r.json(), json!({ "error": "not_found" }));
+
     let f = faux.etat.lock().unwrap();
     assert_eq!(f.membres_du_cercle(1), Some(vec![7]));
     assert_eq!(f.membres_du_cercle(2), Some(vec![9]), "Jazz garde Bruno");
@@ -267,8 +276,9 @@ async fn circle_id_part_tel_quel_et_seulement_s_il_est_donne() {
         Some(json!({ "email": "sans.cercle@exemple.fr" }))
     );
 
-    // Un identifiant de forme inattendue part aussi tel quel : le cloud juge.
-    appel(
+    // Un identifiant non entier part aussi tel quel : le cloud juge (422 de
+    // validation), et son refus revient avec son corps.
+    let r = appel(
         &app,
         "POST",
         "/invitations",
@@ -278,6 +288,51 @@ async fn circle_id_part_tel_quel_et_seulement_s_il_est_donne() {
     assert_eq!(
         faux.etat.lock().unwrap().dernier_corps,
         Some(json!({ "email": "chaine@exemple.fr", "circle_id": "1" }))
+    );
+    assert_eq!(r.statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        r.json(),
+        corps_de_validation("circle_id", MESSAGE_CIRCLE_ID)
+    );
+
+    // Le cercle d'un autre : 404 relayé, sans invitation.
+    let envoyees = faux.etat.lock().unwrap().sent.len();
+    let r = appel(
+        &app,
+        "POST",
+        "/invitations",
+        Some(json!({ "email": "autre.cercle@exemple.fr", "circle_id": CERCLE_D_UN_AUTRE })),
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::NOT_FOUND);
+    assert_eq!(r.json(), json!({ "error": "not_found" }));
+    assert_eq!(faux.etat.lock().unwrap().sent.len(), envoyees);
+}
+
+/// site-mozaiklabs#224 : sans aucun cercle, le cloud garde la forme exacte de
+/// T1, SANS la clé `circles`. Le relais n'en ajoute pas : il transmet tel quel.
+#[tokio::test]
+async fn sans_cercle_la_liste_reste_la_forme_de_t1_telle_quelle() {
+    let faux = demarrer().await;
+    faux.etat.lock().unwrap().circles.clear();
+    let app = app(base(&faux.base, Some(JETON)));
+
+    let r = appel(&app, "GET", "/", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    let v = r.json();
+    assert!(v.get("circles").is_none(), "{v}");
+    let mut t1 = cercle_initial();
+    t1.as_object_mut().unwrap().remove("circles");
+    assert_eq!(v, t1);
+    let attendu = serde_json::to_vec(&faux.etat.lock().unwrap().cercle()).unwrap();
+    assert_eq!(r.octets, attendu, "à l'octet près");
+
+    // Le premier cercle créé fait apparaître la clé.
+    appel(&app, "POST", "/circles", Some(json!({ "name": "Voisins" }))).await;
+    let v = appel(&app, "GET", "/", None).await.json();
+    assert_eq!(
+        v["circles"],
+        json!([{ "id": 3, "name": "Voisins", "member_ids": [] }])
     );
 }
 

@@ -324,24 +324,67 @@ async fn un_jeton_perime_est_rafraichi_une_fois_dans_la_session_du_serveur() {
     );
 }
 
+/// Le cloud rend 401, puis le rafraîchissement unique échoue : le greffon
+/// rend l'état « non connecté au cloud », JAMAIS 401. Côté client web, tout
+/// 401 est la fin de la session TUNE (`fetchJSON` efface le jeton Tune) : une
+/// session mozaiklabs expirée ne doit pas déconnecter l'utilisateur de Tune.
 #[tokio::test]
-async fn un_401_sans_rafraichissement_possible_est_relaye() {
+async fn un_401_du_cloud_sans_rafraichissement_rend_non_connecte_jamais_401() {
     let faux = demarrer().await;
     faux.etat.lock().unwrap().rafraichissement_valide = "autre".into();
     let backend = base(&faux.base, Some(JETON_PERIME));
     let app = app(backend.clone());
 
+    // `GET /` : l'état, comme sans session SSO.
     let r = appel(&app, "GET", "/", None).await;
-    assert_eq!(r.statut, StatusCode::UNAUTHORIZED);
-    assert_eq!(r.json(), json!({ "message": "Unauthenticated." }));
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), json!({ "connected": false }));
+
+    // Toute autre route, T1 comme avenant : 412 `circle.not_connected`.
+    for (m, chemin, corps) in [
+        (
+            "POST",
+            "/invitations",
+            Some(json!({ "email": COURRIEL_INVITE })),
+        ),
+        ("POST", "/invitations/21/accept", None),
+        ("POST", "/invitations/21/decline", None),
+        ("DELETE", "/invitations/11", None),
+        ("DELETE", "/members/7", None),
+        ("POST", "/circles", Some(json!({ "name": "Voisins" }))),
+        ("PATCH", "/circles/1", Some(json!({ "name": "Tribu" }))),
+        ("DELETE", "/circles/1", None),
+        ("PUT", "/circles/2/members/7", None),
+        ("DELETE", "/circles/1/members/7", None),
+    ] {
+        let r = appel(&app, m, chemin, corps).await;
+        assert_eq!(r.statut, StatusCode::PRECONDITION_FAILED, "{m} {chemin}");
+        assert_eq!(
+            r.json(),
+            json!({ "connected": false, "code": "circle.not_connected" }),
+            "{m} {chemin}"
+        );
+    }
     // Rien n'a été réécrit : la session reste ce que le serveur avait.
     assert_eq!(
-        SettingsRepo::with_backend(backend)
+        SettingsRepo::with_backend(backend.clone())
             .get("mozaik_access_token")
             .unwrap()
             .as_deref(),
         Some(JETON_PERIME)
     );
+
+    // Sans jeton de rafraîchissement du tout, même état.
+    SettingsRepo::with_backend(backend)
+        .set("mozaik_refresh_token", "")
+        .unwrap();
+    let r = appel(&app, "DELETE", "/members/7", None).await;
+    assert_eq!(r.statut, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        r.json(),
+        json!({ "connected": false, "code": "circle.not_connected" })
+    );
+    assert_eq!(ids_des_membres(&faux.etat.lock().unwrap().cercle()), [7, 9]);
 }
 
 // Le greffon lui-même -------------------------------------------------------
