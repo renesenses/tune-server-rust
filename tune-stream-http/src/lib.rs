@@ -4849,7 +4849,7 @@ mod reprise_714_sink_strict_de_bout_en_bout {
                 let uri = balise(&corps, "CurrentURI");
                 let didl = mime_de_la_didl(&corps);
                 // Comme le Beosound : un HEAD sur l'URL avant de répondre.
-                let ct = reqwest::Client::new()
+                let ct = tune_core::http::client::shared()
                     .head(&uri)
                     .send()
                     .await
