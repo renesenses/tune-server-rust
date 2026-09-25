@@ -12,6 +12,24 @@
 //! Response parsing is split into pure functions so the field extraction — the
 //! part that actually breaks when MusicBrainz reshapes its JSON — is testable
 //! without a network call.
+//!
+//! # 🔴 Refus ≠ absence (#4991)
+//!
+//! [`lookup_release_candidates`] rendait `Vec::new()` **aussi bien** quand
+//! MusicBrainz n'avait aucun pressage que lorsqu'il avait refusé la requête
+//! (`503`, coupure, délai dépassé) : le `None` de [`mb_get`] était avalé par un
+//! `else { return Vec::new() }`. Les deux cas arrivaient donc à l'appelant sous
+//! la même forme, et **aucun compteur en aval ne pouvait être juste**.
+//!
+//! Mesuré le 25/09/2026 sur le .18 : douze albums de musique classique
+//! contigus par identifiant — introuvables pour une raison structurelle, le
+//! compositeur n'étant pas dans la requête — arrêtaient la passe
+//! `POST /library/identify-all` en annonçant « MusicBrainz injoignable », alors
+//! que MusicBrainz répondait `200` en 0,15 s.
+//!
+//! La recherche rend désormais [`RechercheDePressages`], qui porte la liste
+//! **et** le [`RefusMusicBrainz`] éventuel. Une liste vide sans refus veut dire
+//! ce qu'elle dit : MusicBrainz a répondu, il n'a pas ce pressage.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -367,7 +385,35 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
 
 // -- Network --
 
-async fn mb_get(path: &str, params: &[(&str, String)]) -> Option<Value> {
+/// Pourquoi MusicBrainz n'a **pas répondu** (#4991).
+///
+/// 🔴 À ne jamais confondre avec « MusicBrainz n'a pas ce pressage ». Le second
+/// est un résultat, sur lequel l'appelant peut conclure ; le premier ne dit
+/// rien de l'album et tout du service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusMusicBrainz {
+    /// La requête n'est pas partie, ou la réponse n'est jamais arrivée :
+    /// coupure réseau, DNS, délai de 15 s dépassé.
+    Transport,
+    /// MusicBrainz a répondu autre chose qu'un `2xx` — `503` quand la cadence
+    /// par IP est dépassée, `500`, `502`…
+    Statut(u16),
+    /// Réponse reçue, corps illisible. Ce n'est pas MusicBrainz qui dit
+    /// « rien » : c'est nous qui n'avons pas compris.
+    CorpsIllisible,
+}
+
+impl std::fmt::Display for RefusMusicBrainz {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport => write!(f, "transport"),
+            Self::Statut(code) => write!(f, "statut_{code}"),
+            Self::CorpsIllisible => write!(f, "corps_illisible"),
+        }
+    }
+}
+
+async fn mb_get(path: &str, params: &[(&str, String)]) -> Result<Value, RefusMusicBrainz> {
     let client = crate::http::client::shared();
     let resp = client
         .get(format!("{MB_API}/{path}"))
@@ -376,13 +422,19 @@ async fn mb_get(path: &str, params: &[(&str, String)]) -> Option<Value> {
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
-        .ok()?;
+        .map_err(|e| {
+            debug!(path = path, error = %e, "mb_request_transport_error");
+            RefusMusicBrainz::Transport
+        })?;
 
     if !resp.status().is_success() {
         debug!(status = %resp.status(), path = path, "mb_request_http_error");
-        return None;
+        return Err(RefusMusicBrainz::Statut(resp.status().as_u16()));
     }
-    resp.json().await.ok()
+    resp.json().await.map_err(|e| {
+        debug!(path = path, error = %e, "mb_request_body_error");
+        RefusMusicBrainz::CorpsIllisible
+    })
 }
 
 /// Best-guess identification: narrow the query with everything we know and
@@ -412,7 +464,8 @@ pub async fn lookup_release(
             ("fmt", "json".to_string()),
         ],
     )
-    .await?;
+    .await
+    .ok()?;
 
     parse_search_results(&data, title, artist)
         .into_iter()
@@ -547,45 +600,123 @@ pub async fn lookup_release_candidates(
     artist: &str,
     track_hint: Option<u32>,
     limit: usize,
-) -> Vec<MBReleaseMatch> {
+) -> RechercheDePressages {
+    recherche_de_pressages(
+        title,
+        artist,
+        track_hint,
+        limit,
+        |requete, fetch| async move {
+            mb_get(
+                "release",
+                &[
+                    ("query", requete),
+                    ("limit", fetch.to_string()),
+                    ("fmt", "json".to_string()),
+                ],
+            )
+            .await
+        },
+    )
+    .await
+}
+
+/// Ce qu'une recherche de pressages a donné — **refus du service compris**
+/// (#4991).
+///
+/// Une `Vec<MBReleaseMatch>` nue ne pouvait pas porter cette différence, et
+/// c'est tout le défaut : `candidats` vide avec `refus: None` veut dire
+/// « MusicBrainz a répondu, il n'a pas ce pressage » ; `candidats` vide avec
+/// `refus: Some(_)` veut dire « MusicBrainz n'a pas répondu, on ne sait rien de
+/// cet album ».
+#[derive(Debug, Clone, Default)]
+pub struct RechercheDePressages {
+    /// Les pressages plausibles, du meilleur au moins bon. Toujours vide sur
+    /// refus.
+    pub candidats: Vec<MBReleaseMatch>,
+    /// `Some` quand MusicBrainz n'a pas répondu. `None` veut dire qu'il a
+    /// répondu — **y compris quand il a répondu qu'il n'avait rien**.
+    pub refus: Option<RefusMusicBrainz>,
+}
+
+impl RechercheDePressages {
+    /// MusicBrainz a répondu. La liste peut être vide : c'est alors une
+    /// ABSENCE de pressage, donc un résultat.
+    pub fn repondue(candidats: Vec<MBReleaseMatch>) -> Self {
+        Self {
+            candidats,
+            refus: None,
+        }
+    }
+
+    /// MusicBrainz n'a pas répondu. Aucune conclusion possible sur l'album.
+    pub fn refusee(refus: RefusMusicBrainz) -> Self {
+        Self {
+            candidats: Vec::new(),
+            refus: Some(refus),
+        }
+    }
+
+    /// 🔴 Le prédicat du disjoncteur de `identify-all` : c'est **ça** qu'une
+    /// passe de lot doit compter, et rien d'autre.
+    pub fn service_refuse(&self) -> bool {
+        self.refus.is_some()
+    }
+
+    /// Le pressage retenu, s'il y en a un.
+    pub fn meilleur(self) -> Option<MBReleaseMatch> {
+        self.candidats.into_iter().next()
+    }
+}
+
+/// Le corps de [`lookup_release_candidates`], **sans le transport**.
+///
+/// La couture existe pour que la distinction refus / absence (#4991) soit
+/// prouvable sans réseau : les témoins passent un `interroger` qui rend au
+/// choix un `503` ou une réponse vide, et vérifient que les deux ne se lisent
+/// pas pareil. Le transport réel, lui, n'a qu'un seul appelant.
+async fn recherche_de_pressages<F, Fut>(
+    title: &str,
+    artist: &str,
+    track_hint: Option<u32>,
+    limit: usize,
+    mut interroger: F,
+) -> RechercheDePressages
+where
+    F: FnMut(String, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, RefusMusicBrainz>>,
+{
     if title.trim().is_empty() {
-        return Vec::new();
+        // Rien n'a été demandé à MusicBrainz, et ce n'est pas sa faute.
+        return RechercheDePressages::repondue(Vec::new());
     }
 
     // Ask for more than we show: the plausibility filter drops some, and
     // MusicBrainz mixes in loosely-related releases.
     let fetch = (limit * 3).clamp(10, 100);
 
-    // Un essai de recherche. `interroge` porte le titre ENVOYÉ à MusicBrainz ;
-    // le tri de plausibilité, lui, juge toujours contre `title`, celui de la
+    // La requête Lucene. `interroge` porte le titre ENVOYÉ à MusicBrainz ; le
+    // tri de plausibilité, lui, juge toujours contre `title`, celui de la
     // bibliothèque.
-    async fn un_essai(
-        interroge: &str,
-        title: &str,
-        artist: &str,
-        fetch: usize,
-        track_hint: Option<u32>,
-    ) -> Vec<MBReleaseMatch> {
+    let requete = |interroge: &str| -> String {
         let mut query_parts = vec![format!("release:\"{interroge}\"")];
         if !artist.trim().is_empty() {
             query_parts.push(format!("artist:\"{artist}\""));
         }
-        let Some(data) = mb_get(
-            "release",
-            &[
-                ("query", query_parts.join(" AND ")),
-                ("limit", fetch.to_string()),
-                ("fmt", "json".to_string()),
-            ],
-        )
-        .await
-        else {
-            return Vec::new();
-        };
-        rank_candidates(parse_search_results(&data, title, artist), track_hint)
-    }
+        query_parts.join(" AND ")
+    };
 
-    let mut candidates = un_essai(title, title, artist, fetch, track_hint).await;
+    let mut candidates = match interroger(requete(title), fetch).await {
+        Ok(data) => rank_candidates(parse_search_results(&data, title, artist), track_hint),
+        // 🔴 Refus au premier essai : on s'arrête là et on le DIT. Rejouer le
+        //    titre nettoyé contre un service qui vient de refuser coûterait
+        //    1,1 s pour le même refus, et rendrait surtout une liste vide
+        //    indiscernable d'une absence de pressage.
+        Err(refus) => {
+            debug!(title = title, refus = %refus, "mb_release_candidates_refus");
+            return RechercheDePressages::refusee(refus);
+        }
+    };
 
     // Second essai, et seulement sur échec : le titre débarrassé de son suffixe
     // de pressage. Mesuré à +15,4 points sur le .18 (#4805). Le coût — une
@@ -603,7 +734,13 @@ pub async fn lookup_release_candidates(
             "mb_release_candidates_retry_titre_nettoye"
         );
         rate_limit_delay().await;
-        candidates = un_essai(&nettoye, title, artist, fetch, track_hint).await;
+        candidates = match interroger(requete(&nettoye), fetch).await {
+            Ok(data) => rank_candidates(parse_search_results(&data, title, artist), track_hint),
+            Err(refus) => {
+                debug!(title = title, refus = %refus, "mb_release_candidates_refus");
+                return RechercheDePressages::refusee(refus);
+            }
+        };
     }
 
     candidates.truncate(limit);
@@ -612,7 +749,7 @@ pub async fn lookup_release_candidates(
         title = title,
         "mb_release_candidates_found"
     );
-    candidates
+    RechercheDePressages::repondue(candidates)
 }
 
 /// Fetch a chosen release with its track listing.
@@ -627,7 +764,8 @@ pub async fn lookup_release_detail(release_id: &str) -> Option<MBReleaseDetail> 
             ("fmt", "json".to_string()),
         ],
     )
-    .await?;
+    .await
+    .ok()?;
     parse_release_detail(&data)
 }
 
@@ -654,7 +792,8 @@ pub async fn lookup_release_group_type(
         &format!("release-group/{release_group_id}"),
         &[("fmt", "json".to_string())],
     )
-    .await?;
+    .await
+    .ok()?;
     super::release_type::depuis_groupe_musicbrainz(&data)
 }
 
@@ -1190,5 +1329,212 @@ mod tests {
             "Smash the System: Singles and More, Disc 1",
             "Saint Etienne"
         ));
+    }
+
+    // -- 🔴 #4991 : un refus de MusicBrainz n'est pas une absence de pressage --
+    //
+    // Hermétique : aucun appel réseau. La couture `recherche_de_pressages`
+    // reçoit un `interroger` de témoin, qui rend au choix un refus ou une
+    // réponse. C'est la SEULE façon de prouver que les deux cas ne se lisent
+    // plus pareil — le défaut d'origine était précisément qu'ils étaient
+    // indiscernables à la sortie de la fonction.
+
+    /// Une réponse de recherche portant un pressage plausible.
+    fn reponse_avec_un_pressage(titre: &str, artiste: &str) -> Value {
+        json!({
+            "releases": [{
+                "id": "11111111-2222-3333-4444-555555555555",
+                "title": titre,
+                "score": 100,
+                "artist-credit": [{ "name": artiste }],
+            }]
+        })
+    }
+
+    /// Le cas mesuré sur le .18 le 25/09/2026, côté service en panne : un `503`
+    /// ne doit **pas** ressortir comme « aucun pressage ». Sans ce témoin, le
+    /// pilote de lot ne peut pas faire la différence, et c'est tout le défaut.
+    #[tokio::test(start_paused = true)]
+    async fn un_refus_de_musicbrainz_se_lit_comme_un_refus() {
+        let recherche = recherche_de_pressages(
+            "Goldberg-Variationen",
+            "Laszlo Borbely",
+            Some(64),
+            5,
+            |_requete, _fetch| async { Err(RefusMusicBrainz::Statut(503)) },
+        )
+        .await;
+
+        assert!(
+            recherche.service_refuse(),
+            "un 503 de MusicBrainz doit se lire comme un REFUS, pas comme une \
+             absence de pressage : refus = {:?}",
+            recherche.refus
+        );
+        assert_eq!(recherche.refus, Some(RefusMusicBrainz::Statut(503)));
+        assert!(recherche.candidats.is_empty());
+    }
+
+    /// L'autre moitié, et la plus importante : MusicBrainz répond, il n'a rien.
+    /// C'est un RÉSULTAT. Douze albums de musique classique contigus par
+    /// identifiant passent tous par ici — et arrêtaient la passe.
+    #[tokio::test(start_paused = true)]
+    async fn une_reponse_sans_pressage_nest_pas_un_refus() {
+        let recherche = recherche_de_pressages(
+            "Goldberg-Variationen",
+            "Laszlo Borbely",
+            Some(64),
+            5,
+            |_requete, _fetch| async { Ok(json!({ "releases": [] })) },
+        )
+        .await;
+
+        assert!(
+            !recherche.service_refuse(),
+            "MusicBrainz a RÉPONDU qu'il n'avait pas ce pressage : le prendre \
+             pour une panne est le défaut #4991 — refus = {:?}",
+            recherche.refus
+        );
+        assert!(recherche.candidats.is_empty());
+    }
+
+    /// Une recherche qui aboutit ne porte évidemment aucun refus.
+    #[tokio::test(start_paused = true)]
+    async fn une_recherche_aboutie_ne_porte_aucun_refus() {
+        let recherche = recherche_de_pressages(
+            "Kind of Blue",
+            "Miles Davis",
+            Some(5),
+            5,
+            |_requete, _fetch| async {
+                Ok(reponse_avec_un_pressage("Kind of Blue", "Miles Davis"))
+            },
+        )
+        .await;
+
+        assert!(!recherche.service_refuse());
+        assert_eq!(recherche.candidats.len(), 1);
+        assert_eq!(
+            recherche.meilleur().map(|m| m.release_id),
+            Some("11111111-2222-3333-4444-555555555555".to_string())
+        );
+    }
+
+    /// Un refus au premier essai n'arme pas le second : rejouer le titre
+    /// nettoyé contre un service qui vient de refuser coûte 1,1 s pour le même
+    /// refus. Le titre porte ici un suffixe, donc un second essai serait
+    /// possible — c'est bien le refus qui l'empêche.
+    #[tokio::test(start_paused = true)]
+    async fn un_refus_au_premier_essai_narme_pas_le_second() {
+        assert!(
+            titre_de_requete("Somethin' Else (192kHz/24bit)").is_some(),
+            "le titre du témoin doit avoir un suffixe à retirer, sinon le \
+             témoin ne prouve rien"
+        );
+        let appels = std::cell::Cell::new(0usize);
+
+        let recherche = recherche_de_pressages(
+            "Somethin' Else (192kHz/24bit)",
+            "Cannonball Adderley",
+            Some(5),
+            5,
+            |_requete, _fetch| {
+                appels.set(appels.get() + 1);
+                async { Err(RefusMusicBrainz::Transport) }
+            },
+        )
+        .await;
+
+        assert!(recherche.service_refuse());
+        assert_eq!(
+            appels.get(),
+            1,
+            "le second essai a été lancé alors que MusicBrainz venait de refuser"
+        );
+    }
+
+    /// Et à l'inverse : réponse vide au premier essai, le second essai part
+    /// bien — le correctif ne doit pas avoir emporté le rattrapage de #4805.
+    #[tokio::test(start_paused = true)]
+    async fn une_reponse_vide_arme_toujours_le_second_essai() {
+        let appels = std::cell::Cell::new(0usize);
+
+        let recherche = recherche_de_pressages(
+            "Somethin' Else (192kHz/24bit)",
+            "Cannonball Adderley",
+            Some(5),
+            5,
+            |_requete, _fetch| {
+                appels.set(appels.get() + 1);
+                let premier = appels.get() == 1;
+                async move {
+                    if premier {
+                        Ok(json!({ "releases": [] }))
+                    } else {
+                        Ok(reponse_avec_un_pressage(
+                            "Somethin' Else",
+                            "Cannonball Adderley",
+                        ))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(appels.get(), 2, "le second essai n'a pas eu lieu");
+        assert!(!recherche.service_refuse());
+        assert_eq!(recherche.candidats.len(), 1);
+    }
+
+    /// Un refus au SECOND essai est un refus tout court : la passe ne doit pas
+    /// conclure « rien trouvé » parce que le premier essai, lui, avait répondu.
+    #[tokio::test(start_paused = true)]
+    async fn un_refus_au_second_essai_reste_un_refus() {
+        let appels = std::cell::Cell::new(0usize);
+
+        let recherche = recherche_de_pressages(
+            "Somethin' Else (192kHz/24bit)",
+            "Cannonball Adderley",
+            Some(5),
+            5,
+            |_requete, _fetch| {
+                appels.set(appels.get() + 1);
+                let premier = appels.get() == 1;
+                async move {
+                    if premier {
+                        Ok(json!({ "releases": [] }))
+                    } else {
+                        Err(RefusMusicBrainz::Statut(503))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(appels.get(), 2);
+        assert!(
+            recherche.service_refuse(),
+            "le refus du second essai a été avalé : {:?}",
+            recherche.refus
+        );
+    }
+
+    /// Un titre vide n'interroge personne — et n'accuse donc personne.
+    #[tokio::test(start_paused = true)]
+    async fn un_titre_vide_nest_pas_un_refus_de_musicbrainz() {
+        let appels = std::cell::Cell::new(0usize);
+        let recherche = recherche_de_pressages("   ", "Miles Davis", None, 5, |_r, _f| {
+            appels.set(appels.get() + 1);
+            async { Ok(Value::Null) }
+        })
+        .await;
+
+        assert_eq!(
+            appels.get(),
+            0,
+            "aucune requête ne doit partir pour un titre vide"
+        );
+        assert!(!recherche.service_refuse());
+        assert!(recherche.candidats.is_empty());
     }
 }
