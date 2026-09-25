@@ -43,30 +43,28 @@ fn refus(code: StatusCode, motif: &str, message: String) -> Response {
     (code, Json(json!({ "error": motif, "message": message }))).into_response()
 }
 
-/// La TOC du disque inséré, ou la réponse qui dit pourquoi il n'y en a pas.
-async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Box<Response>> {
+/// Un refus : statut, motif stable, message lisible.
+pub(crate) type Refus = (StatusCode, &'static str, String);
+
+/// La TOC du disque inséré, ou le refus qui dit pourquoi il n'y en a pas.
+async fn toc_ou_refus(etat: &EtatRoutes) -> Result<Toc, Refus> {
     let Some(lecteur) = etat.lecteur.clone() else {
-        return Err(Box::new(refus(
+        return Err((
             StatusCode::NOT_FOUND,
             "aucun_lecteur",
             "Aucun lecteur de CD sur la machine qui fait tourner Tune.".into(),
-        )));
+        ));
     };
-    let r = match tokio::task::spawn_blocking(move || lecteur.lire_toc()).await {
-        Ok(Ok(toc)) => return Ok(toc),
-        Ok(Err(ErreurCd::AucunDisque)) => Err(refus(
+    match tokio::task::spawn_blocking(move || lecteur.lire_toc()).await {
+        Ok(Ok(toc)) => Ok(toc),
+        Ok(Err(ErreurCd::AucunDisque)) => Err((
             StatusCode::CONFLICT,
             "aucun_disque",
             "Le lecteur est vide.".into(),
         )),
-        Ok(Err(e)) => Err(refus(StatusCode::BAD_GATEWAY, "lecture_toc", e.to_string())),
-        Err(e) => Err(refus(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "interne",
-            e.to_string(),
-        )),
-    };
-    r.map_err(Box::new)
+        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, "lecture_toc", e.to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, "interne", e.to_string())),
+    }
 }
 
 async fn etat_du_lecteur(State(etat): State<EtatRoutes>) -> Json<Value> {
@@ -113,7 +111,7 @@ fn elements(toc: &Toc, disc: &str, infos: Option<&InfosDisque>) -> Vec<ElementFi
 async fn disque(State(etat): State<EtatRoutes>) -> Response {
     let toc = match toc_ou_refus(&etat).await {
         Ok(v) => v,
-        Err(r) => return *r,
+        Err((code, motif, message)) => return refus(code, motif, message),
     };
     let disc = disc_id(&toc);
     let infos = etat.consultation.consulter(&disc).await;
@@ -157,36 +155,44 @@ struct DemandeJouer {
 }
 
 async fn jouer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeJouer>) -> Response {
-    let toc = match toc_ou_refus(&etat).await {
-        Ok(v) => v,
-        Err(r) => return *r,
-    };
+    match jouer_disque(&etat, d.zone_id, d.piste).await {
+        Ok(v) => Json(v).into_response(),
+        Err((code, motif, message)) => refus(code, motif, message),
+    }
+}
+
+/// Pose le disque entier en file sur la zone et joue la piste demandée (la
+/// 1ʳᵉ sans `piste`). Partagé par `POST /jouer` et par la délégation du
+/// registre des sources (`POST /api/v1/sources/cd/jouer`, #5065).
+pub(crate) async fn jouer_disque(
+    etat: &EtatRoutes,
+    zone_id: i64,
+    piste: Option<u8>,
+) -> Result<Value, Refus> {
+    let toc = toc_ou_refus(etat).await?;
     let disc = disc_id(&toc);
     let infos = etat.consultation.consulter(&disc).await;
     let file = elements(&toc, &disc, infos.as_ref());
-    let numero = d
-        .piste
-        .unwrap_or_else(|| file.first().map(|e| e.numero).unwrap_or(1));
+    let numero = piste.unwrap_or_else(|| file.first().map(|e| e.numero).unwrap_or(1));
     let Some(depart) = file.iter().position(|e| e.numero == numero) else {
-        return refus(
+        return Err((
             StatusCode::BAD_REQUEST,
             "piste_inconnue",
             format!("La piste {numero} n'est pas une piste audio de ce disque."),
-        );
+        ));
     };
     let longueur = file.len();
-    match etat.hote.jouer_file(d.zone_id, file, depart).await {
+    match etat.hote.jouer_file(zone_id, file, depart).await {
         Ok(()) => {
-            etat.zones.lock().await.insert(d.zone_id);
-            Json(json!({
-                "zone_id": d.zone_id,
+            etat.zones.lock().await.insert(zone_id);
+            Ok(json!({
+                "zone_id": zone_id,
                 "disc_id": disc,
                 "piste": numero,
                 "file": longueur,
             }))
-            .into_response()
         }
-        Err(e) => refus(StatusCode::BAD_GATEWAY, "lecture", e),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, "lecture", e)),
     }
 }
 
