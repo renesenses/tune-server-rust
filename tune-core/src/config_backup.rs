@@ -905,9 +905,13 @@ fn import_favorites(
         let item_type = fav["item_type"].as_str().unwrap_or_default();
         let item_id = fav["item_id"].as_i64().unwrap_or(0);
 
+        // #4983 — `INSERT OR IGNORE` est propre a SQLite : PostgreSQL le
+        // refuse, et la restauration s'arretait la. `ON CONFLICT … DO NOTHING`
+        // vaut pour les deux moteurs (SQLite >= 3.24), sur la contrainte
+        // UNIQUE(profile_id, item_type, item_id) que portent les deux schemas.
         let affected = backend.execute(
-            "INSERT OR IGNORE INTO favorites (profile_id, item_type, item_id) \
-             VALUES (?, ?, ?)",
+            "INSERT INTO favorites (profile_id, item_type, item_id) \
+             VALUES (?, ?, ?) ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
             &[
                 &profile_id as &dyn ToSqlValue,
                 &item_type.to_string() as &dyn ToSqlValue,
@@ -1579,6 +1583,12 @@ mod tests {
     fn playlist_d_une_sauvegarde_existante_restauree() {
         scenarios_playlists::une_sauvegarde_existante_se_restaure(&backend_sqlite());
     }
+
+    /// #4983 — temoin SQLite de non-regression : le doublon reste ignore.
+    #[test]
+    fn favoris_restaures_et_doublon_ignore() {
+        scenarios_favoris::un_favori_se_restaure_et_un_doublon_est_ignore(&backend_sqlite());
+    }
 }
 
 /// Contre-epreuves de `import_zones`, ecrites contre un `DbBackend` quelconque.
@@ -2066,6 +2076,74 @@ pub(crate) mod scenarios_playlists {
 
         import_config(backend, snapshot).expect("la restauration echoue");
         assert_eq!(pistes_restaurees(backend), ordre.to_vec());
+
+        effacer(backend);
+    }
+}
+
+/// #4983 — restauration des favoris, jouee sur SQLite par `mod tests` et sur
+/// une VRAIE base PostgreSQL par `db::postgres_e2e::pg_config_backup_zones_volume_fixe`.
+///
+/// La sauvegarde porte un favori deja present (doublon) et un nouveau : le
+/// nouveau entre, le doublon est ignore sans erreur, et la restauration va
+/// au bout. Sous PostgreSQL, `INSERT OR IGNORE` faisait echouer tout
+/// `import_config` a cet endroit.
+#[cfg(test)]
+pub(crate) mod scenarios_favoris {
+    use super::*;
+
+    const TYPE: &str = "album";
+    const DEJA_LA: i64 = 4_983_001;
+    const NOUVEAU: i64 = 4_983_002;
+
+    fn effacer(backend: &Arc<dyn DbBackend>) {
+        backend
+            .execute(
+                "DELETE FROM favorites WHERE profile_id = 1 AND item_type = ? AND item_id IN (?, ?)",
+                &[&TYPE as &dyn ToSqlValue, &DEJA_LA, &NOUVEAU],
+            )
+            .unwrap();
+    }
+
+    fn nombre(backend: &Arc<dyn DbBackend>, item_id: i64) -> i64 {
+        backend
+            .query_one(
+                "SELECT COUNT(*) FROM favorites WHERE profile_id = 1 AND item_type = ? AND item_id = ?",
+                &[&TYPE as &dyn ToSqlValue, &item_id],
+            )
+            .unwrap()
+            .unwrap()[0]
+            .as_i64()
+            .unwrap()
+    }
+
+    pub(crate) fn un_favori_se_restaure_et_un_doublon_est_ignore(backend: &Arc<dyn DbBackend>) {
+        effacer(backend);
+        backend
+            .execute(
+                "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, ?, ?)",
+                &[&TYPE as &dyn ToSqlValue, &DEJA_LA],
+            )
+            .unwrap();
+
+        let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "0.9.164",
+            "created_at": "2026-09-25T00:00:00Z",
+            "zones": [], "settings": [], "playlists": [], "radio_stations": [],
+            "alarms": [], "eq_presets": [], "room_profiles": [],
+            "favorites": [
+                {"id": 1, "profile_id": 1, "item_type": TYPE, "item_id": DEJA_LA,
+                 "created_at": "2026-09-01T00:00:00Z"},
+                {"id": 2, "profile_id": 1, "item_type": TYPE, "item_id": NOUVEAU,
+                 "created_at": "2026-09-02T00:00:00Z"}
+            ]
+        }))
+        .unwrap();
+
+        let report = import_config(backend, snapshot).expect("la restauration des favoris echoue");
+        assert_eq!(report.favorites_restored, 1, "{report:?}");
+        assert_eq!(nombre(backend, DEJA_LA), 1, "le doublon a ete insere");
+        assert_eq!(nombre(backend, NOUVEAU), 1, "le nouveau favori manque");
 
         effacer(backend);
     }
