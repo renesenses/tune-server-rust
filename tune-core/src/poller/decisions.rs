@@ -1429,6 +1429,14 @@ const MOUVEMENT_MINIMAL_MS: u64 = 1000;
 /// suffit). Les octets tirés ne valent PAS confirmation : un renderer qui
 /// télécharge n'est pas un renderer qui joue.
 ///
+/// 🔴 Fils 1926/1931 (Stéphane Villerio, DMP-A6, 0.9.163-0.9.164) : un
+/// renderer ARRÊTÉ n'est jamais un signe de vie (`renderer_arrete`). Un
+/// appareil qui acquitte le `Next` de #3967 puis se tait rapporte `STOPPED`
+/// et une position remise à 0 : l'écart avec la position gelée (237 s → 0)
+/// passait pour « la position repart » et confirmait la bascule. Plus aucun
+/// repli ne partait, la zone restait sur une piste 2 muette. Arrêté, on
+/// attend le délai, puis le repli relance la piste adoptée.
+///
 /// Sans signe de vie pendant `delai_secs`, l'adoption est infirmée : le
 /// repli reprend, sur la piste adoptée et non sur la suivante — sans cette
 /// surveillance, une position gelée à l'ancienne durée finirait par passer
@@ -1438,6 +1446,7 @@ pub fn suite_de_l_adoption(
     position_figee_ms: u64,
     current_uri: Option<&str>,
     flux_adopte: &str,
+    renderer_arrete: bool,
     age_secs: u64,
     delai_secs: u64,
 ) -> SuiteAdoption {
@@ -1445,7 +1454,9 @@ pub fn suite_de_l_adoption(
         && current_uri
             .map(str::trim)
             .is_some_and(|u| !u.is_empty() && u.contains(flux_adopte));
-    if uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS {
+    let signe_de_vie =
+        uri_confirme || position_ms.abs_diff(position_figee_ms) >= MOUVEMENT_MINIMAL_MS;
+    if signe_de_vie && !renderer_arrete {
         SuiteAdoption::Confirmee
     } else if age_secs >= delai_secs {
         SuiteAdoption::Infirmee
