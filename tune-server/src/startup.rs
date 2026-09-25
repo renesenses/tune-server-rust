@@ -293,6 +293,11 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     masquer_les_zones_reflet(state);
     cleanup_orphan_queues(state);
     reconcile_favorites(state);
+    // Coffrets automatiques (GO du 25/09/2026) : la passe sur la base
+    // EXISTANTE, sans relire un fichier. Après la réconciliation des paires
+    // « distinctes », que la passe consulte. Idempotente : sur une base déjà
+    // passée, trois lectures et rien d'écrit.
+    tune_core::db::coffrets_auto::passe_journalisee(&state.backend, "demarrage");
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
     restore_playback_positions(state).await;

@@ -269,6 +269,10 @@ pub fn router() -> Router<AppState> {
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),
         )
+        // Les coffrets RÉUNIS — l'onglet « Coffrets » de la Bibliothèque — et
+        // le geste qui défait un coffret automatique (GO du 25/09/2026).
+        .route("/coffrets", get(albums::lister_coffrets))
+        .route("/coffrets/{id}/defaire", post(albums::defaire_coffret))
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
