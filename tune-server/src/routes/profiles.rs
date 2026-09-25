@@ -735,7 +735,7 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
             rows.into_iter()
                 .map(|r| {
                     (
-                        r.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                        r.first().and_then(|v| v.as_string()).unwrap_or_default(),
                         r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                     )
                 })
@@ -862,7 +862,7 @@ async fn profile_history(
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "track_id": cols.get(1).and_then(|v| v.as_i64()),
                 "title": cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
                 "artist_name": cols.get(3).and_then(|v| v.as_string()),

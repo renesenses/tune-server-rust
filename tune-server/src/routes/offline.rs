@@ -452,12 +452,12 @@ async fn list_downloads(State(state): State<AppState>) -> Result<Json<Value>, Ap
         "SELECT id, source, source_id, track_title, artist_name, album_title, file_size, quality, status, error, downloaded_at \
          FROM offline_cache ORDER BY downloaded_at DESC LIMIT 200",
         &[],
-    ).map_err(|e| AppError::internal(e))?;
+    ).map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "source": r.get(1).and_then(|v| v.as_string()),
                 "source_id": r.get(2).and_then(|v| v.as_string()),
                 "track_title": r.get(3).and_then(|v| v.as_string()),
@@ -484,11 +484,11 @@ async fn download_status(
         "SELECT id, source, source_id, track_title, artist_name, album_title, file_path, file_size, quality, status, error, downloaded_at, expires_at \
          FROM offline_cache WHERE id = ?",
         &[&id as &dyn ToSqlValue],
-    ).map_err(|e| AppError::internal(e))?;
+    ).map_err(AppError::internal)?;
 
     match row {
         Some(r) => Ok(Json(json!({
-            "id": r.get(0).and_then(|v| v.as_i64()),
+            "id": r.first().and_then(|v| v.as_i64()),
             "source": r.get(1).and_then(|v| v.as_string()),
             "source_id": r.get(2).and_then(|v| v.as_string()),
             "track_title": r.get(3).and_then(|v| v.as_string()),
@@ -547,12 +547,12 @@ async fn list_offline_albums(State(state): State<AppState>) -> Result<Json<Value
          GROUP BY album_title, artist_name, source \
          ORDER BY album_title",
         &[],
-    ).map_err(|e| AppError::internal(e))?;
+    ).map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "album_title": r.get(0).and_then(|v| v.as_string()),
+                "album_title": r.first().and_then(|v| v.as_string()),
                 "artist_name": r.get(1).and_then(|v| v.as_string()),
                 "track_count": r.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
                 "total_size": r.get(3).and_then(|v| v.as_i64()).unwrap_or(0),
@@ -571,12 +571,12 @@ async fn list_offline_tracks(State(state): State<AppState>) -> Result<Json<Value
          WHERE status = 'completed' \
          ORDER BY track_title",
         &[],
-    ).map_err(|e| AppError::internal(e))?;
+    ).map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "source": r.get(1).and_then(|v| v.as_string()),
                 "source_id": r.get(2).and_then(|v| v.as_string()),
                 "track_title": r.get(3).and_then(|v| v.as_string()),
@@ -602,7 +602,7 @@ async fn sync_offline(State(state): State<AppState>) -> Result<impl IntoResponse
         .ou_defaut_journalise()
         .into_iter()
         .filter_map(|r| {
-            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let id = r.first().and_then(|v| v.as_i64())?;
             let path = r.get(1).and_then(|v| v.as_string())?;
             Some((id, path))
         })

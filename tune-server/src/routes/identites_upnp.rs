@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn identites_upnp_un_album_deja_porteur_de_la_cle_est_reutilise_et_les_coquilles_partent() {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-        let albums = AlbumRepo::with_backend(state.backend.clone());
+        let _albums = AlbumRepo::with_backend(state.backend.clone());
         let a = piste("A", "a");
         let b = piste("B", "b");
         assert_eq!(indexer(&state, "u", &[a.clone(), b]).albums_ajoutes, 1);

@@ -132,10 +132,9 @@ async fn lyrics_by_meta(
             .plain_lyrics
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            && let Some(resp) = plain_lines_response("lrclib", plain)
         {
-            if let Some(resp) = plain_lines_response("lrclib", plain) {
-                return resp;
-            }
+            return resp;
         }
         if entry.negative_still_fresh() {
             return no_lyrics_response();
@@ -164,10 +163,10 @@ async fn lyrics_by_meta(
                     return synced_lines_response("lrclib", &lines);
                 }
             }
-            if let Some(plain) = raw.plain_lyrics.as_deref() {
-                if let Some(resp) = plain_lines_response("lrclib", plain) {
-                    return resp;
-                }
+            if let Some(plain) = raw.plain_lyrics.as_deref()
+                && let Some(resp) = plain_lines_response("lrclib", plain)
+            {
+                return resp;
             }
             no_lyrics_response()
         }

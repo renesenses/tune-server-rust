@@ -280,15 +280,16 @@ pub(super) async fn artist_bio(
         .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
     let stored_ok = langue_convient(bio_lang, lang);
 
-    if let Some(ref bio) = artist.bio {
-        if !bio.is_empty() && stored_ok {
-            return Json(json!({
-                "artist": artist.name,
-                "bio": bio,
-                "bio_provenance": prov,
-            }))
-            .into_response();
-        }
+    if let Some(ref bio) = artist.bio
+        && !bio.is_empty()
+        && stored_ok
+    {
+        return Json(json!({
+            "artist": artist.name,
+            "bio": bio,
+            "bio_provenance": prov,
+        }))
+        .into_response();
     }
     // Community artist-bio API is keyed by NAME (AI-generated on demand) — NO
     // MusicBrainz id required, so it works for the whole library, most of which
@@ -637,7 +638,7 @@ pub(super) async fn artist_timeline(
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let mut albums = repo.list_by_artist(id).unwrap_or_default();
-    albums.sort_by(|a, b| a.year.unwrap_or(0).cmp(&b.year.unwrap_or(0)));
+    albums.sort_by_key(|a| a.year.unwrap_or(0));
 
     let years: Vec<i32> = albums.iter().filter_map(|a| a.year).collect();
     let mut gaps = Vec::new();

@@ -1213,13 +1213,13 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
         let credits = TrackRepo::with_backend(state.backend.clone())
             .get_credits(track_id)
             .unwrap_or_default();
-        if !credits.is_empty() {
-            if let Some(np) = v.get_mut("now_playing").and_then(|np| np.as_object_mut()) {
-                np.insert(
-                    "credits".into(),
-                    serde_json::to_value(&credits).unwrap_or_default(),
-                );
-            }
+        if !credits.is_empty()
+            && let Some(np) = v.get_mut("now_playing").and_then(|np| np.as_object_mut())
+        {
+            np.insert(
+                "credits".into(),
+                serde_json::to_value(&credits).unwrap_or_default(),
+            );
         }
     }
     // #3164 — « la surface que les clients interrogent en boucle » (#1274)
@@ -2743,54 +2743,53 @@ async fn resume(
     // celui de `PlaybackManager::stop` : « keep position_ms […] can resume from
     // the same position ». L'intention était écrite, l'instruction manquait
     // (#2876).
-    if current.state == tune_core::playback::PlayState::Stopped {
-        if let Some(ref np) = current.now_playing {
-            let output_device_id = get_zone_device_id(&state, zone_id);
-            let reprise =
-                position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
-            let orch_req = tune_core::orchestrator::PlayRequest {
-                zone_id,
-                output_device_id,
-                track_id: np.track_id,
-                source: if np.source == "local" {
-                    None
-                } else {
-                    Some(np.source.clone())
-                },
-                source_id: np.source_id.clone(),
-                title: Some(np.title.clone()),
-                artist_name: np.artist_name.clone(),
-                album_title: np.album_title.clone(),
-                cover_url: np.cover_path.clone(),
-                duration_ms: Some(np.duration_ms),
-                seek_ms: reprise,
-                temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
-                track_number: None,
-                disc_number: None,
-            };
-            ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
-            return match state.orchestrator.play(orch_req).await {
-                Ok(result) => {
-                    // Restore queue_length from DB so the poller can
-                    // advance tracks (fixes repeat-all after restart).
-                    let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                    let q_len = qr.count_all(zone_id).unwrap_or(0);
-                    if q_len > 0 {
-                        let cur_pos = state.playback.get_state(zone_id).await.queue_position;
-                        state
-                            .playback
-                            .update_queue_info(zone_id, cur_pos, q_len)
-                            .await;
-                    }
-                    Json(build_zone_json_with_result(&state, zone_id, &result).await)
-                        .into_response()
+    if current.state == tune_core::playback::PlayState::Stopped
+        && let Some(ref np) = current.now_playing
+    {
+        let output_device_id = get_zone_device_id(&state, zone_id);
+        let reprise =
+            position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
+        let orch_req = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: np.track_id,
+            source: if np.source == "local" {
+                None
+            } else {
+                Some(np.source.clone())
+            },
+            source_id: np.source_id.clone(),
+            title: Some(np.title.clone()),
+            artist_name: np.artist_name.clone(),
+            album_title: np.album_title.clone(),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(np.duration_ms),
+            seek_ms: reprise,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
+        return match state.orchestrator.play(orch_req).await {
+            Ok(result) => {
+                // Restore queue_length from DB so the poller can
+                // advance tracks (fixes repeat-all after restart).
+                let qr = PlayQueueRepo::with_backend(state.backend.clone());
+                let q_len = qr.count_all(zone_id).unwrap_or(0);
+                if q_len > 0 {
+                    let cur_pos = state.playback.get_state(zone_id).await.queue_position;
+                    state
+                        .playback
+                        .update_queue_info(zone_id, cur_pos, q_len)
+                        .await;
                 }
-                Err(e) => play_error_response(e, &lang),
-            };
-        }
+                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
+            }
+            Err(e) => play_error_response(e, &lang),
+        };
     }
 
     // Stopped with no now_playing (e.g. after server restart) — try to
@@ -4813,21 +4812,20 @@ async fn do_transfer(
                 // Reprendre à la position de la source. Sous 3 s on repart du
                 // début (même seuil que la route seek) — inutile de chercher
                 // dans un flux qui vient de démarrer.
-                if source_position_ms > 3000 {
-                    if let Err(error) = state
+                if source_position_ms > 3000
+                    && let Err(error) = state
                         .orchestrator
                         .seek(target_zone, source_position_ms, Some(did))
                         .await
-                    {
-                        return output_command_error_response(error);
-                    }
+                {
+                    return output_command_error_response(error);
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
-                if source_paused {
-                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
-                        return output_command_error_response(error);
-                    }
+                if source_paused
+                    && let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await
+                {
+                    return output_command_error_response(error);
                 }
             }
             Err(e) => {
@@ -4895,7 +4893,7 @@ async fn get_alarms(
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "zone_id": r.get(1).and_then(|v| v.as_i64()),
                 "time": r.get(2).and_then(|v| v.as_string()),
                 "enabled": r.get(3).and_then(|v| v.as_i64()).unwrap_or(1) != 0,

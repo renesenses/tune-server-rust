@@ -747,20 +747,19 @@ pub(super) async fn track_all_tags(
         .file_path
         .as_deref()
         .and_then(tune_core::library::local_path::resolve_existing_local_path)
+        && let Ok(tagged) = lofty::read_from_path(&path)
     {
-        if let Ok(tagged) = lofty::read_from_path(&path) {
-            let tags: Vec<Value> = tagged
-                .tags()
-                .iter()
-                .map(|tag| {
-                    json!({
-                        "tag_type": format!("{:?}", tag.tag_type()),
-                        "items": tag.items().map(|item| format!("{:?}", item)).collect::<Vec<_>>(),
-                    })
+        let tags: Vec<Value> = tagged
+            .tags()
+            .iter()
+            .map(|tag| {
+                json!({
+                    "tag_type": format!("{:?}", tag.tag_type()),
+                    "items": tag.items().map(|item| format!("{:?}", item)).collect::<Vec<_>>(),
                 })
-                .collect();
-            result["file_tags"] = json!(tags);
-        }
+            })
+            .collect();
+        result["file_tags"] = json!(tags);
     }
 
     Json(result).into_response()
@@ -801,12 +800,12 @@ pub(super) async fn track_lyrics(
     };
 
     // 1. Sidecar .lrc / .LRC next to the audio file.
-    if let Some(ref path) = track.file_path {
-        if let Some(content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
-            let lines = tune_core::metadata::lyrics::parse_lrc(&content);
-            if !lines.is_empty() {
-                return synced_response("lrc", &lines);
-            }
+    if let Some(ref path) = track.file_path
+        && let Some(content) = tune_core::metadata::lyrics::find_sidecar_lrc(path)
+    {
+        let lines = tune_core::metadata::lyrics::parse_lrc(&content);
+        if !lines.is_empty() {
+            return synced_response("lrc", &lines);
         }
     }
 
@@ -878,10 +877,9 @@ pub(super) async fn track_lyrics(
             .plain_lyrics
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            && let Some(resp) = plain_response("lrclib", plain)
         {
-            if let Some(resp) = plain_response("lrclib", plain) {
-                return resp;
-            }
+            return resp;
         }
         if entry.negative_still_fresh() {
             return no_lyrics();
@@ -915,10 +913,10 @@ pub(super) async fn track_lyrics(
                     return synced_response("lrclib", &lines);
                 }
             }
-            if let Some(plain) = raw.plain_lyrics.as_deref() {
-                if let Some(resp) = plain_response("lrclib", plain) {
-                    return resp;
-                }
+            if let Some(plain) = raw.plain_lyrics.as_deref()
+                && let Some(resp) = plain_response("lrclib", plain)
+            {
+                return resp;
             }
             no_lyrics()
         }
@@ -949,17 +947,17 @@ pub(super) async fn track_synced_lyrics(
         _ => return (StatusCode::NOT_FOUND, "track not found").into_response(),
     };
 
-    if let Some(ref path) = track.file_path {
-        if let Some(lrc_content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
-            let lines = tune_core::metadata::lyrics::parse_lrc(&lrc_content);
-            if !lines.is_empty() {
-                let json_str = serde_json::to_string(&lines).unwrap_or_default();
-                repo.set_synced_lyrics(id, &json_str).ok();
-                return Json(
-                    json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" }),
-                )
-                .into_response();
-            }
+    if let Some(ref path) = track.file_path
+        && let Some(lrc_content) = tune_core::metadata::lyrics::find_sidecar_lrc(path)
+    {
+        let lines = tune_core::metadata::lyrics::parse_lrc(&lrc_content);
+        if !lines.is_empty() {
+            let json_str = serde_json::to_string(&lines).unwrap_or_default();
+            repo.set_synced_lyrics(id, &json_str).ok();
+            return Json(
+                json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" }),
+            )
+            .into_response();
         }
     }
 
@@ -1206,7 +1204,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                 // Un jalon, pas une publication par piste : le registre émet un
                 // événement WebSocket à chaque changement.
                 let traitees = updated + skipped + errors;
-                if traitees % JALON_AVANCEMENT_RESCAN == 0 {
+                if traitees.is_multiple_of(JALON_AVANCEMENT_RESCAN) {
                     taches.update_progress(
                         TACHE_RESCAN_METADATA,
                         traitees as u64,
@@ -1384,16 +1382,16 @@ pub(super) async fn track_metadata_put(
 
     // Write tags to file (best-effort, don't fail the request)
     let mut file_write_error: Option<String> = None;
-    if let Some(ref path) = file_path {
-        if let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await {
-            tracing::warn!(
-                track_id = id,
-                path = path.as_str(),
-                error = e.as_str(),
-                "tag_write_to_file_failed"
-            );
-            file_write_error = Some(e);
-        }
+    if let Some(ref path) = file_path
+        && let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await
+    {
+        tracing::warn!(
+            track_id = id,
+            path = path.as_str(),
+            error = e.as_str(),
+            "tag_write_to_file_failed"
+        );
+        file_write_error = Some(e);
     }
 
     let mut resp = json!({"status": "ok", "fields": body.len()});

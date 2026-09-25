@@ -494,40 +494,42 @@ async fn local_ai_query(
         let tracks = search_result["tracks"].as_array();
 
         // Prefer album match
-        if let Some(albums) = albums {
-            if let Some(first) = albums.first() {
-                if let Some(title) = first["title"].as_str() {
-                    let result = executor
-                        .execute("play_album", json!({ "album_name": title }))
-                        .await;
-                    actions.push(json!({ "tool": "play_album", "input": { "album_name": title }, "result": result }));
-                    let artist = result["artist"].as_str().unwrap_or("");
-                    let count = result["track_count"].as_i64().unwrap_or(0);
-                    return Ok(Json(json!({
-                        "reply": tr("ai.playingCount").replace("{title}", title).replace("{artist}", artist).replace("{count}", &count.to_string()),
-                        "actions": actions,
-                        "zone_id": executor.zone_id(),
-                    })));
-                }
-            }
+        if let Some(albums) = albums
+            && let Some(first) = albums.first()
+            && let Some(title) = first["title"].as_str()
+        {
+            let result = executor
+                .execute("play_album", json!({ "album_name": title }))
+                .await;
+            actions.push(
+                json!({ "tool": "play_album", "input": { "album_name": title }, "result": result }),
+            );
+            let artist = result["artist"].as_str().unwrap_or("");
+            let count = result["track_count"].as_i64().unwrap_or(0);
+            return Ok(Json(json!({
+                "reply": tr("ai.playingCount").replace("{title}", title).replace("{artist}", artist).replace("{count}", &count.to_string()),
+                "actions": actions,
+                "zone_id": executor.zone_id(),
+            })));
         }
 
         // Fall back to track match
-        if let Some(tracks) = tracks {
-            if let Some(first) = tracks.first() {
-                if let Some(title) = first["title"].as_str() {
-                    let result = executor
-                        .execute("play_track", json!({ "track_name": title }))
-                        .await;
-                    actions.push(json!({ "tool": "play_track", "input": { "track_name": title }, "result": result }));
-                    let artist = result["artist"].as_str().unwrap_or("");
-                    return Ok(Json(json!({
-                        "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
-                        "actions": actions,
-                        "zone_id": executor.zone_id(),
-                    })));
-                }
-            }
+        if let Some(tracks) = tracks
+            && let Some(first) = tracks.first()
+            && let Some(title) = first["title"].as_str()
+        {
+            let result = executor
+                .execute("play_track", json!({ "track_name": title }))
+                .await;
+            actions.push(
+                json!({ "tool": "play_track", "input": { "track_name": title }, "result": result }),
+            );
+            let artist = result["artist"].as_str().unwrap_or("");
+            return Ok(Json(json!({
+                "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
+                "actions": actions,
+                "zone_id": executor.zone_id(),
+            })));
         }
 
         return Ok(Json(json!({
@@ -615,37 +617,39 @@ async fn local_ai_query(
     let albums = result["albums"].as_array();
     let tracks = result["tracks"].as_array();
 
-    if let Some(albums) = albums {
-        if let Some(first) = albums.first() {
-            if let Some(title) = first["title"].as_str() {
-                let play = executor
-                    .execute("play_album", json!({ "album_name": title }))
-                    .await;
-                actions.push(json!({ "tool": "play_album", "input": { "album_name": title }, "result": play }));
-                let artist = play["artist"].as_str().unwrap_or("");
-                return Ok(Json(json!({
-                    "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
-                    "actions": actions,
-                    "zone_id": executor.zone_id(),
-                })));
-            }
-        }
+    if let Some(albums) = albums
+        && let Some(first) = albums.first()
+        && let Some(title) = first["title"].as_str()
+    {
+        let play = executor
+            .execute("play_album", json!({ "album_name": title }))
+            .await;
+        actions.push(
+            json!({ "tool": "play_album", "input": { "album_name": title }, "result": play }),
+        );
+        let artist = play["artist"].as_str().unwrap_or("");
+        return Ok(Json(json!({
+            "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
+            "actions": actions,
+            "zone_id": executor.zone_id(),
+        })));
     }
-    if let Some(tracks) = tracks {
-        if let Some(first) = tracks.first() {
-            if let Some(title) = first["title"].as_str() {
-                let play = executor
-                    .execute("play_track", json!({ "track_name": title }))
-                    .await;
-                actions.push(json!({ "tool": "play_track", "input": { "track_name": title }, "result": play }));
-                let artist = play["artist"].as_str().unwrap_or("");
-                return Ok(Json(json!({
-                    "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
-                    "actions": actions,
-                    "zone_id": executor.zone_id(),
-                })));
-            }
-        }
+    if let Some(tracks) = tracks
+        && let Some(first) = tracks.first()
+        && let Some(title) = first["title"].as_str()
+    {
+        let play = executor
+            .execute("play_track", json!({ "track_name": title }))
+            .await;
+        actions.push(
+            json!({ "tool": "play_track", "input": { "track_name": title }, "result": play }),
+        );
+        let artist = play["artist"].as_str().unwrap_or("");
+        return Ok(Json(json!({
+            "reply": tr("ai.playing").replace("{title}", title).replace("{artist}", artist),
+            "actions": actions,
+            "zone_id": executor.zone_id(),
+        })));
     }
 
     Ok(Json(json!({
@@ -840,10 +844,10 @@ fn parse_volume(msg: &str) -> Option<f64> {
         return None;
     }
     for word in msg.split(|c: char| !c.is_ascii_digit() && c != '.') {
-        if let Ok(v) = word.parse::<f64>() {
-            if v >= 0.0 && v <= 100.0 {
-                return Some(v / 100.0);
-            }
+        if let Ok(v) = word.parse::<f64>()
+            && (0.0..=100.0).contains(&v)
+        {
+            return Some(v / 100.0);
         }
     }
     None

@@ -198,10 +198,9 @@ fn extract_year_from_path(path: &str) -> Option<u32> {
             if let Ok(y) = std::str::from_utf8(&b[i..i + 4])
                 .unwrap_or("")
                 .parse::<u32>()
+                && (1900..=2099).contains(&y)
             {
-                if (1900..=2099).contains(&y) {
-                    best = Some(y);
-                }
+                best = Some(y);
             }
             i += 4;
         } else {
@@ -244,7 +243,7 @@ fn albums_missing_year(state: &AppState) -> Result<Vec<(i64, String)>, String> {
     Ok(rows
         .into_iter()
         .filter_map(|r| {
-            let id = r.get(0).and_then(|v| v.as_i64())?;
+            let id = r.first().and_then(|v| v.as_i64())?;
             let path = r.get(1).and_then(|v| v.as_string())?;
             Some((id, path))
         })
@@ -1276,27 +1275,24 @@ async fn enrich_artist(
                             break;
                         }
                         if let Ok(wiki) = client
-                            .get(&format!(
+                            .get(format!(
                                 "https://{wiki_lang}.wikipedia.org/api/rest_v1/page/summary/{}",
                                 urlencoding::encode(&artist.name)
                             ))
                             .timeout(std::time::Duration::from_secs(10))
                             .send()
                             .await
+                            && let Ok(wd) = wiki.json::<serde_json::Value>().await
+                            && let Some(extract) = wd["extract"].as_str()
+                            && extract.len() > bio.len()
                         {
-                            if let Ok(wd) = wiki.json::<serde_json::Value>().await {
-                                if let Some(extract) = wd["extract"].as_str() {
-                                    if extract.len() > bio.len() {
-                                        bio = extract.to_string();
-                                        bio_source = "wikipedia".to_string();
-                                        bio_license = "CC-BY-SA-4.0".to_string();
-                                        bio_lang = wiki_lang.clone();
-                                        bio_url = wd["content_urls"]["desktop"]["page"]
-                                            .as_str()
-                                            .map(String::from);
-                                    }
-                                }
-                            }
+                            bio = extract.to_string();
+                            bio_source = "wikipedia".to_string();
+                            bio_license = "CC-BY-SA-4.0".to_string();
+                            bio_lang = wiki_lang.clone();
+                            bio_url = wd["content_urls"]["desktop"]["page"]
+                                .as_str()
+                                .map(String::from);
                         }
                     }
                 }
@@ -1498,10 +1494,10 @@ fn normalize_genre(
         }
         // Synonym -> canonical bucket, but only if that bucket exists.
         for tag in tags {
-            if let Some(&bucket) = gmap.get(tag.to_lowercase().trim()) {
-                if let Some(hit) = allowed.get(&bucket.to_lowercase()) {
-                    return Some(hit.clone());
-                }
+            if let Some(&bucket) = gmap.get(tag.to_lowercase().trim())
+                && let Some(hit) = allowed.get(&bucket.to_lowercase())
+            {
+                return Some(hit.clone());
             }
         }
         return None;
@@ -1587,10 +1583,10 @@ fn strip_ensemble_suffix(name: &str) -> String {
             return name[..cut].trim().to_string();
         }
         // Also match "all star <word>" or "all-star <word>".
-        if let Some(pos) = lower.rfind(pat) {
-            if pos > 0 {
-                return name[..pos].trim().to_string();
-            }
+        if let Some(pos) = lower.rfind(pat)
+            && pos > 0
+        {
+            return name[..pos].trim().to_string();
         }
     }
 
@@ -1618,10 +1614,10 @@ fn strip_ensemble_suffix(name: &str) -> String {
         "& his ",
         "& her ",
     ] {
-        if let Some(pos) = lower.rfind(pat) {
-            if pos > 0 {
-                return name[..pos].trim().to_string();
-            }
+        if let Some(pos) = lower.rfind(pat)
+            && pos > 0
+        {
+            return name[..pos].trim().to_string();
         }
     }
 
@@ -1682,10 +1678,13 @@ struct CoherenceParams {
     min_coherence: Option<f64>,
 }
 
+/// Un album et son artiste, tels que la propagation de genres les lit.
+type AlbumEtArtiste = (i64, String, Option<String>, Option<i64>, Option<String>);
+
 /// Helper: fetch all albums with artist info for genre propagation.
 fn fetch_albums_with_artists(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-) -> Result<Vec<(i64, String, Option<String>, Option<i64>, Option<String>)>, String> {
+) -> Result<Vec<AlbumEtArtiste>, String> {
     let rows = backend.query_many(
         "SELECT al.id, al.title, al.genre, al.artist_id, ar.name as artist_name \
          FROM albums al \
@@ -1698,7 +1697,7 @@ fn fetch_albums_with_artists(
         .into_iter()
         .map(|r| {
             (
-                r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                 r.get(2).and_then(|v| v.as_string()),
                 r.get(3).and_then(|v| v.as_i64()),
@@ -2155,7 +2154,7 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
                 rows.into_iter()
                     .map(|r| {
                         (
-                            r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                            r.first().and_then(|v| v.as_i64()).unwrap_or(0),
                             r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
                             r.get(2).and_then(|v| v.as_string()),
                         )
@@ -2239,78 +2238,74 @@ async fn fix_genres(State(state): State<AppState>) -> impl IntoResponse {
                 .send()
                 .await;
 
-            if let Ok(resp) = resp {
-                if resp.status().is_success() {
-                    if let Ok(data) = resp.json::<serde_json::Value>().await {
-                        let tags: Vec<String> = data
-                            .get("album")
-                            .and_then(|a| a.get("tags"))
-                            .and_then(|t| t.get("tag"))
-                            .and_then(|t| t.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
-                                    .map(|s| s.to_string())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        genre = normalize_genre(&tags, allowed_genres.as_ref(), &gmap);
-                    }
-                }
+            if let Ok(resp) = resp
+                && resp.status().is_success()
+                && let Ok(data) = resp.json::<serde_json::Value>().await
+            {
+                let tags: Vec<String> = data
+                    .get("album")
+                    .and_then(|a| a.get("tags"))
+                    .and_then(|t| t.get("tag"))
+                    .and_then(|t| t.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+                            .map(|s| s.to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                genre = normalize_genre(&tags, allowed_genres.as_ref(), &gmap);
             }
         }
 
         // 2) Discogs fallback
-        if genre.is_none() {
-            if let Some(ref token) = discogs_token {
-                let mut query_params = vec![
-                    ("release_title".to_string(), clean_title.clone()),
-                    ("type".to_string(), "release".to_string()),
-                    ("per_page".to_string(), "3".to_string()),
-                ];
-                if !artist_name.is_empty() && artist_name != "Unknown Artist" && artist_name != "?"
+        if genre.is_none()
+            && let Some(ref token) = discogs_token
+        {
+            let mut query_params = vec![
+                ("release_title".to_string(), clean_title.clone()),
+                ("type".to_string(), "release".to_string()),
+                ("per_page".to_string(), "3".to_string()),
+            ];
+            if !artist_name.is_empty() && artist_name != "Unknown Artist" && artist_name != "?" {
+                query_params.push(("artist".to_string(), artist_name.to_string()));
+            }
+
+            let resp = client
+                .get("https://api.discogs.com/database/search")
+                .query(&query_params)
+                .header("User-Agent", "TuneServer/2.0 +https://mozaiklabs.fr")
+                .header("Authorization", format!("Discogs token={token}"))
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp {
+                if resp.status().as_u16() == 429 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } else if resp.status().is_success()
+                    && let Ok(data) = resp.json::<serde_json::Value>().await
+                    && let Some(results) = data.get("results").and_then(|r| r.as_array())
                 {
-                    query_params.push(("artist".to_string(), artist_name.to_string()));
-                }
-
-                let resp = client
-                    .get("https://api.discogs.com/database/search")
-                    .query(&query_params)
-                    .header("User-Agent", "TuneServer/2.0 +https://mozaiklabs.fr")
-                    .header("Authorization", format!("Discogs token={token}"))
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await;
-
-                if let Ok(resp) = resp {
-                    if resp.status().as_u16() == 429 {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    } else if resp.status().is_success() {
-                        if let Ok(data) = resp.json::<serde_json::Value>().await {
-                            if let Some(results) = data.get("results").and_then(|r| r.as_array()) {
-                                for hit in results {
-                                    let mut styles: Vec<String> = Vec::new();
-                                    if let Some(arr) = hit.get("style").and_then(|v| v.as_array()) {
-                                        for v in arr {
-                                            if let Some(s) = v.as_str() {
-                                                styles.push(s.to_string());
-                                            }
-                                        }
-                                    }
-                                    if let Some(arr) = hit.get("genre").and_then(|v| v.as_array()) {
-                                        for v in arr {
-                                            if let Some(s) = v.as_str() {
-                                                styles.push(s.to_string());
-                                            }
-                                        }
-                                    }
-                                    genre =
-                                        normalize_genre(&styles, allowed_genres.as_ref(), &gmap);
-                                    if genre.is_some() {
-                                        break;
-                                    }
+                    for hit in results {
+                        let mut styles: Vec<String> = Vec::new();
+                        if let Some(arr) = hit.get("style").and_then(|v| v.as_array()) {
+                            for v in arr {
+                                if let Some(s) = v.as_str() {
+                                    styles.push(s.to_string());
                                 }
                             }
+                        }
+                        if let Some(arr) = hit.get("genre").and_then(|v| v.as_array()) {
+                            for v in arr {
+                                if let Some(s) = v.as_str() {
+                                    styles.push(s.to_string());
+                                }
+                            }
+                        }
+                        genre = normalize_genre(&styles, allowed_genres.as_ref(), &gmap);
+                        if genre.is_some() {
+                            break;
                         }
                     }
                 }
@@ -2412,25 +2407,25 @@ async fn fetch_album_cover(
     };
 
     // Step 2: Try Cover Art Archive
-    if let Some(ref mbid_val) = mbid {
-        if let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await {
-            let cache_dir = super::library::artwork_cache_dir();
-            // Adressage par le CONTENU (#1444). Route de RE-téléchargement
-            // (`force_update_cover_path`) : écrire sous `artwork_hash(mbid)`
-            // gardait l'adresse déjà distribuée, servie `immutable,
-            // max-age=31536000` — la nouvelle pochette n'apparaissait pas.
-            if let Some(hash) =
-                tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
-            {
-                repo.force_update_cover_path(id, &hash).ok();
-                return Json(json!({
-                    "ok": true,
-                    "cover_path": hash,
-                    "source": "coverartarchive",
-                    "size": data.len(),
-                }))
-                .into_response();
-            }
+    if let Some(ref mbid_val) = mbid
+        && let Some(data) = tune_core::library::artwork::fetch_cover_art(mbid_val).await
+    {
+        let cache_dir = super::library::artwork_cache_dir();
+        // Adressage par le CONTENU (#1444). Route de RE-téléchargement
+        // (`force_update_cover_path`) : écrire sous `artwork_hash(mbid)`
+        // gardait l'adresse déjà distribuée, servie `immutable,
+        // max-age=31536000` — la nouvelle pochette n'apparaissait pas.
+        if let Some(hash) =
+            tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
+        {
+            repo.force_update_cover_path(id, &hash).ok();
+            return Json(json!({
+                "ok": true,
+                "cover_path": hash,
+                "source": "coverartarchive",
+                "size": data.len(),
+            }))
+            .into_response();
         }
     }
 

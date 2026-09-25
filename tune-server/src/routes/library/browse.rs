@@ -112,41 +112,41 @@ pub(super) async fn browse_roots(
     let none_populated = roots
         .iter()
         .all(|r| r.get("track_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0);
-    if none_populated {
-        if let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref()) {
-            let pattern = tune_core::db::track_repo::folder_like_pattern(&base);
-            let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-                "$1"
-            } else {
-                "?1"
-            };
-            let esc = tune_core::db::track_repo::like_escape_clause();
-            let count: i64 = state
-                .backend
-                .query_one(
-                    &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
-                    &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-                )
-                .ok()
-                .flatten()
-                .and_then(|r| r.first().and_then(|v| v.as_i64()))
-                .unwrap_or(0);
-            let dup = roots
-                .iter()
-                .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
-            if count > 0 && !dup {
-                let name = std::path::Path::new(&base)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&base)
-                    .to_string();
-                let exists = std::path::Path::new(&base).is_dir();
-                warn!(root = %base, count, "browse_roots_data_derived_fallback");
-                roots.push(json!({
-                    "path": base, "name": name, "track_count": count,
-                    "exists": exists, "derived": true
-                }));
-            }
+    if none_populated
+        && let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref())
+    {
+        let pattern = tune_core::db::track_repo::folder_like_pattern(&base);
+        let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+            "$1"
+        } else {
+            "?1"
+        };
+        let esc = tune_core::db::track_repo::like_escape_clause();
+        let count: i64 = state
+            .backend
+            .query_one(
+                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
+                &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap_or(0);
+        let dup = roots
+            .iter()
+            .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
+        if count > 0 && !dup {
+            let name = std::path::Path::new(&base)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&base)
+                .to_string();
+            let exists = std::path::Path::new(&base).is_dir();
+            warn!(root = %base, count, "browse_roots_data_derived_fallback");
+            roots.push(json!({
+                "path": base, "name": name, "track_count": count,
+                "exists": exists, "derived": true
+            }));
         }
     }
 
