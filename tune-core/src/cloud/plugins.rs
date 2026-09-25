@@ -293,9 +293,19 @@ impl PluginMarketplace {
     }
 }
 
+/// Remplace l'adresse de la boutique (mozaiklabs.fr par défaut).
+///
+/// Sert à éprouver le chemin « catalogue → téléchargement → installation »
+/// contre une boutique de banc, sans jamais toucher la vraie (#4715). Une
+/// valeur vide est ignorée : la boutique publique reste la valeur par défaut.
+pub const MARKETPLACE_URL_ENV: &str = "TUNE_MARKETPLACE_URL";
+
 impl Default for PluginMarketplace {
     fn default() -> Self {
-        Self::new(None)
+        let depuis_env = std::env::var(MARKETPLACE_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        Self::new(depuis_env.as_deref())
     }
 }
 

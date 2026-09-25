@@ -531,6 +531,11 @@ jobs:
           mkdir -p package/plugins/party
           cp tune-server/tests/fixtures/plugins/party/main.wasm package/plugins/party/
           cp tune-server/tests/fixtures/plugins/party/manifest.json package/plugins/party/
+          # « Playlists converter » (WASM, Premium, #4715), livré comme Party et
+          # depuis son fixture commité, que les essais greffon_* éprouvent.
+          mkdir -p package/plugins/playlists-converter
+          cp tune-server/tests/fixtures/plugins/playlists-converter/main.wasm package/plugins/playlists-converter/
+          cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json package/plugins/playlists-converter/
           # Bundle airplay-daemon next to tune-server if it built for this target.
           DAEMON=""
           if [ -f "$RUNNER_TEMP/apd/bin/airplay-daemon" ]; then
@@ -728,6 +733,10 @@ jobs:
           mkdir package\plugins\party
           copy tune-server\tests\fixtures\plugins\party\main.wasm package\plugins\party\
           copy tune-server\tests\fixtures\plugins\party\manifest.json package\plugins\party\
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          mkdir package\plugins\playlists-converter
+          copy tune-server\tests\fixtures\plugins\playlists-converter\main.wasm package\plugins\playlists-converter\
+          copy tune-server\tests\fixtures\plugins\playlists-converter\manifest.json package\plugins\playlists-converter\
           cd package
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
@@ -767,6 +776,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path "plugins\party" | Out-Null
           copy "tune-server\tests\fixtures\plugins\party\main.wasm" "plugins\party\"
           copy "tune-server\tests\fixtures\plugins\party\manifest.json" "plugins\party\"
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          New-Item -ItemType Directory -Force -Path "plugins\playlists-converter" | Out-Null
+          copy "tune-server\tests\fixtures\plugins\playlists-converter\main.wasm" "plugins\playlists-converter\"
+          copy "tune-server\tests\fixtures\plugins\playlists-converter\manifest.json" "plugins\playlists-converter\"
           @"
           !include "MUI2.nsh"
           Name "Tune Server"
@@ -801,6 +814,10 @@ jobs:
             SetOutPath "`$INSTDIR\plugins\party"
             File "plugins\party\main.wasm"
             File "plugins\party\manifest.json"
+            ; Bundled Playlists converter (WASM, Premium, #4715)
+            SetOutPath "`$INSTDIR\plugins\playlists-converter"
+            File "plugins\playlists-converter\main.wasm"
+            File "plugins\playlists-converter\manifest.json"
 
             ; Launcher script
             SetOutPath "`$INSTDIR"
@@ -904,6 +921,10 @@ jobs:
           mkdir -p "$APP/Contents/Resources/plugins/party"
           cp tune-server/tests/fixtures/plugins/party/main.wasm "$APP/Contents/Resources/plugins/party/"
           cp tune-server/tests/fixtures/plugins/party/manifest.json "$APP/Contents/Resources/plugins/party/"
+          # « Playlists converter » (WASM, Premium, #4715), comme Party.
+          mkdir -p "$APP/Contents/Resources/plugins/playlists-converter"
+          cp tune-server/tests/fixtures/plugins/playlists-converter/main.wasm "$APP/Contents/Resources/plugins/playlists-converter/"
+          cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json "$APP/Contents/Resources/plugins/playlists-converter/"
           # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
           on run

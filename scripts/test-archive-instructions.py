@@ -39,12 +39,17 @@ class ArchiveInstructions(unittest.TestCase):
                 "web/index.html": b"web fixture\n",
                 "tune-server/tests/fixtures/plugins/party/main.wasm": b"plugin fixture\n",
                 "tune-server/tests/fixtures/plugins/party/manifest.json": b"{}\n",
+                "tune-server/tests/fixtures/plugins/playlists-converter/main.wasm": b"converter fixture\n",
+                "tune-server/tests/fixtures/plugins/playlists-converter/manifest.json": b"{\"id\":1}\n",
             }
             expected = {
                 "tune-server": inputs[f"target/{target}/release/tune-server"],
                 "web/index.html": inputs["web/index.html"],
                 "plugins/party/main.wasm": inputs["tune-server/tests/fixtures/plugins/party/main.wasm"],
                 "plugins/party/manifest.json": b"{}\n",
+                # #4715 : « Playlists converter », livré comme Party.
+                "plugins/playlists-converter/main.wasm": b"converter fixture\n",
+                "plugins/playlists-converter/manifest.json": b"{\"id\":1}\n",
             }
             if extras:
                 inputs.update({
