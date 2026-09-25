@@ -415,24 +415,44 @@ fn le_drainage_attend_la_fin_reelle_de_la_chaine() {
     let garde = &prod[fin_chaine..draine];
 
     let milieu = &prod[debut..fin_chaine];
-    let garde_format = milieu
+    // #4953 : la frontière de format de la piste enchaînée vit dans l'étage,
+    // `EtageDeConversion::enchainer_la_piste` — c'est ELLE qui draine, sous la
+    // garde de changement de format, et la boucle l'appelle AVANT de
+    // reconstruire le convolveur. La boucle elle-même ne draine plus rien.
+    const FRONTIERE: &str = "etage.enchainer_la_piste(";
+    assert_eq!(
+        milieu.matches(DRAINAGE).count() + milieu.matches("flush_local_dsp(").count(),
+        0,
+        "le drainage de la frontière gapless appartient à l'étage (#4953)"
+    );
+    assert_eq!(
+        milieu.matches(FRONTIERE).count(),
+        1,
+        "la boucle gapless doit passer une fois par la frontière de l'étage"
+    );
+    let appel = milieu.find(FRONTIERE).expect("la frontière de l'étage");
+    assert!(
+        milieu[appel..].contains("rebuild_local_convolver("),
+        "la frontière (et son drainage) doit précéder la reconstruction du convolveur"
+    );
+    let corps = methode_de_l_etage(prod, "enchainer_la_piste");
+    const DRAINAGE_DE_L_ETAGE: &str = "self.rendre_la_queue_du_dsp(";
+    let garde_format = corps
         .find("if convolver_format_changed {")
         .expect("un changement de format gapless doit être traité explicitement (#2210)");
-    let draine_transition = milieu[garde_format..]
-        .find(DRAINAGE)
+    let draine_transition = corps[garde_format..]
+        .find(DRAINAGE_DE_L_ETAGE)
         .map(|i| garde_format + i)
         .expect("l'ancien moteur doit rendre sa queue avant d'être remplacé");
     assert_eq!(
-        milieu.matches(DRAINAGE).count() + milieu.matches("flush_local_dsp(").count(),
+        corps.matches(DRAINAGE_DE_L_ETAGE).count() + corps.matches("flush_local_dsp(").count(),
         1,
-        "un seul drainage est permis dans la boucle : celui du changement de format"
+        "un seul drainage est permis à la frontière : celui du changement de format"
     );
     assert!(
-        !milieu[..garde_format].contains(DRAINAGE)
-            && garde_format < draine_transition
-            && milieu[draine_transition..].contains("rebuild_local_convolver("),
-        "le drainage intermédiaire doit rester sous la garde de changement de format \
-         et précéder la reconstruction ; à format identique il briserait le gapless (#2296)"
+        !corps[..garde_format].contains(DRAINAGE_DE_L_ETAGE) && garde_format < draine_transition,
+        "le drainage intermédiaire doit rester sous la garde de changement de format ; \
+         à format identique il briserait le gapless (#2296)"
     );
     assert!(
         garde.contains("if http_eof")
@@ -456,14 +476,13 @@ fn le_gapless_preserve_le_resampler_si_la_cadence_ne_change_pas() {
     let src = source();
     let prod = production(&src);
     // R1 (#2219) : le format source vit dans l'étage de conversion.
-    let debut = prod
-        .find("let prev_sr = etage.sample_rate")
+    // #4953 : la transition EST la frontière de l'étage, que la boucle appelle
+    // (`le_drainage_attend_la_fin_reelle_de_la_chaine` garde cet appel).
+    let corps = methode_de_l_etage(prod, "enchainer_la_piste");
+    let debut = corps
+        .find("let prev_sr = self.sample_rate")
         .expect("la transition doit mémoriser la cadence précédente");
-    let fin = prod[debut..]
-        .find("L'enchaînement est acquis")
-        .map(|i| debut + i)
-        .expect("la fin de la négociation gapless doit être identifiable");
-    let transition = &prod[debut..fin];
+    let transition = &corps[debut..];
 
     assert!(
         transition.contains("prev_needs_resample && (new_sr != prev_sr || !next_needs_resample)"),
@@ -574,8 +593,19 @@ fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
         .split("// ------- Open cpal device (shared mode) -------")
         .nth(1)
         .expect("le chemin cpal partagé doit rester identifiable");
+    // #4953 : la frontière gapless qui change de cadence vide par `self.vider(`
+    // dans `enchainer_la_piste`, que le chemin partagé appelle une fois.
+    assert!(
+        partage.matches("etage.enchainer_la_piste(").count() == 1
+            && methode_de_l_etage(prod, "enchainer_la_piste")
+                .matches("self.vider(")
+                .count()
+                == 1,
+        "la frontière gapless doit vider le resampler par le geste de l'étage (#4953)"
+    );
     assert_eq!(
-        partage.matches("etage.vider(").count(),
+        partage.matches("etage.vider(").count()
+            + partage.matches("etage.enchainer_la_piste(").count(),
         2,
         "le chemin partagé doit vider le resampler à DEUX endroits — la frontière \
          gapless qui change de cadence et la fin de chaîne — par le geste de \
@@ -603,8 +633,9 @@ fn aucun_vidage_du_resampleur_ne_recoit_d_echantillons() {
     let vidage_final = partage
         .find("// Flush the resampler")
         .expect("le vidage final du resampler doit rester commenté à sa place");
+    // #4953 : dans la boucle, la transition vide par la frontière de l'étage.
     assert!(
-        partage[..fin_de_boucle].contains("etage.vider(")
+        partage[..fin_de_boucle].contains("etage.enchainer_la_piste(")
             && partage[vidage_final..].contains("etage.vider("),
         "les deux appelants du vidage ne sont plus à leur place : l'un doit vivre \
          dans la transition gapless, l'autre après la fin de chaîne (REF-7, #2219)"
