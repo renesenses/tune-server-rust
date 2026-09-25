@@ -89,17 +89,20 @@ impl TunePlugin for CdPlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Lecture directe d'un CD audio vers une zone, sans extraction"
+        "Lecture directe d'un CD audio vers une zone, sans extraction (lecteur pris en charge sous Linux)"
     }
     /// Opt-in : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
         false
     }
-    /// Hors catalogue tant qu'aucun écran du client ne consomme ses routes
-    /// (doctrine #2090, comme `concerts`). Installable nommément :
-    /// `POST /api/v1/plugins/cd/install`.
+    /// Au catalogue (#4863) : l'écran « Lecture CD » du client web consomme
+    /// ses trois routes, donc la doctrine #2090 est remplie — le gestionnaire
+    /// peut proposer « Installer ». Gratuit, comme `bandcamp` (absent de
+    /// `premium_plugins`). Sous macOS et Windows, l'installation réussit et
+    /// `/etat` répond `plateforme_prise_en_charge: false` : un état, pas une
+    /// erreur.
     fn catalogued(&self) -> bool {
-        false
+        true
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
