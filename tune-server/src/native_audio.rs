@@ -47,17 +47,31 @@ pub fn load_installed(settings: &tune_core::db::settings_repo::SettingsRepo) {
     };
     let keys = trusted_keys();
     for id in ids {
-        if !tune_core::audio::premium_plugins::contains(&id) {
+        let tiers = !tune_core::audio::premium_plugins::contains(&id);
+        if tiers && !tune_core::audio::natifs_tiers::identifiant_admissible(&id) {
             tracing::warn!(%id,"native_audio_unknown_slot");
             continue;
         }
-        if !tune_core::audio::premium_plugins::enabled(settings, &id) {
+        let demande = if tiers {
+            tune_core::audio::natifs_tiers::demande(settings, &id)
+        } else {
+            tune_core::audio::premium_plugins::enabled(settings, &id)
+        };
+        if !demande {
             continue;
         }
         let loaded = keys
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|keys| tune_plugin_native::package::load(&directory, &id, keys));
+            .and_then(|keys| tune_plugin_native::package::load(&directory, &id, keys))
+            .and_then(|library| {
+                // Un greffon natif tiers n'a de place que sur la chaîne DSP.
+                if tiers && library.manifest.kind != tune_plugin_sdk::manifest::PluginKind::Dsp {
+                    Err("third-party native plugins must be DSP plugins".to_string())
+                } else {
+                    Ok(library)
+                }
+            });
         match loaded {
             Ok(library) => {
                 if let Err(error) = tune_plugin_native::register(library) {
@@ -75,6 +89,20 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(status))
         .route("/{id}/install", post(install))
+        .route(
+            "/{id}/zones/{zone}",
+            get(crate::routes::greffons_natifs_tiers::reglage_de_zone)
+                .put(crate::routes::greffons_natifs_tiers::regler_la_zone),
+        )
+        .route(
+            "/{id}/profiles",
+            get(crate::routes::greffons_natifs_tiers::lister_les_profils)
+                .post(crate::routes::greffons_natifs_tiers::enregistrer_un_profil),
+        )
+        .route(
+            "/{id}/profiles/{profile}",
+            axum::routing::delete(crate::routes::greffons_natifs_tiers::supprimer_un_profil),
+        )
         .route("/{id}/assets/{*name}", get(asset))
         .route("/{id}/rollback", post(rollback))
         .route("/{id}/uninstall", post(uninstall))
@@ -82,9 +110,44 @@ pub fn router() -> Router<AppState> {
             tune_plugin_native::package::MAX_ARCHIVE as usize,
         ))
 }
+/// Les greffons natifs tiers présents sur le disque (au moins une version
+/// retenue), triés. Un greffon désinstallé avec `remove_native` garde ses
+/// versions : il reste listé, inactif.
+pub fn third_party_ids() -> Vec<String> {
+    let root = root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|id| is_third_party(id))
+        .collect();
+    ids.sort();
+    ids
+}
+/// Un greffon natif tiers présent sur le disque sous cet identifiant.
+pub fn is_third_party(id: &str) -> bool {
+    tune_core::audio::natifs_tiers::identifiant_admissible(id)
+        && root().join(id).join("versions").is_dir()
+}
+/// Un emplacement que ces routes gèrent : l'un des quatre intégrés, ou un
+/// greffon natif tiers présent sur le disque.
+fn managed(id: &str) -> bool {
+    tune_core::audio::premium_plugins::contains(id) || is_third_party(id)
+}
 async fn status(_admin: RequireAdmin) -> Response {
-    let ids = tune_core::audio::premium_plugins::IDS;
-    Json(json!({"abi":1,"target":tune_plugin_native::package::host_target(),"trust_configured":trusted_keys().is_ok_and(|v|!v.is_empty()),"plugins":ids.into_iter().map(|id|json!({"id":id,"native_loaded":tune_plugin_native::provider(id).is_some(),"error":tune_plugin_native::failure(id)})).collect::<Vec<_>>()})).into_response()
+    let integres = tune_core::audio::premium_plugins::IDS
+        .into_iter()
+        .map(|id| (id.to_string(), false));
+    let tiers = third_party_ids().into_iter().map(|id| (id, true));
+    let plugins: Vec<_> = integres
+        .chain(tiers)
+        .map(|(id, third_party)| {
+            json!({"id":id,"third_party":third_party,"native_loaded":tune_plugin_native::provider(&id).is_some(),"error":tune_plugin_native::failure(&id)})
+        })
+        .collect();
+    Json(json!({"abi":1,"target":tune_plugin_native::package::host_target(),"trust_configured":trusted_keys().is_ok_and(|v|!v.is_empty()),"plugins":plugins})).into_response()
 }
 fn refusal(error: String) -> Response {
     (
@@ -102,8 +165,16 @@ async fn install(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !tune_core::audio::premium_plugins::contains(&id) {
-        return refusal("unknown premium feature slot".into());
+    let tiers = !tune_core::audio::premium_plugins::contains(&id);
+    if tiers {
+        if !tune_core::audio::natifs_tiers::identifiant_admissible(&id) {
+            return refusal("invalid plugin id".into());
+        }
+        // L'identifiant d'un autre greffon (compilé, WASM) partagerait ses
+        // drapeaux `plugin_{id}_*` : refusé.
+        if name_taken_by_another_plugin(&state, &id).await {
+            return refusal("plugin id already used by another plugin".into());
+        }
     }
     if let Err(response) = crate::premium_guard::require_premium(&state.license, feature(&id)).await
     {
@@ -124,6 +195,12 @@ async fn install(
     let expected = id.clone();
     let installed = tokio::task::spawn_blocking(move || {
         // Validate expected slot BEFORE activation, not after writing active.json.
+        if tiers {
+            let package = tune_plugin_native::package::inspect(&body, &signature, &keys)?;
+            if package.manifest.kind != tune_plugin_sdk::manifest::PluginKind::Dsp {
+                return Err("third-party native plugins must be DSP plugins".to_string());
+            }
+        }
         tune_plugin_native::package::install_for(&root, &body, &signature, &keys, &expected)
     })
     .await;
@@ -143,20 +220,45 @@ async fn install(
         Err(e) => refusal(e.to_string()),
     }
 }
+/// Le droit qui ouvre un emplacement. Le droit gratuit (`DspEq`) n'appartient
+/// qu'à l'égaliseur, nommément ; tout autre identifiant, greffon natif tiers
+/// compris, exige le Premium.
 pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
     match id {
+        "equalizer" => tune_core::license::Feature::DspEq,
         "crossfeed" => tune_core::license::Feature::Crossfeed,
         "converter" => tune_core::license::Feature::BatchConverter,
         "declick" => tune_core::license::Feature::Declick,
-        _ => tune_core::license::Feature::DspEq,
+        _ => THIRD_PARTY_FEATURE,
     }
+}
+/// Le droit Premium des greffons natifs tiers.
+pub(crate) const THIRD_PARTY_FEATURE: tune_core::license::Feature =
+    tune_core::license::Feature::PluginMarketplace;
+/// Le nom est-il déjà celui d'un greffon d'une autre famille : compilé dans
+/// ce serveur (jeu registré) ou WASM posé sur le disque ?
+async fn name_taken_by_another_plugin(state: &AppState, id: &str) -> bool {
+    if state
+        .plugin_names
+        .get()
+        .is_some_and(|names| names.iter().any(|n| n == id))
+    {
+        return true;
+    }
+    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
+        return false;
+    };
+    tune_core::plugins::PluginManager::new(dir)
+        .scan()
+        .await
+        .is_ok_and(|infos| infos.iter().any(|i| i.manifest.id == id))
 }
 async fn rollback(
     _admin: RequireAdmin,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    if !tune_core::audio::premium_plugins::contains(&id) {
+    if !managed(&id) {
         return refusal("unknown plugin".into());
     }
     if let Err(response) = crate::premium_guard::require_premium(&state.license, feature(&id)).await
@@ -185,7 +287,7 @@ async fn uninstall(
     Path(id): Path<String>,
     Json(options): Json<UninstallOptions>,
 ) -> Response {
-    if !tune_core::audio::premium_plugins::contains(&id) {
+    if !managed(&id) {
         return refusal("unknown plugin".into());
     }
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -211,7 +313,7 @@ async fn asset(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
 ) -> Response {
-    if !tune_core::audio::premium_plugins::contains(&id) {
+    if !managed(&id) {
         return refusal("unknown plugin".into());
     }
     if let Err(response) = crate::premium_guard::require_premium(&state.license, feature(&id)).await

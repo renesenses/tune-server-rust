@@ -88,3 +88,46 @@ fn packaging_refuses_nonportable_and_reserved_assets() {
         );
     }
 }
+/// A third-party package installs under its own id, outside the four slots;
+/// `inspect` reports its kind BEFORE anything is activated, so the host can
+/// refuse a kind it does not wire.
+#[test]
+fn third_party_package_installs_under_its_own_id_and_inspect_precedes_activation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("plugins");
+    let bin = temp.path().join("fixture.so");
+    fs::write(&bin, b"third party").unwrap();
+    for (id, source, kind) in [
+        (
+            "greffon-tiers",
+            include_str!("../../tune-plugin-equalizer/manifest.json"),
+            tune_plugin_sdk::manifest::PluginKind::Dsp,
+        ),
+        (
+            "outil-tiers",
+            include_str!("../../tune-plugin-converter/manifest.json"),
+            tune_plugin_sdk::manifest::PluginKind::Batch,
+        ),
+    ] {
+        let mut manifest: tune_plugin_sdk::manifest::Manifest =
+            serde_json::from_str(source).unwrap();
+        manifest.id = id.into();
+        manifest.entitlement = format!("plugin.{id}");
+        let bytes = pack(manifest, &bin, host_target(), &BTreeMap::new()).unwrap();
+        let (keys, sig) = sign(&bytes);
+        let inspected = inspect(&bytes, &sig, &keys).unwrap();
+        assert_eq!(inspected.manifest.id, id);
+        assert_eq!(inspected.manifest.kind, kind);
+        assert!(
+            !root.join(id).exists(),
+            "inspect must not stage or activate anything"
+        );
+        assert!(inspect(&bytes, &sig, &[]).is_err(), "untrusted inspect");
+        assert!(install_for(&root, &bytes, &sig, &keys, "equalizer").is_err());
+        install_for(&root, &bytes, &sig, &keys, id).unwrap();
+    }
+    assert_eq!(
+        installed_ids(&root).unwrap(),
+        vec!["greffon-tiers".to_string(), "outil-tiers".to_string()]
+    );
+}

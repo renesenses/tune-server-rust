@@ -27,6 +27,8 @@ pub mod eq_pro;
 pub mod export;
 pub(crate) mod filtre_sources;
 pub mod graphql;
+/// Réglages de zone et profils nommés des greffons natifs tiers.
+pub mod greffons_natifs_tiers;
 pub mod history;
 pub mod home;
 pub mod homeassistant;

@@ -61,6 +61,9 @@ pub mod mixer;
 /// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
 /// réglage `zone_{id}_mono_downmix` (#2362).
 pub mod mono_downmix;
+/// Greffons natifs tiers : paquets signés hors des quatre emplacements
+/// intégrés, toujours Premium, branchés sur l'étage casque de la chaîne.
+pub mod natifs_tiers;
 pub mod opus_ogg;
 /// L'ordonnancement temps réel du fil de rendu local (#3206). Hors
 /// `local-audio` pour la même raison que `periode_alsa` : la décision de
