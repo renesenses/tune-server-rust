@@ -1591,6 +1591,9 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let batch_size = tune_core::scanner::walker::SCAN_BATCH_SIZE;
 
         // Process files in batches: parse metadata in parallel, then insert in a transaction
+        // #4896 — les balises lues, par album : voir
+        // `auto_scan::BalisesVuesParAlbum`.
+        let mut balises_vues = crate::auto_scan::BalisesVuesParAlbum::default();
         let scan_stats = tune_core::scanner::walker::scan_files_batched(
             &files_to_scan,
             true,
@@ -1701,6 +1704,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                             // bibliothèque, lui appartient désormais.
                             a_adopter.push(id);
                         }
+                        balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_update.push(track);
                     } else {
                         // The sampled hash only narrows the candidates. A track
@@ -1743,6 +1747,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                                 );
                             }
                         }
+                        balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_insert.push(track);
                     }
                 }
@@ -2294,6 +2299,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
             }
         }
         drop(sqlite_write_guard);
+
+        // #4896 — APRÈS la purge et son COMMIT : la ligne album d'un dossier
+        // retouché suit ses balises, par la même règle que le surveillant.
+        balises_vues.realigner(&db);
 
         // Clean up orphan albums (album rows with no tracks). A full rescan
         // after removing files from disk — or the duplicate-album grouping —

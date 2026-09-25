@@ -22,6 +22,16 @@ pub enum ChangeType {
     Added,
     Modified,
     Deleted,
+    /// #4896 — un DOSSIER est apparu sous une racine : renommé (nouveau nom),
+    /// déplacé depuis ailleurs, ou créé. Les trois moteurs natifs ne signalent
+    /// que le dossier, jamais les fichiers qu'il emporte.
+    DossierApparu,
+    /// #4896 — un chemin qui n'est pas un fichier audio a quitté le disque :
+    /// peut-être un dossier renommé (ancien nom), déplacé hors de la racine,
+    /// mis à la corbeille ou supprimé. Rien ne dit ici que c'était un dossier
+    /// — il n'existe plus — : `auto_scan` le décide d'après les pistes qu'il
+    /// contenait, et un chemin sans piste n'y touche à rien.
+    DossierDisparu,
 }
 
 #[derive(Debug, Clone)]
@@ -80,11 +90,125 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                     }
                 }
             }
+            // #4896 — les événements de DOSSIER. Ils étaient tous écartés par
+            // le filtre audio ci-dessus : un dossier d'album renommé ou mis à
+            // la corbeille n'était vu qu'au scan suivant. Un montage ou un
+            // démontage (FSEvents, info « mount ») n'en est pas un : la
+            // reprise d'une racine est l'affaire de `ensure_watches`.
+            if event.info() == Some("mount") {
+                return;
+            }
+            for path in &event.paths {
+                if is_audio_file(path) || super::is_tune_temp_file(path) {
+                    continue;
+                }
+                if let Some(genre) = evenement_de_dossier(&event.kind, path) {
+                    let _ = event_tx.send(FileChange {
+                        change_type: genre,
+                        path: path.to_string_lossy().to_string(),
+                    });
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "watcher_error");
         }
     }
+}
+
+/// #4896 — ce qu'un événement dit d'un chemin qui n'est pas un fichier audio.
+///
+/// Les trois moteurs natifs de `notify` 7.0.0 ne décrivent pas un dossier de
+/// la même façon, et deux d'entre eux ne disent même pas que c'en est un :
+///
+/// | geste | Windows (`windows.rs`) | macOS (`fsevent.rs`) | Linux (`inotify.rs`) |
+/// |---|---|---|---|
+/// | renommer sur place | `Name(From)` ancien, `Name(To)` nouveau | `Name(Any)` ancien, `Name(Any)` nouveau | `Name(From)`, `Name(To)`, `Name(Both)` [ancien, nouveau] |
+/// | déplacer sous la racine | `Remove(Any)` ancien, `Create(Any)` nouveau | comme renommer | comme renommer |
+/// | corbeille / sortie de la racine | `Remove(Any)` | `Name(Any)` | `Name(From)` |
+/// | supprimer | `Remove(Any)` par fichier puis dossier | `Remove(File)`… puis `Remove(Folder)` | idem |
+/// | entrer dans la racine | `Create(Any)` | `Name(Any)` | `Name(To)` |
+///
+/// Le seul arbitre commun est donc le DISQUE, lu à l'arrivée de l'événement :
+/// un chemin qui est un dossier est apparu, un chemin qui n'existe plus a
+/// disparu. Un chemin toujours présent qui n'est pas un dossier (pochette,
+/// fichier temporaire d'un éditeur de balises) ne dit rien. Un « disparu »
+/// n'était peut-être qu'un fichier : `auto_scan` n'y touche que s'il couvrait
+/// des pistes indexées.
+fn evenement_de_dossier(genre: &EventKind, chemin: &Path) -> Option<ChangeType> {
+    use notify::event::{CreateKind, RemoveKind};
+    let disparu = || std::fs::symlink_metadata(chemin).is_err();
+    match genre {
+        // Le moteur a dit « fichier » : ce n'est pas un dossier.
+        EventKind::Create(CreateKind::File) | EventKind::Remove(RemoveKind::File) => None,
+        EventKind::Create(_) => chemin.is_dir().then_some(ChangeType::DossierApparu),
+        EventKind::Remove(_) => disparu().then_some(ChangeType::DossierDisparu),
+        EventKind::Modify(ModifyKind::Name(_)) => {
+            if chemin.is_dir() {
+                Some(ChangeType::DossierApparu)
+            } else if disparu() {
+                Some(ChangeType::DossierDisparu)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// #4896 — les fichiers audio d'un dossier apparu, à toute profondeur : un
+/// dossier renommé ou déplacé n'amène aucun événement pour son contenu. Les
+/// liens symboliques de DOSSIER ne sont pas suivis (une boucle ne se parcourt
+/// pas) ; un fichier illisible est simplement absent de la liste.
+pub fn fichiers_audio_sous(dossier: &Path) -> Vec<String> {
+    let mut trouves = Vec::new();
+    let mut a_lire = vec![dossier.to_path_buf()];
+    while let Some(courant) = a_lire.pop() {
+        let Ok(entrees) = std::fs::read_dir(&courant) else {
+            continue;
+        };
+        for entree in entrees.flatten() {
+            let Ok(genre) = entree.file_type() else {
+                continue;
+            };
+            let chemin = entree.path();
+            if genre.is_dir() {
+                a_lire.push(chemin);
+            } else if is_audio_file(&chemin) && !super::is_tune_temp_file(&chemin) {
+                trouves.push(chemin.to_string_lossy().to_string());
+            }
+        }
+    }
+    trouves.sort();
+    trouves
+}
+
+/// Le moteur `notify` que ce module traduit, pour que les épreuves des autres
+/// caisses fabriquent ses événements sans en dépendre elles-mêmes.
+pub use notify;
+
+/// Rejoue des événements `notify` BRUTS dans le gestionnaire de production,
+/// puis les fusionne comme `poll_debounced` : le dernier événement d'un chemin
+/// l'emporte. Sert aux épreuves du surveillant (#4896) : le gestionnaire est
+/// privé, et une épreuve qui recopierait sa traduction ne garderait qu'une
+/// copie. (La fusion, trois lignes, est celle de `poll_debounced`, que ce
+/// correctif ne touche pas.)
+pub fn rejouer_evenements_notify(evenements: Vec<Event>) -> Vec<FileChange> {
+    let (tx, rx) = mpsc::channel();
+    let gestionnaire = make_event_handler(tx);
+    for e in evenements {
+        gestionnaire(Ok(e));
+    }
+    let mut fusion: HashMap<String, ChangeType> = HashMap::new();
+    while let Ok(c) = rx.try_recv() {
+        fusion.insert(c.path, c.change_type);
+    }
+    let mut changes: Vec<FileChange> = fusion
+        .into_iter()
+        .map(|(path, change_type)| FileChange { change_type, path })
+        .collect();
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes
 }
 
 impl FileWatcher {
@@ -422,7 +546,17 @@ mod tests {
             ev(EventKind::Modify(ModifyKind::Name(RenameMode::To)), x),
         ]);
         assert_eq!(par_renommage.get(x), Some(&ChangeType::Modified));
-        assert!(!par_renommage.contains_key(tmp), "le temporaire est filtré");
+        // Le temporaire n'est pas un changement de FICHIER audio. Disparu du
+        // disque, il peut sortir en candidat « dossier disparu » : `auto_scan`
+        // l'écarte faute de piste indexée sous ce chemin (#4896,
+        // `un_chemin_disparu_sans_piste_ne_touche_a_rien_4896`).
+        assert!(
+            !matches!(
+                par_renommage.get(tmp),
+                Some(ChangeType::Added | ChangeType::Modified | ChangeType::Deleted)
+            ),
+            "le temporaire est filtré"
+        );
         // Remplacement par déplacement depuis un autre dossier : REMOVED puis
         // ADDED, sans MODIFIED.
         let par_deplacement = rejouer(vec![
@@ -430,6 +564,196 @@ mod tests {
             ev(EventKind::Create(CreateKind::Any), x),
         ]);
         assert_eq!(par_deplacement.get(x), Some(&ChangeType::Added));
+    }
+
+    /// Un dossier d'album APRÈS son renommage : l'ancien nom n'existe plus, le
+    /// nouveau porte ses fichiers. C'est l'état du disque quand `notify` livre
+    /// les événements. Racine sous le dossier courant : `is_tune_temp_file`
+    /// écarte tout ce qui vit sous le dossier temporaire du système.
+    fn scene_renommee(etiquette: &str) -> (crate::test_scratch::ScratchDir, PathBuf, PathBuf) {
+        let racine = crate::test_scratch::scratch_dir_in(
+            std::env::current_dir().unwrap(),
+            &format!("watcher-dossiers-4896-{etiquette}"),
+        );
+        let ancien = racine.join("Pink Floyd").join("Multichannel 7.1");
+        let nouveau = racine
+            .join("Pink Floyd")
+            .join("1973 - The Dark Side Of The Moon");
+        fs::create_dir_all(&nouveau).unwrap();
+        fs::write(nouveau.join("01 - Speak To Me.flac"), b"x").unwrap();
+        (racine, ancien, nouveau)
+    }
+
+    fn genres(changes: &[FileChange]) -> HashMap<String, ChangeType> {
+        changes
+            .iter()
+            .map(|c| (c.path.clone(), c.change_type.clone()))
+            .collect()
+    }
+
+    fn evp(kind: EventKind, chemin: &Path) -> Event {
+        Event::new(kind).add_path(chemin.to_path_buf())
+    }
+
+    /// #4896 — un dossier d'album RENOMMÉ ou DÉPLACÉ sous la racine, tel que
+    /// chacun des trois moteurs natifs de `notify` 7.0.0 le livre (voir
+    /// `evenement_de_dossier`). Avant le correctif, toutes ces séquences
+    /// étaient perdues : aucun des deux chemins n'a d'extension audio.
+    #[test]
+    fn un_dossier_renomme_sort_en_disparu_puis_apparu_sur_les_trois_moteurs_4896() {
+        use notify::event::{CreateKind, RemoveKind, RenameMode};
+        let (_racine, ancien, nouveau) = scene_renommee("renomme");
+        let nom = |m| EventKind::Modify(ModifyKind::Name(m));
+        let sequences: Vec<(&str, Vec<Event>)> = vec![
+            (
+                "Windows, renommage sur place (RENAMED_OLD_NAME/NEW_NAME)",
+                vec![
+                    evp(nom(RenameMode::From), &ancien),
+                    evp(nom(RenameMode::To), &nouveau),
+                ],
+            ),
+            (
+                "Windows, déplacement vers un autre parent (REMOVED/ADDED)",
+                vec![
+                    evp(EventKind::Remove(RemoveKind::Any), &ancien),
+                    evp(EventKind::Create(CreateKind::Any), &nouveau),
+                ],
+            ),
+            (
+                "macOS FSEvents (ItemRenamed sur chaque nom)",
+                vec![
+                    evp(nom(RenameMode::Any), &ancien),
+                    evp(nom(RenameMode::Any), &nouveau),
+                ],
+            ),
+            (
+                "Linux inotify (MOVED_FROM, MOVED_TO, paire, MOVE_SELF)",
+                vec![
+                    evp(nom(RenameMode::From), &ancien),
+                    evp(nom(RenameMode::To), &nouveau),
+                    Event::new(nom(RenameMode::Both))
+                        .add_path(ancien.clone())
+                        .add_path(nouveau.clone()),
+                    evp(nom(RenameMode::From), &ancien),
+                ],
+            ),
+            (
+                "PollWatcher (partage réseau) : disparition puis création",
+                vec![
+                    evp(EventKind::Remove(RemoveKind::Any), &ancien),
+                    evp(EventKind::Create(CreateKind::Any), &nouveau),
+                    evp(
+                        EventKind::Create(CreateKind::Any),
+                        &nouveau.join("01 - Speak To Me.flac"),
+                    ),
+                ],
+            ),
+        ];
+        for (moteur, evenements) in sequences {
+            let vus = genres(&rejouer_evenements_notify(evenements));
+            assert_eq!(
+                vus.get(&*ancien.to_string_lossy()),
+                Some(&ChangeType::DossierDisparu),
+                "{moteur} : l'ancien nom doit sortir en « dossier disparu »"
+            );
+            assert_eq!(
+                vus.get(&*nouveau.to_string_lossy()),
+                Some(&ChangeType::DossierApparu),
+                "{moteur} : le nouveau nom doit sortir en « dossier apparu »"
+            );
+        }
+    }
+
+    /// #4896 — le dossier mis à la corbeille ou sorti de la racine : un seul
+    /// événement, sur le dossier.
+    #[test]
+    fn un_dossier_mis_a_la_corbeille_sort_en_disparu_sur_les_trois_moteurs_4896() {
+        use notify::event::{RemoveKind, RenameMode};
+        let (_racine, ancien, _nouveau) = scene_renommee("corbeille");
+        for (moteur, kind) in [
+            ("Windows (REMOVED)", EventKind::Remove(RemoveKind::Any)),
+            (
+                "macOS (ItemRenamed vers ~/.Trash)",
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+            ),
+            (
+                "Linux (MOVED_FROM sans MOVED_TO)",
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            ),
+            (
+                "macOS/Linux, suppression (IsDir / ISDIR)",
+                EventKind::Remove(RemoveKind::Folder),
+            ),
+        ] {
+            let vus = genres(&rejouer_evenements_notify(vec![evp(kind, &ancien)]));
+            assert_eq!(
+                vus.get(&*ancien.to_string_lossy()),
+                Some(&ChangeType::DossierDisparu),
+                "{moteur}"
+            );
+        }
+    }
+
+    /// Contre-épreuves : ce qui n'est PAS un dossier qui bouge ne sort pas.
+    #[test]
+    fn ni_une_pochette_ni_un_montage_ne_passent_pour_un_dossier_4896() {
+        use notify::event::{CreateKind, RemoveKind, RenameMode};
+        let (_racine, _ancien, nouveau) = scene_renommee("contre");
+        let pochette = nouveau.join("cover.jpg");
+        fs::write(&pochette, b"jpg").unwrap();
+        let vus = genres(&rejouer_evenements_notify(vec![
+            // Toujours là, pas un dossier : rien à dire.
+            evp(EventKind::Remove(RemoveKind::Any), &pochette),
+            evp(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                &pochette,
+            ),
+            evp(EventKind::Create(CreateKind::Any), &pochette),
+        ]));
+        assert!(
+            vus.is_empty(),
+            "une pochette présente ne dit rien : {vus:?}"
+        );
+        // Le moteur a dit « fichier » : pas de dossier, même disparu.
+        let vus = genres(&rejouer_evenements_notify(vec![evp(
+            EventKind::Remove(RemoveKind::File),
+            &nouveau.join("notes.txt"),
+        )]));
+        assert!(vus.is_empty(), "{vus:?}");
+        // Un montage (FSEvents, info « mount ») n'est pas un dossier d'album.
+        let vus = genres(&rejouer_evenements_notify(vec![
+            evp(EventKind::Create(CreateKind::Other), &nouveau).set_info("mount"),
+        ]));
+        assert!(vus.is_empty(), "{vus:?}");
+        // Les événements de CONTENU d'un dossier ne le font pas « apparaître ».
+        let vus = genres(&rejouer_evenements_notify(vec![evp(
+            EventKind::Modify(ModifyKind::Any),
+            &nouveau,
+        )]));
+        assert!(vus.is_empty(), "{vus:?}");
+    }
+
+    #[test]
+    fn les_fichiers_audio_d_un_dossier_apparu_se_listent_a_toute_profondeur_4896() {
+        let (_racine, _ancien, nouveau) = scene_renommee("liste");
+        fs::create_dir_all(nouveau.join("CD2")).unwrap();
+        fs::write(nouveau.join("CD2").join("01 - Us And Them.flac"), b"x").unwrap();
+        fs::write(nouveau.join("cover.jpg"), b"x").unwrap();
+        let vus = fichiers_audio_sous(&nouveau);
+        assert_eq!(
+            vus,
+            vec![
+                nouveau
+                    .join("01 - Speak To Me.flac")
+                    .to_string_lossy()
+                    .to_string(),
+                nouveau
+                    .join("CD2")
+                    .join("01 - Us And Them.flac")
+                    .to_string_lossy()
+                    .to_string(),
+            ]
+        );
     }
 
     #[test]
