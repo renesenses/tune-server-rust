@@ -1246,16 +1246,21 @@ pub mod sql {
     /// un album masqué » en ET — appliqué APRÈS la passe FTS, les index
     /// `tracks_fts` contiennent tout (#1391).
     ///
+    /// Même ET pour les pistes d'un album DISTANT doublé par un album local
+    /// (#4146) : le prédicat est celui de `GET /library/tracks`, pris à
+    /// `facet_filter` — une seconde rédaction divergerait au premier correctif.
+    ///
     /// Emplacements 1..=5 : requête FTS, puis trois `LIKE`, puis l'année.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {}",
+            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {} AND {}",
             plein_texte_de_la_piste(d),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
             crate::db::facet_filter::hidden_tracks_excluded(),
+            crate::db::facet_filter::pistes_album_distant_double_exclu(d.engine()),
         )
     }
 

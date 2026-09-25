@@ -202,6 +202,14 @@ path = "tests/titres_bannis_4806.rs"
 name = "albums_upnp_visibles_4146"
 path = "tests/albums_upnp_visibles_4146.rs"
 
+# La recherche de bibliothèque masque le double UPnP d'un album local, comme
+# la grille (#4146). `autotests = false` en tête de ce manifeste : sans cette
+# cible, le fichier ne serait JAMAIS compilé, donc vert contre rien. Rangée au
+# MILIEU, à côté de sa sœur, et non en queue.
+[[test]]
+name = "recherche_sans_doublons_upnp"
+path = "tests/recherche_sans_doublons_upnp.rs"
+
 [[test]]
 name = "appliance_contracts"
 path = "tests/appliance_contracts.rs"

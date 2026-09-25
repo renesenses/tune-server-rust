@@ -578,10 +578,15 @@ pub mod sql {
     /// index `albums_fts` contiennent tout, les reconstruire à chaque
     /// masquage serait le mauvais échange (#1391).
     ///
+    /// Même ET pour l'album DISTANT doublé par un album local (#4146) :
+    /// seul le local est rendu, comme dans la grille de `/library/albums`.
+    /// Le prédicat est celui de la grille, pris à `facet_filter`, jamais
+    /// recopié — il vaut pour la page ET pour son total.
+    ///
     /// Emplacements 1..=6.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {}",
+            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {} AND {}",
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
@@ -589,6 +594,7 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
         )
     }
 
@@ -636,10 +642,11 @@ pub mod sql {
         format!(
             "SELECT a.label, COUNT(*) AS n FROM albums a \
              WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' \
-             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} \
+             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} AND {} \
              GROUP BY a.label ORDER BY n DESC, a.label LIMIT {}",
             d.placeholder(1),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
             d.placeholder(2)
         )
     }
