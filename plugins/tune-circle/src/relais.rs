@@ -28,9 +28,10 @@ const DELAI: Duration = Duration::from_secs(15);
 /// Ce qu'un appel au cloud a donné, avant sa mise en forme HTTP.
 #[derive(Debug)]
 pub enum Issue {
-    /// Aucune session SSO : aucun appel n'est parti.
+    /// Aucune session SSO (aucun appel n'est parti), ou une session que le
+    /// cloud refuse encore (401) après le rafraîchissement unique.
     NonConnecte,
-    /// Le cloud a répondu (2xx, 3xx ou 4xx) : relayé tel quel.
+    /// Le cloud a répondu (2xx, 3xx ou 4xx hors 401) : relayé tel quel.
     Reponse {
         statut: u16,
         corps: Vec<u8>,
@@ -93,6 +94,14 @@ impl Relais {
             }
         };
         let statut = reponse.status();
+        // Un 401 qui survit au rafraîchissement unique : la session mozaiklabs
+        // est finie. Il ne doit JAMAIS sortir tel quel : côté client, un 401
+        // est la fin de la session TUNE (`fetchJSON` efface le jeton Tune).
+        // C'est l'état « non connecté au cloud », comme sans session SSO.
+        if statut == StatusCode::UNAUTHORIZED {
+            info!(route, duree_ms, "circle_session_cloud_refusee");
+            return Issue::NonConnecte;
+        }
         if statut.is_server_error() {
             warn!(
                 route,
