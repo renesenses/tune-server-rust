@@ -7,7 +7,7 @@ use tune_core::license::{Feature, LicenseManager};
 
 /// Où acheter un droit, et où lier son compte. Une seule définition : le refus
 /// d'un module réutilise l'adresse que `require_premium` sert déjà.
-const UPGRADE_URL: &str = "https://mozaiklabs.fr/pricing";
+const UPGRADE_URL: &str = tune_core::license::URL_OFFRE_PREMIUM;
 
 /// La clé de traduction du refus premium, dans `i18n_server.json`. Elle porte
 /// un `{feature}` que l'appelant remplace par le nom du droit manquant — même
@@ -79,95 +79,10 @@ async fn require_premium_dans_la_langue(
     }
 }
 
-/// Pourquoi un **module payant** (SKU séparé, ex. « diretta ») est indisponible.
-///
-/// Les modules ne passent pas par [`Feature`] : ils ne sont pas des options du
-/// palier premium mais des achats distincts, et leur droit voyage
-/// **uniquement avec le compte lié** — jamais avec la clé de licence. D'où les
-/// deux raisons, qui appellent deux gestes opposés de la part de
-/// l'utilisateur : lier son compte, ou acheter le module.
-///
-/// Cette distinction est tout l'objet de #2392. Un bêta-testeur du module
-/// Diretta a réinstallé Fedora, changé de système de fichiers et recompilé
-/// trente minutes durant, parce que le serveur ne disait **rien** : son droit
-/// était valide depuis sept jours, il lui manquait une connexion de compte.
-/// Le refus n'existait nulle part — ni en journal au-dessus de `debug`, ni
-/// dans une réponse d'API. Le nommer est le correctif.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleRefusal {
-    /// Aucun compte lié : le droit ne peut pas parvenir au serveur, même
-    /// acheté et même avec une clé premium valide saisie.
-    AccountNotLinked,
-    /// Compte lié, mais ce module-ci n'est pas possédé.
-    NotOwned,
-}
-
-impl ModuleRefusal {
-    /// La raison du refus, ou `None` si le module est bien possédé.
-    ///
-    /// `account_linked` = un jeton de compte (`mozaik_access_token`) est
-    /// stocké. Il départage les deux seuls écrans aujourd'hui identiques.
-    pub fn evaluate(module_owned: bool, account_linked: bool) -> Option<Self> {
-        match (module_owned, account_linked) {
-            (true, _) => None,
-            // L'ordre compte : sans compte lié, on ne SAIT pas si le module est
-            // possédé — la liste est vide parce que personne n'a pu la lire, pas
-            // parce que l'achat manque. Annoncer « non possédé » à quelqu'un qui
-            // a payé, c'est le renvoyer acheter deux fois.
-            (false, false) => Some(Self::AccountNotLinked),
-            (false, true) => Some(Self::NotOwned),
-        }
-    }
-
-    /// Le **code** stable, seul terme du contrat avec le client.
-    ///
-    /// Piège relevé sur #2419 : `require_premium` composait son `message` en
-    /// anglais (`"… requires Tune Premium"`) et l'interface l'affichait tel
-    /// quel dans un écran traduit. Ce guide-ci a tenu le premier ; depuis
-    /// #2419 `require_premium` porte lui aussi un `code`, et sa phrase suit
-    /// l'`Accept-Language`. Les deux familles de refus se lisent pareil.
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::AccountNotLinked => "module_account_not_linked",
-            Self::NotOwned => "module_not_owned",
-        }
-    }
-
-    /// Le geste attendu de l'utilisateur — l'« actionnable » du refus.
-    pub fn action(self) -> &'static str {
-        match self {
-            Self::AccountNotLinked => "link_account",
-            Self::NotOwned => "purchase_module",
-        }
-    }
-
-    /// Repli anglais, pour le journal et pour un client qui ne connaîtrait pas
-    /// encore le code. **Jamais** destiné à être affiché tel quel.
-    fn message(self, module: &str) -> String {
-        match self {
-            Self::AccountNotLinked => format!(
-                "the {module} module is a paid add-on: link your Mozaiklabs account so the server can receive the entitlement"
-            ),
-            Self::NotOwned => {
-                format!("the {module} module is a paid add-on and this account does not own it")
-            }
-        }
-    }
-
-    /// Le refus, dans la **même forme** que celui de [`require_premium`] :
-    /// `error` + `message` + `upgrade_url`, plus le `code` et l'`action` qui
-    /// portent le sens. Une seule famille de refus premium, pas deux.
-    pub fn to_json(self, module: &str) -> Value {
-        json!({
-            "error": "module_required",
-            "code": self.code(),
-            "module": module,
-            "action": self.action(),
-            "message": self.message(module),
-            "upgrade_url": UPGRADE_URL,
-        })
-    }
-}
+/// Le refus d'un **module payant**, décrit dans `tune_core::license` pour
+/// être partagé avec les greffons qui refusent eux-mêmes (« Concerts »,
+/// #2363). Ré-exporté ici : tous les appelants gardent leur chemin.
+pub use tune_core::license::ModuleRefusal;
 
 #[cfg(test)]
 mod tests {
