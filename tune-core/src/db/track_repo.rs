@@ -1372,6 +1372,32 @@ pub struct PreuveDeCompilation {
     pub compilation: bool,
 }
 
+/// Une colonne texte d'une piste qu'on peut interroger par
+/// [`TrackRepo::search_by_text_column`]. Liste FERMEE : l'expression SQL vient
+/// d'ici, jamais de la requete d'un client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColonneTextePiste {
+    /// `tracks.title`.
+    Titre,
+    /// `artists.name`, l'artiste resolu — celui que porte `Track::artist_name`.
+    Artiste,
+    /// `albums.title` — celui que porte `Track::album_title`.
+    Album,
+    /// `tracks.genre`.
+    Genre,
+}
+
+impl ColonneTextePiste {
+    fn expression_sql(self) -> &'static str {
+        match self {
+            ColonneTextePiste::Titre => "t.title",
+            ColonneTextePiste::Artiste => "ar.name",
+            ColonneTextePiste::Album => "al.title",
+            ColonneTextePiste::Genre => "t.genre",
+        }
+    }
+}
+
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -2487,14 +2513,27 @@ impl TrackRepo {
     }
 
     pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
-        let like = format!("%{title}%");
+        self.search_by_text_column(ColonneTextePiste::Titre, title, limit)
+    }
+
+    /// Les pistes dont `colonne` CONTIENT `valeur`, a la casse et aux accents
+    /// pres — la comparaison de [`Self::search_by_title`], etendue aux autres
+    /// champs qu'une recherche du serveur media peut interroger (#4955).
+    pub fn search_by_text_column(
+        &self,
+        colonne: ColonneTextePiste,
+        valeur: &str,
+        limit: i64,
+    ) -> Result<Vec<Track>, TuneError> {
+        let like = format!("%{valeur}%");
         let make_ph = |i: usize| match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(i),
             Engine::Postgres => PostgresDialect.placeholder(i),
         };
         let sql = format!(
-            "{} WHERE LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})) LIMIT {}",
+            "{} WHERE LOWER(unaccent({})) LIKE LOWER(unaccent({})) LIMIT {}",
             sql::select_track(),
+            colonne.expression_sql(),
             make_ph(1),
             make_ph(2)
         );
