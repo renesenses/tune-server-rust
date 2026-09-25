@@ -1,0 +1,33 @@
+[package]
+name = "tune-playlists-converter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Greffon WASM « Playlists converter » — tranche 2 de l'épique #4715 (#4717).
+#
+# Ce n'est PAS un greffon natif : il ne dépend ni de `tune-core`, ni d'axum, ni
+# de tokio. Il ne parle au serveur que par les fonctions hôte de la tranche 1
+# (#4716) importées du module wasm `"tune"`. C'est la contrainte qui fait toute
+# la valeur du bac à sable : ce qu'il ne peut pas importer, il ne peut pas le
+# faire — et il n'existe aucune capacité de SUPPRESSION à importer.
+#
+# Deux cibles, un seul code :
+#
+# * `wasm32-unknown-unknown` → `main.wasm`, l'artefact installé. Seul
+#   `src/abi.rs` est alors compilé : les `extern "C"` du module `"tune"` et les
+#   exports `abi_version`/`alloc`/`dealloc`/`plugin_dispatch` (RFC §3.3).
+# * la cible native → la PORTE. `src/abi.rs` disparaît, `moteur.rs` reste, et
+#   ses essais tournent contre un hôte de banc. C'est ainsi que l'aperçu, la
+#   règle d'appariement et la reprise se prouvent sur Shrek avec le reste de
+#   l'atelier, sans wasmtime et sans jamais toucher un vrai service.
+#
+# ⚠️ `crate-type` porte `rlib` EN PLUS de `cdylib` : sans `rlib`, `cargo test`
+# ne peut pas lier la caisse et les essais ne tourneraient nulle part.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
