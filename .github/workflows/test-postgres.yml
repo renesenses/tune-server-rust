@@ -487,3 +487,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1
+
+      # #5007 — la purge des artistes orphelins. PostgreSQL refusait le DELETE
+      # entier par `albums_artist_id_fkey` dès qu'un artiste d'album n'avait
+      # aucune piste à lui : plus aucun orphelin purgé. Sans cette étape, le
+      # cas PG de `artist_repo.rs` prendrait son « saut annoncé ».
+      - name: Purge des artistes orphelins sur PostgreSQL (#5007)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5007 -- --nocapture

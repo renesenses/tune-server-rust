@@ -105,12 +105,31 @@ pub mod sql {
         )
     }
 
+    /// #5007 — un artiste n'est orphelin que si AUCUNE table ne le désigne.
+    /// Trois clés étrangères pointent `artists(id)`, sur SQLite (`sqlite.rs`,
+    /// CORE_SCHEMA) comme sur PostgreSQL (`001_initial_schema.sql`) :
+    /// `tracks.artist_id`, `albums.artist_id` et `track_credits.artist_id`,
+    /// toutes sans `ON DELETE`. Ne regarder que `tracks` visait l'artiste d'un
+    /// album sans piste à lui (« Various Artists », artiste d'album distinct
+    /// des interprètes) ou un compositeur crédité : la clé étrangère refusait
+    /// alors le DELETE ENTIER, et plus aucun orphelin n'était purgé.
+    /// Une seule clause pour le comptage et la suppression : ils ne peuvent
+    /// plus diverger.
+    macro_rules! artistes_orphelins {
+        () => {
+            "FROM artists WHERE \
+             id NOT IN (SELECT artist_id FROM tracks WHERE artist_id IS NOT NULL) \
+             AND id NOT IN (SELECT artist_id FROM albums WHERE artist_id IS NOT NULL) \
+             AND id NOT IN (SELECT artist_id FROM track_credits WHERE artist_id IS NOT NULL)"
+        };
+    }
+
     pub fn count_orphans() -> &'static str {
-        "SELECT COUNT(*) FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
+        concat!("SELECT COUNT(*) ", artistes_orphelins!())
     }
 
     pub fn delete_orphans() -> &'static str {
-        "DELETE FROM artists WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)"
+        concat!("DELETE ", artistes_orphelins!())
     }
 
     pub fn list_without_image() -> &'static str {
@@ -823,7 +842,7 @@ impl ArtistRepo {
         Ok(rows.iter().map(row_to_artist).collect())
     }
 
-    /// Delete artists that have zero tracks referencing them.
+    /// Delete artists that no track, album or track credit references (#5007).
     /// Single tx for count-then-delete atomicity.
     pub fn cleanup_orphans(&self) -> Result<i64, TuneError> {
         let mut count: i64 = 0;
@@ -1833,5 +1852,129 @@ mod tests {
         assert_eq!(retrouve.id, Some(cible));
         assert_eq!(repo.count().unwrap(), avant);
         assert!(repo.absorber(cible, cible).is_err());
+    }
+
+    /// #5007 — l'artiste d'un album sans piste à lui (« Various Artists ») et
+    /// un compositeur seulement crédité ne sont PAS orphelins. Avant le
+    /// correctif, la purge les visait et la clé étrangère refusait le DELETE
+    /// entier (« FOREIGN KEY constraint failed ») : le vrai orphelin restait.
+    /// Joué sur le schéma de base (`init_schema`, clés étrangères déclarées)
+    /// ET sur une base migrée.
+    #[test]
+    fn i5007_la_purge_garde_artistes_d_album_et_credites() {
+        for migree in [false, true] {
+            let db = test_db();
+            if migree {
+                crate::db::migrations::run_migrations(&db).unwrap();
+            }
+            let repo = ArtistRepo::new(db.clone());
+            let interprete = repo.create(&Artist::new("Interprète".into())).unwrap();
+            let d_album = repo.create(&Artist::new("Various Artists".into())).unwrap();
+            let compositeur = repo.create(&Artist::new("Compositeur".into())).unwrap();
+            let orphelin = repo.create(&Artist::new("Orphelin".into())).unwrap();
+            {
+                let conn = db.connection().lock().unwrap();
+                let fk: i64 = conn
+                    .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(fk, 1, "les clés étrangères doivent être actives");
+                conn.execute_batch(&format!(
+                    "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Compilation', {d_album});\
+                     INSERT INTO tracks (id, title, album_id, artist_id, file_path) VALUES \
+                       (1, 'Titre', 1, {interprete}, '/m/compilation/01.flac');\
+                     INSERT INTO track_credits (track_id, artist_id, artist_name, role) VALUES \
+                       (1, {compositeur}, 'Compositeur', 'composer');"
+                ))
+                .unwrap();
+            }
+
+            let purges = repo
+                .cleanup_orphans()
+                .unwrap_or_else(|e| panic!("purge refusée (migrée={migree}) : {e}"));
+            assert_eq!(purges, 1, "seul le vrai orphelin part (migrée={migree})");
+            assert!(
+                repo.get(orphelin).unwrap().is_none(),
+                "l'orphelin est purgé"
+            );
+            for (id, qui) in [
+                (interprete, "l'interprète"),
+                (d_album, "l'artiste d'album"),
+                (compositeur, "le compositeur crédité"),
+            ] {
+                assert!(repo.get(id).unwrap().is_some(), "{qui} est conservé");
+            }
+            assert_eq!(repo.cleanup_orphans().unwrap(), 0, "deuxième passe vide");
+        }
+    }
+
+    /// #5007 sur PostgreSQL : même scénario, sur la table telle que
+    /// `001_initial_schema.sql` la crée (les trois `REFERENCES artists(id)`).
+    /// PostgreSQL refusait le DELETE par `albums_artist_id_fkey`.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_5007_la_purge_garde_artistes_d_album_et_credites() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        const SCHEMA: &str = "artistes_orphelins_5007";
+        let maintenance = sqlx::PgPool::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE; CREATE SCHEMA {SCHEMA}"
+        )))
+        .execute(&maintenance)
+        .await
+        .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(|c, _| {
+                Box::pin(async move {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO {SCHEMA}")))
+                        .execute(c)
+                        .await
+                        .map(|_| ())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/001_initial_schema.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO artists (id, name) VALUES \
+               (1, 'Interprète'), (2, 'Various Artists'), (3, 'Compositeur'), (4, 'Orphelin');\
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'Compilation', 2);\
+             INSERT INTO tracks (id, title, album_id, artist_id) VALUES (1, 'Titre', 1, 1);\
+             INSERT INTO track_credits (track_id, artist_id, artist_name, role) VALUES \
+               (1, 3, 'Compositeur', 'composer');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
+        let repo = ArtistRepo::with_backend(backend);
+        let purges = repo
+            .cleanup_orphans()
+            .unwrap_or_else(|e| panic!("purge refusée par PostgreSQL : {e}"));
+        assert_eq!(purges, 1, "seul le vrai orphelin part");
+        let restants: Vec<i64> = sqlx::query_scalar("SELECT id FROM artists ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(restants, vec![1, 2, 3]);
+        assert_eq!(repo.cleanup_orphans().unwrap(), 0, "deuxième passe vide");
+        pool.close().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"
+        )))
+        .execute(&maintenance)
+        .await
+        .unwrap();
+        maintenance.close().await;
     }
 }
