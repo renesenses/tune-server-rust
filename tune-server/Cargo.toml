@@ -334,6 +334,14 @@ name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
 required-features = ["postgres"]
 
+# SQL propre a SQLite dans des routes jouees sur PostgreSQL (chasse PG du
+# 25/09/2026) : `strftime` du cache d API, `STRING_AGG($1)` de la fusion des
+# doublons. Pas de `required-features` : la contre-epreuve SQLite tourne dans la
+# suite ordinaire.
+[[test]]
+name = "pg_fonctions_sqlite_seules"
+path = "tests/pg_fonctions_sqlite_seules.rs"
+
 # #4625 — la vue par dossiers compte et liste les pistes découpées par une
 # feuille CUE (`file_path` NULL). `autotests = false` plus haut : sans cette
 # cible, le fichier ne serait jamais compilé.
