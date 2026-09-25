@@ -235,6 +235,12 @@ fn active(directory: &Path) -> Result<Option<Active>, String> {
         Err(e) => Err(e.to_string()),
     }
 }
+/// Verify the signature and the archive for this host WITHOUT installing it,
+/// so a caller can apply its own policy (kind, slot) before activation.
+pub fn inspect(bytes: &[u8], signature: &str, keys: &[String]) -> Result<Package, String> {
+    verify_signature(bytes, signature, keys)?;
+    unpack(bytes, host_target()).map(|(package, _)| package)
+}
 /// Verify, stage on the same filesystem, retain the previous version, then
 /// atomically activate for NEXT startup. A failed install leaves active intact.
 pub fn install_for(

@@ -36,13 +36,72 @@ pub struct CrossfeedProcessor {
     /// #4685 — niveau moyen du filtre, calculé UNE fois à la construction
     /// (voir [`Self::gain_moyen_db`]).
     gain_moyen_db: f64,
+    /// Étages des greffons natifs tiers (`super::natifs_tiers`), appliqués
+    /// APRÈS le crossfeed intégré, dans l'ordre des identifiants. Vide pour un
+    /// crossfeed seul : le chemin reste alors celui d'avant, à l'octet près.
+    tiers: Vec<EtageTiers>,
+}
+struct EtageTiers {
+    id: String,
+    stage: tune_plugin_native::stage::Stage,
 }
 enum CrossfeedEngine {
     Bundled(tune_plugin_crossfeed::CrossfeedProcessor),
     Native(tune_plugin_native::stage::Stage),
     Unavailable,
+    /// Crossfeed intégré non demandé : seul(s) le(s) étage(s) tiers
+    /// traite(nt) le signal.
+    Aucun,
 }
 impl CrossfeedProcessor {
+    /// L'étage casque de la chaîne : le crossfeed intégré s'il est demandé
+    /// (`reglage` = `(amount, delay_ms)`), puis les étages des greffons natifs
+    /// tiers demandés par la zone. Un étage tiers que son greffon refuse de
+    /// préparer est journalisé et écarté, sans toucher aux autres.
+    pub fn composer(
+        sample_rate: u32,
+        reglage: Option<(f32, f32)>,
+        tiers: &[(String, serde_json::Value)],
+    ) -> Self {
+        let mut processeur = match reglage {
+            Some((amount, delay_ms)) => Self::new(sample_rate, amount, delay_ms),
+            None => Self {
+                engine: CrossfeedEngine::Aucun,
+                amount: 0.0,
+                delay_samples: 0,
+                gain_moyen_db: 0.0,
+                tiers: Vec::new(),
+            },
+        };
+        for (id, reglage) in tiers {
+            // Directement au registre natif, sans passer par
+            // `super::natifs_tiers` : ce fichier est aussi compilé SEUL par
+            // l'oracle de parité DSP (`sdk/scripts/verify_dsp_parity.py`). Les
+            // appelants ont déjà filtré les identifiants admissibles.
+            let Some(fournisseur) = tune_plugin_native::provider(id).filter(|library| {
+                library.manifest.kind == tune_plugin_sdk::manifest::PluginKind::Dsp
+                    && tune_plugin_native::failure(id).is_none()
+            }) else {
+                continue;
+            };
+            match tune_plugin_native::stage::Stage::prepare(fournisseur, sample_rate, 2, reglage) {
+                Ok(stage) => processeur.tiers.push(EtageTiers {
+                    id: id.clone(),
+                    stage,
+                }),
+                Err(error) => {
+                    tracing::error!(plugin = %id, %error, "native_third_party_prepare_failed")
+                }
+            }
+        }
+        processeur
+    }
+
+    /// Nombre d'étages tiers réellement préparés.
+    pub fn etages_tiers(&self) -> usize {
+        self.tiers.len()
+    }
+
     pub fn new(sample_rate: u32, amount: f32, delay_ms: f32) -> Self {
         let reference =
             tune_plugin_crossfeed::CrossfeedProcessor::new(sample_rate, amount, delay_ms);
@@ -76,6 +135,7 @@ impl CrossfeedProcessor {
             amount,
             delay_samples,
             gain_moyen_db,
+            tiers: Vec::new(),
         }
     }
 
@@ -94,7 +154,12 @@ impl CrossfeedProcessor {
                     tracing::error!(%error,"native_crossfeed_processing_failed");
                 }
             }
-            CrossfeedEngine::Unavailable => {}
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_f32(samples) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
         }
     }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
@@ -108,7 +173,12 @@ impl CrossfeedProcessor {
                     tracing::error!(%error,"native_crossfeed_processing_failed");
                 }
             }
-            CrossfeedEngine::Unavailable => {}
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_pcm(pcm, bit_depth) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
         }
     }
     pub fn inherit_state_from(&mut self, previous: &Self) {
@@ -123,9 +193,21 @@ impl CrossfeedProcessor {
             }
             _ => {}
         }
+        // Chaque étage tiers reprend l'historique de SON prédécesseur, trouvé
+        // par identifiant : un étage ajouté ou retiré ne décale pas les autres.
+        for etage in &mut self.tiers {
+            if let Some(ancien) = previous.tiers.iter().find(|a| a.id == etage.id) {
+                if let Err(error) = etage.stage.inherit(&ancien.stage) {
+                    tracing::debug!(plugin = %etage.id, %error, "native_third_party_history_not_compatible");
+                }
+            }
+        }
     }
     pub fn amount(&self) -> f32 {
-        if matches!(self.engine, CrossfeedEngine::Unavailable) {
+        if matches!(
+            self.engine,
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun
+        ) {
             0.0
         } else {
             self.amount

@@ -93,6 +93,24 @@ pub(super) fn empreinte_avec_crossfeed(
     Some(h.finalize().into())
 }
 
+/// Les étages des greffons natifs tiers ENTRENT dans la clé du cache de
+/// transcodage, pour la même raison que le crossfeed. Empreinte vide : la clé
+/// d'avant, inchangée.
+pub(super) fn empreinte_avec_etages_tiers(dsp: Option<[u8; 32]>, tiers: &str) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    if tiers.is_empty() {
+        return dsp;
+    }
+    let mut h = Sha256::new();
+    h.update(b"native-third-party\0");
+    h.update(tiers.as_bytes());
+    if let Some(d) = dsp {
+        h.update(b"dsp\0");
+        h.update(d);
+    }
+    Some(h.finalize().into())
+}
+
 impl PlaybackOrchestrator {
     /// Le crossfeed à cuire dans le fichier ré-encodé, avec son réglage pour
     /// la clé du cache. `None` hors réseau, sur une sortie locale, en PURE,
@@ -108,7 +126,11 @@ impl PlaybackOrchestrator {
             return None;
         }
         let processeur = self.load_crossfeed_processor(zone_id, sample_rate)?;
-        let reglage = self.crossfeed_configure(zone_id)?;
+        // Un étage casque sans crossfeed intégré (greffons natifs tiers seuls)
+        // entre dans la clé sous le réglage nul `(0, 0)`, qu'aucun crossfeed
+        // actif ne produit (`amount == 0` rend `None`) ; les étages tiers y
+        // entrent par [`empreinte_avec_etages_tiers`].
+        let reglage = self.crossfeed_configure(zone_id).unwrap_or((0.0, 0.0));
         Some((processeur, reglage))
     }
 }
