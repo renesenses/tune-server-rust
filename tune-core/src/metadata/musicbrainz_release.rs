@@ -18,6 +18,66 @@ use serde_json::Value;
 use tracing::debug;
 
 const MB_API: &str = "https://musicbrainz.org/ws/2";
+
+/// La base effectivement interrogée. [`MB_API`] en service ; une doublure
+/// locale dans les tests (#4836), posée par [`remplacer_la_base_musicbrainz`].
+static BASE_REMPLACEE: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+fn base_musicbrainz() -> String {
+    BASE_REMPLACEE
+        .read()
+        .ok()
+        .and_then(|b| b.clone())
+        .unwrap_or_else(|| MB_API.to_string())
+}
+
+/// Remplace la base MusicBrainz par une doublure locale — **tests seulement**
+/// (#4836). Aucun chemin de production ne l'appelle : sans elle, toutes les
+/// requêtes de ce module partent vers [`MB_API`], avec le même User-Agent et
+/// le même limiteur de débit.
+#[doc(hidden)]
+pub fn remplacer_la_base_musicbrainz(base: Option<String>) {
+    if let Ok(mut b) = BASE_REMPLACEE.write() {
+        *b = base;
+    }
+}
+
+/// Le MBID du pseudo-label « [no label] » de MusicBrainz : la release dit
+/// explicitement qu'elle n'a PAS de label. L'écrire comme label d'album serait
+/// poser un faux nom (#4836).
+pub const MBID_SANS_LABEL: &str = "157afde4-4bf5-4039-8ad2-5a15acc85176";
+
+/// Le label et le numéro de catalogue à retenir d'un tableau `label-info`
+/// (#4836).
+///
+/// Règle : le **premier** label dont le nom est non vide et qui n'est pas le
+/// pseudo-label « [no label] » (reconnu par son MBID ou par son nom, casse
+/// ignorée). Le numéro de catalogue est celui de CETTE entrée ; à défaut, le
+/// premier numéro non vide du tableau — un numéro seul reste utile, et
+/// « [none] » (la convention MusicBrainz pour « pas de numéro ») est écarté.
+pub fn choisir_label(label_info: Option<&Value>) -> (Option<String>, Option<String>) {
+    let Some(infos) = label_info.and_then(|l| l.as_array()) else {
+        return (None, None);
+    };
+    let catalogue =
+        |i: &Value| str_field(i, "catalog-number").filter(|c| !c.eq_ignore_ascii_case("[none]"));
+    let retenue = infos.iter().find_map(|i| {
+        let label = i.get("label")?;
+        let nom = str_field(label, "name")?;
+        let pseudo = str_field(label, "id").as_deref() == Some(MBID_SANS_LABEL)
+            || nom.eq_ignore_ascii_case("[no label]");
+        if pseudo {
+            None
+        } else {
+            Some((nom, catalogue(i)))
+        }
+    });
+    match retenue {
+        Some((nom, Some(cat))) => (Some(nom), Some(cat)),
+        Some((nom, None)) => (Some(nom), infos.iter().find_map(catalogue)),
+        None => (None, infos.iter().find_map(catalogue)),
+    }
+}
 /// Public depuis #4863 : le greffon de lecture de CD consulte `/ws/2/discid`
 /// sous la même identité. Son DÉBIT, lui, passe par [`rate_limit_delay`] (#4767).
 pub const MB_UA: &str = "TuneServer/1.0 (contact@mozaiklabs.fr)";
@@ -223,14 +283,7 @@ pub fn parse_search_results(
             })
             .filter(|n| *n > 0);
 
-        let label_info = rel.get("label-info").and_then(|l| l.as_array());
-        let label = label_info.and_then(|infos| {
-            infos
-                .iter()
-                .find_map(|i| i.get("label").and_then(|l| str_field(l, "name")))
-        });
-        let catalog_number =
-            label_info.and_then(|infos| infos.iter().find_map(|i| str_field(i, "catalog-number")));
+        let (label, catalog_number) = choisir_label(rel.get("label-info"));
 
         let date = str_field(rel, "date");
         let country = str_field(rel, "country").or_else(|| {
@@ -293,7 +346,7 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
     let release_id = str_field(data, "id")?;
     let date = str_field(data, "date");
 
-    let label_info = data.get("label-info").and_then(|l| l.as_array());
+    let (label, catalog_number) = choisir_label(data.get("label-info"));
     let media = data.get("media").and_then(|m| m.as_array());
 
     let mut tracks: Vec<MBTrack> = Vec::new();
@@ -353,13 +406,8 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
         year: year_from_date(date.as_deref()),
         date,
         country: str_field(data, "country"),
-        label: label_info.and_then(|infos| {
-            infos
-                .iter()
-                .find_map(|i| i.get("label").and_then(|l| str_field(l, "name")))
-        }),
-        catalog_number: label_info
-            .and_then(|infos| infos.iter().find_map(|i| str_field(i, "catalog-number"))),
+        label,
+        catalog_number,
         disc_count: media.map(|m| m.len() as u32).unwrap_or(0),
         tracks,
     })
@@ -370,7 +418,7 @@ pub fn parse_release_detail(data: &Value) -> Option<MBReleaseDetail> {
 async fn mb_get(path: &str, params: &[(&str, String)]) -> Option<Value> {
     let client = crate::http::client::shared();
     let resp = client
-        .get(format!("{MB_API}/{path}"))
+        .get(format!("{}/{path}", base_musicbrainz()))
         .query(params)
         .header("User-Agent", MB_UA)
         .timeout(std::time::Duration::from_secs(15))
@@ -703,16 +751,36 @@ pub const INC_CREDITS_RELEASE: &str =
 /// Lit une release avec toutes ses relations de crédits (#4767). N'attend PAS
 /// le créneau : l'appelant appelle [`rate_limit_delay`] juste avant.
 pub async fn lookup_release_credits(release_id: &str) -> LectureRelease {
+    lire_release(release_id, INC_CREDITS_RELEASE, 30).await
+}
+
+/// Lit les SEULS labels d'une release connue par son MBID (#4836) : la passe
+/// « labels seulement » du pilote d'identification. Une requête, `inc=labels`,
+/// sans la liste des pistes qu'elle n'utilise pas. N'attend PAS le créneau :
+/// l'appelant appelle [`rate_limit_delay`] juste avant. Le label se tire de la
+/// réponse par [`labels_de_release`].
+pub async fn lookup_release_labels(release_id: &str) -> LectureRelease {
+    lire_release(release_id, "labels", 15).await
+}
+
+/// Le label et le numéro de catalogue d'une réponse `/release/{id}` (#4836),
+/// selon la règle de [`choisir_label`].
+pub fn labels_de_release(data: &Value) -> (Option<String>, Option<String>) {
+    choisir_label(data.get("label-info"))
+}
+
+/// Une lecture `/release/{id}` qui distingue la panne de l'inconnu.
+async fn lire_release(release_id: &str, inc: &str, delai_s: u64) -> LectureRelease {
     let id = release_id.trim();
     if id.is_empty() {
         return LectureRelease::Inconnue;
     }
     let client = crate::http::client::shared();
     let resp = match client
-        .get(format!("{MB_API}/release/{id}"))
-        .query(&[("inc", INC_CREDITS_RELEASE), ("fmt", "json")])
+        .get(format!("{}/release/{id}", base_musicbrainz()))
+        .query(&[("inc", inc), ("fmt", "json")])
         .header("User-Agent", MB_UA)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(delai_s))
         .send()
         .await
     {
@@ -1190,5 +1258,46 @@ mod tests {
             "Smash the System: Singles and More, Disc 1",
             "Saint Etienne"
         ));
+    }
+
+    // -- Choix du label (#4836) --
+
+    #[test]
+    fn le_label_saute_le_pseudo_label_sans_label_et_garde_son_catalogue() {
+        let infos = json!([
+            { "catalog-number": "none-1", "label": { "id": MBID_SANS_LABEL, "name": "[no label]" } },
+            { "catalog-number": "", "label": { "name": "  " } },
+            { "catalog-number": "CL 1355", "label": { "id": "x", "name": "Columbia" } },
+            { "catalog-number": "BN 1", "label": { "name": "Blue Note" } },
+        ]);
+        assert_eq!(
+            choisir_label(Some(&infos)),
+            (Some("Columbia".to_string()), Some("CL 1355".to_string()))
+        );
+    }
+
+    #[test]
+    fn le_pseudo_label_est_reconnu_par_son_nom_sans_son_mbid() {
+        let infos = json!([{ "label": { "name": "[No Label]" } }]);
+        assert_eq!(choisir_label(Some(&infos)), (None, None));
+    }
+
+    #[test]
+    fn un_catalogue_none_n_est_pas_un_numero() {
+        let infos = json!([
+            { "catalog-number": "[none]", "label": { "name": "ECM" } },
+            { "catalog-number": "ECM 1064", "label": null },
+        ]);
+        assert_eq!(
+            choisir_label(Some(&infos)),
+            (Some("ECM".to_string()), Some("ECM 1064".to_string()))
+        );
+    }
+
+    #[test]
+    fn sans_label_info_rien() {
+        assert_eq!(choisir_label(None), (None, None));
+        assert_eq!(choisir_label(Some(&json!([]))), (None, None));
+        assert_eq!(labels_de_release(&json!({"id": "r"})), (None, None));
     }
 }
