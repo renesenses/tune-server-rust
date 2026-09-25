@@ -609,3 +609,11 @@ path = "tests/crossfeed_renderer_sans_lpcm_2742.rs"
 [[test]]
 name = "sonde_lpcm_hors_dlna_4894"
 path = "tests/sonde_lpcm_hors_dlna_4894.rs"
+
+# Édition d'album, tranche 4 — « Écrire dans les fichiers » : un vrai fichier
+# par format courant, relu par le lecteur du scan, audio prouvé intact
+# (empreinte ET PCM décodé). `autotests = false` en tête de ce manifeste : sans
+# cette cible, le fichier ne serait JAMAIS compilé.
+[[test]]
+name = "ecrire_balises_edition_tranche4"
+path = "tests/ecrire_balises_edition_tranche4.rs"

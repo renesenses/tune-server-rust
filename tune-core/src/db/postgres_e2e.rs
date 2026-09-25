@@ -78,6 +78,14 @@ fn reset_schema(db: &Arc<dyn DbBackend>) {
         "artists",
         "zones",
         "listen_history",
+        // Sans clé étrangère vers `albums` : `TRUNCATE albums … CASCADE` ne
+        // les vide PAS, et `RESTART IDENTITY` redonne les mêmes identifiants
+        // d'album à l'épreuve suivante. Un `edition_manuelle` laissé sur
+        // l'album 1 par `pg_edition_album_scenarios` faisait compter
+        // « manuel » l'album 1 de `pg_recalcul_des_compilations_…` (CI de
+        // #5049, `--test-threads=1`, ordre alphabétique).
+        "album_metadata",
+        "album_distinct_pairs",
     ];
     for table in tables {
         let sql = format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE");
@@ -198,7 +206,7 @@ async fn pg_coffrets_auto_reunir_defaire_ne_pas_reformer() {
 async fn pg_edition_album_scenarios() {
     use crate::db::edition_album::tests as e;
     let db = pg_or_skip!();
-    let scenarios: [(&str, fn(&Arc<dyn DbBackend>)); 7] = [
+    let scenarios: [(&str, fn(&Arc<dyn DbBackend>)); 8] = [
         ("aller_retour", e::scenario_aller_retour),
         ("disque_vide", e::scenario_disque_vide),
         ("refus", e::scenario_refus),
@@ -209,6 +217,7 @@ async fn pg_edition_album_scenarios() {
         ),
         ("passe_des_coffrets", e::scenario_passe_des_coffrets),
         ("attacher_detacher", e::scenario_attacher_detacher),
+        ("balises_effectives", e::scenario_balises_effectives),
     ];
     for (nom, scenario) in scenarios {
         eprintln!("pg_edition_album : {nom}");

@@ -45,7 +45,7 @@ fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
 }
 
 /// Apply freshly-read metadata from disk onto an existing Track struct.
-fn apply_metadata_to_track(
+pub(super) fn apply_metadata_to_track(
     track: &mut tune_core::db::models::Track,
     m: &tune_core::metadata::TrackMetadata,
 ) {
