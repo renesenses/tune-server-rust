@@ -1100,6 +1100,13 @@ name = "pg_credits_4984"
 path = "tests/pg_credits_4984.rs"
 required-features = ["postgres"]
 
+# #5026 — la règle « Étiquette » élargie (pistes étiquetées, albums de service
+# étiquetés) sur PostgreSQL : aperçu, collection et compteur par le vrai routeur.
+[[test]]
+name = "pg_etiquette_collection_5026"
+path = "tests/pg_etiquette_collection_5026.rs"
+required-features = ["postgres"]
+
 # 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
 # JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
 # cible ne le déclarait. Il garde maintenant le contrat des titres de service
