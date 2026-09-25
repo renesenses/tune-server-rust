@@ -38,11 +38,45 @@
 //! `GET /search?q=…&limit=30` et lit `local.tracks` comme un tableau, voit
 //! exactement ce qu'il voyait ; les clés neuves lui sont invisibles.
 //!
-//! **Les services de streaming ne sont PAS paginés ici** : `limit` continue de
-//! leur être passé tel quel, sans `offset`, et ils n'entrent dans aucun total.
-//! Le plafond de page de Qobuz reste ce qu'il est, et le contrat de #2036 est
-//! intact — la pagination d'un service passe par `SearchPage`, pas par cette
-//! route.
+//! **Les services de streaming n'étaient PAS paginés ici** : `limit` leur est
+//! passé tel quel, sans `offset`. C'est toujours le cas SANS paramètre de
+//! pagination — voir #4803 ci-dessous, qui ajoute la pagination à la demande.
+//!
+//! # #4803 — la pagination des services, à la demande
+//!
+//! Seul résidu vivant de #895 : la route fédérée ne paginait pas les services.
+//! Deux formes avaient été envisagées, un « Voir plus » par service ou une
+//! pagination globale du résultat fusionné ; Bertrand : « toutes ». Les deux
+//! reposent sur le MÊME mécanisme, et aucun des deux ne change la réponse d'un
+//! client qui ne demande rien.
+//!
+//! | paramètre          | effet                                                     |
+//! |--------------------|-----------------------------------------------------------|
+//! | *aucun des quatre* | la réponse d'avant, octet pour octet                       |
+//! | `paged=true`       | première page, blocs de service enrichis, `next_cursor`   |
+//! | `service_offsets`  | `qobuz:50,tidal:0` — décalage par service (« Voir plus ») |
+//! | `service_limits`   | `qobuz:100` — limite par service (défaut : `limit`)        |
+//! | `cursor`           | la page SUIVANTE du résultat fusionné (`next_cursor`)     |
+//!
+//! En mode paginé, chaque bloc `services.<nom>` garde ses quatre tableaux et
+//! gagne, À CÔTÉ : `offset`, `limit` (la limite SERVIE, bornée par le plafond
+//! propre au service — [`StreamingService::limite_de_page_recherche`]),
+//! `total` (les totaux par catégorie que le service annonce), `has_more` et
+//! `truncated`. La tête de la réponse gagne `has_more` et `next_cursor`
+//! (`null` à la dernière page). Le bloc `local` ne change pas de forme.
+//!
+//! Le service est lu par SON `search_page` — celui que sert déjà
+//! `/streaming/{service}/search` — : sa pagination et son plafond sont les
+//! siens. Qobuz pagine (pages de 50 par requête, 500 par catégorie au plus) ;
+//! les autres services n'ont aujourd'hui qu'une page (50 au plus), et un
+//! décalage au-delà rend une page vide SANS appel réseau.
+//!
+//! La fusion n'est pas réinventée : une page de curseur est la même réponse,
+//! assemblée par la même route et le même [`recherches_concurrentes`]. Le
+//! curseur porte le décalage de chaque source qui AVAIT une suite — et
+//! d'elles seules : une source épuisée n'est plus interrogée. Les radios et
+//! les pistes trouvées par leurs seules métadonnées appartiennent à la
+//! première page, comme sous `offset` (#3189).
 //!
 //! # Les services sont interrogés ENSEMBLE, et le registre n'est plus tenu
 //!
@@ -305,15 +339,133 @@ fn piste_de_service_repond(jetons: &[String], piste: &StreamTrack) -> bool {
         .all(|jeton| separee.contains(jeton.as_str()) || collee.contains(jeton.as_str()))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct SearchParams {
     q: String,
     limit: Option<i64>,
     /// Rang de la première ligne locale rendue (#3189). Absent = 0, donc le
     /// comportement d'avant. Ne s'applique QU'À la bibliothèque locale : les
-    /// radios et les services n'ont pas de curseur ici.
+    /// services ont leurs propres décalages (#4803, `service_offsets`), et
+    /// sous un `cursor` c'est le curseur qui porte le décalage local.
     offset: Option<i64>,
     sources: Option<String>,
+    /// #4803 — décalage PAR SERVICE, `qobuz:50,tidal:0`. Un service absent
+    /// de la liste part de 0. Présent, il met la route en mode paginé.
+    service_offsets: Option<String>,
+    /// #4803 — limite PAR SERVICE, `qobuz:100`. Un service absent reçoit
+    /// `limit`. Présent, il met la route en mode paginé.
+    service_limits: Option<String>,
+    /// #4803 — la page SUIVANTE du résultat fusionné : la valeur de
+    /// `next_cursor` rendue par la page précédente, telle quelle.
+    cursor: Option<String>,
+    /// #4803 — le mode paginé sans rien décaler : la première page, avec
+    /// `offset`/`limit`/`total`/`has_more` par service et `next_cursor`.
+    paged: Option<String>,
+}
+
+/// La pagination des services (#4803), quand la requête la demande.
+///
+/// **Sans aucun des quatre paramètres, `None`** : la route suit alors
+/// exactement le chemin d'avant — `svc.search(q, limit)`, blocs de service
+/// sans clé neuve, pas de `next_cursor`. C'est ce qui garantit qu'aucun
+/// client installé ne voit un octet changer.
+///
+/// Deux formes, un seul mécanisme :
+///
+/// * **par service** (« Voir plus » d'un bloc) — `service_offsets` /
+///   `service_limits` : chaque service demandé est lu à son décalage, et
+///   son bloc dit `offset`, `limit`, `total`, `has_more`, `truncated` ;
+/// * **globale** (« page suivante » du résultat fusionné) — `cursor` : le
+///   curseur porte le décalage de chaque source qui AVAIT une suite, et
+///   seulement d'elles. Une source épuisée n'y figure pas et n'est donc pas
+///   interrogée à la page suivante : c'est ce qui borne le coût.
+#[derive(Debug, Default)]
+struct Pagination {
+    /// `Some` : page suivante d'un curseur global — seules les sources
+    /// qu'il nomme sont interrogées.
+    curseur: Option<HashMap<String, usize>>,
+    /// Décalage de chaque service (curseur, ou `service_offsets`).
+    decalages: HashMap<String, usize>,
+    /// Limite demandée pour chaque service (`service_limits`).
+    limites: HashMap<String, usize>,
+}
+
+/// La clé du curseur qui porte le décalage de la bibliothèque locale.
+///
+/// Aucun service ne s'appelle `local` : c'est déjà le jeton réservé du
+/// filtre `sources` (voir `routes::filtre_sources`).
+const CLE_LOCALE_DU_CURSEUR: &str = "local";
+
+impl Pagination {
+    fn depuis(p: &SearchParams) -> Option<Self> {
+        let paged = p
+            .paged
+            .as_deref()
+            .is_some_and(|v| !matches!(v.trim(), "0" | "false" | "no"));
+        if !paged && p.service_offsets.is_none() && p.service_limits.is_none() && p.cursor.is_none()
+        {
+            return None;
+        }
+        let curseur = p.cursor.as_deref().map(lire_table);
+        let decalages = match &curseur {
+            Some(c) => c.clone(),
+            None => p
+                .service_offsets
+                .as_deref()
+                .map(lire_table)
+                .unwrap_or_default(),
+        };
+        Some(Self {
+            curseur,
+            decalages,
+            limites: p
+                .service_limits
+                .as_deref()
+                .map(lire_table)
+                .unwrap_or_default(),
+        })
+    }
+
+    /// Cette source est-elle interrogée ? Toujours, hors curseur ; avec un
+    /// curseur, seulement si elle y figure.
+    fn interroge(&self, source: &str) -> bool {
+        self.curseur.as_ref().is_none_or(|c| c.contains_key(source))
+    }
+}
+
+/// `qobuz:50,tidal:0` → `{qobuz: 50, tidal: 0}`.
+///
+/// Une entrée illisible est ignorée plutôt que de faire échouer la
+/// recherche : le service retombe sur son décalage 0, ce qui rend une page
+/// réelle au lieu d'une erreur.
+fn lire_table(texte: &str) -> HashMap<String, usize> {
+    texte
+        .split(',')
+        .filter_map(|entree| {
+            let (nom, valeur) = entree.trim().rsplit_once(':')?;
+            let nom = nom.trim();
+            if nom.is_empty() {
+                return None;
+            }
+            Some((nom.to_string(), valeur.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// L'inverse de [`lire_table`], dans un ordre STABLE (alphabétique) : deux
+/// réponses identiques rendent le même curseur. `None` quand plus aucune
+/// source n'a de suite — c'est la dernière page.
+fn ecrire_curseur(suites: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if suites.is_empty() {
+        return None;
+    }
+    Some(
+        suites
+            .iter()
+            .map(|(nom, decalage)| format!("{nom}:{decalage}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 // Les jetons `local` / `all` et la règle qui les lit vivaient ICI, sous la
@@ -334,15 +486,30 @@ pub fn router() -> Router<AppState> {
 
 async fn federated_search(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<SearchParams>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(LIMITE_PAR_DEFAUT);
-    let offset = p.offset.unwrap_or(0).max(0);
+    // #4803 — `None` sans paramètre de pagination : le chemin d'avant.
+    let pagination = Pagination::depuis(&p);
+    let page_de_curseur = pagination.as_ref().is_some_and(|pg| pg.curseur.is_some());
+    // Sous un curseur, le décalage local est celui du curseur, pas `offset`.
+    let offset = match pagination.as_ref().and_then(|pg| pg.curseur.as_ref()) {
+        Some(c) => c
+            .get(CLE_LOCALE_DU_CURSEUR)
+            .map_or(0, |d| i64::try_from(*d).unwrap_or(i64::MAX)),
+        None => p.offset.unwrap_or(0).max(0),
+    };
 
     // #3226 — LU EN PREMIER. Tant que ce parsing vivait sous les recherches
     // locales, il ne pouvait par construction gouverner qu'elles seules.
     let filtre = FiltreSources::depuis(p.sources.as_deref());
-    let local_demande = filtre.local_demande();
+    // #4803 — une page de curseur n'interroge le local que s'il avait une
+    // suite ; sinon il rendrait sa première page une seconde fois.
+    let local_demande = filtre.local_demande()
+        && pagination
+            .as_ref()
+            .is_none_or(|pg| pg.interroge(CLE_LOCALE_DU_CURSEUR));
 
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
@@ -362,9 +529,15 @@ async fn federated_search(
             track_repo
                 .search_page(&p.q, limit, offset)
                 .unwrap_or_default(),
-            RadioRepo::with_backend(state.backend.clone())
-                .search(&p.q)
-                .unwrap_or_default(),
+            // Les radios ne sont pas paginées : elles appartiennent à la
+            // première page, une page de curseur les répéterait (#4803).
+            if page_de_curseur {
+                Vec::new()
+            } else {
+                RadioRepo::with_backend(state.backend.clone())
+                    .search(&p.q)
+                    .unwrap_or_default()
+            },
         )
     } else {
         // Pas « calculer puis jeter » : les requêtes ne partent pas.
@@ -468,6 +641,9 @@ async fn federated_search(
         }
         track_results.push(v);
     }
+    // #4806 — `banned` sur la recherche fédérée aussi : un titre banni se
+    // trouve, grisé.
+    crate::routes::library::attacher_banni(&state, profile.id(), &mut track_results);
 
     // La moitié streaming ne change pas d'un octet : la liste blanche est la
     // même, lue plus haut, et la règle qu'elle applique ici est celle d'avant.
@@ -485,6 +661,8 @@ async fn federated_search(
             .list()
             .into_iter()
             .filter(|nom| filtre.service_demande(nom))
+            // #4803 — sous un curseur, un service épuisé n'est pas rappelé.
+            .filter(|nom| pagination.as_ref().is_none_or(|pg| pg.interroge(nom)))
             .filter_map(|nom| registry.get(&nom).map(|svc| (nom, svc)))
             .collect()
     };
@@ -495,37 +673,83 @@ async fn federated_search(
         .into_iter()
         .map(|(nom, svc)| {
             let requete = requete.clone();
+            // #4803 — ce que CE service reçoit en mode paginé : son décalage,
+            // sa limite. `None` hors pagination.
+            let fenetre = pagination.as_ref().map(|pg| {
+                (
+                    pg.decalages.get(&nom).copied().unwrap_or(0),
+                    pg.limites.get(&nom).copied().unwrap_or(limite),
+                )
+            });
             let nom_log = nom.clone();
             (nom, async move {
                 let svc = svc.read().await;
                 if !svc.auth_status().await.authenticated {
                     return None;
                 }
-                // `limit` tel quel, sans `offset` : le plafond de page d'un
-                // service (Qobuz : 50) est SA contrainte, et #2036 dit qu'on la
-                // pagine par `SearchPage`, pas en gonflant ce nombre.
-                //
-                // « Tel quel » s'arrête au SIGNE : voir
-                // [`limite_pour_les_services`] (#2160).
-                let mut results = svc.search(&requete, limite).await.ok()?;
-                // #4441 — voir `ne_garder_que_les_pistes_qui_repondent` : le filtre
-                // s'applique à chaque service, dans sa tâche, avant la réunion.
-                let ecartees = ne_garder_que_les_pistes_qui_repondent(&requete, &mut results);
-                if ecartees > 0 {
-                    tracing::debug!(
-                        service = %nom_log,
-                        ecartees,
-                        gardees = results.tracks.len(),
-                        "search_pistes_de_service_hors_identite_ecartees"
-                    );
+                let Some((decalage, demandee)) = fenetre else {
+                    // `limit` tel quel, sans `offset` : le chemin d'avant #4803,
+                    // intact. Le plafond de page d'un service (Qobuz : 50 par
+                    // requête) est SA contrainte.
+                    //
+                    // « Tel quel » s'arrête au SIGNE : voir
+                    // [`limite_pour_les_services`] (#2160).
+                    let mut results = svc.search(&requete, limite).await.ok()?;
+                    ecarter_hors_identite(&nom_log, &requete, &mut results);
+                    return Some(json!(results));
+                };
+                // #4803 — la page du service, par SON `search_page` : la
+                // pagination et le plafond sont les siens (Qobuz : 500 par
+                // catégorie ; un service sans pagination : une page de 50,
+                // puis rien).
+                let page = svc.search_page(&requete, demandee, decalage).await.ok()?;
+                let servie = svc.limite_de_page_recherche(demandee);
+                let mut results = page.results;
+                ecarter_hors_identite(&nom_log, &requete, &mut results);
+                let mut bloc = json!(results);
+                if let Some(o) = bloc.as_object_mut() {
+                    o.insert("offset".into(), json!(decalage));
+                    // La limite SERVIE, pas la demandée : c'est d'elle que le
+                    // curseur avance, sans trou (voir `limite_de_page_recherche`).
+                    o.insert("limit".into(), json!(servie));
+                    o.insert("total".into(), json!(page.totals));
+                    o.insert("has_more".into(), json!(page.has_more));
+                    o.insert("truncated".into(), json!(page.truncated));
                 }
-                Some(json!(results))
+                Some(bloc)
             })
         })
         .collect();
     service_results = recherches_concurrentes(travaux).await;
 
-    Json(json!({
+    // #4803 — la suite du résultat fusionné : chaque source qui a une suite,
+    // à `offset + limit`. Calculé AVANT que le `json!` ne consomme les listes.
+    let suite_locale = local_demande
+        && limit > 0
+        && (a_la_suite(artists.len(), total_artists)
+            || a_la_suite(albums.len(), total_albums)
+            || a_la_suite(tracks.len(), total_tracks));
+    let suites = pagination.as_ref().map(|_| {
+        let mut suites = std::collections::BTreeMap::new();
+        if suite_locale {
+            suites.insert(
+                CLE_LOCALE_DU_CURSEUR.to_string(),
+                usize::try_from(offset.saturating_add(limit)).unwrap_or(usize::MAX),
+            );
+        }
+        for (nom, bloc) in &service_results {
+            if bloc["has_more"].as_bool() == Some(true) {
+                let de = bloc["offset"].as_u64().unwrap_or(0) as usize;
+                let pas = bloc["limit"].as_u64().unwrap_or(0) as usize;
+                if pas > 0 {
+                    suites.insert(nom.clone(), de.saturating_add(pas));
+                }
+            }
+        }
+        suites
+    });
+
+    let mut reponse = json!({
         "local": {
             "artists": artists,
             "albums": albums,
@@ -557,7 +781,27 @@ async fn federated_search(
         },
         "radios": radios,
         "services": service_results,
-    }))
+    });
+    if let (Some(suites), Some(o)) = (suites, reponse.as_object_mut()) {
+        let suivant = ecrire_curseur(&suites);
+        o.insert("has_more".into(), json!(suivant.is_some()));
+        o.insert("next_cursor".into(), json!(suivant));
+    }
+    Json(reponse)
+}
+
+/// #4441 — voir `ne_garder_que_les_pistes_qui_repondent` : le filtre
+/// s'applique à chaque service, dans sa tâche, avant la réunion.
+fn ecarter_hors_identite(service: &str, requete: &str, results: &mut SearchResults) {
+    let ecartees = ne_garder_que_les_pistes_qui_repondent(requete, results);
+    if ecartees > 0 {
+        tracing::debug!(
+            service = %service,
+            ecartees,
+            gardees = results.tracks.len(),
+            "search_pistes_de_service_hors_identite_ecartees"
+        );
+    }
 }
 
 /// Attache `added_at` aux albums d'une page de résultats.
@@ -572,6 +816,10 @@ fn avec_date_d_ajout(
     repo.attacher_added_at(&mut albums);
     albums
 }
+
+#[cfg(test)]
+#[path = "search_pagination_i4803_tests.rs"]
+mod tests_pagination_i4803;
 
 #[cfg(test)]
 mod tests_date_d_ajout {
@@ -782,11 +1030,13 @@ mod tests_pistes_de_service_i4441 {
             .register(Box::new(QobuzDeFabien));
         let reponse = federated_search(
             State(state),
+            crate::routes::active_profile::ActiveProfile(1),
             Query(SearchParams {
                 q: q.to_string(),
                 limit: None,
                 offset: None,
                 sources: Some("qobuz".into()),
+                ..Default::default()
             }),
         )
         .await;

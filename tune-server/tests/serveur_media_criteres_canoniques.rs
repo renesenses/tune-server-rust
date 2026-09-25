@@ -81,6 +81,11 @@ fn etat_media() -> UpnpState {
 
 /// Le corps SOAP d'un `Search` tel qu'un point de contrôle l'envoie.
 fn corps_search(conteneur: &str, criteres: &str, requested_count: u64) -> String {
+    corps_search_trie(conteneur, criteres, requested_count, "")
+}
+
+/// Le même `Search`, avec un `SortCriteria`.
+fn corps_search_trie(conteneur: &str, criteres: &str, requested_count: u64, tri: &str) -> String {
     // Le critère voyage ÉCHAPPÉ dans l'enveloppe, comme sur le fil.
     let criteres = criteres.replace('"', "&quot;");
     format!(
@@ -89,7 +94,7 @@ fn corps_search(conteneur: &str, criteres: &str, requested_count: u64) -> String
  <s:Body><u:Search xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
   <ContainerID>{conteneur}</ContainerID><SearchCriteria>{criteres}</SearchCriteria>
   <Filter>*</Filter><StartingIndex>0</StartingIndex><RequestedCount>{requested_count}</RequestedCount>
-  <SortCriteria></SortCriteria>
+  <SortCriteria>{tri}</SortCriteria>
  </u:Search></s:Body></s:Envelope>"#
     )
 }
@@ -303,4 +308,146 @@ async fn temoin_le_browse_a_requested_count_zero_rend_tout_et_l_annonce() {
              donc annoncer autant que le corps transporte\n{soap}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #4955 — la Recherche du Marantz ND8006 (Denon/Marantz HEOS)
+// ---------------------------------------------------------------------------
+//
+// « Recherche qui ne fonctionne toujours pas, je peux mettre un nom mais je
+// n'arrive pas à envoyer l'ordre » — Jean Valjean, trois relevés du 30/08 au
+// 24/09. Le Browse du même appareil marche (témoin 2 ci-dessus) ; c'est donc
+// le dialogue `GetSearchCapabilities` / `Search` qui est en cause. Trois
+// refus pouvaient, chacun seul, rendre la recherche muette :
+// - tout `SortCriteria` non vide → SOAP 709, alors que `Browse` l'ignore ;
+// - toute parenthèse, tout `or` → SOAP 708 ;
+// - `upnp:artist`, `upnp:album` absents de `SearchCaps`, et refusés en 708.
+// Chaque témoin ci-dessous porte un de ces trois refus : ROUGE avant le
+// correctif, vert après.
+
+/// Le `GET` d'une ressource du serveur média, sur la vraie route.
+async fn lire(chemin: &str) -> (StatusCode, String) {
+    let routeur = tune_server::routes::upnp_media_server::standalone_router(etat_media());
+    let reponse = routeur
+        .oneshot(Request::get(chemin).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (statut, String::from_utf8(octets.to_vec()).unwrap())
+}
+
+/// Poste un `Search` et exige une réponse servie : ni faute, ni HTTP 500, et
+/// autant d'éléments annoncés que transportés. Rend ce nombre.
+async fn chercher(criteres: &str, tri: &str) -> (usize, String) {
+    let (statut, soap) = poster("Search", corps_search_trie("0", criteres, 0, tri)).await;
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "le lecteur reçoit {statut} pour « {criteres} » (tri « {tri} ») : \
+         sa recherche ne rend rien\n{soap}"
+    );
+    assert!(!soap.contains("<s:Fault>"), "{criteres}\n{soap}");
+    let transportes = elements_transportes(&soap);
+    assert_eq!(
+        champ(&soap, "TotalMatches"),
+        transportes.to_string(),
+        "{criteres}\n{soap}"
+    );
+    (transportes, soap)
+}
+
+/// Ce que lit un point de contrôle AVANT d'offrir sa recherche : le SCPD
+/// déclare l'action et ses capacités, et `SearchCaps` nomme les champs d'une
+/// recherche de lecteur réseau — l'artiste, l'album, le titre.
+#[tokio::test]
+async fn les_capacites_nomment_artiste_album_et_titre_4955() {
+    let (statut, scpd) = lire("/ContentDirectory/scpd.xml").await;
+    assert_eq!(statut, StatusCode::OK, "{scpd}");
+    for action in ["<name>Search</name>", "<name>GetSearchCapabilities</name>"] {
+        assert!(scpd.contains(action), "SCPD sans {action} : {scpd}");
+    }
+
+    let corps = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+ <s:Body><u:GetSearchCapabilities xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"/></s:Body>
+</s:Envelope>"#;
+    let (statut, soap) = poster("GetSearchCapabilities", corps.to_string()).await;
+    assert_eq!(statut, StatusCode::OK, "{soap}");
+    let caps: Vec<String> = champ(&soap, "SearchCaps")
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    for attendu in ["upnp:class", "dc:title", "upnp:artist", "upnp:album"] {
+        assert!(
+            caps.iter().any(|c| c == attendu),
+            "SearchCaps sans {attendu} : {caps:?}"
+        );
+    }
+}
+
+/// Refus 1 — le tri. Un lecteur qui demande ses artistes triés par nom
+/// recevait un SOAP 709 pour toute la recherche.
+#[tokio::test]
+async fn une_recherche_triee_est_servie_4955() {
+    let (n, soap) = chercher(
+        "upnp:class derivedfrom \"object.container.person.musicArtist\" and dc:title contains \"Artiste 2\"",
+        "+dc:title",
+    )
+    .await;
+    assert_eq!(n, 1, "{soap}");
+    assert!(soap.contains("Artiste 2"), "{soap}");
+}
+
+/// Refus 2 — les parenthèses et `or`. La recherche « partout » d'un lecteur :
+/// un nom cherché dans le titre, l'artiste ET l'album.
+#[tokio::test]
+async fn une_recherche_parenthesee_sur_plusieurs_champs_est_servie_4955() {
+    let (n, soap) = chercher(
+        "(upnp:class derivedfrom \"object.container.album.musicAlbum\" and dc:title contains \"Album 1-\")",
+        "",
+    )
+    .await;
+    assert_eq!(n, 3, "les trois albums de l'artiste 1 : {soap}");
+
+    let (n, soap) = chercher(
+        "upnp:class derivedfrom \"object.item.audioItem.musicTrack\" and (dc:title contains \"Album 0-1\" \
+         or upnp:artist contains \"Album 0-1\" or upnp:album contains \"Album 0-1\")",
+        "+dc:title",
+    )
+    .await;
+    assert_eq!(n, 5, "les cinq pistes de l'album « Album 0-1 » : {soap}");
+    assert!(soap.contains("Piste 0-1-4"), "{soap}");
+    assert!(!soap.contains("Piste 0-2-"), "{soap}");
+}
+
+/// Refus 3 — l'artiste. Les pistes d'un artiste, et ses albums.
+#[tokio::test]
+async fn une_recherche_par_artiste_est_servie_4955() {
+    let (n, soap) = chercher(
+        "upnp:class derivedfrom \"object.item.audioItem\" and upnp:artist contains \"Artiste 3\"",
+        "",
+    )
+    .await;
+    assert_eq!(n, 15, "trois albums de cinq pistes : {soap}");
+    assert!(!soap.contains("Piste 2-"), "{soap}");
+
+    let (n, soap) = chercher(
+        "upnp:class = \"object.container.album.musicAlbum\" and dc:creator contains \"artiste 1\"",
+        "",
+    )
+    .await;
+    assert_eq!(n, 3, "{soap}");
+    assert!(soap.contains("Album 1-2"), "{soap}");
+}
+
+/// Témoin 3 — ce qui reste hors capacités est toujours REFUSÉ (#2312) : le
+/// correctif élargit la grammaire, il ne se met pas à tout rendre.
+#[tokio::test]
+async fn temoin_un_champ_non_annonce_reste_refuse() {
+    let (statut, soap) = poster("Search", corps_search("0", "dc:date contains \"1960\"", 0)).await;
+    assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR, "{soap}");
+    assert!(soap.contains("<errorCode>708</errorCode>"), "{soap}");
 }

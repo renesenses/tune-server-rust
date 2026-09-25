@@ -105,22 +105,45 @@ fn le_rapporteur_de_decodage_ecrit_bien_dans_le_verrou() {
     );
 }
 
-/// La famille `record_*` compte CINQ membres : refus PCM exclusif Windows,
+/// La famille `record_*` compte SIX membres : refus PCM exclusif Windows,
 /// refus d'ouverture exclusive, blocage d'alimentation (#3108), échec de
-/// décodage (#3270), et désormais **périphérique introuvable sur le chemin
-/// PARTAGÉ** — `record_shared_device_not_found`, qui couvre les deux jumeaux
+/// décodage (#3270), **périphérique introuvable sur le chemin PARTAGÉ** —
+/// `record_shared_device_not_found`, qui couvre les deux jumeaux
 /// `audio_device_not_found_no_fallback` (chemin WAV) et
-/// `audio_device_not_found_compressed`.
+/// `audio_device_not_found_compressed` —, et désormais **piste tronquée**
+/// (fil 1915) — `record_truncated_track_failure`, le flux d'une piste coupé
+/// loin de sa fin. Celui-là ne dit pas une panne de SORTIE : son constat porte
+/// le préfixe `piste_tronquee:` et le sondeur passe à la piste suivante au
+/// lieu d'arrêter la zone. Sa garde de site vit dans
+/// `piste_tronquee_dit_pourquoi_1915.rs`.
 ///
-/// Ce compte est le garde-fou du recensement : si un sixième silence trouve
+/// Ce compte est le garde-fou du recensement : si un septième silence trouve
 /// son canal, il se déclare ici. C'est cette garde qui a fait rougir la PR
-/// du chemin partagé, et c'est exactement son travail.
+/// du chemin partagé, puis celle du fil 1915, et c'est exactement son
+/// travail. Les membres sont NOMMÉS, pas seulement comptés : un rapporteur
+/// renommé ou remplacé par un autre à nombre égal se déclare aussi.
 #[test]
 fn la_famille_des_rapporteurs_compte_ses_membres() {
-    let membres = LOCAL.matches("\nfn record_").count();
+    let mut membres: Vec<&str> = LOCAL
+        .match_indices("\nfn record_")
+        .map(|(i, _)| {
+            let nom = &LOCAL[i + "\nfn ".len()..];
+            &nom[..nom.find('(').expect("un `fn record_*` sans parenthèse")]
+        })
+        .collect();
+    membres.sort_unstable();
     assert_eq!(
-        membres, 5,
-        "la famille `record_*` de local.rs compte {membres} membre(s) et non 5 ; \
-         mettre ce compte à jour EN NOMMANT le nouveau canal"
+        membres,
+        [
+            "record_compressed_decode_failure",
+            "record_exclusive_open_failure",
+            "record_feed_stall_failure",
+            "record_shared_device_not_found",
+            "record_truncated_track_failure",
+            "record_windows_exclusive_pcm_refusal",
+        ],
+        "la famille `record_*` de local.rs a changé ({} membre(s), 6 attendus) ; \
+         mettre ce recensement à jour EN NOMMANT le nouveau canal",
+        membres.len()
     );
 }

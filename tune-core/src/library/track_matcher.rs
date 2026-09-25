@@ -307,6 +307,83 @@ pub fn find_best_match(
     result
 }
 
+/// Classer PLUSIEURS candidats pour un même titre connu, du meilleur au moins
+/// bon — au lieu du verdict unique de [`find_best_match`].
+///
+/// # Pourquoi (#4716)
+///
+/// [`find_best_match`] s'arrête au premier palier qui répond : un seul
+/// candidat sort, les autres sont jetés. Or l'appelant applique parfois SA
+/// propre règle par-dessus — le greffon « Playlists converter » refuse un
+/// appariement dont la durée s'écarte de plus de 3 s de la piste d'origine.
+/// Quand le vainqueur rate cette tolérance, le titre ressortait
+/// « introuvable » alors qu'un autre résultat du même service aurait convenu.
+/// Rendre le classement laisse l'appelant redescendre d'un cran.
+///
+/// # Rien n'est rescoré
+///
+/// Chaque candidat est jugé par [`find_best_match`] lui-même :
+///
+/// * la TÊTE du classement est le verdict global, identique à ce que
+///   l'appelant obtenait avant (paliers ISRC puis exact puis approché compris)
+///   — l'écran et le greffon continuent donc de désigner la même piste ;
+/// * les suivants sont les mêmes candidats jugés SEULS, triés par score
+///   décroissant. Le tri est stable : à score égal, l'ordre du fournisseur est
+///   conservé.
+///
+/// Les candidats sous `plancher` sont écartés, et le classement est borné à
+/// `max` entrées. Rend `(indice dans `candidates`, score)` — l'appelant garde
+/// ses propres identifiants.
+pub fn classer_candidats(
+    title: &str,
+    artist: &str,
+    isrc: &str,
+    duration_ms: i64,
+    candidates: &[MatchCandidate],
+    plancher: f64,
+    max: usize,
+) -> Vec<(usize, f64)> {
+    if candidates.is_empty() || max == 0 {
+        return Vec::new();
+    }
+
+    // L'indice sert d'identifiant de travail : deux résultats peuvent porter le
+    // même `source_id` (ou aucun), et c'est la POSITION que l'appelant
+    // retrouvera. La copie ne coûte rien à cette échelle (une dizaine de
+    // résultats de recherche).
+    let indexes: Vec<MatchCandidate> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| MatchCandidate {
+            source_id: i.to_string(),
+            ..c.clone()
+        })
+        .collect();
+
+    let tete: Option<(usize, f64)> = find_best_match(title, artist, isrc, duration_ms, &indexes)
+        .best_match
+        .filter(|m| m.score >= plancher)
+        .and_then(|m| m.source_id.parse::<usize>().ok().map(|i| (i, m.score)));
+    let mut classement: Vec<(usize, f64)> = tete.into_iter().collect();
+
+    let mut autres: Vec<(usize, f64)> = indexes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| classement.first().map(|(t, _)| t != i).unwrap_or(true))
+        .filter_map(|(i, c)| {
+            find_best_match(title, artist, isrc, duration_ms, std::slice::from_ref(c))
+                .best_match
+                .filter(|m| m.score >= plancher)
+                .map(|m| (i, m.score))
+        })
+        .collect();
+    autres.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    classement.extend(autres);
+    classement.truncate(max);
+    classement
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +642,88 @@ mod tests {
         assert!(
             m.best_match.is_none(),
             "rien ne doit être rattaché sur une clé vide : {m:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #4716 — `classer_candidats` : plusieurs candidats, pas un seul verdict
+    // -----------------------------------------------------------------------
+
+    /// Un candidat de banc : titre, artiste, durée.
+    fn c(titre: &str, artiste: &str, duree_ms: i64) -> MatchCandidate {
+        MatchCandidate {
+            title: titre.into(),
+            artist_name: artiste.into(),
+            album_title: String::new(),
+            source_id: String::new(),
+            duration_ms: duree_ms,
+            isrc: String::new(),
+            score: 0.0,
+            match_method: String::new(),
+            confidence: String::new(),
+        }
+    }
+
+    /// La tête du classement est EXACTEMENT le verdict de `find_best_match` —
+    /// sans quoi l'écran et le greffon désigneraient deux pistes différentes.
+    #[test]
+    fn la_tete_du_classement_est_le_verdict_global() {
+        let candidats = vec![
+            c("Imagine", "A Tribute Band", 190_000),
+            c("Imagine", "John Lennon", 187_000),
+        ];
+        let classement =
+            classer_candidats("Imagine", "John Lennon", "", 187_000, &candidats, 0.6, 5);
+        let global = find_best_match("Imagine", "John Lennon", "", 187_000, &candidats)
+            .best_match
+            .expect("un verdict");
+        assert_eq!(classement[0].0, 1, "la reprise ne doit pas gagner");
+        assert_eq!(classement[0].1, global.score);
+    }
+
+    /// Le chemin ISRC garde la main, et les autres candidats restent derrière.
+    #[test]
+    fn l_isrc_reste_en_tete_du_classement() {
+        let mut porteur = c("Titre mal etiquete", "V.A.", 200_000);
+        porteur.isrc = "FRUM71600123".into();
+        let candidats = vec![c("La Boheme", "Charles Aznavour", 210_000), porteur];
+        let classement = classer_candidats(
+            "La Boheme",
+            "Charles Aznavour",
+            "FRUM71600123",
+            210_000,
+            &candidats,
+            0.6,
+            5,
+        );
+        assert_eq!(classement[0].0, 1, "l'ISRC tranche : {classement:?}");
+        assert_eq!(classement[0].1, 1.0);
+    }
+
+    /// Rien de plausible : un classement VIDE, jamais un candidat de dépit.
+    #[test]
+    fn aucun_candidat_plausible_rend_un_classement_vide() {
+        let candidats = vec![c("Totalement autre chose", "Quelqu'un d'autre", 200_000)];
+        assert!(
+            classer_candidats("La Boheme", "Charles Aznavour", "", 0, &candidats, 0.6, 5)
+                .is_empty()
+        );
+        assert!(classer_candidats("X", "Y", "", 0, &[], 0.6, 5).is_empty());
+    }
+
+    /// Le plafond est respecté, et un plafond nul ne rend rien.
+    #[test]
+    fn le_nombre_de_candidats_est_plafonne() {
+        let candidats: Vec<MatchCandidate> = (0..8)
+            .map(|i| c("La Boheme", "Charles Aznavour", 200_000 + i * 1000))
+            .collect();
+        assert_eq!(
+            classer_candidats("La Boheme", "Charles Aznavour", "", 0, &candidats, 0.6, 3).len(),
+            3
+        );
+        assert!(
+            classer_candidats("La Boheme", "Charles Aznavour", "", 0, &candidats, 0.6, 0)
+                .is_empty()
         );
     }
 }

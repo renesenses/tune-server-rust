@@ -99,6 +99,7 @@ fn apply_metadata_to_track(
 /// diverger — c'est l'argument que porte déjà le commentaire ci-dessous.
 pub(super) fn joindre_dr_par_piste(
     state: &AppState,
+    profile_id: i64,
     items: Vec<tune_core::db::models::Track>,
 ) -> Vec<Value> {
     let track_ids: Vec<i64> = items.iter().filter_map(|t| t.id).collect();
@@ -124,7 +125,75 @@ pub(super) fn joindre_dr_par_piste(
     // second recopieur qui aurait fini par diverger — c'est exactement
     // l'argument de #1388 sur `attach_track_tags`.
     super::albums::attacher_ecoutes(state, &mut items);
+    // #4806 — même seam, même raison : `banned` sur toutes les surfaces
+    // d'un coup, sans filtrer aucune.
+    super::albums::attacher_banni(state, profile_id, &mut items);
     items
+}
+
+/// `POST /library/tracks/{id}/ban` — bannit un titre LOCAL pour le profil
+/// qui agit (#4806). Jamais joué par une sélection automatique (aléatoire,
+/// smart playlist, enchaînement, radio d'artiste, recommandations), sauté
+/// quand une file y arrive, mais visible et grisé dans son album. Réversible
+/// par DELETE. Idempotent. 404 si l'id ne désigne aucune piste.
+///
+/// S'il JOUE au moment du bannissement, la zone passe au suivant — le
+/// journal le dit (`piste_bannie_en_cours_passage_au_suivant`) et la réponse
+/// nomme les zones passées.
+pub(super) async fn ban_track(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.ban_track(profile.id(), id) {
+        Ok(true) => {}
+        Ok(false) => return Err(AppError::not_found(format!("track {id} not found"))),
+        Err(e) => return Err(AppError::internal(e)),
+    }
+    let zones = crate::routes::playback::passer_les_zones_qui_jouent_la_piste(&state, id).await;
+    Ok(Json(json!({
+        "track_id": id,
+        "profile_id": profile.id(),
+        "banned": true,
+        "zones_passees_au_suivant": zones,
+    })))
+}
+
+/// `DELETE /library/tracks/{id}/ban` — débannit. Idempotent : débannir un
+/// titre non banni rend simplement `banned: false`.
+pub(super) async fn unban_track(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.unban_track(profile.id(), id) {
+        Ok(_) => Ok(Json(json!({
+            "track_id": id,
+            "profile_id": profile.id(),
+            "banned": false,
+        }))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
+/// `GET /library/tracks/banned` — l'écran « Titres bannis » du profil :
+/// tout revoir et débannir, y compris les marqueurs orphelins (piste morte),
+/// rendus avec l'instantané d'identité.
+pub(super) async fn list_banned_tracks(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    let items = repo
+        .list_banned_tracks(profile.id())
+        .map_err(AppError::internal)?;
+    Ok(Json(json!({
+        "profile_id": profile.id(),
+        "total": items.len(),
+        "items": items,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -153,6 +222,7 @@ pub(super) struct TrackFilterQuery {
 
 pub(super) async fn list_tracks(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Query(p): Query<TrackFilterQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, AppError> {
@@ -192,7 +262,7 @@ pub(super) async fn list_tracks(
     if filter.is_active() {
         match repo.list_filtered(&filter, limit, offset) {
             Ok((items, total)) => {
-                let items = joindre_dr_par_piste(&state, items);
+                let items = joindre_dr_par_piste(&state, profile.id(), items);
                 Ok(Json(
                     json!({"items": items, "total": total, "limit": limit, "offset": offset}),
                 ))
@@ -221,7 +291,7 @@ pub(super) async fn list_tracks(
                 Vec::new()
             }
         };
-        let items = joindre_dr_par_piste(&state, items);
+        let items = joindre_dr_par_piste(&state, profile.id(), items);
         Ok(Json(
             json!({"items": items, "total": total, "limit": limit, "offset": offset}),
         ))
@@ -248,6 +318,7 @@ pub(super) struct SimilarParams {
 /// this build never computed vectors — so the client can fall back gracefully.
 pub(super) async fn track_similar(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
     Query(p): Query<SimilarParams>,
 ) -> Json<Value> {
@@ -264,7 +335,7 @@ pub(super) async fn track_similar(
     let by_id: std::collections::HashMap<i64, &tune_core::db::models::Track> =
         tracks.iter().filter_map(|t| t.id.map(|i| (i, t))).collect();
     // Re-emit in acoustic-rank order (list_by_ids is unordered) with the score.
-    let items: Vec<Value> = neighbors
+    let mut items: Vec<Value> = neighbors
         .iter()
         .filter_map(|(tid, score)| {
             let t = by_id.get(tid)?;
@@ -278,11 +349,15 @@ pub(super) async fn track_similar(
             Some(v)
         })
         .collect();
+    // #4806 — « Plus comme ça » est une liste d'affichage : le titre banni y
+    // reste, `banned: true`, c'est l'écran qui le grise.
+    super::albums::attacher_banni(&state, profile.id(), &mut items);
     Json(json!({ "seed_track_id": id, "count": items.len(), "items": items }))
 }
 
 pub(super) async fn get_track(
     State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
@@ -291,7 +366,7 @@ pub(super) async fn get_track(
             // Dynamic Range par piste (#1388) : la fiche d'une piste rend le
             // même champ que les pistes d'un album. Sans tag, la clé reste
             // absente et la charge utile est celle d'avant, au bit près.
-            let v = joindre_dr_par_piste(&state, vec![track])
+            let v = joindre_dr_par_piste(&state, profile.id(), vec![track])
                 .into_iter()
                 .next()
                 .unwrap_or_default();

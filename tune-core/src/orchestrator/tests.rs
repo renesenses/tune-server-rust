@@ -1724,11 +1724,20 @@ async fn une_zone_reseau_dont_le_seul_traitement_est_le_crossfeed() {
     );
     let req = requete_locale_3234(zone_id, 1);
 
-    // Opt-in DÉSARMÉ : rien ne bouge. FLAC ré-encodé par le fichier, comme
-    // avant le correctif — pas une seconde d'attente ajoutée.
+    // Opt-in DÉSARMÉ, renderer qui annonce le LPCM (absent du registre :
+    // présumé capable). Depuis le 24/09 (#2742, décision de Bertrand), le
+    // crossfeed seul vaut consentement au WAV progressif — jamais au fichier
+    // entier : pas une seconde d'attente ajoutée. Le cas sans LPCM, qui part
+    // tel quel, est mesuré dans `crossfeed_bibliotheque_reseau`.
     let avant = orch.format_de_sortie_pour_test(&req).await.unwrap();
-    assert_eq!(avant.out_mime, "audio/flac", "à froid, rien ne change");
-    assert!(avant.use_file_transcode);
+    assert_eq!(
+        avant.out_mime, "audio/wav",
+        "crossfeed seul : WAV progressif"
+    );
+    assert!(
+        !avant.use_file_transcode,
+        "jamais le fichier entier pour un crossfeed seul"
+    );
 
     // Opt-in ARMÉ : WAV progressif, et le relais portera le crossfeed.
     settings.set("dsp_progressif_reseau", "true").unwrap();
@@ -9091,5 +9100,96 @@ async fn la_bulle_de_refus_ne_montre_pas_la_sentinelle_de_code() {
         ev.data.get("code").and_then(|v| v.as_str()),
         Some("zone_output_unavailable"),
         "le code stable doit voyager à part, pas collé devant la phrase"
+    );
+}
+
+/// ⭐ #2742, 23/09 — TÉMOIN D'EFFET : une zone DLNA dont l'opt-in
+/// `dsp_progressif_reseau` est DÉSARMÉ entend quand même son crossfeed sur un
+/// flux Qobuz, Tidal ou YouTube — et le statut publié doit le savoir.
+///
+/// La chaîne mesurée est celle des bras streaming de `resolve_stream.rs`
+/// (HTTPS, DASH, AAC) : `load_streaming_dsp(zone, …)` puis
+/// `StreamingDsp::process`, sans aucune lecture de l'opt-in. On y fait passer
+/// un signal dont la voie DROITE est silencieuse : ce qui en ressort à droite
+/// est de la diaphonie, et rien d'autre.
+///
+/// La mesure est verte dès la v0.9.151 : le crossfeed ATTEINT le renderer.
+/// Ce qui était faux, c'est l'écran — `crossfeed_status`, nourri des MÊMES
+/// faits de zone, répondait `unavailable: true` (`network_progressive_off`),
+/// et le client verrouillait intensité et retard. Tades, 0.9.151, zone DLNA
+/// « C19 », source Qobuz : « Aucun effet et même plus la possibilité de régler
+/// intensité et retard ».
+#[tokio::test]
+async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
+    let orch = test_orchestrator();
+    let device = "uuid:diretta-renderer-2742";
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("C19", Some("dlna"), Some(device))
+        .unwrap();
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    // L'opt-in n'est PAS posé : c'est la fiche système de Tades
+    // (`dsp_progressif_reseau: false`).
+    assert_ne!(
+        settings
+            .get("dsp_progressif_reseau")
+            .ok()
+            .flatten()
+            .as_deref(),
+        Some("true")
+    );
+
+    // 1. L'EFFET, mesuré sur les échantillons de la chaîne réelle.
+    const N: usize = 4410;
+    let mut pcm = Vec::with_capacity(N * 4);
+    for i in 0..N {
+        let t = i as f64 / 44100.0;
+        let l = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() * 0.5;
+        pcm.extend_from_slice(&((l * 32767.0) as i16).to_le_bytes());
+        pcm.extend_from_slice(&0i16.to_le_bytes());
+    }
+    let mut chaine = orch.load_streaming_dsp(zone_id, None, 44100, 2);
+    chaine.process(&mut pcm, 16);
+    let voie = |c: usize| -> f64 {
+        let e: f64 = pcm
+            .chunks_exact(4)
+            .map(|f| {
+                let v = i16::from_le_bytes([f[2 * c], f[2 * c + 1]]) as f64 / 32768.0;
+                v * v
+            })
+            .sum();
+        (e / N as f64).sqrt()
+    };
+    let (l, r) = (voie(0), voie(1));
+    let diaphonie_db = 20.0 * (r.max(1e-12) / l.max(1e-12)).log10();
+    println!("#2742 — zone DLNA, opt-in désarmé : diaphonie D/G = {diaphonie_db:.1} dB");
+    assert!(
+        diaphonie_db > -20.0,
+        "la chaîne streaming de la zone devait porter le crossfeed : \
+         diaphonie {diaphonie_db:.1} dB"
+    );
+
+    // 2. CE QUE L'ÉCRAN EN DIT, avec les faits de la MÊME zone.
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    let statut = crate::audio::crossfeed::crossfeed_status(
+        true,
+        crate::audio::crossfeed::crossfeed_runs_on_output(zone.output_device_id.as_deref()),
+        crate::orchestrator::is_network_output_type(zone.output_type.as_deref()),
+        orch.zone_audiophile(zone_id),
+        false,
+        false,
+    );
+    assert!(
+        !statut.unavailable && statut.effective,
+        "le statut publié VERROUILLE un crossfeed qui s'entend : diaphonie \
+         mesurée {diaphonie_db:.1} dB sur le flux, et pourtant {statut:?}"
     );
 }

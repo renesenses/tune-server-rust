@@ -19,11 +19,25 @@ BASE = 'af70d7e251735d8be2c5d7ddc9d6539f61e2ac34'
 # line of the pinned sources still has to match byte for byte, and each
 # substitution below is asserted to actually apply: a patch that silently misses
 # its target would turn this oracle into a gate that guards nothing.
+#
+# #4973 is the second one, for the crossfeed: the pinned source decoded integer
+# PCM at 2^(N-1) but re-encoded it at 2^(N-1) - 1, which cost one LSB on every
+# sample past half scale and turned -32768 into -32767, even on mono content
+# the algorithm otherwise returns untouched. The encode now uses the scale of
+# the decode and of the rest of the audio chain (convolver, equalizer, local
+# output): 2^(N-1), round to nearest, saturate into [-2^(N-1), 2^(N-1) - 1].
 INTENTIONAL_DIVERGENCE = {'eq': [
     ('if l1 > 1.0 { 20.0 * l1.log10() } else { 0.0 }',
      'if l1 > 1.0 { 20.0 * l1.log10() + 0.01 } else { 0.0 }'),
     ('-(somme_positive_db.max(l1_db) + resonance_db)',
      '-(l1_db + resonance_db)'),
+], 'crossfeed': [
+    ('(s * 32767.0).round() as i16',
+     '(f64::from(s) * 32_768.0).round().clamp(-32_768.0, 32_767.0) as i16'),
+    ('(s * 8_388_607.0).round() as i32',
+     '(f64::from(s) * 8_388_608.0).round().clamp(-8_388_608.0, 8_388_607.0) as i32'),
+    ('(s * 2_147_483_647.0).round() as i32',
+     '(f64::from(s) * 2_147_483_648.0).round().clamp(-2_147_483_648.0, 2_147_483_647.0) as i32'),
 ]}
 RUNNER = r'''
 use audio::eq::{EqProfile,EqBandSpec,EqProcessor};

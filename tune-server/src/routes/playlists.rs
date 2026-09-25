@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use tune_core::db::play_queue_repo::PlayQueueRepo;
-use tune_core::db::playlist_repo::PlaylistRepo;
+use tune_core::db::playlist_repo::{EntryContent, PlaylistRepo, ServiceEntry};
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
 
@@ -38,6 +38,9 @@ struct UpdatePlaylist {
 
 #[derive(Deserialize)]
 struct AddTracks {
+    /// `#[serde(default)]` : une demande qui ne porte que des titres de
+    /// service (#4889) n'a pas à envoyer une liste vide.
+    #[serde(default)]
     track_ids: Vec<i64>,
     position: Option<i64>,
     /// Pistes de service (Qobuz, Tidal…) que le client joint à la demande.
@@ -48,9 +51,9 @@ struct AddTracks {
     /// inconnu, `add_tracks` n'ajoutait donc rien et repondait quand meme
     /// `201 Created` (#1848).
     ///
-    /// Le contenu n'est pas typé : la route ne peut de toute façon pas le
-    /// stocker (voir `add_tracks`), elle n'a besoin que de savoir COMBIEN il y
-    /// en a pour pouvoir le dire.
+    /// Depuis #4889, ces titres sont ENREGISTRÉS dans la playlist. Le contenu
+    /// reste un `Value` : un titre incomplet ne doit pas faire rejeter toute
+    /// la demande par serde, il est écarté et compté (voir `add_tracks`).
     streaming_tracks: Option<Vec<Value>>,
 }
 
@@ -64,9 +67,20 @@ struct RemoveTracksBody {
     positions: Vec<i64>,
 }
 
+/// Deux formes (#4889) :
+///
+/// * `positions` — le nouvel ordre en RANGS actuels (les indices de
+///   `GET /playlists/{id}/tracks`) : c'est la seule qui sache déplacer un
+///   titre de service, qui n'a pas de `tracks.id`.
+/// * `track_ids` — l'ancienne forme, gardée pour les clients déployés. Sur
+///   une playlist qui porte des titres de service, ils gardent leur rang
+///   (voir `PlaylistRepo::reorder_tracks`).
 #[derive(Deserialize)]
 struct ReorderTracksBody {
-    track_ids: Vec<i64>,
+    #[serde(default)]
+    track_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    positions: Option<Vec<i64>>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -250,6 +264,36 @@ async fn delete_playlist(
     }
 }
 
+/// Les lignes d'une playlist, locales ET de service (#4889), dans l'ordre et
+/// au format que le client connaît : une piste de la bibliothèque sous la
+/// forme de `Track::to_json`, un titre de service sous celle d'une piste de
+/// streaming (`ServiceEntry::to_json` : `id` nul, `source`, `source_id`).
+///
+/// Une ligne locale dont la piste a disparu de `tracks` est omise, comme
+/// l'omettait `get_multiple` avant #4889. Une erreur de base est RENDUE : elle
+/// ne se déguise pas en playlist vide (#2797).
+pub(crate) fn lignes_de_la_playlist(
+    state: &AppState,
+    playlist_id: i64,
+) -> Result<Vec<Value>, String> {
+    let entries = PlaylistRepo::with_backend(state.backend.clone()).get_entries(playlist_id)?;
+    let locales: Vec<i64> = entries.iter().filter_map(|e| e.track_id()).collect();
+    let pistes: std::collections::HashMap<i64, tune_core::db::models::Track> =
+        TrackRepo::with_backend(state.backend.clone())
+            .get_multiple(&locales)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|t| t.id.map(|id| (id, t)))
+            .collect();
+    Ok(entries
+        .iter()
+        .filter_map(|e| match &e.content {
+            EntryContent::Local(tid) => pistes.get(tid).map(|t| t.to_json()),
+            EntryContent::Service(s) => Some(s.to_json()),
+        })
+        .collect())
+}
+
 /// Une erreur de base ne doit PAS se déguiser en playlist vide (#2797) : le
 /// client ne peut alors pas distinguer « la playlist est vide » de « la
 /// requête a échoué », et l'utilisateur voit une playlist se vider toute
@@ -261,13 +305,12 @@ async fn get_tracks(
 ) -> Result<Json<Value>, AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     owned_or_404(&repo, id, profile.id())?;
-    let track_ids = repo
-        .get_track_ids(id)
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .get_multiple(&track_ids)
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    Ok(Json(json!(tracks)))
+    let mut items = lignes_de_la_playlist(&state, id).map_err(AppError::internal)?;
+    // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
+    // Une ligne de service (`id` nul) n'est jamais bannie : le bannissement
+    // désigne un `tracks.id`.
+    crate::routes::library::attacher_banni(&state, profile.id(), &mut items);
+    Ok(Json(json!(items)))
 }
 
 async fn add_tracks(
@@ -276,65 +319,82 @@ async fn add_tracks(
     Path(id): Path<i64>,
     Json(body): Json<AddTracks>,
 ) -> impl IntoResponse {
-    // #1848 — Dominique Comet : « lorsqu'on sélectionne une piste nous n'avons
-    // pas les mêmes possibilités sur la bibliothèque et sur Qobuz ».
+    // #4889 — FabienM : « une playlist peut être locale et peut contenir des
+    // titres de services, oui ou non ? » Désormais oui.
     //
-    // Le client OFFRE « ajouter à une playlist » sur une piste de service
-    // (`StreamingView.svelte`, trois listes : album, playlist, recherche) et
-    // poste alors `streaming_tracks` avec `track_ids` vide. Ce champ n'étant
-    // pas déclaré, serde l'écartait : `add_tracks_deduped(id, &[], …)`
-    // n'ajoutait rien, la route répondait `201 Created` avec la playlist, et le
-    // modal lisait ce 201 comme un succès — il affichait « ajoutée » devant une
-    // playlist restée vide.
+    // Historique : le client OFFRAIT déjà « ajouter à une playlist » sur une
+    // piste de service et postait `streaming_tracks` avec `track_ids` vide.
+    // Le champ n'était pas déclaré (201 pour rien, #1848), puis il fut refusé
+    // en 422, parce que `playlist_tracks.track_id` ne savait nommer qu'un
+    // `tracks.id`. La migration SQLite 109 / PG 072 donne à une ligne de quoi
+    // porter un titre de service : il est maintenant ENREGISTRÉ.
     //
-    // Ce n'est PAS réparable en stockant la piste : `playlist_tracks.track_id`
-    // est `NOT NULL REFERENCES tracks(id)` dans les trois définitions de schéma
-    // (sqlite.rs, migrations/postgres, pg_migrate.rs). Une playlist locale ne
-    // PEUT pas porter une piste de service. Le refus est donc légitime — c'est
-    // de le déguiser en succès qui ne l'était pas. Même doctrine que #1959 sur
-    // `save_queue_as_playlist` : 422 avec la raison, et le compte des ignorées
-    // sur le cas mixte.
-    let distantes = body.streaming_tracks.as_ref().map_or(0, Vec::len);
+    // Un titre de service incomplet (sans `source`, `source_id` ou `title`,
+    // ou annoncé `local`) n'entre pas : la liste ne rappelle pas le service,
+    // une ligne sans titre le resterait pour toujours. Il est COMPTÉ dans
+    // `skipped_streaming`, et une demande qui ne porte que de tels titres est
+    // un 422 qui dit pourquoi — même doctrine que #1959 : un refus se dit, il
+    // ne se déguise pas en succès.
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
+        return r;
+    }
 
-    if distantes > 0 && body.track_ids.is_empty() {
+    let recus = body.streaming_tracks.as_deref().unwrap_or_default();
+    let titres: Vec<ServiceEntry> = recus.iter().filter_map(ServiceEntry::from_json).collect();
+    let incomplets = recus.len() - titres.len();
+
+    if body.track_ids.is_empty() && titres.is_empty() && incomplets > 0 {
         tracing::warn!(
             playlist_id = id,
-            distantes,
-            "playlist_add_tracks_refused_streaming_only"
+            incomplets,
+            "playlist_add_tracks_refused_incomplete_streaming"
         );
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             format!(
-                "Cette demande ne porte que des pistes de service ({distantes}), \
-                 qui ne peuvent pas entrer dans une playlist locale. \
-                 Ajoutez-les à une playlist du service, ou ajoutez d'abord ces \
-                 titres à votre bibliothèque."
+                "Cette demande ne porte que des titres de service incomplets \
+                 ({incomplets}) : il leur faut une source (autre que « local »), \
+                 un identifiant chez le service et un titre pour entrer dans \
+                 une playlist."
             ),
         )
             .into_response();
     }
 
-    let repo = PlaylistRepo::with_backend(state.backend.clone());
-    if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
-        return r;
-    }
-    match repo.add_tracks_deduped(id, &body.track_ids, body.position) {
-        Ok(_) => match repo.get(id) {
+    let lignes: Vec<EntryContent> = body
+        .track_ids
+        .iter()
+        .copied()
+        .map(EntryContent::Local)
+        .chain(titres.iter().cloned().map(EntryContent::Service))
+        .collect();
+    match repo.add_entries_deduped(id, &lignes, body.position) {
+        Ok(ecrites) => match repo.get(id) {
             Ok(Some(playlist)) => {
                 let mut corps = json!(playlist);
-                if distantes > 0 {
-                    // Une demande mixte perd ses pistes de service en chemin.
-                    // Le taire produirait le défaut d'à côté : une playlist
-                    // plus courte que la demande, sans que rien ne dise
-                    // pourquoi.
+                let de_service = ecrites
+                    .iter()
+                    .filter(|e| matches!(e, EntryContent::Service(_)))
+                    .count();
+                if de_service > 0 {
                     tracing::info!(
                         playlist_id = id,
-                        ajoutees = body.track_ids.len(),
-                        ignorees = distantes,
+                        titres_de_service = de_service,
+                        "playlist_add_tracks_service_entries"
+                    );
+                }
+                if incomplets > 0 {
+                    // Taire les écartés produirait le défaut d'à côté : une
+                    // playlist plus courte que la demande, sans que rien ne
+                    // dise pourquoi.
+                    tracing::info!(
+                        playlist_id = id,
+                        ignores = incomplets,
                         "playlist_add_tracks_skipped_streaming"
                     );
                     if let Some(obj) = corps.as_object_mut() {
-                        obj.insert("skipped_streaming".into(), json!(distantes));
+                        obj.insert("skipped_streaming".into(), json!(incomplets));
                     }
                 }
                 (StatusCode::CREATED, Json(corps)).into_response()
@@ -388,7 +448,29 @@ async fn reorder_tracks(
     if let Err(r) = owned_or_404_response(&repo, id, profile.id()) {
         return r;
     }
-    match repo.reorder_tracks(id, &body.track_ids) {
+    if let Some(rangs) = body.positions {
+        return match repo.reorder_by_ranks(id, &rangs) {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            // Une liste qui n'est pas une permutation exacte des rangs actuels
+            // (liste périmée côté client) n'écrit RIEN : réécrire quand même
+            // perdrait ou dupliquerait des lignes.
+            Ok(false) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "`positions` doit être une permutation exacte des rangs actuels \
+                 de la playlist (0..n-1) ; rien n'a été modifié.",
+            )
+                .into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        };
+    }
+    let Some(track_ids) = body.track_ids else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Corps attendu : `positions` (rangs) ou `track_ids`.",
+        )
+            .into_response();
+    };
+    match repo.reorder_tracks(id, &track_ids) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
@@ -413,8 +495,10 @@ async fn duplicate_playlist(
     // Reading the source track list used to be `unwrap_or_default()`: a
     // database error produced an EMPTY copy announced as a success — the same
     // shape as #2119. A copy whose source we cannot read is a failure.
-    let track_ids = match repo.get_track_ids(id) {
-        Ok(ids) => ids,
+    // #4889 — les lignes de service sont recopiées aussi : une copie qui les
+    // perdrait serait une copie plus courte que l'original, sans le dire.
+    let lignes: Vec<EntryContent> = match repo.get_entries(id) {
+        Ok(entries) => entries.into_iter().map(|e| e.content).collect(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
@@ -423,7 +507,7 @@ async fn duplicate_playlist(
     // either the copy exists complete, or nothing is left behind and the
     // caller is told so (#2798). The old code created the playlist, then threw
     // the track-insert error away with `.ok()` and answered 201 anyway.
-    match repo.create_with_tracks(&new_name, None, profile.id(), &track_ids) {
+    match repo.create_with_entries(&new_name, None, profile.id(), &lignes) {
         Ok((new_id, copied)) => (
             StatusCode::CREATED,
             Json(json!({
@@ -447,6 +531,54 @@ struct ExportQuery {
     format: Option<String>,
 }
 
+/// Une ligne de playlist telle que les exports la lisent — piste locale ou
+/// titre de service (#4889). `source` / `source_id` ne sont posés que pour un
+/// titre de service ; `file_path` que pour une piste locale.
+struct LigneExportee {
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    duration_ms: i64,
+    file_path: Option<String>,
+    service: Option<(String, String)>,
+}
+
+/// Les lignes d'une playlist pour les exports, dans l'ordre. Même règle que
+/// `lignes_de_la_playlist` : une piste locale disparue est omise, une erreur
+/// de base est rendue (#2797).
+fn lignes_a_exporter(state: &AppState, playlist_id: i64) -> Result<Vec<LigneExportee>, String> {
+    let entries = PlaylistRepo::with_backend(state.backend.clone()).get_entries(playlist_id)?;
+    let locales: Vec<i64> = entries.iter().filter_map(|e| e.track_id()).collect();
+    let pistes: std::collections::HashMap<i64, tune_core::db::models::Track> =
+        TrackRepo::with_backend(state.backend.clone())
+            .get_multiple(&locales)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter_map(|t| t.id.map(|id| (id, t)))
+            .collect();
+    Ok(entries
+        .into_iter()
+        .filter_map(|e| match e.content {
+            EntryContent::Local(tid) => pistes.get(&tid).map(|t| LigneExportee {
+                title: t.title.clone(),
+                artist: t.artist_name.clone(),
+                album: t.album_title.clone(),
+                duration_ms: t.duration_ms,
+                file_path: t.file_path.clone(),
+                service: None,
+            }),
+            EntryContent::Service(s) => Some(LigneExportee {
+                title: s.title,
+                artist: s.artist,
+                album: s.album,
+                duration_ms: s.duration_ms.unwrap_or(0),
+                file_path: None,
+                service: Some((s.source, s.source_id)),
+            }),
+        })
+        .collect())
+}
+
 async fn export_m3u(
     State(state): State<AppState>,
     profile: ActiveProfile,
@@ -462,17 +594,23 @@ async fn export_m3u(
 
     // Exporter un M3U vide sur erreur de base produit un fichier qui a l'air
     // valide et détruit la playlist chez qui le réimporte (#2797).
-    let track_ids = repo
-        .get_track_ids(id)
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .get_multiple(&track_ids)
-        .map_err(|e| AppError::internal(e.to_string()))?;
+    let lignes = lignes_a_exporter(&state, id).map_err(AppError::internal)?;
 
     let mut m3u = String::from("#EXTM3U\n");
-    for t in &tracks {
+    for t in &lignes {
+        // #4889 — un titre de service n'a pas de chemin : une ligne M3U
+        // désigne un fichier. Il est NOMMÉ en commentaire plutôt que tu —
+        // tout lecteur M3U ignore les lignes `#`, et l'import de Tune aussi.
+        if let Some((source, source_id)) = &t.service {
+            m3u.push_str(&format!(
+                "# titre de service, sans fichier : {source}:{source_id} — {} - {}\n",
+                t.artist.as_deref().unwrap_or("Unknown"),
+                t.title
+            ));
+            continue;
+        }
         let duration_secs = t.duration_ms / 1000;
-        let artist = t.artist_name.as_deref().unwrap_or("Unknown");
+        let artist = t.artist.as_deref().unwrap_or("Unknown");
         m3u.push_str(&format!(
             "#EXTINF:{},{} - {}\n",
             duration_secs, artist, t.title
@@ -506,22 +644,23 @@ async fn export_multi_format(
 ) -> Result<(axum::http::StatusCode, axum::http::HeaderMap, String), AppError> {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
     let playlist = owned_or_404(&repo, id, profile.id())?;
-    let track_ids = repo
-        .get_track_ids(id)
-        .map_err(|e| AppError::internal(e.to_string()))?;
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .get_multiple(&track_ids)
-        .map_err(|e| AppError::internal(e.to_string()))?;
+    let tracks = lignes_a_exporter(&state, id).map_err(AppError::internal)?;
 
     let (content, content_type, ext) = match format {
         "json" => {
             let items: Vec<serde_json::Value> = tracks
                 .iter()
                 .map(|t| {
-                    serde_json::json!({
-                        "title": t.title, "artist": t.artist_name, "album": t.album_title,
+                    let mut v = serde_json::json!({
+                        "title": t.title, "artist": t.artist, "album": t.album,
                         "duration_ms": t.duration_ms, "file_path": t.file_path,
-                    })
+                    });
+                    // #4889 — un titre de service se ré-identifie par sa paire.
+                    if let (Some((source, source_id)), Some(o)) = (&t.service, v.as_object_mut()) {
+                        o.insert("source".into(), json!(source));
+                        o.insert("source_id".into(), json!(source_id));
+                    }
+                    v
                 })
                 .collect();
             (
@@ -534,15 +673,26 @@ async fn export_multi_format(
             )
         }
         "csv" => {
-            let mut csv = String::from("title,artist,album,duration_ms,file_path\n");
+            // #4889 — deux colonnes en FIN de ligne, vides pour une piste
+            // locale : un lecteur qui lit les cinq premières par position
+            // n'est pas dérangé.
+            let mut csv =
+                String::from("title,artist,album,duration_ms,file_path,source,source_id\n");
             for t in &tracks {
+                let (source, source_id) = t
+                    .service
+                    .as_ref()
+                    .map(|(s, i)| (s.as_str(), i.as_str()))
+                    .unwrap_or(("", ""));
                 csv.push_str(&format!(
-                    "\"{}\",\"{}\",\"{}\",{},\"{}\"\n",
+                    "\"{}\",\"{}\",\"{}\",{},\"{}\",\"{}\",\"{}\"\n",
                     t.title.replace('"', "\"\""),
-                    t.artist_name.as_deref().unwrap_or("").replace('"', "\"\""),
-                    t.album_title.as_deref().unwrap_or("").replace('"', "\"\""),
+                    t.artist.as_deref().unwrap_or("").replace('"', "\"\""),
+                    t.album.as_deref().unwrap_or("").replace('"', "\"\""),
                     t.duration_ms,
                     t.file_path.as_deref().unwrap_or("").replace('"', "\"\""),
+                    source.replace('"', "\"\""),
+                    source_id.replace('"', "\"\""),
                 ));
             }
             (csv, "text/csv", "csv")
@@ -561,13 +711,13 @@ async fn export_multi_format(
                     "      <title>{}</title>\n",
                     quick_xml::escape::escape(&t.title)
                 ));
-                if let Some(ref a) = t.artist_name {
+                if let Some(ref a) = t.artist {
                     xspf.push_str(&format!(
                         "      <creator>{}</creator>\n",
                         quick_xml::escape::escape(a)
                     ));
                 }
-                if let Some(ref a) = t.album_title {
+                if let Some(ref a) = t.album {
                     xspf.push_str(&format!(
                         "      <album>{}</album>\n",
                         quick_xml::escape::escape(a)
@@ -578,6 +728,16 @@ async fn export_multi_format(
                     xspf.push_str(&format!(
                         "      <location>{}</location>\n",
                         quick_xml::escape::escape(p)
+                    ));
+                }
+                // #4889 — XSPF réserve `<identifier>` aux URI qui désignent
+                // la ressource sans la localiser : exactement un titre de
+                // service.
+                if let Some((source, source_id)) = &t.service {
+                    xspf.push_str(&format!(
+                        "      <identifier>tune:{}:{}</identifier>\n",
+                        quick_xml::escape::escape(source),
+                        quick_xml::escape::escape(source_id)
                     ));
                 }
                 xspf.push_str("    </track>\n");
@@ -1352,14 +1512,11 @@ async fn get_shared_playlist(
     };
 
     // Une erreur de base rendait un partage « vide » indistinguable d'une
-    // playlist réellement vide (#2797) : 500 explicite.
-    let track_ids = match repo.get_track_ids(playlist_id) {
-        Ok(ids) => ids,
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
-    };
-    let tracks = match TrackRepo::with_backend(state.backend.clone()).get_multiple(&track_ids) {
+    // playlist réellement vide (#2797) : 500 explicite. #4889 : les titres de
+    // service sont partagés aussi, au même format que dans la playlist.
+    let tracks = match lignes_de_la_playlist(&state, playlist_id) {
         Ok(t) => t,
-        Err(e) => return AppError::internal(e.to_string()).into_response(),
+        Err(e) => return AppError::internal(e).into_response(),
     };
 
     Json(json!({
@@ -1459,13 +1616,24 @@ async fn transfer_playlist(
     if let Err(r) = owned_or_404_response(&repo, body.playlist_id, profile.id()) {
         return r;
     }
-    let track_ids = match repo.get_track_ids(body.playlist_id) {
-        Ok(ids) => ids,
+    let entries = match repo.get_entries(body.playlist_id) {
+        Ok(e) => e,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
     let zone_id = body.zone_id.unwrap_or(1);
     let queue = PlayQueueRepo::with_backend(state.backend.clone());
+    if entries.iter().any(|e| e.service().is_some()) {
+        // #4889 — une playlist mixte passe par la file UNIFIÉE : chaque titre
+        // de service y entre comme une ligne de streaming, résolue à la
+        // lecture comme n'importe quelle piste de service.
+        let items = crate::routes::playback::entrees_de_file(&entries);
+        if let Err(e) = queue.append(zone_id, &items) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+        return Json(json!({ "transferred": items.len() })).into_response();
+    }
+    let track_ids: Vec<i64> = entries.iter().filter_map(|e| e.track_id()).collect();
     if let Err(e) = queue.add_tracks(zone_id, &track_ids, None) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
@@ -1525,12 +1693,20 @@ async fn diff_playlist_tracks(
         {
             return Vec::new();
         }
+        // #4889 — un titre de service de la playlist compte aussi : il a son
+        // titre et son artiste en ligne, comme une piste locale.
         prepo
-            .get_track_ids(pid)
+            .get_entries(pid)
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|id| trepo.get(id).ok().flatten())
-            .map(|t| (t.title, t.artist_name.unwrap_or_default()))
+            .filter_map(|e| match e.content {
+                EntryContent::Local(id) => trepo
+                    .get(id)
+                    .ok()
+                    .flatten()
+                    .map(|t| (t.title, t.artist_name.unwrap_or_default())),
+                EntryContent::Service(s) => Some((s.title, s.artist.unwrap_or_default())),
+            })
             .collect()
     } else {
         let reg = state.services.lock().await;
@@ -1745,9 +1921,10 @@ async fn apply_recovery(
             rejected.push(refus(
                 r,
                 format!(
-                    "« {source} » : une playlist locale ne référence que des pistes de \
-                     la bibliothèque, elle ne peut pas porter une piste de service \
-                     (#1848). Ajoutez d'abord ce titre à votre bibliothèque."
+                    "« {source} » : la récupération ne remplace une piste manquante \
+                     que par une autre piste de la bibliothèque. Pour garder ce \
+                     titre de service, ajoutez-le à la playlist depuis le service \
+                     (#4889)."
                 ),
             ));
             continue;

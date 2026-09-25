@@ -203,10 +203,17 @@ async fn les_identifiants_morts_sont_comptes_dans_un_champ_lisible() {
         .find(|c| c["id"].as_i64() == Some(cid))
         .unwrap()
         .clone();
+    // #901 — `orphan_album_ids` porte désormais la LISTE ; le compte a son
+    // propre nom. La garde de #3285 vaut sur le compte, et sur lui seul.
     assert_eq!(
-        dossier["orphan_album_ids"].as_i64(),
+        dossier["orphan_album_count"].as_i64(),
         Some(2),
         "les deux albums disparus doivent être comptés: {dossier}"
+    );
+    assert_eq!(
+        dossier["orphan_album_ids"].as_array().map(|l| l.len()),
+        Some(2),
+        "et ils doivent être NOMMÉS, pas seulement comptés (#901): {dossier}"
     );
     assert_eq!(dossier["album_count"].as_i64(), Some(3));
 
@@ -236,8 +243,12 @@ async fn une_lecture_ne_purge_pas_la_liste_stockee() {
     let _ = get(&app, &format!("/api/v1/library/collections/{cid}/albums")).await;
     let _ = get(&app, &format!("/api/v1/library/collections/{cid}")).await;
 
+    // ⚠️ #901 a introduit UNE écriture sur l'ouverture d'un dossier : le nom
+    // des albums encore vivants, relevé pour pouvoir nommer les manquants plus
+    // tard. Elle n'ajoute qu'un champ `album_labels` et ne touche JAMAIS à
+    // l'appartenance — c'est exactement ce que cette garde vérifie.
     let apres = ids_stockes(&state, cid);
-    assert_eq!(apres.len(), 5, "aucune écriture sur un GET: {apres:?}");
+    assert_eq!(apres.len(), 5, "aucune purge sur un GET: {apres:?}");
     for mort in condamnes {
         assert!(
             apres.contains(&mort),
@@ -275,7 +286,11 @@ async fn un_dossier_sain_ne_declare_aucun_orphelin() {
         .find(|c| c["id"].as_i64() == Some(cid))
         .unwrap()
         .clone();
-    assert_eq!(dossier["orphan_album_ids"].as_i64(), Some(0));
+    assert_eq!(dossier["orphan_album_count"].as_i64(), Some(0));
+    assert_eq!(
+        dossier["orphan_album_ids"].as_array().map(|l| l.len()),
+        Some(0)
+    );
     assert_eq!(dossier["album_ids"].as_array().unwrap().len(), 2);
 
     let (_, rendus) = get(&app, &format!("/api/v1/library/collections/{cid}/albums")).await;

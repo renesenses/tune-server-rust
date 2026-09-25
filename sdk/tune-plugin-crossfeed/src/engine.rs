@@ -185,19 +185,13 @@ impl CrossfeedProcessor {
             let s = sample.clamp(-1.0, 1.0);
             match bit_depth {
                 16 => {
-                    let v = (s * 32767.0).round() as i16;
-                    pcm[o..o + 2].copy_from_slice(&v.to_le_bytes());
+                    pcm[o..o + 2].copy_from_slice(&quantifier_i16(s).to_le_bytes());
                 }
                 24 => {
-                    let v = (s * 8_388_607.0).round() as i32;
-                    let b = v.to_le_bytes();
-                    pcm[o] = b[0];
-                    pcm[o + 1] = b[1];
-                    pcm[o + 2] = b[2];
+                    pcm[o..o + 3].copy_from_slice(&quantifier_i24(s));
                 }
                 32 => {
-                    let v = (s * 2_147_483_647.0).round() as i32;
-                    pcm[o..o + 4].copy_from_slice(&v.to_le_bytes());
+                    pcm[o..o + 4].copy_from_slice(&quantifier_i32(s).to_le_bytes());
                 }
                 _ => {}
             }
@@ -264,6 +258,63 @@ impl CrossfeedProcessor {
     pub fn delay_samples(&self) -> usize {
         self.delay_samples
     }
+}
+
+// ---------------------------------------------------------------------------
+// #4973 — retour à l'entier, à la MÊME échelle que le décodage
+// ---------------------------------------------------------------------------
+//
+// Le décodage divise par 2^(N−1) (32 768, 2^23 via `<< 8` puis 2^31, 2^31) ;
+// l'encodage multipliait par 2^(N−1) − 1. Le module entier s'en trouvait
+// atténué de (2^(N−1) − 1)/2^(N−1) : −32 768 revenait −32 767, et tout
+// échantillon au-delà de la demi-échelle perdait 1 LSB — y compris sur une
+// source MONO, dont le Mid est pourtant rendu intact par l'algorithme.
+//
+// C'est la convention de toute la chaîne principale qui est reprise ici,
+// telle quelle : échelle 2^(N−1) dans les deux sens, arrondi au plus proche,
+// saturation au rail EN DERNIER dans [−2^(N−1), 2^(N−1) − 1], par la porte
+// partagée `quantifier_avec` avec un bruit nul — celle du convolveur et de
+// l'égaliseur, et l'échelle de `f32_to_native_i32` de la sortie locale. La
+// saturation borne le +1,0 exact, qui vaut 2^(N−1) et n'a pas de mot.
+//
+// Les trois fonctions servent le chemin `process_pcm` (bras progressif,
+// ré-encodage réseau) ET l'instance du greffon (`sdk.rs`) : un seul arrondi
+// pour les deux portes.
+
+/// Un échantillon normalisé ramené en mot 16 bits signé.
+pub(crate) fn quantifier_i16(s: f32) -> i16 {
+    tune_plugin_audio_support::dither::quantifier_avec(
+        f64::from(s) * 32_768.0,
+        0.0,
+        -32_768.0,
+        32_767.0,
+    ) as i16
+}
+
+/// Un échantillon normalisé ramené en mot 24 bits signé, petit-boutien.
+pub(crate) fn quantifier_i24(s: f32) -> [u8; 3] {
+    let v = tune_plugin_audio_support::dither::quantifier_avec(
+        f64::from(s) * 8_388_608.0,
+        0.0,
+        -8_388_608.0,
+        8_388_607.0,
+    ) as i32;
+    let b = v.to_le_bytes();
+    [b[0], b[1], b[2]]
+}
+
+/// Un échantillon normalisé ramené en mot 32 bits signé.
+///
+/// Le traitement se fait en `f32` : un mot 32 bits n'y survit exactement que
+/// s'il tient dans sa mantisse (24 bits significatifs) — c'est le cas des
+/// rails, et de tout 24 bits aligné à gauche. L'échelle, elle, est exacte.
+pub(crate) fn quantifier_i32(s: f32) -> i32 {
+    tune_plugin_audio_support::dither::quantifier_avec(
+        f64::from(s) * 2_147_483_648.0,
+        0.0,
+        f64::from(i32::MIN),
+        f64::from(i32::MAX),
+    ) as i32
 }
 
 /// Le retard RÉEL du terme croisé, en échantillons : `delay_ms` borné à
@@ -642,6 +693,122 @@ mod tests {
                 g > gain_moyen_db(44_100, amount, 0.0),
                 "le retard doit rendre du niveau par rapport au même dosage instantané"
             );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // #4973 — l'échelle de retour à l'entier est celle du décodage
+    // -------------------------------------------------------------------
+
+    /// Chaque mot 16 bits, décodé puis requantifié, redonne LE MÊME mot —
+    /// les deux rails compris. Avant : −32 768 → −32 767, et tout mot au-delà
+    /// de la demi-échelle perdait 1 LSB.
+    #[test]
+    fn chaque_mot_16_bits_fait_l_aller_retour_4973() {
+        for mot in i16::MIN..=i16::MAX {
+            let s = f32::from(mot) / 32_768.0;
+            assert_eq!(quantifier_i16(s), mot, "mot {mot}");
+        }
+    }
+
+    /// Même chose sur les 2^24 mots 24 bits, par le décodage de `process_pcm`
+    /// (octets placés en haut d'un `i32`, divisés par 2^31).
+    #[test]
+    fn chaque_mot_24_bits_fait_l_aller_retour_4973() {
+        for mot in -8_388_608_i32..=8_388_607 {
+            let b = mot.to_le_bytes();
+            let s = i32::from_le_bytes([0, b[0], b[1], b[2]]) as f32 / 2_147_483_648.0;
+            assert_eq!(quantifier_i24(s), [b[0], b[1], b[2]], "mot {mot}");
+        }
+    }
+
+    /// 32 bits : le traitement est en `f32`, donc exact pour ce que sa
+    /// mantisse porte — les rails, un 24 bits aligné à gauche, les petites
+    /// valeurs. `i32::MAX` s'arrondit à 2^31 en `f32` (soit +1,0) et doit
+    /// revenir `i32::MAX` par la saturation, pas déborder.
+    #[test]
+    fn les_mots_32_bits_representables_font_l_aller_retour_4973() {
+        for mot in [
+            i32::MIN,
+            i32::MIN + 256,
+            -(1 << 30),
+            -256,
+            -1,
+            0,
+            1,
+            256,
+            1 << 30,
+            i32::MAX - 255,
+            i32::MAX,
+        ] {
+            let s = mot as f32 / 2_147_483_648.0;
+            assert_eq!(quantifier_i32(s), mot, "mot {mot}");
+        }
+    }
+
+    /// Le +1,0 exact n'a pas de mot : il sature au rail positif, sans
+    /// déborder ni changer de signe. Et au-delà, jamais de repli.
+    #[test]
+    fn le_plus_un_sature_au_rail_4973() {
+        assert_eq!(quantifier_i16(1.0), i16::MAX);
+        assert_eq!(quantifier_i16(-1.0), i16::MIN);
+        assert_eq!(quantifier_i16(1.5), i16::MAX);
+        assert_eq!(quantifier_i24(1.0), [0xff, 0xff, 0x7f]);
+        assert_eq!(quantifier_i24(-1.0), [0x00, 0x00, 0x80]);
+        assert_eq!(quantifier_i32(1.0), i32::MAX);
+        assert_eq!(quantifier_i32(-1.0), i32::MIN);
+    }
+
+    /// Le PCM stéréo d'un mot par canal, L = R.
+    fn pcm_mono(mots: &[i32], bps: usize) -> Vec<u8> {
+        mots.iter()
+            .flat_map(|m| {
+                let b = m.to_le_bytes();
+                let mot = if bps == 3 {
+                    b[..3].to_vec()
+                } else {
+                    b[..bps].to_vec()
+                };
+                [mot.clone(), mot].concat()
+            })
+            .collect()
+    }
+
+    /// Le contrat du module — « Mid préservé au bit près, une source mono
+    /// rendue intacte » — tenu sur du PCM ENTIER, crossfeed actif, rails
+    /// compris, par la porte du bras progressif et du ré-encodage réseau.
+    #[test]
+    fn une_source_mono_traverse_process_pcm_au_bit_pres_4973() {
+        let seize = [
+            -32_768, -32_767, -16_385, -1, 0, 1, 16_384, 16_385, 32_766, 32_767,
+        ];
+        let vingt_quatre = [
+            -8_388_608, -8_388_607, -4_194_305, -1, 0, 1, 4_194_304, 8_388_606, 8_388_607,
+        ];
+        let trente_deux = [i32::MIN, -1 << 30, -1, 0, 1, 1 << 30, i32::MAX];
+        for (bits, mots) in [
+            (16_u16, &seize[..]),
+            (24, &vingt_quatre[..]),
+            (32, &trente_deux[..]),
+        ] {
+            for (amount, delay_ms) in [(0.3_f32, 0.3_f32), (0.5, 0.0), (0.25, 1.0)] {
+                let entree = pcm_mono(mots, usize::from(bits / 8));
+                let mut sortie = entree.clone();
+                CrossfeedProcessor::new(44_100, amount, delay_ms).process_pcm(&mut sortie, bits, 2);
+                assert_eq!(sortie, entree, "{bits} bits, a={amount}, d={delay_ms} ms");
+            }
+        }
+    }
+
+    /// Crossfeed à 0 : bit-perfect, quelle que soit la profondeur — le module
+    /// ne touche pas un octet, pas même par l'aller-retour.
+    #[test]
+    fn a_zero_process_pcm_ne_touche_aucun_octet_4973() {
+        let entree: Vec<u8> = (0..=255_u8).cycle().take(4 * 3 * 64).collect();
+        for bits in [16_u16, 24, 32] {
+            let mut sortie = entree.clone();
+            CrossfeedProcessor::new(48_000, 0.0, 0.3).process_pcm(&mut sortie, bits, 2);
+            assert_eq!(sortie, entree, "{bits} bits");
         }
     }
 }

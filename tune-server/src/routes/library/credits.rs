@@ -59,49 +59,11 @@ fn ecrire_credits(
     track_id: i64,
     lignes: &[LigneCredit],
 ) -> usize {
-    use tune_core::db::backend::ToSqlValue;
-    let id_str = track_id.to_string();
-    backend
-        .execute(
-            "DELETE FROM track_credits WHERE track_id = ?",
-            &[&id_str as &dyn ToSqlValue],
-        )
-        .ok();
-    // CRD-4 : la fiche artiste existante est LIÉE (jamais créée ici — un
-    // musicien de session n'est pas un artiste de la bibliothèque tant
-    // qu'aucun album ne le porte). Sans ce lien, `/artists/{id}/credits`
-    // retombait sur une comparaison de noms, et l'onglet Instrument à venir
-    // (CRD-6) n'aurait aucune clé. Lié en CHAÎNE, comme `track_id`, pour le
-    // miroir PostgreSQL où la colonne est du `TEXT`.
-    let artistes = tune_core::db::artist_repo::ArtistRepo::with_backend(backend.clone());
-    let mut ecrites = 0usize;
-    for (pos, ligne) in lignes.iter().enumerate() {
-        let pos = pos as i32;
-        let artist_id: Option<String> = artistes
-            .get_by_name(&ligne.artist_name)
-            .ok()
-            .flatten()
-            .and_then(|a| a.id)
-            .map(|id| id.to_string());
-        let ok = backend
-            .execute(
-                "INSERT INTO track_credits (track_id, artist_id, artist_name, role, instrument, position) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-                &[
-                    &id_str as &dyn ToSqlValue,
-                    &artist_id as &dyn ToSqlValue,
-                    &ligne.artist_name as &dyn ToSqlValue,
-                    &ligne.role as &dyn ToSqlValue,
-                    &ligne.instrument as &dyn ToSqlValue,
-                    &pos as &dyn ToSqlValue,
-                ],
-            )
-            .is_ok();
-        if ok {
-            ecrites += 1;
-        }
-    }
-    ecrites
+    // #4767 — l'écriture vit désormais dans tune-core, pour que la passe des
+    // crédits PAR DISQUE (`POST /system/enrich-credits`) écrive exactement
+    // comme ces routes : même purge, mêmes positions, même liaison de fiche
+    // (par MBID d'abord, puis par nom), jamais de fiche créée.
+    tune_core::metadata::credits_release::ecrire_credits_piste(backend, track_id, lignes)
 }
 
 pub(super) async fn track_credits(
@@ -109,16 +71,16 @@ pub(super) async fn track_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
-    // On Postgres the mirror schema stores integer-semantic columns as TEXT, so
-    // binding an i64 here made the comparison `text = bigint`, which Postgres
-    // rejects ("operator does not exist: text = bigint") → 500. Bind the id as a
-    // string: `text = text` on PG, and SQLite numeric affinity handles it too.
-    let id_str = id.to_string();
+    // #4984 — `track_credits.track_id` est un entier sur PostgreSQL : BIGINT dès
+    // `001_initial_schema.sql`, et `012_integer_id_columns.sql` a converti les
+    // bases migrées depuis SQLite. Lier l'id en TEXTE faisait `bigint = text`,
+    // que PostgreSQL refuse (« operator does not exist ») → 500 sur toute base
+    // PG. On lie l'entier, comme partout ailleurs.
     let rows = state
         .backend
         .query_many(
             "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
-            &[&id_str as &dyn ToSqlValue],
+            &[&id as &dyn ToSqlValue],
         )
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
@@ -143,17 +105,24 @@ pub(super) async fn artist_credits(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     use tune_core::db::backend::ToSqlValue;
-    // Bind as string — see track_credits above (Postgres TEXT columns vs bigint).
+    // #4984 — `artists.id` est BIGINT sur PostgreSQL : l'entier s'y lie tel
+    // quel. `track_credits.artist_id` peut, lui, être resté TEXT sur une base
+    // migrée depuis SQLite (conversion gardée de la migration 012) : on le
+    // compare en texte sur PostgreSQL, comme `credits_release::artiste`.
     let id_str = id.to_string();
+    let cle_fiche = match state.backend.engine() {
+        tune_core::db::engine::Engine::Postgres => "CAST(tc.artist_id AS TEXT) = ?",
+        tune_core::db::engine::Engine::Sqlite => "tc.artist_id = ?",
+    };
+    let sql = format!(
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
+         FROM track_credits tc \
+         WHERE {cle_fiche} OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
+         ORDER BY tc.track_id, tc.position"
+    );
     let rows = state
         .backend
-        .query_many(
-            "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position \
-             FROM track_credits tc \
-             WHERE tc.artist_id = ? OR tc.artist_name = (SELECT name FROM artists WHERE id = ?) \
-             ORDER BY tc.track_id, tc.position",
-            &[&id_str as &dyn ToSqlValue, &id_str as &dyn ToSqlValue],
-        )
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue, &id as &dyn ToSqlValue])
         .map_err(|e| AppError::internal(e))?;
     let items: Vec<Value> = rows
         .into_iter()
@@ -166,6 +135,66 @@ pub(super) async fn artist_credits(
                 "role": r.get(4).and_then(|v| v.as_string()),
                 "instrument": r.get(5).and_then(|v| v.as_string()),
                 "position": r.get(6).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect();
+    Ok(Json(json!(items)))
+}
+
+/// Crédits d'un ALBUM (#1572, fil forum 1921, FabienM) : les lignes de
+/// `track_credits` de toutes ses pistes, avec la piste concernée.
+///
+/// La réponse est la liste PLATE de `GET /library/tracks/{id}/credits`, plus
+/// `track_title`, `track_number` et `disc_number` : le client regroupe par
+/// rôle puis par artiste et cite, pour chaque nom, les pistes où il figure.
+/// Un seul aller-retour au lieu d'un appel par piste.
+///
+/// Ordre : disque, numéro de piste, puis `position` du crédit.
+///
+/// PostgreSQL : sur une base migrée depuis SQLite, `track_credits.track_id` et
+/// `tracks.album_id` peuvent être du TEXT, du BIGINT ailleurs — même remède
+/// que la lecture de la page artiste (`credits_release`) : la comparaison en
+/// texte vaut pour les deux. Sur SQLite, les colonnes gardent leur index.
+pub(super) async fn album_credits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    use tune_core::db::backend::ToSqlValue;
+    use tune_core::db::engine::Engine;
+    let (jointure, cle_album) = match state.backend.engine() {
+        Engine::Postgres => (
+            "CAST(tc.track_id AS TEXT) = CAST(t.id AS TEXT)",
+            "CAST(t.album_id AS TEXT) = ?",
+        ),
+        Engine::Sqlite => ("tc.track_id = t.id", "t.album_id = ?"),
+    };
+    let sql = format!(
+        "SELECT tc.id, tc.track_id, tc.artist_id, tc.artist_name, tc.role, tc.instrument, tc.position, \
+                t.title, t.track_number, t.disc_number \
+         FROM track_credits tc \
+         JOIN tracks t ON {jointure} \
+         WHERE {cle_album} \
+         ORDER BY t.disc_number, t.track_number, t.id, tc.position"
+    );
+    let id_str = id.to_string();
+    let rows = state
+        .backend
+        .query_many(&sql, &[&id_str as &dyn ToSqlValue])
+        .map_err(|e| AppError::internal(e))?;
+    let items: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.get(0).and_then(|v| v.as_i64()),
+                "track_id": r.get(1).and_then(|v| v.as_i64()),
+                "artist_id": r.get(2).and_then(|v| v.as_i64()),
+                "artist_name": r.get(3).and_then(|v| v.as_string()),
+                "role": r.get(4).and_then(|v| v.as_string()),
+                "instrument": r.get(5).and_then(|v| v.as_string()),
+                "position": r.get(6).and_then(|v| v.as_i64()),
+                "track_title": r.get(7).and_then(|v| v.as_string()),
+                "track_number": r.get(8).and_then(|v| v.as_i64()),
+                "disc_number": r.get(9).and_then(|v| v.as_i64()),
             })
         })
         .collect();
@@ -232,6 +261,8 @@ pub(super) async fn enrich_track_credits(
         "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
     );
 
+    // Créneau du limiteur MusicBrainz PARTAGÉ (#4767) — pas de cadence locale.
+    tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
     let resp =
         match state.http_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
@@ -288,6 +319,7 @@ pub(super) async fn enrich_album_credits(
             "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
         );
 
+        tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
         let resp = match state.http_client.get(&url).send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                 Ok(data) => data,
@@ -305,9 +337,6 @@ pub(super) async fn enrich_album_credits(
         ecrire_credits(&state.backend, track_id, &lignes_credits(&resp));
 
         enriched += 1;
-
-        // MusicBrainz rate limit: 1 request/sec
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     }
 
     Json(json!({
@@ -455,6 +484,7 @@ pub(super) async fn enrich_all_credits(
                 "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
             );
 
+            tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
             match state.http_client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                     Ok(data) => {
@@ -498,9 +528,6 @@ pub(super) async fn enrich_all_credits(
                     "Crédits",
                 );
             }
-
-            // MusicBrainz rate limit: 1 request/sec
-            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         }
 
         reglages
@@ -568,9 +595,11 @@ pub(crate) const CADENCE_CREDITS_AUTO: std::time::Duration =
     std::time::Duration::from_secs(6 * 3600);
 /// Attente avant le premier tour : le démarrage a mieux à faire.
 const PREMIER_TOUR_APRES: std::time::Duration = std::time::Duration::from_secs(90);
-/// Pause entre deux appels MusicBrainz (politique du service : une requête
-/// par seconde).
-const PAUSE_MUSICBRAINZ: std::time::Duration = std::time::Duration::from_millis(1100);
+// La cadence MusicBrainz (une requête par seconde) n'est plus tenue ici par
+// un `sleep` : chaque appel attend son créneau dans le limiteur PARTAGÉ du
+// dépôt (`musicbrainz_release::rate_limit_delay`, #4767), que la passe des
+// crédits par disque, les types de sortie et les pochettes empruntent aussi.
+
 /// Quand la passe manuelle tourne, on repasse plus tard sans compter un tour.
 const REESSAI_SI_PASSE_MANUELLE: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -688,7 +717,12 @@ async fn passe_automatique_credits(state: AppState) {
             .background_tasks
             .snapshot()
             .iter()
-            .any(|t| t.id == TACHE_CREDITS)
+            // La passe PAR DISQUE (#4767) écrit la même table : on s'efface
+            // aussi devant elle.
+            .any(|t| {
+                t.id == TACHE_CREDITS
+                    || t.id == tune_core::metadata::credits_release::TACHE_CREDITS_RELEASES
+            })
         {
             tokio::time::sleep(REESSAI_SI_PASSE_MANUELLE).await;
             continue;
@@ -766,7 +800,6 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                     Some(c.duree_ms),
                 )
                 .await;
-                tokio::time::sleep(PAUSE_MUSICBRAINZ).await;
                 if let Some(t) = &trouve {
                     retenir_le_mbid(state, c.id, &t.mbid);
                 }
@@ -778,6 +811,7 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                 let url = format!(
                     "https://musicbrainz.org/ws/2/recording/{mbid}?inc=artist-credits+artist-rels&fmt=json"
                 );
+                tune_core::metadata::musicbrainz_release::rate_limit_delay().await;
                 match state.http_client.get(&url).send().await {
                     Ok(r) if r.status().is_success() => match r.json::<Value>().await {
                         Ok(data) => {
@@ -793,7 +827,6 @@ async fn un_tour_de_credits(state: &AppState) -> BilanTour {
                     },
                     _ => bilan.erreurs += 1,
                 }
-                tokio::time::sleep(PAUSE_MUSICBRAINZ).await;
             }
             None => bilan.sans_credit += 1,
         }
@@ -1013,11 +1046,13 @@ mod tests {
                 artist_name: "anouar brahem".into(),
                 role: "performer".into(),
                 instrument: Some("oud".into()),
+                artist_mbid: None,
             },
             LigneCredit {
                 artist_name: "Musicien De Session".into(),
                 role: "performer".into(),
                 instrument: Some("piano".into()),
+                artist_mbid: None,
             },
         ];
         assert_eq!(ecrire_credits(b, piste, &lignes), 2);

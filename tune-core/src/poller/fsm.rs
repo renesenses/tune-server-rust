@@ -126,6 +126,12 @@ pub enum StoppedOutcome {
     /// sec n'est pas un renderer à sec ; voir
     /// [`famine_etablie_malgre_l_avance`].
     FailureWaitingAvance,
+    /// Seuil d'échec atteint, compteur MESURÉ et à sec — mais le fichier a
+    /// été servi EN ENTIER et l'horloge de la piste n'a pas encore atteint sa
+    /// fin : il reste de la musique à jouer, à la seconde près (#4661). La
+    /// borne plate de #4480 coupait ici 59 s trop tôt ; voir
+    /// [`horloge_de_piste_couvre_l_arret`].
+    FailureWaitingHorloge,
     /// Failure threshold reached, stream idle — stop the zone.
     FailureStop,
     /// Below threshold, or above threshold without a natural end — accumulate.
@@ -190,6 +196,14 @@ pub struct StoppedInput {
     /// défaut, comme `consommation` part à `Inconnue`. Ne pèse que sur
     /// [`ConsommationFlux::ASec`] : c'est la seule issue qui coupe.
     pub avance_audio_couvre_l_arret: bool,
+    /// #4661 — le fichier a-t-il été servi EN ENTIER, avec l'horloge de la
+    /// piste pas encore arrivée à sa fin ? Calculé par le même bras, qui
+    /// seul connaît la taille du flux ; `false` par défaut. Ne pèse que sur
+    /// [`ConsommationFlux::ASec`], et se consulte AVANT
+    /// [`Self::avance_audio_couvre_l_arret`] : quand la durée est connue et
+    /// le fichier entier, l'horloge est le critère exact, l'avance le
+    /// forfait.
+    pub horloge_de_piste_couvre_l_arret: bool,
     /// Precomputed `decisions::dlna_dsd_reached_end` for this zone/track — a
     /// DSD track on a DLNA renderer whose peak position reached the end.
     /// Gapless is intentionally off for a DSD next on DLNA, and DLNA never
@@ -256,6 +270,13 @@ pub fn classify_stopped(i: &StoppedInput) -> StoppedOutcome {
             return match i.consommation {
                 ConsommationFlux::Consomme => FailureWaitingConsuming,
                 ConsommationFlux::Inconnue => FailureWaitingUnknown,
+                // #4661 — le fichier est servi EN ENTIER et la piste n'est
+                // pas finie à l'horloge : la musique qui reste se compte à la
+                // seconde, pas au forfait. Avant l'avance : c'est le critère
+                // EXACT, elle n'est que la borne plate.
+                ConsommationFlux::ASec if i.horloge_de_piste_couvre_l_arret => {
+                    FailureWaitingHorloge
+                }
                 // #4480 — une socket à sec n'est pas un renderer à sec : tant
                 // que l'audio livrée devance la position, il reste de quoi
                 // jouer et la famine n'est pas établie.
@@ -472,6 +493,80 @@ pub fn famine_etablie_malgre_l_avance(
     arret.as_secs() >= patience_secs
 }
 
+/// 🔴 #4661 — le flux a-t-il été servi EN ENTIER ?
+///
+/// **C'est la seule chose qui autorise l'horloge de piste à trancher**, et
+/// elle se lit aux OCTETS contre la TAILLE DU FLUX
+/// ([`crate::http::streamer::AudioStreamer::stream_total_bytes`]) — jamais à
+/// la branche où l'on se trouve. Le bras du seuil d'échec s'atteint aussi
+/// bien sur un flux complet que sur un flux tronqué : mesuré le 24/09/2026
+/// sur un journal réel, la même branche `consommation="a_sec"` s'est armée à
+/// **70,5 %** du fichier servi. Conclure « servi en entier » de la branche
+/// aurait accordé l'horloge à un renderer qui n'avait pas la musique.
+///
+/// Les deux ignorances rendent `false` — jamais l'horloge :
+///
+/// - `octets_servis` à `None` : session inconnue du gestionnaire de flux, ou
+///   now-playing sans `stream_id` (#2394) ;
+/// - `octets_total` à `None` : radio (infinie par nature), ou flux dont la
+///   taille n'est pas connue.
+///
+/// Le `>=` n'est pas une tolérance mais une nécessité : `bytes_sent` est
+/// monotone toutes connexions confondues, donc une reprise `Range` le fait
+/// DÉPASSER la taille du fichier. Sur le cas mesuré, 50 317 520 octets servis
+/// pour un fichier de 49 596 668. C'est aussi pourquoi la patience que cette
+/// mesure ouvre reste plafonnée — voir
+/// [`horloge_de_piste_couvre_l_arret`].
+pub fn flux_servi_en_entier(octets_servis: Option<u64>, octets_total: Option<u64>) -> bool {
+    match (octets_servis, octets_total) {
+        (Some(servis), Some(total)) => total > 0 && servis >= total,
+        _ => false,
+    }
+}
+
+/// 🔴 #4661 — l'HORLOGE DE PISTE couvre-t-elle cet arrêt, c'est-à-dire :
+/// reste-t-il de la musique à jouer, pour de bon ?
+///
+/// #4480 a remplacé « le compteur d'octets monte-t-il ? » par « l'audio
+/// livrée devance-t-elle la position ? », et accorde `min(avance, 120 s)` de
+/// patience. Ce forfait de deux minutes est PLAT : il ignore la piste. Quand
+/// le fichier a été servi en entier et que la durée est connue, on n'a plus
+/// besoin d'un forfait — on sait à la seconde près quand la musique s'arrête.
+///
+/// Trois conditions, cumulatives :
+///
+/// 1. `flux_servi_en_entier` — établi aux octets contre la taille du flux,
+///    [`flux_servi_en_entier`], jamais supposé de la branche ;
+/// 2. `reste_de_musique` — l'horloge murale n'a pas dépassé la fin de la
+///    piste, [`decisions::tampon_du_renderer_peut_encore_jouer`] (qui rend
+///    `false` sur une durée inconnue) ;
+/// 3. l'arrêt dure moins que `borne_haute_secs` — le plafond du
+///    pathologique, voir `HORLOGE_DE_PISTE_BORNE_HAUTE_SECS`.
+///
+/// ⚠️ Cette patience s'AJOUTE à celle de [`famine_etablie_malgre_l_avance`],
+/// elle n'en retire aucune : `classify_stopped` ne consulte l'horloge que
+/// dans le bras qui coupait, et toute coupure qu'elle n'épargne pas a lieu
+/// exactement comme avant. Une zone sur un flux réellement mort — rien servi,
+/// flux tronqué, durée inconnue — retombe sur la borne des 120 s et s'arrête.
+///
+/// `arret_depuis` à `None` rend `false` : on n'accorde pas une patience dont
+/// on ne sait pas mesurer la durée. En exploitation le cas n'existe pas,
+/// l'horloge d'arrêt étant posée au passage de 0 à 1 tour.
+pub fn horloge_de_piste_couvre_l_arret(
+    flux_servi_en_entier: bool,
+    reste_de_musique: bool,
+    arret_depuis: Option<std::time::Duration>,
+    borne_haute_secs: u64,
+) -> bool {
+    if !flux_servi_en_entier || !reste_de_musique {
+        return false;
+    }
+    match arret_depuis {
+        Some(d) => d.as_secs() < borne_haute_secs,
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +594,8 @@ mod tests {
             consommation: ConsommationFlux::ASec,
             // Base : aucune avance d'audio à opposer — c'est ce qui coupe.
             avance_audio_couvre_l_arret: false,
+            // Base : rien qui prouve un fichier servi en entier (#4661).
+            horloge_de_piste_couvre_l_arret: false,
             dlna_dsd_reached_end: false,
         }
     }

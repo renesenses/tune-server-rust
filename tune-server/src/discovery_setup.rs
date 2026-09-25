@@ -680,7 +680,8 @@ pub(crate) fn appareil_ignore(
 ) -> bool {
     tune_core::db::ignored_device_repo::IgnoredDeviceRepo::with_backend(db.clone()).is_ignored(
         tune_core::db::ignored_device_repo::DeviceIdentity::new(&dev.id, &dev.host, &dev.name)
-            .with_mac(dev.mac_address.as_deref()),
+            .with_mac(dev.mac_address.as_deref())
+            .with_protocol(Some(&dev.device_type.to_string())),
     )
 }
 
@@ -4419,6 +4420,51 @@ mod appareils_ignores_1280 {
             repo.list().unwrap().len(),
             1,
             "après déblocage, l'appareil revient au scan suivant"
+        );
+    }
+
+    /// 🔴 #4957 — une MAC désigne un BOÎTIER, pas un appareil : l'Eversolo
+    /// DMP-A6 porte la même sous DLNA et sous AirPlay. Ignorer l'entrée
+    /// AirPlay « eversolo,1 » ne doit pas faire taire le renderer DLNA à la
+    /// découverte suivante ; une autre identité AirPlay de la même MAC, elle,
+    /// reste ignorée (#2803).
+    #[tokio::test]
+    async fn la_mac_d_une_entree_airplay_ignoree_ne_fait_pas_taire_le_dlna_du_meme_boitier() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        IgnoredDeviceRepo::with_backend(state.backend.clone())
+            .ignore(&IgnoredDevice {
+                device_id: "airplay-192.168.1.85-5500".into(),
+                mac: "80:0A:80:5C:26:89".into(),
+                host: "192.168.1.85".into(),
+                name: "eversolo,1".into(),
+                device_type: "airplay".into(),
+                created_at: None,
+            })
+            .unwrap();
+
+        let mut dlna = renderer_ssdp(
+            "uuid:3E151150-D9C0-11F0-A7C6-800A805C2689",
+            "DMP-A6",
+            OutputType::Dlna,
+            "192.168.1.85",
+        );
+        dlna.mac_address = Some("80:0A:80:5C:26:89".into());
+        assert!(
+            !super::appareil_ignore(&state.backend, &dlna),
+            "le renderer DLNA du même boîtier ne doit pas être ignoré"
+        );
+
+        let mut airplay = DiscoveredDevice::new(
+            "airplay-800A805C2689".into(),
+            "eversolo".into(),
+            OutputType::Airplay,
+            "192.168.1.90".into(),
+            7000,
+        );
+        airplay.mac_address = Some("800A805C2689".into());
+        assert!(
+            super::appareil_ignore(&state.backend, &airplay),
+            "une autre identité AirPlay de la même MAC reste ignorée"
         );
     }
 }

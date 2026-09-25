@@ -6,6 +6,7 @@ pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
 pub mod backend;
+pub mod collection_folder_repo;
 pub mod engine;
 pub mod facet_filter;
 pub mod favorite_facets_repo;
@@ -51,6 +52,8 @@ pub mod task_run_repo;
 pub mod track_metadata_repo;
 pub mod track_repo;
 pub mod tx_holder;
+/// Verrou d'écriture SQLite surveillé, attente hors de l'exécuteur (#4924).
+pub mod verrou_ecriture;
 pub mod zone_repo;
 
 #[cfg(test)]

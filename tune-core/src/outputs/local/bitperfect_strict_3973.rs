@@ -126,30 +126,53 @@ fn ouverture_3973_l_orchestrateur_pose_le_reglage_a_chaque_lecture() {
 
 #[test]
 fn enchainement_3973_strict_n_enchaine_pas_une_autre_cadence() {
-    assert!(enchainement_refuse_par_le_strict(
-        192_000, 96_000, true, "DAC USB"
-    ));
-    assert!(!enchainement_refuse_par_le_strict(
-        192_000, 96_000, false, "DAC USB"
-    ));
-    assert!(!enchainement_refuse_par_le_strict(
-        96_000, 96_000, true, "DAC USB"
-    ));
+    // Le strict seul, sur un périphérique qui NE suit PAS la source et hors
+    // PURE : c'est lui, et lui seul, qui refuse l'enchaînement.
+    let strict = ReglesDeCadence {
+        strict: true,
+        ..ReglesDeCadence::default()
+    };
+    assert_eq!(
+        decider_la_cadence_enchainee(192_000, 96_000, strict),
+        CadenceEnchainee::Rouvrir(MotifDeReouverture::BitPerfectStrict)
+    );
+    assert_eq!(
+        decider_la_cadence_enchainee(192_000, 96_000, ReglesDeCadence::default()),
+        CadenceEnchainee::Convertir
+    );
+    assert_eq!(
+        decider_la_cadence_enchainee(96_000, 96_000, strict),
+        CadenceEnchainee::MemeCadence
+    );
 }
 
-/// Garde du BRANCHEMENT, site 2 : la boucle gapless consulte la règle AVANT de
-/// décider du rééchantillonnage de la piste enchaînée, et en sort.
+/// Garde du BRANCHEMENT, site 2 : la boucle gapless passe par la frontière de
+/// l'étage (`enchainer_la_piste`, qui consulte la règle AVANT de convertir),
+/// en sort sur un refus, et y porte le réglage strict de la zone.
 #[test]
 fn enchainement_3973_la_boucle_gapless_sort_avant_de_convertir() {
     let src = compact(include_str!("../local.rs"));
-    let appel = src
-        .find("ifenchainement_refuse_par_le_strict(new_sr,output_sr,strict_bitperfect,&device_name,){break;}")
-        .expect("la boucle gapless doit consulter la règle bit-perfect, et en sortir");
-    let decision = src
-        .find("letnext_needs_resample=output_sr!=new_sr;")
-        .expect("la décision de rééchantillonner la piste enchaînée");
     assert!(
-        appel < decision,
+        src.contains(
+            "letOk(convolver_format_changed)=etage.enchainer_la_piste(&mut*puits,nouvelle_spec,regles,&device_name)else{break;};"
+        ),
+        "la boucle gapless doit passer par la frontière de l'étage, et en sortir sur un refus"
+    );
+    assert!(
+        src.contains("strict:strict_bitperfect,"),
+        "la frontière doit recevoir le réglage « bit-perfect strict » de la zone"
+    );
+    let corps = src
+        .find("fnenchainer_la_piste(")
+        .expect("la frontière de l'étage");
+    let decision = src[corps..]
+        .find("decider_la_cadence_enchainee(new_sr,output_sr,regles)")
+        .expect("la frontière consulte la règle");
+    let conversion = src[corps..]
+        .find("new_streaming_resampler(new_sr,output_sr,output_ch)")
+        .expect("la conversion de la piste enchaînée");
+    assert!(
+        decision < conversion,
         "la règle doit trancher AVANT le rééchantillonnage"
     );
 }

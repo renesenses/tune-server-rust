@@ -290,8 +290,16 @@ pub fn read_dsf_blocks(path: &str, info: &DsfInfo) -> Result<Vec<u8>, String> {
 /// suitable for feeding to `DsdToPcmStreamer`.
 ///
 /// Memory usage: O(block_size * channels) per call, typically ~8-32 KB.
-pub struct DsfStreamReader {
-    file: File,
+///
+/// Générique sur sa SOURCE d'octets : `File` par défaut (le chemin local,
+/// `open`), mais toute source `Read` convient dès qu'elle est positionnée sur
+/// le premier bloc de `data`. C'est ce qui permet de décoder un DSF **au fil
+/// de l'eau** depuis un corps HTTP (`decode::decode_dsf_http_to_pcm_streaming`),
+/// sans fichier temporaire de 300 Mio ni attente de la fin du téléchargement.
+/// Le chunk de métadonnées (ID3, en FIN de fichier) n'est jamais nécessaire
+/// au décodage.
+pub struct DsfStreamReader<R: Read = File> {
+    source: R,
     info: DsfInfo,
     block_idx: usize,
     blocks_per_channel: usize,
@@ -299,29 +307,39 @@ pub struct DsfStreamReader {
     super_block_buf: Vec<u8>,
 }
 
-impl DsfStreamReader {
+impl DsfStreamReader<File> {
     /// Open a DSF file for streaming reading.
     pub fn open(path: &str, info: DsfInfo) -> Result<Self, String> {
         let mut file = File::open(path).map_err(|e| format!("dsf open: {e}"))?;
         file.seek(SeekFrom::Start(info.data_offset))
             .map_err(|e| format!("dsf seek: {e}"))?;
+        Ok(Self::depuis_lecteur(file, info))
+    }
+}
 
+impl<R: Read> DsfStreamReader<R> {
+    /// Une source déjà positionnée sur le premier octet du chunk `data`
+    /// (`info.data_offset`) : les blocs se lisent séquentiellement, sans
+    /// jamais revenir en arrière.
+    pub fn depuis_lecteur(source: R, info: DsfInfo) -> Self {
         let block_size = info.block_size as usize;
         let channels = info.channels as usize;
         let total_bytes_per_channel = ((info.total_samples + 7) / 8) as usize;
         let blocks_per_channel = (total_bytes_per_channel + block_size - 1) / block_size;
         let super_block_size = block_size * channels;
 
-        Ok(DsfStreamReader {
-            file,
+        DsfStreamReader {
+            source,
             info,
             block_idx: 0,
             blocks_per_channel,
             bytes_read_total: 0,
             super_block_buf: vec![0u8; super_block_size],
-        })
+        }
     }
+}
 
+impl<R: Read + Seek> DsfStreamReader<R> {
     /// Seek to the super-block whose start is at or before `target_bpc` bytes
     /// (per channel) into the DSD stream. Super-block aligned (DSF stores data
     /// as interleaved per-channel blocks), so playback resumes on a clean block
@@ -333,14 +351,16 @@ impl DsfStreamReader {
         let channels = self.info.channels as usize;
         let block_idx = (target_bpc / block_size).min(self.blocks_per_channel);
         let byte_pos = block_idx * block_size * channels;
-        self.file
+        self.source
             .seek(SeekFrom::Start(self.info.data_offset + byte_pos as u64))
             .map_err(|e| format!("dsf seek: {e}"))?;
         self.block_idx = block_idx;
         self.bytes_read_total = byte_pos;
         Ok(block_idx * block_size)
     }
+}
 
+impl<R: Read> DsfStreamReader<R> {
     /// Read the next chunk of byte-interleaved DSD data.
     ///
     /// Returns `Ok(Some(chunk))` with interleaved bytes, or `Ok(None)` at EOF.
@@ -362,7 +382,7 @@ impl DsfStreamReader {
         }
 
         let buf = &mut self.super_block_buf[..to_read];
-        self.file
+        self.source
             .read_exact(buf)
             .map_err(|e| format!("dsf read block {}: {e}", self.block_idx))?;
         self.bytes_read_total += to_read;

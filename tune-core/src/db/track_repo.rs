@@ -4,7 +4,9 @@ use std::sync::Arc;
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 pub use super::facet_filter::TrackFilter;
-use super::facet_filter::{Placeholders, any_of, favorite_condition, hidden_tracks_excluded};
+use super::facet_filter::{
+    Placeholders, any_of, banned_tracks_excluded, favorite_condition, hidden_tracks_excluded,
+};
 use super::home_queries::{DATE_D_AJOUT, JOINTURE_PREMIERE_VUE};
 use super::models::Track;
 use super::sqlite::SqliteDb;
@@ -255,15 +257,15 @@ pub fn compter_pistes_par_sous_dossier(
 /// dossiers du serveur média (#4318) : le motif `LIKE` (pré-filtre, échappé),
 /// le préfixe littéral `<dossier><séparateur>` en NFC, et sa longueur en
 /// CARACTÈRES — `substr` compte en caractères sur les deux moteurs.
-struct DossierExact {
-    motif: String,
-    prefixe: String,
-    separateur: String,
-    longueur: usize,
+pub(crate) struct DossierExact {
+    pub(crate) motif: String,
+    pub(crate) prefixe: String,
+    pub(crate) separateur: String,
+    pub(crate) longueur: usize,
 }
 
 impl DossierExact {
-    fn new(dossier: &str) -> Self {
+    pub(crate) fn new(dossier: &str) -> Self {
         use unicode_normalization::UnicodeNormalization as _;
         let separateur = std::path::MAIN_SEPARATOR.to_string();
         let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
@@ -703,34 +705,152 @@ pub mod sql {
         )
     }
 
+    /// Les colonnes de CONNAISSANCE d'une piste : ce que l'enrichissement
+    /// MusicBrainz dépose et qu'un fichier ne porte, chez la plupart des
+    /// auditeurs, jamais.
+    ///
+    /// Elles sont listées ici, et ici seulement, pour que
+    /// [`update_du_scan`] et le commentaire qui l'explique ne puissent pas
+    /// diverger.
+    ///
+    /// `isrc` n'y figure pas : [`update`] ne l'écrit pas du tout — le scan ne
+    /// peut donc pas l'effacer, et l'ajouter ici laisserait croire l'inverse.
+    pub const COLONNES_DE_CONNAISSANCE: [&str; 6] = [
+        "genre",
+        "genres",
+        "composer",
+        "year",
+        "label",
+        "musicbrainz_recording_id",
+    ];
+
+    /// `UPDATE tracks …` qui ÉCRASE tout, y compris ce que le scan ignore.
+    ///
+    /// Réservé aux écritures qui connaissent vraiment la valeur qu'elles
+    /// posent — la retouche manuelle d'une fiche (`PUT /metadata/track/:id`),
+    /// où vider un champ est une volonté et doit passer. Le scan, lui, prend
+    /// [`update_du_scan`].
     pub fn update<D: SqlDialect>(d: &D) -> String {
+        update_avec(d, false)
+    }
+
+    /// `UPDATE tracks …` du SCAN : il n'efface jamais ce qu'il ne sait pas.
+    ///
+    /// # Le défaut, mesuré le 24/09/2026
+    ///
+    /// [`update`] pose les 24 colonnes sans condition. Le scan la fait tourner
+    /// par [`super::TrackRepo::update_batch`] sur chaque fichier dont
+    /// `verdict_ecriture` rend `MettreAJour` — c'est-à-dire sur TOUS, dès que
+    /// `force`/`full` est armé, donc à chaque clic sur « Scan complet ». Or la
+    /// ligne que le scan écrit est construite à partir du FICHIER SEUL
+    /// (`scan_import::build_track_row`) : elle ne relit pas la base. Les six
+    /// colonnes de [`COLONNES_DE_CONNAISSANCE`] retombaient donc sur ce que
+    /// disent les balises — c'est-à-dire sur rien, pour 98 % d'une
+    /// bibliothèque ordinaire.
+    ///
+    /// Sur le serveur du mainteneur : `settings.enrich_all_status` garde la
+    /// trace d'une passe qui avait apparié **22 450 pistes sur 46 898**, et il
+    /// n'en reste **1 147** qui portent un `musicbrainz_recording_id`
+    /// (relevé du 24/09/2026 sur `tune_v2.db`, en lecture seule). Les
+    /// identifiants de `tracks` y courent de 114 852 à 211 370 **sans un seul
+    /// trou** : la table a été vidée et réinsérée d'un bloc.
+    ///
+    /// Contre-épreuve du mécanisme : le scan ne récrit PAS les albums — il
+    /// n'appelle que `update_cover_path`, `update_track_count`,
+    /// `update_quality_from_tracks` — et les biographies d'album, elles, sont
+    /// intactes. Seules les colonnes de PISTE étaient effacées.
+    ///
+    /// # La règle
+    ///
+    /// * une balise présente GAGNE — retaguer dans Picard puis rescanner met
+    ///   bien la base à jour, c'est tout l'objet d'un scan ;
+    /// * un fichier qui ne dit RIEN laisse la valeur stockée en place.
+    ///
+    /// D'où `COALESCE(NULLIF(?, ''), colonne)`, et **dans cet ordre** :
+    /// `COALESCE(colonne, ?)` — la forme de `write_track_enrichment`, juste
+    /// pour lui, qui comble un trou — figerait ici l'ancienne valeur pour
+    /// toujours et rendrait tout rescan inutile.
+    ///
+    /// # Chaîne vide ou NULL
+    ///
+    /// Les deux valent « je ne sais pas », et le `NULLIF` le dit. Le lecteur
+    /// d'étiquettes rend `Some("")` pour une trame PRÉSENTE mais vide —
+    /// `get(ItemKey::MusicBrainzRecordingId)` ne filtre rien, et `genre`
+    /// retombe sur `raw_genres.first()` quand le découpage ne rend aucun
+    /// genre — ce qui est indiscernable d'une trame absente : un éditeur
+    /// d'étiquettes qui « efface » un champ laisse le plus souvent la trame
+    /// vide derrière lui. Sans le `NULLIF`, ces `""` rouvriraient le trou
+    /// qu'on vient de boucher, en écrasant l'enrichissement par du vide.
+    ///
+    /// Ce que cela coûte, et qu'on assume : on ne peut plus effacer un de ces
+    /// six champs en vidant la balise puis en rescannant. La fiche de piste
+    /// reste le chemin pour cela — elle passe par [`update`], qui écrase.
+    ///
+    /// `year` est un entier : il n'a pas de chaîne vide, et `NULLIF($n, '')`
+    /// sur un paramètre lié en `int8` ne passerait pas sur PostgreSQL. Simple
+    /// `COALESCE`.
+    pub fn update_du_scan<D: SqlDialect>(d: &D) -> String {
+        update_avec(d, true)
+    }
+
+    /// Le corps commun aux deux formes ci-dessus.
+    ///
+    /// ⚠️ UNE seule définition de l'ordre des colonnes, donc de l'ordre des
+    /// paramètres liés : `update` et `update_du_scan` partagent le même
+    /// tableau de 25 valeurs chez leurs appelants. Deux `format!` recopiés
+    /// auraient fini par diverger d'un cran, et un décalage de paramètres
+    /// écrit des valeurs justes dans les mauvaises colonnes sans lever la
+    /// moindre erreur.
+    fn update_avec<D: SqlDialect>(d: &D, conserver: bool) -> String {
+        // `COALESCE(NULLIF(?, ''), col)` : la balise gagne quand elle parle.
+        let texte = |n: usize, col: &str| {
+            let p = d.placeholder(n);
+            if conserver {
+                format!("{col} = COALESCE(NULLIF({p}, ''), {col})")
+            } else {
+                format!("{col} = {p}")
+            }
+        };
+        // Un entier n'a pas de chaîne vide à neutraliser.
+        let entier = |n: usize, col: &str| {
+            let p = d.placeholder(n);
+            if conserver {
+                format!("{col} = COALESCE({p}, {col})")
+            } else {
+                format!("{col} = {p}")
+            }
+        };
+        let brut = |n: usize, col: &str| format!("{col} = {}", d.placeholder(n));
+        let colonnes = [
+            brut(1, "title"),
+            brut(2, "album_id"),
+            brut(3, "artist_id"),
+            brut(4, "album_artist"),
+            brut(5, "disc_number"),
+            brut(6, "disc_subtitle"),
+            brut(7, "track_number"),
+            brut(8, "duration_ms"),
+            brut(9, "file_path"),
+            brut(10, "format"),
+            brut(11, "sample_rate"),
+            brut(12, "bit_depth"),
+            brut(13, "channels"),
+            brut(14, "file_mtime"),
+            brut(15, "file_size"),
+            brut(16, "audio_hash"),
+            texte(17, "genre"),
+            texte(18, "genres"),
+            texte(19, "composer"),
+            entier(20, "year"),
+            brut(21, "bpm"),
+            texte(22, "label"),
+            texte(23, "musicbrainz_recording_id"),
+            brut(24, "comments"),
+        ];
         format!(
-            "UPDATE tracks SET title = {}, album_id = {}, artist_id = {}, album_artist = {}, disc_number = {}, disc_subtitle = {}, track_number = {}, duration_ms = {}, file_path = {}, format = {}, sample_rate = {}, bit_depth = {}, channels = {}, file_mtime = {}, file_size = {}, audio_hash = {}, genre = {}, genres = {}, composer = {}, year = {}, bpm = {}, label = {}, musicbrainz_recording_id = {}, comments = {} WHERE id = {}",
-            d.placeholder(1),
-            d.placeholder(2),
-            d.placeholder(3),
-            d.placeholder(4),
-            d.placeholder(5),
-            d.placeholder(6),
-            d.placeholder(7),
-            d.placeholder(8),
-            d.placeholder(9),
-            d.placeholder(10),
-            d.placeholder(11),
-            d.placeholder(12),
-            d.placeholder(13),
-            d.placeholder(14),
-            d.placeholder(15),
-            d.placeholder(16),
-            d.placeholder(17),
-            d.placeholder(18),
-            d.placeholder(19),
-            d.placeholder(20),
-            d.placeholder(21),
-            d.placeholder(22),
-            d.placeholder(23),
-            d.placeholder(24),
-            d.placeholder(25),
+            "UPDATE tracks SET {} WHERE id = {}",
+            colonnes.join(", "),
+            d.placeholder(25)
         )
     }
 
@@ -1126,16 +1246,21 @@ pub mod sql {
     /// un album masqué » en ET — appliqué APRÈS la passe FTS, les index
     /// `tracks_fts` contiennent tout (#1391).
     ///
+    /// Même ET pour les pistes d'un album DISTANT doublé par un album local
+    /// (#4146) : le prédicat est celui de `GET /library/tracks`, pris à
+    /// `facet_filter` — une seconde rédaction divergerait au premier correctif.
+    ///
     /// Emplacements 1..=5 : requête FTS, puis trois `LIKE`, puis l'année.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {}",
+            "({} OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.genre)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(t.composer)) LIKE LOWER(unaccent({})) OR CAST(al.year AS TEXT) = {}) AND {} AND {}",
             plein_texte_de_la_piste(d),
             d.placeholder(2),
             d.placeholder(3),
             d.placeholder(4),
             d.placeholder(5),
             crate::db::facet_filter::hidden_tracks_excluded(),
+            crate::db::facet_filter::pistes_album_distant_double_exclu(d.engine()),
         )
     }
 
@@ -1372,6 +1497,32 @@ pub struct PreuveDeCompilation {
     pub compilation: bool,
 }
 
+/// Une colonne texte d'une piste qu'on peut interroger par
+/// [`TrackRepo::search_by_text_column`]. Liste FERMEE : l'expression SQL vient
+/// d'ici, jamais de la requete d'un client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColonneTextePiste {
+    /// `tracks.title`.
+    Titre,
+    /// `artists.name`, l'artiste resolu — celui que porte `Track::artist_name`.
+    Artiste,
+    /// `albums.title` — celui que porte `Track::album_title`.
+    Album,
+    /// `tracks.genre`.
+    Genre,
+}
+
+impl ColonneTextePiste {
+    fn expression_sql(self) -> &'static str {
+        match self {
+            ColonneTextePiste::Titre => "t.title",
+            ColonneTextePiste::Artiste => "ar.name",
+            ColonneTextePiste::Album => "al.title",
+            ColonneTextePiste::Genre => "t.genre",
+        }
+    }
+}
+
 pub struct TrackRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -1529,6 +1680,79 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
         Ok(self.db.query_one(&sql, &params)?.is_some())
+    }
+
+    /// #4896 — les fichiers indexés sous `dossier`, à toute profondeur, avec
+    /// leur taille connue : `file_path`, ou le fichier image d'une tranche CUE
+    /// (`cue_media_path`, une ligne par fichier). Même découpage exact que
+    /// [`Self::dossier_peuple`] : `…/Album` ne ramène pas `…/Album 2`.
+    pub fn fichiers_sous_dossier(
+        &self,
+        dossier: &str,
+    ) -> Result<Vec<(String, Option<i64>)>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!(
+            "SELECT DISTINCT {c}, file_size FROM tracks WHERE {c} LIKE {p1}{esc} \
+             AND substr({c}, 1, {n}) = {p2}",
+            c = CHEMIN_DE_LA_PISTE,
+            esc = like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .iter()
+            .filter_map(|ligne| {
+                let chemin = ligne.first()?.as_string()?;
+                Some((chemin, ligne.get(1).and_then(|v| v.as_i64())))
+            })
+            .collect())
+    }
+
+    /// #4896 — un dossier renommé ou déplacé : chaque fichier `(ancien,
+    /// nouveau)` change de chemin en GARDANT sa ligne, donc son identifiant et
+    /// tout ce qui s'y rattache (favoris, écoutes, étiquettes, files
+    /// d'attente). Les tranches CUE du fichier suivent (`cue_media_path`), et
+    /// sa date de première vue aussi : un album renommé n'est pas un ajout.
+    ///
+    /// Un nouveau chemin DÉJÀ indexé n'est pas écrasé (`file_path` est unique) :
+    /// l'ancienne ligne reste où elle est, et l'appelant la traite comme
+    /// disparue. Rend le nombre de lignes déplacées.
+    pub fn deplacer_fichiers(&self, deplacements: &[(String, String)]) -> Result<usize, TuneError> {
+        if deplacements.is_empty() {
+            return Ok(0);
+        }
+        let (p1, p2) = self.marqueurs2();
+        let piste = format!(
+            "UPDATE tracks SET file_path = {p1} WHERE file_path = {p2} \
+             AND NOT EXISTS (SELECT 1 FROM tracks deja WHERE deja.file_path = {p1})"
+        );
+        let tranches =
+            format!("UPDATE tracks SET cue_media_path = {p1} WHERE cue_media_path = {p2}");
+        let mut deplacees = 0usize;
+        let compte = &mut deplacees;
+        self.db.write_tx(&mut |tx| {
+            *compte = 0;
+            for (ancien, nouveau) in deplacements {
+                let params: [&dyn ToSqlValue; 2] = [nouveau, ancien];
+                *compte += tx.execute(&piste, &params)?;
+                *compte += tx.execute(&tranches, &params)?;
+            }
+            Ok(())
+        })?;
+        // Hors transaction et sans échec : sur une base antérieure à la table
+        // (#473), l'erreur annulerait tout le déplacement côté PostgreSQL.
+        let premiere_vue = format!(
+            "UPDATE file_first_seen SET file_path = {p1} WHERE file_path = {p2} \
+             AND NOT EXISTS (SELECT 1 FROM file_first_seen deja WHERE deja.file_path = {p1})"
+        );
+        for (ancien, nouveau) in deplacements {
+            let params: [&dyn ToSqlValue; 2] = [nouveau, ancien];
+            let _ = self.db.execute(&premiere_vue, &params);
+        }
+        Ok(deplacees)
     }
 
     /// Les sous-dossiers **directs** de `dossier` qui contiennent au moins une
@@ -2299,6 +2523,50 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Les identifiants de TOUTES les pistes, croissants — l'ensemble exact
+    /// que [`Self::list`] pagine et que [`Self::count`] compte, sans
+    /// hydrater une seule ligne. Serveur de médias, « All Tracks (Shuffle) »
+    /// (fil 1916) : le mélange porte sur des entiers, seule la page servie
+    /// est hydratée.
+    pub fn all_ids(&self) -> Result<Vec<i64>, TuneError> {
+        let rows = self
+            .db
+            .query_many("SELECT id FROM tracks ORDER BY id", &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    /// `(piste, album)` pour les pistes des albums donnés, chaque album dans
+    /// l'ordre de [`Self::list_by_album`] (disque, numéro, titre) — en UNE
+    /// requête, là où un genre de mille albums en coûterait mille. L'ordre
+    /// ENTRE albums est celui de l'appelant, qui regroupe. Mêmes identifiants
+    /// en ligne que [`Self::list_by_ids`], pour la même raison.
+    pub fn ids_by_album_ids(&self, album_ids: &[i64]) -> Result<Vec<(i64, i64)>, TuneError> {
+        if album_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = album_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT t.id, t.album_id FROM tracks t WHERE t.album_id IN ({id_list}) \
+             ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title, t.id"
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|cols| {
+                let piste = cols.first().and_then(|v| v.as_i64())?;
+                let album = cols.get(1).and_then(|v| v.as_i64())?;
+                Some((piste, album))
+            })
+            .collect())
+    }
+
     /// Like `list_by_album` but restricted to tracks matching an active
     /// quality/format filter, so the album detail agrees with a filtered grid.
     /// Sergio: a Hi-Res + 96kHz + FLAC filter matched a mixed album (the grid
@@ -2443,14 +2711,27 @@ impl TrackRepo {
     }
 
     pub fn search_by_title(&self, title: &str, limit: i64) -> Result<Vec<Track>, TuneError> {
-        let like = format!("%{title}%");
+        self.search_by_text_column(ColonneTextePiste::Titre, title, limit)
+    }
+
+    /// Les pistes dont `colonne` CONTIENT `valeur`, a la casse et aux accents
+    /// pres — la comparaison de [`Self::search_by_title`], etendue aux autres
+    /// champs qu'une recherche du serveur media peut interroger (#4955).
+    pub fn search_by_text_column(
+        &self,
+        colonne: ColonneTextePiste,
+        valeur: &str,
+        limit: i64,
+    ) -> Result<Vec<Track>, TuneError> {
+        let like = format!("%{valeur}%");
         let make_ph = |i: usize| match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(i),
             Engine::Postgres => PostgresDialect.placeholder(i),
         };
         let sql = format!(
-            "{} WHERE LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})) LIMIT {}",
+            "{} WHERE LOWER(unaccent({})) LIKE LOWER(unaccent({})) LIMIT {}",
             sql::select_track(),
+            colonne.expression_sql(),
             make_ph(1),
             make_ph(2)
         );
@@ -2483,7 +2764,10 @@ impl TrackRepo {
         Ok(n > 0)
     }
 
-    pub fn random_ids(&self, limit: i64) -> Result<Vec<i64>, TuneError> {
+    /// Tirage aléatoire sur la bibliothèque ENTIÈRE, pour ce profil : les
+    /// titres bannis (#4806) n'en sortent jamais — le filtre est dans la
+    /// requête, pas après, pour que le plafond soit tenu en pistes jouables.
+    pub fn random_ids(&self, profile_id: i64, limit: i64) -> Result<Vec<i64>, TuneError> {
         // Both engines accept `ORDER BY RANDOM()` (SQLite) /
         // `ORDER BY random()` (PG). The lowercase form works on both.
         let make_ph = |i: usize| match self.db.engine() {
@@ -2491,7 +2775,8 @@ impl TrackRepo {
             Engine::Postgres => PostgresDialect.placeholder(i),
         };
         let sql = format!(
-            "SELECT id FROM tracks ORDER BY random() LIMIT {}",
+            "SELECT t.id FROM tracks t WHERE {} ORDER BY random() LIMIT {}",
+            banned_tracks_excluded(profile_id),
             make_ph(1)
         );
         let params: [&dyn ToSqlValue; 1] = [&limit];
@@ -2545,6 +2830,7 @@ impl TrackRepo {
     /// le sous-arbre affiché ; `None` ou vide = tout le sous-arbre.
     pub fn random_ids_in_folder(
         &self,
+        profile_id: i64,
         folder: &str,
         terme: Option<&str>,
         limit: i64,
@@ -2578,6 +2864,9 @@ impl TrackRepo {
 
         // Jumeau du socle de la vue filtrée : les albums masqués n'en sont pas.
         conditions.push(hidden_tracks_excluded().to_string());
+        // Et les titres bannis par ce profil non plus (#4806) — un tirage est
+        // une sélection automatique, pas une liste d'affichage.
+        conditions.push(banned_tracks_excluded(profile_id));
 
         // La jointure `artists` est inconditionnelle — comme dans
         // `list_filtered` — pour que le compte et le tirage lisent la MÊME
@@ -2858,8 +3147,14 @@ impl TrackRepo {
     /// The caller is responsible for wrapping the call in a transaction
     /// (e.g. `BEGIN IMMEDIATE` / `COMMIT`) if atomicity is needed.
     /// See `create_batch` for rationale.
+    /// La mise à jour par LOT — le chemin du scan, et rien d'autre.
+    ///
+    /// Elle prend [`sql::update_du_scan`], pas [`sql::update`] : les six
+    /// colonnes de connaissance ne sont écrasées que par une balise qui parle.
+    /// Voir la fiche de [`sql::update_du_scan`] pour le défaut mesuré et la
+    /// règle.
     pub fn update_batch(&self, tracks: &[Track]) -> Result<usize, TuneError> {
-        let update_sql = self.dialect_sql(sql::update, sql::update);
+        let update_sql = self.dialect_sql(sql::update_du_scan, sql::update_du_scan);
         let mut count = 0usize;
         // Rows without an id are skipped, so collect the params first and
         // batch them through one execute_many call (see create_batch).
@@ -4328,7 +4623,7 @@ mod tests {
 
         let s = std::path::MAIN_SEPARATOR;
         let vise = format!("{s}music{s}Disco Pack");
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 500).unwrap();
 
         let attendus: std::collections::HashSet<i64> = cree
             .iter()
@@ -4368,7 +4663,7 @@ mod tests {
 
         let s = std::path::MAIN_SEPARATOR;
         let vise = format!("{s}music{s}Disco Pack");
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 2).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 2).unwrap();
         assert_eq!(ids.len(), 2, "la file est bornée par le plafond");
         assert_eq!(total, 3, "le total reste celui du répertoire entier");
     }
@@ -4388,7 +4683,7 @@ mod tests {
         let s = std::path::MAIN_SEPARATOR;
         let vise = format!("{s}music{s}Disco Pack");
         let (ids, total) = repo
-            .random_ids_in_folder(&vise, Some("funkytown"), 500)
+            .random_ids_in_folder(1, &vise, Some("funkytown"), 500)
             .unwrap();
         assert_eq!(ids.len(), 1, "une seule « Funkytown » sous ce répertoire");
         assert_eq!(total, 1);
@@ -4433,7 +4728,7 @@ mod tests {
         repo.create(&masquee).unwrap();
 
         // Témoin : avant le masquage, les deux pistes partent.
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 500).unwrap();
         assert_eq!(ids.len(), 2, "témoin : les deux pistes sont éligibles");
         assert_eq!(total, 2);
 
@@ -4441,7 +4736,7 @@ mod tests {
             .hide_album(album_id)
             .unwrap();
 
-        let (ids, total) = repo.random_ids_in_folder(&vise, None, 500).unwrap();
+        let (ids, total) = repo.random_ids_in_folder(1, &vise, None, 500).unwrap();
         assert_eq!(
             ids,
             vec![visible_id],
@@ -4470,7 +4765,7 @@ mod tests {
         let vise = format!("{s}music{s}Disco Pack");
 
         for terme in [None, Some("funkytown")] {
-            let (ids, total) = repo.random_ids_in_folder(&vise, terme, 500).unwrap();
+            let (ids, total) = repo.random_ids_in_folder(1, &vise, terme, 500).unwrap();
             let filtre = TrackFilter {
                 folder: Some(vise.clone()),
                 q: terme.map(str::to_string),
@@ -4788,5 +5083,383 @@ mod tests {
             "la valeur est déjà la bonne : la garde `cover_path <> ?` doit \
              empêcher toute réécriture à chaque scan"
         );
+    }
+
+    /// #4806 (a) — un titre banni ne sort JAMAIS d'un aléatoire de 500, sur
+    /// une base de banc de 40 pistes : 500 tirages de la bibliothèque entière
+    /// et 500 tirages par répertoire, aucun ne le contient ; et le plafond
+    /// est tenu en pistes JOUABLES (39, pas 40 moins une). Contre-épreuves :
+    /// avant le bannissement il sort, pour un AUTRE profil (g) il sort, et
+    /// après débannissement (e) il ressort.
+    #[test]
+    fn un_titre_banni_ne_sort_jamais_de_l_aleatoire() {
+        let db = test_db();
+        let artist_id = ArtistRepo::new(db.clone())
+            .create(&Artist::new("Chic".into()))
+            .unwrap();
+        let repo = TrackRepo::new(db.clone());
+        let s = std::path::MAIN_SEPARATOR;
+        let vise = format!("{s}music{s}Banc");
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            let mut t = Track::new(format!("Piste {i:02}"));
+            t.artist_id = Some(artist_id);
+            t.file_path = Some(format!("{vise}{s}piste-{i:02}.flac"));
+            ids.push(repo.create(&t).unwrap());
+        }
+        let bannie = ids[17];
+        let bans = crate::db::hidden_repo::HiddenRepo::new(db.clone());
+
+        // Témoin : avant le bannissement, 500 tirages de 5 le ramènent.
+        let sort_avant = (0..500).any(|_| repo.random_ids(1, 5).unwrap().contains(&bannie));
+        assert!(
+            sort_avant,
+            "témoin : la piste doit sortir avant d'être bannie"
+        );
+
+        assert!(bans.ban_track(1, bannie).unwrap());
+
+        for _ in 0..500 {
+            let tirage = repo.random_ids(1, 5).unwrap();
+            assert!(
+                !tirage.contains(&bannie),
+                "bannie et pourtant tirée : {tirage:?}"
+            );
+        }
+        let tout = repo.random_ids(1, 500).unwrap();
+        assert_eq!(tout.len(), 39, "le plafond se tient en pistes jouables");
+        assert!(!tout.contains(&bannie));
+
+        for _ in 0..500 {
+            let (tirage, total) = repo.random_ids_in_folder(1, &vise, None, 5).unwrap();
+            assert!(
+                !tirage.contains(&bannie),
+                "bannie et pourtant tirée : {tirage:?}"
+            );
+            assert_eq!(total, 39, "le total du répertoire ne compte pas la bannie");
+        }
+
+        // (g) Par profil : bannie chez 1, pas chez 2.
+        let chez_2 = repo.random_ids(2, 500).unwrap();
+        assert_eq!(chez_2.len(), 40);
+        assert!(chez_2.contains(&bannie), "le profil 2 n'a rien banni");
+
+        // (e) Débannir rend tout.
+        assert!(bans.unban_track(1, bannie).unwrap());
+        let apres = repo.random_ids(1, 500).unwrap();
+        assert_eq!(apres.len(), 40);
+        assert!(apres.contains(&bannie));
+    }
+
+    // ── Le scan n'efface plus l'enrichissement ────────────────────────────
+    //
+    // Le défaut, mesuré le 24/09/2026 sur la bibliothèque du mainteneur :
+    // `settings.enrich_all_status` garde la trace d'une passe qui avait
+    // apparié 22 450 pistes sur 46 898, et plus une seule ne survit en base.
+    // `sql::update` posait les six colonnes de connaissance sans condition, et
+    // `update_batch` la faisait tourner sur CHAQUE fichier dès que
+    // `force`/`full` est armé — donc à chaque clic sur « Scan complet ».
+    // Voir la fiche de [`sql::update_du_scan`].
+
+    /// Une piste telle que la base la porte APRÈS un enrichissement
+    /// MusicBrainz : les six colonnes de connaissance sont pleines.
+    fn piste_enrichie(repo: &TrackRepo) -> i64 {
+        let mut t = Track::new("Blue In Green".into());
+        t.file_path = Some("/music/kind-of-blue/03.flac".into());
+        t.file_mtime = Some(1_000.0);
+        t.file_size = Some(42);
+        t.genre = Some("Jazz".into());
+        t.genres = Some(r#"["Jazz","Modal"]"#.into());
+        t.composer = Some("Bill Evans".into());
+        t.year = Some(1959);
+        t.label = Some("Columbia".into());
+        t.musicbrainz_recording_id = Some("c0ffee00-dead-beef-cafe-000000000001".into());
+        repo.create(&t).unwrap()
+    }
+
+    /// La ligne que le SCAN écrit : elle sort de `build_track_row`, qui ne lit
+    /// que le FICHIER — jamais la base. Le mtime avance, c'est une relecture.
+    fn ligne_du_scan(id: i64, connaissance: Option<&str>) -> Track {
+        let mut t = Track::new("Blue In Green".into());
+        t.id = Some(id);
+        t.file_path = Some("/music/kind-of-blue/03.flac".into());
+        t.file_mtime = Some(2_000.0);
+        t.file_size = Some(43);
+        t.genre = connaissance.map(str::to_string);
+        t.genres = connaissance.map(|_| r#"["Rock"]"#.to_string());
+        t.composer = connaissance.map(str::to_string);
+        t.year = None;
+        t.label = connaissance.map(str::to_string);
+        t.musicbrainz_recording_id = connaissance.map(str::to_string);
+        t
+    }
+
+    /// Les six colonnes de connaissance, relues en base.
+    fn connaissance(repo: &TrackRepo, id: i64) -> Vec<String> {
+        let t = repo.get(id).unwrap().unwrap();
+        vec![
+            format!("genre={:?}", t.genre),
+            format!("genres={:?}", t.genres),
+            format!("composer={:?}", t.composer),
+            format!("year={:?}", t.year),
+            format!("label={:?}", t.label),
+            format!("mbid={:?}", t.musicbrainz_recording_id),
+        ]
+    }
+
+    /// (1) Un fichier qui ne dit RIEN laisse l'enrichissement en place.
+    ///
+    /// Rouge avant le correctif : les six valeurs reviennent à `None` — c'est
+    /// exactement la perte des 22 450 pistes.
+    #[test]
+    fn le_scan_complet_n_efface_plus_l_enrichissement() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        // « Scan complet » : `verdict_ecriture` rend `MettreAJour` pour tout
+        // fichier connu, et le lot passe par `update_batch`.
+        assert_eq!(repo.update_batch(&[ligne_du_scan(id, None)]).unwrap(), 1);
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Jazz")"#.to_string(),
+                r#"genres=Some("[\"Jazz\",\"Modal\"]")"#.to_string(),
+                r#"composer=Some("Bill Evans")"#.to_string(),
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Columbia")"#.to_string(),
+                r#"mbid=Some("c0ffee00-dead-beef-cafe-000000000001")"#.to_string(),
+            ],
+            "un scan complet a effacé l'enrichissement d'une piste dont le \
+             fichier ne porte aucune de ces balises"
+        );
+
+        // Le scan a bien fait son travail par ailleurs : la preuve que la
+        // garde ne fige pas TOUTE la ligne.
+        let relue = repo.get(id).unwrap().unwrap();
+        assert_eq!(relue.file_mtime, Some(2_000.0), "le mtime doit avancer");
+        assert_eq!(relue.file_size, Some(43), "la taille doit avancer");
+    }
+
+    /// (2) Une balise PRÉSENTE gagne : retaguer dans Picard puis rescanner met
+    /// bien la base à jour, c'est tout l'objet d'un scan.
+    ///
+    /// Rouge si l'on écrit `COALESCE(colonne, ?)` — la forme de
+    /// `write_track_enrichment`, qui comble un trou — au lieu de
+    /// `COALESCE(NULLIF(?, ''), colonne)` : la valeur stockée resterait figée
+    /// pour toujours et aucun rescan ne pourrait plus rien corriger.
+    #[test]
+    fn une_balise_presente_gagne_sur_la_valeur_stockee() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        assert_eq!(
+            repo.update_batch(&[ligne_du_scan(id, Some("Retagué"))])
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Retagué")"#.to_string(),
+                r#"genres=Some("[\"Rock\"]")"#.to_string(),
+                r#"composer=Some("Retagué")"#.to_string(),
+                // `year` n'est pas dans le fichier retagué : elle SURVIT.
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Retagué")"#.to_string(),
+                r#"mbid=Some("Retagué")"#.to_string(),
+            ],
+            "la balise du fichier doit gagner — sans quoi un rescan ne \
+             corrigerait plus jamais rien"
+        );
+    }
+
+    /// (3) Une balise VIDE ne vaut pas effacement.
+    ///
+    /// Le lecteur rend `Some("")` pour une trame présente mais vide —
+    /// `get(ItemKey::MusicBrainzRecordingId)` ne filtre rien, et `genre`
+    /// retombe sur `raw_genres.first()` quand le découpage ne rend aucun
+    /// genre. C'est indiscernable d'une trame absente. Sans le `NULLIF`, ces
+    /// `""` rouvriraient le trou en écrasant l'enrichissement par du vide.
+    #[test]
+    fn une_balise_vide_ne_vaut_pas_effacement() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        let mut ligne = ligne_du_scan(id, Some(""));
+        ligne.genres = Some(String::new());
+        assert_eq!(repo.update_batch(&[ligne]).unwrap(), 1);
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Jazz")"#.to_string(),
+                r#"genres=Some("[\"Jazz\",\"Modal\"]")"#.to_string(),
+                r#"composer=Some("Bill Evans")"#.to_string(),
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Columbia")"#.to_string(),
+                r#"mbid=Some("c0ffee00-dead-beef-cafe-000000000001")"#.to_string(),
+            ],
+            "une trame d'étiquette vide a effacé l'enrichissement : c'est le \
+             même trou, par l'autre bout"
+        );
+    }
+
+    /// (4) Une piste NEUVE reçoit ses balises comme avant : la garde ne peut
+    /// pas empêcher une colonne vide de se remplir.
+    #[test]
+    fn une_piste_neuve_recoit_bien_ses_balises() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let mut nue = Track::new("Blue In Green".into());
+        nue.file_path = Some("/music/kind-of-blue/03.flac".into());
+        let id = repo.create(&nue).unwrap();
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                "genre=None".to_string(),
+                "genres=None".to_string(),
+                "composer=None".to_string(),
+                "year=None".to_string(),
+                "label=None".to_string(),
+                "mbid=None".to_string(),
+            ],
+            "la piste doit bien partir nue"
+        );
+
+        let mut ligne = ligne_du_scan(id, Some("Jazz"));
+        ligne.year = Some(1959);
+        assert_eq!(repo.update_batch(&[ligne]).unwrap(), 1);
+
+        assert_eq!(
+            connaissance(&repo, id),
+            vec![
+                r#"genre=Some("Jazz")"#.to_string(),
+                r#"genres=Some("[\"Rock\"]")"#.to_string(),
+                r#"composer=Some("Jazz")"#.to_string(),
+                "year=Some(1959)".to_string(),
+                r#"label=Some("Jazz")"#.to_string(),
+                r#"mbid=Some("Jazz")"#.to_string(),
+            ],
+            "une piste neuve doit recevoir les balises de son fichier"
+        );
+    }
+
+    /// (5) La RETOUCHE MANUELLE, elle, doit toujours pouvoir vider un champ.
+    ///
+    /// `PUT /metadata/track/:id` lit la fiche, y pose ce que l'utilisateur a
+    /// tapé — chaîne vide comprise — et appelle `TrackRepo::update`. Ce
+    /// chemin garde `sql::update`, qui écrase : sans quoi le correctif rendrait
+    /// les six champs ineffaçables pour de bon.
+    #[test]
+    fn la_fiche_de_piste_peut_toujours_vider_un_champ() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let id = piste_enrichie(&repo);
+
+        let mut fiche = repo.get(id).unwrap().unwrap();
+        fiche.genre = Some(String::new());
+        fiche.label = None;
+        repo.update(&fiche).unwrap();
+
+        let relue = repo.get(id).unwrap().unwrap();
+        assert_eq!(
+            relue.genre.as_deref(),
+            Some(""),
+            "la fiche de piste doit pouvoir vider le genre"
+        );
+        assert_eq!(
+            relue.label, None,
+            "la fiche de piste doit pouvoir retirer le label"
+        );
+    }
+
+    /// La garde porte sur les SIX colonnes nommées, et sur elles seules.
+    ///
+    /// Un `COALESCE` posé par erreur sur `file_mtime`, `audio_hash` ou
+    /// `album_id` figerait la ligne que le scan a justement pour rôle de
+    /// tenir à jour — et le rouge, lui, n'arriverait qu'au prochain
+    /// déménagement de fichier.
+    #[test]
+    fn la_garde_ne_couvre_que_les_colonnes_de_connaissance() {
+        let sql = sql::update_du_scan(&SqliteDialect);
+        for col in sql::COLONNES_DE_CONNAISSANCE {
+            assert!(
+                sql.contains(&format!("{col} = COALESCE(")),
+                "`{col}` doit être gardée : {sql}"
+            );
+        }
+        for col in [
+            "title",
+            "album_id",
+            "artist_id",
+            "album_artist",
+            "file_path",
+            "file_mtime",
+            "file_size",
+            "audio_hash",
+            "format",
+            "comments",
+            "bpm",
+        ] {
+            assert!(
+                sql.contains(&format!("{col} = ?")),
+                "`{col}` doit rester écrite telle quelle : {sql}"
+            );
+        }
+        // `year` est un entier : pas de `NULLIF`, qui ne passerait pas sur
+        // PostgreSQL (`int8` comparé à `''`).
+        assert!(
+            sql.contains("year = COALESCE(?, year)"),
+            "`year` se garde sans NULLIF : {sql}"
+        );
+        // L'ORDRE des arguments décide de tout : `COALESCE(?, colonne)` garde
+        // la nouveauté, `COALESCE(colonne, ?)` figerait l'ancien pour toujours.
+        assert!(
+            !sql.contains("COALESCE(genre,"),
+            "ordre inversé : la valeur stockée serait figée pour toujours"
+        );
+        // Les 25 paramètres restent à leur rang, dans les deux formes.
+        for forme in [sql::update(&SqliteDialect), sql] {
+            assert_eq!(
+                forme.matches('?').count(),
+                25,
+                "25 paramètres liés, ni plus ni moins : {forme}"
+            );
+        }
+    }
+
+    /// La forme PostgreSQL est la même règle, avec ses `$n` dans l'ordre.
+    #[test]
+    fn la_garde_du_scan_tient_aussi_en_postgresql() {
+        let sql = sql::update_du_scan(&PostgresDialect);
+        assert!(
+            sql.contains("genre = COALESCE(NULLIF($17, ''), genre)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("genres = COALESCE(NULLIF($18, ''), genres)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("composer = COALESCE(NULLIF($19, ''), composer)"),
+            "{sql}"
+        );
+        assert!(sql.contains("year = COALESCE($20, year)"), "{sql}");
+        assert!(
+            sql.contains("label = COALESCE(NULLIF($22, ''), label)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "musicbrainz_recording_id = COALESCE(NULLIF($23, ''), musicbrainz_recording_id)"
+            ),
+            "{sql}"
+        );
+        assert!(sql.ends_with("WHERE id = $25"), "{sql}");
     }
 }

@@ -1859,6 +1859,9 @@ async fn ignore_device(
         let outputs = state.outputs.lock().await;
         outputs.info_all().await
     };
+    // Les identifiants jumeaux retirés du registre avec lui : leurs zones
+    // sont les siennes (#4957).
+    let mut jumelles: Vec<String> = Vec::new();
     {
         let mut outputs = state.outputs.lock().await;
         outputs.remove(&device_id);
@@ -1873,9 +1876,11 @@ async fn ignore_device(
             }
             let s = |cle: &str| info.get(cle).and_then(Value::as_str).unwrap_or_default();
             let identite =
-                tune_core::db::ignored_device_repo::DeviceIdentity::new(id, s("host"), s("name"));
+                tune_core::db::ignored_device_repo::DeviceIdentity::new(id, s("host"), s("name"))
+                    .with_protocol(Some(s("type")));
             if tune_core::db::ignored_device_repo::identity_matches(&snapshot, identite) {
                 outputs.remove(id);
+                jumelles.push(id.to_string());
             }
         }
     }
@@ -1884,25 +1889,45 @@ async fn ignore_device(
     // La zone de l'appareil, s'il en a une : masquée, comme une suppression.
     let zone_repo = ZoneRepo::with_backend(state.backend.clone());
     let mut zones_masquees = Vec::new();
-    if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id)
-        && let Some(zid) = zone.id
-        && zone_repo.delete(zid).is_ok()
-    {
-        zones_masquees.push(zid);
+    let mut protocole = snapshot.device_type.clone();
+    if let Ok(Some(zone)) = zone_repo.get_by_device_id(&device_id) {
+        if protocole.is_empty() {
+            protocole = zone.output_type.clone().unwrap_or_default();
+        }
+        if let Some(zid) = zone.id
+            && zone_repo.delete(zid).is_ok()
+        {
+            zones_masquees.push(zid);
+        }
     }
-    if !snapshot.host.is_empty() || !snapshot.mac.is_empty() {
-        let mac = (!snapshot.mac.is_empty()).then_some(snapshot.mac.as_str());
-        // Masquer une zone la retire des zones VISIBLES, donc l'appel suivant
-        // rend la jumelle. Borne dure quand même : on ne fait pas dépendre la
-        // terminaison d'une écriture en base.
-        for _ in 0..16 {
-            let Some((zid, _, _)) = zone_repo.find_visible_zone_by_identity(&snapshot.host, mac)
-            else {
-                break;
-            };
-            if zones_masquees.contains(&zid) || zone_repo.delete(zid).is_err() {
-                break;
-            }
+    // 🔴 #4957 — les AUTRES zones de son hôte ne sont les siennes que si
+    // elles en sont une jumelle ou parlent son protocole. Avant, toute zone
+    // visible du même hôte (ou de la même MAC) tombait : ignorer l'entrée
+    // AirPlay « eversolo,1 » masquait la zone DLNA du DMP-A6 en pleine
+    // lecture. L'adresse IP seule n'identifie aucun appareil.
+    for (zid, zone_device_id, zone_protocole) in zone_repo.visible_zones_on_host(&snapshot.host) {
+        if zones_masquees.contains(&zid)
+            || !tune_core::db::ignored_device_repo::zone_de_l_appareil_ignore(
+                &zone_device_id,
+                &zone_protocole,
+                &device_id,
+                &jumelles,
+                &protocole,
+            )
+        {
+            continue;
+        }
+        if zone_repo.delete(zid).is_ok() {
+            zones_masquees.push(zid);
+        }
+    }
+    // Les jumelles dont la zone ne porte pas d'hôte persisté.
+    for jumelle in &jumelles {
+        if let Ok(Some(zone)) = zone_repo.get_by_device_id(jumelle)
+            && let Some(zid) = zone.id
+            && !zones_masquees.contains(&zid)
+            && zone_repo.delete(zid).is_ok()
+        {
             zones_masquees.push(zid);
         }
     }
@@ -1916,6 +1941,7 @@ async fn ignore_device(
         name = %snapshot.name,
         host = %snapshot.host,
         zones = zones_masquees.len(),
+        hidden_zone_ids = ?zones_masquees,
         "device_ignored"
     );
     Json(json!({

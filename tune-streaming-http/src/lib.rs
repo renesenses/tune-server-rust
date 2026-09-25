@@ -141,9 +141,25 @@ impl TypeFavori {
 /// Tout le reste — réseau injoignable, JSON illisible, erreur rendue par le
 /// service, cas inconnu — reste une panne d'amont. `None` ici, et l'appelant
 /// garde son 502. Remplacer un mensonge par un autre n'aurait rien réparé.
+///
+/// # L'objet introuvable (renesenses/tune-web-client#992)
+///
+/// [`TuneError::NotFound`] dit « le service a répondu, et cet objet n'existe
+/// pas chez lui » — un artiste inconnu de Qobuz ou de YouTube. Ce n'est pas
+/// une passerelle en panne non plus : c'est un `404`. Mesuré sur la .18 le
+/// 24/09/2026 (0.9.164) :
+///
+/// ```text
+/// GET /api/v1/streaming/youtube/artists/UCxxxx992 → 502
+///     Not found: youtube artist UCxxxx992 not found
+/// ```
+///
+/// et le client affichait ce 502 en bandeau « Server error », depuis la
+/// Lecture en cours (FabienM, fil 1774, point 14).
 fn statut_porte_par_l_erreur(e: &tune_core::TuneError) -> Option<StatusCode> {
     match e {
         tune_core::TuneError::Unsupported(_) => Some(StatusCode::NOT_IMPLEMENTED),
+        tune_core::TuneError::NotFound(_) => Some(StatusCode::NOT_FOUND),
         _ => None,
     }
 }
@@ -335,6 +351,13 @@ fn memoriser_contenu_utilisateur(service: &str, ressource: &str, donnees: Value)
 /// SANS passer par les routes d'ici : elles ne purgeaient donc rien, et la
 /// liste rendue restait la mémorisée — jusqu'à 2 minutes. Bertrand : « Je ne
 /// vois pas la playlist résultant du merge ! ». Elle existait chez Qobuz.
+///
+/// **Publique depuis #4716** : les routes HTTP ne sont plus les seules à écrire
+/// chez un service. L'interface hôte WASM (`tune-server/src/plugins_host.rs`)
+/// crée des playlists et y ajoute des pistes pour le compte d'un greffon, HORS
+/// de ces routes ; sans appeler cette purge, l'écran continuerait de servir la
+/// liste mémorisée pendant 120 s et la playlist qui vient d'être créée
+/// « n'existerait pas ».
 pub fn purge_contenu_utilisateur(service: &str) {
     let Ok(mut cache) = cache_contenu_utilisateur().lock() else {
         return;
@@ -477,6 +500,10 @@ where
         )
         .route("/{service}/tracks/{track_id}", get(service_track))
         .route("/{service}/tracks/{track_id}/url", get(service_track_url))
+        .route(
+            "/{service}/tracks/{track_id}/similar",
+            get(service_track_similar),
+        )
         .route("/{service}/featured", get(service_featured))
         .route(
             "/{service}/featured/sections",
@@ -1182,6 +1209,104 @@ async fn service_logout(
     // Le compte change : ses listes ne doivent pas survivre à la session.
     purge_contenu_utilisateur(&service);
     Json(json!({ "service": service, "status": "logged_out" })).into_response()
+}
+
+/// Nombre de titres rendus par défaut par « Plus comme ça » sur un titre de
+/// service : un titre par artiste voisin, comme la radio.
+const PLUS_COMME_CA_PAR_DEFAUT: usize = 20;
+/// Plafond de `?limit=`. Chaque titre coûte un appel au service (les titres
+/// phares d'un voisin), faits l'un après l'autre : au-delà, le clic attend.
+const PLUS_COMME_CA_PLAFOND: usize = 50;
+
+#[derive(Deserialize)]
+struct SimilairesQuery {
+    limit: Option<usize>,
+}
+
+/// Le nombre de titres réellement demandé : absent → le défaut, `0` → au
+/// moins un, trop grand → le plafond.
+fn borne_plus_comme_ca(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(PLUS_COMME_CA_PAR_DEFAUT)
+        .clamp(1, PLUS_COMME_CA_PLAFOND)
+}
+
+/// `GET /{service}/tracks/{track_id}/similar` — « Plus comme ça » sur un titre
+/// de service. Fil 1906 (FabienM), point 3.
+///
+/// Même algorithme que la reprise automatique de fin de file (voir
+/// `tune_core::playback::auto_dj::pistes_similaires_du_service`) : l'artiste
+/// du titre, ses voisins, un titre phare par voisin, le titre source exclu.
+/// La réponse est une liste de pistes au format des autres routes streaming
+/// (`StreamTrack`), que le client lit ou enfile comme d'habitude.
+///
+/// Réponses :
+///  - 404 : service inconnu (comme toutes les routes `/{service}/…`) ;
+///  - 501 : le service ne connaît pas ses artistes similaires — aujourd'hui,
+///    tous sauf Qobuz. Un refus DIT, pas une liste vide qui laisserait croire
+///    à un artiste sans voisin ;
+///  - 502 : le titre source n'a pas pu être lu chez le service ;
+///  - 200 `[]` : aucun voisin trouvé — une réponse, pas une panne.
+///
+/// Titres bannis : la radio n'en exclut aucun sur cette base (la fonction
+/// `banned` de #4818 n'y est pas) ; la route suit la radio.
+async fn service_track_similar(
+    State(state): State<StreamingHttpState>,
+    Path((service, track_id)): Path<(String, String)>,
+    Query(q): Query<SimilairesQuery>,
+) -> Response {
+    let arc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // Le verrou de lecture est RELÂCHÉ avant la recherche des voisins, qui
+    // reprend le sien à chaque appel : le garder ici laisserait un écrivain en
+    // attente (rafraîchissement de jeton) bloquer toute la requête.
+    let source = {
+        let svc = arc.read().await;
+        if !svc.propose_des_artistes_similaires() {
+            return svc_response::<Vec<tune_core::streaming::traits::StreamTrack>>(Err(
+                tune_core::TuneError::Unsupported(format!(
+                    "{service} ne fournit pas d'artistes similaires : « Plus comme ça » \
+                     n'est pas disponible pour ce service"
+                )),
+            ));
+        }
+        match svc.get_track(&track_id).await {
+            Ok(piste) => piste,
+            Err(e) => {
+                return svc_response::<Vec<tune_core::streaming::traits::StreamTrack>>(Err(e));
+            }
+        }
+    };
+    let borne = borne_plus_comme_ca(q.limit);
+    let noms =
+        tune_core::playback::auto_dj::similar_artist_names(&state.backend, &source.artist, borne)
+            .await;
+    let mut exclure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    exclure.insert(track_id.clone());
+    if !source.id.is_empty() {
+        exclure.insert(source.id.clone());
+    }
+    let similaires = tune_core::playback::auto_dj::pistes_similaires_du_service(
+        &arc,
+        &source.artist,
+        source.artist_id.as_deref(),
+        noms,
+        borne,
+        borne,
+        &exclure,
+    )
+    .await;
+    tracing::info!(
+        service = %service,
+        track_id = %track_id,
+        candidats = similaires.candidats,
+        depuis_enrichissement = similaires.depuis_enrichissement,
+        pistes = similaires.pistes.len(),
+        "plus_comme_ca_service"
+    );
+    svc_response(Ok(similaires.pistes))
 }
 
 async fn service_track_url(
@@ -2882,6 +3007,16 @@ mod temoin_statut_du_refus_i859 {
         }
     }
 
+    /// #992 — la ROUTE, pas seulement la table : un artiste introuvable sort
+    /// en 404, avec la phrase du service, et plus en 502.
+    #[test]
+    fn un_objet_introuvable_sort_en_404_et_non_en_502() {
+        let r = svc_response::<Value>(Err(TuneError::NotFound(
+            "youtube artist UCxxxx992 not found".into(),
+        )));
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
     /// Une réponse ÉDITORIALE refusée passe par `svc_response_editorial`, qui
     /// délègue à `svc_response`. Sans cet essai, la moitié éditoriale des
     /// routes pourrait garder le 502 sans que rien ne rougisse.
@@ -2896,19 +3031,24 @@ mod temoin_statut_du_refus_i859 {
     }
 
     /// Le 502 reste le DÉFAUT. Aucune autre variante ne doit être promue en
-    /// douce : cet essai fige la frontière, variante par variante.
+    /// douce : cet essai fige la frontière, variante par variante. Deux
+    /// seulement portent un statut — le refus (501, #859) et l'introuvable
+    /// (404, renesenses/tune-web-client#992).
     #[test]
-    fn seule_la_variante_du_refus_porte_un_statut() {
+    fn seuls_le_refus_et_l_introuvable_portent_un_statut() {
         assert_eq!(
             statut_porte_par_l_erreur(&TuneError::Unsupported("x".into())),
             Some(StatusCode::NOT_IMPLEMENTED)
+        );
+        assert_eq!(
+            statut_porte_par_l_erreur(&TuneError::NotFound("x".into())),
+            Some(StatusCode::NOT_FOUND)
         );
         for panne in [
             TuneError::Streaming("x".into()),
             TuneError::Json(serde_json::from_str::<Value>("{").unwrap_err()),
             TuneError::Db("x".into()),
             TuneError::Config("x".into()),
-            TuneError::NotFound("x".into()),
             TuneError::Other("x".into()),
         ] {
             assert_eq!(

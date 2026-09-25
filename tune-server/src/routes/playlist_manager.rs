@@ -375,20 +375,23 @@ async fn transfer_playlist(
             drop(registry);
 
             let svc = svc_arc.read().await;
-            let query = if artist.is_empty() {
-                title.to_string()
-            } else {
-                format!("{title} {artist}")
-            };
-            match svc.search(&query, 10).await {
-                Ok(results) => {
-                    if let Some(best) = tune_core::streaming::matching::best_stream_match(
-                        title,
-                        artist,
-                        "",
-                        0,
-                        &results.tracks,
-                    ) {
+            // #4716 — la recherche PUIS l'appariement vivent désormais dans
+            // `matching::apparier_chez_le_service`, que la capacité WASM
+            // `host_streaming_match_track` appelle aussi : un seul verdict pour
+            // l'écran et pour le greffon. Le seuil reste celui d'avant
+            // (`best_stream_match` = score au-dessus de `MATCH_ACCEPT_SCORE`).
+            match tune_core::streaming::matching::apparier_chez_le_service(
+                &**svc, title, artist, "", 0,
+            )
+            .await
+            {
+                Ok(candidat) => {
+                    if let Some(best) = candidat
+                        .filter(|(_, score)| {
+                            *score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE
+                        })
+                        .map(|(t, _)| t)
+                    {
                         matched += 1;
                         track_details.push(json!({
                             "source_title": title,
@@ -1099,11 +1102,12 @@ async fn restore_backup(
 
     let playlist_id = if let Some(ex) = existing {
         let pid = ex.id.unwrap_or(0);
-        // Clear existing tracks
-        let track_ids = playlist_repo.get_track_ids(pid).unwrap_or_default();
-        for (pos, _) in track_ids.iter().enumerate() {
-            playlist_repo.remove_track(pid, pos as i64).ok();
-        }
+        // Clear existing tracks — TOUTES les lignes. L'ancienne boucle
+        // retirait les positions 0..n-1, n compté sur les seules pistes
+        // LOCALES : depuis #4889 une playlist peut porter des titres de
+        // service, qui décalent les positions, et « remplacer » aurait
+        // laissé des lignes de l'ancienne version derrière la nouvelle.
+        playlist_repo.set_tracks(pid, &[]).ok();
         pid
     } else {
         match playlist_repo.create(

@@ -92,19 +92,28 @@ pub enum Tache {
     Enrichissement,
     /// Les images d'artistes et les pochettes.
     ImagesArtistes,
+    /// L'identification de la bibliothèque : le pilote de lot de
+    /// `POST /library/identify-all` (#4805). Il enchaîne, album par album, la
+    /// chaîne déjà écrite de `POST /library/albums/{id}/reidentify`.
+    ///
+    /// Elle est ici pour la MÊME raison que les six autres : 2 h 23 de
+    /// requêtes sortantes mesurées sur les 3 909 albums locaux du .18 ne
+    /// peuvent pas être une passe qu'on ne peut plus arrêter.
+    Identification,
 }
 
 impl Tache {
     /// Toutes les tâches, dans l'ordre d'affichage de l'écran « État du
     /// serveur ». C'est la liste que balaient l'interrupteur général et le
     /// relevé : ajouter une tâche ici suffit à l'y faire entrer.
-    pub const TOUTES: [Tache; 6] = [
+    pub const TOUTES: [Tache; 7] = [
         Tache::ReplayGain,
         Tache::Empreintes,
         Tache::PlageDynamique,
         Tache::Acoustique,
         Tache::Enrichissement,
         Tache::ImagesArtistes,
+        Tache::Identification,
     ];
 
     /// Identifiant STABLE — c'est le mot que lisent l'API et le client web.
@@ -123,6 +132,7 @@ impl Tache {
             Tache::Acoustique => "acoustic",
             Tache::Enrichissement => "enrichment",
             Tache::ImagesArtistes => "artist_images",
+            Tache::Identification => "identification",
         }
     }
 
@@ -146,6 +156,7 @@ impl Tache {
             Tache::Acoustique => "tache_de_fond_pause_acoustic",
             Tache::Enrichissement => "tache_de_fond_pause_enrichment",
             Tache::ImagesArtistes => "tache_de_fond_pause_artist_images",
+            Tache::Identification => "tache_de_fond_pause_identification",
         }
     }
 

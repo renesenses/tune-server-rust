@@ -578,10 +578,15 @@ pub mod sql {
     /// index `albums_fts` contiennent tout, les reconstruire à chaque
     /// masquage serait le mauvais échange (#1391).
     ///
+    /// Même ET pour l'album DISTANT doublé par un album local (#4146) :
+    /// seul le local est rendu, comme dans la grille de `/library/albums`.
+    /// Le prédicat est celui de la grille, pris à `facet_filter`, jamais
+    /// recopié — il vaut pour la page ET pour son total.
+    ///
     /// Emplacements 1..=6.
     pub fn search_where<D: SqlDialect>(d: &D) -> String {
         format!(
-            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {}",
+            "(({}) OR LOWER(unaccent(a.title)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(ar.name)) LIKE LOWER(unaccent({})) OR LOWER(unaccent(a.genre)) LIKE LOWER(unaccent({})) OR a.musicbrainz_release_id = {} OR EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = a.id AND LOWER(unaccent(t.title)) LIKE LOWER(unaccent({})))) AND {} AND {}",
             d.fts_where("albums", "a", &d.placeholder(1)),
             d.placeholder(2),
             d.placeholder(3),
@@ -589,6 +594,7 @@ pub mod sql {
             d.placeholder(5),
             d.placeholder(6),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
         )
     }
 
@@ -636,10 +642,11 @@ pub mod sql {
         format!(
             "SELECT a.label, COUNT(*) AS n FROM albums a \
              WHERE a.label IS NOT NULL AND TRIM(a.label) <> '' \
-             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} \
+             AND LOWER(unaccent(a.label)) LIKE LOWER(unaccent({})) AND {} AND {} \
              GROUP BY a.label ORDER BY n DESC, a.label LIMIT {}",
             d.placeholder(1),
             crate::db::facet_filter::hidden_albums_excluded(),
+            crate::db::facet_filter::album_distant_double_exclu(d.engine(), "a"),
             d.placeholder(2)
         )
     }
@@ -780,6 +787,31 @@ pub struct AussiSur {
     pub local: bool,
     /// Le nom du serveur UPnP, quand l'indexation l'a noté.
     pub serveur: Option<String>,
+}
+
+/// Le fragment `SET` qui remonte le label des PISTES sur leur ALBUM (#4836).
+///
+/// Le scan range le label lu dans le fichier (`LABEL`/`ORGANIZATION` Vorbis,
+/// `TPUB` ID3v2…) sur `tracks.label` ; l'onglet Labels de la bibliothèque et
+/// la recherche des labels (`search_labels`) lisent `albums.label`. Aucun
+/// chemin de scan n'écrivait ce dernier : seuls l'enrichissement MusicBrainz,
+/// la ré-identification et l'édition manuelle le faisaient. Un label bien
+/// étiqueté ne s'affichait donc jamais (fil 1899).
+///
+/// Comblement seul : un label d'album déjà posé — par l'utilisateur ou par
+/// l'enrichissement — n'est jamais écrasé ; une chaîne vide compte comme un
+/// trou (même règle que `genre`). Parmi les pistes, le label le plus fréquent
+/// l'emporte, départagé par ordre alphabétique : un `LIMIT 1` nu rendrait une
+/// ligne quelconque, différente d'un scan à l'autre (#1160).
+///
+/// Corrélé sur `albums.id` : il sert tel quel à la remontée d'un album
+/// (`WHERE id = ?`) comme à la remontée globale du scan manuel. SQL commun à
+/// SQLite et PostgreSQL.
+pub fn sql_label_repris_des_pistes() -> &'static str {
+    "label = COALESCE(NULLIF(albums.label, ''), \
+     (SELECT t.label FROM tracks t \
+      WHERE t.album_id = albums.id AND t.label IS NOT NULL AND t.label != '' \
+      GROUP BY t.label ORDER BY COUNT(*) DESC, t.label ASC LIMIT 1))"
 }
 
 pub struct AlbumRepo {
@@ -1758,6 +1790,47 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// #4896 — un dossier renommé ou déplacé : les albums identifiés par ce
+    /// dossier, ou par un dossier qu'il contient, le suivent. Sans cela,
+    /// `get_or_create_for_folder` ne reconnaîtrait plus l'album à son dossier
+    /// et la prochaine relecture d'une piste en ouvrirait un second. Découpage
+    /// exact (`…/Album` ne déplace pas `…/Album 2`). Rend le nombre de lignes.
+    pub fn deplacer_dossier(&self, ancien: &str, nouveau: &str) -> Result<usize, TuneError> {
+        use unicode_normalization::UnicodeNormalization as _;
+        let d = super::track_repo::DossierExact::new(ancien);
+        let base_ancienne = d
+            .prefixe
+            .trim_end_matches(d.separateur.as_str())
+            .to_string();
+        let base_nouvelle: String = nouveau.trim_end_matches(['/', '\\']).nfc().collect();
+        let (p1, p2, p3) = match self.db.engine() {
+            Engine::Postgres => ("$1", "$2", "$3"),
+            Engine::Sqlite => ("?1", "?2", "?3"),
+        };
+        let sql = format!(
+            "SELECT id, folder_path FROM albums WHERE folder_path = {p1} \
+             OR (folder_path LIKE {p2}{esc} AND substr(folder_path, 1, {n}) = {p3})",
+            esc = super::track_repo::like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 3] = [&base_ancienne, &d.motif, &d.prefixe];
+        let mut deplaces = 0usize;
+        for ligne in self.db.query_many_strong(&sql, &params)? {
+            let (Some(id), Some(dossier)) = (
+                ligne.first().and_then(|v| v.as_i64()),
+                ligne.get(1).and_then(|v| v.as_string()),
+            ) else {
+                continue;
+            };
+            let Some(reste) = dossier.strip_prefix(&base_ancienne) else {
+                continue;
+            };
+            self.set_folder_path(id, &format!("{base_nouvelle}{reste}"))?;
+            deplaces += 1;
+        }
+        Ok(deplaces)
+    }
+
     /// Marque l'album comme compilation (#1957). **Ne baisse jamais le
     /// drapeau**, et c'est délibéré :
     ///
@@ -1851,6 +1924,37 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 3] = [&artist_id, &titre, &album_id];
         self.db.execute(&sql, &params)?;
         self.mark_compilation(album_id)
+    }
+
+    /// #4896 — reprend le titre et/ou l'artiste d'une ligne album d'après les
+    /// balises de ses pistes, que le surveillant de fichiers vient de relire
+    /// (voir `auto_scan::realigner_albums_sur_les_balises`, qui décide).
+    ///
+    /// Écriture ciblée, comme [`Self::reclasser_en_compilation`] : la pochette
+    /// et les dates restent. Chaque champ tenu par une édition manuelle
+    /// (C3) est laissé tel quel. Rend `true` si quelque chose a été écrit.
+    pub fn realigner_sur_les_balises(
+        &self,
+        album_id: i64,
+        titre: Option<&str>,
+        artist_id: Option<i64>,
+    ) -> Result<bool, TuneError> {
+        let mut ecrit = false;
+        if let Some(titre) = titre
+            && !self.tenu_a_la_main(album_id, "title")
+        {
+            self.force_update_title(album_id, titre)?;
+            ecrit = true;
+        }
+        if let Some(artist_id) = artist_id
+            && !self.tenu_a_la_main(album_id, "artist")
+        {
+            let sql = self.dialect_sql(sql::set_artist_id, sql::set_artist_id);
+            let params: [&dyn ToSqlValue; 2] = [&artist_id, &album_id];
+            self.db.execute(&sql, &params)?;
+            ecrit = true;
+        }
+        Ok(ecrit)
     }
 
     /// Répare le drapeau « compilation » et, s'il est donné, l'artiste d'un
@@ -2043,6 +2147,21 @@ impl AlbumRepo {
         Ok(())
     }
 
+    /// Remonte le label des pistes sur leur album — voir [`sql_label_repris_des_pistes`].
+    pub fn update_label_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
+        let sql = format!(
+            "UPDATE albums SET {} WHERE id = {}",
+            sql_label_repris_des_pistes(),
+            match self.db.engine() {
+                Engine::Sqlite => SqliteDialect.placeholder(1),
+                Engine::Postgres => PostgresDialect.placeholder(1),
+            }
+        );
+        let params: [&dyn ToSqlValue; 1] = [&album_id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {
         // 7 references to the same album_id parameter. SQLite uses `?`
         // for each; PG would use $1..$7 — we build the placeholder list
@@ -2082,6 +2201,8 @@ impl AlbumRepo {
             &album_id, &album_id, &album_id, &album_id, &album_id, &album_id, &album_id,
         ];
         self.db.execute(&sql, &params)?;
+        // #4836 : le label des pistes remonte avec le reste.
+        self.update_label_from_tracks(album_id)?;
         Ok(())
     }
 
@@ -4184,6 +4305,81 @@ mod tests {
             repo.get(album_id).unwrap().unwrap().genre.as_deref(),
             Some("Jazz"),
             "an already-empty album genre must be re-filled from a real track genre"
+        );
+    }
+
+    /// #4836 (Dominique Pamingle, fil 1899) — « mes balises LABEL sont bien
+    /// remplies, mais ne s'affichent pas ». Le scan range le label du fichier
+    /// sur la PISTE (`tracks.label`) ; l'onglet Labels et la recherche des
+    /// labels lisent l'ALBUM (`albums.label`). La remontée de fin de scan doit
+    /// donc porter le label des pistes jusqu'à l'album — par vote majoritaire,
+    /// une piste vide ne comptant pas — sans jamais écraser un label d'album
+    /// déjà posé (édition manuelle, enrichissement MusicBrainz).
+    #[test]
+    fn le_label_des_pistes_remonte_sur_l_album_sans_ecraser_4836() {
+        let db = test_db();
+        let artist_repo = ArtistRepo::new(db.clone());
+        let repo = AlbumRepo::new(db.clone());
+        let artist_id = artist_repo
+            .create(&Artist::new("Miles Davis".into()))
+            .unwrap();
+        let vide = repo
+            .get_or_create("Kind of Blue", artist_id, Some(1959))
+            .unwrap()
+            .id
+            .unwrap();
+        let pose = repo
+            .get_or_create("Bitches Brew", artist_id, Some(1970))
+            .unwrap()
+            .id
+            .unwrap();
+        let global = repo
+            .get_or_create("In a Silent Way", artist_id, Some(1969))
+            .unwrap()
+            .id
+            .unwrap();
+        db.execute_batch(&format!(
+            "UPDATE albums SET label = 'Sony Music' WHERE id = {pose};
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('So What', {vide}, {artist_id}, '');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Freddie', {vide}, {artist_id}, 'CBS');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Blue in Green', {vide}, {artist_id}, 'Columbia');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('All Blues', {vide}, {artist_id}, 'Columbia');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Pharaoh', {pose}, {artist_id}, 'Columbia');
+             INSERT INTO tracks (title, album_id, artist_id, label) VALUES ('Shhh', {global}, {artist_id}, 'Columbia');"
+        ))
+        .unwrap();
+
+        // Le chemin par album (scan automatique, veilleur, enrichissement).
+        repo.update_quality_from_tracks(vide).unwrap();
+        repo.update_quality_from_tracks(pose).unwrap();
+        assert_eq!(
+            repo.get(vide).unwrap().unwrap().label.as_deref(),
+            Some("Columbia"),
+            "#4836 — le label porté par les pistes doit remonter sur l'album \
+             (majorité, piste vide écartée) : c'est `albums.label` que lit \
+             l'onglet Labels"
+        );
+        assert_eq!(
+            repo.get(pose).unwrap().unwrap().label.as_deref(),
+            Some("Sony Music"),
+            "un label d'album déjà posé ne s'écrase pas"
+        );
+
+        // Le chemin global du scan manuel (`routes/system/scan.rs`), qui
+        // emploie le MÊME fragment SQL.
+        db.execute(
+            &format!("UPDATE albums SET {}", sql_label_repris_des_pistes()),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            repo.get(global).unwrap().unwrap().label.as_deref(),
+            Some("Columbia"),
+            "#4836 — la remontée globale de fin de scan manuel porte aussi le label"
+        );
+        assert_eq!(
+            repo.get(pose).unwrap().unwrap().label.as_deref(),
+            Some("Sony Music")
         );
     }
 

@@ -12,6 +12,14 @@ use tune_core::db::settings_repo::SettingsRepo;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Mise en file d'une piste d'album ou de playlist ; une piste deja en file
+/// est laissee telle quelle. #4983 : `INSERT OR IGNORE` est propre a SQLite et
+/// PostgreSQL le refusait — l'erreur etant avalee (`.ok()`), rien n'entrait en
+/// file. `ON CONFLICT … DO NOTHING` vaut pour les deux moteurs (SQLite >= 3.24),
+/// comme le `DO UPDATE` de la mise en file d'une piste seule.
+const SQL_METTRE_EN_FILE: &str = "INSERT INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) \
+     VALUES (?, ?, ?, ?, ?, ?, 'pending') ON CONFLICT (source, source_id) DO NOTHING";
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/status", get(offline_status))
@@ -365,17 +373,20 @@ async fn download_album_tracks(
                 if !track_id.is_empty() {
                     {
                         use tune_core::db::backend::ToSqlValue;
-                        state.backend.execute(
-                            "INSERT OR IGNORE INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                            &[
-                                &source as &dyn ToSqlValue,
-                                &track_id as &dyn ToSqlValue,
-                                &track["title"].as_str().unwrap_or("") as &dyn ToSqlValue,
-                                &track["artist"].as_str().unwrap_or("") as &dyn ToSqlValue,
-                                &track["album"].as_str().unwrap_or("") as &dyn ToSqlValue,
-                                &quality as &dyn ToSqlValue,
-                            ],
-                        ).ok();
+                        state
+                            .backend
+                            .execute(
+                                SQL_METTRE_EN_FILE,
+                                &[
+                                    &source as &dyn ToSqlValue,
+                                    &track_id as &dyn ToSqlValue,
+                                    &track["title"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                    &track["artist"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                    &track["album"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                    &quality as &dyn ToSqlValue,
+                                ],
+                            )
+                            .ok();
                     }
                     queued += 1;
                 }
@@ -415,17 +426,20 @@ async fn download_playlist_tracks(
                 if !track_id.is_empty() {
                     {
                         use tune_core::db::backend::ToSqlValue;
-                        state.backend.execute(
-                            "INSERT OR IGNORE INTO offline_cache (source, source_id, track_title, artist_name, album_title, quality, status) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                            &[
-                                &source as &dyn ToSqlValue,
-                                &track_id as &dyn ToSqlValue,
-                                &track["title"].as_str().unwrap_or("") as &dyn ToSqlValue,
-                                &track["artist"].as_str().unwrap_or("") as &dyn ToSqlValue,
-                                &track["album"].as_str().unwrap_or("") as &dyn ToSqlValue,
-                                &quality as &dyn ToSqlValue,
-                            ],
-                        ).ok();
+                        state
+                            .backend
+                            .execute(
+                                SQL_METTRE_EN_FILE,
+                                &[
+                                    &source as &dyn ToSqlValue,
+                                    &track_id as &dyn ToSqlValue,
+                                    &track["title"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                    &track["artist"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                    &track["album"].as_str().unwrap_or("") as &dyn ToSqlValue,
+                                    &quality as &dyn ToSqlValue,
+                                ],
+                            )
+                            .ok();
                     }
                     queued += 1;
                 }

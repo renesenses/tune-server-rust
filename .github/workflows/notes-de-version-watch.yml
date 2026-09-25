@@ -35,8 +35,13 @@ on:
   pull_request:
     paths:
       - ".github/scripts/notes-de-version-watch.sh"
+      - ".github/scripts/forme-des-notes.awk"
       - "scripts/test-notes-de-version-watch.sh"
+      - "scripts/test-forme-des-notes.sh"
       - ".github/workflows/notes-de-version-watch.yml"
+      # Le lecteur awk est une copie gardee de `parse_release_body` : une
+      # retouche du Rust doit rejouer la comparaison des tables.
+      - "tune-server/src/routes/system/update.rs"
 
 permissions:
   contents: read
@@ -59,6 +64,25 @@ jobs:
       - uses: actions/checkout@v4
       - name: Rejouer le décor du 20/09/2026
         run: bash scripts/test-notes-de-version-watch.sh
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # La contre-épreuve de la FORME (#4190). Un fil qui existe ne prouve pas
+  # qu'on y lit quelque chose : le 23/09/2026, les vingt entrées du panneau de
+  # mise à jour étaient réduites à « Release 0.9.x », toutes annoncées, toutes
+  # vertes pour la sonde. Le banc montre le rouge sur une note en prose et le
+  # vert sur la même note en puces — même décor, même fil, seul le corps
+  # change — et vérifie que les tables de mots-clés du lecteur `awk` n'ont pas
+  # dérivé de celles du serveur.
+  # ───────────────────────────────────────────────────────────────────────────
+  forme:
+    name: Contre-épreuve de la forme des notes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prose refusée, puces acceptées
+        run: bash scripts/test-forme-des-notes.sh
 
   veille:
     name: Versions publiees sans note de version

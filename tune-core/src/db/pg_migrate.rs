@@ -171,6 +171,11 @@ const MIGRATION_TABLES: &[&str] = &[
     // l'utilisateur a fait taire réapparaîtraient à la bascule
     // SQLite → PostgreSQL.
     "ignored_devices",
+    // Dossiers de collections (#4853). Sans ces deux lignes, tout le
+    // rangement de l'utilisateur serait perdu a la bascule SQLite ->
+    // PostgreSQL — les collections, elles, passent (reglage + table).
+    "collection_folders",
+    "collection_folder_items",
     "album_ratings",
     "smart_playlists",
     "smart_collections",
@@ -268,7 +273,10 @@ CREATE TABLE IF NOT EXISTS albums (
     -- Type de sortie MusicBrainz (#4767) : `album`, `ep`, `single`,
     -- `broadcast`, `other`. TEXT des DEUX côtés — c'est un mot, pas un
     -- booléen — donc rien à reconvertir après la copie. NUL = inconnu.
-    release_type TEXT
+    release_type TEXT,
+    -- Curseur de la passe des crédits MusicBrainz (#4767). NUL = jamais
+    -- interrogé.
+    credits_mb_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -320,7 +328,8 @@ CREATE TABLE IF NOT EXISTS track_credits (
     artist_name TEXT NOT NULL,
     role TEXT DEFAULT 'performer',
     instrument TEXT,
-    position TEXT DEFAULT 0
+    position TEXT DEFAULT 0,
+    artist_mbid TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_metadata (
@@ -357,11 +366,22 @@ CREATE TABLE IF NOT EXISTS playlists (
     profile_id TEXT NOT NULL DEFAULT '1'
 );
 
+-- #4889 : `track_id` nul pour un titre de service, porte par `source` /
+-- `source_id` et ses colonnes d'affichage (migration PG 072, SQLite 109).
+-- Tout en TEXT comme le reste de ce schema : la 072 convertit `duration_ms`.
 CREATE TABLE IF NOT EXISTS playlist_tracks (
     id TEXT PRIMARY KEY,
     playlist_id TEXT NOT NULL,
-    track_id TEXT NOT NULL,
-    position TEXT NOT NULL DEFAULT 0
+    track_id TEXT,
+    position TEXT NOT NULL DEFAULT 0,
+    source TEXT,
+    source_id TEXT,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    duration_ms TEXT,
+    cover_url TEXT
 );
 
 CREATE SEQUENCE IF NOT EXISTS zones_id_seq;
@@ -593,6 +613,25 @@ CREATE TABLE IF NOT EXISTS ignored_devices (
     name TEXT NOT NULL DEFAULT '',
     device_type TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+
+-- Dossiers de collections (#4853). Tout en TEXT, comme le reste de ce
+-- schéma : la copie lie chaque valeur SQLite en texte. La migration 071
+-- convertit ensuite les colonnes entières en BIGINT (conversion gardée sur le
+-- type courant, patron 038).
+CREATE TABLE IF NOT EXISTS collection_folders (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    parent_id TEXT,
+    position TEXT NOT NULL DEFAULT '0',
+    created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+);
+CREATE TABLE IF NOT EXISTS collection_folder_items (
+    kind TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    folder_id TEXT,
+    position TEXT NOT NULL DEFAULT '0',
+    PRIMARY KEY (kind, collection_id)
 );
 
 CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq;
@@ -876,6 +915,7 @@ CREATE INDEX IF NOT EXISTS idx_tracks_file_path ON tracks(file_path);
 CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks(artist_id);
 CREATE INDEX IF NOT EXISTS idx_tracks_audio_hash ON tracks(audio_hash);
+CREATE INDEX IF NOT EXISTS idx_tracks_source_source_id ON tracks(source, source_id);
 CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_track_id ON track_credits(track_id);
 CREATE INDEX IF NOT EXISTS idx_track_credits_artist_id ON track_credits(artist_id);
@@ -962,6 +1002,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS is_compilation TEXT DEFAULT 0;
 -- défaut : NUL veut dire « inconnu », et c'est l'état normal — la couverture
 -- MBID mesurée est de 0,9 % sur le .18. `select_album` NOMME cette colonne.
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
+
+-- Crédits MusicBrainz par disque (SQLite migration v107, #4767) : l'artiste
+-- crédité par son MBID, et le curseur de reprise de la passe.
+ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
 
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;
@@ -1241,6 +1286,8 @@ async fn migrate_table(sqlite_db: &SqliteDb, pool: &PgPool, table: &str) -> Resu
         "upnp_library_sources" => "ON CONFLICT (source_key) DO NOTHING",
         "upnp_library_members" => "ON CONFLICT (source_key, track_id) DO NOTHING",
         "media_servers" => "ON CONFLICT (udn) DO NOTHING",
+        // Pas de colonne `id` : la clef primaire est la paire (#4853).
+        "collection_folder_items" => "ON CONFLICT (kind, collection_id) DO NOTHING",
         "album_ratings" => "ON CONFLICT (album_id, profile_id) DO NOTHING",
         "offline_cache" => "ON CONFLICT (source, source_id) DO NOTHING",
         "track_source_links" => "ON CONFLICT (track_id, service) DO NOTHING",

@@ -64,6 +64,129 @@ fn public(s: &Source) -> Value {
         "last_success": s.last_success, "report": s.report, "generation": s.generation,
         "pending_count": s.pending.len()})
 }
+
+/// L'état d'import des sources UPnP synchronisées, tel que `/library/stats`
+/// le porte dans son champ additif `upnp_import`.
+///
+/// `library/stats` annonçait le nombre de pistes UPnP importées sans réserve,
+/// alors que le dernier bilan de chaque source SAIT si l'import est complet :
+/// mesuré sur le .18 le 24/09, 49 395 pistes importées sur 50 772, plafond de
+/// 1 000 conteneurs atteint, 34 paginations interrompues — et l'écran n'en
+/// disait rien. Rien n'est recalculé ici : c'est le bilan persisté de la
+/// dernière passe (`report`), lu tel quel.
+///
+/// Une erreur de lecture ne fait pas tomber la route qui l'appelle : elle rend
+/// `null`, et les compteurs existants continuent de répondre.
+pub(crate) fn etat_d_import(db: &dyn DbBackend) -> Value {
+    let Ok(toutes) = sources(db) else {
+        return Value::Null;
+    };
+    let mut par_source = Vec::new();
+    let mut raisons = Vec::new();
+    let mut plafonds: Vec<String> = Vec::new();
+    let (mut erreurs, mut interrompues, mut incompletes) = (0usize, 0usize, 0usize);
+    let (mut distinctes, mut vus, mut visites, mut sans_url) = (0u64, 0u64, 0u64, 0u64);
+    for s in &toutes {
+        let r = &s.report;
+        let complet = r["complet"] == true;
+        let liste_erreurs: Vec<&str> = r["erreurs"]
+            .as_array()
+            .map(|e| e.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let nb_interrompues = liste_erreurs
+            .iter()
+            .filter(|e| e.contains("pagination interrompue"))
+            .count();
+        let plafond = r["parcours"]["plafond_atteint"].as_str();
+        let n = |v: &Value| v.as_u64().unwrap_or(0);
+        let ecartees = n(&r["pistes"]["ecartees_sans_url_de_lecture"]);
+        let raison = if complet {
+            None
+        } else if let Some(e) = r["error"].as_str() {
+            Some(e.to_string())
+        } else if r["indexe"] == false {
+            Some(
+                r["detail"]
+                    .as_str()
+                    .or(r["raison"].as_str())
+                    .unwrap_or("source indisponible")
+                    .to_string(),
+            )
+        } else if r.get("complet").is_none() {
+            Some("aucun import terminé pour cette source".to_string())
+        } else {
+            let mut morceaux = Vec::new();
+            if let Some(message) = r["parcours"]["plafond"]["message"].as_str() {
+                morceaux.push(message.to_string());
+            } else if let Some(nature) = plafond {
+                morceaux.push(format!("plafond de {nature} atteint"));
+            }
+            if nb_interrompues > 0 {
+                morceaux.push(format!("{nb_interrompues} pagination(s) interrompue(s)"));
+            }
+            let autres = liste_erreurs.len() - nb_interrompues;
+            if autres > 0 {
+                morceaux.push(format!("{autres} autre(s) erreur(s) de parcours"));
+            }
+            if ecartees > 0 {
+                morceaux.push(format!(
+                    "{ecartees} piste(s) écartée(s) sans URL de lecture"
+                ));
+            }
+            if morceaux.is_empty() {
+                morceaux.push("dernier bilan incomplet".to_string());
+            }
+            Some(morceaux.join(" ; "))
+        };
+        if let Some(raison) = &raison {
+            incompletes += 1;
+            raisons.push(format!("{} : {raison}", s.name));
+        }
+        if let Some(nature) = plafond {
+            if !plafonds.iter().any(|p| p == nature) {
+                plafonds.push(nature.to_string());
+            }
+        }
+        erreurs += liste_erreurs.len();
+        interrompues += nb_interrompues;
+        distinctes += n(&r["pistes"]["distinctes"]);
+        vus += n(&r["parcours"]["items_vus"]);
+        visites += n(&r["parcours"]["conteneurs_visites"]);
+        sans_url += ecartees;
+        par_source.push(json!({
+            "key": s.key,
+            "name": s.name,
+            "udn": s.udn,
+            "container": s.container,
+            "status": s.status,
+            "last_attempt": s.last_attempt,
+            "last_success": s.last_success,
+            "complet": raison.is_none(),
+            "raison": raison,
+            "plafond_atteint": plafond,
+            "erreurs": liste_erreurs.len(),
+            "paginations_interrompues": nb_interrompues,
+            "pistes_distinctes": r["pistes"]["distinctes"],
+            "items_vus": r["parcours"]["items_vus"],
+            "conteneurs_visites": r["parcours"]["conteneurs_visites"],
+        }));
+    }
+    json!({
+        "sources": toutes.len(),
+        // Sans source, il n'y a pas d'import à juger : ni complet ni incomplet.
+        "complet": if toutes.is_empty() { Value::Null } else { json!(incompletes == 0) },
+        "sources_incompletes": incompletes,
+        "raisons": raisons,
+        "plafonds_atteints": plafonds,
+        "erreurs": erreurs,
+        "paginations_interrompues": interrompues,
+        "pistes_distinctes": distinctes,
+        "items_vus": vus,
+        "conteneurs_visites": visites,
+        "ecartees_sans_url_de_lecture": sans_url,
+        "par_source": par_source,
+    })
+}
 pub async fn list(State(state): State<AppState>) -> ApiResult {
     Ok(Json(
         json!({"items": sources(state.backend.as_ref()).map_err(error)?.iter().map(public).collect::<Vec<_>>()}),
@@ -193,7 +316,9 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
                     Json(json!({"error": "Bilan expiré : relancez la synchronisation."})),
                 ));
             }
-            let removed = remove_missing(&state, &source, true).map_err(error)?;
+            let removed = hors_executeur(&state, &source, |db, s| remove_missing(db, s, true))
+                .await
+                .map_err(error)?;
             source.report["supprimees"] = json!(removed);
             source.pending.clear();
             source.status = "ready".into();
@@ -214,6 +339,19 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
         });
     }
     Ok(Json(result))
+}
+
+/// Le travail SQL d'une source sur le pool de fils bloquants de Tokio (#4924) :
+/// ni la lecture des liens ni le retrait ne tiennent un fil de l'exécuteur.
+async fn hors_executeur<T: Send + 'static>(
+    state: &AppState,
+    source: &Source,
+    f: impl FnOnce(&dyn DbBackend, &Source) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (db, source) = (state.backend.clone(), source.clone());
+    tokio::task::spawn_blocking(move || f(db.as_ref(), &source))
+        .await
+        .map_err(|e| format!("tâche de synchronisation perdue : {e}"))?
 }
 
 fn member_ids(tx: &dyn DbTxHandle, key: &str) -> Result<Vec<i64>, String> {
@@ -240,23 +378,26 @@ fn liens_utilisateur_sql(ids: &str) -> String {
     )
 }
 
-fn retrait_avec_liens(state: &AppState, source: &Source) -> Result<bool, String> {
+fn retrait_avec_liens(db: &dyn DbBackend, source: &Source) -> Result<bool, String> {
     for ids in source.pending.chunks(500) {
         let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-        if state
-            .backend
-            .query_one(&liens_utilisateur_sql(&ids), &[])?
-            .is_some()
-        {
+        if db.query_one(&liens_utilisateur_sql(&ids), &[])?.is_some() {
             return Ok(true);
         }
     }
     Ok(false)
 }
 
-fn remove_missing(state: &AppState, source: &Source, confirme: bool) -> Result<usize, String> {
+/// Le retrait reste UNE transaction : un lien utilisateur découvert en cours
+/// de route doit restituer toutes les appartenances déjà retirées (témoin
+/// `identites_upnp_tests`). Ses recherches par piste passent par des index
+/// (`tracks.id`, clé primaire et `idx_upnp_library_members_track`) : pas de
+/// parcours de table par élément comme celui de #4924. Appelée hors de
+/// l'exécuteur (`hors_executeur`).
+fn remove_missing(db: &dyn DbBackend, source: &Source, confirme: bool) -> Result<usize, String> {
     let mut removed = 0;
-    state.backend.write_tx(&mut |tx| {
+    let prefixe = format!("{}|", source.udn);
+    db.write_tx(&mut |tx| {
         let owned: std::collections::HashSet<i64> = member_ids(tx, &source.key)?.into_iter().collect();
         for id in &source.pending {
             if !owned.contains(id) { continue; }
@@ -265,7 +406,7 @@ fn remove_missing(state: &AppState, source: &Source, confirme: bool) -> Result<u
             // A refreshed member must not be removed by an earlier proposal.
             if tx.query_one("SELECT track_id FROM upnp_library_members WHERE track_id = ?", &[id])?.is_some() { continue; }
             let row = tx.query_one("SELECT source, source_id FROM tracks WHERE id = ?", &[id])?;
-            let ours = row.is_some_and(|r| r[0].as_str() == Some("upnp") && r[1].as_str().is_some_and(|s| s.starts_with(&format!("{}|", source.udn))));
+            let ours = row.is_some_and(|r| r[0].as_str() == Some("upnp") && r[1].as_str().is_some_and(|s| s.starts_with(&prefixe)));
             if ours {
                 // Revalider dans la transaction : un favori/une playlist a pu
                 // être ajouté depuis le bilan. Une erreur annule aussi le
@@ -279,7 +420,7 @@ fn remove_missing(state: &AppState, source: &Source, confirme: bool) -> Result<u
         // Only empty remote albums of THIS server. Local albums are untouched.
         let albums = tx.query_many("SELECT id, source_id FROM albums WHERE source = 'upnp' AND NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = albums.id)", &[])?;
         for row in albums {
-            if row[1].as_str().is_some_and(|s| s.starts_with(&format!("{}|", source.udn))) {
+            if row[1].as_str().is_some_and(|s| s.starts_with(&prefixe)) {
                 let id = row[0].as_i64().ok_or("album sans identifiant")?;
                 tx.execute("DELETE FROM albums WHERE id = ? AND source = 'upnp' AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.item_type = 'album' AND f.item_id = CAST(albums.id AS TEXT))", &[&id])?;
             }
@@ -289,64 +430,205 @@ fn remove_missing(state: &AppState, source: &Source, confirme: bool) -> Result<u
     Ok(removed)
 }
 
+/// Ce que l'enregistrement des membres d'une passe rend à `run_one`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MembresDeLaPasse {
+    /// Membres de la source AVANT la passe (orphelins retirés) : la base du
+    /// seuil de 20 % qui impose une confirmation.
+    pub(crate) avant: usize,
+    /// Les membres absents de cette génération, calculés seulement sur un
+    /// Browse complet.
+    pub(crate) pending: Option<Vec<i64>>,
+}
+
+/// Taille d'un lot d'écritures d'appartenance : le verrou d'écriture est
+/// relâché entre deux lots.
+pub(crate) const MEMBRES_PAR_LOT: usize = 1_000;
+/// Le temps laissé aux autres écrivains entre deux lots.
+const PAUSE_ENTRE_LOTS: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Rattache chaque identité indexée à la source, sous la nouvelle génération.
+///
+/// Synchrone : `run_one` l'appelle par `spawn_blocking`, jamais sur un fil de
+/// l'exécuteur.
+///
+/// 🔴 #4924 — c'était UNE transaction qui, pour chaque identité, cherchait
+/// `tracks WHERE source = 'upnp' AND source_id = ?`. Aucun index ne porte
+/// `(source, source_id)` : chaque recherche parcourait toutes les pistes UPnP.
+/// Sur le .18, 49 440 identités, soit ≈ 2,4 × 10⁹ lignes lues sous le verrou
+/// d'écriture : 271 s de détention relevées par la sentinelle de #4945, et le
+/// serveur figé toutes les heures.
+///
+/// Trois temps désormais :
+///
+/// 1. une transaction courte retire les orphelins, compte les membres
+///    d'avant et lit en UNE requête la table `source_id → id` des pistes
+///    UPnP. Toutes les identités sont résolues en mémoire AVANT la moindre
+///    écriture : une identité introuvable échoue sans avoir rien écrit, comme
+///    le faisait l'annulation de l'ancienne transaction unique ;
+/// 2. les appartenances s'écrivent par lots de [`MEMBRES_PAR_LOT`], une
+///    transaction par lot. Un lot partiellement appliqué n'autorise aucun
+///    retrait : la passe échoue avant l'étape 3, `run_one` passe la source en
+///    `error` et vide `pending` ; la passe suivante tire une nouvelle
+///    génération et réécrit chaque membre vu ;
+/// 3. une transaction finale, atomique, retire à nouveau les orphelins (une
+///    piste a pu être supprimée entre deux lots) puis calcule `pending` sur
+///    l'état complet de la génération.
+///
+/// Les écrivains concurrents de `upnp_library_members` (abonnement, action,
+/// retrait) passent tous par `upnp_index_lock`, tenu par `run_one` pendant
+/// les trois temps : le découpage ne les laisse pas s'intercaler.
+pub(crate) fn enregistrer_les_membres(
+    db: &dyn DbBackend,
+    key: &str,
+    generation: &str,
+    identites: &[String],
+    complete: bool,
+) -> Result<MembresDeLaPasse, String> {
+    const ORPHELINS: &str = "DELETE FROM upnp_library_members WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.id = upnp_library_members.track_id)";
+    let mut avant = 0;
+    let mut par_identite: std::collections::HashMap<String, i64> = Default::default();
+    db.write_tx(&mut |tx| {
+        // The conversion schema temporarily uses TEXT track IDs, so the
+        // membership table cannot declare that FK at creation time.
+        // Clean up removed tracks explicitly before computing percentages.
+        tx.execute(ORPHELINS, &[])?;
+        avant = member_ids(tx, key)?.len();
+        par_identite = tx
+            .query_many(
+                "SELECT id, source_id FROM tracks WHERE source = 'upnp' AND source_id IS NOT NULL",
+                &[],
+            )?
+            .iter()
+            .filter_map(|r| Some((r[1].as_str()?.to_string(), r[0].as_i64()?)))
+            .collect();
+        Ok(())
+    })?;
+    let ids = identites
+        .iter()
+        .map(|i| {
+            par_identite
+                .get(i)
+                .copied()
+                .ok_or("piste indexée introuvable")
+        })
+        .collect::<Result<Vec<i64>, _>>()?;
+    drop(par_identite);
+    for (n, lot) in ids.chunks(MEMBRES_PAR_LOT).enumerate() {
+        // Relâcher ne suffit pas : le `Mutex` de la connexion n'est pas
+        // équitable, et reprendre aussitôt le verrou l'arrache à l'écrivain
+        // qui attendait. Mesuré : sans cette pause, 20 000 membres tenaient
+        // encore les autres écrivains 430 ms d'affilée ; avec elle, un lot.
+        if n > 0 {
+            std::thread::sleep(PAUSE_ENTRE_LOTS);
+        }
+        db.write_tx(&mut |tx| {
+            for id in lot {
+                tx.execute("INSERT INTO upnp_library_members (source_key, track_id, generation) VALUES (?, ?, ?) ON CONFLICT(source_key, track_id) DO UPDATE SET generation = excluded.generation",
+                    &[&key, id, &generation])?;
+            }
+            Ok(())
+        })?;
+    }
+    let mut pending = None;
+    if complete {
+        db.write_tx(&mut |tx| {
+            tx.execute(ORPHELINS, &[])?;
+            pending = Some(tx.query_many("SELECT track_id FROM upnp_library_members WHERE source_key = ? AND generation <> ?", &[&key, &generation])?
+                .iter().filter_map(|r| r[0].as_i64()).collect());
+            Ok(())
+        })?;
+    }
+    Ok(MembresDeLaPasse { avant, pending })
+}
+
 async fn run_one(state: AppState, key: String) {
     let _guard = state.upnp_index_lock.lock().await;
     let result = async {
-        let Some(mut source) = sources(state.backend.as_ref())?.into_iter().find(|s| s.key == key) else { return Ok::<(), String>(()); };
-        if !source.enabled || source.status == "confirmation" { return Ok(()); }
+        let Some(mut source) = sources(state.backend.as_ref())?
+            .into_iter()
+            .find(|s| s.key == key)
+        else {
+            return Ok::<(), String>(());
+        };
+        if !source.enabled || source.status == "confirmation" {
+            return Ok(());
+        }
         // A queued duplicate does not run again after the first has finished.
         let now = now_seconds();
-        if source.status != "pending" && now - source.last_attempt < 3600 { return Ok(()); }
+        if source.status != "pending" && now - source.last_attempt < 3600 {
+            return Ok(());
+        }
         source.status = "running".into();
         source.last_attempt = now;
         source.generation = uuid::Uuid::new_v4().to_string();
         source.pending.clear();
         save(state.backend.as_ref(), &source)?;
         super::network::synchroniser_le_registre(&state).await;
-        let Json(mut report) = tokio::time::timeout(std::time::Duration::from_secs(1800), indexer(&state, &source.udn, DemandeIndexation {
-            conteneur: Some(source.container.clone()), profondeur_max: None, max_conteneurs: None, max_pistes: None,
-        })).await.map_err(|_| "Synchronisation interrompue après 30 minutes ; aucun retrait autorisé")?;
-        let identities = report.as_object_mut().and_then(|r| r.remove("identites")).unwrap_or(json!([]));
+        let Json(mut report) = tokio::time::timeout(
+            std::time::Duration::from_secs(1800),
+            indexer(
+                &state,
+                &source.udn,
+                DemandeIndexation {
+                    conteneur: Some(source.container.clone()),
+                    profondeur_max: None,
+                    max_conteneurs: None,
+                    max_pistes: None,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| "Synchronisation interrompue après 30 minutes ; aucun retrait autorisé")?;
+        let identities = report
+            .as_object_mut()
+            .and_then(|r| r.remove("identites"))
+            .unwrap_or(json!([]));
         let complete = report["complet"] == true;
-        let mut prior_count = 0;
-        state.backend.write_tx(&mut |tx| {
-            // The conversion schema temporarily uses TEXT track IDs, so the
-            // membership table cannot declare that FK at creation time.
-            // Clean up removed tracks explicitly before computing percentages.
-            tx.execute("DELETE FROM upnp_library_members WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.id = upnp_library_members.track_id)", &[])?;
-            prior_count = member_ids(tx, &source.key)?.len();
-            for identity in identities.as_array().ok_or("identités invalides")? {
-                let identity = identity.as_str().ok_or("identité invalide")?;
-                let row = tx.query_one("SELECT id FROM tracks WHERE source = 'upnp' AND source_id = ?", &[&identity])?
-                    .ok_or("piste indexée introuvable")?;
-                let id = row[0].as_i64().ok_or("identifiant de piste invalide")?;
-                tx.execute("INSERT INTO upnp_library_members (source_key, track_id, generation) VALUES (?, ?, ?) ON CONFLICT(source_key, track_id) DO UPDATE SET generation = excluded.generation",
-                    &[&source.key, &id, &source.generation])?;
-            }
-            if complete {
-                source.pending = tx.query_many("SELECT track_id FROM upnp_library_members WHERE source_key = ? AND generation <> ?", &[&source.key, &source.generation])?
-                    .iter().filter_map(|r| r[0].as_i64()).collect();
-            }
-            Ok(())
-        })?;
+        let identites: Vec<String> = identities
+            .as_array()
+            .ok_or("identités invalides")?
+            .iter()
+            .map(|i| i.as_str().map(str::to_string).ok_or("identité invalide"))
+            .collect::<Result<_, _>>()?;
+        let (cle, generation) = (source.key.clone(), source.generation.clone());
+        let membres = hors_executeur(&state, &source, move |db, _| {
+            enregistrer_les_membres(db, &cle, &generation, &identites, complete)
+        })
+        .await?;
+        let prior_count = membres.avant;
+        if let Some(pending) = membres.pending {
+            source.pending = pending;
+        }
         source.report = report;
         if complete {
             source.last_success = Some(now);
-            let liens = retrait_avec_liens(&state, &source)?;
+            let liens = hors_executeur(&state, &source, |db, s| retrait_avec_liens(db, s)).await?;
             source.report["retrait_avec_liens_utilisateur"] = json!(liens);
-            if !source.pending.is_empty() && (liens || source.pending.len().saturating_mul(100) > prior_count.saturating_mul(20)) {
+            if !source.pending.is_empty()
+                && (liens
+                    || source.pending.len().saturating_mul(100) > prior_count.saturating_mul(20))
+            {
                 source.status = "confirmation".into();
             } else {
-                source.report["supprimees"] = json!(remove_missing(&state, &source, false)?);
+                source.report["supprimees"] = json!(
+                    hors_executeur(&state, &source, |db, s| remove_missing(db, s, false)).await?
+                );
                 source.pending.clear();
                 source.status = "ready".into();
             }
         } else {
-            source.status = if source.report["indexe"] == true { "partial" } else { "unavailable" }.into();
+            source.status = if source.report["indexe"] == true {
+                "partial"
+            } else {
+                "unavailable"
+            }
+            .into();
         }
         save(state.backend.as_ref(), &source)?;
         Ok(())
-    }.await;
+    }
+    .await;
     if let Err(e) = result {
         tracing::error!(source = %key, error = %e, "upnp_sync_failed");
         if let Ok(all) = sources(state.backend.as_ref()) {
@@ -390,6 +672,10 @@ pub fn start(state: AppState) {
 }
 
 #[cfg(test)]
+#[path = "synchronisation_upnp_tests_4924.rs"]
+mod synchronisation_upnp_tests_4924;
+
+#[cfg(test)]
 mod identites_upnp_tests {
     use super::*;
     use tune_core::db::{
@@ -430,7 +716,7 @@ mod identites_upnp_tests {
             };
             save(state.backend.as_ref(), &source).unwrap();
             state.backend.execute("INSERT INTO upnp_library_members (source_key,track_id,generation) VALUES ('s',?,'old')", &[&id]).unwrap();
-            assert!(!retrait_avec_liens(&state, &source).unwrap());
+            assert!(!retrait_avec_liens(state.backend.as_ref(), &source).unwrap());
             if nature == "playlist" {
                 let playlists = PlaylistRepo::with_backend(state.backend.clone());
                 let pid = playlists.create("Garder", None, 1).unwrap();
@@ -446,11 +732,11 @@ mod identites_upnp_tests {
                     .unwrap();
             }
             assert!(
-                retrait_avec_liens(&state, &source).unwrap(),
+                retrait_avec_liens(state.backend.as_ref(), &source).unwrap(),
                 "un lien {nature} impose une confirmation"
             );
             assert!(
-                remove_missing(&state, &source, false).is_err(),
+                remove_missing(state.backend.as_ref(), &source, false).is_err(),
                 "le retrait automatique doit refuser le lien {nature}"
             );
             assert!(tracks.get(id).unwrap().is_some());
@@ -465,7 +751,7 @@ mod identites_upnp_tests {
                 "la transaction restitue l'appartenance"
             );
             assert_eq!(
-                remove_missing(&state, &source, true).unwrap(),
+                remove_missing(state.backend.as_ref(), &source, true).unwrap(),
                 1,
                 "la confirmation explicite reste possible"
             );

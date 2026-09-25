@@ -370,6 +370,8 @@ pub(super) struct BackendCpal<'a> {
     stream: cpal::Stream,
     anneau: Arc<RingBuf>,
     sortie: FormatOuvert,
+    /// #4953 — voir [`BackendCpal::suit_la_cadence_source`].
+    suit_la_cadence_source: bool,
     device_name: String,
     stop_rx: &'a std::sync::mpsc::Receiver<()>,
     paused: &'a AtomicBool,
@@ -377,6 +379,29 @@ pub(super) struct BackendCpal<'a> {
     device_gone: Arc<AtomicBool>,
     starvation: Arc<RingStarvation>,
     position_ms: &'a AtomicU64,
+}
+
+impl BackendCpal<'_> {
+    /// #4953 — le périphérique a-t-il prouvé, à cette ouverture, qu'il suit
+    /// la cadence de la source ? Vrai seulement quand sa liste de cadences est
+    /// une MESURE (ALSA `hw:`, ASIO, CoreAudio, JACK — jamais un greffon qui
+    /// accepte tout) ET que le flux a été ouvert à la cadence de la source.
+    ///
+    /// C'est ce qui fait, à une frontière gapless qui change de cadence,
+    /// rouvrir le périphérique plutôt que convertir en silence : l'ouverture
+    /// suivante jugera la nouvelle cadence contre le matériel réel.
+    pub(super) fn suit_la_cadence_source(&self) -> bool {
+        self.suit_la_cadence_source
+    }
+}
+
+/// #4953 — la règle de [`BackendCpal::suit_la_cadence_source`], sans cpal.
+pub(super) fn suit_la_cadence_source(
+    cadences_mesurees: bool,
+    source_sr: u32,
+    ouverte_sr: u32,
+) -> bool {
+    cadences_mesurees && source_sr != 0 && source_sr == ouverte_sr
 }
 
 impl<'a> BackendLocal<'a> for BackendCpal<'a> {
@@ -448,6 +473,9 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
         // d'echec qui en a besoin est 300 lignes plus bas.
         #[cfg(target_os = "linux")]
         let pcm_ouvert = device.id().map(|id| id.to_string()).unwrap_or_default();
+        // #4953 — la liste de cadences de CE périphérique est-elle une mesure ?
+        // Retenu hors du bloc de décision, comme `pcm_ouvert`.
+        let cadences_mesurees: bool;
         let output_config = {
             // First, get the device's default config (reflects actual
             // operating rate on most platforms).
@@ -502,6 +530,7 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             let opened_endpoint_id = device.id().map(|id| id.to_string()).unwrap_or_default();
             let rate_evidence =
                 sample_rate_evidence_for_device(host_id_name, &opened_endpoint_id, true);
+            cadences_mesurees = rate_evidence.is_measured();
             let decision = decide_local_rate_opening(
                 sample_rate,
                 default_sr,
@@ -860,6 +889,11 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
             stream,
             anneau: ring,
             sortie: FormatOuvert::new(actual_config.sample_rate, actual_config.channels),
+            suit_la_cadence_source: suit_la_cadence_source(
+                cadences_mesurees,
+                sample_rate,
+                actual_config.sample_rate,
+            ),
             device_name,
             stop_rx: demande.stop_rx,
             paused: demande.paused.as_ref(),

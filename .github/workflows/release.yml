@@ -173,7 +173,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -184,7 +184,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -372,7 +372,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -386,12 +386,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -923,6 +923,11 @@ jobs:
           mv "$APP/Contents/MacOS/Tune Server.app/Contents/MacOS/applet" "$APP/Contents/MacOS/Tune Server"
           mv "$APP/Contents/MacOS/Tune Server.app/Contents/Resources/Scripts" "$APP/Contents/Resources/Scripts"
           rm -rf "$APP/Contents/MacOS/Tune Server.app"
+          # #4949 — sans NSLocalNetworkUsageDescription ni NSBonjourServices,
+          # macOS 15+ n'inscrit pas l'app dans « Réseau local » : la permission
+          # ne peut pas être accordée, et tout le LAN tombe en os error 65
+          # (Cyrille, #4580). Chaque type Bonjour du serveur doit y figurer :
+          # tune-server/tests/reseau_local_macos_4949.rs les compare au code.
           cat > "$APP/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -938,6 +943,22 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>LSUIElement</key><true/>
             <key>NSAppleScriptEnabled</key><true/>
+            <key>NSLocalNetworkUsageDescription</key><string>Tune trouve et pilote vos appareils audio (DLNA, AirPlay, Chromecast) sur le réseau local. Tune finds and controls your audio devices on the local network.</string>
+            <key>NSBonjourServices</key>
+            <array>
+              <string>_airplay._tcp</string>
+              <string>_raop._tcp</string>
+              <string>_googlecast._tcp</string>
+              <string>_sendspin._tcp</string>
+              <string>_sendspin-server._tcp</string>
+              <string>_oaat._tcp</string>
+              <string>_tune-server._tcp</string>
+              <string>_smb._tcp</string>
+              <string>_slimcli._tcp</string>
+              <string>_musc._tcp</string>
+              <string>_musp._tcp</string>
+              <string>_musz._tcp</string>
+            </array>
           </dict>
           </plist>
           PLIST

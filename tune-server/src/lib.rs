@@ -17,6 +17,8 @@ pub mod catalogue_services;
 pub mod chemin_inaccessible;
 pub mod config;
 pub mod discovery_setup;
+/// Détecteur de gel de l'exécuteur et relevé automatique (#4924).
+pub mod gel_executeur;
 pub use tune_http_types::error;
 pub mod i18n;
 pub mod journal;

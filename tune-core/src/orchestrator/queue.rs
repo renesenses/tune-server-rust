@@ -1,11 +1,24 @@
 use super::*;
 
+/// Verdict de [`PlaybackOrchestrator::enjamber_les_pistes_bannies`] (#4806).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Enjambee {
+    /// La ligne visée n'est pas bannie : l'appelant garde sa position.
+    Rien,
+    /// Des lignes bannies ont été sautées ; reprendre à cette position.
+    Reprise(i64),
+    /// Tout ce qui restait était banni : la file est finie.
+    FileEpuisee,
+}
+
 impl PlaybackOrchestrator {
     /// Remove any gapless-prepared stream session for a zone.
     /// Called when a zone starts a new track or stops, so the
     /// previously prepared session doesn't leak.
     pub(super) async fn cleanup_gapless_session(&self, zone_id: i64) {
         let old_sid = self.gapless_sessions.lock().await.remove(&zone_id);
+        // #3365 — la qualité rangée avec ce flux part avec lui.
+        self.ranger_la_qualite_pre_armee(zone_id, None).await;
         if let Some(ref sid) = old_sid {
             self.streamer.remove_session(sid).await;
             debug!(zone_id, stream_id = %sid, "gapless_session_cleaned_up");
@@ -457,6 +470,68 @@ impl PlaybackOrchestrator {
         Some((p, cible))
     }
 
+    /// #4806 — une file déjà constituée n'est PAS purgée quand un titre est
+    /// banni : la piste est SAUTÉE quand la lecture y arrive. Depuis
+    /// `position`, enjambe d'un coup les lignes locales bannies pour le
+    /// profil actif du serveur et dit où reprendre.
+    ///
+    /// Ne s'appelle que sur une TRANSITION automatique (fin de piste,
+    /// « suivant ») — jamais sur un `play_from_queue` demandé par un clic :
+    /// un titre banni reste jouable si on le choisit exprès. Une ligne de
+    /// service (sans `track_id`) n'est jamais enjambée, même si son
+    /// `source_id` a la valeur d'un id local banni : deux espaces
+    /// d'identifiants, pas de confusion possible.
+    pub async fn enjamber_les_pistes_bannies(&self, zone_id: i64, position: i64) -> Enjambee {
+        let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
+        let Ok(total) = queue_repo.count_all(zone_id) else {
+            return Enjambee::Rien;
+        };
+        let bans = crate::db::hidden_repo::HiddenRepo::with_backend(self.db.clone());
+        let profil = crate::db::hidden_repo::profil_de_selection_automatique(&self.db);
+        let mut p = position.max(0);
+        let mut enjambees = 0usize;
+        while p < total {
+            let Ok(Some(entry)) = queue_repo.get_at(zone_id, p) else {
+                break;
+            };
+            let bannie = entry
+                .track_id
+                .is_some_and(|id| bans.is_track_banned(profil, id).unwrap_or(false));
+            if !bannie {
+                break;
+            }
+            info!(
+                zone_id,
+                position = p,
+                track_id = ?entry.track_id,
+                title = ?entry.title,
+                profil,
+                "file_enjambe_piste_bannie"
+            );
+            if let Some(ref bus) = self.event_bus {
+                bus.emit(
+                    "playback.track_skipped",
+                    serde_json::json!({
+                        "zone_id": zone_id,
+                        "position": p,
+                        "title": entry.title,
+                        "reason": "piste_bannie",
+                    }),
+                );
+            }
+            enjambees += 1;
+            p += 1;
+        }
+        if enjambees == 0 {
+            Enjambee::Rien
+        } else if p >= total {
+            info!(zone_id, enjambees, "file_epuisee_apres_pistes_bannies");
+            Enjambee::FileEpuisee
+        } else {
+            Enjambee::Reprise(p)
+        }
+    }
+
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
 
@@ -698,6 +773,18 @@ impl PlaybackOrchestrator {
             } else {
                 source
             };
+            // #3365 — la qualité que `resolve_stream` a rendue à l'armement de
+            // CE flux, par les mêmes règles que le démarrage
+            // (`composer_le_now_playing`). Sans elle, `..Default::default()`
+            // posait `None` et l'album Qobuz de Serge passait de 192/24 à
+            // « 44,1 / 16 » (repli du chemin du signal) dès la piste 2.
+            // Rien d'armé, ou armé pour un autre flux : `None`, pas un chiffre.
+            let qualite = self
+                .reprendre_la_qualite_pre_armee(zone_id, flux_adopte.as_deref())
+                .await;
+            let (format, sample_rate, bit_depth, bitrate_kbps) = qualite
+                .map(|q| (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps))
+                .unwrap_or_default();
             crate::playback::NowPlaying {
                 track_id: None,
                 title: entry.title.clone().unwrap_or_default(),
@@ -710,6 +797,10 @@ impl PlaybackOrchestrator {
                 source_id: entry.source_id.clone(),
                 // #3442 — le `None` en dur qui perdait le flux pre-arme.
                 stream_id: flux_adopte.clone(),
+                format,
+                sample_rate,
+                bit_depth,
+                bitrate_kbps,
                 ..Default::default()
             }
         };
@@ -1039,6 +1130,18 @@ impl PlaybackOrchestrator {
                 .await
                 .insert(zone_id, sid.clone());
         }
+        // #3365 — la qualité que la première piste aurait annoncée pour ce
+        // flux, gardée jusqu'à ce que `advance_queue_metadata` l'adopte. Sans
+        // elle, la piste suivante d'un album Qobuz perdait 192/24.
+        self.ranger_la_qualite_pre_armee(
+            zone_id,
+            QualitePreArmee::d_un_flux_de_service(
+                req.source.as_deref().unwrap_or_default(),
+                req.source_id.as_deref(),
+                &resolved,
+            ),
+        )
+        .await;
         let raw_cover = cover.or(resolved.cover_url);
         Ok(ResolvedQueueItem {
             url: resolved.url,

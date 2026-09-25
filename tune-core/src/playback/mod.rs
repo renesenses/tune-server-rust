@@ -791,6 +791,30 @@ pub struct PlaybackEvent {
     pub data: serde_json::Value,
 }
 
+/// Fil 1908 (Didier) — ce qu'une sortie LOCALE sait de l'instant où un
+/// échantillon sort : sa position alimentée et le compteur de son anneau.
+///
+/// Les deux sont les `Arc` du fil de lecture lui-même
+/// (`LocalOutput::horloge_de_sortie`), relus à chaque appel : rien n'est
+/// figé au branchement.
+#[derive(Clone)]
+pub struct HorlogeDeSortie {
+    /// Position ALIMENTÉE, en ms de piste — celle que la sortie rapporte.
+    pub position_alimentee_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Le compteur de l'anneau, qui sait ce qui attend encore le pilote.
+    pub anneau: Arc<crate::outputs::traits::RingStarvation>,
+}
+
+impl HorlogeDeSortie {
+    /// Position alimentée moins ce que l'anneau retient encore.
+    pub fn position_audible_ms(&self) -> i64 {
+        let alimentee = self
+            .position_alimentee_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.anneau.position_audible_ms(alimentee) as i64
+    }
+}
+
 pub struct PlaybackManager {
     zones: Arc<Mutex<HashMap<i64, ZoneState>>>,
     event_tx: broadcast::Sender<PlaybackEvent>,
@@ -826,6 +850,11 @@ pub struct PlaybackManager {
     /// porte le gain de rendu apparaîtrait sur l'aiguille sans la réserve
     /// qu'elle compense. Absent = 1,0.
     gains_moyens_du_dsp: std::sync::Mutex<HashMap<i64, Arc<std::sync::atomic::AtomicU32>>>,
+    /// Fil 1908 (Didier) — l'horloge de la sortie LOCALE qui joue la zone :
+    /// sa position ALIMENTÉE et le compteur de son anneau. Voir
+    /// [`Self::position_audible_ms`]. Absent = sortie qui ne dit pas ce
+    /// qu'elle retient (rendu réseau) : le forwarder garde son cadencement.
+    horloges_de_sortie: std::sync::Mutex<HashMap<i64, HorlogeDeSortie>>,
 }
 
 impl Default for PlaybackManager {
@@ -845,6 +874,7 @@ impl PlaybackManager {
             levels_gens: std::sync::Mutex::new(HashMap::new()),
             gains_de_sortie: std::sync::Mutex::new(HashMap::new()),
             gains_moyens_du_dsp: std::sync::Mutex::new(HashMap::new()),
+            horloges_de_sortie: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -875,6 +905,39 @@ impl PlaybackManager {
             .lock()
             .expect("gains_moyens_du_dsp lock")
             .remove(&zone_id);
+        // Son horloge aussi (fil 1908) : une zone rebasculée sur un rendu
+        // réseau ne doit pas caler ses niveaux sur l'anneau de son ancien DAC.
+        self.horloges_de_sortie
+            .lock()
+            .expect("horloges_de_sortie lock")
+            .remove(&zone_id);
+    }
+
+    /// Fil 1908 — partage l'horloge de la sortie locale qui va jouer cette
+    /// zone. Voir [`Self::position_audible_ms`].
+    pub fn brancher_l_horloge_de_sortie(&self, zone_id: i64, horloge: HorlogeDeSortie) {
+        self.horloges_de_sortie
+            .lock()
+            .expect("horloges_de_sortie lock")
+            .insert(zone_id, horloge);
+    }
+
+    /// La position que l'on ENTEND sur la sortie locale de cette zone, en
+    /// millisecondes de piste — `None` si aucune sortie locale n'est branchée.
+    ///
+    /// Fil 1908 (Didier, 24/09/2026, SMSL SU-8 en USB sous Windows) :
+    /// « l'analyseur [est] en gros une à deux secondes en avance sur la sortie
+    /// audio ». La sortie locale rapporte la position ALIMENTÉE
+    /// (`total_frames_fed`, `outputs/local.rs`), et son anneau garde jusqu'à
+    /// deux secondes (`taux × canaux × 2`) entre cette position et le pilote.
+    /// Le forwarder de niveaux se calait dessus. Lue en direct, sans passer
+    /// par l'état de zone que le sondeur ne rafraîchit qu'une fois par tour.
+    pub fn position_audible_ms(&self, zone_id: i64) -> Option<i64> {
+        self.horloges_de_sortie
+            .lock()
+            .expect("horloges_de_sortie lock")
+            .get(&zone_id)
+            .map(HorlogeDeSortie::position_audible_ms)
     }
 
     /// #4685 — partage le gain MOYEN du DSP de la sortie locale qui va jouer

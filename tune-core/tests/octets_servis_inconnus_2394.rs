@@ -101,6 +101,9 @@ fn au_seuil_d_echec(consommation: ConsommationFlux) -> StoppedInput {
         // #4480 : aucune avance d'audio à opposer — l'état d'AVANT ce
         // correctif, celui où `ASec` coupe.
         avance_audio_couvre_l_arret: false,
+        // #4661 : rien qui prouve un fichier servi en entier — l'horloge de
+        // la piste ne tranche pas.
+        horloge_de_piste_couvre_l_arret: false,
         dlna_dsd_reached_end: false,
     }
 }
