@@ -257,15 +257,15 @@ pub fn compter_pistes_par_sous_dossier(
 /// dossiers du serveur média (#4318) : le motif `LIKE` (pré-filtre, échappé),
 /// le préfixe littéral `<dossier><séparateur>` en NFC, et sa longueur en
 /// CARACTÈRES — `substr` compte en caractères sur les deux moteurs.
-struct DossierExact {
-    motif: String,
-    prefixe: String,
-    separateur: String,
-    longueur: usize,
+pub(crate) struct DossierExact {
+    pub(crate) motif: String,
+    pub(crate) prefixe: String,
+    pub(crate) separateur: String,
+    pub(crate) longueur: usize,
 }
 
 impl DossierExact {
-    fn new(dossier: &str) -> Self {
+    pub(crate) fn new(dossier: &str) -> Self {
         use unicode_normalization::UnicodeNormalization as _;
         let separateur = std::path::MAIN_SEPARATOR.to_string();
         let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
@@ -1531,6 +1531,79 @@ impl TrackRepo {
         );
         let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
         Ok(self.db.query_one(&sql, &params)?.is_some())
+    }
+
+    /// #4896 — les fichiers indexés sous `dossier`, à toute profondeur, avec
+    /// leur taille connue : `file_path`, ou le fichier image d'une tranche CUE
+    /// (`cue_media_path`, une ligne par fichier). Même découpage exact que
+    /// [`Self::dossier_peuple`] : `…/Album` ne ramène pas `…/Album 2`.
+    pub fn fichiers_sous_dossier(
+        &self,
+        dossier: &str,
+    ) -> Result<Vec<(String, Option<i64>)>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!(
+            "SELECT DISTINCT {c}, file_size FROM tracks WHERE {c} LIKE {p1}{esc} \
+             AND substr({c}, 1, {n}) = {p2}",
+            c = CHEMIN_DE_LA_PISTE,
+            esc = like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .iter()
+            .filter_map(|ligne| {
+                let chemin = ligne.first()?.as_string()?;
+                Some((chemin, ligne.get(1).and_then(|v| v.as_i64())))
+            })
+            .collect())
+    }
+
+    /// #4896 — un dossier renommé ou déplacé : chaque fichier `(ancien,
+    /// nouveau)` change de chemin en GARDANT sa ligne, donc son identifiant et
+    /// tout ce qui s'y rattache (favoris, écoutes, étiquettes, files
+    /// d'attente). Les tranches CUE du fichier suivent (`cue_media_path`), et
+    /// sa date de première vue aussi : un album renommé n'est pas un ajout.
+    ///
+    /// Un nouveau chemin DÉJÀ indexé n'est pas écrasé (`file_path` est unique) :
+    /// l'ancienne ligne reste où elle est, et l'appelant la traite comme
+    /// disparue. Rend le nombre de lignes déplacées.
+    pub fn deplacer_fichiers(&self, deplacements: &[(String, String)]) -> Result<usize, TuneError> {
+        if deplacements.is_empty() {
+            return Ok(0);
+        }
+        let (p1, p2) = self.marqueurs2();
+        let piste = format!(
+            "UPDATE tracks SET file_path = {p1} WHERE file_path = {p2} \
+             AND NOT EXISTS (SELECT 1 FROM tracks deja WHERE deja.file_path = {p1})"
+        );
+        let tranches =
+            format!("UPDATE tracks SET cue_media_path = {p1} WHERE cue_media_path = {p2}");
+        let mut deplacees = 0usize;
+        let compte = &mut deplacees;
+        self.db.write_tx(&mut |tx| {
+            *compte = 0;
+            for (ancien, nouveau) in deplacements {
+                let params: [&dyn ToSqlValue; 2] = [nouveau, ancien];
+                *compte += tx.execute(&piste, &params)?;
+                *compte += tx.execute(&tranches, &params)?;
+            }
+            Ok(())
+        })?;
+        // Hors transaction et sans échec : sur une base antérieure à la table
+        // (#473), l'erreur annulerait tout le déplacement côté PostgreSQL.
+        let premiere_vue = format!(
+            "UPDATE file_first_seen SET file_path = {p1} WHERE file_path = {p2} \
+             AND NOT EXISTS (SELECT 1 FROM file_first_seen deja WHERE deja.file_path = {p1})"
+        );
+        for (ancien, nouveau) in deplacements {
+            let params: [&dyn ToSqlValue; 2] = [nouveau, ancien];
+            let _ = self.db.execute(&premiere_vue, &params);
+        }
+        Ok(deplacees)
     }
 
     /// Les sous-dossiers **directs** de `dossier` qui contiennent au moins une

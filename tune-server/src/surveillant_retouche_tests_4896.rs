@@ -63,7 +63,7 @@ fn crc16(octets: &[u8]) -> u16 {
 
 /// Un FLAC 7.1 (8 canaux, 24 bits, 48 kHz) de 4 096 échantillons de silence —
 /// le gabarit de `coffret_multicanal_tests_4846`, décodé par symphonia.
-fn flac_8_canaux() -> Vec<u8> {
+pub(super) fn flac_8_canaux() -> Vec<u8> {
     let mut v = b"fLaC".to_vec();
     v.extend_from_slice(&[0x80, 0, 0, 34]);
     v.extend_from_slice(&4096u16.to_be_bytes());
@@ -86,7 +86,7 @@ fn flac_8_canaux() -> Vec<u8> {
 /// Remplace les commentaires Vorbis du fichier, puis avance sa date de
 /// modification : l'option Mp3tag « sans modifier l'horodatage » est
 /// DÉCOCHÉE chez Didier (capture vue).
-fn baliser(piste: &Path, tags: &[(&str, &str)], mtime: std::time::SystemTime) {
+pub(super) fn baliser(piste: &Path, tags: &[(&str, &str)], mtime: std::time::SystemTime) {
     let mut fh = std::fs::File::open(piste).expect("ouverture");
     let mut flac = FlacFile::read_from(&mut fh, ParseOptions::new()).expect("lecture FLAC");
     drop(fh);
@@ -104,21 +104,21 @@ fn baliser(piste: &Path, tags: &[(&str, &str)], mtime: std::time::SystemTime) {
         .expect("date de modification");
 }
 
-fn base() -> Arc<dyn DbBackend> {
+pub(super) fn base() -> Arc<dyn DbBackend> {
     let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     tune_core::db::migrations::run_migrations(&db).unwrap();
     Arc::new(db)
 }
 
-const TITRES: [&str; 2] = ["Speak To Me", "Breathe"];
+pub(super) const TITRES: [&str; 2] = ["Speak To Me", "Breathe"];
 
 /// Le coffret de Didier, SANS balise ALBUM ni ALBUMARTIST, indexé par le scan
 /// comme au premier lancement. Rend la racine (à garder vivante) et les pistes.
 ///
 /// Racine sous le dossier courant et NON sous le dossier temporaire du
 /// système : `is_tune_temp_file` écarte tout ce qui vit sous ce dernier.
-fn coffret_indexe(
+pub(super) fn coffret_indexe(
     db: &Arc<dyn DbBackend>,
     epreuve: &str,
 ) -> (tune_core::test_scratch::ScratchDir, Vec<PathBuf>) {
@@ -169,7 +169,7 @@ fn retoucher_dans_mp3tag(pistes: &[PathBuf]) {
 }
 
 /// Idem, avec l'artiste d'album donné.
-fn retoucher_avec_artiste(pistes: &[PathBuf], artiste_d_album: &str) {
+pub(super) fn retoucher_avec_artiste(pistes: &[PathBuf], artiste_d_album: &str) {
     let maintenant = std::time::SystemTime::now();
     for (i, (piste, titre)) in pistes.iter().zip(TITRES).enumerate() {
         let n = (i + 1).to_string();
@@ -203,7 +203,7 @@ fn lot_du_surveillant(db: &Arc<dyn DbBackend>, pistes: &[PathBuf], genre: Change
 }
 
 /// (titre de l'album, artiste d'album) de chaque piste, relus en base.
-fn albums_en_base(db: &Arc<dyn DbBackend>, pistes: &[PathBuf]) -> Vec<(String, String)> {
+pub(super) fn albums_en_base(db: &Arc<dyn DbBackend>, pistes: &[PathBuf]) -> Vec<(String, String)> {
     let track_repo = TrackRepo::with_backend(db.clone());
     let album_repo = AlbumRepo::with_backend(db.clone());
     pistes
