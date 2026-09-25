@@ -405,6 +405,42 @@ pub fn etiquette_localisee(
 /// Discovery context of an album/track: its genre and record label. Lets a
 /// client jump from the now-playing track to the genre's expert playlists or
 /// the label's catalogue, without bloating the shared `StreamAlbum` model.
+/// Un crédit d'une piste de SERVICE (#4993, FabienM, fil forum 1921).
+///
+/// Même forme JSON, champ pour champ, que les lignes de
+/// `GET /library/tracks/{id}/credits` et `GET /library/albums/{id}/credits`,
+/// pour que le tiroir « Crédits » du client les affiche tels quels :
+///
+/// - `id` et `artist_id` sont toujours `null` : ils désignent une ligne de
+///   `track_credits` et une fiche artiste de la BIBLIOTHÈQUE, qu'une piste de
+///   service n'a pas. Les omettre changerait la forme ; les inventer ferait
+///   ouvrir la mauvaise fiche ;
+/// - `track_id` est l'identifiant de la piste SUR LE SERVICE (une chaîne,
+///   comme `source_id`), pas un entier de bibliothèque ;
+/// - `role` et `instrument` suivent le vocabulaire des crédits MusicBrainz
+///   (`artist`, `performer`, `composer`, `producer`…, instrument canonisé) ;
+/// - `track_title`, `track_number` et `disc_number` ne sont écrits que pour
+///   les crédits d'un ALBUM, comme dans la route de bibliothèque.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCredit {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub track_id: String,
+    #[serde(default)]
+    pub artist_id: Option<i64>,
+    pub artist_name: String,
+    pub role: String,
+    #[serde(default)]
+    pub instrument: Option<String>,
+    pub position: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_number: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disc_number: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AlbumContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,6 +733,22 @@ pub trait StreamingService: Send + Sync {
     async fn get_album_context(&self, _album_id: &str) -> Result<AlbumContext, TuneError> {
         Err(TuneError::Unsupported(
             "album context not supported for this service".into(),
+        ))
+    }
+    /// Crédits d'une piste du service (#4993), dans la forme de
+    /// [`StreamCredit`]. Un service qui n'a AUCUNE source de crédits répond
+    /// `Unsupported` (501) : le client garde alors l'entrée absente, au lieu
+    /// d'une fiche vide qui laisserait croire que la piste n'a pas d'auteur.
+    async fn get_track_credits(&self, _track_id: &str) -> Result<Vec<StreamCredit>, TuneError> {
+        Err(TuneError::Unsupported(
+            "credits not supported for this service".into(),
+        ))
+    }
+    /// Crédits de toutes les pistes d'un album du service (#4993), chaque
+    /// ligne portant sa piste (`track_title`, `track_number`, `disc_number`).
+    async fn get_album_credits(&self, _album_id: &str) -> Result<Vec<StreamCredit>, TuneError> {
+        Err(TuneError::Unsupported(
+            "credits not supported for this service".into(),
         ))
     }
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {

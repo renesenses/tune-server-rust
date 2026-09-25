@@ -121,6 +121,19 @@ pub fn canoniser_instrument(brut: &str) -> String {
     n
 }
 
+/// Vrai si le libellé contient un mot de la table des familles (#4993).
+///
+/// Sert à la lecture de la chaîne de rôles Qobuz `performers`, où un nom
+/// d'artiste peut contenir une virgule (« Blood, Sweat & Tears, MainArtist ») :
+/// un segment reconnu comme instrument marque la FIN du nom. Même table, même
+/// comparaison par mot entier que [`canoniser_instrument`].
+pub fn est_un_instrument_connu(brut: &str) -> bool {
+    let n = normaliser(brut);
+    FAMILLES_INSTRUMENTS
+        .iter()
+        .any(|(mot, _)| n.split(' ').any(|m| m == *mot))
+}
+
 #[cfg(test)]
 mod tests {
     use super::canoniser_instrument;
