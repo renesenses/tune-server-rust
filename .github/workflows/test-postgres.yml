@@ -451,6 +451,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dossier_cue_4625 pg_4625 -- --nocapture --test-threads=1
+      # Chasse PG du 25/09/2026 — les favoris LOCAUX (coeurs de piste, d'album,
+      # d'artiste) etaient lies en chaine sur des colonnes BIGINT : ajout en
+      # 500, liste vide, ordre manuel et retrait en echec sur toute base PG.
+      # Le scenario passe par les vraies routes ; son jumeau SQLite tourne dans
+      # ci.yml. `--test-threads=1` : le test vide la table des favoris.
+      - name: Favoris locaux sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_favoris_locaux_entiers -- --nocapture --test-threads=1
       - name: Versions par piste sur PostgreSQL (#2372)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
