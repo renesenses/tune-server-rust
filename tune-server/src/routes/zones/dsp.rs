@@ -22,7 +22,7 @@ pub(super) async fn get_zone_dsp(
     let crossfeed_status =
         crossfeed_status_de_zone(&state, id, crossfeed["enabled"].as_bool().unwrap_or(false)).await;
     // #4685 — additif : un client qui l'ignore voit le même écran qu'avant.
-    let level_compensation = compensation_de_niveau_de_zone(&state, id);
+    let level_compensation = compensation_de_niveau_de_zone(&state, id).await;
 
     match repo.get_dsp_config(id) {
         Ok((preset_id, enabled)) => Json(json!({
@@ -53,18 +53,26 @@ pub(super) async fn get_zone_dsp(
 ///
 /// ```json
 /// { "enabled": true, "eq_db": -10.62, "crossfeed_db": -1.05,
-///   "compensation_db": 11.67, "local_output_only": true }
+///   "compensation_db": 11.67, "rendered_db": 3.0, "unrendered_db": 8.67,
+///   "volume": 0.708, "local_output_only": true }
 /// ```
 ///
 /// `eq_db` / `crossfeed_db` : ce que chaque étage fait au niveau MOYEN
 /// (négatif = il en retire), calculé depuis le filtre par les mêmes
 /// chargeurs que la lecture — 0 quand l'étage n'est pas actif sur la zone.
-/// `compensation_db` : ce qui est rendu par le volume quand l'interrupteur
-/// est ouvert, 0 sinon. C'est une DEMANDE : à volume plein, le rabot à
-/// l'unité la mange (la ligne `local_gain_rabote_a_l_unite` le dit au
-/// journal). `local_output_only` : la compensation passe par le volume de la
-/// sortie LOCALE ; une zone réseau ne la reçoit pas.
-pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
+/// `compensation_db` : ce que la compensation DEMANDE au volume quand
+/// l'interrupteur est ouvert, 0 sinon. `local_output_only` : la compensation
+/// passe par le volume de la sortie LOCALE ; une zone réseau ne la reçoit pas.
+///
+/// #5069 — `rendered_db` / `unrendered_db` : ce que le volume COURANT de la
+/// zone peut réellement en rendre, et ce qu'il ne peut pas. La demande est
+/// multipliée au volume puis rabotée à l'unité (`effective_volume_units`,
+/// ligne `local_gain_rabote_a_l_unite`) : au volume maximal, rien ne passe.
+/// L'écran annonçait pourtant « +8.4 dB rendus par le volume » à 100 % — un
+/// testeur perdait 8,4 dB sans que rien ne le lui dise. `volume` est le
+/// volume linéaire (0..1) sur lequel ce partage est calculé. Le ReplayGain de
+/// la piste, propre à chaque morceau, n'y entre pas.
+pub(super) async fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
     let enabled = state.orchestrator.zone_compensation_de_niveau(zone_id);
     let (eq_db, crossfeed_db) = state.orchestrator.gain_moyen_du_dsp_de_zone(zone_id);
     // `+ 0.0` : pas de « -0 » dans le JSON quand rien n'est à rendre.
@@ -74,13 +82,61 @@ pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> 
     } else {
         0.0
     };
+    let volume = volume_de_zone(state, zone_id).await;
+    let (rendu, non_rendu) = part_rendue_par_le_volume(compensation_db, volume);
     json!({
         "enabled": enabled,
         "eq_db": arrondi(eq_db),
         "crossfeed_db": arrondi(crossfeed_db),
         "compensation_db": compensation_db,
+        "rendered_db": arrondi(rendu),
+        "unrendered_db": arrondi(non_rendu),
+        "volume": (volume * 1000.0).round() / 1000.0,
         "local_output_only": true,
     })
+}
+
+/// #5069 — le volume linéaire (0..1) de la zone, pris à la même source que
+/// `GET /zones/{id}` (`routes/zones/lecture.rs`) : l'état de lecture s'il est
+/// connu, sinon la colonne persistée (échelle 0..100).
+async fn volume_de_zone(state: &AppState, zone_id: i64) -> f64 {
+    let vivant = state.playback.get_state(zone_id).await.volume;
+    let v = if vivant > 0.0 {
+        vivant
+    } else {
+        ZoneRepo::with_backend(state.backend.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .map_or(1.0, |z| z.volume / 100.0)
+    };
+    if v.is_finite() {
+        v.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// #5069 — partage une compensation demandée entre ce que le volume `volume`
+/// (linéaire, 0..1) rend et ce que le rabot à l'unité mange.
+///
+/// Le gain effectif est `volume × 10^(compensation/20)`, borné à 1 : la marge
+/// disponible est donc `−20·log10(volume)` dB. Une compensation négative (une
+/// atténuation) passe toujours en entier. Rend `(rendu, non_rendu)`, en dB.
+pub(super) fn part_rendue_par_le_volume(compensation_db: f64, volume: f64) -> (f64, f64) {
+    if !compensation_db.is_finite() {
+        return (0.0, 0.0);
+    }
+    if compensation_db <= 0.0 {
+        return (compensation_db, 0.0);
+    }
+    let marge_db = if volume <= 0.0 {
+        f64::INFINITY
+    } else {
+        (-20.0 * volume.min(1.0).log10()).max(0.0)
+    };
+    let rendu = compensation_db.min(marge_db);
+    (rendu, compensation_db - rendu)
 }
 
 /// Cache of computed convolver responses, keyed by zone id. The value pairs
@@ -436,7 +492,7 @@ pub(super) async fn set_zone_dsp(
     }
     // Rendu à CHAQUE écriture : changer l'égaliseur ou le crossfeed change
     // aussi ce que la compensation rend.
-    let level_compensation = compensation_de_niveau_de_zone(&state, id);
+    let level_compensation = compensation_de_niveau_de_zone(&state, id).await;
 
     let preset_id = body["dsp_preset_id"].as_i64();
     let enabled = body["dsp_enabled"].as_bool().unwrap_or(false);
