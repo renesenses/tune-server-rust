@@ -473,3 +473,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --test pg_returning_id_hors_table_a_id_3256 -- --nocapture
+
+      # #4984 — les crédits de piste. `track_credits.track_id` est BIGINT sur
+      # PostgreSQL et le code le liait en texte : aucun crédit écrit, purge
+      # jamais faite, GET des crédits en 500. SQLite l'avale, il faut le
+      # moteur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Crédits de piste sur PostgreSQL (#4984)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_credits_4984 -- --nocapture --test-threads=1

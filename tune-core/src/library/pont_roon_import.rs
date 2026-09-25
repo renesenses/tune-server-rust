@@ -326,11 +326,11 @@ fn ranger(data: &[u8], images: Option<&ImagesRoon<'_>>) -> Option<String> {
 }
 
 fn a_des_credits(backend: &Arc<dyn DbBackend>, track_id: i64) -> bool {
-    let id = track_id.to_string();
+    // #4984 — l'entier : `track_id` est BIGINT sur PostgreSQL.
     backend
         .query_one(
             "SELECT 1 FROM track_credits WHERE track_id = ? LIMIT 1",
-            &[&id as &dyn ToSqlValue],
+            &[&track_id as &dyn ToSqlValue],
         )
         .ok()
         .flatten()
