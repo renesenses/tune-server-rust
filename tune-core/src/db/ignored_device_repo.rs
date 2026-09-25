@@ -89,6 +89,10 @@ pub struct DeviceIdentity<'a> {
     pub mac: Option<&'a str>,
     pub host: &'a str,
     pub name: &'a str,
+    /// Le protocole annoncé (`dlna`, `airplay`…), s'il est connu. Il borne la
+    /// règle de la MAC (#4957) : une même MAC porte souvent PLUSIEURS
+    /// appareils logiques (DLNA + AirPlay + Cast d'un même boîtier).
+    pub protocole: Option<&'a str>,
 }
 
 impl<'a> DeviceIdentity<'a> {
@@ -98,6 +102,7 @@ impl<'a> DeviceIdentity<'a> {
             mac: None,
             host,
             name,
+            protocole: None,
         }
     }
 
@@ -105,6 +110,46 @@ impl<'a> DeviceIdentity<'a> {
         self.mac = mac;
         self
     }
+
+    pub fn with_protocol(mut self, protocole: Option<&'a str>) -> Self {
+        self.protocole = protocole;
+        self
+    }
+}
+
+/// Deux protocoles sont-ils compatibles ? Oui si l'un des deux est inconnu
+/// (vide) : on ne perd rien de l'ancienne règle quand on ne sait pas.
+fn protocoles_compatibles(a: &str, b: Option<&str>) -> bool {
+    let (a, b) = (a.trim(), b.unwrap_or("").trim());
+    a.is_empty() || b.is_empty() || a.eq_ignore_ascii_case(b)
+}
+
+/// #4957 — une ZONE appartient-elle à l'appareil qu'on vient d'ignorer ?
+///
+/// Trois preuves, et l'adresse IP seule n'en est jamais une : un boîtier
+/// annoncé en DLNA ET en AirPlay à la même adresse est vu comme deux
+/// appareils, et ignorer l'un ne doit pas masquer la zone de l'autre (le
+/// DMP-A6 de Villerio perdait sa zone DLNA en pleine lecture).
+///
+/// 1. l'identifiant exact (`device_id`, UDN SSDP, id mDNS…) ;
+/// 2. une identité JUMELLE reconnue par [`identity_matches`] (même hôte ET
+///    même nom), celle dont la sortie a quitté le registre avec lui ;
+/// 3. le couple (protocole, hôte) : même protocole que l'appareil ignoré,
+///    sur son hôte — l'appelant ne présente que les zones de cet hôte.
+pub fn zone_de_l_appareil_ignore(
+    zone_device_id: &str,
+    zone_protocole: &str,
+    device_id: &str,
+    jumelles: &[String],
+    protocole: &str,
+) -> bool {
+    if zone_device_id.is_empty() {
+        return false;
+    }
+    zone_device_id == device_id
+        || jumelles.iter().any(|j| j == zone_device_id)
+        || (!protocole.trim().is_empty()
+            && protocole.trim().eq_ignore_ascii_case(zone_protocole.trim()))
 }
 
 /// La forme courte d'un nom annoncé : « Chambre - Sonos One » → « Chambre ».
@@ -150,7 +195,14 @@ pub fn identity_matches(entry: &IgnoredDevice, live: DeviceIdentity<'_>) -> bool
         .and_then(crate::discovery::mac::normalize_mac)
         .unwrap_or_default();
     let mac_figee = crate::discovery::mac::normalize_mac(&entry.mac).unwrap_or_default();
-    if !mac_vive.is_empty() && mac_vive == mac_figee {
+    //    #4957 — mais une MAC n'identifie qu'un BOÎTIER : l'Eversolo DMP-A6
+    //    porte la même MAC sous DLNA et sous AirPlay. Ignorer l'entrée
+    //    AirPlay ne doit pas faire taire le renderer DLNA : la MAC ne vaut
+    //    que pour le même protocole (ou un protocole inconnu).
+    if !mac_vive.is_empty()
+        && mac_vive == mac_figee
+        && protocoles_compatibles(&entry.device_type, live.protocole)
+    {
         return true;
     }
 
@@ -261,6 +313,7 @@ impl IgnoredDeviceRepo {
             mac: Some(cible.mac.as_str()),
             host: cible.host.as_str(),
             name: cible.name.as_str(),
+            protocole: Some(cible.device_type.as_str()),
         };
         let a_liberer: Vec<String> = entries
             .iter()
