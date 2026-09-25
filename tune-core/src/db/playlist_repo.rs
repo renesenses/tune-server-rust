@@ -1923,11 +1923,35 @@ mod tests {
             );
         }
 
-        // 1. Installation native.
+        // 1. Installation native : la table telle que 001 la crée
+        //    (`track_id BIGINT NOT NULL REFERENCES tracks(id)`), puis la 072.
+        //    PAS `run_pg_migrations` dans un schéma de côté : la CI partage UNE
+        //    base, dont le schéma `public` est déjà migré, et la 012 relève les
+        //    déclencheurs dans `pg_trigger` SANS filtrer le schéma — elle
+        //    trouvait ceux de `public` et échouait à les retirer ici
+        //    (« trigger upnp_revision_tracks_insert does not exist »). Même
+        //    découpe que `pg_4853` : on monte ce que la 072 doit trouver.
         let pool = base(&url, "playlists_4889_natif").await;
-        crate::db::migrations::run_pg_migrations(&pool)
-            .await
-            .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/001_initial_schema.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // `profile_id` : posée par `ensure_schema` (postgres.rs) sur toute
+        // base, et lue par `PlaylistRepo::create`.
+        sqlx::raw_sql(
+            "ALTER TABLE playlists ADD COLUMN IF NOT EXISTS profile_id BIGINT NOT NULL DEFAULT 1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/072_playlist_tracks_titres_de_service.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             duree_et_contrainte(&pool).await,
             ("bigint".to_string(), "YES".to_string(), 1)
