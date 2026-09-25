@@ -369,6 +369,7 @@ pub(super) async fn set_zone_dsp(
     // même borne que les préréglages, #4684). Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
     let mut cf_applique_a_chaud = false;
+    let mut cf_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
     // #2742 — publié dès que le corps porte un `crossfeed`, pour que la réponse
     // au CLIC dise déjà si le réglage aura le moindre effet.
     let mut crossfeed_status: Option<tune_core::audio::crossfeed::CrossfeedStatus> = None;
@@ -401,8 +402,11 @@ pub(super) async fn set_zone_dsp(
         // Meme raison que pour l'egaliseur juste au-dessus : persister ne
         // suffit pas. Sans ceci, activer le crossfeed ou deplacer `amount` /
         // `delay_ms` en ecoutant ne changeait rien avant la piste suivante
-        // (#1786).
-        cf_applique_a_chaud = state.orchestrator.refresh_zone_crossfeed(id).await;
+        // (#1786). #4680 — et la réponse dit QUAND : un booléen seul
+        // confondait « rien ne joue », « piste suivante » et un retrait à chaud.
+        let portee = state.orchestrator.refresh_zone_crossfeed_portee(id).await;
+        cf_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+        cf_portee = Some(portee);
         // #2742 — et si la zone ne peut PAS faire tourner de crossfeed, le
         // serveur le dit au lieu d'enregistrer en silence. Journalisé au
         // moment du CLIC, pas à la lecture : c'est ici que l'utilisateur
@@ -465,6 +469,8 @@ pub(super) async fn set_zone_dsp(
         "eq_portee": eq_portee.map(|p| p.code()),
         // Idem pour le crossfeed (#1786).
         "crossfeed_applied_live": cf_applique_a_chaud,
+        // #4680 — même contrat que `eq_portee` ; `null` sans `crossfeed`.
+        "crossfeed_portee": cf_portee.map(|p| p.code()),
         // #4685 — l'interrupteur et ce qu'il rend, après cette écriture.
         "level_compensation": level_compensation,
         "level_compensation_applied_live": compensation_appliquee_a_chaud,

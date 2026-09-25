@@ -1185,40 +1185,63 @@ impl PlaybackOrchestrator {
     /// crossfeed désactivé, mode PURE (où `load_crossfeed_processor` rend `None`,
     /// donc la promesse bit-perfect tient sans garde supplémentaire).
     pub async fn refresh_zone_crossfeed(&self, zone_id: i64) -> bool {
+        self.pousser_le_crossfeed_en_direct(zone_id)
+            .await
+            .unwrap_or(false)
+    }
+    /// [`Self::refresh_zone_crossfeed`], mais qui dit QUAND le réglage atteint
+    /// le son, au lieu d'un booléen à plusieurs sens (#4680).
+    ///
+    /// `crossfeed_applied_live: false` confondait « rien ne joue », « la piste
+    /// suivante », et même « crossfeed DÉSACTIVÉ à chaud sur une sortie
+    /// locale » — le retrait s'entend pourtant dans l'instant. Les écrans
+    /// traduisaient tout « prendra effet à la piste suivante ».
+    ///
+    /// Contrairement à l'égaliseur, aucune relance de flux n'est programmée :
+    /// sur une zone réseau dont le flux ne porte pas encore ce crossfeed, la
+    /// réponse honnête est `next_track`.
+    pub async fn refresh_zone_crossfeed_portee(&self, zone_id: i64) -> PorteeDuReglage {
+        if self.pousser_le_crossfeed_en_direct(zone_id).await.is_some() {
+            return PorteeDuReglage::Immediate;
+        }
+        match self.playback.get_state(zone_id).await.now_playing {
+            None => PorteeDuReglage::RienNeJoue,
+            Some(ref np) if self.flux_porte_deja_ce_traitement(zone_id, np) => {
+                PorteeDuReglage::Immediate
+            }
+            Some(_) => PorteeDuReglage::PisteSuivante,
+        }
+    }
+    /// Pousse le crossfeed configuré vers la sortie locale qui joue.
+    ///
+    /// `Some(actif)` quand une sortie vivante a reçu le réglage — y compris
+    /// `Some(false)` quand il vient d'être RETIRÉ, ce qui s'entend aussi tout
+    /// de suite ; `None` quand aucune sortie locale ne joue.
+    async fn pousser_le_crossfeed_en_direct(&self, zone_id: i64) -> Option<bool> {
         #[cfg(not(feature = "local-audio"))]
         {
             let _ = zone_id;
-            false
+            None
         }
         #[cfg(feature = "local-audio")]
         {
-            let Some(device_id) = ZoneRepo::with_backend(self.db.clone())
+            let device_id = ZoneRepo::with_backend(self.db.clone())
                 .get(zone_id)
                 .ok()
                 .flatten()
-                .and_then(|z| z.output_device_id)
-            else {
-                return false;
-            };
+                .and_then(|z| z.output_device_id)?;
             if !device_id.starts_with("local:") {
-                return false;
+                return None;
             }
-            let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
-                return false;
-            };
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
             let output = output_arc.lock().await;
-            let Some(local_output) = output
+            let local_output = output
                 .as_any()
-                .downcast_ref::<crate::outputs::local::LocalOutput>()
-            else {
-                return false;
-            };
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?;
             // Pas de flux en cours : la prochaine lecture rebâtira le crossfeed
             // de toute façon, et le bâtir pour un taux inconnu donnerait une
             // ligne à retard de la mauvaise longueur.
-            let Some((taux, _canaux)) = local_output.current_format() else {
-                return false;
-            };
+            let (taux, _canaux) = local_output.current_format()?;
             let cf = self.load_crossfeed_processor(zone_id, taux);
             let actif = cf.is_some();
             // `replace_crossfeed_live` et non `set_crossfeed` : la piste est en
@@ -1231,7 +1254,7 @@ impl PlaybackOrchestrator {
                 actif,
                 "zone_crossfeed_refreshed_live"
             );
-            actif
+            Some(actif)
         }
     }
 
