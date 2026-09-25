@@ -2052,36 +2052,43 @@ pub(crate) fn traiter_le_lot_du_surveillant(
     // #4896 — les DOSSIERS d'abord : une piste emportée par son dossier doit
     // avoir son nouveau chemin avant que les événements de fichier du même lot
     // (ceux du PollWatcher, qui voit chaque fichier bouger) ne la cherchent.
-    let a_relire = traiter_les_dossiers_du_lot(
-        db,
-        &dossiers,
-        reglages,
-        &racines_illisibles,
-        dossiers_en_attente,
-    );
+    // La porte n'est prise que s'il y a un dossier à traiter : un lot de
+    // fichiers seuls ne doit pas attendre la fin d'un lot de scan pour rien.
+    let a_relire = if dossiers.is_empty() && dossiers_en_attente.is_empty() {
+        Vec::new()
+    } else {
+        let _porte = porte_du_scan(db);
+        traiter_les_dossiers_du_lot(
+            db,
+            &dossiers,
+            reglages,
+            &racines_illisibles,
+            dossiers_en_attente,
+        )
+    };
+    let mut fichiers: Vec<_> = fichiers
+        .into_iter()
+        .filter(|c| !ecarte_du_surveillant(&c.path, reglages.exclusions))
+        .collect();
+    // #5073 — les dossiers dont une feuille CUE ou un fichier audio a changé
+    // sont relus par le découpage du scan, AVANT d'importer quoi que ce soit :
+    // un FLAC que sa feuille découpe n'est pas une piste à lui seul.
+    let images_decoupees = relire_les_feuilles_cue_du_lot(db, &mut fichiers);
     let mut albums_a_realigner = std::collections::HashSet::new();
     for change in fichiers {
-        // Same exclusions as the scans (re-read per event batch
-        // so setting edits apply without a restart is overkill;
-        // the list was read once at watcher start).
-        if !reglages.exclusions.is_empty() {
-            let path_l = change.path.to_lowercase();
-            if reglages
-                .exclusions
-                .iter()
-                .any(|x| path_l.contains(x.as_str()))
-            {
-                continue;
-            }
-        }
-        // Tune's own streaming temp files (tune-stream-*/
-        // tune-prefetch-* in %TEMP%) fire watcher events on every
-        // transcode when the library root is a parent of the temp
-        // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
-        // degrading the first seconds of each streaming play.
-        if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
+        // La feuille elle-même n'est pas une piste : son dossier vient d'être
+        // relu. Un fichier qu'elle découpe est représenté par ses tranches.
+        if tune_core::scanner::watcher::est_une_feuille_cue(std::path::Path::new(&change.path)) {
             continue;
         }
+        if change.change_type != ChangeType::Deleted
+            && images_decoupees.contains(std::path::Path::new(&change.path))
+        {
+            tracing::debug!(path = %change.path, "watcher_skip_image_decoupee_par_sa_feuille");
+            continue;
+        }
+        // Un fichier à la fois : un lot de scan en attente passe entre deux.
+        let _porte = porte_du_scan(db);
         match change.change_type {
             ChangeType::Added | ChangeType::Modified => {
                 if let Some(aid) =
@@ -2136,8 +2143,117 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         }
     }
     // #4896 — la ligne album d'un dossier retouché suit ses balises.
-    realigner_albums_sur_les_balises(db, &albums_a_realigner);
+    if !albums_a_realigner.is_empty() {
+        let _porte = porte_du_scan(db);
+        realigner_albums_sur_les_balises(db, &albums_a_realigner);
+    }
     a_relire
+}
+
+/// Un chemin que le surveillant ignore : exclu des scans, ou fichier
+/// temporaire de Tune.
+fn ecarte_du_surveillant(chemin: &str, exclusions: &[String]) -> bool {
+    // Same exclusions as the scans (re-read per event batch
+    // so setting edits apply without a restart is overkill;
+    // the list was read once at watcher start).
+    if !exclusions.is_empty() {
+        let path_l = chemin.to_lowercase();
+        if exclusions.iter().any(|x| path_l.contains(x.as_str())) {
+            return true;
+        }
+    }
+    // Tune's own streaming temp files (tune-stream-*/
+    // tune-prefetch-* in %TEMP%) fire watcher events on every
+    // transcode when the library root is a parent of the temp
+    // dir — 119 ghost scans in 2 minutes on Frédéric's setup,
+    // degrading the first seconds of each streaming play.
+    tune_core::scanner::is_tune_temp_file(std::path::Path::new(chemin))
+}
+
+/// #5073 (Gros Bidon, fil 1904) — un album « FLAC unique + feuille CUE »
+/// déposé Tune lancé était importé en UNE piste : le surveillant ne relayait
+/// pas le `.cue`, et importait le FLAC seul. Le découpage n'avait lieu qu'à
+/// une analyse complète.
+///
+/// Relit, par le découpage du scan (`cue_bibliotheque::relire_le_dossier`),
+/// chaque dossier du lot dont une feuille a changé (ajoutée, retouchée,
+/// supprimée) ou dont un fichier audio a changé à côté d'une feuille — un FLAC
+/// arrivé avant ou avec sa feuille, un dossier apparu. Rend les fichiers image
+/// désormais découpés, que la boucle ne doit pas importer en piste entière, et
+/// ajoute au lot, en `Added`, ceux qu'aucune feuille ne découpe plus.
+fn relire_les_feuilles_cue_du_lot(
+    db: &Arc<dyn DbBackend>,
+    fichiers: &mut Vec<tune_core::scanner::watcher::FileChange>,
+) -> std::collections::HashSet<std::path::PathBuf> {
+    use tune_core::scanner::watcher::{ChangeType, FileChange, est_une_feuille_cue};
+    let mut porte_une_feuille: std::collections::HashMap<std::path::PathBuf, bool> =
+        std::collections::HashMap::new();
+    let mut dossiers: Vec<std::path::PathBuf> = Vec::new();
+    for change in fichiers.iter() {
+        let chemin = std::path::Path::new(&change.path);
+        let Some(dossier) = chemin.parent() else {
+            continue;
+        };
+        let concerne = est_une_feuille_cue(chemin)
+            || *porte_une_feuille
+                .entry(dossier.to_path_buf())
+                .or_insert_with(|| {
+                    std::fs::read_dir(dossier).is_ok_and(|entrees| {
+                        entrees.flatten().any(|e| est_une_feuille_cue(&e.path()))
+                    })
+                });
+        if concerne && !dossiers.iter().any(|d| d == dossier) {
+            dossiers.push(dossier.to_path_buf());
+        }
+    }
+    let mut images_decoupees = std::collections::HashSet::new();
+    if dossiers.is_empty() {
+        return images_decoupees;
+    }
+    let _porte = porte_du_scan(db);
+    for dossier in dossiers {
+        let relecture = tune_core::scanner::cue_bibliotheque::relire_le_dossier(db, &dossier);
+        info!(
+            dossier = %dossier.display(),
+            images_decoupees = relecture.images_decoupees.len(),
+            pistes_creees = relecture.bilan.pistes_creees,
+            pistes_mises_a_jour = relecture.bilan.pistes_mises_a_jour,
+            tranches_retirees = relecture.tranches_retirees,
+            pistes_entieres_retirees = relecture.pistes_entieres_retirees,
+            images_liberees = relecture.images_liberees.len(),
+            "watcher_dossier_cue_relu (#5073)"
+        );
+        images_decoupees.extend(relecture.images_decoupees);
+        for image in relecture.images_liberees {
+            let chemin = image.to_string_lossy().into_owned();
+            // Déjà dans le lot : il sera importé par la boucle, une fois.
+            if let Some(present) = fichiers.iter_mut().find(|c| c.path == chemin) {
+                if present.change_type == ChangeType::Deleted {
+                    continue;
+                }
+                present.change_type = ChangeType::Added;
+            } else {
+                fichiers.push(FileChange {
+                    change_type: ChangeType::Added,
+                    path: chemin,
+                });
+            }
+        }
+    }
+    images_decoupees
+}
+
+/// La porte des lots de scan (`sqlite_write_gate`), prise par le surveillant
+/// autour de chacune de ses écritures — SQLite seulement.
+///
+/// Un lot de scan tient `BEGIN IMMEDIATE` sur l'unique connexion d'écriture à
+/// travers des centaines d'appels. Sans la porte, les écritures du surveillant
+/// entraient dans CETTE transaction, que le pool de lecture ne voit pas :
+/// voir `surveillant_pendant_un_lot_de_scan_tests.rs`. Sous PostgreSQL, le
+/// scan travaille sans transaction de lot : rien à attendre.
+fn porte_du_scan(db: &Arc<dyn DbBackend>) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    (db.engine() == tune_core::db::engine::Engine::Sqlite)
+        .then(crate::sqlite_write_gate::surveillant)
 }
 
 /// Un dossier disparu que ce lot examine : son chemin, les fichiers indexés
@@ -2516,7 +2632,10 @@ pub fn spawn_file_watcher(
                 // these; the watcher never did.
                 if had_changes {
                     let album_repo = AlbumRepo::with_backend(db.clone());
-                    let cleaned = album_repo.delete_orphans().unwrap_or(0);
+                    let cleaned = {
+                        let _porte = porte_du_scan(&db);
+                        album_repo.delete_orphans().unwrap_or(0)
+                    };
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
@@ -2556,3 +2675,11 @@ mod surveillant_dossiers_tests_4896;
 #[cfg(test)]
 #[path = "scan_realigne_tests_4896.rs"]
 mod scan_realigne_tests_4896;
+
+#[cfg(test)]
+#[path = "surveillant_pendant_un_lot_de_scan_tests.rs"]
+mod surveillant_pendant_un_lot_de_scan_tests;
+
+#[cfg(test)]
+#[path = "surveillant_feuille_cue_tests_5073.rs"]
+mod surveillant_feuille_cue_tests_5073;
