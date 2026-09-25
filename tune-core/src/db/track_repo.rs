@@ -2301,6 +2301,50 @@ impl TrackRepo {
         Ok(rows.iter().map(row_to_track).collect())
     }
 
+    /// Les identifiants de TOUTES les pistes, croissants — l'ensemble exact
+    /// que [`Self::list`] pagine et que [`Self::count`] compte, sans
+    /// hydrater une seule ligne. Serveur de médias, « All Tracks (Shuffle) »
+    /// (fil 1916) : le mélange porte sur des entiers, seule la page servie
+    /// est hydratée.
+    pub fn all_ids(&self) -> Result<Vec<i64>, TuneError> {
+        let rows = self
+            .db
+            .query_many("SELECT id FROM tracks ORDER BY id", &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|cols| cols.first().and_then(|v| v.as_i64()))
+            .collect())
+    }
+
+    /// `(piste, album)` pour les pistes des albums donnés, chaque album dans
+    /// l'ordre de [`Self::list_by_album`] (disque, numéro, titre) — en UNE
+    /// requête, là où un genre de mille albums en coûterait mille. L'ordre
+    /// ENTRE albums est celui de l'appelant, qui regroupe. Mêmes identifiants
+    /// en ligne que [`Self::list_by_ids`], pour la même raison.
+    pub fn ids_by_album_ids(&self, album_ids: &[i64]) -> Result<Vec<(i64, i64)>, TuneError> {
+        if album_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_list = album_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT t.id, t.album_id FROM tracks t WHERE t.album_id IN ({id_list}) \
+             ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title, t.id"
+        );
+        let rows = self.db.query_many(&sql, &[])?;
+        Ok(rows
+            .iter()
+            .filter_map(|cols| {
+                let piste = cols.first().and_then(|v| v.as_i64())?;
+                let album = cols.get(1).and_then(|v| v.as_i64())?;
+                Some((piste, album))
+            })
+            .collect())
+    }
+
     /// Like `list_by_album` but restricted to tracks matching an active
     /// quality/format filter, so the album detail agrees with a filtered grid.
     /// Sergio: a Hi-Res + 96kHz + FLAC filter matched a mixed album (the grid

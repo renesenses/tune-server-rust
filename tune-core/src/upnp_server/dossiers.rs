@@ -381,7 +381,7 @@ pub(super) fn parcourir(state: &UpnpState, id: &str, start: u64, count: u64) -> 
 /// Tri naturel : les suites de chiffres se comparent par leur VALEUR, le
 /// reste sans casse ni accents. Égalité départagée par le texte brut, pour
 /// un ordre total et stable entre deux requêtes — la pagination en dépend.
-fn comparer_naturel(a: &str, b: &str) -> Ordering {
+pub(super) fn comparer_naturel(a: &str, b: &str) -> Ordering {
     let (ka, kb) = (cle_naturelle(a), cle_naturelle(b));
     ka.cmp(&kb).then_with(|| a.cmp(b))
 }
@@ -760,13 +760,14 @@ mod tests {
     fn par_soap_la_racine_annonce_folders_et_il_s_ouvre() {
         let b = arbre();
         let racine = soap(&b.state, "0", "BrowseDirectChildren", 0, 0);
-        assert_eq!(champ(&racine, "TotalMatches"), "8");
+        // Huit rayons (dont « All Tracks (Shuffle) », fil 1916) + « Folders ».
+        assert_eq!(champ(&racine, "TotalMatches"), "9");
         let rayons = lire(&didl(&racine));
         assert_eq!(rayons.last().unwrap().1, "folders");
         assert_eq!(rayons.last().unwrap().2, "Folders");
         // BrowseMetadata("0") annonce ce que la racine ouvre.
         let meta0 = didl(&soap(&b.state, "0", "BrowseMetadata", 0, 0));
-        assert!(meta0.contains("childCount=\"8\""), "{meta0}");
+        assert!(meta0.contains("childCount=\"9\""), "{meta0}");
 
         let meta = soap(&b.state, "folders", "BrowseMetadata", 0, 0);
         assert_eq!(champ(&meta, "NumberReturned"), "1");
@@ -793,10 +794,11 @@ mod tests {
     }
 
     #[test]
-    fn sans_music_dirs_la_racine_garde_ses_sept_rayons() {
+    fn sans_music_dirs_la_racine_garde_ses_huit_rayons() {
         let b = banc(&[]);
         let racine = soap(&b.state, "0", "BrowseDirectChildren", 0, 0);
-        assert_eq!(champ(&racine, "TotalMatches"), "7");
+        // Sept rayons historiques + « All Tracks (Shuffle) » (fil 1916).
+        assert_eq!(champ(&racine, "TotalMatches"), "8");
         assert!(!didl(&racine).contains("\"folders\""));
     }
 
