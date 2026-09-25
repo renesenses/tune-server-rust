@@ -78,6 +78,14 @@ fn reset_schema(db: &Arc<dyn DbBackend>) {
         "artists",
         "zones",
         "listen_history",
+        // Sans clé étrangère vers `albums` : `TRUNCATE albums … CASCADE` ne
+        // les vide PAS, et `RESTART IDENTITY` redonne les mêmes identifiants
+        // d'album à l'épreuve suivante. Un `edition_manuelle` laissé sur
+        // l'album 1 par `pg_edition_album_scenarios` faisait compter
+        // « manuel » l'album 1 de `pg_recalcul_des_compilations_…` (CI de
+        // #5049, `--test-threads=1`, ordre alphabétique).
+        "album_metadata",
+        "album_distinct_pairs",
     ];
     for table in tables {
         let sql = format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE");
