@@ -33,5 +33,9 @@ base64 = "0.22"
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# macOS : `getfsstat` pour trouver le volume `cddafs` du disque (#4863).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
