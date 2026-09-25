@@ -73,6 +73,11 @@ impl PlaybackOrchestrator {
             "source_pcm_session_ouverte"
         );
 
+        // #5078 — les niveaux (crête-mètre, vu-mètre, spectre) du PCM pompé.
+        let niveaux = self
+            .niveaux_de_la_source_pcm(req.zone_id, &session_id, depuis_ms)
+            .await;
+
         let streamer = self.streamer.clone();
         let bus = self.event_bus.clone();
         let zone_id = req.zone_id;
@@ -93,7 +98,18 @@ impl PlaybackOrchestrator {
                     return FinDePompe::ConsommateurParti;
                 }
                 data_ready.notify_one();
-                pomper(&mut *lecteur, octets, |t| rt.block_on(tx.send(t)).is_ok())
+                pomper(&mut *lecteur, octets, |t| {
+                    if let Some(ltx) = &niveaux {
+                        crate::audio::tap::send_windowed_pcm(
+                            ltx,
+                            &t,
+                            format.bits,
+                            format.canaux,
+                            format.frequence,
+                        );
+                    }
+                    rt.block_on(tx.send(t)).is_ok()
+                })
             })
             .await;
             match fin {
@@ -148,5 +164,131 @@ impl PlaybackOrchestrator {
             origin_url: None,
             bitrate_kbps: None,
         })
+    }
+
+    /// #5078 (GgB, fil 1945) — la source PCM n'alimentait AUCUN instrument :
+    /// elle ouvrait sa session sans forwarder de niveaux, là où les autres
+    /// chemins qui tiennent le PCM en main en attachent un. Même forwarder
+    /// cadencé qu'eux : il publie une fenêtre quand la sortie la joue
+    /// (fil 1908), pas quand la pompe la lit.
+    ///
+    /// Pendant un pré-armement gapless, aucun forwarder ne peut naître : il
+    /// serait daté de la piste qui joue encore (voir `levels_prewarm`). Les
+    /// fenêtres attendent alors l'avance qui adopte ce flux
+    /// ([`adopter_les_niveaux_pre_armes`]) : relire le disque pour les
+    /// niveaux, comme le fait la sonde d'une piste de service, le ferait
+    /// sauter d'une piste à l'autre.
+    async fn niveaux_de_la_source_pcm(
+        &self,
+        zone_id: i64,
+        session_id: &str,
+        depuis_ms: u64,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>> {
+        let bus = self.event_bus.clone()?;
+        if self.levels_attach_allowed(zone_id) {
+            return self
+                .levels_forwarder_if_allowed(zone_id, depuis_ms as i64)
+                .await;
+        }
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (adopte_tx, adopte_rx) = tokio::sync::oneshot::channel();
+        niveaux_en_attente().insert(session_id.to_string(), adopte_tx);
+        tokio::spawn(relayer_les_niveaux_pre_armes(
+            bus,
+            self.playback.clone(),
+            self.streamer.clone(),
+            zone_id,
+            session_id.to_string(),
+            depuis_ms,
+            rx,
+            adopte_rx,
+        ));
+        Some(tx)
+    }
+}
+
+type Adoption = tokio::sync::oneshot::Sender<u64>;
+
+/// Les sessions PCM pré-armées dont les niveaux attendent l'avance gapless,
+/// par identifiant de session (un UUID : unique d'un orchestrateur à l'autre).
+fn niveaux_en_attente() -> std::sync::MutexGuard<'static, HashMap<String, Adoption>> {
+    static EN_ATTENTE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Adoption>>> =
+        std::sync::LazyLock::new(Default::default);
+    EN_ATTENTE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// L'avance gapless vient d'adopter `stream_id` : si c'est une source PCM
+/// pré-armée, ses niveaux démarrent, sous le `play_seq` de la zone.
+pub(super) fn adopter_les_niveaux_pre_armes(stream_id: &str, play_seq: u64) {
+    if let Some(adoption) = niveaux_en_attente().remove(stream_id) {
+        let _ = adoption.send(play_seq);
+    }
+}
+
+/// Au plus deux minutes d'audio tenues en attente : la pompe devance la
+/// sortie de la capacité de la session (256 tronçons, ~47 s de CD).
+const ATTENTE_MAX: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[allow(clippy::too_many_arguments)]
+async fn relayer_les_niveaux_pre_armes(
+    bus: Arc<crate::event_bus::EventBus>,
+    playback: Arc<PlaybackManager>,
+    streamer: Arc<AudioStreamer>,
+    zone_id: i64,
+    session_id: String,
+    depuis_ms: u64,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<crate::audio::tap::RawWindow>,
+    mut adopte: tokio::sync::oneshot::Receiver<u64>,
+) {
+    let mut tampon = std::collections::VecDeque::new();
+    let mut tenu = std::time::Duration::ZERO;
+    let mut ecarte = std::time::Duration::ZERO;
+    let mut pompe_finie = false;
+    let mut controle = tokio::time::interval(std::time::Duration::from_secs(2));
+    let play_seq = loop {
+        tokio::select! {
+            r = &mut adopte => match r {
+                Ok(seq) => break seq,
+                Err(_) => return,
+            },
+            f = rx.recv(), if !pompe_finie => match f {
+                Some(f) => {
+                    tenu += f.window;
+                    tampon.push_back(f);
+                    while tenu > ATTENTE_MAX {
+                        let Some(vieille) = tampon.pop_front() else { break };
+                        tenu -= vieille.window;
+                        ecarte += vieille.window;
+                    }
+                }
+                None => pompe_finie = true,
+            },
+            _ = controle.tick() => {
+                // Flux jamais adopté (file changée, zone arrêtée) : sa
+                // session a disparu, l'attente aussi.
+                let vivante = streamer.sessions_state().lock().await.contains_key(&session_id);
+                if !vivante {
+                    niveaux_en_attente().remove(&session_id);
+                    return;
+                }
+            }
+        }
+    };
+    let fwd = super::spawn_paced_levels_forwarder(
+        bus,
+        playback,
+        zone_id,
+        play_seq,
+        (depuis_ms as i64).saturating_add(ecarte.as_millis() as i64),
+    );
+    for f in tampon {
+        if fwd.send(f).is_err() {
+            return;
+        }
+    }
+    while let Some(f) = rx.recv().await {
+        if fwd.send(f).is_err() {
+            return;
+        }
     }
 }
