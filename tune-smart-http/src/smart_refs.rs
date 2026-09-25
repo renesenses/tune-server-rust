@@ -467,7 +467,13 @@ pub(crate) fn track_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
                     Err(()) => "1=0".into(),
                 }
             } else {
-                let sub = format!("SELECT track_id FROM playlist_tracks WHERE playlist_id = {id}");
+                // #4889 — une ligne de TITRE DE SERVICE a `track_id` NUL.
+                // Sans ce filtre, `t.id NOT IN (…, NULL)` vaut NULL pour
+                // TOUTE piste : la règle « pas dans la playlist X » ne
+                // rendrait plus rien dès que X porte un titre de service.
+                let sub = format!(
+                    "SELECT track_id FROM playlist_tracks WHERE playlist_id = {id} AND track_id IS NOT NULL"
+                );
                 membership("t.id", &sub, neg, false)
             }
         }
@@ -773,7 +779,55 @@ mod tests {
         let cond = track_ref_condition("in_playlist", "in", "classic:9", &ctx);
         assert_eq!(
             cond,
-            "t.id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = 9)"
+            "t.id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = 9 AND track_id IS NOT NULL)"
+        );
+    }
+
+    /// #4889 — une playlist Tune peut porter un titre de service, dont la
+    /// ligne a `track_id` NUL. La règle NÉGATIVE « pas dans la playlist X »
+    /// s'écrit `t.id NOT IN (SELECT track_id …)` : un seul NUL dans la
+    /// sous-requête rend le test NUL pour TOUTE piste, et la playlist
+    /// intelligente se vide. Exécuté pour de vrai sur SQLite — une garde de
+    /// texte ne verrait pas la sémantique du NUL.
+    #[test]
+    fn pas_dans_une_playlist_qui_porte_un_titre_de_service_rend_les_autres_pistes() {
+        use tune_core::db::backend::DbBackend;
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        DbBackend::execute_batch(
+            &db,
+            "INSERT INTO tracks (id, title) VALUES (1, 'Dedans'), (2, 'Dehors');
+             INSERT INTO playlists (id, name) VALUES (7, 'Mixte');
+             INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (7, 1, 0);
+             INSERT INTO playlist_tracks (playlist_id, position, source, source_id, title)
+                 VALUES (7, 1, 'qobuz', '52818331', 'Sinfonia');",
+        )
+        .unwrap();
+        let r = EmptyResolver;
+        let ctx = RefCtx::root(&r, Some(1));
+        let ids = |cond: &str| -> Vec<i64> {
+            DbBackend::query_many(
+                &db,
+                &format!("SELECT t.id FROM tracks t WHERE {cond} ORDER BY t.id"),
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .filter_map(|l| l[0].as_i64())
+            .collect()
+        };
+
+        let hors = track_ref_condition("in_playlist", "not_in", "classic:7", &ctx);
+        assert_eq!(ids(&hors), vec![2], "règle négative : {hors}");
+        let dans = track_ref_condition("in_playlist", "in", "classic:7", &ctx);
+        assert_eq!(ids(&dans), vec![1], "règle positive : {dans}");
+
+        // Contre-épreuve : la sous-requête d'AVANT #4889, sans le filtre,
+        // vide bien la règle négative sur cette même base.
+        assert!(
+            ids("t.id NOT IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = 7)")
+                .is_empty(),
+            "le piège du NUL doit être reproduit, sinon ce test ne garde rien"
         );
     }
 
