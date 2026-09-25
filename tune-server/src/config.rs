@@ -535,56 +535,130 @@ pub fn resolve_web_dir() -> std::path::PathBuf {
 /// terminal, a non-matching unit name) exported an empty log.
 ///
 /// Both the writer (main) and the reader (`/system/logs`) call this, so they
-/// always agree on the path.
+/// always agree on the path. La résolution elle-même vit dans
+/// [`chemin_du_journal`], seule fonction qui compose ce chemin : le
+/// diagnostic n'en recompose plus un à la main (#4770).
 ///
 /// Resolution order:
 ///   1. `TUNE_LOG_FILE` — honored verbatim.
 ///   2. Windows: `%LOCALAPPDATA%\TuneServer\tune-server.log`.
-///   3. macOS: `$HOME/Library/Logs/tune-server.log`.
+///   3. macOS: `$HOME/Library/Logs/tune-server.log`, sans `HOME` :
+///      `temp_dir()/tune-<uid>/tune-server.log`.
 ///   4. Linux/other: `$XDG_STATE_HOME/tune/`, else `$HOME/.local/state/tune/`,
-///      else `/tmp/` — the first user-writable location, never `/var/log`
-///      (a `User=` service or a container can't write there).
+///      else `temp_dir()/tune-<uid>/` — the first user-writable location, never
+///      `/var/log` (a `User=` service or a container can't write there).
 ///
 /// Creates the parent directory. Note: append-only, no rotation (same as the
 /// pre-existing macOS/Windows behavior); rotation is a separate follow-up.
 pub fn default_log_file_path() -> std::path::PathBuf {
-    use std::path::PathBuf;
-
-    if let Ok(custom) = std::env::var("TUNE_LOG_FILE") {
-        if !custom.is_empty() {
-            return PathBuf::from(custom);
-        }
-    }
-
-    let path = if cfg!(target_os = "windows") {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\ProgramData".into());
-        PathBuf::from(base)
-            .join("TuneServer")
-            .join("tune-server.log")
-    } else if cfg!(target_os = "macos") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        PathBuf::from(home)
-            .join("Library/Logs")
-            .join("tune-server.log")
-    } else {
-        let base = std::env::var("XDG_STATE_HOME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .map(|h| PathBuf::from(h).join(".local/state"))
-            })
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        base.join("tune").join("tune-server.log")
-    };
-
+    let lire = |nom: &str| std::env::var(nom).ok();
+    let path = chemin_du_journal(
+        &lire,
+        SystemeDuJournal::courant(),
+        &std::env::temp_dir(),
+        tune_core::chemins_de_travail::uid_courant(),
+    );
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     path
+}
+
+/// L'emplacement **par défaut** du journal, `TUNE_LOG_FILE` mis de côté.
+///
+/// C'est le repli du diagnostic : quand `TUNE_LOG_FILE` désigne un fichier
+/// absent ou vide, `/system/logs` va voir là où le serveur écrirait sans lui.
+/// Même fonction de résolution que l'écrivain, seule la surcharge est masquée.
+/// Ne crée rien : un lecteur n'a pas à fabriquer de dossier.
+pub(crate) fn emplacement_par_defaut_du_journal() -> std::path::PathBuf {
+    let lire = |nom: &str| std::env::var(nom).ok();
+    chemin_du_journal(
+        &sans_surcharge_du_journal(&lire),
+        SystemeDuJournal::courant(),
+        &std::env::temp_dir(),
+        tune_core::chemins_de_travail::uid_courant(),
+    )
+}
+
+/// Le système pour lequel on résout le chemin du journal — paramètre, pour
+/// que les tests éprouvent les trois branches sur la machine qui les exécute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SystemeDuJournal {
+    Windows,
+    MacOs,
+    Autre,
+}
+
+impl SystemeDuJournal {
+    pub(crate) fn courant() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Autre
+        }
+    }
+}
+
+/// Le même environnement, `TUNE_LOG_FILE` en moins.
+pub(crate) fn sans_surcharge_du_journal<'a>(
+    lire: &'a dyn Fn(&str) -> Option<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |nom: &str| {
+        if nom == "TUNE_LOG_FILE" {
+            None
+        } else {
+            lire(nom)
+        }
+    }
+}
+
+/// Le chemin du journal, environnement, système, base temporaire et UID
+/// **passés** — la seule fonction qui le compose (#4770).
+///
+/// Sans `HOME`, le repli était un dossier au nom FIXE : `/tmp/tune/` sous
+/// Linux, `/tmp/Library/Logs/` sous macOS. Tous les comptes de la machine s'y
+/// partageaient le même journal ; le premier qui créait le dossier en devenait
+/// propriétaire, et chez les suivants `JournalBorne::ouvrir` échouait sans
+/// bruit — plus aucun fichier, donc un export de journaux vide. Le repli passe
+/// désormais par [`tune_core::chemins_de_travail`] : `temp_dir()/tune-<uid>/`,
+/// qui respecte aussi `TMPDIR` — le même dossier que le repli des outils
+/// `yt-dlp` (`tune_core::ytdlp`).
+///
+/// Quand `HOME` (ou `XDG_STATE_HOME`, ou `TUNE_LOG_FILE`) est posé, rien ne
+/// change : c'est le cas des unités systemd (`User=` pose `HOME`) et des
+/// images Docker (`USER tune`, compte créé avec `-m`).
+pub(crate) fn chemin_du_journal(
+    lire: &dyn Fn(&str) -> Option<String>,
+    systeme: SystemeDuJournal,
+    temp: &Path,
+    uid: u32,
+) -> PathBuf {
+    if let Some(custom) = lire("TUNE_LOG_FILE").filter(|s| !s.is_empty()) {
+        return PathBuf::from(custom);
+    }
+    let non_vide = |nom: &str| lire(nom).filter(|s| !s.is_empty());
+    let repli = || tune_core::chemins_de_travail::racine_de_travail_sous(temp, "tune", uid);
+
+    match systeme {
+        SystemeDuJournal::Windows => {
+            let base = lire("LOCALAPPDATA").unwrap_or_else(|| "C:\\ProgramData".into());
+            PathBuf::from(base)
+                .join("TuneServer")
+                .join("tune-server.log")
+        }
+        SystemeDuJournal::MacOs => non_vide("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Logs"))
+            .unwrap_or_else(repli)
+            .join("tune-server.log"),
+        SystemeDuJournal::Autre => non_vide("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| non_vide("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+            .map(|base| base.join("tune"))
+            .unwrap_or_else(repli)
+            .join("tune-server.log"),
+    }
 }
 
 /// Rotate the log file at `path` when it grows past `max_bytes`: the current
@@ -1038,5 +1112,180 @@ mod adresse_annoncee_3867 {
     #[test]
     fn sans_environnement_la_valeur_de_tune_toml_survit() {
         assert_eq!(adresse_annoncee_depuis_env(None, None), (None, false));
+    }
+}
+
+#[cfg(test)]
+mod chemin_du_journal_4770 {
+    use super::{SystemeDuJournal, chemin_du_journal, sans_surcharge_du_journal};
+    use std::path::{Path, PathBuf};
+
+    fn env_de(paires: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let paires: Vec<(String, String)> = paires
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |nom| {
+            paires
+                .iter()
+                .find(|(k, _)| k == nom)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// Le témoin de #4770 pour le journal : sans `HOME`, deux comptes n'ont
+    /// plus le même fichier de journal, et le second peut ouvrir le sien même
+    /// quand le premier a déjà créé — en `555` — le sien ET l'ancien dossier
+    /// au nom fixe (`…/tune` sous Linux, `…/Library/Logs` sous macOS).
+    ///
+    /// Contre-épreuve : remettre `temp.join("tune")` (l'ancien `/tmp/tune`)
+    /// comme repli dans `chemin_du_journal` — le test rougit.
+    #[cfg(unix)]
+    #[test]
+    fn sans_home_deux_comptes_ont_chacun_leur_journal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if tune_core::chemins_de_travail::uid_courant() == 0 {
+            eprintln!("témoin ignoré : exécuté en root, les modes ne mordent pas");
+            return;
+        }
+        let rien = |_: &str| None;
+        for (systeme, ancien) in [
+            (SystemeDuJournal::Autre, "tune"),
+            (SystemeDuJournal::MacOs, "Library/Logs"),
+        ] {
+            let racine = tune_core::test_scratch::scratch_dir("tune-journal-deux-comptes");
+            let le_sien = chemin_du_journal(&rien, systeme, racine.path(), 1001);
+            let le_mien = chemin_du_journal(&rien, systeme, racine.path(), 1000);
+            assert_ne!(
+                le_mien, le_sien,
+                "{systeme:?} : deux comptes partagent le même journal"
+            );
+
+            let dossier_sien = le_sien.parent().unwrap().to_path_buf();
+            let fermes = [racine.path().join(ancien), dossier_sien];
+            for d in &fermes {
+                std::fs::create_dir_all(d).expect("dossier « de l'autre compte »");
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555))
+                    .expect("mode 555");
+            }
+            // Ce que fait l'écrivain : créer le dossier, ouvrir en ajout.
+            let ouvert = le_mien
+                .parent()
+                .map(std::fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|_| {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&le_mien)
+                });
+            for d in &fermes {
+                std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).ok();
+            }
+            ouvert
+                .unwrap_or_else(|e| panic!("{systeme:?} : journal refusé sous {le_mien:?} : {e}"));
+        }
+    }
+
+    /// Quand `HOME` (ou `XDG_STATE_HOME`, `LOCALAPPDATA`, `TUNE_LOG_FILE`) est
+    /// posé, l'emplacement ne bouge pas d'un octet — ni avec l'UID, ni avec la
+    /// base temporaire. C'est le cas des unités systemd (`User=` pose `HOME`)
+    /// et des images Docker : leur journal reste où il était.
+    #[test]
+    fn home_garde_la_priorite_et_l_emplacement_ne_change_pas() {
+        let home = env_de(&[("HOME", "/home/moi")]);
+        let xdg = env_de(&[("HOME", "/home/moi"), ("XDG_STATE_HOME", "/etat")]);
+        let windows = env_de(&[("LOCALAPPDATA", "C:\\Users\\moi\\AppData\\Local")]);
+        let surcharge = env_de(&[("HOME", "/home/moi"), ("TUNE_LOG_FILE", "/var/x.log")]);
+        let cas: [(&dyn Fn(&str) -> Option<String>, SystemeDuJournal, PathBuf); 6] = [
+            (
+                &home,
+                SystemeDuJournal::Autre,
+                PathBuf::from("/home/moi/.local/state/tune/tune-server.log"),
+            ),
+            (
+                &xdg,
+                SystemeDuJournal::Autre,
+                PathBuf::from("/etat/tune/tune-server.log"),
+            ),
+            (
+                &home,
+                SystemeDuJournal::MacOs,
+                PathBuf::from("/home/moi/Library/Logs/tune-server.log"),
+            ),
+            (
+                &windows,
+                SystemeDuJournal::Windows,
+                PathBuf::from("C:\\Users\\moi\\AppData\\Local")
+                    .join("TuneServer")
+                    .join("tune-server.log"),
+            ),
+            (
+                &surcharge,
+                SystemeDuJournal::Autre,
+                PathBuf::from("/var/x.log"),
+            ),
+            (
+                &surcharge,
+                SystemeDuJournal::MacOs,
+                PathBuf::from("/var/x.log"),
+            ),
+        ];
+        for (lire, systeme, attendu) in cas {
+            for (temp, uid) in [(Path::new("/tmp"), 1000), (Path::new("/ailleurs"), 1001)] {
+                assert_eq!(
+                    chemin_du_journal(lire, systeme, temp, uid),
+                    attendu,
+                    "{systeme:?}, base {temp:?}, uid {uid}"
+                );
+            }
+        }
+    }
+
+    /// Le repli du diagnostic n'est pas un second mécanisme : sans
+    /// `TUNE_LOG_FILE`, il rend EXACTEMENT le chemin de l'écrivain ; avec, il
+    /// rend l'emplacement par défaut, jamais la surcharge.
+    #[test]
+    fn le_diagnostic_lit_le_chemin_ou_le_serveur_ecrit() {
+        let temp = Path::new("/tmp");
+        for systeme in [
+            SystemeDuJournal::Autre,
+            SystemeDuJournal::MacOs,
+            SystemeDuJournal::Windows,
+        ] {
+            for paires in [&[][..], &[("HOME", "/home/moi")][..]] {
+                let lire = env_de(paires);
+                assert_eq!(
+                    chemin_du_journal(&sans_surcharge_du_journal(&lire), systeme, temp, 1000),
+                    chemin_du_journal(&lire, systeme, temp, 1000),
+                    "{systeme:?} {paires:?}"
+                );
+            }
+            let surcharge = env_de(&[("HOME", "/home/moi"), ("TUNE_LOG_FILE", "/var/x.log")]);
+            let sans = env_de(&[("HOME", "/home/moi")]);
+            assert_eq!(
+                chemin_du_journal(&sans_surcharge_du_journal(&surcharge), systeme, temp, 1000),
+                chemin_du_journal(&sans, systeme, temp, 1000),
+            );
+        }
+    }
+
+    /// Le diagnostic ne recompose plus le chemin du journal à la main : c'est
+    /// par là qu'il avait gardé l'ancien repli `/tmp` pendant que l'écrivain
+    /// en changeait. Contre-épreuve : la version d'avant de `diagnostics.rs`
+    /// contient `Library/Logs/tune-server.log` deux fois.
+    #[test]
+    fn le_diagnostic_ne_recompose_pas_le_chemin_du_journal() {
+        let source = include_str!("routes/system/diagnostics.rs");
+        assert!(
+            !source.contains("Library/Logs/tune-server.log"),
+            "diagnostics.rs recompose le chemin du journal au lieu d'appeler \
+             config::emplacement_par_defaut_du_journal"
+        );
+        assert!(
+            source.contains("crate::config::emplacement_par_defaut_du_journal()"),
+            "diagnostics.rs doit relire le journal par config::emplacement_par_defaut_du_journal"
+        );
     }
 }
