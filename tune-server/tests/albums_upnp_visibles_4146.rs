@@ -98,15 +98,19 @@ fn exige_un_banc_des_deux_natures() {
         ALBUMS_LOCAUX_EN_BASE + ALBUMS_UPNP_EN_BASE,
         "le banc et le total attendu ont divergé"
     );
-    assert!(
-        ALBUMS_UPNP_EN_BASE >= 2,
-        "il faut DEUX albums distants — un doublé, un orphelin — sinon l'épreuve \
+    const {
+        assert!(
+            ALBUMS_UPNP_EN_BASE >= 2,
+            "il faut DEUX albums distants — un doublé, un orphelin — sinon l'épreuve \
          ne départage pas « ouvrir » de « tout ouvrir »"
-    );
-    assert!(
-        ALBUMS_LOCAUX_EN_BASE >= 2,
-        "il faut DEUX albums locaux — la contrepartie du doublon, et un local seul"
-    );
+        )
+    };
+    const {
+        assert!(
+            ALBUMS_LOCAUX_EN_BASE >= 2,
+            "il faut DEUX albums locaux — la contrepartie du doublon, et un local seul"
+        )
+    };
     assert_eq!(
         ALBUMS_VISIBLES,
         (ALBUMS_EN_BASE - 1) as usize,

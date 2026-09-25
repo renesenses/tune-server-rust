@@ -800,19 +800,16 @@ fn ensure_zones_is_hidden(state: &AppState) {
 
     // Ensure last_play_state column exists (migration v39 for SQLite,
     // idempotent ALTER for Postgres).
-    match state.backend.engine() {
-        tune_core::db::engine::Engine::Postgres => {
-            let result = state.backend.execute(
-                "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped'",
-                &[],
-            );
-            match result {
-                Ok(_) => info!("zones_last_play_state_column_added"),
-                Err(e) if e.contains("duplicate") || e.contains("already exists") => {}
-                Err(e) => tracing::warn!(error = %e, "zones_last_play_state_add_failed"),
-            }
+    if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
+        let result = state.backend.execute(
+            "ALTER TABLE zones ADD COLUMN last_play_state TEXT DEFAULT 'stopped'",
+            &[],
+        );
+        match result {
+            Ok(_) => info!("zones_last_play_state_column_added"),
+            Err(e) if e.contains("duplicate") || e.contains("already exists") => {}
+            Err(e) => tracing::warn!(error = %e, "zones_last_play_state_add_failed"),
         }
-        _ => {}
     }
 
     // Aucune zone ne peut être en lecture au démarrage : c'est ce processus qui
@@ -1047,9 +1044,8 @@ async fn restore_playback_positions(state: &AppState) {
                 } else {
                     continue;
                 }
-            } else if zone.last_track_source.as_deref() == Some("radio") {
-                continue;
             } else {
+                // Radio comprise : sans piste en base, rien à restaurer ici.
                 continue;
             };
             let clamped_pos = if np.duration_ms > 0 {
@@ -1088,7 +1084,9 @@ async fn restore_oaat_groups(state: &AppState) {
     let groups: Vec<serde_json::Value> = serde_json::from_str(&groups_json).unwrap_or_default();
 
     let mut restored = 0usize;
-    let mut to_probe: Vec<(String, String, Vec<(String, u16)>)> = Vec::new();
+    // (identifiant du groupe, nom, points d'accès hôte:port à sonder)
+    type GroupeASonder = (String, String, Vec<(String, u16)>);
+    let mut to_probe: Vec<GroupeASonder> = Vec::new();
     for group in &groups {
         let id = match group["id"].as_str() {
             Some(id) => id.to_string(),
@@ -2107,8 +2105,10 @@ mod semis_des_dossiers_de_bibliotheque_tests {
         // Rien ne doit etre ecrit — et surtout pas « [] », qui vaudrait
         // « l'utilisateur a tout retire » pour tous les demarrages suivants.
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-        let mut config = TuneConfig::default();
-        config.music_dirs = vec![vide.clone()];
+        let config = TuneConfig {
+            music_dirs: vec![vide.clone()],
+            ..Default::default()
+        };
         persist_initial_settings(&state, &config);
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -2123,8 +2123,10 @@ mod semis_des_dossiers_de_bibliotheque_tests {
         // Sans elle, un `dossier_semable` qui refuserait tout serait vert
         // ci-dessus tout en empechant TOUTE installation Docker de demarrer.
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-        let mut config = TuneConfig::default();
-        config.music_dirs = vec![vide, plein.clone()];
+        let config = TuneConfig {
+            music_dirs: vec![vide, plein.clone()],
+            ..Default::default()
+        };
         persist_initial_settings(&state, &config);
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
@@ -2154,8 +2156,10 @@ mod semis_des_dossiers_de_bibliotheque_tests {
         settings.set("music_dirs", "[]").unwrap();
 
         let t = arbre();
-        let mut config = TuneConfig::default();
-        config.music_dirs = vec![t.path().join("plein").to_string_lossy().to_string()];
+        let config = TuneConfig {
+            music_dirs: vec![t.path().join("plein").to_string_lossy().to_string()],
+            ..Default::default()
+        };
         persist_initial_settings(&state, &config);
 
         assert_eq!(

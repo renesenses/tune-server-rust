@@ -57,7 +57,14 @@ fn exec(state: &AppState, sql: &str) {
 /// | Echo    | `dr_album=DR12.5`                             | `null`     |
 fn bibliotheque() -> axum::Router {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    let pistes: [(i64, i64, &str, &[(&str, &str)]); 6] = [
+    // (id de piste, id d'album, titre, étiquettes)
+    type Piste = (
+        i64,
+        i64,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+    let pistes: [Piste; 6] = [
         (1, 1, "Alpha", &[("dr_album", "9"), ("dr_track", "7")]),
         (2, 2, "Bravo", &[("dr_track", "12"), ("dr_source", "tag")]),
         (

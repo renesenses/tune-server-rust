@@ -132,11 +132,13 @@ const ALBUMS_ATTENDUS: usize = 2;
 /// Plancher du détecteur : un banc qui ne porterait plus les deux natures
 /// (répétition entre axes ET séparation par la taille) ne prouverait plus rien.
 fn exige_un_banc_des_deux_natures() {
-    assert!(
-        ITEMS_PUBLIES > PISTES_ATTENDUES,
-        "le banc ne publie plus la même piste sous deux axes : le repli ne \
+    const {
+        assert!(
+            ITEMS_PUBLIES > PISTES_ATTENDUES,
+            "le banc ne publie plus la même piste sous deux axes : le repli ne \
          serait plus mis à l'épreuve"
-    );
+        )
+    };
     let tailles: std::collections::BTreeSet<u64> = AXE_ALBUM
         .iter()
         .chain(AXE_GENRE)

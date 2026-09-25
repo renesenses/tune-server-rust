@@ -49,7 +49,8 @@ pub(crate) fn decide_compilation_albums<'a>(
 ) -> HashMap<(String, String), VerdictAlbum> {
     // Par album : (un tag dit VRAI, un tag dit FAUX, un artiste « Various
     // Artists », les graphies d'artiste d'album rencontrées).
-    let mut acc: HashMap<(String, String), (bool, bool, bool, HashSet<String>)> = HashMap::new();
+    type Indices = (bool, bool, bool, HashSet<String>);
+    let mut acc: HashMap<(String, String), Indices> = HashMap::new();
     for (dir, album, album_artist, tag) in items {
         let e = acc.entry((dir, album.to_lowercase())).or_default();
         match tag {
@@ -362,6 +363,9 @@ fn sanitize_track_row_text(track: &mut Track) -> Vec<tune_core::metadata::TextCo
     corrections
 }
 
+/// Clé du cache d'albums : (dossier, titre, artiste d'album, année, release MB).
+type CleDAlbum = (String, String, i64, Option<i32>, Option<String>);
+
 /// Batch-stateful importer that resolves a scanned file's artist and album in
 /// the DB and builds its [`Track`] row, sharing one implementation between the
 /// manual scan and the auto/startup + watcher scans.
@@ -392,7 +396,7 @@ pub struct TrackImporter {
     // The album's FOLDER leads the key: it is what identifies a release (see
     // `scanner::album_folder`), so two rips of the same album in two folders
     // never share a cache entry even though title+artist+year match.
-    album_cache: HashMap<(String, String, i64, Option<i32>, Option<String>), Arc<Album>>,
+    album_cache: HashMap<CleDAlbum, Arc<Album>>,
     albums_with_cover: HashSet<i64>,
     /// Par album : le condensat de CONTENU de la jaquette qui FAIT RÉFÉRENCE
     /// — celle dont la pochette d'album a été tirée (#4650).
@@ -1247,26 +1251,26 @@ impl TrackImporter {
         // bouge. Rien n'est enregistré si l'écriture du cache échoue, sinon la
         // base annonce « a une image » sans rien sur le disque (carré gris +
         // saut définitif).
-        if let Some(ref art) = track_artist {
-            if art.image_path.is_none() {
-                match tune_core::library::artwork::folder_artist_image_hash(
-                    std::path::Path::new(&sf.path),
-                    &self.cache_dir,
-                ) {
-                    Some(hash) => {
-                        let mut updated_artist = tune_core::db::models::Artist::clone(art);
-                        updated_artist.image_path = Some(hash);
-                        updated_artist.image_source = Some("local".to_string());
-                        if let Err(e) = self.artist_repo.update(&updated_artist) {
-                            tracing::warn!(error = %e, "artist_image_update_failed");
-                        }
+        if let Some(ref art) = track_artist
+            && art.image_path.is_none()
+        {
+            match tune_core::library::artwork::folder_artist_image_hash(
+                std::path::Path::new(&sf.path),
+                &self.cache_dir,
+            ) {
+                Some(hash) => {
+                    let mut updated_artist = tune_core::db::models::Artist::clone(art);
+                    updated_artist.image_path = Some(hash);
+                    updated_artist.image_source = Some("local".to_string());
+                    if let Err(e) = self.artist_repo.update(&updated_artist) {
+                        tracing::warn!(error = %e, "artist_image_update_failed");
                     }
-                    None => {
-                        tracing::trace!(
-                            artist = %art.name,
-                            "artist_image_absente_ou_non_mise_en_cache"
-                        );
-                    }
+                }
+                None => {
+                    tracing::trace!(
+                        artist = %art.name,
+                        "artist_image_absente_ou_non_mise_en_cache"
+                    );
                 }
             }
         }

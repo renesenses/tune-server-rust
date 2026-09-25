@@ -2588,10 +2588,10 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
         }
         if let Some(output) = outputs.get(&id) {
             let output = output.lock().await;
-            if let Ok(status) = output.get_status().await {
-                if status.state == tune_core::outputs::traits::TransportState::Playing {
-                    return true;
-                }
+            if let Ok(status) = output.get_status().await
+                && status.state == tune_core::outputs::traits::TransportState::Playing
+            {
+                return true;
             }
         }
     }
