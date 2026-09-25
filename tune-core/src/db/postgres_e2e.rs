@@ -1290,6 +1290,10 @@ async fn pg_config_backup_zones_volume_fixe() {
     use crate::config_backup::scenarios_playlists;
     scenarios_playlists::une_playlist_de_trois_pistes_fait_l_aller_retour(&db);
     scenarios_playlists::une_sauvegarde_existante_se_restaure(&db);
+    // #5066 — titres de service (#4922) : meme base, playlist effacee entre
+    // l'export et la restauration.
+    scenarios_playlists::une_playlist_mixte_fait_l_aller_retour(&db, &db);
+    scenarios_playlists::une_sauvegarde_a_titres_de_service_se_restaure(&db);
 
     // #4983 — la restauration des favoris, meme raison d'etre jouee ici.
     use crate::config_backup::scenarios_favoris;
