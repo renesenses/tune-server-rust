@@ -11,6 +11,23 @@
 //! | `DELETE /invitations/{id}`            | `DELETE /invitations/{id}`             |
 //! | `DELETE /members/{user_id}`           | `DELETE /members/{user_id}`            |
 //!
+//! Avenant « plusieurs cercles » (#5018, 25/09) : les `members` sont les
+//! CONTACTS, et les cercles leurs classements privés par le propriétaire.
+//! Purement additif ; `GET /` y gagne la clé `circles`, relayée telle quelle.
+//!
+//! | Tune (`/api/v1/ext/circle`)                  | mozaiklabs (`/api/v1/circle`)          |
+//! |----------------------------------------------|----------------------------------------|
+//! | `POST /invitations` `{ "email", "circle_id"? }` | `POST /invitations`                 |
+//! | `POST /circles` `{ "name" }`                 | `POST /circles`                        |
+//! | `PATCH /circles/{id}` `{ "name" }`           | `PATCH /circles/{id}`                  |
+//! | `DELETE /circles/{id}`                       | `DELETE /circles/{id}`                 |
+//! | `PUT /circles/{id}/members/{user_id}`        | `PUT /circles/{id}/members/{user_id}`  |
+//! | `DELETE /circles/{id}/members/{user_id}`     | `DELETE /circles/{id}/members/{user_id}` |
+//!
+//! Le nom (1 à 60 caractères, unique sans casse : 409 `circle_name_taken`),
+//! le plafond (422 `too_many_circles`) et la propriété du cercle (404) sont
+//! jugés par le cloud seul, et relayés avec leur corps.
+//!
 //! ## Les états
 //!
 //! * **Réponse du cloud** (2xx, 4xx — dont 401, 404, 429) : statut et corps
@@ -31,7 +48,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -51,6 +68,15 @@ pub fn router(relais: Arc<Relais>) -> Router<()> {
         .route("/invitations/{id}/accept", post(accepter))
         .route("/invitations/{id}/decline", post(refuser))
         .route("/members/{user_id}", delete(revoquer))
+        .route("/circles", post(creer_cercle))
+        .route(
+            "/circles/{id}",
+            delete(supprimer_cercle).patch(renommer_cercle),
+        )
+        .route(
+            "/circles/{id}/members/{user_id}",
+            put(ranger).delete(deranger),
+        )
         .with_state(relais)
 }
 
@@ -129,7 +155,16 @@ async fn inviter(State(relais): State<Arc<Relais>>, corps: Bytes) -> Response {
         .ok()
         .and_then(|v| v.get("email").cloned())
         .unwrap_or(Value::Null);
-    let envoi = json!({ "email": email });
+    let mut envoi = json!({ "email": email });
+    // Avenant « plusieurs cercles » : `circle_id`, facultatif, part tel que le
+    // client l'a donné, et seulement s'il l'a donné. Le cloud juge s'il désigne
+    // un cercle de l'appelant.
+    if let Some(circle_id) = serde_json::from_slice::<Value>(&corps)
+        .ok()
+        .and_then(|v| v.get("circle_id").cloned())
+    {
+        envoi["circle_id"] = circle_id;
+    }
     en_reponse(
         relais
             .appeler(
@@ -200,6 +235,101 @@ async fn revoquer(State(relais): State<Arc<Relais>>, Path(user_id): Path<String>
                 "DELETE /members/{user_id}",
                 Method::DELETE,
                 &["members", &user_id],
+                None,
+            )
+            .await,
+    )
+}
+
+// Avenant « plusieurs cercles » ---------------------------------------------
+
+/// `{ "name" }` et rien d'autre, `null` s'il manque : le cloud juge le nom.
+fn corps_du_nom(corps: &Bytes) -> Value {
+    let name = serde_json::from_slice::<Value>(corps)
+        .ok()
+        .and_then(|v| v.get("name").cloned())
+        .unwrap_or(Value::Null);
+    json!({ "name": name })
+}
+
+async fn creer_cercle(State(relais): State<Arc<Relais>>, corps: Bytes) -> Response {
+    let envoi = corps_du_nom(&corps);
+    en_reponse(
+        relais
+            .appeler("POST /circles", Method::POST, &["circles"], Some(&envoi))
+            .await,
+    )
+}
+
+async fn renommer_cercle(
+    State(relais): State<Arc<Relais>>,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if !identifiant_valide(&id) {
+        return introuvable();
+    }
+    let envoi = corps_du_nom(&corps);
+    en_reponse(
+        relais
+            .appeler(
+                "PATCH /circles/{id}",
+                Method::PATCH,
+                &["circles", &id],
+                Some(&envoi),
+            )
+            .await,
+    )
+}
+
+async fn supprimer_cercle(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    if !identifiant_valide(&id) {
+        return introuvable();
+    }
+    en_reponse(
+        relais
+            .appeler(
+                "DELETE /circles/{id}",
+                Method::DELETE,
+                &["circles", &id],
+                None,
+            )
+            .await,
+    )
+}
+
+async fn ranger(
+    State(relais): State<Arc<Relais>>,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Response {
+    if !identifiant_valide(&id) || !identifiant_valide(&user_id) {
+        return introuvable();
+    }
+    en_reponse(
+        relais
+            .appeler(
+                "PUT /circles/{id}/members/{user_id}",
+                Method::PUT,
+                &["circles", &id, "members", &user_id],
+                None,
+            )
+            .await,
+    )
+}
+
+async fn deranger(
+    State(relais): State<Arc<Relais>>,
+    Path((id, user_id)): Path<(String, String)>,
+) -> Response {
+    if !identifiant_valide(&id) || !identifiant_valide(&user_id) {
+        return introuvable();
+    }
+    en_reponse(
+        relais
+            .appeler(
+                "DELETE /circles/{id}/members/{user_id}",
+                Method::DELETE,
+                &["circles", &id, "members", &user_id],
                 None,
             )
             .await,

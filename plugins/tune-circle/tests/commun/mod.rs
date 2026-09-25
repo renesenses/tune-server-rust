@@ -11,6 +11,17 @@
 //! Il tient le cercle d'UN compte (le détenteur du jeton), compte les appels
 //! reçus, et sait jouer la panne (500) et le débit dépassé (429). Il sert
 //! aussi `POST /oauth/token` pour le rafraîchissement.
+//!
+//! Avenant « plusieurs cercles » (#5018, 25/09) : `GET /` porte aussi
+//! `circles` (les cercles DU détenteur, `{ id, name, member_ids }`) ;
+//! `POST /circles` = 201 et le cercle ; `PATCH /circles/{id}` et
+//! `PUT /circles/{id}/members/{user_id}` (idempotent) = 200 et le cercle ;
+//! les deux `DELETE` = 200 `{ "ok": true }`. Nom de 1 à 60 caractères
+//! (422 `invalid_name`), unique sans casse (409 `circle_name_taken`), au plus
+//! [`CERCLES_MAX`] (422 `too_many_circles`) ; cercle d'un autre ou non-contact
+//! = 404. Révoquer un contact le retire de tous les cercles ; supprimer un
+//! cercle ne révoque personne. `circle_id` d'une invitation est gardé pour
+//! [`Faux::acceptee_par_l_invite`].
 
 #![allow(dead_code)]
 
@@ -20,7 +31,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use tune_core::db::backend::DbBackend;
@@ -41,6 +52,10 @@ pub const COURRIEL_MEMBRE: &str = "alice.membre@exemple.fr";
 pub const COURRIEL_QUI_NOUS_INVITE: &str = "denis.invitant@exemple.fr";
 /// L'adresse d'une invitation déjà envoyée et en attente : 409 `already_invited`.
 pub const COURRIEL_DEJA_INVITE: &str = "bob.envoye@exemple.fr";
+/// Plafond de cercles par utilisateur (avenant de #5018).
+pub const CERCLES_MAX: usize = 50;
+/// Un cercle qui existe chez mozaiklabs, mais appartient à un AUTRE compte.
+pub const CERCLE_D_UN_AUTRE: i64 = 77;
 
 pub struct Faux {
     pub jeton_valide: String,
@@ -56,6 +71,11 @@ pub struct Faux {
     /// Le dernier corps reçu par `POST /invitations`.
     pub dernier_corps: Option<Value>,
     pub prochain_id: i64,
+    /// Les cercles du détenteur du jeton.
+    pub circles: Vec<Value>,
+    pub prochain_cercle_id: i64,
+    /// Le `circle_id` porté par chaque invitation envoyée (id → circle_id).
+    pub rangement_des_invitations: Vec<(i64, Value)>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -75,6 +95,10 @@ pub fn cercle_initial() -> Value {
               "created_at": "2026-09-21T08:00:00Z", "expires_at": "2026-10-21T08:00:00Z" },
             { "id": 22, "name_or_email": "Emma",
               "created_at": "2026-09-22T08:00:00Z", "expires_at": "2026-10-22T08:00:00Z" }
+        ],
+        "circles": [
+            { "id": 1, "name": "Famille", "member_ids": [7, 9] },
+            { "id": 2, "name": "Jazz", "member_ids": [9] }
         ]
     })
 }
@@ -93,11 +117,56 @@ impl Faux {
             invitations_permises: 10,
             dernier_corps: None,
             prochain_id: 12,
+            circles: c["circles"].as_array().unwrap().clone(),
+            prochain_cercle_id: 3,
+            rangement_des_invitations: Vec::new(),
         }
     }
 
     pub fn cercle(&self) -> Value {
-        json!({ "members": self.members, "sent": self.sent, "received": self.received })
+        json!({
+            "members": self.members, "sent": self.sent, "received": self.received,
+            "circles": self.circles
+        })
+    }
+
+    /// Ce que fait le cloud quand l'invité accepte, de SON côté, une
+    /// invitation envoyée : il devient contact, et il est rangé dans le cercle
+    /// que portait l'invitation — si ce cercle existe encore. Rend son `user_id`.
+    pub fn acceptee_par_l_invite(&mut self, invitation_id: i64) -> Option<i64> {
+        let i = position(&self.sent, "id", &invitation_id.to_string())?;
+        let inv = self.sent.remove(i);
+        let user_id = 200 + invitation_id;
+        self.members.push(json!({
+            "user_id": user_id, "name": inv["name_or_email"],
+            "since": "2026-09-25T10:00:00Z"
+        }));
+        let circle_id = self
+            .rangement_des_invitations
+            .iter()
+            .find(|(id, _)| *id == invitation_id)
+            .map(|(_, c)| c.clone());
+        if let Some(c) = circle_id
+            && let Some(k) = self.circles.iter().position(|x| x["id"] == c)
+        {
+            self.circles[k]["member_ids"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(user_id));
+        }
+        Some(user_id)
+    }
+
+    /// Les `member_ids` du cercle `id`, `None` s'il n'existe pas.
+    pub fn membres_du_cercle(&self, id: i64) -> Option<Vec<i64>> {
+        self.circles.iter().find(|c| c["id"] == id).map(|c| {
+            c["member_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m.as_i64().unwrap())
+                .collect()
+        })
     }
 }
 
@@ -182,6 +251,10 @@ async fn inviter(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Respon
     if f.sent.iter().any(|i| i["name_or_email"] == email) {
         return refus(StatusCode::CONFLICT, "already_invited");
     }
+    if let Some(c) = v.get("circle_id") {
+        let id = f.prochain_id;
+        f.rangement_des_invitations.push((id, c.clone()));
+    }
     let invitation = json!({
         "id": f.prochain_id, "name_or_email": email,
         "created_at": "2026-09-25T08:00:00Z", "expires_at": "2026-10-25T08:00:00Z"
@@ -192,12 +265,17 @@ async fn inviter(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Respon
     (StatusCode::CREATED, Json(invitation)).into_response()
 }
 
-fn position(v: &[Value], cle: &str, id: &str) -> Option<usize> {
-    v.iter().position(|x| match &x[cle] {
+/// Un identifiant JSON (entier ou chaîne) lu tel qu'il est dans le chemin.
+fn meme_id(v: &Value, id: &str) -> bool {
+    match v {
         Value::String(s) => s == id,
         Value::Number(n) => n.to_string() == id,
         _ => false,
-    })
+    }
+}
+
+fn position(v: &[Value], cle: &str, id: &str) -> Option<usize> {
+    v.iter().position(|x| meme_id(&x[cle], id))
 }
 
 async fn accepter(State(e): State<Partage>, h: HeaderMap, Path(id): Path<String>) -> Response {
@@ -250,6 +328,143 @@ async fn revoquer(State(e): State<Partage>, h: HeaderMap, Path(uid): Path<String
         return introuvable();
     };
     f.members.remove(i);
+    // Révoquer un contact le retire de TOUS les cercles, aussitôt.
+    for c in &mut f.circles {
+        c["member_ids"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|m| !meme_id(m, &uid));
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+// Avenant « plusieurs cercles » ---------------------------------------------
+
+/// Le nom valide (1 à 60 caractères), `None` s'il faut refuser (422).
+fn nom_valide(corps: &Bytes) -> Option<String> {
+    let v: Value = serde_json::from_slice(corps).unwrap_or(Value::Null);
+    v["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| (1..=60).contains(&n.chars().count()))
+        .map(str::to_string)
+}
+
+fn nom_invalide() -> Response {
+    refus(StatusCode::UNPROCESSABLE_ENTITY, "invalid_name")
+}
+
+/// Un autre cercle du propriétaire porte-t-il déjà ce nom, casse ignorée ?
+fn nom_pris(f: &Faux, nom: &str, sauf: Option<usize>) -> bool {
+    let nom = nom.to_lowercase();
+    f.circles.iter().enumerate().any(|(k, c)| {
+        Some(k) != sauf
+            && c["name"].as_str().map(str::to_lowercase).as_deref() == Some(nom.as_str())
+    })
+}
+
+async fn creer_cercle(State(e): State<Partage>, h: HeaderMap, corps: Bytes) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let Some(nom) = nom_valide(&corps) else {
+        return nom_invalide();
+    };
+    if nom_pris(&f, &nom, None) {
+        return refus(StatusCode::CONFLICT, "circle_name_taken");
+    }
+    if f.circles.len() >= CERCLES_MAX {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "too_many_circles");
+    }
+    let cercle = json!({ "id": f.prochain_cercle_id, "name": nom, "member_ids": [] });
+    f.prochain_cercle_id += 1;
+    f.circles.push(cercle.clone());
+    (StatusCode::CREATED, Json(cercle)).into_response()
+}
+
+async fn renommer_cercle(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    let Some(nom) = nom_valide(&corps) else {
+        return nom_invalide();
+    };
+    if nom_pris(&f, &nom, Some(k)) {
+        return refus(StatusCode::CONFLICT, "circle_name_taken");
+    }
+    f.circles[k]["name"] = json!(nom);
+    Json(f.circles[k].clone()).into_response()
+}
+
+async fn supprimer_cercle(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    // Les contacts restent : supprimer un cercle ne révoque personne.
+    f.circles.remove(k);
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn ranger(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((id, uid)): Path<(String, String)>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    let Some(m) = position(&f.members, "user_id", &uid) else {
+        return introuvable();
+    };
+    let user_id = f.members[m]["user_id"].clone();
+    let ids = f.circles[k]["member_ids"].as_array_mut().unwrap();
+    if !ids.contains(&user_id) {
+        ids.push(user_id);
+    }
+    Json(f.circles[k].clone()).into_response()
+}
+
+async fn deranger(
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path((id, uid)): Path<(String, String)>,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    if position(&f.members, "user_id", &uid).is_none() {
+        return introuvable();
+    }
+    f.circles[k]["member_ids"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|m| !meme_id(m, &uid));
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -284,6 +499,15 @@ pub async fn demarrer() -> Serveur {
         .route("/api/v1/circle/invitations/{id}/accept", post(accepter))
         .route("/api/v1/circle/invitations/{id}/decline", post(refuser))
         .route("/api/v1/circle/members/{user_id}", delete(revoquer))
+        .route("/api/v1/circle/circles", post(creer_cercle))
+        .route(
+            "/api/v1/circle/circles/{id}",
+            delete(supprimer_cercle).patch(renommer_cercle),
+        )
+        .route(
+            "/api/v1/circle/circles/{id}/members/{user_id}",
+            put(ranger).delete(deranger),
+        )
         .route("/oauth/token", post(jeton))
         .with_state(etat.clone());
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
