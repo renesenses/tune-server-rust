@@ -2764,7 +2764,9 @@ fn le_fil_de_lecture_local_publie_ses_transformations_a_l_ouverture_et_a_chaque_
     );
 
     let gapless = production
-        .find("etage.spec = nouvelle_spec;")
+        // #4953 : la nouvelle spec est posée par la frontière de l'étage
+        // (`EtageDeConversion::enchainer_la_piste`), que la boucle appelle.
+        .find("etage.enchainer_la_piste(&mut *puits, nouvelle_spec, regles, &device_name)")
         .expect("la mise à jour gapless de l'étage doit rester identifiable");
     let apres_gapless = &production[gapless..];
     let republiee = apres_gapless
