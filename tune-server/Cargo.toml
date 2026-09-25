@@ -691,6 +691,15 @@ path = "tests/zones_auto_create_recension.rs"
 name = "serveur_media_didl_hors_auth_3933"
 path = "tests/serveur_media_didl_hors_auth_3933.rs"
 
+# #1390 puis #4955 — les critères de `Search` tels qu'un point de contrôle les
+# envoie (clause `@refID`, parenthèses, `or`, `upnp:artist`, `SortCriteria`),
+# posés sur la VRAIE route du serveur média. Le fichier existait depuis #1390
+# mais `autotests = false` plus haut le laissait hors compilation : ses
+# témoins n'avaient jamais été exécutés.
+[[test]]
+name = "serveur_media_criteres_canoniques"
+path = "tests/serveur_media_criteres_canoniques.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.
