@@ -64,6 +64,129 @@ fn public(s: &Source) -> Value {
         "last_success": s.last_success, "report": s.report, "generation": s.generation,
         "pending_count": s.pending.len()})
 }
+
+/// L'état d'import des sources UPnP synchronisées, tel que `/library/stats`
+/// le porte dans son champ additif `upnp_import`.
+///
+/// `library/stats` annonçait le nombre de pistes UPnP importées sans réserve,
+/// alors que le dernier bilan de chaque source SAIT si l'import est complet :
+/// mesuré sur le .18 le 24/09, 49 395 pistes importées sur 50 772, plafond de
+/// 1 000 conteneurs atteint, 34 paginations interrompues — et l'écran n'en
+/// disait rien. Rien n'est recalculé ici : c'est le bilan persisté de la
+/// dernière passe (`report`), lu tel quel.
+///
+/// Une erreur de lecture ne fait pas tomber la route qui l'appelle : elle rend
+/// `null`, et les compteurs existants continuent de répondre.
+pub(crate) fn etat_d_import(db: &dyn DbBackend) -> Value {
+    let Ok(toutes) = sources(db) else {
+        return Value::Null;
+    };
+    let mut par_source = Vec::new();
+    let mut raisons = Vec::new();
+    let mut plafonds: Vec<String> = Vec::new();
+    let (mut erreurs, mut interrompues, mut incompletes) = (0usize, 0usize, 0usize);
+    let (mut distinctes, mut vus, mut visites, mut sans_url) = (0u64, 0u64, 0u64, 0u64);
+    for s in &toutes {
+        let r = &s.report;
+        let complet = r["complet"] == true;
+        let liste_erreurs: Vec<&str> = r["erreurs"]
+            .as_array()
+            .map(|e| e.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let nb_interrompues = liste_erreurs
+            .iter()
+            .filter(|e| e.contains("pagination interrompue"))
+            .count();
+        let plafond = r["parcours"]["plafond_atteint"].as_str();
+        let n = |v: &Value| v.as_u64().unwrap_or(0);
+        let ecartees = n(&r["pistes"]["ecartees_sans_url_de_lecture"]);
+        let raison = if complet {
+            None
+        } else if let Some(e) = r["error"].as_str() {
+            Some(e.to_string())
+        } else if r["indexe"] == false {
+            Some(
+                r["detail"]
+                    .as_str()
+                    .or(r["raison"].as_str())
+                    .unwrap_or("source indisponible")
+                    .to_string(),
+            )
+        } else if r.get("complet").is_none() {
+            Some("aucun import terminé pour cette source".to_string())
+        } else {
+            let mut morceaux = Vec::new();
+            if let Some(message) = r["parcours"]["plafond"]["message"].as_str() {
+                morceaux.push(message.to_string());
+            } else if let Some(nature) = plafond {
+                morceaux.push(format!("plafond de {nature} atteint"));
+            }
+            if nb_interrompues > 0 {
+                morceaux.push(format!("{nb_interrompues} pagination(s) interrompue(s)"));
+            }
+            let autres = liste_erreurs.len() - nb_interrompues;
+            if autres > 0 {
+                morceaux.push(format!("{autres} autre(s) erreur(s) de parcours"));
+            }
+            if ecartees > 0 {
+                morceaux.push(format!(
+                    "{ecartees} piste(s) écartée(s) sans URL de lecture"
+                ));
+            }
+            if morceaux.is_empty() {
+                morceaux.push("dernier bilan incomplet".to_string());
+            }
+            Some(morceaux.join(" ; "))
+        };
+        if let Some(raison) = &raison {
+            incompletes += 1;
+            raisons.push(format!("{} : {raison}", s.name));
+        }
+        if let Some(nature) = plafond {
+            if !plafonds.iter().any(|p| p == nature) {
+                plafonds.push(nature.to_string());
+            }
+        }
+        erreurs += liste_erreurs.len();
+        interrompues += nb_interrompues;
+        distinctes += n(&r["pistes"]["distinctes"]);
+        vus += n(&r["parcours"]["items_vus"]);
+        visites += n(&r["parcours"]["conteneurs_visites"]);
+        sans_url += ecartees;
+        par_source.push(json!({
+            "key": s.key,
+            "name": s.name,
+            "udn": s.udn,
+            "container": s.container,
+            "status": s.status,
+            "last_attempt": s.last_attempt,
+            "last_success": s.last_success,
+            "complet": raison.is_none(),
+            "raison": raison,
+            "plafond_atteint": plafond,
+            "erreurs": liste_erreurs.len(),
+            "paginations_interrompues": nb_interrompues,
+            "pistes_distinctes": r["pistes"]["distinctes"],
+            "items_vus": r["parcours"]["items_vus"],
+            "conteneurs_visites": r["parcours"]["conteneurs_visites"],
+        }));
+    }
+    json!({
+        "sources": toutes.len(),
+        // Sans source, il n'y a pas d'import à juger : ni complet ni incomplet.
+        "complet": if toutes.is_empty() { Value::Null } else { json!(incompletes == 0) },
+        "sources_incompletes": incompletes,
+        "raisons": raisons,
+        "plafonds_atteints": plafonds,
+        "erreurs": erreurs,
+        "paginations_interrompues": interrompues,
+        "pistes_distinctes": distinctes,
+        "items_vus": vus,
+        "conteneurs_visites": visites,
+        "ecartees_sans_url_de_lecture": sans_url,
+        "par_source": par_source,
+    })
+}
 pub async fn list(State(state): State<AppState>) -> ApiResult {
     Ok(Json(
         json!({"items": sources(state.backend.as_ref()).map_err(error)?.iter().map(public).collect::<Vec<_>>()}),

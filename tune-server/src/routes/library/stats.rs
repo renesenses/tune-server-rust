@@ -164,6 +164,12 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
         "total_size_bytes": total_size_bytes,
     });
     ajouter_ventilation(&mut corps, &VentilationParSource::lire(&state));
+    // Le compte `tracks_by_source.upnp` ne dit pas si l'import est entier :
+    // le dernier bilan de chaque source synchronisée, lui, le sait (plafond
+    // atteint, paginations interrompues…). Champ ADDITIF : rien d'existant ne
+    // change de valeur ; le client l'affichera à côté du compte.
+    corps["upnp_import"] =
+        crate::routes::synchronisation_upnp::etat_d_import(state.backend.as_ref());
     Ok(Json(corps))
 }
 
