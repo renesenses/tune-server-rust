@@ -89,20 +89,15 @@ pub(super) fn poser_cover(dossier: &Path, cover: Option<&[u8]>) {
     }
 }
 
-/// Un album de deux pistes sous une racine de musique, daté d'hier.
-///
-/// Racine sous le dossier courant et NON sous le dossier temporaire du
-/// système : `is_tune_temp_file` écarte tout ce qui vit sous ce dernier.
-pub(super) fn album_sur_disque(
-    epreuve: &str,
+/// Un album de deux pistes, `<racine>/Didier/<nom>/`, tagué `ALBUM = nom`,
+/// daté d'hier.
+pub(super) fn album_dans(
+    racine: &Path,
+    nom: &str,
     jaquette: Option<&[u8]>,
     cover: Option<&[u8]>,
-) -> (tune_core::test_scratch::ScratchDir, PathBuf, Vec<PathBuf>) {
-    let racine = tune_core::test_scratch::scratch_dir_in(
-        std::env::current_dir().unwrap(),
-        &format!("pochettes-5034-{epreuve}"),
-    );
-    let dossier = racine.join("Didier").join("Album");
+) -> (PathBuf, Vec<PathBuf>) {
+    let dossier = racine.join("Didier").join(nom);
     std::fs::create_dir_all(&dossier).unwrap();
     let mut pistes = Vec::new();
     for (i, titre) in ["Un", "Deux"].iter().enumerate() {
@@ -117,7 +112,7 @@ pub(super) fn album_sur_disque(
             ("TITLE", *titre),
             ("ARTIST", "Didier"),
             ("ALBUMARTIST", "Didier"),
-            ("ALBUM", "Album de Didier"),
+            ("ALBUM", nom),
             ("TRACKNUMBER", n.as_str()),
         ] {
             vc.insert(k.to_string(), v.to_string());
@@ -132,7 +127,28 @@ pub(super) fn album_sur_disque(
     if cover.is_some() {
         dater(&dossier.join("cover.jpg"), hier());
     }
-    (racine, dossier, pistes)
+    (dossier, pistes)
+}
+
+/// Une racine de musique neuve, sous le dossier courant et NON sous le
+/// dossier temporaire du système : `is_tune_temp_file` écarte tout ce qui vit
+/// sous ce dernier.
+pub(super) fn racine(epreuve: &str) -> tune_core::test_scratch::ScratchDir {
+    tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        &format!("pochettes-5034-{epreuve}"),
+    )
+}
+
+/// Un album de deux pistes seul sous une racine de musique neuve.
+pub(super) fn album_sur_disque(
+    epreuve: &str,
+    jaquette: Option<&[u8]>,
+    cover: Option<&[u8]>,
+) -> (tune_core::test_scratch::ScratchDir, PathBuf, Vec<PathBuf>) {
+    let r = racine(epreuve);
+    let (dossier, pistes) = album_dans(&r, "Album de Didier", jaquette, cover);
+    (r, dossier, pistes)
 }
 
 pub(super) fn etat_sur(racine: &Path) -> AppState {
@@ -211,13 +227,14 @@ pub(super) fn lot_du_surveillant(
     db: &Arc<dyn DbBackend>,
     racine: &Path,
     pistes_touchees: &[PathBuf],
-    cover: Option<(&Path, bool)>,
+    covers: &[(PathBuf, bool)],
 ) {
     let mut evenements: Vec<Event> = pistes_touchees
         .iter()
         .map(|p| Event::new(EventKind::Modify(ModifyKind::Any)).add_path(p.clone()))
         .collect();
-    if let Some((chemin, existe)) = cover {
+    for (chemin, existe) in covers {
+        let existe = *existe;
         // Windows : `FILE_ACTION_REMOVED` → `Remove(Any)` ; une écriture en
         // place → `Modify(Any)` ; une création → `Create(Any)`.
         let genre = if !existe {
@@ -227,7 +244,7 @@ pub(super) fn lot_du_surveillant(
         } else {
             EventKind::Create(CreateKind::Any)
         };
-        evenements.push(Event::new(genre).add_path(chemin.to_path_buf()));
+        evenements.push(Event::new(genre).add_path(chemin.clone()));
     }
     let changes = tune_core::scanner::watcher::rejouer_evenements_notify(evenements);
     let (prets, en_attente) = settle_partition(changes, &[]);
@@ -281,6 +298,10 @@ pub(super) struct Cas {
     pub apres: (Option<&'static [u8]>, Option<&'static [u8]>),
     /// `None` : l'album ne doit plus avoir de pochette.
     pub attendu: Option<&'static [u8]>,
+    /// Ce qu'attend l'« Analyse complète » quand elle diffère des passes
+    /// automatiques (elle seule remplace une pochette de fournisseur ou de
+    /// source inconnue).
+    pub complet: Option<Option<&'static [u8]>>,
 }
 
 fn nommer(h: Option<&str>) -> String {
@@ -311,97 +332,96 @@ fn album_de(db: &Arc<dyn DbBackend>, piste: &Path) -> i64 {
         .expect("album")
 }
 
-/// Joue UN cas par UNE passe ; rend ce que la base porte à la fin, nommé.
-pub(super) async fn jouer(cas: &Cas, passe: Passe) -> (String, String) {
-    let epreuve = format!(
-        "{:?}-{}",
-        passe,
-        cas.nom
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect::<String>()
-    );
-    let (racine, dossier, pistes) = album_sur_disque(&epreuve, cas.avant.0, cas.avant.1);
-    let etat = etat_sur(&racine);
+/// Joue le tableau par UNE passe : tous les cas vivent sous la MÊME racine de
+/// musique, un album par cas, indexés par un seul scan, et la passe est jouée
+/// UNE fois — deux scans par passe, pas deux par cas. (Le droit de scanner est
+/// global au processus : cent scans d'affilée affamaient les épreuves voisines
+/// qui en lancent un et le veulent tout de suite.)
+///
+/// Rend TOUS les écarts d'un coup : un rouge dit chaque cas faux, pas
+/// seulement le premier.
+pub(super) async fn jouer_le_tableau(table: &str, cas: &[Cas], passe: Passe) {
+    let r = racine(&format!("{table}-{passe:?}"));
+    let albums: Vec<(PathBuf, Vec<PathBuf>)> = cas
+        .iter()
+        .enumerate()
+        .map(|(i, c)| album_dans(&r, &format!("Album {i:02}"), c.avant.0, c.avant.1))
+        .collect();
+    let etat = etat_sur(&r);
     let db = etat.backend.clone();
     scan_manuel(&etat, false, None).await;
-    let aid = album_de(&db, &pistes[0]);
     let repo = AlbumRepo::with_backend(db.clone());
-    match cas.pochette {
-        Avant::DuScan => {}
-        Avant::Televersee => repo
-            .force_update_cover_path(aid, &content_hash(TELEVERSEE), SourcePochette::Televersee)
-            .unwrap(),
-        Avant::Fournisseur => repo
-            .force_update_cover_path(aid, &content_hash(FOURNISSEUR), SourcePochette::Fournisseur)
-            .unwrap(),
-        Avant::SourceInconnue => {
-            db.execute(
-                "UPDATE albums SET cover_source = NULL, cover_source_path = NULL, \
-                 cover_source_stamp = NULL WHERE id = ?",
-                &[&aid],
-            )
-            .unwrap();
+    let mut avant = Vec::new();
+    for (c, (_, pistes)) in cas.iter().zip(&albums) {
+        let aid = album_de(&db, &pistes[0]);
+        match c.pochette {
+            Avant::DuScan => {}
+            Avant::Televersee => repo
+                .force_update_cover_path(aid, &content_hash(TELEVERSEE), SourcePochette::Televersee)
+                .unwrap(),
+            Avant::Fournisseur => repo
+                .force_update_cover_path(
+                    aid,
+                    &content_hash(FOURNISSEUR),
+                    SourcePochette::Fournisseur,
+                )
+                .unwrap(),
+            Avant::SourceInconnue => {
+                db.execute(
+                    "UPDATE albums SET cover_source = NULL, cover_source_path = NULL, \
+                     cover_source_stamp = NULL WHERE id = ?",
+                    &[&aid],
+                )
+                .unwrap();
+            }
+            Avant::AdresseHeritee => {
+                let heritee = artwork_hash(&pistes[0].to_string_lossy());
+                db.execute(
+                    "UPDATE albums SET cover_path = ?, cover_source = NULL, \
+                     cover_source_path = NULL, cover_source_stamp = NULL WHERE id = ?",
+                    &[&heritee as &dyn tune_core::db::backend::ToSqlValue, &aid],
+                )
+                .unwrap();
+            }
         }
-        Avant::AdresseHeritee => {
-            let heritee = artwork_hash(&pistes[0].to_string_lossy());
-            db.execute(
-                "UPDATE albums SET cover_path = ?, cover_source = NULL, \
-                 cover_source_path = NULL, cover_source_stamp = NULL WHERE id = ?",
-                &[&heritee as &dyn tune_core::db::backend::ToSqlValue, &aid],
-            )
-            .unwrap();
-        }
+        avant.push(nommer(
+            repo.get(aid).unwrap().unwrap().cover_path.as_deref(),
+        ));
     }
-    let avant = nommer(repo.get(aid).unwrap().unwrap().cover_path.as_deref());
 
-    // Le geste, sur le disque.
+    // Les gestes, sur le disque.
     let mut touchees = Vec::new();
-    if cas.apres.0 != cas.avant.0 {
-        for p in &pistes {
-            poser_jaquette(p, cas.apres.0);
-            touchees.push(p.clone());
+    let mut covers = Vec::new();
+    for (c, (dossier, pistes)) in cas.iter().zip(&albums) {
+        if c.apres.0 != c.avant.0 {
+            for p in pistes {
+                poser_jaquette(p, c.apres.0);
+                touchees.push(p.clone());
+            }
         }
-    }
-    let cover_touche = cas.apres.1 != cas.avant.1;
-    if cover_touche {
-        poser_cover(&dossier, cas.apres.1);
+        if c.apres.1 != c.avant.1 {
+            poser_cover(dossier, c.apres.1);
+            covers.push((dossier.join("cover.jpg"), c.apres.1.is_some()));
+        }
     }
 
     match passe {
         Passe::Rapide => scan_manuel(&etat, false, None).await,
-        Passe::Repertoires => scan_manuel(&etat, false, Some(&dossier)).await,
+        Passe::Repertoires => scan_manuel(&etat, false, Some(&r.join("Didier"))).await,
         Passe::Complete => scan_manuel(&etat, true, None).await,
         Passe::Demarrage => scan_de_demarrage(&db).await,
-        Passe::Surveillant => {
-            let cover = dossier.join("cover.jpg");
-            lot_du_surveillant(
-                &db,
-                &racine,
-                &touchees,
-                cover_touche.then_some((cover.as_path(), cas.apres.1.is_some())),
-            );
-        }
+        Passe::Surveillant => lot_du_surveillant(&db, &r, &touchees, &covers),
     }
-    let aid = album_de(&db, &pistes[0]);
-    let apres = nommer(
-        AlbumRepo::with_backend(db.clone())
-            .get(aid)
-            .unwrap()
-            .unwrap()
-            .cover_path
-            .as_deref(),
-    );
-    (avant, apres)
-}
 
-/// Joue le tableau par une passe, et rend TOUS les écarts d'un coup : un
-/// rouge dit chaque cas faux, pas seulement le premier.
-pub(super) async fn jouer_le_tableau(cas: &[Cas], passe: Passe) {
     let mut ecarts = Vec::new();
-    for c in cas {
-        let (avant, apres) = jouer(c, passe).await;
-        let attendu = nommer(c.attendu.map(content_hash).as_deref());
+    for ((c, (_, pistes)), avant) in cas.iter().zip(&albums).zip(avant) {
+        let aid = album_de(&db, &pistes[0]);
+        let apres = nommer(repo.get(aid).unwrap().unwrap().cover_path.as_deref());
+        let attendu = match (passe, c.complet) {
+            (Passe::Complete, Some(a)) => a,
+            _ => c.attendu,
+        };
+        let attendu = nommer(attendu.map(content_hash).as_deref());
         if apres != attendu {
             ecarts.push(format!(
                 "{passe:?} / {} : avant « {avant} », après « {apres} », attendu « {attendu} »",
@@ -420,6 +440,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::DuScan,
         apres: (None, None),
         attendu: None,
+        complet: None,
     },
     Cas {
         nom: "6b jaquette retiree, cover.jpg present",
@@ -427,6 +448,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::DuScan,
         apres: (None, Some(COVER)),
         attendu: Some(COVER),
+        complet: None,
     },
     Cas {
         nom: "8 cover.jpg retire sans jaquette",
@@ -434,6 +456,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::DuScan,
         apres: (None, None),
         attendu: None,
+        complet: None,
     },
     Cas {
         nom: "8b cover.jpg retire, jaquette presente",
@@ -441,6 +464,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::DuScan,
         apres: (Some(JAQUETTE), None),
         attendu: Some(JAQUETTE),
+        complet: None,
     },
     Cas {
         nom: "televersee puis jaquette retiree",
@@ -448,6 +472,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::Televersee,
         apres: (None, None),
         attendu: Some(TELEVERSEE),
+        complet: None,
     },
     Cas {
         nom: "televersee puis cover.jpg retire",
@@ -455,6 +480,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::Televersee,
         apres: (None, None),
         attendu: Some(TELEVERSEE),
+        complet: None,
     },
     Cas {
         nom: "fournisseur puis cover.jpg retire",
@@ -462,6 +488,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::Fournisseur,
         apres: (None, None),
         attendu: Some(FOURNISSEUR),
+        complet: None,
     },
     Cas {
         nom: "source inconnue (avant migration) puis cover.jpg retire",
@@ -469,6 +496,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::SourceInconnue,
         apres: (None, None),
         attendu: Some(COVER),
+        complet: None,
     },
     Cas {
         nom: "source inconnue (avant migration) puis jaquette retiree",
@@ -476,6 +504,7 @@ pub(super) const RETRAITS: &[Cas] = &[
         pochette: Avant::SourceInconnue,
         apres: (None, None),
         attendu: Some(JAQUETTE),
+        complet: None,
     },
 ];
 
@@ -491,36 +520,37 @@ const RETRAIT_PROUVE: &[Cas] = &[Cas {
     pochette: Avant::AdresseHeritee,
     apres: (None, None),
     attendu: None,
+    complet: None,
 }];
 
 #[tokio::test]
 async fn retraits_par_l_analyse_rapide_5034() {
-    jouer_le_tableau(RETRAITS, Passe::Rapide).await;
-    jouer_le_tableau(RETRAIT_PROUVE, Passe::Rapide).await;
+    jouer_le_tableau("retraits", RETRAITS, Passe::Rapide).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Rapide).await;
 }
 
 #[tokio::test]
 async fn retraits_par_repertoires_5034() {
-    jouer_le_tableau(RETRAITS, Passe::Repertoires).await;
-    jouer_le_tableau(RETRAIT_PROUVE, Passe::Repertoires).await;
+    jouer_le_tableau("retraits", RETRAITS, Passe::Repertoires).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Repertoires).await;
 }
 
 #[tokio::test]
 async fn retraits_par_l_analyse_complete_5034() {
-    jouer_le_tableau(RETRAITS, Passe::Complete).await;
-    jouer_le_tableau(RETRAIT_PROUVE, Passe::Complete).await;
+    jouer_le_tableau("retraits", RETRAITS, Passe::Complete).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Complete).await;
 }
 
 #[tokio::test]
 async fn retraits_par_le_scan_de_demarrage_5034() {
-    jouer_le_tableau(RETRAITS, Passe::Demarrage).await;
-    jouer_le_tableau(RETRAIT_PROUVE, Passe::Demarrage).await;
+    jouer_le_tableau("retraits", RETRAITS, Passe::Demarrage).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Demarrage).await;
 }
 
 #[tokio::test]
 async fn retraits_par_le_surveillant_5034() {
-    jouer_le_tableau(RETRAITS, Passe::Surveillant).await;
-    jouer_le_tableau(RETRAIT_PROUVE, Passe::Surveillant).await;
+    jouer_le_tableau("retraits", RETRAITS, Passe::Surveillant).await;
+    jouer_le_tableau("prouve", RETRAIT_PROUVE, Passe::Surveillant).await;
 }
 
 /// Le surveillant relaie désormais les images de pochette — et SEULEMENT
