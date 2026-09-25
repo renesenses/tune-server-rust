@@ -532,6 +532,11 @@ pub(super) fn build_signal_path(
         transport: (transport_bit_perfect, transport_desc, output_format_name),
         verdicts,
         transformations_reelles,
+        canaux_declares: tune_core::audio::canaux_declares::disposition_declaree(
+            backend,
+            zone.id.unwrap_or(0),
+        )
+        .map(|d| d.channel_count()),
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
@@ -589,6 +594,9 @@ struct Analyse<'a> {
     verdicts: Verdicts,
     /// Ce que la sortie a réellement fait (REF-6b) ; `None` = non publié.
     transformations_reelles: Option<&'a TransformationsReelles>,
+    /// Fils 1914/1913 — les canaux de la disposition déclarée pour la zone,
+    /// pour dire la CAUSE d'une réduction réseau.
+    canaux_declares: Option<u16>,
 }
 
 /// Les étapes affichées, le résumé et les métriques DSP.
@@ -614,6 +622,7 @@ fn assembler_les_etapes(
     analyse: Analyse<'_>,
 ) -> Etapes {
     let (transport_bit_perfect, transport_desc, output_format_name) = analyse.transport;
+    let canaux_declares = analyse.canaux_declares;
     let Source {
         wire_sample_rate,
         wire_bit_depth,
@@ -997,8 +1006,11 @@ fn assembler_les_etapes(
     if reel.is_none()
         && tune_core::orchestrator::is_network_output_type(Some(output_type))
         && let (Some(entree), Some(sortie)) = (canaux_source, canaux_du_fil)
-        && let Some(etiquette) =
-            tune_core::audio::canaux_reseau_4573::etiquette_de_reduction(entree, Some(sortie))
+        && let Some(etiquette) = tune_core::audio::canaux_reseau_4573::etiquette_de_reduction_reseau(
+            entree,
+            sortie,
+            canaux_declares,
+        )
     {
         steps.push(json!({
             "name": "Canaux",

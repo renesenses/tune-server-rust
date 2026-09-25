@@ -1286,11 +1286,21 @@ impl PlaybackOrchestrator {
         } else {
             None
         };
+        // Fils 1914/1913 — la disposition DÉCLARÉE pour la zone est un second
+        // plafond, lu sous les mêmes gardes que la sonde. Elle ne fait que
+        // réduire (plancher stéréo) ; le renderer garde le dernier mot quand
+        // il annonce moins. Voir `plafond_de_canaux`.
+        let canaux_declares = if is_network_output && !dsd_passthrough && canaux_source > 2 {
+            crate::audio::canaux_declares::disposition_declaree(&self.db, req.zone_id)
+                .map(|d| d.channel_count())
+        } else {
+            None
+        };
         let canaux_reduits = crate::audio::canaux_reseau_4573::canaux_a_servir(
             is_network_output,
             dsd_passthrough,
             canaux_source,
-            canaux_renderer,
+            crate::audio::canaux_reseau_4573::plafond_de_canaux(canaux_renderer, canaux_declares),
         );
         if let Some(cible) = canaux_reduits {
             info!(

@@ -87,6 +87,48 @@ pub fn canaux_a_servir(
     (cible < canaux_source).then_some(cible)
 }
 
+/// Fils 1914/1913 — le plafond de canaux d'une zone RÉSEAU : le plus petit
+/// des nombres CONNUS entre ce qu'annonce le renderer et la disposition que
+/// l'utilisateur a déclarée ([`super::canaux_declares::disposition_declaree`]).
+///
+/// Reivax66 (Denon AVR-X1600H) : « la case canaux suivre l'appareil reste
+/// grisée ». Le sélecteur se verrouillait sur toute zone non locale, alors
+/// que le chemin réseau SAIT replier une piste — c'est ce module. La
+/// déclaration y devient un second plafond, et rien de plus :
+///
+/// - elle ne fabrique jamais de canal : [`canaux_a_servir`] ne fait que
+///   réduire, avec son plancher stéréo ;
+/// - le renderer garde le dernier mot quand il annonce moins ;
+/// - deux ignorances ne font pas une déclaration : `None`, piste intacte.
+pub fn plafond_de_canaux(
+    canaux_renderer: Option<u16>,
+    canaux_declares: Option<u16>,
+) -> Option<u16> {
+    [canaux_renderer, canaux_declares]
+        .into_iter()
+        .flatten()
+        .filter(|n| *n > 0)
+        .min()
+}
+/// L'étiquette du chemin du signal pour une réduction RÉSEAU mesurée, avec sa
+/// CAUSE. Quand la disposition déclarée — ramenée au plancher stéréo, comme
+/// dans [`canaux_a_servir`] — égale ce qui part sur le fil, c'est le choix de
+/// l'utilisateur qui a tranché ; sinon c'est l'annonce du lecteur.
+pub fn etiquette_de_reduction_reseau(
+    canaux_source: u16,
+    canaux_du_fil: u16,
+    canaux_declares: Option<u16>,
+) -> Option<String> {
+    if !reduction_de_canaux_requise(canaux_source, Some(canaux_du_fil)) {
+        return None;
+    }
+    if canaux_declares.map(|d| d.max(2)) == Some(canaux_du_fil) {
+        return Some(format!(
+            "{canaux_source} → {canaux_du_fil} canaux (disposition choisie)"
+        ));
+    }
+    etiquette_de_reduction(canaux_source, Some(canaux_du_fil))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +213,71 @@ mod tests {
             etiquette_de_reduction(8, Some(6)).as_deref(),
             Some("8 → 6 canaux (annoncés par le lecteur)")
         );
+    }
+    /// Fils 1914/1913 — la disposition déclarée plafonne une zone dont le
+    /// renderer se tait : c'est ce qui rend le sélecteur utile en réseau.
+    #[test]
+    fn une_declaration_plafonne_un_lecteur_muet() {
+        assert_eq!(plafond_de_canaux(None, Some(2)), Some(2));
+        assert_eq!(
+            canaux_a_servir(true, false, 6, plafond_de_canaux(None, Some(2))),
+            Some(2)
+        );
+    }
+    /// 🔴 Le renderer garde le dernier mot : déclarer 7.1 chez un Denon qui
+    /// annonce deux canaux ne rend pas six voies au fil.
+    #[test]
+    fn le_plus_petit_des_nombres_connus_l_emporte() {
+        assert_eq!(plafond_de_canaux(Some(2), Some(8)), Some(2));
+        assert_eq!(plafond_de_canaux(Some(8), Some(6)), Some(6));
+        assert_eq!(
+            canaux_a_servir(true, false, 8, plafond_de_canaux(Some(2), Some(8))),
+            Some(2)
+        );
+    }
+    /// 🔴 Rien de déclaré, rien d'annoncé : la piste part intacte, comme avant.
+    #[test]
+    fn deux_ignorances_ne_font_pas_une_declaration() {
+        assert_eq!(plafond_de_canaux(None, None), None);
+        assert_eq!(plafond_de_canaux(Some(0), None), None);
+        assert_eq!(
+            canaux_a_servir(true, false, 6, plafond_de_canaux(None, None)),
+            None
+        );
+    }
+    /// Une déclaration ne fabrique jamais de canal : une stéréo reste stéréo
+    /// sous un 7.1 déclaré, et un 5.1 sous un 7.1 passe intact.
+    #[test]
+    fn une_declaration_plus_large_que_la_source_ne_touche_a_rien() {
+        assert_eq!(
+            canaux_a_servir(true, false, 2, plafond_de_canaux(None, Some(8))),
+            None
+        );
+        assert_eq!(
+            canaux_a_servir(true, false, 6, plafond_de_canaux(None, Some(8))),
+            None
+        );
+    }
+    #[test]
+    fn l_etiquette_dit_la_cause_de_la_reduction() {
+        assert_eq!(
+            etiquette_de_reduction_reseau(6, 2, Some(2)).as_deref(),
+            Some("6 → 2 canaux (disposition choisie)")
+        );
+        // Mono déclaré : le plancher stéréo sert deux voies, et c'est bien
+        // le choix qui a tranché.
+        assert_eq!(
+            etiquette_de_reduction_reseau(6, 2, Some(1)).as_deref(),
+            Some("6 → 2 canaux (disposition choisie)")
+        );
+        assert_eq!(
+            etiquette_de_reduction_reseau(6, 2, Some(8)).as_deref(),
+            Some("6 → 2 canaux (annoncés par le lecteur)")
+        );
+        assert_eq!(
+            etiquette_de_reduction_reseau(6, 2, None).as_deref(),
+            Some("6 → 2 canaux (annoncés par le lecteur)")
+        );
+        assert_eq!(etiquette_de_reduction_reseau(2, 2, Some(2)), None);
     }
 }
