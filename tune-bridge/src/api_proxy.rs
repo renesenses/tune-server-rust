@@ -46,17 +46,17 @@ pub async fn proxy_api(
     let mut relay_headers = serde_json::Map::new();
     for (name, value) in headers.iter() {
         let key = name.as_str();
-        if matches!(key, "content-type" | "accept" | "authorization" | "range") {
-            if let Ok(v) = value.to_str() {
-                // Ne PAS transmettre un `Authorization` qui porte le jeton de
-                // pont : il ne concerne que le relais, et le serveur y
-                // chercherait un `Bearer`. Un vrai `Bearer` destine au serveur
-                // passe, lui, sans y toucher.
-                if key == "authorization" && porte_un_jeton_de_pont(v) {
-                    continue;
-                }
-                relay_headers.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+        if matches!(key, "content-type" | "accept" | "authorization" | "range")
+            && let Ok(v) = value.to_str()
+        {
+            // Ne PAS transmettre un `Authorization` qui porte le jeton de
+            // pont : il ne concerne que le relais, et le serveur y
+            // chercherait un `Bearer`. Un vrai `Bearer` destine au serveur
+            // passe, lui, sans y toucher.
+            if key == "authorization" && porte_un_jeton_de_pont(v) {
+                continue;
             }
+            relay_headers.insert(key.to_string(), serde_json::Value::String(v.to_string()));
         }
     }
 

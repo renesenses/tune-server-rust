@@ -279,10 +279,10 @@ impl Registre {
         self.0.lock().ok().and_then(|m| m.get(cle).cloned())
     }
     fn poser(&self, cle: &str, etape: Etape) {
-        if let Ok(mut m) = self.0.lock() {
-            if let Some(t) = m.get_mut(cle) {
-                t.etape = etape;
-            }
+        if let Ok(mut m) = self.0.lock()
+            && let Some(t) = m.get_mut(cle)
+        {
+            t.etape = etape;
         }
     }
     /// Inscrire une tâche. `false` si elle tourne déjà — on ne descend pas
@@ -291,13 +291,13 @@ impl Registre {
         let Ok(mut m) = self.0.lock() else {
             return false;
         };
-        if let Some(t) = m.get(cle) {
-            if matches!(
+        if let Some(t) = m.get(cle)
+            && matches!(
                 t.etape,
                 Etape::Page | Etape::Telechargement { .. } | Etape::Extraction
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
         m.insert(
             cle.to_string(),

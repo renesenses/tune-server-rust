@@ -74,7 +74,7 @@ async fn list_smart_playlists(
             "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists ORDER BY name",
             &[],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -84,7 +84,7 @@ async fn list_smart_playlists(
                 .unwrap_or_else(|| "[]".into());
             let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
                 "match_mode": cols.get(7).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
@@ -137,7 +137,7 @@ async fn create_smart_playlist(
                 &body.max_tracks as &dyn ToSqlValue,
             ],
         )
-        .map_err(|e| AppError::internal(e));
+        .map_err(AppError::internal);
 
     match result {
         Ok(id) => {
@@ -168,7 +168,7 @@ async fn get_smart_playlist(
     let result = state
         .backend
         .query_one(sql, &[&id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     match result {
         Some(cols) => {
@@ -178,7 +178,7 @@ async fn get_smart_playlist(
                 .unwrap_or_else(|| "[]".into());
             let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
             Ok(Json(json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
                 "match_mode": cols.get(7).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
@@ -311,7 +311,7 @@ async fn update_smart_playlist(
     let result = state
         .backend
         .query_one(sql, &[&id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     match result {
         Some(cols) => {
@@ -321,7 +321,7 @@ async fn update_smart_playlist(
                 .unwrap_or_else(|| "[]".into());
             let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
             Ok(Json(json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
                 "sort_by": cols.get(3).and_then(|v| v.as_string()),
@@ -409,7 +409,7 @@ pub(crate) fn build_smart_query_rapport(
 
         let val_clean = value.replace('\'', "''");
         let val_unaccented = strip_accents(&val_clean);
-        let has_accents = val_clean != val_unaccented;
+        let _has_accents = val_clean != val_unaccented;
 
         // Les deux champs qui ne sont pas une colonne : ils se comptent
         // ailleurs, dans l'historique d'écoute.
@@ -441,7 +441,7 @@ pub(crate) fn build_smart_query_rapport(
             // propose passaient par là — dont `composer` en entier et `title`
             // avec tout autre opérateur que « contient ».
             match regles_sql::colonne_piste(field)
-                .and_then(|col| regles_sql::condition(col, op, &value))
+                .and_then(|col| regles_sql::condition(col, op, value))
             {
                 Some(c) => c,
                 None => {
@@ -544,12 +544,12 @@ fn execute_smart_track_query(
     let rows = state
         .backend
         .query_many(&sql, &[])
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(rows
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "title": cols.get(1).and_then(|v| v.as_string()),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -699,11 +699,14 @@ async fn avec_pistes_de_catalogue(
     Ok(pistes)
 }
 
+/// Critères d'une playlist intelligente : (rules, sort_by, sort_order, match_mode, max_tracks).
+type CriteresDePlaylist = (String, String, String, String, Option<i64>);
+
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
 fn load_smart_criteria(
     state: &SmartHttpState,
     id: i64,
-) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
+) -> Result<Option<CriteresDePlaylist>, AppError> {
     let sql = if state.backend.engine() == Engine::Postgres {
         "SELECT rules, sort_by, sort_order, max_tracks, match_mode FROM smart_playlists WHERE id = $1"
     } else {
@@ -712,10 +715,10 @@ fn load_smart_criteria(
     let result = state
         .backend
         .query_one(sql, &[&id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     Ok(result.map(|cols| {
         (
-            cols.get(0)
+            cols.first()
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "[]".into()),
             cols.get(1)
@@ -1431,11 +1434,10 @@ mod catalogue_de_service {
     /// ce que le service rend, il ne cherche pas un album de ce nom.
     #[tokio::test]
     async fn le_titre_de_piste_trie_ce_que_le_service_rend() {
-        let r = format!(
-            r#"[{{"field":"source","op":"=","value":"catalogue:qobuz"}},
-                {{"field":"artist","op":"=","value":"John Coltrane"}},
-                {{"field":"title","op":"=","value":"Naima"}}]"#
-        );
+        let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                {"field":"artist","op":"=","value":"John Coltrane"},
+                {"field":"title","op":"=","value":"Naima"}]"#
+            .to_string();
         let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), &r, None).await else {
             panic!("demande valide")
         };

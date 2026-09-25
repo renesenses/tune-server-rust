@@ -70,10 +70,10 @@ impl RelayState {
                 return Err("server_id already registered");
             }
         } else {
-            if let Some(owner) = &token_owner {
-                if owner != &server_id {
-                    return Err("bridge_token already bound to another server");
-                }
+            if let Some(owner) = &token_owner
+                && owner != &server_id
+            {
+                return Err("bridge_token already bound to another server");
             }
             if self.servers.len() >= self.max_servers {
                 return Err("max servers reached");
