@@ -1108,3 +1108,10 @@ required-features = ["postgres"]
 [[test]]
 name = "playlists_pistes_de_service"
 path = "tests/playlists_pistes_de_service.rs"
+
+# #5124 : le rapport de bogue, l'export des journaux et le ticket de support
+# sortent sans adresse, chemin personnel ni jeton — lu sur les routes montées
+# et sur les envois captés par un nuage simulé.
+[[test]]
+name = "rapport_sans_donnees_personnelles_5124"
+path = "tests/rapport_sans_donnees_personnelles_5124.rs"

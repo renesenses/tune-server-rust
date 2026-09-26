@@ -1455,7 +1455,11 @@ fn selectionner_lignes(
 }
 
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    collect_recent_logs(q.lines.unwrap_or(1000)).await
+    // #5124 — « Exporter les journaux » : le fichier finit collé dans un fil.
+    // Même nettoyage que le rapport de bogue, par la même fonction.
+    let Json(mut journaux) = collect_recent_logs(q.lines.unwrap_or(1000)).await;
+    tune_core::confidentialite::anonymiser_json(&mut journaux);
+    Json(journaux)
 }
 
 #[derive(Deserialize)]
@@ -2567,7 +2571,7 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         md.push_str("\n```\n");
     }
 
-    Json(json!({
+    let mut rapport = json!({
         "version": tune_core::version(),
         // #3380 — le champ que la telemetrie reprend et que l'admin mozaiklabs
         // affichera a cote de `version`. `null` = interface non identifiable.
@@ -2648,7 +2652,14 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "settings": reglages,
         "audio": moteur_audio,
         "markdown": md,
-    }))
+    });
+    // #5124 — ce rapport part tel quel sur le forum PUBLIC (`submit`), en
+    // pièce jointe d'un ticket (`markdown`), et l'aperçu doit montrer
+    // exactement ce qui partira. Le nom qu'annonce un serveur UPnP, les
+    // répertoires musicaux et le journal portent des adresses, des chemins
+    // personnels et des jetons : on nettoie ICI, à la seule source des trois.
+    tune_core::confidentialite::anonymiser_json(&mut rapport);
+    Json(rapport)
 }
 
 /// Returns the bug report as raw markdown (text/markdown) for direct forum paste.

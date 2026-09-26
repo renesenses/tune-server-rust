@@ -1511,10 +1511,13 @@ impl StreamingService for TidalService {
                     });
                 }
 
-                info!(body = %body, "tidal_token_exchange_success");
+                // #5124 — la réponse porte les jetons d'accès et de
+                // rafraîchissement : jamais son contenu dans le journal, que le
+                // testeur joint à un rapport public. Sa taille suffit.
+                info!(body_len = body.len(), "tidal_token_exchange_success");
 
                 let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
-                    warn!(error = %e, body = %body, "tidal_token_parse_failed");
+                    warn!(error = %e, body_len = body.len(), "tidal_token_parse_failed");
                     format!("token parse: {e}")
                 })?;
                 let access_token_clone = token.access_token.clone();
