@@ -1424,6 +1424,10 @@ mod crossfeed_bibliotheque_reseau;
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
 
+// #5080 — un flux de service à traitement actif part en WAV progressif.
+#[cfg(test)]
+mod service_wav_progressif_5080;
+
 mod dsp;
 pub use dsp::PorteeDuReglage;
 // Greffons natifs tiers : l'étage casque de la chaîne, avec une vraie
