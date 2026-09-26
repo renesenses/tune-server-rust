@@ -107,24 +107,83 @@ pub(super) fn zone_eq_alters_signal(
 }
 
 /// Description du traitement EQ réellement configuré, y compris le headroom
-/// automatique. Le limiteur est nommé comme absent : le pré-gain réserve la
-/// marge des boosts, il ne faut plus confondre l'EQ avec une protection de crête.
+/// automatique.
+///
+/// #5171 — la réserve est nommée (`sûre` / `réaliste`) et le pré-gain affiché
+/// est celui qu'elle applique réellement (`EqProfile::reserve_db_at`). En
+/// réserve sûre, le limiteur est nommé comme absent : le pré-gain réserve la
+/// norme L1, aucune crête ne peut saturer. En réserve réaliste, le limiteur de
+/// sécurité est présent, et la description dit s'il a agi.
 pub(super) fn zone_eq_step_description(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     zone_id: i64,
 ) -> Option<String> {
     let profile = active_zone_eq_profile(backend, zone_id)?;
-    let left = profile.automatic_headroom_db(0);
-    let right = profile.automatic_headroom_db(1);
-    if (left - right).abs() < 0.01 {
-        Some(format!(
-            "EQ actif (pré-gain auto {left:.1} dB, sans limiteur)"
-        ))
+    let sr = tune_core::audio::eq::DEBIT_DE_REFERENCE_HZ;
+    let left = profile.reserve_db_at(0, sr);
+    let right = profile.reserve_db_at(1, sr);
+    let pre_gain = if (left - right).abs() < 0.01 {
+        format!("pré-gain auto {left:.1} dB")
     } else {
-        Some(format!(
-            "EQ actif (pré-gain auto G {left:.1} dB / D {right:.1} dB, sans limiteur)"
-        ))
+        format!("pré-gain auto G {left:.1} dB / D {right:.1} dB")
+    };
+    Some(match profile.headroom_mode {
+        tune_core::audio::eq::HeadroomMode::Safe => {
+            format!("EQ actif (réserve sûre, {pre_gain}, sans limiteur)")
+        }
+        tune_core::audio::eq::HeadroomMode::Realistic => {
+            format!(
+                "EQ actif (réserve réaliste, {pre_gain}, {})",
+                phrase_du_limiteur(&tune_core::audio::limiteur::REGISTRE.releve())
+            )
+        }
+    })
+}
+
+/// #5171 — ce que le limiteur de sécurité a fait, en clair. Le compteur est
+/// celui du PROCESSUS (comme les compteurs d'écrêtage de #2218) : il cumule
+/// toutes les zones en réserve réaliste depuis le démarrage du serveur.
+pub(super) fn phrase_du_limiteur(r: &tune_core::audio::limiteur::ReleveLimiteur) -> String {
+    if r.trames_limitees == 0 {
+        "limiteur de sécurité, n'a pas agi".to_string()
+    } else {
+        format!(
+            "limiteur de sécurité, a agi sur {} trames ({:.3} %) depuis le démarrage, \
+             {:.1} dB au plus",
+            r.trames_limitees, r.pourcentage, r.reduction_max_db
+        )
     }
+}
+
+/// #5171 — la réserve de l'égaliseur de la zone, pour l'écran : le mode, le
+/// pré-gain réellement appliqué par canal (au débit de référence) et, en mode
+/// réaliste, le compteur du limiteur. `None` quand l'égaliseur ne modifie pas
+/// le signal (éteint, neutre, PURE).
+pub(super) fn zone_eq_headroom(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<serde_json::Value> {
+    let profile = active_zone_eq_profile(backend, zone_id)?;
+    let sr = tune_core::audio::eq::DEBIT_DE_REFERENCE_HZ;
+    let arrondi = |db: f64| (db * 100.0).round() / 100.0 + 0.0;
+    let limiteur =
+        (profile.headroom_mode == tune_core::audio::eq::HeadroomMode::Realistic).then(|| {
+            let r = tune_core::audio::limiteur::REGISTRE.releve();
+            json!({
+                "portee": "processus",
+                "trames_vues": r.trames_vues,
+                "trames_limitees": r.trames_limitees,
+                "pourcentage": r.pourcentage,
+                "reduction_max_db": r.reduction_max_db,
+                "pistes_limitees": r.pistes_limitees,
+                "a_agi": r.trames_limitees > 0,
+            })
+        });
+    Some(json!({
+        "mode": profile.headroom_mode.code(),
+        "reserve_db": [arrondi(profile.reserve_db_at(0, sr)), arrondi(profile.reserve_db_at(1, sr))],
+        "limiter": limiteur,
+    }))
 }
 
 /// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
@@ -563,6 +622,8 @@ pub(super) fn build_signal_path(
         "runtime_observed": runtime_signal_path.is_some(),
         "runtime_reasons": runtime_signal_path.map(|status| &status.reasons),
         "dsp_metrics": etapes.dsp_metrics,
+        // #5171 — la réserve de l'égaliseur (sûre / réaliste) et le limiteur.
+        "eq_headroom": zone_eq_headroom(backend, zone_id_courant),
         // #3973 — « jouer, et le dire ». PURE promet un chemin intouché ;
         // une conversion de fréquence le dégrade, et l'écran doit le dire au
         // lieu d'allumer le badge. `strict_bitperfect` : la zone refuserait

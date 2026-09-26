@@ -950,6 +950,12 @@ path = "tests/compensation_de_niveau_4685.rs"
 name = "compensation_rendue_au_volume_5069"
 path = "tests/compensation_rendue_au_volume_5069.rs"
 
+# #5171 — le réglage « Réserve » de l'égaliseur (sûre / réaliste) par le
+# routeur réel, et la compensation de niveau qui suit la réserve appliquée.
+[[test]]
+name = "reserve_egaliseur_5171"
+path = "tests/reserve_egaliseur_5171.rs"
+
 # #4684 — les préréglages nommés du crossfeed (`/crossfeed/presets`) et les
 # bornes publiées par `GET /zones/{id}/dsp` (#4683). `autotests = false` en tête
 # de ce manifeste : sans cette cible, ce fichier ne serait JAMAIS compilé.

@@ -4531,6 +4531,8 @@ struct EqSettings {
     enabled: Option<bool>,
     preset: Option<String>,
     bands: Option<Vec<Value>>,
+    /// #5171 — la réserve : `safe` ou `realistic`. Absent = inchangée.
+    headroom_mode: Option<String>,
 }
 
 fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
@@ -4581,6 +4583,10 @@ async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json
         "enabled": profile.enabled && !bands.is_empty(),
         "preset": if bands.is_empty() { "flat" } else { "custom" },
         "bands": bands,
+        // #5171 — toujours présent : sa présence dit au client que ce serveur
+        // connaît le réglage « Réserve » (un serveur plus ancien ne l'envoie
+        // pas, et le client cache alors le contrôle).
+        "headroom_mode": profile.headroom_mode.code(),
     }))
 }
 
@@ -4659,6 +4665,23 @@ async fn set_eq(
     if let Some(enabled) = body.enabled {
         profile.enabled = enabled;
     }
+    // #5171 — la réserve. Une valeur inconnue se VOIT (400) au lieu de
+    // retomber en silence sur la réserve sûre.
+    if let Some(code) = body.headroom_mode.as_deref() {
+        match tune_core::audio::eq::HeadroomMode::depuis_code(code) {
+            Some(mode) => profile.headroom_mode = mode,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("headroom_mode inconnu : {code}"),
+                        "known": ["safe", "realistic"],
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
     let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
 
     // Persister ne suffit pas : sans ceci, le reglage n'atteignait le son qu'a
@@ -4675,6 +4698,7 @@ async fn set_eq(
         "enabled": profile.enabled,
         "preset": body.preset.unwrap_or_else(|| "custom".into()),
         "bands": bands,
+        "headroom_mode": profile.headroom_mode.code(),
         // Vrai quand le reglage vient d'atteindre le son d'un flux en cours.
         // Faux ne signale PAS un echec : rien ne joue, la zone n'est pas
         // locale, ou elle est en PURE. Expose pour qu'un client puisse dire

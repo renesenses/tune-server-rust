@@ -416,10 +416,23 @@ pub(super) async fn set_zone_dsp(
     let mut eq_applique_a_chaud = false;
     let mut eq_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
     if let Some(eq_val) = body.get("eq_profile") {
-        if let Ok(profile) =
+        if let Ok(mut profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
         {
             let key = format!("zone_{id}_eq_profile");
+            // #5171 — la réserve est un choix de l'utilisateur, pas une
+            // propriété de la courbe : un corps qui ne la porte pas (l'écran
+            // « Profil acoustique », un client d'avant #5171) la garde telle
+            // qu'elle est enregistrée au lieu de la ramener à « Sûre ».
+            if eq_val.get("headroom_mode").is_none() {
+                profile.headroom_mode = settings
+                    .get(&key)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str::<tune_core::audio::eq::EqProfile>(&s).ok())
+                    .map(|p| p.headroom_mode)
+                    .unwrap_or_default();
+            }
             let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
             // Persister ne suffit pas : sans ceci le reglage n'atteint le son
             // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
