@@ -4,11 +4,20 @@ pub fn build_signal_path_pub(
     ps: &ZoneState,
     zone: &Zone,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    licence: Option<&tune_core::license::LicenseManager>,
     renderer_label: Option<&str>,
     audio_backend: &str,
     wire: Option<&StreamInfo>,
 ) -> Option<Value> {
-    build_signal_path(ps, zone, backend, renderer_label, audio_backend, wire)
+    build_signal_path_sous_licence(
+        ps,
+        zone,
+        backend,
+        licence,
+        renderer_label,
+        audio_backend,
+        wire,
+    )
 }
 
 /// #1395 — sur la ZONE, dire quel backend de sortie locale tourne vraiment,
@@ -499,6 +508,23 @@ pub(super) fn build_signal_path(
     audio_backend: &str,
     wire: Option<&StreamInfo>,
 ) -> Option<Value> {
+    build_signal_path_sous_licence(ps, zone, backend, None, renderer_label, audio_backend, wire)
+}
+
+/// [`build_signal_path`], sous la licence du serveur (#5114).
+///
+/// `licence` est le `LicenseManager` que l'orchestrateur consulte avant de
+/// charger le crossfeed : le miroir de la compensation réseau passe par la
+/// MÊME garde. `None` : aucune garde, comme un orchestrateur sans licence.
+pub(super) fn build_signal_path_sous_licence(
+    ps: &ZoneState,
+    zone: &Zone,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    licence: Option<&tune_core::license::LicenseManager>,
+    renderer_label: Option<&str>,
+    audio_backend: &str,
+    wire: Option<&StreamInfo>,
+) -> Option<Value> {
     if ps.state == PlayState::Stopped {
         return None;
     }
@@ -521,7 +547,15 @@ pub(super) fn build_signal_path(
     // mesuré le publie, et `None` laisse chaque verdict à sa déduction.
     let transformations_reelles = ps.transformations_reelles.as_ref();
 
-    let traitements = relever_les_traitements(backend, zone, np, output_type, runtime_signal_path);
+    let traitements = relever_les_traitements(
+        backend,
+        licence,
+        zone,
+        np,
+        output_type,
+        runtime_signal_path,
+        wire,
+    );
     let forcages = decider_les_forcages(
         zone,
         backend,
@@ -698,6 +732,8 @@ fn assembler_les_etapes(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        compensation_reseau_db,
+        crossfeed_du_flux,
         ui_volume,
         volume_full,
         ..
@@ -1029,6 +1065,42 @@ fn assembler_les_etapes(
         }));
     }
 
+    // Étape « Crossfeed » (#5114) — le crossfeed que le flux RÉSEAU porte
+    // dans ses octets. Ce panneau ne le voyait pas : l'étape DSP ne lit que
+    // l'égaliseur et le préréglage, et une zone DLNA dont le flux croisait
+    // les voies se disait « bit-perfect ». Ce n'est pas une déduction des
+    // réglages : c'est le fait que la session publie (`StreamInfo::crossfeed`),
+    // posé là où le processeur réellement chargé — licence, greffon, PURE et
+    // case compris — entre dans le flux. Une piste servie telle quelle (cas 3
+    // de #2742) ne l'annonce donc pas, et n'affiche rien.
+    //
+    // Place : après l'égaliseur et le convolveur, avant la compensation —
+    // l'ordre de `StreamingDsp::process` et du ré-encodage par le fichier.
+    if crossfeed_du_flux {
+        steps.push(json!({
+            "name": "Crossfeed",
+            "code": "crossfeed",
+            "description": "Crossfeed casque dans le flux (voies gauche et droite croisées)",
+            "bit_perfect": false,
+        }));
+    }
+
+    // Étape « Compensation » (#5071) — APRÈS le DSP, là où elle a lieu : le
+    // dernier étage du flux réseau, après égaliseur, convolveur et crossfeed.
+    // `bit_perfect: false` : elle multiplie chaque échantillon, comme le
+    // ReplayGain. Absente sur un DSD servi brut, où rien n'est cuit.
+    if let Some(db) = compensation_reseau_db.filter(|_| !dsp_contourne_par_le_dsd) {
+        steps.push(json!({
+            "name": "Compensation",
+            "code": "level_compensation",
+            "description": format!(
+                "Compensation de niveau {db:+.1} dB dans le flux (bornée à la crête, sans écrêtage)"
+            ),
+            "bit_perfect": false,
+            "compensation_db": (db * 100.0).round() / 100.0,
+        }));
+    }
+
     // Étape « Mono » (#2362) — APRÈS le DSP et juste avant le transport, parce
     // que c'est exactement là qu'elle a lieu dans la chaîne : le repli tombe en
     // dernier dans `apply_local_dsp`, après l'égaliseur, le convolveur et le
@@ -1177,6 +1249,11 @@ fn rendre_les_verdicts(
     let dsp_applique = forcages.dsp_applique;
     let replaygain_step = traitements.replaygain_step.as_ref();
     let mono_downmix_step = traitements.mono_downmix_step.as_deref();
+    // #5071 — sauf sur un DSD servi brut : rien n'y est cuit.
+    let compensation_reseau =
+        traitements.compensation_reseau_db.is_some() && !forcages.dsp_contourne_par_le_dsd;
+    // #5114 — le crossfeed cuit dans le flux réécrit chaque échantillon.
+    let crossfeed_du_flux = traitements.crossfeed_du_flux;
     // Detect sample rate capping (DSD excluded — the DSD→PCM transcode
     // already handles rate conversion; showing a separate resampler step
     // would be misleading since sample_rate here is the DSD MHz rate).
@@ -1231,7 +1308,9 @@ fn rendre_les_verdicts(
         && !resampling_active
         && !transformation_reelle_declaree
         && !replaygain_altere
-        && mono_downmix_step.is_none();
+        && mono_downmix_step.is_none()
+        && !compensation_reseau
+        && !crossfeed_du_flux;
 
     // Débit de la SOURCE, annoncé seulement quand elle le nomme elle-même.
     //
@@ -1729,6 +1808,14 @@ struct Traitements {
     eq_step_description: Option<String>,
     replaygain_step: Option<ReplayGainStep>,
     mono_downmix_step: Option<String>,
+    /// #5071 — la compensation de niveau cuite dans le flux RÉSEAU, en dB.
+    /// `None` sur une sortie locale (elle compense par son volume, une
+    /// préférence et non une dégradation), en PURE, interrupteur coupé, ou
+    /// sans égaliseur ni crossfeed.
+    compensation_reseau_db: Option<f64>,
+    /// #5114 — le flux servi porte le crossfeed dans ses octets, tel que la
+    /// session le publie (`StreamInfo::crossfeed`). `false` sans session.
+    crossfeed_du_flux: bool,
     ui_volume: f64,
     volume_full: bool,
 }
@@ -1736,10 +1823,12 @@ struct Traitements {
 /// Relève les traitements armés sur la zone, la sonde locale primant sur les réglages.
 fn relever_les_traitements(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    licence: Option<&tune_core::license::LicenseManager>,
     zone: &Zone,
     np: &tune_core::playback::NowPlaying,
     output_type: &str,
     runtime_signal_path: Option<&OutputSignalPathStatus>,
+    wire: Option<&StreamInfo>,
 ) -> Traitements {
     // Determine if DSP is active.
     //
@@ -1774,6 +1863,18 @@ fn relever_les_traitements(
     // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
     let mono_downmix_step = zone_mono_downmix_step(&backend, zid, output_type);
 
+    // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
+    // échantillon du flux : une étape, et le verdict en tient compte. Même
+    // lecture que les chargeurs de la lecture (`compensation_du_flux_reseau`).
+    //
+    // #5114 — sous la MÊME garde de licence que le crossfeed réellement
+    // chargé : une licence échue ne fait plus compter un crossfeed absent.
+    let compensation_reseau_db =
+        tune_core::orchestrator::PlaybackOrchestrator::compensation_reseau_prevue_with(
+            backend, licence, zid,
+        );
+    let crossfeed_du_flux = wire.is_some_and(|w| w.crossfeed);
+
     // Volume at 100% means no software volume adjustment.
     // Fixed-volume zones always output at full volume (bit-perfect).
     //
@@ -1795,6 +1896,8 @@ fn relever_les_traitements(
         eq_step_description,
         replaygain_step,
         mono_downmix_step,
+        compensation_reseau_db,
+        crossfeed_du_flux,
         ui_volume,
         volume_full,
     }

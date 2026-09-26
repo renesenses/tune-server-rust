@@ -53,7 +53,8 @@ pub(super) async fn get_zone_dsp(
 ///
 /// ```json
 /// { "enabled": true, "eq_db": -10.62, "crossfeed_db": -1.05,
-///   "compensation_db": 11.67, "local_output_only": true }
+///   "compensation_db": 11.67, "local_output_only": false,
+///   "applied_by": "stream_gain" }
 /// ```
 ///
 /// `eq_db` / `crossfeed_db` : ce que chaque étage fait au niveau MOYEN
@@ -62,11 +63,20 @@ pub(super) async fn get_zone_dsp(
 /// `compensation_db` : ce qui est rendu par le volume quand l'interrupteur
 /// est ouvert, 0 sinon. C'est une DEMANDE : à volume plein, le rabot à
 /// l'unité la mange (la ligne `local_gain_rabote_a_l_unite` le dit au
-/// journal). `local_output_only` : la compensation passe par le volume de la
-/// sortie LOCALE ; une zone réseau ne la reçoit pas.
+/// journal). `local_output_only` : faux depuis #5071 — une zone réseau la
+/// reçoit aussi. `applied_by` dit PAR OÙ : `output_volume` (sortie locale,
+/// par le volume raboté à l'unité) ou `stream_gain` (zone réseau, gain cuit
+/// dans le flux après l'égaliseur, borné à la crête : il peut rendre MOINS
+/// que `compensation_db` sur une piste dont les crêtes n'ont pas la place).
 pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> Value {
     let enabled = state.orchestrator.zone_compensation_de_niveau(zone_id);
     let (eq_db, crossfeed_db) = state.orchestrator.gain_moyen_du_dsp_de_zone(zone_id);
+    let sortie_locale = ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .is_none_or(|id| id.starts_with("local:"));
     // `+ 0.0` : pas de « -0 » dans le JSON quand rien n'est à rendre.
     let arrondi = |db: f64| (db * 100.0).round() / 100.0 + 0.0;
     let compensation_db = if enabled {
@@ -79,7 +89,8 @@ pub(super) fn compensation_de_niveau_de_zone(state: &AppState, zone_id: i64) -> 
         "eq_db": arrondi(eq_db),
         "crossfeed_db": arrondi(crossfeed_db),
         "compensation_db": compensation_db,
-        "local_output_only": true,
+        "local_output_only": false,
+        "applied_by": if sortie_locale { "output_volume" } else { "stream_gain" },
     })
 }
 
@@ -429,6 +440,9 @@ pub(super) async fn set_zone_dsp(
     // il ne crée aucun traitement, il rend par le volume ce que l'égaliseur
     // (gratuit) ou le crossfeed (Premium, déjà gardé) retirent.
     let mut compensation_appliquee_a_chaud = false;
+    // #5071 — quand la bascule s'entend, comme `eq_portee` ; `null` sans
+    // `level_compensation` dans le corps.
+    let mut compensation_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
     if let Some(enabled) = body
         .get("level_compensation")
         .and_then(|v| v.get("enabled"))
@@ -436,7 +450,17 @@ pub(super) async fn set_zone_dsp(
     {
         let cle = tune_core::orchestrator::PlaybackOrchestrator::cle_compensation_de_niveau(id);
         let _ = settings.set(&cle, if enabled { "true" } else { "false" });
-        compensation_appliquee_a_chaud = state.orchestrator.refresh_zone_compensation(id).await;
+        // #5071 — sortie locale : à chaud, par le volume. Zone réseau : le
+        // flux porte la compensation, il est refabriqué par le chemin même
+        // d'un changement d'égaliseur (anti-rebond, plancher, flux conservé
+        // quand rien ne change).
+        let portee = state
+            .orchestrator
+            .apply_compensation_change_portee(id)
+            .await;
+        compensation_appliquee_a_chaud =
+            portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+        compensation_portee = Some(portee);
     }
     // Rendu à CHAQUE écriture : changer l'égaliseur ou le crossfeed change
     // aussi ce que la compensation rend.
@@ -474,6 +498,7 @@ pub(super) async fn set_zone_dsp(
         // #4685 — l'interrupteur et ce qu'il rend, après cette écriture.
         "level_compensation": level_compensation,
         "level_compensation_applied_live": compensation_appliquee_a_chaud,
+        "level_compensation_portee": compensation_portee.map(|p| p.code()),
     }))
     .into_response()
 }

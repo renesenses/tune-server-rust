@@ -81,6 +81,14 @@ pub struct StreamInfo {
     pub file_size: Option<u64>,
     pub duration_ms: Option<u64>,
     pub seek_ms: Option<u64>,
+    /// #5114 — le crossfeed est CUIT dans les octets de ce flux.
+    ///
+    /// Posé là où le flux est bâti, depuis le processeur réellement chargé
+    /// (`load_crossfeed_processor` : licence, greffon, PURE, case cochée) et
+    /// seulement s'il s'exécute (stéréo). C'est un fait du flux, pas une
+    /// déduction des réglages : le chemin du signal le lit tel quel. `false`
+    /// partout ailleurs, y compris sur une piste servie telle quelle.
+    pub crossfeed: bool,
 }
 
 impl StreamInfo {

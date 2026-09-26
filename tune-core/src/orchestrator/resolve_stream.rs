@@ -1506,6 +1506,10 @@ impl PlaybackOrchestrator {
             tmp_path,
             ..
         } = p;
+        // #5114 — lu avant que le porteur parte dans la tâche de décodage :
+        // la session de fichier dira si ses octets portent le crossfeed.
+        // Le remux (sans traitement) ne l'appelle jamais, d'où `dash_dsp_active`.
+        let dash_crossfeed = dash_dsp_active && dash_dsp.crossfeed_executable();
         let flux = {
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
@@ -1635,6 +1639,7 @@ impl PlaybackOrchestrator {
                         channels: 2,
                         file_size: Some(file_size),
                         duration_ms: None,
+                        crossfeed: dash_crossfeed,
                         ..Default::default()
                     };
                     // Store into the warm cache (atomic rename) when enabled, so
@@ -1874,7 +1879,6 @@ impl PlaybackOrchestrator {
                 channels: 2,
                 ..Default::default()
             };
-            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
             // Chaîne DSP de la zone (#2863). Ce bras servait le PCM décodé
             // TEL QUEL : égaliseur, convolveur et ReplayGain y étaient
             // calculés côté interface puis jetés. Le relais les applique au
@@ -1882,6 +1886,12 @@ impl PlaybackOrchestrator {
             // immédiat conquis en 0.9.106 est préservé. Sans traitement
             // actif, le canal reste celui d'avant, à l'octet près.
             let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
+            let info = StreamInfo {
+                crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
+                ..info
+            };
+            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
             let tx = if aac_dsp.is_active() {
                 info!(
                     zone_id = req.zone_id,
@@ -2025,6 +2035,8 @@ impl PlaybackOrchestrator {
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
             let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
             let https_dsp_active = https_dsp.is_active();
+            // #5114 — lu avant que le porteur parte dans la tâche de décodage.
+            let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();
 
             if streaming_needs_pretranscode(
                 renderer_supports_mime,
@@ -2186,6 +2198,7 @@ impl PlaybackOrchestrator {
                             channels: actual_ch,
                             file_size: Some(file_size),
                             duration_ms: None,
+                            crossfeed: https_crossfeed,
                             ..Default::default()
                         };
                         let session_id = self

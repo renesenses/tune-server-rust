@@ -441,7 +441,7 @@ pub(super) async fn transcode_source_to_file(
 ) -> Result<(u64, Vec<u8>, u16), String> {
     transcode_source_to_file_avec_crossfeed(
         source, out_sr, channels, target_bd, target_fmt, eq, convolver, replaygain, dest, progres,
-        abandon, tranche, None,
+        abandon, tranche, None, None,
     )
     .await
 }
@@ -480,6 +480,9 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // #2742 — le crossfeed, dernier étage. `None` : strictement la chaîne
     // d'avant.
     crossfeed: Option<crate::audio::crossfeed::CrossfeedProcessor>,
+    // #5071 — la compensation de niveau, DERNIER étage, bornée à la crête de
+    // la piste entière. `None` : strictement la chaîne d'avant.
+    compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -545,6 +548,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     let reserve_eq_db_d = eq.as_ref().and_then(|e| e.preamp_db(1));
     let convolution = convolver.is_some();
     let crossfeed_actif = crossfeed.is_some();
+    let compensation_cible_db = compensation.as_ref().map(|c| c.cible_db());
 
     // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
     //
@@ -597,6 +601,14 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         cf.process_pcm(&mut pcm_bytes, actual_bd, decoded.channels as u16);
     }
 
+    // 1f. #5071 — la compensation de niveau APRÈS tous les étages. Le PCM de
+    // la piste ENTIÈRE est un seul bloc : le gain est constant, borné par la
+    // vraie crête de la piste traitée — aucun échantillon écrêté.
+    let compensation_appliquee_db = compensation.map(|mut comp| {
+        comp.process_pcm(&mut pcm_bytes, actual_bd);
+        (comp.gain_applique_db() * 100.0).round() / 100.0
+    });
+
     let traitement_ms = chrono.elapsed().as_millis() as u64 - decode_ms;
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
@@ -638,6 +650,8 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         reserve_eq_db_d = ?reserve_eq_db_d,
         convolution,
         crossfeed = crossfeed_actif,
+        compensation_cible_db = ?compensation_cible_db,
+        compensation_appliquee_db = ?compensation_appliquee_db,
         "transcode_to_temp_file_stages"
     );
 
