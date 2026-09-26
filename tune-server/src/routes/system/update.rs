@@ -4380,6 +4380,11 @@ mod scan_de_demarrage_tests {
 
     #[tokio::test]
     async fn le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable() {
+        // Le scan de démarrage se retire en silence quand un autre tient le
+        // droit de scanner : aucune épreuve de scan réel ne doit tourner en
+        // même temps.
+        let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+        crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
         // Le dossier doit exister pendant TOUT le scan : le handle est gardé
         // en vie jusqu'à la fin du test, et il n'est pas dans /tmp partagé.
         let dossier = tempfile::tempdir().unwrap();

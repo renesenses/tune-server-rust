@@ -560,6 +560,16 @@ jobs:
       # PostgreSQL et le code le liait en texte : aucun crédit écrit, purge
       # jamais faite, GET des crédits en 500. SQLite l'avale, il faut le
       # moteur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      # #5034 — la SOURCE de la pochette d'album (migration PG 074). Les
+      # requêtes du scan et du surveillant sur `albums.cover_source` —
+      # absorption à cinq marqueurs comprise — jouées sur la VRAIE base, dans
+      # une table temporaire copiée du schéma migré. Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Source de la pochette d'album sur PostgreSQL (#5034)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5034 -- --nocapture --test-threads=1
+
       - name: Crédits de piste sur PostgreSQL (#4984)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

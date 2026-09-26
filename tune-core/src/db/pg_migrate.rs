@@ -276,7 +276,12 @@ CREATE TABLE IF NOT EXISTS albums (
     release_type TEXT,
     -- Curseur de la passe des crédits MusicBrainz (#4767). NUL = jamais
     -- interrogé.
-    credits_mb_at TEXT
+    credits_mb_at TEXT,
+    -- Source de la pochette et fichier d'origine (#5034, SQLite 111 / PG 074).
+    -- NUL = inconnue. TEXT des deux côtés.
+    cover_source TEXT,
+    cover_source_path TEXT,
+    cover_source_stamp TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tracks (
@@ -1007,6 +1012,12 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_type TEXT;
 -- crédité par son MBID, et le curseur de reprise de la passe.
 ALTER TABLE track_credits ADD COLUMN IF NOT EXISTS artist_mbid TEXT;
 ALTER TABLE albums ADD COLUMN IF NOT EXISTS credits_mb_at TEXT;
+
+-- Source de la pochette d'album (SQLite migration v111, #5034). Sans défaut :
+-- NUL = inconnue, l'état de toute ligne d'avant la migration.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source_path TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS cover_source_stamp TEXT;
 
 -- alarms: owning profile (SQLite migration v64)
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS profile_id BIGINT;

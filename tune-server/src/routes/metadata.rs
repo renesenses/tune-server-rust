@@ -2422,7 +2422,12 @@ async fn fetch_album_cover(
             if let Some(hash) =
                 tune_core::library::artwork::cache_fetched_image(&data, &cache_dir, "jpg")
             {
-                repo.force_update_cover_path(id, &hash).ok();
+                repo.force_update_cover_path(
+                    id,
+                    &hash,
+                    tune_core::db::models::SourcePochette::Fournisseur,
+                )
+                .ok();
                 return Json(json!({
                     "ok": true,
                     "cover_path": hash,
@@ -2480,7 +2485,12 @@ async fn fetch_album_cover(
                 return Json(json!({"ok": false, "error": "failed to save to cache"}))
                     .into_response();
             };
-            repo.force_update_cover_path(id, &hash).ok();
+            repo.force_update_cover_path(
+                id,
+                &hash,
+                tune_core::db::models::SourcePochette::Fournisseur,
+            )
+            .ok();
             return Json(json!({
                 "ok": true,
                 "cover_path": hash,

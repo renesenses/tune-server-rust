@@ -1048,6 +1048,15 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // ses balises, par la même règle que le surveillant.
         balises_vues.realigner(&db);
 
+        // #5034 — APRÈS la purge : même confrontation des pochettes à leur
+        // fichier source que le scan manuel.
+        tune_core::library::pochette_disque::suivre_les_fichiers_sources(
+            &db,
+            &cache_dir,
+            &[],
+            false,
+        );
+
         // Clean up orphan albums with 0 tracks (ghost entries from
         // artist_id changes or interrupted scans) — bug #593.
         let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
@@ -1326,10 +1335,15 @@ fn settle_partition(
         // Une suppression n'a rien à attendre ; un événement de DOSSIER non
         // plus (#4896) — et la taille d'un dossier ne se stabilise pas, elle
         // vaut 0 sous Windows : il resterait en attente pour toujours.
+        // #5034 — une image de pochette SUPPRIMÉE non plus : sans cela, le
+        // `stat` ci-dessous échouerait et l'événement serait jeté comme
+        // transitoire. Une image qui s'écrit attend, comme un fichier audio.
         if matches!(
             change.change_type,
             ChangeType::Deleted | ChangeType::DossierApparu | ChangeType::DossierDisparu
-        ) {
+        ) || (change.change_type == ChangeType::ImageDePochette
+            && !std::path::Path::new(&change.path).exists())
+        {
             ready.push(change);
             continue;
         }
@@ -1861,13 +1875,21 @@ pub(crate) fn reimporter_fichier_surveillant(
         }
 
         if let Some(aid) = album_id {
+            // #5034 — la même règle que le scan : pochette posée si l'album
+            // n'en a pas, RETIRÉE quand cette piste portait la jaquette de
+            // l'album et ne la porte plus (Mp3tag), jamais touchée si elle a
+            // été téléversée.
             let cache_dir = crate::routes::library::artwork_cache_dir();
-            if let Some(hash) = tune_core::library::artwork::get_or_extract(
+            tune_core::library::pochette_disque::suivre_la_piste(
+                db,
+                aid,
                 std::path::Path::new(&sf.path),
+                tune_core::library::pochette_disque::Jaquette::depuis(
+                    sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref()),
+                ),
                 &cache_dir,
-            ) {
-                album_repo.update_cover_path(aid, &hash).ok();
-            }
+                false,
+            );
         }
 
         if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
@@ -2115,6 +2137,9 @@ pub(crate) fn traiter_le_lot_du_surveillant(
 ) -> Vec<tune_core::scanner::watcher::FileChange> {
     use crate::routes::system::scan::VerdictPurge;
     use tune_core::scanner::watcher::ChangeType;
+    let (images, changes): (Vec<_>, Vec<_>) = changes
+        .into_iter()
+        .partition(|c| c.change_type == ChangeType::ImageDePochette);
     let (dossiers, fichiers): (Vec<_>, Vec<_>) = changes.into_iter().partition(|c| {
         matches!(
             c.change_type,
@@ -2241,14 +2266,24 @@ pub(crate) fn traiter_le_lot_du_surveillant(
                     info!(path = %change.path, "watcher_track_removed");
                 }
             }
-            // Traités plus haut, par `traiter_les_dossiers_du_lot`.
-            ChangeType::DossierApparu | ChangeType::DossierDisparu => {}
+            // Traités plus haut, par `traiter_les_dossiers_du_lot`, et plus
+            // bas, par `suivre_les_images_de_pochette`.
+            ChangeType::DossierApparu
+            | ChangeType::DossierDisparu
+            | ChangeType::ImageDePochette => {}
         }
     }
     // #4896 — la ligne album d'un dossier retouché suit ses balises.
     if !albums_a_realigner.is_empty() {
         let _porte = porte_du_scan(db);
         realigner_albums_sur_les_balises(db, &albums_a_realigner);
+    }
+    // #5034 — APRÈS les pistes : une jaquette retouchée dans le même lot que
+    // le `cover.jpg` est déjà relue quand l'album est tranché. Sous la porte
+    // des lots de scan, comme toute écriture du surveillant.
+    if !images.is_empty() {
+        let _porte = porte_du_scan(db);
+        suivre_les_images_de_pochette(db, &images, reglages.exclusions);
     }
     a_relire
 }
@@ -2357,6 +2392,49 @@ fn relire_les_feuilles_cue_du_lot(
 fn porte_du_scan(db: &Arc<dyn DbBackend>) -> Option<tokio::sync::MutexGuard<'static, ()>> {
     (db.engine() == tune_core::db::engine::Engine::Sqlite)
         .then(crate::sqlite_write_gate::surveillant)
+}
+
+/// #5034 — une image de pochette de dossier a bougé : chaque album dont une
+/// piste vit DANS ce dossier est relu sur le disque, et la règle de
+/// `pochette_disque` tranche (retrait si l'image était sa source et qu'il n'y
+/// a plus rien ; pochette posée si l'album n'en avait pas). Une pochette
+/// téléversée n'est pas touchée.
+fn suivre_les_images_de_pochette(
+    db: &Arc<dyn DbBackend>,
+    images: &[tune_core::scanner::watcher::FileChange],
+    exclusions: &[String],
+) {
+    if images.is_empty() {
+        return;
+    }
+    let track_repo = TrackRepo::with_backend(db.clone());
+    let cache_dir = crate::routes::library::artwork_cache_dir();
+    let mut albums = std::collections::BTreeSet::new();
+    for image in images {
+        let chemin_l = image.path.to_lowercase();
+        if exclusions.iter().any(|x| chemin_l.contains(x.as_str())) {
+            continue;
+        }
+        let Some(dossier) = std::path::Path::new(&image.path).parent() else {
+            continue;
+        };
+        for (piste, album) in track_repo
+            .albums_sous_dossier(&dossier.to_string_lossy())
+            .unwrap_or_default()
+        {
+            // Les seuls fichiers DU dossier : une image ne décrit pas les
+            // sous-dossiers (`find_folder_cover` ne regarde que le parent).
+            if std::path::Path::new(&piste).parent() == Some(dossier) {
+                albums.insert(album);
+            }
+        }
+    }
+    for album in albums {
+        let geste = tune_core::library::pochette_disque::reevaluer_l_album(
+            db, album, &cache_dir, false, None,
+        );
+        tracing::debug!(album_id = album, ?geste, "watcher_pochette_de_dossier");
+    }
 }
 
 /// Un dossier disparu que ce lot examine : son chemin, les fichiers indexés
@@ -2841,3 +2919,7 @@ mod surveillant_feuille_cue_tests_5073;
 #[cfg(test)]
 #[path = "scan_feuille_cue_tests_5108.rs"]
 mod scan_feuille_cue_tests_5108;
+
+#[cfg(test)]
+#[path = "pochettes_disque_tests_5034.rs"]
+mod pochettes_disque_tests_5034;

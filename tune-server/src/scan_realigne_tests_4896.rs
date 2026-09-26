@@ -93,6 +93,9 @@ fn etat(racine: &Path) -> AppState {
 /// Le scan MANUEL, jusqu'à sa fin annoncée. Le droit de scanner est global au
 /// processus : un autre essai peut le tenir, on attend qu'il revienne.
 pub(super) async fn scan_manuel(etat: &AppState) {
+    // Le droit de scanner et le compteur de scans sont des globales de
+    // processus : voir `serialiser_les_scans_de_test` (#5034).
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let mut rx = etat.event_bus.subscribe();
     let debut = Instant::now();
     while !crate::routes::system::scan::spawn_library_scan(etat.clone(), false, None).await {
@@ -108,7 +111,10 @@ pub(super) async fn scan_manuel(etat: &AppState) {
             .await
             .expect("le scan manuel n'a pas annoncé sa fin")
         {
-            Ok(ev) if ev.event_type == fin => return,
+            Ok(ev) if ev.event_type == fin => {
+                crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+                return;
+            }
             Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(e) => panic!("bus d'événements fermé : {e}"),
         }
@@ -119,6 +125,7 @@ pub(super) async fn scan_manuel(etat: &AppState) {
 /// droit : `scan_started_at`, qu'il ne pose qu'une fois le droit acquis, dit
 /// s'il a vraiment tourné.
 pub(super) async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     let reglages = SettingsRepo::with_backend(db.clone());
     let debut = Instant::now();
     loop {
@@ -135,6 +142,7 @@ pub(super) async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         if reglages.get("scan_started_at").unwrap().as_deref() != Some("0") {
+            crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
             return;
         }
         assert!(
