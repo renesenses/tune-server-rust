@@ -579,6 +579,12 @@ async fn shutdown_signal(state: crate::state::AppState) {
         db.checkpoint();
     }
 
+    // #5138 — la passe acoustique s'arrête à la frontière de piste et
+    // l'inférence ONNX en cours est interrompue : l'arrêt n'attend plus une
+    // inférence qui tient ses fils jusqu'à la sortie forcée.
+    #[cfg(feature = "audio-embedding")]
+    tune_core::audio::embedding::arreter();
+
     // Force exit after 3s if graceful shutdown stalls — must use std::thread
     // because tokio runtime may itself be stalling
     std::thread::spawn(|| {
