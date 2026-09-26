@@ -50,8 +50,9 @@ karaoke = ["dep:tune-karaoke"]
 # (`catalogued() == false`), donc jamais proposés à l'installation tant qu'aucun
 # écran ne les atteint. Voir docs/plugins/README.md.
 bandcamp = ["dep:tune-bandcamp"]
-# Concerts (#2363) : la tache d'abonnement et la route de lecture, sorties du
-# coeur toujours-compile. Hors catalogue tant qu'aucun ecran ne les consomme.
+# Concerts (#2363) : la tache d'abonnement, la lecture et la localisation,
+# sorties du coeur toujours-compile. Au catalogue, Premium (`Feature::Concerts`,
+# refus porte par le greffon lui-meme). Compile par les lignes de release.
 concerts = ["dep:tune-concerts"]
 # Pont Roon (#3914) — Premium : importer l'archive du moissonneur (crédits,
 # images). Dans `default` comme Bandcamp : le greffon est opt-in à l'exécution

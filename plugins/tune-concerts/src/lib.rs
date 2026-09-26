@@ -1,94 +1,125 @@
 //! Les concerts des artistes de la bibliothèque, en [`TunePlugin`] (#2363).
 //!
-//! Extrait du cœur toujours-compilé :
+//! « Les artistes que j'écoute jouent-ils près de chez moi ? » — la demande de
+//! FabienM et Didier (forum, fil 1540). Le greffon :
 //!
-//! - `tune-core/src/cloud/concert_alerts.rs` — la tâche de fond qui pousse
-//!   toutes les 24 h les artistes de la bibliothèque vers
-//!   `mozaiklabs.fr/api/v1/premium/concerts/subscribe`. Elle était démarrée
-//!   **sans condition** par `background.rs`, dans tous les serveurs, y compris
-//!   ceux dont personne n'a jamais demandé la fonction.
-//! - `GET /api/v1/system/concerts` — la route de lecture, remontée ici sur
-//!   `/api/v1/ext/concerts/upcoming` (le préfixe vient de `name()` : un plugin
-//!   ne choisit jamais le sien).
+//! - abonne, toutes les 24 h, les artistes de la bibliothèque auprès du nuage
+//!   (`mozaiklabs.fr/api/v1/premium/concerts/subscribe`) ;
+//! - relaie la commune SAISIE par l'utilisateur et le périmètre voulu
+//!   (`…/concerts/location`, site-mozaiklabs#186) ;
+//! - lit les dates à venir dans ce périmètre (`…/concerts/upcoming`). Les
+//!   dates viennent de l'agenda Ticketmaster, rapatrié par le nuage depuis le
+//!   30/08/2026 (site-mozaiklabs#185, #189).
 //!
-//! Bertrand a tranché le 29/08 : la fonction sera un plugin. Le cœur nu cesse
-//! donc de parler à un service tiers, et la tâche de fond ne tourne plus que
-//! chez ceux qui ont installé le plugin.
+//! # Les routes
+//!
+//! Montées par l'hôte sous `/api/v1/ext/concerts` — le préfixe vient de
+//! `name()`, un greffon ne choisit jamais le sien. Le contrat est celui que
+//! l'écran `ConcertsView.svelte` (tune-web-client#695) consomme déjà :
+//!
+//! | Route | 200 |
+//! |---|---|
+//! | `GET /upcoming` | `{concerts, scope?, radius_km?, city?, country?, code?}` |
+//! | `POST /location` | `{scope, city, country, radius_km, located}` |
+//! | `GET /location` | la dernière localisation enregistrée, même forme |
+//!
+//! Le périmètre de `/upcoming` est celui que le NUAGE a appliqué : il le garde
+//! par instance (`concert_locations`) et l'applique lui-même à la lecture. Le
+//! greffon n'envoie donc que l'identité de l'instance, et remonte à l'écran
+//! le périmètre rendu — sans lui, l'écran affiche « 3 concerts » sans pouvoir
+//! dire « à moins de 100 km de Dijon », ni proposer d'élargir.
+//!
+//! Trois crans, jamais un filtre binaire (arbitrage du 29/08) : rayon de 50,
+//! 100 ou 200 km autour de la commune, le pays, ou partout. **Pays** par
+//! défaut quand l'écran n'en dit rien. Tant qu'aucune localisation n'a été
+//! enregistrée, le nuage ne filtre pas du tout (`world`) : il ne cache pas de
+//! concerts au nom d'un lieu que personne n'a choisi.
+//!
+//! **La commune est SAISIE, jamais déduite.** Le nuage connaît des coordonnées
+//! tirées de l'adresse IP (`tune_instances.latitude`) : elles ne servent pas
+//! ici. Une IP désigne la sortie du fournisseur d'accès — derrière un VPN, un
+//! autre pays.
+//!
+//! # Premium, décidé ICI et pas par l'hôte
+//!
+//! « Concerts » est un module à lui, inclus dans Premium, sans achat séparé
+//! (Bertrand, 30/08 et 25/09/2026). Deux raccourcis sont interdits, parce
+//! qu'une version RÉDUITE gratuite viendra plus tard :
+//!
+//! 1. pas de `require_premium` écrit en dur sur un chemin — le payant est une
+//!    propriété du GREFFON ([`ConcertsPlugin::required_feature`]) ;
+//! 2. pas de garde monté par l'hôte devant les routes — il ne saurait
+//!    qu'ouvrir ou fermer.
+//!
+//! La licence descend donc jusqu'ici (`PluginContext::license`) et la décision
+//! tient dans UNE fonction, [`acces`], qui rend [`Acces`]. Le jour de la
+//! version réduite, `Reduit` s'ajoute à l'énumération et aux `match` qui la
+//! lisent — le compilateur les désigne tous ; ni l'hôte ni le montage ne
+//! bougent.
+//!
+//! Le refus est un `ModuleRefusal` (402, `error: "module_required"`, `code`
+//! `module_account_not_linked` ou `module_not_owned`, `module: "concerts"`) :
+//! l'idiome des refus de module du serveur, que le client web reconnaît comme
+//! un refus d'offre et non comme une panne ([`refus_du_module`]). Il porte sur les ROUTES, jamais sur le chargement : un
+//! compte gratuit peut installer le greffon, et l'écran lui dit pourquoi il
+//! reste verrouillé.
 //!
 //! # L'extraction a été rebasée sur #2892, pas sur la version d'avant
 //!
-//! Ce greffon a d'abord été écrit comme un portage littéral de
-//! `concert_alerts.rs` **tel qu'il était le 29/08**. Entre-temps, le 30/08,
-//! #2892 a réécrit ce même fichier dans la ligne de release (+275 / −38) :
-//! l'abonnement porte désormais sur TOUTE la bibliothèque et non plus sur les
-//! seuls artistes identifiés par un MusicBrainz ID.
-//!
-//! La fusion rendait un conflit `modify/delete` : la PR supprime le fichier,
-//! la ligne de release le réécrit. Prendre la suppression — le réflexe, puisque
-//! c'est l'intention de la PR — aurait annulé #2892 **sans qu'aucun test ne
-//! rougisse**, le greffon compilant parfaitement avec l'ancienne requête. Le
-//! comportement de #2892 a donc été reporté ici, et il est gardé par des tests
+//! Ce greffon a d'abord été un portage littéral de `concert_alerts.rs` **tel
+//! qu'il était le 29/08**. Le 30/08, #2892 a réécrit ce même fichier dans la
+//! ligne de release : l'abonnement porte désormais sur TOUTE la bibliothèque
+//! et non plus sur les seuls artistes identifiés par un MusicBrainz ID. Prendre
+//! la suppression à la fusion aurait annulé #2892 **sans qu'aucun test ne
+//! rougisse**. Le comportement est donc porté ici, et gardé par des tests
 //! (`tune-server/tests/concerts_plugin.rs`) qui portent sur le fait de base :
 //! un artiste sans MBID est abonné comme les autres.
 //!
 //! # Et l'apport de #2178, porté à la fusion de `rc/v0.9.130`
 //!
-//! Même piège, une seconde fois, sur le même fichier. Le lot
-//! `batch/p2-recentes-1` portait `64e8378f` — « un 429 du nuage dit la limite
-//! et le délai, partout » — qui apprenait à `concert_alerts.rs` à rendre un
-//! [`CloudError`] plutôt qu'une `String`, et à `GET /system/concerts` à rendre
-//! ce refus **sans écraser son statut**. Ce fichier et cette route étant
-//! supprimés ici, prendre la suppression aurait perdu le traitement du 429
-//! pour les concerts — en silence, une fois de plus : le greffon compile très
-//! bien en rendant 200 sur tous les refus.
-//!
-//! Le comportement a donc été porté ([`reponse_de_refus`]), et gardé par des
+//! Même piège, une seconde fois : « un 429 du nuage dit la limite et le délai,
+//! partout ». Le comportement est porté ([`reponse_de_refus`]) et gardé par des
 //! tests qui portent sur le fait de base : un 429 du nuage arrive au client
 //! **en 429, avec son délai**.
-//!
-//! # Ce que ce plugin ne fait PAS, et pourquoi
-//!
-//! **Il n'est pas au catalogue** ([`ConcertsPlugin::catalogued`] rend `false`).
-//! Aucun écran ne consomme encore ces routes — `git grep -i concert` dans
-//! `tune-web-client` ne rend rien de la fonction. Offrir « Installer » sur une
-//! fonction que rien n'expose dépense la confiance de l'utilisateur et ne rend
-//! rien : il installe, il redémarre comme on le lui demande, et rien
-//! n'apparaît (#2090). À rebrancher au catalogue le jour où l'écran existe.
-//!
-//! **Il ne rendra rien tant que le cloud n'aura pas de source.** La seule
-//! source branchée aujourd'hui est MusicBrainz, dont l'entité `event` est une
-//! archive : 0 date future sur Coldplay, Taylor Swift et Metallica réunis.
-//! Ce n'est pas un défaut de ce plugin — la table `concert_events` est vide
-//! côté cloud, et le rester est le sujet du lot 1, ailleurs.
-//!
-//! **Il ne collecte aucune position.** Le filtre géographique (rayon / pays /
-//! partout, arbitré le 29/08) est le lot 2, et il commence côté cloud : la
-//! route `upcoming` accepte `city` et `country` aujourd'hui sans rien en
-//! faire. Envoyer une position que personne ne lit ne servirait personne.
-//!
-//! **Il ne pose pas de portillon premium.** L'arbitrage « réservé aux
-//! premium » est acté, mais `tune-core/src/license.rs` n'a aucune variante
-//! `Feature` pour les concerts, et en ajouter une touche aussi le catalogue
-//! côté client et côté cloud. C'est le lot 5, et il doit sortir *en même temps*
-//! que l'écran — sinon on pose un refus que personne ne peut voir.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::body::Bytes;
+use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tracing::{debug, info, warn};
 
 use tune_core::cloud::refusal::CloudError;
 use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::event_bus::TuneEvent;
+use tune_core::license::{Feature, LicenseManager, ModuleRefusal};
 use tune_core::plugin_sdk::{PluginContext, TunePlugin};
 
 const CONCERTS_API: &str = "https://mozaiklabs.fr/api/v1/premium/concerts";
+
+/// Le réglage où la dernière localisation ACCEPTÉE par le nuage est gardée.
+///
+/// Le nuage n'a pas de route de lecture de la localisation : sans cette copie,
+/// `GET /location` n'aurait rien à rendre. Elle n'est écrite qu'après un
+/// succès du nuage — elle dit ce que le nuage applique, pas ce qu'on a tenté.
+pub const CLE_LOCALISATION: &str = "plugin_concerts_localisation";
+
+/// Les trois crans, dans les mots du nuage (`PerimetreConcerts::valeurs()`).
+pub const PERIMETRES: [&str; 3] = ["radius", "country", "world"];
+
+/// Le cran appliqué quand l'écran n'en dit rien — `PerimetreConcerts::DEFAUT`.
+pub const PERIMETRE_PAR_DEFAUT: &str = "country";
+
+/// Les rayons, liste FERMÉE et identique au nuage (`PerimetreConcerts::RAYONS`)
+/// et au client (`RAYONS_CONCERTS`) : un rayon libre serait un « partout »
+/// déguisé. Le nuage refuse tout autre valeur par un 422.
+pub const RAYONS_KM: [i64; 3] = [50, 100, 200];
 
 /// Le nuage n'accepte pas plus de 200 artistes par appel (`artists => max:200`).
 ///
@@ -110,7 +141,8 @@ pub const PLAFOND: usize = 5_000;
 /// Passés explicitement plutôt que tirés du [`PluginContext`], comme
 /// `tune-dj`, `tune-karaoke` et `tune-bandcamp` : la vraie dépendance du
 /// plugin — la base — est ainsi visible au point de câblage, dans
-/// `tune-server/src/plugins.rs`.
+/// `tune-server/src/plugins.rs`. La licence, elle, arrive par le contexte
+/// (`PluginContext::license`) : c'est le chemin commun à tout greffon payant.
 pub struct HostServices {
     pub backend: Arc<dyn DbBackend>,
 }
@@ -143,7 +175,7 @@ impl TunePlugin for ConcertsPlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Concerts à venir des artistes de la bibliothèque"
+        "Concerts (Premium) : les dates à venir des artistes de votre bibliothèque, autour de chez vous"
     }
 
     /// Opt-in, comme `dj`, `karaoke` et `bandcamp`.
@@ -151,16 +183,30 @@ impl TunePlugin for ConcertsPlugin {
         false
     }
 
-    /// Hors catalogue tant qu'aucun écran ne consomme ces routes — voir l'en-
-    /// tête du module. Le plugin reste compilé, testé, et se charge si
-    /// `plugin_concerts_installed` est posé à la main.
+    /// Au catalogue depuis que l'écran existe (tune-web-client#695,
+    /// `ConcertsView.svelte`) et que le nuage a des dates : les deux raisons
+    /// qui le tenaient dehors (#2090) sont tombées. Dit explicitement plutôt
+    /// que laissé au défaut, pour qu'un retour en arrière soit un acte visible.
     fn catalogued(&self) -> bool {
-        false
+        true
+    }
+
+    /// Le module Premium auquel ce greffon appartient. Le gestionnaire s'en
+    /// sert pour montrer le cadenas avant le clic ; le comportement réel se
+    /// décide dans [`acces`].
+    fn required_feature(&self) -> Option<Feature> {
+        Some(Feature::Concerts)
     }
 
     async fn setup(&mut self, ctx: &PluginContext) -> Result<(), String> {
-        ctx.register_router(router(self.backend.clone()));
-        self.tache = Some(lancer_synchronisation(self.backend.clone()));
+        let license = ctx.license.clone();
+        if !ctx.feature_licensed(Feature::Concerts).await {
+            // Chargé quand même : le refus porte sur les routes, et l'écran
+            // doit pouvoir dire pourquoi il reste verrouillé.
+            info!("concerts_charge_sans_premium");
+        }
+        ctx.register_router(router(self.backend.clone(), license.clone()));
+        self.tache = Some(lancer_synchronisation(self.backend.clone(), license));
         Ok(())
     }
 
@@ -178,18 +224,143 @@ impl TunePlugin for ConcertsPlugin {
 }
 
 // ---------------------------------------------------------------------------
+// Le droit — la SEULE décision du payant
+// ---------------------------------------------------------------------------
+
+/// Ce que ce serveur a le droit de recevoir du module, selon sa licence.
+///
+/// La variante manquante est `Reduit` : la version limitée des comptes
+/// gratuits, prévue une fois le module abouti. Elle s'ajoutera ici, et le
+/// compilateur désignera les `match` à compléter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Acces {
+    Complet,
+    Refuse,
+}
+
+/// LE point de décision du payant. Publique pour être observable depuis
+/// `tune-server/tests/concerts_plugin.rs`.
+///
+/// ⚠️ Une licence ABSENTE ne vaut pas une autorisation. C'est le cas d'un hôte
+/// qui n'en fournit pas — tests, `tune-cli`, ou une construction future qui
+/// oublierait de la brancher. Interpréter l'absence en faveur du doute
+/// ouvrirait le module à tout le monde le jour où quelqu'un déplace une ligne.
+pub async fn acces(license: Option<&LicenseManager>) -> Acces {
+    match license {
+        Some(l) if l.check_feature(Feature::Concerts).await => Acces::Complet,
+        _ => Acces::Refuse,
+    }
+}
+
+/// Le nom du module dans les refus — le même que `name()` et que le chemin.
+pub const MODULE: &str = "concerts";
+
+/// Un compte mozaiklabs est-il lié à ce serveur ? Même lecture que
+/// `discovery_setup::compte_mozaik_lie` (tune-server) : un jeton stocké.
+pub fn compte_lie(backend: &Arc<dyn DbBackend>) -> bool {
+    SettingsRepo::with_backend(backend.clone())
+        .get("mozaik_access_token")
+        .ok()
+        .flatten()
+        .is_some_and(|t| !t.is_empty())
+}
+
+/// Le refus du module, dans la forme de [`ModuleRefusal`] — l'idiome des
+/// refus de module du serveur (#2392) : `error: "module_required"`, et un
+/// `code` qui nomme la raison et le geste attendu :
+///
+/// - `module_account_not_linked` (`action: link_account`) : aucun compte lié,
+///   le droit Premium ne peut pas parvenir au serveur ;
+/// - `module_not_owned` (`action: purchase_module`) : compte lié, sans Premium.
+///
+/// Statut **402** : celui de tous les refus d'offre du serveur. Le client web
+/// le reconnaît deux fois — par le corps (`module_required`) et par le
+/// statut (`estRefusPremium`) —, jamais comme une panne. `message` est le
+/// repli anglais de `ModuleRefusal`, jamais destiné à l'affichage : le client
+/// traduit le `code`.
+pub fn refus_du_module(raison: ModuleRefusal) -> Response {
+    let mut corps = raison.to_json(MODULE);
+    if let Some(objet) = corps.as_object_mut() {
+        // Le droit qui ouvre le module, pour l'écran qui voudrait le nommer.
+        objet.insert("feature".into(), json!(Feature::Concerts.code()));
+    }
+    (StatusCode::PAYMENT_REQUIRED, Json(corps)).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Routes — montées par l'hôte sous /api/v1/ext/concerts
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct EtatConcerts {
     backend: Arc<dyn DbBackend>,
+    license: Option<Arc<LicenseManager>>,
+    /// La racine de l'API du nuage : [`CONCERTS_API`] en production, un banc
+    /// local dans les essais ([`router_vers`]).
+    racine: Arc<str>,
 }
 
-pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
+impl EtatConcerts {
+    /// Le refus à rendre, ou `None` si la route peut servir.
+    ///
+    /// Toutes les routes passent par ici, et par rien d'autre : une route
+    /// ajoutée sans son portillon est l'erreur classique — la lecture refuse,
+    /// l'écriture passe.
+    async fn refus(&self) -> Option<Response> {
+        match acces(self.license.as_deref()).await {
+            Acces::Complet => None,
+            Acces::Refuse => {
+                // `evaluate(false, …)` rend toujours une raison ; `NotOwned` n'est
+                // qu'un filet si la règle venait à changer.
+                let raison = ModuleRefusal::evaluate(false, compte_lie(&self.backend))
+                    .unwrap_or(ModuleRefusal::NotOwned);
+                info!(code = raison.code(), "concerts_refuse_sans_premium");
+                Some(refus_du_module(raison))
+            }
+        }
+    }
+
+    fn settings(&self) -> SettingsRepo {
+        SettingsRepo::with_backend(self.backend.clone())
+    }
+
+    fn instance_id(&self) -> String {
+        self.settings()
+            .get("instance_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+}
+
+/// Le routeur de production, qui parle à `mozaiklabs.fr`.
+pub fn router(backend: Arc<dyn DbBackend>, license: Option<Arc<LicenseManager>>) -> Router<()> {
+    router_vers(CONCERTS_API, backend, license)
+}
+
+/// Le même routeur, vers une autre racine d'API — le seul moyen d'exercer les
+/// routes de bout en bout sans appeler `mozaiklabs.fr` depuis un essai.
+/// L'unique appelant en production est [`router`], juste au-dessus.
+pub fn router_vers(
+    racine: &str,
+    backend: Arc<dyn DbBackend>,
+    license: Option<Arc<LicenseManager>>,
+) -> Router<()> {
     Router::new()
         .route("/upcoming", get(concerts_a_venir))
-        .with_state(EtatConcerts { backend })
+        .route("/location", get(lire_localisation).post(poser_localisation))
+        .with_state(EtatConcerts {
+            backend,
+            license,
+            racine: Arc::from(racine),
+        })
+}
+
+fn client_du_nuage() -> Result<reqwest::Client, reqwest::Error> {
+    tune_core::http::client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
+        .build()
 }
 
 /// `GET /api/v1/ext/concerts/upcoming` — remplace `GET /system/concerts`.
@@ -198,24 +369,17 @@ pub fn router(backend: Arc<dyn DbBackend>) -> Router<()> {
 /// (`{"concerts": [], "error": "concerts: HTTP 500"}`) qu'une interface
 /// traduite en 11 langues aurait affichée telle quelle. On rend désormais un
 /// **code stable**, traduisible côté client, et le détail part au journal.
-async fn concerts_a_venir(
-    axum::extract::State(etat): axum::extract::State<EtatConcerts>,
-) -> Response {
-    let instance_id = SettingsRepo::with_backend(etat.backend.clone())
-        .get("instance_id")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+async fn concerts_a_venir(State(etat): State<EtatConcerts>) -> Response {
+    if let Some(refus) = etat.refus().await {
+        return refus;
+    }
 
+    let instance_id = etat.instance_id();
     if instance_id.is_empty() {
         return Json(json!({"concerts": [], "code": "concerts.no_instance_id"})).into_response();
     }
 
-    let client = match tune_core::http::client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
-        .build()
-    {
+    let client = match client_du_nuage() {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "concerts_client_build_failed");
@@ -223,8 +387,8 @@ async fn concerts_a_venir(
         }
     };
 
-    match recuperer_concerts(&client, &instance_id).await {
-        Ok(concerts) => Json(json!({"concerts": concerts})).into_response(),
+    match recuperer_concerts_depuis(&etat.racine, &client, &instance_id).await {
+        Ok(corps) => Json(corps).into_response(),
         Err(e) => {
             warn!(error = %e, retry_after = ?e.retry_after(), "concerts_fetch_failed");
             reponse_de_refus(&e)
@@ -232,31 +396,185 @@ async fn concerts_a_venir(
     }
 }
 
+/// `GET /api/v1/ext/concerts/location` — la localisation que le nuage applique.
+///
+/// Rien d'enregistré : le nuage ne filtre pas (`world`), et on le dit par un
+/// code. Les champs restent des chaînes (vides) et le rayon vaut celui du
+/// nuage par défaut (100 km) : l'écran pré-remplit son formulaire avec, et un
+/// `null` y casserait un `.trim()`.
+async fn lire_localisation(State(etat): State<EtatConcerts>) -> Response {
+    if let Some(refus) = etat.refus().await {
+        return refus;
+    }
+    let gardee = etat
+        .settings()
+        .get(CLE_LOCALISATION)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .filter(Value::is_object);
+    match gardee {
+        Some(localisation) => Json(localisation).into_response(),
+        None => Json(json!({
+            "scope": "world",
+            "city": "",
+            "postal_code": null,
+            "country": "",
+            "radius_km": 100,
+            "code": "concerts.no_location",
+        }))
+        .into_response(),
+    }
+}
+
+/// `POST /api/v1/ext/concerts/location` — la commune SAISIE et le périmètre.
+///
+/// Corps attendu, celui de `setLocalisationConcerts` (tune-web-client) :
+/// `{city, postal_code?, country, scope, radius_km?}`. Validé ICI avant tout
+/// appel, avec les règles du nuage ([`valider_localisation`]) : un 422 du nuage
+/// ne dirait pas quel champ est en cause.
+///
+/// Le corps est lu brut, pas par l'extracteur `Json` : un corps illisible doit
+/// d'abord passer le portillon, puis finir en 422 à code — pas en rejet
+/// texte d'axum avant même la question du droit.
+///
+/// Réponses : 200 (la réponse du nuage), 402 (sans Premium), 422
+/// `concerts.invalid_location` (+ `field`), 409 `concerts.no_instance_id`,
+/// 429 `concerts.rate_limited` (+ délai), 502 `concerts.unavailable`. Tout
+/// échec est un statut d'erreur : l'écran, qui ne regarde que les exceptions
+/// sur cette route, prendrait sinon un corps sans `scope` pour un succès.
+async fn poser_localisation(State(etat): State<EtatConcerts>, corps: Bytes) -> Response {
+    if let Some(refus) = etat.refus().await {
+        return refus;
+    }
+
+    let demande: Value = serde_json::from_slice(&corps).unwrap_or(Value::Null);
+    let demande = match valider_localisation(&demande) {
+        Ok(d) => d,
+        Err(champ) => return localisation_invalide(Some(champ)),
+    };
+
+    let instance_id = etat.instance_id();
+    if instance_id.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"code": "concerts.no_instance_id"})),
+        )
+            .into_response();
+    }
+
+    let client = match client_du_nuage() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "concerts_client_build_failed");
+            return refus_du_nuage(&CloudError::from(e.to_string()), false);
+        }
+    };
+
+    match enregistrer_localisation_vers(&etat.racine, &client, &instance_id, &demande).await {
+        Ok(rendu) => {
+            let mut gardee = rendu.clone();
+            if let (Some(objet), Some(cp)) = (gardee.as_object_mut(), demande.get("postal_code")) {
+                objet.insert("postal_code".into(), cp.clone());
+            }
+            if let Err(e) = etat.settings().set(CLE_LOCALISATION, &gardee.to_string()) {
+                // Le nuage a accepté : c'est lui qui filtre. La copie locale ne
+                // sert qu'à `GET /location` — la perdre ne défait rien.
+                warn!(error = %e, "concerts_localisation_non_gardee");
+            }
+            info!(scope = ?rendu.get("scope"), located = ?rendu.get("located"), "concerts_localisation_enregistree");
+            Json(rendu).into_response()
+        }
+        Err(EchecLocalisation::Refusee) => localisation_invalide(None),
+        Err(EchecLocalisation::Nuage(e)) => {
+            warn!(error = %e, retry_after = ?e.retry_after(), "concerts_location_failed");
+            refus_du_nuage(&e, false)
+        }
+    }
+}
+
+fn localisation_invalide(champ: Option<&'static str>) -> Response {
+    let mut corps = Map::new();
+    corps.insert("code".into(), json!("concerts.invalid_location"));
+    if let Some(champ) = champ {
+        corps.insert("field".into(), json!(champ));
+    }
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(Value::Object(corps))).into_response()
+}
+
+/// Valide et normalise une demande de localisation, avec les règles EXACTES
+/// de la route du nuage (`POST /concerts/location`, site-mozaiklabs#186) :
+///
+/// - `city` : obligatoire, 255 caractères au plus ;
+/// - `postal_code` : facultatif, 16 au plus ;
+/// - `country` : obligatoire, 5 au plus — mis en majuscules ;
+/// - `scope` : `radius` | `country` | `world`, [`PERIMETRE_PAR_DEFAUT`] si absent ;
+/// - `radius_km` : 50, 100 ou 200 s'il est donné.
+///
+/// Rend le corps à relayer, ou le nom du champ fautif. Aucun `instance_id` :
+/// celui qui part au nuage est TOUJOURS celui de ce serveur.
+pub fn valider_localisation(demande: &Value) -> Result<Value, &'static str> {
+    fn texte<'a>(demande: &'a Value, cle: &str) -> Option<&'a str> {
+        demande
+            .get(cle)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    let city = texte(demande, "city").ok_or("city")?;
+    if city.chars().count() > 255 {
+        return Err("city");
+    }
+    let country = texte(demande, "country").ok_or("country")?.to_uppercase();
+    if country.chars().count() > 5 {
+        return Err("country");
+    }
+    let postal_code = texte(demande, "postal_code");
+    if postal_code.is_some_and(|cp| cp.chars().count() > 16) {
+        return Err("postal_code");
+    }
+    let scope = match demande.get("scope") {
+        None | Some(Value::Null) => PERIMETRE_PAR_DEFAUT,
+        Some(v) => v
+            .as_str()
+            .filter(|s| PERIMETRES.contains(s))
+            .ok_or("scope")?,
+    };
+    let radius_km = match demande.get("radius_km") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_i64()
+                .filter(|km| RAYONS_KM.contains(km))
+                .ok_or("radius_km")?,
+        ),
+    };
+
+    let mut corps = Map::new();
+    corps.insert("city".into(), json!(city));
+    corps.insert("postal_code".into(), json!(postal_code));
+    corps.insert("country".into(), json!(country));
+    corps.insert("scope".into(), json!(scope));
+    if let Some(km) = radius_km {
+        corps.insert("radius_km".into(), json!(km));
+    }
+    Ok(Value::Object(corps))
+}
+
 /// Rend un refus du nuage **sans en perdre le motif** — la forme greffon de
-/// `routes::cloud_error::reponse` (#2178).
+/// `routes::cloud_error::reponse` (#2178), pour la lecture des concerts.
 ///
 /// # Pourquoi ce n'est pas un appel à la fabrique commune
 ///
-/// `tune-server/src/routes/cloud_error.rs` rend ce contrat pour les quinze
+/// `tune-server/src/routes/cloud_error.rs` rend ce contrat pour les
 /// gestionnaires du cœur. Ce greffon **ne peut pas l'appeler** : il dépend de
 /// `tune-core`, jamais de `tune-server` — l'inverse ferait un cycle, puisque
 /// c'est `tune-server` qui monte ce routeur. Ce qui est partagé l'est au bon
 /// niveau : le **type** du refus, [`CloudError`], et la lecture du délai
-/// (`cloud::rate_limit::retry_after_secs`), tous deux dans `tune-core`. Seul le
-/// rendu est refait ici, et il l'est sur la forme propre au greffon.
+/// (`cloud::rate_limit::retry_after_secs`), tous deux dans `tune-core`.
 ///
-/// # Ce qui diffère de la fabrique du cœur, et pourquoi
-///
-/// La fabrique du cœur pose un `message` **déjà traduit** (`crate::i18n::t`,
-/// dix langues). Ce greffon n'en pose pas : `i18n_server.json` vit dans
-/// `tune-server`, hors de portée — mais surtout, ne pas traduire ici est la
-/// règle que ce greffon s'est donnée en sortant du cœur. L'ancienne route
-/// rendait `{"error": "concerts: HTTP 500"}`, une phrase anglaise qu'une
-/// interface traduite en onze langues affichait telle quelle ; le greffon rend
-/// un **code stable** que le client traduit. Le 429 suit cette règle : il se
-/// nomme `concerts.rate_limited`, il ne se raconte pas.
-///
-/// Le reste du contrat est tenu mot pour mot :
+/// Le greffon ne traduit pas : il rend un **code stable** que le client
+/// traduit. Le reste du contrat est tenu mot pour mot :
 ///
 /// * le **statut 429 est préservé** — l'ancienne route rendait 200 sur un
 ///   refus, et c'est précisément ce qui empêchait de le reconnaître ;
@@ -269,20 +587,36 @@ async fn concerts_a_venir(
 /// Hors 429, **rien ne bouge** : 200 et `concerts.unavailable`, comme avant.
 ///
 /// Publique pour être observable depuis `tune-server/tests/concerts_plugin.rs`,
-/// de l'autre côté de la frontière de crate — même raison que
-/// [`artistes_de_la_bibliotheque`].
+/// de l'autre côté de la frontière de crate.
 pub fn reponse_de_refus(err: &CloudError) -> Response {
+    refus_du_nuage(err, true)
+}
+
+/// Le rendu commun d'un refus du nuage. `lecture` = la route `/upcoming`, qui
+/// garde l'enveloppe `{"concerts": []}` et répond 200 hors 429 (contrat
+/// historique). L'écriture (`/location`) répond 502 hors 429 : un succès
+/// apparent y serait lu comme « localisation enregistrée ».
+fn refus_du_nuage(err: &CloudError, lecture: bool) -> Response {
     let CloudError::RateLimited {
         retry_after,
         upstream,
         ..
     } = err
     else {
-        return Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response();
+        if lecture {
+            return Json(json!({"concerts": [], "code": "concerts.unavailable"})).into_response();
+        }
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"code": "concerts.unavailable"})),
+        )
+            .into_response();
     };
 
-    let mut corps = serde_json::Map::new();
-    corps.insert("concerts".into(), json!([]));
+    let mut corps = Map::new();
+    if lecture {
+        corps.insert("concerts".into(), json!([]));
+    }
     corps.insert("code".into(), json!("concerts.rate_limited"));
     if let Some(secs) = retry_after {
         corps.insert("retry_after".into(), json!(secs));
@@ -303,10 +637,9 @@ pub fn reponse_de_refus(err: &CloudError) -> Response {
 // ---------------------------------------------------------------------------
 // Le cloud — repris de tune-core/src/cloud/concert_alerts.rs, dans son état
 // après #2892 (40f9342c) : l'abonnement porte sur toute la bibliothèque.
-// La lecture (`recuperer_concerts`) a depuis reçu l'apport de #2178
-// (64e8378f) à la fusion de rc/v0.9.130 : elle rend un `CloudError`, et un
-// 429 du nuage arrive au client en 429. Voir l'en-tête et
-// [`reponse_de_refus`].
+// La lecture (`recuperer_concerts_depuis`) a reçu l'apport de #2178
+// (64e8378f) : elle rend un `CloudError`, et un 429 du nuage arrive au client
+// en 429. Puis site-mozaiklabs#186 : la localisation et le périmètre.
 // ---------------------------------------------------------------------------
 
 /// Les artistes de la bibliothèque, prêts à être abonnés.
@@ -502,32 +835,22 @@ pub async fn envoyer_abonnements(
     Ok(total)
 }
 
-/// Récupère les concerts à venir pour les artistes auxquels cette instance
-/// s'est abonnée.
+/// La lecture des concerts à venir, avec la racine de l'API en argument —
+/// même raison que [`envoyer_abonnements`] : c'est le seul moyen d'exercer la
+/// traduction d'un refus du nuage en [`CloudError`] sans appeler
+/// `mozaiklabs.fr`. Rend le corps destiné à l'écran ([`corps_a_venir`]).
 ///
-/// Le refus est rendu en [`CloudError`] et non plus en `String` (#2178) : un
-/// 429 y garde son délai (`Retry-After`, à défaut `X-RateLimit-Reset`) et le
-/// texte du distant, que [`reponse_de_refus`] fait ensuite ressortir jusqu'au
-/// client. Les autres erreurs — réseau, analyse — passent inchangées par
-/// `impl From<String>`, et le texte rendu par `Display` reste mot pour mot
-/// celui d'avant : les journaux ne bougent pas.
-pub async fn recuperer_concerts(
-    http_client: &reqwest::Client,
-    instance_id: &str,
-) -> Result<Vec<Value>, CloudError> {
-    recuperer_concerts_depuis(CONCERTS_API, http_client, instance_id).await
-}
-
-/// La lecture, avec la racine de l'API en argument — même raison que
-/// [`envoyer_abonnements`] : c'est le seul moyen d'exercer la traduction d'un
-/// refus du nuage en [`CloudError`] sans appeler `mozaiklabs.fr`.
+/// Le refus est rendu en [`CloudError`] et non en `String` (#2178) : un 429 y
+/// garde son délai (`Retry-After`, à défaut `X-RateLimit-Reset`) et le texte du
+/// distant, que [`reponse_de_refus`] fait ressortir jusqu'au client.
 ///
-/// L'unique appelant en production est [`recuperer_concerts`] juste au-dessus.
+/// Seule l'identité de l'instance part : le périmètre est gardé et appliqué
+/// par le nuage lui-même (`concert_locations`), qui le rend dans sa réponse.
 pub async fn recuperer_concerts_depuis(
     racine: &str,
     http_client: &reqwest::Client,
     instance_id: &str,
-) -> Result<Vec<Value>, CloudError> {
+) -> Result<Value, CloudError> {
     let resp = http_client
         .get(format!("{racine}/upcoming"))
         .query(&[("instance_id", instance_id)])
@@ -542,18 +865,142 @@ pub async fn recuperer_concerts_depuis(
     }
 
     let data: Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
-    let concerts = data["concerts"].as_array().cloned().unwrap_or_default();
-    info!(count = concerts.len(), "upcoming_concerts_fetched");
-    Ok(concerts)
+    let corps = corps_a_venir(&data);
+    info!(
+        count = corps["concerts"].as_array().map_or(0, Vec::len),
+        scope = ?corps.get("scope"),
+        "upcoming_concerts_fetched"
+    );
+    Ok(corps)
+}
+
+/// Le corps rendu à l'écran : la liste, et le périmètre que le nuage a
+/// APPLIQUÉ (`scope`, `radius_km`, `city`, `country`, site-mozaiklabs#186).
+///
+/// Champs nommés un à un plutôt que le corps du nuage relayé tel quel : ce que
+/// l'écran reçoit est le contrat de CE serveur (`ConcertsAVenir`,
+/// `docs/contrat-web.json`), pas ce que le nuage ajoutera demain. Un champ nul
+/// est omis — le client les déclare facultatifs.
+pub fn corps_a_venir(data: &Value) -> Value {
+    let mut corps = Map::new();
+    corps.insert(
+        "concerts".into(),
+        data.get("concerts")
+            .filter(|c| c.is_array())
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    );
+    for champ in ["scope", "radius_km", "city", "country"] {
+        if let Some(v) = data.get(champ).filter(|v| !v.is_null()) {
+            corps.insert(champ.into(), v.clone());
+        }
+    }
+    Value::Object(corps)
+}
+
+/// Pourquoi une localisation n'a pas été enregistrée.
+#[derive(Debug)]
+pub enum EchecLocalisation {
+    /// Le nuage a refusé la demande elle-même (422) : commune, pays, cran ou
+    /// rayon hors de ses règles. Distingué d'une panne : réessayer la même
+    /// demande ne donnera rien.
+    Refusee,
+    /// Réseau, limite (429), panne du nuage, réponse illisible.
+    Nuage(CloudError),
+}
+
+/// Enregistre la commune SAISIE et le périmètre auprès du nuage
+/// (`POST {racine}/location`). Rend ce que le nuage a retenu :
+/// `{scope, city, country, radius_km, located}`.
+///
+/// ⚠️ L'`instance_id` est IMPOSÉ ici, par-dessus la demande : c'est celui de
+/// CE serveur, jamais celui qu'un client prétendrait — sinon n'importe qui
+/// poserait la commune d'une autre instance.
+///
+/// `located == false` : le rayon était demandé mais le géocodeur n'a pas
+/// trouvé la commune ; le nuage retombe alors sur le pays. L'écran le dit.
+pub async fn enregistrer_localisation_vers(
+    racine: &str,
+    http_client: &reqwest::Client,
+    instance_id: &str,
+    demande: &Value,
+) -> Result<Value, EchecLocalisation> {
+    let mut corps = demande.clone();
+    if let Some(objet) = corps.as_object_mut() {
+        objet.insert("instance_id".into(), json!(instance_id));
+    }
+
+    let resp = http_client
+        .post(format!("{racine}/location"))
+        .json(&corps)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| EchecLocalisation::Nuage(format!("concerts location: {e}").into()))?;
+
+    let status = resp.status();
+    if status.as_u16() == 422 {
+        let detail = resp.text().await.unwrap_or_default();
+        warn!(detail = %detail.chars().take(300).collect::<String>(), "concerts_location_refusee_par_le_nuage");
+        return Err(EchecLocalisation::Refusee);
+    }
+    if !status.is_success() {
+        return Err(EchecLocalisation::Nuage(
+            CloudError::from_response(format!("concerts location: HTTP {status}"), resp).await,
+        ));
+    }
+
+    let data: Value = resp
+        .json()
+        .await
+        .map_err(|e| EchecLocalisation::Nuage(format!("parse: {e}").into()))?;
+    let mut rendu = Map::new();
+    for champ in ["scope", "city", "country", "radius_km", "located"] {
+        if let Some(v) = data.get(champ) {
+            rendu.insert(champ.into(), v.clone());
+        }
+    }
+    Ok(Value::Object(rendu))
+}
+
+/// Le greffon a-t-il le droit d'envoyer la liste des artistes au nuage ?
+///
+/// Deux conditions, et plus `community_sync_enabled` :
+///
+/// 1. **Premium** — sans le module, l'abonnement ne servirait à rien : les
+///    routes refusent. Envoyer chaque jour la bibliothèque d'un compte gratuit
+///    serait un envoi sans usage.
+/// 2. **La télémétrie n'est pas refusée** (`TUNE_TELEMETRY`, ou le réglage de
+///    l'interface) — un refus, d'où qu'il vienne, reste souverain (#3383).
+///
+/// ⚠️ Pourquoi le greffon ne lit plus `community_sync_enabled`. Ce réglage est
+/// la bascule « Partage communautaire des métadonnées », désactivée par
+/// défaut, qui gouverne l'envoi de TOUTES les métadonnées des pistes toutes
+/// les 30 minutes. L'exiger ici rendait le module inutilisable par défaut —
+/// liste toujours vide — ou obligeait à partager bien plus que ce qu'il
+/// demande. Installer « Concerts » est le consentement à SON envoi, borné à
+/// sa finalité : les noms d'artistes (et leur MBID quand on l'a), rien d'autre.
+///
+/// Le `match` sur [`Acces`] est exhaustif exprès : le jour où `Reduit` arrive,
+/// le compilateur demande ici ce que la version réduite synchronise.
+pub fn synchronisation_autorisee(settings: &SettingsRepo, acces: Acces) -> bool {
+    let premium = match acces {
+        Acces::Complet => true,
+        Acces::Refuse => false,
+    };
+    premium && tune_core::cloud::telemetry::TelemetryReporter::is_enabled_for(settings)
 }
 
 /// La tâche périodique : abonnement toutes les 24 h, 2 min après le démarrage.
 ///
-/// Le double garde-fou de l'original est conservé : le réglage
-/// `community_sync_enabled` **et** un `instance_id` non vide. Ce qui change,
-/// c'est qu'elle ne démarre plus que si le plugin est installé — avant, elle
-/// tournait dans tous les serveurs.
-fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandle<()> {
+/// Elle ne tourne que si le greffon est installé (sinon il n'est pas chargé),
+/// et n'envoie que si [`synchronisation_autorisee`] et un `instance_id` non
+/// vide le permettent — relus à chaque tour : un Premium qui arrive ou qui
+/// part est pris en compte au tour suivant, sans redémarrage.
+fn lancer_synchronisation(
+    backend: Arc<dyn DbBackend>,
+    license: Option<Arc<LicenseManager>>,
+) -> tokio::task::JoinHandle<()> {
     let client = match tune_core::http::client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("Tune/2.0 (https://mozaiklabs.fr)")
@@ -571,14 +1018,9 @@ fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandl
 
         loop {
             let settings = SettingsRepo::with_backend(backend.clone());
-            let enabled = settings
-                .get("community_sync_enabled")
-                .ok()
-                .flatten()
-                .map(|v| v == "true")
-                .unwrap_or(false);
+            let droit = acces(license.as_deref()).await;
 
-            if enabled {
+            if synchronisation_autorisee(&settings, droit) {
                 let instance_id = settings
                     .get("instance_id")
                     .ok()
@@ -593,6 +1035,8 @@ fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandl
                 } else {
                     debug!("concert_alerts_skipped_no_instance_id");
                 }
+            } else {
+                debug!(acces = ?droit, "concert_alerts_skipped_not_allowed");
             }
 
             tokio::time::sleep(std::time::Duration::from_secs(86400)).await;
@@ -606,7 +1050,7 @@ fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandl
 //
 // Cette caisse rendait `tune_concerts: 0 passed` dans les deux jobs qui la
 // nomment. `tune-server/tests/concerts_plugin.rs` en garde déjà la moitié
-// haute — le montage du routeur, le hors-catalogue, l'arrêt de la tâche, la
+// haute — le montage du routeur, le catalogue, l'arrêt de la tâche, la
 // requête d'artistes, et le RENDU d'un refus par `reponse_de_refus`.
 //
 // Ce qui restait sans aucun témoin, c'est tout ce qui parle au nuage :
@@ -616,7 +1060,7 @@ fn lancer_synchronisation(backend: Arc<dyn DbBackend>) -> tokio::task::JoinHandl
 //     sa propre arithmétique — il relit le code au lieu de l'appeler, et
 //     resterait vert si la boucle d'envoi se remettait à couper à 200 ;
 //   * la LECTURE d'un refus : `reponse_de_refus` est gardée, mais rien ne
-//     vérifiait que `recuperer_concerts` construit bien le `CloudError` qu'elle
+//     vérifiait que `recuperer_concerts_depuis` construit bien le `CloudError` qu'elle
 //     rend. Les deux moitiés du 429 sont désormais tenues.
 
 #[cfg(test)]
@@ -936,7 +1380,7 @@ mod essais {
     }
 
     // -----------------------------------------------------------------------
-    // `recuperer_concerts` — appelée par `concerts_a_venir`
+    // `recuperer_concerts_depuis` — appelée par `concerts_a_venir`
     // -----------------------------------------------------------------------
 
     /// ⭐ La moitié LECTURE du 429. `tune-server/tests/concerts_plugin.rs` garde
@@ -995,16 +1439,320 @@ mod essais {
         )])
         .await;
 
-        let concerts =
+        let corps =
             recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
                 .await
                 .unwrap();
 
-        assert_eq!(concerts.len(), 3);
+        assert_eq!(corps["concerts"].as_array().unwrap().len(), 3);
         let cible = banc.recues()[0]["cible"].as_str().unwrap().to_string();
         assert!(
             cible.starts_with("GET /upcoming?") && cible.contains("instance_id=inst-7"),
             "l'identite doit partir en requete : {cible}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Le périmètre (site-mozaiklabs#186)
+    // -----------------------------------------------------------------------
+
+    /// ⭐ Le périmètre APPLIQUÉ par le nuage remonte jusqu'à l'écran. Avant, la
+    /// lecture ne gardait que `concerts` : l'écran affichait « 3 concerts »
+    /// sans pouvoir dire « à moins de 100 km de Dijon », ni proposer d'élargir.
+    #[tokio::test]
+    async fn la_lecture_remonte_le_perimetre_applique_par_le_nuage() {
+        let banc = banc(vec![(
+            200,
+            r#"{"concerts":[{"artist_name":"Superbus","event_date":"2026-11-02"}],
+                "scope":"radius","radius_km":100,"city":"Dijon","country":"FR",
+                "interne":"ne doit pas sortir"}"#,
+            None,
+        )])
+        .await;
+
+        let corps =
+            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
+                .await
+                .unwrap();
+
+        assert_eq!(corps["scope"], "radius");
+        assert_eq!(corps["radius_km"], 100);
+        assert_eq!(corps["city"], "Dijon");
+        assert_eq!(corps["country"], "FR");
+        assert_eq!(corps["concerts"][0]["artist_name"], "Superbus");
+        assert!(
+            corps.get("interne").is_none(),
+            "l'ecran recoit le contrat de CE serveur, pas le corps brut du nuage"
+        );
+    }
+
+    /// Contre-épreuve : un nuage qui ne dit rien du périmètre (version
+    /// antérieure à #186, ou champs nuls) ne fait fabriquer AUCUN périmètre.
+    /// Un `scope` inventé ferait mentir l'écran sur le filtre appliqué.
+    #[tokio::test]
+    async fn contre_epreuve_aucun_perimetre_n_est_fabrique() {
+        let banc = banc(vec![(200, r#"{"concerts":[],"radius_km":null}"#, None)]).await;
+
+        let corps =
+            recuperer_concerts_depuis(&banc.racine, tune_core::http::client::shared(), "inst-7")
+                .await
+                .unwrap();
+
+        assert_eq!(corps, json!({"concerts": []}));
+    }
+
+    /// ⭐ L'aller de la localisation : la demande part telle quelle, sauf
+    /// l'identité — c'est TOUJOURS celle de ce serveur. Et le retour rend ce
+    /// que le nuage a retenu, `located` compris.
+    #[tokio::test]
+    async fn la_localisation_part_avec_l_instance_du_serveur_et_revient_entiere() {
+        let banc = banc(vec![(
+            200,
+            r#"{"scope":"radius","city":"Dijon","country":"FR","radius_km":50,"located":true}"#,
+            None,
+        )])
+        .await;
+        let demande = json!({
+            "city": "Dijon", "postal_code": "21000", "country": "FR",
+            "scope": "radius", "radius_km": 50,
+            "instance_id": "celle-d-un-autre",
+        });
+
+        let rendu = enregistrer_localisation_vers(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-9",
+            &demande,
+        )
+        .await
+        .unwrap();
+
+        let recues = banc.recues();
+        assert!(
+            recues[0]["cible"]
+                .as_str()
+                .unwrap()
+                .starts_with("POST /location "),
+            "{:?}",
+            recues[0]["cible"]
+        );
+        assert_eq!(
+            recues[0]["corps"]["instance_id"], "inst-9",
+            "l'instance est celle du serveur, jamais celle que la demande pretend"
+        );
+        assert_eq!(recues[0]["corps"]["city"], "Dijon");
+        assert_eq!(recues[0]["corps"]["postal_code"], "21000");
+        assert_eq!(recues[0]["corps"]["radius_km"], 50);
+        assert_eq!(
+            rendu,
+            json!({"scope":"radius","city":"Dijon","country":"FR","radius_km":50,"located":true})
+        );
+    }
+
+    /// Un 422 du nuage est une demande refusée, pas une panne : réessayer la
+    /// même chose ne donnera rien, et l'écran doit le dire autrement.
+    #[tokio::test]
+    async fn un_422_du_nuage_est_une_demande_refusee_pas_une_panne() {
+        let banc = banc(vec![(
+            422,
+            r#"{"message":"The radius km field is invalid."}"#,
+            None,
+        )])
+        .await;
+
+        let echec = enregistrer_localisation_vers(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-9",
+            &json!({"city": "Dijon", "country": "FR"}),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(echec, EchecLocalisation::Refusee), "{echec:?}");
+    }
+
+    /// Contre-épreuve du précédent : une limite (429) reste une limite, avec
+    /// son délai — elle ne se confond pas avec une demande refusée.
+    #[tokio::test]
+    async fn contre_epreuve_un_429_sur_la_localisation_reste_une_limite() {
+        let banc = banc(vec![(429, r#"{"message":"Too Many Attempts."}"#, Some(12))]).await;
+
+        let echec = enregistrer_localisation_vers(
+            &banc.racine,
+            tune_core::http::client::shared(),
+            "inst-9",
+            &json!({"city": "Dijon", "country": "FR"}),
+        )
+        .await
+        .unwrap_err();
+
+        let EchecLocalisation::Nuage(e) = echec else {
+            panic!("un 429 n'est pas une demande refusee");
+        };
+        assert!(e.is_rate_limited());
+        assert_eq!(e.retry_after(), Some(12));
+    }
+
+    // -----------------------------------------------------------------------
+    // `valider_localisation` — les règles du nuage, appliquées avant l'appel
+    // -----------------------------------------------------------------------
+
+    /// Le cran par défaut est le PAYS (arbitrage du 29/08) : mieux vaut montrer
+    /// trop que trop peu. Et le pays part en majuscules, comme le nuage le
+    /// compare (`where('country', …)`).
+    #[test]
+    fn sans_cran_la_demande_part_au_pays_et_en_majuscules() {
+        let corps = valider_localisation(&json!({"city": " Dijon ", "country": "fr"})).unwrap();
+        assert_eq!(corps["scope"], PERIMETRE_PAR_DEFAUT);
+        assert_eq!(corps["scope"], "country");
+        assert_eq!(corps["country"], "FR");
+        assert_eq!(corps["city"], "Dijon");
+        assert!(corps.get("radius_km").is_none(), "aucun rayon invente");
+    }
+
+    /// Le corps que l'écran envoie aujourd'hui (`setLocalisationConcerts`),
+    /// cran par cran : il doit passer tel quel.
+    #[test]
+    fn les_trois_crans_de_l_ecran_passent() {
+        for scope in PERIMETRES {
+            for km in RAYONS_KM {
+                let corps = valider_localisation(&json!({
+                    "city": "—", "postal_code": null, "country": "FR",
+                    "scope": scope, "radius_km": km,
+                }))
+                .unwrap_or_else(|champ| panic!("{scope}/{km} refuse sur {champ}"));
+                assert_eq!(corps["scope"], scope);
+                assert_eq!(corps["radius_km"], km);
+            }
+        }
+    }
+
+    /// Liste fermée : un rayon libre serait un « partout » déguisé, et le
+    /// nuage le refuserait en 422 sans dire quel champ.
+    #[test]
+    fn un_rayon_hors_liste_ou_un_cran_inconnu_nomme_son_champ() {
+        let base = json!({"city": "Dijon", "country": "FR"});
+        let avec = |cle: &str, v: Value| {
+            let mut d = base.clone();
+            d[cle] = v;
+            valider_localisation(&d)
+        };
+        assert_eq!(avec("radius_km", json!(75)), Err("radius_km"));
+        assert_eq!(avec("radius_km", json!("100")), Err("radius_km"));
+        assert_eq!(avec("scope", json!("galaxy")), Err("scope"));
+        assert_eq!(avec("country", json!("FRANCE")), Err("country"));
+        assert_eq!(avec("city", json!("   ")), Err("city"));
+        assert_eq!(valider_localisation(&json!({"country": "FR"})), Err("city"));
+        assert_eq!(valider_localisation(&Value::Null), Err("city"));
+    }
+
+    /// L'identité ne vient JAMAIS du client : la validation ne la recopie pas.
+    #[test]
+    fn la_validation_ne_recopie_pas_l_instance_du_client() {
+        let corps = valider_localisation(
+            &json!({"city": "Dijon", "country": "FR", "instance_id": "pirate"}),
+        )
+        .unwrap();
+        assert!(corps.get("instance_id").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // `acces` — la seule décision du payant
+    // -----------------------------------------------------------------------
+
+    fn licence() -> Arc<LicenseManager> {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        Arc::new(LicenseManager::new(Arc::new(db)))
+    }
+
+    /// ⚠️ Une licence absente ne vaut PAS une autorisation — c'est la
+    /// contre-épreuve de tout le portillon.
+    #[tokio::test]
+    async fn sans_licence_l_acces_est_refuse() {
+        assert_eq!(acces(None).await, Acces::Refuse);
+    }
+
+    #[tokio::test]
+    async fn un_compte_gratuit_est_refuse_un_compte_premium_a_l_acces_complet() {
+        let l = licence();
+        assert_eq!(
+            acces(Some(l.as_ref())).await,
+            Acces::Refuse,
+            "compte neuf = gratuit"
+        );
+        l.set_account_premium(true, None).await;
+        assert_eq!(acces(Some(l.as_ref())).await, Acces::Complet);
+        l.set_account_premium(false, None).await;
+        assert_eq!(
+            acces(Some(l.as_ref())).await,
+            Acces::Refuse,
+            "un Premium qui s'en va referme le module"
+        );
+    }
+
+    /// Le greffon nomme son module (cadenas avant le clic) et entre au
+    /// catalogue : l'écran existe, le nuage a des dates.
+    #[test]
+    fn le_greffon_nomme_son_module_et_entre_au_catalogue() {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let greffon = ConcertsPlugin::new(HostServices {
+            backend: Arc::new(db),
+        });
+        assert_eq!(greffon.required_feature(), Some(Feature::Concerts));
+        assert!(greffon.catalogued());
+        assert!(!greffon.default_enabled(), "toujours opt-in");
+    }
+
+    // -----------------------------------------------------------------------
+    // `synchronisation_autorisee`
+    // -----------------------------------------------------------------------
+
+    fn reglages() -> SettingsRepo {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        SettingsRepo::with_backend(Arc::new(db))
+    }
+
+    /// Un compte gratuit n'envoie pas sa bibliothèque : ses routes refusent,
+    /// l'abonnement ne servirait à rien.
+    #[test]
+    fn sans_premium_la_bibliotheque_ne_part_pas() {
+        assert!(!synchronisation_autorisee(&reglages(), Acces::Refuse));
+    }
+
+    /// ⭐ Premium, installation neuve : l'abonnement part SANS que le
+    /// « partage communautaire des métadonnées » soit coché. Avant, il
+    /// l'exigeait, et la liste restait vide pour tout le monde par défaut.
+    #[test]
+    fn premium_l_abonnement_part_sans_le_partage_communautaire() {
+        if !tune_core::cloud::telemetry::TelemetryReporter::is_enabled() {
+            eprintln!("TUNE_TELEMETRY refuse dans cet environnement : cas non jouable ici");
+            return;
+        }
+        let settings = reglages();
+        assert!(
+            settings
+                .get(tune_core::cloud::consent::SYNC_SETTING_KEY)
+                .unwrap()
+                .is_none(),
+            "le partage communautaire n'est pas coche dans une base neuve"
+        );
+        assert!(synchronisation_autorisee(&settings, Acces::Complet));
+    }
+
+    /// Contre-épreuve : un refus de télémétrie reste souverain (#3383), même
+    /// Premium.
+    #[test]
+    fn contre_epreuve_le_refus_de_telemetrie_arrete_l_abonnement() {
+        let settings = reglages();
+        settings
+            .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
+            .unwrap();
+        assert!(!synchronisation_autorisee(&settings, Acces::Complet));
     }
 }
