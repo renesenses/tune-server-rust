@@ -251,6 +251,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_bascule_ -- --nocapture
 
+      # Bascule SQLite -> PostgreSQL REJOUEE (#5199, releve par #5139) : la seconde
+      # bascule complete sur une base deja basculee echouait a la creation du
+      # schema (`'lq_' || id` dans `queue_items.id` devenu BIGINT). Le temoin
+      # joue la bascule deux fois sur une base jetable, puis la supprime.
+      - name: Bascule SQLite -> PostgreSQL rejouee deux fois (#5199)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_rejeu_bascule -- --nocapture
+
       # #5077 — le MOTIF du masquage d'une zone (migration PG 075). Chaque
       # chemin qui masque, le démasquage et la réparation sûre, joués sur la
       # VRAIE base, dans des tables temporaires copiées du schéma migré. Sans
