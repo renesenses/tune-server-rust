@@ -30,7 +30,45 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Compteur, et non booléen : le `Drop` d'un jeton ne doit jamais effacer la
 /// marque d'un autre. La porte unique n'en délivre qu'un à la fois aujourd'hui,
 /// mais un compteur reste juste si cela change — un booléen, non.
-static SCANS_EN_COURS: AtomicUsize = AtomicUsize::new(0);
+///
+/// Un TYPE, et pas seulement une globale (#5142) : la porte du scan reçoit le
+/// compteur qu'elle doit lever. En production c'est [`SCANS_DU_PROCESSUS`], le
+/// seul que lit [`scan_bibliotheque_en_cours`] ; une épreuve de la porte lui
+/// donne le sien, et ne voit donc plus les vrais scans que d'autres épreuves
+/// font tourner dans le même processus.
+#[derive(Debug)]
+pub struct CompteurDeScans {
+    en_cours: AtomicUsize,
+}
+
+impl CompteurDeScans {
+    pub const fn new() -> Self {
+        Self {
+            en_cours: AtomicUsize::new(0),
+        }
+    }
+
+    /// À n'appeler que depuis le détenteur de la porte unique du scan.
+    pub fn poser(&'static self) -> MarqueDeScan {
+        self.en_cours.fetch_add(1, Ordering::SeqCst);
+        MarqueDeScan { compteur: self }
+    }
+
+    /// Vrai tant qu'une marque posée sur CE compteur est vivante.
+    pub fn en_cours(&self) -> bool {
+        self.en_cours.load(Ordering::SeqCst) > 0
+    }
+}
+
+impl Default for CompteurDeScans {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Le compteur du processus : celui que la porte de production lève, et le
+/// seul que lit le balayage acoustique.
+pub static SCANS_DU_PROCESSUS: CompteurDeScans = CompteurDeScans::new();
 
 /// Marque « un scan de bibliothèque tourne » tant qu'elle est vivante.
 ///
@@ -38,14 +76,13 @@ static SCANS_EN_COURS: AtomicUsize = AtomicUsize::new(0);
 /// aussi sur une panique de la tâche qui la portait.
 #[derive(Debug)]
 pub struct MarqueDeScan {
-    _prive: (),
+    compteur: &'static CompteurDeScans,
 }
 
 impl MarqueDeScan {
-    /// À n'appeler que depuis le détenteur de la porte unique du scan.
+    /// Pose la marque sur le compteur du PROCESSUS.
     pub fn poser() -> Self {
-        SCANS_EN_COURS.fetch_add(1, Ordering::SeqCst);
-        Self { _prive: () }
+        SCANS_DU_PROCESSUS.poser()
     }
 }
 
@@ -54,9 +91,12 @@ impl Drop for MarqueDeScan {
         // `fetch_update` plutôt que `fetch_sub` : un décompte qui passerait sous
         // zéro reboucle sur `usize::MAX` et rendrait le scan éternellement « en
         // cours ». Ici il ne descend simplement pas sous zéro.
-        let _ = SCANS_EN_COURS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            Some(n.saturating_sub(1))
-        });
+        let _ = self
+            .compteur
+            .en_cours
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 }
 
@@ -64,69 +104,84 @@ impl Drop for MarqueDeScan {
 ///
 /// Lu par le balayage acoustique, qui s'efface devant lui (#2469).
 pub fn scan_bibliotheque_en_cours() -> bool {
-    SCANS_EN_COURS.load(Ordering::SeqCst) > 0
+    SCANS_DU_PROCESSUS.en_cours()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Ces tests partagent un compteur de processus : ils ne peuvent pas
-    /// tourner en parallèle sans se voler leurs constats.
-    static SERIALISE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Un compteur propre à l'épreuve : elle ne voit ni ne gêne aucune autre
+    /// épreuve du processus, et n'a donc pas à se sérialiser (#5142).
+    fn compteur_isole() -> &'static CompteurDeScans {
+        Box::leak(Box::new(CompteurDeScans::new()))
+    }
 
     #[test]
     fn au_repos_aucun_scan_ne_tourne() {
-        let _s = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
+        let c = compteur_isole();
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !c.en_cours(),
             "sans marque posée, aucun scan ne doit être annoncé"
         );
     }
 
     #[test]
     fn la_marque_leve_puis_baisse_le_drapeau() {
-        let _s = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!scan_bibliotheque_en_cours());
+        let c = compteur_isole();
+        assert!(!c.en_cours());
         {
-            let _marque = MarqueDeScan::poser();
-            assert!(
-                scan_bibliotheque_en_cours(),
-                "la marque posée doit rendre le scan visible"
-            );
+            let _marque = c.poser();
+            assert!(c.en_cours(), "la marque posée doit rendre le scan visible");
         }
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !c.en_cours(),
             "le Drop de la marque doit rendre la main au balayage acoustique"
         );
     }
 
     #[test]
     fn deux_marques_ne_se_volent_pas_leur_drop() {
-        let _s = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
-        let a = MarqueDeScan::poser();
-        let b = MarqueDeScan::poser();
+        let c = compteur_isole();
+        let a = c.poser();
+        let b = c.poser();
         drop(a);
         assert!(
-            scan_bibliotheque_en_cours(),
+            c.en_cours(),
             "la seconde marque tient encore : le drapeau doit rester levé"
         );
         drop(b);
-        assert!(!scan_bibliotheque_en_cours());
+        assert!(!c.en_cours());
     }
 
     #[test]
     fn une_panique_pendant_le_scan_rend_quand_meme_la_main() {
-        let _s = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
+        let c = compteur_isole();
         let issue = std::panic::catch_unwind(|| {
-            let _marque = MarqueDeScan::poser();
-            assert!(scan_bibliotheque_en_cours());
+            let _marque = c.poser();
+            assert!(c.en_cours());
             panic!("le scan explose");
         });
         assert!(issue.is_err(), "la panique doit bien être survenue");
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !c.en_cours(),
             "un scan qui panique ne doit pas geler le balayage acoustique pour toujours"
         );
+    }
+
+    /// Le câblage de production : `MarqueDeScan::poser` lève LE compteur que
+    /// lit `scan_bibliotheque_en_cours`. C'est la seule épreuve qui touche au
+    /// compteur du processus, et aucune autre épreuve de `tune-core` ne pose
+    /// de marque dessus : elle n'a personne avec qui se disputer.
+    #[test]
+    fn la_marque_du_processus_est_celle_que_lit_le_balayage() {
+        assert!(!scan_bibliotheque_en_cours());
+        let marque = MarqueDeScan::poser();
+        assert!(
+            scan_bibliotheque_en_cours(),
+            "la marque du processus doit être visible du balayage acoustique"
+        );
+        drop(marque);
+        assert!(!scan_bibliotheque_en_cours());
     }
 }

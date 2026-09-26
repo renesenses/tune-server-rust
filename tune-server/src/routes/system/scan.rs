@@ -29,12 +29,20 @@ const SCAN_FLAGS: u64 = SCAN_ACTIVE | SCAN_CANCELLED;
 /// de génération empêche cette fuite entre propriétaires successifs.
 struct ScanGate {
     state: AtomicU64,
+    /// Le compteur que le jeton lève pour le balayage acoustique. Celui du
+    /// PROCESSUS pour [`SCAN_GATE`] ; un compteur propre pour une porte
+    /// d'épreuve, qui ne voit donc pas les vrais scans des autres épreuves
+    /// (#5142).
+    activite: &'static tune_core::scanner::activite::CompteurDeScans,
 }
 
 impl ScanGate {
-    const fn new() -> Self {
+    const fn avec_activite(
+        activite: &'static tune_core::scanner::activite::CompteurDeScans,
+    ) -> Self {
         Self {
             state: AtomicU64::new(0),
+            activite,
         }
     }
 
@@ -68,7 +76,7 @@ impl ScanGate {
                         // ICI, dans la seule branche qui délivre un jeton, et
                         // baissée par le `Drop` du jeton : les deux gestes ne
                         // peuvent pas se désynchroniser.
-                        _marque_acoustique: tune_core::scanner::activite::MarqueDeScan::poser(),
+                        _marque_acoustique: self.activite.poser(),
                     });
                 }
                 Err(current) => observed = current,
@@ -148,7 +156,8 @@ impl Drop for ScanLease<'_> {
     }
 }
 
-static SCAN_GATE: ScanGate = ScanGate::new();
+static SCAN_GATE: ScanGate =
+    ScanGate::avec_activite(&tune_core::scanner::activite::SCANS_DU_PROCESSUS);
 
 /// Épreuves seulement — le verrou des tests qui dépendent de l'ÉTAT GLOBAL du
 /// scan : le droit de scanner (`SCAN_GATE`) et le compteur de scans en cours
@@ -161,6 +170,12 @@ static SCAN_GATE: ScanGate = ScanGate::new();
 /// vingtaine : `le_jeton_de_scan_efface_le_balayage_acoustique` et
 /// `le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable` ont rougi
 /// sur Shrek, sans rapport avec leur code).
+///
+/// Recensement du 26/09/2026 (#5142) : chaque appel à `try_begin_scan` des
+/// épreuves de la caisse, sous les deux jeux de fonctionnalités de la CI, a
+/// été relevé avec l'état de ce verrou — tous le tenaient. Les épreuves de la
+/// porte elle-même n'en ont plus besoin : elles ont leur porte et leur
+/// compteur (`scan_gate_tests::porte_isolee`).
 #[cfg(test)]
 static VERROU_DES_SCANS_DE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -223,12 +238,20 @@ pub(crate) fn scan_cancel_requested() -> bool {
 #[cfg(test)]
 mod scan_gate_tests {
     use super::ScanGate;
+    use tune_core::scanner::activite::CompteurDeScans;
+
+    /// Une porte d'épreuve avec SON compteur d'activité (#5142) : elle ne
+    /// partage rien avec les vrais scans que d'autres épreuves du processus
+    /// font tourner, et n'a donc pas à se sérialiser avec elles.
+    fn porte_isolee() -> (ScanGate, &'static CompteurDeScans) {
+        let activite: &'static CompteurDeScans = Box::leak(Box::new(CompteurDeScans::new()));
+        (ScanGate::avec_activite(activite), activite)
+    }
 
     /// Le bit que `trigger_scan` consulte se lit, et retombe avec le jeton.
     #[test]
     fn le_verrou_dit_s_il_est_tenu() {
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         assert!(!gate.is_active());
         let jeton = gate.try_acquire().expect("premier depart");
         assert!(gate.is_active(), "tenu : un nouveau depart serait refuse");
@@ -271,16 +294,10 @@ mod scan_gate_tests {
         drop(jeton);
     }
 
-    /// Chaque `ScanGate` de test est local, mais le drapeau que son jeton lève
-    /// pour le balayage acoustique est un COMPTEUR DE PROCESSUS (#2469,
-    /// point 3). Deux tests qui tiennent un jeton en même temps se voient donc
-    /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
-    /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
-    /// verrou.
-    ///
-    /// C'est le verrou COMMUN aux épreuves de scan réel
-    /// ([`super::serialiser_les_scans_de_test`]) : un vrai scan lève le même
-    /// compteur.
+    /// Le verrou COMMUN aux épreuves de scan réel
+    /// ([`super::serialiser_les_scans_de_test`]). Seule l'épreuve qui touche à
+    /// la porte du PROCESSUS le prend : les autres ont leur porte et leur
+    /// compteur (`porte_isolee`).
     fn serialiser() -> std::sync::MutexGuard<'static, ()> {
         super::serialiser_les_scans_de_test()
     }
@@ -290,8 +307,7 @@ mod scan_gate_tests {
     /// bit d'annulation de A à zéro.
     #[test]
     fn un_second_depart_refuse_ne_desarme_pas_stop() {
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         let scan_a = gate.try_acquire().expect("le premier scan doit demarrer");
 
         assert!(gate.request_cancel());
@@ -320,34 +336,46 @@ mod scan_gate_tests {
     /// jamais et la garde ajoutée dans `embedding.rs` serait du code mort —
     /// exactement le défaut que #2469 a déjà rencontré une fois, quand
     /// `spawn_scan_scheduler` n'était appelé de nulle part.
+    ///
+    /// La porte d'épreuve a son propre compteur (#5142) : le constat ne dépend
+    /// plus d'aucun vrai scan lancé par une autre épreuve du processus, alors
+    /// qu'il attendait jusqu'à deux minutes qu'ils aient fini et rougissait
+    /// quand l'un d'eux démarrait entre l'attente et l'assertion. Le câblage
+    /// de production est cloué juste en dessous.
     #[test]
     fn le_jeton_de_scan_efface_le_balayage_acoustique() {
-        use tune_core::scanner::activite::scan_bibliotheque_en_cours;
-
-        let _serialise = serialiser();
-        // Le compteur est de PROCESSUS : un vrai scan lancé par une autre
-        // épreuve peut finir de tourner. On attend qu'il ait fini (#5034).
-        let debut = std::time::Instant::now();
-        while scan_bibliotheque_en_cours() && debut.elapsed() < std::time::Duration::from_secs(120)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let gate = ScanGate::new();
+        let (gate, activite) = porte_isolee();
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !activite.en_cours(),
             "aucun scan ne tourne avant d'avoir pris la porte"
         );
 
         let scan = gate.try_acquire().expect("le scan doit demarrer");
         assert!(
-            scan_bibliotheque_en_cours(),
+            activite.en_cours(),
             "un scan qui tourne doit etre visible du balayage acoustique"
         );
 
         drop(scan);
         assert!(
-            !scan_bibliotheque_en_cours(),
+            !activite.en_cours(),
             "la fin du scan doit rendre la main au balayage acoustique"
+        );
+    }
+
+    /// Le câblage : la porte de PRODUCTION lève le compteur du processus,
+    /// celui-là même que lit `scan_bibliotheque_en_cours()` (et donc la garde
+    /// de `embedding.rs`). Une porte branchée sur un autre compteur laisserait
+    /// le balayage acoustique aveugle aux scans — le défaut que #2469 a déjà
+    /// rencontré une fois.
+    #[test]
+    fn la_porte_du_processus_leve_le_compteur_du_balayage_acoustique() {
+        assert!(
+            std::ptr::eq(
+                super::SCAN_GATE.activite,
+                &tune_core::scanner::activite::SCANS_DU_PROCESSUS
+            ),
+            "SCAN_GATE doit lever le compteur que lit le balayage acoustique"
         );
     }
 
@@ -355,8 +383,7 @@ mod scan_gate_tests {
     /// scan. C'est l'autre moitié de l'attachement à une génération précise.
     #[test]
     fn stop_sans_scan_actif_ne_fuit_pas_vers_le_suivant() {
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         assert!(!gate.request_cancel());
         let _scan = gate.try_acquire().expect("le scan doit demarrer");
         assert!(!gate.cancel_requested());
@@ -369,8 +396,7 @@ mod scan_gate_tests {
     fn deux_departs_concurrents_n_ont_qu_un_proprietaire() {
         use std::sync::{Arc, Barrier, mpsc};
 
-        let _serialise = serialiser();
-        let gate = ScanGate::new();
+        let (gate, _) = porte_isolee();
         let depart = Arc::new(Barrier::new(3));
         let maintien = Arc::new(Barrier::new(3));
         let (tx, rx) = mpsc::channel();
