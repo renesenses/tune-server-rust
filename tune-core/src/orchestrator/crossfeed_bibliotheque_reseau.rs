@@ -93,6 +93,30 @@ pub(super) fn empreinte_avec_crossfeed(
     Some(h.finalize().into())
 }
 
+/// #5081 — l'ombre de la tête du crossfeed ENTRE à son tour dans la clé du
+/// cache de transcodage : deux réglages de filtre donnent deux renditions.
+/// Brassée APRÈS [`empreinte_avec_crossfeed`], sans en changer la signature ;
+/// `None` (filtre éteint, réglage d'avant #5081) rend la clé inchangée — les
+/// renditions déjà en cache restent bonnes.
+pub(super) fn empreinte_avec_ombre(
+    dsp: Option<[u8; 32]>,
+    ombre: Option<tune_plugin_crossfeed::OmbreDeTete>,
+) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let Some(ombre) = ombre else {
+        return dsp;
+    };
+    let mut h = Sha256::new();
+    h.update(b"crossfeed-ombre\0");
+    h.update(ombre.cutoff_hz.to_le_bytes());
+    h.update(ombre.slope_db_per_octave.to_le_bytes());
+    if let Some(d) = dsp {
+        h.update(b"dsp\0");
+        h.update(d);
+    }
+    Some(h.finalize().into())
+}
+
 impl PlaybackOrchestrator {
     /// Le crossfeed à cuire dans le fichier ré-encodé, avec son réglage pour
     /// la clé du cache. `None` hors réseau, sur une sortie locale, en PURE,
@@ -115,3 +139,110 @@ impl PlaybackOrchestrator {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ombre_5081_tests {
+    use super::*;
+
+    fn ombre(
+        cutoff_hz: f32,
+        slope_db_per_octave: f32,
+    ) -> Option<tune_plugin_crossfeed::OmbreDeTete> {
+        Some(tune_plugin_crossfeed::OmbreDeTete {
+            cutoff_hz,
+            slope_db_per_octave,
+        })
+    }
+
+    /// Un réglage de filtre change la clé du cache ; filtre éteint, la clé
+    /// d'avant #5081 est rendue telle quelle.
+    #[test]
+    fn un_reglage_de_filtre_change_la_cle_du_cache_5081() {
+        let base = empreinte_avec_crossfeed(None, Some((0.3, 0.3)));
+        assert_eq!(empreinte_avec_ombre(base, None), base);
+        let a = empreinte_avec_ombre(base, ombre(700.0, 6.0));
+        let b = empreinte_avec_ombre(base, ombre(1200.0, 6.0));
+        let c = empreinte_avec_ombre(base, ombre(700.0, 3.0));
+        assert_ne!(a, base, "allumer le filtre ne change pas la clé");
+        assert_ne!(a, b, "la coupure n'entre pas dans la clé");
+        assert_ne!(a, c, "la pente n'entre pas dans la clé");
+        assert_ne!(
+            empreinte_avec_ombre(None, ombre(700.0, 6.0)),
+            a,
+            "le reste de la clé est perdu"
+        );
+    }
+
+    /// L'orchestrateur charge le filtre enregistré sur la zone, et
+    /// l'empreinte du traitement (relance d'un flux) le distingue. Un réglage
+    /// d'avant #5081 se charge filtre éteint.
+    #[test]
+    fn l_orchestrateur_charge_l_ombre_de_la_zone_5081() {
+        use std::sync::Arc;
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
+        let orch = PlaybackOrchestrator::new(
+            db.clone(),
+            Arc::new(crate::playback::PlaybackManager::new()),
+            Arc::new(crate::http::streamer::AudioStreamer::new(0)),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::streaming::registry::ServiceRegistry::new(),
+            )),
+            Arc::new(tokio::sync::Mutex::new(
+                crate::outputs::registry::OutputRegistry::new(),
+            )),
+            None,
+        );
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(db);
+        settings
+            .set(crate::audio::premium_plugins::MIGRATION, "complete")
+            .unwrap();
+        settings.set("plugin_crossfeed_installed", "true").unwrap();
+        settings.set("plugin_crossfeed_enabled", "true").unwrap();
+
+        settings
+            .set(
+                "zone_1_crossfeed",
+                r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+            )
+            .unwrap();
+        let p = orch.load_crossfeed_processor(1, 48_000).expect("crossfeed");
+        assert_eq!(p.ombre(), None, "un réglage d'avant #5081 allume le filtre");
+        let sans = orch.empreinte_du_traitement(1, None);
+
+        let reglage = |fc: f32| {
+            format!(
+                r#"{{"enabled":true,"amount":0.3,"delay_ms":0.3,"head_shadow_enabled":true,"cutoff_hz":{fc},"slope_db_per_octave":4.5}}"#
+            )
+        };
+        settings.set("zone_1_crossfeed", &reglage(1200.0)).unwrap();
+        let p = orch.load_crossfeed_processor(1, 48_000).expect("crossfeed");
+        assert_eq!(
+            p.ombre(),
+            ombre(1200.0, 4.5),
+            "le filtre enregistré n'est pas chargé"
+        );
+        let a = orch.empreinte_du_traitement(1, None);
+        settings.set("zone_1_crossfeed", &reglage(700.0)).unwrap();
+        let b = orch.empreinte_du_traitement(1, None);
+        assert!(
+            sans != a && a != b,
+            "l'empreinte ignore le filtre : {sans} / {a} / {b}"
+        );
+    }
+
+    /// La clé est brassée par `resolve_local`, sur le processeur réellement
+    /// chargé.
+    #[test]
+    fn resolve_local_brasse_l_ombre_du_processeur_charge_5081() {
+        const RESOLVE_LOCAL: &str = include_str!("resolve_local.rs");
+        assert!(
+            RESOLVE_LOCAL.contains(
+                "super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(\n                empreinte_dsp,\n                crossfeed.as_ref().and_then(|(p, _)| p.ombre()),"
+            ),
+            "le filtre d'ombre n'entre plus dans la clé du cache de transcodage"
+        );
+    }
+}

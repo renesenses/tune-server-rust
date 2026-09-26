@@ -8,6 +8,13 @@
       "format": "float",
       "default": 0.30000001192092896
     },
+    "cutoff_hz": {
+      "type": "number",
+      "format": "float",
+      "default": 700.0,
+      "maximum": 20000.0,
+      "minimum": 200.0
+    },
     "delay_ms": {
       "type": "number",
       "format": "float",
@@ -16,6 +23,17 @@
     "enabled": {
       "type": "boolean",
       "default": false
+    },
+    "head_shadow_enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "slope_db_per_octave": {
+      "type": "number",
+      "format": "float",
+      "default": 6.0,
+      "maximum": 6.0,
+      "minimum": 3.0
     }
   }
 }

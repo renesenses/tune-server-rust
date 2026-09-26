@@ -31,14 +31,40 @@
 //! therefore returned untouched. When `delay_samples == 0` the terms collapse
 //! to the instantaneous `amount * (R - L)` / `amount * (L - R)`.
 //!
-//! # v1 scope — NO filtering, by design
+//! # v1 scope — head-shadow filter, OFF by default (#5081)
+//!
+//! Until 0.9.165 this section read « NO filtering, by design »: Thierry wanted
+//! "zéro coloration" — an image narrowed with no tonal change — and the
+//! low-pass on the crossfed term was deferred until he signed it off.
+//!
+//! What changed (#5081, <https://github.com/renesenses/tune-server-rust/issues/5081>):
+//! a listener asked for the cutoff frequency and the slope of that low-pass —
+//! « un paramètre clé pour trader entre ampleur de l'espace et précision de la
+//! scène » — and Bertrand decided (26/09/2026) to put them in THIS v1,
+//! **disabled by default**, with Thierry's agreement (he cites Jan Meier
+//! "extended", about 3 dB/oct near 1200 Hz, and Gold Note, up to 20 kHz).
 //!
 //! Real HRTF crossfeed (bs2b, Meier, Linkwitz…) low-passes the crossfed term so
 //! only lower frequencies bleed across, mimicking head shadowing at high
-//! frequencies. We deliberately ship **zero** frequency shaping in v1: Thierry
-//! wants "zéro coloration" — a pure, phase-linear image narrower with no tonal
-//! change. The low-pass on the crossfed term is explicitly deferred to a v2
-//! discussion. Do not add an EQ/low-pass here without that sign-off.
+//! frequencies. Here that filter, `f`, only ever touches the crossfed term:
+//!
+//! ```text
+//! L_out = L[n] + amount * f(Rd - Ld)
+//! R_out = R[n] + amount * f(Ld - Rd)
+//! ```
+//!
+//! so the Mid is still preserved and mono content still passes untouched.
+//! - `f` OFF (the default, `head_shadow_enabled: false`): the historical
+//!   loop runs, bit-for-bit — "zéro coloration" stays the default promise;
+//! - `f` ON: cutoff 200 Hz – 20 kHz (default 700 Hz), slope 3 – 6 dB/oct
+//!   (default 6). The design, what is measured and the documented deviations
+//!   live in `ombre.rs`.
+//!
+//! A settings change while playing, with the filter involved on either side,
+//! cross-fades the crossfed term over [`DUREE_DU_FONDU_S`] from the old
+//! processor to the new one, both fed the same (shared) history: no step.
+
+use crate::ombre::{FiltreOmbre, OmbreDeTete};
 
 /// Hard ceiling on the crossfeed delay, in milliseconds.
 ///
@@ -47,11 +73,16 @@
 /// at 5 ms as a sane guard against a bogus config value.
 const MAX_DELAY_MS: f32 = 5.0;
 
+/// #5081 — durée du fondu d'un changement de réglage en cours de lecture,
+/// quand le filtre d'ombre est en jeu d'un côté ou de l'autre.
+pub const DUREE_DU_FONDU_S: f64 = 0.010;
+
 /// Difference-based, Mid-preserving headphone crossfeed.
 ///
 /// State (the two per-channel delay lines) persists across `process_interleaved`
 /// calls because audio arrives in arbitrarily sized chunks. No allocation
 /// happens in the processing hot loop.
+#[derive(Clone)]
 pub struct CrossfeedProcessor {
     /// Crossfeed strength. 0.0 = bypass (identity), higher = narrower image.
     amount: f32,
@@ -63,6 +94,23 @@ pub struct CrossfeedProcessor {
     ring_r: Vec<f32>,
     /// Shared read/write cursor into both ring buffers.
     pos: usize,
+    /// #5081 — débit, pour la durée du fondu.
+    sample_rate: u32,
+    /// #5081 — le réglage d'ombre (borné) et son filtre ; `None` = éteint.
+    ombre: Option<OmbreDeTete>,
+    filtre: Option<FiltreOmbre>,
+    /// #5081 — le processeur d'avant un changement de réglage, qui continue
+    /// de tourner le temps du fondu.
+    fondu: Option<Box<Fondu>>,
+}
+
+/// #5081 — un fondu en cours : l'ancien processeur, nourri des mêmes
+/// échantillons, et le nombre de trames qui restent.
+#[derive(Clone)]
+struct Fondu {
+    ancien: CrossfeedProcessor,
+    restant: usize,
+    total: usize,
 }
 
 impl CrossfeedProcessor {
@@ -71,15 +119,90 @@ impl CrossfeedProcessor {
     ///
     /// `delay_samples = round(delay_ms / 1000 * sample_rate)`, clamped so a
     /// pathological config can never allocate an unbounded buffer.
+    ///
+    /// No head-shadow filter: see [`Self::avec_ombre`].
     pub fn new(sample_rate: u32, amount: f32, delay_ms: f32) -> Self {
+        Self::avec_ombre(sample_rate, amount, delay_ms, None)
+    }
+
+    /// #5081 — [`Self::new`], avec le filtre d'ombre de la tête sur le terme
+    /// croisé quand `ombre` est `Some` (le réglage est borné ici).
+    pub fn avec_ombre(
+        sample_rate: u32,
+        amount: f32,
+        delay_ms: f32,
+        ombre: Option<OmbreDeTete>,
+    ) -> Self {
         let delay_samples = retard_en_echantillons(sample_rate, delay_ms);
+        let ombre = ombre.map(OmbreDeTete::bornee);
         Self {
             amount,
             delay_samples,
             ring_l: vec![0.0; delay_samples],
             ring_r: vec![0.0; delay_samples],
             pos: 0,
+            sample_rate,
+            ombre,
+            filtre: ombre.map(|o| FiltreOmbre::concevoir(sample_rate, o)),
+            fondu: None,
         }
+    }
+
+    /// #5081 — le réglage d'ombre de ce processeur (borné), `None` s'il est
+    /// éteint.
+    pub fn ombre(&self) -> Option<OmbreDeTete> {
+        self.ombre
+    }
+
+    /// Rien à faire : force nulle et aucun fondu en cours.
+    pub fn est_neutre(&self) -> bool {
+        self.amount == 0.0 && self.fondu.is_none()
+    }
+
+    /// Les échantillons retardés `(Ld, Rd)` de la trame `(l, r)`, ligne à
+    /// retard avancée.
+    #[inline]
+    fn retarder(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if self.delay_samples == 0 {
+            return (l, r);
+        }
+        let d = (self.ring_l[self.pos], self.ring_r[self.pos]);
+        self.ring_l[self.pos] = l;
+        self.ring_r[self.pos] = r;
+        self.pos += 1;
+        if self.pos >= self.delay_samples {
+            self.pos = 0;
+        }
+        d
+    }
+
+    /// #5081 — le terme croisé `c` de la trame (`L_out = l + c`,
+    /// `R_out = r − c`), filtre et fondu compris.
+    #[inline]
+    fn terme_croise(&mut self, l: f32, r: f32) -> f64 {
+        let neuf = if self.amount == 0.0 {
+            0.0
+        } else {
+            let (ld, rd) = self.retarder(l, r);
+            let difference = f64::from(rd - ld);
+            let filtree = match &mut self.filtre {
+                Some(f) => f.traiter(difference),
+                None => difference,
+            };
+            f64::from(self.amount) * filtree
+        };
+        let Some(fondu) = self.fondu.as_deref_mut() else {
+            return neuf;
+        };
+        let ancien = fondu.ancien.terme_croise(l, r);
+        // Cosinus surélevé : 0 → 1, à dérivée nulle aux deux bouts.
+        let t = 1.0 - fondu.restant as f64 / fondu.total as f64;
+        let poids = 0.5 - 0.5 * (std::f64::consts::PI * t).cos();
+        fondu.restant -= 1;
+        if fondu.restant == 0 {
+            self.fondu = None;
+        }
+        ancien + poids * (neuf - ancien)
     }
 
     /// Process a **stereo interleaved** f32 buffer (`[L0, R0, L1, R1, …]`,
@@ -93,8 +216,20 @@ impl CrossfeedProcessor {
         if !samples.len().is_multiple_of(2) {
             return;
         }
-        if self.amount == 0.0 {
+        if self.est_neutre() {
             return; // exact identity, and no delay-line state to advance
+        }
+        // #5081 — filtre d'ombre allumé, ou fondu en cours : le terme croisé
+        // passe par `terme_croise`. Sinon, la boucle historique ci-dessous,
+        // intacte : éteint, le filtre ne change pas un bit.
+        if self.filtre.is_some() || self.fondu.is_some() {
+            for trame in samples.as_chunks_mut::<2>().0 {
+                let (l, r) = (trame[0], trame[1]);
+                let c = self.terme_croise(l, r) as f32;
+                trame[0] = (l + c).clamp(-1.0, 1.0);
+                trame[1] = (r - c).clamp(-1.0, 1.0);
+            }
+            return;
         }
 
         let frames = samples.len() / 2;
@@ -147,7 +282,7 @@ impl CrossfeedProcessor {
     /// progressif est donc transparent, exactement comme pour les biquads de
     /// l'égaliseur et le recouvrement du convolveur.
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
-        if channels != 2 || pcm.is_empty() || self.amount == 0.0 {
+        if channels != 2 || pcm.is_empty() || self.est_neutre() {
             return;
         }
         let bps = (bit_depth / 8) as usize;
@@ -217,7 +352,49 @@ impl CrossfeedProcessor {
     ///   échantillons connus sont placés à la fin, le début reste à zéro. Le
     ///   creux est inévitable — on ne l'invente pas — mais il est borné à la
     ///   différence de longueur au lieu de valoir toute la ligne.
+    ///
+    /// #5081 — quand le filtre d'ombre est en jeu d'un côté ou de l'autre (ou
+    /// qu'un fondu est déjà en cours), la ligne est reprise de même, puis le
+    /// terme croisé passe en fondu de [`DUREE_DU_FONDU_S`] de l'ancien
+    /// processeur — qui continue de tourner sur les mêmes échantillons — au
+    /// nouveau. Un filtre de mêmes coefficients reprend en plus l'état de
+    /// l'ancien. Filtre éteint des deux côtés : rien de plus qu'avant, au bit
+    /// près.
     pub fn inherit_state_from(&mut self, previous: &CrossfeedProcessor) {
+        self.heriter_la_ligne_a_retard(previous);
+        if self.filtre.is_none() && previous.filtre.is_none() && previous.fondu.is_none() {
+            return;
+        }
+        if self.sample_rate == previous.sample_rate
+            && self.ombre == previous.ombre
+            && let (Some(neuf), Some(ancien)) = (&mut self.filtre, &previous.filtre)
+        {
+            neuf.reprendre_etat(ancien);
+        }
+        let identique = previous.fondu.is_none()
+            && self.sample_rate == previous.sample_rate
+            && self.amount == previous.amount
+            && self.delay_samples == previous.delay_samples
+            && self.ombre == previous.ombre;
+        if identique {
+            return;
+        }
+        let total = ((f64::from(self.sample_rate) * DUREE_DU_FONDU_S).round() as usize).max(1);
+        let mut ancien = previous.clone();
+        // Un fondu dans le fondu, au plus : un curseur qu'on fait glisser
+        // n'empile pas les processeurs.
+        if let Some(f) = ancien.fondu.as_deref_mut() {
+            f.ancien.fondu = None;
+        }
+        self.fondu = Some(Box::new(Fondu {
+            ancien,
+            restant: total,
+            total,
+        }));
+    }
+
+    /// La reprise de la ligne à retard seule, décrite ci-dessus.
+    fn heriter_la_ligne_a_retard(&mut self, previous: &CrossfeedProcessor) {
         let (n_neuf, n_prec) = (self.delay_samples, previous.delay_samples);
         if n_neuf == 0 || n_prec == 0 {
             return; // Pas de ligne à retard d'un côté ou de l'autre.
@@ -247,6 +424,10 @@ impl CrossfeedProcessor {
         self.ring_l.fill(0.0);
         self.ring_r.fill(0.0);
         self.pos = 0;
+        if let Some(f) = &mut self.filtre {
+            f.reinitialiser();
+        }
+        self.fondu = None;
     }
 
     /// Crossfeed strength this processor was built with.
@@ -370,6 +551,23 @@ pub const CORRELATION_DE_REFERENCE: f64 = 0.5;
 /// non stéréo, que le module laisse intact (0 dB serait alors juste ; ce
 /// calcul ne connaît pas les canaux et suppose la stéréo).
 pub fn gain_moyen_db(sample_rate: u32, amount: f32, delay_ms: f32) -> f64 {
+    gain_moyen_db_avec_ombre(sample_rate, amount, delay_ms, None)
+}
+
+/// #5081 — [`gain_moyen_db`], filtre d'ombre compris : avec `H(f)` la réponse
+/// complexe du filtre construit, le Side devient `S · (1 − 2a·H(f)·z^−D)`, et
+///
+/// ```text
+/// P(f) = (1+ρ)/2 + (1−ρ)/2 · |1 − 2a·H(f)·e^(−j2πfD/fs)|²
+/// ```
+///
+/// `None` rend exactement le calcul d'avant (`H = 1`).
+pub fn gain_moyen_db_avec_ombre(
+    sample_rate: u32,
+    amount: f32,
+    delay_ms: f32,
+    ombre: Option<OmbreDeTete>,
+) -> f64 {
     if amount == 0.0 || !amount.is_finite() || sample_rate == 0 {
         return 0.0;
     }
@@ -378,9 +576,20 @@ pub fn gain_moyen_db(sample_rate: u32, amount: f32, delay_ms: f32) -> f64 {
     let fs = f64::from(sample_rate);
     let rho = CORRELATION_DE_REFERENCE;
     let (p_mid, p_side) = ((1.0 + rho) / 2.0, (1.0 - rho) / 2.0);
+    let filtre = ombre.map(|o| FiltreOmbre::concevoir(sample_rate, o.bornee()));
     tune_plugin_audio_support::niveau_moyen::gain_moyen_rose_db(fs, |f| {
-        let cos = (2.0 * std::f64::consts::PI * f * retard / fs).cos();
-        p_mid + p_side * (1.0 - 4.0 * a * cos + 4.0 * a * a)
+        let phase = 2.0 * std::f64::consts::PI * f * retard / fs;
+        let Some(filtre) = &filtre else {
+            let cos = phase.cos();
+            return p_mid + p_side * (1.0 - 4.0 * a * cos + 4.0 * a * a);
+        };
+        let (hr, hi) = filtre.reponse(f, sample_rate);
+        // X = H · e^(−jφ)
+        let (xr, xi) = (
+            hr * phase.cos() + hi * phase.sin(),
+            hi * phase.cos() - hr * phase.sin(),
+        );
+        p_mid + p_side * ((1.0 - 2.0 * a * xr).powi(2) + (2.0 * a * xi).powi(2))
     })
 }
 
@@ -812,3 +1021,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "engine_ombre_5081_tests.rs"]
+mod ombre_5081_tests;

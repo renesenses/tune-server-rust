@@ -1303,6 +1303,10 @@ pub use groupes::*;
 #[cfg(test)]
 mod signal_path_tests;
 
+// #5081 — l'ombre de la tête sur l'étape crossfeed du chemin du signal.
+#[cfg(test)]
+mod signal_path_ombre_5081_tests;
+
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///
 /// Deux situations produisent le même symptôme (file remplie, position qui

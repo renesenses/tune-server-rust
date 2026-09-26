@@ -2420,6 +2420,11 @@ impl PlaybackOrchestrator {
                 empreinte_dsp,
                 crossfeed.as_ref().map(|(_, reglage)| *reglage),
             );
+            // #5081 — et l'ombre de la tête du processeur chargé.
+            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_ombre(
+                empreinte_dsp,
+                crossfeed.as_ref().and_then(|(p, _)| p.ombre()),
+            );
             // #5071 — la compensation change les octets : elle entre dans la
             // clé, sinon une rendition non compensée serait servie à une zone
             // qui l'a demandée (et inversement). `None` : la clé d'avant.

@@ -283,16 +283,50 @@ pub(super) async fn convolver_response(
 /// Les bornes du crossfeed, publiées pour que le bout des curseurs d'un client
 /// soit EXACTEMENT celui que le serveur applique (#4683). `amount_max` est le
 /// point mono (Side entièrement replié) : c'est lui que « 100 % » désigne.
+///
+/// #5081 — et celles de l'ombre de la tête. Leur présence est aussi ce qui
+/// dit à un client que ce serveur connaît le filtre : un serveur d'avant ne
+/// les publie pas, et le client cache alors ses contrôles.
 pub(crate) fn crossfeed_limits() -> Value {
     json!({
         "amount_max": tune_core::audio::crossfeed::MAX_AMOUNT,
         "delay_ms_max": tune_core::audio::crossfeed::MAX_DELAY_MS,
+        "cutoff_hz_min": tune_core::audio::crossfeed::COUPURE_MIN_HZ,
+        "cutoff_hz_max": tune_core::audio::crossfeed::COUPURE_MAX_HZ,
+        "slope_db_per_octave_min": tune_core::audio::crossfeed::PENTE_MIN_DB_OCT,
+        "slope_db_per_octave_max": tune_core::audio::crossfeed::PENTE_MAX_DB_OCT,
+    })
+}
+
+/// #5081 — les trois champs de l'ombre de la tête, normalisés et bornés, lus
+/// dans `v`, et à défaut dans `repli` (le réglage déjà enregistré) : un client
+/// d'avant #5081, qui n'envoie que `{ enabled, amount, delay_ms }`, ne ferme
+/// pas le filtre qu'un autre écran a ouvert. Sans l'un ni l'autre : éteint,
+/// 700 Hz, 6 dB/oct.
+pub(crate) fn ombre_normalisee(v: &Value, repli: &Value) -> Value {
+    let champ = |cle: &str| v.get(cle).or_else(|| repli.get(cle));
+    let (cutoff_hz, slope) = tune_core::audio::crossfeed::borner_ombre(
+        champ("cutoff_hz")
+            .and_then(|c| c.as_f64())
+            .unwrap_or(f64::from(tune_core::audio::crossfeed::COUPURE_DEFAUT_HZ)),
+        champ("slope_db_per_octave")
+            .and_then(|p| p.as_f64())
+            .unwrap_or(f64::from(tune_core::audio::crossfeed::PENTE_DEFAUT_DB_OCT)),
+    );
+    json!({
+        "head_shadow_enabled": champ("head_shadow_enabled")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false),
+        "cutoff_hz": cutoff_hz,
+        "slope_db_per_octave": slope,
     })
 }
 
 /// Read the `zone_{id}_crossfeed` settings row into a normalised JSON object,
 /// falling back to defaults (disabled, amount 0.30, delay 0.30 ms) for any
-/// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`.
+/// missing/invalid field. Shape: `{ enabled, amount, delay_ms }`, plus the
+/// #5081 head-shadow fields `{ head_shadow_enabled, cutoff_hz,
+/// slope_db_per_octave }` (off, 700 Hz, 6 dB/oct when never written).
 pub(super) fn read_crossfeed_config(
     settings: &tune_core::db::settings_repo::SettingsRepo,
     id: i64,
@@ -306,10 +340,14 @@ pub(super) fn read_crossfeed_config(
     let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false);
     let amount = v.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.30);
     let delay_ms = v.get("delay_ms").and_then(|d| d.as_f64()).unwrap_or(0.30);
+    let ombre = ombre_normalisee(&v, &Value::Null);
     json!({
         "enabled": enabled,
         "amount": amount,
         "delay_ms": delay_ms,
+        "head_shadow_enabled": ombre["head_shadow_enabled"],
+        "cutoff_hz": ombre["cutoff_hz"],
+        "slope_db_per_octave": ombre["slope_db_per_octave"],
     })
 }
 
@@ -466,10 +504,16 @@ pub(super) async fn set_zone_dsp(
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.30),
         );
+        // #5081 — l'ombre de la tête ; un champ absent du corps garde la
+        // valeur enregistrée (`ombre_normalisee`).
+        let ombre = ombre_normalisee(cf_val, &read_crossfeed_config(&settings, id));
         let normalised = json!({
             "enabled": enabled,
             "amount": amount,
             "delay_ms": delay_ms,
+            "head_shadow_enabled": ombre["head_shadow_enabled"],
+            "cutoff_hz": ombre["cutoff_hz"],
+            "slope_db_per_octave": ombre["slope_db_per_octave"],
         });
         let key = format!("zone_{id}_crossfeed");
         let _ = settings.set(
