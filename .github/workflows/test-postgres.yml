@@ -222,6 +222,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
 
+      # #5134 — la bascule SQLite -> PostgreSQL sur une VRAIE base : chaque
+      # clause ON CONFLICT de `copy_table` doit viser une clef de sa table, et
+      # les tables sans colonne `id` (masques, favoris de facette, doublons
+      # arbitres, appareils ignores) doivent arriver entieres, deux fois de
+      # suite. Bases jetables creees puis supprimees par le test.
+      - name: Bascule SQLite -> PostgreSQL, clefs de conflit (#5134)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_bascule_ -- --nocapture
+
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
