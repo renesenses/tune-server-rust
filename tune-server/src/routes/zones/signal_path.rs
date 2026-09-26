@@ -127,6 +127,53 @@ pub(super) fn zone_eq_step_description(
     }
 }
 
+/// #5081 — l'ombre de la tête du crossfeed de la zone, quand la case du
+/// crossfeed ET l'interrupteur du filtre sont cochés (clé
+/// `zone_{id}_crossfeed`, bornes du greffon). `None` sinon — et pour tout
+/// réglage écrit avant #5081.
+pub(super) fn zone_crossfeed_ombre(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<tune_core::audio::crossfeed::OmbreDeTete> {
+    let reglage: Value = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+        .get(&format!("zone_{zone_id}_crossfeed"))
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+    if !reglage["enabled"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    tune_core::audio::crossfeed::ombre_du_reglage(&reglage)
+}
+
+/// #5081 — l'étape « Crossfeed » (`code: "crossfeed"`) montre l'ombre de la
+/// tête quand elle est allumée : la coupure et la pente, en champs et dans la
+/// description. N'ajoute AUCUNE étape : elle annote celle qui dit que le
+/// crossfeed est dans le flux, et rien quand il n'y en a pas.
+pub(super) fn annoter_l_ombre_du_crossfeed(
+    steps: &mut [Value],
+    ombre: Option<tune_core::audio::crossfeed::OmbreDeTete>,
+) {
+    let Some(ombre) = ombre else {
+        return;
+    };
+    for etape in steps.iter_mut().filter(|e| e["code"] == "crossfeed") {
+        let suffixe = format!(
+            "ombre de la tête {} Hz, {} dB/octave",
+            ombre.cutoff_hz, ombre.slope_db_per_octave
+        );
+        let description = match etape["description"].as_str() {
+            Some(d) => format!("{d} · {suffixe}"),
+            None => suffixe,
+        };
+        etape["description"] = json!(description);
+        etape["head_shadow"] = json!({
+            "cutoff_hz": ombre.cutoff_hz,
+            "slope_db_per_octave": ombre.slope_db_per_octave,
+        });
+    }
+}
+
 /// Le ReplayGain modifie-t-il réellement le signal de cette zone — et comment ?
 ///
 /// Miroir de `Orchestrator::zone_replaygain_changes_audio`, pour la même
@@ -542,13 +589,19 @@ pub(super) fn build_signal_path(
     let is_lossless = analyse.source.is_lossless;
     let zone_id_courant = zone.id.unwrap_or(0);
     let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id_courant);
-    let etapes = assembler_les_etapes(
+    let mut etapes = assembler_les_etapes(
         ps,
         zone,
         renderer_label,
         output_type,
         runtime_signal_path,
         analyse,
+    );
+    // #5081 — la coupure et la pente de l'ombre de la tête, sur l'étape
+    // crossfeed quand elle existe.
+    annoter_l_ombre_du_crossfeed(
+        &mut etapes.steps,
+        zone_crossfeed_ombre(backend, zone_id_courant),
     );
     Some(json!({
         "bit_perfect": bit_perfect,

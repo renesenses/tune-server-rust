@@ -34,7 +34,7 @@ impl TunePlugin for PremiumAudio {
     fn description(&self) -> &str {
         match self.id {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
-            "crossfeed" => "Crossfeed casque : intensité et retard, état conservé à chaud",
+            "crossfeed" => "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
             "converter" => "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
             _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
         }

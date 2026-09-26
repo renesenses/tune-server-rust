@@ -6,6 +6,11 @@
 //! `{ id, name, amount, delay_ms, created_at }` — jamais la case « activé » : il
 //! se choisit pour une zone, il ne l'allume pas à sa place.
 //!
+//! #5081 — l'ombre de la tête fait aussi le son : un préréglage porte
+//! `{ head_shadow_enabled, cutoff_hz, slope_db_per_octave }`. Un préréglage
+//! enregistré avant, sans ces champs, se relit filtre ÉTEINT
+//! (`GET /crossfeed/presets` les complète) — jamais avec le filtre de la zone.
+//!
 //! APPLIQUER n'a pas de route ici : le client envoie les valeurs du préréglage
 //! à `PUT /zones/{id}/dsp`, le seul chemin qui persiste le réglage de la zone,
 //! le fait entendre à chaud et publie `crossfeed_status`. Une seconde route
@@ -74,7 +79,19 @@ async fn autoriser(state: &AppState, headers: &axum::http::HeaderMap) -> Result<
 
 /// `GET /crossfeed/presets`
 async fn lister(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "presets": charger(&state) }))
+    let presets: Vec<Value> = charger(&state).into_iter().map(completer).collect();
+    Json(json!({ "presets": presets }))
+}
+
+/// #5081 — un préréglage d'avant l'ombre de la tête se relit filtre éteint.
+fn completer(mut preset: Value) -> Value {
+    let ombre = crate::routes::zones::ombre_normalisee(&preset, &Value::Null);
+    if let (Some(p), Some(o)) = (preset.as_object_mut(), ombre.as_object()) {
+        for (cle, valeur) in o {
+            p.insert(cle.clone(), valeur.clone());
+        }
+    }
+    preset
 }
 
 #[derive(Deserialize)]
@@ -82,6 +99,11 @@ struct CorpsPreset {
     name: String,
     amount: f64,
     delay_ms: f64,
+    // #5081 — facultatifs : absents, le préréglage est enregistré filtre
+    // éteint (700 Hz, 6 dB/oct).
+    head_shadow_enabled: Option<bool>,
+    cutoff_hz: Option<f64>,
+    slope_db_per_octave: Option<f64>,
 }
 
 /// `POST /crossfeed/presets` — enregistre les valeurs sous ce nom.
@@ -109,6 +131,14 @@ async fn enregistrer(
         )));
     }
     let (amount, delay_ms) = tune_core::audio::crossfeed::borner(corps.amount, corps.delay_ms);
+    let ombre = crate::routes::zones::ombre_normalisee(
+        &json!({
+            "head_shadow_enabled": corps.head_shadow_enabled,
+            "cutoff_hz": corps.cutoff_hz,
+            "slope_db_per_octave": corps.slope_db_per_octave,
+        }),
+        &Value::Null,
+    );
 
     let mut presets = charger(&state);
     let meme_nom = |p: &Value| {
@@ -121,6 +151,9 @@ async fn enregistrer(
             existant["name"] = json!(nom);
             existant["amount"] = json!(amount);
             existant["delay_ms"] = json!(delay_ms);
+            existant["head_shadow_enabled"] = ombre["head_shadow_enabled"].clone();
+            existant["cutoff_hz"] = ombre["cutoff_hz"].clone();
+            existant["slope_db_per_octave"] = ombre["slope_db_per_octave"].clone();
             (StatusCode::OK, existant.clone())
         }
         None => {
@@ -129,6 +162,9 @@ async fn enregistrer(
                 "name": nom,
                 "amount": amount,
                 "delay_ms": delay_ms,
+                "head_shadow_enabled": ombre["head_shadow_enabled"],
+                "cutoff_hz": ombre["cutoff_hz"],
+                "slope_db_per_octave": ombre["slope_db_per_octave"],
                 "created_at": std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())

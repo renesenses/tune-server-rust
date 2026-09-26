@@ -1,4 +1,4 @@
-use crate::CrossfeedProcessor;
+use crate::{CrossfeedProcessor, OmbreDeTete};
 use serde::{Deserialize, Serialize};
 use tune_plugin_sdk::{Error, Settings, audio::*};
 
@@ -9,6 +9,16 @@ pub struct CrossfeedSettings {
     pub enabled: bool,
     pub amount: f32,
     pub delay_ms: f32,
+    // #5081 — filtre d'ombre de la tête sur le terme croisé. Faux par
+    // défaut : éteint, la sortie est celle d'avant, au bit près. (Commentaires
+    // `//` et non `///` : ils ne passent pas dans `schemas/config.json`.)
+    pub head_shadow_enabled: bool,
+    // Fréquence de coupure du filtre d'ombre, en Hz.
+    #[cfg_attr(feature = "schemas", schemars(range(min = 200.0, max = 20000.0)))]
+    pub cutoff_hz: f32,
+    // Pente au-delà de la coupure, en dB par octave.
+    #[cfg_attr(feature = "schemas", schemars(range(min = 3.0, max = 6.0)))]
+    pub slope_db_per_octave: f32,
 }
 impl Default for CrossfeedSettings {
     fn default() -> Self {
@@ -16,7 +26,19 @@ impl Default for CrossfeedSettings {
             enabled: false,
             amount: 0.3,
             delay_ms: 0.3,
+            head_shadow_enabled: false,
+            cutoff_hz: crate::COUPURE_DEFAUT_HZ,
+            slope_db_per_octave: crate::PENTE_DEFAUT_DB_OCT,
         }
+    }
+}
+impl CrossfeedSettings {
+    /// #5081 — le réglage d'ombre, `None` quand il est éteint.
+    fn ombre(&self) -> Option<OmbreDeTete> {
+        self.head_shadow_enabled.then_some(OmbreDeTete {
+            cutoff_hz: self.cutoff_hz,
+            slope_db_per_octave: self.slope_db_per_octave,
+        })
     }
 }
 fn settings(s: &Settings) -> Result<CrossfeedSettings, Error> {
@@ -25,6 +47,8 @@ fn settings(s: &Settings) -> Result<CrossfeedSettings, Error> {
         || !s.delay_ms.is_finite()
         || !(0.0..=0.5).contains(&s.amount)
         || !(0.0..=5.0).contains(&s.delay_ms)
+        || !(crate::COUPURE_MIN_HZ..=crate::COUPURE_MAX_HZ).contains(&s.cutoff_hz)
+        || !(crate::PENTE_MIN_DB_OCT..=crate::PENTE_MAX_DB_OCT).contains(&s.slope_db_per_octave)
     {
         return Err(Error::InvalidSettings);
     }
@@ -60,10 +84,11 @@ impl DspFactory for Crossfeed {
             .ok_or(Error::BlockTooLarge)?;
         let s = settings(s)?;
         Ok(Box::new(Instance {
-            engine: CrossfeedProcessor::new(
+            engine: CrossfeedProcessor::avec_ombre(
                 format.sample_rate(),
                 if s.enabled { s.amount } else { 0.0 },
                 s.delay_ms,
+                s.ombre(),
             ),
             settings: s,
             format,
@@ -91,7 +116,8 @@ impl Processor for Instance {
         if block.frames() > self.max_frames {
             return Err(Error::BlockTooLarge);
         }
-        if self.engine.amount() == 0.0 {
+        // #5081 — un fondu en cours se joue même vers une force nulle.
+        if self.engine.est_neutre() {
             return Ok(ProcessReport::default());
         }
         let scratch = &mut self.scratch[..block.frames() * 2];
@@ -138,10 +164,11 @@ impl Processor for Instance {
     }
     fn update(&mut self, value: &Settings) -> Result<(), Error> {
         let s = settings(value)?;
-        let mut next = CrossfeedProcessor::new(
+        let mut next = CrossfeedProcessor::avec_ombre(
             self.format.sample_rate(),
             if s.enabled { s.amount } else { 0.0 },
             s.delay_ms,
+            s.ombre(),
         );
         next.inherit_state_from(&self.engine);
         self.engine = next;
@@ -159,7 +186,14 @@ impl Processor for Instance {
         Ok(())
     }
     fn diagnostics(&self) -> Settings {
-        serde_json::json!({"amount":self.engine.amount(),"delay_samples":self.engine.delay_samples()})
+        let ombre = self.engine.ombre();
+        serde_json::json!({
+            "amount": self.engine.amount(),
+            "delay_samples": self.engine.delay_samples(),
+            "head_shadow_enabled": ombre.is_some(),
+            "cutoff_hz": ombre.map(|o| o.cutoff_hz),
+            "slope_db_per_octave": ombre.map(|o| o.slope_db_per_octave),
+        })
     }
     fn reset(&mut self, _: ResetReason) {
         self.engine.reset_history();
