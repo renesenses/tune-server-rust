@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -89,6 +90,25 @@ const EPERM: &str = "os error 1";
 /// Dernière émission de l'indice « permission réseau local » (#4597).
 static LOCAL_NETWORK_HINT: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// #4597 — combien de connexions vers le LAN macOS a refusées depuis le
+/// démarrage (`os error 65` / `os error 1`), et quand pour la dernière fois.
+static REFUS_RESEAU_LOCAL: AtomicU64 = AtomicU64::new(0);
+static DERNIER_REFUS_RESEAU_LOCAL: AtomicU64 = AtomicU64::new(0);
+
+/// Le motif d'erreur que macOS rend quand il refuse le réseau local.
+pub fn ressemble_a_un_refus_du_reseau_local(rendered: &str) -> bool {
+    rendered.contains(EHOSTUNREACH) || rendered.contains(EPERM)
+}
+
+/// #4597 — `(nombre de refus, horodatage Unix du dernier)` depuis le démarrage.
+/// Toujours `(0, None)` hors macOS. Reste un INDICE : `EHOSTUNREACH` dit aussi
+/// « appareil éteint ».
+pub fn refus_du_reseau_local() -> (u64, Option<u64>) {
+    let n = REFUS_RESEAU_LOCAL.load(Ordering::Relaxed);
+    let dernier = DERNIER_REFUS_RESEAU_LOCAL.load(Ordering::Relaxed);
+    (n, (n > 0 && dernier > 0).then_some(dernier))
+}
+
 /// #4597 — l'indice se RÉARME passé ce délai.
 ///
 /// Il était sous un `Once` : une fois par PROCESSUS. Un serveur qui tourne
@@ -132,9 +152,17 @@ pub fn hint_if_local_network_denied(rendered: &str) {
     if !cfg!(target_os = "macos") {
         return;
     }
-    if !rendered.contains(EHOSTUNREACH) && !rendered.contains(EPERM) {
+    if !ressemble_a_un_refus_du_reseau_local(rendered) {
         return;
     }
+    // #4597 — le journal seul ne suffisait pas : l'utilisateur ne voit que des
+    // zones hors ligne. On COMPTE, pour que l'API puisse le dire à l'écran.
+    REFUS_RESEAU_LOCAL.fetch_add(1, Ordering::Relaxed);
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    DERNIER_REFUS_RESEAU_LOCAL.store(maintenant, Ordering::Relaxed);
     let du = LOCAL_NETWORK_HINT
         .lock()
         .map(|mut derniere| indice_du(&mut derniere, Instant::now(), LOCAL_NETWORK_HINT_REARM))
