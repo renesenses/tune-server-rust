@@ -2087,9 +2087,66 @@ impl TrackRepo {
     /// (#4101). `list` reste ENTIER pour la maintenance (export, résolutions
     /// internes).
     pub fn list_visible(&self, limit: i64, offset: i64) -> Result<Vec<Track>, TuneError> {
-        let sql = format!(
-            "{} WHERE {} AND {} AND {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER) LIMIT {} OFFSET {}",
-            sql::select_track(),
+        let sql = self.sql_list_visible(&sql::select_track());
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// #5138 — [`Self::list_visible`] ET son total, le `WHERE` évalué UNE fois.
+    ///
+    /// La route faisait `count_visible` puis `list_visible` : deux passes du
+    /// même `WHERE` sur toute la bibliothèque, à chaque page — et la vue
+    /// Oxygen charge ses 34 091 pistes par pages de 2 000, soit dix-huit
+    /// pages. Ici, deux temps, comme la grille d'albums (#1269, #4800) :
+    ///
+    /// 1. les IDENTIFIANTS de la page, dans l'ordre de la liste, avec
+    ///    `COUNT(*) OVER ()` — l'effectif de l'ensemble filtré, avant
+    ///    LIMIT/OFFSET. Le tri ne porte que des lignes étroites (clés + id),
+    ///    et non plus les 35 colonnes de chaque piste de la bibliothèque ;
+    /// 2. les pistes de CES identifiants, remises dans l'ordre du premier temps.
+    ///
+    /// Mêmes lignes, même ordre que `list_visible` — l'ordre est total
+    /// (`t.id` en dernier). Page vide (décalage au-delà de la fin) : `None`,
+    /// l'appelant recompte.
+    pub fn list_visible_avec_total(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<Track>, Option<i64>), TuneError> {
+        let tete = format!("SELECT t.id, COUNT(*) OVER (){}", sql::track_from());
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&self.sql_list_visible(&tete), &params)?;
+        let total = rows.first().and_then(|r| r.get(1)).and_then(|v| v.as_i64());
+        let ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+            .collect();
+        if ids.is_empty() {
+            return Ok((Vec::new(), total));
+        }
+        // Des entiers lus dans notre propre base : les inscrire en clair est
+        // sûr, et évite une liste de marqueurs de longueur variable.
+        let id_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let hydratees = self.db.query_many(
+            &format!("{} WHERE t.id IN ({id_list})", sql::select_track()),
+            &[],
+        )?;
+        let mut par_id: HashMap<i64, Track> = hydratees
+            .iter()
+            .map(row_to_track)
+            .filter_map(|t| t.id.map(|id| (id, t)))
+            .collect();
+        let pistes = ids.iter().filter_map(|id| par_id.remove(id)).collect();
+        Ok((pistes, total))
+    }
+
+    /// Le SQL de la vue pistes par défaut, sous la projection `tete` (qui
+    /// porte son `FROM`, celui de [`sql::track_from`]).
+    fn sql_list_visible(&self, tete: &str) -> String {
+        format!(
+            "{} WHERE {} AND {} AND {} ORDER BY LOWER(ar.name), LOWER(al.title), CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.id LIMIT {} OFFSET {}",
+            tete,
             hidden_tracks_excluded(),
             crate::db::facet_filter::pistes_album_distant_double_exclu(self.db.engine()),
             crate::db::facet_filter::copie_de_moindre_qualite_exclue(),
@@ -2101,10 +2158,7 @@ impl TrackRepo {
                 Engine::Sqlite => SqliteDialect.placeholder(2),
                 Engine::Postgres => PostgresDialect.placeholder(2),
             }
-        );
-        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
-        let rows = self.db.query_many(&sql, &params)?;
-        Ok(rows.iter().map(row_to_track).collect())
+        )
     }
 
     /// Compteur de la vue pistes : exclut comme [`Self::list_visible`].
