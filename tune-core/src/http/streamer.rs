@@ -1562,6 +1562,7 @@ impl AudioStreamer {
 /// Called once when the server starts to clean up files from a previous
 /// crash or unclean shutdown.
 pub fn cleanup_leftover_transcode_files() {
+    // tmp-autorise: balayage en LECTURE au démarrage ; ne supprime que des temporaires de transcodage tune-* au nom UUID ; ceux d'un autre compte restent protégés par le sticky bit de /tmp.
     let tmp_dir = std::env::temp_dir();
     let entries = match std::fs::read_dir(&tmp_dir) {
         Ok(e) => e,

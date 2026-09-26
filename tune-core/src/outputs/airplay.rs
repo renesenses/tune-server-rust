@@ -532,12 +532,11 @@ async fn url_to_local_path(url: &str) -> Result<(String, Option<TempFileGuard>),
             .await
             .map_err(|e| format!("download body: {e}"))?;
 
-        let tmp_dir = std::env::temp_dir();
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_path = tmp_dir.join(format!("tune_airplay_{id}.pcm"));
+        // #4770 : nom aléatoire. L'horodatage d'avant retombait sur le nom
+        // fixe `tune_airplay_0.pcm` dès que l'horloge précédait l'époque.
+        let id = uuid::Uuid::new_v4();
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), supprimé par TempFileGuard.
+        let tmp_path = std::env::temp_dir().join(format!("tune_airplay_{id}.pcm"));
         std::fs::write(&tmp_path, &bytes).map_err(|e| format!("write tmp: {e}"))?;
         let path_str = tmp_path.to_string_lossy().to_string();
         return Ok((path_str, Some(TempFileGuard(tmp_path))));

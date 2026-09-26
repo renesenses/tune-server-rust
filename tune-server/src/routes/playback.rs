@@ -5998,8 +5998,11 @@ pub async fn shuffle_all(
 }
 
 async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl IntoResponse {
-    let upload_dir = std::path::Path::new("/tmp/tune-upload");
-    let _ = std::fs::create_dir_all(upload_dir);
+    // #4770 : un dossier par compte, sous `TMPDIR`. `/tmp/tune-upload` était
+    // un nom fixe : créé par le premier compte venu, il refusait les
+    // téléversements de tous les autres.
+    let upload_dir = tune_core::chemins_de_travail::racine_de_travail("tune-upload");
+    let _ = std::fs::create_dir_all(&upload_dir);
     let file_id = uuid::Uuid::new_v4().to_string();
 
     let mut file_data: Option<Vec<u8>> = None;
@@ -6030,7 +6033,7 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
             .into_response();
     };
 
-    // #3270 (point 4) — refuser AVANT d'écrire dans `/tmp/tune-upload`.
+    // #3270 (point 4) — refuser AVANT d'écrire dans le dossier de téléversement.
     //
     // Le refus de fond est dans `resolve_uploaded_file` : c'est lui qui garde
     // le chemin de LECTURE, y compris un `temp_file_path` fourni directement

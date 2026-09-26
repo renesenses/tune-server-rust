@@ -22,6 +22,7 @@ pub fn is_tune_temp_file(path: &std::path::Path) -> bool {
     if name.starts_with("tune-stream-") || name.starts_with("tune-prefetch-") {
         return true;
     }
+    // tmp-autorise: comparaison seule : on LIT la racine pour reconnaître nos propres temporaires.
     path.starts_with(std::env::temp_dir())
 }
 

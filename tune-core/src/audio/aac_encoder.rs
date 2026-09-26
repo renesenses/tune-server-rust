@@ -283,6 +283,7 @@ pub fn encode_aac_m4a(
 
     // The sink writer writes a file; produce it in a temp path and return
     // the bytes to keep the same contract as the AudioToolbox path.
+    // tmp-autorise: Windows seulement, où temp_dir() est propre au compte ; nom pid + adresse, fichier supprimé après lecture.
     let tmp = std::env::temp_dir().join(format!(
         "tune-aac-{}-{}.m4a",
         std::process::id(),

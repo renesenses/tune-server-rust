@@ -1651,10 +1651,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     #[cfg(target_os = "macos")]
     {
         let stderr_paths = [
-            format!(
-                "{}/Library/Logs/tune-server.log",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-            ),
+            // L'emplacement par défaut du journal, par la MÊME fonction que
+            // l'écrivain (`config::chemin_du_journal`) : plus de chemin
+            // recomposé ici, ni de repli `/tmp` partagé entre comptes (#4770).
+            crate::config::emplacement_par_defaut_du_journal()
+                .to_string_lossy()
+                .into_owned(),
             "/usr/local/var/log/tune-server.log".into(),
             "/opt/homebrew/var/log/tune-server.log".into(),
         ];
@@ -1714,10 +1716,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     #[cfg(not(target_os = "macos"))]
     {
         let stderr_paths: [String; 3] = [
-            format!(
-                "{}/Library/Logs/tune-server.log",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-            ),
+            // L'emplacement par défaut du journal, par la MÊME fonction que
+            // l'écrivain (`config::chemin_du_journal`) : plus de chemin
+            // recomposé ici, ni de repli `/tmp` partagé entre comptes (#4770).
+            crate::config::emplacement_par_defaut_du_journal()
+                .to_string_lossy()
+                .into_owned(),
             "/usr/local/var/log/tune-server.log".into(),
             "/opt/homebrew/var/log/tune-server.log".into(),
         ];
