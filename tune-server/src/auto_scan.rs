@@ -690,6 +690,24 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 updated += batch_updated;
 
                 // Extract extended metadata (ISRC, ReplayGain, MusicBrainz, lyrics, etc.)
+                //
+                // #5043 — ce bloc parcourt le LOT DE TRAVAIL du scan, et le
+                // scan de démarrage est toujours INCRÉMENTAL : `files_to_scan`
+                // ne retient que les fichiers neufs ou modifiés
+                // (`file_needs_scan`), et `verdict_ecriture` y est appelé avec
+                // `force = false`. Un fichier inchangé n'entre donc jamais
+                // ici : ce scan ne rattrape rien, et c'est voulu — rouvrir
+                // toute la bibliothèque à chaque démarrage serait une
+                // régression de performance à chaque allumage.
+                //
+                // Le rattrapage d'une bibliothèque constituée avant l'ajout de
+                // ce bloc se fait au SCAN COMPLET (`?force=true` / `?full=true`,
+                // le bouton « Scan complet »), dans
+                // `routes::system::scan::spawn_library_scan_confirmee` : c'est
+                // le seul scan dont le lot de travail contient les fichiers
+                // inchangés. Voir la borne posée là-bas
+                // (`rattrapage_metadonnees_5043`) : il n'y rouvre que les
+                // pistes qui n'ont AUCUNE métadonnée étendue.
                 {
                     let meta_repo =
                         tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(
@@ -697,17 +715,37 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                         );
                     let mut meta_entries: Vec<(i64, std::collections::HashMap<String, String>)> =
                         Vec::new();
-                    for sf in &batch {
-                        if sf.metadata.is_some() {
-                            let path = std::path::Path::new(&sf.path);
-                            if let Ok(Some(track)) = track_repo.get_by_path(&sf.path) {
-                                if let Some(track_id) = track.id {
-                                    let ext = tune_core::metadata::read_extended_metadata(path);
-                                    if !ext.is_empty() {
-                                        meta_entries.push((track_id, ext));
-                                    }
-                                }
-                            }
+                    // #5043 — les `tracks.id` du lot, par une lecture FORTE.
+                    //
+                    // Ce bloc tourne DANS la transaction du lot. `get_by_path`
+                    // passait par le pool de lecture — des connexions SÉPARÉES
+                    // sous SQLite, qui ne voient pas ce que cette transaction
+                    // vient d'écrire. Elle rendait `None`, le `if let
+                    // Ok(Some(..))` l'avalait, et aucune métadonnée étendue
+                    // n'entrait en base. Le défaut est invisible sur une base
+                    // `:memory:`, où les connexions de lecture sont des clones
+                    // de celle d'écriture.
+                    let chemins: Vec<String> = batch
+                        .iter()
+                        .filter(|sf| sf.metadata.is_some())
+                        .map(|sf| sf.path.clone())
+                        .collect();
+                    let ids = tune_core::db::rattrapage_metadonnees_5043::ids_par_chemin(
+                        &db, &chemins,
+                    )
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "auto_scan_ids_des_metadonnees_etendues_echec");
+                        std::collections::HashMap::new()
+                    });
+                    for chemin in &chemins {
+                        let Some(track_id) = ids.get(chemin).copied() else {
+                            continue;
+                        };
+                        let ext = tune_core::metadata::read_extended_metadata(
+                            std::path::Path::new(chemin),
+                        );
+                        if !ext.is_empty() {
+                            meta_entries.push((track_id, ext));
                         }
                     }
                     if !meta_entries.is_empty() {
@@ -2577,3 +2615,7 @@ mod surveillant_dossiers_tests_4896;
 #[cfg(test)]
 #[path = "scan_realigne_tests_4896.rs"]
 mod scan_realigne_tests_4896;
+
+#[cfg(test)]
+#[path = "scan_metadonnees_etendues_tests_5043.rs"]
+mod scan_metadonnees_etendues_tests_5043;
