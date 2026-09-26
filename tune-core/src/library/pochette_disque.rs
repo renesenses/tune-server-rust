@@ -329,10 +329,15 @@ fn reevaluer_avec(
         return Geste::Garder;
     }
     let mut pistes = pistes_de_l_album(db, album_id);
+    // La piste en cours d'écriture passe APRÈS celles que la base connaît :
+    // son rang dans le disque n'est pas encore écrit, et elle n'est relue ici
+    // que quand la pochette ne vient pas d'elle — une autre piste source a
+    // changé, ou elle a perdu sa jaquette. La mettre en tête laissait un
+    // single, relu le premier, imposer sa jaquette à l'album (#4650).
     if let Some(p) = en_plus
         && !pistes.iter().any(|q| q == p)
     {
-        pistes.insert(0, p.to_path_buf());
+        pistes.push(p.to_path_buf());
     }
     let lue = lire_depuis_l_album(&pistes, cache_dir);
     let du_disque = vient_du_disque(etat, lue.as_ref(), &pistes);
