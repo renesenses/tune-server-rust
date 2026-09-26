@@ -928,12 +928,11 @@ fn postgresql_execute_les_requetes_de_tune_server() {
         lignes += 1;
         let mots: Vec<&str> = commande.split_whitespace().collect();
         for (index, mot) in mots.iter().enumerate() {
-            if *mot == "-p" {
-                if let Some(paquet) = mots.get(index + 1) {
-                    if !paquets.contains(paquet) {
-                        paquets.push(paquet);
-                    }
-                }
+            if *mot == "-p"
+                && let Some(paquet) = mots.get(index + 1)
+                && !paquets.contains(paquet)
+            {
+                paquets.push(paquet);
             }
         }
     }

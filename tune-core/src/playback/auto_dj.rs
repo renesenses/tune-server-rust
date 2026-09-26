@@ -460,12 +460,12 @@ pub fn generate_queue(
         param_idx += 2;
     }
 
-    if let Some(b) = bpm {
-        if b > 0.0 {
-            conditions.push(format!("t.bpm BETWEEN ?{param_idx} AND ?{}", param_idx + 1));
-            owned_params.push((b * 0.85).to_sql_value());
-            owned_params.push((b * 1.15).to_sql_value());
-        }
+    if let Some(b) = bpm
+        && b > 0.0
+    {
+        conditions.push(format!("t.bpm BETWEEN ?{param_idx} AND ?{}", param_idx + 1));
+        owned_params.push((b * 0.85).to_sql_value());
+        owned_params.push((b * 1.15).to_sql_value());
     }
 
     let where_clause = conditions.join(" AND ");

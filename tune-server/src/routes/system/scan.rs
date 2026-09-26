@@ -248,6 +248,9 @@ mod scan_gate_tests {
     /// dire « scanning » — sinon le client relance et reçoit 409
     /// `already_scanning` (pg_scan_converge_4602, 24/09/2026).
     #[tokio::test]
+    // `serialiser()` est tenu à travers les `.await` à dessein : c'est lui qui
+    // tient à l'écart les autres tests du droit de scan global (clippy 1.98).
+    #[allow(clippy::await_holding_lock)]
     async fn scan_status_ne_dit_pas_idle_tant_que_le_droit_est_tenu() {
         let _serialise = serialiser();
         let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -676,18 +679,18 @@ pub(crate) fn purge_refusee(candidats: usize, total: usize, confirmee: Option<u6
 /// received the NFC fix.
 pub fn file_needs_scan(path: &std::path::Path, existing_tracks: &CarteDesChemins) -> bool {
     let path_str: String = path.to_string_lossy().nfc().collect();
-    if let Some(info) = existing_tracks.get(path_str.as_str()) {
-        if let Ok(file_meta) = path.metadata() {
-            let mtime = file_meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
-                && info.taille.is_some_and(|s| s == file_meta.len() as i64);
-            return !unchanged;
-        }
+    if let Some(info) = existing_tracks.get(path_str.as_str())
+        && let Ok(file_meta) = path.metadata()
+    {
+        let mtime = file_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let unchanged = info.mtime.is_some_and(|m| (m - mtime as f64).abs() <= 0.5)
+            && info.taille.is_some_and(|s| s == file_meta.len() as i64);
+        return !unchanged;
     }
     true
 }
@@ -813,7 +816,7 @@ pub(super) async fn trigger_scan(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| tune_core::scanner::walker::normalize_path(s));
+        .map(tune_core::scanner::walker::normalize_path);
     if spawn_library_scan_confirmee(state, force, q.confirm_purge, targeted_req).await {
         (StatusCode::ACCEPTED, Json(json!({ "status": "scanning" })))
     } else {
@@ -2377,11 +2380,10 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // `discovered_paths` only holds files below that folder, so a
                 // track anywhere else would look "missing" and get wrongly
                 // deleted — pruning the whole library except the sub-folder.
-                if let Some(ref t) = targeted {
-                    if !sous_le_dossier(db_path, t) {
+                if let Some(ref t) = targeted
+                    && !sous_le_dossier(db_path, t) {
                         continue;
                     }
-                }
                 examinees += 1;
                 if !discovered_paths.contains(db_path) {
                     match verdict_purge(

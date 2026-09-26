@@ -304,18 +304,18 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
              ORDER BY RANDOM() LIMIT 15"
         );
 
-        if let Ok(rows) = backend.query_many(&sql, &[genre as &dyn ToSqlValue]) {
-            if rows.len() >= 3 {
-                let tracks: Vec<RecommendedTrack> = rows
-                    .iter()
-                    .map(|r| row_to_track(r, &format!("{genre} mix")))
-                    .collect();
-                mixes.push(DailyMix {
-                    name: format!("{genre} Mix"),
-                    description: format!("Your favorites in {genre}"),
-                    tracks,
-                });
-            }
+        if let Ok(rows) = backend.query_many(&sql, &[genre as &dyn ToSqlValue])
+            && rows.len() >= 3
+        {
+            let tracks: Vec<RecommendedTrack> = rows
+                .iter()
+                .map(|r| row_to_track(r, &format!("{genre} mix")))
+                .collect();
+            mixes.push(DailyMix {
+                name: format!("{genre} Mix"),
+                description: format!("Your favorites in {genre}"),
+                tracks,
+            });
         }
 
         if mixes.len() >= 5 {
@@ -343,16 +343,16 @@ pub fn generate_daily_mixes(backend: &Arc<dyn DbBackend>) -> Vec<DailyMix> {
              ORDER BY RANDOM() LIMIT 15"
         );
 
-        if let Ok(rows) = backend.query_many(&sql, &[]) {
-            if rows.len() >= 3 {
-                let tracks: Vec<RecommendedTrack> =
-                    rows.iter().map(|r| row_to_track(r, "rediscover")).collect();
-                mixes.push(DailyMix {
-                    name: "Rediscover".to_string(),
-                    description: "Tracks you haven't listened to in a while".to_string(),
-                    tracks,
-                });
-            }
+        if let Ok(rows) = backend.query_many(&sql, &[])
+            && rows.len() >= 3
+        {
+            let tracks: Vec<RecommendedTrack> =
+                rows.iter().map(|r| row_to_track(r, "rediscover")).collect();
+            mixes.push(DailyMix {
+                name: "Rediscover".to_string(),
+                description: "Tracks you haven't listened to in a while".to_string(),
+                tracks,
+            });
         }
     }
 

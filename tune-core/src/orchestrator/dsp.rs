@@ -442,16 +442,12 @@ impl PlaybackOrchestrator {
             use std::io::Write;
             if let Some(ref ltx) = prefetch_levels_tx {
                 crate::audio::tap::send_windowed_pcm(
-                    ltx,
-                    &pcm_data,
-                    encode_bd,
-                    encode_ch as u16,
-                    encode_sr,
+                    ltx, &pcm_data, encode_bd, encode_ch, encode_sr,
                 );
             }
             let data_size = pcm_data.len() as u32;
             let byte_rate = encode_sr * encode_ch as u32 * (encode_bd as u32 / 8);
-            let block_align = encode_ch as u16 * (encode_bd as u16 / 8);
+            let block_align = encode_ch * (encode_bd / 8);
             if encode_wav {
                 let mut f = std::fs::File::create(&encode_path)
                     .map_err(|e| format!("create tmp wav: {e}"))?;
@@ -461,11 +457,11 @@ impl PlaybackOrchestrator {
                 hdr.extend_from_slice(b"WAVEfmt ");
                 hdr.extend_from_slice(&16u32.to_le_bytes());
                 hdr.extend_from_slice(&1u16.to_le_bytes());
-                hdr.extend_from_slice(&(encode_ch as u16).to_le_bytes());
+                hdr.extend_from_slice(&encode_ch.to_le_bytes());
                 hdr.extend_from_slice(&encode_sr.to_le_bytes());
                 hdr.extend_from_slice(&byte_rate.to_le_bytes());
                 hdr.extend_from_slice(&block_align.to_le_bytes());
-                hdr.extend_from_slice(&(encode_bd as u16).to_le_bytes());
+                hdr.extend_from_slice(&encode_bd.to_le_bytes());
                 hdr.extend_from_slice(b"data");
                 hdr.extend_from_slice(&data_size.to_le_bytes());
                 f.write_all(&hdr)
@@ -625,7 +621,7 @@ impl PlaybackOrchestrator {
                         &ltx,
                         &levels_pcm,
                         levels_bd,
-                        levels_ch as u16,
+                        levels_ch,
                         levels_sr,
                     );
                 });
@@ -1178,11 +1174,11 @@ impl PlaybackOrchestrator {
             // client sait déjà dire (`applied_live: false`).
             {
                 let derniers = moi.eq_replay_last.lock().unwrap();
-                if let Some(t) = derniers.get(&zone_id) {
-                    if t.elapsed().as_millis() < Self::EQ_REPLAY_FLOOR_MS as u128 {
-                        info!(zone_id, "eq_replay_skipped_floor");
-                        return;
-                    }
+                if let Some(t) = derniers.get(&zone_id)
+                    && t.elapsed().as_millis() < Self::EQ_REPLAY_FLOOR_MS as u128
+                {
+                    info!(zone_id, "eq_replay_skipped_floor");
+                    return;
                 }
             }
             let position_ms = moi.playback.get_state(zone_id).await.position_ms.max(0) as u64;

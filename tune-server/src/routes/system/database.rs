@@ -96,11 +96,11 @@ pub(super) async fn database_status(
          (SELECT COUNT(*) FROM albums), \
          (SELECT COUNT(*) FROM tracks)",
         &[],
-    ).map_err(|e| AppError::internal(e))?;
+    ).map_err(AppError::internal)?;
     let (artists, albums, tracks) = row
         .map(|r| {
             (
-                r.get(0).and_then(|v| v.as_i64()).unwrap_or(0),
+                r.first().and_then(|v| v.as_i64()).unwrap_or(0),
                 r.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 r.get(2).and_then(|v| v.as_i64()).unwrap_or(0),
             )
@@ -880,8 +880,8 @@ mod tests_import {
     fn plafond_import_depasse_la_limite_globale_et_un_export_reel() {
         const LIMITE_GLOBALE: usize = 50 * 1024 * 1024;
         const EXPORT_MESURE: usize = 256 * 1024 * 1024;
-        assert!(IMPORT_DB_BODY_LIMIT > LIMITE_GLOBALE);
-        assert!(IMPORT_DB_BODY_LIMIT > EXPORT_MESURE);
+        const { assert!(IMPORT_DB_BODY_LIMIT > LIMITE_GLOBALE) };
+        const { assert!(IMPORT_DB_BODY_LIMIT > EXPORT_MESURE) };
     }
 
     fn base_tune_minimale(chemin: &std::path::Path) {

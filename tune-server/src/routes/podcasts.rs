@@ -106,8 +106,8 @@ async fn search_podcasts(
     }
 }
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description, source_id FROM podcast_subscriptions ORDER BY title", &[]).map_err(|e| AppError::internal(e))?;
-    let items: Vec<Value> = rows.into_iter().map(|r| json!({"id": r.get(0).and_then(|v| v.as_i64()), "feed_url": r.get(1).and_then(|v| v.as_string()), "title": r.get(2).and_then(|v| v.as_string()), "author": r.get(3).and_then(|v| v.as_string()), "image_url": r.get(4).and_then(|v| v.as_string()), "description": r.get(5).and_then(|v| v.as_string()), "source_id": r.get(6).and_then(|v| v.as_string())})).collect();
+    let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description, source_id FROM podcast_subscriptions ORDER BY title", &[]).map_err(AppError::internal)?;
+    let items: Vec<Value> = rows.into_iter().map(|r| json!({"id": r.first().and_then(|v| v.as_i64()), "feed_url": r.get(1).and_then(|v| v.as_string()), "title": r.get(2).and_then(|v| v.as_string()), "author": r.get(3).and_then(|v| v.as_string()), "image_url": r.get(4).and_then(|v| v.as_string()), "description": r.get(5).and_then(|v| v.as_string()), "source_id": r.get(6).and_then(|v| v.as_string())})).collect();
     Ok(Json(json!(items)))
 }
 async fn subscribe(
@@ -418,7 +418,7 @@ async fn play_episode(
             let output = output_arc.lock().await;
             let media = tune_core::outputs::PlayMedia {
                 url: &body.audio_url,
-                mime_type: &mime_type,
+                mime_type,
                 title: Some(title),
                 artist: Some(podcast_name),
                 album: Some(podcast_name),
@@ -510,7 +510,7 @@ async fn rf_shows(
     let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
     let code = q.station.as_deref().unwrap_or("FRANCEINTER");
     let station = RfStation::from_code(code)
-        .ok_or_else(|| AppError::bad_request(&format!("unknown station: {code}")))?;
+        .ok_or_else(|| AppError::bad_request(format!("unknown station: {code}")))?;
     match api.list_shows(station).await {
         Ok(shows) => Ok(Json(
             json!({"station": station.label(), "count": shows.len(), "shows": shows}),

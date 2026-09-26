@@ -110,12 +110,12 @@ impl CloudError {
 /// À défaut d'un JSON exploitable, on garde le début du corps brut — mieux
 /// vaut trois lignes de HTML dans un journal qu'un refus muet.
 fn texte_amont(body: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(m) = v.get("message").and_then(|m| m.as_str()) {
-            let m = m.trim();
-            if !m.is_empty() {
-                return m.chars().take(MAX_AMONT).collect();
-            }
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(m) = v.get("message").and_then(|m| m.as_str())
+    {
+        let m = m.trim();
+        if !m.is_empty() {
+            return m.chars().take(MAX_AMONT).collect();
         }
     }
     body.trim().chars().take(MAX_AMONT).collect()

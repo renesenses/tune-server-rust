@@ -215,7 +215,7 @@ impl PlaybackOrchestrator {
             }
 
             let sr = stream_data.quality.sample_rate;
-            let bd = stream_data.quality.bit_depth.max(16).min(24);
+            let bd = stream_data.quality.bit_depth.clamp(16, 24);
             let key_bd = if out_fmt == "wav" { 16 } else { bd };
             // Pas de racine de cache utilisable pour ce compte (#5133) : rien
             // à chauffer.

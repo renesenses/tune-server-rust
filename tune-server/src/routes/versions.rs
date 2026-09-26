@@ -76,11 +76,11 @@ pub(crate) fn classer_version(
 /// Les trois delimiteurs qui ouvrent un suffixe d'edition.
 ///
 /// ` (` et ` [` sont d'origine. ` - ` a ete ajoute pour #2372 : c'est la forme
-/// que Qobuz, Tidal et Deezer emploient pour les remasters — « Smooth Operator
-/// - 2011 Remastered », « Heroes - 2017 Remaster ». Sans lui, la fonction
-/// « Autres versions » rate la convention de nommage LA PLUS COURANTE de ce
-/// qu'elle est faite pour trouver, exactement le cas decrit par Gros Bidon
-/// (« Reissue, Remastered, Special Edition », fil 1627, 31/08).
+/// que Qobuz, Tidal et Deezer emploient pour les remasters —
+/// « Smooth Operator - 2011 Remastered », « Heroes - 2017 Remaster ». Sans lui,
+/// la fonction « Autres versions » rate la convention de nommage LA PLUS
+/// COURANTE de ce qu'elle est faite pour trouver, exactement le cas decrit par
+/// Gros Bidon (« Reissue, Remastered, Special Edition », fil 1627, 31/08).
 ///
 /// ⚠️ Le tiret est exige ENTOURE d'espaces (` - `), jamais nu : sans cela
 /// `Cross-Eyed Mary` deviendrait une variante de `Cross`.
@@ -1187,8 +1187,8 @@ mod tests {
         assert_eq!(points(295_000), POINTS_DUREE_PROCHE);
         assert_eq!(points(340_000), POINTS_DUREE_VOISINE);
         assert_eq!(points(600_000), 0);
-        assert!(POINTS_DUREE_QUASI_EGALE > POINTS_DUREE_PROCHE);
-        assert!(POINTS_DUREE_PROCHE > POINTS_DUREE_VOISINE);
+        const { assert!(POINTS_DUREE_QUASI_EGALE > POINTS_DUREE_PROCHE) };
+        const { assert!(POINTS_DUREE_PROCHE > POINTS_DUREE_VOISINE) };
     }
 
     /// Un signal ABSENT ne rapporte rien et ne coute rien : c'est la

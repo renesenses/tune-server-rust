@@ -126,7 +126,7 @@ fn horodatage_de_ligne(ligne: &str) -> Option<&str> {
 fn periode_couverte(extrait: &str) -> Option<String> {
     let mut lignes = extrait.lines().filter_map(horodatage_de_ligne);
     let debut = lignes.next()?;
-    match lignes.last() {
+    match lignes.next_back() {
         Some(fin) if fin != debut => Some(format!("du {debut} au {fin}")),
         _ => Some(format!("à {debut}")),
     }
@@ -1438,11 +1438,11 @@ fn selectionner_lignes(
     let seuil_ancienne_fenetre = candidates.len().saturating_sub(max_lines);
     let retenu: std::collections::BTreeSet<usize> = retenues.iter().copied().collect();
     let mut vraiment_ecartees: BTreeMap<String, usize> = BTreeMap::new();
-    for i in seuil_ancienne_fenetre..candidates.len() {
+    for (i, candidate) in candidates.iter().enumerate().skip(seuil_ancienne_fenetre) {
         if retenu.contains(&i) {
             continue;
         }
-        if let Some(m) = module_de_la_ligne(&candidates[i]) {
+        if let Some(m) = module_de_la_ligne(candidate) {
             *vraiment_ecartees.entry(m.to_string()).or_insert(0) += 1;
         }
     }
@@ -1614,18 +1614,17 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
                     "short-iso",
                 ])
                 .output()
+                && output.status.success()
             {
-                if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    let count = text.lines().count();
-                    if count > 1 {
-                        return Json(json!({
-                            "logs": text,
-                            "lines": count,
-                            "source": "journalctl",
-                            "service": service,
-                        }));
-                    }
+                let text = String::from_utf8_lossy(&output.stdout);
+                let count = text.lines().count();
+                if count > 1 {
+                    return Json(json!({
+                        "logs": text,
+                        "lines": count,
+                        "source": "journalctl",
+                        "service": service,
+                    }));
                 }
             }
         }

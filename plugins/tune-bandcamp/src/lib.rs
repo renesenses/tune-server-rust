@@ -199,6 +199,9 @@ fn passerelle_en_echec(detail: String) -> axum::response::Response {
 /// plugin avec un HTTP 200 et n'échouait que dans le navigateur. Rendre le
 /// `Value` à l'appelant l'oblige à regarder ce qu'il a reçu avant de le
 /// servir.
+// L'erreur est la `Response` axum rendue telle quelle au client : l'emballer
+// dans une `Box` n'apporterait rien sur ce chemin froid (clippy 1.98).
+#[allow(clippy::result_large_err)]
 async fn json_sortant(
     reponse: Result<reqwest::Response, reqwest::Error>,
 ) -> Result<Value, axum::response::Response> {
@@ -1151,10 +1154,10 @@ fn extraire_fan_id(page: &str) -> Option<i64> {
         while let Some(i) = reste.find(motif) {
             reste = &reste[i + motif.len()..];
             let chiffres: String = reste.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if !chiffres.is_empty() {
-                if let Ok(n) = chiffres.parse::<i64>() {
-                    return Some(n);
-                }
+            if !chiffres.is_empty()
+                && let Ok(n) = chiffres.parse::<i64>()
+            {
+                return Some(n);
             }
         }
     }

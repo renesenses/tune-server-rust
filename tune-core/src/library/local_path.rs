@@ -136,10 +136,10 @@ pub fn resolve_local_path(stored: &str) -> LocalPath {
     }
     // Dernier recours : les trois graphies globales ne couvrent pas une
     // normalisation qui change d'un composant à l'autre (#1837).
-    if merite_un_parcours(stored) {
-        if let Some(p) = resolve_par_composant(stored) {
-            return LocalPath::Found(p);
-        }
+    if merite_un_parcours(stored)
+        && let Some(p) = resolve_par_composant(stored)
+    {
+        return LocalPath::Found(p);
     }
     LocalPath::Missing
 }
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn lestampille_de_report_se_compare_en_texte_comme_en_nombre() {
         // C'est la propriété dont dépend le prédicat SQL portable.
-        let mut secondes = vec![
+        let mut secondes = [
             0i64,
             1,
             9,

@@ -1,4 +1,10 @@
 #![recursion_limit = "256"]
+// Les gestionnaires axum et leurs gardes (`require_premium`, `require_admin`…)
+// rendent `Result<_, axum::response::Response>` : c'est l'idiome d'axum, et
+// `Response` pèse 128 octets. Emballer l'erreur dans une `Box` changerait la
+// signature de dizaines de routes pour un gain nul sur un chemin qui n'est pas
+// chaud (clippy 1.98, `result_large_err`).
+#![allow(clippy::result_large_err)]
 
 mod adresse_d_accueil;
 pub mod auth;

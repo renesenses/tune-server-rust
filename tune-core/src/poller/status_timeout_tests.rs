@@ -130,7 +130,7 @@ async fn healthy_transport_passes_through() {
             .await
             .unwrap();
     assert_eq!(status.state, TransportState::Playing);
-    assert_eq!(signal_path.unwrap().bit_perfect, true);
+    assert!(signal_path.unwrap().bit_perfect);
     assert_eq!(dsp_metrics.unwrap().eq_overs, 3);
     // Une sortie sans anneau ne rend rien : c'est le defaut du trait, et il
     // doit rester distinct de « un anneau qui n'a rien manque » (#3318).

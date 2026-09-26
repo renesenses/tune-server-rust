@@ -238,10 +238,10 @@ fn spawn_paced_levels_forwarder(
                 }
                 let zone_state = playback.get_state(zone_id).await;
                 let reported_position_ms = zone_state.position_ms;
-                if let Some(prev) = last_reported {
-                    if reported_position_ms > prev {
-                        reported_advancing = true;
-                    }
+                if let Some(prev) = last_reported
+                    && reported_position_ms > prev
+                {
+                    reported_advancing = true;
                 }
                 last_reported = Some(reported_position_ms);
                 match zone_state.state {
@@ -945,6 +945,10 @@ fn spawn_proxy_levels_probe_task(
     });
 }
 
+/// Dernière piste poussée vers un renderer RÉSEAU d'une zone :
+/// `(source, source_id, track_id, quand)` — voir `last_net_play`.
+type DerniereLectureReseau = (String, Option<String>, Option<i64>, std::time::Instant);
+
 pub struct PlaybackOrchestrator {
     pub db: Arc<dyn crate::db::backend::DbBackend>,
     pub playback: Arc<PlaybackManager>,
@@ -1017,7 +1021,7 @@ pub struct PlaybackOrchestrator {
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
     /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
-    last_net_play: Mutex<HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>>,
+    last_net_play: Mutex<HashMap<i64, DerniereLectureReseau>>,
     /// Annonces « en écoute » DIFFÉRÉES des zones navigateur (#1998).
     ///
     /// Une zone navigateur n'a pas de périphérique de sortie : la sortie est

@@ -363,13 +363,13 @@ where
         // n'attend n'a pas à être mesuré, et surtout pas à être attendu. C'est
         // le point de contrôle que #3444 réclamait — celui qui existait déjà
         // dans `resolve_local`, mais seulement APRÈS la fin du transcodage.
-        if let Some(sup) = supersession {
-            if let Some(gagnant) = sup.gagnant().await {
-                return Err(FinDeTranscodage::Preempte {
-                    gagnant,
-                    perdu: ecoule,
-                });
-            }
+        if let Some(sup) = supersession
+            && let Some(gagnant) = sup.gagnant().await
+        {
+            return Err(FinDeTranscodage::Preempte {
+                gagnant,
+                perdu: ecoule,
+            });
         }
         let decode = std::time::Duration::from_millis(progres.decoded_ms());
         if decode > std::time::Duration::ZERO {

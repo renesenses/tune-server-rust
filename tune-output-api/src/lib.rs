@@ -698,11 +698,10 @@ impl RingStarvation {
             missing_samples: self.missing_samples.load(Ordering::Relaxed),
             served_samples: served,
             driver_underruns: self.driver_underruns.load(Ordering::Relaxed),
-            stream_ms: if cadence == 0 {
-                0
-            } else {
-                served.saturating_mul(1000) / cadence
-            },
+            stream_ms: served
+                .saturating_mul(1000)
+                .checked_div(cadence)
+                .unwrap_or(0),
         }
     }
 }
@@ -1615,7 +1614,7 @@ impl PuitsDEchantillons for CaptureOutput {
         if mots.is_empty() {
             self.blocs_vides += 1;
         }
-        if self.format.canaux != 0 && mots.len() % usize::from(self.format.canaux) != 0 {
+        if self.format.canaux != 0 && !mots.len().is_multiple_of(usize::from(self.format.canaux)) {
             self.blocs_non_alignes += 1;
         }
         self.mots += mots.len() as u64;

@@ -3,6 +3,10 @@ use super::*;
 /// Issue du deuxième temps de `play_inner` : un flux résolu à envoyer, ou
 /// une lecture déjà close (reprise par une plus récente, renvoi coalescé)
 /// dont le résultat remonte tel quel.
+// Valeur de passage entre deux temps de `play_inner`, jamais stockée :
+// emballer `ResolvedStream` ajouterait une allocation par lecture pour rien
+// (clippy 1.98, `large_enum_variant`).
+#[allow(clippy::large_enum_variant)]
 enum ResoluOuFini {
     Resolu {
         resolved: ResolvedStream,
@@ -226,26 +230,26 @@ impl PlaybackOrchestrator {
         //     auto-resume runs from a Stopped state — neither trips this guard.
         if req.seek_ms.unwrap_or(0) == 0 {
             let state = self.playback.get_state(req.zone_id).await;
-            if state.state == PlayState::Playing {
-                if let Some(np) = state.now_playing.as_ref() {
-                    let recent = state
-                        .last_play_started_at
-                        .map(|t| t.elapsed() < RETAP_DEDUP_WINDOW)
-                        .unwrap_or(false);
-                    if recent && Self::is_same_track_retap(np, &req) {
-                        info!(
-                            zone_id = req.zone_id,
-                            title = %np.title,
-                            source = %np.source,
-                            "orchestrator_play_retap_deduped_same_inflight_track"
-                        );
-                        return Ok(PlayResult {
-                            stream_url: None,
-                            output_sent: false,
-                            source: np.source.clone(),
-                            error: None,
-                        });
-                    }
+            if state.state == PlayState::Playing
+                && let Some(np) = state.now_playing.as_ref()
+            {
+                let recent = state
+                    .last_play_started_at
+                    .map(|t| t.elapsed() < RETAP_DEDUP_WINDOW)
+                    .unwrap_or(false);
+                if recent && Self::is_same_track_retap(np, &req) {
+                    info!(
+                        zone_id = req.zone_id,
+                        title = %np.title,
+                        source = %np.source,
+                        "orchestrator_play_retap_deduped_same_inflight_track"
+                    );
+                    return Ok(PlayResult {
+                        stream_url: None,
+                        output_sent: false,
+                        source: np.source.clone(),
+                        error: None,
+                    });
                 }
             }
         }
@@ -697,10 +701,8 @@ impl PlaybackOrchestrator {
             .output_device_id
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
-        if !is_local {
-            if let Some(ref old_sid) = old_stream_id {
-                self.streamer.remove_session(old_sid).await;
-            }
+        if !is_local && let Some(ref old_sid) = old_stream_id {
+            self.streamer.remove_session(old_sid).await;
         }
 
         let (output_sent, output_error) = self
@@ -711,10 +713,8 @@ impl PlaybackOrchestrator {
 
         // For local outputs, clean up the old stream now that play_url() has
         // called stop() and the old audio thread is no longer reading.
-        if is_local {
-            if let Some(ref old_sid) = old_stream_id {
-                self.streamer.remove_session(old_sid).await;
-            }
+        if is_local && let Some(ref old_sid) = old_stream_id {
+            self.streamer.remove_session(old_sid).await;
         }
 
         self.annoncer_apres_la_sortie(
@@ -1044,7 +1044,8 @@ impl PlaybackOrchestrator {
                 .ok()
                 .flatten()
         });
-        let np = NowPlaying {
+
+        NowPlaying {
             track_id: req.track_id,
             title: resolved.title.clone(),
             artist_name: resolved.artist.clone(),
@@ -1122,8 +1123,7 @@ impl PlaybackOrchestrator {
             // auditeur ne peut distinguer d'un 320 (#2074). Une piste locale
             // n'en porte pas : sa résolution réelle est lue au scan.
             bitrate_kbps: resolved.bitrate_kbps,
-        };
-        np
+        }
     }
 
     /// Quatrième temps : l'envoi à la sortie. Rend `(output_sent,
@@ -1802,42 +1802,42 @@ impl PlaybackOrchestrator {
             // postgres-without-oaat build (test-postgres "Engine module tests"),
             // mirroring the `local-audio` gate on the analogous block below.
             #[cfg(feature = "oaat")]
-            if let Some(position_ms) = start_position_ms {
-                if device_id.starts_with("oaat:") {
-                    let output = output_arc.lock().await;
-                    if let Some(oaat_output) = output
-                        .as_any()
-                        .downcast_ref::<crate::outputs::oaat::OaatOutput>()
-                    {
-                        oaat_output.set_pending_start_position_ms(position_ms);
-                    }
-                    drop(output);
+            if let Some(position_ms) = start_position_ms
+                && device_id.starts_with("oaat:")
+            {
+                let output = output_arc.lock().await;
+                if let Some(oaat_output) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::oaat::OaatOutput>()
+                {
+                    oaat_output.set_pending_start_position_ms(position_ms);
                 }
+                drop(output);
             }
             // For local outputs, set the pending start position before play
             #[cfg(feature = "local-audio")]
-            if let Some(position_ms) = start_position_ms {
-                if device_id.starts_with("local:") {
-                    let output = output_arc.lock().await;
-                    if let Some(local_output) = output
-                        .as_any()
-                        .downcast_ref::<crate::outputs::local::LocalOutput>()
-                    {
-                        local_output.set_pending_start_position_ms(position_ms);
-                        // The WAV a local output receives is ALWAYS pre-seeked:
-                        // since b3a4a79f the streaming (Qobuz/Tidal) transcode
-                        // arm feeds seek_s to decode_to_pcm_streaming_seeked,
-                        // exactly like the local-file arm. Deriving this flag
-                        // from media.file_path (streaming → false → consumer
-                        // byte-skip) made the output skip the seek offset a
-                        // SECOND time on an already-seeked stream: a seek at
-                        // 4:30 discarded the entire remainder of the track —
-                        // silence, then a ~3s restart loop as the poller kept
-                        // recovering the "ended" track (Vincent, #1518).
-                        local_output.set_producer_seeked(true);
-                    }
-                    drop(output);
+            if let Some(position_ms) = start_position_ms
+                && device_id.starts_with("local:")
+            {
+                let output = output_arc.lock().await;
+                if let Some(local_output) = output
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                {
+                    local_output.set_pending_start_position_ms(position_ms);
+                    // The WAV a local output receives is ALWAYS pre-seeked:
+                    // since b3a4a79f the streaming (Qobuz/Tidal) transcode
+                    // arm feeds seek_s to decode_to_pcm_streaming_seeked,
+                    // exactly like the local-file arm. Deriving this flag
+                    // from media.file_path (streaming → false → consumer
+                    // byte-skip) made the output skip the seek offset a
+                    // SECOND time on an already-seeked stream: a seek at
+                    // 4:30 discarded the entire remainder of the track —
+                    // silence, then a ~3s restart loop as the poller kept
+                    // recovering the "ended" track (Vincent, #1518).
+                    local_output.set_producer_seeked(true);
                 }
+                drop(output);
             }
             // PURE (audiophile) mode: bypass the room-correction convolver on
             // this local output for the zone about to play, so the signal path
@@ -2013,14 +2013,14 @@ impl PlaybackOrchestrator {
         // l'ancien fil ASIO/WASAPI peut encore tenir la connexion HTTP quand la
         // nouvelle session démarre — d'où un « request or response body error »
         // intermittent. Les 300 ms lui laissent relâcher le périphérique.
-        if let Some(ref did) = output_device_id {
-            if did.starts_with("local:") || did.starts_with("oaat:") {
-                let arc = { self.outputs.lock().await.get(did.as_str()) };
-                if let Some(output) = arc {
-                    let _ = output.lock().await.stop().await;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Some(ref did) = output_device_id
+            && (did.starts_with("local:") || did.starts_with("oaat:"))
+        {
+            let arc = { self.outputs.lock().await.get(did.as_str()) };
+            if let Some(output) = arc {
+                let _ = output.lock().await.stop().await;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
 
         let req = PlayRequest {
@@ -2511,6 +2511,10 @@ impl PlaybackOrchestrator {
             // #4177 — une sortie exclusive Windows a RENDU son périphérique à
             // la pause : reprendre « sur place » ne rouvrirait rien. Elle le
             // dit elle-même ; toutes les autres sorties répondent `false`.
+            // Les accolades rendent le verrou de `outputs` AVANT de prendre celui
+            // de la sortie : sans elles, le garde vivrait tout le `match`
+            // (clippy 1.98, `blocks_in_conditions`, à ne pas suivre ici).
+            #[allow(clippy::blocks_in_conditions)]
             let peripherique_rendu = match device_id {
                 Some(did) => match { self.outputs.lock().await.get(did) } {
                     Some(sortie) => sortie.lock().await.device_released_on_pause(),
@@ -2724,10 +2728,10 @@ impl PlaybackOrchestrator {
         };
         if let Some(ref did) = resolved_did {
             let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc {
-                if let Err(e) = output.lock().await.stop().await {
-                    warn!(zone_id, error = %e, "device_stop_failed");
-                }
+            if let Some(output) = arc
+                && let Err(e) = output.lock().await.stop().await
+            {
+                warn!(zone_id, error = %e, "device_stop_failed");
             }
         } else {
             // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
@@ -2807,16 +2811,17 @@ impl PlaybackOrchestrator {
         // Clamp seek to track duration to prevent out-of-bounds seek on files
         // with incorrect metadata duration (e.g. VBR MP3 with wrong header).
         let state = self.playback.get_state(zone_id).await;
-        if let Some(ref np) = state.now_playing {
-            if np.duration_ms > 0 && position_ms > np.duration_ms as u64 {
-                info!(
-                    zone_id,
-                    requested = position_ms,
-                    duration = np.duration_ms,
-                    "seek_clamped_to_duration"
-                );
-                position_ms = (np.duration_ms as u64).saturating_sub(1000);
-            }
+        if let Some(ref np) = state.now_playing
+            && np.duration_ms > 0
+            && position_ms > np.duration_ms as u64
+        {
+            info!(
+                zone_id,
+                requested = position_ms,
+                duration = np.duration_ms,
+                "seek_clamped_to_duration"
+            );
+            position_ms = (np.duration_ms as u64).saturating_sub(1000);
         }
         if let Some(did) = device_id {
             self.deplacer_la_sortie(zone_id, did, position_ms, &state, seek_start)
@@ -2828,16 +2833,16 @@ impl PlaybackOrchestrator {
         // garde au poller pendant une recréation de flux.
         self.playback.seek(zone_id, position_ms as i64).await;
         let confirmed_state = self.playback.get_state(zone_id).await;
-        if let Some(ref np) = confirmed_state.now_playing {
-            if let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
+        if let Some(ref np) = confirmed_state.now_playing
+            && let Err(e) = ZoneRepo::with_backend(self.db.clone()).save_playback_position(
                 zone_id,
                 position_ms as i64,
                 np.track_id,
                 Some(np.source.as_str()),
                 np.source_id.as_deref(),
-            ) {
-                warn!(zone_id, error = %e, "persist_seek_position_failed");
-            }
+            )
+        {
+            warn!(zone_id, error = %e, "persist_seek_position_failed");
         }
         Ok(())
     }

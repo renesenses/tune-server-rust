@@ -82,10 +82,10 @@ impl AmazonMusicService {
 
     fn api_headers(&self) -> reqwest::header::HeaderMap {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Some(ref token) = self.access_token {
-            if let Ok(val) = format!("Bearer {token}").parse() {
-                headers.insert("Authorization", val);
-            }
+        if let Some(ref token) = self.access_token
+            && let Ok(val) = format!("Bearer {token}").parse()
+        {
+            headers.insert("Authorization", val);
         }
         if let Ok(val) = self.device_id.parse() {
             headers.insert("X-Amzn-Device-Id", val);

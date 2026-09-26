@@ -64,10 +64,12 @@ fn le_constat_attend_son_propre_seuil() {
         "le constat ne s'appuie plus sur son propre seuil : il parlerait \
          avant que les detecteurs de fin de piste aient eu leur chance."
     );
-    assert!(
-        super::DEPASSEMENT_DUREE_TICKS > super::POSITION_PAST_END_TICKS,
-        "le seuil du constat doit rester STRICTEMENT au-dessus de celui des \
+    const {
+        assert!(
+            super::DEPASSEMENT_DUREE_TICKS > super::POSITION_PAST_END_TICKS,
+            "le seuil du constat doit rester STRICTEMENT au-dessus de celui des \
          detecteurs de fin de piste, sinon il double-signale une fin de \
          piste parfaitement normale."
-    );
+        )
+    };
 }

@@ -578,7 +578,7 @@ fn dst_est_hors_du_defaut_et_tiree_par_aucune_autre_feature() {
             .get("default")
             .unwrap_or_else(|| panic!("{nom} n'a plus de `default` — lecteur de manifeste cassé"));
         assert!(
-            defauts.len() >= 1 && !defauts.iter().any(|d| d.starts_with('[')),
+            !defauts.is_empty() && !defauts.iter().any(|d| d.starts_with('[')),
             "{nom} : `default` mal lu ({defauts:?}) — lecteur de manifeste cassé"
         );
 

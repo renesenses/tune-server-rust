@@ -1796,14 +1796,9 @@ mod tests {
         let attempts = Arc::new(AtomicU32::new(0));
         let counter = attempts.clone();
         tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        drop(stream);
-                    }
-                    Err(_) => break,
-                }
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
             }
         });
 

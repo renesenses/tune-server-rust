@@ -351,7 +351,7 @@ fn tout_jeu_qui_garde_un_fichier_d_essais_est_active_par_une_porte_cargo_test() 
                 }
             }
             for f in fonctionnalites(&mots) {
-                if !actives.iter().any(|a| *a == f) {
+                if !actives.contains(&f) {
                     actives.push(f);
                 }
             }

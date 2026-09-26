@@ -479,10 +479,10 @@ impl OutputTarget for Airplay2Output {
 
         // Kill daemon process
         let mut proc = self.process.lock().await;
-        if let Some(mut daemon) = proc.take() {
-            if let Some(child) = daemon.child.as_mut() {
-                child.kill().await.ok();
-            }
+        if let Some(mut daemon) = proc.take()
+            && let Some(child) = daemon.child.as_mut()
+        {
+            child.kill().await.ok();
         }
         info!(device = %self.name, "airplay2: stop");
         Ok(())
@@ -578,6 +578,7 @@ fn is_usable_daemon(path: &std::path::Path) -> bool {
 ///      wherever the user extracted the zip/tar;
 ///   2. well-known absolute install locations (Docker image, manual installs);
 ///   3. the current working directory (legacy behaviour).
+///
 /// Returns None if not found on disk (caller then falls back to a PATH probe).
 fn resolve_daemon_path(exe_dir: Option<&std::path::Path>, exe_name: &str) -> Option<String> {
     if let Some(dir) = exe_dir {

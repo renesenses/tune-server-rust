@@ -374,6 +374,9 @@ impl PoigneeServeur {
 /// qui ne réussit la poignée de main que contre son propre miroir n'a rien
 /// prouvé. La preuve, elle, se fait contre une implémentation tierce.
 #[cfg(test)]
+// Banc prêt, pas encore appelé par une épreuve : le retirer perdrait le miroir
+// du répondeur ; le garder en silence est le moindre mal (clippy 1.98).
+#[allow(dead_code)]
 pub(crate) mod repondeur_de_test {
     use super::*;
 

@@ -1295,7 +1295,7 @@ fn i4079_le_gain_continu_de_tune_reste_unitaire_sur_les_sept_rapports() {
         let milieu = &sortie[sortie.len() / 4..sortie.len() * 3 / 4];
         let pire = milieu
             .iter()
-            .map(|&x| (x as f64 / 0.5 - 1.0).abs())
+            .map(|&x| (x / 0.5 - 1.0).abs())
             .fold(0.0f64, f64::max);
         eprintln!("[4079 DC] {} : erreur relative maximale {pire:.9e}", r.nom);
         assert!(

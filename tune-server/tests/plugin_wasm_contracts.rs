@@ -1,5 +1,10 @@
 //! Contrats WASM sérialisés autour de `TUNE_PLUGINS_DIR`.
 
+// Le verrou d'environnement est TENU pendant toute l'épreuve, `.await` compris :
+// c'est lui qui sérialise les tests qui posent des variables d'environnement.
+// `await_holding_lock` décrit ici l'intention même (clippy 1.98).
+#![allow(clippy::await_holding_lock)]
+
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lock_environment() -> std::sync::MutexGuard<'static, ()> {

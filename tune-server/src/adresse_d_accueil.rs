@@ -41,7 +41,7 @@ pub(crate) fn lignes_d_accueil(port: u16, urls: &[String]) -> Vec<String> {
     // à coup sûr depuis la machine elle-même, y compris quand aucune IP de
     // réseau local n'a pu être déterminée.
     let locale = format!("http://localhost:{port}");
-    if !urls.iter().any(|u| *u == locale) {
+    if !urls.contains(&locale) {
         lignes.push(format!("  {locale}  (from this machine only)"));
     }
 

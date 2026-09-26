@@ -99,8 +99,7 @@ fn matches_pattern(event_type: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if pattern.ends_with(".*") {
-        let prefix = &pattern[..pattern.len() - 2];
+    if let Some(prefix) = pattern.strip_suffix(".*") {
         return event_type.starts_with(prefix);
     }
     event_type == pattern

@@ -7,6 +7,11 @@
 //! The converter produces 24-bit signed PCM samples packed as little-endian i32
 //! values in the output byte stream (3 bytes per sample, packed as 4 bytes for
 //! alignment, or as raw 24-bit LE).
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(clippy::needless_range_loop)]
 
 use std::f64::consts::PI;
 

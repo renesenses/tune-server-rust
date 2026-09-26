@@ -84,14 +84,18 @@ fn exige_un_banc_des_deux_natures() {
         BANC_PISTES.iter().map(|(_, n)| *n as i64).sum::<i64>(),
         "le banc et le total attendu ont divergé"
     );
-    assert!(
-        PISTES_NON_LOCALES > 0,
-        "banc sans piste NON LOCALE : « le compte est bon » ne prouverait rien"
-    );
-    assert!(
-        PISTES_LOCALES > 0,
-        "banc sans piste LOCALE : la ventilation n'aurait rien à départager"
-    );
+    const {
+        assert!(
+            PISTES_NON_LOCALES > 0,
+            "banc sans piste NON LOCALE : « le compte est bon » ne prouverait rien"
+        )
+    };
+    const {
+        assert!(
+            PISTES_LOCALES > 0,
+            "banc sans piste LOCALE : la ventilation n'aurait rien à départager"
+        )
+    };
     assert!(
         BANC_PISTES.len() >= 3,
         "le banc est retombé à {} sources : le détecteur perdrait sa portée",

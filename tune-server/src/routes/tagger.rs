@@ -45,7 +45,7 @@ fn get_track_path(state: &AppState, track_id: i64) -> Result<Option<(String, Val
             "SELECT path, title, artist_name, album_title, genre, year FROM tracks WHERE id = $1",
             &[&track_id as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     Ok(row.and_then(|r| {
         let path = r.first()?.as_string()?;
@@ -91,14 +91,14 @@ fn apply_tags_to_file(path: &str, fields: &BatchFields) -> Result<Vec<String>, S
         tag.set_genre(genre.clone());
         changes.push(format!("genre -> {genre}"));
     }
-    if let Some(year) = &fields.year {
-        if let Ok(y) = year.parse::<u16>() {
-            tag.set_date(lofty::tag::items::Timestamp {
-                year: y,
-                ..Default::default()
-            });
-            changes.push(format!("year -> {year}"));
-        }
+    if let Some(year) = &fields.year
+        && let Ok(y) = year.parse::<u16>()
+    {
+        tag.set_date(lofty::tag::items::Timestamp {
+            year: y,
+            ..Default::default()
+        });
+        changes.push(format!("year -> {year}"));
     }
     if let Some(album_artist) = &fields.album_artist {
         tag.insert(lofty::tag::TagItem::new(
@@ -467,7 +467,7 @@ async fn rename_by_pattern(
                 "SELECT path, title, artist_name, album_title, track_number, year FROM tracks WHERE id = $1",
                 &[track_id as &dyn ToSqlValue],
             )
-            .map_err(|e| AppError::internal(e))?;
+            .map_err(AppError::internal)?;
 
         let Some(r) = row else {
             results.push(json!({"track_id": track_id, "error": "Track not found"}));
@@ -579,14 +579,14 @@ async fn fix_encoding(
 
         // Check each text field for mojibake (Latin1 bytes interpreted as UTF-8)
         for field_name in &["title", "artist_name", "album_title", "genre"] {
-            if let Some(val) = info[field_name].as_str() {
-                if let Some(fixed) = try_fix_mojibake(val) {
-                    fixed_fields.push(json!({
-                        "field": field_name,
-                        "old": val,
-                        "new": fixed,
-                    }));
-                }
+            if let Some(val) = info[field_name].as_str()
+                && let Some(fixed) = try_fix_mojibake(val)
+            {
+                fixed_fields.push(json!({
+                    "field": field_name,
+                    "old": val,
+                    "new": fixed,
+                }));
             }
         }
 

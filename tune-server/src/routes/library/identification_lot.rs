@@ -650,7 +650,7 @@ async fn executer_le_lot(state: AppState, task_id: String, albums: Vec<i64>) {
             return;
         }
 
-        if traites % ALBUMS_PAR_ECRITURE == 0 {
+        if traites.is_multiple_of(ALBUMS_PAR_ECRITURE) {
             ecrire_etat(
                 &state.backend,
                 &task_id,

@@ -330,13 +330,12 @@ fn running_in_docker() -> bool {
         return true;
     }
     for cgroup in ["/proc/1/cgroup", "/proc/self/cgroup"] {
-        if let Ok(contents) = std::fs::read_to_string(cgroup) {
-            if contents.contains("docker")
+        if let Ok(contents) = std::fs::read_to_string(cgroup)
+            && (contents.contains("docker")
                 || contents.contains("containerd")
-                || contents.contains("kubepods")
-            {
-                return true;
-            }
+                || contents.contains("kubepods"))
+        {
+            return true;
         }
     }
     false
@@ -2265,17 +2264,17 @@ pub(super) async fn update_install(
     // Prevent concurrent updates
     {
         let phase = state.update_phase.lock().unwrap();
-        if let Some(ref p) = *phase {
-            if !p.starts_with("failed") {
-                return (
-                    StatusCode::CONFLICT,
-                    Json(json!({
-                        "status": "already_in_progress",
-                        "phase": p,
-                    })),
-                )
-                    .into_response();
-            }
+        if let Some(ref p) = *phase
+            && !p.starts_with("failed")
+        {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "status": "already_in_progress",
+                    "phase": p,
+                })),
+            )
+                .into_response();
         }
     }
 
@@ -2392,10 +2391,11 @@ pub(super) async fn update_install(
 
     // Guard: refuse update if .no-auto-update flag file exists
     let working_dir = current_exe.and_then(|p| p.parent().map(|d| d.to_path_buf()));
-    if let Some(ref dir) = working_dir {
-        if dir.join(".no-auto-update").exists() {
-            warn!("update_blocked_no_auto_update_flag");
-            return (
+    if let Some(ref dir) = working_dir
+        && dir.join(".no-auto-update").exists()
+    {
+        warn!("update_blocked_no_auto_update_flag");
+        return (
                 StatusCode::CONFLICT,
                 Json(json!({
                     "status": "blocked",
@@ -2403,7 +2403,6 @@ pub(super) async fn update_install(
                 })),
             )
                 .into_response();
-        }
     }
 
     // Guard: the install stages the new binary next to the running one, so a
@@ -2412,13 +2411,14 @@ pub(super) async fn update_install(
     // that tells the user nothing about what to do (Yacine: two identical
     // failures 55 minutes apart, still on 0.9.42). Probe it up front and hand
     // back the path and the account so the fix is a single chown away.
-    if let Some(ref dir) = working_dir {
-        if let Err(e) = probe_dir_writable(dir) {
-            let user = std::env::var("USER")
-                .or_else(|_| std::env::var("USERNAME"))
-                .unwrap_or_else(|_| "the account running Tune".into());
-            warn!(dir = %dir.display(), user = %user, error = %e, "update_blocked_dir_not_writable");
-            return (
+    if let Some(ref dir) = working_dir
+        && let Err(e) = probe_dir_writable(dir)
+    {
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "the account running Tune".into());
+        warn!(dir = %dir.display(), user = %user, error = %e, "update_blocked_dir_not_writable");
+        return (
                 StatusCode::CONFLICT,
                 Json(json!({
                     "status": "not_writable",
@@ -2430,7 +2430,6 @@ pub(super) async fn update_install(
                 })),
             )
                 .into_response();
-        }
     }
 
     // Guard: don't restart while a library scan is running. A full cold scan of

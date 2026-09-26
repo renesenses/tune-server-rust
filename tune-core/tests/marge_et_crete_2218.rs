@@ -139,15 +139,21 @@ fn ecrire(out: &mut Vec<u8>, raw: i64, bits: u16) {
 fn depuis_pcm(pcm: &[u8], bits: u16) -> Vec<i64> {
     match bits {
         16 => pcm
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| i64::from(i16::from_le_bytes([b[0], b[1]])))
             .collect(),
         24 => pcm
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|b| i64::from((i32::from_le_bytes([0, b[0], b[1], b[2]])) >> 8))
             .collect(),
         32 => pcm
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|b| i64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]])))
             .collect(),
         _ => unreachable!("profondeur {bits}"),
@@ -1507,11 +1513,11 @@ fn crete_et_overs(p: &EqProfile, sr: u32, signal: &[f32]) -> (f64, u64) {
 fn la_reserve_de_chaque_prereglage_livre_est_la_borne_vraie_4594() {
     let attendu = [
         ("flat", 0.0),
-        ("bass_boost", -13.407_932_007_318_667_19),
-        ("treble_boost", -12.334_241_217_122_317_02),
-        ("loudness", -13.741_067_957_532_147_05),
-        ("rock", -13.653_372_806_391_917_75),
-        ("jazz", -9.629_790_433_680_865_29),
+        ("bass_boost", -13.407_932_007_318_667),
+        ("treble_boost", -12.334_241_217_122_317),
+        ("loudness", -13.741_067_957_532_147),
+        ("rock", -13.653_372_806_391_918),
+        ("jazz", -9.629_790_433_680_865),
         ("classical", 0.0),
     ];
     for (nom, reserve_attendue) in attendu {

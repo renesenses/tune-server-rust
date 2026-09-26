@@ -621,10 +621,10 @@ pub(super) async fn enrich_extended_metadata(State(state): State<AppState>) -> i
                 batch.clear();
             }
         }
-        if !batch.is_empty() {
-            if let Err(e) = meta_repo.set_batch_multi(&batch) {
-                tracing::error!(error = %e, "enrich_metadata_batch_failed");
-            }
+        if !batch.is_empty()
+            && let Err(e) = meta_repo.set_batch_multi(&batch)
+        {
+            tracing::error!(error = %e, "enrich_metadata_batch_failed");
         }
         tracing::info!(total, enriched, "enrich_extended_metadata_complete");
     });
@@ -1044,10 +1044,10 @@ pub(super) async fn enrichment_run(
                 batch.clear();
             }
         }
-        if !batch.is_empty() {
-            if let Err(e) = meta_repo.set_batch_multi(&batch) {
-                tracing::error!(error = %e, "enrichment_run_metadata_batch_failed");
-            }
+        if !batch.is_empty()
+            && let Err(e) = meta_repo.set_batch_multi(&batch)
+        {
+            tracing::error!(error = %e, "enrichment_run_metadata_batch_failed");
         }
         tracing::info!(total, enriched, "enrichment_run_extended_metadata_complete");
     });
@@ -1172,10 +1172,11 @@ fn cleanup_orphan_artwork(
             let path = entry.path();
             if path.is_file() {
                 let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                if !stem.is_empty() && !referenced.contains(stem) {
-                    if std::fs::remove_file(&path).is_ok() {
-                        deleted += 1;
-                    }
+                if !stem.is_empty()
+                    && !referenced.contains(stem)
+                    && std::fs::remove_file(&path).is_ok()
+                {
+                    deleted += 1;
                 }
             }
         }
@@ -1328,8 +1329,7 @@ mod garde_et_quota_2507 {
 
         let (statut, Json(corps)) = gate_enrichment(&etat)
             .await
-            .err()
-            .expect("le onzième geste doit être refusé");
+            .expect_err("le onzième geste doit être refusé");
         assert_eq!(statut, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(corps["code"], MOTIF_QUOTA_EPUISE, "{corps}");
         assert_eq!(

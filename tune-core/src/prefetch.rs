@@ -271,6 +271,8 @@ impl PrefetchEngine {
     }
 
     /// Internal: download, decode, and buffer a streaming track.
+    // Un argument par colonne écrite ; une structure changerait tous les appelants pour un gain de forme (clippy 1.98).
+    #[allow(clippy::too_many_arguments)]
     async fn do_prefetch(
         &self,
         _db: Arc<dyn DbBackend>,
@@ -490,7 +492,7 @@ impl PrefetchEngine {
                     pcm_data,
                     format: "wav".into(),
                     sample_rate: actual_sr,
-                    bit_depth: actual_bd as u16,
+                    bit_depth: actual_bd,
                     channels: actual_ch as u16,
                     duration_ms: actual_duration,
                     title: track_title,

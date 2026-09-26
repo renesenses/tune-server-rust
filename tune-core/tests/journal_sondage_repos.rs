@@ -204,8 +204,7 @@ fn une_panne_durable_se_dit_quelques_fois_puis_se_recapitule() {
     // plafond d'une censure.
     let dernier = texte
         .lines()
-        .filter(|l| l.contains("idle_poll_still_failing"))
-        .next_back()
+        .rfind(|l| l.contains("idle_poll_still_failing"))
         .expect("il doit rester au moins un récapitulatif");
     assert!(
         dernier.contains("echecs=64"),

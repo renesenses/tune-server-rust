@@ -160,7 +160,7 @@ impl PodcastService {
         country: &str,
         language: Option<&str>,
     ) -> Result<Vec<Podcast>, String> {
-        let limit = limit.min(50).max(1);
+        let limit = limit.clamp(1, 50);
         let cc = if country.is_empty() { "US" } else { country };
         let query_lower = query.to_lowercase();
         let lang = language.unwrap_or("");
@@ -172,10 +172,10 @@ impl PodcastService {
         let cache_key = format!("{cc}:{lang}:{query_lower}:{limit}");
         {
             let guard = cache.lock().await;
-            if let Some((ts, data)) = guard.get(&cache_key) {
-                if ts.elapsed() < Duration::from_secs(300) {
-                    return Ok(data.clone());
-                }
+            if let Some((ts, data)) = guard.get(&cache_key)
+                && ts.elapsed() < Duration::from_secs(300)
+            {
+                return Ok(data.clone());
             }
         }
 
@@ -674,10 +674,11 @@ impl PodcastService {
 
         {
             let guard = cache.lock().await;
-            if let Some((ts, data)) = guard.get(&cache_key) {
-                if ts.elapsed() < TOP_CACHE_TTL && !data.is_empty() {
-                    return Ok(data.clone());
-                }
+            if let Some((ts, data)) = guard.get(&cache_key)
+                && ts.elapsed() < TOP_CACHE_TTL
+                && !data.is_empty()
+            {
+                return Ok(data.clone());
             }
         }
 

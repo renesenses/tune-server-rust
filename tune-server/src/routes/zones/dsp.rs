@@ -215,10 +215,10 @@ pub(super) async fn convolver_response(
     let fingerprint = format!("{ir_path}|{}|{mtime}", meta.len());
 
     let cache = CONVOLVER_RESPONSE_CACHE.get_or_init(Default::default);
-    if let Some((fp, body)) = cache.lock().expect("convolver cache poisoned").get(&id) {
-        if *fp == fingerprint {
-            return Json(body.clone()).into_response();
-        }
+    if let Some((fp, body)) = cache.lock().expect("convolver cache poisoned").get(&id)
+        && *fp == fingerprint
+    {
+        return Json(body.clone()).into_response();
     }
 
     // ~200 log-spaced points × up to 128k taps of f64 accumulation: fast, but
@@ -439,44 +439,42 @@ pub(super) async fn set_zone_dsp(
 ) -> impl IntoResponse {
     // Authorize the whole request before any write: EQ is free, crossfeed is
     // separately Premium. A mixed request must never partially mutate EQ.
-    if body.get("crossfeed").is_some() {
-        if let Err(resp) = crate::premium_guard::require_premium_localise(
+    if body.get("crossfeed").is_some()
+        && let Err(resp) = crate::premium_guard::require_premium_localise(
             &state.license,
             tune_core::license::Feature::Crossfeed,
             &headers,
         )
         .await
-        {
-            return resp;
-        }
+    {
+        return resp;
     }
 
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
 
     for (key, plugin) in [("eq_profile", "equalizer"), ("crossfeed", "crossfeed")] {
-        if body.get(key).is_some() {
-            if let Err(response) = crate::premium_audio_plugins::require_installed(&state, plugin) {
-                return response;
-            }
+        if body.get(key).is_some()
+            && let Err(response) = crate::premium_audio_plugins::require_installed(&state, plugin)
+        {
+            return response;
         }
     }
     // Handle eq_profile if present
     let mut eq_applique_a_chaud = false;
     let mut eq_portee: Option<tune_core::orchestrator::PorteeDuReglage> = None;
-    if let Some(eq_val) = body.get("eq_profile") {
-        if let Ok(profile) =
+    if let Some(eq_val) = body.get("eq_profile")
+        && let Ok(profile) =
             serde_json::from_value::<tune_core::audio::eq::EqProfile>(eq_val.clone())
-        {
-            let key = format!("zone_{id}_eq_profile");
-            let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
-            // Persister ne suffit pas : sans ceci le reglage n'atteint le son
-            // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
-            // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
-            // ne le faisait pas.
-            let portee = state.orchestrator.apply_eq_change_portee(id).await;
-            eq_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
-            eq_portee = Some(portee);
-        }
+    {
+        let key = format!("zone_{id}_eq_profile");
+        let _ = settings.set(&key, &serde_json::to_string(&profile).unwrap_or_default());
+        // Persister ne suffit pas : sans ceci le reglage n'atteint le son
+        // qu'a la piste SUIVANTE sur une zone locale (#1725). `POST
+        // /zones/{id}/eq` le fait deja ; cette route ecrit la MEME cle et
+        // ne le faisait pas.
+        let portee = state.orchestrator.apply_eq_change_portee(id).await;
+        eq_applique_a_chaud = portee == tune_core::orchestrator::PorteeDuReglage::Immediate;
+        eq_portee = Some(portee);
     }
 
     // Handle crossfeed sub-object if present (local-output headphone effect).

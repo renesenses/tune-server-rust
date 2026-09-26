@@ -170,10 +170,10 @@ pub extern "C" fn tune_server_stop() -> i32 {
             return -1;
         }
         // Take the sender so it is cleared for the next start/stop cycle.
-        if let Ok(mut guard) = SHUTDOWN_TX.lock() {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(true);
-            }
+        if let Ok(mut guard) = SHUTDOWN_TX.lock()
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(true);
         }
         0
     })
@@ -241,10 +241,12 @@ async fn run_server(
     use tune_server::state::AppState;
 
     // Build config
-    let mut config = TuneConfig::default();
-    config.db_path = db_path;
-    config.port = port;
-    config.music_dirs = music_dirs;
+    let mut config = TuneConfig {
+        db_path,
+        port,
+        music_dirs,
+        ..Default::default()
+    };
     if let Some(ref wd) = web_dir {
         config.web_dir = wd.clone();
     }

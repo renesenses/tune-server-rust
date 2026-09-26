@@ -171,36 +171,36 @@ fn build_facet_conditions(
             params.push(SqlValue::Text(format!("%\"{g}\"%")));
         }
     }
-    if exclude != "year" {
-        if let Some(c) = ph.in_list("t.year", sel.years.len()) {
-            conds.push(c);
-            for v in &sel.years {
-                params.push(SqlValue::Int(*v));
-            }
+    if exclude != "year"
+        && let Some(c) = ph.in_list("t.year", sel.years.len())
+    {
+        conds.push(c);
+        for v in &sel.years {
+            params.push(SqlValue::Int(*v));
         }
     }
-    if exclude != "format" {
-        if let Some(c) = ph.in_list_ci("t.format", sel.formats.len()) {
-            conds.push(c);
-            for v in &sel.formats {
-                params.push(SqlValue::Text(v.clone()));
-            }
+    if exclude != "format"
+        && let Some(c) = ph.in_list_ci("t.format", sel.formats.len())
+    {
+        conds.push(c);
+        for v in &sel.formats {
+            params.push(SqlValue::Text(v.clone()));
         }
     }
-    if exclude != "sample_rate" {
-        if let Some(c) = ph.in_list("t.sample_rate", sel.sample_rates.len()) {
-            conds.push(c);
-            for v in &sel.sample_rates {
-                params.push(SqlValue::Int(*v));
-            }
+    if exclude != "sample_rate"
+        && let Some(c) = ph.in_list("t.sample_rate", sel.sample_rates.len())
+    {
+        conds.push(c);
+        for v in &sel.sample_rates {
+            params.push(SqlValue::Int(*v));
         }
     }
-    if exclude != "bit_depth" {
-        if let Some(c) = ph.in_list("t.bit_depth", sel.bit_depths.len()) {
-            conds.push(c);
-            for v in &sel.bit_depths {
-                params.push(SqlValue::Int(*v));
-            }
+    if exclude != "bit_depth"
+        && let Some(c) = ph.in_list("t.bit_depth", sel.bit_depths.len())
+    {
+        conds.push(c);
+        for v in &sel.bit_depths {
+            params.push(SqlValue::Int(*v));
         }
     }
     // `source` (colonne `tracks.source`) n'est pas une facette du rail : elle ne
@@ -211,33 +211,33 @@ fn build_facet_conditions(
             params.push(SqlValue::Text(v.clone()));
         }
     }
-    if exclude != "label" {
-        if let Some(c) = ph.or_like_ci("t.label", sel.labels.len()) {
-            conds.push(c);
-            for v in &sel.labels {
-                params.push(SqlValue::Text(format!("%{v}%")));
-            }
+    if exclude != "label"
+        && let Some(c) = ph.or_like_ci("t.label", sel.labels.len())
+    {
+        conds.push(c);
+        for v in &sel.labels {
+            params.push(SqlValue::Text(format!("%{v}%")));
         }
     }
     // `composer` est une facette à part entière : comme les autres, elle ne
     // doit pas se filtrer elle-même, sinon sélectionner « Bach » ne laisserait
     // plus que « Bach » dans la liste des compositeurs.
-    if exclude != "composer" {
-        if let Some(c) = ph.or_like_ci("t.composer", sel.composers.len()) {
-            conds.push(c);
-            for v in &sel.composers {
-                params.push(SqlValue::Text(format!("%{v}%")));
-            }
+    if exclude != "composer"
+        && let Some(c) = ph.or_like_ci("t.composer", sel.composers.len())
+    {
+        conds.push(c);
+        for v in &sel.composers {
+            params.push(SqlValue::Text(format!("%{v}%")));
         }
     }
     // CRD-6 : « instrument » est une facette à part entière — elle ne se filtre
     // pas elle-même — et vient des crédits, pas d'une colonne de `tracks`.
-    if exclude != "instrument" {
-        if let Some(c) = ph.in_list_ci("tc.instrument", sel.instruments.len()) {
-            conds.push(tune_core::db::facet_filter::instrument_exists(engine, &c));
-            for v in &sel.instruments {
-                params.push(SqlValue::Text(v.clone()));
-            }
+    if exclude != "instrument"
+        && let Some(c) = ph.in_list_ci("tc.instrument", sel.instruments.len())
+    {
+        conds.push(tune_core::db::facet_filter::instrument_exists(engine, &c));
+        for v in &sel.instruments {
+            params.push(SqlValue::Text(v.clone()));
         }
     }
     if exclude != "artist" {
@@ -275,29 +275,29 @@ fn build_facet_conditions(
     // folder-facet endpoint scopes by path prefix on its own, so it passes
     // exclude="folder" to skip this redundant predicate; the flat /facets
     // endpoint (exclude = a real field name) always applies it.
-    if exclude != "folder" {
-        if let Some(fld) = sel.folder.as_deref().filter(|s| !s.is_empty()) {
-            conds.push(format!(
-                "t.file_path LIKE {}{}",
-                ph.take(),
-                tune_core::db::track_repo::like_escape_clause()
-            ));
-            params.push(SqlValue::Text(
-                tune_core::db::track_repo::folder_like_pattern(fld),
-            ));
-        }
+    if exclude != "folder"
+        && let Some(fld) = sel.folder.as_deref().filter(|s| !s.is_empty())
+    {
+        conds.push(format!(
+            "t.file_path LIKE {}{}",
+            ph.take(),
+            tune_core::db::track_repo::like_escape_clause()
+        ));
+        params.push(SqlValue::Text(
+            tune_core::db::track_repo::folder_like_pattern(fld),
+        ));
     }
     // Album rating (profile 1). Tracks inherit their album's rating via a join
     // to `album_ratings`; EXISTS keeps it self-contained on alias `t`.
-    if exclude != "rating" {
-        if let Some(c) = ph.in_list("arr.rating", sel.ratings.len()) {
-            conds.push(format!(
-                "EXISTS (SELECT 1 FROM album_ratings arr \
+    if exclude != "rating"
+        && let Some(c) = ph.in_list("arr.rating", sel.ratings.len())
+    {
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM album_ratings arr \
                  WHERE arr.album_id = t.album_id AND arr.profile_id = 1 AND {c})"
-            ));
-            for v in &sel.ratings {
-                params.push(SqlValue::Int(*v));
-            }
+        ));
+        for v in &sel.ratings {
+            params.push(SqlValue::Int(*v));
         }
     }
     // Manual collection: the resolved album ids are our own i64s (parsed from the
@@ -340,28 +340,28 @@ fn build_facet_conditions(
     // jointures — la liste dispose d'un `JOIN artists`, pas le compteur.
     // L'année d'enregistrement vit sur l'ALBUM, pas sur la piste : jointure par
     // EXISTS pour rester sur l'alias `t`.
-    if exclude != "original_year" {
-        if let Some(c) = ph.in_list("alo.original_year", sel.original_years.len()) {
-            conds.push(format!(
-                "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND {c})"
-            ));
-            for v in &sel.original_years {
-                params.push(SqlValue::Int(*v));
-            }
+    if exclude != "original_year"
+        && let Some(c) = ph.in_list("alo.original_year", sel.original_years.len())
+    {
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM albums alo WHERE alo.id = t.album_id AND {c})"
+        ));
+        for v in &sel.original_years {
+            params.push(SqlValue::Int(*v));
         }
     }
     // Dynamic Range (#2144) : JUMEAU strict du prédicat de
     // `TrackRepo::list_filtered`, tous deux bâtis par `facet_filter` pour que
     // le rail ne puisse pas compter autrement que la liste qu'il filtre.
-    if exclude != "dr" {
-        if let Some(c) = ph.in_list(
+    if exclude != "dr"
+        && let Some(c) = ph.in_list(
             tune_core::db::facet_filter::DR_ALBUM_VALUE,
             sel.dynamic_ranges.len(),
-        ) {
-            conds.push(tune_core::db::facet_filter::dr_album_in(engine, &c));
-            for v in &sel.dynamic_ranges {
-                params.push(SqlValue::Int(*v));
-            }
+        )
+    {
+        conds.push(tune_core::db::facet_filter::dr_album_in(engine, &c));
+        for v in &sel.dynamic_ranges {
+            params.push(SqlValue::Int(*v));
         }
     }
     if exclude != "favorite" {
@@ -377,15 +377,15 @@ fn build_facet_conditions(
             conds.push(c);
         }
     }
-    if exclude != "playlist" {
-        if let Some(c) = ph.in_list_ci("pl.name", sel.playlists.len()) {
-            conds.push(format!(
-                "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
+    if exclude != "playlist"
+        && let Some(c) = ph.in_list_ci("pl.name", sel.playlists.len())
+    {
+        conds.push(format!(
+            "EXISTS (SELECT 1 FROM playlist_tracks pt JOIN playlists pl ON pl.id = pt.playlist_id \
                  WHERE pt.track_id = t.id AND {c})"
-            ));
-            for v in &sel.playlists {
-                params.push(SqlValue::Text(v.clone()));
-            }
+        ));
+        for v in &sel.playlists {
+            params.push(SqlValue::Text(v.clone()));
         }
     }
     if exclude != "untagged" {
@@ -879,10 +879,10 @@ fn genre_facet(
         let n = it.next().and_then(|v| v.as_i64()).unwrap_or(0);
 
         let mut valeurs: Vec<String> = Vec::new();
-        if let Some(json) = tableau.as_deref() {
-            if let Ok(arr) = serde_json::from_str::<Vec<String>>(json) {
-                valeurs.extend(arr.into_iter().filter(|g| !g.trim().is_empty()));
-            }
+        if let Some(json) = tableau.as_deref()
+            && let Ok(arr) = serde_json::from_str::<Vec<String>>(json)
+        {
+            valeurs.extend(arr.into_iter().filter(|g| !g.trim().is_empty()));
         }
         if let Some(g) = colonne.as_deref().filter(|g| !g.trim().is_empty()) {
             valeurs.push(g.to_string());
@@ -897,7 +897,7 @@ fn genre_facet(
         }
     }
     let mut sortie = fusionner_les_casses(brut);
-    sortie.sort_by(|a, b| b.1.cmp(&a.1));
+    sortie.sort_by_key(|a| std::cmp::Reverse(a.1));
     if let Some(n) = limit {
         sortie.truncate(n.max(0) as usize);
     }

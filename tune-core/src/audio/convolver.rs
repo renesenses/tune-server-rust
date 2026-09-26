@@ -1,3 +1,13 @@
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(
+    clippy::needless_range_loop,
+    clippy::manual_repeat_n,
+    clippy::chunks_exact_to_as_chunks
+)]
+
 use crate::audio::dither::quantifier_avec;
 use realfft::num_complex::Complex;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
@@ -127,7 +137,7 @@ impl Convolver {
         let mut num_partitions = 0;
 
         for ch_ir in impulse_response {
-            let n_parts = (ch_ir.len() + block_size - 1) / block_size;
+            let n_parts = ch_ir.len().div_ceil(block_size);
             num_partitions = num_partitions.max(n_parts);
             let mut ch_parts = Vec::with_capacity(n_parts);
 
@@ -859,7 +869,7 @@ mod tests {
         let x: Vec<f32> = (0..1000).map(|n| ((n as f32) * 0.11).sin()).collect();
 
         let attendu = convolution_directe(&x, &h);
-        let sortie = passer_par_lots(&[h.clone()], block, &x, &[37]);
+        let sortie = passer_par_lots(std::slice::from_ref(&h), block, &x, &[37]);
         let latence = block;
         for (n, a) in attendu.iter().enumerate() {
             let obtenu = sortie[latence + n];

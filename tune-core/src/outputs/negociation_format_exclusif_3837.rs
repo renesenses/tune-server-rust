@@ -401,7 +401,7 @@ mod tests {
                     candidat.est_recevable(),
                     "{candidat} ne serait pas sérialisé par pop_pcm_bytes"
                 );
-                assert!(matches!(candidat.octets_par_echantillon(), 2 | 3 | 4));
+                assert!(matches!(candidat.octets_par_echantillon(), 2..=4));
             }
         }
     }

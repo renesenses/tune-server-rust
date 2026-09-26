@@ -1223,6 +1223,10 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
 /// sont désormais séparées, et c'est le NOM qui porte la différence :
 /// - fenêtre complète → `process_responses` / [`traiter_le_flux`] ;
 /// - annonce isolée → [`enregistrer_une_annonce`], qui n'oublie jamais.
+///
+/// La production passe par [`traiter_le_flux`] ; seules les épreuves
+/// l'appellent encore directement.
+#[cfg(test)]
 async fn process_responses(
     state: &Arc<Mutex<ScannerState>>,
     event_tx: &mpsc::Sender<SsdpEvent>,
@@ -1311,17 +1315,16 @@ async fn classer_la_reponse(
     }
     seen_locations.insert(resp.location.clone());
 
-    if let Some(host_str) = host_from_location(&resp.location) {
-        if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
-            if is_virtual_ip(ip) {
-                debug!(
-                    location = %resp.location,
-                    ip = %ip,
-                    "ssdp_response_rejected_virtual_ip_in_location"
-                );
-                return None;
-            }
-        }
+    if let Some(host_str) = host_from_location(&resp.location)
+        && let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>()
+        && is_virtual_ip(ip)
+    {
+        debug!(
+            location = %resp.location,
+            ip = %ip,
+            "ssdp_response_rejected_virtual_ip_in_location"
+        );
+        return None;
     }
 
     // Un appareil est identifié par sa LOCATION, pas par l'UDN de
@@ -1919,7 +1922,7 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
             }
         }
         // Pick highest-scoring candidate
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
         if let Some((ip, _)) = candidates.first() {
             debug!(ip = %ip, method = "interface_enum", "local_ip_detected");
             return Some(*ip);
@@ -1962,10 +1965,10 @@ fn has_192_168_interface() -> bool {
 fn ip_on_virtual_interface(target: Ipv4Addr) -> bool {
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in &ifaces {
-            if let std::net::IpAddr::V4(ip) = iface.ip() {
-                if ip == target {
-                    return is_virtual_interface(&iface.name, ip);
-                }
+            if let std::net::IpAddr::V4(ip) = iface.ip()
+                && ip == target
+            {
+                return is_virtual_interface(&iface.name, ip);
             }
         }
     }

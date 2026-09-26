@@ -1,3 +1,9 @@
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -191,10 +197,10 @@ fn band_tables() -> &'static BandTables {
 /// trame une fois le format vu une première fois.
 pub fn band_center_frequencies(bins: usize, sample_rate: u32, fft_size: usize) -> Arc<[f32]> {
     let key = (bins, sample_rate, fft_size);
-    if let Ok(tables) = band_tables().read() {
-        if let Some(table) = tables.get(&key) {
-            return Arc::clone(table);
-        }
+    if let Ok(tables) = band_tables().read()
+        && let Some(table) = tables.get(&key)
+    {
+        return Arc::clone(table);
     }
 
     let table = compute_band_center_frequencies(bins, sample_rate, fft_size);
@@ -273,16 +279,16 @@ pub fn spectrum_resolution_hz(sample_rate: u32, frames: usize) -> f32 {
 /// par `Arc`, comme la table de fréquences.
 pub fn band_resolved(bins: usize, sample_rate: u32, frames: usize) -> Arc<[bool]> {
     let key = (bins, sample_rate, frames);
-    if let Ok(tables) = resolved_tables().read() {
-        if let Some(table) = tables.get(&key) {
-            return Arc::clone(table);
-        }
+    if let Ok(tables) = resolved_tables().read()
+        && let Some(table) = tables.get(&key)
+    {
+        return Arc::clone(table);
     }
     let table = compute_band_resolved(bins, sample_rate, frames);
-    if let Ok(mut tables) = resolved_tables().write() {
-        if tables.len() < 64 {
-            tables.insert(key, Arc::clone(&table));
-        }
+    if let Ok(mut tables) = resolved_tables().write()
+        && tables.len() < 64
+    {
+        tables.insert(key, Arc::clone(&table));
     }
     table
 }
@@ -316,10 +322,10 @@ type TwiddleTables = RwLock<HashMap<usize, Arc<[(f64, f64)]>>>;
 fn twiddle_table(n: usize) -> Arc<[(f64, f64)]> {
     static TABLES: OnceLock<TwiddleTables> = OnceLock::new();
     let tables = TABLES.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Ok(t) = tables.read() {
-        if let Some(tw) = t.get(&n) {
-            return Arc::clone(tw);
-        }
+    if let Ok(t) = tables.read()
+        && let Some(tw) = t.get(&n)
+    {
+        return Arc::clone(tw);
     }
     let built: Vec<(f64, f64)> = (0..n / 2)
         .map(|j| {
@@ -1133,10 +1139,7 @@ mod tests {
             .unwrap()
             .0;
         // 440 Hz in 32 log-scale bins (20–20000 Hz) should be around bin 10-12
-        assert!(
-            peak_bin >= 8 && peak_bin <= 14,
-            "440Hz peak at bin {peak_bin}"
-        );
+        assert!((8..=14).contains(&peak_bin), "440Hz peak at bin {peak_bin}");
     }
 
     // ------------------------------------------------------------------

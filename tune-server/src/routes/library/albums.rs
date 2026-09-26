@@ -831,15 +831,16 @@ pub(super) async fn album_bio(
         .and_then(|p| p.get("lang").and_then(|v| v.as_str()));
     let stored_ok = super::artists::langue_convient(bio_lang, lang);
 
-    if let Some(ref bio) = album.bio {
-        if !bio.is_empty() && stored_ok {
-            return Json(json!({
-                "album": album.title,
-                "bio": bio,
-                "bio_provenance": prov,
-            }))
-            .into_response();
-        }
+    if let Some(ref bio) = album.bio
+        && !bio.is_empty()
+        && stored_ok
+    {
+        return Json(json!({
+            "album": album.title,
+            "bio": bio,
+            "bio_provenance": prov,
+        }))
+        .into_response();
     }
     // Community album-bio API is keyed by NAME (title + artist) and generated
     // on demand by the cloud — NO MusicBrainz id required, so it works for
@@ -1063,8 +1064,7 @@ fn strip_variant_suffix(title: &str) -> String {
     let lower = title.to_lowercase();
     for pat in VARIANT_PATTERNS {
         if let Some(pos) = lower.find(pat) {
-            let prefix = title[..pos]
-                .trim_end_matches(|c: char| c == '(' || c == '[' || c == '-' || c == ' ');
+            let prefix = title[..pos].trim_end_matches(['(', '[', '-', ' ']);
             if !prefix.is_empty() {
                 return prefix.to_string();
             }
@@ -2624,7 +2624,7 @@ mod tests_editions {
         .await;
         assert_eq!(meta.champs_edites_a_la_main(2).unwrap(), vec!["genre"]);
         // Un album non touché ne porte rien.
-        assert!(meta.get_all(2).unwrap().get(CLE_EDITION_MANUELLE).is_some());
+        assert!(meta.get_all(2).unwrap().contains_key(CLE_EDITION_MANUELLE));
     }
 
     /// 🔴 #4427 — poser le drapeau « compilation » à la main, et qu'il TIENNE.

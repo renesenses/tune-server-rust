@@ -1,3 +1,9 @@
+// Code audio (décodage, analyse, traitement du signal) : les boucles indexées
+// et les découpes par `chunks_exact` y sont gardées telles quelles. Les récrire
+// (`as_chunks`, itérateurs, `repeat_n`) ne changerait rien au son mais toucherait
+// la logique audio pour un gain de forme (clippy 1.98).
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 use lofty::file::AudioFile;
 
 use tracing::{debug, info, warn};
@@ -1269,7 +1275,7 @@ mod tests {
 
     #[test]
     fn waveform_normalize() {
-        let rms = vec![0.5_f64, 1.0, 0.25];
+        let rms = [0.5_f64, 1.0, 0.25];
         let max = rms.iter().cloned().fold(0.0_f64, f64::max);
         let normalized: Vec<f32> = rms.iter().map(|v| (v / max) as f32).collect();
         assert!((normalized[0] - 0.5).abs() < 0.01);
@@ -1333,7 +1339,7 @@ mod tests {
 
     #[test]
     fn moving_average_smoothing() {
-        let data = vec![0.0, 0.0, 10.0, 0.0, 0.0];
+        let data = [0.0, 0.0, 10.0, 0.0, 0.0];
         let window = 3_usize;
         let smoothed: Vec<f64> = (0..data.len())
             .map(|i| {

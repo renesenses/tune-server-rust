@@ -131,10 +131,10 @@ pub fn enrich_identity(device: &mut DiscoveredDevice) {
         }
         None => device.mac_address = arp_lookup(&device.host),
     }
-    if device.manufacturer.as_deref().is_none_or(str::is_empty) {
-        if let Some(mac) = &device.mac_address {
-            device.manufacturer = vendor_for_mac(mac).map(str::to_string);
-        }
+    if device.manufacturer.as_deref().is_none_or(str::is_empty)
+        && let Some(mac) = &device.mac_address
+    {
+        device.manufacturer = vendor_for_mac(mac).map(str::to_string);
     }
 }
 

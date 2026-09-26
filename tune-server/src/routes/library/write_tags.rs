@@ -181,7 +181,7 @@ pub(crate) async fn write_tags_to_files(
                 );
             }
 
-            let track_id = row.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
+            let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
             let file_path = match row.get(1).and_then(|v| v.as_string()) {
                 Some(fp) => fp,
                 None => continue,
@@ -223,53 +223,47 @@ pub(crate) async fn write_tags_to_files(
 
                 // Build update with only fields missing from the file
                 let update = TagUpdate {
-                    title: if current_tags.get("title").map_or(true, |v| v.is_empty()) {
+                    title: if current_tags.get("title").is_none_or(|v| v.is_empty()) {
                         title
                     } else {
                         None
                     },
-                    artist_name: if current_tags.get("artist").map_or(true, |v| v.is_empty()) {
+                    artist_name: if current_tags.get("artist").is_none_or(|v| v.is_empty()) {
                         artist_name
                     } else {
                         None
                     },
-                    album_title: if current_tags.get("album").map_or(true, |v| v.is_empty()) {
+                    album_title: if current_tags.get("album").is_none_or(|v| v.is_empty()) {
                         album_title
                     } else {
                         None
                     },
-                    track_number: if current_tags
-                        .get("tracknumber")
-                        .map_or(true, |v| v.is_empty())
-                    {
+                    track_number: if current_tags.get("tracknumber").is_none_or(|v| v.is_empty()) {
                         track_number
                     } else {
                         None
                     },
-                    disc_number: if current_tags
-                        .get("discnumber")
-                        .map_or(true, |v| v.is_empty())
-                    {
+                    disc_number: if current_tags.get("discnumber").is_none_or(|v| v.is_empty()) {
                         disc_number
                     } else {
                         None
                     },
-                    genre: if current_tags.get("genre").map_or(true, |v| v.is_empty()) {
+                    genre: if current_tags.get("genre").is_none_or(|v| v.is_empty()) {
                         genre
                     } else {
                         None
                     },
-                    composer: if current_tags.get("composer").map_or(true, |v| v.is_empty()) {
+                    composer: if current_tags.get("composer").is_none_or(|v| v.is_empty()) {
                         composer
                     } else {
                         None
                     },
-                    year: if current_tags.get("date").map_or(true, |v| v.is_empty()) {
+                    year: if current_tags.get("date").is_none_or(|v| v.is_empty()) {
                         year
                     } else {
                         None
                     },
-                    comment: if current_tags.get("comment").map_or(true, |v| v.is_empty()) {
+                    comment: if current_tags.get("comment").is_none_or(|v| v.is_empty()) {
                         comment
                     } else {
                         None

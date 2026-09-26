@@ -1759,10 +1759,12 @@ fn la_cadence_de_repos_est_une_duree_murale() {
         super::POLL_INTERVAL_MS,
         super::IDLE_REPOS_POLL_SECS
     );
-    assert!(
-        super::IDLE_REPOS_POLL_TICKS >= 1,
-        "une cadence de repos nulle sonderait en boucle"
-    );
+    const {
+        assert!(
+            super::IDLE_REPOS_POLL_TICKS >= 1,
+            "une cadence de repos nulle sonderait en boucle"
+        )
+    };
 }
 
 /// Un renderer qui répond `Stopped` est sondé à la cadence de repos, pas

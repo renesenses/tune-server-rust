@@ -250,10 +250,10 @@ fn parse_net_view_hosts(output: &str) -> Vec<String> {
     let mut hosts = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("\\\\") {
-            if let Some(name) = rest.split_whitespace().next() {
-                hosts.push(name.to_string());
-            }
+        if let Some(rest) = trimmed.strip_prefix("\\\\")
+            && let Some(name) = rest.split_whitespace().next()
+        {
+            hosts.push(name.to_string());
         }
     }
     hosts.sort();

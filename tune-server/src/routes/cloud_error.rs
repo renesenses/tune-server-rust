@@ -109,10 +109,10 @@ pub fn reponse(
     }
 
     let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(Value::Object(corps))).into_response();
-    if let Some(secs) = retry_after {
-        if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
-            resp.headers_mut().insert(header::RETRY_AFTER, v);
-        }
+    if let Some(secs) = retry_after
+        && let Ok(v) = header::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, v);
     }
     resp
 }
