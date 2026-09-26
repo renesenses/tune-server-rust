@@ -1422,6 +1422,10 @@ mod compensation_reseau_5071_tests;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;
+// Greffons natifs tiers : l'étage casque de la chaîne, avec une vraie
+// bibliothèque native de test.
+#[cfg(test)]
+mod greffon_natif_tiers_tests;
 
 mod resolve_direct;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.

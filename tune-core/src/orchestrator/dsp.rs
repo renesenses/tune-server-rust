@@ -958,9 +958,17 @@ impl PlaybackOrchestrator {
         } else {
             ""
         };
-        format!(
+        let mut empreinte = format!(
             "eq={eq}\u{1f}ir={ir}\u{1f}cf={crossfeed}\u{1f}rg={replaygain}\u{1f}lc={compensation}"
-        )
+        );
+        // Étages natifs tiers : ajoutés seulement quand il y en a, pour que
+        // l'empreinte d'une zone sans greffon tiers reste celle d'avant.
+        let tiers = self.empreinte_des_etages_tiers(zone_id);
+        if !tiers.is_empty() {
+            empreinte.push_str("\u{1f}tiers=");
+            empreinte.push_str(&tiers);
+        }
+        empreinte
     }
 
     /// Retenir le traitement avec lequel le flux `stream_id` a été résolu.
@@ -1644,6 +1652,9 @@ impl PlaybackOrchestrator {
         if self.crossfeed_configure(zone_id).is_some() {
             return Some("crossfeed");
         }
+        if !self.etages_tiers_configures(zone_id).is_empty() {
+            return Some("greffon_natif_tiers");
+        }
         if track_id.is_some_and(|tid| {
             (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
         }) {
@@ -1727,14 +1738,45 @@ impl PlaybackOrchestrator {
         if self.zone_audiophile(zone_id) {
             return None;
         }
-        let (amount, delay_ms) = self.crossfeed_configure(zone_id)?;
+        // L'étage casque porte aussi les greffons natifs tiers de la zone
+        // (`audio::natifs_tiers`) : même garde PURE, même place dans la chaîne.
+        let reglage = self.crossfeed_configure(zone_id);
+        let tiers = self.etages_tiers_configures(zone_id);
+        if reglage.is_none() && tiers.is_empty() {
+            return None;
+        }
         // #5081 — le filtre d'ombre de la tête, éteint par défaut.
-        Some(crate::audio::crossfeed::CrossfeedProcessor::avec_ombre(
-            sample_rate,
-            amount,
-            delay_ms,
-            self.crossfeed_ombre_configuree(zone_id),
-        ))
+        Some(
+            crate::audio::crossfeed::CrossfeedProcessor::composer_avec_ombre(
+                sample_rate,
+                reglage,
+                self.crossfeed_ombre_configuree(zone_id),
+                &tiers,
+            ),
+        )
+    }
+
+    /// Les étages des greffons natifs tiers que la zone demande, SANS regarder
+    /// le mode PURE (comme [`Self::crossfeed_configure`]). Vide sans le
+    /// Premium : un greffon natif tiers n'a jamais de droit gratuit.
+    pub(super) fn etages_tiers_configures(&self, zone_id: i64) -> Vec<(String, serde_json::Value)> {
+        if self
+            .license
+            .as_ref()
+            .is_some_and(|license| !license.premium_snapshot())
+        {
+            return Vec::new();
+        }
+        crate::audio::natifs_tiers::etages_configures(
+            &crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone()),
+            zone_id,
+        )
+    }
+
+    /// Empreinte des étages tiers de la zone, vide sans étage (voir
+    /// `audio::natifs_tiers::empreinte`).
+    pub(super) fn empreinte_des_etages_tiers(&self, zone_id: i64) -> String {
+        crate::audio::natifs_tiers::empreinte(&self.etages_tiers_configures(zone_id))
     }
 
     /// #5081 — l'ombre de la tête du crossfeed de la zone, lue dans la même

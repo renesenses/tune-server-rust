@@ -2432,6 +2432,13 @@ impl PlaybackOrchestrator {
                 empreinte_dsp,
                 compensation.as_ref().map(|c| c.cible_db()),
             );
+            let empreinte_dsp = super::crossfeed_bibliotheque_reseau::empreinte_avec_etages_tiers(
+                empreinte_dsp,
+                &crossfeed
+                    .as_ref()
+                    .map(|_| self.empreinte_des_etages_tiers(req.zone_id))
+                    .unwrap_or_default(),
+            );
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
                 &out_ext,
