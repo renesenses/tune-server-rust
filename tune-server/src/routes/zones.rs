@@ -271,7 +271,7 @@ fn fixed_volume_confirmation_required(zone: &Zone, body: &PatchZone) -> bool {
 /// Une seule définition : la route qui l'écrit, la lecture qui la publie et le
 /// catalogue qui s'y réfère lisent la MÊME chaîne.
 pub(crate) fn cle_identite_effacee(zone_id: i64) -> String {
-    format!("zone_{zone_id}_identite_effacee")
+    tune_core::device_catalog::cle_identite_effacee(zone_id)
 }
 
 /// L'utilisateur a-t-il récusé l'identité DÉTECTÉE de cette zone ?

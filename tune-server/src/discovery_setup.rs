@@ -233,8 +233,10 @@ fn set_zone_online(event_bus: &EventBus, db: &Arc<dyn DbBackend>, device_id: &st
 // Known-renderer persistence (#1126)
 // ---------------------------------------------------------------------------
 
-/// Settings key holding the JSON array of renderers seen at least once via SSDP.
-const KNOWN_RENDERERS_KEY: &str = "known_renderers";
+// Settings key holding the JSON array of renderers seen at least once via SSDP.
+// Relu par `tune_core::device_catalog::resolve_zone_quirks` (#5194) : la
+// constante vit là-bas pour que l'écrivain et le lecteur nomment la même clé.
+use tune_core::device_catalog::KNOWN_RENDERERS_KEY;
 
 /// A DLNA/OpenHome renderer we discovered via SSDP, persisted so it can be
 /// re-probed directly over HTTP at startup (#1126).
