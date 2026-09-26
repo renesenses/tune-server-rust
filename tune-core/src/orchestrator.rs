@@ -1237,6 +1237,13 @@ impl StreamingDsp {
         self.crossfeed.is_some() && self.channels == 2
     }
 
+    /// La cible de la compensation que ce porteur CUIT, en dB — ce que le
+    /// flux publie (`StreamInfo::compensation_db`) quand il est posé sur son
+    /// canal. `None` : aucun étage de compensation.
+    fn compensation_cuite_db(&self) -> Option<f64> {
+        self.compensation.as_ref().map(|c| c.cible_db())
+    }
+
     /// Applique les trois étages EN PLACE.
     ///
     /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin

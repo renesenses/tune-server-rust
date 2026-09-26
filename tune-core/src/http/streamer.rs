@@ -89,6 +89,16 @@ pub struct StreamInfo {
     /// déduction des réglages : le chemin du signal le lit tel quel. `false`
     /// partout ailleurs, y compris sur une piste servie telle quelle.
     pub crossfeed: bool,
+    /// La compensation de niveau (#5071) CUITE dans les octets de ce flux :
+    /// sa cible en dB, lue sur l'étage réellement posé
+    /// (`CompensationReseau::cible_db`).
+    ///
+    /// Même règle que [`Self::crossfeed`] : c'est un fait du flux, posé là où
+    /// il est bâti, et le chemin du signal le lit tel quel au lieu de le
+    /// PRÉVOIR depuis les réglages. `None` quand aucun étage de compensation
+    /// n'entre dans le flux — piste servie telle quelle (cas 3 de #2742),
+    /// sortie locale, PURE, interrupteur coupé, radio, préchargement.
+    pub compensation_db: Option<f64>,
 }
 
 impl StreamInfo {
