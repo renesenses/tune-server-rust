@@ -49,8 +49,6 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
-use crate::db::transaction_du_lot::{ATTENTE_MAX_FIN_DU_LOT, CESSION_MAX, TransactionDuLot};
-
 /// Au-delà, une détention du verrou d'écriture est dite en WARN.
 ///
 /// Une écriture SQLite ordinaire tient le verrou quelques millisecondes ; un
@@ -172,9 +170,6 @@ struct Etat {
     attentes: Mutex<Vec<Prise>>,
     jetons: AtomicU64,
     seuil: Duration,
-    /// Qui a laissé une transaction ouverte, et qui attend qu'elle se ferme
-    /// (voir [`crate::db::transaction_du_lot`]).
-    lot: TransactionDuLot,
 }
 
 impl Etat {
@@ -256,7 +251,6 @@ impl VerrouEcriture {
                 attentes: Mutex::new(Vec::new()),
                 jetons: AtomicU64::new(1),
                 seuil,
-                lot: TransactionDuLot::default(),
             }),
         }
     }
@@ -267,122 +261,14 @@ impl VerrouEcriture {
         self.connexion.clone()
     }
 
-    /// Prendre la connexion d'écriture pour ÉCRIRE.
+    /// Prendre la connexion d'écriture.
     ///
     /// Libre : un `try_lock`, le relevé du détenteur, rien d'autre. Prise :
     /// l'appelant est inscrit parmi les attentes et attend HORS de
     /// l'exécuteur (voir [`attendre_hors_executeur`]).
-    ///
-    /// Si un AUTRE fil a laissé une transaction ouverte sur la connexion — un
-    /// lot de scan entre deux de ses appels — l'appelant attend qu'elle se
-    /// ferme au lieu d'écrire dedans (voir [`crate::db::transaction_du_lot`]).
-    /// Le lot lui cède la place entre deux fichiers
-    /// ([`Self::ceder_aux_ecrivains`]). Au-delà de
-    /// [`ATTENTE_MAX_FIN_DU_LOT`], il écrit comme avant.
     #[track_caller]
     pub fn lock(&self) -> LockResult<EcritureTenue<'_>> {
         let lieu = Location::caller();
-        let debut = Instant::now();
-        let limite = debut + ATTENTE_MAX_FIN_DU_LOT;
-        let mut inscrit = false;
-        loop {
-            let tenue = self.prendre(lieu);
-            let autocommit = match &tenue {
-                Ok(t) => t.is_autocommit(),
-                Err(p) => p.get_ref().is_autocommit(),
-            };
-            let attendre = self.etat.lot.ouverte_par_un_autre(autocommit);
-            if !attendre || Instant::now() >= limite {
-                if inscrit {
-                    self.etat.lot.desinscrire();
-                    let attendu = debut.elapsed();
-                    if attendre {
-                        tracing::warn!(
-                            lieu = %lieu,
-                            attendu_ms = attendu.as_millis() as u64,
-                            "ecriture_sqlite_entre_dans_une_transaction_etrangere"
-                        );
-                    } else if attendu >= Duration::from_millis(10) {
-                        tracing::info!(
-                            lieu = %lieu,
-                            attendu_ms = attendu.as_millis() as u64,
-                            "ecriture_sqlite_a_attendu_la_transaction_du_lot"
-                        );
-                    }
-                }
-                return tenue;
-            }
-            if !inscrit {
-                self.etat.lot.inscrire();
-                inscrit = true;
-            }
-            drop(tenue);
-            attendre_hors_executeur(|| self.etat.lot.attendre_la_fermeture(limite));
-        }
-    }
-
-    /// Prendre la connexion d'écriture pour LIRE, sans attendre la fin d'une
-    /// transaction ouverte par un autre fil : les lectures fortes servent la
-    /// lecture audio (file d'attente, zones) et ne doivent pas patienter
-    /// derrière un lot de scan.
-    #[track_caller]
-    pub fn lock_sans_attendre_le_lot(&self) -> LockResult<EcritureTenue<'_>> {
-        self.prendre(Location::caller())
-    }
-
-    /// Point de cession d'un lot : à appeler par le fil qui tient une
-    /// transaction ouverte, entre deux unités de travail.
-    ///
-    /// Si un écrivain attend la fermeture de la transaction, le lot valide
-    /// ce qu'il a fait (`COMMIT`), laisse passer les écrivains inscrits
-    /// (au plus [`CESSION_MAX`]), puis rouvre sa transaction
-    /// (`BEGIN IMMEDIATE`). Sans écrivain en attente, ou hors de sa propre
-    /// transaction, ne fait rien. Rend `true` s'il a cédé.
-    ///
-    /// Le lot perd son atomicité : ce qu'il a validé avant la cession ne sera
-    /// pas annulé par un `ROLLBACK` ultérieur. Le scan n'en dépend pas — son
-    /// seul `ROLLBACK` suit un `COMMIT` refusé.
-    #[track_caller]
-    pub fn ceder_aux_ecrivains(&self) -> bool {
-        let lieu = Location::caller();
-        if self.etat.lot.en_attente() == 0 {
-            return false;
-        }
-        let debut = Instant::now();
-        {
-            let conn = match self.prendre(lieu) {
-                Ok(c) => c,
-                Err(p) => p.into_inner(),
-            };
-            if conn.is_autocommit() || !self.etat.lot.est_au_fil_courant() {
-                return false;
-            }
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                tracing::warn!(error = %e, lieu = %lieu, "lot_cession_commit_refuse");
-                let _ = conn.execute_batch("ROLLBACK");
-            }
-        }
-        while self.etat.lot.en_attente() > 0 && debut.elapsed() < CESSION_MAX {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        {
-            let conn = match self.prendre(lieu) {
-                Ok(c) => c,
-                Err(p) => p.into_inner(),
-            };
-            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
-                tracing::warn!(error = %e, lieu = %lieu, "lot_cession_begin_refuse");
-            }
-        }
-        tracing::debug!(
-            lieu = %lieu,
-            cede_ms = debut.elapsed().as_millis() as u64,
-            "lot_cede_aux_ecrivains"
-        );
-        true
-    }
-
-    fn prendre(&self, lieu: &'static Location<'static>) -> LockResult<EcritureTenue<'_>> {
         let (garde, empoisonnee) = match self.connexion.try_lock() {
             Ok(g) => (g, false),
             Err(TryLockError::Poisoned(p)) => (p.into_inner(), true),
@@ -467,12 +353,6 @@ impl std::ops::DerefMut for EcritureTenue<'_> {
 
 impl Drop for EcritureTenue<'_> {
     fn drop(&mut self) {
-        // AVANT de rendre la connexion : noter qui laisse une transaction
-        // ouverte, ou signaler qu'elle s'est fermée. Après, un autre fil
-        // pourrait la prendre entre le `BEGIN` et cette inscription.
-        if let Some(g) = self.garde.as_ref() {
-            self.etat.lot.au_rendu(g.is_autocommit());
-        }
         self.garde.take();
         // Le jeton garde d'effacer la prise d'un SUIVANT qui aurait pris le
         // verrou entre la ligne du dessus et celle-ci.

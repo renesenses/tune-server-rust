@@ -170,20 +170,6 @@ pub trait DbBackend: Send + Sync {
     ) -> Result<Option<Vec<SqlValue>>, String> {
         self.query_one(sql, params)
     }
-
-    /// Point de cession d'une longue transaction brute (`BEGIN IMMEDIATE`
-    /// d'un lot de scan), à appeler par son propriétaire entre deux unités
-    /// de travail : si un autre écrivain attend qu'elle se ferme, elle est
-    /// validée, l'écrivain passe, et elle est rouverte. Rend `true` si elle
-    /// a cédé.
-    ///
-    /// SQLite seulement : sa connexion d'écriture est unique, et un autre fil
-    /// y attend la fin de la transaction plutôt que d'écrire dedans
-    /// (`transaction_du_lot.rs`). PostgreSQL ne partage pas de connexion
-    /// entre écrivains : rien à céder.
-    fn ceder_aux_ecrivains(&self) -> bool {
-        false
-    }
 }
 
 /// Transaction handle. Mirror of `DbBackend`'s execution surface, but
@@ -642,10 +628,6 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
         }
     }
 
-    fn ceder_aux_ecrivains(&self) -> bool {
-        self.connection().ceder_aux_ecrivains()
-    }
-
     fn query_many_strong(
         &self,
         sql: &str,
@@ -660,9 +642,7 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
-        // Lecture : ne pas attendre la fin d'un lot de scan ouvert par
-        // un autre fil (voir `VerrouEcriture::lock_sans_attendre_le_lot`).
-        let conn = self.connection().lock_sans_attendre_le_lot().unwrap();
+        let conn = self.connection().lock().unwrap();
         let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
         let col_count = stmt.column_count();
         let mut rows = stmt
@@ -695,9 +675,7 @@ impl DbBackend for crate::db::sqlite::SqliteDb {
             .iter()
             .map(|v| v as &dyn rusqlite::types::ToSql)
             .collect();
-        // Lecture : ne pas attendre la fin d'un lot de scan ouvert par
-        // un autre fil (voir `VerrouEcriture::lock_sans_attendre_le_lot`).
-        let conn = self.connection().lock_sans_attendre_le_lot().unwrap();
+        let conn = self.connection().lock().unwrap();
         let mut stmt = conn.prepare(sql).map_err(|e| format!("prepare: {e}"))?;
         let col_count = stmt.column_count();
         let mut rows = stmt
