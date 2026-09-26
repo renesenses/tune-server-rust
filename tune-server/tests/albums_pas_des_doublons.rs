@@ -11,10 +11,14 @@
 //!   se répare pas, donc celui qu'un simple filtre d'affichage aurait laissé
 //!   détruire.
 //!
-//! Le jeu d'essai n'est pas théorique : `merge-duplicates` groupe par
+//! Le jeu d'essai n'est pas théorique : `merge-duplicates` groupait par
 //! `LOWER(title)` **sans regarder l'artiste**. Deux « Greatest Hits »
-//! d'artistes différents sont donc, pour lui, un doublon à fusionner — la
-//! forme la plus brutale du défaut décrit par l'issue.
+//! d'artistes différents étaient donc, pour lui, un doublon à fusionner — la
+//! forme la plus brutale du défaut décrit par l'issue. Depuis le reste de
+//! #5005, la fusion manuelle partage la logique de la fin de scan et du
+//! nettoyage (`album_doublons::FusionDesDoublons`) : groupes `(LOWER(title),
+//! artist_id)`. Les homonymes d'artistes différents ne sont plus fusionnés du
+//! tout ; les tests de FUSION jouent donc deux doublons d'un même artiste.
 //!
 //! Chaque test porte sa contre-épreuve : on prouve d'abord que le
 //! rapprochement a bien lieu SANS arbitrage, sans quoi un test vert ne dirait
@@ -100,6 +104,16 @@ fn deux_homonymes(state: &Etat) -> (i64, i64) {
     (
         album(state, "Greatest Hits", queen),
         album(state, "Greatest Hits", abba),
+    )
+}
+
+/// Deux lignes du MÊME disque (même artiste, casse différente) : ce que la
+/// fusion rapproche.
+fn deux_doublons(state: &Etat) -> (i64, i64) {
+    let queen = artiste(state, "Queen");
+    (
+        album(state, "Greatest Hits", queen),
+        album(state, "greatest hits", queen),
     )
 }
 
@@ -208,9 +222,8 @@ async fn l_alerte_disparait_pour_la_paire_arbitree() {
 async fn une_autre_paire_n_est_pas_affectee_par_l_arbitrage() {
     let (app, state) = app_et_etat();
     let (a, b) = deux_homonymes(&state);
-    let miles = artiste(&state, "Miles Davis");
     let coltrane = artiste(&state, "John Coltrane");
-    let c = album(&state, "Blue Train", miles);
+    let c = album(&state, "Blue Train", coltrane);
     let d = album(&state, "Blue Train", coltrane);
 
     let (_, avant) = appel(&app, "GET", "/api/v1/library/albums/grouped").await;
@@ -231,10 +244,11 @@ async fn une_autre_paire_n_est_pas_affectee_par_l_arbitrage() {
     );
     assert_eq!(apres["groups"][0]["group_id"].as_str(), Some("Blue Train"));
 
-    // Et la fusion emporte toujours la paire NON arbitrée.
+    // Et la fusion emporte toujours la paire NON arbitrée (même artiste) ; la
+    // paire arbitrée, d'artistes différents, n'est même plus candidate.
     let (_, fusion) = appel(&app, "POST", "/api/v1/library/albums/merge-duplicates").await;
     assert_eq!(fusion["merged"].as_i64(), Some(1), "{fusion}");
-    assert_eq!(fusion["protected"].as_i64(), Some(1));
+    assert_eq!(fusion["protected"].as_i64(), Some(0));
     assert!(album_existe(&state, a) && album_existe(&state, b));
     assert!(
         album_existe(&state, c) ^ album_existe(&state, d),
@@ -251,7 +265,7 @@ async fn une_autre_paire_n_est_pas_affectee_par_l_arbitrage() {
 #[tokio::test]
 async fn sans_arbitrage_la_fusion_supprime_une_ligne() {
     let (app, state) = app_et_etat();
-    let (a, b) = deux_homonymes(&state);
+    let (a, b) = deux_doublons(&state);
 
     let (status, body) = appel(&app, "POST", "/api/v1/library/albums/merge-duplicates").await;
     assert_eq!(status, StatusCode::OK);
@@ -266,7 +280,7 @@ async fn sans_arbitrage_la_fusion_supprime_une_ligne() {
 #[tokio::test]
 async fn la_paire_arbitree_survit_a_la_fusion() {
     let (app, state) = app_et_etat();
-    let (a, b) = deux_homonymes(&state);
+    let (a, b) = deux_doublons(&state);
 
     appel(
         &app,
@@ -283,6 +297,19 @@ async fn la_paire_arbitree_survit_a_la_fusion() {
 
     // Rejouable : une seconde fusion ne grignote pas non plus.
     let (_, body) = appel(&app, "POST", "/api/v1/library/albums/merge-duplicates").await;
+    assert_eq!(body["merged"].as_i64(), Some(0), "{body}");
+    assert!(album_existe(&state, a) && album_existe(&state, b));
+}
+
+/// Reste de #5005 : deux « Greatest Hits » d'artistes différents ne sont plus
+/// fusionnés, même sans arbitrage — le critère est `(LOWER(title),
+/// artist_id)`, celui de la fin de scan et du nettoyage.
+#[tokio::test]
+async fn deux_homonymes_d_artistes_differents_ne_sont_pas_fusionnes() {
+    let (app, state) = app_et_etat();
+    let (a, b) = deux_homonymes(&state);
+    let (status, body) = appel(&app, "POST", "/api/v1/library/albums/merge-duplicates").await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(body["merged"].as_i64(), Some(0), "{body}");
     assert!(album_existe(&state, a) && album_existe(&state, b));
 }

@@ -2,6 +2,8 @@
 /// l'utilisateur, réconciliées sur le modèle des favoris et des masquages.
 pub(crate) mod absorption;
 pub mod album_distinct_repo;
+/// La fusion des albums en double, commune au manuel, au scan et au nettoyage.
+pub mod album_doublons;
 pub mod album_metadata_repo;
 pub mod album_repo;
 pub mod artist_repo;
