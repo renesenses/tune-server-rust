@@ -9,6 +9,12 @@
 //! - **C2** — l'artiste d'un album de compilation est l'artiste d'album
 //!   **tagué** s'il existe, et « Various Artists » seulement à défaut.
 //!
+//! 🔴 Arbitrage du 25/09/2026, qui amende C1 : la balise `COMPILATION=1`
+//! SEULE, sur un album d'un seul artiste, ne suffit plus (« Here & Gone »,
+//! « A Love Supreme, Disc 1 »). LA règle vit dans
+//! `tune_core::library::regle_compilation` ; la balise `COMPILATION=0`, elle,
+//! fait toujours foi. Le nom du fichier est gardé (cible `[[test]]`).
+//!
 //! ## Pourquoi un binaire de test à lui seul, et un seul test dedans
 //!
 //! Leçon déjà payée sept fois par ce dépôt (`panne_sql_journalisee.rs`,
@@ -285,21 +291,125 @@ fn le_tag_decide_et_le_journal_dit_pourquoi() {
     );
 
     // ───────────────────────────────────────────────────────────────────────
-    // Contre-épreuve de C1 : le MÊME coffret sans aucun tag. Le tag est
-    // absent, donc le repli s'applique — et la forme, elle, tranche
-    // « compilation ». C2 garde malgré tout l'artiste d'album tagué.
+    // Le MÊME coffret sans aucun tag. Jusqu'au 25/09/2026, la « forme » (deux
+    // graphies d'artiste d'album) en faisait une compilation. LA règle
+    // (`tune_core::library::regle_compilation`) compte les artistes
+    // PRINCIPAUX : toutes les pistes sont de Fritz Reiner, et ses deux
+    // graphies d'artiste d'album partagent son nom — un seul artiste, pas
+    // une compilation. C'est ce que demandait #3855.
     // ───────────────────────────────────────────────────────────────────────
     let c = jouer(&tmp.path().join("C"), &deux_graphies(None));
     eprintln!("CAS C (#3855, tag absent) — obtenu : {c:?}");
     assert_eq!(c.len(), 1, "sans tag non plus, le dossier reste UN album");
     assert!(
-        c[0].compilation,
-        "sans tag, la forme des dossiers reprend la main — c'est le REPLI de C1"
+        !c[0].compilation,
+        "sans tag, un seul artiste principal : pas une compilation"
     );
 
     // ───────────────────────────────────────────────────────────────────────
-    // Le journal dit POURQUOI. Aujourd'hui, rien ne le dit : c'était déjà au
-    // plan du chantier (phase 1, « Journaliser chaque décision »).
+    // Cas D — « Here & Gone » (David Sanborn, .18 id 10831), 25/09/2026.
+    // Toutes les pistes de David Sanborn (dont une avec un invité), artiste
+    // d'album David Sanborn, et `COMPILATION=1` sur tous les fichiers. La
+    // balise SEULE ne suffit plus : pas une compilation, l'album reste à
+    // David Sanborn.
+    // ───────────────────────────────────────────────────────────────────────
+    let sanborn = |fichier, titre, artiste, numero| Piste {
+        dossier: "Jazz/David Sanborn/2008-Here & Gone",
+        fichier,
+        titre,
+        artiste,
+        album: "Here & Gone",
+        album_artiste: Some("David Sanborn"),
+        tag: Some(true),
+        numero,
+    };
+    let d = jouer(
+        &tmp.path().join("D"),
+        &[
+            sanborn("01.flac", "St. Louis Blues", "David Sanborn", 1),
+            sanborn("02.flac", "Brother Ray", "David Sanborn", 2),
+            sanborn(
+                "03.flac",
+                "I'm Gonna Move to the Outskirts of Town",
+                "David Sanborn feat. Eric Clapton",
+                3,
+            ),
+        ],
+    );
+    eprintln!("CAS D (Here & Gone) — obtenu : {d:?}");
+    assert_eq!(
+        d,
+        vec![Verdict {
+            compilation: false,
+            artiste: "David Sanborn".into(),
+            titre: "Here & Gone".into(),
+        }],
+        "un seul artiste + COMPILATION=1 : la balise seule ne suffit plus"
+    );
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Cas E — « A Love Supreme », deux disques, deux dossiers : le Disc 1
+    // porte `Compilation=1`, le Disc 2 non (.18, ids 10534 / 10520). Les deux
+    // disques d'un même album doivent rendre le MÊME verdict.
+    // ───────────────────────────────────────────────────────────────────────
+    let disque = |dossier, album, tag, fichier, titre, numero| Piste {
+        dossier,
+        fichier,
+        titre,
+        artiste: "John Coltrane",
+        album,
+        album_artiste: Some("John Coltrane"),
+        tag,
+        numero,
+    };
+    let e = jouer(
+        &tmp.path().join("E"),
+        &[
+            disque(
+                "Coltrane/A Love Supreme CD1",
+                "A Love Supreme, Disc 1",
+                Some(true),
+                "01.flac",
+                "Acknowledgement",
+                1,
+            ),
+            disque(
+                "Coltrane/A Love Supreme CD1",
+                "A Love Supreme, Disc 1",
+                Some(true),
+                "02.flac",
+                "Resolution",
+                2,
+            ),
+            disque(
+                "Coltrane/A Love Supreme CD2",
+                "A Love Supreme, Disc 2",
+                None,
+                "01.flac",
+                "Acknowledgement (live)",
+                1,
+            ),
+            disque(
+                "Coltrane/A Love Supreme CD2",
+                "A Love Supreme, Disc 2",
+                None,
+                "02.flac",
+                "Resolution (live)",
+                2,
+            ),
+        ],
+    );
+    eprintln!("CAS E (A Love Supreme) — obtenu : {e:?}");
+    assert!(!e.is_empty());
+    assert!(
+        e.iter()
+            .all(|v| !v.compilation && v.artiste == "John Coltrane"),
+        "les disques d'un même coffret sont cohérents : {e:?}"
+    );
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Le journal dit POURQUOI (phase 1 du chantier, « Journaliser chaque
+    // décision ») — et depuis le 25/09/2026, quand une balise est écartée.
     // ───────────────────────────────────────────────────────────────────────
     let journal = capture.texte();
     eprintln!("---- JOURNAL ----\n{journal}\n---- FIN ----");
@@ -307,13 +417,19 @@ fn le_tag_decide_et_le_journal_dit_pourquoi() {
         journal.contains("compilation_decidee"),
         "le scan doit journaliser sa décision ; journal obtenu :\n{journal}"
     );
+    let motif = |m: &str| {
+        journal.contains(&format!("motif=\"{m}\"")) || journal.contains(&format!("motif={m}"))
+    };
     assert!(
-        journal.contains("motif=\"tag\"") || journal.contains("motif=tag"),
-        "le cas A est décidé PAR LE TAG, et le journal doit le nommer ;\n{journal}"
+        motif("plusieurs_artistes_principaux"),
+        "le cas A est décidé par ses artistes variés, et le journal doit le nommer ;\n{journal}"
     );
     assert!(
-        journal.contains("motif=\"forme_des_dossiers\"")
-            || journal.contains("motif=forme_des_dossiers"),
-        "le cas C est décidé par la FORME, et le journal doit le nommer ;\n{journal}"
+        motif("balise_non"),
+        "le cas B est décidé par `COMPILATION=0`, et le journal doit le nommer ;\n{journal}"
+    );
+    assert!(
+        motif("un_seul_artiste") && journal.contains("balise_ecartee=true"),
+        "le cas D écarte la balise, et le journal doit le dire ;\n{journal}"
     );
 }

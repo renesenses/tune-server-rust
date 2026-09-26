@@ -54,16 +54,16 @@ pub fn build_track_from_metadata_opts(
 ) -> Option<(Track, Option<i64>)> {
     let meta = sf.metadata.as_ref()?;
 
-    // C1 — le tag fait foi, la forme sert de repli. Même règle que
-    // `scan_import::TrackImporter::import` ; cette voie-ci est celle du
-    // surveillant de fichiers.
+    // LA règle (`tune_core::library::regle_compilation`), sur ce seul
+    // fichier quand l'appelant n'a pas la vue du dossier : la balise
+    // `COMPILATION=1` seule ne suffit plus.
     let is_compilation = compilation_override.unwrap_or_else(|| {
-        meta.compilation.unwrap_or_else(|| {
-            meta.album_artist
-                .as_deref()
-                .map(crate::scan_import::is_various_artists)
-                .unwrap_or(false)
-        })
+        let mut seul = tune_core::library::regle_compilation::IndicesCompilation::new();
+        if !meta.artist_from_path {
+            seul.ajouter_piste(meta.album_artist.as_deref(), meta.artist.as_deref());
+        }
+        seul.balise(meta.compilation);
+        seul.juger().compilation
     });
 
     let album_artist_name = if is_compilation {
@@ -1132,6 +1132,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                     tracing::warn!(error = %e, "auto_scan_album_distinct_pairs_reconcile_failed")
                 }
             }
+            // Coffrets automatiques (GO du 25/09/2026) — même passe qu'après
+            // `POST /system/scan`.
+            tune_core::db::coffrets_auto::passe_journalisee(&db, "apres_scan_auto");
         }
 
         info!(
@@ -1785,7 +1788,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                 let dir = std::path::Path::new(&sf.path).parent()?;
                 // Le TAG, en trois etats (C1).
                 let tag = meta.compilation;
-                let mut va_tague = false;
+                // LA regle (25/09/2026), sur la vue du
+                // dossier que la base reconstruit.
+                let mut indices = tune_core::library::regle_compilation::IndicesCompilation::new();
+                indices.balise(tag);
                 let mut artists: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 // La casse d'origine du premier artiste
@@ -1794,9 +1800,6 @@ pub(crate) fn reimporter_fichier_surveillant(
                 let mut premier: Option<String> = None;
                 let mut note = |aa: Option<&str>| {
                     if let Some(a) = aa.map(str::trim).filter(|s| !s.is_empty()) {
-                        if crate::scan_import::is_various_artists(a) {
-                            va_tague = true;
-                        }
                         if artists.insert(a.to_lowercase()) && premier.is_none() {
                             premier = Some(a.to_string());
                         }
@@ -1806,24 +1809,25 @@ pub(crate) fn reimporter_fichier_surveillant(
                 // une balise : il ne compte pas.
                 if !meta.artist_from_path {
                     note(meta.album_artist.as_deref());
+                    indices.ajouter_piste(meta.album_artist.as_deref(), meta.artist.as_deref());
                 }
                 let siblings = track_repo
                     .siblings_album_artists(&dir.to_string_lossy())
                     .ok()?;
-                for (fp, aa) in &siblings {
+                for (fp, aa, artiste) in &siblings {
                     // Direct children only (exclude
                     // sub-folders sharing the prefix).
                     if std::path::Path::new(fp).parent() != Some(dir) {
                         continue;
                     }
                     note(aa.as_deref());
+                    indices.ajouter_piste(aa.as_deref(), artiste.as_deref());
                 }
                 let unique = if artists.len() == 1 { premier } else { None };
-                // C1 : le tag tranche s'il existe ; sinon la forme.
-                Some((Some(tag.unwrap_or(va_tague || artists.len() >= 2)), unique))
+                Some((Some(indices.juger().compilation), unique))
             })
             .unwrap_or((None, None));
-        let Some((track, album_id)) = build_track_from_metadata_opts(
+        let Some((mut track, mut album_id)) = build_track_from_metadata_opts(
             sf,
             &artist_repo,
             &album_repo,
@@ -1834,6 +1838,14 @@ pub(crate) fn reimporter_fichier_surveillant(
             tracing::warn!(path = %sf.path, "watcher_track_skipped_no_metadata");
             continue;
         };
+
+        // L'édition manuelle prime sur les balises
+        // (écran « Modifier », GO du 25/09/2026) : le
+        // fichier réenregistré garde sa place, son
+        // titre et son artiste tenus à la main.
+        if tune_core::db::edition_album::Tenues::charger(db).appliquer(&mut track) {
+            album_id = track.album_id;
+        }
 
         // The hash is only a candidate selector. The
         // watcher is allowed to skip solely after a

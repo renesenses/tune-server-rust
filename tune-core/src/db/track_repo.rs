@@ -2732,22 +2732,26 @@ impl TrackRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
-    /// `(file_path, album_artist)` of every track whose file path begins with
-    /// `dir_prefix`. Used by the file-watcher to decide compilation status for a
-    /// single re-imported file from its already-scanned siblings — a folder with
-    /// 2+ distinct album_artists is a various-artists compilation (JP Borderies).
-    /// The caller filters to direct children of the folder.
+    /// `(file_path, album_artist, artiste de la piste)` of every track whose
+    /// file path begins with `dir_prefix`. Used by the file-watcher to decide
+    /// compilation status for a single re-imported file from its
+    /// already-scanned siblings, by LA règle
+    /// ([`crate::library::regle_compilation`]) — JP Borderies. The caller
+    /// filters to direct children of the folder.
     pub fn siblings_album_artists(
         &self,
         dir_prefix: &str,
-    ) -> Result<Vec<(String, Option<String>)>, TuneError> {
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, TuneError> {
         let ph = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
         let esc = like_escape_clause();
-        let sql =
-            format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}{esc}");
+        let sql = format!(
+            "SELECT t.file_path, t.album_artist, ar.name FROM tracks t \
+             LEFT JOIN artists ar ON ar.id = t.artist_id \
+             WHERE t.file_path LIKE {ph}{esc}"
+        );
         // Même contrat que `folder_like_pattern` : le préfixe est du texte, le
         // `%` final est le seul joker.
         let like = format!("{}%", echapper_jokers_like(dir_prefix));
@@ -2758,7 +2762,8 @@ impl TrackRepo {
             .filter_map(|c| {
                 let fp = c.first().and_then(|v| v.as_string())?;
                 let aa = c.get(1).and_then(|v| v.as_string());
-                Some((fp, aa))
+                let artiste = c.get(2).and_then(|v| v.as_string());
+                Some((fp, aa, artiste))
             })
             .collect())
     }

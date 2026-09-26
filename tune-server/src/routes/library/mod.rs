@@ -18,6 +18,9 @@ pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
+// Le mode « Modifier » de la fiche album (GO du 25/09/2026).
+mod edition;
+mod edition_balises;
 mod enrich;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
 mod exemplaires;
@@ -289,6 +292,10 @@ pub fn router() -> Router<AppState> {
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),
         )
+        // Les coffrets RÉUNIS — l'onglet « Coffrets » de la Bibliothèque — et
+        // le geste qui défait un coffret automatique (GO du 25/09/2026).
+        .route("/coffrets", get(albums::lister_coffrets))
+        .route("/coffrets/{id}/defaire", post(albums::defaire_coffret))
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
@@ -301,6 +308,24 @@ pub fn router() -> Router<AppState> {
         .route(
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),
+        )
+        // Le mode « Modifier » de la fiche album (GO du 25/09/2026) : champs,
+        // mode de compilation, disques (ordre, noms, pistes), et les deux
+        // gestes sur les disques d'un coffret.
+        .route(
+            "/albums/{id}/edition",
+            get(edition::lire).put(edition::modifier),
+        )
+        // Tranche 4 : reporter l'édition dans les BALISES des fichiers
+        // (`{ dry_run }` rend le plan sans rien écrire).
+        .route(
+            "/albums/{id}/edition/write-tags",
+            post(edition_balises::ecrire_balises),
+        )
+        .route("/albums/{id}/discs/attach", post(edition::attacher))
+        .route(
+            "/albums/{id}/discs/{number}/detach",
+            post(edition::detacher),
         )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
         // #4907 — le répertoire depuis lequel lire un album.
