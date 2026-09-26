@@ -59,6 +59,16 @@ pub struct ConfigSnapshot {
     /// Key-value settings (sensitive keys excluded).
     pub settings: Vec<(String, String)>,
     /// Playlists with their track lists.
+    ///
+    /// Une entree de `tracks` est une piste de la bibliotheque (retrouvee a la
+    /// restauration par `source` / `source_id`, ou titre + artiste + album,
+    /// puis, depuis #5113, par son empreinte `audio_hash` ; introuvable, elle
+    /// est signalee dans `warnings` avec son `file_path` d'origine),
+    /// ou, depuis #5066, un titre de service (#4922) marque `"kind":
+    /// "service"`, recree tel quel avec `album_source_id` et `cover_url` en
+    /// plus. Les sauvegardes sans `kind` se restaurent comme avant ; un serveur
+    /// anterieur lit un fichier neuf et ignore ses titres de service, faute de
+    /// les trouver dans `tracks` (il les perdait deja a l'export).
     pub playlists: Vec<Value>,
     /// User favorites.
     pub favorites: Vec<Value>,
@@ -420,29 +430,69 @@ fn export_playlists(backend: &Arc<dyn DbBackend>) -> Result<Vec<Value>, String> 
         // porte que `artist_id` et `album_id`. Jointures a GAUCHE, pour qu'une
         // piste sans artiste ni album reste dans la sauvegarde (champ vide).
         // Les cles exportees ne changent pas : c'est ce que lit la restauration.
+        //
+        // #5066 — une ligne peut aussi etre un TITRE DE SERVICE (#4922) :
+        // `track_id` NUL, identite et affichage portes par la ligne elle-meme.
+        // `JOIN tracks` les faisait disparaitre sans un mot ; la jointure est
+        // donc a gauche, et l'ordre est celui de `get_entries` (`id` departage
+        // deux lignes de meme position).
         let track_rows = backend.query_many(
             "SELECT pt.position, t.title, ar.name, al.title, \
-             t.source, t.source_id, t.isrc, t.duration_ms \
+             t.source, t.source_id, t.isrc, t.duration_ms, pt.track_id, \
+             pt.source, pt.source_id, pt.title, pt.artist, pt.album, \
+             pt.album_source_id, pt.duration_ms, pt.cover_url, \
+             t.file_path, t.audio_hash \
              FROM playlist_tracks pt \
-             JOIN tracks t ON t.id = pt.track_id \
+             LEFT JOIN tracks t ON t.id = pt.track_id \
              LEFT JOIN artists ar ON ar.id = t.artist_id \
              LEFT JOIN albums al ON al.id = t.album_id \
-             WHERE pt.playlist_id = ? ORDER BY pt.position",
+             WHERE pt.playlist_id = ? ORDER BY pt.position, pt.id",
             &[&id as &dyn ToSqlValue],
         )?;
 
         let tracks: Vec<Value> = track_rows
             .into_iter()
             .map(|r| {
+                let texte = |i: usize| r.get(i).and_then(|v| v.as_string());
+                let entier = |i: usize| r.get(i).and_then(|v| v.as_i64());
+                let position = entier(0).unwrap_or(0);
+                if entier(8).is_some() {
+                    return serde_json::json!({
+                        "position": position,
+                        "title": texte(1).unwrap_or_default(),
+                        "artist_name": texte(2).unwrap_or_default(),
+                        "album_title": texte(3).unwrap_or_default(),
+                        "source": texte(4).unwrap_or_default(),
+                        "source_id": texte(5).unwrap_or_default(),
+                        "isrc": texte(6),
+                        "duration_ms": entier(7).unwrap_or(0),
+                        // #5113 — de quoi NOMMER la piste si la base cible ne
+                        // la connait pas, et la retrouver par son empreinte.
+                        // Cles en plus : un serveur anterieur les ignore.
+                        "file_path": texte(17),
+                        "audio_hash": texte(18),
+                    });
+                }
+                // Titre de service : `kind` le distingue d'une piste de la
+                // bibliotheque venue d'un service (`tracks.source = qobuz`),
+                // qui se retrouve, elle, par `tracks`. Les cles restent celles
+                // d'une piste (`title`, `artist_name`, `album_title`, `source`,
+                // `source_id`) : un serveur plus ancien lit ce fichier, cherche
+                // la piste dans `tracks`, ne la trouve pas et passe — comme il
+                // le faisait deja d'une piste absente. `source` et `source_id`
+                // ne sont jamais NULS ici : le CHECK de la table l'interdit.
                 serde_json::json!({
-                    "position": r.first().and_then(|v| v.as_i64()).unwrap_or(0),
-                    "title": r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
-                    "artist_name": r.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
-                    "album_title": r.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
-                    "source": r.get(4).and_then(|v| v.as_string()).unwrap_or_default(),
-                    "source_id": r.get(5).and_then(|v| v.as_string()).unwrap_or_default(),
-                    "isrc": r.get(6).and_then(|v| v.as_string()),
-                    "duration_ms": r.get(7).and_then(|v| v.as_i64()).unwrap_or(0),
+                    "position": position,
+                    "kind": "service",
+                    "title": texte(11),
+                    "artist_name": texte(12),
+                    "album_title": texte(13),
+                    "source": texte(9).unwrap_or_default(),
+                    "source_id": texte(10).unwrap_or_default(),
+                    "album_source_id": texte(14),
+                    "isrc": Value::Null,
+                    "duration_ms": entier(15),
+                    "cover_url": texte(16),
                 })
             })
             .collect();
@@ -845,6 +895,45 @@ fn import_playlists(
                 let source_id = t["source_id"].as_str().unwrap_or_default();
                 let position = t["position"].as_i64().unwrap_or(0);
 
+                // #5066 — un titre de service (#4922) ne se cherche pas dans
+                // `tracks` : il se RECREE tel quel, `track_id` NUL, avec ses
+                // colonnes d'affichage. Le CHECK de la table exige `source` et
+                // `source_id` ; une ligne qui ne les a pas est signalee.
+                if t["kind"].as_str() == Some("service") {
+                    let texte = |cle: &str| {
+                        t[cle]
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_string)
+                    };
+                    let (Some(source), Some(source_id)) = (texte("source"), texte("source_id"))
+                    else {
+                        warnings.push(format!(
+                            "playlist '{name}': service track at position {position} \
+                             has no source/source_id, skipped"
+                        ));
+                        continue;
+                    };
+                    backend.execute(
+                        "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, \
+                         title, artist, album, album_source_id, duration_ms, cover_url) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        &[
+                            &pl_id as &dyn ToSqlValue,
+                            &position as &dyn ToSqlValue,
+                            &source as &dyn ToSqlValue,
+                            &source_id as &dyn ToSqlValue,
+                            &texte("title") as &dyn ToSqlValue,
+                            &texte("artist_name") as &dyn ToSqlValue,
+                            &texte("album_title") as &dyn ToSqlValue,
+                            &texte("album_source_id") as &dyn ToSqlValue,
+                            &t["duration_ms"].as_i64() as &dyn ToSqlValue,
+                            &texte("cover_url") as &dyn ToSqlValue,
+                        ],
+                    )?;
+                    continue;
+                }
+
                 let track_row = if !source_id.is_empty() {
                     backend.query_one(
                         "SELECT id FROM tracks WHERE source = ? AND source_id = ?",
@@ -874,24 +963,76 @@ fn import_playlists(
                     )?
                 };
 
-                if let Some(row) = track_row {
-                    let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
-                    backend.execute(
-                        "INSERT INTO playlist_tracks (playlist_id, track_id, position) \
-                         VALUES (?, ?, ?)",
-                        &[
-                            &pl_id as &dyn ToSqlValue,
-                            &track_id as &dyn ToSqlValue,
-                            &position as &dyn ToSqlValue,
-                        ],
-                    )?;
-                }
+                // #5113 — titre et artiste ne la retrouvent pas : son
+                // empreinte, si la sauvegarde la porte et qu'elle designe UNE
+                // seule piste de la cible.
+                let track_row = match track_row {
+                    Some(row) => Some(row),
+                    None => piste_par_empreinte(backend, t)?,
+                };
+
+                let Some(row) = track_row else {
+                    // #5113 — elle etait abandonnee sans un mot : la playlist
+                    // revenait plus courte et rien ne le disait.
+                    let chemin = t["file_path"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("unknown path: backup predates it");
+                    warnings.push(format!(
+                        "playlist '{name}': track at position {position} not found in the \
+                         library, skipped: '{title}' by '{artist}' ({chemin})"
+                    ));
+                    continue;
+                };
+                let track_id = row.first().and_then(|v| v.as_i64()).unwrap_or(0);
+                backend.execute(
+                    "INSERT INTO playlist_tracks (playlist_id, track_id, position) \
+                     VALUES (?, ?, ?)",
+                    &[
+                        &pl_id as &dyn ToSqlValue,
+                        &track_id as &dyn ToSqlValue,
+                        &position as &dyn ToSqlValue,
+                    ],
+                )?;
             }
         }
 
         count += 1;
     }
     Ok(count)
+}
+
+/// #5113 — retrouver une piste de la sauvegarde par son empreinte
+/// `audio_hash` (`scanner/hasher.rs` : taille du fichier + 64 Kio a 25 %).
+///
+/// Deux fichiers qui la partagent sont des copies du MEME contenu : elle
+/// survit a un changement de racine, de machine ou d'etiquettes de dossier, pas
+/// a une retouche des balises (la taille change). N'est retenue qu'une
+/// empreinte de la forme COURANTE (deux recettes anterieures partageaient la
+/// colonne) et qui ne designe qu'UNE piste de la cible : partagee par deux
+/// pistes, elle ne dit pas laquelle, et deviner serait pire que signaler.
+///
+/// Portee : la colonne n'est remplie que par la detection des doublons ; une
+/// base qui ne l'a jamais lancee rend `None`, et la piste est alors signalee.
+fn piste_par_empreinte(
+    backend: &Arc<dyn DbBackend>,
+    t: &Value,
+) -> Result<Option<Vec<SqlValue>>, String> {
+    let Some(empreinte) = t["audio_hash"]
+        .as_str()
+        .filter(|h| crate::scanner::hasher::is_current_audio_hash(h))
+    else {
+        return Ok(None);
+    };
+    let mut lignes = backend.query_many(
+        "SELECT id FROM tracks WHERE audio_hash = ? ORDER BY id LIMIT 2",
+        &[&empreinte.to_string() as &dyn ToSqlValue],
+    )?;
+    Ok(if lignes.len() == 1 {
+        lignes.pop()
+    } else {
+        None
+    })
 }
 
 fn import_favorites(
@@ -1584,6 +1725,47 @@ mod tests {
         scenarios_playlists::une_sauvegarde_existante_se_restaure(&backend_sqlite());
     }
 
+    /// #5066 — playlist mixte (locales + titres de service), de base a base neuve.
+    #[test]
+    fn playlist_mixte_titres_de_service_aller_retour() {
+        scenarios_playlists::une_playlist_mixte_fait_l_aller_retour(
+            &backend_sqlite(),
+            &backend_sqlite(),
+        );
+    }
+
+    /// #5066 — le format neuf d'un titre de service, fige.
+    #[test]
+    fn playlist_sauvegarde_a_titres_de_service_restauree() {
+        scenarios_playlists::une_sauvegarde_a_titres_de_service_se_restaure(&backend_sqlite());
+    }
+
+    /// #5113 — une piste locale absente de la cible est signalee.
+    #[test]
+    fn playlist_piste_locale_absente_signalee() {
+        scenarios_playlists::une_piste_locale_absente_est_signalee(&backend_sqlite());
+    }
+
+    /// #5113 — idem depuis une sauvegarde anterieure, sans `file_path`.
+    #[test]
+    fn playlist_piste_absente_ancienne_sauvegarde_signalee() {
+        scenarios_playlists::une_piste_absente_d_une_ancienne_sauvegarde_est_signalee(
+            &backend_sqlite(),
+        );
+    }
+
+    /// #5113 — repli par empreinte `audio_hash`, unique seulement.
+    #[test]
+    fn playlist_piste_retrouvee_par_empreinte() {
+        scenarios_playlists::une_piste_se_retrouve_par_son_empreinte(&backend_sqlite());
+    }
+
+    /// #5113 — l'export porte `file_path` et `audio_hash`.
+    #[test]
+    fn playlist_export_porte_chemin_et_empreinte() {
+        scenarios_playlists::l_export_porte_le_chemin_et_l_empreinte(&backend_sqlite());
+    }
+
     /// #4983 — temoin SQLite de non-regression : le doublon reste ignore.
     #[test]
     fn favoris_restaures_et_doublon_ignore() {
@@ -1833,6 +2015,7 @@ pub(crate) mod scenarios_zones {
 #[cfg(test)]
 pub(crate) mod scenarios_playlists {
     use super::*;
+    use crate::db::playlist_repo::ServiceEntry;
 
     const PLAYLIST: &str = "Temoin sauvegarde playlist 4927";
     const ARTISTE: &str = "Artiste temoin 4927";
@@ -2076,6 +2259,421 @@ pub(crate) mod scenarios_playlists {
 
         import_config(backend, snapshot).expect("la restauration echoue");
         assert_eq!(pistes_restaurees(backend), ordre.to_vec());
+
+        effacer(backend);
+    }
+
+    /// Les titres de service de la playlist mixte (#4922) : Tidal, Bandcamp,
+    /// Qobuz, et un titre sans aucune metadonnee facultative.
+    fn titres_de_service() -> Vec<(i64, ServiceEntry)> {
+        let titre = |source: &str, id: &str, titre: &str| ServiceEntry {
+            source: source.into(),
+            source_id: id.into(),
+            title: titre.into(),
+            artist: Some(format!("Artiste {source}")),
+            album: Some(format!("Album {source}")),
+            album_source_id: Some(format!("album-{id}")),
+            duration_ms: Some(123_456),
+            cover_url: Some(format!("https://{source}.example/{id}.jpg")),
+        };
+        vec![
+            (1, titre("tidal", "t-5066-1", "Titre Tidal")),
+            (3, titre("bandcamp", "b-5066-2", "Titre Bandcamp")),
+            (5, titre("qobuz", "q-5066-3", "Titre Qobuz")),
+            // Meme position que le precedent : `id` departage (get_entries).
+            (
+                5,
+                ServiceEntry {
+                    source: "qobuz".into(),
+                    source_id: "q-5066-4".into(),
+                    title: "Titre nu".into(),
+                    artist: None,
+                    album: None,
+                    album_source_id: None,
+                    duration_ms: None,
+                    cover_url: None,
+                },
+            ),
+        ]
+    }
+
+    /// Chaque ligne de la playlist, rendue en texte : position, fichier de la
+    /// piste locale (les `tracks.id` different d'une base a l'autre), puis
+    /// toutes les colonnes d'un titre de service. Ordre de `get_entries`.
+    fn lignes(backend: &Arc<dyn DbBackend>) -> Vec<String> {
+        let rendu = |v: &SqlValue| -> String {
+            if v.is_null() {
+                "NUL".into()
+            } else if let Some(s) = v.as_string() {
+                s
+            } else {
+                v.as_i64().map(|i| i.to_string()).unwrap_or_default()
+            }
+        };
+        backend
+            .query_many(
+                "SELECT pt.position, t.file_path, pt.source, pt.source_id, pt.title, \
+                 pt.artist, pt.album, pt.album_source_id, pt.duration_ms, pt.cover_url \
+                 FROM playlist_tracks pt \
+                 JOIN playlists p ON p.id = pt.playlist_id \
+                 LEFT JOIN tracks t ON t.id = pt.track_id \
+                 WHERE p.name = ? ORDER BY pt.position, pt.id",
+                &[&PLAYLIST.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .iter()
+            .map(|r| r.iter().map(rendu).collect::<Vec<_>>().join(" | "))
+            .collect()
+    }
+
+    /// La playlist de `semer`, ses pistes locales aux positions paires, et
+    /// les titres de service intercales aux positions impaires.
+    fn semer_mixte(backend: &Arc<dyn DbBackend>) {
+        semer(backend);
+        let pl = backend
+            .query_one(
+                "SELECT id FROM playlists WHERE name = ?",
+                &[&PLAYLIST.to_string() as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()[0]
+            .as_i64()
+            .unwrap();
+        backend
+            .execute(
+                "UPDATE playlist_tracks SET position = position * 2 WHERE playlist_id = ?",
+                &[&pl as &dyn ToSqlValue],
+            )
+            .unwrap();
+        for (position, e) in titres_de_service() {
+            backend
+                .execute(
+                    "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, \
+                     title, artist, album, album_source_id, duration_ms, cover_url) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    &[
+                        &pl as &dyn ToSqlValue,
+                        &position as &dyn ToSqlValue,
+                        &e.source as &dyn ToSqlValue,
+                        &e.source_id as &dyn ToSqlValue,
+                        &e.title as &dyn ToSqlValue,
+                        &e.artist as &dyn ToSqlValue,
+                        &e.album as &dyn ToSqlValue,
+                        &e.album_source_id as &dyn ToSqlValue,
+                        &e.duration_ms as &dyn ToSqlValue,
+                        &e.cover_url as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    /// #5066 — une playlist MIXTE (pistes locales et titres de service de
+    /// #4922) sauvegardee sur `source`, restauree sur `cible` (base neuve, meme
+    /// bibliotheque, sans la playlist) : elle revient ENTIERE, dans son ordre,
+    /// avec les metadonnees d'affichage de chaque titre de service.
+    ///
+    /// `source` et `cible` peuvent etre la meme base (PostgreSQL de la CI) :
+    /// la playlist y est alors effacee entre l'export et la restauration.
+    pub(crate) fn une_playlist_mixte_fait_l_aller_retour(
+        source: &Arc<dyn DbBackend>,
+        cible: &Arc<dyn DbBackend>,
+    ) {
+        semer_mixte(source);
+        let avant = lignes(source);
+        assert_eq!(avant.len(), 7, "{avant:#?}");
+
+        let snapshot = export_config(source).expect("l'export de la configuration echoue");
+        let exportee = snapshot
+            .playlists
+            .iter()
+            .find(|p| p["name"] == PLAYLIST)
+            .expect("playlist absente de l'export");
+        assert_eq!(
+            exportee["tracks"].as_array().map(Vec::len),
+            Some(7),
+            "des lignes manquent a l'export : {exportee}"
+        );
+
+        // Une sauvegarde voyage en JSON : la restaurer depuis son texte.
+        let texte = serde_json::to_string(&snapshot).unwrap();
+        let snapshot: ConfigSnapshot = serde_json::from_str(&texte).unwrap();
+
+        semer(cible);
+        effacer_la_playlist(cible);
+        let report = import_config(cible, snapshot).expect("la restauration echoue");
+        assert!(report.playlists_restored >= 1, "{report:?}");
+        assert_eq!(lignes(cible), avant);
+
+        effacer(source);
+        effacer(cible);
+    }
+
+    /// #5066 — une sauvegarde a la forme NEUVE, figee ici : un titre de
+    /// service porte `kind: "service"` et ses colonnes d'affichage. Un
+    /// changement de format qui la rendrait illisible echoue ici.
+    pub(crate) fn une_sauvegarde_a_titres_de_service_se_restaure(backend: &Arc<dyn DbBackend>) {
+        semer(backend);
+        effacer_la_playlist(backend);
+
+        let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "0.9.166",
+            "created_at": "2026-09-25T00:00:00Z",
+            "zones": [], "settings": [], "favorites": [], "radio_stations": [],
+            "alarms": [], "eq_presets": [], "room_profiles": [],
+            "playlists": [{
+                "id": 7, "name": PLAYLIST, "description": null,
+                "tracks": [
+                    {"position": 0, "title": "Deuxieme", "artist_name": ARTISTE,
+                     "album_title": ALBUM, "source": "local", "source_id": "",
+                     "isrc": null, "duration_ms": 200000},
+                    {"position": 1, "kind": "service", "title": "Titre Tidal",
+                     "artist_name": "Artiste tidal", "album_title": "Album tidal",
+                     "album_source_id": "album-t-5066-1", "source": "tidal",
+                     "source_id": "t-5066-1", "isrc": null, "duration_ms": 123456,
+                     "cover_url": "https://tidal.example/t-5066-1.jpg"},
+                    {"position": 2, "kind": "service", "title": "Titre nu",
+                     "artist_name": null, "album_title": null,
+                     "album_source_id": null, "source": "qobuz",
+                     "source_id": "q-5066-4", "isrc": null, "duration_ms": null,
+                     "cover_url": null}
+                ]
+            }]
+        }))
+        .unwrap();
+
+        import_config(backend, snapshot).expect("la restauration echoue");
+        assert_eq!(
+            lignes(backend),
+            [
+                "0 | /temoin-4927/album/02.flac | NUL | NUL | NUL | NUL | NUL | NUL | NUL | NUL",
+                "1 | NUL | tidal | t-5066-1 | Titre Tidal | Artiste tidal | Album tidal \
+                 | album-t-5066-1 | 123456 | https://tidal.example/t-5066-1.jpg",
+                "2 | NUL | qobuz | q-5066-4 | Titre nu | NUL | NUL | NUL | NUL | NUL",
+            ]
+        );
+
+        effacer(backend);
+    }
+
+    /// Chemin d'origine de la piste absente : une AUTRE racine que celle de
+    /// la bibliotheque cible, comme apres un changement de machine.
+    const CHEMIN_ABSENT: &str = "/ancienne-racine-5113/Artiste/Album/09 - Absente.flac";
+
+    /// Une sauvegarde de trois pistes locales, dont la 2e n'existe pas dans
+    /// la bibliotheque cible. `milieu` est la piste du milieu.
+    fn sauvegarde_de_trois_locales(milieu: Value) -> ConfigSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "version": "0.9.166",
+            "created_at": "2026-09-26T00:00:00Z",
+            "zones": [], "settings": [], "favorites": [], "radio_stations": [],
+            "alarms": [], "eq_presets": [], "room_profiles": [],
+            "playlists": [{
+                "id": 7, "name": PLAYLIST, "description": null,
+                "tracks": [
+                    {"position": 0, "title": "Deuxieme", "artist_name": ARTISTE,
+                     "album_title": ALBUM, "source": "local", "source_id": "",
+                     "isrc": null, "duration_ms": 200000,
+                     "file_path": "/temoin-4927/album/02.flac"},
+                    milieu,
+                    {"position": 2, "title": "Intro", "artist_name": ARTISTE,
+                     "album_title": ALBUM, "source": "local", "source_id": "",
+                     "isrc": null, "duration_ms": 200000,
+                     "file_path": "/temoin-4927/album/01.flac"}
+                ]
+            }]
+        }))
+        .unwrap()
+    }
+
+    /// Les avertissements de la restauration qui nomment `titre`.
+    fn avertissements_sur<'a>(report: &'a ImportReport, titre: &str) -> Vec<&'a String> {
+        report
+            .warnings
+            .iter()
+            .filter(|w| w.contains(titre))
+            .collect()
+    }
+
+    /// #5113 — trois pistes locales sauvegardees, dont UNE absente de la
+    /// bibliotheque cible : la playlist revient avec les deux autres, dans
+    /// leur ordre, et la piste absente est SIGNALEE dans `warnings` avec son
+    /// titre, son artiste et son chemin d'origine. Elle etait ignoree sans un
+    /// mot : l'utilisateur retrouvait une playlist plus courte.
+    pub(crate) fn une_piste_locale_absente_est_signalee(backend: &Arc<dyn DbBackend>) {
+        semer(backend);
+        effacer_la_playlist(backend);
+
+        let snapshot = sauvegarde_de_trois_locales(serde_json::json!({
+            "position": 1, "title": "Absente 5113", "artist_name": ARTISTE,
+            "album_title": ALBUM, "source": "local", "source_id": "",
+            "isrc": null, "duration_ms": 200000, "file_path": CHEMIN_ABSENT
+        }));
+        let report = import_config(backend, snapshot).expect("la restauration echoue");
+
+        assert_eq!(
+            lignes(backend),
+            [
+                "0 | /temoin-4927/album/02.flac | NUL | NUL | NUL | NUL | NUL | NUL | NUL | NUL",
+                "2 | /temoin-4927/album/01.flac | NUL | NUL | NUL | NUL | NUL | NUL | NUL | NUL",
+            ]
+        );
+        let signales = avertissements_sur(&report, "Absente 5113");
+        assert_eq!(
+            signales.len(),
+            1,
+            "la piste absente n'est pas signalee : {:?}",
+            report.warnings
+        );
+        for attendu in [PLAYLIST, ARTISTE, CHEMIN_ABSENT] {
+            assert!(
+                signales[0].contains(attendu),
+                "l'avertissement ne nomme pas {attendu:?} : {}",
+                signales[0]
+            );
+        }
+        // Les deux pistes retrouvees ne sont pas signalees.
+        assert!(
+            avertissements_sur(&report, "Deuxieme").is_empty(),
+            "{report:?}"
+        );
+        assert!(
+            avertissements_sur(&report, "Intro").is_empty(),
+            "{report:?}"
+        );
+
+        effacer(backend);
+    }
+
+    /// #5113 — une sauvegarde ANTERIEURE ne porte pas `file_path` : la piste
+    /// absente est signalee quand meme, en disant que le chemin est inconnu.
+    pub(crate) fn une_piste_absente_d_une_ancienne_sauvegarde_est_signalee(
+        backend: &Arc<dyn DbBackend>,
+    ) {
+        semer(backend);
+        effacer_la_playlist(backend);
+
+        let snapshot = sauvegarde_de_trois_locales(serde_json::json!({
+            "position": 1, "title": "Absente 5113", "artist_name": ARTISTE,
+            "album_title": ALBUM, "source": "local", "source_id": "",
+            "isrc": null, "duration_ms": 200000
+        }));
+        let report = import_config(backend, snapshot).expect("la restauration echoue");
+
+        assert_eq!(lignes(backend).len(), 2, "{:#?}", lignes(backend));
+        let signales = avertissements_sur(&report, "Absente 5113");
+        assert_eq!(signales.len(), 1, "{:?}", report.warnings);
+        assert!(signales[0].contains(ARTISTE), "{}", signales[0]);
+        assert!(signales[0].contains("unknown path"), "{}", signales[0]);
+
+        effacer(backend);
+    }
+
+    /// Empreinte `audio_hash` (forme courante `sample64k-v2:`) posee sur la
+    /// piste de `chemin`.
+    fn poser_l_empreinte(backend: &Arc<dyn DbBackend>, chemin: &str, empreinte: &str) {
+        backend
+            .execute(
+                "UPDATE tracks SET audio_hash = ? WHERE file_path = ?",
+                &[
+                    &empreinte.to_string() as &dyn ToSqlValue,
+                    &chemin.to_string() as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+
+    /// #5113 — une piste que le titre et l'artiste ne retrouvent plus (son
+    /// titre a change entre les deux bases) mais dont l'EMPREINTE
+    /// `audio_hash` sauvegardee designe UNE seule piste de la cible : elle y
+    /// est rattachee, sans avertissement. Une empreinte que DEUX pistes
+    /// partagent ne tranche pas : la piste est signalee, pas devinee.
+    pub(crate) fn une_piste_se_retrouve_par_son_empreinte(backend: &Arc<dyn DbBackend>) {
+        const EMPREINTE: &str = "sample64k-v2:5113aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const PARTAGEE: &str = "sample64k-v2:5113bbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        semer(backend);
+        effacer_la_playlist(backend);
+        poser_l_empreinte(backend, "/temoin-4927/album/03.flac", EMPREINTE);
+
+        let snapshot = sauvegarde_de_trois_locales(serde_json::json!({
+            "position": 1, "title": "Ancien titre 5113", "artist_name": ARTISTE,
+            "album_title": ALBUM, "source": "local", "source_id": "",
+            "isrc": null, "duration_ms": 200000, "file_path": CHEMIN_ABSENT,
+            "audio_hash": EMPREINTE
+        }));
+        let report = import_config(backend, snapshot).expect("la restauration echoue");
+        assert_eq!(
+            lignes(backend)
+                .iter()
+                .map(|l| l.split(" | ").take(2).collect::<Vec<_>>().join(" | "))
+                .collect::<Vec<_>>(),
+            [
+                "0 | /temoin-4927/album/02.flac",
+                "1 | /temoin-4927/album/03.flac",
+                "2 | /temoin-4927/album/01.flac",
+            ],
+            "la piste n'est pas retrouvee par son empreinte : {:?}",
+            report.warnings
+        );
+        assert!(
+            avertissements_sur(&report, "Ancien titre 5113").is_empty(),
+            "{:?}",
+            report.warnings
+        );
+
+        // Deux pistes de la cible partagent l'empreinte : rien n'est devine.
+        effacer_la_playlist(backend);
+        poser_l_empreinte(backend, "/temoin-4927/album/03.flac", PARTAGEE);
+        poser_l_empreinte(backend, "/temoin-4927/leurre/01.flac", PARTAGEE);
+        let snapshot = sauvegarde_de_trois_locales(serde_json::json!({
+            "position": 1, "title": "Ancien titre 5113", "artist_name": ARTISTE,
+            "album_title": ALBUM, "source": "local", "source_id": "",
+            "isrc": null, "duration_ms": 200000, "file_path": CHEMIN_ABSENT,
+            "audio_hash": PARTAGEE
+        }));
+        let report = import_config(backend, snapshot).expect("la restauration echoue");
+        assert_eq!(lignes(backend).len(), 2, "{:#?}", lignes(backend));
+        assert_eq!(
+            avertissements_sur(&report, "Ancien titre 5113").len(),
+            1,
+            "{:?}",
+            report.warnings
+        );
+
+        effacer(backend);
+    }
+
+    /// #5113 — l'export porte le chemin et l'empreinte de chaque piste de la
+    /// bibliotheque : c'est ce que lisent l'avertissement et le repli par
+    /// empreinte a la restauration.
+    pub(crate) fn l_export_porte_le_chemin_et_l_empreinte(backend: &Arc<dyn DbBackend>) {
+        const EMPREINTE: &str = "sample64k-v2:5113cccccccccccccccccccccccccccc";
+        semer(backend);
+        poser_l_empreinte(backend, "/temoin-4927/album/02.flac", EMPREINTE);
+
+        let snapshot = export_config(backend).expect("l'export de la configuration echoue");
+        let exportee = snapshot
+            .playlists
+            .iter()
+            .find(|p| p["name"] == PLAYLIST)
+            .expect("playlist absente de l'export");
+        let pistes = exportee["tracks"].as_array().unwrap();
+        let chemins: Vec<&str> = pistes
+            .iter()
+            .map(|t| t["file_path"].as_str().unwrap_or("ABSENT"))
+            .collect();
+        assert_eq!(
+            chemins,
+            [
+                "/temoin-4927/album/02.flac",
+                "/temoin-4927/album/03.flac",
+                "/temoin-4927/album/01.flac",
+            ],
+            "{exportee}"
+        );
+        assert_eq!(pistes[0]["audio_hash"], EMPREINTE, "{exportee}");
+        assert!(pistes[1]["audio_hash"].is_null(), "{exportee}");
 
         effacer(backend);
     }
