@@ -690,7 +690,14 @@ CREATE TABLE IF NOT EXISTS zones (
     -- Ne remplace PAS `output_device_id`, qui reste l'identité de la zone :
     -- le réécrire renverrait tous les réglages accrochés sur une clef neuve.
     -- Voir `outputs::identite_de_sortie` pour ce qui a le droit de s'en servir.
-    output_endpoint_id TEXT
+    output_endpoint_id TEXT,
+    -- POURQUOI la zone est masquee (migration 112, #5077) : une valeur de
+    -- `zone_motif_masquage::MotifMasquage` (`suppression_utilisateur`,
+    -- `appareil_ignore`…), et quand. NUL = INCONNU, l'etat de tout masquage
+    -- d'avant la migration : jamais demasque automatiquement. Effaces tous
+    -- deux au demasquage.
+    motif_masquage TEXT,
+    masquee_le TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both

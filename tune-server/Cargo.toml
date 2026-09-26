@@ -1038,6 +1038,13 @@ path = "tests/reseau_local_macos_4949.rs"
 name = "ignorer_un_appareil_ne_masque_que_ses_zones_4957"
 path = "tests/ignorer_un_appareil_ne_masque_que_ses_zones_4957.rs"
 
+# #5077 — le MOTIF du masquage d'une zone par les vraies routes : « Ignorer »
+# pose `appareil_ignore`, « Ne plus ignorer » rend la zone ; une suppression
+# par l'utilisateur ne revient jamais.
+[[test]]
+name = "motif_de_masquage_des_zones_5077"
+path = "tests/motif_de_masquage_des_zones_5077.rs"
+
 # `library/stats` dit si l'import UPnP est complet (plafond, paginations
 # interrompues) — champ additif `upnp_import`.
 [[test]]
