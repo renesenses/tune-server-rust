@@ -296,6 +296,64 @@ mod tests {
         assert_eq!(changements(&mut rx), 1);
     }
 
+    /// #5161 — le lecteur est branché APRÈS le démarrage du greffon : tant
+    /// qu'il n'est pas là, aucune source ; branché, la surveillance le voit,
+    /// la source `cd` apparaît et `sources.changed` part. Débranché, elle
+    /// disparaît ; rebranché, elle revient.
+    #[tokio::test]
+    async fn la_source_cd_apparait_quand_le_lecteur_est_branche_apres_coup() {
+        use crate::lecteur::tests::SystemeFactice;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let bus = Arc::new(EventBus::new());
+        let mut rx = bus.subscribe();
+        let registre = Arc::new(RegistreSources::new());
+        registre.brancher_bus(bus);
+        let systeme = Arc::new(SystemeFactice::default());
+        let lecteur: Arc<dyn LecteurDisque> = Arc::new(systeme.lecteur(Duration::ZERO));
+        let hote = Arc::new(HoteTemoin::default());
+        let routes = EtatRoutes {
+            lecteur: Some(lecteur.clone()),
+            hote: hote.clone(),
+            consultation: Arc::new(Fixture),
+            zones: Arc::default(),
+        };
+        let publication = Arc::new(PublicationSource::new(registre.clone(), &routes));
+        publication.publier_sans_lecteur();
+        let mut s =
+            Surveillant::new(lecteur, hote, routes.zones.clone()).avec_publication(publication);
+
+        s.un_tour().await;
+        s.un_tour().await;
+        assert!(registre.lister().is_empty(), "rien de branché");
+        assert_eq!(changements(&mut rx), 0);
+
+        systeme.branche.store(true, Ordering::SeqCst);
+        s.un_tour().await;
+        let cd = registre.source(ID).expect("la source cd, lecteur branché");
+        assert_eq!(cd.etat, EtatSource::Disque);
+        assert_eq!(cd.detail["pistes"], 10);
+        assert_eq!(changements(&mut rx), 1);
+
+        systeme.branche.store(false, Ordering::SeqCst);
+        systeme
+            .dernier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .debrancher();
+        s.un_tour().await;
+        assert!(registre.lister().is_empty(), "débranché");
+        assert_eq!(changements(&mut rx), 1);
+
+        systeme.branche.store(true, Ordering::SeqCst);
+        s.un_tour().await;
+        assert_eq!(registre.source(ID).unwrap().etat, EtatSource::Disque);
+        assert_eq!(changements(&mut rx), 1);
+    }
+
     /// Sans lecteur : `non_pris_en_charge` si la plateforme n'a pas
     /// d'implémentation, rien du tout sinon (seules les sources présentes).
     #[tokio::test]
