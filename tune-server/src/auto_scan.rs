@@ -2133,13 +2133,20 @@ pub(crate) fn traiter_le_lot_du_surveillant(
     // #4896 — les DOSSIERS d'abord : une piste emportée par son dossier doit
     // avoir son nouveau chemin avant que les événements de fichier du même lot
     // (ceux du PollWatcher, qui voit chaque fichier bouger) ne la cherchent.
-    let a_relire = traiter_les_dossiers_du_lot(
-        db,
-        &dossiers,
-        reglages,
-        &racines_illisibles,
-        dossiers_en_attente,
-    );
+    // La porte n'est prise que s'il y a un dossier à traiter : un lot de
+    // fichiers seuls ne doit pas attendre la fin d'un lot de scan pour rien.
+    let a_relire = if dossiers.is_empty() && dossiers_en_attente.is_empty() {
+        Vec::new()
+    } else {
+        let _porte = porte_du_scan(db);
+        traiter_les_dossiers_du_lot(
+            db,
+            &dossiers,
+            reglages,
+            &racines_illisibles,
+            dossiers_en_attente,
+        )
+    };
     let mut albums_a_realigner = std::collections::HashSet::new();
     for change in fichiers {
         // Same exclusions as the scans (re-read per event batch
@@ -2163,6 +2170,8 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         if tune_core::scanner::is_tune_temp_file(std::path::Path::new(&change.path)) {
             continue;
         }
+        // Un fichier à la fois : un lot de scan en attente passe entre deux.
+        let _porte = porte_du_scan(db);
         match change.change_type {
             ChangeType::Added | ChangeType::Modified => {
                 if let Some(aid) =
@@ -2227,8 +2236,24 @@ pub(crate) fn traiter_le_lot_du_surveillant(
         }
     }
     // #4896 — la ligne album d'un dossier retouché suit ses balises.
-    realigner_albums_sur_les_balises(db, &albums_a_realigner);
+    if !albums_a_realigner.is_empty() {
+        let _porte = porte_du_scan(db);
+        realigner_albums_sur_les_balises(db, &albums_a_realigner);
+    }
     a_relire
+}
+
+/// La porte des lots de scan (`sqlite_write_gate`), prise par le surveillant
+/// autour de chacune de ses écritures — SQLite seulement.
+///
+/// Un lot de scan tient `BEGIN IMMEDIATE` sur l'unique connexion d'écriture à
+/// travers des centaines d'appels. Sans la porte, les écritures du surveillant
+/// entraient dans CETTE transaction, que le pool de lecture ne voit pas :
+/// voir `surveillant_pendant_un_lot_de_scan_tests.rs`. Sous PostgreSQL, le
+/// scan travaille sans transaction de lot : rien à attendre.
+fn porte_du_scan(db: &Arc<dyn DbBackend>) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    (db.engine() == tune_core::db::engine::Engine::Sqlite)
+        .then(crate::sqlite_write_gate::surveillant)
 }
 
 /// Un dossier disparu que ce lot examine : son chemin, les fichiers indexés
@@ -2654,7 +2679,10 @@ pub fn spawn_file_watcher(
                 // these; the watcher never did.
                 if had_changes {
                     let album_repo = AlbumRepo::with_backend(db.clone());
-                    let cleaned = album_repo.delete_orphans().unwrap_or(0);
+                    let cleaned = {
+                        let _porte = porte_du_scan(&db);
+                        album_repo.delete_orphans().unwrap_or(0)
+                    };
                     if cleaned > 0 {
                         info!(cleaned, "watcher_orphan_albums_cleaned");
                     }
@@ -2698,3 +2726,7 @@ mod scan_realigne_tests_4896;
 #[cfg(test)]
 #[path = "scan_metadonnees_etendues_tests_5043.rs"]
 mod scan_metadonnees_etendues_tests_5043;
+
+#[cfg(test)]
+#[path = "surveillant_pendant_un_lot_de_scan_tests.rs"]
+mod surveillant_pendant_un_lot_de_scan_tests;

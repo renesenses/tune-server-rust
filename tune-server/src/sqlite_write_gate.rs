@@ -23,6 +23,20 @@ pub(crate) fn scan_batch() -> MutexGuard<'static, ()> {
     gate().blocking_lock()
 }
 
+/// Le surveillant de fichiers, autour de chacune de ses écritures. À appeler
+/// uniquement depuis `spawn_blocking` (la boucle de `spawn_file_watcher`).
+///
+/// Sans elle, ses écritures s'intercalaient entre deux instructions d'un lot de
+/// scan et entraient dans SA transaction, encore ouverte — alors que le
+/// surveillant relit ensuite par le pool de lecture, qui ne la voit pas. Une
+/// piste réenregistrée à l'identique était supprimée dans le lot, retrouvée
+/// comme « doublon d'elle-même » par ce pool, jamais recréée, et le `COMMIT`
+/// du lot validait la perte ; un dossier renommé voyait son `write_tx` refusé
+/// et ses pistes revenir comme neuves.
+pub(crate) fn surveillant() -> MutexGuard<'static, ()> {
+    gate().blocking_lock()
+}
+
 /// Attente asynchrone : ne bloque pas un worker Tokio pendant un lot de scan.
 pub(crate) async fn user_queue() -> MutexGuard<'static, ()> {
     let started = Instant::now();
