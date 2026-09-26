@@ -206,7 +206,8 @@ pub(super) fn corps_network_health(
 
 pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
-    let zones = repo.list().unwrap_or_default();
+    // #5077 — une zone masquée qui joue reste dans la liste.
+    let zones = super::zones_a_montrer(&state).await;
     // DUP-1 (phase 2) : l'age de la derniere reponse, une requete pour toutes.
     let ages = repo.ages_depuis_derniere_vue().unwrap_or_default();
     let devices = state.scanner.devices().await;

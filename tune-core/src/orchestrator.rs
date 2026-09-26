@@ -219,6 +219,11 @@ fn spawn_paced_levels_forwarder(
         // reste cohérente avec la piste de CE forwarder ; retombée une fois,
         // on revient au cadencement mural pour le reste de la piste.
         let mut horloge_de_sortie_fiable = true;
+        // Fil 1954 — l'horloge a-t-elle été vue, pendant la vie de CE
+        // forwarder, sur la piste qu'il publie ? Tant que non, elle peut
+        // encore décrire la piste PRÉCÉDENTE, et rien ne se jette sur sa foi.
+        // Voir [`attendre_que_la_sortie_joue`].
+        let mut horloge_de_cette_piste = false;
         while let Some(raw) = rx.recv().await {
             // La boucle RAPPORTE la position lue au moment où la zone est
             // effectivement en lecture : c'est cette valeur-là, et aucune autre,
@@ -278,7 +283,20 @@ fn spawn_paced_levels_forwarder(
             };
             if let Some(audible) = audible {
                 let debut_fenetre_ms = position.as_millis() as i64;
-                if debut_fenetre_ms + 2_000 < audible {
+                if audible <= debut_fenetre_ms + FENETRE_DEJA_ENTENDUE_MS {
+                    horloge_de_cette_piste = true;
+                }
+                // 🔴 Fil 1954 — on ne jette une fenêtre « déjà entendue » que
+                // sur une horloge déjà vue sur CETTE piste. Au démarrage d'une
+                // piste, la sortie rapporte encore la fin de la précédente
+                // (180 s pour une piste enchaînée sans blanc manqué, ou
+                // cliquée) jusqu'à ce qu'elle l'ouvre ; une piste pré-
+                // transcodée ou servie du cache livre alors TOUTES ses
+                // fenêtres d'un coup, et toutes partaient à la poubelle :
+                // plus un niveau pour la piste entière. C'est la garde
+                // `reported_advancing` du rattrapage mural ci-dessous, que la
+                // branche d'horloge de #4883 n'avait pas reprise.
+                if horloge_de_cette_piste && debut_fenetre_ms + FENETRE_DEJA_ENTENDUE_MS < audible {
                     // Déjà entendue depuis longtemps : même règle que le
                     // rattrapage ci-dessous, on ne l'émet pas.
                     position += raw.window;
@@ -292,6 +310,7 @@ fn spawn_paced_levels_forwarder(
                     &gen_arc,
                     gen_at_spawn,
                     debut_fenetre_ms,
+                    &mut horloge_de_cette_piste,
                 )
                 .await
                 {
@@ -484,10 +503,31 @@ const HORLOGE_DE_SORTIE_AVANCE_MAX_MS: i64 = 5_000;
 /// cesse de la croire (flux réseau figé, pilote muet).
 const HORLOGE_DE_SORTIE_FIGEE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Retard sur le son au-delà duquel une fenêtre est « déjà entendue » et
+/// n'est pas publiée — la même borne que le rattrapage mural.
+const FENETRE_DEJA_ENTENDUE_MS: i64 = 2_000;
+
+/// Fil 1954 — combien de temps attendre qu'une horloge restée sur la piste
+/// PRÉCÉDENTE revienne sur celle du forwarder (la sortie ouvre la nouvelle
+/// piste et repart de sa position de départ) avant de la lâcher pour le
+/// cadencement mural. L'ouverture d'une sortie locale se compte en
+/// centaines de millisecondes ; cinq secondes couvrent un pilote lent.
+const HORLOGE_D_UNE_AUTRE_PISTE_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Attendre que le son de la sortie locale atteigne `cible_ms` — fil 1908.
 ///
 /// La pause ne compte pas comme une horloge figée : l'attente reprend avec la
 /// lecture, et la fenêtre sort avec le son.
+///
+/// 🔴 Fil 1954 (Didier, 25/09/2026, Windows, album LOCAL) : tant que
+/// `horloge_de_cette_piste` est faux, une horloge DEVANT la fenêtre de plus
+/// de [`FENETRE_DEJA_ENTENDUE_MS`] n'est pas celle de cette piste — c'est la
+/// fin de la précédente, que la sortie rapporte jusqu'à ce qu'elle ouvre la
+/// nouvelle. La croire faisait publier la fenêtre sur-le-champ, et le
+/// forwarder jetait toutes les suivantes comme « déjà entendues ». On attend
+/// qu'elle revienne sur la piste (elle est alors marquée), au plus
+/// [`HORLOGE_D_UNE_AUTRE_PISTE_MAX`], après quoi elle est déclarée
+/// incohérente.
 async fn attendre_que_la_sortie_joue(
     playback: &PlaybackManager,
     zone_id: i64,
@@ -495,9 +535,11 @@ async fn attendre_que_la_sortie_joue(
     gen_arc: &std::sync::atomic::AtomicU64,
     gen_at_spawn: u64,
     cible_ms: i64,
+    horloge_de_cette_piste: &mut bool,
 ) -> AttenteDeSortie {
     let mut dernier_audible = i64::MIN;
     let mut depuis_le_dernier_progres = tokio::time::Instant::now();
+    let debut_de_l_attente = tokio::time::Instant::now();
     loop {
         if playback.current_play_seq(zone_id).await != play_seq
             || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
@@ -509,6 +551,19 @@ async fn attendre_que_la_sortie_joue(
         let Some(audible) = playback.position_audible_ms(zone_id) else {
             return AttenteDeSortie::Jouee;
         };
+        if !*horloge_de_cette_piste {
+            if audible <= cible_ms + FENETRE_DEJA_ENTENDUE_MS {
+                *horloge_de_cette_piste = true;
+            } else {
+                // Fil 1954 — l'horloge d'une autre piste : attendre que la
+                // sortie ouvre celle-ci, sans publier ni jeter.
+                if debut_de_l_attente.elapsed() > HORLOGE_D_UNE_AUTRE_PISTE_MAX {
+                    return AttenteDeSortie::HorlogeIncoherente;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            }
+        }
         let avance = cible_ms - audible;
         if avance <= 0 {
             return AttenteDeSortie::Jouee;
