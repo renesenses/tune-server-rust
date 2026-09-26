@@ -150,6 +150,23 @@ impl Drop for ScanLease<'_> {
 
 static SCAN_GATE: ScanGate = ScanGate::new();
 
+/// Épreuves seulement — le verrou des tests qui dépendent de l'ÉTAT GLOBAL du
+/// scan : le droit de scanner (`SCAN_GATE`) et le compteur de scans en cours
+/// que lit le balayage acoustique sont des globales de PROCESSUS.
+///
+/// Un test qui lance un vrai scan le prend pendant tout le scan ; un test qui
+/// constate « aucun scan ne tourne » ou « mon scan de démarrage a pris le
+/// droit » le prend aussi. Sans lui, ces constats deviennent intermittents dès
+/// que des épreuves de scan réel tournent en parallèle (#5034 en ajoute une
+/// vingtaine : `le_jeton_de_scan_efface_le_balayage_acoustique` et
+/// `le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable` ont rougi
+/// sur Shrek, sans rapport avec leur code).
+#[cfg(test)]
+pub(crate) fn serialiser_les_scans_de_test() -> std::sync::MutexGuard<'static, ()> {
+    static VERROU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    VERROU.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn try_begin_scan() -> Option<ScanLease<'static>> {
     SCAN_GATE.try_acquire()
 }
@@ -217,10 +234,12 @@ mod scan_gate_tests {
     /// mutuellement, et `le_jeton_de_scan_efface_le_balayage_acoustique`
     /// deviendrait intermittent. Tout test qui prend un jeton prend d'abord ce
     /// verrou.
-    static PORTE_SERIALISEE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    ///
+    /// C'est le verrou COMMUN aux épreuves de scan réel
+    /// ([`super::serialiser_les_scans_de_test`]) : un vrai scan lève le même
+    /// compteur.
     fn serialiser() -> std::sync::MutexGuard<'static, ()> {
-        PORTE_SERIALISEE.lock().unwrap_or_else(|e| e.into_inner())
+        super::serialiser_les_scans_de_test()
     }
 
     /// Reproduit directement #2459 : Stop est demandé sur A, puis une seconde

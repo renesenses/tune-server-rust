@@ -341,6 +341,7 @@ fn album_de(db: &Arc<dyn DbBackend>, piste: &Path) -> i64 {
 /// Rend TOUS les écarts d'un coup : un rouge dit chaque cas faux, pas
 /// seulement le premier.
 pub(super) async fn jouer_le_tableau(table: &str, cas: &[Cas], passe: Passe) {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
     let r = racine(&format!("{table}-{passe:?}"));
     let albums: Vec<(PathBuf, Vec<PathBuf>)> = cas
         .iter()
