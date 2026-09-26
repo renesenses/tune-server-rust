@@ -108,7 +108,14 @@ fn scaffold(args: &[String]) -> Result<(), String> {
                 &format!("tune_plugin_{}", template.replace('-', "_")),
                 "PLUGIN_CRATE",
             );
-        for name in ["engine.rs", "sdk.rs"] {
+        // #5081 — le crossfeed porte aussi `ombre.rs` (le filtre d'ombre de
+        // la tête) et les témoins de son moteur ; absents ailleurs, ignorés.
+        for name in [
+            "engine.rs",
+            "sdk.rs",
+            "ombre.rs",
+            "engine_ombre_5081_tests.rs",
+        ] {
             let source = reference.join("src").join(name);
             if source.is_file() {
                 extra_files.push((
