@@ -167,7 +167,17 @@ pub fn empreinte(profil: &EqProfile) -> u64 {
     fnv(tout)
 }
 
-/// Relevées sur le moteur d'avant #5171 (voir l'en-tête).
+/// Relevées sur le moteur d'avant #5171 (voir l'en-tête), sous Linux x86_64.
+///
+/// Elles ne valent QUE là : les coefficients passent par `sin`, `cos`,
+/// `powf` et `exp` de la libm de la plateforme, qui diffèrent au dernier bit
+/// entre glibc, macOS et Windows : en CI, ce même mode sûr rend pour « rock »
+/// 0xd7b6752f009a4453 sur macOS et Windows, et « thierry » y retombe pile.
+/// Aucune ligne de l'arithmétique du mode sûr n'a changé ; l'écart est celui
+/// de la libm. La comparaison aux empreintes est faite sous Linux
+/// x86_64 — la plateforme du relevé, et celle de l'oracle
+/// `verify_dsp_parity.py` ; partout, le mode sûr doit rendre les mêmes octets
+/// qu'un profil sans le champ.
 const EMPREINTES_AVANT_5171: [(&str, u64); 3] = [
     ("thierry", 0x66ea_dc67_81c7_a48d),
     ("rock", 0xa2e0_22bb_675d_0c93),
@@ -188,13 +198,18 @@ fn la_reserve_sure_rend_les_memes_octets_qu_avant_5171() {
         let mut explicite = json;
         explicite["headroom_mode"] = "safe".into();
         let explicite: EqProfile = serde_json::from_value(explicite).unwrap();
-        for (etiquette, p) in [("sans le champ", relu), ("\"safe\"", explicite)] {
-            let e = empreinte(&p);
-            println!("{nom} ({etiquette}) : {e:#018x}");
+        let sans_le_champ = empreinte(&relu);
+        let sure = empreinte(&explicite);
+        println!("{nom} : {sans_le_champ:#018x} (sans le champ) / {sure:#018x} (\"safe\")");
+        assert_eq!(
+            sure, sans_le_champ,
+            "{nom} : « safe » explicite ne rend pas les octets d'un profil sans le champ"
+        );
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             assert_eq!(
-                e, fige,
-                "{nom} ({etiquette}) : la réserve Sûre ne rend plus les octets d'avant #5171 \
-                 ({e:#018x} au lieu de {fige:#018x})"
+                sans_le_champ, fige,
+                "{nom} : la réserve Sûre ne rend plus les octets d'avant #5171 \
+                 ({sans_le_champ:#018x} au lieu de {fige:#018x})"
             );
         }
     }
