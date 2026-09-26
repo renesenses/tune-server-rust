@@ -37,6 +37,67 @@
 
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
+/// Les champs que compare le TEXTE LIBRE d'Oxygen (#5192), dans l'ordre du
+/// prédicat de [`condition_texte_libre`] — et, mot pour mot, ceux que le
+/// client web compare dans sa fenêtre chargée (`OxygenView.svelte`) : le
+/// titre, l'artiste, l'album, le label, et les termes de chemin
+/// (`path_terms`, que `/library/tracks` rend calculés, voir
+/// [`crate::library::full_text_search::termes_de_chemin`]).
+///
+/// Avant #5192, le serveur ne comparait que le titre et l'artiste, le
+/// navigateur les quatre premiers : les deux ne rendaient pas la même liste.
+pub const CHAMPS_DU_TEXTE_LIBRE: [&str; 5] =
+    ["title", "artist_name", "album_title", "label", "path_terms"];
+
+/// Le prédicat du texte libre d'Oxygen, pour la piste d'alias `t` : sous-
+/// chaîne, insensible à la casse et aux accents, de l'un des
+/// [`CHAMPS_DU_TEXTE_LIBRE`].
+///
+/// UNE rédaction pour les trois jumeaux — la liste (`list_filtered`), le
+/// tirage par répertoire (`random_ids_in_folder`) et les effectifs du rail
+/// (`facets::build_conditions`) — qui en tenaient chacun une copie. L'artiste
+/// et l'album passent par sous-requête : le compteur du rail n'a aucune
+/// jointure.
+///
+/// La saisie est LITTÉRALE : ses `%` et `_` sont échappés, comme le navigateur
+/// qui fait un `includes`. Les doubles guillemets sont ôtés (`motif_like`).
+/// Rend le prédicat et les valeurs à lier, dans l'ordre des marqueurs.
+pub fn condition_texte_libre(
+    ph: &mut Placeholders,
+    query: &str,
+) -> (String, Vec<super::backend::SqlValue>) {
+    let motif = format!(
+        "%{}%",
+        super::track_repo::echapper_jokers_like(query.replace('"', "").trim())
+    );
+    let esc = super::track_repo::like_escape_clause();
+    let like = |ph: &mut Placeholders| format!("LIKE LOWER(unaccent({})){esc}", ph.take());
+    let titre = like(ph);
+    let artiste = like(ph);
+    let album = like(ph);
+    let label = like(ph);
+    let chemin = like(ph);
+    // SQLite : la fonction Rust enregistrée, linéaire — l'expression pure
+    // coûte ~60 µs par piste, et ce prédicat parcourt la bibliothèque entière.
+    let termes = match ph.engine() {
+        Engine::Sqlite => {
+            crate::library::full_text_search::sql_sqlite_termes_de_chemin_de_piste("t")
+        }
+        Engine::Postgres => crate::library::full_text_search::sql_termes_de_chemin_de_piste("t"),
+    };
+    let sql = format!(
+        "(LOWER(unaccent(t.title)) {titre} \
+         OR t.artist_id IN (SELECT id FROM artists WHERE LOWER(unaccent(name)) {artiste}) \
+         OR t.album_id IN (SELECT id FROM albums WHERE LOWER(unaccent(title)) {album}) \
+         OR LOWER(unaccent(t.label)) {label} \
+         OR LOWER(unaccent({termes})) {chemin})"
+    );
+    let valeurs = (0..CHAMPS_DU_TEXTE_LIBRE.len())
+        .map(|_| super::backend::SqlValue::Text(motif.clone()))
+        .collect();
+    (sql, valeurs)
+}
+
 /// Générateur de marqueurs positionnels, partagé par les DEUX constructeurs de
 /// prédicats de facettes (`TrackRepo::list_filtered` et
 /// `routes::library::facets::build_conditions`), pour que la liste filtrée et
@@ -59,6 +120,11 @@ impl Placeholders {
             engine,
             next: next.max(1),
         }
+    }
+
+    /// Le moteur pour lequel ces marqueurs sont écrits.
+    pub fn engine(&self) -> Engine {
+        self.engine
     }
 
     /// Indice du PROCHAIN marqueur — pour rendre la main à du code qui tient

@@ -3695,6 +3695,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
 
     combler_les_labels_d_album_sqlite(db);
 
+    // #5192 — les termes de chemin dans `tracks_fts`. Passe rejouée à chaque
+    // démarrage, sans numéro : elle lit `sqlite_master` et ne recrée l'index
+    // qu'une fois. Un échec laisse l'ancien index, qui sert encore.
+    {
+        let conn = db.connection().lock().unwrap();
+        if let Err(e) = crate::library::full_text_search::assurer_termes_de_chemin(&conn) {
+            warn!(error = %e, "tracks_fts_termes_de_chemin_echec");
+        }
+    }
+
     db.execute_batch("ANALYZE;").ok();
     info!("sqlite_analyze_complete");
 
@@ -4343,6 +4353,45 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
 /// the runner does not add an outer transaction so that each script
 /// controls its own transactional boundaries.
 #[cfg(feature = "postgres")]
+/// #5192 — pose la fonction `tracks_search_tsv_refresh` avec les termes de
+/// chemin et recalcule les vecteurs, UNE fois. Rend `Ok(None)` quand c'était
+/// déjà fait, `Ok(Some(n))` avec le nombre de pistes recalculées sinon.
+///
+/// Une seule transaction : la fonction, le déclencheur et les vecteurs
+/// changent ensemble, ou rien ne change.
+pub async fn assurer_termes_de_chemin_pg(pool: &sqlx::PgPool) -> Result<Option<u64>, String> {
+    use crate::library::full_text_search as fts;
+    let deja: i64 = sqlx::query_scalar(fts::SQL_PG_A_LES_TERMES_DE_CHEMIN)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("lecture de pg_proc : {e}"))?;
+    if deja > 0 {
+        return Ok(None);
+    }
+    let debut = std::time::Instant::now();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("transaction : {e}"))?;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(fts::sql_pg_fonction_tsv_des_pistes()))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("fonction tracks_search_tsv_refresh : {e}"))?;
+    let n = sqlx::query(fts::SQL_PG_RECALCULER_TSV_DES_PISTES)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("recalcul des vecteurs : {e}"))?
+        .rows_affected();
+    tx.commit().await.map_err(|e| format!("validation : {e}"))?;
+    info!(
+        pistes = n,
+        ms = debut.elapsed().as_millis() as u64,
+        "pg_tracks_termes_de_chemin_poses"
+    );
+    Ok(Some(n))
+}
+
+#[cfg(feature = "postgres")]
 pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // Ensure the tracking table exists.  The 001 script creates
     // `schema_version`, but on a truly empty database we need it
@@ -4513,6 +4562,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
             "pg_albums_labels_repris_des_pistes"
         ),
         Err(e) => warn!(error = %e, "pg_albums_labels_repris_des_pistes_failed"),
+    }
+
+    // #5192 — les termes de chemin dans `search_tsv`, même passe que SQLite :
+    // rejouée à chaque démarrage, sans numéro, et ne réécrivant les vecteurs
+    // qu'une fois — le marqueur dans le corps de la fonction le dit.
+    if let Err(e) = assurer_termes_de_chemin_pg(pool).await {
+        warn!(error = %e, "pg_tracks_termes_de_chemin_echec");
     }
 
     // Run ANALYZE on key tables for the query planner.

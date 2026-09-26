@@ -245,6 +245,54 @@ pub fn format_fts_query_piste(engine: Engine, raw: &str) -> String {
     }
 }
 
+/// La requête plein texte qui SÉLECTIONNE les pistes d'une recherche : la
+/// piste par elle-même, OU par les termes de son chemin (#5192) — nom du
+/// dernier dossier et nom du fichier, voir
+/// [`crate::library::full_text_search::termes_de_chemin`].
+///
+/// Sous SQLite, deux branches dans la chaîne du `MATCH` :
+///  - [`COLONNES_IDENTITE_PISTE`] seules, comme [`format_fts_query_piste`] ;
+///  - les mêmes PLUS `path_terms`, SAUF quand le titre de l'album porte à lui
+///    seul toute la requête. Les mots peuvent se répartir entre les colonnes
+///    (« Mahler » dans l'artiste, « Kondrashin » dans le dossier). Le `NOT`
+///    garde #4367 : un dossier nommé d'après son album (« Pink Floyd - Wish
+///    You Were Here ») ferait sinon revenir *Have A Cigar* sur « Wish You Were
+///    Here » — par le chemin, cette fois. L'album, lui, reste trouvé par la
+///    section Albums.
+///
+/// Postgres reçoit la requête nue ; la même logique est dans
+/// [`SqlDialect::fts_piste_ou_chemin_hors_album`].
+///
+/// Le CLASSEMENT (« par la piste » avant « par le chemin seul ») n'est pas
+/// ici : c'est l'`ORDER BY` de la recherche de pistes, qui rejoue
+/// [`format_fts_query_piste`].
+pub fn format_fts_query_piste_ou_chemin(engine: Engine, raw: &str) -> String {
+    let base = format_fts_query(engine, raw);
+    match engine {
+        Engine::Sqlite if !base.is_empty() => {
+            let identite = COLONNES_IDENTITE_PISTE.join(" ");
+            let chemin = crate::library::full_text_search::COLONNE_TERMES_DE_CHEMIN;
+            format!(
+                "({{{identite}}} : ({base})) OR \
+                 (({{{identite} {chemin}}} : ({base})) NOT ({{album_title}} : ({base})))"
+            )
+        }
+        _ => base,
+    }
+}
+
+/// Le vecteur d'IDENTITÉ d'une piste sous Postgres, recalculé à la volée :
+/// celui de `tracks_search_tsv_refresh` moins `album_title` et moins les
+/// termes de chemin.
+fn pg_vecteur_identite_piste(alias_piste: &str, alias_artiste: &str) -> String {
+    format!(
+        "(to_tsvector('simple', unaccent(COALESCE({alias_piste}.title, ''))) \
+         || to_tsvector('simple', unaccent(COALESCE({alias_artiste}.name, ''))) \
+         || to_tsvector('simple', unaccent(COALESCE({alias_piste}.genre, ''))) \
+         || to_tsvector('simple', unaccent(COALESCE({alias_piste}.composer, ''))))"
+    )
+}
+
 /// AND the tokens together in `engine`'s dialect, prefix-marking the last.
 fn join_fts_tokens(engine: Engine, tokens: &[String]) -> String {
     let Some((last, head)) = tokens.split_last() else {
@@ -328,6 +376,24 @@ pub trait SqlDialect {
         &self,
         alias_piste: &str,
         alias_artiste: &str,
+        query_placeholder: &str,
+    ) -> String;
+
+    /// Comme [`Self::fts_piste_hors_album`], pour la branche qui SÉLECTIONNE
+    /// les pistes d'une recherche : la piste par elle-même, ou par ses termes
+    /// de chemin tant que le titre de l'album ne porte pas seul la requête
+    /// (#5192, voir [`format_fts_query_piste_ou_chemin`]).
+    ///
+    /// SQLite : chaîne vide, tout est dans la chaîne du `MATCH`. Postgres :
+    /// recalcul à la volée, en ET du prédicat indexé — `search_tsv` porte
+    /// déjà l'album et le chemin, l'index GIN choisit donc toujours les
+    /// lignes. `alias_album` est l'alias du `LEFT JOIN albums` de la requête
+    /// englobante.
+    fn fts_piste_ou_chemin_hors_album(
+        &self,
+        alias_piste: &str,
+        alias_artiste: &str,
+        alias_album: &str,
         query_placeholder: &str,
     ) -> String;
 
@@ -439,6 +505,17 @@ impl SqlDialect for SqliteDialect {
         String::new()
     }
 
+    fn fts_piste_ou_chemin_hors_album(
+        &self,
+        _piste: &str,
+        _artiste: &str,
+        _album: &str,
+        _placeholder: &str,
+    ) -> String {
+        // Idem : filtres de colonnes et `NOT` voyagent dans la chaîne.
+        String::new()
+    }
+
     fn json_extract_text(&self, column: &str, path: &str) -> String {
         // Caller is responsible for passing a path that is already
         // single-quote-safe (we don't allow user input here in practice;
@@ -529,11 +606,28 @@ impl SqlDialect for PostgresDialect {
         // reste, et lui en donner exigerait de réécrire le tsvector de toutes
         // les pistes de toutes les bases.
         format!(
-            "(to_tsvector('simple', unaccent(COALESCE({alias_piste}.title, ''))) \
-             || to_tsvector('simple', unaccent(COALESCE({alias_artiste}.name, ''))) \
-             || to_tsvector('simple', unaccent(COALESCE({alias_piste}.genre, ''))) \
-             || to_tsvector('simple', unaccent(COALESCE({alias_piste}.composer, '')))) \
-             @@ to_tsquery('simple', unaccent({query_placeholder}))"
+            "{} @@ to_tsquery('simple', unaccent({query_placeholder}))",
+            pg_vecteur_identite_piste(alias_piste, alias_artiste)
+        )
+    }
+
+    fn fts_piste_ou_chemin_hors_album(
+        &self,
+        alias_piste: &str,
+        alias_artiste: &str,
+        alias_album: &str,
+        query_placeholder: &str,
+    ) -> String {
+        let requete = format!("to_tsquery('simple', unaccent({query_placeholder}))");
+        let identite = pg_vecteur_identite_piste(alias_piste, alias_artiste);
+        let chemin = format!(
+            "to_tsvector('simple', unaccent({}))",
+            crate::library::full_text_search::sql_termes_de_chemin_de_piste(alias_piste)
+        );
+        let album = format!("to_tsvector('simple', unaccent(COALESCE({alias_album}.title, '')))");
+        format!(
+            "({identite} @@ {requete} OR \
+             (({identite} || {chemin}) @@ {requete} AND NOT ({album} @@ {requete})))"
         )
     }
 
