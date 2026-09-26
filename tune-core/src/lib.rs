@@ -13,6 +13,7 @@ pub mod cadence;
 pub mod chemins_de_travail;
 pub mod cloud;
 pub mod collaborative;
+pub mod confidentialite;
 pub mod config;
 pub mod config_backup;
 pub mod credentials_vault;
