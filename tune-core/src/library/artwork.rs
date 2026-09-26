@@ -148,6 +148,79 @@ pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     crate::metadata::extract_dsf_cover(audio_path)
 }
 
+/// Empreinte BON MARCHÉ de la jaquette d'un FLAC : la longueur des octets de
+/// l'image et trois échantillons de 32 octets (début, milieu, fin), lus SANS
+/// charger l'image — quelques petites lectures dans l'en-tête du fichier.
+///
+/// Sert au scan à reconnaître, piste après piste, la MÊME jaquette que celle de
+/// l'album, sans relire 250 Kio par piste (#5034, décision 3 : relire la
+/// jaquette de chaque piste coûtait +50 % sur un scan de 3 000 FLAC, mesuré
+/// sur Shrek). Deux images différentes ont en pratique des longueurs
+/// différentes ; les trois échantillons tranchent le reste.
+///
+/// `None` : pas un FLAC nu (un en-tête ID3 le précède, autre format), pas de
+/// bloc `PICTURE`, ou fichier illisible. L'appelant relit alors la jaquette
+/// entière, comme avant : ce n'est qu'un raccourci.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmpreinteJaquette {
+    longueur: u32,
+    echantillons: [[u8; 32]; 3],
+}
+
+pub fn empreinte_jaquette_flac(chemin: &Path) -> Option<EmpreinteJaquette> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&*extended_path(chemin)).ok()?;
+    let mut mot = [0u8; 4];
+    f.read_exact(&mut mot).ok()?;
+    if &mot != b"fLaC" {
+        return None;
+    }
+    let u32_suivant = |f: &mut std::fs::File| -> Option<u32> {
+        let mut u = [0u8; 4];
+        f.read_exact(&mut u).ok()?;
+        Some(u32::from_be_bytes(u))
+    };
+    loop {
+        let mut entete = [0u8; 4];
+        f.read_exact(&mut entete).ok()?;
+        let dernier = entete[0] & 0x80 != 0;
+        let genre = entete[0] & 0x7F;
+        let longueur = u64::from(u32::from_be_bytes([0, entete[1], entete[2], entete[3]]));
+        if genre == 6 {
+            // METADATA_BLOCK_PICTURE : type, MIME, description, 4 × u32
+            // (dimensions, profondeur, couleurs), puis la longueur des octets.
+            let debut = f.stream_position().ok()?;
+            u32_suivant(&mut f)?;
+            let mime = u32_suivant(&mut f)?;
+            f.seek(SeekFrom::Current(i64::from(mime))).ok()?;
+            let description = u32_suivant(&mut f)?;
+            f.seek(SeekFrom::Current(i64::from(description) + 16))
+                .ok()?;
+            let n = u32_suivant(&mut f)?;
+            let donnees = f.stream_position().ok()?;
+            if donnees + u64::from(n) > debut + longueur {
+                return None;
+            }
+            let mut echantillons = [[0u8; 32]; 3];
+            let n64 = u64::from(n);
+            for (i, decalage) in [0, n64 / 2, n64.saturating_sub(32)].into_iter().enumerate() {
+                let k = (n64 - decalage.min(n64)).min(32) as usize;
+                f.seek(SeekFrom::Start(donnees + decalage)).ok()?;
+                f.read_exact(&mut echantillons[i][..k]).ok()?;
+            }
+            return Some(EmpreinteJaquette {
+                longueur: n,
+                echantillons,
+            });
+        }
+        if dernier {
+            return None;
+        }
+        f.seek(SeekFrom::Current(i64::try_from(longueur).ok()?))
+            .ok()?;
+    }
+}
+
 pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
     let dir = audio_path.parent()?;
     for name in FOLDER_COVER_NAMES {

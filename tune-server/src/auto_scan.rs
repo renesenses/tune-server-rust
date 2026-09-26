@@ -1789,7 +1789,9 @@ pub(crate) fn reimporter_fichier_surveillant(
                 db,
                 aid,
                 std::path::Path::new(&sf.path),
-                sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref()),
+                tune_core::library::pochette_disque::Jaquette::depuis(
+                    sf.metadata.as_ref().and_then(|m| m.cover_art.as_ref()),
+                ),
                 &cache_dir,
                 false,
             );

@@ -132,13 +132,61 @@ pub fn lire_l_image_du_dossier(piste: &Path, cache_dir: &Path) -> Option<Pochett
     })
 }
 
+/// Ce que l'appelant sait déjà de la jaquette intégrée d'une piste.
+#[derive(Debug, Clone, Copy)]
+pub enum Jaquette<'a> {
+    /// Rien : elle sera relue sur le disque si la règle en a besoin.
+    Inconnue,
+    /// Lue, et la piste n'en porte pas : rien à relire.
+    Absente,
+    /// Lue : ses octets et son type.
+    Lue(&'a (Vec<u8>, String)),
+}
+
+impl<'a> Jaquette<'a> {
+    /// Des octets lus avec les balises : présents, ou inconnus.
+    pub fn depuis(octets: Option<&'a (Vec<u8>, String)>) -> Self {
+        octets.map_or(Self::Inconnue, Self::Lue)
+    }
+
+    /// Des octets relus sur la piste : présents, ou absents.
+    pub fn relue(octets: Option<&'a (Vec<u8>, String)>) -> Self {
+        octets.map_or(Self::Absente, Self::Lue)
+    }
+
+    fn octets(self) -> Option<&'a (Vec<u8>, String)> {
+        match self {
+            Self::Lue(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// La piste porte-t-elle une jaquette ? Ne relit la piste que si l'on
+    /// n'en sait rien.
+    fn presente(self, piste: &Path) -> bool {
+        match self {
+            Self::Lue(_) => true,
+            Self::Absente => false,
+            Self::Inconnue => extract_cover_art(piste).is_some(),
+        }
+    }
+}
+
 /// UNE piste : sa jaquette intégrée d'abord, puis l'image de son dossier.
 pub fn lire_depuis_la_piste(
     piste: &Path,
     cache_dir: &Path,
     octets: Option<&(Vec<u8>, String)>,
 ) -> Option<PochetteLue> {
-    lire_la_jaquette(piste, cache_dir, octets).or_else(|| lire_l_image_du_dossier(piste, cache_dir))
+    lire_selon(piste, cache_dir, Jaquette::depuis(octets))
+}
+
+fn lire_selon(piste: &Path, cache_dir: &Path, jaquette: Jaquette<'_>) -> Option<PochetteLue> {
+    let integree = match jaquette {
+        Jaquette::Absente => None,
+        j => lire_la_jaquette(piste, cache_dir, j.octets()),
+    };
+    integree.or_else(|| lire_l_image_du_dossier(piste, cache_dir))
 }
 
 /// L'album ENTIER, relu sur le disque : la première jaquette intégrée parmi
@@ -350,8 +398,9 @@ fn reevaluer_avec(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Suivi {
     /// L'album est tranché pour ce scan : les pistes suivantes n'y reviennent
-    /// pas. Faux seulement pour un album SANS pochette dont cette piste n'a
-    /// rien donné — la suivante peut en porter une.
+    /// pas. Faux pour un album SANS pochette dont cette piste n'a rien donné,
+    /// et pour un album illustré par son IMAGE DE DOSSIER : une piste suivante
+    /// peut porter une jaquette intégrée, qui passe avant (#5035).
     pub tranche: bool,
     /// Une pochette a été posée (compteur du rapport de scan).
     pub posee: bool,
@@ -367,12 +416,41 @@ pub struct Suivi {
 /// - pochette tirée de CETTE piste, ou fichier source disparu : cette piste,
 ///   puis — si elle ne porte plus d'image — l'album entier.
 ///
-/// `octets` : la jaquette déjà lue avec les balises, s'il y en a.
+/// `jaquette` : ce que l'appelant sait déjà de la jaquette de la piste.
 pub fn suivre_la_piste(
     db: &std::sync::Arc<dyn DbBackend>,
     album_id: i64,
     piste: &Path,
-    octets: Option<&(Vec<u8>, String)>,
+    jaquette: Jaquette<'_>,
+    cache_dir: &Path,
+    complet: bool,
+) -> Suivi {
+    let suivi = suivre(db, album_id, piste, jaquette, cache_dir, complet);
+    // #5035 — un album illustré par son image de DOSSIER reste ouvert : la
+    // piste suivante peut porter une jaquette intégrée, qui passe avant.
+    if suivi.tranche
+        && matches!(
+            AlbumRepo::with_backend(db.clone())
+                .etat_pochette(album_id)
+                .ok()
+                .flatten()
+                .and_then(|e| e.source),
+            Some(SourcePochette::Dossier)
+        )
+    {
+        return Suivi {
+            tranche: false,
+            ..suivi
+        };
+    }
+    suivi
+}
+
+fn suivre(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    piste: &Path,
+    jaquette: Jaquette<'_>,
     cache_dir: &Path,
     complet: bool,
 ) -> Suivi {
@@ -396,7 +474,7 @@ pub fn suivre_la_piste(
 
     // Album sans pochette : cette piste la donne, ou la suivante.
     if etat.cover_path.is_none() {
-        let Some(lue) = lire_depuis_la_piste(piste, cache_dir, octets) else {
+        let Some(lue) = lire_selon(piste, cache_dir, jaquette) else {
             return Suivi {
                 tranche: false,
                 posee: false,
@@ -435,6 +513,19 @@ pub fn suivre_la_piste(
                 posee: false,
             };
         }
+        // #5035 — l'album est illustré par son IMAGE DE DOSSIER et cette
+        // piste porte une jaquette intégrée : la jaquette passe avant. C'est
+        // le cas où la PREMIÈRE piste lue n'en portait pas — son `cover.jpg`
+        // gagnait, et `albums_with_cover` le figeait pour tout le scan, même
+        // quand toutes les autres pistes portaient la leur. L'album entier
+        // tranche (première jaquette dans l'ordre du disque).
+        Some(SourcePochette::Dossier) if !complet && jaquette.presente(piste) => {
+            let geste = reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste));
+            return Suivi {
+                tranche: true,
+                posee: matches!(geste, Geste::Poser(_)),
+            };
+        }
         // Pochette du disque tirée d'un autre fichier, toujours présent : la
         // relecture de cette piste ne la concerne pas (un single à la jaquette
         // propre, rangé dans l'album, ne la remplace pas — #4650).
@@ -458,7 +549,7 @@ pub fn suivre_la_piste(
         _ => {}
     }
 
-    let lue = lire_depuis_la_piste(piste, cache_dir, octets);
+    let lue = lire_selon(piste, cache_dir, jaquette);
     let pistes = [piste.to_path_buf()];
     let du_disque = vient_du_disque(&etat, lue.as_ref(), &pistes);
     // La piste ne porte plus d'image — ou plus la sienne : l'album entier
