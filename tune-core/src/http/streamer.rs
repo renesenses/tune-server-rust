@@ -81,6 +81,24 @@ pub struct StreamInfo {
     pub file_size: Option<u64>,
     pub duration_ms: Option<u64>,
     pub seek_ms: Option<u64>,
+    /// #5114 — le crossfeed est CUIT dans les octets de ce flux.
+    ///
+    /// Posé là où le flux est bâti, depuis le processeur réellement chargé
+    /// (`load_crossfeed_processor` : licence, greffon, PURE, case cochée) et
+    /// seulement s'il s'exécute (stéréo). C'est un fait du flux, pas une
+    /// déduction des réglages : le chemin du signal le lit tel quel. `false`
+    /// partout ailleurs, y compris sur une piste servie telle quelle.
+    pub crossfeed: bool,
+    /// La compensation de niveau (#5071) CUITE dans les octets de ce flux :
+    /// sa cible en dB, lue sur l'étage réellement posé
+    /// (`CompensationReseau::cible_db`).
+    ///
+    /// Même règle que [`Self::crossfeed`] : c'est un fait du flux, posé là où
+    /// il est bâti, et le chemin du signal le lit tel quel au lieu de le
+    /// PRÉVOIR depuis les réglages. `None` quand aucun étage de compensation
+    /// n'entre dans le flux — piste servie telle quelle (cas 3 de #2742),
+    /// sortie locale, PURE, interrupteur coupé, radio, préchargement.
+    pub compensation_db: Option<f64>,
 }
 
 impl StreamInfo {
@@ -1153,6 +1171,7 @@ impl AudioStreamer {
     ///     the mpsc channel, so waiting would hang),
     ///   - file sessions (`serve_file`, already on disk, Range-seekable),
     ///   - unknown or already-closed sessions.
+    ///
     /// Only genuine transcode/radio channel sessions are actually awaited.
     ///
     /// Returns `false` when `timeout` elapses first — the hard cap so a slow or
@@ -1346,13 +1365,13 @@ impl AudioStreamer {
         // to avoid accidentally removing actual music files.
         if let Some(session) = removed {
             let fp = session.file_path.lock().await;
-            if let Some(ref path) = *fp {
-                if is_temp_transcode_file(path) {
-                    if let Err(e) = std::fs::remove_file(path) {
-                        info!(stream_id, path, error = %e, "temp_transcode_file_cleanup_failed");
-                    } else {
-                        info!(stream_id, path, "temp_transcode_file_cleaned_up");
-                    }
+            if let Some(ref path) = *fp
+                && is_temp_transcode_file(path)
+            {
+                if let Err(e) = std::fs::remove_file(path) {
+                    info!(stream_id, path, error = %e, "temp_transcode_file_cleanup_failed");
+                } else {
+                    info!(stream_id, path, "temp_transcode_file_cleaned_up");
                 }
             }
         }
@@ -1521,12 +1540,11 @@ impl AudioStreamer {
             };
             // Check for temp transcode file to clean up.
             // We can't .await inside retain, so use try_lock.
-            if let Ok(fp) = s.file_path.try_lock() {
-                if let Some(ref path) = *fp {
-                    if is_temp_transcode_file(path) {
-                        temp_files_to_remove.push(path.clone());
-                    }
-                }
+            if let Ok(fp) = s.file_path.try_lock()
+                && let Some(ref path) = *fp
+                && is_temp_transcode_file(path)
+            {
+                temp_files_to_remove.push(path.clone());
             }
             info!(
                 stream_id = %id,
@@ -1562,6 +1580,7 @@ impl AudioStreamer {
 /// Called once when the server starts to clean up files from a previous
 /// crash or unclean shutdown.
 pub fn cleanup_leftover_transcode_files() {
+    // tmp-autorise: balayage en LECTURE au démarrage ; ne supprime que des temporaires de transcodage tune-* au nom UUID ; ceux d'un autre compte restent protégés par le sticky bit de /tmp.
     let tmp_dir = std::env::temp_dir();
     let entries = match std::fs::read_dir(&tmp_dir) {
         Ok(e) => e,
@@ -1569,16 +1588,14 @@ pub fn cleanup_leftover_transcode_files() {
     };
     let mut count = 0;
     for entry in entries.flatten() {
-        if let Some(name) = entry.file_name().to_str() {
-            if name.starts_with("tune-transcode-")
+        if let Some(name) = entry.file_name().to_str()
+            && (name.starts_with("tune-transcode-")
                 || name.starts_with("tune-aac-transcode-")
                 || name.starts_with("tune-dash-transcode-")
-                || name.starts_with("tune-faststart-")
-            {
-                if std::fs::remove_file(entry.path()).is_ok() {
-                    count += 1;
-                }
-            }
+                || name.starts_with("tune-faststart-"))
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            count += 1;
         }
     }
     if count > 0 {

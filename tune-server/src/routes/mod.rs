@@ -27,6 +27,8 @@ pub mod eq_pro;
 pub mod export;
 pub(crate) mod filtre_sources;
 pub mod graphql;
+/// Réglages de zone et profils nommés des greffons natifs tiers.
+pub mod greffons_natifs_tiers;
 pub mod history;
 pub mod home;
 pub mod homeassistant;
@@ -93,6 +95,7 @@ pub use tune_stream_http as stream_handler;
 // l'état serveur. Elle compile dans une crate sœur, tout en conservant le
 // chemin historique `routes::streaming` pour les appelants.
 pub use tune_streaming_http as streaming;
+pub mod sources_physiques;
 pub mod support;
 pub mod system;
 pub mod tagger;
@@ -469,6 +472,11 @@ pub fn router_with_plugins(
         .nest("/tagger", tagger::router())
         .nest("/kiosk", kiosk::router())
         .nest("/widget", widget::router())
+        // #5065 — le registre commun des sources physiques (CD, entrées…).
+        .nest(
+            "/sources",
+            sources_physiques::router(state.orchestrator.sources_physiques().clone()),
+        )
         .nest("/mediasync", mediasync::router())
         .nest("/cd-rip", cd_rip::router())
         .nest("/sacd-rip", sacd_rip::router())
@@ -966,10 +974,7 @@ mod eq_refresh_guard {
         };
         let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
         lignes.iter().enumerate().any(|(i, l)| {
-            *l == format!("mod {nom};")
-                && lignes[i.saturating_sub(3)..i]
-                    .iter()
-                    .any(|a| *a == "#[cfg(test)]")
+            *l == format!("mod {nom};") && lignes[i.saturating_sub(3)..i].contains(&"#[cfg(test)]")
         })
     }
 
@@ -986,10 +991,7 @@ mod eq_refresh_guard {
         let parent = fs::read_to_string(&fichier_parent).ok()?;
         let lignes: Vec<&str> = parent.lines().map(str::trim).collect();
         let declare = lignes.iter().enumerate().any(|(i, l)| {
-            *l == format!("mod {nom};")
-                && !lignes[i.saturating_sub(3)..i]
-                    .iter()
-                    .any(|a| *a == "#[cfg(test)]")
+            *l == format!("mod {nom};") && !lignes[i.saturating_sub(3)..i].contains(&"#[cfg(test)]")
         });
         if !declare {
             return None;

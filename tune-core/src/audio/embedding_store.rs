@@ -42,8 +42,10 @@ pub fn to_bytes(embedding: &[f32]) -> Vec<u8> {
 /// Reverse of [`to_bytes`].
 pub fn from_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -409,7 +411,8 @@ pub fn inherit_from_local_twins(backend: &Arc<dyn DbBackend>) -> u64 {
         Err(_) => return 0,
     };
     let normalize = crate::library::track_matcher::normalize;
-    let mut by_key: std::collections::HashMap<(String, String), Vec<(i64, i64, i64)>> =
+    type Occurrences = Vec<(i64, i64, i64)>;
+    let mut by_key: std::collections::HashMap<(String, String), Occurrences> =
         std::collections::HashMap::new();
     for r in &sources {
         let (Some(id), Some(title), Some(artist), Some(dur)) = (

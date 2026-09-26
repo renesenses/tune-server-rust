@@ -72,6 +72,12 @@ fn use_scratch_plugin_data_dir() {
     });
 }
 
+#[path = "circle_plugin.rs"]
+mod circle_plugin;
+// #5018 — le greffon `circle` au catalogue (feature `circle`, dans `default`).
+#[cfg(feature = "circle")]
+#[path = "circle_catalogue_5018.rs"]
+mod circle_catalogue_5018;
 #[path = "concerts_plugin.rs"]
 mod concerts_plugin;
 #[path = "dj_plugin.rs"]
@@ -82,6 +88,15 @@ mod plugin_routes;
 #[cfg(feature = "cd")]
 #[path = "cd_catalogue_4863.rs"]
 mod cd_catalogue_4863;
+// #5065 — le registre des sources physiques, et le greffon `cd` qui s'y inscrit.
+#[cfg(feature = "cd")]
+#[path = "sources_physiques_5065.rs"]
+mod sources_physiques_5065;
+// #5051 — le greffon `entree-audio` hors catalogue (feature `entree-audio`,
+// dans `default`).
+#[cfg(feature = "entree-audio")]
+#[path = "entree_audio_hors_catalogue_5051.rs"]
+mod entree_audio_hors_catalogue_5051;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une

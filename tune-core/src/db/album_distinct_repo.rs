@@ -13,7 +13,7 @@
 //! | chemin | ce qu'il fait | risque |
 //! |---|---|---|
 //! | `GET /library/albums/grouped` | signale les groupes (MBID de release group, puis titre « dévarianté ») | l'alerte |
-//! | `POST /library/albums/merge-duplicates` | FUSIONNE par `LOWER(title)` : les pistes changent d'album, la ligne perdante est SUPPRIMÉE | irréversible |
+//! | `POST /library/albums/merge-duplicates`, fin de scan, `POST /system/cleanup` | FUSIONNENT par `(LOWER(title), artist_id)` via `album_doublons::FusionDesDoublons` : tout est repointé vers l'album conservé, la ligne perdante est SUPPRIMÉE | irréversible |
 //!
 //! L'issue demande les deux : ne plus voir l'alerte, ET ne pas se faire
 //! fusionner. Un marqueur qui ne couvrirait que l'affichage laisserait la

@@ -68,6 +68,10 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
         state.clone(),
         config.auto_update,
     );
+    // #5141 — sur macOS, un paquet `.app` resté à une version antérieure
+    // (binaire posé par un ancien programme de mise à jour) est remplacé par
+    // celui de la version qui tourne. Une tentative par version, en fond.
+    crate::routes::system::update::spawn_reparation_du_paquet_macos(state.clone());
     // Détecteur de zones figées (#3581). Sans lui, une zone restée `Playing`
     // en mémoire n'est contredite par PERSONNE : l'écran annonce une lecture
     // qui n'existe pas, le garde-fou de mise à jour refuse tour après tour, et
@@ -1013,6 +1017,7 @@ fn spawn_dash_temp_gc() {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             ticker.tick().await;
+            // tmp-autorise: balayage en LECTURE de la racine ; ne supprime que des tune-dash-*.mp4 au nom UUID, ceux d'un autre compte restent protégés par le sticky bit de /tmp.
             let dir = std::env::temp_dir();
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -2588,10 +2593,10 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
         }
         if let Some(output) = outputs.get(&id) {
             let output = output.lock().await;
-            if let Ok(status) = output.get_status().await {
-                if status.state == tune_core::outputs::traits::TransportState::Playing {
-                    return true;
-                }
+            if let Ok(status) = output.get_status().await
+                && status.state == tune_core::outputs::traits::TransportState::Playing
+            {
+                return true;
             }
         }
     }

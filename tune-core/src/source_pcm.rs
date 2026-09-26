@@ -32,10 +32,31 @@
 //! `StreamInfo::wav_content_length`) : une durée en millisecondes ne tombe
 //! presque jamais sur une trame entière, et une longueur arrondie tronquerait
 //! la fin de la piste — donc la jonction avec la suivante.
+//!
+//! ## Le mode « en direct » (#5051)
+//!
+//! Une entrée audio (platine par préampli USB, S/PDIF, sortie optique d'une
+//! TV) n'a ni longueur ni fin : elle joue tant qu'on l'écoute. Un fournisseur
+//! qui répond `true` à [`FournisseurPcm::en_direct`] est ouvert par
+//! [`FournisseurPcm::ouvrir_direct`] au lieu de [`FournisseurPcm::ouvrir`], et
+//! l'orchestrateur le sert comme une RADIO : session sans longueur
+//! (`create_radio_session`), en-tête WAV de longueur indéterminée, corps
+//! découpé à la volée — ce que les zones réseau savent déjà consommer pour
+//! une webradio, et ce que la sortie locale lit en continu.
+//!
+//! Le mode « longueur connue » ne change pas : un fournisseur qui ne dit rien
+//! (le CD) garde `ouvrir`, la session finie et son `Content-Length` exact.
+//!
+//! Pour mesurer la dérive entre l'horloge de l'entrée et celle de la sortie,
+//! l'hôte passe au fournisseur un compteur [`Consommation`] : les octets que
+//! le consommateur a RÉELLEMENT tirés de la session (`bytes_sent`). Le
+//! fournisseur compare ce débit à son débit capté ; la compensation qu'il
+//! applique est publiée par [`EtatDirect`] pour que le chemin du signal ne
+//! revendique pas un bit-perfect qu'il n'y a plus.
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 /// Format du PCM rendu : entiers signés petit-boutistes, canaux entrelacés.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +103,104 @@ pub trait FournisseurPcm: Send + Sync {
     /// partir de `depuis_ms` millisecondes. Appelé depuis un fil bloquant :
     /// l'implémentation peut parler au matériel.
     fn ouvrir(&self, source_id: &str, depuis_ms: u64) -> Result<FluxPcm, String>;
+
+    /// Vrai pour une source SANS FIN (#5051) : l'orchestrateur appelle alors
+    /// [`Self::ouvrir_direct`] et sert un flux en direct, jamais `ouvrir`.
+    fn en_direct(&self) -> bool {
+        false
+    }
+
+    /// Ouvre l'élément `source_id` en direct. `consommation` rend, à tout
+    /// instant, les octets que le consommateur a tirés de la session. Appelé
+    /// depuis un fil bloquant.
+    fn ouvrir_direct(
+        &self,
+        source_id: &str,
+        consommation: Consommation,
+    ) -> Result<FluxDirect, String> {
+        let _ = consommation;
+        Err(format!("« {source_id} » n'est pas une source en direct"))
+    }
+}
+
+/// Un flux en direct : pas de longueur, pas de durée, pas d'avance possible.
+pub struct FluxDirect {
+    pub format: FormatPcm,
+    /// La source des octets. `Ok(0)` est une fin NORMALE (arrêt demandé,
+    /// relance sur une autre fréquence) ; une erreur est une fin ANORMALE
+    /// (périphérique débranché), dite à la zone.
+    pub lecteur: Box<dyn Read + Send>,
+    /// Ce que la compensation de dérive fait au signal, pour le chemin du
+    /// signal. `None` : le fournisseur ne transforme rien.
+    pub etat: Option<Arc<dyn EtatDirect>>,
+}
+
+/// Les octets que le consommateur a tirés de la session en direct.
+#[derive(Clone)]
+pub struct Consommation(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl Consommation {
+    pub fn new(f: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn octets(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+/// Ce que la compensation de dérive fait au signal d'une source en direct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compensation {
+    /// `"tampon_avec_reprise"` ou `"reechantillonnage_adaptatif"`.
+    pub methode: &'static str,
+    /// Un rééchantillonnage est-il en cours ? Si oui, rien n'est bit-perfect.
+    pub reechantillonne: bool,
+    /// Trames retirées ou ajoutées pour ramener le tampon dans sa fenêtre.
+    /// Zéro : le signal servi est, octet pour octet, le signal capté.
+    pub reprises: u64,
+    /// Dérive mesurée entre l'entrée et le consommateur, en ppm.
+    pub derive_ppm: Option<f64>,
+}
+
+impl Compensation {
+    /// Le signal servi est-il celui capté, à l'octet près ?
+    pub fn bit_perfect(&self) -> bool {
+        !self.reechantillonne && self.reprises == 0
+    }
+}
+
+/// Publié par un fournisseur en direct, relu par le chemin du signal.
+pub trait EtatDirect: Send + Sync {
+    fn compensation(&self) -> Compensation;
+}
+
+/// Les flux en direct en cours, par `stream_id` de session. Global parce que
+/// son lecteur — le chemin du signal, côté serveur HTTP — ne tient pas
+/// l'orchestrateur ; inscrit et retiré par l'orchestrateur seul.
+static DIRECTS: LazyLock<RwLock<HashMap<String, Arc<dyn EtatDirect>>>> =
+    LazyLock::new(Default::default);
+
+#[doc(hidden)]
+pub fn inscrire_direct(stream_id: &str, etat: Arc<dyn EtatDirect>) {
+    if let Ok(mut m) = DIRECTS.write() {
+        m.insert(stream_id.to_string(), etat);
+    }
+}
+
+#[doc(hidden)]
+pub fn retirer_direct(stream_id: &str) {
+    if let Ok(mut m) = DIRECTS.write() {
+        m.remove(stream_id);
+    }
+}
+
+/// La compensation appliquée au flux en direct `stream_id`, s'il en est un.
+pub fn compensation_du_direct(stream_id: &str) -> Option<Compensation> {
+    DIRECTS
+        .read()
+        .ok()
+        .and_then(|m| m.get(stream_id).map(|e| e.compensation()))
 }
 
 /// Registre des sources PCM inscrites, par nom de `source`.
@@ -161,6 +280,38 @@ pub fn pomper(
     FinDePompe::Complete
 }
 
+/// Lit un flux EN DIRECT et remet chaque tronçon à `remettre`, sans fin
+/// annoncée (#5051).
+///
+/// `Ok(0)` du lecteur est la fin normale ([`FinDePompe::Complete`]) ; une
+/// erreur, la fin anormale. Rien n'est jamais comblé : un lecteur qui n'a
+/// rien à rendre BLOQUE — c'est lui qui connaît le rythme de la capture.
+pub fn pomper_sans_fin(
+    lecteur: &mut dyn Read,
+    mut remettre: impl FnMut(Vec<u8>) -> bool,
+) -> FinDePompe {
+    let mut remis: u64 = 0;
+    loop {
+        let mut tampon = vec![0u8; TRONCON];
+        let lu = match lecteur.read(&mut tampon) {
+            Ok(0) => return FinDePompe::Complete,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return FinDePompe::Interrompue {
+                    remis,
+                    raison: e.to_string(),
+                };
+            }
+        };
+        tampon.truncate(lu);
+        remis += lu as u64;
+        if !remettre(tampon) {
+            return FinDePompe::ConsommateurParti;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +364,84 @@ mod tests {
         });
         assert_eq!(fin, FinDePompe::ConsommateurParti);
         assert_eq!(appels, 1);
+    }
+
+    /// Un lecteur qui rend un nombre donné de tronçons, puis `fin`.
+    struct Direct {
+        restants: usize,
+        fin: Option<std::io::ErrorKind>,
+    }
+    impl Read for Direct {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.restants == 0 {
+                return match self.fin {
+                    None => Ok(0),
+                    Some(k) => Err(std::io::Error::new(k, "débranché")),
+                };
+            }
+            self.restants -= 1;
+            let n = buf.len().min(1000);
+            buf[..n].fill(7);
+            Ok(n)
+        }
+    }
+
+    /// #5051 — le mode en direct n'a PAS de longueur : il remet tout ce que
+    /// le lecteur rend, bien au-delà de n'importe quelle borne, jusqu'à la
+    /// fin que le lecteur décide.
+    #[test]
+    fn la_pompe_sans_fin_remet_tout_jusqu_a_la_fin_du_lecteur() {
+        let mut l = Direct {
+            restants: 5_000,
+            fin: None,
+        };
+        let mut recu = 0usize;
+        let fin = pomper_sans_fin(&mut l, |t| {
+            recu += t.len();
+            true
+        });
+        assert_eq!(fin, FinDePompe::Complete);
+        assert_eq!(recu, 5_000 * 1000);
+    }
+
+    #[test]
+    fn la_pompe_sans_fin_dit_une_fin_anormale_et_un_consommateur_parti() {
+        let mut l = Direct {
+            restants: 3,
+            fin: Some(std::io::ErrorKind::BrokenPipe),
+        };
+        let fin = pomper_sans_fin(&mut l, |_| true);
+        assert!(matches!(fin, FinDePompe::Interrompue { remis: 3000, .. }));
+
+        let mut l = Direct {
+            restants: 10,
+            fin: None,
+        };
+        let fin = pomper_sans_fin(&mut l, |_| false);
+        assert_eq!(fin, FinDePompe::ConsommateurParti);
+    }
+
+    #[test]
+    fn un_fournisseur_qui_ne_dit_rien_n_est_pas_en_direct() {
+        let f = Fournisseur;
+        assert!(!f.en_direct());
+        let c = Consommation::new(|| 0);
+        assert!(f.ouvrir_direct("x", c).is_err());
+    }
+
+    #[test]
+    fn une_reprise_ou_un_reechantillonnage_retire_le_bit_perfect() {
+        let mut c = Compensation {
+            methode: "tampon_avec_reprise",
+            reechantillonne: false,
+            reprises: 0,
+            derive_ppm: Some(3.0),
+        };
+        assert!(c.bit_perfect());
+        c.reprises = 1;
+        assert!(!c.bit_perfect());
+        c.reprises = 0;
+        c.reechantillonne = true;
+        assert!(!c.bit_perfect());
     }
 }

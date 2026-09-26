@@ -235,8 +235,7 @@ fn un_hqplayer_debranche_ne_tourne_plus_ni_ne_parle_toutes_les_minutes() {
     // Le total n'est jamais perdu : le dernier récapitulatif le porte.
     let dernier = texte
         .lines()
-        .filter(|l| l.contains("hqplayer_poll_still_failing"))
-        .next_back()
+        .rfind(|l| l.contains("hqplayer_poll_still_failing"))
         .expect("il doit rester au moins un récapitulatif");
     assert!(
         dernier.contains("echecs=128"),

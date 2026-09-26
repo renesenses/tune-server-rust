@@ -13,10 +13,11 @@
 //!    répondait dans tous les serveurs. Si l'extraction l'avait laissée en
 //!    place, on aurait deux portes pour la même donnée — exactement le défaut
 //!    corrigé côté cloud dans le même chantier.
-//! 2. **Le plugin reste hors catalogue.** Aucun écran ne consomme ses routes ;
-//!    l'offrir à l'installation vendrait une fonction que rien n'expose
-//!    (#2090). Ce test échouera le jour où quelqu'un rebranchera
-//!    `catalogued()` — et c'est le but : il faudra alors que l'écran existe.
+//! 2. **Le plugin est au catalogue, en module Premium.** L'écran existe
+//!    (tune-web-client#695) et le nuage a des dates : il est proposé à
+//!    l'installation, avec le cadenas avant le clic (`premium`,
+//!    `required_feature`), et il refuse LUI-MÊME ses routes à un compte gratuit
+//!    — 402, forme de `ModuleRefusal`. Voir la section « Premium » plus bas.
 //! 3. **Le corps d'erreur ne contient pas de phrase anglaise.** L'ancien
 //!    handler rendait `{"error": "concerts: HTTP 500"}`, qu'une interface
 //!    traduite en 11 langues aurait affichée telle quelle.
@@ -47,6 +48,17 @@ use tune_server::state::AppState;
 
 fn new_state() -> AppState {
     AppState::new(":memory:", 0, Default::default()).unwrap()
+}
+
+/// Construit l'app avec le plugin chargé, sur un serveur PREMIUM.
+///
+/// Sur un compte gratuit, les routes du greffon répondent 402 avant tout
+/// traitement. Les tests qui portent sur le contrat d'erreur du greffon partent
+/// donc d'un serveur qui a le droit de s'en servir ; le cas gratuit a ses
+/// propres tests.
+async fn app_avec_concerts_premium(state: &AppState) -> axum::Router {
+    state.license.set_account_premium(true, None).await;
+    app_avec_concerts(state).await
 }
 
 /// Construit l'app avec le plugin chargé par le vrai chemin d'enregistrement.
@@ -101,7 +113,7 @@ async fn la_route_du_coeur_a_disparu() {
 #[tokio::test]
 async fn le_routeur_est_monte_sous_son_nom() {
     let state = new_state();
-    let app = app_avec_concerts(&state).await;
+    let app = app_avec_concerts_premium(&state).await;
 
     // Sans `instance_id`, le plugin répond sans jamais appeler le cloud : le
     // test ne dépend d'aucun réseau.
@@ -118,7 +130,7 @@ async fn le_routeur_est_monte_sous_son_nom() {
 #[tokio::test]
 async fn le_corps_ne_porte_aucune_phrase_anglaise() {
     let state = new_state();
-    let app = app_avec_concerts(&state).await;
+    let app = app_avec_concerts_premium(&state).await;
 
     let (_, corps) = get_json(&app, "/api/v1/ext/concerts/upcoming").await;
     assert!(
@@ -135,7 +147,8 @@ async fn le_corps_ne_porte_aucune_phrase_anglaise() {
 }
 
 #[tokio::test]
-async fn le_greffon_reste_hors_catalogue_tant_qu_aucun_ecran_ne_l_appelle() {
+async fn le_greffon_est_au_catalogue_et_declare_son_module() {
+    use tune_core::license::Feature;
     use tune_core::plugin_sdk::TunePlugin;
 
     let state = new_state();
@@ -148,12 +161,451 @@ async fn le_greffon_reste_hors_catalogue_tant_qu_aucun_ecran_ne_l_appelle() {
         "le greffon doit être opt-in, comme dj, karaoke et bandcamp"
     );
     assert!(
-        !greffon.catalogued(),
-        "le greffon ne doit PAS être offert au catalogue tant qu'aucun écran \
-         ne consomme ses routes : proposer « Installer » sur une fonction que \
-         rien n'expose fait redémarrer l'utilisateur pour rien (#2090). \
-         Rebrancher ce test le jour où l'écran existe."
+        greffon.catalogued(),
+        "l'écran existe (tune-web-client#695) et le nuage a des dates : le \
+         greffon doit être PROPOSÉ à l'installation"
     );
+    assert_eq!(
+        greffon.required_feature(),
+        Some(Feature::Concerts),
+        "le payant est une propriété du greffon : il nomme son module"
+    );
+}
+
+/// ⭐ Ce que l'écran Extensions reçoit réellement : le greffon dormant (pas
+/// encore installé) figure dans `/api/v1/plugins`, installable, avec le
+/// cadenas AVANT le clic. `stores/concerts.ts` (tune-web-client) lit
+/// `required_feature` ; sans lui, l'utilisateur installe, redémarre, et
+/// n'obtient qu'un 402.
+#[tokio::test]
+async fn l_ecran_extensions_propose_le_greffon_avec_son_cadenas() {
+    use_scratch_plugin_data_dir();
+    let state = new_state();
+    // Surtout PAS `plugin_concerts_installed` : c'est le cas d'un compte qui
+    // découvre la fonction.
+    tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+
+    let app = tune_server::routes::router(state.clone());
+    let (statut, liste) = get_json(&app, "/api/v1/plugins").await;
+    assert_eq!(statut, StatusCode::OK);
+    let fiche = liste
+        .as_array()
+        .expect("une liste")
+        .iter()
+        .find(|p| p["name"] == "concerts")
+        .unwrap_or_else(|| panic!("concerts doit figurer au catalogue, dormant : {liste:#}"))
+        .clone();
+
+    assert_eq!(
+        fiche["installed"], false,
+        "pas installé → bouton « Installer »"
+    );
+    assert_eq!(fiche["compatible"], true);
+    assert_eq!(fiche["premium"], true, "cadenas avant le clic");
+    assert_eq!(fiche["required_feature"], "Concerts");
+    assert_eq!(fiche["url"], "/api/v1/ext/concerts");
+
+    // Contre-épreuve : un greffon libre du même binaire ne porte ni cadenas
+    // ni module — le champ vient bien de la déclaration du greffon, pas d'une
+    // valeur posée sur toutes les fiches.
+    if let Some(libre) = liste
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "bandcamp")
+    {
+        assert_eq!(libre["premium"], false, "{libre:#}");
+        assert!(libre["required_feature"].is_null(), "{libre:#}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Premium — le refus appartient au greffon (#2363, décision du 25/09/2026)
+//
+// Un compte gratuit peut INSTALLER le greffon (le refus porte sur les routes,
+// jamais sur le chargement) ; chaque route refuse alors par un 402 dans la
+// forme de `ModuleRefusal` (`error: "module_required"`), l'idiome des refus
+// de module, que le client web reconnaît comme un refus d'offre et non comme
+// une panne.
+// ---------------------------------------------------------------------------
+
+async fn requete(
+    app: &axum::Router,
+    methode: &str,
+    chemin: &str,
+    corps: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(methode).uri(chemin);
+    if corps.is_some() {
+        req = req.header("content-type", "application/json");
+    }
+    let reponse = app
+        .clone()
+        .oneshot(
+            req.body(corps.map_or_else(Body::empty, |c| Body::from(c.to_string())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let statut = reponse.status();
+    let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        statut,
+        serde_json::from_slice(&octets).unwrap_or(Value::Null),
+    )
+}
+
+/// ⭐ Compte gratuit : TOUTES les routes du greffon refusent, et par le même
+/// corps. Une route ajoutée sans son portillon est l'erreur classique — la
+/// lecture refuse, l'écriture passe, et un compte gratuit pose sa commune sur
+/// un service qu'il n'a pas.
+#[tokio::test]
+async fn un_compte_gratuit_recoit_un_refus_d_offre_sur_toutes_les_routes() {
+    let state = new_state();
+    // Même un serveur qui a son identité : le refus passe AVANT tout.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("instance_id", "3f1c7a52-5e0b-4f5e-9d7c-2b8f3f6f9a10")
+        .unwrap();
+    let app = app_avec_concerts(&state).await;
+    assert!(!state.license.is_premium().await, "compte neuf = gratuit");
+
+    for (methode, chemin, corps) in [
+        ("GET", "/api/v1/ext/concerts/upcoming", None),
+        ("GET", "/api/v1/ext/concerts/location", None),
+        (
+            "POST",
+            "/api/v1/ext/concerts/location",
+            Some(r#"{"city":"Dijon","country":"FR","scope":"country"}"#),
+        ),
+        // Un corps illisible passe d'abord le portillon.
+        ("POST", "/api/v1/ext/concerts/location", Some("pas du json")),
+    ] {
+        let (statut, corps) = requete(&app, methode, chemin, corps).await;
+        assert_eq!(
+            statut,
+            StatusCode::PAYMENT_REQUIRED,
+            "{methode} {chemin} : un compte gratuit doit recevoir 402, pas une \
+             liste vide qui se lirait « il n'y a aucun concert » ({corps})"
+        );
+        assert_eq!(corps["error"], "module_required", "{methode} {chemin}");
+        assert_eq!(
+            corps["code"], "module_account_not_linked",
+            "aucun compte lié : le code nomme la raison, que le client traduit"
+        );
+        assert_eq!(corps["action"], "link_account");
+        assert_eq!(corps["module"], "concerts");
+        assert_eq!(corps["feature"], "concerts");
+        assert!(
+            corps.get("concerts").is_none(),
+            "un refus d'offre ne se déguise pas en liste vide"
+        );
+    }
+
+    // Compte lié, mais sans Premium : l'autre raison, l'autre geste. Annoncer
+    // « liez votre compte » à qui l'a déjà lié le renverrait tourner en rond
+    // (#2392).
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("mozaik_access_token", "jeton-de-test")
+        .unwrap();
+    let (statut, corps) = get_json(&app, "/api/v1/ext/concerts/upcoming").await;
+    assert_eq!(statut, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(corps["error"], "module_required");
+    assert_eq!(corps["code"], "module_not_owned");
+    assert_eq!(corps["action"], "purchase_module");
+}
+
+/// Contre-épreuve du précédent : le MÊME serveur, passé Premium, sert.
+/// Si le portillon refusait tout le monde, le test gratuit resterait vert.
+#[tokio::test]
+async fn contre_epreuve_le_meme_serveur_premium_est_servi() {
+    let state = new_state();
+    let app = app_avec_concerts_premium(&state).await;
+
+    let (statut, corps) = get_json(&app, "/api/v1/ext/concerts/location").await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["code"], "concerts.no_location");
+    assert_eq!(
+        corps["scope"], "world",
+        "rien d'enregistré : le nuage ne filtre pas, et on le dit"
+    );
+
+    // Un Premium qui s'en va referme le module, sans redémarrage : la licence
+    // est relue à chaque requête.
+    state.license.set_account_premium(false, None).await;
+    let (statut, _) = get_json(&app, "/api/v1/ext/concerts/upcoming").await;
+    assert_eq!(statut, StatusCode::PAYMENT_REQUIRED);
+}
+
+/// `acces()`, de l'autre côté de la frontière de crate, sur la licence que
+/// l'hôte construit vraiment (`AppState::license`).
+#[tokio::test]
+async fn acces_suit_la_licence_de_l_hote() {
+    let state = new_state();
+    assert_eq!(
+        tune_concerts::acces(Some(state.license.as_ref())).await,
+        tune_concerts::Acces::Refuse
+    );
+    assert_eq!(
+        tune_concerts::acces(None).await,
+        tune_concerts::Acces::Refuse,
+        "une licence absente ne vaut pas une autorisation"
+    );
+    state.license.set_account_premium(true, None).await;
+    assert_eq!(
+        tune_concerts::acces(Some(state.license.as_ref())).await,
+        tune_concerts::Acces::Complet
+    );
+}
+
+// ---------------------------------------------------------------------------
+// La localisation et le périmètre, de bout en bout, contre un nuage simulé.
+//
+// Le routeur est celui du greffon (`router_vers`), pointé sur un banc local :
+// c'est le même code que `router` en production, seule la racine change. Le
+// banc répond comme `site-mozaiklabs` (`routes/api.php`, #186) et garde ce
+// qu'il reçoit.
+// ---------------------------------------------------------------------------
+
+const INSTANCE: &str = "3f1c7a52-5e0b-4f5e-9d7c-2b8f3f6f9a10";
+
+struct NuageSimule {
+    racine: String,
+    recues: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    tache: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for NuageSimule {
+    fn drop(&mut self) {
+        self.tache.abort();
+    }
+}
+
+/// Un nuage minimal : `POST /location` rend la localisation retenue,
+/// `GET /upcoming` rend une date et le périmètre. Lit la requête ENTIÈRE avant
+/// de répondre (un banc qui répond sans lire fait émettre un RST, #1358).
+async fn nuage_simule() -> NuageSimule {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let racine = format!("http://{}", ecoute.local_addr().unwrap());
+    let recues = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let journal = recues.clone();
+
+    let tache = tokio::spawn(async move {
+        loop {
+            let Ok((mut flux, _)) = ecoute.accept().await else {
+                return;
+            };
+            let mut brut = Vec::new();
+            let mut tampon = [0u8; 4096];
+            let (ligne, corps) = loop {
+                let Ok(lu) = flux.read(&mut tampon).await else {
+                    break (String::new(), Value::Null);
+                };
+                if lu == 0 {
+                    break (String::new(), Value::Null);
+                }
+                brut.extend_from_slice(&tampon[..lu]);
+                let Some(fin) = brut.windows(4).position(|f| f == b"\r\n\r\n") else {
+                    continue;
+                };
+                let tete = String::from_utf8_lossy(&brut[..fin]).to_string();
+                let taille = tete
+                    .to_lowercase()
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|s| s.split("\r\n").next())
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if brut.len() >= fin + 4 + taille {
+                    let ligne = tete.lines().next().unwrap_or_default().to_string();
+                    let corps = serde_json::from_slice(&brut[fin + 4..fin + 4 + taille])
+                        .unwrap_or(Value::Null);
+                    break (ligne, corps);
+                }
+            };
+            if ligne.is_empty() {
+                continue;
+            }
+            journal.lock().unwrap().push((ligne.clone(), corps.clone()));
+
+            let reponse = if ligne.starts_with("POST /location ") {
+                serde_json::json!({
+                    "scope": corps["scope"],
+                    "city": corps["city"],
+                    "country": corps["country"],
+                    "radius_km": corps["radius_km"],
+                    "located": true,
+                })
+            } else {
+                serde_json::json!({
+                    "concerts": [{
+                        "artist_name": "Superbus", "event_date": "2026-11-02",
+                        "venue": "La Vapeur", "city": "Dijon", "country": "FR",
+                    }],
+                    "scope": "radius", "radius_km": 50,
+                    "city": "Dijon", "country": "FR",
+                })
+            }
+            .to_string();
+            let http = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reponse}",
+                reponse.len()
+            );
+            let _ = flux.write_all(http.as_bytes()).await;
+            let _ = flux.flush().await;
+            let _ = flux.shutdown().await;
+        }
+    });
+
+    NuageSimule {
+        racine,
+        recues,
+        tache,
+    }
+}
+
+/// ⭐ L'aller-retour complet : l'écran pose sa commune et son cran, le
+/// greffon les relaie au nuage SOUS L'IDENTITÉ DU SERVEUR, rend ce que le
+/// nuage a retenu, le garde pour `GET /location` ; puis `upcoming` rend le
+/// périmètre appliqué avec les dates.
+#[tokio::test]
+async fn la_localisation_fait_l_aller_retour_et_upcoming_rend_le_perimetre() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("instance_id", INSTANCE)
+        .unwrap();
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+
+    // Le corps EXACT de `setLocalisationConcerts` (tune-web-client), avec une
+    // identité que le client prétendrait — elle ne doit jamais partir.
+    let (statut, rendu) = requete(
+        &app,
+        "POST",
+        "/location",
+        Some(
+            r#"{"city":"Dijon","postal_code":"21000","country":"fr","scope":"radius",
+               "radius_km":50,"instance_id":"00000000-0000-4000-8000-000000000000"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{rendu}");
+    // Les champs obligatoires du contrat `LocalisationConcerts`
+    // (docs/contrat-web.json) : scope, city, country, radius_km.
+    assert_eq!(rendu["scope"], "radius");
+    assert_eq!(rendu["city"], "Dijon");
+    assert_eq!(rendu["country"], "FR", "le pays part en majuscules");
+    assert_eq!(rendu["radius_km"], 50);
+    assert_eq!(rendu["located"], true);
+
+    {
+        let recues = nuage.recues.lock().unwrap();
+        let (ligne, corps) = &recues[0];
+        assert!(ligne.starts_with("POST /location "), "{ligne}");
+        assert_eq!(
+            corps["instance_id"], INSTANCE,
+            "l'identité est celle du serveur, jamais celle du client"
+        );
+        assert_eq!(corps["postal_code"], "21000");
+        assert!(
+            corps.get("latitude").is_none() && corps.get("longitude").is_none(),
+            "aucune position déduite ne part : la commune est SAISIE"
+        );
+    }
+
+    // Gardée pour la lecture — le nuage n'a pas de route de lecture.
+    let (statut, lue) = requete(&app, "GET", "/location", None).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(lue["scope"], "radius");
+    assert_eq!(lue["radius_km"], 50);
+    assert_eq!(lue["postal_code"], "21000");
+    assert!(lue.get("code").is_none(), "{lue}");
+
+    let (statut, a_venir) = requete(&app, "GET", "/upcoming", None).await;
+    assert_eq!(statut, StatusCode::OK, "{a_venir}");
+    assert_eq!(a_venir["concerts"][0]["artist_name"], "Superbus");
+    assert_eq!(a_venir["scope"], "radius");
+    assert_eq!(a_venir["radius_km"], 50);
+    assert_eq!(a_venir["city"], "Dijon");
+    assert_eq!(a_venir["country"], "FR");
+
+    let recues = nuage.recues.lock().unwrap();
+    let (ligne, _) = &recues[1];
+    assert!(
+        ligne.starts_with("GET /upcoming?") && ligne.contains(INSTANCE),
+        "la lecture porte l'identité de l'instance : {ligne}"
+    );
+}
+
+/// Une demande hors des règles du nuage est refusée ICI, en 422 et en nommant
+/// le champ — et le nuage n'est pas appelé. Contre-épreuve de l'aller-retour :
+/// la même route, un rayon hors liste.
+#[tokio::test]
+async fn contre_epreuve_une_demande_invalide_ne_part_pas_au_nuage() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("instance_id", INSTANCE)
+        .unwrap();
+    let nuage = nuage_simule().await;
+    let app = tune_concerts::router_vers(
+        &nuage.racine,
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+
+    let (statut, corps) = requete(
+        &app,
+        "POST",
+        "/location",
+        Some(r#"{"city":"Dijon","country":"FR","scope":"radius","radius_km":75}"#),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(corps["code"], "concerts.invalid_location");
+    assert_eq!(corps["field"], "radius_km");
+    assert!(
+        nuage.recues.lock().unwrap().is_empty(),
+        "rien ne part au nuage"
+    );
+
+    let (_, lue) = requete(&app, "GET", "/location", None).await;
+    assert_eq!(
+        lue["code"], "concerts.no_location",
+        "un refus n'enregistre rien"
+    );
+}
+
+/// Sans identité d'instance, la localisation ne peut pas être posée : un
+/// statut d'erreur, pas un 200 — l'écran ne regarde que les exceptions sur
+/// cette route.
+#[tokio::test]
+async fn sans_identite_la_localisation_est_un_echec_visible() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+    let app = tune_concerts::router_vers(
+        "http://127.0.0.1:9",
+        state.backend.clone(),
+        Some(state.license.clone()),
+    );
+
+    let (statut, corps) = requete(
+        &app,
+        "POST",
+        "/location",
+        Some(r#"{"city":"Dijon","country":"FR"}"#),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT);
+    assert_eq!(corps["code"], "concerts.no_instance_id");
 }
 
 #[tokio::test]

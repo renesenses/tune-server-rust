@@ -82,12 +82,12 @@ pub(super) async fn track_credits(
             "SELECT id, track_id, artist_id, artist_name, role, instrument, position FROM track_credits WHERE track_id = ? ORDER BY position",
             &[&id as &dyn ToSqlValue],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "track_id": r.get(1).and_then(|v| v.as_i64()),
                 "artist_id": r.get(2).and_then(|v| v.as_i64()),
                 "artist_name": r.get(3).and_then(|v| v.as_string()),
@@ -123,12 +123,12 @@ pub(super) async fn artist_credits(
     let rows = state
         .backend
         .query_many(&sql, &[&id_str as &dyn ToSqlValue, &id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "track_id": r.get(1).and_then(|v| v.as_i64()),
                 "artist_id": r.get(2).and_then(|v| v.as_i64()),
                 "artist_name": r.get(3).and_then(|v| v.as_string()),
@@ -455,7 +455,7 @@ pub(super) async fn enrich_all_credits(
             .ou_defaut_journalise()
             .into_iter()
             .filter_map(|r| {
-                let id = r.get(0).and_then(|v| v.as_i64())?;
+                let id = r.first().and_then(|v| v.as_i64())?;
                 let mbid = r.get(1).and_then(|v| v.as_string())?;
                 Some((id, mbid))
             })

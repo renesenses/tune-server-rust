@@ -64,6 +64,8 @@ mod tests {
     }
 
     #[test]
+    // Le « PAS » en capitales porte le sens du témoin (clippy 1.98).
+    #[allow(non_snake_case)]
     fn une_panne_systemique_ne_l_est_PAS() {
         // 🔴 Le cœur du garde-fou : ces motifs-là doivent continuer d'épuiser
         // le budget de 25, sans quoi un jeton expiré ferait marteler le

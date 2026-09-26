@@ -748,6 +748,28 @@ impl PositionPoller {
         Self::next_position_inner(zone_state, false)
     }
 
+    /// #5143 — LA prochaine piste JOUABLE : `next_position`, puis les lignes
+    /// bannies enjambées par le même parcours que l'avance de la file
+    /// (`orchestrator::lignes_bannies_a_enjamber`). File [A, B banni, C], A en
+    /// cours : rend C. `None` quand il n'y a plus rien, ou que tout ce qui
+    /// reste est banni.
+    ///
+    /// C'est la suivante que préparent l'armement sans blanc et le
+    /// préchargement, et celle que suivent les gardes de l'armement (« la file
+    /// a changé », verrou DSD) et l'avance des métadonnées à l'enchaînement :
+    /// tous doivent désigner la même, sans quoi un armement de C serait jugé
+    /// périmé face à B et ré-armé à chaque sondage.
+    pub fn prochaine_position_jouable(
+        db: &Arc<dyn crate::db::backend::DbBackend>,
+        zone_id: i64,
+        zone_state: &crate::playback::ZoneState,
+    ) -> Option<i64> {
+        let p = Self::next_position(zone_state)?;
+        crate::orchestrator::lignes_bannies_a_enjamber(db, zone_id, p)
+            .0
+            .position_depuis(p)
+    }
+
     /// Next-track decision for a MANUAL skip (the `next` button). A manual skip
     /// is an explicit request for a *different* track, so it ignores repeat-one
     /// — treating it as repeat-all (advance, wrapping at the end) instead of
@@ -867,7 +889,9 @@ impl PositionPoller {
         zone_state: &crate::playback::ZoneState,
         arme: Option<ArmedNext>,
     ) -> Option<i64> {
-        let par_index = Self::next_position(zone_state);
+        // #5143 — la suivante JOUABLE : celle que l'armement a envoyée quand
+        // la suivante par l'index est bannie.
+        let par_index = Self::prochaine_position_jouable(&self.db, zone_id, zone_state);
         let arme = arme?;
         let repo = crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
         let ligne_au_suivant = par_index
@@ -1185,6 +1209,12 @@ mod depassement_duree_nagit_pas_guard;
 /// par désarmer.
 #[cfg(test)]
 mod lire_ensuite_dans_la_fenetre_gapless;
+
+/// #5143 — une suivante BANNIE n'est ni préchargée, ni armée, ni jouée après
+/// un échec : préchargement, enchaînement sans blanc et reprise désignent la
+/// même suivante que l'avance de la file.
+#[cfg(test)]
+mod suivante_bannie_5143;
 
 /// Garde-fou #2991 — les DEUX branchements que ce ticket a posés vivent chacun
 /// à un EMPLACEMENT précis d'une boucle de dix mille lignes. Retirés, ils

@@ -93,10 +93,8 @@ impl PlaybackOrchestrator {
             self.lastfm_now_playing(title, artist, album);
         }
 
-        if lb_ready {
-            if !lastfm_ready || is_premium {
-                self.listenbrainz_now_playing(title, artist, album);
-            }
+        if lb_ready && (!lastfm_ready || is_premium) {
+            self.listenbrainz_now_playing(title, artist, album);
         }
     }
 

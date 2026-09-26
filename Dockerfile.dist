@@ -40,8 +40,9 @@ COPY dist/${TARGETARCH}/airplay-daemon /usr/local/bin/airplay-daemon
 # cette image à la main sans cette étape échouera ici — c'est voulu, plutôt que
 # d'embarquer silencieusement une interface périmée.
 COPY web/ /app/web/
-# Bundled Party (WASM) plugin, next to /app/tune-server (arch-independent). The
-# plugins-wasm runtime resolves plugins/ exe-relative, i.e. /app/plugins.
+# Bundled WASM plugins (Party, Playlists converter #4715), next to
+# /app/tune-server (arch-independent). The plugins-wasm runtime resolves
+# plugins/ exe-relative, i.e. /app/plugins.
 COPY dist/plugins/ /app/plugins/
 
 RUN chmod +x /app/tune-server /usr/local/bin/librespot /usr/local/bin/airplay-daemon && \

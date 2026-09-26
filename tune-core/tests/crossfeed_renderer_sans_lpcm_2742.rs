@@ -54,10 +54,7 @@ async fn renderer_qui_annonce(sink: &'static str) -> (String, tokio::task::JoinH
             tokio::spawn(async move {
                 let mut brut = Vec::new();
                 let mut tampon = [0u8; 4096];
-                loop {
-                    let Ok(n) = sock.read(&mut tampon).await else {
-                        break;
-                    };
+                while let Ok(n) = sock.read(&mut tampon).await {
                     if n == 0 {
                         break;
                     }
@@ -129,7 +126,7 @@ fn diaphonie_du_fichier_servi(chemin: &str) -> (f64, String) {
     assert_eq!(d.channels, 2, "le fichier servi reste stéréo");
     let pleine_echelle = (1i64 << (d.bit_depth - 1)) as f64;
     let (mut eg, mut ed) = (0.0f64, 0.0f64);
-    for f in d.samples_i32.chunks_exact(2) {
+    for f in d.samples_i32.as_chunks::<2>().0.iter() {
         let (l, r) = (f[0] as f64 / pleine_echelle, f[1] as f64 / pleine_echelle);
         eg += l * l;
         ed += r * r;

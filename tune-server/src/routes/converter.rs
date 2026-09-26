@@ -695,10 +695,10 @@ fn payload_statut(job_id: &str, job: &ConvertJob) -> Value {
 async fn job_status(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, AppError> {
     let store = job_store();
     let map = store.lock().await;
-    if !map.contains_key(&job_id) {
-        if let Some(status) = crate::audio_job_journal::recovered("converter", &job_id) {
-            return Ok(Json(status));
-        }
+    if !map.contains_key(&job_id)
+        && let Some(status) = crate::audio_job_journal::recovered("converter", &job_id)
+    {
+        return Ok(Json(status));
     }
     let job_arc = map
         .get(&job_id)
@@ -880,6 +880,9 @@ async fn cancel_job(AxumPath(job_id): AxumPath<String>) -> Result<Json<Value>, A
 // Background conversion worker
 // ---------------------------------------------------------------------------
 
+// Tâche de fond lancée une fois par conversion : une structure d'arguments
+// changerait sa seule invocation pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn run_conversion(
     job: Arc<Mutex<ConvertJob>>,
     files: Vec<PathBuf>,
@@ -1218,7 +1221,8 @@ fn encode_lossless_native(
     // Encode
     let encoded = match format {
         "wav" => encode_wav(&pcm_final, out_sr, out_bd as u32, decoded.channels)?,
-        "flac" | _ => encode_flac(&pcm_final, out_sr, out_bd as u32, decoded.channels)?,
+        // « flac », et tout autre format demandé : FLAC par défaut.
+        _ => encode_flac(&pcm_final, out_sr, out_bd as u32, decoded.channels)?,
     };
 
     std::fs::write(output, &encoded)
@@ -1304,16 +1308,16 @@ pub(super) fn encode_flac(
 
 /// Convert i32 samples from one bit depth to another, returning PCM bytes.
 pub(super) fn convert_bit_depth(samples: &[i32], from_bd: u16, to_bd: u16) -> Vec<u8> {
-    let bytes_per_sample = ((to_bd as usize) + 7) / 8;
+    let bytes_per_sample = (to_bd as usize).div_ceil(8);
     let mut output = Vec::with_capacity(samples.len() * bytes_per_sample);
 
     for &s in samples {
         let v = match (from_bd, to_bd) {
-            (24, 16) => (s >> 8) as i32,
-            (32, 16) => (s >> 16) as i32,
-            (16, 24) => (s as i32) << 8,
+            (24, 16) => s >> 8,
+            (32, 16) => s >> 16,
+            (16, 24) => s << 8,
             (32, 24) => s >> 8,
-            (16, 32) => (s as i32) << 16,
+            (16, 32) => s << 16,
             (24, 32) => s << 8,
             _ => s,
         };
@@ -1563,10 +1567,10 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_audio_files(&path, out);
-        } else if let Some(s) = path.to_str() {
-            if convertible_input(s) {
-                out.push(path);
-            }
+        } else if let Some(s) = path.to_str()
+            && convertible_input(s)
+        {
+            out.push(path);
         }
     }
 }
@@ -1651,7 +1655,7 @@ fn decode_via_converter_ffmpeg(
         return Err("ffmpeg decode produced no usable PCM".into());
     }
     let mut samples_i32 = Vec::with_capacity(pcm.len() / 3);
-    for b in pcm.chunks_exact(3) {
+    for b in pcm.as_chunks::<3>().0 {
         let v = (b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16);
         samples_i32.push((v << 8) >> 8); // sign-extend 24-bit
     }
@@ -1777,7 +1781,7 @@ pub(super) fn copy_tags(source: &Path, dest: &Path) -> Result<(), String> {
         ItemKey::ReplayGainAlbumGain,
         ItemKey::ReplayGainAlbumPeak,
     ] {
-        if let Some(item) = src_tag.get(key.clone()) {
+        if let Some(item) = src_tag.get(key) {
             dst_tag.push(item.clone());
         }
     }

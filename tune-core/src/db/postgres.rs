@@ -77,7 +77,7 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // forcing the `::text` flavour is both wrong and fatal (#1706).
     "DO $ensure$ BEGIN \
             IF EXISTS (SELECT 1 FROM information_schema.columns \
-                        WHERE table_name = 'streaming_favorites' AND column_name = 'id' \
+                        WHERE table_schema = current_schema() AND table_name = 'streaming_favorites' AND column_name = 'id' \
                           AND data_type IN ('text', 'character varying')) THEN \
                 ALTER TABLE streaming_favorites \
                     ALTER COLUMN id SET DEFAULT nextval('streaming_favorites_id_seq')::text; \
@@ -146,6 +146,24 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (tag_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_item_tags_item ON streaming_item_tags(item_type, source, source_id)",
+    // Titres de SERVICE bannis (#4806). SEUL chemin des bases PostgreSQL
+    // existantes, numerotees comme converties : pas de script numerote (voir
+    // le rattrapage SQLite de `run_migrations`), ce rattrapage rejoue a CHAQUE
+    // demarrage suffit — c'est deja le regime de `streaming_favorites`.
+    "CREATE TABLE IF NOT EXISTS streaming_hidden_items (\
+            profile_id BIGINT NOT NULL DEFAULT 1,\
+            item_type TEXT NOT NULL,\
+            source TEXT NOT NULL,\
+            source_id TEXT NOT NULL,\
+            title TEXT,\
+            artist TEXT,\
+            album TEXT,\
+            album_source_id TEXT,\
+            cover_url TEXT,\
+            created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),\
+            PRIMARY KEY (profile_id, item_type, source, source_id)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id)",
     // Registre DURABLE des serveurs multimedia (#2219, phase 1). Quatrieme
     // chemin, meme raison : une base PostgreSQL convertie AVANT cette version
     // porte `schema_version = 99` et ne recevra jamais la migration 058. Or la
@@ -280,7 +298,18 @@ impl PostgresDb {
     /// an existing Postgres database self-heals on startup instead of erroring
     /// at runtime. `days_of_week`/`multi_zone_ids` were missing on .15 prod →
     /// the alarm scheduler failed every 30s with `column ... does not exist`.
-    async fn ensure_schema(&self) {
+    ///
+    /// ⚠️ Public, et à rejouer APRÈS `run_pg_migrations()` (chasse PG du
+    /// 25/09/2026). `connect()` l'appelle AVANT les scripts numérotés — c'est
+    /// voulu (#1706 : réparer une base dérivée avant qu'une migration ne bute
+    /// dessus). Mais sur une base VIDE, ses `ALTER TABLE` visent des tables qui
+    /// n'existent pas encore : ils échouent tous, et les scripts créent ensuite
+    /// les tables SANS les colonnes que seul `ENSURE_COLUMNS` apporte
+    /// (`listen_history.album_id`, `source_id`, les `bio_*`, `zones.host`…),
+    /// jusqu'au redémarrage suivant. Le second passage, idempotent, les pose dès
+    /// le premier démarrage. Voir
+    /// `tune-server/tests/pg_premier_demarrage_base_neuve.rs`.
+    pub async fn ensure_schema(&self) {
         self.run_each("pg_ensure_tables_failed", ENSURE_TABLES)
             .await;
         self.run_each("pg_ensure_schema_failed", ENSURE_COLUMNS)
@@ -400,6 +429,10 @@ mod tests {
             .expect("streaming_favorites id DEFAULT statement missing");
         assert!(stmt.starts_with("DO $"), "unguarded ALTER: {stmt}");
         assert!(stmt.contains("information_schema.columns"), "{stmt}");
+        assert!(
+            stmt.contains("table_schema = current_schema()"),
+            "#5003 : {stmt}"
+        );
         assert!(stmt.contains("'text', 'character varying'"), "{stmt}");
     }
 }

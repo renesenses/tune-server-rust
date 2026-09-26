@@ -73,7 +73,7 @@ fn texte(v: Option<&Value>) -> String {
     }
 }
 
-fn operateur(rule: &Value) -> String {
+pub(crate) fn operateur(rule: &Value) -> String {
     // 🔴 #4467 — la même lecture des deux clés que les trois autres
     // analyseurs, au même endroit.
     let brut = crate::regles_sql::lire_op(rule);
@@ -88,7 +88,7 @@ fn operateur(rule: &Value) -> String {
 }
 
 /// Les valeurs d'une règle : une liste pour `in`, sinon une seule.
-fn valeurs(rule: &Value) -> Vec<String> {
+pub(crate) fn valeurs(rule: &Value) -> Vec<String> {
     match rule.get("value") {
         Some(Value::Array(a)) => a.iter().map(|v| texte(Some(v))).collect(),
         Some(Value::String(s)) if operateur(rule) == "in" => {
@@ -130,7 +130,7 @@ fn motif(s: &str) -> String {
     )
 }
 
-fn comparaison_texte(col: &str, op: &str, vals: &[String]) -> String {
+pub(crate) fn comparaison_texte(col: &str, op: &str, vals: &[String]) -> String {
     let v = vals.first().map(String::as_str).unwrap_or("");
     match op {
         "=" => format!("LOWER({col}) = LOWER('{}')", apostrophes(v)),
@@ -205,12 +205,7 @@ pub(crate) fn requete(
     sort_order: &str,
     limite: Option<i64>,
 ) -> Option<String> {
-    if !demande_un_service(rules_json) {
-        return None;
-    }
-    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
-    let joiner = if match_mode == "any" { " OR " } else { " AND " };
-    let conditions: Vec<String> = rules.iter().map(|r| condition(r, objet)).collect();
+    let ou = filtre(rules_json, match_mode, objet, profile_id)?;
     let tri = if sort_by == "random" {
         "RANDOM()".to_string()
     } else {
@@ -229,11 +224,56 @@ pub(crate) fn requete(
     Some(format!(
         "SELECT sf.service, sf.service_id, sf.title, sf.artist, sf.album, sf.cover_url \
          FROM streaming_favorites sf \
-         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds}) \
-         ORDER BY {tri}{limite}",
+         WHERE {ou} \
+         ORDER BY {tri}{limite}"
+    ))
+}
+
+/// Le filtre `WHERE` des favoris de service que les règles sélectionnent, sur
+/// l'alias `sf` — ou `None` quand aucune règle `source` ne nomme de service.
+///
+/// Partagé par [`requete`], [`requete_compte`] et, depuis #5026, par
+/// `etiquettes_streaming`, qui écarte les albums que ce chemin rend déjà : un
+/// album Qobuz à la fois favori et étiqueté ne doit ni paraître ni compter
+/// deux fois.
+pub(crate) fn filtre(
+    rules_json: &str,
+    match_mode: &str,
+    objet: Objet,
+    profile_id: i64,
+) -> Option<String> {
+    if !demande_un_service(rules_json) {
+        return None;
+    }
+    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    let joiner = if match_mode == "any" { " OR " } else { " AND " };
+    let conditions: Vec<String> = rules.iter().map(|r| condition(r, objet)).collect();
+    Some(format!(
+        "sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds}){socle}",
         item = objet.item_type(),
         conds = conditions.join(joiner),
+        socle = socle_des_bannis(objet, profile_id),
     ))
+}
+
+/// #4806 suite — un titre de service BANNI par ce profil sort d'office d'une
+/// playlist intelligente, sans règle à configurer : la jumelle, pour les
+/// favoris de service, de `smart_playlists::avec_le_socle_des_bannis`. Posé
+/// HORS de la parenthèse des règles, pour qu'un `match_mode = any` ne le
+/// contourne pas par précédence. Une collection (des albums) n'est pas
+/// concernée : on bannit un TITRE.
+fn socle_des_bannis(objet: Objet, profile_id: i64) -> String {
+    match objet {
+        Objet::Piste => format!(
+            " AND {}",
+            tune_core::db::facet_filter::banned_streaming_excluded(
+                profile_id,
+                "sf.service",
+                "sf.service_id"
+            )
+        ),
+        Objet::Album => String::new(),
+    }
 }
 
 /// COMBIEN de favoris de service satisfont les règles — la même sélection que
@@ -254,17 +294,10 @@ pub(crate) fn requete_compte(
     objet: Objet,
     profile_id: i64,
 ) -> Option<String> {
-    if !demande_un_service(rules_json) {
-        return None;
-    }
-    let rules: Vec<Value> = serde_json::from_str(rules_json).unwrap_or_default();
-    let joiner = if match_mode == "any" { " OR " } else { " AND " };
-    let conditions: Vec<String> = rules.iter().map(|r| condition(r, objet)).collect();
+    let ou = filtre(rules_json, match_mode, objet, profile_id)?;
     Some(format!(
         "SELECT COUNT(*) FROM streaming_favorites sf \
-         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds})",
-        item = objet.item_type(),
-        conds = conditions.join(joiner),
+         WHERE {ou}"
     ))
 }
 

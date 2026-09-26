@@ -135,7 +135,7 @@ async fn set_active_skin(
 
     tracing::info!(skin_id = %body.skin_id, "active_skin_changed");
 
-    if let Some(ref bus) = Some(&state.event_bus) {
+    if let Some(bus) = Some(&state.event_bus) {
         bus.emit("skin.changed", json!({ "skin_id": body.skin_id }));
     }
 

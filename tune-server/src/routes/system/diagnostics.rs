@@ -126,7 +126,7 @@ fn horodatage_de_ligne(ligne: &str) -> Option<&str> {
 fn periode_couverte(extrait: &str) -> Option<String> {
     let mut lignes = extrait.lines().filter_map(horodatage_de_ligne);
     let debut = lignes.next()?;
-    match lignes.last() {
+    match lignes.next_back() {
         Some(fin) if fin != debut => Some(format!("du {debut} au {fin}")),
         _ => Some(format!("à {debut}")),
     }
@@ -1438,11 +1438,11 @@ fn selectionner_lignes(
     let seuil_ancienne_fenetre = candidates.len().saturating_sub(max_lines);
     let retenu: std::collections::BTreeSet<usize> = retenues.iter().copied().collect();
     let mut vraiment_ecartees: BTreeMap<String, usize> = BTreeMap::new();
-    for i in seuil_ancienne_fenetre..candidates.len() {
+    for (i, candidate) in candidates.iter().enumerate().skip(seuil_ancienne_fenetre) {
         if retenu.contains(&i) {
             continue;
         }
-        if let Some(m) = module_de_la_ligne(&candidates[i]) {
+        if let Some(m) = module_de_la_ligne(candidate) {
             *vraiment_ecartees.entry(m.to_string()).or_insert(0) += 1;
         }
     }
@@ -1455,7 +1455,11 @@ fn selectionner_lignes(
 }
 
 pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
-    collect_recent_logs(q.lines.unwrap_or(1000)).await
+    // #5124 — « Exporter les journaux » : le fichier finit collé dans un fil.
+    // Même nettoyage que le rapport de bogue, par la même fonction.
+    let Json(mut journaux) = collect_recent_logs(q.lines.unwrap_or(1000)).await;
+    tune_core::confidentialite::anonymiser_json(&mut journaux);
+    Json(journaux)
 }
 
 #[derive(Deserialize)]
@@ -1610,18 +1614,17 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
                     "short-iso",
                 ])
                 .output()
+                && output.status.success()
             {
-                if output.status.success() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    let count = text.lines().count();
-                    if count > 1 {
-                        return Json(json!({
-                            "logs": text,
-                            "lines": count,
-                            "source": "journalctl",
-                            "service": service,
-                        }));
-                    }
+                let text = String::from_utf8_lossy(&output.stdout);
+                let count = text.lines().count();
+                if count > 1 {
+                    return Json(json!({
+                        "logs": text,
+                        "lines": count,
+                        "source": "journalctl",
+                        "service": service,
+                    }));
                 }
             }
         }
@@ -1651,10 +1654,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     #[cfg(target_os = "macos")]
     {
         let stderr_paths = [
-            format!(
-                "{}/Library/Logs/tune-server.log",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-            ),
+            // L'emplacement par défaut du journal, par la MÊME fonction que
+            // l'écrivain (`config::chemin_du_journal`) : plus de chemin
+            // recomposé ici, ni de repli `/tmp` partagé entre comptes (#4770).
+            crate::config::emplacement_par_defaut_du_journal()
+                .to_string_lossy()
+                .into_owned(),
             "/usr/local/var/log/tune-server.log".into(),
             "/opt/homebrew/var/log/tune-server.log".into(),
         ];
@@ -1714,10 +1719,12 @@ pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
     #[cfg(not(target_os = "macos"))]
     {
         let stderr_paths: [String; 3] = [
-            format!(
-                "{}/Library/Logs/tune-server.log",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())
-            ),
+            // L'emplacement par défaut du journal, par la MÊME fonction que
+            // l'écrivain (`config::chemin_du_journal`) : plus de chemin
+            // recomposé ici, ni de repli `/tmp` partagé entre comptes (#4770).
+            crate::config::emplacement_par_defaut_du_journal()
+                .to_string_lossy()
+                .into_owned(),
             "/usr/local/var/log/tune-server.log".into(),
             "/opt/homebrew/var/log/tune-server.log".into(),
         ];
@@ -2567,7 +2574,7 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         md.push_str("\n```\n");
     }
 
-    Json(json!({
+    let mut rapport = json!({
         "version": tune_core::version(),
         // #3380 — le champ que la telemetrie reprend et que l'admin mozaiklabs
         // affichera a cote de `version`. `null` = interface non identifiable.
@@ -2648,7 +2655,14 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "settings": reglages,
         "audio": moteur_audio,
         "markdown": md,
-    }))
+    });
+    // #5124 — ce rapport part tel quel sur le forum PUBLIC (`submit`), en
+    // pièce jointe d'un ticket (`markdown`), et l'aperçu doit montrer
+    // exactement ce qui partira. Le nom qu'annonce un serveur UPnP, les
+    // répertoires musicaux et le journal portent des adresses, des chemins
+    // personnels et des jetons : on nettoie ICI, à la seule source des trois.
+    tune_core::confidentialite::anonymiser_json(&mut rapport);
+    Json(rapport)
 }
 
 /// Returns the bug report as raw markdown (text/markdown) for direct forum paste.
@@ -2870,7 +2884,15 @@ pub(super) async fn submit_bug_report(
     };
 
     let (code, corps) = envoyer_le_rapport(state, description, images).await;
-    (code, Json(corps)).into_response()
+    let mut resp = (code, Json(&corps)).into_response();
+    // #5068 — le délai du site, aussi sous sa forme standard.
+    if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+    }
+    resp
 }
 
 /// Le corps du signalement, une fois le format d'entrée résolu.
@@ -3036,10 +3058,15 @@ async fn envoyer_le_rapport(
         Ok(resp) => {
             let status = resp.status().as_u16();
             tracing::warn!(status, images = nb_images, "bug_report_submit_rejected");
-            (
-                StatusCode::BAD_GATEWAY,
-                json!({ "error": "cloud rejected the report", "status": status }),
-            )
+            // #5068 — la limite d'envoi du site garde son 429 : ce n'est pas
+            // une panne, et un 5xx ferait lever à l'interface un bandeau
+            // « Server error » en plus de la phrase de l'écran.
+            let code = if status == 429 {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (code, corps_du_refus(status, resp.headers()))
         }
         Err(e) => {
             tracing::warn!(error = %e, "bug_report_submit_failed");
@@ -3049,6 +3076,31 @@ async fn envoyer_le_rapport(
             )
         }
     }
+}
+
+/// Le corps rendu à l'écran quand le site refuse le rapport (#5068).
+///
+/// Le site limite `POST /api/v1/community/bug-report` à 5 envois par heure et
+/// par adresse (`throttle:5,60`). Avant #5068, ce refus-là arrivait à l'écran
+/// comme les autres : « cloud rejected the report », sans dire qu'il suffisait
+/// d'attendre, ni combien. Sur 429 on rend donc un CODE stable,
+/// `rate_limited`, que l'interface traduit elle-même, et le délai en secondes
+/// lu dans le `Retry-After` du site sous `retry_after` — le même nom que le
+/// relais du support (#2178), que le client web lit déjà. Sans en-tête
+/// exploitable, la clé est absente : on n'invente aucun délai.
+///
+/// Hors 429, le statut rendu reste 502 et `status` porte le code du site, comme
+/// avant.
+fn corps_du_refus(status: u16, headers: &reqwest::header::HeaderMap) -> Value {
+    if status == 429 {
+        let mut corps =
+            json!({ "error": "rate_limited", "code": "rate_limited", "status": status });
+        if let Some(secs) = tune_core::cloud::rate_limit::retry_after_secs(headers) {
+            corps["retry_after"] = json!(secs);
+        }
+        return corps;
+    }
+    json!({ "error": "cloud rejected the report", "status": status })
 }
 
 pub(super) async fn audio_check() -> Json<Value> {

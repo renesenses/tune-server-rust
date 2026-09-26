@@ -45,7 +45,7 @@ fn build_genres_json(genres: &[String], genre: Option<&str>) -> Option<String> {
 }
 
 /// Apply freshly-read metadata from disk onto an existing Track struct.
-fn apply_metadata_to_track(
+pub(super) fn apply_metadata_to_track(
     track: &mut tune_core::db::models::Track,
     m: &tune_core::metadata::TrackMetadata,
 ) {
@@ -178,9 +178,90 @@ pub(super) async fn unban_track(
     }
 }
 
+/// Corps de `POST /library/tracks/streaming/unban`.
+#[derive(Deserialize)]
+pub(super) struct DesignationDeService {
+    source: String,
+    source_id: String,
+}
+
+/// `POST /library/tracks/streaming/ban` — bannit un titre de SERVICE (Qobuz,
+/// Tidal, Bandcamp…) pour le profil qui agit (#4806 suite). Même promesse
+/// que la forme locale : jamais joué par une sélection automatique, sauté
+/// quand une file y arrive, grisé mais jouable à la main. Le corps porte la
+/// paire et l'instantané d'affichage (`title`, `artist`, `album`,
+/// `album_source_id`, `cover_url`). 400 si la paire est incomplète, ou si la
+/// `source` désigne la bibliothèque (`local`, `upnp` : c'est `/tracks/{id}/ban`).
+///
+/// S'il JOUE au moment du bannissement, la zone passe au suivant, comme pour
+/// un titre local.
+pub(super) async fn ban_streaming_track(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    Json(body): Json<tune_core::db::hidden_repo::TitreDeService>,
+) -> Result<Json<Value>, AppError> {
+    let source = tune_core::db::hidden_repo::source_normalisee(&body.source);
+    if matches!(source.as_str(), "local" | "upnp") {
+        return Err(AppError::bad_request(
+            "a library track is banned by POST /library/tracks/{id}/ban",
+        ));
+    }
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.ban_streaming_track(profile.id(), &body) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::bad_request(
+                "source and source_id are both required",
+            ));
+        }
+        Err(e) => return Err(AppError::internal(e)),
+    }
+    let source_id = body.source_id.trim().to_string();
+    let zones = crate::routes::playback::passer_les_zones_qui_jouent(
+        &state,
+        &crate::routes::playback::PisteVisee::Service {
+            source: source.clone(),
+            source_id: source_id.clone(),
+        },
+    )
+    .await;
+    Ok(Json(json!({
+        "track_id": Value::Null,
+        "source": source,
+        "source_id": source_id,
+        "profile_id": profile.id(),
+        "banned": true,
+        "zones_passees_au_suivant": zones,
+    })))
+}
+
+/// `POST /library/tracks/streaming/unban` — débannit un titre de service.
+/// Idempotent : débannir un titre non banni rend `banned: false`.
+pub(super) async fn unban_streaming_track(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    Json(body): Json<DesignationDeService>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.unban_streaming_track(profile.id(), &body.source, &body.source_id) {
+        Ok(_) => Ok(Json(json!({
+            "track_id": Value::Null,
+            "source": tune_core::db::hidden_repo::source_normalisee(&body.source),
+            "source_id": body.source_id.trim(),
+            "profile_id": profile.id(),
+            "banned": false,
+        }))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
 /// `GET /library/tracks/banned` — l'écran « Titres bannis » du profil :
 /// tout revoir et débannir, y compris les marqueurs orphelins (piste morte),
-/// rendus avec l'instantané d'identité.
+/// rendus avec l'instantané d'identité. Les titres de SERVICE y figurent
+/// aussi (#4806 suite) : `track_id: null` et la paire `source` + `source_id`.
+/// C'est aussi la liste que le client lit pour griser un titre de service
+/// dans son album de service — les routes du catalogue d'un service ne
+/// connaissent pas le profil.
 pub(super) async fn list_banned_tracks(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
@@ -478,10 +559,12 @@ pub(super) async fn stream_track_audio(
     req_headers: HeaderMap,
 ) -> impl IntoResponse {
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let track = match repo.get(id) {
+    let mut track = match repo.get(id) {
         Ok(Some(t)) => t,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
+    // #4907 — même choix d'exemplaire que la lecture en zone.
+    tune_core::library::exemplaires::appliquer_a_la_lecture(&*state.backend, &mut track);
 
     let Some(ref file_path) = track.file_path else {
         return StatusCode::NOT_FOUND.into_response();
@@ -688,9 +771,17 @@ pub(super) async fn rescan_track(
     match meta {
         Some(m) => {
             apply_metadata_to_track(&mut track, &m);
+            // L'édition manuelle (GO du 25/09/2026) prime sur les étiquettes.
+            tune_core::db::edition_album::Tenues::charger(&state.backend).appliquer(&mut track);
 
             if let Err(e) = repo.update(&track) {
                 tracing::warn!(track_id = id, error = %e, "rescan_track_update_failed");
+            } else if let Some(album_id) = track.album_id {
+                // #4836 : le label relu (TPUB, LABEL…) remonte sur l'album, que
+                // lit l'onglet Labels. Comblement seul, comme au scan.
+                tune_core::db::album_repo::AlbumRepo::with_backend(state.backend.clone())
+                    .update_label_from_tracks(album_id)
+                    .ok();
             }
 
             Json(json!({
@@ -747,20 +838,19 @@ pub(super) async fn track_all_tags(
         .file_path
         .as_deref()
         .and_then(tune_core::library::local_path::resolve_existing_local_path)
+        && let Ok(tagged) = lofty::read_from_path(&path)
     {
-        if let Ok(tagged) = lofty::read_from_path(&path) {
-            let tags: Vec<Value> = tagged
-                .tags()
-                .iter()
-                .map(|tag| {
-                    json!({
-                        "tag_type": format!("{:?}", tag.tag_type()),
-                        "items": tag.items().map(|item| format!("{:?}", item)).collect::<Vec<_>>(),
-                    })
+        let tags: Vec<Value> = tagged
+            .tags()
+            .iter()
+            .map(|tag| {
+                json!({
+                    "tag_type": format!("{:?}", tag.tag_type()),
+                    "items": tag.items().map(|item| format!("{:?}", item)).collect::<Vec<_>>(),
                 })
-                .collect();
-            result["file_tags"] = json!(tags);
-        }
+            })
+            .collect();
+        result["file_tags"] = json!(tags);
     }
 
     Json(result).into_response()
@@ -801,12 +891,12 @@ pub(super) async fn track_lyrics(
     };
 
     // 1. Sidecar .lrc / .LRC next to the audio file.
-    if let Some(ref path) = track.file_path {
-        if let Some(content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
-            let lines = tune_core::metadata::lyrics::parse_lrc(&content);
-            if !lines.is_empty() {
-                return synced_response("lrc", &lines);
-            }
+    if let Some(ref path) = track.file_path
+        && let Some(content) = tune_core::metadata::lyrics::find_sidecar_lrc(path)
+    {
+        let lines = tune_core::metadata::lyrics::parse_lrc(&content);
+        if !lines.is_empty() {
+            return synced_response("lrc", &lines);
         }
     }
 
@@ -878,10 +968,9 @@ pub(super) async fn track_lyrics(
             .plain_lyrics
             .as_deref()
             .filter(|s| !s.trim().is_empty())
+            && let Some(resp) = plain_response("lrclib", plain)
         {
-            if let Some(resp) = plain_response("lrclib", plain) {
-                return resp;
-            }
+            return resp;
         }
         if entry.negative_still_fresh() {
             return no_lyrics();
@@ -915,10 +1004,10 @@ pub(super) async fn track_lyrics(
                     return synced_response("lrclib", &lines);
                 }
             }
-            if let Some(plain) = raw.plain_lyrics.as_deref() {
-                if let Some(resp) = plain_response("lrclib", plain) {
-                    return resp;
-                }
+            if let Some(plain) = raw.plain_lyrics.as_deref()
+                && let Some(resp) = plain_response("lrclib", plain)
+            {
+                return resp;
             }
             no_lyrics()
         }
@@ -949,17 +1038,17 @@ pub(super) async fn track_synced_lyrics(
         _ => return (StatusCode::NOT_FOUND, "track not found").into_response(),
     };
 
-    if let Some(ref path) = track.file_path {
-        if let Some(lrc_content) = tune_core::metadata::lyrics::find_sidecar_lrc(path) {
-            let lines = tune_core::metadata::lyrics::parse_lrc(&lrc_content);
-            if !lines.is_empty() {
-                let json_str = serde_json::to_string(&lines).unwrap_or_default();
-                repo.set_synced_lyrics(id, &json_str).ok();
-                return Json(
-                    json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" }),
-                )
-                .into_response();
-            }
+    if let Some(ref path) = track.file_path
+        && let Some(lrc_content) = tune_core::metadata::lyrics::find_sidecar_lrc(path)
+    {
+        let lines = tune_core::metadata::lyrics::parse_lrc(&lrc_content);
+        if !lines.is_empty() {
+            let json_str = serde_json::to_string(&lines).unwrap_or_default();
+            repo.set_synced_lyrics(id, &json_str).ok();
+            return Json(
+                json!({ "track_id": id, "synced": true, "lines": lines, "source": "lrc_file" }),
+            )
+            .into_response();
         }
     }
 
@@ -1190,6 +1279,9 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                 }
             };
 
+            // Ce que l'utilisateur a tenu à la main (écran « Modifier », GO du
+            // 25/09/2026) : relire les étiquettes ne l'écrase pas.
+            let tenues = tune_core::db::edition_album::Tenues::charger(&backend_inner);
             let total = tracks.len();
             let mut updated = 0usize;
             let mut skipped = 0usize;
@@ -1206,7 +1298,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                 // Un jalon, pas une publication par piste : le registre émet un
                 // événement WebSocket à chaque changement.
                 let traitees = updated + skipped + errors;
-                if traitees % JALON_AVANCEMENT_RESCAN == 0 {
+                if traitees.is_multiple_of(JALON_AVANCEMENT_RESCAN) {
                     taches.update_progress(
                         TACHE_RESCAN_METADATA,
                         traitees as u64,
@@ -1255,6 +1347,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
 
                 let mut t = track.clone();
                 apply_metadata_to_track(&mut t, &meta);
+                tenues.appliquer(&mut t);
 
                 match track_repo.update(&t) {
                     Ok(_) => updated += 1,
@@ -1283,6 +1376,16 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                  WHERE source = 'local' OR source IS NULL",
             )
             .ok();
+            // #4836 : cette passe relit les étiquettes de toute la bibliothèque,
+            // TPUB compris ; le label relu remonte sur l'album, en comblement
+            // seul — même règle que le scan et le démarrage.
+            if let Err(e) = tune_core::db::album_repo::AlbumRepo::with_backend(
+                backend_inner.clone(),
+            )
+            .combler_les_labels_depuis_les_pistes()
+            {
+                tracing::warn!(error = %e, "rescan_metadata_album_labels_failed");
+            }
 
             // errors compte toujours les pistes et sert à l'avancement.
             // Un lot étendu peut être partiellement écrit : ne pas additionner
@@ -1384,16 +1487,16 @@ pub(super) async fn track_metadata_put(
 
     // Write tags to file (best-effort, don't fail the request)
     let mut file_write_error: Option<String> = None;
-    if let Some(ref path) = file_path {
-        if let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await {
-            tracing::warn!(
-                track_id = id,
-                path = path.as_str(),
-                error = e.as_str(),
-                "tag_write_to_file_failed"
-            );
-            file_write_error = Some(e);
-        }
+    if let Some(ref path) = file_path
+        && let Err(e) = tune_core::metadata::tag_writer::write_metadata_to_file(path, &body).await
+    {
+        tracing::warn!(
+            track_id = id,
+            path = path.as_str(),
+            error = e.as_str(),
+            "tag_write_to_file_failed"
+        );
+        file_write_error = Some(e);
     }
 
     let mut resp = json!({"status": "ok", "fields": body.len()});

@@ -165,8 +165,8 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
         .iter()
         .map(|cols| {
             json!({
-                "name": cols.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
-                "artist_name": cols.get(0).and_then(|v| v.as_string()).unwrap_or_default(),
+                "name": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
+                "artist_name": cols.first().and_then(|v| v.as_string()).unwrap_or_default(),
                 "plays": cols.get(1).and_then(|v| v.as_i64()).unwrap_or(0),
                 "artist_id": cols.get(2).and_then(|v| v.as_i64()),
                 "id": cols.get(2).and_then(|v| v.as_i64()),

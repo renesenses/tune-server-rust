@@ -776,10 +776,10 @@ pub(crate) fn generate_shuffle_order(length: usize, current: usize) -> Vec<usize
         let j = (seed % (i as u64 + 1)) as usize;
         order.swap(i, j);
     }
-    if current < length {
-        if let Some(pos) = order.iter().position(|&x| x == current) {
-            order.swap(0, pos);
-        }
+    if current < length
+        && let Some(pos) = order.iter().position(|&x| x == current)
+    {
+        order.swap(0, pos);
     }
     order
 }

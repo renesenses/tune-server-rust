@@ -20,7 +20,7 @@ DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
-         WHERE table_name = 'radio_favorites'
+         WHERE table_schema = current_schema() AND table_name = 'radio_favorites'
            AND column_name = 'saved_at'
            AND data_type IN ('bigint', 'integer')
     ) THEN

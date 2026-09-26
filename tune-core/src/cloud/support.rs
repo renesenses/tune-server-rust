@@ -84,14 +84,27 @@ pub struct NewTicket {
 ///
 /// Extrait de [`create_ticket`] pour être vérifiable sans réseau : c'est
 /// exactement ici que `logs` et `system` étaient perdus.
+///
+/// #5124 — `system` (la fiche : noms des serveurs multimédia, répertoires…) et
+/// `logs` (le rapport et son journal) sont nettoyés ICI, à la porte de sortie,
+/// quel que soit le client qui les a composés : le miroir republie le ticket.
+/// Le sujet et le corps sont les mots du testeur, laissés tels quels.
 fn ticket_payload(ticket: &NewTicket) -> Value {
+    let system = ticket.system.clone().map(|mut fiche| {
+        crate::confidentialite::anonymiser_json(&mut fiche);
+        fiche
+    });
+    let logs = ticket
+        .logs
+        .as_deref()
+        .map(crate::confidentialite::anonymiser);
     json!({
         "subject": ticket.subject,
         "body": ticket.body,
         "category": ticket.category,
         "zone": ticket.zone,
-        "system": ticket.system,
-        "logs": ticket.logs,
+        "system": system,
+        "logs": logs,
         "tune_version": crate::version(),
         "platform": std::env::consts::OS,
     })
@@ -148,7 +161,7 @@ pub async fn create_ticket_multipart(
         reqwest::multipart::Form::new()
             .text("tune_version", crate::version())
             .text("platform", std::env::consts::OS),
-        fields,
+        champs_de_diagnostic_nettoyes(fields),
         files,
     )?;
 
@@ -161,6 +174,23 @@ pub async fn create_ticket_multipart(
         .map_err(request_error)?;
 
     parse(resp).await
+}
+
+/// #5124 — les champs `system` et `logs` d'un ticket multipart, nettoyés par
+/// la même fonction que le chemin JSON ([`ticket_payload`]). `system` arrive
+/// sérialisé : [`crate::confidentialite::anonymiser_champ`] le relit en JSON
+/// pour masquer aussi par nom de clé.
+fn champs_de_diagnostic_nettoyes(fields: Vec<(String, String)>) -> Vec<(String, String)> {
+    fields
+        .into_iter()
+        .map(|(nom, valeur)| match nom.as_str() {
+            "system" | "logs" => {
+                let propre = crate::confidentialite::anonymiser_champ(&valeur);
+                (nom, propre)
+            }
+            _ => (nom, valeur),
+        })
+        .collect()
 }
 
 /// Complète un formulaire sortant : les champs texte tels quels, puis chaque
@@ -393,6 +423,59 @@ fn build_result(status: u16, text: &str, retry_after: Option<u64>) -> SupportRes
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    /// #5124 — la fiche et le journal d'un ticket JSON sortent nettoyés ; le
+    /// sujet et le corps, mots du testeur, sortent tels quels.
+    #[test]
+    fn le_ticket_json_sort_sans_donnee_personnelle() {
+        let ticket = NewTicket {
+            subject: "Coupure".into(),
+            body: "Mon texte".into(),
+            system: Some(json!({
+                "network": { "media_servers": [
+                    { "name": "MinimServer [jean.dupont@exemple.fr]", "host": "192.168.1.20" }
+                ]},
+                "library": { "music_dirs": ["/home/jdupont/Musique"] },
+            })),
+            logs: Some("INFO x refresh_token=rt-SECRET-5124 path=/Users/jdupont/a".into()),
+            ..Default::default()
+        };
+        let sortie = ticket_payload(&ticket).to_string();
+        for fuite in ["jean.dupont", "exemple.fr", "jdupont", "rt-SECRET-5124"] {
+            assert!(
+                !sortie.contains(fuite),
+                "« {fuite} » sort encore : {sortie}"
+            );
+        }
+        for garde in [
+            "MinimServer",
+            "192.168.1.20",
+            "~/Musique",
+            "Mon texte",
+            "Coupure",
+        ] {
+            assert!(sortie.contains(garde), "« {garde} » a disparu : {sortie}");
+        }
+    }
+
+    /// #5124 — même nettoyage sur le chemin multipart, où la fiche arrive
+    /// sérialisée ; les autres champs passent tels quels.
+    #[test]
+    fn le_ticket_multipart_sort_sans_donnee_personnelle() {
+        let champs = champs_de_diagnostic_nettoyes(vec![
+            ("body".into(), "écrire à moi@exemple.fr".into()),
+            (
+                "system".into(),
+                r#"{"streaming":[{"name":"qobuz","username":"jdupont"}]}"#.into(),
+            ),
+            ("logs".into(), "sig=0f1e2d3c mac=00:1A:2B:3C:4D:5E".into()),
+        ]);
+        assert_eq!(champs[0].1, "écrire à moi@exemple.fr");
+        assert!(!champs[1].1.contains("jdupont"), "{}", champs[1].1);
+        assert!(champs[1].1.contains("qobuz"), "{}", champs[1].1);
+        assert!(!champs[2].1.contains("0f1e2d3c"), "{}", champs[2].1);
+        assert!(champs[2].1.contains("00:1A:2B:xx:xx:xx"), "{}", champs[2].1);
+    }
 
     fn err_body(result: SupportResult) -> (u16, Value) {
         result.expect_err("un statut hors 2xx doit rendre une erreur")

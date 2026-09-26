@@ -363,13 +363,13 @@ where
         // n'attend n'a pas à être mesuré, et surtout pas à être attendu. C'est
         // le point de contrôle que #3444 réclamait — celui qui existait déjà
         // dans `resolve_local`, mais seulement APRÈS la fin du transcodage.
-        if let Some(sup) = supersession {
-            if let Some(gagnant) = sup.gagnant().await {
-                return Err(FinDeTranscodage::Preempte {
-                    gagnant,
-                    perdu: ecoule,
-                });
-            }
+        if let Some(sup) = supersession
+            && let Some(gagnant) = sup.gagnant().await
+        {
+            return Err(FinDeTranscodage::Preempte {
+                gagnant,
+                perdu: ecoule,
+            });
         }
         let decode = std::time::Duration::from_millis(progres.decoded_ms());
         if decode > std::time::Duration::ZERO {
@@ -441,7 +441,7 @@ pub(super) async fn transcode_source_to_file(
 ) -> Result<(u64, Vec<u8>, u16), String> {
     transcode_source_to_file_avec_crossfeed(
         source, out_sr, channels, target_bd, target_fmt, eq, convolver, replaygain, dest, progres,
-        abandon, tranche, None,
+        abandon, tranche, None, None,
     )
     .await
 }
@@ -480,6 +480,9 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // #2742 — le crossfeed, dernier étage. `None` : strictement la chaîne
     // d'avant.
     crossfeed: Option<crate::audio::crossfeed::CrossfeedProcessor>,
+    // #5071 — la compensation de niveau, DERNIER étage, bornée à la crête de
+    // la piste entière. `None` : strictement la chaîne d'avant.
+    compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -522,8 +525,30 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         .filter(|f| *f > 0.0)
         .map(|f| (20.0 * f.log10() * 100.0).round() / 100.0);
     let egaliseur = eq.is_some();
+    // #4407 — la RÉSERVE de l'égaliseur, dite au moment où elle est cuite dans
+    // les octets.
+    //
+    // Jean Valjean, 0.9.155, zone DLNA : « le volume baisse au minimum pour le
+    // morceau en cours ; le morceau suivant retrouve le volume normal ». La
+    // relance ne dure que 0,9 s : ce n'est pas elle. La piste candidate est la
+    // réserve automatique (`EqProfile::automatic_headroom_db`), qui croît
+    // avec les gains positifs et qui, ici, entre dans le FICHIER — le profil
+    // fait partie de la clé du cache de transcodage, donc la rendition reste
+    // atténuée jusqu'à la fin du morceau.
+    //
+    // 🔴 Cette réserve n'était écrite NULLE PART. Sur une sortie non locale,
+    // `eq_change_journal` publie `preamp_db_g=0.0 preamp_db_d=0.0` — des
+    // valeurs par DÉFAUT d'échec (`premier_echec="sortie_non_locale"`, #3479),
+    // indiscernables d'une mesure. Le journal du testeur ne pouvait donc ni
+    // confirmer ni écarter l'hypothèse. Il le pourra.
+    //
+    // ⚠️ Instrument, pas correctif : rien du son ne change ici.
+    let eq_actif = eq.as_ref().is_some_and(|e| e.is_enabled());
+    let reserve_eq_db_g = eq.as_ref().and_then(|e| e.preamp_db(0));
+    let reserve_eq_db_d = eq.as_ref().and_then(|e| e.preamp_db(1));
     let convolution = convolver.is_some();
     let crossfeed_actif = crossfeed.is_some();
+    let compensation_cible_db = compensation.as_ref().map(|c| c.cible_db());
 
     // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
     //
@@ -576,6 +601,14 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         cf.process_pcm(&mut pcm_bytes, actual_bd, decoded.channels as u16);
     }
 
+    // 1f. #5071 — la compensation de niveau APRÈS tous les étages. Le PCM de
+    // la piste ENTIÈRE est un seul bloc : le gain est constant, borné par la
+    // vraie crête de la piste traitée — aucun échantillon écrêté.
+    let compensation_appliquee_db = compensation.map(|mut comp| {
+        comp.process_pcm(&mut pcm_bytes, actual_bd);
+        (comp.gain_applique_db() * 100.0).round() / 100.0
+    });
+
     let traitement_ms = chrono.elapsed().as_millis() as u64 - decode_ms;
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
@@ -612,8 +645,13 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         cible_bd = actual_bd,
         replaygain_db = ?replaygain_db,
         egaliseur,
+        eq_actif,
+        reserve_eq_db_g = ?reserve_eq_db_g,
+        reserve_eq_db_d = ?reserve_eq_db_d,
         convolution,
         crossfeed = crossfeed_actif,
+        compensation_cible_db = ?compensation_cible_db,
+        compensation_appliquee_db = ?compensation_appliquee_db,
         "transcode_to_temp_file_stages"
     );
 

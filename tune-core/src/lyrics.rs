@@ -187,7 +187,7 @@ fn jeton_de_qualite(jeton: &str) -> bool {
 
     // « 24/96 », « 24-192 », « 32x384 » : une profondeur ET une fréquence, les
     // deux plausibles. C'est ce couple qui distingue « 24/96 » de « 24/7 ».
-    let mut morceaux = sans_unite.splitn(2, |c| c == '/' || c == '-' || c == 'x');
+    let mut morceaux = sans_unite.splitn(2, ['/', '-', 'x']);
     match (morceaux.next(), morceaux.next()) {
         (Some(profondeur), Some(frequence)) => {
             matches!(profondeur, "16" | "24" | "32") && frequence_plausible(frequence)
@@ -689,21 +689,21 @@ pub async fn get_lyrics(
     duration_ms: i64,
 ) -> Result<Lyrics, String> {
     // 1. Try cache.
-    if let Some(cached) = load_cache_entry(db, track_id) {
-        if cached.spares_a_fetch() {
-            debug!(track_id, "lyrics_cache_hit");
-            let lines = cached
-                .synced_lyrics
-                .as_deref()
-                .map(parse_lrc)
-                .unwrap_or_default();
-            return Ok(Lyrics {
-                synced: !lines.is_empty(),
-                lines,
-                plain_text: cached.plain_lyrics,
-                source: cached.source,
-            });
-        }
+    if let Some(cached) = load_cache_entry(db, track_id)
+        && cached.spares_a_fetch()
+    {
+        debug!(track_id, "lyrics_cache_hit");
+        let lines = cached
+            .synced_lyrics
+            .as_deref()
+            .map(parse_lrc)
+            .unwrap_or_default();
+        return Ok(Lyrics {
+            synced: !lines.is_empty(),
+            lines,
+            plain_text: cached.plain_lyrics,
+            source: cached.source,
+        });
     }
 
     // 2. Fetch from LRCLIB.

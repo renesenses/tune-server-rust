@@ -269,13 +269,12 @@ async fn importer(State(etat): State<Etat>, Query(q): Query<ImportQuery>, corps:
         v["releve"] = json!(export.releve);
         v["absent_de_l_api"] = json!(export.absent_de_l_api);
         v["archive"] = json!(avec_images);
-        if !apercu {
-            if let Err(e) =
+        if !apercu
+            && let Err(e) =
                 tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
                     .set(CLE_DERNIER_RAPPORT, &v.to_string())
-            {
-                tracing::warn!(erreur = %e, "pont_roon_rapport_non_garde");
-            }
+        {
+            tracing::warn!(erreur = %e, "pont_roon_rapport_non_garde");
         }
         Ok(v)
     })

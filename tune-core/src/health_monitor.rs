@@ -147,11 +147,11 @@ impl AdvancedHealthMonitor {
             _ => AlertLevel::Ok, // None (unavailable on this OS) or below thresholds
         };
 
-        if status != AlertLevel::Ok {
-            if let Some(mb) = rss_mb {
-                let msg = format!("Mémoire: {mb:.0}MB");
-                let _ = self.add_alert_sync(status, "memory", &msg);
-            }
+        if status != AlertLevel::Ok
+            && let Some(mb) = rss_mb
+        {
+            let msg = format!("Mémoire: {mb:.0}MB");
+            let _ = self.add_alert_sync(status, "memory", &msg);
         }
 
         CheckResult {
@@ -171,11 +171,11 @@ impl AdvancedHealthMonitor {
             _ => AlertLevel::Ok, // None (df unavailable on Windows) or plenty of space
         };
 
-        if status != AlertLevel::Ok {
-            if let Some(gb) = free_gb {
-                let msg = format!("Disque: {gb:.1}Go restants");
-                let _ = self.add_alert_sync(status, "disk", &msg);
-            }
+        if status != AlertLevel::Ok
+            && let Some(gb) = free_gb
+        {
+            let msg = format!("Disque: {gb:.1}Go restants");
+            let _ = self.add_alert_sync(status, "disk", &msg);
         }
 
         CheckResult {

@@ -222,7 +222,7 @@ pub fn build_genre_tree(db: &Arc<dyn DbBackend>) -> Vec<GenreNode> {
             });
         }
     }
-    other_children.sort_by(|a, b| b.count.cmp(&a.count));
+    other_children.sort_by_key(|a| std::cmp::Reverse(a.count));
 
     if !other_children.is_empty() {
         let total: i64 = other_children.iter().map(|c| c.count).sum();
@@ -233,7 +233,7 @@ pub fn build_genre_tree(db: &Arc<dyn DbBackend>) -> Vec<GenreNode> {
         });
     }
 
-    tree.sort_by(|a, b| b.count.cmp(&a.count));
+    tree.sort_by_key(|a| std::cmp::Reverse(a.count));
     tree
 }
 

@@ -1,7 +1,9 @@
 //! Rendering outbound-HTTP failures so the log says what actually went wrong.
 
 use std::error::Error;
-use std::sync::Once;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tracing::warn;
 
@@ -85,9 +87,56 @@ const EHOSTUNREACH: &str = "os error 65";
 /// `EPERM` — the connection was refused by policy before any packet was built.
 const EPERM: &str = "os error 1";
 
-static LOCAL_NETWORK_HINT: Once = Once::new();
+/// Dernière émission de l'indice « permission réseau local » (#4597).
+static LOCAL_NETWORK_HINT: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Warn once per process when a failure to reach a device looks like macOS
+/// #4597 — combien de connexions vers le LAN macOS a refusées depuis le
+/// démarrage (`os error 65` / `os error 1`), et quand pour la dernière fois.
+static REFUS_RESEAU_LOCAL: AtomicU64 = AtomicU64::new(0);
+static DERNIER_REFUS_RESEAU_LOCAL: AtomicU64 = AtomicU64::new(0);
+
+/// Le motif d'erreur que macOS rend quand il refuse le réseau local.
+pub fn ressemble_a_un_refus_du_reseau_local(rendered: &str) -> bool {
+    rendered.contains(EHOSTUNREACH) || rendered.contains(EPERM)
+}
+
+/// #4597 — `(nombre de refus, horodatage Unix du dernier)` depuis le démarrage.
+/// Toujours `(0, None)` hors macOS. Reste un INDICE : `EHOSTUNREACH` dit aussi
+/// « appareil éteint ».
+pub fn refus_du_reseau_local() -> (u64, Option<u64>) {
+    let n = REFUS_RESEAU_LOCAL.load(Ordering::Relaxed);
+    let dernier = DERNIER_REFUS_RESEAU_LOCAL.load(Ordering::Relaxed);
+    (n, (n > 0 && dernier > 0).then_some(dernier))
+}
+
+/// #4597 — l'indice se RÉARME passé ce délai.
+///
+/// Il était sous un `Once` : une fois par PROCESSUS. Un serveur qui tourne
+/// depuis des heures l'avait brûlé bien avant que quelqu'un exporte un
+/// journal, c'est-à-dire au seul moment où il est lu — le journal de Cyrille
+/// (fil 1861, 0.9.158) porte 31 `No route to host (os error 65)` en une heure
+/// et zéro indice. Quinze minutes bornent le bruit (quatre lignes par heure
+/// au pire, pendant une panne qui en produit des dizaines) et garantissent
+/// qu'un export pris pendant l'incident le contient.
+const LOCAL_NETWORK_HINT_REARM: Duration = Duration::from_secs(15 * 60);
+
+/// La décision, isolée de l'horloge et de la plateforme : faut-il émettre
+/// l'indice maintenant ? Oui la première fois, puis à nouveau dès que
+/// `rearm` s'est écoulé depuis la dernière émission. Met l'état à jour
+/// quand elle répond oui.
+fn indice_du(derniere: &mut Option<Instant>, maintenant: Instant, rearm: Duration) -> bool {
+    let du = match *derniere {
+        None => true,
+        Some(t) => maintenant.saturating_duration_since(t) >= rearm,
+    };
+    if du {
+        *derniere = Some(maintenant);
+    }
+    du
+}
+
+/// Warn — at most once per [`LOCAL_NETWORK_HINT_REARM`] — when a failure to
+/// reach a device looks like macOS
 /// denying local-network access rather than the device being at fault.
 ///
 /// macOS keys that permission to the binary's code identity. An ad-hoc signed
@@ -103,10 +152,22 @@ pub fn hint_if_local_network_denied(rendered: &str) {
     if !cfg!(target_os = "macos") {
         return;
     }
-    if !rendered.contains(EHOSTUNREACH) && !rendered.contains(EPERM) {
+    if !ressemble_a_un_refus_du_reseau_local(rendered) {
         return;
     }
-    LOCAL_NETWORK_HINT.call_once(|| {
+    // #4597 — le journal seul ne suffisait pas : l'utilisateur ne voit que des
+    // zones hors ligne. On COMPTE, pour que l'API puisse le dire à l'écran.
+    REFUS_RESEAU_LOCAL.fetch_add(1, Ordering::Relaxed);
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    DERNIER_REFUS_RESEAU_LOCAL.store(maintenant, Ordering::Relaxed);
+    let du = LOCAL_NETWORK_HINT
+        .lock()
+        .map(|mut derniere| indice_du(&mut derniere, Instant::now(), LOCAL_NETWORK_HINT_REARM))
+        .unwrap_or(false);
+    if du {
         warn!(
             "the OS refused this connection before it reached the network. If the device is \
              powered on and answers `curl` from a terminal, macOS is denying tune-server \
@@ -114,12 +175,82 @@ pub fn hint_if_local_network_denied(rendered: &str) {
              which is also needed after any upgrade that replaces the binary while it runs. \
              Confirm with: log show --last 5m --info --debug --predicate 'eventMessage CONTAINS \"reason: NECP\"'"
         );
-    });
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4597 — deux rafales d'`EHOSTUNREACH` séparées par une pause, sur un
+    /// même processus : la seconde produit ELLE AUSSI l'indice.
+    ///
+    /// Rouge attendu avec un `Once` : la seconde rafale est muette, et c'est
+    /// elle que l'export de journal contient.
+    #[test]
+    fn une_seconde_rafale_apres_une_pause_reemet_l_indice_4597() {
+        let rearm = LOCAL_NETWORK_HINT_REARM;
+        let t0 = Instant::now();
+        let mut derniere = None;
+        // Première rafale : une émission, puis silence dans la rafale.
+        assert!(indice_du(&mut derniere, t0, rearm), "première occurrence");
+        for s in 1..60 {
+            assert!(
+                !indice_du(&mut derniere, t0 + Duration::from_secs(s), rearm),
+                "dans la même rafale, l'indice ne se répète pas ({s} s)"
+            );
+        }
+        // Seconde rafale, une heure plus tard.
+        let t1 = t0 + Duration::from_secs(3_600);
+        assert!(
+            indice_du(&mut derniere, t1, rearm),
+            "une heure plus tard, la seconde rafale doit porter l'indice — \
+             sinon l'export pris pendant l'incident ne le contient pas (#4597)"
+        );
+        assert!(!indice_du(
+            &mut derniere,
+            t1 + Duration::from_secs(1),
+            rearm
+        ));
+    }
+
+    /// Garde de BRANCHEMENT : l'indice de production passe par `indice_du`,
+    /// pas par un `Once` — sinon les deux témoins ci-dessus resteraient verts
+    /// sur une règle que plus personne n'appelle.
+    #[test]
+    fn l_indice_de_production_passe_par_la_regle_rearmable_4597() {
+        let src = include_str!("error.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap();
+        let debut = prod
+            .find("pub fn hint_if_local_network_denied(")
+            .expect("hint_if_local_network_denied");
+        let corps = &prod[debut..];
+        let corps = &corps[..corps.find("\n}\n").expect("fin du corps")];
+        assert!(
+            corps.contains("indice_du("),
+            "l'indice doit passer par indice_du"
+        );
+        assert!(
+            !corps.contains("call_once"),
+            "plus de Once par processus (#4597)"
+        );
+    }
+
+    /// La borne du bruit : jamais plus d'une émission par délai de réarmement,
+    /// même sous une rafale continue d'une heure (une par seconde).
+    #[test]
+    fn l_indice_reste_borne_sous_une_rafale_continue_4597() {
+        let rearm = LOCAL_NETWORK_HINT_REARM;
+        let t0 = Instant::now();
+        let mut derniere = None;
+        let emissions = (0..3_600u64)
+            .filter(|s| indice_du(&mut derniere, t0 + Duration::from_secs(*s), rearm))
+            .count();
+        assert_eq!(
+            emissions, 4,
+            "une heure à 15 min de réarmement : quatre lignes"
+        );
+    }
     use std::fmt;
 
     #[derive(Debug)]

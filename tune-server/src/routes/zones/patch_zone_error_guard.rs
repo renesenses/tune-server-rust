@@ -95,7 +95,7 @@ fn value_checks_come_before_any_write() {
 fn full_volume_refusal_comes_before_any_write() {
     let corps = corps_du_handler();
     let refus = corps
-        .find("fixed_volume_confirmation_required(&zone_before, &body)")
+        .find("fixed_volume_confirmation_required(zone_before, body)")
         .expect("le PATCH ne protège plus l'armement du volume fixe");
     let premiere_ecriture = corps
         .find("ecrire!(")

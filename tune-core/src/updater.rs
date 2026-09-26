@@ -184,6 +184,52 @@ pub fn select_release<'a>(
     best
 }
 
+/// Retrouve, dans une liste de releases, celle d'une version précise (#5141).
+/// Tolère le `v` de l'étiquette des deux côtés.
+pub fn release_par_version<'a>(
+    releases: &'a [serde_json::Value],
+    version: &str,
+) -> Option<&'a serde_json::Value> {
+    let voulue = version.trim().trim_start_matches('v');
+    if voulue.is_empty() {
+        return None;
+    }
+    releases.iter().find(|rel| {
+        rel["tag_name"]
+            .as_str()
+            .map(|t| t.trim().trim_start_matches('v') == voulue)
+            .unwrap_or(false)
+    })
+}
+
+/// Lit une release de l'API GitHub (ou de son proxy) en [`ReleaseInfo`].
+pub fn release_info_depuis_json(data: &serde_json::Value) -> ReleaseInfo {
+    let tag = data["tag_name"].as_str().unwrap_or("").to_string();
+    let version = tag.trim_start_matches('v').to_string();
+
+    let assets: Vec<ReleaseAsset> = data["assets"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .map(|a| ReleaseAsset {
+            name: a["name"].as_str().unwrap_or("").to_string(),
+            browser_download_url: a["browser_download_url"].as_str().unwrap_or("").to_string(),
+            size: a["size"].as_u64().unwrap_or(0),
+            content_type: a["content_type"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+
+    ReleaseInfo {
+        tag_name: tag,
+        version,
+        name: data["name"].as_str().unwrap_or("").to_string(),
+        body: data["body"].as_str().unwrap_or("").to_string(),
+        published_at: data["published_at"].as_str().unwrap_or("").to_string(),
+        html_url: data["html_url"].as_str().unwrap_or("").to_string(),
+        assets,
+    }
+}
+
 pub struct UpdateChecker {
     client: reqwest::Client,
     current_version: String,
@@ -227,38 +273,62 @@ impl UpdateChecker {
             return Ok(None);
         };
 
-        let tag = data["tag_name"].as_str().unwrap_or("").to_string();
-        let version = tag.trim_start_matches('v').to_string();
+        Ok(Some(release_info_depuis_json(data)))
+    }
 
-        let assets: Vec<ReleaseAsset> = data["assets"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|a| ReleaseAsset {
-                name: a["name"].as_str().unwrap_or("").to_string(),
-                browser_download_url: a["browser_download_url"].as_str().unwrap_or("").to_string(),
-                size: a["size"].as_u64().unwrap_or(0),
-                content_type: a["content_type"].as_str().unwrap_or("").to_string(),
-            })
-            .collect();
-
-        Ok(Some(ReleaseInfo {
-            tag_name: tag,
-            version,
-            name: data["name"].as_str().unwrap_or("").to_string(),
-            body: data["body"].as_str().unwrap_or("").to_string(),
-            published_at: data["published_at"].as_str().unwrap_or("").to_string(),
-            html_url: data["html_url"].as_str().unwrap_or("").to_string(),
-            assets,
-        }))
+    /// La release d'une version DONNÉE — pas la plus récente (#5141).
+    ///
+    /// Sert la réparation du paquet macOS au démarrage : un binaire posé par un
+    /// ancien programme de mise à jour tourne dans le paquet `.app` de la
+    /// version d'AVANT, et c'est le paquet de SA version qu'il doit aller
+    /// chercher. Le canal n'entre pas en jeu : on ne choisit rien, on relit la
+    /// release de la version qui tourne déjà.
+    ///
+    /// La liste (proxy, puis GitHub) couvre les vingt dernières releases ; au
+    /// delà, la route GitHub par étiquette prend le relais.
+    pub async fn release_de_la_version(
+        &self,
+        version: &str,
+    ) -> Result<Option<ReleaseInfo>, String> {
+        let liste = match self.fetch_releases_json(PROXY_RELEASES_URL).await {
+            Ok(d) => Ok(d),
+            Err(proxy_err) => {
+                warn!(error = %proxy_err, "proxy_check_failed, falling back to github");
+                self.fetch_releases_json(GITHUB_RELEASES_URL).await
+            }
+        };
+        if let Ok(releases) = &liste {
+            if let Some(data) = release_par_version(releases, version) {
+                return Ok(Some(release_info_depuis_json(data)));
+            }
+        }
+        let url = format!(
+            "https://api.github.com/repos/renesenses/tune-server-rust/releases/tags/v{}",
+            version.trim().trim_start_matches('v')
+        );
+        let mut req = self.client.get(&url);
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let resp = req.send().await.map_err(|e| format!("request: {e}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            // La liste a pu répondre sans contenir la version : c'est l'échec
+            // de la route par étiquette qui compte alors.
+            return Err(format!("api: {} {}", url, resp.status()));
+        }
+        let data: serde_json::Value = resp.json().await.map_err(|e| format!("parse: {e}"))?;
+        Ok(Some(release_info_depuis_json(&data)))
     }
 
     async fn fetch_releases_json(&self, url: &str) -> Result<Vec<serde_json::Value>, String> {
         let mut req = self.client.get(url);
-        if url.contains("github.com") {
-            if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-                req = req.header("Authorization", format!("Bearer {token}"));
-            }
+        if url.contains("github.com")
+            && let Ok(token) = std::env::var("GITHUB_TOKEN")
+        {
+            req = req.header("Authorization", format!("Bearer {token}"));
         }
         let resp = req.send().await.map_err(|e| format!("request: {e}"))?;
         if !resp.status().is_success() {
@@ -458,6 +528,21 @@ mod tests {
         assert_eq!(UpdateChannel::Auto.effective("0.9.130"), "stable");
         assert_eq!(UpdateChannel::Stable.effective("0.9.130-rc1"), "stable");
         assert_eq!(UpdateChannel::Beta.effective("0.9.130"), "beta");
+    }
+
+    #[test]
+    fn la_release_d_une_version_precise_se_retrouve_par_son_etiquette() {
+        let releases = catalogue();
+        let trouvee = release_par_version(&releases, "0.9.129").expect("0.9.129 est au catalogue");
+        assert_eq!(trouvee["tag_name"], "v0.9.129");
+        assert_eq!(
+            release_par_version(&releases, "v0.9.131-rc1").map(|r| &r["tag_name"]),
+            Some(&serde_json::json!("v0.9.131-rc1"))
+        );
+        assert!(release_par_version(&releases, "0.9.99").is_none());
+        assert!(release_par_version(&releases, "").is_none());
+        let info = release_info_depuis_json(trouvee);
+        assert_eq!(info.version, "0.9.129");
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub const MAX_DB: f64 = 0.0;
 /// L'entrée est bornée à `1.0` avant le logarithme, comme partout ailleurs
 /// dans la chaîne : un état interne qui déborderait afficherait sinon un gain
 /// positif que personne n'entendra jamais.
+// `!(x > 0.0)` n'est pas `x <= 0.0` : seul le premier écarte `NaN` (clippy 1.98).
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
 pub fn linear_to_db(linear: f64) -> Option<f64> {
     if !(linear > 0.0) {
         // Couvre 0.0, les négatifs et NaN — la négation est volontaire.

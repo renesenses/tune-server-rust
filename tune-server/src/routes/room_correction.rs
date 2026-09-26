@@ -429,11 +429,9 @@ async fn upload_ir_handler(
                 if let Some(local) = output
                     .as_any()
                     .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+                    && let Err(e) = local.set_convolver_ir(&ir_path_str)
                 {
-                    if let Err(e) = local.set_convolver_ir(&ir_path_str) {
-                        return (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
-                            .into_response();
-                    }
+                    return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
                 }
             }
         }

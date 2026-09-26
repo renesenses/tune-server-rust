@@ -725,10 +725,8 @@ fn decode_ape_truncated_graceful() {
         tune_core::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0);
 
     // Should return an error, not panic
-    match result {
-        Ok(_) => {}  // Unlikely but acceptable
-        Err(_) => {} // Expected
-    }
+    // Ok : improbable mais admis ; Err : attendu. Seule compte l'absence de panique.
+    let _ = result;
 }
 
 // ── DSF/DFF parser tests via public API ──────────────────────────────────

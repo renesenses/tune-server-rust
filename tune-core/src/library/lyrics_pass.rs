@@ -2475,11 +2475,13 @@ mod tests_rattrapage_de_fond {
             repos_apres(FillStatus::NetworkError),
             REPOS_APRES_REFUS_SECS
         );
-        assert!(
-            REPOS_APRES_REFUS_SECS > REPOS_AU_CALME_SECS
-                && REPOS_AU_CALME_SECS > REPOS_ENTRE_LOTS_SECS,
-            "les trois repos sont ordonnés du plus court au plus long"
-        );
+        const {
+            assert!(
+                REPOS_APRES_REFUS_SECS > REPOS_AU_CALME_SECS
+                    && REPOS_AU_CALME_SECS > REPOS_ENTRE_LOTS_SECS,
+                "les trois repos sont ordonnés du plus court au plus long"
+            )
+        };
     }
 
     #[test]

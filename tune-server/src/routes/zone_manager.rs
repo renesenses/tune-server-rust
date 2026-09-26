@@ -795,23 +795,21 @@ async fn activate_zone_profile(
             .ok()
             .flatten()
             .and_then(|zone| zone.output_device_id);
-        if let Some(vol) = zc.get("volume").and_then(|v| v.as_f64()) {
-            if let Err(error) = state
+        if let Some(vol) = zc.get("volume").and_then(|v| v.as_f64())
+            && let Err(error) = state
                 .orchestrator
                 .set_volume(zone_id, vol / 100.0, device_id.as_deref())
                 .await
-            {
-                return crate::routes::playback::output_command_error_response(error);
-            }
+        {
+            return crate::routes::playback::output_command_error_response(error);
         }
-        if let Some(muted) = zc.get("muted").and_then(|v| v.as_bool()) {
-            if let Err(error) = state
+        if let Some(muted) = zc.get("muted").and_then(|v| v.as_bool())
+            && let Err(error) = state
                 .orchestrator
                 .set_mute(zone_id, muted, device_id.as_deref())
                 .await
-            {
-                return crate::routes::playback::output_command_error_response(error);
-            }
+        {
+            return crate::routes::playback::output_command_error_response(error);
         }
         applied += 1;
     }

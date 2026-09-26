@@ -383,7 +383,7 @@ fn list_players_cli(host: &str, port: u16) -> Result<Vec<Value>, String> {
         let player_id = id_resp.rsplit(' ').next().unwrap_or("").to_string();
         // Response: "player name 0 Kitchen"
         let player_name = name_resp
-            .rsplitn(2, &format!("player name {i} "))
+            .rsplit(&format!("player name {i} "))
             .next()
             .unwrap_or("Squeezebox")
             .to_string();

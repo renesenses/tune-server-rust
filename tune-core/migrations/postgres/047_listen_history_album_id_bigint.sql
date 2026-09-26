@@ -53,7 +53,7 @@ DECLARE
 BEGIN
   SELECT data_type INTO cur_type
     FROM information_schema.columns
-   WHERE table_name = 'listen_history' AND column_name = 'album_id';
+   WHERE table_schema = current_schema() AND table_name = 'listen_history' AND column_name = 'album_id';
 
   IF cur_type IN ('text', 'character varying') THEN
     SELECT count(*) INTO bad

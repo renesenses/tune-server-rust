@@ -219,6 +219,11 @@ fn spawn_paced_levels_forwarder(
         // reste cohérente avec la piste de CE forwarder ; retombée une fois,
         // on revient au cadencement mural pour le reste de la piste.
         let mut horloge_de_sortie_fiable = true;
+        // Fil 1954 — l'horloge a-t-elle été vue, pendant la vie de CE
+        // forwarder, sur la piste qu'il publie ? Tant que non, elle peut
+        // encore décrire la piste PRÉCÉDENTE, et rien ne se jette sur sa foi.
+        // Voir [`attendre_que_la_sortie_joue`].
+        let mut horloge_de_cette_piste = false;
         while let Some(raw) = rx.recv().await {
             // La boucle RAPPORTE la position lue au moment où la zone est
             // effectivement en lecture : c'est cette valeur-là, et aucune autre,
@@ -233,10 +238,10 @@ fn spawn_paced_levels_forwarder(
                 }
                 let zone_state = playback.get_state(zone_id).await;
                 let reported_position_ms = zone_state.position_ms;
-                if let Some(prev) = last_reported {
-                    if reported_position_ms > prev {
-                        reported_advancing = true;
-                    }
+                if let Some(prev) = last_reported
+                    && reported_position_ms > prev
+                {
+                    reported_advancing = true;
                 }
                 last_reported = Some(reported_position_ms);
                 match zone_state.state {
@@ -278,7 +283,20 @@ fn spawn_paced_levels_forwarder(
             };
             if let Some(audible) = audible {
                 let debut_fenetre_ms = position.as_millis() as i64;
-                if debut_fenetre_ms + 2_000 < audible {
+                if audible <= debut_fenetre_ms + FENETRE_DEJA_ENTENDUE_MS {
+                    horloge_de_cette_piste = true;
+                }
+                // 🔴 Fil 1954 — on ne jette une fenêtre « déjà entendue » que
+                // sur une horloge déjà vue sur CETTE piste. Au démarrage d'une
+                // piste, la sortie rapporte encore la fin de la précédente
+                // (180 s pour une piste enchaînée sans blanc manqué, ou
+                // cliquée) jusqu'à ce qu'elle l'ouvre ; une piste pré-
+                // transcodée ou servie du cache livre alors TOUTES ses
+                // fenêtres d'un coup, et toutes partaient à la poubelle :
+                // plus un niveau pour la piste entière. C'est la garde
+                // `reported_advancing` du rattrapage mural ci-dessous, que la
+                // branche d'horloge de #4883 n'avait pas reprise.
+                if horloge_de_cette_piste && debut_fenetre_ms + FENETRE_DEJA_ENTENDUE_MS < audible {
                     // Déjà entendue depuis longtemps : même règle que le
                     // rattrapage ci-dessous, on ne l'émet pas.
                     position += raw.window;
@@ -292,6 +310,7 @@ fn spawn_paced_levels_forwarder(
                     &gen_arc,
                     gen_at_spawn,
                     debut_fenetre_ms,
+                    &mut horloge_de_cette_piste,
                 )
                 .await
                 {
@@ -484,10 +503,31 @@ const HORLOGE_DE_SORTIE_AVANCE_MAX_MS: i64 = 5_000;
 /// cesse de la croire (flux réseau figé, pilote muet).
 const HORLOGE_DE_SORTIE_FIGEE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Retard sur le son au-delà duquel une fenêtre est « déjà entendue » et
+/// n'est pas publiée — la même borne que le rattrapage mural.
+const FENETRE_DEJA_ENTENDUE_MS: i64 = 2_000;
+
+/// Fil 1954 — combien de temps attendre qu'une horloge restée sur la piste
+/// PRÉCÉDENTE revienne sur celle du forwarder (la sortie ouvre la nouvelle
+/// piste et repart de sa position de départ) avant de la lâcher pour le
+/// cadencement mural. L'ouverture d'une sortie locale se compte en
+/// centaines de millisecondes ; cinq secondes couvrent un pilote lent.
+const HORLOGE_D_UNE_AUTRE_PISTE_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Attendre que le son de la sortie locale atteigne `cible_ms` — fil 1908.
 ///
 /// La pause ne compte pas comme une horloge figée : l'attente reprend avec la
 /// lecture, et la fenêtre sort avec le son.
+///
+/// 🔴 Fil 1954 (Didier, 25/09/2026, Windows, album LOCAL) : tant que
+/// `horloge_de_cette_piste` est faux, une horloge DEVANT la fenêtre de plus
+/// de [`FENETRE_DEJA_ENTENDUE_MS`] n'est pas celle de cette piste — c'est la
+/// fin de la précédente, que la sortie rapporte jusqu'à ce qu'elle ouvre la
+/// nouvelle. La croire faisait publier la fenêtre sur-le-champ, et le
+/// forwarder jetait toutes les suivantes comme « déjà entendues ». On attend
+/// qu'elle revienne sur la piste (elle est alors marquée), au plus
+/// [`HORLOGE_D_UNE_AUTRE_PISTE_MAX`], après quoi elle est déclarée
+/// incohérente.
 async fn attendre_que_la_sortie_joue(
     playback: &PlaybackManager,
     zone_id: i64,
@@ -495,9 +535,11 @@ async fn attendre_que_la_sortie_joue(
     gen_arc: &std::sync::atomic::AtomicU64,
     gen_at_spawn: u64,
     cible_ms: i64,
+    horloge_de_cette_piste: &mut bool,
 ) -> AttenteDeSortie {
     let mut dernier_audible = i64::MIN;
     let mut depuis_le_dernier_progres = tokio::time::Instant::now();
+    let debut_de_l_attente = tokio::time::Instant::now();
     loop {
         if playback.current_play_seq(zone_id).await != play_seq
             || gen_arc.load(std::sync::atomic::Ordering::Relaxed) != gen_at_spawn
@@ -509,6 +551,19 @@ async fn attendre_que_la_sortie_joue(
         let Some(audible) = playback.position_audible_ms(zone_id) else {
             return AttenteDeSortie::Jouee;
         };
+        if !*horloge_de_cette_piste {
+            if audible <= cible_ms + FENETRE_DEJA_ENTENDUE_MS {
+                *horloge_de_cette_piste = true;
+            } else {
+                // Fil 1954 — l'horloge d'une autre piste : attendre que la
+                // sortie ouvre celle-ci, sans publier ni jeter.
+                if debut_de_l_attente.elapsed() > HORLOGE_D_UNE_AUTRE_PISTE_MAX {
+                    return AttenteDeSortie::HorlogeIncoherente;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                continue;
+            }
+        }
         let avance = cible_ms - audible;
         if avance <= 0 {
             return AttenteDeSortie::Jouee;
@@ -890,6 +945,10 @@ fn spawn_proxy_levels_probe_task(
     });
 }
 
+/// Dernière piste poussée vers un renderer RÉSEAU d'une zone :
+/// `(source, source_id, track_id, quand)` — voir `last_net_play`.
+type DerniereLectureReseau = (String, Option<String>, Option<i64>, std::time::Instant);
+
 pub struct PlaybackOrchestrator {
     pub db: Arc<dyn crate::db::backend::DbBackend>,
     pub playback: Arc<PlaybackManager>,
@@ -962,7 +1021,7 @@ pub struct PlaybackOrchestrator {
     /// `zone_id → (source, source_id, when)`. Used in `play_inner` to coalesce a
     /// redundant re-play of the same track within `DUPLICATE_NET_PLAY_WINDOW`,
     /// which would otherwise restart a push renderer from 0. Cleared on `stop`.
-    last_net_play: Mutex<HashMap<i64, (String, Option<String>, Option<i64>, std::time::Instant)>>,
+    last_net_play: Mutex<HashMap<i64, DerniereLectureReseau>>,
     /// Annonces « en écoute » DIFFÉRÉES des zones navigateur (#1998).
     ///
     /// Une zone navigateur n'a pas de périphérique de sortie : la sortie est
@@ -1025,6 +1084,9 @@ pub struct PlaybackOrchestrator {
     /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
     /// par nom de `source`. Voir `crate::source_pcm`.
     pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
+    /// #5065 — le registre commun des sources physiques (CD, entrées…).
+    /// Voir `crate::sources_physiques`.
+    pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1202,6 +1264,12 @@ struct StreamingDsp {
     /// bâti sans dire combien de canaux il traite ne doit pas mélanger des
     /// canaux au hasard.
     channels: u16,
+    /// #5071 — la compensation de niveau (#4685), cinquième et DERNIER étage :
+    /// elle rend ce que l'égaliseur et le crossfeed retirent au niveau moyen,
+    /// bornée à la crête pour ne jamais écrêter. `None` sur une sortie
+    /// locale (qui compense par son volume), en PURE, interrupteur coupé, ou
+    /// sans égaliseur ni crossfeed.
+    compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
 }
 
 impl StreamingDsp {
@@ -1212,6 +1280,7 @@ impl StreamingDsp {
             || self.eq.is_some()
             || self.convolver.is_some()
             || self.crossfeed.is_some()
+            || self.compensation.is_some()
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -1223,9 +1292,18 @@ impl StreamingDsp {
     /// « actif » tout en étant MUET sur le crossfeed. C'est le mode de panne
     /// qu'une garde de site, purement textuelle, ne peut pas voir : le champ
     /// existe, le chargement existe, l'appel existe, et rien ne sort.
-    #[cfg(test)]
+    ///
+    /// #5114 — c'est aussi ce fait-là, et non le réglage, que le flux publie
+    /// (`StreamInfo::crossfeed`) quand ce porteur est posé sur son canal.
     fn crossfeed_executable(&self) -> bool {
         self.crossfeed.is_some() && self.channels == 2
+    }
+
+    /// La cible de la compensation que ce porteur CUIT, en dB — ce que le
+    /// flux publie (`StreamInfo::compensation_db`) quand il est posé sur son
+    /// canal. `None` : aucun étage de compensation.
+    fn compensation_cuite_db(&self) -> Option<f64> {
+        self.compensation.as_ref().map(|c| c.cible_db())
     }
 
     /// Applique les trois étages EN PLACE.
@@ -1248,6 +1326,11 @@ impl StreamingDsp {
         // l'image d'un signal déjà corrigé, il ne corrige pas.
         if let Some(cf) = self.crossfeed.as_mut() {
             cf.process_pcm(pcm, bit_depth, self.channels);
+        }
+        // #5071 — la compensation APRÈS tous les étages : elle rend le niveau
+        // moyen qu'ils ont retiré, et sa borne lit la crête qu'ils ont laissée.
+        if let Some(comp) = self.compensation.as_mut() {
+            comp.process_pcm(pcm, bit_depth);
         }
     }
 }
@@ -1328,6 +1411,7 @@ impl PlaybackOrchestrator {
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
+            sources_physiques: Arc::default(),
         }
     }
 
@@ -1402,9 +1486,20 @@ mod resolve_local;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
+// #5071 — témoins de bout en bout de la compensation de niveau réseau.
+#[cfg(test)]
+mod compensation_reseau_5071_tests;
+
+// #5080 — un flux de service à traitement actif part en WAV progressif.
+#[cfg(test)]
+mod service_wav_progressif_5080;
 
 mod dsp;
 pub use dsp::PorteeDuReglage;
+// Greffons natifs tiers : l'étage casque de la chaîne, avec une vraie
+// bibliothèque native de test.
+#[cfg(test)]
+mod greffon_natif_tiers_tests;
 
 mod resolve_direct;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
@@ -1422,7 +1517,7 @@ mod serveur_source_absent_4362;
 pub mod verdict_upnp;
 
 mod queue;
-pub use queue::Enjambee;
+pub use queue::{Enjambee, lignes_bannies_a_enjamber};
 
 mod history;
 
@@ -1563,12 +1658,26 @@ mod dsd_passthrough_tests;
 #[cfg(test)]
 mod dsd_upnp_politique_de_zone_tests;
 
+/// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
+/// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
+#[cfg(test)]
+mod double_dsp_dsf_aac_sortie_locale_tests;
+
+#[cfg(test)]
+mod mesure_saut_cd_5079;
+
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]
 mod niveaux_a_la_sortie_1908;
 #[cfg(test)]
+mod niveaux_relais_unique_5078_5051;
+#[cfg(test)]
+mod niveaux_source_pcm_5078;
+#[cfg(test)]
 mod resolution_annoncee_tests;
+#[cfg(test)]
+mod saut_de_piste_pcm_5079;
 
 /// #2250 — « Lire » et « Lecture aléatoire » annoncent la MÊME résolution pour
 /// la même ligne. La garde voisine (`resolution_annoncee_tests`) éprouve la
@@ -1584,6 +1693,9 @@ mod wav_override_tests;
 /// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
 #[cfg(test)]
 mod alac_passthrough_tests;
+/// #4907 — l'exemplaire préféré injoignable : la lecture part depuis le suivant.
+#[cfg(test)]
+mod exemplaires_lecture_tests;
 /// #4800 (cause 5) — un FLAC de l'enregistreur (`Lavf` sans MD5, #4350) part
 /// tel quel sous un en-tête neuf vers une zone réseau, sans être ré-encodé.
 #[cfg(test)]
@@ -1646,6 +1758,11 @@ mod curseur_intact_4283;
 /// reprise rétablit à la position au lieu de reprendre « sur place ».
 #[cfg(test)]
 mod pause_rend_le_peripherique_4177;
+
+/// #5050 — le Seek d'après reprise DLNA/OpenHome n'est plus envoyé qu'à un
+/// renderer qui n'est pas à la position de la pause.
+#[cfg(test)]
+mod seek_de_reprise_conditionnel_5050;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).

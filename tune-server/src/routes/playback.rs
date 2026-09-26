@@ -368,8 +368,9 @@ pub(crate) fn entrees_de_file(
 /// (`insert_at` l'écarte) — `GET /playlists/{id}/tracks` l'omet aussi, donc
 /// l'indice du client désigne toujours la même ligne.
 ///
-/// Un titre banni (#4806) est une piste LOCALE : l'avance de la file le
-/// saute déjà, comme dans toute file.
+/// Un titre banni (#4806), local ou de service, est sauté par l'avance de la
+/// file, comme dans toute file ; la ligne de départ, elle, est un choix de
+/// l'utilisateur et se joue.
 async fn jouer_playlist_mixte(
     state: &AppState,
     zone_id: i64,
@@ -1306,13 +1307,13 @@ async fn zone_status(State(state): State<AppState>, Path(zone_id): Path<i64>) ->
         let credits = TrackRepo::with_backend(state.backend.clone())
             .get_credits(track_id)
             .unwrap_or_default();
-        if !credits.is_empty() {
-            if let Some(np) = v.get_mut("now_playing").and_then(|np| np.as_object_mut()) {
-                np.insert(
-                    "credits".into(),
-                    serde_json::to_value(&credits).unwrap_or_default(),
-                );
-            }
+        if !credits.is_empty()
+            && let Some(np) = v.get_mut("now_playing").and_then(|np| np.as_object_mut())
+        {
+            np.insert(
+                "credits".into(),
+                serde_json::to_value(&credits).unwrap_or_default(),
+            );
         }
     }
     // #3164 — « la surface que les clients interrogent en boucle » (#1274)
@@ -2855,54 +2856,53 @@ async fn resume(
     // celui de `PlaybackManager::stop` : « keep position_ms […] can resume from
     // the same position ». L'intention était écrite, l'instruction manquait
     // (#2876).
-    if current.state == tune_core::playback::PlayState::Stopped {
-        if let Some(ref np) = current.now_playing {
-            let output_device_id = get_zone_device_id(&state, zone_id);
-            let reprise =
-                position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
-            let orch_req = tune_core::orchestrator::PlayRequest {
-                zone_id,
-                output_device_id,
-                track_id: np.track_id,
-                source: if np.source == "local" {
-                    None
-                } else {
-                    Some(np.source.clone())
-                },
-                source_id: np.source_id.clone(),
-                title: Some(np.title.clone()),
-                artist_name: np.artist_name.clone(),
-                album_title: np.album_title.clone(),
-                cover_url: np.cover_path.clone(),
-                duration_ms: Some(np.duration_ms),
-                seek_ms: reprise,
-                temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
-                track_number: None,
-                disc_number: None,
-            };
-            ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
-            return match state.orchestrator.play(orch_req).await {
-                Ok(result) => {
-                    // Restore queue_length from DB so the poller can
-                    // advance tracks (fixes repeat-all after restart).
-                    let qr = PlayQueueRepo::with_backend(state.backend.clone());
-                    let q_len = qr.count_all(zone_id).unwrap_or(0);
-                    if q_len > 0 {
-                        let cur_pos = state.playback.get_state(zone_id).await.queue_position;
-                        state
-                            .playback
-                            .update_queue_info(zone_id, cur_pos, q_len)
-                            .await;
-                    }
-                    Json(build_zone_json_with_result(&state, zone_id, &result).await)
-                        .into_response()
+    if current.state == tune_core::playback::PlayState::Stopped
+        && let Some(ref np) = current.now_playing
+    {
+        let output_device_id = get_zone_device_id(&state, zone_id);
+        let reprise =
+            position_de_reprise(&state, zone_id, np.track_id, np.source_id.as_deref()).await;
+        let orch_req = tune_core::orchestrator::PlayRequest {
+            zone_id,
+            output_device_id,
+            track_id: np.track_id,
+            source: if np.source == "local" {
+                None
+            } else {
+                Some(np.source.clone())
+            },
+            source_id: np.source_id.clone(),
+            title: Some(np.title.clone()),
+            artist_name: np.artist_name.clone(),
+            album_title: np.album_title.clone(),
+            cover_url: np.cover_path.clone(),
+            duration_ms: Some(np.duration_ms),
+            seek_ms: reprise,
+            temp_file_path: None,
+            sample_rate: None,
+            bit_depth: None,
+            media_format: None,
+            track_number: None,
+            disc_number: None,
+        };
+        ancrer_position_demandee(&state, zone_id, orch_req.seek_ms, reprise).await;
+        return match state.orchestrator.play(orch_req).await {
+            Ok(result) => {
+                // Restore queue_length from DB so the poller can
+                // advance tracks (fixes repeat-all after restart).
+                let qr = PlayQueueRepo::with_backend(state.backend.clone());
+                let q_len = qr.count_all(zone_id).unwrap_or(0);
+                if q_len > 0 {
+                    let cur_pos = state.playback.get_state(zone_id).await.queue_position;
+                    state
+                        .playback
+                        .update_queue_info(zone_id, cur_pos, q_len)
+                        .await;
                 }
-                Err(e) => play_error_response(e, &lang),
-            };
-        }
+                Json(build_zone_json_with_result(&state, zone_id, &result).await).into_response()
+            }
+            Err(e) => play_error_response(e, &lang),
+        };
     }
 
     // Stopped with no now_playing (e.g. after server restart) — try to
@@ -3426,14 +3426,54 @@ pub(crate) async fn passer_les_zones_qui_jouent_la_piste(
     state: &AppState,
     track_id: i64,
 ) -> Vec<Value> {
+    passer_les_zones_qui_jouent(state, &PisteVisee::Locale(track_id)).await
+}
+
+/// Le titre que vise un bannissement : une piste de la bibliothèque, ou un
+/// titre de SERVICE désigné par sa paire (#4806 suite). Deux espaces
+/// d'identifiants — jamais l'un pour l'autre.
+pub(crate) enum PisteVisee {
+    Locale(i64),
+    Service { source: String, source_id: String },
+}
+
+impl PisteVisee {
+    /// Cette lecture en cours est-elle le titre visé ? Un titre de service
+    /// se reconnaît à sa paire et seulement quand la lecture n'a PAS de
+    /// `track_id` : une piste locale dont le `source_id` vaudrait la même
+    /// chaîne n'est pas concernée.
+    fn est_jouee_par(&self, np: &tune_core::playback::NowPlaying) -> bool {
+        match self {
+            PisteVisee::Locale(id) => np.track_id == Some(*id),
+            PisteVisee::Service { source, source_id } => {
+                np.track_id.is_none()
+                    && tune_core::db::hidden_repo::source_normalisee(&np.source) == *source
+                    && np.source_id.as_deref().map(str::trim) == Some(source_id.as_str())
+            }
+        }
+    }
+}
+
+/// #4806 — un titre (local ou de service) vient d'être BANNI alors qu'il
+/// joue : chaque zone qui le joue passe au suivant. Voir
+/// [`passer_les_zones_qui_jouent_la_piste`].
+pub(crate) async fn passer_les_zones_qui_jouent(
+    state: &AppState,
+    visee: &PisteVisee,
+) -> Vec<Value> {
     let mut passees = Vec::new();
     for zs in state.playback.all_states().await {
         if zs.state == tune_core::playback::PlayState::Stopped {
             continue;
         }
-        if zs.now_playing.as_ref().and_then(|np| np.track_id) != Some(track_id) {
+        if !zs
+            .now_playing
+            .as_ref()
+            .is_some_and(|np| visee.est_jouee_par(np))
+        {
             continue;
         }
+        let track_id = zs.now_playing.as_ref().and_then(|np| np.track_id);
         let zone_id = zs.zone_id;
         let titre = zs
             .now_playing
@@ -3462,7 +3502,7 @@ pub(crate) async fn passer_les_zones_qui_jouent_la_piste(
         };
         info!(
             zone_id,
-            track_id,
+            track_id = ?track_id,
             title = %titre,
             queue_position = zs.queue_position,
             suivante = ?suivante,
@@ -3553,19 +3593,34 @@ async fn get_queue(
     let mut zs = ps.clone();
     zs.queue_length = length as i64;
     // #4806 — `banned` par ligne, pour le profil qui regarde : la file n'est
-    // pas purgée, la ligne reste et l'écran la grise. Une ligne de service
-    // (`track_id` absent) n'est jamais bannie, quel que soit son `source_id`.
+    // pas purgée, la ligne reste et l'écran la grise. Une ligne locale se juge
+    // sur son `track_id`, une ligne de SERVICE (`track_id` absent) sur sa
+    // paire `source` + `source_id` — jamais l'une pour l'autre.
     let ids_locaux: Vec<i64> = entries.iter().filter_map(|e| e.track_id).collect();
-    let bannis = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+    let bans = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    let bannis = bans
         .banned_track_ids(profile.id(), &ids_locaux)
         .ou_defaut_journalise();
+    let bannis_de_service = if entries.iter().any(|e| e.track_id.is_none()) {
+        bans.banned_streaming_keys(profile.id())
+            .ou_defaut_journalise()
+    } else {
+        Default::default()
+    };
     let tracks: Vec<Value> = entries
         .iter()
         .enumerate()
         .map(|(idx, e)| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
             if let Some(obj) = v.as_object_mut() {
-                let bannie = e.track_id.is_some_and(|id| bannis.contains(&id));
+                let bannie = match (e.track_id, e.source.as_deref(), e.source_id.as_deref()) {
+                    (Some(id), _, _) => bannis.contains(&id),
+                    (None, Some(src), Some(sid)) => bannis_de_service.contains(&(
+                        tune_core::db::hidden_repo::source_normalisee(src),
+                        sid.trim().to_string(),
+                    )),
+                    _ => false,
+                };
                 obj.insert("banned".into(), Value::Bool(bannie));
             }
             let suivant = entries.get(idx + 1);
@@ -4925,21 +4980,27 @@ async fn do_transfer(
                 // Reprendre à la position de la source. Sous 3 s on repart du
                 // début (même seuil que la route seek) — inutile de chercher
                 // dans un flux qui vient de démarrer.
-                if source_position_ms > 3000 {
-                    if let Err(error) = state
+                // #4442 — pas un `seek` nu dans la foulée du `Play` : voir
+                // `reprendre_la_position_transferee`.
+                if source_position_ms > 3000
+                    && let Err(error) = state
                         .orchestrator
-                        .seek(target_zone, source_position_ms, Some(did))
+                        .reprendre_la_position_transferee(
+                            target_zone,
+                            did,
+                            source_position_ms,
+                            !source_paused,
+                        )
                         .await
-                    {
-                        return output_command_error_response(error);
-                    }
+                {
+                    return output_command_error_response(error);
                 }
                 // Une source en pause reste en pause sur la cible : transférer
                 // ne veut pas dire relancer.
-                if source_paused {
-                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
-                        return output_command_error_response(error);
-                    }
+                if source_paused
+                    && let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await
+                {
+                    return output_command_error_response(error);
                 }
             }
             Err(e) => {
@@ -5007,7 +5068,7 @@ async fn get_alarms(
         .into_iter()
         .map(|r| {
             json!({
-                "id": r.get(0).and_then(|v| v.as_i64()),
+                "id": r.first().and_then(|v| v.as_i64()),
                 "zone_id": r.get(1).and_then(|v| v.as_i64()),
                 "time": r.get(2).and_then(|v| v.as_string()),
                 "enabled": r.get(3).and_then(|v| v.as_i64()).unwrap_or(1) != 0,
@@ -5998,8 +6059,11 @@ pub async fn shuffle_all(
 }
 
 async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl IntoResponse {
-    let upload_dir = std::path::Path::new("/tmp/tune-upload");
-    let _ = std::fs::create_dir_all(upload_dir);
+    // #4770 : un dossier par compte, sous `TMPDIR`. `/tmp/tune-upload` était
+    // un nom fixe : créé par le premier compte venu, il refusait les
+    // téléversements de tous les autres.
+    let upload_dir = tune_core::chemins_de_travail::racine_de_travail("tune-upload");
+    let _ = std::fs::create_dir_all(&upload_dir);
     let file_id = uuid::Uuid::new_v4().to_string();
 
     let mut file_data: Option<Vec<u8>> = None;
@@ -6030,7 +6094,7 @@ async fn upload_audio_file(mut multipart: axum::extract::Multipart) -> impl Into
             .into_response();
     };
 
-    // #3270 (point 4) — refuser AVANT d'écrire dans `/tmp/tune-upload`.
+    // #3270 (point 4) — refuser AVANT d'écrire dans le dossier de téléversement.
     //
     // Le refus de fond est dans `resolve_uploaded_file` : c'est lui qui garde
     // le chemin de LECTURE, y compris un `temp_file_path` fourni directement

@@ -528,7 +528,16 @@ CREATE TABLE IF NOT EXISTS albums (
     -- Dernier passage de la passe des credits MusicBrainz sur ce disque
     -- (migration 107, #4767). NUL = jamais interroge : c'est le curseur de
     -- reprise de `POST /system/enrich-credits`.
-    credits_mb_at TEXT
+    credits_mb_at TEXT,
+    -- D'ou vient la pochette (migration 111, #5034) : `embedded`, `folder`,
+    -- `upload`, `provider`, `import` — voir `models::SourcePochette`. NUL =
+    -- INCONNUE, l'etat de toute ligne d'avant la migration : jamais retiree
+    -- sans preuve. `cover_source_path` / `cover_source_stamp` : le fichier
+    -- d'ou l'image a ete tiree et sa date/taille a ce moment-la (« mtime:taille »),
+    -- pour qu'un scan sache, d'un seul stat, que la source a change ou disparu.
+    cover_source TEXT,
+    cover_source_path TEXT,
+    cover_source_stamp TEXT
 );
 
 -- No index on folder_path here: this batch runs against EXISTING databases too,
@@ -690,7 +699,14 @@ CREATE TABLE IF NOT EXISTS zones (
     -- Ne remplace PAS `output_device_id`, qui reste l'identité de la zone :
     -- le réécrire renverrait tous les réglages accrochés sur une clef neuve.
     -- Voir `outputs::identite_de_sortie` pour ce qui a le droit de s'en servir.
-    output_endpoint_id TEXT
+    output_endpoint_id TEXT,
+    -- POURQUOI la zone est masquee (migration 112, #5077) : une valeur de
+    -- `zone_motif_masquage::MotifMasquage` (`suppression_utilisateur`,
+    -- `appareil_ignore`…), et quand. NUL = INCONNU, l'etat de tout masquage
+    -- d'avant la migration : jamais demasque automatiquement. Effaces tous
+    -- deux au demasquage.
+    motif_masquage TEXT,
+    masquee_le TEXT
 );
 
 -- Unified queue (v0.9 rc.2): a single ordered queue per zone holding both
@@ -814,6 +830,26 @@ CREATE TABLE IF NOT EXISTS hidden_items (
     PRIMARY KEY (profile_id, item_type, item_id)
 );
 CREATE INDEX IF NOT EXISTS idx_hidden_items_item ON hidden_items(item_type, item_id);
+
+-- Titres de SERVICE bannis (#4806, FabienM fil 1946 réponse 6820) — la
+-- jumelle de `hidden_items` pour l'espace d'identifiants du streaming, comme
+-- `streaming_item_tags` l'est de `item_tags` : un titre Qobuz, Tidal ou
+-- Bandcamp n'a pas d'entier, il porte la paire `source` + `source_id`.
+-- Présente AUSSI dans le rattrapage de `run_migrations` (bases existantes).
+CREATE TABLE IF NOT EXISTS streaming_hidden_items (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    title TEXT,
+    artist TEXT,
+    album TEXT,
+    album_source_id TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, source, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
 
 -- « Ces deux albums ne sont pas des doublons » (#1276) — miroir de la
 -- migration SQLite 91, présent AUSSI ici pour que le rapprochement d'albums

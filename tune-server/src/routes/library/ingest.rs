@@ -368,13 +368,17 @@ pub(super) async fn analyze(
     if body.identify.unwrap_or(false)
         && let Some(title) = album.album.as_deref()
     {
+        // Le refus éventuel (#4991) n'a pas d'emploi ici : l'écran d'import est
+        // devant l'utilisateur, qui relance s'il ne voit rien. C'est la passe de
+        // LOT qui a besoin de la différence, personne ne la regardant.
         candidates = tune_core::metadata::musicbrainz_release::lookup_release_candidates(
             title,
             album.album_artist.as_deref().unwrap_or(""),
             Some(album.track_count as u32),
             MAX_RELEASE_CANDIDATES,
         )
-        .await;
+        .await
+        .candidats;
     }
 
     let settings = load_settings(&state);

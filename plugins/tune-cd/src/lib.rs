@@ -8,6 +8,8 @@
 //!
 //! ```text
 //! LecteurDisque (trait)  ── linux.rs  : ioctl /dev/sr*
+//!        │                ├─ cddafs.rs : volume cddafs (AIFF + .TOC.plist),
+//!        │                │              découvert par macos.rs
 //!        │                └─ simule.rs : TOC et secteurs en mémoire (témoins)
 //!        ▼
 //! toc.rs / discid.rs / musicbrainz.rs   (purs : TOC, identifiant, métadonnées)
@@ -26,10 +28,11 @@
 //!
 //! ## Hors de ce greffon
 //!
-//! L'extraction vers la bibliothèque (#2466), macOS (volume AIFF sous
-//! `/Volumes`) et Windows (`IOCTL_CDROM_RAW_READ`) : l'abstraction
-//! [`lecteur::LecteurDisque`] est prête à les recevoir.
+//! L'extraction vers la bibliothèque (#2466) et Windows
+//! (`IOCTL_CDROM_RAW_READ`) : l'abstraction [`lecteur::LecteurDisque`] est
+//! prête à les recevoir.
 
+pub mod cddafs;
 pub mod discid;
 pub mod ejection;
 pub mod flux;
@@ -38,9 +41,12 @@ pub mod hote;
 pub mod lecteur;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod musicbrainz;
 pub mod routes;
 pub mod simule;
+pub mod source;
 pub mod toc;
 
 use std::sync::Arc;
@@ -89,7 +95,7 @@ impl TunePlugin for CdPlugin {
         env!("CARGO_PKG_VERSION")
     }
     fn description(&self) -> &str {
-        "Lecture directe d'un CD audio vers une zone, sans extraction (lecteur pris en charge sous Linux)"
+        "Lecture directe d'un CD audio vers une zone, sans extraction (lecteur pris en charge sous Linux et macOS)"
     }
     /// Opt-in : compilé partout, dormant tant qu'on ne l'installe pas.
     fn default_enabled(&self) -> bool {
@@ -98,7 +104,7 @@ impl TunePlugin for CdPlugin {
     /// Au catalogue (#4863) : l'écran « Lecture CD » du client web consomme
     /// ses trois routes, donc la doctrine #2090 est remplie — le gestionnaire
     /// peut proposer « Installer ». Gratuit, comme `bandcamp` (absent de
-    /// `premium_plugins`). Sous macOS et Windows, l'installation réussit et
+    /// `premium_plugins`). Sous Windows, l'installation réussit et
     /// `/etat` répond `plateforme_prise_en_charge: false` : un état, pas une
     /// erreur.
     fn catalogued(&self) -> bool {
@@ -113,6 +119,18 @@ impl TunePlugin for CdPlugin {
             playback: self.services.playback.clone(),
         });
         let zones: ZonesDuDisque = Arc::default();
+        let etat_routes = routes::EtatRoutes {
+            lecteur: lecteur.clone(),
+            hote: hote.clone(),
+            consultation: musicbrainz::MusicBrainz::new(),
+            zones: zones.clone(),
+        };
+        // #5065 — la source `cd` du registre commun des sources physiques.
+        let publication = Arc::new(source::PublicationSource::new(
+            self.services.orchestrator.sources_physiques().clone(),
+            &etat_routes,
+        ));
+        publication.publier_sans_lecteur();
         match &lecteur {
             Some(l) => {
                 tracing::info!(lecteur = %l.chemin(), "cd_lecteur_detecte");
@@ -120,7 +138,8 @@ impl TunePlugin for CdPlugin {
                     .orchestrator
                     .sources_pcm()
                     .inscrire(SOURCE, Arc::new(FournisseurCd { lecteur: l.clone() }));
-                let s = Surveillant::new(l.clone(), hote.clone(), zones.clone());
+                let s = Surveillant::new(l.clone(), hote.clone(), zones.clone())
+                    .avec_publication(publication);
                 self.surveillance = Some(tokio::spawn(s.tourner()));
             }
             None => tracing::info!(
@@ -128,12 +147,7 @@ impl TunePlugin for CdPlugin {
                 "cd_aucun_lecteur"
             ),
         }
-        ctx.register_router(routes::router(routes::EtatRoutes {
-            lecteur,
-            hote,
-            consultation: musicbrainz::MusicBrainz::new(),
-            zones,
-        }));
+        ctx.register_router(routes::router(etat_routes));
         Ok(())
     }
 
@@ -141,7 +155,14 @@ impl TunePlugin for CdPlugin {
         self.services.orchestrator.sources_pcm().retirer(SOURCE);
         if let Some(h) = self.surveillance.take() {
             h.abort();
+            // Attendue : un tour en vol ne republie pas la source après son
+            // retrait.
+            let _ = h.await;
         }
+        self.services
+            .orchestrator
+            .sources_physiques()
+            .retirer_greffon(source::ID);
         Ok(())
     }
 

@@ -578,7 +578,7 @@ mod essais {
             let fin = (debut + SALVE).min(total);
             for (i, e) in v[debut..fin].iter_mut().enumerate() {
                 // Alternance : une salve continue n'aurait pas d'énergie utile.
-                *e = if (debut + i) % 2 == 0 { c } else { -c };
+                *e = if (debut + i).is_multiple_of(2) { c } else { -c };
             }
             debut += periode;
         }

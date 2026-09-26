@@ -678,6 +678,14 @@ pub mod sql {
         )
     }
 
+    /// #5073 — les tranches d'un fichier image : `(id, cue_start_ms)`.
+    pub fn tranches_cue_du_media<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, cue_start_ms FROM tracks WHERE cue_media_path = {}",
+            d.placeholder(1)
+        )
+    }
+
     pub fn get_by_id<D: SqlDialect>(d: &D) -> String {
         format!("{} WHERE t.id = {}", select_track(), d.placeholder(1))
     }
@@ -1711,6 +1719,31 @@ impl TrackRepo {
             .collect())
     }
 
+    /// #5034 — `(fichier, album)` des pistes rangées sous `dossier` (découpage
+    /// exact, comme [`Self::fichiers_sous_dossier`]) : ce qu'une image de
+    /// pochette de ce dossier peut illustrer.
+    pub fn albums_sous_dossier(&self, dossier: &str) -> Result<Vec<(String, i64)>, TuneError> {
+        let d = DossierExact::new(dossier);
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!(
+            "SELECT DISTINCT {c}, album_id FROM tracks WHERE {c} LIKE {p1}{esc} \
+             AND substr({c}, 1, {n}) = {p2} AND album_id IS NOT NULL",
+            c = CHEMIN_DE_LA_PISTE,
+            esc = like_escape_clause(),
+            n = d.longueur,
+        );
+        let params: [&dyn ToSqlValue; 2] = [&d.motif, &d.prefixe];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .iter()
+            .filter_map(|ligne| {
+                let chemin = ligne.first()?.as_string()?;
+                Some((chemin, ligne.get(1)?.as_i64()?))
+            })
+            .collect())
+    }
+
     /// #4896 — un dossier renommé ou déplacé : chaque fichier `(ancien,
     /// nouveau)` change de chemin en GARDANT sa ligne, donc son identifiant et
     /// tout ce qui s'y rattache (favoris, écoutes, étiquettes, files
@@ -1877,6 +1910,26 @@ impl TrackRepo {
         let sql = self.dialect_sql(sql::delete_by_cue_media, sql::delete_by_cue_media);
         let params: [&dyn ToSqlValue; 1] = [&cue_media_path];
         Ok(self.db.execute(&sql, &params)? as u64)
+    }
+
+    /// #5073 — les tranches que la base porte pour ce fichier image, en
+    /// `(id, cue_start_ms)` : ce qu'une feuille relue confronte à ce qu'elle
+    /// décrit désormais (`cue_bibliotheque::relire_le_dossier`).
+    pub fn tranches_cue_du_media(
+        &self,
+        cue_media_path: &str,
+    ) -> Result<Vec<(i64, i64)>, TuneError> {
+        let sql = self.dialect_sql(sql::tranches_cue_du_media, sql::tranches_cue_du_media);
+        let params: [&dyn ToSqlValue; 1] = [&cue_media_path];
+        Ok(self
+            .db
+            .query_many(&sql, &params)?
+            .iter()
+            .filter_map(|ligne| {
+                let id = ligne.first()?.as_i64()?;
+                Some((id, ligne.get(1).and_then(|v| v.as_i64()).unwrap_or(0)))
+            })
+            .collect())
     }
 
     fn create_inner(&self, track: &Track) -> Result<i64, TuneError> {
@@ -2679,22 +2732,26 @@ impl TrackRepo {
         Ok(self.db.query_one(&sql, &params)?.as_ref().map(row_to_track))
     }
 
-    /// `(file_path, album_artist)` of every track whose file path begins with
-    /// `dir_prefix`. Used by the file-watcher to decide compilation status for a
-    /// single re-imported file from its already-scanned siblings — a folder with
-    /// 2+ distinct album_artists is a various-artists compilation (JP Borderies).
-    /// The caller filters to direct children of the folder.
+    /// `(file_path, album_artist, artiste de la piste)` of every track whose
+    /// file path begins with `dir_prefix`. Used by the file-watcher to decide
+    /// compilation status for a single re-imported file from its
+    /// already-scanned siblings, by LA règle
+    /// ([`crate::library::regle_compilation`]) — JP Borderies. The caller
+    /// filters to direct children of the folder.
     pub fn siblings_album_artists(
         &self,
         dir_prefix: &str,
-    ) -> Result<Vec<(String, Option<String>)>, TuneError> {
+    ) -> Result<Vec<(String, Option<String>, Option<String>)>, TuneError> {
         let ph = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
         let esc = like_escape_clause();
-        let sql =
-            format!("SELECT file_path, album_artist FROM tracks WHERE file_path LIKE {ph}{esc}");
+        let sql = format!(
+            "SELECT t.file_path, t.album_artist, ar.name FROM tracks t \
+             LEFT JOIN artists ar ON ar.id = t.artist_id \
+             WHERE t.file_path LIKE {ph}{esc}"
+        );
         // Même contrat que `folder_like_pattern` : le préfixe est du texte, le
         // `%` final est le seul joker.
         let like = format!("{}%", echapper_jokers_like(dir_prefix));
@@ -2705,7 +2762,8 @@ impl TrackRepo {
             .filter_map(|c| {
                 let fp = c.first().and_then(|v| v.as_string())?;
                 let aa = c.get(1).and_then(|v| v.as_string());
-                Some((fp, aa))
+                let artiste = c.get(2).and_then(|v| v.as_string());
+                Some((fp, aa, artiste))
             })
             .collect())
     }
@@ -3934,7 +3992,11 @@ mod tests {
             .id
             .unwrap();
         albums
-            .update_cover_path(album_id, "album-sleeve-hash")
+            .update_cover_path(
+                album_id,
+                "album-sleeve-hash",
+                crate::db::models::SourcePochette::Dossier,
+            )
             .unwrap();
 
         let repo = TrackRepo::new(db.clone());
@@ -4988,7 +5050,13 @@ mod tests {
         let album = albums
             .create(&Album::new("Hackney Diamonds".into()))
             .unwrap();
-        albums.update_cover_path(album, "condensat-album").unwrap();
+        albums
+            .update_cover_path(
+                album,
+                "condensat-album",
+                crate::db::models::SourcePochette::Integree,
+            )
+            .unwrap();
 
         // La piste telle qu'un scan d'avant le correctif l'a posée : aucune
         // pochette propre.

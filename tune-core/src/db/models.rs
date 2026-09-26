@@ -151,6 +151,77 @@ impl Album {
     }
 }
 
+/// D'où vient la pochette d'un album (`albums.cover_source`, migration 111,
+/// #5034).
+///
+/// La colonne existe pour une seule question : **le scan a-t-il le droit de
+/// retirer ou de remplacer cette pochette ?** Seules les deux sources du
+/// DISQUE — la jaquette intégrée d'une piste et l'image posée dans le dossier —
+/// suivent le disque : leur fichier disparu, elles disparaissent ; leur
+/// fichier changé, elles changent. Toutes les autres sont GARDÉES : une
+/// pochette téléversée à la main n'est jamais écrasée par une passe de scan,
+/// et une pochette venue d'un fournisseur n'a pas de fichier dont la
+/// disparition la condamnerait.
+///
+/// La valeur est lue par tous les écrivains de `cover_path`, un par un :
+/// - [`Self::Integree`] : le scan, le surveillant, le rattrapage de fin de scan
+///   et les routes `/artwork/rescan`, quand l'image sort des balises d'une
+///   piste ;
+/// - [`Self::Dossier`] : les mêmes, quand elle sort d'un `cover.jpg`,
+///   `folder.jpg`… posé à côté des pistes ;
+/// - [`Self::Televersee`] : `POST /albums/{id}/artwork` (téléversement) ;
+/// - [`Self::Fournisseur`] : Cover Art Archive, iTunes, Discogs (passe
+///   d'enrichissement et routes de récupération), et le catalogue
+///   communautaire du nuage ;
+/// - [`Self::Importee`] : l'import du pont Roon, image d'une AUTRE
+///   bibliothèque.
+///
+/// 🔴 NUL = INCONNUE, et c'est l'état de TOUTES les lignes d'avant la
+/// migration : rien dans la base ne dit si une pochette déjà posée venait
+/// d'un fichier ou d'un téléversement (les deux sont adressées par le
+/// condensat de leur contenu). Une source inconnue n'est donc jamais retirée
+/// sans preuve — voir `library::pochette_disque`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourcePochette {
+    Integree,
+    Dossier,
+    Televersee,
+    Fournisseur,
+    Importee,
+}
+
+impl SourcePochette {
+    /// La valeur stockée dans `albums.cover_source`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Integree => "embedded",
+            Self::Dossier => "folder",
+            Self::Televersee => "upload",
+            Self::Fournisseur => "provider",
+            Self::Importee => "import",
+        }
+    }
+
+    /// Relit la colonne. Une valeur inconnue de ce binaire (base migrée par
+    /// une version plus récente) rend `None` : traitée comme inconnue, donc
+    /// jamais retirée.
+    pub fn depuis_colonne(v: &str) -> Option<Self> {
+        match v {
+            "embedded" => Some(Self::Integree),
+            "folder" => Some(Self::Dossier),
+            "upload" => Some(Self::Televersee),
+            "provider" => Some(Self::Fournisseur),
+            "import" => Some(Self::Importee),
+            _ => None,
+        }
+    }
+
+    /// Vrai pour les deux sources qui suivent le disque.
+    pub fn vient_du_disque(self) -> bool {
+        matches!(self, Self::Integree | Self::Dossier)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: Option<i64>,

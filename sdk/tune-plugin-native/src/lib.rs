@@ -263,6 +263,14 @@ static REGISTRY: OnceLock<RwLock<BTreeMap<String, Arc<Library>>>> = OnceLock::ne
 pub fn provider(id: &str) -> Option<Arc<Library>> {
     REGISTRY.get()?.read().ok()?.get(id).cloned()
 }
+/// Identifiers of every registered provider, sorted. Hosts use it to find
+/// installed packages that are not one of their compiled-in slots.
+pub fn provider_ids() -> Vec<String> {
+    REGISTRY
+        .get()
+        .and_then(|registry| registry.read().ok().map(|r| r.keys().cloned().collect()))
+        .unwrap_or_default()
+}
 /// Register before playback/jobs start. Replacing the registry entry does not
 /// unload the previous library while existing processors still own it.
 pub fn register(library: Arc<Library>) -> Result<(), Error> {

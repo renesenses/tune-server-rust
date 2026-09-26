@@ -222,15 +222,13 @@ pub fn appliquer(
                 .unwrap_or(false);
             if sans_image {
                 r.images_artistes_a_poser += 1;
-                if !apercu {
-                    if let Some(hash) = octets_de(&ar.image).and_then(|d| ranger(&d, images)) {
-                        if artistes
-                            .update_image(*artiste_id, &hash, SOURCE_IMAGE_ROON)
-                            .is_ok()
-                        {
-                            r.images_artistes_posees += 1;
-                        }
-                    }
+                if !apercu
+                    && let Some(hash) = octets_de(&ar.image).and_then(|d| ranger(&d, images))
+                    && artistes
+                        .update_image(*artiste_id, &hash, SOURCE_IMAGE_ROON)
+                        .is_ok()
+                {
+                    r.images_artistes_posees += 1;
                 }
             }
         }
@@ -254,13 +252,20 @@ pub fn appliquer(
                 let pochette = siens[j].cover_path.as_deref();
                 if pochette.is_none_or(str::is_empty) {
                     r.images_albums_a_poser += 1;
-                    if !apercu {
-                        if let Some(hash) = octets_de(&al.image).and_then(|d| ranger(&d, images)) {
-                            // `force` : une chaîne vide n'est pas remplacée par
-                            // COALESCE ; on vient de vérifier qu'il n'y a rien.
-                            if albums.force_update_cover_path(album_id, &hash).is_ok() {
-                                r.images_albums_posees += 1;
-                            }
+                    if !apercu
+                        && let Some(hash) = octets_de(&al.image).and_then(|d| ranger(&d, images))
+                    {
+                        // `force` : une chaîne vide n'est pas remplacée par
+                        // COALESCE ; on vient de vérifier qu'il n'y a rien.
+                        if albums
+                            .force_update_cover_path(
+                                album_id,
+                                &hash,
+                                crate::db::models::SourcePochette::Importee,
+                            )
+                            .is_ok()
+                        {
+                            r.images_albums_posees += 1;
                         }
                     }
                 }

@@ -1339,6 +1339,43 @@ impl QobuzService {
         element
     }
 
+    /// Les crédits d'un item de piste Qobuz (#4993), tirés de sa chaîne de
+    /// rôles `performers` — la même que lit `artiste_interprete` (#1407).
+    ///
+    /// `avec_piste` : pour un ALBUM, chaque ligne porte le titre, le numéro et
+    /// le disque de sa piste. Pas de `performers` ⇒ aucune ligne : Qobuz ne
+    /// crédite personne, et on ne fabrique pas de crédit depuis `performer`.
+    fn credits_de_l_item(item: &serde_json::Value, avec_piste: bool) -> Vec<StreamCredit> {
+        let track_id = item["id"]
+            .as_u64()
+            .map(|id| id.to_string())
+            .or_else(|| item["id"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        let performers = item["performers"].as_str().unwrap_or("");
+        super::qobuz_credits::lignes_performers(performers)
+            .into_iter()
+            .enumerate()
+            .map(|(position, ligne)| StreamCredit {
+                id: None,
+                track_id: track_id.clone(),
+                artist_id: None,
+                artist_name: ligne.artist_name,
+                role: ligne.role,
+                instrument: ligne.instrument,
+                position: position as i64,
+                track_title: avec_piste
+                    .then(|| item["title"].as_str().map(str::to_string))
+                    .flatten(),
+                track_number: avec_piste
+                    .then(|| item["track_number"].as_u64().map(|n| n as u32))
+                    .flatten(),
+                disc_number: avec_piste
+                    .then(|| item["media_number"].as_u64().map(|n| n as u32))
+                    .flatten(),
+            })
+            .collect()
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
         StreamTrack {
@@ -2823,6 +2860,36 @@ impl StreamingService for QobuzService {
                 .or_else(|| album["label"]["id"].as_str().map(Into::into)),
             label_name: album["label"]["name"].as_str().map(Into::into),
         })
+    }
+
+    /// #4993 — crédits d'une piste Qobuz : la chaîne `performers` de
+    /// `/track/get`.
+    async fn get_track_credits(&self, track_id: &str) -> Result<Vec<StreamCredit>, TuneError> {
+        let data = self
+            .api_get("/track/get", &[("track_id", track_id)])
+            .await?;
+        Ok(Self::credits_de_l_item(&data, false))
+    }
+
+    /// #4993 — crédits de toutes les pistes d'un album Qobuz, depuis la
+    /// réponse `/album/get` déjà mise en cache par `detail_album` (#2190) :
+    /// aucun appel par piste. Ordre : disque, piste, puis position du crédit.
+    async fn get_album_credits(&self, album_id: &str) -> Result<Vec<StreamCredit>, TuneError> {
+        let data = self.detail_album(album_id).await?;
+        let mut pistes: Vec<&serde_json::Value> = data["tracks"]["items"]
+            .as_array()
+            .map(|items| items.iter().collect())
+            .unwrap_or_default();
+        pistes.sort_by_key(|p| {
+            (
+                p["media_number"].as_u64().unwrap_or(1),
+                p["track_number"].as_u64().unwrap_or(0),
+            )
+        });
+        Ok(pistes
+            .into_iter()
+            .flat_map(|p| Self::credits_de_l_item(p, true))
+            .collect())
     }
 
     async fn get_user_tracks(&self) -> Result<Vec<StreamTrack>, TuneError> {
@@ -6652,6 +6719,184 @@ mod tests_repli_editorial {
         assert!(
             svc.get_playlist_tags().await.is_err(),
             "au-delà de la fenêtre de repli, l'échec redevient franc"
+        );
+    }
+}
+
+/// #4993 — crédits d'une piste et d'un album Qobuz (FabienM, fil forum 1921).
+///
+/// Aucun appel à l'API Qobuz : un Qobuz simulé sur `127.0.0.1:0` rend
+/// `/track/get` et `/album/get` avec la chaîne `performers` des tests de
+/// #1407. Il compte ses `/album/get` : les crédits d'un album ne doivent
+/// coûter aucun appel par piste.
+#[cfg(test)]
+mod tests_credits_4993 {
+    use super::*;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn qobuz_credits_simule() -> (String, Arc<AtomicUsize>) {
+        let appels_album = Arc::new(AtomicUsize::new(0));
+        let compteur = appels_album.clone();
+        let app = Router::new()
+            .route(
+                "/track/get",
+                get(|| async {
+                    Json(json!({
+                        "id": 11,
+                        "title": "Nocturne No. 2",
+                        "performer": {"id": 111, "name": "Frédéric Chopin"},
+                        "composer": {"id": 111, "name": "Frédéric Chopin"},
+                        "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist",
+                        "duration": 271,
+                    }))
+                }),
+            )
+            .route(
+                "/album/get",
+                get(move || {
+                    let compteur = compteur.clone();
+                    async move {
+                        compteur.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "id": "a1",
+                            "title": "Chopin: Nocturnes",
+                            "artist": {"id": 222, "name": "Martha Argerich"},
+                            "tracks_count": 3,
+                            "tracks": {"items": [
+                                // Désordre voulu : disque 2 d'abord.
+                                {"id": 13, "title": "Face B", "track_number": 1, "media_number": 2,
+                                 "performers": "Boston Pops Orchestra, Orchestra, MainArtist"},
+                                {"id": 12, "title": "Deuxième", "track_number": 2, "media_number": 1},
+                                {"id": 11, "title": "Nocturne No. 2", "track_number": 1, "media_number": 1,
+                                 "performers": "Frédéric Chopin, Composer - Martha Argerich, Piano, MainArtist"},
+                            ]},
+                        }))
+                    }
+                }),
+            );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}"), appels_album)
+    }
+
+    #[tokio::test]
+    async fn les_credits_d_une_piste_viennent_de_sa_chaine_performers() {
+        let (base, _) = qobuz_credits_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let credits = svc
+            .get_track_credits("11")
+            .await
+            .expect("Qobuz sait rendre les crédits d'une piste (#4993)");
+        let lignes: Vec<(&str, &str, &str, Option<&str>, i64)> = credits
+            .iter()
+            .map(|c| {
+                (
+                    c.track_id.as_str(),
+                    c.artist_name.as_str(),
+                    c.role.as_str(),
+                    c.instrument.as_deref(),
+                    c.position,
+                )
+            })
+            .collect();
+        assert_eq!(
+            lignes,
+            vec![
+                ("11", "Frédéric Chopin", "composer", None, 0),
+                ("11", "Martha Argerich", "performer", Some("piano"), 1),
+                ("11", "Martha Argerich", "artist", None, 2),
+            ],
+            "les crédits d'une piste Qobuz doivent reprendre sa chaîne performers"
+        );
+        assert!(
+            credits
+                .iter()
+                .all(|c| c.id.is_none() && c.artist_id.is_none() && c.track_title.is_none()),
+            "ni ligne ni fiche de bibliothèque à désigner pour une piste de service"
+        );
+    }
+
+    #[tokio::test]
+    async fn les_credits_d_un_album_portent_leur_piste_sans_appel_par_piste() {
+        let (base, appels_album) = qobuz_credits_simule().await;
+        let svc = QobuzService::avec_base_forcee(base);
+        let credits = svc
+            .get_album_credits("a1")
+            .await
+            .expect("Qobuz sait rendre les crédits d'un album (#4993)");
+        let lignes: Vec<(&str, Option<&str>, Option<u32>, Option<u32>, &str, &str)> = credits
+            .iter()
+            .map(|c| {
+                (
+                    c.track_id.as_str(),
+                    c.track_title.as_deref(),
+                    c.disc_number,
+                    c.track_number,
+                    c.artist_name.as_str(),
+                    c.role.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lignes,
+            vec![
+                (
+                    "11",
+                    Some("Nocturne No. 2"),
+                    Some(1),
+                    Some(1),
+                    "Frédéric Chopin",
+                    "composer"
+                ),
+                (
+                    "11",
+                    Some("Nocturne No. 2"),
+                    Some(1),
+                    Some(1),
+                    "Martha Argerich",
+                    "performer"
+                ),
+                (
+                    "11",
+                    Some("Nocturne No. 2"),
+                    Some(1),
+                    Some(1),
+                    "Martha Argerich",
+                    "artist"
+                ),
+                (
+                    "13",
+                    Some("Face B"),
+                    Some(2),
+                    Some(1),
+                    "Boston Pops Orchestra",
+                    "performer"
+                ),
+                (
+                    "13",
+                    Some("Face B"),
+                    Some(2),
+                    Some(1),
+                    "Boston Pops Orchestra",
+                    "artist"
+                ),
+            ],
+            "crédits d'album : disque puis piste, chaque ligne portant sa piste ; \
+             une piste sans performers n'en invente aucun"
+        );
+        assert_eq!(
+            appels_album.load(Ordering::SeqCst),
+            1,
+            "un seul /album/get pour tout l'album"
         );
     }
 }

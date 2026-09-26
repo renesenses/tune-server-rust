@@ -660,14 +660,14 @@ fn preparer_la_sortie(
         gap_ms = ?gap_ms,
         "radio_local_decode_started"
     );
-    if let Some(g) = gap_ms {
-        if g > 2000 {
-            warn!(
-                gap_ms = g,
-                reconnect = etat.reconnects,
-                "radio_reconnect_gap_long — renderer may have been starved"
-            );
-        }
+    if let Some(g) = gap_ms
+        && g > 2000
+    {
+        warn!(
+            gap_ms = g,
+            reconnect = etat.reconnects,
+            "radio_reconnect_gap_long — renderer may have been starved"
+        );
     }
 
     Ok(SortieRadio {

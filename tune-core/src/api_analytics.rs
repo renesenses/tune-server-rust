@@ -112,10 +112,10 @@ impl ApiAnalytics {
             .collect();
 
         let mut top_endpoints = all_stats.clone();
-        top_endpoints.sort_by(|a, b| b.count.cmp(&a.count));
+        top_endpoints.sort_by_key(|a| std::cmp::Reverse(a.count));
         top_endpoints.truncate(10);
 
-        all_stats.sort_by(|a, b| b.p95_latency_ms.cmp(&a.p95_latency_ms));
+        all_stats.sort_by_key(|a| std::cmp::Reverse(a.p95_latency_ms));
         all_stats.truncate(10);
 
         ApiStats {

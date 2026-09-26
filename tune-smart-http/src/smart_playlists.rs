@@ -74,7 +74,7 @@ async fn list_smart_playlists(
             "SELECT id, name, rules, sort_by, sort_order, max_tracks, created_at, match_mode FROM smart_playlists ORDER BY name",
             &[],
         )
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     let items: Vec<Value> = rows
         .iter()
         .map(|cols| {
@@ -84,7 +84,7 @@ async fn list_smart_playlists(
                 .unwrap_or_else(|| "[]".into());
             let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
                 "match_mode": cols.get(7).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
@@ -137,7 +137,7 @@ async fn create_smart_playlist(
                 &body.max_tracks as &dyn ToSqlValue,
             ],
         )
-        .map_err(|e| AppError::internal(e));
+        .map_err(AppError::internal);
 
     match result {
         Ok(id) => {
@@ -168,7 +168,7 @@ async fn get_smart_playlist(
     let result = state
         .backend
         .query_one(sql, &[&id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     match result {
         Some(cols) => {
@@ -178,7 +178,7 @@ async fn get_smart_playlist(
                 .unwrap_or_else(|| "[]".into());
             let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
             Ok(Json(json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
                 "match_mode": cols.get(7).and_then(|v| v.as_string()).unwrap_or_else(|| "all".into()),
@@ -311,7 +311,7 @@ async fn update_smart_playlist(
     let result = state
         .backend
         .query_one(sql, &[&id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
 
     match result {
         Some(cols) => {
@@ -321,7 +321,7 @@ async fn update_smart_playlist(
                 .unwrap_or_else(|| "[]".into());
             let rules = serde_json::from_str::<Value>(&rules_str).unwrap_or(json!([]));
             Ok(Json(json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "name": cols.get(1).and_then(|v| v.as_string()),
                 "rules": rules,
                 "sort_by": cols.get(3).and_then(|v| v.as_string()),
@@ -409,7 +409,7 @@ pub(crate) fn build_smart_query_rapport(
 
         let val_clean = value.replace('\'', "''");
         let val_unaccented = strip_accents(&val_clean);
-        let has_accents = val_clean != val_unaccented;
+        let _has_accents = val_clean != val_unaccented;
 
         // Les deux champs qui ne sont pas une colonne : ils se comptent
         // ailleurs, dans l'historique d'écoute.
@@ -441,7 +441,7 @@ pub(crate) fn build_smart_query_rapport(
             // propose passaient par là — dont `composer` en entier et `title`
             // avec tout autre opérateur que « contient ».
             match regles_sql::colonne_piste(field)
-                .and_then(|col| regles_sql::condition(col, op, &value))
+                .and_then(|col| regles_sql::condition(col, op, value))
             {
                 Some(c) => c,
                 None => {
@@ -544,12 +544,12 @@ fn execute_smart_track_query(
     let rows = state
         .backend
         .query_many(&sql, &[])
-        .map_err(|e| AppError::internal(format!("{e}")))?;
+        .map_err(|e| AppError::internal(e.to_string()))?;
     Ok(rows
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "title": cols.get(1).and_then(|v| v.as_string()),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -639,10 +639,15 @@ fn avec_favoris_de_service(
 ///   nommé, TRIE encore le résultat.
 /// * un titre de piste nommé → il trie le résultat, comme le titre d'album
 ///   trie une discographie côté collections.
+///
+/// #4806 suite — un titre de service BANNI par ce profil n'en sort jamais :
+/// comme la clause `avec_le_socle_des_bannis` des pistes locales, sans règle à
+/// configurer.
 async fn avec_pistes_de_catalogue(
     state: &SmartHttpState,
     mut pistes: Vec<Value>,
     rules_json: &str,
+    profile_id: i64,
     max_tracks: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
     let demande = match catalogue::lire(rules_json, catalogue::Objet::Piste) {
@@ -674,6 +679,19 @@ async fn avec_pistes_de_catalogue(
     if let Some(titre) = &demande.titre_piste {
         trouves.retain(|t| egal(&t.title, titre));
     }
+    // #4806 suite — le socle des bannis, côté catalogue : une seule lecture
+    // des paires bannies du profil, puis un tri en mémoire.
+    let bannis = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone())
+        .banned_streaming_keys(profile_id)
+        .map_err(AppError::internal)?;
+    if !bannis.is_empty() {
+        trouves.retain(|t| {
+            !bannis.contains(&(
+                tune_core::db::hidden_repo::source_normalisee(&t.service),
+                t.source_id.trim().to_string(),
+            ))
+        });
+    }
     // La même forme qu'une piste de service (`source_streaming::piste_json`) :
     // pas d'`id` local, une provenance et un identifiant de service.
     pistes.extend(trouves.into_iter().map(|t| {
@@ -699,11 +717,14 @@ async fn avec_pistes_de_catalogue(
     Ok(pistes)
 }
 
+/// Critères d'une playlist intelligente : (rules, sort_by, sort_order, match_mode, max_tracks).
+type CriteresDePlaylist = (String, String, String, String, Option<i64>);
+
 /// Load a smart playlist's criteria from the DB. Returns (rules_json, sort_by, sort_order, max_tracks).
 fn load_smart_criteria(
     state: &SmartHttpState,
     id: i64,
-) -> Result<Option<(String, String, String, String, Option<i64>)>, AppError> {
+) -> Result<Option<CriteresDePlaylist>, AppError> {
     let sql = if state.backend.engine() == Engine::Postgres {
         "SELECT rules, sort_by, sort_order, max_tracks, match_mode FROM smart_playlists WHERE id = $1"
     } else {
@@ -712,10 +733,10 @@ fn load_smart_criteria(
     let result = state
         .backend
         .query_one(sql, &[&id as &dyn ToSqlValue])
-        .map_err(|e| AppError::internal(e))?;
+        .map_err(AppError::internal)?;
     Ok(result.map(|cols| {
         (
-            cols.get(0)
+            cols.first()
                 .and_then(|v| v.as_string())
                 .unwrap_or_else(|| "[]".into()),
             cols.get(1)
@@ -773,7 +794,8 @@ async fn resolve_tracks(
     };
     // 🔴 #4473 — le catalogue du service, comme le chemin des ALBUMS le fait
     // depuis la v0.9.158. Sans cet appel, `Test Qobuz Coltrane` rend 0 piste.
-    let items = avec_pistes_de_catalogue(&state, items, &rules_json, max_tracks).await?;
+    let items =
+        avec_pistes_de_catalogue(&state, items, &rules_json, profile.id(), max_tracks).await?;
 
     Ok(Json(json!(items)).into_response())
 }
@@ -808,7 +830,8 @@ async fn smart_collection_albums(
     // le catalogue et surtout porter les MÊMES refus. Sans cet appel, une
     // règle « catalogue » y serait ignorée en silence, ce qui est exactement
     // le défaut que l'issue reproche au chemin des pistes.
-    let tracks = avec_pistes_de_catalogue(&state, tracks, &rules_json, max_tracks).await?;
+    let tracks =
+        avec_pistes_de_catalogue(&state, tracks, &rules_json, profile.id(), max_tracks).await?;
 
     // Group tracks by album_id, dedup albums. Une piste de service n'a pas
     // d'`album_id` : son album se reconnaît à son titre et à son artiste.
@@ -893,7 +916,8 @@ async fn preview_smart_collection(
     };
     // 🔴 #4473 — l'aperçu est ce que la playlist rendra : sans cet appel, une
     // règle « catalogue » s'y montrerait vide et sans refus.
-    let items = avec_pistes_de_catalogue(&state, items, &rules_json, body.max_tracks).await?;
+    let items =
+        avec_pistes_de_catalogue(&state, items, &rules_json, profile.id(), body.max_tracks).await?;
 
     // 🔴 #4467 — l'aperçu DIT ce qu'il n'a pas su appliquer. Une règle
     // intraduisible rend FAUX depuis #4469 : la playlist se vide sans rien
@@ -1352,7 +1376,7 @@ mod catalogue_de_service {
     #[tokio::test]
     async fn la_playlist_de_fabienm_rend_des_pistes_du_catalogue() {
         let locales = vec![serde_json::json!({"id": 1, "title": "Une piste locale"})];
-        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), locales, FABIENM, None).await
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), locales, FABIENM, 1, None).await
         else {
             panic!("le catalogue doit répondre")
         };
@@ -1380,7 +1404,8 @@ mod catalogue_de_service {
             r#"[{"field":"artist","op":"=","value":"John Coltrane"}]"#,
         ] {
             let Ok(r) =
-                super::avec_pistes_de_catalogue(&etat(true), locales.clone(), regles, None).await
+                super::avec_pistes_de_catalogue(&etat(true), locales.clone(), regles, 1, None)
+                    .await
             else {
                 panic!("aucun catalogue demandé : {regles}")
             };
@@ -1394,7 +1419,7 @@ mod catalogue_de_service {
     async fn sans_cible_la_playlist_est_refusee() {
         let sans = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
                        {"field":"year","op":"=","value":"2025"}]"#;
-        let Err(e) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), sans, None).await
+        let Err(e) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), sans, 1, None).await
         else {
             panic!("sans cible, il faut refuser")
         };
@@ -1415,7 +1440,7 @@ mod catalogue_de_service {
                         {"field":"artist","op":"=","value":"John Coltrane"},
                         {"field":"format","op":"=","value":"FLAC"},
                         {"field":"play_count","op":">=","value":"3"}]"#;
-        let Err(e) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), mixte, None).await
+        let Err(e) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), mixte, 1, None).await
         else {
             panic!("une règle hors service doit être refusée")
         };
@@ -1431,12 +1456,12 @@ mod catalogue_de_service {
     /// ce que le service rend, il ne cherche pas un album de ce nom.
     #[tokio::test]
     async fn le_titre_de_piste_trie_ce_que_le_service_rend() {
-        let r = format!(
-            r#"[{{"field":"source","op":"=","value":"catalogue:qobuz"}},
-                {{"field":"artist","op":"=","value":"John Coltrane"}},
-                {{"field":"title","op":"=","value":"Naima"}}]"#
-        );
-        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), &r, None).await else {
+        let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
+                {"field":"artist","op":"=","value":"John Coltrane"},
+                {"field":"title","op":"=","value":"Naima"}]"#
+            .to_string();
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), &r, 1, None).await
+        else {
             panic!("demande valide")
         };
         assert_eq!(r.len(), 1, "une seule piste porte ce titre : {r:?}");
@@ -1450,7 +1475,8 @@ mod catalogue_de_service {
         let r = r#"[{"field":"source","op":"=","value":"catalogue:qobuz"},
                     {"field":"artist","op":"=","value":"John Coltrane"},
                     {"field":"album","op":"=","value":"Blue Train"}]"#;
-        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), r, None).await else {
+        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), Vec::new(), r, 1, None).await
+        else {
             panic!("demande valide")
         };
         assert_eq!(r.len(), 1, "l'hommage homonyme est écarté : {r:?}");
@@ -1462,7 +1488,8 @@ mod catalogue_de_service {
     /// on refuse plutôt que de rendre vide en silence.
     #[tokio::test]
     async fn sans_registre_on_refuse_au_lieu_de_rendre_vide() {
-        let Err(e) = super::avec_pistes_de_catalogue(&etat(false), Vec::new(), FABIENM, None).await
+        let Err(e) =
+            super::avec_pistes_de_catalogue(&etat(false), Vec::new(), FABIENM, 1, None).await
         else {
             panic!("sans registre, il faut refuser")
         };
@@ -1547,10 +1574,48 @@ mod catalogue_de_service {
     #[tokio::test]
     async fn la_borne_coupe_l_ensemble() {
         let locales = vec![serde_json::json!({"id": 1})];
-        let Ok(r) = super::avec_pistes_de_catalogue(&etat(true), locales, FABIENM, Some(2)).await
+        let Ok(r) =
+            super::avec_pistes_de_catalogue(&etat(true), locales, FABIENM, 1, Some(2)).await
         else {
             panic!("demande valide")
         };
         assert_eq!(r.len(), 2, "une locale et une distante : {r:?}");
+    }
+
+    /// #4806 suite — un titre du CATALOGUE banni par le profil sort d'office
+    /// de la playlist, sans règle à configurer ; un autre profil le garde.
+    #[tokio::test]
+    async fn un_titre_de_catalogue_banni_sort_de_la_playlist() {
+        let e = etat(true);
+        let titres = |r: &[serde_json::Value]| -> Vec<String> {
+            r.iter()
+                .filter_map(|p| p["title"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let Ok(r) = super::avec_pistes_de_catalogue(&e, Vec::new(), FABIENM, 1, None).await else {
+            panic!("demande valide")
+        };
+        assert_eq!(titres(&r), vec!["Giant Steps", "Naima"], "témoin");
+
+        let bans = tune_core::db::hidden_repo::HiddenRepo::with_backend(e.backend.clone());
+        assert!(
+            bans.ban_streaming_track(
+                1,
+                &tune_core::db::hidden_repo::TitreDeService {
+                    source: "Qobuz".into(),
+                    source_id: "t-Giant Steps".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        );
+        let Ok(r) = super::avec_pistes_de_catalogue(&e, Vec::new(), FABIENM, 1, None).await else {
+            panic!("demande valide")
+        };
+        assert_eq!(titres(&r), vec!["Naima"], "le titre banni sort d'office");
+        let Ok(r) = super::avec_pistes_de_catalogue(&e, Vec::new(), FABIENM, 2, None).await else {
+            panic!("demande valide")
+        };
+        assert_eq!(titres(&r).len(), 2, "le profil 2 n'a rien banni");
     }
 }

@@ -290,7 +290,12 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "enabled": info.enabled,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
-            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
+            // Payant : greffon audio de #4861, ou greffon qui déclare son module
+            // (`TunePlugin::required_feature`, « Concerts »). Le nom du module suit,
+            // pour que l'écran montre le cadenas AVANT le clic.
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name)
+                || info.required_feature.is_some(),
+            "required_feature": info.required_feature,
             "activation_error": tune_plugin_native::failure(&info.name),
             "compatible": true,
         });
@@ -327,7 +332,12 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
             "loaded": false,
             "url": format!("/api/v1/ext/{}", info.name),
             "config_schema": info.config_schema,
-            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
+            // Payant : greffon audio de #4861, ou greffon qui déclare son module
+            // (`TunePlugin::required_feature`, « Concerts »). Le nom du module suit,
+            // pour que l'écran montre le cadenas AVANT le clic.
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name)
+                || info.required_feature.is_some(),
+            "required_feature": info.required_feature,
             "activation_error": tune_plugin_native::failure(&info.name),
             // 🔴 #3484 — le champ que la fiche wasm porte depuis toujours, et
             // que la fiche COMPILÉE n'a jamais porté (voir la boucle wasm plus
@@ -363,13 +373,7 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     .flatten()
                     .map(|v| v != "false")
                     .unwrap_or(true);
-                #[cfg(feature = "plugins-wasm")]
-                let loaded = state
-                    .wasm_plugins
-                    .get()
-                    .is_some_and(|reg| reg.get(&id).is_some());
-                #[cfg(not(feature = "plugins-wasm"))]
-                let loaded = false;
+                let loaded = wasm_charge(&state, &id);
                 // Le SEUL endroit où ce serveur détient un énoncé de
                 // compatibilité écrit par le greffon lui-même :
                 // `min_server_version`, jusqu'ici lu par le manifeste et par
@@ -399,6 +403,9 @@ async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
                     "url": format!("/api/v1/plugins/{id}/"),
                     "compatible": compatible,
                     "min_server_version": info.manifest.min_server_version,
+                    // Le badge, comme sur les fiches compilées (#4715) : la
+                    // garde de `wasm_dispatch` lit ce même champ du manifeste.
+                    "premium": info.manifest.premium,
                 }));
             }
         }
@@ -450,6 +457,40 @@ async fn compatible_selon_le_disque(name: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Le manifeste wasm posé sur le disque demande-t-il Premium ?
+///
+/// Même source que la garde de [`wasm_dispatch`] (`manifest.premium`), lue au
+/// disque comme [`compatible_selon_le_disque`] : un greffon installé depuis le
+/// dernier démarrage répond déjà juste.
+async fn premium_selon_le_disque(name: &str) -> bool {
+    let Some(dir) = crate::plugins::wasm_plugins_dir() else {
+        return false;
+    };
+    let manager = tune_core::plugins::PluginManager::new(dir);
+    let Ok(infos) = manager.scan().await else {
+        return false;
+    };
+    infos
+        .iter()
+        .any(|i| i.manifest.id == name && i.manifest.premium)
+}
+
+/// Le verrou des routes d'action (`install`, `enable`, `update`) : le droit
+/// des greffons audio payants, puis celui d'un greffon wasm dont le manifeste
+/// dit `premium` (#4715). Même `Feature` que la garde de [`wasm_dispatch`] :
+/// installer ou activer ce qu'on ne pourra pas appeler serait un « oui » vide.
+async fn exiger_le_droit(state: &AppState, name: &str) -> Result<(), axum::response::Response> {
+    crate::premium_audio_plugins::require_entitlement(state, name).await?;
+    if premium_selon_le_disque(name).await {
+        crate::premium_guard::require_premium(
+            &state.license,
+            tune_core::license::Feature::PluginMarketplace,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
     // An SDK plugin is authoritative about itself: it is loaded or it is not,
     // regardless of what the settings table happens to say.
@@ -464,7 +505,12 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
             "enabled": info.enabled,
             "status": "loaded",
             "config_schema": info.config_schema,
-            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name),
+            // Payant : greffon audio de #4861, ou greffon qui déclare son module
+            // (`TunePlugin::required_feature`, « Concerts »). Le nom du module suit,
+            // pour que l'écran montre le cadenas AVANT le clic.
+            "premium": tune_core::audio::premium_plugins::requires_premium(&info.name)
+                || info.required_feature.is_some(),
+            "required_feature": info.required_feature,
             "activation_error": tune_plugin_native::failure(&info.name),
             // Il TOURNE dans ce processus : il a franchi la porte d'ABI.
             "compatible": true,
@@ -530,6 +576,7 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
         "enabled": enabled,
         "status": if installed { "installed" } else { "not_installed" },
         "compatible": compatible,
+        "premium": premium_selon_le_disque(&name).await,
     });
     crate::premium_audio_plugins::annotate(&settings, &name, &mut card);
     Json(card)
@@ -540,8 +587,27 @@ async fn get_plugin(Path(name): Path<String>, State(state): State<AppState>) -> 
 /// La seule autorité est l'instantané que `plugins::init` a publié après
 /// `setup_all` : il ne contient que ce qui a réellement chargé. Un réglage en
 /// base ne dit rien de l'instant présent — c'est tout le sujet de #3484.
+///
+/// Un greffon **wasm** chargé n'y figure pas : il vit dans le registre
+/// `state.wasm_plugins`, le même que lit `loaded` dans `GET /plugins`. Sans
+/// lui, `enable` d'un wasm qui tourne réclamait un redémarrage inutile, et
+/// `disable` taisait celui qu'il faut pour le décharger (#5112).
 fn greffon_charge(state: &AppState, name: &str) -> bool {
-    plugin_snapshot(state).iter().any(|p| p.name == name)
+    plugin_snapshot(state).iter().any(|p| p.name == name) || wasm_charge(state, name)
+}
+
+/// Le greffon wasm `name` est-il dans le registre publié au démarrage ?
+#[cfg(feature = "plugins-wasm")]
+fn wasm_charge(state: &AppState, name: &str) -> bool {
+    state
+        .wasm_plugins
+        .get()
+        .is_some_and(|reg| reg.get(name).is_some())
+}
+
+#[cfg(not(feature = "plugins-wasm"))]
+fn wasm_charge(_state: &AppState, _name: &str) -> bool {
+    false
 }
 
 /// 🔴 #3484 — activer un greffon n'en démarre AUCUN.
@@ -570,7 +636,7 @@ async fn enable_plugin(
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
-    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+    if let Err(response) = exiger_le_droit(&state, &name).await {
         return response;
     }
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -687,7 +753,7 @@ async fn install_plugin(
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
     }
-    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+    if let Err(response) = exiger_le_droit(&state, &name).await {
         return response;
     }
 
@@ -710,7 +776,7 @@ async fn update_plugin(
     if !peut_etre_installe(&state, &name).await {
         return greffon_inconnu(&name);
     }
-    if let Err(response) = crate::premium_audio_plugins::require_entitlement(&state, &name).await {
+    if let Err(response) = exiger_le_droit(&state, &name).await {
         return response;
     }
 

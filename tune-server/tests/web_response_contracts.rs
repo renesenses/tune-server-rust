@@ -994,7 +994,7 @@ async fn la_completude_compte_la_plage_dynamique_et_dit_d_ou_elle_vient() {
     let meta =
         tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(etat.backend.clone());
 
-    let mut poser = |nom: &str| -> i64 {
+    let poser = |nom: &str| -> i64 {
         let mut t = tune_core::db::models::Track::new(nom.into());
         t.file_path = Some(format!("/music/{nom}.flac"));
         pistes.create(&t).expect("piste temoin")

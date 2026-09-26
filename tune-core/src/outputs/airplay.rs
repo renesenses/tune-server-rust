@@ -532,12 +532,11 @@ async fn url_to_local_path(url: &str) -> Result<(String, Option<TempFileGuard>),
             .await
             .map_err(|e| format!("download body: {e}"))?;
 
-        let tmp_dir = std::env::temp_dir();
-        let id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp_path = tmp_dir.join(format!("tune_airplay_{id}.pcm"));
+        // #4770 : nom aléatoire. L'horodatage d'avant retombait sur le nom
+        // fixe `tune_airplay_0.pcm` dès que l'horloge précédait l'époque.
+        let id = uuid::Uuid::new_v4();
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), supprimé par TempFileGuard.
+        let tmp_path = std::env::temp_dir().join(format!("tune_airplay_{id}.pcm"));
         std::fs::write(&tmp_path, &bytes).map_err(|e| format!("write tmp: {e}"))?;
         let path_str = tmp_path.to_string_lossy().to_string();
         return Ok((path_str, Some(TempFileGuard(tmp_path))));
@@ -668,11 +667,11 @@ impl OutputTarget for AirplayOutput {
     async fn pause(&self) -> Result<(), String> {
         self.paused.store(true, Ordering::SeqCst);
         let (sequence, timestamp) = self.rtp.prochain();
-        if let Some(ref mut session) = *self.rtsp_session.lock().await {
-            if let Err(raison) = session.flush(sequence, timestamp).await {
-                self.paused.store(false, Ordering::SeqCst);
-                return Err(raison);
-            }
+        if let Some(ref mut session) = *self.rtsp_session.lock().await
+            && let Err(raison) = session.flush(sequence, timestamp).await
+        {
+            self.paused.store(false, Ordering::SeqCst);
+            return Err(raison);
         }
         self.rtp.marquer_reprise();
         Ok(())
@@ -834,7 +833,7 @@ async fn stream_to_airplay(
         echantillons = crate::audio::resample::resample_i32(
             &echantillons,
             decoded.bit_depth,
-            CHANNELS as u16,
+            CHANNELS,
             decoded.sample_rate,
             SAMPLE_RATE,
         );
@@ -880,6 +879,8 @@ impl SortieRtp for tokio::net::UdpSocket {
 }
 
 /// Emet le PCM big-endian en paquets RTP, au rythme reel.
+// Chemin de sortie audio : regrouper ces arguments en structure toucherait la lecture pour un gain de forme (clippy 1.98).
+#[allow(clippy::too_many_arguments)]
 async fn diffuser_pcm<S: SortieRtp>(
     pcm_be: &[u8],
     sortie: &S,
@@ -970,8 +971,7 @@ async fn diffuser_pcm<S: SortieRtp>(
     let reste = pcm_be.len() - offset;
     if !interrompu
         && playing.load(Ordering::Relaxed)
-        && reste >= BYTES_PER_FRAME
-        && reste < BYTES_PER_PACKET
+        && (BYTES_PER_FRAME..BYTES_PER_PACKET).contains(&reste)
     {
         let trames = reste / BYTES_PER_FRAME;
         let fin = offset + trames * BYTES_PER_FRAME;
@@ -1091,10 +1091,10 @@ mod tests {
                     if entete.is_empty() {
                         break;
                     }
-                    if let Some((cle, valeur)) = entete.split_once(':') {
-                        if cle.trim().eq_ignore_ascii_case("Content-Length") {
-                            taille = valeur.trim().parse().unwrap_or(0);
-                        }
+                    if let Some((cle, valeur)) = entete.split_once(':')
+                        && cle.trim().eq_ignore_ascii_case("Content-Length")
+                    {
+                        taille = valeur.trim().parse().unwrap_or(0);
                     }
                 }
                 if taille > 0 {

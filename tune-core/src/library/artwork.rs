@@ -39,7 +39,7 @@ static ARTWORK_CACHE_WRITE_FAILURES: AtomicU32 = AtomicU32::new(0);
 ///
 /// On case-insensitive filesystems (NTFS, APFS) duplicates are harmless.
 /// On case-sensitive mounts (some NAS/SMB) we need several variants.
-const FOLDER_COVER_NAMES: &[&str] = &[
+pub(crate) const FOLDER_COVER_NAMES: &[&str] = &[
     "cover.jpg",
     "cover.jpeg",
     "cover.png",
@@ -121,16 +121,16 @@ pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
 
     match lofty::read_from_path(&*extended_path(audio_path)) {
         Ok(tagged) => {
-            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-                if let Some(pic) = tag.pictures().first() {
-                    let mime = match pic.mime_type() {
-                        Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
-                        Some(lofty::picture::MimeType::Png) => "image/png",
-                        Some(lofty::picture::MimeType::Bmp) => "image/bmp",
-                        _ => "image/jpeg",
-                    };
-                    return Some((pic.data().to_vec(), mime.to_string()));
-                }
+            if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag())
+                && let Some(pic) = tag.pictures().first()
+            {
+                let mime = match pic.mime_type() {
+                    Some(lofty::picture::MimeType::Jpeg) => "image/jpeg",
+                    Some(lofty::picture::MimeType::Png) => "image/png",
+                    Some(lofty::picture::MimeType::Bmp) => "image/bmp",
+                    _ => "image/jpeg",
+                };
+                return Some((pic.data().to_vec(), mime.to_string()));
             }
         }
         Err(e) => {
@@ -146,6 +146,79 @@ pub fn extract_cover_art(audio_path: &Path) -> Option<(Vec<u8>, String)> {
     // an offset that lofty does not read, so the path above finds no picture.
     // Fall back to reading the cover directly from the DSF metadata chunk.
     crate::metadata::extract_dsf_cover(audio_path)
+}
+
+/// Empreinte BON MARCHÉ de la jaquette d'un FLAC : la longueur des octets de
+/// l'image et trois échantillons de 32 octets (début, milieu, fin), lus SANS
+/// charger l'image — quelques petites lectures dans l'en-tête du fichier.
+///
+/// Sert au scan à reconnaître, piste après piste, la MÊME jaquette que celle de
+/// l'album, sans relire 250 Kio par piste (#5034, décision 3 : relire la
+/// jaquette de chaque piste coûtait +50 % sur un scan de 3 000 FLAC, mesuré
+/// sur Shrek). Deux images différentes ont en pratique des longueurs
+/// différentes ; les trois échantillons tranchent le reste.
+///
+/// `None` : pas un FLAC nu (un en-tête ID3 le précède, autre format), pas de
+/// bloc `PICTURE`, ou fichier illisible. L'appelant relit alors la jaquette
+/// entière, comme avant : ce n'est qu'un raccourci.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmpreinteJaquette {
+    longueur: u32,
+    echantillons: [[u8; 32]; 3],
+}
+
+pub fn empreinte_jaquette_flac(chemin: &Path) -> Option<EmpreinteJaquette> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(&*extended_path(chemin)).ok()?;
+    let mut mot = [0u8; 4];
+    f.read_exact(&mut mot).ok()?;
+    if &mot != b"fLaC" {
+        return None;
+    }
+    let u32_suivant = |f: &mut std::fs::File| -> Option<u32> {
+        let mut u = [0u8; 4];
+        f.read_exact(&mut u).ok()?;
+        Some(u32::from_be_bytes(u))
+    };
+    loop {
+        let mut entete = [0u8; 4];
+        f.read_exact(&mut entete).ok()?;
+        let dernier = entete[0] & 0x80 != 0;
+        let genre = entete[0] & 0x7F;
+        let longueur = u64::from(u32::from_be_bytes([0, entete[1], entete[2], entete[3]]));
+        if genre == 6 {
+            // METADATA_BLOCK_PICTURE : type, MIME, description, 4 × u32
+            // (dimensions, profondeur, couleurs), puis la longueur des octets.
+            let debut = f.stream_position().ok()?;
+            u32_suivant(&mut f)?;
+            let mime = u32_suivant(&mut f)?;
+            f.seek(SeekFrom::Current(i64::from(mime))).ok()?;
+            let description = u32_suivant(&mut f)?;
+            f.seek(SeekFrom::Current(i64::from(description) + 16))
+                .ok()?;
+            let n = u32_suivant(&mut f)?;
+            let donnees = f.stream_position().ok()?;
+            if donnees + u64::from(n) > debut + longueur {
+                return None;
+            }
+            let mut echantillons = [[0u8; 32]; 3];
+            let n64 = u64::from(n);
+            for (i, decalage) in [0, n64 / 2, n64.saturating_sub(32)].into_iter().enumerate() {
+                let k = (n64 - decalage.min(n64)).min(32) as usize;
+                f.seek(SeekFrom::Start(donnees + decalage)).ok()?;
+                f.read_exact(&mut echantillons[i][..k]).ok()?;
+            }
+            return Some(EmpreinteJaquette {
+                longueur: n,
+                echantillons,
+            });
+        }
+        if dernier {
+            return None;
+        }
+        f.seek(SeekFrom::Current(i64::try_from(longueur).ok()?))
+            .ok()?;
+    }
 }
 
 pub fn find_folder_cover(audio_path: &Path) -> Option<PathBuf> {
@@ -851,7 +924,13 @@ pub async fn batch_enrich_artwork_scoped(
                 // premier. Voir `cache_fetched_image`.
                 std::fs::create_dir_all(&cache_dir).ok();
                 if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
-                    album_repo.update_cover_path(*album_id, &hash).ok();
+                    album_repo
+                        .update_cover_path(
+                            *album_id,
+                            &hash,
+                            crate::db::models::SourcePochette::Fournisseur,
+                        )
+                        .ok();
                     enriched += 1;
                     info!(
                         album_id,
@@ -918,25 +997,23 @@ pub async fn fetch_artist_image(
         .ok()?;
 
     // 1. Mozaiklabs community by MBID (fastest, no rate limit) — highest priority
-    if !mbid.is_empty() {
-        if let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid)
+    if !mbid.is_empty()
+        && let Some(bytes) = fetch_artist_image_mozaiklabs(&client, mbid)
             .await
             .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some(bytes);
-        }
+    {
+        return Some(bytes);
     }
 
     // 1b. Mozaiklabs community by NAME — keeps mozaiklabs the top priority even
     // for artists without an MBID (which never reach the by-MBID lookup above),
     // BEFORE falling back to any external source.
-    if !artist_name.is_empty() {
-        if let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name)
+    if !artist_name.is_empty()
+        && let Some(bytes) = fetch_artist_image_mozaiklabs_by_name(&client, artist_name)
             .await
             .and_then(|b| image_retenue(b, refusees))
-        {
-            return Some(bytes);
-        }
+    {
+        return Some(bytes);
     }
 
     // Sources 2–5 are keyed by MBID; skip them entirely for artists without one
@@ -1127,16 +1204,15 @@ async fn fetch_artist_image_musicbrainz_full(
         } else {
             None
         }
-    }) {
-        if let Some(filename) = commons_page.rsplit("File:").next() {
-            let direct_url = format!(
-                "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
-                filename.replace(' ', "_")
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            if let Some(bytes) = download_image(client, &direct_url).await {
-                return Some(bytes);
-            }
+    }) && let Some(filename) = commons_page.rsplit("File:").next()
+    {
+        let direct_url = format!(
+            "https://commons.wikimedia.org/wiki/Special:Redirect/file/{}?width=500",
+            filename.replace(' ', "_")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Some(bytes) = download_image(client, &direct_url).await {
+            return Some(bytes);
         }
     }
 
@@ -1418,7 +1494,7 @@ pub const PHASE_PAR_NOM: &str = "names";
 /// de la condition. Une seule définition désormais — et le `traites == total`
 /// n'est pas décoratif : sans lui, un lot de douze cesserait d'afficher à dix.
 pub(crate) fn doit_publier_avancement(traites: usize, total: usize) -> bool {
-    traites % 5 == 0 || traites == total
+    traites.is_multiple_of(5) || traites == total
 }
 
 /// Instantané d'avancement de la passe 3 — recherche d'image **par nom**
@@ -1636,27 +1712,26 @@ async fn batch_enrich_artist_artwork_inner(
                 // #4837 : l'image communautaire que l'utilisateur a rejetée
                 // pour cet artiste n'est plus reposée à chaque passe.
                 let refusees = empreintes_rejetees(&db, artist_id, &img.mbid);
-                if let Ok(client) = client {
-                    if let Some(data) = download_image(&client, &img.image_url)
+                if let Ok(client) = client
+                    && let Some(data) = download_image(&client, &img.image_url)
                         .await
                         .and_then(|d| image_retenue(d, &refusees))
-                    {
-                        // Adressage par le CONTENU (#1444) : sous
-                        // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
-                        // — dont c'est tout l'objet — réécrivait sous l'adresse
-                        // déjà distribuée, servie `immutable, max-age=31536000` :
-                        // l'ancienne photo restait affichée un an.
-                        std::fs::create_dir_all(&cache_dir).ok();
-                        if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
-                            artist_repo.update_image(artist_id, &hash, "community").ok();
-                            community_applied += 1;
-                            info!(
-                                artist_id,
-                                artist = %img.artist_name,
-                                hash = %hash,
-                                "batch_artist_artwork_community_applied"
-                            );
-                        }
+                {
+                    // Adressage par le CONTENU (#1444) : sous
+                    // `artwork_hash("artist-mbid-{mbid}")`, le mode `force`
+                    // — dont c'est tout l'objet — réécrivait sous l'adresse
+                    // déjà distribuée, servie `immutable, max-age=31536000` :
+                    // l'ancienne photo restait affichée un an.
+                    std::fs::create_dir_all(&cache_dir).ok();
+                    if let Some(hash) = cache_fetched_image(&data, &cache_dir, "jpg") {
+                        artist_repo.update_image(artist_id, &hash, "community").ok();
+                        community_applied += 1;
+                        info!(
+                            artist_id,
+                            artist = %img.artist_name,
+                            hash = %hash,
+                            "batch_artist_artwork_community_applied"
+                        );
                     }
                 }
             }
@@ -2007,8 +2082,8 @@ async fn batch_enrich_artist_artwork_inner(
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                     // Try Discogs first
-                    if discogs_available {
-                        if let Some(data) =
+                    if discogs_available
+                        && let Some(data) =
                             fetch_artist_image_discogs(client, &name, discogs_token)
                                 .await
                                 .and_then(|d| image_retenue(d, &refusees))
@@ -2022,7 +2097,6 @@ async fn batch_enrich_artist_artwork_inner(
                                 return Some(SourceParNom::Discogs);
                             }
                         }
-                    }
 
                     // Fallback to Last.fm
                     if lastfm_available {
@@ -2171,11 +2245,12 @@ pub fn cache_embedded_cover(
 /// Pochette du DOSSIER d'un fichier, mise en cache — sans jamais regarder les
 /// tags du fichier lui-même.
 ///
-/// Sert à choisir la pochette d'un ALBUM, où l'ordre de priorité n'est pas le
-/// même que pour une piste. Une `cover.jpg` posée dans le dossier est un choix
-/// délibéré de l'utilisateur ; une pochette intégrée à UNE piste est un
-/// accident de tag. Sur une compilation « maison », c'est la seconde qui
-/// gagnait et se retrouvait attribuée à tout le répertoire (testeur, forum).
+/// ⚠️ Ne décide PAS de l'ordre de priorité d'un album : la règle, confirmée
+/// par Bertrand le 25/09/2026 (#5035), est « la jaquette intégrée d'abord,
+/// puis l'image du dossier », partout — `refresh_cover_hash`, le scan, le
+/// rattrapage de fin de scan (`library::pochette_disque`). Cette fonction ne
+/// lit que la seconde ; le rattrapage, qui l'appelait EN PREMIER sur la foi
+/// d'une règle inverse, ne l'appelle plus.
 pub fn folder_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String> {
     let folder_cover = find_folder_cover(audio_path)?;
     // Entrée héritée, adressée par le CHEMIN de la pochette : la sonder
@@ -2354,71 +2429,29 @@ pub fn refresh_cover_hash(audio_path: &Path, cache_dir: &Path) -> Option<String>
 /// Running this at the end of a scan self-heals those albums: any local album
 /// with a missing cover gets its embedded art re-extracted from the first track
 /// that yields one. Returns the number of albums filled.
-/// Le fichier RÉEL d'une piste — celui qu'on peut ouvrir.
-///
-/// 🔴 `file_path` ne suffit pas. Une piste découpée par une feuille CUE est une
-/// tranche à l'intérieur d'un autre fichier : elle n'a pas de fichier à elle et
-/// porte `file_path = NULL` par construction, son support étant `cue_media_path`.
-///
-/// Les deux boucles ci-dessous filtraient sur `file_path` : les pistes CUE
-/// étaient donc écartées AVANT même qu'on cherche une pochette. Gros Bidon
-/// (Didier), fil forum 1738 le 09/09/2026 : « il manque les pochettes des albums
-/// car Tune ne semble pas prendre le fichier cover.jpg associé au FLAC quand il
-/// est associé à un fichier CUE. » Le `cover.jpg` était bien là, à côté du FLAC ;
-/// personne n'allait le voir.
-///
-/// C'est le même motif que l'élagage, qui a dû recevoir son propre chemin
-/// (`elaguer_les_pistes_cue`) parce que la purge ordinaire filtre elle aussi sur
-/// `file_path IS NOT NULL` : toute passe indexée sur `file_path` perd les pistes
-/// CUE en silence.
-fn chemin_sur_disque(track: &crate::db::models::Track) -> Option<&str> {
-    track
-        .file_path
-        .as_deref()
-        .or(track.cue_media_path.as_deref())
-}
-
 pub fn backfill_embedded_covers(
     db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
     cache_dir: &Path,
 ) -> usize {
     use crate::db::album_repo::AlbumRepo;
-    use crate::db::track_repo::TrackRepo;
 
     let album_repo = AlbumRepo::with_backend(db.clone());
-    let track_repo = TrackRepo::with_backend(db.clone());
     let coverless = album_repo.list_without_cover().unwrap_or_default();
 
     let mut filled = 0usize;
     for (album_id, _title, _artist, _mbid) in &coverless {
-        let tracks = track_repo.list_by_album(*album_id).unwrap_or_default();
-
-        // La pochette du DOSSIER d'abord : elle décrit l'album, là où une
-        // pochette intégrée ne décrit qu'une piste. Sur une compilation
-        // « maison », la première piste taguée imposait sa jaquette à tout le
-        // répertoire — un disque de Brel illustré par la pochette du seul titre
-        // dont le fichier portait une image.
-        if let Some(hash) = tracks
-            .iter()
-            .filter_map(chemin_sur_disque)
-            .find_map(|p| folder_cover_hash(Path::new(p), cache_dir))
-        {
-            if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
-                filled += 1;
-            }
-            continue;
-        }
-
-        for track in &tracks {
-            let Some(file_path) = chemin_sur_disque(track) else {
-                continue;
-            };
-            if let Some(hash) = get_or_extract(Path::new(file_path), cache_dir) {
-                if album_repo.force_update_cover_path(*album_id, &hash).is_ok() {
-                    filled += 1;
-                }
-                break;
-            }
+        // La jaquette INTÉGRÉE d'abord, puis l'image du dossier — la règle
+        // de toute la lecture des pochettes (`refresh_cover_hash`, le scan),
+        // confirmée par Bertrand le 25/09/2026 (#5035). Ce rattrapage prenait
+        // l'ordre inverse, et donnait donc à un même album une autre pochette
+        // selon qu'il passait par le scan ou par ici. La source et le fichier
+        // sont écrits avec elle (#5034) : c'est ce qui permet de la retirer
+        // quand ce fichier disparaît.
+        if matches!(
+            super::pochette_disque::reevaluer_l_album(db, *album_id, cache_dir, false, None),
+            super::pochette_disque::Geste::Poser(_)
+        ) {
+            filled += 1;
         }
     }
     if filled > 0 {
@@ -2639,9 +2672,9 @@ mod tests {
         assert_eq!(vus[0]["total"], 12);
 
         // Cadence : rien ne bouge avant la cinquième, puis la dixième.
-        for avant in 1..5 {
+        for (avant, vu) in vus.iter().enumerate().take(5).skip(1) {
             assert_eq!(
-                vus[avant]["processed"],
+                vu["processed"],
                 0,
                 "publication hors cadence avant la fiche {}",
                 avant + 1

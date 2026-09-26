@@ -25,6 +25,9 @@ use tune_core::db::zone_repo::ZoneRepo;
 
 use crate::state::AppState;
 
+/// Une clé de réglage exposée et sa valeur par défaut.
+pub(super) type ReglageExpose = (&'static str, fn() -> Value);
+
 /// Réglages « pertinents support », avec leur valeur par défaut quand ils ne
 /// sont pas encore persistés (mêmes défauts que /system/config). Liste
 /// d'inclusion STRICTE : ajouter une clé ici = l'exposer à tout utilisateur
@@ -36,7 +39,7 @@ use crate::state::AppState;
 /// de réglages, et c'est cette même liste qu'il doit rendre. Deux listes
 /// auraient divergé, et la seconde n'aurait pas hérité de la garde de
 /// `est_secret` posée ci-dessous.
-pub(super) const SUPPORT_SETTING_KEYS: &[(&str, fn() -> Value)] = &[
+pub(super) const SUPPORT_SETTING_KEYS: &[ReglageExpose] = &[
     ("community_sync_enabled", || json!(false)),
     // Consentement de contribution (bios + images d'artistes). Non sensible,
     // et utile en support : « est-ce que cette instance envoie quelque chose ? »

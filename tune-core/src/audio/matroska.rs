@@ -464,6 +464,8 @@ pub(crate) mod muxer_de_test {
     /// Fabrique un Matroska complet : un segment, une piste, les trames
     /// réparties en `clusters` clusters, et — si demandé — un `Cues` qui pointe
     /// chaque cluster.
+    // Fabrique d'épreuve, un argument par champ du banc (clippy 1.98).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn matroska(
         doc_type: &str,
         piste: &Piste<'_>,
@@ -840,7 +842,7 @@ mod tests {
             // (4 096 trames = 93 ms) : le seek se pose sur une frontière de
             // trame, jamais après la cible.
             assert!(
-                sautees >= 8_820 - 4_096 && sautees < 17_640,
+                (8_820 - 4_096..17_640).contains(&sautees),
                 "{nom} : {sautees} trames sautées pour un seek à 0,2 s"
             );
         }
@@ -940,7 +942,7 @@ mod tests {
         );
         let trames_sautees = (mka_entier.len() - mka_seeke.len()) / 4;
         assert!(
-            trames_sautees >= 8_820 - 4_096 && trames_sautees < 17_640,
+            (8_820 - 4_096..17_640).contains(&trames_sautees),
             "{trames_sautees} trames sautées pour un seek à 0,2 s (FLAC nu : {})",
             (flac_entier.len() - flac_seeke.len()) / 4
         );

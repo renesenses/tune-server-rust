@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,9 +339,34 @@ impl TuneConfig {
 }
 
 fn dirs_home() -> String {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/tmp".into())
+    let lire = |nom: &str| std::env::var(nom).ok();
+    dirs_home_avec(
+        &lire,
+        // tmp-autorise: base seule : dirs_home_avec y joint l'UID du compte (#4770).
+        &std::env::temp_dir(),
+        crate::chemins_de_travail::uid_courant(),
+    )
+}
+
+/// Le répertoire personnel, environnement et repli **passés** (#4770).
+///
+/// Sans `HOME` ni `USERPROFILE`, le repli était le littéral `/tmp` : tous les
+/// comptes de la machine y partageaient le même « répertoire personnel »,
+/// donc la même bibliothèque par défaut `/tmp/Music` — et le premier compte
+/// qui la créait en devenait propriétaire. Le repli passe désormais par
+/// [`crate::chemins_de_travail`] : `temp_dir()/tune-home-<uid>`, qui respecte
+/// aussi `TMPDIR`.
+///
+/// Tout est paramètre pour simuler deux comptes sans toucher à
+/// l'environnement du processus, partagé par les tests parallèles.
+fn dirs_home_avec(lire: &dyn Fn(&str) -> Option<String>, temp: &Path, uid: u32) -> String {
+    lire("HOME")
+        .or_else(|| lire("USERPROFILE"))
+        .unwrap_or_else(|| {
+            crate::chemins_de_travail::racine_de_travail_sous(temp, "tune-home", uid)
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 fn parse_music_dirs(raw: &str) -> Vec<String> {
@@ -830,6 +857,58 @@ mod tests {
         assert!(cfg.scan_on_startup);
         assert!(cfg.metadata_readonly);
         assert!(!cfg.crossfade_enabled);
+    }
+
+    /// Le témoin de #4770 pour `dirs_home` : sans `HOME` ni `USERPROFILE`,
+    /// deux comptes n'ont plus le même « répertoire personnel », et le second
+    /// peut y créer sa bibliothèque par défaut même quand le premier a déjà
+    /// créé la sienne — ou l'ancien `…/Music` au nom fixe — en `555`.
+    ///
+    /// Contre-épreuve : remettre `temp.to_string_lossy()` comme repli dans
+    /// `dirs_home_avec` (l'équivalent de l'ancien `/tmp`) — le test rougit.
+    #[cfg(unix)]
+    #[test]
+    fn sans_home_deux_comptes_ont_chacun_leur_repertoire_personnel() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if crate::chemins_de_travail::uid_courant() == 0 {
+            eprintln!("témoin ignoré : exécuté en root, les modes ne mordent pas");
+            return;
+        }
+        let racine = crate::test_scratch::scratch_dir("tune-dirs-home-deux-comptes");
+        let rien = |_: &str| None;
+        let le_sien = std::path::PathBuf::from(dirs_home_avec(&rien, racine.path(), 1001));
+        let le_mien = std::path::PathBuf::from(dirs_home_avec(&rien, racine.path(), 1000));
+        assert_ne!(
+            le_mien, le_sien,
+            "deux comptes partagent le répertoire personnel"
+        );
+
+        let ancienne = racine.path().join("Music");
+        for d in [ancienne.clone(), le_sien.join("Music")] {
+            std::fs::create_dir_all(&d).expect("bibliothèque « de l'autre compte »");
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).expect("mode 555");
+        }
+        let cree = std::fs::create_dir_all(le_mien.join("Music").join("Album"));
+        for d in [ancienne, le_sien.join("Music")] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).ok();
+        }
+        cree.unwrap_or_else(|e| panic!("création refusée sous {le_mien:?} : {e}"));
+    }
+
+    /// `HOME`, puis `USERPROFILE`, gardent la main : le repli ne sert que
+    /// sans eux.
+    #[test]
+    fn dirs_home_prefere_home_puis_userprofile() {
+        let base = Path::new("/ailleurs");
+        let les_deux = |nom: &str| match nom {
+            "HOME" => Some("/home/moi".to_string()),
+            "USERPROFILE" => Some("C:/Users/moi".to_string()),
+            _ => None,
+        };
+        assert_eq!(dirs_home_avec(&les_deux, base, 1000), "/home/moi");
+        let windows = |nom: &str| (nom == "USERPROFILE").then(|| "C:/Users/moi".to_string());
+        assert_eq!(dirs_home_avec(&windows, base, 1000), "C:/Users/moi");
     }
 
     /// Fabrique un `lookup` à partir d'une liste de paires, pour éprouver la

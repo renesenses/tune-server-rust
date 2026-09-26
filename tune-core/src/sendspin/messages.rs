@@ -218,10 +218,10 @@ impl ClientHello {
     /// S2-c choisirait un format à l'aveugle.
     pub fn support_du_lecteur(&self) -> Option<&Value> {
         for role in &self.supported_roles {
-            if role.split('@').next() == Some("player") {
-                if let Some(valeur) = self.reste.get(&format!("{role}_support")) {
-                    return Some(valeur);
-                }
+            if role.split('@').next() == Some("player")
+                && let Some(valeur) = self.reste.get(&format!("{role}_support"))
+            {
+                return Some(valeur);
             }
         }
         self.player_support

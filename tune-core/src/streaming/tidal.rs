@@ -88,13 +88,9 @@ impl UrlCache {
     }
 
     fn get(&self, key: &str) -> Option<&CachedUrl> {
-        self.entries.get(key).and_then(|entry| {
-            if entry.created.elapsed() < self.ttl {
-                Some(entry)
-            } else {
-                None
-            }
-        })
+        self.entries
+            .get(key)
+            .filter(|&entry| entry.created.elapsed() < self.ttl)
     }
 
     fn set(&mut self, key: String, entry: CachedUrl) {
@@ -236,6 +232,7 @@ impl TidalService {
         );
 
         // Create temp file and write init segment
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), balayé par le ramasse-miettes DASH.
         let tmp_path = std::env::temp_dir()
             .join(format!("tune-dash-{}.mp4", uuid::Uuid::new_v4()))
             .to_string_lossy()
@@ -719,7 +716,7 @@ impl TidalService {
     /// Les albums existaient : `get_featured_sections` les parse et les range
     /// dans ses paires, avant de n'en rendre que les sections. Il suffisait de
     /// les garder.
-
+    ///
     /// Remplace les rangées en cache. Un verrou empoisonné fait perdre la mise
     /// en cache, jamais la réponse : l'appelant a déjà ses données.
     fn remplir_le_cache(&self, sections: Vec<(FeaturedSection, Vec<StreamAlbum>)>) {
@@ -929,9 +926,9 @@ impl TidalService {
             released_at: None,
             quality: {
                 let tags = item["mediaMetadata"]["tags"].as_array();
-                let is_hires = tags.map_or(false, |t| {
+                let is_hires = tags.is_some_and(|t| {
                     t.iter()
-                        .any(|v| v.as_str().map_or(false, |s| s.contains("HIRES")))
+                        .any(|v| v.as_str().is_some_and(|s| s.contains("HIRES")))
                 });
                 let aq = item["audioQuality"].as_str().unwrap_or("");
                 if !aq.is_empty() || is_hires {
@@ -1087,23 +1084,23 @@ impl TidalService {
             info!(username = ?self.username, country = %self.country_code, "tidal_user_refreshed");
         }
         // Fetch subscription type for quality diagnostics
-        if let Some(uid) = self.user_id {
-            if let Ok(sub) = self.api_get(&format!("/users/{uid}/subscription")).await {
-                let sub_type = sub["subscription"]["type"]
-                    .as_str()
-                    .or_else(|| sub["type"].as_str())
-                    .unwrap_or("unknown");
-                self.subscription = Some(sub_type.into());
-                let highest = sub["subscription"]["highestSoundQuality"]
-                    .as_str()
-                    .or_else(|| sub["highestSoundQuality"].as_str())
-                    .unwrap_or("unknown");
-                info!(
-                    subscription = sub_type,
-                    highest_quality = highest,
-                    "tidal_subscription_info"
-                );
-            }
+        if let Some(uid) = self.user_id
+            && let Ok(sub) = self.api_get(&format!("/users/{uid}/subscription")).await
+        {
+            let sub_type = sub["subscription"]["type"]
+                .as_str()
+                .or_else(|| sub["type"].as_str())
+                .unwrap_or("unknown");
+            self.subscription = Some(sub_type.into());
+            let highest = sub["subscription"]["highestSoundQuality"]
+                .as_str()
+                .or_else(|| sub["highestSoundQuality"].as_str())
+                .unwrap_or("unknown");
+            info!(
+                subscription = sub_type,
+                highest_quality = highest,
+                "tidal_subscription_info"
+            );
         }
     }
 
@@ -1463,20 +1460,20 @@ impl StreamingService for TidalService {
             if let Some(ref pending) = self.pending_device_auth.clone() {
                 // Check if the device code has expired (Tidal typically gives 300s)
                 let max_lifetime = Duration::from_secs(pending.expires_in.max(300));
-                if let Some(started) = self.device_auth_started {
-                    if started.elapsed() > max_lifetime {
-                        warn!(
-                            elapsed_secs = started.elapsed().as_secs(),
-                            expires_in = pending.expires_in,
-                            "tidal_device_code_expired — clearing pending auth"
-                        );
-                        self.pending_device_auth = None;
-                        self.device_auth_started = None;
-                        return Ok(AuthStatus {
-                            authenticated: false,
-                            ..Default::default()
-                        });
-                    }
+                if let Some(started) = self.device_auth_started
+                    && started.elapsed() > max_lifetime
+                {
+                    warn!(
+                        elapsed_secs = started.elapsed().as_secs(),
+                        expires_in = pending.expires_in,
+                        "tidal_device_code_expired — clearing pending auth"
+                    );
+                    self.pending_device_auth = None;
+                    self.device_auth_started = None;
+                    return Ok(AuthStatus {
+                        authenticated: false,
+                        ..Default::default()
+                    });
                 }
 
                 let resp = self
@@ -1511,10 +1508,13 @@ impl StreamingService for TidalService {
                     });
                 }
 
-                info!(body = %body, "tidal_token_exchange_success");
+                // #5124 — la réponse porte les jetons d'accès et de
+                // rafraîchissement : jamais son contenu dans le journal, que le
+                // testeur joint à un rapport public. Sa taille suffit.
+                info!(body_len = body.len(), "tidal_token_exchange_success");
 
                 let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
-                    warn!(error = %e, body = %body, "tidal_token_parse_failed");
+                    warn!(error = %e, body_len = body.len(), "tidal_token_parse_failed");
                     format!("token parse: {e}")
                 })?;
                 let access_token_clone = token.access_token.clone();
@@ -1795,18 +1795,18 @@ impl StreamingService for TidalService {
         }
 
         // Use the best available data: exact match first, then best downgraded fallback
-        if data.is_none() {
-            if let Some(fb) = downgraded_fallback {
-                let fb_quality = fb["audioQuality"].as_str().unwrap_or("UNKNOWN");
-                warn!(
-                    track_id,
-                    requested = requested_quality,
-                    actual = fb_quality,
-                    subscription = ?self.subscription,
-                    "tidal_using_downgraded_quality_no_better_available"
-                );
-                data = Some(fb);
-            }
+        if data.is_none()
+            && let Some(fb) = downgraded_fallback
+        {
+            let fb_quality = fb["audioQuality"].as_str().unwrap_or("UNKNOWN");
+            warn!(
+                track_id,
+                requested = requested_quality,
+                actual = fb_quality,
+                subscription = ?self.subscription,
+                "tidal_using_downgraded_quality_no_better_available"
+            );
+            data = Some(fb);
         }
 
         let data = data.ok_or_else(|| {
@@ -2739,11 +2739,11 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
     // Build segment info if we have a SegmentTemplate with SegmentTimeline
     let segments = if has_segment_timeline
         && timeline_segment_count > 0
-        && segment_template_media.is_some()
-        && segment_template_init.is_some()
+        && let Some(media) = segment_template_media.as_ref()
+        && let Some(init) = segment_template_init.as_ref()
     {
-        let init_url = resolve_tidal_url(segment_template_init.as_ref().unwrap());
-        let media_template = resolve_tidal_url(segment_template_media.as_ref().unwrap());
+        let init_url = resolve_tidal_url(init);
+        let media_template = resolve_tidal_url(media);
         if init_url.starts_with("http") && media_template.starts_with("http") {
             Some(DashSegmentInfo {
                 init_url,
@@ -2812,7 +2812,8 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             );
             resolved
         }
-    } else if let Some(ref init) = segment_template_init {
+    } else {
+        let init = &segment_template_init?;
         // Last resort: initialization-only SegmentTemplate (no media attr).
         // This is typically just the MP4 header — it will be small, but
         // it's better to try than to fail silently.
@@ -2830,8 +2831,6 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             "tidal_dash_init_only_no_media_template — URL may be header-only"
         );
         resolved
-    } else {
-        return None;
     };
 
     Some(DashManifest {

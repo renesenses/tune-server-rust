@@ -275,8 +275,8 @@ fn prefixe_reconnu<'a>(hay: &str, prefixes: &[&'a str]) -> Option<&'a str> {
 /// de leur station mère : les neuf webradios de France Musique — Baroque,
 /// Classique Easy, Classique Plus, Concerts, Contemporaine, Jazz, Musiques du
 /// monde, Opéra, Piano Zen — partaient toutes sur le canal 4, celui de France
-/// Musique **principale** ; Mouv Xtra sur le 6 ; Mon Petit France Inter sur le
-/// 1. Elles affichaient donc, pendant des heures, le morceau d'une autre
+/// Musique **principale** ; Mouv Xtra sur le 6 ; Mon Petit France Inter sur
+/// le 1. Elles affichaient donc, pendant des heures, le morceau d'une autre
 /// station : plausible, au bon format, dans le bon genre, et faux.
 ///
 /// Il n'y a **pas** de bon numéro à mettre à la place. Le balayage des canaux
@@ -308,9 +308,7 @@ fn radiofrance_channel_id(station_name: &str, stream_url: &str) -> Option<u32> {
     } else if hay.contains("fip") {
         // FIP webradios: pick the specific substation, main FIP when there is
         // no qualifier at all, and nothing when the qualifier is unknown.
-        let Some(qualifier) = qualificatif_webradio(&hay, "fip") else {
-            return None;
-        };
+        let qualifier = qualificatif_webradio(&hay, "fip")?;
         if qualifier.is_empty() {
             Some(7)
         } else if qualifier.contains("rock") {

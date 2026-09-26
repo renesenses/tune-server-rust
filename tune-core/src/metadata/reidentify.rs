@@ -390,10 +390,14 @@ pub fn apply_album_identification(
         }
     }
 
+    // `label` et `catalog_number` : une chaîne VIDE est un trou (#4836). Un
+    // `COALESCE` nu la prenait pour une valeur, et l'album restait sans label
+    // pour toujours — c'est ce qu'écrit un scan dont la balise est vide.
     backend.execute(
         "UPDATE albums SET \
-         label = COALESCE(label, ?), \
-         catalog_number = COALESCE(catalog_number, ?), \
+         label = CASE WHEN TRIM(COALESCE(label, '')) = '' THEN ? ELSE label END, \
+         catalog_number = CASE WHEN TRIM(COALESCE(catalog_number, '')) = '' THEN ? \
+           ELSE catalog_number END, \
          release_date = COALESCE(release_date, ?), \
          year = COALESCE(year, ?) \
          WHERE id = ?",
@@ -407,6 +411,39 @@ pub fn apply_album_identification(
     )?;
 
     Ok(applied)
+}
+
+/// Comble le label (et le numéro de catalogue) d'un album DÉJÀ identifié —
+/// la passe « labels seulement » du pilote (#4836).
+///
+/// Comblement seul, et vérifié **dans l'`UPDATE` lui-même** (`WHERE` sur le
+/// label vide) : entre la sélection du lot et le tour de l'album, l'utilisateur
+/// a pu saisir un label, un enrichissement a pu en poser un — aucun n'est
+/// écrasé. Le numéro de catalogue n'est comblé que sur un album dont le label
+/// l'est aussi, et seulement s'il est vide. Rend `true` si une ligne a bougé.
+pub fn combler_label_album(
+    backend: &Arc<dyn DbBackend>,
+    album_id: i64,
+    label: &str,
+    catalogue: Option<&str>,
+) -> Result<bool, String> {
+    let label: Option<String> = non_empty(Some(label));
+    if label.is_none() {
+        return Ok(false);
+    }
+    let catalogue: Option<String> = non_empty(catalogue);
+    let n = backend.execute(
+        "UPDATE albums SET label = ?, \
+         catalog_number = CASE WHEN TRIM(COALESCE(catalog_number, '')) = '' THEN ? \
+           ELSE catalog_number END \
+         WHERE id = ? AND TRIM(COALESCE(label, '')) = ''",
+        &[
+            &label as &dyn ToSqlValue,
+            &catalogue as &dyn ToSqlValue,
+            &album_id as &dyn ToSqlValue,
+        ],
+    )?;
+    Ok(n > 0)
 }
 
 #[cfg(test)]
@@ -901,5 +938,67 @@ mod tests {
             Some("rec-TEMOIN".to_string()),
             "une piste d'un autre album a ete reecrite"
         );
+    }
+
+    // ---- labels (#4836) --------------------------------------------------
+
+    fn label_catalogue(backend: &Arc<dyn DbBackend>, id: i64) -> (Option<String>, Option<String>) {
+        let row = backend
+            .query_one(
+                "SELECT label, catalog_number FROM albums WHERE id = ?",
+                &[&id as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap();
+        (row[0].as_string(), row[1].as_string())
+    }
+
+    /// Une chaîne vide est un trou : la pose de l'identification la comble.
+    #[test]
+    fn un_label_vide_est_comble_par_l_identification() {
+        let backend = setup();
+        backend
+            .execute(
+                "UPDATE albums SET label = '', catalog_number = ' ' WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        apply_album_identification(
+            &backend,
+            1,
+            "rel-BON",
+            None,
+            &[],
+            2,
+            Some(&detail(Some("Label MB"), Some("CAT-MB"), None, None)),
+        )
+        .unwrap();
+        assert_eq!(
+            label_catalogue(&backend, 1),
+            (Some("Label MB".to_string()), Some("CAT-MB".to_string()))
+        );
+    }
+
+    #[test]
+    fn combler_le_label_ne_touche_qu_un_label_vide() {
+        let backend = setup();
+        // Album 1 : label 'Label A' posé — jamais écrasé.
+        assert!(!combler_label_album(&backend, 1, "Label MB", Some("CAT-MB")).unwrap());
+        assert_eq!(
+            label_catalogue(&backend, 1),
+            (Some("Label A".to_string()), Some("CAT-1".to_string()))
+        );
+        // Album 2 : sans label — comblé, catalogue compris.
+        assert!(combler_label_album(&backend, 2, "Label MB", Some("CAT-MB")).unwrap());
+        assert_eq!(
+            label_catalogue(&backend, 2),
+            (Some("Label MB".to_string()), Some("CAT-MB".to_string()))
+        );
+        // Un label proposé vide n'écrit rien.
+        backend
+            .execute("UPDATE albums SET label = '' WHERE id = 2", &[])
+            .unwrap();
+        assert!(!combler_label_album(&backend, 2, "  ", None).unwrap());
+        assert_eq!(label_catalogue(&backend, 2).0, Some(String::new()));
     }
 }

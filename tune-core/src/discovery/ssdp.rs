@@ -1223,6 +1223,10 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
 /// sont désormais séparées, et c'est le NOM qui porte la différence :
 /// - fenêtre complète → `process_responses` / [`traiter_le_flux`] ;
 /// - annonce isolée → [`enregistrer_une_annonce`], qui n'oublie jamais.
+///
+/// La production passe par [`traiter_le_flux`] ; seules les épreuves
+/// l'appellent encore directement.
+#[cfg(test)]
 async fn process_responses(
     state: &Arc<Mutex<ScannerState>>,
     event_tx: &mpsc::Sender<SsdpEvent>,
@@ -1311,17 +1315,16 @@ async fn classer_la_reponse(
     }
     seen_locations.insert(resp.location.clone());
 
-    if let Some(host_str) = host_from_location(&resp.location) {
-        if let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>() {
-            if is_virtual_ip(ip) {
-                debug!(
-                    location = %resp.location,
-                    ip = %ip,
-                    "ssdp_response_rejected_virtual_ip_in_location"
-                );
-                return None;
-            }
-        }
+    if let Some(host_str) = host_from_location(&resp.location)
+        && let Ok(ip) = host_str.parse::<std::net::Ipv4Addr>()
+        && is_virtual_ip(ip)
+    {
+        debug!(
+            location = %resp.location,
+            ip = %ip,
+            "ssdp_response_rejected_virtual_ip_in_location"
+        );
+        return None;
     }
 
     // Un appareil est identifié par sa LOCATION, pas par l'UDN de
@@ -1919,7 +1922,7 @@ pub fn get_local_ip() -> Option<Ipv4Addr> {
             }
         }
         // Pick highest-scoring candidate
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.1));
         if let Some((ip, _)) = candidates.first() {
             debug!(ip = %ip, method = "interface_enum", "local_ip_detected");
             return Some(*ip);
@@ -1962,10 +1965,10 @@ fn has_192_168_interface() -> bool {
 fn ip_on_virtual_interface(target: Ipv4Addr) -> bool {
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
         for iface in &ifaces {
-            if let std::net::IpAddr::V4(ip) = iface.ip() {
-                if ip == target {
-                    return is_virtual_interface(&iface.name, ip);
-                }
+            if let std::net::IpAddr::V4(ip) = iface.ip()
+                && ip == target
+            {
+                return is_virtual_interface(&iface.name, ip);
             }
         }
     }
@@ -2212,47 +2215,66 @@ mod tests {
     /// pose, n'est probablement PAS la cause du dossier de #3687.
     #[tokio::test]
     async fn l_etat_d_ecoute_dit_le_refus_puis_la_reprise() {
-        // L'occupant : aucune option de partage, exactement le cas ou le
-        // noyau refuse.
-        let occupant = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("port ephemere");
-        let port = occupant.local_addr().unwrap().port();
+        const TENTATIVES: usize = 8;
+        let mut derniere_erreur = String::new();
+        for _ in 0..TENTATIVES {
+            // L'occupant : aucune option de partage, exactement le cas ou le
+            // noyau refuse.
+            let occupant = std::net::UdpSocket::bind(("0.0.0.0", 0)).expect("port ephemere");
+            let port = occupant.local_addr().unwrap().port();
 
-        // ── MOITIE ROUGE : le port est pris, on doit le DIRE ──────────────
-        let refus = lier_ecouteur_ssdp(port);
-        assert!(
-            refus.is_err(),
-            "un occupant sans SO_REUSEADDR doit faire refuser la liaison"
-        );
-        let etat = etat_ecoute_ssdp().expect("aucun etat retenu apres un bind refuse");
-        assert_eq!(etat.port, port);
-        assert!(
-            !etat.ecoute,
-            "l'etat doit dire que le repondeur ne tourne pas"
-        );
-        assert!(
-            etat.erreur_systeme.is_some(),
-            "l'erreur systeme est la moitie exploitable du diagnostic"
-        );
-        assert!(etat.echecs >= 1, "l'echec doit etre compte");
-        let message = etat
-            .message
-            .expect("une phrase lisible, pas seulement un code");
-        assert!(
-            message.contains("M-SEARCH"),
-            "la phrase doit nommer la consequence, pas seulement la cause : {message}"
-        );
+            // ── MOITIE ROUGE : le port est pris, on doit le DIRE ──────────────
+            let refus = lier_ecouteur_ssdp(port);
+            assert!(
+                refus.is_err(),
+                "un occupant sans SO_REUSEADDR doit faire refuser la liaison"
+            );
+            let etat = etat_ecoute_ssdp().expect("aucun etat retenu apres un bind refuse");
+            assert_eq!(etat.port, port);
+            assert!(
+                !etat.ecoute,
+                "l'etat doit dire que le repondeur ne tourne pas"
+            );
+            assert!(
+                etat.erreur_systeme.is_some(),
+                "l'erreur systeme est la moitie exploitable du diagnostic"
+            );
+            assert!(etat.echecs >= 1, "l'echec doit etre compte");
+            let message = etat
+                .message
+                .expect("une phrase lisible, pas seulement un code");
+            assert!(
+                message.contains("M-SEARCH"),
+                "la phrase doit nommer la consequence, pas seulement la cause : {message}"
+            );
 
-        // ── MOITIE VERTE : le port se libere, on doit le dire AUSSI ───────
-        // Sans elle, un `lier_ecouteur_ssdp` qui echouerait toujours serait
-        // vert au premier assert et rendrait Tune muet en le proclamant.
-        drop(occupant);
-        let socket = lier_ecouteur_ssdp(port).expect("le port libere doit se lier");
-        let etat = etat_ecoute_ssdp().expect("etat retenu apres un bind reussi");
-        assert_eq!(etat.port, port);
-        assert!(etat.ecoute, "l'etat doit dire que le repondeur tourne");
-        assert!(etat.erreur_systeme.is_none());
-        assert!(etat.message.is_none());
-        drop(socket);
+            // ── MOITIE VERTE : le port se libere, on doit le dire AUSSI ───────
+            // Sans elle, un `lier_ecouteur_ssdp` qui echouerait toujours serait
+            // vert au premier assert et rendrait Tune muet en le proclamant.
+            //
+            // Entre `drop(occupant)` et la re-liaison, un autre test du meme
+            // binaire qui lie le port 0 peut recevoir CE port ephemere (CI #4709,
+            // 22/09 : `os error 98` sur un port libere). On rejoue alors tout le
+            // scenario sur un port neuf ; apres TENTATIVES echecs le test rougit
+            // avec la derniere erreur, donc une liaison qui echouerait toujours
+            // reste rouge.
+            drop(occupant);
+            let socket = match lier_ecouteur_ssdp(port) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    derniere_erreur = e;
+                    continue;
+                }
+            };
+            let etat = etat_ecoute_ssdp().expect("etat retenu apres un bind reussi");
+            assert_eq!(etat.port, port);
+            assert!(etat.ecoute, "l'etat doit dire que le repondeur tourne");
+            assert!(etat.erreur_systeme.is_none());
+            assert!(etat.message.is_none());
+            drop(socket);
+            return;
+        }
+        panic!("le port libere doit se lier ({TENTATIVES} tentatives) : {derniere_erreur:?}");
     }
 
     /// 🔴 #3687 — LA GARDE du repondeur M-SEARCH.

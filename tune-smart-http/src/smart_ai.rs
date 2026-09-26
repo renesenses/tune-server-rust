@@ -254,7 +254,7 @@ async fn generate_smart_playlist(
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "title": cols.get(1).and_then(|v| v.as_string()),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -391,7 +391,7 @@ async fn mood_playlist(
 
     let decode_track_row = |cols: &Vec<tune_core::db::backend::SqlValue>| {
         json!({
-            "id": cols.get(0).and_then(|v| v.as_i64()),
+            "id": cols.first().and_then(|v| v.as_i64()),
             "title": cols.get(1).and_then(|v| v.as_string()),
             "artist_name": cols.get(2).and_then(|v| v.as_string()),
             "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -479,7 +479,7 @@ async fn similar_to_playlist(
                 .unwrap_or(None)
                 .map(|cols| {
                     (
-                        cols.get(0).and_then(|v| v.as_string()),
+                        cols.first().and_then(|v| v.as_string()),
                         cols.get(1).and_then(|v| v.as_i64()),
                         cols.get(2).and_then(|v| v.as_i64()),
                         cols.get(3).and_then(|v| v.as_f64()),
@@ -497,7 +497,7 @@ async fn similar_to_playlist(
                 .unwrap_or(None)
                 .map(|cols| {
                     (
-                        cols.get(0).and_then(|v| v.as_string()),
+                        cols.first().and_then(|v| v.as_string()),
                         cols.get(1).and_then(|v| v.as_i64()),
                         cols.get(2).and_then(|v| v.as_i64()),
                         None,
@@ -588,7 +588,7 @@ async fn similar_to_playlist(
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "title": cols.get(1).and_then(|v| v.as_string()),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -705,7 +705,7 @@ async fn history_based_playlist(
             .iter()
             .map(|cols| {
                 json!({
-                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "id": cols.first().and_then(|v| v.as_i64()),
                     "title": cols.get(1).and_then(|v| v.as_string()),
                     "artist_name": cols.get(2).and_then(|v| v.as_string()),
                     "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -749,7 +749,7 @@ async fn history_based_playlist(
             .iter()
             .map(|cols| {
                 json!({
-                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "id": cols.first().and_then(|v| v.as_i64()),
                     "title": cols.get(1).and_then(|v| v.as_string()),
                     "artist_name": cols.get(2).and_then(|v| v.as_string()),
                     "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -785,7 +785,7 @@ async fn history_based_playlist(
             .iter()
             .map(|cols| {
                 json!({
-                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "id": cols.first().and_then(|v| v.as_i64()),
                     "title": cols.get(1).and_then(|v| v.as_string()),
                     "artist_name": cols.get(2).and_then(|v| v.as_string()),
                     "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -871,7 +871,7 @@ async fn tempo_match_playlist(
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "title": cols.get(1).and_then(|v| v.as_string()),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -951,7 +951,7 @@ async fn discovery_playlist(
             .iter()
             .map(|cols| {
                 json!({
-                    "id": cols.get(0).and_then(|v| v.as_i64()),
+                    "id": cols.first().and_then(|v| v.as_i64()),
                     "title": cols.get(1).and_then(|v| v.as_string()),
                     "artist_name": cols.get(2).and_then(|v| v.as_string()),
                     "album_title": cols.get(3).and_then(|v| v.as_string()),
@@ -1001,7 +1001,7 @@ async fn discovery_playlist(
         .iter()
         .map(|cols| {
             json!({
-                "id": cols.get(0).and_then(|v| v.as_i64()),
+                "id": cols.first().and_then(|v| v.as_i64()),
                 "title": cols.get(1).and_then(|v| v.as_string()),
                 "artist_name": cols.get(2).and_then(|v| v.as_string()),
                 "album_title": cols.get(3).and_then(|v| v.as_string()),

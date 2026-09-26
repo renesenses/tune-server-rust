@@ -586,30 +586,29 @@ fn service_to_device(
         // Parse the AirPlay `features` bitmask (and `flags`) so callers can tell
         // whether the receiver demands a HomeKit-style pair-setup before it will
         // accept an RTSP session (Apple TV, Samsung/LG TVs, HomePod, ...).
-        if let Some(raw) = features_raw {
-            if let Some(bits) = parse_airplay_features(raw) {
-                caps.insert(
-                    "airplay_features".to_string(),
-                    serde_json::Value::String(format!("0x{bits:016X}")),
-                );
-                let needs_pairing = airplay_requires_pairing(bits);
-                caps.insert(
-                    "airplay_requires_pairing".to_string(),
-                    serde_json::Value::Bool(needs_pairing),
-                );
-            }
+        if let Some(raw) = features_raw
+            && let Some(bits) = parse_airplay_features(raw)
+        {
+            caps.insert(
+                "airplay_features".to_string(),
+                serde_json::Value::String(format!("0x{bits:016X}")),
+            );
+            let needs_pairing = airplay_requires_pairing(bits);
+            caps.insert(
+                "airplay_requires_pairing".to_string(),
+                serde_json::Value::Bool(needs_pairing),
+            );
         }
         // The `flags` TXT independently signals "PIN required" (bit 9 / 0x200)
         // on many receivers even when features are ambiguous.
-        if let Some(flags_raw) = info.get_property_val_str("flags") {
-            if let Some(flags) = parse_hex_u64(flags_raw) {
-                if flags & AIRPLAY_FLAG_PIN_REQUIRED != 0 {
-                    caps.insert(
-                        "airplay_requires_pairing".to_string(),
-                        serde_json::Value::Bool(true),
-                    );
-                }
-            }
+        if let Some(flags_raw) = info.get_property_val_str("flags")
+            && let Some(flags) = parse_hex_u64(flags_raw)
+            && flags & AIRPLAY_FLAG_PIN_REQUIRED != 0
+        {
+            caps.insert(
+                "airplay_requires_pairing".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
 
         // Groupe AirPlay 2 (paire stéréo, multi-room) : `gid` identifie le
@@ -962,6 +961,7 @@ fn parse_hex_u64(raw: &str) -> Option<u64> {
 /// The record appears in two shapes in the wild:
 ///   * one word:  `0x5A7FFFF7`
 ///   * two words: `0x5A7FFFF7,0x1E`  (low word first, high word second)
+///
 /// Returns `None` if nothing parses.
 pub fn parse_airplay_features(raw: &str) -> Option<u64> {
     let mut parts = raw.split(',');

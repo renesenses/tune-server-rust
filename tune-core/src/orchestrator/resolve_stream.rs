@@ -45,6 +45,10 @@ struct DashPret<'a> {
 
 /// Issue du premier temps : tout est prêt pour transcoder, ou la piste est
 /// déjà résolue depuis le cache chaud.
+// Valeur de passage entre deux temps d'une même résolution, jamais stockée :
+// emballer `DashPret` dans une `Box` ajouterait une allocation par lecture pour
+// rien (clippy 1.98, `large_enum_variant`).
+#[allow(clippy::large_enum_variant)]
 enum DashOuFini<'a> {
     Pret(DashPret<'a>),
     Fini(ResolvedStream),
@@ -662,33 +666,33 @@ impl PlaybackOrchestrator {
             .flatten()
             .and_then(|z| z.max_sample_rate);
         let mut sr = stream_data.quality.sample_rate;
-        if let Some(max_sr) = zone_max_sample_rate {
-            if sr > max_sr {
-                // #3973 — même plafond de zone, même règle bit-perfect que
-                // `resolve_local` : strict ⇒ refuser plutôt que plafonner.
-                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
-                    sr,
-                    max_sr,
-                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
-                )
-                .refus()
-                {
-                    warn!(
-                        zone_id = req.zone_id,
-                        source_rate = sr,
-                        max_rate = max_sr,
-                        "streaming_zone_max_sample_rate_bitperfect_strict_refused"
-                    );
-                    return Err(refus.sentinelle());
-                }
-                info!(
+        if let Some(max_sr) = zone_max_sample_rate
+            && sr > max_sr
+        {
+            // #3973 — même plafond de zone, même règle bit-perfect que
+            // `resolve_local` : strict ⇒ refuser plutôt que plafonner.
+            if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                sr,
+                max_sr,
+                crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+            )
+            .refus()
+            {
+                warn!(
                     zone_id = req.zone_id,
                     source_rate = sr,
                     max_rate = max_sr,
-                    "streaming_zone_max_sample_rate_cap_applied"
+                    "streaming_zone_max_sample_rate_bitperfect_strict_refused"
                 );
-                sr = max_sr;
+                return Err(refus.sentinelle());
             }
+            info!(
+                zone_id = req.zone_id,
+                source_rate = sr,
+                max_rate = max_sr,
+                "streaming_zone_max_sample_rate_cap_applied"
+            );
+            sr = max_sr;
         }
         // Local output: 32-bit to avoid 24-bit byte misalignment noise
         // (see local_needs_wav comment in resolve_local_track).
@@ -915,6 +919,7 @@ impl PlaybackOrchestrator {
                 &upstream_url,
                 &upstream_headers,
                 &codec,
+                // tmp-autorise: base seule : telecharger_pour_session y crée un fichier tempfile au nom aléatoire.
                 &std::env::temp_dir(),
             )
             .await
@@ -925,7 +930,7 @@ impl PlaybackOrchestrator {
                         stream_id = %session_id_for_eof,
                         octets,
                         elapsed_ms = ms,
-                        debit_kio_s = if ms > 0 { octets * 1000 / 1024 / ms } else { 0 },
+                        debit_kio_s = (octets * 1000 / 1024).checked_div(ms).unwrap_or(0),
                         "streaming_download_complete"
                     );
                     let path = file.path().to_string_lossy().into_owned();
@@ -1142,7 +1147,7 @@ impl PlaybackOrchestrator {
         // the encoded bytes can never disagree.
         let warm: Option<DashWarm> = if dash_warm_cache_enabled() {
             let wsr = stream_data.quality.sample_rate;
-            let wbd = stream_data.quality.bit_depth.max(16).min(24);
+            let wbd = stream_data.quality.bit_depth.clamp(16, 24);
             let wdid = req.output_device_id.as_deref().unwrap_or("");
             let wflac = ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
             let wfmt = if is_browser_output {
@@ -1158,16 +1163,19 @@ impl PlaybackOrchestrator {
             // flux traité ne peut donc jamais partager la clé d'un flux
             // brut. La garde ne couvrait que l'égaliseur ; le convolveur et
             // le ReplayGain la traversaient (#2863).
+            // Sans racine de cache utilisable pour ce compte (#5133), même
+            // chemin que sans cache : pas de `DashWarm`.
             if !dash_dsp_active {
-                Some(DashWarm {
-                    cache_path: crate::transcode_cache::cache_path_streaming(
-                        service_name,
-                        source_id,
-                        wfmt,
-                        wsr,
-                        wkbd,
-                        2,
-                    ),
+                crate::transcode_cache::cache_path_streaming(
+                    service_name,
+                    source_id,
+                    wfmt,
+                    wsr,
+                    wkbd,
+                    2,
+                )
+                .map(|cache_path| DashWarm {
+                    cache_path,
                     enc_format: wfmt,
                     key_bit_depth: wkbd,
                     force_flac: wflac,
@@ -1183,103 +1191,100 @@ impl PlaybackOrchestrator {
         // download+decode+encode. The fMP4 on disk is left untouched (not
         // renamed to `.decoding` / consumed), so a concurrent path can still
         // use it. Mirrors the common metadata tail before returning.
-        if let Some(w) = warm.as_ref() {
-            if crate::transcode_cache::is_hit(&w.cache_path) {
-                crate::transcode_cache::touch(&w.cache_path);
-                if let Ok(md) = std::fs::metadata(&w.cache_path) {
-                    let file_size = md.len();
-                    let hit_mime = if w.enc_format == "flac" {
-                        "audio/flac"
-                    } else {
-                        "audio/wav"
-                    };
-                    let file_info = StreamInfo {
-                        format: w.enc_format.into(),
-                        mime_type: hit_mime.into(),
-                        sample_rate: stream_data.quality.sample_rate,
-                        bit_depth: w.key_bit_depth,
-                        channels: 2,
-                        file_size: Some(file_size),
-                        duration_ms: None,
-                        ..Default::default()
-                    };
-                    let session_id = self
-                        .streamer
-                        .create_file_session(file_info, w.cache_path.clone(), false)
-                        .await;
-                    let server_ip = self.server_ip();
-                    let stream_url =
-                        self.streamer
-                            .get_stream_url(&session_id, &server_ip, w.enc_format);
-                    info!(cache = %w.cache_path, file_size, "streaming_dash_warm_cache_hit");
-                    // Warm N+1 into the cache while this track plays (same
-                    // device → same FLAC/WAV decision, so inherit it).
-                    self.spawn_warm_next_streaming(
-                        req.zone_id,
-                        source_id.to_string(),
-                        w.enc_format,
-                    );
+        if let Some(w) = warm.as_ref()
+            && crate::transcode_cache::is_hit(&w.cache_path)
+        {
+            crate::transcode_cache::touch(&w.cache_path);
+            if let Ok(md) = std::fs::metadata(&w.cache_path) {
+                let file_size = md.len();
+                let hit_mime = if w.enc_format == "flac" {
+                    "audio/flac"
+                } else {
+                    "audio/wav"
+                };
+                let file_info = StreamInfo {
+                    format: w.enc_format.into(),
+                    mime_type: hit_mime.into(),
+                    sample_rate: stream_data.quality.sample_rate,
+                    bit_depth: w.key_bit_depth,
+                    channels: 2,
+                    file_size: Some(file_size),
+                    duration_ms: None,
+                    ..Default::default()
+                };
+                let session_id = self
+                    .streamer
+                    .create_file_session(file_info, w.cache_path.clone(), false)
+                    .await;
+                let server_ip = self.server_ip();
+                let stream_url =
+                    self.streamer
+                        .get_stream_url(&session_id, &server_ip, w.enc_format);
+                info!(cache = %w.cache_path, file_size, "streaming_dash_warm_cache_hit");
+                // Warm N+1 into the cache while this track plays (same
+                // device → same FLAC/WAV decision, so inherit it).
+                self.spawn_warm_next_streaming(req.zone_id, source_id.to_string(), w.enc_format);
 
-                    let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
-                    let (title, artist, album, duration_ms, cover_path) = if has_title {
-                        (
-                            req.title.clone().unwrap_or_default(),
+                let has_title = req.title.as_deref().is_some_and(|s| !s.is_empty());
+                let (title, artist, album, duration_ms, cover_path) = if has_title {
+                    (
+                        req.title.clone().unwrap_or_default(),
+                        req.artist_name.clone(),
+                        req.album_title.clone(),
+                        req.duration_ms,
+                        req.cover_url.clone(),
+                    )
+                } else {
+                    match svc.get_track(source_id).await {
+                        Ok(track) => (
+                            track.title,
+                            Some(track.artist),
+                            track.album,
+                            Some(track.duration_ms as i64),
+                            track.cover_path,
+                        ),
+                        Err(_) => (
+                            req.title
+                                .clone()
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| "Unknown".into()),
                             req.artist_name.clone(),
                             req.album_title.clone(),
                             req.duration_ms,
                             req.cover_url.clone(),
-                        )
-                    } else {
-                        match svc.get_track(source_id).await {
-                            Ok(track) => (
-                                track.title,
-                                Some(track.artist),
-                                track.album,
-                                Some(track.duration_ms as i64),
-                                track.cover_path,
-                            ),
-                            Err(_) => (
-                                req.title
-                                    .clone()
-                                    .filter(|s| !s.is_empty())
-                                    .unwrap_or_else(|| "Unknown".into()),
-                                req.artist_name.clone(),
-                                req.album_title.clone(),
-                                req.duration_ms,
-                                req.cover_url.clone(),
-                            ),
-                        }
-                    };
-                    return Ok(DashOuFini::Fini(ResolvedStream {
-                        url: stream_url,
-                        mime_type: hit_mime.into(),
-                        title,
-                        artist,
-                        album,
-                        duration_ms,
-                        source: service_name.into(),
-                        cover_url: cover_path,
-                        stream_id: Some(session_id),
-                        file_size: Some(file_size),
-                        sample_rate: Some(stream_data.quality.sample_rate),
-                        bit_depth: Some(stream_data.quality.bit_depth as u32),
-                        channels: Some(2),
-                        origin_url: None,
-                        bitrate_kbps: None,
-                    }));
-                }
+                        ),
+                    }
+                };
+                return Ok(DashOuFini::Fini(ResolvedStream {
+                    url: stream_url,
+                    mime_type: hit_mime.into(),
+                    title,
+                    artist,
+                    album,
+                    duration_ms,
+                    source: service_name.into(),
+                    cover_url: cover_path,
+                    stream_id: Some(session_id),
+                    file_size: Some(file_size),
+                    sample_rate: Some(stream_data.quality.sample_rate),
+                    bit_depth: Some(stream_data.quality.bit_depth as u32),
+                    channels: Some(2),
+                    origin_url: None,
+                    bitrate_kbps: None,
+                }));
             }
         }
 
-        let unique_path = format!("{}.decoding", &dash_file_path);
+        let unique_path = format!("{}.decoding", dash_file_path);
         if std::fs::rename(&dash_file_path, &unique_path).is_err() {
             warn!(path = %dash_file_path, "streaming_dash_file_already_being_decoded");
             return Err("DASH file already being decoded".into());
         }
 
         let sr = stream_data.quality.sample_rate;
-        let bd = stream_data.quality.bit_depth.max(16).min(24);
+        let bd = stream_data.quality.bit_depth.clamp(16, 24);
 
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
         let tmp_path = std::env::temp_dir()
             .join(format!("tune-dash-transcode-{}.flac", uuid::Uuid::new_v4()))
             .to_string_lossy()
@@ -1504,6 +1509,11 @@ impl PlaybackOrchestrator {
             tmp_path,
             ..
         } = p;
+        // #5114 — lu avant que le porteur parte dans la tâche de décodage :
+        // la session de fichier dira si ses octets portent le crossfeed.
+        // Le remux (sans traitement) ne l'appelle jamais, d'où `dash_dsp_active`.
+        let dash_crossfeed = dash_dsp_active && dash_dsp.crossfeed_executable();
+        let dash_compensation = dash_dsp.compensation_cuite_db().filter(|_| dash_dsp_active);
         let flux = {
             let tmp_path_clone = tmp_path.clone();
             let unique_path_clone = unique_path.clone();
@@ -1633,6 +1643,8 @@ impl PlaybackOrchestrator {
                         channels: 2,
                         file_size: Some(file_size),
                         duration_ms: None,
+                        crossfeed: dash_crossfeed,
+                        compensation_db: dash_compensation,
                         ..Default::default()
                     };
                     // Store into the warm cache (atomic rename) when enabled, so
@@ -1704,6 +1716,9 @@ impl PlaybackOrchestrator {
     /// phase 2, #2219) : les renderers réseau ne parlent pas TLS, le flux passe
     /// par le relais de Tune, pré-transcodé en FLAC quand le codec l'exige.
     /// Rend (url servie, identifiant de session, mime servi, taille).
+    // Signature d'un temps de la résolution (REF-2) : la regrouper en structure
+    // toucherait le chemin de lecture pour un gain de forme (clippy 1.98).
+    #[allow(clippy::too_many_arguments)]
     async fn resoudre_flux_https(
         &self,
         req: &PlayRequest,
@@ -1772,6 +1787,7 @@ impl PlaybackOrchestrator {
         upstream_headers: Vec<(String, String)>,
         codec: &str,
     ) -> Result<String, String> {
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
         let tmp_dl = std::env::temp_dir()
             .join(format!("tune-stream-{}.{}", uuid::Uuid::new_v4(), codec))
             .to_string_lossy()
@@ -1822,7 +1838,7 @@ impl PlaybackOrchestrator {
             // ou un flux de service plus haut — sortait à sa cadence d'origine
             // vers une zone qui avait demandé moins.
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
-            let bd = stream_data.quality.bit_depth.max(16).min(24) as u16;
+            let bd = stream_data.quality.bit_depth.clamp(16, 24);
 
             info!(
                 service = service_name,
@@ -1871,7 +1887,6 @@ impl PlaybackOrchestrator {
                 channels: 2,
                 ..Default::default()
             };
-            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
             // Chaîne DSP de la zone (#2863). Ce bras servait le PCM décodé
             // TEL QUEL : égaliseur, convolveur et ReplayGain y étaient
             // calculés côté interface puis jetés. Le relais les applique au
@@ -1879,6 +1894,13 @@ impl PlaybackOrchestrator {
             // immédiat conquis en 0.9.106 est préservé. Sans traitement
             // actif, le canal reste celui d'avant, à l'octet près.
             let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
+            let info = StreamInfo {
+                crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
+                compensation_db: aac_dsp.compensation_cuite_db(),
+                ..info
+            };
+            let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
             let tx = if aac_dsp.is_active() {
                 info!(
                     zone_id = req.zone_id,
@@ -1965,7 +1987,7 @@ impl PlaybackOrchestrator {
     /// MIME ? Sinon transcodage WAV (LPCM) ; sinon relais du flux CDN par
     /// session mandataire, bit-perfect, avec la sonde de niveaux en parallèle.
     #[allow(clippy::too_many_arguments)] // les arguments de `resoudre_flux_https`, plus le codec
-    async fn relayer_le_flux(
+    pub(super) async fn relayer_le_flux(
         &self,
         req: &PlayRequest,
         source_id: &str,
@@ -2022,6 +2044,42 @@ impl PlaybackOrchestrator {
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
             let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
             let https_dsp_active = https_dsp.is_active();
+            // #5114 — lu avant que le porteur parte dans la tâche de décodage.
+            let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();
+            let https_compensation = https_dsp
+                .compensation_cuite_db()
+                .filter(|_| https_dsp_active);
+
+            // #5080 — traitement actif vers une zone réseau : WAV progressif,
+            // le traitement au fil de l'eau, quand la bibliothèque y aurait
+            // droit. Sans cela, le bras ci-dessous attend la piste ENTIÈRE —
+            // téléchargée, décodée, traitée, ré-encodée — avant de rendre une
+            // adresse : plus d'une minute de silence sur un Hi-Res long.
+            if https_dsp_active
+                && let Some(bd_servie) = self
+                    .profondeur_du_wav_progressif_de_service(
+                        service_name,
+                        stream_data,
+                        &codec_lower,
+                        zone_output_type.as_deref(),
+                        device_id,
+                        renderer_supports_mime,
+                        &https_dsp,
+                    )
+                    .await
+            {
+                return Ok(self
+                    .servir_le_service_en_wav_progressif(
+                        req,
+                        service_name,
+                        stream_data,
+                        codec_lower,
+                        sr,
+                        bd_servie,
+                        https_dsp,
+                    )
+                    .await);
+            }
 
             if streaming_needs_pretranscode(
                 renderer_supports_mime,
@@ -2034,7 +2092,7 @@ impl PlaybackOrchestrator {
                 // lire). Même schéma que le pré-transcodage AAC :
                 // téléchargement → décodage → traitement → encodage →
                 // session fichier (Content-Length, pas de chunked).
-                let bd = stream_data.quality.bit_depth.max(16).min(24);
+                let bd = stream_data.quality.bit_depth.clamp(16, 24);
                 let enc_format = streaming_pretranscode_format(renderer_supports_mime);
                 let enc_is_wav = enc_format == "wav";
 
@@ -2054,6 +2112,7 @@ impl PlaybackOrchestrator {
                 // #4366 — même rejeu qu'au canal AAC : ce chemin télécharge la
                 // même URL, il tomberait sur le même 403.
                 let upstream_headers = stream_data.headers.clone();
+                // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
                 let tmp_dl = std::env::temp_dir()
                     .join(format!(
                         "tune-stream-{}.{}",
@@ -2062,6 +2121,7 @@ impl PlaybackOrchestrator {
                     ))
                     .to_string_lossy()
                     .to_string();
+                // tmp-autorise: fichier au nom aléatoire (UUID v4), propre à la session.
                 let tmp_wav = std::env::temp_dir()
                     .join(format!(
                         "tune-stream-pretranscode-{}.{}",
@@ -2181,6 +2241,8 @@ impl PlaybackOrchestrator {
                             channels: actual_ch,
                             file_size: Some(file_size),
                             duration_ms: None,
+                            crossfeed: https_crossfeed,
+                            compensation_db: https_compensation,
                             ..Default::default()
                         };
                         let session_id = self
@@ -2305,6 +2367,111 @@ impl PlaybackOrchestrator {
             }
         };
         Ok(flux)
+    }
+
+    /// #5080 — la profondeur du WAV progressif à servir, ou `None` quand le
+    /// flux doit rester sur le pré-transcodage par le fichier.
+    ///
+    /// La décision de la bibliothèque (`resolve_local.rs`, `dsp_progressif_wav`)
+    /// appliquée au bras des services : même opt-in (`dsp_progressif_reseau`),
+    /// même consentement d'un crossfeed seul (#2742), même sonde LPCM du
+    /// renderer, et le flux doit se décoder au fil de l'eau. Profondeur : celle
+    /// de la source bornée à 24 bits quand le renderer lit le FLAC amont ;
+    /// 16 bits quand il le refuse — le profil LPCM historique de #1137, que le
+    /// pré-transcodage WAV servait déjà.
+    #[allow(clippy::too_many_arguments)] // les faits déjà établis par `relayer_le_flux`
+    async fn profondeur_du_wav_progressif_de_service(
+        &self,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        codec_lower: &str,
+        zone_output_type: Option<&str>,
+        device_id: &str,
+        renderer_supports_mime: bool,
+        dsp: &StreamingDsp,
+    ) -> Option<u16> {
+        let decodable = decodage_progressif_par_range(service_name, codec_lower, &stream_data.url);
+        let sortie_reseau = is_network_output_type(zone_output_type);
+        let opt_in = SettingsRepo::with_backend(self.db.clone())
+            .get("dsp_progressif_reseau")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
+        let autre_traitement =
+            dsp.replaygain.is_some() || dsp.eq.is_some() || dsp.convolver.is_some();
+        let consenti = super::crossfeed_bibliotheque_reseau::wav_progressif_consenti(
+            opt_in,
+            dsp.crossfeed.is_some(),
+            autre_traitement,
+        );
+        let actif = dsp.is_active();
+        // La sonde SOAP n'est consultée que si tout le reste est réuni.
+        if !service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, true) {
+            return None;
+        }
+        let bd = if renderer_supports_mime {
+            cap_output_bit_depth(stream_data.quality.bit_depth)
+        } else {
+            16
+        };
+        let lpcm = !device_id.is_empty() && self.dlna_accepte_lpcm(device_id, bd > 16).await;
+        service_en_wav_progressif(actif, sortie_reseau, consenti, decodable, lpcm).then_some(bd)
+    }
+
+    /// #5080 — sert un flux de service en WAV progressif, traitement de zone
+    /// au fil de l'eau : session ouverte TOUT DE SUITE, adresse rendue tout de
+    /// suite, décodage (source Range, sinon téléchargement) dans une tâche
+    /// détachée — le même producteur que le bras local/OAAT, avec le relais
+    /// DSP de LAT-F1 entre le décodeur et la session. Le premier chunk est
+    /// l'en-tête WAV : il est épargné (`skip_header`).
+    #[allow(clippy::too_many_arguments)] // les faits déjà établis par `relayer_le_flux`
+    async fn servir_le_service_en_wav_progressif(
+        &self,
+        req: &PlayRequest,
+        service_name: &str,
+        stream_data: &crate::streaming::StreamUrl,
+        codec_lower: String,
+        sr: u32,
+        bd: u16,
+        dsp: StreamingDsp,
+    ) -> FluxHttps {
+        info!(
+            zone_id = req.zone_id,
+            service = service_name,
+            codec = %codec_lower,
+            sample_rate = sr,
+            bit_depth = bd,
+            "streaming_dsp_progressif_wav_target"
+        );
+        let wav_info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: sr,
+            bit_depth: bd,
+            channels: 2,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let (session_id, tx, data_ready) = self
+            .ouvrir_la_session_wav(wav_info, service_name, &codec_lower, sr, bd)
+            .await;
+        let tx = spawn_streaming_dsp_relay(dsp, bd, true, tx);
+        let tache = self.capturer_pour_le_transcodage(
+            req,
+            service_name,
+            stream_data.url.clone(),
+            stream_data.headers.clone(),
+            codec_lower,
+            sr,
+            bd,
+            &session_id,
+        );
+        tokio::spawn(Self::transcoder_le_flux_en_wav(tache, tx, data_ready));
+        let server_ip = self.server_ip();
+        let url = self.streamer.get_stream_url(&session_id, &server_ip, "wav");
+        (url, Some(session_id), "audio/wav".to_string(), None)
     }
 }
 

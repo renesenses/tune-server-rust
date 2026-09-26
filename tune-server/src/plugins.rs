@@ -41,10 +41,16 @@ pub type PluginRouters = Vec<(String, axum::Router<()>)>;
 pub fn build_loader(
     event_bus: &tune_core::event_bus::EventBus,
     backend: Arc<dyn tune_core::db::backend::DbBackend>,
+    license: Arc<tune_core::license::LicenseManager>,
 ) -> PluginLoader {
+    // La licence descend jusqu'aux greffons (`PluginContext::license`) pour
+    // qu'un greffon payant ADAPTE sa réponse au lieu de se voir fermer la porte
+    // par l'hôte : « Concerts » servira un jour une version réduite aux comptes
+    // gratuits, et cette décision doit tenir chez lui, en un seul endroit.
     PluginLoader::new(plugins_data_root())
         .with_event_bus(event_bus.clone())
         .with_db(backend)
+        .with_license(license)
 }
 
 /// Where plugins keep their private state. Each plugin gets
@@ -134,8 +140,9 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // Concerts (#2363) : la tâche d'abonnement 24 h et la route de lecture,
     // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
     // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
-    // installé le plugin. Sa seule dépendance est la base : lire les artistes
-    // de la bibliothèque, et lire `instance_id` / `community_sync_enabled`.
+    // installé le plugin. Sa dépendance explicite est la base : lire les artistes
+    // de la bibliothèque et `instance_id`. La licence lui arrive par le contexte
+    // (`PluginContext::license`) : c'est lui qui décide ce qu'il sert (Premium).
     #[cfg(feature = "concerts")]
     loader
         .register(Box::new(tune_concerts::ConcertsPlugin::new(
@@ -155,6 +162,33 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
             orchestrator: state.orchestrator.clone(),
             playback: state.playback.clone(),
         })))
+        .await;
+
+    // Tune Circle, étape T1 (#5018). La base seule : le greffon y relit, à
+    // chaque appel, la session SSO du serveur (`mozaik_access_token`,
+    // `mozaik_refresh_token`, `mozaik_base_url`) — la même que lisent
+    // `library_sync` et les routes `/cloud/*`. Aucun service hôte de plus.
+    #[cfg(feature = "circle")]
+    loader
+        .register(Box::new(tune_circle::CirclePlugin::new(
+            tune_circle::HostServices {
+                backend: state.backend.clone(),
+            },
+        )))
+        .await;
+
+    // Entrée audio en direct (#5051). Comme `cd` : l'orchestrateur pour y
+    // inscrire la source PCM EN DIRECT `entree-audio` et lancer la zone, le
+    // gestionnaire de lecture pour la file et l'état des zones.
+    #[cfg(feature = "entree-audio")]
+    loader
+        .register(Box::new(tune_entree_audio::EntreeAudioPlugin::new(
+            tune_entree_audio::HostServices {
+                backend: state.backend.clone(),
+                orchestrator: state.orchestrator.clone(),
+                playback: state.playback.clone(),
+            },
+        )))
         .await;
 
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon

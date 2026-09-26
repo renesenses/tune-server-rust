@@ -1,9 +1,10 @@
 //! L'abstraction « lecteur de disque ».
 //!
-//! Trois implémentations : Linux (ioctl sur `/dev/sr*`, `linux.rs`), simulée
-//! (en mémoire, pour les tests, `simule.rs`), et plus tard macOS (volume AIFF
-//! sous `/Volumes`) et Windows (`IOCTL_CDROM_RAW_READ`). Tout ce qui est
-//! au-dessus — flux, identifiant, routes — ne connaît que ce trait.
+//! Trois implémentations : Linux (ioctl sur `/dev/sr*`, `linux.rs`), macOS
+//! (le volume `cddafs` monté sous `/Volumes`, `cddafs.rs` et `macos.rs`) et
+//! simulée (en mémoire, pour les tests, `simule.rs`). Windows
+//! (`IOCTL_CDROM_RAW_READ`) reste à faire. Tout ce qui est au-dessus — flux,
+//! identifiant, routes — ne connaît que ce trait.
 
 use std::fmt;
 use std::sync::Arc;
@@ -61,8 +62,12 @@ pub trait LecteurDisque: Send + Sync {
 
 /// Le lecteur du système, s'il y en a un que Tune sait lire.
 ///
-/// `TUNE_CD_DEVICE` impose un périphérique ; sinon le premier `/dev/sr0..3`
-/// présent, comme la détection de `/cd-rip/drives`.
+/// Linux : `TUNE_CD_DEVICE` impose un périphérique ; sinon le premier
+/// `/dev/sr0..3` présent, comme la détection de `/cd-rip/drives`.
+///
+/// macOS : toujours un lecteur, dont la présence dit « aucun lecteur »,
+/// « vide » ou « disque » (un lecteur USB se branche à chaud) ;
+/// `TUNE_CD_DEVICE` y impose un DOSSIER de volume.
 pub fn lecteur_du_systeme() -> Option<Arc<dyn LecteurDisque>> {
     #[cfg(target_os = "linux")]
     {
@@ -73,14 +78,18 @@ pub fn lecteur_du_systeme() -> Option<Arc<dyn LecteurDisque>> {
         })?;
         Some(Arc::new(crate::linux::LecteurLinux::new(chemin)))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        // macOS et Windows : hors de cette PR (#4863).
+        Some(Arc::new(crate::macos::lecteur_du_systeme()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Windows : pas encore (#4863).
         None
     }
 }
 
 /// La plateforme a-t-elle une implémentation ?
 pub const fn plateforme_prise_en_charge() -> bool {
-    cfg!(target_os = "linux")
+    cfg!(any(target_os = "linux", target_os = "macos"))
 }

@@ -175,7 +175,8 @@ mod tests {
         // Les copies du rapport #1362 et les arbitrages documentés plus haut :
         // sans-perte contre avec-perte, débit à famille égale, DSD, et les
         // colonnes absentes d'une base ancienne.
-        const COPIES: [(&str, Option<&str>, Option<i32>, Option<i32>); 8] = [
+        type Copie = (&'static str, Option<&'static str>, Option<i32>, Option<i32>);
+        const COPIES: [Copie; 8] = [
             ("aiff 44/16", Some("aiff"), Some(44100), Some(16)),
             ("aac 48/24", Some("aac"), Some(48000), Some(24)),
             ("flac 44/16", Some("flac"), Some(44100), Some(16)),

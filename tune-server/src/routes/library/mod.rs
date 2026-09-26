@@ -18,7 +18,12 @@ pub(crate) mod collections;
 pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
+// Le mode « Modifier » de la fiche album (GO du 25/09/2026).
+mod edition;
+mod edition_balises;
 mod enrich;
+/// #4907 — ordre des répertoires et répertoire préféré d'un album.
+mod exemplaires;
 mod facets;
 mod folder_facet;
 mod genres;
@@ -37,6 +42,7 @@ mod search;
 // `pub(crate)` : `/system/stats` (routes/system/config.rs) affiche les mêmes
 // compteurs que `/library/stats` sur un autre écran et doit les ventiler par
 // source de la même façon. Un seul point de vérité, partagé (#2147).
+pub(crate) mod compositeur_depuis_credits;
 pub(crate) mod graver_compilation;
 pub(crate) mod graver_dr;
 pub(crate) mod reparer_compilations;
@@ -86,13 +92,30 @@ pub(super) fn api_cache_get(
     key: &str,
 ) -> Option<Value> {
     use tune_core::db::backend::ToSqlValue;
-    let row = backend
-        .query_one(
+    use tune_core::db::engine::Engine;
+    // `strftime` n'existe pas sur PostgreSQL : la requête SQLite y tombait
+    // (« function strftime(unknown, unknown) does not exist »), l'erreur était
+    // avalée par le `.ok()?` ci-dessous, et le cache des biographies, des
+    // artistes similaires et des métadonnées n'était JAMAIS relu — chaque
+    // visite rappelait le service distant (chasse PG du 25/09/2026). Sur PG,
+    // la fraîcheur se compare en texte à une borne calculée par le serveur :
+    // `updated_at` y est toujours écrit `%Y-%m-%dT%H:%M:%SZ`
+    // (`SettingsRepo::set` et le défaut de la colonne), un format qui se
+    // range comme le temps.
+    let row = match backend.engine() {
+        Engine::Sqlite => backend.query_one(
             "SELECT value FROM settings WHERE key = ? AND \
              CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
             &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
-        )
-        .ok()?
+        ),
+        Engine::Postgres => backend.query_one(
+            "SELECT value FROM settings WHERE key = $1 AND updated_at > \
+             to_char((now() - make_interval(secs => CAST($2 AS DOUBLE PRECISION))) \
+             AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+        ),
+    }
+    .ok()?
         .and_then(|r| r.first().and_then(|v| v.as_string()))?;
     serde_json::from_str(&row).ok()
 }
@@ -269,6 +292,10 @@ pub fn router() -> Router<AppState> {
             "/albums/coffrets/{cible}/regrouper",
             post(albums::regrouper_coffret),
         )
+        // Les coffrets RÉUNIS — l'onglet « Coffrets » de la Bibliothèque — et
+        // le geste qui défait un coffret automatique (GO du 25/09/2026).
+        .route("/coffrets", get(albums::lister_coffrets))
+        .route("/coffrets/{id}/defaire", post(albums::defaire_coffret))
         .route(
             "/albums/disques-abimes/reparer",
             post(albums::reparer_disques),
@@ -282,7 +309,37 @@ pub fn router() -> Router<AppState> {
             "/albums/{id}",
             get(albums::get_album).put(albums::update_album),
         )
+        // Le mode « Modifier » de la fiche album (GO du 25/09/2026) : champs,
+        // mode de compilation, disques (ordre, noms, pistes), et les deux
+        // gestes sur les disques d'un coffret.
+        .route(
+            "/albums/{id}/edition",
+            get(edition::lire).put(edition::modifier),
+        )
+        // Tranche 4 : reporter l'édition dans les BALISES des fichiers
+        // (`{ dry_run }` rend le plan sans rien écrire).
+        .route(
+            "/albums/{id}/edition/write-tags",
+            post(edition_balises::ecrire_balises),
+        )
+        .route("/albums/{id}/discs/attach", post(edition::attacher))
+        .route(
+            "/albums/{id}/discs/{number}/detach",
+            post(edition::detacher),
+        )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
+        // #4907 — le répertoire depuis lequel lire un album.
+        .route(
+            "/albums/{id}/repertoire-prefere",
+            get(exemplaires::preference_get)
+                .put(exemplaires::preference_put)
+                .delete(exemplaires::preference_delete),
+        )
+        // #4907 — l'ordre des dossiers de musique, à qualité égale.
+        .route(
+            "/repertoires/ordre",
+            get(exemplaires::ordre_get).put(exemplaires::ordre_put),
+        )
         .route("/albums/{id}/aussi-sur", get(albums::album_aussi_sur))
         .route(
             "/albums/{id}/metadata",
@@ -296,6 +353,17 @@ pub fn router() -> Router<AppState> {
         .route(
             "/tracks/{id}/ban",
             post(tracks::ban_track).delete(tracks::unban_track),
+        )
+        // Titres de SERVICE bannis (#4806 suite, FabienM fil 1946 réponse
+        // 6820). Deux `POST` plutôt qu'un `POST` et un `DELETE` de chemin :
+        // la désignation `source` + `source_id` voyage dans le CORPS, parce
+        // qu'un `source_id` peut contenir une barre oblique — la forme de
+        // `/tags/{id}/streaming-items` (#3699). Le segment fixe `streaming`
+        // passe avant `{id}` dans le routeur.
+        .route("/tracks/streaming/ban", post(tracks::ban_streaming_track))
+        .route(
+            "/tracks/streaming/unban",
+            post(tracks::unban_streaming_track),
         )
         // PUT mirrors POST /metadata/tracks/{id}/edit so track editing lives on
         // the same REST family as albums/artists (PUT /library/…/{id}).
@@ -507,6 +575,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/dr/gravure",
             get(graver_dr::statut).post(graver_dr::lancer),
+        )
+        // 25/09/2026 — le compositeur des CRÉDITS descend dans la colonne ET
+        // dans la balise du fichier. La balise est indispensable : `update_batch`
+        // reconstruit `tracks.composer` à partir du fichier seul dès qu'un scan
+        // complet est armé, et défairait sinon chaque correction.
+        .route(
+            "/composer-from-credits",
+            get(compositeur_depuis_credits::statut).post(compositeur_depuis_credits::lancer),
         )
         // Phase 4 du chantier « tag compilation » : réparer l'existant (C3).
         .route(

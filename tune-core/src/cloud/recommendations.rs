@@ -51,7 +51,7 @@ pub async fn generate_recommendations(
 
     let artist_names: Vec<String> = top_artists
         .iter()
-        .filter_map(|r| r.get(0).and_then(|v| v.as_string()))
+        .filter_map(|r| r.first().and_then(|v| v.as_string()))
         .collect();
 
     // Query MusicBrainz for similar artists (via tags)
@@ -60,7 +60,7 @@ pub async fn generate_recommendations(
             Some(id) => id,
             None => continue,
         };
-        let artist_name = row.get(0).and_then(|v| v.as_string()).unwrap_or_default();
+        let artist_name = row.first().and_then(|v| v.as_string()).unwrap_or_default();
 
         let resp = mb_client
             .get(format!("https://musicbrainz.org/ws/2/artist/{mb_id}"))
@@ -68,70 +68,63 @@ pub async fn generate_recommendations(
             .send()
             .await;
 
-        if let Ok(r) = resp {
-            if r.status().is_success() {
-                if let Ok(data) = r.json::<serde_json::Value>().await {
-                    // Get the artist's top tags
-                    let tags: Vec<String> = data["tags"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|t| t["name"].as_str().map(String::from))
-                                .take(3)
-                                .collect()
-                        })
-                        .unwrap_or_default();
+        if let Ok(r) = resp
+            && r.status().is_success()
+            && let Ok(data) = r.json::<serde_json::Value>().await
+        {
+            // Get the artist's top tags
+            let tags: Vec<String> = data["tags"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| t["name"].as_str().map(String::from))
+                        .take(3)
+                        .collect()
+                })
+                .unwrap_or_default();
 
-                    if !tags.is_empty() {
-                        // Search for other artists with similar tags
-                        let tag_query = tags
+            if !tags.is_empty() {
+                // Search for other artists with similar tags
+                let tag_query = tags
+                    .iter()
+                    .map(|t| format!("tag:{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+                let search_resp = mb_client
+                    .get("https://musicbrainz.org/ws/2/artist")
+                    .query(&[
+                        ("query", tag_query.as_str()),
+                        ("fmt", "json"),
+                        ("limit", "5"),
+                    ])
+                    .send()
+                    .await;
+
+                if let Ok(sr) = search_resp
+                    && sr.status().is_success()
+                    && let Ok(search_data) = sr.json::<serde_json::Value>().await
+                    && let Some(artists) = search_data["artists"].as_array()
+                {
+                    for similar in artists {
+                        let sim_name = similar["name"].as_str().unwrap_or("").to_string();
+                        // Skip if already in library
+                        if artist_names
                             .iter()
-                            .map(|t| format!("tag:{t}"))
-                            .collect::<Vec<_>>()
-                            .join(" AND ");
-                        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-
-                        let search_resp = mb_client
-                            .get("https://musicbrainz.org/ws/2/artist")
-                            .query(&[
-                                ("query", tag_query.as_str()),
-                                ("fmt", "json"),
-                                ("limit", "5"),
-                            ])
-                            .send()
-                            .await;
-
-                        if let Ok(sr) = search_resp {
-                            if sr.status().is_success() {
-                                if let Ok(search_data) = sr.json::<serde_json::Value>().await {
-                                    if let Some(artists) = search_data["artists"].as_array() {
-                                        for similar in artists {
-                                            let sim_name =
-                                                similar["name"].as_str().unwrap_or("").to_string();
-                                            // Skip if already in library
-                                            if artist_names.iter().any(|n| {
-                                                n.to_lowercase() == sim_name.to_lowercase()
-                                            }) {
-                                                continue;
-                                            }
-                                            let score = similar["score"].as_i64().unwrap_or(0)
-                                                as f64
-                                                / 100.0;
-                                            recommendations.push(Recommendation {
-                                                recommended_album: format!("Discover {sim_name}"),
-                                                recommended_artist: sim_name,
-                                                reason: Some(format!(
-                                                    "Parce que vous écoutez {artist_name}"
-                                                )),
-                                                musicbrainz_release_group_id: None,
-                                                cover_url: None,
-                                                confidence: score,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
+                            .any(|n| n.to_lowercase() == sim_name.to_lowercase())
+                        {
+                            continue;
                         }
+                        let score = similar["score"].as_i64().unwrap_or(0) as f64 / 100.0;
+                        recommendations.push(Recommendation {
+                            recommended_album: format!("Discover {sim_name}"),
+                            recommended_artist: sim_name,
+                            reason: Some(format!("Parce que vous écoutez {artist_name}")),
+                            musicbrainz_release_group_id: None,
+                            cover_url: None,
+                            confidence: score,
+                        });
                     }
                 }
             }

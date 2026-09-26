@@ -29,6 +29,55 @@ pub fn borner(amount: f64, delay_ms: f64) -> (f64, f64) {
     )
 }
 
+/// #5081 — le réglage d'ombre de la tête et ses bornes, tels que le greffon
+/// les définit : une seule source pour les routes et l'orchestrateur.
+pub use tune_plugin_crossfeed::{
+    COUPURE_DEFAUT_HZ, COUPURE_MAX_HZ, COUPURE_MIN_HZ, OmbreDeTete, PENTE_DEFAUT_DB_OCT,
+    PENTE_MAX_DB_OCT, PENTE_MIN_DB_OCT,
+};
+
+/// #5081 — le réglage d'ombre de la tête ramené dans ses bornes (coupure
+/// 200 Hz – 20 kHz, pente 3 – 6 dB/oct) ; un NaN retombe sur le défaut
+/// (700 Hz, 6 dB/oct). Mêmes bornes que le greffon, qui refuse le hors-bornes :
+/// une seule définition, `tune_plugin_crossfeed::OmbreDeTete::bornee`.
+pub fn borner_ombre(cutoff_hz: f64, slope_db_per_octave: f64) -> (f64, f64) {
+    let o = tune_plugin_crossfeed::OmbreDeTete {
+        cutoff_hz: cutoff_hz as f32,
+        slope_db_per_octave: slope_db_per_octave as f32,
+    }
+    .bornee();
+    (f64::from(o.cutoff_hz), f64::from(o.slope_db_per_octave))
+}
+
+/// #5081 — l'ombre de la tête telle qu'un réglage JSON de crossfeed la porte
+/// (`zone_{id}_crossfeed`, un préréglage, un corps de `PUT /zones/{id}/dsp`) :
+/// `{ head_shadow_enabled, cutoff_hz, slope_db_per_octave }`. `None` quand
+/// l'interrupteur est éteint ou ABSENT — un réglage écrit avant #5081 se relit
+/// filtre éteint. Les valeurs sont bornées.
+pub fn ombre_du_reglage(reglage: &serde_json::Value) -> Option<tune_plugin_crossfeed::OmbreDeTete> {
+    if !reglage
+        .get("head_shadow_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let (cutoff_hz, slope) = borner_ombre(
+        reglage
+            .get("cutoff_hz")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::from(tune_plugin_crossfeed::COUPURE_DEFAUT_HZ)),
+        reglage
+            .get("slope_db_per_octave")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::from(tune_plugin_crossfeed::PENTE_DEFAUT_DB_OCT)),
+    );
+    Some(tune_plugin_crossfeed::OmbreDeTete {
+        cutoff_hz: cutoff_hz as f32,
+        slope_db_per_octave: slope as f32,
+    })
+}
+
 pub struct CrossfeedProcessor {
     engine: CrossfeedEngine,
     amount: f32,
@@ -36,16 +85,112 @@ pub struct CrossfeedProcessor {
     /// #4685 — niveau moyen du filtre, calculé UNE fois à la construction
     /// (voir [`Self::gain_moyen_db`]).
     gain_moyen_db: f64,
+    /// #5081 — le filtre d'ombre de la tête, `None` s'il est éteint.
+    ombre: Option<tune_plugin_crossfeed::OmbreDeTete>,
+    /// Étages des greffons natifs tiers (`super::natifs_tiers`), appliqués
+    /// APRÈS le crossfeed intégré, dans l'ordre des identifiants. Vide pour un
+    /// crossfeed seul : le chemin reste alors celui d'avant, à l'octet près.
+    tiers: Vec<EtageTiers>,
+}
+struct EtageTiers {
+    id: String,
+    stage: tune_plugin_native::stage::Stage,
 }
 enum CrossfeedEngine {
     Bundled(tune_plugin_crossfeed::CrossfeedProcessor),
     Native(tune_plugin_native::stage::Stage),
     Unavailable,
+    /// Crossfeed intégré non demandé : seul(s) le(s) étage(s) tiers
+    /// traite(nt) le signal.
+    Aucun,
 }
 impl CrossfeedProcessor {
+    /// L'étage casque de la chaîne : le crossfeed intégré s'il est demandé
+    /// (`reglage` = `(amount, delay_ms)`), puis les étages des greffons natifs
+    /// tiers demandés par la zone. Un étage tiers que son greffon refuse de
+    /// préparer est journalisé et écarté, sans toucher aux autres.
+    pub fn composer(
+        sample_rate: u32,
+        reglage: Option<(f32, f32)>,
+        tiers: &[(String, serde_json::Value)],
+    ) -> Self {
+        Self::composer_avec_ombre(sample_rate, reglage, None, tiers)
+    }
+
+    /// [`Self::composer`], avec le filtre d'ombre de la tête (#5081) sur le
+    /// crossfeed intégré quand `ombre` est `Some`. Sans crossfeed intégré,
+    /// l'ombre n'a rien sur quoi porter : elle est ignorée.
+    pub fn composer_avec_ombre(
+        sample_rate: u32,
+        reglage: Option<(f32, f32)>,
+        ombre: Option<tune_plugin_crossfeed::OmbreDeTete>,
+        tiers: &[(String, serde_json::Value)],
+    ) -> Self {
+        let mut processeur = match reglage {
+            Some((amount, delay_ms)) => Self::avec_ombre(sample_rate, amount, delay_ms, ombre),
+            None => Self {
+                engine: CrossfeedEngine::Aucun,
+                amount: 0.0,
+                delay_samples: 0,
+                gain_moyen_db: 0.0,
+                ombre: None,
+                tiers: Vec::new(),
+            },
+        };
+        for (id, reglage) in tiers {
+            // Directement au registre natif, sans passer par
+            // `super::natifs_tiers` : ce fichier est aussi compilé SEUL par
+            // l'oracle de parité DSP (`sdk/scripts/verify_dsp_parity.py`). Les
+            // appelants ont déjà filtré les identifiants admissibles.
+            let Some(fournisseur) = tune_plugin_native::provider(id).filter(|library| {
+                library.manifest.kind == tune_plugin_sdk::manifest::PluginKind::Dsp
+                    && tune_plugin_native::failure(id).is_none()
+            }) else {
+                continue;
+            };
+            match tune_plugin_native::stage::Stage::prepare(fournisseur, sample_rate, 2, reglage) {
+                Ok(stage) => processeur.tiers.push(EtageTiers {
+                    id: id.clone(),
+                    stage,
+                }),
+                Err(error) => {
+                    tracing::error!(plugin = %id, %error, "native_third_party_prepare_failed")
+                }
+            }
+        }
+        processeur
+    }
+
+    /// Nombre d'étages tiers réellement préparés.
+    pub fn etages_tiers(&self) -> usize {
+        self.tiers.len()
+    }
+
     pub fn new(sample_rate: u32, amount: f32, delay_ms: f32) -> Self {
-        let reference =
-            tune_plugin_crossfeed::CrossfeedProcessor::new(sample_rate, amount, delay_ms);
+        Self::avec_ombre(sample_rate, amount, delay_ms, None)
+    }
+
+    /// #5081 — [`Self::new`], avec le filtre d'ombre de la tête sur le terme
+    /// croisé quand `ombre` est `Some`. `None` : exactement [`Self::new`].
+    pub fn avec_ombre(
+        sample_rate: u32,
+        amount: f32,
+        delay_ms: f32,
+        ombre: Option<tune_plugin_crossfeed::OmbreDeTete>,
+    ) -> Self {
+        let reference = tune_plugin_crossfeed::CrossfeedProcessor::avec_ombre(
+            sample_rate,
+            amount,
+            delay_ms,
+            ombre,
+        );
+        let ombre = reference.ombre();
+        let (cutoff_hz, slope_db_per_octave) = ombre
+            .map(|o| (o.cutoff_hz, o.slope_db_per_octave))
+            .unwrap_or((
+                tune_plugin_crossfeed::COUPURE_DEFAUT_HZ,
+                tune_plugin_crossfeed::PENTE_DEFAUT_DB_OCT,
+            ));
         let delay_samples = reference.delay_samples();
         let engine = if tune_plugin_native::failure("crossfeed").is_some() {
             CrossfeedEngine::Unavailable
@@ -54,7 +199,14 @@ impl CrossfeedProcessor {
                 provider,
                 sample_rate,
                 2,
-                &serde_json::json!({"enabled":amount!=0.0,"amount":amount,"delay_ms":delay_ms}),
+                &serde_json::json!({
+                    "enabled": amount != 0.0,
+                    "amount": amount,
+                    "delay_ms": delay_ms,
+                    "head_shadow_enabled": ombre.is_some(),
+                    "cutoff_hz": cutoff_hz,
+                    "slope_db_per_octave": slope_db_per_octave,
+                }),
             ) {
                 Ok(stage) => CrossfeedEngine::Native(stage),
                 Err(error) => {
@@ -69,14 +221,22 @@ impl CrossfeedProcessor {
         let gain_moyen_db = if matches!(engine, CrossfeedEngine::Unavailable) {
             0.0
         } else {
-            tune_plugin_crossfeed::gain_moyen_db(sample_rate, amount, delay_ms)
+            tune_plugin_crossfeed::gain_moyen_db_avec_ombre(sample_rate, amount, delay_ms, ombre)
         };
         Self {
             engine,
             amount,
             delay_samples,
             gain_moyen_db,
+            ombre,
+            tiers: Vec::new(),
         }
+    }
+
+    /// #5081 — le réglage d'ombre de ce processeur (borné), `None` s'il est
+    /// éteint. C'est lui qui entre dans la clé du cache de transcodage.
+    pub fn ombre(&self) -> Option<tune_plugin_crossfeed::OmbreDeTete> {
+        self.ombre
     }
 
     /// #4685 — ce que ce crossfeed fait gagner ou perdre au niveau MOYEN d'un
@@ -94,7 +254,12 @@ impl CrossfeedProcessor {
                     tracing::error!(%error,"native_crossfeed_processing_failed");
                 }
             }
-            CrossfeedEngine::Unavailable => {}
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_f32(samples) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
         }
     }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
@@ -108,7 +273,12 @@ impl CrossfeedProcessor {
                     tracing::error!(%error,"native_crossfeed_processing_failed");
                 }
             }
-            CrossfeedEngine::Unavailable => {}
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_pcm(pcm, bit_depth) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
         }
     }
     pub fn inherit_state_from(&mut self, previous: &Self) {
@@ -123,9 +293,21 @@ impl CrossfeedProcessor {
             }
             _ => {}
         }
+        // Chaque étage tiers reprend l'historique de SON prédécesseur, trouvé
+        // par identifiant : un étage ajouté ou retiré ne décale pas les autres.
+        for etage in &mut self.tiers {
+            if let Some(ancien) = previous.tiers.iter().find(|a| a.id == etage.id) {
+                if let Err(error) = etage.stage.inherit(&ancien.stage) {
+                    tracing::debug!(plugin = %etage.id, %error, "native_third_party_history_not_compatible");
+                }
+            }
+        }
     }
     pub fn amount(&self) -> f32 {
-        if matches!(self.engine, CrossfeedEngine::Unavailable) {
+        if matches!(
+            self.engine,
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun
+        ) {
             0.0
         } else {
             self.amount
@@ -1089,5 +1271,54 @@ mod tests {
             "`StreamingDsp::process` n'applique plus le crossfeed : il est \
              chargé, transporté, et jeté sans être exécuté"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #5081 — l'ombre de la tête, lue depuis un réglage JSON.
+    // -----------------------------------------------------------------
+
+    /// Un réglage écrit avant #5081 (sans les champs) ou interrupteur éteint
+    /// se relit filtre ÉTEINT ; allumé sans valeurs, il prend 700 Hz / 6 dB ;
+    /// les valeurs hors bornes sont ramenées dans l'échelle.
+    #[test]
+    fn un_reglage_sans_les_champs_se_relit_filtre_eteint_5081() {
+        use serde_json::json;
+        assert_eq!(
+            ombre_du_reglage(&json!({"enabled":true,"amount":0.3})),
+            None
+        );
+        assert_eq!(
+            ombre_du_reglage(&json!({"head_shadow_enabled":false,"cutoff_hz":1200.0})),
+            None
+        );
+        let o = ombre_du_reglage(&json!({"head_shadow_enabled":true})).unwrap();
+        assert_eq!((o.cutoff_hz, o.slope_db_per_octave), (700.0, 6.0));
+        let o = ombre_du_reglage(
+            &json!({"head_shadow_enabled":true,"cutoff_hz":50000.0,"slope_db_per_octave":1.0}),
+        )
+        .unwrap();
+        assert_eq!((o.cutoff_hz, o.slope_db_per_octave), (20_000.0, 3.0));
+    }
+
+    /// L'hôte transmet le filtre au moteur : le processeur le porte, et la
+    /// compensation de niveau (#4685) en tient compte.
+    #[test]
+    fn l_hote_construit_le_filtre_et_sa_compensation_5081() {
+        let ombre = tune_plugin_crossfeed::OmbreDeTete {
+            cutoff_hz: 1200.0,
+            slope_db_per_octave: 3.0,
+        };
+        let sans = CrossfeedProcessor::new(48_000, 0.4, 0.7);
+        let avec = CrossfeedProcessor::avec_ombre(48_000, 0.4, 0.7, Some(ombre));
+        assert_eq!(sans.ombre(), None);
+        assert_eq!(avec.ombre(), Some(ombre));
+        assert_ne!(sans.gain_moyen_db(), avec.gain_moyen_db());
+        let signal: Vec<f32> = (0..2048).map(|i| (i as f32 * 0.9).sin() * 0.4).collect();
+        let (mut a, mut b) = (signal.clone(), signal);
+        let mut sans = sans;
+        let mut avec = avec;
+        sans.process_interleaved(&mut a);
+        avec.process_interleaved(&mut b);
+        assert_ne!(a, b, "le filtre d'ombre n'a pas atteint le moteur");
     }
 }

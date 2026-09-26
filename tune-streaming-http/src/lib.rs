@@ -521,6 +521,16 @@ where
             "/{service}/albums/{album_id}/context",
             get(service_album_context),
         )
+        // #4993 — crédits d'une piste et d'un album de SERVICE, dans la forme
+        // de `/library/tracks/{id}/credits` (501 si le service n'en a pas).
+        .route(
+            "/{service}/tracks/{track_id}/credits",
+            get(service_track_credits),
+        )
+        .route(
+            "/{service}/albums/{album_id}/credits",
+            get(service_album_credits),
+        )
         .route("/{service}/playlist-tags", get(service_playlist_tags))
         .route(
             "/{service}/featured-playlists",
@@ -976,6 +986,29 @@ async fn service_album_context(
         .await)
 }
 
+/// #4993 — crédits d'une piste de service (FabienM, fil forum 1921). Même
+/// forme JSON que `GET /library/tracks/{id}/credits` ; `track_id` est
+/// l'identifiant SUR LE SERVICE. Service sans source de crédits : 501.
+async fn service_track_credits(
+    State(state): State<StreamingHttpState>,
+    Path((service, track_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_track_credits(&track_id)
+        .await)
+}
+
+/// #4993 — crédits de toutes les pistes d'un album de service, chaque ligne
+/// portant sa piste, comme `GET /library/albums/{id}/credits`.
+async fn service_album_credits(
+    State(state): State<StreamingHttpState>,
+    Path((service, album_id)): Path<(String, String)>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc
+        .get_album_credits(&album_id)
+        .await)
+}
+
 // ---------------------------------------------------------------------------
 // Mutable handlers (via with_svc_mut!)
 
@@ -1248,8 +1281,13 @@ fn borne_plus_comme_ca(limit: Option<usize>) -> usize {
 ///  - 502 : le titre source n'a pas pu être lu chez le service ;
 ///  - 200 `[]` : aucun voisin trouvé — une réponse, pas une panne.
 ///
-/// Titres bannis : la radio n'en exclut aucun sur cette base (la fonction
-/// `banned` de #4818 n'y est pas) ; la route suit la radio.
+/// Titres bannis (#4806 suite) : la route suit la radio de fin de file
+/// (`autoplay_streaming_radio`) — un titre de ce service banni par le profil
+/// actif du serveur n'est jamais proposé, et l'exclusion se fait AVANT le
+/// tirage pour que la borne se tienne en titres jouables. Le profil est celui
+/// des sélections automatiques (`profil_de_selection_automatique`) : ce
+/// routeur ne porte pas l'extracteur `ActiveProfile`, qui vit dans
+/// `tune-server`.
 async fn service_track_similar(
     State(state): State<StreamingHttpState>,
     Path((service, track_id)): Path<(String, String)>,
@@ -1288,6 +1326,11 @@ async fn service_track_similar(
     if !source.id.is_empty() {
         exclure.insert(source.id.clone());
     }
+    tune_core::db::hidden_repo::exclure_les_titres_de_service_bannis(
+        &state.backend,
+        &service,
+        &mut exclure,
+    );
     let similaires = tune_core::playback::auto_dj::pistes_similaires_du_service(
         &arc,
         &source.artist,
@@ -2682,8 +2725,8 @@ mod temoin_statut_du_refus_i859 {
     use tune_core::TuneError;
     use tune_core::db::sqlite::SqliteDb;
     use tune_core::streaming::traits::{
-        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack,
-        StreamUrl,
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamCredit, StreamPlaylist,
+        StreamTrack, StreamUrl,
     };
 
     /// Ce que le connecteur simulé fait de `get_user_playlists`.
@@ -2694,6 +2737,8 @@ mod temoin_statut_du_refus_i859 {
         Refuse,
         /// L'amont est injoignable — la seule situation qu'un 502 décrit.
         PasserelleEnPanne,
+        /// #4993 — un service qui SAIT créditer ses pistes.
+        Credite,
     }
 
     const REFUS: &str = "Bandcamp ne fournit pas de playlists";
@@ -2756,7 +2801,31 @@ mod temoin_statut_du_refus_i859 {
         async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
             match self.humeur {
                 Humeur::Refuse => Err(TuneError::Unsupported(REFUS.into())),
-                Humeur::PasserelleEnPanne => Err(TuneError::Streaming(PANNE.into())),
+                Humeur::PasserelleEnPanne | Humeur::Credite => {
+                    Err(TuneError::Streaming(PANNE.into()))
+                }
+            }
+        }
+        /// #4993 — seule l'humeur `Credite` sait créditer une piste.
+        /// `get_album_credits` n'est PAS surchargé : l'essai du 501 interroge
+        /// le défaut du trait par la route d'album.
+        async fn get_track_credits(&self, t: &str) -> Result<Vec<StreamCredit>, TuneError> {
+            match self.humeur {
+                Humeur::Credite => Ok(vec![StreamCredit {
+                    id: None,
+                    track_id: t.to_string(),
+                    artist_id: None,
+                    artist_name: "Martha Argerich".into(),
+                    role: "performer".into(),
+                    instrument: Some("piano".into()),
+                    position: 0,
+                    track_title: None,
+                    track_number: None,
+                    disc_number: None,
+                }]),
+                _ => Err(TuneError::Unsupported(
+                    "credits not supported for this service".into(),
+                )),
             }
         }
         async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -2878,6 +2947,70 @@ mod temoin_statut_du_refus_i859 {
                 "le contexte ne doit pas journaliser les paramètres privés"
             );
         }
+    }
+
+    /// #4993 — les routes de crédits de service sont branchées : la forme
+    /// JSON est celle de `/library/tracks/{id}/credits` (`id` et `artist_id`
+    /// à `null`, `track_id` en chaîne), et un service sans source de crédits
+    /// répond 501 — le client garde alors l'entrée absente.
+    #[tokio::test]
+    async fn credits_de_service_4993_forme_de_la_bibliotheque_et_501_sinon() {
+        use tower::ServiceExt;
+        use tracing::instrument::WithSubscriber;
+        let (state, name) = etat("credits-4993", Humeur::Credite);
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(state));
+        // Le 501 passe par `contexte_diagnostic_streaming`, qui journalise
+        // `streaming_service_error`. Sans abonné PROPRE à cet essai, ce site
+        // d'appel était enregistré sous le seul abonné global (muet) en même
+        // temps que `diagnostic_4039…` posait le sien : le cache d'intérêt de
+        // `tracing` pouvait alors taire l'évènement que l'autre essai attend
+        // (5 rouges sur 60 mesurés sur Shrek, 0 sur 60 sans cet essai).
+        let appel = |chemin: String| {
+            let app = app.clone();
+            async move {
+                let abonne = tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(std::io::sink)
+                    .finish();
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(chemin)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .with_subscriber(abonne)
+                .await
+                .unwrap()
+            }
+        };
+
+        let r = appel(format!("/api/v1/streaming/{name}/tracks/q-11/credits")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::OK,
+            "GET /streaming/{{service}}/tracks/{{id}}/credits doit exister (#4993)"
+        );
+        let corps: Value = serde_json::from_str(&texte(r).await).unwrap();
+        assert_eq!(
+            corps,
+            json!([{
+                "id": null,
+                "track_id": "q-11",
+                "artist_id": null,
+                "artist_name": "Martha Argerich",
+                "role": "performer",
+                "instrument": "piano",
+                "position": 0,
+            }]),
+            "même forme, champ pour champ, que /library/tracks/{{id}}/credits"
+        );
+
+        let r = appel(format!("/api/v1/streaming/{name}/albums/a-1/credits")).await;
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_IMPLEMENTED,
+            "un service sans crédits d'album répond 501, pas 404 ni 502"
+        );
     }
 
     /// Le défaut mesuré : `GET /streaming/{service}/playlists` sur un

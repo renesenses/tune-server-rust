@@ -698,11 +698,10 @@ impl RingStarvation {
             missing_samples: self.missing_samples.load(Ordering::Relaxed),
             served_samples: served,
             driver_underruns: self.driver_underruns.load(Ordering::Relaxed),
-            stream_ms: if cadence == 0 {
-                0
-            } else {
-                served.saturating_mul(1000) / cadence
-            },
+            stream_ms: served
+                .saturating_mul(1000)
+                .checked_div(cadence)
+                .unwrap_or(0),
         }
     }
 }
@@ -1615,7 +1614,7 @@ impl PuitsDEchantillons for CaptureOutput {
         if mots.is_empty() {
             self.blocs_vides += 1;
         }
-        if self.format.canaux != 0 && mots.len() % usize::from(self.format.canaux) != 0 {
+        if self.format.canaux != 0 && !mots.len().is_multiple_of(usize::from(self.format.canaux)) {
             self.blocs_non_alignes += 1;
         }
         self.mots += mots.len() as u64;
@@ -2173,6 +2172,25 @@ pub trait OutputTarget: Send + Sync {
     /// reprennent comme avant.
     fn device_released_on_pause(&self) -> bool {
         false
+    }
+
+    /// #5050 — la position que l'appareil DÉCLARE jouer, lue chez lui à
+    /// l'instant de l'appel.
+    ///
+    /// Sert au rattrapage qui suit une reprise sur un renderer réseau : l'hôte
+    /// n'envoie plus le `Seek` à la position de la pause que si l'appareil
+    /// n'y est pas déjà (le Beosound Stage répond à ce Seek superflu par une
+    /// transition pendant laquelle il refuse la Pause en 701).
+    ///
+    /// Ce n'est PAS `get_status().position_ms` : ce champ vaut 0 quand la
+    /// réponse est illisible, et peut être une extrapolation (mode silence
+    /// UPnP) — ni l'un ni l'autre ne dit où l'appareil en est vraiment.
+    ///
+    /// `None` = pas de mesure. L'hôte garde alors la conduite d'avant : il
+    /// envoie le `Seek`. C'est le défaut, donc une sortie qui ne sait pas
+    /// répondre ne change pas de comportement.
+    async fn position_mesuree_ms(&self) -> Option<u64> {
+        None
     }
 
     fn host(&self) -> Option<&str> {

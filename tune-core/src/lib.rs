@@ -13,6 +13,7 @@ pub mod cadence;
 pub mod chemins_de_travail;
 pub mod cloud;
 pub mod collaborative;
+pub mod confidentialite;
 pub mod config;
 pub mod config_backup;
 pub mod credentials_vault;
@@ -67,6 +68,7 @@ pub mod slimproto;
 pub mod smb_discovery;
 pub mod social;
 pub mod source_pcm;
+pub mod sources_physiques;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;
@@ -103,6 +105,9 @@ pub fn rustc_version() -> &'static str {
 }
 
 /// List of cargo features enabled at compile time.
+// Chaque `push` dépend d'un `cfg` : un `vec![]` littéral ne sait pas les
+// porter (clippy 1.98, `vec_init_then_push`).
+#[allow(clippy::vec_init_then_push)]
 pub fn enabled_features() -> Vec<&'static str> {
     let mut features = Vec::new();
     #[cfg(feature = "local-audio")]

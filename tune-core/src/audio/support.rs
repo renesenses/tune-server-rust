@@ -274,7 +274,8 @@ fn motif_de_refus(ext: &str, precision: Option<&str>) -> String {
 
 /// DSDIFF minimal, mais structurellement valide, dont le payload est annoncé
 /// DST. Gardé octet pour octet comme témoin commun du contrat scanner/décodeur.
-#[cfg(test)]
+// Seules les épreuves du refus DST (sans la feature `dst`) s'en servent.
+#[cfg(all(test, not(feature = "dst")))]
 pub(crate) fn dff_dst_minimal_fixture() -> Vec<u8> {
     let mut fver = Vec::new();
     fver.extend_from_slice(b"FVER");

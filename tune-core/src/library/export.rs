@@ -107,8 +107,8 @@ impl ExportService {
             } else {
                 String::new()
             });
-            for i in 8..15 {
-                record.push(val(&row[i]));
+            for cellule in &row[8..15] {
+                record.push(val(cellule));
             }
             wtr.write_record(&record).map_err(|e| e.to_string())?;
         }
