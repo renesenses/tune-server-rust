@@ -4,7 +4,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::artist_repo::ArtistRepo;
@@ -2219,66 +2218,6 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     tracing::warn!(error = %e, "post_scan_album_genre_refresh_failed");
                 }
             }
-            // Merge duplicate local albums (same title, case-insensitive).
-            // After a rescan, tag changes can create a second album entry for
-            // tracks that already belonged to an existing album (e.g. when
-            // album_artist changed). Merging moves all tracks to the album
-            // with the most tracks, so the orphan cleanup below can delete the
-            // now-empty duplicate. This is the definitive fix for bug #593
-            // ("Doublons pochettes albums apres rescan").
-            {
-                let dupe_rows = db.query_many(
-                    "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums \
-                     WHERE source = 'local' \
-                     GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
-                    &[],
-                ).ou_defaut_journalise();
-                let dupes: Vec<(String, String)> = dupe_rows.iter().map(|r| {
-                    (r[0].as_string().unwrap_or_default(), r[1].as_string().unwrap_or_default())
-                }).collect();
-                let mut merged_albums = 0usize;
-                for (_title, ids_str) in &dupes {
-                    let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
-                    if ids.len() < 2 {
-                        continue;
-                    }
-                    // Keep the album with the most tracks
-                    let mut best_id = ids[0];
-                    let mut best_count = 0i64;
-                    for &aid in &ids {
-                        let cnt = db.query_one(
-                            "SELECT COUNT(id) FROM tracks WHERE album_id = ?",
-                            &[&aid],
-                        ).ok().flatten().and_then(|r| r[0].as_i64()).unwrap_or(0);
-                        if cnt > best_count {
-                            best_count = cnt;
-                            best_id = aid;
-                        }
-                    }
-                    for &aid in &ids {
-                        if aid != best_id {
-                            db.execute(
-                                "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                                &[&best_id, &aid],
-                            ).ok();
-                            db.execute(
-                                "DELETE FROM albums WHERE id = ?",
-                                &[&aid],
-                            ).ok();
-                            merged_albums += 1;
-                        }
-                    }
-                }
-                if merged_albums > 0 {
-                    // Refresh track_count for albums that received tracks from merged duplicates
-                    db.execute_batch(&format!(
-                        "UPDATE albums SET track_count = {}",
-                        tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
-                    ))
-                    .ok();
-                    tracing::info!(merged_albums, "post_scan_duplicate_albums_merged");
-                }
-            }
             // Remove orphan albums with 0 tracks (created by interrupted scans or tag changes)
             let orphan_albums = db.execute(
                 "DELETE FROM albums WHERE id IN (\
@@ -2417,6 +2356,31 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     tracing::warn!(error = %e, "post_scan_album_distinct_pairs_reconcile_failed")
                 }
             }
+        }
+
+        // Merge duplicate local albums (same title, case-insensitive, same
+        // artist). After a rescan, tag changes can create a second album entry
+        // for tracks that already belonged to an existing album — bug #593
+        // ("Doublons pochettes albums apres rescan").
+        //
+        // Reste de #5005 : la logique est celle de la fusion manuelle et du
+        // nettoyage (`FusionDesDoublons`). Écrite dans la transaction plus
+        // haut avec `GROUP_CONCAT` en dur, elle ne tournait jamais sur
+        // PostgreSQL (erreur avalée), et elle fusionnait des paires déclarées
+        // distinctes (#1276). Elle vient APRÈS la réconciliation des paires :
+        // un scan qui renouvelle les rowids laisse jusque-là les arbitrages
+        // pointer des albums morts, et la fusion ne les verrait pas.
+        match tune_core::db::album_doublons::FusionDesDoublons::with_backend(db.clone())
+            .fusionner(tune_core::db::album_doublons::Declencheur::FinDeScan)
+        {
+            Ok(bilan) if bilan.fusionnes > 0 => {
+                tracing::info!(
+                    merged_albums = bilan.fusionnes,
+                    "post_scan_duplicate_albums_merged"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "post_scan_duplicate_albums_merge_failed"),
         }
 
         // Backfill embedded cover art for local albums still missing a cover.

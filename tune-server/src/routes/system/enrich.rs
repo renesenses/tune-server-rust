@@ -1106,7 +1106,14 @@ pub(super) async fn cleanup(
     let album_repo = AlbumRepo::with_backend(state.backend.clone());
     let artist_repo = ArtistRepo::with_backend(state.backend.clone());
 
-    let merged_albums = merge_duplicate_albums(&state.backend)?;
+    // La fusion commune (reste de #5005) : paires distinctes respectées,
+    // absorption complète, plafond automatique. Elle écrivait `GROUP_CONCAT`
+    // en dur et ne tournait jamais sur PostgreSQL.
+    let doublons =
+        tune_core::db::album_doublons::FusionDesDoublons::with_backend(state.backend.clone())
+            .fusionner(tune_core::db::album_doublons::Declencheur::Nettoyage)
+            .map_err(|e| AppError::internal(e.to_string()))?;
+    let merged_albums = doublons.fusionnes as i64;
     let orphan_albums = album_repo.delete_orphans().unwrap_or(0);
     let orphan_artists = artist_repo.cleanup_orphans().unwrap_or(0);
     let tracks = TrackRepo::with_backend(state.backend.clone())
@@ -1126,72 +1133,14 @@ pub(super) async fn cleanup(
 
     Ok(Json(json!({
         "duplicate_albums_merged": merged_albums,
+        "duplicate_albums_protected": doublons.proteges,
+        "duplicate_albums_suspended": doublons.suspendus,
         "orphan_albums_deleted": orphan_albums,
         "orphan_artists_deleted": orphan_artists,
         "duplicate_tracks_removed": tracks,
         "orphan_artwork_deleted": orphan_artwork,
         "db_optimized": db_optimized,
     })))
-}
-
-fn merge_duplicate_albums(
-    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
-) -> Result<i64, AppError> {
-    // Group by (LOWER(title), artist_id) so that albums with the same title
-    // but different artists are NOT merged (e.g. "One by One" by Grey Reverend
-    // vs "One by One" by Robert Francis).
-    let dupe_rows = db.query_many(
-        "SELECT LOWER(title), GROUP_CONCAT(id) FROM albums WHERE source = 'local' GROUP BY LOWER(title), artist_id HAVING COUNT(id) > 1",
-        &[],
-    ).ou_defaut_journalise();
-    let dupes: Vec<(String, String)> = dupe_rows
-        .iter()
-        .map(|r| {
-            (
-                r[0].as_string().unwrap_or_default(),
-                r[1].as_string().unwrap_or_default(),
-            )
-        })
-        .collect();
-
-    let mut deleted = 0i64;
-    for (_title, ids_str) in &dupes {
-        let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
-        if ids.len() < 2 {
-            continue;
-        }
-        let mut best_id = ids[0];
-        let mut best_count = 0i64;
-        for &aid in &ids {
-            let cnt = db
-                .query_one("SELECT COUNT(id) FROM tracks WHERE album_id = ?", &[&aid])
-                .ok()
-                .flatten()
-                .and_then(|r| r[0].as_i64())
-                .unwrap_or(0);
-            if cnt > best_count {
-                best_count = cnt;
-                best_id = aid;
-            }
-        }
-        for &aid in &ids {
-            if aid != best_id {
-                db.execute(
-                    "UPDATE tracks SET album_id = ? WHERE album_id = ?",
-                    &[&best_id, &aid],
-                )
-                .ok();
-                db.execute("DELETE FROM albums WHERE id = ?", &[&aid]).ok();
-                deleted += 1;
-            }
-        }
-    }
-    db.execute_batch(&format!(
-        "UPDATE albums SET track_count = {}",
-        tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
-    ))
-    .ok();
-    Ok(deleted)
 }
 
 fn cleanup_orphan_artwork(

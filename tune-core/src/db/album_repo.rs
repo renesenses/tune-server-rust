@@ -837,9 +837,11 @@ impl AlbumRepo {
     /// `cible` absorbe `doublon` (BIB-A2, phase 1) : tout ce qui désignait le
     /// doublon désigne désormais la cible, puis la ligne du doublon disparaît.
     ///
-    /// Les quatre « fusions » du dépôt (`merge-duplicates`, `/metadata/albums/
-    /// merge`, post-scan, maintenance) ne migrent que `tracks` : un favori, une
-    /// note, une étiquette ou un dossier posés sur le perdant meurent avec lui.
+    /// Les « fusions » historiques du dépôt ne migraient que `tracks` : un
+    /// favori, une note, une étiquette ou un dossier posés sur le perdant
+    /// mouraient avec lui. `merge-duplicates`, la fin de scan et le nettoyage
+    /// passent désormais par ici, via
+    /// [`crate::db::album_doublons::FusionDesDoublons`] (reste de #5005).
     /// Ici, dans l'ordre : champs vides de la cible repris du doublon (une
     /// pochette n'a pas de raison de disparaître), pistes, historique,
     /// suggestions, notes et métadonnées (à clé unique : le doublon cède quand
@@ -849,8 +851,10 @@ impl AlbumRepo {
     /// `track_count` et `folder_path` de la cible recalculés.
     ///
     /// L'appelant a établi que les deux albums sont le même disque (même
-    /// dossier, même titre normalisé, pas de paire déclarée distincte) : ce
-    /// n'est pas décidé ici, et jamais automatiquement.
+    /// dossier et même titre normalisé pour la route `absorber` ; même titre,
+    /// même artiste, pas de paire déclarée distincte ni de releases
+    /// MusicBrainz différentes pour `FusionDesDoublons`) : ce n'est pas décidé
+    /// ici.
     pub fn absorber(&self, cible: i64, doublon: i64) -> Result<RapportDAbsorption, TuneError> {
         if cible == doublon {
             return Err(TuneError::from(

@@ -358,6 +358,15 @@ required-features = ["postgres"]
 name = "pg_fonctions_sqlite_seules"
 path = "tests/pg_fonctions_sqlite_seules.rs"
 
+# Reste de #5005 : la fin de scan et `POST /system/cleanup` fusionnaient les
+# albums en double par `GROUP_CONCAT` en dur -- mortes sur PostgreSQL -- et
+# sans respecter les paires declarees distinctes (#1276). Le banc joue le vrai
+# scan, le nettoyage et la route manuelle, sur SQLite et PostgreSQL. Pas de
+# `required-features` : la moitie SQLite joue dans la suite ordinaire.
+[[test]]
+name = "pg_fusions_auto_albums"
+path = "tests/pg_fusions_auto_albums.rs"
+
 # Reste de #5005 : `ai/recommendations.rs` joignait `bigint = text` (`CAST(a.id
 # AS TEXT)`) et datait par `datetime('now', ...)` -- recommandations, Daily
 # mixes et radio intelligente mortes sur PostgreSQL. Pas de `required-features` :
