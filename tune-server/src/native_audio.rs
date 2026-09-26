@@ -21,17 +21,42 @@ pub fn root() -> PathBuf {
                 .join("audio")
         })
 }
+/// #5149 — clé publique minisign des greffons natifs de Mozaiklabs (id
+/// `24A5D1CD444CB780`). Paire DÉDIÉE aux greffons, distincte de la clé des
+/// mises à jour du serveur (`UPDATE_PUBLIC_KEY`) : un incident sur l'une ne
+/// doit pas contraindre l'autre. Sans elle, aucun greffon natif signé par
+/// Mozaiklabs ne s'installait chez un utilisateur qui n'avait pas réglé
+/// `TUNE_AUDIO_PLUGIN_TRUST` lui-même.
+pub(crate) const MOZAIKLABS_PLUGIN_PUBLIC_KEY: &str =
+    "RWSAt0xEzdGlJGlttTKkGF4Q3M/tI3jyTY5kLh+PNWziX4QJ3FRQlrJT";
+
+/// Les clés de confiance : celle de Mozaiklabs toujours, puis celles que
+/// l'opérateur AJOUTE par `TUNE_AUDIO_PLUGIN_TRUST` (fichier JSON, liste de
+/// clés) ou `TUNE_AUDIO_PLUGIN_PUBLIC_KEY`. Un fichier illisible reste une
+/// erreur : une confiance mal réglée ne doit pas passer en silence.
 pub fn trusted_keys() -> Result<Vec<String>, String> {
-    if let Some(path) = std::env::var_os("TUNE_AUDIO_PLUGIN_TRUST") {
+    let ajoutees: Vec<String> = if let Some(path) = std::env::var_os("TUNE_AUDIO_PLUGIN_TRUST") {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?
     } else {
-        Ok(std::env::var("TUNE_AUDIO_PLUGIN_PUBLIC_KEY")
+        std::env::var("TUNE_AUDIO_PLUGIN_PUBLIC_KEY")
             .ok()
             .filter(|s| !s.is_empty())
             .into_iter()
-            .collect())
+            .collect()
+    };
+    Ok(avec_la_cle_de_mozaiklabs(ajoutees))
+}
+
+fn avec_la_cle_de_mozaiklabs(ajoutees: Vec<String>) -> Vec<String> {
+    let mut cles = vec![MOZAIKLABS_PLUGIN_PUBLIC_KEY.to_string()];
+    for cle in ajoutees {
+        let cle = cle.trim().to_string();
+        if !cle.is_empty() && !cles.contains(&cle) {
+            cles.push(cle);
+        }
     }
+    cles
 }
 pub fn load_installed(settings: &tune_core::db::settings_repo::SettingsRepo) {
     let directory = root();
@@ -237,5 +262,45 @@ async fn asset(
     match tokio::task::spawn_blocking(move||tune_plugin_native::package::read_asset(&root(),&id,&name,&keys)).await {
         Ok(Ok(bytes)) => ([("content-type",content_type),("x-content-type-options","nosniff"),("cache-control","no-store"),("content-security-policy","sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; frame-ancestors 'self'"),("access-control-allow-origin","*")],bytes).into_response(),
         Ok(Err(e))=>refusal(e),Err(e)=>refusal(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod cle_de_mozaiklabs_5149 {
+    use super::{MOZAIKLABS_PLUGIN_PUBLIC_KEY, avec_la_cle_de_mozaiklabs};
+
+    #[test]
+    fn la_cle_integree_est_une_cle_publique_minisign_valide() {
+        assert!(
+            minisign_verify::PublicKey::from_base64(MOZAIKLABS_PLUGIN_PUBLIC_KEY).is_ok(),
+            "#5149 : la clé publique des greffons intégrée au serveur n'est pas lisible par minisign-verify"
+        );
+    }
+
+    #[test]
+    fn sans_reglage_la_cle_de_mozaiklabs_est_de_confiance() {
+        assert_eq!(
+            avec_la_cle_de_mozaiklabs(Vec::new()),
+            vec![MOZAIKLABS_PLUGIN_PUBLIC_KEY.to_string()],
+            "#5149 : sans réglage de l'opérateur, aucun greffon signé par Mozaiklabs ne s'installerait"
+        );
+    }
+
+    #[test]
+    fn les_cles_de_l_operateur_s_ajoutent_sans_doublon() {
+        let cles = avec_la_cle_de_mozaiklabs(vec![
+            "  CLE-OPERATEUR  ".to_string(),
+            MOZAIKLABS_PLUGIN_PUBLIC_KEY.to_string(),
+            String::new(),
+            "CLE-OPERATEUR".to_string(),
+        ]);
+        assert_eq!(
+            cles,
+            vec![
+                MOZAIKLABS_PLUGIN_PUBLIC_KEY.to_string(),
+                "CLE-OPERATEUR".to_string()
+            ],
+            "#5149 : une clé de l'opérateur s'ajoute à celle de Mozaiklabs, sans la remplacer ni se dédoubler"
+        );
     }
 }
