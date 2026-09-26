@@ -553,9 +553,6 @@ pub(crate) async fn zones_a_montrer(state: &AppState) -> Vec<Zone> {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod zone_masquee_en_lecture_affichee_5077;
-
 mod dsp;
 pub use dsp::*;
 
@@ -572,6 +569,8 @@ mod fusion_tests;
 mod identite_appareil_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
+#[cfg(test)]
+mod zone_masquee_en_lecture_affichee_5077;
 #[cfg(test)]
 mod zone_sans_appareil_guard;
 
