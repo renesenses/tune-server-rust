@@ -15,8 +15,11 @@
 //! ```
 //!
 //! - `tag` : `value` est l'identifiant d'une ÉTIQUETTE (`tags.id`). Au niveau
-//!   album, l'album porte l'étiquette OU son artiste la porte ; au niveau
-//!   piste, la piste, son album ou son artiste. Étiqueter un artiste
+//!   album, l'album porte l'étiquette, OU son artiste la porte, OU au moins
+//!   une de ses pistes la porte (#5026) ; les albums de SERVICE étiquetés
+//!   (`streaming_item_tags`) s'y ajoutent hors SQL, par
+//!   `etiquettes_streaming`. Au niveau piste, la piste, son album ou son
+//!   artiste. Étiqueter un artiste
 //!   « J'adore » et bâtir une collection « J'adore » doit ramener ses albums :
 //!   c'est ce que l'étiquette dit. Les étiquettes sont globales, pas par
 //!   profil — la table `item_tags` n'a pas de colonne de profil.
@@ -62,9 +65,23 @@ fn portant_l_etiquette(tag_id: i64, item_type: &str) -> String {
     )
 }
 
+/// Les albums dont AU MOINS UNE piste porte l'étiquette `tag_id` (#5026).
+///
+/// `t2.album_id IS NOT NULL` : sans ce filtre, une piste sans album glisserait
+/// un NULL dans la liste, et `al.id NOT IN (…, NULL)` vaudrait NULL pour TOUT
+/// album — la règle « ne porte pas » ne rendrait plus rien (même piège que
+/// #4889).
+fn album_d_une_piste_portant(tag_id: i64) -> String {
+    format!(
+        "SELECT t9.album_id FROM tracks t9 \
+         WHERE t9.album_id IS NOT NULL AND t9.id IN ({})",
+        portant_l_etiquette(tag_id, "track")
+    )
+}
+
 /// L'identifiant d'étiquette d'une règle `tag`. Une valeur illisible rend
 /// `None`, et la règle dégénère comme une référence introuvable.
-fn etiquette_de(value: &str) -> Option<i64> {
+pub(crate) fn etiquette_de(value: &str) -> Option<i64> {
     value.trim().parse::<i64>().ok().filter(|id| *id > 0)
 }
 
@@ -203,7 +220,7 @@ fn parse_ref_value(value: &str) -> Option<(bool, i64)> {
     v.parse().ok().map(|id| (false, id))
 }
 
-fn is_negated(op: &str) -> bool {
+pub(crate) fn is_negated(op: &str) -> bool {
     matches!(op, "not_in" | "is_not" | "!=" | "neq" | "ne" | "not_equals")
 }
 
@@ -395,19 +412,28 @@ pub(crate) fn album_ref_condition(field: &str, op: &str, value: &str, ctx: &RefC
             };
             let albums = portant_l_etiquette(id, "album");
             let artistes = portant_l_etiquette(id, "artist");
+            // #5026 — Bertrand, 25/09 : l'album entre aussi quand AU MOINS
+            // UNE de ses pistes porte l'étiquette. Le compteur de `/tags`
+            // comptait déjà ces pistes ; la règle ne les lisait pas, d'où
+            // « Sept Oct 2026 (1) » au-dessus de « 0 albums correspondent ».
+            // La négation suit : « ne porte pas » = ni l'album, ni son
+            // artiste, ni AUCUNE de ses pistes.
+            let pistes = album_d_une_piste_portant(id);
             if neg {
                 // `ar.id` est NULLable (LEFT JOIN) : un album sans artiste
                 // ne porte PAS l'étiquette par son artiste.
                 format!(
-                    "({} AND {})",
+                    "({} AND {} AND {})",
                     membership("al.id", &albums, true, false),
-                    membership("ar.id", &artistes, true, true)
+                    membership("ar.id", &artistes, true, true),
+                    membership("al.id", &pistes, true, false)
                 )
             } else {
                 format!(
-                    "({} OR {})",
+                    "({} OR {} OR {})",
                     membership("al.id", &albums, false, false),
-                    membership("ar.id", &artistes, false, true)
+                    membership("ar.id", &artistes, false, true),
+                    membership("al.id", &pistes, false, false)
                 )
             }
         }
