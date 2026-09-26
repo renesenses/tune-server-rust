@@ -4145,3 +4145,78 @@ fn licence_echue_le_miroir_ne_compense_pas_un_crossfeed_absent_5114() {
     assert!(etape(&sp, "Crossfeed").is_none(), "{sp}");
     assert_eq!(sp["bit_perfect"], true, "{sp}");
 }
+
+/// #5051 — une entrée audio en direct : l'étape « Capture » suit la source,
+/// et une reprise (ou un rééchantillonnage) retire le bit-perfect au lieu de
+/// le revendiquer.
+#[test]
+fn entree_audio_en_direct_dit_sa_compensation_et_ne_revendique_pas_le_bit_perfect() {
+    struct Etat(u64, bool);
+    impl tune_core::source_pcm::EtatDirect for Etat {
+        fn compensation(&self) -> tune_core::source_pcm::Compensation {
+            tune_core::source_pcm::Compensation {
+                methode: "tampon_avec_reprise",
+                reechantillonne: self.1,
+                reprises: self.0,
+                derive_ppm: Some(-4.2),
+            }
+        }
+    }
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("local".into());
+    let etat = |sid: &str| ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Entrée audio — Yeti X".into(),
+            source: "entree-audio".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(48_000),
+            bit_depth: Some(24),
+            stream_id: Some(sid.into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let w = wire("wav", 48_000, 24);
+    let capture = |sp: &Value| {
+        sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Capture")
+            .cloned()
+            .expect("étape Capture")
+    };
+
+    tune_core::source_pcm::inscrire_direct("ea-0", Arc::new(Etat(0, false)));
+    let sp = build_signal_path(&etat("ea-0"), &zone, &backend, None, "", Some(&w)).unwrap();
+    let c = capture(&sp);
+    assert_eq!(sp["steps"][1]["name"], "Capture", "juste après la source");
+    assert_eq!(c["bit_perfect"], true);
+    assert!(c["description"].as_str().unwrap().contains("0 reprise"));
+
+    tune_core::source_pcm::inscrire_direct("ea-2", Arc::new(Etat(2, false)));
+    let sp = build_signal_path(&etat("ea-2"), &zone, &backend, None, "", Some(&w)).unwrap();
+    assert_eq!(capture(&sp)["bit_perfect"], false);
+    assert_eq!(
+        sp["bit_perfect"], false,
+        "une reprise n'est pas bit-perfect"
+    );
+
+    tune_core::source_pcm::inscrire_direct("ea-r", Arc::new(Etat(0, true)));
+    let sp = build_signal_path(&etat("ea-r"), &zone, &backend, None, "", Some(&w)).unwrap();
+    let c = capture(&sp);
+    assert_eq!(c["bit_perfect"], false);
+    assert!(
+        c["description"]
+            .as_str()
+            .unwrap()
+            .contains("rééchantillonnage")
+    );
+    assert_eq!(sp["bit_perfect"], false);
+
+    for sid in ["ea-0", "ea-2", "ea-r"] {
+        tune_core::source_pcm::retirer_direct(sid);
+    }
+}

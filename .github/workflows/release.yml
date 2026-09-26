@@ -173,7 +173,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle
+            features: oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
           # Statically-linked ARM64 build (musl) — zero glibc dependency, runs
           # on old-userland NAS (Synology DSM, etc.) where the gnu build fails
           # with GLIBC_2.xx-not-found. SQLite-only (no postgres/libpq) since NAS
@@ -184,7 +184,7 @@ jobs:
             ext: tar.gz
             cross: true
             # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding"]}
-            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle
+            features: oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
           - target: x86_64-apple-darwin
             os: macos-15-intel
             platform: macos-x86_64
@@ -372,7 +372,7 @@ jobs:
       - name: Build (native, Linux with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'Linux'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
 
       - name: Download ASIO SDK (Windows)
         if: "!matrix.cross && runner.os == 'Windows'"
@@ -386,12 +386,12 @@ jobs:
       - name: Build (native, Windows with local-audio + ASIO + postgres)
         if: "!matrix.cross && runner.os == 'Windows'"
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
 
       - name: Build (native, macOS with local-audio + postgres)
         if: "!matrix.cross && runner.os == 'macOS'"
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding"]}
-        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle
+        run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio
 
       # Garde-fou #3355 : le relais cloud doit etre DANS chaque binaire livre,
       # pas seulement dans la ligne `--features` qui l'a construit.
@@ -964,6 +964,7 @@ jobs:
             <key>LSMinimumSystemVersion</key><string>13.0</string>
             <key>LSUIElement</key><true/>
             <key>NSAppleScriptEnabled</key><true/>
+            <key>NSMicrophoneUsageDescription</key><string>Tune capte une entrée audio (platine, S/PDIF, optique) pour la diffuser vers vos zones ; macOS traite toute entrée audio comme un micro. Tune captures an audio input (turntable, S/PDIF, optical) to stream it to your zones; macOS treats every audio input as a microphone.</string>
             <key>NSLocalNetworkUsageDescription</key><string>Tune trouve et pilote vos appareils audio (DLNA, AirPlay, Chromecast) sur le réseau local. Tune finds and controls your audio devices on the local network.</string>
             <key>NSBonjourServices</key>
             <array>

@@ -643,7 +643,12 @@ pub(super) fn build_signal_path_sous_licence(
         )
         .map(|d| d.channel_count()),
     };
-    let bit_perfect = analyse.verdicts.bit_perfect;
+    // #5051 — une entrée audio EN DIRECT : ce que la compensation de dérive
+    // fait au signal. Une reprise ou un rééchantillonnage retire le
+    // bit-perfect, et l'étape « Capture » le dit.
+    let capture = etape_de_capture_en_direct(np);
+    let bit_perfect =
+        analyse.verdicts.bit_perfect && capture.as_ref().is_none_or(|(_, intacte)| *intacte);
     let is_lossless = analyse.source.is_lossless;
     let codec_connu = analyse.source.codec_connu;
     let zone_id_courant = zone.id.unwrap_or(0);
@@ -662,6 +667,10 @@ pub(super) fn build_signal_path_sous_licence(
         &mut etapes.steps,
         zone_crossfeed_ombre(backend, zone_id_courant),
     );
+    if let Some((etape, _)) = capture {
+        let apres_la_source = etapes.steps.len().min(1);
+        etapes.steps.insert(apres_la_source, etape);
+    }
     Some(json!({
         "bit_perfect": bit_perfect,
         // Whether the *source* is a lossless format (FLAC, ALAC, WAV, DSD, …).
@@ -727,6 +736,51 @@ pub(crate) const CODEC_INCONNU: &str = "?";
 /// #4346 — code stable des étapes (`Source`, `Decoder`, `Transcoder`) dont la
 /// description nomme un codec inconnu par [`CODEC_INCONNU`].
 pub(crate) const CODE_CODEC_INCONNU: &str = "source_codec_unknown";
+
+/// #5051 — l'étape « Capture » d'une entrée audio en direct, et si le signal
+/// servi est encore, à l'octet près, celui capté. `None` hors entrée audio.
+pub(super) fn etape_de_capture_en_direct(
+    np: &tune_core::playback::NowPlaying,
+) -> Option<(Value, bool)> {
+    if np.source != "entree-audio" {
+        return None;
+    }
+    let compensation = np
+        .stream_id
+        .as_deref()
+        .and_then(tune_core::source_pcm::compensation_du_direct);
+    let Some(c) = compensation else {
+        return Some((
+            json!({
+                "name": "Capture",
+                "description": "Entrée audio en direct",
+                "bit_perfect": true,
+            }),
+            true,
+        ));
+    };
+    let derive = c
+        .derive_ppm
+        .map(|p| format!(", dérive {p:+.1} ppm"))
+        .unwrap_or_default();
+    let description = if c.reechantillonne {
+        format!("Entrée audio en direct — dérive compensée par rééchantillonnage adaptatif{derive}")
+    } else {
+        format!(
+            "Entrée audio en direct — tampon avec reprise, sans rééchantillonnage ; {} reprise(s){derive}",
+            c.reprises
+        )
+    };
+    let intacte = c.bit_perfect();
+    Some((
+        json!({
+            "name": "Capture",
+            "description": description,
+            "bit_perfect": intacte,
+        }),
+        intacte,
+    ))
+}
 
 /// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
 /// fréquence a lieu : la décision « jouer, et le dire » de Bertrand (19/09).

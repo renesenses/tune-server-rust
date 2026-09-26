@@ -7,7 +7,8 @@
     {"id": "concerts", "crate": "../plugins/tune-concerts", "feature": "concerts", "fast_test": false},
     {"id": "pont-roon", "crate": "../plugins/tune-pont-roon", "feature": "pont-roon", "fast_test": false},
     {"id": "cd", "crate": "../plugins/tune-cd", "feature": "cd", "fast_test": true},
-    {"id": "circle", "crate": "../plugins/tune-circle", "feature": "circle", "fast_test": true}
+    {"id": "circle", "crate": "../plugins/tune-circle", "feature": "circle", "fast_test": true},
+    {"id": "entree-audio", "crate": "../plugins/tune-entree-audio", "feature": "entree-audio", "fast_test": true}
   ],
   "native": [
     {"id": "equalizer", "crate": "tune-plugin-equalizer", "bundled_in": "tune-core"},
