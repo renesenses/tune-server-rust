@@ -611,3 +611,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
+
+      # #5192 — la recherche et le texte libre d'Oxygen trouvent une piste par
+      # le nom de son dernier dossier et celui de son fichier. Sur la VRAIE
+      # base : l'expression SQL des termes égale la fonction Rust, le rang
+      # « par la piste » précède « par le chemin », et la passe du démarrage
+      # réindexe une base restée à l'ancienne fonction (contre-épreuve
+      # comprise). Sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Termes de chemin dans la recherche sur PostgreSQL (#5192)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5192 -- --nocapture --test-threads=1

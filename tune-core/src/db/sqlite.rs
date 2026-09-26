@@ -184,7 +184,14 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
             Ok(s.map(|v| crate::db::engine::fold_diacritics(&v)))
         },
     )
-    .map_err(|e| format!("register unaccent: {e}"))
+    .map_err(|e| format!("register unaccent: {e}"))?;
+    // #5192 — les termes de chemin, en Rust, pour les passes EN MASSE
+    // (reconstruction de `tracks_fts`, texte libre d'Oxygen). Les
+    // déclencheurs, eux, gardent l'expression SQL pure : une base éditée au
+    // `sqlite3` en ligne de commande, qui ne connaît pas cette fonction, doit
+    // rester inscriptible.
+    crate::library::full_text_search::enregistrer_termes_de_chemin(conn)
+        .map_err(|e| format!("register tune_termes_de_chemin: {e}"))
 }
 
 /// Build the full PRAGMA batch, including adaptive cache_size.
@@ -400,7 +407,12 @@ impl SqliteDb {
     }
 
     pub fn init_schema(&self) -> Result<(), String> {
-        self.execute_batch(CORE_SCHEMA)
+        self.execute_batch(CORE_SCHEMA)?;
+        // #5192 — `IF NOT EXISTS` comme le reste : sur une base existante,
+        // c'est la passe finale de `run_migrations` qui met l'index à niveau.
+        self.execute_batch(
+            &crate::library::full_text_search::sql_tracks_fts_avec_termes_de_chemin(),
+        )
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -736,11 +748,9 @@ CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_id ON playlist_tracks(pl
 CREATE INDEX IF NOT EXISTS idx_queue_items_zone_id ON queue_items(zone_id);
 
 -- FTS5 virtual tables for full-text search (accent-insensitive, multi-column)
-CREATE VIRTUAL TABLE IF NOT EXISTS tracks_fts USING fts5(
-    title, artist_name, album_title, genre, composer,
-    tokenize='unicode61 remove_diacritics 2',
-    content='tracks', content_rowid='id'
-);
+-- tracks_fts et ses déclencheurs : posés par `init_schema` juste après ce
+-- texte, depuis `full_text_search::sql_tracks_fts_avec_termes_de_chemin`
+-- (#5192) — l'expression des termes de chemin est calculée, pas recopiée.
 CREATE VIRTUAL TABLE IF NOT EXISTS albums_fts USING fts5(
     title, artist_name, genre,
     tokenize='unicode61 remove_diacritics 2',
@@ -751,34 +761,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artists_fts USING fts5(
     tokenize='unicode61 remove_diacritics 2',
     content='artists', content_rowid='id'
 );
-
--- FTS sync triggers: tracks
-CREATE TRIGGER IF NOT EXISTS tracks_fts_insert AFTER INSERT ON tracks BEGIN
-    INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
-    VALUES (new.id, new.title,
-            (SELECT name FROM artists WHERE id = new.artist_id),
-            (SELECT title FROM albums WHERE id = new.album_id),
-            new.genre, new.composer);
-END;
-CREATE TRIGGER IF NOT EXISTS tracks_fts_update AFTER UPDATE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
-    VALUES ('delete', old.id, old.title,
-            (SELECT name FROM artists WHERE id = old.artist_id),
-            (SELECT title FROM albums WHERE id = old.album_id),
-            old.genre, old.composer);
-    INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer)
-    VALUES (new.id, new.title,
-            (SELECT name FROM artists WHERE id = new.artist_id),
-            (SELECT title FROM albums WHERE id = new.album_id),
-            new.genre, new.composer);
-END;
-CREATE TRIGGER IF NOT EXISTS tracks_fts_delete AFTER DELETE ON tracks BEGIN
-    INSERT INTO tracks_fts(tracks_fts, rowid, title, artist_name, album_title, genre, composer)
-    VALUES ('delete', old.id, old.title,
-            (SELECT name FROM artists WHERE id = old.artist_id),
-            (SELECT title FROM albums WHERE id = old.album_id),
-            old.genre, old.composer);
-END;
 
 -- FTS sync triggers: albums
 CREATE TRIGGER IF NOT EXISTS albums_fts_insert AFTER INSERT ON albums BEGIN

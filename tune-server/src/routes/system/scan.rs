@@ -2820,18 +2820,20 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // A full rebuild after scan guarantees consistency.
         // FTS rebuild + WAL checkpoint are SQLite-specific operations
         if db.engine() == tune_core::db::engine::Engine::Sqlite {
-            db.execute_batch(
+            // #5192 — le remplissage de `tracks_fts` est celui de
+            // `full_text_search` : une seule liste de colonnes, termes de
+            // chemin compris.
+            db.execute_batch(&format!(
                 "INSERT INTO tracks_fts(tracks_fts) VALUES('delete-all');\
-                 INSERT INTO tracks_fts(rowid, title, artist_name, album_title, genre, composer) \
-                 SELECT t.id, t.title, ar.name, al.title, t.genre, t.composer \
-                 FROM tracks t LEFT JOIN artists ar ON t.artist_id = ar.id LEFT JOIN albums al ON t.album_id = al.id;\
+                 {};\
                  INSERT INTO albums_fts(albums_fts) VALUES('delete-all');\
                  INSERT INTO albums_fts(rowid, title, artist_name, genre) \
                  SELECT a.id, a.title, ar.name, a.genre FROM albums a LEFT JOIN artists ar ON a.artist_id = ar.id;\
                  INSERT INTO artists_fts(artists_fts) VALUES('delete-all');\
                  INSERT INTO artists_fts(rowid, name, sort_name) SELECT id, name, sort_name FROM artists;\
                  PRAGMA wal_checkpoint(PASSIVE);",
-            ).ok();
+                tune_core::library::full_text_search::sql_remplir_tracks_fts()
+            )).ok();
             tracing::info!("post_scan_fts_rebuilt");
 
         }
