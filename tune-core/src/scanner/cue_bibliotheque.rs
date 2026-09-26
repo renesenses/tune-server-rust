@@ -35,7 +35,7 @@
 //! métadonnées, c'est tout son objet) et ne cherche pas de pochette : la ligne
 //! `albums` porte son dossier, les passes existantes s'en chargent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -75,6 +75,12 @@ pub struct BilanCue {
     /// du nom de son FLAC, et rien ne le corrigeait. Ce compteur dit combien de
     /// lignes un scan a effectivement RENOMMÉES.
     pub titres_corriges: usize,
+    /// Tranches retirées par la confrontation du scan complet : la feuille,
+    /// retouchée ou supprimée, ne les décrit plus (#5108).
+    pub tranches_retirees: usize,
+    /// Tranches que la confrontation aurait retirées, mais que le plafond de
+    /// purge a refusées : rien n'a été retiré (#5108).
+    pub confrontation_refusee: usize,
     /// Écritures refusées par la base. Jamais fatales : une feuille bancale ne
     /// doit pas emporter le scan.
     pub echecs: usize,
@@ -518,10 +524,64 @@ pub fn inventorier_et_ecrire(
     dossiers: &[PathBuf],
     racines: &[String],
 ) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
-    let (inventaire, mut bilan, images_couvertes) = ecrire_les_dossiers(&db, dossiers, |_, _| {});
+    inventorier_et_ecrire_avec(db, dossiers, racines, None)
+}
+
+/// Ce que le scan complet confie à la confrontation des feuilles (#5108).
+pub struct ConfrontationDuScan<'a> {
+    /// Les fichiers audio que CE parcours a vus, avant tout retrait des images
+    /// découpées. Un dossier dont la feuille a disparu n'est confronté que si
+    /// l'une de ses images y figure : c'est la preuve que le parcours l'a lu.
+    /// Un dossier hors du scan ciblé, exclu ou sur un support absent n'y est
+    /// pas, et rien n'y est touché.
+    pub fichiers_vus: &'a [PathBuf],
+    /// Le plafond de la purge du scan, `purge_trop_massive(candidats, examinées)` :
+    /// vrai ⇒ la confrontation ne retire RIEN et le dit.
+    pub trop_massive: &'a dyn Fn(usize, usize) -> bool,
+}
+
+/// [`inventorier_et_ecrire`], plus la confrontation de la base aux feuilles
+/// relues : celle du surveillant ([`relire_le_dossier`]), appliquée à chaque
+/// dossier que le parcours a vu (#5108, suite de #5073).
+///
+/// - Feuille retouchée (INDEX déplacé, piste retirée) : la tranche qu'elle ne
+///   décrit plus est retirée.
+/// - Feuille supprimée : les tranches de l'image partent. L'image, restée
+///   dans le parcours et absente des images couvertes, est réimportée entière
+///   par le scan ordinaire. L'album n'existe plus deux fois.
+///
+/// La ligne « image entière » d'un fichier découpé n'est pas retirée ici : la
+/// purge de fin du scan s'en charge, sous ses propres gardes.
+pub fn inventorier_ecrire_et_confronter(
+    db: Arc<dyn DbBackend>,
+    dossiers: &[PathBuf],
+    racines: &[String],
+    confrontation: &ConfrontationDuScan<'_>,
+) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
+    inventorier_et_ecrire_avec(db, dossiers, racines, Some(confrontation))
+}
+
+fn inventorier_et_ecrire_avec(
+    db: Arc<dyn DbBackend>,
+    dossiers: &[PathBuf],
+    racines: &[String],
+    confrontation: Option<&ConfrontationDuScan<'_>>,
+) -> (InventaireCue, BilanCue, HashSet<PathBuf>) {
+    let mut relues: HashMap<PathBuf, FeuillesRelues> = HashMap::new();
+    let (inventaire, mut bilan, images_couvertes) =
+        ecrire_les_dossiers(&db, dossiers, |dossier, plan| {
+            if confrontation.is_some() {
+                relues.entry(dossier.to_path_buf()).or_default().noter(plan);
+            }
+        });
 
     let track_repo = TrackRepo::with_backend(db.clone());
     bilan.pistes_elaguees = elaguer_les_pistes_cue(&track_repo, racines);
+    // Après l'élagage : une image disparue relève de ses gardes de support
+    // absent (#1943), pas de la confrontation.
+    if let Some(c) = confrontation {
+        confronter_au_scan(&track_repo, dossiers, &relues, c, &mut bilan);
+    }
 
     if bilan != BilanCue::default() {
         info!(
@@ -530,12 +590,84 @@ pub fn inventorier_et_ecrire(
             pistes_mises_a_jour = bilan.pistes_mises_a_jour,
             pistes_elaguees = bilan.pistes_elaguees,
             doublons_resorbes = bilan.doublons_resorbes,
+            tranches_retirees = bilan.tranches_retirees,
+            confrontation_refusee = bilan.confrontation_refusee,
             echecs = bilan.echecs,
             images_couvertes = images_couvertes.len(),
             "scan_cue_tracks_written"
         );
     }
     (inventaire, bilan, images_couvertes)
+}
+
+/// Confronte, au scan complet, chaque dossier vu qui porte des tranches en
+/// base. Rien n'est retiré si le total dépasse le plafond de purge.
+fn confronter_au_scan(
+    track_repo: &TrackRepo,
+    dossiers_avec_feuille: &[PathBuf],
+    relues: &HashMap<PathBuf, FeuillesRelues>,
+    c: &ConfrontationDuScan<'_>,
+    bilan: &mut BilanCue,
+) {
+    let images = match track_repo.cue_media_paths() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "cue_confrontation_base_illisible");
+            return;
+        }
+    };
+    if images.is_empty() {
+        return;
+    }
+    let mut par_dossier: std::collections::BTreeMap<PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for image in images {
+        if let Some(parent) = Path::new(&image).parent() {
+            par_dossier
+                .entry(parent.to_path_buf())
+                .or_default()
+                .push(image);
+        }
+    }
+    let vus: HashSet<&Path> = c.fichiers_vus.iter().map(PathBuf::as_path).collect();
+    let avec_feuille: HashSet<&Path> = dossiers_avec_feuille.iter().map(PathBuf::as_path).collect();
+    let aucune_feuille = FeuillesRelues::default();
+
+    let mut a_retirer: Vec<i64> = Vec::new();
+    let mut examinees = 0usize;
+    for (dossier, images_avant) in &par_dossier {
+        let vu = avec_feuille.contains(dossier.as_path())
+            || images_avant.iter().any(|i| vus.contains(Path::new(i)));
+        if !vu {
+            continue;
+        }
+        let feuilles = relues.get(dossier).unwrap_or(&aucune_feuille);
+        if let Some(conf) = confronter_le_dossier(track_repo, dossier, images_avant, feuilles) {
+            examinees += conf.examinees;
+            a_retirer.extend(conf.a_retirer);
+        }
+    }
+    if a_retirer.is_empty() {
+        return;
+    }
+    if (c.trop_massive)(a_retirer.len(), examinees) {
+        warn!(
+            candidats = a_retirer.len(),
+            examinees,
+            "cue_confrontation_refusee — trop de tranches à retirer d'un coup, rien n'est retiré"
+        );
+        bilan.confrontation_refusee = a_retirer.len();
+        return;
+    }
+    for id in a_retirer {
+        if track_repo.delete(id).is_ok() {
+            bilan.tranches_retirees += 1;
+        }
+    }
+    info!(
+        tranches = bilan.tranches_retirees,
+        examinees, "cue_tranches_retirees — les feuilles ne les décrivent plus"
+    );
 }
 
 /// Le cœur commun du scan et du surveillant : planifier chaque dossier et
@@ -587,6 +719,100 @@ pub struct RelectureDuDossier {
     pub pistes_entieres_retirees: usize,
 }
 
+/// Ce que les feuilles relues d'un dossier décrivent : le surveillant
+/// ([`relire_le_dossier`]) et le scan complet le notent de la même façon.
+#[derive(Debug, Default)]
+struct FeuillesRelues {
+    /// Les tranches décrites, en `(cue_media_path, cue_start_ms)`.
+    decrites: HashSet<(String, i64)>,
+    /// Un plan non vide a été lu pour ce dossier.
+    vue: bool,
+    /// Une feuille est présente mais illisible (en cours d'écriture, droits).
+    illisible: bool,
+}
+
+impl FeuillesRelues {
+    fn noter(&mut self, plan: &PlanCue) {
+        use super::cue_album::MotifEcart;
+        self.vue = true;
+        for album in &plan.albums {
+            for piste in &album.pistes {
+                self.decrites.insert((
+                    piste.media.to_string_lossy().into_owned(),
+                    piste.debut_ms as i64,
+                ));
+            }
+        }
+        self.illisible |= plan
+            .ecartees
+            .iter()
+            .any(|(_, motif)| matches!(motif, MotifEcart::Illisible(_)));
+    }
+}
+
+/// Ce que la confrontation d'un dossier retirerait. Elle ne supprime rien.
+#[derive(Debug, Default)]
+struct ConfrontationDuDossier {
+    /// Les tranches que les feuilles ne décrivent plus.
+    a_retirer: Vec<i64>,
+    /// Toutes les tranches examinées : le dénominateur du plafond de purge.
+    examinees: usize,
+    /// Les images dont plus aucune tranche n'est décrite.
+    images_liberees: Vec<PathBuf>,
+}
+
+/// Confronte les tranches en base des `images_avant` de ce dossier à ce que
+/// ses feuilles relues décrivent. Le cœur commun du surveillant et du scan.
+///
+/// ⚠️ Rend `None`, donc rien à retirer, sur un doute : dossier illisible
+/// (#1943), feuille présente mais illisible, ou aucune feuille lue alors que
+/// le dossier en porte encore une (plan vide, dossier au-delà du plafond
+/// d'inventaire).
+fn confronter_le_dossier(
+    track_repo: &TrackRepo,
+    dossier: &Path,
+    images_avant: &[String],
+    feuilles: &FeuillesRelues,
+) -> Option<ConfrontationDuDossier> {
+    if std::fs::read_dir(dossier).is_err() {
+        return None;
+    }
+    if feuilles.illisible {
+        warn!(dossier = %dossier.display(), "cue_relecture_feuille_illisible — aucune tranche retirée");
+        return None;
+    }
+    // Aucune feuille vue : seulement si le dossier se lit ET n'en porte
+    // vraiment plus — `planifier_dossier` rend aussi un plan vide sur un
+    // dossier devenu illisible entre-temps.
+    if !feuilles.vue && !dossier_lisible_sans_feuille(dossier) {
+        return None;
+    }
+    let mut conf = ConfrontationDuDossier::default();
+    for media in images_avant {
+        let tranches = match track_repo.tranches_cue_du_media(media) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(media = %media, error = %e, "cue_relecture_tranches_illisibles");
+                continue;
+            }
+        };
+        let mut gardees = 0usize;
+        for (id, debut) in tranches {
+            conf.examinees += 1;
+            if feuilles.decrites.contains(&(media.clone(), debut)) {
+                gardees += 1;
+            } else {
+                conf.a_retirer.push(id);
+            }
+        }
+        if gardees == 0 && Path::new(media).is_file() {
+            info!(image = %media, "cue_image_liberee — plus aucune feuille ne la découpe");
+            conf.images_liberees.push(PathBuf::from(media));
+        }
+    }
+    Some(conf)
+}
+
 /// Le dossier ne porte, à cet instant, aucune feuille `.cue` — et il se lit.
 fn dossier_lisible_sans_feuille(dossier: &Path) -> bool {
     let Ok(entrees) = std::fs::read_dir(dossier) else {
@@ -626,7 +852,6 @@ fn dossier_lisible_sans_feuille(dossier: &Path) -> bool {
 /// ([`elaguer_les_pistes_cue`]) reste l'affaire du scan : il sonderait chaque
 /// image de chaque album CUE à chaque événement.
 pub fn relire_le_dossier(db: &Arc<dyn DbBackend>, dossier: &Path) -> RelectureDuDossier {
-    use super::cue_album::MotifEcart;
     let mut relecture = RelectureDuDossier::default();
     if std::fs::read_dir(dossier).is_err() {
         return relecture;
@@ -644,25 +869,9 @@ pub fn relire_le_dossier(db: &Arc<dyn DbBackend>, dossier: &Path) -> RelectureDu
         }
     };
 
-    let mut decrites: HashSet<(String, i64)> = HashSet::new();
-    let mut feuille_vue = false;
-    let mut feuille_illisible = false;
+    let mut feuilles = FeuillesRelues::default();
     let (_, bilan, images_decoupees) =
-        ecrire_les_dossiers(db, &[dossier.to_path_buf()], |_, plan| {
-            feuille_vue = true;
-            for album in &plan.albums {
-                for piste in &album.pistes {
-                    decrites.insert((
-                        piste.media.to_string_lossy().into_owned(),
-                        piste.debut_ms as i64,
-                    ));
-                }
-            }
-            feuille_illisible |= plan
-                .ecartees
-                .iter()
-                .any(|(_, motif)| matches!(motif, MotifEcart::Illisible(_)));
-        });
+        ecrire_les_dossiers(db, &[dossier.to_path_buf()], |_, plan| feuilles.noter(plan));
     relecture.bilan = bilan;
 
     // Le fichier découpé perd sa ligne « image entière » : sans quoi l'album
@@ -680,37 +889,15 @@ pub fn relire_le_dossier(db: &Arc<dyn DbBackend>, dossier: &Path) -> RelectureDu
     }
     relecture.images_decoupees = images_decoupees;
 
-    if feuille_illisible {
-        warn!(dossier = %dossier.display(), "cue_relecture_feuille_illisible — aucune tranche retirée");
+    let Some(conf) = confronter_le_dossier(&track_repo, dossier, &images_avant, &feuilles) else {
         return relecture;
-    }
-    // Aucune feuille vue : seulement si le dossier se lit ET n'en porte
-    // vraiment plus — `planifier_dossier` rend aussi un plan vide sur un
-    // dossier devenu illisible entre-temps.
-    if !feuille_vue && !dossier_lisible_sans_feuille(dossier) {
-        return relecture;
-    }
-    for media in images_avant {
-        let tranches = match track_repo.tranches_cue_du_media(&media) {
-            Ok(t) => t,
-            Err(e) => {
-                warn!(media = %media, error = %e, "cue_relecture_tranches_illisibles");
-                continue;
-            }
-        };
-        let mut gardees = 0usize;
-        for (id, debut) in tranches {
-            if decrites.contains(&(media.clone(), debut)) {
-                gardees += 1;
-            } else if track_repo.delete(id).is_ok() {
-                relecture.tranches_retirees += 1;
-            }
-        }
-        if gardees == 0 && Path::new(&media).is_file() {
-            info!(image = %media, "cue_image_liberee — plus aucune feuille ne la découpe");
-            relecture.images_liberees.push(PathBuf::from(media));
+    };
+    for id in conf.a_retirer {
+        if track_repo.delete(id).is_ok() {
+            relecture.tranches_retirees += 1;
         }
     }
+    relecture.images_liberees = conf.images_liberees;
     if relecture.tranches_retirees > 0 {
         info!(
             dossier = %dossier.display(),
@@ -1207,6 +1394,126 @@ mod tests {
         fs::remove_file(&image).unwrap();
         assert_eq!(elaguer_les_pistes_cue(&repo, &[]), 0);
         assert_eq!(repo.count().unwrap(), 2);
+    }
+
+    /// #5108 — une base de FICHIER : sur `:memory:`, le pool de lecture voit
+    /// ce qu'une base réelle ne verrait pas.
+    fn base_fichier(d: &Path) -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open(&d.join("tune-5108.db").to_string_lossy()).unwrap();
+        db.init_schema().unwrap();
+        Arc::new(db)
+    }
+
+    fn debuts(db: &Arc<dyn DbBackend>, image: &Path) -> Vec<i64> {
+        let mut v: Vec<i64> = TrackRepo::with_backend(db.clone())
+            .tranches_cue_du_media(&image.to_string_lossy())
+            .unwrap()
+            .into_iter()
+            .map(|(_, debut)| debut)
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn jamais(_: usize, _: usize) -> bool {
+        false
+    }
+
+    fn toujours(_: usize, _: usize) -> bool {
+        true
+    }
+
+    /// #5108 — la confrontation du scan : feuille retouchée ⇒ l'ancienne
+    /// tranche part ; le plafond de purge refuse ⇒ RIEN ne part, et le bilan
+    /// le dit.
+    #[test]
+    fn le_scan_confronte_la_feuille_retouchee_sous_le_plafond_5108() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (dossier, image) = album_simple(d.path());
+        let db = base_fichier(d.path());
+        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        assert_eq!(debuts(&db, &image), vec![0, 1_000], "montage");
+
+        fs::write(
+            dossier.join("album.cue"),
+            FEUILLE.replace("INDEX 01 00:01:00", "INDEX 01 00:02:00"),
+        )
+        .unwrap();
+        let vus = vec![image.clone()];
+        let (_, refuse, _) = inventorier_ecrire_et_confronter(
+            db.clone(),
+            &[dossier.clone()],
+            &racines(d.path()),
+            &ConfrontationDuScan {
+                fichiers_vus: &vus,
+                trop_massive: &toujours,
+            },
+        );
+        assert_eq!(refuse.confrontation_refusee, 1, "bilan : {refuse:?}");
+        assert_eq!(refuse.tranches_retirees, 0);
+        assert_eq!(
+            debuts(&db, &image),
+            vec![0, 1_000, 2_000],
+            "plafond atteint : l'ancienne tranche reste"
+        );
+
+        let (_, bilan, _) = inventorier_ecrire_et_confronter(
+            db.clone(),
+            &[dossier],
+            &racines(d.path()),
+            &ConfrontationDuScan {
+                fichiers_vus: &vus,
+                trop_massive: &jamais,
+            },
+        );
+        assert_eq!(bilan.tranches_retirees, 1, "bilan : {bilan:?}");
+        assert_eq!(debuts(&db, &image), vec![0, 2_000]);
+    }
+
+    /// #5108 — feuille supprimée : le dossier n'est confronté que si le
+    /// parcours a vu son image. Hors du parcours (scan ciblé ailleurs, dossier
+    /// exclu), rien n'est touché.
+    #[test]
+    fn la_feuille_supprimee_n_est_confrontee_que_si_le_parcours_a_vu_l_image_5108() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (dossier, image) = album_simple(d.path());
+        let db = base_fichier(d.path());
+        inventorier_et_ecrire(db.clone(), &[dossier.clone()], &racines(d.path()));
+        fs::remove_file(dossier.join("album.cue")).unwrap();
+
+        let rien: Vec<PathBuf> = Vec::new();
+        let (_, bilan, _) = inventorier_ecrire_et_confronter(
+            db.clone(),
+            &[],
+            &racines(d.path()),
+            &ConfrontationDuScan {
+                fichiers_vus: &rien,
+                trop_massive: &jamais,
+            },
+        );
+        assert_eq!(bilan.tranches_retirees, 0);
+        assert_eq!(
+            debuts(&db, &image),
+            vec![0, 1_000],
+            "dossier non parcouru : intact"
+        );
+
+        let vus = vec![image.clone()];
+        let (_, bilan, images) = inventorier_ecrire_et_confronter(
+            db.clone(),
+            &[],
+            &racines(d.path()),
+            &ConfrontationDuScan {
+                fichiers_vus: &vus,
+                trop_massive: &jamais,
+            },
+        );
+        assert_eq!(bilan.tranches_retirees, 2, "bilan : {bilan:?}");
+        assert!(debuts(&db, &image).is_empty());
+        assert!(
+            images.is_empty(),
+            "l'image n'est plus couverte : le scan la réimporte"
+        );
     }
 
     #[test]

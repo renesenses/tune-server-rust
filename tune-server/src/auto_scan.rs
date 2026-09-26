@@ -332,7 +332,7 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
         // jetait ; `inventorier_et_ecrire` les range, sans relire une seule
         // feuille de plus, et rend l'inventaire à l'identique.
         let (inventaire_cue, bilan_cue, images_cue) =
-            tune_core::scanner::cue_bibliotheque::inventorier_et_ecrire(
+            tune_core::scanner::cue_bibliotheque::inventorier_ecrire_et_confronter(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
                 // 🔴 `music_dirs`, PAS `scan_dirs` : un scan ciblé ne porte que
@@ -341,6 +341,12 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 // racines DÉCLARÉES qui bornent la décision, jamais l'étendue
                 // du scan en cours.
                 &music_dirs,
+                // #5108 : la base est confrontée aux feuilles relues (retouchées ou
+                // supprimées), sous le plafond de la purge.
+                &tune_core::scanner::cue_bibliotheque::ConfrontationDuScan {
+                    fichiers_vus: &list_result.files,
+                    trop_massive: &crate::routes::system::scan::purge_trop_massive,
+                },
             );
         if inventaire_cue.dossiers > 0 {
             info!(
@@ -2683,3 +2689,7 @@ mod surveillant_pendant_un_lot_de_scan_tests;
 #[cfg(test)]
 #[path = "surveillant_feuille_cue_tests_5073.rs"]
 mod surveillant_feuille_cue_tests_5073;
+
+#[cfg(test)]
+#[path = "scan_feuille_cue_tests_5108.rs"]
+mod scan_feuille_cue_tests_5108;
