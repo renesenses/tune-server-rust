@@ -1503,7 +1503,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
         // virtuelles, au même endroit et sans relire une feuille de plus. Le
         // rapport garde exactement les mêmes clés — c'est le même inventaire.
         let (inventaire_cue, bilan_cue, images_cue) =
-            tune_core::scanner::cue_bibliotheque::inventorier_et_ecrire(
+            tune_core::scanner::cue_bibliotheque::inventorier_ecrire_et_confronter(
                 db.clone(),
                 &list_result.dossiers_avec_feuille_cue,
                 // 🔴 `music_dirs`, PAS `scan_dirs` : un scan ciblé ne porte que
@@ -1512,6 +1512,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // racines DÉCLARÉES qui bornent la décision, jamais l'étendue
                 // du scan en cours.
                 &music_dirs,
+                // #5108 : la base est confrontée aux feuilles relues (retouchées ou
+                // supprimées), sous le plafond de la purge.
+                &tune_core::scanner::cue_bibliotheque::ConfrontationDuScan {
+                    fichiers_vus: &list_result.files,
+                    trop_massive: &crate::routes::system::scan::purge_trop_massive,
+                },
             );
         if inventaire_cue.dossiers > 0 {
             tracing::info!(
