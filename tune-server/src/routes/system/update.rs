@@ -12,6 +12,8 @@ use tune_core::updater::{ReleaseAsset, ReleaseInfo, UpdateChannel, UpdateChecker
 
 use crate::state::AppState;
 
+use super::paquet_macos::{self, VoieMiseAJour};
+
 /// An in-progress library scan older than this is treated as stale (a scan
 /// killed by a crash/restart leaves `scan_status = "scanning"` persisted), so
 /// it can never block updates forever. A full cold scan of a large catalogue on
@@ -2525,6 +2527,31 @@ pub(super) async fn update_install(
         }
     };
 
+    // #5141 — sur macOS, dans un paquet `.app`, la mise à jour est le paquet
+    // ENTIER, tiré du DMG de la release : `Info.plist`, signature, lanceur.
+    // L'archive ne remplaçait que le binaire et `web/`, et cassait au passage
+    // le sceau du paquet. Sans DMG publié (notarisation refusée), on retombe
+    // sur l'archive, et l'état de la mise à jour le dit.
+    let paquet_app = if cfg!(target_os = "macos") {
+        std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(paquet_macos::paquet_de_l_executable)
+    } else {
+        None
+    };
+    let dmg = paquet_app
+        .as_ref()
+        .and_then(|_| paquet_macos::actif_dmg(&release, std::env::consts::ARCH).cloned());
+    let voie = paquet_macos::voie_de_mise_a_jour(paquet_app.is_some(), dmg.is_some(), &[]);
+    let (asset, paquet_cible) = match (&voie, dmg) {
+        (VoieMiseAJour::Paquet { .. }, Some(dmg)) => (dmg, paquet_app.clone()),
+        _ => (asset, None),
+    };
+    if cfg!(target_os = "macos") {
+        info!(voie = ?voie, asset = %asset.name, "update_macos_voie");
+    }
+
     info!(
         version = %release.version,
         asset = %asset.name,
@@ -2573,24 +2600,7 @@ pub(super) async fn update_install(
         };
 
         // --- Download ---
-        let archive_bytes = match async {
-            let resp = http_client
-                .get(&asset.browser_download_url)
-                .timeout(std::time::Duration::from_secs(600))
-                .send()
-                .await
-                .map_err(|e| format!("Download failed: {e}"))?;
-
-            if !resp.status().is_success() {
-                return Err(format!("Download failed: HTTP {}", resp.status()));
-            }
-
-            resp.bytes()
-                .await
-                .map_err(|e| format!("Failed to read download: {e}"))
-        }
-        .await
-        {
+        let archive_bytes = match telecharger_actif(&http_client, &asset).await {
             Ok(b) => {
                 info!(size = b.len(), "update_downloaded");
                 b
@@ -2623,145 +2633,208 @@ pub(super) async fn update_install(
             return;
         }
 
-        // --- Extract ---
-        set_phase("extracting");
-
-        let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
-        // Sweep leftover tune-update-* dirs from earlier updates. The success
-        // path used to never remove the extraction dir, so one accumulated per
-        // version (Benjithom, Windows: a new folder on every update).
-        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-            for e in entries.flatten() {
-                if e.file_name().to_string_lossy().starts_with("tune-update-") {
-                    let _ = std::fs::remove_dir_all(e.path());
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let mut relance_par_le_paquet: Option<std::path::PathBuf> = None;
+        'installation: {
+            // --- Paquet macOS complet (#5141) ---
+            if let Some(app) = paquet_cible.clone() {
+                set_phase("installing_bundle");
+                match installer_le_paquet_depuis_dmg(&app, &version, &archive_bytes).await {
+                    Ok((motifs, verification)) => {
+                        let motif = motifs
+                            .first()
+                            .copied()
+                            .unwrap_or(paquet_macos::MOTIF_MISE_A_JOUR);
+                        let etat = paquet_macos::etat_du_paquet(
+                            true,
+                            motif,
+                            &motifs,
+                            "mise_a_jour",
+                            &version,
+                            None,
+                            Some(&verification),
+                        );
+                        let _ = settings.set(paquet_macos::CLE_ETAT_PAQUET, &etat.to_string());
+                        mettre_a_jour_le_web_hors_du_paquet(&app);
+                        relance_par_le_paquet = Some(app);
+                        break 'installation;
+                    }
+                    Err((motifs, e)) => {
+                        let motif = motifs
+                            .first()
+                            .copied()
+                            .unwrap_or(paquet_macos::MOTIF_MISE_A_JOUR);
+                        let etat = paquet_macos::etat_du_paquet(
+                            false,
+                            motif,
+                            &motifs,
+                            "mise_a_jour",
+                            &version,
+                            Some(&e),
+                            None,
+                        );
+                        let _ = settings.set(paquet_macos::CLE_ETAT_PAQUET, &etat.to_string());
+                        error!(error = %e, "update_macos_paquet_refuse");
+                        set_phase(&format!("failed: macOS bundle not installed: {e}"));
+                        return;
+                    }
                 }
             }
-        }
-        if tmp_dir.exists() {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-        }
-        if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-            set_phase(&format!("failed: Failed to create temp dir: {e}"));
-            return;
-        }
+            if cfg!(target_os = "macos") {
+                if let VoieMiseAJour::BinaireSeul { motif } = &voie {
+                    let etat = paquet_macos::etat_du_paquet(
+                        false,
+                        motif,
+                        &[],
+                        "mise_a_jour",
+                        &version,
+                        None,
+                        None,
+                    );
+                    let _ = settings.set(paquet_macos::CLE_ETAT_PAQUET, &etat.to_string());
+                }
+            }
 
-        let is_zip = asset.name.to_lowercase().ends_with(".zip");
-        if let Err(e) = extract_archive(&archive_bytes, &tmp_dir, is_zip) {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            set_phase(&format!("failed: Extraction failed: {e}"));
-            return;
-        }
+            // --- Extract ---
+            set_phase("extracting");
 
-        info!(dir = %tmp_dir.display(), "update_extracted");
-
-        // --- Install ---
-        set_phase("installing");
-
-        // Belt-and-braces: the handler already steers Docker users to the
-        // image-pull path before we ever download, but if the install path is
-        // somehow reached in a container the binary swap is doomed (read-only
-        // image layer). Fail with a clear, actionable phase instead of the raw
-        // "copy new binary: Permission denied".
-        if running_in_docker() {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            set_phase(
-                "failed: Running in Docker — update by pulling the new image (docker compose pull && docker compose up -d)",
-            );
-            return;
-        }
-
-        let binary_name = if cfg!(windows) {
-            "tune-server.exe"
-        } else {
-            "tune-server"
-        };
-        let new_binary = tmp_dir.join(binary_name);
-        if !new_binary.exists() {
-            let _ = std::fs::remove_dir_all(&tmp_dir);
-            set_phase(&format!(
-                "failed: Binary '{}' not found in archive",
-                binary_name
-            ));
-            return;
-        }
-
-        // Guard: refuse update if current binary has postgres but new one doesn't
-        if cfg!(feature = "postgres") {
-            // Detect postgres support in the DOWNLOADED binary via a string that
-            // only a `--features postgres` build compiles in: the
-            // `info!("postgres_backend_ready")` log lives in the
-            // `#[cfg(feature = "postgres")]` branch of state.rs. The previous
-            // markers were inverted — "PostgreSQL engine requested" is emitted
-            // ONLY by the `cfg(not(feature="postgres"))` fallback (so a PG binary
-            // *lacked* it) and "postgresql://" is nowhere in the code — so every
-            // update on a PG server (.15) was wrongly blocked while a non-PG
-            // binary would have passed. Keep this marker a PG-ONLY literal.
-            // Scan the downloaded binary for the PG-only marker WITHOUT loading
-            // the whole ~53 MB into memory: `fs::read` + `from_utf8_lossy` used
-            // to allocate a ~150 MB lossy String copy of a binary — needless
-            // memory pressure on modest hardware right in the middle of an
-            // update. Stream it in bounded chunks instead.
-            let new_has_pg = file_contains_bytes(&new_binary, b"postgres_backend_ready");
-            if !new_has_pg {
+            let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
+            // Sweep leftover tune-update-* dirs from earlier updates. The success
+            // path used to never remove the extraction dir, so one accumulated per
+            // version (Benjithom, Windows: a new folder on every update).
+            if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+                for e in entries.flatten() {
+                    if e.file_name().to_string_lossy().starts_with("tune-update-") {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
+                }
+            }
+            if tmp_dir.exists() {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                warn!("update_blocked_missing_postgres_feature");
+            }
+            if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+                set_phase(&format!("failed: Failed to create temp dir: {e}"));
+                return;
+            }
+
+            let is_zip = asset.name.to_lowercase().ends_with(".zip");
+            if let Err(e) = extract_archive(&archive_bytes, &tmp_dir, is_zip) {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                set_phase(&format!("failed: Extraction failed: {e}"));
+                return;
+            }
+
+            info!(dir = %tmp_dir.display(), "update_extracted");
+
+            // --- Install ---
+            set_phase("installing");
+
+            // Belt-and-braces: the handler already steers Docker users to the
+            // image-pull path before we ever download, but if the install path is
+            // somehow reached in a container the binary swap is doomed (read-only
+            // image layer). Fail with a clear, actionable phase instead of the raw
+            // "copy new binary: Permission denied".
+            if running_in_docker() {
+                let _ = std::fs::remove_dir_all(&tmp_dir);
                 set_phase(
-                    "failed: Update blocked: current binary has PostgreSQL support but the downloaded release does not.",
+                    "failed: Running in Docker — update by pulling the new image (docker compose pull && docker compose up -d)",
                 );
                 return;
             }
-        }
 
-        let current_exe = match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                set_phase(&format!("failed: Cannot determine current exe: {e}"));
-                return;
-            }
-        };
-
-        // Install (swap the binary + web/). This is synchronous, blocking
-        // filesystem work. Wrap it in `catch_unwind` so a panic surfaces as a
-        // `failed` phase instead of vanishing: the update runs in a spawned task,
-        // so an uncaught panic silently ends it, leaving the phase stuck on
-        // "installing" and the server running the OLD binary while the UI keeps
-        // re-offering the update (JP Borderies, Windows: install never completed,
-        // no `restarting`, no error). `install_windows` now logs each step too,
-        // so a genuine hang is pinpointed by the last step logged.
-        info!(exe = %current_exe.display(), "update_install_starting");
-        let install_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if cfg!(windows) {
-                install_windows(&current_exe, &new_binary, &tmp_dir)
+            let binary_name = if cfg!(windows) {
+                "tune-server.exe"
             } else {
-                install_unix(&current_exe, &new_binary, &tmp_dir)
-            }
-        }));
-        match install_outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
+                "tune-server"
+            };
+            let new_binary = tmp_dir.join(binary_name);
+            if !new_binary.exists() {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
-                set_phase(&format!("failed: Install failed: {e}"));
+                set_phase(&format!(
+                    "failed: Binary '{}' not found in archive",
+                    binary_name
+                ));
                 return;
             }
-            Err(panic) => {
-                let msg = panic
-                    .downcast_ref::<&str>()
-                    .map(|s| (*s).to_string())
-                    .or_else(|| panic.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                let _ = std::fs::remove_dir_all(&tmp_dir);
-                error!(panic = %msg, "update_install_panicked");
-                set_phase(&format!("failed: Install crashed: {msg}"));
-                return;
-            }
-        }
 
-        // Success: install_windows/install_unix have copied the binary + web/
-        // into the install dir (the Windows .bat swap works entirely within
-        // exe_dir), so the extraction dir is no longer needed. Removing it here
-        // stops the per-version accumulation.
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+            // Guard: refuse update if current binary has postgres but new one doesn't
+            if cfg!(feature = "postgres") {
+                // Detect postgres support in the DOWNLOADED binary via a string that
+                // only a `--features postgres` build compiles in: the
+                // `info!("postgres_backend_ready")` log lives in the
+                // `#[cfg(feature = "postgres")]` branch of state.rs. The previous
+                // markers were inverted — "PostgreSQL engine requested" is emitted
+                // ONLY by the `cfg(not(feature="postgres"))` fallback (so a PG binary
+                // *lacked* it) and "postgresql://" is nowhere in the code — so every
+                // update on a PG server (.15) was wrongly blocked while a non-PG
+                // binary would have passed. Keep this marker a PG-ONLY literal.
+                // Scan the downloaded binary for the PG-only marker WITHOUT loading
+                // the whole ~53 MB into memory: `fs::read` + `from_utf8_lossy` used
+                // to allocate a ~150 MB lossy String copy of a binary — needless
+                // memory pressure on modest hardware right in the middle of an
+                // update. Stream it in bounded chunks instead.
+                let new_has_pg = file_contains_bytes(&new_binary, b"postgres_backend_ready");
+                if !new_has_pg {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    warn!("update_blocked_missing_postgres_feature");
+                    set_phase(
+                        "failed: Update blocked: current binary has PostgreSQL support but the downloaded release does not.",
+                    );
+                    return;
+                }
+            }
+
+            let current_exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    set_phase(&format!("failed: Cannot determine current exe: {e}"));
+                    return;
+                }
+            };
+
+            // Install (swap the binary + web/). This is synchronous, blocking
+            // filesystem work. Wrap it in `catch_unwind` so a panic surfaces as a
+            // `failed` phase instead of vanishing: the update runs in a spawned task,
+            // so an uncaught panic silently ends it, leaving the phase stuck on
+            // "installing" and the server running the OLD binary while the UI keeps
+            // re-offering the update (JP Borderies, Windows: install never completed,
+            // no `restarting`, no error). `install_windows` now logs each step too,
+            // so a genuine hang is pinpointed by the last step logged.
+            info!(exe = %current_exe.display(), "update_install_starting");
+            let install_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if cfg!(windows) {
+                    install_windows(&current_exe, &new_binary, &tmp_dir)
+                } else {
+                    install_unix(&current_exe, &new_binary, &tmp_dir)
+                }
+            }));
+            match install_outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    set_phase(&format!("failed: Install failed: {e}"));
+                    return;
+                }
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    let _ = std::fs::remove_dir_all(&tmp_dir);
+                    error!(panic = %msg, "update_install_panicked");
+                    set_phase(&format!("failed: Install crashed: {msg}"));
+                    return;
+                }
+            }
+
+            // Success: install_windows/install_unix have copied the binary + web/
+            // into the install dir (the Windows .bat swap works entirely within
+            // exe_dir), so the extraction dir is no longer needed. Removing it here
+            // stops the per-version accumulation.
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
 
         info!(
             from = %tune_core::version(),
@@ -2858,45 +2931,7 @@ pub(super) async fn update_install(
         }
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
-            let exe = current_exe.clone();
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            // Let the final status-poll response flush before we swap the image.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            // Le lanceur pose TUNE_OPEN_BROWSER=1 ; l'image relancée l'hérite et
-            // ROUVRAIT un onglet alors que l'ancien se reconnecte déjà → deux
-            // onglets Tune à chaque mise à jour (Jean, forum #1236).
-            unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
-            // Replier le WAL AVANT l'exec. `exec()` remplace l'image sans
-            // dérouler un seul destructeur : aucune connexion n'est fermée,
-            // aucun verrou n'est rendu proprement. Le 10 août, deux re-exec ont
-            // eu lieu pendant que la base était en écriture, et elle s'est
-            // retrouvée corrompue sans qu'on ait pu établir le mécanisme
-            // (#1462). Un checkpoint ici ne prouve rien sur cette cause — il
-            // supprime la fenêtre où elle pouvait jouer.
-            if let Some(db) = state.db.as_ref() {
-                db.checkpoint();
-            }
-            info!(exe = %exe.display(), "update_reexec");
-            // exec() replaces this process on success and never returns.
-            let err = std::process::Command::new(&exe).args(&args).exec();
-            warn!(error = %err, "update_reexec_failed — falling back to spawn+exit");
-            match std::process::Command::new(&exe)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::inherit())
-                .stderr(std::process::Stdio::inherit())
-                .spawn()
-            {
-                Ok(child) => {
-                    info!(pid = child.id(), exe = %exe.display(), "update_new_process_spawned");
-                }
-                Err(e) => {
-                    warn!(error = %e, "update_restart_spawn_failed — manual restart required");
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            std::process::exit(0);
+            relancer_le_serveur(&state, &current_exe, relance_par_le_paquet.as_deref()).await;
         }
     });
 
@@ -3154,7 +3189,7 @@ fn install_windows(
 /// Reads in 64 KiB chunks with a `needle.len()-1` overlap so a match that
 /// straddles a chunk boundary is still found. Used by the update installer to
 /// detect a feature marker in a ~53 MB binary without allocating a full copy.
-fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> bool {
+pub(super) fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> bool {
     use std::io::Read;
     if needle.is_empty() {
         return true;
@@ -3233,7 +3268,10 @@ fn update_web_dir(exe_dir: &std::path::Path, tmp_dir: &std::path::Path) -> Resul
 /// filesystem → rename is atomic), move the old dir to `target.old`, rename
 /// the staged copy into place, then delete the backup. On a failed final
 /// rename the old directory is restored.
-fn swap_dir_atomic(src: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+pub(super) fn swap_dir_atomic(
+    src: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<(), String> {
     let staged = target.with_extension("new");
     let backup = target.with_extension("old");
     // Clear leftovers from a previous interrupted attempt.
