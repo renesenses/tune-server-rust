@@ -12,6 +12,7 @@ use crate::source_pcm::{
     Consommation, FinDePompe, FournisseurPcm, inscrire_direct, pomper, pomper_sans_fin,
     retirer_direct,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Profondeur du canal d'une session EN DIRECT, en tronçons. Petite exprès :
 /// c'est le consommateur qui doit donner le rythme. Un canal de 256 tronçons
@@ -47,6 +48,13 @@ impl PlaybackOrchestrator {
             .clone()
             .ok_or_else(|| format!("source « {source} » : source_id requis"))?;
         let depuis_ms = req.seek_ms.unwrap_or(0);
+        // #5079 — une lecture EXPLICITE (pas un pré-armement gapless, qui
+        // doit laisser finir la piste qui joue) arrête d'abord les pompes que
+        // la zone fait encore tourner : un seul bras de lecture ne sert pas
+        // deux positions à la fois.
+        if self.levels_attach_allowed(req.zone_id) {
+            arreter_les_pompes_de_la_zone(req.zone_id).await;
+        }
         // L'ouverture parle au matériel (lecture de la TOC d'un disque) : hors
         // du fil asynchrone.
         let ouvrir = {
@@ -104,9 +112,14 @@ impl PlaybackOrchestrator {
         let sid = session_id.clone();
         let nom = source.to_string();
         let titre = req.title.clone().unwrap_or_default();
-        let mut lecteur = flux.lecteur;
+        let pompe = PompeDeZone::inscrire(zone_id);
+        let mut lecteur = LectureArretable {
+            flux: flux.lecteur,
+            pompe: pompe.clone(),
+        };
         tokio::spawn(async move {
             let rt = tokio::runtime::Handle::current();
+            let arretee = pompe.arret.clone();
             let fin = tokio::task::spawn_blocking(move || {
                 let entete = crate::audio::wav::build_wav_header_with_data_size(
                     format.canaux,
@@ -118,7 +131,7 @@ impl PlaybackOrchestrator {
                     return FinDePompe::ConsommateurParti;
                 }
                 data_ready.notify_one();
-                pomper(&mut *lecteur, octets, |t| {
+                pomper(&mut lecteur, octets, |t| {
                     if let Some(ltx) = &niveaux {
                         crate::audio::tap::send_windowed_pcm(
                             ltx,
@@ -128,10 +141,20 @@ impl PlaybackOrchestrator {
                             format.frequence,
                         );
                     }
-                    rt.block_on(tx.send(t)).is_ok()
+                    // Revérifié APRÈS l'envoi : une pompe bloquée sur un canal
+                    // plein ne relit pas le disque une fois remplacée.
+                    rt.block_on(tx.send(t)).is_ok() && !arretee.load(Ordering::SeqCst)
                 })
             })
             .await;
+            pompe.desinscrire();
+            if pompe.arret.load(Ordering::SeqCst) {
+                // Remplacée par une lecture plus récente de la zone : ni
+                // erreur, ni EOF. La session est retirée par cette lecture ;
+                // un EOF ici ferait croire à la fin naturelle de la piste.
+                debug!(stream_id = %sid, "source_pcm_pompe_remplacee");
+                return;
+            }
             match fin {
                 Ok(FinDePompe::Complete) => debug!(stream_id = %sid, "source_pcm_complete"),
                 Ok(FinDePompe::ConsommateurParti) => {
@@ -485,6 +508,92 @@ async fn relayer_les_niveaux_pre_armes(
         if fwd.send(f).is_err() {
             return;
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #5079 — une pompe par zone à la fois sur le disque
+// ─────────────────────────────────────────────────────────────────────────
+//
+// GgB (fil 1945) : choisir une autre piste pendant la lecture coupe le son
+// 3 à 4 s. Mesuré sur un SuperDrive (Genesis, *A Trick of the Tail*) : la
+// piste visée arrive à ~5× le temps réel quand la pompe précédente est
+// arrêtée, mais tombe à 0,55× quand elle lit encore, le bras sautant d'une
+// position à l'autre (4 s de manque sur 5 s d'audio). Or la pompe d'une
+// piste lit à pleine vitesse jusqu'à remplir son canal de 256 tronçons
+// (~41 s de CD), et rien ne l'arrêtait avant qu'un `send` échoue, c'est-à-
+// dire après que la nouvelle piste avait déjà démarré.
+
+/// Une pompe de source PCM en cours, et de quoi l'arrêter.
+struct PompeDeZone {
+    zone_id: i64,
+    arret: Arc<AtomicBool>,
+    /// Tenu pendant chaque lecture du disque : l'arrêt l'attend, pour
+    /// qu'aucune lecture de l'ancienne pompe ne chevauche l'ouverture.
+    lecture: std::sync::Mutex<()>,
+}
+
+fn pompes() -> std::sync::MutexGuard<'static, HashMap<i64, Vec<Arc<PompeDeZone>>>> {
+    static POMPES: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, Vec<Arc<PompeDeZone>>>>> =
+        std::sync::LazyLock::new(Default::default);
+    POMPES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl PompeDeZone {
+    fn inscrire(zone_id: i64) -> Arc<Self> {
+        let p = Arc::new(Self {
+            zone_id,
+            arret: Arc::new(AtomicBool::new(false)),
+            lecture: std::sync::Mutex::new(()),
+        });
+        pompes().entry(zone_id).or_default().push(p.clone());
+        p
+    }
+
+    fn desinscrire(self: &Arc<Self>) {
+        let mut m = pompes();
+        if let Some(v) = m.get_mut(&self.zone_id) {
+            v.retain(|p| !Arc::ptr_eq(p, self));
+            if v.is_empty() {
+                m.remove(&self.zone_id);
+            }
+        }
+    }
+}
+
+/// Arrête les pompes de la zone et attend que leur lecture en cours finisse.
+async fn arreter_les_pompes_de_la_zone(zone_id: i64) {
+    let a_arreter = pompes().remove(&zone_id).unwrap_or_default();
+    if a_arreter.is_empty() {
+        return;
+    }
+    for p in &a_arreter {
+        p.arret.store(true, Ordering::SeqCst);
+    }
+    let n = a_arreter.len();
+    let _ = tokio::task::spawn_blocking(move || {
+        for p in &a_arreter {
+            drop(p.lecture.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    })
+    .await;
+    debug!(zone_id, pompes = n, "source_pcm_pompes_arretees");
+}
+
+/// Le flux du fournisseur, qui ne lit plus rien une fois sa pompe arrêtée.
+struct LectureArretable {
+    flux: Box<dyn std::io::Read + Send>,
+    pompe: Arc<PompeDeZone>,
+}
+
+impl std::io::Read for LectureArretable {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let _garde = self.pompe.lecture.lock().unwrap_or_else(|e| e.into_inner());
+        if self.pompe.arret.load(Ordering::SeqCst) {
+            // Fin courte : la tâche voit l'arrêt et n'en fait pas une erreur.
+            return Ok(0);
+        }
+        self.flux.read(buf)
     }
 }
 

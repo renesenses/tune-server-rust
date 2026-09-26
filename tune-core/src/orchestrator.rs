@@ -1663,6 +1663,9 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod double_dsp_dsf_aac_sortie_locale_tests;
 
+#[cfg(test)]
+mod mesure_saut_cd_5079;
+
 /// Fil 1908 — les niveaux d'une sortie locale sortent avec le son, pas avec
 /// l'alimentation de l'anneau.
 #[cfg(test)]
@@ -1673,6 +1676,8 @@ mod niveaux_relais_unique_5078_5051;
 mod niveaux_source_pcm_5078;
 #[cfg(test)]
 mod resolution_annoncee_tests;
+#[cfg(test)]
+mod saut_de_piste_pcm_5079;
 
 /// #2250 — « Lire » et « Lecture aléatoire » annoncent la MÊME résolution pour
 /// la même ligne. La garde voisine (`resolution_annoncee_tests`) éprouve la
