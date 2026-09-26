@@ -5400,6 +5400,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-entree-audio"
+version = "0.9.165"
+dependencies = [
+ "async-trait",
+ "axum",
+ "coreaudio-rs",
+ "cpal",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-ffi"
 version = "0.9.165"
 dependencies = [
@@ -5447,7 +5465,7 @@ dependencies = [
 
 [[package]]
 name = "tune-playlists-converter"
-version = "0.9.161"
+version = "0.9.165"
 dependencies = [
  "serde",
  "serde_json",
@@ -5601,6 +5619,7 @@ dependencies = [
  "tune-concerts",
  "tune-core",
  "tune-dj",
+ "tune-entree-audio",
  "tune-http-types",
  "tune-karaoke",
  "tune-plugin-converter",

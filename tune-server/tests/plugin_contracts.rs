@@ -82,6 +82,11 @@ mod plugin_routes;
 #[cfg(feature = "cd")]
 #[path = "cd_catalogue_4863.rs"]
 mod cd_catalogue_4863;
+// #5051 — le greffon `entree-audio` hors catalogue (feature `entree-audio`,
+// dans `default`).
+#[cfg(feature = "entree-audio")]
+#[path = "entree_audio_hors_catalogue_5051.rs"]
+mod entree_audio_hors_catalogue_5051;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une

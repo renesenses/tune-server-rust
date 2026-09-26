@@ -8,7 +8,15 @@
 //! sortie voie un vrai EOF et enchaîne la piste suivante.
 
 use super::*;
-use crate::source_pcm::{FinDePompe, FournisseurPcm, pomper};
+use crate::source_pcm::{
+    Consommation, FinDePompe, FournisseurPcm, inscrire_direct, pomper, pomper_sans_fin,
+    retirer_direct,
+};
+
+/// Profondeur du canal d'une session EN DIRECT, en tronçons. Petite exprès :
+/// c'est le consommateur qui doit donner le rythme. Un canal de 256 tronçons
+/// (celui d'une piste) cacherait des secondes de retard et la dérive avec.
+pub(super) const CANAL_DIRECT: usize = 8;
 
 impl PlaybackOrchestrator {
     /// Le registre des sources PCM fournies par les greffons.
@@ -22,6 +30,12 @@ impl PlaybackOrchestrator {
         fournisseur: Arc<dyn FournisseurPcm>,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
+        // #5051 — une source sans fin se sert comme une radio.
+        if fournisseur.en_direct() {
+            return self
+                .resolve_source_pcm_direct(source, fournisseur, req)
+                .await;
+        }
         let source_id = req
             .source_id
             .clone()
@@ -148,5 +162,350 @@ impl PlaybackOrchestrator {
             origin_url: None,
             bitrate_kbps: None,
         })
+    }
+
+    /// #5051 — une source PCM EN DIRECT : session de radio (sans longueur,
+    /// en-tête WAV indéterminé, corps découpé à la volée), pompe sans fin.
+    pub(super) async fn resolve_source_pcm_direct(
+        &self,
+        source: &str,
+        fournisseur: Arc<dyn FournisseurPcm>,
+        req: &PlayRequest,
+    ) -> Result<ResolvedStream, String> {
+        let source_id = req
+            .source_id
+            .clone()
+            .ok_or_else(|| format!("source « {source} » : source_id requis"))?;
+        // L'ouverture reçoit le compteur de consommation de la session, qui
+        // n'existe qu'une fois le format connu : lié après coup. Une référence
+        // FAIBLE : tenir la session garderait son canal ouvert après son
+        // retrait, et la pompe ne verrait jamais le consommateur partir.
+        type Faible = std::sync::Weak<crate::http::streamer::StreamSession>;
+        let cellule: Arc<std::sync::OnceLock<Faible>> = Arc::default();
+        let consommation = {
+            let c = cellule.clone();
+            Consommation::new(move || {
+                c.get()
+                    .and_then(|s| s.upgrade())
+                    .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(0)
+            })
+        };
+        let ouvrir = {
+            let f = fournisseur.clone();
+            let sid = source_id.clone();
+            tokio::task::spawn_blocking(move || f.ouvrir_direct(&sid, consommation))
+        };
+        let flux = ouvrir
+            .await
+            .map_err(|e| format!("source « {source} » : ouverture interrompue ({e})"))??;
+        let format = flux.format;
+        // L'en-tête WAV du corps HTTP lit sa profondeur dans `info` ; la
+        // fréquence et les canaux, dans le format détecté publié plus bas.
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: format.frequence,
+            bit_depth: format.bits,
+            channels: format.canaux,
+            file_size: None,
+            duration_ms: None,
+            ..Default::default()
+        };
+        let (session_id, tx, data_ready, session) =
+            self.streamer.create_radio_session(info, CANAL_DIRECT).await;
+        let _ = cellule.set(Arc::downgrade(&session));
+        session.publish_detected_output_format(format.frequence, format.canaux);
+        session.publish_radio_source(crate::http::streamer::RadioSourceInfo {
+            format: Some("wav"),
+            sample_rate: Some(format.frequence),
+            bit_depth: Some(format.bits),
+        });
+        if let Some(etat) = flux.etat.clone() {
+            inscrire_direct(&session_id, etat);
+        }
+        info!(
+            zone_id = req.zone_id,
+            source,
+            source_id = %source_id,
+            frequence = format.frequence,
+            bits = format.bits,
+            canaux = format.canaux,
+            stream_id = %session_id,
+            "source_pcm_direct_ouverte"
+        );
+
+        // Les instruments de la zone (crête, vu-mètre, spectre) : la même
+        // porte que la radio décodée — le PCM est tapé au moment où il part
+        // vers la sortie, et le forwarder le recadence sur la lecture. Rien
+        // d'autre ne décode ce flux pour les niveaux.
+        let mut niveaux = match &self.event_bus {
+            Some(bus) => {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                Some(spawn_paced_levels_forwarder(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    0,
+                ))
+            }
+            None => None,
+        };
+        let streamer = self.streamer.clone();
+        let bus = self.event_bus.clone();
+        let zone_id = req.zone_id;
+        let sid = session_id.clone();
+        let nom = source.to_string();
+        let titre = req.title.clone().unwrap_or_default();
+        let mut lecteur = flux.lecteur;
+        // Faible, pour la même raison que la consommation.
+        let session_fin = Arc::downgrade(&session);
+        drop(session);
+        tokio::spawn(async move {
+            let rt = tokio::runtime::Handle::current();
+            let fin = tokio::task::spawn_blocking(move || {
+                let mut premier = true;
+                pomper_sans_fin(&mut *lecteur, |t| {
+                    if let Some(n) = &niveaux {
+                        if !crate::audio::tap::send_windowed_pcm(
+                            n,
+                            &t,
+                            format.bits,
+                            format.canaux,
+                            format.frequence,
+                        ) {
+                            niveaux = None;
+                        }
+                    }
+                    let ok = rt.block_on(tx.send(t)).is_ok();
+                    if premier {
+                        // Le corps HTTP attend ce signal avant l'en-tête.
+                        data_ready.notify_one();
+                        premier = false;
+                    }
+                    ok
+                })
+            })
+            .await;
+            if let Some(s) = session_fin.upgrade() {
+                s.producer_done
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            retirer_direct(&sid);
+            match fin {
+                Ok(FinDePompe::Complete) => info!(stream_id = %sid, "source_pcm_direct_terminee"),
+                Ok(FinDePompe::ConsommateurParti) => {
+                    info!(stream_id = %sid, "source_pcm_direct_consommateur_parti")
+                }
+                Ok(FinDePompe::Interrompue { remis, raison }) => {
+                    warn!(
+                        zone_id,
+                        source = %nom,
+                        stream_id = %sid,
+                        remis,
+                        raison = %raison,
+                        "source_pcm_direct_interrompue"
+                    );
+                    if let Some(bus) = bus {
+                        bus.emit(
+                            "zone.playback_error",
+                            serde_json::json!({
+                                "zone_id": zone_id,
+                                "error": format!("« {titre} » s'est interrompue : {raison}"),
+                                "fatal": true,
+                            }),
+                        );
+                    }
+                }
+                Err(e) => warn!(stream_id = %sid, error = %e, "source_pcm_direct_tache_paniquee"),
+            }
+            // Le flux est fini : que la sortie voie l'EOF.
+            streamer.end_session_input(&sid).await;
+        });
+
+        let url = self
+            .streamer
+            .get_stream_url(&session_id, &self.server_ip(), "wav");
+        Ok(ResolvedStream {
+            url,
+            mime_type: "audio/wav".into(),
+            title: req.title.clone().unwrap_or_default(),
+            artist: req.artist_name.clone(),
+            album: req.album_title.clone(),
+            // En direct : ni durée, ni longueur.
+            duration_ms: None,
+            source: source.to_string(),
+            cover_url: req.cover_url.clone(),
+            stream_id: Some(session_id),
+            file_size: None,
+            sample_rate: Some(format.frequence),
+            bit_depth: Some(format.bits as u32),
+            channels: Some(format.canaux as u32),
+            origin_url: None,
+            bitrate_kbps: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod direct_5051 {
+    //! #5051 — une source PCM EN DIRECT passe par l'orchestrateur comme une
+    //! radio : session sans longueur, ni durée ni `Content-Length`, corps qui
+    //! remet TOUT ce que le fournisseur rend, et le mode « longueur connue »
+    //! inchangé à côté.
+
+    use std::io::Read;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tokio::sync::Mutex;
+
+    use crate::db::migrations::run_migrations;
+    use crate::db::sqlite::SqliteDb;
+    use crate::http::streamer::AudioStreamer;
+    use crate::orchestrator::{PlayRequest, PlaybackOrchestrator};
+    use crate::outputs::registry::OutputRegistry;
+    use crate::playback::PlaybackManager;
+    use crate::source_pcm::{
+        Compensation, Consommation, EtatDirect, FluxDirect, FluxPcm, FormatPcm, FournisseurPcm,
+        compensation_du_direct,
+    };
+    use crate::streaming::registry::ServiceRegistry;
+
+    fn orchestrateur() -> PlaybackOrchestrator {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        PlaybackOrchestrator::new(
+            Arc::new(db),
+            Arc::new(PlaybackManager::new()),
+            Arc::new(AudioStreamer::new(0)),
+            Arc::new(Mutex::new(ServiceRegistry::new())),
+            Arc::new(Mutex::new(OutputRegistry::new())),
+            Some("127.0.0.1".into()),
+        )
+    }
+
+    /// Rend `restants` blocs de 1 000 octets numérotés, puis la fin normale.
+    struct Blocs {
+        restants: u32,
+        n: u8,
+    }
+    impl Read for Blocs {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.restants == 0 {
+                return Ok(0);
+            }
+            self.restants -= 1;
+            self.n = self.n.wrapping_add(1);
+            let k = buf.len().min(1000);
+            buf[..k].fill(self.n);
+            Ok(k)
+        }
+    }
+
+    struct Etat;
+    impl EtatDirect for Etat {
+        fn compensation(&self) -> Compensation {
+            Compensation {
+                methode: "tampon_avec_reprise",
+                reechantillonne: false,
+                reprises: 0,
+                derive_ppm: Some(1.5),
+            }
+        }
+    }
+
+    struct Direct {
+        blocs: u32,
+        consommation_vue: Arc<AtomicU64>,
+    }
+    impl FournisseurPcm for Direct {
+        fn ouvrir(&self, _: &str, _: u64) -> Result<FluxPcm, String> {
+            panic!("une source en direct ne s'ouvre jamais en longueur connue");
+        }
+        fn en_direct(&self) -> bool {
+            true
+        }
+        fn ouvrir_direct(&self, _: &str, c: Consommation) -> Result<FluxDirect, String> {
+            self.consommation_vue
+                .store(c.octets() + 1, Ordering::SeqCst);
+            Ok(FluxDirect {
+                format: FormatPcm {
+                    frequence: 48_000,
+                    canaux: 2,
+                    bits: 24,
+                },
+                lecteur: Box::new(Blocs {
+                    restants: self.blocs,
+                    n: 0,
+                }),
+                etat: Some(Arc::new(Etat)),
+            })
+        }
+    }
+
+    fn demande() -> PlayRequest {
+        PlayRequest {
+            zone_id: 1,
+            source: Some("entree-audio".into()),
+            source_id: Some("Loopback Audio".into()),
+            title: Some("Entrée audio — Loopback Audio".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn une_source_en_direct_est_servie_sans_longueur_comme_une_radio() {
+        let orch = orchestrateur();
+        let vue = Arc::new(AtomicU64::new(0));
+        // Bien plus que les 8 tronçons du canal : la pompe ne s'arrête qu'à
+        // la fin décidée par le lecteur.
+        orch.sources_pcm().inscrire(
+            "entree-audio",
+            Arc::new(Direct {
+                blocs: 300,
+                consommation_vue: vue.clone(),
+            }),
+        );
+        let r = orch.resolve_stream(&demande()).await.unwrap();
+        assert_eq!(r.duration_ms, None, "un direct n'a pas de durée");
+        assert_eq!(r.file_size, None, "un direct n'a pas de longueur");
+        assert_eq!(r.source, "entree-audio");
+        assert_eq!(
+            (r.sample_rate, r.bit_depth, r.channels),
+            (Some(48_000), Some(24), Some(2))
+        );
+        assert!(r.url.ends_with(".wav"), "{}", r.url);
+        assert_eq!(
+            vue.load(Ordering::SeqCst),
+            1,
+            "compteur de consommation passé"
+        );
+        let sid = r.stream_id.clone().unwrap();
+        let session = orch.streamer.sessions_state().lock().await[&sid].clone();
+        assert!(session.is_radio, "servie comme une radio : sans longueur");
+        assert_eq!(session.info.bit_depth, 24);
+        assert_eq!(session.detected_output_format(), Some((48_000, 2)));
+        assert_eq!(
+            compensation_du_direct(&sid).map(|c| c.methode),
+            Some("tampon_avec_reprise")
+        );
+        let mut total = 0usize;
+        let mut premiers = Vec::new();
+        while let Some(t) = session.recv_chunk().await {
+            if premiers.len() < 3 {
+                premiers.push(t[0]);
+            }
+            total += t.len();
+        }
+        // Aucun en-tête dans le canal : c'est le corps HTTP d'une radio qui
+        // écrit l'en-tête de longueur indéterminée.
+        assert_eq!(premiers, vec![1, 2, 3]);
+        assert_eq!(total, 300 * 1000);
+        // Fin du flux : l'état de compensation est retiré.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(compensation_du_direct(&sid).is_none());
     }
 }
