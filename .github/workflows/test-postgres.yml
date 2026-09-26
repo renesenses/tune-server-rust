@@ -180,6 +180,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test alarm_source_3715 i3715_alarm_postgres -- --nocapture
 
+      # Chasse PG du 25/09/2026 -- `GROUP BY` lache de l historique : une
+      # colonne nue hors du GROUP BY passe sur SQLite et fait tomber la requete
+      # entiere sur PostgreSQL. « Titres les plus ecoutes » et « Ce jour-la »
+      # rendaient `200 []` sur toute base PG. Jumeau SQLite dans ci.yml.
+      - name: GROUP BY strict de l historique sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_group_by_strict_historique -- --nocapture --test-threads=1
+
       # #2860 — « Continuer l'ecoute » et « Ajoutes recemment » sur une VRAIE
       # base. Ces requetes vivaient dans tune-server, que ce job ne compile
       # pas : elles n'etaient donc jouees que sur SQLite, qui tolere
@@ -306,6 +315,25 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres --lib pg_ensure_schema_parity -- --nocapture --test-threads=1
 
+      # Chasse PG du 25/09/2026 -- deux ecritures propres a SQLite, avalees par
+      # leur appelant : `strftime` dans la fraicheur du cache d API (le cache des
+      # biographies n etait jamais relu) et `STRING_AGG($1)` dans la fusion
+      # manuelle des doublons (le bouton ne fusionnait rien). Jumeau SQLite
+      # dans ci.yml.
+      - name: Fonctions propres a SQLite dans les routes, sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_fonctions_sqlite_seules -- --nocapture --test-threads=1
+
+      # Reste de #5005 -- `ai/recommendations.rs` : `t.artist_id = CAST(a.id AS
+      # TEXT)` (bigint = text refuse), `datetime('now', ...)`. Chaque requete etait
+      # avalee : recommandations retombees sur le hasard, Daily
+      # mixes vides, radio intelligente sans graine. Jumeau SQLite dans ci.yml.
+      - name: Recommandations IA sur PostgreSQL (#5005)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_recommandations_ia -- --nocapture --test-threads=1
+
       # #3726 — les ECRITURES, et non plus seulement les schemas.
       #
       # Les trois portes ci-dessus comparent des SCHEMAS entre eux. Aucune ne
@@ -393,6 +421,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_scan_converge_4602 -- --nocapture --test-threads=1
 
+      # Chasse PG du 25/09/2026 -- le PREMIER demarrage d'une installation
+      # native. Toutes les autres etapes jouent sur une base dont les scripts
+      # ont ete appliques par `psql` AVANT le serveur : `ensure_schema` y trouve
+      # toujours ses tables. Celle-ci monte une base VIDE et laisse le serveur
+      # la creer, comme chez un utilisateur qui vient d'installer.
+      - name: Premier démarrage d'une base PostgreSQL neuve (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_premier_demarrage_base_neuve -- --nocapture --test-threads=1
+
       # #3569 -- les E2E historiques de `postgres_e2e.rs`, ENFIN executees.
       #
       # Quinze epreuves sur dix-neuf n'avaient jamais tourne sur AUCUNE porte.
@@ -456,6 +494,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test dossier_cue_4625 pg_4625 -- --nocapture --test-threads=1
+      # Chasse PG du 25/09/2026 — les favoris LOCAUX (coeurs de piste, d'album,
+      # d'artiste) etaient lies en chaine sur des colonnes BIGINT : ajout en
+      # 500, liste vide, ordre manuel et retrait en echec sur toute base PG.
+      # Le scenario passe par les vraies routes ; son jumeau SQLite tourne dans
+      # ci.yml. `--test-threads=1` : le test vide la table des favoris.
+      - name: Favoris locaux sur PostgreSQL (chasse PG)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_favoris_locaux_entiers -- --nocapture --test-threads=1
       - name: Versions par piste sur PostgreSQL (#2372)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

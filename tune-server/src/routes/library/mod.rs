@@ -86,13 +86,30 @@ pub(super) fn api_cache_get(
     key: &str,
 ) -> Option<Value> {
     use tune_core::db::backend::ToSqlValue;
-    let row = backend
-        .query_one(
+    use tune_core::db::engine::Engine;
+    // `strftime` n'existe pas sur PostgreSQL : la requête SQLite y tombait
+    // (« function strftime(unknown, unknown) does not exist »), l'erreur était
+    // avalée par le `.ok()?` ci-dessous, et le cache des biographies, des
+    // artistes similaires et des métadonnées n'était JAMAIS relu — chaque
+    // visite rappelait le service distant (chasse PG du 25/09/2026). Sur PG,
+    // la fraîcheur se compare en texte à une borne calculée par le serveur :
+    // `updated_at` y est toujours écrit `%Y-%m-%dT%H:%M:%SZ`
+    // (`SettingsRepo::set` et le défaut de la colonne), un format qui se
+    // range comme le temps.
+    let row = match backend.engine() {
+        Engine::Sqlite => backend.query_one(
             "SELECT value FROM settings WHERE key = ? AND \
              CAST(strftime('%s','now') AS INTEGER) - CAST(strftime('%s', updated_at) AS INTEGER) < ?",
             &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
-        )
-        .ok()?
+        ),
+        Engine::Postgres => backend.query_one(
+            "SELECT value FROM settings WHERE key = $1 AND updated_at > \
+             to_char((now() - make_interval(secs => CAST($2 AS DOUBLE PRECISION))) \
+             AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
+            &[&key as &dyn ToSqlValue, &API_CACHE_TTL_SECS as &dyn ToSqlValue],
+        ),
+    }
+    .ok()?
         .and_then(|r| r.first().and_then(|v| v.as_string()))?;
     serde_json::from_str(&row).ok()
 }

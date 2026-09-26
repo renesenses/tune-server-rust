@@ -280,7 +280,18 @@ impl PostgresDb {
     /// an existing Postgres database self-heals on startup instead of erroring
     /// at runtime. `days_of_week`/`multi_zone_ids` were missing on .15 prod →
     /// the alarm scheduler failed every 30s with `column ... does not exist`.
-    async fn ensure_schema(&self) {
+    ///
+    /// ⚠️ Public, et à rejouer APRÈS `run_pg_migrations()` (chasse PG du
+    /// 25/09/2026). `connect()` l'appelle AVANT les scripts numérotés — c'est
+    /// voulu (#1706 : réparer une base dérivée avant qu'une migration ne bute
+    /// dessus). Mais sur une base VIDE, ses `ALTER TABLE` visent des tables qui
+    /// n'existent pas encore : ils échouent tous, et les scripts créent ensuite
+    /// les tables SANS les colonnes que seul `ENSURE_COLUMNS` apporte
+    /// (`listen_history.album_id`, `source_id`, les `bio_*`, `zones.host`…),
+    /// jusqu'au redémarrage suivant. Le second passage, idempotent, les pose dès
+    /// le premier démarrage. Voir
+    /// `tune-server/tests/pg_premier_demarrage_base_neuve.rs`.
+    pub async fn ensure_schema(&self) {
         self.run_each("pg_ensure_tables_failed", ENSURE_TABLES)
             .await;
         self.run_each("pg_ensure_schema_failed", ENSURE_COLUMNS)

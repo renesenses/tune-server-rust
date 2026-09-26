@@ -1015,7 +1015,12 @@ pub(super) async fn merge_duplicate_albums_route(
     // Pick engine-specific aggregate and placeholder helpers.
     let (group_concat_expr, p1, p2) = match state.backend.engine() {
         Engine::Postgres => (
-            PostgresDialect.group_concat(&PostgresDialect.placeholder(1), ","),
+            // L'agrégat porte sur `id`, converti en texte (`STRING_AGG` exige du
+            // texte, cf. #4602). Il agrégeait `$1` — un PARAMÈTRE que la requête
+            // ne lie jamais : PostgreSQL refusait la requête (« bind message
+            // supplies 0 parameters, but prepared statement requires 1 »), la route rendait « 0 fusionné » et le bouton
+            // « Fusionner les doublons » ne faisait rien (chasse PG du 25/09/2026).
+            PostgresDialect.group_concat("CAST(id AS TEXT)", ","),
             PostgresDialect.placeholder(1),
             PostgresDialect.placeholder(2),
         ),
