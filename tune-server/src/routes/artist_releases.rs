@@ -225,7 +225,7 @@ pub(super) async fn artist_releases(
         };
         let Some(arc) = arc else { continue };
         let svc = arc.read().await;
-        if !svc.enabled() || !svc.auth_status().await.authenticated {
+        if !svc.utilisable().await {
             continue;
         }
         // Un service en echec n'emporte ni les autres ni la section.
@@ -280,7 +280,7 @@ pub(super) async fn artist_releases(
         };
         let Some(arc) = arc else { continue };
         let svc = arc.read().await;
-        if !svc.enabled() || !svc.auth_status().await.authenticated {
+        if !svc.utilisable().await {
             continue;
         }
         let Ok(albums) = svc.get_new_releases().await else {

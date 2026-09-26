@@ -684,7 +684,9 @@ async fn federated_search(
             let nom_log = nom.clone();
             (nom, async move {
                 let svc = svc.read().await;
-                if !svc.auth_status().await.authenticated {
+                // #5103 — activé ET connecté : un service désactivé dans les
+                // Réglages ne répond plus, même si sa session reste ouverte.
+                if !svc.utilisable().await {
                     return None;
                 }
                 let Some((decalage, demandee)) = fenetre else {
@@ -820,6 +822,10 @@ fn avec_date_d_ajout(
 #[cfg(test)]
 #[path = "search_pagination_i4803_tests.rs"]
 mod tests_pagination_i4803;
+
+#[cfg(test)]
+#[path = "service_desactive_i5103_tests.rs"]
+mod tests_service_desactive_i5103;
 
 #[cfg(test)]
 mod tests_date_d_ajout {

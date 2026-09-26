@@ -515,23 +515,19 @@ impl HostContext for AppStateHost {
     fn streaming_services(&self) -> Result<Value, String> {
         block_on(async {
             let registry = self.services.lock().await;
-            let statuts = registry.status_all().await;
             let mut services: Vec<Value> = Vec::new();
-            for statut in &statuts {
-                let nom = statut.get("name").and_then(Value::as_str).unwrap_or("");
-                let authentifie = statut
-                    .get("authenticated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                // « les services AUTHENTIFIÉS » : un service déconnecté n'a ni
-                // playlists ni droit d'écriture, l'annoncer n'aiderait personne.
-                if !authentifie || nom.is_empty() {
+            for nom in registry.list() {
+                let Some(arc) = registry.get(&nom) else {
+                    continue;
+                };
+                let svc = arc.read().await;
+                // « les services UTILISABLES » : un service déconnecté n'a ni
+                // playlists ni droit d'écriture, l'annoncer n'aiderait personne ;
+                // un service désactivé dans les Réglages non plus (#5103).
+                if nom.is_empty() || !svc.utilisable().await {
                     continue;
                 }
-                let ecrivable = match registry.get(nom) {
-                    Some(arc) => arc.read().await.supports_write(),
-                    None => false,
-                };
+                let ecrivable = svc.supports_write();
                 services.push(json!({
                     "name": nom,
                     "authenticated": true,

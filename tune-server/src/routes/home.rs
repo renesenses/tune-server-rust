@@ -2597,25 +2597,25 @@ fn fetch_top_tracks(state: &AppState, limit: i64) -> Vec<Value> {
 
 /// If Tidal/Qobuz authenticated, fetch their featured/new-releases.
 async fn streaming_highlights(State(state): State<AppState>) -> Json<Value> {
-    let registry = state.services.lock().await;
-    let statuses = registry.status_all().await;
-    drop(registry);
+    let poignees: Vec<(String, _)> = {
+        let registry = state.services.lock().await;
+        registry
+            .list()
+            .into_iter()
+            .filter_map(|nom| registry.get(&nom).map(|svc| (nom, svc)))
+            .collect()
+    };
 
     let mut highlights: Vec<Value> = Vec::new();
 
-    for svc_status in &statuses {
-        let name = svc_status
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or("");
-        let authenticated = svc_status
-            .get("authenticated")
-            .and_then(|a| a.as_bool())
-            .unwrap_or(false);
-
-        if !authenticated {
+    for (nom, svc) in poignees {
+        // #5103 — activé ET connecté, la règle unique de
+        // `StreamingService::utilisable` : un service désactivé dans les
+        // Réglages ne s'invite plus sur l'accueil.
+        if !svc.read().await.utilisable().await {
             continue;
         }
+        let name = nom.as_str();
 
         match name {
             "tidal" | "qobuz" => {

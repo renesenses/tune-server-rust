@@ -478,6 +478,22 @@ pub trait StreamingService: Send + Sync {
         credentials: &serde_json::Value,
     ) -> Result<AuthStatus, TuneError>;
     async fn auth_status(&self) -> AuthStatus;
+
+    /// Le service peut-il être INTERROGÉ ou PROPOSÉ : activé ET connecté.
+    ///
+    /// Les deux faits sont indépendants — la case « Actif » des Réglages
+    /// n'ouvre ni ne ferme la session. Un service connecté mais désactivé
+    /// (« Connecté, mais désactivé » à l'écran) ne doit plus apparaître
+    /// nulle part : la recherche fédérée ne testait que la connexion, et
+    /// YouTube désactivé y répondait encore, badge compris (#5103, FabienM,
+    /// fil 1957). Toute route qui choisit ELLE-MÊME les services qu'elle
+    /// interroge passe par ici, pour qu'il n'y ait qu'une règle.
+    ///
+    /// `enabled()` d'abord : un service désactivé n'a pas à être sondé.
+    async fn utilisable(&self) -> bool {
+        self.enabled() && self.auth_status().await.authenticated
+    }
+
     async fn logout(&mut self) -> Result<(), TuneError>;
 
     async fn search(&self, query: &str, limit: usize) -> Result<SearchResults, TuneError>;
