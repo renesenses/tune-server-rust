@@ -4,7 +4,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_http_types::panne_sql::OuDefautJournalise;
 use unicode_normalization::UnicodeNormalization;
 
 use tune_core::db::artist_repo::ArtistRepo;
