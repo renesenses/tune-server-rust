@@ -5274,6 +5274,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-circle"
+version = "0.9.164"
+dependencies = [
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "tune-core",
+]
+
+[[package]]
 name = "tune-cli"
 version = "0.9.165"
 dependencies = [
@@ -5598,6 +5613,7 @@ dependencies = [
  "tracing-subscriber",
  "tune-bandcamp",
  "tune-cd",
+ "tune-circle",
  "tune-concerts",
  "tune-core",
  "tune-dj",

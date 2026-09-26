@@ -164,6 +164,19 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
         })))
         .await;
 
+    // Tune Circle, étape T1 (#5018). La base seule : le greffon y relit, à
+    // chaque appel, la session SSO du serveur (`mozaik_access_token`,
+    // `mozaik_refresh_token`, `mozaik_base_url`) — la même que lisent
+    // `library_sync` et les routes `/cloud/*`. Aucun service hôte de plus.
+    #[cfg(feature = "circle")]
+    loader
+        .register(Box::new(tune_circle::CirclePlugin::new(
+            tune_circle::HostServices {
+                backend: state.backend.clone(),
+            },
+        )))
+        .await;
+
     // Pont Roon (#3914) — Premium. La licence est passée pour que le greffon
     // refuse lui-même (402) ; le cache d'illustrations, pour y ranger les
     // images de l'archive sous le même condensat que tout le reste.

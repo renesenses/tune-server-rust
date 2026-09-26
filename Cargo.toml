@@ -10,7 +10,7 @@
 # lit cette liste — dont la garde `cargo test`, qui restait verte pendant que
 # ses SEPT essais n'etaient executes par aucune porte. Le rendre explicite ne
 # change rien pour cargo ; ca rend l'inventaire vrai.
-members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts", "plugins/tune-pont-roon", "plugins/tune-cd", "plugins/tune-playlists-converter"]
+members = ["tune-core", "tune-http-types", "tune-output-api", "tune-server", "tune-smart-http", "tune-stream-http", "tune-streaming-http", "tune-cli", "tune-ffi", "tune-bridge", "tune-plugin-runtime-wasm", "plugins/tune-dj", "plugins/tune-karaoke", "plugins/tune-bandcamp", "plugins/tune-concerts", "plugins/tune-pont-roon", "plugins/tune-cd", "plugins/tune-playlists-converter", "plugins/tune-circle"]
 # tune-desktop and tune-widget are Tauri apps, each with its own workspace and
 # release pipeline (.github/workflows/widget.yml). They are kept out of the
 # server workspace so their GUI/webkit deps never enter the server CI

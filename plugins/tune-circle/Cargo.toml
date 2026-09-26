@@ -1,0 +1,30 @@
+[package]
+name = "tune-circle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Tune Circle, étape T1 (#5018) : le cercle — inviter, accepter, refuser,
+# retirer, révoquer. Greffon natif, sur le modèle de `tune-bandcamp` et de
+# `tune-cd`.
+#
+# Le cloud mozaiklabs porte LE DROIT et LA FICHE : ce greffon ne fait que
+# relayer `/api/v1/ext/circle/…` vers `/api/v1/circle/…` avec le jeton SSO que
+# le serveur détient déjà (`mozaik_access_token`, obtenu par PKCE). Il ne
+# stocke rien du cercle : une révocation vue par le cloud est vraie au prochain
+# appel, sans cache à invalider.
+
+[dependencies]
+tune-core = { path = "../../tune-core", default-features = false, features = ["plugin-http"] }
+axum = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Nommé dans les signatures du relais (`Method`, `Url`). `tune-core` ne le
+# réexporte pas, comme pour `tune-bandcamp` et `tune-karaoke`.
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { workspace = true }
