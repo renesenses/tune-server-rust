@@ -4926,9 +4926,16 @@ async fn do_transfer(
                 // début (même seuil que la route seek) — inutile de chercher
                 // dans un flux qui vient de démarrer.
                 if source_position_ms > 3000 {
+                    // #4442 — pas un `seek` nu dans la foulée du `Play` : voir
+                    // `reprendre_la_position_transferee`.
                     if let Err(error) = state
                         .orchestrator
-                        .seek(target_zone, source_position_ms, Some(did))
+                        .reprendre_la_position_transferee(
+                            target_zone,
+                            did,
+                            source_position_ms,
+                            !source_paused,
+                        )
                         .await
                     {
                         return output_command_error_response(error);

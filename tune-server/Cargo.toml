@@ -1171,3 +1171,10 @@ path = "tests/playlists_pistes_de_service.rs"
 [[test]]
 name = "pg_favoris_locaux_entiers"
 path = "tests/pg_favoris_locaux_entiers.rs"
+
+# #4442 — le transfert vers une zone réseau reprend à la position de la
+# source. `autotests = false` en tête de ce manifeste : sans cette cible, le
+# fichier ne serait jamais compilé, ni en local ni en CI.
+[[test]]
+name = "transfert_reprend_la_position_4442"
+path = "tests/transfert_reprend_la_position_4442.rs"
