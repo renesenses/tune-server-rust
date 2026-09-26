@@ -18,6 +18,8 @@ pub(crate) mod enrich;
 /// Périmètre de l'explorateur de dossiers (#1275).
 pub(crate) mod explorateur;
 mod import_pont_roon;
+// #5141 — remplacement du paquet `Tune Server.app` complet sur macOS.
+pub(crate) mod paquet_macos;
 // Shared enrichment quota/premium gate, reused by /library/enrich-all so the
 // full-library MusicBrainz path isn't a free bypass of the same operation.
 // #2507 : et par `/library/artwork/enrich*` — le bouton « Enrichir les images
