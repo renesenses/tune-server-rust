@@ -16,23 +16,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-const APPAREIL: &str = "dlna:diretta-renderer-88782b77cab17717";
+pub(super) const APPAREIL: &str = "dlna:diretta-renderer-88782b77cab17717";
 /// La piste en cours. Longue, pour que la fenêtre des 30 s soit un vrai
 /// intervalle et non toute la piste.
-const DUREE_COURANTE_MS: i64 = 300_000;
+pub(super) const DUREE_COURANTE_MS: i64 = 300_000;
 /// Toutes les SUIVANTES ont la même durée, exprès : après la transition le
 /// renderer annonce cette durée quelle que soit celle des trois qu'il joue,
 /// donc la durée rapportée ne peut pas trahir la réponse qu'on cherche.
-const DUREE_SUIVANTE_MS: i64 = 200_000;
+pub(super) const DUREE_SUIVANTE_MS: i64 = 200_000;
 
 /// Les quatre titres du banc, tous DISTINCTS et sur quatre pistes
 /// distinctes : les gardes anti-doublon de la lecture coalescent une
 /// relecture du même identifiant de piste, et un test qui rejouerait deux
 /// fois la même piste serait vert sans rien prouver.
-const COURANTE: &str = "Voir un ami pleurer";
-const ARMEE: &str = "Script Switch Trigger";
-const SUITE: &str = "Hold Me";
-const INSEREE: &str = "Freddie Freeloader";
+pub(super) const COURANTE: &str = "Voir un ami pleurer";
+pub(super) const ARMEE: &str = "Script Switch Trigger";
+pub(super) const SUITE: &str = "Hold Me";
+pub(super) const INSEREE: &str = "Freddie Freeloader";
 
 /// Un WAV minuscule mais réel : `resolve_stream` ouvre le fichier, un
 /// chemin qui ne mène à rien ne s'armerait pas.
@@ -58,23 +58,23 @@ fn ecrire_wav(chemin: &std::path::Path) {
     f.flush().unwrap();
 }
 
-struct Banc {
-    poller: PositionPoller,
-    playback: Arc<PlaybackManager>,
-    db: Arc<dyn crate::db::backend::DbBackend>,
-    outputs: Arc<Mutex<OutputRegistry>>,
-    zone_id: i64,
-    pistes: Vec<i64>,
-    _fichiers: Vec<tempfile::NamedTempFile>,
-    poll_states: HashMap<i64, ZonePollState>,
-    idle: HashMap<i64, IdlePollBackoff>,
+pub(super) struct Banc {
+    pub(super) poller: PositionPoller,
+    pub(super) playback: Arc<PlaybackManager>,
+    pub(super) db: Arc<dyn crate::db::backend::DbBackend>,
+    pub(super) outputs: Arc<Mutex<OutputRegistry>>,
+    pub(super) zone_id: i64,
+    pub(super) pistes: Vec<i64>,
+    pub(super) _fichiers: Vec<tempfile::NamedTempFile>,
+    pub(super) poll_states: HashMap<i64, ZonePollState>,
+    pub(super) idle: HashMap<i64, IdlePollBackoff>,
 }
 
 impl Banc {
     /// Une zone DLNA en lecture de `COURANTE`, file `[COURANTE, ARMEE,
     /// SUITE]`. `INSEREE` existe en bibliothèque mais pas encore en file :
     /// c'est elle que le geste ajoutera.
-    async fn monter() -> Self {
+    pub(super) async fn monter() -> Self {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
@@ -165,7 +165,7 @@ impl Banc {
     /// Porter la lecture à `position_ms` SANS attendre : la position du
     /// renderer et l'horloge de fin de piste du poller sont deux champs, on
     /// les écrit. C'est l'injection réclamée — pas un `sleep` déguisé.
-    async fn a(&mut self, position_ms: u64) {
+    pub(super) async fn a(&mut self, position_ms: u64) {
         self.poser(position_ms, DUREE_COURANTE_MS as u64).await;
     }
 
@@ -173,11 +173,11 @@ impl Banc {
     /// le Devialet de FabienM (#1929, point 3) et le pont UPnP LMS
     /// (Yacine/Jean-Pierre) : la durée que Tune connaît est celle de la
     /// FILE, pas celle du renderer.
-    async fn a_sans_duree_annoncee(&mut self, position_ms: u64) {
+    pub(super) async fn a_sans_duree_annoncee(&mut self, position_ms: u64) {
         self.poser(position_ms, 0).await;
     }
 
-    async fn poser(&mut self, position_ms: u64, duree_annoncee_ms: u64) {
+    pub(super) async fn poser(&mut self, position_ms: u64, duree_annoncee_ms: u64) {
         {
             let reg = self.outputs.lock().await;
             let arc = reg.get(APPAREIL).unwrap();
@@ -197,7 +197,7 @@ impl Banc {
         ps.last_position_ms = position_ms;
     }
 
-    async fn tic(&mut self) {
+    pub(super) async fn tic(&mut self) {
         self.poller
             .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
             .await;
@@ -206,18 +206,18 @@ impl Banc {
     /// Le renderer enchaîne : il passe sur l'URI qu'on lui a armée et
     /// repart de zéro. C'est la chute de position du journal
     /// (`gapless_position_reset_detected prev_pos=… new_pos=0`).
-    async fn le_renderer_enchaine(&mut self) {
+    pub(super) async fn le_renderer_enchaine(&mut self) {
         self.enchainer(DUREE_SUIVANTE_MS as u64).await;
     }
 
     /// Le même enchaînement chez un renderer muet sur la durée : il passe à
     /// l'URI armée et continue d'annoncer `0`. Ni avant ni après la
     /// transition Tune n'apprend quoi que ce soit de lui.
-    async fn le_renderer_enchaine_sans_duree(&mut self) {
+    pub(super) async fn le_renderer_enchaine_sans_duree(&mut self) {
         self.enchainer(0).await;
     }
 
-    async fn enchainer(&mut self, duree_annoncee_ms: u64) {
+    pub(super) async fn enchainer(&mut self, duree_annoncee_ms: u64) {
         let reg = self.outputs.lock().await;
         let arc = reg.get(APPAREIL).unwrap();
         let sortie = arc.lock().await;
@@ -231,7 +231,7 @@ impl Banc {
 
     /// « Lire ensuite » : exactement ce que fait la route — `insert_at` à la
     /// position demandée, puis `update_queue_info` avec le nouveau total.
-    async fn lire_ensuite(&self, indice_piste: usize, position: i64) {
+    pub(super) async fn lire_ensuite(&self, indice_piste: usize, position: i64) {
         let depot = PlayQueueRepo::with_backend(self.db.clone());
         depot
             .insert_at(
@@ -251,7 +251,7 @@ impl Banc {
 
     /// « + File » : le même ajout, mais en FIN de file. Rien ne bouge avant
     /// la piste armée.
-    async fn ajouter_en_fin(&self, indice_piste: usize) {
+    pub(super) async fn ajouter_en_fin(&self, indice_piste: usize) {
         let depot = PlayQueueRepo::with_backend(self.db.clone());
         depot
             .append(
@@ -270,7 +270,7 @@ impl Banc {
 
     /// Ce qui est PARTI au renderer par `SetNextAVTransportURI`, dans
     /// l'ordre. La mesure du ticket.
-    async fn armees(&self) -> Vec<String> {
+    pub(super) async fn armees(&self) -> Vec<String> {
         let reg = self.outputs.lock().await;
         let arc = reg.get(APPAREIL).unwrap();
         let sortie = arc.lock().await;
@@ -284,7 +284,7 @@ impl Banc {
 
     /// Ce que le renderer JOUE réellement, nommé par le titre qu'on lui a
     /// donné avec l'URI.
-    async fn joue_par_le_renderer(&self) -> Option<String> {
+    pub(super) async fn joue_par_le_renderer(&self) -> Option<String> {
         let reg = self.outputs.lock().await;
         let arc = reg.get(APPAREIL).unwrap();
         let sortie = arc.lock().await;
@@ -299,7 +299,7 @@ impl Banc {
     /// Les `Play` complets envoyés au renderer. Un enchaînement sans blanc
     /// n'en produit AUCUN : dès qu'il y en a un, il y a eu un arrêt et une
     /// relance, c'est-à-dire un blanc.
-    async fn play_complets(&self) -> Vec<String> {
+    pub(super) async fn play_complets(&self) -> Vec<String> {
         let reg = self.outputs.lock().await;
         let arc = reg.get(APPAREIL).unwrap();
         let sortie = arc.lock().await;
@@ -312,7 +312,7 @@ impl Banc {
     }
 
     /// Ce que l'écran affiche : la position dans la file, et le titre.
-    async fn ecran(&self) -> (i64, String) {
+    pub(super) async fn ecran(&self) -> (i64, String) {
         let etat = self.playback.get_state(self.zone_id).await;
         (
             etat.queue_position,
@@ -321,7 +321,7 @@ impl Banc {
     }
 
     /// La file telle qu'elle est rendue à l'écran, dans l'ordre.
-    async fn file_affichee(&self) -> Vec<String> {
+    pub(super) async fn file_affichee(&self) -> Vec<String> {
         PlayQueueRepo::with_backend(self.db.clone())
             .get_ordered(self.zone_id)
             .unwrap()
