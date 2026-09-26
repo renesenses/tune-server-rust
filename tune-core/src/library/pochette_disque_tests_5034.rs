@@ -130,6 +130,45 @@ fn la_regle_retire_seulement_ce_qui_vient_du_disque_5034() {
             true,
             Geste::Poser(a.clone()),
         ),
+        // Du disque, source là mais image CHANGÉE : suivie, même en passe
+        // automatique (décision du 25/09/2026, #5034 point 1).
+        (
+            Some("old"),
+            Some(Dossier),
+            Some(&a),
+            false,
+            true,
+            false,
+            Geste::Poser(a.clone()),
+        ),
+        (
+            Some("old"),
+            None,
+            Some(&a),
+            false,
+            true,
+            false,
+            Geste::Poser(a.clone()),
+        ),
+        // Inconnue, non prouvée, autre image : gardée hors scan complet.
+        (
+            Some("old"),
+            None,
+            Some(&a),
+            false,
+            false,
+            false,
+            Geste::Garder,
+        ),
+        (
+            Some("old"),
+            None,
+            Some(&a),
+            true,
+            false,
+            false,
+            Geste::Poser(a.clone()),
+        ),
         // Même image : confirmée.
         (
             Some("aaa"),
@@ -148,7 +187,7 @@ fn la_regle_retire_seulement_ce_qui_vient_du_disque_5034() {
     ];
     for (i, (cover, source, l, complet, dd, partie, attendu)) in cas.into_iter().enumerate() {
         assert_eq!(
-            arbitrer(&etat(cover, source), l, complet, dd, partie),
+            arbitrer(&etat(cover, source), l, complet, dd),
             attendu,
             "ligne {i} : {cover:?} {source:?} lue={:?} complet={complet} du_disque={dd} partie={partie}",
             l.map(|x| &x.condensat)
@@ -272,4 +311,64 @@ fn l_absorption_emporte_la_source_avec_la_pochette_5034() {
         e.source, None,
         "la source d'une autre image ne s'invite pas"
     );
+}
+
+/// Décision 3 — l'empreinte bon marché d'une jaquette FLAC reconnaît la MÊME
+/// image, distingue une autre, et se tait (`None`) quand elle ne sait pas :
+/// pas de jaquette, pas un FLAC.
+#[test]
+fn l_empreinte_d_une_jaquette_flac_reconnait_la_meme_image_5034() {
+    use crate::library::artwork::empreinte_jaquette_flac;
+    use lofty::config::{ParseOptions, WriteOptions};
+    use lofty::file::AudioFile;
+    use lofty::flac::FlacFile;
+    use lofty::ogg::OggPictureStorage;
+    use lofty::picture::{MimeType, Picture, PictureInformation, PictureType};
+
+    let dir = tempfile::tempdir().unwrap();
+    let gabarit = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/test.flac");
+    let avec = |nom: &str, image: Option<&[u8]>| -> PathBuf {
+        let p = dir.path().join(nom);
+        std::fs::copy(&gabarit, &p).unwrap();
+        let mut f = std::fs::File::open(&p).unwrap();
+        let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        while !flac.pictures().is_empty() {
+            flac.remove_picture(0);
+        }
+        if let Some(o) = image {
+            let pic = Picture::unchecked(o.to_vec())
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Jpeg)
+                .build();
+            flac.insert_picture(pic, Some(PictureInformation::default()))
+                .unwrap();
+        }
+        flac.save_to_path(&p, WriteOptions::default()).unwrap();
+        p
+    };
+    let grande_a: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let mut grande_b = grande_a.clone();
+    grande_b[150_010] ^= 0xFF; // même longueur, un octet au milieu
+    let petite: &[u8] = b"\xFF\xD8\xFF\xE0PETITE";
+
+    let a1 = empreinte_jaquette_flac(&avec("a1.flac", Some(&grande_a)));
+    let a2 = empreinte_jaquette_flac(&avec("a2.flac", Some(&grande_a)));
+    let b = empreinte_jaquette_flac(&avec("b.flac", Some(&grande_b)));
+    let p = empreinte_jaquette_flac(&avec("p.flac", Some(petite)));
+    assert!(
+        a1.is_some() && p.is_some(),
+        "une jaquette doit donner une empreinte"
+    );
+    assert_eq!(a1, a2, "la même image, deux pistes : même empreinte");
+    assert_ne!(a1, p, "une autre longueur : autre empreinte");
+    assert_ne!(a1, b, "même longueur, milieu différent : autre empreinte");
+    assert_eq!(
+        empreinte_jaquette_flac(&avec("sans.flac", None)),
+        None,
+        "sans jaquette : l'empreinte ne sait pas, l'appelant relit"
+    );
+    let pas_flac = dir.path().join("x.mp3");
+    std::fs::write(&pas_flac, b"ID3\x04\x00\x00\x00\x00\x00\x00").unwrap();
+    assert_eq!(empreinte_jaquette_flac(&pas_flac), None);
 }

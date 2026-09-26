@@ -162,9 +162,32 @@ static SCAN_GATE: ScanGate = ScanGate::new();
 /// `le_scan_de_demarrage_horodate_son_annonce_et_devient_perimable` ont rougi
 /// sur Shrek, sans rapport avec leur code).
 #[cfg(test)]
+static VERROU_DES_SCANS_DE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 pub(crate) fn serialiser_les_scans_de_test() -> std::sync::MutexGuard<'static, ()> {
-    static VERROU: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    VERROU.lock().unwrap_or_else(|e| e.into_inner())
+    VERROU_DES_SCANS_DE_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Le même verrou, attendu SANS bloquer le fil : pour une épreuve qui a déjà
+/// lancé un scan sur son propre exécuteur. Bloquer le fil figerait ce scan,
+/// qui tient le droit de scanner que le détenteur du verrou attend : les deux
+/// s'attendraient pour toujours (vu sur Shrek, les aides de
+/// `scan_realigne_tests_4896`, qui scannent deux fois par épreuve).
+#[cfg(test)]
+pub(crate) async fn serialiser_les_scans_de_test_sans_bloquer() -> std::sync::MutexGuard<'static, ()>
+{
+    loop {
+        match VERROU_DES_SCANS_DE_TEST.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(e)) => return e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
 }
 
 /// Épreuves seulement — attend que le droit de scanner soit LIBRE : le scan

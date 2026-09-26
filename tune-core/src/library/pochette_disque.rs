@@ -132,13 +132,61 @@ pub fn lire_l_image_du_dossier(piste: &Path, cache_dir: &Path) -> Option<Pochett
     })
 }
 
+/// Ce que l'appelant sait déjà de la jaquette intégrée d'une piste.
+#[derive(Debug, Clone, Copy)]
+pub enum Jaquette<'a> {
+    /// Rien : elle sera relue sur le disque si la règle en a besoin.
+    Inconnue,
+    /// Lue, et la piste n'en porte pas : rien à relire.
+    Absente,
+    /// Lue : ses octets et son type.
+    Lue(&'a (Vec<u8>, String)),
+}
+
+impl<'a> Jaquette<'a> {
+    /// Des octets lus avec les balises : présents, ou inconnus.
+    pub fn depuis(octets: Option<&'a (Vec<u8>, String)>) -> Self {
+        octets.map_or(Self::Inconnue, Self::Lue)
+    }
+
+    /// Des octets relus sur la piste : présents, ou absents.
+    pub fn relue(octets: Option<&'a (Vec<u8>, String)>) -> Self {
+        octets.map_or(Self::Absente, Self::Lue)
+    }
+
+    fn octets(self) -> Option<&'a (Vec<u8>, String)> {
+        match self {
+            Self::Lue(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    /// La piste porte-t-elle une jaquette ? Ne relit la piste que si l'on
+    /// n'en sait rien.
+    fn presente(self, piste: &Path) -> bool {
+        match self {
+            Self::Lue(_) => true,
+            Self::Absente => false,
+            Self::Inconnue => extract_cover_art(piste).is_some(),
+        }
+    }
+}
+
 /// UNE piste : sa jaquette intégrée d'abord, puis l'image de son dossier.
 pub fn lire_depuis_la_piste(
     piste: &Path,
     cache_dir: &Path,
     octets: Option<&(Vec<u8>, String)>,
 ) -> Option<PochetteLue> {
-    lire_la_jaquette(piste, cache_dir, octets).or_else(|| lire_l_image_du_dossier(piste, cache_dir))
+    lire_selon(piste, cache_dir, Jaquette::depuis(octets))
+}
+
+fn lire_selon(piste: &Path, cache_dir: &Path, jaquette: Jaquette<'_>) -> Option<PochetteLue> {
+    let integree = match jaquette {
+        Jaquette::Absente => None,
+        j => lire_la_jaquette(piste, cache_dir, j.octets()),
+    };
+    integree.or_else(|| lire_l_image_du_dossier(piste, cache_dir))
 }
 
 /// L'album ENTIER, relu sur le disque : la première jaquette intégrée parmi
@@ -198,24 +246,23 @@ fn vient_du_disque(etat: &EtatPochette, lue: Option<&PochetteLue>, pistes: &[Pat
 /// LA règle. `complet` : « Analyse complète » (scan forcé) ; sinon passe
 /// automatique — scan rapide, « Répertoires », scan de démarrage, surveillant.
 ///
-/// `source_partie` : le fichier qui avait donné la pochette en place n'existe
-/// plus, ou ne porte plus d'image. Ce que le disque offre alors la REMPLACE —
-/// c'est un retrait suivi d'une reprise, pas un changement.
-///
 /// | pochette en place | disque : rien | disque : même image | disque : autre image |
 /// |---|---|---|---|
 /// | aucune | — | — | posée |
 /// | téléversée | gardée | gardée | gardée |
 /// | fournisseur, import | gardée | gardée | posée si complet |
-/// | du disque (prouvée), source partie | **retirée** | confirmée | **posée** |
-/// | du disque (prouvée), source là | — | confirmée | posée si complet |
+/// | du disque (prouvée) | **retirée** | confirmée | **posée** |
 /// | inconnue, non prouvée | gardée | — | posée si complet |
+///
+/// Décision de Bertrand du 25/09/2026 (#5034, point 1) : les passes
+/// automatiques SUIVENT une pochette du disque CHANGÉE — jaquette retouchée
+/// dans Mp3tag, `cover.jpg` remplacé. Jusqu'ici seule l'Analyse complète le
+/// faisait, et pour la seule jaquette intégrée.
 pub fn arbitrer(
     etat: &EtatPochette,
     lue: Option<&PochetteLue>,
     complet: bool,
     du_disque: bool,
-    source_partie: bool,
 ) -> Geste {
     let Some(actuelle) = etat.cover_path.as_deref() else {
         return lue.map_or(Geste::Garder, |l| Geste::Poser(l.clone()));
@@ -236,7 +283,7 @@ pub fn arbitrer(
         // Même image : on la CONFIRME, pour que sa source et son fichier
         // soient à jour (une ligne inconnue devient ainsi classée).
         Some(l) if l.condensat == actuelle => Geste::Poser(l.clone()),
-        Some(l) if complet || (du_disque && source_partie) => Geste::Poser(l.clone()),
+        Some(l) if complet || du_disque => Geste::Poser(l.clone()),
         Some(_) => Geste::Garder,
     }
 }
@@ -312,9 +359,7 @@ pub fn reevaluer_l_album(
     let Ok(Some(etat)) = repo.etat_pochette(album_id) else {
         return Geste::Garder;
     };
-    reevaluer_avec(
-        db, &repo, album_id, &etat, cache_dir, complet, en_plus, false,
-    )
+    reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, en_plus)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -326,26 +371,25 @@ fn reevaluer_avec(
     cache_dir: &Path,
     complet: bool,
     en_plus: Option<&Path>,
-    perdue: bool,
 ) -> Geste {
     // Rien à relire pour une pochette que le disque ne peut pas toucher.
     if etat.cover_path.is_some() && matches!(etat.source, Some(SourcePochette::Televersee)) {
         return Geste::Garder;
     }
     let mut pistes = pistes_de_l_album(db, album_id);
+    // La piste en cours d'écriture passe APRÈS celles que la base connaît :
+    // son rang dans le disque n'est pas encore écrit, et elle n'est relue ici
+    // que quand la pochette ne vient pas d'elle — une autre piste source a
+    // changé, ou elle a perdu sa jaquette. La mettre en tête laissait un
+    // single, relu le premier, imposer sa jaquette à l'album (#4650).
     if let Some(p) = en_plus
         && !pistes.iter().any(|q| q == p)
     {
-        pistes.insert(0, p.to_path_buf());
+        pistes.push(p.to_path_buf());
     }
     let lue = lire_depuis_l_album(&pistes, cache_dir);
     let du_disque = vient_du_disque(etat, lue.as_ref(), &pistes);
-    let source_partie = perdue
-        || etat
-            .fichier
-            .as_deref()
-            .is_some_and(|f| !extended_path(Path::new(f)).exists());
-    let geste = arbitrer(etat, lue.as_ref(), complet, du_disque, source_partie);
+    let geste = arbitrer(etat, lue.as_ref(), complet, du_disque);
     appliquer(repo, album_id, &geste);
     geste
 }
@@ -354,8 +398,9 @@ fn reevaluer_avec(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Suivi {
     /// L'album est tranché pour ce scan : les pistes suivantes n'y reviennent
-    /// pas. Faux seulement pour un album SANS pochette dont cette piste n'a
-    /// rien donné — la suivante peut en porter une.
+    /// pas. Faux pour un album SANS pochette dont cette piste n'a rien donné,
+    /// et pour un album illustré par son IMAGE DE DOSSIER : une piste suivante
+    /// peut porter une jaquette intégrée, qui passe avant (#5035).
     pub tranche: bool,
     /// Une pochette a été posée (compteur du rapport de scan).
     pub posee: bool,
@@ -371,12 +416,41 @@ pub struct Suivi {
 /// - pochette tirée de CETTE piste, ou fichier source disparu : cette piste,
 ///   puis — si elle ne porte plus d'image — l'album entier.
 ///
-/// `octets` : la jaquette déjà lue avec les balises, s'il y en a.
+/// `jaquette` : ce que l'appelant sait déjà de la jaquette de la piste.
 pub fn suivre_la_piste(
     db: &std::sync::Arc<dyn DbBackend>,
     album_id: i64,
     piste: &Path,
-    octets: Option<&(Vec<u8>, String)>,
+    jaquette: Jaquette<'_>,
+    cache_dir: &Path,
+    complet: bool,
+) -> Suivi {
+    let suivi = suivre(db, album_id, piste, jaquette, cache_dir, complet);
+    // #5035 — un album illustré par son image de DOSSIER reste ouvert : la
+    // piste suivante peut porter une jaquette intégrée, qui passe avant.
+    if suivi.tranche
+        && matches!(
+            AlbumRepo::with_backend(db.clone())
+                .etat_pochette(album_id)
+                .ok()
+                .flatten()
+                .and_then(|e| e.source),
+            Some(SourcePochette::Dossier)
+        )
+    {
+        return Suivi {
+            tranche: false,
+            ..suivi
+        };
+    }
+    suivi
+}
+
+fn suivre(
+    db: &std::sync::Arc<dyn DbBackend>,
+    album_id: i64,
+    piste: &Path,
+    jaquette: Jaquette<'_>,
     cache_dir: &Path,
     complet: bool,
 ) -> Suivi {
@@ -400,7 +474,7 @@ pub fn suivre_la_piste(
 
     // Album sans pochette : cette piste la donne, ou la suivante.
     if etat.cover_path.is_none() {
-        let Some(lue) = lire_depuis_la_piste(piste, cache_dir, octets) else {
+        let Some(lue) = lire_selon(piste, cache_dir, jaquette) else {
             return Suivi {
                 tranche: false,
                 posee: false,
@@ -419,6 +493,12 @@ pub fn suivre_la_piste(
         .fichier
         .as_deref()
         .is_some_and(|f| !extended_path(Path::new(f)).exists());
+    // Disparu, ou réécrit depuis la lecture : l'empreinte (« mtime:taille »)
+    // ne correspond plus.
+    let source_changee = source_disparue
+        || etat.fichier.as_deref().is_some_and(|f| {
+            empreinte_du_fichier(Path::new(f)).as_deref() != etat.empreinte.as_deref()
+        });
 
     match etat.source {
         Some(SourcePochette::Televersee) => {
@@ -433,19 +513,43 @@ pub fn suivre_la_piste(
                 posee: false,
             };
         }
+        // #5035 — l'album est illustré par son IMAGE DE DOSSIER et cette
+        // piste porte une jaquette intégrée : la jaquette passe avant. C'est
+        // le cas où la PREMIÈRE piste lue n'en portait pas — son `cover.jpg`
+        // gagnait, et `albums_with_cover` le figeait pour tout le scan, même
+        // quand toutes les autres pistes portaient la leur. L'album entier
+        // tranche (première jaquette dans l'ordre du disque).
+        Some(SourcePochette::Dossier) if !complet && jaquette.presente(piste) => {
+            let geste = reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste));
+            return Suivi {
+                tranche: true,
+                posee: matches!(geste, Geste::Poser(_)),
+            };
+        }
         // Pochette du disque tirée d'un autre fichier, toujours présent : la
         // relecture de cette piste ne la concerne pas (un single à la jaquette
         // propre, rangé dans l'album, ne la remplace pas — #4650).
-        Some(s) if s.vient_du_disque() && !complet && !piste_source && !source_disparue => {
+        Some(s) if s.vient_du_disque() && !complet && !piste_source && !source_changee => {
             return Suivi {
                 tranche: true,
                 posee: false,
             };
         }
+        // Tirée d'un AUTRE fichier, qui a changé : c'est LUI qu'il faut
+        // relire, pas cette piste — l'album entier tranche. Sans quoi un
+        // single à la jaquette propre, relu le premier après une retouche de
+        // tout l'album, imposerait sa pochette au disque (#4650).
+        Some(s) if s.vient_du_disque() && !complet && !piste_source => {
+            let geste = reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste));
+            return Suivi {
+                tranche: true,
+                posee: matches!(geste, Geste::Poser(_)),
+            };
+        }
         _ => {}
     }
 
-    let lue = lire_depuis_la_piste(piste, cache_dir, octets);
+    let lue = lire_selon(piste, cache_dir, jaquette);
     let pistes = [piste.to_path_buf()];
     let du_disque = vient_du_disque(&etat, lue.as_ref(), &pistes);
     // La piste ne porte plus d'image — ou plus la sienne : l'album entier
@@ -459,18 +563,9 @@ pub fn suivre_la_piste(
         }
     };
     let geste = if du_disque && (perdue || source_disparue) {
-        reevaluer_avec(
-            db,
-            &repo,
-            album_id,
-            &etat,
-            cache_dir,
-            complet,
-            Some(piste),
-            perdue,
-        )
+        reevaluer_avec(db, &repo, album_id, &etat, cache_dir, complet, Some(piste))
     } else {
-        let g = arbitrer(&etat, lue.as_ref(), complet, du_disque, false);
+        let g = arbitrer(&etat, lue.as_ref(), complet, du_disque);
         appliquer(&repo, album_id, &g);
         g
     };
@@ -481,10 +576,11 @@ pub fn suivre_la_piste(
 }
 
 /// Fin de scan : chaque album dont la pochette sort d'un fichier du disque
-/// est confronté à ce fichier, d'un `stat`. Disparu, l'album est relu en
-/// entier et la règle s'applique. C'est ce qui rattrape le `cover.jpg`
-/// supprimé d'un album dont aucune piste n'a changé — le scan rapide ne relit
-/// que les pistes modifiées.
+/// est confronté à ce fichier, d'un `stat`. Disparu ou réécrit (empreinte
+/// « mtime:taille » différente), l'album est relu en entier et la règle
+/// s'applique. C'est ce qui rattrape le `cover.jpg` supprimé ou remplacé
+/// d'un album dont aucune piste n'a changé — le scan rapide ne relit que les
+/// pistes modifiées.
 ///
 /// `portee` : les dossiers scannés (« Répertoires ») ; vide = tous.
 pub fn suivre_les_fichiers_sources(
@@ -502,11 +598,12 @@ pub fn suivre_les_fichiers_sources(
         }
     };
     let mut reprises = 0usize;
-    for (album_id, fichier, _empreinte) in sources {
+    for (album_id, fichier, empreinte) in sources {
         if !portee.is_empty() && !portee.iter().any(|d| sous_le_dossier(&fichier, d)) {
             continue;
         }
-        if empreinte_du_fichier(Path::new(&fichier)).is_some() {
+        let actuelle = empreinte_du_fichier(Path::new(&fichier));
+        if actuelle.is_some() && actuelle == empreinte {
             continue;
         }
         if reevaluer_l_album(db, album_id, cache_dir, complet, None) != Geste::Garder {
