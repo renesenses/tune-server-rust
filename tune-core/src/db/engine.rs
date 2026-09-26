@@ -620,10 +620,9 @@ impl SqlDialect for PostgresDialect {
     ) -> String {
         let requete = format!("to_tsquery('simple', unaccent({query_placeholder}))");
         let identite = pg_vecteur_identite_piste(alias_piste, alias_artiste);
-        let chemin = format!(
-            "to_tsvector('simple', unaccent({}))",
-            crate::library::full_text_search::sql_termes_de_chemin_de_piste(alias_piste)
-        );
+        // La colonne calculée et stockée (migration 076), pas l'expression.
+        let chemin =
+            format!("to_tsvector('simple', unaccent(COALESCE({alias_piste}.path_terms, '')))");
         let album = format!("to_tsvector('simple', unaccent(COALESCE({alias_album}.title, '')))");
         format!(
             "({identite} @@ {requete} OR \

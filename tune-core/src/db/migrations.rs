@@ -4343,6 +4343,16 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "zones_motif_masquage",
         include_str!("../../migrations/postgres/075_zones_motif_masquage.sql"),
     ),
+    // #5192 : les termes de chemin d'une piste en colonne calculée et
+    // stockée, lue par le texte libre d'Oxygen et la recherche de pistes.
+    // PostgreSQL SEUL : sous SQLite, la fonction Rust enregistrée
+    // (`tune_termes_de_chemin`) tient ce rôle sans changer le schéma — aucune
+    // jumelle SQLite, le 113 reste libre.
+    (
+        76,
+        "tracks_path_terms",
+        include_str!("../../migrations/postgres/076_tracks_path_terms.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -6937,7 +6947,10 @@ mod tests {
         // 75 : `zones_motif_masquage` (#5077), jumelle de la SQLite 112. Pose
         // `zones.motif_masquage` et `zones.masquee_le`, que chaque masquage
         // et chaque demasquage NOMMENT.
-        assert_eq!(pg_latest_version(), 75, "latest PG migration must be 75");
+        // 76 : `tracks_path_terms` (#5192), SANS jumelle SQLite : la colonne
+        // calculée des termes de chemin, que lisent le texte libre d'Oxygen et
+        // la recherche de pistes sous PostgreSQL.
+        assert_eq!(pg_latest_version(), 76, "latest PG migration must be 76");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

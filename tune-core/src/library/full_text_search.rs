@@ -709,6 +709,18 @@ mod tests {
 
     // ─── #5192 : termes de chemin ─────────────────────────────────────────
 
+    /// La colonne générée de PostgreSQL (migration 076) porte l'expression de
+    /// [`sql_termes_de_chemin`] MOT POUR MOT — une seule définition, même
+    /// écrite dans un fichier SQL.
+    #[test]
+    fn la_migration_pg_076_porte_l_expression_des_termes_de_chemin() {
+        let migration = include_str!("../../migrations/postgres/076_tracks_path_terms.sql");
+        assert!(
+            migration.contains(&sql_termes_de_chemin("COALESCE(file_path, cue_media_path)")),
+            "076_tracks_path_terms.sql a divergé de sql_termes_de_chemin"
+        );
+    }
+
     /// Des chemins qui couvrent les pièges du découpage : séparateurs, point
     /// absent ou multiple, antislash Windows, pas de dossier, dossier final
     /// vide, adresse réseau, accents, suites d'espaces.
@@ -1017,6 +1029,65 @@ mod tests {
         drop(conn);
     }
 
+    /// L'URL de la base `base`, sur le serveur de `url`.
+    #[cfg(feature = "postgres")]
+    fn url_de_la_base_5192(url: &str, base: &str) -> String {
+        let (avant, apres) = match url.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (url, None),
+        };
+        let racine = avant.rsplit_once('/').map(|(r, _)| r).unwrap_or(avant);
+        match apres {
+            Some(q) => format!("{racine}/{base}?{q}"),
+            None => format!("{racine}/{base}"),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn supprimer_base_pg_5192(url: &str, base: &str) {
+        let maintenance = sqlx::PgPool::connect(url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {base} WITH (FORCE)"
+        )))
+        .execute(&maintenance)
+        .await
+        .unwrap();
+        maintenance.close().await;
+    }
+
+    /// Une BASE neuve (pas un schéma : la base de la CI a déjà ses tables
+    /// dans `public`, qu'un `search_path` laisserait voir), puis le vrai
+    /// démarrage : `ensure_schema`, `run_pg_migrations`.
+    #[cfg(feature = "postgres")]
+    async fn base_pg_neuve_5192(url: &str, base: &str) -> sqlx::PgPool {
+        supprimer_base_pg_5192(url, base).await;
+        let maintenance = sqlx::PgPool::connect(url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {base}")))
+            .execute(&maintenance)
+            .await
+            .unwrap();
+        maintenance.close().await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url_de_la_base_5192(url, base))
+            .await
+            .unwrap();
+        sqlx::raw_sql("CREATE EXTENSION IF NOT EXISTS unaccent")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for sql in crate::db::postgres::ENSURE_TABLES
+            .iter()
+            .chain(crate::db::postgres::ENSURE_COLUMNS.iter())
+        {
+            let _ = sqlx::raw_sql(*sql).execute(&pool).await;
+        }
+        crate::db::migrations::run_pg_migrations(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("run_pg_migrations : {e}"));
+        pool
+    }
+
     /// #5192 sur PostgreSQL, par le VRAI démarrage (`ensure_schema` puis
     /// `run_pg_migrations`) : l'expression SQL égale la fonction Rust, la
     /// recherche trouve par le dossier et classe après, le texte libre
@@ -1038,38 +1109,8 @@ mod tests {
             eprintln!("SAUT: TUNE_TEST_PG_URL absent");
             return;
         };
-        const SCHEMA: &str = "termes_de_chemin_5192";
-        let maintenance = sqlx::PgPool::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE; CREATE SCHEMA {SCHEMA}"
-        )))
-        .execute(&maintenance)
-        .await
-        .unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .after_connect(|c, _| {
-                Box::pin(async move {
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                        "SET search_path TO {SCHEMA}, public"
-                    )))
-                    .execute(c)
-                    .await
-                    .map(|_| ())
-                })
-            })
-            .connect(&url)
-            .await
-            .unwrap();
-        for sql in crate::db::postgres::ENSURE_TABLES
-            .iter()
-            .chain(crate::db::postgres::ENSURE_COLUMNS.iter())
-        {
-            let _ = sqlx::raw_sql(*sql).execute(&pool).await;
-        }
-        crate::db::migrations::run_pg_migrations(&pool)
-            .await
-            .unwrap_or_else(|e| panic!("run_pg_migrations : {e}"));
+        const BASE: &str = "tune_termes_de_chemin_5192";
+        let pool = base_pg_neuve_5192(&url, BASE).await;
 
         // 1. Une seule définition : Rust = SQL, sous PostgreSQL aussi.
         let sql = format!("SELECT {}", sql_termes_de_chemin("$1::text"));
@@ -1135,6 +1176,74 @@ mod tests {
             .unwrap();
         assert_eq!((tires, total), (vec![1], 1));
 
+        // 2 bis. La colonne calculée (migration 076) égale la fonction Rust,
+        // chemin par chemin — posés en `cue_media_path` (le repli d'une piste
+        // CUE), `file_path` étant UNIQUE et déjà pris par le jeu.
+        for (i, chemin) in CORPUS_DE_CHEMINS.iter().enumerate() {
+            let id = 1_000 + i as i64;
+            sqlx::query(
+                "INSERT INTO tracks (id, title, cue_media_path, source) VALUES ($1, 'c', $2, 'local')",
+            )
+            .bind(id)
+            .bind(*chemin)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let colonne: String = sqlx::query_scalar("SELECT path_terms FROM tracks WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                colonne,
+                termes_de_chemin(Some(chemin)),
+                "colonne 076 : {chemin:?}"
+            );
+        }
+        sqlx::raw_sql(
+            "DELETE FROM tracks WHERE id >= 1000;\
+             INSERT INTO tracks (id, title, cue_media_path, cue_start_ms, source) \
+               VALUES (900, 'c', '/music/Mahler Kondrashin/image.flac', 0, 'local');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let cue: String = sqlx::query_scalar("SELECT path_terms FROM tracks WHERE id = 900")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cue, "Mahler Kondrashin image");
+        sqlx::raw_sql("DELETE FROM tracks WHERE id = 900")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Contre-épreuve de la colonne : le texte libre et la recherche LA
+        // lisent. Vidée par une colonne ordinaire du même nom, le dossier
+        // n'est plus trouvé ; rendue, il l'est de nouveau.
+        sqlx::raw_sql(
+            "ALTER TABLE tracks RENAME COLUMN path_terms TO path_terms_076;\
+             ALTER TABLE tracks ADD COLUMN path_terms TEXT;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // « 01 Langsam » n'est QUE dans les termes de chemin.
+        assert_eq!(
+            liste("01 Langsam"),
+            0,
+            "sans la colonne, le fichier n'est plus trouvé"
+        );
+        assert_eq!(ids("Kondrashin Langsam"), Vec::<i64>::new());
+        sqlx::raw_sql(
+            "ALTER TABLE tracks DROP COLUMN path_terms;\
+             ALTER TABLE tracks RENAME COLUMN path_terms_076 TO path_terms;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(liste("01 Langsam"), 1);
+        assert_eq!(ids("Kondrashin Langsam"), vec![1]);
+
         // 3. Idempotence : déjà posé par le démarrage.
         assert_eq!(
             crate::db::migrations::assurer_termes_de_chemin_pg(&pool)
@@ -1177,12 +1286,7 @@ mod tests {
         assert_eq!(ids("Solti"), vec![1]);
 
         pool.close().await;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"
-        )))
-        .execute(&maintenance)
-        .await
-        .unwrap();
+        supprimer_base_pg_5192(&url, BASE).await;
     }
 
     /// Mesure PostgreSQL (#5192) : recalcul des vecteurs par la passe du
@@ -1207,38 +1311,8 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(100_000);
-        const SCHEMA: &str = "mesure_5192";
-        let maintenance = sqlx::PgPool::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE; CREATE SCHEMA {SCHEMA}"
-        )))
-        .execute(&maintenance)
-        .await
-        .unwrap();
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .after_connect(|c, _| {
-                Box::pin(async move {
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                        "SET search_path TO {SCHEMA}, public"
-                    )))
-                    .execute(c)
-                    .await
-                    .map(|_| ())
-                })
-            })
-            .connect(&url)
-            .await
-            .unwrap();
-        for sql in crate::db::postgres::ENSURE_TABLES
-            .iter()
-            .chain(crate::db::postgres::ENSURE_COLUMNS.iter())
-        {
-            let _ = sqlx::raw_sql(*sql).execute(&pool).await;
-        }
-        crate::db::migrations::run_pg_migrations(&pool)
-            .await
-            .unwrap();
+        const BASE: &str = "tune_mesure_5192";
+        let pool = base_pg_neuve_5192(&url, BASE).await;
         // L'état d'AVANT : l'ancienne fonction, puis les pistes.
         sqlx::raw_sql(include_str!(
             "../../migrations/postgres/002_fts_tsvector.sql"
@@ -1270,12 +1344,26 @@ mod tests {
                 .await
                 .unwrap()
         };
+        sqlx::raw_sql("ALTER TABLE tracks DROP COLUMN path_terms")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::raw_sql("VACUUM FULL tracks")
             .execute(&pool)
             .await
             .unwrap();
         let avant = taille(pool.clone()).await;
 
+        // La migration 076 sur une table déjà remplie : colonne retirée puis
+        // reposée, comme sur une base existante.
+        let debut = Instant::now();
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/076_tracks_path_terms.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let ms_076 = debut.elapsed().as_millis();
         let debut = Instant::now();
         let recalculees = crate::db::migrations::assurer_termes_de_chemin_pg(&pool)
             .await
@@ -1300,34 +1388,52 @@ mod tests {
         let backend: Arc<dyn DbBackend> =
             Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
         let repo = TrackRepo::with_backend(backend);
-        let debut = Instant::now();
-        let f = TrackFilter {
-            q: Some("kondrashin".into()),
-            ..Default::default()
+        sqlx::raw_sql("ANALYZE tracks")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Temps PAR RECHERCHE : moyenne de 5, après une première à froid.
+        let par_recherche = |q: &'static str, libre: bool| {
+            let repo = &repo;
+            move || {
+                let un = || {
+                    if libre {
+                        let f = TrackFilter {
+                            q: Some(q.into()),
+                            ..Default::default()
+                        };
+                        repo.list_filtered(&f, 3000, 0).unwrap().1
+                    } else {
+                        repo.search(q, 50).unwrap().len() as i64
+                    }
+                };
+                let trouves = un();
+                let debut = Instant::now();
+                for _ in 0..5 {
+                    un();
+                }
+                (trouves, debut.elapsed().as_millis() / 5)
+            }
         };
-        let (_, total_q) = repo.list_filtered(&f, 3000, 0).unwrap();
-        let ms_texte_libre = debut.elapsed().as_millis();
-        let debut = Instant::now();
-        let trouves = repo.search("Album numéro 42", 50).unwrap().len();
-        let ms_recherche = debut.elapsed().as_millis();
-
+        let (total_q, ms_texte_libre) = par_recherche("numéro 42 (1961)", true)();
+        let (total_q2, ms_texte_libre2) = par_recherche("zzz introuvable", true)();
+        let (trouves, ms_recherche) = par_recherche("Album numéro 42", false)();
+        let (trouves2, ms_recherche2) = par_recherche("Mouvement 1961", false)();
         eprintln!(
             "MESURE_PG_5192 pistes={n} insertion(ancienne fonction)={ms_insertion_ancienne} ms\n\
-             MESURE_PG_5192 passe du démarrage : {recalculees:?} pistes en {ms_passe} ms\n\
+             MESURE_PG_5192 migration 076 sur table remplie : {ms_076} ms\n\
+             MESURE_PG_5192 passe du démarrage (vecteurs) : {recalculees:?} pistes en {ms_passe} ms\n\
              MESURE_PG_5192 tracks (table+index) avant={} Kio après={} Kio (+{} Kio)\n\
-             MESURE_PG_5192 expression_seule={ms_expression} ms\n\
-             MESURE_PG_5192 texte libre « kondrashin » : {total_q} pistes en {ms_texte_libre} ms\n\
-             MESURE_PG_5192 recherche « Album numéro 42 » : {trouves} en {ms_recherche} ms",
+             MESURE_PG_5192 expression_seule (toute la table)={ms_expression} ms\n\
+             MESURE_PG_5192 texte libre « numéro 42 (1961) » : {total_q} pistes, {ms_texte_libre} ms par recherche\n\
+             MESURE_PG_5192 texte libre « zzz introuvable » : {total_q2} pistes, {ms_texte_libre2} ms par recherche\n\
+             MESURE_PG_5192 recherche « Album numéro 42 » : {trouves}, {ms_recherche} ms par recherche\n\
+             MESURE_PG_5192 recherche « Mouvement 1961 » : {trouves2}, {ms_recherche2} ms par recherche",
             avant / 1024,
             apres / 1024,
             (apres - avant) / 1024
         );
         pool.close().await;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "DROP SCHEMA IF EXISTS {SCHEMA} CASCADE"
-        )))
-        .execute(&maintenance)
-        .await
-        .unwrap();
+        supprimer_base_pg_5192(&url, BASE).await;
     }
 }

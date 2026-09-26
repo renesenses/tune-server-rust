@@ -77,13 +77,14 @@ pub fn condition_texte_libre(
     let album = like(ph);
     let label = like(ph);
     let chemin = like(ph);
-    // SQLite : la fonction Rust enregistrée, linéaire — l'expression pure
-    // coûte ~60 µs par piste, et ce prédicat parcourt la bibliothèque entière.
+    // Jamais l'expression pure ici : ~60 µs par piste, et ce prédicat
+    // parcourt la bibliothèque entière. SQLite : la fonction Rust enregistrée.
     let termes = match ph.engine() {
         Engine::Sqlite => {
             crate::library::full_text_search::sql_sqlite_termes_de_chemin_de_piste("t")
         }
-        Engine::Postgres => crate::library::full_text_search::sql_termes_de_chemin_de_piste("t"),
+        // PostgreSQL : la colonne calculée et stockée (migration 076).
+        Engine::Postgres => "t.path_terms".to_string(),
     };
     let sql = format!(
         "(LOWER(unaccent(t.title)) {titre} \
