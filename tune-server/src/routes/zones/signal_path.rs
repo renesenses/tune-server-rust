@@ -540,6 +540,7 @@ pub(super) fn build_signal_path(
     };
     let bit_perfect = analyse.verdicts.bit_perfect;
     let is_lossless = analyse.source.is_lossless;
+    let codec_connu = analyse.source.codec_connu;
     let zone_id_courant = zone.id.unwrap_or(0);
     let pure = tune_core::audio::audiophile::zone_enabled(backend, zone_id_courant);
     let etapes = assembler_les_etapes(
@@ -556,7 +557,12 @@ pub(super) fn build_signal_path(
         // Distinct from bit_perfect: a lossless source transcoded to another
         // lossless container (DSD→FLAC, ALAC→FLAC for a DLNA renderer) is not
         // bit-perfect but is still lossless — the UI must not call it "lossy".
-        "lossless": is_lossless,
+        //
+        // #4346 — `null` quand le codec de la source est INCONNU (radio pas
+        // encore sondée, format non reconnu) : « je ne sais pas » n'est ni
+        // « sans perte » ni « avec perte ». Publier `false` faisait afficher
+        // « Avec perte » sur une radio FLAC pendant toute l'attente de la sonde.
+        "lossless": lossless_publie(codec_connu, is_lossless),
         "summary": etapes.summary,
         "steps": etapes.steps,
         "runtime_observed": runtime_signal_path.is_some(),
@@ -575,6 +581,28 @@ pub(super) fn build_signal_path(
         })),
     }))
 }
+
+/// #4346 — la valeur publiée dans `signal_path.lossless` : le verdict de la
+/// source quand son codec est connu, `null` sinon. Un codec inconnu n'est
+/// jamais un aveu de perte.
+pub(super) fn lossless_publie(codec_connu: bool, is_lossless: bool) -> Value {
+    if codec_connu {
+        Value::Bool(is_lossless)
+    } else {
+        Value::Null
+    }
+}
+
+/// #4346 — le libellé NEUTRE d'un codec inconnu dans les descriptions
+/// d'étapes. Les descriptions sont du texte libre : y écrire le mot anglais
+/// « Unknown » le montrait tel quel, non traduit (« Unknown → Unknown
+/// 44kHz/16bit »). Le jeton est court et sans langue ; les étapes qui le
+/// portent sont marquées par [`CODE_CODEC_INCONNU`], que le client traduit.
+pub(crate) const CODEC_INCONNU: &str = "?";
+
+/// #4346 — code stable des étapes (`Source`, `Decoder`, `Transcoder`) dont la
+/// description nomme un codec inconnu par [`CODEC_INCONNU`].
+pub(crate) const CODE_CODEC_INCONNU: &str = "source_codec_unknown";
 
 /// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
 /// fréquence a lieu : la décision « jouer, et le dire » de Bertrand (19/09).
@@ -631,6 +659,7 @@ fn assembler_les_etapes(
         bit_depth,
         format_name,
         is_lossless,
+        codec_connu,
         flac_ffmpeg_vers_le_reseau,
         conteneur_flac_copie,
         canaux_source,
@@ -687,16 +716,25 @@ fn assembler_les_etapes(
         "description": source_desc,
         "bit_perfect": true,
     })];
+    // #4346 — l'étape qui nomme un codec inconnu le DIT par un code stable.
+    let marquer_codec_inconnu = |etape: &mut Value| {
+        if !codec_connu {
+            etape["code"] = json!(CODE_CODEC_INCONNU);
+        }
+    };
+    marquer_codec_inconnu(&mut steps[0]);
 
     // Decoder step. Skipped for DSD: the Source already reads e.g.
     // "DSD64 2.8 MHz" and the DSD→PCM/FLAC conversion is shown by the Transcoder
     // step, so a bare "DSD64" decoder line was just a confusing duplicate.
     if !is_dsd {
-        steps.push(json!({
+        let mut decodeur = json!({
             "name": "Decoder",
             "description": format_name,
             "bit_perfect": is_lossless,
-        }));
+        });
+        marquer_codec_inconnu(&mut decodeur);
+        steps.push(decodeur);
     }
 
     // Transcoding step (only if transcoding occurs). Include the zone-forced
@@ -775,6 +813,7 @@ fn assembler_les_etapes(
             "description": format!("{source_desc} \u{2192} {out_desc}"),
             "bit_perfect": transcode_lossless,
         });
+        marquer_codec_inconnu(&mut etape);
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
             // même résolution ressemble à une erreur d'affichage.
@@ -1727,6 +1766,10 @@ struct Source<'w> {
     bit_depth: i32,
     format_name: &'static str,
     is_lossless: bool,
+    /// #4346 — le codec de la source est-il CONNU ? Faux pour une radio pas
+    /// encore sondée ou un format non reconnu : `format_name` vaut alors
+    /// [`CODEC_INCONNU`] et `lossless` est publié `null`, jamais `false`.
+    codec_connu: bool,
     /// #4350 — FLAC écrit par ffmpeg (vendeur `Lavf…`) SANS MD5, vers une
     /// sortie réseau : l'orchestrateur le RÉ-ENCODE au lieu de le servir tel
     /// quel (le DMP-A8 cale sur ces en-têtes). Même fonction que la décision,
@@ -1799,8 +1842,9 @@ fn decrire_la_source<'w>(
             bit_depth: radio.bit_depth.unwrap_or(0) as i32,
             format_name: source_format
                 .as_ref()
-                .map_or("Unknown", AudioFormat::display_name),
+                .map_or(CODEC_INCONNU, AudioFormat::display_name),
             is_lossless: source_format.as_ref().is_some_and(AudioFormat::is_lossless),
+            codec_connu: source_format.is_some(),
             flac_ffmpeg_vers_le_reseau: false,
             conteneur_flac_copie: false,
             // Une radio n'a pas de ligne `tracks` : rien à comparer.
@@ -1901,7 +1945,7 @@ fn decrire_la_source<'w>(
         } else if l.contains("opus") {
             "OPUS"
         } else {
-            "Unknown"
+            CODEC_INCONNU
         }
     };
     // For a media-server source (no from_extension AudioFormat) the lossless
@@ -1946,6 +1990,7 @@ fn decrire_la_source<'w>(
         bit_depth,
         format_name,
         is_lossless,
+        codec_connu: format_name != CODEC_INCONNU,
         flac_ffmpeg_vers_le_reseau,
         conteneur_flac_copie,
         // #4573 — un `0` en base veut dire « le scan ne l'a pas lu », pas

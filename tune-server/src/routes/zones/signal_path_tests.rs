@@ -2873,16 +2873,17 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
         ..Default::default()
     };
     for (codec, rate, bits, expected, lossless) in [
-        (Some("mp3"), Some(44_100), None, "MP3 44kHz", false),
-        (Some("aac"), Some(22_050), None, "AAC 22kHz", false),
+        (Some("mp3"), Some(44_100), None, "MP3 44kHz", json!(false)),
+        (Some("aac"), Some(22_050), None, "AAC 22kHz", json!(false)),
         (
             Some("flac"),
             Some(48_000),
             Some(16),
             "FLAC 48kHz/16bit",
-            true,
+            json!(true),
         ),
-        (None, None, None, "Unknown", false),
+        // #4346 : codec inconnu ⇒ état inconnu (`null`), jamais `false`.
+        (None, None, None, CODEC_INCONNU, Value::Null),
     ] {
         let stream = StreamInfo {
             radio_source: Some(RadioSourceInfo {
@@ -2912,7 +2913,7 @@ fn radio_4346_signal_path_preserves_source_codec_and_output_container() {
                 sp["lossless"], lossless,
                 "WAV decoding must not make a lossy radio lossless"
             );
-            if !lossless {
+            if lossless != json!(true) {
                 assert_eq!(
                     sp["bit_perfect"], false,
                     "lossy or unknown radio cannot claim bit-perfect"
@@ -2938,11 +2939,12 @@ fn radio_4346_without_probe_cannot_claim_lossless() {
     for stream in [None, Some(wire("wav", 44_100, 16))] {
         let sp = build_signal_path(&ps, &zone, &backend, None, "none", stream.as_ref()).unwrap();
         assert_eq!(
-            sp["lossless"], false,
-            "pending radio codec must not be inferred from WAV"
+            sp["lossless"],
+            Value::Null,
+            "pending radio codec must not be inferred from WAV — nor declared lossy (#4346)"
         );
         assert_eq!(sp["bit_perfect"], false);
-        assert_eq!(step_desc(&sp, "Source").as_deref(), Some("Unknown"));
+        assert_eq!(step_desc(&sp, "Source").as_deref(), Some(CODEC_INCONNU));
     }
 }
 
@@ -3007,6 +3009,150 @@ fn radio_4346_flac_truncated_before_local_output_is_not_bit_perfect() {
             "{output}: 24-bit source truncated to 16-bit before output"
         );
     }
+}
+
+// ── #4346 — codec INCONNU : un état publié, pas un aveu de perte ──
+
+fn step_code(v: &Value, name: &str) -> Option<String> {
+    step_field(v, name, "code")
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+/// La capture de Jean Valjean (fil 1825, v0.9.155, Windows 11) : une radio
+/// lancée sur `local:Haut-parleurs`, codec pas encore sondé, fil WAV 44,1/16.
+/// L'écran disait « Avec perte », et « Unknown » trois fois.
+fn radio_non_sondee_en_local() -> (Arc<dyn DbBackend>, Zone, ZoneState, StreamInfo) {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("local".into());
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let stream = StreamInfo {
+        radio_source: Some(RadioSourceInfo::default()),
+        ..wire("wav", 44_100, 16)
+    };
+    (backend, zone, ps, stream)
+}
+
+#[test]
+fn codec_inconnu_4346_publie_lossless_null_jamais_false() {
+    let (backend, zone, ps, stream) = radio_non_sondee_en_local();
+    let sp = build_signal_path(&ps, &zone, &backend, None, "WASAPI", Some(&stream)).unwrap();
+    assert!(
+        sp.get("lossless").is_some(),
+        "la clé `lossless` doit rester publiée"
+    );
+    assert_eq!(
+        sp["lossless"],
+        Value::Null,
+        "codec inconnu : `lossless` doit valoir null (état inconnu), pas {} — \
+         `false` fait afficher « Avec perte » (#4346)",
+        sp["lossless"]
+    );
+    assert_eq!(sp["bit_perfect"], false, "l'inconnu ne prouve rien");
+}
+
+#[test]
+fn codec_inconnu_4346_aucune_description_n_ecrit_unknown() {
+    let (backend, zone, ps, stream) = radio_non_sondee_en_local();
+    let sp = build_signal_path(&ps, &zone, &backend, None, "WASAPI", Some(&stream)).unwrap();
+    let steps = sp["steps"].as_array().unwrap();
+    for step in steps {
+        let desc = step["description"].as_str().unwrap_or_default();
+        assert!(
+            !desc.contains("Unknown"),
+            "étape {} : « {desc} » écrit le mot anglais en dur (#4346)",
+            step["name"]
+        );
+    }
+    assert!(
+        !sp["summary"].as_str().unwrap().contains("Unknown"),
+        "résumé : {}",
+        sp["summary"]
+    );
+    for name in ["Source", "Decoder", "Transcoder"] {
+        assert_eq!(
+            step_code(&sp, name).as_deref(),
+            Some(CODE_CODEC_INCONNU),
+            "l'étape {name} nomme un codec inconnu : elle doit le dire par un code stable"
+        );
+        assert!(
+            step_desc(&sp, name).unwrap().contains(CODEC_INCONNU),
+            "l'étape {name} porte le jeton neutre que le client traduit"
+        );
+    }
+}
+
+/// Un format de piste non reconnu (ni extension, ni MIME connu) est le même
+/// inconnu que la radio pas encore sondée.
+#[test]
+fn codec_inconnu_4346_format_de_piste_non_reconnu_est_aussi_inconnu() {
+    let (backend, zone) = dlna_zone();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            format: Some("x-codec-exotique".into()),
+            sample_rate: Some(44_100),
+            bit_depth: Some(16),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, None, "none", None).unwrap();
+    assert_eq!(sp["lossless"], Value::Null);
+    assert_eq!(
+        step_code(&sp, "Source").as_deref(),
+        Some(CODE_CODEC_INCONNU)
+    );
+    assert!(!step_desc(&sp, "Source").unwrap().contains("Unknown"));
+}
+
+/// Codec CONNU : rien ne change — booléen, et aucune étape marquée.
+#[test]
+fn codec_connu_4346_lossless_reste_un_booleen_sans_code() {
+    use tune_core::http::streamer::RadioSourceInfo;
+    let (backend, mut zone, ps, _) = radio_non_sondee_en_local();
+    for (codec, bits, attendu) in [
+        ("mp3", None, false),
+        ("aac", None, false),
+        ("flac", Some(16), true),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                format: Some(codec),
+                sample_rate: Some(44_100),
+                bit_depth: bits,
+            }),
+            ..wire("wav", 44_100, 16)
+        };
+        for output in ["local", "dlna", "oaat"] {
+            zone.output_type = Some(output.into());
+            let sp =
+                build_signal_path(&ps, &zone, &backend, None, "WASAPI", Some(&stream)).unwrap();
+            assert_eq!(sp["lossless"], json!(attendu), "{codec} vers {output}");
+            for step in sp["steps"].as_array().unwrap() {
+                assert_ne!(
+                    step["code"].as_str(),
+                    Some(CODE_CODEC_INCONNU),
+                    "{codec} vers {output} : étape {} marquée inconnue à tort",
+                    step["name"]
+                );
+            }
+        }
+    }
+    // Et une piste ALAC de la bibliothèque, le cas courant.
+    let sp = build_signal_path(&alac_hires_playing(), &zone, &backend, None, "none", None).unwrap();
+    assert_eq!(sp["lossless"], json!(true));
 }
 
 // ── #4172 — WASAPI sans contrat exclusif = mode partagé, nommé et non bit-perfect ──
