@@ -1510,7 +1510,7 @@ mod serveur_source_absent_4362;
 pub mod verdict_upnp;
 
 mod queue;
-pub use queue::Enjambee;
+pub use queue::{Enjambee, lignes_bannies_a_enjamber};
 
 mod history;
 

@@ -188,7 +188,12 @@ impl PrefetchEngine {
         // Use the same next_position() logic as the poller so that Repeat
         // All correctly wraps from the last track back to position 0, and
         // Repeat One re-prefetches the same track.
-        let next_pos = match PositionPoller::next_position(&zone_state) {
+        //
+        // #5143 — et la prochaine JOUABLE, pas la prochaine tout court : une
+        // suivante bannie n'est jamais jouée (l'avance l'enjambe), la
+        // télécharger ne coûtait que de la bande passante et du quota chez
+        // le service. Même fonction que l'armement sans blanc.
+        let next_pos = match PositionPoller::prochaine_position_jouable(&db, zone_id, &zone_state) {
             Some(pos) => pos,
             None => {
                 debug!(zone_id, "prefetch_end_of_queue");
@@ -210,14 +215,18 @@ impl PrefetchEngine {
 
         let queue_repo = PlayQueueRepo::with_backend(db.clone());
 
-        // Try streaming queue first (Tidal, Qobuz, etc.)
-        let streaming_queue = queue_repo
-            .get_streaming_queue(zone_id)
+        // La ligne de la file UNIFIÉE à cette position (#5143). L'ancien
+        // `get_streaming_queue().get(next_pos)` indexait la seule liste des
+        // lignes de service par une position de la file entière : juste sur
+        // une file toute de service, à côté dès qu'une piste locale précède.
+        let ligne = queue_repo
+            .get_at(zone_id, next_pos)
             .ok()
-            .unwrap_or_default();
-        if let Some(item) = streaming_queue.get(next_pos as usize) {
-            let source = item["source"].as_str().unwrap_or("tidal").to_string();
-            let source_id = item["source_id"].as_str().unwrap_or("").to_string();
+            .flatten()
+            .filter(|e| e.track_id.is_none());
+        if let Some(item) = ligne {
+            let source = item.source.clone().unwrap_or_else(|| "tidal".to_string());
+            let source_id = item.source_id.clone().unwrap_or_default();
 
             if !is_streaming_source(&source) {
                 debug!(zone_id, source = %source, "prefetch_skip_non_streaming");
@@ -229,11 +238,11 @@ impl PrefetchEngine {
                 return;
             }
 
-            let title = item["title"].as_str().map(String::from);
-            let artist = item["artist_name"].as_str().map(String::from);
-            let album = item["album_title"].as_str().map(String::from);
-            let cover = item["cover_path"].as_str().map(String::from);
-            let duration_ms = item["duration_ms"].as_u64().unwrap_or(0);
+            let title = item.title.clone();
+            let artist = item.artist_name.clone();
+            let album = item.album_title.clone();
+            let cover = item.cover_path.clone();
+            let duration_ms = item.duration_ms.unwrap_or(0).max(0) as u64;
 
             info!(
                 zone_id,

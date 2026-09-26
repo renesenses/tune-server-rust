@@ -2515,7 +2515,9 @@ impl PositionPoller {
                         ps.gapless_advance_pending = false;
                         ps.gapless_stuck_ticks = 0;
                         ps.transition(fsm::Transition::EnchainementConfirme);
-                        if let Some(next_pos) = Self::next_position(zone_state) {
+                        if let Some(next_pos) =
+                            Self::prochaine_position_jouable(&self.db, zone_id, zone_state)
+                        {
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
                             if let Err(e) = self
                                 .orchestrator
@@ -2693,7 +2695,8 @@ impl PositionPoller {
                         // desarmer des qu'on touche a la file — qui supprimerait
                         // le defaut en supprimant la fonctionnalite.
                         if ps.gapless_sent {
-                            let suivant = Self::next_position(zone_state);
+                            let suivant =
+                                Self::prochaine_position_jouable(&self.db, zone_id, zone_state);
                             let ligne_au_suivant = suivant.and_then(|p| {
                                 crate::db::play_queue_repo::PlayQueueRepo::with_backend(
                                     self.db.clone(),
@@ -2773,7 +2776,7 @@ impl PositionPoller {
                                 });
                             } else if decisions::dsd_skip_latched(
                                 ps.gapless_dsd_skip_pos,
-                                Self::next_position(zone_state),
+                                Self::prochaine_position_jouable(&self.db, zone_id, zone_state),
                             ) {
                                 // Suivant DSD sur DLNA, déjà constaté pour cette
                                 // position : ne pas re-résoudre (donc re-créer puis
@@ -2796,7 +2799,9 @@ impl PositionPoller {
                                         ps.transition(fsm::armement_accepte(arme));
                                     }
                                     GaplessPrep::DsdNextSkipped => {
-                                        ps.gapless_dsd_skip_pos = Self::next_position(zone_state);
+                                        ps.gapless_dsd_skip_pos = Self::prochaine_position_jouable(
+                                            &self.db, zone_id, zone_state,
+                                        );
                                     }
                                     GaplessPrep::NotArmed => {}
                                 }
