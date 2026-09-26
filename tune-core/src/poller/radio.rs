@@ -179,6 +179,14 @@ impl PositionPoller {
         {
             exclude.extend(rows.into_iter().filter_map(|r| r.source_id));
         }
+        // #4806 — ni un titre de ce service BANNI par le profil actif : la
+        // radio est une sélection automatique. L'exclusion se fait AVANT le
+        // tirage, pour que les 10 titres demandés soient 10 titres jouables.
+        crate::db::hidden_repo::exclure_les_titres_de_service_bannis(
+            &self.db,
+            source,
+            &mut exclude,
+        );
 
         // Source 2 (le service) et le passage « voisin → titre » vivent dans
         // `auto_dj::pistes_similaires_du_service`, partagés avec « Plus comme

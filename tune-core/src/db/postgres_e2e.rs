@@ -2566,3 +2566,87 @@ async fn pg_4924_index_source_id_pose_au_redemarrage() {
     assert_eq!(version(pool.clone()).await, version_avant);
     pool.close().await;
 }
+
+/// #4806 suite — bannir un titre de SERVICE sur le VRAI moteur PostgreSQL.
+///
+/// La table `streaming_hidden_items` n'a PAS de script numéroté : sur
+/// PostgreSQL, c'est `ENSURE_TABLES` (rejoué par `PostgresDb::connect` à
+/// chaque démarrage) qui la pose, sur toute base, numérotée comme convertie.
+/// Le témoin la RETIRE d'abord, puis démarre le moteur : si le rattrapage ne la
+/// posait pas, le premier bannissement rendrait une erreur SQL.
+///
+/// Puis, par le pont `DbBackend` : les marqueurs `$n` du dialecte, le
+/// `ON CONFLICT … DO UPDATE` (rebannir sans doublon), la provenance
+/// normalisée, le cloisonnement par profil (BIGINT), le prédicat SQL des
+/// smart playlists, et la séparation des deux espaces d'identifiants.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_4806_titres_de_service_bannis() {
+    use crate::db::hidden_repo::{HiddenRepo, TitreDeService};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!(
+            "SAUT : TUNE_TEST_PG_URL non posée — une épreuve de {} rend la main sans toucher aucune base.",
+            module_path!()
+        );
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap_or_else(|e| {
+        panic!("TUNE_TEST_PG_URL est POSÉE ({url}) mais la connexion échoue : {e}")
+    });
+    sqlx::raw_sql("DROP TABLE IF EXISTS streaming_hidden_items")
+        .execute(&pool)
+        .await
+        .expect("retirer la table");
+
+    // Démarrer le moteur : `connect` rejoue `ensure_schema`.
+    let moteur = crate::db::postgres::PostgresDb::connect(&url)
+        .await
+        .expect("démarrage PostgreSQL");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(moteur.pool().clone()));
+    let repo = HiddenRepo::with_backend(db.clone());
+
+    let titre = |id: &str| TitreDeService {
+        source: " Qobuz ".into(),
+        source_id: id.into(),
+        title: Some(format!("Titre {id}")),
+        artist: Some("Alice Coltrane".into()),
+        album: Some("Journey".into()),
+        album_source_id: Some("alb-9".into()),
+        cover_url: None,
+    };
+    assert!(!repo.is_streaming_track_banned(1, "qobuz", "pg-7").unwrap());
+    assert!(repo.ban_streaming_track(1, &titre("pg-7")).unwrap());
+    assert!(
+        repo.ban_streaming_track(1, &titre("pg-7")).unwrap(),
+        "rebannir : ON CONFLICT … DO UPDATE, pas d'erreur de clé"
+    );
+    assert!(repo.is_streaming_track_banned(1, "QOBUZ", "pg-7").unwrap());
+    assert!(!repo.is_streaming_track_banned(2, "qobuz", "pg-7").unwrap());
+    assert!(!repo.is_streaming_track_banned(1, "tidal", "pg-7").unwrap());
+    assert!(repo.ligne_bannie(1, None, Some("qobuz"), Some("pg-7")));
+    let cles = repo.banned_streaming_keys(1).unwrap();
+    assert_eq!(cles.len(), 1, "une seule ligne malgré deux bannissements");
+    assert!(cles.contains(&("qobuz".to_string(), "pg-7".to_string())));
+
+    // Le prédicat des smart playlists, sur une table de favoris simulée.
+    let compte = |profil: i64| -> i64 {
+        let sql = format!(
+            "SELECT COUNT(*) FROM (VALUES ('Qobuz', 'pg-7'), ('Qobuz', 'pg-8')) AS sf(service, service_id) \
+             WHERE {}",
+            crate::db::facet_filter::banned_streaming_excluded(
+                profil,
+                "sf.service",
+                "sf.service_id"
+            )
+        );
+        db.query_one(&sql, &[]).unwrap().unwrap()[0]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(compte(1), 1, "le titre banni sort");
+    assert_eq!(compte(2), 2, "autre profil");
+
+    assert!(repo.unban_streaming_track(1, "Qobuz", "pg-7").unwrap());
+    assert!(!repo.is_streaming_track_banned(1, "qobuz", "pg-7").unwrap());
+    assert_eq!(compte(1), 2, "débannir rend tout");
+}

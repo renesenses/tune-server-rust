@@ -472,15 +472,16 @@ impl PlaybackOrchestrator {
 
     /// #4806 — une file déjà constituée n'est PAS purgée quand un titre est
     /// banni : la piste est SAUTÉE quand la lecture y arrive. Depuis
-    /// `position`, enjambe d'un coup les lignes locales bannies pour le
-    /// profil actif du serveur et dit où reprendre.
+    /// `position`, enjambe d'un coup les lignes bannies pour le profil actif
+    /// du serveur — locales (`track_id`) comme de SERVICE (`source` +
+    /// `source_id`, #4806 suite) — et dit où reprendre.
     ///
     /// Ne s'appelle que sur une TRANSITION automatique (fin de piste,
     /// « suivant ») — jamais sur un `play_from_queue` demandé par un clic :
-    /// un titre banni reste jouable si on le choisit exprès. Une ligne de
-    /// service (sans `track_id`) n'est jamais enjambée, même si son
-    /// `source_id` a la valeur d'un id local banni : deux espaces
-    /// d'identifiants, pas de confusion possible.
+    /// un titre banni reste jouable si on le choisit exprès. Les deux espaces
+    /// d'identifiants ne se confondent pas : une ligne de service dont le
+    /// `source_id` vaut un id local banni n'est pas enjambée pour autant, et
+    /// inversement — voir [`HiddenRepo::ligne_bannie`].
     pub async fn enjamber_les_pistes_bannies(&self, zone_id: i64, position: i64) -> Enjambee {
         let queue_repo = PlayQueueRepo::with_backend(self.db.clone());
         let Ok(total) = queue_repo.count_all(zone_id) else {
@@ -494,9 +495,12 @@ impl PlaybackOrchestrator {
             let Ok(Some(entry)) = queue_repo.get_at(zone_id, p) else {
                 break;
             };
-            let bannie = entry
-                .track_id
-                .is_some_and(|id| bans.is_track_banned(profil, id).unwrap_or(false));
+            let bannie = bans.ligne_bannie(
+                profil,
+                entry.track_id,
+                entry.source.as_deref(),
+                entry.source_id.as_deref(),
+            );
             if !bannie {
                 break;
             }
@@ -504,6 +508,8 @@ impl PlaybackOrchestrator {
                 zone_id,
                 position = p,
                 track_id = ?entry.track_id,
+                source = ?entry.source,
+                source_id = ?entry.source_id,
                 title = ?entry.title,
                 profil,
                 "file_enjambe_piste_bannie"

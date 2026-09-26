@@ -178,9 +178,90 @@ pub(super) async fn unban_track(
     }
 }
 
+/// Corps de `POST /library/tracks/streaming/unban`.
+#[derive(Deserialize)]
+pub(super) struct DesignationDeService {
+    source: String,
+    source_id: String,
+}
+
+/// `POST /library/tracks/streaming/ban` — bannit un titre de SERVICE (Qobuz,
+/// Tidal, Bandcamp…) pour le profil qui agit (#4806 suite). Même promesse
+/// que la forme locale : jamais joué par une sélection automatique, sauté
+/// quand une file y arrive, grisé mais jouable à la main. Le corps porte la
+/// paire et l'instantané d'affichage (`title`, `artist`, `album`,
+/// `album_source_id`, `cover_url`). 400 si la paire est incomplète, ou si la
+/// `source` désigne la bibliothèque (`local`, `upnp` : c'est `/tracks/{id}/ban`).
+///
+/// S'il JOUE au moment du bannissement, la zone passe au suivant, comme pour
+/// un titre local.
+pub(super) async fn ban_streaming_track(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    Json(body): Json<tune_core::db::hidden_repo::TitreDeService>,
+) -> Result<Json<Value>, AppError> {
+    let source = tune_core::db::hidden_repo::source_normalisee(&body.source);
+    if matches!(source.as_str(), "local" | "upnp") {
+        return Err(AppError::bad_request(
+            "a library track is banned by POST /library/tracks/{id}/ban",
+        ));
+    }
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.ban_streaming_track(profile.id(), &body) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(AppError::bad_request(
+                "source and source_id are both required",
+            ));
+        }
+        Err(e) => return Err(AppError::internal(e)),
+    }
+    let source_id = body.source_id.trim().to_string();
+    let zones = crate::routes::playback::passer_les_zones_qui_jouent(
+        &state,
+        &crate::routes::playback::PisteVisee::Service {
+            source: source.clone(),
+            source_id: source_id.clone(),
+        },
+    )
+    .await;
+    Ok(Json(json!({
+        "track_id": Value::Null,
+        "source": source,
+        "source_id": source_id,
+        "profile_id": profile.id(),
+        "banned": true,
+        "zones_passees_au_suivant": zones,
+    })))
+}
+
+/// `POST /library/tracks/streaming/unban` — débannit un titre de service.
+/// Idempotent : débannir un titre non banni rend `banned: false`.
+pub(super) async fn unban_streaming_track(
+    State(state): State<AppState>,
+    profile: crate::routes::active_profile::ActiveProfile,
+    Json(body): Json<DesignationDeService>,
+) -> Result<Json<Value>, AppError> {
+    let repo = tune_core::db::hidden_repo::HiddenRepo::with_backend(state.backend.clone());
+    match repo.unban_streaming_track(profile.id(), &body.source, &body.source_id) {
+        Ok(_) => Ok(Json(json!({
+            "track_id": Value::Null,
+            "source": tune_core::db::hidden_repo::source_normalisee(&body.source),
+            "source_id": body.source_id.trim(),
+            "profile_id": profile.id(),
+            "banned": false,
+        }))),
+        Err(e) => Err(AppError::internal(e)),
+    }
+}
+
 /// `GET /library/tracks/banned` — l'écran « Titres bannis » du profil :
 /// tout revoir et débannir, y compris les marqueurs orphelins (piste morte),
-/// rendus avec l'instantané d'identité.
+/// rendus avec l'instantané d'identité. Les titres de SERVICE y figurent
+/// aussi (#4806 suite) : `track_id: null` et la paire `source` + `source_id`.
+/// C'est aussi la liste que le client lit pour griser un titre de service
+/// dans son album de service — les routes du catalogue d'un service ne
+/// connaissent pas le profil.
 pub(super) async fn list_banned_tracks(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,

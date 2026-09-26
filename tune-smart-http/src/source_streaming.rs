@@ -229,11 +229,32 @@ pub(crate) fn requete(
     Some(format!(
         "SELECT sf.service, sf.service_id, sf.title, sf.artist, sf.album, sf.cover_url \
          FROM streaming_favorites sf \
-         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds}) \
+         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds}){socle} \
          ORDER BY {tri}{limite}",
         item = objet.item_type(),
         conds = conditions.join(joiner),
+        socle = socle_des_bannis(objet, profile_id),
     ))
+}
+
+/// #4806 suite — un titre de service BANNI par ce profil sort d'office d'une
+/// playlist intelligente, sans règle à configurer : la jumelle, pour les
+/// favoris de service, de `smart_playlists::avec_le_socle_des_bannis`. Posé
+/// HORS de la parenthèse des règles, pour qu'un `match_mode = any` ne le
+/// contourne pas par précédence. Une collection (des albums) n'est pas
+/// concernée : on bannit un TITRE.
+fn socle_des_bannis(objet: Objet, profile_id: i64) -> String {
+    match objet {
+        Objet::Piste => format!(
+            " AND {}",
+            tune_core::db::facet_filter::banned_streaming_excluded(
+                profile_id,
+                "sf.service",
+                "sf.service_id"
+            )
+        ),
+        Objet::Album => String::new(),
+    }
 }
 
 /// COMBIEN de favoris de service satisfont les règles — la même sélection que
@@ -262,9 +283,10 @@ pub(crate) fn requete_compte(
     let conditions: Vec<String> = rules.iter().map(|r| condition(r, objet)).collect();
     Some(format!(
         "SELECT COUNT(*) FROM streaming_favorites sf \
-         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds})",
+         WHERE sf.profile_id = {profile_id} AND sf.item_type = '{item}' AND ({conds}){socle}",
         item = objet.item_type(),
         conds = conditions.join(joiner),
+        socle = socle_des_bannis(objet, profile_id),
     ))
 }
 
