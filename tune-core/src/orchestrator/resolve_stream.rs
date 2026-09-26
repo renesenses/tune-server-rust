@@ -1159,16 +1159,19 @@ impl PlaybackOrchestrator {
             // flux traité ne peut donc jamais partager la clé d'un flux
             // brut. La garde ne couvrait que l'égaliseur ; le convolveur et
             // le ReplayGain la traversaient (#2863).
+            // Sans racine de cache utilisable pour ce compte (#5133), même
+            // chemin que sans cache : pas de `DashWarm`.
             if !dash_dsp_active {
-                Some(DashWarm {
-                    cache_path: crate::transcode_cache::cache_path_streaming(
-                        service_name,
-                        source_id,
-                        wfmt,
-                        wsr,
-                        wkbd,
-                        2,
-                    ),
+                crate::transcode_cache::cache_path_streaming(
+                    service_name,
+                    source_id,
+                    wfmt,
+                    wsr,
+                    wkbd,
+                    2,
+                )
+                .map(|cache_path| DashWarm {
+                    cache_path,
                     enc_format: wfmt,
                     key_bit_depth: wkbd,
                     force_flac: wflac,

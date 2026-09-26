@@ -217,9 +217,13 @@ impl PlaybackOrchestrator {
             let sr = stream_data.quality.sample_rate;
             let bd = stream_data.quality.bit_depth.max(16).min(24);
             let key_bd = if out_fmt == "wav" { 16 } else { bd };
-            let cp = crate::transcode_cache::cache_path_streaming(
+            // Pas de racine de cache utilisable pour ce compte (#5133) : rien
+            // à chauffer.
+            let Some(cp) = crate::transcode_cache::cache_path_streaming(
                 &source, &source_id, out_fmt, sr, key_bd, 2,
-            );
+            ) else {
+                return;
+            };
             if crate::transcode_cache::is_hit(&cp) {
                 return; // already warmed
             }
