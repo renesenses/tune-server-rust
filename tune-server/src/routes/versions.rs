@@ -658,7 +658,7 @@ pub(crate) async fn versions_streaming(
                 };
                 let Some(arc) = arc else { break };
                 let svc = arc.read().await;
-                if !svc.enabled() || !svc.auth_status().await.authenticated {
+                if !svc.utilisable().await {
                     break;
                 }
                 let Ok(resultats) = svc
