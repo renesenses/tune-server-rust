@@ -549,10 +549,11 @@ async fn le_scan_range_chaque_piste_dans_un_album_et_rend_les_memes_comptes_a_ch
             .expect("vider la bibliothèque PostgreSQL");
         let p = jouer(&pg, "postgres").await;
         verifier("PostgreSQL", &p);
-        // ⚠️ Le NOMBRE d'albums n'est pas comparé entre moteurs : la fusion
-        // post-scan des albums homonymes (`routes/system/scan.rs`, #593) est
-        // écrite en `GROUP_CONCAT` et ne tourne que sur SQLite. C'est un
-        // arbitrage ouvert, pas un oubli de ce banc — voir la PR de #4602.
+        // ⚠️ Le NOMBRE d'albums n'est pas comparé entre moteurs. La fusion
+        // post-scan des albums homonymes (#593), longtemps morte sur
+        // PostgreSQL (`GROUP_CONCAT` en dur), tourne sur les deux moteurs
+        // depuis le reste de #5005 — elle a son propre banc,
+        // `pg_fusions_auto_albums.rs`.
         return;
     }
     eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL de #4602 SAUTÉE");

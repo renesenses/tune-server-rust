@@ -14,6 +14,7 @@ use crate::error::AppError;
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 use tune_core::db::album_distinct_repo::{AlbumDistinctRepo, DistinctPairSet};
+use tune_core::db::album_doublons::{Declencheur, FusionDesDoublons};
 use tune_core::db::album_repo::{AlbumRepo, DrRange};
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::backend::{DbBackend, ToSqlValue};
@@ -1009,114 +1010,27 @@ fn paires_distinctes(state: &AppState) -> DistinctPairSet {
         })
 }
 
+/// `POST /library/albums/merge-duplicates` — la fusion à la demande.
+///
+/// La détection et la fusion sont celles de la fin de scan et du nettoyage
+/// ([`FusionDesDoublons`], reste de #5005) : groupes `(LOWER(title),
+/// artist_id)`, paires déclarées distinctes jamais fusionnées (#1276),
+/// absorption complète (favoris, étiquettes, écoutes, dossiers suivent
+/// l'album conservé). Seul le plafond des chemins automatiques ne s'applique
+/// pas ici : c'est le geste de l'utilisateur.
 pub(super) async fn merge_duplicate_albums_route(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
-    // Pick engine-specific aggregate and placeholder helpers.
-    let (group_concat_expr, p1, p2) = match state.backend.engine() {
-        Engine::Postgres => (
-            // L'agrégat porte sur `id`, converti en texte (`STRING_AGG` exige du
-            // texte, cf. #4602). Il agrégeait `$1` — un PARAMÈTRE que la requête
-            // ne lie jamais : PostgreSQL refusait la requête (« bind message
-            // supplies 0 parameters, but prepared statement requires 1 »), la route rendait « 0 fusionné » et le bouton
-            // « Fusionner les doublons » ne faisait rien (chasse PG du 25/09/2026).
-            PostgresDialect.group_concat("CAST(id AS TEXT)", ","),
-            PostgresDialect.placeholder(1),
-            PostgresDialect.placeholder(2),
-        ),
-        Engine::Sqlite => (
-            SqliteDialect.group_concat("id", ","),
-            SqliteDialect.placeholder(1),
-            SqliteDialect.placeholder(2),
-        ),
-    };
-
-    // Case-insensitive grouping: LOWER(title) catches duplicates that differ
-    // only by case (e.g. "The Dark Side of the Moon" vs "The Dark Side Of The Moon").
-    let dupes_sql = format!(
-        "SELECT LOWER(title), {group_concat_expr} FROM albums WHERE source = 'local' GROUP BY LOWER(title) HAVING COUNT(id) > 1"
-    );
-    let dupes: Vec<(String, String)> = state
-        .backend
-        .query_many(&dupes_sql, &[])
-        .ou_defaut_journalise()
-        .into_iter()
-        .filter_map(|row| {
-            let title = row.first()?.as_string()?;
-            let ids = row.get(1)?.as_string()?;
-            Some((title, ids))
-        })
-        .collect();
-
-    // #1276 : l'utilisateur a pu déclarer que deux de ces albums sont des
-    // releases DIFFÉRENTES. Une requête, un `HashSet` — le coût par candidat
-    // reste nul, et aucun `LOWER` n'est ajouté à ce chemin (#2848 y a mesuré
-    // ×4000 pour un `LOWER` non indexé).
-    let distinctes = paires_distinctes(&state);
-
-    let mut deleted = 0i64;
-    let mut protegees = 0i64;
-    for (_title, ids_str) in &dupes {
-        let ids: Vec<i64> = ids_str.split(',').filter_map(|s| s.parse().ok()).collect();
-        if ids.len() < 2 {
-            continue;
-        }
-        let mut best_id = ids[0];
-        let mut best_count = 0i64;
-        let count_sql = format!("SELECT COUNT(id) FROM tracks WHERE album_id = {p1}");
-        for &aid in &ids {
-            let cnt: i64 = state
-                .backend
-                .query_one(&count_sql, &[&aid as &dyn ToSqlValue])
-                .ok()
-                .flatten()
-                .and_then(|row| row.into_iter().next()?.as_i64())
-                .unwrap_or(0);
-            if cnt > best_count {
-                best_count = cnt;
-                best_id = aid;
-            }
-        }
-        let update_sql = format!("UPDATE tracks SET album_id = {p1} WHERE album_id = {p2}");
-        let delete_sql = format!("DELETE FROM albums WHERE id = {p1}");
-        for &aid in &ids {
-            if aid == best_id {
-                continue;
-            }
-            // L'arbitrage de l'utilisateur prime sur le rapprochement par
-            // titre : la fusion SUPPRIME la ligne perdante, elle ne se répare
-            // pas. Un album protégé reste simplement à part (#1276).
-            if distinctes.contains(best_id, aid) {
-                protegees += 1;
-                tracing::info!(
-                    conserve = best_id,
-                    protege = aid,
-                    "album_merge_ignoree_paire_declaree_distincte"
-                );
-                continue;
-            }
-            state
-                .backend
-                .execute(
-                    &update_sql,
-                    &[&best_id as &dyn ToSqlValue, &aid as &dyn ToSqlValue],
-                )
-                .ok();
-            state
-                .backend
-                .execute(&delete_sql, &[&aid as &dyn ToSqlValue])
-                .ok();
-            deleted += 1;
-        }
-    }
-    state
-        .backend
-        .execute_batch(&format!(
-            "UPDATE albums SET track_count = {}",
-            tune_core::db::track_repo::sql_compte_pistes_visibles("albums.id")
-        ))
-        .ok();
-    Ok(Json(json!({ "merged": deleted, "protected": protegees })))
+    let bilan = FusionDesDoublons::with_backend(state.backend.clone())
+        .fusionner(Declencheur::Manuel)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+    Ok(Json(json!({
+        "merged": bilan.fusionnes,
+        "protected": bilan.proteges,
+        "identified_elsewhere": bilan.identifies_ailleurs,
+        "manually_edited": bilan.edites_a_la_main,
+        "failed": bilan.echecs,
+    })))
 }
 
 const VARIANT_PATTERNS: &[&str] = &[
