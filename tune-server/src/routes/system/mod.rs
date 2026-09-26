@@ -132,6 +132,10 @@ pub fn router() -> Router<AppState> {
         // d'abord n'en changerait rien ici (les gabarits ne se recouvrent pas)
         // mais l'ordre dit l'intention à la lecture.
         .route(
+            "/background-tasks/dynamic-range-priority",
+            post(taches_de_fond::fixer_priorite_dr),
+        )
+        .route(
             "/background-tasks/pause-all",
             post(taches_de_fond::tout_suspendre),
         )
