@@ -7,6 +7,32 @@ use super::backend::{DbBackend, SqlValue, ToSqlValue};
 use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::sqlite::SqliteDb;
 
+pub use super::zone_motif_masquage::MotifMasquage;
+
+/// Une zone masquée, telle que la réparation des masquages la confronte à la
+/// liste des appareils ignorés (#5077).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZoneMasquee {
+    pub id: i64,
+    pub name: String,
+    pub device_id: String,
+    /// `output_type` de la zone (`dlna`, `airplay`…), vide si inconnu.
+    pub protocole: String,
+    pub host: String,
+    pub mac: Option<String>,
+    pub motif: Option<String>,
+    pub masquee_le: Option<String>,
+}
+
+/// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
+/// inconnu : masquage d'avant la migration 112, ou zone visible.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EtatDeMasquage {
+    pub masquee: bool,
+    pub motif: Option<String>,
+    pub masquee_le: Option<String>,
+}
+
 /// Nombre d'écritures de réglages de zone que le schéma courant n'a pas pu
 /// conserver. Ce compteur de processus est volontairement monotone : un
 /// rapport de bogue doit dire qu'un mensonge a eu lieu même si l'utilisateur a
@@ -337,6 +363,21 @@ pub mod sql {
 
     pub fn hide_duplicate_generic_local<D: SqlDialect>(d: &D) -> String {
         format!(
+            "UPDATE zones SET is_hidden = 1, motif_masquage = '{}', masquee_le = {} \
+             WHERE id <> {} AND output_type = 'local' \
+             AND name IN ({}) \
+             AND COALESCE(is_hidden, 0) = 0",
+            super::MotifMasquage::DoublonLocalGenerique.as_str(),
+            d.now_iso8601(),
+            d.placeholder(1),
+            etiquettes_locales_generiques()
+        )
+    }
+
+    /// La forme d'avant #5077, sans motif : le repli d'une base à qui la
+    /// migration 112 n'a pas encore été appliquée (voir `ZoneRepo::masquer`).
+    pub fn hide_duplicate_generic_local_sans_motif<D: SqlDialect>(d: &D) -> String {
+        format!(
             "UPDATE zones SET is_hidden = 1 \
              WHERE id <> {} AND output_type = 'local' \
              AND name IN ({}) \
@@ -374,9 +415,114 @@ pub mod sql {
         "UPDATE zones SET is_hidden = 1, last_track_id = NULL"
     }
 
+    /// `delete_all` avec son motif (#5077). « Supprimer toutes les zones » est
+    /// un geste explicite : il écrase le motif d'une zone déjà masquée, comme
+    /// la suppression d'une seule zone.
+    pub fn delete_all_avec_motif<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 1, last_track_id = NULL, \
+             motif_masquage = '{}', masquee_le = {}",
+            super::MotifMasquage::SuppressionTotale.as_str(),
+            d.now_iso8601()
+        )
+    }
+
+    /// Masque la zone `$2` pour le motif `$1`, et date le masquage (#5077).
+    ///
+    /// `seulement_si_visible` : un masquage AUTOMATIQUE (cascade d'« Ignorer »,
+    /// reflet, jumelle générique) ne touche qu'une zone encore visible — il ne
+    /// doit jamais réécrire le motif d'une zone que l'utilisateur a déjà
+    /// supprimée, sans quoi une réparation future la ressusciterait.
+    pub fn masquer<D: SqlDialect>(d: &D, seulement_si_visible: bool) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 1, motif_masquage = {}, masquee_le = {} \
+             WHERE id = {}{}",
+            d.placeholder(1),
+            d.now_iso8601(),
+            d.placeholder(2),
+            if seulement_si_visible {
+                " AND COALESCE(is_hidden, 0) = 0"
+            } else {
+                ""
+            }
+        )
+    }
+
+    /// La forme d'avant #5077 de [`masquer`] : le repli d'une base sans les
+    /// colonnes de la migration 112.
+    pub fn masquer_sans_motif<D: SqlDialect>(d: &D, seulement_si_visible: bool) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 1 WHERE id = {}{}",
+            d.placeholder(1),
+            if seulement_si_visible {
+                " AND COALESCE(is_hidden, 0) = 0"
+            } else {
+                ""
+            }
+        )
+    }
+
+    /// Démasque, et oublie le motif et la date : une zone visible n'a pas de
+    /// raison d'être masquée (#5077).
+    pub fn unhide<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 0, motif_masquage = NULL, masquee_le = NULL \
+             WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    pub fn unhide_sans_motif<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 0 WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// Démasque la zone `$1` SEULEMENT si elle porte encore le motif `$2` : la
+    /// réparation relit le motif dans la même écriture, donc une suppression
+    /// arrivée entre la lecture et l'écriture n'est jamais défaite (#5077).
+    pub fn demasquer_si_motif<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE zones SET is_hidden = 0, motif_masquage = NULL, masquee_le = NULL \
+             WHERE id = {} AND COALESCE(is_hidden, 0) = 1 AND motif_masquage = {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// Les zones masquées pour le motif `$1`, avec de quoi les confronter à la
+    /// liste des appareils ignorés (#5077).
+    pub fn zones_masquees_pour_motif<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT id, COALESCE(name, ''), COALESCE(output_device_id, ''), \
+             COALESCE(output_type, ''), COALESCE(host, ''), mac, motif_masquage, masquee_le \
+             FROM zones WHERE COALESCE(is_hidden, 0) = 1 AND motif_masquage = {} ORDER BY id",
+            d.placeholder(1)
+        )
+    }
+
+    /// L'état de masquage d'une zone : drapeau, motif, date (#5077).
+    pub fn etat_de_masquage<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT COALESCE(is_hidden, 0), motif_masquage, masquee_le FROM zones WHERE id = {}",
+            d.placeholder(1)
+        )
+    }
+
+    /// Le motif de masquage de la zone MASQUÉE de cet appareil (#5077).
+    pub fn motif_masquage_par_appareil<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT motif_masquage FROM zones WHERE output_device_id = {} \
+             AND COALESCE(is_hidden, 0) = 1 ORDER BY id LIMIT 1",
+            d.placeholder(1)
+        )
+    }
+
     pub fn unhide_by_device_id<D: SqlDialect>(d: &D) -> String {
         format!(
-            "UPDATE zones SET is_hidden = 0 WHERE output_device_id = {} AND COALESCE(is_hidden, 0) = 1",
+            "UPDATE zones SET is_hidden = 0, motif_masquage = NULL, masquee_le = NULL \
+             WHERE output_device_id = {} AND COALESCE(is_hidden, 0) = 1",
             d.placeholder(1)
         )
     }
@@ -1210,7 +1356,9 @@ impl ZoneRepo {
         self.reporter_une_table_vers("streaming_queue", doublon, cible)?;
         let (groupes_reecrits, zone_par_defaut_reportee) =
             self.reporter_les_references_vers(doublon, cible)?;
-        self.delete(doublon)?;
+        // Masquage de motif `fusion` (#5077) : le doublon a été versé dans la
+        // cible, le démasquer recréerait le doublon.
+        self.masquer(doublon, MotifMasquage::Fusion)?;
         tracing::info!(
             doublon,
             cible,
@@ -2405,7 +2553,18 @@ impl ZoneRepo {
             sql::hide_duplicate_generic_local,
         );
         let params: [&dyn ToSqlValue; 1] = [&keep_id];
-        self.db.execute(&sql, &params)
+        match self.db.execute(&sql, &params) {
+            // Base sans les colonnes de la migration 112 (#5077) : masquer
+            // quand même, sans motif.
+            Err(e) if schema_incomplet(&e) => {
+                let repli = self.dialect_sql(
+                    sql::hide_duplicate_generic_local_sans_motif,
+                    sql::hide_duplicate_generic_local_sans_motif,
+                );
+                self.db.execute(&repli, &params)
+            }
+            autre => autre,
+        }
     }
 
     /// Une zone locale VISIBLE porte-t-elle déjà l'étiquette générique, sur un
@@ -2441,36 +2600,142 @@ impl ZoneRepo {
     /// wipe the slate and explicitly re-create the zones he wants: discovery
     /// never resurrects a hidden zone, only POST /zones does.
     pub fn delete_all(&self) -> Result<usize, String> {
-        self.db.execute(sql::delete_all(), &[])
+        let sql = self.dialect_sql(sql::delete_all_avec_motif, sql::delete_all_avec_motif);
+        match self.db.execute(&sql, &[]) {
+            // Base sans les colonnes de la 112 : le masquage passe quand même,
+            // sans motif — ne pas masquer serait pire que ne pas dire pourquoi.
+            Err(e) if schema_incomplet(&e) => self.db.execute(sql::delete_all(), &[]),
+            autre => autre,
+        }
     }
 
+    /// Supprimer une zone, geste de l'UTILISATEUR : c'est un masquage de motif
+    /// [`MotifMasquage::SuppressionUtilisateur`], qui n'est JAMAIS défait
+    /// automatiquement.
+    ///
+    /// Un chemin automatique qui masque une zone passe par [`Self::masquer`]
+    /// avec SON motif. Ce défaut-ci est le prudent : un appelant qui aurait
+    /// oublié de nommer sa raison obtient le motif que rien ne répare.
     pub fn delete(&self, id: i64) -> Result<(), String> {
-        let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
-        let params: [&dyn ToSqlValue; 1] = [&id];
-        self.db.execute(&sql, &params)?;
+        self.masquer(id, MotifMasquage::SuppressionUtilisateur)
+            .map(|_| ())
+    }
+
+    /// Masque la zone `id` en retenant POURQUOI et QUAND (#5077). Rend le
+    /// nombre de lignes touchées.
+    ///
+    /// Un motif qui n'écrase pas un masquage existant
+    /// ([`MotifMasquage::ecrase_un_masquage_existant`]) ne touche qu'une zone
+    /// encore visible : une zone déjà supprimée par l'utilisateur garde son
+    /// motif, et aucune réparation ne pourra la ressusciter.
+    ///
+    /// Base sans les colonnes de la migration 112 : repli sur le masquage
+    /// d'avant, sans motif — la zone est masquée quand même.
+    pub fn masquer(&self, id: i64, motif: MotifMasquage) -> Result<usize, String> {
+        let seulement_si_visible = !motif.ecrase_un_masquage_existant();
+        let sql = self.dialect_sql(
+            |d| sql::masquer(d, seulement_si_visible),
+            |d| sql::masquer(d, seulement_si_visible),
+        );
+        let texte = motif.as_str();
+        let params: [&dyn ToSqlValue; 2] = [&texte, &id];
+        let touchees = match self.db.execute(&sql, &params) {
+            Err(e) if schema_incomplet(&e) => {
+                let repli = self.dialect_sql(
+                    |d| sql::masquer_sans_motif(d, seulement_si_visible),
+                    |d| sql::masquer_sans_motif(d, seulement_si_visible),
+                );
+                self.db.execute(&repli, &[&id as &dyn ToSqlValue])?
+            }
+            autre => autre?,
+        };
         // Une zone supprimée ne joue plus : sans cela, la supprimer en pleine
         // lecture laisserait les passes de fond freinées (#4681).
         crate::taches_de_fond::priorite::oublier_la_zone(id);
+        Ok(touchees)
+    }
+
+    /// Démasque la zone, et efface son motif et sa date de masquage.
+    pub fn unhide(&self, id: i64) -> Result<(), String> {
+        let sql = self.dialect_sql(sql::unhide, sql::unhide);
+        match self.db.execute(&sql, &[&id as &dyn ToSqlValue]) {
+            Err(e) if schema_incomplet(&e) => {
+                let repli = self.dialect_sql(sql::unhide_sans_motif, sql::unhide_sans_motif);
+                self.db.execute(&repli, &[&id as &dyn ToSqlValue])?;
+            }
+            autre => {
+                autre?;
+            }
+        }
         Ok(())
     }
 
-    pub fn unhide(&self, id: i64) -> Result<(), String> {
+    /// Démasque la zone `id` SEULEMENT si elle est encore masquée pour
+    /// `motif` — la condition est relue dans la même écriture (#5077). Rend le
+    /// nombre de lignes touchées : `0` si une suppression est passée entre-temps.
+    pub fn demasquer_si_motif(&self, id: i64, motif: MotifMasquage) -> Result<usize, String> {
+        let sql = self.dialect_sql(sql::demasquer_si_motif, sql::demasquer_si_motif);
+        let texte = motif.as_str();
+        let params: [&dyn ToSqlValue; 2] = [&id, &texte];
+        self.db.execute(&sql, &params)
+    }
+
+    /// Les zones masquées pour `motif` (#5077). Lecture forte : un masquage
+    /// vient parfois d'arriver dans la même session.
+    pub fn zones_masquees_pour_motif(
+        &self,
+        motif: MotifMasquage,
+    ) -> Result<Vec<ZoneMasquee>, String> {
         let sql = self.dialect_sql(
-            |d| {
-                format!(
-                    "UPDATE zones SET is_hidden = 0 WHERE id = {}",
-                    d.placeholder(1)
-                )
-            },
-            |d| {
-                format!(
-                    "UPDATE zones SET is_hidden = 0 WHERE id = {}",
-                    d.placeholder(1)
-                )
-            },
+            sql::zones_masquees_pour_motif,
+            sql::zones_masquees_pour_motif,
         );
-        self.db.execute(&sql, &[&id as &dyn ToSqlValue])?;
-        Ok(())
+        let texte = motif.as_str();
+        let params: [&dyn ToSqlValue; 1] = [&texte];
+        let lignes = self.db.query_many_strong(&sql, &params)?;
+        Ok(lignes
+            .iter()
+            .filter_map(|r| {
+                let texte = |i: usize| r.get(i).and_then(|v| v.as_string());
+                Some(ZoneMasquee {
+                    id: r.first().and_then(|v| v.as_i64())?,
+                    name: texte(1).unwrap_or_default(),
+                    device_id: texte(2).unwrap_or_default(),
+                    protocole: texte(3).unwrap_or_default(),
+                    host: texte(4).unwrap_or_default(),
+                    mac: texte(5).filter(|m| !m.trim().is_empty()),
+                    motif: texte(6),
+                    masquee_le: texte(7),
+                })
+            })
+            .collect())
+    }
+
+    /// L'état de masquage de la zone `id` : `None` si elle n'existe pas.
+    pub fn etat_de_masquage(&self, id: i64) -> Result<Option<EtatDeMasquage>, String> {
+        let sql = self.dialect_sql(sql::etat_de_masquage, sql::etat_de_masquage);
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        Ok(self.db.query_one(&sql, &params)?.map(|r| EtatDeMasquage {
+            masquee: r.first().and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+            motif: r.get(1).and_then(|v| v.as_string()),
+            masquee_le: r.get(2).and_then(|v| v.as_string()),
+        }))
+    }
+
+    /// Le motif de masquage de la zone MASQUÉE de cet appareil, s'il est
+    /// connu (#5077). `None` : pas de zone masquée, motif inconnu (masquage
+    /// d'avant la migration 112), ou base sans la colonne.
+    pub fn motif_masquage_par_appareil(&self, device_id: &str) -> Option<String> {
+        let sql = self.dialect_sql(
+            sql::motif_masquage_par_appareil,
+            sql::motif_masquage_par_appareil,
+        );
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        self.db
+            .query_one(&sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|r| r.first().and_then(|v| v.as_string()))
     }
 
     pub fn update_group(&self, id: i64, group_id: Option<&str>) -> Result<(), String> {

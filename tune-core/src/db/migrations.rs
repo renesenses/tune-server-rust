@@ -2073,6 +2073,38 @@ CREATE INDEX IF NOT EXISTS idx_collection_folder_items_folder ON collection_fold
         name: "playlist_tracks_titres_de_service",
         up: "",
     },
+    // #5077 (Villerio, fil 1926) — POURQUOI une zone est masquee :
+    // `zones.motif_masquage` et `zones.masquee_le`.
+    //
+    // Le masquage etait un seul bit (`is_hidden = 1`), sans motif ni date.
+    // Plusieurs chemins le posent — suppression par l'utilisateur, « supprimer
+    // toutes les zones », jumelle locale generique, cascade d'« Ignorer cet
+    // appareil », reflet de notre propre facade, fusion — et rien ne
+    // permettait ensuite de distinguer une zone que l'utilisateur a voulu
+    // retirer d'une zone emportee par erreur (l'ancien defaut #4957 : ignorer
+    // l'entree AirPlay d'un boitier masquait sa zone DLNA). Les valeurs sont
+    // celles de `zone_motif_masquage::MotifMasquage`.
+    //
+    // 🔴 NUL = INCONNU, pour TOUT masquage existant : on ne devine rien. Seul
+    // un motif CONNU et explicitement reparable (`appareil_ignore` dont
+    // l'appareil n'est plus ignore) peut etre demasque automatiquement ; un
+    // NUL ou une `suppression_utilisateur` ne l'est jamais.
+    //
+    // Numerotee 112, PAS 110 : la 110 (PG 073) est prise par #4925, la 111
+    // (PG 074) par #5034, toutes deux en PR en meme temps que celle-ci. Le
+    // lanceur ne joue que `version > MAX` : une 112 appliquee AVANT la 110 et
+    // la 111 les ferait sauter en silence sur toute base deja montee. Cette
+    // migration EXIGE donc les deux avant elle — sinon, elle se renumerote a
+    // la promotion. La garde de contiguite de cette liste le signale tant
+    // qu'elles manquent.
+    //
+    // Colonnes posees par `add_column_if_missing` dans le bloc de version, PAS
+    // par un ALTER TABLE ici — meme regle qu'a la 106. Jumelle PG : 075.
+    Migration {
+        version: 112,
+        name: "zones_motif_masquage",
+        up: "",
+    },
 ];
 
 /// SQL de la migration 109 (#4889) — voir son entree dans `MIGRATIONS`.
@@ -2990,6 +3022,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
                 warn!(erreur = %e, "migration_107_index_artist_mbid");
             }
         }
+        if migration.version == 112 {
+            // Motif et date du masquage d'une zone (#5077). Sans defaut : NUL =
+            // INCONNU, et c'est ce que recoit tout masquage existant — rien
+            // dans cette base ne dit pourquoi une zone deja masquee l'a ete.
+            add_column_if_missing(db, "zones", "motif_masquage", "TEXT");
+            add_column_if_missing(db, "zones", "masquee_le", "TEXT");
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -3283,6 +3322,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #2269 : identifiant d'endpoint stable de la sortie locale, NULL pour
     // l'existant. Voir la migration 99 et `outputs::identite_de_sortie`.
     add_column_if_missing(db, "zones", "output_endpoint_id", "TEXT");
+    // #5077 : motif et date du masquage (migration 112). Chaque masquage et
+    // chaque demasquage les NOMMENT ; NUL = inconnu pour l'existant.
+    add_column_if_missing(db, "zones", "motif_masquage", "TEXT");
+    add_column_if_missing(db, "zones", "masquee_le", "TEXT");
     // BIB-B2 : empreinte du contenu audio decode, versionnee (env100ms-v1:<hex>).
     add_column_if_missing(db, "tracks", "audio_fingerprint", "TEXT");
 
@@ -4099,6 +4142,15 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         72,
         "playlist_tracks_titres_de_service",
         include_str!("../../migrations/postgres/072_playlist_tracks_titres_de_service.sql"),
+    ),
+    // Jumelle de la SQLite 112 (#5077) : motif et date du masquage d'une
+    // zone. Numerotee 75 : la 73 est prise par #4925, la 74 par #5034, PR
+    // ouvertes en meme temps. Elle EXIGE la 73 et la 74 avant elle, sinon
+    // elle se renumerote a la promotion — la garde de contiguite le signale.
+    (
+        75,
+        "zones_motif_masquage",
+        include_str!("../../migrations/postgres/075_zones_motif_masquage.sql"),
     ),
 ];
 
@@ -6511,7 +6563,14 @@ mod tests {
         // 72 : `playlist_tracks_titres_de_service` (#4889), jumelle de la
         // SQLite 109. Relache `track_id`, pose `source` / `source_id` et les
         // colonnes d'affichage, et le CHECK « l'un ou l'autre ».
-        assert_eq!(pg_latest_version(), 72, "latest PG migration must be 72");
+        // 73 : `exemplaires_par_repertoire` (#4925), attendue — voir la 75.
+        // 74 : `albums_source_de_pochette` (#5034), attendue — voir la 75.
+        // 75 : `zones_motif_masquage` (#5077), jumelle de la SQLite 112. Pose
+        // `zones.motif_masquage` et `zones.masquee_le`, que chaque masquage
+        // et chaque demasquage NOMMENT. Elle exige la 73 et la 74 : tant
+        // qu'elles ne sont pas fusionnees, la contiguite ci-dessus echoue, et
+        // c'est voulu.
+        assert_eq!(pg_latest_version(), 75, "latest PG migration must be 75");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),
