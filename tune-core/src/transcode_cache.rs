@@ -9,7 +9,9 @@
 //!
 //! This module gives those files a **deterministic** name derived from
 //! everything that affects the encoded bytes, so an identical request finds the
-//! finished file and serves it instantly. Cache files use the `tune-tcache-`
+//! finished file and serves it instantly. Cache files live in a root of their
+//! own **per account** — `racine_de_travail("tune-tcache")`, i.e.
+//! `…/tune-tcache-<uid>/` (#5133) — and use the `tune-tcache-`
 //! prefix, which `streamer::is_temp_transcode_file` does NOT match, so the
 //! per-session and startup cleanups leave them alone — their lifetime is
 //! governed here by [`evict`] (bounded total size, LRU).
@@ -167,12 +169,7 @@ pub fn cache_path_dsp(
     }
     let hex = format!("{:x}", h.finalize());
     let name = format!("{CACHE_PREFIX}{}.{out_ext}", &hex[..32]);
-    Some(
-        std::env::temp_dir()
-            .join(name)
-            .to_string_lossy()
-            .to_string(),
-    )
+    chemin_du_rendu(&name)
 }
 
 /// Deterministic cache path for a transcoded *streaming* rendition (Tidal /
@@ -183,8 +180,10 @@ pub fn cache_path_dsp(
 /// its path/mtime/size are meaningless as a key. Instead we hash the durable
 /// stream identity — `service | source_id | out_ext | sample_rate | bit_depth |
 /// channels` — which is what actually determines the transcoded bytes. This is
-/// **infallible** (no `metadata()` call): a HI-RES track resolved for the same
-/// zone always maps to the same cached FLAC/WAV.
+/// independent of any `metadata()` call: a HI-RES track resolved for the same
+/// zone always maps to the same cached FLAC/WAV. `None` only when the
+/// account's cache root is unusable (see [`racine_preparee`]): the caller then
+/// transcodes without caching.
 ///
 /// Shares the `tune-tcache-` prefix so [`is_hit`], [`touch`] and [`evict`] cover
 /// these entries identically. EQ is out of the key (see the module docs): the
@@ -198,7 +197,7 @@ pub fn cache_path_streaming(
     sample_rate: u32,
     bit_depth: u16,
     channels: u16,
-) -> String {
+) -> Option<String> {
     let mut h = Sha256::new();
     h.update(service.as_bytes());
     h.update([0u8]); // domain separator so "ab|c" ≠ "a|bc"
@@ -210,10 +209,71 @@ pub fn cache_path_streaming(
     h.update(channels.to_le_bytes());
     let hex = format!("{:x}", h.finalize());
     let name = format!("{CACHE_PREFIX}{}.{out_ext}", &hex[..32]);
-    std::env::temp_dir()
-        .join(name)
-        .to_string_lossy()
-        .to_string()
+    chemin_du_rendu(&name)
+}
+
+/// Étiquette de la racine du cache : `racine_de_travail(ETIQUETTE_RACINE)` rend
+/// `…/tune-tcache-<uid>`, un dossier par compte (#5133).
+const ETIQUETTE_RACINE: &str = "tune-tcache";
+
+/// Le chemin du rendu `nom` dans la racine du compte courant.
+fn chemin_du_rendu(nom: &str) -> Option<String> {
+    chemin_dans(
+        &crate::chemins_de_travail::racine_de_travail(ETIQUETTE_RACINE),
+        crate::chemins_de_travail::uid_courant(),
+        nom,
+    )
+}
+
+/// Le chemin du rendu `nom` sous `racine`, une fois la racine préparée pour
+/// `proprietaire`. Forme testable de [`chemin_du_rendu`] : la racine est
+/// passée, donc un test peut jouer deux comptes sans en avoir deux.
+fn chemin_dans(racine: &std::path::Path, proprietaire: u32, nom: &str) -> Option<String> {
+    let racine = racine_preparee(racine, proprietaire)?;
+    Some(racine.join(nom).to_string_lossy().to_string())
+}
+
+/// Crée la racine du cache si besoin (`0700` sous Unix) et ne la rend que si
+/// elle est **à nous** : un vrai dossier (pas un lien) qui appartient à
+/// `proprietaire`.
+///
+/// Avant #5133, les rendus vivaient à plat dans le dossier temporaire partagé,
+/// sous un nom qui ne dépendait que de la piste : deux comptes qui rendaient la
+/// même piste partageaient le même fichier, et le second ne pouvait pas y
+/// renommer le sien. Une racine déjà là mais qui appartient à un autre compte
+/// ramènerait ce partage : on n'y lit ni n'y écrit, on transcode sans cache.
+fn racine_preparee(racine: &std::path::Path, proprietaire: u32) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        if let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(racine)
+        {
+            tracing::debug!(racine = %racine.display(), error = %e, "transcode_cache_root_unavailable");
+            return None;
+        }
+        let m = std::fs::symlink_metadata(racine).ok()?;
+        if !m.file_type().is_dir() || m.uid() != proprietaire {
+            tracing::warn!(
+                racine = %racine.display(),
+                "transcode_cache_root_not_owned — cache désactivé pour ce compte"
+            );
+            return None;
+        }
+        if m.permissions().mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(racine, std::fs::Permissions::from_mode(0o700));
+        }
+        Some(racine.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        // Sous Windows, le dossier temporaire est déjà propre au compte.
+        let _ = proprietaire;
+        std::fs::create_dir_all(racine).ok()?;
+        Some(racine.to_path_buf())
+    }
 }
 
 /// True when `path` holds a completed transcode (exists, non-trivial size).
@@ -249,17 +309,53 @@ pub fn evict() {
 }
 
 /// Eviction with an explicit byte cap (the testable core of [`evict`]).
+///
+/// Balaie la racine du compte courant (#5133), puis purge dans son dossier
+/// parent — le dossier temporaire — les rendus posés à plat par les versions
+/// d'avant, **seulement** ceux du compte courant.
 fn evict_with_cap(cap: u64) {
-    evict_in(
-        &std::env::temp_dir(),
-        cap,
-        crate::chemins_de_travail::uid_courant(),
-    );
+    let uid = crate::chemins_de_travail::uid_courant();
+    let racine = crate::chemins_de_travail::racine_de_travail(ETIQUETTE_RACINE);
+    evict_in(&racine, cap, uid);
+    if let Some(ancien) = racine.parent() {
+        purger_anciens_rendus(ancien, uid);
+    }
+}
+
+/// Supprime, dans `dossier`, les rendus `tune-tcache-*` posés à plat par les
+/// versions d'avant #5133 : des fichiers ordinaires (ni lien, ni dossier — la
+/// racine `tune-tcache-<uid>` porte le même préfixe) qui appartiennent à `uid`
+/// et assez vieux pour ne plus être servis. Ceux d'un autre compte restent.
+fn purger_anciens_rendus(dossier: &std::path::Path, uid: u32) {
+    let Ok(entrees) = std::fs::read_dir(dossier) else {
+        return;
+    };
+    let maintenant = SystemTime::now();
+    for entree in entrees.flatten() {
+        if !entree
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(CACHE_PREFIX))
+        {
+            continue;
+        }
+        // `DirEntry::metadata` ne suit pas les liens symboliques.
+        let Ok(m) = entree.metadata() else { continue };
+        if !m.is_file() || !appartient_a(&m, uid) {
+            continue;
+        }
+        let age = maintenant
+            .duration_since(m.modified().unwrap_or(maintenant))
+            .unwrap_or(Duration::ZERO);
+        if age >= Duration::from_secs(EVICT_MIN_AGE_SECS) {
+            let _ = std::fs::remove_file(entree.path());
+        }
+    }
 }
 /// Le cœur de l'éviction, avec son dossier et son propriétaire **passés**.
 ///
-/// Les rendus vivent à plat dans `temp_dir()`, que d'autres comptes de la même
-/// machine partagent (#4770). Seuls les fichiers qui appartiennent à `uid`
+/// Les rendus vivent dans la racine du compte (#5133) ; avant, ils vivaient à
+/// plat dans le dossier temporaire partagé (#4770). Le filtre reste : seuls les fichiers qui appartiennent à `uid`
 /// comptent dans le total et peuvent être supprimés : sans ce filtre, le
 /// plafond comparait un total gonflé par le cache du voisin, et, sur un
 /// `TMPDIR` non sticky, la boucle effaçait les fichiers d'un autre serveur.
@@ -444,8 +540,9 @@ mod tests {
         let b = cache_path_streaming("tidal", "12345", "flac", 96000, 24, 2);
         assert_eq!(a, b, "same inputs → same path");
         // Shares the cache prefix so is_hit / touch / evict cover it.
-        assert!(a.contains("tune-tcache-"));
-        assert!(a.ends_with(".flac"));
+        let chemin = a.as_deref().expect("racine du cache utilisable");
+        assert!(chemin.contains("tune-tcache-"));
+        assert!(chemin.ends_with(".flac"));
 
         // Every identity/output param changes the path.
         assert_ne!(
@@ -542,5 +639,165 @@ mod tests {
             !rendu.exists(),
             "le propriétaire doit pouvoir évincer son propre rendu (sinon le témoin ne prouve rien)"
         );
+    }
+
+    /// Témoin de #5133, côté production : un rendu est rangé dans la racine
+    /// du compte courant (`racine_de_travail("tune-tcache")` → `…-<uid>`), pas
+    /// à plat dans le dossier temporaire partagé. Sans le correctif, son
+    /// dossier parent est le dossier temporaire lui-même.
+    #[test]
+    fn un_rendu_vit_dans_la_racine_du_compte_courant() {
+        let fichier = tmp_source(2048);
+        let src = fichier.to_string_lossy();
+        let racine = crate::chemins_de_travail::racine_de_travail(ETIQUETTE_RACINE);
+        let attendu = format!(
+            "{ETIQUETTE_RACINE}-{}",
+            crate::chemins_de_travail::uid_courant()
+        );
+        assert_eq!(
+            racine.file_name().unwrap().to_string_lossy(),
+            attendu,
+            "la racine du cache ne porte pas l'UID du compte"
+        );
+        let local = cache_path(&src, "flac", 44_100, 16, 2).expect("chemin local");
+        let flux =
+            cache_path_streaming("tidal", "5133", "flac", 96_000, 24, 2).expect("chemin flux");
+        for chemin in [&local, &flux] {
+            assert_eq!(
+                std::path::Path::new(chemin).parent(),
+                Some(racine.as_path()),
+                "le rendu {chemin} n'est pas rangé dans la racine du compte {racine:?}"
+            );
+        }
+    }
+
+    /// Témoin de #5133 : deux comptes qui rendent la MÊME piste ont deux
+    /// fichiers distincts, chacun dans sa racine ; le second met bien son
+    /// rendu en cache, et aucun ne voit ni ne lit le fichier de l'autre.
+    ///
+    /// Les deux UID sont simulés : les racines sont composées par
+    /// `racine_de_travail_sous` avec 1000 et 1001, et préparées au nom du
+    /// compte réel, qui crée bel et bien les deux dossiers.
+    #[cfg(unix)]
+    #[test]
+    fn deux_comptes_ne_partagent_pas_le_rendu_d_une_meme_piste() {
+        use crate::chemins_de_travail::{racine_de_travail_sous, uid_courant};
+        let base = crate::test_scratch::scratch_dir("tcache-comptes-5133");
+        let fichier = tmp_source(3000);
+        let src = fichier.to_string_lossy();
+        let piste = cache_path(&src, "flac", 44_100, 16, 2).expect("chemin de la piste");
+        let nom = std::path::Path::new(&piste)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let moi = uid_courant();
+
+        let racine_a = racine_de_travail_sous(base.path(), ETIQUETTE_RACINE, 1000);
+        let racine_b = racine_de_travail_sous(base.path(), ETIQUETTE_RACINE, 1001);
+        let chemin_a = chemin_dans(&racine_a, moi, &nom).expect("racine du compte A");
+        let chemin_b = chemin_dans(&racine_b, moi, &nom).expect("racine du compte B");
+        assert_ne!(chemin_a, chemin_b, "deux comptes partagent le même rendu");
+        assert_eq!(
+            std::path::Path::new(&chemin_a).parent(),
+            Some(racine_a.as_path())
+        );
+        assert_eq!(
+            std::path::Path::new(&chemin_b).parent(),
+            Some(racine_b.as_path())
+        );
+
+        // Comme en production : écrire un temporaire, puis le renommer.
+        let rendre = |chemin: &str, octet: u8| {
+            let tmp = base.path().join(format!("tune-transcode-{octet}.flac"));
+            std::fs::write(&tmp, vec![octet; 4096]).unwrap();
+            std::fs::rename(&tmp, chemin)
+        };
+
+        // Le compte A rend la piste.
+        rendre(&chemin_a, b'A').expect("mise en cache du compte A");
+        assert!(is_hit(&chemin_a));
+
+        // Le compte B ne voit pas le rendu de A…
+        assert!(
+            !is_hit(&chemin_b),
+            "le compte B trouve en cache le rendu du compte A"
+        );
+        // …et met bien le sien en cache.
+        rendre(&chemin_b, b'B').expect("le second compte n'a pas pu mettre son rendu en cache");
+        assert!(is_hit(&chemin_b));
+
+        // Chacun lit SON rendu.
+        assert!(std::fs::read(&chemin_a).unwrap().iter().all(|&o| o == b'A'));
+        assert!(std::fs::read(&chemin_b).unwrap().iter().all(|&o| o == b'B'));
+    }
+
+    /// Une racine qui existe déjà mais n'est pas à nous — autre propriétaire,
+    /// ou lien symbolique — n'est pas utilisée : pas de cache plutôt qu'un
+    /// cache partagé. Contre-partie : au nom de son propriétaire, la même
+    /// racine est rendue, en `0700`.
+    #[cfg(unix)]
+    #[test]
+    fn une_racine_qui_n_est_pas_a_nous_n_est_pas_utilisee() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::test_scratch::scratch_dir("tcache-racine-5133");
+        let moi = crate::chemins_de_travail::uid_courant();
+        let racine = base.path().join("tune-tcache-4242");
+
+        assert!(
+            racine_preparee(&racine, moi.wrapping_add(1)).is_none(),
+            "une racine d'un autre compte a été acceptée"
+        );
+        assert!(chemin_dans(&racine, moi.wrapping_add(1), "x.flac").is_none());
+
+        let rendue = racine_preparee(&racine, moi).expect("sa propre racine");
+        assert_eq!(rendue, racine);
+        let mode = std::fs::metadata(&racine).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "la racine est lisible par d'autres comptes");
+
+        let lien = base.path().join("tune-tcache-lien");
+        std::os::unix::fs::symlink(&racine, &lien).unwrap();
+        assert!(
+            racine_preparee(&lien, moi).is_none(),
+            "un lien symbolique a été accepté comme racine"
+        );
+    }
+
+    /// Les anciens rendus posés à plat (avant #5133) ne sont purgés que s'ils
+    /// sont au compte courant et assez vieux ; la racine `tune-tcache-<uid>`,
+    /// qui porte le même préfixe, n'est jamais touchée.
+    #[cfg(unix)]
+    #[test]
+    fn les_anciens_rendus_a_plat_ne_partent_que_s_ils_sont_a_nous() {
+        let dossier = crate::test_scratch::scratch_dir("tcache-anciens-5133");
+        let vieux = SystemTime::now() - Duration::from_secs(2 * 3600);
+        let ancien = dossier.path().join(format!("{CACHE_PREFIX}ancien.flac"));
+        let recent = dossier.path().join(format!("{CACHE_PREFIX}recent.flac"));
+        std::fs::write(&ancien, vec![0u8; 4096]).unwrap();
+        std::fs::write(&recent, vec![0u8; 4096]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&ancien)
+            .unwrap()
+            .set_modified(vieux)
+            .unwrap();
+        let racine = dossier.path().join(format!("{ETIQUETTE_RACINE}-1000"));
+        std::fs::create_dir(&racine).unwrap();
+        std::fs::write(racine.join(format!("{CACHE_PREFIX}garde.flac")), b"x").unwrap();
+        let moi = crate::chemins_de_travail::uid_courant();
+
+        purger_anciens_rendus(dossier.path(), moi.wrapping_add(1));
+        assert!(
+            ancien.exists(),
+            "l'ancien rendu d'un autre compte a été supprimé"
+        );
+
+        purger_anciens_rendus(dossier.path(), moi);
+        assert!(
+            !ancien.exists(),
+            "l'ancien rendu du compte n'a pas été purgé"
+        );
+        assert!(recent.exists(), "un rendu récent a été purgé");
+        assert!(racine.join(format!("{CACHE_PREFIX}garde.flac")).exists());
     }
 }

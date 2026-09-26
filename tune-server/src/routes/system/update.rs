@@ -2698,10 +2698,15 @@ pub(super) async fn update_install(
             // --- Extract ---
             set_phase("extracting");
 
-            let tmp_dir = std::env::temp_dir().join(format!("tune-update-{}", version));
+            // #4770 : un dossier par compte. `tune-update-<version>` était un nom
+            // fixe : le premier compte à mettre à jour vers une version donnée le
+            // créait, et un autre compte ne pouvait plus y extraire la sienne.
+            let tmp_dir =
+                tune_core::chemins_de_travail::racine_de_travail(&format!("tune-update-{version}"));
             // Sweep leftover tune-update-* dirs from earlier updates. The success
             // path used to never remove the extraction dir, so one accumulated per
             // version (Benjithom, Windows: a new folder on every update).
+            // tmp-autorise: balayage en LECTURE de la racine ; seuls les tune-update-* du compte courant se laissent supprimer (sticky bit de /tmp).
             if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
                 for e in entries.flatten() {
                     if e.file_name().to_string_lossy().starts_with("tune-update-") {
@@ -2836,6 +2841,16 @@ pub(super) async fn update_install(
             let _ = std::fs::remove_dir_all(&tmp_dir);
         }
 
+        // Le chemin de l'exécutable, pour la relance : le même, que le paquet
+        // entier ou le seul binaire ait été remplacé.
+        let current_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                set_phase(&format!("failed: Cannot determine current exe: {e}"));
+                return;
+            }
+        };
+
         info!(
             from = %tune_core::version(),
             to = %version,
@@ -2941,6 +2956,327 @@ pub(super) async fn update_install(
         "version": response_version,
     }))
     .into_response()
+}
+
+/// Relance le serveur dans son binaire fraîchement posé (Unix).
+///
+/// Sans `paquet` : `exec` sur place, comme toujours. Avec `paquet` (macOS,
+/// paquet `.app` remplacé, #5141) : par le lanceur du paquet quand c'est lui
+/// qui avait lancé ce processus.
+#[cfg(unix)]
+async fn relancer_le_serveur(
+    state: &AppState,
+    current_exe: &std::path::Path,
+    paquet: Option<&std::path::Path>,
+) {
+    // #5141 — le paquet vient d'être remplacé : on relance PAR SON LANCEUR,
+    // pour que macOS rattache le nouveau processus au nouveau paquet (son
+    // `Info.plist`, sa signature, la permission « Réseau local »). Un `exec`
+    // sur place garderait le processus rattaché à ce qu'il était.
+    if let Some(app) = paquet {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        match paquet_macos::mode_de_relance(&env) {
+            paquet_macos::Relance::Lanceur => {
+                if let Some(db) = state.db.as_ref() {
+                    db.checkpoint();
+                }
+                match paquet_macos::armer_la_relance_par_le_lanceur(app, std::process::id()) {
+                    Ok(()) => {
+                        info!(app = %app.display(), "update_relance_par_le_lanceur");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "update_relance_par_le_lanceur_impossible — exec sur place");
+                    }
+                }
+            }
+            paquet_macos::Relance::ExecSurPlace => {
+                info!("update_relance_exec_sur_place — lancé hors du lanceur du paquet");
+            }
+        }
+    }
+    use std::os::unix::process::CommandExt;
+    let exe = current_exe.to_path_buf();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Let the final status-poll response flush before we swap the image.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Le lanceur pose TUNE_OPEN_BROWSER=1 ; l'image relancée l'hérite et
+    // ROUVRAIT un onglet alors que l'ancien se reconnecte déjà → deux
+    // onglets Tune à chaque mise à jour (Jean, forum #1236).
+    unsafe { std::env::remove_var("TUNE_OPEN_BROWSER") };
+    // Replier le WAL AVANT l'exec. `exec()` remplace l'image sans
+    // dérouler un seul destructeur : aucune connexion n'est fermée,
+    // aucun verrou n'est rendu proprement. Le 10 août, deux re-exec ont
+    // eu lieu pendant que la base était en écriture, et elle s'est
+    // retrouvée corrompue sans qu'on ait pu établir le mécanisme
+    // (#1462). Un checkpoint ici ne prouve rien sur cette cause — il
+    // supprime la fenêtre où elle pouvait jouer.
+    if let Some(db) = state.db.as_ref() {
+        db.checkpoint();
+    }
+    info!(exe = %exe.display(), "update_reexec");
+    // exec() replaces this process on success and never returns.
+    let err = std::process::Command::new(&exe).args(&args).exec();
+    warn!(error = %err, "update_reexec_failed — falling back to spawn+exit");
+    match std::process::Command::new(&exe)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => {
+            info!(pid = child.id(), exe = %exe.display(), "update_new_process_spawned");
+        }
+        Err(e) => {
+            warn!(error = %e, "update_restart_spawn_failed — manual restart required");
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    std::process::exit(0);
+}
+
+/// Télécharge un actif de release en mémoire.
+async fn telecharger_actif(
+    http_client: &reqwest::Client,
+    asset: &ReleaseAsset,
+) -> Result<bytes::Bytes, String> {
+    let resp = http_client
+        .get(&asset.browser_download_url)
+        .timeout(std::time::Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Download failed: HTTP {}", resp.status()));
+    }
+
+    resp.bytes()
+        .await
+        .map_err(|e| format!("Failed to read download: {e}"))
+}
+
+/// Pourquoi le paquet en place ne correspond pas au binaire (#5141). Vide :
+/// cohérent. Lecture de l'`Info.plist` et `codesign --verify --deep --strict`.
+fn motifs_du_paquet_en_place(app: &std::path::Path, version: &str) -> Vec<&'static str> {
+    let info = match paquet_macos::info_du_paquet(app) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!(error = %e, "macos_paquet_info_plist_illisible");
+            paquet_macos::InfoPaquet {
+                version: None,
+                reseau_local: false,
+            }
+        }
+    };
+    let signature = paquet_macos::verifier_signature(app);
+    if let Err(e) = &signature {
+        warn!(app = %app.display(), error = %e, "macos_paquet_signature_invalide");
+    }
+    paquet_macos::motifs_de_reparation(&info, signature.is_ok(), version)
+}
+
+/// Installe le paquet `.app` du DMG (déjà vérifié par `SHA256SUMS` signé) à
+/// la place de `app`. Rend les motifs constatés sur l'ancien paquet, et le
+/// compte rendu des vérifications ou l'erreur.
+async fn installer_le_paquet_depuis_dmg(
+    app: &std::path::Path,
+    version: &str,
+    octets_dmg: &[u8],
+) -> Result<(Vec<&'static str>, Value), (Vec<&'static str>, String)> {
+    let app = app.to_path_buf();
+    let version = version.to_string();
+    let octets = octets_dmg.to_vec();
+    let tache = tokio::task::spawn_blocking(move || {
+        let motifs = motifs_du_paquet_en_place(&app, &version);
+        let attentes = paquet_macos::Attentes {
+            version: version.clone(),
+            // L'équipe qui a signé le binaire EN COURS : le nouveau paquet doit
+            // venir du même développeur.
+            equipe: std::env::current_exe()
+                .ok()
+                .and_then(|exe| paquet_macos::equipe_du_developpeur(&exe)),
+            marqueur_binaire: cfg!(feature = "postgres")
+                .then_some(b"postgres_backend_ready".as_slice()),
+        };
+        let resultat = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            paquet_macos::remplacer_depuis_dmg(&octets, &app, &attentes)
+        }))
+        .unwrap_or_else(|_| Err("le remplacement du paquet a paniqué".to_string()));
+        (motifs, resultat)
+    });
+    match tache.await {
+        Ok((motifs, Ok(v))) => Ok((motifs, v)),
+        Ok((motifs, Err(e))) => Err((motifs, e)),
+        Err(e) => Err((Vec::new(), format!("tâche de remplacement : {e}"))),
+    }
+}
+
+/// Le lanceur sert `web/` depuis le paquet, remplacé avec lui. Un `web/`
+/// désigné HORS du paquet (`TUNE_WEB_DIR`) est mis à jour à part, depuis le
+/// paquet neuf.
+fn mettre_a_jour_le_web_hors_du_paquet(app: &std::path::Path) {
+    let Ok(custom) = std::env::var("TUNE_WEB_DIR") else {
+        return;
+    };
+    let cible = std::path::PathBuf::from(custom);
+    if !cible.is_absolute() || cible.starts_with(app) {
+        return;
+    }
+    let source = app.join("Contents/Resources/web");
+    if let Err(e) = swap_dir_atomic(&source, &cible) {
+        warn!(error = %e, cible = %cible.display(), "macos_web_hors_paquet_non_mis_a_jour");
+    }
+}
+
+/// #5141 — Réparation du paquet au DÉMARRAGE, sur macOS.
+///
+/// Un Mac mis à jour par un programme de mise à jour antérieur à ce correctif
+/// a reçu le binaire et `web/` de la nouvelle version DANS le paquet de
+/// l'ancienne : `Info.plist` périmé (sans `NSLocalNetworkUsageDescription`,
+/// #4949), sceau cassé. Ce binaire-ci est le premier à tourner qui sache le
+/// voir : il remplace alors le paquet par celui de SA version, en tâche de
+/// fond, puis se relance par le lanceur quand aucune zone ne joue.
+///
+/// Borné : une seule tentative par version (`CLE_REPARATION_TENTEE`, posée
+/// juste avant le remplacement), pour qu'un échec ne tourne pas en boucle de
+/// relances. L'échec se lit dans `GET /system/update/status` (`macos_paquet`),
+/// et ne bloque ni le démarrage ni la lecture.
+pub fn spawn_reparation_du_paquet_macos(state: AppState) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    tokio::spawn(async move {
+        // Laisser le démarrage finir avant de solliciter disque et réseau.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        reparer_le_paquet_si_necessaire(state).await;
+    });
+}
+
+async fn reparer_le_paquet_si_necessaire(state: AppState) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(app) = paquet_macos::paquet_de_l_executable(&exe) else {
+        return;
+    };
+    let version = tune_core::version().to_string();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    let (app_c, version_c) = (app.clone(), version.clone());
+    let Ok(motifs) =
+        tokio::task::spawn_blocking(move || motifs_du_paquet_en_place(&app_c, &version_c)).await
+    else {
+        return;
+    };
+    let tentee = settings
+        .get(paquet_macos::CLE_REPARATION_TENTEE)
+        .ok()
+        .flatten();
+    let motifs = match paquet_macos::decision_au_demarrage(motifs, tentee.as_deref(), &version) {
+        paquet_macos::DecisionDemarrage::RienAFaire => {
+            info!(app = %app.display(), "macos_paquet_coherent");
+            return;
+        }
+        paquet_macos::DecisionDemarrage::DejaTentee(motifs) => {
+            warn!(motifs = ?motifs, version, "macos_paquet_incoherent_reparation_deja_tentee");
+            return;
+        }
+        paquet_macos::DecisionDemarrage::Reparer(motifs) => motifs,
+    };
+    warn!(app = %app.display(), motifs = ?motifs, version, "macos_paquet_a_reparer");
+    let motif = motifs
+        .first()
+        .copied()
+        .unwrap_or(paquet_macos::MOTIF_MISE_A_JOUR);
+
+    // Le verrou des mises à jour : jamais deux remplacements à la fois.
+    {
+        let mut phase = state.update_phase.lock().unwrap();
+        if phase.as_deref().is_some_and(|p| !p.starts_with("failed")) {
+            info!("macos_paquet_reparation_reportee_mise_a_jour_en_cours");
+            return;
+        }
+        *phase = Some("repairing_bundle".into());
+    }
+    let liberer = |state: &AppState| *state.update_phase.lock().unwrap() = None;
+    let noter = |remplace: bool, erreur: Option<&str>, verification: Option<&Value>| {
+        let etat = paquet_macos::etat_du_paquet(
+            remplace,
+            motif,
+            &motifs,
+            "demarrage",
+            &version,
+            erreur,
+            verification,
+        );
+        let _ = settings.set(paquet_macos::CLE_ETAT_PAQUET, &etat.to_string());
+    };
+
+    let resultat: Result<Value, String> = async {
+        let release = checker_for(&state.backend)
+            .release_de_la_version(&version)
+            .await?
+            .ok_or_else(|| format!("release v{version} introuvable"))?;
+        let dmg = paquet_macos::actif_dmg(&release, std::env::consts::ARCH)
+            .cloned()
+            .ok_or_else(|| paquet_macos::MOTIF_DMG_ABSENT.to_string())?;
+        let sums_url = release
+            .assets
+            .iter()
+            .find(|a| a.name == "SHA256SUMS")
+            .map(|a| a.browser_download_url.clone());
+        let sig_url = release
+            .assets
+            .iter()
+            .find(|a| a.name == "SHA256SUMS.minisig")
+            .map(|a| a.browser_download_url.clone());
+        info!(asset = %dmg.name, size = dmg.size, "macos_paquet_telechargement");
+        let octets = telecharger_actif(&state.http_client, &dmg).await?;
+        verify_update_signature(
+            &state.http_client,
+            &dmg.name,
+            &octets,
+            sums_url.as_deref(),
+            sig_url.as_deref(),
+        )
+        .await
+        .map_err(|e| format!("{} ({})", e.blame.user_message(), e.detail))?;
+        // La tentative compte à partir d'ici : ce qui suit ne se rejoue pas
+        // au démarrage suivant, qu'il réussisse ou non.
+        let _ = settings.set(paquet_macos::CLE_REPARATION_TENTEE, &version);
+        installer_le_paquet_depuis_dmg(&app, &version, &octets)
+            .await
+            .map(|(_, verification)| verification)
+            .map_err(|(_, e)| e)
+    }
+    .await;
+
+    match resultat {
+        Err(e) => {
+            warn!(error = %e, "macos_paquet_reparation_echouee");
+            noter(false, Some(&e), None);
+            liberer(&state);
+        }
+        Ok(verification) => {
+            info!(verification = %verification, "macos_paquet_repare");
+            noter(true, None, Some(&verification));
+            if playback_in_progress(&state.playback).await {
+                *state.update_phase.lock().unwrap() = Some("restart_pending_playback".into());
+            }
+            let _ = defer_restart_until_quiet(
+                &state.playback,
+                RESTART_DEFERRAL_MAX,
+                RESTART_DEFERRAL_POLL,
+            )
+            .await;
+            *state.update_phase.lock().unwrap() = Some("restarting".into());
+            #[cfg(unix)]
+            relancer_le_serveur(&state, &exe, Some(&app)).await;
+        }
+    }
 }
 
 /// Extract a tar.gz or zip archive to the given directory.
@@ -3402,6 +3738,24 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
     // secondes plus tard. C'était déjà le recours ; il n'était annoncé nulle
     // part. `force_hint` orientait vers le forçage, qui ne porte QUE sur le
     // garde-fou d'entrée et ne touche pas ce report.
+    // #5141 — ce que la dernière opération a fait du paquet `.app` (macOS) :
+    // `bundle_remplace` et son motif, pour vérification sur le terrain.
+    let macos_paquet = settings
+        .get(paquet_macos::CLE_ETAT_PAQUET)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    // #4597 — macOS refuse-t-il le réseau local ? Un INDICE (os error 65 veut
+    // aussi dire « appareil éteint ») : `null` tant qu'aucun refus n'est vu.
+    let reseau_local = match tune_core::http::error::refus_du_reseau_local() {
+        (0, _) => Value::Null,
+        (refus, dernier) => json!({
+            "refus": refus,
+            "dernier_refus": dernier,
+            "conseil": "macOS refuse peut-être à Tune l'accès au réseau local : autorisez « Tune Server » dans Réglages Système → Confidentialité et sécurité → Réseau local, puis relancez Tune.",
+        }),
+    };
+
     let (restart_pending_zones, recovery_hint) =
         if phase.as_deref() == Some("restart_pending_playback") {
             let ids = playing_zone_ids(&state.playback).await;
@@ -3433,6 +3787,10 @@ pub(super) async fn update_status(State(state): State<AppState>) -> Json<Value> 
         // Ce que le script Homebrew détaché a écrit sur le disque, s'il tourne
         // ou s'il vient de finir. `null` partout ailleurs.
         "homebrew_upgrade": homebrew_upgrade,
+        "macos_paquet": &macos_paquet,
+        "bundle_remplace": macos_paquet.as_ref().and_then(|p| p["bundle_remplace"].as_bool()),
+        "bundle_motif": macos_paquet.as_ref().and_then(|p| p["motif"].as_str().map(str::to_owned)),
+        "reseau_local": reseau_local,
     }))
 }
 

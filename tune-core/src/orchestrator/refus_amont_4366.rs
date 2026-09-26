@@ -69,11 +69,10 @@ async fn cdn_qui_refuse() -> (String, tokio::task::JoinHandle<()>) {
 async fn refus_et_journal(url: String, entetes: Vec<(String, String)>) -> (String, String) {
     let journal = Journal::default();
     let capture = journal.clone();
-    let vers = std::env::temp_dir()
-        .join(format!("tune-temoin-4366-{}.m4a", uuid::Uuid::new_v4()))
-        .to_string_lossy()
-        .to_string();
-    let vers_clone = vers.clone();
+    // Supprimé par `Drop`, panique comprise : le `remove_file` de fin de
+    // fonction ne tournait pas quand le fil bloquant paniquait.
+    let fichier = crate::test_scratch::scratch_file("tune-temoin-4366", ".m4a");
+    let vers_clone = fichier.to_string_lossy().to_string();
     let issue = tokio::task::spawn_blocking(move || {
         let _garde = tracing::subscriber::set_default(
             tracing_subscriber::fmt()
@@ -86,7 +85,7 @@ async fn refus_et_journal(url: String, entetes: Vec<(String, String)>) -> (Strin
     })
     .await
     .unwrap();
-    let _ = std::fs::remove_file(&vers);
+    drop(fichier);
     (issue.unwrap_err(), journal.texte())
 }
 

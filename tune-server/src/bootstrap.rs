@@ -202,7 +202,11 @@ pub async fn run_with(opts: RunOptions) {
             .as_deref()
             .and_then(|c| c.parent())
             .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir);
+            // #4770 : sans journal, un dossier par compte plutôt que la
+            // racine temporaire partagée.
+            .unwrap_or_else(|| {
+                tune_core::chemins_de_travail::racine_de_travail("tune-gel-executeur")
+            });
         std::mem::forget(crate::gel_executeur::demarrer_en_production(dossier));
     }
 

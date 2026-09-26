@@ -236,6 +236,7 @@ impl TidalService {
         );
 
         // Create temp file and write init segment
+        // tmp-autorise: fichier au nom aléatoire (UUID v4), balayé par le ramasse-miettes DASH.
         let tmp_path = std::env::temp_dir()
             .join(format!("tune-dash-{}.mp4", uuid::Uuid::new_v4()))
             .to_string_lossy()

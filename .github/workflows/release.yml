@@ -904,7 +904,15 @@ jobs:
           mkdir -p "$APP/Contents/Resources/plugins/party"
           cp tune-server/tests/fixtures/plugins/party/main.wasm "$APP/Contents/Resources/plugins/party/"
           cp tune-server/tests/fixtures/plugins/party/manifest.json "$APP/Contents/Resources/plugins/party/"
-          # AppleScript launcher — responds to Apple Events, launches server in background, opens browser
+          # Lanceur AppleScript. #5141 — il RESTE VIVANT, parent du serveur :
+          # `exec` sans `&`, l'applet attend. L'ancien lanceur lançait le
+          # serveur en arrière-plan puis se terminait ; orphelin, le serveur
+          # n'était plus rattaché à Tune Server.app, et macOS lui refusait le
+          # réseau local (os error 65) même avec la clé de #4949 — alors que le
+          # même binaire, lancé depuis un Terminal resté ouvert, voyait tout.
+          # TUNE_PORT se surcharge par l'environnement (`open --env`), et
+          # TUNE_RELANCE_APRES_MAJ=1 (relance après mise à jour) n'ouvre pas
+          # d'onglet de plus (#1236).
           cat > /tmp/tune-launcher.applescript << 'ASCRIPT'
           on run
             set appPath to (path to me as text)
@@ -912,10 +920,14 @@ jobs:
             set resDir to posixApp & "Contents/Resources/"
             set serverBin to quoted form of (resDir & "tune-server")
             set webDir to quoted form of (resDir & "web")
-            set logFile to (POSIX path of (path to home folder)) & "Library/Logs/tune-server.log"
-            do shell script "export TUNE_WEB_DIR=" & webDir & "; export TUNE_PORT=8888; " & serverBin & " >> " & quoted form of logFile & " 2>&1 &"
-            delay 1
-            open location "http://localhost:8888"
+            set tunePort to system attribute "TUNE_PORT"
+            if tunePort is "" then set tunePort to "8888"
+            if (system attribute "TUNE_RELANCE_APRES_MAJ") is not "1" then
+              do shell script "(sleep 2; /usr/bin/open " & quoted form of ("http://localhost:" & tunePort) & ") > /dev/null 2>&1 &"
+            end if
+            try
+              do shell script "mkdir -p \"$HOME/Library/Logs\"; export TUNE_WEB_DIR=" & webDir & "; export TUNE_PORT=" & quoted form of tunePort & "; exec " & serverBin & " >> \"$HOME/Library/Logs/tune-server.log\" 2>&1"
+            end try
           end run
           ASCRIPT
           osacompile -o "$APP/Contents/MacOS/Tune Server.app" /tmp/tune-launcher.applescript

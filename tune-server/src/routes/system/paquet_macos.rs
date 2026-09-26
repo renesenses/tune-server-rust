@@ -362,11 +362,51 @@ pub(crate) struct Attentes {
     pub marqueur_binaire: Option<&'static [u8]>,
 }
 
-fn atelier_pour(cible: &Path) -> Result<PathBuf, String> {
-    let parent = cible
-        .parent()
-        .ok_or_else(|| format!("{} n'a pas de dossier parent", cible.display()))?;
-    Ok(parent.join(format!(".tune-maj-paquet-{}", std::process::id())))
+/// Un dossier de travail n'est utilisé que s'il est un vrai dossier (pas un
+/// lien), à ce compte, et fermé aux autres (aucun droit pour le groupe ni le
+/// reste du monde).
+pub(crate) fn dossier_de_travail_sur(dossier: &Path) -> Result<(), String> {
+    let meta =
+        std::fs::symlink_metadata(dossier).map_err(|e| format!("{} : {e}", dossier.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{} est un lien", dossier.display()));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{} n'est pas un dossier", dossier.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != tune_core::chemins_de_travail::uid_courant() {
+            return Err(format!(
+                "{} n'appartient pas à ce compte (uid {})",
+                dossier.display(),
+                meta.uid()
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(format!(
+                "{} est ouvert à d'autres comptes (mode {:o})",
+                dossier.display(),
+                meta.mode() & 0o7777
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Un dossier de travail au nom aléatoire, créé fermé (0700), vérifié.
+/// Supprimé à la fin de sa portée.
+pub(crate) fn dossier_de_travail_prive(dans: Option<&Path>) -> Result<tempfile::TempDir, String> {
+    let mut b = tempfile::Builder::new();
+    b.prefix(".tune-maj-paquet-");
+    let dossier = match dans {
+        Some(parent) => b.tempdir_in(parent),
+        None => b.tempdir(),
+    }
+    .map_err(|e| format!("dossier de travail : {e}"))?;
+    dossier_de_travail_sur(dossier.path())?;
+    Ok(dossier)
 }
 
 /// Copie `source` à côté de `cible`, vérifie la COPIE, puis la met à la place
@@ -378,59 +418,51 @@ pub(crate) fn installer_paquet_verifie(
     cible: &Path,
     attentes: &Attentes,
 ) -> Result<Value, String> {
-    let atelier = atelier_pour(cible)?;
-    if atelier.exists() {
-        std::fs::remove_dir_all(&atelier)
-            .map_err(|e| format!("nettoyage de {} : {e}", atelier.display()))?;
-    }
-    std::fs::create_dir_all(&atelier)
-        .map_err(|e| format!("création de {} : {e}", atelier.display()))?;
+    let parent = cible
+        .parent()
+        .ok_or_else(|| format!("{} n'a pas de dossier parent", cible.display()))?;
     let nom = cible
         .file_name()
         .ok_or_else(|| format!("{} n'a pas de nom", cible.display()))?;
-    let neuf = atelier.join(nom);
+    // L'atelier est sur le MÊME volume que la cible : c'est ce qui rend les
+    // deux renommages atomiques. Supprimé avec son contenu en fin de portée.
+    let atelier = dossier_de_travail_prive(Some(parent))?;
+    let neuf = atelier.path().join(nom);
 
-    let resultat = preparer_et_verifier(source, &neuf, attentes);
-    let verification = match resultat {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&atelier);
-            return Err(e);
-        }
-    };
+    let verification = preparer_et_verifier(source, &neuf, attentes)?;
+    // Juste avant de poser : l'atelier est toujours le nôtre.
+    dossier_de_travail_sur(atelier.path())?;
 
     // Deux renommages sur le même volume : à chaque instant, `cible` est
     // l'ancien paquet complet ou le nouveau complet.
-    let ancien = atelier.join("ancien.app");
+    let ancien = atelier.path().join("ancien.app");
     let avait_un_ancien = cible.exists();
     if avait_un_ancien {
-        if let Err(e) = std::fs::rename(cible, &ancien) {
-            let _ = std::fs::remove_dir_all(&atelier);
-            return Err(format!("mise de côté de l'ancien paquet : {e}"));
-        }
+        std::fs::rename(cible, &ancien)
+            .map_err(|e| format!("mise de côté de l'ancien paquet : {e}"))?;
     }
     if let Err(e) = std::fs::rename(&neuf, cible) {
         if avait_un_ancien {
             if let Err(e2) = std::fs::rename(&ancien, cible) {
-                // Le seul état où l'ancien n'est plus à sa place : on le
-                // laisse dans l'atelier, et on le dit.
+                // Le seul état où l'ancien n'est plus à sa place : on garde
+                // l'atelier, et on le dit.
+                let garde = atelier.keep();
                 error!(
-                    ancien = %ancien.display(),
+                    ancien = %garde.join("ancien.app").display(),
                     error = %e2,
                     "macos_paquet_retour_arriere_impossible"
                 );
                 return Err(format!(
                     "pose du nouveau paquet : {e} ; retour arrière impossible ({e2}), l'ancien est dans {}",
-                    ancien.display()
+                    garde.join("ancien.app").display()
                 ));
             }
         }
-        let _ = std::fs::remove_dir_all(&atelier);
         return Err(format!("pose du nouveau paquet : {e}"));
     }
     // L'ancien paquet peut contenir l'image du processus qui tourne : macOS
-    // garde l'inode ouvert, la suppression est sans effet sur lui.
-    let _ = std::fs::remove_dir_all(&atelier);
+    // garde l'inode ouvert, sa suppression (fin de portée de l'atelier) est
+    // sans effet sur lui.
     info!(cible = %cible.display(), "macos_paquet_remplace");
     Ok(verification)
 }
@@ -442,6 +474,7 @@ fn preparer_et_verifier(source: &Path, neuf: &Path, attentes: &Attentes) -> Resu
     if !ok {
         return Err(format!("copie du nouveau paquet : {texte}"));
     }
+    // La signature est vérifiée sur la COPIE assemblée, celle qui sera posée.
     verifier_signature(neuf).map_err(|e| format!("signature du nouveau paquet refusée : {e}"))?;
     let equipe = equipe_du_developpeur(neuf);
     if let Some(attendue) = &attentes.equipe {
@@ -480,17 +513,33 @@ fn preparer_et_verifier(source: &Path, neuf: &Path, attentes: &Attentes) -> Resu
     }))
 }
 
-/// Monte le DMG en lecture seule, sans Finder, et en installe le paquet.
+/// Écrit le DMG téléchargé dans un dossier de travail privé, le fait juger
+/// par Gatekeeper, le monte en lecture seule, sans Finder, et en installe le
+/// paquet. Le DMG a déjà passé le `SHA256SUMS` signé.
 pub(crate) fn remplacer_depuis_dmg(
-    dmg: &Path,
+    octets_dmg: &[u8],
     cible: &Path,
     attentes: &Attentes,
 ) -> Result<Value, String> {
-    let notarisation = verifier_notarisation_du_dmg(dmg)
+    use std::io::Write;
+
+    let travail = dossier_de_travail_prive(None)?;
+    let dmg = travail.path().join("paquet.dmg");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dmg)
+        .map_err(|e| format!("écriture du DMG : {e}"))?;
+    f.write_all(octets_dmg)
+        .and_then(|_| f.sync_all())
+        .map_err(|e| format!("écriture du DMG : {e}"))?;
+    drop(f);
+
+    let notarisation = verifier_notarisation_du_dmg(&dmg)
         .map_err(|e| format!("DMG refusé par Gatekeeper : {e}"))?;
 
-    let montage = std::env::temp_dir().join(format!("tune-maj-dmg-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&montage);
+    let montage = travail.path().join("montage");
+    std::fs::create_dir(&montage).map_err(|e| format!("point de montage : {e}"))?;
     let (ok, texte) = sortie(
         Command::new("/usr/bin/hdiutil")
             .args([
@@ -501,10 +550,9 @@ pub(crate) fn remplacer_depuis_dmg(
                 "-mountpoint",
             ])
             .arg(&montage)
-            .arg(dmg),
+            .arg(&dmg),
     )?;
     if !ok {
-        let _ = std::fs::remove_dir(&montage);
         return Err(format!("montage du DMG : {texte}"));
     }
 
@@ -522,13 +570,19 @@ pub(crate) fn remplacer_depuis_dmg(
         .unwrap_or((false, String::new()));
     if !detache {
         warn!(sortie = %texte, "macos_dmg_detach_retry_force");
-        let _ = sortie(
+        let (detache, texte) = sortie(
             Command::new("/usr/bin/hdiutil")
                 .args(["detach", "-force"])
                 .arg(&montage),
-        );
+        )
+        .unwrap_or((false, String::new()));
+        if !detache {
+            // Surtout ne pas laisser `TempDir` vider un volume encore monté :
+            // il est en lecture seule, mais on ne parcourt pas un montage.
+            error!(sortie = %texte, montage = %montage.display(), "macos_dmg_detach_impossible");
+            let _ = travail.keep();
+        }
     }
-    let _ = std::fs::remove_dir(&montage);
 
     let mut verification = resultat?;
     verification["notarisation_dmg"] = json!(notarisation);
@@ -834,6 +888,108 @@ mod tests {
         );
     }
 
+    /// Le signal de terrain : ce que la dernière opération a fait du paquet
+    /// se lit dans `GET /system/update/status`.
+    #[tokio::test]
+    async fn l_etat_de_la_mise_a_jour_dit_si_le_paquet_a_ete_remplace() {
+        use axum::extract::State;
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings =
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+
+        let corps = super::super::update::update_status(State(state.clone()))
+            .await
+            .0;
+        assert!(corps["bundle_remplace"].is_null(), "rien fait, rien à dire");
+        assert!(corps["macos_paquet"].is_null());
+
+        let etat = etat_du_paquet(
+            true,
+            MOTIF_SANS_RESEAU_LOCAL,
+            &[MOTIF_SANS_RESEAU_LOCAL, MOTIF_SIGNATURE_INVALIDE],
+            "demarrage",
+            "0.9.166",
+            None,
+            Some(&json!({"codesign": "ok"})),
+        );
+        settings.set(CLE_ETAT_PAQUET, &etat.to_string()).unwrap();
+        let corps = super::super::update::update_status(State(state.clone()))
+            .await
+            .0;
+        assert_eq!(corps["bundle_remplace"], true);
+        assert_eq!(corps["bundle_motif"], MOTIF_SANS_RESEAU_LOCAL);
+        assert_eq!(corps["macos_paquet"]["origine"], "demarrage");
+        assert_eq!(corps["macos_paquet"]["verification"]["codesign"], "ok");
+
+        let refus = etat_du_paquet(
+            false,
+            MOTIF_SIGNATURE_INVALIDE,
+            &[MOTIF_SIGNATURE_INVALIDE],
+            "mise_a_jour",
+            "0.9.166",
+            Some("signature du nouveau paquet refusée"),
+            None,
+        );
+        settings.set(CLE_ETAT_PAQUET, &refus.to_string()).unwrap();
+        let corps = super::super::update::update_status(State(state)).await.0;
+        assert_eq!(corps["bundle_remplace"], false);
+        assert_eq!(
+            corps["macos_paquet"]["erreur"],
+            "signature du nouveau paquet refusée"
+        );
+    }
+
+    /// Câblage : la réparation au démarrage est LANCÉE, pas seulement écrite.
+    #[test]
+    fn la_reparation_du_paquet_est_lancee_au_demarrage() {
+        let source = include_str!("../../background.rs");
+        let appels = source
+            .matches("update::spawn_reparation_du_paquet_macos(state.clone())")
+            .count();
+        assert_eq!(
+            appels, 1,
+            "background.rs doit lancer la réparation du paquet (#5141)"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn un_dossier_de_travail_non_conforme_est_refuse() {
+        use std::os::unix::fs::PermissionsExt;
+        let racine = tune_core::test_scratch::scratch_dir("paquet-dossier");
+        // Le dossier créé par la voie normale passe.
+        let prive = dossier_de_travail_prive(Some(racine.path())).expect("dossier privé");
+        assert!(dossier_de_travail_sur(prive.path()).is_ok());
+        let nom = prive
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(nom.starts_with(".tune-maj-paquet-") && nom.len() > ".tune-maj-paquet-".len());
+
+        // Un lien vers un dossier conforme : refusé.
+        let lien = racine.join("lien");
+        std::os::unix::fs::symlink(prive.path(), &lien).unwrap();
+        let refus = dossier_de_travail_sur(&lien).expect_err("un lien doit être refusé");
+        assert!(refus.contains("lien"), "{refus}");
+
+        // Un dossier ouvert aux autres : refusé.
+        let ouvert = racine.join("ouvert");
+        std::fs::create_dir(&ouvert).unwrap();
+        std::fs::set_permissions(&ouvert, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let refus =
+            dossier_de_travail_sur(&ouvert).expect_err("un dossier ouvert doit être refusé");
+        assert!(refus.contains("ouvert"), "{refus}");
+
+        // Un dossier d'un autre compte : refusé (sauf à tourner en root).
+        if tune_core::chemins_de_travail::uid_courant() != 0 {
+            let refus = dossier_de_travail_sur(Path::new("/usr"))
+                .expect_err("un dossier d'un autre compte doit être refusé");
+            assert!(refus.contains("n'appartient pas"), "{refus}");
+        }
+    }
+
     /// Le témoin sur de VRAIS paquets (#5141). Ignoré par défaut : il lui faut
     /// un Mac, un DMG notarisé et une COPIE d'une app installée.
     ///
@@ -872,7 +1028,8 @@ mod tests {
             equipe,
             marqueur_binaire: None,
         };
-        let verification = remplacer_depuis_dmg(&dmg, &ancien, &attentes).expect("remplacement");
+        let octets = std::fs::read(&dmg).expect("lecture du DMG");
+        let verification = remplacer_depuis_dmg(&octets, &ancien, &attentes).expect("remplacement");
         println!("VÉRIFICATION : {verification}");
 
         let apres = info_du_paquet(&ancien).unwrap();
@@ -925,8 +1082,17 @@ mod tests {
             "{refus}"
         );
         assert_eq!(empreinte(&ancien), avant, "l'ancien paquet a été modifié");
+        let restes: Vec<_> = std::fs::read_dir(ancien.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".tune-maj-paquet-")
+            })
+            .collect();
         assert!(
-            !atelier_pour(&ancien).unwrap().exists(),
+            restes.is_empty(),
             "l'atelier doit être nettoyé après un refus"
         );
     }
