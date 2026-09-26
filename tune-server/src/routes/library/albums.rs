@@ -454,6 +454,17 @@ pub(super) async fn get_album(
                 );
                 obj.insert("dynamic_range_provenance".into(), json!(dr.provenance));
             }
+            // #4907 — les EXEMPLAIRES de l'album, un par dossier de musique :
+            // racine, format, fréquence, profondeur, joignable, préféré.
+            // Champ additif ; un échec de lecture le laisse absent.
+            match tune_core::library::exemplaires::exemplaires_de_l_album(&*state.backend, id) {
+                Ok(exemplaires) => {
+                    if let Some(obj) = j.as_object_mut() {
+                        obj.insert("exemplaires".into(), json!(exemplaires));
+                    }
+                }
+                Err(e) => tracing::warn!(album_id = id, error = %e, "album_exemplaires_illisibles"),
+            }
             Json(j).into_response()
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),

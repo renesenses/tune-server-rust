@@ -1584,6 +1584,9 @@ mod wav_override_tests;
 /// `diretta` n'est pas une sortie réseau, et c'est voulu (écart n° 2).
 #[cfg(test)]
 mod alac_passthrough_tests;
+/// #4907 — l'exemplaire préféré injoignable : la lecture part depuis le suivant.
+#[cfg(test)]
+mod exemplaires_lecture_tests;
 /// #4800 (cause 5) — un FLAC de l'enregistreur (`Lavf` sans MD5, #4350) part
 /// tel quel sous un en-tête neuf vers une zone réseau, sans être ré-encodé.
 #[cfg(test)]

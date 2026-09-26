@@ -490,3 +490,117 @@ fn un_dossier_disparu_sous_une_racine_illisible_ou_hors_perimetre_garde_ses_pist
         );
     }
 }
+
+/// Les exemplaires (#4907) en base : (chemin, piste propriétaire), triés.
+fn exemplaires(db: &Arc<dyn DbBackend>) -> Vec<(String, i64)> {
+    db.query_many_strong(
+        "SELECT file_path, track_id FROM track_copies ORDER BY file_path",
+        &[],
+    )
+    .unwrap()
+    .iter()
+    .map(|r| (r[0].as_string().unwrap(), r[1].as_i64().unwrap()))
+    .collect()
+}
+
+/// Copie `depuis` vers `vers` et la rattache comme exemplaire de `depuis`,
+/// comme le scan le fait d'une copie à l'identique (#4907).
+fn poser_exemplaire(db: &Arc<dyn DbBackend>, depuis: &Path, vers: &Path) {
+    std::fs::copy(depuis, vers).unwrap();
+    let n = tune_core::library::exemplaires::NouvelExemplaire {
+        chemin_proprietaire: chaine(depuis),
+        chemin: chaine(vers),
+        format: Some("flac".into()),
+        sample_rate: None,
+        bit_depth: None,
+        file_size: Some(std::fs::metadata(vers).unwrap().len() as i64),
+        file_mtime: None,
+        audio_hash: None,
+    };
+    assert_eq!(
+        tune_core::library::exemplaires::rattacher(&**db, &[n]),
+        1,
+        "montage : exemplaire rattaché"
+    );
+}
+
+/// #4896 × #4907 — un dossier renommé emporte AUSSI ses exemplaires. Deux
+/// formes : une copie rangée à côté des pistes, et un dossier qui ne porte
+/// QUE des copies (la même musique sous un autre répertoire). Sans le report,
+/// `track_copies` gardait le chemin mort, et le fichier sous son nouveau nom
+/// était relu comme inconnu — une piste de plus, ou une copie en double.
+#[test]
+fn un_dossier_renomme_emporte_ses_exemplaires_4907() {
+    // (1) Une copie à côté des pistes, dans le dossier renommé.
+    let db = base();
+    let (racine, pistes) = coffret_indexe(&db, "exemplaires-a-cote");
+    let avant = lignes(&db, &pistes);
+    let ancien = pistes[0].parent().unwrap().to_path_buf();
+    poser_exemplaire(
+        &db,
+        &pistes[0],
+        &ancien.join("01 - Speak To Me (copie).flac"),
+    );
+    let nouveau = ancien.with_file_name("Multichannel 7.1 (2023)");
+    std::fs::rename(&ancien, &nouveau).unwrap();
+    surveiller(
+        &db,
+        &racine,
+        vec![
+            ev(nom(RenameMode::From), &ancien),
+            ev(nom(RenameMode::To), &nouveau),
+        ],
+    );
+    assert_meme_album_deplace(
+        &db,
+        "copie à côté",
+        &avant,
+        &pistes,
+        &sous(&nouveau, &pistes),
+    );
+    assert_eq!(
+        exemplaires(&db),
+        vec![(
+            chaine(&nouveau.join("01 - Speak To Me (copie).flac")),
+            avant[0].unwrap().0
+        )],
+        "la copie suit le dossier et reste l'exemplaire de SA piste"
+    );
+
+    // (2) Un dossier qui ne porte QUE des copies.
+    let db = base();
+    let (racine, pistes) = coffret_indexe(&db, "exemplaires-seuls");
+    let avant = lignes(&db, &pistes);
+    let copies = racine.join("Copies").join("Multichannel 7.1");
+    std::fs::create_dir_all(&copies).unwrap();
+    for p in &pistes {
+        poser_exemplaire(&db, p, &copies.join(p.file_name().unwrap()));
+    }
+    let renomme = copies.with_file_name("Multichannel 7.1 (copie)");
+    std::fs::rename(&copies, &renomme).unwrap();
+    surveiller(
+        &db,
+        &racine,
+        vec![
+            ev(nom(RenameMode::From), &copies),
+            ev(nom(RenameMode::To), &renomme),
+        ],
+    );
+    assert_eq!(lignes(&db, &pistes), avant, "les pistes ne bougent pas");
+    assert_eq!(
+        nombre_de_pistes(&db),
+        avant.len() as i64,
+        "aucune piste en plus"
+    );
+    let mut attendus: Vec<(String, i64)> = pistes
+        .iter()
+        .zip(&avant)
+        .map(|(p, l)| (chaine(&renomme.join(p.file_name().unwrap())), l.unwrap().0))
+        .collect();
+    attendus.sort();
+    assert_eq!(
+        exemplaires(&db),
+        attendus,
+        "les copies suivent leur dossier, une ligne chacune, rattachées à leur piste"
+    );
+}

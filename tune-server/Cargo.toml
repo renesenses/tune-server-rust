@@ -999,6 +999,14 @@ path = "tests/crossfeed_presets_4684.rs"
 name = "pg_scan_converge_4602"
 path = "tests/pg_scan_converge_4602.rs"
 
+# #4907 — la même musique dans plusieurs répertoires : exemplaires, vues sans
+# doublon, identifiants conservés, sur SQLite et sur PostgreSQL
+# (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans cette cible, le
+# fichier ne serait jamais compilé.
+[[test]]
+name = "exemplaires_par_repertoire_4907"
+path = "tests/exemplaires_par_repertoire_4907.rs"
+
 # « pas de bouton pour supprimer une playlist Tidal ! » — le trait savait le
 # faire (Qobuz seulement) mais AUCUNE route ne l'appelait. `autotests = false`
 # plus haut : sans cette cible, la garde du refus préalable (501 avant tout

@@ -2073,6 +2073,48 @@ CREATE INDEX IF NOT EXISTS idx_collection_folder_items_folder ON collection_fold
         name: "playlist_tracks_titres_de_service",
         up: "",
     },
+    // #4907 — la meme musique dans plusieurs repertoires : les EXEMPLAIRES
+    // d'une piste, et le repertoire prefere d'un album.
+    //
+    // Numerotee 110, a la suite des 107 (credits MusicBrainz), 108 (dossiers
+    // de collections) et 109 (titres de service en playlist) livrees par la
+    // v0.9.165. Un numero deja applique sur une base ne se reprend jamais.
+    //
+    // `track_copies` : un fichier octet pour octet identique a celui d'une
+    // piste, range dans le meme album. Le scan l'ecartait
+    // (`skip_duplicate_audio_hash`) ; il le rattache desormais a la piste.
+    // AUCUNE ligne `tracks` n'est creee, modifiee ni renumerotee : les
+    // identifiants que visent playlists, favoris, historique, notes et files
+    // d'attente ne bougent pas. La table part VIDE ; le prochain scan la
+    // remplit. `ON DELETE CASCADE` : une piste retiree emporte ses copies.
+    //
+    // `album_preferred_roots` : le dossier de musique depuis lequel
+    // l'utilisateur veut lire un album. Absente = regle par defaut (meilleure
+    // qualite, puis ordre des repertoires).
+    Migration {
+        version: 110,
+        name: "exemplaires_par_repertoire",
+        up: "
+CREATE TABLE IF NOT EXISTS track_copies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL UNIQUE,
+    format TEXT,
+    sample_rate INTEGER,
+    bit_depth INTEGER,
+    file_size INTEGER,
+    file_mtime REAL,
+    audio_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS idx_track_copies_track ON track_copies(track_id);
+CREATE TABLE IF NOT EXISTS album_preferred_roots (
+    album_id INTEGER PRIMARY KEY REFERENCES albums(id) ON DELETE CASCADE,
+    root TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+",
+    },
 ];
 
 /// SQL de la migration 109 (#4889) — voir son entree dans `MIGRATIONS`.
@@ -4129,6 +4171,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         72,
         "playlist_tracks_titres_de_service",
         include_str!("../../migrations/postgres/072_playlist_tracks_titres_de_service.sql"),
+    ),
+    // #4907 — exemplaires d'une piste et repertoire prefere d'un album.
+    // Jumelle de la migration SQLite 110. Numerotee 73, a la suite des 70, 71
+    // et 72 (#4767, #4853, #4889) livrees par la v0.9.165.
+    (
+        73,
+        "exemplaires_par_repertoire",
+        include_str!("../../migrations/postgres/073_exemplaires_par_repertoire.sql"),
     ),
 ];
 
@@ -6559,7 +6609,9 @@ mod tests {
         // 72 : `playlist_tracks_titres_de_service` (#4889), jumelle de la
         // SQLite 109. Relache `track_id`, pose `source` / `source_id` et les
         // colonnes d'affichage, et le CHECK « l'un ou l'autre ».
-        assert_eq!(pg_latest_version(), 72, "latest PG migration must be 72");
+        // 73 : `exemplaires_par_repertoire` (#4907), jumelle de la SQLite 110.
+        // Pose `track_copies` et `album_preferred_roots`.
+        assert_eq!(pg_latest_version(), 73, "latest PG migration must be 73");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

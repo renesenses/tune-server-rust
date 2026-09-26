@@ -19,6 +19,8 @@ pub(crate) mod credits;
 pub(crate) mod credits_mb;
 mod duplicates;
 mod enrich;
+/// #4907 — ordre des répertoires et répertoire préféré d'un album.
+mod exemplaires;
 mod facets;
 mod folder_facet;
 mod genres;
@@ -301,6 +303,18 @@ pub fn router() -> Router<AppState> {
             get(albums::get_album).put(albums::update_album),
         )
         .route("/albums/{id}/tracks", get(albums::album_tracks))
+        // #4907 — le répertoire depuis lequel lire un album.
+        .route(
+            "/albums/{id}/repertoire-prefere",
+            get(exemplaires::preference_get)
+                .put(exemplaires::preference_put)
+                .delete(exemplaires::preference_delete),
+        )
+        // #4907 — l'ordre des dossiers de musique, à qualité égale.
+        .route(
+            "/repertoires/ordre",
+            get(exemplaires::ordre_get).put(exemplaires::ordre_put),
+        )
         .route("/albums/{id}/aussi-sur", get(albums::album_aussi_sur))
         .route(
             "/albums/{id}/metadata",

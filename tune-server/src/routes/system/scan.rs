@@ -881,6 +881,162 @@ pub(crate) fn supprimer_pistes_du_scan(
     bilan
 }
 
+/// #4907 — les copies À L'IDENTIQUE rencontrées par un lot de scan.
+///
+/// Une copie octet pour octet d'une piste du même album n'est plus écartée :
+/// elle devient un EXEMPLAIRE de cette piste (`track_copies`), sans ligne
+/// `tracks` de plus. Partagé par le scan manuel et le scan automatique, qui
+/// ne doivent pas diverger sur cette règle (même leçon que #2939).
+#[derive(Default)]
+pub(crate) struct ExemplairesDuLot {
+    a_rattacher: Vec<tune_core::library::exemplaires::NouvelExemplaire>,
+    /// Les pistes que ce lot va insérer, par (hachage, album) : une copie et
+    /// son original peuvent tomber dans le même lot, avant que l'index des
+    /// hachages connus ne les voie.
+    chemins_du_lot: std::collections::HashMap<(String, i64), Vec<String>>,
+}
+
+impl ExemplairesDuLot {
+    /// La piste que l'importateur vient de lire est-elle la copie exacte
+    /// d'une piste déjà connue (base ou lot) du même album ? Si oui, elle est
+    /// notée comme exemplaire et le chemin du propriétaire est rendu ; sinon
+    /// elle est notée comme insertion du lot, et l'appelant l'insère.
+    ///
+    /// Le hachage échantillonné ne fait que désigner des candidats : seule une
+    /// comparaison complète des octets fait d'un fichier un exemplaire (#2664).
+    pub(crate) fn exemplaire_identique(
+        &mut self,
+        track: &tune_core::db::models::Track,
+        connus: &std::collections::HashMap<(String, i64), Vec<String>>,
+    ) -> Option<String> {
+        let (Some(hash), Some(aid), Some(chemin)) =
+            (&track.audio_hash, track.album_id, &track.file_path)
+        else {
+            return None;
+        };
+        let key = (hash.clone(), aid);
+        let mut candidates = connus.get(&key).cloned().unwrap_or_default();
+        candidates.extend(self.chemins_du_lot.get(&key).cloned().unwrap_or_default());
+        if let Some(existant) = tune_core::scanner::hasher::find_byte_identical_path(
+            std::path::Path::new(chemin),
+            &candidates,
+        ) {
+            if let Some(n) =
+                tune_core::library::exemplaires::NouvelExemplaire::depuis_la_piste(&existant, track)
+            {
+                self.a_rattacher.push(n);
+            }
+            return Some(existant);
+        }
+        if !candidates.is_empty() {
+            tracing::warn!(
+                audio_hash = %hash,
+                album_id = aid,
+                path = %chemin,
+                candidates = candidates.len(),
+                "audio_hash_candidate_not_byte_identical"
+            );
+        }
+        self.chemins_du_lot
+            .entry(key)
+            .or_default()
+            .push(chemin.clone());
+        None
+    }
+
+    /// Après l'écriture du lot : rattache les copies à leur piste, et retire
+    /// des exemplaires un fichier qui ne l'est plus (il vient d'entrer comme
+    /// piste parce qu'il a changé).
+    pub(crate) fn ecrire(
+        self,
+        db: &dyn tune_core::db::backend::DbBackend,
+        copies_connues: &CarteDesChemins,
+        inseres: &[tune_core::db::models::Track],
+    ) -> usize {
+        let plus_copies: Vec<String> = inseres
+            .iter()
+            .filter_map(|t| t.file_path.clone())
+            .filter(|p| copies_connues.contains_key(p))
+            .collect();
+        if !plus_copies.is_empty() {
+            tune_core::library::exemplaires::retirer_des_exemplaires(db, &plus_copies);
+        }
+        tune_core::library::exemplaires::rattacher(db, &self.a_rattacher)
+    }
+}
+
+/// #4907 — une piste dont le fichier a disparu mais dont une copie a été VUE
+/// par ce scan ne part pas : la copie prend sa place et la piste garde son
+/// identifiant. Retire ces pistes des candidats à la suppression — AVANT le
+/// plafond volumétrique, qui ne doit compter que de vraies disparitions — et
+/// les rend.
+pub(crate) fn separer_les_promotions(
+    a_supprimer: &mut Vec<i64>,
+    copies: &CarteDesChemins,
+    discovered_paths: &std::collections::HashSet<String>,
+) -> Vec<i64> {
+    let vus: std::collections::HashSet<i64> = copies
+        .iter()
+        .filter(|(chemin, _)| discovered_paths.contains(chemin.as_str()))
+        .map(|(_, info)| info.id)
+        .collect();
+    let (promus, restent): (Vec<i64>, Vec<i64>) =
+        a_supprimer.drain(..).partition(|id| vus.contains(id));
+    *a_supprimer = restent;
+    promus
+}
+
+/// Applique les promotions décidées par [`separer_les_promotions`]. Rend le
+/// nombre de pistes sauvées ; une piste dont aucune copie ne répond plus au
+/// moment de promouvoir est retirée comme avant.
+pub(crate) fn promouvoir_les_exemplaires(
+    db: &dyn tune_core::db::backend::DbBackend,
+    track_repo: &tune_core::db::track_repo::TrackRepo,
+    promus: Vec<i64>,
+    scan: &'static str,
+) -> BilanSuppressionDuScan {
+    let mut perdues = Vec::new();
+    let mut sauvees = 0i64;
+    for id in promus {
+        match tune_core::library::exemplaires::promouvoir(db, id) {
+            Ok(Some(_)) => sauvees += 1,
+            Ok(None) => perdues.push(id),
+            Err(e) => {
+                tracing::warn!(scan, track_id = id, error = %e, "scan_promotion_exemplaire_echec")
+            }
+        }
+    }
+    if sauvees > 0 {
+        tracing::info!(scan, sauvees, "scan_pistes_sauvees_par_un_exemplaire");
+    }
+    supprimer_pistes_du_scan(track_repo, perdues, scan)
+}
+
+/// #4907 — retire les exemplaires dont le fichier a disparu, sous la MÊME
+/// règle que les pistes ([`verdict_purge`]) : une racine illisible ou vidée
+/// ne prouve rien. Le plafond volumétrique ne s'applique pas : retirer un
+/// exemplaire ne retire jamais une piste.
+pub(crate) fn purger_les_exemplaires_disparus(
+    db: &dyn tune_core::db::backend::DbBackend,
+    copies: &CarteDesChemins,
+    discovered_paths: &std::collections::HashSet<String>,
+    targeted: Option<&str>,
+    verdict: impl Fn(&str) -> VerdictPurge,
+) -> usize {
+    let partis: Vec<String> = copies
+        .keys()
+        .filter(|c| targeted.is_none_or(|t| sous_le_dossier(c, t)))
+        .filter(|c| !discovered_paths.contains(c.as_str()))
+        .filter(|c| verdict(c) == VerdictPurge::Supprimer)
+        .cloned()
+        .collect();
+    let n = tune_core::library::exemplaires::retirer_des_exemplaires(db, &partis);
+    if n > 0 {
+        tracing::info!(retires = n, "scan_exemplaires_disparus_retires");
+    }
+    n
+}
+
 /// Les chiffres d'un scan complet, rassemblés UNE fois pour les trois
 /// consommateurs du rapport de fin de scan (#2012).
 ///
@@ -1469,6 +1625,12 @@ pub(crate) async fn spawn_library_scan_confirmee(
         let mut known_hashes = track_repo
             .get_existing_audio_hash_album_paths()
             .unwrap_or_default();
+        // #4907 — les copies à l'identique déjà rattachées à une piste. Une
+        // lecture en échec rend une carte vide : chaque copie repasse alors par
+        // l'importateur et se rattache de nouveau — rien ne se perd.
+        tune_core::library::exemplaires::nettoyer_les_orphelins(&*db);
+        let existing_copies: CarteDesChemins =
+            tune_core::library::exemplaires::carte_des_exemplaires(&*db).unwrap_or_default();
 
         // #5043 — le RATTRAPAGE des métadonnées étendues, et sa borne.
         //
@@ -1532,7 +1694,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 }
                 // Shared with auto_scan so the manual and watcher scans can't
                 // diverge on the NFC key handling (the "scan interminable" bug).
-                file_needs_scan(path, &existing_tracks)
+                // Un exemplaire inchangé se saute comme une piste (#4907).
+                file_needs_scan(path, &existing_tracks) && file_needs_scan(path, &existing_copies)
             });
         let pre_skipped = (total_discovered - files_to_scan.len()) as i64;
 
@@ -1656,6 +1819,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // Lignes de ce lot qui existaient sous une source d'importation
                 // et que le scan reprend à son compte (#2939).
                 let mut a_adopter: Vec<i64> = Vec::new();
+                let mut exemplaires_du_lot = ExemplairesDuLot::default();
 
                 // BEGIN transaction for this batch (SQLite only — PG uses autocommit
                 // to avoid "current transaction is aborted" cascading failures)
@@ -1722,6 +1886,14 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     // fichier qu'on va finalement écarter (#593). Le mode
                     // `force` désactive le raccourci « inchangé » pour que les
                     // album_id soient re-résolus.
+                    // Un exemplaire déjà rattaché et inchangé ne se relit pas (#4907).
+                    if verdict_ecriture(&sf.path, sf.mtime, sf.file_size, force, &existing_copies)
+                        == VerdictEcriture::Inchange
+                    {
+                        skipped += 1;
+                        skipped_unchanged += 1;
+                        continue;
+                    }
                     let verdict =
                         verdict_ecriture(&sf.path, sf.mtime, sf.file_size, force, &existing_tracks);
                     if verdict == VerdictEcriture::Inchange {
@@ -1745,45 +1917,24 @@ pub(crate) async fn spawn_library_scan_confirmee(
                         balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_update.push(track);
                     } else {
-                        // The sampled hash only narrows the candidates. A track
-                        // is skipped solely when a complete byte comparison
-                        // confirms an exact copy in the same album.
-                        if let (Some(hash), Some(aid)) = (&track.audio_hash, track.album_id) {
-                            let key = (hash.clone(), aid);
-                            let candidates = known_hashes.get(&key).cloned().unwrap_or_default();
-                            if let Some(existing_path) =
-                                tune_core::scanner::hasher::find_byte_identical_path(
-                                    std::path::Path::new(&sf.path),
-                                    &candidates,
-                                )
-                            {
-                                tracing::debug!(
-                                    audio_hash = %hash,
-                                    album_id = aid,
-                                    path = %sf.path,
-                                    existing_path = %existing_path,
-                                    "skip_duplicate_audio_hash"
-                                );
-                                skipped += 1;
-                                skipped_duplicate += 1;
-                                // Ce chemin n'était journalisé qu'en `debug!` :
-                                // invisible au niveau livré, donc introuvable
-                                // même en fouillant les journaux (#2050).
-                                tune_core::scanner::walker::pousser_chemin_ecarte(
-                                    &mut skipped_duplicate_paths,
-                                    format!("{} (identique à {})", sf.path, existing_path),
-                                );
-                                continue;
-                            }
-                            if !candidates.is_empty() {
-                                tracing::warn!(
-                                    audio_hash = %hash,
-                                    album_id = aid,
-                                    path = %sf.path,
-                                    candidates = candidates.len(),
-                                    "audio_hash_candidate_not_byte_identical"
-                                );
-                            }
+                        // #4907 — une copie octet pour octet d'une piste du même
+                        // album n'est plus écartée : elle devient un EXEMPLAIRE de
+                        // cette piste, sans ligne `tracks` de plus.
+                        if let Some(existing_path) =
+                            exemplaires_du_lot.exemplaire_identique(&track, &known_hashes)
+                        {
+                            tracing::debug!(
+                                path = %sf.path,
+                                existing_path = %existing_path,
+                                "scan_exemplaire_identique"
+                            );
+                            skipped += 1;
+                            skipped_duplicate += 1;
+                            tune_core::scanner::walker::pousser_chemin_ecarte(
+                                &mut skipped_duplicate_paths,
+                                format!("{} (exemplaire de {})", sf.path, existing_path),
+                            );
+                            continue;
                         }
                         balises_vues.noter(track.album_id, sf.metadata.as_ref());
                         to_insert.push(track);
@@ -1835,6 +1986,7 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 // tracks that were scanned but never made it into the DB.
                 let batch_inserted = track_repo.create_batch(&to_insert).unwrap_or(0) as i64;
                 let batch_updated = track_repo.update_batch(&to_update).unwrap_or(0) as i64;
+                exemplaires_du_lot.ecrire(&*db, &existing_copies, &to_insert);
                 // La pochette PROPRE d'une piste se pose à part : `update_batch`
                 // n'écrit pas `cover_path`, faute de quoi une piste relue
                 // recopierait dans sa ligne la pochette de son ALBUM (la lecture
@@ -2096,10 +2248,21 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 .filter(|(_, info)| info.est_locale())
                 .map(|(chemin, info)| (chemin.as_str(), info.id))
                 .collect();
+            // #4907 — les exemplaires TELS QU'ILS SONT MAINTENANT : ce scan
+            // vient peut-être d'en rattacher, et ce sont eux qui sauvent une
+            // piste dont le fichier propre a disparu.
+            let copies_du_scan: CarteDesChemins =
+                tune_core::library::exemplaires::carte_des_exemplaires(&*db).unwrap_or_default();
             // Racines devenues vides : un partage non monté est LISIBLE et
             // vide, donc invisible pour `missing_dirs`. Sans ce garde, le
             // nettoyage ci-dessous efface la bibliothèque entière (#1652).
-            let existing_refs: Vec<&str> = pistes_locales.keys().copied().collect();
+            // Les exemplaires comptent : une racine qui ne porte QUE des
+            // copies se vide aussi quand son montage tombe (#4907).
+            let existing_refs: Vec<&str> = pistes_locales
+                .keys()
+                .copied()
+                .chain(copies_du_scan.keys().map(String::as_str))
+                .collect();
             racines_videes = roots_gone_empty(&scan_dirs, &existing_refs, &discovered_paths);
             let emptied_roots = &racines_videes;
             // Un montage IMBRIQUÉ qui tombe laisse la racine répondre : ni
@@ -2154,6 +2317,8 @@ pub(crate) async fn spawn_library_scan_confirmee(
                     }
                 }
             }
+            let a_promouvoir =
+                separer_les_promotions(&mut a_supprimer, &copies_du_scan, &discovered_paths);
             if purge_refusee(a_supprimer.len(), examinees, purge_confirmee) {
                 // Le nombre exact est publié — log ET `scan_result` — parce
                 // que c'est lui qu'il faut renvoyer pour confirmer. Un refus
@@ -2184,8 +2349,26 @@ pub(crate) async fn spawn_library_scan_confirmee(
                 );
             }
             let bilan = supprimer_pistes_du_scan(&track_repo, a_supprimer, "manual");
-            let pruned = bilan.removed;
-            db_delete_failed = bilan.db_delete_failed;
+            let bilan_promotions =
+                promouvoir_les_exemplaires(&*db, &track_repo, a_promouvoir, "manual");
+            purger_les_exemplaires_disparus(
+                &*db,
+                &copies_du_scan,
+                &discovered_paths,
+                targeted.as_deref(),
+                |chemin| {
+                    verdict_purge(
+                        chemin,
+                        &scan_dirs,
+                        &missing_dirs,
+                        &error_dirs,
+                        emptied_roots,
+                        sous_arbres,
+                    )
+                },
+            );
+            let pruned = bilan.removed + bilan_promotions.removed;
+            db_delete_failed = bilan.db_delete_failed + bilan_promotions.db_delete_failed;
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
             pistes_supprimees = pruned;
