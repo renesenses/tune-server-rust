@@ -92,7 +92,7 @@ fn etat(racine: &Path) -> AppState {
 
 /// Le scan MANUEL, jusqu'à sa fin annoncée. Le droit de scanner est global au
 /// processus : un autre essai peut le tenir, on attend qu'il revienne.
-async fn scan_manuel(etat: &AppState) {
+pub(super) async fn scan_manuel(etat: &AppState) {
     let mut rx = etat.event_bus.subscribe();
     let debut = Instant::now();
     while !crate::routes::system::scan::spawn_library_scan(etat.clone(), false, None).await {
@@ -118,7 +118,7 @@ async fn scan_manuel(etat: &AppState) {
 /// Le scan de DÉMARRAGE. Il se retire en silence quand un autre scan tient le
 /// droit : `scan_started_at`, qu'il ne pose qu'une fois le droit acquis, dit
 /// s'il a vraiment tourné.
-async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) {
+pub(super) async fn scan_de_demarrage(db: &Arc<dyn DbBackend>) {
     let reglages = SettingsRepo::with_backend(db.clone());
     let debut = Instant::now();
     loop {
