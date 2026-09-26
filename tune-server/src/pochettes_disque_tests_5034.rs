@@ -757,3 +757,262 @@ fn le_surveillant_relaie_les_images_de_pochette_5034() {
     );
     assert_eq!(prets.len(), 1, "une image supprimée n'a rien à attendre");
 }
+
+// ---------------------------------------------------------------------------
+// Décision 3 (25/09/2026) — la jaquette PAR PISTE, lue pour de vrai.
+//
+// `read_metadata` lit avec `.read_cover_art(false)` : `meta.cover_art` est
+// TOUJOURS vide en production, et la pochette propre d'une piste (#4650,
+// #1284) ne se déclenchait jamais. Les épreuves d'origine l'injectaient à la
+// main ; celles-ci passent par la vraie lecture des balises.
+// ---------------------------------------------------------------------------
+
+/// La pochette qu'affiche une piste : `COALESCE(t.cover_path, al.cover_path)`.
+fn pochette_de_piste(db: &Arc<dyn DbBackend>, piste: &Path) -> String {
+    nommer(
+        TrackRepo::with_backend(db.clone())
+            .get_by_path(&piste.to_string_lossy())
+            .unwrap()
+            .expect("piste indexée")
+            .cover_path
+            .as_deref(),
+    )
+}
+
+const SINGLE_PROPRE: &[u8] = b"\xFF\xD8\xFF\xE0JAQUETTE-PROPRE-DU-SINGLE-5034";
+
+/// #4650 — « Angry » rangé dans *Hackney Diamonds* avec sa propre jaquette :
+/// la piste garde la sienne, l'album garde la sienne. Par le scan manuel, le
+/// scan de démarrage et l'Analyse complète, sur un premier index.
+#[tokio::test]
+async fn un_single_garde_sa_jaquette_dans_son_album_4650_5034() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    for passe in [Passe::Rapide, Passe::Demarrage, Passe::Complete] {
+        let (r, _dossier, pistes) =
+            album_sur_disque(&format!("single-propre-{passe:?}"), Some(JAQUETTE), None);
+        poser_jaquette(&pistes[1], Some(SINGLE_PROPRE));
+        dater(&pistes[1], hier());
+        let etat = etat_sur(&r);
+        let db = etat.backend.clone();
+        match passe {
+            Passe::Demarrage => scan_de_demarrage(&db).await,
+            _ => scan_manuel(&etat, passe == Passe::Complete, None).await,
+        }
+        let aid = album_de(&db, &pistes[0]);
+        let album = nommer(
+            AlbumRepo::with_backend(db.clone())
+                .get(aid)
+                .unwrap()
+                .unwrap()
+                .cover_path
+                .as_deref(),
+        );
+        assert_eq!(
+            (
+                album.as_str(),
+                pochette_de_piste(&db, &pistes[0]),
+                pochette_de_piste(&db, &pistes[1])
+            ),
+            (
+                "jaquette du FLAC",
+                "jaquette du FLAC".to_string(),
+                format!("autre ({})", content_hash(SINGLE_PROPRE))
+            ),
+            "{passe:?} — album, piste 1, single (#4650)"
+        );
+    }
+}
+
+/// #1284 — un dossier fourre-tout (artistes ET albums sans rapport) : chaque
+/// piste montre SA jaquette, pas celle du premier fichier lu.
+#[tokio::test]
+async fn un_dossier_fourre_tout_montre_la_jaquette_de_chaque_piste_1284_5034() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    let r = racine("fourre-tout");
+    let dossier = r.join("Divers");
+    std::fs::create_dir_all(&dossier).unwrap();
+    let mut pistes = Vec::new();
+    for (i, (artiste, album, jaquette)) in [
+        ("Brel", "Ces gens-là", JAQUETTE),
+        ("Ferré", "Avec le temps", JAQUETTE_2),
+        ("Barbara", "L'Aigle noir", SINGLE_PROPRE),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let piste = dossier.join(format!("0{} - {artiste}.flac", i + 1));
+        std::fs::copy(gabarit(), &piste).unwrap();
+        let mut f = std::fs::File::open(&piste).unwrap();
+        let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+        drop(f);
+        let mut vc = VorbisComments::default();
+        for (k, v) in [("TITLE", *artiste), ("ARTIST", *artiste), ("ALBUM", *album)] {
+            vc.insert(k.to_string(), v.to_string());
+        }
+        flac.set_vorbis_comments(vc);
+        flac.save_to_path(&piste, WriteOptions::default()).unwrap();
+        poser_jaquette(&piste, Some(jaquette));
+        pistes.push(piste);
+    }
+    let etat = etat_sur(&r);
+    let db = etat.backend.clone();
+    scan_manuel(&etat, false, None).await;
+    let vues: Vec<String> = pistes.iter().map(|p| pochette_de_piste(&db, p)).collect();
+    assert_eq!(
+        vues,
+        vec![
+            "jaquette du FLAC".to_string(),
+            "jaquette du FLAC changée".to_string(),
+            format!("autre ({})", content_hash(SINGLE_PROPRE)),
+        ],
+        "#1284 — chaque piste du dossier fourre-tout garde sa jaquette"
+    );
+}
+
+/// #5035 — l'hypothèse de l'enquête, AVÉRÉE : la PREMIÈRE piste lue n'a pas
+/// de jaquette, les autres en ont une, et le dossier porte un `cover.jpg`.
+/// Le `cover.jpg` gagnait — `albums_with_cover` le figeait pour tout le scan.
+/// La règle est « jaquette intégrée d'abord » : elle doit gagner.
+#[tokio::test]
+async fn la_jaquette_passe_avant_le_cover_jpg_meme_si_la_premiere_piste_n_en_a_pas_5035() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test();
+    for passe in [Passe::Rapide, Passe::Demarrage, Passe::Complete] {
+        let (r, _dossier, pistes) = album_sur_disque(
+            &format!("premiere-sans-jaquette-{passe:?}"),
+            Some(JAQUETTE),
+            Some(COVER),
+        );
+        poser_jaquette(&pistes[0], None);
+        dater(&pistes[0], hier());
+        let etat = etat_sur(&r);
+        let db = etat.backend.clone();
+        match passe {
+            Passe::Demarrage => scan_de_demarrage(&db).await,
+            _ => scan_manuel(&etat, passe == Passe::Complete, None).await,
+        }
+        let aid = album_de(&db, &pistes[0]);
+        assert_eq!(
+            nommer(
+                AlbumRepo::with_backend(db.clone())
+                    .get(aid)
+                    .unwrap()
+                    .unwrap()
+                    .cover_path
+                    .as_deref()
+            ),
+            "jaquette du FLAC",
+            "{passe:?} — #5035 : la jaquette de la piste 2 passe avant le cover.jpg"
+        );
+    }
+}
+
+/// MESURE (décision 3) — le coût de la lecture des jaquettes sur un vrai scan.
+///
+/// Banc, pas témoin : `#[ignore]`, joué à la main de part et d'autre du
+/// correctif (`cargo test --release -p tune-server … -- --ignored
+/// banc_cout_de_la_jaquette_par_piste_5034 --nocapture`). La bibliothèque est
+/// fabriquée une fois sous `banc-5034-pochettes/`, dans le dossier courant
+/// (pas le dossier temporaire du système, que le scan écarte). Trois scans sur
+/// base neuve, puis le travail AJOUTÉ par le correctif, mesuré seul.
+#[tokio::test]
+#[ignore = "banc de mesure, 800 Mo de FLAC : à jouer à la main"]
+async fn banc_cout_de_la_jaquette_par_piste_5034() {
+    let dir = std::env::current_dir()
+        .unwrap()
+        .join("banc-5034-pochettes")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(&dir).unwrap();
+    // La bibliothèque, fabriquée une fois : 300 albums de 10 pistes, une
+    // jaquette de 256 Kio par album (octets pseudo-aléatoires : le scan ne
+    // décode pas l'image), un `cover.jpg` un album sur trois, un single à la
+    // jaquette propre un album sur cinq.
+    let marque = Path::new(&dir).join(".banc5034");
+    if !marque.exists() {
+        let albums: usize = 300;
+        let mut graine: u64 = 0x5034;
+        let mut octets = |n: usize| -> Vec<u8> {
+            let mut v = b"\xFF\xD8\xFF\xE0".to_vec();
+            while v.len() < n {
+                graine ^= graine << 13;
+                graine ^= graine >> 7;
+                graine ^= graine << 17;
+                v.extend_from_slice(&graine.to_le_bytes());
+            }
+            v
+        };
+        for a in 0..albums {
+            let jaquette = octets(256 * 1024);
+            let single = octets(200 * 1024);
+            let dossier = Path::new(&dir)
+                .join(format!("Artiste {:03}", a / 10))
+                .join(format!("Album {a:03}"));
+            std::fs::create_dir_all(&dossier).unwrap();
+            for t in 0..10 {
+                let piste = dossier.join(format!("{:02} - Titre.flac", t + 1));
+                std::fs::copy(gabarit(), &piste).unwrap();
+                let mut f = std::fs::File::open(&piste).unwrap();
+                let mut flac = FlacFile::read_from(&mut f, ParseOptions::new()).unwrap();
+                drop(f);
+                let mut vc = VorbisComments::default();
+                let n = (t + 1).to_string();
+                let album = format!("Album {a:03}");
+                let artiste = format!("Artiste {:03}", a / 10);
+                for (k, v) in [
+                    ("TITLE", format!("Titre {n}")),
+                    ("ARTIST", artiste.clone()),
+                    ("ALBUMARTIST", artiste),
+                    ("ALBUM", album),
+                    ("TRACKNUMBER", n),
+                ] {
+                    vc.insert(k.to_string(), v);
+                }
+                flac.set_vorbis_comments(vc);
+                flac.save_to_path(&piste, WriteOptions::default()).unwrap();
+                let j = if a % 5 == 0 && t == 3 {
+                    &single
+                } else {
+                    &jaquette
+                };
+                poser_jaquette(&piste, Some(j));
+            }
+            if a % 3 == 0 {
+                std::fs::write(dossier.join("cover.jpg"), octets(300 * 1024)).unwrap();
+            }
+        }
+        std::fs::write(&marque, b"").unwrap();
+    }
+    for tour in 0..3 {
+        let etat = etat_sur(Path::new(&dir));
+        let debut = Instant::now();
+        scan_manuel(&etat, false, None).await;
+        let duree = debut.elapsed();
+        let n = TrackRepo::with_backend(etat.backend.clone())
+            .get_all_file_info_by_path()
+            .map(|m| m.len())
+            .unwrap_or(0);
+        eprintln!(
+            "BANC5034 tour={tour} pistes={n} premier_scan_ms={}",
+            duree.as_millis()
+        );
+    }
+    // Le travail que le correctif AJOUTE, isolé du reste du scan : relire la
+    // jaquette de chaque piste (une à la fois, cache disque chaud) et en
+    // prendre le condensat.
+    let pistes = tune_core::scanner::walker::list_audio_files(std::slice::from_ref(&dir)).files;
+    for tour in 0..3 {
+        let debut = Instant::now();
+        let mut octets = 0usize;
+        for p in &pistes {
+            if let Some((data, _)) = tune_core::library::artwork::extract_cover_art(p) {
+                octets += data.len();
+                std::hint::black_box(content_hash(&data));
+            }
+        }
+        eprintln!(
+            "BANC5034 jaquettes tour={tour} pistes={} octets={octets} ms={}",
+            pistes.len(),
+            debut.elapsed().as_millis()
+        );
+    }
+}
