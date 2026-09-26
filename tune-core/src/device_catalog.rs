@@ -97,8 +97,41 @@ pub struct DeviceModel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceBrand {
     pub name: String,
+    /// #5194 — profil de la MARQUE, valable pour TOUT modèle de cette marque,
+    /// catalogué ou non. Un modèle catalogué le complète (ses propres valeurs
+    /// passent devant) ; un modèle inconnu le reçoit tel quel.
+    ///
+    /// Sonos en est la raison : ses enceintes ne décodent le FLAC que jusqu'à
+    /// 48 kHz, et la liste de modèles ne suivra jamais le rythme des sorties
+    /// (Era 100 et Ray jouaient du silence en 96 kHz, fil forum 1978).
+    #[serde(default, skip_serializing_if = "is_neutral")]
+    pub default_quirks: DeviceQuirks,
     #[serde(default)]
     pub models: Vec<DeviceModel>,
+}
+
+fn is_neutral(q: &DeviceQuirks) -> bool {
+    *q == DeviceQuirks::default()
+}
+
+impl DeviceQuirks {
+    /// Complète ce profil (celui d'un modèle) par le profil de sa marque : un
+    /// drapeau affirmé d'un côté ou de l'autre reste affirmé, une valeur posée
+    /// par le modèle passe devant celle de la marque.
+    fn completer_par(mut self, marque: &DeviceQuirks) -> DeviceQuirks {
+        self.dlna_no_extra_headers |= marque.dlna_no_extra_headers;
+        self.force_16bit |= marque.force_16bit;
+        self.no_gapless |= marque.no_gapless;
+        self.pcm_only |= marque.pcm_only;
+        self.dlna_wav24 |= marque.dlna_wav24;
+        self.dlna_native_flac |= marque.dlna_native_flac;
+        self.max_sample_rate = self.max_sample_rate.or(marque.max_sample_rate);
+        if self.force_mime.is_none() {
+            self.force_mime = marque.force_mime.clone();
+        }
+        self.dlna_play_delay_ms = self.dlna_play_delay_ms.or(marque.dlna_play_delay_ms);
+        self
+    }
 }
 
 /// Le catalogue complet.
@@ -120,33 +153,138 @@ pub fn catalog() -> &'static DeviceCatalog {
     &CATALOG
 }
 
+/// La marque du catalogue que désigne `brand`, insensible à la casse et aux
+/// espaces de bord.
+///
+/// #5194 — accepte aussi la raison sociale que le descripteur UPnP met dans
+/// `<manufacturer>` : « Sonos, Inc. » désigne « Sonos ». Le nom du catalogue
+/// doit alors être suivi d'un séparateur (virgule, espace, point…), jamais
+/// d'une lettre : « Sonosphere » ne désigne pas « Sonos ».
+pub fn find_brand<'a>(brand: &str) -> Option<&'a DeviceBrand> {
+    let brand = brand.trim();
+    if brand.is_empty() {
+        return None;
+    }
+    let cat = catalog();
+    cat.brands
+        .iter()
+        .find(|b| b.name.eq_ignore_ascii_case(brand))
+        .or_else(|| {
+            cat.brands
+                .iter()
+                .find(|b| prefixe_suivi_d_un_separateur(brand, &b.name).is_some())
+        })
+}
+
+/// Si `texte` commence par `prefixe` (casse ignorée) suivi d'un caractère non
+/// alphanumérique, rend le reste débarrassé de ses séparateurs de tête.
+fn prefixe_suivi_d_un_separateur<'t>(texte: &'t str, prefixe: &str) -> Option<&'t str> {
+    let tete = texte.get(..prefixe.len())?;
+    if !tete.eq_ignore_ascii_case(prefixe) {
+        return None;
+    }
+    let reste = &texte[prefixe.len()..];
+    let suivant = reste.chars().next()?;
+    if suivant.is_alphanumeric() {
+        return None;
+    }
+    Some(reste.trim_start_matches(|c: char| !c.is_alphanumeric()))
+}
+
+/// Le modèle de `marque` que désigne `model`. Accepte le `<modelName>` UPnP,
+/// qui répète souvent la marque : « Sonos Era 100 » désigne « Era 100 ».
+fn find_model_in<'a>(marque: &'a DeviceBrand, model: &str) -> Option<&'a DeviceModel> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    marque
+        .models
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(model))
+        .or_else(|| {
+            let sans_marque = prefixe_suivi_d_un_separateur(model, &marque.name)?;
+            marque
+                .models
+                .iter()
+                .find(|m| m.name.eq_ignore_ascii_case(sans_marque))
+        })
+}
+
 /// Recherche un modèle par (marque, modèle), insensible à la casse et aux
 /// espaces de bord. `None` si introuvable (marque libre « Autre », modèle
 /// inconnu…).
 pub fn find_model<'a>(brand: &str, model: &str) -> Option<&'a DeviceModel> {
-    let brand = brand.trim();
-    let model = model.trim();
-    catalog()
-        .brands
-        .iter()
-        .find(|b| b.name.eq_ignore_ascii_case(brand))
-        .and_then(|b| b.models.iter().find(|m| m.name.eq_ignore_ascii_case(model)))
+    find_brand(brand).and_then(|b| find_model_in(b, model))
 }
 
-/// Profil de quirks pour un couple (marque, modèle). Profil neutre par défaut
-/// si le modèle n'est pas au catalogue.
+/// Profil de quirks pour un couple (marque, modèle) : celui du modèle,
+/// complété par celui de sa marque ; celui de la marque seule quand le modèle
+/// n'est pas au catalogue (#5194) ; neutre quand la marque ne l'est pas.
 pub fn quirks_for(brand: &str, model: &str) -> DeviceQuirks {
-    find_model(brand, model)
-        .map(|m| m.quirks.clone())
-        .unwrap_or_default()
+    let Some(marque) = find_brand(brand) else {
+        return DeviceQuirks::default();
+    };
+    match find_model_in(marque, model) {
+        Some(m) => m.quirks.clone().completer_par(&marque.default_quirks),
+        None => marque.default_quirks.clone(),
+    }
 }
 
-/// Résout les quirks *effectifs* d'une zone depuis son override utilisateur
-/// persisté (`zone_{id}_brand` / `zone_{id}_model`). Profil neutre si l'un des
-/// deux est absent, ou si le modèle n'est pas au catalogue.
+/// #3660 — la clé du vide FORCÉ sur l'identité d'appareil d'une zone :
+/// « l'appareil détecté n'est PAS celui de cette zone ». Une seule définition
+/// pour la route qui l'écrit et la lecture qui la respecte.
+pub fn cle_identite_effacee(zone_id: i64) -> String {
+    format!("zone_{zone_id}_identite_effacee")
+}
+
+/// Clé de réglage du magasin des renderers connus, écrit par la découverte
+/// SSDP à chaque renderer enregistré (#1126, identité #2639) : un tableau JSON
+/// de `{device_id, location, name, mac, manufacturer, model}`.
+pub const KNOWN_RENDERERS_KEY: &str = "known_renderers";
+
+/// La marque et le modèle DÉTECTÉS (`<manufacturer>`, `<modelName>` UPnP) de
+/// l'appareil de la zone, lus dans le magasin des renderers connus. `None`
+/// quand la zone n'a pas d'appareil, que le magasin ne le connaît pas, ou que
+/// l'un des deux champs est vide.
+fn detected_identity(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<(String, String)> {
+    let device_id = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()?
+        .output_device_id?;
+    let magasin = SettingsRepo::with_backend(db.clone())
+        .get(KNOWN_RENDERERS_KEY)
+        .ok()
+        .flatten()?;
+    let entrees: Vec<serde_json::Value> = serde_json::from_str(&magasin).ok()?;
+    let entree = entrees
+        .iter()
+        .find(|e| e.get("device_id").and_then(|v| v.as_str()) == Some(device_id.as_str()))?;
+    let champ = |k: &str| {
+        entree
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Some((champ("manufacturer")?, champ("model")?))
+}
+
+/// Résout les quirks *effectifs* d'une zone : depuis son override utilisateur
+/// persisté (`zone_{id}_brand` / `zone_{id}_model`) quand les deux sont posés,
+/// sinon depuis l'identité DÉTECTÉE de son appareil (magasin
+/// [`KNOWN_RENDERERS_KEY`]), sauf si l'utilisateur l'a récusée
+/// (`zone_{id}_identite_effacee`, #3660). Profil neutre si rien n'est connu
+/// ou que la marque n'est pas au catalogue.
 ///
-/// C'est le SEUL point d'entrée du chemin de lecture : un quirk ne s'active que
-/// si l'utilisateur a explicitement choisi un modèle catalogué pour la zone.
+/// C'est le SEUL point d'entrée du chemin de lecture.
+///
+/// 🔴 #5194 — la retombée sur la détection manquait : un quirk ne s'activait
+/// que si l'utilisateur avait choisi un modèle à la main. Aucun Sonos
+/// découvert ne recevait donc son plafond de 48 kHz, et un FLAC Qobuz 96 kHz
+/// partait tel quel vers un Era 100 ou un Ray, qui bouclaient sans un son.
 pub fn resolve_zone_quirks(db: &Arc<dyn DbBackend>, zone_id: i64) -> DeviceQuirks {
     let settings = SettingsRepo::with_backend(db.clone());
     let brand = settings
@@ -159,7 +297,20 @@ pub fn resolve_zone_quirks(db: &Arc<dyn DbBackend>, zone_id: i64) -> DeviceQuirk
         .flatten();
     match (brand, model) {
         (Some(b), Some(m)) if !b.trim().is_empty() && !m.trim().is_empty() => quirks_for(&b, &m),
-        _ => DeviceQuirks::default(),
+        _ => {
+            let recusee = settings
+                .get(&cle_identite_effacee(zone_id))
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("true");
+            if recusee {
+                return DeviceQuirks::default();
+            }
+            detected_identity(db, zone_id)
+                .map(|(b, m)| quirks_for(&b, &m))
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -353,12 +504,103 @@ mod tests {
                 .as_deref(),
             Some("audio/x-flac")
         );
-        // Modèle sans quirk / inconnu → profil neutre.
-        assert_eq!(quirks_for("Sonos", "inconnu"), DeviceQuirks::default());
+        // Modèle inconnu d'une marque SANS profil de marque → profil neutre.
+        assert_eq!(quirks_for("NAD", "inconnu"), DeviceQuirks::default());
+        // #5194 — modèle Sonos inconnu : le profil de la MARQUE s'applique.
+        assert_eq!(quirks_for("Sonos", "inconnu").max_sample_rate, Some(48000));
         assert_eq!(
             quirks_for(CUSTOM_BRAND, "quoi-que-ce-soit"),
             DeviceQuirks::default()
         );
+    }
+
+    /// #5194 — l'identité telle que le descripteur UPnP d'un Sonos la donne :
+    /// `<manufacturer>Sonos, Inc.</manufacturer>` et un `<modelName>` qui
+    /// répète la marque. Tout Sonos, catalogué ou non, est plafonné à 48 kHz,
+    /// sans contrainte de profondeur (24 bits acceptés : pas de `force_16bit`).
+    ///
+    /// Sabotage qui rend ce témoin ROUGE : rendre `DeviceQuirks::default()` au
+    /// lieu de `marque.default_quirks.clone()` dans `quirks_for`.
+    #[test]
+    fn tout_sonos_est_plafonne_a_48k_par_sa_marque_5194() {
+        for modele in [
+            "Sonos Era 100",
+            "Sonos Ray",
+            "Era 300",
+            "Sonos Arc Ultra",
+            "Sonos Zzz 2031",
+        ] {
+            let q = quirks_for("Sonos, Inc.", modele);
+            assert_eq!(q.max_sample_rate, Some(48000), "{modele}");
+            assert!(!q.force_16bit, "{modele} : le 24 bits reste permis");
+        }
+        // Le modèle catalogué est bien RECONNU sous son `<modelName>` UPnP.
+        assert_eq!(
+            find_model("Sonos, Inc.", "Sonos Era 100").map(|m| m.name.as_str()),
+            Some("Era 100")
+        );
+        assert_eq!(
+            find_model("Sonos, Inc.", "Sonos Ray").map(|m| m.name.as_str()),
+            Some("Ray")
+        );
+        // Un nom qui ne fait que COMMENCER par les mêmes lettres n'est pas la
+        // marque.
+        assert!(find_brand("Sonosphere").is_none());
+        assert_eq!(quirks_for("Sonosphere", "X"), DeviceQuirks::default());
+        // Le profil de la marque complète celui d'un modèle, sans l'écraser.
+        let ruark = quirks_for("Ruark Audio", "R3");
+        assert!(ruark.force_16bit);
+        assert_eq!(ruark.max_sample_rate, None);
+    }
+
+    /// #5194 — sans override, la zone prend les quirks de l'appareil DÉTECTÉ
+    /// (magasin `known_renderers`) ; une identité récusée (#3660) les coupe.
+    ///
+    /// Sabotage qui rend ce témoin ROUGE : rendre `DeviceQuirks::default()`
+    /// dans la branche « sans override » de `resolve_zone_quirks`.
+    #[test]
+    fn resolve_zone_quirks_retombe_sur_l_appareil_detecte_5194() {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+        use crate::db::zone_repo::ZoneRepo;
+
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let settings = SettingsRepo::with_backend(backend.clone());
+        let zid = ZoneRepo::with_backend(backend.clone())
+            .create("Salon", Some("dlna"), Some("uuid:RINCON_RAY"))
+            .unwrap();
+
+        // Aucun appareil connu : neutre.
+        assert_eq!(resolve_zone_quirks(&backend, zid), DeviceQuirks::default());
+
+        settings
+            .set(
+                KNOWN_RENDERERS_KEY,
+                r#"[{"device_id":"uuid:RINCON_RAY","location":"http://h/x.xml","name":"Sonos Ray","manufacturer":"Sonos, Inc.","model":"Sonos Ray"}]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            resolve_zone_quirks(&backend, zid).max_sample_rate,
+            Some(48000)
+        );
+
+        // L'override reste roi : « Autre » ⇒ aucun quirk.
+        settings
+            .set(&format!("zone_{zid}_brand"), CUSTOM_BRAND)
+            .unwrap();
+        settings
+            .set(&format!("zone_{zid}_model"), "Mon DAC")
+            .unwrap();
+        assert_eq!(resolve_zone_quirks(&backend, zid), DeviceQuirks::default());
+        settings.delete(&format!("zone_{zid}_brand")).unwrap();
+        settings.delete(&format!("zone_{zid}_model")).unwrap();
+
+        // Identité récusée : la détection ne compte plus.
+        settings.set(&cle_identite_effacee(zid), "true").unwrap();
+        assert_eq!(resolve_zone_quirks(&backend, zid), DeviceQuirks::default());
     }
 
     #[test]
