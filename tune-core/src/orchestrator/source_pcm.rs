@@ -16,6 +16,12 @@ impl PlaybackOrchestrator {
         &self.sources_pcm
     }
 
+    /// #5065 — le registre commun des sources physiques, que les greffons
+    /// natifs reçoivent par l'orchestrateur de leurs `HostServices`.
+    pub fn sources_physiques(&self) -> &Arc<crate::sources_physiques::RegistreSources> {
+        &self.sources_physiques
+    }
+
     pub(super) async fn resolve_source_pcm(
         &self,
         source: &str,

@@ -67,6 +67,13 @@ impl LecteurSimule {
         self.etat.lock().unwrap().ejecte = true;
     }
 
+    /// Remet le disque dans le lecteur (#5065 : la source suit l'insertion).
+    pub fn inserer(&self) {
+        let mut e = self.etat.lock().unwrap();
+        e.ejecte = false;
+        e.ejection_apres = None;
+    }
+
     pub fn tentatives(&self, lba: u32) -> u32 {
         self.etat
             .lock()

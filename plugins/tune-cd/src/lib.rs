@@ -41,6 +41,7 @@ pub mod linux;
 pub mod musicbrainz;
 pub mod routes;
 pub mod simule;
+pub mod source;
 pub mod toc;
 
 use std::sync::Arc;
@@ -113,6 +114,18 @@ impl TunePlugin for CdPlugin {
             playback: self.services.playback.clone(),
         });
         let zones: ZonesDuDisque = Arc::default();
+        let etat_routes = routes::EtatRoutes {
+            lecteur: lecteur.clone(),
+            hote: hote.clone(),
+            consultation: musicbrainz::MusicBrainz::new(),
+            zones: zones.clone(),
+        };
+        // #5065 — la source `cd` du registre commun des sources physiques.
+        let publication = Arc::new(source::PublicationSource::new(
+            self.services.orchestrator.sources_physiques().clone(),
+            &etat_routes,
+        ));
+        publication.publier_sans_lecteur();
         match &lecteur {
             Some(l) => {
                 tracing::info!(lecteur = %l.chemin(), "cd_lecteur_detecte");
@@ -120,7 +133,8 @@ impl TunePlugin for CdPlugin {
                     .orchestrator
                     .sources_pcm()
                     .inscrire(SOURCE, Arc::new(FournisseurCd { lecteur: l.clone() }));
-                let s = Surveillant::new(l.clone(), hote.clone(), zones.clone());
+                let s = Surveillant::new(l.clone(), hote.clone(), zones.clone())
+                    .avec_publication(publication);
                 self.surveillance = Some(tokio::spawn(s.tourner()));
             }
             None => tracing::info!(
@@ -128,12 +142,7 @@ impl TunePlugin for CdPlugin {
                 "cd_aucun_lecteur"
             ),
         }
-        ctx.register_router(routes::router(routes::EtatRoutes {
-            lecteur,
-            hote,
-            consultation: musicbrainz::MusicBrainz::new(),
-            zones,
-        }));
+        ctx.register_router(routes::router(etat_routes));
         Ok(())
     }
 
@@ -141,7 +150,14 @@ impl TunePlugin for CdPlugin {
         self.services.orchestrator.sources_pcm().retirer(SOURCE);
         if let Some(h) = self.surveillance.take() {
             h.abort();
+            // Attendue : un tour en vol ne republie pas la source après son
+            // retrait.
+            let _ = h.await;
         }
+        self.services
+            .orchestrator
+            .sources_physiques()
+            .retirer_greffon(source::ID);
         Ok(())
     }
 

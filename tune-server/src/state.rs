@@ -415,6 +415,8 @@ impl AppState {
             tune_config.advertised_ip.clone(),
         );
         orch.event_bus = Some(event_bus.clone());
+        // #5065 — `sources.changed` part sur le même bus.
+        orch.sources_physiques().brancher_bus(event_bus.clone());
         orch.license = Some(license.clone());
         let orchestrator = Arc::new(orch);
 

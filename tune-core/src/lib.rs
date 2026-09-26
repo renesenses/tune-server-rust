@@ -68,6 +68,7 @@ pub mod slimproto;
 pub mod smb_discovery;
 pub mod social;
 pub mod source_pcm;
+pub mod sources_physiques;
 pub mod stream_cache;
 pub mod streaming;
 mod system_sleep;

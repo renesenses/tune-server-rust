@@ -88,6 +88,10 @@ mod plugin_routes;
 #[cfg(feature = "cd")]
 #[path = "cd_catalogue_4863.rs"]
 mod cd_catalogue_4863;
+// #5065 — le registre des sources physiques, et le greffon `cd` qui s'y inscrit.
+#[cfg(feature = "cd")]
+#[path = "sources_physiques_5065.rs"]
+mod sources_physiques_5065;
 // Garde de la couture des FOURNISSEURS de sorties declares par un plugin.
 // Rattachee ici plutot qu en cible propre : `autotests = false` sur ce paquet,
 // donc un fichier non declare n est JAMAIS compile — vert contre rien. Et une
