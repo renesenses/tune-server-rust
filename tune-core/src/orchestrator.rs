@@ -1568,6 +1568,8 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod niveaux_a_la_sortie_1908;
 #[cfg(test)]
+mod niveaux_relais_unique_5078_5051;
+#[cfg(test)]
 mod niveaux_source_pcm_5078;
 #[cfg(test)]
 mod resolution_annoncee_tests;
