@@ -397,13 +397,34 @@ pub(super) fn wire_carries_raw_dsd(wire: Option<&StreamInfo>) -> bool {
     })
 }
 
+/// 🔴 #4354 (défaut n° 3) — `dsd_decime_en_pcm` ferme un trou qui déclarait
+/// bit-perfect une conversion de DOMAINE.
+///
+/// Pour une source DSD, `bit_depth` vaut la profondeur de la SOURCE, soit 1
+/// (voir `decrire_la_source`, qui la force délibérément pour que l'écran
+/// affiche « 1 bit » et non la profondeur du fil). La clause `bit_depth <= 16`
+/// était donc **trivialement vraie** sur tout DSD, et `is_lossless` l'est aussi
+/// (le DSD est un format sans perte). Résultat : dès que le fil portait du WAV,
+/// cette fonction rendait `true` — y compris pour une décimation 1 bit → PCM
+/// multibit, qui n'a plus rien de bit-perfect.
+///
+/// La branche `"oaat"` de [`decrire_le_transport`] tenait déjà la bonne règle,
+/// en toutes lettres : « DSD → WAV is a domain conversion […] so it is NOT
+/// bit-perfect ». Elle manquait à la branche `"dlna" | "openhome"` — celle du
+/// signalement.
+///
+/// ⚠️ Le drapeau ne dit PAS « la source est du DSD » : le DoP emballe le DSD
+/// dans des trames PCM **sans toucher aux bits**, et reste bit-perfect. Il dit
+/// « le DSD est décimé en PCM », ce que seul [`tune_core::orchestrator::transport_dsd`]
+/// sait trancher, depuis le réglage `dsd_mode` de la zone.
 pub(super) fn wav_wire_bit_perfect(
     is_lossless: bool,
     source_is_wav: bool,
     dlna_wav24: bool,
     bit_depth: i32,
+    dsd_decime_en_pcm: bool,
 ) -> bool {
-    is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
+    !dsd_decime_en_pcm && is_lossless && (source_is_wav || dlna_wav24 || bit_depth <= 16)
 }
 
 /// Le fil est-il intact, du point de vue du VERDICT affiché ?
@@ -509,6 +530,9 @@ pub(super) fn build_signal_path(
         &source,
         traitements.dsp_enabled,
     );
+    // #4354 — lu AVANT que `forcages` parte dans `Analyse` : le verdict PURE
+    // se rend en fin de fonction, une fois les étapes décrites.
+    let dsd_decime_en_pcm = forcages.dsd_decime_en_pcm;
     let (transport_bit_perfect, transport_desc, output_format_name) = decrire_le_transport(
         output_type,
         audio_backend,
@@ -567,7 +591,7 @@ pub(super) fn build_signal_path(
         // lieu d'allumer le badge. `strict_bitperfect` : la zone refuserait
         // plutôt que convertir (la lecture n'aurait alors pas démarré).
         "pure": pure,
-        "pure_degraded": pure_degraded(pure, etapes.rate_conversion),
+        "pure_degraded": pure_degraded(pure, etapes.rate_conversion, dsd_decime_en_pcm),
         "strict_bitperfect": tune_core::audio::bitperfect_strict::zone_enabled(backend, zone_id_courant),
         "rate_conversion": etapes.rate_conversion.map(|(de, vers)| json!({
             "from_hz": de,
@@ -591,8 +615,28 @@ pub(super) fn build_signal_path(
 
 /// #3973 — PURE est dégradé quand il est armé ET qu'une conversion de
 /// fréquence a lieu : la décision « jouer, et le dire » de Bertrand (19/09).
-pub(super) fn pure_degraded(pure: bool, rate_conversion: Option<(u32, u32)>) -> bool {
-    pure && rate_conversion.is_some_and(|(de, vers)| de != vers)
+///
+/// 🔴 #4354 (défaut n° 3) — `dsd_decime_en_pcm` ajoute la conversion de
+/// DOMAINE, que `rate_conversion` ne pouvait pas voir.
+///
+/// `rate_conversion` n'est renseigné que par l'étape « Resampler »
+/// (rééchantillonnage PCM → PCM mesuré, ou plafond `max_sample_rate`), et ce
+/// second cas **exclut explicitement le DSD** (`rendre_les_verdicts` :
+/// `!is_dsd && forcages.max_sample_rate.is_some_and(…)`). Une décimation
+/// DSD128 → PCM 352,8 kHz passe, elle, par l'étape « Transcoder ». Elle
+/// laissait donc `rate_conversion` à `None` et le badge PURE allumé, intact,
+/// pendant que le signal était reconstruit — le bandeau trompeur du
+/// signalement du 17/09 sur le .42.
+///
+/// PURE promet l'absence de traitement. Convertir du 1 bit en PCM multibit est
+/// le traitement le plus lourd de toute la chaîne : c'est au moins aussi
+/// dégradant qu'un changement de fréquence, qui, lui, était déjà dit.
+pub(super) fn pure_degraded(
+    pure: bool,
+    rate_conversion: Option<(u32, u32)>,
+    dsd_decime_en_pcm: bool,
+) -> bool {
+    pure && (dsd_decime_en_pcm || rate_conversion.is_some_and(|(de, vers)| de != vers))
 }
 
 /// Tout ce que `build_signal_path` a établi, prêt à être décrit en étapes
@@ -669,6 +713,9 @@ fn assembler_les_etapes(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        // #4354 — la description des étapes n'en a pas besoin : le drapeau ne
+        // sert qu'au verdict de transport et au badge PURE.
+        dsd_decime_en_pcm: _,
     } = analyse.forcages;
     let Verdicts {
         resampling_active,
@@ -1268,6 +1315,7 @@ fn decrire_le_transport<'a>(
         dlna_cap_16bit,
         needs_transcode_for_output,
         oaat_transcodes,
+        dsd_decime_en_pcm,
         ..
     } = *forcages;
     match output_type {
@@ -1288,18 +1336,17 @@ fn decrire_le_transport<'a>(
                 // transcodes for DLNA), so it is bit-perfect at any depth
                 // regardless of `dlna_wav24` — which only governs the FLAC/ALAC→WAV
                 // fallback (Sandro/Progman: WAV 24-bit direct showed red without it).
-                // Un DSD décimé en WAV est un changement de DOMAINE (1 bit
-                // sigma-delta → PCM multibit), jamais bit-perfect — le bras
-                // OAAT le dit déjà. Ici, `bit_depth` vaut 1 pour un DSD, et
-                // `1 <= 16` faisait passer la décimation pour du LPCM intact
-                // (Abacab, DMP-A8, .18 du 23/09/2026).
-                let wav_bit_perfect = !is_dsd
-                    && wav_wire_bit_perfect(
-                        is_lossless,
-                        matches!(source_format, Some(AudioFormat::Wav)),
-                        dlna_wav24,
-                        bit_depth,
-                    );
+                // #4354 — le cinquième argument est la conversion de DOMAINE.
+                // Sans lui, un DSD128 décimé en WAV 352,8 kHz/24 bits sortait
+                // d'ici `bit_perfect = true` : `bit_depth` vaut 1 pour du DSD,
+                // donc `bit_depth <= 16` était toujours vrai.
+                let wav_bit_perfect = wav_wire_bit_perfect(
+                    is_lossless,
+                    matches!(source_format, Some(AudioFormat::Wav)),
+                    dlna_wav24,
+                    bit_depth,
+                    dsd_decime_en_pcm,
+                );
                 (wav_bit_perfect, "DLNA/UPnP", "WAV")
             } else if needs_transcode_for_output || dlna_cap_16bit {
                 // Cap forces a 16-bit FLAC downconvert (not bit-perfect) even for
@@ -1437,6 +1484,14 @@ struct Forcages {
     /// Plafond de fréquence EFFECTIF : réglage de zone et catalogue d'appareils
     /// combinés en `min`, comme `resolve_local_track` (#3183).
     max_sample_rate: Option<u32>,
+    /// #4354 — le DSD est-il DÉCIMÉ en PCM multibit ?
+    ///
+    /// Vrai seulement pour une conversion de domaine réelle : ni le DSD servi
+    /// brut (`dsd_passthrough`), ni le DoP — qui emballe les mêmes bits dans
+    /// des trames PCM et reste, lui, bit-perfect. La distinction se lit dans
+    /// [`tune_core::orchestrator::transport_dsd`], la règle que l'orchestrateur
+    /// applique déjà ; ce miroir n'en écrit pas une sixième copie.
+    dsd_decime_en_pcm: bool,
 }
 
 /// Décide les forçages de sortie, en miroir des conditions de l'orchestrateur.
@@ -1630,6 +1685,26 @@ fn decider_les_forcages(
     // so the path shows "ALAC → WAV" instead of a phantom "ALAC → FLAC" (Sevy,
     // LHC-52). Only "wav" changes the verdict; anything else keeps prior logic.
     let wire_wav = output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+    // #4354 (défaut n° 3) — la conversion de DOMAINE, celle que le panneau ne
+    // voyait pas.
+    //
+    // `is_local` se lit sur le PRÉFIXE `local:` de `output_device_id`, et non
+    // sur `output_type` : c'est la source dont se sert `resolve_local_track`,
+    // et `transport_dsd` documente en toutes lettres que le miroir d'affichage
+    // doit se servir de la même, faute de quoi le panneau et le chemin audio
+    // répondraient à deux questions différentes (#2189).
+    //
+    // `!dsd_passthrough` garde le cas du .dsf servi BRUT : là, rien n'est
+    // converti, et c'est constaté sur le fil, pas déduit.
+    let dsd_decime_en_pcm = is_dsd
+        && !dsd_passthrough
+        && tune_core::orchestrator::transport_dsd(
+            zone.output_device_id
+                .as_deref()
+                .is_some_and(|d| d.starts_with("local:")),
+            is_network_output,
+            &ZoneRepo::with_backend(backend.clone()).get_dsd_mode(zone_id),
+        ) == tune_core::orchestrator::TransportDsd::Pcm;
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
@@ -1641,6 +1716,7 @@ fn decider_les_forcages(
         oaat_transcodes,
         wire_wav,
         max_sample_rate,
+        dsd_decime_en_pcm,
     }
 }
 
