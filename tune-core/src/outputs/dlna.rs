@@ -31,7 +31,7 @@ mod contact_tests_4971;
 
 #[cfg(test)]
 #[path = "dlna_pause_701_tests_5050.rs"]
-mod pause_701_tests_5050;
+pub(crate) mod pause_701_tests_5050;
 
 /// Une faute SOAP reste un corps HTTP lisible. Les chemins Play avec reprise
 /// doivent pouvoir l'inspecter ; pause/resume, eux, doivent la rendre en erreur.
@@ -1788,6 +1788,22 @@ impl OutputTarget for DlnaOutput {
 
     fn host(&self) -> Option<&str> {
         Some(&self.host)
+    }
+
+    /// #5050 — un `GetPositionInfo` envoyé exprès, jamais l'ancre ni
+    /// l'extrapolation du mode silence : après une reprise, on veut savoir où
+    /// l'appareil EST, pas où Tune croit qu'il est. Un transport en échec, une
+    /// faute SOAP, un `RelTime` absent ou non numérique (`NOT_IMPLEMENTED`)
+    /// ne sont pas des mesures : `None`.
+    async fn position_mesuree_ms(&self) -> Option<u64> {
+        let reponse = self
+            .av_action("GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .await
+            .ok()?;
+        if faute_commande_soap(&reponse) {
+            return None;
+        }
+        crate::upnp_renderer::parse_upnp_time(&extract_tag(&reponse, "RelTime")?)
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
