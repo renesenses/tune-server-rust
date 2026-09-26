@@ -1773,11 +1773,9 @@ pub(crate) fn reimporter_fichier_surveillant(
             ) {
                 album_repo.update_cover_path(aid, &hash).ok();
             }
-            album_repo.update_track_count(aid).ok();
-            album_repo.update_quality_from_tracks(aid).ok();
         }
 
-        if track_repo.create(&track).is_ok() {
+        if ranger_la_piste_du_surveillant(&track_repo, &album_repo, &track, album_id) {
             info!(path = %sf.path, "watcher_track_added");
             // #4896 — les balises relues désavouent-elles la ligne album du
             // dossier ? Un simple lookup ; la relecture du dossier entier
@@ -2382,6 +2380,29 @@ fn retirer_les_pistes_du_dossier(
         let _ = track_repo.delete_by_cue_media(chemin);
     }
     info!(dossier = %disparu.chemin, pistes = retirees, "watcher_dossier_retire");
+}
+
+/// Le surveillant range UNE piste lue sur le disque, PUIS remonte sur son
+/// album ce qui s'en déduit (nombre de pistes, qualité, genre, label).
+///
+/// L'ordre est la correction (#4836, suite) : la remontée précédait
+/// l'insertion, si bien qu'elle ne voyait pas la piste qu'on venait de lire.
+/// Le premier fichier d'un album neuf n'y portait jamais son label, et un
+/// fichier modifié (supprimé puis réinséré) le retirait du vote. Le scan de
+/// démarrage et le scan manuel, eux, remontent APRÈS avoir écrit leurs
+/// pistes : les trois chemins suivent désormais le même ordre.
+pub(crate) fn ranger_la_piste_du_surveillant(
+    track_repo: &TrackRepo,
+    album_repo: &AlbumRepo,
+    track: &Track,
+    album_id: Option<i64>,
+) -> bool {
+    let rangee = track_repo.create(track).is_ok();
+    if let Some(aid) = album_id {
+        album_repo.update_track_count(aid).ok();
+        album_repo.update_quality_from_tracks(aid).ok();
+    }
+    rangee
 }
 
 /// `event_bus` est ce qui manquait : le surveillant importait, et ne le disait

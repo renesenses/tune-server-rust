@@ -814,6 +814,32 @@ pub fn sql_label_repris_des_pistes() -> &'static str {
       GROUP BY t.label ORDER BY COUNT(*) DESC, t.label ASC LIMIT 1))"
 }
 
+/// La remontée GLOBALE du label des pistes, bornée aux seuls albums à combler
+/// (#4836, suite).
+///
+/// Même fragment que [`sql_label_repris_des_pistes`], donc même règle
+/// (comblement seul, vote majoritaire, départage alphabétique) ; le `WHERE`
+/// ne fait que taire les lignes où l'`UPDATE` n'aurait rien changé. Deux
+/// effets : la passe est idempotente jusque dans son bilan (un second passage
+/// touche 0 ligne), et elle ne réécrit pas toute la table `albums` à chaque
+/// démarrage — sur PostgreSQL, un `UPDATE` sans filtre produit une nouvelle
+/// version de CHAQUE ligne, même inchangée.
+///
+/// Elle est rejouée à chaque démarrage (`migrations::run_migrations` et
+/// `run_pg_migrations`) et par la relecture des métadonnées : v0.9.164 ne la
+/// jouait qu'en fin de scan MANUEL, si bien qu'une base mise à jour gardait
+/// 0 album étiqueté (mesuré le 25/09 sur le .18 : 2 641 pistes étiquetées,
+/// 257 albums à combler, 0 album avec un label).
+pub fn sql_combler_les_labels_d_album() -> String {
+    format!(
+        "UPDATE albums SET {} \
+         WHERE (albums.label IS NULL OR albums.label = '') \
+           AND EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id \
+                       AND t.label IS NOT NULL AND t.label != '')",
+        sql_label_repris_des_pistes()
+    )
+}
+
 pub struct AlbumRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -2119,6 +2145,13 @@ impl AlbumRepo {
         let params: [&dyn ToSqlValue; 1] = [&album_id];
         self.db.execute(&sql, &params)?;
         Ok(())
+    }
+
+    /// Comble le label de TOUS les albums qui n'en ont pas, depuis leurs
+    /// pistes — voir [`sql_combler_les_labels_d_album`]. Rend le nombre
+    /// d'albums comblés.
+    pub fn combler_les_labels_depuis_les_pistes(&self) -> Result<usize, TuneError> {
+        Ok(self.db.execute(&sql_combler_les_labels_d_album(), &[])?)
     }
 
     pub fn update_quality_from_tracks(&self, album_id: i64) -> Result<(), TuneError> {

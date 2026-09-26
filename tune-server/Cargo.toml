@@ -1055,6 +1055,11 @@ path = "tests/collections_albums_manquants_901.rs"
 name = "identification_lot_4805"
 path = "tests/identification_lot_4805.rs"
 
+# #4836 — le pilote remplit le label des albums (doublure MusicBrainz locale).
+[[test]]
+name = "labels_par_le_pilote_4836"
+path = "tests/labels_par_le_pilote_4836.rs"
+
 # 🔴 #4805 — `tests/reidentification_album.rs` existe depuis #2128 et n'a JAMAIS
 # été compilé : `autotests = false` en tête de ce manifeste, et aucune cible ne
 # le déclarait. Le contrat de `POST /library/albums/{id}/reidentify` — la chaîne
