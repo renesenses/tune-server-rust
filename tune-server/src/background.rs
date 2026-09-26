@@ -2444,6 +2444,11 @@ fn spawn_replaygain_analysis(state: &AppState) {
     // lui dépose le bus, comme il le fait pour l'orchestrateur.
     tune_core::audio::replaygain::progression::brancher_le_bus(state.event_bus.clone());
     tune_core::audio::replaygain::spawn(state.backend.clone());
+    // #5168 — le rattrapage des rapports `foo_dr.txt`, sans décodage. Il vit
+    // sous la carte « Plage dynamique », donc à côté de la cascade qui la
+    // porte ; il ne dépend PAS de l'interrupteur d'analyse : lire un rapport
+    // ne décode rien, exactement comme le scan qui le lit déjà.
+    tune_core::taches_de_fond::rapports_dr::spawn(state.backend.clone());
 }
 
 /// #2172 — le rattrapage des paroles.

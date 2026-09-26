@@ -70,7 +70,11 @@ fn etat_de(state: &AppState, tache: Tache) -> Etat {
     let cascade = tune_core::audio::replaygain::progression::releve().actif;
     let en_cours = match tache {
         Tache::ReplayGain | Tache::Empreintes => cascade,
-        Tache::PlageDynamique => state.passe_dr.releve().actif || cascade,
+        Tache::PlageDynamique => {
+            state.passe_dr.releve().actif
+                || cascade
+                || tune_core::taches_de_fond::rapports_dr::en_cours()
+        }
         // Le module `embedding` est derrière `audio-embedding` : sans la
         // feature, la passe acoustique n'existe pas, donc elle ne tourne pas.
         // La suspendre reste possible et sans effet — plutôt qu'un identifiant
@@ -138,7 +142,45 @@ pub(crate) fn instantane(state: &AppState) -> Value {
                 .contains(&tune_core::taches_de_fond::priorite::ID_SCAN),
         },
         "playback_priority": priorite,
+        // #5169 — la place de la plage dynamique parmi les passes qui
+        // décodent. Absent d'un serveur antérieur : le client cache alors le
+        // choix plutôt que d'en proposer un qui n'aurait aucun effet.
+        "dynamic_range_priority": tune_core::taches_de_fond::ordre::priorite_dr().id(),
+        "dynamic_range_priority_choices": tune_core::taches_de_fond::ordre::PrioriteDr::TOUTES
+            .map(|p| p.id()),
+        // #5168 — le rattrapage des rapports `foo_dr.txt` : tourne-t-il, et
+        // qu'a fait son dernier passage.
+        "dynamic_range_sidecar": tune_core::taches_de_fond::rapports_dr::releve(),
     })
+}
+
+/// `POST /system/background-tasks/dynamic-range-priority` — corps
+/// `{"priority": "last" | "before_fingerprints" | "first"}` (#5169).
+///
+/// Un mot inconnu rend **400** en nommant les mots admis : retomber en silence
+/// sur le défaut laisserait l'écran afficher un choix qui n'a rien changé.
+/// Rend l'instantané complet, comme les routes de pause.
+pub(crate) async fn fixer_priorite_dr(
+    State(state): State<AppState>,
+    Json(corps): Json<Value>,
+) -> impl IntoResponse {
+    use tune_core::taches_de_fond::ordre::{PrioriteDr, fixer_priorite_dr};
+    let demande = corps.get("priority").and_then(Value::as_str).unwrap_or("");
+    let Some(priorite) = PrioriteDr::depuis_id(demande) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "unknown_priority",
+                "requested": demande,
+                "known": PrioriteDr::TOUTES.map(|p| p.id()),
+            })),
+        )
+            .into_response();
+    };
+    match fixer_priorite_dr(&state.backend, priorite) {
+        Ok(()) => reponse(&state),
+        Err(e) => echec(e).into_response(),
+    }
 }
 
 /// Le 404 d'un identifiant inconnu — qui NOMME les identifiants servis.
@@ -235,4 +277,65 @@ fn reponse(state: &AppState) -> axum::response::Response {
         .event_bus
         .emit("system.background_tasks", corps.clone());
     (StatusCode::OK, Json(corps)).into_response()
+}
+
+#[cfg(test)]
+mod tests_5169 {
+    use super::*;
+    use tune_core::taches_de_fond::ordre::{PrioriteDr, priorite_dr};
+
+    async fn corps(resp: axum::response::Response) -> (StatusCode, Value) {
+        let statut = resp.status();
+        let octets = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap())
+    }
+
+    /// Le réglage d'ordre se lit dans l'instantané, se change par la route, et
+    /// un mot inconnu est REFUSÉ en nommant les mots admis — jamais un 200 qui
+    /// retomberait en silence sur le défaut.
+    #[tokio::test]
+    async fn la_priorite_de_la_plage_dynamique_se_lit_et_se_change() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        tune_core::taches_de_fond::ordre::oublier_pour_les_essais();
+        assert_eq!(instantane(&state)["dynamic_range_priority"], "last");
+        assert_eq!(
+            instantane(&state)["dynamic_range_priority_choices"],
+            json!(["last", "before_fingerprints", "first"])
+        );
+
+        let (statut, v) = corps(
+            fixer_priorite_dr(State(state.clone()), Json(json!({"priority": "avant"})))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["known"], json!(["last", "before_fingerprints", "first"]));
+        assert_eq!(
+            priorite_dr(),
+            PrioriteDr::Derniere,
+            "un refus ne change rien"
+        );
+
+        let (statut, v) = corps(
+            fixer_priorite_dr(State(state.clone()), Json(json!({"priority": "first"})))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{v}");
+        assert_eq!(v["dynamic_range_priority"], "first", "{v}");
+        assert_eq!(
+            tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                .get(tune_core::taches_de_fond::ordre::CLE_REGLAGE)
+                .unwrap()
+                .as_deref(),
+            Some("first"),
+            "le réglage est PERSISTÉ, pas seulement tenu en mémoire"
+        );
+        assert!(v["dynamic_range_sidecar"].is_object(), "{v}");
+        tune_core::taches_de_fond::ordre::oublier_pour_les_essais();
+    }
 }

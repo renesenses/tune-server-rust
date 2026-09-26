@@ -89,6 +89,22 @@ fn make_event_handler(event_tx: mpsc::Sender<FileChange>) -> impl Fn(Result<Even
                         });
                     }
                 }
+                // #5168 — un rapport de plage dynamique (`foo_dr.txt` et ses
+                // cousins, tout `.txt`) posé ou réécrit : réveiller le
+                // rattrapage des rapports pour CE dossier. Les pistes n'ont
+                // pas changé, le scan n'a donc rien à relire — c'est la passe
+                // `taches_de_fond::rapports_dr` qui lit le rapport.
+                if ct != ChangeType::Deleted {
+                    for path in &event.paths {
+                        if crate::metadata::foo_dr::peut_etre_un_rapport(path)
+                            && let Some(dossier) = path.parent()
+                        {
+                            crate::taches_de_fond::rapports_dr::signaler_le_dossier(
+                                dossier.to_path_buf(),
+                            );
+                        }
+                    }
+                }
             }
             // #4896 — les événements de DOSSIER. Ils étaient tous écartés par
             // le filtre audio ci-dessus : un dossier d'album renommé ou mis à
@@ -775,5 +791,56 @@ mod tests {
         }
 
         watcher.stop();
+    }
+
+    /// #5168 — un `foo_dr.txt` posé ou réécrit dans un dossier d'album doit
+    /// réveiller le rattrapage des rapports pour CE dossier. Avant, le
+    /// surveillant ne relayait que l'audio : le rapport restait invisible
+    /// jusqu'au prochain scan complet, et même lui ne le lisait pas (les
+    /// pistes n'avaient pas changé).
+    #[test]
+    fn un_rapport_dr_pose_ou_reecrit_reveille_le_rattrapage_de_son_dossier_5168() {
+        use notify::event::{CreateKind, DataChange, RemoveKind};
+        let racine = crate::test_scratch::scratch_dir("watcher-foo-dr-5168");
+        let pose = racine.join("Album pose");
+        let reecrit = racine.join("Album reecrit");
+        let supprime = racine.join("Album supprime");
+        for d in [&pose, &reecrit, &supprime] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(pose.join("foo_dr.txt"), "x").unwrap();
+        fs::write(reecrit.join("FOO_DR.TXT"), "x").unwrap();
+        let _ = rejouer_evenements_notify(vec![
+            evp(
+                EventKind::Create(CreateKind::File),
+                &pose.join("foo_dr.txt"),
+            ),
+            evp(
+                EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                &reecrit.join("FOO_DR.TXT"),
+            ),
+            evp(
+                EventKind::Remove(RemoveKind::File),
+                &supprime.join("foo_dr.txt"),
+            ),
+            // Une pochette n'est pas un rapport.
+            evp(
+                EventKind::Create(CreateKind::File),
+                &supprime.join("cover.jpg"),
+            ),
+        ]);
+        let signales = crate::taches_de_fond::rapports_dr::dossiers_signales();
+        for d in [&pose, &reecrit] {
+            assert!(
+                signales.contains(d),
+                "🔴 #5168 — un rapport de DR posé ou réécrit dans {d:?} n'a pas \
+                 réveillé le rattrapage de son dossier : le surveillant ne \
+                 relaie que l'audio. Signalés : {signales:?}"
+            );
+        }
+        assert!(
+            !signales.contains(&supprime),
+            "un rapport supprimé ou une pochette ne relancent rien : {signales:?}"
+        );
     }
 }

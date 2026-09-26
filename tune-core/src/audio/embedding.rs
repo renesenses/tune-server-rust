@@ -1418,6 +1418,23 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     embedder = None;
                 }
 
+                // #5169 — l'utilisateur a placé la plage dynamique AVANT le
+                // CLAP, et elle a du travail : céder le créneau d'analyse au
+                // lieu d'y alterner avec elle. Ni une plage dynamique
+                // suspendue ni une plage dynamique au repos ne retiennent le
+                // CLAP (`taches_de_fond::ordre::le_clap_doit_ceder`). La
+                // session ORT est relâchée : la cession peut durer des jours
+                // sur une grande bibliothèque, et c'est la passe DR qui a
+                // besoin de la mémoire.
+                if crate::taches_de_fond::ordre::le_clap_cede_a_la_plage_dynamique() {
+                    if embedder.take().is_some() {
+                        info!("audio_embed_cede_a_la_plage_dynamique — session relachee");
+                    }
+                    BALAYAGE_EN_COURS.store(false, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    continue;
+                }
+
                 if embedder.is_none() {
                     // No model path configured: `enabled=true` and yet the sweep
                     // can do nothing at all. Before this, that branch fell

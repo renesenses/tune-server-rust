@@ -69,7 +69,7 @@ const DR_SOURCE_ANALYSIS: &str = "analysis";
 /// Fonction à part, et non un `if` dans la boucle : une garde écrite contre la
 /// boucle devrait monter une base, des fichiers et un décodeur pour juger deux
 /// lignes de condition. Ici elle APPELLE la décision.
-fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
+pub(crate) fn peut_ecrire_le_dr(existant: Option<&str>) -> bool {
     !existant.is_some_and(|v| !v.trim().is_empty())
 }
 
@@ -528,7 +528,10 @@ pub enum TourDeCascade {
 }
 
 /// Un tour de la cascade de fond : ReplayGain, puis les empreintes, puis la
-/// plage dynamique.
+/// plage dynamique — dans l'ordre par défaut. #5169 : l'utilisateur peut
+/// faire passer la plage dynamique avant les empreintes, ou avant tout
+/// (`taches_de_fond::ordre`) ; la règle de descente ci-dessous vaut pour
+/// chaque ordre.
 ///
 /// Une passe à la fois (#1576) : le verrou d'analyse est pris ici, pour tout le
 /// tour — si le sweep acoustique décode, on attend notre tour plutôt que
@@ -565,35 +568,57 @@ pub enum TourDeCascade {
 /// EXTERNE, et un test qui recopierait la cascade la répliquerait au lieu de la
 /// garder.
 pub async fn un_tour_de_cascade(backend: &Arc<dyn DbBackend>) -> TourDeCascade {
+    use crate::taches_de_fond::ordre::{Rang, noter_travail_dr, ordre_de_la_cascade, priorite_dr};
     use crate::taches_de_fond::{Tache, est_en_pause};
 
     let _slot = ANALYSIS_SLOT.lock().await;
 
-    // Rang 1 — ReplayGain, la passe nominale.
-    if est_en_pause(Tache::ReplayGain) {
-        return TourDeCascade::Suspendue(Tache::ReplayGain);
+    // #5169 — l'ORDRE des rangs vient du réglage (défaut : ReplayGain, puis
+    // les empreintes, puis la plage dynamique — l'ordre d'avant). La règle de
+    // descente, elle, ne change pas pour le ReplayGain et les empreintes : on
+    // s'arrête au premier d'entre eux qui est SUSPENDU.
+    //
+    // La plage dynamique suspendue est SAUTÉE, pas bloquante. Dans l'ordre par
+    // défaut elle est dernière, et cela revient exactement à l'ancien
+    // comportement. Avancée par l'utilisateur, elle ne doit pas prendre les
+    // autres rangs en otage : « suspendre la seule plage dynamique laisse le
+    // ReplayGain travailler » vaut dans tous les ordres
+    // (`suspendre_la_plage_dynamique_laisse_le_replaygain_travailler`).
+    let mut dr_suspendue = false;
+    for rang in ordre_de_la_cascade(priorite_dr()) {
+        let tache = match rang {
+            Rang::ReplayGain => Tache::ReplayGain,
+            Rang::Empreintes => Tache::Empreintes,
+            Rang::PlageDynamique => Tache::PlageDynamique,
+        };
+        if est_en_pause(tache) {
+            if rang == Rang::PlageDynamique {
+                noter_travail_dr(false);
+                dr_suspendue = true;
+                continue;
+            }
+            return TourDeCascade::Suspendue(tache);
+        }
+        let n = match rang {
+            Rang::ReplayGain => analyze_track_batch(backend).await,
+            Rang::Empreintes => empreinter_un_lot(backend).await,
+            Rang::PlageDynamique => {
+                let n = rattraper_un_lot_de_dr(backend).await;
+                // Le signal que lit le CLAP pour céder son tour (#5169).
+                noter_travail_dr(n > 0);
+                n
+            }
+        };
+        if n > 0 {
+            return TourDeCascade::Travail(n);
+        }
     }
-    let n = analyze_track_batch(backend).await;
-    if n > 0 {
-        return TourDeCascade::Travail(n);
-    }
-
-    // Rang 2 — les empreintes (BIB-B2).
-    if est_en_pause(Tache::Empreintes) {
-        return TourDeCascade::Suspendue(Tache::Empreintes);
-    }
-    let n = empreinter_un_lot(backend).await;
-    if n > 0 {
-        return TourDeCascade::Travail(n);
-    }
-
-    // Rang 3 — la plage dynamique.
-    if est_en_pause(Tache::PlageDynamique) {
-        return TourDeCascade::Suspendue(Tache::PlageDynamique);
-    }
-    match rattraper_un_lot_de_dr(backend).await {
-        0 => TourDeCascade::Repos,
-        n => TourDeCascade::Travail(n),
+    // Une plage dynamique suspendue n'est pas au repos : le travail est
+    // toujours devant elle, la campagne ne doit pas se clore.
+    if dr_suspendue {
+        TourDeCascade::Suspendue(Tache::PlageDynamique)
+    } else {
+        TourDeCascade::Repos
     }
 }
 
@@ -718,6 +743,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                 // viendrait donc fermer l'avancement, et la carte afficherait
                 // « en cours » sur une passe qu'on vient d'éteindre.
                 progression::au_repos();
+                // #5169 — la cascade ne tourne plus : le CLAP ne doit pas
+                // céder son tour à une plage dynamique qui ne viendra pas.
+                crate::taches_de_fond::ordre::noter_travail_dr(false);
                 clore_campagne(
                     &registre,
                     &mut campagne,
