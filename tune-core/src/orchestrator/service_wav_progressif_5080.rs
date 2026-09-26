@@ -267,6 +267,13 @@ async fn un_titre_qobuz_a_egaliseur_n_attend_pas_la_piste_entiere_5080() {
 async fn le_wav_progressif_d_un_service_porte_l_egaliseur_de_la_zone_5080() {
     let orch = orchestrateur();
     let zone_id = zone_du_fil_1949(&orch);
+    // La compensation de niveau réseau (#5071) se rabote à la crête de CHAQUE
+    // morceau de flux : le rendu dépend du découpage, et ne peut pas égaler
+    // octet pour octet un traitement du tampon entier. Ce témoin porte sur
+    // l'égaliseur : la compensation est coupée pour lui.
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(&format!("zone_{zone_id}_level_compensation"), "false")
+        .unwrap();
     let brut = crate::audio::decode::decode_to_pcm(FIXTURE, None, Some(2), 0.0, 0.0).unwrap();
     let (sr, bd) = (brut.sample_rate, brut.bit_depth);
     let url = cdn_par_range().await;

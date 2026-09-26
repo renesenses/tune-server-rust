@@ -398,10 +398,12 @@ fn la_migration_110_garde_les_identifiants_de_pistes() {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     run_migrations(&db).unwrap();
-    // Revenir à une base d'AVANT la 110, peuplée.
+    // Revenir à une base d'AVANT la 110, peuplée. Les versions suivantes
+    // (111, 112…) sont oubliées aussi : le lanceur ne joue que
+    // `version > MAX`, une base d'avant la 110 ne les a pas davantage.
     db.execute_batch(
         "DROP TABLE track_copies; DROP TABLE album_preferred_roots;
-         DELETE FROM _migrations WHERE version = 110;
+         DELETE FROM _migrations WHERE version >= 110;
          INSERT INTO artists (id, name) VALUES (1, 'Miles Davis');
          INSERT INTO albums (id, title, artist_id) VALUES (1, 'Kind of Blue', 1);
          INSERT INTO tracks (id, title, album_id, artist_id, file_path, format)
