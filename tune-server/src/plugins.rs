@@ -41,10 +41,16 @@ pub type PluginRouters = Vec<(String, axum::Router<()>)>;
 pub fn build_loader(
     event_bus: &tune_core::event_bus::EventBus,
     backend: Arc<dyn tune_core::db::backend::DbBackend>,
+    license: Arc<tune_core::license::LicenseManager>,
 ) -> PluginLoader {
+    // La licence descend jusqu'aux greffons (`PluginContext::license`) pour
+    // qu'un greffon payant ADAPTE sa réponse au lieu de se voir fermer la porte
+    // par l'hôte : « Concerts » servira un jour une version réduite aux comptes
+    // gratuits, et cette décision doit tenir chez lui, en un seul endroit.
     PluginLoader::new(plugins_data_root())
         .with_event_bus(event_bus.clone())
         .with_db(backend)
+        .with_license(license)
 }
 
 /// Where plugins keep their private state. Each plugin gets
@@ -134,8 +140,9 @@ async fn register_builtin_plugins(loader: &PluginLoader, state: &AppState) {
     // Concerts (#2363) : la tâche d'abonnement 24 h et la route de lecture,
     // sorties du cœur toujours-compilé. Elle y était démarrée SANS condition
     // par `background.rs` — elle ne tourne désormais que chez ceux qui ont
-    // installé le plugin. Sa seule dépendance est la base : lire les artistes
-    // de la bibliothèque, et lire `instance_id` / `community_sync_enabled`.
+    // installé le plugin. Sa dépendance explicite est la base : lire les artistes
+    // de la bibliothèque et `instance_id`. La licence lui arrive par le contexte
+    // (`PluginContext::license`) : c'est lui qui décide ce qu'il sert (Premium).
     #[cfg(feature = "concerts")]
     loader
         .register(Box::new(tune_concerts::ConcertsPlugin::new(
