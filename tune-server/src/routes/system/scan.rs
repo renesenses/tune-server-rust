@@ -167,6 +167,26 @@ pub(crate) fn serialiser_les_scans_de_test() -> std::sync::MutexGuard<'static, (
     VERROU.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Épreuves seulement — attend que le droit de scanner soit LIBRE : le scan
+/// annonce sa fin (`ScanComplete`) avant d'avoir rendu son droit et baissé le
+/// compteur de scans en cours. Une épreuve qui rend le verrou commun dès
+/// l'annonce laisserait la suivante trouver un scan « en cours ».
+#[cfg(test)]
+pub(crate) async fn attendre_que_le_droit_de_scanner_soit_libre() {
+    let debut = std::time::Instant::now();
+    loop {
+        if let Some(jeton) = try_begin_scan() {
+            drop(jeton);
+            return;
+        }
+        assert!(
+            debut.elapsed() < std::time::Duration::from_secs(300),
+            "le droit de scanner n'est jamais revenu"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 pub(crate) fn try_begin_scan() -> Option<ScanLease<'static>> {
     SCAN_GATE.try_acquire()
 }
@@ -282,6 +302,13 @@ mod scan_gate_tests {
         use tune_core::scanner::activite::scan_bibliotheque_en_cours;
 
         let _serialise = serialiser();
+        // Le compteur est de PROCESSUS : un vrai scan lancé par une autre
+        // épreuve peut finir de tourner. On attend qu'il ait fini (#5034).
+        let debut = std::time::Instant::now();
+        while scan_bibliotheque_en_cours() && debut.elapsed() < std::time::Duration::from_secs(120)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let gate = ScanGate::new();
         assert!(
             !scan_bibliotheque_en_cours(),
