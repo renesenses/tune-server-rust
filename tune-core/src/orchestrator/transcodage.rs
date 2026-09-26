@@ -522,6 +522,27 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         .filter(|f| *f > 0.0)
         .map(|f| (20.0 * f.log10() * 100.0).round() / 100.0);
     let egaliseur = eq.is_some();
+    // #4407 — la RÉSERVE de l'égaliseur, dite au moment où elle est cuite dans
+    // les octets.
+    //
+    // Jean Valjean, 0.9.155, zone DLNA : « le volume baisse au minimum pour le
+    // morceau en cours ; le morceau suivant retrouve le volume normal ». La
+    // relance ne dure que 0,9 s : ce n'est pas elle. La piste candidate est la
+    // réserve automatique (`EqProfile::automatic_headroom_db`), qui croît
+    // avec les gains positifs et qui, ici, entre dans le FICHIER — le profil
+    // fait partie de la clé du cache de transcodage, donc la rendition reste
+    // atténuée jusqu'à la fin du morceau.
+    //
+    // 🔴 Cette réserve n'était écrite NULLE PART. Sur une sortie non locale,
+    // `eq_change_journal` publie `preamp_db_g=0.0 preamp_db_d=0.0` — des
+    // valeurs par DÉFAUT d'échec (`premier_echec="sortie_non_locale"`, #3479),
+    // indiscernables d'une mesure. Le journal du testeur ne pouvait donc ni
+    // confirmer ni écarter l'hypothèse. Il le pourra.
+    //
+    // ⚠️ Instrument, pas correctif : rien du son ne change ici.
+    let eq_actif = eq.as_ref().is_some_and(|e| e.is_enabled());
+    let reserve_eq_db_g = eq.as_ref().and_then(|e| e.preamp_db(0));
+    let reserve_eq_db_d = eq.as_ref().and_then(|e| e.preamp_db(1));
     let convolution = convolver.is_some();
     let crossfeed_actif = crossfeed.is_some();
 
@@ -612,6 +633,9 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         cible_bd = actual_bd,
         replaygain_db = ?replaygain_db,
         egaliseur,
+        eq_actif,
+        reserve_eq_db_g = ?reserve_eq_db_g,
+        reserve_eq_db_d = ?reserve_eq_db_d,
         convolution,
         crossfeed = crossfeed_actif,
         "transcode_to_temp_file_stages"

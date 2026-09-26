@@ -1677,3 +1677,44 @@ fn un_profil_qui_ne_fait_que_creuser_ne_reserve_rien_4594() {
         "une cascade purement soustractive sonne : L1 = {l1_db} dB"
     );
 }
+
+/// #4407 — la RÉSERVE publiée par le transcodage réseau discrimine-t-elle ?
+///
+/// Jean Valjean, 0.9.155, zone DLNA : « le volume baisse au minimum pour le
+/// morceau en cours ». `transcode_to_temp_file_stages` publie désormais
+/// `reserve_eq_db_g` / `reserve_eq_db_d`, pris sur le processeur EFFECTIVEMENT
+/// monté. Ce témoin dit ce que le prochain journal du testeur vaudra : les dix
+/// bandes dont il parle réservent des dizaines de dB si elles POUSSENT, et
+/// rigoureusement rien si elles CREUSENT. Sans cette ligne, les deux cas
+/// étaient indiscernables — `eq_change_journal` publie `preamp_db_g=0.0` par
+/// DÉFAUT sur une sortie non locale (#3479).
+#[test]
+fn reserve_publiee_separe_dix_bandes_qui_poussent_de_dix_qui_creusent() {
+    let freqs = [
+        31.0, 62.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    ];
+
+    let poussent = profil(freqs.iter().map(|f| bande("peak", *f, 6.0, 1.0)).collect());
+    let reserve_poussent = poussent.automatic_headroom_db(0);
+    assert!(
+        // #4594 : la réserve est désormais la borne vraie (norme L1), −16,54 dB
+        // pour ces dix cloches — plus les −60 dB de la somme des gains.
+        reserve_poussent <= -10.0,
+        "dix bandes à +6 dB réservent plus de 10 dB : {reserve_poussent}"
+    );
+    assert_eq!(
+        EqProcessor::new(&poussent, FS, 2).preamp_db(0),
+        Some(reserve_poussent),
+        "c'est bien cette valeur que le journal publie"
+    );
+
+    // 🔴 La contre-épreuve : un profil qui ne fait que creuser ne réserve RIEN.
+    // Si le testeur renvoie `reserve_eq_db_g` proche de zéro, l'hypothèse du
+    // préampli tombe et il faut chercher ailleurs.
+    let creusent = profil(freqs.iter().map(|f| bande("peak", *f, -6.0, 1.0)).collect());
+    let reserve_creusent = creusent.automatic_headroom_db(0);
+    assert!(
+        reserve_creusent.abs() < 1e-9,
+        "dix bandes à −6 dB ne réservent aucune marge : {reserve_creusent}"
+    );
+}
