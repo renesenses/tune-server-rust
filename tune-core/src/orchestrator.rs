@@ -1230,7 +1230,9 @@ impl StreamingDsp {
     /// « actif » tout en étant MUET sur le crossfeed. C'est le mode de panne
     /// qu'une garde de site, purement textuelle, ne peut pas voir : le champ
     /// existe, le chargement existe, l'appel existe, et rien ne sort.
-    #[cfg(test)]
+    ///
+    /// #5114 — c'est aussi ce fait-là, et non le réglage, que le flux publie
+    /// (`StreamInfo::crossfeed`) quand ce porteur est posé sur son canal.
     fn crossfeed_executable(&self) -> bool {
         self.crossfeed.is_some() && self.channels == 2
     }

@@ -298,10 +298,11 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 Some(sid) => state.streamer.stream_output_wire(sid).await,
                 None => None,
             };
-            let signal_path = build_signal_path(
+            let signal_path = build_signal_path_sous_licence(
                 &ps,
                 z,
                 &state.backend,
+                Some(&*state.license),
                 renderer_label,
                 audio_backend,
                 wire.as_ref(),
@@ -474,10 +475,11 @@ pub(super) async fn get_zone(
                     Some(sid) => state.streamer.stream_output_wire(sid).await,
                     None => None,
                 };
-                let signal_path = build_signal_path(
+                let signal_path = build_signal_path_sous_licence(
                     &ps,
                     &zone,
                     &state.backend,
+                    Some(&*state.license),
                     renderer_label,
                     audio_backend,
                     wire.as_ref(),

@@ -203,6 +203,10 @@ struct Servi {
     progressif: bool,
     diaphonie_db: f64,
     premier_octet: Duration,
+    /// #5114 — ce que le flux ANNONCE porter (`StreamInfo::crossfeed`, lu par
+    /// `stream_output_wire`, l'accesseur du chemin du signal). Confronté à la
+    /// diaphonie MESURÉE dans les octets servis.
+    annonce_crossfeed: bool,
 }
 
 async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
@@ -225,6 +229,13 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
         .get(&sid)
         .cloned()
         .expect("session inscrite");
+    let annonce_crossfeed = m
+        .orch
+        .streamer
+        .stream_output_wire(&sid)
+        .await
+        .expect("fil publié")
+        .crossfeed;
     let fichier = session.file_path.lock().await.clone();
     if let Some(chemin) = fichier {
         let premier_octet = t0.elapsed();
@@ -235,6 +246,7 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
             progressif: false,
             diaphonie_db: diaphonie_fichier(&chemin),
             premier_octet,
+            annonce_crossfeed,
         };
     }
     // Session progressive : on tire le canal comme le ferait le renderer.
@@ -258,17 +270,20 @@ async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
         progressif: true,
         diaphonie_db: diaphonie_fichier(&wav.to_string_lossy()),
         premier_octet: premier_octet.expect("aucun octet servi"),
+        annonce_crossfeed,
     }
 }
 
 fn journal(cas: &str, s: &Servi) {
     println!(
-        "#2742 {cas} : mime={} tel_quel={} progressif={} diaphonie={:.1} dB premier_octet={} ms",
+        "#2742 {cas} : mime={} tel_quel={} progressif={} diaphonie={:.1} dB premier_octet={} ms \
+         annonce_crossfeed={}",
         s.mime,
         s.tel_quel,
         s.progressif,
         s.diaphonie_db,
-        s.premier_octet.as_millis()
+        s.premier_octet.as_millis(),
+        s.annonce_crossfeed
     );
 }
 
@@ -286,6 +301,11 @@ fn porte_le_crossfeed_une_fois(cas: &str, s: &Servi) {
          donne un silence à droite",
         s.diaphonie_db
     );
+    // #5114 — et le flux le DIT : c'est ce que le chemin du signal affiche.
+    assert!(
+        s.annonce_crossfeed,
+        "{cas} : les octets portent le crossfeed, le flux doit l'annoncer"
+    );
 }
 
 fn ne_porte_aucun_crossfeed(cas: &str, s: &Servi) {
@@ -293,6 +313,10 @@ fn ne_porte_aucun_crossfeed(cas: &str, s: &Servi) {
         s.diaphonie_db < -60.0,
         "{cas} : aucune diaphonie attendue, mesuré {:.1} dB",
         s.diaphonie_db
+    );
+    assert!(
+        !s.annonce_crossfeed,
+        "{cas} : aucun crossfeed dans les octets, le flux ne doit pas en annoncer"
     );
 }
 
@@ -411,9 +435,69 @@ async fn le_chemin_des_services_garde_une_seule_passe_2742() {
         progressif: false,
         diaphonie_db: diaphonie_pcm(&pcm, 16),
         premier_octet: Duration::ZERO,
+        // Le fait que les bras des services posent sur leur session.
+        annonce_crossfeed: chaine.is_active() && chaine.crossfeed_executable(),
     };
     journal("services", &s);
     porte_le_crossfeed_une_fois("services", &s);
+}
+
+/// #5114 — licence ÉCHUE : l'orchestrateur ne charge plus le crossfeed, le
+/// flux n'en porte donc pas (mesuré), ne l'annonce pas, et le miroir de la
+/// compensation ne le compte plus — il rend exactement la cible de
+/// l'égaliseur seul, au lieu de la surestimer du gain moyen du crossfeed.
+#[tokio::test]
+async fn licence_echue_ni_crossfeed_servi_ni_compte_par_le_miroir_5114() {
+    let mut m = monter(Renderer::AnnonceLeLpcm, None).await;
+    armer_l_egaliseur(&m);
+    let miroir = |m: &Montage| {
+        PlaybackOrchestrator::compensation_reseau_prevue_with(
+            &m.orch.db,
+            m.orch.license.as_deref(),
+            m.zone_id,
+        )
+    };
+    let premium = miroir(&m).expect("égaliseur et crossfeed : compensés");
+    m.orch.license = Some(Arc::new(crate::license::LicenseManager::new(
+        m.orch.db.clone(),
+    )));
+    assert!(
+        !m.orch.license.as_ref().unwrap().premium_snapshot(),
+        "le témoin exige une licence échue"
+    );
+    assert!(m.orch.crossfeed_configure(m.zone_id).is_none());
+    let echue = miroir(&m).expect("l'égaliseur, gratuit, reste compensé");
+    // L'étalon : la même zone sans crossfeed du tout.
+    SettingsRepo::with_backend(m.orch.db.clone())
+        .set(
+            &format!("zone_{}_crossfeed", m.zone_id),
+            r#"{"enabled":false}"#,
+        )
+        .unwrap();
+    let egaliseur_seul = miroir(&m).expect("égaliseur seul : compensé");
+    println!(
+        "#5114 miroir : premium {premium:.2} dB, licence échue {echue:.2} dB, \
+         égaliseur seul {egaliseur_seul:.2} dB"
+    );
+    assert!(
+        (echue - egaliseur_seul).abs() < 1e-9,
+        "licence échue : le miroir doit rendre la cible de l'égaliseur seul \
+         ({egaliseur_seul:.2} dB), il rend {echue:.2} dB"
+    );
+    assert!(
+        premium - echue > 0.05,
+        "le témoin exige un crossfeed qui déplace la cible : {premium:.2} / {echue:.2} dB"
+    );
+    // Et le flux, crossfeed recoché : toujours rien, la licence tranche.
+    SettingsRepo::with_backend(m.orch.db.clone())
+        .set(
+            &format!("zone_{}_crossfeed", m.zone_id),
+            &format!(r#"{{"enabled":true,"amount":{AMOUNT},"delay_ms":{DELAY_MS}}}"#),
+        )
+        .unwrap();
+    let s = jouer(&m, None).await;
+    journal("licence échue", &s);
+    ne_porte_aucun_crossfeed("licence échue", &s);
 }
 
 /// Les deux règles pures du module, table complète.

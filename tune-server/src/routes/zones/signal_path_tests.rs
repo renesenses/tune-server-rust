@@ -3692,3 +3692,149 @@ fn en_pure_aucune_compensation_reseau_5071() {
     .unwrap();
     assert!(etape(&sp, "Compensation").is_none(), "{sp}");
 }
+
+/// #5114 — un fil qui porte le crossfeed, tel que la session le publie.
+fn fil_avec_crossfeed(format: &str) -> StreamInfo {
+    StreamInfo {
+        crossfeed: true,
+        ..wire(format, 44_100, 16)
+    }
+}
+
+/// #5114 — la zone RÉSEAU a coché le crossfeed ; l'interrupteur de
+/// compensation est coupé, pour que le verdict ne tienne qu'au crossfeed.
+fn zone_reseau_crossfeed_5114(compensation: bool) -> (Arc<dyn DbBackend>, Zone) {
+    let (backend, zone) = dlna_zone();
+    let zid = zone.id.unwrap();
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.set(
+        &format!("zone_{zid}_crossfeed"),
+        r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+    )
+    .unwrap();
+    if !compensation {
+        s.set(&format!("zone_{zid}_level_compensation"), "false")
+            .unwrap();
+    }
+    (backend, zone)
+}
+
+/// #5114 — une zone DLNA dont le flux porte le crossfeed (WAV progressif,
+/// cas 2 de #2742) : l'étape est là, non bit-perfect, et le verdict global
+/// tombe. Avant, le panneau n'en disait rien et annonçait « bit-perfect » :
+/// un FLAC 16 bits servi en WAV 16 bits passe pour un transcodage sans perte.
+#[test]
+fn le_crossfeed_du_flux_reseau_est_une_etape_et_fait_tomber_le_verdict_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(false);
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&fil_avec_crossfeed("wav")),
+    )
+    .unwrap();
+    let cf = etape(&sp, "Crossfeed").expect("étape Crossfeed absente");
+    eprintln!("crossfeed = {cf}");
+    assert_eq!(cf["bit_perfect"], false, "{cf}");
+    assert_eq!(cf["code"], "crossfeed", "{cf}");
+    assert_eq!(sp["bit_perfect"], false, "{sp}");
+    assert!(
+        !sp["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bit-perfect"),
+        "{sp}"
+    );
+}
+
+/// #5114 — le crossfeed COCHÉ mais absent du flux (renderer sans LPCM, piste
+/// servie telle quelle : cas 3 de #2742) n'affiche rien, et le fil intact
+/// reste bit-perfect. C'est le flux qui parle, pas le réglage.
+#[test]
+fn un_crossfeed_regle_que_le_flux_ne_porte_pas_n_affiche_rien_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(false);
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Crossfeed").is_none(), "{sp}");
+    assert_eq!(sp["bit_perfect"], true, "{sp}");
+}
+
+/// #5114 — l'ordre de la chaîne : le crossfeed avant la compensation, comme
+/// `StreamingDsp::process` et le ré-encodage par le fichier.
+#[test]
+fn le_crossfeed_precede_la_compensation_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(true);
+    let sp = build_signal_path(
+        &flac_16_en_lecture_5071(),
+        &zone,
+        &backend,
+        Some("Marantz ND8006"),
+        "",
+        Some(&fil_avec_crossfeed("wav")),
+    )
+    .unwrap();
+    let noms: Vec<&str> = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["name"].as_str())
+        .collect();
+    let cf = noms.iter().position(|n| *n == "Crossfeed");
+    let cp = noms.iter().position(|n| *n == "Compensation");
+    assert!(
+        cf.is_some() && cp.is_some() && cf < cp,
+        "le crossfeed vient AVANT la compensation : {noms:?}"
+    );
+}
+
+/// #5114 — licence ÉCHUE : l'orchestrateur ne charge pas le crossfeed, le
+/// flux part intact. Le miroir de la compensation passe par la MÊME garde :
+/// il ne compte plus ce crossfeed absent, aucune étape Compensation n'est
+/// inventée et le fil reste bit-perfect. Le témoin : la même zone, sans
+/// garde, dont le flux porte le crossfeed — elle EST compensée.
+#[test]
+fn licence_echue_le_miroir_ne_compense_pas_un_crossfeed_absent_5114() {
+    let (backend, zone) = zone_reseau_crossfeed_5114(true);
+    let echue = tune_core::license::LicenseManager::new(backend.clone());
+    assert!(
+        !echue.premium_snapshot(),
+        "le témoin exige une licence échue"
+    );
+    let ps = flac_16_en_lecture_5071();
+    let temoin = build_signal_path_sous_licence(
+        &ps,
+        &zone,
+        &backend,
+        None,
+        Some("Marantz ND8006"),
+        "",
+        Some(&fil_avec_crossfeed("wav")),
+    )
+    .unwrap();
+    assert!(
+        etape(&temoin, "Compensation").is_some(),
+        "le témoin doit compenser le crossfeed : {temoin}"
+    );
+    let sp = build_signal_path_sous_licence(
+        &ps,
+        &zone,
+        &backend,
+        Some(&echue),
+        Some("Marantz ND8006"),
+        "",
+        Some(&wire("flac", 44_100, 16)),
+    )
+    .unwrap();
+    assert!(etape(&sp, "Compensation").is_none(), "{sp}");
+    assert!(etape(&sp, "Crossfeed").is_none(), "{sp}");
+    assert_eq!(sp["bit_perfect"], true, "{sp}");
+}
