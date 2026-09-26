@@ -8,9 +8,17 @@ une playlist d'un service vers un autre, **à l'identique** et **par lot**,
 garde une **copie datée** (snapshot) de toute playlist avant d'y écrire, et
 tient deux playlists à jour par des **liens** qui n'écrivent que des ajouts.
 
-Greffon **WASM**, **premium** (`manifest.premium = true`) et **facultatif** :
-il n'est pas embarqué dans les paquets publiés, il s'installe depuis le
-gestionnaire de greffons. Source : `plugins/tune-playlists-converter`.
+Greffon **WASM** et **premium** (`manifest.premium = true`). Depuis la
+v0.9.166 (#4715), il est livré comme `party` : le `main.wasm` et le
+`manifest.json` du fixture sont copiés à côté de `tune-server` dans chaque
+paquet publié (archives, installeur Windows, `.app`, image Docker), sous
+`plugins/playlists-converter/`. Le gestionnaire d'extensions le montre avec
+`premium: true` ; sans licence Premium, ses routes rendent 402 (garde
+`Feature::PluginMarketplace`, posée par l'hôte) et `enable`/`install`/`update`
+aussi, comme pour les greffons audio payants. Il peut encore s'installer depuis
+la boutique de mozaiklabs.fr, dès que sa fiche y est publiée (payante : un
+`price` > 0 exige Premium à l'installation). Source :
+`plugins/tune-playlists-converter`.
 
 ## Les trois garanties
 
